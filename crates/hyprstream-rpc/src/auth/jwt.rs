@@ -30,7 +30,6 @@ pub enum JwkThumbprintInput<'a> {
     Rsa { n: &'a str, e: &'a str },
     /// AKP / ML-DSA-65 (draft-ietf-cose-dilithium-11): canonical
     /// `{"alg":"ML-DSA-65","kty":"AKP","pub":"<base64url>"}`
-    #[cfg(feature = "pq-hybrid")]
     Akp { alg: &'a str, pub_bytes: &'a [u8] },
 }
 
@@ -52,7 +51,6 @@ pub fn jwk_thumbprint(input: &JwkThumbprintInput<'_>) -> String {
         JwkThumbprintInput::Rsa { n, e } => {
             format!(r#"{{"e":"{}","kty":"RSA","n":"{}"}}"#, e, n)
         }
-        #[cfg(feature = "pq-hybrid")]
         JwkThumbprintInput::Akp { alg, pub_bytes } => {
             let pub_b64 = URL_SAFE_NO_PAD.encode(pub_bytes);
             format!(r#"{{"alg":"{}","kty":"AKP","pub":"{}"}}"#, alg, pub_b64)
@@ -320,7 +318,6 @@ pub fn decode_unverified(token: &str) -> Result<Claims, JwtError> {
 /// Uses lenient audience validation (same as `decode_with_key`): if
 /// `expected_aud` is `Some`, a wrong `aud` is rejected but an absent
 /// `aud` is accepted.
-#[cfg(feature = "pq-hybrid")]
 pub fn decode_ml_dsa_65(
     token: &str,
     vk: &crate::crypto::pq::MlDsaVerifyingKey,
@@ -379,7 +376,6 @@ pub fn decode_ml_dsa_65(
 ///
 /// Per draft-ietf-jose-pq-composite-sigs, the signature is
 /// `ml_dsa_sig (3309 bytes) ∥ ed25519_sig (64 bytes)`.
-#[cfg(feature = "pq-hybrid")]
 pub fn decode_composite(
     token: &str,
     ml_dsa_vk: &crate::crypto::pq::MlDsaVerifyingKey,

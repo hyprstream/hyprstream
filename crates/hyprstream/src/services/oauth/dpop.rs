@@ -27,9 +27,7 @@ use subtle::ConstantTimeEq;
 pub enum DpopKey {
     Ed25519 { bytes: [u8; 32] },
     Es256 { x: [u8; 32], y: [u8; 32] },
-    #[cfg(feature = "pq-hybrid")]
     MlDsa65 { pub_bytes: Vec<u8> },
-    #[cfg(feature = "pq-hybrid")]
     MlDsa65Ed25519 { pub_bytes: Vec<u8> },
 }
 
@@ -42,11 +40,9 @@ impl DpopKey {
             DpopKey::Es256 { x, y } => {
                 jwk_thumbprint(&JwkThumbprintInput::Es256 { x, y })
             }
-            #[cfg(feature = "pq-hybrid")]
             DpopKey::MlDsa65 { pub_bytes } => {
                 jwk_thumbprint(&JwkThumbprintInput::Akp { alg: "ML-DSA-65", pub_bytes })
             }
-            #[cfg(feature = "pq-hybrid")]
             DpopKey::MlDsa65Ed25519 { pub_bytes } => {
                 jwk_thumbprint(&JwkThumbprintInput::Akp { alg: "ML-DSA-65-Ed25519", pub_bytes })
             }
@@ -163,8 +159,7 @@ pub fn verify_dpop_proof(
         let (x, y) = extract_p256_key(jwk)?;
         verify_es256(&x, &y, signing_input.as_bytes(), &sig_bytes)?;
         DpopKey::Es256 { x, y }
-    } else if cfg!(feature = "pq-hybrid") && alg == "ML-DSA-65" {
-        #[cfg(feature = "pq-hybrid")]
+    } else if alg == "ML-DSA-65" {
         {
             let pub_bytes = extract_akp_pub(jwk)?;
             let vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(&pub_bytes)
@@ -173,10 +168,7 @@ pub fn verify_dpop_proof(
                 .map_err(|_| DpopError::SignatureInvalid)?;
             DpopKey::MlDsa65 { pub_bytes }
         }
-        #[cfg(not(feature = "pq-hybrid"))]
-        return Err(DpopError::WrongAlg(alg.to_owned()))
-    } else if cfg!(feature = "pq-hybrid") && alg == "ML-DSA-65-Ed25519" {
-        #[cfg(feature = "pq-hybrid")]
+    } else if alg == "ML-DSA-65-Ed25519" {
         {
             let pub_bytes = extract_akp_pub(jwk)?;
             // Composite: ML-DSA-65 vk (1952) + Ed25519 vk (32) = 1984
@@ -203,8 +195,6 @@ pub fn verify_dpop_proof(
                 .map_err(|_| DpopError::SignatureInvalid)?;
             DpopKey::MlDsa65Ed25519 { pub_bytes }
         }
-        #[cfg(not(feature = "pq-hybrid"))]
-        return Err(DpopError::WrongAlg(alg.to_owned()))
     } else {
         return Err(DpopError::WrongAlg(alg.to_owned()));
     };
@@ -298,7 +288,6 @@ fn extract_p256_key(jwk: &serde_json::Value) -> Result<([u8; 32], [u8; 32]), Dpo
     Ok((x_bytes, y_bytes))
 }
 
-#[cfg(feature = "pq-hybrid")]
 fn extract_akp_pub(jwk: &serde_json::Value) -> Result<Vec<u8>, DpopError> {
     if jwk["kty"].as_str() != Some("AKP") {
         return Err(DpopError::InvalidJwk);
@@ -435,10 +424,9 @@ mod dpop_nonce_tests {
 
 /// Regression test: take a JWT-style DPoP proof signed with a composite alg,
 /// strip the ML-DSA-65 sig half, confirm `verify_dpop_proof` rejects.
-#[cfg(all(test, feature = "pq-hybrid"))]
+#[cfg(test)]
 mod dpop_stripping_tests {
     use super::*;
-    use base64::Engine as _;
     use ed25519_dalek::Signer as _;
 
     #[test]

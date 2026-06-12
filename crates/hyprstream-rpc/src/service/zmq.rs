@@ -476,7 +476,6 @@ pub trait RequestService: 'static {
 
         // Route verification by algorithm
         let verified = match alg.as_str() {
-            #[cfg(feature = "pq-hybrid")]
             "ML-DSA-65" => {
                 let vks = key_source.ml_dsa_verifying_keys();
                 if vks.is_empty() {
@@ -499,7 +498,6 @@ pub trait RequestService: 'static {
                     }
                 }
             }
-            #[cfg(feature = "pq-hybrid")]
             "ML-DSA-65-Ed25519" => {
                 let vks = key_source.ml_dsa_verifying_keys();
                 if vks.is_empty() {

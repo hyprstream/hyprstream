@@ -446,12 +446,10 @@ impl Spawnable for OAuthService {
             );
             info!("ES256 (P-256) signing key rotation store loaded");
 
-            #[cfg(feature = "pq-hybrid")]
             let ml_dsa_store = crate::auth::key_rotation::global_ml_dsa_key_store(
                 &secrets_dir,
                 &self.config,
             );
-            #[cfg(feature = "pq-hybrid")]
             info!("ML-DSA-65 signing key rotation store loaded");
 
             let (ca_jwt_key, signing_key_store) = match crate::auth::identity_store::load_ca_signing_key(&credentials_dir) {
@@ -473,7 +471,6 @@ impl Spawnable for OAuthService {
                         Arc::clone(&store_arc),
                         crate::auth::key_rotation::RotationStores {
                             es256: Some(Arc::clone(&es256_store)),
-                            #[cfg(feature = "pq-hybrid")]
                             ml_dsa: Some(Arc::clone(&ml_dsa_store)),
                         },
                     );
@@ -513,7 +510,6 @@ impl Spawnable for OAuthService {
                 oauth_state = oauth_state.with_signing_key_store(store);
             }
             oauth_state = oauth_state.with_es256_key_store(Arc::clone(&es256_store));
-            #[cfg(feature = "pq-hybrid")]
             {
                 oauth_state = oauth_state.with_ml_dsa_key_store(Arc::clone(&ml_dsa_store));
             }

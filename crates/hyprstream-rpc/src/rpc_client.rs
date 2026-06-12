@@ -291,19 +291,55 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         }
 
         let canonical = envelope.to_bytes();
+        let ed_pubkey = self.signer.pubkey();
+
+        // Raw EdDSA signature (sig/cnf) retained for signer-pubkey advertisement
+        // + the JWT cnf key-binding path.
         let signature = self.signer.sign(&canonical).await?;
 
-        let pq_sig = self.signer.pq_sign(&canonical).await?;
-        let pq_cnf = self.signer.pq_pubkey();
+        // Build the COSE composite (M3 #152) by signing each entry's
+        // Sig_structure out-of-band via the (possibly async/WASM) Signer.
+        let aad = crate::crypto::cose_sign1::build_external_aad(
+            crate::envelope::ENVELOPE_SCHEMA_ID,
+            crate::envelope::REQUEST_ENVELOPE_TYPE_ID,
+        );
+        // Nested SNS composite: sign the inner EdDSA layer first, then sign the
+        // outer ML-DSA-65 layer over `canonical ‖ inner_eddsa_signature` so the
+        // inner signature is bound into the outer (Strong-Non-Separable).
+        let ed_kid = ed_pubkey.to_vec();
+        let ed_tbs = crate::crypto::cose_sign::inner_tbs(ed_kid.clone(), &canonical, &aad);
+        let ed_sig = self.signer.sign(&ed_tbs).await?.to_vec();
+
+        // Hybrid component when the signer exposes an ML-DSA-65 key.
+        let pq_entry = if let Some(pq_kid) = self.signer.pq_pubkey() {
+            let pq_tbs = crate::crypto::cose_sign::outer_tbs(
+                pq_kid.clone(),
+                &canonical,
+                &ed_sig,
+                &aad,
+            );
+            self.signer
+                .pq_sign(&pq_tbs)
+                .await?
+                .map(|pq_sig| (pq_kid, pq_sig))
+        } else {
+            None
+        };
+        let policy = if pq_entry.is_some() {
+            crate::crypto::CryptoPolicy::Hybrid
+        } else {
+            crate::crypto::CryptoPolicy::Classical
+        };
+        let cose = crate::crypto::cose_sign::assemble_composite_nested((ed_kid, ed_sig), pq_entry)?;
 
         let signed = SignedEnvelope {
             envelope,
             sig: signature,
-            cnf: self.signer.pubkey(),
+            cnf: ed_pubkey,
             encrypted_envelope: None,
             client_ephemeral_public: None,
-            pq_sig,
-            pq_cnf,
+            cose,
+            policy,
             pq_kem_ciphertext: None,
         };
 

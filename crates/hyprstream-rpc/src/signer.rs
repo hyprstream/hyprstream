@@ -17,7 +17,6 @@ use crate::transport_traits::Signer;
 /// Used for server-to-server RPC where the signing key is local.
 pub struct LocalSigner {
     signing_key: SigningKey,
-    #[cfg(feature = "pq-hybrid")]
     pq_signing_key: Option<crate::crypto::pq::MlDsaSigningKey>,
 }
 
@@ -25,7 +24,6 @@ impl LocalSigner {
     pub fn new(signing_key: SigningKey) -> Self {
         Self {
             signing_key,
-            #[cfg(feature = "pq-hybrid")]
             pq_signing_key: {
                 let (sk, _) = crate::crypto::pq::ml_dsa_generate_keypair();
                 Some(sk)
@@ -33,7 +31,6 @@ impl LocalSigner {
         }
     }
 
-    #[cfg(feature = "pq-hybrid")]
     pub fn with_pq_key(mut self, key: crate::crypto::pq::MlDsaSigningKey) -> Self {
         self.pq_signing_key = Some(key);
         self
@@ -57,29 +54,16 @@ impl Signer for LocalSigner {
     }
 
     fn pq_pubkey(&self) -> Option<Vec<u8>> {
-        #[cfg(feature = "pq-hybrid")]
-        {
-            self.pq_signing_key.as_ref().map(|sk| {
-                let vk = ml_dsa::Keypair::verifying_key(sk);
-                crate::crypto::pq::ml_dsa_vk_bytes(&vk)
-            })
-        }
-        #[cfg(not(feature = "pq-hybrid"))]
-        None
+        self.pq_signing_key.as_ref().map(|sk| {
+            let vk = ml_dsa::Keypair::verifying_key(sk);
+            crate::crypto::pq::ml_dsa_vk_bytes(&vk)
+        })
     }
 
     async fn pq_sign(&self, canonical_bytes: &[u8]) -> Result<Option<Vec<u8>>> {
-        #[cfg(feature = "pq-hybrid")]
-        {
-            return match &self.pq_signing_key {
-                Some(sk) => Ok(Some(crate::crypto::pq::ml_dsa_sign(sk, canonical_bytes))),
-                None => Ok(None),
-            };
-        }
-        #[cfg(not(feature = "pq-hybrid"))]
-        {
-            let _ = canonical_bytes;
-            Ok(None)
+        match &self.pq_signing_key {
+            Some(sk) => Ok(Some(crate::crypto::pq::ml_dsa_sign(sk, canonical_bytes))),
+            None => Ok(None),
         }
     }
 }

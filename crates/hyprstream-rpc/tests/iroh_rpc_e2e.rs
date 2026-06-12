@@ -110,6 +110,19 @@ fn direct_addr(substrate: &IrohSubstrate) -> EndpointAddr {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn signed_envelope_round_trip_over_iroh() -> Result<()> {
+    // This canary exercises the classical (EdDSA-only) wire+envelope path. As
+    // an integration test it compiles hyprstream-rpc in non-test mode, where
+    // the uninstalled global verify policy now fail-closes to Hybrid (#160).
+    // Opt in to the Classical policy this test actually validates. `set` is
+    // idempotent-by-first-write; ignore the error if another test in this
+    // binary already installed a (matching) config.
+    let _ = hyprstream_rpc::envelope::install_verify_config(
+        hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+            policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
+            pq_store: None,
+        },
+    );
+
     // ─── Server side ──────────────────────────────────────────────────────
     let server_signing = fresh_signing_key();
     let server_verifying: VerifyingKey = server_signing.verifying_key();

@@ -180,9 +180,9 @@ pub use crypto::{generate_ephemeral_keypair, ristretto_dh, RistrettoPublic, Rist
 
 pub use envelope::{
     unwrap_and_verify,
-    Authorization, EnvelopeVerification, FederatedToken, InMemoryNonceCache, NonceCache,
-    RequestEnvelope, ResponseEnvelope, SignedEnvelope, Subject, TokenClaims, UnwrapOptions,
-    MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
+    Authorization, EnvelopeVerification, FederatedToken, InMemoryNonceCache, KeyedPqTrustStore,
+    NonceCache, PqTrustStore, RequestEnvelope, ResponseEnvelope, SignedEnvelope, Subject,
+    TokenClaims, UnwrapOptions, MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use envelope::unwrap_envelope;

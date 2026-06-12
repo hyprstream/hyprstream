@@ -234,7 +234,10 @@ pub struct ServiceContext {
 
     /// Shared ML-DSA-65 verifying keys for PQ-hybrid JWT verification.
     /// Updated by the rotation task; shared across all key sources.
-    #[cfg(feature = "pq-hybrid")]
+    ///
+    /// Uses `std::sync::RwLock` to match the cross-crate `Arc<RwLock<..>>`
+    /// contract with `hyprstream::auth::key_rotation` and `JwtKeySource`.
+    #[allow(clippy::disallowed_types)]
     ml_dsa_verifying_keys: std::sync::Arc<std::sync::RwLock<Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>>>,
 }
 
@@ -263,19 +266,21 @@ impl ServiceContext {
             service_keys: HashMap::new(),
             ca_verifying_key: None,
             jwks_fetcher: None,
-            #[cfg(feature = "pq-hybrid")]
-            ml_dsa_verifying_keys: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
+            ml_dsa_verifying_keys: {
+                #[allow(clippy::disallowed_types)]
+                std::sync::Arc::new(std::sync::RwLock::new(Vec::new()))
+            },
         }
     }
 
     /// Set the shared ML-DSA-65 verifying keys for PQ-hybrid JWT verification.
-    #[cfg(feature = "pq-hybrid")]
+    #[allow(clippy::disallowed_types)]
     pub fn set_ml_dsa_verifying_keys(&mut self, keys: std::sync::Arc<std::sync::RwLock<Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>>>) {
         self.ml_dsa_verifying_keys = keys;
     }
 
     /// Get a clone of the shared ML-DSA verifying keys Arc.
-    #[cfg(feature = "pq-hybrid")]
+    #[allow(clippy::disallowed_types)]
     pub fn ml_dsa_verifying_keys_arc(&self) -> std::sync::Arc<std::sync::RwLock<Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>>> {
         self.ml_dsa_verifying_keys.clone()
     }
@@ -556,7 +561,6 @@ impl ServiceContext {
                 issuer_url,
                 fetcher.clone(),
             );
-            #[cfg(feature = "pq-hybrid")]
             let source = source.with_ml_dsa_verifying_keys(self.ml_dsa_verifying_keys.clone());
             std::sync::Arc::new(source)
         } else {
@@ -564,7 +568,6 @@ impl ServiceContext {
                 self.jwt_verifying_key(),
                 issuer_url,
             );
-            #[cfg(feature = "pq-hybrid")]
             let source = source.with_ml_dsa_verifying_keys(self.ml_dsa_verifying_keys.clone());
             std::sync::Arc::new(source)
         }
