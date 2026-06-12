@@ -25,6 +25,8 @@ pub mod iroh_transport;
 pub mod iroh_moq;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod in_memory;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod lazy_quinn;
 
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
@@ -162,6 +164,13 @@ pub enum EndpointType {
         addr: SocketAddr,
         /// Server hostname for TLS certificate validation
         server_name: String,
+        /// SHA-256 fingerprint of the server's self-signed certificate, for
+        /// client-side cert pinning (`with_server_certificate_hashes`). `None`
+        /// for the server/bind side or when peer authentication is provided
+        /// some other way (e.g. an expected response-signing key). Carrying the
+        /// 32-byte hash (not the full cert) keeps `TransportConfig` compact and
+        /// wire-publishable. Public fingerprint — not secret.
+        cert_pin: Option<[u8; 32]>,
     },
 }
 
@@ -219,9 +228,25 @@ impl TransportConfig {
             endpoint: EndpointType::Quic {
                 addr,
                 server_name: server_name.into(),
+                cert_pin: None,
             },
             curve: None, // QUIC has TLS 1.3 built-in, no CurveZMQ needed
             bind_mode: BindMode::Bind,
+        }
+    }
+
+    /// Create a client QUIC endpoint that pins the server's self-signed cert by
+    /// its SHA-256 fingerprint (`cert_pin`). This is the dial target the
+    /// resolver/`dial()` produce for a networked RPC peer.
+    pub fn quic_pinned(addr: SocketAddr, server_name: impl Into<String>, cert_pin: [u8; 32]) -> Self {
+        Self {
+            endpoint: EndpointType::Quic {
+                addr,
+                server_name: server_name.into(),
+                cert_pin: Some(cert_pin),
+            },
+            curve: None,
+            bind_mode: BindMode::Connect,
         }
     }
 
@@ -300,7 +325,7 @@ impl TransportConfig {
             EndpointType::SystemdFd { client_path, .. } => {
                 format!("ipc://{}", client_path.display())
             }
-            EndpointType::Quic { addr, server_name } => {
+            EndpointType::Quic { addr, server_name, .. } => {
                 format!("quic://{server_name}:{addr}")
             }
         }
@@ -317,7 +342,7 @@ impl TransportConfig {
     /// Returns `https://{server_name}:{port}` for QUIC endpoints, `None` otherwise.
     pub fn quic_webtransport_url(&self) -> Option<String> {
         match &self.endpoint {
-            EndpointType::Quic { addr, server_name } => {
+            EndpointType::Quic { addr, server_name, .. } => {
                 Some(format!("https://{}:{}", server_name, addr.port()))
             }
             _ => None,

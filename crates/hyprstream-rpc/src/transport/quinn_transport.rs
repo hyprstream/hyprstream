@@ -286,15 +286,19 @@ impl Transport for QuinnTransport {
     }
 }
 
-/// Helper to build a quinn WebTransport client session against a self-signed
-/// server, pinning the server cert by its sha256 fingerprint. Hermetic: dials
-/// an IP-literal URL so no DNS lookup or network egress occurs.
-pub async fn connect_pinned(
+/// Build a quinn WebTransport client session against a self-signed server,
+/// pinning the server cert by its **SHA-256 fingerprint** (the 32-byte hash
+/// carried in `EndpointType::Quic { cert_pin }`). Hermetic: dials an IP-literal
+/// URL so no DNS lookup or network egress occurs.
+///
+/// This is the connect path the lazy dial transport uses — the resolver/DID doc
+/// publishes the compact hash, not the full cert.
+pub async fn connect_pinned_sha256(
     addr: std::net::SocketAddr,
-    cert_der: &[u8],
+    cert_sha256: [u8; 32],
 ) -> Result<web_transport_quinn::Session> {
     let client = web_transport_quinn::ClientBuilder::new()
-        .with_server_certificate_hashes(vec![sha256(cert_der)])
+        .with_server_certificate_hashes(vec![cert_sha256.to_vec()])
         .map_err(|e| anyhow!("quinn client build: {e}"))?;
     let url = url::Url::parse(&format!("https://{addr}/"))
         .map_err(|e| anyhow!("quinn url: {e}"))?;
@@ -302,6 +306,17 @@ pub async fn connect_pinned(
         .connect(url)
         .await
         .map_err(|e| anyhow!("quinn connect: {e}"))
+}
+
+/// Convenience: pin by the full server cert DER (hashes it for you). Used by
+/// tests and callers that hold the cert rather than its fingerprint.
+pub async fn connect_pinned(
+    addr: std::net::SocketAddr,
+    cert_der: &[u8],
+) -> Result<web_transport_quinn::Session> {
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&sha256(cert_der));
+    connect_pinned_sha256(addr, hash).await
 }
 
 fn sha256(bytes: &[u8]) -> Vec<u8> {
