@@ -11,7 +11,7 @@ use ed25519_dalek::VerifyingKey;
 ///
 /// Implemented by `hyprstream::auth::FederationKeyResolver`. Services that
 /// serve external traffic return `Some(Arc<dyn FederationKeySource>)` from
-/// `ZmqService::federation_key_source()` so the default `verify_claims()`
+/// `RequestService::federation_key_source()` so the default `verify_claims()`
 /// can perform real key resolution instead of rejecting federated JWTs.
 ///
 /// # Note on `Send` bounds
@@ -19,10 +19,10 @@ use ed25519_dalek::VerifyingKey;
 /// `get_key` uses the default (`Send`) flavour of `#[async_trait]` because
 /// `FederationKeyResolver` performs real async I/O (HTTPS JWKS fetch) whose
 /// future must be `Send`. Call sites inside `#[async_trait(?Send)]` contexts
-/// (e.g. `ZmqService::verify_claims`) may `.await` this future directly:
+/// (e.g. `RequestService::verify_claims`) may `.await` this future directly:
 /// it is valid in Rust to await a `Send` future from within a `!Send`
 /// async function — the `?Send` bound constrains the outer function's
-/// future, not the futures it polls. `ZmqService::verify_claims` does
+/// future, not the futures it polls. `RequestService::verify_claims` does
 /// exactly this and compiles correctly.
 #[async_trait::async_trait]
 pub trait FederationKeySource: Send + Sync + 'static {

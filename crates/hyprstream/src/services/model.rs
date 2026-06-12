@@ -390,7 +390,7 @@ impl ModelService {
         let fs: Option<crate::services::WorktreeClient> = Some(repo_client.worktree(&branch_name));
 
         // Start InferenceService for this model via standard Spawnable infrastructure
-        let zmq_ctx = Arc::clone(hyprstream_rpc::ZmqService::context(self));
+        let zmq_ctx = Arc::clone(hyprstream_rpc::RequestService::context(self));
         let spawner = hyprstream_service::ServiceSpawner::threaded();
 
         let transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(&endpoint);
@@ -1297,11 +1297,11 @@ impl ModelService {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ZmqService Implementation — delegates to generated dispatch_model
+// RequestService Implementation — delegates to generated dispatch_model
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[async_trait(?Send)]
-impl crate::services::ZmqService for ModelService {
+impl crate::services::RequestService for ModelService {
     async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
         debug!(
             "Model request from {} (id={})",

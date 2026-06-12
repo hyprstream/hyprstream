@@ -1,12 +1,12 @@
 //! Policy service for authorization checks over ZMQ
 //!
-//! Wraps PolicyManager and exposes it as a ZmqService.
+//! Wraps PolicyManager and exposes it as a RequestService.
 //! Handlers are async and use `.await` directly (compatible with single-threaded runtime).
 
 use async_trait::async_trait;
 use crate::auth::PolicyManager;
 use crate::auth::policy_templates;
-use crate::services::{EnvelopeContext, ZmqService};
+use crate::services::{EnvelopeContext, RequestService};
 use crate::services::generated::policy_client::{
     ErrorInfo, PolicyHandler, PolicyResponseVariant, TokenInfo, ScopeList,
     PolicyCheck, IssueToken,
@@ -1470,7 +1470,7 @@ impl PolicyHandler for PolicyService {
 }
 
 #[async_trait(?Send)]
-impl ZmqService for PolicyService {
+impl RequestService for PolicyService {
     async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
         trace!(
             "Policy request from {} (id={})",

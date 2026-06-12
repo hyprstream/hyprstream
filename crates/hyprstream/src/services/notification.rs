@@ -31,7 +31,7 @@ use parking_lot::RwLock;
 use tracing::{debug, error, trace, warn};
 use uuid::Uuid;
 
-use crate::services::{Continuation, EnvelopeContext, PolicyClient, ZmqService};
+use crate::services::{Continuation, EnvelopeContext, PolicyClient, RequestService};
 use crate::services::generated::policy_client::PolicyCheck;
 use crate::services::generated::notification_client::{
     NotificationClient, NotificationHandler, NotificationResponseVariant,
@@ -766,11 +766,11 @@ impl NotificationHandler for NotificationService {
 }
 
 // ============================================================================
-// ZmqService implementation
+// RequestService implementation
 // ============================================================================
 
 #[async_trait(?Send)]
-impl ZmqService for NotificationService {
+impl RequestService for NotificationService {
     async fn handle_request(
         &self,
         ctx: &EnvelopeContext,

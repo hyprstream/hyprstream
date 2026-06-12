@@ -2543,15 +2543,15 @@ impl InferenceHandler for InferenceService {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ZmqService adapter and Spawnable implementation
+// RequestService adapter and Spawnable implementation
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// verify_claims is now handled by the default ZmqService::verify_claims() implementation
+// verify_claims is now handled by the default RequestService::verify_claims() implementation
 // in hyprstream-rpc (E2E JWT verification for all non-local identities).
 
-/// ZmqService adapter for InferenceService.
+/// RequestService adapter for InferenceService.
 ///
-/// Wraps `InferenceService` to implement `ZmqService` for use with `RequestLoop`.
+/// Wraps `InferenceService` to implement `RequestService` for use with `RequestLoop`.
 /// This adapter is created inside `Spawnable::run()` on the service thread —
 /// it never crosses thread boundaries.
 struct InferenceZmqAdapter {
@@ -2564,7 +2564,7 @@ struct InferenceZmqAdapter {
 }
 
 #[async_trait::async_trait(?Send)]
-impl hyprstream_rpc::service::ZmqService for InferenceZmqAdapter {
+impl hyprstream_rpc::service::RequestService for InferenceZmqAdapter {
     async fn handle_request(
         &self,
         ctx: &EnvelopeContext,
@@ -2744,7 +2744,7 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
             .await
             .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("init: {e}")))?;
 
-            // Create ZmqService adapter for RequestLoop
+            // Create RequestService adapter for RequestLoop
             let adapter = InferenceZmqAdapter {
                 service,
                 zmq_context: context.clone(),

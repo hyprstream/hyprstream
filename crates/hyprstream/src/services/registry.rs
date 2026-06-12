@@ -6,7 +6,7 @@
 use crate::services::PolicyClient;
 use crate::services::types::{MAX_FDS_GLOBAL, MAX_FDS_PER_CLIENT};
 use hyprstream_containedfs::{ContainedFs, FsError, FsHandle};
-use crate::services::{EnvelopeContext, ZmqService};
+use crate::services::{EnvelopeContext, RequestService};
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::{global as endpoint_registry, SocketKind};
@@ -297,7 +297,7 @@ impl FidTable {
 /// 4. Continuation publishes clone progress via PUB/SUB
 ///
 /// The registry is wrapped in RwLock for interior mutability since some operations
-/// (like clone) require mutable access but ZmqService::handle_request takes &self.
+/// (like clone) require mutable access but RequestService::handle_request takes &self.
 pub struct RegistryService {
     // Business logic
     registry: Arc<RwLock<Git2DB>>,
@@ -2660,7 +2660,7 @@ impl WorktreeHandler for RegistryService {
 }
 
 #[async_trait(?Send)]
-impl ZmqService for RegistryService {
+impl RequestService for RegistryService {
     async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
         dispatch_registry(self, ctx, payload).await
     }

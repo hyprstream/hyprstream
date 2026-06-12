@@ -1,6 +1,6 @@
 //! TuiService — ZMQ RPC service for the TUI multiplexer.
 //!
-//! Implements `ZmqService` for the TUI display server. Manages sessions,
+//! Implements `RequestService` for the TUI display server. Manages sessions,
 //! windows, and panes via RPC. Frame publishing is handled separately
 //! by the frame loop task (not in the service struct).
 
@@ -21,7 +21,7 @@ use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::streaming::{
     BatchingConfig, StreamChannel, StreamContext, StreamPublisher, StreamPublisherConfig,
 };
-use hyprstream_rpc::{EnvelopeContext, ZmqService, Continuation};
+use hyprstream_rpc::{EnvelopeContext, RequestService, Continuation};
 
 use crate::tui_capnp;
 use crate::services::PolicyClient;
@@ -134,11 +134,11 @@ pub struct TuiService {
     state: Arc<RwLock<TuiState>>,
     /// Next viewer ID counter (atomic for Send+Sync).
     next_viewer_id: AtomicU32,
-    /// ZMQ context (required by ZmqService).
+    /// ZMQ context (required by RequestService).
     context: Arc<zmq::Context>,
-    /// Transport config (required by ZmqService).
+    /// Transport config (required by RequestService).
     transport: TransportConfig,
-    /// Signing key (required by ZmqService).
+    /// Signing key (required by RequestService).
     signing_key: SigningKey,
     /// Per-session viewer registration channels + frame loop tokens.
     sessions: SessionRegistry,
@@ -1614,7 +1614,7 @@ impl TuiService {
 }
 
 #[async_trait(?Send)]
-impl ZmqService for TuiService {
+impl RequestService for TuiService {
     async fn handle_request(
         &self,
         _ctx: &EnvelopeContext,

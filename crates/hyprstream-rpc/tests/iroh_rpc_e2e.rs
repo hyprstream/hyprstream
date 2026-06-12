@@ -1,6 +1,6 @@
 //! End-to-end Phase 2 canary: real SignedEnvelope round-trip over iroh.
 //!
-//! Wires a minimal [`ZmqService`] through:
+//! Wires a minimal [`RequestService`] through:
 //! 1. [`LocalServiceBridge`] (dedicated LocalSet thread)
 //! 2. [`IrohRpcProtocolHandler`] on ALPN `hyprstream-rpc/1`
 //! 3. iroh `Connection` (direct dial, no DNS/pkarr)
@@ -24,7 +24,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 
 use hyprstream_rpc::envelope::InMemoryNonceCache;
 use hyprstream_rpc::rpc_client::RpcClientImpl;
-use hyprstream_rpc::service::{Continuation, EnvelopeContext, ZmqService};
+use hyprstream_rpc::service::{Continuation, EnvelopeContext, RequestService};
 use hyprstream_rpc::signer::LocalSigner;
 use hyprstream_rpc::transport::iroh_rpc::{IrohRpcProtocolHandler, LocalServiceBridge};
 use hyprstream_rpc::transport::iroh_substrate::{
@@ -35,7 +35,7 @@ use hyprstream_rpc::transport::TransportConfig;
 use iroh::{EndpointAddr, TransportAddr};
 use rand::RngCore;
 
-/// Minimal `ZmqService` for the canary: echoes the request payload with a
+/// Minimal `RequestService` for the canary: echoes the request payload with a
 /// 1-byte prefix so the test can verify identity round-trip.
 struct EchoService {
     name: String,
@@ -56,7 +56,7 @@ impl EchoService {
 }
 
 #[async_trait(?Send)]
-impl ZmqService for EchoService {
+impl RequestService for EchoService {
     async fn handle_request(
         &self,
         _ctx: &EnvelopeContext,

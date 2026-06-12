@@ -14,7 +14,7 @@
 //!     └── SystemdBackend (systemd-run)
 //!         └── Transient units in hyprstream-workers.slice
 //!
-//! ServiceSpawner (ZmqService hosting)
+//! ServiceSpawner (RequestService hosting)
 //!     ├── Tokio mode (tokio::spawn)
 //!     ├── Thread mode (std::thread + runtime)
 //!     └── Subprocess mode (ProcessSpawner)

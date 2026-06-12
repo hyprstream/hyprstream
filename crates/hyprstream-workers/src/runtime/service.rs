@@ -1,6 +1,6 @@
 //! WorkerService - CRI RuntimeClient + ImageClient via ZMQ
 //!
-//! Implements ZmqService trait for handling CRI-aligned requests.
+//! Implements RequestService trait for handling CRI-aligned requests.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 
 // Import ZMQ service infrastructure from hyprstream-rpc
 use hyprstream_rpc::prelude::SigningKey;
-use hyprstream_rpc::service::{AuthorizeFn, EnvelopeContext, ZmqService};
+use hyprstream_rpc::service::{AuthorizeFn, EnvelopeContext, RequestService};
 use hyprstream_rpc::streaming::{StreamChannel, StreamPublisher};
 use hyprstream_rpc::transport::TransportConfig;
 
@@ -58,7 +58,7 @@ const SERVICE_NAME: &str = "worker";
 
 /// WorkerService handles CRI RuntimeClient and ImageClient requests
 ///
-/// Implements the ZmqService trait for integration with hyprstream's ZMQ infrastructure.
+/// Implements the RequestService trait for integration with hyprstream's ZMQ infrastructure.
 pub struct WorkerService {
     // Business logic
     /// Sandbox pool for VM management
@@ -1281,11 +1281,11 @@ impl WorkerHandler for WorkerService {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ZmqService Implementation — delegates to generated dispatch_worker
+// RequestService Implementation — delegates to generated dispatch_worker
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[async_trait(?Send)]
-impl ZmqService for WorkerService {
+impl RequestService for WorkerService {
     async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> AnyhowResult<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
         debug!(
             "Worker request from {} (request_id={})",

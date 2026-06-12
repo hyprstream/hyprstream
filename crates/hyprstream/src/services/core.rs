@@ -1,6 +1,6 @@
 //! Core service infrastructure — re-exports from `hyprstream-rpc`.
 
-pub use hyprstream_rpc::service::{Continuation, EnvelopeContext, ZmqService};
+pub use hyprstream_rpc::service::{Continuation, EnvelopeContext, RequestService};
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::print_stdout)]
@@ -32,7 +32,7 @@ mod tests {
     }
 
     #[async_trait::async_trait(?Send)]
-    impl ZmqService for EchoService {
+    impl RequestService for EchoService {
         async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
             let user = ctx.user();
             let mut response = format!("from {}:", user).into_bytes();

@@ -9,7 +9,7 @@
 //! # Architecture
 //!
 //! ```text
-//! hyprstream-rpc       (transport: ZmqService, RequestLoop, Resolver)
+//! hyprstream-rpc       (transport: RequestService, RequestLoop, Resolver)
 //!     ↑
 //! hyprstream-service   (orchestration: spawner, factory, manager)
 //!     ↑

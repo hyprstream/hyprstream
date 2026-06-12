@@ -15,7 +15,7 @@
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │  hyprstream/src/services/                                   │
-//! │  ├── core.rs      ← ZmqService trait, runners, clients     │
+//! │  ├── core.rs      ← RequestService trait, runners, clients     │
 //! │  ├── types.rs     ← Shared types (FsDirEntry, ModelInfo, etc.)│
 //! │  ├── registry.rs  ← Registry service (REP) + client (REQ)  │
 //! │  └── inference.rs ← Inference service (REP) + client (REQ) │
@@ -24,11 +24,11 @@
 //!
 //! # Usage
 //!
-//! Services implement `ZmqService` with infrastructure methods and are automatically
+//! Services implement `RequestService` with infrastructure methods and are automatically
 //! `Spawnable` via blanket impl:
 //!
 //! ```rust,ignore
-//! use crate::services::{EnvelopeContext, ZmqService};
+//! use crate::services::{EnvelopeContext, RequestService};
 //! use hyprstream_rpc::prelude::*;
 //! use hyprstream_rpc::service::{InprocManager, ServiceManager, Spawnable};
 //! use hyprstream_rpc::transport::TransportConfig;
@@ -41,7 +41,7 @@
 //!     verifying_key: VerifyingKey,
 //! }
 //!
-//! impl ZmqService for MyService {
+//! impl RequestService for MyService {
 //!     fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<Continuation>)> {
 //!         // ctx.identity is already verified
 //!         println!("Request from: {}", ctx.subject());
@@ -95,7 +95,7 @@ pub mod typed;
 pub mod worker;
 
 pub use core::{
-    Continuation, EnvelopeContext, ZmqService,
+    Continuation, EnvelopeContext, RequestService,
 };
 
 // Generated client types — the public API

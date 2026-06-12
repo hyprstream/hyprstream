@@ -200,7 +200,11 @@ pub use resolver::Resolver;
 pub use registry::SocketKind;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use service::{Continuation, EnvelopeContext, RequestLoop, Spawnable, ServiceHandle, ZmqService};
+pub use service::{Continuation, EnvelopeContext, RequestLoop, Spawnable, ServiceHandle, RequestService};
+/// Transitional compat alias for the former `ZmqService` (#166); removed in #138.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use service::RequestService as ZmqService;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use streaming::{
@@ -232,7 +236,7 @@ pub mod prelude {
         // Error
         EnvelopeError, EnvelopeResult, Result, RpcError,
         // Service (transport)
-        EnvelopeContext, RequestLoop, ServiceHandle, ZmqService,
+        EnvelopeContext, RequestLoop, ServiceHandle, RequestService,
         // Streaming
         StreamContext, StreamPublisher,
     };

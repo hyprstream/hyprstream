@@ -21,7 +21,7 @@ use hyprstream_rpc::streaming::StreamChannel;
 use hyprstream_rpc::transport::TransportConfig;
 use tracing::{error, trace};
 
-use crate::services::{Continuation, EnvelopeContext, PolicyClient, ZmqService};
+use crate::services::{Continuation, EnvelopeContext, PolicyClient, RequestService};
 use crate::services::generated::policy_client::PolicyCheck;
 use crate::services::generated::metrics_client::{
     MetricsHandler, MetricsResponseVariant,
@@ -585,11 +585,11 @@ impl MetricsHandler for MetricsService {
 }
 
 // ============================================================================
-// ZmqService
+// RequestService
 // ============================================================================
 
 #[async_trait(?Send)]
-impl ZmqService for MetricsService {
+impl RequestService for MetricsService {
     async fn handle_request(
         &self,
         ctx: &EnvelopeContext,

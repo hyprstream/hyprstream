@@ -70,7 +70,7 @@ use axum::{
     Router,
 };
 use hyprstream_rpc::registry::SocketKind;
-use hyprstream_rpc::service::{RequestLoop, ZmqService};
+use hyprstream_rpc::service::{RequestLoop, RequestService};
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_service::Spawnable;
 use tokio::sync::Notify;
@@ -655,9 +655,9 @@ impl Spawnable for OAuthService {
                     zmq_transport,
                     zmq_signing_key,
                 );
-                let zmq_transport = ZmqService::transport(&handler).clone();
-                let zmq_context = Arc::clone(ZmqService::context(&handler));
-                let zmq_signing_key = ZmqService::signing_key(&handler);
+                let zmq_transport = RequestService::transport(&handler).clone();
+                let zmq_context = Arc::clone(RequestService::context(&handler));
+                let zmq_signing_key = RequestService::signing_key(&handler);
                 let loop_ = RequestLoop::new(zmq_transport, zmq_context, zmq_signing_key);
                 if let Err(e) = loop_.run(handler).await {
                     tracing::error!("OAuth ZMQ loop error: {}", e);

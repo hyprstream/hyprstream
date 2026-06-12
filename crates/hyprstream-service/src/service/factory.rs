@@ -635,7 +635,7 @@ impl ServiceContext {
         std::sync::Arc::new(rpc)
     }
 
-    /// Wrap a ZmqService for spawning with a per-service QUIC port.
+    /// Wrap a RequestService for spawning with a per-service QUIC port.
     ///
     /// - `quic_port: None` → use ephemeral port (0) when QUIC is globally enabled
     /// - `quic_port: Some(0)` → ephemeral (OS-assigned) port
@@ -644,7 +644,7 @@ impl ServiceContext {
     /// When `[quic] enabled = true` in config, all services get QUIC on
     /// auto-assigned ephemeral ports by default. Set an explicit port to
     /// control which port a service uses.
-    pub fn into_spawnable_quic<S: hyprstream_rpc::service::ZmqService + Send + Sync + 'static>(
+    pub fn into_spawnable_quic<S: hyprstream_rpc::service::RequestService + Send + Sync + 'static>(
         &self,
         service: S,
         quic_port: Option<u16>,
@@ -687,10 +687,10 @@ impl ServiceContext {
         }
     }
 
-    /// Wrap a ZmqService for spawning, enabling QUIC when globally configured.
+    /// Wrap a RequestService for spawning, enabling QUIC when globally configured.
     ///
     /// Uses ephemeral port (0) for QUIC when `[quic] enabled = true`.
-    pub fn into_spawnable<S: hyprstream_rpc::service::ZmqService + Send + Sync + 'static>(
+    pub fn into_spawnable<S: hyprstream_rpc::service::RequestService + Send + Sync + 'static>(
         &self,
         service: S,
     ) -> Box<dyn Spawnable> {

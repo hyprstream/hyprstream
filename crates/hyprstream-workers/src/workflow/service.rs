@@ -1,4 +1,4 @@
-//! WorkflowService - ZmqService implementation for workflow orchestration
+//! WorkflowService - RequestService implementation for workflow orchestration
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use anyhow::Result as AnyhowResult;
 use async_trait::async_trait;
 use hyprstream_rpc::prelude::SigningKey;
-use hyprstream_rpc::service::{AuthorizeFn, EnvelopeContext, ZmqService};
+use hyprstream_rpc::service::{AuthorizeFn, EnvelopeContext, RequestService};
 use hyprstream_rpc::transport::TransportConfig;
 
 use hyprstream_vfs::Namespace;
@@ -99,7 +99,7 @@ pub struct WorkflowService {
     /// Background event loop handle
     event_loop_handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
 
-    // Infrastructure (for ZmqService / Spawnable)
+    // Infrastructure (for RequestService / Spawnable)
     /// Transport configuration
     transport: TransportConfig,
     /// Signing key for message authentication
@@ -613,11 +613,11 @@ impl WorkflowHandler for WorkflowService {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ZmqService Implementation — delegates to generated dispatch_workflow
+// RequestService Implementation — delegates to generated dispatch_workflow
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[async_trait(?Send)]
-impl ZmqService for WorkflowService {
+impl RequestService for WorkflowService {
     async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> AnyhowResult<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
         tracing::debug!(
             "Workflow request from {} (request_id={})",

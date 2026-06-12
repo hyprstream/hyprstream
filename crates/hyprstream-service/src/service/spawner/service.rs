@@ -1,6 +1,6 @@
-//! Unified service spawner for ZmqService hosting.
+//! Unified service spawner for RequestService hosting.
 //!
-//! Provides a single API for spawning ZmqService implementations with different
+//! Provides a single API for spawning RequestService implementations with different
 //! execution modes (Tokio task, dedicated thread, or subprocess).
 
 use std::path::PathBuf;
@@ -12,7 +12,7 @@ use tokio::sync::Notify;
 use super::{ProcessConfig, ProcessSpawner, SpawnedProcess};
 use hyprstream_rpc::error::Result;
 use hyprstream_rpc::registry::{ServiceRegistration, SocketKind};
-use hyprstream_rpc::service::ZmqService;
+use hyprstream_rpc::service::RequestService;
 use hyprstream_rpc::transport::TransportConfig;
 
 // Import anyhow! macro for error creation in ServiceManager impl
@@ -322,36 +322,36 @@ impl Spawnable for LoadBalancerService {
 // QuicServiceLoop — Spawnable wrapper for QUIC-only service loop
 // ============================================================================
 
-/// Spawnable wrapper that runs a ZmqService with explicit QUIC configuration.
+/// Spawnable wrapper that runs a RequestService with explicit QUIC configuration.
 ///
 /// This is used when a service factory wants to pass a `QuicLoopConfig` to
 /// `RequestLoop::with_quic()` without relying on the blanket `Spawnable` impl.
 ///
-/// The blanket `impl Spawnable for S: ZmqService` creates a plain `RequestLoop`;
+/// The blanket `impl Spawnable for S: RequestService` creates a plain `RequestLoop`;
 /// this wrapper additionally enables QUIC when `quic_config` is `Some`.
-pub struct UnifiedServiceConfig<S: ZmqService + Send + 'static> {
+pub struct UnifiedServiceConfig<S: RequestService + Send + 'static> {
     service: S,
     quic_config: Option<hyprstream_rpc::service::QuicLoopConfig>,
 }
 
-impl<S: ZmqService + Send + 'static> UnifiedServiceConfig<S> {
+impl<S: RequestService + Send + 'static> UnifiedServiceConfig<S> {
     /// Create a unified service config with optional QUIC.
     pub fn new(service: S, quic_config: Option<hyprstream_rpc::service::QuicLoopConfig>) -> Self {
         Self { service, quic_config }
     }
 }
 
-impl<S: ZmqService + Send + Sync + 'static> Spawnable for UnifiedServiceConfig<S> {
+impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConfig<S> {
     fn name(&self) -> &str {
-        ZmqService::name(&self.service)
+        RequestService::name(&self.service)
     }
 
     fn context(&self) -> &Arc<zmq::Context> {
-        ZmqService::context(&self.service)
+        RequestService::context(&self.service)
     }
 
     fn registrations(&self) -> Vec<(SocketKind, TransportConfig)> {
-        vec![(SocketKind::Rep, ZmqService::transport(&self.service).clone())]
+        vec![(SocketKind::Rep, RequestService::transport(&self.service).clone())]
     }
 
     fn run(
@@ -360,9 +360,9 @@ impl<S: ZmqService + Send + Sync + 'static> Spawnable for UnifiedServiceConfig<S
         on_ready: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<()> {
         let UnifiedServiceConfig { service, quic_config } = *self;
-        let transport = ZmqService::transport(&service).clone();
-        let context = Arc::clone(ZmqService::context(&service));
-        let signing_key = ZmqService::signing_key(&service);
+        let transport = RequestService::transport(&service).clone();
+        let context = Arc::clone(RequestService::context(&service));
+        let signing_key = RequestService::signing_key(&service);
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -423,8 +423,8 @@ pub enum ServiceMode {
 /// use hyprstream_rpc::service::spawner::{ServiceSpawner, ProxyService};
 /// use hyprstream_rpc::transport::TransportConfig;
 ///
-/// // Spawn a REQ/REP service (ZmqService implementations are directly Spawnable)
-/// let service = MyZmqService::new(ctx, transport, verifying_key);
+/// // Spawn a REQ/REP service (RequestService implementations are directly Spawnable)
+/// let service = MyRequestService::new(ctx, transport, verifying_key);
 /// let spawner = ServiceSpawner::tokio();
 /// let spawned = spawner.spawn(service).await?;
 ///
@@ -487,7 +487,7 @@ impl ServiceSpawner {
     /// Spawn any Spawnable service with registry integration.
     ///
     /// This is the unified spawning API that works with both:
-    /// - Any `S: ZmqService` - REQ/REP services (directly Spawnable via blanket impl)
+    /// - Any `S: RequestService` - REQ/REP services (directly Spawnable via blanket impl)
     /// - `ProxyService` - XSUB/XPUB proxies
     ///
     /// The service is automatically registered with the EndpointRegistry and
@@ -496,8 +496,8 @@ impl ServiceSpawner {
     /// # Example
     ///
     /// ```ignore
-    /// // Spawn a REQ/REP service (ZmqService implementations are directly Spawnable)
-    /// let service = MyZmqService::new(ctx, transport, verifying_key);
+    /// // Spawn a REQ/REP service (RequestService implementations are directly Spawnable)
+    /// let service = MyRequestService::new(ctx, transport, verifying_key);
     /// let spawned = spawner.spawn(service).await?;
     ///
     /// // Spawn a proxy
@@ -1007,7 +1007,7 @@ mod tests {
     use super::*;
     use hyprstream_rpc::crypto::generate_signing_keypair;
     use hyprstream_rpc::prelude::SigningKey;
-    use hyprstream_rpc::service::ZmqService;
+    use hyprstream_rpc::service::RequestService;
     use anyhow::Result as AnyhowResult;
 
     /// Test service that includes infrastructure (new pattern)
@@ -1024,7 +1024,7 @@ mod tests {
     }
 
     #[async_trait::async_trait(?Send)]
-    impl ZmqService for EchoService {
+    impl RequestService for EchoService {
         async fn handle_request(
             &self,
             _ctx: &hyprstream_rpc::service::EnvelopeContext,

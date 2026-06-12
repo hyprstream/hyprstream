@@ -384,7 +384,7 @@ impl QuicRep {
         Ok(())
     }
 
-    /// Accept loop for ZmqService handlers.
+    /// Accept loop for RequestService handlers.
     ///
     /// This variant handles the full envelope processing pipeline:
     /// 1. ZMTP handshake
@@ -392,11 +392,11 @@ impl QuicRep {
     /// 3. Service handle_request dispatch
     /// 4. Signed response serialization
     ///
-    /// Uses `spawn_local` because `ZmqService` is `?Send`.
+    /// Uses `spawn_local` because `RequestService` is `?Send`.
     ///
     /// # Arguments
     ///
-    /// * `service` - ZmqService implementation (wrapped in Rc)
+    /// * `service` - RequestService implementation (wrapped in Rc)
     /// * `server_pubkey` - Server's Ed25519 verifying key
     /// * `signing_key` - Server's Ed25519 signing key
     /// * `nonce_cache` - Nonce cache for replay protection (wrapped in Arc)
@@ -410,7 +410,7 @@ impl QuicRep {
         shutdown: Arc<Notify>,
     ) -> Result<()>
     where
-        S: crate::service::ZmqService + 'static,
+        S: crate::service::RequestService + 'static,
     {
         loop {
             tokio::select! {
@@ -419,7 +419,7 @@ impl QuicRep {
                     let nonce_cache = Arc::clone(&nonce_cache);
                     let signing_key = signing_key.clone();  // Clone before spawn
 
-                    // Use spawn_local because ZmqService is ?Send
+                    // Use spawn_local because RequestService is ?Send
                     tokio::task::spawn_local(async move {
                         match incoming.await {
                             Ok(conn) => {
@@ -459,7 +459,7 @@ impl QuicRep {
         nonce_cache: Arc<crate::envelope::InMemoryNonceCache>,
     ) -> Result<()>
     where
-        S: crate::service::ZmqService + 'static,
+        S: crate::service::RequestService + 'static,
     {
         let remote = conn.remote_address();
         debug!(?remote, "QUIC connection established");
@@ -508,7 +508,7 @@ impl QuicRep {
         nonce_cache: Arc<crate::envelope::InMemoryNonceCache>,
     ) -> Result<()>
     where
-        S: crate::service::ZmqService + 'static,
+        S: crate::service::RequestService + 'static,
     {
         let mut stream = ZmtpStream::new(QuicStream { send, recv });
 
@@ -1229,14 +1229,14 @@ impl<S: AsyncWrite + Unpin, R: Unpin> AsyncWrite for WtStream<S, R> {
 // QuicServiceLoop - QUIC Transport Service Loop
 // ============================================================================
 
-/// Service loop for hosting ZmqService over QUIC transport.
+/// Service loop for hosting RequestService over QUIC transport.
 ///
-/// This struct wraps a `QuicRep` socket and a `ZmqService` implementation,
+/// This struct wraps a `QuicRep` socket and a `RequestService` implementation,
 /// running the QUIC accept loop in a dedicated thread with its own tokio runtime.
 ///
 /// # Threading Model
 ///
-/// `ZmqService` is `#[async_trait(?Send)]` - handlers are not `Send`. This requires:
+/// `RequestService` is `#[async_trait(?Send)]` - handlers are not `Send`. This requires:
 /// - Single-threaded runtime (`new_current_thread`)
 /// - `LocalSet` for non-Send futures
 /// - `spawn_local` instead of `tokio::spawn`
@@ -1260,7 +1260,7 @@ impl<S: AsyncWrite + Unpin, R: Unpin> AsyncWrite for WtStream<S, R> {
 /// ```
 pub struct QuicServiceLoop<S>
 where
-    S: crate::service::ZmqService + Send + Sync + 'static,
+    S: crate::service::RequestService + Send + Sync + 'static,
 {
     rep: QuicRep,
     service: S,
@@ -1276,7 +1276,7 @@ where
 
 impl<S> QuicServiceLoop<S>
 where
-    S: crate::service::ZmqService + Send + Sync + 'static,
+    S: crate::service::RequestService + Send + Sync + 'static,
 {
     /// Create a new QUIC service loop.
     pub fn new(rep: QuicRep, service: S, cert_der: Vec<u8>) -> Result<Self> {
@@ -1300,7 +1300,7 @@ where
 
 impl<S> crate::service::Spawnable for QuicServiceLoop<S>
 where
-    S: crate::service::ZmqService + Send + Sync + 'static,
+    S: crate::service::RequestService + Send + Sync + 'static,
 {
     fn name(&self) -> &str {
         &self.name
@@ -1358,7 +1358,7 @@ where
 /// WebTransport server for browser clients.
 ///
 /// Accepts WebTransport sessions (HTTP/3) from browsers and handles
-/// ZMTP requests using the same ZmqService handlers as native QUIC.
+/// ZMTP requests using the same RequestService handlers as native QUIC.
 ///
 /// # Browser Compatibility
 ///
@@ -1441,7 +1441,7 @@ impl WebTransportServer {
 
     /// Accept connections and dispatch HTTP/3 + WebTransport.
     ///
-    /// Uses `spawn_local` because `ZmqService` is `?Send`.
+    /// Uses `spawn_local` because `RequestService` is `?Send`.
     pub async fn accept_loop_service<S>(
         self,
         service: Rc<S>,
@@ -1451,7 +1451,7 @@ impl WebTransportServer {
         shutdown: Arc<Notify>,
     ) -> Result<()>
     where
-        S: crate::service::ZmqService + 'static,
+        S: crate::service::RequestService + 'static,
     {
         let metadata_json = self.protected_resource_json.map(Arc::new);
         let cert_hash_hex = Arc::new(cert_hash_hex(&self.cert_der));
@@ -1498,7 +1498,7 @@ impl WebTransportServer {
         cert_hash_hex: Arc<String>,
     ) -> Result<()>
     where
-        S: crate::service::ZmqService + 'static,
+        S: crate::service::RequestService + 'static,
     {
         let quinn_conn = incoming.await?;
         let h3_conn = h3_quinn::Connection::new(quinn_conn);
@@ -1599,7 +1599,7 @@ impl WebTransportServer {
         metadata_json: Option<Arc<Vec<u8>>>,
     ) -> Result<()>
     where
-        S: crate::service::ZmqService + 'static,
+        S: crate::service::RequestService + 'static,
     {
         debug!("WebTransport session established");
         loop {
@@ -1653,7 +1653,7 @@ impl WebTransportServer {
         nonce_cache: Arc<crate::envelope::InMemoryNonceCache>,
     ) -> Result<()>
     where
-        S: crate::service::ZmqService + 'static,
+        S: crate::service::RequestService + 'static,
     {
         use h3::quic::BidiStream as H3BidiStream;
         let (send, recv) = H3BidiStream::split(stream);
@@ -1984,7 +1984,7 @@ pub use crate::envelope::EnvelopeVerification;
 /// # Arguments
 ///
 /// * `raw_bytes` - Raw Cap'n Proto bytes containing a `SignedEnvelope`
-/// * `service` - The ZmqService to dispatch to
+/// * `service` - The RequestService to dispatch to
 /// * `verification` - Envelope signer verification mode
 /// * `signing_key` - Server's signing key for response
 /// * `nonce_cache` - Nonce cache for replay protection
@@ -2001,7 +2001,7 @@ pub async fn process_request<S>(
     nonce_cache: &crate::envelope::InMemoryNonceCache,
 ) -> Result<(Vec<u8>, Option<crate::service::Continuation>)>
 where
-    S: crate::service::ZmqService,
+    S: crate::service::RequestService,
 {
     use crate::ToCapnp;
     use crate::envelope::ResponseEnvelope;
