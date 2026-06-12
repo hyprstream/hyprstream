@@ -1264,8 +1264,9 @@ where
 {
     rep: QuicRep,
     service: S,
-    /// Server certificate DER bytes (for registration)
-    _cert_der: Vec<u8>,
+    /// Server leaf certificate DER bytes — used to pin the registered QUIC
+    /// endpoint (self-signed, so clients pin the SHA-256 rather than CA-validate).
+    cert_der: Vec<u8>,
     /// ZMQ context (for Spawnable trait)
     context: Arc<zmq::Context>,
     /// Service name
@@ -1285,7 +1286,7 @@ where
         Ok(Self {
             rep,
             service,
-            _cert_der: cert_der,
+            cert_der,
             context: Arc::new(zmq::Context::new()),
             name,
             addr,
@@ -1311,10 +1312,13 @@ where
     }
 
     fn registrations(&self) -> Vec<(crate::registry::SocketKind, crate::transport::TransportConfig)> {
-        // Register QUIC endpoint
+        // Register the QUIC endpoint *pinned* by the self-signed leaf cert's
+        // SHA-256 — a plain (WebPki) registration would make clients CA-validate
+        // a self-signed cert and fail.
+        let pin = cert_sha256(&self.cert_der);
         vec![(
             crate::registry::SocketKind::Rep,
-            crate::transport::TransportConfig::quic(self.addr, "hyprstream.local"),
+            crate::transport::TransportConfig::quic_pinned(self.addr, "hyprstream.local", pin),
         )]
     }
 
@@ -1856,6 +1860,17 @@ pub fn cert_hash(cert_der: &[u8]) -> String {
     use sha2::{Sha256, Digest};
     let hash = Sha256::digest(cert_der);
     base64::engine::general_purpose::STANDARD.encode(hash)
+}
+
+/// SHA-256 fingerprint of a certificate as raw bytes — the pin carried in
+/// `QuicServerAuth::Pinned` and matched by `connect_pinned_sha256`. A
+/// self-signed QUIC server registers `TransportConfig::quic_pinned(addr, name,
+/// cert_sha256(leaf_cert))` so clients can pin it.
+pub fn cert_sha256(cert_der: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&Sha256::digest(cert_der));
+    out
 }
 
 /// Compute SHA-256 hash of certificate as hex string.
