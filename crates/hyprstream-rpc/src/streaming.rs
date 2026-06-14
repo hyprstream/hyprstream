@@ -292,6 +292,11 @@ pub struct StreamBuilder {
     hmac_state: StreamHmacState,
     pending: Vec<StreamPayloadData>,
     pending_bytes: usize,
+    /// Producer-assigned monotonic counter per epoch (#219). Named `sequenceNumber`
+    /// per IETF convention (DTLS RFC 9147, RTP RFC 3550). Incremented once per
+    /// emitted block; stamped into the block (MAC-covered) for resume/dedup/anti-replay.
+    /// Epoch is 0 until the #223 epoch lifecycle lands.
+    sequence_number: u64,
 }
 
 impl StreamBuilder {
@@ -302,6 +307,7 @@ impl StreamBuilder {
             hmac_state: StreamHmacState::new(mac_key, topic),
             pending: Vec::new(),
             pending_bytes: 0,
+            sequence_number: 0,
         }
     }
 
@@ -399,7 +405,10 @@ impl StreamBuilder {
 
         // Build StreamBlock capnp message (shared encoder; also used by the
         // moq plane in `moq_stream.rs`).
-        let capnp_bytes = encode_stream_block(self.hmac_state.prev_mac_bytes(), &payloads)?;
+        let sequence_number = self.sequence_number;
+        self.sequence_number += 1;
+        // epoch is 0 until the #223 key-epoch lifecycle lands.
+        let capnp_bytes = encode_stream_block(self.hmac_state.prev_mac_bytes(), sequence_number, 0, &payloads)?;
 
         let mac = self.hmac_state.compute_next(&capnp_bytes);
 
@@ -1947,12 +1956,18 @@ pub fn spawn_streaming_response(service_name: &str, continuation: crate::service
 /// chained-HMAC tokenstream.
 pub fn encode_stream_block(
     prev_mac: &[u8],
+    sequence_number: u64,
+    epoch: u64,
     payloads: &[StreamPayloadData],
 ) -> Result<Vec<u8>> {
     let mut msg = Builder::new_default();
     {
         let mut block = msg.init_root::<streaming_capnp::stream_block::Builder>();
         block.set_prev_mac(prev_mac);
+        // Producer-assigned counter (#219); MAC-covered implicitly (whole block is signed).
+        // epoch is 0 until the #223 key-epoch lifecycle lands.
+        block.set_sequence_number(sequence_number);
+        block.set_epoch(epoch);
 
         // Cap'n Proto uses u32 for list lengths
         let payloads_len = u32::try_from(payloads.len()).unwrap_or(u32::MAX);
@@ -2180,5 +2195,25 @@ mod tests {
 
         // Chain state should advance to mac2
         assert_eq!(state.prev_mac_bytes(), &mac2[..]);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn stream_block_carries_sequence_number_and_epoch() {
+        // #219: the producer stamps sequenceNumber/epoch into the StreamBlock; since the
+        // MAC covers the whole serialized block, they're authenticated implicitly. Confirm
+        // the wire round-trips them (consumer enforcement is policy-selected, #163).
+        let payloads = vec![StreamPayloadData::Data(b"hello".to_vec())];
+        let bytes = encode_stream_block(&[0u8; 16], 42, 7, &payloads).unwrap();
+        let reader = capnp::serialize::read_message(
+            &mut std::io::Cursor::new(&bytes),
+            capnp::message::ReaderOptions::default(),
+        )
+        .unwrap();
+        let block = reader
+            .get_root::<crate::streaming_capnp::stream_block::Reader>()
+            .unwrap();
+        assert_eq!(block.get_sequence_number(), 42);
+        assert_eq!(block.get_epoch(), 7);
     }
 }

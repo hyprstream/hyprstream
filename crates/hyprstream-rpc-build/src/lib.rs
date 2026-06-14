@@ -13,25 +13,6 @@ pub mod backend;
 pub mod schema;
 pub mod util;
 
-// Generated `StreamContract` (#213/#216) types, used to decode the struct-valued
-// `$streamPolicy` annotation value (see `build.rs`). Crate-private; the generated
-// `streaming_capnp` references its import as `crate::annotations_capnp`, so both modules
-// live at the crate root.
-mod annotations_capnp {
-    #![allow(dead_code, unused_imports)]
-    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
-    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-    include!(concat!(env!("OUT_DIR"), "/annotations_capnp.rs"));
-}
-mod streaming_capnp {
-    #![allow(dead_code, unused_imports)]
-    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
-    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-    include!(concat!(env!("OUT_DIR"), "/streaming_capnp.rs"));
-}
-
 use std::path::Path;
 
 /// Compile Cap'n Proto schemas with CGR + metadata extraction.
@@ -209,23 +190,7 @@ fn extract_annotations(
         let name = annotation_names.get(&ann_id).cloned().unwrap_or_default();
 
         if let Ok(value) = ann.get_value() {
-            // Struct-valued annotations need the generated typed reader (#216) — capnp has
-            // no CGR-runtime dynamic decode. `$streamPolicy` (:StreamContract) is the one
-            // such annotation; decode it structurally. Any other struct annotation, or a
-            // decode failure, falls through to presence-only so we never silently corrupt.
-            let val = if name == "streamPolicy" {
-                match value.which() {
-                    Ok(capnp::schema_capnp::value::Struct(ptr)) => match extract_stream_contract(ptr) {
-                        Ok(v) => Some(v),
-                        // Fail-closed: an invalid/contradictory $streamPolicy aborts the build
-                        // rather than silently degrading (#213).
-                        Err(e) => panic!("invalid $streamPolicy annotation: {e}"),
-                    },
-                    _ => extract_value_json(value),
-                }
-            } else {
-                extract_value_json(value)
-            };
+            let val = extract_value_json(value);
             match val {
                 Some(v) => result.push(serde_json::json!({
                     "id": ann_id,
@@ -261,134 +226,6 @@ fn extract_value_json(value: capnp::schema_capnp::value::Reader) -> Option<serde
         value::Uint32(n) => Some(serde_json::Value::Number(n.into())),
         value::Enum(ordinal) => Some(serde_json::json!({"enum_ordinal": ordinal})),
         _ => None,
-    }
-}
-
-/// Decode a `$streamPolicy` annotation value (a `StreamContract`, #213/#216) into
-/// structured JSON for the codegen backends. Uses the generated typed reader — capnp-rust
-/// cannot build a `StructSchema` from a raw CGR, so generic dynamic decode isn't possible
-/// (see `build.rs`). Each axis is a union; group variants carry their own params.
-fn extract_stream_contract(
-    ptr: capnp::any_pointer::Reader,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    use crate::streaming_capnp::{backpressure, completion, delivery, ordering, retention, stream_contract};
-
-    let c: stream_contract::Reader = ptr.get_as()?;
-
-    // Fail-closed validation (#213): reject contradictory axis combinations at build time.
-    // A returned Err is treated as fatal by the caller (the build aborts) — an invalid
-    // policy must never silently pass through to codegen.
-    let lossy = matches!(c.get_backpressure()?.which()?, backpressure::DropOldest(_));
-    let reliable = matches!(c.get_delivery()?.which()?, delivery::AtLeastOnce(_));
-    if lossy && reliable {
-        return Err("streamPolicy: backpressure=dropOldest contradicts delivery=atLeastOnce \
-                    (a stream cannot be lossless and also drop under load)"
-            .into());
-    }
-    let terminal = matches!(c.get_completion()?.which()?, completion::Terminal(()));
-    let at_most_once = matches!(c.get_delivery()?.which()?, delivery::AtMostOnce(()));
-    if terminal && at_most_once {
-        return Err("streamPolicy: completion=terminal contradicts delivery=atMostOnce \
-                    (truncation detection requires reliable delivery)"
-            .into());
-    }
-
-    let ordering = match c.get_ordering()?.which()? {
-        ordering::Ordered(()) => serde_json::json!({ "ordered": true }),
-        ordering::Unordered(u) => serde_json::json!({
-            "unordered": { "replayWindow": u.get_replay_window() }
-        }),
-    };
-    let delivery = match c.get_delivery()?.which()? {
-        delivery::AtMostOnce(()) => serde_json::json!({ "atMostOnce": true }),
-        delivery::AtLeastOnce(a) => serde_json::json!({
-            "atLeastOnce": { "dedupWindow": a.get_dedup_window(), "resumable": a.get_resumable() }
-        }),
-    };
-    let completion = match c.get_completion()?.which()? {
-        completion::Terminal(()) => "terminal",
-        completion::None(()) => "none",
-    };
-    let retention = match c.get_retention()?.which()? {
-        retention::LiveOnly(()) => serde_json::json!({ "liveOnly": true }),
-        retention::Groups(n) => serde_json::json!({ "groups": n }),
-        retention::Seconds(n) => serde_json::json!({ "seconds": n }),
-    };
-    let backpressure = match c.get_backpressure()?.which()? {
-        backpressure::Block(()) => serde_json::json!({ "block": true }),
-        backpressure::DropOldest(d) => serde_json::json!({
-            "dropOldest": { "highWater": d.get_high_water() }
-        }),
-    };
-
-    Ok(serde_json::json!({
-        "ordering": ordering,
-        "delivery": delivery,
-        "completion": completion,
-        "retention": retention,
-        "backpressure": backpressure,
-    }))
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::items_after_test_module)]
-mod stream_contract_tests {
-    use super::extract_stream_contract;
-    use crate::streaming_capnp::stream_contract;
-
-    /// Round-trips a `StreamContract` (ordered / atLeastOnce{256,true} / none / groups=256
-    /// / block) through the typed decoder and asserts the JSON the codegen will consume —
-    /// covering void variants, a group with params, and the scalar-bearing retention variant.
-    #[test]
-    fn stream_contract_decodes_to_json() {
-        let mut msg = capnp::message::Builder::new_default();
-        {
-            let mut c = msg.init_root::<stream_contract::Builder>();
-            c.reborrow().init_ordering().set_ordered(());
-            {
-                let mut a = c.reborrow().init_delivery().init_at_least_once();
-                a.set_dedup_window(256);
-                a.set_resumable(true);
-            }
-            c.reborrow().init_completion().set_none(());
-            c.reborrow().init_retention().set_groups(256);
-            c.reborrow().init_backpressure().set_block(());
-        }
-        let root = msg
-            .get_root_as_reader::<capnp::any_pointer::Reader>()
-            .unwrap();
-        let json = extract_stream_contract(root).unwrap();
-
-        assert_eq!(json["ordering"]["ordered"], serde_json::json!(true));
-        assert_eq!(json["delivery"]["atLeastOnce"]["dedupWindow"], serde_json::json!(256));
-        assert_eq!(json["delivery"]["atLeastOnce"]["resumable"], serde_json::json!(true));
-        assert_eq!(json["completion"], serde_json::json!("none"));
-        assert_eq!(json["retention"]["groups"], serde_json::json!(256));
-        assert_eq!(json["backpressure"]["block"], serde_json::json!(true));
-    }
-
-    /// A contradictory policy (atLeastOnce + dropOldest = lossless yet drops) must be
-    /// rejected by the fail-closed validation, not silently decoded.
-    #[test]
-    fn contradictory_policy_is_rejected() {
-        let mut msg = capnp::message::Builder::new_default();
-        {
-            let mut c = msg.init_root::<stream_contract::Builder>();
-            c.reborrow().init_ordering().set_ordered(());
-            {
-                let mut a = c.reborrow().init_delivery().init_at_least_once();
-                a.set_dedup_window(64);
-                a.set_resumable(true);
-            }
-            c.reborrow().init_completion().set_none(());
-            c.reborrow().init_retention().set_groups(64);
-            c.reborrow().init_backpressure().init_drop_oldest().set_high_water(1024);
-        }
-        let root = msg
-            .get_root_as_reader::<capnp::any_pointer::Reader>()
-            .unwrap();
-        let err = extract_stream_contract(root).unwrap_err().to_string();
-        assert!(err.contains("dropOldest") && err.contains("atLeastOnce"), "got: {err}");
     }
 }
 

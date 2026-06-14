@@ -273,8 +273,15 @@ impl MoqStreamPublisher {
     /// Serialize payloads into a StreamBlock, chain the MAC, and append as a
     /// moq Group (one Frame = `capnp || mac`).
     fn write_block(&mut self, payloads: &[StreamPayloadData]) -> Result<()> {
+        // The StreamBlock sequenceNumber (#219) IS the moq Group id — unified so the
+        // in-block sequenceNumber the consumer authenticates matches the transport Group.
+        // epoch is 0 until the #223 key-epoch lifecycle lands.
+        let sequence_number = self.next_group;
+        self.next_group += 1;
         let capnp_bytes = crate::streaming::encode_stream_block(
             self.hmac_state.prev_mac_bytes(),
+            sequence_number,
+            0,
             payloads,
         )?;
         let mac = self.hmac_state.compute_next(&capnp_bytes);
@@ -283,9 +290,7 @@ impl MoqStreamPublisher {
         frame.extend_from_slice(&capnp_bytes);
         frame.extend_from_slice(&mac);
 
-        let seq = self.next_group;
-        self.next_group += 1;
-        let mut group = self.track.create_group(Group::from(seq))?;
+        let mut group = self.track.create_group(Group::from(sequence_number))?;
         group.write_frame(Bytes::from(frame))?;
         group.finish()?;
         Ok(())

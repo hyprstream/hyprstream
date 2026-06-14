@@ -184,6 +184,17 @@ struct StreamRegister {
 struct StreamBlock {
   prevMac @0 :Data;              # topic[..16] for block 0, mac_{n-1} for block N
   payloads @1 :List(StreamPayload);
+  # Producer-assigned monotonic counter per epoch (#219). On the moq transport
+  # this equals the moq Group id; it is the resume/dedup offset and the
+  # anti-replay/ordering anchor. Authenticated implicitly — the MAC covers the
+  # whole serialized StreamBlock. Consumer ordering/replay enforcement (gap-fatal
+  # vs media per-Group) is policy-selected via StreamPolicy (#163).
+  # Named `sequenceNumber` per IETF convention (DTLS RFC 9147, RTP RFC 3550).
+  sequenceNumber @2 :UInt64;
+  # Key-epoch (#223): analogous to DTLS 1.3 epoch (RFC 9147 §4.2.3). Bumps on
+  # re-key / producer restart so (epoch, sequenceNumber) is globally unique.
+  # 0 until the epoch lifecycle lands; ordinal reserved so that change is wire-safe.
+  epoch @3 :UInt64;
 }
 
 # =============================================================================
