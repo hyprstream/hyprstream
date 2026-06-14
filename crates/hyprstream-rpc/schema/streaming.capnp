@@ -19,6 +19,91 @@ using import "annotations.capnp".fixedSize;
 #   - Client: Verifies HMAC chain end-to-end
 
 # =============================================================================
+# Stream QoS policy (#213) — schema-declared delivery/integrity contract.
+#
+# Applied to a streaming method's StreamInfo response variant; codegen (#216/#217/
+# #218) realizes a *matched* producer + consumer from it, so the two ends can never
+# silently disagree on QoS or integrity mode. This defines the *vocabulary* only;
+# resolver + codegen land in #216+. Policy *values* are declared per-application —
+# inline at the call site, or an app-local `const :StreamContract` — never standardized
+# here until real call sites prove a grouping is generic.
+#
+# Each axis is a union-of-(void|group) so a strategy carries its own parameters.
+#
+# **`@0`-is-safe discipline:** capnp zero-fills an absent field, so the `@0` variant of
+# each *security-bearing* axis is the strict/fail-closed choice (ordering=ordered → gap
+# fatal; completion=terminal → require terminal). QoS axes (delivery/retention/
+# backpressure) take the most-conservative-surface `@0` (atMostOnce / liveOnly / block).
+# Codegen additionally *requires* every axis to be set for a compile-time policy, so this
+# ordering is load-bearing only for externally-sourced / advertised policy.
+# =============================================================================
+
+# Ordering + (media) replay-window. ordered = strict (gap fatal, chained MAC).
+struct Ordering {
+  union {
+    ordered @0 :Void;
+    unordered :group {
+      replayWindow @1 :UInt32;   # media: reject group seq <= (last-seen - window)
+    }
+  }
+}
+
+# Delivery guarantee. atLeastOnce carries dedup + resume params.
+struct Delivery {
+  union {
+    atMostOnce @0 :Void;
+    atLeastOnce :group {
+      dedupWindow @1 :UInt32;    # # of recent group seqs remembered for client dedup
+      resumable   @2 :Bool;      # offset-resume from last-acked seq across reconnect
+    }
+  }
+}
+
+# Truncation policy — its OWN axis (terminal frames are opt-in; inference uses none).
+# terminal = require a Complete/Error payload before EOF (EOF-without-terminal = reject).
+struct Completion {
+  union {
+    terminal @0 :Void;
+    none     @1 :Void;
+  }
+}
+
+# Relay-side retention window (late-join / resume). liveOnly = smallest surface (#174).
+struct Retention {
+  union {
+    liveOnly @0 :Void;
+    groups   @1 :UInt32;
+    seconds  @2 :UInt32;
+  }
+}
+
+# Backpressure when the publish path saturates. block = lossless (EAGAIN contract).
+struct Backpressure {
+  union {
+    block @0 :Void;
+    dropOldest :group {
+      highWater @1 :UInt32;
+    }
+  }
+}
+
+# The full per-stream delivery contract. Composed of the axes above; one per stream.
+struct StreamContract {
+  ordering     @0 :Ordering;
+  delivery     @1 :Delivery;
+  completion   @2 :Completion;
+  retention    @3 :Retention;
+  backpressure @4 :Backpressure;
+}
+
+# Apply to a streaming method's StreamInfo response variant:
+#   streamInfo @0 :StreamInfo $streamPolicy(.tokenStream);   # app-local const, or inline a literal
+# Naming: annotation `streamPolicy` (noun-form, like `mcpScope`/`fixedSize`), value type
+# `StreamContract` — a distinct identifier per the `mcpScope :ScopeAction` precedent (which
+# capnpc-rust requires: a struct and annotation that snake_case to the same module collide).
+annotation streamPolicy(field) :StreamContract;
+
+# =============================================================================
 # Stream Setup
 # =============================================================================
 
