@@ -1296,6 +1296,7 @@ impl InferenceService {
             stream_id,
             endpoint: stream_sub_endpoint,
             server_pubkey,
+            ..Default::default()
         };
 
         Ok((stream_info, stream_ctx))
@@ -2143,6 +2144,7 @@ impl InferenceHandler for InferenceService {
             stream_id,
             endpoint: stream_sub_endpoint,
             server_pubkey,
+            ..Default::default()
         };
 
         // Build continuation that executes the stream after REP is sent.
@@ -2348,6 +2350,7 @@ impl InferenceHandler for InferenceService {
             stream_id,
             endpoint: stream_sub_endpoint,
             server_pubkey,
+            ..Default::default()
         };
 
         let adaptation_strategy = map_adaptation_strategy(data.adaptation_strategy, data.writeback_threshold);

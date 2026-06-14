@@ -19,89 +19,122 @@ using import "annotations.capnp".fixedSize;
 #   - Client: Verifies HMAC chain end-to-end
 
 # =============================================================================
-# Stream QoS policy (#213) — schema-declared delivery/integrity contract.
+# Stream Policy (#213) — service-declared delivery/integrity contract.
 #
-# Applied to a streaming method's StreamInfo response variant; codegen (#216/#217/
-# #218) realizes a *matched* producer + consumer from it, so the two ends can never
-# silently disagree on QoS or integrity mode. This defines the *vocabulary* only;
-# resolver + codegen land in #216+. Policy *values* are declared per-application —
-# inline at the call site, or an app-local `const :StreamContract` — never standardized
-# here until real call sites prove a grouping is generic.
+# Returned in the signed StreamInfo handshake response so the policy is:
+#   1. Authenticated: covered by the Ed25519 SignedEnvelope over StreamInfo
+#   2. Wire-visible: encoded in the Cap'n Proto StreamInfo message body
+#   3. Cross-language: capnp codegens native readers for Rust/TS/Python (#217/#218)
+#   4. IETF-friendly: a struct in the handshake response, not a schema annotation
 #
-# Each axis is a union-of-(void|group) so a strategy carries its own parameters.
+# The service asserts the policy it will enforce; clients MUST enforce the same
+# policy on ingress. A client that cannot honour the received policy (e.g.,
+# unordered delivery not yet implemented) MUST disconnect rather than silently
+# downgrade. See `StreamVerifier::with_policy`.
 #
-# **`@0`-is-safe discipline:** capnp zero-fills an absent field, so the `@0` variant of
-# each *security-bearing* axis is the strict/fail-closed choice (ordering=ordered → gap
-# fatal; completion=terminal → require terminal). QoS axes (delivery/retention/
-# backpressure) take the most-conservative-surface `@0` (atMostOnce / liveOnly / block).
-# Codegen additionally *requires* every axis to be set for a compile-time policy, so this
-# ordering is load-bearing only for externally-sourced / advertised policy.
+# Policy *values* are per-application (inline literals or app-local `const
+# :StreamPolicy`). No preset named policies live here until real call sites
+# prove a grouping is generic enough for the common vocabulary.
+#
+# **`@0`-is-safe discipline:** capnp zero-fills an absent/unrecognized union
+# discriminant. The `@0` variant of every *security-bearing* axis is the
+# strictest/fail-closed choice:
+#   Ordering:      ordered   (gap = fatal)
+#   Completion:    endOfStream (terminal frame required)
+# QoS axes take the most-conservative-surface default:
+#   Delivery:      atMostOnce
+#   Retention:     live
+#   OverflowPolicy: block
+# Codegen MUST require every axis to be set for compile-time policies; this
+# discipline is load-bearing only for externally-sourced (advertised) policy.
+#
+# Out of scope for StreamPolicy:
+#   - exactlyOnce delivery (MQTT QoS 2): incompatible with low-latency streaming
+#   - causal / total ordering: use ordered + external coordination
+#   - transport encryption: provided by QUIC (RFC 9001) + application HPKE
+#   - message compression: Cap'n Proto packing or negotiated separately
+#   - subscriber fan-out scope: defined by MoQ namespace/track model
 # =============================================================================
 
-# Ordering + (media) replay-window. ordered = strict (gap fatal, chained MAC).
+# Ordering + anti-replay window.
+# ordered = strict in-order delivery; gap detection is fatal (DTLS anti-replay,
+# RFC 9147 §4.2.3). Fail-closed default (@0).
 struct Ordering {
   union {
     ordered @0 :Void;
     unordered :group {
-      replayWindow @1 :UInt32;   # media: reject group seq <= (last-seen - window)
+      # Anti-replay window for out-of-order / media delivery.
+      # Reject block with sequenceNumber <= (highest-seen - antiReplayWindow).
+      # Analogous to SRTP anti-replay window (RFC 3711 §3.3.2).
+      antiReplayWindow @1 :UInt32;
     }
   }
 }
 
-# Delivery guarantee. atLeastOnce carries dedup + resume params.
+# Delivery guarantee. Aligned with MQTT QoS 0/1 (OASIS MQTT 5.0 §4.3).
+# exactlyOnce (QoS 2) is intentionally out of scope; use atLeastOnce with
+# idempotent consumers.
 struct Delivery {
   union {
     atMostOnce @0 :Void;
     atLeastOnce :group {
-      dedupWindow @1 :UInt32;    # # of recent group seqs remembered for client dedup
-      resumable   @2 :Bool;      # offset-resume from last-acked seq across reconnect
+      # Number of recent sequenceNumbers remembered for client-side dedup.
+      dedupWindow @1 :UInt32;
+      # Resume delivery from last-acked sequenceNumber after reconnect.
+      resumable   @2 :Bool;
     }
   }
 }
 
-# Truncation policy — its OWN axis (terminal frames are opt-in; inference uses none).
-# terminal = require a Complete/Error payload before EOF (EOF-without-terminal = reject).
+# Stream termination contract. endOfStream = a StreamPayload.complete or
+# StreamPayload.error frame MUST be received before EOF; EOF without one is
+# a truncation attack and MUST be rejected. Fail-closed default (@0).
+# Analogous to gRPC END_STREAM / HTTP/2 DATA+END_STREAM / WebTransport FIN.
 struct Completion {
   union {
-    terminal @0 :Void;
-    none     @1 :Void;
+    endOfStream @0 :Void;  # terminal frame required before close
+    none        @1 :Void;  # stream may close without explicit terminator
   }
 }
 
-# Relay-side retention window (late-join / resume). liveOnly = smallest surface (#174).
+# Relay-side retention / late-join buffer policy.
+# live     = no buffering beyond the live delivery window (lossless relay surface).
+# blocks   = retain the last N delivery blocks (~N MoQ Transport Groups).
+# seconds  = retain for N wall-clock seconds.
+# NOTE: live is declared, not enforced, by the relay (which is blind to MAC keys).
+# Clients MUST enforce liveness by checking epoch: reject blocks from a prior DH
+# session epoch on reconnect. See also: OverflowPolicy.
 struct Retention {
   union {
-    liveOnly @0 :Void;
-    groups   @1 :UInt32;
-    seconds  @2 :UInt32;
+    live    @0 :Void;      # no buffering beyond live window (fail-closed default)
+    blocks  @1 :UInt32;   # retain N delivery blocks (~N MoQ Transport Groups)
+    seconds @2 :UInt32;   # retain for N seconds
   }
 }
 
-# Backpressure when the publish path saturates. block = lossless (EAGAIN contract).
-struct Backpressure {
+# Application-layer overflow policy when the publish buffer saturates.
+# block = lossless EAGAIN-style backpressure on the publisher side.
+# dropOldest = ring-buffer semantics; highWaterMark is the buffer element cap.
+# NOTE: this is an application-layer policy; QUIC flow control (RFC 9000 §4)
+# operates independently at the transport layer.
+struct OverflowPolicy {
   union {
     block @0 :Void;
     dropOldest :group {
-      highWater @1 :UInt32;
+      highWaterMark @1 :UInt32;
     }
   }
 }
 
-# The full per-stream delivery contract. Composed of the axes above; one per stream.
-struct StreamContract {
-  ordering     @0 :Ordering;
-  delivery     @1 :Delivery;
-  completion   @2 :Completion;
-  retention    @3 :Retention;
-  backpressure @4 :Backpressure;
+# The full per-stream delivery policy. One instance per stream, carried in
+# the signed StreamInfo handshake response.
+struct StreamPolicy {
+  ordering       @0 :Ordering;
+  delivery       @1 :Delivery;
+  completion     @2 :Completion;
+  retention      @3 :Retention;
+  overflowPolicy @4 :OverflowPolicy;
 }
-
-# Apply to a streaming method's StreamInfo response variant:
-#   streamInfo @0 :StreamInfo $streamPolicy(.tokenStream);   # app-local const, or inline a literal
-# Naming: annotation `streamPolicy` (noun-form, like `mcpScope`/`fixedSize`), value type
-# `StreamContract` — a distinct identifier per the `mcpScope :ScopeAction` precedent (which
-# capnpc-rust requires: a struct and annotation that snake_case to the same module collide).
-annotation streamPolicy(field) :StreamContract;
 
 # =============================================================================
 # Stream Setup
@@ -111,10 +144,15 @@ annotation streamPolicy(field) :StreamContract;
 #
 # Contains everything the client needs to subscribe and derive keys.
 # Returned by generateStream/inferStream RPC calls.
+# Wrapped in a SignedEnvelope (Ed25519) so the policy field is authenticated.
 struct StreamInfo {
   streamId @0 :Text;      # Unique stream identifier (e.g., "stream-{uuid}")
   endpoint @1 :Text;      # XPUB endpoint to subscribe to
   dhPublic @2 :Data $fixedSize(32);  # Server's ephemeral Ristretto255 public key for DH
+  # Service-declared delivery policy. Authenticated by the Ed25519 signature
+  # over the enclosing SignedEnvelope. Clients MUST enforce this policy and
+  # MUST disconnect (not silently downgrade) if a required mode is unsupported.
+  policy   @3 :StreamPolicy;
 }
 
 # Stream registration - wrapped in SignedEnvelope for authorization
@@ -235,4 +273,3 @@ struct StreamControl {
     ping @1 :Void;          # Keep-alive probe (reserved)
   }
 }
-

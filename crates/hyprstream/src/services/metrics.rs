@@ -326,6 +326,7 @@ impl MetricsHandler for MetricsService {
             stream_id: stream_ctx.stream_id().to_owned(),
             endpoint: self.inner.stream_channel.stream_endpoint(),
             server_pubkey: *stream_ctx.server_pubkey(),
+            ..Default::default()
         };
         let inner = Arc::clone(&self.inner);
 

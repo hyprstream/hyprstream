@@ -765,6 +765,7 @@ impl RegistryService {
             stream_id: stream_ctx.stream_id().to_owned(),
             endpoint: stream_endpoint,
             server_pubkey: *stream_ctx.server_pubkey(),
+            ..Default::default()
         };
 
         // Build continuation that executes the clone and streams progress

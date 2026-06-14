@@ -837,6 +837,7 @@ impl WorkerService {
             stream_id,
             endpoint: stream_endpoint,
             server_pubkey: *stream_ctx.server_pubkey(),
+            ..Default::default()
         };
 
         // Continuation: spawns FD streaming task AFTER REP is sent to client
