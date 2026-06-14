@@ -69,6 +69,11 @@ web-sys = { version = "0.3.64", features = [
 ] }
 serde-wasm-bindgen = "0.6"
 getrandom = { version = "0.2", features = ["js"] }  # rand 0.8 uses getrandom 0.2
+# The always-on PQ crypto (ml-dsa/ml-kem → sha3/crypto-common) pulls getrandom 0.4, which
+# refuses to build on wasm32-unknown-unknown unless its `wasm_js` backend is enabled.
+# Declare it (renamed to coexist with the 0.2 entry) so the feature unifies onto the
+# transitive 0.4 dep and the browser/WebTransport consumer compiles for wasm (#225).
+getrandom_v04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 
 # Native-only deps (not compiled for wasm32)
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

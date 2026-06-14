@@ -6632,6 +6632,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "futures",
  "getrandom 0.2.16",
+ "getrandom 0.4.2",
  "h3",
  "h3-quinn",
  "h3-webtransport",
