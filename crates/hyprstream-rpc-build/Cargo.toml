@@ -21,5 +21,11 @@ clap = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 
+# Generate StreamContract (#213/#216) typed readers so the annotation extractor can
+# decode the struct-valued `$streamPolicy` annotation (capnp-rust has no CGR-runtime
+# dynamic reflection, so the generated type is required).
+[build-dependencies]
+capnpc = { workspace = true }
+
 [lints]
 workspace = true
