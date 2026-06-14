@@ -974,112 +974,12 @@ pub async fn forward_progress_to_stream(
 // Stream Verifier (Consumer helper)
 // ============================================================================
 
-/// HMAC chain verifier for StreamBlock.
-pub struct StreamVerifier {
-    key: [u8; 32],
-    prev_mac: Option<[u8; 16]>,
-    topic: String,
-}
-
-impl StreamVerifier {
-    /// Create a new verifier.
-    pub fn new(key: [u8; 32], topic: String) -> Self {
-        Self {
-            key,
-            prev_mac: None,
-            topic,
-        }
-    }
-
-    /// Verify frames and return parsed payloads.
-    ///
-    /// Expected frames: [topic, capnp StreamBlock, 16-byte MAC]
-    pub fn verify(&mut self, frames: &[Vec<u8>]) -> Result<Vec<StreamPayload>> {
-        if frames.len() != 3 {
-            anyhow::bail!("Expected 3 frames, got {}", frames.len());
-        }
-
-        let received_topic = &frames[0];
-        let capnp_data = &frames[1];
-        let received_mac = &frames[2];
-
-        if received_mac.len() != 16 {
-            anyhow::bail!("Expected 16-byte MAC, got {}", received_mac.len());
-        }
-
-        if received_topic != self.topic.as_bytes() {
-            anyhow::bail!("Topic mismatch");
-        }
-
-        // Compute expected MAC
-        let mut input = Vec::with_capacity(64 + capnp_data.len());
-        match &self.prev_mac {
-            None => input.extend_from_slice(self.topic.as_bytes()),
-            Some(prev) => input.extend_from_slice(prev),
-        }
-        input.extend_from_slice(capnp_data);
-
-        let expected_mac = keyed_mac_truncated(&self.key, &input);
-
-        if !constant_time_eq(received_mac, &expected_mac) {
-            anyhow::bail!("MAC verification failed");
-        }
-
-        // Update chain state
-        let mut new_prev = [0u8; 16];
-        new_prev.copy_from_slice(received_mac);
-        self.prev_mac = Some(new_prev);
-
-        // Parse StreamBlock
-        let reader = serialize::read_message(
-            &mut std::io::Cursor::new(capnp_data),
-            capnp::message::ReaderOptions::default(),
-        )?;
-        let block = reader.get_root::<streaming_capnp::stream_block::Reader>()?;
-
-        let payloads_reader = block.get_payloads()?;
-        let mut payloads = Vec::with_capacity(payloads_reader.len() as usize);
-
-        for i in 0..payloads_reader.len() {
-            let p = payloads_reader.get(i);
-
-            use streaming_capnp::stream_payload::Which;
-            let payload = match p.which()? {
-                Which::Data(data_result) => {
-                    StreamPayload::Data(data_result?.to_vec())
-                }
-                Which::Error(err_result) => {
-                    let err = err_result?;
-                    StreamPayload::Error(err.get_message()?.to_string()?)
-                }
-                Which::Complete(complete_result) => {
-                    StreamPayload::Complete(complete_result?.to_vec())
-                }
-                Which::Heartbeat(()) => {
-                    continue;
-                }
-                Which::Tagged(tagged_result) => {
-                    let tagged = tagged_result?;
-                    StreamPayload::Tagged {
-                        tag: tagged.get_tag()?.to_vec(),
-                        payload: tagged.get_payload()?.to_vec(),
-                        nonce: tagged.get_nonce()?.to_vec(),
-                        key_commitment: tagged.get_key_commitment()?.to_vec(),
-                    }
-                }
-            };
-
-            payloads.push(payload);
-        }
-
-        Ok(payloads)
-    }
-
-    /// Get the topic.
-    pub fn topic(&self) -> &str {
-        &self.topic
-    }
-}
+// #224: the canonical StreamVerifier lives in `stream_consumer` (cross-target — compiles
+// on native + wasm). The native-only duplicate the cross-target extraction left here is
+// removed; re-export the shared one (mirrors the `StreamPayload` re-export above) so
+// `crate::StreamVerifier`, the moq path, and the wasm/browser consumer all use a single
+// verifier — the one place #163's policy-selected enforcement will land.
+pub use crate::stream_consumer::StreamVerifier;
 
 // ============================================================================
 // Stream Handle (Consumer)
@@ -2080,17 +1980,8 @@ fn pubkey_to_32(pubkey: &[u8]) -> [u8; 32] {
     }
 }
 
-/// Constant-time byte slice comparison.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
+// `constant_time_eq` removed with the duplicate StreamVerifier (#224) — the canonical
+// verifier in `stream_consumer` has its own.
 
 #[cfg(test)]
 mod tests {
