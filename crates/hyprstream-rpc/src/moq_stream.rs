@@ -37,6 +37,7 @@
 //! latest Group natively by the moq Track cache (respecting upstream Group
 //! cache consts), so the custom `StreamResume` / rejoin-buffer code is gone.
 
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, Result};
@@ -127,7 +128,7 @@ impl MoqStreamOriginBuilder {
                 consumer: self.consumer,
                 prefix: self.prefix,
                 authorize_signer: self.authorize_signer,
-                broadcasts: Mutex::new(Vec::new()),
+                broadcasts: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -144,8 +145,12 @@ struct OriginInner {
     /// a publisher is created for a topic. `None` accepts any caller
     /// (testing/bootstrap), matching the ZMQ default.
     authorize_signer: Option<Arc<dyn Fn(&[u8; 32]) -> bool + Send + Sync>>,
-    /// Keep broadcast producers alive for the lifetime of their publishers.
-    broadcasts: Mutex<Vec<BroadcastProducer>>,
+    /// Keep broadcast producers alive while their publishers are active.
+    ///
+    /// Keyed by broadcast path (replace semantics) so a re-announced topic
+    /// drops the old `BroadcastProducer` (unannouncing it) rather than
+    /// accumulating unboundedly (#164).
+    broadcasts: Mutex<HashMap<String, BroadcastProducer>>,
 }
 
 impl MoqStreamOrigin {
@@ -219,7 +224,9 @@ impl MoqStreamOrigin {
 
         // Retain the broadcast producer so it stays announced for the
         // publisher's lifetime (dropping it would unannounce the broadcast).
-        self.inner.broadcasts.lock().push(broadcast);
+        // Replace-semantics: inserting the same path twice drops the old
+        // BroadcastProducer rather than accumulating indefinitely (#164).
+        self.inner.broadcasts.lock().insert(path, broadcast);
 
         Ok(MoqStreamPublisher {
             hmac_state: StreamHmacState::new(*ctx.mac_key(), ctx.topic().to_owned()),
