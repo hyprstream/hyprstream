@@ -193,6 +193,13 @@ fn build_cli() -> ClapCommand {
                     .long("enable-federation")
                     .action(clap::ArgAction::SetTrue)
                     .help("Apply the federation-open policy template — accept third-party apps AND remote peer servers from any HTTPS origin (atproto-style federation). Default is disabled; under -y this flag is the only way to enable it."),
+            )
+            .arg(
+                Arg::new("initial_user_role")
+                    .long("initial-user-role")
+                    .value_name("ROLE")
+                    .default_value("admin")
+                    .help("Role to assign the local user under --non-interactive (admin|operator|trainer|viewer). Default is admin; use operator/viewer in tests for least-privilege."),
             ),
     );
 
@@ -1597,6 +1604,10 @@ fn main() -> Result<()> {
                 let start_services = sub_m.get_flag("start");
                 let bootstrap_only = sub_m.get_flag("bootstrap_only");
                 let enable_federation = sub_m.get_flag("enable_federation");
+                let initial_user_role = sub_m
+                    .get_one::<String>("initial_user_role")
+                    .cloned()
+                    .unwrap_or_else(|| "admin".to_owned());
                 let use_tui = tui_mode || (!non_interactive && !bootstrap_only && supports_tui());
                 return with_runtime(
                     RuntimeConfig { device: DeviceConfig::request_cpu(), multi_threaded: true },
@@ -1606,7 +1617,7 @@ fn main() -> Result<()> {
                         } else {
                             hyprstream_core::cli::handle_wizard(
                                 &models_dir, &services, non_interactive, start_services,
-                                bootstrap_only, enable_federation,
+                                bootstrap_only, enable_federation, &initial_user_role,
                             ).await
                         }
                     },
@@ -1622,7 +1633,7 @@ fn main() -> Result<()> {
                         // First-run fallback (no `wizard` subcommand) defaults
                         // federation to off — explicit opt-in only.
                         hyprstream_core::cli::handle_wizard(
-                            &models_dir, &services, false, false, false, false,
+                            &models_dir, &services, false, false, false, false, "admin",
                         ).await
                     }
                 },
@@ -2363,7 +2374,7 @@ fn main() -> Result<()> {
                         } else {
                             // First-run auto-wizard defaults federation to off.
                             hyprstream_core::cli::handle_wizard(
-                                &models_dir, &services, false, false, false, false,
+                                &models_dir, &services, false, false, false, false, "admin",
                             ).await
                         }
                     },
