@@ -212,37 +212,69 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
         shutdown: Arc<Notify>,
         on_ready: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<()> {
+        use hyprstream_rpc::transport::rpc_session::IrohRequestProcessor;
+
         let UnifiedServiceConfig { service, quic_config } = *self;
         let transport = RequestService::transport(&service).clone();
-        let context = Arc::clone(RequestService::context(&service));
         let signing_key = RequestService::signing_key(&service);
+        let server_pubkey = signing_key.verifying_key();
+        let service_name = RequestService::name(&service).to_owned();
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("runtime: {e}")))?;
 
+        // LocalSet is required for WebTransportServer's spawn_local internals.
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async move {
-            let mut runner = hyprstream_rpc::service::RequestLoop::new(
-                transport, context, signing_key,
-            );
+            let nonce_cache = Arc::new(hyprstream_rpc::envelope::InMemoryNonceCache::new());
+            let bridge = hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge::spawn(
+                service, Arc::clone(&nonce_cache), 0,
+            ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("bridge: {e}")))?;
+            let processor: Arc<dyn IrohRequestProcessor> = Arc::new(bridge);
 
-            if let Some(qc) = quic_config {
-                runner = runner.with_quic(qc);
-            }
-
-            match runner.run(service).await {
-                Ok(mut handle) => {
-                    if let Some(tx) = on_ready {
-                        let _ = tx.send(());
-                    }
-                    let _ = crate::notify::ready();
-                    shutdown.notified().await;
-                    handle.stop().await;
-                    Ok(())
+            if let Some(mut qc) = quic_config {
+                // Build WebTransportServer and run it alongside the inproc/UDS plane.
+                let mut wt_server = hyprstream_rpc::transport::zmtp_quic::WebTransportServer::bind(
+                    qc.bind_addr,
+                    qc.cert_chain.clone(),
+                    (*qc.key_der).clone(),
+                ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("QUIC bind: {e}")))?;
+                if let Some(ref meta) = qc.protected_resource_json {
+                    wt_server = wt_server.with_protected_resource_metadata(meta.clone());
                 }
-                Err(e) => Err(hyprstream_rpc::error::RpcError::SpawnFailed(e.to_string())),
+                let actual_addr = wt_server.local_addr().unwrap_or(qc.bind_addr);
+                let pin = hyprstream_rpc::transport::zmtp_quic::cert_sha256(&qc.cert_chain[0]);
+                if let Some(reg) = hyprstream_rpc::registry::try_global() {
+                    reg.register(
+                        &service_name,
+                        hyprstream_rpc::registry::SocketKind::Quic,
+                        hyprstream_rpc::transport::TransportConfig::quic_pinned(
+                            actual_addr,
+                            &qc.server_name,
+                            pin,
+                        ),
+                        None,
+                    );
+                }
+                if let Some(cb) = qc.on_quic_bound.take() {
+                    cb(service_name, actual_addr, qc.server_name);
+                }
+                let rep_fut = hyprstream_rpc::service::serve::serve_bridged(
+                    &transport, Arc::clone(&processor), signing_key.clone(),
+                    Arc::clone(&shutdown), on_ready,
+                );
+                let quic_fut = wt_server.accept_loop_processor(
+                    processor, server_pubkey, signing_key, nonce_cache,
+                    Arc::clone(&shutdown),
+                );
+                let (rep_result, _) = tokio::join!(rep_fut, quic_fut);
+                rep_result.map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(e.to_string()))
+            } else {
+                hyprstream_rpc::service::serve::serve_bridged(
+                    &transport, processor, signing_key, shutdown, on_ready,
+                ).await.map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(e.to_string()))
             }
         })
     }

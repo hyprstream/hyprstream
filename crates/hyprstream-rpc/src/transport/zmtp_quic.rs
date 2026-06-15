@@ -1483,6 +1483,199 @@ impl WebTransportServer {
         Ok(())
     }
 
+    /// Accept connections and dispatch via a [`crate::transport::rpc_session::IrohRequestProcessor`].
+    ///
+    /// Same behaviour as [`Self::accept_loop_service`] but takes an `Arc<dyn
+    /// IrohRequestProcessor>` (Send + Sync) instead of `Rc<S: RequestService>`, so it
+    /// can be used with a [`crate::transport::iroh_rpc::LocalServiceBridge`] that wraps a
+    /// `!Send` service behind a channel.
+    pub async fn accept_loop_processor(
+        self,
+        processor: Arc<dyn crate::transport::rpc_session::IrohRequestProcessor>,
+        server_pubkey: ed25519_dalek::VerifyingKey,
+        signing_key: ed25519_dalek::SigningKey,
+        nonce_cache: Arc<crate::envelope::InMemoryNonceCache>,
+        shutdown: Arc<Notify>,
+    ) -> Result<()> {
+        let metadata_json = self.protected_resource_json.map(Arc::new);
+        let cert_hash_hex = Arc::new(cert_hash_hex(&self.cert_der));
+
+        loop {
+            tokio::select! {
+                incoming = self.endpoint.accept() => {
+                    let Some(incoming) = incoming else { break; };
+                    let processor = Arc::clone(&processor);
+                    let nonce_cache = Arc::clone(&nonce_cache);
+                    let signing_key = signing_key.clone();
+                    let metadata = metadata_json.clone();
+                    let cert_hash = Arc::clone(&cert_hash_hex);
+
+                    tokio::task::spawn_local(async move {
+                        if let Err(e) = Self::handle_connection_processor(
+                            incoming, processor, server_pubkey, signing_key,
+                            nonce_cache, metadata, cert_hash,
+                        ).await {
+                            debug!("H3 connection error (processor): {}", e);
+                        }
+                    });
+                }
+                _ = shutdown.notified() => {
+                    debug!("WebTransport accept loop (processor) shutting down");
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_connection_processor(
+        incoming: quinn::Incoming,
+        processor: Arc<dyn crate::transport::rpc_session::IrohRequestProcessor>,
+        server_pubkey: ed25519_dalek::VerifyingKey,
+        signing_key: ed25519_dalek::SigningKey,
+        nonce_cache: Arc<crate::envelope::InMemoryNonceCache>,
+        metadata_json: Option<Arc<Vec<u8>>>,
+        cert_hash_hex: Arc<String>,
+    ) -> Result<()> {
+        let quinn_conn = incoming.await?;
+        let h3_conn = h3_quinn::Connection::new(quinn_conn);
+        let mut h3_server: H3QuinnConnection = h3::server::builder()
+            .enable_webtransport(true)
+            .max_webtransport_sessions(64)
+            .enable_datagram(true)
+            .enable_extended_connect(true)
+            .build(h3_conn)
+            .await
+            .map_err(|e| anyhow!("h3 server build failed: {}", e))?;
+
+        loop {
+            match h3_server.accept().await {
+                Ok(Some(resolver)) => {
+                    let (req, stream) = resolver.resolve_request().await
+                        .map_err(|e| anyhow!("h3 resolve request failed: {}", e))?;
+
+                    let is_webtransport = req.method() == http::Method::CONNECT
+                        && req.extensions().get::<h3::ext::Protocol>()
+                            == Some(&h3::ext::Protocol::WEB_TRANSPORT);
+
+                    if is_webtransport {
+                        let session: WtSession = h3_webtransport::server::WebTransportSession::accept(
+                            req, stream, h3_server,
+                        ).await
+                        .map_err(|e| anyhow!("WebTransport session accept failed: {}", e))?;
+
+                        Self::handle_webtransport_session_processor(
+                            session, processor, server_pubkey, signing_key,
+                            nonce_cache, metadata_json,
+                        ).await?;
+                        break;
+                    } else {
+                        Self::handle_http_request(req, stream, metadata_json.as_ref(), &cert_hash_hex).await?;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    debug!("H3 accept error: {}", e);
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_webtransport_session_processor(
+        session: WtSession,
+        processor: Arc<dyn crate::transport::rpc_session::IrohRequestProcessor>,
+        server_pubkey: ed25519_dalek::VerifyingKey,
+        signing_key: ed25519_dalek::SigningKey,
+        nonce_cache: Arc<crate::envelope::InMemoryNonceCache>,
+        metadata_json: Option<Arc<Vec<u8>>>,
+    ) -> Result<()> {
+        debug!("WebTransport session established (processor)");
+        loop {
+            match session.accept_bi().await {
+                Ok(Some(h3_webtransport::server::AcceptedBi::BidiStream(_session_id, stream))) => {
+                    let processor = Arc::clone(&processor);
+                    let nonce_cache = Arc::clone(&nonce_cache);
+                    let signing_key = signing_key.clone();
+                    tokio::task::spawn_local(async move {
+                        if let Err(e) = Self::handle_wt_stream_processor(
+                            stream, processor, server_pubkey, signing_key, nonce_cache,
+                        ).await {
+                            warn!("WebTransport stream error (processor): {}", e);
+                        }
+                    });
+                }
+                Ok(Some(h3_webtransport::server::AcceptedBi::Request(req, stream))) => {
+                    if let Err(e) = Self::handle_http_request(req, stream, metadata_json.as_ref(), "").await {
+                        debug!("WebTransport in-session HTTP request error: {}", e);
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    debug!("WebTransport session closed (processor): {}", e);
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_wt_stream_processor(
+        stream: WtBidiStream,
+        processor: Arc<dyn crate::transport::rpc_session::IrohRequestProcessor>,
+        _server_pubkey: ed25519_dalek::VerifyingKey,
+        signing_key: ed25519_dalek::SigningKey,
+        nonce_cache: Arc<crate::envelope::InMemoryNonceCache>,
+    ) -> Result<()> {
+        use h3::quic::BidiStream as H3BidiStream;
+        let (send, recv) = H3BidiStream::split(stream);
+        let mut zmtp = ZmtpStream::new(WtStream { send, recv });
+
+        let cmd = zmtp.recv_command().await?;
+        ensure!(cmd.name == "STREAM_TYPE", "Expected STREAM_TYPE command, got '{}'", cmd.name);
+
+        let stream_type = std::str::from_utf8(&cmd.body)
+            .map_err(|_| anyhow!("Invalid STREAM_TYPE body"))?;
+
+        match stream_type {
+            "REQ" => {
+                let request = zmtp.recv_multipart().await?;
+                ensure!(!request.parts.is_empty(), "Empty RPC request");
+                let raw_bytes = bytes::Bytes::copy_from_slice(&request.parts[0]);
+
+                // Verify + dispatch via processor (includes signing_key and nonce_cache
+                // encapsulated inside the LocalServiceBridge).
+                let _ = (signing_key, nonce_cache); // unused — bridge handles auth internally
+                match processor.process(raw_bytes).await {
+                    Ok(response_bytes) => {
+                        zmtp.send_multipart(&[response_bytes]).await?;
+                        zmtp.stream.send.shutdown().await
+                            .map_err(std::io::Error::other)?;
+                    }
+                    Err(e) => {
+                        warn!("WebTransport processor RPC error: {}", e);
+                        let error_msg = format!("RPC error: {}", e);
+                        zmtp.send_multipart(&[bytes::Bytes::from(error_msg.into_bytes())]).await?;
+                        zmtp.stream.send.shutdown().await
+                            .map_err(std::io::Error::other)?;
+                    }
+                }
+            }
+            "SUB" => {
+                let topic_msg = zmtp.recv_multipart().await?;
+                ensure!(!topic_msg.parts.is_empty(), "SUB: missing topic");
+                let topic_bytes = &topic_msg.parts[0];
+                debug!(topic_len = topic_bytes.len(), "WebTransport SUB stream (processor)");
+                Self::handle_stream_subscription_zmtp(zmtp, topic_bytes).await?;
+            }
+            other => {
+                warn!("Unknown STREAM_TYPE '{}' in processor path", other);
+            }
+        }
+        Ok(())
+    }
+
     /// Handle an individual QUIC connection via h3.
     ///
     /// Routes incoming requests: WebTransport CONNECT upgrades go to
