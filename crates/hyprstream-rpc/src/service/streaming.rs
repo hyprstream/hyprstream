@@ -462,18 +462,26 @@ impl StreamService {
 
         let name_clone = self.name.clone();
         std::thread::spawn(move || {
-            // Block until shutdown is signaled
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    tracing::error!("Failed to create shutdown listener runtime: {e}");
-                    return;
+            // Await the async Notify without spawning a new runtime when we are
+            // already inside spawn_blocking (the tokio handle is accessible).
+            // Falls back to a minimal runtime for the pure-thread spawn path.
+            let fut = shutdown.notified();
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => handle.block_on(fut),
+                Err(_) => {
+                    let rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            tracing::error!("Failed to create shutdown listener runtime: {e}");
+                            return;
+                        }
+                    };
+                    rt.block_on(fut);
                 }
-            };
-            rt.block_on(shutdown.notified());
+            }
 
             // Send termination message
             debug!("Sending TERMINATE to StreamService {}", name_clone);
@@ -925,11 +933,19 @@ impl crate::service::Spawnable for StreamService {
             }
             let _ = crate::notify::ready();
             // Park the spawner thread until shutdown is signalled.
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| crate::error::RpcError::SpawnFailed(format!("rt: {e}")))?;
-            rt.block_on(shutdown.notified());
+            // Use the existing tokio handle when available (spawn_blocking path);
+            // fall back to a minimal runtime on the pure-thread path.
+            let fut = shutdown.notified();
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => handle.block_on(fut),
+                Err(_) => {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| crate::error::RpcError::SpawnFailed(format!("rt: {e}")))?
+                        .block_on(fut);
+                }
+            }
             info!(service = %self.name, "StreamService (moq-primary) stopped");
             return Ok(());
         }

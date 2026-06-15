@@ -135,18 +135,26 @@ impl Spawnable for ProxyService {
 
         let name_clone = self.name.clone();
         std::thread::spawn(move || {
-            // Block until shutdown is signaled
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    tracing::error!("Failed to create shutdown listener runtime: {e}");
-                    return;
+            // Await the async Notify without spawning a new runtime when we are
+            // already inside spawn_blocking (the tokio handle is accessible).
+            // Falls back to a minimal runtime for the pure-thread spawn path.
+            let fut = shutdown.notified();
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => handle.block_on(fut),
+                Err(_) => {
+                    let rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            tracing::error!("Failed to create shutdown listener runtime: {e}");
+                            return;
+                        }
+                    };
+                    rt.block_on(fut);
                 }
-            };
-            rt.block_on(shutdown.notified());
+            }
 
             // Send termination message to proxy
             tracing::debug!("Sending TERMINATE to proxy {}", name_clone);
