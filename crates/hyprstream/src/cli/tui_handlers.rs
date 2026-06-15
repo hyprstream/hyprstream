@@ -115,31 +115,15 @@ pub async fn handle_tui_attach(signing_key: &SigningKey, session_id: Option<u32>
 /// Uses `StreamVerifier` for Blake3 HMAC chain verification of incoming
 /// StreamBlock messages. The verifier checks that each block's MAC is
 /// valid relative to the previous block, ensuring no reordering or tampering.
-// TODO(#134/moq-sub): On the moq path `run_attach_loop` must subscribe to the
-// viewer's track via WebTransport QUIC rather than a raw ZMQ SUB socket.
-// The ConnectResult currently only carries a ZMQ sub_endpoint.  When moq is
-// the active transport the service should instead return the server's WebTransport
-// URL + broadcast path so the client can open a moq subscriber session here.
-// Until that wire change lands this function stays on the ZMQ path unchanged.
+///
+/// When `stream_info.moq_broadcast_path` is non-empty, uses the moq UDS path
+/// for cross-process subscription rather than ZMQ SUB.
 async fn run_attach_loop(
     stream_info: &crate::services::generated::tui_client::StreamInfo,
     client: &TuiClient,
     viewer_id: u32,
 ) -> Result<()> {
-    use hyprstream_rpc::registry::{global as endpoint_registry, SocketKind};
     use hyprstream_rpc::streaming::{StreamPayload, StreamVerifier};
-
-    let zmq_ctx = zmq::Context::new();
-
-    // Connect directly via ZMQ SUB to the XPUB endpoint
-    let sub_endpoint = endpoint_registry()
-        .endpoint("streams", SocketKind::Sub)
-        .to_zmq_string();
-
-    let sub_socket = zmq_ctx.socket(zmq::SUB)?;
-    sub_socket.connect(&sub_endpoint)?;
-    sub_socket.set_subscribe(stream_info.topic.as_bytes())?;
-    sub_socket.set_linger(0)?;
 
     // Create verifier with the mac_key from ConnectResult.stream_info
     let mac_key: [u8; 32] = stream_info.mac_key.as_slice()
@@ -153,45 +137,138 @@ async fn run_attach_loop(
 
     let mut stdout = std::io::stdout();
 
-    // ZMQ recv loop in spawn_blocking — collects full multipart [topic, capnp, mac]
-    // and verifies via StreamVerifier before sending ANSI data
+    // Frame bytes channel: producers are either the moq or ZMQ recv loop.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
 
-    let recv_handle = tokio::task::spawn_blocking(move || {
-        let mut verifier = StreamVerifier::new(mac_key, topic);
+    let recv_handle = if !stream_info.moq_broadcast_path.is_empty() {
+        // ── moq path: connect via UDS and subscribe to the broadcast ──────────
+        use hyprstream_rpc::moq_stream::{verify_moq_frame, STREAM_TRACK};
+        use hyprstream_rpc::transport::uds_session::{connect_uds, PLANE_MOQ};
+        use moq_net::{Client as MoqClient, Origin};
 
-        loop {
-            // Receive full multipart message
-            let mut frames: Vec<Vec<u8>> = Vec::with_capacity(3);
-            match sub_socket.recv_bytes(0) {
-                Ok(frame) => frames.push(frame),
-                Err(_) => break,
+        let uds_path = stream_info.moq_uds_path.clone();
+        let broadcast_path = stream_info.moq_broadcast_path.clone();
+        let tx_moq = tx.clone();
+        tokio::spawn(async move {
+            let session = match connect_uds(&uds_path, PLANE_MOQ).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("moq UDS connect failed: {e}");
+                    return;
+                }
+            };
+
+            let client_origin = Origin::random().produce();
+            let client_consumer = client_origin.consume();
+            let moq_client = MoqClient::new().with_consume(client_origin);
+            let _session = match moq_client.connect(session).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("moq client handshake failed: {e}");
+                    return;
+                }
+            };
+
+            let bc = match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                client_consumer.announced_broadcast(&broadcast_path),
+            ).await {
+                Ok(Some(bc)) => bc,
+                Ok(None) => {
+                    tracing::warn!("broadcast {broadcast_path} not announced");
+                    return;
+                }
+                Err(_) => {
+                    tracing::warn!("timeout waiting for broadcast {broadcast_path}");
+                    return;
+                }
+            };
+
+            let mut track = match bc.subscribe_track(&moq_net::Track::new(STREAM_TRACK)) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!("subscribe_track failed: {e}");
+                    return;
+                }
+            };
+
+            let topic_str = topic.clone();
+            let mut verifier = StreamVerifier::new(mac_key, topic);
+            loop {
+                let group_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    track.next_group(),
+                ).await;
+                let mut group = match group_result {
+                    Ok(Ok(Some(g))) => g,
+                    Ok(Ok(None)) => break, // track closed
+                    Ok(Err(e)) => { tracing::debug!("moq next_group: {e}"); break; }
+                    Err(_) => { tracing::debug!("moq next_group timeout"); break; }
+                };
+                let frame_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    group.read_frame(),
+                ).await;
+                let frame: bytes::Bytes = match frame_result {
+                    Ok(Ok(Some(f))) => f,
+                    _ => continue,
+                };
+                match verify_moq_frame(&mut verifier, &topic_str, &frame) {
+                    Ok(payloads) => {
+                        for payload in payloads {
+                            if let StreamPayload::Data(data) = payload {
+                                if tx_moq.send(data).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!("moq frame verify failed: {e}"),
+                }
             }
-            while sub_socket.get_rcvmore().unwrap_or(false) {
+        })
+    } else {
+        // ── ZMQ path: connect SUB socket and receive multipart messages ────────
+        use hyprstream_rpc::registry::{global as endpoint_registry, SocketKind};
+
+        let zmq_ctx = zmq::Context::new();
+        let sub_endpoint = endpoint_registry()
+            .endpoint("streams", SocketKind::Sub)
+            .to_zmq_string();
+        let sub_socket = zmq_ctx.socket(zmq::SUB)?;
+        sub_socket.connect(&sub_endpoint)?;
+        sub_socket.set_subscribe(stream_info.topic.as_bytes())?;
+        sub_socket.set_linger(0)?;
+
+        tokio::task::spawn_blocking(move || {
+            let mut verifier = StreamVerifier::new(mac_key, topic);
+            loop {
+                let mut frames: Vec<Vec<u8>> = Vec::with_capacity(3);
                 match sub_socket.recv_bytes(0) {
                     Ok(frame) => frames.push(frame),
                     Err(_) => break,
                 }
-            }
-
-            // Verify HMAC chain and extract payloads
-            match verifier.verify(&frames) {
-                Ok(payloads) => {
-                    for payload in payloads {
-                        if let StreamPayload::Data(data) = payload {
-                            if tx.blocking_send(data).is_err() {
-                                return;
+                while sub_socket.get_rcvmore().unwrap_or(false) {
+                    match sub_socket.recv_bytes(0) {
+                        Ok(frame) => frames.push(frame),
+                        Err(_) => break,
+                    }
+                }
+                match verifier.verify(&frames) {
+                    Ok(payloads) => {
+                        for payload in payloads {
+                            if let StreamPayload::Data(data) = payload {
+                                if tx.blocking_send(data).is_err() {
+                                    return;
+                                }
                             }
                         }
                     }
-                }
-                Err(e) => {
-                    tracing::warn!("Stream verification failed: {}", e);
-                    // Continue — transient errors (e.g. first block) shouldn't kill attach
+                    Err(e) => tracing::warn!("Stream verification failed: {e}"),
                 }
             }
-        }
-    });
+        })
+    };
 
     // Read stdin in a separate task
     let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);

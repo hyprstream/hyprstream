@@ -38,6 +38,7 @@
 //! cache consts), so the custom `StreamResume` / rejoin-buffer code is gone.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, Result};
@@ -56,6 +57,8 @@ use crate::streaming::{StreamContext, StreamPayloadData, StreamVerifier};
 // ============================================================================
 
 static GLOBAL_MOQ_ORIGIN: OnceLock<MoqStreamOrigin> = OnceLock::new();
+/// The UDS socket path serving the moq plane (set by `serve_moq_uds_background`).
+static GLOBAL_MOQ_UDS_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 /// Register the process-global moq streaming origin.
 ///
@@ -71,6 +74,73 @@ pub fn init_global_moq_origin(origin: MoqStreamOrigin) -> bool {
 /// `None` when moq is not yet wired (unit tests, ZMQ-only deployments).
 pub fn global_moq_origin() -> Option<&'static MoqStreamOrigin> {
     GLOBAL_MOQ_ORIGIN.get()
+}
+
+/// Path of the UDS socket that serves the moq streaming plane to local clients.
+///
+/// Set by [`serve_moq_uds_background`] once the listener is ready.
+/// `None` in ZMQ-only or unit-test deployments.
+pub fn global_moq_uds_path() -> Option<&'static Path> {
+    GLOBAL_MOQ_UDS_PATH.get().map(PathBuf::as_path)
+}
+
+/// Start a UDS moq server in the background, serving the moq origin's consumer
+/// to local cross-process subscribers (e.g. `hyprstream tui attach`).
+///
+/// Each accepted connection that presents [`crate::transport::uds_session::PLANE_MOQ`]
+/// gets a dedicated moq server session via `moq_net::Server::with_publish`.
+/// The origin consumer is cloned per session so every subscriber sees the
+/// same live broadcast tree.
+///
+/// Idempotent: a second call is a no-op (the first path wins).
+pub fn serve_moq_uds_background(origin: MoqStreamOrigin, path: PathBuf) {
+    use crate::transport::uds_session::{accept_uds, PLANE_MOQ};
+    use moq_net::Server as MoqServer;
+
+    if GLOBAL_MOQ_UDS_PATH.set(path.clone()).is_err() {
+        return; // already started
+    }
+
+    // Remove stale socket from a previous run (best-effort).
+    let _ = std::fs::remove_file(&path);
+
+    tokio::spawn(async move {
+        let listener = match tokio::net::UnixListener::bind(&path) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(path = %path.display(), "moq UDS bind failed: {e}");
+                return;
+            }
+        };
+        tracing::info!(path = %path.display(), "moq UDS listener ready");
+
+        loop {
+            let stream = match listener.accept().await {
+                Ok((s, _)) => s,
+                Err(e) => {
+                    tracing::warn!("moq UDS accept error: {e}");
+                    continue;
+                }
+            };
+            let consumer = origin.consumer().clone();
+            tokio::spawn(async move {
+                let (plane, session) = match accept_uds(stream).await {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        tracing::debug!("moq UDS handshake error: {e}");
+                        return;
+                    }
+                };
+                if plane != PLANE_MOQ {
+                    tracing::debug!("moq UDS: unexpected plane 0x{plane:02x} — dropping");
+                    return;
+                }
+                if let Err(e) = MoqServer::new().with_publish(consumer).accept(session).await {
+                    tracing::debug!("moq UDS session ended: {e}");
+                }
+            });
+        }
+    });
 }
 
 /// The single track name that carries StreamBlock groups for a broadcast.

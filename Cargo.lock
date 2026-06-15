@@ -6412,6 +6412,7 @@ dependencies = [
  "memmap2",
  "minijinja",
  "ml-dsa",
+ "moq-net",
  "nix 0.27.1",
  "notify",
  "num_cpus",

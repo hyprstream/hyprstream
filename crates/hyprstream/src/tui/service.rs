@@ -360,13 +360,30 @@ impl TuiService {
         let stdin_ctx = make_stream_ctx("stdin")?;
         let stdout_ctx = make_stream_ctx("stdout")?;
 
-        let sub_endpoint = hyprstream_rpc::registry::global()
-            .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
-            .to_zmq_string();
+        // Build moq metadata (broadcast paths + UDS socket) when moq is active.
+        let moq_uds_path = global_moq_origin()
+            .and_then(|_| hyprstream_rpc::moq_stream::global_moq_uds_path())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let stdin_moq_path = global_moq_origin()
+            .map(|o| o.broadcast_path(stdin_ctx.topic()))
+            .unwrap_or_default();
+        let stdout_moq_path = global_moq_origin()
+            .map(|o| o.broadcast_path(stdout_ctx.topic()))
+            .unwrap_or_default();
 
-        let streams: [(&str, &str, &[u8; 32]); 2] = [
-            (stdin_ctx.topic(), &sub_endpoint, stdin_ctx.mac_key()),
-            (stdout_ctx.topic(), &sub_endpoint, stdout_ctx.mac_key()),
+        let sub_endpoint = if global_moq_origin().is_some() {
+            String::new()
+        } else {
+            hyprstream_rpc::registry::global()
+                .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
+                .to_zmq_string()
+        };
+
+        // (topic, sub_endpoint, mac_key, moq_broadcast_path, moq_uds_path)
+        let streams: [(&str, &str, &[u8; 32], &str, &str); 2] = [
+            (stdin_ctx.topic(), &sub_endpoint, stdin_ctx.mac_key(), &stdin_moq_path, &moq_uds_path),
+            (stdout_ctx.topic(), &sub_endpoint, stdout_ctx.mac_key(), &stdout_moq_path, &moq_uds_path),
         ];
 
         let response = self.build_connect_response(
@@ -1525,7 +1542,8 @@ impl TuiService {
         viewer_id: u32,
         session_id: u32,
         windows: &[(u32, String, Vec<(u32, (u16, u16), bool)>, u32)],
-        streams: &[(&str, &str, &[u8; 32])], // (topic, sub_endpoint, mac_key)
+        // (topic, sub_endpoint, mac_key, moq_broadcast_path, moq_uds_path)
+        streams: &[(&str, &str, &[u8; 32], &str, &str)],
     ) -> Result<Vec<u8>> {
         let mut msg = Builder::new_default();
         {
@@ -1537,11 +1555,13 @@ impl TuiService {
 
             // FD-indexed streams: [0]=stdin (input relay), [1]=stdout (frames)
             let mut stream_list = connect.reborrow().init_streams(streams.len() as u32);
-            for (i, (topic, sub_endpoint, mac_key)) in streams.iter().enumerate() {
+            for (i, (topic, sub_endpoint, mac_key, moq_path, moq_uds)) in streams.iter().enumerate() {
                 let mut si = stream_list.reborrow().get(i as u32);
                 si.set_topic(topic);
                 si.set_sub_endpoint(sub_endpoint);
                 si.set_mac_key(*mac_key);
+                si.set_moq_broadcast_path(moq_path);
+                si.set_moq_uds_path(moq_uds);
             }
 
             let mut win_list = connect.init_windows(windows.len() as u32);

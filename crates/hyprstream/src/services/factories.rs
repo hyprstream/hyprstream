@@ -486,6 +486,16 @@ fn create_streams_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
     // services that call StreamChannel::publisher() will see it immediately.
     hyprstream_rpc::moq_stream::init_global_moq_origin(moq_origin.clone());
 
+    // Start the UDS moq server so cross-process subscribers (e.g. `tui attach`)
+    // can subscribe without going through the ZMQ XPUB plane.
+    let moq_uds_path = {
+        let dir = std::env::temp_dir()
+            .join(format!("hyprstream-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("moq.sock")
+    };
+    hyprstream_rpc::moq_stream::serve_moq_uds_background(moq_origin.clone(), moq_uds_path);
+
     let stream_service = StreamService::new(
         "streams",
         global_context(),

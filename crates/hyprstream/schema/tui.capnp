@@ -375,10 +375,14 @@ struct ConnectResult {
 struct StreamInfo {
   # Topic to subscribe to for frame data
   topic @0 :Text;
-  # SUB endpoint
+  # SUB endpoint (ZMQ path; empty when moq is active)
   subEndpoint @1 :Text;
   # MAC key for HMAC verification (32 bytes)
   macKey @2 :Data;
+  # moq broadcast path: "{prefix}/{topic}" (empty when ZMQ is active)
+  moqBroadcastPath @3 :Text;
+  # UDS socket path for the moq streaming plane (empty when ZMQ is active)
+  moqUdsPath @4 :Text;
 }
 
 # Window information
