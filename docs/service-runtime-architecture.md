@@ -4,7 +4,7 @@ This document describes the threading model, async patterns, and `Send`/`Sync` c
 
 ## Overview
 
-Hyprstream services run in isolated threads, each with their own tokio runtime. The choice of runtime type depends on whether the service holds `!Send` types (like ZMQ sockets or GPU tensors).
+Hyprstream services run in isolated threads, each with their own tokio runtime. The choice of runtime type depends on whether the service holds `!Send` types (like GPU tensors).
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -19,8 +19,9 @@ Hyprstream services run in isolated threads, each with their own tokio runtime. 
 │  │ │ T1  │ │ T2  │ │ T3  ││           │ │ Single thread       │ │         │
 │  │ └─────┘ └─────┘ └─────┘│           │ │ (spawn_local)       │ │         │
 │  │                         │           │ └─────────────────────┘ │         │
-│  │ HTTP servers            │           │ ZMQ services            │         │
-│  │ gRPC (Flight)           │           │ GPU inference           │         │
+│  │ HTTP servers            │           │ GPU inference           │         │
+│  │ gRPC (Flight)           │           │ InferenceService        │         │
+│  │ RPC services            │           │                         │         │
 │  └─────────────────────────┘           └─────────────────────────┘         │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -36,47 +37,60 @@ These services use `tokio::runtime::Builder::new_multi_thread()` and can leverag
 |---------|----------|-------------------|
 | OAIService | HTTP/HTTPS | Axum server handles concurrent requests |
 | FlightService | gRPC | Arrow Flight uses tonic (multi-threaded) |
+| RegistryService | UDS RPC | Serves via `serve_bridged()` — async, no !Send types |
+| PolicyService | UDS RPC | Same: `serve_bridged()` + generated client handles |
+| ModelService | UDS RPC | Same; GPU tensors live in InferenceService subprocess |
 
 ### Single-threaded Services (LocalSet required)
 
-These services use `new_current_thread()` + `LocalSet` because they hold `!Send` types or make RPC calls in handlers:
+These services use `new_current_thread()` + `LocalSet` because they hold `!Send` types:
 
 | Service | !Send Type | Why |
 |---------|-----------|-----|
 | InferenceService | GPU tensors (tch-rs) | CUDA contexts are thread-bound |
-| ModelService | ZMQ sockets | libzmq sockets are `!Send` |
-| RegistryService | ZMQ sockets | ZMQ client for policy checks |
-| PolicyService | ZMQ sockets | ZMQ REP socket |
 | OAuthService | RPC in handlers | HTTP handlers call `policy_client.issue_token()` |
 
 ## Client vs Service Constraints
 
-**Important distinction**: The `spawn_local` constraint applies to the **service side**, not the client side.
+**Important distinction**: The `spawn_local` constraint applies to the **service side** (when a handler holds `!Send` state), not the client side.
 
 ### RPC Client (Send + Sync)
 
-The RPC client is designed for concurrent use:
+Generated clients are designed for concurrent use across threads:
 
 ```rust
-pub struct ZmqConnection {
-    endpoint: String,
-    context: Arc<zmq::Context>,
-    sender: tokio::sync::Mutex<Option<RequestSender>>,  // Mutex makes it Send+Sync
+// All generated clients wrap Arc<dyn RpcClient>
+pub struct PolicyClient {
+    inner: Arc<dyn RpcClient>,
 }
 
-// Safe because socket is only accessed under the Mutex
-unsafe impl Send for ZmqConnection {}
-unsafe impl Sync for ZmqConnection {}
+// RpcClientImpl<Signer, LazyUdsTransport> is Send+Sync:
+// - LazyUdsTransport holds a tokio::sync::Mutex<Option<UdsSession>>
+// - Signer holds an Arc<SigningKey>
 ```
 
 Generated clients like `PolicyClient` wrap `Arc<dyn RpcClient>` — they're `Clone`, `Send`, and `Sync`. Multiple threads can share one client instance.
 
-### Service Side (spawn_local)
+### Service Side
 
-The `spawn_local` requirement comes from:
-1. **RequestLoop** — uses `spawn_local` to handle connections with `?Send` services
-2. **Continuations** — streaming responses spawn continuations via `spawn_local`
-3. **ZmqService trait** — allows `?Send` implementations (e.g., GPU tensors)
+The `spawn_local` requirement comes from services that hold `!Send` state. `serve_bridged()` handles this:
+
+```rust
+// serve_bridged() accepts a Box<dyn RequestService> (which may be !Send)
+// and runs the dispatch loop on whatever runtime context calls it.
+// For !Send services, wrap in LocalSet:
+let local = tokio::task::LocalSet::new();
+local.run_until(serve_bridged(transport, service, shutdown)).await?;
+```
+
+The `RequestService` trait allows `?Send` implementations (e.g., GPU tensors):
+
+```rust
+#[async_trait(?Send)]
+pub trait RequestService {
+    async fn handle(&self, ctx: EnvelopeContext, payload: Vec<u8>) -> Result<Vec<u8>>;
+}
+```
 
 ## Factory Construction
 
@@ -86,7 +100,7 @@ Service factories run synchronously on the main thread. When a factory needs to 
 // Safe: no RPC calls, just local initialization
 let policy_client = PolicyClient::for_service(sk, policy_vk, token);
 
-// Requires LocalSet wrapper if async code makes RPC calls
+// Requires LocalSet wrapper if async code makes RPC calls during construction
 let model_service = tokio::task::block_in_place(|| {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -102,7 +116,7 @@ let model_service = tokio::task::block_in_place(|| {
 |-----------|-----------------|--------|
 | Creating a client (`XxxClient::for_service`) | No | Just struct construction |
 | Calling client methods (`.load()`, `.resolve_service_key()`) | Yes | Uses `spawn_local` |
-| Local file/DB operations | No | No ZMQ involved |
+| Local file/DB operations | No | No async RPC involved |
 | `tokio::spawn()` | No | Regular async spawn |
 
 ## Deferred Initialization Pattern
@@ -117,8 +131,6 @@ impl Spawnable for OAIService {
             .build()?;
 
         rt.block_on(async move {
-            // ... setup HTTP server ...
-
             // Signal ready immediately (don't block on slow operations)
             if let Some(tx) = on_ready {
                 let _ = tx.send(());
@@ -155,49 +167,206 @@ fn create_model_service(ctx: &ServiceContext) -> Result<Box<dyn Spawnable>> {
 
 This is critical when factories make RPC calls during construction — the target service must be running.
 
-## Future: Channel-based RPC Proxy (Service Side)
-
-For services that need to make RPC calls from multi-threaded HTTP handlers (like OAuthService calling PolicyService), a cleaner architecture would use a dedicated I/O thread with channels:
+## Service Spawning Architecture
 
 ```
-┌─────────────────────┐     mpsc      ┌──────────────────────┐
-│  HTTP Handler       │ ──────────▶   │  Dedicated I/O       │
-│  (Axum thread pool) │               │  thread + LocalSet   │
-│                     │ ◀──────────   │  (owns RPC clients)  │
-└─────────────────────┘   oneshot     └──────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       SERVICE SPAWNING MODES                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ServiceSpawner                                                             │
+│       │                                                                     │
+│       ├──► TOKIO MODE ──────────────────────────────────────────────────►  │
+│       │    tokio::spawn(async { service.run_blocking(shutdown) })          │
+│       │    ┌──────────────────────────────────────────────┐                │
+│       │    │ SpawnedService { ServiceKind::TokioTask }    │                │
+│       │    │   └── ServiceHandle (JoinHandle + Notify)    │                │
+│       │    └──────────────────────────────────────────────┘                │
+│       │                                                                     │
+│       ├──► THREAD MODE ─────────────────────────────────────────────────►  │
+│       │    std::thread::spawn() + single-threaded tokio runtime            │
+│       │    ┌──────────────────────────────────────────────┐                │
+│       │    │ SpawnedService { ServiceKind::Thread }       │                │
+│       │    │   └── JoinHandle + Arc<Notify>               │                │
+│       │    │   USE: !Send types (tch-rs tensors)          │                │
+│       │    └──────────────────────────────────────────────┘                │
+│       │                                                                     │
+│       └──► SUBPROCESS MODE ─────────────────────────────────────────────►  │
+│            ProcessSpawner (auto-detects backend)                           │
+│            ┌──────────────────────────────────────────────┐                │
+│            │         ┌─────────────┐ ┌─────────────┐      │                │
+│            │         │ Standalone  │ │ Systemd     │      │                │
+│            │         │ Backend     │ │ Backend     │      │                │
+│            │         │ (tokio      │ │ (systemd-   │      │                │
+│            │         │  process)   │ │  run)       │      │                │
+│            │         └─────────────┘ └─────────────┘      │                │
+│            │ SpawnedService { ServiceKind::Subprocess }   │                │
+│            │   └── PID file + SIGTERM/SIGKILL             │                │
+│            └──────────────────────────────────────────────┘                │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-```rust
-struct RpcProxy {
-    tx: mpsc::Sender<(Request, oneshot::Sender<Response>)>,
-}
+### Process Spawner Backends
 
-impl RpcProxy {
-    async fn call(&self, req: Request) -> Result<Response> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx.send((req, resp_tx)).await?;
-        resp_rx.await?
-    }
-}
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       PROCESS SPAWNER BACKENDS                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ProcessSpawner::new()                                                      │
+│       │                                                                     │
+│       ├─► Check: /run/systemd/system exists?                               │
+│       │         OR NOTIFY_SOCKET env var?                                  │
+│       │         AND which("systemd-run")?                                  │
+│       │                                                                     │
+│       ├─► YES ──► SystemdBackend                                           │
+│       │           ┌───────────────────────────────────────────────┐        │
+│       │           │ • Uses systemd-run for transient units        │        │
+│       │           │ • Unit: hyprstream-{name}-{uuid}.service      │        │
+│       │           │ • Slice: hyprstream-workers.slice             │        │
+│       │           │ • Resource limits: MemoryMax, CPUQuota        │        │
+│       │           │ • Auto-cleanup: CollectMode=inactive-or-failed│        │
+│       │           │ • Stop: systemctl stop <unit>                 │        │
+│       │           │ • Status: systemctl is-active --quiet         │        │
+│       │           └───────────────────────────────────────────────┘        │
+│       │                                                                     │
+│       └─► NO ───► StandaloneBackend                                        │
+│                   ┌───────────────────────────────────────────────┐        │
+│                   │ • Uses tokio::process::Command                │        │
+│                   │ • Tracks in DashMap<id, Child>                │        │
+│                   │ • kill_on_drop(true) for cleanup              │        │
+│                   │ • Stop: SIGTERM → wait 5s → kill_on_drop      │        │
+│                   │ • Status: signal 0 (kill with None)           │        │
+│                   └───────────────────────────────────────────────┘        │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Benefits:
-- HTTP handlers don't need LocalSet
-- True multi-threading for request handling
-- Clean separation of I/O concerns
+## Service Lifecycle
 
-Tradeoffs:
-- Extra channel hop (~microseconds latency)
-- More complexity in client wrapper
-- Streaming responses need additional plumbing
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    SERVICE LIFECYCLE STATES                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│                    ┌─────────┐                                              │
+│                    │ CREATED │                                              │
+│                    └────┬────┘                                              │
+│                         │ spawn()                                           │
+│                         ▼                                                   │
+│      ┌──────────────────────────────────────────────────┐                  │
+│      │                   SPAWNING                        │                  │
+│      │  • Create Notify shutdown signal                  │                  │
+│      │  • Register with EndpointRegistry                 │                  │
+│      │  • Start task/thread/process                      │                  │
+│      │  • Wait for ready signal (transport bound)        │                  │
+│      └────────────────────┬─────────────────────────────┘                  │
+│                           │ ready signal received                           │
+│                           ▼                                                 │
+│      ┌──────────────────────────────────────────────────┐                  │
+│      │                    ACTIVE                         │                  │
+│      │  • Accepting requests (UDS / QUIC / iroh)        │                  │
+│      │  • Publishing events (moq-lite)                   │                  │
+│      │  • is_running() == true                           │                  │
+│      └────────────────────┬─────────────────────────────┘                  │
+│                           │ stop() called                                   │
+│                           ▼                                                 │
+│      ┌──────────────────────────────────────────────────┐                  │
+│      │                   STOPPING                        │                  │
+│      │  Tokio:      shutdown.notify_one() → task.await   │                  │
+│      │  Thread:     shutdown.notify_one() → join()       │                  │
+│      │  Subprocess: SIGTERM → wait → SIGKILL (if stuck)  │                  │
+│      └────────────────────┬─────────────────────────────┘                  │
+│                           │                                                 │
+│                           ▼                                                 │
+│      ┌──────────────────────────────────────────────────┐                  │
+│      │                   STOPPED                         │                  │
+│      │  • is_running() == false                          │                  │
+│      │  • ServiceRegistration dropped (auto-unregister)  │                  │
+│      │  • PID file cleaned up (subprocess)               │                  │
+│      └──────────────────────────────────────────────────┘                  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
-**Current workaround**: OAuthService runs entirely in a LocalSet (`new_current_thread()`), which works but limits concurrency. The mpsc proxy would allow multi-threaded HTTP handling while keeping RPC on a dedicated thread.
+## RPC Client Architecture
+
+All generated clients share the same structure:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  PolicyClient / RegistryClient / etc.                       │
+│  └── Arc<dyn RpcClient>  (Clone, Send+Sync)                │
+│       └── RpcClientImpl<LocalSigner, LazyUdsTransport>      │
+│            ├── signer: Ed25519 signing key                  │
+│            ├── transport: LazyUdsTransport                  │
+│            │     └── tokio::sync::Mutex<Option<UdsSession>> │
+│            ├── request_id: AtomicU64                        │
+│            └── default_jwt: Option<String>                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+- **Pooling primitive**: `Arc::clone()` — share one client across handlers
+- **Thread safety**: `LazyUdsTransport` wraps session in `tokio::Mutex`
+- **Per-call auth**: `RequestBuilder` allows JWT override without mutation
+- **No LocalSet on client side**: The constraint is on the service side only
+
+For QUIC/iroh transports, `LazyQuinnTransport` and iroh substrate follow the same `Send+Sync` pattern via `Mutex`-wrapped session state.
+
+## Complete Service Topology
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    HYPRSTREAM SERVICE TOPOLOGY                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────┐     │
+│  │                     MAIN PROCESS                                   │     │
+│  │                                                                    │     │
+│  │  ┌────────────────┐  ┌──────────────────────────────────────┐     │     │
+│  │  │ EndpointRegistry│  │ moq-lite Origin (MoqEventOrigin)    │     │     │
+│  │  │ (global singl.) │  │ • UDS at /tmp/hyprstream-{pid}/     │     │     │
+│  │  └───────┬────────┘  │   moq.sock                          │     │     │
+│  │          │            │ • Streaming + event bus             │     │     │
+│  │          │            └──────────────────────────────────────┘     │     │
+│  │  ┌───────┴───────────────────────────────────────────────────┐   │     │
+│  │  │                                                           │   │     │
+│  │  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐       │   │     │
+│  │  │  │RegistrySvc  │  │ PolicySvc   │  │ ModelSvc    │       │   │     │
+│  │  │  │ (Tokio)     │  │ (Tokio)     │  │ (Thread)    │       │   │     │
+│  │  │  │ UDS/inproc  │  │ UDS/inproc  │  │ UDS/inproc  │       │   │     │
+│  │  │  └─────────────┘  └─────────────┘  └─────────────┘       │   │     │
+│  │  │                                                           │   │     │
+│  │  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐       │   │     │
+│  │  │  │InferenceSvc │  │ WorkerSvc   │  │ EventBarrier│       │   │     │
+│  │  │  │ (Thread)    │  │ (Tokio)     │  │ (Tokio)     │       │   │     │
+│  │  │  │ UDS/inproc  │  │ UDS/inproc  │  │ moq-lite    │       │   │     │
+│  │  │  │ +moq stream │  │ +moq events │  │ event bus   │       │   │     │
+│  │  │  └─────────────┘  └─────────────┘  └─────────────┘       │   │     │
+│  │  │                                                           │   │     │
+│  │  └───────────────────────────────────────────────────────────┘   │     │
+│  │                                                                    │     │
+│  └───────────────────────────────────────────────────────────────────┘     │
+│                              │                                              │
+│           ┌──────────────────┼──────────────────┐                          │
+│           │                  │                  │                          │
+│           ▼                  ▼                  ▼                          │
+│  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐               │
+│  │ SUBPROCESS     │  │ SUBPROCESS     │  │ SUBPROCESS     │               │
+│  │ (Isolated)     │  │ (GPU Worker)   │  │ (Kata VM)      │               │
+│  │                │  │                │  │                │               │
+│  │ InferenceSvc   │  │ InferenceSvc   │  │ Container      │               │
+│  └────────────────┘  └────────────────┘  └────────────────┘               │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
 ## Debugging Runtime Issues
 
 ### "there is no reactor running" / "spawn_local called outside LocalSet"
 
-**Cause**: Async code using `spawn_local` (ZMQ client) running outside a LocalSet context.
+**Cause**: Async code using `spawn_local` running outside a LocalSet context.
 
 **Fix**: Wrap the async block in a LocalSet:
 ```rust
@@ -224,27 +393,6 @@ local.block_on(&rt, async { ... });
 | Factory construction | Main thread | No (unless wrapped) | Only with wrapper |
 | `Spawnable::run()` multi-thread | `new_multi_thread()` | No | Spawn dedicated thread |
 | `Spawnable::run()` single-thread | `new_current_thread()` | Yes | Yes |
-| ZMQ `RequestLoop` | Single thread | Yes | Yes |
+| `serve_bridged()` dispatch loop | Caller's runtime | Caller's | Yes |
 | HTTP handlers (OAI, Flight) | Multi-thread pool | No | Spawn dedicated thread |
 | HTTP handlers (OAuth) | Single thread (LocalSet) | Yes | Yes |
-
-## RPC Client Architecture
-
-The RPC client is already designed for connection pooling:
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  PolicyClient / RegistryClient / etc.                       │
-│  └── Arc<dyn RpcClient>  (Clone, Send+Sync)                │
-│       └── RpcClientImpl<Signer, Transport>                  │
-│            ├── signer: Ed25519 key                          │
-│            ├── transport: ZmqConnection (Send+Sync via Mutex)│
-│            ├── request_id: AtomicU64                        │
-│            └── default_jwt: Option<String>                  │
-└─────────────────────────────────────────────────────────────┘
-```
-
-- **Pooling primitive**: `Arc::clone()` — share one client across handlers
-- **Thread safety**: `ZmqConnection` wraps socket in `tokio::Mutex`
-- **Per-call auth**: `RequestBuilder` allows JWT override without mutation
-- **No LocalSet on client side**: The constraint is on the service side only
