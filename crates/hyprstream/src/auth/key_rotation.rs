@@ -174,10 +174,11 @@ fn load_slot(secrets_dir: &Path, name: &str) -> Option<KeySlot> {
 }
 
 fn persist_slot(secrets_dir: &Path, name: &str, slot: &KeySlot) -> anyhow::Result<()> {
-    let (key_path, meta_path) = slot_paths(secrets_dir, name);
-    std::fs::write(&key_path, slot.key.to_bytes())?;
+    // Atomic write + 0600 perms (#179) — replaces bare std::fs::write which
+    // used 0644 (world-readable) and was non-atomic (torn file on crash).
+    super::identity_store::write_secret(secrets_dir, &format!("jwt-signing-key.{name}"), &slot.key.to_bytes())?;
     let meta = SlotMeta { nbf: slot.nbf, exp: slot.exp };
-    std::fs::write(&meta_path, serde_json::to_vec(&meta)?)?;
+    super::identity_store::write_secret(secrets_dir, &format!("jwt-signing-key.{name}.meta"), &serde_json::to_vec(&meta)?)?;
     Ok(())
 }
 
@@ -420,10 +421,10 @@ fn load_es256_slot(secrets_dir: &Path, name: &str) -> Option<Es256KeySlot> {
 }
 
 fn persist_es256_slot(secrets_dir: &Path, name: &str, slot: &Es256KeySlot) -> anyhow::Result<()> {
-    let (key_path, meta_path) = es256_slot_paths(secrets_dir, name);
-    std::fs::write(&key_path, slot.key.to_bytes())?;
+    // Atomic write + 0600 perms (#179).
+    super::identity_store::write_secret(secrets_dir, &format!("es256-signing-key.{name}"), &slot.key.to_bytes())?;
     let meta = SlotMeta { nbf: slot.nbf, exp: slot.exp };
-    std::fs::write(&meta_path, serde_json::to_vec(&meta)?)?;
+    super::identity_store::write_secret(secrets_dir, &format!("es256-signing-key.{name}.meta"), &serde_json::to_vec(&meta)?)?;
     Ok(())
 }
 
@@ -615,11 +616,11 @@ mod ml_dsa_rotation {
     }
 
     pub(super) fn persist_ml_dsa_slot(secrets_dir: &Path, name: &str, slot: &MlDsaKeySlot) -> anyhow::Result<()> {
-        let (key_path, meta_path) = ml_dsa_slot_paths(secrets_dir, name);
+        // Atomic write + 0600 perms (#179).
         let seed = ml_dsa_sk_to_seed(&slot.key);
-        std::fs::write(&key_path, seed)?;
+        super::super::identity_store::write_secret(secrets_dir, &format!("ml-dsa-signing-key.{name}"), &seed)?;
         let meta = SlotMeta { nbf: slot.nbf, exp: slot.exp };
-        std::fs::write(&meta_path, serde_json::to_vec(&meta)?)?;
+        super::super::identity_store::write_secret(secrets_dir, &format!("ml-dsa-signing-key.{name}.meta"), &serde_json::to_vec(&meta)?)?;
         Ok(())
     }
 
