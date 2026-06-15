@@ -21,7 +21,7 @@ pub mod notify;
 
 // Top-level re-exports for convenience
 pub use service::spawner::{
-    DualSpawnable, LoadBalancerService, ProcessBackend, ProcessConfig, ProcessKind,
+    DualSpawnable, ProcessBackend, ProcessConfig, ProcessKind,
     ProcessSpawner, ProxyService, ServiceKind, ServiceMode, ServiceSpawner,
     Spawnable, SpawnedProcess, SpawnedService, SpawnerBackend, StandaloneBackend,
     SystemdBackend, InprocManager, UnifiedServiceConfig,
