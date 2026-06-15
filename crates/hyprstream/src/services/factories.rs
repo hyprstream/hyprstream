@@ -419,14 +419,18 @@ fn create_streams_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
     };
 
     // moq-lite streaming origin (epic #134 M2a). A standalone origin is built
-    // here so StreamService holds it and in-process publishers can append to it.
-    // When the iroh substrate is wired into bootstrap (M2b), this origin will be
-    // the substrate's shared `IrohMoqProtocolHandler` origin so external moq
-    // subscribers consume the same tree over the `moql` ALPN.
+    // here and registered as the process-global so all StreamChannels (on
+    // InferenceService, MetricsService, etc.) use it without each needing a
+    // reference threaded through their factory. In M2b this becomes the iroh
+    // substrate's shared origin so external moq subscribers see the same tree.
     let moq_origin = hyprstream_rpc::moq_stream::MoqStreamOrigin::standalone()
         .with_prefix("local/streams")
         .with_authorize_signer(gate)
         .build();
+
+    // Register the global BEFORE StreamService signals ready — all downstream
+    // services that call StreamChannel::publisher() will see it immediately.
+    hyprstream_rpc::moq_stream::init_global_moq_origin(moq_origin.clone());
 
     let stream_service = StreamService::new(
         "streams",

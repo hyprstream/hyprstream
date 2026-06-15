@@ -14,7 +14,8 @@ use tracing::{debug, info, warn};
 // Import ZMQ service infrastructure from hyprstream-rpc
 use hyprstream_rpc::prelude::SigningKey;
 use hyprstream_rpc::service::{AuthorizeFn, EnvelopeContext, RequestService};
-use hyprstream_rpc::streaming::{StreamChannel, StreamPublisher};
+use hyprstream_rpc::moq_stream::AnyStreamPublisher;
+use hyprstream_rpc::streaming::StreamChannel;
 use hyprstream_rpc::transport::TransportConfig;
 
 use crate::config::PoolConfig;
@@ -907,7 +908,7 @@ struct ActiveFdStream {
 /// 2. Reads from container console (vsock/serial)
 /// 3. Publishes data via StreamPublisher with HMAC authentication
 async fn run_fd_streaming_task(
-    publisher: &mut StreamPublisher,
+    publisher: &mut AnyStreamPublisher,
     container_id: String,
     cancel_token: CancellationToken,
     sandbox_pool: Arc<SandboxPool>,

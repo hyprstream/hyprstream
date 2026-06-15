@@ -37,7 +37,7 @@
 //! latest Group natively by the moq Track cache (respecting upstream Group
 //! cache consts), so the custom `StreamResume` / rejoin-buffer code is gone.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
@@ -47,6 +47,30 @@ use tokio_util::sync::CancellationToken;
 
 use crate::crypto::StreamHmacState;
 use crate::streaming::{StreamContext, StreamPayloadData, StreamVerifier};
+
+// ============================================================================
+// Process-global moq streaming origin — set once at startup, read everywhere.
+// Allows StreamChannel (publisher side) to use the same origin as StreamService
+// (server side) without threading it through every service factory.
+// ============================================================================
+
+static GLOBAL_MOQ_ORIGIN: OnceLock<MoqStreamOrigin> = OnceLock::new();
+
+/// Register the process-global moq streaming origin.
+///
+/// Must be called once at startup (from the streams service factory) before any
+/// `StreamChannel::publisher()` call. Returns `true` on first call, `false` if
+/// already set (idempotent — a second set is silently ignored).
+pub fn init_global_moq_origin(origin: MoqStreamOrigin) -> bool {
+    GLOBAL_MOQ_ORIGIN.set(origin).is_ok()
+}
+
+/// Borrow the process-global moq streaming origin, if initialized.
+///
+/// `None` when moq is not yet wired (unit tests, ZMQ-only deployments).
+pub fn global_moq_origin() -> Option<&'static MoqStreamOrigin> {
+    GLOBAL_MOQ_ORIGIN.get()
+}
 
 /// The single track name that carries StreamBlock groups for a broadcast.
 pub const STREAM_TRACK: &str = "stream";
@@ -297,6 +321,106 @@ impl MoqStreamPublisher {
     }
 }
 
+// ============================================================================
+// AnyStreamPublisher — unified publish API over ZMQ or moq-lite paths (#220)
+// ============================================================================
+
+/// Unified publisher that dispatches to either the ZMQ or moq-lite streaming
+/// plane. The API surface matches `StreamPublisher` exactly so all call sites
+/// that receive a publisher via closure (e.g. `StreamChannel::run_stream`) work
+/// unchanged regardless of which transport is active.
+pub enum AnyStreamPublisher {
+    /// ZMQ PUSH path (legacy, kept behind `StreamService::with_zmq_fallback`).
+    Zmq(crate::streaming::StreamPublisher),
+    /// moq-lite in-process path (M2a primary).
+    Moq(MoqStreamPublisher),
+}
+
+impl AnyStreamPublisher {
+    /// Publish binary data. For the moq path the rate hint is ignored (each
+    /// call maps 1:1 to one moq Group; batching is a ZMQ-path concern).
+    pub async fn publish_data(&mut self, data: &[u8]) -> Result<()> {
+        match self {
+            Self::Zmq(p) => p.publish_data(data).await,
+            Self::Moq(p) => p.publish_data(data).await,
+        }
+    }
+
+    /// Publish binary data with adaptive-batching rate hint (ZMQ path only).
+    /// On the moq path the rate is ignored and data is published immediately.
+    pub async fn publish_data_with_rate(&mut self, data: &[u8], rate: f32) -> Result<()> {
+        match self {
+            Self::Zmq(p) => p.publish_data_with_rate(data, rate).await,
+            Self::Moq(p) => {
+                let _ = rate;
+                p.publish_data(data).await
+            }
+        }
+    }
+
+    /// Publish a progress update (`stage:current:total`).
+    pub async fn publish_progress(&mut self, stage: &str, current: usize, total: usize) -> Result<()> {
+        let data = format!("{}:{}:{}", stage, current, total);
+        self.publish_data(data.as_bytes()).await
+    }
+
+    /// Publish an error payload (terminal).
+    pub async fn publish_error(&mut self, message: &str) -> Result<()> {
+        match self {
+            Self::Zmq(p) => p.publish_error(message).await,
+            Self::Moq(p) => p.publish_error(message).await,
+        }
+    }
+
+    /// Complete the stream with app-specific metadata (consumes self).
+    pub async fn complete(self, metadata: &[u8]) -> Result<()> {
+        match self {
+            Self::Zmq(p) => p.complete(metadata).await,
+            Self::Moq(p) => p.complete(metadata).await,
+        }
+    }
+
+    /// Complete the stream without consuming self (for use inside `run_stream`).
+    pub async fn complete_ref(&mut self, metadata: &[u8]) -> Result<()> {
+        match self {
+            Self::Zmq(p) => p.complete_ref(metadata).await,
+            Self::Moq(p) => p.complete_ref(metadata).await,
+        }
+    }
+
+    /// Flush any pending batched data (ZMQ path). No-op on the moq path.
+    pub async fn flush(&mut self) -> Result<()> {
+        match self {
+            Self::Zmq(p) => p.flush().await,
+            Self::Moq(_) => Ok(()), // moq publishes each block immediately
+        }
+    }
+
+    /// The opaque topic this publisher serves.
+    pub fn topic(&self) -> &str {
+        match self {
+            Self::Zmq(p) => p.topic(),
+            Self::Moq(p) => p.topic(),
+        }
+    }
+
+    /// Whether a terminal frame (Error/Complete) has been sent.
+    pub fn is_terminated(&self) -> bool {
+        match self {
+            Self::Zmq(p) => p.is_terminated(),
+            Self::Moq(p) => p.is_terminated(),
+        }
+    }
+
+    /// Whether the stream has been cancelled via the `CancellationToken`.
+    pub fn is_cancelled(&self) -> bool {
+        match self {
+            Self::Zmq(p) => p.is_cancelled(),
+            Self::Moq(p) => p.is_cancelled(),
+        }
+    }
+}
+
 /// Consumer-side helper: split a moq Frame payload back into the ZMQ-style
 /// `[topic, capnp, mac]` frames expected by [`StreamVerifier::verify`], then
 /// verify and parse it.
@@ -375,6 +499,52 @@ mod tests {
         assert!(matches!(&got[0], StreamPayload::Data(d) if d == b"hello"));
         assert!(matches!(&got[1], StreamPayload::Data(d) if d == b"world"));
         assert!(matches!(&got[2], StreamPayload::Complete(_)));
+        Ok(())
+    }
+
+    /// `AnyStreamPublisher::Moq` round-trip: publish via the enum wrapper and
+    /// verify the same bytes arrive on the moq consumer side.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn any_stream_publisher_moq_round_trip() -> Result<()> {
+        let origin = origin();
+        let (_client_secret, client_pub) = crate::crypto::generate_ephemeral_keypair();
+        let ctx = StreamContext::from_dh(&client_pub.to_bytes())?;
+        let topic = ctx.topic().to_owned();
+        let mac_key = *ctx.mac_key();
+
+        // Publish via AnyStreamPublisher::Moq (the primary M2a path)
+        let mut any_pub = AnyStreamPublisher::Moq(origin.publisher(&ctx)?);
+        any_pub.publish_data(b"ping").await?;
+        any_pub.complete_ref(b"{}").await?;
+
+        // Consume and verify
+        let path = origin.broadcast_path(&topic);
+        let bc = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            origin.consumer().announced_broadcast(path.as_str()),
+        )
+        .await?
+        .ok_or_else(|| anyhow!("broadcast not announced"))?;
+        let mut track = bc.subscribe_track(&Track::new(STREAM_TRACK))?;
+        let mut verifier = StreamVerifier::new(mac_key, topic.clone());
+        let mut got: Vec<StreamPayload> = Vec::new();
+        for _ in 0..2 {
+            let mut group = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                track.next_group(),
+            )
+            .await??
+            .ok_or_else(|| anyhow!("next_group None"))?;
+            let frame = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                group.read_frame(),
+            )
+            .await??
+            .ok_or_else(|| anyhow!("read_frame None"))?;
+            got.extend(verify_moq_frame(&mut verifier, &topic, &frame)?);
+        }
+        assert!(matches!(&got[0], StreamPayload::Data(d) if d == b"ping"));
+        assert!(matches!(&got[1], StreamPayload::Complete(_)));
         Ok(())
     }
 

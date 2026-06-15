@@ -1354,21 +1354,29 @@ impl StreamChannel {
         // 1. DH key exchange
         let stream_ctx = StreamContext::from_dh(client_ephemeral_pubkey)?;
 
-        // 2. Pre-authorize data + control topics with StreamService
-        let exp = chrono::Utc::now().timestamp() + expiry_secs;
-        self.pre_authorize(&stream_ctx, exp, claims.clone()).await?;
-        self.register_topic(stream_ctx.ctrl_topic(), exp, claims).await?;
+        if crate::moq_stream::global_moq_origin().is_none() {
+            // ZMQ path: pre-register topics with StreamService and wire the
+            // control-channel SUB socket. On the moq path these are unnecessary
+            // — the moq Origin's `authorize_signer` gate controls access, and
+            // late-join + cancellation are handled natively by moq Track cache
+            // and the CancellationToken below.
 
-        // 3. Subscribe control channel and register cancel token
-        let ctrl_tx = self.get_or_init_ctrl_sub().await?;
-        ctrl_tx.send(stream_ctx.ctrl_topic().as_bytes().to_vec()).await
-            .map_err(|_| anyhow::anyhow!("ctrl listener closed"))?;
-        self.cancel_tokens.insert(
-            stream_ctx.ctrl_topic().to_owned(),
-            (stream_ctx.cancel_token().clone(), *stream_ctx.ctrl_mac_key()),
-        );
+            // 2. Pre-authorize data + control topics with StreamService
+            let exp = chrono::Utc::now().timestamp() + expiry_secs;
+            self.pre_authorize(&stream_ctx, exp, claims.clone()).await?;
+            self.register_topic(stream_ctx.ctrl_topic(), exp, claims).await?;
 
-        // 4. Spawn JWT expiry timeout as universal backstop
+            // 3. Subscribe control channel and register cancel token
+            let ctrl_tx = self.get_or_init_ctrl_sub().await?;
+            ctrl_tx.send(stream_ctx.ctrl_topic().as_bytes().to_vec()).await
+                .map_err(|_| anyhow::anyhow!("ctrl listener closed"))?;
+            self.cancel_tokens.insert(
+                stream_ctx.ctrl_topic().to_owned(),
+                (stream_ctx.cancel_token().clone(), *stream_ctx.ctrl_mac_key()),
+            );
+        }
+
+        // 4. Spawn JWT expiry timeout as universal backstop (both paths)
         let token = stream_ctx.cancel_token().clone();
         let ctrl_topic = stream_ctx.ctrl_topic().to_owned();
         let tokens_map = Arc::clone(&self.cancel_tokens);
@@ -1550,27 +1558,34 @@ impl StreamChannel {
     /// // ... perform operation ...
     /// publisher.complete(&result_bytes).await?;
     /// ```
-    pub async fn publisher(&self, ctx: &StreamContext) -> Result<StreamPublisher> {
+    /// Create a publisher for a stream context.
+    ///
+    /// Returns an `AnyStreamPublisher` that dispatches to the moq-lite origin
+    /// when one is globally registered (#220), otherwise falls back to ZMQ PUSH.
+    pub async fn publisher(&self, ctx: &StreamContext) -> Result<crate::moq_stream::AnyStreamPublisher> {
+        if let Some(origin) = crate::moq_stream::global_moq_origin() {
+            let moq_pub = origin.publisher(ctx)?;
+            return Ok(crate::moq_stream::AnyStreamPublisher::Moq(moq_pub));
+        }
         let socket_arc = self.get_or_init_socket().await?;
-        Ok(StreamPublisher::new(socket_arc, ctx))
+        Ok(crate::moq_stream::AnyStreamPublisher::Zmq(StreamPublisher::new(socket_arc, ctx)))
     }
 
     /// Run a streaming operation with framework-guaranteed terminal frame.
     ///
-    /// The closure receives `StreamPublisher` by value and **must return it**
-    /// alongside its result. This preserves the HMAC chain so the framework
-    /// can send a valid terminal frame if the closure didn't.
+    /// The closure receives an [`AnyStreamPublisher`] by value and **must return
+    /// it** alongside its result. The framework sends a terminal frame if the
+    /// closure didn't. Transport (moq-lite or ZMQ) is selected automatically
+    /// based on whether a global moq origin is registered.
     ///
     /// After the closure returns:
     /// - If `Ok` and not terminated → framework sends `Complete` (empty metadata)
     /// - If `Err` and not terminated → framework sends `Error` with the error message
     /// - If already terminated → no-op (closure handled it)
-    ///
-    /// Drop remains as a panic-only safety net.
     pub async fn run_stream<F, Fut, R>(&self, ctx: &StreamContext, f: F) -> Result<R>
     where
-        F: FnOnce(StreamPublisher) -> Fut,
-        Fut: Future<Output = (StreamPublisher, Result<R>)>,
+        F: FnOnce(crate::moq_stream::AnyStreamPublisher) -> Fut,
+        Fut: Future<Output = (crate::moq_stream::AnyStreamPublisher, Result<R>)>,
     {
         let publisher = self.publisher(ctx).await?;
         let (mut publisher, result) = f(publisher).await;
@@ -1598,9 +1613,9 @@ impl StreamChannel {
     /// Used by NotificationService where topics are registered via `register_topic()`
     /// and don't use DH-based key exchange. The transport MAC key is randomly generated
     /// (separate from notification E2E MAC which is embedded in the payload).
-    pub async fn publisher_for_topic(&self, topic: &str) -> Result<StreamPublisher> {
-        // Generate a random transport-level MAC key for StreamService wire format.
-        // This is NOT the notification's E2E MAC — it's for StreamService HMAC chain.
+    pub async fn publisher_for_topic(&self, topic: &str) -> Result<crate::moq_stream::AnyStreamPublisher> {
+        // Generate a random transport-level MAC key for the HMAC chain.
+        // (Not the notification's E2E MAC — that's embedded in the payload.)
         let mut mac_key = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut mac_key);
 

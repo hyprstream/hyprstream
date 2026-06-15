@@ -153,13 +153,17 @@ pub struct StreamService {
 
     /// moq-lite streaming plane (epic #134 M2a).
     ///
-    /// When set, in-process publishers can append directly to the shared
-    /// `moq_net::Origin` (via [`crate::moq_stream::MoqStreamOrigin::publisher`])
-    /// and external subscribers consume the same origin over the `moql` ALPN.
-    /// The ZMQ PULL→XPUB proxy below remains as a parallel path until the
-    /// substrate is wired into service bootstrap. The in-process publish gate
-    /// (`authorize_signer`) is mirrored onto the moq origin by the factory.
+    /// When set and `zmq_fallback` is false (default), the ZMQ PULL→XPUB
+    /// loop is not started. In-process publishers reach this origin via the
+    /// process-global accessor `global_moq_origin()`; external subscribers
+    /// consume over the `moql` ALPN. Late-join is moq's job (Track cache).
     moq: Option<crate::moq_stream::MoqStreamOrigin>,
+
+    /// Keep the ZMQ PULL→XPUB proxy loop running even when `moq` is set.
+    ///
+    /// Default: `false`. Set via `with_zmq_fallback()` for differential
+    /// testing against the ZMQ path. Removed entirely in M5 teardown.
+    zmq_fallback: bool,
 }
 
 impl StreamService {
@@ -216,7 +220,15 @@ impl StreamService {
             verifying_key,
             authorize_signer: None,
             moq: None,
+            zmq_fallback: false,
         }
+    }
+
+    /// Keep the ZMQ PULL→XPUB proxy loop running even when a moq origin is
+    /// attached. Used for differential testing; removed in M5 teardown.
+    pub fn with_zmq_fallback(mut self) -> Self {
+        self.zmq_fallback = true;
+        self
     }
 
     /// Attach a moq-lite streaming origin (epic #134 M2a).
@@ -899,11 +911,34 @@ impl crate::service::Spawnable for StreamService {
         shutdown: Arc<Notify>,
         on_ready: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<(), crate::error::RpcError> {
+        // When moq is primary (default M2a configuration), skip the ZMQ proxy
+        // loop entirely. In-process publishers go straight to the global moq
+        // origin; external subscribers consume over the `moql` ALPN. The ZMQ
+        // PULL→XPUB sockets are not bound so they consume no OS resources.
+        if self.moq.is_some() && !self.zmq_fallback {
+            info!(
+                service = %self.name,
+                "StreamService running in moq-primary mode (ZMQ proxy bypassed)"
+            );
+            if let Some(tx) = on_ready {
+                let _ = tx.send(());
+            }
+            let _ = crate::notify::ready();
+            // Park the spawner thread until shutdown is signalled.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| crate::error::RpcError::SpawnFailed(format!("rt: {e}")))?;
+            rt.block_on(shutdown.notified());
+            info!(service = %self.name, "StreamService (moq-primary) stopped");
+            return Ok(());
+        }
+
         info!(
             service = %self.name,
             pub_endpoint = %self.pub_transport.to_zmq_string(),
             pull_endpoint = %self.pull_transport.to_zmq_string(),
-            "Starting StreamService queuing proxy"
+            "Starting StreamService ZMQ queuing proxy"
         );
 
         // Setup sockets BEFORE signaling ready
