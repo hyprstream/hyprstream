@@ -626,24 +626,6 @@ impl ServiceContext {
         }
     }
 
-    /// Create a typed client for a compile-time-known service.
-    ///
-    /// Uses `RpcClient<LocalSigner, ZmqConnection>` via the generated `connect_to()` constructor.
-    pub fn rpc_client(&self, service: &str) -> std::sync::Arc<dyn hyprstream_rpc::RpcClient> {
-        let endpoint = self.endpoint(service, SocketKind::Rep).to_zmq_string();
-        let signer = hyprstream_rpc::signer::LocalSigner::new(
-            self.signing_key.clone(),
-        );
-        let transport = hyprstream_rpc::zmq_connection::ZmqConnection::new(
-            &endpoint,
-            self.zmq_context.clone(),
-        );
-        let rpc = hyprstream_rpc::rpc_client::RpcClientImpl::new(
-            signer, transport, Some(self.verifying_key),
-        );
-        std::sync::Arc::new(rpc)
-    }
-
     /// Wrap a RequestService for spawning with a per-service QUIC port.
     ///
     /// - `quic_port: None` → use ephemeral port (0) when QUIC is globally enabled

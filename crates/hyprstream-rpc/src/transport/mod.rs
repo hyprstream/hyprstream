@@ -421,8 +421,17 @@ impl TransportConfig {
             EndpointType::Ipc {
                 path: PathBuf::from(path),
             }
+        } else if endpoint.contains("://") {
+            // Unknown scheme — fail-closed: misrouting to inproc would yield a
+            // cryptic "no in-process service registered" error at dial time.
+            // Networked transports (quic://, iroh://, tcp://) are obtained via
+            // TransportConfig::from_resolver(), not from_endpoint().
+            panic!(
+                "TransportConfig::from_endpoint: unknown scheme in '{endpoint}'; \
+                 use from_resolver() for networked transports"
+            );
         } else {
-            // Default to inproc if no scheme
+            // Bare name (no scheme) — defaults to inproc
             EndpointType::Inproc {
                 endpoint: endpoint.to_owned(),
             }
