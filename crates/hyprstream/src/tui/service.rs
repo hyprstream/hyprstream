@@ -19,9 +19,7 @@ use tracing::{debug, info, warn};
 
 use hyprstream_rpc::moq_stream::{AnyStreamPublisher, global_moq_origin};
 use hyprstream_rpc::prelude::*;
-use hyprstream_rpc::streaming::{
-    BatchingConfig, StreamChannel, StreamContext, StreamPublisher, StreamPublisherConfig,
-};
+use hyprstream_rpc::streaming::{StreamChannel, StreamContext};
 use hyprstream_rpc::{EnvelopeContext, RequestService, Continuation};
 
 use crate::tui_capnp;
@@ -1890,49 +1888,16 @@ pub(crate) async fn run_frame_loop(
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
                     FrameLoopCommand::RegisterViewer(pending) => {
-                        // ZMQ-only: dedicated socket config + batching for frame publishing.
-                        let publisher_config = StreamPublisherConfig { sndhwm: 100, dedicated: true };
-                        let batching = BatchingConfig {
-                            min_batch_size: 1,
-                            max_batch_size: 1,
-                            max_block_bytes: 256 * 1024,
-                            min_rate: 1.0,
-                            max_rate: 30.0,
-                        };
-                        let exp = chrono::Utc::now().timestamp() + 86400; // 24h expiry
-                        let use_zmq = global_moq_origin().is_none();
-
                         // FD 0 (stdin): input relay publisher — only for Capnp-mode viewers
                         // (i.e. the CLI cast player). Ansi-mode viewers don't need it;
                         // their keyboard input falls through to VTE when no producer exists.
                         let stdin_publisher: Option<AnyStreamPublisher> = if pending.display_mode == DisplayMode::Capnp {
                             if let Some(stdin_ctx) = pending.stream_ctxs.first() {
-                                let topic = stdin_ctx.topic().to_owned();
-                                // ZMQ path: pre-register with StreamService proxy so subscriptions
-                                // aren't rejected. moq Origin handles access control natively.
-                                if use_zmq {
-                                    if let Err(e) = stream_channel.register_topic(&topic, exp, None).await {
-                                        warn!(viewer_id = pending.id, error = %e, "Failed to register stdin topic");
-                                    }
-                                }
                                 match stream_channel.publisher(stdin_ctx).await {
                                     Ok(pub_) => Some(pub_),
                                     Err(e) => {
-                                        if use_zmq {
-                                            // ZMQ dedicated socket: fall back to custom batching config
-                                            match stream_channel.create_publisher_socket(&publisher_config) {
-                                                Ok(socket) => Some(AnyStreamPublisher::Zmq(
-                                                    StreamPublisher::with_dedicated_socket(socket, stdin_ctx, batching.clone()),
-                                                )),
-                                                Err(e2) => {
-                                                    warn!(viewer_id = pending.id, error = %e2, "Failed to create stdin publisher");
-                                                    None
-                                                }
-                                            }
-                                        } else {
-                                            warn!(viewer_id = pending.id, error = %e, "Failed to create stdin publisher");
-                                            None
-                                        }
+                                        warn!(viewer_id = pending.id, error = %e, "Failed to create stdin publisher");
+                                        None
                                     }
                                 }
                             } else {
@@ -1950,15 +1915,6 @@ pub(crate) async fn run_frame_loop(
                                 continue;
                             }
                         };
-                        let stdout_topic = stdout_ctx.topic().to_owned();
-                        // ZMQ path only: pre-register topic with StreamService proxy.
-                        if use_zmq {
-                            if let Err(e) = stream_channel.register_topic(&stdout_topic, exp, None).await {
-                                warn!(viewer_id = pending.id, error = %e, "Failed to register stdout topic");
-                            } else {
-                                debug!(viewer_id = pending.id, topic = %stdout_topic, "Stream topic registered with proxy");
-                            }
-                        }
 
                         // Register a stdin queue for Capnp-mode viewers so they can
                         // use pollStdin RPC instead of subscribing to the ZMQ stream.
@@ -1967,17 +1923,8 @@ pub(crate) async fn run_frame_loop(
                             queues.entry(pending.id).or_default();
                         }
 
-                        // Build stdout publisher: moq path via stream_channel.publisher();
-                        // ZMQ path uses a dedicated socket with custom batching config.
-                        let publisher_result: Result<AnyStreamPublisher, _> = if use_zmq {
-                            stream_channel.create_publisher_socket(&publisher_config).map(|socket| {
-                                AnyStreamPublisher::Zmq(StreamPublisher::with_dedicated_socket(
-                                    socket, stdout_ctx, batching,
-                                ))
-                            })
-                        } else {
-                            stream_channel.publisher(stdout_ctx).await
-                        };
+                        let publisher_result: Result<AnyStreamPublisher, _> =
+                            stream_channel.publisher(stdout_ctx).await;
 
                         match publisher_result {
                             Ok(publisher) => {
