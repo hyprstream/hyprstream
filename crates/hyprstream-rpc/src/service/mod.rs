@@ -12,7 +12,6 @@
 mod traits;
 mod zmq;
 pub mod dispatch;
-pub mod streaming;
 pub mod serve;
 pub mod spawnable;
 pub mod metadata;
@@ -28,7 +27,6 @@ pub use zmq::{AuthorizeFn, Continuation, EnvelopeContext, QuicLoopConfig, Servic
 /// edits; removed in #138 when ZMQ is torn down.
 #[doc(hidden)]
 pub use zmq::RequestService as ZmqService;
-pub use streaming::StreamService;
 pub use spawnable::Spawnable;
 pub use metadata::{MethodMeta, ParamMeta, SchemaMetadataFn, ScopedSchemaMetadataFn, ScopedClientTreeNode};
 pub use doc::DocFs;

@@ -89,7 +89,6 @@ pub mod registry;
 pub mod fs;
 pub mod remote_mount;
 pub mod rpc_types;
-pub mod stream;
 pub mod typed;
 pub mod worker;
 
@@ -127,7 +126,6 @@ pub use policy::PolicyService;
 pub use generated::policy_client::PolicyClient;
 pub use model::{ModelService, ModelServiceConfig, MODEL_ENDPOINT};
 pub use generated::model_client::ModelClient;
-pub use stream::StreamService;
 pub use worker::build_authorize_fn;
 pub use hyprstream_workers::runtime::WorkerClient;
 pub use oauth::OAuthService;
