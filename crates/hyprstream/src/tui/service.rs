@@ -849,12 +849,8 @@ impl TuiService {
         ).map_err(|e| anyhow::anyhow!("Invalid model key: {e}"))?;
 
         let models = {
-            let registry_endpoint = hyprstream_rpc::registry::global()
-                .endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep)
-                .to_zmq_string();
             let registry_client: crate::services::RegistryClient =
-                crate::services::RegistryClient::for_endpoint(
-                    &registry_endpoint,
+                crate::services::RegistryClient::for_service(
                     self.signing_key.clone(),
                     registry_vk,
                     None,
