@@ -1314,12 +1314,12 @@ impl TuiService {
         let model_ref = model_ref.to_owned();
 
         let (tool_caller, tool_descriptions, openai_tools) =
-            super::zmq_transport::make_tool_caller(&self.signing_key);
+            super::rpc_transport::make_tool_caller(&self.signing_key);
 
         let gen_config = std::sync::Arc::new(parking_lot::RwLock::new(
             hyprstream_tui::chat_app::ChatGenConfig::default(),
         ));
-        let spawner = super::zmq_transport::make_chat_spawner(
+        let spawner = super::rpc_transport::make_chat_spawner(
             &self.signing_key,
             &model_ref,
             Some(openai_tools),

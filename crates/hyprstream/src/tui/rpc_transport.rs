@@ -1,4 +1,4 @@
-//! ZMQ-based StreamSpawner and ToolCaller for ChatApp inference.
+//! RPC-backed StreamSpawner and ToolCaller for ChatApp inference.
 //!
 //! Deduplicated from `shell_handlers.rs` and `service.rs` — both callers now
 //! use `make_chat_spawner` and (optionally) `make_tool_caller` from this module.

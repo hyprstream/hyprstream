@@ -1093,7 +1093,7 @@ async fn handle_rpc(
             // Fetch tool list once; used by both the spawner (for chat template)
             // and the ChatApp (for dispatch + descriptions).
             let (tool_caller, tool_descriptions, openai_tools) =
-                crate::tui::zmq_transport::make_tool_caller(signing_key);
+                crate::tui::rpc_transport::make_tool_caller(signing_key);
 
             // Shared gen_config Arc — passed to both the spawner and the ChatApp.
             // Use model-specific defaults from RPC if available, otherwise fall back.
@@ -1150,7 +1150,7 @@ async fn handle_rpc(
                     let save_hook: SaveHook = Box::new(move |entries| {
                         let _ = save_store.save(&uuid_for_save, entries);
                     });
-                    let spawner = crate::tui::zmq_transport::make_chat_spawner(
+                    let spawner = crate::tui::rpc_transport::make_chat_spawner(
                         signing_key, &model_ref, Some(openai_tools.clone()),
                         gen_config.clone(),
                     );
@@ -1167,7 +1167,7 @@ async fn handle_rpc(
                         format!("Private store dir unavailable: {e}"),
                         ToastLevel::Warn,
                     );
-                    let spawner = crate::tui::zmq_transport::make_chat_spawner(
+                    let spawner = crate::tui::rpc_transport::make_chat_spawner(
                         signing_key, &model_ref, Some(openai_tools.clone()),
                         gen_config.clone(),
                     );
