@@ -2670,10 +2670,6 @@ impl RequestService for RegistryService {
         "registry"
     }
 
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
-    }
-
     fn transport(&self) -> &TransportConfig {
         &self.transport
     }
@@ -2789,7 +2785,6 @@ mod tests {
             Arc::new(signing_key.clone()),
             crate::config::TokenConfig::default(),
             git2db,
-            context.clone(),
             policy_transport,
         );
         let manager = InprocManager::new();

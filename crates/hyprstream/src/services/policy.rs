@@ -68,7 +68,6 @@ pub struct PolicyService {
     /// JWT key source for verifying JWTs (local and federated).
     jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
     // Infrastructure (for Spawnable)
-    context: Arc<zmq::Context>,
     transport: TransportConfig,
     /// Event prefix state for secure event transport (Phase 7).
     /// PolicyService is a blind relay — stores opaque wrapped blobs, never plaintext keys.
@@ -88,7 +87,6 @@ impl PolicyService {
         signing_key: Arc<SigningKey>,
         token_config: crate::config::TokenConfig,
         git2db: Arc<RwLock<Git2DB>>,
-        context: Arc<zmq::Context>,
         transport: TransportConfig,
     ) -> Self {
         let registry_repo_id = RepoId::from_uuid(git2db::registry::registry_self_uuid());
@@ -103,7 +101,6 @@ impl PolicyService {
             registry_repo_id,
             default_audience: None,
             jwt_key_source: None,
-            context,
             transport,
             event_prefixes: RwLock::new(HashMap::new()),
             jti_blocklist: Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new()),
@@ -1478,10 +1475,6 @@ impl RequestService for PolicyService {
 
     fn name(&self) -> &str {
         "policy"
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
     }
 
     fn transport(&self) -> &TransportConfig {

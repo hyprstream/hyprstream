@@ -1262,8 +1262,6 @@ where
     /// Server leaf certificate DER bytes — used to pin the registered QUIC
     /// endpoint (self-signed, so clients pin the SHA-256 rather than CA-validate).
     cert_der: Vec<u8>,
-    /// ZMQ context (for Spawnable trait)
-    context: Arc<zmq::Context>,
     /// Service name
     name: String,
     /// QUIC endpoint address
@@ -1282,7 +1280,6 @@ where
             rep,
             service,
             cert_der,
-            context: Arc::new(zmq::Context::new()),
             name,
             addr,
         })
@@ -1300,10 +1297,6 @@ where
 {
     fn name(&self) -> &str {
         &self.name
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
     }
 
     fn registrations(&self) -> Vec<(crate::registry::SocketKind, crate::transport::TransportConfig)> {

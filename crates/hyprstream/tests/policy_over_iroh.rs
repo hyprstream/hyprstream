@@ -82,10 +82,6 @@ async fn make_policy_service() -> Result<(PolicyService, SigningKey, TempDir)> {
         Arc::new(signing_key.clone()),
         TokenConfig::default(),
         git2db,
-        // Unused on the iroh path — the bridge never touches the ZMQ
-        // transport bits of RequestService, just `handle_request` + envelope
-        // metadata.
-        Arc::new(zmq::Context::new()),
         TransportConfig::inproc("policy-over-iroh-unused"),
     );
 

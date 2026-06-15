@@ -55,7 +55,6 @@ struct MetricsInner {
 pub struct MetricsService {
     inner: Arc<MetricsInner>,
     policy_client: PolicyClient,
-    context: Arc<zmq::Context>,
     transport: TransportConfig,
     signing_key: SigningKey,
     expected_audience: Option<String>,
@@ -72,13 +71,13 @@ impl MetricsService {
     ) -> Self {
         let stream_channel = StreamChannel::new(Arc::clone(&context), signing_key.clone());
 
+        let _ = context; // consumed by StreamChannel::new above; not retained
         Self {
             inner: Arc::new(MetricsInner {
                 orchestrator,
                 stream_channel,
             }),
             policy_client,
-            context,
             transport,
             signing_key,
             expected_audience: None,
@@ -604,10 +603,6 @@ impl RequestService for MetricsService {
         "metrics"
     }
 
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
-    }
-
     fn transport(&self) -> &TransportConfig {
         &self.transport
     }
@@ -690,7 +685,6 @@ mod tests {
             Arc::new(signing_key.clone()),
             crate::config::TokenConfig::default(),
             git2db,
-            context.clone(),
             TransportConfig::inproc(&policy_tag),
         );
         let manager = InprocManager::new();

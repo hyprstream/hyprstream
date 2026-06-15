@@ -84,7 +84,6 @@ pub struct WorkerService {
     stream_channel: Arc<StreamChannel>,
 
     // Infrastructure (for Spawnable)
-    context: Arc<zmq::Context>,
     transport: TransportConfig,
     signing_key: SigningKey,
 
@@ -115,6 +114,7 @@ impl WorkerService {
 
         let stream_channel = Arc::new(StreamChannel::new(Arc::clone(&context), signing_key.clone()));
 
+        let _ = context; // consumed by StreamChannel::new above; not retained
         Ok(Self {
             sandbox_pool,
             rafs_store,
@@ -123,7 +123,6 @@ impl WorkerService {
             event_publisher: tokio::sync::Mutex::new(event_publisher),
             active_fd_streams: Arc::new(RwLock::new(HashMap::new())),
             stream_channel,
-            context,
             transport,
             signing_key,
             authorize_fn: None,
@@ -1318,10 +1317,6 @@ impl RequestService for WorkerService {
 
     fn name(&self) -> &str {
         SERVICE_NAME
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
     }
 
     fn transport(&self) -> &TransportConfig {

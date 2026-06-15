@@ -302,9 +302,6 @@ pub trait RequestService: 'static {
     /// Service name (for logging and registry).
     fn name(&self) -> &str;
 
-    /// ZMQ context for socket creation.
-    fn context(&self) -> &Arc<zmq::Context>;
-
     /// Transport configuration (endpoint binding).
     fn transport(&self) -> &TransportConfig;
 

@@ -503,7 +503,6 @@ mod tests {
     /// Minimal `RequestService` for `spawn_with` tests.
     struct BridgeEcho {
         name: String,
-        ctx: Arc<zmq::Context>,
         transport: crate::transport::TransportConfig,
         signing_key: SigningKey,
     }
@@ -511,7 +510,6 @@ mod tests {
         fn new(signing_key: SigningKey) -> Self {
             Self {
                 name: "bridge-echo".to_owned(),
-                ctx: Arc::new(zmq::Context::new()),
                 transport: crate::transport::TransportConfig::inproc("bridge-echo-unused"),
                 signing_key,
             }
@@ -530,9 +528,6 @@ mod tests {
         }
         fn name(&self) -> &str {
             &self.name
-        }
-        fn context(&self) -> &Arc<zmq::Context> {
-            &self.ctx
         }
         fn transport(&self) -> &crate::transport::TransportConfig {
             &self.transport

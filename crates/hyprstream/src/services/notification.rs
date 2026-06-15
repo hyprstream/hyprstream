@@ -301,7 +301,6 @@ pub struct NotificationService {
     expected_audience: Option<String>,
     jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
     // Infrastructure
-    context: Arc<zmq::Context>,
     transport: TransportConfig,
 }
 
@@ -331,6 +330,7 @@ impl NotificationService {
             }
         });
 
+        let _ = context; // consumed by StreamChannel::new above; not retained
         Self {
             subscribers,
             pending_intents: Arc::new(RwLock::new(HashMap::new())),
@@ -340,7 +340,6 @@ impl NotificationService {
             policy_client: None,
             expected_audience: None,
             jwt_key_source: None,
-            context,
             transport,
         }
     }
@@ -800,10 +799,6 @@ impl RequestService for NotificationService {
 
     fn name(&self) -> &str {
         "notification"
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
     }
 
     fn transport(&self) -> &TransportConfig {

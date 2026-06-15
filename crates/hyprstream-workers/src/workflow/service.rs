@@ -90,9 +90,6 @@ pub struct WorkflowService {
     /// Per-repo workflow subscriptions (O(1) lookup)
     repo_workflows: RwLock<HashMap<String, Vec<WorkflowSubscription>>>,
 
-    /// ZMQ context for event subscription
-    context: Arc<zmq::Context>,
-
     /// Event handlers for different event types
     handlers: RwLock<Vec<Box<dyn EventHandler>>>,
 
@@ -117,11 +114,9 @@ impl WorkflowService {
     ///
     /// # Arguments
     ///
-    /// * `context` - ZMQ context for event subscription (must be same as EventService for inproc://)
     /// * `transport` - Transport configuration for ZMQ service binding
     /// * `signing_key` - Signing key for message authentication
     pub fn new(
-        context: Arc<zmq::Context>,
         transport: TransportConfig,
         signing_key: SigningKey,
     ) -> Self {
@@ -129,7 +124,6 @@ impl WorkflowService {
             workflows: RwLock::new(HashMap::new()),
             runs: Arc::new(RwLock::new(HashMap::new())),
             repo_workflows: RwLock::new(HashMap::new()),
-            context,
             handlers: RwLock::new(Vec::new()),
             event_loop_handle: tokio::sync::Mutex::new(None),
             transport,
@@ -629,10 +623,6 @@ impl RequestService for WorkflowService {
 
     fn name(&self) -> &str {
         SERVICE_NAME
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
     }
 
     fn transport(&self) -> &TransportConfig {

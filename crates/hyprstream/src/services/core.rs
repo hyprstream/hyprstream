@@ -8,7 +8,7 @@ mod tests {
     use super::*;
     use crate::zmq::global_context;
     use anyhow::Result;
-    use std::sync::Arc;
+
     use hyprstream_rpc::crypto::generate_signing_keypair;
     use hyprstream_rpc::prelude::*;
     use hyprstream_rpc::service::RequestLoop;
@@ -20,14 +20,13 @@ mod tests {
 
     /// Test service with infrastructure (new pattern)
     struct EchoService {
-        context: Arc<zmq::Context>,
         transport: TransportConfig,
         signing_key: SigningKey,
     }
 
     impl EchoService {
-        fn new(context: Arc<zmq::Context>, transport: TransportConfig, signing_key: SigningKey) -> Self {
-            Self { context, transport, signing_key }
+        fn new(transport: TransportConfig, signing_key: SigningKey) -> Self {
+            Self { transport, signing_key }
         }
     }
 
@@ -42,10 +41,6 @@ mod tests {
 
         fn name(&self) -> &str {
             "echo"
-        }
-
-        fn context(&self) -> &Arc<zmq::Context> {
-            &self.context
         }
 
         fn transport(&self) -> &TransportConfig {
@@ -79,7 +74,7 @@ mod tests {
             let endpoint = transport.zmq_endpoint();
 
             let (signing_key, verifying_key) = generate_signing_keypair();
-            let service = EchoService::new(global_context(), transport.clone(), signing_key.clone());
+            let service = EchoService::new(transport.clone(), signing_key.clone());
 
             let runner = RequestLoop::new(transport, global_context(), signing_key.clone());
             let mut handle = runner.run(service).await.expect("test: start service");
@@ -109,7 +104,7 @@ mod tests {
 
             let (server_signing_key, server_verifying_key) = generate_signing_keypair();
 
-            let service = EchoService::new(global_context(), transport.clone(), server_signing_key.clone());
+            let service = EchoService::new(transport.clone(), server_signing_key.clone());
 
             let runner = RequestLoop::new(transport, global_context(), server_signing_key);
             let mut handle = runner.run(service).await.expect("test: start service");

@@ -119,7 +119,6 @@ pub struct DiscoveryService {
     /// Domain the TLS endorsement covers (empty when no endorsement).
     tls_domain: String,
     // Infrastructure (for Spawnable)
-    context: Arc<zmq::Context>,
     transport: TransportConfig,
 }
 
@@ -132,7 +131,6 @@ impl DiscoveryService {
     pub fn new(
         signing_key: Arc<SigningKey>,
         jwt_verifying_key: hyprstream_rpc::prelude::VerifyingKey,
-        context: Arc<zmq::Context>,
         transport: TransportConfig,
     ) -> Self {
         Self {
@@ -148,7 +146,6 @@ impl DiscoveryService {
             envelope_keysets: RwLock::new(HashMap::new()),
             tls_endorsement: Vec::new(),
             tls_domain: String::new(),
-            context,
             transport,
         }
     }
@@ -743,10 +740,6 @@ impl RequestService for DiscoveryService {
 
     fn name(&self) -> &str {
         "discovery"
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
     }
 
     fn transport(&self) -> &TransportConfig {

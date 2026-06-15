@@ -57,9 +57,6 @@ pub struct FlightService {
     /// Optional registry client for dataset lookup
     registry_client: Option<Arc<dyn hyprstream_metrics::RegistryClient>>,
 
-    /// ZMQ context for control socket
-    context: Arc<zmq::Context>,
-
     /// Transport configuration for ZMQ control channel
     control_transport: TransportConfig,
 
@@ -75,20 +72,17 @@ impl FlightService {
     ///
     /// * `config` - Flight configuration (host, port, dataset)
     /// * `registry_client` - Optional registry client for dataset lookup
-    /// * `context` - ZMQ context for control socket
     /// * `control_transport` - Transport for ZMQ control channel
     /// * `verifying_key` - Key for verifying signed envelopes
     pub fn new(
         config: HyprFlightConfig,
         registry_client: Option<Arc<dyn hyprstream_metrics::RegistryClient>>,
-        context: Arc<zmq::Context>,
         control_transport: TransportConfig,
         verifying_key: VerifyingKey,
     ) -> Self {
         Self {
             config,
             registry_client,
-            context,
             control_transport,
             verifying_key,
         }
@@ -98,10 +92,6 @@ impl FlightService {
 impl Spawnable for FlightService {
     fn name(&self) -> &str {
         SERVICE_NAME
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
     }
 
     fn registrations(&self) -> Vec<(SocketKind, TransportConfig)> {

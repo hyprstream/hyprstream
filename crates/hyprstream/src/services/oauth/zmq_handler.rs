@@ -28,7 +28,6 @@ use super::state::OAuthState;
 /// for Cap'n Proto serialization, and `RequestService` for ZMQ transport.
 pub struct OAuthZmqHandler {
     state: Arc<OAuthState>,
-    context: Arc<zmq::Context>,
     transport: TransportConfig,
     signing_key: SigningKey,
 }
@@ -36,13 +35,11 @@ pub struct OAuthZmqHandler {
 impl OAuthZmqHandler {
     pub fn new(
         state: Arc<OAuthState>,
-        context: Arc<zmq::Context>,
         transport: TransportConfig,
         signing_key: SigningKey,
     ) -> Self {
         Self {
             state,
-            context,
             transport,
             signing_key,
         }
@@ -277,10 +274,6 @@ impl RequestService for OAuthZmqHandler {
 
     fn name(&self) -> &str {
         "oauth"
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
     }
 
     fn transport(&self) -> &TransportConfig {

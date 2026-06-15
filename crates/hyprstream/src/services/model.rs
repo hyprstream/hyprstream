@@ -140,7 +140,6 @@ pub struct ModelServiceInner {
     #[allow(dead_code)]
     spawned_instances: RwLock<HashMap<String, crate::services::callback::Instance>>,
     // Infrastructure (for Spawnable)
-    context: Arc<zmq::Context>,
     transport: TransportConfig,
     /// Expected JWT audience for token validation (RFC 8707).
     expected_audience: Option<String>,
@@ -181,7 +180,6 @@ impl ModelService {
         signing_key: SigningKey,
         policy_client: PolicyClient,
         registry: RegistryClient,
-        context: Arc<zmq::Context>,
         transport: TransportConfig,
     ) -> Result<Self> {
         // SAFETY: 5 is a valid non-zero value
@@ -217,7 +215,6 @@ impl ModelService {
             registry,
             callback_router: None,
             spawned_instances: RwLock::new(HashMap::new()),
-            context,
             transport,
             expected_audience: None,
             jwt_key_source: None,
@@ -260,7 +257,6 @@ impl ModelService {
         policy_client: PolicyClient,
         registry: RegistryClient,
         callback_router: crate::services::callback::CallbackRouter,
-        context: Arc<zmq::Context>,
         transport: TransportConfig,
     ) -> Result<Self> {
         const DEFAULT_CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(5) {
@@ -295,7 +291,6 @@ impl ModelService {
             registry,
             callback_router: Some(callback_router),
             spawned_instances: RwLock::new(HashMap::new()),
-            context,
             transport,
             expected_audience: None,
             jwt_key_source: None,
@@ -390,7 +385,6 @@ impl ModelService {
         let fs: Option<crate::services::WorktreeClient> = Some(repo_client.worktree(&branch_name));
 
         // Start InferenceService for this model via standard Spawnable infrastructure
-        let zmq_ctx = Arc::clone(hyprstream_rpc::RequestService::context(self));
         let spawner = hyprstream_service::ServiceSpawner::threaded();
 
         let transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(&endpoint);
@@ -399,7 +393,6 @@ impl ModelService {
             runtime_config,
             self.signing_key.verifying_key(),
             self.signing_key.clone(),
-            zmq_ctx,
             transport,
             fs,
         );
@@ -1405,10 +1398,6 @@ impl crate::services::RequestService for ModelService {
 
     fn name(&self) -> &str {
         "model"
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
     }
 
     fn transport(&self) -> &TransportConfig {

@@ -29,7 +29,6 @@ use hyprstream_rpc::transport::TransportConfig;
 /// test can assert the bridge actually spawned the streaming pump.
 struct StreamingEcho {
     name: String,
-    ctx: Arc<zmq::Context>,
     transport: TransportConfig,
     signing_key: SigningKey,
     fired: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -53,9 +52,6 @@ impl RequestService for StreamingEcho {
 
     fn name(&self) -> &str {
         &self.name
-    }
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.ctx
     }
     fn transport(&self) -> &TransportConfig {
         &self.transport
@@ -90,7 +86,6 @@ async fn inproc_bridged_round_trip_and_continuation_spawned() -> Result<()> {
 
     let svc = StreamingEcho {
         name: NAME.to_owned(),
-        ctx: Arc::new(zmq::Context::new()),
         transport: TransportConfig::inproc(NAME),
         signing_key: server_key,
         fired: Mutex::new(Some(fired_tx)),

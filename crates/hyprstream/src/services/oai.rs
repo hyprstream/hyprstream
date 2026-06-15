@@ -63,9 +63,6 @@ pub struct OAIService {
     /// Shared server state containing clients and metrics
     server_state: ServerState,
 
-    /// ZMQ context for control socket
-    context: Arc<zmq::Context>,
-
     /// Transport configuration for ZMQ control channel
     control_transport: TransportConfig,
 
@@ -82,14 +79,12 @@ impl OAIService {
     /// * `config` - OAI configuration (host, port, TLS settings)
     /// * `tls_config` - Global TLS configuration
     /// * `server_state` - Shared state with ZMQ clients and metrics
-    /// * `context` - ZMQ context for control socket
     /// * `control_transport` - Transport for ZMQ control channel
     /// * `verifying_key` - Key for verifying signed envelopes
     pub fn new(
         config: OAIConfig,
         tls_config: TlsConfig,
         server_state: ServerState,
-        context: Arc<zmq::Context>,
         control_transport: TransportConfig,
         verifying_key: VerifyingKey,
     ) -> Self {
@@ -97,7 +92,6 @@ impl OAIService {
             config,
             tls_config,
             server_state,
-            context,
             control_transport,
             verifying_key,
         }
@@ -113,10 +107,6 @@ impl OAIService {
 impl Spawnable for OAIService {
     fn name(&self) -> &str {
         SERVICE_NAME
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
     }
 
     fn registrations(&self) -> Vec<(SocketKind, TransportConfig)> {

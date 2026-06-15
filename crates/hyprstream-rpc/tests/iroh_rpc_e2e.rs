@@ -39,7 +39,6 @@ use rand::RngCore;
 /// 1-byte prefix so the test can verify identity round-trip.
 struct EchoService {
     name: String,
-    ctx: Arc<zmq::Context>,
     transport: TransportConfig,
     signing_key: SigningKey,
 }
@@ -48,7 +47,6 @@ impl EchoService {
     fn new(signing_key: SigningKey) -> Self {
         Self {
             name: "iroh-echo".to_owned(),
-            ctx: Arc::new(zmq::Context::new()),
             transport: TransportConfig::inproc("iroh-echo-unused"),
             signing_key,
         }
@@ -70,10 +68,6 @@ impl RequestService for EchoService {
 
     fn name(&self) -> &str {
         &self.name
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.ctx
     }
 
     fn transport(&self) -> &TransportConfig {

@@ -270,23 +270,17 @@ fn create_event_service(_ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 /// Minimal `Spawnable` that satisfies the service lifecycle contract for the
 /// moq event bus. The bus itself is a process-global `MoqEventOrigin` with no
 /// dedicated thread; this service just waits for shutdown.
-struct MoqEventBarrierService {
-    context: std::sync::Arc<zmq::Context>,
-}
+struct MoqEventBarrierService;
 
 impl MoqEventBarrierService {
     fn new() -> Self {
-        Self { context: global_context() }
+        Self
     }
 }
 
 impl Spawnable for MoqEventBarrierService {
     fn name(&self) -> &str {
         "event"
-    }
-
-    fn context(&self) -> &std::sync::Arc<zmq::Context> {
-        &self.context
     }
 
     fn registrations(&self) -> Vec<(hyprstream_rpc::registry::SocketKind, hyprstream_rpc::transport::TransportConfig)> {
@@ -380,7 +374,6 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         Arc::new(ctx.signing_key().clone()),
         TokenConfig::default(),
         git2db,
-        global_context(),
         ctx.transport("policy", SocketKind::Rep),
     );
     if let Some(issuer) = ctx.oauth_issuer_url() {
@@ -554,7 +547,6 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
             sk.clone(),
             policy_client,
             registry_client,
-            global_context(),
             ctx.transport("model", SocketKind::Rep),
         ))
     })?;
@@ -727,7 +719,6 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         config.oai.clone(),
         config.tls.clone(),
         server_state,
-        global_context(),
         ctx.transport("oai", SocketKind::Rep),
         ctx.verifying_key(),
     );
@@ -776,7 +767,6 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let flight_service = FlightService::new(
         config.flight.clone(),
         registry_client,
-        global_context(),
         ctx.transport("flight", SocketKind::Rep),
         ctx.verifying_key(),
     );
@@ -811,7 +801,6 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
         config.oauth.clone(),
         config.tls.clone(),
         sk,
-        global_context(),
         ctx.transport("oauth", SocketKind::Rep),
         ctx.verifying_key(),
         ctx.jwt_verifying_key(),
@@ -1149,7 +1138,6 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 
     let mut tui_service = TuiService::new(
         state,
-        global_context(),
         ctx.transport("tui", SocketKind::Rep),
         sk.clone(),
     ).with_policy_client(policy_client)
@@ -1191,7 +1179,6 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     let mut discovery_service = DiscoveryService::new(
         Arc::new(sk),
         ctx.jwt_verifying_key(),
-        global_context(),
         ctx.transport("discovery", SocketKind::Rep),
     ).with_auth_provider(Box::new(auth_provider));
     if let Some(issuer) = ctx.oauth_issuer_url() {

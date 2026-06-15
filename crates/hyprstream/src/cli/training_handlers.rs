@@ -24,7 +24,6 @@ use crate::services::generated::registry_client::{
 use crate::services::{InferenceServiceConfig, RegistryClient, WorktreeClient, INFERENCE_ENDPOINT};
 use crate::services::generated::inference_client::InferenceClient;
 use crate::storage::ModelRef;
-use crate::zmq::global_context;
 use hyprstream_rpc::{SigningKey, VerifyingKey};
 use hyprstream_service::ServiceSpawner;
 use std::path::PathBuf;
@@ -385,7 +384,6 @@ pub async fn handle_training_infer(
         runtime_config,
         verifying_key,
         signing_key.clone(),
-        global_context(),
         transport,
         None, // CLI: no FsOps
     );
@@ -694,7 +692,6 @@ pub async fn handle_training_batch(
         runtime_config,
         verifying_key,
         signing_key.clone(),
-        global_context(),
         transport,
         None, // CLI: no FsOps
     );

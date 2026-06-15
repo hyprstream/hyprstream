@@ -20,9 +20,6 @@ pub trait Spawnable: Send + 'static {
     /// Service name (for logging and registry).
     fn name(&self) -> &str;
 
-    /// ZMQ context.
-    fn context(&self) -> &Arc<zmq::Context>;
-
     /// Endpoints to register with EndpointRegistry.
     ///
     /// Each tuple is (SocketKind, TransportConfig).
@@ -60,10 +57,6 @@ pub trait Spawnable: Send + 'static {
 impl<S: RequestService + Send + Sync> Spawnable for S {
     fn name(&self) -> &str {
         RequestService::name(self)
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        RequestService::context(self)
     }
 
     fn registrations(&self) -> Vec<(SocketKind, TransportConfig)> {

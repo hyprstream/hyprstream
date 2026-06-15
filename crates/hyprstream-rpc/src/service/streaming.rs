@@ -900,10 +900,6 @@ impl crate::service::Spawnable for StreamService {
         &self.name
     }
 
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
-    }
-
     fn registrations(&self) -> Vec<(crate::registry::SocketKind, TransportConfig)> {
         vec![
             // Note: Registrations show the client-side view

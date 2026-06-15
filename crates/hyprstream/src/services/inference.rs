@@ -165,9 +165,6 @@ pub struct InferenceServiceInner {
     /// Optional WorktreeClient for worktree-scoped file operations.
     /// When present, adapter/snapshot writes use contained-root access.
     fs: Option<WorktreeClient>,
-    /// ZMQ context for socket creation
-    #[allow(dead_code)] // Standard mode passes context to InferenceZmqAdapter
-    zmq_context: Arc<zmq::Context>,
     /// Transport configuration for the service endpoint
     #[allow(dead_code)] // Standard mode passes transport to InferenceZmqAdapter
     transport: hyprstream_rpc::transport::TransportConfig,
@@ -629,7 +626,6 @@ impl InferenceService {
                 delta_pool,
                 base_delta: Mutex::new(None),
                 fs,
-                zmq_context: global_context(),
                 transport: hyprstream_rpc::transport::TransportConfig::inproc("inference-unset"),
                 lora_generation: Arc::new(AtomicU64::new(0)),
             }),
@@ -2566,7 +2562,6 @@ impl InferenceHandler for InferenceService {
 /// it never crosses thread boundaries.
 struct InferenceZmqAdapter {
     service: InferenceService,
-    zmq_context: Arc<zmq::Context>,
     transport: hyprstream_rpc::transport::TransportConfig,
     signing_key: SigningKey,
     expected_audience: Option<String>,
@@ -2585,10 +2580,6 @@ impl hyprstream_rpc::service::RequestService for InferenceZmqAdapter {
 
     fn name(&self) -> &str {
         "inference"
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.zmq_context
     }
 
     fn transport(&self) -> &hyprstream_rpc::transport::TransportConfig {
@@ -2635,7 +2626,6 @@ pub struct InferenceServiceConfig {
     /// created in the caller's runtime will fail with "Tokio context being shutdown" when
     /// used on a different thread's runtime.
     policy_signing_key: SigningKey,
-    zmq_context: Arc<zmq::Context>,
     transport: hyprstream_rpc::transport::TransportConfig,
     fs: Option<WorktreeClient>,
     /// Expected audience for JWT validation (resource URL)
@@ -2658,7 +2648,6 @@ impl InferenceServiceConfig {
         config: RuntimeConfig,
         server_pubkey: VerifyingKey,
         signing_key: SigningKey,
-        zmq_context: Arc<zmq::Context>,
         transport: hyprstream_rpc::transport::TransportConfig,
         fs: Option<WorktreeClient>,
     ) -> Self {
@@ -2669,7 +2658,6 @@ impl InferenceServiceConfig {
             server_pubkey,
             signing_key,
             policy_signing_key,
-            zmq_context,
             transport,
             fs,
             expected_audience: None,
@@ -2696,10 +2684,6 @@ impl InferenceServiceConfig {
 impl hyprstream_service::Spawnable for InferenceServiceConfig {
     fn name(&self) -> &str {
         "inference"
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.zmq_context
     }
 
     fn registrations(&self) -> Vec<(hyprstream_rpc::registry::SocketKind, hyprstream_rpc::transport::TransportConfig)> {
@@ -2735,7 +2719,6 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                 server_pubkey,
                 signing_key: svc_signing_key,
                 policy_signing_key,
-                zmq_context,
                 transport: _transport,
                 fs,
                 expected_audience,
@@ -2767,7 +2750,6 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                     .map_err(|e| anyhow::anyhow!("inference init: {e}"))?;
                     Ok(InferenceZmqAdapter {
                         service,
-                        zmq_context,
                         transport: adapter_transport,
                         signing_key: svc_signing_key,
                         expected_audience,

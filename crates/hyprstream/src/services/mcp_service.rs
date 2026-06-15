@@ -1161,10 +1161,6 @@ impl RequestService for McpService {
         "mcp"
     }
 
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
-    }
-
     fn transport(&self) -> &TransportConfig {
         &self.transport
     }

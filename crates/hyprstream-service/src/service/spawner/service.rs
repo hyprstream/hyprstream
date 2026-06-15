@@ -68,10 +68,6 @@ impl Spawnable for ProxyService {
         &self.name
     }
 
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
-    }
-
     fn registrations(&self) -> Vec<(SocketKind, TransportConfig)> {
         // Note: Socket type inversion for clients
         vec![
@@ -197,10 +193,6 @@ impl<S: RequestService + Send + 'static> UnifiedServiceConfig<S> {
 impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConfig<S> {
     fn name(&self) -> &str {
         RequestService::name(&self.service)
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        RequestService::context(&self.service)
     }
 
     fn registrations(&self) -> Vec<(SocketKind, TransportConfig)> {
@@ -847,10 +839,6 @@ impl Spawnable for DualSpawnable {
         self.primary.name()
     }
 
-    fn context(&self) -> &Arc<zmq::Context> {
-        self.primary.context()
-    }
-
     fn registrations(&self) -> Vec<(SocketKind, TransportConfig)> {
         // Merge registrations from both
         let mut regs = self.primary.registrations();
@@ -897,14 +885,13 @@ mod tests {
 
     /// Test service that includes infrastructure (new pattern)
     struct EchoService {
-        context: Arc<zmq::Context>,
         transport: TransportConfig,
         signing_key: SigningKey,
     }
 
     impl EchoService {
-        fn new(context: Arc<zmq::Context>, transport: TransportConfig, signing_key: SigningKey) -> Self {
-            Self { context, transport, signing_key }
+        fn new(transport: TransportConfig, signing_key: SigningKey) -> Self {
+            Self { transport, signing_key }
         }
     }
 
@@ -922,10 +909,6 @@ mod tests {
             "echo"
         }
 
-        fn context(&self) -> &Arc<zmq::Context> {
-            &self.context
-        }
-
         fn transport(&self) -> &TransportConfig {
             &self.transport
         }
@@ -937,12 +920,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_tokio_spawner() -> hyprstream_rpc::Result<()> {
-        let context = Arc::new(zmq::Context::new());
         let (signing_key, _verifying_key) = generate_signing_keypair();
         let transport = TransportConfig::inproc("test-spawner-tokio");
 
         // Service is directly Spawnable - no wrapping needed
-        let service = EchoService::new(context, transport, signing_key);
+        let service = EchoService::new(transport, signing_key);
 
         let spawner = ServiceSpawner::tokio();
         let mut spawned = spawner.spawn(service).await?;
@@ -955,12 +937,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_thread_spawner() -> hyprstream_rpc::Result<()> {
-        let context = Arc::new(zmq::Context::new());
         let (signing_key, _verifying_key) = generate_signing_keypair();
         let transport = TransportConfig::inproc("test-spawner-thread");
 
         // Service is directly Spawnable - no wrapping needed
-        let service = EchoService::new(context, transport, signing_key);
+        let service = EchoService::new(transport, signing_key);
 
         let spawner = ServiceSpawner::threaded();
         let mut spawned = spawner.spawn(service).await?;

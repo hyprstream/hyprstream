@@ -269,7 +269,6 @@ pub struct OAuthService {
     quic_config: Option<crate::config::QuicConfig>,
     /// Signing key for creating the PolicyClient inside `run()`.
     signing_key: hyprstream_rpc::prelude::SigningKey,
-    context: Arc<zmq::Context>,
     control_transport: TransportConfig,
     #[allow(dead_code)]
     verifying_key: ed25519_dalek::VerifyingKey,
@@ -285,7 +284,6 @@ impl OAuthService {
         config: OAuthConfig,
         tls_config: crate::config::TlsConfig,
         signing_key: hyprstream_rpc::prelude::SigningKey,
-        context: Arc<zmq::Context>,
         control_transport: TransportConfig,
         verifying_key: ed25519_dalek::VerifyingKey,
         jwt_verifying_key: ed25519_dalek::VerifyingKey,
@@ -295,7 +293,6 @@ impl OAuthService {
             tls_config,
             quic_config: None,
             signing_key,
-            context,
             control_transport,
             verifying_key,
             jwt_verifying_key: jwt_verifying_key.to_bytes(),
@@ -319,10 +316,6 @@ impl OAuthService {
 impl Spawnable for OAuthService {
     fn name(&self) -> &str {
         SERVICE_NAME
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
     }
 
     fn registrations(&self) -> Vec<(SocketKind, TransportConfig)> {
@@ -690,7 +683,6 @@ impl Spawnable for OAuthService {
             // ZMQ ROUTER. A dedicated `serve_shutdown` stops it once the HTTP
             // server exits, so the task joins cleanly.
             let control_transport = self.control_transport.clone();
-            let rpc_context = Arc::clone(&self.context);
             let rpc_signing_key = self.signing_key.clone();
             let rpc_state = state.clone();
             let serve_shutdown = Arc::new(Notify::new());
@@ -698,7 +690,6 @@ impl Spawnable for OAuthService {
             let rpc_loop = tokio::task::spawn_local(async move {
                 let handler = zmq_handler::OAuthZmqHandler::new(
                     rpc_state,
-                    rpc_context,
                     control_transport.clone(),
                     rpc_signing_key.clone(),
                 );

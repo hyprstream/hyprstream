@@ -137,8 +137,6 @@ pub struct TuiService {
     state: Arc<RwLock<TuiState>>,
     /// Next viewer ID counter (atomic for Send+Sync).
     next_viewer_id: AtomicU32,
-    /// ZMQ context (required by RequestService).
-    context: Arc<zmq::Context>,
     /// Transport config (required by RequestService).
     transport: TransportConfig,
     /// Signing key (required by RequestService).
@@ -166,14 +164,12 @@ impl TuiService {
     /// Create a new TUI service.
     pub fn new(
         state: Arc<RwLock<TuiState>>,
-        context: Arc<zmq::Context>,
         transport: TransportConfig,
         signing_key: SigningKey,
     ) -> Self {
         Self {
             state,
             next_viewer_id: AtomicU32::new(1),
-            context,
             transport,
             signing_key,
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -1794,10 +1790,6 @@ impl RequestService for TuiService {
 
     fn name(&self) -> &str {
         "tui"
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
     }
 
     fn transport(&self) -> &TransportConfig {
