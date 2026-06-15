@@ -10,7 +10,7 @@
 //! Metadata types remain here (used by proc macro codegen across all crates).
 
 mod traits;
-mod zmq;
+mod svc;
 pub mod dispatch;
 pub mod serve;
 pub mod spawnable;
@@ -20,7 +20,7 @@ pub mod doc;
 pub use traits::{RpcHandler, RpcRequest, RpcService};
 /// Transport-neutral request dispatch core (#148) — shared by all front-ends.
 pub use dispatch::process_request;
-pub use zmq::{AuthorizeFn, Continuation, EnvelopeContext, QuicLoopConfig, ServiceHandle, RequestService};
+pub use svc::{AuthorizeFn, Continuation, EnvelopeContext, QuicLoopConfig, ServiceHandle, RequestService};
 pub use spawnable::Spawnable;
 pub use metadata::{MethodMeta, ParamMeta, SchemaMetadataFn, ScopedSchemaMetadataFn, ScopedClientTreeNode};
 pub use doc::DocFs;

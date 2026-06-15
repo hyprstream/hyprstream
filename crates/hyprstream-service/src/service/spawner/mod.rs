@@ -2,7 +2,7 @@
 //!
 //! Provides unified interfaces for spawning:
 //! - Raw processes via `ProcessSpawner` (Standalone or Systemd backends)
-//! - ZMQ services via `ServiceSpawner` (Tokio, Thread, or Subprocess modes)
+//! - RPC services via `ServiceSpawner` (Tokio, Thread, or Subprocess modes)
 //!
 //! # Architecture
 //!

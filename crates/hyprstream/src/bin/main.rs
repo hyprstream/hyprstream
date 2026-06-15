@@ -45,12 +45,11 @@ use hyprstream_core::cli::{handle_commit, handle_merge, handle_push, MergeOption
 use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
 
-// Registry and policy services - uses ZMQ-based services from hyprstream_core
+// Registry and policy services
 use hyprstream_core::services::{PolicyClient, RegistryClient};
 // Worker service for Kata-based workload execution
 use hyprstream_workers::runtime::WorkerService;
 use hyprstream_workers::{ImageConfig, PoolConfig};
-// ZMQ context for service startup
 use std::sync::Arc;
 // Unified service manager API
 use hyprstream_service::{get_factory, InprocManager, ServiceContext, ServiceManager};
@@ -1645,7 +1644,7 @@ fn main() -> Result<()> {
         .build()
         .context("Failed to create registry runtime")?;
 
-    // Start ZMQ-based services and create keypair
+    // Start services and create keypair
     let (registry_client, signing_key, verifying_key): (
         RegistryClient,
         SigningKey,

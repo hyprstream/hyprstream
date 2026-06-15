@@ -664,7 +664,7 @@ fn parse_stream_info(
     let moq_uds_path = json["moqUdsPath"].as_str().unwrap_or("").to_owned();
     let moq_broadcast_path = json["moqBroadcastPath"].as_str().unwrap_or("").to_owned();
     if moq_uds_path.is_empty() {
-        anyhow::bail!("missing moqUdsPath in streaming response — server may be in ZMQ-only mode");
+        anyhow::bail!("missing moqUdsPath in streaming response — server did not initialize moq transport");
     }
     Ok((stream_id, server_pubkey, qos, moq_uds_path, moq_broadcast_path))
 }

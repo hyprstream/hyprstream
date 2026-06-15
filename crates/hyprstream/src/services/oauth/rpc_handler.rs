@@ -1,4 +1,4 @@
-//! ZMQ RPC handler for user CRUD operations.
+//! OAuth RPC handler for user CRUD operations.
 //!
 //! Implements the `OauthHandler` trait (generated from `oauth.capnp`)
 //! and `RequestService` for ZMQ transport. Delegates to `UserService` for
@@ -26,13 +26,13 @@ use super::state::OAuthState;
 ///
 /// Wraps `UserService` and implements the generated `OauthHandler` trait
 /// for Cap'n Proto serialization, and `RequestService` for ZMQ transport.
-pub struct OAuthZmqHandler {
+pub struct OAuthRpcHandler {
     state: Arc<OAuthState>,
     transport: TransportConfig,
     signing_key: SigningKey,
 }
 
-impl OAuthZmqHandler {
+impl OAuthRpcHandler {
     pub fn new(
         state: Arc<OAuthState>,
         transport: TransportConfig,
@@ -74,7 +74,7 @@ impl OAuthZmqHandler {
 }
 
 #[async_trait(?Send)]
-impl OauthHandler for OAuthZmqHandler {
+impl OauthHandler for OAuthRpcHandler {
     async fn authorize(
         &self,
         _ctx: &EnvelopeContext,
@@ -263,7 +263,7 @@ impl OauthHandler for OAuthZmqHandler {
 
 
 #[async_trait(?Send)]
-impl RequestService for OAuthZmqHandler {
+impl RequestService for OAuthRpcHandler {
     async fn handle_request(
         &self,
         ctx: &EnvelopeContext,

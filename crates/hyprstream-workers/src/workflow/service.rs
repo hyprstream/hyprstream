@@ -114,7 +114,7 @@ impl WorkflowService {
     ///
     /// # Arguments
     ///
-    /// * `transport` - Transport configuration for ZMQ service binding
+    /// * `transport` - Transport configuration for service binding
     /// * `signing_key` - Signing key for message authentication
     pub fn new(
         transport: TransportConfig,

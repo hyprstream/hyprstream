@@ -1,7 +1,7 @@
-//! Discovery service — exposes EndpointRegistry over ZMQ RPC.
+//! Discovery service — exposes EndpointRegistry over RPC.
 //!
 //! Allows remote clients to discover registered services, their endpoints,
-//! socket kinds, and schemas via the standard ZMQ REQ/REP transport.
+//! socket kinds, and schemas via the standard REQ/REP transport.
 
 use async_trait::async_trait;
 use hyprstream_rpc::service::{EnvelopeContext, RequestService};
@@ -86,7 +86,7 @@ fn unix_seconds_now() -> i64 {
         .unwrap_or(0)
 }
 
-/// Discovery service that exposes EndpointRegistry over ZMQ RPC.
+/// Discovery service that exposes EndpointRegistry over RPC.
 pub struct DiscoveryService {
     /// Timestamp when the service was created
     started_at: Instant,
@@ -335,7 +335,7 @@ impl DiscoveryHandler for DiscoveryService {
                 .iter()
                 .map(|(kind, transport)| EndpointInfo {
                     socket_kind: socket_kind_to_string(*kind).to_owned(),
-                    endpoint: transport.to_zmq_string(),
+                    endpoint: transport.endpoint_string(),
                     service_jwt: String::new(),
                     tls_endorsement: self.tls_endorsement.clone(),
                     tls_domain: self.tls_domain.clone(),

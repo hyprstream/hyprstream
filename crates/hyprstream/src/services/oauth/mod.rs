@@ -58,7 +58,7 @@ pub mod wit_bootstrap;
 pub mod user_service;
 pub mod userinfo;
 pub mod device_enrollment;
-pub mod zmq_handler;
+pub mod rpc_handler;
 
 use std::sync::Arc;
 
@@ -688,7 +688,7 @@ impl Spawnable for OAuthService {
             let serve_shutdown = Arc::new(Notify::new());
             let serve_shutdown_task = Arc::clone(&serve_shutdown);
             let rpc_loop = tokio::task::spawn_local(async move {
-                let handler = zmq_handler::OAuthZmqHandler::new(
+                let handler = rpc_handler::OAuthRpcHandler::new(
                     rpc_state,
                     control_transport.clone(),
                     rpc_signing_key.clone(),

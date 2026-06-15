@@ -230,7 +230,7 @@ impl ModelService {
     fn inference_endpoint(model_ref_str: &str) -> String {
         let safe_name = model_ref_str.replace([':', '/', '\\'], "-");
         let service_name = format!("inference-{safe_name}");
-        registry().endpoint(&service_name, SocketKind::Rep).to_zmq_string()
+        registry().endpoint(&service_name, SocketKind::Rep).endpoint_string()
     }
 
     /// Load a model by reference with optional per-model config, returns the inference endpoint

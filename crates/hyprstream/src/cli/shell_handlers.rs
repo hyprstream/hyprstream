@@ -241,7 +241,7 @@ pub async fn handle_shell_tui(
 
     anyhow::ensure!(
         !stdout_stream.moq_uds_path.is_empty(),
-        "TUI service did not return a moq UDS path — server may be in ZMQ-only mode"
+        "TUI service did not return a moq UDS path — server did not initialize moq transport"
     );
 
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -863,8 +863,7 @@ pub async fn handle_shell_tui(
     let _ = terminal.flush();
     restore_terminal(&orig);
 
-    // Drop ZMQ clients off-thread: TMQ's RequestSender holds an internal
-    // runtime that panics if dropped inside an async context.
+    // Drop RPC clients off-thread to avoid dropping futures inside an async context.
     tokio::task::spawn_blocking(move || {
         drop(client);
         drop(model_client);
@@ -875,7 +874,7 @@ pub async fn handle_shell_tui(
 }
 
 // ============================================================================
-// dispatch_outputs — translate CompositorOutput to ZMQ calls
+// dispatch_outputs — translate CompositorOutput to RPC calls
 // ============================================================================
 
 // ============================================================================
@@ -905,7 +904,7 @@ fn composite_draw(
     });
 }
 
-/// Dispatch compositor outputs to the appropriate ZMQ RPC calls.
+/// Dispatch compositor outputs to the appropriate RPC calls.
 /// Returns `true` if the session should exit.
 async fn dispatch_outputs(
     compositor: &mut Compositor,
@@ -970,7 +969,7 @@ async fn dispatch_outputs(
     false
 }
 
-/// Translate an `RpcRequest` into ZMQ calls and return `CompositorInput`
+/// Translate an `RpcRequest` into RPC calls and return `CompositorInput`
 /// events to feed back (e.g. updated window list after create/close).
 async fn handle_rpc(
     compositor: &mut Compositor,
@@ -1305,7 +1304,7 @@ async fn handle_rpc(
         | RpcRequest::ServiceStopAll
         | RpcRequest::ServiceStartAll => {
             compositor.chrome.push_toast(
-                "Service management not yet available (requires ZMQ service RPC)".to_owned(),
+                "Service management not yet available".to_owned(),
                 ToastLevel::Warn,
             );
             vec![]
@@ -1825,7 +1824,7 @@ async fn fetch_models(
 }
 
 // ============================================================================
-// ZMQ RPC helpers
+// RPC helpers
 // ============================================================================
 
 async fn list_windows_rpc(client: &TuiClient) -> anyhow::Result<Vec<WindowSummary>> {

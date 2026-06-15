@@ -2,15 +2,15 @@
 //!
 //! This crate provides:
 //! - `ToCapnp` / `FromCapnp` traits and derive macros for Cap'n Proto serialization
-//! - ZMQ transport implementation
+//! - ZMTP framing over UDS/QUIC/iroh transports
 //! - Service dispatch helpers
 //! - Ed25519 signed envelopes for request authentication
 //! - DH key exchange + HMAC for streaming response authentication
 //!
 //! # Security Model
 //!
-//! All ZMQ messages are wrapped in signed envelopes:
-//! - **Transport layer**: CURVE encryption (TCP only)
+//! All RPC messages are wrapped in signed envelopes:
+//! - **Transport layer**: TLS 1.3 (QUIC) or UDS peer credentials (IPC)
 //! - **Application layer**: Ed25519 signatures (survives message forwarding)
 //!
 //! Streaming responses use HMAC-SHA256 derived from DH shared secrets.

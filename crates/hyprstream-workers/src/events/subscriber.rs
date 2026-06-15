@@ -2,7 +2,7 @@
 //!
 //! Subscribers connect to the process-global [`MoqEventOrigin`] via a background
 //! task that watches for announced source broadcasts and reads their `events` tracks.
-//! No ZMQ context is required.
+//! No external context is required.
 
 use anyhow::Result;
 use std::time::Duration;
@@ -12,7 +12,7 @@ use hyprstream_rpc::moq_event::MoqEventSubscriber as Inner;
 /// Async event subscriber backed by moq-lite.
 ///
 /// Wraps [`MoqEventSubscriber`] from `hyprstream-rpc`. Patterns use dot-separated
-/// prefix matching identical to the former ZMQ semantics.
+/// prefix matching using dot-separated topic prefixes.
 ///
 /// **Note**: Call `subscribe()` at least once before calling `recv()`.
 ///

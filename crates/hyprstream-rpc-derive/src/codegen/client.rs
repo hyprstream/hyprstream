@@ -446,7 +446,7 @@ fn generate_trait_method_impl(
                     anyhow::bail!("Server did not provide DH public key for streaming");
                 }
                 if info.moq_uds_path.is_empty() {
-                    anyhow::bail!("Server did not provide moq transport path — may be running in ZMQ-only mode");
+                    anyhow::bail!("Server did not provide moq transport path — moq transport not initialized");
                 }
                 let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
                     &client_secret, &client_pubkey_bytes, &info.server_pubkey,

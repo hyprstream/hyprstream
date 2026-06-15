@@ -4,7 +4,7 @@
 //! - `Transport` / `AsyncTransport` traits for generic transport abstraction
 //! - `TransportConfig` for unified endpoint configuration
 //! - Systemd socket activation support via `SystemdFd` variant
-//! - QUIC/WebTransport via `zmtp_quic` (WebTransportServer + process_request; ZMQ removal pending #138)
+//! - QUIC/WebTransport via `zmtp_quic` (WebTransportServer + process_request)
 //! - Raw socket options via `sockopt` submodule
 
 mod traits;
@@ -157,7 +157,7 @@ pub enum EndpointType {
     /// Systemd socket activation endpoint.
     ///
     /// Used when systemd passes a pre-bound file descriptor to the service.
-    /// The `fd` is used for server-side binding (via `ZMQ_USE_FD`),
+    /// The `fd` is used for server-side binding,
     /// while `client_path` provides the IPC path for clients to connect.
     SystemdFd {
         /// Pre-bound file descriptor from systemd
@@ -168,9 +168,9 @@ pub enum EndpointType {
 
     /// QUIC transport endpoint (ZMTP 3.1 over QUIC).
     ///
-    /// Provides TLS 1.3 encryption built into the transport layer,
-    /// replacing CurveZMQ. ZMTP handshake uses NULL mechanism since
-    /// QUIC already provides wire confidentiality.
+    /// Provides TLS 1.3 encryption built into the transport layer.
+    /// ZMTP handshake uses NULL mechanism since QUIC already provides
+    /// wire confidentiality.
     ///
     /// Format: `quic://hostname:port`
     Quic {
@@ -312,7 +312,7 @@ impl TransportConfig {
         self.bind_mode
     }
 
-    /// Parse a ZMQ endpoint string into a TransportConfig.
+    /// Parse an endpoint string into a TransportConfig.
     ///
     /// Supports:
     /// - `inproc://name` → `TransportConfig::Inproc`
@@ -324,7 +324,7 @@ impl TransportConfig {
     /// use hyprstream_rpc::transport::TransportConfig;
     ///
     /// let config = TransportConfig::from_endpoint("inproc://hyprstream/registry");
-    /// assert_eq!(config.zmq_endpoint(), "inproc://hyprstream/registry");
+    /// assert_eq!(config.endpoint_string(), "inproc://hyprstream/registry");
     /// ```
     pub fn from_endpoint(endpoint: &str) -> Self {
         let endpoint_type = if let Some(name) = endpoint.strip_prefix("inproc://") {
@@ -357,11 +357,11 @@ impl TransportConfig {
         }
     }
 
-    /// Get the ZMQ endpoint string for this configuration.
+    /// Get the endpoint string for this configuration.
     ///
     /// For `SystemdFd`, returns the client IPC path.
-    /// For `Quic`, returns a descriptive string (not a valid ZMQ endpoint).
-    pub fn zmq_endpoint(&self) -> String {
+    /// For `Quic`, returns a descriptive string (not a connectable endpoint).
+    pub fn endpoint_string(&self) -> String {
         match &self.endpoint {
             EndpointType::Inproc { endpoint } => format!("inproc://{endpoint}"),
             EndpointType::Ipc { path } => format!("ipc://{}", path.display()),
@@ -376,12 +376,6 @@ impl TransportConfig {
                 format!("iroh://{hex}")
             }
         }
-    }
-
-    /// Alias for `zmq_endpoint()` for consistency.
-    #[inline]
-    pub fn to_zmq_string(&self) -> String {
-        self.zmq_endpoint()
     }
 
     /// Get the WebTransport URL for QUIC endpoints.
@@ -433,15 +427,15 @@ mod tests {
     #[test]
     fn test_inproc_endpoint() {
         let config = TransportConfig::inproc("hyprstream/registry");
-        assert_eq!(config.zmq_endpoint(), "inproc://hyprstream/registry");
-        assert_eq!(config.to_zmq_string(), "inproc://hyprstream/registry");
+        assert_eq!(config.endpoint_string(), "inproc://hyprstream/registry");
+        assert_eq!(config.endpoint_string(), "inproc://hyprstream/registry");
         assert!(!config.is_systemd_activated());
     }
 
     #[test]
     fn test_ipc_endpoint() {
         let config = TransportConfig::ipc("/tmp/hyprstream.sock");
-        assert_eq!(config.zmq_endpoint(), "ipc:///tmp/hyprstream.sock");
+        assert_eq!(config.endpoint_string(), "ipc:///tmp/hyprstream.sock");
         assert!(!config.is_systemd_activated());
     }
 
@@ -449,7 +443,7 @@ mod tests {
     fn test_systemd_fd_endpoint() {
         let config = TransportConfig::systemd_fd(5, "/run/hyprstream/policy.sock");
         assert_eq!(
-            config.zmq_endpoint(),
+            config.endpoint_string(),
             "ipc:///run/hyprstream/policy.sock"
         );
         assert!(config.is_systemd_activated());
@@ -461,7 +455,7 @@ mod tests {
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4433);
         let config = TransportConfig::quic(addr, "hyprstream.local");
-        assert!(config.zmq_endpoint().starts_with("quic://hyprstream.local:"));
+        assert!(config.endpoint_string().starts_with("quic://hyprstream.local:"));
         assert!(config.is_quic());
         assert!(!config.is_systemd_activated());
     }

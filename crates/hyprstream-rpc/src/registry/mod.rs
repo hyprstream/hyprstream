@@ -2,7 +2,7 @@
 //!
 //! This module provides:
 //! - `EndpointMode` for determining transport type (inproc, ipc, tcp)
-//! - `SocketKind` for identifying ZMQ socket types (implements Hash)
+//! - `SocketKind` for identifying RPC socket types (implements Hash)
 //! - `EndpointRegistry` for service endpoint management (supports multiple socket types)
 //! - `ServiceRegistration` RAII guard for automatic cleanup
 //!
@@ -61,7 +61,7 @@ pub enum SocketKind {
     Pair,
     /// STREAM socket (raw TCP)
     Stream,
-    /// QUIC/WebTransport (not a ZMQ socket type)
+    /// QUIC/WebTransport transport type
     Quic,
 }
 
@@ -88,11 +88,11 @@ impl SocketKind {
 
 /// Endpoint mode determines default transport type.
 ///
-/// - `Inproc`: In-process ZMQ endpoints (daemon mode, single process)
+/// - `Inproc`: In-process endpoints (daemon mode, single process)
 /// - `Ipc`: Unix domain sockets (systemd mode, auto-detects socket activation)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum EndpointMode {
-    /// In-process ZMQ (daemon mode)
+    /// In-process (daemon mode)
     #[default]
     Inproc,
     /// Unix domain sockets (systemd mode)
@@ -212,7 +212,7 @@ impl EndpointRegistry {
 
     /// Generate a default endpoint for a service and socket type.
     fn default_endpoint(&self, name: &str, socket_kind: SocketKind) -> TransportConfig {
-        // QUIC endpoints are always TCP-based, independent of ZMQ endpoint mode.
+        // QUIC endpoints are always TCP-based, independent of endpoint mode.
         // This is a non-dialable PLACEHOLDER (port 0), returned only when a
         // service has no real registration; a genuine QUIC endpoint is
         // registered by the serving loop *pinned* with its cert hash (see
@@ -230,8 +230,7 @@ impl EndpointRegistry {
                 TransportConfig::inproc(format!("hyprstream/{name}{suffix}"))
             }
             EndpointMode::Ipc => {
-                // Use normal IPC binding instead of systemd socket activation for ZMQ sockets
-                // ZMQ_USE_FD has compatibility issues with systemd socket activation
+                // Use normal IPC binding instead of systemd socket activation
                 let path = self
                     .runtime_dir
                     .as_ref()
@@ -465,7 +464,7 @@ impl ServiceRegistration {
     /// # Arguments
     ///
     /// * `name` - Service name for discovery
-    /// * `socket_kind` - The ZMQ socket type
+    /// * `socket_kind` - The socket type
     /// * `endpoint` - The endpoint configuration
     /// * `description` - Optional human-readable description
     pub fn with_socket_kind(
@@ -560,15 +559,15 @@ mod tests {
 
         // REP socket (default, no suffix)
         let endpoint = global().endpoint("policy", SocketKind::Rep);
-        assert_eq!(endpoint.to_zmq_string(), "inproc://hyprstream/policy");
+        assert_eq!(endpoint.endpoint_string(), "inproc://hyprstream/policy");
 
         // ROUTER socket (with suffix)
         let endpoint = global().endpoint("model", SocketKind::Router);
-        assert_eq!(endpoint.to_zmq_string(), "inproc://hyprstream/model-router");
+        assert_eq!(endpoint.endpoint_string(), "inproc://hyprstream/model-router");
 
         // XPUB socket (with suffix)
         let endpoint = global().endpoint("inference", SocketKind::XPub);
-        assert_eq!(endpoint.to_zmq_string(), "inproc://hyprstream/inference-xpub");
+        assert_eq!(endpoint.endpoint_string(), "inproc://hyprstream/inference-xpub");
     }
 
     #[test]
@@ -579,11 +578,11 @@ mod tests {
 
         // REP socket (default, no suffix)
         let endpoint = global().endpoint("policy", SocketKind::Rep);
-        assert_eq!(endpoint.to_zmq_string(), "ipc:///run/hyprstream/policy.sock");
+        assert_eq!(endpoint.endpoint_string(), "ipc:///run/hyprstream/policy.sock");
 
         // ROUTER socket (with suffix)
         let endpoint = global().endpoint("model", SocketKind::Router);
-        assert_eq!(endpoint.to_zmq_string(), "ipc:///run/hyprstream/model-router.sock");
+        assert_eq!(endpoint.endpoint_string(), "ipc:///run/hyprstream/model-router.sock");
     }
 
     #[test]
@@ -600,12 +599,12 @@ mod tests {
             )?;
 
             let endpoint = global().endpoint("test-service", SocketKind::Rep);
-            assert_eq!(endpoint.to_zmq_string(), "inproc://custom/endpoint");
+            assert_eq!(endpoint.endpoint_string(), "inproc://custom/endpoint");
         }
 
         // After drop, falls back to default
         let endpoint = global().endpoint("test-service", SocketKind::Rep);
-        assert_eq!(endpoint.to_zmq_string(), "inproc://hyprstream/test-service");
+        assert_eq!(endpoint.endpoint_string(), "inproc://hyprstream/test-service");
         Ok(())
     }
 
@@ -627,18 +626,18 @@ mod tests {
 
             // Both endpoints registered
             let rep_ep = global().endpoint("model", SocketKind::Rep);
-            assert_eq!(rep_ep.to_zmq_string(), "inproc://model/rep");
+            assert_eq!(rep_ep.endpoint_string(), "inproc://model/rep");
 
             let router_ep = global().endpoint("model", SocketKind::Router);
-            assert_eq!(router_ep.to_zmq_string(), "inproc://model/router");
+            assert_eq!(router_ep.endpoint_string(), "inproc://model/router");
         }
 
         // After drop, both fall back to defaults
         let rep_ep = global().endpoint("model", SocketKind::Rep);
-        assert_eq!(rep_ep.to_zmq_string(), "inproc://hyprstream/model");
+        assert_eq!(rep_ep.endpoint_string(), "inproc://hyprstream/model");
 
         let router_ep = global().endpoint("model", SocketKind::Router);
-        assert_eq!(router_ep.to_zmq_string(), "inproc://hyprstream/model-router");
+        assert_eq!(router_ep.endpoint_string(), "inproc://hyprstream/model-router");
         Ok(())
     }
 
@@ -658,11 +657,11 @@ mod tests {
 
         // Old-style retrieval
         let endpoint = registry.rep_endpoint("compat-service");
-        assert_eq!(endpoint.to_zmq_string(), "inproc://compat/endpoint");
+        assert_eq!(endpoint.endpoint_string(), "inproc://compat/endpoint");
 
         // New-style retrieval works too
         let endpoint = registry.endpoint("compat-service", SocketKind::Rep);
-        assert_eq!(endpoint.to_zmq_string(), "inproc://compat/endpoint");
+        assert_eq!(endpoint.endpoint_string(), "inproc://compat/endpoint");
     }
 
     #[test]
