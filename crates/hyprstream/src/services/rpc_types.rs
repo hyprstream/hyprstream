@@ -22,18 +22,11 @@ pub use hyprstream_rpc::streaming::StreamInfo;
 // Re-export generic streaming types from hyprstream-rpc
 pub use hyprstream_rpc::streaming::{
     BatchingConfig,
-    StreamBuilder,
-    StreamFrames,
-    StreamHandle,
     StreamHmacState,
     StreamPayload,
     StreamPayloadData,
     StreamVerifier,
 };
-
-// connect_stream_handle / inference_stream_handle removed — generated streaming
-// trait methods (InferRpc, RegistryRpc, ContainerRpc, etc.) encapsulate DH
-// key exchange internally and return StreamHandle directly.
 
 // ============================================================================
 // Inference-Specific Stream Types

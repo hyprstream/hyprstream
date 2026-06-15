@@ -366,13 +366,7 @@ impl TuiService {
             .map(|o| o.broadcast_path(stdout_ctx.topic()))
             .unwrap_or_default();
 
-        let sub_endpoint = if global_moq_origin().is_some() {
-            String::new()
-        } else {
-            hyprstream_rpc::registry::global()
-                .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
-                .to_zmq_string()
-        };
+        let sub_endpoint = String::new();
 
         // (topic, sub_endpoint, mac_key, moq_broadcast_path, moq_uds_path)
         let streams: [(&str, &str, &[u8; 32], &str, &str); 2] = [

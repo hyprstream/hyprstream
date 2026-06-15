@@ -1656,11 +1656,7 @@ impl WebTransportServer {
                 }
             }
             "SUB" => {
-                let topic_msg = zmtp.recv_multipart().await?;
-                ensure!(!topic_msg.parts.is_empty(), "SUB: missing topic");
-                let topic_bytes = &topic_msg.parts[0];
-                debug!(topic_len = topic_bytes.len(), "WebTransport SUB stream (processor)");
-                Self::handle_stream_subscription_zmtp(zmtp, topic_bytes).await?;
+                bail!("ZMQ streaming removed — use moq-net subscription");
             }
             other => {
                 warn!("Unknown STREAM_TYPE '{}' in processor path", other);
@@ -1882,24 +1878,8 @@ impl WebTransportServer {
                     }
                 }
             }
-            "SUB" => {
-                // Subscription path: read topic from next multipart, then forward blocks
-                let topic_msg = zmtp.recv_multipart().await?;
-                ensure!(!topic_msg.parts.is_empty(), "SUB: missing topic");
-                let topic_bytes = &topic_msg.parts[0];
-
-                debug!(topic_len = topic_bytes.len(), "WebTransport SUB stream");
-                Self::handle_stream_subscription_zmtp(zmtp, topic_bytes).await?;
-            }
-            "PUB" => {
-                // Client→server publish: read topic, forward ZMTP multipart into ZMQ PUSH.
-                // Used for ctrl channel messages (cancel, etc.) from browser clients.
-                let topic_msg = zmtp.recv_multipart().await?;
-                ensure!(!topic_msg.parts.is_empty(), "PUB: missing topic");
-                let topic_bytes = &topic_msg.parts[0];
-
-                debug!(topic_len = topic_bytes.len(), "WebTransport PUB stream");
-                Self::handle_stream_publish_zmtp(zmtp, topic_bytes).await?;
+            "SUB" | "PUB" => {
+                bail!("ZMQ streaming removed — use moq-net subscription");
             }
             other => bail!("Unknown STREAM_TYPE: {}", other),
         }
@@ -1909,128 +1889,6 @@ impl WebTransportServer {
 
 
 
-    /// Handle a stream subscription using ZMTP multipart framing.
-    ///
-    /// Like `handle_stream_subscription` but sends each block as a ZMTP multipart
-    /// message (3 frames: topic, capnp, mac) instead of length-prefixed bytes.
-    async fn handle_stream_subscription_zmtp<S: AsyncRead + AsyncWrite + Unpin>(
-        mut zmtp: ZmtpStream<S>,
-        topic_bytes: &[u8],
-    ) -> Result<()> {
-        use crate::registry::{global as endpoint_registry, SocketKind};
-
-        let topic = std::str::from_utf8(topic_bytes)
-            .map_err(|e| anyhow!("Invalid UTF-8 subscription topic: {}", e))?;
-
-        debug!(topic = %topic, "WebTransport ZMTP stream subscription started");
-
-        let sub_endpoint = endpoint_registry()
-            .endpoint("streams", SocketKind::Sub)
-            .to_zmq_string();
-
-        // Channel carries multipart frames: Vec<Vec<u8>>
-        let (block_tx, mut block_rx) = tokio::sync::mpsc::channel::<Vec<Vec<u8>>>(64);
-        let topic_owned = topic.to_owned();
-        let sub_endpoint_owned = sub_endpoint.clone();
-
-        std::thread::spawn(move || {
-            let zmq_ctx = zmq::Context::new();
-            let sub_socket = match zmq_ctx.socket(zmq::SUB) {
-                Ok(s) => s,
-                Err(e) => { warn!("Failed to create SUB socket: {}", e); return; }
-            };
-            if let Err(e) = sub_socket.connect(&sub_endpoint_owned) {
-                warn!("SUB connect failed: {} endpoint={}", e, sub_endpoint_owned);
-                return;
-            }
-            if let Err(e) = sub_socket.set_subscribe(topic_owned.as_bytes()) {
-                warn!("SUB set_subscribe failed: {}", e);
-                return;
-            }
-            let _ = sub_socket.set_linger(0);
-            let _ = sub_socket.set_rcvtimeo(100);
-
-            loop {
-                if block_tx.is_closed() { break; }
-
-                // Receive full multipart: [topic, capnp_block, mac?]
-                match sub_socket.recv_multipart(0) {
-                    Ok(frames) => {
-                        if block_tx.blocking_send(frames).is_err() { break; }
-                    }
-                    Err(zmq::Error::EAGAIN) => continue,
-                    Err(e) => { warn!("ZMQ SUB recv error: {}", e); break; }
-                }
-            }
-        });
-
-        debug!(topic = %topic, endpoint = %sub_endpoint, "ZMQ SUB connected for ZMTP bridge");
-
-        // Forward loop: channel → ZMTP multipart on WebTransport stream
-        while let Some(frames) = block_rx.recv().await {
-            let parts: Vec<Bytes> = frames.into_iter().map(Bytes::from).collect();
-            if let Err(e) = zmtp.send_multipart(&parts).await {
-                debug!(topic = %topic, "ZMTP send error: {}", e);
-                break;
-            }
-        }
-
-        debug!(topic = %topic, "WebTransport ZMTP stream subscription ended");
-        Ok(())
-    }
-
-    /// Handle a client→server PUB stream using ZMTP multipart framing.
-    ///
-    /// Reads ZMTP multipart messages from the WebTransport stream and forwards
-    /// them into the ZMQ PUSH infrastructure. The existing `spawn_ctrl_listener`
-    /// SUB socket picks them up — same path as native ZMQ PUSH ctrl messages.
-    ///
-    /// Wire format per message: `[ctrl_topic, capnp_payload, mac]`
-    async fn handle_stream_publish_zmtp<S: AsyncRead + AsyncWrite + Unpin>(
-        mut zmtp: ZmtpStream<S>,
-        topic_bytes: &[u8],
-    ) -> Result<()> {
-        use crate::registry::{global as endpoint_registry, SocketKind};
-
-        let topic = std::str::from_utf8(topic_bytes)
-            .map_err(|e| anyhow!("Invalid UTF-8 PUB topic: {}", e))?;
-
-        debug!(topic = %topic, "WebTransport ZMTP PUB stream started");
-
-        let push_endpoint = endpoint_registry()
-            .endpoint("streams", SocketKind::Push)
-            .to_zmq_string();
-
-        // Create a sync ZMQ PUSH socket to forward ctrl messages
-        let zmq_ctx = zmq::Context::new();
-        let push_socket = zmq_ctx.socket(zmq::PUSH)
-            .map_err(|e| anyhow!("Failed to create PUSH socket: {}", e))?;
-        push_socket.connect(&push_endpoint)
-            .map_err(|e| anyhow!("PUSH connect to {}: {}", push_endpoint, e))?;
-        let _ = push_socket.set_linger(0);
-
-        // Read loop: ZMTP multipart from WebTransport → ZMQ PUSH
-        while let Ok(msg) = zmtp.recv_multipart().await {
-            if msg.parts.is_empty() {
-                continue;
-            }
-            // Forward all frames via ZMQ PUSH
-            for (i, frame) in msg.parts.iter().enumerate() {
-                let flags = if i < msg.parts.len() - 1 {
-                    zmq::SNDMORE | zmq::DONTWAIT
-                } else {
-                    zmq::DONTWAIT
-                };
-                if let Err(e) = push_socket.send(frame.as_ref(), flags) {
-                    warn!(topic = %topic, "PUSH send failed: {}", e);
-                    break;
-                }
-            }
-        }
-
-        debug!(topic = %topic, "WebTransport ZMTP PUB stream ended");
-        Ok(())
-    }
 }
 
 /// Compute SHA-256 hash of certificate for browser `serverCertificateHashes` (base64).

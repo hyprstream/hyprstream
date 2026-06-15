@@ -321,7 +321,6 @@ mod tests {
                 server_name: "localhost".to_owned(),
                 auth: QuicServerAuth::web_pki_pinned(vec![[9u8; 32]]).unwrap(),
             },
-            curve: None,
             bind_mode: crate::transport::BindMode::Connect,
         };
         let client = dial(&cfg, test_signer(), None, None);

@@ -132,8 +132,6 @@ pub mod resolver;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod service;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod zmq_context;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod streaming;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod moq_stream;
@@ -173,8 +171,6 @@ pub mod node_identity;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod federated_identity;
 pub mod signer;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod zmq_connection;
 pub use stream_info::StreamInfo;
 pub use crypto::{
     generate_signing_keypair, signing_key_from_bytes, verifying_key_from_bytes,
@@ -208,21 +204,14 @@ pub use resolver::Resolver;
 pub use registry::SocketKind;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use service::{Continuation, EnvelopeContext, RequestLoop, Spawnable, ServiceHandle, RequestService};
-/// Transitional compat alias for the former `ZmqService` (#166); removed in #138.
-#[cfg(not(target_arch = "wasm32"))]
-#[doc(hidden)]
-pub use service::RequestService as ZmqService;
+pub use service::{Continuation, EnvelopeContext, Spawnable, ServiceHandle, RequestService};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use streaming::{
-    ChannelProgressReporter, derive_client_stream_keys, forward_progress_to_stream,
+    ChannelProgressReporter, derive_client_stream_keys,
     progress_channel, ProgressUpdate, ResponseStream, StreamChannel, StreamContext,
-    StreamHandle, StreamPayload, StreamPublisher, StreamVerifier,
+    StreamPayload, StreamPayloadData, StreamVerifier,
 };
-
-#[cfg(not(target_arch = "wasm32"))]
-pub use zmq_context::global_context;
 
 // ============================================================================
 // Prelude (native only — too many native-only types)
@@ -244,16 +233,13 @@ pub mod prelude {
         // Error
         EnvelopeError, EnvelopeResult, Result, RpcError,
         // Service (transport)
-        EnvelopeContext, RequestLoop, ServiceHandle, RequestService,
+        EnvelopeContext, ServiceHandle, RequestService,
         // Streaming
-        StreamContext, StreamPublisher,
+        StreamContext,
     };
 
     #[cfg(not(feature = "fips"))]
     pub use crate::{generate_ephemeral_keypair, ristretto_dh, RistrettoPublic, RistrettoSecret};
-
-    // ZMQ context
-    pub use crate::zmq_context::global_context;
 
     // Registry (with renamed imports for convenience)
     pub use crate::registry::{

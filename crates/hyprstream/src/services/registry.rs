@@ -9,7 +9,6 @@ use hyprstream_containedfs::{ContainedFs, FsError, FsHandle};
 use crate::services::{EnvelopeContext, RequestService};
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc::prelude::*;
-use hyprstream_rpc::registry::{global as endpoint_registry, SocketKind};
 use hyprstream_rpc::{StreamChannel, StreamContext};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -751,14 +750,18 @@ impl RegistryService {
             "Clone stream prepared (DH + pre-authorization via StreamChannel)"
         );
 
-        let stream_endpoint = endpoint_registry()
-            .endpoint("streams", SocketKind::Sub)
-            .to_zmq_string();
-
+        let moq_uds_path = hyprstream_rpc::moq_stream::global_moq_uds_path()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let moq_broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()
+            .map(|o| o.broadcast_path(stream_ctx.topic()))
+            .unwrap_or_default();
         let stream_info = StreamInfo {
             stream_id: stream_ctx.stream_id().to_owned(),
-            endpoint: stream_endpoint,
+            endpoint: String::new(),
             server_pubkey: *stream_ctx.server_pubkey(),
+            moq_uds_path,
+            moq_broadcast_path,
             ..Default::default()
         };
 

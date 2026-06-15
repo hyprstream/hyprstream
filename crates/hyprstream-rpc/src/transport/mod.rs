@@ -8,7 +8,6 @@
 //! - Raw socket options via `sockopt` submodule
 
 mod traits;
-pub mod sockopt;
 pub mod zmtp_quic;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod iroh_substrate;
@@ -56,80 +55,20 @@ pub enum BindMode {
     Connect,
 }
 
-/// CurveZMQ security configuration.
-///
-/// CurveZMQ provides transport-layer encryption and authentication using
-/// elliptic curve cryptography (Curve25519). Requires ZMQ compiled with libsodium.
-///
-/// # Security Layers
-///
-/// - **Encryption**: All messages encrypted with ephemeral session keys
-/// - **Authentication**: Server verifies client public keys (optional client auth)
-/// - **Forward secrecy**: Compromising long-term keys doesn't decrypt past sessions
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CurveConfig {
-    /// Server public key (required for clients)
-    pub server_public_key: Option<[u8; 32]>,
-
-    /// Client secret key (for client authentication)
-    pub client_secret_key: Option<[u8; 32]>,
-
-    /// Client public key (for client authentication)
-    pub client_public_key: Option<[u8; 32]>,
-}
-
-impl CurveConfig {
-    /// Create a client configuration (connects to server with server's public key)
-    pub fn client(server_public_key: [u8; 32]) -> Self {
-        Self {
-            server_public_key: Some(server_public_key),
-            client_secret_key: None,
-            client_public_key: None,
-        }
-    }
-
-    /// Create a server configuration (accepts any authenticated client)
-    pub fn server() -> Self {
-        Self {
-            server_public_key: None,
-            client_secret_key: None,
-            client_public_key: None,
-        }
-    }
-}
-
-/// ZMQ endpoint configuration with optional CurveZMQ encryption.
-///
-/// This enum represents the different endpoint types ZMQ can connect to.
-/// Network-level routing (SOCKS proxy, WireGuard, etc.) is configured
-/// separately at the socket/system level.
-///
-/// # Security
-///
-/// CurveZMQ can be enabled on any transport type via `with_curve()`.
-/// This provides transport-layer encryption and authentication.
+/// Transport endpoint configuration.
 ///
 /// # Examples
 ///
 /// ```
 /// use hyprstream_rpc::transport::TransportConfig;
 ///
-/// // In-process endpoint (no encryption needed)
+/// // In-process endpoint
 /// let inproc = TransportConfig::inproc("hyprstream/registry");
-/// ```
-///
-/// ```ignore
-/// // IPC endpoint with CurveZMQ encryption
-/// let ipc = TransportConfig::ipc("/run/user/1000/hyprstream/service.sock")
-///     .with_curve(server_keypair);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportConfig {
     /// Endpoint type (inproc, IPC, systemd FD)
     pub endpoint: EndpointType,
-
-    /// Optional CurveZMQ encryption configuration
-    pub curve: Option<CurveConfig>,
 
     /// Socket bind mode (Bind or Connect).
     /// Workers behind a ROUTER/DEALER load balancer use Connect.
@@ -272,7 +211,6 @@ impl TransportConfig {
             endpoint: EndpointType::Inproc {
                 endpoint: endpoint.into(),
             },
-            curve: None,
             bind_mode: BindMode::Bind,
         }
     }
@@ -283,7 +221,6 @@ impl TransportConfig {
             endpoint: EndpointType::Ipc {
                 path: path.into(),
             },
-            curve: None,
             bind_mode: BindMode::Bind,
         }
     }
@@ -300,15 +237,11 @@ impl TransportConfig {
                 fd,
                 client_path: client_path.into(),
             },
-            curve: None,
             bind_mode: BindMode::Bind,
         }
     }
 
     /// Create a QUIC transport endpoint.
-    ///
-    /// QUIC provides TLS 1.3 encryption at the transport layer, so CurveZMQ
-    /// is not needed (NULL mechanism is used in ZMTP handshake).
     ///
     /// # Arguments
     ///
@@ -321,7 +254,6 @@ impl TransportConfig {
                 server_name: server_name.into(),
                 auth: QuicServerAuth::web_pki(),
             },
-            curve: None, // QUIC has TLS 1.3 built-in, no CurveZMQ needed
             bind_mode: BindMode::Bind,
         }
     }
@@ -337,7 +269,6 @@ impl TransportConfig {
                 // In-module: construct directly (a one-element set is always valid).
                 auth: QuicServerAuth { require_web_pki: false, accept_cert_hashes: vec![cert_hash] },
             },
-            curve: None,
             bind_mode: BindMode::Connect,
         }
     }
@@ -348,7 +279,6 @@ impl TransportConfig {
     pub fn quic_with_auth(addr: SocketAddr, server_name: impl Into<String>, auth: QuicServerAuth) -> Self {
         Self {
             endpoint: EndpointType::Quic { addr, server_name: server_name.into(), auth },
-            curve: None,
             bind_mode: BindMode::Connect,
         }
     }
@@ -367,7 +297,6 @@ impl TransportConfig {
                 direct_addrs,
                 relay_url,
             },
-            curve: None,
             bind_mode: BindMode::Connect,
         }
     }
@@ -381,22 +310,6 @@ impl TransportConfig {
     /// Get the bind mode.
     pub fn bind_mode(&self) -> BindMode {
         self.bind_mode
-    }
-
-    /// Enable CurveZMQ encryption for this transport.
-    ///
-    /// This provides transport-layer encryption and authentication for any
-    /// ZMQ socket type (REQ/REP, PUB/SUB, PUSH/PULL, etc.).
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let config = TransportConfig::ipc("/run/service.sock")
-    ///     .with_curve(CurveConfig::server());
-    /// ```
-    pub fn with_curve(mut self, curve: CurveConfig) -> Self {
-        self.curve = Some(curve);
-        self
     }
 
     /// Parse a ZMQ endpoint string into a TransportConfig.
@@ -440,7 +353,6 @@ impl TransportConfig {
 
         Self {
             endpoint: endpoint_type,
-            curve: None,
             bind_mode: BindMode::Bind,
         }
     }
@@ -481,131 +393,6 @@ impl TransportConfig {
                 Some(format!("https://{}:{}", server_name, addr.port()))
             }
             _ => None,
-        }
-    }
-
-    /// Apply CurveZMQ configuration to a socket (client or server).
-    ///
-    /// This method configures CurveZMQ encryption and authentication on the given socket.
-    /// Gracefully degrades if ZMQ wasn't compiled with libsodium support.
-    ///
-    /// # Arguments
-    ///
-    /// * `socket` - ZMQ socket to configure
-    /// * `is_server` - True for server sockets (bind), false for client sockets (connect)
-    ///
-    /// # Returns
-    ///
-    /// `Ok(true)` if CurveZMQ was successfully configured,
-    /// `Ok(false)` if CurveZMQ is not supported (graceful degradation),
-    /// `Err` if configuration fails.
-    pub fn apply_curve(&self, socket: &mut zmq::Socket, is_server: bool) -> anyhow::Result<bool> {
-        let Some(ref curve) = self.curve else {
-            return Ok(false); // No CurveZMQ requested
-        };
-
-        if is_server {
-            // Server configuration
-            socket
-                .set_curve_server(true)
-                .map_err(|e| {
-                    if e == zmq::Error::ENOTSUP {
-                        tracing::warn!("CurveZMQ not supported by ZMQ build - encryption disabled");
-                        return anyhow::anyhow!("CurveZMQ not supported");
-                    }
-                    anyhow::anyhow!("Failed to enable CurveZMQ server: {}", e)
-                })?;
-            Ok(true)
-        } else {
-            // Client configuration
-            if let Some(server_pubkey) = curve.server_public_key {
-                socket
-                    .set_curve_serverkey(&server_pubkey)
-                    .map_err(|e| anyhow::anyhow!("Failed to set server public key: {}", e))?;
-
-                // Generate ephemeral client keypair if not provided
-                if let (Some(client_secret), Some(client_public)) =
-                    (curve.client_secret_key, curve.client_public_key)
-                {
-                    socket
-                        .set_curve_secretkey(&client_secret)
-                        .map_err(|e| anyhow::anyhow!("Failed to set client secret key: {}", e))?;
-                    socket
-                        .set_curve_publickey(&client_public)
-                        .map_err(|e| anyhow::anyhow!("Failed to set client public key: {}", e))?;
-                }
-
-                Ok(true)
-            } else {
-                Ok(false) // No server public key, skip CurveZMQ
-            }
-        }
-    }
-
-    /// Bind a ZMQ socket to this endpoint with optional CurveZMQ.
-    ///
-    /// For `SystemdFd`, uses the pre-bound file descriptor via `ZMQ_USE_FD`.
-    /// For `Ipc`, creates parent directories before binding.
-    /// For other variants, binds to the endpoint string directly.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if binding fails, directory creation fails,
-    /// or the endpoint type is `Quic` (use `QuicRep::bind` instead).
-    pub fn bind(&self, socket: &mut zmq::Socket) -> anyhow::Result<()> {
-        // Apply CurveZMQ first (before bind)
-        self.apply_curve(socket, true)?;
-
-        match &self.endpoint {
-            EndpointType::SystemdFd { fd, .. } => {
-                sockopt::set_use_fd(socket, *fd)?;
-                Ok(())
-            }
-            EndpointType::Ipc { path } => {
-                // Ensure parent directory exists before binding IPC socket
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| anyhow::anyhow!("Failed to create directory {}: {}", parent.display(), e))?;
-                }
-                socket.bind(&self.zmq_endpoint())?;
-                Ok(())
-            }
-            EndpointType::Inproc { .. } => {
-                socket.bind(&self.zmq_endpoint())?;
-                Ok(())
-            }
-            EndpointType::Quic { .. } | EndpointType::Iroh { .. } => {
-                anyhow::bail!(
-                    "QUIC/iroh endpoints are not ZMQ sockets — they are dialed via \
-                     the transport/dial() layer, not bound here"
-                )
-            }
-        }
-    }
-
-    /// Connect a ZMQ socket to this endpoint with optional CurveZMQ.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if connection fails or the endpoint type is `Quic`
-    /// (use `QuicReq::connect` instead).
-    pub fn connect(&self, socket: &mut zmq::Socket) -> anyhow::Result<()> {
-        // Apply CurveZMQ first (before connect)
-        self.apply_curve(socket, false)?;
-
-        match &self.endpoint {
-            EndpointType::Inproc { .. }
-            | EndpointType::Ipc { .. }
-            | EndpointType::SystemdFd { .. } => {
-                socket.connect(&self.zmq_endpoint())?;
-                Ok(())
-            }
-            EndpointType::Quic { .. } | EndpointType::Iroh { .. } => {
-                anyhow::bail!(
-                    "QUIC/iroh endpoints are not ZMQ sockets — they are dialed via \
-                     the transport/dial() layer, not connected here"
-                )
-            }
         }
     }
 

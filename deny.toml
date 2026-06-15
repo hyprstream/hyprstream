@@ -15,24 +15,14 @@ wildcards = "allow"
 
 # ZMQ removal exit criterion (#138 / #173):
 # These are banned to enforce the "no ZMQ" invariant post-cutover.
-# Currently warn (not deny) because ZMQ is still in use; flip to `deny`
-# when #138 is merged and the dependency graph is clean.
 deny = [
-    # Intentionally left empty until #138 lands — then add:
-    # { name = "zmq" },
-    # { name = "zmq-sys" },
-    # { name = "tmq" },
-    # { name = "zeromq-src" },
+    { name = "zmq", reason = "ZMQ fully removed in #138 — no new zmq deps" },
+    { name = "zmq-sys", reason = "ZMQ fully removed in #138" },
+    { name = "tmq", reason = "ZMQ fully removed in #138" },
+    { name = "zeromq-src", reason = "ZMQ fully removed in #138" },
 ]
 
-warn = [
-    # ZMQ deps — tracked for removal via #138.
-    # `cargo deny check bans` will emit warnings for each until they're gone.
-    { name = "zmq", reason = "ZMQ in-flight removal (#138) — migrate callers then flip to deny" },
-    { name = "zmq-sys", reason = "ZMQ in-flight removal (#138)" },
-    { name = "tmq", reason = "ZMQ in-flight removal (#138)" },
-    { name = "zeromq-src", reason = "ZMQ in-flight removal (#138)" },
-]
+warn = []
 
 [licenses]
 # Minimum confidence threshold for license detection.

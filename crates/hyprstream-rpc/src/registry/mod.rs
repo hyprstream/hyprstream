@@ -34,10 +34,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// ZMQ socket type identifier for endpoint registration.
-///
-/// This enum mirrors `zmq::SocketType` but implements `Hash` for use as HashMap keys.
-/// Use `.into()` to convert to `zmq::SocketType` when needed.
+/// Socket type identifier for endpoint registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SocketKind {
     /// REQ socket (client request)
@@ -85,45 +82,6 @@ impl SocketKind {
             SocketKind::Pair => "-pair",
             SocketKind::Stream => "-stream",
             SocketKind::Quic => "-quic",
-        }
-    }
-}
-
-impl From<SocketKind> for zmq::SocketType {
-    fn from(kind: SocketKind) -> Self {
-        match kind {
-            SocketKind::Req => zmq::SocketType::REQ,
-            SocketKind::Rep => zmq::SocketType::REP,
-            SocketKind::Dealer => zmq::SocketType::DEALER,
-            SocketKind::Router => zmq::SocketType::ROUTER,
-            SocketKind::Pub => zmq::SocketType::PUB,
-            SocketKind::Sub => zmq::SocketType::SUB,
-            SocketKind::XPub => zmq::SocketType::XPUB,
-            SocketKind::XSub => zmq::SocketType::XSUB,
-            SocketKind::Push => zmq::SocketType::PUSH,
-            SocketKind::Pull => zmq::SocketType::PULL,
-            SocketKind::Pair => zmq::SocketType::PAIR,
-            SocketKind::Stream => zmq::SocketType::STREAM,
-            SocketKind::Quic => panic!("SocketKind::Quic has no ZMQ equivalent"),
-        }
-    }
-}
-
-impl From<zmq::SocketType> for SocketKind {
-    fn from(st: zmq::SocketType) -> Self {
-        match st {
-            zmq::SocketType::REQ => SocketKind::Req,
-            zmq::SocketType::REP => SocketKind::Rep,
-            zmq::SocketType::DEALER => SocketKind::Dealer,
-            zmq::SocketType::ROUTER => SocketKind::Router,
-            zmq::SocketType::PUB => SocketKind::Pub,
-            zmq::SocketType::SUB => SocketKind::Sub,
-            zmq::SocketType::XPUB => SocketKind::XPub,
-            zmq::SocketType::XSUB => SocketKind::XSub,
-            zmq::SocketType::PUSH => SocketKind::Push,
-            zmq::SocketType::PULL => SocketKind::Pull,
-            zmq::SocketType::PAIR => SocketKind::Pair,
-            zmq::SocketType::STREAM => SocketKind::Stream,
         }
     }
 }
@@ -728,15 +686,4 @@ mod tests {
         assert!(services.contains(&"svc2".to_owned()));
     }
 
-    #[test]
-    fn test_socket_kind_conversion() {
-        // No lock needed - doesn't use global registry
-        // Test From<SocketKind> for zmq::SocketType
-        let zmq_type: zmq::SocketType = SocketKind::Router.into();
-        assert_eq!(zmq_type, zmq::SocketType::ROUTER);
-
-        // Test From<zmq::SocketType> for SocketKind
-        let socket_kind: SocketKind = zmq::SocketType::XPUB.into();
-        assert_eq!(socket_kind, SocketKind::XPub);
-    }
 }

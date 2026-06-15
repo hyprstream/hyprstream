@@ -318,10 +318,18 @@ impl MetricsHandler for MetricsService {
             .prepare_stream(&q.ephemeral_pubkey, 600)
             .await?;
 
+        let moq_uds_path = hyprstream_rpc::moq_stream::global_moq_uds_path()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let moq_broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()
+            .map(|o| o.broadcast_path(stream_ctx.topic()))
+            .unwrap_or_default();
         let stream_info = StreamInfo {
             stream_id: stream_ctx.stream_id().to_owned(),
-            endpoint: self.inner.stream_channel.stream_endpoint(),
+            endpoint: String::new(),
             server_pubkey: *stream_ctx.server_pubkey(),
+            moq_uds_path,
+            moq_broadcast_path,
             ..Default::default()
         };
         let inner = Arc::clone(&self.inner);

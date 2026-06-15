@@ -1,12 +1,12 @@
 //! Service layer for hyprstream
 //!
-//! This module provides ZMQ-based services for inference and registry operations.
-//! Services use the REQ/REP pattern and Cap'n Proto for serialization.
+//! This module provides services for inference and registry operations.
+//! Services use Cap'n Proto for serialization via moq-net + UDS transport.
 //!
 //! # Security
 //!
 //! All requests are wrapped in `SignedEnvelope` for authentication:
-//! - `RequestLoop` verifies Ed25519 signatures before dispatching
+//! - `process_request` verifies Ed25519 signatures before dispatching
 //! - Handlers receive `EnvelopeContext` with verified identity
 //! - Services use `ctx.subject()` for policy checks and resource isolation
 //!
@@ -15,47 +15,39 @@
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │  hyprstream/src/services/                                   │
-//! │  ├── core.rs      ← RequestService trait, runners, clients     │
+//! │  ├── core.rs      ← RequestService trait re-exports           │
 //! │  ├── types.rs     ← Shared types (FsDirEntry, ModelInfo, etc.)│
-//! │  ├── registry.rs  ← Registry service (REP) + client (REQ)  │
-//! │  └── inference.rs ← Inference service (REP) + client (REQ) │
+//! │  ├── registry.rs  ← Registry service + client               │
+//! │  └── inference.rs ← Inference service + client              │
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 //!
 //! # Usage
 //!
-//! Services implement `RequestService` with infrastructure methods and are automatically
-//! `Spawnable` via blanket impl:
+//! Services implement `RequestService` and are automatically `Spawnable` via blanket impl:
 //!
 //! ```rust,ignore
 //! use crate::services::{EnvelopeContext, RequestService};
 //! use hyprstream_rpc::prelude::*;
-//! use hyprstream_rpc::service::{InprocManager, ServiceManager, Spawnable};
 //! use hyprstream_rpc::transport::TransportConfig;
-//! use std::sync::Arc;
 //!
-//! // Define a service with infrastructure
 //! struct MyService {
-//!     context: Arc<zmq::Context>,
 //!     transport: TransportConfig,
-//!     verifying_key: VerifyingKey,
+//!     signing_key: SigningKey,
 //! }
 //!
 //! impl RequestService for MyService {
-//!     fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<Continuation>)> {
-//!         // ctx.identity is already verified
+//!     async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<Continuation>)> {
 //!         println!("Request from: {}", ctx.subject());
 //!         Ok((vec![], None))
 //!     }
 //!
 //!     fn name(&self) -> &str { "my-service" }
-//!     fn context(&self) -> &Arc<zmq::Context> { &self.context }
 //!     fn transport(&self) -> &TransportConfig { &self.transport }
-//!     fn verifying_key(&self) -> VerifyingKey { self.verifying_key }
+//!     fn signing_key(&self) -> SigningKey { self.signing_key.clone() }
 //! }
 //!
-//! // Services are directly Spawnable - no wrapping needed!
-//! let service = MyService { context, transport, verifying_key };
+//! let service = MyService { transport, signing_key };
 //! let manager = InprocManager::new();
 //! let handle = manager.spawn(Box::new(service)).await?;
 //!

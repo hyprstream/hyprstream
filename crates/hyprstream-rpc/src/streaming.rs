@@ -6,55 +6,42 @@
 //! # Architecture
 //!
 //! ```text
-//! Producer                              Consumer
-//! ────────                              ────────
-//! StreamBuilder::with_dh() ◄── DH ──► StreamHandle::new()
-//!       │                                    │
-//!       │ add_data(rate)                     │ next()
-//!       ▼                                    ▼
-//! [topic, capnp, mac] ────────────► StreamVerifier
+//! Producer                     Consumer
+//! ────────                     ────────
+//! StreamChannel::publisher()   MoqStreamHandle::new()
+//!       │                             │
+//!       │ publish_data()              │ recv_next()
+//!       ▼                             ▼
+//! moq UDS track ──────────► StreamVerifier
 //! ```
 //!
 //! # Wire Format
 //!
-//! ```text
-//! ZMQ Multipart:
-//!   Frame 0: topic (64 hex chars, DH-derived)
-//!   Frame 1: capnp StreamBlock
-//!   Frame 2: mac (16 bytes truncated MAC)
-//! ```
+//! Moq track payload (binary):
+//!   capnp StreamBlock + 16-byte truncated HMAC appended
 //!
 //! # Security
 //!
 //! - DH key exchange: Ristretto255 ECDH derives topic + mac_key
 //! - MAC chain: Each block's MAC depends on previous, enforces ordering
-//! - E2E authentication: StreamService is blind forwarder
 //!
 //! # Backend
 //!
 //! - Default: Blake3 `keyed_hash()` (~10+ GB/s with SIMD)
 //! - FIPS mode: HMAC-SHA256 (FIPS 198-1)
 
-use std::collections::VecDeque;
 use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::Poll;
 
 use anyhow::Result;
 use capnp::message::Builder;
 use capnp::serialize;
-use futures::{SinkExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::Claims;
 use crate::prelude::SigningKey;
-use crate::registry::{global as endpoint_registry, SocketKind};
 
-use tmq::SocketExt;
-
-use crate::crypto::{derive_stream_keys, keyed_mac_truncated};
+use crate::crypto::derive_stream_keys;
 
 // DH key types - Ristretto255 (default) or P-256 (FIPS)
 #[cfg(not(feature = "fips"))]
@@ -73,40 +60,6 @@ pub use crate::stream_info::StreamInfo;
 // ============================================================================
 // Configuration
 // ============================================================================
-
-/// Configuration for a StreamPublisher socket.
-///
-/// Controls high-water mark and whether the publisher gets a dedicated socket
-/// (bypasses the shared StreamChannel socket for high-frequency publishers like TUI frames).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StreamPublisherConfig {
-    /// ZMQ send high-water mark. 0 = unlimited. Default: 1000.
-    #[serde(default = "default_sndhwm")]
-    pub sndhwm: i32,
-    /// If true, the publisher creates its own PUSH socket instead of sharing.
-    #[serde(default)]
-    pub dedicated: bool,
-}
-
-fn default_sndhwm() -> i32 { 1000 }
-
-impl Default for StreamPublisherConfig {
-    fn default() -> Self {
-        Self { sndhwm: default_sndhwm(), dedicated: false }
-    }
-}
-
-/// Socket variant for StreamPublisher — shared (default) or dedicated.
-///
-/// `Shared` reuses the StreamChannel's single PUSH socket (suitable for most streams).
-/// `Dedicated` owns its own PUSH socket (for high-frequency publishers like TUI frame loops
-/// where HWM saturation on the shared socket would block other streams).
-pub enum PublisherSocket {
-    /// Shared socket from StreamChannel (existing behavior).
-    Shared(Arc<tokio::sync::Mutex<tmq::push::Push>>),
-    /// Dedicated socket owned by this publisher. Wrapped in `Option` for `Drop` take.
-    Dedicated(Option<tmq::push::Push>),
-}
 
 /// Configuration for adaptive batching (rate control).
 ///
@@ -193,240 +146,6 @@ pub use crate::stream_consumer::StreamPayload;
 // StreamHmacState was moved to crypto::hmac for cross-platform availability.
 // Re-exported here for backward compatibility.
 pub use crate::crypto::StreamHmacState;
-
-// ============================================================================
-// Stream Frames
-// ============================================================================
-
-/// ZMQ multipart frames for a StreamBlock.
-pub struct StreamFrames {
-    /// Frame 0: topic (64 hex chars)
-    pub topic: Vec<u8>,
-    /// Frame 1: capnp StreamBlock
-    pub capnp: Vec<u8>,
-    /// Frame 2: 16-byte truncated HMAC
-    pub mac: [u8; 16],
-}
-
-impl StreamFrames {
-    /// Send frames via raw ZMQ socket (sync).
-    ///
-    /// Use this for low-level streaming code that manages its own zmq sockets.
-    /// For service-level code, prefer `StreamChannel::run_stream()`.
-    pub fn send(&self, socket: &zmq::Socket) -> Result<()> {
-        socket.send(&self.topic, zmq::SNDMORE)?;
-        socket.send(&self.capnp, zmq::SNDMORE)?;
-        socket.send(self.mac.as_slice(), 0)?;
-        Ok(())
-    }
-
-    /// Send frames via async tmq Push socket.
-    pub async fn send_async(&self, socket: &mut tmq::push::Push) -> Result<()> {
-        let multipart = tmq::Multipart::from(vec![
-            self.topic.clone(),
-            self.capnp.clone(),
-            self.mac.to_vec(),
-        ]);
-        socket.send(multipart).await
-            .map_err(|e| anyhow::anyhow!("Failed to send stream frames: {}", e))?;
-        Ok(())
-    }
-
-    /// Try to send frames via async tmq Push socket with zero timeout.
-    ///
-    /// Returns `Ok(())` if sent, `Err` if the send would block (HWM full).
-    /// Used by `try_publish_data()` for non-blocking frame delivery.
-    pub async fn try_send_async(&self, socket: &mut tmq::push::Push) -> Result<()> {
-        let multipart = tmq::Multipart::from(vec![
-            self.topic.clone(),
-            self.capnp.clone(),
-            self.mac.to_vec(),
-        ]);
-        // tmq::push::Push wraps ZMQ PUSH — if HWM is hit and SNDTIMEO is 0,
-        // send returns EAGAIN. We rely on the socket having SNDTIMEO=0 for
-        // dedicated sockets used in frame loops.
-        socket.send(multipart).await
-            .map_err(|e| anyhow::anyhow!("try_send failed (HWM full?): {}", e))?;
-        Ok(())
-    }
-
-    /// Convert to Vec of frames for buffering.
-    pub fn to_vec(self) -> Vec<Vec<u8>> {
-        vec![self.topic, self.capnp, self.mac.to_vec()]
-    }
-}
-
-// ============================================================================
-// Stream Builder (Producer)
-// ============================================================================
-
-/// Stream producer with adaptive batching and DH encapsulation.
-///
-/// # Example
-///
-/// ```ignore
-/// // Create with DH key exchange
-/// let mut builder = StreamBuilder::with_dh(
-///     config,
-///     &server_secret,
-///     &client_pubkey,
-///     &server_pubkey,
-/// )?;
-///
-/// // Add data with rate-based batching
-/// while let Some(data) = source.next().await {
-///     if let Some(frames) = builder.add_data(&stream_id, &data, rate)? {
-///         frames.send(&socket)?;
-///     }
-/// }
-///
-/// // Final flush
-/// if let Some(frames) = builder.flush()? {
-///     frames.send(&socket)?;
-/// }
-/// ```
-pub struct StreamBuilder {
-    config: BatchingConfig,
-    hmac_state: StreamHmacState,
-    pending: Vec<StreamPayloadData>,
-    pending_bytes: usize,
-    /// Producer-assigned monotonic counter per epoch (#219). Named `sequenceNumber`
-    /// per IETF convention (DTLS RFC 9147, RTP RFC 3550). Incremented once per
-    /// emitted block; stamped into the block (MAC-covered) for resume/dedup/anti-replay.
-    /// Epoch is 0 until the #223 epoch lifecycle lands.
-    sequence_number: u64,
-}
-
-impl StreamBuilder {
-    /// Create a new StreamBuilder with raw keys.
-    pub fn new(config: BatchingConfig, mac_key: [u8; 32], topic: String) -> Self {
-        Self {
-            config,
-            hmac_state: StreamHmacState::new(mac_key, topic),
-            pending: Vec::new(),
-            pending_bytes: 0,
-            sequence_number: 0,
-        }
-    }
-
-    /// Create with DH key derivation (encapsulated).
-    ///
-    /// Performs DH (Ristretto255 or P-256 in FIPS mode) and derives topic + mac_key internally.
-    ///
-    /// # Note
-    ///
-    /// FIPS mode uses P-256 which requires 33-byte compressed public keys.
-    /// Default mode uses Ristretto255 with 32-byte keys.
-    pub fn with_dh(
-        config: BatchingConfig,
-        server_secret: &DhSecret,
-        client_pubkey: &[u8],
-        server_pubkey: &[u8],
-    ) -> Result<Self> {
-        // Perform DH
-        let client_pub = DhPublic::from_slice(client_pubkey)
-            .ok_or_else(|| anyhow::anyhow!("Invalid client public key"))?;
-        let shared_secret = dh_compute(server_secret, &client_pub);
-
-        // Derive stream keys (needs 32-byte arrays for salt computation)
-        // For non-32-byte keys, hash them to 32 bytes
-        let client_pub_32 = pubkey_to_32(client_pubkey);
-        let server_pub_32 = pubkey_to_32(server_pubkey);
-        let keys = derive_stream_keys(&shared_secret, &client_pub_32, &server_pub_32)?;
-
-        Ok(Self::new(config, *keys.mac_key, keys.topic))
-    }
-
-    /// Compute adaptive batch size based on rate (logarithmic scaling).
-    fn adaptive_batch_size(&self, rate: f32) -> usize {
-        let min = self.config.min_batch_size;
-        let max = self.config.max_batch_size;
-
-        let log_min_rate = self.config.min_rate.max(1.0).ln();
-        let log_max_rate = self.config.max_rate.max(1.0).ln();
-
-        let log_rate = rate.max(1.0).ln();
-        let t = ((log_rate - log_min_rate) / (log_max_rate - log_min_rate)).clamp(0.0, 1.0);
-
-        // Interpolate: result is in [min, max]
-        let batch_f32 = (min as f32 + t * (max - min) as f32).round();
-
-        // Return early for boundary/edge cases (no cast needed)
-        if !batch_f32.is_finite() || batch_f32 <= min as f32 {
-            return min;
-        }
-        if batch_f32 >= max as f32 {
-            return max;
-        }
-
-        // SAFETY: batch_f32 is in (min, max), both small positive integers (typically 1-64).
-        // Clippy can't verify bounds, but we've proven batch_f32 > min >= 1 and < max.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        { batch_f32 as usize }
-    }
-
-    /// Add data payload with adaptive batching.
-    ///
-    /// Returns frames if batch is ready to send.
-    pub fn add_data(&mut self, data: &[u8], rate: f32) -> Result<Option<StreamFrames>> {
-        self.pending_bytes += data.len() + 8; // Estimate overhead
-        self.pending.push(StreamPayloadData::Data(data.to_vec()));
-
-        let batch_size = self.adaptive_batch_size(rate);
-        if self.pending.len() >= batch_size || self.pending_bytes >= self.config.max_block_bytes {
-            self.flush()
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Add error payload (flushes immediately).
-    pub fn add_error(&mut self, message: &str) -> Result<Option<StreamFrames>> {
-        self.pending.push(StreamPayloadData::Error(message.to_owned()));
-        self.flush()
-    }
-
-    /// Add completion payload (flushes immediately).
-    pub fn add_complete(&mut self, metadata: &[u8]) -> Result<Option<StreamFrames>> {
-        self.pending.push(StreamPayloadData::Complete(metadata.to_vec()));
-        self.flush()
-    }
-
-    /// Flush pending payloads to StreamFrames.
-    pub fn flush(&mut self) -> Result<Option<StreamFrames>> {
-        if self.pending.is_empty() {
-            return Ok(None);
-        }
-
-        let payloads = std::mem::take(&mut self.pending);
-        self.pending_bytes = 0;
-
-        // Build StreamBlock capnp message (shared encoder; also used by the
-        // moq plane in `moq_stream.rs`).
-        let sequence_number = self.sequence_number;
-        self.sequence_number += 1;
-        // epoch is 0 until the #223 key-epoch lifecycle lands.
-        let capnp_bytes = encode_stream_block(self.hmac_state.prev_mac_bytes(), sequence_number, 0, &payloads)?;
-
-        let mac = self.hmac_state.compute_next(&capnp_bytes);
-
-        Ok(Some(StreamFrames {
-            topic: self.hmac_state.topic().as_bytes().to_vec(),
-            capnp: capnp_bytes,
-            mac,
-        }))
-    }
-
-    /// Consume builder and flush remaining payloads.
-    pub fn finish(mut self) -> Result<Option<StreamFrames>> {
-        self.flush()
-    }
-
-    /// Get the topic.
-    pub fn topic(&self) -> &str {
-        self.hmac_state.topic()
-    }
-}
 
 // ============================================================================
 // Stream Context (Encapsulates stream state for producers)
@@ -585,282 +304,6 @@ impl StreamContext {
 }
 
 // ============================================================================
-// Stream Publisher (High-level producer API)
-// ============================================================================
-
-/// High-level async stream publisher with automatic batching and MAC chain.
-///
-/// Wraps `StreamBuilder` and an async tmq Push socket to provide a simple API for
-/// publishing stream data. Handles all the complexity of batching,
-/// MAC computation, and frame sending.
-///
-/// # Example
-///
-/// ```ignore
-/// let publisher = StreamPublisher::new(socket_arc.clone(), &stream_ctx);
-///
-/// // Publish data (batched automatically)
-/// for chunk in data_source {
-///     publisher.publish_data(&chunk).await?;
-/// }
-///
-/// // Or publish progress updates
-/// publisher.publish_progress("Downloading", 50, 100).await?;
-///
-/// // Complete the stream
-/// publisher.complete(b"{\"status\":\"done\"}").await?;
-/// ```
-pub struct StreamPublisher {
-    builder: StreamBuilder,
-    socket: PublisherSocket,
-    cancel_token: CancellationToken,
-    terminated: bool,
-}
-
-impl StreamPublisher {
-    /// Create a new publisher from a stream context (shared socket).
-    pub fn new(socket: Arc<tokio::sync::Mutex<tmq::push::Push>>, ctx: &StreamContext) -> Self {
-        Self::with_config(socket, ctx, BatchingConfig::default())
-    }
-
-    /// Create a new publisher with custom batching config (shared socket).
-    pub fn with_config(
-        socket: Arc<tokio::sync::Mutex<tmq::push::Push>>,
-        ctx: &StreamContext,
-        config: BatchingConfig,
-    ) -> Self {
-        let builder = StreamBuilder::new(config, ctx.mac_key, ctx.topic.clone());
-        Self {
-            builder,
-            socket: PublisherSocket::Shared(socket),
-            cancel_token: ctx.cancel_token.clone(),
-            terminated: false,
-        }
-    }
-
-    /// Create a publisher with a dedicated PUSH socket.
-    ///
-    /// The dedicated socket is owned exclusively by this publisher, avoiding
-    /// contention with other streams on the shared StreamChannel socket.
-    /// Used for high-frequency publishers (e.g., TUI frame loops at 30fps).
-    pub fn with_dedicated_socket(
-        socket: tmq::push::Push,
-        ctx: &StreamContext,
-        config: BatchingConfig,
-    ) -> Self {
-        let builder = StreamBuilder::new(config, ctx.mac_key, ctx.topic.clone());
-        Self {
-            builder,
-            socket: PublisherSocket::Dedicated(Some(socket)),
-            cancel_token: ctx.cancel_token.clone(),
-            terminated: false,
-        }
-    }
-
-    /// Publish binary data with automatic batching.
-    ///
-    /// Data is batched based on the configured batch size and rate.
-    /// Use `flush()` to force immediate send.
-    pub async fn publish_data(&mut self, data: &[u8]) -> Result<()> {
-        self.publish_data_with_rate(data, 10.0).await
-    }
-
-    /// Publish binary data with explicit rate for adaptive batching.
-    ///
-    /// Higher rates result in larger batches (more efficient).
-    /// Lower rates result in smaller batches (lower latency).
-    pub async fn publish_data_with_rate(&mut self, data: &[u8], rate: f32) -> Result<()> {
-        if self.cancel_token.is_cancelled() {
-            anyhow::bail!("stream cancelled");
-        }
-        if let Some(frames) = self.builder.add_data(data, rate)? {
-            self.send_frames(frames).await?;
-        }
-        Ok(())
-    }
-
-    /// Try to publish data without blocking on a full HWM.
-    ///
-    /// Returns `Ok(true)` if the data was sent, `Ok(false)` if the socket's
-    /// high-water mark is full (zero-timeout send). Useful for frame loops
-    /// where a slow viewer should be skipped rather than blocking the loop.
-    ///
-    /// Only meaningful with `Dedicated` sockets; `Shared` sockets always await.
-    pub async fn try_publish_data(&mut self, data: &[u8], rate: f32) -> Result<bool> {
-        if self.cancel_token.is_cancelled() {
-            anyhow::bail!("stream cancelled");
-        }
-        if let Some(frames) = self.builder.add_data(data, rate)? {
-            match &mut self.socket {
-                PublisherSocket::Dedicated(Some(sock)) => {
-                    match frames.try_send_async(sock).await {
-                        Ok(()) => return Ok(true),
-                        Err(_) => return Ok(false),
-                    }
-                }
-                _ => {
-                    self.send_frames(frames).await?;
-                }
-            }
-        }
-        Ok(true)
-    }
-
-    /// Send frames via the appropriate socket variant.
-    async fn send_frames(&mut self, frames: StreamFrames) -> Result<()> {
-        match &mut self.socket {
-            PublisherSocket::Shared(arc) => {
-                let mut socket = arc.lock().await;
-                frames.send_async(&mut socket).await?;
-            }
-            PublisherSocket::Dedicated(Some(sock)) => {
-                frames.send_async(sock).await?;
-            }
-            PublisherSocket::Dedicated(None) => {
-                anyhow::bail!("dedicated socket already taken (publisher dropped?)");
-            }
-        }
-        Ok(())
-    }
-
-    /// Publish a progress update.
-    ///
-    /// Convenience method that formats progress as `stage:current:total`.
-    /// Client should parse this format or use a structured payload.
-    pub async fn publish_progress(&mut self, stage: &str, current: usize, total: usize) -> Result<()> {
-        let data = format!("{}:{}:{}", stage, current, total);
-        self.publish_data(data.as_bytes()).await
-    }
-
-    /// Publish an error and flush immediately.
-    pub async fn publish_error(&mut self, message: &str) -> Result<()> {
-        self.terminated = true; // Before await — cancellation-safe
-        if let Some(frames) = self.builder.add_error(message)? {
-            self.send_frames(frames).await?;
-        }
-        Ok(())
-    }
-
-    /// Complete the stream with metadata and flush.
-    ///
-    /// This consumes the publisher - no more data can be sent after completion.
-    pub async fn complete(mut self, metadata: &[u8]) -> Result<()> {
-        self.complete_ref(metadata).await
-    }
-
-    /// Complete the stream with metadata and flush (by reference).
-    ///
-    /// Same as `complete()` but doesn't consume self, allowing use in
-    /// callback-based APIs like `StreamChannel::run_stream()`.
-    pub async fn complete_ref(&mut self, metadata: &[u8]) -> Result<()> {
-        self.terminated = true; // Before await — cancellation-safe
-        if let Some(frames) = self.builder.add_complete(metadata)? {
-            self.send_frames(frames).await?;
-        }
-        if let Some(frames) = self.builder.flush()? {
-            self.send_frames(frames).await?;
-        }
-        Ok(())
-    }
-
-    /// Flush any pending batched data immediately.
-    pub async fn flush(&mut self) -> Result<()> {
-        if let Some(frames) = self.builder.flush()? {
-            self.send_frames(frames).await?;
-        }
-        Ok(())
-    }
-
-    /// Get the topic being published to.
-    pub fn topic(&self) -> &str {
-        self.builder.topic()
-    }
-
-    /// Check if this stream has been cancelled.
-    pub fn is_cancelled(&self) -> bool {
-        self.cancel_token.is_cancelled()
-    }
-
-    /// Whether a terminal frame (Error or Complete) has been sent.
-    pub fn is_terminated(&self) -> bool {
-        self.terminated
-    }
-}
-
-impl Drop for StreamPublisher {
-    fn drop(&mut self) {
-        if self.terminated || self.cancel_token.is_cancelled() {
-            return;
-        }
-
-        // Take the original builder to preserve HMAC chain state.
-        // The replacement is a dummy that will never be used (we're being dropped).
-        let mut builder = std::mem::replace(
-            &mut self.builder,
-            StreamBuilder::new(BatchingConfig::default(), [0u8; 32], String::new()),
-        );
-
-        let frames = match builder.add_error("publisher dropped without terminal frame") {
-            Ok(Some(f)) => f,
-            _ => return,
-        };
-
-        // Take the socket out of self for the spawned flush task.
-        let socket = std::mem::replace(
-            &mut self.socket,
-            PublisherSocket::Dedicated(None),
-        );
-
-        // Spawn async send — the spawned task yields to the runtime, so Drop
-        // itself returns immediately. Bounded 200ms wait covers brief lock
-        // contention from concurrent publishers or register_topic() on the
-        // same StreamChannel. If the lock cannot be acquired, log an error
-        // so the failure is observable rather than silent.
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(async move {
-                    match socket {
-                        PublisherSocket::Shared(arc) => {
-                            match tokio::time::timeout(
-                                std::time::Duration::from_millis(200),
-                                arc.lock(),
-                            )
-                            .await
-                            {
-                                Ok(mut sock) => {
-                                    let _ = frames.send_async(&mut sock).await;
-                                }
-                                Err(_) => {
-                                    tracing::error!(
-                                        "StreamPublisher::drop: could not acquire socket lock \
-                                         within 200ms; terminal error frame not sent — \
-                                         client will hang until JWT expiry"
-                                    );
-                                }
-                            }
-                        }
-                        PublisherSocket::Dedicated(Some(mut sock)) => {
-                            let _ = frames.send_async(&mut sock).await;
-                        }
-                        PublisherSocket::Dedicated(None) => {
-                            tracing::error!(
-                                "StreamPublisher::drop: dedicated socket already taken"
-                            );
-                        }
-                    }
-                });
-            }
-            Err(_) => {
-                tracing::error!(
-                    "StreamPublisher::drop: no tokio runtime; \
-                     terminal error frame not sent"
-                );
-            }
-        }
-    }
-}
-
-// ============================================================================
 // Progress Streaming (Bridges progress callbacks to streams)
 // ============================================================================
 
@@ -956,41 +399,6 @@ pub fn progress_channel(buffer_size: usize) -> (
     tokio::sync::mpsc::channel(buffer_size)
 }
 
-/// Helper to forward progress updates from a tokio channel to a StreamPublisher.
-///
-/// This is a convenience function for the common pattern of receiving progress
-/// updates from a blocking operation and forwarding them to a stream.
-///
-/// # Arguments
-/// * `receiver` - Tokio channel receiving progress updates
-/// * `publisher` - StreamPublisher to forward updates to
-///
-/// # Returns
-/// Ok(()) on successful completion, Err on any error
-pub async fn forward_progress_to_stream(
-    mut receiver: tokio::sync::mpsc::Receiver<ProgressUpdate>,
-    publisher: &mut StreamPublisher,
-) -> Result<()> {
-    while let Some(update) = receiver.recv().await {
-        match update {
-            ProgressUpdate::Progress { stage, current, total } => {
-                publisher.publish_progress(&stage, current, total).await?;
-            }
-            ProgressUpdate::Complete(metadata) => {
-                publisher.complete_ref(&metadata).await?;
-                return Ok(());
-            }
-            ProgressUpdate::Error(msg) => {
-                publisher.publish_error(&msg).await?;
-                return Err(anyhow::anyhow!("Operation failed: {}", msg));
-            }
-        }
-    }
-    // Channel closed without completion - treat as error
-    publisher.publish_error("Progress channel closed unexpectedly").await?;
-    Err(anyhow::anyhow!("Progress channel closed unexpectedly"))
-}
-
 // ============================================================================
 // Stream Verifier (Consumer helper)
 // ============================================================================
@@ -1001,261 +409,6 @@ pub async fn forward_progress_to_stream(
 // `crate::StreamVerifier`, the moq path, and the wasm/browser consumer all use a single
 // verifier — the one place #163's policy-selected enforcement will land.
 pub use crate::stream_consumer::StreamVerifier;
-
-// ============================================================================
-// Stream Handle (Consumer)
-// ============================================================================
-
-/// E2E authenticated stream consumer with DH encapsulation.
-///
-/// # Example
-///
-/// ```ignore
-/// let mut handle = StreamHandle::new(
-///     &context,
-///     stream_id,
-///     endpoint,
-///     &server_pubkey,
-///     &client_secret,
-///     &client_pubkey,
-/// )?;
-///
-/// use futures::StreamExt;
-/// while let Some(payload) = handle.next().await {
-///     match payload? {
-///         StreamPayload::Data(data) => process(data),
-///         StreamPayload::Complete(_) => break,
-///         StreamPayload::Error(message) => return Err(message.into()),
-///     }
-/// }
-/// ```
-pub struct StreamHandle {
-    subscriber: tmq::subscribe::Subscribe,
-    stream_id: String,
-    topic: String,
-    verifier: StreamVerifier,
-    pending: VecDeque<StreamPayload>,
-    completed: bool,
-    /// PUSH socket for sending control messages (lazy, consumer → StreamService)
-    /// Kept as sync zmq::Socket — cancel is best-effort fire-and-forget with DONTWAIT.
-    ctrl_push: Option<zmq::Socket>,
-    /// Control channel topic (DH-derived)
-    ctrl_topic: String,
-    /// Control channel MAC key
-    ctrl_mac_key: [u8; 32],
-    /// Cancellation token — consumer-side; fired by cancel() to unblock poll_next
-    cancel_token: CancellationToken,
-}
-
-// StreamHandle must be Send for ToolResult::Stream(Box<StreamHandle>)
-const _: () = {
-    fn _assert_send<T: Send>() {}
-    fn _check() {
-        _assert_send::<StreamHandle>();
-    }
-};
-
-impl StreamHandle {
-    /// Create with DH key derivation (encapsulated).
-    ///
-    /// # Note
-    ///
-    /// FIPS mode uses P-256 which requires 33-byte compressed public keys.
-    /// Default mode uses Ristretto255 with 32-byte keys.
-    pub fn new(
-        context: &zmq::Context,
-        stream_id: String,
-        endpoint: &str,
-        server_pubkey: &[u8],
-        client_secret: &DhSecret,
-        client_pubkey: &[u8],
-        qos: crate::stream_info::StreamOpt,
-    ) -> Result<Self> {
-        // Perform DH
-        let server_pub = DhPublic::from_slice(server_pubkey)
-            .ok_or_else(|| anyhow::anyhow!("Invalid server public key"))?;
-        let shared_secret = dh_compute(client_secret, &server_pub);
-
-        // Derive stream keys (needs 32-byte arrays for salt computation)
-        let client_pub_32 = pubkey_to_32(client_pubkey);
-        let server_pub_32 = pubkey_to_32(server_pubkey);
-        let keys = derive_stream_keys(&shared_secret, &client_pub_32, &server_pub_32)?;
-
-        // Create async TMQ subscriber
-        let subscriber = tmq::subscribe::subscribe(context)
-            .connect(endpoint)
-            .map_err(|e| anyhow::anyhow!("SUB connect to {}: {}", endpoint, e))?
-            .subscribe(keys.topic.as_bytes())
-            .map_err(|e| anyhow::anyhow!("SUB subscribe to topic: {}", e))?;
-
-        subscriber.set_linger(0)
-            .map_err(|e| anyhow::anyhow!("Failed to set linger on SUB: {}", e))?;
-
-        tracing::debug!(
-            stream_id = %stream_id,
-            topic = %keys.topic,
-            endpoint = %endpoint,
-            "Subscribed to E2E authenticated stream"
-        );
-
-        let verifier = StreamVerifier::with_policy(*keys.mac_key, keys.topic.clone(), qos.into());
-
-        // Set up control channel PUSH socket (consumer → StreamService → producer)
-        let ctrl_push = context.socket(zmq::PUSH).ok();
-        if let Some(ref sock) = ctrl_push {
-            let push_endpoint = endpoint_registry()
-                .endpoint("streams", SocketKind::Push)
-                .to_zmq_string();
-            // Best-effort connect — cancel is not critical path
-            let _ = sock.connect(&push_endpoint);
-        }
-
-        Ok(Self {
-            subscriber,
-            stream_id,
-            topic: keys.topic,
-            verifier,
-            pending: VecDeque::new(),
-            completed: false,
-            ctrl_push,
-            ctrl_topic: keys.ctrl_topic,
-            ctrl_mac_key: *keys.ctrl_mac_key,
-            cancel_token: CancellationToken::new(),
-        })
-    }
-
-    /// Receive next payload (async).
-    ///
-    /// Returns `None` when stream is complete or socket closed.
-    /// Prefer using `StreamExt::next()` directly for composability.
-    pub async fn recv_next(&mut self) -> Result<Option<StreamPayload>> {
-        self.next().await.transpose()
-    }
-
-    /// Get the stream ID.
-    pub fn stream_id(&self) -> &str {
-        &self.stream_id
-    }
-
-    /// Get the topic.
-    pub fn topic(&self) -> &str {
-        &self.topic
-    }
-
-    /// Check if stream is complete.
-    pub fn is_completed(&self) -> bool {
-        self.completed
-    }
-
-    /// Get the cancellation token (clone to trigger from another context).
-    pub fn cancel_token(&self) -> &CancellationToken {
-        &self.cancel_token
-    }
-
-    /// Send a cancel control message to the producer via the control channel.
-    ///
-    /// Also fires the cancellation token to unblock `poll_next` immediately.
-    /// Best-effort: if the PUSH socket is unavailable or send fails, the
-    /// JWT expiry timeout will still stop the stream.
-    pub fn cancel(&self) {
-        self.cancel_token.cancel();  // Unblock poll_next (waker fires)
-
-        let Some(ref sock) = self.ctrl_push else { return };
-
-        // Build StreamControl::Cancel capnp message
-        let mut builder = Builder::new_default();
-        {
-            let mut ctrl = builder.init_root::<crate::streaming_capnp::stream_control::Builder>();
-            ctrl.set_cancel(());
-        }
-        let mut buf = Vec::new();
-        if serialize::write_message(&mut buf, &builder).is_err() {
-            return;
-        }
-
-        // Compute HMAC over the capnp payload using ctrl_mac_key
-        let mac = keyed_mac_truncated(&self.ctrl_mac_key, &buf);
-
-        // Send [ctrl_topic, capnp, mac] — best effort, non-blocking
-        let _ = sock.send(self.ctrl_topic.as_bytes(), zmq::SNDMORE | zmq::DONTWAIT);
-        let _ = sock.send(&buf, zmq::SNDMORE | zmq::DONTWAIT);
-        let _ = sock.send(mac.as_slice(), zmq::DONTWAIT);
-
-        tracing::debug!(stream_id = %self.stream_id, "sent cancel on control channel");
-    }
-}
-
-impl Stream for StreamHandle {
-    type Item = Result<StreamPayload>;
-
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        loop {
-            // Fast path: drain buffered payloads
-            if let Some(payload) = self.pending.pop_front() {
-                return Poll::Ready(Some(Ok(payload)));
-            }
-            if self.completed {
-                return Poll::Ready(None);
-            }
-
-            // Poll cancellation token — registers cx.waker() with the token.
-            // When cancel() fires, the waker is invoked and poll_next re-runs.
-            let is_cancelled = {
-                let cancel_fut = std::pin::pin!(self.cancel_token.cancelled());
-                cancel_fut.poll(cx).is_ready()
-            };
-            if is_cancelled {
-                self.completed = true;
-                return Poll::Ready(None);
-            }
-
-            // Poll TMQ subscriber — registers cx.waker() with epoll.
-            // Now the SAME waker is registered with BOTH token AND epoll.
-            match Pin::new(&mut self.subscriber).poll_next(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => {
-                    self.completed = true;
-                    return Poll::Ready(None);
-                }
-                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e.into()))),
-                Poll::Ready(Some(Ok(multipart))) => {
-                    let frames: Vec<Vec<u8>> =
-                        multipart.into_iter().map(|m| m.to_vec()).collect();
-
-                    if frames.len() != 3 || frames[2].len() != 16 {
-                        return Poll::Ready(Some(Err(anyhow::anyhow!(
-                            "Invalid StreamBlock format: expected 3 frames with 16-byte MAC, got {} frames",
-                            frames.len()
-                        ))));
-                    }
-
-                    match self.verifier.verify(&frames) {
-                        Err(e) => return Poll::Ready(Some(Err(e))),
-                        Ok(payloads) => {
-                            for p in payloads {
-                                if matches!(
-                                    p,
-                                    StreamPayload::Complete(..) | StreamPayload::Error(..)
-                                ) {
-                                    self.completed = true;
-                                }
-                                self.pending.push_back(p);
-                            }
-                            // Loop back: if payloads is non-empty, pop_front
-                            // returns the first one. If empty (heartbeat-only),
-                            // we re-poll the TMQ subscriber which will return
-                            // Poll::Pending and register the waker via epoll.
-                            continue;
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
 
 // ============================================================================
 // StreamChannel - Service-Level Streaming Infrastructure
@@ -1449,14 +602,6 @@ impl StreamChannel {
         self.publisher(&ctx).await
     }
 
-    /// Get the stream endpoint for clients to subscribe to.
-    ///
-    /// Returns the SUB endpoint URL from the registry.
-    pub fn stream_endpoint(&self) -> String {
-        endpoint_registry()
-            .endpoint("streams", SocketKind::Sub)
-            .to_zmq_string()
-    }
 }
 
 // ============================================================================
@@ -1663,9 +808,8 @@ pub fn spawn_streaming_response(service_name: &str, continuation: crate::service
 
 /// Encode a `StreamBlock` capnp message from a `prev_mac` + payload list.
 ///
-/// Factored out of [`StreamBuilder::flush`] so the moq streaming plane
-/// (`crate::moq_stream`) can produce byte-identical StreamBlocks for the §7.5
-/// chained-HMAC tokenstream.
+/// Used by the moq streaming plane (`crate::moq_stream`) to produce
+/// chained-HMAC StreamBlocks (§7.5 wire format).
 pub fn encode_stream_block(
     prev_mac: &[u8],
     sequence_number: u64,
@@ -1866,22 +1010,6 @@ mod tests {
         assert_eq!(config.min_batch_size, 1);
         assert_eq!(config.max_batch_size, 16);
         assert_eq!(config.max_block_bytes, 65536);
-    }
-
-    #[test]
-    fn test_adaptive_batch_size() {
-        let config = BatchingConfig::default();
-        let builder = StreamBuilder::new(config, [0u8; 32], "topic".to_owned());
-
-        // Low rate → small batch
-        assert_eq!(builder.adaptive_batch_size(1.0), 1);
-
-        // High rate → large batch
-        assert_eq!(builder.adaptive_batch_size(100.0), 16);
-
-        // Mid rate → mid batch
-        let mid = builder.adaptive_batch_size(10.0);
-        assert!(mid > 1 && mid < 16);
     }
 
     #[test]

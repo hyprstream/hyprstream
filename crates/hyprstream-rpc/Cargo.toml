@@ -77,11 +77,6 @@ getrandom_v04 = { package = "getrandom", version = "0.4", features = ["wasm_js"]
 
 # Native-only deps (not compiled for wasm32)
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-# ZMQ transport
-tmq = { workspace = true }
-zmq = { workspace = true }
-zmq-sys = { workspace = true }  # Raw FFI for ZMQ_USE_FD socket option
-
 # QUIC transport (HTTP/3 + WebTransport + ZMTP over QUIC)
 quinn = { workspace = true }
 rcgen = { workspace = true }
