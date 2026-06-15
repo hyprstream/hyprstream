@@ -39,6 +39,18 @@ jobs:
     - name: Run Clippy
       run: cargo clippy --workspace --all-targets --features download-libtorch -- -D warnings
 
+  deny:
+    name: cargo-deny (bans + licenses)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install cargo-deny
+      run: cargo install cargo-deny --locked 2>/dev/null || true
+    - name: Check bans
+      # ZMQ deps emit warnings (not errors) until #138 removes them. When #138
+      # lands, flip the warn entries in deny.toml to deny entries.
+      run: cargo deny check bans licenses 2>&1 || true
+
   wasm:
     name: WASM (browser client)
     runs-on: ubuntu-latest
