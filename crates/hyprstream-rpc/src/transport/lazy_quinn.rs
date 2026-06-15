@@ -31,6 +31,7 @@ use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
+use crate::transport::backoff::LazyState;
 use crate::transport::quinn_transport::{
     connect_pinned_hashes, connect_webpki, verify_peer_cert_pinned, QuinnPendingStream,
     QuinnPublishStub, QuinnTransport,
@@ -52,9 +53,10 @@ pub struct LazyQuinnTransport {
     addr: SocketAddr,
     server_name: String,
     auth: QuicServerAuth,
-    /// `None` until the first successful dial, and reset to `None` after a
-    /// `send()` failure so the next call re-dials.
-    cached: Mutex<Option<QuinnTransport>>,
+    /// Cached session + reconnect backoff state (#156). `None` until the first
+    /// successful dial; reset to `None` (with backoff recorded) after any
+    /// transport-fatal `send()` error or failed dial.
+    state: Mutex<LazyState<QuinnTransport>>,
 }
 
 impl LazyQuinnTransport {
@@ -66,48 +68,60 @@ impl LazyQuinnTransport {
             addr,
             server_name: server_name.into(),
             auth,
-            cached: Mutex::new(None),
+            state: Mutex::new(LazyState::default()),
         }
     }
 
     /// Return the cached connected transport, dialing once (under the lock —
-    /// single-flight) if not yet connected. The connect path is chosen by the
-    /// server-auth policy.
+    /// single-flight) if not yet connected. Backs off after consecutive failures
+    /// so a downed peer is not tight-looped (#156).
     async fn connected(&self) -> Result<QuinnTransport> {
-        let mut guard = self.cached.lock().await;
-        if let Some(transport) = guard.as_ref() {
+        let mut guard = self.state.lock().await;
+        if let Some(transport) = guard.cached.as_ref() {
             return Ok(transport.clone());
+        }
+        if let Some(remaining) = guard.backoff.cooldown_remaining() {
+            return Err(anyhow!(
+                "quinn peer is in reconnect backoff — retry in {remaining:.1?}"
+            ));
         }
         let connect = async {
             let hashes = self.auth.accept_cert_hashes();
             match (self.auth.require_web_pki(), hashes.is_empty()) {
-                // WebPKI only.
                 (true, true) => connect_webpki(&self.server_name, self.addr.port()).await,
-                // Pin only (self-signed) — verified in-handshake by cert-hash.
                 (false, false) => connect_pinned_hashes(self.addr, hashes).await,
-                // WebPKI + pin: CA-validate in the handshake, then enforce the
-                // pin on the established session before any RPC flows.
                 (true, false) => {
                     let session = connect_webpki(&self.server_name, self.addr.port()).await?;
                     verify_peer_cert_pinned(&session, hashes)?;
                     Ok(session)
                 }
-                // No auth at all — unreachable: QuicServerAuth's constructors
-                // reject the empty case.
                 (false, true) => bail!("QUIC endpoint has no server-auth requirement"),
             }
         };
-        let session = tokio::time::timeout(CONNECT_TIMEOUT, connect)
-            .await
-            .map_err(|_| anyhow!("quinn connect timed out after {CONNECT_TIMEOUT:?}"))??;
-        let transport = QuinnTransport::new(session);
-        *guard = Some(transport.clone());
-        Ok(transport)
+        match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
+            Err(_) => {
+                guard.backoff.record_failure();
+                Err(anyhow!("quinn connect timed out after {CONNECT_TIMEOUT:?}"))
+            }
+            Ok(Err(e)) => {
+                guard.backoff.record_failure();
+                Err(e)
+            }
+            Ok(Ok(session)) => {
+                guard.backoff.record_success();
+                let transport = QuinnTransport::new(session);
+                guard.cached = Some(transport.clone());
+                Ok(transport)
+            }
+        }
     }
 
-    /// Drop the cached session so the next `send()` re-dials.
+    /// Drop the cached session and record a failure so the next `send()`
+    /// re-dials after the backoff cooldown (#156).
     async fn invalidate(&self) {
-        *self.cached.lock().await = None;
+        let mut guard = self.state.lock().await;
+        guard.cached = None;
+        guard.backoff.record_failure();
     }
 }
 
@@ -214,11 +228,11 @@ mod tests {
         let (addr, pin, shutdown) = spawn_echo_server();
         let t = LazyQuinnTransport::new(addr, "localhost", QuicServerAuth::pinned(vec![pin]).unwrap());
 
-        assert!(t.cached.lock().await.is_none(), "no connection before first send");
+        assert!(t.state.lock().await.cached.is_none(), "no connection before first send");
 
         let resp = t.send(b"hello".to_vec(), Some(5_000)).await.unwrap();
         assert_eq!(resp, b"hello");
-        assert!(t.cached.lock().await.is_some(), "session cached after first send");
+        assert!(t.state.lock().await.cached.is_some(), "session cached after first send");
 
         let resp2 = t.send(b"again".to_vec(), Some(5_000)).await.unwrap();
         assert_eq!(resp2, b"again");
@@ -237,7 +251,7 @@ mod tests {
             .await
             .expect("send must complete (with an error) — a wrong pin should reject, not hang");
         assert!(res.is_err(), "a wrong cert pin must make send fail");
-        assert!(t.cached.lock().await.is_none(), "failed dial leaves nothing cached");
+        assert!(t.state.lock().await.cached.is_none(), "failed dial leaves nothing cached");
         shutdown.cancel();
     }
 
@@ -255,7 +269,7 @@ mod tests {
             .await
             .expect("send must complete (with an error) within the connect timeout, not hang");
         assert!(res.is_err(), "a dead address must yield an error, not a connection");
-        assert!(t.cached.lock().await.is_none(), "a failed connect caches nothing");
+        assert!(t.state.lock().await.cached.is_none(), "a failed connect caches nothing");
     }
 
     #[tokio::test]

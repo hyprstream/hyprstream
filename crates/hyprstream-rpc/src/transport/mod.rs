@@ -34,6 +34,8 @@ pub mod uds_session;
 pub mod lazy_uds;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod uds_server;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod backoff;
 
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;

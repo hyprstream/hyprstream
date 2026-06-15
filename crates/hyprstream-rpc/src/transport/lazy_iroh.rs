@@ -35,6 +35,7 @@ use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
+use crate::transport::backoff::LazyState;
 use crate::transport::iroh_substrate::ALPN_HYPRSTREAM_RPC;
 use crate::transport::iroh_transport::{IrohPendingStream, IrohPublishStub, IrohTransport};
 use crate::transport_traits::Transport;
@@ -71,7 +72,8 @@ pub struct LazyIrohTransport {
     node_id: [u8; 32],
     direct_addrs: Vec<SocketAddr>,
     relay_url: Option<String>,
-    cached: Mutex<Option<IrohTransport>>,
+    /// Cached session + reconnect backoff (#156).
+    state: Mutex<LazyState<IrohTransport>>,
 }
 
 impl LazyIrohTransport {
@@ -82,7 +84,7 @@ impl LazyIrohTransport {
             node_id,
             direct_addrs,
             relay_url,
-            cached: Mutex::new(None),
+            state: Mutex::new(LazyState::default()),
         }
     }
 
@@ -103,11 +105,16 @@ impl LazyIrohTransport {
     }
 
     /// Return the cached connected transport, dialing once (single-flight under
-    /// the lock) if not yet connected.
+    /// the lock) if not yet connected. Backs off after consecutive failures (#156).
     async fn connected(&self) -> Result<IrohTransport> {
-        let mut guard = self.cached.lock().await;
-        if let Some(transport) = guard.as_ref() {
+        let mut guard = self.state.lock().await;
+        if let Some(transport) = guard.cached.as_ref() {
             return Ok(transport.clone());
+        }
+        if let Some(remaining) = guard.backoff.cooldown_remaining() {
+            return Err(anyhow!(
+                "iroh peer is in reconnect backoff — retry in {remaining:.1?}"
+            ));
         }
         let endpoint = iroh_client_endpoint().ok_or_else(|| {
             anyhow!(
@@ -116,18 +123,35 @@ impl LazyIrohTransport {
             )
         })?;
         let addr = self.endpoint_addr()?;
-        let conn = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(addr, ALPN_HYPRSTREAM_RPC))
-            .await
-            .map_err(|_| anyhow!("iroh connect timed out after {CONNECT_TIMEOUT:?}"))?
-            .map_err(|e| anyhow!("iroh connect: {e}"))?;
-        let transport = IrohTransport::new(conn);
-        *guard = Some(transport.clone());
-        Ok(transport)
+        match tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            endpoint.connect(addr, ALPN_HYPRSTREAM_RPC),
+        )
+        .await
+        {
+            Err(_) => {
+                guard.backoff.record_failure();
+                Err(anyhow!("iroh connect timed out after {CONNECT_TIMEOUT:?}"))
+            }
+            Ok(Err(e)) => {
+                guard.backoff.record_failure();
+                Err(anyhow!("iroh connect: {e}"))
+            }
+            Ok(Ok(conn)) => {
+                guard.backoff.record_success();
+                let transport = IrohTransport::new(conn);
+                guard.cached = Some(transport.clone());
+                Ok(transport)
+            }
+        }
     }
 
-    /// Drop the cached session so the next `send()` re-dials.
+    /// Drop the cached session and record a failure so the next `send()`
+    /// re-dials after the backoff cooldown (#156).
     async fn invalidate(&self) {
-        *self.cached.lock().await = None;
+        let mut guard = self.state.lock().await;
+        guard.cached = None;
+        guard.backoff.record_failure();
     }
 }
 
@@ -198,7 +222,7 @@ mod tests {
 
         let node_id: [u8; 32] = *server_id.as_bytes();
         let t = LazyIrohTransport::new(node_id, direct, None);
-        assert!(t.cached.lock().await.is_none(), "no connection before first send");
+        assert!(t.state.lock().await.cached.is_none(), "no connection before first send");
 
         // EchoHandler echoes the bytes written on the bidi stream, which is the
         // same shape SessionRpcTransport::send uses (write payload → read to
@@ -209,7 +233,7 @@ mod tests {
         // QuinnRpcServer, which IrohTransport shares via SessionRpcTransport.)
         let resp = t.send(b"ping".to_vec(), Some(4_000)).await.unwrap();
         assert_eq!(resp, b"ping");
-        assert!(t.cached.lock().await.is_some(), "session cached after first send");
+        assert!(t.state.lock().await.cached.is_some(), "session cached after first send");
 
         server.shutdown().await.unwrap();
         // NOTE: do NOT shut down `client` — its endpoint is installed in the
@@ -247,7 +271,7 @@ mod tests {
             .await
             .expect("send must complete (with an error) — wrong identity should reject, not hang");
         assert!(res.is_err(), "dialing a server's address under a wrong EndpointId must fail");
-        assert!(t.cached.lock().await.is_none(), "a failed handshake caches nothing");
+        assert!(t.state.lock().await.cached.is_none(), "a failed handshake caches nothing");
 
         other.shutdown().await.unwrap();
         server.shutdown().await.unwrap();

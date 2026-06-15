@@ -33,6 +33,7 @@ use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
+use super::backoff::LazyState;
 use super::rpc_session::{RpcPendingStream, RpcPublishStub, SessionRpcTransport};
 use super::uds_session::{connect_uds, UdsSession, PLANE_RPC};
 use crate::transport_traits::Transport;
@@ -48,7 +49,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// A UDS RPC transport that connects on first use and caches the session.
 pub struct LazyUdsTransport {
     path: PathBuf,
-    cached: Mutex<Option<SessionRpcTransport<UdsSession>>>,
+    /// Cached session + reconnect backoff (#156).
+    state: Mutex<LazyState<SessionRpcTransport<UdsSession>>>,
 }
 
 impl LazyUdsTransport {
@@ -57,34 +59,51 @@ impl LazyUdsTransport {
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
-            cached: Mutex::new(None),
+            state: Mutex::new(LazyState::default()),
         }
     }
 
     /// Return the cached connected transport, connecting once (single-flight
-    /// under the lock) if not yet connected.
+    /// under the lock) if not yet connected. Backs off after consecutive failures
+    /// so a removed/restarting socket is not tight-looped (#156).
     async fn connected(&self) -> Result<SessionRpcTransport<UdsSession>> {
-        let mut guard = self.cached.lock().await;
-        if let Some(transport) = guard.as_ref() {
+        let mut guard = self.state.lock().await;
+        if let Some(transport) = guard.cached.as_ref() {
             return Ok(transport.clone());
         }
-        let session = tokio::time::timeout(CONNECT_TIMEOUT, connect_uds(&self.path, PLANE_RPC))
-            .await
-            .map_err(|_| {
-                anyhow!(
+        if let Some(remaining) = guard.backoff.cooldown_remaining() {
+            return Err(anyhow!(
+                "uds peer at {} is in reconnect backoff — retry in {remaining:.1?}",
+                self.path.display()
+            ));
+        }
+        match tokio::time::timeout(CONNECT_TIMEOUT, connect_uds(&self.path, PLANE_RPC)).await {
+            Err(_) => {
+                guard.backoff.record_failure();
+                Err(anyhow!(
                     "uds connect to {} timed out after {CONNECT_TIMEOUT:?}",
                     self.path.display()
-                )
-            })?
-            .map_err(|e| anyhow!("uds connect to {}: {e}", self.path.display()))?;
-        let transport = SessionRpcTransport::new(session);
-        *guard = Some(transport.clone());
-        Ok(transport)
+                ))
+            }
+            Ok(Err(e)) => {
+                guard.backoff.record_failure();
+                Err(anyhow!("uds connect to {}: {e}", self.path.display()))
+            }
+            Ok(Ok(session)) => {
+                guard.backoff.record_success();
+                let transport = SessionRpcTransport::new(session);
+                guard.cached = Some(transport.clone());
+                Ok(transport)
+            }
+        }
     }
 
-    /// Drop the cached session so the next `send()` re-connects.
+    /// Drop the cached session and record a failure so the next `send()`
+    /// re-connects after the backoff cooldown (#156).
     async fn invalidate(&self) {
-        *self.cached.lock().await = None;
+        let mut guard = self.state.lock().await;
+        guard.cached = None;
+        guard.backoff.record_failure();
     }
 }
 
@@ -174,10 +193,10 @@ mod tests {
         });
 
         let t = LazyUdsTransport::new(path.clone());
-        assert!(t.cached.lock().await.is_none(), "no connection before first send");
+        assert!(t.state.lock().await.cached.is_none(), "no connection before first send");
         let resp = t.send(b"ping".to_vec(), Some(4_000)).await.unwrap();
         assert_eq!(resp, b"ping");
-        assert!(t.cached.lock().await.is_some(), "session cached after first send");
+        assert!(t.state.lock().await.cached.is_some(), "session cached after first send");
         // Second call reuses the cached session (multiplexed stream).
         let resp2 = t.send(b"pong".to_vec(), Some(4_000)).await.unwrap();
         assert_eq!(resp2, b"pong");
@@ -197,7 +216,7 @@ mod tests {
             .await
             .expect("send must complete (with an error), not hang");
         assert!(res.is_err(), "dialing an absent socket must fail");
-        assert!(t.cached.lock().await.is_none(), "a failed connect caches nothing");
+        assert!(t.state.lock().await.cached.is_none(), "a failed connect caches nothing");
     }
 
     #[tokio::test]
