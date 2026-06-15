@@ -915,57 +915,75 @@ async fn run_fd_streaming_task(
     sandbox_pool: Arc<SandboxPool>,
     sandbox_id: Option<String>,
 ) -> anyhow::Result<()> {
+    use tokio::io::AsyncReadExt;
+
     info!(
         container_id = %container_id,
         topic = %publisher.topic(),
         "Starting FD streaming task"
     );
 
-    // Get sandbox for this container to access console
-    let sandbox = if let Some(sid) = sandbox_id {
-        sandbox_pool.get(&sid).await
+    let sandbox = if let Some(ref sid) = sandbox_id {
+        sandbox_pool.get(sid).await
     } else {
         None
     };
 
-    // TODO: Connect to actual container console
-    // In a full implementation, this would:
-    // - For Cloud Hypervisor: Connect to vsock or serial console via API socket
-    // - For QEMU: Connect to monitor socket or virtio-serial
-    // - Read stdout/stderr and forward via publisher
+    let console_path = sandbox.as_ref().and_then(|s| s.console_socket().map(std::path::Path::to_path_buf));
 
-    if sandbox.is_none() {
-        warn!(
-            container_id = %container_id,
-            "No sandbox found for container, FD streaming limited"
-        );
-    }
-
-    // Placeholder: keep task alive until cancellation.
-    // In production, replace with actual vsock/serial reading:
-    //   let data = console.read().await?;
-    //   publisher.publish_data(&data).await?;
-    let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
-
-    loop {
-        tokio::select! {
-            _ = cancel_token.cancelled() => {
-                info!(container_id = %container_id, "FD streaming cancelled");
-                if !publisher.is_terminated() {
-                    publisher.publish_error("cancelled").await?;
+    if let Some(ref path) = console_path {
+        match tokio::net::UnixStream::connect(path).await {
+            Ok(mut stream) => {
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel_token.cancelled() => {
+                            info!(container_id = %container_id, "FD streaming cancelled");
+                            if !publisher.is_terminated() {
+                                publisher.publish_error("cancelled").await?;
+                            }
+                            return Ok(());
+                        }
+                        result = stream.read(&mut buf) => {
+                            match result? {
+                                0 => {
+                                    info!(container_id = %container_id, "Console EOF — container exited");
+                                    return Ok(());
+                                }
+                                n => {
+                                    publisher.publish_data(&buf[..n]).await?;
+                                }
+                            }
+                        }
+                    }
                 }
-                return Ok(());  // framework sees terminated=true, no-ops
             }
-            _ = interval.tick() => {
-                // Placeholder — poll vsock/serial and publish_data() here
+            Err(e) => {
+                warn!(
+                    container_id = %container_id,
+                    path = ?path,
+                    error = %e,
+                    "Failed to connect to console socket, waiting for cancellation"
+                );
+                cancel_token.cancelled().await;
+                if !publisher.is_terminated() {
+                    publisher.publish_error("console unavailable").await?;
+                }
             }
         }
+    } else {
+        if sandbox_id.is_some() {
+            warn!(container_id = %container_id, "No console socket configured for sandbox");
+        } else {
+            warn!(container_id = %container_id, "No sandbox found for container, FD streaming idle");
+        }
+        cancel_token.cancelled().await;
+        if !publisher.is_terminated() {
+            publisher.publish_error("cancelled").await?;
+        }
     }
-
-    // Note: unreachable in placeholder, but in production the loop would break
-    // on EOF from vsock/serial and fall through here for normal completion.
-    // The framework's run_stream will send Complete if we return Ok without
-    // having called complete_ref ourselves.
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
