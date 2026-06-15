@@ -36,7 +36,6 @@ use crate::auth::PolicyManager;
 use crate::config::{HyprConfig, TokenConfig};
 use crate::services::{DiscoveryService, McpService, McpConfig, PolicyService, PolicyClient, RegistryService, RegistryClient};
 use crate::services::generated::policy_client::{RefreshServiceTokenRequest, RegisterServiceKey};
-use crate::zmq::global_context;
 
 /// Load HyprConfig, falling back to default on error.
 fn load_config() -> HyprConfig {
@@ -857,7 +856,6 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 
     let mcp_config = McpConfig {
         verifying_key: ctx.verifying_key(),
-        zmq_context: global_context(),
         signing_key: sk,
         transport: ctx.transport("mcp", SocketKind::Rep),
         ctx: None, // ServiceContext not yet available as Arc — handlers use signing_key directly

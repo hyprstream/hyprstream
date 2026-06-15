@@ -35,7 +35,8 @@ use futures::future::BoxFuture;
 use hyprstream_rpc::auth::jwt;
 use hyprstream_service::ServiceContext;
 use hyprstream_rpc::service::RequestService;
-use hyprstream_rpc::streaming::{StreamHandle, StreamPayload};
+use hyprstream_rpc::moq_stream::MoqStreamHandle;
+use hyprstream_rpc::streaming::StreamPayload;
 use hyprstream_rpc::transport::TransportConfig;
 use rmcp::{
     model::{
@@ -139,11 +140,9 @@ fn snake_to_camel(s: &str) -> String {
 pub struct McpConfig {
     /// Ed25519 public key for JWT verification
     pub verifying_key: VerifyingKey,
-    /// ZMQ context for backend clients
-    pub zmq_context: Arc<zmq::Context>,
-    /// Ed25519 signing key for creating ZMQ clients
+    /// Ed25519 signing key for creating RPC clients
     pub signing_key: SigningKey,
-    /// ZMQ transport for control plane
+    /// RPC transport for control plane
     pub transport: TransportConfig,
     /// Service context for client construction (optional for backward compat)
     pub ctx: Option<Arc<ServiceContext>>,
@@ -164,15 +163,14 @@ pub struct McpConfig {
 pub enum ToolResult {
     /// Immediate JSON result (REQ/REP tools)
     Sync(Value),
-    /// Streaming result — StreamHandle encapsulates DH, SUB, HMAC verification
-    Stream(Box<StreamHandle>),
+    /// Streaming result — MoqStreamHandle encapsulates DH, moq subscribe, HMAC verification
+    Stream(Box<MoqStreamHandle>),
 }
 
-/// Context passed to handler — carries auth + ZMQ infra + optional ServiceContext
+/// Context passed to handler — carries auth + optional ServiceContext
 pub struct ToolCallContext {
     pub args: Value,
     pub signing_key: SigningKey,
-    pub zmq_context: Arc<zmq::Context>,
     /// Authenticated user string propagated to backend services
     pub user: String,
     /// ServiceContext for typed_client() / client() access (optional for backward compat)
@@ -439,17 +437,12 @@ fn register_scoped_tools_recursive(
                                 _ => anyhow::bail!("No scoped streaming dispatch for service: {service}"),
                             };
 
-                            let (stream_id, endpoint, server_pubkey, policy) = parse_stream_info(&stream_info_json)?;
-
-                            let handle = StreamHandle::new(
-                                &ctx.zmq_context,
-                                stream_id,
-                                &endpoint,
-                                &server_pubkey,
-                                &client_secret,
-                                &client_pubkey_bytes,
-                                policy,
+                            let (_stream_id, server_pubkey, _policy, moq_uds_path, moq_broadcast_path) =
+                                parse_stream_info(&stream_info_json)?;
+                            let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
+                                &client_secret, &client_pubkey_bytes, &server_pubkey,
                             )?;
+                            let handle = MoqStreamHandle::new(moq_uds_path, moq_broadcast_path, mac_key, topic);
 
                             Ok(ToolResult::Stream(Box::new(handle)))
                         })
@@ -600,17 +593,12 @@ fn register_streaming_tool(
                     _ => anyhow::bail!("No streaming support for service: {}", service),
                 };
 
-                let (stream_id, endpoint, server_pubkey, policy) = parse_stream_info(&stream_info_json)?;
-
-                let handle = StreamHandle::new(
-                    &ctx.zmq_context,
-                    stream_id,
-                    &endpoint,
-                    &server_pubkey,
-                    &client_secret,
-                    &client_pubkey_bytes,
-                    policy,
+                let (_stream_id, server_pubkey, _policy, moq_uds_path, moq_broadcast_path) =
+                    parse_stream_info(&stream_info_json)?;
+                let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
+                    &client_secret, &client_pubkey_bytes, &server_pubkey,
                 )?;
+                let handle = MoqStreamHandle::new(moq_uds_path, moq_broadcast_path, mac_key, topic);
 
                 Ok(ToolResult::Stream(Box::new(handle)))
             })
@@ -656,13 +644,13 @@ fn params_to_json_schema(params: &[(&str, &str, bool, &str)]) -> Value {
     })
 }
 
-/// Parse streamId, endpoint, serverPubkey, and qos from a streaming response JSON.
+/// Parse moq stream info from a streaming response JSON.
 /// StreamInfo serializes with `#[serde(rename_all = "camelCase")]`, so all keys are camelCase.
-fn parse_stream_info(json: &Value) -> anyhow::Result<(String, String, Vec<u8>, hyprstream_rpc::stream_info::StreamOpt)> {
+fn parse_stream_info(
+    json: &Value,
+) -> anyhow::Result<(String, Vec<u8>, hyprstream_rpc::stream_info::StreamOpt, String, String)> {
     let stream_id = json["streamId"].as_str()
         .ok_or_else(|| anyhow::anyhow!("missing streamId in streaming response"))?.to_owned();
-    let endpoint = json["endpoint"].as_str()
-        .ok_or_else(|| anyhow::anyhow!("missing endpoint in streaming response"))?.to_owned();
     let server_pubkey: Vec<u8> = json["serverPubkey"].as_array()
         .ok_or_else(|| anyhow::anyhow!("missing serverPubkey in streaming response"))?
         .iter()
@@ -673,7 +661,12 @@ fn parse_stream_info(json: &Value) -> anyhow::Result<(String, String, Vec<u8>, h
     } else {
         hyprstream_rpc::stream_info::StreamOpt::default()
     };
-    Ok((stream_id, endpoint, server_pubkey, qos))
+    let moq_uds_path = json["moqUdsPath"].as_str().unwrap_or("").to_owned();
+    let moq_broadcast_path = json["moqBroadcastPath"].as_str().unwrap_or("").to_owned();
+    if moq_uds_path.is_empty() {
+        anyhow::bail!("missing moqUdsPath in streaming response — server may be in ZMQ-only mode");
+    }
+    Ok((stream_id, server_pubkey, qos, moq_uds_path, moq_broadcast_path))
 }
 
 /// Dispatch a method call to the appropriate generated client.
@@ -720,7 +713,6 @@ pub struct McpService {
     /// Verifying key for JWT validation
     verifying_key: VerifyingKey,
     // === RequestService infrastructure ===
-    context: Arc<zmq::Context>,
     transport: TransportConfig,
     signing_key: SigningKey,
     /// ServiceContext for typed_client() / client() access
@@ -756,7 +748,6 @@ impl McpService {
             registry: Arc::new(RwLock::new(tool_reg)),
             stdio_token,
             verifying_key: config.verifying_key,
-            context: config.zmq_context.clone(),
             transport: config.transport,
             signing_key: config.signing_key,
             service_ctx: config.ctx,
@@ -880,7 +871,6 @@ impl McpService {
         let ctx = ToolCallContext {
             args: normalize_mcp_args(args),
             signing_key: self.signing_key.clone(),
-            zmq_context: self.context.clone(),
             user,
             ctx: self.service_ctx.clone(),
             policy_client: self.policy_client.clone(),
