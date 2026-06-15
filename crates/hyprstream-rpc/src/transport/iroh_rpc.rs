@@ -147,6 +147,36 @@ impl IrohRpcProtocolHandler {
         }
         self
     }
+
+    /// Override the concurrent-connection cap (builder style, mirrors
+    /// [`super::quinn_transport::QuinnRpcServer::with_connection_limit`]).
+    pub fn with_connection_limit(mut self, connection_limit: usize) -> Self {
+        match Arc::get_mut(&mut self.inner) {
+            Some(inner) => inner.connection_limit = Arc::new(Semaphore::new(connection_limit)),
+            None => {
+                let i = &self.inner;
+                self.inner = Arc::new(HandlerInner {
+                    processor: Arc::clone(&i.processor),
+                    signing_key: i.signing_key.clone(),
+                    stream_limit: Arc::clone(&i.stream_limit),
+                    stream_limit_capacity: i.stream_limit_capacity,
+                    connection_limit: Arc::new(Semaphore::new(connection_limit)),
+                    read_timeout: i.read_timeout,
+                    shutdown: i.shutdown.clone(),
+                });
+            }
+        }
+        self
+    }
+
+    /// Apply all tunables from an [`super::rpc_session::RpcConfig`] in one call (#197).
+    pub fn with_rpc_config(self, cfg: &super::rpc_session::RpcConfig) -> Self {
+        let processor = Arc::clone(&self.inner.processor);
+        let signing_key = self.inner.signing_key.clone();
+        Self::with_stream_limit(processor, signing_key, cfg.stream_limit)
+            .with_read_timeout(cfg.request_read_timeout)
+            .with_connection_limit(cfg.connection_limit)
+    }
 }
 
 impl ProtocolHandler for IrohRpcProtocolHandler {

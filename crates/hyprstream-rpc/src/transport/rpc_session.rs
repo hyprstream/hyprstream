@@ -92,6 +92,46 @@ pub const DEFAULT_CONNECTION_LIMIT: usize = 256;
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ============================================================================
+// RpcConfig — unified server-side tunables (#197)
+// ============================================================================
+
+/// Unified RPC transport tunables for server builders.
+///
+/// All values default to the process-global constants; override via
+/// `with_rpc_config()` on any server builder. This consolidates the
+/// previously scattered `with_stream_limit` / `with_connection_limit` /
+/// `with_read_timeout` builder methods behind one struct so a single
+/// config source (e.g. a loaded `HyprConfig`) can tune all planes at once.
+#[derive(Clone, Debug)]
+pub struct RpcConfig {
+    /// Max concurrent in-flight bidi streams (server-wide semaphore).
+    pub stream_limit: usize,
+    /// Max concurrent accepted connections per server.
+    pub connection_limit: usize,
+    /// Max wall-clock time to read a single request frame.
+    pub request_read_timeout: Duration,
+    /// Max time for a peer's QUIC/WebTransport handshake to complete.
+    pub handshake_timeout: Duration,
+    /// Grace period after writing a response for the peer to ack FIN.
+    pub stopped_grace: Duration,
+    /// Max wall-clock time for graceful drain on shutdown.
+    pub drain_timeout: Duration,
+}
+
+impl Default for RpcConfig {
+    fn default() -> Self {
+        Self {
+            stream_limit: DEFAULT_STREAM_LIMIT,
+            connection_limit: DEFAULT_CONNECTION_LIMIT,
+            request_read_timeout: REQUEST_READ_TIMEOUT,
+            handshake_timeout: HANDSHAKE_TIMEOUT,
+            stopped_grace: STOPPED_GRACE,
+            drain_timeout: DRAIN_TIMEOUT,
+        }
+    }
+}
+
+// ============================================================================
 // IrohRequestProcessor — pluggable request handling trait
 // ============================================================================
 

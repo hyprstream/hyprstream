@@ -95,6 +95,13 @@ impl UdsRpcServer {
         self
     }
 
+    /// Apply all tunables from an [`super::rpc_session::RpcConfig`] in one call (#197).
+    pub fn with_rpc_config(self, cfg: &super::rpc_session::RpcConfig) -> Self {
+        self.with_stream_limit(cfg.stream_limit)
+            .with_connection_limit(cfg.connection_limit)
+            .with_read_timeout(cfg.request_read_timeout)
+    }
+
     /// A handle that, when cancelled, stops the accept loop and per-connection
     /// serve loops. Does not by itself drain in-flight streams — use
     /// [`UdsRpcServer::shutdown`] for a graceful drain.
