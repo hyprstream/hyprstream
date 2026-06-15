@@ -216,9 +216,9 @@ pub use service::RequestService as ZmqService;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use streaming::{
-    ChannelProgressReporter, forward_progress_to_stream, progress_channel,
-    ProgressUpdate, ResponseStream, StreamChannel, StreamContext, StreamHandle,
-    StreamPayload, StreamPublisher, StreamVerifier,
+    ChannelProgressReporter, derive_client_stream_keys, forward_progress_to_stream,
+    progress_channel, ProgressUpdate, ResponseStream, StreamChannel, StreamContext,
+    StreamHandle, StreamPayload, StreamPublisher, StreamVerifier,
 };
 
 #[cfg(not(target_arch = "wasm32"))]

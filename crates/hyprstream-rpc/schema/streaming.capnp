@@ -147,12 +147,17 @@ struct StreamOpt {
 # Wrapped in a SignedEnvelope (Ed25519) so the policy field is authenticated.
 struct StreamInfo {
   streamId @0 :Text;      # Unique stream identifier (e.g., "stream-{uuid}")
-  endpoint @1 :Text;      # XPUB endpoint to subscribe to
+  endpoint @1 :Text;      # Reserved (was ZMQ XPUB endpoint — moq paths below supersede)
   dhPublic @2 :Data $fixedSize(32);  # Server's ephemeral Ristretto255 public key for DH
   # Service-declared QoS options. Authenticated by the Ed25519 signature
   # over the enclosing SignedEnvelope. Clients MUST enforce these options and
   # MUST disconnect (not silently downgrade) if a required mode is unsupported.
   qos   @3 :StreamOpt;
+  # moq transport paths (M3 — replaces ZMQ SUB endpoint).
+  # moqUdsPath: UDS socket path for cross-process moq subscription.
+  # moqBroadcastPath: broadcast path within the moq origin (e.g. "local/streams/{topic_hex}").
+  moqUdsPath @4 :Text;
+  moqBroadcastPath @5 :Text;
 }
 
 # Stream registration - wrapped in SignedEnvelope for authorization

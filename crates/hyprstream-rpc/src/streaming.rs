@@ -1731,6 +1731,25 @@ fn pubkey_to_32(pubkey: &[u8]) -> [u8; 32] {
     }
 }
 
+/// Derive the `(mac_key, topic)` pair from a client-side DH exchange.
+///
+/// This is the consumer-side counterpart to `StreamContext::from_dh` (the server side).
+/// Call this before constructing a `MoqStreamHandle` when you have the raw keys from
+/// `generate_ephemeral_keypair()` and the server pubkey from `StreamInfo`.
+pub fn derive_client_stream_keys(
+    client_secret: &DhSecret,
+    client_pubkey: &[u8],
+    server_pubkey: &[u8],
+) -> anyhow::Result<([u8; 32], String)> {
+    let server_pub = DhPublic::from_slice(server_pubkey)
+        .ok_or_else(|| anyhow::anyhow!("invalid server pubkey length"))?;
+    let shared = dh_compute(client_secret, &server_pub);
+    let client_pub_32 = pubkey_to_32(client_pubkey);
+    let server_pub_32 = pubkey_to_32(server_pubkey);
+    let keys = crate::crypto::derive_stream_keys(&shared, &client_pub_32, &server_pub_32)?;
+    Ok((*keys.mac_key, keys.topic.clone()))
+}
+
 // `constant_time_eq` removed with the duplicate StreamVerifier (#224) — the canonical
 // verifier in `stream_consumer` has its own.
 

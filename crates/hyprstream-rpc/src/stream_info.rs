@@ -181,9 +181,14 @@ impl StreamOptPreset for Pipe {
 #[serde(rename_all = "camelCase")]
 pub struct StreamInfo {
     pub stream_id: String,
+    /// Reserved — was the ZMQ XPUB endpoint. Empty on moq-only paths.
     pub endpoint: String,
     pub server_pubkey: [u8; 32],
     pub qos: StreamOpt,
+    /// UDS socket path for cross-process moq subscription.
+    pub moq_uds_path: String,
+    /// moq broadcast path within the origin (e.g. `"local/streams/{topic_hex}"`).
+    pub moq_broadcast_path: String,
 }
 
 impl crate::capnp::ToCapnp for StreamInfo {
@@ -195,6 +200,8 @@ impl crate::capnp::ToCapnp for StreamInfo {
         builder.set_dh_public(&self.server_pubkey);
         let mut qos_builder = builder.reborrow().init_qos();
         write_stream_qos(&self.qos, &mut qos_builder);
+        builder.set_moq_uds_path(&self.moq_uds_path);
+        builder.set_moq_broadcast_path(&self.moq_broadcast_path);
     }
 }
 
@@ -217,6 +224,8 @@ impl crate::capnp::FromCapnp for StreamInfo {
             endpoint: reader.get_endpoint()?.to_str()?.to_owned(),
             server_pubkey,
             qos,
+            moq_uds_path: reader.get_moq_uds_path()?.to_str()?.to_owned(),
+            moq_broadcast_path: reader.get_moq_broadcast_path()?.to_str()?.to_owned(),
         })
     }
 }
