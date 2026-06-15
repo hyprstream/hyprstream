@@ -7,12 +7,14 @@ fn main() {
     println!("ROCm GPU Detection Test");
     println!("=======================");
 
-    // Set environment for ROCm
-    std::env::set_var("ROCM_PATH", "/usr");
+    // Set environment for ROCm — use system ROCm path, let HSA select the correct arch natively
+    std::env::set_var("ROCM_PATH", "/opt/rocm");
     std::env::set_var("HIP_VISIBLE_DEVICES", "0");
-    std::env::set_var("HSA_OVERRIDE_GFX_VERSION", "9.0.0");
+    // HSA_OVERRIDE_GFX_VERSION intentionally not set: let ROCm detect the actual GPU arch.
+    // Setting it to a fixed value (e.g. 9.0.0 for gfx90a/MI210) breaks non-MI210 hardware
+    // such as gfx1151 (Strix Halo) by loading the wrong ISA kernels.
 
-    println!("Environment set for ROCm MI210");
+    println!("Environment set for ROCm (auto-detecting GPU arch)");
 
     // Check device
     let device = Device::cuda_if_available();
