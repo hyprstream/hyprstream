@@ -46,7 +46,7 @@ pub enum DisplayMode {
 
 /// A connected viewer's handle — tracks its publisher and health.
 ///
-/// On the ZMQ path `AnyStreamPublisher::Zmq` wraps a `tmq::push::Push` socket
+/// On the moq path `AnyStreamPublisher` wraps a `MoqStreamPublisher`.
 /// (`!Send`); viewer handles therefore live on the frame loop's local task
 /// (spawned via `spawn_local`).  On the moq path the publisher is `Send`, but
 /// `spawn_local` is kept for uniformity.

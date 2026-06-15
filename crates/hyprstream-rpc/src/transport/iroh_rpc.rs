@@ -59,6 +59,7 @@ pub struct IrohRpcProtocolHandler {
     inner: Arc<HandlerInner>,
 }
 
+#[derive(Clone)]
 struct HandlerInner {
     processor: Arc<dyn IrohRequestProcessor>,
     /// Used to produce signed error envelopes when the processor itself
@@ -124,49 +125,27 @@ impl IrohRpcProtocolHandler {
     /// tests that need a short slowloris bound; production uses the default
     /// [`super::rpc_session::REQUEST_READ_TIMEOUT`].
     pub fn with_read_timeout(mut self, read_timeout: std::time::Duration) -> Self {
-        // `inner` is freshly built here (no other Arc clones yet), so this
-        // get_mut always succeeds; fall back to a rebuild if it somehow doesn't.
-        debug_assert!(
-            Arc::strong_count(&self.inner) == 1,
-            "with_read_timeout called on a shared handler; rebuilding inner"
-        );
-        match Arc::get_mut(&mut self.inner) {
-            Some(inner) => inner.read_timeout = read_timeout,
-            None => {
-                let i = &self.inner;
-                self.inner = Arc::new(HandlerInner {
-                    processor: Arc::clone(&i.processor),
-                    signing_key: i.signing_key.clone(),
-                    stream_limit: Arc::clone(&i.stream_limit),
-                    stream_limit_capacity: i.stream_limit_capacity,
-                    connection_limit: Arc::clone(&i.connection_limit),
-                    read_timeout,
-                    shutdown: i.shutdown.clone(),
-                });
-            }
-        }
+        self.mutate_inner(|i| i.read_timeout = read_timeout);
         self
     }
 
     /// Override the concurrent-connection cap (builder style, mirrors
     /// [`super::quinn_transport::QuinnRpcServer::with_connection_limit`]).
     pub fn with_connection_limit(mut self, connection_limit: usize) -> Self {
+        self.mutate_inner(|i| i.connection_limit = Arc::new(Semaphore::new(connection_limit)));
+        self
+    }
+
+    /// Mutate the inner config, cloning `Arc<HandlerInner>` only if it is shared.
+    fn mutate_inner(&mut self, f: impl FnOnce(&mut HandlerInner)) {
         match Arc::get_mut(&mut self.inner) {
-            Some(inner) => inner.connection_limit = Arc::new(Semaphore::new(connection_limit)),
+            Some(inner) => f(inner),
             None => {
-                let i = &self.inner;
-                self.inner = Arc::new(HandlerInner {
-                    processor: Arc::clone(&i.processor),
-                    signing_key: i.signing_key.clone(),
-                    stream_limit: Arc::clone(&i.stream_limit),
-                    stream_limit_capacity: i.stream_limit_capacity,
-                    connection_limit: Arc::new(Semaphore::new(connection_limit)),
-                    read_timeout: i.read_timeout,
-                    shutdown: i.shutdown.clone(),
-                });
+                let mut cloned = (*self.inner).clone();
+                f(&mut cloned);
+                self.inner = Arc::new(cloned);
             }
         }
-        self
     }
 
     /// Apply all tunables from an [`super::rpc_session::RpcConfig`] in one call (#197).
@@ -275,6 +254,35 @@ struct BridgeMessage {
     respond: tokio::sync::oneshot::Sender<Result<Bytes>>,
 }
 
+/// Shared dispatch loop body: relay `BridgeMessage`s from `rx` to `service`,
+/// each in its own `spawn_local` task so a slow handler never head-of-lines
+/// the queue.
+async fn run_bridge_dispatch_loop<S>(
+    service: std::rc::Rc<S>,
+    mut rx: tokio::sync::mpsc::Receiver<BridgeMessage>,
+    nonce_cache: Arc<crate::envelope::InMemoryNonceCache>,
+) where
+    S: crate::service::RequestService + 'static,
+{
+    while let Some(msg) = rx.recv().await {
+        let service = std::rc::Rc::clone(&service);
+        let nonce_cache = Arc::clone(&nonce_cache);
+        tokio::task::spawn_local(async move {
+            let signing_key = service.signing_key();
+            let result = crate::service::dispatch::process_request(
+                msg.request.as_ref(),
+                &*service,
+                crate::envelope::EnvelopeVerification::AnySigner,
+                &signing_key,
+                &nonce_cache,
+            )
+            .await
+            .map(Bytes::from);
+            let _ = msg.respond.send(result);
+        });
+    }
+}
+
 /// Adapt a [`crate::service::RequestService`] to [`IrohRequestProcessor`].
 ///
 /// Spins up a dedicated thread running a single-threaded tokio runtime with
@@ -312,7 +320,7 @@ impl LocalServiceBridge {
         S: crate::service::RequestService + Send + 'static,
     {
         let cap = if queue_depth == 0 { 128 } else { queue_depth };
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<BridgeMessage>(cap);
+        let (tx, rx) = tokio::sync::mpsc::channel::<BridgeMessage>(cap);
         let service_name = service.name().to_owned();
 
         std::thread::Builder::new()
@@ -329,38 +337,11 @@ impl LocalServiceBridge {
                     }
                 };
                 let local = tokio::task::LocalSet::new();
-                local.spawn_local(async move {
-                    let service = std::rc::Rc::new(service);
-                    while let Some(msg) = rx.recv().await {
-                        let service = std::rc::Rc::clone(&service);
-                        let nonce_cache = Arc::clone(&nonce_cache);
-                        // Each request gets its own local task so a slow
-                        // handler doesn't head-of-line the queue.
-                        tokio::task::spawn_local(async move {
-                            // Re-derive the signing key per call: cheap clone,
-                            // tracks any future rotation in the service.
-                            let signing_key = service.signing_key();
-                            // As of #186 process_request spawns any streaming
-                            // pump itself (onto this bridge's LocalSet, where
-                            // this task already runs, bounded by a per-service
-                            // admission permit) and returns only the reply bytes,
-                            // so the generic plane is uniform "bytes in → bytes
-                            // out" like every other front-end. (Previously the
-                            // bridge spawned the continuation here; that worked
-                            // but duplicated the spawn logic per transport.)
-                            let result = crate::service::dispatch::process_request(
-                                msg.request.as_ref(),
-                                &*service,
-                                crate::envelope::EnvelopeVerification::AnySigner,
-                                &signing_key,
-                                &nonce_cache,
-                            )
-                            .await
-                            .map(Bytes::from);
-                            let _ = msg.respond.send(result);
-                        });
-                    }
-                });
+                local.spawn_local(run_bridge_dispatch_loop(
+                    std::rc::Rc::new(service),
+                    rx,
+                    nonce_cache,
+                ));
                 rt.block_on(local);
             })
             .map_err(|e| anyhow::anyhow!("spawn iroh-rpc bridge thread: {e}"))?;
@@ -391,7 +372,7 @@ impl LocalServiceBridge {
         S: crate::service::RequestService + 'static,
     {
         let cap = if queue_depth == 0 { 128 } else { queue_depth };
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<BridgeMessage>(cap);
+        let (tx, rx) = tokio::sync::mpsc::channel::<BridgeMessage>(cap);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<()>>();
         let thread_name = thread_name.into();
 
@@ -420,25 +401,7 @@ impl LocalServiceBridge {
                         // Caller gave up waiting; no point serving.
                         return;
                     }
-                    while let Some(msg) = rx.recv().await {
-                        let service = std::rc::Rc::clone(&service);
-                        let nonce_cache = Arc::clone(&nonce_cache);
-                        tokio::task::spawn_local(async move {
-                            let signing_key = service.signing_key();
-                            // process_request spawns any streaming pump itself
-                            // (#186); the bridge just relays the reply bytes.
-                            let result = crate::service::dispatch::process_request(
-                                msg.request.as_ref(),
-                                &*service,
-                                crate::envelope::EnvelopeVerification::AnySigner,
-                                &signing_key,
-                                &nonce_cache,
-                            )
-                            .await
-                            .map(Bytes::from);
-                            let _ = msg.respond.send(result);
-                        });
-                    }
+                    run_bridge_dispatch_loop(service, rx, nonce_cache).await;
                 });
                 rt.block_on(local);
             })

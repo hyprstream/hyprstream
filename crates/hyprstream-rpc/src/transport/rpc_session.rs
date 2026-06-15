@@ -69,13 +69,17 @@ pub const STOPPED_GRACE: Duration = Duration::from_secs(5);
 /// also defeats a trickle attacker who dribbles one byte per idle window.
 pub const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Default per-call timeout when the caller passes `None` on the client side.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default per-call timeout on the client side when the caller passes `None`.
+/// Distinct from [`REQUEST_READ_TIMEOUT`] (server-side per-request read budget).
+const DEFAULT_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Upper bound on how long graceful shutdown waits for in-flight streams to
 /// drain before forcing teardown. With [`REQUEST_READ_TIMEOUT`] bounding each
 /// read, well-behaved drains finish quickly; this is a backstop so a wedged
 /// processor or transport can't hang shutdown forever (#159).
+///
+/// Must exceed [`REQUEST_READ_TIMEOUT`] (30 s) so in-flight requests can finish
+/// before the connection tears down. The 10 s margin is intentional.
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(40);
 
 /// Default cap on concurrent accepted connections per server (#162). Bounds
@@ -409,7 +413,7 @@ impl<S: Session> Transport for SessionRpcTransport<S> {
     async fn send(&self, payload: Vec<u8>, timeout_ms: Option<i32>) -> Result<Vec<u8>> {
         let timeout = timeout_ms
             .map(|ms| Duration::from_millis(ms.max(0) as u64))
-            .unwrap_or(DEFAULT_TIMEOUT);
+            .unwrap_or(DEFAULT_CLIENT_TIMEOUT);
         let session = self.session.clone();
         let fut = async move {
             let (mut send, mut recv) = session

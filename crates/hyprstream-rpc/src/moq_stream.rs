@@ -143,6 +143,16 @@ pub fn serve_moq_uds_background(origin: MoqStreamOrigin, path: PathBuf) {
     });
 }
 
+/// Timeout waiting for the moq origin to announce a broadcast at startup.
+pub const BROADCAST_ANNOUNCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Timeout between consecutive moq Groups on a subscribed track.
+/// A timeout here signals the publisher is gone; the subscriber breaks out.
+pub const GROUP_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Timeout reading a single Frame from an already-opened Group.
+pub const FRAME_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The single track name that carries StreamBlock groups for a broadcast.
 pub const STREAM_TRACK: &str = "stream";
 
@@ -404,31 +414,16 @@ impl MoqStreamPublisher {
 
 /// Publisher for the moq-lite streaming plane.
 ///
-/// All call sites that receive a publisher via closure (e.g.
-/// `StreamChannel::run_stream`) use this type; the ZMQ PUSH variant was
-/// removed in the N4 hard cutover (#138/#213).
-pub enum AnyStreamPublisher {
-    /// moq-lite in-process path.
-    Moq(MoqStreamPublisher),
-}
+/// Type alias for [`MoqStreamPublisher`]; the ZMQ variant was removed in the
+/// N4 hard cutover (#138/#213). Retained as an alias so existing call sites
+/// compile unchanged.
+pub type AnyStreamPublisher = MoqStreamPublisher;
 
-impl AnyStreamPublisher {
-    /// Publish binary data.
-    pub async fn publish_data(&mut self, data: &[u8]) -> Result<()> {
-        match self {
-            Self::Moq(p) => p.publish_data(data).await,
-        }
-    }
-
-    /// Publish binary data with a rate hint (ignored on the moq path; each
-    /// call maps 1:1 to one moq Group).
+impl MoqStreamPublisher {
+    /// Publish binary data with a rate hint (ignored — each call maps 1:1 to one moq Group).
     pub async fn publish_data_with_rate(&mut self, data: &[u8], rate: f32) -> Result<()> {
-        match self {
-            Self::Moq(p) => {
-                let _ = rate;
-                p.publish_data(data).await
-            }
-        }
+        let _ = rate;
+        self.publish_data(data).await
     }
 
     /// Publish a progress update (`stage:current:total`).
@@ -437,64 +432,16 @@ impl AnyStreamPublisher {
         self.publish_data(data.as_bytes()).await
     }
 
-    /// Publish an error payload (terminal).
-    pub async fn publish_error(&mut self, message: &str) -> Result<()> {
-        match self {
-            Self::Moq(p) => p.publish_error(message).await,
-        }
-    }
-
-    /// Complete the stream with app-specific metadata (consumes self).
-    pub async fn complete(self, metadata: &[u8]) -> Result<()> {
-        match self {
-            Self::Moq(p) => p.complete(metadata).await,
-        }
-    }
-
-    /// Complete the stream without consuming self (for use inside `run_stream`).
-    pub async fn complete_ref(&mut self, metadata: &[u8]) -> Result<()> {
-        match self {
-            Self::Moq(p) => p.complete_ref(metadata).await,
-        }
-    }
-
-    /// Flush — no-op on the moq path (each block is published immediately).
+    /// Flush — no-op (each block is published immediately).
     pub async fn flush(&mut self) -> Result<()> {
-        match self {
-            Self::Moq(_) => Ok(()),
-        }
+        Ok(())
     }
 
-    /// The opaque topic this publisher serves.
-    pub fn topic(&self) -> &str {
-        match self {
-            Self::Moq(p) => p.topic(),
-        }
-    }
-
-    /// Whether a terminal frame (Error/Complete) has been sent.
-    pub fn is_terminated(&self) -> bool {
-        match self {
-            Self::Moq(p) => p.is_terminated(),
-        }
-    }
-
-    /// Whether the stream has been cancelled via the `CancellationToken`.
-    pub fn is_cancelled(&self) -> bool {
-        match self {
-            Self::Moq(p) => p.is_cancelled(),
-        }
-    }
-
-    /// Non-blocking publish — on the moq path every publish succeeds immediately
-    /// (no HWM concept) and always returns `Ok(true)`. The `rate` hint is ignored.
+    /// Non-blocking publish — always succeeds immediately (no HWM concept).
+    /// The `rate` hint is ignored.
     pub async fn try_publish_data(&mut self, data: &[u8], rate: f32) -> Result<bool> {
-        match self {
-            Self::Moq(p) => {
-                let _ = rate;
-                p.publish_data(data).await.map(|_| true)
-            }
-        }
+        let _ = rate;
+        self.publish_data(data).await.map(|_| true)
     }
 }
 
@@ -592,7 +539,7 @@ async fn moq_stream_handle_task(
         Err(e) => { let _ = tx.send(Err(anyhow!("moq handshake: {e}"))).await; return; }
     };
     let bc = match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        BROADCAST_ANNOUNCE_TIMEOUT,
         client_consumer.announced_broadcast(&broadcast_path),
     ).await {
         Ok(Some(bc)) => bc,
@@ -614,23 +561,35 @@ async fn moq_stream_handle_task(
         if cancel.is_cancelled() {
             break;
         }
-        let mut group = match tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            track.next_group(),
-        ).await {
+        let mut group = match tokio::time::timeout(GROUP_IDLE_TIMEOUT, track.next_group()).await {
             Ok(Ok(Some(g))) => g,
-            Ok(Ok(None)) | Err(_) => break, // end of track or timeout
+            Ok(Ok(None)) => break, // track ended cleanly
+            Err(_elapsed) => {
+                let _ = tx.send(Err(anyhow!(
+                    "stream idle: no group for {}s",
+                    GROUP_IDLE_TIMEOUT.as_secs()
+                ))).await;
+                break;
+            }
             Ok(Err(e)) => {
                 let _ = tx.send(Err(anyhow!("moq next_group: {e}"))).await;
                 break;
             }
         };
-        let frame: bytes::Bytes = match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            group.read_frame(),
-        ).await {
+        let frame: bytes::Bytes = match tokio::time::timeout(FRAME_READ_TIMEOUT, group.read_frame()).await {
             Ok(Ok(Some(f))) => f,
-            _ => continue,
+            Ok(Ok(None)) => break, // group ended without a frame
+            Ok(Err(e)) => {
+                let _ = tx.send(Err(anyhow!("frame read error: {e}"))).await;
+                break;
+            }
+            Err(_elapsed) => {
+                let _ = tx.send(Err(anyhow!(
+                    "frame read timeout after {}s",
+                    FRAME_READ_TIMEOUT.as_secs()
+                ))).await;
+                break;
+            }
         };
         match verify_moq_frame(&mut verifier, &topic, &frame) {
             Ok(payloads) => {
@@ -737,8 +696,8 @@ mod tests {
         Ok(())
     }
 
-    /// `AnyStreamPublisher::Moq` round-trip: publish via the enum wrapper and
-    /// verify the same bytes arrive on the moq consumer side.
+    /// `AnyStreamPublisher` round-trip: publish via the type alias and verify
+    /// the same bytes arrive on the moq consumer side.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn any_stream_publisher_moq_round_trip() -> Result<()> {
         let origin = origin();
@@ -747,8 +706,7 @@ mod tests {
         let topic = ctx.topic().to_owned();
         let mac_key = *ctx.mac_key();
 
-        // Publish via AnyStreamPublisher::Moq (the primary M2a path)
-        let mut any_pub = AnyStreamPublisher::Moq(origin.publisher(&ctx)?);
+        let mut any_pub: AnyStreamPublisher = origin.publisher(&ctx)?;
         any_pub.publish_data(b"ping").await?;
         any_pub.complete_ref(b"{}").await?;
 

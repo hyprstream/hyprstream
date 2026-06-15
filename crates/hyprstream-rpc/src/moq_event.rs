@@ -288,8 +288,15 @@ impl MoqEventSubscriber {
     }
 
     /// Try to receive without blocking.
-    pub async fn try_recv(&mut self) -> Result<Option<(String, Vec<u8>)>> {
-        self.recv_timeout(Duration::from_millis(0)).await
+    pub fn try_recv(&mut self) -> Result<Option<(String, Vec<u8>)>> {
+        let rx = self.ensure_started()?;
+        match rx.try_recv() {
+            Ok(msg) => Ok(Some(msg)),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                Err(anyhow!("event subscriber closed"))
+            }
+        }
     }
 }
 
@@ -320,14 +327,10 @@ async fn run_subscriber_task(
     }
 
     loop {
-        let (path, broadcast_opt) = match consumer.announced().await {
-            Some(update) => update,
-            None => break, // origin closed
-        };
-
-        let broadcast = match broadcast_opt {
-            Some(b) => b,
-            None => continue, // unannounce
+        let (path, broadcast) = match consumer.announced().await {
+            None => break,               // origin closed
+            Some((_, None)) => continue, // unannounce
+            Some((path, Some(b))) => (path, b),
         };
 
         let tx2 = tx.clone();
@@ -393,9 +396,16 @@ async fn read_event_broadcast(
     };
 
     loop {
-        let mut group = match track.next_group().await {
-            Ok(Some(g)) => g,
-            _ => break,
+        let mut group = match tokio::time::timeout(
+            crate::moq_stream::GROUP_IDLE_TIMEOUT,
+            track.next_group(),
+        ).await {
+            Ok(Ok(Some(g))) => g,
+            Ok(Ok(None)) | Ok(Err(_)) => break,
+            Err(_elapsed) => {
+                tracing::debug!("event subscriber idle timeout — source broadcast may be gone");
+                break;
+            }
         };
 
         let frame = match group.read_frame().await {

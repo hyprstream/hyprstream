@@ -93,6 +93,14 @@ pub struct HyprConfig {
     #[serde(default)]
     pub streaming: StreamingConfig,
 
+    /// RPC transport server tunables (stream cap, connection cap, timeouts).
+    ///
+    /// All values default to the process-wide constants in `hyprstream-rpc`
+    /// (`DEFAULT_STREAM_LIMIT=64`, `DEFAULT_CONNECTION_LIMIT=256`, etc.).
+    /// Override via `[rpc]` in the config file or `HYPRSTREAM__RPC__*` env vars.
+    #[serde(default)]
+    pub rpc: RpcServerConfig,
+
     /// TLS configuration for HTTP services (OAI, OAuth, MCP)
     ///
     /// Enabled by default. Auto-generates self-signed cert when paths are unset.
@@ -1160,23 +1168,79 @@ fn default_jwt_key_drain_days() -> u32 { 30 }
 
 /// StreamService configuration
 ///
-/// Controls the PULL/XPUB streaming proxy behavior including buffer sizes,
-/// message TTL, retransmission settings, and StreamBlock batching.
+/// RPC transport server tunables. Mirrors `hyprstream_rpc::transport::rpc_session::RpcConfig`
+/// so operators can tune these via the config file or `HYPRSTREAM__RPC__*` env vars.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcServerConfig {
+    /// Max concurrent in-flight bidi streams (server-wide semaphore).
+    #[serde(default = "default_rpc_stream_limit")]
+    pub stream_limit: usize,
+    /// Max concurrent accepted connections per server.
+    #[serde(default = "default_rpc_connection_limit")]
+    pub connection_limit: usize,
+    /// Max wall-clock seconds to read a single request frame.
+    #[serde(default = "default_rpc_request_read_timeout_secs")]
+    pub request_read_timeout_secs: u64,
+    /// Max seconds for a peer's QUIC/WebTransport handshake to complete.
+    #[serde(default = "default_rpc_handshake_timeout_secs")]
+    pub handshake_timeout_secs: u64,
+    /// Grace period (seconds) after writing a response for the peer to ack FIN.
+    #[serde(default = "default_rpc_stopped_grace_secs")]
+    pub stopped_grace_secs: u64,
+    /// Max seconds for graceful drain on shutdown.
+    #[serde(default = "default_rpc_drain_timeout_secs")]
+    pub drain_timeout_secs: u64,
+}
+
+impl Default for RpcServerConfig {
+    fn default() -> Self {
+        use hyprstream_rpc::transport::rpc_session as rpc;
+        Self {
+            stream_limit: rpc::DEFAULT_STREAM_LIMIT,
+            connection_limit: rpc::DEFAULT_CONNECTION_LIMIT,
+            request_read_timeout_secs: rpc::REQUEST_READ_TIMEOUT.as_secs(),
+            handshake_timeout_secs: rpc::HANDSHAKE_TIMEOUT.as_secs(),
+            stopped_grace_secs: rpc::STOPPED_GRACE.as_secs(),
+            drain_timeout_secs: rpc::DRAIN_TIMEOUT.as_secs(),
+        }
+    }
+}
+
+fn default_rpc_stream_limit() -> usize { hyprstream_rpc::transport::rpc_session::DEFAULT_STREAM_LIMIT }
+fn default_rpc_connection_limit() -> usize { hyprstream_rpc::transport::rpc_session::DEFAULT_CONNECTION_LIMIT }
+fn default_rpc_request_read_timeout_secs() -> u64 { hyprstream_rpc::transport::rpc_session::REQUEST_READ_TIMEOUT.as_secs() }
+fn default_rpc_handshake_timeout_secs() -> u64 { hyprstream_rpc::transport::rpc_session::HANDSHAKE_TIMEOUT.as_secs() }
+fn default_rpc_stopped_grace_secs() -> u64 { hyprstream_rpc::transport::rpc_session::STOPPED_GRACE.as_secs() }
+fn default_rpc_drain_timeout_secs() -> u64 { hyprstream_rpc::transport::rpc_session::DRAIN_TIMEOUT.as_secs() }
+
+impl RpcServerConfig {
+    /// Convert to the `hyprstream_rpc` wire type consumed by server builders.
+    pub fn to_rpc_config(&self) -> hyprstream_rpc::transport::rpc_session::RpcConfig {
+        use std::time::Duration;
+        hyprstream_rpc::transport::rpc_session::RpcConfig {
+            stream_limit: self.stream_limit,
+            connection_limit: self.connection_limit,
+            request_read_timeout: Duration::from_secs(self.request_read_timeout_secs),
+            handshake_timeout: Duration::from_secs(self.handshake_timeout_secs),
+            stopped_grace: Duration::from_secs(self.stopped_grace_secs),
+            drain_timeout: Duration::from_secs(self.drain_timeout_secs),
+        }
+    }
+}
+
+/// moq streaming plane configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamingConfig {
-    /// Maximum pending messages per topic (for pre-subscribe queue and retransmit buffer)
-    /// Default: 1000
-    #[serde(default = "default_max_pending_per_topic")]
+    /// Deprecated ZMQ-era field — no longer used. Retained for config compat.
+    #[serde(default = "default_max_pending_per_topic", skip_serializing)]
     pub max_pending_per_topic: usize,
 
-    /// Message TTL in seconds - messages older than this are dropped
-    /// Default: 30
-    #[serde(default = "default_message_ttl_secs")]
+    /// Deprecated ZMQ-era field — no longer used. Retained for config compat.
+    #[serde(default = "default_message_ttl_secs", skip_serializing)]
     pub message_ttl_secs: u64,
 
-    /// Interval between compaction runs in seconds
-    /// Default: 5
-    #[serde(default = "default_compact_interval_secs")]
+    /// Deprecated ZMQ-era field — no longer used. Retained for config compat.
+    #[serde(default = "default_compact_interval_secs", skip_serializing)]
     pub compact_interval_secs: u64,
 
     /// StreamBlock batching configuration (rate control)
@@ -1190,6 +1254,22 @@ pub struct StreamingConfig {
     /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
     #[serde(default)]
     pub quic_port: Option<u16>,
+
+    /// Timeout (seconds) waiting for the moq origin to announce a broadcast.
+    /// Default: 10
+    #[serde(default = "default_broadcast_announce_timeout_secs")]
+    pub broadcast_announce_timeout_secs: u64,
+
+    /// Timeout (seconds) between consecutive moq Groups on a subscribed track.
+    /// A subscriber that sees no new Group for this long treats the publisher as gone.
+    /// Default: 30
+    #[serde(default = "default_group_idle_timeout_secs")]
+    pub group_idle_timeout_secs: u64,
+
+    /// Timeout (seconds) reading a single Frame from an already-opened moq Group.
+    /// Default: 5
+    #[serde(default = "default_frame_read_timeout_secs")]
+    pub frame_read_timeout_secs: u64,
 }
 
 impl Default for StreamingConfig {
@@ -1200,6 +1280,9 @@ impl Default for StreamingConfig {
             compact_interval_secs: default_compact_interval_secs(),
             batching: hyprstream_rpc::streaming::BatchingConfig::default(),
             quic_port: None,
+            broadcast_announce_timeout_secs: default_broadcast_announce_timeout_secs(),
+            group_idle_timeout_secs: default_group_idle_timeout_secs(),
+            frame_read_timeout_secs: default_frame_read_timeout_secs(),
         }
     }
 }
@@ -1207,6 +1290,15 @@ impl Default for StreamingConfig {
 fn default_max_pending_per_topic() -> usize { 1000 }
 fn default_message_ttl_secs() -> u64 { 30 }
 fn default_compact_interval_secs() -> u64 { 5 }
+fn default_broadcast_announce_timeout_secs() -> u64 {
+    hyprstream_rpc::moq_stream::BROADCAST_ANNOUNCE_TIMEOUT.as_secs()
+}
+fn default_group_idle_timeout_secs() -> u64 {
+    hyprstream_rpc::moq_stream::GROUP_IDLE_TIMEOUT.as_secs()
+}
+fn default_frame_read_timeout_secs() -> u64 {
+    hyprstream_rpc::moq_stream::FRAME_READ_TIMEOUT.as_secs()
+}
 
 /// Storage paths and directories configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1678,6 +1770,7 @@ impl HyprConfigBuilder {
             oauth: self.oauth,
             credentials: Default::default(),
             streaming: self.streaming,
+            rpc: Default::default(),
             tls: self.tls,
             quic: self.quic,
             event: self.event,

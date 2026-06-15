@@ -542,7 +542,7 @@ impl StreamChannel {
     pub async fn publisher(&self, ctx: &StreamContext) -> Result<crate::moq_stream::AnyStreamPublisher> {
         let origin = crate::moq_stream::global_moq_origin()
             .ok_or_else(|| anyhow::anyhow!("no moq stream origin — server not initialized"))?;
-        Ok(crate::moq_stream::AnyStreamPublisher::Moq(origin.publisher(ctx)?))
+        origin.publisher(ctx)
     }
 
     /// Run a streaming operation with framework-guaranteed terminal frame.

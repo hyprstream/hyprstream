@@ -76,8 +76,8 @@ impl EventSubscriber {
     }
 
     /// Try to receive without blocking.
-    pub async fn try_recv(&mut self) -> Result<Option<(String, Vec<u8>)>> {
-        self.inner.try_recv().await
+    pub fn try_recv(&mut self) -> Result<Option<(String, Vec<u8>)>> {
+        self.inner.try_recv()
     }
 }
 
