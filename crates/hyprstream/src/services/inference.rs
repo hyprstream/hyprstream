@@ -37,7 +37,6 @@ use crate::services::PolicyClient;
 use crate::config::TrainingMode;
 use crate::runtime::GenerationRequest;
 use crate::runtime::ModelInfo;
-use crate::inference_capnp;
 use crate::runtime::kv_cache::CacheOwner;
 use crate::runtime::model_config::ModelConfig;
 use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
@@ -47,12 +46,9 @@ use crate::services::WorktreeClient;
 use crate::training::{DeltaPool, TenantDeltaConfig, TTTConfig, TestTimeTrainer};
 use hyprstream_rpc::Subject;
 use crate::training::serialize_state_dict_to_bytes;
-use crate::zmq::global_context;
 use anyhow::{anyhow, Result};
-use capnp::message::{Builder, ReaderOptions};
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::StreamChannel;
-use capnp::serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -143,13 +139,13 @@ pub struct InferenceServiceInner {
     /// Handles DH key exchange, pre-authorization, and publishing.
     stream_channel: Option<StreamChannel>,
     /// Server's Ed25519 verifying key for signature verification
-    #[allow(dead_code)] // Reserved for callback-mode signature verification
+    #[allow(dead_code)]
     server_pubkey: VerifyingKey,
     /// Service signing key for stream registration (generated at init)
-    #[allow(dead_code)] // Used by callback mode; standard mode passes key to InferenceZmqAdapter
+    #[allow(dead_code)]
     signing_key: SigningKey,
     /// Nonce cache for replay protection
-    #[allow(dead_code)] // Standard mode uses RequestLoop's nonce cache; kept for callback mode
+    #[allow(dead_code)]
     nonce_cache: Arc<InMemoryNonceCache>,
     /// Policy client for authorization checks (async via TMQ)
     policy_client: PolicyClient,
@@ -203,204 +199,6 @@ unsafe impl Sync for InferenceServiceInner {}
 // ExportPeftResult) eliminated — handlers return generated types directly.
 
 impl InferenceService {
-    /// Start inference service in callback mode
-    ///
-    /// This mode is used when InferenceService is spawned as a separate process.
-    /// The service:
-    /// 1. Connects DEALER to ModelService's ROUTER (callback endpoint)
-    /// 2. Sends Register message with its stream endpoint
-    /// 3. Waits for LoadModel command
-    /// 4. Loads the model
-    /// 5. Enters command loop handling Infer/Shutdown
-    ///
-    /// # Arguments
-    /// * `instance_id` - Unique ID for this instance (e.g., "inference-a1b2c3d4")
-    /// * `callback_endpoint` - ModelService's ROUTER endpoint for callbacks
-    /// * `config` - Runtime configuration
-    /// * `policy_client` - Policy client for authorization
-    pub async fn start_with_callback(
-        instance_id: String,
-        callback_endpoint: String,
-        config: RuntimeConfig,
-        policy_client: PolicyClient,
-    ) -> Result<()> {
-        info!(
-            "Starting InferenceService {} in callback mode (callback={})",
-            instance_id, callback_endpoint
-        );
-
-        // Run in current thread (we're likely spawned as a separate process)
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-
-        let local = tokio::task::LocalSet::new();
-        local.block_on(&rt, async move {
-            Self::run_callback_mode(instance_id, callback_endpoint, config, policy_client).await
-        })
-    }
-
-    /// Run the callback mode loop
-    async fn run_callback_mode(
-        instance_id: String,
-        callback_endpoint: String,
-        config: RuntimeConfig,
-        policy_client: PolicyClient,
-    ) -> Result<()> {
-        let ctx = global_context();
-
-        // Create DEALER socket and connect to callback endpoint
-        let dealer = ctx.socket(zmq::DEALER)?;
-        dealer.set_identity(instance_id.as_bytes())?;
-        dealer.set_rcvtimeo(100)?; // 100ms timeout for polling
-        dealer.connect(&callback_endpoint)?;
-        info!("Connected DEALER to {}", callback_endpoint);
-
-        // StreamChannel will be created after we have a signing key
-
-        // Get StreamService's Sub endpoint for client subscriptions
-        let stream_sub_endpoint = hyprstream_rpc::registry::global()
-            .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
-            .to_zmq_string();
-
-        // Send Register message (this IS the ready signal)
-        let register_msg = Self::build_register(&instance_id, &stream_sub_endpoint)?;
-        dealer.send(&register_msg, 0)?;
-        info!("Sent Register to callback");
-
-        // Wait for LoadModel command
-        let (model_path, model_ref) = Self::wait_for_load_model(&dealer)?;
-
-        // Initialize the engine and load the model
-        // SECURITY NOTE: Callback mode uses IPC (unix socket / inproc) between model service
-        // and inference worker — both in the same trust domain. Signature verification is
-        // skipped because the worker process doesn't have the server's public key.
-        // This is acceptable for IPC but must NOT be used for network-facing endpoints.
-        if callback_endpoint.starts_with("tcp://") {
-            return Err(anyhow!(
-                "Callback mode must use IPC transport (ipc:// or inproc://), not TCP. \
-                 TCP callback would bypass signature verification."
-            ));
-        }
-        let server_pubkey = VerifyingKey::default();
-        // Generate signing key for callback mode (separate process, no shared key access)
-        let signing_key = hyprstream_rpc::crypto::signing::generate_signing_keypair().0;
-        let nonce_cache = Arc::new(InMemoryNonceCache::new());
-        let service = Self::initialize(
-            model_path.clone(),
-            config,
-            server_pubkey,
-            signing_key.clone(),
-            nonce_cache,
-            policy_client,
-            None, // Callback mode: no FsOps
-        )
-        .await?;
-
-        // StreamChannel already created in initialize()
-
-        // Send LoadModelResponse
-        let response = Self::build_load_model_response(true, "")?;
-        dealer.send(&response, 0)?;
-        info!("Model {} loaded, sent response", model_ref);
-
-        // Enter command loop
-        Self::callback_command_loop(service, &dealer).await
-    }
-
-    /// Wait for LoadModel command from DEALER
-    fn wait_for_load_model(dealer: &zmq::Socket) -> Result<(PathBuf, String)> {
-        loop {
-            match dealer.recv_bytes(0) {
-                Ok(data) => {
-                    let reader = serialize::read_message(
-                        &mut std::io::Cursor::new(&data),
-                        ReaderOptions::new(),
-                    )?;
-                    let cmd = reader.get_root::<crate::model_capnp::inference_command::Reader>()?;
-
-                    use crate::model_capnp::inference_command::Which;
-                    match cmd.which()? {
-                        Which::LoadModel(load) => {
-                            let load = load?;
-                            let model_ref = load.get_model_ref()?.to_str()?.to_owned();
-                            let model_path = PathBuf::from(load.get_model_path()?.to_str()?);
-                            return Ok((model_path, model_ref));
-                        }
-                        Which::Shutdown(()) => {
-                            info!("Received Shutdown before LoadModel, returning");
-                            return Err(anyhow!("Shutdown requested before LoadModel"));
-                        }
-                        Which::Infer(_) => {
-                            warn!("Received Infer before LoadModel, ignoring");
-                        }
-                    }
-                }
-                Err(zmq::Error::EAGAIN) => {
-                    // Timeout, continue waiting
-                    continue;
-                }
-                Err(e) => {
-                    return Err(anyhow!("DEALER recv error: {}", e));
-                }
-            }
-        }
-    }
-
-    /// Callback mode command loop
-    async fn callback_command_loop(mut service: Self, dealer: &zmq::Socket) -> Result<()> {
-        loop {
-            match dealer.recv_bytes(0) {
-                Ok(data) => {
-                    let (response, continuation) = service.handle_callback_command(&data).await?;
-                    dealer.send(&response, 0)?;
-                    // Spawn continuation after response (mirrors RequestLoop's spawn_local behavior).
-                    // Using spawn_local (not inline await) so the DEALER loop isn't blocked
-                    // while streaming completes.
-                    if let Some(future) = continuation {
-                        tokio::task::spawn_local(future);
-                    }
-                }
-                Err(zmq::Error::EAGAIN) => {
-                    // Timeout, continue
-                    continue;
-                }
-                Err(e) => {
-                    error!("DEALER recv error: {}", e);
-                    return Err(anyhow!("DEALER recv error: {}", e));
-                }
-            }
-        }
-    }
-
-    /// Handle a command from the callback channel
-    async fn handle_callback_command(&mut self, data: &[u8])
-        -> Result<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)>
-    {
-        let reader = serialize::read_message(
-            &mut std::io::Cursor::new(data),
-            ReaderOptions::new(),
-        )?;
-        let cmd = reader.get_root::<crate::model_capnp::inference_command::Reader>()?;
-
-        use crate::model_capnp::inference_command::Which;
-        match cmd.which()? {
-            Which::LoadModel(_) => {
-                // Already loaded, return success
-                Ok((Self::build_load_model_response(true, "")?, None))
-            }
-            Which::Shutdown(()) => {
-                info!("Received Shutdown command, returning");
-                Err(anyhow!("Shutdown requested"))
-            }
-            Which::Infer(infer_data) => {
-                let infer_data = infer_data?;
-                // infer_data contains serialized InferenceRequest
-                self.handle_callback_infer(infer_data).await
-            }
-        }
-    }
-
     /// Run invariant checks before any TTT-scoped operation.
     /// Returns GuardStatus encoding expired, capacity, and generation state.
     /// The result must be passed to delta.adaptation_state.resolve().
@@ -421,54 +219,6 @@ impl InferenceService {
             at_capacity,
             lora_generation: self.lora_generation.load(std::sync::atomic::Ordering::Acquire),
         }
-    }
-
-    /// Handle inference request from callback channel
-    async fn handle_callback_infer(&mut self, request_data: &[u8])
-        -> Result<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)>
-    {
-        // Parse InferenceRequest
-        let reader = serialize::read_message(
-            &mut std::io::Cursor::new(request_data),
-            ReaderOptions::new(),
-        )?;
-        let req = reader.get_root::<inference_capnp::inference_request::Reader>()?;
-        let request_id = req.get_id();
-
-        // Create a service-identity context for the internal callback.
-        // Callback mode is an inproc self-call — it does not go through the ZMQ
-        // envelope pipeline, so we construct the context directly with
-        // from_callback_service to authenticate as the model service.
-        let ctx = EnvelopeContext::from_callback_service(request_id, "model");
-
-        // Dispatch via generated handler — propagate continuation
-        dispatch_inference(self, &ctx, request_data).await
-    }
-
-    /// Build Register message
-    fn build_register(id: &str, stream_endpoint: &str) -> Result<Vec<u8>> {
-        let mut message = Builder::new_default();
-        {
-            let mut reg = message.init_root::<crate::model_capnp::register::Builder>();
-            reg.set_id(id);
-            reg.set_stream_endpoint(stream_endpoint);
-        }
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-        Ok(bytes)
-    }
-
-    /// Build LoadModelCommandResponse
-    fn build_load_model_response(success: bool, error: &str) -> Result<Vec<u8>> {
-        let mut message = Builder::new_default();
-        {
-            let mut resp = message.init_root::<crate::model_capnp::load_model_command_response::Builder>();
-            resp.set_success(success);
-            resp.set_error(error);
-        }
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-        Ok(bytes)
     }
 
     /// Initialize the service
@@ -811,7 +561,7 @@ impl InferenceService {
         expiry_secs: i64,
         subject: &Subject,
         ttt_overrides: crate::training::ttt::TTTOverrides,
-    ) -> Result<(String, [u8; 32], PendingWork)> {
+    ) -> Result<(String, [u8; 32], String, String, PendingWork)> {
         // TTT adaptation is deferred to execute_stream (runs in continuation after REP
         // is sent) to avoid blocking the ZMQ REQ/REP handler with GPU-intensive work.
 
@@ -836,6 +586,12 @@ impl InferenceService {
 
         let stream_id = stream_ctx.stream_id().to_owned();
         let server_pubkey = *stream_ctx.server_pubkey();
+        let moq_uds_path = hyprstream_rpc::moq_stream::global_moq_uds_path()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let moq_broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()
+            .map(|o| o.broadcast_path(stream_ctx.topic()))
+            .unwrap_or_default();
 
         // Delta lookup deferred to execute_stream (after TTT may modify it)
         let pending = PendingWork::Generation {
@@ -845,7 +601,7 @@ impl InferenceService {
             ttt_overrides,
         };
 
-        Ok((stream_id, server_pubkey, pending))
+        Ok((stream_id, server_pubkey, moq_uds_path, moq_broadcast_path, pending))
     }
 
     /// Execute streaming generation - called AFTER REP response is sent.
@@ -1285,15 +1041,20 @@ impl InferenceService {
 
         let stream_id = stream_ctx.stream_id().to_owned();
         let server_pubkey = *stream_ctx.server_pubkey();
-        let stream_sub_endpoint = hyprstream_rpc::registry::global()
-            .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
-            .to_zmq_string();
+        let moq_uds_path = hyprstream_rpc::moq_stream::global_moq_uds_path()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let moq_broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()
+            .map(|o| o.broadcast_path(stream_ctx.topic()))
+            .unwrap_or_default();
 
         let stream_info = crate::services::generated::inference_client::StreamInfo {
             stream_id,
-            endpoint: stream_sub_endpoint,
+            endpoint: String::new(),
             server_pubkey,
             qos: stream_ctx.qos().clone(),
+            moq_uds_path,
+            moq_broadcast_path,
         };
 
         Ok((stream_info, stream_ctx))
@@ -2131,17 +1892,16 @@ impl InferenceHandler for InferenceService {
 
         let client_ephemeral_pubkey = ctx.ephemeral_pubkey();
         let claims = ctx.claims().cloned();
-        let (stream_id, server_pubkey, pending) = self.prepare_stream(request, client_ephemeral_pubkey.as_ref().map(<[u8; 32]>::as_slice), claims, expiry_secs, &subject, ttt_overrides).await?;
-
-        let stream_sub_endpoint = hyprstream_rpc::registry::global()
-            .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
-            .to_zmq_string();
+        let (stream_id, server_pubkey, moq_uds_path, moq_broadcast_path, pending) =
+            self.prepare_stream(request, client_ephemeral_pubkey.as_ref().map(<[u8; 32]>::as_slice), claims, expiry_secs, &subject, ttt_overrides).await?;
 
         let stream_info = crate::services::generated::inference_client::StreamInfo {
             stream_id,
-            endpoint: stream_sub_endpoint,
+            endpoint: String::new(),
             server_pubkey,
             qos: <hyprstream_rpc::stream_info::Job as hyprstream_rpc::stream_info::StreamOptPreset>::stream_opt(),
+            moq_uds_path,
+            moq_broadcast_path,
         };
 
         // Build continuation that executes the stream after REP is sent.
@@ -2342,15 +2102,20 @@ impl InferenceHandler for InferenceService {
 
         let stream_id = stream_ctx.stream_id().to_owned();
         let server_pubkey = *stream_ctx.server_pubkey();
-        let stream_sub_endpoint = hyprstream_rpc::registry::global()
-            .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
-            .to_zmq_string();
+        let moq_uds_path = hyprstream_rpc::moq_stream::global_moq_uds_path()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let moq_broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()
+            .map(|o| o.broadcast_path(stream_ctx.topic()))
+            .unwrap_or_default();
 
         let stream_info = crate::services::generated::inference_client::StreamInfo {
             stream_id,
-            endpoint: stream_sub_endpoint,
+            endpoint: String::new(),
             server_pubkey,
             qos: stream_ctx.qos().clone(),
+            moq_uds_path,
+            moq_broadcast_path,
         };
 
         let adaptation_strategy = map_adaptation_strategy(data.adaptation_strategy, data.writeback_threshold);

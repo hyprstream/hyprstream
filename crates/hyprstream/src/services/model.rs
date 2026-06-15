@@ -45,7 +45,7 @@ use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::{global as registry, SocketKind};
 use hyprstream_rpc::transport::TransportConfig;
 use lru::LruCache;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
@@ -80,16 +80,6 @@ pub struct LoadedModel {
     pub generation_defaults: crate::config::SamplingParams,
 }
 
-/// How InferenceService instances are spawned
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SpawnMode {
-    /// Run InferenceService in-process (current behavior)
-    #[default]
-    InProcess,
-    /// Spawn InferenceService as separate process via callback pattern
-    Spawned,
-}
-
 /// Model service configuration
 pub struct ModelServiceConfig {
     /// Maximum number of models to keep loaded
@@ -98,10 +88,6 @@ pub struct ModelServiceConfig {
     pub max_context: Option<u32>,
     /// KV cache quantization type
     pub kv_quant: KVQuantType,
-    /// How to spawn InferenceService instances
-    pub spawn_mode: SpawnMode,
-    /// Callback endpoint for spawned mode
-    pub callback_endpoint: Option<String>,
 }
 
 impl Default for ModelServiceConfig {
@@ -110,8 +96,6 @@ impl Default for ModelServiceConfig {
             max_models: 5,
             max_context: None,
             kv_quant: KVQuantType::None,
-            spawn_mode: SpawnMode::InProcess,
-            callback_endpoint: None,
         }
     }
 }
@@ -133,12 +117,6 @@ pub struct ModelServiceInner {
     notification_publisher: NotificationPublisher,
     /// Registry client for resolving model paths
     registry: RegistryClient,
-    /// Callback router for spawned mode (None for in-process)
-    #[allow(dead_code)]
-    callback_router: Option<crate::services::callback::CallbackRouter>,
-    /// Spawned instances by model ref (for spawned mode)
-    #[allow(dead_code)]
-    spawned_instances: RwLock<HashMap<String, crate::services::callback::Instance>>,
     // Infrastructure (for Spawnable)
     transport: TransportConfig,
     /// Expected JWT audience for token validation (RFC 8707).
@@ -213,8 +191,6 @@ impl ModelService {
             policy_client,
             notification_publisher,
             registry,
-            callback_router: None,
-            spawned_instances: RwLock::new(HashMap::new()),
             transport,
             expected_audience: None,
             jwt_key_source: None,
@@ -248,54 +224,6 @@ impl ModelService {
             .expect("with_jwt_key_source must be called before service is shared")
             .jwt_key_source = Some(src);
         self
-    }
-
-    /// Create a model service with callback router for spawned mode
-    pub async fn with_callback_router(
-        config: ModelServiceConfig,
-        signing_key: SigningKey,
-        policy_client: PolicyClient,
-        registry: RegistryClient,
-        callback_router: crate::services::callback::CallbackRouter,
-        transport: TransportConfig,
-    ) -> Result<Self> {
-        const DEFAULT_CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(5) {
-            Some(n) => n,
-            None => unreachable!(),
-        };
-        let cache_size = NonZeroUsize::new(config.max_models).unwrap_or(DEFAULT_CACHE_SIZE);
-
-        let key_resp = policy_client.resolve_service_key(
-            &crate::services::generated::policy_client::ResolveServiceKey {
-                service_name: "notification".to_owned(),
-            },
-        ).await?;
-        let notif_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
-            key_resp.verifying_key.as_slice().try_into()
-                .map_err(|_| anyhow!("Invalid verifying key length"))?,
-        ).map_err(|e| anyhow!("Invalid Ed25519 key: {e}"))?;
-        let notif_client = NotificationClient::for_service(
-            signing_key.clone(),
-            notif_vk,
-            None,
-        )?;
-        let notification_publisher = NotificationPublisher::new(notif_client, signing_key.clone());
-
-        Ok(Self { inner: Arc::new(ModelServiceInner {
-            loaded_models: RwLock::new(LruCache::new(cache_size)),
-            pending_loads: Mutex::new(HashSet::new()),
-            config,
-            signing_key,
-            policy_client,
-            notification_publisher,
-            registry,
-            callback_router: Some(callback_router),
-            spawned_instances: RwLock::new(HashMap::new()),
-            transport,
-            expected_audience: None,
-            jwt_key_source: None,
-            fs_tree: std::sync::OnceLock::new(),
-        })})
     }
 
     /// Derive the deterministic IPC endpoint for a model reference.

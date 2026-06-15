@@ -1736,7 +1736,6 @@ fn main() -> Result<()> {
                     foreground,
                     daemon,
                     ipc,
-                    callback,
                     services: multi_services,
                     quic_bind,
                     print_cert_hash,
@@ -1756,58 +1755,6 @@ fn main() -> Result<()> {
                                 )),
                             }
                         };
-
-                        // Check if this is inference callback mode
-                        if let Some(callback_endpoint) = callback {
-                            use hyprstream_core::services::InferenceService;
-
-                            let instance_id =
-                                if let Some(id) = name.strip_prefix("inference@") {
-                                    id.to_owned()
-                                } else {
-                                    return Err(anyhow::anyhow!(
-                                        "--callback requires inference@{{id}} format (got: {})",
-                                        name
-                                    ));
-                                };
-
-                            info!(
-                                "Starting InferenceService in callback mode: {} -> {}",
-                                instance_id, callback_endpoint
-                            );
-
-                            return with_runtime(
-                                RuntimeConfig {
-                                    device: DeviceConfig::request_cpu(),
-                                    multi_threaded: false,
-                                },
-                                || async move {
-                                    let data_dir = dirs::data_local_dir()
-                                        .unwrap_or_else(|| std::path::PathBuf::from("."))
-                                        .join("hyprstream");
-                                    let keys_dir = data_dir.join("keys");
-                                    let signing_key =
-                                        load_or_generate_signing_key(&keys_dir).await?;
-                                    let policy_client = PolicyClient::for_service(
-                                        signing_key.clone(),
-                                        resolve_service_vk("policy")
-                                            .ok_or_else(|| anyhow::anyhow!("Cannot resolve policy pubkey. Run wizard."))?,
-                                        None,
-                                    )?;
-
-                                    let runtime_config =
-                                        hyprstream_core::runtime::RuntimeConfig::default();
-
-                                    InferenceService::start_with_callback(
-                                        instance_id,
-                                        callback_endpoint,
-                                        runtime_config,
-                                        policy_client,
-                                    )
-                                    .await
-                                },
-                            );
-                        }
 
                         // Standard foreground service startup
                         let rpc_mode = if ipc {
