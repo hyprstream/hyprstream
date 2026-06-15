@@ -1048,6 +1048,7 @@ impl StreamHandle {
         server_pubkey: &[u8],
         client_secret: &DhSecret,
         client_pubkey: &[u8],
+        policy: crate::stream_info::StreamPolicy,
     ) -> Result<Self> {
         // Perform DH
         let server_pub = DhPublic::from_slice(server_pubkey)
@@ -1076,7 +1077,7 @@ impl StreamHandle {
             "Subscribed to E2E authenticated stream"
         );
 
-        let verifier = StreamVerifier::new(*keys.mac_key, keys.topic.clone());
+        let verifier = StreamVerifier::with_policy(*keys.mac_key, keys.topic.clone(), policy.into());
 
         // Set up control channel PUSH socket (consumer → StreamService → producer)
         let ctrl_push = context.socket(zmq::PUSH).ok();

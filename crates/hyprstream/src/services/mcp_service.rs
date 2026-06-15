@@ -439,7 +439,7 @@ fn register_scoped_tools_recursive(
                                 _ => anyhow::bail!("No scoped streaming dispatch for service: {service}"),
                             };
 
-                            let (stream_id, endpoint, server_pubkey) = parse_stream_info(&stream_info_json)?;
+                            let (stream_id, endpoint, server_pubkey, policy) = parse_stream_info(&stream_info_json)?;
 
                             let handle = StreamHandle::new(
                                 &ctx.zmq_context,
@@ -448,6 +448,7 @@ fn register_scoped_tools_recursive(
                                 &server_pubkey,
                                 &client_secret,
                                 &client_pubkey_bytes,
+                                policy,
                             )?;
 
                             Ok(ToolResult::Stream(Box::new(handle)))
@@ -599,7 +600,7 @@ fn register_streaming_tool(
                     _ => anyhow::bail!("No streaming support for service: {}", service),
                 };
 
-                let (stream_id, endpoint, server_pubkey) = parse_stream_info(&stream_info_json)?;
+                let (stream_id, endpoint, server_pubkey, policy) = parse_stream_info(&stream_info_json)?;
 
                 let handle = StreamHandle::new(
                     &ctx.zmq_context,
@@ -608,6 +609,7 @@ fn register_streaming_tool(
                     &server_pubkey,
                     &client_secret,
                     &client_pubkey_bytes,
+                    policy,
                 )?;
 
                 Ok(ToolResult::Stream(Box::new(handle)))
@@ -654,9 +656,9 @@ fn params_to_json_schema(params: &[(&str, &str, bool, &str)]) -> Value {
     })
 }
 
-/// Parse streamId, endpoint, and serverPubkey from a streaming response JSON.
+/// Parse streamId, endpoint, serverPubkey, and policy from a streaming response JSON.
 /// StreamInfo serializes with `#[serde(rename_all = "camelCase")]`, so all keys are camelCase.
-fn parse_stream_info(json: &Value) -> anyhow::Result<(String, String, Vec<u8>)> {
+fn parse_stream_info(json: &Value) -> anyhow::Result<(String, String, Vec<u8>, hyprstream_rpc::stream_info::StreamPolicy)> {
     let stream_id = json["streamId"].as_str()
         .ok_or_else(|| anyhow::anyhow!("missing streamId in streaming response"))?.to_owned();
     let endpoint = json["endpoint"].as_str()
@@ -666,7 +668,12 @@ fn parse_stream_info(json: &Value) -> anyhow::Result<(String, String, Vec<u8>)> 
         .iter()
         .map(|v| v.as_u64().unwrap_or(0) as u8)
         .collect();
-    Ok((stream_id, endpoint, server_pubkey))
+    let policy: hyprstream_rpc::stream_info::StreamPolicy = if json["policy"].is_object() {
+        serde_json::from_value(json["policy"].clone()).unwrap_or_default()
+    } else {
+        hyprstream_rpc::stream_info::StreamPolicy::default()
+    };
+    Ok((stream_id, endpoint, server_pubkey, policy))
 }
 
 /// Dispatch a method call to the appropriate generated client.

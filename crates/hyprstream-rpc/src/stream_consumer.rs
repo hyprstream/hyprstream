@@ -311,8 +311,12 @@ impl<T: Transport> StreamHandleImpl<T> {
         let subscriber = transport.subscribe(keys.topic.as_bytes()).await?;
         let publisher = transport.publish(keys.ctrl_topic.as_bytes()).await.ok();
 
-        // Pure crypto
-        let verifier = StreamVerifier::new(*keys.mac_key, keys.topic.clone());
+        // Policy from the signed StreamInfo handshake — enforced for both native and WASM paths.
+        let verifier = StreamVerifier::with_policy(
+            *keys.mac_key,
+            keys.topic.clone(),
+            stream_info.policy.into(),
+        );
 
         Ok(Self {
             subscriber,
@@ -463,6 +467,28 @@ impl StreamHandle for Box<dyn StreamHandle> {
 
     fn is_completed(&self) -> bool {
         (**self).is_completed()
+    }
+}
+
+// ─── Conversion from wire StreamPolicy ────────────────────────────────────────
+
+/// Convert the full wire `StreamPolicy` (5 axes) to the consumer's 2-axis slice.
+///
+/// The delivery, retention, and overflow_policy axes are producer-side concerns;
+/// the consumer only enforces ordering + completion.
+impl From<crate::stream_info::StreamPolicy> for StreamPolicy {
+    fn from(p: crate::stream_info::StreamPolicy) -> Self {
+        let ordering = match p.ordering {
+            crate::stream_info::Ordering::Ordered => StreamOrdering::Ordered,
+            crate::stream_info::Ordering::Unordered { anti_replay_window } => {
+                StreamOrdering::Unordered { anti_replay_window }
+            }
+        };
+        let completion = match p.completion {
+            crate::stream_info::Completion::EndOfStream => Completion::EndOfStream,
+            crate::stream_info::Completion::None => Completion::Open,
+        };
+        StreamPolicy { ordering, completion }
     }
 }
 

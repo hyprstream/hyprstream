@@ -452,6 +452,7 @@ fn generate_trait_method_impl(
                     &info.server_pubkey,
                     &client_secret,
                     &client_pubkey_bytes,
+                    info.policy,
                 )
             }
         })
