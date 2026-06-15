@@ -101,6 +101,48 @@ pub struct StreamPolicy {
     pub overflow_policy: OverflowPolicy,
 }
 
+impl StreamPolicy {
+    /// Token/job streams: ordered, at-least-once with 4096-entry dedup window,
+    /// resumable from last-acked Group, EndOfStream terminator, 256-Group relay
+    /// retention, lossless backpressure. Use for InferenceService token streams
+    /// and model lifecycle events (#169).
+    pub fn job() -> Self {
+        Self {
+            ordering: Ordering::Ordered,
+            delivery: Delivery::AtLeastOnce { dedup_window: 4096, resumable: true },
+            completion: Completion::EndOfStream,
+            retention: Retention::Blocks(256),
+            overflow_policy: OverflowPolicy::Block,
+        }
+    }
+
+    /// Log/mobile streams: ordered, at-least-once, no terminator sentinel,
+    /// 300-second relay retention. Use for Metrics, Notification, and mobile
+    /// clients with intermittent connectivity (#169).
+    pub fn log() -> Self {
+        Self {
+            ordering: Ordering::Ordered,
+            delivery: Delivery::AtLeastOnce { dedup_window: 4096, resumable: true },
+            completion: Completion::None,
+            retention: Retention::Seconds(300),
+            overflow_policy: OverflowPolicy::Block,
+        }
+    }
+
+    /// Pipe streams: ordered, at-least-once with 256-entry dedup, live retention,
+    /// no terminator. Use for container I/O attach and the model↔worker callback
+    /// DEALER replacement (#170).
+    pub fn pipe() -> Self {
+        Self {
+            ordering: Ordering::Ordered,
+            delivery: Delivery::AtLeastOnce { dedup_window: 256, resumable: false },
+            completion: Completion::None,
+            retention: Retention::Live,
+            overflow_policy: OverflowPolicy::Block,
+        }
+    }
+}
+
 // ─── StreamInfo ───────────────────────────────────────────────────────────────
 
 /// Canonical stream info returned by streaming RPC methods.

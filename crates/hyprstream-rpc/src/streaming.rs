@@ -471,6 +471,8 @@ pub struct StreamContext {
     ctrl_mac_key: [u8; 32],
     /// Cancellation token — fired by control listener or JWT expiry
     cancel_token: CancellationToken,
+    /// Delivery policy advertised in StreamInfo and honoured by MoqStreamPublisher (#169).
+    policy: crate::stream_info::StreamPolicy,
 }
 
 impl StreamContext {
@@ -489,6 +491,7 @@ impl StreamContext {
             ctrl_topic: String::new(),
             ctrl_mac_key: [0u8; 32],
             cancel_token: CancellationToken::new(),
+            policy: crate::stream_info::StreamPolicy::default(),
         }
     }
 
@@ -524,6 +527,7 @@ impl StreamContext {
             ctrl_topic: keys.ctrl_topic,
             ctrl_mac_key: *keys.ctrl_mac_key,
             cancel_token: CancellationToken::new(),
+            policy: crate::stream_info::StreamPolicy::default(),
         })
     }
 
@@ -560,6 +564,17 @@ impl StreamContext {
     /// Get the cancellation token.
     pub fn cancel_token(&self) -> &CancellationToken {
         &self.cancel_token
+    }
+
+    /// Set the delivery policy for this stream (#169).
+    pub fn with_policy(mut self, policy: crate::stream_info::StreamPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Get the delivery policy for this stream (#169).
+    pub fn policy(&self) -> &crate::stream_info::StreamPolicy {
+        &self.policy
     }
 }
 

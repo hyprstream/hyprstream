@@ -832,7 +832,8 @@ impl InferenceService {
 
         let stream_ctx = stream_channel
             .prepare_stream_with_claims(client_pub_bytes, expiry_secs, claims)
-            .await?;
+            .await?
+            .with_policy(hyprstream_rpc::stream_info::StreamPolicy::job());
 
         debug!(
             stream_id = %stream_ctx.stream_id(),
@@ -1284,7 +1285,10 @@ impl InferenceService {
             .max(600);
         let claims = ctx.claims().cloned();
 
-        let stream_ctx = stream_channel.prepare_stream_with_claims(client_pub_ref, expiry_secs, claims).await?;
+        let stream_ctx = stream_channel
+            .prepare_stream_with_claims(client_pub_ref, expiry_secs, claims)
+            .await?
+            .with_policy(hyprstream_rpc::stream_info::StreamPolicy::job());
 
         let stream_id = stream_ctx.stream_id().to_owned();
         let server_pubkey = *stream_ctx.server_pubkey();
@@ -1296,7 +1300,7 @@ impl InferenceService {
             stream_id,
             endpoint: stream_sub_endpoint,
             server_pubkey,
-            ..Default::default()
+            policy: stream_ctx.policy().clone(),
         };
 
         Ok((stream_info, stream_ctx))
@@ -2144,7 +2148,7 @@ impl InferenceHandler for InferenceService {
             stream_id,
             endpoint: stream_sub_endpoint,
             server_pubkey,
-            ..Default::default()
+            policy: hyprstream_rpc::stream_info::StreamPolicy::job(),
         };
 
         // Build continuation that executes the stream after REP is sent.
@@ -2338,7 +2342,10 @@ impl InferenceHandler for InferenceService {
             .max(600);
         let claims = ctx.claims().cloned();
 
-        let stream_ctx = stream_channel.prepare_stream_with_claims(client_pub_ref, expiry_secs, claims).await?;
+        let stream_ctx = stream_channel
+            .prepare_stream_with_claims(client_pub_ref, expiry_secs, claims)
+            .await?
+            .with_policy(hyprstream_rpc::stream_info::StreamPolicy::job());
 
         let stream_id = stream_ctx.stream_id().to_owned();
         let server_pubkey = *stream_ctx.server_pubkey();
@@ -2350,7 +2357,7 @@ impl InferenceHandler for InferenceService {
             stream_id,
             endpoint: stream_sub_endpoint,
             server_pubkey,
-            ..Default::default()
+            policy: stream_ctx.policy().clone(),
         };
 
         let adaptation_strategy = map_adaptation_strategy(data.adaptation_strategy, data.writeback_threshold);

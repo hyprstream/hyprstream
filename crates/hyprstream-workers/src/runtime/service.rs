@@ -814,7 +814,8 @@ impl WorkerService {
         // DH + pre-authorization via StreamChannel — atomic, no pending state
         let stream_ctx = self.stream_channel
             .prepare_stream_with_claims(&client_pubkey, 600, claims).await
-            .map_err(|e| anyhow::anyhow!("Stream preparation failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Stream preparation failed: {}", e))?
+            .with_policy(hyprstream_rpc::stream_info::StreamPolicy::pipe());
 
         let stream_id = stream_ctx.stream_id().to_owned();
         let stream_endpoint = self.stream_channel.stream_endpoint();
@@ -838,7 +839,7 @@ impl WorkerService {
             stream_id,
             endpoint: stream_endpoint,
             server_pubkey: *stream_ctx.server_pubkey(),
-            ..Default::default()
+            policy: stream_ctx.policy().clone(),
         };
 
         // Continuation: spawns FD streaming task AFTER REP is sent to client

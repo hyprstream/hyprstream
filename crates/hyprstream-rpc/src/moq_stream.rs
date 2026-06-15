@@ -235,6 +235,7 @@ impl MoqStreamOrigin {
             cancel_token: ctx.cancel_token().clone(),
             terminated: false,
             topic: ctx.topic().to_owned(),
+            policy: ctx.policy().clone(),
         })
     }
 }
@@ -258,6 +259,8 @@ pub struct MoqStreamPublisher {
     cancel_token: CancellationToken,
     terminated: bool,
     topic: String,
+    /// Delivery policy from the originating StreamContext (#169).
+    pub policy: crate::stream_info::StreamPolicy,
 }
 
 impl MoqStreamPublisher {
