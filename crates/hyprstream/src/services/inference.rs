@@ -604,11 +604,8 @@ impl InferenceService {
             None
         };
 
-        // Create StreamChannel upfront (lazy socket init on first use)
-        let stream_channel = StreamChannel::new(
-            Arc::clone(&global_context()),
-            signing_key.clone(),
-        );
+        // Create StreamChannel upfront.
+        let stream_channel = StreamChannel::new(signing_key.clone());
 
         Ok(InferenceService {
             inner: Arc::new(InferenceServiceInner {

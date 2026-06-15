@@ -1086,7 +1086,6 @@ fn handle_quick_command(
                             pool_config,
                             backend,
                             rafs_store,
-                            global_context().clone(),
                             worker_transport,
                             signing_key.clone(),
                         )?;

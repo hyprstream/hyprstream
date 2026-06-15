@@ -25,7 +25,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use git2db::Git2DB;
 use hyprstream_rpc::prelude::*;
-use hyprstream_rpc::registry::{global as global_registry, SocketKind};
+use hyprstream_rpc::registry::SocketKind;
 use hyprstream_service::{ServiceContext, Spawnable};
 use hyprstream_rpc::service_factory;
 use hyprstream_rpc::moq_event::MoqEventOrigin;
@@ -426,7 +426,6 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
         rt.block_on(RegistryService::new(
             ctx.models_dir(),
             policy_client,
-            global_context(),
             ctx.transport("registry", SocketKind::Rep),
             sk.clone(),
         ))
@@ -443,20 +442,15 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
 // Streams Service Factory
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Factory for StreamService (PULL/XPUB queuing proxy with JWT validation)
+/// Factory for the moq stream origin (#138 N4 — ZMQ StreamService removed).
+///
+/// Builds the process-global `MoqStreamOrigin`, registers it, and starts the
+/// UDS moq server so cross-process subscribers (e.g. `tui attach`) can
+/// subscribe over moq without any ZMQ sockets.
 #[service_factory("streams")]
-fn create_streams_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
-    info!("Creating StreamService with JWT validation and queuing");
+fn create_streams_service(_ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+    info!("Creating moq stream origin (ZMQ StreamService removed)");
 
-    use crate::services::StreamService;
-
-    // XPUB frontend - clients subscribe via SUB
-    let pub_transport = global_registry().endpoint("streams", SocketKind::Sub);
-    // PULL backend - publishers connect via PUSH
-    let pull_transport = global_registry().endpoint("streams", SocketKind::Push);
-
-    // In-process publish gate: only accept signers attested in the trust store.
-    // Shared by the ZMQ StreamRegister path and the moq in-process plane (M2a).
     let gate = |pubkey: &[u8; 32]| -> bool {
         use ed25519_dalek::VerifyingKey;
         let Ok(vk) = VerifyingKey::from_bytes(pubkey) else {
@@ -465,41 +459,57 @@ fn create_streams_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
         hyprstream_service::global_trust_store().get(&vk).is_some()
     };
 
-    // moq-lite streaming origin (epic #134 M2a). A standalone origin is built
-    // here and registered as the process-global so all StreamChannels (on
-    // InferenceService, MetricsService, etc.) use it without each needing a
-    // reference threaded through their factory. In M2b this becomes the iroh
-    // substrate's shared origin so external moq subscribers see the same tree.
     let moq_origin = hyprstream_rpc::moq_stream::MoqStreamOrigin::standalone()
         .with_prefix("local/streams")
         .with_authorize_signer(gate)
         .build();
 
-    // Register the global BEFORE StreamService signals ready — all downstream
-    // services that call StreamChannel::publisher() will see it immediately.
+    // Register the global BEFORE signalling ready — downstream services that
+    // call StreamChannel::publisher() will see it immediately.
     hyprstream_rpc::moq_stream::init_global_moq_origin(moq_origin.clone());
 
-    // Start the UDS moq server so cross-process subscribers (e.g. `tui attach`)
-    // can subscribe without going through the ZMQ XPUB plane.
     let moq_uds_path = {
         let dir = std::env::temp_dir()
             .join(format!("hyprstream-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         dir.join("moq.sock")
     };
-    hyprstream_rpc::moq_stream::serve_moq_uds_background(moq_origin.clone(), moq_uds_path);
+    hyprstream_rpc::moq_stream::serve_moq_uds_background(moq_origin, moq_uds_path);
 
-    let stream_service = StreamService::new(
-        "streams",
-        global_context(),
-        pub_transport,
-        pull_transport,
-        ctx.verifying_key(),
-    )
-    .with_authorize_signer(gate)
-    .with_moq_origin(moq_origin);
+    Ok(Box::new(MoqStreamBarrierService::new()))
+}
 
-    Ok(Box::new(stream_service))
+/// Minimal `Spawnable` that holds the moq stream origin lifetime and satisfies
+/// the service lifecycle contract. The origin itself is a process-global with
+/// no dedicated thread; this service just waits for shutdown.
+struct MoqStreamBarrierService;
+
+impl MoqStreamBarrierService {
+    fn new() -> Self { Self }
+}
+
+impl Spawnable for MoqStreamBarrierService {
+    fn name(&self) -> &str { "streams" }
+
+    fn registrations(&self) -> Vec<(hyprstream_rpc::registry::SocketKind, hyprstream_rpc::transport::TransportConfig)> {
+        vec![]
+    }
+
+    fn run(
+        self: Box<Self>,
+        shutdown: std::sync::Arc<tokio::sync::Notify>,
+        on_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> hyprstream_rpc::error::Result<()> {
+        if let Some(ready) = on_ready {
+            let _ = ready.send(());
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| hyprstream_rpc::error::RpcError::Other(e.to_string()))?;
+        rt.block_on(shutdown.notified());
+        Ok(())
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -630,7 +640,6 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         pool_config,
         backend,
         rafs_store,
-        global_context(),
         ctx.transport("worker", SocketKind::Rep),
         sk.clone(),
     )?;
@@ -1234,7 +1243,6 @@ fn create_notification_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn S
 
     let mut notification_service = crate::services::NotificationService::new(
         Arc::new(sk),
-        global_context(),
         ctx.transport("notification", SocketKind::Rep),
     ).with_policy_client(policy_client);
     if let Some(issuer) = ctx.oauth_issuer_url() {
@@ -1296,7 +1304,6 @@ fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
 
     let mut metrics_service = MetricsService::new(
         orchestrator,
-        global_context(),
         ctx.transport("metrics", SocketKind::Rep),
         sk,
         policy_client,

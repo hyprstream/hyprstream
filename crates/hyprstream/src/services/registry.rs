@@ -306,7 +306,6 @@ pub struct RegistryService {
     /// Policy client for authorization checks (uses ZMQ to PolicyService)
     policy_client: PolicyClient,
     // Infrastructure (for Spawnable)
-    context: Arc<zmq::Context>,
     transport: TransportConfig,
     signing_key: SigningKey,
     /// 9P fid table for filesystem operations.
@@ -364,7 +363,6 @@ impl RegistryService {
     pub async fn new(
         base_dir: impl AsRef<Path>,
         policy_client: PolicyClient,
-        context: Arc<zmq::Context>,
         transport: TransportConfig,
         signing_key: SigningKey,
     ) -> Result<Self> {
@@ -386,7 +384,6 @@ impl RegistryService {
             registry: worker_registry,
             base_dir,
             policy_client,
-            context,
             transport,
             signing_key,
             fid_table,
@@ -743,10 +740,7 @@ impl RegistryService {
             .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
 
         // Create StreamChannel for DH key exchange and publishing
-        let stream_channel = StreamChannel::new(
-            Arc::clone(&self.context),
-            self.signing_key.clone(),
-        );
+        let stream_channel = StreamChannel::new(self.signing_key.clone());
 
         // 10 minutes expiry for clone operations
         let stream_ctx = stream_channel.prepare_stream(client_pub_bytes, 600).await?;
@@ -2769,7 +2763,6 @@ mod tests {
         );
 
         let temp_dir = TempDir::new().expect("test: create temp dir");
-        let context = crate::zmq::global_context();
 
         // Generate keypair for signing/verification
         let (signing_key, _verifying_key) = generate_signing_keypair();
@@ -2803,7 +2796,6 @@ mod tests {
         let registry_service = RegistryService::new(
             temp_dir.path(),
             policy_client,
-            context.clone(),
             registry_transport,
             signing_key.clone(),
         ).await.expect("test: create registry service");

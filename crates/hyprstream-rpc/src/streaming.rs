@@ -44,10 +44,8 @@ use std::task::Poll;
 use anyhow::Result;
 use capnp::message::Builder;
 use capnp::serialize;
-use dashmap::DashMap;
 use futures::{SinkExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::Claims;
@@ -1276,10 +1274,7 @@ impl Stream for StreamHandle {
 ///
 /// ```ignore
 /// // In service initialization
-/// let stream_channel = StreamChannel::new(
-///     zmq_context.clone(),
-///     signing_key.clone(),
-/// );
+/// let stream_channel = StreamChannel::new(signing_key.clone());
 ///
 /// // In request handler
 /// let stream_ctx = stream_channel.prepare_stream(&client_pubkey, 600).await?;
@@ -1291,9 +1286,8 @@ impl Stream for StreamHandle {
 /// publisher.complete(&metadata).await?;
 /// ```
 pub struct StreamChannel {
-    /// ZMQ context (shared)
-    context: Arc<zmq::Context>,
-    /// Ed25519 signing key for stream registration
+    /// Ed25519 signing key for stream authorization (wired into moq publish claims, N7).
+    #[allow(dead_code)]
     signing_key: SigningKey,
     /// ML-DSA-65 signing key for the post-quantum half of the StreamRegister
     /// composite signature. Mirrors `LocalSigner` on the RPC plane so the
@@ -1301,12 +1295,6 @@ pub struct StreamChannel {
     /// generated; the node's persistent ML-DSA identity is wired in via
     /// [`Self::with_pq_key`] once peer attestation lands (#157).
     pq_signing_key: Option<crate::crypto::pq::MlDsaSigningKey>,
-    /// Lazy-initialized async PUSH socket to StreamService (wrapped in Arc for sharing)
-    push_socket: OnceCell<Arc<tokio::sync::Mutex<tmq::push::Push>>>,
-    /// Channel to send subscription requests to the ctrl listener task
-    ctrl_sub_tx: OnceCell<tokio::sync::mpsc::Sender<Vec<u8>>>,
-    /// Active cancel tokens keyed by ctrl_topic, with ctrl_mac_key for verification
-    cancel_tokens: Arc<DashMap<String, (CancellationToken, [u8; 32])>>,
 }
 
 impl StreamChannel {
@@ -1316,15 +1304,11 @@ impl StreamChannel {
     /// StreamRegister composite, mirroring `LocalSigner::new` on the RPC
     /// plane. Use [`Self::with_pq_key`] to install the node's persistent
     /// ML-DSA identity (#157).
-    pub fn new(context: Arc<zmq::Context>, signing_key: SigningKey) -> Self {
+    pub fn new(signing_key: SigningKey) -> Self {
         let (pq_sk, _) = crate::crypto::pq::ml_dsa_generate_keypair();
         Self {
-            context,
             signing_key,
             pq_signing_key: Some(pq_sk),
-            push_socket: OnceCell::new(),
-            ctrl_sub_tx: OnceCell::new(),
-            cancel_tokens: Arc::new(DashMap::new()),
         }
     }
 
@@ -1373,231 +1357,39 @@ impl StreamChannel {
         &self,
         client_ephemeral_pubkey: &[u8],
         expiry_secs: i64,
-        claims: Option<Claims>,
+        _claims: Option<Claims>,
     ) -> Result<StreamContext> {
         // 1. DH key exchange
         let stream_ctx = StreamContext::from_dh(client_ephemeral_pubkey)?;
 
-        if crate::moq_stream::global_moq_origin().is_none() {
-            // ZMQ path: pre-register topics with StreamService and wire the
-            // control-channel SUB socket. On the moq path these are unnecessary
-            // — the moq Origin's `authorize_signer` gate controls access, and
-            // late-join + cancellation are handled natively by moq Track cache
-            // and the CancellationToken below.
-
-            // 2. Pre-authorize data + control topics with StreamService
-            let exp = chrono::Utc::now().timestamp() + expiry_secs;
-            self.pre_authorize(&stream_ctx, exp, claims.clone()).await?;
-            self.register_topic(stream_ctx.ctrl_topic(), exp, claims).await?;
-
-            // 3. Subscribe control channel and register cancel token
-            let ctrl_tx = self.get_or_init_ctrl_sub().await?;
-            ctrl_tx.send(stream_ctx.ctrl_topic().as_bytes().to_vec()).await
-                .map_err(|_| anyhow::anyhow!("ctrl listener closed"))?;
-            self.cancel_tokens.insert(
-                stream_ctx.ctrl_topic().to_owned(),
-                (stream_ctx.cancel_token().clone(), *stream_ctx.ctrl_mac_key()),
-            );
-        }
-
-        // 4. Spawn JWT expiry timeout as universal backstop (both paths)
+        // Spawn JWT expiry timeout as universal backstop.
         let token = stream_ctx.cancel_token().clone();
-        let ctrl_topic = stream_ctx.ctrl_topic().to_owned();
-        let tokens_map = Arc::clone(&self.cancel_tokens);
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(expiry_secs.max(0) as u64)).await;
             token.cancel();
-            tokens_map.remove(&ctrl_topic);
         });
 
         Ok(stream_ctx)
     }
 
-    /// Pre-authorize a stream with StreamService.
+    /// Register a topic with the stream plane.
     ///
-    /// Sends a signed StreamRegister message to StreamService so the topic
-    /// is ready for subscriptions before the client tries to subscribe.
-    async fn pre_authorize(&self, ctx: &StreamContext, expiry: i64, claims: Option<Claims>) -> Result<()> {
-        self.register_topic(ctx.topic(), expiry, claims).await?;
-        tracing::debug!(
-            stream_id = %ctx.stream_id(),
-            topic = %ctx.topic(),
-            expiry = expiry,
-            "Stream pre-authorized with StreamService"
-        );
+    /// No-op on the moq path — topics are published lazily by
+    /// `MoqStreamPublisher` on first frame; no pre-registration is needed.
+    /// Kept for API compatibility with callers such as `NotificationService`.
+    pub async fn register_topic(&self, _topic: &str, _expiry: i64, _claims: Option<Claims>) -> Result<()> {
         Ok(())
     }
 
-    /// Register a topic with StreamService.
-    ///
-    /// This is a low-level method that sends a StreamRegister message.
-    /// For DH-based streams, use `prepare_stream()` instead.
-    ///
-    /// Use cases:
-    /// - Re-authorizing an existing stream by ID
-    /// - Legacy stream authorization
-    pub async fn register_topic(&self, topic: &str, expiry: i64, claims: Option<Claims>) -> Result<()> {
-        // moq path: topic is published lazily by MoqStreamPublisher on first frame; no pre-registration needed.
-        if crate::moq_stream::global_moq_origin().is_some() {
-            return Ok(());
-        }
-
-        let register_msg = build_stream_register_envelope(
-            topic,
-            expiry,
-            &self.signing_key,
-            self.pq_signing_key.as_ref(),
-            claims,
-        );
-
-        let socket_arc = self.get_or_init_socket().await?;
-        let mut socket = socket_arc.lock().await;
-
-        let multipart = tmq::Multipart::from(vec![register_msg]);
-        socket.send(multipart).await
-            .map_err(|e| anyhow::anyhow!("Failed to send stream registration: {}", e))?;
-
-        Ok(())
-    }
-
-    /// Get or initialize the async PUSH socket to StreamService.
-    ///
-    /// Returns an Arc to the socket mutex, initializing it on first call.
-    async fn get_or_init_socket(&self) -> Result<Arc<tokio::sync::Mutex<tmq::push::Push>>> {
-        let socket_arc = self.push_socket.get_or_try_init(|| async {
-            // Connect to StreamService's PUSH endpoint
-            let endpoint = endpoint_registry()
-                .endpoint("streams", SocketKind::Push)
-                .to_zmq_string();
-
-            let socket = tmq::push::push(&self.context)
-                .set_sndtimeo(1000)
-                .connect(&endpoint)
-                .map_err(|e| anyhow::anyhow!("Failed to connect to StreamService: {}", e))?;
-
-            tracing::debug!(endpoint = %endpoint, "StreamChannel connected to StreamService (async)");
-
-            Ok::<_, anyhow::Error>(Arc::new(tokio::sync::Mutex::new(socket)))
-        }).await?;
-        Ok(Arc::clone(socket_arc))
-    }
-
-    /// Get or initialize the control channel subscription sender.
-    ///
-    /// The SUB socket is owned exclusively by the ctrl listener task.
-    /// Subscription requests are sent via the returned mpsc channel,
-    /// avoiding the deadlock that occurred when a Mutex was held across `.await`.
-    async fn get_or_init_ctrl_sub(&self) -> Result<tokio::sync::mpsc::Sender<Vec<u8>>> {
-        let tx = self.ctrl_sub_tx.get_or_try_init(|| async {
-            let endpoint = endpoint_registry()
-                .endpoint("streams", SocketKind::Sub)
-                .to_zmq_string();
-
-            let without_topic = tmq::subscribe::subscribe(&self.context)
-                .connect(&endpoint)
-                .map_err(|e| anyhow::anyhow!("Failed to connect ctrl SUB: {}", e))?;
-
-            // Subscribe to a NUL-prefixed topic that will never match real hex topics
-            let sub = without_topic.subscribe(b"\x00__ctrl_init__")
-                .map_err(|e| anyhow::anyhow!("Failed to init ctrl SUB: {}", e))?;
-
-            // Spawn the control listener task — it owns the socket exclusively
-            let tx = self.spawn_ctrl_listener(sub);
-
-            Ok::<_, anyhow::Error>(tx)
-        }).await?;
-        Ok(tx.clone())
-    }
-
-    /// Spawn a background task that owns the SUB socket and listens for control messages.
-    ///
-    /// Subscription requests arrive via the returned mpsc channel, so the socket
-    /// is never shared behind a Mutex — eliminating the deadlock that occurred when
-    /// the listener held the lock across `sub.next().await`.
-    fn spawn_ctrl_listener(
-        &self,
-        mut sub: tmq::subscribe::Subscribe,
-    ) -> tokio::sync::mpsc::Sender<Vec<u8>> {
-        use futures::StreamExt;
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-        let tokens = Arc::clone(&self.cancel_tokens);
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    Some(topic_bytes) = rx.recv() => {
-                        if let Err(e) = sub.subscribe(&topic_bytes) {
-                            tracing::warn!("ctrl subscribe failed: {}", e);
-                        }
-                    }
-                    msg = sub.next() => {
-                        let multipart = match msg {
-                            Some(Ok(m)) => m,
-                            Some(Err(e)) => {
-                                tracing::warn!("ctrl SUB error: {}", e);
-                                continue;
-                            }
-                            None => break, // socket closed
-                        };
-
-                        // Wire format: [ctrl_topic, capnp, mac]
-                        if multipart.len() < 3 {
-                            tracing::warn!("ctrl message missing frames (got {})", multipart.len());
-                            continue;
-                        }
-                        let topic = String::from_utf8_lossy(&multipart[0]);
-                        let capnp_data = &multipart[1];
-                        let mac_bytes = &multipart[2];
-
-                        // Look up the token + mac_key for this topic
-                        if let Some(entry) = tokens.get(topic.as_ref()) {
-                            let (ref token, ref ctrl_mac_key) = *entry;
-
-                            // Verify MAC before acting on the control message
-                            let expected_mac = keyed_mac_truncated(ctrl_mac_key, capnp_data);
-                            if subtle::ConstantTimeEq::ct_eq(&mac_bytes[..], &expected_mac[..]).into() {
-                                tracing::debug!(ctrl_topic = %topic, "control cancel received (MAC verified)");
-                                token.cancel();
-                                drop(entry);
-                                tokens.remove(topic.as_ref());
-                            } else {
-                                tracing::warn!(ctrl_topic = %topic, "control message MAC verification failed — ignoring");
-                            }
-                        }
-                    }
-                }
-            }
-        });
-        tx
-    }
-
-    /// Create a publisher for the given stream context.
-    ///
-    /// The publisher owns a reference to the socket and can be used in async contexts
-    /// without lifetime concerns.
-    ///
-    /// # Arguments
-    /// * `ctx` - Stream context from `prepare_stream()`
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let mut publisher = stream_channel.publisher(&stream_ctx).await?;
-    /// publisher.publish_progress("cloning", 0, 1).await?;
-    /// // ... perform operation ...
-    /// publisher.complete(&result_bytes).await?;
-    /// ```
     /// Create a publisher for a stream context.
     ///
-    /// Returns an `AnyStreamPublisher` that dispatches to the moq-lite origin
-    /// when one is globally registered (#220), otherwise falls back to ZMQ PUSH.
+    /// Fails loudly if the process-global moq stream origin has not been
+    /// initialized (server not started). In production the `streams` factory
+    /// always calls `init_global_moq_origin` before any service handles requests.
     pub async fn publisher(&self, ctx: &StreamContext) -> Result<crate::moq_stream::AnyStreamPublisher> {
-        if let Some(origin) = crate::moq_stream::global_moq_origin() {
-            let moq_pub = origin.publisher(ctx)?;
-            return Ok(crate::moq_stream::AnyStreamPublisher::Moq(moq_pub));
-        }
-        let socket_arc = self.get_or_init_socket().await?;
-        Ok(crate::moq_stream::AnyStreamPublisher::Zmq(StreamPublisher::new(socket_arc, ctx)))
+        let origin = crate::moq_stream::global_moq_origin()
+            .ok_or_else(|| anyhow::anyhow!("no moq stream origin — server not initialized"))?;
+        Ok(crate::moq_stream::AnyStreamPublisher::Moq(origin.publisher(ctx)?))
     }
 
     /// Run a streaming operation with framework-guaranteed terminal frame.
@@ -1655,30 +1447,6 @@ impl StreamChannel {
             [0u8; 32], // No server pubkey needed for notification delivery
         );
         self.publisher(&ctx).await
-    }
-
-    /// Create a dedicated PUSH socket for a high-frequency publisher.
-    ///
-    /// The returned socket has `SNDTIMEO=0` (non-blocking) and the specified HWM.
-    /// Used for TUI frame loops and other publishers that need `try_publish_data()`.
-    pub fn create_publisher_socket(&self, config: &StreamPublisherConfig) -> Result<tmq::push::Push> {
-        let endpoint = endpoint_registry()
-            .endpoint("streams", SocketKind::Push)
-            .to_zmq_string();
-
-        let socket = tmq::push::push(&self.context)
-            .set_sndhwm(config.sndhwm)
-            .set_sndtimeo(0)  // Non-blocking for try_publish_data
-            .connect(&endpoint)
-            .map_err(|e| anyhow::anyhow!("Failed to create dedicated PUSH socket: {}", e))?;
-
-        tracing::debug!(
-            endpoint = %endpoint,
-            sndhwm = config.sndhwm,
-            "Created dedicated publisher socket"
-        );
-
-        Ok(socket)
     }
 
     /// Get the stream endpoint for clients to subscribe to.
@@ -1948,67 +1716,6 @@ pub fn encode_stream_block(
     Ok(capnp_bytes)
 }
 
-/// Build a StreamRegister message wrapped in SignedEnvelope.
-///
-/// Used by `StreamChannel::pre_authorize()` to register streams with StreamService.
-fn build_stream_register_envelope(
-    topic: &str,
-    expiry: i64,
-    signing_key: &SigningKey,
-    pq_signing_key: Option<&crate::crypto::pq::MlDsaSigningKey>,
-    _claims: Option<Claims>,
-) -> Vec<u8> {
-    use crate::common_capnp;
-    use crate::envelope::{RequestEnvelope, SignedEnvelope};
-    use crate::ToCapnp;
-
-    // Build StreamRegister message
-    let mut inner_msg = Builder::new_default();
-    {
-        let mut register = inner_msg.init_root::<crate::streaming_capnp::stream_register::Builder>();
-        register.set_topic(topic);
-        register.set_exp(expiry);
-    }
-
-    let mut inner_bytes = Vec::new();
-    // Vec write cannot fail for memory, and the capnp message is well-formed
-    if let Err(e) = serialize::write_message(&mut inner_bytes, &inner_msg) {
-        tracing::error!("Failed to serialize StreamRegister: {e}");
-        return Vec::new();
-    }
-
-    // Wrap in SignedEnvelope
-    let envelope = RequestEnvelope::new(inner_bytes);
-    // Claims are no longer carried in the envelope — authorization is via JWT/Authorization field
-
-    // Sign under the same policy mechanism as the RPC plane (#161): Hybrid
-    // (EdDSA + ML-DSA-65 SNS composite) when a PQ key is present, else
-    // Classical. This removes the prior unconditional `new_signed` (Classical)
-    // that the StreamService verifier — enforcing the global Hybrid policy —
-    // would either reject or accept as a strict downgrade vs RPC.
-    let policy = if pq_signing_key.is_some() {
-        crate::crypto::CryptoPolicy::Hybrid
-    } else {
-        crate::crypto::CryptoPolicy::Classical
-    };
-    let signed =
-        SignedEnvelope::new_signed_with_policy(envelope, signing_key, pq_signing_key, policy);
-
-    let mut msg = Builder::new_default();
-    {
-        let mut builder = msg.init_root::<common_capnp::signed_envelope::Builder>();
-        signed.write_to(&mut builder);
-    }
-
-    let mut bytes = Vec::new();
-    // Vec write cannot fail for memory, and the capnp message is well-formed
-    if let Err(e) = serialize::write_message(&mut bytes, &msg) {
-        tracing::error!("Failed to serialize SignedEnvelope: {e}");
-        return Vec::new();
-    }
-    bytes
-}
-
 /// Convert a public key to 32 bytes for derive_stream_keys.
 ///
 /// - If 32 bytes: use as-is (Ristretto255)
@@ -2030,6 +1737,49 @@ fn pubkey_to_32(pubkey: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn build_stream_register_envelope(
+        topic: &str,
+        expiry: i64,
+        signing_key: &SigningKey,
+        pq_signing_key: Option<&crate::crypto::pq::MlDsaSigningKey>,
+        _claims: Option<Claims>,
+    ) -> Vec<u8> {
+        use crate::common_capnp;
+        use crate::envelope::{RequestEnvelope, SignedEnvelope};
+        use crate::ToCapnp;
+
+        let mut inner_msg = Builder::new_default();
+        {
+            let mut register = inner_msg.init_root::<crate::streaming_capnp::stream_register::Builder>();
+            register.set_topic(topic);
+            register.set_exp(expiry);
+        }
+        let mut inner_bytes = Vec::new();
+        if let Err(e) = serialize::write_message(&mut inner_bytes, &inner_msg) {
+            tracing::error!("Failed to serialize StreamRegister: {e}");
+            return Vec::new();
+        }
+        let envelope = RequestEnvelope::new(inner_bytes);
+        let policy = if pq_signing_key.is_some() {
+            crate::crypto::CryptoPolicy::Hybrid
+        } else {
+            crate::crypto::CryptoPolicy::Classical
+        };
+        let signed =
+            SignedEnvelope::new_signed_with_policy(envelope, signing_key, pq_signing_key, policy);
+        let mut msg = Builder::new_default();
+        {
+            let mut builder = msg.init_root::<common_capnp::signed_envelope::Builder>();
+            signed.write_to(&mut builder);
+        }
+        let mut bytes = Vec::new();
+        if let Err(e) = serialize::write_message(&mut bytes, &msg) {
+            tracing::error!("Failed to serialize SignedEnvelope: {e}");
+            return Vec::new();
+        }
+        bytes
+    }
 
     /// #161: a StreamRegister built with a PQ key is a Hybrid (SNS) composite
     /// that verifies under the global Hybrid policy when the signer's ML-DSA

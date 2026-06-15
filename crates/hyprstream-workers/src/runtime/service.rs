@@ -103,7 +103,6 @@ impl WorkerService {
         pool_config: PoolConfig,
         backend: Arc<dyn super::backend::SandboxBackend>,
         rafs_store: Arc<RafsStore>,
-        context: Arc<zmq::Context>,
         transport: TransportConfig,
         signing_key: SigningKey,
     ) -> AnyhowResult<Self> {
@@ -112,9 +111,7 @@ impl WorkerService {
         // Create event publisher for worker lifecycle events
         let event_publisher = EventPublisher::new("worker")?;
 
-        let stream_channel = Arc::new(StreamChannel::new(Arc::clone(&context), signing_key.clone()));
-
-        let _ = context; // consumed by StreamChannel::new above; not retained
+        let stream_channel = Arc::new(StreamChannel::new(signing_key.clone()));
         Ok(Self {
             sandbox_pool,
             rafs_store,
@@ -834,11 +831,20 @@ impl WorkerService {
         let stream_id_for_cleanup = stream_id.clone();
         let sc = Arc::clone(&self.stream_channel);
 
+        let moq_uds_path = hyprstream_rpc::moq_stream::global_moq_uds_path()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let moq_broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()
+            .map(|o| o.broadcast_path(stream_ctx.topic()))
+            .unwrap_or_default();
+
         let stream_info = StreamInfo {
             stream_id,
             endpoint: stream_endpoint,
             server_pubkey: *stream_ctx.server_pubkey(),
             qos: stream_ctx.qos().clone(),
+            moq_uds_path,
+            moq_broadcast_path,
         };
 
         // Continuation: spawns FD streaming task AFTER REP is sent to client
@@ -1374,15 +1380,13 @@ mod tests {
             ..PoolConfig::default()
         };
 
-        // Create a zmq context for event publishing
-        let context = Arc::new(zmq::Context::new());
         let transport = TransportConfig::inproc("test-worker-service");
         let (signing_key, _verifying_key) = generate_signing_keypair();
 
         let backend: Arc<dyn crate::runtime::backend::SandboxBackend> = Arc::new(
             crate::runtime::kata_backend::KataBackend::new(image_config, Arc::clone(&rafs_store)),
         );
-        let service = WorkerService::new(pool_config, backend, rafs_store, context, transport, signing_key)?;
+        let service = WorkerService::new(pool_config, backend, rafs_store, transport, signing_key)?;
         Ok((service, temp_dir))
     }
 

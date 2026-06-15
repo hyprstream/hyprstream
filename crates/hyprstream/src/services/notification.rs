@@ -308,13 +308,9 @@ impl NotificationService {
     /// Create a new notification service.
     pub fn new(
         signing_key: Arc<SigningKey>,
-        context: Arc<zmq::Context>,
         transport: TransportConfig,
     ) -> Self {
-        let stream_channel = StreamChannel::new(
-            Arc::clone(&context),
-            (*signing_key).clone(),
-        );
+        let stream_channel = StreamChannel::new((*signing_key).clone());
 
         let subscribers = Arc::new(RwLock::new(SubscriberRegistry::new()));
 
@@ -329,8 +325,6 @@ impl NotificationService {
                 }
             }
         });
-
-        let _ = context; // consumed by StreamChannel::new above; not retained
         Self {
             subscribers,
             pending_intents: Arc::new(RwLock::new(HashMap::new())),

@@ -64,14 +64,11 @@ pub struct MetricsService {
 impl MetricsService {
     pub fn new(
         orchestrator: Arc<QueryOrchestrator>,
-        context: Arc<zmq::Context>,
         transport: TransportConfig,
         signing_key: SigningKey,
         policy_client: PolicyClient,
     ) -> Self {
-        let stream_channel = StreamChannel::new(Arc::clone(&context), signing_key.clone());
-
-        let _ = context; // consumed by StreamChannel::new above; not retained
+        let stream_channel = StreamChannel::new(signing_key.clone());
         Self {
             inner: Arc::new(MetricsInner {
                 orchestrator,
@@ -651,8 +648,6 @@ mod tests {
         MetricsClient, ViewSpec,
     };
     use crate::services::{PolicyClient, PolicyService};
-    use crate::zmq::global_context;
-
     /// Spin up an in-memory MetricsService and return a typed client + InprocManager handle.
     async fn start_metrics_service(
         tag: &str,
@@ -666,7 +661,6 @@ mod tests {
             },
         );
         let (signing_key, _vk) = generate_signing_keypair();
-        let context = global_context();
 
         // Permissive policy service so authorize() always passes.
         let policy_tag = format!("test-policy-{tag}");
@@ -723,7 +717,6 @@ mod tests {
         let svc_tag = format!("test-metrics-{tag}");
         let service = MetricsService::new(
             orchestrator,
-            context.clone(),
             TransportConfig::inproc(&svc_tag),
             signing_key.clone(),
             policy_client,

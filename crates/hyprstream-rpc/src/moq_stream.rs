@@ -399,35 +399,31 @@ impl MoqStreamPublisher {
 }
 
 // ============================================================================
-// AnyStreamPublisher — unified publish API over ZMQ or moq-lite paths (#220)
+// AnyStreamPublisher — moq-lite publish API
 // ============================================================================
 
-/// Unified publisher that dispatches to either the ZMQ or moq-lite streaming
-/// plane. The API surface matches `StreamPublisher` exactly so all call sites
-/// that receive a publisher via closure (e.g. `StreamChannel::run_stream`) work
-/// unchanged regardless of which transport is active.
+/// Publisher for the moq-lite streaming plane.
+///
+/// All call sites that receive a publisher via closure (e.g.
+/// `StreamChannel::run_stream`) use this type; the ZMQ PUSH variant was
+/// removed in the N4 hard cutover (#138/#213).
 pub enum AnyStreamPublisher {
-    /// ZMQ PUSH path (legacy, kept behind `StreamService::with_zmq_fallback`).
-    Zmq(crate::streaming::StreamPublisher),
-    /// moq-lite in-process path (M2a primary).
+    /// moq-lite in-process path.
     Moq(MoqStreamPublisher),
 }
 
 impl AnyStreamPublisher {
-    /// Publish binary data. For the moq path the rate hint is ignored (each
-    /// call maps 1:1 to one moq Group; batching is a ZMQ-path concern).
+    /// Publish binary data.
     pub async fn publish_data(&mut self, data: &[u8]) -> Result<()> {
         match self {
-            Self::Zmq(p) => p.publish_data(data).await,
             Self::Moq(p) => p.publish_data(data).await,
         }
     }
 
-    /// Publish binary data with adaptive-batching rate hint (ZMQ path only).
-    /// On the moq path the rate is ignored and data is published immediately.
+    /// Publish binary data with a rate hint (ignored on the moq path; each
+    /// call maps 1:1 to one moq Group).
     pub async fn publish_data_with_rate(&mut self, data: &[u8], rate: f32) -> Result<()> {
         match self {
-            Self::Zmq(p) => p.publish_data_with_rate(data, rate).await,
             Self::Moq(p) => {
                 let _ = rate;
                 p.publish_data(data).await
@@ -444,7 +440,6 @@ impl AnyStreamPublisher {
     /// Publish an error payload (terminal).
     pub async fn publish_error(&mut self, message: &str) -> Result<()> {
         match self {
-            Self::Zmq(p) => p.publish_error(message).await,
             Self::Moq(p) => p.publish_error(message).await,
         }
     }
@@ -452,7 +447,6 @@ impl AnyStreamPublisher {
     /// Complete the stream with app-specific metadata (consumes self).
     pub async fn complete(self, metadata: &[u8]) -> Result<()> {
         match self {
-            Self::Zmq(p) => p.complete(metadata).await,
             Self::Moq(p) => p.complete(metadata).await,
         }
     }
@@ -460,23 +454,20 @@ impl AnyStreamPublisher {
     /// Complete the stream without consuming self (for use inside `run_stream`).
     pub async fn complete_ref(&mut self, metadata: &[u8]) -> Result<()> {
         match self {
-            Self::Zmq(p) => p.complete_ref(metadata).await,
             Self::Moq(p) => p.complete_ref(metadata).await,
         }
     }
 
-    /// Flush any pending batched data (ZMQ path). No-op on the moq path.
+    /// Flush — no-op on the moq path (each block is published immediately).
     pub async fn flush(&mut self) -> Result<()> {
         match self {
-            Self::Zmq(p) => p.flush().await,
-            Self::Moq(_) => Ok(()), // moq publishes each block immediately
+            Self::Moq(_) => Ok(()),
         }
     }
 
     /// The opaque topic this publisher serves.
     pub fn topic(&self) -> &str {
         match self {
-            Self::Zmq(p) => p.topic(),
             Self::Moq(p) => p.topic(),
         }
     }
@@ -484,7 +475,6 @@ impl AnyStreamPublisher {
     /// Whether a terminal frame (Error/Complete) has been sent.
     pub fn is_terminated(&self) -> bool {
         match self {
-            Self::Zmq(p) => p.is_terminated(),
             Self::Moq(p) => p.is_terminated(),
         }
     }
@@ -492,21 +482,141 @@ impl AnyStreamPublisher {
     /// Whether the stream has been cancelled via the `CancellationToken`.
     pub fn is_cancelled(&self) -> bool {
         match self {
-            Self::Zmq(p) => p.is_cancelled(),
             Self::Moq(p) => p.is_cancelled(),
         }
     }
 
-    /// Non-blocking publish with HWM back-pressure detection (ZMQ path only).
-    ///
-    /// On the moq path every publish succeeds immediately (no HWM concept) and
-    /// always returns `Ok(true)`. The `rate` hint is ignored on the moq path.
+    /// Non-blocking publish — on the moq path every publish succeeds immediately
+    /// (no HWM concept) and always returns `Ok(true)`. The `rate` hint is ignored.
     pub async fn try_publish_data(&mut self, data: &[u8], rate: f32) -> Result<bool> {
         match self {
-            Self::Zmq(p) => p.try_publish_data(data, rate).await,
             Self::Moq(p) => {
                 let _ = rate;
                 p.publish_data(data).await.map(|_| true)
+            }
+        }
+    }
+}
+
+/// moq stream consumer handle for MCP tool calls and other async consumers.
+///
+/// Connects to the moq UDS plane, subscribes to the broadcast, verifies the
+/// chained-HMAC frames, and delivers [`crate::streaming::StreamPayload`]s via
+/// an internal channel. Mirrors the `StreamHandle` interface (same `recv_next()`
+/// signature) so callers need no code change beyond the constructor.
+pub struct MoqStreamHandle {
+    rx: tokio::sync::mpsc::Receiver<anyhow::Result<crate::streaming::StreamPayload>>,
+}
+
+impl MoqStreamHandle {
+    /// Construct a handle and immediately spawn the background receive task.
+    ///
+    /// The task connects to the UDS moq server, subscribes to `broadcast_path`,
+    /// verifies frames with the chained HMAC (derived from `mac_key` + `topic`),
+    /// and forwards payloads to the channel. Errors and end-of-stream close the
+    /// channel so `recv_next()` returns `Err` or `Ok(None)` respectively.
+    pub fn new(
+        uds_path: String,
+        broadcast_path: String,
+        mac_key: [u8; 32],
+        topic: String,
+    ) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<crate::streaming::StreamPayload>>(64);
+        tokio::spawn(moq_stream_handle_task(uds_path, broadcast_path, mac_key, topic, tx));
+        Self { rx }
+    }
+
+    /// Receive the next stream payload.
+    ///
+    /// Returns `Ok(None)` when the stream ends cleanly, `Err` on a stream error.
+    pub async fn recv_next(&mut self) -> anyhow::Result<Option<crate::streaming::StreamPayload>> {
+        match self.rx.recv().await {
+            Some(Ok(p)) => Ok(Some(p)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+}
+
+async fn moq_stream_handle_task(
+    uds_path: String,
+    broadcast_path: String,
+    mac_key: [u8; 32],
+    topic: String,
+    tx: tokio::sync::mpsc::Sender<anyhow::Result<crate::streaming::StreamPayload>>,
+) {
+    use crate::streaming::StreamVerifier;
+    use crate::transport::uds_session::{connect_uds, PLANE_MOQ};
+    use moq_net::{Client as MoqClient, Origin, Track};
+
+    let session = match connect_uds(&uds_path, PLANE_MOQ).await {
+        Ok(s) => s,
+        Err(e) => { let _ = tx.send(Err(anyhow!("moq UDS connect {uds_path}: {e}"))).await; return; }
+    };
+    let client_origin = Origin::random().produce();
+    let client_consumer = client_origin.consume();
+    let moq_client = MoqClient::new().with_consume(client_origin);
+    let _session = match moq_client.connect(session).await {
+        Ok(s) => s,
+        Err(e) => { let _ = tx.send(Err(anyhow!("moq handshake: {e}"))).await; return; }
+    };
+    let bc = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client_consumer.announced_broadcast(&broadcast_path),
+    ).await {
+        Ok(Some(bc)) => bc,
+        Ok(None) => {
+            let _ = tx.send(Err(anyhow!("broadcast {broadcast_path} not announced"))).await;
+            return;
+        }
+        Err(_) => {
+            let _ = tx.send(Err(anyhow!("timeout waiting for broadcast {broadcast_path}"))).await;
+            return;
+        }
+    };
+    let mut track = match bc.subscribe_track(&Track::new(STREAM_TRACK)) {
+        Ok(t) => t,
+        Err(e) => { let _ = tx.send(Err(anyhow!("subscribe_track: {e}"))).await; return; }
+    };
+    let mut verifier = StreamVerifier::new(mac_key, topic.clone());
+    loop {
+        let mut group = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            track.next_group(),
+        ).await {
+            Ok(Ok(Some(g))) => g,
+            Ok(Ok(None)) | Err(_) => break, // end of track or timeout
+            Ok(Err(e)) => {
+                let _ = tx.send(Err(anyhow!("moq next_group: {e}"))).await;
+                break;
+            }
+        };
+        let frame: bytes::Bytes = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            group.read_frame(),
+        ).await {
+            Ok(Ok(Some(f))) => f,
+            _ => continue,
+        };
+        match verify_moq_frame(&mut verifier, &topic, &frame) {
+            Ok(payloads) => {
+                for p in payloads {
+                    let is_terminal = matches!(
+                        p,
+                        crate::streaming::StreamPayload::Complete(_)
+                            | crate::streaming::StreamPayload::Error(_)
+                    );
+                    if tx.send(Ok(p)).await.is_err() {
+                        return;
+                    }
+                    if is_terminal {
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+                return;
             }
         }
     }

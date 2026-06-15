@@ -1871,7 +1871,7 @@ pub(crate) async fn run_frame_loop(
     let mut heartbeat_at = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
 
     // StreamChannel for creating publisher sockets (ZMQ or moq, auto-dispatched).
-    let stream_channel = StreamChannel::new(crate::zmq::global_context(), signing_key);
+    let stream_channel = StreamChannel::new(signing_key);
 
     info!(session_id, "Frame loop started");
 
