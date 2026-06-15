@@ -67,6 +67,13 @@ pub async fn serve_bridged(
             let _ = std::fs::remove_file(path);
             let listener = tokio::net::UnixListener::bind(path)
                 .map_err(|e| anyhow!("bind uds {}: {e}", path.display()))?;
+            // Restrict to owner-only access (#207): world-accessible sockets would
+            // let any local process connect, undermining same-host trust isolation.
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                    .map_err(|e| anyhow!("set uds perms {}: {e}", path.display()))?;
+            }
             signal_ready(on_ready);
             run_uds(listener, processor, signing_key, shutdown).await
         }

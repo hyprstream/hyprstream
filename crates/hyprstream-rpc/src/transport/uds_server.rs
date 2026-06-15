@@ -145,7 +145,37 @@ impl UdsRpcServer {
                 }
                 accepted = self.listener.accept() => {
                     let stream = match accepted {
-                        Ok((stream, _addr)) => stream,
+                        Ok((stream, _addr)) => {
+                            // SECURITY (#207): enforce same-uid-only access via
+                            // SO_PEERCRED. The socket is already 0o700 so only the
+                            // daemon's user can connect, but kernel-level peer-cred
+                            // verification adds defense-in-depth against fd-passing
+                            // or capability tricks that bypass filesystem permissions.
+                            #[cfg(target_os = "linux")]
+                            {
+                                use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+                                let daemon_uid = nix::unistd::getuid();
+                                match getsockopt(&stream, PeerCredentials) {
+                                    Ok(cred) if cred.uid() == daemon_uid.as_raw() => {}
+                                    Ok(cred) => {
+                                        tracing::warn!(
+                                            peer_uid = cred.uid(),
+                                            daemon_uid = daemon_uid.as_raw(),
+                                            "uds-rpc: peer uid mismatch, rejecting connection"
+                                        );
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "uds-rpc: SO_PEERCRED failed, rejecting connection"
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                            stream
+                        }
                         Err(e) => {
                             tracing::debug!(error = %e, "uds-rpc: listener accept error");
                             continue;
