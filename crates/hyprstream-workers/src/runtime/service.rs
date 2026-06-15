@@ -815,7 +815,7 @@ impl WorkerService {
         let stream_ctx = self.stream_channel
             .prepare_stream_with_claims(&client_pubkey, 600, claims).await
             .map_err(|e| anyhow::anyhow!("Stream preparation failed: {}", e))?
-            .with_policy(hyprstream_rpc::stream_info::StreamPolicy::pipe());
+            .with_qos_preset::<hyprstream_rpc::stream_info::Pipe>();
 
         let stream_id = stream_ctx.stream_id().to_owned();
         let stream_endpoint = self.stream_channel.stream_endpoint();
@@ -839,7 +839,7 @@ impl WorkerService {
             stream_id,
             endpoint: stream_endpoint,
             server_pubkey: *stream_ctx.server_pubkey(),
-            policy: stream_ctx.policy().clone(),
+            qos: stream_ctx.qos().clone(),
         };
 
         // Continuation: spawns FD streaming task AFTER REP is sent to client

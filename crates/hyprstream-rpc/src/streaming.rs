@@ -471,8 +471,8 @@ pub struct StreamContext {
     ctrl_mac_key: [u8; 32],
     /// Cancellation token — fired by control listener or JWT expiry
     cancel_token: CancellationToken,
-    /// Delivery policy advertised in StreamInfo and honoured by MoqStreamPublisher (#169).
-    policy: crate::stream_info::StreamPolicy,
+    /// QoS options advertised in StreamInfo and honoured by MoqStreamPublisher (#169).
+    qos: crate::stream_info::StreamOpt,
 }
 
 impl StreamContext {
@@ -491,7 +491,7 @@ impl StreamContext {
             ctrl_topic: String::new(),
             ctrl_mac_key: [0u8; 32],
             cancel_token: CancellationToken::new(),
-            policy: crate::stream_info::StreamPolicy::default(),
+            qos: crate::stream_info::StreamOpt::default(),
         }
     }
 
@@ -527,7 +527,7 @@ impl StreamContext {
             ctrl_topic: keys.ctrl_topic,
             ctrl_mac_key: *keys.ctrl_mac_key,
             cancel_token: CancellationToken::new(),
-            policy: crate::stream_info::StreamPolicy::default(),
+            qos: crate::stream_info::StreamOpt::default(),
         })
     }
 
@@ -566,15 +566,23 @@ impl StreamContext {
         &self.cancel_token
     }
 
-    /// Set the delivery policy for this stream (#169).
-    pub fn with_policy(mut self, policy: crate::stream_info::StreamPolicy) -> Self {
-        self.policy = policy;
+    /// Set the QoS options for this stream using a typed preset (#169).
+    ///
+    /// Call with a preset ZST: `.with_qos_preset::<Job>()`, `.with_qos_preset::<Pipe>()`.
+    pub fn with_qos_preset<Q: crate::stream_info::StreamOptPreset>(mut self) -> Self {
+        self.qos = Q::stream_opt();
         self
     }
 
-    /// Get the delivery policy for this stream (#169).
-    pub fn policy(&self) -> &crate::stream_info::StreamPolicy {
-        &self.policy
+    /// Set the QoS options for this stream from a runtime value (#169).
+    pub fn with_qos(mut self, qos: crate::stream_info::StreamOpt) -> Self {
+        self.qos = qos;
+        self
+    }
+
+    /// Get the QoS options for this stream (#169).
+    pub fn qos(&self) -> &crate::stream_info::StreamOpt {
+        &self.qos
     }
 }
 
@@ -1063,7 +1071,7 @@ impl StreamHandle {
         server_pubkey: &[u8],
         client_secret: &DhSecret,
         client_pubkey: &[u8],
-        policy: crate::stream_info::StreamPolicy,
+        qos: crate::stream_info::StreamOpt,
     ) -> Result<Self> {
         // Perform DH
         let server_pub = DhPublic::from_slice(server_pubkey)
@@ -1092,7 +1100,7 @@ impl StreamHandle {
             "Subscribed to E2E authenticated stream"
         );
 
-        let verifier = StreamVerifier::with_policy(*keys.mac_key, keys.topic.clone(), policy.into());
+        let verifier = StreamVerifier::with_policy(*keys.mac_key, keys.topic.clone(), qos.into());
 
         // Set up control channel PUSH socket (consumer → StreamService → producer)
         let ctrl_push = context.socket(zmq::PUSH).ok();
@@ -1830,7 +1838,7 @@ fn stream_admission_semaphore(service_name: &str) -> std::sync::Arc<tokio::sync:
 /// longer threaded through every transport's request/response path. This is the
 /// M1 shape; in M2 the streaming transport (`StreamChannel`) moves to a
 /// service-owned moq broadcast and this coarse per-service cap is replaced by
-/// the StreamPolicy backpressure axes (#134).
+/// the StreamOpt backpressure axes (#134).
 ///
 /// `service_name` keys the per-service permit pool (see
 /// [`DEFAULT_MAX_CONCURRENT_STREAMS_PER_SERVICE`] and

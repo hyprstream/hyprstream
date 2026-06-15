@@ -833,7 +833,7 @@ impl InferenceService {
         let stream_ctx = stream_channel
             .prepare_stream_with_claims(client_pub_bytes, expiry_secs, claims)
             .await?
-            .with_policy(hyprstream_rpc::stream_info::StreamPolicy::job());
+            .with_qos_preset::<hyprstream_rpc::stream_info::Job>();
 
         debug!(
             stream_id = %stream_ctx.stream_id(),
@@ -1288,7 +1288,7 @@ impl InferenceService {
         let stream_ctx = stream_channel
             .prepare_stream_with_claims(client_pub_ref, expiry_secs, claims)
             .await?
-            .with_policy(hyprstream_rpc::stream_info::StreamPolicy::job());
+            .with_qos_preset::<hyprstream_rpc::stream_info::Job>();
 
         let stream_id = stream_ctx.stream_id().to_owned();
         let server_pubkey = *stream_ctx.server_pubkey();
@@ -1300,7 +1300,7 @@ impl InferenceService {
             stream_id,
             endpoint: stream_sub_endpoint,
             server_pubkey,
-            policy: stream_ctx.policy().clone(),
+            qos: stream_ctx.qos().clone(),
         };
 
         Ok((stream_info, stream_ctx))
@@ -2148,7 +2148,7 @@ impl InferenceHandler for InferenceService {
             stream_id,
             endpoint: stream_sub_endpoint,
             server_pubkey,
-            policy: hyprstream_rpc::stream_info::StreamPolicy::job(),
+            qos: <hyprstream_rpc::stream_info::Job as hyprstream_rpc::stream_info::StreamOptPreset>::stream_opt(),
         };
 
         // Build continuation that executes the stream after REP is sent.
@@ -2345,7 +2345,7 @@ impl InferenceHandler for InferenceService {
         let stream_ctx = stream_channel
             .prepare_stream_with_claims(client_pub_ref, expiry_secs, claims)
             .await?
-            .with_policy(hyprstream_rpc::stream_info::StreamPolicy::job());
+            .with_qos_preset::<hyprstream_rpc::stream_info::Job>();
 
         let stream_id = stream_ctx.stream_id().to_owned();
         let server_pubkey = *stream_ctx.server_pubkey();
@@ -2357,7 +2357,7 @@ impl InferenceHandler for InferenceService {
             stream_id,
             endpoint: stream_sub_endpoint,
             server_pubkey,
-            policy: stream_ctx.policy().clone(),
+            qos: stream_ctx.qos().clone(),
         };
 
         let adaptation_strategy = map_adaptation_strategy(data.adaptation_strategy, data.writeback_threshold);

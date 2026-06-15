@@ -19,22 +19,22 @@ using import "annotations.capnp".fixedSize;
 #   - Client: Verifies HMAC chain end-to-end
 
 # =============================================================================
-# Stream Policy (#213) — service-declared delivery/integrity contract.
+# StreamOpt (#213) — service-declared delivery/integrity contract.
 #
-# Returned in the signed StreamInfo handshake response so the policy is:
+# Returned in the signed StreamInfo handshake response so the contract is:
 #   1. Authenticated: covered by the Ed25519 SignedEnvelope over StreamInfo
 #   2. Wire-visible: encoded in the Cap'n Proto StreamInfo message body
 #   3. Cross-language: capnp codegens native readers for Rust/TS/Python (#217/#218)
 #   4. IETF-friendly: a struct in the handshake response, not a schema annotation
 #
-# The service asserts the policy it will enforce; clients MUST enforce the same
-# policy on ingress. A client that cannot honour the received policy (e.g.,
+# The service asserts the contract it will enforce; clients MUST enforce the same
+# options on ingress. A client that cannot honour the received options (e.g.,
 # unordered delivery not yet implemented) MUST disconnect rather than silently
 # downgrade. See `StreamVerifier::with_policy`.
 #
-# Policy *values* are per-application (inline literals or app-local `const
-# :StreamPolicy`). No preset named policies live here until real call sites
-# prove a grouping is generic enough for the common vocabulary.
+# Named Rust presets (Job, Log, Pipe) live in hyprstream_rpc::stream_info
+# rather than here — the schema vocabulary covers all axes; the preset types
+# validate received values match the expected combination at compile time.
 #
 # **`@0`-is-safe discipline:** capnp zero-fills an absent/unrecognized union
 # discriminant. The `@0` variant of every *security-bearing* axis is the
@@ -45,10 +45,10 @@ using import "annotations.capnp".fixedSize;
 #   Delivery:      atMostOnce
 #   Retention:     live
 #   OverflowPolicy: block
-# Codegen MUST require every axis to be set for compile-time policies; this
-# discipline is load-bearing only for externally-sourced (advertised) policy.
+# Codegen MUST require every axis to be set for compile-time presets; this
+# discipline is load-bearing only for externally-sourced (advertised) opts.
 #
-# Out of scope for StreamPolicy:
+# Out of scope for StreamOpt:
 #   - exactlyOnce delivery (MQTT QoS 2): incompatible with low-latency streaming
 #   - causal / total ordering: use ordered + external coordination
 #   - transport encryption: provided by QUIC (RFC 9001) + application HPKE
@@ -126,9 +126,9 @@ struct OverflowPolicy {
   }
 }
 
-# The full per-stream delivery policy. One instance per stream, carried in
+# The full per-stream QoS options. One instance per stream, carried in
 # the signed StreamInfo handshake response.
-struct StreamPolicy {
+struct StreamOpt {
   ordering       @0 :Ordering;
   delivery       @1 :Delivery;
   completion     @2 :Completion;
@@ -149,10 +149,10 @@ struct StreamInfo {
   streamId @0 :Text;      # Unique stream identifier (e.g., "stream-{uuid}")
   endpoint @1 :Text;      # XPUB endpoint to subscribe to
   dhPublic @2 :Data $fixedSize(32);  # Server's ephemeral Ristretto255 public key for DH
-  # Service-declared delivery policy. Authenticated by the Ed25519 signature
-  # over the enclosing SignedEnvelope. Clients MUST enforce this policy and
+  # Service-declared QoS options. Authenticated by the Ed25519 signature
+  # over the enclosing SignedEnvelope. Clients MUST enforce these options and
   # MUST disconnect (not silently downgrade) if a required mode is unsupported.
-  policy   @3 :StreamPolicy;
+  qos   @3 :StreamOpt;
 }
 
 # Stream registration - wrapped in SignedEnvelope for authorization
@@ -188,7 +188,7 @@ struct StreamBlock {
   # this equals the moq Group id; it is the resume/dedup offset and the
   # anti-replay/ordering anchor. Authenticated implicitly — the MAC covers the
   # whole serialized StreamBlock. Consumer ordering/replay enforcement (gap-fatal
-  # vs media per-Group) is policy-selected via StreamPolicy (#163).
+  # vs media per-Group) is qos-selected via StreamOpt (#163).
   # Named `sequenceNumber` per IETF convention (DTLS RFC 9147, RTP RFC 3550).
   sequenceNumber @2 :UInt64;
   # Key-epoch (#223): analogous to DTLS 1.3 epoch (RFC 9147 §4.2.3). Bumps on

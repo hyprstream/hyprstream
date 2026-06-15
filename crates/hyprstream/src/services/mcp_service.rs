@@ -656,9 +656,9 @@ fn params_to_json_schema(params: &[(&str, &str, bool, &str)]) -> Value {
     })
 }
 
-/// Parse streamId, endpoint, serverPubkey, and policy from a streaming response JSON.
+/// Parse streamId, endpoint, serverPubkey, and qos from a streaming response JSON.
 /// StreamInfo serializes with `#[serde(rename_all = "camelCase")]`, so all keys are camelCase.
-fn parse_stream_info(json: &Value) -> anyhow::Result<(String, String, Vec<u8>, hyprstream_rpc::stream_info::StreamPolicy)> {
+fn parse_stream_info(json: &Value) -> anyhow::Result<(String, String, Vec<u8>, hyprstream_rpc::stream_info::StreamOpt)> {
     let stream_id = json["streamId"].as_str()
         .ok_or_else(|| anyhow::anyhow!("missing streamId in streaming response"))?.to_owned();
     let endpoint = json["endpoint"].as_str()
@@ -668,12 +668,12 @@ fn parse_stream_info(json: &Value) -> anyhow::Result<(String, String, Vec<u8>, h
         .iter()
         .map(|v| v.as_u64().unwrap_or(0) as u8)
         .collect();
-    let policy: hyprstream_rpc::stream_info::StreamPolicy = if json["policy"].is_object() {
-        serde_json::from_value(json["policy"].clone()).unwrap_or_default()
+    let qos: hyprstream_rpc::stream_info::StreamOpt = if json["qos"].is_object() {
+        serde_json::from_value(json["qos"].clone()).unwrap_or_default()
     } else {
-        hyprstream_rpc::stream_info::StreamPolicy::default()
+        hyprstream_rpc::stream_info::StreamOpt::default()
     };
-    Ok((stream_id, endpoint, server_pubkey, policy))
+    Ok((stream_id, endpoint, server_pubkey, qos))
 }
 
 /// Dispatch a method call to the appropriate generated client.

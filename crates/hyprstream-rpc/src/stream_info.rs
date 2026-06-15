@@ -1,12 +1,12 @@
-//! Target-independent StreamInfo + StreamPolicy types.
+//! Target-independent StreamInfo + StreamOpt types.
 //!
 //! Extracted from `streaming` (native-only) so that generated client code
 //! on wasm32 can reference `StreamInfo` without pulling in ZMQ/tokio deps.
 //!
 //! Service codegen modules emit `pub type StreamInfo = hyprstream_rpc::stream_info::StreamInfo;`
-//! (and similar aliases for the StreamPolicy axis types) rather than generating duplicates.
+//! (and similar aliases for the StreamOpt axis types) rather than generating duplicates.
 
-// ─── StreamPolicy axis types ──────────────────────────────────────────────────
+// ─── StreamOpt axis types ──────────────────────────────────────────────────────
 
 /// Ordered delivery — gaps are fatal (DTLS anti-replay, RFC 9147 §4.2.3).
 /// Unordered delivery with an anti-replay window (SRTP RFC 3711 §3.3).
@@ -55,7 +55,7 @@ pub enum Completion {
 
 /// Relay-side retention / late-join buffer policy.
 /// `live` is the smallest attack surface (no buffering beyond the live window).
-/// NOTE: `live` is declared by the policy but enforced by the client (via epoch
+/// NOTE: `live` is declared by the qos but enforced by the client (via epoch
 /// binding), not the relay (which is blind to MAC keys).
 ///
 /// `@0 = live` is the fail-closed default.
@@ -86,14 +86,14 @@ pub enum OverflowPolicy {
     },
 }
 
-/// Full per-stream delivery policy. Carried in the signed StreamInfo handshake
+/// Full per-stream QoS options. Carried in the signed StreamInfo handshake
 /// response so the contract is Ed25519-authenticated and wire-visible.
 ///
 /// All axes default to their fail-closed (`@0`) variants per the schema
 /// discipline — safe under capnp zero-fill of absent/unknown discriminants.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct StreamPolicy {
+pub struct StreamOpt {
     pub ordering: Ordering,
     pub delivery: Delivery,
     pub completion: Completion,
@@ -101,13 +101,43 @@ pub struct StreamPolicy {
     pub overflow_policy: OverflowPolicy,
 }
 
-impl StreamPolicy {
-    /// Token/job streams: ordered, at-least-once with 4096-entry dedup window,
-    /// resumable from last-acked Group, EndOfStream terminator, 256-Group relay
-    /// retention, lossless backpressure. Use for InferenceService token streams
-    /// and model lifecycle events (#169).
-    pub fn job() -> Self {
-        Self {
+/// Marker trait for typed stream QoS presets.
+///
+/// Each preset is a zero-sized type that encodes a specific `StreamOpt`
+/// configuration, enabling type-safe API contracts without runtime dispatch.
+/// Implement this trait to define a new named preset.
+pub trait StreamOptPreset: Clone + Send + Sync + 'static {
+    fn stream_opt() -> StreamOpt;
+}
+
+/// Inference / job streams.
+///
+/// Ordered, at-least-once with 4096-entry dedup window, resumable from
+/// last-acked Group, EndOfStream terminator, 256-Group relay retention,
+/// lossless backpressure. Use for InferenceService token streams and model
+/// lifecycle events (#169).
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct Job;
+
+/// Log / notification streams.
+///
+/// Ordered, at-least-once, no terminator sentinel, 300-second relay
+/// retention. Use for Metrics, Notification, and mobile clients with
+/// intermittent connectivity (#169).
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct Log;
+
+/// Pipe / console streams.
+///
+/// Ordered, at-least-once with 256-entry dedup, live retention, no
+/// terminator. Use for container I/O attach and the model↔worker callback
+/// DEALER replacement (#170).
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct Pipe;
+
+impl StreamOptPreset for Job {
+    fn stream_opt() -> StreamOpt {
+        StreamOpt {
             ordering: Ordering::Ordered,
             delivery: Delivery::AtLeastOnce { dedup_window: 4096, resumable: true },
             completion: Completion::EndOfStream,
@@ -115,12 +145,11 @@ impl StreamPolicy {
             overflow_policy: OverflowPolicy::Block,
         }
     }
+}
 
-    /// Log/mobile streams: ordered, at-least-once, no terminator sentinel,
-    /// 300-second relay retention. Use for Metrics, Notification, and mobile
-    /// clients with intermittent connectivity (#169).
-    pub fn log() -> Self {
-        Self {
+impl StreamOptPreset for Log {
+    fn stream_opt() -> StreamOpt {
+        StreamOpt {
             ordering: Ordering::Ordered,
             delivery: Delivery::AtLeastOnce { dedup_window: 4096, resumable: true },
             completion: Completion::None,
@@ -128,12 +157,11 @@ impl StreamPolicy {
             overflow_policy: OverflowPolicy::Block,
         }
     }
+}
 
-    /// Pipe streams: ordered, at-least-once with 256-entry dedup, live retention,
-    /// no terminator. Use for container I/O attach and the model↔worker callback
-    /// DEALER replacement (#170).
-    pub fn pipe() -> Self {
-        Self {
+impl StreamOptPreset for Pipe {
+    fn stream_opt() -> StreamOpt {
+        StreamOpt {
             ordering: Ordering::Ordered,
             delivery: Delivery::AtLeastOnce { dedup_window: 256, resumable: false },
             completion: Completion::None,
@@ -147,7 +175,7 @@ impl StreamPolicy {
 
 /// Canonical stream info returned by streaming RPC methods.
 ///
-/// Wrapped in a `SignedEnvelope` (Ed25519) so the `policy` field is authenticated.
+/// Wrapped in a `SignedEnvelope` (Ed25519) so the `qos` field is authenticated.
 /// Service codegen modules alias this type from `hyprstream_rpc::stream_info`.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -155,7 +183,7 @@ pub struct StreamInfo {
     pub stream_id: String,
     pub endpoint: String,
     pub server_pubkey: [u8; 32],
-    pub policy: StreamPolicy,
+    pub qos: StreamOpt,
 }
 
 impl crate::capnp::ToCapnp for StreamInfo {
@@ -165,8 +193,8 @@ impl crate::capnp::ToCapnp for StreamInfo {
         builder.set_stream_id(&self.stream_id);
         builder.set_endpoint(&self.endpoint);
         builder.set_dh_public(&self.server_pubkey);
-        let mut policy_builder = builder.reborrow().init_policy();
-        write_stream_policy(&self.policy, &mut policy_builder);
+        let mut qos_builder = builder.reborrow().init_qos();
+        write_stream_qos(&self.qos, &mut qos_builder);
     }
 }
 
@@ -179,30 +207,30 @@ impl crate::capnp::FromCapnp for StreamInfo {
         if pubkey_data.len() == 32 {
             server_pubkey.copy_from_slice(pubkey_data);
         }
-        let policy = if reader.has_policy() {
-            read_stream_policy(reader.get_policy()?)?
+        let qos = if reader.has_qos() {
+            read_stream_qos(reader.get_qos()?)?
         } else {
-            StreamPolicy::default()
+            StreamOpt::default()
         };
         Ok(Self {
             stream_id: reader.get_stream_id()?.to_str()?.to_owned(),
             endpoint: reader.get_endpoint()?.to_str()?.to_owned(),
             server_pubkey,
-            policy,
+            qos,
         })
     }
 }
 
 // ─── capnp serialization helpers (not pub — internal to this module) ─────────
 
-fn write_stream_policy(
-    policy: &StreamPolicy,
-    builder: &mut crate::streaming_capnp::stream_policy::Builder<'_>,
+fn write_stream_qos(
+    qos: &StreamOpt,
+    builder: &mut crate::streaming_capnp::stream_opt::Builder<'_>,
 ) {
     // ordering
     {
         let mut b = builder.reborrow().init_ordering();
-        match &policy.ordering {
+        match &qos.ordering {
             Ordering::Ordered => b.set_ordered(()),
             Ordering::Unordered { anti_replay_window } => {
                 b.init_unordered().set_anti_replay_window(*anti_replay_window);
@@ -212,7 +240,7 @@ fn write_stream_policy(
     // delivery
     {
         let mut b = builder.reborrow().init_delivery();
-        match &policy.delivery {
+        match &qos.delivery {
             Delivery::AtMostOnce => b.set_at_most_once(()),
             Delivery::AtLeastOnce { dedup_window, resumable } => {
                 let mut g = b.init_at_least_once();
@@ -224,7 +252,7 @@ fn write_stream_policy(
     // completion
     {
         let mut b = builder.reborrow().init_completion();
-        match &policy.completion {
+        match &qos.completion {
             Completion::EndOfStream => b.set_end_of_stream(()),
             Completion::None => b.set_none(()),
         }
@@ -232,7 +260,7 @@ fn write_stream_policy(
     // retention
     {
         let mut b = builder.reborrow().init_retention();
-        match &policy.retention {
+        match &qos.retention {
             Retention::Live => b.set_live(()),
             Retention::Blocks(n) => b.set_blocks(*n),
             Retention::Seconds(n) => b.set_seconds(*n),
@@ -241,7 +269,7 @@ fn write_stream_policy(
     // overflow_policy
     {
         let mut b = builder.reborrow().init_overflow_policy();
-        match &policy.overflow_policy {
+        match &qos.overflow_policy {
             OverflowPolicy::Block => b.set_block(()),
             OverflowPolicy::DropOldest { high_water_mark } => {
                 b.init_drop_oldest().set_high_water_mark(*high_water_mark);
@@ -250,9 +278,9 @@ fn write_stream_policy(
     }
 }
 
-fn read_stream_policy(
-    reader: crate::streaming_capnp::stream_policy::Reader<'_>,
-) -> anyhow::Result<StreamPolicy> {
+fn read_stream_qos(
+    reader: crate::streaming_capnp::stream_opt::Reader<'_>,
+) -> anyhow::Result<StreamOpt> {
     use crate::streaming_capnp::{
         completion, delivery, ordering, overflow_policy, retention,
     };
@@ -290,7 +318,7 @@ fn read_stream_policy(
         },
     };
 
-    Ok(StreamPolicy {
+    Ok(StreamOpt {
         ordering,
         delivery,
         completion,

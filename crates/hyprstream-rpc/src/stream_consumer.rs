@@ -53,7 +53,7 @@ pub enum StreamPayload {
 // StreamVerifier — HMAC chain verifier (pure crypto)
 // ============================================================================
 
-/// Consumer-side ordering contract (#163/#213). The full `StreamPolicy` (schema) carries
+/// Consumer-side ordering contract (#163/#213). The full `StreamOpt` (schema) carries
 /// producer-side QoS too (delivery/retention/overflow); the consumer only needs ordering
 /// + completion to *verify*. Cross-target so native and the wasm/browser consumer share it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,9 +78,9 @@ pub enum Completion {
 }
 
 /// The consumer's slice of the stream's API contract (#213), set from the service's
-/// `$streamPolicy` via codegen (#217) — NOT from the wire, so it can't be downgraded.
+/// `$streamQos` via codegen (#217) — NOT from the wire, so it can't be downgraded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StreamPolicy {
+pub struct VerifierContract {
     pub ordering: StreamOrdering,
     pub completion: Completion,
 }
@@ -90,10 +90,10 @@ pub struct StreamVerifier {
     key: [u8; 32],
     prev_mac: Option<[u8; 16]>,
     topic: String,
-    /// Policy-selected enforcement (#163). `None` ⇒ legacy behaviour (MAC chain only, no
+    /// Verifier contract enforcement (#163). `None` ⇒ legacy behaviour (MAC chain only, no
     /// `seq`/completion checks). Set via [`StreamVerifier::with_policy`] by codegen-generated
     /// consumers; default `new()` keeps `None` so existing call sites are unchanged.
-    policy: Option<StreamPolicy>,
+    policy: Option<VerifierContract>,
     /// Next expected `seq` (ordered) / highest `seq` seen (media). `None` until the first
     /// block, so a late-join starting at an arbitrary offset is accepted, then enforced.
     seq_cursor: Option<u64>,
@@ -115,8 +115,8 @@ impl StreamVerifier {
     }
 
     /// Create a verifier that enforces `policy` (#163) — used by codegen-generated consumers,
-    /// where the policy is a compile-time constant from the service's API contract.
-    pub fn with_policy(key: [u8; 32], topic: String, policy: StreamPolicy) -> Self {
+    /// where the contract is a compile-time constant from the service's API contract.
+    pub fn with_policy(key: [u8; 32], topic: String, policy: VerifierContract) -> Self {
         let mut v = Self::new(key, topic);
         v.policy = Some(policy);
         v
@@ -311,11 +311,11 @@ impl<T: Transport> StreamHandleImpl<T> {
         let subscriber = transport.subscribe(keys.topic.as_bytes()).await?;
         let publisher = transport.publish(keys.ctrl_topic.as_bytes()).await.ok();
 
-        // Policy from the signed StreamInfo handshake — enforced for both native and WASM paths.
+        // QoS contract from the signed StreamInfo handshake — enforced for both native and WASM paths.
         let verifier = StreamVerifier::with_policy(
             *keys.mac_key,
             keys.topic.clone(),
-            stream_info.policy.into(),
+            stream_info.qos.into(),
         );
 
         Ok(Self {
@@ -470,25 +470,25 @@ impl StreamHandle for Box<dyn StreamHandle> {
     }
 }
 
-// ─── Conversion from wire StreamPolicy ────────────────────────────────────────
+// ─── Conversion from wire StreamOpt ───────────────────────────────────────────
 
-/// Convert the full wire `StreamPolicy` (5 axes) to the consumer's 2-axis slice.
+/// Convert the full wire `StreamOpt` (5 axes) to the consumer's 2-axis slice.
 ///
 /// The delivery, retention, and overflow_policy axes are producer-side concerns;
 /// the consumer only enforces ordering + completion.
-impl From<crate::stream_info::StreamPolicy> for StreamPolicy {
-    fn from(p: crate::stream_info::StreamPolicy) -> Self {
-        let ordering = match p.ordering {
+impl From<crate::stream_info::StreamOpt> for VerifierContract {
+    fn from(q: crate::stream_info::StreamOpt) -> Self {
+        let ordering = match q.ordering {
             crate::stream_info::Ordering::Ordered => StreamOrdering::Ordered,
             crate::stream_info::Ordering::Unordered { anti_replay_window } => {
                 StreamOrdering::Unordered { anti_replay_window }
             }
         };
-        let completion = match p.completion {
+        let completion = match q.completion {
             crate::stream_info::Completion::EndOfStream => Completion::EndOfStream,
             crate::stream_info::Completion::None => Completion::Open,
         };
-        StreamPolicy { ordering, completion }
+        VerifierContract { ordering, completion }
     }
 }
 
@@ -543,7 +543,7 @@ mod policy_tests {
         let mut v = StreamVerifier::with_policy(
             key,
             topic.to_owned(),
-            StreamPolicy { ordering: StreamOrdering::Ordered, completion: Completion::Open },
+            VerifierContract { ordering: StreamOrdering::Ordered, completion: Completion::Open },
         );
         let (f5, m5) = frame(&key, topic, None, 5, false); // late-join at seq 5
         v.verify(&f5).unwrap();
@@ -573,7 +573,7 @@ mod policy_tests {
         let mut v = StreamVerifier::with_policy(
             key,
             topic.to_owned(),
-            StreamPolicy {
+            VerifierContract {
                 ordering: StreamOrdering::Unordered { anti_replay_window: 4 },
                 completion: Completion::Open,
             },
@@ -589,7 +589,7 @@ mod policy_tests {
         let mut v = StreamVerifier::with_policy(
             key,
             topic.to_owned(),
-            StreamPolicy { ordering: StreamOrdering::Ordered, completion: Completion::EndOfStream },
+            VerifierContract { ordering: StreamOrdering::Ordered, completion: Completion::EndOfStream },
         );
         assert!(v.requires_terminal());
         assert!(!v.terminal_seen());
