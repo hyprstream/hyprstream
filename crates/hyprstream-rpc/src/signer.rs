@@ -15,9 +15,23 @@ use crate::transport_traits::Signer;
 ///
 /// Signs synchronously — the async wrapper resolves immediately.
 /// Used for server-to-server RPC where the signing key is local.
+///
+/// `SigningKey` derives `ZeroizeOnDrop` from ed25519-dalek ≥ 2.0, so the
+/// Ed25519 key bytes are zeroed when the `LocalSigner` is dropped. The ML-DSA
+/// key is an opaque byte buffer (`ml_dsa` crate) without `ZeroizeOnDrop`; we
+/// zero it explicitly in our `Drop` impl.
 pub struct LocalSigner {
     signing_key: SigningKey,
     pq_signing_key: Option<crate::crypto::pq::MlDsaSigningKey>,
+}
+
+impl std::fmt::Debug for LocalSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalSigner")
+            .field("pubkey", &hex::encode(self.signing_key.verifying_key().to_bytes()))
+            .field("pq_pubkey", &self.pq_signing_key.as_ref().map(|_| "<ml-dsa-65>"))
+            .finish()
+    }
 }
 
 impl LocalSigner {

@@ -1347,10 +1347,18 @@ fn install_envelope_verify_config() {
                 "envelope verify policy: HYBRID enforced (SNS nested COSE); \
                  peer ML-DSA bindings required for cross-node traffic"
             ),
-            CryptoPolicy::Classical => tracing::warn!(
-                "envelope verify policy: CLASSICAL (EdDSA-only) — \
-                 set HYPRSTREAM_ENVELOPE_POLICY=hybrid to enforce PQ"
-            ),
+            CryptoPolicy::Classical => {
+                tracing::error!(
+                    "⚠ SECURITY DOWNGRADE: envelope verify policy is CLASSICAL (EdDSA-only). \
+                     Post-quantum protection is DISABLED for ALL envelope traffic. \
+                     Unset HYPRSTREAM_ENVELOPE_POLICY or set it to 'hybrid' to re-enable PQ enforcement. \
+                     This setting must not be used in production."
+                );
+                eprintln!(
+                    "SECURITY WARNING: HYPRSTREAM_ENVELOPE_POLICY=classical disables post-quantum \
+                     protection. Set to 'hybrid' or unset for production use."
+                );
+            }
         }
     }
 }
