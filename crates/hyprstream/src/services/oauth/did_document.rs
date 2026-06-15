@@ -280,9 +280,30 @@ pub async fn root_did_document(
         handle,
     });
 
-    // Transport `service` entries are populated by the addressing layer (#151
-    // dial endpoints) once available; empty until then.
-    let transports: Vec<TransportEndpoint> = Vec::new();
+    // Transport `service` entries: populate QUIC entry when cert hash is available (#185).
+    // The cert hash was set at OAuthService startup from the node's QUIC TLS cert,
+    // closing the two-trust-roots gap: peers dialing by DID can now pin the cert
+    // instead of accepting it on TOFU.
+    let mut transports: Vec<TransportEndpoint> = Vec::new();
+    if !state.quic_cert_hashes.is_empty() {
+        if let Some(ref quic_uri) = state.quic_public_uri {
+            let auth = match hyprstream_rpc::transport::QuicServerAuth::pinned(
+                state.quic_cert_hashes.clone(),
+            ) {
+                Ok(auth) => auth,
+                Err(_) => hyprstream_rpc::transport::QuicServerAuth::web_pki(),
+            };
+            transports.push(TransportEndpoint {
+                fragment: "quic".to_owned(),
+                vm_type: "QuicTransport".to_owned(),
+                endpoint: hyprstream_rpc::service_entry::encode_quic(
+                    quic_uri,
+                    &auth,
+                    &["hyprstream-rpc/1"],
+                ),
+            });
+        }
+    }
 
     let doc = build_did_document(
         &did,

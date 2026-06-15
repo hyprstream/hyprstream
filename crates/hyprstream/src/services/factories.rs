@@ -805,7 +805,8 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
         ctx.transport("oauth", SocketKind::Rep),
         ctx.verifying_key(),
         ctx.jwt_verifying_key(),
-    );
+    )
+    .with_quic_config(config.quic.clone());
     if let Some(bl) = SHARED_JTI_BLOCKLIST.get() {
         oauth_service = oauth_service.with_jti_blocklist(Arc::clone(bl));
     } else {

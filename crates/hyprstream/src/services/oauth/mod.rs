@@ -265,6 +265,8 @@ pub struct OAuthService {
     config: OAuthConfig,
     /// Global TLS configuration (passed from factory, avoids re-loading config)
     tls_config: crate::config::TlsConfig,
+    /// Global QUIC configuration for cert-hash publication in DID doc (#185).
+    quic_config: Option<crate::config::QuicConfig>,
     /// Signing key for creating the PolicyClient inside `run()`.
     signing_key: hyprstream_rpc::prelude::SigningKey,
     context: Arc<zmq::Context>,
@@ -291,6 +293,7 @@ impl OAuthService {
         Self {
             config,
             tls_config,
+            quic_config: None,
             signing_key,
             context,
             control_transport,
@@ -298,6 +301,12 @@ impl OAuthService {
             jwt_verifying_key: jwt_verifying_key.to_bytes(),
             jti_blocklist: None,
         }
+    }
+
+    /// Attach the global QUIC configuration for DID-doc cert-hash publication (#185).
+    pub fn with_quic_config(mut self, quic: crate::config::QuicConfig) -> Self {
+        self.quic_config = Some(quic);
+        self
     }
 
     /// Attach the shared JTI blocklist (same Arc as PolicyService).
@@ -608,6 +617,29 @@ impl Spawnable for OAuthService {
             };
             if let Some(_url) = cached_discovery_url {
                 // Discovery URL caching removed - use issuer URL directly
+            }
+
+            // Publish QUIC cert hash in DID doc (#185): close the two-trust-roots / TOFU gap.
+            // The leaf cert hash (SHA-256 of cert DER) is stored in OAuthState and
+            // included in the `#quic` service entry at `GET /.well-known/did.json`.
+            if let Some(ref quic_cfg) = self.quic_config {
+                if quic_cfg.enabled {
+                    if let Ok((cert_chain, _)) = quic_cfg.load_tls_materials() {
+                        if let Some(leaf) = cert_chain.first() {
+                            let mut hash = [0u8; 32];
+                            let digest = ring::digest::digest(&ring::digest::SHA256, leaf);
+                            hash.copy_from_slice(digest.as_ref());
+                            // Derive the public QUIC URI: same host as issuer, port from QUIC bind addr.
+                            let quic_port = quic_cfg.socket_addr().map(|a| a.port()).unwrap_or(4433);
+                            let issuer_host = url::Url::parse(&oauth_state.issuer_url)
+                                .ok()
+                                .and_then(|u| u.host_str().map(str::to_owned))
+                                .unwrap_or_else(|| "localhost".to_owned());
+                            let quic_uri = format!("https://{issuer_host}:{quic_port}");
+                            oauth_state = oauth_state.with_quic_transport(quic_uri, vec![hash]);
+                        }
+                    }
+                }
             }
 
             let state = Arc::new(oauth_state);

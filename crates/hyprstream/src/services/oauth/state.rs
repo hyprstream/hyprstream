@@ -371,6 +371,13 @@ pub struct OAuthState {
     pub es256_key_store: Option<Arc<crate::auth::Es256SigningKeyStore>>,
     /// ML-DSA-65 signing key rotation store for PQ-hybrid JWT issuance.
     pub ml_dsa_key_store: Option<Arc<crate::auth::MlDsaSigningKeyStore>>,
+    /// QUIC/WebTransport cert hashes (SHA-256 of leaf DER, `sha2-256` multihash encoding).
+    /// Published in the DID-doc `#quic` service entry so peers can pin the cert (#185).
+    /// A set so cert rotation can publish old + new simultaneously.
+    pub quic_cert_hashes: Vec<[u8; 32]>,
+    /// Public QUIC URI (`https://host:port`) for the DID-doc service entry (#185).
+    /// None until the QUIC server is started and the cert hash is known.
+    pub quic_public_uri: Option<String>,
 }
 
 impl OAuthState {
@@ -421,6 +428,8 @@ impl OAuthState {
             jti_blocklist: None,
             es256_key_store: None,
             ml_dsa_key_store: None,
+            quic_cert_hashes: Vec::new(),
+            quic_public_uri: None,
         }
     }
 
@@ -460,6 +469,17 @@ impl OAuthState {
     /// Attach the ML-DSA-65 key rotation store.
     pub fn with_ml_dsa_key_store(mut self, store: Arc<crate::auth::MlDsaSigningKeyStore>) -> Self {
         self.ml_dsa_key_store = Some(store);
+        self
+    }
+
+    /// Set the node's QUIC transport info for DID-doc publication (#185).
+    ///
+    /// `cert_hashes` is the set of SHA-256 cert DER hashes currently in use
+    /// (old + new during rotation). `public_uri` is `https://host:port` that
+    /// external peers dial.
+    pub fn with_quic_transport(mut self, public_uri: String, cert_hashes: Vec<[u8; 32]>) -> Self {
+        self.quic_public_uri = Some(public_uri);
+        self.quic_cert_hashes = cert_hashes;
         self
     }
 
