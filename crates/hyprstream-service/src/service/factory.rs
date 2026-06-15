@@ -15,7 +15,6 @@
 //!     // Services include infrastructure and are directly Spawnable
 //!     let policy = PolicyService::new(
 //!         ...,
-//!         ctx.zmq_context(),
 //!         ctx.transport("policy", SocketKind::Rep),
 //!         ctx.verifying_key(),
 //!     );
@@ -191,9 +190,6 @@ impl QuicSharedConfig {
 /// Contains all shared resources needed by services during initialization.
 /// Passed to factory functions registered via `#[service_factory]`.
 pub struct ServiceContext {
-    /// ZMQ context (shared across all services)
-    zmq_context: Arc<zmq::Context>,
-
     /// Server's signing key (for JWT generation)
     signing_key: SigningKey,
 
@@ -250,7 +246,6 @@ pub struct ServiceContext {
 impl ServiceContext {
     /// Create a new service context.
     pub fn new(
-        zmq_context: Arc<zmq::Context>,
         signing_key: SigningKey,
         verifying_key: VerifyingKey,
         ipc: bool,
@@ -260,7 +255,6 @@ impl ServiceContext {
             hyprstream_rpc::node_identity::NodeIdentityProvider::new(&signing_key)
         );
         Self {
-            zmq_context,
             signing_key,
             verifying_key,
             identity_provider,
@@ -475,11 +469,6 @@ impl ServiceContext {
     ) -> Self {
         self.federation_key_source = Some(src);
         self
-    }
-
-    /// Get the shared ZMQ context.
-    pub fn zmq_context(&self) -> Arc<zmq::Context> {
-        self.zmq_context.clone()
     }
 
     /// Get the root signing key.

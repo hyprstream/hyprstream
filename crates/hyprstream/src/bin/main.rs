@@ -51,7 +51,6 @@ use hyprstream_core::services::{PolicyClient, RegistryClient};
 use hyprstream_workers::runtime::WorkerService;
 use hyprstream_workers::{ImageConfig, PoolConfig};
 // ZMQ context for service startup
-use hyprstream_core::zmq::global_context;
 use std::sync::Arc;
 // Unified service manager API
 use hyprstream_service::{get_factory, InprocManager, ServiceContext, ServiceManager};
@@ -1801,7 +1800,6 @@ fn main() -> Result<()> {
                                         &config.oauth.trusted_issuers,
                                     ));
                                 let mut ctx = ServiceContext::new(
-                                    global_context(),
                                     signing_key.clone(),
                                     verifying_key,
                                     ipc,
