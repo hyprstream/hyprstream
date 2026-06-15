@@ -502,10 +502,13 @@ impl AnyStreamPublisher {
 ///
 /// Connects to the moq UDS plane, subscribes to the broadcast, verifies the
 /// chained-HMAC frames, and delivers [`crate::streaming::StreamPayload`]s via
-/// an internal channel. Mirrors the `StreamHandle` interface (same `recv_next()`
-/// signature) so callers need no code change beyond the constructor.
+/// an internal channel. Mirrors the `StreamHandle` interface (same `recv_next()`,
+/// `stream_id()`, `cancel_token()`, and `futures::Stream` impl) so callers need
+/// no code change beyond the constructor.
 pub struct MoqStreamHandle {
     rx: tokio::sync::mpsc::Receiver<anyhow::Result<crate::streaming::StreamPayload>>,
+    broadcast_path: String,
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 impl MoqStreamHandle {
@@ -521,9 +524,10 @@ impl MoqStreamHandle {
         mac_key: [u8; 32],
         topic: String,
     ) -> Self {
+        let cancel = tokio_util::sync::CancellationToken::new();
         let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<crate::streaming::StreamPayload>>(64);
-        tokio::spawn(moq_stream_handle_task(uds_path, broadcast_path, mac_key, topic, tx));
-        Self { rx }
+        tokio::spawn(moq_stream_handle_task(uds_path, broadcast_path.clone(), mac_key, topic, tx, cancel.clone()));
+        Self { rx, broadcast_path, cancel }
     }
 
     /// Receive the next stream payload.
@@ -536,6 +540,32 @@ impl MoqStreamHandle {
             None => Ok(None),
         }
     }
+
+    /// Returns the moq broadcast path used as stream identifier.
+    pub fn stream_id(&self) -> &str {
+        &self.broadcast_path
+    }
+
+    /// Returns a cancellation token that aborts the background receive task.
+    pub fn cancel_token(&self) -> &tokio_util::sync::CancellationToken {
+        &self.cancel
+    }
+
+    /// Cancel the background receive task immediately.
+    pub fn cancel(&self) {
+        self.cancel.cancel();
+    }
+}
+
+impl futures::Stream for MoqStreamHandle {
+    type Item = anyhow::Result<crate::streaming::StreamPayload>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
 }
 
 async fn moq_stream_handle_task(
@@ -544,6 +574,7 @@ async fn moq_stream_handle_task(
     mac_key: [u8; 32],
     topic: String,
     tx: tokio::sync::mpsc::Sender<anyhow::Result<crate::streaming::StreamPayload>>,
+    cancel: tokio_util::sync::CancellationToken,
 ) {
     use crate::streaming::StreamVerifier;
     use crate::transport::uds_session::{connect_uds, PLANE_MOQ};
@@ -580,6 +611,9 @@ async fn moq_stream_handle_task(
     };
     let mut verifier = StreamVerifier::new(mac_key, topic.clone());
     loop {
+        if cancel.is_cancelled() {
+            break;
+        }
         let mut group = match tokio::time::timeout(
             std::time::Duration::from_secs(30),
             track.next_group(),

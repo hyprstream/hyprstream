@@ -814,7 +814,12 @@ impl WorkerService {
             .with_qos_preset::<hyprstream_rpc::stream_info::Pipe>();
 
         let stream_id = stream_ctx.stream_id().to_owned();
-        let stream_endpoint = self.stream_channel.stream_endpoint();
+        let moq_uds_path = hyprstream_rpc::moq_stream::global_moq_uds_path()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let moq_broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()
+            .map(|o| o.broadcast_path(stream_ctx.topic()))
+            .unwrap_or_default();
 
         // Register active stream before returning
         let cancel_token = stream_ctx.cancel_token().child_token();
@@ -831,16 +836,9 @@ impl WorkerService {
         let stream_id_for_cleanup = stream_id.clone();
         let sc = Arc::clone(&self.stream_channel);
 
-        let moq_uds_path = hyprstream_rpc::moq_stream::global_moq_uds_path()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let moq_broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()
-            .map(|o| o.broadcast_path(stream_ctx.topic()))
-            .unwrap_or_default();
-
         let stream_info = StreamInfo {
             stream_id,
-            endpoint: stream_endpoint,
+            endpoint: String::new(),
             server_pubkey: *stream_ctx.server_pubkey(),
             qos: stream_ctx.qos().clone(),
             moq_uds_path,

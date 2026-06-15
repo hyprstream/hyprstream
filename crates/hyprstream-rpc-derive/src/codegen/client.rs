@@ -155,9 +155,9 @@ fn generate_trait_method(
         .map(|v| is_rpc_stream_info(&v.type_name, resolved))
         .unwrap_or(false);
 
-    // Streaming methods in the trait don't take ephemeral_pubkey — they return StreamHandle
+    // Streaming methods in the trait don't take ephemeral_pubkey — they return MoqStreamHandle
     let return_type = if is_streaming {
-        quote! { hyprstream_rpc::streaming::StreamHandle }
+        quote! { hyprstream_rpc::moq_stream::MoqStreamHandle }
     } else {
         return_type
     };
@@ -403,9 +403,9 @@ fn generate_trait_method_impl(
         .map(|v| is_rpc_stream_info(&v.type_name, resolved))
         .unwrap_or(false);
 
-    // Streaming trait methods return StreamHandle (no ephemeral_pubkey param)
+    // Streaming trait methods return MoqStreamHandle (no ephemeral_pubkey param)
     let return_type = if is_streaming {
-        quote! { hyprstream_rpc::streaming::StreamHandle }
+        quote! { hyprstream_rpc::moq_stream::MoqStreamHandle }
     } else {
         return_type
     };
@@ -436,24 +436,24 @@ fn generate_trait_method_impl(
     };
 
     if is_streaming {
-        // Streaming trait impl: generate ephemeral keypair, call raw method, construct StreamHandle
+        // Streaming trait impl: generate ephemeral keypair, call raw method, construct MoqStreamHandle
         Some(quote! {
-            async fn #method_name(&self #(, #params)*) -> anyhow::Result<hyprstream_rpc::streaming::StreamHandle> {
+            async fn #method_name(&self #(, #params)*) -> anyhow::Result<hyprstream_rpc::moq_stream::MoqStreamHandle> {
                 let (client_secret, client_pubkey) = hyprstream_rpc::crypto::generate_ephemeral_keypair();
                 let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
                 let info = Self::#method_name(self #(, #args)*, client_pubkey_bytes).await?;
                 if info.server_pubkey == [0u8; 32] {
                     anyhow::bail!("Server did not provide DH public key for streaming");
                 }
-                hyprstream_rpc::streaming::StreamHandle::new(
-                    &hyprstream_rpc::zmq_context::global_context(),
-                    info.stream_id,
-                    &info.endpoint,
-                    &info.server_pubkey,
-                    &client_secret,
-                    &client_pubkey_bytes,
-                    info.qos,
-                )
+                if info.moq_uds_path.is_empty() {
+                    anyhow::bail!("Server did not provide moq transport path — may be running in ZMQ-only mode");
+                }
+                let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
+                    &client_secret, &client_pubkey_bytes, &info.server_pubkey,
+                )?;
+                Ok(hyprstream_rpc::moq_stream::MoqStreamHandle::new(
+                    info.moq_uds_path, info.moq_broadcast_path, mac_key, topic,
+                ))
             }
         })
     } else {
