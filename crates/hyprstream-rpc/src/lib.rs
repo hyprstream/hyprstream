@@ -138,6 +138,8 @@ pub mod streaming;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod moq_stream;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod moq_event;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod transport;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dial;

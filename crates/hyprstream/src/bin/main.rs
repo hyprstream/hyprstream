@@ -2088,10 +2088,7 @@ fn main() -> Result<()> {
                                     // Publish ready events for this stage before starting the next.
                                     for svc_name in stage {
                                         if let Ok(mut publisher) =
-                                            hyprstream_workers::EventPublisher::new(
-                                                &global_context(),
-                                                "system",
-                                            )
+                                            hyprstream_workers::EventPublisher::new("system")
                                         {
                                             let _ = publisher
                                                 .publish_raw(
@@ -2118,10 +2115,7 @@ fn main() -> Result<()> {
                                 // Stop all services
                                 for (svc_name, mut handle) in handles {
                                     if let Ok(mut publisher) =
-                                        hyprstream_workers::EventPublisher::new(
-                                            &global_context(),
-                                            "system",
-                                        )
+                                        hyprstream_workers::EventPublisher::new("system")
                                     {
                                         let _ = publisher
                                             .publish_raw(

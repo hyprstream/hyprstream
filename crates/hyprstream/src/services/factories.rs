@@ -26,9 +26,9 @@ use anyhow::Context;
 use git2db::Git2DB;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::{global as global_registry, SocketKind};
-use hyprstream_service::{ProxyService, ServiceContext, Spawnable};
+use hyprstream_service::{ServiceContext, Spawnable};
 use hyprstream_rpc::service_factory;
-use hyprstream_workers::endpoints;
+use hyprstream_rpc::moq_event::MoqEventOrigin;
 use tokio::sync::RwLock;
 use tracing::info;
 
@@ -244,21 +244,63 @@ fn spawn_jwt_renewal_task(
 // Event Service Factory
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Factory for EventService (XPUB/XSUB proxy for event distribution)
+/// Factory for EventService — initializes the moq-lite event bus (#167).
+///
+/// Replaces the ZMQ XPUB/XSUB ProxyService with a `MoqEventOrigin` registered
+/// as a process global. Publishers and subscribers use the global origin directly;
+/// no forwarding proxy or thread is needed. The returned service just holds the
+/// shutdown barrier so the orchestrator tracks lifecycle correctly.
 #[service_factory("event")]
-fn create_event_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
-    info!("Creating EventService");
+fn create_event_service(_ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+    info!("Creating EventService (moq-lite event bus)");
 
-    let mode = if ctx.is_ipc() {
-        endpoints::EndpointMode::Ipc
-    } else {
-        endpoints::EndpointMode::Inproc
-    };
+    let origin = MoqEventOrigin::new();
+    hyprstream_rpc::moq_event::init_global_moq_event_origin(origin);
 
-    let (pub_transport, sub_transport) = endpoints::detect_transports(mode);
-    let proxy = ProxyService::new("events", global_context(), pub_transport, sub_transport);
+    Ok(Box::new(MoqEventBarrierService::new()))
+}
 
-    Ok(Box::new(proxy))
+/// Minimal `Spawnable` that satisfies the service lifecycle contract for the
+/// moq event bus. The bus itself is a process-global `MoqEventOrigin` with no
+/// dedicated thread; this service just waits for shutdown.
+struct MoqEventBarrierService {
+    context: std::sync::Arc<zmq::Context>,
+}
+
+impl MoqEventBarrierService {
+    fn new() -> Self {
+        Self { context: global_context() }
+    }
+}
+
+impl Spawnable for MoqEventBarrierService {
+    fn name(&self) -> &str {
+        "event"
+    }
+
+    fn context(&self) -> &std::sync::Arc<zmq::Context> {
+        &self.context
+    }
+
+    fn registrations(&self) -> Vec<(hyprstream_rpc::registry::SocketKind, hyprstream_rpc::transport::TransportConfig)> {
+        vec![] // no ZMQ endpoints
+    }
+
+    fn run(
+        self: Box<Self>,
+        shutdown: std::sync::Arc<tokio::sync::Notify>,
+        on_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> hyprstream_rpc::error::Result<()> {
+        if let Some(ready) = on_ready {
+            let _ = ready.send(());
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| hyprstream_rpc::error::RpcError::Other(e.to_string()))?;
+        rt.block_on(shutdown.notified());
+        Ok(())
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

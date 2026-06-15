@@ -111,7 +111,7 @@ impl WorkerService {
         let sandbox_pool = Arc::new(SandboxPool::new(pool_config, backend));
 
         // Create event publisher for worker lifecycle events
-        let event_publisher = EventPublisher::new(&context, "worker")?;
+        let event_publisher = EventPublisher::new("worker")?;
 
         let stream_channel = Arc::new(StreamChannel::new(Arc::clone(&context), signing_key.clone()));
 

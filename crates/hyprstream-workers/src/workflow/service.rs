@@ -165,7 +165,7 @@ impl WorkflowService {
     /// Subscribes to worker events and routes them to registered handlers.
     /// This spawns a background task that runs until `stop()` is called.
     pub async fn start(self: Arc<Self>) -> Result<()> {
-        let mut subscriber = EventSubscriber::new(&self.context)?;
+        let mut subscriber = EventSubscriber::new()?;
 
         // Subscribe to worker events (sandbox/container lifecycle)
         subscriber.subscribe("worker.")?;

@@ -1,29 +1,25 @@
-//! EventSubscriber - Async event subscription using TMQ
+//! EventSubscriber — moq-backed async event subscription (#167).
 //!
-//! Subscribers connect to the EventService proxy's XPUB socket
-//! and receive events matching their subscription patterns.
+//! Subscribers connect to the process-global [`MoqEventOrigin`] via a background
+//! task that watches for announced source broadcasts and reads their `events` tracks.
+//! No ZMQ context is required.
 
-use anyhow::{anyhow, Result};
-use futures::StreamExt;
-use std::sync::Arc;
+use anyhow::Result;
 use std::time::Duration;
-use tmq::subscribe;
 
-use super::endpoints;
-use hyprstream_rpc::registry::{self, SocketKind};
+use hyprstream_rpc::moq_event::MoqEventSubscriber as Inner;
 
-/// Async event subscriber using TMQ SUB socket
+/// Async event subscriber backed by moq-lite.
 ///
-/// Subscribers connect to the EventService proxy and receive events
-/// matching their subscription patterns. Patterns use prefix matching.
+/// Wraps [`MoqEventSubscriber`] from `hyprstream-rpc`. Patterns use dot-separated
+/// prefix matching identical to the former ZMQ semantics.
 ///
-/// **Note**: You must call `subscribe()` at least once before calling `recv()`.
-/// ZMQ SUB sockets don't receive any messages until subscribed to a topic.
+/// **Note**: Call `subscribe()` at least once before calling `recv()`.
 ///
 /// # Example
 ///
 /// ```ignore
-/// let mut subscriber = EventSubscriber::new(&ctx)?;
+/// let mut subscriber = EventSubscriber::new()?;
 /// subscriber.subscribe("worker.")?;  // All worker events
 ///
 /// while let Ok((topic, payload)) = subscriber.recv().await {
@@ -31,166 +27,64 @@ use hyprstream_rpc::registry::{self, SocketKind};
 /// }
 /// ```
 pub struct EventSubscriber {
-    /// Before first subscribe: Some(SubscribeWithoutTopic)
-    /// After first subscribe: None (moved to `subscribed`)
-    unsubscribed: Option<tmq::SubscribeWithoutTopic>,
-    /// After first subscribe: Some(Subscribe)
-    subscribed: Option<tmq::Subscribe>,
+    inner: Inner,
 }
 
 impl EventSubscriber {
-    /// Create a new subscriber connecting to the default endpoint
+    /// Create a new subscriber.
     ///
-    /// # Arguments
-    ///
-    /// * `context` - ZMQ context (must be same as EventService for inproc://)
-    ///
-    /// # Note
-    ///
-    /// The subscriber won't receive any messages until `subscribe()` is called.
-    ///
-    /// # Endpoint Resolution
-    ///
-    /// Uses EndpointRegistry if initialized, otherwise falls back to default inproc endpoint.
-    pub fn new(context: &Arc<zmq::Context>) -> Result<Self> {
-        let endpoint = match registry::try_global() {
-            Some(reg) => reg.endpoint("events", SocketKind::Sub).to_zmq_string(),
-            None => endpoints::SUB.to_owned(),
-        };
-        Self::with_endpoint(context, &endpoint)
+    /// No background task is started until the first `recv()` call.
+    pub fn new() -> Result<Self> {
+        Ok(Self { inner: Inner::new() })
     }
 
-    /// Create a new subscriber connecting to a specific endpoint
-    ///
-    /// Use this for IPC sockets in distributed mode.
-    ///
-    /// # Arguments
-    ///
-    /// * `context` - ZMQ context
-    /// * `endpoint` - Endpoint to connect to (e.g., "ipc:///run/user/1000/hyprstream/events/sub.sock")
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let endpoint = format!("ipc://{}", paths::events_sub_socket().display());
-    /// let mut subscriber = EventSubscriber::with_endpoint(&ctx, &endpoint)?;
-    /// subscriber.subscribe("system.")?;
-    /// ```
-    pub fn with_endpoint(context: &Arc<zmq::Context>, endpoint: &str) -> Result<Self> {
-        let socket = subscribe(context)
-            .connect(endpoint)
-            .map_err(|e| anyhow!("Failed to connect subscriber to {}: {}", endpoint, e))?;
-
-        Ok(Self {
-            unsubscribed: Some(socket),
-            subscribed: None,
-        })
-    }
-
-    /// Subscribe to a topic pattern (prefix match)
+    /// Subscribe to a topic pattern (prefix match).
     ///
     /// # Examples
     ///
     /// - `"worker."` - All worker events
     /// - `"worker.sandbox123."` - Events for specific sandbox
     /// - `"worker.sandbox123.started"` - Exact topic match
-    /// - `""` - All events (empty string = subscribe all)
+    /// - `""` - All events (subscribe-all)
     pub fn subscribe(&mut self, pattern: &str) -> Result<()> {
-        if let Some(socket) = self.unsubscribed.take() {
-            // First subscription - converts SubscribeWithoutTopic to Subscribe
-            let subscribed = socket
-                .subscribe(pattern.as_bytes())
-                .map_err(|e| anyhow!("Failed to subscribe to '{}': {}", pattern, e))?;
-            self.subscribed = Some(subscribed);
-        } else if let Some(ref mut socket) = self.subscribed {
-            // Already subscribed - add another topic
-            socket
-                .subscribe(pattern.as_bytes())
-                .map_err(|e| anyhow!("Failed to subscribe to '{}': {}", pattern, e))?;
-        } else {
-            return Err(anyhow!("Subscriber in invalid state"));
-        }
-
-        Ok(())
+        self.inner.subscribe(pattern)
     }
 
-    /// Subscribe to all events
+    /// Subscribe to all events.
     pub fn subscribe_all(&mut self) -> Result<()> {
-        self.subscribe("")
+        self.inner.subscribe_all()
     }
 
-    /// Unsubscribe from a topic pattern
+    /// Unsubscribe from a topic pattern. Must be called before `recv()`.
     pub fn unsubscribe(&mut self, pattern: &str) -> Result<()> {
-        match &mut self.subscribed {
-            None => Err(anyhow!("Cannot unsubscribe: no active subscriptions")),
-            Some(socket) => {
-                socket
-                    .unsubscribe(pattern.as_bytes())
-                    .map_err(|e| anyhow!("Failed to unsubscribe from '{}': {}", pattern, e))?;
-                Ok(())
-            }
-        }
+        self.inner.unsubscribe(pattern)
     }
 
-    /// Receive the next event asynchronously
+    /// Receive the next event asynchronously.
     ///
-    /// Returns (topic, payload) tuple.
-    /// Blocks until an event is received or the stream ends.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if `subscribe()` hasn't been called yet.
+    /// Returns `(topic, payload)`. Blocks until an event arrives.
     pub async fn recv(&mut self) -> Result<(String, Vec<u8>)> {
-        let socket = self.subscribed.as_mut().ok_or_else(|| {
-            anyhow!("No subscriptions active. Call subscribe() before recv()")
-        })?;
-
-        match socket.next().await {
-            Some(Ok(multipart)) => {
-                let parts: Vec<_> = multipart.into_iter().collect();
-                if parts.len() < 2 {
-                    return Err(anyhow!(
-                        "Invalid message format: expected 2 frames, got {}",
-                        parts.len()
-                    ));
-                }
-                let topic = String::from_utf8(parts[0].to_vec())
-                    .map_err(|e| anyhow!("Invalid UTF-8 in topic: {}", e))?;
-                let payload = parts[1].to_vec();
-                Ok((topic, payload))
-            }
-            Some(Err(e)) => Err(anyhow!("Receive error: {}", e)),
-            None => Err(anyhow!("Subscriber stream ended")),
-        }
+        self.inner.recv().await
     }
 
-    /// Receive with timeout
+    /// Receive with timeout.
     ///
-    /// Returns `Ok(Some((topic, payload)))` if event received,
+    /// Returns `Ok(Some((topic, payload)))` if event received within timeout,
     /// `Ok(None)` if timeout elapsed, or `Err` on error.
     pub async fn recv_timeout(&mut self, timeout: Duration) -> Result<Option<(String, Vec<u8>)>> {
-        match tokio::time::timeout(timeout, self.recv()).await {
-            Ok(result) => result.map(Some),
-            Err(_) => Ok(None),
-        }
+        self.inner.recv_timeout(timeout).await
     }
 
-    /// Try to receive without blocking
-    ///
-    /// Returns `Ok(Some((topic, payload)))` if event available,
-    /// `Ok(None)` if no event ready.
+    /// Try to receive without blocking.
     pub async fn try_recv(&mut self) -> Result<Option<(String, Vec<u8>)>> {
-        self.recv_timeout(Duration::from_millis(0)).await
+        self.inner.try_recv().await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    
-
     #[test]
     fn test_subscription_patterns() {
-        // These are valid subscription patterns
         let patterns = vec![
             "",                           // All events
             "worker.",                    // All worker events
