@@ -68,6 +68,11 @@ struct HandlerInner {
     /// Caps concurrent bidi streams in flight. Hold one permit per stream.
     stream_limit: Arc<Semaphore>,
     stream_limit_capacity: u32,
+    /// Caps concurrent accepted connections (#165). iroh's Router spawns
+    /// each accepted connection into an unbounded JoinSet — connections beyond
+    /// this cap are rejected (dropped) rather than queued so a peer opening
+    /// many idle connections can't exhaust fd/memory.
+    connection_limit: Arc<Semaphore>,
     /// Per-stream request-read timeout (#159 slowloris bound).
     read_timeout: std::time::Duration,
     /// Level-triggered shutdown signal: once `cancel()` is called, every
@@ -106,6 +111,9 @@ impl IrohRpcProtocolHandler {
                 signing_key,
                 stream_limit: Arc::new(Semaphore::new(stream_limit)),
                 stream_limit_capacity,
+                connection_limit: Arc::new(Semaphore::new(
+                    super::rpc_session::DEFAULT_CONNECTION_LIMIT,
+                )),
                 read_timeout: super::rpc_session::REQUEST_READ_TIMEOUT,
                 shutdown: CancellationToken::new(),
             }),
@@ -131,6 +139,7 @@ impl IrohRpcProtocolHandler {
                     signing_key: i.signing_key.clone(),
                     stream_limit: Arc::clone(&i.stream_limit),
                     stream_limit_capacity: i.stream_limit_capacity,
+                    connection_limit: Arc::clone(&i.connection_limit),
                     read_timeout,
                     shutdown: i.shutdown.clone(),
                 });
@@ -142,6 +151,19 @@ impl IrohRpcProtocolHandler {
 
 impl ProtocolHandler for IrohRpcProtocolHandler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        // Connection cap (#165): reject (drop) at cap rather than queue.
+        // iroh's Router spawns each accepted connection into an unbounded
+        // JoinSet — this try_acquire enforces the same bound QuinnRpcServer
+        // and UdsRpcServer apply. The permit is held for the connection's
+        // entire lifetime (dropped when this fn returns).
+        let _conn_permit = match Arc::clone(&self.inner.connection_limit).try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!("iroh-rpc: connection cap reached, rejecting connection");
+                return Ok(());
+            }
+        };
+
         // Adapt the raw iroh `Connection` to the transport-generic `Session`
         // abstraction and delegate to the shared accept loop. Drain semantics
         // (`shutdown` below draining the same `Semaphore`) are unchanged.
