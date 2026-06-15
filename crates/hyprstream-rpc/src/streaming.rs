@@ -1437,6 +1437,11 @@ impl StreamChannel {
     /// - Re-authorizing an existing stream by ID
     /// - Legacy stream authorization
     pub async fn register_topic(&self, topic: &str, expiry: i64, claims: Option<Claims>) -> Result<()> {
+        // moq path: topic is published lazily by MoqStreamPublisher on first frame; no pre-registration needed.
+        if crate::moq_stream::global_moq_origin().is_some() {
+            return Ok(());
+        }
+
         let register_msg = build_stream_register_envelope(
             topic,
             expiry,

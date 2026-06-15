@@ -80,7 +80,9 @@ struct NotificationResponse {
 struct SubscribeResponse {
   subscriptionId @0 :Text;
   assignedTopic @1 :Text;      # XPUB topic (pre-registered with StreamService)
-  streamEndpoint @2 :Text;     # StreamService XPUB endpoint to connect to
+  streamEndpoint @2 :Text;     # StreamService XPUB endpoint; empty when moq is active
+  moqUdsPath @3 :Text;         # Path to moq UDS socket; empty when ZMQ is active
+  moqBroadcastPath @4 :Text;   # moq broadcast path for the assigned topic; empty when ZMQ is active
 }
 
 struct PublishIntentResponse {

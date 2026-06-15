@@ -470,13 +470,27 @@ impl NotificationHandler for NotificationService {
 
         debug!("Subscriber {} registered for topic {}", sub_id, topic);
 
-        // Get StreamService endpoint for client to connect SUB socket
-        let stream_endpoint = self.stream_channel.stream_endpoint();
+        // Populate transport fields for the subscriber.
+        // moq path: return the UDS socket path and broadcast path; leave stream_endpoint empty.
+        // ZMQ path: return the XPUB endpoint; leave moq fields empty.
+        let (stream_endpoint, moq_uds_path, moq_broadcast_path) =
+            if let Some(uds) = hyprstream_rpc::moq_stream::global_moq_uds_path() {
+                let bc = format!(
+                    "{}/{}",
+                    hyprstream_rpc::moq_stream::DEFAULT_PREFIX,
+                    topic
+                );
+                (String::new(), uds.to_string_lossy().into_owned(), bc)
+            } else {
+                (self.stream_channel.stream_endpoint(), String::new(), String::new())
+            };
 
         Ok(NotificationResponseVariant::SubscribeResult(SubscribeResponse {
             subscription_id: sub_id.to_string(),
             assigned_topic: topic,
             stream_endpoint,
+            moq_uds_path,
+            moq_broadcast_path,
         }))
     }
 
