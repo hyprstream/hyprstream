@@ -54,6 +54,13 @@ fn service_token(service_name: &str) -> Option<String> {
 /// that needs it. Both PolicyService and RegistryService share this instance.
 static SHARED_GIT2DB: std::sync::OnceLock<Arc<RwLock<Git2DB>>> = std::sync::OnceLock::new();
 
+/// Shared JTI blocklist Arc — set by `create_policy_service`, read by
+/// `create_oauth_service`. Because PolicyService is always created first
+/// (OAuthService `depends_on = ["policy"]`), the lock is always populated
+/// before `create_oauth_service` runs.
+static SHARED_JTI_BLOCKLIST: std::sync::OnceLock<Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>> =
+    std::sync::OnceLock::new();
+
 /// Get or initialize the shared Git2DB registry for the given models directory.
 fn get_or_init_git2db(models_dir: &std::path::Path) -> anyhow::Result<Arc<RwLock<Git2DB>>> {
     if let Some(existing) = SHARED_GIT2DB.get() {
@@ -390,6 +397,11 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         let ml_dsa_store = crate::auth::key_rotation::global_ml_dsa_key_store(&secrets_dir, &config.oauth);
         policy_service = policy_service.with_ml_dsa_key_store(ml_dsa_store);
     }
+
+    // Publish the JTI blocklist Arc so OAuthService (created later) can share it.
+    // This wires POST /oauth/revoke → PolicyService RPC enforcement: a revoked
+    // access token is rejected by both the HTTP path and the RPC auth check.
+    let _ = SHARED_JTI_BLOCKLIST.set(policy_service.jti_blocklist_arc());
 
     Ok(ctx.into_spawnable_quic(policy_service, config.policy.quic_port))
 }
@@ -785,7 +797,7 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     // Pass signing key instead of a pre-created PolicyClient.
     // OAuthService runs in its own tokio runtime (separate thread), so the
     // PolicyClient must be created inside that runtime for ZMQ async I/O to work.
-    let oauth_service = OAuthService::new(
+    let mut oauth_service = OAuthService::new(
         config.oauth.clone(),
         config.tls.clone(),
         sk,
@@ -794,6 +806,11 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
         ctx.verifying_key(),
         ctx.jwt_verifying_key(),
     );
+    if let Some(bl) = SHARED_JTI_BLOCKLIST.get() {
+        oauth_service = oauth_service.with_jti_blocklist(Arc::clone(bl));
+    } else {
+        tracing::warn!("JTI blocklist not set by PolicyService factory — revoked access tokens will not be blocked at RPC layer");
+    }
 
     Ok(Box::new(oauth_service))
 }

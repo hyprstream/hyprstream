@@ -274,6 +274,8 @@ pub struct OAuthService {
     /// JWT verifying key (CA key) for JWKS endpoint. This is the key that verifies
     /// JWTs signed by PolicyService, derived from the root signing key.
     jwt_verifying_key: [u8; 32],
+    /// Shared JTI blocklist (same Arc as PolicyService) for cross-plane revocation.
+    jti_blocklist: Option<Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>>,
 }
 
 impl OAuthService {
@@ -294,7 +296,14 @@ impl OAuthService {
             control_transport,
             verifying_key,
             jwt_verifying_key: jwt_verifying_key.to_bytes(),
+            jti_blocklist: None,
         }
+    }
+
+    /// Attach the shared JTI blocklist (same Arc as PolicyService).
+    pub fn with_jti_blocklist(mut self, bl: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>) -> Self {
+        self.jti_blocklist = Some(bl);
+        self
     }
 }
 
@@ -515,6 +524,9 @@ impl Spawnable for OAuthService {
             oauth_state = oauth_state.with_es256_key_store(Arc::clone(&es256_store));
             {
                 oauth_state = oauth_state.with_ml_dsa_key_store(Arc::clone(&ml_dsa_store));
+            }
+            if let Some(bl) = self.jti_blocklist {
+                oauth_state = oauth_state.with_jti_blocklist(bl);
             }
             // Populate legacy JWKS nbf/exp from signing-key file mtime (used when store absent).
             let key_nbf = crate::auth::identity_store::node_signing_key_mtime(&credentials_dir);

@@ -459,6 +459,16 @@ impl OAuthState {
         self
     }
 
+    /// Attach the shared JWT ID blocklist (shared with PolicyService).
+    ///
+    /// When set, `POST /oauth/revoke` on access tokens writes the JTI into
+    /// this blocklist so the PolicyService RPC enforcement path also rejects
+    /// revoked tokens — closing the gap between HTTP revocation and RPC auth.
+    pub fn with_jti_blocklist(mut self, bl: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>) -> Self {
+        self.jti_blocklist = Some(bl);
+        self
+    }
+
     /// Return the verifying key to use for JWT bearer token validation.
     ///
     /// Prefers the active slot from the signing key store; falls back to the
