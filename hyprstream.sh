@@ -26,8 +26,18 @@ else
   BITSANDBYTES_LIB_DIR=${BITSANDBYTES_LIB_PATH:-$DEPS_DIR/bitsandbytes/bitsandbytes}
 fi
 
-# GPU architecture
-export PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH:-gfx90a}
+# GPU architecture: auto-detect via rocminfo rather than hardcoding gfx90a (#228).
+# rocminfo lists "Name: gfxXXXX" for each GPU agent; we take the first match.
+# Falls back to gfx90a (MI210) only when PYTORCH_ROCM_ARCH is already set by the user
+# OR when rocminfo is unavailable (e.g. no ROCm install).
+if [ -z "${PYTORCH_ROCM_ARCH:-}" ]; then
+    _detected_arch=$(rocminfo 2>/dev/null | grep -m1 -oP 'Name:\s+\Kgfx\S+' || true)
+    if [ -n "$_detected_arch" ]; then
+        export PYTORCH_ROCM_ARCH="$_detected_arch"
+    else
+        export PYTORCH_ROCM_ARCH=gfx90a
+    fi
+fi
 
 # Libtorch build settings
 export LIBTORCH_STATIC=0
