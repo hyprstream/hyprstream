@@ -4,13 +4,12 @@
 //! - `Transport` / `AsyncTransport` traits for generic transport abstraction
 //! - `TransportConfig` for unified endpoint configuration
 //! - Systemd socket activation support via `SystemdFd` variant
-//! - QUIC transport via `zmtp_quic` module (ZMTP 3.1 over QUIC)
+//! - QUIC/WebTransport via `zmtp_quic` (WebTransportServer + process_request; ZMQ removal pending #138)
 //! - Raw socket options via `sockopt` submodule
 
 mod traits;
 pub mod sockopt;
 pub mod zmtp_quic;
-pub mod quic_stream_bridge;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod iroh_substrate;
 #[cfg(not(target_arch = "wasm32"))]
