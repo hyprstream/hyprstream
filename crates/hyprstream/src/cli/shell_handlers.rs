@@ -1728,11 +1728,7 @@ async fn fetch_models(
         }
     };
 
-    let registry_endpoint = hyprstream_rpc::registry::global()
-        .endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep)
-        .to_zmq_string();
-    let registry: crate::services::RegistryClient = match crate::services::RegistryClient::for_endpoint(
-        &registry_endpoint,
+    let registry: crate::services::RegistryClient = match crate::services::RegistryClient::for_service(
         signing_key.clone(),
         registry_server_vk,
         None,
