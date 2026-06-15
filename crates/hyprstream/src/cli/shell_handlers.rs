@@ -235,45 +235,72 @@ pub async fn handle_shell_tui(
         .context("mac_key must be 32 bytes")?;
     let topic = stdout_stream.topic.clone();
 
-    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-    let sub_endpoint = hyprstream_rpc::registry::global()
-        .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
-        .to_zmq_string();
-    let zmq_ctx = zmq::Context::new();
-    let sub_socket = zmq_ctx.socket(zmq::SUB)?;
-    sub_socket.connect(&sub_endpoint)?;
-    sub_socket.set_subscribe(topic.as_bytes())?;
-    sub_socket.set_linger(0)?;
-    sub_socket.set_rcvtimeo(1000)?; // 1s timeout so recv unblocks periodically for shutdown
+    use hyprstream_rpc::moq_stream::{verify_moq_frame, STREAM_TRACK};
+    use hyprstream_rpc::transport::uds_session::{connect_uds, PLANE_MOQ};
+    use moq_net::{Client as MoqClient, Origin};
 
-    let _recv_handle = tokio::task::spawn_blocking(move || {
+    anyhow::ensure!(
+        !stdout_stream.moq_uds_path.is_empty(),
+        "TUI service did not return a moq UDS path — server may be in ZMQ-only mode"
+    );
+
+    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+    let uds_path = stdout_stream.moq_uds_path.clone();
+    let broadcast_path = stdout_stream.moq_broadcast_path.clone();
+    let topic_str = topic.clone();
+    let _recv_handle = tokio::spawn(async move {
+        let session = match connect_uds(&uds_path, PLANE_MOQ).await {
+            Ok(s) => s,
+            Err(e) => { tracing::warn!("moq UDS connect: {e}"); return; }
+        };
+        let client_origin = Origin::random().produce();
+        let client_consumer = client_origin.consume();
+        let moq_client = MoqClient::new().with_consume(client_origin);
+        let _session = match moq_client.connect(session).await {
+            Ok(s) => s,
+            Err(e) => { tracing::warn!("moq handshake: {e}"); return; }
+        };
+        let bc = match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client_consumer.announced_broadcast(&broadcast_path),
+        ).await {
+            Ok(Some(bc)) => bc,
+            Ok(None) => { tracing::warn!("broadcast {broadcast_path} not announced"); return; }
+            Err(_) => { tracing::warn!("timeout waiting for broadcast {broadcast_path}"); return; }
+        };
+        let mut track = match bc.subscribe_track(&moq_net::Track::new(STREAM_TRACK)) {
+            Ok(t) => t,
+            Err(e) => { tracing::warn!("subscribe_track: {e}"); return; }
+        };
         let mut verifier = StreamVerifier::new(mac_key, topic);
         loop {
-            let mut frames: Vec<Vec<u8>> = Vec::with_capacity(3);
-            match sub_socket.recv_bytes(0) {
-                Ok(f) => frames.push(f),
-                Err(zmq::Error::EAGAIN) => {
-                    // Timeout — check if the receiver is still alive.
-                    if frame_tx.is_closed() { return; }
-                    continue;
-                }
-                Err(_) => break,
-            }
-            while sub_socket.get_rcvmore().unwrap_or(false) {
-                match sub_socket.recv_bytes(0) {
-                    Ok(f) => frames.push(f),
-                    Err(_) => break,
-                }
-            }
-            match verifier.verify(&frames) {
+            let group_result = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                track.next_group(),
+            ).await;
+            let mut group = match group_result {
+                Ok(Ok(Some(g))) => g,
+                Ok(Ok(None)) => break,
+                Ok(Err(e)) => { tracing::debug!("moq next_group: {e}"); break; }
+                Err(_) => { tracing::debug!("moq next_group timeout"); break; }
+            };
+            let frame: bytes::Bytes = match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                group.read_frame(),
+            ).await {
+                Ok(Ok(Some(f))) => f,
+                _ => continue,
+            };
+            match verify_moq_frame(&mut verifier, &topic_str, &frame) {
                 Ok(payloads) => {
                     for p in payloads {
                         if let StreamPayload::Data(data) = p {
-                            if frame_tx.blocking_send(data).is_err() { return; }
+                            if frame_tx.send(data).await.is_err() { return; }
                         }
                     }
                 }
-                Err(e) => tracing::warn!("Frame stream verification failed: {e}"),
+                Err(e) => tracing::warn!("moq frame verify: {e}"),
             }
         }
     });
