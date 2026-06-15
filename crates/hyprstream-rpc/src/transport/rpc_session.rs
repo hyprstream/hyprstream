@@ -38,14 +38,20 @@ use web_transport_trait::{RecvStream, SendStream, Session};
 
 use crate::transport_traits::{PublishSink, Transport};
 
-/// Hard cap on per-frame size (request or response). Mirrors the WebTransport
-/// server-side cap used in [`crate::transport::zmtp_quic`].
-pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+/// Hard cap on per-frame size (request or response) for the RPC control plane.
+///
+/// SECURITY (#162): the original 64 MiB cap would let an attacker buffer up to
+/// `64 MiB × DEFAULT_STREAM_LIMIT` (= 4 GiB) across concurrent streams before
+/// any application-layer rejection. The RPC plane carries control messages only
+/// (SQL queries, metric batches, Cap'n Proto envelopes) — no ingest blobs,
+/// no streaming chunks. Those belong on the streaming ALPN (moq-net). 4 MiB is
+/// generous for any realistic control-plane payload.
+pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 
 /// Default concurrent-stream cap. NOTE: the `Arc<Semaphore>` this sizes is
 /// shared **server-wide** across all connections (one `Arc<HandlerInner>`),
 /// not per-connection — so this bounds total in-flight streams for the whole
-/// server, capping memory to `MAX_FRAME_BYTES × DEFAULT_STREAM_LIMIT`.
+/// server, capping memory to `MAX_FRAME_BYTES × DEFAULT_STREAM_LIMIT` = 256 MiB.
 pub const DEFAULT_STREAM_LIMIT: usize = 64;
 
 /// Grace period for [`SendStream::closed`] after writing the response — if

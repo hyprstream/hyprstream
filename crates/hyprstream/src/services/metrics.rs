@@ -662,6 +662,14 @@ mod tests {
     async fn start_metrics_service(
         tag: &str,
     ) -> (MetricsClient, InprocManager) {
+        // Tests use Classical (EdDSA-only) keys — install Classical verify
+        // policy so the global fail-closed Hybrid default doesn't reject them.
+        let _ = hyprstream_rpc::envelope::install_verify_config(
+            hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+                policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
+                pq_store: None,
+            },
+        );
         let (signing_key, _vk) = generate_signing_keypair();
         let context = global_context();
 

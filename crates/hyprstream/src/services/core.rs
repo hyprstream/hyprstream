@@ -65,6 +65,14 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_request_loop() {
+        // Tests use Classical (EdDSA-only) keys — install Classical verify
+        // policy so the global fail-closed Hybrid default doesn't reject them.
+        let _ = hyprstream_rpc::envelope::install_verify_config(
+            hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+                policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
+                pq_store: None,
+            },
+        );
         let local = tokio::task::LocalSet::new();
         local.run_until(async {
             let transport = TransportConfig::inproc("test-echo-service-core");
@@ -88,6 +96,12 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_corrupted_envelope_rejected() {
+        let _ = hyprstream_rpc::envelope::install_verify_config(
+            hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+                policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
+                pq_store: None,
+            },
+        );
         let local = tokio::task::LocalSet::new();
         local.run_until(async {
             let transport = TransportConfig::inproc("test-corrupted-envelope-core");

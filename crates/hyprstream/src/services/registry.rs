@@ -2763,6 +2763,15 @@ mod tests {
         use hyprstream_service::InprocManager;
         use hyprstream_rpc::transport::TransportConfig;
 
+        // Tests use Classical (EdDSA-only) keys — install Classical verify
+        // policy so the global fail-closed Hybrid default doesn't reject them.
+        let _ = hyprstream_rpc::envelope::install_verify_config(
+            hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+                policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
+                pq_store: None,
+            },
+        );
+
         let temp_dir = TempDir::new().expect("test: create temp dir");
         let context = crate::zmq::global_context();
 
