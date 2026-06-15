@@ -1009,6 +1009,15 @@ pub struct OAuthConfig {
     /// Override rotation check interval in seconds (default: 21600 = 6 hours).
     #[serde(default)]
     pub jwt_key_rotation_check_secs: Option<u64>,
+
+    /// Enforce RFC 9126 Pushed Authorization Requests at `/oauth/authorize`.
+    ///
+    /// When `true`, the authorization endpoint rejects any request that does
+    /// not arrive via a `request_uri` referencing a prior `/oauth/par` call.
+    /// Advertised in server metadata as `require_pushed_authorization_requests`.
+    /// Defaults to `false` for compatibility.
+    #[serde(default)]
+    pub require_pushed_authorization_requests: bool,
 }
 
 fn default_oauth_cors() -> server::CorsConfig {
@@ -1040,6 +1049,7 @@ impl Default for OAuthConfig {
             jwt_key_lead_secs: None,
             jwt_key_drain_secs: None,
             jwt_key_rotation_check_secs: None,
+            require_pushed_authorization_requests: false,
         }
     }
 }

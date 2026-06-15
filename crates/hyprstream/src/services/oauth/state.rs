@@ -310,6 +310,9 @@ pub struct OAuthState {
     pub token_ttl: u32,
     /// Refresh token TTL in seconds
     pub refresh_token_ttl: u32,
+    /// When true, `/oauth/authorize` rejects inline params and requires a `request_uri`
+    /// from a prior `/oauth/par` call (RFC 9126). Advertised in server metadata.
+    pub require_pushed_authorization_requests: bool,
     /// HTTP client for fetching Client ID Metadata Documents
     pub http_client: reqwest::Client,
     /// Raw Ed25519 verifying key bytes (32 bytes) for the JWKS endpoint.
@@ -391,6 +394,7 @@ impl OAuthState {
             default_scopes: config.default_scopes.clone(),
             token_ttl: config.token_ttl_seconds,
             refresh_token_ttl: config.refresh_token_ttl_seconds,
+            require_pushed_authorization_requests: config.require_pushed_authorization_requests,
             http_client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
                 .build()
