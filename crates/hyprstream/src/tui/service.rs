@@ -17,6 +17,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use hyprstream_rpc::moq_stream::{AnyStreamPublisher, global_moq_origin};
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::streaming::{
     BatchingConfig, StreamChannel, StreamContext, StreamPublisher, StreamPublisherConfig,
@@ -47,16 +48,18 @@ pub enum DisplayMode {
 
 /// A connected viewer's handle — tracks its publisher and health.
 ///
-/// This is `!Send` because `StreamPublisher` contains a `tmq::push::Push` socket.
-/// Viewer handles live on the frame loop's local task (spawned via `spawn_local`).
+/// On the ZMQ path `AnyStreamPublisher::Zmq` wraps a `tmq::push::Push` socket
+/// (`!Send`); viewer handles therefore live on the frame loop's local task
+/// (spawned via `spawn_local`).  On the moq path the publisher is `Send`, but
+/// `spawn_local` is kept for uniformity.
 struct ViewerHandle {
     /// Viewer ID.
     id: u32,
     /// FD 1 (stdout): dedicated publisher for this viewer's frame stream.
-    publisher: StreamPublisher,
+    publisher: AnyStreamPublisher,
     /// FD 0 (stdin): publisher for relaying viewer input back to the CLI process.
     /// Only populated when a session has a remote process that needs input relay.
-    stdin_publisher: Option<StreamPublisher>,
+    stdin_publisher: Option<AnyStreamPublisher>,
     /// How this viewer wants frames encoded.
     display_mode: DisplayMode,
     /// Consecutive frames that failed to send (HWM full).
@@ -382,7 +385,6 @@ impl TuiService {
         // Build continuation: send viewer registration to frame loop
         let sessions_reg = Arc::clone(&self.sessions);
         let tui_state = Arc::clone(&self.state);
-        let zmq_context = Arc::clone(&self.context);
         let sk = self.signing_key.clone();
         let stdin_queues = Arc::clone(&self.stdin_queues);
         let continuation: Continuation = Box::pin(async move {
@@ -393,9 +395,8 @@ impl TuiService {
                 // Spawn frame loop for this session
                 let s = Arc::clone(&tui_state);
                 let c = cancel.clone();
-                let ctx = Arc::clone(&zmq_context);
                 let sq = Arc::clone(&stdin_queues);
-                tokio::task::spawn_local(run_frame_loop(s, sid, rx, ctx, sk, c, sq));
+                tokio::task::spawn_local(run_frame_loop(s, sid, rx, sk, c, sq));
                 info!(session_id = sid, "Frame loop spawned");
                 (tx, cancel)
             });
@@ -1839,7 +1840,6 @@ pub(crate) async fn run_frame_loop(
     state: Arc<RwLock<TuiState>>,
     session_id: u32,
     mut cmd_rx: CommandReceiver,
-    zmq_context: Arc<zmq::Context>,
     signing_key: SigningKey,
     cancel: CancellationToken,
     stdin_queues: StdinQueues,
@@ -1850,23 +1850,22 @@ pub(crate) async fn run_frame_loop(
         s.subscribe()
     };
 
-    // Viewer list lives here (local, !Send is OK)
+    // Viewer list lives here (local, !Send is OK on ZMQ path)
     let mut viewers: Vec<ViewerHandle> = Vec::new();
     // Hosted processes attached to panes (pane_id → PaneProcess)
     let mut processes: HashMap<u32, super::process::PaneProcess> = HashMap::new();
     // Previous frame snapshot for incremental diffs (per-pane, keyed by pane_id)
     let mut prev_cells: HashMap<u32, Vec<Cell>> = HashMap::new();
     let mut has_damage = false;
-    // Delayed initial frame: after a viewer registers, wait for the ZMQ SUB to connect
-    // before publishing the first frame (avoids "slow joiner" race condition).
+    // Delayed initial frame: after a viewer registers, wait for ZMQ SUB to connect
+    // (slow-joiner race) or for the moq subscriber to appear before the first publish.
     let mut initial_frame_at: Option<tokio::time::Instant> = None;
     // Periodic heartbeat: re-publish a full frame every 2s when viewers are present.
-    // This guarantees late-joining viewers (whose SUB socket connected after the
-    // initial_frame_at fired) receive current state without waiting for new damage.
+    // This guarantees late-joining viewers receive current state without waiting for new damage.
     let mut heartbeat_at = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
 
-    // StreamChannel for creating dedicated publisher sockets
-    let stream_channel = StreamChannel::new(zmq_context, signing_key);
+    // StreamChannel for creating publisher sockets (ZMQ or moq, auto-dispatched).
+    let stream_channel = StreamChannel::new(crate::zmq::global_context(), signing_key);
 
     info!(session_id, "Frame loop started");
 
@@ -1883,8 +1882,7 @@ pub(crate) async fn run_frame_loop(
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
                     FrameLoopCommand::RegisterViewer(pending) => {
-                        // Pre-authorize stream topics with the StreamService proxy.
-                        // Without this, the proxy rejects subscriptions.
+                        // ZMQ-only: dedicated socket config + batching for frame publishing.
                         let publisher_config = StreamPublisherConfig { sndhwm: 100, dedicated: true };
                         let batching = BatchingConfig {
                             min_batch_size: 1,
@@ -1894,23 +1892,39 @@ pub(crate) async fn run_frame_loop(
                             max_rate: 30.0,
                         };
                         let exp = chrono::Utc::now().timestamp() + 86400; // 24h expiry
+                        let use_zmq = global_moq_origin().is_none();
 
                         // FD 0 (stdin): input relay publisher — only for Capnp-mode viewers
                         // (i.e. the CLI cast player). Ansi-mode viewers don't need it;
                         // their keyboard input falls through to VTE when no producer exists.
-                        let stdin_publisher = if pending.display_mode == DisplayMode::Capnp {
+                        let stdin_publisher: Option<AnyStreamPublisher> = if pending.display_mode == DisplayMode::Capnp {
                             if let Some(stdin_ctx) = pending.stream_ctxs.first() {
                                 let topic = stdin_ctx.topic().to_owned();
-                                if let Err(e) = stream_channel.register_topic(&topic, exp, None).await {
-                                    warn!(viewer_id = pending.id, error = %e, "Failed to register stdin topic");
+                                // ZMQ path: pre-register with StreamService proxy so subscriptions
+                                // aren't rejected. moq Origin handles access control natively.
+                                if use_zmq {
+                                    if let Err(e) = stream_channel.register_topic(&topic, exp, None).await {
+                                        warn!(viewer_id = pending.id, error = %e, "Failed to register stdin topic");
+                                    }
                                 }
-                                match stream_channel.create_publisher_socket(&publisher_config) {
-                                    Ok(socket) => Some(StreamPublisher::with_dedicated_socket(
-                                        socket, stdin_ctx, batching.clone(),
-                                    )),
+                                match stream_channel.publisher(stdin_ctx).await {
+                                    Ok(pub_) => Some(pub_),
                                     Err(e) => {
-                                        warn!(viewer_id = pending.id, error = %e, "Failed to create stdin publisher");
-                                        None
+                                        if use_zmq {
+                                            // ZMQ dedicated socket: fall back to custom batching config
+                                            match stream_channel.create_publisher_socket(&publisher_config) {
+                                                Ok(socket) => Some(AnyStreamPublisher::Zmq(
+                                                    StreamPublisher::with_dedicated_socket(socket, stdin_ctx, batching.clone()),
+                                                )),
+                                                Err(e2) => {
+                                                    warn!(viewer_id = pending.id, error = %e2, "Failed to create stdin publisher");
+                                                    None
+                                                }
+                                            }
+                                        } else {
+                                            warn!(viewer_id = pending.id, error = %e, "Failed to create stdin publisher");
+                                            None
+                                        }
                                     }
                                 }
                             } else {
@@ -1929,10 +1943,13 @@ pub(crate) async fn run_frame_loop(
                             }
                         };
                         let stdout_topic = stdout_ctx.topic().to_owned();
-                        if let Err(e) = stream_channel.register_topic(&stdout_topic, exp, None).await {
-                            warn!(viewer_id = pending.id, error = %e, "Failed to register stdout topic");
-                        } else {
-                            debug!(viewer_id = pending.id, topic = %stdout_topic, "Stream topic registered with proxy");
+                        // ZMQ path only: pre-register topic with StreamService proxy.
+                        if use_zmq {
+                            if let Err(e) = stream_channel.register_topic(&stdout_topic, exp, None).await {
+                                warn!(viewer_id = pending.id, error = %e, "Failed to register stdout topic");
+                            } else {
+                                debug!(viewer_id = pending.id, topic = %stdout_topic, "Stream topic registered with proxy");
+                            }
                         }
 
                         // Register a stdin queue for Capnp-mode viewers so they can
@@ -1942,11 +1959,20 @@ pub(crate) async fn run_frame_loop(
                             queues.entry(pending.id).or_default();
                         }
 
-                        match stream_channel.create_publisher_socket(&publisher_config) {
-                            Ok(socket) => {
-                                let publisher = StreamPublisher::with_dedicated_socket(
+                        // Build stdout publisher: moq path via stream_channel.publisher();
+                        // ZMQ path uses a dedicated socket with custom batching config.
+                        let publisher_result: Result<AnyStreamPublisher, _> = if use_zmq {
+                            stream_channel.create_publisher_socket(&publisher_config).map(|socket| {
+                                AnyStreamPublisher::Zmq(StreamPublisher::with_dedicated_socket(
                                     socket, stdout_ctx, batching,
-                                );
+                                ))
+                            })
+                        } else {
+                            stream_channel.publisher(stdout_ctx).await
+                        };
+
+                        match publisher_result {
+                            Ok(publisher) => {
                                 viewers.push(ViewerHandle {
                                     id: pending.id,
                                     publisher,

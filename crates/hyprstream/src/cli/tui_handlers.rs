@@ -21,13 +21,9 @@ use crate::services::generated::tui_client::{TuiClient, ConnectRequest, DisplayM
 
 /// Create a TuiClient for RPC calls.
 ///
-/// Resolves the TUI service endpoint from the registry and creates a client
-/// with the given signing key and local identity. Uses PolicyClient to resolve
-/// the TUI service's verifying key at runtime.
+/// Resolves the TUI service verifying key via PolicyService, then dials the
+/// TUI service via the registry (inproc or QUIC — transport-agnostic).
 pub fn create_tui_client(signing_key: &SigningKey) -> TuiClient {
-    use hyprstream_rpc::registry::{global as registry, SocketKind};
-
-    let endpoint = registry().endpoint("tui", SocketKind::Rep).to_zmq_string();
     let sk = signing_key.clone();
 
     // Bootstrap: PolicyService uses the root key in inproc mode
@@ -59,7 +55,7 @@ pub fn create_tui_client(signing_key: &SigningKey) -> TuiClient {
         }
     };
 
-    match TuiClient::for_endpoint(&endpoint, sk, server_vk, None) {
+    match TuiClient::for_service(sk, server_vk, None) {
         Ok(c) => c,
         Err(e) => panic!("Failed to create TuiClient: {e}"),
     }
@@ -119,6 +115,12 @@ pub async fn handle_tui_attach(signing_key: &SigningKey, session_id: Option<u32>
 /// Uses `StreamVerifier` for Blake3 HMAC chain verification of incoming
 /// StreamBlock messages. The verifier checks that each block's MAC is
 /// valid relative to the previous block, ensuring no reordering or tampering.
+// TODO(#134/moq-sub): On the moq path `run_attach_loop` must subscribe to the
+// viewer's track via WebTransport QUIC rather than a raw ZMQ SUB socket.
+// The ConnectResult currently only carries a ZMQ sub_endpoint.  When moq is
+// the active transport the service should instead return the server's WebTransport
+// URL + broadcast path so the client can open a moq subscriber session here.
+// Until that wire change lands this function stays on the ZMQ path unchanged.
 async fn run_attach_loop(
     stream_info: &crate::services::generated::tui_client::StreamInfo,
     client: &TuiClient,

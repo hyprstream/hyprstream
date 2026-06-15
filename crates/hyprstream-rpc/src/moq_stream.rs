@@ -426,6 +426,20 @@ impl AnyStreamPublisher {
             Self::Moq(p) => p.is_cancelled(),
         }
     }
+
+    /// Non-blocking publish with HWM back-pressure detection (ZMQ path only).
+    ///
+    /// On the moq path every publish succeeds immediately (no HWM concept) and
+    /// always returns `Ok(true)`. The `rate` hint is ignored on the moq path.
+    pub async fn try_publish_data(&mut self, data: &[u8], rate: f32) -> Result<bool> {
+        match self {
+            Self::Zmq(p) => p.try_publish_data(data, rate).await,
+            Self::Moq(p) => {
+                let _ = rate;
+                p.publish_data(data).await.map(|_| true)
+            }
+        }
+    }
 }
 
 /// Consumer-side helper: split a moq Frame payload back into the ZMQ-style
