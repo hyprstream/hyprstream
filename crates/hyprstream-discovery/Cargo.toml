@@ -22,9 +22,6 @@ capnp = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-# ZMQ transport (needed for ZmqService impl)
-zmq = { workspace = true }
-
 # Error handling
 anyhow = { workspace = true }
 

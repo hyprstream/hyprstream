@@ -37,10 +37,6 @@ dashmap = { workspace = true }
 parking_lot = { workspace = true }
 once_cell = { workspace = true }
 
-# ZMQ transport
-zmq = { workspace = true }
-zmq-sys = { workspace = true }
-
 # Ed25519 (for factory::ServiceContext)
 ed25519-dalek = { workspace = true }
 
