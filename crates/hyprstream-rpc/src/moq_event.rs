@@ -20,7 +20,7 @@
 //! auditable streams. `SecureEventPublisher` / `SecureEventSubscriber` (Phase 7)
 //! layer group-key encryption on top and are unaffected by this transport change.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -80,7 +80,8 @@ struct EventOriginInner {
     /// Consumer over the same origin tree (for subscribers).
     consumer: OriginConsumer,
     /// Keep `BroadcastProducer`s alive so their broadcasts stay announced.
-    broadcasts: Mutex<Vec<BroadcastProducer>>,
+    /// Keyed by source name so re-registration replaces the stale producer.
+    broadcasts: Mutex<HashMap<String, BroadcastProducer>>,
 }
 
 impl MoqEventOrigin {
@@ -92,7 +93,7 @@ impl MoqEventOrigin {
             inner: Arc::new(EventOriginInner {
                 producer,
                 consumer,
-                broadcasts: Mutex::new(Vec::new()),
+                broadcasts: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -104,7 +105,7 @@ impl MoqEventOrigin {
             inner: Arc::new(EventOriginInner {
                 producer,
                 consumer,
-                broadcasts: Mutex::new(Vec::new()),
+                broadcasts: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -123,7 +124,8 @@ impl MoqEventOrigin {
         let track = broadcast.create_track(Track::new(EVENT_TRACK))?;
 
         // Retain the broadcast producer so it stays announced for the publisher's lifetime.
-        self.inner.broadcasts.lock().push(broadcast);
+        // HashMap keyed by source: re-registration replaces the stale producer atomically.
+        self.inner.broadcasts.lock().insert(source.to_owned(), broadcast);
 
         Ok(MoqEventPublisher {
             track,
@@ -317,14 +319,24 @@ async fn run_subscriber_task(
     patterns: Vec<String>,
     tx: mpsc::Sender<(String, Vec<u8>)>,
 ) {
+    use tokio::task::JoinSet;
+
     let patterns = Arc::new(patterns);
 
     // Scope the consumer to the `local/events` subtree, then further narrow by
     // source names extracted from the patterns.
-    let scoped_consumer = scope_consumer_for_patterns(&consumer, &patterns);
-    if let Some(c) = scoped_consumer {
-        consumer = c;
+    match scope_consumer_for_patterns(&consumer, &patterns) {
+        Some(c) => consumer = c,
+        None => {
+            // Origin has no `local/events` tree yet — using the root consumer would
+            // expose all RPC traffic to the event channel. Abort instead.
+            tracing::warn!("event subscriber: origin has no event scope; subscriber task exiting");
+            return;
+        }
     }
+
+    // Track per-broadcast read tasks so they are cancelled when this loop exits.
+    let mut tasks: JoinSet<()> = JoinSet::new();
 
     loop {
         let (path, broadcast) = match consumer.announced().await {
@@ -337,10 +349,11 @@ async fn run_subscriber_task(
         let patterns2 = patterns.clone();
         let path_str = path.as_str().to_owned();
 
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             read_event_broadcast(broadcast, path_str, patterns2, tx2).await;
         });
     }
+    // Dropping `tasks` here cancels all per-broadcast read tasks.
 }
 
 /// Scope the origin consumer to `local/events/{sources}` based on patterns.
@@ -410,7 +423,11 @@ async fn read_event_broadcast(
 
         let frame = match group.read_frame().await {
             Ok(Some(f)) => f,
-            _ => continue,
+            Ok(None) => break,   // group ended without a frame
+            Err(e) => {
+                tracing::warn!(error = %e, "event broadcast: frame read error");
+                break;
+            }
         };
 
         // Decode: [4 bytes topic_len BE][topic][payload]
