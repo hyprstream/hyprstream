@@ -111,6 +111,12 @@ fn validate_policy_component(component: &str, name: &str) -> Result<(), PolicyEr
         )));
     }
 
+    if component.contains('*') {
+        return Err(PolicyError::ValidationError(format!(
+            "{name} contains wildcard '*' (not allowed in user-supplied policy subjects)"
+        )));
+    }
+
     Ok(())
 }
 

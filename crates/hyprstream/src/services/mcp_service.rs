@@ -654,8 +654,13 @@ fn parse_stream_info(
     let server_pubkey: Vec<u8> = json["serverPubkey"].as_array()
         .ok_or_else(|| anyhow::anyhow!("missing serverPubkey in streaming response"))?
         .iter()
-        .map(|v| v.as_u64().unwrap_or(0) as u8)
-        .collect();
+        .enumerate()
+        .map(|(i, v)| {
+            v.as_u64()
+                .and_then(|n| u8::try_from(n).ok())
+                .ok_or_else(|| anyhow::anyhow!("serverPubkey[{i}]: value out of u8 range"))
+        })
+        .collect::<anyhow::Result<Vec<u8>>>()?;
     let qos: hyprstream_rpc::stream_info::StreamOpt = if json["qos"].is_object() {
         serde_json::from_value(json["qos"].clone()).unwrap_or_default()
     } else {

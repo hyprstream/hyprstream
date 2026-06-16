@@ -24,7 +24,15 @@ impl StoragePaths {
     /// the same host (mirrors the socket-path isolation in hyprstream-rpc/paths.rs).
     pub fn new() -> Result<Self> {
         let prefix = match std::env::var("HYPRSTREAM_INSTANCE") {
-            Ok(inst) if !inst.is_empty() => format!("{APP_NAME}/instances/{inst}"),
+            Ok(inst) if !inst.is_empty() => {
+                if inst.contains('/') || inst.contains("..") {
+                    return Err(anyhow!(
+                        "HYPRSTREAM_INSTANCE must not contain '/' or '..': {:?}",
+                        inst
+                    ));
+                }
+                format!("{APP_NAME}/instances/{inst}")
+            }
             _ => APP_NAME.to_owned(),
         };
         let base_dirs = BaseDirectories::with_prefix(&prefix)

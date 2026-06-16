@@ -47,9 +47,9 @@ jobs:
     - name: Install cargo-deny
       run: cargo install cargo-deny --locked 2>/dev/null || true
     - name: Check bans
-      # ZMQ deps emit warnings (not errors) until #138 removes them. When #138
-      # lands, flip the warn entries in deny.toml to deny entries.
-      run: cargo deny check bans licenses 2>&1 || true
+      # ZMQ crates are deny-listed in deny.toml (#138 complete). This gate must
+      # be able to fail — do NOT add `|| true`.
+      run: cargo deny check bans licenses
 
   wasm:
     name: WASM (browser client)
