@@ -1689,16 +1689,20 @@ impl ModelOperations for Qwen3_5Model {
 
     fn forward_with_cache(&self, input: &Tensor, start_pos: usize) -> Result<Tensor> {
         let hidden = self.forward_inner(Some(input), None, start_pos, None)?;
+        let seq_len = hidden.size()[1];
+        anyhow::ensure!(seq_len > 0, "forward_with_cache: empty token sequence (seq_len=0)");
         // Prefill optimization (#201): only run the expensive LM-head matmul over the
         // last position — the caller always discards all but the last token's logits.
-        let last = hidden.narrow(1, hidden.size()[1] - 1, 1);
+        let last = hidden.narrow(1, seq_len - 1, 1);
         let normed = self.norm.forward(&last)?;
         self.lm_head_apply(&normed)
     }
 
     fn forward_from_embeddings(&self, embeddings: &Tensor, start_pos: usize) -> Result<Tensor> {
         let hidden = self.forward_inner(None, Some(embeddings), start_pos, None)?;
-        let last = hidden.narrow(1, hidden.size()[1] - 1, 1);
+        let seq_len = hidden.size()[1];
+        anyhow::ensure!(seq_len > 0, "forward_from_embeddings: empty embedding sequence (seq_len=0)");
+        let last = hidden.narrow(1, seq_len - 1, 1);
         let normed = self.norm.forward(&last)?;
         self.lm_head_apply(&normed)
     }
@@ -1710,7 +1714,9 @@ impl ModelOperations for Qwen3_5Model {
         delta: Option<&crate::training::TenantDelta>,
     ) -> Result<Tensor> {
         let hidden = self.forward_inner(Some(input), None, start_pos, delta)?;
-        let last = hidden.narrow(1, hidden.size()[1] - 1, 1);
+        let seq_len = hidden.size()[1];
+        anyhow::ensure!(seq_len > 0, "forward_with_cache_and_delta: empty token sequence (seq_len=0)");
+        let last = hidden.narrow(1, seq_len - 1, 1);
         let normed = self.norm.forward(&last)?;
         self.lm_head_apply(&normed)
     }
