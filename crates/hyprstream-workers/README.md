@@ -36,6 +36,8 @@ hyprstream               (WorkerService factory, WorkflowService factory)
 | `WorkflowService` | Workflow discovery + trigger + execution orchestration |
 | `PodSandboxConfig` | CRI pod sandbox configuration |
 | `ContainerConfig` | OCI container spec |
+| `EventPublisher` | Async moq-lite event publisher (per-service lifecycle events) |
+| `EventSubscriber` | Async moq-lite event subscriber with dot-prefix filtering |
 
 ## Feature flags
 

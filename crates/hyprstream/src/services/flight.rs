@@ -1,8 +1,8 @@
-//! FlightService - Arrow Flight SQL with ZMQ control channel
+//! FlightService - Arrow Flight SQL with RPC control channel
 //!
 //! Dual-protocol service:
 //! - gRPC server for Flight SQL queries (data plane)
-//! - ZMQ REQ/REP for health, metrics, shutdown (control plane)
+//! - RPC (iroh/UDS) for health, metrics, shutdown (control plane)
 //!
 //! # Architecture
 //!
@@ -11,7 +11,7 @@
 //!                             │
 //!                             └──► DuckDB / Dataset Backend
 //!
-//! Control ──► ZMQ REP Socket ──► FlightService (health, metrics)
+//! Control ──► RPC endpoint ──► FlightService (health, metrics)
 //! ```
 //!
 //! # Usage
@@ -42,11 +42,11 @@ use tracing::{error, info};
 /// Service name for registry and logging
 pub const SERVICE_NAME: &str = "flight";
 
-/// FlightService - Arrow Flight SQL with ZMQ control channel
+/// FlightService - Arrow Flight SQL with RPC control channel
 ///
 /// This service provides:
 /// - gRPC server with Flight SQL protocol for dataset queries
-/// - ZMQ REQ/REP control channel for health checks
+/// - RPC control channel for health checks
 ///
 /// The Flight server uses hyprstream-flight crate for the actual
 /// Flight SQL implementation with DuckDB backend.
@@ -57,7 +57,7 @@ pub struct FlightService {
     /// Optional registry client for dataset lookup
     registry_client: Option<Arc<dyn hyprstream_metrics::RegistryClient>>,
 
-    /// Transport configuration for ZMQ control channel
+    /// Transport configuration for RPC control channel
     control_transport: TransportConfig,
 
     /// Verifying key for envelope verification
@@ -72,7 +72,7 @@ impl FlightService {
     ///
     /// * `config` - Flight configuration (host, port, dataset)
     /// * `registry_client` - Optional registry client for dataset lookup
-    /// * `control_transport` - Transport for ZMQ control channel
+    /// * `control_transport` - Transport for RPC control channel
     /// * `verifying_key` - Key for verifying signed envelopes
     pub fn new(
         config: HyprFlightConfig,

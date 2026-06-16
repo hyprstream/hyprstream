@@ -110,8 +110,8 @@ Async subscriber backed by `MoqEventSubscriber`. Dot-separated prefix filtering.
 **Location:** `crates/hyprstream-workers/src/events/subscriber.rs`
 
 ```rust
-let mut subscriber = EventSubscriber::new(origin.clone());
-subscriber.subscribe("worker.").await?;  // All worker events
+let mut subscriber = EventSubscriber::new()?;
+subscriber.subscribe("worker.")?;  // All worker events
 
 while let Ok((topic, payload)) = subscriber.recv().await {
     println!("Received: {} ({} bytes)", topic, payload.len());

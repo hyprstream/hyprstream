@@ -181,6 +181,7 @@ impl UdsRpcServer {
                                     }
                                 }
                             }
+                            // TODO: add getpeereid() check for macOS/FreeBSD via nix crate
                             stream
                         }
                         Err(e) => {

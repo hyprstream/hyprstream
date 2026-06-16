@@ -1215,6 +1215,7 @@ fn default_rpc_drain_timeout_secs() -> u64 { hyprstream_rpc::transport::rpc_sess
 
 impl RpcServerConfig {
     /// Convert to the `hyprstream_rpc` wire type consumed by server builders.
+    // TODO: wire into serve_bridged / QuinnRpcServer init paths (tracking issue #197)
     pub fn to_rpc_config(&self) -> hyprstream_rpc::transport::rpc_session::RpcConfig {
         use std::time::Duration;
         hyprstream_rpc::transport::rpc_session::RpcConfig {
@@ -1257,17 +1258,20 @@ pub struct StreamingConfig {
 
     /// Timeout (seconds) waiting for the moq origin to announce a broadcast.
     /// Default: 10
+    // TODO: wire into moq_stream.rs BROADCAST_ANNOUNCE_TIMEOUT constant (tracking issue #NNN)
     #[serde(default = "default_broadcast_announce_timeout_secs")]
     pub broadcast_announce_timeout_secs: u64,
 
     /// Timeout (seconds) between consecutive moq Groups on a subscribed track.
     /// A subscriber that sees no new Group for this long treats the publisher as gone.
     /// Default: 30
+    // TODO: wire into moq_stream.rs GROUP_IDLE_TIMEOUT constant (tracking issue #NNN)
     #[serde(default = "default_group_idle_timeout_secs")]
     pub group_idle_timeout_secs: u64,
 
     /// Timeout (seconds) reading a single Frame from an already-opened moq Group.
     /// Default: 5
+    // TODO: wire into moq_stream.rs FRAME_READ_TIMEOUT constant (tracking issue #NNN)
     #[serde(default = "default_frame_read_timeout_secs")]
     pub frame_read_timeout_secs: u64,
 }

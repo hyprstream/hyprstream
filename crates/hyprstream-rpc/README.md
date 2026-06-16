@@ -25,7 +25,7 @@ hyprstream-{rpc-std,discovery,service,workers,vfs,9p}
 hyprstream               (application, factories, OAuth, CLI)
 ```
 
-ZMQ/ZMTP is being removed; all new transport code lives here.
+ZMQ/ZMTP was removed in #131/#138; all transport code lives here.
 
 ## Key types
 
@@ -37,6 +37,9 @@ ZMQ/ZMTP is being removed; all new transport code lives here.
 | `LocalServiceBridge` | Bridge a `RequestService` to an `IrohRequestProcessor` |
 | `SignedEnvelope` | COSE_Sign1 wrapper for authenticated RPC payloads |
 | `RpcClient` | Async bidi-stream RPC client |
+| `RpcConfig` | Server-side concurrency + timeout configuration |
+| `MoqStreamHandle` | Reconnectable moq-lite stream consumer handle |
+| `RpcServerConfig` | QUIC/iroh server bind configuration |
 
 ## Feature flags
 

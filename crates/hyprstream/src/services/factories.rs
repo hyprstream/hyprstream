@@ -762,12 +762,12 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
             let registry_vk = hyprstream_service::global_trust_store()
                 .resolve_one("registry")
                 .ok_or_else(|| anyhow::anyhow!("trust store has no registry key"))?;
-            let zmq_client: RegistryClient = RegistryClient::for_service(
+            let registry_client: RegistryClient = RegistryClient::for_service(
                 sk.clone(),
                 registry_vk,
                 service_token("flight"),
             )?;
-            Some(Arc::new(zmq_client))
+            Some(Arc::new(registry_client))
         } else {
             None
         };
