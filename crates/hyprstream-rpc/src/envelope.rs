@@ -724,15 +724,25 @@ pub const ENVELOPE_SCHEMA_ID: u64 = 0xb3e9_f4a1_c7d8_2056;
 pub const REQUEST_ENVELOPE_TYPE_ID: u64 = 0x5265_7145_6e76_3031; // "ReqEnv01"
 
 /// Stable inner-type id for `ResponseEnvelope`, distinct from
-/// [`REQUEST_ENVELOPE_TYPE_ID`]. Even though responses currently use a separate
-/// raw-Ed25519 signing domain (`request_id ‖ payload`, not COSE), keeping a
-/// distinct type-id documents/enforces the request↔response domain separation
-/// so a response can never be replayed as a request (LOW finding).
+/// [`REQUEST_ENVELOPE_TYPE_ID`]. The `ResponseEnvelope` COSE composite (#275)
+/// binds this type-id into its `external_aad` via
+/// [`response_envelope_external_aad`], so a response COSE signature can NEVER
+/// verify as a request signature (or vice-versa) — the request↔response domain
+/// separation is cryptographically enforced, not merely documented.
 pub const RESPONSE_ENVELOPE_TYPE_ID: u64 = 0x5265_7350_456e_7631; // "RsPEnv1"
 
-/// Build the COSE external_aad used for all envelope signatures.
+/// Build the COSE external_aad used for all REQUEST envelope signatures.
 fn envelope_external_aad() -> Vec<u8> {
     crate::crypto::cose_sign1::build_external_aad(ENVELOPE_SCHEMA_ID, REQUEST_ENVELOPE_TYPE_ID)
+}
+
+/// Build the COSE external_aad used for all RESPONSE envelope signatures (#275).
+///
+/// Bound to [`RESPONSE_ENVELOPE_TYPE_ID`] (≠ [`REQUEST_ENVELOPE_TYPE_ID`]), this
+/// is the load-bearing domain separation: a COSE composite produced for a
+/// response cannot verify against the request AAD, and vice-versa.
+fn response_envelope_external_aad() -> Vec<u8> {
+    crate::crypto::cose_sign1::build_external_aad(ENVELOPE_SCHEMA_ID, RESPONSE_ENVELOPE_TYPE_ID)
 }
 
 /// Resolves the anchored ML-DSA-65 verifying key for an EdDSA signer identity.
@@ -1674,10 +1684,20 @@ impl FromCapnp for SignedEnvelope {
 /// All RPC responses are signed to prevent MITM attacks on response data
 /// (e.g., server's DH public key in StreamInfo).
 ///
-/// # Security
+/// # Security (#275 — Hybrid parity with `SignedEnvelope`)
 ///
-/// The signature covers `request_id || payload`, binding the response to
-/// a specific request and ensuring the payload hasn't been tampered with.
+/// The signing-data is `request_id || payload`, binding the response to a
+/// specific request and ensuring the payload hasn't been tampered with. The
+/// authoritative authentication mechanism is the COSE composite [`cose`] —
+/// one EdDSA entry (Classical) or EdDSA + ML-DSA-65 entries (Hybrid) — over
+/// that signing-data, bound to [`RESPONSE_ENVELOPE_TYPE_ID`] via the COSE
+/// `external_aad` so it can NEVER verify as a request signature.
+///
+/// `sig`/`cnf` remain populated with the raw EdDSA signature + signer public
+/// key for backward compatibility and signer-pubkey advertisement, but the
+/// COSE composite is what `verify*` enforces.
+///
+/// [`cose`]: ResponseEnvelope::cose
 #[derive(Debug, Clone)]
 pub struct ResponseEnvelope {
     /// Request ID this response corresponds to
@@ -1691,33 +1711,140 @@ pub struct ResponseEnvelope {
 
     /// Ed25519 public key of the signer (32 bytes)
     pub cnf: [u8; 32],
+
+    /// #275: CBOR-encoded nested COSE composite signature (detached).
+    ///
+    /// Authoritative authentication mechanism, mirroring [`SignedEnvelope::cose`].
+    /// Carries one EdDSA entry (Classical) or EdDSA + ML-DSA-65 entries (Hybrid)
+    /// over the response signing-data (`request_id || payload`), bound to the
+    /// distinct [`RESPONSE_ENVELOPE_TYPE_ID`] domain. The ML-DSA-65 verifying key
+    /// is resolved by kid from a [`PqTrustStore`] (kid-anchored), not embedded.
+    pub cose: Vec<u8>,
+
+    /// Runtime crypto policy used when this envelope was signed.
+    pub policy: crate::crypto::CryptoPolicy,
 }
 
 impl ResponseEnvelope {
-    /// Create and sign a new response envelope.
+    /// Response signing-data: `request_id (8 bytes LE) || payload`.
+    fn signing_data(request_id: u64, payload: &[u8]) -> Vec<u8> {
+        let mut data = Vec::with_capacity(8 + payload.len());
+        data.extend_from_slice(&request_id.to_le_bytes());
+        data.extend_from_slice(payload);
+        data
+    }
+
+    /// Create and sign a new response envelope (Classical, EdDSA-only).
     ///
-    /// The signature covers `request_id || payload` to bind the response
-    /// to the specific request and prevent tampering.
+    /// The bare constructor defaults to Classical so callers that don't supply a
+    /// PQ key produce verifiable envelopes, mirroring
+    /// [`SignedEnvelope::new_signed`].
     pub fn new_signed(request_id: u64, payload: Vec<u8>, signing_key: &SigningKey) -> Self {
-        // Build signing data: request_id (8 bytes LE) || payload
-        let mut signing_data = Vec::with_capacity(8 + payload.len());
-        signing_data.extend_from_slice(&request_id.to_le_bytes());
-        signing_data.extend_from_slice(&payload);
+        Self::new_signed_with_policy(
+            request_id,
+            payload,
+            signing_key,
+            None,
+            crate::crypto::CryptoPolicy::Classical,
+        )
+    }
+
+    /// Create and dual-sign a response with Ed25519 + ML-DSA-65 (Hybrid).
+    pub fn new_signed_hybrid(
+        request_id: u64,
+        payload: Vec<u8>,
+        signing_key: &SigningKey,
+        pq_signing_key: &crate::crypto::pq::MlDsaSigningKey,
+    ) -> Self {
+        Self::new_signed_with_policy(
+            request_id,
+            payload,
+            signing_key,
+            Some(pq_signing_key),
+            crate::crypto::CryptoPolicy::Hybrid,
+        )
+    }
+
+    /// Create and sign a response under an explicit [`CryptoPolicy`].
+    ///
+    /// Mirrors [`SignedEnvelope::new_signed_with_policy`]:
+    /// - `Classical`: single-EdDSA COSE composite; `pq_signing_key` ignored.
+    /// - `Hybrid`: EdDSA + ML-DSA-65 nested composite; `pq_signing_key` MUST be
+    ///   `Some` (if `None`, falls back to Classical, defensive).
+    ///
+    /// `sig`/`cnf` are always populated with the raw EdDSA signature + signer
+    /// public key. The COSE build is **fail-closed**: a COSE encoding error
+    /// panics rather than silently emitting an empty (fail-open) composite,
+    /// matching the request side.
+    pub fn new_signed_with_policy(
+        request_id: u64,
+        payload: Vec<u8>,
+        signing_key: &SigningKey,
+        pq_signing_key: Option<&crate::crypto::pq::MlDsaSigningKey>,
+        policy: crate::crypto::CryptoPolicy,
+    ) -> Self {
+        let signing_data = Self::signing_data(request_id, &payload);
 
         let signature_obj = signing_key.sign(&signing_data);
         let sig: [u8; 64] = signature_obj.to_bytes();
         let cnf: [u8; 32] = signing_key.verifying_key().to_bytes();
+
+        // SECURITY: no empty-cose fallback (mirrors SignedEnvelope). A COSE build
+        // failure is a should-never-happen crypto-encoding error; fail loud
+        // rather than emit a potentially fail-open empty composite.
+        #[allow(clippy::expect_used)]
+        let cose = Self::build_cose(signing_key, pq_signing_key, policy, &signing_data)
+            .expect("COSE composite signing must not fail for valid keys");
 
         Self {
             request_id,
             payload,
             sig,
             cnf,
+            cose,
+            policy,
         }
     }
 
-    /// Verify the response signature.
+    /// Build the nested COSE composite over the response signing-data per policy.
+    /// Returns `Err` on encoding failure — callers MUST NOT substitute an empty
+    /// cose (that would fail open at verify time). Bound to the RESPONSE domain.
+    fn build_cose(
+        signing_key: &SigningKey,
+        pq_signing_key: Option<&crate::crypto::pq::MlDsaSigningKey>,
+        policy: crate::crypto::CryptoPolicy,
+        signing_data: &[u8],
+    ) -> Result<Vec<u8>> {
+        let pq = if policy.uses_pq() { pq_signing_key } else { None };
+        let aad = response_envelope_external_aad();
+        crate::crypto::cose_sign::sign_composite(signing_key, pq, signing_data, &aad)
+    }
+
+    /// Verify the response signature (Classical-only, EdDSA via COSE).
+    ///
+    /// Convenience wrapper mirroring [`SignedEnvelope::verify`]: uses the
+    /// `Classical` policy and no PQ trust store. For Hybrid enforcement use
+    /// [`Self::verify_with`].
     pub fn verify(&self, expected_pubkey: Option<&VerifyingKey>) -> Result<()> {
+        self.verify_with(expected_pubkey, None, crate::crypto::CryptoPolicy::Classical)
+    }
+
+    /// Verify with an explicit kid-anchored PQ trust store and verify policy.
+    ///
+    /// Mirrors [`SignedEnvelope::verify_with`]'s fail-closed SNS semantics:
+    /// - `pq_store`: when `Some`, resolves the trust-anchored ML-DSA-65 key for
+    ///   the response's EdDSA signer (`cnf`); the outer COSE entry must verify
+    ///   against it and its kid must match (kid-anchoring).
+    /// - `verify_policy = Hybrid` REQUIRES a valid ML-DSA-65 entry anchored to
+    ///   the trust store — rejecting classical-only, stripped-outer, self-cert,
+    ///   and missing-anchor responses (NO silent downgrade). `Classical`
+    ///   verifies only the inner EdDSA and skips any PQ entry.
+    pub fn verify_with(
+        &self,
+        expected_pubkey: Option<&VerifyingKey>,
+        pq_store: Option<&dyn PqTrustStore>,
+        verify_policy: crate::crypto::CryptoPolicy,
+    ) -> Result<()> {
         let verifying_key = VerifyingKey::from_bytes(&self.cnf)
             .map_err(|_| anyhow::anyhow!("Invalid signer public key"))?;
 
@@ -1727,14 +1854,46 @@ impl ResponseEnvelope {
             }
         }
 
-        let mut signing_data = Vec::with_capacity(8 + self.payload.len());
-        signing_data.extend_from_slice(&self.request_id.to_le_bytes());
-        signing_data.extend_from_slice(&self.payload);
+        self.verify_cose(&verifying_key, pq_store, verify_policy)
+    }
 
-        let signature = ed25519_dalek::Signature::from_bytes(&self.sig);
-        verifying_key
-            .verify_strict(&signing_data, &signature)
-            .map_err(|_| anyhow::anyhow!("Response signature verification failed"))
+    /// Verify the COSE composite signature (authoritative auth check).
+    ///
+    /// Mirrors [`SignedEnvelope::verify_cose`]: the raw EdDSA `sig`/`cnf` is not
+    /// trusted on its own; this re-verifies the EdDSA component inside the COSE
+    /// composite and (under Hybrid policy) the kid-anchored ML-DSA-65 component.
+    fn verify_cose(
+        &self,
+        ed_vk: &VerifyingKey,
+        pq_store: Option<&dyn PqTrustStore>,
+        verify_policy: crate::crypto::CryptoPolicy,
+    ) -> Result<()> {
+        let signing_data = Self::signing_data(self.request_id, &self.payload);
+        let aad = response_envelope_external_aad();
+
+        // kid-anchor: resolve the trusted ML-DSA-65 key for this EdDSA identity.
+        let anchored_pq = pq_store.and_then(|s| s.ml_dsa_key_for(&self.cnf));
+
+        // Hybrid enforcement requires an anchored PQ key; without one we cannot
+        // safely require PQ (fail-closed).
+        let require_pq = verify_policy.uses_pq();
+        if require_pq && anchored_pq.is_none() {
+            anyhow::bail!(
+                "Hybrid policy requires a kid-anchored ML-DSA-65 key, none resolved"
+            );
+        }
+
+        crate::crypto::cose_sign::verify_composite(
+            &self.cose,
+            ed_vk,
+            anchored_pq.as_ref(),
+            &signing_data,
+            &aad,
+            require_pq,
+        )
+        .map_err(|e| anyhow::anyhow!("Response signature verification failed: {e}"))?;
+
+        Ok(())
     }
 
     /// Get the signer's public key.
@@ -1753,6 +1912,7 @@ impl ToCapnp for ResponseEnvelope {
         builder.set_payload(&self.payload);
         builder.set_sig(&self.sig);
         builder.set_cnf(&self.cnf);
+        builder.set_cose(&self.cose);
     }
 }
 
@@ -1774,11 +1934,17 @@ impl FromCapnp for ResponseEnvelope {
         let mut cnf = [0u8; 32];
         cnf.copy_from_slice(cnf_data);
 
+        let cose = reader.get_cose()?.to_vec();
+
+        // `policy` is a signing-time concept; the verifier supplies the verify
+        // policy explicitly, so decode to the default here (mirrors SignedEnvelope).
         Ok(Self {
             request_id: reader.get_request_id(),
             payload: reader.get_payload()?.to_vec(),
             sig,
             cnf,
+            cose,
+            policy: crate::crypto::CryptoPolicy::default(),
         })
     }
 }
@@ -1846,9 +2012,11 @@ pub fn unwrap_envelope(
     Ok((ctx, payload))
 }
 
-/// Unwrap and verify a ResponseEnvelope from wire bytes.
+/// Unwrap and verify a ResponseEnvelope from wire bytes (Classical-only).
 ///
-/// Deserializes and verifies signature, then extracts the payload.
+/// Convenience wrapper over [`unwrap_response_with`] using the `Classical`
+/// policy and no PQ trust store. Mirrors [`SignedEnvelope::verify`]; for Hybrid
+/// enforcement use [`unwrap_response_with`].
 ///
 /// # Arguments
 ///
@@ -1871,6 +2039,21 @@ pub fn unwrap_response(
     response: &[u8],
     expected_pubkey: Option<&VerifyingKey>,
 ) -> Result<(u64, Vec<u8>)> {
+    unwrap_response_with(response, expected_pubkey, None, crate::crypto::CryptoPolicy::Classical)
+}
+
+/// Unwrap and verify a ResponseEnvelope under an explicit kid-anchored PQ trust
+/// store + verify policy (#275).
+///
+/// Enforces the COSE composite with the SAME fail-closed SNS semantics as
+/// [`unwrap_and_verify`]: under `Hybrid`, a stripped-outer, classical-only,
+/// self-cert, or unanchored response is REJECTED (no silent downgrade).
+pub fn unwrap_response_with(
+    response: &[u8],
+    expected_pubkey: Option<&VerifyingKey>,
+    pq_store: Option<&dyn PqTrustStore>,
+    verify_policy: crate::crypto::CryptoPolicy,
+) -> Result<(u64, Vec<u8>)> {
     use capnp::serialize;
 
     // Deserialize ResponseEnvelope from Cap'n Proto
@@ -1881,8 +2064,8 @@ pub fn unwrap_response(
     let response_reader = reader.get_root::<crate::common_capnp::response_envelope::Reader>()?;
     let envelope = ResponseEnvelope::read_from(response_reader)?;
 
-    // Verify signature
-    envelope.verify(expected_pubkey)?;
+    // Verify the COSE composite under the supplied policy + anchor.
+    envelope.verify_with(expected_pubkey, pq_store, verify_policy)?;
 
     Ok((envelope.request_id, envelope.payload))
 }
@@ -2596,5 +2779,235 @@ mod tests {
             .map_err(|e| EnvelopeError::PqSignatureInvalid(e.to_string()))?;
         assert_eq!(payload, vec![4, 2]);
         Ok(())
+    }
+
+    // =========================================================================
+    // #275: ResponseEnvelope COSE composite (Hybrid parity with SignedEnvelope)
+    // =========================================================================
+
+    /// Serialize a ResponseEnvelope to wire bytes (mirrors the prod path).
+    fn response_to_wire(env: &ResponseEnvelope) -> Vec<u8> {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut builder = message.init_root::<common_capnp::response_envelope::Builder>();
+            env.write_to(&mut builder);
+        }
+        let mut wire = Vec::new();
+        capnp::serialize::write_message(&mut wire, &message).expect("serialize response");
+        wire
+    }
+
+    /// Classical round-trip: sign + verify a response (EdDSA-only COSE).
+    #[test]
+    fn resp_classical_round_trip() -> anyhow::Result<()> {
+        let (sk, vk) = generate_signing_keypair();
+        let resp = ResponseEnvelope::new_signed(7, vec![1, 2, 3], &sk);
+        // Direct verify.
+        resp.verify(Some(&vk))?;
+        // Via the wire + unwrap_response (Classical).
+        let wire = response_to_wire(&resp);
+        let (rid, payload) = unwrap_response(&wire, Some(&vk))?;
+        assert_eq!(rid, 7);
+        assert_eq!(payload, vec![1, 2, 3]);
+        Ok(())
+    }
+
+    /// Hybrid round-trip: sign + verify a response (EdDSA + ML-DSA-65 anchored).
+    #[test]
+    fn resp_hybrid_round_trip() -> anyhow::Result<()> {
+        let (sk, vk) = generate_signing_keypair();
+        let (pq_sk, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let resp = ResponseEnvelope::new_signed_hybrid(9, vec![4, 5, 6], &sk, &pq_sk);
+        let store = pq_store_for(vk.to_bytes(), &pq_vk);
+
+        resp.verify_with(Some(&vk), Some(&store), CryptoPolicy::Hybrid)?;
+
+        let wire = response_to_wire(&resp);
+        let (rid, payload) =
+            unwrap_response_with(&wire, Some(&vk), Some(&store), CryptoPolicy::Hybrid)?;
+        assert_eq!(rid, 9);
+        assert_eq!(payload, vec![4, 5, 6]);
+        Ok(())
+    }
+
+    /// A Hybrid-signed response verifies under a Classical verifier via its
+    /// inner EdDSA (skip-unknown interop) — the default-policy interop path.
+    #[test]
+    fn resp_hybrid_signed_classical_verifier_accepted() -> anyhow::Result<()> {
+        let (sk, vk) = generate_signing_keypair();
+        let (pq_sk, _pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let resp = ResponseEnvelope::new_signed_hybrid(1, vec![1], &sk, &pq_sk);
+        resp.verify(Some(&vk))?; // Classical, no store
+        Ok(())
+    }
+
+    /// Stripping the outer ML-DSA layer under Hybrid policy is rejected.
+    #[test]
+    fn resp_strip_outer_mldsa_rejected_under_hybrid() {
+        let (sk, vk) = generate_signing_keypair();
+        let (pq_sk, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let mut resp = ResponseEnvelope::new_signed_hybrid(2, vec![2, 2], &sk, &pq_sk);
+        let (inner, outer) =
+            crate::crypto::cose_sign::decode_composite_for_test(&resp.cose).expect("decode");
+        assert!(outer.is_some(), "hybrid response must have an outer layer");
+        resp.cose =
+            crate::crypto::cose_sign::encode_composite_for_test(inner, None).expect("encode");
+
+        let store = pq_store_for(vk.to_bytes(), &pq_vk);
+        let res = resp.verify_with(Some(&vk), Some(&store), CryptoPolicy::Hybrid);
+        assert!(res.is_err(), "stripping the outer ML-DSA layer must fail Hybrid policy");
+    }
+
+    /// Tampering the inner EdDSA signature invalidates the Hybrid composite.
+    #[test]
+    fn resp_tamper_inner_rejected() {
+        let (sk, vk) = generate_signing_keypair();
+        let (pq_sk, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let resp = ResponseEnvelope::new_signed_hybrid(3, vec![3, 3, 3], &sk, &pq_sk);
+        let (_inner, outer) =
+            crate::crypto::cose_sign::decode_composite_for_test(&resp.cose).expect("decode");
+        // Forge a new inner with a different key; keep the original outer.
+        let (other_sk, _other_vk) = generate_signing_keypair();
+        let other_resp = ResponseEnvelope::new_signed(3, vec![3, 3, 3], &other_sk);
+        let (forged_inner, _none) =
+            crate::crypto::cose_sign::decode_composite_for_test(&other_resp.cose).expect("decode");
+        let mut tampered = resp.clone();
+        tampered.cose =
+            crate::crypto::cose_sign::encode_composite_for_test(forged_inner, outer).expect("encode");
+
+        let store = pq_store_for(vk.to_bytes(), &pq_vk);
+        let res = tampered.verify_with(Some(&vk), Some(&store), CryptoPolicy::Hybrid);
+        assert!(res.is_err(), "tampering the inner EdDSA must invalidate the response composite");
+    }
+
+    /// Tampering the payload invalidates the signature.
+    #[test]
+    fn resp_tamper_payload_rejected() {
+        let (sk, vk) = generate_signing_keypair();
+        let mut resp = ResponseEnvelope::new_signed(4, vec![1, 2, 3], &sk);
+        resp.payload = vec![9, 9, 9];
+        assert!(resp.verify(Some(&vk)).is_err(), "tampered payload must invalidate the response");
+    }
+
+    /// self-cert: anchored ML-DSA key not matching the signer's PQ key → reject.
+    #[test]
+    fn resp_self_cert_wrong_anchor_rejected() {
+        let (sk, vk) = generate_signing_keypair();
+        let (pq_sk, _pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let (_other_sk, other_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let resp = ResponseEnvelope::new_signed_hybrid(5, vec![5], &sk, &pq_sk);
+        let store = pq_store_for(vk.to_bytes(), &other_vk);
+        let res = resp.verify_with(Some(&vk), Some(&store), CryptoPolicy::Hybrid);
+        assert!(res.is_err(), "wrong anchored PQ key must be rejected (self-cert fix)");
+    }
+
+    /// Hybrid policy with NO anchored key fails closed (no self-asserted PQ key).
+    #[test]
+    fn resp_hybrid_without_anchor_rejected() {
+        let (sk, vk) = generate_signing_keypair();
+        let (pq_sk, _pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let resp = ResponseEnvelope::new_signed_hybrid(6, vec![6], &sk, &pq_sk);
+        let res = resp.verify_with(Some(&vk), None, CryptoPolicy::Hybrid);
+        assert!(res.is_err(), "Hybrid policy requires a kid-anchored PQ key");
+    }
+
+    /// classical-signed response under Hybrid policy → rejected (no downgrade).
+    #[test]
+    fn resp_classical_signed_hybrid_verifier_rejected() {
+        let (sk, vk) = generate_signing_keypair();
+        let (_pq_sk, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let resp = ResponseEnvelope::new_signed(8, vec![8], &sk);
+        let store = pq_store_for(vk.to_bytes(), &pq_vk);
+        let res = resp.verify_with(Some(&vk), Some(&store), CryptoPolicy::Hybrid);
+        assert!(res.is_err(), "Hybrid policy must reject a classical-only response");
+    }
+
+    /// Wrong expected signer key → rejected.
+    #[test]
+    fn resp_wrong_signer_rejected() {
+        let (sk, _vk) = generate_signing_keypair();
+        let (_other_sk, other_vk) = generate_signing_keypair();
+        let resp = ResponseEnvelope::new_signed(10, vec![1], &sk);
+        assert!(resp.verify(Some(&other_vk)).is_err(), "wrong expected signer must be rejected");
+    }
+
+    /// Cap'n Proto round-trip preserves the cose field.
+    #[test]
+    fn resp_capnp_roundtrip_preserves_cose() -> anyhow::Result<()> {
+        let (sk, vk) = generate_signing_keypair();
+        let (pq_sk, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let resp = ResponseEnvelope::new_signed_hybrid(11, vec![7, 7], &sk, &pq_sk);
+        let wire = response_to_wire(&resp);
+        let reader = capnp::serialize::read_message(
+            &mut std::io::Cursor::new(&wire),
+            envelope_reader_options(),
+        )?;
+        let r = reader.get_root::<common_capnp::response_envelope::Reader>()?;
+        let decoded = ResponseEnvelope::read_from(r)?;
+        assert_eq!(decoded.cose, resp.cose, "cose must survive the capnp round-trip");
+        let store = pq_store_for(vk.to_bytes(), &pq_vk);
+        decoded.verify_with(Some(&vk), Some(&store), CryptoPolicy::Hybrid)?;
+        Ok(())
+    }
+
+    // -- Cross-direction replay (the load-bearing domain-separation guard) -----
+
+    /// A REQUEST COSE composite must NOT verify against the RESPONSE AAD, and a
+    /// RESPONSE COSE composite must NOT verify against the REQUEST AAD. Distinct
+    /// type-ids in `external_aad` enforce this: the bytes are interchangeable but
+    /// the AAD binding differs, so each direction's signature is non-fungible.
+    #[test]
+    fn cross_direction_replay_rejected() {
+        let (sk, vk) = generate_signing_keypair();
+        let payload = b"shared bytes";
+
+        // Build a REQUEST-domain composite and a RESPONSE-domain composite over
+        // the same payload bytes, same key.
+        let req_aad = envelope_external_aad();
+        let resp_aad = response_envelope_external_aad();
+        assert_ne!(req_aad, resp_aad, "request/response AADs must differ (domain separation)");
+
+        let req_cose =
+            crate::crypto::cose_sign::sign_composite(&sk, None, payload, &req_aad).expect("sign req");
+        let resp_cose =
+            crate::crypto::cose_sign::sign_composite(&sk, None, payload, &resp_aad).expect("sign resp");
+
+        // The request signature verifies under the request AAD …
+        crate::crypto::cose_sign::verify_composite(&req_cose, &vk, None, payload, &req_aad, false)
+            .expect("request verifies under request AAD");
+        // … but MUST NOT verify under the response AAD (replay as a response).
+        let cross1 = crate::crypto::cose_sign::verify_composite(
+            &req_cose, &vk, None, payload, &resp_aad, false,
+        );
+        assert!(cross1.is_err(), "a request COSE sig must not verify as a response");
+
+        // And symmetrically for the response signature.
+        crate::crypto::cose_sign::verify_composite(&resp_cose, &vk, None, payload, &resp_aad, false)
+            .expect("response verifies under response AAD");
+        let cross2 = crate::crypto::cose_sign::verify_composite(
+            &resp_cose, &vk, None, payload, &req_aad, false,
+        );
+        assert!(cross2.is_err(), "a response COSE sig must not verify as a request");
+    }
+
+    /// End-to-end cross-direction: a `SignedEnvelope`'s COSE must not satisfy a
+    /// `ResponseEnvelope::verify_with`, proving the request and response signing
+    /// domains are separated at the envelope API level (not just the AAD helper).
+    #[test]
+    fn cross_direction_request_cose_rejected_as_response() {
+        let (sk, vk) = generate_signing_keypair();
+        // A request envelope's signing-data is canonical(RequestEnvelope); a
+        // response's is request_id||payload. Even constructing a response whose
+        // signing-data happens to match, the request-domain AAD differs, so the
+        // composite cannot be reused. Here we directly graft a request COSE onto
+        // a response and confirm rejection.
+        let req = SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![1, 2, 3]), &sk);
+        let mut resp = ResponseEnvelope::new_signed(0, vec![1, 2, 3], &sk);
+        resp.cose = req.cose.clone(); // graft the request composite onto the response
+        let res = resp.verify(Some(&vk));
+        assert!(
+            res.is_err(),
+            "a request-domain COSE grafted onto a response must be rejected"
+        );
     }
 }

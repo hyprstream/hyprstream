@@ -300,10 +300,10 @@ impl<T: Transport> StreamHandleImpl<T> {
         // `dh_public` is the server's ephemeral Ristretto255 DH public key (one
         // input to the ECDH that derives the topic + MAC keys). Trust in this
         // field comes from the signed RPC `ResponseEnvelope` wrapping StreamInfo,
-        // not from the field itself. NOTE: that response signature is currently
-        // classical Ed25519 only — unlike the request-side `SignedEnvelope`, the
-        // `ResponseEnvelope` does not yet carry a COSE/ML-DSA-65 hybrid layer, so
-        // StreamInfo authentication is not PQ-ready. See `ResponseEnvelope`.
+        // not from the field itself. As of #275 the `ResponseEnvelope` carries a
+        // COSE composite (EdDSA + ML-DSA-65 under Hybrid), so StreamInfo
+        // authentication reaches PQ strength on a par with the request-side
+        // `SignedEnvelope`. See `ResponseEnvelope`.
         let shared_secret = dh_compute_raw(client_secret, &stream_info.dh_public)?;
         let keys = derive_stream_keys(&shared_secret, client_pubkey, &stream_info.dh_public)?;
 

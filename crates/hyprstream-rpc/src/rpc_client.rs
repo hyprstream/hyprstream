@@ -143,6 +143,15 @@ pub struct RpcClientImpl<S: Signer, T: Transport + 'static> {
     pub server_verifying_key: Option<VerifyingKey>,
     token_provider: Option<TokenProviderBox>,
     request_id: AtomicU64,
+    /// Response-verify policy (#275). Defaults to `Classical` — a Classical
+    /// verifier still accepts a Hybrid-signed response via its inner EdDSA
+    /// (skip-unknown interop), so the default never breaks RPC. Set to `Hybrid`
+    /// (with [`Self::with_response_pq_store`]) to REQUIRE the server's anchored
+    /// ML-DSA-65 layer and fail closed on a classical-only / stripped response.
+    response_verify_policy: crate::crypto::CryptoPolicy,
+    /// kid-anchored ML-DSA-65 trust store used to resolve the server's PQ key
+    /// for `ResponseEnvelope` verification. Required under the `Hybrid` policy.
+    response_pq_store: Option<std::sync::Arc<dyn crate::envelope::PqTrustStore>>,
 }
 
 impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
@@ -157,7 +166,30 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             server_verifying_key,
             token_provider: None,
             request_id: AtomicU64::new(1),
+            response_verify_policy: crate::crypto::CryptoPolicy::Classical,
+            response_pq_store: None,
         }
+    }
+
+    /// Enforce Hybrid (EdDSA + ML-DSA-65) verification of responses (#275),
+    /// anchoring the server's ML-DSA-65 key via `pq_store`. Under this policy a
+    /// classical-only, stripped-outer, self-cert, or unanchored response is
+    /// REJECTED (fail-closed, no silent downgrade). Mirrors the request-side
+    /// Hybrid verify config.
+    pub fn with_response_pq_store(
+        mut self,
+        pq_store: std::sync::Arc<dyn crate::envelope::PqTrustStore>,
+    ) -> Self {
+        self.response_pq_store = Some(pq_store);
+        self.response_verify_policy = crate::crypto::CryptoPolicy::Hybrid;
+        self
+    }
+
+    /// Set the response-verify policy explicitly (advanced). Under `Hybrid` a
+    /// PQ trust store MUST also be set via [`Self::with_response_pq_store`].
+    pub fn with_response_verify_policy(mut self, policy: crate::crypto::CryptoPolicy) -> Self {
+        self.response_verify_policy = policy;
+        self
     }
 
     /// Set a dynamic token provider called on every RPC request.
@@ -190,10 +222,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         let signed_bytes = self.sign_envelope(request_id, payload, None, self.effective_jwt(), None).await?;
         let timeout = self.calculate_timeout();
         let response_bytes = self.transport.send(signed_bytes, timeout).await?;
-        let (_req_id, inner) = envelope::unwrap_response(
-            &response_bytes,
-            self.server_verifying_key.as_ref(),
-        )?;
+        let (_req_id, inner) = self.unwrap_response(&response_bytes)?;
         Ok(inner)
     }
 
@@ -211,10 +240,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             .await?;
         let timeout = self.calculate_timeout();
         let response_bytes = self.transport.send(signed_bytes, timeout).await?;
-        let (_req_id, inner) = envelope::unwrap_response(
-            &response_bytes,
-            self.server_verifying_key.as_ref(),
-        )?;
+        let (_req_id, inner) = self.unwrap_response(&response_bytes)?;
         Ok(inner)
     }
 
@@ -234,10 +260,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             .await?;
         let timeout = self.calculate_timeout();
         let response_bytes = self.transport.send(signed_bytes, timeout).await?;
-        let (_req_id, inner) = envelope::unwrap_response(
-            &response_bytes,
-            self.server_verifying_key.as_ref(),
-        )?;
+        let (_req_id, inner) = self.unwrap_response(&response_bytes)?;
         Ok(inner)
     }
 
@@ -257,16 +280,26 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             .await?;
         let timeout = self.calculate_timeout();
         let response_bytes = self.transport.send(signed_bytes, timeout).await?;
-        let (_req_id, inner) = envelope::unwrap_response(
-            &response_bytes,
-            self.server_verifying_key.as_ref(),
-        )?;
+        let (_req_id, inner) = self.unwrap_response(&response_bytes)?;
         Ok(inner)
     }
 
     /// Get the next monotonically increasing request ID.
     pub fn next_id(&self) -> u64 {
         self.request_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Unwrap + verify a `ResponseEnvelope` under the client's configured
+    /// response-verify policy + PQ trust store (#275). Under the default
+    /// `Classical` policy this verifies the inner EdDSA only; under `Hybrid` it
+    /// requires the server's kid-anchored ML-DSA-65 layer (fail-closed).
+    fn unwrap_response(&self, response_bytes: &[u8]) -> Result<(u64, Vec<u8>)> {
+        envelope::unwrap_response_with(
+            response_bytes,
+            self.server_verifying_key.as_ref(),
+            self.response_pq_store.as_deref(),
+            self.response_verify_policy,
+        )
     }
 
     /// Build, sign, and serialize a request envelope.

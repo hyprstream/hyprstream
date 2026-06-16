@@ -263,6 +263,20 @@ pub trait RequestService: 'static {
     /// Ed25519 signing key for signing responses.
     fn signing_key(&self) -> SigningKey;
 
+    /// ML-DSA-65 signing key for the post-quantum half of the response COSE
+    /// composite (#275). When `Some`, `process_request` signs the
+    /// `ResponseEnvelope` under the Hybrid policy (EdDSA + ML-DSA-65); when
+    /// `None` it signs Classical (EdDSA-only). The matching ML-DSA-65 public key
+    /// must be anchored in the client's PQ trust store for Hybrid verification
+    /// to succeed (peer attestation). Default `None` (Classical responses).
+    ///
+    /// Mirrors the request-side signing policy: the server emits the strongest
+    /// composite it has keys for; a Classical verifier still accepts it via the
+    /// inner EdDSA (skip-unknown interop).
+    fn pq_signing_key(&self) -> Option<crate::crypto::pq::MlDsaSigningKey> {
+        None
+    }
+
     /// Ed25519 verifying key for envelope signature verification.
     fn verifying_key(&self) -> VerifyingKey {
         self.signing_key().verifying_key()

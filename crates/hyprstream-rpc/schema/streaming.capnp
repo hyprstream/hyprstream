@@ -22,7 +22,11 @@ using import "annotations.capnp".fixedSize;
 # StreamOpt (#213) — service-declared delivery/integrity contract.
 #
 # Returned in the signed StreamInfo handshake response so the contract is:
-#   1. Authenticated: covered by the Ed25519 SignedEnvelope over StreamInfo
+#   1. Authenticated: covered by the Hybrid (EdDSA + ML-DSA-65) COSE composite
+#      signature on the ResponseEnvelope wrapping StreamInfo (#275). PQ-strength
+#      and fail-closed: a Hybrid verifier rejects a classical-only or stripped
+#      signature, so the "authenticated, fail-closed" guarantee holds at PQ
+#      strength.
 #   2. Wire-visible: encoded in the Cap'n Proto StreamInfo message body
 #   3. Cross-language: capnp codegens native readers for Rust/TS/Python (#217/#218)
 #   4. IETF-friendly: a struct in the handshake response, not a schema annotation
@@ -183,13 +187,15 @@ struct QuicReach {
 #
 # Contains everything the client needs to subscribe and derive keys.
 # Returned by generateStream/inferStream RPC calls.
-# Wrapped in a SignedEnvelope (Ed25519) so the policy field is authenticated.
+# Wrapped in a ResponseEnvelope whose Hybrid (EdDSA + ML-DSA-65) COSE composite
+# signature authenticates dhPublic and the QoS contract at PQ strength (#275).
 struct StreamInfo {
   streamId @0 :Text;      # Unique stream identifier (e.g., "stream-{uuid}")
   dhPublic @1 :Data $fixedSize(32);  # Server's ephemeral Ristretto255 public key for DH
-  # Service-declared QoS options. Authenticated by the Ed25519 signature
-  # over the enclosing SignedEnvelope. Clients MUST enforce these options and
-  # MUST disconnect (not silently downgrade) if a required mode is unsupported.
+  # Service-declared QoS options. Authenticated by the Hybrid COSE composite
+  # signature over the enclosing ResponseEnvelope (#275). Clients MUST enforce
+  # these options and MUST disconnect (not silently downgrade) if a required
+  # mode is unsupported.
   qos   @2 :StreamOpt;
   # Broadcast path within the moq origin (e.g. "local/streams/{topic_hex}").
   broadcastPath @3 :Text;

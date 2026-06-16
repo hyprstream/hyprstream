@@ -68,6 +68,27 @@ where
     //    process-global verify configuration installed at startup (Hybrid
     //    ENFORCED in the daemon). This closes the prior fail-open where the
     //    site hardcoded Classical / no PQ store.
+    // Response signing policy (#275): mirror the request side — sign the
+    // strongest composite the server has keys for. When the service exposes an
+    // ML-DSA-65 key, responses are Hybrid (EdDSA + ML-DSA-65); otherwise
+    // Classical. A Classical-only client still verifies via the inner EdDSA
+    // (skip-unknown interop), and a Hybrid-enforcing client requires the anchor.
+    let response_pq_key = service.pq_signing_key();
+    let response_policy = if response_pq_key.is_some() {
+        crate::crypto::CryptoPolicy::Hybrid
+    } else {
+        crate::crypto::CryptoPolicy::Classical
+    };
+    let sign_response = |request_id: u64, payload: Vec<u8>| {
+        ResponseEnvelope::new_signed_with_policy(
+            request_id,
+            payload,
+            signing_key,
+            response_pq_key.as_ref(),
+            response_policy,
+        )
+    };
+
     let pq_store_holder = crate::envelope::global_pq_store();
     let base = match verification {
         EnvelopeVerification::FixedSigner(pubkey) =>
@@ -84,7 +105,7 @@ where
             warn!("{} envelope verification failed: {}", service.name(), e);
             // Build error response with request_id=0 (envelope is invalid)
             let error_payload = service.build_error_payload(0, &format!("envelope verification failed: {}", e));
-            let signed_response = ResponseEnvelope::new_signed(0, error_payload, signing_key);
+            let signed_response = sign_response(0, error_payload);
 
             let mut message = Builder::new_default();
             let mut builder = message.init_root::<crate::common_capnp::response_envelope::Builder>();
@@ -111,7 +132,7 @@ where
             service.name(), ctx.subject(), request_id, e
         );
         let error_payload = service.build_error_payload(request_id, &e.to_string());
-        let signed_response = ResponseEnvelope::new_signed(request_id, error_payload, signing_key);
+        let signed_response = sign_response(request_id, error_payload);
 
         let mut message = Builder::new_default();
         let mut builder = message.init_root::<crate::common_capnp::response_envelope::Builder>();
@@ -132,7 +153,7 @@ where
     };
 
     // 4. Sign and serialize response
-    let signed_response = ResponseEnvelope::new_signed(request_id, response_payload, signing_key);
+    let signed_response = sign_response(request_id, response_payload);
 
     let mut message = Builder::new_default();
     let mut builder = message.init_root::<crate::common_capnp::response_envelope::Builder>();
