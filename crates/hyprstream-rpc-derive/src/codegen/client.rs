@@ -442,14 +442,14 @@ fn generate_trait_method_impl(
                 let (client_secret, client_pubkey) = hyprstream_rpc::crypto::generate_ephemeral_keypair();
                 let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
                 let info = Self::#method_name(self #(, #args)*, client_pubkey_bytes).await?;
-                if info.server_pubkey == [0u8; 32] {
+                if info.dh_public == [0u8; 32] {
                     anyhow::bail!("Server did not provide DH public key for streaming");
                 }
                 if info.moq_uds_path.is_empty() {
                     anyhow::bail!("Server did not provide moq transport path — moq transport not initialized");
                 }
                 let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
-                    &client_secret, &client_pubkey_bytes, &info.server_pubkey,
+                    &client_secret, &client_pubkey_bytes, &info.dh_public,
                 )?;
                 Ok(hyprstream_rpc::moq_stream::MoqStreamHandle::new(
                     info.moq_uds_path, info.moq_broadcast_path, mac_key, topic,

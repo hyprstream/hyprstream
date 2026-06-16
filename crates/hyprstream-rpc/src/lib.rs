@@ -97,6 +97,22 @@ pub mod common_types {
     hyprstream_rpc_derive::generate_rpc_service!("common");
 }
 
+/// Code-generated streaming data types (#273): `StreamInfo`, `StreamOpt`, and the
+/// five QoS axis unions (`Ordering`/`Delivery`/`Completion`/`Retention`/
+/// `OverflowPolicy`). Re-exported through `stream_info` (the canonical hub) so
+/// service codegen and call sites keep resolving `hyprstream_rpc::stream_info::*`.
+///
+/// NOTE: this module also generates the wire types (`StreamBlock`, `StreamPayload`,
+/// `StreamControl`, etc.). Those are NOT re-exported — `streaming.rs` remains the
+/// authoritative hand-written implementation for the wire path; the generated
+/// duplicates live here unused (`#![allow(dead_code)]`).
+pub mod streaming_types {
+    #![allow(dead_code, unused_imports, unused_variables)]
+    #![allow(clippy::all)]
+    extern crate self as hyprstream_rpc;
+    hyprstream_rpc_derive::generate_rpc_service!("streaming");
+}
+
 pub mod capnp;
 pub mod crypto;
 pub mod envelope;

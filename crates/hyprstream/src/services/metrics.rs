@@ -327,7 +327,7 @@ impl MetricsHandler for MetricsService {
         let stream_info = StreamInfo {
             stream_id: stream_ctx.stream_id().to_owned(),
             endpoint: String::new(),
-            server_pubkey: *stream_ctx.server_pubkey(),
+            dh_public: *stream_ctx.server_pubkey(),
             moq_uds_path,
             moq_broadcast_path,
             ..Default::default()

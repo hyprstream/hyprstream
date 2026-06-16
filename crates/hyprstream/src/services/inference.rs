@@ -1051,7 +1051,7 @@ impl InferenceService {
         let stream_info = crate::services::generated::inference_client::StreamInfo {
             stream_id,
             endpoint: String::new(),
-            server_pubkey,
+            dh_public: server_pubkey,
             qos: stream_ctx.qos().clone(),
             moq_uds_path,
             moq_broadcast_path,
@@ -1898,7 +1898,7 @@ impl InferenceHandler for InferenceService {
         let stream_info = crate::services::generated::inference_client::StreamInfo {
             stream_id,
             endpoint: String::new(),
-            server_pubkey,
+            dh_public: server_pubkey,
             qos: <hyprstream_rpc::stream_info::Job as hyprstream_rpc::stream_info::StreamOptPreset>::stream_opt(),
             moq_uds_path,
             moq_broadcast_path,
@@ -2112,7 +2112,7 @@ impl InferenceHandler for InferenceService {
         let stream_info = crate::services::generated::inference_client::StreamInfo {
             stream_id,
             endpoint: String::new(),
-            server_pubkey,
+            dh_public: server_pubkey,
             qos: stream_ctx.qos().clone(),
             moq_uds_path,
             moq_broadcast_path,

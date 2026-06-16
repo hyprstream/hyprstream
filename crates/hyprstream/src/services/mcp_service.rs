@@ -651,14 +651,16 @@ fn parse_stream_info(
 ) -> anyhow::Result<(String, Vec<u8>, hyprstream_rpc::stream_info::StreamOpt, String, String)> {
     let stream_id = json["streamId"].as_str()
         .ok_or_else(|| anyhow::anyhow!("missing streamId in streaming response"))?.to_owned();
-    let server_pubkey: Vec<u8> = json["serverPubkey"].as_array()
-        .ok_or_else(|| anyhow::anyhow!("missing serverPubkey in streaming response"))?
+    // StreamInfo's `dh_public` field serializes as `dhPublic` under camelCase
+    // (was `serverPubkey` before #273 renamed the field to match the capnp schema).
+    let server_pubkey: Vec<u8> = json["dhPublic"].as_array()
+        .ok_or_else(|| anyhow::anyhow!("missing dhPublic in streaming response"))?
         .iter()
         .enumerate()
         .map(|(i, v)| {
             v.as_u64()
                 .and_then(|n| u8::try_from(n).ok())
-                .ok_or_else(|| anyhow::anyhow!("serverPubkey[{i}]: value out of u8 range"))
+                .ok_or_else(|| anyhow::anyhow!("dhPublic[{i}]: value out of u8 range"))
         })
         .collect::<anyhow::Result<Vec<u8>>>()?;
     let qos: hyprstream_rpc::stream_info::StreamOpt = if json["qos"].is_object() {

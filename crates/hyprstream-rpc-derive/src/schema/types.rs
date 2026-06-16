@@ -41,6 +41,20 @@ pub fn collect_list_struct_types(schema: &ParsedSchema) -> Vec<String> {
         for f in s.non_union_fields() {
             add_type(&f.type_name, &mut types);
         }
+        // Union-arm payload types are referenced by the generated enum variants
+        // (e.g. `WorktreeResult(WorktreeResponse)`), so they must be generated too.
+        // The flat `non_union_fields` walk above does not cover them.
+        for arm in &s.union_arms {
+            match &arm.payload {
+                ArmPayload::Void => {}
+                ArmPayload::Type(name) => add_type(name, &mut types),
+                ArmPayload::Group(leaves) => {
+                    for leaf in leaves {
+                        add_type(&leaf.type_name, &mut types);
+                    }
+                }
+            }
+        }
     }
     for v in &schema.request_variants {
         add_type(&v.type_name, &mut types);

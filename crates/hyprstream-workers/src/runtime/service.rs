@@ -839,7 +839,7 @@ impl WorkerService {
         let stream_info = StreamInfo {
             stream_id,
             endpoint: String::new(),
-            server_pubkey: *stream_ctx.server_pubkey(),
+            dh_public: *stream_ctx.server_pubkey(),
             qos: stream_ctx.qos().clone(),
             moq_uds_path,
             moq_broadcast_path,

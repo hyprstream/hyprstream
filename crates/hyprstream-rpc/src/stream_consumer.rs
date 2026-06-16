@@ -296,9 +296,16 @@ impl<T: Transport> StreamHandleImpl<T> {
         client_secret: &[u8; 32],
         client_pubkey: &[u8; 32],
     ) -> Result<Self> {
-        // Pure crypto — same code, both targets
-        let shared_secret = dh_compute_raw(client_secret, &stream_info.server_pubkey)?;
-        let keys = derive_stream_keys(&shared_secret, client_pubkey, &stream_info.server_pubkey)?;
+        // Pure crypto — same code, both targets.
+        // `dh_public` is the server's ephemeral Ristretto255 DH public key (one
+        // input to the ECDH that derives the topic + MAC keys). Trust in this
+        // field comes from the signed RPC `ResponseEnvelope` wrapping StreamInfo,
+        // not from the field itself. NOTE: that response signature is currently
+        // classical Ed25519 only — unlike the request-side `SignedEnvelope`, the
+        // `ResponseEnvelope` does not yet carry a COSE/ML-DSA-65 hybrid layer, so
+        // StreamInfo authentication is not PQ-ready. See `ResponseEnvelope`.
+        let shared_secret = dh_compute_raw(client_secret, &stream_info.dh_public)?;
+        let keys = derive_stream_keys(&shared_secret, client_pubkey, &stream_info.dh_public)?;
 
         // Transport-abstracted — ZMQ or WebTransport
         let subscriber = transport.subscribe(keys.topic.as_bytes()).await?;

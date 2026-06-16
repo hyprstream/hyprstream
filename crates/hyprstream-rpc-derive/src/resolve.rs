@@ -96,6 +96,23 @@ impl<'a> ResolvedSchema<'a> {
                 name_strings.insert(f.name.clone());
                 type_strings.insert(f.type_name.clone());
             }
+            // Walk union arms: arm names become Rust enum variant idents, and arm /
+            // group-leaf type names need classification so codegen can resolve them.
+            for arm in &s.union_arms {
+                name_strings.insert(arm.name.clone());
+                match &arm.payload {
+                    ArmPayload::Void => {}
+                    ArmPayload::Type(name) => {
+                        type_strings.insert(name.clone());
+                    }
+                    ArmPayload::Group(leaves) => {
+                        for leaf in leaves {
+                            name_strings.insert(leaf.name.clone());
+                            type_strings.insert(leaf.type_name.clone());
+                        }
+                    }
+                }
+            }
         }
 
         // Walk enums
