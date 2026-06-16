@@ -28,7 +28,8 @@ use hyprstream_core::config::TokenConfig;
 use hyprstream_core::services::PolicyService;
 use hyprstream_core::services::generated::policy_client::{PolicyCheck, PolicyClient};
 
-use hyprstream_rpc::envelope::InMemoryNonceCache;
+use hyprstream_rpc::envelope::{EnvelopeVerifyConfig, InMemoryNonceCache, install_verify_config};
+use hyprstream_rpc::crypto::CryptoPolicy;
 use hyprstream_rpc::rpc_client::RpcClientImpl;
 use hyprstream_rpc::signer::LocalSigner;
 use hyprstream_rpc::transport::TransportConfig;
@@ -134,6 +135,13 @@ async fn client_for(
 /// produced by the bootstrap `SERVICE_BASE_POLICIES`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn policy_check_allow_and_deny_over_iroh() -> Result<()> {
+    // Opt in to Classical so the test is order-independent w.r.t. process-global
+    // verify config; fail-close default is Hybrid which requires PQ keys.
+    let _ = install_verify_config(EnvelopeVerifyConfig {
+        policy: CryptoPolicy::Classical,
+        pq_store: None,
+    });
+
     let (service, server_signing, _temp) = make_policy_service().await?;
     let server_vk = server_signing.verifying_key();
 

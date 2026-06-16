@@ -530,6 +530,27 @@ mod policy_tests {
     }
 
     #[test]
+    fn tampered_mac_is_rejected() {
+        // Exercises the subtle::ConstantTimeEq path in StreamVerifier::verify.
+        let key = [0xAAu8; 32];
+        let topic = "tamper";
+        let mut v = StreamVerifier::with_policy(
+            key,
+            topic.to_owned(),
+            VerifierContract { ordering: StreamOrdering::Ordered, completion: Completion::Open },
+        );
+        let (mut frame, _) = frame(&key, topic, None, 0, false);
+        // Corrupt the MAC part (last element of the frame).
+        let mac = frame.last_mut().unwrap();
+        mac[0] ^= 0xFF; // flip a bit — constant_time_eq must reject this
+        let err = v.verify(&frame).unwrap_err().to_string();
+        assert!(
+            err.contains("MAC") || err.contains("mac") || err.contains("HMAC") || err.contains("invalid"),
+            "tampered MAC should be rejected, got: {err}"
+        );
+    }
+
+    #[test]
     fn ordered_accepts_contiguous_and_rejects_gap() {
         let key = [7u8; 32];
         let topic = "tok";
