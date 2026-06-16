@@ -22,9 +22,14 @@
 //   Retention::{Live, Blocks(u32), Seconds(u32)}
 //   OverflowPolicy::{Block, DropOldest{high_water_mark}}
 //   StreamOpt { ordering, delivery, completion, retention, overflow_policy }
-//   StreamInfo { stream_id, endpoint, dh_public: [u8; 32], qos, moq_uds_path, moq_broadcast_path }
+//   StreamInfo { stream_id, dh_public: [u8; 32], qos, broadcast_path, reach }
+//
+// #274: the moq reach model — `StreamInfo.reach: Vec<Destination>` plus the
+// `Role` / `TransportConfig` / `QuicReach` types — is also code-generated here
+// from `streaming.capnp` (native capnp, no JSON-in-Text on the wire).
 pub use crate::streaming_types::{
-    Completion, Delivery, Ordering, OverflowPolicy, Retention, StreamInfo, StreamOpt,
+    Completion, Delivery, Ordering, OverflowPolicy, QuicReach, Destination, Retention, Role,
+    StreamInfo, StreamOpt, TransportConfig,
 };
 
 /// Marker trait for typed stream QoS presets.

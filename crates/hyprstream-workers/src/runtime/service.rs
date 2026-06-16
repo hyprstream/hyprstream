@@ -814,10 +814,7 @@ impl WorkerService {
             .with_qos_preset::<hyprstream_rpc::stream_info::Pipe>();
 
         let stream_id = stream_ctx.stream_id().to_owned();
-        let moq_uds_path = hyprstream_rpc::moq_stream::global_moq_uds_path()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let moq_broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()
+        let broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()
             .map(|o| o.broadcast_path(stream_ctx.topic()))
             .unwrap_or_default();
 
@@ -838,11 +835,10 @@ impl WorkerService {
 
         let stream_info = StreamInfo {
             stream_id,
-            endpoint: String::new(),
             dh_public: *stream_ctx.server_pubkey(),
             qos: stream_ctx.qos().clone(),
-            moq_uds_path,
-            moq_broadcast_path,
+            broadcast_path,
+            announced_at: hyprstream_rpc::moq_stream::producer_reach(),
         };
 
         // Continuation: spawns FD streaming task AFTER REP is sent to client

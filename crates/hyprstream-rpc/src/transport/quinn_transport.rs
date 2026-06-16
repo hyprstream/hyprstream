@@ -54,6 +54,10 @@ pub struct QuinnRpcServer {
     connection_limit: Arc<Semaphore>,
     /// Per-stream request-read timeout (#159 slowloris bound).
     read_timeout: Duration,
+    /// Optional moq streaming-plane consumer (#274). When set, sessions whose
+    /// WebTransport CONNECT URL path is [`crate::dial::MOQ_PATH`] are handed to
+    /// `moq_net::Server::accept` instead of the RPC core. `None` = RPC only.
+    moq_consumer: Option<moq_net::OriginConsumer>,
     shutdown: CancellationToken,
 }
 
@@ -85,8 +89,21 @@ impl QuinnRpcServer {
                 super::rpc_session::DEFAULT_CONNECTION_LIMIT,
             )),
             read_timeout: super::rpc_session::REQUEST_READ_TIMEOUT,
+            moq_consumer: None,
             shutdown: CancellationToken::new(),
         }
+    }
+
+    /// Serve the moq streaming plane on the same endpoint (#274).
+    ///
+    /// Sessions whose WebTransport CONNECT URL path is [`crate::dial::MOQ_PATH`]
+    /// are handed to `moq_net::Server::accept` against `consumer`; all other
+    /// paths route to the RPC core. Mirrors
+    /// [`crate::transport::iroh_moq::IrohMoqProtocolHandler`], which serves moq
+    /// over a per-connection iroh ALPN — here the multiplex is by URL path.
+    pub fn with_moq_consumer(mut self, consumer: moq_net::OriginConsumer) -> Self {
+        self.moq_consumer = Some(consumer);
+        self
     }
 
     /// Override the concurrent-connection cap (#162, builder style).
@@ -213,8 +230,14 @@ impl QuinnRpcServer {
                     let stream_limit = Arc::clone(&self.stream_limit);
                     let read_timeout = self.read_timeout;
                     let shutdown = self.shutdown.clone();
+                    let moq_consumer = self.moq_consumer.clone();
                     tokio::spawn(async move {
                         let _conn_permit = conn_permit; // released when this connection ends
+                        // Multiplex by WebTransport CONNECT URL path (#274): read
+                        // it BEFORE `request.ok()` consumes the request. `/moq`
+                        // → moq streaming plane; any other path → RPC core.
+                        // (`Request` Derefs to `ConnectRequest`, exposing `url`.)
+                        let is_moq = request.url.path() == crate::dial::MOQ_PATH;
                         // Resolve the handshake INSIDE the task, bounded (#162),
                         // so a slow/stalled CONNECT never blocks the accept loop.
                         let session = match tokio::time::timeout(
@@ -236,6 +259,40 @@ impl QuinnRpcServer {
                                 return;
                             }
                         };
+
+                        if is_moq {
+                            match moq_consumer {
+                                Some(consumer) => {
+                                    // Serve moq over this session, mirroring
+                                    // IrohMoqProtocolHandler: publish the shared
+                                    // origin consumer to remote subscribers.
+                                    let server = moq_net::Server::new().with_publish(consumer);
+                                    match server.accept(session).await {
+                                        Ok(moq_session) => {
+                                            // Hold the session until it closes or
+                                            // shutdown is requested.
+                                            tokio::select! {
+                                                biased;
+                                                _ = shutdown.cancelled() => {}
+                                                res = moq_session.closed() => {
+                                                    tracing::debug!(result = ?res, "quinn-moq: session closed");
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::debug!(error = ?e, "quinn-moq: accept failed");
+                                        }
+                                    }
+                                }
+                                None => {
+                                    tracing::warn!(
+                                        "quinn-rpc: /moq requested but no moq consumer configured"
+                                    );
+                                }
+                            }
+                            return;
+                        }
+
                         if let Err(e) = serve_rpc_connection(
                             session,
                             processor,
@@ -359,6 +416,47 @@ pub fn verify_peer_cert_pinned(
     }
 }
 
+/// Build a quinn WebTransport client session against a self-signed server at an
+/// explicit URL **path** (e.g. `/moq` for the moq plane vs `/` for RPC),
+/// accepting the leaf cert if its SHA-256 is any of `cert_hashes`. Hermetic:
+/// dials an IP-literal URL so no DNS lookup occurs. Mirrors
+/// [`connect_pinned_hashes`] but lets the caller select the path the server
+/// path-dispatches on (#274).
+pub async fn connect_pinned_hashes_path(
+    addr: std::net::SocketAddr,
+    cert_hashes: &[[u8; 32]],
+    path: &str,
+) -> Result<web_transport_quinn::Session> {
+    let hashes: Vec<Vec<u8>> = cert_hashes.iter().map(|h| h.to_vec()).collect();
+    let client = web_transport_quinn::ClientBuilder::new()
+        .with_server_certificate_hashes(hashes)
+        .map_err(|e| anyhow!("quinn client build: {e}"))?;
+    let url = url::Url::parse(&format!("https://{addr}{path}"))
+        .map_err(|e| anyhow!("quinn url: {e}"))?;
+    client
+        .connect(url)
+        .await
+        .map_err(|e| anyhow!("quinn connect: {e}"))
+}
+
+/// WebPKI variant of [`connect_pinned_hashes_path`]: validate via the system
+/// root store + DNS `server_name`, dialing the given URL `path` (#274).
+pub async fn connect_webpki_path(
+    server_name: &str,
+    port: u16,
+    path: &str,
+) -> Result<web_transport_quinn::Session> {
+    let client = web_transport_quinn::ClientBuilder::new()
+        .with_system_roots()
+        .map_err(|e| anyhow!("quinn client (system roots): {e}"))?;
+    let url = url::Url::parse(&format!("https://{server_name}:{port}{path}"))
+        .map_err(|e| anyhow!("quinn url: {e}"))?;
+    client
+        .connect(url)
+        .await
+        .map_err(|e| anyhow!("quinn connect (webpki): {e}"))
+}
+
 /// Convenience: pin by the full server cert DER (hashes it for you). Used by
 /// tests and callers that hold the cert rather than its fingerprint.
 pub async fn connect_pinned(
@@ -373,6 +471,15 @@ pub async fn connect_pinned(
 fn sha256(bytes: &[u8]) -> Vec<u8> {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes).to_vec()
+}
+
+/// SHA-256 fingerprint of a DER-encoded certificate, as 32 raw bytes — the
+/// cert-hash pin used in `QuicServerAuth`, the DID-doc `#quic` entry, and the
+/// `StreamInfo.reach` Quic option (#274). The fingerprint is public material.
+pub fn cert_sha256(cert_der: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&sha256(cert_der));
+    out
 }
 
 #[cfg(test)]

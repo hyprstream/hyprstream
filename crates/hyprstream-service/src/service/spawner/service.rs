@@ -72,9 +72,11 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
             .build()
             .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("runtime: {e}")))?;
 
-        // LocalSet is required for WebTransportServer's spawn_local internals.
+        // A LocalSet is retained for any `!Send` per-service internals reachable
+        // through the bridge; the quinn accept loop itself is fully `Send`.
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async move {
+            let _ = server_pubkey; // identity is verified app-layer via the bridge
             let nonce_cache = Arc::new(hyprstream_rpc::envelope::InMemoryNonceCache::new());
             let bridge = hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge::spawn(
                 service, Arc::clone(&nonce_cache), 0,
@@ -82,17 +84,40 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
             let processor: Arc<dyn IrohRequestProcessor> = Arc::new(bridge);
 
             if let Some(mut qc) = quic_config {
-                // Build WebTransportServer and run it alongside the inproc/UDS plane.
-                let mut wt_server = hyprstream_rpc::transport::zmtp_quic::WebTransportServer::bind(
-                    qc.bind_addr,
-                    qc.cert_chain.clone(),
-                    (*qc.key_der).clone(),
-                ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("QUIC bind: {e}")))?;
-                if let Some(ref meta) = qc.protected_resource_json {
-                    wt_server = wt_server.with_protected_resource_metadata(meta.clone());
+                // #274: serve the RPC plane over `web_transport_quinn` (replacing
+                // the bespoke h3 WebTransportServer) and multiplex the moq
+                // streaming plane on the same endpoint via `/moq` path-dispatch.
+                let _ = &qc.protected_resource_json; // RFC 9728 metadata served by axum (:6790)
+                let chain: Vec<rustls::pki_types::CertificateDer<'static>> = qc
+                    .cert_chain
+                    .iter()
+                    .map(|d| rustls::pki_types::CertificateDer::from(d.clone()))
+                    .collect();
+                let key = rustls::pki_types::PrivateKeyDer::try_from((*qc.key_der).clone())
+                    .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("QUIC key: {e}")))?;
+                let wt_server = web_transport_quinn::ServerBuilder::new()
+                    .with_addr(qc.bind_addr)
+                    .with_certificate(chain, key)
+                    .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("QUIC bind: {e}")))?;
+                let actual_addr = wt_server.local_addr()
+                    .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("QUIC local_addr: {e}")))?;
+                let pin = hyprstream_rpc::transport::quinn_transport::cert_sha256(&qc.cert_chain[0]);
+
+                let mut rpc_server = hyprstream_rpc::transport::quinn_transport::QuinnRpcServer::with_capacity(
+                    wt_server,
+                    Arc::clone(&processor),
+                    signing_key.clone(),
+                    hyprstream_rpc::transport::rpc_session::DEFAULT_STREAM_LIMIT,
+                );
+                // Multiplex moq on the same endpoint when the global origin is up.
+                if let Some(origin) = hyprstream_rpc::moq_stream::global_moq_origin() {
+                    rpc_server = rpc_server.with_moq_consumer(origin.consumer().clone());
                 }
-                let actual_addr = wt_server.local_addr().unwrap_or(qc.bind_addr);
-                let pin = hyprstream_rpc::transport::zmtp_quic::cert_sha256(&qc.cert_chain[0]);
+
+                // Register this endpoint for RPC resolution and, once, as the
+                // node's network reach for StreamInfo producers (#274) — the
+                // SAME (addr, server_name, cert-hash) the DID-doc #quic entry
+                // advertises, built from one source so no per-site drift.
                 if let Some(reg) = hyprstream_rpc::registry::try_global() {
                     reg.register(
                         &service_name,
@@ -105,18 +130,38 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                         None,
                     );
                 }
+                hyprstream_rpc::moq_stream::init_global_producer_reach(
+                    hyprstream_rpc::moq_stream::NodeStreamReach {
+                        addr: actual_addr,
+                        server_name: qc.server_name.clone(),
+                        cert_hashes: vec![pin],
+                    },
+                );
                 if let Some(cb) = qc.on_quic_bound.take() {
-                    cb(service_name, actual_addr, qc.server_name);
+                    cb(service_name, actual_addr, qc.server_name.clone());
                 }
+
+                // Bridge the `Notify` shutdown to the server's graceful drain.
+                let drain_limit = rpc_server.stream_limit();
+                let drain_capacity = rpc_server.capacity();
+                let drain_token = rpc_server.shutdown_token();
+                let drain_shutdown = Arc::clone(&shutdown);
+                tokio::spawn(async move {
+                    drain_shutdown.notified().await;
+                    hyprstream_rpc::transport::quinn_transport::QuinnRpcServer::shutdown(
+                        &drain_limit, drain_capacity, &drain_token,
+                    ).await;
+                });
+
                 let rep_fut = hyprstream_rpc::service::serve::serve_bridged(
                     &transport, Arc::clone(&processor), signing_key.clone(),
                     Arc::clone(&shutdown), on_ready,
                 );
-                let quic_fut = wt_server.accept_loop_processor(
-                    processor, server_pubkey, signing_key, nonce_cache,
-                    Arc::clone(&shutdown),
-                );
-                let (rep_result, _) = tokio::join!(rep_fut, quic_fut);
+                let quic_fut = rpc_server.run();
+                let (rep_result, quic_result) = tokio::join!(rep_fut, quic_fut);
+                if let Err(e) = quic_result {
+                    tracing::warn!("QUIC server loop ended with error: {e}");
+                }
                 rep_result.map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(e.to_string()))
             } else {
                 hyprstream_rpc::service::serve::serve_bridged(

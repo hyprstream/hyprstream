@@ -140,6 +140,45 @@ struct StreamOpt {
 # Stream Setup
 # =============================================================================
 
+# A single way to reach the moq streaming plane for this stream (#274).
+#
+# `role` distinguishes a direct producer endpoint from a relay; `transport`
+# carries the network-routable dial parameters (no JSON-in-Text — native capnp
+# so the generated codec covers it). The same-host UDS fast path is NOT encoded
+# here: co-located clients resolve `ipc`/`inproc` from LOCAL config, never from
+# the wire. A client picks a reach it can dial and subscribes to `broadcastPath`.
+struct Destination {
+  role @0 :Role;
+  transport @1 :TransportConfig;
+}
+
+# Whether this reach is the producer itself (direct) or a relay in front of it.
+enum Role {
+  direct @0;
+  relay  @1;
+}
+
+# Network-routable transport for a reach. A union so new transports (e.g. Iroh)
+# can be added later without a wire break. Each arm is a struct so its fields —
+# including `List(Data)` cert pins — are covered by the generated codec.
+struct TransportConfig {
+  union {
+    # Quic / WebTransport (web-transport-quinn). Dialed over `web_transport_quinn`.
+    quic @0 :QuicReach;
+    # Reserved for NAT-traversing iroh dial (#274 follow-up). Capnp requires a
+    # union to have >= 2 members; this placeholder leaves room without a wire
+    # break when the iroh reach lands.
+    iroh @1 :Void;
+  }
+}
+
+# Dial parameters for the Quic / WebTransport arm.
+struct QuicReach {
+  addr       @0 :Text;        # "host:port" socket address to dial.
+  serverName @1 :Text;        # TLS SNI / WebPKI validation name.
+  certHashes @2 :List(Data);  # Acceptable leaf-cert SHA-256 pins (self-signed mesh).
+}
+
 # Stream metadata returned when starting a stream
 #
 # Contains everything the client needs to subscribe and derive keys.
@@ -147,17 +186,17 @@ struct StreamOpt {
 # Wrapped in a SignedEnvelope (Ed25519) so the policy field is authenticated.
 struct StreamInfo {
   streamId @0 :Text;      # Unique stream identifier (e.g., "stream-{uuid}")
-  endpoint @1 :Text;      # Reserved (was ZMQ XPUB endpoint — moq paths below supersede)
-  dhPublic @2 :Data $fixedSize(32);  # Server's ephemeral Ristretto255 public key for DH
+  dhPublic @1 :Data $fixedSize(32);  # Server's ephemeral Ristretto255 public key for DH
   # Service-declared QoS options. Authenticated by the Ed25519 signature
   # over the enclosing SignedEnvelope. Clients MUST enforce these options and
   # MUST disconnect (not silently downgrade) if a required mode is unsupported.
-  qos   @3 :StreamOpt;
-  # moq transport paths (M3 — replaces ZMQ SUB endpoint).
-  # moqUdsPath: UDS socket path for cross-process moq subscription.
-  # moqBroadcastPath: broadcast path within the moq origin (e.g. "local/streams/{topic_hex}").
-  moqUdsPath @4 :Text;
-  moqBroadcastPath @5 :Text;
+  qos   @2 :StreamOpt;
+  # Broadcast path within the moq origin (e.g. "local/streams/{topic_hex}").
+  broadcastPath @3 :Text;
+  # Ways to reach the moq plane for this stream (#274). The client dials the
+  # first reach it supports (see `dial_stream`) and subscribes to `broadcastPath`.
+  # Co-located clients ignore this and use the same-host UDS fast path.
+  announcedAt @4 :List(Destination);
 }
 
 # Stream registration - wrapped in SignedEnvelope for authorization

@@ -8,8 +8,8 @@
 
 use hyprstream_rpc::capnp::{FromCapnp, ToCapnp};
 use hyprstream_rpc::stream_info::{
-    Completion, Delivery, Job, Log, Ordering, OverflowPolicy, Pipe, Retention, StreamInfo,
-    StreamOpt, StreamOptPreset,
+    Completion, Delivery, Job, Log, Ordering, OverflowPolicy, Pipe, QuicReach, Destination,
+    Retention, Role, StreamInfo, StreamOpt, StreamOptPreset, TransportConfig,
 };
 
 /// Serialize a `StreamInfo` through a Cap'n Proto message and read it back.
@@ -38,12 +38,19 @@ fn roundtrip(info: &StreamInfo) -> StreamInfo {
 fn sample_info(qos: StreamOpt) -> StreamInfo {
     StreamInfo {
         stream_id: "stream-273".to_owned(),
-        endpoint: "".to_owned(),
         // `dh_public` = server's ephemeral Ristretto255 DH public key.
         dh_public: [7u8; 32],
         qos,
-        moq_uds_path: "/tmp/moq.sock".to_owned(),
-        moq_broadcast_path: "local/streams/deadbeef".to_owned(),
+        broadcast_path: "local/streams/deadbeef".to_owned(),
+        // #274: exercise the native-capnp reach codec (List(struct) + union + group).
+        announced_at: vec![Destination {
+            role: Role::Direct,
+            transport: TransportConfig::Quic(QuicReach {
+                addr: "127.0.0.1:4433".to_owned(),
+                server_name: "hyprstream.local".to_owned(),
+                cert_hashes: vec![vec![0xABu8; 32], vec![0xCDu8; 32]],
+            }),
+        }],
     }
 }
 
@@ -51,10 +58,9 @@ fn assert_roundtrips(qos: StreamOpt) {
     let info = sample_info(qos);
     let back = roundtrip(&info);
     assert_eq!(info.stream_id, back.stream_id);
-    assert_eq!(info.endpoint, back.endpoint);
     assert_eq!(info.dh_public, back.dh_public);
-    assert_eq!(info.moq_uds_path, back.moq_uds_path);
-    assert_eq!(info.moq_broadcast_path, back.moq_broadcast_path);
+    assert_eq!(info.broadcast_path, back.broadcast_path);
+    assert_eq!(info.announced_at, back.announced_at);
     assert_eq!(info.qos, back.qos);
 }
 

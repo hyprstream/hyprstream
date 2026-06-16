@@ -84,6 +84,66 @@ pub fn global_moq_uds_path() -> Option<&'static Path> {
     GLOBAL_MOQ_UDS_PATH.get().map(PathBuf::as_path)
 }
 
+// ============================================================================
+// Process-global producer reach (#274) — the network-routable way external
+// subscribers reach this node's moq plane. Set once when the QUIC /
+// web_transport_quinn server binds; read by every StreamInfo producer site so
+// the `reach` field is built from ONE source (no per-site assembly, no drift),
+// the same Rust value `root_did_document()` uses for its QuicTransport entry.
+// ============================================================================
+
+/// The node's network-routable moq reach: the bound QUIC address, its TLS
+/// server name, and the leaf-cert SHA-256 pins. `None` until the daemon binds
+/// its `web_transport_quinn` server (UDS-only / unit-test deployments).
+static GLOBAL_PRODUCER_REACH: OnceLock<NodeStreamReach> = OnceLock::new();
+
+/// The node's own moq reach parameters — the single source for the `reach`
+/// list every StreamInfo producer publishes.
+#[derive(Clone, Debug)]
+pub struct NodeStreamReach {
+    /// Bound socket address external subscribers dial (`/moq` over WebTransport).
+    pub addr: std::net::SocketAddr,
+    /// TLS SNI / WebPKI validation name advertised for the endpoint.
+    pub server_name: String,
+    /// Acceptable leaf-cert SHA-256 pins (self-signed mesh; rotation = multiple).
+    pub cert_hashes: Vec<[u8; 32]>,
+}
+
+/// Register the node's network-routable moq reach (idempotent — first wins).
+///
+/// Called once when the daemon binds its `web_transport_quinn` server, with the
+/// same `(addr, server_name, cert_hash)` the RPC endpoint registers and the
+/// DID-doc `#quic` entry advertises.
+pub fn init_global_producer_reach(reach: NodeStreamReach) -> bool {
+    GLOBAL_PRODUCER_REACH.set(reach).is_ok()
+}
+
+/// Borrow the node's registered network reach, if the QUIC server is bound.
+pub fn global_producer_reach() -> Option<&'static NodeStreamReach> {
+    GLOBAL_PRODUCER_REACH.get()
+}
+
+/// Build the `StreamInfo.reach` list for a producer on this node (#274).
+///
+/// Centralised so every producer site emits an identical reach, sourced from the
+/// one [`NodeStreamReach`] the QUIC bind registered. Returns an empty list when
+/// the node has no networked reach (UDS-only); co-located clients fall back to
+/// the same-host UDS fast path and ignore `reach` entirely.
+pub fn producer_reach() -> Vec<crate::stream_info::Destination> {
+    use crate::stream_info::{QuicReach, Destination, Role, TransportConfig};
+    match global_producer_reach() {
+        Some(r) => vec![Destination {
+            role: Role::Direct,
+            transport: TransportConfig::Quic(QuicReach {
+                addr: r.addr.to_string(),
+                server_name: r.server_name.clone(),
+                cert_hashes: r.cert_hashes.iter().map(|h| h.to_vec()).collect(),
+            }),
+        }],
+        None => Vec::new(),
+    }
+}
+
 /// Start a UDS moq server in the background, serving the moq origin's consumer
 /// to local cross-process subscribers (e.g. `hyprstream tui attach`).
 ///
@@ -496,6 +556,48 @@ impl MoqStreamHandle {
         Self { rx, broadcast_path, cancel }
     }
 
+    /// Construct a handle that subscribes over the **network** (#274).
+    ///
+    /// Resolves the signed `StreamInfo`'s `reach` list: if the same-host moq UDS
+    /// plane is available (co-located producer), that fast path is used; else
+    /// the first dialable network reach is dialed via
+    /// [`crate::dial::dial_stream`] over `web_transport_quinn`. After connecting,
+    /// it subscribes to `broadcast_path` and verifies the chained-HMAC frames
+    /// exactly as [`Self::new`] does. Errors/end-of-stream close the channel.
+    pub fn networked(
+        reach: Vec<crate::stream_info::Destination>,
+        broadcast_path: String,
+        mac_key: [u8; 32],
+        topic: String,
+    ) -> Self {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<anyhow::Result<crate::streaming::StreamPayload>>(64);
+        // Same-host fast path: if a local moq UDS plane is serving (co-located
+        // producer), prefer it and ignore the wire reach entirely.
+        if let Some(uds) = global_moq_uds_path() {
+            let uds_path = uds.to_string_lossy().into_owned();
+            tokio::spawn(moq_stream_handle_task(
+                uds_path,
+                broadcast_path.clone(),
+                mac_key,
+                topic,
+                tx,
+                cancel.clone(),
+            ));
+        } else {
+            tokio::spawn(moq_stream_handle_task_networked(
+                reach,
+                broadcast_path.clone(),
+                mac_key,
+                topic,
+                tx,
+                cancel.clone(),
+            ));
+        }
+        Self { rx, broadcast_path, cancel }
+    }
+
     /// Receive the next stream payload.
     ///
     /// Returns `Ok(None)` when the stream ends cleanly, `Err` on a stream error.
@@ -608,6 +710,165 @@ async fn moq_stream_handle_task(
                     "frame read timeout after {}s",
                     FRAME_READ_TIMEOUT.as_secs()
                 ))).await;
+                break;
+            }
+        };
+        match verify_moq_frame(&mut verifier, &topic, &frame) {
+            Ok(payloads) => {
+                for p in payloads {
+                    let is_terminal = matches!(
+                        p,
+                        crate::streaming::StreamPayload::Complete(_)
+                            | crate::streaming::StreamPayload::Error(_)
+                    );
+                    if tx.send(Ok(p)).await.is_err() {
+                        return;
+                    }
+                    if is_terminal {
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+                return;
+            }
+        }
+    }
+}
+
+/// Convert a wire-published [`crate::stream_info::Destination`] into the local
+/// [`crate::transport::TransportConfig`] [`crate::dial::dial_stream`] dials (#274).
+///
+/// Only the network-routable transports map; same-host endpoints are never
+/// carried in `reach` (co-located clients use the UDS fast path).
+fn reach_to_transport_config(
+    reach: &crate::stream_info::Destination,
+) -> Option<crate::transport::TransportConfig> {
+    use crate::stream_info::TransportConfig as ReachTransport;
+    use crate::transport::{QuicServerAuth, TransportConfig};
+    match &reach.transport {
+        ReachTransport::Quic(q) => {
+            let addr: std::net::SocketAddr = q.addr.parse().ok()?;
+            // Fixed-size cert pins (SHA-256 = 32 bytes); skip any malformed entry.
+            let hashes: Vec<[u8; 32]> = q
+                .cert_hashes
+                .iter()
+                .filter_map(|h| <[u8; 32]>::try_from(h.as_slice()).ok())
+                .collect();
+            let auth = if hashes.is_empty() {
+                QuicServerAuth::web_pki()
+            } else {
+                // Pinned self-signed mesh (matches the DID-doc #quic entry).
+                QuicServerAuth::pinned(hashes).ok()?
+            };
+            Some(TransportConfig::quic_with_auth(addr, q.server_name.clone(), auth))
+        }
+        // Reserved (#274 follow-up): no dialable Iroh reach yet.
+        ReachTransport::Iroh => None,
+    }
+}
+
+/// Networked variant of [`moq_stream_handle_task`]: dial a `/moq`
+/// `web_transport_quinn` session from the `reach` list instead of the UDS
+/// plane, then run the identical subscribe + chained-HMAC verify loop (#274).
+async fn moq_stream_handle_task_networked(
+    reach: Vec<crate::stream_info::Destination>,
+    broadcast_path: String,
+    mac_key: [u8; 32],
+    topic: String,
+    tx: tokio::sync::mpsc::Sender<anyhow::Result<crate::streaming::StreamPayload>>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    use crate::streaming::StreamVerifier;
+    use moq_net::{Client as MoqClient, Origin, Track};
+
+    // Dial the first reach we can resolve + connect.
+    let mut session = None;
+    let mut last_err: Option<String> = None;
+    for opt in &reach {
+        let Some(cfg) = reach_to_transport_config(opt) else {
+            continue;
+        };
+        match crate::dial::dial_stream(&cfg).await {
+            Ok(s) => {
+                session = Some(s);
+                break;
+            }
+            Err(e) => last_err = Some(e.to_string()),
+        }
+    }
+    let Some(session) = session else {
+        let msg = last_err.unwrap_or_else(|| "no dialable reach in StreamInfo".to_owned());
+        let _ = tx.send(Err(anyhow!("moq networked dial failed: {msg}"))).await;
+        return;
+    };
+
+    let client_origin = Origin::random().produce();
+    let client_consumer = client_origin.consume();
+    let moq_client = MoqClient::new().with_consume(client_origin);
+    let _session = match moq_client.connect(session).await {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = tx.send(Err(anyhow!("moq handshake: {e}"))).await;
+            return;
+        }
+    };
+    let bc = match tokio::time::timeout(
+        BROADCAST_ANNOUNCE_TIMEOUT,
+        client_consumer.announced_broadcast(&broadcast_path),
+    )
+    .await
+    {
+        Ok(Some(bc)) => bc,
+        Ok(None) => {
+            let _ = tx.send(Err(anyhow!("broadcast {broadcast_path} not announced"))).await;
+            return;
+        }
+        Err(_) => {
+            let _ = tx
+                .send(Err(anyhow!("timeout waiting for broadcast {broadcast_path}")))
+                .await;
+            return;
+        }
+    };
+    let mut track = match bc.subscribe_track(&Track::new(STREAM_TRACK)) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = tx.send(Err(anyhow!("subscribe_track: {e}"))).await;
+            return;
+        }
+    };
+    let mut verifier = StreamVerifier::new(mac_key, topic.clone());
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let mut group = match tokio::time::timeout(GROUP_IDLE_TIMEOUT, track.next_group()).await {
+            Ok(Ok(Some(g))) => g,
+            Ok(Ok(None)) => break,
+            Err(_elapsed) => {
+                let _ = tx
+                    .send(Err(anyhow!("stream idle: no group for {}s", GROUP_IDLE_TIMEOUT.as_secs())))
+                    .await;
+                break;
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(Err(anyhow!("moq next_group: {e}"))).await;
+                break;
+            }
+        };
+        let frame: bytes::Bytes = match tokio::time::timeout(FRAME_READ_TIMEOUT, group.read_frame()).await {
+            Ok(Ok(Some(f))) => f,
+            Ok(Ok(None)) => break,
+            Ok(Err(e)) => {
+                let _ = tx.send(Err(anyhow!("frame read error: {e}"))).await;
+                break;
+            }
+            Err(_elapsed) => {
+                let _ = tx
+                    .send(Err(anyhow!("frame read timeout after {}s", FRAME_READ_TIMEOUT.as_secs())))
+                    .await;
                 break;
             }
         };

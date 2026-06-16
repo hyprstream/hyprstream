@@ -216,6 +216,66 @@ where
     }
 }
 
+/// The URL path the daemon's `web_transport_quinn` server dispatches to the moq
+/// streaming plane (default path → RPC). Both server and client use this.
+pub const MOQ_PATH: &str = "/moq";
+
+/// Dial the moq streaming plane for a network-routable reach, returning a live
+/// [`web_transport_quinn::Session`] (#274).
+///
+/// The sibling of [`dial`] for the *streaming* plane: it dials the `/moq` path
+/// over `web_transport_quinn` (the server path-dispatches `/moq` → moq, default
+/// → RPC), reusing [`crate::transport::quinn_transport`]'s connect + cert-pin
+/// helpers. The returned session is handed straight to `moq_net::Client::connect`.
+///
+/// Only the **network-routable** transports are dialable here. `Ipc` / `Inproc`
+/// / `SystemdFd` are same-host endpoints resolved from LOCAL config — never from
+/// a wire-published reach — so they are rejected: a co-located client must use
+/// the same-host UDS fast path instead of dialing.
+pub async fn dial_stream(
+    target: &TransportConfig,
+) -> Result<web_transport_quinn::Session> {
+    use crate::transport::quinn_transport::{
+        connect_pinned_hashes_path, connect_webpki_path, verify_peer_cert_pinned,
+    };
+    match &target.endpoint {
+        EndpointType::Quic { addr, server_name, auth } => {
+            let pins = auth.accept_cert_hashes();
+            let session = if auth.require_web_pki() {
+                // WebPKI (optionally + pin): validate via system roots + SNI.
+                let session = connect_webpki_path(server_name, addr.port(), MOQ_PATH).await?;
+                if !pins.is_empty() {
+                    // Defence in depth (#185): also require the leaf to be pinned.
+                    verify_peer_cert_pinned(&session, pins)?;
+                }
+                session
+            } else {
+                // Self-signed mesh: pin the leaf by its SHA-256 (dial by IP).
+                if pins.is_empty() {
+                    bail!("dial_stream(): pinned QUIC reach has no cert hashes — not dialable");
+                }
+                connect_pinned_hashes_path(*addr, pins, MOQ_PATH).await?
+            };
+            Ok(session)
+        }
+        EndpointType::Iroh { .. } => {
+            bail!(
+                "dial_stream(): iroh streaming reach is not yet supported — \
+                 the reach list should carry a Quic/WebTransport option"
+            )
+        }
+        EndpointType::Ipc { .. }
+        | EndpointType::SystemdFd { .. }
+        | EndpointType::Inproc { .. } => {
+            bail!(
+                "dial_stream(): same-host endpoint ({:?}) is resolved from local \
+                 config, not dialed from the wire — use the UDS fast path",
+                target.endpoint
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

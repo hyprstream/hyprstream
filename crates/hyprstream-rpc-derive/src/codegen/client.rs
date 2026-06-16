@@ -445,14 +445,16 @@ fn generate_trait_method_impl(
                 if info.dh_public == [0u8; 32] {
                     anyhow::bail!("Server did not provide DH public key for streaming");
                 }
-                if info.moq_uds_path.is_empty() {
-                    anyhow::bail!("Server did not provide moq transport path — moq transport not initialized");
+                if info.broadcast_path.is_empty() {
+                    anyhow::bail!("Server did not provide moq broadcast path — moq transport not initialized");
                 }
                 let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
                     &client_secret, &client_pubkey_bytes, &info.dh_public,
                 )?;
-                Ok(hyprstream_rpc::moq_stream::MoqStreamHandle::new(
-                    info.moq_uds_path, info.moq_broadcast_path, mac_key, topic,
+                // #274: subscribe over the resolved `reach` (the same-host UDS
+                // fast path is preferred automatically when co-located).
+                Ok(hyprstream_rpc::moq_stream::MoqStreamHandle::networked(
+                    info.announced_at, info.broadcast_path, mac_key, topic,
                 ))
             }
         })

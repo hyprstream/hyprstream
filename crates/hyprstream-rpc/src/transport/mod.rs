@@ -4,7 +4,7 @@
 //! - `Transport` / `AsyncTransport` traits for generic transport abstraction
 //! - `TransportConfig` for unified endpoint configuration
 //! - Systemd socket activation support via `SystemdFd` variant
-//! - QUIC/WebTransport via `zmtp_quic` (WebTransportServer + process_request)
+//! - QUIC/WebTransport via `quinn_transport` (`QuinnRpcServer` + moq multiplex, #274)
 //! - Raw socket options via `sockopt` submodule
 
 mod traits;

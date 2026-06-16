@@ -561,7 +561,13 @@ impl InferenceService {
         expiry_secs: i64,
         subject: &Subject,
         ttt_overrides: crate::training::ttt::TTTOverrides,
-    ) -> Result<(String, [u8; 32], String, String, PendingWork)> {
+    ) -> Result<(
+        String,
+        [u8; 32],
+        String,
+        Vec<hyprstream_rpc::stream_info::Destination>,
+        PendingWork,
+    )> {
         // TTT adaptation is deferred to execute_stream (runs in continuation after REP
         // is sent) to avoid blocking the ZMQ REQ/REP handler with GPU-intensive work.
 
@@ -586,12 +592,10 @@ impl InferenceService {
 
         let stream_id = stream_ctx.stream_id().to_owned();
         let server_pubkey = *stream_ctx.server_pubkey();
-        let moq_uds_path = hyprstream_rpc::moq_stream::global_moq_uds_path()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let moq_broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()
+        let broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()
             .map(|o| o.broadcast_path(stream_ctx.topic()))
             .unwrap_or_default();
+        let reach = hyprstream_rpc::moq_stream::producer_reach();
 
         // Delta lookup deferred to execute_stream (after TTT may modify it)
         let pending = PendingWork::Generation {
@@ -601,7 +605,7 @@ impl InferenceService {
             ttt_overrides,
         };
 
-        Ok((stream_id, server_pubkey, moq_uds_path, moq_broadcast_path, pending))
+        Ok((stream_id, server_pubkey, broadcast_path, reach, pending))
     }
 
     /// Execute streaming generation - called AFTER REP response is sent.
@@ -1041,20 +1045,16 @@ impl InferenceService {
 
         let stream_id = stream_ctx.stream_id().to_owned();
         let server_pubkey = *stream_ctx.server_pubkey();
-        let moq_uds_path = hyprstream_rpc::moq_stream::global_moq_uds_path()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let moq_broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()
+        let broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()
             .map(|o| o.broadcast_path(stream_ctx.topic()))
             .unwrap_or_default();
 
         let stream_info = crate::services::generated::inference_client::StreamInfo {
             stream_id,
-            endpoint: String::new(),
             dh_public: server_pubkey,
             qos: stream_ctx.qos().clone(),
-            moq_uds_path,
-            moq_broadcast_path,
+            broadcast_path,
+            announced_at: hyprstream_rpc::moq_stream::producer_reach(),
         };
 
         Ok((stream_info, stream_ctx))
@@ -1892,16 +1892,15 @@ impl InferenceHandler for InferenceService {
 
         let client_ephemeral_pubkey = ctx.ephemeral_pubkey();
         let claims = ctx.claims().cloned();
-        let (stream_id, server_pubkey, moq_uds_path, moq_broadcast_path, pending) =
+        let (stream_id, server_pubkey, broadcast_path, reach, pending) =
             self.prepare_stream(request, client_ephemeral_pubkey.as_ref().map(<[u8; 32]>::as_slice), claims, expiry_secs, &subject, ttt_overrides).await?;
 
         let stream_info = crate::services::generated::inference_client::StreamInfo {
             stream_id,
-            endpoint: String::new(),
             dh_public: server_pubkey,
             qos: <hyprstream_rpc::stream_info::Job as hyprstream_rpc::stream_info::StreamOptPreset>::stream_opt(),
-            moq_uds_path,
-            moq_broadcast_path,
+            broadcast_path,
+            announced_at: reach,
         };
 
         // Build continuation that executes the stream after REP is sent.
@@ -2102,20 +2101,16 @@ impl InferenceHandler for InferenceService {
 
         let stream_id = stream_ctx.stream_id().to_owned();
         let server_pubkey = *stream_ctx.server_pubkey();
-        let moq_uds_path = hyprstream_rpc::moq_stream::global_moq_uds_path()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let moq_broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()
+        let broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()
             .map(|o| o.broadcast_path(stream_ctx.topic()))
             .unwrap_or_default();
 
         let stream_info = crate::services::generated::inference_client::StreamInfo {
             stream_id,
-            endpoint: String::new(),
             dh_public: server_pubkey,
             qos: stream_ctx.qos().clone(),
-            moq_uds_path,
-            moq_broadcast_path,
+            broadcast_path,
+            announced_at: hyprstream_rpc::moq_stream::producer_reach(),
         };
 
         let adaptation_strategy = map_adaptation_strategy(data.adaptation_strategy, data.writeback_threshold);
