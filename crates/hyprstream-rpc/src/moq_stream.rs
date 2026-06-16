@@ -97,23 +97,42 @@ pub fn serve_moq_uds_background(origin: MoqStreamOrigin, path: PathBuf) {
     use crate::transport::uds_session::{accept_uds, PLANE_MOQ};
     use moq_net::Server as MoqServer;
 
-    if GLOBAL_MOQ_UDS_PATH.set(path.clone()).is_err() {
-        return; // already started
-    }
-
     // Remove stale socket from a previous run (best-effort).
     let _ = std::fs::remove_file(&path);
 
-    tokio::spawn(async move {
-        let listener = match tokio::net::UnixListener::bind(&path) {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!(path = %path.display(), "moq UDS bind failed: {e}");
-                return;
-            }
-        };
-        tracing::info!(path = %path.display(), "moq UDS listener ready");
+    // Bind synchronously so the socket exists before we advertise the path.
+    // Any caller reading global_moq_uds_path() is guaranteed the socket is ready.
+    let listener = match std::os::unix::net::UnixListener::bind(&path) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(path = %path.display(), "moq UDS bind failed: {e}");
+            return;
+        }
+    };
 
+    // 0o600: owner read/write only; SO_PEERCRED enforces uid match on Linux (see uds_server.rs).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    // Convert to async and publish the path only after the socket is bound.
+    let listener = match tokio::net::UnixListener::from_std(listener) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("moq UDS listener conversion failed: {e}");
+            return;
+        }
+    };
+
+    if GLOBAL_MOQ_UDS_PATH.set(path.clone()).is_err() {
+        return; // already started (concurrent call)
+    }
+
+    tracing::info!(path = %path.display(), "moq UDS listener ready");
+
+    tokio::spawn(async move {
         loop {
             let stream = match listener.accept().await {
                 Ok((s, _)) => s,
@@ -515,6 +534,7 @@ impl futures::Stream for MoqStreamHandle {
     }
 }
 
+// TODO: add reconnect backoff on UDS disconnect (ZMQ auto-reconnect parity)
 async fn moq_stream_handle_task(
     uds_path: String,
     broadcast_path: String,
