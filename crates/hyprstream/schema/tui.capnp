@@ -10,6 +10,10 @@
 using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".mcpScope;
 using import "/annotations.capnp".mcpDescription;
+# #275: the moq reach model (network-routable dial parameters) so a cross-process
+# TUI viewer can dial the producer's networked moq plane instead of its own local
+# UDS plane. Shared 1:1 with the inference StreamInfo's reach (streaming.capnp).
+using import "/streaming.capnp".Destination;
 
 # ═══════════════════════════════════════════════════════════════════
 # Frame Types (streamed via StreamPublisher, not RPC)
@@ -383,6 +387,13 @@ struct StreamInfo {
   moqBroadcastPath @3 :Text;
   # UDS socket path for the moq streaming plane (empty when ZMQ is active)
   moqUdsPath @4 :Text;
+  # #275: network-routable ways to reach the producer's moq plane (mirrors the
+  # inference StreamInfo's `announcedAt`). A cross-process viewer dials the first
+  # reach it supports (see `dial_stream`) and subscribes to `moqBroadcastPath`,
+  # rather than connecting to its OWN local moq UDS plane — which only carries the
+  # producer's broadcast when the producer is co-located in the very same process.
+  # Co-located clients ignore this and use the same-host UDS fast path (`moqUdsPath`).
+  reach @5 :List(Destination);
 }
 
 # Window information

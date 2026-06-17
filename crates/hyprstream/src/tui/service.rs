@@ -1541,6 +1541,13 @@ impl TuiService {
             connect.set_viewer_id(viewer_id);
             connect.set_session_id(session_id);
 
+            // #275: the node's network-routable moq reach (the bound QUIC `/moq`
+            // endpoint, registered when the daemon's web_transport_quinn server
+            // binds). Shared across all FD streams — they all live on this node's
+            // one moq plane. A cross-process viewer dials this reach instead of its
+            // own local moq UDS plane (see StreamInfo.reach docs / MoqStreamHandle::networked).
+            let reach = hyprstream_rpc::moq_stream::producer_reach();
+
             // FD-indexed streams: [0]=stdin (input relay), [1]=stdout (frames)
             let mut stream_list = connect.reborrow().init_streams(streams.len() as u32);
             for (i, (topic, sub_endpoint, mac_key, moq_path, moq_uds)) in streams.iter().enumerate() {
@@ -1550,6 +1557,14 @@ impl TuiService {
                 si.set_mac_key(*mac_key);
                 si.set_moq_broadcast_path(moq_path);
                 si.set_moq_uds_path(moq_uds);
+                // Encode the networked reach via the shared generated ToCapnp impl
+                // (Destination::write_to), so the wire bytes match the inference
+                // StreamInfo's `announcedAt` 1:1.
+                let mut reach_list = si.reborrow().init_reach(reach.len() as u32);
+                for (j, dest) in reach.iter().enumerate() {
+                    let mut db = reach_list.reborrow().get(j as u32);
+                    hyprstream_rpc::capnp::ToCapnp::write_to(dest, &mut db);
+                }
             }
 
             let mut win_list = connect.init_windows(windows.len() as u32);
@@ -2375,6 +2390,7 @@ pub(crate) async fn run_frame_loop(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -2382,5 +2398,77 @@ mod tests {
     fn test_display_mode() {
         assert_ne!(DisplayMode::Ansi, DisplayMode::Capnp);
         assert_ne!(DisplayMode::Capnp, DisplayMode::Structured);
+    }
+
+    /// #275: the PTY StreamInfo must carry the producer's networked reach so a
+    /// cross-process viewer dials the TUI service's QUIC `/moq` endpoint instead
+    /// of its own local moq UDS plane. This exercises the exact encode path
+    /// `build_connect_response` uses — `producer_reach()` → `Destination::write_to`
+    /// into the tui StreamInfo capnp `reach` field — and reads it back through the
+    /// generated `tui_client::StreamInfo` decoder, asserting the Quic dial params
+    /// survive the round-trip intact (the chat-inference fix relied on the same
+    /// reach being present; the bug was the TUI StreamInfo not carrying it).
+    #[test]
+    fn pty_stream_info_carries_dialable_reach() {
+        use hyprstream_rpc::capnp::FromCapnp;
+        use hyprstream_rpc::moq_stream::{init_global_producer_reach, producer_reach, NodeStreamReach};
+
+        // Register a networked reach exactly as the QUIC bind does (idempotent —
+        // first wins; ignore the result so concurrent tests don't fail this one).
+        let addr: std::net::SocketAddr = "127.0.0.1:4433".parse().expect("addr");
+        let _ = init_global_producer_reach(NodeStreamReach {
+            addr,
+            server_name: "localhost".to_owned(),
+            cert_hashes: vec![[0x11u8; 32]],
+        });
+        let reach = producer_reach();
+        assert!(
+            !reach.is_empty(),
+            "producer_reach() must be non-empty after registering a NodeStreamReach"
+        );
+
+        // Build a tui StreamInfo capnp the same way build_connect_response does.
+        let mut msg = Builder::new_default();
+        {
+            let mut si = msg.init_root::<tui_capnp::stream_info::Builder<'_>>();
+            si.set_topic("deadbeef");
+            si.set_mac_key(&[7u8; 32]);
+            si.set_moq_broadcast_path("local/streams/deadbeef");
+            si.set_moq_uds_path("/run/hyprstream/moq.sock");
+            let mut reach_list = si.reborrow().init_reach(reach.len() as u32);
+            for (j, dest) in reach.iter().enumerate() {
+                let mut db = reach_list.reborrow().get(j as u32);
+                hyprstream_rpc::capnp::ToCapnp::write_to(dest, &mut db);
+            }
+        }
+        let mut buf = Vec::new();
+        serialize::write_message(&mut buf, &msg).expect("serialize");
+
+        // Decode through the generated client StreamInfo and assert the reach
+        // carries the Quic dial parameters intact.
+        let reader = serialize::read_message(&buf[..], capnp::message::ReaderOptions::new())
+            .expect("read");
+        let si_reader = reader
+            .get_root::<tui_capnp::stream_info::Reader<'_>>()
+            .expect("root");
+        let decoded =
+            crate::services::generated::tui_client::StreamInfo::read_from(si_reader).expect("decode");
+
+        assert_eq!(
+            decoded.reach.len(),
+            reach.len(),
+            "decoded StreamInfo.reach must round-trip the producer reach"
+        );
+        // The single reach must be a Quic destination with our dial params.
+        let dest = &decoded.reach[0];
+        match &dest.transport {
+            hyprstream_rpc::stream_info::TransportConfig::Quic(q) => {
+                assert_eq!(q.addr, "127.0.0.1:4433");
+                assert_eq!(q.server_name, "localhost");
+                assert_eq!(q.cert_hashes.len(), 1);
+                assert_eq!(q.cert_hashes[0], vec![0x11u8; 32]);
+            }
+            other => panic!("expected a Quic reach, got {other:?}"),
+        }
     }
 }

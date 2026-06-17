@@ -119,22 +119,19 @@ async fn run_attach_loop(
     client: &TuiClient,
     viewer_id: u32,
 ) -> Result<()> {
-    use hyprstream_rpc::moq_stream::{verify_moq_frame, STREAM_TRACK};
-    use hyprstream_rpc::streaming::{StreamPayload, StreamVerifier};
-    use hyprstream_rpc::transport::uds_session::{connect_uds, PLANE_MOQ};
-    use moq_net::{Client as MoqClient, Origin};
+    use hyprstream_rpc::moq_stream::MoqStreamHandle;
+    use hyprstream_rpc::streaming::StreamPayload;
 
+    let broadcast_path = stream_info.moq_broadcast_path.clone();
     anyhow::ensure!(
-        !stream_info.moq_uds_path.is_empty(),
-        "TUI service did not return a moq UDS path — server may be in ZMQ-only mode"
+        !broadcast_path.is_empty(),
+        "TUI service did not return a moq broadcast path — server may be in ZMQ-only mode"
     );
 
     let mac_key: [u8; 32] = stream_info.mac_key.as_slice()
         .try_into()
         .context("mac_key must be 32 bytes")?;
     let topic = stream_info.topic.clone();
-    let uds_path = stream_info.moq_uds_path.clone();
-    let broadcast_path = stream_info.moq_broadcast_path.clone();
 
     // Enter raw terminal mode
     let orig_termios = enter_raw_mode()?;
@@ -144,69 +141,27 @@ async fn run_attach_loop(
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
 
+    // #275: dial the producer's networked reach (the TUI service's QUIC `/moq`
+    // endpoint) via the shared `MoqStreamHandle::networked` consumer, which prefers
+    // the StreamInfo's reach and falls back to the local moq UDS plane only when no
+    // dialable reach is present. `attach` is a cross-process viewer, so the old
+    // `connect_uds(moq_uds_path)` connected to *this* process's empty plane and
+    // timed out waiting for the producer's broadcast.
+    let reach = stream_info.reach.clone();
+    let mut handle = MoqStreamHandle::networked(reach, broadcast_path, mac_key, topic);
     let recv_handle = tokio::spawn(async move {
-        let session = match connect_uds(&uds_path, PLANE_MOQ).await {
-            Ok(s) => s,
-            Err(e) => { tracing::warn!("moq UDS connect: {e}"); return; }
-        };
-        let client_origin = Origin::random().produce();
-        let client_consumer = client_origin.consume();
-        let moq_client = MoqClient::new().with_consume(client_origin);
-        let _session = match moq_client.connect(session).await {
-            Ok(s) => s,
-            Err(e) => { tracing::warn!("moq handshake: {e}"); return; }
-        };
-        let bc = match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            client_consumer.announced_broadcast(&broadcast_path),
-        ).await {
-            Ok(Some(bc)) => bc,
-            Ok(None) => { tracing::warn!("broadcast {broadcast_path} not announced"); return; }
-            Err(_) => { tracing::warn!("timeout waiting for broadcast {broadcast_path}"); return; }
-        };
-        let mut track = match bc.subscribe_track(&moq_net::Track::new(STREAM_TRACK)) {
-            Ok(t) => t,
-            Err(e) => { tracing::warn!("subscribe_track: {e}"); return; }
-        };
-        let topic_str = topic.clone();
-        let mut verifier = StreamVerifier::new(mac_key, topic);
-        // The first group only arrives after the model finishes PREFILL, which can
-        // take minutes for a large prompt on slow/CPU hardware; give it a generous
-        // budget. Subsequent decode groups arrive steadily, so a short idle suffices.
-        let mut first_group = true;
         loop {
-            let next_timeout = if first_group {
-                std::time::Duration::from_secs(300)
-            } else {
-                std::time::Duration::from_secs(30)
-            };
-            let group_result = tokio::time::timeout(
-                next_timeout,
-                track.next_group(),
-            ).await;
-            let mut group = match group_result {
-                Ok(Ok(Some(g))) => g,
-                Ok(Ok(None)) => break,
-                Ok(Err(e)) => { tracing::debug!("moq next_group: {e}"); break; }
-                Err(_) => { tracing::debug!("moq next_group timeout"); break; }
-            };
-            first_group = false;
-            let frame: bytes::Bytes = match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                group.read_frame(),
-            ).await {
-                Ok(Ok(Some(f))) => f,
-                _ => continue,
-            };
-            match verify_moq_frame(&mut verifier, &topic_str, &frame) {
-                Ok(payloads) => {
-                    for payload in payloads {
-                        if let StreamPayload::Data(data) = payload {
-                            if tx.send(data).await.is_err() { return; }
-                        }
-                    }
+            match handle.recv_next().await {
+                Ok(Some(StreamPayload::Data(data))) => {
+                    if tx.send(data).await.is_err() { return; }
                 }
-                Err(e) => tracing::warn!("moq frame verify: {e}"),
+                Ok(Some(StreamPayload::Complete(_))) | Ok(None) => return,
+                Ok(Some(StreamPayload::Error(msg))) => {
+                    tracing::warn!("moq stream error: {msg}");
+                    return;
+                }
+                Ok(Some(_)) => continue,
+                Err(e) => { tracing::warn!("moq frame recv: {e}"); return; }
             }
         }
     });
