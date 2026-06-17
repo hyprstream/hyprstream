@@ -10,6 +10,7 @@
 //! - Git-native model registry
 pub mod adapter_manager;
 pub mod errors;
+pub mod mir;
 pub mod model_ref;
 pub mod paths;
 pub mod release_store;
@@ -17,6 +18,7 @@ pub mod release_store;
 // Re-export types for backward compatibility
 pub use adapter_manager::{AdapterConfig, AdapterInfo, AdapterManager};
 pub use errors::{ModelRefError, ModelRefResult};
+pub use mir::{Arch, Domain, KnownArch, Mir, MirError};
 pub use model_ref::{validate_model_name, GitRef, ModelRef};
 pub use paths::StoragePaths;
 

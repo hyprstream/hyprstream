@@ -233,6 +233,55 @@ impl ModelService {
         registry().endpoint(&service_name, SocketKind::Rep).endpoint_string()
     }
 
+    /// Resolve a model identifier string to a [`ModelRef`], supporting MIR.
+    ///
+    /// Accepts three identifier forms:
+    /// - a registry name / HF repo id (e.g. `Qwen3-0.6B`, optionally `name:ref`),
+    /// - a MIR string (e.g. `mir:model.transformer.clip-l:stable-diffusion-xl`).
+    ///
+    /// MIR strings are matched against registered models by comparing the MIR
+    /// `series` to the series-key of each registered model's name (see
+    /// [`crate::storage::mir`] for the mapping + lossiness notes). MIR carries no
+    /// git revision, so the resolved ref uses the default branch.
+    async fn resolve_model_ref(&self, model_ref_str: &str) -> Result<ModelRef> {
+        if crate::storage::mir::is_mir(model_ref_str) {
+            let mir = crate::storage::mir::Mir::parse(model_ref_str)
+                .map_err(|e| anyhow!("Invalid MIR '{}': {}", model_ref_str, e))?;
+
+            let repos = self
+                .registry
+                .list()
+                .await
+                .map_err(|e| anyhow!("Failed to list registry for MIR resolution: {}", e))?;
+
+            let names: Vec<String> = repos.into_iter().map(|r| r.name).collect();
+            let name = crate::storage::mir::resolve_mir_against_names(
+                &mir,
+                names.iter().map(String::as_str),
+            )
+            .map_err(|e| anyhow!("Failed to resolve MIR '{}': {}", mir, e))?;
+            ModelRef::parse(&name)
+        } else {
+            ModelRef::parse(model_ref_str)
+        }
+    }
+
+    /// Emit a MIR for a registered model name.
+    ///
+    /// LOSSY: domain defaults to `model`, architecture to `unclassified`,
+    /// variant to `base`; only the series is derived from the name. See
+    /// [`crate::storage::mir::mir_from_internal_name`].
+    pub async fn mir_for_model(&self, model_ref_str: &str) -> Result<crate::storage::mir::Mir> {
+        let parsed = ModelRef::parse(model_ref_str)?;
+        // Verify the model exists in the registry before emitting a MIR.
+        self.registry
+            .get_by_name(&parsed.model)
+            .await
+            .map_err(|e| anyhow!("Model '{}' not found in registry: {}", parsed.model, e))?;
+        crate::storage::mir::mir_from_internal_name(&parsed.model)
+            .map_err(|e| anyhow!("Cannot derive MIR for '{}': {}", parsed.model, e))
+    }
+
     /// Load a model by reference with optional per-model config, returns the inference endpoint
     async fn load_model(&self, model_ref_str: &str, max_context: Option<u32>, kv_quant: Option<KVQuantType>) -> Result<String> {
         // Check if already loaded
@@ -271,8 +320,8 @@ impl ModelService {
 
     /// Inner model loading logic, called by load_model() which manages pending_loads.
     async fn load_model_inner(&self, model_ref_str: &str, max_context: Option<u32>, kv_quant: Option<KVQuantType>) -> Result<String> {
-        // Parse model reference
-        let model_ref = ModelRef::parse(model_ref_str)?;
+        // Parse/resolve model reference (supports MIR identifiers)
+        let model_ref = self.resolve_model_ref(model_ref_str).await?;
 
         // Get model path from registry
         let tracked = self.registry.get_by_name(&model_ref.model).await
@@ -717,8 +766,8 @@ impl TttHandler for ModelService {
         &self, _ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &WriteTttConfigRequest,
     ) -> Result<()> {
-        // 1. Parse model ref and resolve worktree path
-        let parsed = ModelRef::parse(model_ref)?;
+        // 1. Parse/resolve model ref (supports MIR) and resolve worktree path
+        let parsed = self.resolve_model_ref(model_ref).await?;
         let tracked = self.registry.get_by_name(&parsed.model).await
             .map_err(|e| anyhow!("Model '{}' not found in registry: {}", parsed.model, e))?;
         let repo_client = self.registry.repo(&tracked.id);
@@ -817,8 +866,8 @@ impl AdapterHandler for ModelService {
         &self, _ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, value: &str,
     ) -> Result<AdapterInfo> {
-        // Resolve model_ref to a worktree client (does NOT require model loaded in memory)
-        let parsed = ModelRef::parse(model_ref)?;
+        // Resolve model_ref (supports MIR) to a worktree client (does NOT require model loaded in memory)
+        let parsed = self.resolve_model_ref(model_ref).await?;
         let tracked = self.registry.get_by_name(&parsed.model).await
             .map_err(|e| anyhow!("Model '{}' not found in registry: {}", parsed.model, e))?;
         let repo_client = self.registry.repo(&tracked.id);
