@@ -40,8 +40,6 @@ pub struct SystemdManager {
     #[allow(dead_code)]
     connection: Connection,
     systemd: ManagerProxy<'static>,
-    #[allow(dead_code)]
-    login: LoginProxy<'static>,
 }
 
 impl SystemdManager {
