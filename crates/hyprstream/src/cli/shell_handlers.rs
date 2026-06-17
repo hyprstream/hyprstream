@@ -274,9 +274,18 @@ pub async fn handle_shell_tui(
             Err(e) => { tracing::warn!("subscribe_track: {e}"); return; }
         };
         let mut verifier = StreamVerifier::new(mac_key, topic);
+        // The first group only arrives after the model finishes PREFILL, which can
+        // take minutes for a large prompt on slow/CPU hardware; give it a generous
+        // budget. Subsequent decode groups arrive steadily, so a short idle suffices.
+        let mut first_group = true;
         loop {
+            let next_timeout = if first_group {
+                std::time::Duration::from_secs(300)
+            } else {
+                std::time::Duration::from_secs(30)
+            };
             let group_result = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
+                next_timeout,
                 track.next_group(),
             ).await;
             let mut group = match group_result {
@@ -285,6 +294,7 @@ pub async fn handle_shell_tui(
                 Ok(Err(e)) => { tracing::debug!("moq next_group: {e}"); break; }
                 Err(_) => { tracing::debug!("moq next_group timeout"); break; }
             };
+            first_group = false;
             let frame: bytes::Bytes = match tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 group.read_frame(),
