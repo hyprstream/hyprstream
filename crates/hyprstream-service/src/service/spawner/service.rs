@@ -101,6 +101,23 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                     .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("QUIC bind: {e}")))?;
                 let actual_addr = wt_server.local_addr()
                     .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("QUIC local_addr: {e}")))?;
+                // The bound addr is unspecified (0.0.0.0 / ::) when binding all
+                // interfaces — that is NOT a dialable destination, so advertising
+                // it makes dial_stream's QUIC connect time out. Advertise loopback
+                // for same-host (the single-node default); cross-host routable-IP
+                // advertisement is the wire-reach follow-up (#131/#282).
+                let advertise_addr = if actual_addr.ip().is_unspecified() {
+                    match actual_addr {
+                        std::net::SocketAddr::V4(_) => {
+                            std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, actual_addr.port()))
+                        }
+                        std::net::SocketAddr::V6(_) => {
+                            std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, actual_addr.port()))
+                        }
+                    }
+                } else {
+                    actual_addr
+                };
                 let pin = hyprstream_rpc::transport::quinn_transport::cert_sha256(&qc.cert_chain[0]);
 
                 let mut rpc_server = hyprstream_rpc::transport::quinn_transport::QuinnRpcServer::with_capacity(
@@ -146,7 +163,7 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                         &service_name,
                         hyprstream_rpc::registry::SocketKind::Quic,
                         hyprstream_rpc::transport::TransportConfig::quic_pinned(
-                            actual_addr,
+                            advertise_addr,
                             &qc.server_name,
                             pin,
                         ),
@@ -155,13 +172,13 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                 }
                 hyprstream_rpc::moq_stream::init_global_producer_reach(
                     hyprstream_rpc::moq_stream::NodeStreamReach {
-                        addr: actual_addr,
+                        addr: advertise_addr,
                         server_name: qc.server_name.clone(),
                         cert_hashes: vec![pin],
                     },
                 );
                 if let Some(cb) = qc.on_quic_bound.take() {
-                    cb(service_name.clone(), actual_addr, qc.server_name.clone());
+                    cb(service_name.clone(), advertise_addr, qc.server_name.clone());
                 }
 
                 // #282: bind an iroh substrate in PARALLEL to the quinn endpoint,
