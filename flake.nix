@@ -33,9 +33,9 @@
           config.allowUnfree = true;
         };
 
-        # Fetch libtorch variants
+        # Fetch libtorch variants (GPU variants apply autoAddDriverRunpath internally)
         libtorchVariants = import ./nix/libtorch.nix {
-          inherit (pkgs) lib stdenv fetchurl unzip runCommand;
+          inherit (pkgs) lib stdenv fetchurl unzip autoAddDriverRunpath;
         };
 
         # Rust toolchain from fenix (stable channel)
@@ -137,8 +137,9 @@
 
         };
 
-        # Build a variant by overlaying LIBTORCH env vars
-        mkHyprstream = variant: libtorch:
+        # Build a variant by overlaying LIBTORCH env vars.
+        # extraBuildInputs: GPU runtime libs (cudaPackages.*, rocmPackages.*) for RPATH
+        mkHyprstream = variant: libtorch: extraBuildInputs:
           let
             craneArgs = commonArgs // {
               pname = "hyprstream-${variant}";
@@ -148,21 +149,41 @@
               LD_LIBRARY_PATH = "${libtorch}/lib";
               LIBTORCH_BYPASS_VERSION_CHECK = "1";
 
-              # Include libtorch in buildInputs so patchelf adds its lib dir to RPATH
-              buildInputs = commonArgs.buildInputs ++ [ libtorch ];
+              # libtorch + GPU runtime libs so autoPatchelfHook sets correct RPATHs
+              buildInputs = commonArgs.buildInputs ++ [ libtorch ] ++ extraBuildInputs;
 
               # Passthru for downstream use
               passthru = { inherit variant libtorch; };
             };
           in craneLib.buildPackage craneArgs;
 
+        # CUDA runtime libs needed for RPATH hints (bundled CUDA toolkit in zip handles
+        # the bulk; we add Nix packages so autoPatchelfHook can resolve any system deps)
+        cuda12Libs = with pkgs.cudaPackages; [
+          cuda_cudart libcublas libcufft libcurand libcusolver libcusparse
+        ];
+
+        # ROCm runtime libs — most HIP compute libs are bundled in the libtorch zip,
+        # but rocm-runtime (libamdhip64.so) and supporting libs must come from Nix
+        rocm71Libs = with pkgs.rocmPackages; [
+          clr            # HIP runtime: libamdhip64.so
+          rocblas
+          hipblas
+          miopen         # MIOpen DNN kernels
+          rocrand
+          hipfft
+          hipsolver
+          hipsparse
+          rccl           # ROCm collective communications
+        ];
+
       in {
         packages = {
-          hyprstream = mkHyprstream "cpu" libtorchVariants.cpu;
-          hyprstream-cpu = mkHyprstream "cpu" libtorchVariants.cpu;
-          hyprstream-cuda128 = mkHyprstream "cuda128" libtorchVariants.cuda128;
-          hyprstream-cuda130 = mkHyprstream "cuda130" libtorchVariants.cuda130;
-          hyprstream-rocm71 = mkHyprstream "rocm71" libtorchVariants.rocm71;
+          hyprstream     = mkHyprstream "cpu"     libtorchVariants.cpu     [];
+          hyprstream-cpu = mkHyprstream "cpu"     libtorchVariants.cpu     [];
+          hyprstream-cuda128 = mkHyprstream "cuda128" libtorchVariants.cuda128 cuda12Libs;
+          hyprstream-cuda130 = mkHyprstream "cuda130" libtorchVariants.cuda130 cuda12Libs;
+          hyprstream-rocm71  = mkHyprstream "rocm71"  libtorchVariants.rocm71  rocm71Libs;
         };
 
         devShells.default = let
@@ -170,7 +191,7 @@
         in pkgs.mkShell {
           name = "hyprstream-dev";
 
-          inputsFrom = [ (mkHyprstream "cpu" devLibtorch) ];
+          inputsFrom = [ (mkHyprstream "cpu" devLibtorch []) ];
 
           buildInputs = [ rustToolchain ];
 
