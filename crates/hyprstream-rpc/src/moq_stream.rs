@@ -177,6 +177,14 @@ pub fn serve_moq_uds_background(origin: MoqStreamOrigin, path: PathBuf) {
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
 
+    // tokio requires the listener be non-blocking before adoption; otherwise
+    // `from_std` panics ("Registering a blocking socket with the tokio runtime
+    // is unsupported"). Mirrors the event-bus plane (moq_event.rs).
+    if let Err(e) = listener.set_nonblocking(true) {
+        tracing::error!("moq UDS set_nonblocking failed: {e}");
+        return;
+    }
+
     // Convert to async and publish the path only after the socket is bound.
     let listener = match tokio::net::UnixListener::from_std(listener) {
         Ok(l) => l,

@@ -422,6 +422,11 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating RegistryService");
 
+    // RegistryService publishes clone-progress streams via StreamChannel::run_stream
+    // (which fails loudly if no moq origin is registered in this process).
+    // Initialize this process's local moq plane. Idempotent.
+    init_local_moq_stream_plane("registry");
+
     let config = load_config();
     let sk = ctx.service_signing_key("registry");
 
@@ -456,14 +461,30 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
 // Streams Service Factory
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Factory for the moq stream origin (#138 N4 — ZMQ StreamService removed).
+/// Initialize this process's local moq stream plane (origin + UDS server).
 ///
-/// Builds the process-global `MoqStreamOrigin`, registers it, and starts the
-/// UDS moq server so cross-process subscribers (e.g. `tui attach`) can
-/// subscribe over moq without any ZMQ sockets.
-#[service_factory("streams")]
-fn create_streams_service(_ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
-    info!("Creating moq stream origin (ZMQ StreamService removed)");
+/// Every service process that **publishes** moq streams (the central `streams`
+/// service, and stream-publisher services such as `tui`/`notification`/`registry`/
+/// `metrics`/`model`) needs its OWN moq plane in-process: the process-global
+/// [`MoqStreamOrigin`] that `StreamChannel::publisher()` appends into, plus a
+/// per-PID UDS moq server so a co-located client can connect directly to the
+/// path returned in the publisher's response.
+///
+/// In a multi-process (systemd one-process-per-service) deployment, only the
+/// `streams` factory used to do this, so other publisher processes had a `None`
+/// origin (nothing to publish to) and returned an empty `moq_uds_path` to the
+/// client (→ client `ensure!` fails). This helper closes that gap.
+///
+/// Idempotent: if the process already has a moq origin (the `streams` factory
+/// ran in this process, or this helper was already called), it returns early
+/// without double-initializing the origin or double-serving the UDS. This lets
+/// it compose with the `streams` factory and with multiple publisher factories
+/// co-located in one process.
+fn init_local_moq_stream_plane(service_name: &str) {
+    // Guard: a moq origin already exists in this process — nothing to do.
+    if hyprstream_rpc::moq_stream::global_moq_origin().is_some() {
+        return;
+    }
 
     let gate = |pubkey: &[u8; 32]| -> bool {
         use ed25519_dalek::VerifyingKey;
@@ -473,14 +494,22 @@ fn create_streams_service(_ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
         hyprstream_service::global_trust_store().get(&vk).is_some()
     };
 
+    // Use DEFAULT_PREFIX ("local/streams") so the publisher's broadcast paths
+    // match what consumers reconstruct (NotificationService builds its consumer
+    // path from DEFAULT_PREFIX; TUI/registry/metrics echo the origin's own
+    // broadcast_path back to the client, so any prefix is self-consistent there).
     let moq_origin = hyprstream_rpc::moq_stream::MoqStreamOrigin::standalone()
-        .with_prefix("local/streams")
+        .with_prefix(hyprstream_rpc::moq_stream::DEFAULT_PREFIX)
         .with_authorize_signer(gate)
         .build();
 
-    // Register the global BEFORE signalling ready — downstream services that
-    // call StreamChannel::publisher() will see it immediately.
-    hyprstream_rpc::moq_stream::init_global_moq_origin(moq_origin.clone());
+    // Register the global BEFORE serving — downstream code that calls
+    // StreamChannel::publisher() will see it immediately.
+    if !hyprstream_rpc::moq_stream::init_global_moq_origin(moq_origin.clone()) {
+        // Lost a race to another initializer in this process; that init owns the
+        // UDS server too, so don't start a second one.
+        return;
+    }
 
     let moq_uds_path = {
         let dir = std::env::temp_dir()
@@ -488,7 +517,24 @@ fn create_streams_service(_ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
         let _ = std::fs::create_dir_all(&dir);
         dir.join("moq.sock")
     };
+    info!(
+        service = service_name,
+        path = %moq_uds_path.display(),
+        "Initializing local moq stream plane",
+    );
     hyprstream_rpc::moq_stream::serve_moq_uds_background(moq_origin, moq_uds_path);
+}
+
+/// Factory for the moq stream origin (#138 N4 — ZMQ StreamService removed).
+///
+/// Builds the process-global `MoqStreamOrigin`, registers it, and starts the
+/// UDS moq server so cross-process subscribers (e.g. `tui attach`) can
+/// subscribe over moq without any ZMQ sockets.
+#[service_factory("streams")]
+fn create_streams_service(_ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+    info!("Creating moq stream origin (ZMQ StreamService removed)");
+
+    init_local_moq_stream_plane("streams");
 
     Ok(Box::new(MoqStreamBarrierService::new()))
 }
@@ -541,6 +587,11 @@ impl Spawnable for MoqStreamBarrierService {
 #[service_factory("model", schema = "../../../hyprstream-rpc-std/schema/model.capnp", metadata = crate::services::generated::model_client::schema_metadata, depends_on = ["policy", "registry", "discovery", "notification"])]
 fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating ModelService");
+
+    // ModelService spawns InferenceService instances in-process, which publish
+    // generation streams via StreamChannel::run_stream (fails loudly without a
+    // moq origin). Initialize this process's local moq plane. Idempotent.
+    init_local_moq_stream_plane("model");
 
     use crate::services::{ModelService, ModelServiceConfig};
 
@@ -1144,6 +1195,12 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 
     use crate::tui::{TuiState, service::TuiService};
 
+    // TUI publishes terminal frames (stdin/stdout) over moq via
+    // StreamChannel::publisher(), and returns its per-PID moq UDS path to the
+    // client. In a per-process deployment this process has no moq plane unless
+    // we initialize one here. Idempotent — no-op if already set.
+    init_local_moq_stream_plane("tui");
+
     let config = load_config();
     let tui_config = &config.tui;
     let sk = ctx.service_signing_key("tui");
@@ -1251,6 +1308,12 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
 fn create_notification_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating NotificationService");
 
+    // NotificationService publishes broadcast frames over moq and returns its
+    // per-PID moq UDS path to subscribers (notification.rs handle_subscribe).
+    // Initialize this process's local moq plane so that path is non-empty and
+    // the origin exists for StreamChannel::publisher(). Idempotent.
+    init_local_moq_stream_plane("notification");
+
     let sk = ctx.service_signing_key("notification");
 
     // Register this service's verifying key with PolicyService
@@ -1281,6 +1344,11 @@ fn create_notification_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn S
 #[service_factory("metrics", schema = "../../../hyprstream-rpc-std/schema/metrics.capnp", metadata = crate::services::generated::metrics_client::schema_metadata, depends_on = ["policy", "discovery"])]
 fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating MetricsService");
+
+    // MetricsService publishes query-result streams via StreamChannel::run_stream
+    // (fails loudly without a moq origin). Initialize this process's local moq
+    // plane. Idempotent.
+    init_local_moq_stream_plane("metrics");
 
     use crate::services::MetricsService;
     use hyprstream_metrics::query::QueryOrchestrator;
@@ -1466,5 +1534,41 @@ mod tests {
         let ed25519_pubkey = [0xAB_u8; 32];
         let result = compute_tls_endorsement(&[0xFF; 32], &ed25519_pubkey, "example.com");
         assert!(result.is_err());
+    }
+
+    /// `init_local_moq_stream_plane` sets both process-global moq state
+    /// (`global_moq_origin` + `global_moq_uds_path`) and is idempotent: a second
+    /// call is a no-op and must not panic (composes with the streams factory and
+    /// multiple co-located publisher factories).
+    ///
+    /// Uses process-global `OnceLock`s, so it runs in a dedicated single-test
+    /// binary (`#[cfg(test)]` integration is impractical for OnceLock); the
+    /// assertions tolerate a plane already initialized by an earlier test in the
+    /// same process — the contract under test is "set after call" + "idempotent".
+    #[tokio::test]
+    async fn init_local_moq_stream_plane_sets_globals_and_is_idempotent() {
+        use hyprstream_rpc::moq_stream::{global_moq_origin, global_moq_uds_path};
+
+        // First call (or pre-set by another test) → plane is initialized.
+        init_local_moq_stream_plane("test");
+        assert!(
+            global_moq_origin().is_some(),
+            "origin must be set after init_local_moq_stream_plane",
+        );
+        let uds = global_moq_uds_path();
+        assert!(
+            uds.is_some(),
+            "uds path must be set after init_local_moq_stream_plane",
+        );
+        let path_after_first = uds.map(std::path::Path::to_path_buf);
+
+        // Second call must be a no-op (idempotent) — no panic, no change.
+        init_local_moq_stream_plane("test");
+        assert!(global_moq_origin().is_some());
+        assert_eq!(
+            global_moq_uds_path().map(std::path::Path::to_path_buf),
+            path_after_first,
+            "second call must not change the served UDS path",
+        );
     }
 }
