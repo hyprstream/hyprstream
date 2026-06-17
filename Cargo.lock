@@ -6632,6 +6632,7 @@ dependencies = [
  "quinn",
  "rand 0.8.5",
  "rcgen",
+ "reqwest 0.11.27",
  "rustls 0.23.40",
  "serde",
  "serde-wasm-bindgen",

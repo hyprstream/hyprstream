@@ -160,6 +160,8 @@ pub mod dial;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod service_entry;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod did_web;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod notify;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod paths;

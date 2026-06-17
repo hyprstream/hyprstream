@@ -94,6 +94,9 @@ web-transport-quinn = { workspace = true }
 web-transport-trait = { workspace = true }
 yamux = { workspace = true }  # UDS transport: stream-multiplexer for Session-over-UnixStream
 url = { workspace = true }
+# HTTPS did:web DID-document fetch (#279). Native-only; mirrors the JWKS
+# fetch+cache posture used by FederationKeyResolver in the hyprstream crate.
+reqwest = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true, features = ["io-util", "net"] }
