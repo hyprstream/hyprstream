@@ -54,11 +54,10 @@ pub struct SystemdManager {
 }
 
 impl SystemdManager {
-    /// Create a new SystemdManager using the systemd private bus (default).
+    /// Create a new SystemdManager.
     ///
-    /// Connects to the systemd user instance via the private bus socket, which
-    /// is session-independent. Correct for all long-lived public service daemons.
-    /// Also enables user linger so services persist across logouts.
+    /// Connects to the user D-Bus instance and enables user linger so
+    /// services persist across logouts on headless machines.
     pub async fn new() -> Result<Self> {
         let connection = user_systemd_connection().await?;
         let systemd = ManagerProxy::new(&connection).await?;
@@ -198,19 +197,27 @@ impl ServiceManager for SystemdSystemManager {
     }
 
     async fn reload(&self) -> Result<()> {
-        self.systemd.reload().await?;
-        debug!("Reloaded systemd daemon (system)");
+        let status = tokio::process::Command::new("systemctl")
+            .arg("daemon-reload")
+            .status()
+            .await
+            .context("failed to spawn systemctl daemon-reload")?;
+        if !status.success() {
+            anyhow::bail!("systemctl daemon-reload failed (exit {})", status);
+        }
+        debug!("Reloaded systemd system daemon");
         Ok(())
     }
 
     async fn enable(&self, service: &str) -> Result<()> {
-        let unit_path = Self::units_dir()
-            .join(Self::service_unit(service))
-            .to_string_lossy()
-            .into_owned();
-        self.systemd
-            .enable_unit_files(vec![unit_path], false, false)
-            .await?;
+        let status = tokio::process::Command::new("systemctl")
+            .args(["enable", &Self::service_unit(service)])
+            .status()
+            .await
+            .context("failed to spawn systemctl enable")?;
+        if !status.success() {
+            anyhow::bail!("systemctl enable {} failed (exit {})", Self::service_unit(service), status);
+        }
         debug!("Enabled system service unit: {}", Self::service_unit(service));
         Ok(())
     }
@@ -241,7 +248,8 @@ impl ServiceManager for SystemdManager {
         let service_content = units::service_unit(service, use_creds, depends_on)?;
         let service_path = units_dir.join(Self::service_unit(service));
 
-        // Write service unit if changed (idempotent)
+        // Write service unit if changed (idempotent), then reload so systemd
+        // sees the new unit before any subsequent start() or enable() call.
         if std::fs::read_to_string(&service_path).ok().as_deref() != Some(&service_content) {
             std::fs::write(&service_path, &service_content)?;
             info!("Installed service unit: {}", service_path.display());
@@ -284,19 +292,30 @@ impl ServiceManager for SystemdManager {
     }
 
     async fn reload(&self) -> Result<()> {
-        self.systemd.reload().await?;
-        debug!("Reloaded systemd daemon");
+        // Use systemctl subprocess rather than the D-Bus Reload() call.
+        // The D-Bus call hangs on systemd 258+ (Fedora 43) during daemon-reload
+        // when called from a non-session context.
+        let status = tokio::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status()
+            .await
+            .context("failed to spawn systemctl --user daemon-reload")?;
+        if !status.success() {
+            anyhow::bail!("systemctl --user daemon-reload failed (exit {})", status);
+        }
+        debug!("Reloaded systemd user daemon");
         Ok(())
     }
 
     async fn enable(&self, service: &str) -> Result<()> {
-        let unit_path = Self::units_dir()?
-            .join(Self::service_unit(service))
-            .to_string_lossy()
-            .into_owned();
-        self.systemd
-            .enable_unit_files(vec![unit_path], false, false)
-            .await?;
+        let status = tokio::process::Command::new("systemctl")
+            .args(["--user", "enable", &Self::service_unit(service)])
+            .status()
+            .await
+            .context("failed to spawn systemctl --user enable")?;
+        if !status.success() {
+            anyhow::bail!("systemctl --user enable {} failed (exit {})", Self::service_unit(service), status);
+        }
         debug!("Enabled service unit: {}", Self::service_unit(service));
         Ok(())
     }
