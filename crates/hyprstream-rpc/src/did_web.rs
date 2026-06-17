@@ -231,6 +231,113 @@ pub fn preferred_transport(doc: &Value, kind: Option<SocketKind>) -> Option<Tran
         .map(|d| d.config)
 }
 
+// ── DID-doc → verification-method keys (#137 admission stage 2) ────────────────
+
+/// Multicodec `ed25519-pub` unsigned-varint prefix (`0xed01` → bytes `0xed 0x01`).
+///
+/// Mirrors `hyprstream::auth::mesh_trust::MULTICODEC_ED25519_PUB`; duplicated here
+/// (a 2-byte constant) because `hyprstream-rpc` is the lower crate and cannot
+/// depend on `hyprstream` for the `verificationMethod` decode the admission gate
+/// (#137) needs at this layer.
+const MULTICODEC_ED25519_PUB: [u8; 2] = [0xed, 0x01];
+
+/// Decode a `Multikey` `publicKeyMultibase` string into raw Ed25519 key bytes.
+///
+/// Verifies the base58btc multibase prefix (`z`) and the `ed25519-pub` multicodec
+/// header, returning the 32-byte payload. This is the `did_web`/`hyprstream-rpc`
+/// sibling of `hyprstream::auth::mesh_trust::decode_multikey` (kept local because
+/// `hyprstream-rpc` cannot depend on `hyprstream`); both are exercised against the
+/// same `encode_multikey` output in tests.
+///
+/// Returns `Err` for a wrong multibase, an undecodable base58, a non-Ed25519
+/// codec, or a payload that is not exactly 32 bytes.
+pub fn decode_ed25519_multikey(multibase: &str) -> Result<[u8; 32]> {
+    let body = multibase
+        .strip_prefix('z')
+        .ok_or_else(|| anyhow!("Multikey must use base58btc multibase ('z') prefix"))?;
+    let decoded = bs58::decode(body)
+        .into_vec()
+        .map_err(|e| anyhow!("invalid base58btc Multikey: {e}"))?;
+    if decoded.len() < 2 || decoded[..2] != MULTICODEC_ED25519_PUB {
+        bail!(
+            "unexpected multicodec prefix (expected ed25519-pub {MULTICODEC_ED25519_PUB:02x?}, got {:02x?})",
+            decoded.get(..2).unwrap_or(&decoded)
+        );
+    }
+    let raw: [u8; 32] = decoded[2..]
+        .try_into()
+        .map_err(|_| anyhow!("ed25519 Multikey payload is {} bytes (expected 32)", decoded.len() - 2))?;
+    Ok(raw)
+}
+
+/// Extract every Ed25519 public key published in a DID document's
+/// `verificationMethod` array, decoded to raw 32-byte keys (#137 stage 2).
+///
+/// Only `Multikey` / `Ed25519VerificationKey2020`-shaped entries with a
+/// `publicKeyMultibase` carrying the `ed25519-pub` multicodec are returned (the
+/// `#mesh` / `#iroh` Ed25519 VMs the mesh publishes). Entries with a different
+/// codec, a non-multibase encoding (e.g. `publicKeyJwk`-only), or that fail to
+/// decode are skipped — a malformed VM must not be admitted, and a doc with no
+/// Ed25519 VM yields an **empty** vec (the caller treats empty as "no match →
+/// reject", preserving §4.4 fail-closed posture).
+pub fn verification_method_ed25519_keys(doc: &Value) -> Vec<[u8; 32]> {
+    let Some(vms) = doc.get("verificationMethod").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut keys = Vec::new();
+    for vm in vms {
+        let Some(mb) = vm.get("publicKeyMultibase").and_then(Value::as_str) else {
+            continue;
+        };
+        match decode_ed25519_multikey(mb) {
+            Ok(k) => keys.push(k),
+            Err(e) => {
+                tracing::debug!(error = %e, "skipping undecodable verificationMethod Multikey");
+            }
+        }
+    }
+    keys
+}
+
+/// Extract every Ed25519 public key from a JWKS document (RFC 7517), decoded to
+/// raw 32-byte keys (#137 stage 2, JWKS fallback path).
+///
+/// Mirrors `FederationKeyResolver::fetch_ed25519_key`'s parse: an OKP key with
+/// `crv == "Ed25519"` and a base64url `x` of exactly 32 bytes. Keys that don't
+/// match that shape (wrong `kty`/`crv`, malformed `x`) are skipped. A JWKS with
+/// no usable Ed25519 key yields an **empty** vec (→ no match → reject).
+///
+/// NOTE: this does not itself enforce a "federation"-tagged `use`; the caller
+/// supplies the federation JWKS document (e.g. the per-issuer `jwks_uri` already
+/// resolved/cached by `FederationKeyResolver`), and tag filtering, if any, is the
+/// caller's policy. This keeps the decode pure and reuses the existing JWKS cache
+/// rather than adding a new fetch pipeline.
+pub fn jwks_ed25519_keys(jwks: &Value) -> Vec<[u8; 32]> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let Some(keys) = jwks.get("keys").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for key in keys {
+        if key.get("kty").and_then(Value::as_str) != Some("OKP") {
+            continue;
+        }
+        if key.get("crv").and_then(Value::as_str) != Some("Ed25519") {
+            continue;
+        }
+        let Some(x) = key.get("x").and_then(Value::as_str) else {
+            continue;
+        };
+        match URL_SAFE_NO_PAD.decode(x).ok().and_then(|raw| <[u8; 32]>::try_from(raw).ok()) {
+            Some(k) => out.push(k),
+            None => {
+                tracing::debug!("skipping JWKS OKP/Ed25519 key with malformed/wrong-length 'x'");
+            }
+        }
+    }
+    out
+}
+
 // ── fetcher abstraction ───────────────────────────────────────────────────────
 
 /// Fetches a DID document (parsed JSON) for a resolved HTTPS URL.
@@ -271,6 +378,17 @@ impl<F: DidDocFetcher> DidWebResolver<F> {
         let url = did_web_to_url(did)?;
         let doc = self.fetcher.fetch(&url).await?;
         Ok(transport_entries(&doc))
+    }
+
+    /// Resolve a `did:web` identifier to its **raw** DID document JSON.
+    ///
+    /// `resolve`/`resolve_all` discard everything but transport reach; the #137
+    /// admission gate needs the full document to read `verificationMethod` (the
+    /// peer's published Ed25519 keys). Reuses the same derive-URL + cached fetch
+    /// path — no new fetch/cache infra.
+    pub async fn resolve_document(&self, did: &str) -> Result<Value> {
+        let url = did_web_to_url(did)?;
+        self.fetcher.fetch(&url).await
     }
 }
 
