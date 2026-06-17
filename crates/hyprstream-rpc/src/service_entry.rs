@@ -18,8 +18,8 @@
 //!
 //! `serviceEndpoint` is a DIDComm-style map (W3C DID Core §5.4 permits a map).
 //! Binary values use multibase (`z` = base58btc) over a multiformats prefix,
-//! matching the doc's existing `Ed25519VerificationKey2020` `publicKeyMultibase`
-//! encoding:
+//! matching the doc's `Multikey` `publicKeyMultibase` encoding (#280; ed25519
+//! VMs were formerly `Ed25519VerificationKey2020`):
 //!
 //! ```jsonc
 //! // type: "IrohTransport"

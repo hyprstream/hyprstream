@@ -8,9 +8,10 @@
 //!   - `GET /clients/:client_id/did.json` — per-client DID document (for Tier 3
 //!     confidential clients with registered keys)
 //!
-//! All documents follow the W3C DID Core 1.0 + did:web 1.0 conventions plus
-//! the `Ed25519VerificationKey2020` verification-method type (Multibase z6Mk
-//! encoding per the spec).
+//! All documents follow the W3C DID Core 1.0 + did:web 1.0 conventions. All
+//! key-bearing verification methods use the `Multikey` type with a
+//! multicodec-prefixed `publicKeyMultibase` (ed25519 z6Mk form; p256 / ML-DSA-65
+//! likewise), matching the atproto `#atproto` VM and the `did:key` encoding.
 //!
 //! The **root** document is additionally **atproto-compatible** (#154): when an
 //! ES256 key store is present it carries a P-256 `#atproto` `Multikey`, an
@@ -96,6 +97,30 @@ fn p256_to_multibase(vk: &p256::ecdsa::VerifyingKey) -> String {
     format!("z{}", bs58::encode(payload).into_string())
 }
 
+/// multicodec `ml-dsa-65-pub` unsigned-varint prefix.
+///
+/// Code point `0x1211` (FIPS 204 / ML-DSA-65 public key) from the multiformats
+/// multicodec registry (status: draft); see also draft-ietf-cose-mldsa. As an
+/// unsigned varint `0x1211` encodes to the two bytes `0x91 0x24` — same shape as
+/// `p256-pub` (`0x1200` → `0x80 0x24`).
+const MULTICODEC_ML_DSA_65_PUB: [u8; 2] = [0x91, 0x24];
+
+/// Build the multibase z-encoded ML-DSA-65 public key as a `Multikey`-compatible
+/// `publicKeyMultibase` value.
+///
+/// Multibase prefix `z` (base58btc); payload is the multicodec `ml-dsa-65-pub`
+/// unsigned-varint header (`0x1211` → bytes `0x91 0x24`) followed by the raw
+/// ML-DSA-65 verifying-key bytes (1952 bytes, FIPS 204). The input is the raw
+/// public-key bytes (e.g. from `Signer::pq_pubkey()` / `ml_dsa_vk_bytes`), so
+/// this helper stays decoupled from the concrete `ml_dsa` key type and can be
+/// called by #157 when it publishes the `#mesh` PQ key.
+fn mldsa65_to_multibase(vk_bytes: &[u8]) -> String {
+    let mut payload = Vec::with_capacity(MULTICODEC_ML_DSA_65_PUB.len() + vk_bytes.len());
+    payload.extend_from_slice(&MULTICODEC_ML_DSA_65_PUB);
+    payload.extend_from_slice(vk_bytes);
+    format!("z{}", bs58::encode(payload).into_string())
+}
+
 /// The node's atproto-native identity to embed in the root DID document:
 /// the P-256 signing key (published as the `#atproto` Multikey) plus the
 /// account handle (published in `alsoKnownAs` as `at://{handle}`).
@@ -128,12 +153,36 @@ fn atproto_verification_method(did: &str, vk: &p256::ecdsa::VerifyingKey) -> Val
 
 /// Build the verification-method JSON for a single Ed25519 key under a
 /// did:web subject.
+///
+/// Emitted as `type: "Multikey"` (W3C / atproto canonical VM type): the
+/// `publicKeyMultibase` value `ed25519_to_multibase` produces is already the
+/// multicodec-prefixed (`0xed01`) base58btc form `Multikey` requires, so this
+/// is the same shape used for `#atproto` (p256) and matches the `did:key`
+/// encoding (multicodec/multibase) for cross-tool interop.
 fn ed25519_verification_method(did: &str, key_id: &str, vk: &VerifyingKey) -> Value {
     json!({
         "id": format!("{did}#{key_id}"),
-        "type": "Ed25519VerificationKey2020",
+        "type": "Multikey",
         "controller": did,
         "publicKeyMultibase": ed25519_to_multibase(vk),
+    })
+}
+
+/// Build the verification-method JSON for an ML-DSA-65 (post-quantum) key under
+/// a did:web subject, emitted as a `Multikey` with the registered
+/// `ml-dsa-65-pub` multicodec (`0x1211`).
+///
+/// `vk_bytes` is the raw ML-DSA-65 verifying-key (1952 bytes). The DID document
+/// builder does not yet publish a PQ key (that is #157's job — populating
+/// `KeyedPqTrustStore` from the `#mesh` ML-DSA key); this helper exists so #157
+/// can emit the VM with the settled multicodec encoding (e.g. as `#mesh-pq`).
+#[allow(dead_code)]
+fn mldsa65_verification_method(did: &str, key_id: &str, vk_bytes: &[u8]) -> Value {
+    json!({
+        "id": format!("{did}#{key_id}"),
+        "type": "Multikey",
+        "controller": did,
+        "publicKeyMultibase": mldsa65_to_multibase(vk_bytes),
     })
 }
 
@@ -508,6 +557,12 @@ mod tests {
         assert_eq!(doc["id"].as_str().unwrap(), did);
         assert!(doc["@context"].is_array());
         assert_eq!(doc["verificationMethod"].as_array().unwrap().len(), 2); // multibase + jwk
+        // The ed25519 VM is emitted as a Multikey (#280) with a multibase key.
+        let vm = &doc["verificationMethod"][0];
+        assert_eq!(vm["type"].as_str().unwrap(), "Multikey");
+        assert!(vm["publicKeyMultibase"].as_str().unwrap().starts_with('z'));
+        // The JWK fallback VM is retained.
+        assert_eq!(doc["verificationMethod"][1]["type"].as_str().unwrap(), "JsonWebKey2020");
         assert_eq!(doc["service"][0]["type"].as_str().unwrap(), "HyprstreamService");
         assert_eq!(
             doc["service"][0]["serviceEndpoint"].as_str().unwrap(),
@@ -566,6 +621,11 @@ mod tests {
         assert!(vms[0]["publicKeyMultibase"].as_str().unwrap().starts_with('z'));
         // Ed25519 mesh VMs still present after it.
         assert_eq!(vms.len(), 1 + 2);
+        // The ed25519 mesh VM is also a Multikey (#280), not the deprecated
+        // Ed25519VerificationKey2020 type, with a multibase key; JWK fallback kept.
+        assert_eq!(vms[1]["type"].as_str().unwrap(), "Multikey");
+        assert!(vms[1]["publicKeyMultibase"].as_str().unwrap().starts_with('z'));
+        assert_eq!(vms[2]["type"].as_str().unwrap(), "JsonWebKey2020");
 
         // #atproto_pds first, origin-only (no path), correct type.
         let svcs = doc["service"].as_array().unwrap();
@@ -596,5 +656,52 @@ mod tests {
         let keys = extract_ed25519_keys_from_jwks(&Some(jwks));
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].0, "good");
+    }
+
+    #[test]
+    fn mesh_ed25519_vm_is_multikey() {
+        // The `#mesh` verification method must be emitted as a Multikey (#280),
+        // not the deprecated Ed25519VerificationKey2020 type.
+        let sk = SigningKey::generate(&mut OsRng);
+        let did = "did:web:hyprstream.example.com";
+        let vm = ed25519_verification_method(did, "mesh", &sk.verifying_key());
+        assert_eq!(vm["id"].as_str().unwrap(), format!("{did}#mesh"));
+        assert_eq!(vm["type"].as_str().unwrap(), "Multikey");
+        assert_eq!(vm["controller"].as_str().unwrap(), did);
+        let mb = vm["publicKeyMultibase"].as_str().unwrap();
+        assert!(mb.starts_with('z'), "Multikey publicKeyMultibase must be base58btc multibase");
+        // The encoded key carries the ed25519-pub multicodec prefix (0xed 0x01).
+        let decoded = bs58::decode(&mb[1..]).into_vec().unwrap();
+        assert_eq!(&decoded[..2], &[0xed, 0x01]);
+        assert_eq!(&decoded[2..], sk.verifying_key().as_bytes());
+    }
+
+    #[test]
+    fn mldsa65_multibase_multicodec_round_trip() {
+        // ML-DSA-65 public keys are 1952 bytes (FIPS 204). Use a stand-in buffer
+        // of the correct length to exercise the multicodec/multibase encoding.
+        let vk_bytes = vec![0xABu8; 1952];
+        let mb = mldsa65_to_multibase(&vk_bytes);
+        assert!(mb.starts_with('z'), "must use base58btc multibase prefix");
+        let decoded = bs58::decode(&mb[1..]).into_vec().unwrap();
+        // multicodec ml-dsa-65-pub = 0x1211 → unsigned-varint [0x91, 0x24].
+        assert_eq!(&decoded[..2], &[0x91, 0x24]);
+        // Remaining bytes are the verifying-key payload, unmodified.
+        assert_eq!(&decoded[2..], vk_bytes.as_slice());
+        assert_eq!(decoded.len(), 2 + 1952);
+    }
+
+    #[test]
+    fn mldsa65_verification_method_is_multikey() {
+        let did = "did:web:hyprstream.example.com";
+        let vk_bytes = vec![0x07u8; 1952];
+        let vm = mldsa65_verification_method(did, "mesh-pq", &vk_bytes);
+        assert_eq!(vm["id"].as_str().unwrap(), format!("{did}#mesh-pq"));
+        assert_eq!(vm["type"].as_str().unwrap(), "Multikey");
+        assert_eq!(vm["controller"].as_str().unwrap(), did);
+        let mb = vm["publicKeyMultibase"].as_str().unwrap();
+        let decoded = bs58::decode(&mb[1..]).into_vec().unwrap();
+        assert_eq!(&decoded[..2], &[0x91, 0x24]); // ml-dsa-65-pub multicodec
+        assert_eq!(&decoded[2..], vk_bytes.as_slice());
     }
 }
