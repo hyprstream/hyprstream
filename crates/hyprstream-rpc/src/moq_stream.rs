@@ -714,16 +714,24 @@ async fn moq_stream_handle_task(
             return;
         }
     };
-    let mut track = match bc.subscribe_track(&Track::new(STREAM_TRACK)) {
+    let track = match bc.subscribe_track(&Track::new(STREAM_TRACK)) {
         Ok(t) => t,
         Err(e) => { let _ = tx.send(Err(anyhow!("subscribe_track: {e}"))).await; return; }
     };
     let mut verifier = StreamVerifier::new(mac_key, topic.clone());
+    // #145: read groups by EXACT sequence (get_group), not arrival-order next_group.
+    // Each Group is served on its own QUIC uni-stream, so Groups can arrive out of
+    // order; next_group's monotonic cursor returns the first Group with sequence >=
+    // its cursor in *arrival* order, so a lower-seq Group that arrives after a higher
+    // one (e.g. the small terminal / always-retained max_sequence Group) is skipped —
+    // fatally breaking the ordered, gap-fatal chained HMAC. get_group(seq) waits for
+    // each exact Group (even out-of-order), guaranteeing in-order, gap-free delivery.
+    let mut expected_seq = 0u64;
     loop {
         if cancel.is_cancelled() {
             break;
         }
-        let mut group = match tokio::time::timeout(GROUP_IDLE_TIMEOUT, track.next_group()).await {
+        let mut group = match tokio::time::timeout(GROUP_IDLE_TIMEOUT, track.get_group(expected_seq)).await {
             Ok(Ok(Some(g))) => g,
             Ok(Ok(None)) => break, // track ended cleanly
             Err(_elapsed) => {
@@ -738,6 +746,7 @@ async fn moq_stream_handle_task(
                 break;
             }
         };
+        expected_seq += 1;
         let frame: bytes::Bytes = match tokio::time::timeout(FRAME_READ_TIMEOUT, group.read_frame()).await {
             Ok(Ok(Some(f))) => f,
             Ok(Ok(None)) => break, // group ended without a frame
@@ -880,7 +889,7 @@ async fn moq_stream_handle_task_networked(
             return;
         }
     };
-    let mut track = match bc.subscribe_track(&Track::new(STREAM_TRACK)) {
+    let track = match bc.subscribe_track(&Track::new(STREAM_TRACK)) {
         Ok(t) => t,
         Err(e) => {
             let _ = tx.send(Err(anyhow!("subscribe_track: {e}"))).await;
@@ -888,11 +897,19 @@ async fn moq_stream_handle_task_networked(
         }
     };
     let mut verifier = StreamVerifier::new(mac_key, topic.clone());
+    // #145: read groups by EXACT sequence (get_group), not arrival-order next_group.
+    // Each Group is served on its own QUIC uni-stream, so Groups can arrive out of
+    // order; next_group's monotonic cursor returns the first Group with sequence >=
+    // its cursor in *arrival* order, so a lower-seq Group that arrives after a higher
+    // one (e.g. the small terminal / always-retained max_sequence Group) is skipped —
+    // fatally breaking the ordered, gap-fatal chained HMAC. get_group(seq) waits for
+    // each exact Group (even out-of-order), guaranteeing in-order, gap-free delivery.
+    let mut expected_seq = 0u64;
     loop {
         if cancel.is_cancelled() {
             break;
         }
-        let mut group = match tokio::time::timeout(GROUP_IDLE_TIMEOUT, track.next_group()).await {
+        let mut group = match tokio::time::timeout(GROUP_IDLE_TIMEOUT, track.get_group(expected_seq)).await {
             Ok(Ok(Some(g))) => g,
             Ok(Ok(None)) => break,
             Err(_elapsed) => {
@@ -906,6 +923,7 @@ async fn moq_stream_handle_task_networked(
                 break;
             }
         };
+        expected_seq += 1;
         let frame: bytes::Bytes = match tokio::time::timeout(FRAME_READ_TIMEOUT, group.read_frame()).await {
             Ok(Ok(Some(f))) => f,
             Ok(Ok(None)) => break,
