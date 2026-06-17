@@ -908,22 +908,49 @@ impl Qwen3_5FullAttention {
         let k_exp = k_full.repeat_interleave_self_int(groups as i64, 2, None);
         let v_exp = v_full.repeat_interleave_self_int(groups as i64, 2, None);
 
-        // Manual attention in f32 for numerical stability
+        // Manual attention in f32 for numerical stability. For long prefills the
+        // query axis is processed in chunks so the [q_seq, kv_seq] FP32 score and
+        // softmax tensors are never materialized at full size — peak VRAM stays
+        // O(ATTN_CHUNK * kv_seq) rather than O(q_seq * kv_seq). An 8K-token prompt
+        // otherwise pushes these full-attn layers past 13 GB, and the CUDA caching
+        // allocator retains that peak, OOMing the next request. The decode path
+        // (q_seq == 1) and short prompts take the single-shot branch unchanged.
+        const ATTN_CHUNK: i64 = 1024;
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let q_p = query.permute([0, 2, 1, 3]).to_kind(Kind::Float).contiguous();
         let k_p = k_exp.permute([0, 2, 3, 1]).to_kind(Kind::Float).contiguous();
         let v_p = v_exp.permute([0, 2, 1, 3]).to_kind(Kind::Float).contiguous();
 
-        let mut scores = q_p.matmul(&k_p) * scale; // [batch, heads, q_seq, kv_seq]
-        let q_len = scores.size()[2];
-        let kv_len = scores.size()[3];
-        if q_len > 1 {
-            let mask = Tensor::ones([q_len, kv_len], (Kind::Float, device)).tril(0);
-            let mask = mask.unsqueeze(0).unsqueeze(0).expand_as(&scores);
-            scores = scores.masked_fill(&mask.eq(0.0), -10000.0f64);
-        }
-        let attn = scores.softmax(-1, Kind::Float).to_kind(dtype);
-        let ctx = attn.matmul(&v_p.to_kind(dtype)); // [batch, heads, seq, head_dim]
+        let q_len = q_p.size()[2];
+        let kv_len = k_p.size()[3];
+        let ctx = if q_len <= ATTN_CHUNK {
+            let mut scores = q_p.matmul(&k_p) * scale; // [batch, heads, q_seq, kv_seq]
+            if q_len > 1 {
+                let mask = Tensor::ones([q_len, kv_len], (Kind::Float, device)).tril(0);
+                let mask = mask.unsqueeze(0).unsqueeze(0).expand_as(&scores);
+                scores = scores.masked_fill(&mask.eq(0.0), -10000.0f64);
+            }
+            let attn = scores.softmax(-1, Kind::Float).to_kind(dtype);
+            attn.matmul(&v_p.to_kind(dtype)) // [batch, heads, q_seq, head_dim]
+        } else {
+            // Chunk over the query axis. Per-chunk causal mask `tril(start)` is the
+            // exact restriction of the full `tril(0)` mask to rows [start, start+cur).
+            let v_d = v_p.to_kind(dtype);
+            let mut outs: Vec<Tensor> = Vec::new();
+            let mut start = 0i64;
+            while start < q_len {
+                let cur = (q_len - start).min(ATTN_CHUNK);
+                let q_chunk = q_p.narrow(2, start, cur); // [batch, heads, cur, head_dim]
+                let mut scores = q_chunk.matmul(&k_p) * scale; // [batch, heads, cur, kv_seq]
+                let mask = Tensor::ones([cur, kv_len], (Kind::Float, device)).tril(start);
+                let mask = mask.unsqueeze(0).unsqueeze(0).expand_as(&scores);
+                scores = scores.masked_fill(&mask.eq(0.0), -10000.0f64);
+                let attn = scores.softmax(-1, Kind::Float).to_kind(dtype);
+                outs.push(attn.matmul(&v_d)); // [batch, heads, cur, head_dim]
+                start += cur;
+            }
+            Tensor::cat(&outs, 2) // [batch, heads, q_seq, head_dim]
+        };
         let ctx = ctx.permute([0, 2, 1, 3]).contiguous(); // [batch, seq, heads, head_dim]
 
         // Apply output gate: gate_flat[batch*seq, nh*hd] * sigmoid(gate) BEFORE o_proj
