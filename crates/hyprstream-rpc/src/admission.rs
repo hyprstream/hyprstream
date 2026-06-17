@@ -19,12 +19,21 @@
 //!
 //! 2. **Key binding** — does the peer's authenticated channel key (the raw
 //!    Ed25519 public key it proved possession of when establishing the session /
-//!    signing its envelopes) match a `verificationMethod` published in that
-//!    peer's resolved DID document (the `#mesh` / `#iroh` Ed25519 VM), OR an
-//!    Ed25519 key in a federation JWKS the caller supplies? The DID document is
-//!    resolved via the [`crate::did_web::DidWebResolver`] landed in #279 (no new
-//!    fetch/cache infra); the VM extraction is
-//!    [`crate::did_web::verification_method_ed25519_keys`] (#280 Multikey decode).
+//!    signing its envelopes) bind to the peer's DID? Two DID-method paths:
+//!
+//!    - **`did:web`** — match the key against a `verificationMethod` in the
+//!      peer's *resolved* DID document (the `#mesh` / `#iroh` Ed25519 VM), OR an
+//!      Ed25519 key in a federation JWKS the caller supplies. The DID document is
+//!      resolved via the [`crate::did_web::DidWebResolver`] landed in #279 (no new
+//!      fetch/cache infra); the VM extraction is
+//!      [`crate::did_web::verification_method_ed25519_keys`] (#280 Multikey decode).
+//!    - **`did:key` (Tiles interop, #281)** — a `did:key` is **self-certifying**:
+//!      the Ed25519 key *is* the identity (`did:key:z6Mk…` =
+//!      `multibase(0xed01 ‖ pubkey)`). There is **no document to resolve and no
+//!      network fetch**; the gate decodes the key from the DID
+//!      ([`crate::did_web::did_key_to_ed25519`]) and admits iff the peer's channel
+//!      key equals it. Reach for such a peer comes from iroh discovery (#282), not
+//!      the DID string.
 //!
 //! Either stage failing — or any resolution / I/O error — rejects (§4.4
 //! fail-closed). A successful run yields an [`AdmittedIdentity`] binding the
@@ -48,7 +57,10 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::did_web::{jwks_ed25519_keys, verification_method_ed25519_keys, DidDocFetcher, DidWebResolver};
+use crate::did_web::{
+    did_key_to_ed25519, is_did_key, jwks_ed25519_keys, verification_method_ed25519_keys, DidDocFetcher,
+    DidWebResolver,
+};
 
 /// The peer's authenticated channel key: the raw 32-byte Ed25519 public key the
 /// connecting peer proved possession of for this session.
@@ -156,7 +168,8 @@ impl<O: OriginAdmission, R: DidDocResolve> FederationAdmissionGate<O, R> {
     ///   DID / advertised issuer with `extract_origin`).
     /// - `peer_key` — the peer's authenticated channel/envelope key (see
     ///   [`PeerChannelKey`]).
-    /// - `did` — the peer's DID identifier to resolve for stage 2 (`did:web:…`).
+    /// - `did` — the peer's DID identifier for stage 2 (`did:web:…` resolved via
+    ///   the DID-doc resolver, or `did:key:…` self-certifying / no fetch — #281).
     /// - `federation_jwks` — an optional already-resolved federation JWKS
     ///   document (e.g. from the existing `jwks_uri` cache) used as a **fallback**
     ///   key source when the DID document carries no matching Ed25519 VM. Reuses
@@ -184,12 +197,24 @@ impl<O: OriginAdmission, R: DidDocResolve> FederationAdmissionGate<O, R> {
     }
 }
 
-/// Stage 2 core, factored out so it is independently unit-testable: resolve the
-/// peer DID document, and admit iff `peer_key` matches one of its Ed25519
-/// `verificationMethod` keys, falling back to a supplied federation JWKS.
+/// Stage 2 core, factored out so it is independently unit-testable: bind the
+/// peer's authenticated channel key to its DID's published key material, and
+/// admit iff it matches.
 ///
-/// Fail-closed: a resolution error, an empty/absent VM set with no JWKS match,
-/// or a key mismatch all return `Err`.
+/// Two DID-method paths (chosen by the DID string):
+///
+/// - **`did:key` (self-certifying, #281)** — Tiles-style Ed25519 device/account
+///   identity. The key *is* the identity: `did:key:z6Mk…` is exactly
+///   `multibase(0xed01 ‖ pubkey)`, so there is **no document to fetch and no
+///   resolver call**. We decode the key directly ([`did_key_to_ed25519`]) and
+///   admit iff `peer_key` equals it. (Reach for such a peer comes from iroh
+///   discovery #282, not the DID string — out of scope here.)
+/// - **`did:web` (resolver fetch, #279/#137)** — resolve the peer DID document
+///   and admit iff `peer_key` matches one of its Ed25519 `verificationMethod`
+///   keys, falling back to a supplied federation JWKS.
+///
+/// Fail-closed: a parse error, a resolution error, an empty/absent VM set with no
+/// JWKS match, or a key mismatch all return `Err`.
 pub async fn admit_key_against_did<R: DidDocResolve>(
     resolver: &R,
     origin: &str,
@@ -197,6 +222,28 @@ pub async fn admit_key_against_did<R: DidDocResolve>(
     did: &str,
     federation_jwks: Option<&Value>,
 ) -> Result<AdmittedIdentity> {
+    // ── did:key self-certifying arm (#281) ────────────────────────────────────
+    // A did:key carries its own Ed25519 key — no DID-doc resolution / network
+    // fetch. The peer's authenticated channel key MUST equal the key the DID
+    // encodes; any mismatch or parse error fails closed.
+    if is_did_key(did) {
+        let did_key = did_key_to_ed25519(did)
+            .map_err(|e| admission_reject(origin, peer_key, &format!("did:key {did} is invalid: {e}")))?;
+        if key_eq(&did_key, peer_key.as_bytes()) {
+            return Ok(AdmittedIdentity {
+                origin: origin.to_owned(),
+                did: Some(did.to_owned()),
+                key: *peer_key.as_bytes(),
+            });
+        }
+        return Err(admission_reject(
+            origin,
+            peer_key,
+            &format!("peer key does not match the self-certifying did:key identity {did}"),
+        ));
+    }
+
+    // ── did:web resolver arm (#279/#137) ──────────────────────────────────────
     // Resolve the peer's DID document. A resolution failure is fail-closed:
     // without the published key material we cannot bind the channel key.
     let doc = resolver
@@ -502,5 +549,80 @@ mod tests {
         let err = reject_no_peer_key(ORIGIN);
         assert!(err.to_string().contains("failing closed"), "{err}");
         assert!(err.to_string().contains("#200"), "{err}");
+    }
+
+    // ── did:key self-certifying arm (#281) ───────────────────────────────────
+
+    use crate::did_web::ed25519_to_did_key;
+
+    /// A resolver that MUST NOT be called: the did:key arm is self-certifying and
+    /// must never fetch/resolve. If the gate calls it, the test fails loudly.
+    struct NeverResolve;
+    #[async_trait]
+    impl DidDocResolve for NeverResolve {
+        async fn resolve_doc(&self, did: &str) -> Result<Value> {
+            panic!("did:key admission must not resolve a DID document (called for {did})");
+        }
+    }
+
+    #[tokio::test]
+    async fn admits_did_key_peer_whose_channel_key_matches() {
+        // Self-certifying: the peer's channel key equals the key the did:key
+        // encodes. No DID-doc resolution — NeverResolve proves the gate never
+        // calls the resolver for a did:key.
+        let key = random_ed25519();
+        let did = ed25519_to_did_key(&key);
+        let gate = FederationAdmissionGate::new(AllowOrigin, NeverResolve);
+        let admitted = gate
+            .admit(ORIGIN, PeerChannelKey(key), &did, None)
+            .await
+            .expect("matching did:key must admit (self-certifying)");
+        assert_eq!(admitted.origin, ORIGIN);
+        assert_eq!(admitted.did.as_deref(), Some(did.as_str()));
+        assert_eq!(admitted.key, key);
+    }
+
+    #[tokio::test]
+    async fn rejects_did_key_peer_on_key_mismatch() {
+        // The peer presents a different key than the did:key identity encodes.
+        let identity = random_ed25519();
+        let peer = random_ed25519();
+        let did = ed25519_to_did_key(&identity);
+        let gate = FederationAdmissionGate::new(AllowOrigin, NeverResolve);
+        let err = gate
+            .admit(ORIGIN, PeerChannelKey(peer), &did, None)
+            .await
+            .expect_err("mismatched did:key must reject");
+        assert!(err.to_string().contains("stage 2"), "{err}");
+        assert!(err.to_string().contains("self-certifying"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn did_key_still_enforces_stage1_origin() {
+        // Even a self-certifying did:key whose key would match must be rejected
+        // when stage 1 (origin) denies — stage 1 runs first and the did:key arm
+        // is never reached (NeverResolve also guards against any resolve attempt).
+        let key = random_ed25519();
+        let did = ed25519_to_did_key(&key);
+        let gate = FederationAdmissionGate::new(DenyOrigin, NeverResolve);
+        let err = gate
+            .admit(ORIGIN, PeerChannelKey(key), &did, None)
+            .await
+            .expect_err("denied origin must reject a did:key peer");
+        assert!(err.to_string().contains("stage 1"), "expected stage-1 rejection, got: {err}");
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_did_key_fail_closed() {
+        // A malformed did:key (ed25519-pub multicodec absent / wrong) must fail
+        // closed without resolving.
+        let peer = random_ed25519();
+        let bad_did = "did:key:zNotAValidEd25519Multikey";
+        let gate = FederationAdmissionGate::new(AllowOrigin, NeverResolve);
+        let err = gate
+            .admit(ORIGIN, PeerChannelKey(peer), bad_did, None)
+            .await
+            .expect_err("invalid did:key must reject (fail-closed)");
+        assert!(err.to_string().contains("stage 2"), "{err}");
     }
 }

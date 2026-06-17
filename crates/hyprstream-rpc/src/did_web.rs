@@ -270,6 +270,64 @@ pub fn decode_ed25519_multikey(multibase: &str) -> Result<[u8; 32]> {
     Ok(raw)
 }
 
+// ── did:key (Ed25519) interop (#281) ──────────────────────────────────────────
+
+/// Decode a `did:key` (Ed25519) identifier into its raw 32-byte Ed25519 key.
+///
+/// Tiles (and the broader did:key ecosystem) uses `did:key` for self-certifying
+/// device/account identity. For Ed25519 a `did:key` is *exactly*
+/// `"did:key:" + multibase-base58btc(0xed01 ‖ pubkey)` — i.e. the method-specific
+/// identifier is the same `Multikey` `publicKeyMultibase` value we already decode
+/// for `verificationMethod` (see [`decode_ed25519_multikey`]). A `did:key` is
+/// therefore **self-contained**: the key *is* the identity, so this is a pure
+/// decode with **no network fetch** (the inverse of `did:web`, which resolves a
+/// document). Reach for a `did:key` peer comes from iroh discovery (#282), not the
+/// DID string.
+///
+/// Returns `Err` for a non-`did:key` identifier, a non-Ed25519 multicodec, a bad
+/// multibase, or a wrong-length payload. A DID URL fragment / query is stripped
+/// (we decode the base identifier).
+pub fn did_key_to_ed25519(did: &str) -> Result<[u8; 32]> {
+    // Strip any DID URL fragment / query (`did:key:z6Mk…#z6Mk…` self-references
+    // the same key; we decode the base method-specific identifier).
+    let did = did.split(['#', '?']).next().unwrap_or(did);
+    let msi = did
+        .strip_prefix("did:key:")
+        .ok_or_else(|| anyhow!("not a did:key identifier: {did}"))?;
+    if msi.is_empty() {
+        bail!("did:key has empty method-specific identifier: {did}");
+    }
+    // The method-specific id IS a Multikey `publicKeyMultibase`; reuse the one
+    // source of truth for the ed25519-pub multicodec (no duplicated 0xed01).
+    decode_ed25519_multikey(msi)
+        .map_err(|e| anyhow!("did:key {did} is not a valid Ed25519 Multikey: {e}"))
+}
+
+/// Encode a raw 32-byte Ed25519 public key as a `did:key` (Ed25519) identifier
+/// (`did:key:z6Mk…`).
+///
+/// Reverse interop for #281: lets our Ed25519 keys (the `#mesh` / `#iroh` VMs)
+/// render as the `did:key` form Tiles and other did:key consumers expect. The
+/// produced string is `"did:key:" + ed25519_to_multibase(key)` and round-trips
+/// with [`did_key_to_ed25519`]; the Multikey body is byte-identical to the
+/// `publicKeyMultibase` our DID documents publish (`#280`'s `ed25519_to_multibase`
+/// over the same `0xed01 ‖ key` payload — one multicodec source of truth).
+pub fn ed25519_to_did_key(key: &[u8; 32]) -> String {
+    let mut payload = Vec::with_capacity(2 + 32);
+    payload.extend_from_slice(&MULTICODEC_ED25519_PUB);
+    payload.extend_from_slice(key);
+    format!("did:key:z{}", bs58::encode(payload).into_string())
+}
+
+/// Whether `did` is a `did:key` identifier (the self-certifying interop arm).
+///
+/// The admission gate (#137) uses this to route a `did:key` peer down the
+/// self-certifying path (the key *is* the identity — no DID-doc resolution /
+/// fetch) instead of the `did:web` resolver path.
+pub fn is_did_key(did: &str) -> bool {
+    did.starts_with("did:key:")
+}
+
 /// Extract every Ed25519 public key published in a DID document's
 /// `verificationMethod` array, decoded to raw 32-byte keys (#137 stage 2).
 ///
@@ -1031,5 +1089,100 @@ mod tests {
             );
         }
         assert!(cache.len() <= MAX_CACHE_ENTRIES);
+    }
+
+    // ── did:key (Ed25519) interop (#281) ───────────────────────────────────
+
+    /// Encode raw Ed25519 bytes as an `ed25519-pub` Multikey `publicKeyMultibase`
+    /// (`z` + base58btc(0xed01 ‖ key)). Mirrors `#280`'s `ed25519_to_multibase`
+    /// and `mesh_trust::encode_multikey`; kept local to the test.
+    fn ed25519_multikey(raw: &[u8; 32]) -> String {
+        let mut payload = Vec::with_capacity(2 + 32);
+        payload.extend_from_slice(&MULTICODEC_ED25519_PUB);
+        payload.extend_from_slice(raw);
+        format!("z{}", bs58::encode(payload).into_string())
+    }
+
+    fn rand_ed25519() -> [u8; 32] {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        SigningKey::generate(&mut OsRng).verifying_key().to_bytes()
+    }
+
+    #[test]
+    fn did_key_decodes_known_fixture() {
+        // The canonical did:key test vector for an all-zero Ed25519 public key
+        // (multibase-base58btc of 0xed01 followed by 32 zero bytes). This is a
+        // stable, spec-shaped fixture: the multicodec header + payload, not a
+        // random key, so it pins the exact wire format we interoperate on.
+        let did = ed25519_to_did_key(&[0u8; 32]);
+        assert!(did.starts_with("did:key:z6Mk"), "ed25519 did:key must start with z6Mk: {did}");
+        assert_eq!(did_key_to_ed25519(&did).unwrap(), [0u8; 32]);
+    }
+
+    #[test]
+    fn did_key_roundtrips_random_key() {
+        for _ in 0..16 {
+            let raw = rand_ed25519();
+            assert_eq!(did_key_to_ed25519(&ed25519_to_did_key(&raw)).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn did_key_strips_fragment() {
+        // A did:key with a fragment (self-referencing VM id) decodes the base key.
+        let raw = [3u8; 32];
+        let base = ed25519_to_did_key(&raw);
+        let mb = base.strip_prefix("did:key:").unwrap();
+        let with_fragment = format!("{base}#{mb}");
+        assert_eq!(did_key_to_ed25519(&with_fragment).unwrap(), raw);
+    }
+
+    #[test]
+    fn did_key_rejects_non_did_key() {
+        assert!(did_key_to_ed25519("did:web:example.com").is_err());
+        assert!(did_key_to_ed25519("https://example.com").is_err());
+        assert!(did_key_to_ed25519("did:key:").is_err());
+        assert!(!is_did_key("did:web:example.com"));
+        assert!(is_did_key("did:key:z6MkfooBar"));
+    }
+
+    #[test]
+    fn did_key_rejects_wrong_multicodec() {
+        // A Multikey carrying a p256-pub multicodec (0x1200 → 0x80 0x24), not
+        // ed25519-pub, must be rejected — only Ed25519 did:key is in scope.
+        let mut payload = vec![0x80u8, 0x24];
+        payload.extend_from_slice(&[0u8; 33]); // compressed p256-shaped body
+        let did = format!("did:key:z{}", bs58::encode(payload).into_string());
+        assert!(did_key_to_ed25519(&did).is_err());
+    }
+
+    #[test]
+    fn did_key_rejects_bad_length() {
+        // ed25519-pub multicodec but a 31-byte payload (wrong length).
+        let mut payload = vec![0xedu8, 0x01];
+        payload.extend_from_slice(&[0u8; 31]);
+        let did = format!("did:key:z{}", bs58::encode(payload).into_string());
+        assert!(did_key_to_ed25519(&did).is_err());
+    }
+
+    #[test]
+    fn did_key_rejects_non_base58btc_multibase() {
+        // 'b' is base32 multibase, not the base58btc 'z' Multikey uses.
+        assert!(did_key_to_ed25519("did:key:bMkfoo").is_err());
+    }
+
+    #[test]
+    fn did_key_equivalent_to_vm_multikey() {
+        // Equivalence: our Ed25519 VM `publicKeyMultibase` (#280 form) is exactly
+        // the method-specific id of the did:key for the same key — one multicodec
+        // source of truth, no divergence between did:web VMs and did:key.
+        let raw = rand_ed25519();
+        let vm_multibase = ed25519_multikey(&raw); // == #280 ed25519_to_multibase
+        let did_key = ed25519_to_did_key(&raw);
+        assert_eq!(did_key, format!("did:key:{vm_multibase}"));
+        // And both decode to the same key.
+        assert_eq!(decode_ed25519_multikey(&vm_multibase).unwrap(), raw);
+        assert_eq!(did_key_to_ed25519(&did_key).unwrap(), raw);
     }
 }
