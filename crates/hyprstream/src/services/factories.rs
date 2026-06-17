@@ -294,6 +294,13 @@ impl Spawnable for MoqEventBarrierService {
         if let Some(ready) = on_ready {
             let _ = ready.send(());
         }
+        // systemd Type=notify: send READY=1 so the unit reaches `active` rather
+        // than timing out (~45s) and restart-looping. These moq barrier services
+        // don't go through the RPC serve path (serve.rs::signal_ready) that
+        // normally notifies systemd, so they must signal readiness themselves —
+        // the moq origin/event-bus is already initialized in the factory before
+        // run() is called, so the service is genuinely ready here.
+        let _ = hyprstream_rpc::notify::ready();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -502,6 +509,13 @@ impl Spawnable for MoqStreamBarrierService {
         if let Some(ready) = on_ready {
             let _ = ready.send(());
         }
+        // systemd Type=notify: send READY=1 so the unit reaches `active` rather
+        // than timing out (~45s) and restart-looping. These moq barrier services
+        // don't go through the RPC serve path (serve.rs::signal_ready) that
+        // normally notifies systemd, so they must signal readiness themselves —
+        // the moq origin/event-bus is already initialized in the factory before
+        // run() is called, so the service is genuinely ready here.
+        let _ = hyprstream_rpc::notify::ready();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
