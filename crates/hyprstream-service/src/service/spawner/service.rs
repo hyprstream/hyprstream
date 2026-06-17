@@ -112,6 +112,29 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                 // Multiplex moq on the same endpoint when the global origin is up.
                 if let Some(origin) = hyprstream_rpc::moq_stream::global_moq_origin() {
                     rpc_server = rpc_server.with_moq_consumer(origin.consumer().clone());
+                    // #276: subscribe-authz + per-tenant announce scoping. The
+                    // default config is permissive (no resolver, no authorizer)
+                    // so the working open same-tenant subscribe model is
+                    // preserved. A deployment opts into per-tenant scoping /
+                    // private-stream gating by building a
+                    // `hyprstream_rpc::transport::iroh_moq::MoqAuthzConfig` with
+                    // a `tenant_resolver` and a `DefaultAuthorizer` whose policy
+                    // gate calls into the Casbin `PolicyManager`
+                    // (`hyprstream::auth::policy_manager::global_policy_manager()`
+                    // -> `check_with_domain(subject, tenant, broadcast, "subscribe")`).
+                    // That gate is constructed in the `hyprstream` crate (which
+                    // owns PolicyManager) and threaded down via the service
+                    // factory; wiring it here would create a `hyprstream-service`
+                    // -> `hyprstream` dependency cycle, so it is left as a seam.
+                    // TODO(#276): thread a `MoqAuthzConfig` through the service
+                    // factory (built in the `hyprstream` crate) and call
+                    // `.with_moq_authz(cfg)` here. NOTE: on this quinn `/moq`
+                    // path the peer is anonymous (no mutual TLS), so the
+                    // resolver/gate sees `PeerIdentity::anonymous()` — full
+                    // per-peer enforcement requires the iroh `moql` path, where
+                    // `with_authz` is already honoured.
+                    let _moq_authz_default =
+                        hyprstream_rpc::transport::iroh_moq::MoqAuthzConfig::default();
                 }
 
                 // Register this endpoint for RPC resolution and, once, as the

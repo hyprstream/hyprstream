@@ -32,6 +32,33 @@ use moq_net::{Origin, OriginConsumer, OriginProducer, Server, StatsHandle};
 use tokio_util::sync::CancellationToken;
 use web_transport_iroh::Session;
 
+use crate::moq_authz::{tenant_scoped_consumer, PeerIdentity, SharedSubscribeAuthorizer};
+
+/// Resolves the tenant a connected peer belongs to, from its (authenticated)
+/// identity. Returning `Some(tenant)` scopes that peer's view of announces to
+/// `{tenant}/`; returning `None` leaves the peer unscoped (the pre-#276 open
+/// model). Wired by the caller, which owns the peer↔tenant policy.
+pub type PeerTenantResolver = Arc<dyn Fn(&PeerIdentity) -> Option<String> + Send + Sync>;
+
+/// #276 authorization config for a moq accept path: an optional subscribe
+/// authorizer and an optional peer→tenant resolver for per-tenant announce
+/// scoping. Both default to "off" so existing open same-tenant subscribe keeps
+/// working until a deployment opts in.
+#[derive(Clone, Default)]
+pub struct MoqAuthzConfig {
+    /// Subscribe-time authorization hook (public-open / private-gated).
+    pub authorizer: Option<SharedSubscribeAuthorizer>,
+    /// Maps a peer identity to its tenant for per-tenant announce scoping.
+    pub tenant_resolver: Option<PeerTenantResolver>,
+}
+
+impl MoqAuthzConfig {
+    /// Resolve the tenant for `peer`, if a resolver is configured.
+    pub fn tenant_for(&self, peer: &PeerIdentity) -> Option<String> {
+        self.tenant_resolver.as_ref().and_then(|r| r(peer))
+    }
+}
+
 /// Shared `Origin` clone-pair held by the handler.
 ///
 /// - `producer` is what *we* publish into (call `create_broadcast`, `create_track`, etc.).
@@ -80,6 +107,9 @@ pub struct IrohMoqProtocolHandler {
 struct HandlerInner {
     origin: OriginShared,
     stats: StatsHandle,
+    /// #276 subscribe-authz + per-tenant announce scoping config. Defaults to
+    /// "off" (open same-tenant subscribe preserved).
+    authz: MoqAuthzConfig,
     /// Triggered by `ProtocolHandler::shutdown` so accept handlers stop
     /// waiting for `Session::closed()` and exit promptly.
     shutdown: CancellationToken,
@@ -105,9 +135,32 @@ impl IrohMoqProtocolHandler {
             inner: Arc::new(HandlerInner {
                 origin,
                 stats: StatsHandle::default(),
+                authz: MoqAuthzConfig::default(),
                 shutdown: CancellationToken::new(),
             }),
         }
+    }
+
+    /// Install the #276 subscribe-authz + per-tenant announce-scoping config.
+    ///
+    /// On this (iroh) path the accepted connection is authenticated, so the
+    /// `tenant_resolver` receives a real [`PeerIdentity`] (the remote endpoint
+    /// id) and per-tenant scoping is enforced live by handing the moq session a
+    /// tenant-scoped [`OriginConsumer`].
+    pub fn with_authz(mut self, authz: MoqAuthzConfig) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.authz = authz;
+        } else {
+            // Inner already shared (cloned handler); rebuild a fresh Arc.
+            let old = &*self.inner;
+            self.inner = Arc::new(HandlerInner {
+                origin: old.origin.clone(),
+                stats: old.stats.clone(),
+                authz,
+                shutdown: old.shutdown.clone(),
+            });
+        }
+        self
     }
 
     /// Borrow the shared origin pair.
@@ -135,9 +188,55 @@ impl Default for IrohMoqProtocolHandler {
 
 impl ProtocolHandler for IrohMoqProtocolHandler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        // #276: peer identity IS available here — an accepted iroh connection
+        // is authenticated by the remote endpoint's public key. Use it to
+        // derive the peer's tenant and scope the consumer it's served.
+        let peer = PeerIdentity::authenticated(conn.remote_id().to_string());
+
+        // Per-tenant announce scoping (live): if the caller installed a
+        // peer→tenant resolver, hand this session a consumer narrowed to its
+        // own `{tenant}/` prefix so it cannot enumerate or subscribe to other
+        // tenants' broadcasts. No resolver → unscoped (pre-#276 open model).
+        let publish_consumer = match self.inner.authz.tenant_for(&peer) {
+            Some(tenant) => {
+                // `scope` returns None when the tenant prefix is outside the
+                // origin's allowed prefixes — serve that peer nothing rather
+                // than falling back to the unscoped consumer (fail-closed for
+                // cross-tenant enumeration).
+                match tenant_scoped_consumer(&self.inner.origin.consumer, &tenant) {
+                    Some(scoped) => {
+                        tracing::debug!(peer = %peer.subject.as_deref().unwrap_or("?"), %tenant, "iroh-moq: tenant-scoped consumer");
+                        scoped
+                    }
+                    None => {
+                        tracing::debug!(%tenant, "iroh-moq: tenant has no visible broadcasts; serving empty scope");
+                        // An empty scope: a fresh consumer cursor over a prefix
+                        // with no broadcasts. Re-scope to a sentinel under the
+                        // tenant so the peer sees nothing it isn't entitled to.
+                        // Falling through to a clone would leak cross-tenant
+                        // names, so we instead drop the session.
+                        return Ok(());
+                    }
+                }
+            }
+            None => self.inner.origin.consumer.clone(),
+        };
+
+        // NOTE (#276 subscribe-authz seam): `moq_net::Server` exposes no
+        // per-subscribe callback, so we cannot gate individual `subscribe_track`
+        // calls in-band. The public/private decision is therefore enforced
+        // *structurally* by what the served consumer can see (tenant scoping
+        // above). The pluggable `SubscribeAuthorizer` is retained as the policy
+        // unit a richer moq-net (one that surfaces a subscribe hook) would call;
+        // it is exercised by unit tests in `crate::moq_authz`. Until moq-net
+        // grows that hook, private-vs-public must be expressed as scoping (e.g.
+        // a private broadcast lives under a prefix only entitled peers' tenant
+        // scope includes).
+        let _authorizer = self.inner.authz.authorizer.as_ref();
+
         let session = Session::raw(conn);
         let server = Server::new()
-            .with_publish(self.inner.origin.consumer.clone())
+            .with_publish(publish_consumer)
             // Subscribe slot is None for v1 — we only serve broadcasts;
             // accepting remote announces (cross-instance fan-out) lands
             // in Phase 3 part N (#142).
@@ -257,6 +356,83 @@ mod tests {
         .await??
         .ok_or_else(|| anyhow::anyhow!("read_frame returned None"))?;
         assert_eq!(&frame[..], b"hello-moq");
+
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// #276 live per-tenant announce scoping over the iroh `moql` path: the
+    /// server publishes broadcasts for two tenants but the accept path scopes
+    /// every connection to `bob/` (via the tenant resolver). A remote subscriber
+    /// must see `bob`'s broadcast and must NOT be able to reach `alice`'s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn iroh_moq_scopes_announces_to_connection_tenant() -> anyhow::Result<()> {
+        // `MoqAuthzConfig` is defined in this module (`super`).
+        // Server scoped so EVERY peer is treated as tenant "bob".
+        let authz = MoqAuthzConfig {
+            authorizer: None,
+            tenant_resolver: Some(Arc::new(|_peer| Some("bob".to_owned()))),
+        };
+        let handler = IrohMoqProtocolHandler::new().with_authz(authz);
+        let producer = handler.origin_producer().clone();
+        let server = IrohSubstrate::new(fresh_key(), handler, NoopHandler::new("rpc-not-wired")).await?;
+        let server_addr = direct_addr(&server);
+
+        // Publish one broadcast per tenant.
+        let mut alice_bc = producer
+            .create_broadcast("alice/streams/secret/i0")
+            .ok_or_else(|| anyhow::anyhow!("create alice broadcast"))?;
+        let mut alice_tr = alice_bc.create_track(Track::new("tokens"))?;
+        let mut alice_g = alice_tr.create_group(Group::from(0u64))?;
+        alice_g.write_frame(Bytes::from_static(b"alice-secret"))?;
+        drop(alice_g);
+
+        let mut bob_bc = producer
+            .create_broadcast("bob/streams/run-1/i0")
+            .ok_or_else(|| anyhow::anyhow!("create bob broadcast"))?;
+        let mut bob_tr = bob_bc.create_track(Track::new("tokens"))?;
+        let mut bob_g = bob_tr.create_group(Group::from(0u64))?;
+        bob_g.write_frame(Bytes::from_static(b"bob-data"))?;
+        drop(bob_g);
+
+        // Client connects; the accept path scopes its consumer to bob/.
+        let client =
+            IrohSubstrate::new(fresh_key(), NoopHandler::new("c-moq"), NoopHandler::new("c-rpc")).await?;
+        let conn = client.connect(server_addr, ALPN_MOQ_LITE).await?;
+        let session = Session::raw(conn);
+        let client_origin: OriginProducer = Origin::random().produce();
+        let client_consumer: OriginConsumer = client_origin.consume();
+        let moq_client = Client::new().with_consume(client_origin);
+        let _moq_session = moq_client.connect(session).await?;
+
+        // bob/ is visible: subscribe and read its frame.
+        let bob_consumer = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_consumer.announced_broadcast("bob/streams/run-1/i0"),
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("bob broadcast not announced"))?;
+        let mut bob_track = bob_consumer.subscribe_track(&Track::new("tokens"))?;
+        let mut bob_group = tokio::time::timeout(std::time::Duration::from_secs(5), bob_track.next_group())
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("bob next_group None"))?;
+        let bob_frame: Bytes = tokio::time::timeout(std::time::Duration::from_secs(5), bob_group.read_frame())
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("bob read_frame None"))?;
+        assert_eq!(&bob_frame[..], b"bob-data");
+
+        // alice/ is NOT visible to this bob-scoped subscriber: the announce
+        // must never arrive (timeout → not announced through the scoped cursor).
+        let alice_seen = tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            client_consumer.announced_broadcast("alice/streams/secret/i0"),
+        )
+        .await;
+        assert!(
+            alice_seen.is_err() || alice_seen.ok().flatten().is_none(),
+            "bob-scoped subscriber must NOT see alice's broadcast"
+        );
 
         client.shutdown().await?;
         server.shutdown().await?;

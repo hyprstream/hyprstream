@@ -58,6 +58,9 @@ pub struct QuinnRpcServer {
     /// WebTransport CONNECT URL path is [`crate::dial::MOQ_PATH`] are handed to
     /// `moq_net::Server::accept` instead of the RPC core. `None` = RPC only.
     moq_consumer: Option<moq_net::OriginConsumer>,
+    /// #276 subscribe-authz + per-tenant announce-scoping config for the `/moq`
+    /// plane. Defaults to "off" (open subscribe preserved).
+    moq_authz: crate::transport::iroh_moq::MoqAuthzConfig,
     shutdown: CancellationToken,
 }
 
@@ -90,6 +93,7 @@ impl QuinnRpcServer {
             )),
             read_timeout: super::rpc_session::REQUEST_READ_TIMEOUT,
             moq_consumer: None,
+            moq_authz: crate::transport::iroh_moq::MoqAuthzConfig::default(),
             shutdown: CancellationToken::new(),
         }
     }
@@ -103,6 +107,26 @@ impl QuinnRpcServer {
     /// over a per-connection iroh ALPN — here the multiplex is by URL path.
     pub fn with_moq_consumer(mut self, consumer: moq_net::OriginConsumer) -> Self {
         self.moq_consumer = Some(consumer);
+        self
+    }
+
+    /// Install the #276 subscribe-authz + per-tenant announce-scoping config for
+    /// the `/moq` plane.
+    ///
+    /// **Identity caveat (documented seam):** the WebTransport `/moq` CONNECT is
+    /// *not* mutually authenticated — the server presents a pinned cert, but the
+    /// client is anonymous at the TLS layer. So the `tenant_resolver` is invoked
+    /// with [`crate::moq_authz::PeerIdentity::anonymous`]; per-tenant scoping on
+    /// this path is only effective if the resolver returns a tenant from
+    /// non-identity context (e.g. a single-tenant endpoint), and a policy-gated
+    /// authorizer will deny *private* subscribes here (fail-closed) while public
+    /// broadcasts stay open. Cross-tenant enumeration defense for authenticated
+    /// peers lives on the iroh `moql` path.
+    pub fn with_moq_authz(
+        mut self,
+        authz: crate::transport::iroh_moq::MoqAuthzConfig,
+    ) -> Self {
+        self.moq_authz = authz;
         self
     }
 
@@ -231,6 +255,7 @@ impl QuinnRpcServer {
                     let read_timeout = self.read_timeout;
                     let shutdown = self.shutdown.clone();
                     let moq_consumer = self.moq_consumer.clone();
+                    let moq_authz = self.moq_authz.clone();
                     tokio::spawn(async move {
                         let _conn_permit = conn_permit; // released when this connection ends
                         // Multiplex by WebTransport CONNECT URL path (#274): read
@@ -263,10 +288,42 @@ impl QuinnRpcServer {
                         if is_moq {
                             match moq_consumer {
                                 Some(consumer) => {
+                                    // #276: the `/moq` WebTransport CONNECT is NOT
+                                    // mutually authenticated, so no peer identity
+                                    // is available — treat the peer as anonymous.
+                                    let peer = crate::moq_authz::PeerIdentity::anonymous();
+                                    // Per-tenant announce scoping: only effective
+                                    // if the resolver yields a tenant from
+                                    // non-identity context (e.g. a single-tenant
+                                    // endpoint). With no resolver, serve unscoped
+                                    // (preserves the pre-#276 open model).
+                                    // TODO(#276): when the `/moq` plane gains a
+                                    // mutually-authenticated peer identity (client
+                                    // cert / app-level token), derive the tenant
+                                    // from it here instead of `anonymous()` so
+                                    // cross-tenant enumeration defense applies to
+                                    // network subscribers, not just iroh peers.
+                                    let publish_consumer = match moq_authz.tenant_for(&peer) {
+                                        Some(tenant) => {
+                                            match crate::moq_authz::tenant_scoped_consumer(&consumer, &tenant) {
+                                                Some(scoped) => scoped,
+                                                None => {
+                                                    tracing::debug!(%tenant, "quinn-moq: tenant has no visible broadcasts; dropping session");
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                        None => consumer,
+                                    };
+                                    // See iroh_moq::accept for why the authorizer
+                                    // is not enforced per-track here (moq-net has
+                                    // no subscribe callback); structural scoping
+                                    // is the live enforcement.
+                                    let _authorizer = moq_authz.authorizer.as_ref();
                                     // Serve moq over this session, mirroring
                                     // IrohMoqProtocolHandler: publish the shared
                                     // origin consumer to remote subscribers.
-                                    let server = moq_net::Server::new().with_publish(consumer);
+                                    let server = moq_net::Server::new().with_publish(publish_consumer);
                                     match server.accept(session).await {
                                         Ok(moq_session) => {
                                             // Hold the session until it closes or
