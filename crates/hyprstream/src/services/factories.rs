@@ -261,7 +261,15 @@ fn create_event_service(_ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     info!("Creating EventService (moq-lite event bus)");
 
     let origin = MoqEventOrigin::new();
-    hyprstream_rpc::moq_event::init_global_moq_event_origin(origin);
+    hyprstream_rpc::moq_event::init_global_moq_event_origin(origin.clone());
+
+    // #275: serve the event-bus origin over the well-known cross-process UDS path
+    // so OTHER service processes (worker, model, ...) can publish/subscribe events
+    // to this shared bus. In the same-process (InprocManager) deployment every
+    // service shares this global origin directly; this UDS plane is the bridge
+    // for the systemd / --ipc deployment where each service is its own process.
+    let event_moq_path = hyprstream_rpc::paths::event_socket();
+    hyprstream_rpc::moq_event::serve_event_moq_uds_background(origin, event_moq_path);
 
     Ok(Box::new(MoqEventBarrierService::new()))
 }
@@ -589,7 +597,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
 ///
 /// Note: This service requires worker configuration. If not configured,
 /// the factory will use sensible defaults.
-#[service_factory("worker", depends_on = ["policy", "discovery"])]
+#[service_factory("worker", depends_on = ["policy", "discovery", "event"])]
 fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating WorkerService");
 

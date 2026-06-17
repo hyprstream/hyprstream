@@ -2050,6 +2050,24 @@ fn main() -> Result<()> {
                                 // Compute dependency-aware startup stages.
                                 let stages = hyprstream_service::startup_stages(&service_names);
 
+                                // #275: in the systemd / --ipc deployment each service
+                                // runs in its OWN process. Only the `event` service's
+                                // process initializes the process-global moq event bus
+                                // origin. If THIS process does not host the `event`
+                                // service, wire a CLIENT-mode event origin connected to
+                                // the event service's UDS plane BEFORE any factory runs
+                                // (so `EventPublisher::new` in e.g. the worker factory
+                                // resolves the global). Idempotent + a no-op when `event`
+                                // is co-located.
+                                let hosts_event_service = stages
+                                    .iter()
+                                    .any(|stage| stage.iter().any(|s| s == "event"));
+                                if !hosts_event_service {
+                                    hyprstream_rpc::moq_event::ensure_event_client_origin(
+                                        hyprstream_rpc::paths::event_socket(),
+                                    );
+                                }
+
                                 for stage in &stages {
                                     for svc_name in stage {
                                         let factory = get_factory(svc_name).ok_or_else(|| {
