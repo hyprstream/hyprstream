@@ -10,6 +10,7 @@ pub mod identity_store;
 pub mod key_rotation;
 pub mod service_jwt;
 pub mod federation;
+pub mod mesh_trust;
 pub mod id_token_verify;
 pub mod jwt;
 mod policy_manager;

@@ -444,24 +444,27 @@ pub struct StreamChannel {
     signing_key: SigningKey,
     /// ML-DSA-65 signing key for the post-quantum half of the StreamRegister
     /// composite signature. Mirrors `LocalSigner` on the RPC plane so the
-    /// streaming control plane signs under the same policy (#161). Auto-
-    /// generated; the node's persistent ML-DSA identity is wired in via
-    /// [`Self::with_pq_key`] once peer attestation lands (#157).
+    /// streaming control plane signs under the same policy (#161). Derived
+    /// deterministically from the node's persistent Ed25519 signing key (#157)
+    /// in [`Self::new`]; override with [`Self::with_pq_key`].
     pq_signing_key: Option<crate::crypto::pq::MlDsaSigningKey>,
 }
 
 impl StreamChannel {
     /// Create a new stream channel.
     ///
-    /// Auto-generates an ML-DSA-65 key for the post-quantum half of the
-    /// StreamRegister composite, mirroring `LocalSigner::new` on the RPC
-    /// plane. Use [`Self::with_pq_key`] to install the node's persistent
-    /// ML-DSA identity (#157).
+    /// The post-quantum half of the StreamRegister composite is the node's
+    /// **persistent** mesh ML-DSA-65 key, derived deterministically from
+    /// `signing_key` via [`crate::node_identity::derive_mesh_mldsa_key`] (#157),
+    /// mirroring `LocalSigner::new` on the RPC plane. This replaces the previous
+    /// ephemeral keygen so the streaming control plane's ML-DSA public key is
+    /// stable across restarts and equals the `#mesh-pq` key peers anchor. Use
+    /// [`Self::with_pq_key`] only to override with an externally supplied key.
     pub fn new(signing_key: SigningKey) -> Self {
-        let (pq_sk, _) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let pq_signing_key = Some(crate::node_identity::derive_mesh_mldsa_key(&signing_key));
         Self {
             signing_key,
-            pq_signing_key: Some(pq_sk),
+            pq_signing_key,
         }
     }
 

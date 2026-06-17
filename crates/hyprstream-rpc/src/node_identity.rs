@@ -42,6 +42,33 @@ pub fn derive_purpose_key(root_key: &SigningKey, purpose: &str) -> SigningKey {
     key
 }
 
+/// HKDF purpose label for the mesh ML-DSA-65 signing key (#157).
+///
+/// Distinct from any Ed25519 / JWT purpose label so the post-quantum mesh key
+/// satisfies the PQUIP key-separation restriction (a derived key is bound to
+/// exactly one cryptographic purpose). The `-v1` suffix allows a future
+/// rotation by bumping the version without changing the root node key.
+pub const MESH_MLDSA_PURPOSE: &str = "hyprstream-mesh-mldsa-v1";
+
+/// Deterministically derive the node's mesh ML-DSA-65 signing key from its
+/// persisted Ed25519 root/signing key (#157).
+///
+/// Uses [`derive_purpose_key`] (HKDF-SHA256 over the Ed25519 seed) with the
+/// dedicated [`MESH_MLDSA_PURPOSE`] label, then re-keys that 32-byte output as
+/// an ML-DSA-65 seed via [`crate::crypto::pq::ml_dsa_sk_from_seed`]. This is
+/// stable across restarts (no new key file) and key-separated from both the
+/// Ed25519 identity and the JWT ML-DSA keyset.
+///
+/// The matching public key (`signing_key.verifying_key()`) is what peers must
+/// anchor in their `KeyedPqTrustStore`, keyed by the Ed25519 signer identity.
+pub fn derive_mesh_mldsa_key(ed25519_key: &SigningKey) -> crate::crypto::pq::MlDsaSigningKey {
+    let derived = derive_purpose_key(ed25519_key, MESH_MLDSA_PURPOSE);
+    let mut seed = derived.to_bytes();
+    let sk = crate::crypto::pq::ml_dsa_sk_from_seed(&seed);
+    seed.zeroize();
+    sk
+}
+
 /// A purpose-derived Ed25519 signing identity.
 /// Inner SigningKey is zeroized on drop via ed25519-dalek's `zeroize` feature.
 struct DerivedIdentity {
@@ -235,6 +262,49 @@ mod tests {
         let provider = NodeIdentityProvider::new(&root);
         let long = "x".repeat(256);
         assert!(provider.identity_open(&long).await.is_err());
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn mesh_mldsa_key_is_deterministic() {
+        // #157: deriving the mesh ML-DSA key from the same node Ed25519 key must
+        // be stable across calls (so it survives restarts without a key file).
+        let root = SigningKey::from_bytes(&[3u8; 32]);
+        let sk1 = derive_mesh_mldsa_key(&root);
+        let sk2 = derive_mesh_mldsa_key(&root);
+        assert_eq!(
+            crate::crypto::pq::ml_dsa_sk_to_vk_bytes(&sk1),
+            crate::crypto::pq::ml_dsa_sk_to_vk_bytes(&sk2),
+            "same node seed must derive the same mesh ML-DSA key"
+        );
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn mesh_mldsa_key_differs_per_node() {
+        let root_a = SigningKey::generate(&mut rand::rngs::OsRng);
+        let root_b = SigningKey::generate(&mut rand::rngs::OsRng);
+        let vk_a = crate::crypto::pq::ml_dsa_sk_to_vk_bytes(&derive_mesh_mldsa_key(&root_a));
+        let vk_b = crate::crypto::pq::ml_dsa_sk_to_vk_bytes(&derive_mesh_mldsa_key(&root_b));
+        assert_ne!(vk_a, vk_b, "different node seeds must derive different mesh keys");
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn mesh_mldsa_key_separated_from_ed25519() {
+        // PQUIP key separation: the derived ML-DSA seed must not equal the
+        // Ed25519 node seed (it goes through a dedicated purpose label).
+        let root = SigningKey::from_bytes(&[9u8; 32]);
+        let mesh_sk = derive_mesh_mldsa_key(&root);
+        let mesh_seed = crate::crypto::pq::ml_dsa_sk_to_seed(&mesh_sk);
+        assert_ne!(
+            mesh_seed,
+            root.to_bytes(),
+            "mesh ML-DSA seed must be key-separated from the Ed25519 node seed"
+        );
+        // And it equals the explicit two-step derivation (purpose key -> seed).
+        let expected_seed = derive_purpose_key(&root, MESH_MLDSA_PURPOSE).to_bytes();
+        assert_eq!(mesh_seed, expected_seed, "derivation must match the purpose-key path");
     }
 
     #[allow(clippy::unwrap_used)]

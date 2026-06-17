@@ -706,6 +706,35 @@ pub struct TrustedIssuerConfig {
 
 fn default_jwks_cache_ttl() -> u64 { 300 }
 
+/// Configuration for a trusted mesh peer's post-quantum signing identity (#157).
+///
+/// Admin-anchored entry binding a peer's Ed25519 mesh **signer** identity (the
+/// envelope/COSE signer key, used as the kid anchor) to its trusted ML-DSA-65
+/// mesh verifying key. These entries populate the process-global
+/// `KeyedPqTrustStore` eagerly at startup; the store is immutable thereafter.
+///
+/// Both keys are supplied **inline**, out-of-band, as `Multikey`
+/// `publicKeyMultibase` strings (base58btc, multicodec-prefixed) — the same
+/// encoding the node publishes in its DID document (`#mesh` ed25519-pub `0xed01`
+/// and `#mesh-pq` ml-dsa-65-pub `0x1211`). An operator copies a peer's
+/// `#mesh` and `#mesh-pq` `publicKeyMultibase` values from that peer's DID doc.
+///
+/// This matches the `KeyedPqTrustStore` contract ("Entries MUST be established
+/// out-of-band") and the Tiles interop admission model: only keys an operator
+/// configured are trusted. If `mesh_peers` is empty, the store is empty and
+/// behavior is unchanged (Hybrid fails closed for unknown peers).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshPeerConfig {
+    /// Peer's Ed25519 mesh signer public key as a `Multikey` `publicKeyMultibase`
+    /// string (base58btc `z…`, multicodec `ed25519-pub` `0xed01`). This is the
+    /// kid anchor the COSE composite is verified against.
+    pub ed25519_multibase: String,
+    /// Peer's ML-DSA-65 mesh verifying key as a `Multikey` `publicKeyMultibase`
+    /// string (base58btc `z…`, multicodec `ml-dsa-65-pub` `0x1211`). The trusted
+    /// post-quantum key bound to `ed25519_multibase`.
+    pub mldsa65_multibase: String,
+}
+
 /// Protocol kind for an external OAuth/OIDC provider.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -950,6 +979,16 @@ pub struct OAuthConfig {
     #[serde(default)]
     pub trusted_issuers: std::collections::HashMap<String, TrustedIssuerConfig>,
 
+    /// Trusted mesh peers' post-quantum signing identities (#157).
+    /// Key = an operator-chosen peer label (informational only).
+    /// Value = the peer's Ed25519 mesh signer key + ML-DSA-65 mesh verifying
+    /// key, supplied inline as out-of-band `Multikey` strings. Populates the
+    /// process-global `KeyedPqTrustStore` eagerly at startup (admin-anchored,
+    /// immutable). Empty = empty store = unchanged behavior (Hybrid fails
+    /// closed for unknown peers). Distinct from `trusted_issuers`.
+    #[serde(default)]
+    pub mesh_peers: std::collections::HashMap<String, MeshPeerConfig>,
+
     /// OpenID Federation 1.0 Trust Anchor URLs (optional).
     /// When set, included as `authority_hints` in the entity configuration JWT,
     /// making this node discoverable within the named federations.
@@ -1047,6 +1086,7 @@ impl Default for OAuthConfig {
             quic_port: None,
             cors: default_oauth_cors(),
             trusted_issuers: std::collections::HashMap::new(),
+            mesh_peers: std::collections::HashMap::new(),
             authority_hints: Vec::new(),
             oidc_providers: std::collections::HashMap::new(),
             user_signing_key: None,

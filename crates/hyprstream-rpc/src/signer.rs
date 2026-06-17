@@ -35,13 +35,20 @@ impl std::fmt::Debug for LocalSigner {
 }
 
 impl LocalSigner {
+    /// Create a native signer.
+    ///
+    /// The post-quantum half is the node's **persistent** mesh ML-DSA-65 key,
+    /// derived deterministically from `signing_key` via
+    /// [`crate::node_identity::derive_mesh_mldsa_key`] (#157). This replaces the
+    /// previous ephemeral keygen so the signer's ML-DSA public key is stable
+    /// across restarts and equals the `#mesh-pq` key peers anchor in their PQ
+    /// trust store. Use [`Self::with_pq_key`] only to override with an
+    /// externally supplied key (e.g. tests).
     pub fn new(signing_key: SigningKey) -> Self {
+        let pq_signing_key = Some(crate::node_identity::derive_mesh_mldsa_key(&signing_key));
         Self {
             signing_key,
-            pq_signing_key: {
-                let (sk, _) = crate::crypto::pq::ml_dsa_generate_keypair();
-                Some(sk)
-            },
+            pq_signing_key,
         }
     }
 

@@ -1101,8 +1101,11 @@ fn handle_quick_command(
 
                         // Standalone worker entrypoint serves RPC, so it must
                         // install the verify config too (#160) — otherwise the
-                        // fail-closed default rejects all mesh traffic.
-                        install_envelope_verify_config();
+                        // fail-closed default rejects all mesh traffic. No config
+                        // is in scope here, so the mesh PQ store is empty (#157):
+                        // identical to prior behavior (Hybrid fails closed for
+                        // unknown peers).
+                        install_envelope_verify_config(None);
 
                         let manager = InprocManager::new();
                         Some(
@@ -1320,7 +1323,13 @@ fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
 /// peer ML-DSA bindings are provisioned, may set
 /// `HYPRSTREAM_ENVELOPE_POLICY=classical`. Under Hybrid with no anchored peer
 /// key the verifier fails closed (correct, by design).
-fn install_envelope_verify_config() {
+/// Install the process-global envelope verify configuration.
+///
+/// When `oauth` is `Some`, the kid-anchored PQ trust store is populated eagerly
+/// from `mesh_peers` (#157). When `None` (e.g. the standalone worker entrypoint,
+/// which has no config in scope), the store is empty — identical to the prior
+/// behavior. Either way the store is immutable after install.
+fn install_envelope_verify_config(oauth: Option<&hyprstream_core::config::OAuthConfig>) {
     use hyprstream_rpc::crypto::CryptoPolicy;
     use hyprstream_rpc::envelope::{
         install_verify_config, EnvelopeVerifyConfig, KeyedPqTrustStore, PqTrustStore,
@@ -1335,10 +1344,15 @@ fn install_envelope_verify_config() {
         }
     };
 
-    // Mesh kid-anchored PQ trust store. Peer bindings (Ed25519 signer ->
-    // trusted ML-DSA) are added by the attestation layer; an empty store under
-    // Hybrid fails closed for unknown peers (correct, by design).
-    let pq_store: std::sync::Arc<dyn PqTrustStore> = std::sync::Arc::new(KeyedPqTrustStore::new());
+    // Mesh kid-anchored PQ trust store (#157, Option A): populated eagerly from
+    // admin-configured `mesh_peers`, immutable after install. An empty store
+    // under Hybrid fails closed for unknown peers (correct, by design).
+    let keyed_store = match oauth {
+        Some(oauth) => hyprstream_core::auth::mesh_trust::build_mesh_pq_trust_store(oauth),
+        None => KeyedPqTrustStore::new(),
+    };
+    tracing::info!("mesh PQ trust store installed with {} peer binding(s)", keyed_store.len());
+    let pq_store: std::sync::Arc<dyn PqTrustStore> = std::sync::Arc::new(keyed_store);
 
     if install_verify_config(EnvelopeVerifyConfig {
         policy,
@@ -2000,9 +2014,14 @@ fn main() -> Result<()> {
                                 // (`global_ml_dsa_verifying_keys`, loaded above).
                                 // We therefore DO NOT seed the mesh PqTrustStore
                                 // from the JWT keyset. The mesh store is keyed by
-                                // Ed25519 signer identity and is populated from
-                                // attested peer identities (peer-attestation
-                                // registry — residual integration work).
+                                // Ed25519 signer identity.
+                                //
+                                // #157 (Option A — eager, admin-anchored): the
+                                // store is populated EAGERLY here, before install,
+                                // from the operator-configured `mesh_peers`. It is
+                                // immutable after install (no lazy-at-verify
+                                // resolution). Empty `mesh_peers` => empty store =>
+                                // unchanged behavior.
                                 //
                                 // Policy: Hybrid is enforced by default. Operators
                                 // mid-rollout (before peer ML-DSA bindings are
@@ -2010,7 +2029,7 @@ fn main() -> Result<()> {
                                 // HYPRSTREAM_ENVELOPE_POLICY=classical to keep the
                                 // legacy EdDSA-only verifier. Under Hybrid with no
                                 // anchored key the verifier FAILS CLOSED.
-                                install_envelope_verify_config();
+                                install_envelope_verify_config(Some(&config.oauth));
 
                                 let manager = InprocManager::new();
                                 let mut handles = Vec::new();

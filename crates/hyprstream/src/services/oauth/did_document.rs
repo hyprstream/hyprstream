@@ -172,11 +172,9 @@ fn ed25519_verification_method(did: &str, key_id: &str, vk: &VerifyingKey) -> Va
 /// a did:web subject, emitted as a `Multikey` with the registered
 /// `ml-dsa-65-pub` multicodec (`0x1211`).
 ///
-/// `vk_bytes` is the raw ML-DSA-65 verifying-key (1952 bytes). The DID document
-/// builder does not yet publish a PQ key (that is #157's job — populating
-/// `KeyedPqTrustStore` from the `#mesh` ML-DSA key); this helper exists so #157
-/// can emit the VM with the settled multicodec encoding (e.g. as `#mesh-pq`).
-#[allow(dead_code)]
+/// `vk_bytes` is the raw ML-DSA-65 verifying-key (1952 bytes). The root DID
+/// document publishes the node's mesh ML-DSA-65 key as `#mesh-pq` (#157) so
+/// peers can anchor it in their `KeyedPqTrustStore`.
 fn mldsa65_verification_method(did: &str, key_id: &str, vk_bytes: &[u8]) -> Value {
     json!({
         "id": format!("{did}#{key_id}"),
@@ -217,10 +215,11 @@ fn build_did_document(
     keys: &[(String, VerifyingKey)],
     atproto: Option<&AtprotoIdentity<'_>>,
     transports: &[TransportEndpoint],
+    mesh_pq_vk: Option<&[u8]>,
 ) -> Value {
-    let mut verification_methods = Vec::with_capacity(keys.len() * 2 + 1);
-    let mut authentication_refs = Vec::with_capacity(keys.len() * 2 + 1);
-    let mut assertion_refs = Vec::with_capacity(keys.len() * 2 + 1);
+    let mut verification_methods = Vec::with_capacity(keys.len() * 2 + 2);
+    let mut authentication_refs = Vec::with_capacity(keys.len() * 2 + 2);
+    let mut assertion_refs = Vec::with_capacity(keys.len() * 2 + 2);
 
     // atproto signing key FIRST (atproto takes the first matching entry).
     if let Some(at) = atproto {
@@ -240,6 +239,16 @@ fn build_did_document(
         authentication_refs.push(Value::String(vm_id_jwk.clone()));
         assertion_refs.push(Value::String(vm_id));
         assertion_refs.push(Value::String(vm_id_jwk));
+    }
+
+    // Mesh post-quantum verification method (#157): the node's ML-DSA-65 mesh
+    // key, published as `#mesh-pq` so peers can anchor it in their PQ trust
+    // store. Additive and ignored by atproto resolvers (matched by id/type).
+    if let Some(vk_bytes) = mesh_pq_vk {
+        verification_methods.push(mldsa65_verification_method(did, "mesh-pq", vk_bytes));
+        let vm_id = format!("{did}#mesh-pq");
+        authentication_refs.push(Value::String(vm_id.clone()));
+        assertion_refs.push(Value::String(vm_id));
     }
 
     // Services: atproto PDS first, then the legacy HyprstreamService, then any
@@ -360,6 +369,7 @@ pub async fn root_did_document(
         &[("key-1".to_owned(), vk)],
         atproto.as_ref(),
         &transports,
+        state.mesh_pq_verifying_key.as_deref(),
     );
     (
         StatusCode::OK,
@@ -412,7 +422,7 @@ pub async fn user_did_document(
         None => Vec::new(),
     };
 
-    let doc = build_did_document(&did, &state.issuer_url, &keys, None, &[]);
+    let doc = build_did_document(&did, &state.issuer_url, &keys, None, &[], None);
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/did+json")],
@@ -451,7 +461,7 @@ pub async fn client_did_document(
     // lookup + extract_ed25519_keys_from_jwks call.
     let keys: Vec<(String, VerifyingKey)> = Vec::new();
 
-    let doc = build_did_document(&did, &state.issuer_url, &keys, None, &[]);
+    let doc = build_did_document(&did, &state.issuer_url, &keys, None, &[], None);
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/did+json")],
@@ -553,6 +563,7 @@ mod tests {
             &[("key-1".to_owned(), sk.verifying_key())],
             None,
             &[],
+            None,
         );
         assert_eq!(doc["id"].as_str().unwrap(), did);
         assert!(doc["@context"].is_array());
@@ -573,7 +584,7 @@ mod tests {
     #[test]
     fn build_did_doc_empty_keys_is_valid() {
         let did = "did:web:example.com:users:alice";
-        let doc = build_did_document(did, "https://example.com", &[], None, &[]);
+        let doc = build_did_document(did, "https://example.com", &[], None, &[], None);
         assert_eq!(doc["id"].as_str().unwrap(), did);
         assert_eq!(doc["verificationMethod"].as_array().unwrap().len(), 0);
         assert_eq!(doc["authentication"].as_array().unwrap().len(), 0);
@@ -612,6 +623,7 @@ mod tests {
             &[("key-1".to_owned(), ed.verifying_key())],
             Some(&atproto),
             &transports,
+            None,
         );
 
         // #atproto Multikey is FIRST and p256.
@@ -689,6 +701,63 @@ mod tests {
         // Remaining bytes are the verifying-key payload, unmodified.
         assert_eq!(&decoded[2..], vk_bytes.as_slice());
         assert_eq!(decoded.len(), 2 + 1952);
+    }
+
+    #[test]
+    fn build_did_doc_publishes_mesh_pq_vm() {
+        // #157: when a mesh ML-DSA-65 vk is provided, build_did_document emits a
+        // `#mesh-pq` Multikey VM with the ml-dsa-65-pub multicodec, listed after
+        // the Ed25519 VMs, and referenced in authentication/assertionMethod.
+        let sk = SigningKey::generate(&mut OsRng);
+        let did = "did:web:hyprstream.example.com";
+        let vk_bytes = vec![0x42u8; 1952];
+        let doc = build_did_document(
+            did,
+            "https://hyprstream.example.com",
+            &[("key-1".to_owned(), sk.verifying_key())],
+            None,
+            &[],
+            Some(&vk_bytes),
+        );
+        let vms = doc["verificationMethod"].as_array().unwrap();
+        // key-1 multibase + key-1 jwk + mesh-pq = 3.
+        assert_eq!(vms.len(), 3);
+        let pq = vms.iter().find(|v| v["id"] == format!("{did}#mesh-pq")).unwrap();
+        assert_eq!(pq["type"].as_str().unwrap(), "Multikey");
+        let mb = pq["publicKeyMultibase"].as_str().unwrap();
+        let decoded = bs58::decode(&mb[1..]).into_vec().unwrap();
+        assert_eq!(&decoded[..2], &[0x91, 0x24]); // ml-dsa-65-pub multicodec
+        assert_eq!(&decoded[2..], vk_bytes.as_slice());
+        // Referenced as both an authentication and assertion method.
+        let mesh_pq_id = format!("{did}#mesh-pq");
+        assert!(doc["authentication"].as_array().unwrap().iter().any(|v| *v == mesh_pq_id));
+        assert!(doc["assertionMethod"].as_array().unwrap().iter().any(|v| *v == mesh_pq_id));
+    }
+
+    #[test]
+    fn mesh_pq_vm_matches_derived_signing_key() {
+        // #157 scope #1/#2 consistency: the `#mesh-pq` VM published from the
+        // OAuth signing key must equal the ML-DSA-65 verifying key the mesh
+        // actually signs with (derive_mesh_mldsa_key over the same Ed25519 key).
+        let sk = SigningKey::generate(&mut OsRng);
+        let pq_sk = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&sk);
+        let pq_vk_bytes = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq_sk);
+
+        let did = "did:web:hyprstream.example.com";
+        let doc = build_did_document(
+            did,
+            "https://hyprstream.example.com",
+            &[("key-1".to_owned(), sk.verifying_key())],
+            None,
+            &[],
+            Some(&pq_vk_bytes),
+        );
+        let vms = doc["verificationMethod"].as_array().unwrap();
+        let pq = vms.iter().find(|v| v["id"] == format!("{did}#mesh-pq")).unwrap();
+        let mb = pq["publicKeyMultibase"].as_str().unwrap();
+        let decoded = bs58::decode(&mb[1..]).into_vec().unwrap();
+        assert_eq!(&decoded[2..], pq_vk_bytes.as_slice(),
+            "published #mesh-pq key must equal the derived mesh signing key's public key");
     }
 
     #[test]

@@ -268,13 +268,22 @@ pub trait RequestService: 'static {
     /// `ResponseEnvelope` under the Hybrid policy (EdDSA + ML-DSA-65); when
     /// `None` it signs Classical (EdDSA-only). The matching ML-DSA-65 public key
     /// must be anchored in the client's PQ trust store for Hybrid verification
-    /// to succeed (peer attestation). Default `None` (Classical responses).
+    /// to succeed (peer attestation).
+    ///
+    /// The default derives the node's **persistent** mesh ML-DSA-65 key
+    /// deterministically from this service's Ed25519 [`Self::signing_key`] via
+    /// [`crate::node_identity::derive_mesh_mldsa_key`] (#157). Because the EdDSA
+    /// half of the response is signed with that same Ed25519 key (dispatch is
+    /// handed `service.signing_key()`), the kid-anchored binding the client
+    /// stores — Ed25519 signer pubkey → ML-DSA vk — is self-consistent, and the
+    /// published `#mesh-pq` DID verification method equals this signing key.
     ///
     /// Mirrors the request-side signing policy: the server emits the strongest
     /// composite it has keys for; a Classical verifier still accepts it via the
-    /// inner EdDSA (skip-unknown interop).
+    /// inner EdDSA (skip-unknown interop). Override to return `None` to force
+    /// Classical-only responses.
     fn pq_signing_key(&self) -> Option<crate::crypto::pq::MlDsaSigningKey> {
-        None
+        Some(crate::node_identity::derive_mesh_mldsa_key(&self.signing_key()))
     }
 
     /// Ed25519 verifying key for envelope signature verification.

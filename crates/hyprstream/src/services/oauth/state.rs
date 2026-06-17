@@ -378,6 +378,13 @@ pub struct OAuthState {
     /// Public QUIC URI (`https://host:port`) for the DID-doc service entry (#185).
     /// None until the QUIC server is started and the cert hash is known.
     pub quic_public_uri: Option<String>,
+    /// Raw ML-DSA-65 verifying-key bytes (1952 bytes) for the node's mesh
+    /// post-quantum signing key (#157). Published as the `#mesh-pq` Multikey
+    /// verification method in the root DID document. Derived from the same
+    /// Ed25519 key as [`Self::signing_key`] (via `derive_mesh_mldsa_key`), so
+    /// the published VM equals the key the node signs mesh responses with.
+    /// `None` when the entity signing key is not configured.
+    pub mesh_pq_verifying_key: Option<Vec<u8>>,
 }
 
 impl OAuthState {
@@ -430,6 +437,7 @@ impl OAuthState {
             ml_dsa_key_store: None,
             quic_cert_hashes: Vec::new(),
             quic_public_uri: None,
+            mesh_pq_verifying_key: None,
         }
     }
 
@@ -544,7 +552,14 @@ impl OAuthState {
     }
 
     /// Attach the signing key for OpenID Federation 1.0 entity configuration signing.
+    ///
+    /// Also derives and stores the node's mesh ML-DSA-65 verifying key (#157)
+    /// from this same Ed25519 key, so the root DID document's `#mesh-pq`
+    /// Multikey verification method matches the post-quantum key the mesh signs
+    /// with (`derive_mesh_mldsa_key`).
     pub fn with_signing_key(mut self, key: ed25519_dalek::SigningKey) -> Self {
+        let pq_sk = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&key);
+        self.mesh_pq_verifying_key = Some(hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq_sk));
         self.signing_key = Some(key);
         self
     }
