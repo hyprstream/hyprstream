@@ -2,8 +2,8 @@
 #
 # Multi-variant packaging: CPU, CUDA 12.8, CUDA 13.0, ROCm 7.1
 #
-# Uses crane for Rust builds -- vendors ALL cargo deps under a single hash
-# instead of 47 separate git dependency hashes.
+# Uses crane for Rust builds with pre-vendored cargo deps.
+# All registry and git deps are fetched in an isolated vendoring step.
 #
 # Usage:
 #   nix build .#hyprstream-cpu
@@ -12,9 +12,6 @@
 #   nix build .#hyprstream-rocm71
 #   nix build .#hyprstream         # alias for cpu
 #   nix develop                    # dev shell
-#
-# On first build, crane will error with the correct cargoHash.
-# Replace lib.fakeHash in the hash line with the reported hash.
 {
   description = "HyprStream - Agentic infrastructure for continuously learning applications";
 
@@ -47,8 +44,13 @@
         # Crane instance with our toolchain
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-        # Common source filtering -- exclude build artifacts, git internals
-        src = craneLib.cleanCargoSource ./.;
+        # Source filtering: standard cargo sources + .capnp schemas (needed by hyprstream-rpc build.rs)
+        src = pkgs.lib.cleanSourceWith {
+          src = craneLib.path ./.;
+          filter = path: type:
+            (craneLib.filterCargoSources path type) ||
+            (builtins.match ".*\\.capnp$" path != null);
+        };
 
         # Pre-vendor cargo deps with fixes for broken git dependencies
         cargoVendorDir = craneLib.vendorCargoDeps {
@@ -66,6 +68,7 @@
                     touch "$dir/$readme"
                   fi
                 done
+
               '';
             });
         };
@@ -82,7 +85,11 @@
             perl
             capnproto
             protobuf
+            llvmPackages.libclang
+            llvmPackages.clang
           ];
+
+          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
           buildInputs = with pkgs; [
             openssl
@@ -95,12 +102,36 @@
           # Git deps require CLI fetch (Nix sandbox disables libgit2 SSH)
           CARGO_NET_GIT_FETCH_WITH_CLI = "true";
 
+          # Tests require runtime libs (libstdc++, libtorch) not available in build sandbox
+          doCheck = false;
+
           # Build only the main binary
           cargoExtraArgs = "-p hyprstream";
 
-          # Only hash of all cargo deps (registry + git) -- single FOD
-          # On first build, replace lib.fakeHash with the real hash from the error
-          cargoHash = pkgs.lib.fakeHash;
+          # Fix: kata-containers protocols/build.rs generates protobuf .rs files
+          # into src/ which is read-only in the Nix store vendor directory.
+          # Copy the entire vendor dir to a writable tmpdir before building.
+          preBuild = ''
+            vendor_src="${builtins.toString cargoVendorDir}"
+            echo "preBuild: making vendor dir writable (for kata-containers proto codegen)"
+            cp -rL "$vendor_src" "$TMPDIR/writable-vendor"
+            chmod -R u+w "$TMPDIR/writable-vendor"
+            # Update cargo config to use the writable copy
+            # crane puts cargo home at $CARGO_HOME (set by configureCargoVendoredDepsHook)
+            if [ -n "''${CARGO_HOME:-}" ] && [ -f "$CARGO_HOME/config.toml" ]; then
+              echo "preBuild: updating $CARGO_HOME/config.toml"
+              sed -i "s|$vendor_src|$TMPDIR/writable-vendor|g" "$CARGO_HOME/config.toml"
+            else
+              echo "preBuild: CARGO_HOME not set or config missing, trying .cargo-home"
+              for cfg in .cargo-home/config.toml .cargo/config.toml; do
+                if [ -f "$cfg" ]; then
+                  echo "preBuild: updating $cfg"
+                  sed -i "s|$vendor_src|$TMPDIR/writable-vendor|g" "$cfg"
+                fi
+              done
+            fi
+          '';
+
         };
 
         # Build a variant by overlaying LIBTORCH env vars
