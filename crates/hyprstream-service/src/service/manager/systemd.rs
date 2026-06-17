@@ -67,7 +67,6 @@ impl SystemdManager {
         Ok(Self {
             connection,
             systemd,
-            login,
         })
     }
 
