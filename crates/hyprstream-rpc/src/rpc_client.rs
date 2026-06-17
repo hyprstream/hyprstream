@@ -399,10 +399,24 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
                 &ed_sig,
                 &aad,
             );
-            self.signer
+            // The inner EdDSA above was already bound to the hybrid-composite
+            // alg-id (`hybrid = pq_pubkey().is_some()`), so it cannot fall back to
+            // a classical inner. A signer that advertises a PQ key but declines to
+            // sign must therefore be a HARD ERROR, not a silent downgrade that
+            // would desync inner-AAD (hybrid) from outer-presence (none) and make
+            // the peer's inner verification fail (#278 review).
+            let pq_sig = self
+                .signer
                 .pq_sign(&pq_tbs)
                 .await?
-                .map(|pq_sig| (pq_kid, pq_sig))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "signer exposes a PQ public key but pq_sign() returned no \
+                         signature; refusing to emit a hybrid-bound inner without \
+                         its ML-DSA-65 outer (#278)"
+                    )
+                })?;
+            Some((pq_kid, pq_sig))
         } else {
             None
         };

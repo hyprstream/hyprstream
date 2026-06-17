@@ -145,10 +145,13 @@ pub fn build_hybrid_external_aad(base_aad: &[u8]) -> Vec<u8> {
         CborValue::Bytes(HYBRID_COMPOSITE_ALG_ID.to_vec()),
     ]);
     let mut buf = Vec::with_capacity(base_aad.len() + HYBRID_COMPOSITE_ALG_ID.len() + 8);
-    if ciborium::ser::into_writer(&value, &mut buf).is_err() {
-        // Infallible for this fixed shape into an unbounded Vec; never panic.
-        return Vec::new();
-    }
+    // Infallible for this fixed [bstr,bstr] shape into an unbounded Vec. Fail
+    // LOUD rather than silently degrading the hybrid-alg-id binding to an empty
+    // (classical-equivalent) AAD on BOTH sign and verify — a silent empty return
+    // would erode the #278 non-separability property invisibly (review finding).
+    #[allow(clippy::expect_used)]
+    ciborium::ser::into_writer(&value, &mut buf)
+        .expect("CBOR serialization of the hybrid external_aad is infallible");
     buf
 }
 
