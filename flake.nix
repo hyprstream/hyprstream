@@ -87,6 +87,7 @@
             protobuf
             llvmPackages.libclang
             llvmPackages.clang
+            autoPatchelfHook
           ];
 
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
@@ -97,6 +98,8 @@
             zeromq
             git
             systemd
+            # C++ runtime needed by libtorch and kata-containers FFI
+            stdenv.cc.cc.lib
           ];
 
           # Git deps require CLI fetch (Nix sandbox disables libgit2 SSH)
@@ -144,6 +147,9 @@
               LIBTORCH = "${libtorch}";
               LD_LIBRARY_PATH = "${libtorch}/lib";
               LIBTORCH_BYPASS_VERSION_CHECK = "1";
+
+              # Include libtorch in buildInputs so patchelf adds its lib dir to RPATH
+              buildInputs = commonArgs.buildInputs ++ [ libtorch ];
 
               # Passthru for downstream use
               passthru = { inherit variant libtorch; };
