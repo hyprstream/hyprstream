@@ -339,8 +339,13 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         // Nested SNS composite: sign the inner EdDSA layer first, then sign the
         // outer ML-DSA-65 layer over `canonical ‖ inner_eddsa_signature` so the
         // inner signature is bound into the outer (Strong-Non-Separable).
+        //
+        // Hybrid iff the signer exposes an ML-DSA-65 key. In Hybrid mode the inner
+        // EdDSA layer binds the hybrid-composite alg-id into its AAD (#278), making
+        // it byte-distinct from a Classical inner layer.
+        let hybrid = self.signer.pq_pubkey().is_some();
         let ed_kid = ed_pubkey.to_vec();
-        let ed_tbs = crate::crypto::cose_sign::inner_tbs(ed_kid.clone(), &canonical, &aad);
+        let ed_tbs = crate::crypto::cose_sign::inner_tbs(ed_kid.clone(), &canonical, &aad, hybrid);
         let ed_sig = self.signer.sign(&ed_tbs).await?.to_vec();
 
         // Hybrid component when the signer exposes an ML-DSA-65 key.

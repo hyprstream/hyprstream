@@ -4,23 +4,32 @@
 //! ## Where this sits in the PQUIP hybrid-signature taxonomy
 //!
 //! In the taxonomy of `draft-ietf-pquip-hybrid-signature-spectrums` §1.3.4 this
-//! construction is **Weak Non-Separable (WNS)**, *not* Strong Non-Separable
+//! construction is still **Weak Non-Separable (WNS)**, *not* Strong Non-Separable
 //! (SNS). SNS requires *fusion* — the two algorithms' signatures combined into a
 //! single object that cannot be verified by either component alone. We do not do
 //! that: we emit two distinct COSE_Sign1 signatures and bind them by nesting
-//! (the outer signs `payload ‖ inner_sig`). A classical-only verifier can — and,
-//! per [`verify_composite`]'s `require_pq = false` path, deliberately does —
-//! accept the inner EdDSA signature on its own. That standalone-acceptability is
-//! exactly what SNS precludes, so labelling this SNS would overstate the
-//! cryptographic guarantee.
+//! (the outer signs `payload ‖ inner_sig`).
 //!
-//! **Downgrade resistance here is enforced by *verifier policy*, not by the
-//! crypto.** It rests on two policy mechanisms, not on non-separability:
-//!   1. `require_pq` (fail-closed Hybrid policy): a Hybrid verifier rejects any
+//! As of #278 the inner EdDSA layer additionally binds a hybrid-composite alg-id
+//! into its signed input when produced in Hybrid mode (see
+//! [`HYBRID_COMPOSITE_ALG_ID`] / [`build_hybrid_external_aad`]). This delivers
+//! *signature-level* non-separability for the inner component: an inner EdDSA
+//! signature lifted out of a Hybrid composite (its outer ML-DSA layer stripped)
+//! is NO LONGER a valid standalone Classical signature, because its `Sig_structure`
+//! was bound to the hybrid-alg-id that a Classical verifier does not reconstruct.
+//! A genuine *Classical*-mode inner (no hybrid-alg-id) still verifies under a
+//! Classical verifier — that intended interop is preserved. We keep the WNS label
+//! because the two signatures remain separable *objects* (no fusion) and a
+//! standalone outer ML-DSA layer is still independently meaningful; #278 closes
+//! the inner-component separability gap, not the structural one.
+//!
+//! **Downgrade resistance is now enforced by BOTH crypto and policy:**
+//!   1. signature-level non-separability (#278): a stripped-inner attack fails the
+//!      inner EdDSA *signature* check (AAD mismatch), not merely a policy gate.
+//!   2. `require_pq` (fail-closed Hybrid policy): a Hybrid verifier rejects any
 //!      envelope lacking a valid outer ML-DSA-65 layer, so an attacker who strips
-//!      the outer layer is rejected by *policy* (not because the inner is
-//!      cryptographically unusable without it).
-//!   2. kid-anchoring: the PQ key is resolved from a [`PqTrustStore`] keyed by
+//!      the outer layer is *also* rejected by policy.
+//!   3. kid-anchoring: the PQ key is resolved from a [`PqTrustStore`] keyed by
 //!      the EdDSA signer identity, never self-asserted in the COSE object —
 //!      closing the self-certification gap a naïve two-signature scheme has.
 //!
@@ -36,23 +45,48 @@
 //! at all comes from policy.
 //!
 //! ```text
-//! Classical:
-//!   inner  = EdDSA   COSE_Sign1 over  payload                       (detached)
+//! Classical:                                          external_aad
+//!   inner  = EdDSA  COSE_Sign1 over  payload          base_aad
 //!
-//! Hybrid (WNS, policy-enforced):
-//!   inner  = EdDSA   COSE_Sign1 over  payload                       (detached)
-//!   outer  = ML-DSA  COSE_Sign1 over  payload ‖ inner_eddsa_sig     (detached)
+//! Hybrid (#278 hybrid-alg-id bound; policy-enforced): external_aad
+//!   inner  = EdDSA  COSE_Sign1 over  payload          [base_aad, hybridAlgID]
+//!   outer  = ML-DSA COSE_Sign1 over  payload‖inner_sig [base_aad, hybridAlgID]
 //! ```
 //!
-//! Both layers bind the same `external_aad` (the CBOR `[envelope_schema_id,
-//! inner_type_id]` schema binding, see [`crate::crypto::cose_sign1::build_external_aad`]).
+//! Both layers bind the base `external_aad` (the CBOR `[envelope_schema_id,
+//! inner_type_id]` schema binding, see [`crate::crypto::cose_sign1::build_external_aad`]),
+//! and — in **Hybrid** mode only — *additionally* bind a hybrid-composite
+//! algorithm identifier (see [`HYBRID_COMPOSITE_ALG_ID`]) into both layers'
+//! `external_aad` via [`build_hybrid_external_aad`].
 //!
-//! Note the `external_aad` does **not** currently carry a hybrid-composite
-//! algorithm identifier, so the inner EdDSA COSE_Sign1 produced in Hybrid mode is
-//! byte-identical to one produced in Classical mode. Binding a composite alg-id
-//! into the AAD would move this construction closer to true non-separability —
-//! but at the cost of the deliberate classical-verifier interop documented on
-//! [`verify_composite`]. That trade-off is tracked as a follow-up; see #152.
+//! ## Signature-level non-separability of the inner EdDSA (#278)
+//!
+//! Per `draft-ietf-pquip-hybrid-signature-spectrums` (§ Nested Construction /
+//! Non-Separability), signature-level non-separability requires binding a
+//! `hybridAlgID` into each component's signed input: `sig = Sign(hybridAlgID ‖ m)`.
+//! We achieve this by extending the COSE `external_aad` (which RFC 9052 §4.4
+//! folds into every layer's `Sig_structure`) with the composite alg-id whenever
+//! signing in Hybrid mode.
+//!
+//! Consequence: the inner EdDSA `COSE_Sign1` to-be-signed bytes produced in
+//! Hybrid mode are now **byte-distinct** from those produced in Classical mode,
+//! so a stripped inner EdDSA signature lifted out of a Hybrid composite is *not*
+//! a valid standalone Classical signature — it fails verification at the
+//! *signature* level (not merely the `require_pq` policy check). In **Classical**
+//! mode the `external_aad` is left exactly as before (no hybrid-alg-id), so
+//! classical-only signing/verification is byte-for-byte unchanged.
+//!
+//! ## Backwards-compatibility / transition window
+//!
+//! This changes *what is signed* under Hybrid mode: a Hybrid signer at this
+//! revision binds the hybrid-alg-id, so its inner EdDSA layer will NOT verify
+//! against a pre-#278 Classical verifier that reconstructs the bare base AAD,
+//! and vice-versa. Per WNS the classical `sig`/`cnf` fields on the envelope are
+//! retained for the raw-EdDSA advertisement / JWT-cnf paths and are unaffected.
+//! During a mixed-version deployment, peers MUST agree on the same policy
+//! (Classical↔Classical or Hybrid↔Hybrid); a Hybrid producer talking to a
+//! Classical-only consumer was already rejected by the `require_pq` policy, so
+//! no *new* interop surface is broken — only the Hybrid inner AAD changed.
 //!
 //! # Wire shape (`SignedEnvelope.cose`)
 //!
@@ -77,6 +111,58 @@ use crate::crypto::pq::{ml_dsa_sign, ml_dsa_verify, MlDsaSigningKey, MlDsaVerify
 
 /// IANA COSE algorithm id for ML-DSA-65 (FIPS 204, draft-ietf-cose-dilithium).
 pub const ALG_ML_DSA_65: i64 = iana::Algorithm::ML_DSA_65 as i64;
+
+/// Stable composite/hybrid algorithm identifier for the EdDSA + ML-DSA-65
+/// component pair signed by this nested construction.
+///
+/// Bound into the COSE `external_aad` of BOTH layers in Hybrid mode so that the
+/// inner EdDSA `Sig_structure` becomes byte-distinct from a Classical-mode one
+/// (signature-level non-separability, see this module's docs and #278).
+///
+/// Value: the ASCII bytes of the registered composite-signature name
+/// `id-MLDSA65-Ed25519` from `draft-ietf-lamps-pq-composite-sigs` (the LAMPS
+/// composite that pairs ML-DSA-65 with Ed25519). We bind a deterministic,
+/// human-auditable label rather than an integer OID-arc to keep the AAD
+/// self-describing on the wire and avoid depending on a not-yet-final IANA COSE
+/// code-point allocation. It is a fixed constant: changing it is a wire-breaking
+/// change that both signer and verifier must adopt together.
+pub const HYBRID_COMPOSITE_ALG_ID: &[u8] = b"id-MLDSA65-Ed25519";
+
+/// Extend a base `external_aad` with the [`HYBRID_COMPOSITE_ALG_ID`] binding.
+///
+/// Produces the deterministic CBOR encoding of the 2-element array
+/// `[base_aad : bstr, HYBRID_COMPOSITE_ALG_ID : bstr]`. Wrapping the (already
+/// CBOR) base AAD as a byte string inside a fresh 2-bstr array is unambiguous:
+/// the Classical AAD is the bare base bytes (a CBOR `[int,int]` array, major
+/// type 4), whereas the Hybrid AAD is a CBOR `[bstr,bstr]` array (also major
+/// type 4 but with bstr elements), so the two TBS inputs can never collide.
+///
+/// Used ONLY in Hybrid mode; Classical mode signs/verifies against the bare
+/// `base_aad` so classical-only behaviour is byte-for-byte unchanged.
+pub fn build_hybrid_external_aad(base_aad: &[u8]) -> Vec<u8> {
+    let value = CborValue::Array(vec![
+        CborValue::Bytes(base_aad.to_vec()),
+        CborValue::Bytes(HYBRID_COMPOSITE_ALG_ID.to_vec()),
+    ]);
+    let mut buf = Vec::with_capacity(base_aad.len() + HYBRID_COMPOSITE_ALG_ID.len() + 8);
+    if ciborium::ser::into_writer(&value, &mut buf).is_err() {
+        // Infallible for this fixed shape into an unbounded Vec; never panic.
+        return Vec::new();
+    }
+    buf
+}
+
+/// Select the `external_aad` to bind into each layer for the given mode.
+///
+/// - `hybrid = true`  → bind the hybrid-composite alg-id ([`build_hybrid_external_aad`]).
+/// - `hybrid = false` → bare `base_aad` (Classical; unchanged).
+fn layer_aad(base_aad: &[u8], hybrid: bool) -> Vec<u8> {
+    if hybrid {
+        build_hybrid_external_aad(base_aad)
+    } else {
+        base_aad.to_vec()
+    }
+}
 
 /// EdDSA kid convention: raw 32-byte Ed25519 verifying key.
 fn eddsa_kid(vk: &ed25519_dalek::VerifyingKey) -> Vec<u8> {
@@ -189,7 +275,13 @@ pub fn sign_composite(
     payload: &[u8],
     external_aad: &[u8],
 ) -> Result<Vec<u8>> {
-    let inner = build_inner_eddsa(ed_sk, payload, external_aad)?;
+    // Hybrid iff an ML-DSA-65 key is present. In Hybrid mode the hybrid-composite
+    // alg-id is bound into BOTH layers' external_aad (#278); in Classical mode the
+    // bare base AAD is used so classical signatures are byte-identical to before.
+    let hybrid = pq_sk.is_some();
+    let aad = layer_aad(external_aad, hybrid);
+
+    let inner = build_inner_eddsa(ed_sk, payload, &aad)?;
     let inner_sig = inner_signature_bytes(&inner).to_vec();
     let inner_bytes = inner
         .to_vec()
@@ -198,7 +290,7 @@ pub fn sign_composite(
     let outer_bytes = match pq_sk {
         Some(pq) => {
             let outer_pl = outer_payload(payload, &inner_sig);
-            let outer = build_outer_mldsa(pq, &outer_pl, external_aad)?;
+            let outer = build_outer_mldsa(pq, &outer_pl, &aad)?;
             Some(
                 outer
                     .to_vec()
@@ -247,20 +339,31 @@ fn unsigned_outer(pq_kid: Vec<u8>) -> CoseSign1 {
 }
 
 /// Compute the inner EdDSA layer's detached to-be-signed bytes.
-pub fn inner_tbs(ed_kid: Vec<u8>, payload: &[u8], external_aad: &[u8]) -> Vec<u8> {
-    unsigned_inner(ed_kid).tbs_detached_data(payload, external_aad)
+///
+/// `hybrid` MUST match the composite mode the caller will assemble: when `true`
+/// the hybrid-composite alg-id is bound into the `external_aad` (#278), making
+/// the inner TBS byte-distinct from a Classical one. Pass `false` for a
+/// Classical-only composite.
+pub fn inner_tbs(ed_kid: Vec<u8>, payload: &[u8], external_aad: &[u8], hybrid: bool) -> Vec<u8> {
+    let aad = layer_aad(external_aad, hybrid);
+    unsigned_inner(ed_kid).tbs_detached_data(payload, &aad)
 }
 
 /// Compute the outer ML-DSA-65 layer's detached to-be-signed bytes over
 /// `payload ‖ inner_eddsa_signature` (the inner→outer binding).
+///
+/// The outer layer only exists in Hybrid mode, so the hybrid-composite alg-id is
+/// always bound into its `external_aad` (#278) — symmetric with [`inner_tbs`]
+/// called with `hybrid = true`.
 pub fn outer_tbs(
     pq_kid: Vec<u8>,
     payload: &[u8],
     inner_eddsa_sig: &[u8],
     external_aad: &[u8],
 ) -> Vec<u8> {
+    let aad = build_hybrid_external_aad(external_aad);
     let outer_pl = outer_payload(payload, inner_eddsa_sig);
-    unsigned_outer(pq_kid).tbs_detached_data(&outer_pl, external_aad)
+    unsigned_outer(pq_kid).tbs_detached_data(&outer_pl, &aad)
 }
 
 /// Assemble the nested WNS composite from out-of-band signatures.
@@ -339,6 +442,17 @@ pub struct CompositeVerified {
 /// - `require_pq = false` (Classical verifier): only the inner EdDSA layer is
 ///   required and verified; any outer ML-DSA layer is IGNORED (skip-unknown
 ///   interop — a Hybrid-signed envelope still verifies via its inner EdDSA).
+///
+/// # Hybrid-alg-id binding (#278)
+///
+/// The inner/outer layers in a Hybrid composite bind the hybrid-composite alg-id
+/// into their `external_aad` (see [`build_hybrid_external_aad`]). The verifier
+/// reconstructs the inner AAD from the composite's *self-describing* shape: if an
+/// outer ML-DSA layer is present, the inner was Hybrid-signed → reconstruct the
+/// hybrid inner AAD; if the outer is absent (Classical or stripped), reconstruct
+/// the bare base AAD. Consequently a Hybrid-signed inner whose outer layer has
+/// been STRIPPED (outer = null) fails the inner EdDSA *signature* check (AAD
+/// mismatch) — signature-level non-separability — independent of `require_pq`.
 pub fn verify_composite(
     cose_composite_bytes: &[u8],
     expected_ed_vk: &ed25519_dalek::VerifyingKey,
@@ -348,6 +462,13 @@ pub fn verify_composite(
     require_pq: bool,
 ) -> Result<CompositeVerified> {
     let (inner_bytes, outer_bytes) = decode_composite(cose_composite_bytes)?;
+
+    // The composite is self-describing: an outer ML-DSA layer means the inner was
+    // produced in Hybrid mode (hybrid-alg-id bound into its AAD). Reconstruct the
+    // inner AAD accordingly. A stripped Hybrid composite (outer=null) therefore
+    // reconstructs the *bare* AAD and FAILS the inner signature check below.
+    let inner_hybrid = outer_bytes.is_some();
+    let inner_aad = layer_aad(external_aad, inner_hybrid);
 
     // --- Inner EdDSA layer (always required) ---
     let inner = CoseSign1::from_slice(&inner_bytes)
@@ -362,7 +483,7 @@ pub fn verify_composite(
         bail!("inner EdDSA COSE_Sign1 kid does not match anchored EdDSA key");
     }
     inner
-        .verify_detached_signature(payload, external_aad, |sig, tbs| {
+        .verify_detached_signature(payload, &inner_aad, |sig, tbs| {
             ed_verify(expected_ed_vk, tbs, sig)
         })
         .context("inner EdDSA signature verification failed")?;
@@ -395,8 +516,11 @@ pub fn verify_composite(
                 bail!("outer ML-DSA-65 COSE_Sign1 kid does not match anchored PQ key (self-cert rejected)");
             }
             let outer_pl = outer_payload(payload, &inner_sig);
+            // The outer layer only exists in Hybrid mode, so it always binds the
+            // hybrid-composite alg-id into its external_aad (#278).
+            let outer_aad = build_hybrid_external_aad(external_aad);
             outer
-                .verify_detached_signature(&outer_pl, external_aad, |sig, tbs| {
+                .verify_detached_signature(&outer_pl, &outer_aad, |sig, tbs| {
                     ml_dsa_verify(pq_vk, tbs, sig)
                 })
                 .context("outer ML-DSA-65 signature verification failed")?;
@@ -580,5 +704,115 @@ mod tests {
         let cose = sign_composite(&ed, Some(&pq_sk), payload, &aad()).unwrap();
         let res = verify_composite(&cose, &ed.verifying_key(), None, payload, &aad(), true);
         assert!(res.is_err(), "Hybrid policy requires an anchored PQ key");
+    }
+
+    // ── #278: hybrid-composite alg-id binding (signature-level non-separability) ──
+
+    /// The hybrid AAD must differ from the bare base AAD and embed the alg-id.
+    #[test]
+    fn hybrid_external_aad_binds_alg_id_and_differs() {
+        let base = aad();
+        let hybrid = build_hybrid_external_aad(&base);
+        assert_ne!(hybrid, base, "hybrid AAD must differ from the bare base AAD");
+        // Determinism.
+        assert_eq!(hybrid, build_hybrid_external_aad(&base));
+        // The composite alg-id bytes appear in the encoded hybrid AAD.
+        let needle = HYBRID_COMPOSITE_ALG_ID;
+        assert!(
+            hybrid.windows(needle.len()).any(|w| w == needle),
+            "hybrid AAD must embed HYBRID_COMPOSITE_ALG_ID"
+        );
+    }
+
+    /// The inner EdDSA TBS / signature bytes in Hybrid mode must be byte-distinct
+    /// from Classical mode over the same payload + base AAD.
+    #[test]
+    fn inner_eddsa_bytes_hybrid_distinct_from_classical() {
+        let ed = SigningKey::generate(&mut OsRng);
+        let payload = b"distinctness";
+        let kid = ed.verifying_key().to_bytes().to_vec();
+
+        // TBS bytes differ by mode.
+        let tbs_classical = inner_tbs(kid.clone(), payload, &aad(), false);
+        let tbs_hybrid = inner_tbs(kid, payload, &aad(), true);
+        assert_ne!(
+            tbs_classical, tbs_hybrid,
+            "inner EdDSA TBS in Hybrid mode must differ from Classical mode"
+        );
+
+        // Signature bytes differ by mode (Ed25519 is deterministic, so equal TBS
+        // would yield equal sigs; distinct TBS yields distinct sigs).
+        let (pq_sk, _pq_vk) = ml_dsa_generate_keypair();
+        let classical = sign_composite(&ed, None, payload, &aad()).unwrap();
+        let hybrid = sign_composite(&ed, Some(&pq_sk), payload, &aad()).unwrap();
+        let (inner_c, _) = decode_composite(&classical).unwrap();
+        let (inner_h, _) = decode_composite(&hybrid).unwrap();
+        let sig_c = CoseSign1::from_slice(&inner_c).unwrap().signature;
+        let sig_h = CoseSign1::from_slice(&inner_h).unwrap().signature;
+        assert_ne!(
+            sig_c, sig_h,
+            "inner EdDSA signature bytes must differ between Hybrid and Classical"
+        );
+    }
+
+    /// SIGNATURE-LEVEL non-separability: a Hybrid-signed composite with the outer
+    /// ML-DSA layer stripped must FAIL standalone-Classical verification at the
+    /// *signature* level (not merely the require_pq policy check).
+    #[test]
+    fn stripped_hybrid_inner_fails_classical_signature_verification() {
+        let ed = SigningKey::generate(&mut OsRng);
+        let (pq_sk, _pq_vk) = ml_dsa_generate_keypair();
+        let payload = b"strip and downgrade";
+        let cose = sign_composite(&ed, Some(&pq_sk), payload, &aad()).unwrap();
+
+        // Strip the outer layer → outer = null.
+        let (inner, _outer) = decode_composite(&cose).unwrap();
+        let stripped = encode_composite(inner, None).unwrap();
+
+        // Classical verifier (require_pq=false, no PQ anchor): would have ACCEPTED
+        // the inner EdDSA before #278. Now the inner was bound to the hybrid-alg-id,
+        // so reconstructing the bare base AAD fails the signature check.
+        let res = verify_composite(&stripped, &ed.verifying_key(), None, payload, &aad(), false);
+        assert!(
+            res.is_err(),
+            "stripped Hybrid inner must fail standalone Classical signature verification"
+        );
+        let msg = format!("{:#}", res.unwrap_err());
+        assert!(
+            msg.contains("inner EdDSA signature verification failed"),
+            "failure must be at the signature level, got: {msg}"
+        );
+    }
+
+    /// Regression guard: a genuine Classical-signed inner still verifies under a
+    /// Classical verifier (no hybrid-alg-id involved on either side).
+    #[test]
+    fn classical_roundtrip_unchanged_after_278() {
+        let ed = SigningKey::generate(&mut OsRng);
+        let payload = b"classical unchanged";
+        let cose = sign_composite(&ed, None, payload, &aad()).unwrap();
+        let res = verify_composite(&cose, &ed.verifying_key(), None, payload, &aad(), false).unwrap();
+        assert!(res.eddsa);
+        assert!(!res.ml_dsa);
+    }
+
+    /// A genuine Classical inner is NOT mistaken for a Hybrid one: verifying a
+    /// Classical composite with the hybrid AAD reconstruction would fail, but the
+    /// verifier keys the inner AAD off outer-presence, so the normal Classical
+    /// path succeeds (covered above) while a hybrid-AAD reconstruction is rejected.
+    #[test]
+    fn classical_inner_not_accepted_under_hybrid_aad() {
+        let ed = SigningKey::generate(&mut OsRng);
+        let payload = b"no false hybrid";
+        let cose = sign_composite(&ed, None, payload, &aad()).unwrap();
+        // Decode the classical inner and re-verify it directly against the HYBRID
+        // AAD to prove the two TBS inputs are genuinely separated.
+        let (inner, _) = decode_composite(&cose).unwrap();
+        let inner_cose = CoseSign1::from_slice(&inner).unwrap();
+        let hybrid_aad = build_hybrid_external_aad(&aad());
+        let res = inner_cose.verify_detached_signature(payload, &hybrid_aad, |sig, tbs| {
+            ed_verify(&ed.verifying_key(), tbs, sig)
+        });
+        assert!(res.is_err(), "classical inner must not verify under the hybrid AAD");
     }
 }
