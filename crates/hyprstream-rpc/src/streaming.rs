@@ -947,10 +947,12 @@ mod tests {
         bytes
     }
 
-    /// #161: a StreamRegister built with a PQ key is a Hybrid (SNS) composite
-    /// that verifies under the global Hybrid policy when the signer's ML-DSA
-    /// key is anchored in the PQ trust store — and fail-closes when it isn't,
-    /// exactly mirroring the RPC plane (no silent Classical downgrade).
+    /// #161 / WNS: a StreamRegister built with a PQ key is a Hybrid composite
+    /// that ENFORCES the anchored ML-DSA outer when the signer's key is anchored
+    /// in the PQ trust store, and falls back to the inner EdDSA (classical floor)
+    /// when it isn't — per-identity, exactly mirroring the RPC plane. The
+    /// unanchored fallback is no weaker than `verify_any_signer` (Classical),
+    /// which already verifies the self-asserted `cnf`'s EdDSA without a pin.
     #[test]
     fn stream_register_hybrid_verifies_only_when_pq_anchored() -> anyhow::Result<()> {
         use crate::crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_from_bytes};
@@ -995,14 +997,29 @@ mod tests {
             "anchored Hybrid register must verify"
         );
 
-        // Not anchored: empty store under Hybrid fails closed.
+        // Not anchored: empty store under Hybrid falls back to the inner EdDSA
+        // classical floor (WNS per-identity) rather than failing closed. PQ is
+        // never trusted from the self-asserted COSE entry, so this is no weaker
+        // than the pre-existing classical `verify_any_signer` path.
         let empty = KeyedPqTrustStore::new();
         let nonce_empty = InMemoryNonceCache::new();
         assert!(
             signed
                 .verify_any_signer_with(&nonce_empty, Some(&empty), CryptoPolicy::Hybrid)
+                .is_ok(),
+            "unanchored Hybrid register must verify via classical inner-EdDSA fallback"
+        );
+
+        // But a tampered/forged inner EdDSA on an unanchored signer is still
+        // rejected — the classical floor is a real signature check, not a bypass.
+        let mut forged = signed.clone();
+        forged.cnf = SigningKey::from_bytes(&[9u8; 32]).verifying_key().to_bytes();
+        let nonce_forged = InMemoryNonceCache::new();
+        assert!(
+            forged
+                .verify_any_signer_with(&nonce_forged, Some(&empty), CryptoPolicy::Hybrid)
                 .is_err(),
-            "unanchored Hybrid register must fail closed (no Classical downgrade)"
+            "swapping cnf without a matching inner EdDSA must still be rejected"
         );
         Ok(())
     }

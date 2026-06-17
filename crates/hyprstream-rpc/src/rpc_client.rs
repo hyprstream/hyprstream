@@ -143,14 +143,17 @@ pub struct RpcClientImpl<S: Signer, T: Transport + 'static> {
     pub server_verifying_key: Option<VerifyingKey>,
     token_provider: Option<TokenProviderBox>,
     request_id: AtomicU64,
-    /// Response-verify policy (#275). Defaults to `Classical` — a Classical
-    /// verifier still accepts a Hybrid-signed response via its inner EdDSA
-    /// (skip-unknown interop), so the default never breaks RPC. Set to `Hybrid`
-    /// (with [`Self::with_response_pq_store`]) to REQUIRE the server's anchored
-    /// ML-DSA-65 layer and fail closed on a classical-only / stripped response.
-    response_verify_policy: crate::crypto::CryptoPolicy,
-    /// kid-anchored ML-DSA-65 trust store used to resolve the server's PQ key
-    /// for `ResponseEnvelope` verification. Required under the `Hybrid` policy.
+    /// Per-client response-verify policy override (#275/#277). `None` means "not
+    /// explicitly set" — in that case `unwrap_response` consults the process-
+    /// global response verify config ([`crate::envelope::global_response_verify_policy`]),
+    /// which is fail-closed `Hybrid` when the daemon installed it (or when
+    /// uninstalled in production). `Some(_)` pins the policy for this client,
+    /// bypassing the global default (advanced / tests).
+    response_verify_policy: Option<crate::crypto::CryptoPolicy>,
+    /// Per-client kid-anchored ML-DSA-65 trust store used to resolve the server's
+    /// PQ key for `ResponseEnvelope` verification (required under `Hybrid`). `None`
+    /// falls back to the process-global response store
+    /// ([`crate::envelope::global_response_pq_store`]).
     response_pq_store: Option<std::sync::Arc<dyn crate::envelope::PqTrustStore>>,
 }
 
@@ -166,7 +169,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             server_verifying_key,
             token_provider: None,
             request_id: AtomicU64::new(1),
-            response_verify_policy: crate::crypto::CryptoPolicy::Classical,
+            response_verify_policy: None,
             response_pq_store: None,
         }
     }
@@ -181,14 +184,16 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         pq_store: std::sync::Arc<dyn crate::envelope::PqTrustStore>,
     ) -> Self {
         self.response_pq_store = Some(pq_store);
-        self.response_verify_policy = crate::crypto::CryptoPolicy::Hybrid;
+        self.response_verify_policy = Some(crate::crypto::CryptoPolicy::Hybrid);
         self
     }
 
     /// Set the response-verify policy explicitly (advanced). Under `Hybrid` a
     /// PQ trust store MUST also be set via [`Self::with_response_pq_store`].
+    /// Setting this pins the policy for this client and bypasses the process-
+    /// global response default consulted by [`Self::unwrap_response`].
     pub fn with_response_verify_policy(mut self, policy: crate::crypto::CryptoPolicy) -> Self {
-        self.response_verify_policy = policy;
+        self.response_verify_policy = Some(policy);
         self
     }
 
@@ -289,16 +294,54 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         self.request_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Unwrap + verify a `ResponseEnvelope` under the client's configured
-    /// response-verify policy + PQ trust store (#275). Under the default
-    /// `Classical` policy this verifies the inner EdDSA only; under `Hybrid` it
-    /// requires the server's kid-anchored ML-DSA-65 layer (fail-closed).
+    /// Unwrap + verify a `ResponseEnvelope` (#275/#277).
+    ///
+    /// Resolves the effective response-verify policy and PQ trust store: a
+    /// per-client override (set via [`Self::with_response_pq_store`] /
+    /// [`Self::with_response_verify_policy`]) wins; otherwise the process-global
+    /// response default ([`envelope::global_response_verify_policy`] +
+    /// [`envelope::global_response_pq_store`]) is consulted. That global default
+    /// is fail-closed `Hybrid` in production — symmetric to the request-side
+    /// `global_verify_policy` — so a classical-only / stripped response is
+    /// rejected by default unless an operator opted into the `classical` escape
+    /// hatch. Under `Hybrid` the server's kid-anchored ML-DSA-65 layer is
+    /// required (no silent downgrade).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn unwrap_response(&self, response_bytes: &[u8]) -> Result<(u64, Vec<u8>)> {
+        let policy = self
+            .response_verify_policy
+            .unwrap_or_else(envelope::global_response_verify_policy);
+        // Prefer the per-client store; else the process-global one. Hold the Arc
+        // so the borrow passed to `unwrap_response_with` outlives the call.
+        let global_store = if self.response_pq_store.is_none() {
+            envelope::global_response_pq_store()
+        } else {
+            None
+        };
+        let store: Option<&dyn envelope::PqTrustStore> = self
+            .response_pq_store
+            .as_deref()
+            .or(global_store.as_deref());
+        envelope::unwrap_response_with(
+            response_bytes,
+            self.server_verifying_key.as_ref(),
+            store,
+            policy,
+        )
+    }
+
+    /// WASM response unwrap (#277 scope boundary): no process-global response
+    /// config exists on wasm, so this keeps the per-client behavior. The wasm
+    /// verify policy is owned by #158 (`wasm_api.rs`) and is intentionally NOT
+    /// changed here.
+    #[cfg(target_arch = "wasm32")]
     fn unwrap_response(&self, response_bytes: &[u8]) -> Result<(u64, Vec<u8>)> {
         envelope::unwrap_response_with(
             response_bytes,
             self.server_verifying_key.as_ref(),
             self.response_pq_store.as_deref(),
-            self.response_verify_policy,
+            self.response_verify_policy
+                .unwrap_or(crate::crypto::CryptoPolicy::Classical),
         )
     }
 

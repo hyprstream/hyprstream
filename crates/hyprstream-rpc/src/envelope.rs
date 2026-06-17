@@ -894,6 +894,117 @@ pub fn apply_global_verify_config<'a>(
     opts
 }
 
+/// Name of the mid-rollout escape-hatch env var shared by the request and
+/// response verify paths. Setting it to `classical` downgrades BOTH directions
+/// (operators staging the PQ rollout before peer ML-DSA bindings are
+/// provisioned). Any other value (or unset) means Hybrid.
+pub const ENVELOPE_POLICY_ENV: &str = "HYPRSTREAM_ENVELOPE_POLICY";
+
+/// Parse [`ENVELOPE_POLICY_ENV`] into a [`CryptoPolicy`]. Single source of truth
+/// for the escape hatch so the request side (`install_verify_config` in
+/// `main.rs`) and the response side share identical semantics. Defaults to
+/// fail-closed [`CryptoPolicy::Hybrid`]; only the literal `classical` downgrades.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn envelope_policy_from_env() -> crate::crypto::CryptoPolicy {
+    match std::env::var(ENVELOPE_POLICY_ENV).ok().as_deref() {
+        Some("classical") => crate::crypto::CryptoPolicy::Classical,
+        Some("hybrid") | None => crate::crypto::CryptoPolicy::Hybrid,
+        Some(other) => {
+            tracing::warn!("unknown {ENVELOPE_POLICY_ENV}={other:?}, defaulting to Hybrid");
+            crate::crypto::CryptoPolicy::Hybrid
+        }
+    }
+}
+
+// ============================================================================
+// Process-global RESPONSE-envelope verify configuration (#277).
+//
+// Symmetric to the request-side `EnvelopeVerifyConfig`/`global_verify_policy`
+// above, but for the client-side `ResponseEnvelope` verify path. The daemon /
+// native RPC client construction installs this at startup with `Hybrid` + the
+// admin-anchored mesh PQ trust store (#157), so server-asserted `StreamInfo`
+// (dhPublic anchoring + QoS contract) is PQ-attested in production. When
+// uninstalled, the default is fail-closed `Hybrid` (mirroring the request side):
+// a classical-only / stripped response is rejected rather than silently
+// accepted.
+//
+// This REUSES the same `CryptoPolicy`, `PqTrustStore`, and `KeyedPqTrustStore`
+// machinery as the request side — it is a second arm of the same system, not a
+// parallel one.
+// ============================================================================
+
+/// Process-wide RESPONSE-envelope verify configuration consulted by clients that
+/// did not explicitly set a per-client response policy / PQ store (#277).
+pub struct ResponseVerifyConfig {
+    pub policy: crate::crypto::CryptoPolicy,
+    pub pq_store: Option<std::sync::Arc<dyn PqTrustStore>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+static RESPONSE_VERIFY_CONFIG: std::sync::OnceLock<ResponseVerifyConfig> = std::sync::OnceLock::new();
+
+/// Install the process-global RESPONSE verify configuration. First write wins.
+///
+/// Returns `Err` if a configuration was already installed.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn install_response_verify_config(config: ResponseVerifyConfig) -> Result<()> {
+    RESPONSE_VERIFY_CONFIG
+        .set(config)
+        .map_err(|_| anyhow!("response verify config already installed"))
+}
+
+/// Whether a process-global RESPONSE verify configuration has been installed.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn response_verify_config_installed() -> bool {
+    RESPONSE_VERIFY_CONFIG.get().is_some()
+}
+
+/// The enforced RESPONSE-verify policy (consulted when a client did not set one).
+///
+/// When a config has been installed, its policy is returned verbatim.
+///
+/// When **uninstalled**, the default is **fail-closed**, symmetric to the
+/// request side ([`global_verify_policy`]): production builds default to
+/// [`CryptoPolicy::Hybrid`] so a client that reaches the response-verify path
+/// before `install_response_verify_config` rejects classical-only responses
+/// rather than silently accepting EdDSA-only ones (#277). The escape hatch
+/// ([`ENVELOPE_POLICY_ENV`]`=classical`) is honored even in the uninstalled
+/// path so the response side downgrades in parity with the request side.
+///
+/// Under `cfg(test)` the uninstalled default stays `Classical`: in-process unit
+/// tests share one `OnceLock` and rely on explicit per-call policy overrides.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn global_response_verify_policy() -> crate::crypto::CryptoPolicy {
+    if let Some(c) = RESPONSE_VERIFY_CONFIG.get() {
+        return c.policy;
+    }
+    #[cfg(test)]
+    {
+        crate::crypto::CryptoPolicy::Classical
+    }
+    #[cfg(not(test))]
+    {
+        // Honor the escape hatch even before install (parity with request side
+        // staging) but otherwise fail closed.
+        let policy = envelope_policy_from_env();
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "response verify config not installed; defaulting to fail-closed \
+                 {policy:?} policy. Production code MUST call \
+                 install_response_verify_config() at startup."
+            );
+        });
+        policy
+    }
+}
+
+/// The installed RESPONSE-side kid-anchored PQ trust store, if any.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn global_response_pq_store() -> Option<std::sync::Arc<dyn PqTrustStore>> {
+    RESPONSE_VERIFY_CONFIG.get().and_then(|c| c.pq_store.clone())
+}
+
 /// Replay protection cache interface.
 ///
 /// Implementations should maintain a cache of recently seen nonces
@@ -1256,10 +1367,12 @@ impl SignedEnvelope {
     ///   the envelope's EdDSA signer (`cnf`). The COSE ML-DSA-65 entry must
     ///   verify against this key and its kid must match (kid-anchoring) —
     ///   fixing the self-certification weakness.
-    /// - `verify_policy`: `Hybrid` REQUIRES a valid ML-DSA-65 entry anchored to
-    ///   the trust store (rejects classical-only and self-asserted PQ keys);
-    ///   `Classical` verifies only EdDSA and SKIPS any PQ entry (RFC 7517
-    ///   skip-unknown interop).
+    /// - `verify_policy`: `Hybrid` is Weakly Non-Separable (per-identity): for a
+    ///   signer with an anchored ML-DSA-65 key it ENFORCES the outer layer
+    ///   (rejecting stripped-outer, forged, and self-asserted PQ keys); for an
+    ///   unanchored signer it falls back to verifying the inner EdDSA (classical
+    ///   floor) rather than failing closed. `Classical` verifies only EdDSA and
+    ///   SKIPS any PQ entry (RFC 7517 skip-unknown interop).
     pub fn verify_with(
         &self,
         expected_pubkey: &VerifyingKey,
@@ -1370,14 +1483,22 @@ impl SignedEnvelope {
         // kid-anchor: resolve the trusted ML-DSA-65 key for this EdDSA identity.
         let anchored_pq = pq_store.and_then(|s| s.ml_dsa_key_for(&self.cnf));
 
-        // Hybrid enforcement requires an anchored PQ key; without one we cannot
-        // safely require PQ (resolving from the self-asserted COSE entry would
-        // reintroduce the self-cert weakness). Treat as a policy error.
-        let require_pq = verify_policy.uses_pq();
-        if require_pq && anchored_pq.is_none() {
-            return Err(EnvelopeError::PqSignatureInvalid(
-                "Hybrid policy requires a kid-anchored ML-DSA-65 key, none resolved".to_owned(),
-            ));
+        // WNS posture (draft-ietf-pquip-hybrid-signature-spectrums): the composite is
+        // Weakly Non-Separable — the inner EdDSA is independently verifiable, so PQ
+        // enforcement is applied PER-IDENTITY. Require the ML-DSA-65 outer ONLY for a
+        // signer whose PQ key we have anchored out-of-band; for an unanchored signer,
+        // fall back to the inner EdDSA (classical floor) rather than failing closed.
+        // Safe because ed_vk is derived from this same `cnf` (the PQ-lookup identity ==
+        // the EdDSA-verified identity), so an anchored identity cannot be downgraded by
+        // spoofing cnf, while an unanchored one is no weaker than classical. PQ is NEVER
+        // resolved from the self-asserted COSE entry (that is the self-cert weakness).
+        let require_pq = verify_policy.uses_pq() && anchored_pq.is_some();
+        #[cfg(not(target_arch = "wasm32"))]
+        if verify_policy.uses_pq() && anchored_pq.is_none() {
+            tracing::debug!(
+                "Hybrid policy active but signer has no anchored ML-DSA-65 key; \
+                 verifying classical inner EdDSA (WNS backwards-compat)"
+            );
         }
 
         crate::crypto::cose_sign::verify_composite(
@@ -1831,14 +1952,16 @@ impl ResponseEnvelope {
 
     /// Verify with an explicit kid-anchored PQ trust store and verify policy.
     ///
-    /// Mirrors [`SignedEnvelope::verify_with`]'s fail-closed SNS semantics:
+    /// Mirrors [`SignedEnvelope::verify_with`]'s WNS per-identity semantics:
     /// - `pq_store`: when `Some`, resolves the trust-anchored ML-DSA-65 key for
     ///   the response's EdDSA signer (`cnf`); the outer COSE entry must verify
     ///   against it and its kid must match (kid-anchoring).
-    /// - `verify_policy = Hybrid` REQUIRES a valid ML-DSA-65 entry anchored to
-    ///   the trust store — rejecting classical-only, stripped-outer, self-cert,
-    ///   and missing-anchor responses (NO silent downgrade). `Classical`
-    ///   verifies only the inner EdDSA and skips any PQ entry.
+    /// - `verify_policy = Hybrid` is Weakly Non-Separable (per-identity): for a
+    ///   signer with an anchored ML-DSA-65 key it ENFORCES the outer layer — a
+    ///   stripped/forged/self-cert outer on an ANCHORED identity is rejected; for
+    ///   an unanchored signer it falls back to verifying the inner EdDSA
+    ///   (classical floor) rather than failing closed. `Classical` verifies only
+    ///   the inner EdDSA and skips any PQ entry.
     pub fn verify_with(
         &self,
         expected_pubkey: Option<&VerifyingKey>,
@@ -1874,12 +1997,21 @@ impl ResponseEnvelope {
         // kid-anchor: resolve the trusted ML-DSA-65 key for this EdDSA identity.
         let anchored_pq = pq_store.and_then(|s| s.ml_dsa_key_for(&self.cnf));
 
-        // Hybrid enforcement requires an anchored PQ key; without one we cannot
-        // safely require PQ (fail-closed).
-        let require_pq = verify_policy.uses_pq();
-        if require_pq && anchored_pq.is_none() {
-            anyhow::bail!(
-                "Hybrid policy requires a kid-anchored ML-DSA-65 key, none resolved"
+        // WNS posture (draft-ietf-pquip-hybrid-signature-spectrums): the composite is
+        // Weakly Non-Separable — the inner EdDSA is independently verifiable, so PQ
+        // enforcement is applied PER-IDENTITY. Require the ML-DSA-65 outer ONLY for a
+        // signer whose PQ key we have anchored out-of-band; for an unanchored signer,
+        // fall back to the inner EdDSA (classical floor) rather than failing closed.
+        // Safe because ed_vk is derived from this same `cnf` (the PQ-lookup identity ==
+        // the EdDSA-verified identity), so an anchored identity cannot be downgraded by
+        // spoofing cnf, while an unanchored one is no weaker than classical. PQ is NEVER
+        // resolved from the self-asserted COSE entry (that is the self-cert weakness).
+        let require_pq = verify_policy.uses_pq() && anchored_pq.is_some();
+        #[cfg(not(target_arch = "wasm32"))]
+        if verify_policy.uses_pq() && anchored_pq.is_none() {
+            tracing::debug!(
+                "Hybrid policy active but signer has no anchored ML-DSA-65 key; \
+                 verifying classical inner EdDSA (WNS backwards-compat)"
             );
         }
 
@@ -2045,9 +2177,11 @@ pub fn unwrap_response(
 /// Unwrap and verify a ResponseEnvelope under an explicit kid-anchored PQ trust
 /// store + verify policy (#275).
 ///
-/// Enforces the COSE composite with the SAME fail-closed SNS semantics as
-/// [`unwrap_and_verify`]: under `Hybrid`, a stripped-outer, classical-only,
-/// self-cert, or unanchored response is REJECTED (no silent downgrade).
+/// Enforces the COSE composite with the SAME WNS per-identity semantics as
+/// [`unwrap_and_verify`]: under `Hybrid`, an anchored signer must use its
+/// ML-DSA-65 key (a stripped-outer, classical-only, self-cert, or forged outer
+/// on an ANCHORED identity is REJECTED), while an unanchored signer falls back
+/// to the inner EdDSA (classical floor) rather than failing closed.
 pub fn unwrap_response_with(
     response: &[u8],
     expected_pubkey: Option<&VerifyingKey>,
@@ -2071,12 +2205,17 @@ pub fn unwrap_response_with(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::crypto::signing::generate_signing_keypair;
     use parking_lot::Mutex;
     use std::collections::HashSet;
+
+    /// Serializes tests that mutate the shared `HYPRSTREAM_ENVELOPE_POLICY` env
+    /// var so they don't race under parallel `cargo test`.
+    #[cfg(not(target_arch = "wasm32"))]
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// Simple in-memory nonce cache for testing.
     struct TestNonceCache {
@@ -2624,17 +2763,22 @@ mod tests {
         Ok(())
     }
 
-    /// cross_classical_signer_hybrid_verifier: a Classical-signed item under a
-    /// Hybrid verifier — the policy knob. Hybrid REQUIRES PQ → rejected.
+    /// cross_classical_signer_hybrid_verifier: a Classical-signed item from an
+    /// ANCHORED signer under a Hybrid verifier — WNS enforces the outer layer for
+    /// anchored identities, so a classical-only (no outer) envelope is rejected.
     #[test]
     fn m3_cross_classical_signer_hybrid_verifier_rejected() {
         let (sk, vk) = generate_signing_keypair();
         let (_pq_sk, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
         let cache = TestNonceCache::new();
         let signed = SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![1]), &sk);
+        // Signer's PQ key IS anchored → Hybrid must require its outer ML-DSA layer.
         let store = pq_store_for(vk.to_bytes(), &pq_vk);
         let res = signed.verify_with(&vk, &cache, Some(&store), CryptoPolicy::Hybrid);
-        assert!(res.is_err(), "Hybrid policy must reject a classical-only envelope");
+        assert!(
+            res.is_err(),
+            "Hybrid policy must reject a classical-only envelope from an anchored signer"
+        );
     }
 
     /// Classical signer accepted by a verifier whose policy permits classical.
@@ -2669,10 +2813,12 @@ mod tests {
         );
     }
 
-    /// Hybrid policy with NO anchored key must fail closed (cannot trust a
-    /// self-asserted PQ key — this is the core of the self-cert fix).
+    /// Hybrid policy with NO anchored key falls back to the classical inner
+    /// EdDSA floor (WNS per-identity): an unanchored signer is verified via its
+    /// EdDSA component rather than failing closed. PQ is never trusted from the
+    /// self-asserted COSE entry, so this is no weaker than classical.
     #[test]
-    fn m3_hybrid_policy_without_anchor_rejected() {
+    fn m3_hybrid_policy_without_anchor_classical_fallback() -> crate::EnvelopeResult<()> {
         let (sk, vk) = generate_signing_keypair();
         let (pq_sk, _pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
         let cache = TestNonceCache::new();
@@ -2681,8 +2827,9 @@ mod tests {
             &sk,
             &pq_sk,
         );
-        let res = signed.verify_with(&vk, &cache, None, CryptoPolicy::Hybrid);
-        assert!(res.is_err(), "Hybrid policy requires a kid-anchored PQ key");
+        // Empty store (no anchor) + Hybrid policy → classical inner-EdDSA fallback.
+        signed.verify_with(&vk, &cache, None, CryptoPolicy::Hybrid)?;
+        Ok(())
     }
 
     // -- SNS-specific: strip the outer ML-DSA layer at the cose level and prove
@@ -2830,6 +2977,105 @@ mod tests {
         Ok(())
     }
 
+    // =========================================================================
+    // #277: process-global RESPONSE verify config — fail-closed Hybrid default,
+    // anchored-key enforcement, and the shared `classical` escape hatch.
+    // =========================================================================
+
+    /// The escape-hatch parser is the single source of truth shared by the
+    /// request and response sides: unset / `hybrid` => fail-closed Hybrid, the
+    /// literal `classical` => downgrade, junk => Hybrid (fail-safe).
+    ///
+    /// `#[cfg(not(target_arch = "wasm32"))]` because `envelope_policy_from_env`
+    /// is native-only (it reads a process env var). Serialized via a mutex with
+    /// the other env-mutating test so they don't race on the shared env var.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn resp_escape_hatch_env_parse_parity() {
+        let _guard = ENV_TEST_LOCK.lock();
+        // SAFETY: single-threaded section guarded by ENV_TEST_LOCK.
+        unsafe { std::env::remove_var(ENVELOPE_POLICY_ENV) };
+        assert_eq!(envelope_policy_from_env(), CryptoPolicy::Hybrid, "default must be Hybrid");
+        unsafe { std::env::set_var(ENVELOPE_POLICY_ENV, "hybrid") };
+        assert_eq!(envelope_policy_from_env(), CryptoPolicy::Hybrid);
+        unsafe { std::env::set_var(ENVELOPE_POLICY_ENV, "classical") };
+        assert_eq!(
+            envelope_policy_from_env(),
+            CryptoPolicy::Classical,
+            "the escape hatch must downgrade the response side in parity with the request side"
+        );
+        unsafe { std::env::set_var(ENVELOPE_POLICY_ENV, "bogus") };
+        assert_eq!(envelope_policy_from_env(), CryptoPolicy::Hybrid, "junk must fail-safe to Hybrid");
+        unsafe { std::env::remove_var(ENVELOPE_POLICY_ENV) };
+    }
+
+    /// Process-global RESPONSE verify config drives per-identity enforcement
+    /// (#277, WNS posture): once a Hybrid config + admin-anchored
+    /// `KeyedPqTrustStore` is installed, a Hybrid response whose server ML-DSA key
+    /// IS anchored verifies with the outer enforced; an UNanchored signer falls
+    /// back to its inner EdDSA (classical floor); but an ANCHORED signer that
+    /// sends a classical-only response is rejected (it must use its PQ key — no
+    /// downgrade for anchored identities). This is the install/consult path native
+    /// RPC clients fall back to when no per-client store was set. Single OnceLock
+    /// install per test binary, so this is the one test that installs the config.
+    #[test]
+    fn resp_global_config_anchored_enforced_unanchored_falls_back() -> anyhow::Result<()> {
+        // Anchored signer.
+        let (sk, vk) = generate_signing_keypair();
+        let (pq_sk, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        // A different signer whose ML-DSA key is NOT bound in the store.
+        let (sk2, vk2) = generate_signing_keypair();
+        let (pq_sk2, _pq_vk2) = crate::crypto::pq::ml_dsa_generate_keypair();
+
+        // Admin-anchored store (#157 reuse): only the first signer's key is bound.
+        let mut keyed = KeyedPqTrustStore::new();
+        keyed.bind(vk.to_bytes(), &pq_vk);
+        install_response_verify_config(ResponseVerifyConfig {
+            policy: CryptoPolicy::Hybrid,
+            pq_store: Some(std::sync::Arc::new(keyed)),
+        })
+        .expect("install response verify config once");
+
+        assert_eq!(global_response_verify_policy(), CryptoPolicy::Hybrid);
+        let store = global_response_pq_store().expect("global response store installed");
+
+        // Anchored Hybrid response verifies under the global config.
+        let resp = ResponseEnvelope::new_signed_hybrid(11, vec![7, 7], &sk, &pq_sk);
+        let wire = response_to_wire(&resp);
+        let (rid, payload) =
+            unwrap_response_with(&wire, Some(&vk), Some(store.as_ref()), global_response_verify_policy())?;
+        assert_eq!(rid, 11);
+        assert_eq!(payload, vec![7, 7]);
+
+        // Unanchored signer's Hybrid response falls back to its inner EdDSA
+        // (classical floor) under the WNS posture — no anchored ML-DSA key, so PQ
+        // is not enforced for this identity, but the response still verifies.
+        let resp2 = ResponseEnvelope::new_signed_hybrid(12, vec![8, 8], &sk2, &pq_sk2);
+        let wire2 = response_to_wire(&resp2);
+        let (rid2, payload2) = unwrap_response_with(
+            &wire2,
+            Some(&vk2),
+            Some(store.as_ref()),
+            global_response_verify_policy(),
+        )?;
+        assert_eq!(rid2, 12);
+        assert_eq!(payload2, vec![8, 8]);
+
+        // A Classical-only (inner-EdDSA-only) response from the ANCHORED signer is
+        // rejected: an anchored identity must use its PQ key (the outer is enforced
+        // per-identity), so a stripped/absent outer on an anchored signer downgrades.
+        let resp_classical = ResponseEnvelope::new_signed(13, vec![9], &sk);
+        let wire3 = response_to_wire(&resp_classical);
+        let res3 = unwrap_response_with(
+            &wire3,
+            Some(&vk),
+            Some(store.as_ref()),
+            global_response_verify_policy(),
+        );
+        assert!(res3.is_err(), "classical-only response from an anchored signer must be rejected");
+        Ok(())
+    }
+
     /// A Hybrid-signed response verifies under a Classical verifier via its
     /// inner EdDSA (skip-unknown interop) — the default-policy interop path.
     #[test]
@@ -2901,14 +3147,17 @@ mod tests {
         assert!(res.is_err(), "wrong anchored PQ key must be rejected (self-cert fix)");
     }
 
-    /// Hybrid policy with NO anchored key fails closed (no self-asserted PQ key).
+    /// Hybrid policy with NO anchored key falls back to the inner EdDSA classical
+    /// floor (WNS per-identity): an unanchored response signer verifies via its
+    /// EdDSA component rather than failing closed. PQ is never trusted from the
+    /// self-asserted COSE entry, so this is no weaker than classical.
     #[test]
-    fn resp_hybrid_without_anchor_rejected() {
+    fn resp_hybrid_without_anchor_classical_fallback() -> anyhow::Result<()> {
         let (sk, vk) = generate_signing_keypair();
         let (pq_sk, _pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
         let resp = ResponseEnvelope::new_signed_hybrid(6, vec![6], &sk, &pq_sk);
-        let res = resp.verify_with(Some(&vk), None, CryptoPolicy::Hybrid);
-        assert!(res.is_err(), "Hybrid policy requires a kid-anchored PQ key");
+        resp.verify_with(Some(&vk), None, CryptoPolicy::Hybrid)?;
+        Ok(())
     }
 
     /// classical-signed response under Hybrid policy → rejected (no downgrade).
@@ -2920,6 +3169,128 @@ mod tests {
         let store = pq_store_for(vk.to_bytes(), &pq_vk);
         let res = resp.verify_with(Some(&vk), Some(&store), CryptoPolicy::Hybrid);
         assert!(res.is_err(), "Hybrid policy must reject a classical-only response");
+    }
+
+    // =========================================================================
+    // WNS posture (draft-ietf-pquip-hybrid-signature-spectrums): per-identity PQ
+    // enforcement. Anchored identities cannot downgrade; unanchored identities
+    // fall back to the classical inner-EdDSA floor instead of failing closed.
+    // Covers BOTH SignedEnvelope and ResponseEnvelope paths.
+    // =========================================================================
+
+    /// WNS / SignedEnvelope (1) anchored downgrade rejected: anchor the signer's
+    /// correct ML-DSA key, strip the outer layer, verify under Hybrid → REJECTED.
+    #[test]
+    fn wns_signed_anchored_downgrade_rejected() {
+        let (sk, vk) = generate_signing_keypair();
+        let (pq_sk, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let cache = TestNonceCache::new();
+        let mut signed = SignedEnvelope::new_signed_hybrid(
+            RequestEnvelope::anonymous(vec![1, 2, 3]),
+            &sk,
+            &pq_sk,
+        );
+        let (inner, outer) =
+            crate::crypto::cose_sign::decode_composite_for_test(&signed.cose).expect("decode");
+        assert!(outer.is_some(), "hybrid envelope must carry an outer layer");
+        signed.cose =
+            crate::crypto::cose_sign::encode_composite_for_test(inner, None).expect("encode");
+        // Signer's PQ key IS anchored → the outer is enforced; stripping it fails.
+        let store = pq_store_for(vk.to_bytes(), &pq_vk);
+        let res = signed.verify_with(&vk, &cache, Some(&store), CryptoPolicy::Hybrid);
+        assert!(res.is_err(), "anchored identity must not be downgradable by stripping the outer");
+    }
+
+    /// WNS / SignedEnvelope (2) unanchored classical fallback: empty store, Hybrid
+    /// policy, Hybrid-signed envelope from an UNanchored signer → SUCCEEDS via the
+    /// inner EdDSA floor (the deploy-blocker fix).
+    #[test]
+    fn wns_signed_unanchored_classical_fallback() -> crate::EnvelopeResult<()> {
+        let (sk, vk) = generate_signing_keypair();
+        let (pq_sk, _pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let cache = TestNonceCache::new();
+        let signed = SignedEnvelope::new_signed_hybrid(
+            RequestEnvelope::anonymous(vec![4, 5, 6]),
+            &sk,
+            &pq_sk,
+        );
+        let empty = TestPqStore { bindings: vec![] };
+        signed.verify_with(&vk, &cache, Some(&empty), CryptoPolicy::Hybrid)?;
+        // Also with no store at all (None), mirroring an empty default deployment.
+        let cache2 = TestNonceCache::new();
+        signed.verify_with(&vk, &cache2, None, CryptoPolicy::Hybrid)?;
+        Ok(())
+    }
+
+    /// WNS / SignedEnvelope (3) anchored enforced: anchored signer + intact Hybrid
+    /// succeeds; anchored signer + classical-only (no outer) is rejected.
+    #[test]
+    fn wns_signed_anchored_enforced() {
+        let (sk, vk) = generate_signing_keypair();
+        let (pq_sk, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let store = pq_store_for(vk.to_bytes(), &pq_vk);
+
+        let cache = TestNonceCache::new();
+        let intact = SignedEnvelope::new_signed_hybrid(
+            RequestEnvelope::anonymous(vec![7]),
+            &sk,
+            &pq_sk,
+        );
+        intact
+            .verify_with(&vk, &cache, Some(&store), CryptoPolicy::Hybrid)
+            .expect("intact hybrid from an anchored signer must verify");
+
+        let cache2 = TestNonceCache::new();
+        let classical = SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![8]), &sk);
+        let res = classical.verify_with(&vk, &cache2, Some(&store), CryptoPolicy::Hybrid);
+        assert!(res.is_err(), "anchored signer must use its PQ key — classical-only is rejected");
+    }
+
+    /// WNS / ResponseEnvelope (1) anchored downgrade rejected.
+    #[test]
+    fn wns_response_anchored_downgrade_rejected() {
+        let (sk, vk) = generate_signing_keypair();
+        let (pq_sk, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let mut resp = ResponseEnvelope::new_signed_hybrid(20, vec![2, 0], &sk, &pq_sk);
+        let (inner, outer) =
+            crate::crypto::cose_sign::decode_composite_for_test(&resp.cose).expect("decode");
+        assert!(outer.is_some(), "hybrid response must carry an outer layer");
+        resp.cose =
+            crate::crypto::cose_sign::encode_composite_for_test(inner, None).expect("encode");
+        let store = pq_store_for(vk.to_bytes(), &pq_vk);
+        let res = resp.verify_with(Some(&vk), Some(&store), CryptoPolicy::Hybrid);
+        assert!(res.is_err(), "anchored response identity must not be downgradable");
+    }
+
+    /// WNS / ResponseEnvelope (2) unanchored classical fallback (mirrors the
+    /// SignedEnvelope case for the response path specifically).
+    #[test]
+    fn wns_response_unanchored_classical_fallback() -> anyhow::Result<()> {
+        let (sk, vk) = generate_signing_keypair();
+        let (pq_sk, _pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let resp = ResponseEnvelope::new_signed_hybrid(21, vec![2, 1], &sk, &pq_sk);
+        let empty = TestPqStore { bindings: vec![] };
+        resp.verify_with(Some(&vk), Some(&empty), CryptoPolicy::Hybrid)?;
+        // And with no store at all.
+        resp.verify_with(Some(&vk), None, CryptoPolicy::Hybrid)?;
+        Ok(())
+    }
+
+    /// WNS / ResponseEnvelope (3) anchored enforced.
+    #[test]
+    fn wns_response_anchored_enforced() {
+        let (sk, vk) = generate_signing_keypair();
+        let (pq_sk, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let store = pq_store_for(vk.to_bytes(), &pq_vk);
+
+        let intact = ResponseEnvelope::new_signed_hybrid(22, vec![2, 2], &sk, &pq_sk);
+        intact
+            .verify_with(Some(&vk), Some(&store), CryptoPolicy::Hybrid)
+            .expect("intact hybrid response from an anchored signer must verify");
+
+        let classical = ResponseEnvelope::new_signed(23, vec![2, 3], &sk);
+        let res = classical.verify_with(Some(&vk), Some(&store), CryptoPolicy::Hybrid);
+        assert!(res.is_err(), "anchored response signer must use its PQ key — classical-only rejected");
     }
 
     /// Wrong expected signer key → rejected.

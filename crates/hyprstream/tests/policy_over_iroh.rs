@@ -28,7 +28,7 @@ use hyprstream_core::config::TokenConfig;
 use hyprstream_core::services::PolicyService;
 use hyprstream_core::services::generated::policy_client::{PolicyCheck, PolicyClient};
 
-use hyprstream_rpc::envelope::{EnvelopeVerifyConfig, InMemoryNonceCache, install_verify_config};
+use hyprstream_rpc::envelope::{install_verify_config, EnvelopeVerifyConfig, InMemoryNonceCache};
 use hyprstream_rpc::crypto::CryptoPolicy;
 use hyprstream_rpc::rpc_client::RpcClientImpl;
 use hyprstream_rpc::signer::LocalSigner;

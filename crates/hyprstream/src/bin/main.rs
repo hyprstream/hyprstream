@@ -1332,17 +1332,14 @@ fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
 fn install_envelope_verify_config(oauth: Option<&hyprstream_core::config::OAuthConfig>) {
     use hyprstream_rpc::crypto::CryptoPolicy;
     use hyprstream_rpc::envelope::{
-        install_verify_config, EnvelopeVerifyConfig, KeyedPqTrustStore, PqTrustStore,
+        envelope_policy_from_env, install_response_verify_config, install_verify_config,
+        EnvelopeVerifyConfig, KeyedPqTrustStore, PqTrustStore, ResponseVerifyConfig,
     };
 
-    let policy = match std::env::var("HYPRSTREAM_ENVELOPE_POLICY").ok().as_deref() {
-        Some("classical") => CryptoPolicy::Classical,
-        Some("hybrid") | None => CryptoPolicy::Hybrid,
-        Some(other) => {
-            tracing::warn!("unknown HYPRSTREAM_ENVELOPE_POLICY={other:?}, defaulting to Hybrid");
-            CryptoPolicy::Hybrid
-        }
-    };
+    // Single source of truth for the rollout escape hatch
+    // (`HYPRSTREAM_ENVELOPE_POLICY`), shared by the request AND response sides
+    // (#277): `classical` downgrades both directions in lock-step.
+    let policy = envelope_policy_from_env();
 
     // Mesh kid-anchored PQ trust store (#157, Option A): populated eagerly from
     // admin-configured `mesh_peers`, immutable after install. An empty store
@@ -1352,7 +1349,21 @@ fn install_envelope_verify_config(oauth: Option<&hyprstream_core::config::OAuthC
         None => KeyedPqTrustStore::new(),
     };
     tracing::info!("mesh PQ trust store installed with {} peer binding(s)", keyed_store.len());
+    // Shared Arc: the SAME admin-anchored store backs both the request-side and
+    // response-side verify configs — built once, anchored once (#277 reuse of
+    // #157). The server's `#mesh-pq` ML-DSA-65 key (keyed by its Ed25519 mesh
+    // signer identity) anchors response verification just as it anchors request
+    // verification.
     let pq_store: std::sync::Arc<dyn PqTrustStore> = std::sync::Arc::new(keyed_store);
+
+    // Install the RESPONSE-side process-global default (#277), mirroring the
+    // request-side install below: fail-closed Hybrid by default with the same
+    // anchored store, so native RPC clients consult it when no per-client store
+    // was set.
+    let _ = install_response_verify_config(ResponseVerifyConfig {
+        policy,
+        pq_store: Some(pq_store.clone()),
+    });
 
     if install_verify_config(EnvelopeVerifyConfig {
         policy,
