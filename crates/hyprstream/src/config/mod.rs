@@ -340,6 +340,13 @@ pub struct QuicConfig {
     /// Path to TLS private key (PEM). Empty = generate self-signed.
     #[serde(default)]
     pub key_path: String,
+
+    /// #282: bind an iroh substrate (ALPNs `hyprstream-rpc/1` + `moql`) in
+    /// PARALLEL to the quinn/WebTransport endpoint, enabling node_id-addressed
+    /// (pkarr/DNS-discoverable) federation reach. Off by default — quinn-only is
+    /// the unchanged baseline; opt in with `[quic] iroh = true`. Native-only.
+    #[serde(default = "default_iroh_enabled")]
+    pub iroh: bool,
 }
 
 impl Default for QuicConfig {
@@ -350,6 +357,7 @@ impl Default for QuicConfig {
             server_name: default_quic_server_name(),
             cert_path: String::new(),
             key_path: String::new(),
+            iroh: default_iroh_enabled(),
         }
     }
 }
@@ -467,11 +475,19 @@ impl QuicConfig {
             server_name: self.server_name.clone(),
             protected_resource_json: meta_json,
             on_quic_bound: None,
+            // #282: iroh is opt-in and provisioned by the daemon bootstrap
+            // (`QuicSharedConfig`), not this minimal builder. Off here.
+            iroh_enabled: false,
+            iroh_admission: None,
+            on_iroh_bound: None,
         })
     }
 }
 
 fn default_quic_enabled() -> bool { true }
+/// #282: iroh substrate is opt-in (defaults off) so the quinn-only baseline is
+/// unchanged for existing deployments.
+fn default_iroh_enabled() -> bool { false }
 fn default_quic_bind_addr() -> String { "0.0.0.0:4433".to_owned() }
 fn default_quic_server_name() -> String { "localhost".to_owned() }
 

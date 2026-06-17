@@ -650,6 +650,25 @@ pub struct QuicLoopConfig {
     /// Callback invoked after QUIC binding succeeds, with (service_name, actual_addr, server_name).
     /// Used to announce endpoints to the DiscoveryService.
     pub on_quic_bound: Option<Box<dyn FnOnce(String, std::net::SocketAddr, String) + Send>>,
+    /// #282: when `true`, the spawner binds an `IrohSubstrate` in PARALLEL to the
+    /// quinn endpoint, serving BOTH ALPNs (`hyprstream-rpc/1` + `moql`) with the
+    /// same request processor + moq origin, and installs the shared client
+    /// endpoint for outbound iroh dials. Native-only. Defaults to `false`
+    /// (off) so the working quinn-only deployment is unchanged unless opted in.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub iroh_enabled: bool,
+    /// #282: optional #137 federation admission hook applied at the iroh accept
+    /// path (origin + key-binding against `remote_id()`). `None` = open (the
+    /// pre-#282 accept-open behaviour). Native-only.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub iroh_admission:
+        Option<crate::transport::iroh_admission::SharedIrohAdmission>,
+    /// #282: callback invoked after the iroh substrate binds, with
+    /// (service_name, node_id) where `node_id` is the endpoint's 32-byte Ed25519
+    /// public key. Used to advertise the `#iroh` VM + `IrohTransport` service
+    /// entry in the DID document only when iroh is actually bound.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub on_iroh_bound: Option<Box<dyn FnOnce(String, [u8; 32]) + Send>>,
 }
 
 /// Handle for a running service

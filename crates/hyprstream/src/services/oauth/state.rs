@@ -385,6 +385,15 @@ pub struct OAuthState {
     /// the published VM equals the key the node signs mesh responses with.
     /// `None` when the entity signing key is not configured.
     pub mesh_pq_verifying_key: Option<Vec<u8>>,
+    /// #282: the node's iroh endpoint id (its Ed25519 `node_id`, 32 bytes),
+    /// published as the `#iroh` verification method + an `IrohTransport` service
+    /// entry in the root DID document — **only** when the iroh substrate is
+    /// actually bound. `None` until the daemon binds iroh and reports it.
+    pub iroh_node_id: Option<[u8; 32]>,
+    /// #282: iroh relay URLs to advertise in the `IrohTransport` entry's
+    /// `relays`. Empty = rely on pkarr/DNS discovery for reachability (the
+    /// peer resolves direct paths by node_id alone).
+    pub iroh_relays: Vec<String>,
 }
 
 impl OAuthState {
@@ -438,6 +447,8 @@ impl OAuthState {
             quic_cert_hashes: Vec::new(),
             quic_public_uri: None,
             mesh_pq_verifying_key: None,
+            iroh_node_id: None,
+            iroh_relays: Vec::new(),
         }
     }
 
@@ -488,6 +499,19 @@ impl OAuthState {
     pub fn with_quic_transport(mut self, public_uri: String, cert_hashes: Vec<[u8; 32]>) -> Self {
         self.quic_public_uri = Some(public_uri);
         self.quic_cert_hashes = cert_hashes;
+        self
+    }
+
+    /// Set the node's iroh transport info for DID-doc publication (#282).
+    ///
+    /// Call this only when the iroh substrate is actually bound: it makes
+    /// `root_did_document` advertise the `#iroh` Ed25519 verification method and
+    /// an `IrohTransport` service entry (`accept: [hyprstream-rpc/1, moql]`).
+    /// `relays` may be empty — peers then resolve reachability by node_id alone
+    /// via iroh's pkarr/DNS discovery.
+    pub fn with_iroh_transport(mut self, node_id: [u8; 32], relays: Vec<String>) -> Self {
+        self.iroh_node_id = Some(node_id);
+        self.iroh_relays = relays;
         self
     }
 

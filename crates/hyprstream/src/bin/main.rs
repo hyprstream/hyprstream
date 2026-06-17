@@ -1969,6 +1969,8 @@ fn main() -> Result<()> {
                                         server_name: qc.server_name.clone(),
                                         oauth_issuer_url: Some(config.oauth.issuer_url()),
                                         jwt_verifying_key: Some(ctx.jwt_verifying_key()),
+                                        // #282: bind iroh in parallel to quinn when opted in.
+                                        iroh_enabled: qc.iroh,
                                     };
                                     ctx = ctx.with_quic(shared);
                                 }

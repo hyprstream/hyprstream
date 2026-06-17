@@ -261,6 +261,52 @@ async fn oauth_self_protected_resource_metadata(
 /// (separate thread), and ZMQ async I/O (TMQ) registers socket file descriptors
 /// with the current runtime's epoll. A PolicyClient created in the main runtime
 /// would hang when polled from the OAuth runtime.
+/// #282: build the OAuth service's canonical federation iroh substrate.
+///
+/// Serves BOTH ALPNs (`hyprstream-rpc/1` via `processor`, `moql` via the
+/// process-global moq origin) on a single iroh endpoint whose node key is the
+/// OAuth signing key — the same key advertised as the root DID `#iroh` VM. The
+/// #137 admission gate (origin + key-binding vs `remote_id()`) guards both
+/// accept paths, fail-closed. Installs the shared client endpoint for outbound
+/// iroh dials. Native-only.
+async fn build_oauth_iroh_substrate(
+    signing_key: hyprstream_rpc::prelude::SigningKey,
+    processor: Arc<dyn hyprstream_rpc::transport::rpc_session::IrohRequestProcessor>,
+    policy_client: Arc<PolicyClient>,
+) -> anyhow::Result<hyprstream_rpc::transport::iroh_substrate::IrohSubstrate> {
+    use hyprstream_rpc::transport::{iroh_moq, iroh_rpc, iroh_substrate, lazy_iroh, rpc_session};
+
+    let admission = crate::auth::federation_admission::build_iroh_admission(policy_client)?;
+
+    // moq plane: reuse the SAME global origin the quinn `/moq` path serves.
+    let moq_handler = match hyprstream_rpc::moq_stream::global_moq_origin() {
+        Some(origin) => iroh_moq::IrohMoqProtocolHandler::with_origin(
+            iroh_moq::OriginShared::from_pair(origin.producer().clone(), origin.consumer().clone()),
+        ),
+        None => iroh_moq::IrohMoqProtocolHandler::new(),
+    }
+    .with_admission(Arc::clone(&admission));
+
+    let rpc_handler = iroh_rpc::IrohRpcProtocolHandler::with_stream_limit(
+        processor,
+        signing_key.clone(),
+        rpc_session::DEFAULT_STREAM_LIMIT,
+    )
+    .with_admission(admission);
+
+    // The iroh node key IS the OAuth signing key, so node_id == the advertised
+    // `#iroh` VM. `presets::N0` discovery (pkarr publisher + n0 DNS) is enabled by
+    // `IrohSubstrate::new`, so this node is dial-by-node_id-discoverable (#282).
+    let substrate = iroh_substrate::IrohSubstrate::new(
+        signing_key.to_bytes(),
+        moq_handler,
+        rpc_handler,
+    )
+    .await?;
+    let _ = lazy_iroh::install_iroh_client_endpoint(substrate.endpoint().clone());
+    Ok(substrate)
+}
+
 pub struct OAuthService {
     config: OAuthConfig,
     /// Global TLS configuration (passed from factory, avoids re-loading config)
@@ -632,6 +678,22 @@ impl Spawnable for OAuthService {
                             oauth_state = oauth_state.with_quic_transport(quic_uri, vec![hash]);
                         }
                     }
+
+                    // #282: advertise the `#iroh` VM + IrohTransport entry ONLY
+                    // when iroh is enabled. The iroh substrate the spawner binds
+                    // for THIS service uses `RequestService::signing_key` as its
+                    // node key, and that same key is `oauth_state.signing_key`
+                    // (set above via `with_signing_key`), so the published
+                    // `node_id` (== signing_key.verifying_key()) is exactly the
+                    // endpoint id this service's iroh substrate listens on — no
+                    // drift. Relays are left empty: peers resolve reachability by
+                    // node_id via iroh's built-in pkarr/DNS discovery (#282).
+                    if quic_cfg.iroh {
+                        if let Some(ref sk) = oauth_state.signing_key {
+                            let node_id = sk.verifying_key().to_bytes();
+                            oauth_state = oauth_state.with_iroh_transport(node_id, Vec::new());
+                        }
+                    }
                 }
             }
 
@@ -685,6 +747,27 @@ impl Spawnable for OAuthService {
             let control_transport = self.control_transport.clone();
             let rpc_signing_key = self.signing_key.clone();
             let rpc_state = state.clone();
+            // #282: bind the node's canonical federation iroh substrate for the
+            // OAuth (DID controller) identity when `[quic] iroh = true`. The node
+            // key is this service's signing key (== the root DID `#iroh` VM
+            // advertised above), so the published `node_id` has a live listener.
+            // The #137 admission gate (origin + key-binding vs `remote_id()`)
+            // guards both ALPNs, fail-closed.
+            let iroh_enabled = self.quic_config.as_ref().is_some_and(|q| q.enabled && q.iroh);
+            // Dedicated PolicyClient for the #137 admission gate (the primary
+            // `policy_client` was already moved into OAuthState). Same identity
+            // (this service's signing key) + the resolved policy verifying key.
+            let iroh_policy_client = if iroh_enabled {
+                match PolicyClient::for_service(self.signing_key.clone(), policy_vk, None) {
+                    Ok(pc) => Some(Arc::new(pc)),
+                    Err(e) => {
+                        tracing::warn!("OAuth iroh admission PolicyClient build failed: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let serve_shutdown = Arc::new(Notify::new());
             let serve_shutdown_task = Arc::clone(&serve_shutdown);
             let rpc_loop = tokio::task::spawn_local(async move {
@@ -707,6 +790,27 @@ impl Spawnable for OAuthService {
                 };
                 let processor: Arc<dyn hyprstream_rpc::transport::rpc_session::IrohRequestProcessor> =
                     Arc::new(bridge);
+
+                // #282: parallel iroh substrate (RPC + moq ALPNs) for federation.
+                let _iroh_substrate = match iroh_policy_client {
+                    Some(pc) => match build_oauth_iroh_substrate(
+                        rpc_signing_key.clone(),
+                        Arc::clone(&processor),
+                        pc,
+                    )
+                    .await
+                    {
+                        Ok(substrate) => Some(substrate),
+                        Err(e) => {
+                            tracing::warn!(
+                                "OAuth iroh substrate bind failed; continuing without iroh: {e}"
+                            );
+                            None
+                        }
+                    },
+                    None => None,
+                };
+
                 if let Err(e) = hyprstream_rpc::service::serve::serve_bridged(
                     &control_transport,
                     processor,
@@ -717,6 +821,13 @@ impl Spawnable for OAuthService {
                 .await
                 {
                     tracing::error!("OAuth RPC serve error: {}", e);
+                }
+
+                // Drain the iroh substrate (accept loop + handlers) on shutdown.
+                if let Some(substrate) = _iroh_substrate {
+                    if let Err(e) = substrate.shutdown().await {
+                        tracing::warn!("OAuth iroh substrate shutdown error: {e}");
+                    }
                 }
             });
 

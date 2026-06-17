@@ -63,7 +63,11 @@ pub fn install_iroh_client_endpoint(endpoint: iroh::Endpoint) -> Result<(), iroh
 }
 
 /// The installed client endpoint, cloned (cheap — iroh `Endpoint` is `Arc`-backed).
-fn iroh_client_endpoint() -> Option<iroh::Endpoint> {
+///
+/// Exposed crate-internally so the streaming-plane dialer
+/// ([`crate::dial::dial_stream`]'s iroh arm, #282) can reuse the same install-once
+/// endpoint the RPC plane dials from.
+pub(crate) fn iroh_client_endpoint() -> Option<iroh::Endpoint> {
     IROH_CLIENT_ENDPOINT.get().cloned()
 }
 

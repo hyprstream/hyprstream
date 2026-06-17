@@ -52,6 +52,10 @@ pub struct QuicSharedConfig {
     /// JWT verifying key (derived from root via HKDF "hyprstream-jwt-v1").
     /// Published as `x_root_pubkey` in RFC 9728 metadata for client-side trust pinning.
     pub jwt_verifying_key: Option<ed25519_dalek::VerifyingKey>,
+    /// #282: bind an iroh substrate (ALPNs `hyprstream-rpc/1` + `moql`) in
+    /// parallel to the quinn endpoint for every QUIC-enabled service. Off by
+    /// default; an operator opts in via `[quic] iroh = true`.
+    pub iroh_enabled: bool,
 }
 
 impl QuicSharedConfig {
@@ -84,6 +88,14 @@ impl QuicSharedConfig {
             server_name: self.server_name.clone(),
             protected_resource_json: metadata,
             on_quic_bound: None,
+            // #282: bind iroh in parallel when the deployment opted in. The
+            // admission hook + on_iroh_bound advert callback are threaded by the
+            // service factory (which owns PolicyService / OAuthState); left None
+            // here so iroh, when enabled, runs accept-open until that wiring lands
+            // (documented seam — see service.rs spawner).
+            iroh_enabled: self.iroh_enabled,
+            iroh_admission: None,
+            on_iroh_bound: None,
         }
     }
 

@@ -220,6 +220,35 @@ where
 /// streaming plane (default path → RPC). Both server and client use this.
 pub const MOQ_PATH: &str = "/moq";
 
+/// A dialed moq streaming session, erased over the concrete transport.
+///
+/// [`dial_stream`] returns this so a caller can dial the streaming plane over
+/// either quinn/WebTransport (`/moq` path-dispatch) **or** iroh (the `moql`
+/// ALPN) and hand the result straight to `moq_net::Client::connect`, which is
+/// generic over `web_transport_trait::Session`. The two underlying session
+/// types (`web_transport_quinn::Session` / `web_transport_iroh::Session`) do not
+/// share a concrete type, so this enum dispatches at the `connect` call.
+pub enum MoqStreamSession {
+    /// quinn / WebTransport `/moq` session (#274).
+    Quinn(web_transport_quinn::Session),
+    /// iroh `moql`-ALPN session (#282).
+    Iroh(web_transport_iroh::Session),
+}
+
+impl MoqStreamSession {
+    /// Run the moq-lite handshake over this session, returning the live
+    /// `moq_net::Session`. Dispatches to the concrete transport's `connect`.
+    pub async fn connect_moq(
+        self,
+        client: &moq_net::Client,
+    ) -> std::result::Result<moq_net::Session, moq_net::Error> {
+        match self {
+            MoqStreamSession::Quinn(s) => client.connect(s).await,
+            MoqStreamSession::Iroh(s) => client.connect(s).await,
+        }
+    }
+}
+
 /// Dial the moq streaming plane for a network-routable reach, returning a live
 /// [`web_transport_quinn::Session`] (#274).
 ///
@@ -234,7 +263,7 @@ pub const MOQ_PATH: &str = "/moq";
 /// the same-host UDS fast path instead of dialing.
 pub async fn dial_stream(
     target: &TransportConfig,
-) -> Result<web_transport_quinn::Session> {
+) -> Result<MoqStreamSession> {
     use crate::transport::quinn_transport::{
         connect_pinned_hashes_path, connect_webpki_path, verify_peer_cert_pinned,
     };
@@ -256,13 +285,33 @@ pub async fn dial_stream(
                 }
                 connect_pinned_hashes_path(*addr, pins, MOQ_PATH).await?
             };
-            Ok(session)
+            Ok(MoqStreamSession::Quinn(session))
         }
-        EndpointType::Iroh { .. } => {
+        EndpointType::Iroh { direct_addrs, relay_url, .. }
+            if direct_addrs.is_empty() && relay_url.is_none() =>
+        {
+            // No reachability supplied → fail fast rather than hand iroh a bare
+            // EndpointId that falls through to discovery and times out (~10-30s).
+            // (Dial-by-node_id-alone via pkarr/DNS discovery is available on the
+            // shared endpoint, but the resolver is expected to supply at least a
+            // relay; see #282 pkarr seam.)
             bail!(
-                "dial_stream(): iroh streaming reach is not yet supported — \
-                 the reach list should carry a Quic/WebTransport option"
+                "dial_stream(): iroh streaming reach has neither direct addrs nor a \
+                 relay URL — not dialable; the resolver must supply reachability"
             )
+        }
+        EndpointType::Iroh { node_id, direct_addrs, relay_url } => {
+            // #282: dial the iroh `moql` ALPN from the shared process-wide client
+            // endpoint (the SAME endpoint the daemon's inbound iroh substrate
+            // listens on, installed once at startup), then wrap the authenticated
+            // iroh Connection as a `web_transport_iroh::Session` for moq-net.
+            //
+            // iroh binds the connection to the peer's EndpointId (its Ed25519
+            // pubkey), so the channel is identity-bound (stronger than quinn's
+            // cert-hash pin); the per-Frame chained-HMAC envelope (§7.5) remains
+            // the application-layer integrity check the subscriber verifies.
+            let session = dial_iroh_moq(node_id, direct_addrs, relay_url).await?;
+            Ok(MoqStreamSession::Iroh(session))
         }
         EndpointType::Ipc { .. }
         | EndpointType::SystemdFd { .. }
@@ -274,6 +323,45 @@ pub async fn dial_stream(
             )
         }
     }
+}
+
+/// Dial the iroh `moql` (moq-lite) ALPN to `node_id` and wrap the connection as
+/// a `web_transport_iroh::Session` ready for `moq_net::Client::connect`.
+///
+/// Uses the process-wide client iroh endpoint installed at startup
+/// ([`crate::transport::lazy_iroh::install_iroh_client_endpoint`]) — the same
+/// install-once dialer the RPC plane's `LazyIrohTransport` uses, so the streaming
+/// dial reuses the node identity and bound sockets. Mirrors
+/// [`crate::transport::iroh_substrate::IrohSubstrate::connect`].
+async fn dial_iroh_moq(
+    node_id: &[u8; 32],
+    direct_addrs: &[std::net::SocketAddr],
+    relay_url: &Option<String>,
+) -> Result<web_transport_iroh::Session> {
+    use crate::transport::iroh_substrate::ALPN_MOQ_LITE;
+    use iroh::{EndpointAddr, EndpointId, TransportAddr};
+
+    let endpoint = crate::transport::lazy_iroh::iroh_client_endpoint().ok_or_else(|| {
+        anyhow!(
+            "dial_stream(): no iroh client endpoint installed — call \
+             install_iroh_client_endpoint() at startup before dialing iroh streams"
+        )
+    })?;
+
+    let id = EndpointId::from_bytes(node_id).map_err(|e| anyhow!("invalid iroh node_id: {e}"))?;
+    let mut transport_addrs: Vec<TransportAddr> =
+        direct_addrs.iter().copied().map(TransportAddr::Ip).collect();
+    if let Some(url) = relay_url {
+        let relay = url.parse().map_err(|e| anyhow!("invalid iroh relay_url '{url}': {e}"))?;
+        transport_addrs.push(TransportAddr::Relay(relay));
+    }
+    let addr = EndpointAddr::from_parts(id, transport_addrs);
+
+    let conn = endpoint
+        .connect(addr, ALPN_MOQ_LITE)
+        .await
+        .map_err(|e| anyhow!("iroh moql connect: {e}"))?;
+    Ok(web_transport_iroh::Session::raw(conn))
 }
 
 #[cfg(test)]
@@ -392,5 +480,95 @@ mod tests {
         assert!(QuicServerAuth::pinned(vec![]).is_err(), "empty pin set is no auth");
         assert!(QuicServerAuth::web_pki_pinned(vec![]).is_err(), "empty pin set is no auth");
         assert!(QuicServerAuth::web_pki().require_web_pki());
+    }
+
+    #[test]
+    fn dial_stream_iroh_without_reach_fails_fast() {
+        // An iroh reach with neither direct addrs nor a relay is not dialable —
+        // dial_stream must fail fast rather than hang in discovery.
+        let cfg = TransportConfig::iroh([1u8; 32], Vec::new(), None);
+        let res = futures::executor::block_on(dial_stream(&cfg));
+        assert!(res.is_err(), "iroh reach with no reachability must fail fast");
+    }
+
+    /// #282: `dial_stream`'s iroh arm dials the `moql` ALPN and returns a live
+    /// moq session. A loopback: a server `IrohSubstrate` serves the moq handler
+    /// with one published broadcast; the client installs its endpoint as the
+    /// process-global dialer, then `dial_stream(EndpointType::Iroh{..})` →
+    /// `connect_moq` → subscribe → read the same frame back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dial_stream_iroh_moql_loopback_round_trip() -> Result<()> {
+        use crate::transport::iroh_moq::{IrohMoqProtocolHandler, OriginShared};
+        use crate::transport::iroh_substrate::{IrohSubstrate, NoopHandler};
+        use crate::transport::lazy_iroh::install_iroh_client_endpoint;
+        use moq_net::{Client, Group, Origin, OriginConsumer, OriginProducer, Track};
+        use rand::RngCore;
+
+        fn fresh_key() -> [u8; 32] {
+            let mut k = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut k);
+            k
+        }
+
+        // ── Server: moq handler on the `moql` ALPN with one broadcast ──────────
+        let shared = OriginShared::new();
+        let producer = shared.producer().clone();
+        let moq_handler = IrohMoqProtocolHandler::with_origin(shared);
+        let server =
+            IrohSubstrate::new(fresh_key(), moq_handler, NoopHandler::new("rpc")).await?;
+        let server_id: [u8; 32] = *server.endpoint_id().as_bytes();
+        let direct: Vec<std::net::SocketAddr> =
+            server.endpoint().bound_sockets().into_iter().collect();
+
+        let mut broadcast = producer
+            .create_broadcast("alice/run-1")
+            .ok_or_else(|| anyhow!("create_broadcast denied"))?;
+        let mut track = broadcast.create_track(Track::new("tokens"))?;
+        let mut group = track.create_group(Group::from(0u64))?;
+        group.write_frame(bytes::Bytes::from_static(b"hello-dial-stream"))?;
+        drop(group);
+
+        // ── Client: install its endpoint as the process-global dialer ──────────
+        let client = IrohSubstrate::new(
+            fresh_key(),
+            NoopHandler::new("c-moq"),
+            NoopHandler::new("c-rpc"),
+        )
+        .await?;
+        let _ = install_iroh_client_endpoint(client.endpoint().clone());
+
+        // ── dial_stream over iroh → MoqStreamSession::Iroh ─────────────────────
+        let cfg = TransportConfig::iroh(server_id, direct, None);
+        let session = dial_stream(&cfg).await?;
+        assert!(matches!(session, MoqStreamSession::Iroh(_)), "must be an iroh session");
+
+        // Run the moq handshake via the enum dispatcher and subscribe.
+        let client_origin: OriginProducer = Origin::random().produce();
+        let client_consumer: OriginConsumer = client_origin.consume();
+        let moq_client = Client::new().with_consume(client_origin);
+        let _moq_session = session
+            .connect_moq(&moq_client)
+            .await
+            .map_err(|e| anyhow!("moq handshake: {e}"))?;
+
+        let bc = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_consumer.announced_broadcast("alice/run-1"),
+        )
+        .await?
+        .ok_or_else(|| anyhow!("broadcast not announced"))?;
+        let mut tc = bc.subscribe_track(&Track::new("tokens"))?;
+        let mut gc = tokio::time::timeout(std::time::Duration::from_secs(5), tc.next_group())
+            .await??
+            .ok_or_else(|| anyhow!("next_group None"))?;
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), gc.read_frame())
+            .await??
+            .ok_or_else(|| anyhow!("read_frame None"))?;
+        assert_eq!(&frame[..], b"hello-dial-stream");
+
+        server.shutdown().await?;
+        // Do NOT shut down `client`: its endpoint is the install-once global.
+        drop(client);
+        Ok(())
     }
 }

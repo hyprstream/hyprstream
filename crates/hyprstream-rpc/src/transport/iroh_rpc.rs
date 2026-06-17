@@ -76,6 +76,10 @@ struct HandlerInner {
     connection_limit: Arc<Semaphore>,
     /// Per-stream request-read timeout (#159 slowloris bound).
     read_timeout: std::time::Duration,
+    /// #137/#282 federation admission hook. `None` = open (pre-#282). When set,
+    /// an inbound connection whose `remote_id()` is not admitted is dropped
+    /// (fail-closed) before any stream is served.
+    admission: Option<super::iroh_admission::SharedIrohAdmission>,
     /// Level-triggered shutdown signal: once `cancel()` is called, every
     /// future and current `cancelled().await` resolves immediately. Used
     /// instead of `tokio::sync::Notify` because `Notify::notify_waiters`
@@ -116,9 +120,21 @@ impl IrohRpcProtocolHandler {
                     super::rpc_session::DEFAULT_CONNECTION_LIMIT,
                 )),
                 read_timeout: super::rpc_session::REQUEST_READ_TIMEOUT,
+                admission: None,
                 shutdown: CancellationToken::new(),
             }),
         }
+    }
+
+    /// Install the #137/#282 federation admission hook. When set, an inbound
+    /// connection whose authenticated `remote_id()` is not admitted by the gate
+    /// is dropped (fail-closed) before any RPC stream is served.
+    pub fn with_admission(
+        mut self,
+        admission: super::iroh_admission::SharedIrohAdmission,
+    ) -> Self {
+        self.mutate_inner(|i| i.admission = Some(admission));
+        self
     }
 
     /// Override the per-stream request-read timeout (#159). Primarily for
@@ -152,9 +168,14 @@ impl IrohRpcProtocolHandler {
     pub fn with_rpc_config(self, cfg: &super::rpc_session::RpcConfig) -> Self {
         let processor = Arc::clone(&self.inner.processor);
         let signing_key = self.inner.signing_key.clone();
-        Self::with_stream_limit(processor, signing_key, cfg.stream_limit)
+        let admission = self.inner.admission.clone();
+        let mut built = Self::with_stream_limit(processor, signing_key, cfg.stream_limit)
             .with_read_timeout(cfg.request_read_timeout)
-            .with_connection_limit(cfg.connection_limit)
+            .with_connection_limit(cfg.connection_limit);
+        if let Some(a) = admission {
+            built = built.with_admission(a);
+        }
+        built
     }
 }
 
@@ -172,6 +193,16 @@ impl ProtocolHandler for IrohRpcProtocolHandler {
                 return Ok(());
             }
         };
+
+        // #137/#282 federation admission: iroh authenticated this connection to
+        // the remote endpoint's Ed25519 key (`remote_id()`). Run the gate (origin
+        // stage + key-binding stage) against it; on rejection, fail-closed by
+        // returning Ok(()) (drop the connection without serving any stream). When
+        // no hook is installed the path is open (pre-#282).
+        let remote = *conn.remote_id().as_bytes();
+        if !super::iroh_admission::check_admission(self.inner.admission.as_ref(), &remote).await {
+            return Ok(());
+        }
 
         // Adapt the raw iroh `Connection` to the transport-generic `Session`
         // abstraction and delegate to the shared accept loop. Drain semantics
@@ -801,6 +832,86 @@ mod tests {
         assert_eq!(&resp[..], b"drained-ok");
 
         client.shutdown().await?;
+        Ok(())
+    }
+
+    // ── #137/#282 federation admission at the live iroh accept path ───────────
+
+    use super::super::iroh_admission::{IrohPeerAdmission, SharedIrohAdmission};
+
+    /// Admit iff the peer's node_id equals an expected key — mirrors the #137
+    /// key-binding stage (here against a fixed expected node_id).
+    struct AdmitExpected([u8; 32]);
+    #[async_trait::async_trait]
+    impl IrohPeerAdmission for AdmitExpected {
+        async fn admit_peer(&self, node_id: &[u8; 32]) -> Result<()> {
+            if node_id == &self.0 {
+                Ok(())
+            } else {
+                anyhow::bail!("node_id not admitted")
+            }
+        }
+    }
+
+    /// #282: a gate that admits the client's `remote_id()` lets RPC through; the
+    /// gate is invoked with the authenticated Ed25519 key (no #200/#185 seam).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_admits_known_remote_id() -> Result<()> {
+        // Build the client first so we know the node_id it will present.
+        let client = IrohSubstrate::new(
+            fresh_key(),
+            NoopHandler::new("c-moq"),
+            NoopHandler::new("c-rpc"),
+        )
+        .await?;
+        let client_node_id: [u8; 32] = *client.endpoint_id().as_bytes();
+
+        let processor = from_fn(|req: Bytes| async move { Ok(req) });
+        let gate: SharedIrohAdmission = Arc::new(AdmitExpected(client_node_id));
+        let handler = IrohRpcProtocolHandler::new(processor, fresh_signing_key())
+            .with_admission(gate);
+        let server = IrohSubstrate::new(fresh_key(), NoopHandler::new("moq"), handler).await?;
+        let server_addr = direct_addr(&server);
+
+        let conn = client.connect(server_addr, ALPN_HYPRSTREAM_RPC).await?;
+        let resp = client_request(&conn, b"hi").await?;
+        assert_eq!(&resp[..], b"hi", "admitted peer must be served");
+
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// #282: a gate that does NOT admit the client's `remote_id()` drops the
+    /// connection fail-closed — the RPC request must not succeed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_rejects_unknown_remote_id_fail_closed() -> Result<()> {
+        let processor = from_fn(|req: Bytes| async move { Ok(req) });
+        // Gate expects a different node_id than any real client → reject all.
+        let gate: SharedIrohAdmission = Arc::new(AdmitExpected([0xAAu8; 32]));
+        let handler = IrohRpcProtocolHandler::new(processor, fresh_signing_key())
+            .with_admission(gate);
+        let server = IrohSubstrate::new(fresh_key(), NoopHandler::new("moq"), handler).await?;
+        let server_addr = direct_addr(&server);
+
+        let client = IrohSubstrate::new(
+            fresh_key(),
+            NoopHandler::new("c-moq"),
+            NoopHandler::new("c-rpc"),
+        )
+        .await?;
+        let conn = client.connect(server_addr, ALPN_HYPRSTREAM_RPC).await?;
+
+        // The handler returns Ok(()) (drops the connection) without serving any
+        // stream, so the client's request must fail (reset/closed), not hang.
+        let res = tokio::time::timeout(Duration::from_secs(5), client_request(&conn, b"hi")).await;
+        match res {
+            Ok(inner) => assert!(inner.is_err(), "rejected peer must not be served"),
+            Err(_) => panic!("rejected request must fail promptly, not hang"),
+        }
+
+        client.shutdown().await?;
+        server.shutdown().await?;
         Ok(())
     }
 }

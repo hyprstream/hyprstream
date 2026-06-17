@@ -80,6 +80,13 @@ impl OriginShared {
         Self { producer, consumer }
     }
 
+    /// Wrap an existing producer/consumer pair (e.g. the process-global moq
+    /// origin) so the iroh `moql` accept path serves the SAME broadcasts the
+    /// quinn `/moq` path does (#282 parallel bind).
+    pub fn from_pair(producer: OriginProducer, consumer: OriginConsumer) -> Self {
+        Self { producer, consumer }
+    }
+
     pub fn producer(&self) -> &OriginProducer {
         &self.producer
     }
@@ -110,6 +117,10 @@ struct HandlerInner {
     /// #276 subscribe-authz + per-tenant announce scoping config. Defaults to
     /// "off" (open same-tenant subscribe preserved).
     authz: MoqAuthzConfig,
+    /// #137/#282 federation admission hook. `None` = open (pre-#282). When set,
+    /// an inbound connection whose `remote_id()` is not admitted is dropped
+    /// (fail-closed) before any moq session is served.
+    admission: Option<crate::transport::iroh_admission::SharedIrohAdmission>,
     /// Triggered by `ProtocolHandler::shutdown` so accept handlers stop
     /// waiting for `Session::closed()` and exit promptly.
     shutdown: CancellationToken,
@@ -136,9 +147,21 @@ impl IrohMoqProtocolHandler {
                 origin,
                 stats: StatsHandle::default(),
                 authz: MoqAuthzConfig::default(),
+                admission: None,
                 shutdown: CancellationToken::new(),
             }),
         }
+    }
+
+    /// Install the #137/#282 federation admission hook. When set, an inbound
+    /// connection whose authenticated `remote_id()` is not admitted by the gate
+    /// is dropped (fail-closed) before any moq session is served.
+    pub fn with_admission(
+        mut self,
+        admission: crate::transport::iroh_admission::SharedIrohAdmission,
+    ) -> Self {
+        self.rebuild_inner(|i| i.admission = Some(admission));
+        self
     }
 
     /// Install the #276 subscribe-authz + per-tenant announce-scoping config.
@@ -148,19 +171,28 @@ impl IrohMoqProtocolHandler {
     /// id) and per-tenant scoping is enforced live by handing the moq session a
     /// tenant-scoped [`OriginConsumer`].
     pub fn with_authz(mut self, authz: MoqAuthzConfig) -> Self {
+        self.rebuild_inner(|i| i.authz = authz);
+        self
+    }
+
+    /// Mutate the inner config, cloning the shared `Arc<HandlerInner>` only when
+    /// it is already shared (cloned handler) so builder calls compose without
+    /// dropping previously-installed fields (authz / admission).
+    fn rebuild_inner(&mut self, f: impl FnOnce(&mut HandlerInner)) {
         if let Some(inner) = Arc::get_mut(&mut self.inner) {
-            inner.authz = authz;
+            f(inner);
         } else {
-            // Inner already shared (cloned handler); rebuild a fresh Arc.
             let old = &*self.inner;
-            self.inner = Arc::new(HandlerInner {
+            let mut cloned = HandlerInner {
                 origin: old.origin.clone(),
                 stats: old.stats.clone(),
-                authz,
+                authz: old.authz.clone(),
+                admission: old.admission.clone(),
                 shutdown: old.shutdown.clone(),
-            });
+            };
+            f(&mut cloned);
+            self.inner = Arc::new(cloned);
         }
-        self
     }
 
     /// Borrow the shared origin pair.
@@ -188,6 +220,20 @@ impl Default for IrohMoqProtocolHandler {
 
 impl ProtocolHandler for IrohMoqProtocolHandler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        // #137/#282 federation admission: the accepted iroh connection is
+        // authenticated to the remote endpoint's Ed25519 key (`remote_id()`).
+        // Run the gate (origin + key-binding) before serving any broadcast; on
+        // rejection, fail-closed by dropping the connection. No hook = open.
+        let remote = *conn.remote_id().as_bytes();
+        if !crate::transport::iroh_admission::check_admission(
+            self.inner.admission.as_ref(),
+            &remote,
+        )
+        .await
+        {
+            return Ok(());
+        }
+
         // #276: peer identity IS available here — an accepted iroh connection
         // is authenticated by the remote endpoint's public key. Use it to
         // derive the peer's tenant and scope the consumer it's served.

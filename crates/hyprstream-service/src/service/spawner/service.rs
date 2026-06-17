@@ -161,7 +161,96 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                     },
                 );
                 if let Some(cb) = qc.on_quic_bound.take() {
-                    cb(service_name, actual_addr, qc.server_name.clone());
+                    cb(service_name.clone(), actual_addr, qc.server_name.clone());
+                }
+
+                // #282: bind an iroh substrate in PARALLEL to the quinn endpoint,
+                // serving BOTH ALPNs (`hyprstream-rpc/1` + `moql`) with the SAME
+                // request processor + moq origin. The iroh endpoint's node key is
+                // the service's Ed25519 signing key, so its `node_id` (==
+                // `signing_key.verifying_key()`) is already covered by the node's
+                // published DID verification methods — and the #137 gate, when
+                // installed, matches an inbound peer's `remote_id()` against its
+                // DID. Discovery is iroh's built-in pkarr publisher + n0 DNS
+                // (`presets::N0`), so this node is dial-by-node_id-discoverable.
+                //
+                // Kept alive in this scope via `_iroh_substrate`; on shutdown the
+                // spawned task calls `IrohSubstrate::shutdown` to drain handlers.
+                let _iroh_substrate_guard = if qc.iroh_enabled {
+                    let iroh_secret = signing_key.to_bytes();
+                    let node_id: [u8; 32] = signing_key.verifying_key().to_bytes();
+                    // moq plane: reuse the SAME global origin the quinn `/moq`
+                    // path serves, so broadcasts are visible over both transports.
+                    let moq_handler = match hyprstream_rpc::moq_stream::global_moq_origin() {
+                        Some(origin) => {
+                            let shared = hyprstream_rpc::transport::iroh_moq::OriginShared::from_pair(
+                                origin.producer().clone(),
+                                origin.consumer().clone(),
+                            );
+                            hyprstream_rpc::transport::iroh_moq::IrohMoqProtocolHandler::with_origin(shared)
+                        }
+                        None => hyprstream_rpc::transport::iroh_moq::IrohMoqProtocolHandler::new(),
+                    };
+                    // RPC plane: same processor + signing key as the quinn path.
+                    let mut rpc_handler =
+                        hyprstream_rpc::transport::iroh_rpc::IrohRpcProtocolHandler::with_stream_limit(
+                            Arc::clone(&processor),
+                            signing_key.clone(),
+                            hyprstream_rpc::transport::rpc_session::DEFAULT_STREAM_LIMIT,
+                        );
+                    let mut moq_handler = moq_handler;
+                    // #137/#282: apply the federation admission gate at both iroh
+                    // accept paths (origin + key-binding against `remote_id()`),
+                    // fail-closed. `None` → accept-open (documented seam until the
+                    // factory threads a gate down).
+                    if let Some(gate) = qc.iroh_admission.take() {
+                        rpc_handler = rpc_handler.with_admission(gate.clone());
+                        moq_handler = moq_handler.with_admission(gate);
+                    }
+                    match hyprstream_rpc::transport::iroh_substrate::IrohSubstrate::new(
+                        iroh_secret, moq_handler, rpc_handler,
+                    )
+                    .await
+                    {
+                        Ok(substrate) => {
+                            // Install the shared client endpoint (install-once) so
+                            // outbound iroh RPC/stream dials reuse this identity.
+                            let _ = hyprstream_rpc::transport::lazy_iroh::install_iroh_client_endpoint(
+                                substrate.endpoint().clone(),
+                            );
+                            // Advertise the `#iroh` VM only now that iroh is bound.
+                            if let Some(cb) = qc.on_iroh_bound.take() {
+                                cb(service_name.clone(), node_id);
+                            }
+                            tracing::info!(
+                                service = %service_name,
+                                node_id = %hex_short(&node_id),
+                                "iroh substrate bound (ALPNs hyprstream-rpc/1 + moql)"
+                            );
+                            Some(substrate)
+                        }
+                        Err(e) => {
+                            // Fail soft: an iroh bind failure must not take down the
+                            // working quinn plane. Log and continue quinn-only.
+                            tracing::warn!(
+                                service = %service_name,
+                                "iroh substrate bind failed; continuing quinn-only: {e}"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                // Drain the iroh substrate on shutdown (parallel to quinn drain).
+                if let Some(substrate) = _iroh_substrate_guard {
+                    let iroh_shutdown = Arc::clone(&shutdown);
+                    tokio::spawn(async move {
+                        iroh_shutdown.notified().await;
+                        if let Err(e) = substrate.shutdown().await {
+                            tracing::warn!("iroh substrate shutdown error: {e}");
+                        }
+                    });
                 }
 
                 // Bridge the `Notify` shutdown to the server's graceful drain.
@@ -193,6 +282,11 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
             }
         })
     }
+}
+
+/// Short hex fingerprint of a 32-byte node_id for logs (never the full key).
+fn hex_short(id: &[u8; 32]) -> String {
+    format!("{:02x}{:02x}{:02x}{:02x}…", id[0], id[1], id[2], id[3])
 }
 
 /// Mode for spawning services.

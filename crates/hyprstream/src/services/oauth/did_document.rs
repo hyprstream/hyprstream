@@ -363,10 +363,39 @@ pub async fn root_did_document(
         }
     }
 
+    // #282: iroh transport entry — published ONLY when the iroh substrate is
+    // bound (the daemon set `iroh_node_id`). Advertises the `#iroh` Ed25519
+    // verification method (the node_id, as a Multikey) AND an `IrohTransport`
+    // service entry accepting both ALPNs, so a peer can dial either plane by
+    // node_id (reachability via the advertised relays or pkarr/DNS discovery).
+    let mut extra_vms: Vec<(String, VerifyingKey)> = Vec::new();
+    if let Some(node_id) = state.iroh_node_id {
+        // The iroh node key is the node's Ed25519 endpoint id; publish it as the
+        // `#iroh` VM so the #137 key-binding stage can match an inbound iroh
+        // peer's `remote_id()` against this DID.
+        if let Ok(vk) = VerifyingKey::from_bytes(&node_id) {
+            extra_vms.push(("iroh".to_owned(), vk));
+        }
+        transports.push(TransportEndpoint {
+            fragment: "iroh".to_owned(),
+            vm_type: "IrohTransport".to_owned(),
+            endpoint: hyprstream_rpc::service_entry::encode_iroh(
+                &node_id,
+                &state.iroh_relays,
+                &["hyprstream-rpc/1", "moql"],
+            ),
+        });
+    }
+
+    // Root verification methods: the OAuth signing key plus the `#iroh` node key
+    // (when bound). `build_did_document` emits each as a Multikey VM.
+    let mut keys: Vec<(String, VerifyingKey)> = vec![("key-1".to_owned(), vk)];
+    keys.extend(extra_vms);
+
     let doc = build_did_document(
         &did,
         &state.issuer_url,
-        &[("key-1".to_owned(), vk)],
+        &keys,
         atproto.as_ref(),
         &transports,
         state.mesh_pq_verifying_key.as_deref(),
@@ -758,6 +787,90 @@ mod tests {
         let decoded = bs58::decode(&mb[1..]).into_vec().unwrap();
         assert_eq!(&decoded[2..], pq_vk_bytes.as_slice(),
             "published #mesh-pq key must equal the derived mesh signing key's public key");
+    }
+
+    #[test]
+    fn root_doc_advertises_iroh_vm_and_transport_when_bound() {
+        // #282: when the iroh substrate is bound, root_did_document adds the
+        // `#iroh` Ed25519 VM (the node_id) AND an IrohTransport service entry
+        // accepting both ALPNs. Mirror the exact construction root_did_document
+        // does (node_id → #iroh VM key + encode_iroh transport entry).
+        let oauth_sk = SigningKey::generate(&mut OsRng);
+        let node_sk = SigningKey::generate(&mut OsRng);
+        let node_id = node_sk.verifying_key().to_bytes();
+        let did = "did:web:hyprstream.example.com";
+
+        let iroh_vk = VerifyingKey::from_bytes(&node_id).unwrap();
+        let keys = vec![
+            ("key-1".to_owned(), oauth_sk.verifying_key()),
+            ("iroh".to_owned(), iroh_vk),
+        ];
+        let transports = [TransportEndpoint {
+            fragment: "iroh".to_owned(),
+            vm_type: "IrohTransport".to_owned(),
+            endpoint: hyprstream_rpc::service_entry::encode_iroh(
+                &node_id,
+                &[],
+                &["hyprstream-rpc/1", "moql"],
+            ),
+        }];
+        let doc = build_did_document(
+            did,
+            "https://hyprstream.example.com",
+            &keys,
+            None,
+            &transports,
+            None,
+        );
+
+        // The `#iroh` VM is present and carries the node_id as a Multikey.
+        let vms = doc["verificationMethod"].as_array().unwrap();
+        let iroh_vm = vms
+            .iter()
+            .find(|v| v["id"] == format!("{did}#iroh"))
+            .expect("`#iroh` verification method must be advertised");
+        assert_eq!(iroh_vm["type"].as_str().unwrap(), "Multikey");
+        let mb = iroh_vm["publicKeyMultibase"].as_str().unwrap();
+        let decoded = bs58::decode(&mb[1..]).into_vec().unwrap();
+        assert_eq!(&decoded[..2], &[0xed, 0x01], "ed25519-pub multicodec");
+        assert_eq!(&decoded[2..], &node_id, "`#iroh` VM key must equal the node_id");
+
+        // The IrohTransport service entry accepts BOTH ALPNs.
+        let svcs = doc["service"].as_array().unwrap();
+        let iroh_svc = svcs
+            .iter()
+            .find(|s| s["type"] == "IrohTransport")
+            .expect("IrohTransport service entry must be advertised");
+        assert_eq!(iroh_svc["id"].as_str().unwrap(), format!("{did}#iroh"));
+        let accept = iroh_svc["serviceEndpoint"]["accept"].as_array().unwrap();
+        let accept: Vec<&str> = accept.iter().filter_map(|v| v.as_str()).collect();
+        assert!(accept.contains(&"hyprstream-rpc/1"));
+        assert!(accept.contains(&"moql"));
+    }
+
+    #[test]
+    fn root_doc_omits_iroh_when_not_bound() {
+        // No iroh transport configured → no `#iroh` VM, no IrohTransport entry.
+        let sk = SigningKey::generate(&mut OsRng);
+        let did = "did:web:hyprstream.example.com";
+        let doc = build_did_document(
+            did,
+            "https://hyprstream.example.com",
+            &[("key-1".to_owned(), sk.verifying_key())],
+            None,
+            &[],
+            None,
+        );
+        let vms = doc["verificationMethod"].as_array().unwrap();
+        assert!(
+            !vms.iter().any(|v| v["id"] == format!("{did}#iroh")),
+            "no `#iroh` VM when iroh is not bound"
+        );
+        let svcs = doc["service"].as_array().unwrap();
+        assert!(
+            !svcs.iter().any(|s| s["type"] == "IrohTransport"),
+            "no IrohTransport entry when iroh is not bound"
+        );
     }
 
     #[test]

@@ -764,7 +764,13 @@ fn reach_to_transport_config(
             };
             Some(TransportConfig::quic_with_auth(addr, q.server_name.clone(), auth))
         }
-        // Reserved (#274 follow-up): no dialable Iroh reach yet.
+        // #282 SEAM: `dial_stream` now dials an iroh `moql` reach
+        // (`EndpointType::Iroh { node_id, .. }`), but the **wire** reach enum's
+        // `Iroh` variant is a unit variant carrying no `node_id`/relay payload
+        // (it is code-generated from `stream.capnp`). Until that schema grows a
+        // `nodeId`/`relays` field, a StreamInfo cannot publish a dialable iroh
+        // reach, so this maps to `None` (publishers carry the Quic reach). The
+        // local `dial_stream` iroh arm is covered by the dial.rs loopback test.
         ReachTransport::Iroh => None,
     }
 }
@@ -807,7 +813,9 @@ async fn moq_stream_handle_task_networked(
     let client_origin = Origin::random().produce();
     let client_consumer = client_origin.consume();
     let moq_client = MoqClient::new().with_consume(client_origin);
-    let _session = match moq_client.connect(session).await {
+    // `session` is a `MoqStreamSession` (quinn or iroh, #282) — dispatch the moq
+    // handshake to the concrete transport.
+    let _session = match session.connect_moq(&moq_client).await {
         Ok(s) => s,
         Err(e) => {
             let _ = tx.send(Err(anyhow!("moq handshake: {e}"))).await;
