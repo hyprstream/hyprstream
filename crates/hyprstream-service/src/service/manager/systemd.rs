@@ -12,24 +12,35 @@ use zbus_systemd::login1::ManagerProxy as LoginProxy;
 use zbus_systemd::systemd1::ManagerProxy;
 use zbus_systemd::zbus::Connection;
 
-/// Connect to the user systemd instance via the private bus (session-independent).
+/// Connect to the user D-Bus instance for systemd management.
 ///
-/// Connects to `$XDG_RUNTIME_DIR/systemd/private/bus`, falling back to
-/// `/run/user/$UID/systemd/private/bus` when `XDG_RUNTIME_DIR` is unset.
-/// This socket is always present when `systemd --user` is running for this
-/// UID and is the correct transport for long-lived public service daemons —
-/// it is not tied to any login session.
+/// Tries `$DBUS_SESSION_BUS_ADDRESS` first (set by PAM on both desktop and
+/// headless SSH logins when `systemd --user` is running). Falls back to the
+/// well-known socket path `/run/user/$UID/bus` for environments where the env
+/// var is absent but the socket exists (e.g. running from a cron job or
+/// service that didn't inherit the PAM environment).
+///
+/// Does NOT use the systemd private bus (`/run/user/$UID/systemd/private/bus`)
+/// — that path is an internal bind-mount not accessible from outside systemd.
 async fn user_systemd_connection() -> Result<Connection> {
+    // Primary: $DBUS_SESSION_BUS_ADDRESS (set by pam_systemd on any login).
+    if let Ok(conn) = Connection::session().await {
+        return Ok(conn);
+    }
+
+    // Fallback: well-known socket path that systemd --user maintains.
     let uid = nix::unistd::getuid().as_raw();
     let rt = std::env::var("XDG_RUNTIME_DIR")
         .unwrap_or_else(|_| format!("/run/user/{uid}"));
-    let private_bus = format!("{rt}/systemd/private/bus");
+    let bus_path = format!("{rt}/bus");
     zbus_systemd::zbus::ConnectionBuilder::address(
-        format!("unix:path={private_bus}").as_str(),
+        format!("unix:path={bus_path}").as_str(),
     )?
     .build()
     .await
-    .with_context(|| format!("could not connect to systemd private bus at {private_bus}"))
+    .with_context(|| format!(
+        "could not connect to user D-Bus (tried $DBUS_SESSION_BUS_ADDRESS and {bus_path})"
+    ))
 }
 
 /// Systemd-based user service manager
