@@ -566,12 +566,30 @@ impl MoqStreamHandle {
 
     /// Construct a handle that subscribes over the **network** (#274).
     ///
-    /// Resolves the signed `StreamInfo`'s `reach` list: if the same-host moq UDS
-    /// plane is available (co-located producer), that fast path is used; else
-    /// the first dialable network reach is dialed via
-    /// [`crate::dial::dial_stream`] over `web_transport_quinn`. After connecting,
-    /// it subscribes to `broadcast_path` and verifies the chained-HMAC frames
-    /// exactly as [`Self::new`] does. Errors/end-of-stream close the channel.
+    /// Resolves the signed `StreamInfo`'s `reach` list and dials the first
+    /// dialable network reach via [`crate::dial::dial_stream`] over
+    /// `web_transport_quinn` — exactly as the working CLI `quick infer` consumer
+    /// does. After connecting, it subscribes to `broadcast_path` and verifies the
+    /// chained-HMAC frames exactly as [`Self::new`] does. Errors/end-of-stream
+    /// close the channel.
+    ///
+    /// ## Transport selection (#275 TUI streaming fix)
+    ///
+    /// The producer's `reach` is the source of truth for where the stream lives.
+    /// A stream is a networked address; the subscriber dials the **producer's**
+    /// reach. Loopback works same-host (the bound QUIC `/moq` endpoint), proven by
+    /// the CLI, so the networked reach is used uniformly whenever the StreamInfo
+    /// carries one.
+    ///
+    /// The local moq UDS plane ([`global_moq_uds_path`]) is used **only as a
+    /// fallback** when the StreamInfo carries no dialable reach (UDS-only /
+    /// unit-test deployments). It must NOT be preferred when a reach is present:
+    /// the local UDS is *this process's own* moq plane, which only carries the
+    /// producer's broadcast if the producer is co-located in this very process.
+    /// A consumer process that runs its own moq plane for unrelated streams (e.g.
+    /// the TUI daemon serving its PTY/shell stdout stream) would otherwise connect
+    /// to its own empty plane and time out waiting for the model service's
+    /// broadcast that was published on a *different* process's plane (#275).
     pub fn networked(
         reach: Vec<crate::stream_info::Destination>,
         broadcast_path: String,
@@ -581,9 +599,21 @@ impl MoqStreamHandle {
         let cancel = tokio_util::sync::CancellationToken::new();
         let (tx, rx) =
             tokio::sync::mpsc::channel::<anyhow::Result<crate::streaming::StreamPayload>>(64);
-        // Same-host fast path: if a local moq UDS plane is serving (co-located
-        // producer), prefer it and ignore the wire reach entirely.
-        if let Some(uds) = global_moq_uds_path() {
+        // Prefer the producer's networked reach (the StreamInfo source of truth):
+        // dial the producer directly, mirroring the CLI. Only fall back to the
+        // local moq UDS plane when the StreamInfo carries no dialable reach —
+        // never the other way around (see method docs; #275).
+        let has_dialable_reach = reach.iter().any(|d| reach_to_transport_config(d).is_some());
+        if has_dialable_reach {
+            tokio::spawn(moq_stream_handle_task_networked(
+                reach,
+                broadcast_path.clone(),
+                mac_key,
+                topic,
+                tx,
+                cancel.clone(),
+            ));
+        } else if let Some(uds) = global_moq_uds_path() {
             let uds_path = uds.to_string_lossy().into_owned();
             tokio::spawn(moq_stream_handle_task(
                 uds_path,
@@ -594,14 +624,16 @@ impl MoqStreamHandle {
                 cancel.clone(),
             ));
         } else {
-            tokio::spawn(moq_stream_handle_task_networked(
-                reach,
-                broadcast_path.clone(),
-                mac_key,
-                topic,
-                tx,
-                cancel.clone(),
-            ));
+            // No dialable reach and no local UDS plane: surface a clear error
+            // rather than spawning a task that cannot connect.
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(Err(anyhow!(
+                        "no dialable reach in StreamInfo and no local moq UDS plane — \
+                         cannot subscribe to broadcast"
+                    )))
+                    .await;
+            });
         }
         Self { rx, broadcast_path, cancel }
     }
@@ -933,6 +965,7 @@ pub fn verify_moq_frame(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::streaming::StreamPayload;
@@ -1036,6 +1069,90 @@ mod tests {
         assert!(matches!(&got[0], StreamPayload::Data(d) if d == b"ping"));
         assert!(matches!(&got[1], StreamPayload::Complete(_)));
         Ok(())
+    }
+
+    /// #275: a StreamInfo carrying a dialable Quic reach must be classified as
+    /// dialable, so `networked()` routes to the producer's networked reach
+    /// (`dial_stream`) rather than this process's local moq UDS plane.
+    #[test]
+    fn quic_reach_is_dialable() {
+        use crate::stream_info::{Destination, QuicReach, Role, TransportConfig as ReachTransport};
+        let reach = Destination {
+            role: Role::Direct,
+            transport: ReachTransport::Quic(QuicReach {
+                addr: "127.0.0.1:4433".to_owned(),
+                server_name: "localhost".to_owned(),
+                cert_hashes: vec![vec![0u8; 32]],
+            }),
+        };
+        assert!(
+            reach_to_transport_config(&reach).is_some(),
+            "a Quic reach must resolve to a dialable TransportConfig (selects the \
+             networked dial_stream path, not the local UDS)"
+        );
+    }
+
+    /// #275: the consumer dials the producer's networked reach even when this
+    /// process also serves its own local moq UDS plane. Regression for the TUI
+    /// timeout: the local UDS must NOT shadow a present reach (it is this
+    /// process's plane, not the producer's).
+    ///
+    /// We assert the branch selection deterministically. With a dialable reach
+    /// present we set the local UDS path to a socket that does NOT exist: the
+    /// **UDS branch** would fail in milliseconds with a connect error naming that
+    /// path, whereas the **networked branch** dials QUIC (which, to a closed
+    /// loopback port, keeps retrying past a short deadline). So: a UDS-path error
+    /// before the deadline ⇒ the pre-fix bug (UDS preferred — FAIL); reaching the
+    /// deadline still trying ⇒ the networked dial was taken (PASS). A networked
+    /// dial error is also an acceptable PASS (reach was dialed).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn networked_prefers_reach_over_local_uds() -> Result<()> {
+        use crate::stream_info::{Destination, QuicReach, Role, TransportConfig as ReachTransport};
+
+        // Pretend this process has a local moq UDS plane (the TUI daemon does, to
+        // serve its PTY stdout). The pre-fix code short-circuited onto this path
+        // and ignored the reach; the fix must dial the reach instead. The path is
+        // distinctive so a UDS connect error is unambiguously identifiable.
+        let uds_marker = "/nonexistent/hyprstream-275-uds-marker.sock";
+        let _ = GLOBAL_MOQ_UDS_PATH.set(PathBuf::from(uds_marker));
+
+        // A dialable Quic reach to a closed loopback port.
+        let reach = vec![Destination {
+            role: Role::Direct,
+            transport: ReachTransport::Quic(QuicReach {
+                addr: "127.0.0.1:1".to_owned(),
+                server_name: "localhost".to_owned(),
+                cert_hashes: vec![[0xABu8; 32].to_vec()],
+            }),
+        }];
+
+        let mut handle = MoqStreamHandle::networked(
+            reach,
+            "local/streams/test/deadbeef".to_owned(),
+            [0u8; 32],
+            "deadbeef".repeat(8),
+        );
+
+        match tokio::time::timeout(std::time::Duration::from_secs(3), handle.recv_next()).await {
+            // Still dialing QUIC at the deadline — the networked branch was taken.
+            Err(_elapsed) => Ok(()),
+            // An early error: it must be a *networked* dial failure, NOT a UDS
+            // connect to our marker path (which would prove the bug).
+            Ok(res) => {
+                let err = res.expect_err("dial to a closed port must not yield a payload");
+                let msg = err.to_string();
+                assert!(
+                    !msg.contains(uds_marker),
+                    "consumer connected to the local UDS plane instead of dialing the \
+                     producer's reach (#275 regression): {msg}"
+                );
+                assert!(
+                    msg.contains("networked dial"),
+                    "expected a networked dial failure (reach was dialed), got: {msg}"
+                );
+                Ok(())
+            }
+        }
     }
 
     #[test]
