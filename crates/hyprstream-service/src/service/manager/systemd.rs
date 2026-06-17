@@ -12,9 +12,30 @@ use zbus_systemd::login1::ManagerProxy as LoginProxy;
 use zbus_systemd::systemd1::ManagerProxy;
 use zbus_systemd::zbus::Connection;
 
-/// Systemd-based service manager
+/// Connect to the user systemd instance via the private bus (session-independent).
 ///
-/// Manages services via D-Bus calls to systemd.
+/// Connects to `$XDG_RUNTIME_DIR/systemd/private/bus`, falling back to
+/// `/run/user/$UID/systemd/private/bus` when `XDG_RUNTIME_DIR` is unset.
+/// This socket is always present when `systemd --user` is running for this
+/// UID and is the correct transport for long-lived public service daemons —
+/// it is not tied to any login session.
+async fn user_systemd_connection() -> Result<Connection> {
+    let uid = nix::unistd::getuid().as_raw();
+    let rt = std::env::var("XDG_RUNTIME_DIR")
+        .unwrap_or_else(|_| format!("/run/user/{uid}"));
+    let private_bus = format!("{rt}/systemd/private/bus");
+    zbus_systemd::zbus::ConnectionBuilder::address(
+        format!("unix:path={private_bus}").as_str(),
+    )?
+    .build()
+    .await
+    .with_context(|| format!("could not connect to systemd private bus at {private_bus}"))
+}
+
+/// Systemd-based user service manager
+///
+/// Manages per-user services via D-Bus calls to the systemd user instance.
+/// Units are installed to `~/.config/systemd/user/`.
 pub struct SystemdManager {
     #[allow(dead_code)]
     connection: Connection,
@@ -24,16 +45,20 @@ pub struct SystemdManager {
 }
 
 impl SystemdManager {
-    /// Create a new SystemdManager
+    /// Create a new SystemdManager using the systemd private bus (default).
     ///
-    /// Connects to the user session D-Bus and enables user lingering
-    /// so services persist after logout.
+    /// Connects to the systemd user instance via the private bus socket, which
+    /// is session-independent. Correct for all long-lived public service daemons.
+    /// Also enables user linger so services persist across logouts.
     pub async fn new() -> Result<Self> {
-        let connection = Connection::session().await?;
+        let connection = user_systemd_connection().await?;
         let systemd = ManagerProxy::new(&connection).await?;
-        let login = LoginProxy::new(&connection).await?;
 
-        // Enable linger (services persist after logout)
+        // Enable linger via the system bus (org.freedesktop.login1 is system-only).
+        // This keeps the user systemd instance running after logout so services
+        // registered with WantedBy=default.target survive reboots.
+        let system_connection = Connection::system().await?;
+        let login = LoginProxy::new(&system_connection).await?;
         let uid = nix::unistd::getuid().as_raw();
         if let Err(e) = login.set_user_linger(uid, true, false).await {
             debug!("Failed to enable user linger (may already be enabled): {}", e);
@@ -46,6 +71,18 @@ impl SystemdManager {
             systemd,
             login,
         })
+    }
+
+    /// Create a new SystemdManager using the D-Bus session bus.
+    ///
+    /// Only for session-scoped services (e.g. the TUI multiplexer) that should
+    /// be tied to an active login session.  Do NOT use for long-lived public
+    /// service daemons — the session bus disappears on logout.
+    pub async fn new_session() -> Result<Self> {
+        let connection = Connection::session().await
+            .context("could not connect to D-Bus session bus (is $DBUS_SESSION_BUS_ADDRESS set?)")?;
+        let systemd = ManagerProxy::new(&connection).await?;
+        Ok(Self { connection, systemd })
     }
 
     #[allow(dead_code)]
@@ -61,6 +98,118 @@ impl SystemdManager {
         dirs::config_dir()
             .map(|d| d.join("systemd/user"))
             .ok_or_else(|| anyhow!("cannot determine config directory"))
+    }
+}
+
+/// Systemd-based system-wide service manager (requires root)
+///
+/// Manages system services via the system D-Bus. Units are installed to
+/// `/etc/systemd/system/` and run under a dedicated `hyprstream` system user.
+pub struct SystemdSystemManager {
+    #[allow(dead_code)]
+    connection: Connection,
+    systemd: ManagerProxy<'static>,
+}
+
+impl SystemdSystemManager {
+    pub async fn new() -> Result<Self> {
+        let connection = Connection::system().await?;
+        let systemd = ManagerProxy::new(&connection).await?;
+        Ok(Self { connection, systemd })
+    }
+
+    fn service_unit(service: &str) -> String {
+        format!("hyprstream-{service}.service")
+    }
+
+    fn units_dir() -> PathBuf {
+        PathBuf::from("/etc/systemd/system")
+    }
+}
+
+#[async_trait]
+impl ServiceManager for SystemdSystemManager {
+    async fn install(&self, service: &str) -> Result<()> {
+        let units_dir = Self::units_dir();
+        std::fs::create_dir_all(&units_dir)?;
+
+        let depends_on = crate::service::factory::get_factory(service)
+            .map(|f| f.depends_on)
+            .unwrap_or(&[]);
+
+        let service_content = units::system_service_unit(service, depends_on)?;
+        let service_path = units_dir.join(Self::service_unit(service));
+
+        if std::fs::read_to_string(&service_path).ok().as_deref() != Some(&service_content) {
+            std::fs::write(&service_path, &service_content)?;
+            info!("Installed system service unit: {}", service_path.display());
+            self.reload().await?;
+        }
+
+        Ok(())
+    }
+
+    async fn uninstall(&self, service: &str) -> Result<()> {
+        let _ = self.stop(service).await;
+        let path = Self::units_dir().join(Self::service_unit(service));
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+            info!("Removed: {}", path.display());
+        }
+        self.reload().await
+    }
+
+    async fn start(&self, service: &str) -> Result<()> {
+        self.systemd
+            .start_unit(Self::service_unit(service), "replace".into())
+            .await?;
+        info!("Started system service unit: {}", Self::service_unit(service));
+        Ok(())
+    }
+
+    async fn stop(&self, service: &str) -> Result<()> {
+        self.systemd
+            .stop_unit(Self::service_unit(service), "replace".into())
+            .await?;
+        info!("Stopped system service unit: {}", Self::service_unit(service));
+        Ok(())
+    }
+
+    async fn is_active(&self, service: &str) -> Result<bool> {
+        match self.systemd.get_unit(Self::service_unit(service)).await {
+            Ok(unit_path) => {
+                let unit = zbus_systemd::systemd1::UnitProxy::builder(self.systemd.inner().connection())
+                    .path(unit_path)?
+                    .build()
+                    .await?;
+                let state = unit.active_state().await?;
+                Ok(state == "active")
+            }
+            Err(_) => Ok(false),
+        }
+    }
+
+    async fn reload(&self) -> Result<()> {
+        self.systemd.reload().await?;
+        debug!("Reloaded systemd daemon (system)");
+        Ok(())
+    }
+
+    async fn enable(&self, service: &str) -> Result<()> {
+        let unit_path = Self::units_dir()
+            .join(Self::service_unit(service))
+            .to_string_lossy()
+            .into_owned();
+        self.systemd
+            .enable_unit_files(vec![unit_path], false, false)
+            .await?;
+        debug!("Enabled system service unit: {}", Self::service_unit(service));
+        Ok(())
+    }
+
+    async fn spawn(&self, service: Box<dyn Spawnable>) -> Result<SpawnedService> {
+        self.ensure(service.name()).await?;
+        Ok(SpawnedService::dummy())
     }
 }
 
@@ -129,6 +278,18 @@ impl ServiceManager for SystemdManager {
     async fn reload(&self) -> Result<()> {
         self.systemd.reload().await?;
         debug!("Reloaded systemd daemon");
+        Ok(())
+    }
+
+    async fn enable(&self, service: &str) -> Result<()> {
+        let unit_path = Self::units_dir()?
+            .join(Self::service_unit(service))
+            .to_string_lossy()
+            .into_owned();
+        self.systemd
+            .enable_unit_files(vec![unit_path], false, false)
+            .await?;
+        debug!("Enabled service unit: {}", Self::service_unit(service));
         Ok(())
     }
 

@@ -1626,15 +1626,22 @@ fn main() -> Result<()> {
             let services = config_for_service.services.startup.clone();
 
             match action {
-                ServiceAction::Install { services: filter, start, verbose } => {
+                ServiceAction::Install { services: filter, start, enable, system, systemd_session, verbose } => {
                     let models_dir = config_for_service.models_dir().clone();
+                    let target = if system {
+                        hyprstream_service::ServiceTarget::System
+                    } else if systemd_session {
+                        hyprstream_service::ServiceTarget::UserSession
+                    } else {
+                        hyprstream_service::ServiceTarget::User
+                    };
                     with_runtime(
                         RuntimeConfig {
                             device: DeviceConfig::request_cpu(),
                             multi_threaded: true,
                         },
                         || async move {
-                            handle_service_install(&models_dir, &services, filter, start, verbose).await
+                            handle_service_install(&models_dir, &services, filter, start, enable, target, verbose).await
                         },
                     )?;
                 }
@@ -2092,7 +2099,7 @@ fn main() -> Result<()> {
                             multi_threaded: true,
                         },
                         || async move {
-                            handle_service_install(&models_dir, &services, None, false, verbose).await
+                            handle_service_install(&models_dir, &services, None, false, false, hyprstream_service::ServiceTarget::User, verbose).await
                         },
                     )?;
                 }
