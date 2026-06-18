@@ -34,4 +34,4 @@ jobs:
             nix-sccache-${{ runner.os }}-
 
       - name: nix flake check
-        run: nix flake check --no-build-output
+        run: nix flake check -L
