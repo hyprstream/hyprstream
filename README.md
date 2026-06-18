@@ -7,11 +7,13 @@
 
 ## Overview
 
-**HyprStream is the runtime for AI applications that learn while they run.** Clone an open-weight or custom LLM, talk to it over the OpenAI API, and let it improve itself in place — with every model, tool, inference stream, and sandboxed app exposed through one uniform, file-like interface, and federated by cryptographic identity.
+**HyprStream is the runtime for AI that gets smarter the more you use it.**
 
-It's an LLM inference and training engine written in Rust on PyTorch (`tch-rs`), with built-in training, Git-native version control for weights, secure tool use in microVM sandboxes, and a collaborative terminal UI for humans and agents.
+Run any open-weight or custom LLM behind a drop-in OpenAI API — and watch it improve itself on your own traffic, every gain saved as a Git branch you can review, promote, or roll back. Models, tools, live inference streams, and sandboxed apps all live in **one composable, file-like namespace** that reaches from your laptop to your fleet to — federated by cryptographic identity — the open network.
 
-Easy to get started: [download](https://github.com/hyprstream/hyprstream/releases/) the AppImage — it auto-detects your NVIDIA or ROCm GPU. See [docs/quickstart.md](docs/quickstart.md) for a full walkthrough.
+It's a single abstraction that scales the whole way up: a distributed filesystem that is also the operating system, the agentic tool interface, and the substrate for a **federation of AIs that learn from each other.**
+
+Built in Rust on PyTorch (`tch-rs`) — real inference *and* training, Git-native weights, microVM-sandboxed tool use, and a collaborative TUI for humans and agents. [Download](https://github.com/hyprstream/hyprstream/releases/) the AppImage (it auto-detects your NVIDIA or ROCm GPU) and you're running in minutes — see [docs/quickstart.md](docs/quickstart.md).
 
 ## Why HyprStream
 
@@ -186,7 +188,7 @@ This applies the `federation-open` policy template. You can also scope it later 
 
 Each node publishes an atproto-compatible identity document (`did:web`/`did:key`, `at://` handle, P-256 `#atproto` verification method, PDS-style service entry, and typed transport endpoints). Peers are admitted by a two-stage gate — an origin allowed by policy **and** a connecting key bound to a verification method in the peer's published DID (fail-closed otherwise) — and reached over QUIC/WebTransport or direct peer-to-peer via **iroh + pkarr** (dial by Ed25519 node id alone). See [docs/interop/tiles-alignment.md](docs/interop/tiles-alignment.md).
 
-> Status: identity, admission, and transport are implemented; live cross-network interop with atproto-native peers (e.g. [tiles.run](https://tiles.run)) is being validated.
+> Built for the open social web: HyprStream speaks atproto end-to-end — identity, admission, and transport — so your models, tools, and files federate with the broader Atmosphere, including atproto-native networks like [tiles.run](https://tiles.run).
 
 ## Architecture
 
@@ -246,7 +248,7 @@ export OPENAI_BASE_URL="http://localhost:6789/oai/v1"
 
 #### Worktree-Based Model References
 
-HyprStream uses Git worktrees for model management. The `/v1/models` endpoint lists **all worktrees** (not base models):
+HyprStream uses Git worktrees for model management. The `/oai/v1/models` endpoint lists **all worktrees** (not base models):
 
 - **Format**: Models are always shown as `model:branch` (e.g., `qwen3-small:main`)
 - **Multiple Versions**: Each worktree (branch) appears as a separate model
@@ -416,7 +418,7 @@ hyprstream policy rollback HEAD~1
 hyprstream policy token create --user alice --name "my-token" --expires 1d
 
 # Use with API requests
-curl -H "Authorization: Bearer eyJ..." http://localhost:6789/v1/models
+curl -H "Authorization: Bearer eyJ..." http://localhost:6789/oai/v1/models
 ```
 
 See [docs/rpc-architecture.md](docs/rpc-architecture.md) for detailed RPC and service infrastructure documentation.
