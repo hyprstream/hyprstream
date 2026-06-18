@@ -26,7 +26,7 @@ It's a closed loop you can audit and reverse at any step:
 1. **Propose** — the model adapts to the task in front of it and can suggest its own improvements through agentic (MCP) tools.
 2. **Train** — it learns from your live traffic, or from a stronger **teacher model**. Each change is applied *speculatively*: in place, but instantly reversible — the way a CPU runs ahead of a branch it can undo.
 3. **Evaluate** — agentic tools score every change automatically, so only adaptations that genuinely perform better survive.
-4. **Promote** — each winner is saved as a **Git branch of the weights** (`model:branch`): versioned, diffable, reviewable, and roll-back-able.
+4. **Promote** — merge a winning adaptation into the live (online) model and checkpoint it as a **Git branch of the weights** (`model:branch`). Checkpoint on your terms — every step, on demand via the API, or automatically through agentic tools — each one versioned, diffable, reviewable, and roll-back-able.
 
 *Under the hood: test-time training (Muon optimizer + TTN profiling), with a runtime **rank oracle** that advises how much capacity each adaptation needs — a signal the teacher model can act on or overrule.*
 
