@@ -91,7 +91,6 @@ pub async fn jwks(State(state): State<Arc<OAuthState>>) -> impl IntoResponse {
     }
 
     // ML-DSA-65 from rotation store — publish all slots + composite pairing
-    #[cfg(feature = "pq-hybrid")]
     if let Some(ref store) = state.ml_dsa_key_store {
         for slot in store.all_slots_snapshot().await {
             let vk = ml_dsa::Keypair::verifying_key(&*slot.key);

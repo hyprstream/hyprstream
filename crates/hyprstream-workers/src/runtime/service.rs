@@ -1,6 +1,6 @@
 //! WorkerService - CRI RuntimeClient + ImageClient via ZMQ
 //!
-//! Implements ZmqService trait for handling CRI-aligned requests.
+//! Implements RequestService trait for handling CRI-aligned requests.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,8 +13,9 @@ use tracing::{debug, info, warn};
 
 // Import ZMQ service infrastructure from hyprstream-rpc
 use hyprstream_rpc::prelude::SigningKey;
-use hyprstream_rpc::service::{AuthorizeFn, EnvelopeContext, ZmqService};
-use hyprstream_rpc::streaming::{StreamChannel, StreamPublisher};
+use hyprstream_rpc::service::{AuthorizeFn, EnvelopeContext, RequestService};
+use hyprstream_rpc::moq_stream::AnyStreamPublisher;
+use hyprstream_rpc::streaming::StreamChannel;
 use hyprstream_rpc::transport::TransportConfig;
 
 use crate::config::PoolConfig;
@@ -58,7 +59,7 @@ const SERVICE_NAME: &str = "worker";
 
 /// WorkerService handles CRI RuntimeClient and ImageClient requests
 ///
-/// Implements the ZmqService trait for integration with hyprstream's ZMQ infrastructure.
+/// Implements the RequestService trait for integration with hyprstream's ZMQ infrastructure.
 pub struct WorkerService {
     // Business logic
     /// Sandbox pool for VM management
@@ -83,7 +84,6 @@ pub struct WorkerService {
     stream_channel: Arc<StreamChannel>,
 
     // Infrastructure (for Spawnable)
-    context: Arc<zmq::Context>,
     transport: TransportConfig,
     signing_key: SigningKey,
 
@@ -103,17 +103,15 @@ impl WorkerService {
         pool_config: PoolConfig,
         backend: Arc<dyn super::backend::SandboxBackend>,
         rafs_store: Arc<RafsStore>,
-        context: Arc<zmq::Context>,
         transport: TransportConfig,
         signing_key: SigningKey,
     ) -> AnyhowResult<Self> {
         let sandbox_pool = Arc::new(SandboxPool::new(pool_config, backend));
 
         // Create event publisher for worker lifecycle events
-        let event_publisher = EventPublisher::new(&context, "worker")?;
+        let event_publisher = EventPublisher::new("worker")?;
 
-        let stream_channel = Arc::new(StreamChannel::new(Arc::clone(&context), signing_key.clone()));
-
+        let stream_channel = Arc::new(StreamChannel::new(signing_key.clone()));
         Ok(Self {
             sandbox_pool,
             rafs_store,
@@ -122,7 +120,6 @@ impl WorkerService {
             event_publisher: tokio::sync::Mutex::new(event_publisher),
             active_fd_streams: Arc::new(RwLock::new(HashMap::new())),
             stream_channel,
-            context,
             transport,
             signing_key,
             authorize_fn: None,
@@ -813,10 +810,13 @@ impl WorkerService {
         // DH + pre-authorization via StreamChannel — atomic, no pending state
         let stream_ctx = self.stream_channel
             .prepare_stream_with_claims(&client_pubkey, 600, claims).await
-            .map_err(|e| anyhow::anyhow!("Stream preparation failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Stream preparation failed: {}", e))?
+            .with_qos_preset::<hyprstream_rpc::stream_info::Pipe>();
 
         let stream_id = stream_ctx.stream_id().to_owned();
-        let stream_endpoint = self.stream_channel.stream_endpoint();
+        let broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()
+            .map(|o| o.broadcast_path(stream_ctx.topic()))
+            .unwrap_or_default();
 
         // Register active stream before returning
         let cancel_token = stream_ctx.cancel_token().child_token();
@@ -835,8 +835,10 @@ impl WorkerService {
 
         let stream_info = StreamInfo {
             stream_id,
-            endpoint: stream_endpoint,
-            server_pubkey: *stream_ctx.server_pubkey(),
+            dh_public: *stream_ctx.server_pubkey(),
+            qos: stream_ctx.qos().clone(),
+            broadcast_path,
+            announced_at: hyprstream_rpc::moq_stream::producer_reach(),
         };
 
         // Continuation: spawns FD streaming task AFTER REP is sent to client
@@ -906,63 +908,81 @@ struct ActiveFdStream {
 /// 2. Reads from container console (vsock/serial)
 /// 3. Publishes data via StreamPublisher with HMAC authentication
 async fn run_fd_streaming_task(
-    publisher: &mut StreamPublisher,
+    publisher: &mut AnyStreamPublisher,
     container_id: String,
     cancel_token: CancellationToken,
     sandbox_pool: Arc<SandboxPool>,
     sandbox_id: Option<String>,
 ) -> anyhow::Result<()> {
+    use tokio::io::AsyncReadExt;
+
     info!(
         container_id = %container_id,
         topic = %publisher.topic(),
         "Starting FD streaming task"
     );
 
-    // Get sandbox for this container to access console
-    let sandbox = if let Some(sid) = sandbox_id {
-        sandbox_pool.get(&sid).await
+    let sandbox = if let Some(ref sid) = sandbox_id {
+        sandbox_pool.get(sid).await
     } else {
         None
     };
 
-    // TODO: Connect to actual container console
-    // In a full implementation, this would:
-    // - For Cloud Hypervisor: Connect to vsock or serial console via API socket
-    // - For QEMU: Connect to monitor socket or virtio-serial
-    // - Read stdout/stderr and forward via publisher
+    let console_path = sandbox.as_ref().and_then(|s| s.console_socket().map(std::path::Path::to_path_buf));
 
-    if sandbox.is_none() {
-        warn!(
-            container_id = %container_id,
-            "No sandbox found for container, FD streaming limited"
-        );
-    }
-
-    // Placeholder: keep task alive until cancellation.
-    // In production, replace with actual vsock/serial reading:
-    //   let data = console.read().await?;
-    //   publisher.publish_data(&data).await?;
-    let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
-
-    loop {
-        tokio::select! {
-            _ = cancel_token.cancelled() => {
-                info!(container_id = %container_id, "FD streaming cancelled");
-                if !publisher.is_terminated() {
-                    publisher.publish_error("cancelled").await?;
+    if let Some(ref path) = console_path {
+        match tokio::net::UnixStream::connect(path).await {
+            Ok(mut stream) => {
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel_token.cancelled() => {
+                            info!(container_id = %container_id, "FD streaming cancelled");
+                            if !publisher.is_terminated() {
+                                publisher.publish_error("cancelled").await?;
+                            }
+                            return Ok(());
+                        }
+                        result = stream.read(&mut buf) => {
+                            match result? {
+                                0 => {
+                                    info!(container_id = %container_id, "Console EOF — container exited");
+                                    return Ok(());
+                                }
+                                n => {
+                                    publisher.publish_data(&buf[..n]).await?;
+                                }
+                            }
+                        }
+                    }
                 }
-                return Ok(());  // framework sees terminated=true, no-ops
             }
-            _ = interval.tick() => {
-                // Placeholder — poll vsock/serial and publish_data() here
+            Err(e) => {
+                warn!(
+                    container_id = %container_id,
+                    path = ?path,
+                    error = %e,
+                    "Failed to connect to console socket, waiting for cancellation"
+                );
+                cancel_token.cancelled().await;
+                if !publisher.is_terminated() {
+                    publisher.publish_error("console unavailable").await?;
+                }
             }
         }
+    } else {
+        if sandbox_id.is_some() {
+            warn!(container_id = %container_id, "No console socket configured for sandbox");
+        } else {
+            warn!(container_id = %container_id, "No sandbox found for container, FD streaming idle");
+        }
+        cancel_token.cancelled().await;
+        if !publisher.is_terminated() {
+            publisher.publish_error("cancelled").await?;
+        }
     }
-
-    // Note: unreachable in placeholder, but in production the loop would break
-    // on EOF from vsock/serial and fall through here for normal completion.
-    // The framework's run_stream will send Complete if we return Ok without
-    // having called complete_ref ourselves.
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1281,11 +1301,11 @@ impl WorkerHandler for WorkerService {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ZmqService Implementation — delegates to generated dispatch_worker
+// RequestService Implementation — delegates to generated dispatch_worker
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[async_trait(?Send)]
-impl ZmqService for WorkerService {
+impl RequestService for WorkerService {
     async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> AnyhowResult<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
         debug!(
             "Worker request from {} (request_id={})",
@@ -1297,10 +1317,6 @@ impl ZmqService for WorkerService {
 
     fn name(&self) -> &str {
         SERVICE_NAME
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
     }
 
     fn transport(&self) -> &TransportConfig {
@@ -1332,6 +1348,15 @@ mod tests {
 
     /// Create a test WorkerService with temporary directories
     async fn create_test_service() -> std::result::Result<(WorkerService, TempDir), Box<dyn std::error::Error>> {
+        // The moq event-bus migration (#133/#167) made WorkerService publish
+        // lifecycle events on the process-global moq event origin; without it,
+        // EventPublisher::new fails with "moq event bus not initialized".
+        // Initialize an in-process origin for tests (idempotent — first caller
+        // wins across the test binary, the rest reuse it).
+        let _ = hyprstream_rpc::moq_event::init_global_moq_event_origin(
+            hyprstream_rpc::moq_event::MoqEventOrigin::new(),
+        );
+
         let temp_dir = TempDir::new()?;
         let base_path = temp_dir.path();
 
@@ -1358,15 +1383,13 @@ mod tests {
             ..PoolConfig::default()
         };
 
-        // Create a zmq context for event publishing
-        let context = Arc::new(zmq::Context::new());
         let transport = TransportConfig::inproc("test-worker-service");
         let (signing_key, _verifying_key) = generate_signing_keypair();
 
         let backend: Arc<dyn crate::runtime::backend::SandboxBackend> = Arc::new(
             crate::runtime::kata_backend::KataBackend::new(image_config, Arc::clone(&rafs_store)),
         );
-        let service = WorkerService::new(pool_config, backend, rafs_store, context, transport, signing_key)?;
+        let service = WorkerService::new(pool_config, backend, rafs_store, transport, signing_key)?;
         Ok((service, temp_dir))
     }
 

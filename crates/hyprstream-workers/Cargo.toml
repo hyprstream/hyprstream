@@ -26,11 +26,6 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 capnp = { workspace = true }
 
-# Messaging
-tmq = { workspace = true }
-zmq = { workspace = true }
-zmq-sys = { workspace = true }  # Raw FFI for ZMQ_USE_FD socket option
-
 # Error handling
 anyhow = { workspace = true }
 thiserror = { workspace = true }

@@ -447,6 +447,17 @@ async fn resolve_authorize_query(
         return Ok(entry.params);
     }
 
+    // Enforce PAR-required mode (RFC 9126 §10.1): when the server requires PAR,
+    // inline parameters without a request_uri must be rejected.
+    if state.require_pushed_authorization_requests {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "This server requires a Pushed Authorization Request (RFC 9126). \
+             Submit your authorization parameters to /oauth/par first and use the returned request_uri.",
+        ));
+    }
+
     // Inline path: enforce the originally-required fields.
     let AuthorizeQuery {
         client_id,

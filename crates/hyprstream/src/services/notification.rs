@@ -31,7 +31,7 @@ use parking_lot::RwLock;
 use tracing::{debug, error, trace, warn};
 use uuid::Uuid;
 
-use crate::services::{Continuation, EnvelopeContext, PolicyClient, ZmqService};
+use crate::services::{Continuation, EnvelopeContext, PolicyClient, RequestService};
 use crate::services::generated::policy_client::PolicyCheck;
 use crate::services::generated::notification_client::{
     NotificationClient, NotificationHandler, NotificationResponseVariant,
@@ -301,7 +301,6 @@ pub struct NotificationService {
     expected_audience: Option<String>,
     jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
     // Infrastructure
-    context: Arc<zmq::Context>,
     transport: TransportConfig,
 }
 
@@ -309,13 +308,9 @@ impl NotificationService {
     /// Create a new notification service.
     pub fn new(
         signing_key: Arc<SigningKey>,
-        context: Arc<zmq::Context>,
         transport: TransportConfig,
     ) -> Self {
-        let stream_channel = StreamChannel::new(
-            Arc::clone(&context),
-            (*signing_key).clone(),
-        );
+        let stream_channel = StreamChannel::new((*signing_key).clone());
 
         let subscribers = Arc::new(RwLock::new(SubscriberRegistry::new()));
 
@@ -330,7 +325,6 @@ impl NotificationService {
                 }
             }
         });
-
         Self {
             subscribers,
             pending_intents: Arc::new(RwLock::new(HashMap::new())),
@@ -340,7 +334,6 @@ impl NotificationService {
             policy_client: None,
             expected_audience: None,
             jwt_key_source: None,
-            context,
             transport,
         }
     }
@@ -470,13 +463,23 @@ impl NotificationHandler for NotificationService {
 
         debug!("Subscriber {} registered for topic {}", sub_id, topic);
 
-        // Get StreamService endpoint for client to connect SUB socket
-        let stream_endpoint = self.stream_channel.stream_endpoint();
+        let moq_uds_path = hyprstream_rpc::moq_stream::global_moq_uds_path()
+            .ok_or_else(|| anyhow::anyhow!("moq stream origin not initialized — server misconfiguration"))?
+            .to_string_lossy()
+            .into_owned();
+        let moq_broadcast_path = format!(
+            "{}/{}",
+            hyprstream_rpc::moq_stream::DEFAULT_PREFIX,
+            topic
+        );
+        let stream_endpoint = String::new();
 
         Ok(NotificationResponseVariant::SubscribeResult(SubscribeResponse {
             subscription_id: sub_id.to_string(),
             assigned_topic: topic,
             stream_endpoint,
+            moq_uds_path,
+            moq_broadcast_path,
         }))
     }
 
@@ -766,11 +769,11 @@ impl NotificationHandler for NotificationService {
 }
 
 // ============================================================================
-// ZmqService implementation
+// RequestService implementation
 // ============================================================================
 
 #[async_trait(?Send)]
-impl ZmqService for NotificationService {
+impl RequestService for NotificationService {
     async fn handle_request(
         &self,
         ctx: &EnvelopeContext,
@@ -786,10 +789,6 @@ impl ZmqService for NotificationService {
 
     fn name(&self) -> &str {
         "notification"
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
     }
 
     fn transport(&self) -> &TransportConfig {

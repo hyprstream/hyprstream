@@ -44,13 +44,12 @@ fn run_shell(mut args: impl Iterator<Item = String>) {
     };
 
     let (cols, rows) = terminal_size();
-    let models = hyprstream_tui::shell_app::discover_models(
-        &models_dir.join(".registry").join("models"),
-    );
-    let models = if models.is_empty() {
-        hyprstream_tui::shell_app::discover_models(&models_dir)
+    let registry_dir = models_dir.join(".registry").join("models");
+    let models = hyprstream_tui::shell_app::discover_models(&registry_dir);
+    let (models, registry_dir) = if models.is_empty() {
+        (hyprstream_tui::shell_app::discover_models(&models_dir), models_dir.clone())
     } else {
-        models
+        (models, registry_dir)
     };
     let app = ShellApp::new(
         models,
@@ -59,6 +58,7 @@ fn run_shell(mut args: impl Iterator<Item = String>) {
         Box::new(|_, _| {}),  // no model service in standalone mode
         Box::new(|_| false),
         None,                  // no git ops in standalone mode
+        Some(registry_dir),    // re-scanned when the ModelList view opens
     );
     let config = waxterm::TerminalConfig::new().cols(cols).rows(rows);
 

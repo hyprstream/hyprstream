@@ -127,7 +127,7 @@ pub async fn handle_shell_tui(
     use crate::cli::tui_handlers::{
         create_tui_client, enter_raw_mode, restore_terminal, terminal_size,
     };
-    use hyprstream_rpc::streaming::{StreamPayload, StreamVerifier};
+    use hyprstream_rpc::streaming::StreamPayload;
 
     let client = create_tui_client(signing_key);
     let (cols, rows) = terminal_size();
@@ -166,7 +166,7 @@ pub async fn handle_shell_tui(
         signing_key.clone(),
         policy_vk,
         None,
-    );
+    )?;
     let model_vk_resp = policy_client.resolve_service_key(
         &crate::services::generated::policy_client::ResolveServiceKey {
             service_name: "model".to_owned(),
@@ -190,7 +190,7 @@ pub async fn handle_shell_tui(
             signing_key.clone(),
             model_server_vk,
             None,
-        )
+        )?
     };
     // Worker client for sandbox/container/image management.
     let worker_client = {
@@ -198,7 +198,7 @@ pub async fn handle_shell_tui(
             signing_key.clone(),
             worker_server_vk,
             None,
-        )
+        )?
     };
     let registry_server_vk = match policy_client.resolve_service_key(
         &crate::services::generated::policy_client::ResolveServiceKey {
@@ -214,7 +214,7 @@ pub async fn handle_shell_tui(
         signing_key.clone(),
         registry_server_vk,
         None,
-    );
+    )?;
 
     let (model_status_tx, mut model_status_rx) =
         tokio::sync::mpsc::channel::<ModelStatusUpdate>(32);
@@ -235,45 +235,42 @@ pub async fn handle_shell_tui(
         .context("mac_key must be 32 bytes")?;
     let topic = stdout_stream.topic.clone();
 
-    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-    let sub_endpoint = hyprstream_rpc::registry::global()
-        .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
-        .to_zmq_string();
-    let zmq_ctx = zmq::Context::new();
-    let sub_socket = zmq_ctx.socket(zmq::SUB)?;
-    sub_socket.connect(&sub_endpoint)?;
-    sub_socket.set_subscribe(topic.as_bytes())?;
-    sub_socket.set_linger(0)?;
-    sub_socket.set_rcvtimeo(1000)?; // 1s timeout so recv unblocks periodically for shutdown
+    use hyprstream_rpc::moq_stream::MoqStreamHandle;
 
-    let _recv_handle = tokio::task::spawn_blocking(move || {
-        let mut verifier = StreamVerifier::new(mac_key, topic);
+    let broadcast_path = stdout_stream.moq_broadcast_path.clone();
+    anyhow::ensure!(
+        !broadcast_path.is_empty(),
+        "TUI service did not return a moq broadcast path — server did not initialize moq transport"
+    );
+
+    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+    // #275: dial the producer's networked reach (the TUI service's bound QUIC
+    // `/moq` endpoint) rather than this process's OWN local moq UDS plane. The
+    // shared `MoqStreamHandle::networked` consumer prefers the StreamInfo's reach
+    // and falls back to the local UDS only when no dialable reach is present —
+    // mirroring the chat-inference consumer that this fix is modeled on. (Before
+    // the fix this bespoke loop did `connect_uds(moq_uds_path)`, which timed out
+    // because the PTY broadcast lives on the *TUI service's* plane, a different
+    // process from this viewer.)
+    let reach = stdout_stream.reach.clone();
+    let mut handle = MoqStreamHandle::networked(reach, broadcast_path, mac_key, topic);
+    let _recv_handle = tokio::spawn(async move {
         loop {
-            let mut frames: Vec<Vec<u8>> = Vec::with_capacity(3);
-            match sub_socket.recv_bytes(0) {
-                Ok(f) => frames.push(f),
-                Err(zmq::Error::EAGAIN) => {
-                    // Timeout — check if the receiver is still alive.
-                    if frame_tx.is_closed() { return; }
-                    continue;
+            match handle.recv_next().await {
+                Ok(Some(StreamPayload::Data(data))) => {
+                    if frame_tx.send(data).await.is_err() { return; }
                 }
-                Err(_) => break,
-            }
-            while sub_socket.get_rcvmore().unwrap_or(false) {
-                match sub_socket.recv_bytes(0) {
-                    Ok(f) => frames.push(f),
-                    Err(_) => break,
+                // A terminal Complete payload or a clean end-of-stream both end
+                // the loop cleanly.
+                Ok(Some(StreamPayload::Complete(_))) | Ok(None) => return,
+                Ok(Some(StreamPayload::Error(msg))) => {
+                    tracing::warn!("moq stream error: {msg}");
+                    return;
                 }
-            }
-            match verifier.verify(&frames) {
-                Ok(payloads) => {
-                    for p in payloads {
-                        if let StreamPayload::Data(data) = p {
-                            if frame_tx.blocking_send(data).is_err() { return; }
-                        }
-                    }
-                }
-                Err(e) => tracing::warn!("Frame stream verification failed: {e}"),
+                // Other payloads (e.g. Tagged) carry no ANSI frame bytes.
+                Ok(Some(_)) => continue,
+                Err(e) => { tracing::warn!("moq frame recv: {e}"); return; }
             }
         }
     });
@@ -836,8 +833,7 @@ pub async fn handle_shell_tui(
     let _ = terminal.flush();
     restore_terminal(&orig);
 
-    // Drop ZMQ clients off-thread: TMQ's RequestSender holds an internal
-    // runtime that panics if dropped inside an async context.
+    // Drop RPC clients off-thread to avoid dropping futures inside an async context.
     tokio::task::spawn_blocking(move || {
         drop(client);
         drop(model_client);
@@ -848,7 +844,7 @@ pub async fn handle_shell_tui(
 }
 
 // ============================================================================
-// dispatch_outputs — translate CompositorOutput to ZMQ calls
+// dispatch_outputs — translate CompositorOutput to RPC calls
 // ============================================================================
 
 // ============================================================================
@@ -878,7 +874,7 @@ fn composite_draw(
     });
 }
 
-/// Dispatch compositor outputs to the appropriate ZMQ RPC calls.
+/// Dispatch compositor outputs to the appropriate RPC calls.
 /// Returns `true` if the session should exit.
 async fn dispatch_outputs(
     compositor: &mut Compositor,
@@ -943,7 +939,7 @@ async fn dispatch_outputs(
     false
 }
 
-/// Translate an `RpcRequest` into ZMQ calls and return `CompositorInput`
+/// Translate an `RpcRequest` into RPC calls and return `CompositorInput`
 /// events to feed back (e.g. updated window list after create/close).
 async fn handle_rpc(
     compositor: &mut Compositor,
@@ -1093,7 +1089,7 @@ async fn handle_rpc(
             // Fetch tool list once; used by both the spawner (for chat template)
             // and the ChatApp (for dispatch + descriptions).
             let (tool_caller, tool_descriptions, openai_tools) =
-                crate::tui::zmq_transport::make_tool_caller(signing_key);
+                crate::tui::rpc_transport::make_tool_caller(signing_key);
 
             // Shared gen_config Arc — passed to both the spawner and the ChatApp.
             // Use model-specific defaults from RPC if available, otherwise fall back.
@@ -1150,7 +1146,7 @@ async fn handle_rpc(
                     let save_hook: SaveHook = Box::new(move |entries| {
                         let _ = save_store.save(&uuid_for_save, entries);
                     });
-                    let spawner = crate::tui::zmq_transport::make_chat_spawner(
+                    let spawner = crate::tui::rpc_transport::make_chat_spawner(
                         signing_key, &model_ref, Some(openai_tools.clone()),
                         gen_config.clone(),
                     );
@@ -1167,7 +1163,7 @@ async fn handle_rpc(
                         format!("Private store dir unavailable: {e}"),
                         ToastLevel::Warn,
                     );
-                    let spawner = crate::tui::zmq_transport::make_chat_spawner(
+                    let spawner = crate::tui::rpc_transport::make_chat_spawner(
                         signing_key, &model_ref, Some(openai_tools.clone()),
                         gen_config.clone(),
                     );
@@ -1278,7 +1274,7 @@ async fn handle_rpc(
         | RpcRequest::ServiceStopAll
         | RpcRequest::ServiceStartAll => {
             compositor.chrome.push_toast(
-                "Service management not yet available (requires ZMQ service RPC)".to_owned(),
+                "Service management not yet available".to_owned(),
                 ToastLevel::Warn,
             );
             vec![]
@@ -1688,9 +1684,15 @@ async fn fetch_models(
 
     // Resolve registry + model keys via PolicyClient
     let policy_vk = signing_key.verifying_key();
-    let policy_client = crate::services::PolicyClient::for_service(
+    let policy_client = match crate::services::PolicyClient::for_service(
         signing_key.clone(), policy_vk, None,
-    );
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("Failed to create PolicyClient: {e}");
+            return Vec::new();
+        }
+    };
     let registry_server_vk = match policy_client.resolve_service_key(
         &crate::services::generated::policy_client::ResolveServiceKey {
             service_name: "registry".to_owned(),
@@ -1722,20 +1724,28 @@ async fn fetch_models(
         }
     };
 
-    let registry_endpoint = hyprstream_rpc::registry::global()
-        .endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep)
-        .to_zmq_string();
-    let registry: crate::services::RegistryClient = crate::services::RegistryClient::for_endpoint(
-        &registry_endpoint,
+    let registry: crate::services::RegistryClient = match crate::services::RegistryClient::for_service(
         signing_key.clone(),
         registry_server_vk,
         None,
-    );
-    let model_client_for_status = crate::services::generated::model_client::ModelClient::for_service(
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("Failed to create RegistryClient: {e}");
+            return Vec::new();
+        }
+    };
+    let model_client_for_status = match crate::services::generated::model_client::ModelClient::for_service(
         signing_key.clone(),
         model_server_vk,
         None,
-    );
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("Failed to create ModelClient: {e}");
+            return Vec::new();
+        }
+    };
     let registry_models_dir = models_dir.to_path_buf();
     let status_timeout = std::time::Duration::from_millis(500);
 
@@ -1784,7 +1794,7 @@ async fn fetch_models(
 }
 
 // ============================================================================
-// ZMQ RPC helpers
+// RPC helpers
 // ============================================================================
 
 async fn list_windows_rpc(client: &TuiClient) -> anyhow::Result<Vec<WindowSummary>> {

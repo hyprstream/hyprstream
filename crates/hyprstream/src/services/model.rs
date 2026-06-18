@@ -45,7 +45,7 @@ use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::{global as registry, SocketKind};
 use hyprstream_rpc::transport::TransportConfig;
 use lru::LruCache;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
@@ -80,16 +80,6 @@ pub struct LoadedModel {
     pub generation_defaults: crate::config::SamplingParams,
 }
 
-/// How InferenceService instances are spawned
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SpawnMode {
-    /// Run InferenceService in-process (current behavior)
-    #[default]
-    InProcess,
-    /// Spawn InferenceService as separate process via callback pattern
-    Spawned,
-}
-
 /// Model service configuration
 pub struct ModelServiceConfig {
     /// Maximum number of models to keep loaded
@@ -98,10 +88,6 @@ pub struct ModelServiceConfig {
     pub max_context: Option<u32>,
     /// KV cache quantization type
     pub kv_quant: KVQuantType,
-    /// How to spawn InferenceService instances
-    pub spawn_mode: SpawnMode,
-    /// Callback endpoint for spawned mode
-    pub callback_endpoint: Option<String>,
 }
 
 impl Default for ModelServiceConfig {
@@ -110,8 +96,6 @@ impl Default for ModelServiceConfig {
             max_models: 5,
             max_context: None,
             kv_quant: KVQuantType::None,
-            spawn_mode: SpawnMode::InProcess,
-            callback_endpoint: None,
         }
     }
 }
@@ -133,14 +117,7 @@ pub struct ModelServiceInner {
     notification_publisher: NotificationPublisher,
     /// Registry client for resolving model paths
     registry: RegistryClient,
-    /// Callback router for spawned mode (None for in-process)
-    #[allow(dead_code)]
-    callback_router: Option<crate::services::callback::CallbackRouter>,
-    /// Spawned instances by model ref (for spawned mode)
-    #[allow(dead_code)]
-    spawned_instances: RwLock<HashMap<String, crate::services::callback::Instance>>,
     // Infrastructure (for Spawnable)
-    context: Arc<zmq::Context>,
     transport: TransportConfig,
     /// Expected JWT audience for token validation (RFC 8707).
     expected_audience: Option<String>,
@@ -181,7 +158,6 @@ impl ModelService {
         signing_key: SigningKey,
         policy_client: PolicyClient,
         registry: RegistryClient,
-        context: Arc<zmq::Context>,
         transport: TransportConfig,
     ) -> Result<Self> {
         // SAFETY: 5 is a valid non-zero value
@@ -204,7 +180,7 @@ impl ModelService {
             signing_key.clone(),
             notif_vk,
             None,
-        );
+        )?;
         let notification_publisher = NotificationPublisher::new(notif_client, signing_key.clone());
 
         Ok(Self { inner: Arc::new(ModelServiceInner {
@@ -215,9 +191,6 @@ impl ModelService {
             policy_client,
             notification_publisher,
             registry,
-            callback_router: None,
-            spawned_instances: RwLock::new(HashMap::new()),
-            context,
             transport,
             expected_audience: None,
             jwt_key_source: None,
@@ -253,61 +226,60 @@ impl ModelService {
         self
     }
 
-    /// Create a model service with callback router for spawned mode
-    pub async fn with_callback_router(
-        config: ModelServiceConfig,
-        signing_key: SigningKey,
-        policy_client: PolicyClient,
-        registry: RegistryClient,
-        callback_router: crate::services::callback::CallbackRouter,
-        context: Arc<zmq::Context>,
-        transport: TransportConfig,
-    ) -> Result<Self> {
-        const DEFAULT_CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(5) {
-            Some(n) => n,
-            None => unreachable!(),
-        };
-        let cache_size = NonZeroUsize::new(config.max_models).unwrap_or(DEFAULT_CACHE_SIZE);
-
-        let key_resp = policy_client.resolve_service_key(
-            &crate::services::generated::policy_client::ResolveServiceKey {
-                service_name: "notification".to_owned(),
-            },
-        ).await?;
-        let notif_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
-            key_resp.verifying_key.as_slice().try_into()
-                .map_err(|_| anyhow!("Invalid verifying key length"))?,
-        ).map_err(|e| anyhow!("Invalid Ed25519 key: {e}"))?;
-        let notif_client = NotificationClient::for_service(
-            signing_key.clone(),
-            notif_vk,
-            None,
-        );
-        let notification_publisher = NotificationPublisher::new(notif_client, signing_key.clone());
-
-        Ok(Self { inner: Arc::new(ModelServiceInner {
-            loaded_models: RwLock::new(LruCache::new(cache_size)),
-            pending_loads: Mutex::new(HashSet::new()),
-            config,
-            signing_key,
-            policy_client,
-            notification_publisher,
-            registry,
-            callback_router: Some(callback_router),
-            spawned_instances: RwLock::new(HashMap::new()),
-            context,
-            transport,
-            expected_audience: None,
-            jwt_key_source: None,
-            fs_tree: std::sync::OnceLock::new(),
-        })})
-    }
-
     /// Derive the deterministic IPC endpoint for a model reference.
     fn inference_endpoint(model_ref_str: &str) -> String {
         let safe_name = model_ref_str.replace([':', '/', '\\'], "-");
         let service_name = format!("inference-{safe_name}");
-        registry().endpoint(&service_name, SocketKind::Rep).to_zmq_string()
+        registry().endpoint(&service_name, SocketKind::Rep).endpoint_string()
+    }
+
+    /// Resolve a model identifier string to a [`ModelRef`], supporting MIR.
+    ///
+    /// Accepts three identifier forms:
+    /// - a registry name / HF repo id (e.g. `Qwen3-0.6B`, optionally `name:ref`),
+    /// - a MIR string (e.g. `mir:model.transformer.clip-l:stable-diffusion-xl`).
+    ///
+    /// MIR strings are matched against registered models by comparing the MIR
+    /// `series` to the series-key of each registered model's name (see
+    /// [`crate::storage::mir`] for the mapping + lossiness notes). MIR carries no
+    /// git revision, so the resolved ref uses the default branch.
+    async fn resolve_model_ref(&self, model_ref_str: &str) -> Result<ModelRef> {
+        if crate::storage::mir::is_mir(model_ref_str) {
+            let mir = crate::storage::mir::Mir::parse(model_ref_str)
+                .map_err(|e| anyhow!("Invalid MIR '{}': {}", model_ref_str, e))?;
+
+            let repos = self
+                .registry
+                .list()
+                .await
+                .map_err(|e| anyhow!("Failed to list registry for MIR resolution: {}", e))?;
+
+            let names: Vec<String> = repos.into_iter().map(|r| r.name).collect();
+            let name = crate::storage::mir::resolve_mir_against_names(
+                &mir,
+                names.iter().map(String::as_str),
+            )
+            .map_err(|e| anyhow!("Failed to resolve MIR '{}': {}", mir, e))?;
+            ModelRef::parse(&name)
+        } else {
+            ModelRef::parse(model_ref_str)
+        }
+    }
+
+    /// Emit a MIR for a registered model name.
+    ///
+    /// LOSSY: domain defaults to `model`, architecture to `unclassified`,
+    /// variant to `base`; only the series is derived from the name. See
+    /// [`crate::storage::mir::mir_from_internal_name`].
+    pub async fn mir_for_model(&self, model_ref_str: &str) -> Result<crate::storage::mir::Mir> {
+        let parsed = ModelRef::parse(model_ref_str)?;
+        // Verify the model exists in the registry before emitting a MIR.
+        self.registry
+            .get_by_name(&parsed.model)
+            .await
+            .map_err(|e| anyhow!("Model '{}' not found in registry: {}", parsed.model, e))?;
+        crate::storage::mir::mir_from_internal_name(&parsed.model)
+            .map_err(|e| anyhow!("Cannot derive MIR for '{}': {}", parsed.model, e))
     }
 
     /// Load a model by reference with optional per-model config, returns the inference endpoint
@@ -348,8 +320,8 @@ impl ModelService {
 
     /// Inner model loading logic, called by load_model() which manages pending_loads.
     async fn load_model_inner(&self, model_ref_str: &str, max_context: Option<u32>, kv_quant: Option<KVQuantType>) -> Result<String> {
-        // Parse model reference
-        let model_ref = ModelRef::parse(model_ref_str)?;
+        // Parse/resolve model reference (supports MIR identifiers)
+        let model_ref = self.resolve_model_ref(model_ref_str).await?;
 
         // Get model path from registry
         let tracked = self.registry.get_by_name(&model_ref.model).await
@@ -390,7 +362,6 @@ impl ModelService {
         let fs: Option<crate::services::WorktreeClient> = Some(repo_client.worktree(&branch_name));
 
         // Start InferenceService for this model via standard Spawnable infrastructure
-        let zmq_ctx = Arc::clone(hyprstream_rpc::ZmqService::context(self));
         let spawner = hyprstream_service::ServiceSpawner::threaded();
 
         let transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(&endpoint);
@@ -399,7 +370,6 @@ impl ModelService {
             runtime_config,
             self.signing_key.verifying_key(),
             self.signing_key.clone(),
-            zmq_ctx,
             transport,
             fs,
         );
@@ -420,7 +390,7 @@ impl ModelService {
             self.signing_key.clone(),
             self.signing_key.verifying_key(),
             None,
-        );
+        )?;
 
         // Load TTT config from model's config.json (if TTT is enabled)
         let ttt_config = crate::runtime::model_config::ModelConfig::load_training_config(&model_path)
@@ -796,8 +766,8 @@ impl TttHandler for ModelService {
         &self, _ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &WriteTttConfigRequest,
     ) -> Result<()> {
-        // 1. Parse model ref and resolve worktree path
-        let parsed = ModelRef::parse(model_ref)?;
+        // 1. Parse/resolve model ref (supports MIR) and resolve worktree path
+        let parsed = self.resolve_model_ref(model_ref).await?;
         let tracked = self.registry.get_by_name(&parsed.model).await
             .map_err(|e| anyhow!("Model '{}' not found in registry: {}", parsed.model, e))?;
         let repo_client = self.registry.repo(&tracked.id);
@@ -896,8 +866,8 @@ impl AdapterHandler for ModelService {
         &self, _ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, value: &str,
     ) -> Result<AdapterInfo> {
-        // Resolve model_ref to a worktree client (does NOT require model loaded in memory)
-        let parsed = ModelRef::parse(model_ref)?;
+        // Resolve model_ref (supports MIR) to a worktree client (does NOT require model loaded in memory)
+        let parsed = self.resolve_model_ref(model_ref).await?;
         let tracked = self.registry.get_by_name(&parsed.model).await
             .map_err(|e| anyhow!("Model '{}' not found in registry: {}", parsed.model, e))?;
         let repo_client = self.registry.repo(&tracked.id);
@@ -1297,11 +1267,11 @@ impl ModelService {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ZmqService Implementation — delegates to generated dispatch_model
+// RequestService Implementation — delegates to generated dispatch_model
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[async_trait(?Send)]
-impl crate::services::ZmqService for ModelService {
+impl crate::services::RequestService for ModelService {
     async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
         debug!(
             "Model request from {} (id={})",
@@ -1405,10 +1375,6 @@ impl crate::services::ZmqService for ModelService {
 
     fn name(&self) -> &str {
         "model"
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
     }
 
     fn transport(&self) -> &TransportConfig {

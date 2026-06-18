@@ -99,7 +99,6 @@ pub fn decrypt_envelope(
 ///
 /// Two shared secrets are derived independently and combined via KDF.
 /// Returns `(ciphertext, ephemeral_public, kem_ciphertext)`.
-#[cfg(feature = "pq-hybrid")]
 pub fn encrypt_envelope_hybrid(
     plaintext: &[u8],
     server_ed25519_pubkey: &VerifyingKey,
@@ -132,7 +131,6 @@ pub fn encrypt_envelope_hybrid(
 }
 
 /// Hybrid envelope decryption: X25519 DH + ML-KEM-768 + AES-256-GCM-SIV.
-#[cfg(feature = "pq-hybrid")]
 pub fn decrypt_envelope_hybrid(
     ciphertext: &[u8],
     client_ephemeral_public: &[u8; 32],
@@ -161,7 +159,6 @@ pub fn decrypt_envelope_hybrid(
 }
 
 /// Derive AES-256 key from combined X25519 + ML-KEM shared secrets.
-#[cfg(feature = "pq-hybrid")]
 fn derive_hybrid_envelope_key(
     shared_x25519: &[u8; 32],
     shared_kem: &[u8; 32],
@@ -238,7 +235,6 @@ mod tests {
         assert_ne!(ct1, ct2);
     }
 
-    #[cfg(feature = "pq-hybrid")]
     #[test]
     fn hybrid_roundtrip() {
         let server_key = SigningKey::generate(&mut OsRng);
@@ -257,7 +253,6 @@ mod tests {
         assert_eq!(decrypted, plaintext);
     }
 
-    #[cfg(feature = "pq-hybrid")]
     #[test]
     fn hybrid_wrong_kem_key_fails() {
         let server_key = SigningKey::generate(&mut OsRng);

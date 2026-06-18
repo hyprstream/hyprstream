@@ -340,7 +340,7 @@ pub fn generate_portable_dispatch(
             /// Normal response — serialized JSON string.
             Response(String),
             /// Streaming response — JSON string of the parsed StreamInfo.
-            /// The caller should parse this to get endpoint, serverPubkey, streamId,
+            /// The caller should parse this to get endpoint, dhPublic, streamId,
             /// then set up the SUB subscription.
             Stream(String),
         }

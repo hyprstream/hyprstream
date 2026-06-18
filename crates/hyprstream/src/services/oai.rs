@@ -1,18 +1,18 @@
-//! OAIService - OpenAI-compatible HTTP API with ZMQ control channel
+//! OAIService - OpenAI-compatible HTTP API with RPC control channel
 //!
 //! Dual-protocol service:
 //! - HTTP server for OpenAI API requests (data plane)
-//! - ZMQ REQ/REP for health, metrics, shutdown (control plane)
+//! - RPC (iroh/UDS) for health, metrics, shutdown (control plane)
 //!
 //! # Architecture
 //!
 //! ```text
 //! HTTP Clients ──► HTTP Server (Axum) ──► OAIService
 //!                        │
-//!                        ├──► ModelZmqClient ──► ModelService
+//!                        ├──► ModelClient ──► ModelService
 //!                        └──► PolicyClient ──► PolicyService
 //!
-//! Control ──► ZMQ REP Socket ──► OAIService (health, metrics)
+//! Control ──► RPC endpoint ──► OAIService (health, metrics)
 //! ```
 //!
 //! # Usage
@@ -45,14 +45,14 @@ use tracing::info;
 /// Service name for registry and logging
 pub const SERVICE_NAME: &str = "oai";
 
-/// OAIService - OpenAI-compatible HTTP API with ZMQ control channel
+/// OAIService - OpenAI-compatible HTTP API with RPC control channel
 ///
 /// This service provides:
 /// - HTTP server with OpenAI-compatible API endpoints
-/// - ZMQ REQ/REP control channel for health checks and metrics
+/// - RPC control channel for health checks and metrics
 ///
-/// The HTTP server handles all inference requests via ModelZmqClient,
-/// which communicates with ModelService over ZMQ.
+/// The HTTP server handles all inference requests via ModelClient,
+/// which communicates with ModelService over the RPC transport.
 pub struct OAIService {
     /// OAI-specific configuration (host, port, TLS)
     config: OAIConfig,
@@ -63,10 +63,7 @@ pub struct OAIService {
     /// Shared server state containing clients and metrics
     server_state: ServerState,
 
-    /// ZMQ context for control socket
-    context: Arc<zmq::Context>,
-
-    /// Transport configuration for ZMQ control channel
+    /// Transport configuration for RPC control channel
     control_transport: TransportConfig,
 
     /// Verifying key for envelope verification
@@ -81,15 +78,13 @@ impl OAIService {
     ///
     /// * `config` - OAI configuration (host, port, TLS settings)
     /// * `tls_config` - Global TLS configuration
-    /// * `server_state` - Shared state with ZMQ clients and metrics
-    /// * `context` - ZMQ context for control socket
-    /// * `control_transport` - Transport for ZMQ control channel
+    /// * `server_state` - Shared state with RPC clients and metrics
+    /// * `control_transport` - Transport for RPC control channel
     /// * `verifying_key` - Key for verifying signed envelopes
     pub fn new(
         config: OAIConfig,
         tls_config: TlsConfig,
         server_state: ServerState,
-        context: Arc<zmq::Context>,
         control_transport: TransportConfig,
         verifying_key: VerifyingKey,
     ) -> Self {
@@ -97,7 +92,6 @@ impl OAIService {
             config,
             tls_config,
             server_state,
-            context,
             control_transport,
             verifying_key,
         }
@@ -113,10 +107,6 @@ impl OAIService {
 impl Spawnable for OAIService {
     fn name(&self) -> &str {
         SERVICE_NAME
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
     }
 
     fn registrations(&self) -> Vec<(SocketKind, TransportConfig)> {

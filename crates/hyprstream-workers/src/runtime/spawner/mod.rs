@@ -48,7 +48,6 @@ pub use hyprstream_service::{
     SpawnerBackend,
     SystemdBackend,
     // ServiceSpawner types
-    ProxyService,
     ServiceKind,
     ServiceMode,
     ServiceSpawner,

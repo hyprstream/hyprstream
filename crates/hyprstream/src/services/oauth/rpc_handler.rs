@@ -1,7 +1,7 @@
-//! ZMQ RPC handler for user CRUD operations.
+//! OAuth RPC handler for user CRUD operations.
 //!
 //! Implements the `OauthHandler` trait (generated from `oauth.capnp`)
-//! and `ZmqService` for ZMQ transport. Delegates to `UserService` for
+//! and `RequestService` for ZMQ transport. Delegates to `UserService` for
 //! shared CRUD logic.
 
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use hyprstream_rpc::prelude::*;
-use hyprstream_rpc::service::{Continuation, EnvelopeContext, ZmqService};
+use hyprstream_rpc::service::{Continuation, EnvelopeContext, RequestService};
 use hyprstream_rpc::transport::TransportConfig;
 
 use crate::auth::{UserFilter, decode_pubkey_base64};
@@ -25,24 +25,21 @@ use super::state::OAuthState;
 /// ZMQ RPC handler for OAuth user management.
 ///
 /// Wraps `UserService` and implements the generated `OauthHandler` trait
-/// for Cap'n Proto serialization, and `ZmqService` for ZMQ transport.
-pub struct OAuthZmqHandler {
+/// for Cap'n Proto serialization, and `RequestService` for ZMQ transport.
+pub struct OAuthRpcHandler {
     state: Arc<OAuthState>,
-    context: Arc<zmq::Context>,
     transport: TransportConfig,
     signing_key: SigningKey,
 }
 
-impl OAuthZmqHandler {
+impl OAuthRpcHandler {
     pub fn new(
         state: Arc<OAuthState>,
-        context: Arc<zmq::Context>,
         transport: TransportConfig,
         signing_key: SigningKey,
     ) -> Self {
         Self {
             state,
-            context,
             transport,
             signing_key,
         }
@@ -77,7 +74,7 @@ impl OAuthZmqHandler {
 }
 
 #[async_trait(?Send)]
-impl OauthHandler for OAuthZmqHandler {
+impl OauthHandler for OAuthRpcHandler {
     async fn authorize(
         &self,
         _ctx: &EnvelopeContext,
@@ -266,7 +263,7 @@ impl OauthHandler for OAuthZmqHandler {
 
 
 #[async_trait(?Send)]
-impl ZmqService for OAuthZmqHandler {
+impl RequestService for OAuthRpcHandler {
     async fn handle_request(
         &self,
         ctx: &EnvelopeContext,
@@ -277,10 +274,6 @@ impl ZmqService for OAuthZmqHandler {
 
     fn name(&self) -> &str {
         "oauth"
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
     }
 
     fn transport(&self) -> &TransportConfig {
