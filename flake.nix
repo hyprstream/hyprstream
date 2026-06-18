@@ -108,8 +108,16 @@
           # Tests require runtime libs (libstdc++, libtorch) not available in build sandbox
           doCheck = false;
 
-          # Build only the main binary
-          cargoExtraArgs = "-p hyprstream";
+          # Release build of the main binary only
+          cargoExtraArgs = "--release -p hyprstream";
+
+          # sccache: caches individual crate compilations across variants and rebuilds.
+          # Cache dir is exposed into the Nix sandbox via extra-sandbox-paths in nix.conf.
+          # The cache is sparse/LRU — SCCACHE_CACHE_SIZE is an eviction ceiling, not
+          # pre-allocated space.
+          RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
+          SCCACHE_DIR = "/var/cache/sccache";
+          SCCACHE_CACHE_SIZE = "75G";
 
 
           # Fix: kata-containers protocols/build.rs generates protobuf .rs files
@@ -155,6 +163,8 @@
 
               # Passthru for downstream use
               passthru = { inherit variant libtorch; };
+
+              meta.mainProgram = "hyprstream";
             };
           in craneLib.buildPackage craneArgs;
 
