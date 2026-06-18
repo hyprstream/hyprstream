@@ -196,44 +196,57 @@ where
 
 /// Read an entire stream into [`Bytes`], capping the total at `cap` bytes.
 ///
-/// [`RecvStream::read_all`] is unbounded and a hostile peer could exhaust
-/// memory with it. This reads **directly into the output buffer** — no separate
-/// scratch buffer + `extend_from_slice` second copy; only the one unavoidable
-/// kernel→userspace copy that `RecvStream::read(&mut [u8])` forces (the trait,
-/// `web_transport_trait` 0.3.x, exposes no `Bytes`-yielding chunk read). Errors
-/// out if the peer sends more than `cap` bytes before FIN.
+/// Uses [`RecvStream::read_chunk`] (a defaulted trait method): quinn and iroh
+/// override it to return `Bytes` referencing the QUIC receive buffer, so a
+/// control message that arrives as a **single chunk** (the common case) is
+/// returned **fully zero-copy** — no allocation, no copy. The UDS impl inherits
+/// the trait's one-copy default (local socket, fine). Multi-chunk frames pay at
+/// most one concatenation. Errors out if the peer sends more than `cap` bytes
+/// before FIN (`RecvStream::read_all` is unbounded — a hostile peer could
+/// exhaust memory with it).
 ///
 /// This is the **control plane** (`MAX_FRAME_BYTES` = 4 MiB). Bulk/tensor
 /// payloads ride the streaming plane, where moq-net already yields `Bytes`.
 pub async fn read_to_cap<R: RecvStream>(recv: &mut R, cap: usize) -> Result<Bytes> {
-    // Allocation granularity for the output buffer.
-    const CHUNK: usize = 64 * 1024;
-    let mut buf: Vec<u8> = Vec::new();
+    let mut first: Option<Bytes> = None;
+    let mut acc: Option<bytes::BytesMut> = None;
+    let mut total: usize = 0;
     loop {
-        let filled = buf.len();
-        // Expose a writable window at the tail and read straight into it.
-        buf.resize(filled + CHUNK, 0);
+        // +1 so a chunk that would push us over `cap` is still surfaced, then rejected.
+        let max = cap.saturating_sub(total).saturating_add(1);
         match recv
-            .read(&mut buf[filled..])
+            .read_chunk(max)
             .await
-            .map_err(|e| anyhow!("recv read: {e}"))?
+            .map_err(|e| anyhow!("recv read_chunk: {e}"))?
         {
-            None => {
-                buf.truncate(filled); // FIN
-                break;
-            }
-            Some(0) => {
-                buf.truncate(filled);
-            }
-            Some(n) => {
-                buf.truncate(filled + n);
-                if buf.len() > cap {
+            None => break, // FIN
+            Some(chunk) if chunk.is_empty() => continue,
+            Some(chunk) => {
+                total += chunk.len();
+                if total > cap {
                     bail!("frame exceeds {cap} byte cap");
+                }
+                match (first.take(), acc.as_mut()) {
+                    // Keep the first chunk as-is (zero-copy if it's the only one).
+                    (None, None) => first = Some(chunk),
+                    // Second chunk: start accumulating from the held first.
+                    (Some(f), None) => {
+                        let mut b = bytes::BytesMut::with_capacity(total);
+                        b.extend_from_slice(&f);
+                        b.extend_from_slice(&chunk);
+                        acc = Some(b);
+                    }
+                    (None, Some(b)) => b.extend_from_slice(&chunk),
+                    (Some(_), Some(_)) => unreachable!("first is taken once acc exists"),
                 }
             }
         }
     }
-    Ok(Bytes::from(buf))
+    Ok(match (first, acc) {
+        (Some(f), None) => f,          // single chunk: fully zero-copy
+        (None, Some(b)) => b.freeze(), // multi-chunk: one concatenation
+        _ => Bytes::new(),             // empty / FIN-first
+    })
 }
 
 // ============================================================================
