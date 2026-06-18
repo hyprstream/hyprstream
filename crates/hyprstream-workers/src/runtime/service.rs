@@ -1348,6 +1348,15 @@ mod tests {
 
     /// Create a test WorkerService with temporary directories
     async fn create_test_service() -> std::result::Result<(WorkerService, TempDir), Box<dyn std::error::Error>> {
+        // The moq event-bus migration (#133/#167) made WorkerService publish
+        // lifecycle events on the process-global moq event origin; without it,
+        // EventPublisher::new fails with "moq event bus not initialized".
+        // Initialize an in-process origin for tests (idempotent — first caller
+        // wins across the test binary, the rest reuse it).
+        let _ = hyprstream_rpc::moq_event::init_global_moq_event_origin(
+            hyprstream_rpc::moq_event::MoqEventOrigin::new(),
+        );
+
         let temp_dir = TempDir::new()?;
         let base_path = temp_dir.path();
 
