@@ -108,8 +108,8 @@
           # Tests require runtime libs (libstdc++, libtorch) not available in build sandbox
           doCheck = false;
 
-          # Release build of the main binary only
-          cargoExtraArgs = "--release -p hyprstream";
+          # crane passes --release by default; -p scopes to the main crate only
+          cargoExtraArgs = "-p hyprstream";
 
           # sccache: caches individual crate compilations across variants and rebuilds.
           # Cache dir is exposed into the Nix sandbox via extra-sandbox-paths in nix.conf.
