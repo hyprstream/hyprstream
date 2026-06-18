@@ -21,7 +21,7 @@ Most servers run a frozen model. HyprStream's models **get better while they ser
 
 ### 📁 Everything is a file
 
-Models, inference streams, MCP tools, repositories, and even **sandboxed applications** are all just files in a composable namespace. Want to run a model? Open it. Stream tokens? Read a file under `/stream/`. Drive a service? Write its `ctl` file. And you compose all of it from a **sandboxed, Unix-like shell** — `cat`, pipes, and a real scripting language — which is precisely how agents use tools here: a familiar shell that can't touch the host, instead of bespoke JSON tool APIs. Give an agent a tool, or run an untrusted app, and it's a file you mount, scope, and revoke.
+Models, inference streams, MCP tools, repositories, and even **sandboxed applications** are all just files in a composable namespace. Want to run a model? Open it. Stream tokens? Read a file under `/stream/`. Drive a service? Write its `ctl` file. And you compose all of it from a **sandboxed, Unix-like shell** — `cat`, pipes, and a real scripting language — the same interface humans and agents use to drive models, tools, and apps. Give an agent a tool, or run an untrusted app, and it's a file you mount, scope, and revoke.
 
 This Plan 9-inspired design (see [docs/vfs.md](docs/vfs.md)) gives one uniform interface for everything and per-process namespaces for true isolation. In the browser, HyprStream's WASM clients run as **[Wanix](https://github.com/tractordev/wanix) tasks**, and the VFS mounts Wanix's filesystem over 9P — so the *same* namespace spans your host and the browser. **Application sandboxing** is built in two ways: native workloads run in Kata microVMs ([docs/workers-architecture.md](docs/workers-architecture.md)); browser apps and agent tool-calls run as capability-limited Wanix WASM tasks (WASI, no ambient network) — each reachable as files, but unable to touch anything you didn't mount for it. Composable, network-transparent, capability-scoped.
 
@@ -149,7 +149,7 @@ hyprstream quick infer qwen3-small:main \
 
 HyprStream is organized around a **Plan 9-inspired virtual filesystem** ([docs/vfs.md](docs/vfs.md)): resources are named files in a composable namespace rather than ad-hoc APIs. In the browser it runs on **[Wanix](https://github.com/tractordev/wanix)** — the same namespace, extended to the web.
 
-- **A shell, not an API** — drive the whole namespace from a **sandboxed, Unix-like shell**: `cat`, pipes, redirection, and a real scripting language (Tcl, via [molt](https://github.com/wduquette/molt)) — e.g. `set t [cat /config/temperature]; expr {$t + 0.1}`. This is the tool-use surface an agent gets: familiar shell commands instead of bespoke JSON tool schemas. And it's a locked-down guest — **no direct host I/O**, dangerous commands removed, with instruction- and recursion-limits — so untrusted tool calls and scripts stay contained.
+- **Driven by a shell** — the whole namespace is scriptable from a **sandboxed, Unix-like shell**: `cat`, pipes, redirection, and a real scripting language (Tcl, via [molt](https://github.com/wduquette/molt)) — e.g. `set t [cat /config/temperature]; expr {$t + 0.1}`. The surface humans use is the surface agents use to call tools. It runs as a locked-down guest — **no direct host I/O**, dangerous commands removed, with instruction- and recursion-limits — so untrusted tool calls and scripts stay contained.
 - **Models as branches** — every model is a Git repo; every adaptation is a worktree (`model:branch`). Versioned, diffable, reversible weights.
 - **Streams as files** — token streams, events, and container I/O are read/written under `/stream/`-style mounts with backpressure and at-least-once / lossless QoS presets.
 - **Control via `ctl`** — services are steered by writing their `ctl` file (a Plan 9 idiom), not bespoke management RPCs.
@@ -157,7 +157,7 @@ HyprStream is organized around a **Plan 9-inspired virtual filesystem** ([docs/v
 - **Per-process namespaces + sandboxing** — each workload gets its own namespace. Untrusted *native* workloads run in **Kata microVMs** ([docs/workers-architecture.md](docs/workers-architecture.md)); *browser* apps and agent tool-calls run as **Wanix WASM tasks** (WASI, no ambient network). Either way a sandbox is reachable as files but can't touch anything not mounted for it — capability-scoped by construction.
 - **Wanix bridge** — Wanix's own filesystem mounts into the namespace at `/wanix/` over 9P, so browser and host resources compose into one tree.
 
-The payoff: one uniform, network-transparent interface for models, streams, tools, and apps — composable across processes and across federated nodes.
+The payoff is one abstraction that scales the whole way up: a **distributed filesystem** that is also the **operating system**, the **agentic tool interface**, and — federated across nodes — the substrate for a **network of AIs that learn from each other.** One namespace, all the way up.
 
 ## Federation: one network for models, tools, and files
 
