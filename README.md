@@ -1,4 +1,4 @@
-# HyprStream: agentic infrastructure for continuously-learning applications
+# HyprStream: self-improving AI, federated by identity
 
 [![Rust](https://github.com/hyprstream/hyprstream/actions/workflows/rust.yml/badge.svg)](https://github.com/hyprstream/hyprstream/actions/workflows/rust.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE-AGPLV3)
@@ -9,7 +9,7 @@
 
 **HyprStream is the runtime for AI that gets smarter the more you use it.**
 
-Run any open-weight or custom LLM behind a drop-in OpenAI API — and watch it improve itself on your own traffic, every gain saved as a Git branch you can review, promote, or roll back. Models, tools, live inference streams, and sandboxed apps all live in **one composable, file-like namespace** that reaches from your laptop to your fleet to — federated by cryptographic identity — the open network.
+Run open-weight or custom LLMs behind a drop-in OpenAI API — and watch it improve itself on your own traffic, every gain saved as a Git branch you can review, promote, or roll back. Models, tools, live inference streams, and sandboxed apps all live in **one composable, file-like namespace** that reaches from your laptop to your fleet to — federated by cryptographic identity — the open network.
 
 It's a single abstraction that scales the whole way up: a distributed filesystem that is also the operating system, the agentic tool interface, and the substrate for a **federation of AIs that learn from each other.**
 
@@ -19,7 +19,7 @@ Built in Rust on PyTorch (`tch-rs`) — real inference *and* training, Git-nativ
 
 ### 🧠 Models that improve themselves
 
-Most servers run a frozen model. HyprStream's models **get better while they serve.** They adapt to the task in front of them at inference time (test-time training with the Muon optimizer + TTN profiling), learn from a stronger model through **teacher/student training**, and propose their own improvements through MCP tools — then **agentic tools evaluate each change automatically**, so only adaptations that actually score better are kept. A runtime rank oracle keeps the adaptation cheap. Every accepted improvement lands as a **Git branch of the weights** (`model:branch`): versioned, diffable, reviewable, and instantly reversible. A closed improvement loop — *propose → train → evaluate → promote* — that you can audit and roll back.
+Most servers run a frozen model. HyprStream's models **get better while they serve.** They adapt to the task in front of them at inference time (test-time training with the Muon optimizer + TTN profiling), learn from a stronger model through **teacher/student training**, and propose their own improvements through MCP tools — then **agentic tools evaluate each change automatically**, so only adaptations that actually score better are kept — tried **speculatively** (applied in place, rolled back if they don't earn their keep, the way a CPU runs ahead of a branch it can undo). A runtime **rank oracle** advises how much capacity each adaptation needs; a teacher model running the evals can act on its signals or overrule them. Every accepted improvement lands as a **Git branch of the weights** (`model:branch`): versioned, diffable, reviewable, and instantly reversible. A closed improvement loop — *propose → train → evaluate → promote* — that you can audit and roll back.
 
 ### 📁 Everything is a file
 
