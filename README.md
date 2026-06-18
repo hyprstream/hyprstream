@@ -17,7 +17,7 @@ Easy to get started: [download](https://github.com/hyprstream/hyprstream/release
 
 ### 🧠 Models that improve themselves
 
-Most servers run a frozen model. HyprStream's models **get better while they serve.** They adapt to the task in front of them at inference time (test-time training with the Muon optimizer + TTN profiling), can propose and apply their own improvements through MCP tools, and a runtime rank oracle keeps that adaptation cheap. Every improvement is captured as a **Git branch of the weights** (`model:branch`) — so progress is versioned, diffable, reviewable, and instantly reversible. Self-improvement you can roll back.
+Most servers run a frozen model. HyprStream's models **get better while they serve.** They adapt to the task in front of them at inference time (test-time training with the Muon optimizer + TTN profiling), learn from a stronger model through **teacher/student training**, and propose their own improvements through MCP tools — then **agentic tools evaluate each change automatically**, so only adaptations that actually score better are kept. A runtime rank oracle keeps the adaptation cheap. Every accepted improvement lands as a **Git branch of the weights** (`model:branch`): versioned, diffable, reviewable, and instantly reversible. A closed improvement loop — *propose → train → evaluate → promote* — that you can audit and roll back.
 
 ### 📁 Everything is a file
 
