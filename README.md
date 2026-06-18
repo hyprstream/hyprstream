@@ -23,7 +23,7 @@ Most servers run a frozen model. HyprStream's models **get better while they ser
 
 Models, inference streams, MCP tools, repositories, and even **sandboxed applications** are all just files in a composable namespace. Want to run a model? Open it. Stream tokens? Read a file under `/stream/`. Drive a service? Write its `ctl` file. Give an agent a tool, or run an untrusted app — it shows up as a file you can mount, scope, and revoke.
 
-This Plan 9 / [Wanix](https://github.com/tractordev/wanix)-inspired design (see [docs/vfs.md](docs/vfs.md)) means one uniform interface for everything, per-process namespaces for true isolation, and **application sandboxing** built in: workloads run in Kata microVMs ([docs/workers-architecture.md](docs/workers-architecture.md)), reachable as files but unable to touch anything you didn't mount for them. Composable, network-transparent, capability-scoped.
+This Plan 9-inspired design (see [docs/vfs.md](docs/vfs.md)) gives one uniform interface for everything and per-process namespaces for true isolation. In the browser, HyprStream's WASM clients run as **[Wanix](https://github.com/tractordev/wanix) tasks**, and the VFS mounts Wanix's filesystem over 9P — so the *same* namespace spans your host and the browser. **Application sandboxing** is built in two ways: native workloads run in Kata microVMs ([docs/workers-architecture.md](docs/workers-architecture.md)); browser apps and agent tool-calls run as capability-limited Wanix WASM tasks (WASI, no ambient network) — each reachable as files, but unable to touch anything you didn't mount for it. Composable, network-transparent, capability-scoped.
 
 ### 🌐 Share models, tools, and files across nodes
 
@@ -147,13 +147,14 @@ hyprstream quick infer qwen3-small:main \
 
 ## Everything is a file: the VFS
 
-HyprStream is organized around a **Plan 9 / Wanix-inspired virtual filesystem** ([docs/vfs.md](docs/vfs.md)): resources are named files in a composable namespace rather than ad-hoc APIs.
+HyprStream is organized around a **Plan 9-inspired virtual filesystem** ([docs/vfs.md](docs/vfs.md)): resources are named files in a composable namespace rather than ad-hoc APIs. In the browser it runs on **[Wanix](https://github.com/tractordev/wanix)** — the same namespace, extended to the web.
 
 - **Models as branches** — every model is a Git repo; every adaptation is a worktree (`model:branch`). Versioned, diffable, reversible weights.
 - **Streams as files** — token streams, events, and container I/O are read/written under `/stream/`-style mounts with backpressure and at-least-once / lossless QoS presets.
 - **Control via `ctl`** — services are steered by writing their `ctl` file (a Plan 9 idiom), not bespoke management RPCs.
 - **Tools as files** — MCP tools, repositories, and registries appear as files an agent can be granted, scoped to, and revoked from.
-- **Per-process namespaces + sandboxing** — each workload gets its own namespace; untrusted apps and agent tool-calls run in **Kata microVMs** ([docs/workers-architecture.md](docs/workers-architecture.md)), reachable as files but unable to touch anything not mounted for them. Capability-scoped by construction.
+- **Per-process namespaces + sandboxing** — each workload gets its own namespace. Untrusted *native* workloads run in **Kata microVMs** ([docs/workers-architecture.md](docs/workers-architecture.md)); *browser* apps and agent tool-calls run as **Wanix WASM tasks** (WASI, no ambient network). Either way a sandbox is reachable as files but can't touch anything not mounted for it — capability-scoped by construction.
+- **Wanix bridge** — Wanix's own filesystem mounts into the namespace at `/wanix/` over 9P, so browser and host resources compose into one tree.
 
 The payoff: one uniform, network-transparent interface for models, streams, tools, and apps — composable across processes and across federated nodes.
 
