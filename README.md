@@ -1,4 +1,4 @@
-# HyprStream: agentic infrastructure for continously learning applications
+# HyprStream: agentic infrastructure for continuously-learning applications
 
 [![Rust](https://github.com/hyprstream/hyprstream/actions/workflows/rust.yml/badge.svg)](https://github.com/hyprstream/hyprstream/actions/workflows/rust.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE-AGPLV3)
@@ -7,30 +7,46 @@
 
 ## Overview
 
-HyprStream is an agentic cloud infrastructure for applications that learn, build, and run. Integrating continous development, training, integration, and deployment of software and AI/ML models. Primary features include an LLM inference and training engine built in Rust, with PyTorch, featuring integrated training capabilities, version control, and secure tool use with microvm containers.
+**HyprStream is the runtime for AI applications that learn while they run.** Clone an open-weight or custom LLM, talk to it over the OpenAI API, and let it improve itself in place — with every model, tool, inference stream, and sandboxed app exposed through one uniform, file-like interface, and federated by cryptographic identity.
 
-Users may communicate with open weight and custom LLMs via Hyprstream with an OpenAI API.
+It's an LLM inference and training engine written in Rust on PyTorch (`tch-rs`), with built-in training, Git-native version control for weights, secure tool use in microVM sandboxes, and a collaborative terminal UI for humans and agents.
 
-Easy to get started: [download](https://github.com/hyprstream/hyprstream/releases/) the AppImage and it auto-detects your NVIDIA or ROCm GPU. See [docs/quickstart.md](docs/quickstart.md) for a full walkthrough.
+Easy to get started: [download](https://github.com/hyprstream/hyprstream/releases/) the AppImage — it auto-detects your NVIDIA or ROCm GPU. See [docs/quickstart.md](docs/quickstart.md) for a full walkthrough.
 
-### Core Features
+## Why HyprStream
 
-- **Frontend-ready**: Use the included TUI for easy of use and share terminals with collaborators and agents.
-- **Collaborative**: Multi-user, multi-agent interfaces through a high-speed compositing multiplexer.
-- **LLM Inference & Training**: Supporting the dense Qwen3.5 and Qwen3 model architectures.
-- **Test Time Training**: Models train models using MCP tools, test-time-training, and the Muon optimizer.
-- **Security-minded**: Zero-trust cryptographic architecture with ZK stream proxies, Casbin Policy, and OpenID integration.
-- **Industry-compatible**: Providing compatibility with OpenAI's OpenAPI specification.
-- **Hardware Accelerated**: NVIDIA CUDA and AMD ROCm support, universal binary.
-- **Version Controlled**: Manages source and weights with Git, compatible with HuggingFace.
-- **Systemd Integration** - Optional user-level service management for background workers, long-running services, and containers.
-- **Powered by Torch**: Built on stable PyTorch C++ API (libtorch) using `tch-rs`.
+### 🧠 Models that improve themselves
+
+Most servers run a frozen model. HyprStream's models **get better while they serve.** They adapt to the task in front of them at inference time (test-time training with the Muon optimizer + TTN profiling), can propose and apply their own improvements through MCP tools, and a runtime rank oracle keeps that adaptation cheap. Every improvement is captured as a **Git branch of the weights** (`model:branch`) — so progress is versioned, diffable, reviewable, and instantly reversible. Self-improvement you can roll back.
+
+### 📁 Everything is a file
+
+Models, inference streams, MCP tools, repositories, and even **sandboxed applications** are all just files in a composable namespace. Want to run a model? Open it. Stream tokens? Read a file under `/stream/`. Drive a service? Write its `ctl` file. Give an agent a tool, or run an untrusted app — it shows up as a file you can mount, scope, and revoke.
+
+This Plan 9 / [Wanix](https://github.com/tractordev/wanix)-inspired design (see [docs/vfs.md](docs/vfs.md)) means one uniform interface for everything, per-process namespaces for true isolation, and **application sandboxing** built in: workloads run in Kata microVMs ([docs/workers-architecture.md](docs/workers-architecture.md)), reachable as files but unable to touch anything you didn't mount for them. Composable, network-transparent, capability-scoped.
+
+### 🌐 Federated by identity
+
+A HyprStream node is a first-class, identity-addressed peer on the open web. Each node publishes an **atproto-compatible identity document** (`did:web` / `did:key`, an `at://` handle, and typed transport endpoints), so models and streams become federated resources other nodes can discover and reach — not endpoints locked behind one host. Peers are admitted by a two-stage gate that binds the connecting key to the published DID, over QUIC/WebTransport or direct peer-to-peer (iroh + pkarr discovery). Built to interoperate with atproto-native networks and the [MIR](docs/interop/tiles-alignment.md) model-naming used by [tiles.run](https://tiles.run).
+
+### ⚡ Runs on your hardware
+
+One binary, any accelerator. The **Universal AppImage** auto-detects and loads the right backend — **NVIDIA CUDA**, **AMD ROCm** (including gfx1151 / Strix Halo), or CPU — with per-process GPU selection and no CUDA/ROCm toolchain juggling. Also packaged as a multi-variant **Nix flake** (CPU / CUDA / ROCm). Built on the stable PyTorch C++ API (libtorch).
+
+### Also includes
+
+- **Collaborative TUI** — a high-speed compositing multiplexer; share terminals live with teammates and agents.
+- **OpenAI-compatible API** — drop-in `/v1/chat/completions` for existing tools and client libraries.
+- **MCP server** — expose inference, model management, and repo ops as tools for Claude Code, Cursor, etc.
+- **Post-quantum security** — COSE hybrid-signed RPC (Ed25519 + ML-DSA-65), Casbin policy, OIDC/atproto identity.
+- **Git-native weights** — models and source tracked with Git; HuggingFace-compatible.
+- **Systemd integration** — optional user-level management for background workers and long-running services.
 
 ### Experimental Features
 
-- **[Workers](docs/workers-architecture.md)** - Isolated workload execution using Kata microvms with cloud-hypervisor.
-- **[Workflows]** - Git workflow file support for local continous integration, deployment, and functions-as-a-service.
-- **[Metrics]** - Structured knowledge engine and time-series aggregation database powered by DuckDB, ADBC, and Flight.
+- **[Workers](docs/workers-architecture.md)** — isolated workload execution using Kata microVMs with cloud-hypervisor.
+- **[Workflows]** — Git workflow files for local CI/CD and functions-as-a-service.
+- **[Metrics]** — structured knowledge engine + time-series database powered by DuckDB, ADBC, and Flight.
 
 ## Installation
 
@@ -41,20 +57,16 @@ Hyprstream requires `git` and `git-lfs` (available in all major Linux distros).
 Download the [Universal AppImage](https://github.com/hyprstream/hyprstream/releases/). We publish AppImages for each CPU/GPU configuration; the Universal image is recommended for ease-of-use and GPU auto-detection.
 
 ```bash
-# Download and install (Universal recommended)
-chmod +x hyprstream-v0.3.0-x86_64.AppImage
+# Download the latest release, then make it executable
+chmod +x hyprstream-v0.4.0-x86_64.AppImage
 
-# Installer Path (v0.4.0+):
-
-./hyprstream-v0.4.0-x86_64.AppImage wizard # add `-y` for autoinstall
-
-# Manual path (< v0.3.0):
-./hyprstream-v0.3.0-x86_64.AppImage service install
+# Guided setup (recommended) — add `-y` to accept defaults
+./hyprstream-v0.4.0-x86_64.AppImage wizard
 
 # Add to PATH
 export PATH="$HOME/.local/bin:$PATH"
 
-# Apply policy template (hyprstream is deny-by-default)
+# Apply a policy template (hyprstream is deny-by-default)
 hyprstream quick policy apply-template local
 
 hyprstream service start
@@ -69,6 +81,14 @@ systemctl --user set-environment LD_PRELOAD=libtorch_cuda.so && systemctl --user
 ```
 
 The installed files will be located in `$HOME/.local/hyprstream/` and `$HOME/.local/bin/`.
+
+### Install with Nix
+
+A multi-variant flake builds CPU, CUDA, and ROCm packages:
+
+```bash
+nix build github:hyprstream/hyprstream#cpu     # or #cuda / #rocm
+```
 
 ### Building from source
 
@@ -87,7 +107,7 @@ Hyprstream can run inside containers. See [README-Docker.md](README-Docker.md) f
 
 ### Clone a model
 
-Hyprstream supports Qwen3 model inference from Git repositories (HuggingFace, GitHub, etc.).
+Hyprstream runs Qwen3 / Qwen3.5 (dense and MoE) models cloned from Git repositories (HuggingFace, GitHub, etc.).
 
 ```bash
 # Clone a model
@@ -124,6 +144,29 @@ hyprstream quick infer qwen3-small:main \
     --top-p 0.9 \
     --max-tokens 1024
 ```
+
+## Everything is a file: the VFS
+
+HyprStream is organized around a **Plan 9 / Wanix-inspired virtual filesystem** ([docs/vfs.md](docs/vfs.md)): resources are named files in a composable namespace rather than ad-hoc APIs.
+
+- **Models as branches** — every model is a Git repo; every adaptation is a worktree (`model:branch`). Versioned, diffable, reversible weights.
+- **Streams as files** — token streams, events, and container I/O are read/written under `/stream/`-style mounts with backpressure and at-least-once / lossless QoS presets.
+- **Control via `ctl`** — services are steered by writing their `ctl` file (a Plan 9 idiom), not bespoke management RPCs.
+- **Tools as files** — MCP tools, repositories, and registries appear as files an agent can be granted, scoped to, and revoked from.
+- **Per-process namespaces + sandboxing** — each workload gets its own namespace; untrusted apps and agent tool-calls run in **Kata microVMs** ([docs/workers-architecture.md](docs/workers-architecture.md)), reachable as files but unable to touch anything not mounted for them. Capability-scoped by construction.
+
+The payoff: one uniform, network-transparent interface for models, streams, tools, and apps — composable across processes and across federated nodes.
+
+## Federation (the open AI fabric)
+
+Each node is an identity-addressed peer, not a walled-off endpoint.
+
+- **atproto-compatible identity** — the node publishes a `did:web` / `did:key` document with an `at://` handle, a P-256 `#atproto` verification method, a PDS-style service entry, and typed transport endpoints (QUIC/WebTransport, iroh).
+- **Identity-bound admission** — federated peers are admitted by a two-stage gate: an origin allowed by policy **and** a connecting key that matches a verification method in the peer's published DID document (fail-closed otherwise).
+- **Peer-to-peer discovery** — direct dialing over **iroh + pkarr** (resolve a peer by its Ed25519 node id alone), in addition to QUIC/WebTransport for browsers and reachable hosts.
+- **Interop-minded** — adopts the **MIR** model-naming schema (`mir:domain.arch.variant:series`) used by [tiles.run](https://tiles.run); see [docs/interop/tiles-alignment.md](docs/interop/tiles-alignment.md).
+
+> Status: identity, admission, and transport are implemented; live cross-network interop with atproto-native peers (e.g. tiles.run) is being validated.
 
 ## Architecture
 
@@ -266,30 +309,30 @@ export HYPRSTREAM_GENERATION_TIMEOUT=120
 
 ## Security & Authentication
 
-Hyprstream implements layered security-in-depth:
+Hyprstream implements layered, zero-trust, **post-quantum-ready** security.
 
 ### Security Layers
 
 | Layer | Technology | Purpose |
 |-------|------------|---------|
-| **Transport** | CURVE encryption (TCP) | End-to-end encryption for TCP connections |
-| **Application** | Ed25519 signed envelopes | Request authentication and integrity |
-| **Authorization** | Casbin policy engine | RBAC/ABAC access control |
-| **Isolation** | Kata Containers (optional) | VM-level workload isolation for workers |
+| **Transport** | QUIC / WebTransport + iroh (TLS / Noise) | Encrypted, NAT-traversing transport for browsers, hosts, and P2P peers |
+| **Application** | COSE hybrid-signed envelopes (Ed25519 + ML-DSA-65) | Request authentication + integrity with post-quantum signatures |
+| **Identity** | atproto `did:web`/`did:key` + federation admission | Identity-bound peering (origin policy + DID-key binding) |
+| **Authorization** | Casbin policy engine | RBAC/ABAC access control, deny-by-default |
+| **Isolation** | Kata Containers (optional) | microVM-level workload isolation for workers |
 
-### RPC Architecture
+### RPC & streaming architecture
 
-All inter-service communication uses ZeroMQ with Cap'n Proto serialization:
+Inter-service and inter-node communication runs over **moq-net** (moq-lite streaming) and **iroh**, with Cap'n Proto serialization:
 
-- **REQ/REP**: Synchronous RPC calls (policy checks, model queries)
-- **PUB/SUB**: Event streaming (sandbox lifecycle, training progress)
-- **XPUB/XSUB**: Steerable proxy for event distribution
+- **Request/reply RPC** over QUIC/WebTransport (browsers, reachable hosts) and iroh (direct P2P).
+- **Event bus** over a moq-lite "Live" stream (replaces the legacy pub/sub proxy).
+- **Streaming plane** — moq groups carry token streams, events, and container I/O, with QoS presets (`Job` / `Log` / `Pipe`), per-frame chained-HMAC integrity, and AEAD payloads so a forwarding relay never sees plaintext.
 
-Every request is wrapped in a `SignedEnvelope`:
-- Ed25519 signature over the request payload
-- Nonce for replay protection
-- Timestamp for clock skew validation
-- Request identity (Local user, API token, Peer, or Anonymous)
+Every request is wrapped in a **COSE hybrid-signed envelope**:
+- Ed25519 + ML-DSA-65 composite signature over the request (classical + post-quantum)
+- Nonce for replay protection and timestamp for clock-skew validation
+- Request identity (Local user, API token, federated Peer, or Anonymous)
 
 ### Service Spawning
 
@@ -298,7 +341,7 @@ Services can run in multiple modes:
 - **Dedicated thread**: For `!Send` types (e.g., tch-rs tensors)
 - **Subprocess**: Isolated process with systemd or standalone backend
 
-See [docs/rpc-architecture.md](docs/rpc-architecture.md) for detailed RPC infrastructure documentation.
+See [docs/rpc-architecture.md](docs/rpc-architecture.md) and [docs/streaming-service-architecture.md](docs/streaming-service-architecture.md) for details.
 
 ## Policy Engine
 
@@ -417,13 +460,13 @@ If the Universal AppImage is not detecting your GPU, you may override the settin
 
 ```bash
 # List all available backends
-./hyprstream-v0.2.0-x86_64.AppImage --list-backends
+./hyprstream-x86_64.AppImage --list-backends
 
 # Detect available backends
-./hyprstream-v0.2.0-x86_64.AppImage --detect-gpu
+./hyprstream-x86_64.AppImage --detect-gpu
 
 # Override backend selection for Universal AppImage:
-HYPRSTREAM_BACKEND=cuda130 ./hyprstream-v0.2.0-x86_64.AppImage server
+HYPRSTREAM_BACKEND=cuda130 ./hyprstream-x86_64.AppImage server
 ```
 
 ### System Requirements
@@ -433,7 +476,7 @@ HYPRSTREAM_BACKEND=cuda130 ./hyprstream-v0.2.0-x86_64.AppImage server
   - **CPU**: Full support (x86_64, ARM64)
   - **CUDA**: NVIDIA host kernel modules (`nvidia-smi` works)
   - **ROCm**: AMDGPU kernel modules and userland (`rocm-smi` works)
-- **Workers Service Requirements (optional, experimental):** 
+- **Workers Service Requirements (optional, experimental):**
   - **Nested Virtualization**: The host system running hyprstream-workers must support and have enabled nested virtualization, this may require a physical machine, bare-metal VM, or proper configuration in your QEMU/KVM settings.
 - 8GB+ RAM for inference, 16GB+ for training
 - **Optional Dependencies:**
@@ -473,6 +516,7 @@ Built with:
 - [SafeTensors](https://github.com/huggingface/safetensors) - Efficient tensor serialization
 - [Git2](https://github.com/rust-lang/git2-rs) - Git operations in Rust
 - [Tokio](https://tokio.rs/) - Async runtime
+- [iroh](https://www.iroh.computer/) - Peer-to-peer QUIC transport and discovery
 - [Casbin](https://casbin.org/) - Authorization library for policy engine
 - [Kata Containers](https://katacontainers.io/) - VM-based container isolation (experimental)
 - [cloud-hypervisor](https://www.cloudhypervisor.org/) - Virtual machine monitor (experimental)
