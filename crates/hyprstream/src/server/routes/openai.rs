@@ -482,7 +482,13 @@ async fn chat_completions(
             return (StatusCode::INTERNAL_SERVER_ERROR, "Key resolution failed").into_response();
         }
     };
-    let model_client = ModelClient::for_service((*state.signing_key).clone(), model_server_vk, None);
+    let model_client = match ModelClient::for_service((*state.signing_key).clone(), model_server_vk, None) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Failed to create ModelClient: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Client creation failed").into_response();
+        }
+    };
     let _claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
     // Note: OAI adapter currently creates a fresh client per request.
     // For bearer delegation, use: model_client.request().delegated_bearer(jwt).call(payload)
@@ -711,7 +717,14 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                 return;
             }
         };
-        let model_client = ModelClient::for_service((*state.signing_key).clone(), model_server_vk, None);
+        let model_client = match ModelClient::for_service((*state.signing_key).clone(), model_server_vk, None) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to create ModelClient: {}", e);
+                let _ = tx.send(Err(anyhow::anyhow!("Client creation failed: {}", e))).await;
+                return;
+            }
+        };
         let _claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
         // Note: For bearer delegation, use: model_client.request().delegated_bearer(jwt).call(payload)
         use crate::services::generated::model_client::InferRpc;
@@ -1059,7 +1072,13 @@ async fn completions(
             return (StatusCode::INTERNAL_SERVER_ERROR, "Key resolution failed").into_response();
         }
     };
-    let model_client = ModelClient::for_service((*state.signing_key).clone(), model_server_vk, None);
+    let model_client = match ModelClient::for_service((*state.signing_key).clone(), model_server_vk, None) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Failed to create ModelClient: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Client creation failed").into_response();
+        }
+    };
     let _claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
     let result = collect_stream_to_result(&model_client, &request.model, &gen_request).await;
 

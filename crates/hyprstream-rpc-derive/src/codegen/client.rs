@@ -155,9 +155,9 @@ fn generate_trait_method(
         .map(|v| is_rpc_stream_info(&v.type_name, resolved))
         .unwrap_or(false);
 
-    // Streaming methods in the trait don't take ephemeral_pubkey — they return StreamHandle
+    // Streaming methods in the trait don't take ephemeral_pubkey — they return MoqStreamHandle
     let return_type = if is_streaming {
-        quote! { hyprstream_rpc::streaming::StreamHandle }
+        quote! { hyprstream_rpc::moq_stream::MoqStreamHandle }
     } else {
         return_type
     };
@@ -403,9 +403,9 @@ fn generate_trait_method_impl(
         .map(|v| is_rpc_stream_info(&v.type_name, resolved))
         .unwrap_or(false);
 
-    // Streaming trait methods return StreamHandle (no ephemeral_pubkey param)
+    // Streaming trait methods return MoqStreamHandle (no ephemeral_pubkey param)
     let return_type = if is_streaming {
-        quote! { hyprstream_rpc::streaming::StreamHandle }
+        quote! { hyprstream_rpc::moq_stream::MoqStreamHandle }
     } else {
         return_type
     };
@@ -436,23 +436,26 @@ fn generate_trait_method_impl(
     };
 
     if is_streaming {
-        // Streaming trait impl: generate ephemeral keypair, call raw method, construct StreamHandle
+        // Streaming trait impl: generate ephemeral keypair, call raw method, construct MoqStreamHandle
         Some(quote! {
-            async fn #method_name(&self #(, #params)*) -> anyhow::Result<hyprstream_rpc::streaming::StreamHandle> {
+            async fn #method_name(&self #(, #params)*) -> anyhow::Result<hyprstream_rpc::moq_stream::MoqStreamHandle> {
                 let (client_secret, client_pubkey) = hyprstream_rpc::crypto::generate_ephemeral_keypair();
                 let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
                 let info = Self::#method_name(self #(, #args)*, client_pubkey_bytes).await?;
-                if info.server_pubkey == [0u8; 32] {
+                if info.dh_public == [0u8; 32] {
                     anyhow::bail!("Server did not provide DH public key for streaming");
                 }
-                hyprstream_rpc::streaming::StreamHandle::new(
-                    &hyprstream_rpc::zmq_context::global_context(),
-                    info.stream_id,
-                    &info.endpoint,
-                    &info.server_pubkey,
-                    &client_secret,
-                    &client_pubkey_bytes,
-                )
+                if info.broadcast_path.is_empty() {
+                    anyhow::bail!("Server did not provide moq broadcast path — moq transport not initialized");
+                }
+                let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
+                    &client_secret, &client_pubkey_bytes, &info.dh_public,
+                )?;
+                // #274: subscribe over the resolved `reach` (the same-host UDS
+                // fast path is preferred automatically when co-located).
+                Ok(hyprstream_rpc::moq_stream::MoqStreamHandle::networked(
+                    info.announced_at, info.broadcast_path, mac_key, topic,
+                ))
             }
         })
     } else {
@@ -496,39 +499,41 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
                 signing_key: hyprstream_rpc::crypto::SigningKey,
                 destination: hyprstream_rpc::crypto::VerifyingKey,
                 token: Option<String>,
-            ) -> Self {
-                let endpoint = hyprstream_rpc::registry::try_global()
+            ) -> anyhow::Result<Self> {
+                let transport = hyprstream_rpc::registry::try_global()
                     .map(|r| r.endpoint(#service_name_lit, hyprstream_rpc::registry::SocketKind::Rep))
                     .unwrap_or_else(|| hyprstream_rpc::transport::TransportConfig::inproc(
                         concat!("hyprstream/", #service_name_lit)
-                    ))
-                    .to_zmq_string();
-                Self::for_endpoint(&endpoint, signing_key, destination, token)
+                    ));
+                Self::dial_transport(&transport, signing_key, destination, token)
             }
 
-            /// Create a new client connected to a specific endpoint.
-            ///
-            /// `destination` is the target service's Ed25519 verifying key,
-            /// used to verify response signatures.
+            /// Create a new client connected to a specific endpoint string
+            /// (`inproc://…` / `ipc://…`). Parsed to a `TransportConfig` and routed
+            /// through [`hyprstream_rpc::dial::dial`] — the one place transport
+            /// selection happens. For networked (quic/iroh) targets, prefer
+            /// [`Self::from_resolver`], which carries the full auth config.
             pub fn for_endpoint(
                 endpoint: &str,
                 signing_key: hyprstream_rpc::crypto::SigningKey,
                 destination: hyprstream_rpc::crypto::VerifyingKey,
                 token: Option<String>,
-            ) -> Self {
+            ) -> anyhow::Result<Self> {
+                let transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(endpoint);
+                Self::dial_transport(&transport, signing_key, destination, token)
+            }
+
+            /// Build a client for an already-resolved `TransportConfig` (the one
+            /// place the generated client meets `dial()`).
+            fn dial_transport(
+                transport: &hyprstream_rpc::transport::TransportConfig,
+                signing_key: hyprstream_rpc::crypto::SigningKey,
+                destination: hyprstream_rpc::crypto::VerifyingKey,
+                token: Option<String>,
+            ) -> anyhow::Result<Self> {
                 let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key);
-                let transport = hyprstream_rpc::zmq_connection::ZmqConnection::new(
-                    endpoint,
-                    hyprstream_rpc::zmq_context::global_context(),
-                );
-                let rpc = hyprstream_rpc::rpc_client::RpcClientImpl::new(
-                    signer, transport, Some(destination),
-                );
-                let rpc = match token {
-                    Some(t) => rpc.with_default_jwt(t),
-                    None => rpc,
-                };
-                Self::new(std::sync::Arc::new(rpc) as std::sync::Arc<dyn hyprstream_rpc::RpcClient>)
+                let rpc = hyprstream_rpc::dial::dial(transport, signer, Some(destination), token)?;
+                Ok(Self::new(rpc))
             }
 
             /// Create a new client by resolving the service endpoint via a `Resolver`.
@@ -538,29 +543,35 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
                 destination: hyprstream_rpc::crypto::VerifyingKey,
                 token: Option<String>,
             ) -> anyhow::Result<Self> {
-                let endpoint = resolver
+                let transport = resolver
                     .resolve(Self::SERVICE_NAME, hyprstream_rpc::registry::SocketKind::Rep)
-                    .await?
-                    .to_zmq_string();
-                Ok(Self::for_endpoint(&endpoint, signing_key, destination, token))
+                    .await?;
+                Self::dial_transport(&transport, signing_key, destination, token)
             }
 
             /// Create a client from an `IdentityProvider` with automatic endpoint resolution.
             pub async fn from_provider(
                 provider: &dyn hyprstream_rpc::identity::IdentityProvider,
             ) -> anyhow::Result<Self> {
-                let endpoint = hyprstream_rpc::registry::try_global()
+                let transport = hyprstream_rpc::registry::try_global()
                     .map(|r| r.endpoint(#service_name_lit, hyprstream_rpc::registry::SocketKind::Rep))
                     .unwrap_or_else(|| hyprstream_rpc::transport::TransportConfig::inproc(
                         concat!("hyprstream/", #service_name_lit)
-                    ))
-                    .to_zmq_string();
-                Self::from_provider_at(&endpoint, provider).await
+                    ));
+                Self::from_provider_at_transport(&transport, provider).await
             }
 
-            /// Create a client from an `IdentityProvider` at a specific endpoint.
+            /// Create a client from an `IdentityProvider` at a specific endpoint string.
             pub async fn from_provider_at(
                 endpoint: &str,
+                provider: &dyn hyprstream_rpc::identity::IdentityProvider,
+            ) -> anyhow::Result<Self> {
+                let transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(endpoint);
+                Self::from_provider_at_transport(&transport, provider).await
+            }
+
+            async fn from_provider_at_transport(
+                transport: &hyprstream_rpc::transport::TransportConfig,
                 provider: &dyn hyprstream_rpc::identity::IdentityProvider,
             ) -> anyhow::Result<Self> {
                 let handle = provider.identity_open(concat!("hyprstream-", #service_name_lit, "-v1")).await?;
@@ -568,14 +579,8 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
                 let server_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(&pubkey)
                     .map_err(|e| anyhow::anyhow!("invalid derived pubkey: {}", e))?;
                 let signer = hyprstream_rpc::signer::IdentitySigner::new(handle);
-                let transport = hyprstream_rpc::zmq_connection::ZmqConnection::new(
-                    endpoint,
-                    hyprstream_rpc::zmq_context::global_context(),
-                );
-                let rpc = hyprstream_rpc::rpc_client::RpcClientImpl::new(
-                    signer, transport, Some(server_vk),
-                );
-                Ok(Self::new(std::sync::Arc::new(rpc) as std::sync::Arc<dyn hyprstream_rpc::RpcClient>))
+                let rpc = hyprstream_rpc::dial::dial(transport, signer, Some(server_vk), None)?;
+                Ok(Self::new(rpc))
             }
         }
     }

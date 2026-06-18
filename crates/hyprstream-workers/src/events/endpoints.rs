@@ -1,7 +1,7 @@
 //! Event bus endpoint configuration
 //!
 //! Supports three endpoint modes for EventService sockets:
-//! - **Inproc**: In-process transport for monolithic mode (same ZMQ context)
+//! - **Inproc**: In-process transport for monolithic mode (single process)
 //! - **IPC**: Unix domain sockets for distributed mode (separate processes)
 //! - **SystemdFd**: Pre-bound file descriptors from systemd socket activation
 //!
@@ -164,8 +164,8 @@ mod tests {
     fn test_inproc_transports() {
         let (pub_t, sub_t) = inproc_transports();
 
-        assert_eq!(pub_t.zmq_endpoint(), PUB);
-        assert_eq!(sub_t.zmq_endpoint(), SUB);
+        assert_eq!(pub_t.endpoint_string(), PUB);
+        assert_eq!(sub_t.endpoint_string(), SUB);
     }
 
     #[test]
@@ -173,8 +173,8 @@ mod tests {
         let (pub_t, sub_t) = ipc_transports();
 
         // Verify paths contain "hyprstream" and "events"
-        let pub_str = pub_t.zmq_endpoint();
-        let sub_str = sub_t.zmq_endpoint();
+        let pub_str = pub_t.endpoint_string();
+        let sub_str = sub_t.endpoint_string();
 
         assert!(pub_str.starts_with("ipc://"));
         assert!(sub_str.starts_with("ipc://"));
@@ -194,8 +194,8 @@ mod tests {
     fn test_detect_transports_default() {
         // Without LISTEN_FDS set, Auto should fall back to inproc
         let (pub_t, sub_t) = detect_transports(EndpointMode::Auto);
-        assert_eq!(pub_t.zmq_endpoint(), PUB);
-        assert_eq!(sub_t.zmq_endpoint(), SUB);
+        assert_eq!(pub_t.endpoint_string(), PUB);
+        assert_eq!(sub_t.endpoint_string(), SUB);
     }
 
     #[test]

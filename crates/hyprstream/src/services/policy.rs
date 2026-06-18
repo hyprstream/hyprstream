@@ -1,12 +1,12 @@
 //! Policy service for authorization checks over ZMQ
 //!
-//! Wraps PolicyManager and exposes it as a ZmqService.
+//! Wraps PolicyManager and exposes it as a RequestService.
 //! Handlers are async and use `.await` directly (compatible with single-threaded runtime).
 
 use async_trait::async_trait;
 use crate::auth::PolicyManager;
 use crate::auth::policy_templates;
-use crate::services::{EnvelopeContext, ZmqService};
+use crate::services::{EnvelopeContext, RequestService};
 use crate::services::generated::policy_client::{
     ErrorInfo, PolicyHandler, PolicyResponseVariant, TokenInfo, ScopeList,
     PolicyCheck, IssueToken,
@@ -68,7 +68,6 @@ pub struct PolicyService {
     /// JWT key source for verifying JWTs (local and federated).
     jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
     // Infrastructure (for Spawnable)
-    context: Arc<zmq::Context>,
     transport: TransportConfig,
     /// Event prefix state for secure event transport (Phase 7).
     /// PolicyService is a blind relay — stores opaque wrapped blobs, never plaintext keys.
@@ -78,7 +77,6 @@ pub struct PolicyService {
     /// ES256 (P-256) key rotation store for DPoP/atproto interop.
     es256_key_store: Option<Arc<crate::auth::Es256SigningKeyStore>>,
     /// ML-DSA-65 key rotation store for PQ-hybrid composite token issuance.
-    #[cfg(feature = "pq-hybrid")]
     ml_dsa_key_store: Option<Arc<crate::auth::MlDsaSigningKeyStore>>,
 }
 
@@ -89,7 +87,6 @@ impl PolicyService {
         signing_key: Arc<SigningKey>,
         token_config: crate::config::TokenConfig,
         git2db: Arc<RwLock<Git2DB>>,
-        context: Arc<zmq::Context>,
         transport: TransportConfig,
     ) -> Self {
         let registry_repo_id = RepoId::from_uuid(git2db::registry::registry_self_uuid());
@@ -104,12 +101,10 @@ impl PolicyService {
             registry_repo_id,
             default_audience: None,
             jwt_key_source: None,
-            context,
             transport,
             event_prefixes: RwLock::new(HashMap::new()),
             jti_blocklist: Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new()),
             es256_key_store: None,
-            #[cfg(feature = "pq-hybrid")]
             ml_dsa_key_store: None,
         }
     }
@@ -127,7 +122,6 @@ impl PolicyService {
 
     /// Sign a token with composite PQ signature when available, falling back to Ed25519.
     async fn sign_token(&self, claims: &hyprstream_rpc::auth::Claims, is_service: bool) -> String {
-        #[cfg(feature = "pq-hybrid")]
         {
             let ml_dsa_key = if let Some(ref store) = self.ml_dsa_key_store {
                 store.active_key().await
@@ -169,7 +163,6 @@ impl PolicyService {
     }
 
     /// Attach the ML-DSA-65 key rotation store for composite token issuance.
-    #[cfg(feature = "pq-hybrid")]
     pub fn with_ml_dsa_key_store(mut self, store: Arc<crate::auth::MlDsaSigningKeyStore>) -> Self {
         self.ml_dsa_key_store = Some(store);
         self
@@ -1470,7 +1463,7 @@ impl PolicyHandler for PolicyService {
 }
 
 #[async_trait(?Send)]
-impl ZmqService for PolicyService {
+impl RequestService for PolicyService {
     async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
         trace!(
             "Policy request from {} (id={})",
@@ -1482,10 +1475,6 @@ impl ZmqService for PolicyService {
 
     fn name(&self) -> &str {
         "policy"
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
     }
 
     fn transport(&self) -> &TransportConfig {
@@ -1560,11 +1549,10 @@ pub(crate) async fn watch_policy_file(
     let mut watcher = match notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
         if let Ok(event) = res {
             match event.kind {
-                EventKind::Modify(_) | EventKind::Create(_) => {
-                    // Only trigger for events involving our policy.csv
-                    if event.paths.iter().any(|p| p.ends_with("policy.csv")) {
-                        let _ = tx.blocking_send(());
-                    }
+                EventKind::Modify(_) | EventKind::Create(_)
+                    if event.paths.iter().any(|p| p.ends_with("policy.csv")) =>
+                {
+                    let _ = tx.blocking_send(());
                 }
                 _ => {}
             }

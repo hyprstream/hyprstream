@@ -34,9 +34,10 @@ rand = { workspace = true }
 # FIPS mode (optional)
 p256 = { workspace = true, optional = true }
 
-# Post-quantum hybrid (optional)
-ml-dsa = { workspace = true, optional = true }
-ml-kem = { workspace = true, optional = true }
+# Post-quantum hybrid — always compiled (PQ mode is selected at RUNTIME via
+# CryptoPolicy, not at compile time). See M3 (#152).
+ml-dsa = { workspace = true }
+ml-kem = { workspace = true }
 
 # Shared deps — all targets
 anyhow = { workspace = true }
@@ -46,6 +47,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
+bs58 = "0.5"                              # multibase base58btc for DID-doc transport service entries
 chrono = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
@@ -67,14 +69,14 @@ web-sys = { version = "0.3.64", features = [
 ] }
 serde-wasm-bindgen = "0.6"
 getrandom = { version = "0.2", features = ["js"] }  # rand 0.8 uses getrandom 0.2
+# The always-on PQ crypto (ml-dsa/ml-kem → sha3/crypto-common) pulls getrandom 0.4, which
+# refuses to build on wasm32-unknown-unknown unless its `wasm_js` backend is enabled.
+# Declare it (renamed to coexist with the 0.2 entry) so the feature unifies onto the
+# transitive 0.4 dep and the browser/WebTransport consumer compiles for wasm (#225).
+getrandom_v04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 
 # Native-only deps (not compiled for wasm32)
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-# ZMQ transport
-tmq = { workspace = true }
-zmq = { workspace = true }
-zmq-sys = { workspace = true }  # Raw FFI for ZMQ_USE_FD socket option
-
 # QUIC transport (HTTP/3 + WebTransport + ZMTP over QUIC)
 quinn = { workspace = true }
 rcgen = { workspace = true }
@@ -83,6 +85,18 @@ h3 = { workspace = true }
 h3-quinn = { workspace = true }
 h3-webtransport = { workspace = true }
 http = { workspace = true }
+
+# Iroh + MoQ (Epic #131 — Phase 1 substrate). See transport::iroh_substrate.
+iroh = { workspace = true }
+moq-net = { workspace = true }
+web-transport-iroh = { workspace = true }
+web-transport-quinn = { workspace = true }
+web-transport-trait = { workspace = true }
+yamux = { workspace = true }  # UDS transport: stream-multiplexer for Session-over-UnixStream
+url = { workspace = true }
+# HTTPS did:web DID-document fetch (#279). Native-only; mirrors the JWKS
+# fetch+cache posture used by FederationKeyResolver in the hyprstream crate.
+reqwest = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true, features = ["io-util", "net"] }
@@ -106,7 +120,10 @@ systemd = { version = "0.10", optional = true }
 [features]
 default = []
 fips = ["p256", "hmac"]  # FIPS mode uses P-256 + HMAC-SHA256 (hkdf is always enabled)
-pq-hybrid = ["ml-dsa", "ml-kem"]  # Post-quantum hybrid: ML-DSA-65 signatures + ML-KEM-768 KEM
+# `pq-hybrid` is retained as a NO-OP alias for source/build compatibility.
+# Post-quantum primitives (ML-DSA-65 + ML-KEM-768) are now ALWAYS compiled;
+# Classical vs Hybrid is selected at runtime via `crypto::CryptoPolicy`. See M3.
+pq-hybrid = []
 systemd = ["dep:systemd"]
 
 [build-dependencies]

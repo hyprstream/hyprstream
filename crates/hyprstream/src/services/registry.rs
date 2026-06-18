@@ -6,10 +6,9 @@
 use crate::services::PolicyClient;
 use crate::services::types::{MAX_FDS_GLOBAL, MAX_FDS_PER_CLIENT};
 use hyprstream_containedfs::{ContainedFs, FsError, FsHandle};
-use crate::services::{EnvelopeContext, ZmqService};
+use crate::services::{EnvelopeContext, RequestService};
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc::prelude::*;
-use hyprstream_rpc::registry::{global as endpoint_registry, SocketKind};
 use hyprstream_rpc::{StreamChannel, StreamContext};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -297,7 +296,7 @@ impl FidTable {
 /// 4. Continuation publishes clone progress via PUB/SUB
 ///
 /// The registry is wrapped in RwLock for interior mutability since some operations
-/// (like clone) require mutable access but ZmqService::handle_request takes &self.
+/// (like clone) require mutable access but RequestService::handle_request takes &self.
 pub struct RegistryService {
     // Business logic
     registry: Arc<RwLock<Git2DB>>,
@@ -306,7 +305,6 @@ pub struct RegistryService {
     /// Policy client for authorization checks (uses ZMQ to PolicyService)
     policy_client: PolicyClient,
     // Infrastructure (for Spawnable)
-    context: Arc<zmq::Context>,
     transport: TransportConfig,
     signing_key: SigningKey,
     /// 9P fid table for filesystem operations.
@@ -364,7 +362,6 @@ impl RegistryService {
     pub async fn new(
         base_dir: impl AsRef<Path>,
         policy_client: PolicyClient,
-        context: Arc<zmq::Context>,
         transport: TransportConfig,
         signing_key: SigningKey,
     ) -> Result<Self> {
@@ -386,7 +383,6 @@ impl RegistryService {
             registry: worker_registry,
             base_dir,
             policy_client,
-            context,
             transport,
             signing_key,
             fid_table,
@@ -743,10 +739,7 @@ impl RegistryService {
             .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
 
         // Create StreamChannel for DH key exchange and publishing
-        let stream_channel = StreamChannel::new(
-            Arc::clone(&self.context),
-            self.signing_key.clone(),
-        );
+        let stream_channel = StreamChannel::new(self.signing_key.clone());
 
         // 10 minutes expiry for clone operations
         let stream_ctx = stream_channel.prepare_stream(client_pub_bytes, 600).await?;
@@ -757,14 +750,15 @@ impl RegistryService {
             "Clone stream prepared (DH + pre-authorization via StreamChannel)"
         );
 
-        let stream_endpoint = endpoint_registry()
-            .endpoint("streams", SocketKind::Sub)
-            .to_zmq_string();
-
+        let broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()
+            .map(|o| o.broadcast_path(stream_ctx.topic()))
+            .unwrap_or_default();
         let stream_info = StreamInfo {
             stream_id: stream_ctx.stream_id().to_owned(),
-            endpoint: stream_endpoint,
-            server_pubkey: *stream_ctx.server_pubkey(),
+            dh_public: *stream_ctx.server_pubkey(),
+            broadcast_path,
+            announced_at: hyprstream_rpc::moq_stream::producer_reach(),
+            ..Default::default()
         };
 
         // Build continuation that executes the clone and streams progress
@@ -2660,17 +2654,13 @@ impl WorktreeHandler for RegistryService {
 }
 
 #[async_trait(?Send)]
-impl ZmqService for RegistryService {
+impl RequestService for RegistryService {
     async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
         dispatch_registry(self, ctx, payload).await
     }
 
     fn name(&self) -> &str {
         "registry"
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
     }
 
     fn transport(&self) -> &TransportConfig {
@@ -2762,8 +2752,16 @@ mod tests {
         use hyprstream_service::InprocManager;
         use hyprstream_rpc::transport::TransportConfig;
 
+        // Tests use Classical (EdDSA-only) keys — install Classical verify
+        // policy so the global fail-closed Hybrid default doesn't reject them.
+        let _ = hyprstream_rpc::envelope::install_verify_config(
+            hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+                policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
+                pq_store: None,
+            },
+        );
+
         let temp_dir = TempDir::new().expect("test: create temp dir");
-        let context = crate::zmq::global_context();
 
         // Generate keypair for signing/verification
         let (signing_key, _verifying_key) = generate_signing_keypair();
@@ -2779,7 +2777,6 @@ mod tests {
             Arc::new(signing_key.clone()),
             crate::config::TokenConfig::default(),
             git2db,
-            context.clone(),
             policy_transport,
         );
         let manager = InprocManager::new();
@@ -2791,14 +2788,13 @@ mod tests {
             signing_key.clone(),
             signing_key.verifying_key(),
             None,
-        );
+        ).expect("test: create policy client");
 
         // Start the registry service with policy client
         let registry_transport = TransportConfig::inproc("test-registry-health");
         let registry_service = RegistryService::new(
             temp_dir.path(),
             policy_client,
-            context.clone(),
             registry_transport,
             signing_key.clone(),
         ).await.expect("test: create registry service");
@@ -2810,7 +2806,7 @@ mod tests {
             signing_key.clone(),
             signing_key.verifying_key(),
             None,
-        );
+        ).expect("test: create registry client");
         // health_check returns () on success
         let result = client.health_check().await;
         assert!(result.is_ok(), "health_check should succeed: {:?}", result.err());

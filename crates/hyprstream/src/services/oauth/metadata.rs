@@ -10,7 +10,7 @@ use axum::{extract::State, response::IntoResponse, Json};
 use super::state::OAuthState;
 
 /// Base metadata fields shared between RFC 8414 and OIDC discovery.
-fn base_metadata(issuer: &str, scopes: &[String]) -> serde_json::Value {
+fn base_metadata(issuer: &str, scopes: &[String], require_par: bool) -> serde_json::Value {
     serde_json::json!({
         "issuer": issuer,
         "authorization_endpoint": format!("{}/oauth/authorize", issuer),
@@ -18,7 +18,7 @@ fn base_metadata(issuer: &str, scopes: &[String]) -> serde_json::Value {
         "registration_endpoint": format!("{}/oauth/register", issuer),
         "device_authorization_endpoint": format!("{}/oauth/device", issuer),
         "pushed_authorization_request_endpoint": format!("{}/oauth/par", issuer),
-        "require_pushed_authorization_requests": false,
+        "require_pushed_authorization_requests": require_par,
         "jwks_uri": format!("{}/oauth/jwks", issuer),
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"],
@@ -33,7 +33,11 @@ fn base_metadata(issuer: &str, scopes: &[String]) -> serde_json::Value {
 pub async fn authorization_server_metadata(
     State(state): State<Arc<OAuthState>>,
 ) -> impl IntoResponse {
-    Json(base_metadata(&state.issuer_url, &state.default_scopes))
+    Json(base_metadata(
+        &state.issuer_url,
+        &state.default_scopes,
+        state.require_pushed_authorization_requests,
+    ))
 }
 
 /// GET /.well-known/openid-configuration (OIDC Discovery 1.0)
@@ -45,7 +49,7 @@ pub async fn openid_configuration(
     State(state): State<Arc<OAuthState>>,
 ) -> impl IntoResponse {
     let issuer = &state.issuer_url;
-    let mut meta = base_metadata(issuer, &state.default_scopes);
+    let mut meta = base_metadata(issuer, &state.default_scopes, state.require_pushed_authorization_requests);
 
     // OIDC-specific fields
     let obj = meta.as_object_mut().unwrap_or_else(|| unreachable!());

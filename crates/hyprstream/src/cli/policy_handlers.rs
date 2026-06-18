@@ -27,7 +27,7 @@ use std::process::Command;
 /// Create a PolicyClient for RPC calls.
 ///
 /// Bootstrap: PolicyService key needed to create the PolicyClient for peer key resolution.
-fn create_policy_client(signing_key: &SigningKey) -> PolicyClient {
+fn create_policy_client(signing_key: &SigningKey) -> Result<PolicyClient> {
     PolicyClient::for_service(
         signing_key.clone(),
         // Bootstrap: PolicyService uses the root key
@@ -41,7 +41,7 @@ pub async fn handle_policy_show(
     signing_key: &SigningKey,
     raw: bool,
 ) -> Result<()> {
-    let client = create_policy_client(signing_key);
+    let client = create_policy_client(signing_key)?;
     let policy_info = client.get_policy().await
         .context("Failed to get policy from PolicyService. Are services running?")?;
 
@@ -113,7 +113,7 @@ pub async fn handle_policy_history(
     count: usize,
     _oneline: bool,
 ) -> Result<()> {
-    let client = create_policy_client(signing_key);
+    let client = create_policy_client(signing_key)?;
     let history = client.get_history(&GetHistory { count: count as u32 }).await
         .context("Failed to get policy history from PolicyService. Are services running?")?;
 
@@ -160,7 +160,7 @@ pub async fn handle_policy_edit(
     }
 
     // Check for draft changes via PolicyService RPC
-    let client = create_policy_client(signing_key);
+    let client = create_policy_client(signing_key)?;
     match client.get_draft_status().await {
         Ok(draft) if draft.has_changes => {
             println!();
@@ -182,7 +182,7 @@ pub async fn handle_policy_diff(
     signing_key: &SigningKey,
     against: Option<String>,
 ) -> Result<()> {
-    let client = create_policy_client(signing_key);
+    let client = create_policy_client(signing_key)?;
     let git_ref = against.as_deref().unwrap_or("");
 
     let diff_text = client.get_diff(&GetDiff { git_ref: Some(git_ref.to_owned()) }).await
@@ -217,7 +217,7 @@ pub async fn handle_policy_apply(
     dry_run: bool,
     message: Option<String>,
 ) -> Result<()> {
-    let client = create_policy_client(signing_key);
+    let client = create_policy_client(signing_key)?;
 
     // Check for uncommitted changes via RPC
     let draft = client.get_draft_status().await
@@ -268,7 +268,7 @@ pub async fn handle_policy_rollback(
     git_ref: &str,
     dry_run: bool,
 ) -> Result<()> {
-    let client = create_policy_client(signing_key);
+    let client = create_policy_client(signing_key)?;
 
     if dry_run {
         // Use history RPC to show what we'd be rolling back to
@@ -316,7 +316,7 @@ pub async fn handle_policy_check(
     resource: &str,
     action: &str,
 ) -> Result<()> {
-    let client = create_policy_client(signing_key);
+    let client = create_policy_client(signing_key)?;
 
     let allowed = client.check(&PolicyCheck { subject: user.to_owned(), domain: "*".to_owned(), resource: resource.to_owned(), operation: action.to_owned() }).await
         .context("Failed to check policy via PolicyService. Are services running?")?;
@@ -534,7 +534,7 @@ pub async fn handle_policy_role_add(
         return Ok(());
     }
 
-    let client = create_policy_client(signing_key);
+    let client = create_policy_client(signing_key)?;
     let sha = client.add_grouping(&AddGrouping { user: user.to_owned(), role: role.to_owned() }).await
         .context("Failed to add role assignment via PolicyService. Are services running?")?;
 
@@ -562,7 +562,7 @@ pub async fn handle_policy_role_remove(
         }
     }
 
-    let client = create_policy_client(signing_key);
+    let client = create_policy_client(signing_key)?;
     let sha = client.remove_grouping(&RemoveGrouping { user: user.to_owned(), role: role.to_owned() }).await
         .context("Failed to remove role assignment via PolicyService. Are services running?")?;
 
@@ -576,7 +576,7 @@ pub async fn handle_policy_role_list(
     user: Option<&str>,
     role: Option<&str>,
 ) -> Result<()> {
-    let client = create_policy_client(signing_key);
+    let client = create_policy_client(signing_key)?;
     let policy_info = client.get_policy().await
         .context("Failed to get policy from PolicyService. Are services running?")?;
 
@@ -646,7 +646,7 @@ pub async fn handle_policy_apply_template(
     }
 
     // Use PolicyService RPC to apply the template (writes file, validates, stages, commits)
-    let client = create_policy_client(signing_key);
+    let client = create_policy_client(signing_key)?;
     let result_msg = client.apply_template(&ApplyTemplate { name: template_name.to_owned() }).await
         .context("Failed to apply template via PolicyService. Are services running?")?;
 

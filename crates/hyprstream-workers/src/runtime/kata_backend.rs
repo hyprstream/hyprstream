@@ -463,6 +463,7 @@ mod tests {
             backend_handle: None,
             sandbox_path,
             image_id: None,
+            console_socket: None,
         }
     }
 

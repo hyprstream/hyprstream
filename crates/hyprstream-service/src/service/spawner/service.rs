@@ -1,6 +1,6 @@
-//! Unified service spawner for ZmqService hosting.
+//! Unified service spawner for RequestService hosting.
 //!
-//! Provides a single API for spawning ZmqService implementations with different
+//! Provides a single API for spawning RequestService implementations with different
 //! execution modes (Tokio task, dedicated thread, or subprocess).
 
 use std::path::PathBuf;
@@ -12,7 +12,7 @@ use tokio::sync::Notify;
 use super::{ProcessConfig, ProcessSpawner, SpawnedProcess};
 use hyprstream_rpc::error::Result;
 use hyprstream_rpc::registry::{ServiceRegistration, SocketKind};
-use hyprstream_rpc::service::ZmqService;
+use hyprstream_rpc::service::RequestService;
 use hyprstream_rpc::transport::TransportConfig;
 
 // Import anyhow! macro for error creation in ServiceManager impl
@@ -23,335 +23,35 @@ use anyhow::anyhow;
 pub use hyprstream_rpc::service::Spawnable;
 
 // ============================================================================
-// ProxyService - XSUB/XPUB Proxy
-// ============================================================================
-
-/// XSUB/XPUB proxy service for event forwarding.
-///
-/// This implements the ZMQ XSUB/XPUB proxy pattern:
-/// - XSUB socket binds and receives from publishers (PUB sockets connect)
-/// - XPUB socket binds and sends to subscribers (SUB sockets connect)
-///
-/// Note the socket type inversion in registry:
-/// - XSUB binds → clients use PUB → register as SocketKind::Pub
-/// - XPUB binds → clients use SUB → register as SocketKind::Sub
-pub struct ProxyService {
-    /// Service name (for logging and registry).
-    name: String,
-    /// ZMQ context.
-    context: Arc<zmq::Context>,
-    /// Transport for XSUB socket (publishers connect here).
-    pub_transport: TransportConfig,
-    /// Transport for XPUB socket (subscribers connect here).
-    sub_transport: TransportConfig,
-}
-
-impl ProxyService {
-    /// Create a new proxy service.
-    pub fn new(
-        name: impl Into<String>,
-        context: Arc<zmq::Context>,
-        pub_transport: TransportConfig,
-        sub_transport: TransportConfig,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            context,
-            pub_transport,
-            sub_transport,
-        }
-    }
-}
-
-impl Spawnable for ProxyService {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
-    }
-
-    fn registrations(&self) -> Vec<(SocketKind, TransportConfig)> {
-        // Note: Socket type inversion for clients
-        vec![
-            (SocketKind::Pub, self.pub_transport.clone()),  // XSUB → clients use PUB
-            (SocketKind::Sub, self.sub_transport.clone()),  // XPUB → clients use SUB
-        ]
-    }
-
-    fn run(
-        self: Box<Self>,
-        shutdown: Arc<Notify>,
-        on_ready: Option<tokio::sync::oneshot::Sender<()>>,
-    ) -> Result<()> {
-        // Create XSUB socket (receives from publishers)
-        let mut xsub = self.context.socket(zmq::XSUB)
-            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("XSUB socket: {e}")))?;
-
-        // Create XPUB socket (sends to subscribers)
-        let mut xpub = self.context.socket(zmq::XPUB)
-            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("XPUB socket: {e}")))?;
-
-        // Create CTRL socket for shutdown (PAIR pattern)
-        let mut ctrl = self.context.socket(zmq::PAIR)
-            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("CTRL socket: {e}")))?;
-        let ctrl_endpoint = format!("inproc://proxy-ctrl-{}", self.name);
-        ctrl.bind(&ctrl_endpoint)
-            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("CTRL bind: {e}")))?;
-
-        // Bind XSUB (publishers connect here)
-        // Uses TransportConfig::bind() for proper systemd FD support
-        self.pub_transport.bind(&mut xsub)
-            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("XSUB bind: {e}")))?;
-        let pub_endpoint = self.pub_transport.zmq_endpoint();
-
-        // Bind XPUB (subscribers connect here)
-        // Uses TransportConfig::bind() for proper systemd FD support
-        self.sub_transport.bind(&mut xpub)
-            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("XPUB bind: {e}")))?;
-        let sub_endpoint = self.sub_transport.zmq_endpoint();
-
-        tracing::info!(
-            "Proxy {} started: XSUB={}, XPUB={}",
-            self.name,
-            pub_endpoint,
-            sub_endpoint
-        );
-
-        // Send ready signal after sockets are bound
-        if let Some(tx) = on_ready {
-            let _ = tx.send(());
-        }
-
-        // Notify systemd that service is ready (for Type=notify services)
-        let _ = crate::notify::ready();
-
-        // Spawn shutdown listener
-        let ctrl_sender = self.context.socket(zmq::PAIR)
-            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("CTRL sender: {e}")))?;
-        ctrl_sender.connect(&ctrl_endpoint)
-            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("CTRL connect: {e}")))?;
-
-        let name_clone = self.name.clone();
-        std::thread::spawn(move || {
-            // Block until shutdown is signaled
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    tracing::error!("Failed to create shutdown listener runtime: {e}");
-                    return;
-                }
-            };
-            rt.block_on(shutdown.notified());
-
-            // Send termination message to proxy
-            tracing::debug!("Sending TERMINATE to proxy {}", name_clone);
-            let _ = ctrl_sender.send("TERMINATE", 0);
-        });
-
-        // TEST: Use original proxy_steerable to verify directory fix was the real solution
-        tracing::debug!("Proxy {} calling proxy_steerable", self.name);
-        zmq::proxy_steerable(&mut xsub, &mut xpub, &mut ctrl)
-            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("proxy: {e}")))?;
-
-        tracing::info!("Proxy {} stopped", self.name);
-        Ok(())
-    }
-}
-
-// ============================================================================
-// LoadBalancerService - ROUTER/DEALER Load Balancer
-// ============================================================================
-
-/// ROUTER/DEALER load balancer for distributing REQ/REP traffic across N workers.
-///
-/// Architecture:
-/// ```text
-///   Client (REQ) ──connect──► ROUTER (bind) ═══proxy═══ DEALER (bind) ◄──connect── Worker (REP)
-/// ```
-///
-/// - Clients connect to the ROUTER endpoint (auto-discovered via registry as `SocketKind::Rep`)
-/// - Workers connect their REP sockets to the DEALER backend endpoint
-/// - `zmq::proxy_steerable()` handles fair-queuing distribution (LRU among ready workers)
-/// - Wire-compatible: no changes needed to generated clients or handlers
-///
-/// Uses the same `zmq::proxy_steerable()` + PAIR shutdown pattern as `ProxyService`.
-pub struct LoadBalancerService {
-    /// Service name (for logging and registry)
-    name: String,
-    /// ZMQ context
-    context: Arc<zmq::Context>,
-    /// Frontend: ROUTER socket, clients connect here with REQ
-    frontend_transport: TransportConfig,
-    /// Backend: DEALER socket, workers connect here with REP
-    backend_transport: TransportConfig,
-}
-
-impl LoadBalancerService {
-    /// Create a new load balancer service.
-    ///
-    /// # Arguments
-    /// * `name` - Service name for logging and registry
-    /// * `context` - ZMQ context (shared for inproc connectivity)
-    /// * `frontend` - Transport for ROUTER socket (clients connect here)
-    /// * `backend` - Transport for DEALER socket (workers connect here)
-    pub fn new(
-        name: impl Into<String>,
-        context: Arc<zmq::Context>,
-        frontend: TransportConfig,
-        backend: TransportConfig,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            context,
-            frontend_transport: frontend,
-            backend_transport: backend,
-        }
-    }
-
-    /// Get the backend transport that workers should connect to.
-    pub fn backend_transport(&self) -> &TransportConfig {
-        &self.backend_transport
-    }
-}
-
-impl Spawnable for LoadBalancerService {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
-    }
-
-    fn registrations(&self) -> Vec<(SocketKind, TransportConfig)> {
-        vec![
-            // Register ROUTER as Rep — clients discover via SocketKind::Rep
-            // and connect with REQ (wire-compatible with ROUTER)
-            (SocketKind::Rep, self.frontend_transport.clone()),
-            // Register backend for internal worker discovery
-            (SocketKind::Dealer, self.backend_transport.clone()),
-        ]
-    }
-
-    fn run(
-        self: Box<Self>,
-        shutdown: Arc<Notify>,
-        on_ready: Option<tokio::sync::oneshot::Sender<()>>,
-    ) -> Result<()> {
-        // ROUTER frontend: clients connect with REQ
-        let mut router = self.context.socket(zmq::ROUTER)
-            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("ROUTER socket: {e}")))?;
-
-        // DEALER backend: workers connect with REP
-        let mut dealer = self.context.socket(zmq::DEALER)
-            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("DEALER socket: {e}")))?;
-
-        // PAIR control socket for graceful shutdown
-        let mut ctrl = self.context.socket(zmq::PAIR)
-            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("CTRL socket: {e}")))?;
-        let ctrl_endpoint = format!("inproc://lb-ctrl-{}", self.name);
-        ctrl.bind(&ctrl_endpoint)
-            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("CTRL bind: {e}")))?;
-
-        // Bind ROUTER frontend
-        self.frontend_transport.bind(&mut router)
-            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("ROUTER bind: {e}")))?;
-        let frontend_ep = self.frontend_transport.zmq_endpoint();
-
-        // Bind DEALER backend
-        self.backend_transport.bind(&mut dealer)
-            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("DEALER bind: {e}")))?;
-        let backend_ep = self.backend_transport.zmq_endpoint();
-
-        tracing::info!(
-            "LoadBalancer {} started: ROUTER={}, DEALER={}",
-            self.name,
-            frontend_ep,
-            backend_ep,
-        );
-
-        // Signal ready after sockets are bound
-        if let Some(tx) = on_ready {
-            let _ = tx.send(());
-        }
-
-        // Notify systemd
-        let _ = crate::notify::ready();
-
-        // Spawn shutdown listener (same pattern as ProxyService)
-        let ctrl_sender = self.context.socket(zmq::PAIR)
-            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("CTRL sender: {e}")))?;
-        ctrl_sender.connect(&ctrl_endpoint)
-            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("CTRL connect: {e}")))?;
-
-        let name_clone = self.name.clone();
-        std::thread::spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    tracing::error!("Failed to create LB shutdown listener runtime: {e}");
-                    return;
-                }
-            };
-            rt.block_on(shutdown.notified());
-            tracing::debug!("Sending TERMINATE to LoadBalancer {}", name_clone);
-            let _ = ctrl_sender.send("TERMINATE", 0);
-        });
-
-        // zmq::proxy_steerable does fair-queuing distribution.
-        // ROUTER preserves client identity for reply routing.
-        // DEALER routes to next available (LRU) worker.
-        tracing::debug!("LoadBalancer {} calling proxy_steerable", self.name);
-        zmq::proxy_steerable(&mut router, &mut dealer, &mut ctrl)
-            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("proxy: {e}")))?;
-
-        tracing::info!("LoadBalancer {} stopped", self.name);
-        Ok(())
-    }
-}
-
-// ============================================================================
 // QuicServiceLoop — Spawnable wrapper for QUIC-only service loop
 // ============================================================================
 
-/// Spawnable wrapper that runs a ZmqService with explicit QUIC configuration.
+/// Spawnable wrapper that runs a RequestService with explicit QUIC configuration.
 ///
 /// This is used when a service factory wants to pass a `QuicLoopConfig` to
 /// `RequestLoop::with_quic()` without relying on the blanket `Spawnable` impl.
 ///
-/// The blanket `impl Spawnable for S: ZmqService` creates a plain `RequestLoop`;
+/// The blanket `impl Spawnable for S: RequestService` creates a plain `RequestLoop`;
 /// this wrapper additionally enables QUIC when `quic_config` is `Some`.
-pub struct UnifiedServiceConfig<S: ZmqService + Send + 'static> {
+pub struct UnifiedServiceConfig<S: RequestService + Send + 'static> {
     service: S,
     quic_config: Option<hyprstream_rpc::service::QuicLoopConfig>,
 }
 
-impl<S: ZmqService + Send + 'static> UnifiedServiceConfig<S> {
+impl<S: RequestService + Send + 'static> UnifiedServiceConfig<S> {
     /// Create a unified service config with optional QUIC.
     pub fn new(service: S, quic_config: Option<hyprstream_rpc::service::QuicLoopConfig>) -> Self {
         Self { service, quic_config }
     }
 }
 
-impl<S: ZmqService + Send + Sync + 'static> Spawnable for UnifiedServiceConfig<S> {
+impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConfig<S> {
     fn name(&self) -> &str {
-        ZmqService::name(&self.service)
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        ZmqService::context(&self.service)
+        RequestService::name(&self.service)
     }
 
     fn registrations(&self) -> Vec<(SocketKind, TransportConfig)> {
-        vec![(SocketKind::Rep, ZmqService::transport(&self.service).clone())]
+        vec![(SocketKind::Rep, RequestService::transport(&self.service).clone())]
     }
 
     fn run(
@@ -359,40 +59,251 @@ impl<S: ZmqService + Send + Sync + 'static> Spawnable for UnifiedServiceConfig<S
         shutdown: Arc<Notify>,
         on_ready: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<()> {
+        use hyprstream_rpc::transport::rpc_session::IrohRequestProcessor;
+
         let UnifiedServiceConfig { service, quic_config } = *self;
-        let transport = ZmqService::transport(&service).clone();
-        let context = Arc::clone(ZmqService::context(&service));
-        let signing_key = ZmqService::signing_key(&service);
+        let transport = RequestService::transport(&service).clone();
+        let signing_key = RequestService::signing_key(&service);
+        let server_pubkey = signing_key.verifying_key();
+        let service_name = RequestService::name(&service).to_owned();
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("runtime: {e}")))?;
 
+        // A LocalSet is retained for any `!Send` per-service internals reachable
+        // through the bridge; the quinn accept loop itself is fully `Send`.
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async move {
-            let mut runner = hyprstream_rpc::service::RequestLoop::new(
-                transport, context, signing_key,
-            );
+            let _ = server_pubkey; // identity is verified app-layer via the bridge
+            let nonce_cache = Arc::new(hyprstream_rpc::envelope::InMemoryNonceCache::new());
+            let bridge = hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge::spawn(
+                service, Arc::clone(&nonce_cache), 0,
+            ).map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("bridge: {e}")))?;
+            let processor: Arc<dyn IrohRequestProcessor> = Arc::new(bridge);
 
-            if let Some(qc) = quic_config {
-                runner = runner.with_quic(qc);
-            }
-
-            match runner.run(service).await {
-                Ok(mut handle) => {
-                    if let Some(tx) = on_ready {
-                        let _ = tx.send(());
+            if let Some(mut qc) = quic_config {
+                // #274: serve the RPC plane over `web_transport_quinn` (replacing
+                // the bespoke h3 WebTransportServer) and multiplex the moq
+                // streaming plane on the same endpoint via `/moq` path-dispatch.
+                let _ = &qc.protected_resource_json; // RFC 9728 metadata served by axum (:6790)
+                let chain: Vec<rustls::pki_types::CertificateDer<'static>> = qc
+                    .cert_chain
+                    .iter()
+                    .map(|d| rustls::pki_types::CertificateDer::from(d.clone()))
+                    .collect();
+                let key = rustls::pki_types::PrivateKeyDer::try_from((*qc.key_der).clone())
+                    .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("QUIC key: {e}")))?;
+                let wt_server = web_transport_quinn::ServerBuilder::new()
+                    .with_addr(qc.bind_addr)
+                    .with_certificate(chain, key)
+                    .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("QUIC bind: {e}")))?;
+                let actual_addr = wt_server.local_addr()
+                    .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("QUIC local_addr: {e}")))?;
+                // The bound addr is unspecified (0.0.0.0 / ::) when binding all
+                // interfaces — that is NOT a dialable destination, so advertising
+                // it makes dial_stream's QUIC connect time out. Advertise loopback
+                // for same-host (the single-node default); cross-host routable-IP
+                // advertisement is the wire-reach follow-up (#131/#282).
+                let advertise_addr = if actual_addr.ip().is_unspecified() {
+                    match actual_addr {
+                        std::net::SocketAddr::V4(_) => {
+                            std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, actual_addr.port()))
+                        }
+                        std::net::SocketAddr::V6(_) => {
+                            std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, actual_addr.port()))
+                        }
                     }
-                    let _ = crate::notify::ready();
-                    shutdown.notified().await;
-                    handle.stop().await;
-                    Ok(())
+                } else {
+                    actual_addr
+                };
+                let pin = hyprstream_rpc::transport::quinn_transport::cert_sha256(&qc.cert_chain[0]);
+
+                let mut rpc_server = hyprstream_rpc::transport::quinn_transport::QuinnRpcServer::with_capacity(
+                    wt_server,
+                    Arc::clone(&processor),
+                    signing_key.clone(),
+                    hyprstream_rpc::transport::rpc_session::DEFAULT_STREAM_LIMIT,
+                );
+                // Multiplex moq on the same endpoint when the global origin is up.
+                if let Some(origin) = hyprstream_rpc::moq_stream::global_moq_origin() {
+                    rpc_server = rpc_server.with_moq_consumer(origin.consumer().clone());
+                    // #276: subscribe-authz + per-tenant announce scoping. The
+                    // default config is permissive (no resolver, no authorizer)
+                    // so the working open same-tenant subscribe model is
+                    // preserved. A deployment opts into per-tenant scoping /
+                    // private-stream gating by building a
+                    // `hyprstream_rpc::transport::iroh_moq::MoqAuthzConfig` with
+                    // a `tenant_resolver` and a `DefaultAuthorizer` whose policy
+                    // gate calls into the Casbin `PolicyManager`
+                    // (`hyprstream::auth::policy_manager::global_policy_manager()`
+                    // -> `check_with_domain(subject, tenant, broadcast, "subscribe")`).
+                    // That gate is constructed in the `hyprstream` crate (which
+                    // owns PolicyManager) and threaded down via the service
+                    // factory; wiring it here would create a `hyprstream-service`
+                    // -> `hyprstream` dependency cycle, so it is left as a seam.
+                    // TODO(#276): thread a `MoqAuthzConfig` through the service
+                    // factory (built in the `hyprstream` crate) and call
+                    // `.with_moq_authz(cfg)` here. NOTE: on this quinn `/moq`
+                    // path the peer is anonymous (no mutual TLS), so the
+                    // resolver/gate sees `PeerIdentity::anonymous()` — full
+                    // per-peer enforcement requires the iroh `moql` path, where
+                    // `with_authz` is already honoured.
+                    let _moq_authz_default =
+                        hyprstream_rpc::transport::iroh_moq::MoqAuthzConfig::default();
                 }
-                Err(e) => Err(hyprstream_rpc::error::RpcError::SpawnFailed(e.to_string())),
+
+                // Register this endpoint for RPC resolution and, once, as the
+                // node's network reach for StreamInfo producers (#274) — the
+                // SAME (addr, server_name, cert-hash) the DID-doc #quic entry
+                // advertises, built from one source so no per-site drift.
+                if let Some(reg) = hyprstream_rpc::registry::try_global() {
+                    reg.register(
+                        &service_name,
+                        hyprstream_rpc::registry::SocketKind::Quic,
+                        hyprstream_rpc::transport::TransportConfig::quic_pinned(
+                            advertise_addr,
+                            &qc.server_name,
+                            pin,
+                        ),
+                        None,
+                    );
+                }
+                hyprstream_rpc::moq_stream::init_global_producer_reach(
+                    hyprstream_rpc::moq_stream::NodeStreamReach {
+                        addr: advertise_addr,
+                        server_name: qc.server_name.clone(),
+                        cert_hashes: vec![pin],
+                    },
+                );
+                if let Some(cb) = qc.on_quic_bound.take() {
+                    cb(service_name.clone(), advertise_addr, qc.server_name.clone());
+                }
+
+                // #282: bind an iroh substrate in PARALLEL to the quinn endpoint,
+                // serving BOTH ALPNs (`hyprstream-rpc/1` + `moql`) with the SAME
+                // request processor + moq origin. The iroh endpoint's node key is
+                // the service's Ed25519 signing key, so its `node_id` (==
+                // `signing_key.verifying_key()`) is already covered by the node's
+                // published DID verification methods — and the #137 gate, when
+                // installed, matches an inbound peer's `remote_id()` against its
+                // DID. Discovery is iroh's built-in pkarr publisher + n0 DNS
+                // (`presets::N0`), so this node is dial-by-node_id-discoverable.
+                //
+                // Kept alive in this scope via `_iroh_substrate`; on shutdown the
+                // spawned task calls `IrohSubstrate::shutdown` to drain handlers.
+                let _iroh_substrate_guard = if qc.iroh_enabled {
+                    let iroh_secret = signing_key.to_bytes();
+                    let node_id: [u8; 32] = signing_key.verifying_key().to_bytes();
+                    // moq plane: reuse the SAME global origin the quinn `/moq`
+                    // path serves, so broadcasts are visible over both transports.
+                    let moq_handler = match hyprstream_rpc::moq_stream::global_moq_origin() {
+                        Some(origin) => {
+                            let shared = hyprstream_rpc::transport::iroh_moq::OriginShared::from_pair(
+                                origin.producer().clone(),
+                                origin.consumer().clone(),
+                            );
+                            hyprstream_rpc::transport::iroh_moq::IrohMoqProtocolHandler::with_origin(shared)
+                        }
+                        None => hyprstream_rpc::transport::iroh_moq::IrohMoqProtocolHandler::new(),
+                    };
+                    // RPC plane: same processor + signing key as the quinn path.
+                    let mut rpc_handler =
+                        hyprstream_rpc::transport::iroh_rpc::IrohRpcProtocolHandler::with_stream_limit(
+                            Arc::clone(&processor),
+                            signing_key.clone(),
+                            hyprstream_rpc::transport::rpc_session::DEFAULT_STREAM_LIMIT,
+                        );
+                    let mut moq_handler = moq_handler;
+                    // #137/#282: apply the federation admission gate at both iroh
+                    // accept paths (origin + key-binding against `remote_id()`),
+                    // fail-closed. `None` → accept-open (documented seam until the
+                    // factory threads a gate down).
+                    if let Some(gate) = qc.iroh_admission.take() {
+                        rpc_handler = rpc_handler.with_admission(gate.clone());
+                        moq_handler = moq_handler.with_admission(gate);
+                    }
+                    match hyprstream_rpc::transport::iroh_substrate::IrohSubstrate::new(
+                        iroh_secret, moq_handler, rpc_handler,
+                    )
+                    .await
+                    {
+                        Ok(substrate) => {
+                            // Install the shared client endpoint (install-once) so
+                            // outbound iroh RPC/stream dials reuse this identity.
+                            let _ = hyprstream_rpc::transport::lazy_iroh::install_iroh_client_endpoint(
+                                substrate.endpoint().clone(),
+                            );
+                            // Advertise the `#iroh` VM only now that iroh is bound.
+                            if let Some(cb) = qc.on_iroh_bound.take() {
+                                cb(service_name.clone(), node_id);
+                            }
+                            tracing::info!(
+                                service = %service_name,
+                                node_id = %hex_short(&node_id),
+                                "iroh substrate bound (ALPNs hyprstream-rpc/1 + moql)"
+                            );
+                            Some(substrate)
+                        }
+                        Err(e) => {
+                            // Fail soft: an iroh bind failure must not take down the
+                            // working quinn plane. Log and continue quinn-only.
+                            tracing::warn!(
+                                service = %service_name,
+                                "iroh substrate bind failed; continuing quinn-only: {e}"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                // Drain the iroh substrate on shutdown (parallel to quinn drain).
+                if let Some(substrate) = _iroh_substrate_guard {
+                    let iroh_shutdown = Arc::clone(&shutdown);
+                    tokio::spawn(async move {
+                        iroh_shutdown.notified().await;
+                        if let Err(e) = substrate.shutdown().await {
+                            tracing::warn!("iroh substrate shutdown error: {e}");
+                        }
+                    });
+                }
+
+                // Bridge the `Notify` shutdown to the server's graceful drain.
+                let drain_limit = rpc_server.stream_limit();
+                let drain_capacity = rpc_server.capacity();
+                let drain_token = rpc_server.shutdown_token();
+                let drain_shutdown = Arc::clone(&shutdown);
+                tokio::spawn(async move {
+                    drain_shutdown.notified().await;
+                    hyprstream_rpc::transport::quinn_transport::QuinnRpcServer::shutdown(
+                        &drain_limit, drain_capacity, &drain_token,
+                    ).await;
+                });
+
+                let rep_fut = hyprstream_rpc::service::serve::serve_bridged(
+                    &transport, Arc::clone(&processor), signing_key.clone(),
+                    Arc::clone(&shutdown), on_ready,
+                );
+                let quic_fut = rpc_server.run();
+                let (rep_result, quic_result) = tokio::join!(rep_fut, quic_fut);
+                if let Err(e) = quic_result {
+                    tracing::warn!("QUIC server loop ended with error: {e}");
+                }
+                rep_result.map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(e.to_string()))
+            } else {
+                hyprstream_rpc::service::serve::serve_bridged(
+                    &transport, processor, signing_key, shutdown, on_ready,
+                ).await.map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(e.to_string()))
             }
         })
     }
+}
+
+/// Short hex fingerprint of a 32-byte node_id for logs (never the full key).
+fn hex_short(id: &[u8; 32]) -> String {
+    format!("{:02x}{:02x}{:02x}{:02x}…", id[0], id[1], id[2], id[3])
 }
 
 /// Mode for spawning services.
@@ -423,8 +334,8 @@ pub enum ServiceMode {
 /// use hyprstream_rpc::service::spawner::{ServiceSpawner, ProxyService};
 /// use hyprstream_rpc::transport::TransportConfig;
 ///
-/// // Spawn a REQ/REP service (ZmqService implementations are directly Spawnable)
-/// let service = MyZmqService::new(ctx, transport, verifying_key);
+/// // Spawn a REQ/REP service (RequestService implementations are directly Spawnable)
+/// let service = MyRequestService::new(ctx, transport, verifying_key);
 /// let spawner = ServiceSpawner::tokio();
 /// let spawned = spawner.spawn(service).await?;
 ///
@@ -487,7 +398,7 @@ impl ServiceSpawner {
     /// Spawn any Spawnable service with registry integration.
     ///
     /// This is the unified spawning API that works with both:
-    /// - Any `S: ZmqService` - REQ/REP services (directly Spawnable via blanket impl)
+    /// - Any `S: RequestService` - REQ/REP services (directly Spawnable via blanket impl)
     /// - `ProxyService` - XSUB/XPUB proxies
     ///
     /// The service is automatically registered with the EndpointRegistry and
@@ -496,8 +407,8 @@ impl ServiceSpawner {
     /// # Example
     ///
     /// ```ignore
-    /// // Spawn a REQ/REP service (ZmqService implementations are directly Spawnable)
-    /// let service = MyZmqService::new(ctx, transport, verifying_key);
+    /// // Spawn a REQ/REP service (RequestService implementations are directly Spawnable)
+    /// let service = MyRequestService::new(ctx, transport, verifying_key);
     /// let spawned = spawner.spawn(service).await?;
     ///
     /// // Spawn a proxy
@@ -962,10 +873,6 @@ impl Spawnable for DualSpawnable {
         self.primary.name()
     }
 
-    fn context(&self) -> &Arc<zmq::Context> {
-        self.primary.context()
-    }
-
     fn registrations(&self) -> Vec<(SocketKind, TransportConfig)> {
         // Merge registrations from both
         let mut regs = self.primary.registrations();
@@ -1007,24 +914,23 @@ mod tests {
     use super::*;
     use hyprstream_rpc::crypto::generate_signing_keypair;
     use hyprstream_rpc::prelude::SigningKey;
-    use hyprstream_rpc::service::ZmqService;
+    use hyprstream_rpc::service::RequestService;
     use anyhow::Result as AnyhowResult;
 
     /// Test service that includes infrastructure (new pattern)
     struct EchoService {
-        context: Arc<zmq::Context>,
         transport: TransportConfig,
         signing_key: SigningKey,
     }
 
     impl EchoService {
-        fn new(context: Arc<zmq::Context>, transport: TransportConfig, signing_key: SigningKey) -> Self {
-            Self { context, transport, signing_key }
+        fn new(transport: TransportConfig, signing_key: SigningKey) -> Self {
+            Self { transport, signing_key }
         }
     }
 
     #[async_trait::async_trait(?Send)]
-    impl ZmqService for EchoService {
+    impl RequestService for EchoService {
         async fn handle_request(
             &self,
             _ctx: &hyprstream_rpc::service::EnvelopeContext,
@@ -1035,10 +941,6 @@ mod tests {
 
         fn name(&self) -> &str {
             "echo"
-        }
-
-        fn context(&self) -> &Arc<zmq::Context> {
-            &self.context
         }
 
         fn transport(&self) -> &TransportConfig {
@@ -1052,12 +954,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_tokio_spawner() -> hyprstream_rpc::Result<()> {
-        let context = Arc::new(zmq::Context::new());
         let (signing_key, _verifying_key) = generate_signing_keypair();
         let transport = TransportConfig::inproc("test-spawner-tokio");
 
         // Service is directly Spawnable - no wrapping needed
-        let service = EchoService::new(context, transport, signing_key);
+        let service = EchoService::new(transport, signing_key);
 
         let spawner = ServiceSpawner::tokio();
         let mut spawned = spawner.spawn(service).await?;
@@ -1070,12 +971,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_thread_spawner() -> hyprstream_rpc::Result<()> {
-        let context = Arc::new(zmq::Context::new());
         let (signing_key, _verifying_key) = generate_signing_keypair();
         let transport = TransportConfig::inproc("test-spawner-thread");
 
         // Service is directly Spawnable - no wrapping needed
-        let service = EchoService::new(context, transport, signing_key);
+        let service = EchoService::new(transport, signing_key);
 
         let spawner = ServiceSpawner::threaded();
         let mut spawned = spawner.spawn(service).await?;

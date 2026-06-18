@@ -10,6 +10,8 @@ pub mod identity_store;
 pub mod key_rotation;
 pub mod service_jwt;
 pub mod federation;
+pub mod federation_admission;
+pub mod mesh_trust;
 pub mod id_token_verify;
 pub mod jwt;
 mod policy_manager;
@@ -23,7 +25,6 @@ pub mod valkey;
 pub use federation::FederationKeyResolver;
 pub use jwt::{Claims, JwtError};
 pub use key_rotation::{SigningKeyStore, Es256SigningKeyStore, Es256KeySlot, RotationStores};
-#[cfg(feature = "pq-hybrid")]
 pub use key_rotation::{MlDsaSigningKeyStore, MlDsaKeySlot};
 pub use policy_manager::{PolicyManager, PolicyError, write_policy_file, global_policy_manager, set_global_policy_manager};
 pub use policy_migration::migrate_policy_csv;

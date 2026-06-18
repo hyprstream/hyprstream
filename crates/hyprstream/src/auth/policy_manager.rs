@@ -111,6 +111,18 @@ fn validate_policy_component(component: &str, name: &str) -> Result<(), PolicyEr
         )));
     }
 
+    // NOTE: wildcards ('*') are intentionally NOT rejected here. The Casbin model
+    // (DEFAULT_MODEL_CONF) is wildcard-based: every rule carries domain="*", and
+    // legitimate features rely on wildcard subjects/resources/actions — public
+    // models ("*" subject, see PolicyService::handle_set_branch_visibility),
+    // role-scoped resource grants ("model:*"), action namespaces ("ttt.*"), and
+    // the OIDC self-ownership grant. A blanket '*' ban here broke all of those
+    // (and made add_policy() — which injects domain="*" — always fail) while
+    // adding no real protection: who may mutate policy is enforced at the
+    // PolicyService RPC authz layer (the correct place for anti-escalation), not
+    // by banning '*' in policy *content*. The null/newline/comma/length checks
+    // above remain — those are genuine CSV-injection / DoS guards.
+
     Ok(())
 }
 
@@ -1022,5 +1034,124 @@ mod tests {
         }
 
         assert!(allowed, "service:oauth should be able to query policy:ResolveServiceKey");
+    }
+
+    // ========================================================================
+    // atproto-scoped authorization invariants
+    //
+    // These assert *behavioral* contracts that any authorization model must
+    // hold (deny-by-default, per-identity isolation, public/private visibility,
+    // stream isolation) — NOT the current Casbin mechanism/vocabulary. They are
+    // written to survive the future tiles.run / atproto authz alignment: the
+    // new model has to satisfy the same invariants, so these double as a
+    // conformance harness. Resource identifiers go through the helpers below so
+    // that when model resources move toward MIR / AT-URI form the naming changes
+    // in one place, not every assertion. (OAuth scope-vocabulary tests are
+    // intentionally deferred — hyprstream's `action:service:*` scopes are not
+    // the access gate and will be replaced by atproto scopes.)
+    // ========================================================================
+
+    /// Resource string for a model branch. Centralized for atproto/MIR forward-compat.
+    fn model_resource(name: &str, branch: &str) -> String {
+        format!("model:{name}:{branch}")
+    }
+    /// Resource pattern for an identity's own namespace (self-ownership).
+    fn user_ns(subject: &str) -> String {
+        format!("user:{subject}:*")
+    }
+    /// Resource string for a moq event-prefix subscribe scope.
+    fn subscribe_scope(prefix: &str) -> String {
+        format!("subscribe:events:{prefix}.*")
+    }
+
+    /// Regression guard for the wildcard-validation bug: `add_policy` injects
+    /// domain="*", so a blanket '*' ban made it always fail (even on
+    /// wildcard-free input). It must succeed and take effect.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    async fn test_add_policy_succeeds_with_default_domain() {
+        let pm = PolicyManager::new_in_memory().await.unwrap();
+        // Wildcard-free 3-arg add_policy (internally domain="*") must succeed.
+        pm.add_policy("alice", &model_resource("qwen3", "main"), "infer.generate")
+            .await
+            .expect("add_policy must succeed (domain=* is the legitimate global domain)");
+        assert!(
+            pm.check("alice", &model_resource("qwen3", "main"), Operation::Infer).await,
+            "the rule add_policy created must take effect"
+        );
+    }
+
+    /// P0a — self-namespace isolation: an identity may reach its own namespace,
+    /// and MUST NOT reach another identity's namespace (cross-identity denial).
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn test_self_namespace_isolation() {
+        let pm = PolicyManager::new_in_memory().await.unwrap();
+        // The self-ownership grant the OIDC callback issues on first login.
+        pm.add_policy_with_domain("alice", "*", &user_ns("alice"), "*", "allow")
+            .await
+            .unwrap();
+        pm.add_policy_with_domain("bob", "*", &user_ns("bob"), "*", "allow")
+            .await
+            .unwrap();
+
+        // Each identity reaches its own namespace.
+        assert!(pm.check_with_domain("alice", "*", "user:alice:model1", "ttt.writeback").await);
+        assert!(pm.check_with_domain("bob", "*", "user:bob:model1", "ttt.writeback").await);
+
+        // Neither identity may reach the other's namespace.
+        assert!(!pm.check_with_domain("alice", "*", "user:bob:model1", "infer.generate").await,
+            "alice must not access bob's namespace");
+        assert!(!pm.check_with_domain("bob", "*", "user:alice:model1", "ttt.writeback").await,
+            "bob must not access alice's namespace");
+    }
+
+    /// P1a — deny-by-default and least-privilege: an unknown subject is denied,
+    /// a scoped grant authorizes only that exact (resource, action) pair, and
+    /// does not leak to other resources or actions.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn test_deny_by_default_and_least_privilege() {
+        let pm = PolicyManager::new_in_memory().await.unwrap();
+        let resource = model_resource("qwen3", "main");
+
+        // Deny-by-default: nobody is authorized until granted.
+        assert!(!pm.check_with_domain("mallory", "*", &resource, "infer.generate").await);
+
+        // Grant alice exactly infer on this model.
+        pm.add_policy_with_domain("alice", "*", &resource, "infer.generate", "allow")
+            .await
+            .unwrap();
+
+        assert!(pm.check_with_domain("alice", "*", &resource, "infer.generate").await);
+        // Grant does not leak to other actions...
+        assert!(!pm.check_with_domain("alice", "*", &resource, "ttt.writeback").await,
+            "infer grant must not confer manage");
+        // ...nor to other resources...
+        assert!(!pm.check_with_domain("alice", "*", &model_resource("llama", "main"), "infer.generate").await,
+            "grant on one model must not confer another");
+        // ...nor to other subjects.
+        assert!(!pm.check_with_domain("mallory", "*", &resource, "infer.generate").await);
+    }
+
+    /// P2a — moq subscribe-prefix isolation: a subscribe grant on one event
+    /// prefix MUST NOT authorize a sibling/private prefix (no cross-tenant leak
+    /// via prefix matching).
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn test_subscribe_prefix_isolation() {
+        let pm = PolicyManager::new_in_memory().await.unwrap();
+        // alice may subscribe under the "public" prefix only.
+        pm.add_policy_with_domain("alice", "*", &subscribe_scope("public"), "subscribe", "allow")
+            .await
+            .unwrap();
+
+        assert!(pm.check_with_domain("alice", "*", "subscribe:events:public.metrics", "subscribe").await,
+            "alice may subscribe within her granted prefix");
+        // A private prefix is NOT covered by the public-prefix grant.
+        assert!(!pm.check_with_domain("alice", "*", "subscribe:events:private.secrets", "subscribe").await,
+            "public-prefix grant must not leak to a private prefix");
+        // An ungranted subject is denied entirely.
+        assert!(!pm.check_with_domain("bob", "*", "subscribe:events:public.metrics", "subscribe").await);
     }
 }

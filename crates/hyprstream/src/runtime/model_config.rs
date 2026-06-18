@@ -543,13 +543,11 @@ impl ModelConfig {
                     self.rope_theta = 10_000_000.0; // Qwen3.5 uses 10M
                 }
             }
-            ModelArchitecture::Gemma => {
-                if self.vocab_size == 262144 {
-                    self.rope_theta = 1_000_000.0;
-                    self.use_qk_norm = true;
-                    self.scale_embeddings = true;
-                    self.query_pre_attn_scalar = Some(256.0);
-                }
+            ModelArchitecture::Gemma if self.vocab_size == 262144 => {
+                self.rope_theta = 1_000_000.0;
+                self.use_qk_norm = true;
+                self.scale_embeddings = true;
+                self.query_pre_attn_scalar = Some(256.0);
             }
             _ => {}
         }

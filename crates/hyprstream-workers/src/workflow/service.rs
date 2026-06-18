@@ -1,4 +1,4 @@
-//! WorkflowService - ZmqService implementation for workflow orchestration
+//! WorkflowService - RequestService implementation for workflow orchestration
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use anyhow::Result as AnyhowResult;
 use async_trait::async_trait;
 use hyprstream_rpc::prelude::SigningKey;
-use hyprstream_rpc::service::{AuthorizeFn, EnvelopeContext, ZmqService};
+use hyprstream_rpc::service::{AuthorizeFn, EnvelopeContext, RequestService};
 use hyprstream_rpc::transport::TransportConfig;
 
 use hyprstream_vfs::Namespace;
@@ -90,16 +90,13 @@ pub struct WorkflowService {
     /// Per-repo workflow subscriptions (O(1) lookup)
     repo_workflows: RwLock<HashMap<String, Vec<WorkflowSubscription>>>,
 
-    /// ZMQ context for event subscription
-    context: Arc<zmq::Context>,
-
     /// Event handlers for different event types
     handlers: RwLock<Vec<Box<dyn EventHandler>>>,
 
     /// Background event loop handle
     event_loop_handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
 
-    // Infrastructure (for ZmqService / Spawnable)
+    // Infrastructure (for RequestService / Spawnable)
     /// Transport configuration
     transport: TransportConfig,
     /// Signing key for message authentication
@@ -117,11 +114,9 @@ impl WorkflowService {
     ///
     /// # Arguments
     ///
-    /// * `context` - ZMQ context for event subscription (must be same as EventService for inproc://)
-    /// * `transport` - Transport configuration for ZMQ service binding
+    /// * `transport` - Transport configuration for service binding
     /// * `signing_key` - Signing key for message authentication
     pub fn new(
-        context: Arc<zmq::Context>,
         transport: TransportConfig,
         signing_key: SigningKey,
     ) -> Self {
@@ -129,7 +124,6 @@ impl WorkflowService {
             workflows: RwLock::new(HashMap::new()),
             runs: Arc::new(RwLock::new(HashMap::new())),
             repo_workflows: RwLock::new(HashMap::new()),
-            context,
             handlers: RwLock::new(Vec::new()),
             event_loop_handle: tokio::sync::Mutex::new(None),
             transport,
@@ -165,7 +159,7 @@ impl WorkflowService {
     /// Subscribes to worker events and routes them to registered handlers.
     /// This spawns a background task that runs until `stop()` is called.
     pub async fn start(self: Arc<Self>) -> Result<()> {
-        let mut subscriber = EventSubscriber::new(&self.context)?;
+        let mut subscriber = EventSubscriber::new()?;
 
         // Subscribe to worker events (sandbox/container lifecycle)
         subscriber.subscribe("worker.")?;
@@ -613,11 +607,11 @@ impl WorkflowHandler for WorkflowService {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ZmqService Implementation — delegates to generated dispatch_workflow
+// RequestService Implementation — delegates to generated dispatch_workflow
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[async_trait(?Send)]
-impl ZmqService for WorkflowService {
+impl RequestService for WorkflowService {
     async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> AnyhowResult<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
         tracing::debug!(
             "Workflow request from {} (request_id={})",
@@ -629,10 +623,6 @@ impl ZmqService for WorkflowService {
 
     fn name(&self) -> &str {
         SERVICE_NAME
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
     }
 
     fn transport(&self) -> &TransportConfig {

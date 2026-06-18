@@ -58,7 +58,7 @@ struct DepEdge {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Transport {
-    ZmqRep,
+    RpcReqRep,
     Http,
     Proxy,
 }
@@ -66,9 +66,9 @@ enum Transport {
 impl Transport {
     fn label(&self) -> &'static str {
         match self {
-            Transport::ZmqRep => "ZMQ REQ/REP",
+            Transport::RpcReqRep => "RPC REQ/REP",
             Transport::Http => "HTTP",
-            Transport::Proxy => "ZMQ Proxy",
+            Transport::Proxy => "Event Proxy",
         }
     }
 }
@@ -80,8 +80,8 @@ fn client_to_service(client_type: &str) -> Option<&'static str> {
     match client_type {
         "PolicyClient" => Some("policy"),
         "RegistryClient" => Some("registry"),
-        "ModelZmqClient" => Some("model"),
-        "InferenceZmqClient" => Some("inference"),
+        "ModelClient" => Some("model"),
+        "InferenceClient" => Some("inference"),
         "NotificationClient" => Some("notification"),
         "NotificationPublisher" => Some("notification"),
         "WorktreeClient" => Some("registry"), // scoped sub-client of registry
@@ -101,8 +101,8 @@ fn client_to_service(client_type: &str) -> Option<&'static str> {
 const CLIENT_TYPES: &[&str] = &[
     "PolicyClient",
     "RegistryClient",
-    "ModelZmqClient",
-    "InferenceZmqClient",
+    "ModelClient",
+    "InferenceClient",
     "NotificationClient",
     "NotificationPublisher",
     "WorktreeClient",
@@ -819,7 +819,7 @@ fn extract_quoted(line: &str) -> Option<String> {
 
 /// Scan a factory function body to detect transport type and QUIC support.
 fn scan_factory_body(lines: &[&str], start: usize) -> (Transport, bool) {
-    let mut transport = Transport::ZmqRep;
+    let mut transport = Transport::RpcReqRep;
     let mut has_quic = false;
     let mut brace_depth = 0;
     let mut in_body = false;
@@ -1032,9 +1032,9 @@ fn generate_topology(services: &[ServiceMeta]) -> String {
         .iter()
         .filter(|s| s.transport == Transport::Http)
         .collect();
-    let zmq: Vec<&ServiceMeta> = services
+    let rpc_services: Vec<&ServiceMeta> = services
         .iter()
-        .filter(|s| s.transport == Transport::ZmqRep)
+        .filter(|s| s.transport == Transport::RpcReqRep)
         .collect();
     let proxies: Vec<&ServiceMeta> = services
         .iter()
@@ -1051,11 +1051,11 @@ fn generate_topology(services: &[ServiceMeta]) -> String {
         out.push_str("    end\n\n");
     }
 
-    // ZMQ subgraph
-    if !zmq.is_empty() {
-        out.push_str("    subgraph zmq [\"ZMQ Services · encrypted RPC\"]\n");
+    // RPC subgraph
+    if !rpc_services.is_empty() {
+        out.push_str("    subgraph rpc_services [\"RPC Services\"]\n");
         out.push_str("        direction LR\n");
-        for s in &zmq {
+        for s in &rpc_services {
             out.push_str(&format!("        {}[\"{}\"]\n", s.name, service_label(s)));
         }
         out.push_str("    end\n\n");

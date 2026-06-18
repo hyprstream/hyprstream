@@ -529,21 +529,15 @@ impl LlamaAttention {
             (k_for_attn, v_for_attn)
         };
 
-        // Manual attention implementation
-        // Note: SDPA was tested but:
-        // - efficient_attention panics on this ROCm/libtorch version
-        // - math_attention is slower than manual (~12 tok/sec vs ~70 tok/sec prefill)
-        // See plan file for detailed analysis and future work.
-
-        // Compute attention scores
-        let scores = self.compute_attention_scores(&q, &k_expanded)?;
-
-        // V: [batch, seq, heads, dim] -> [batch, heads, seq, dim]
-        // PERF: .contiguous() required for optimal batched matmul on ROCm/AMD
-        let v = v_expanded.transpose(1, 2).contiguous();
-
-        // Apply attention to values: [batch, heads, seq, seq] x [batch, heads, seq, dim] = [batch, heads, seq, dim]
-        let attn_output = scores.matmul(&v);
+        // Memory-efficient fused attention. For long prefills it chunks over the
+        // query axis so the [q_len, k_len] FP32 score matrix is never materialized
+        // at full size — capping peak VRAM at O(CHUNK * k_len) instead of
+        // O(q_len * k_len). An 8K-token prompt otherwise balloons the score/softmax
+        // tensors past 20 GB and the CUDA caching allocator retains that peak,
+        // OOMing the next request. Backend-agnostic (plain matmul/softmax): SDPA's
+        // flash/efficient kernels panic on this ROCm/libtorch version and
+        // math_attention is slower, so chunking is used instead.
+        let attn_output = self.compute_attention(&q, &k_expanded, &v_expanded)?;
 
         // Transpose back: [batch, heads, seq, dim] -> [batch, seq, heads, dim]
         // PERF: .contiguous() before reshape ensures optimal memory access
@@ -731,64 +725,92 @@ impl LlamaAttention {
         )
     }
 
-    /// Compute scaled dot-product attention scores with causal masking
+    /// Fused scaled dot-product attention with causal masking.
     ///
-    /// Entire computation (Q*K matmul, masking, softmax) is performed in FP32
-    /// for numerical stability. BF16 attention causes progressive precision loss
-    /// in long sequences, leading to corrupted number generation.
-    /// This matches HuggingFace/vLLM standard practice.
-    fn compute_attention_scores(&self, q: &Tensor, k: &Tensor) -> Result<Tensor> {
+    /// Computes `softmax(Q·Kᵀ · scale + mask)·V` in FP32 for numerical stability
+    /// (BF16 attention causes progressive precision loss in long sequences,
+    /// matching HuggingFace/vLLM practice). Fusing the QK, softmax, and V steps
+    /// lets the score matrix be produced and consumed one query-chunk at a time.
+    ///
+    /// For long prefills (`q_len > CHUNK`) the query axis is processed in chunks
+    /// so the `[q_len, k_len]` FP32 score/softmax tensors are never materialized at
+    /// full size — peak VRAM is O(CHUNK · k_len) rather than O(q_len · k_len).
+    /// The decode path (`q_len == 1`) and short prompts take the single-shot
+    /// branch, byte-for-byte equivalent to the previous implementation.
+    ///
+    /// `q`, `k`, `v` are `[batch, seq, heads, dim]` (K/V already GQA-expanded by
+    /// the caller); the result is `[batch, heads, q_len, dim]`.
+    fn compute_attention(&self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+        /// Query-chunk size for long-prefill attention. 1024 keeps the per-chunk
+        /// score matrix small while amortizing kernel-launch overhead.
+        const CHUNK: i64 = 1024;
+
         let scale = 1.0 / (self.head_dim as f32).sqrt();
         let original_kind = q.kind();
 
-        // Q: [batch, seq, heads, dim] -> [batch, heads, seq, dim]
+        // [batch, seq, heads, dim] -> [batch, heads, seq, dim] (K transposed for matmul)
         // PERF: .contiguous() required for optimal batched matmul on ROCm/AMD
         let q = q.transpose(1, 2).contiguous();
-        // K: [batch, seq, heads, dim] -> [batch, heads, seq, dim] -> [batch, heads, dim, seq]
-        let k = k.transpose(1, 2).transpose(2, 3).contiguous();
+        let k_t = k.transpose(1, 2).transpose(2, 3).contiguous(); // [batch, heads, dim, k_len]
+        let v = v.transpose(1, 2).contiguous(); // [batch, heads, k_len, dim]
 
-        // Upcast Q and K to FP32 for precise attention score computation
-        let q_fp32 = if original_kind != tch::Kind::Float {
-            q.to_kind(tch::Kind::Float)
-        } else {
-            q
-        };
-        let k_fp32 = if original_kind != tch::Kind::Float {
-            k.to_kind(tch::Kind::Float)
-        } else {
-            k
-        };
+        // Upcast to FP32 for precise score computation (matches prior behavior).
+        let upcast = original_kind != tch::Kind::Float;
+        let q = if upcast { q.to_kind(tch::Kind::Float) } else { q };
+        let k_t = if upcast { k_t.to_kind(tch::Kind::Float) } else { k_t };
+        let v = if upcast { v.to_kind(tch::Kind::Float) } else { v };
 
-        // Compute attention scores in FP32: [batch, heads, seq, seq]
-        let mut scores = q_fp32.matmul(&k_fp32) * (scale as f64);
+        let q_len = q.size()[2];
+        let k_len = k_t.size()[3];
+        let device = q.device();
 
-        // Apply causal mask - CRITICAL for autoregressive generation
-        let score_shape = scores.size();
-        let q_len = score_shape[2];
-        let k_len = score_shape[3];
+        // Sliding-window (Gemma3 "local") layers keep the single-shot path so the
+        // window mask logic stays in one place.
+        let single_shot = self.sliding_window.is_some() || q_len <= CHUNK;
 
-        // Apply causal mask only when processing multiple query tokens (prompt phase)
-        // For autoregressive generation (q_len=1), all past positions are valid - no mask needed
-        if q_len > 1 {
-            let mask = Tensor::ones([q_len, k_len], (tch::Kind::Float, scores.device())).tril(0);
-            let mask = mask.unsqueeze(0).unsqueeze(0).expand_as(&scores);
-            let mask_value = -10000.0f64;
-            scores = scores.masked_fill(&mask.eq(0.0), mask_value);
-        }
+        let attn_output = if single_shot {
+            // [batch, heads, q_len, k_len]
+            let mut scores = q.matmul(&k_t) * (scale as f64);
 
-        // Apply sliding window mask if configured (Gemma3)
-        if let Some(window_size) = self.sliding_window {
-            if self.layer_type == "local" {
-                scores = self.apply_sliding_window_mask(&scores, window_size)?;
+            // Causal mask only when processing multiple query tokens (prompt phase);
+            // for q_len == 1 (decode) all past positions are valid — no mask.
+            if q_len > 1 {
+                let mask = Tensor::ones([q_len, k_len], (tch::Kind::Float, device)).tril(0);
+                let mask = mask.unsqueeze(0).unsqueeze(0).expand_as(&scores);
+                scores = scores.masked_fill(&mask.eq(0.0), -10000.0f64);
             }
-        }
 
-        // Softmax in FP32, then cast back to original dtype for V multiplication
-        let attn_weights = scores.softmax(-1, tch::Kind::Float);
-        Ok(if original_kind != tch::Kind::Float {
-            attn_weights.to_kind(original_kind)
+            // Sliding window mask if configured (Gemma3)
+            if let Some(window_size) = self.sliding_window {
+                if self.layer_type == "local" {
+                    scores = self.apply_sliding_window_mask(&scores, window_size)?;
+                }
+            }
+
+            scores.softmax(-1, tch::Kind::Float).matmul(&v)
         } else {
-            attn_weights
+            // Chunk over the query axis. Per-chunk causal mask `tril(start)` is the
+            // exact restriction of the full `tril(0)` mask to rows [start, start+cur),
+            // so masking is identical to the single-shot path.
+            let mut outputs: Vec<Tensor> = Vec::new();
+            let mut start = 0i64;
+            while start < q_len {
+                let cur = (q_len - start).min(CHUNK);
+                let q_chunk = q.narrow(2, start, cur); // [batch, heads, cur, dim]
+                let mut scores = q_chunk.matmul(&k_t) * (scale as f64); // [batch, heads, cur, k_len]
+                let mask = Tensor::ones([cur, k_len], (tch::Kind::Float, device)).tril(start);
+                let mask = mask.unsqueeze(0).unsqueeze(0).expand_as(&scores);
+                scores = scores.masked_fill(&mask.eq(0.0), -10000.0f64);
+                outputs.push(scores.softmax(-1, tch::Kind::Float).matmul(&v)); // [batch, heads, cur, dim]
+                start += cur;
+            }
+            Tensor::cat(&outputs, 2) // [batch, heads, q_len, dim]
+        };
+
+        Ok(if upcast {
+            attn_output.to_kind(original_kind)
+        } else {
+            attn_output
         })
     }
 

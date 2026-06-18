@@ -45,13 +45,11 @@ use hyprstream_core::cli::{handle_commit, handle_merge, handle_push, MergeOption
 use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
 
-// Registry and policy services - uses ZMQ-based services from hyprstream_core
+// Registry and policy services
 use hyprstream_core::services::{PolicyClient, RegistryClient};
 // Worker service for Kata-based workload execution
 use hyprstream_workers::runtime::WorkerService;
 use hyprstream_workers::{ImageConfig, PoolConfig};
-// ZMQ context for service startup
-use hyprstream_core::zmq::global_context;
 use std::sync::Arc;
 // Unified service manager API
 use hyprstream_service::{get_factory, InprocManager, ServiceContext, ServiceManager};
@@ -193,6 +191,13 @@ fn build_cli() -> ClapCommand {
                     .long("enable-federation")
                     .action(clap::ArgAction::SetTrue)
                     .help("Apply the federation-open policy template — accept third-party apps AND remote peer servers from any HTTPS origin (atproto-style federation). Default is disabled; under -y this flag is the only way to enable it."),
+            )
+            .arg(
+                Arg::new("initial_user_role")
+                    .long("initial-user-role")
+                    .value_name("ROLE")
+                    .default_value("admin")
+                    .help("Role to assign the local user under --non-interactive (admin|operator|trainer|viewer). Default is admin; use operator/viewer in tests for least-privilege."),
             ),
     );
 
@@ -490,7 +495,7 @@ fn handle_quick_command(
                     signing_key,
                     model_server_vk,
                     None,
-                );
+                )?;
                 let filters = parse_filters(&filter)?;
                 let status_filter = parse_status_filter(&status)?;
                 handle_list(ctx.registry(), model_client, &filters, &status_filter).await
@@ -1079,7 +1084,6 @@ fn handle_quick_command(
                             pool_config,
                             backend,
                             rafs_store,
-                            global_context().clone(),
                             worker_transport,
                             signing_key.clone(),
                         )?;
@@ -1090,10 +1094,18 @@ fn handle_quick_command(
                             resolve_service_vk("policy")
                                 .ok_or_else(|| anyhow::anyhow!("Cannot resolve policy pubkey. Run wizard."))?,
                             None,
-                        );
+                        )?;
                         worker_service.set_authorize_fn(
                             hyprstream_core::services::build_authorize_fn(worker_policy_client),
                         );
+
+                        // Standalone worker entrypoint serves RPC, so it must
+                        // install the verify config too (#160) — otherwise the
+                        // fail-closed default rejects all mesh traffic. No config
+                        // is in scope here, so the mesh PQ store is empty (#157):
+                        // identical to prior behavior (Hybrid fails closed for
+                        // unknown peers).
+                        install_envelope_verify_config(None);
 
                         let manager = InprocManager::new();
                         Some(
@@ -1110,7 +1122,7 @@ fn handle_quick_command(
                     let worker_server_vk = resolve_service_vk("worker")
                         .ok_or_else(|| anyhow::anyhow!("Cannot resolve worker pubkey. Run wizard."))?;
                     let worker_client =
-                        WorkerClient::for_service(signing_key, worker_server_vk, None);
+                        WorkerClient::for_service(signing_key, worker_server_vk, None)?;
 
                     match action {
                         WorkerAction::List {
@@ -1298,6 +1310,88 @@ fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
     trust.resolve_one(service_name)
 }
 
+/// Install the process-global envelope verify configuration (#152, #160).
+///
+/// MUST be called once at startup on **every** process entrypoint that serves
+/// RPC — the inproc daemon AND standalone service entrypoints (e.g. a lone
+/// worker). When uninstalled, `global_verify_policy()` fail-closes to Hybrid
+/// (#160), so a missing call here breaks mesh verification loudly rather than
+/// silently downgrading to EdDSA-only. `install_verify_config` is first-write-
+/// wins, so calling it from multiple stages within one process is harmless.
+///
+/// Policy default is Hybrid (SNS nested COSE); operators mid-rollout, before
+/// peer ML-DSA bindings are provisioned, may set
+/// `HYPRSTREAM_ENVELOPE_POLICY=classical`. Under Hybrid with no anchored peer
+/// key the verifier fails closed (correct, by design).
+/// Install the process-global envelope verify configuration.
+///
+/// When `oauth` is `Some`, the kid-anchored PQ trust store is populated eagerly
+/// from `mesh_peers` (#157). When `None` (e.g. the standalone worker entrypoint,
+/// which has no config in scope), the store is empty — identical to the prior
+/// behavior. Either way the store is immutable after install.
+fn install_envelope_verify_config(oauth: Option<&hyprstream_core::config::OAuthConfig>) {
+    use hyprstream_rpc::crypto::CryptoPolicy;
+    use hyprstream_rpc::envelope::{
+        envelope_policy_from_env, install_response_verify_config, install_verify_config,
+        EnvelopeVerifyConfig, KeyedPqTrustStore, PqTrustStore, ResponseVerifyConfig,
+    };
+
+    // Single source of truth for the rollout escape hatch
+    // (`HYPRSTREAM_ENVELOPE_POLICY`), shared by the request AND response sides
+    // (#277): `classical` downgrades both directions in lock-step.
+    let policy = envelope_policy_from_env();
+
+    // Mesh kid-anchored PQ trust store (#157, Option A): populated eagerly from
+    // admin-configured `mesh_peers`, immutable after install. An empty store
+    // under Hybrid fails closed for unknown peers (correct, by design).
+    let keyed_store = match oauth {
+        Some(oauth) => hyprstream_core::auth::mesh_trust::build_mesh_pq_trust_store(oauth),
+        None => KeyedPqTrustStore::new(),
+    };
+    tracing::info!("mesh PQ trust store installed with {} peer binding(s)", keyed_store.len());
+    // Shared Arc: the SAME admin-anchored store backs both the request-side and
+    // response-side verify configs — built once, anchored once (#277 reuse of
+    // #157). The server's `#mesh-pq` ML-DSA-65 key (keyed by its Ed25519 mesh
+    // signer identity) anchors response verification just as it anchors request
+    // verification.
+    let pq_store: std::sync::Arc<dyn PqTrustStore> = std::sync::Arc::new(keyed_store);
+
+    // Install the RESPONSE-side process-global default (#277), mirroring the
+    // request-side install below: fail-closed Hybrid by default with the same
+    // anchored store, so native RPC clients consult it when no per-client store
+    // was set.
+    let _ = install_response_verify_config(ResponseVerifyConfig {
+        policy,
+        pq_store: Some(pq_store.clone()),
+    });
+
+    if install_verify_config(EnvelopeVerifyConfig {
+        policy,
+        pq_store: Some(pq_store),
+    })
+    .is_ok()
+    {
+        match policy {
+            CryptoPolicy::Hybrid => tracing::info!(
+                "envelope verify policy: HYBRID enforced (SNS nested COSE); \
+                 peer ML-DSA bindings required for cross-node traffic"
+            ),
+            CryptoPolicy::Classical => {
+                tracing::error!(
+                    "⚠ SECURITY DOWNGRADE: envelope verify policy is CLASSICAL (EdDSA-only). \
+                     Post-quantum protection is DISABLED for ALL envelope traffic. \
+                     Unset HYPRSTREAM_ENVELOPE_POLICY or set it to 'hybrid' to re-enable PQ enforcement. \
+                     This setting must not be used in production."
+                );
+                eprintln!(
+                    "SECURITY WARNING: HYPRSTREAM_ENVELOPE_POLICY=classical disables post-quantum \
+                     protection. Set to 'hybrid' or unset for production use."
+                );
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
     // ROCm allocator and BLAS optimizations — must be set before any tch/libtorch init.
     // Expandable segments eliminates ~1,900 hipMalloc/hipFree calls per decode step.
@@ -1384,6 +1478,13 @@ fn main() -> Result<()> {
     config
         .validate()
         .context("Configuration validation failed")?;
+
+    // Install the per-service streaming-response concurrency cap from config
+    // (#186) before any RPC service starts. First-write-wins; ignore if already
+    // installed on this process.
+    let _ = hyprstream_rpc::streaming::install_max_concurrent_streams_per_service(
+        config.server.max_concurrent_streams_per_service,
+    );
 
     // ========== TRACING INITIALIZATION (before service startup) ==========
     let is_service_command = matches.subcommand_name() == Some("service");
@@ -1525,6 +1626,10 @@ fn main() -> Result<()> {
                 let start_services = sub_m.get_flag("start");
                 let bootstrap_only = sub_m.get_flag("bootstrap_only");
                 let enable_federation = sub_m.get_flag("enable_federation");
+                let initial_user_role = sub_m
+                    .get_one::<String>("initial_user_role")
+                    .cloned()
+                    .unwrap_or_else(|| "admin".to_owned());
                 let use_tui = tui_mode || (!non_interactive && !bootstrap_only && supports_tui());
                 return with_runtime(
                     RuntimeConfig { device: DeviceConfig::request_cpu(), multi_threaded: true },
@@ -1534,7 +1639,7 @@ fn main() -> Result<()> {
                         } else {
                             hyprstream_core::cli::handle_wizard(
                                 &models_dir, &services, non_interactive, start_services,
-                                bootstrap_only, enable_federation,
+                                bootstrap_only, enable_federation, &initial_user_role,
                             ).await
                         }
                     },
@@ -1550,7 +1655,7 @@ fn main() -> Result<()> {
                         // First-run fallback (no `wizard` subcommand) defaults
                         // federation to off — explicit opt-in only.
                         hyprstream_core::cli::handle_wizard(
-                            &models_dir, &services, false, false, false, false,
+                            &models_dir, &services, false, false, false, false, "admin",
                         ).await
                     }
                 },
@@ -1564,7 +1669,7 @@ fn main() -> Result<()> {
         .build()
         .context("Failed to create registry runtime")?;
 
-    // Start ZMQ-based services and create keypair
+    // Start services and create keypair
     let (registry_client, signing_key, verifying_key): (
         RegistryClient,
         SigningKey,
@@ -1586,7 +1691,7 @@ fn main() -> Result<()> {
                 signing_key.clone(),
                 registry_vk,
                 None,
-            );
+            )?;
 
             Ok::<_, anyhow::Error>((client, signing_key, verifying_key))
         })
@@ -1654,7 +1759,6 @@ fn main() -> Result<()> {
                     foreground,
                     daemon,
                     ipc,
-                    callback,
                     services: multi_services,
                     quic_bind,
                     print_cert_hash,
@@ -1674,58 +1778,6 @@ fn main() -> Result<()> {
                                 )),
                             }
                         };
-
-                        // Check if this is inference callback mode
-                        if let Some(callback_endpoint) = callback {
-                            use hyprstream_core::services::InferenceService;
-
-                            let instance_id =
-                                if let Some(id) = name.strip_prefix("inference@") {
-                                    id.to_owned()
-                                } else {
-                                    return Err(anyhow::anyhow!(
-                                        "--callback requires inference@{{id}} format (got: {})",
-                                        name
-                                    ));
-                                };
-
-                            info!(
-                                "Starting InferenceService in callback mode: {} -> {}",
-                                instance_id, callback_endpoint
-                            );
-
-                            return with_runtime(
-                                RuntimeConfig {
-                                    device: DeviceConfig::request_cpu(),
-                                    multi_threaded: false,
-                                },
-                                || async move {
-                                    let data_dir = dirs::data_local_dir()
-                                        .unwrap_or_else(|| std::path::PathBuf::from("."))
-                                        .join("hyprstream");
-                                    let keys_dir = data_dir.join("keys");
-                                    let signing_key =
-                                        load_or_generate_signing_key(&keys_dir).await?;
-                                    let policy_client = PolicyClient::for_service(
-                                        signing_key.clone(),
-                                        resolve_service_vk("policy")
-                                            .ok_or_else(|| anyhow::anyhow!("Cannot resolve policy pubkey. Run wizard."))?,
-                                        None,
-                                    );
-
-                                    let runtime_config =
-                                        hyprstream_core::runtime::RuntimeConfig::default();
-
-                                    InferenceService::start_with_callback(
-                                        instance_id,
-                                        callback_endpoint,
-                                        runtime_config,
-                                        policy_client,
-                                    )
-                                    .await
-                                },
-                            );
-                        }
 
                         // Standard foreground service startup
                         let rpc_mode = if ipc {
@@ -1772,7 +1824,6 @@ fn main() -> Result<()> {
                                         &config.oauth.trusted_issuers,
                                     ));
                                 let mut ctx = ServiceContext::new(
-                                    global_context(),
                                     signing_key.clone(),
                                     verifying_key,
                                     ipc,
@@ -1918,6 +1969,8 @@ fn main() -> Result<()> {
                                         server_name: qc.server_name.clone(),
                                         oauth_issuer_url: Some(config.oauth.issuer_url()),
                                         jwt_verifying_key: Some(ctx.jwt_verifying_key()),
+                                        // #282: bind iroh in parallel to quinn when opted in.
+                                        iroh_enabled: qc.iroh,
                                     };
                                     ctx = ctx.with_quic(shared);
                                 }
@@ -1944,7 +1997,6 @@ fn main() -> Result<()> {
                                 }
 
                                 // Populate ML-DSA-65 verifying keys for PQ-hybrid JWT verification.
-                                #[cfg(feature = "pq-hybrid")]
                                 {
                                     let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir();
                                     let ml_dsa_store = hyprstream_core::auth::key_rotation::global_ml_dsa_key_store(
@@ -1956,7 +2008,7 @@ fn main() -> Result<()> {
                                         rt.block_on(ml_dsa_store.all_slots_snapshot())
                                     })
                                     .iter()
-                                    .map(|slot| slot.verifying_key())
+                                    .map(hyprstream_core::auth::MlDsaKeySlot::verifying_key)
                                     .collect();
                                     let shared_vks = hyprstream_core::auth::key_rotation::global_ml_dsa_verifying_keys();
                                     let _ = shared_vks.write().map(|mut guard| *guard = vks);
@@ -1964,11 +2016,57 @@ fn main() -> Result<()> {
                                     tracing::info!("PQ-hybrid: ML-DSA-65 verifying keys loaded for JWT verification");
                                 }
 
+                                // M3 (#152): install the process-global envelope
+                                // verify configuration that closes the fail-open
+                                // at the ZMQ RequestLoop + StreamService verify
+                                // sites.
+                                //
+                                // KEY SEPARATION (PQUIP key-reuse restriction):
+                                // the mesh hybrid identity's ML-DSA key MUST be
+                                // distinct from the JWT-signing ML-DSA keyset
+                                // (`global_ml_dsa_verifying_keys`, loaded above).
+                                // We therefore DO NOT seed the mesh PqTrustStore
+                                // from the JWT keyset. The mesh store is keyed by
+                                // Ed25519 signer identity.
+                                //
+                                // #157 (Option A — eager, admin-anchored): the
+                                // store is populated EAGERLY here, before install,
+                                // from the operator-configured `mesh_peers`. It is
+                                // immutable after install (no lazy-at-verify
+                                // resolution). Empty `mesh_peers` => empty store =>
+                                // unchanged behavior.
+                                //
+                                // Policy: Hybrid is enforced by default. Operators
+                                // mid-rollout (before peer ML-DSA bindings are
+                                // provisioned) may set
+                                // HYPRSTREAM_ENVELOPE_POLICY=classical to keep the
+                                // legacy EdDSA-only verifier. Under Hybrid with no
+                                // anchored key the verifier FAILS CLOSED.
+                                install_envelope_verify_config(Some(&config.oauth));
+
                                 let manager = InprocManager::new();
                                 let mut handles = Vec::new();
 
                                 // Compute dependency-aware startup stages.
                                 let stages = hyprstream_service::startup_stages(&service_names);
+
+                                // #275: in the systemd / --ipc deployment each service
+                                // runs in its OWN process. Only the `event` service's
+                                // process initializes the process-global moq event bus
+                                // origin. If THIS process does not host the `event`
+                                // service, wire a CLIENT-mode event origin connected to
+                                // the event service's UDS plane BEFORE any factory runs
+                                // (so `EventPublisher::new` in e.g. the worker factory
+                                // resolves the global). Idempotent + a no-op when `event`
+                                // is co-located.
+                                let hosts_event_service = stages
+                                    .iter()
+                                    .any(|stage| stage.iter().any(|s| s == "event"));
+                                if !hosts_event_service {
+                                    hyprstream_rpc::moq_event::ensure_event_client_origin(
+                                        hyprstream_rpc::paths::event_socket(),
+                                    );
+                                }
 
                                 for stage in &stages {
                                     for svc_name in stage {
@@ -2002,10 +2100,7 @@ fn main() -> Result<()> {
                                     // Publish ready events for this stage before starting the next.
                                     for svc_name in stage {
                                         if let Ok(mut publisher) =
-                                            hyprstream_workers::EventPublisher::new(
-                                                &global_context(),
-                                                "system",
-                                            )
+                                            hyprstream_workers::EventPublisher::new("system")
                                         {
                                             let _ = publisher
                                                 .publish_raw(
@@ -2032,10 +2127,7 @@ fn main() -> Result<()> {
                                 // Stop all services
                                 for (svc_name, mut handle) in handles {
                                     if let Ok(mut publisher) =
-                                        hyprstream_workers::EventPublisher::new(
-                                            &global_context(),
-                                            "system",
-                                        )
+                                        hyprstream_workers::EventPublisher::new("system")
                                     {
                                         let _ = publisher
                                             .publish_raw(
@@ -2275,7 +2367,7 @@ fn main() -> Result<()> {
                         } else {
                             // First-run auto-wizard defaults federation to off.
                             hyprstream_core::cli::handle_wizard(
-                                &models_dir, &services, false, false, false, false,
+                                &models_dir, &services, false, false, false, false, "admin",
                             ).await
                         }
                     },

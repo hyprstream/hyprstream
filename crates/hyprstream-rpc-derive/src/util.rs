@@ -229,6 +229,7 @@ mod tests {
             pointer_words: 0,
             discriminant_count: 0,
             discriminant_offset: 0,
+            union_arms: vec![],
         }]
     }
 

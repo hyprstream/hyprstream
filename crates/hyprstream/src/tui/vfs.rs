@@ -117,7 +117,7 @@ pub fn build_chat_vfs_namespace(
         signing_key.clone(),
         policy_vk,
         None,
-    );
+    )?;
     let model_vk_resp = tokio::task::block_in_place(|| {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(policy_client.resolve_service_key(
@@ -137,7 +137,7 @@ pub fn build_chat_vfs_namespace(
         signing_key.clone(),
         model_vk,
         None,
-    );
+    )?;
     let remote_model_mount = crate::services::remote_mount::RemoteModelMount::new(model_client);
     let _ = ns.mount("/srv/model", Arc::new(remote_model_mount));
 

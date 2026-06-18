@@ -34,8 +34,9 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::future::BoxFuture;
 use hyprstream_rpc::auth::jwt;
 use hyprstream_service::ServiceContext;
-use hyprstream_rpc::service::ZmqService;
-use hyprstream_rpc::streaming::{StreamHandle, StreamPayload};
+use hyprstream_rpc::service::RequestService;
+use hyprstream_rpc::moq_stream::MoqStreamHandle;
+use hyprstream_rpc::streaming::StreamPayload;
 use hyprstream_rpc::transport::TransportConfig;
 use rmcp::{
     model::{
@@ -139,11 +140,9 @@ fn snake_to_camel(s: &str) -> String {
 pub struct McpConfig {
     /// Ed25519 public key for JWT verification
     pub verifying_key: VerifyingKey,
-    /// ZMQ context for backend clients
-    pub zmq_context: Arc<zmq::Context>,
-    /// Ed25519 signing key for creating ZMQ clients
+    /// Ed25519 signing key for creating RPC clients
     pub signing_key: SigningKey,
-    /// ZMQ transport for control plane
+    /// RPC transport for control plane
     pub transport: TransportConfig,
     /// Service context for client construction (optional for backward compat)
     pub ctx: Option<Arc<ServiceContext>>,
@@ -164,15 +163,14 @@ pub struct McpConfig {
 pub enum ToolResult {
     /// Immediate JSON result (REQ/REP tools)
     Sync(Value),
-    /// Streaming result — StreamHandle encapsulates DH, SUB, HMAC verification
-    Stream(Box<StreamHandle>),
+    /// Streaming result — MoqStreamHandle encapsulates DH, moq subscribe, HMAC verification
+    Stream(Box<MoqStreamHandle>),
 }
 
-/// Context passed to handler — carries auth + ZMQ infra + optional ServiceContext
+/// Context passed to handler — carries auth + optional ServiceContext
 pub struct ToolCallContext {
     pub args: Value,
     pub signing_key: SigningKey,
-    pub zmq_context: Arc<zmq::Context>,
     /// Authenticated user string propagated to backend services
     pub user: String,
     /// ServiceContext for typed_client() / client() access (optional for backward compat)
@@ -428,27 +426,31 @@ fn register_scoped_tools_recursive(
                                     let server_vk = ctx.resolve_peer_key("registry").await?;
                                     let client: RegistryClient = RegistryClient::for_service(
                                         ctx.signing_key, server_vk, None,
-                                    );
+                                    )?;
                                     client.call_scoped_streaming_method(&scope_refs, &method, &ctx.args, client_pubkey_bytes).await?
                                 }
                                 "model" => {
                                     let server_vk = ctx.resolve_peer_key("model").await?;
-                                    let client = ModelClient::for_service(ctx.signing_key, server_vk, None);
+                                    let client = ModelClient::for_service(ctx.signing_key, server_vk, None)?;
                                     client.call_scoped_streaming_method(&scope_refs, &method, &ctx.args, client_pubkey_bytes).await?
                                 }
                                 _ => anyhow::bail!("No scoped streaming dispatch for service: {service}"),
                             };
 
-                            let (stream_id, endpoint, server_pubkey) = parse_stream_info(&stream_info_json)?;
-
-                            let handle = StreamHandle::new(
-                                &ctx.zmq_context,
-                                stream_id,
-                                &endpoint,
-                                &server_pubkey,
-                                &client_secret,
-                                &client_pubkey_bytes,
-                            )?;
+                            let handle = match decode_stream_reach(&stream_info_json)? {
+                                DecodedStreamReach::Networked { dh_public, reach, broadcast_path } => {
+                                    let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
+                                        &client_secret, &client_pubkey_bytes, &dh_public,
+                                    )?;
+                                    MoqStreamHandle::networked(reach, broadcast_path, mac_key, topic)
+                                }
+                                DecodedStreamReach::Uds { dh_public, uds_path, broadcast_path } => {
+                                    let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
+                                        &client_secret, &client_pubkey_bytes, &dh_public,
+                                    )?;
+                                    MoqStreamHandle::new(uds_path, broadcast_path, mac_key, topic)
+                                }
+                            };
 
                             Ok(ToolResult::Stream(Box::new(handle)))
                         })
@@ -515,12 +517,12 @@ async fn dispatch_scoped_call(
             let server_vk = ctx.resolve_peer_key("registry").await?;
             let client: RegistryClient = RegistryClient::for_service(
                 ctx.signing_key.clone(), server_vk, None,
-            );
+            )?;
             client.call_scoped_method(scopes, method, &ctx.args).await?
         }
         "model" => {
             let server_vk = ctx.resolve_peer_key("model").await?;
-            let client = ModelClient::for_service(ctx.signing_key.clone(), server_vk, None);
+            let client = ModelClient::for_service(ctx.signing_key.clone(), server_vk, None)?;
             client.call_scoped_method(scopes, method, &ctx.args).await?
         }
         _ => anyhow::bail!("No scoped dispatch for service: {service}"),
@@ -583,32 +585,36 @@ fn register_streaming_tool(
                         let server_vk = ctx.resolve_peer_key("registry").await?;
                         let client: RegistryClient = RegistryClient::for_service(
                             ctx.signing_key, server_vk, None,
-                        );
+                        )?;
                         client.call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?
                     }
                     "model" => {
                         let server_vk = ctx.resolve_peer_key("model").await?;
-                        let client = ModelClient::for_service(ctx.signing_key, server_vk, None);
+                        let client = ModelClient::for_service(ctx.signing_key, server_vk, None)?;
                         client.call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?
                     }
                     "tui" => {
                         let server_vk = ctx.resolve_peer_key("tui").await?;
-                        let client = TuiClient::for_service(ctx.signing_key, server_vk, None);
+                        let client = TuiClient::for_service(ctx.signing_key, server_vk, None)?;
                         client.call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?
                     }
                     _ => anyhow::bail!("No streaming support for service: {}", service),
                 };
 
-                let (stream_id, endpoint, server_pubkey) = parse_stream_info(&stream_info_json)?;
-
-                let handle = StreamHandle::new(
-                    &ctx.zmq_context,
-                    stream_id,
-                    &endpoint,
-                    &server_pubkey,
-                    &client_secret,
-                    &client_pubkey_bytes,
-                )?;
+                let handle = match decode_stream_reach(&stream_info_json)? {
+                    DecodedStreamReach::Networked { dh_public, reach, broadcast_path } => {
+                        let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
+                            &client_secret, &client_pubkey_bytes, &dh_public,
+                        )?;
+                        MoqStreamHandle::networked(reach, broadcast_path, mac_key, topic)
+                    }
+                    DecodedStreamReach::Uds { dh_public, uds_path, broadcast_path } => {
+                        let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
+                            &client_secret, &client_pubkey_bytes, &dh_public,
+                        )?;
+                        MoqStreamHandle::new(uds_path, broadcast_path, mac_key, topic)
+                    }
+                };
 
                 Ok(ToolResult::Stream(Box::new(handle)))
             })
@@ -654,19 +660,63 @@ fn params_to_json_schema(params: &[(&str, &str, bool, &str)]) -> Value {
     })
 }
 
-/// Parse streamId, endpoint, and serverPubkey from a streaming response JSON.
-/// StreamInfo serializes with `#[serde(rename_all = "camelCase")]`, so all keys are camelCase.
-fn parse_stream_info(json: &Value) -> anyhow::Result<(String, String, Vec<u8>)> {
-    let stream_id = json["streamId"].as_str()
-        .ok_or_else(|| anyhow::anyhow!("missing streamId in streaming response"))?.to_owned();
-    let endpoint = json["endpoint"].as_str()
-        .ok_or_else(|| anyhow::anyhow!("missing endpoint in streaming response"))?.to_owned();
-    let server_pubkey: Vec<u8> = json["serverPubkey"].as_array()
-        .ok_or_else(|| anyhow::anyhow!("missing serverPubkey in streaming response"))?
+/// The transport-resolved shape of a decoded streaming response (#274).
+enum DecodedStreamReach {
+    /// New `StreamInfo`: subscribe over the wire `reach` (or local UDS fast path).
+    Networked {
+        dh_public: [u8; 32],
+        reach: Vec<hyprstream_rpc::stream_info::Destination>,
+        broadcast_path: String,
+    },
+    /// Legacy UDS-only producers (out-of-scope `tui.capnp` `StreamInfo`).
+    Uds {
+        dh_public: Vec<u8>,
+        uds_path: String,
+        broadcast_path: String,
+    },
+}
+
+/// Decode a streaming response into its moq reach (#274).
+///
+/// The signed `StreamInfo` is decoded via the generated library type
+/// (`hyprstream_rpc::stream_info::StreamInfo`) — no bespoke `serde_json` field
+/// scraping for the in-scope path — yielding the native-capnp `reach` list +
+/// `broadcastPath`. Falls back to the legacy UDS fields (`moqUdsPath` /
+/// `moqBroadcastPath`) only for out-of-scope producers (the TUI service's
+/// parallel `tui.capnp` `StreamInfo`, deliberately left on UDS).
+fn decode_stream_reach(json: &Value) -> anyhow::Result<DecodedStreamReach> {
+    // Preferred path: the new streaming.capnp StreamInfo decodes cleanly into the
+    // library type, carrying the native-capnp `reach` list + `broadcastPath`.
+    if let Ok(info) = serde_json::from_value::<hyprstream_rpc::stream_info::StreamInfo>(json.clone()) {
+        if !info.broadcast_path.is_empty() {
+            if info.dh_public == [0u8; 32] {
+                anyhow::bail!("server did not provide DH public key for streaming");
+            }
+            return Ok(DecodedStreamReach::Networked {
+                dh_public: info.dh_public,
+                reach: info.announced_at,
+                broadcast_path: info.broadcast_path,
+            });
+        }
+    }
+
+    // Legacy UDS fallback (out-of-scope producers still on the UDS moq plane).
+    let dh_public: Vec<u8> = json["dhPublic"].as_array()
+        .ok_or_else(|| anyhow::anyhow!("missing dhPublic in streaming response"))?
         .iter()
-        .map(|v| v.as_u64().unwrap_or(0) as u8)
-        .collect();
-    Ok((stream_id, endpoint, server_pubkey))
+        .enumerate()
+        .map(|(i, v)| {
+            v.as_u64()
+                .and_then(|n| u8::try_from(n).ok())
+                .ok_or_else(|| anyhow::anyhow!("dhPublic[{i}]: value out of u8 range"))
+        })
+        .collect::<anyhow::Result<Vec<u8>>>()?;
+    let uds_path = json["moqUdsPath"].as_str().unwrap_or("").to_owned();
+    let broadcast_path = json["moqBroadcastPath"].as_str().unwrap_or("").to_owned();
+    if uds_path.is_empty() {
+        anyhow::bail!("missing reach/broadcastPath in streaming response — server did not initialize moq transport");
+    }
+    Ok(DecodedStreamReach::Uds { dh_public, uds_path, broadcast_path })
 }
 
 /// Dispatch a method call to the appropriate generated client.
@@ -676,24 +726,24 @@ async fn dispatch_schema_call(service: &str, method: &str, ctx: &ToolCallContext
     match service {
         "model" => {
             let server_vk = ctx.resolve_peer_key("model").await?;
-            let client = ModelClient::for_service(signing_key, server_vk, None);
+            let client = ModelClient::for_service(signing_key, server_vk, None)?;
             client.call_method(method, &ctx.args).await
         }
         "registry" => {
             let server_vk = ctx.resolve_peer_key("registry").await?;
             let client: RegistryClient = RegistryClient::for_service(
                 signing_key, server_vk, None,
-            );
+            )?;
             client.call_method(method, &ctx.args).await
         }
         "policy" => {
             let server_vk = ctx.resolve_peer_key("policy").await?;
-            let client = PolicyClient::for_service(signing_key, server_vk, None);
+            let client = PolicyClient::for_service(signing_key, server_vk, None)?;
             client.call_method(method, &ctx.args).await
         }
         "tui" => {
             let server_vk = ctx.resolve_peer_key("tui").await?;
-            let client = TuiClient::for_service(signing_key, server_vk, None);
+            let client = TuiClient::for_service(signing_key, server_vk, None)?;
             client.call_method(method, &ctx.args).await
         }
         _ => anyhow::bail!("Unknown service: {service}"),
@@ -712,8 +762,7 @@ pub struct McpService {
     stdio_token: Option<String>,
     /// Verifying key for JWT validation
     verifying_key: VerifyingKey,
-    // === ZmqService infrastructure ===
-    context: Arc<zmq::Context>,
+    // === RequestService infrastructure ===
     transport: TransportConfig,
     signing_key: SigningKey,
     /// ServiceContext for typed_client() / client() access
@@ -743,13 +792,12 @@ impl McpService {
             config.signing_key.clone(),
             config.policy_verifying_key,
             None,
-        );
+        )?;
 
         Ok(Self {
             registry: Arc::new(RwLock::new(tool_reg)),
             stdio_token,
             verifying_key: config.verifying_key,
-            context: config.zmq_context.clone(),
             transport: config.transport,
             signing_key: config.signing_key,
             service_ctx: config.ctx,
@@ -873,7 +921,6 @@ impl McpService {
         let ctx = ToolCallContext {
             args: normalize_mcp_args(args),
             signing_key: self.signing_key.clone(),
-            zmq_context: self.context.clone(),
             user,
             ctx: self.service_ctx.clone(),
             policy_client: self.policy_client.clone(),
@@ -1039,7 +1086,7 @@ impl McpHandler for McpService {
                 self.signing_key.clone(),
                 server_vk,
                 None,
-            );
+            )?;
             client.status(&crate::services::generated::model_client::StatusRequest { model_ref: String::new() }).await
                 .map(|models| models.len() as u32)
                 .unwrap_or(0)
@@ -1136,11 +1183,11 @@ impl McpHandler for McpService {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ZmqService Implementation (internal control plane)
+// RequestService Implementation (internal control plane)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[async_trait(?Send)]
-impl ZmqService for McpService {
+impl RequestService for McpService {
     async fn handle_request(&self, ctx: &crate::services::EnvelopeContext, payload: &[u8]) -> anyhow::Result<(Vec<u8>, Option<crate::services::Continuation>)> {
         trace!(
             "McpService request from {} (id={})",
@@ -1152,10 +1199,6 @@ impl ZmqService for McpService {
 
     fn name(&self) -> &str {
         "mcp"
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
     }
 
     fn transport(&self) -> &TransportConfig {

@@ -557,7 +557,26 @@ async fn provision_federated_user(
         tracing::warn!(provider = %provider_slug, "PolicyManager not available — default_scopes not applied");
         return;
     };
-    for scope in default_scopes {
+
+    // Self-ownership rules: always grant access to the user's own namespace
+    // (user:{sub}:*) so JIT users can at minimum read/write their own profile
+    // and settings — regardless of what default_scopes the provider supplies.
+    // Addresses the zero-capabilities-on-first-login gap (#182).
+    let self_ns = format!("user:{subject}:*");
+    if let Err(e) = pm.add_policy_with_domain(subject, "*", &self_ns, "*", "allow").await {
+        tracing::warn!(subject = %subject, error = %e, "Failed to write self-ownership Casbin rule");
+    }
+
+    // If no scopes are configured by the provider, fall back to viewer-level
+    // defaults so the user can at minimum query models and registry entries.
+    // Operators can tighten or widen via policy templates after provisioning.
+    let effective_scopes: Vec<String> = if default_scopes.is_empty() {
+        vec!["query:model:*".to_owned(), "query:registry:*".to_owned()]
+    } else {
+        default_scopes.to_vec()
+    };
+
+    for scope in &effective_scopes {
         let parts: Vec<&str> = scope.splitn(3, ':').collect();
         let (action, resource) = match parts.as_slice() {
             [action, rtype, rid] if *rtype == "*" && *rid == "*" => (*action, "*".to_owned()),
@@ -576,7 +595,7 @@ async fn provision_federated_user(
     tracing::info!(
         provider = %provider_slug,
         subject = %subject,
-        scopes = ?default_scopes,
+        scopes = ?effective_scopes,
         "Federated user provisioned"
     );
 }

@@ -337,6 +337,15 @@ impl WizardBackend for BootstrapManager {
     }
 
     fn add_user(&mut self, username: &str, role: &str) {
+        if !VALID_INITIAL_ROLES.contains(&role) {
+            tracing::error!(
+                role,
+                valid = VALID_INITIAL_ROLES.join(", "),
+                "unknown --initial-user-role; aborting bootstrap"
+            );
+            std::process::exit(1);
+        }
+
         // Register identity first — UserStore is authoritative
         self.register_local_identity(username);
 
@@ -458,6 +467,8 @@ impl WizardBackend for BootstrapManager {
             .collect()
     }
 }
+
+pub const VALID_INITIAL_ROLES: &[&str] = &["admin", "operator", "viewer", "trainer"];
 
 /// Predefined role rules (mirrors wizard_handlers.rs).
 fn predefined_role_rules(role: &str) -> Vec<(&'static str, &'static str)> {
