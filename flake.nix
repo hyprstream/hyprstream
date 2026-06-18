@@ -33,9 +33,9 @@
           config.allowUnfree = true;
         };
 
-        # Fetch libtorch variants (GPU variants apply autoAddDriverRunpath internally)
+        # Fetch libtorch variants (GPU variants apply RPATH patches internally)
         libtorchVariants = import ./nix/libtorch.nix {
-          inherit (pkgs) lib stdenv fetchurl unzip autoAddDriverRunpath;
+          inherit (pkgs) lib stdenv fetchurl unzip autoAddDriverRunpath patchelf zlib;
         };
 
         # Rust toolchain from fenix (stable channel)
@@ -110,6 +110,7 @@
 
           # Build only the main binary
           cargoExtraArgs = "-p hyprstream";
+
 
           # Fix: kata-containers protocols/build.rs generates protobuf .rs files
           # into src/ which is read-only in the Nix store vendor directory.

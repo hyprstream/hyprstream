@@ -6,15 +6,15 @@
 # CUDA variants: autoAddDriverRunpath patches bundled libcudart.so et al so they can
 # find libcuda.so.1 from the NVIDIA driver at /run/opengl-driver/lib (NixOS standard).
 #
-# ROCm variant: most HIP runtime libs are bundled in the zip. The AMD kernel driver
-# interface (libdrm_amdgpu.so, /dev/kfd) must be provided by the host NixOS modules
-# (hardware.amdgpu.enable). No autoAddDriverRunpath equivalent exists for AMD.
-{ lib, stdenv, fetchurl, unzip, autoAddDriverRunpath }:
+# ROCm variant: most HIP runtime libs are bundled in the zip. libamd_comgr.so and
+# libelf.so within the bundle need libz.so.1, which is not bundled. We patch their
+# RPATH to point at the Nix zlib store path in postInstall.
+{ lib, stdenv, fetchurl, unzip, autoAddDriverRunpath, patchelf, zlib }:
 
 let
   version = "2.10.0";
 
-  mkLibtorchVariant = { variant, url, sha256, nativeBuildInputs ? [] }:
+  mkLibtorchVariant = { variant, url, sha256, nativeBuildInputs ? [], postInstall ? "" }:
     let
       zip = fetchurl {
         name = "libtorch-${variant}-${version}.zip";
@@ -41,6 +41,8 @@ let
         mv "$TMPDIR/unpack/libtorch" "$out"
         runHook postInstall
       '';
+
+      inherit postInstall;
     };
 
 in {
@@ -67,10 +69,19 @@ in {
     nativeBuildInputs = [ autoAddDriverRunpath ];
   };
 
-  # ROCm 7.1: bundled HIP runtime is sufficient; AMD driver provided by host OS
+  # ROCm 7.1: libamd_comgr.so and libelf.so in the bundle need libz but don't bundle it.
+  # Patch their DT_RPATH so the Nix dynamic linker can find libz.so.1 when they're loaded
+  # as transitive deps (DT_RUNPATH on the final binary doesn't propagate to transitive deps).
   rocm71 = mkLibtorchVariant {
     variant = "rocm71";
     url = "https://download.pytorch.org/libtorch/rocm7.1/libtorch-shared-with-deps-${version}%2Brocm7.1.zip";
     sha256 = "605532aeea2e22b639c2c4c239d2994f040457adff1a22cfb4c6d12b4b9641f7";
+    nativeBuildInputs = [ patchelf ];
+    postInstall = ''
+      for lib in libamd_comgr libelf; do
+        so="$out/lib/$lib.so"
+        [ -f "$so" ] && ${patchelf}/bin/patchelf --add-rpath "${zlib}/lib" "$so"
+      done
+    '';
   };
 }
