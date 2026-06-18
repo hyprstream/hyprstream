@@ -25,9 +25,9 @@ Models, inference streams, MCP tools, repositories, and even **sandboxed applica
 
 This Plan 9 / [Wanix](https://github.com/tractordev/wanix)-inspired design (see [docs/vfs.md](docs/vfs.md)) means one uniform interface for everything, per-process namespaces for true isolation, and **application sandboxing** built in: workloads run in Kata microVMs ([docs/workers-architecture.md](docs/workers-architecture.md)), reachable as files but unable to touch anything you didn't mount for them. Composable, network-transparent, capability-scoped.
 
-### 🌐 Federated by identity
+### 🌐 Share models, tools, and files across nodes
 
-A HyprStream node is a first-class, identity-addressed peer on the open web. Each node publishes an **atproto-compatible identity document** (`did:web` / `did:key`, an `at://` handle, and typed transport endpoints), so models and streams become federated resources other nodes can discover and reach — not endpoints locked behind one host. Peers are admitted by a two-stage gate that binds the connecting key to the published DID, over QUIC/WebTransport or direct peer-to-peer (iroh + pkarr discovery). Built to interoperate with atproto-native networks and the [MIR](docs/interop/tiles-alignment.md) model-naming used by [tiles.run](https://tiles.run).
+Federation turns isolated servers into one network. Use a model another node hosts, call an **MCP tool** a peer publishes, or mount a remote **filesystem** or live stream — addressed by its owner's cryptographic identity and used **as if it were local.** An agent on your node can reach tools, weights, and namespaces anywhere on the fabric, every call policy-gated. No brittle URLs or per-host API keys: resources are portable and verifiable (atproto `did:web`/`did:key` + `at://` handles), reached over QUIC/WebTransport or direct peer-to-peer (iroh). It's **off by default** — opt in with the setup wizard.
 
 ### ⚡ Runs on your hardware
 
@@ -60,15 +60,15 @@ Download the [Universal AppImage](https://github.com/hyprstream/hyprstream/relea
 # Download the latest release, then make it executable
 chmod +x hyprstream-v0.4.0-x86_64.AppImage
 
-# Guided setup (recommended) — add `-y` to accept defaults
+# Guided setup (recommended): the wizard configures access policy, users,
+# and API tokens. Add `-y` to accept defaults, `--start` to launch services,
+# and `--enable-federation` to join the open network (see Federation below).
 ./hyprstream-v0.4.0-x86_64.AppImage wizard
 
 # Add to PATH
 export PATH="$HOME/.local/bin:$PATH"
 
-# Apply a policy template (hyprstream is deny-by-default)
-hyprstream quick policy apply-template local
-
+# Start the services (or pass `--start` to the wizard above)
 hyprstream service start
 ```
 
@@ -157,16 +157,34 @@ HyprStream is organized around a **Plan 9 / Wanix-inspired virtual filesystem** 
 
 The payoff: one uniform, network-transparent interface for models, streams, tools, and apps — composable across processes and across federated nodes.
 
-## Federation (the open AI fabric)
+## Federation: one network for models, tools, and files
 
-Each node is an identity-addressed peer, not a walled-off endpoint.
+Federation lets your node use — and offer — resources across the network instead of being a silo. Because everything is a file in a network-transparent namespace (see above), "remote" resources behave like local ones:
 
-- **atproto-compatible identity** — the node publishes a `did:web` / `did:key` document with an `at://` handle, a P-256 `#atproto` verification method, a PDS-style service entry, and typed transport endpoints (QUIC/WebTransport, iroh).
-- **Identity-bound admission** — federated peers are admitted by a two-stage gate: an origin allowed by policy **and** a connecting key that matches a verification method in the peer's published DID document (fail-closed otherwise).
-- **Peer-to-peer discovery** — direct dialing over **iroh + pkarr** (resolve a peer by its Ed25519 node id alone), in addition to QUIC/WebTransport for browsers and reachable hosts.
-- **Interop-minded** — adopts the **MIR** model-naming schema (`mir:domain.arch.variant:series`) used by [tiles.run](https://tiles.run); see [docs/interop/tiles-alignment.md](docs/interop/tiles-alignment.md).
+- **Federated models** — run a model another node hosts by its identity/name (`model:branch` or a [MIR](docs/interop/tiles-alignment.md) name); it loads and streams as if it were on your box.
+- **Federated tools** — an agent on your node can call MCP tools a peer publishes (and you can offer yours), every call policy-checked.
+- **Federated filesystems & streams** — mount a peer's namespace, read its event/token streams, or drive a shared service — composable across hosts.
+- **Identity, not URLs** — everything is addressed by cryptographic identity (`did:web`/`did:key` + `at://` handle), so resources are portable, verifiable, and survive a host moving.
 
-> Status: identity, admission, and transport are implemented; live cross-network interop with atproto-native peers (e.g. tiles.run) is being validated.
+### Enable it
+
+Federation is **off by default** — deny-by-default, your data stays yours. Turn on the open network (accept third-party apps and remote peers) via the setup wizard:
+
+```bash
+# Interactive — the wizard asks about federation during the Policy step
+hyprstream wizard
+
+# Non-interactive — opt in explicitly
+hyprstream wizard -y --enable-federation
+```
+
+This applies the `federation-open` policy template. You can also scope it later with the [policy engine](#policy-engine) to allow only specific peer origins.
+
+### Under the hood
+
+Each node publishes an atproto-compatible identity document (`did:web`/`did:key`, `at://` handle, P-256 `#atproto` verification method, PDS-style service entry, and typed transport endpoints). Peers are admitted by a two-stage gate — an origin allowed by policy **and** a connecting key bound to a verification method in the peer's published DID (fail-closed otherwise) — and reached over QUIC/WebTransport or direct peer-to-peer via **iroh + pkarr** (dial by Ed25519 node id alone). See [docs/interop/tiles-alignment.md](docs/interop/tiles-alignment.md).
+
+> Status: identity, admission, and transport are implemented; live cross-network interop with atproto-native peers (e.g. [tiles.run](https://tiles.run)) is being validated.
 
 ## Architecture
 
