@@ -977,9 +977,9 @@ pub fn verify_moq_frame(
         anyhow::bail!("moq frame too short: {} bytes", frame.len());
     }
     let split = frame.len() - 16;
-    let capnp = frame[..split].to_vec();
-    let mac = frame[split..].to_vec();
-    verifier.verify(&[topic.as_bytes().to_vec(), capnp, mac])
+    // Zero-copy: pass slices into the received frame (`Bytes` from moq-net) straight
+    // to the verifier — no per-frame `Vec` allocation of the (potentially large) payload.
+    verifier.verify_parts(topic.as_bytes(), &frame[..split], &frame[split..])
 }
 
 #[cfg(test)]

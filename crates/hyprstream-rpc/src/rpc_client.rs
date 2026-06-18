@@ -520,8 +520,10 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
 
 /// Parse StreamInfo from Cap'n Proto response bytes.
 fn parse_stream_info(bytes: &[u8]) -> Result<crate::stream_info::StreamInfo> {
-    let reader = capnp::serialize::read_message(
-        &mut std::io::Cursor::new(bytes),
+    // Borrowing (zero-copy) reader: the capnp `Reader` references `bytes` directly.
+    let mut slice: &[u8] = bytes;
+    let reader = capnp::serialize::read_message_from_flat_slice(
+        &mut slice,
         capnp::message::ReaderOptions::default(),
     )?;
     // StreamInfo may be nested inside a service response variant.

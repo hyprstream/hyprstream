@@ -197,30 +197,43 @@ where
 /// Read an entire stream into [`Bytes`], capping the total at `cap` bytes.
 ///
 /// [`RecvStream::read_all`] is unbounded and a hostile peer could exhaust
-/// memory with it. This loops over [`RecvStream::read`] into a growing buffer,
-/// erroring out if the peer sends more than `cap` bytes before FIN.
+/// memory with it. This reads **directly into the output buffer** — no separate
+/// scratch buffer + `extend_from_slice` second copy; only the one unavoidable
+/// kernel→userspace copy that `RecvStream::read(&mut [u8])` forces (the trait,
+/// `web_transport_trait` 0.3.x, exposes no `Bytes`-yielding chunk read). Errors
+/// out if the peer sends more than `cap` bytes before FIN.
+///
+/// This is the **control plane** (`MAX_FRAME_BYTES` = 4 MiB). Bulk/tensor
+/// payloads ride the streaming plane, where moq-net already yields `Bytes`.
 pub async fn read_to_cap<R: RecvStream>(recv: &mut R, cap: usize) -> Result<Bytes> {
-    // Chunk size for each read. Bounded so a single read can't over-allocate.
+    // Allocation granularity for the output buffer.
     const CHUNK: usize = 64 * 1024;
-    let mut out: Vec<u8> = Vec::new();
-    let mut scratch = vec![0u8; CHUNK];
+    let mut buf: Vec<u8> = Vec::new();
     loop {
+        let filled = buf.len();
+        // Expose a writable window at the tail and read straight into it.
+        buf.resize(filled + CHUNK, 0);
         match recv
-            .read(&mut scratch)
+            .read(&mut buf[filled..])
             .await
             .map_err(|e| anyhow!("recv read: {e}"))?
         {
-            None => break, // FIN
-            Some(0) => continue,
+            None => {
+                buf.truncate(filled); // FIN
+                break;
+            }
+            Some(0) => {
+                buf.truncate(filled);
+            }
             Some(n) => {
-                if out.len() + n > cap {
+                buf.truncate(filled + n);
+                if buf.len() > cap {
                     bail!("frame exceeds {cap} byte cap");
                 }
-                out.extend_from_slice(&scratch[..n]);
             }
         }
     }
-    Ok(Bytes::from(out))
+    Ok(Bytes::from(buf))
 }
 
 // ============================================================================
