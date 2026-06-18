@@ -19,21 +19,22 @@ pub struct SystemdManager {
     #[allow(dead_code)]
     connection: Connection,
     systemd: ManagerProxy<'static>,
-    #[allow(dead_code)]
-    login: LoginProxy<'static>,
 }
 
 impl SystemdManager {
     /// Create a new SystemdManager
     ///
-    /// Connects to the user session D-Bus and enables user lingering
-    /// so services persist after logout.
+    /// Connects to the user session D-Bus for systemd1 and the system D-Bus
+    /// for login1 (logind). logind lives on the system bus only — connecting
+    /// LoginProxy to the session bus caused set_user_linger() to hang forever
+    /// waiting for a response that never arrives.
     pub async fn new() -> Result<Self> {
         let connection = Connection::session().await?;
         let systemd = ManagerProxy::new(&connection).await?;
-        let login = LoginProxy::new(&connection).await?;
 
-        // Enable linger (services persist after logout)
+        // Enable linger via the system bus (org.freedesktop.login1 is system-only).
+        let system_connection = Connection::system().await?;
+        let login = LoginProxy::new(&system_connection).await?;
         let uid = nix::unistd::getuid().as_raw();
         if let Err(e) = login.set_user_linger(uid, true, false).await {
             debug!("Failed to enable user linger (may already be enabled): {}", e);
@@ -44,7 +45,6 @@ impl SystemdManager {
         Ok(Self {
             connection,
             systemd,
-            login,
         })
     }
 

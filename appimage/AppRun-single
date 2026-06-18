@@ -21,7 +21,7 @@ if [[ "$BACKEND" == "rocm71" ]]; then
     if [[ -d /opt/rocm ]]; then
         export ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
     fi
-    export PYTORCH_ROCM_ARCH="${PYTORCH_ROCM_ARCH:-gfx90a;gfx1100;gfx1101}"
+    export PYTORCH_ROCM_ARCH="${PYTORCH_ROCM_ARCH:-gfx90a;gfx1100;gfx1101;gfx1151}"
 fi
 
 # Debug output

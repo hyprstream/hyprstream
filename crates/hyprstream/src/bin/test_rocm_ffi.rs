@@ -18,10 +18,9 @@ fn main() {
     println!("ROCm Direct FFI Test");
     println!("====================");
 
-    // Set ROCm environment
-    std::env::set_var("ROCM_PATH", "/usr");
+    // Set ROCm environment — use system ROCm path, leave arch detection to the runtime
+    std::env::set_var("ROCM_PATH", "/opt/rocm");
     std::env::set_var("HIP_VISIBLE_DEVICES", "0");
-    std::env::set_var("PYTORCH_ROCM_ARCH", "gfx90a");
 
     unsafe {
         let available = torch_cuda_is_available();
