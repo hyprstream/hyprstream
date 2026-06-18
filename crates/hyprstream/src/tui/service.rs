@@ -1210,10 +1210,75 @@ impl TuiService {
                 });
             });
 
-            GitOps { clone_fn, pull_fn, push_fn, fetch_status_fn }
+            let sk_refresh = self.signing_key.clone();
+            let h_refresh = handle.clone();
+            let rvk_refresh = registry_vk;
+            let mvk_refresh = model_vk;
+            let rmd_refresh = registry_models_dir.clone();
+            let refresh_fn: hyprstream_tui::shell_app::RefreshFn = Box::new(move |tx: GitProgressSender| {
+                let sk = sk_refresh.clone();
+                let h = h_refresh.clone();
+                let rvk = rvk_refresh;
+                let mvk = mvk_refresh;
+                let rmd = rmd_refresh.clone();
+                std::thread::spawn(move || {
+                    h.block_on(async {
+                        let registry_client = match crate::services::RegistryClient::for_service(sk.clone(), rvk, None) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::warn!("model-list refresh: RegistryClient: {e}");
+                                return;
+                            }
+                        };
+                        let model_client = match crate::services::generated::model_client::ModelClient::for_service(sk, mvk, None) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::warn!("model-list refresh: ModelClient: {e}");
+                                return;
+                            }
+                        };
+                        let status_timeout = std::time::Duration::from_millis(500);
+                        let all_status_req = crate::services::generated::model_client::StatusRequest { model_ref: String::new() };
+                        let (repos_result, status_result) = tokio::join!(
+                            registry_client.list(),
+                            tokio::time::timeout(status_timeout, model_client.status(&all_status_req)),
+                        );
+                        let status_map: std::collections::HashMap<String, bool> = match status_result {
+                            Ok(Ok(entries)) => entries.into_iter()
+                                .map(|e| (e.model_ref, e.status == "loaded"))
+                                .collect(),
+                            _ => std::collections::HashMap::new(),
+                        };
+                        let models: Vec<hyprstream_tui::shell_app::ModelEntry> = match repos_result {
+                            Ok(repos) => repos
+                                .into_iter()
+                                .filter(|r| !r.name.is_empty())
+                                .flat_map(|r| {
+                                    let name = r.name.clone();
+                                    let rmd = rmd.clone();
+                                    r.worktrees.into_iter().map(|wt| {
+                                        let branch = if wt.branch_name.is_empty() { "main".to_owned() } else { wt.branch_name };
+                                        let model_ref = format!("{name}:{branch}");
+                                        let loaded = *status_map.get(&model_ref).unwrap_or(&false);
+                                        let path = rmd.join(&name).join("worktrees").join(&branch);
+                                        hyprstream_tui::shell_app::ModelEntry {
+                                            model_ref, path, loaded,
+                                            ahead: 0, behind: 0, is_dirty: false,
+                                        }
+                                    }).collect::<Vec<_>>()
+                                })
+                                .collect(),
+                            Err(_) => vec![],
+                        };
+                        let _ = tx.send(GitOpProgress::ModelList(models));
+                    });
+                });
+            });
+
+            GitOps { clone_fn, pull_fn, push_fn, fetch_status_fn, refresh_fn }
         };
 
-        let app = hyprstream_tui::shell_app::ShellApp::new(models, cols, rows, load_fn, unload_fn, Some(git_ops));
+        let app = hyprstream_tui::shell_app::ShellApp::new(models, cols, rows, load_fn, unload_fn, Some(git_ops), Some(registry_models_dir.clone()));
         let config = waxterm::app::TerminalConfig::new().cols(cols).rows(rows);
         let process = super::process::spawn_app_process(app, config);
 
