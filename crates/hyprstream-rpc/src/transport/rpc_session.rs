@@ -354,7 +354,10 @@ async fn handle_stream<S>(
         }
     };
 
-    if let Err(e) = send.write_all(&response).await {
+    // Zero-copy reply: `write_chunk` takes the `Bytes` by value; quinn/iroh write it
+    // without copying the buffer (UDS falls back to the trait default). The response
+    // envelope is moved, never cloned.
+    if let Err(e) = send.write_chunk(response).await {
         tracing::warn!(error = ?e, "rpc-session: failed writing response");
         return;
     }
@@ -466,9 +469,11 @@ impl<S: Session> Transport for SessionRpcTransport<S> {
                 .open_bi()
                 .await
                 .map_err(|e| anyhow!("session open_bi: {e}"))?;
-            send.write_all(&payload)
+            // Zero-copy request: `Bytes::from(Vec)` is a move (no copy), and
+            // `write_chunk` writes it without copying on quinn/iroh.
+            send.write_chunk(bytes::Bytes::from(payload))
                 .await
-                .map_err(|e| anyhow!("session write_all: {e}"))?;
+                .map_err(|e| anyhow!("session write_chunk: {e}"))?;
             send.finish().map_err(|e| anyhow!("session finish: {e}"))?;
             let buf = read_to_cap(&mut recv, MAX_FRAME_BYTES).await?;
             Ok::<Vec<u8>, anyhow::Error>(buf.to_vec())
