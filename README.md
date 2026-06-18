@@ -19,7 +19,16 @@ Built in Rust on PyTorch (`tch-rs`) — real inference *and* training, Git-nativ
 
 ### 🧠 Models that improve themselves
 
-Most servers run a frozen model. HyprStream's models **get better while they serve.** They adapt to the task in front of them at inference time (test-time training with the Muon optimizer + TTN profiling), learn from a stronger model through **teacher/student training**, and propose their own improvements through MCP tools — then **agentic tools evaluate each change automatically**, so only adaptations that actually score better are kept — tried **speculatively** (applied in place, rolled back if they don't earn their keep, the way a CPU runs ahead of a branch it can undo). A runtime **rank oracle** advises how much capacity each adaptation needs; a teacher model running the evals can act on its signals or overrule them. Every accepted improvement lands as a **Git branch of the weights** (`model:branch`): versioned, diffable, reviewable, and instantly reversible. A closed improvement loop — *propose → train → evaluate → promote* — that you can audit and roll back.
+Most servers run a frozen model. **HyprStream's models get better while they serve** — they learn from your real traffic and keep the gains.
+
+It's a closed loop you can audit and reverse at any step:
+
+1. **Propose** — the model adapts to the task in front of it and can suggest its own improvements through agentic (MCP) tools.
+2. **Train** — it learns from your live traffic, or from a stronger **teacher model**. Each change is applied *speculatively*: in place, but instantly reversible — the way a CPU runs ahead of a branch it can undo.
+3. **Evaluate** — agentic tools score every change automatically, so only adaptations that genuinely perform better survive.
+4. **Promote** — each winner is saved as a **Git branch of the weights** (`model:branch`): versioned, diffable, reviewable, and roll-back-able.
+
+*Under the hood: test-time training (Muon optimizer + TTN profiling), with a runtime **rank oracle** that advises how much capacity each adaptation needs — a signal the teacher model can act on or overrule.*
 
 ### 📁 Everything is a file
 
