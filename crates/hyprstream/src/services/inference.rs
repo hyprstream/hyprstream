@@ -2355,6 +2355,18 @@ impl hyprstream_rpc::service::RequestService for InferenceZmqAdapter {
         self.jwt_key_source.clone()
     }
 
+    /// Resolve a verified mesh-peer signer key to its per-host subject (#328).
+    ///
+    /// Routes through the global trust store, which is populated at startup from
+    /// the admin-anchored `mesh_peers` roster (see
+    /// `hyprstream::auth::mesh_trust::build_mesh_identity_roster`). A networked
+    /// peer whose key is enrolled resolves to `service:inference:host-<label>`;
+    /// an unenrolled peer resolves to `None` → anonymous (fail-closed,
+    /// deny-by-default — never the `"system"` god principal).
+    fn resolve_key_subject(&self, signer_pubkey: &[u8; 32]) -> Option<hyprstream_rpc::envelope::Subject> {
+        hyprstream_service::global_trust_store().resolve_subject(signer_pubkey)
+    }
+
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
         let variant = InferenceResponseVariant::Error(ErrorInfo {
             message: error.to_owned(),

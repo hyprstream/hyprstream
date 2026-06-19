@@ -95,6 +95,20 @@ pub trait JwtKeySource: Send + Sync + 'static {
 /// This is the common case: all services in a cluster trust one PolicyService,
 /// identified by its OAuth issuer URL. JWTs with empty `iss` or matching the
 /// local issuer URL are verified against the CA key.
+///
+/// # NOT a mesh authority (#328)
+///
+/// `ClusterKeySource` holds a SINGLE shared CA key and treats an empty `iss` as
+/// always-trusted/local. That is correct for the in-cluster bare-`sub` token
+/// plane, but it MUST NOT be the verification authority for networked **mesh
+/// peers**: a single shared key cannot distinguish per-host peers, and the
+/// empty-`iss` shortcut would let a networked peer inherit local trust. Mesh
+/// peer identity is established by the per-host key roster (Ed25519 signer →
+/// `service:inference:host-<label>`, resolved fail-closed via
+/// `RequestService::resolve_key_subject`), and the empty-`iss` shortcut is
+/// confined to genuine in-process callers in `verify_claims`
+/// (`EnvelopeContext::is_local_caller`). For kid-routed multi-key verification
+/// prefer [`JwksKeySource`], which honors the `kid` hint.
 #[derive(Clone)]
 pub struct ClusterKeySource {
     ca_verifying_key: VerifyingKey,
@@ -149,7 +163,11 @@ impl JwtKeySource for ClusterKeySource {
     }
 
     fn is_trusted(&self, issuer: &str) -> bool {
-        // Empty issuer is always local
+        // Empty issuer is treated as local here. This is SOUND only because the
+        // empty-`iss` shortcut is gated by transport upstream in
+        // `verify_claims` (#328): a networked / mesh caller presenting an
+        // empty-`iss` token is rejected before this is consulted, so empty `iss`
+        // reaches here only for genuine in-process / IPC callers.
         if issuer.is_empty() {
             return true;
         }

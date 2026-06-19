@@ -16,6 +16,7 @@
 //! behavior (Hybrid fails closed for unknown peers).
 
 use hyprstream_rpc::envelope::KeyedPqTrustStore;
+use hyprstream_rpc::Subject;
 
 use crate::config::OAuthConfig;
 
@@ -87,6 +88,49 @@ pub fn build_mesh_pq_trust_store(oauth: &OAuthConfig) -> KeyedPqTrustStore {
         tracing::info!("mesh_peer '{label}': anchored ML-DSA-65 key for Ed25519 signer identity");
     }
     store
+}
+
+/// Build the per-host mesh identity roster from the admin-configured
+/// `mesh_peers` (#328): each peer's Ed25519 signer pubkey → its per-host
+/// authorization subject (`service:inference:host-<label>`).
+///
+/// Reuses the SAME `mesh_peers` enrollment record as
+/// [`build_mesh_pq_trust_store`] (no new roster type): the Ed25519 key is the
+/// envelope signer identity, and the operator-assigned label is the host id.
+/// An invalid Ed25519 multibase is logged and skipped (fail-safe — never trust
+/// a malformed identity). An empty/absent `mesh_peers` yields an empty roster.
+///
+/// This is the source for fail-closed per-host identity resolution: a networked
+/// peer whose key is NOT in this roster resolves to `anonymous`, never the
+/// `"system"` god principal (#328).
+pub fn build_mesh_identity_roster(oauth: &OAuthConfig) -> Vec<([u8; 32], Subject)> {
+    let mut roster = Vec::new();
+    for (label, peer) in &oauth.mesh_peers {
+        let ed_bytes = match decode_multikey(&peer.ed25519_multibase, &MULTICODEC_ED25519_PUB) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("mesh_peer '{label}': invalid ed25519_multibase, skipping identity roster entry: {e}");
+                continue;
+            }
+        };
+        let ed_pubkey: [u8; 32] = match ed_bytes.as_slice().try_into() {
+            Ok(a) => a,
+            Err(_) => {
+                tracing::error!(
+                    "mesh_peer '{label}': ed25519 key is {} bytes (expected 32), skipping identity roster entry",
+                    ed_bytes.len()
+                );
+                continue;
+            }
+        };
+        let subject = hyprstream_rpc::node_identity::mesh_host_subject(label);
+        tracing::info!(
+            "mesh_peer '{label}': enrolled as per-host subject {:?}",
+            subject.name()
+        );
+        roster.push((ed_pubkey, subject));
+    }
+    roster
 }
 
 /// Encode raw key bytes as a `Multikey` `publicKeyMultibase` string (base58btc,
@@ -172,6 +216,52 @@ mod tests {
         )]);
         let store = build_mesh_pq_trust_store(&oauth);
         assert!(store.is_empty(), "malformed entry must be skipped, not trusted");
+    }
+
+    #[test]
+    fn identity_roster_maps_peers_to_per_host_subjects() {
+        // #328: each enrolled peer's Ed25519 key maps to its own granular
+        // per-host subject (service:inference:host-<label>), reusing the SAME
+        // mesh_peers enrollment record.
+        let peer_ed = SigningKey::generate(&mut OsRng);
+        let peer_pq_sk = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&peer_ed);
+        let ed_mb = encode_multikey(&peer_ed.verifying_key().to_bytes(), &MULTICODEC_ED25519_PUB);
+        let pq_mb = encode_multikey(
+            &pq::ml_dsa_sk_to_vk_bytes(&peer_pq_sk),
+            &MULTICODEC_ML_DSA_65_PUB,
+        );
+        let oauth = oauth_with_peers(vec![(
+            "gpu-node-3",
+            MeshPeerConfig { ed25519_multibase: ed_mb, mldsa65_multibase: pq_mb },
+        )]);
+
+        let roster = build_mesh_identity_roster(&oauth);
+        assert_eq!(roster.len(), 1);
+        let (pubkey, subject) = &roster[0];
+        assert_eq!(*pubkey, peer_ed.verifying_key().to_bytes());
+        assert_eq!(subject.name(), Some("service:inference:host-gpu-node-3"));
+        // Crucially, NOT "system".
+        assert_ne!(subject.name(), Some("system"));
+    }
+
+    #[test]
+    fn identity_roster_skips_malformed_entries() {
+        let good_pq = encode_multikey(&vec![0u8; 1952], &MULTICODEC_ML_DSA_65_PUB);
+        let oauth = oauth_with_peers(vec![(
+            "bad-peer",
+            MeshPeerConfig {
+                ed25519_multibase: "not-multibase".to_owned(),
+                mldsa65_multibase: good_pq,
+            },
+        )]);
+        let roster = build_mesh_identity_roster(&oauth);
+        assert!(roster.is_empty(), "malformed entry must be skipped, not enrolled");
+    }
+
+    #[test]
+    fn empty_mesh_peers_yields_empty_identity_roster() {
+        let roster = build_mesh_identity_roster(&OAuthConfig::default());
+        assert!(roster.is_empty());
     }
 
     #[test]
