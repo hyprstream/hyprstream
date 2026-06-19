@@ -6789,7 +6789,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "fuse-backend-rs 0.12.1",
  "hyprstream-rpc",
+ "libc",
+ "parking_lot 0.12.4",
+ "tempfile",
  "tokio",
 ]
 
