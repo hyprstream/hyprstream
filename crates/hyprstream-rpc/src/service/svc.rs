@@ -104,6 +104,17 @@ pub struct EnvelopeContext {
     /// Client's ephemeral DH public key for stream key derivation.
     /// Present on streaming requests; extracted from `RequestEnvelope.client_dh_public`.
     client_dh_public: Option<[u8; 32]>,
+
+    /// Whether this request originated from a genuine in-process / IPC caller
+    /// (the `FixedSigner` mutual-auth plane), as opposed to a networked peer
+    /// (the `AnySigner` plane used by ZMQ-QUIC / iroh / WebTransport).
+    ///
+    /// `true` ONLY for `from_verified_as_system` and `from_callback_service`
+    /// (genuine local callers). Networked callers (`from_verified`) are `false`.
+    /// Gates the empty-`iss` JWT shortcut (#328): an empty issuer is the local
+    /// PolicyService's bare-`sub` token and is accepted ONLY for local callers;
+    /// a networked peer presenting an empty-`iss` token is rejected (fail-closed).
+    is_local_caller: bool,
 }
 
 impl EnvelopeContext {
@@ -124,6 +135,8 @@ impl EnvelopeContext {
             cnf: envelope.cnf,
             envelope_wit_hash: envelope.envelope.wth,
             client_dh_public: envelope.envelope.client_dh_public,
+            // AnySigner / networked plane — NOT a local caller (#328).
+            is_local_caller: false,
         }
     }
 
@@ -142,6 +155,8 @@ impl EnvelopeContext {
             cnf: envelope.cnf,
             envelope_wit_hash: envelope.envelope.wth,
             client_dh_public: envelope.envelope.client_dh_public,
+            // FixedSigner mutual-auth plane — genuine in-process / IPC caller (#328).
+            is_local_caller: true,
         }
     }
 
@@ -164,6 +179,8 @@ impl EnvelopeContext {
             cnf: [0u8; 32],
             envelope_wit_hash: None,
             client_dh_public: None,
+            // Internal self-call that never crosses a network boundary (#328).
+            is_local_caller: true,
         }
     }
 
@@ -228,6 +245,15 @@ impl EnvelopeContext {
     /// Used by streaming handlers to derive shared secrets for HMAC chain keys.
     pub fn ephemeral_pubkey(&self) -> Option<[u8; 32]> {
         self.client_dh_public
+    }
+
+    /// Whether this request came from a genuine in-process / IPC caller (#328).
+    ///
+    /// `true` for the `FixedSigner` mutual-auth plane and internal self-calls;
+    /// `false` for networked / mesh peers (`AnySigner`). Used to confine the
+    /// empty-`iss` JWT shortcut to local callers.
+    pub fn is_local_caller(&self) -> bool {
+        self.is_local_caller
     }
 
 }
@@ -394,6 +420,21 @@ pub trait RequestService: 'static {
         // Decode the JWT to get claims for issuer routing
         let unverified = crate::auth::decode_unverified(&token)
             .map_err(|e| anyhow::anyhow!("JWT decode failed: {}", e))?;
+
+        // Empty-`iss` gate (#328): an empty issuer denotes the local
+        // PolicyService's bare-`sub` token, which the key sources treat as
+        // "always local/trusted". That is only safe for genuine in-process /
+        // IPC callers (the FixedSigner plane). A networked / mesh peer
+        // (AnySigner) presenting an empty-`iss` token would otherwise inherit
+        // local trust — reject it fail-closed; mesh peers must present an
+        // explicit issuer (or authenticate via the key roster, no JWT).
+        if unverified.iss.is_empty() && !ctx.is_local_caller {
+            tracing::warn!(
+                service = self.name(),
+                "rejecting empty-iss JWT from a networked caller (empty issuer is in-process only) (#328)"
+            );
+            anyhow::bail!("empty JWT issuer is only accepted from in-process callers");
+        }
 
         // Extract kid from JOSE header for key selection
         let kid = crate::auth::header_kid(&token)
@@ -714,6 +755,120 @@ impl ServiceHandle {
     /// Check if the service is still running
     pub fn is_running(&self) -> bool {
         self.task.as_ref().map(|t| !t.is_finished()).unwrap_or(true)
+    }
+}
+
+/// Empty-`iss` transport-gating tests (#328).
+///
+/// An empty JWT issuer denotes the local PolicyService's bare-`sub` token, which
+/// the key sources treat as always-trusted/local. That shortcut is confined to
+/// genuine in-process / IPC callers (`EnvelopeContext::is_local_caller`); a
+/// networked / mesh peer presenting an empty-`iss` token is rejected fail-closed.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod empty_iss_gate_tests {
+    use super::*;
+    use crate::auth::{Claims, ClusterKeySource};
+    use crate::transport::TransportConfig;
+    use ed25519_dalek::SigningKey;
+
+    /// Minimal mock service exposing a `ClusterKeySource` for JWT verification.
+    /// `require_cnf_binding` is disabled so the empty-`iss` gate is exercised in
+    /// isolation (without a cnf-binding rejection masking the result).
+    struct MockService {
+        signing_key: SigningKey,
+        transport: TransportConfig,
+        key_source: std::sync::Arc<dyn crate::auth::JwtKeySource>,
+    }
+
+    #[async_trait(?Send)]
+    impl RequestService for MockService {
+        async fn handle_request(&self, _ctx: &EnvelopeContext, _payload: &[u8]) -> Result<(Vec<u8>, Option<Continuation>)> {
+            Ok((vec![], None))
+        }
+        fn name(&self) -> &str { "mock" }
+        fn transport(&self) -> &TransportConfig { &self.transport }
+        fn signing_key(&self) -> SigningKey { self.signing_key.clone() }
+        fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn crate::auth::JwtKeySource>> {
+            Some(self.key_source.clone())
+        }
+        fn require_cnf_binding(&self) -> bool { false }
+        fn pq_signing_key(&self) -> Option<crate::crypto::pq::MlDsaSigningKey> { None }
+    }
+
+    /// Build an `EnvelopeContext` carrying `jwt_token`, with the chosen
+    /// transport provenance.
+    fn ctx_with_token(token: String, is_local_caller: bool) -> EnvelopeContext {
+        EnvelopeContext {
+            request_id: 1,
+            claims: None,
+            jwt_token: Some(token),
+            key_derived_subject: Subject::anonymous(),
+            jwt_subject: None,
+            cnf: [0u8; 32],
+            envelope_wit_hash: None,
+            client_dh_public: None,
+            is_local_caller,
+        }
+    }
+
+    fn mock_service() -> (MockService, SigningKey) {
+        // The CA key signs the bare-sub (empty-iss) token; the ClusterKeySource
+        // anchors that same CA key with an empty local issuer URL (so empty iss
+        // is "local").
+        let ca = SigningKey::from_bytes(&[7u8; 32]);
+        let key_source = std::sync::Arc::new(ClusterKeySource::new(
+            ca.verifying_key(),
+            String::new(),
+        ));
+        let svc = MockService {
+            signing_key: SigningKey::from_bytes(&[8u8; 32]),
+            transport: TransportConfig::inproc("mock"),
+            key_source,
+        };
+        (svc, ca)
+    }
+
+    fn empty_iss_token(ca: &SigningKey) -> String {
+        // iss defaults to empty in Claims::new — the local bare-sub token.
+        let now = chrono::Utc::now().timestamp();
+        let claims = Claims::new("alice".to_owned(), now, now + 3600);
+        assert!(claims.iss.is_empty(), "test token must have empty iss");
+        crate::auth::jwt::encode(&claims, ca)
+    }
+
+    #[tokio::test]
+    async fn empty_iss_rejected_for_networked_caller() {
+        let (svc, ca) = mock_service();
+        let token = empty_iss_token(&ca);
+        let mut ctx = ctx_with_token(token, /* is_local_caller */ false);
+
+        let result = svc.verify_claims(&mut ctx).await;
+        assert!(result.is_err(), "networked empty-iss token must be rejected");
+        let msg = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            msg.contains("empty JWT issuer is only accepted from in-process callers"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_iss_accepted_for_inproc_caller() {
+        let (svc, ca) = mock_service();
+        let token = empty_iss_token(&ca);
+        let mut ctx = ctx_with_token(token, /* is_local_caller */ true);
+
+        let result = svc.verify_claims(&mut ctx).await;
+        assert!(result.is_ok(), "in-process empty-iss token must pass the gate: {result:?}");
+        // And the local bare-sub subject is resolved.
+        assert_eq!(ctx.subject().name(), Some("alice"));
+    }
+
+    #[test]
+    fn constructor_provenance_flags() {
+        // from_callback_service is a genuine in-process self-call.
+        let cb = EnvelopeContext::from_callback_service(1, "inference");
+        assert!(cb.is_local_caller());
     }
 }
 
