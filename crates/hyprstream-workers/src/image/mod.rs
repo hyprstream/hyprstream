@@ -33,6 +33,10 @@
 mod client;
 mod manifest;
 mod rafs_builder;
+// FS-B (#363): per-sandbox RootfsMount = OverlayFs(in-process RAFS lower +
+// writable upper). Native-only (the overlay/RAFS FileSystem stack is Linux).
+#[cfg(not(target_arch = "wasm32"))]
+mod rootfs_mount;
 mod store;
 
 pub use crate::generated::worker_client::{
@@ -40,4 +44,6 @@ pub use crate::generated::worker_client::{
     AuthConfig, FilesystemUsage, FilesystemIdentifier,
 };
 pub use manifest::{ImageReference, ManifestFetcher, ManifestResult, OciManifest};
+#[cfg(not(target_arch = "wasm32"))]
+pub use rootfs_mount::{rootfs_mount_for, rootfs_mount_from_rafs};
 pub use store::{GcStats, ImageMetadata, RafsStore};

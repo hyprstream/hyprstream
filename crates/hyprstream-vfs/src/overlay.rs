@@ -31,6 +31,22 @@ fn map_io(err: io::Error, ctx: &str) -> MountError {
     MountError::Io(format!("{ctx}: {err}"))
 }
 
+/// Wrap any `fuse_backend_rs` [`Layer`] (a `FileSystem` that also implements the
+/// overlay `Layer` trait) as a [`BoxedLayer`] usable by [`rootfs_overlay`].
+///
+/// This is the generic seam FS-B uses to plug an **in-process RAFS** lower
+/// (`nydus_rafs::fs::Rafs`, which implements `Layer`) into the overlay without
+/// this crate depending on `nydus-rafs`: the caller owns the RAFS type, we only
+/// require it be a `Layer<Inode = u64, Handle = u64>`. The layer must already be
+/// ready to serve (RAFS: `import`ed; PassthroughFs: `import`ed).
+pub fn layer_from_fs<L>(fs: L) -> Arc<BoxedLayer>
+where
+    L: Layer<Inode = u64, Handle = u64> + Send + Sync + 'static,
+{
+    let layer: Box<dyn Layer<Inode = u64, Handle = u64> + Send + Sync> = Box::new(fs);
+    Arc::new(layer)
+}
+
 /// Build a `BoxedLayer` from a host directory using `PassthroughFs`.
 ///
 /// `read_only` controls only the cache policy hint; OverlayFs enforces the
@@ -48,8 +64,7 @@ pub fn passthrough_layer(root: &Path) -> Result<Arc<BoxedLayer>, MountError> {
     };
     let fs = PassthroughFs::<()>::new(cfg).map_err(|e| map_io(e, "PassthroughFs::new"))?;
     fs.import().map_err(|e| map_io(e, "PassthroughFs::import"))?;
-    let layer: Box<dyn Layer<Inode = u64, Handle = u64> + Send + Sync> = Box::new(fs);
-    Ok(Arc::new(layer))
+    Ok(layer_from_fs(fs))
 }
 
 /// Build the v1 rootfs overlay as an [`FsMount`].
