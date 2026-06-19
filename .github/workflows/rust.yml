@@ -45,7 +45,13 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Install cargo-deny
-      run: cargo install cargo-deny --locked 2>/dev/null || true
+      # Prebuilt binary — reliable and fast. The previous `cargo install ...
+      # 2>/dev/null || true` masked install failures, so when the install failed
+      # the next step ran `cargo deny` with the binary absent and the job died
+      # with `error: no such command: deny` (failing on every PR).
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-deny
     - name: Check bans
       # ZMQ crates are deny-listed in deny.toml (#138 complete). This gate must
       # be able to fail — do NOT add `|| true`.
