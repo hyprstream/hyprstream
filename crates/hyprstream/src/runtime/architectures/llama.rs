@@ -2222,6 +2222,79 @@ impl LlamaModel {
 
         Ok(hidden_states)
     }
+
+    /// Training-path sibling of [`Self::forward_layers_inner`] — the cross-device
+    /// autograd primitive for TTT-on-split (#316). See the trait
+    /// `forward_layers_train` docs for the contract.
+    ///
+    /// Identical layer loop to the inference runner with three deliberate
+    /// differences: **no KV cache** (full causal attention, computed fresh from
+    /// the whole context), **`start_pos = 0`** (`position_ids = 0..seq`), and the
+    /// autograd graph is left intact (no `no_grad` guard — the caller wraps this
+    /// in `with_grad`). The lone cross-device `hidden.to_device(next)` carries the
+    /// autograd graph across the boundary, so `loss.backward()` materializes grads
+    /// on each parameter's own device.
+    fn forward_layers_train_inner(
+        &self,
+        hidden: &Tensor,
+        range: std::ops::Range<usize>,
+        delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        let num_global = self.config.num_hidden_layers as usize;
+        if range.end > num_global || range.start >= range.end {
+            return Err(anyhow!(
+                "forward_layers_train: invalid global range {range:?} for {num_global} layers"
+            ));
+        }
+        let owned = self.layer_offset..self.layer_offset + self.layers.len();
+        if range.start < owned.start || range.end > owned.end {
+            return Err(anyhow!(
+                "forward_layers_train: range {range:?} not within this stage's owned layers {owned:?}"
+            ));
+        }
+
+        let mut hidden_states = hidden.shallow_clone();
+
+        // Training path: start_pos is always 0 → position_ids = 0..seq, built on
+        // the input device and moved alongside `hidden` at each device boundary.
+        let seq_len = hidden_states.size()[1];
+        let mut position_ids =
+            Tensor::arange(seq_len, (tch::Kind::Int64, hidden_states.device()));
+
+        // No KV cache in the training path: full causal attention is recomputed
+        // over the entire context every step (compute_attention applies the tril
+        // mask when no cache is present).
+        for g in range {
+            let local_idx = g - self.layer_offset;
+            let layer = &self.layers[local_idx];
+
+            // The single cross-device transfer (autograd-transparent): only when
+            // this layer's mapped device differs from where `hidden` currently is.
+            let target = self.device_map.device_for(g);
+            if hidden_states.device() != target {
+                hidden_states = hidden_states.to_device(target);
+                position_ids = position_ids.to_device(target);
+            }
+
+            let residual = hidden_states.shallow_clone();
+            hidden_states = layer.input_layernorm.forward(&hidden_states)?;
+            let attn_output = layer.self_attn.forward(
+                &hidden_states,
+                Some(&position_ids),
+                None, // no KV cache (training)
+                0,    // start_pos = 0 (training)
+                delta,
+            )?;
+            hidden_states = residual + attn_output;
+
+            let residual = hidden_states.shallow_clone();
+            hidden_states = layer.post_attention_layernorm.forward(&hidden_states)?;
+            let ffn_output = layer.mlp.forward(&hidden_states, delta)?;
+            hidden_states = residual + ffn_output;
+        }
+
+        Ok(hidden_states)
+    }
 }
 
 impl ModelOperations for LlamaModel {
@@ -2540,6 +2613,15 @@ impl ModelOperations for LlamaModel {
         delta: Option<&crate::training::TenantDelta>,
     ) -> Result<Tensor> {
         self.forward_layers_inner(hidden, range, start_pos, delta)
+    }
+
+    fn forward_layers_train(
+        &self,
+        hidden: &Tensor,
+        range: std::ops::Range<usize>,
+        delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        self.forward_layers_train_inner(hidden, range, delta)
     }
 
     fn apply_final_norm(&self, hidden_states: &Tensor) -> Result<Tensor> {
@@ -2879,5 +2961,134 @@ mod pipeline_tests {
         let missing = r#"{"hidden_size":16,"num_hidden_layers":4}"#;
         let err = LlamaModel::parse_config(missing).unwrap_err();
         assert!(err.to_string().contains("num_attention_heads"), "got: {err}");
+    }
+
+    // ========================================================================
+    // #316 — TTT-on-split cross-device autograd equivalence (CPU-verifiable).
+    // ========================================================================
+
+    use crate::training::tenant_delta::{TenantDelta, TenantDeltaConfig};
+
+    /// Build a per-layer q_proj/v_proj LoRA delta on CPU with a deterministic,
+    /// RNG-free A **and** non-zero B so that gradients w.r.t. BOTH A and B are
+    /// non-trivial (B is zero-initialized by default → dL/dA would be zero).
+    fn tiny_delta() -> TenantDelta {
+        let mut dims = std::collections::HashMap::new();
+        dims.insert("q_proj".to_owned(), (HIDDEN as usize, HIDDEN as usize));
+        dims.insert("v_proj".to_owned(), (HIDDEN as usize, HIDDEN as usize));
+        let cfg = TenantDeltaConfig {
+            rank: 2,
+            alpha: 2.0,
+            target_modules: vec!["q_proj".to_owned(), "v_proj".to_owned()],
+            ..Default::default()
+        };
+        let delta = TenantDelta::new(&cfg, &dims, Device::Cpu, LAYERS).unwrap();
+        // Seed deterministic, non-zero A and B in-place (no_grad: weight init, not
+        // graph). Seed by a STABLE per-key offset — HashMap iteration order is not
+        // deterministic, so two independent `tiny_delta()` builds (whole vs split)
+        // must agree key-for-key, not enumeration-index-for-index.
+        let key_offset = |key: &str| -> i64 {
+            key.bytes().map(|b| b as i64).sum::<i64>() % 17
+        };
+        let _g = tch::no_grad_guard();
+        for (k, a) in delta.lora_a.iter() {
+            let n: i64 = a.size().iter().product();
+            let vals = (Tensor::arange(n, (DType::Float, Device::Cpu)) + key_offset(k)).sin() * 0.1;
+            // copy_ needs &mut; shallow_clone shares storage so the delta param is mutated.
+            a.shallow_clone().copy_(&vals.reshape(a.size()));
+        }
+        for (k, b) in delta.lora_b.iter() {
+            let n: i64 = b.size().iter().product();
+            let vals = (Tensor::arange(n, (DType::Float, Device::Cpu)) + key_offset(k) + 7).cos() * 0.1;
+            b.shallow_clone().copy_(&vals.reshape(b.size()));
+        }
+        delta
+    }
+
+    /// Sum of squared L2 grad norms over all delta params, plus a per-key map.
+    fn grad_snapshot(delta: &TenantDelta) -> std::collections::HashMap<String, f64> {
+        let mut out = std::collections::HashMap::new();
+        for (k, a) in &delta.lora_a {
+            assert!(a.grad().defined(), "A grad undefined for {k}");
+            out.insert(format!("A:{k}"), a.grad().norm().double_value(&[]));
+        }
+        for (k, b) in &delta.lora_b {
+            assert!(b.grad().defined(), "B grad undefined for {k}");
+            out.insert(format!("B:{k}"), b.grad().norm().double_value(&[]));
+        }
+        out
+    }
+
+    /// The core correctness guardrail (#316): a TTT/training step (forward_layers_train
+    /// → NTP loss → backward) over a two-stage CPU split must produce the SAME delta
+    /// gradients as the whole-model training forward, within ~1e-4. A wrong
+    /// cross-device autograd hookup or mis-placed grad would diverge.
+    #[test]
+    fn ttt_split_autograd_matches_whole_model_grads() {
+        use crate::training::pipeline::{compute_ntp_loss_split, TrainStage};
+
+        let input = Tensor::from_slice(&[3i64, 7, 1, 4, 9, 2]).reshape([1, 6]);
+
+        // --- (a) whole-model training forward over a single-device map ---
+        let whole = whole_model();
+        let whole_delta = tiny_delta();
+        let whole_stage = [TrainStage { model: &whole, range: 0..LAYERS }];
+        let loss_whole = compute_ntp_loss_split(&whole_stage, &input, Some(&whole_delta)).unwrap();
+        loss_whole.backward();
+        let whole_grads = grad_snapshot(&whole_delta);
+        whole_delta.zero_grad();
+
+        // --- (b) two-stage split over an all-CPU map (exercises the boundary
+        // to_device autograd transparency + global↔local remap) ---
+        let map = LayerDeviceMap::single(Device::Cpu, LAYERS).unwrap();
+        let split = LAYERS / 2;
+        let mut w0 = tiny_weights();
+        let stage0 = LlamaModel::stage_from_weights_with_config(
+            &mut w0, tiny_config(), &map, 0..split, DType::Float, KVQuantType::None,
+        ).unwrap();
+        let mut w1 = tiny_weights();
+        let stage1 = LlamaModel::stage_from_weights_with_config(
+            &mut w1, tiny_config(), &map, split..LAYERS, DType::Float, KVQuantType::None,
+        ).unwrap();
+        let split_delta = tiny_delta();
+        let stages = [
+            TrainStage { model: &stage0, range: 0..split },
+            TrainStage { model: &stage1, range: split..LAYERS },
+        ];
+        let loss_split = compute_ntp_loss_split(&stages, &input, Some(&split_delta)).unwrap();
+        loss_split.backward();
+        let split_grads = grad_snapshot(&split_delta);
+
+        // Losses must match (forward equivalence).
+        let lw = loss_whole.double_value(&[]);
+        let ls = loss_split.double_value(&[]);
+        assert!((lw - ls).abs() < 1e-4, "loss diverged: whole={lw} split={ls}");
+
+        // Per-key gradient norms must match within tolerance (backward equivalence).
+        assert_eq!(whole_grads.len(), split_grads.len());
+        for (k, &gw) in &whole_grads {
+            let gs = *split_grads.get(k).unwrap_or_else(|| panic!("missing grad {k}"));
+            assert!(
+                (gw - gs).abs() <= 1e-4 + 1e-4 * gw.abs(),
+                "grad norm diverged for {k}: whole={gw} split={gs}"
+            );
+            // A non-trivial gradient must actually flow (guards against a silently
+            // detached path that would make both sides spuriously equal at 0).
+            assert!(gw > 0.0, "grad for {k} is zero — autograd path not exercised");
+        }
+    }
+
+    /// `forward_layers_train` must reject ranges outside the stage's owned window
+    /// (same guardrail as the inference runner).
+    #[test]
+    fn forward_layers_train_rejects_out_of_window_range() {
+        let map = LayerDeviceMap::single(Device::Cpu, LAYERS).unwrap();
+        let mut w = tiny_weights();
+        let stage = LlamaModel::stage_from_weights_with_config(
+            &mut w, tiny_config(), &map, 2..LAYERS, DType::Float, KVQuantType::None,
+        ).unwrap();
+        let emb = Tensor::randn([1, 3, HIDDEN], (DType::Float, Device::Cpu));
+        assert!(stage.forward_layers_train(&emb, 0..2, None).is_err(), "range below window");
+        assert!(stage.forward_layers_train(&emb, 2..LAYERS, None).is_ok(), "owned range ok");
     }
 }

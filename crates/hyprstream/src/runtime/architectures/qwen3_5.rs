@@ -386,21 +386,40 @@ fn chunked_delta_rule(
 
     // attn = -(k_beta @ k^T * decay_mask).masked_fill(mask0, 0)
     // [B, nv, nc, C, C]
-    let attn = -(k_beta.matmul(&k.transpose(-1, -2)) * &decay_mask)
+    let attn0 = -(k_beta.matmul(&k.transpose(-1, -2)) * &decay_mask)
         .masked_fill(&mask0, 0.0f64);
 
-    // Recursive delta-rule correction (loop over chunk_size positions)
-    for i in 1..CHUNK_SIZE as usize {
-        let i = i as i64;
-        // row = attn[..., i, :i]
-        let row = attn.narrow(-2, i, 1).narrow(-1, 0, i).squeeze_dim(-2); // [B, nv, nc, i]
-        // sub = attn[..., :i, :i]
-        let sub = attn.narrow(-2, 0, i).narrow(-1, 0, i); // [B, nv, nc, i, i]
-        // correction = (row @ sub)  [B, nv, nc, i]
-        let correction = row.unsqueeze(-2).matmul(&sub).squeeze_dim(-2);
-        let new_row = (&row + &correction).unsqueeze(-2); // [B, nv, nc, 1, i]
-        attn.narrow(-2, i, 1).narrow(-1, 0, i).copy_(&new_row);
+    // Recursive delta-rule correction (forward substitution over chunk positions).
+    //
+    // Row `i` of the corrected lower-triangular matrix is
+    //   T[i, :i] = A[i, :i] + A[i, :i] @ T[:i, :i]
+    // i.e. each row depends on the ALREADY-corrected rows above it. The original
+    // implementation built this with an in-place `attn[..i].copy_(row)`, which is
+    // unsafe for autograd (it mutates a tensor saved for backward → "variable
+    // needed for gradient computation modified by an inplace operation"). On the
+    // inference path this ran under `no_grad`; on the TTT-on-split training path
+    // (#316) the graph is live, so we build the rows out-of-place and stack them.
+    // Numerically identical to the in-place form; only the graph differs.
+    let c = CHUNK_SIZE;
+    // Each entry is a full-width row [B, nv, nc, C]; row 0 is unchanged.
+    let mut rows: Vec<Tensor> = Vec::with_capacity(c as usize);
+    rows.push(attn0.narrow(-2, 0, 1).squeeze_dim(-2)); // [B, nv, nc, C]
+    for i in 1..c {
+        // Original row i, columns [0, i) (columns >= i are 0 from mask0).
+        let a_row = attn0.narrow(-2, i, 1).narrow(-1, 0, i).squeeze_dim(-2); // [B, nv, nc, i]
+        // T[:i, :i] — stack the already-corrected rows, take their first i cols.
+        let sub = Tensor::stack(&rows, -2).narrow(-1, 0, i); // [B, nv, nc, i, i]
+        let correction = a_row.unsqueeze(-2).matmul(&sub).squeeze_dim(-2); // [B, nv, nc, i]
+        let corrected = &a_row + &correction; // [B, nv, nc, i]
+        // Re-pad to full width C (columns [i, C) are 0, matching mask0).
+        let pad_cols = c - i;
+        let zeros = Tensor::zeros(
+            [batch, nv, nc, pad_cols],
+            (Kind::Float, device),
+        );
+        rows.push(Tensor::cat(&[corrected, zeros], -1)); // [B, nv, nc, C]
     }
+    let attn = Tensor::stack(&rows, -2); // [B, nv, nc, C, C]
 
     // Add identity
     let eye = Tensor::eye(CHUNK_SIZE, (Kind::Float, device))
@@ -1990,6 +2009,102 @@ impl Qwen3_5Model {
         Ok(hidden)
     }
 
+    /// Training-path sibling of [`Self::forward_layers_inner`] — the cross-device
+    /// autograd primitive for TTT-on-split (#316). See the trait
+    /// `forward_layers_train` docs for the contract.
+    ///
+    /// Differs from the inference runner in three deliberate ways:
+    /// - **no KV cache** — full-attention layers run with full causal attention
+    ///   over the entire context (`start_pos = 0`, no cache);
+    /// - **`start_pos = 0`** — `position_ids = 0..seq`;
+    /// - **fresh, call-local recurrent (SSM) state** — `conv`/`rec` start at
+    ///   `None` for every owned layer and are never written back to
+    ///   `self.conv_states` / `self.rec_states`. This keeps a TTT step from
+    ///   polluting the persistent inference recurrent state, and makes the split
+    ///   numerically identical to the whole-model training forward (per-layer
+    ///   recurrent state never crosses a layer boundary, so partitioning the layer
+    ///   range is exact).
+    ///
+    /// The lone cross-device `hidden.to_device(next)` (carrying `position_ids`) is
+    /// autograd-transparent, so `loss.backward()` materializes grads on each
+    /// parameter's own device.
+    fn forward_layers_train_inner(
+        &self,
+        hidden: &Tensor,
+        range: std::ops::Range<usize>,
+        delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        let num_global = self.config.num_hidden_layers as usize;
+        if range.end > num_global || range.start >= range.end {
+            return Err(anyhow!(
+                "forward_layers_train: invalid global range {range:?} for {num_global} layers"
+            ));
+        }
+        let owned = self.layer_offset..self.layer_offset + self.layers.len();
+        if range.start < owned.start || range.end > owned.end {
+            return Err(anyhow!(
+                "forward_layers_train: range {range:?} not within this stage's owned layers {owned:?}"
+            ));
+        }
+
+        let mut hidden = hidden.shallow_clone();
+
+        // Training path: start_pos is always 0 → position_ids = 0..seq, built on
+        // the input device and moved alongside `hidden` at each device boundary.
+        let seq = hidden.size()[1];
+        let mut position_ids =
+            Tensor::arange(seq, (Kind::Int64, hidden.device()));
+
+        // Fresh, call-local SSM state — never touches the persistent inference
+        // `conv_states`/`rec_states`. Sized to the OWNED layer count and indexed
+        // locally, mirroring the persistent vectors' sizing.
+        let mut conv_local: Vec<Option<Tensor>> =
+            (0..self.layers.len()).map(|_| None).collect();
+        let mut rec_local: Vec<Option<Tensor>> =
+            (0..self.layers.len()).map(|_| None).collect();
+
+        for g in range {
+            let local_idx = g - self.layer_offset;
+
+            // The single cross-device transfer (autograd-transparent): only when
+            // this layer's mapped device differs from where `hidden` currently is.
+            let target = self.device_map.device_for(g);
+            if hidden.device() != target {
+                hidden = hidden.to_device(target);
+                position_ids = position_ids.to_device(target);
+            }
+
+            let layer = &self.layers[local_idx];
+            let residual = hidden.shallow_clone();
+            hidden = layer.input_layernorm.forward(&hidden)?;
+
+            // Delta module lookup uses the GLOBAL layer index (per-layer LoRA is
+            // keyed by global layer, matching whole-model training).
+            let delta_arg = delta.map(|d| (d, g));
+
+            let mixer_out = match &layer.mixer {
+                LayerMixer::LinearAttn(gdn) => gdn.forward(
+                    &hidden,
+                    &mut conv_local[local_idx],
+                    &mut rec_local[local_idx],
+                    delta_arg,
+                )?,
+                LayerMixer::FullAttn(attn) => {
+                    // No KV cache (training): full causal attention, start_pos = 0.
+                    attn.forward(&hidden, Some(&position_ids), None, 0, delta_arg)?
+                }
+            };
+
+            hidden = residual + &mixer_out;
+
+            let residual2 = hidden.shallow_clone();
+            hidden = layer.post_attention_layernorm.forward(&hidden)?;
+            hidden = layer.mlp.forward(&hidden)?;
+            hidden = residual2 + &hidden;
+        }
+        Ok(hidden)
+    }
+
     /// Encode images through the vision encoder and project to text hidden space.
     ///
     /// pixel_values: [B, C, H, W]
@@ -2222,6 +2337,15 @@ impl ModelOperations for Qwen3_5Model {
         delta: Option<&crate::training::TenantDelta>,
     ) -> Result<Tensor> {
         self.forward_layers_inner(hidden, range, start_pos, delta)
+    }
+
+    fn forward_layers_train(
+        &self,
+        hidden: &Tensor,
+        range: std::ops::Range<usize>,
+        delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        self.forward_layers_train_inner(hidden, range, delta)
     }
 
     fn decode_layer(
@@ -2579,5 +2703,142 @@ mod pipeline_tests {
             Ok(_) => panic!("last stage without norm weight must error"),
             Err(e) => assert!(e.to_string().contains("norm"), "got: {e}"),
         }
+    }
+
+    // ========================================================================
+    // #316 — TTT-on-split cross-device autograd equivalence (CPU-verifiable),
+    // exercising the hybrid GDN + full-attention stack across a stage boundary.
+    // ========================================================================
+
+    use crate::training::tenant_delta::{TenantDelta, TenantDeltaConfig};
+
+    /// Per-layer o_proj LoRA delta on CPU. o_proj is the one module BOTH mixer
+    /// kinds inject (GDN out_proj: in=val_dim; full-attn: in=nh*hd), so its dims
+    /// differ per layer type — supplied via per_layer_dims (mirrors
+    /// `TorchEngine::get_per_layer_lora_dims`). Seeds deterministic non-zero A and
+    /// B so gradients w.r.t. both are non-trivial.
+    fn tiny_delta() -> TenantDelta {
+        let hidden = HIDDEN as usize;
+        let gdn_in = LIN_V_HEADS * LIN_V_DIM; // out_proj input dim for GDN layers
+        let full_in = (HEADS * HEAD_DIM) as usize; // o_proj input dim for full-attn layers
+        let mut per_layer: std::collections::HashMap<usize, std::collections::HashMap<String, (usize, usize)>> =
+            std::collections::HashMap::new();
+        for i in 0..LAYERS {
+            let is_full = (i + 1) % 4 == 0;
+            let mut m = std::collections::HashMap::new();
+            let in_dim = if is_full { full_in } else { gdn_in };
+            m.insert("o_proj".to_owned(), (in_dim, hidden));
+            per_layer.insert(i, m);
+        }
+        let cfg = TenantDeltaConfig {
+            rank: 2,
+            alpha: 2.0,
+            target_modules: vec!["o_proj".to_owned()],
+            ..Default::default()
+        };
+        let flat: std::collections::HashMap<String, (usize, usize)> = std::collections::HashMap::new();
+        let delta = TenantDelta::new_with_per_layer_dims(
+            &cfg, &flat, Device::Cpu, LAYERS, Some(&per_layer),
+        ).unwrap();
+
+        // Seed by a STABLE per-key offset (HashMap iteration order is not
+        // deterministic, so independent builds must agree key-for-key).
+        let key_offset = |key: &str| -> i64 {
+            key.bytes().map(|b| b as i64).sum::<i64>() % 17
+        };
+        let _g = tch::no_grad_guard();
+        for (k, a) in delta.lora_a.iter() {
+            let n: i64 = a.size().iter().product();
+            let vals = (Tensor::arange(n, (Kind::Float, Device::Cpu)) + key_offset(k)).sin() * 0.1;
+            // copy_ needs &mut; shallow_clone shares storage so the delta param is mutated.
+            a.shallow_clone().copy_(&vals.reshape(a.size()));
+        }
+        for (k, b) in delta.lora_b.iter() {
+            let n: i64 = b.size().iter().product();
+            let vals = (Tensor::arange(n, (Kind::Float, Device::Cpu)) + key_offset(k) + 7).cos() * 0.1;
+            b.shallow_clone().copy_(&vals.reshape(b.size()));
+        }
+        delta
+    }
+
+    fn grad_snapshot(delta: &TenantDelta) -> std::collections::HashMap<String, f64> {
+        let mut out = std::collections::HashMap::new();
+        for (k, a) in &delta.lora_a {
+            assert!(a.grad().defined(), "A grad undefined for {k}");
+            out.insert(format!("A:{k}"), a.grad().norm().double_value(&[]));
+        }
+        for (k, b) in &delta.lora_b {
+            assert!(b.grad().defined(), "B grad undefined for {k}");
+            out.insert(format!("B:{k}"), b.grad().norm().double_value(&[]));
+        }
+        out
+    }
+
+    /// The #316 correctness guardrail for the hybrid architecture: a TTT/training
+    /// step (forward_layers_train → NTP loss → backward) over a two-stage CPU split
+    /// must produce the SAME delta gradients as the whole-model training forward,
+    /// within ~1e-4. The split point (k=2) keeps the full-attention layer in stage1
+    /// and GDN layers in stage0, so this proves cross-device autograd is correct
+    /// across both mixer kinds AND the (fresh, stage-local) SSM state threading.
+    #[test]
+    fn ttt_split_autograd_matches_whole_model_grads() {
+        use crate::training::pipeline::{compute_ntp_loss_split, TrainStage};
+
+        let input = Tensor::from_slice(&[3i64, 7, 1, 4, 9, 2]).reshape([1, 6]);
+
+        // (a) whole-model training forward over a single-device map.
+        let whole = whole_model();
+        let whole_delta = tiny_delta();
+        let whole_stage = [TrainStage { model: &whole, range: 0..LAYERS }];
+        let loss_whole = compute_ntp_loss_split(&whole_stage, &input, Some(&whole_delta)).unwrap();
+        loss_whole.backward();
+        let whole_grads = grad_snapshot(&whole_delta);
+        whole_delta.zero_grad();
+
+        // (b) two-stage split over an all-CPU map.
+        let map = LayerDeviceMap::single(Device::Cpu, LAYERS).unwrap();
+        let split = LAYERS / 2;
+        let mut w0 = tiny_weights();
+        let stage0 = Qwen3_5Model::stage_from_weights_with_config(
+            &mut w0, tiny_config(), &map, 0..split, Kind::Float, KVQuantType::None,
+        ).unwrap();
+        let mut w1 = tiny_weights();
+        let stage1 = Qwen3_5Model::stage_from_weights_with_config(
+            &mut w1, tiny_config(), &map, split..LAYERS, Kind::Float, KVQuantType::None,
+        ).unwrap();
+        let split_delta = tiny_delta();
+        let stages = [
+            TrainStage { model: &stage0, range: 0..split },
+            TrainStage { model: &stage1, range: split..LAYERS },
+        ];
+        let loss_split = compute_ntp_loss_split(&stages, &input, Some(&split_delta)).unwrap();
+        loss_split.backward();
+        let split_grads = grad_snapshot(&split_delta);
+
+        let lw = loss_whole.double_value(&[]);
+        let ls = loss_split.double_value(&[]);
+        assert!((lw - ls).abs() < 1e-4, "loss diverged: whole={lw} split={ls}");
+
+        assert_eq!(whole_grads.len(), split_grads.len());
+        for (k, &gw) in &whole_grads {
+            let gs = *split_grads.get(k).unwrap_or_else(|| panic!("missing grad {k}"));
+            assert!(
+                (gw - gs).abs() <= 1e-4 + 1e-4 * gw.abs(),
+                "grad norm diverged for {k}: whole={gw} split={gs}"
+            );
+            assert!(gw > 0.0, "grad for {k} is zero — autograd path not exercised");
+        }
+    }
+
+    #[test]
+    fn forward_layers_train_rejects_out_of_window_range() {
+        let map = LayerDeviceMap::single(Device::Cpu, LAYERS).unwrap();
+        let mut w = tiny_weights();
+        let stage = Qwen3_5Model::stage_from_weights_with_config(
+            &mut w, tiny_config(), &map, 2..LAYERS, Kind::Float, KVQuantType::None,
+        ).unwrap();
+        let emb = Tensor::randn([1, 3, HIDDEN], (Kind::Float, Device::Cpu));
+        assert!(stage.forward_layers_train(&emb, 0..2, None).is_err(), "range below window");
+        assert!(stage.forward_layers_train(&emb, 2..LAYERS, None).is_ok(), "owned range ok");
     }
 }

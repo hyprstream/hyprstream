@@ -469,7 +469,17 @@ impl TenantDelta {
         // BF16 + fp32 add panics (addmm requires matching dtypes). The cast back is a
         // device-agnostic no-op when input_kind already equals a.kind().
         let input_kind = x.kind();
+        let input_device = x.device();
         let x = x.to_kind(a.kind());
+        // Pipeline-split (#316) cross-device autograd: the delta's VarStore lives on
+        // a single `self.device`, but under a layer-split TTT the activation `x` may
+        // be on a different device than this layer's delta params. Move A/B onto the
+        // activation's device so the matmuls are device-consistent; `to_device` is
+        // autograd-transparent, so gradients flow back to the params on `self.device`.
+        // On the single-device path both moves are no-op views (source == dest),
+        // keeping the existing TTT behavior byte-identical.
+        let a_eff = a_eff.to_device(input_device);
+        let b_eff = b_eff.to_device(input_device);
         let intermediate = x.f_matmul(&a_eff.tr())
             .map_err(|e| anyhow!("Delta forward_2d matmul A failed for '{}': {}", key, e))?;
         let output = intermediate.f_matmul(&b_eff.tr())
