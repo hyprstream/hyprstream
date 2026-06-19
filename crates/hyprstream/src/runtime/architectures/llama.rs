@@ -625,6 +625,182 @@ impl LlamaAttention {
         Ok(attn_output)
     }
 
+    /// Detect the actual number of KV heads from a projected K tensor.
+    ///
+    /// Mirrors the inline detection in [`LlamaAttention::forward`] so the batched
+    /// path stays byte-consistent with the reference. Extracted to keep both paths
+    /// in lock-step (DRY).
+    fn detect_kv_heads(&self, k_elements: i64, rows: i64) -> usize {
+        if k_elements == rows * (self.num_kv_heads as i64) * (self.head_dim as i64) {
+            self.num_kv_heads
+        } else if k_elements % (rows * (self.head_dim as i64)) == 0 {
+            (k_elements / (rows * (self.head_dim as i64))) as usize
+        } else if k_elements % rows == 0 {
+            let kv_dim = (k_elements / rows) as usize;
+            if kv_dim == 256 && self.head_dim == 128 {
+                2
+            } else if kv_dim == 256 {
+                8
+            } else {
+                self.num_kv_heads
+            }
+        } else {
+            self.num_kv_heads
+        }
+    }
+
+    /// Batched ragged self-attention for continuous decode (#329, Llama-only).
+    ///
+    /// Processes `B` sequences in one batched forward. Each row `r` has:
+    /// - `hidden_states[r]`: `[q, H]` (all rows share `q`; v1 decode uses `q == 1`),
+    /// - its own absolute `start_positions[r]` and per-row `LayerKVCache`.
+    ///
+    /// Q/K/V are projected on the whole `[B, q, H]` batch (one matmul; same-delta
+    /// LoRA injection applies uniformly). RoPE is applied per row with that row's
+    /// absolute positions (`apply_rope`'s 1D path is exact; a 2D batched index
+    /// would mis-broadcast). KV: each row's new K/V is written to its own cache,
+    /// then every row's dense history is read back and **right-padded** to the
+    /// batch-max KV length, stacked to `[B, kv_max, heads, dim]`. The supplied
+    /// additive `attn_mask` (`[B, 1, q, kv_max]`) masks both the causal structure
+    /// and each row's padding, so a single masked matmul is numerically identical
+    /// to running each row through [`LlamaAttention::forward`] serially.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_batched(
+        &self,
+        hidden_states: &Tensor,
+        position_ids: &[Tensor],
+        kv_caches: &mut [&mut crate::runtime::kv_cache::LayerKVCache],
+        start_positions: &[usize],
+        attn_mask: &Tensor,
+        delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        let (batch_size, seq_len, hidden_size) = dims3(hidden_states)?;
+        debug_assert_eq!(batch_size as usize, kv_caches.len());
+        debug_assert_eq!(batch_size as usize, position_ids.len());
+        debug_assert_eq!(batch_size as usize, start_positions.len());
+
+        // Project Q/K/V on the full batch: [B*q, H] -> projections.
+        let hidden_states_2d = hidden_states.reshape([batch_size * seq_len, hidden_size]);
+        let mut q = self.q_proj.apply(&hidden_states_2d);
+        let mut k = self.k_proj.apply(&hidden_states_2d);
+        let mut v = self.v_proj.apply(&hidden_states_2d);
+
+        // Same-delta LoRA injection (scheduler guarantees one delta per batch).
+        if let Some(delta) = delta {
+            for (name, proj) in [("q_proj", &mut q), ("k_proj", &mut k), ("v_proj", &mut v)] {
+                if delta.has_module(name, self.layer_idx) {
+                    let correction = delta.forward_2d(&hidden_states_2d, name, self.layer_idx)?;
+                    let kind = proj.kind();
+                    *proj = proj.f_add(&correction.to_kind(kind)).map_err(|e| {
+                        anyhow::anyhow!(
+                            "Delta correction shape mismatch at layer {} {}: {}",
+                            self.layer_idx, name, e
+                        )
+                    })?;
+                }
+            }
+        }
+
+        let rows = batch_size * seq_len;
+        let kv_heads = self.detect_kv_heads(k.size().iter().product::<i64>(), rows);
+
+        let mut q = q.reshape([batch_size, seq_len, self.num_heads as i64, self.head_dim as i64]);
+        let mut k = k.reshape([batch_size, seq_len, kv_heads as i64, self.head_dim as i64]);
+        let v = v.reshape([batch_size, seq_len, kv_heads as i64, self.head_dim as i64]);
+
+        if let Some(q_norm) = &self.q_norm {
+            q = self.apply_qk_norm(&q, q_norm, self.num_heads)?;
+        }
+        if let Some(k_norm) = &self.k_norm {
+            k = self.apply_qk_norm(&k, k_norm, kv_heads)?;
+        }
+
+        // Per-row RoPE with that row's absolute positions, then re-stack.
+        let mut q_rows: Vec<Tensor> = Vec::with_capacity(batch_size as usize);
+        let mut k_rows: Vec<Tensor> = Vec::with_capacity(batch_size as usize);
+        for (r, pos) in position_ids.iter().enumerate() {
+            let q_r = q.narrow(0, r as i64, 1); // [1, q, heads, dim]
+            let k_r = k.narrow(0, r as i64, 1); // [1, q, kv_heads, dim]
+            q_rows.push(self.apply_rope(&q_r, pos)?);
+            k_rows.push(self.apply_rope(&k_r, pos)?);
+        }
+        let q = Tensor::cat(&q_rows, 0);
+        let k = Tensor::cat(&k_rows, 0);
+
+        // Update each row's cache and collect its dense KV history.
+        let mut row_keys: Vec<Tensor> = Vec::with_capacity(batch_size as usize);
+        let mut row_values: Vec<Tensor> = Vec::with_capacity(batch_size as usize);
+        let mut kv_lens: Vec<i64> = Vec::with_capacity(batch_size as usize);
+        for r in 0..batch_size as usize {
+            let k_r = k.narrow(0, r as i64, 1).contiguous();
+            let v_r = v.narrow(0, r as i64, 1).contiguous();
+            let cache = &mut *kv_caches[r];
+            cache.update(&k_r, &v_r, start_positions[r])?;
+            let (ck, cv) = cache.get()?; // [1, kv_r, kv_heads, dim]
+            kv_lens.push(ck.size()[1]);
+            row_keys.push(ck);
+            row_values.push(cv);
+        }
+
+        // Right-pad every row's KV to the batch-max length so they stack. Padding
+        // positions are masked out by `attn_mask`, so their values are irrelevant.
+        let kv_max = kv_lens.iter().copied().max().unwrap_or(0);
+        let opt = (k.kind(), k.device());
+        let pad_row = |t: &Tensor, len: i64| -> Tensor {
+            if len == kv_max {
+                t.shallow_clone()
+            } else {
+                // [1, pad_len, kv_heads, dim] zeros appended on the seq axis.
+                let mut shape = t.size();
+                shape[1] = kv_max - len;
+                let pad = Tensor::zeros(&shape[..], opt);
+                Tensor::cat(&[t.shallow_clone(), pad], 1)
+            }
+        };
+        let keys_padded: Vec<Tensor> = row_keys
+            .iter()
+            .zip(&kv_lens)
+            .map(|(t, &len)| pad_row(t, len))
+            .collect();
+        let values_padded: Vec<Tensor> = row_values
+            .iter()
+            .zip(&kv_lens)
+            .map(|(t, &len)| pad_row(t, len))
+            .collect();
+        let k_stacked = Tensor::cat(&keys_padded, 0); // [B, kv_max, kv_heads, dim]
+        let v_stacked = Tensor::cat(&values_padded, 0);
+
+        // GQA expansion on the stacked KV.
+        let (k_expanded, v_expanded) = if kv_heads < self.num_heads {
+            (
+                self.expand_kv_for_gqa_with_heads(&k_stacked, kv_heads)?,
+                self.expand_kv_for_gqa_with_heads(&v_stacked, kv_heads)?,
+            )
+        } else {
+            (k_stacked, v_stacked)
+        };
+
+        // One masked batched attention for all rows.
+        let attn_output = self.compute_attention_masked(&q, &k_expanded, &v_expanded, Some(attn_mask))?;
+
+        let attn_output = attn_output.transpose(1, 2).contiguous();
+        let attn_output =
+            attn_output.reshape([batch_size, seq_len, (self.num_heads * self.head_dim) as i64]);
+        let attn_output_2d =
+            attn_output.reshape([batch_size * seq_len, (self.num_heads * self.head_dim) as i64]);
+        let mut attn_output = self.o_proj.apply(&attn_output_2d);
+
+        if let Some(delta) = delta {
+            if delta.has_module("o_proj", self.layer_idx) {
+                let correction = delta.forward_2d(&attn_output_2d, "o_proj", self.layer_idx)?;
+                let kind = attn_output.kind();
+                attn_output += correction.to_kind(kind);
+            }
+        }
+
+        Ok(attn_output.reshape([batch_size, seq_len, hidden_size]))
+    }
+
     /// Expand KV tensors for GQA with explicit head count
     fn expand_kv_for_gqa_with_heads(&self, kv: &Tensor, actual_kv_heads: usize) -> Result<Tensor> {
         let (batch_size, seq_len, _detected_heads, head_dim) = dims4(kv)?;
@@ -795,6 +971,26 @@ impl LlamaAttention {
     /// `q`, `k`, `v` are `[batch, seq, heads, dim]` (K/V already GQA-expanded by
     /// the caller); the result is `[batch, heads, q_len, dim]`.
     fn compute_attention(&self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+        self.compute_attention_masked(q, k, v, None)
+    }
+
+    /// Scaled dot-product attention with an explicit additive attention mask.
+    ///
+    /// When `attn_mask` is `Some`, it is an additive mask broadcastable to the
+    /// `[batch, heads, q_len, k_len]` score tensor (`0.0` for attend, a large
+    /// negative for mask-out) and *replaces* the implicit `tril` causal mask.
+    /// This is the entry the batched/ragged decode path uses to express, in one
+    /// matmul, both per-row causality AND per-row KV padding (rows in a batch have
+    /// different valid KV lengths). When `attn_mask` is `None` the behavior is
+    /// byte-identical to the original inline-`tril` single-sequence path — kept as
+    /// the equivalence reference.
+    fn compute_attention_masked(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        attn_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         /// Query-chunk size for long-prefill attention. 1024 keeps the per-chunk
         /// score matrix small while amortizing kernel-launch overhead.
         const CHUNK: i64 = 1024;
@@ -813,22 +1009,35 @@ impl LlamaAttention {
         let q = if upcast { q.to_kind(tch::Kind::Float) } else { q };
         let k_t = if upcast { k_t.to_kind(tch::Kind::Float) } else { k_t };
         let v = if upcast { v.to_kind(tch::Kind::Float) } else { v };
+        // Match the score dtype (FP32) so broadcast_add doesn't upcast/clash.
+        let attn_mask = attn_mask.map(|m| {
+            if m.kind() != tch::Kind::Float {
+                m.to_kind(tch::Kind::Float)
+            } else {
+                m.shallow_clone()
+            }
+        });
 
         let q_len = q.size()[2];
         let k_len = k_t.size()[3];
         let device = q.device();
 
-        // Sliding-window (Gemma3 "local") layers keep the single-shot path so the
-        // window mask logic stays in one place.
-        let single_shot = self.sliding_window.is_some() || q_len <= CHUNK;
+        // An explicit mask must go through the single-shot path: it already encodes
+        // causality + padding for the whole [q_len, k_len] grid, and chunking would
+        // need to re-slice it per chunk. Decode batches have q_len == 1 anyway.
+        let single_shot = attn_mask.is_some() || self.sliding_window.is_some() || q_len <= CHUNK;
 
         let attn_output = if single_shot {
             // [batch, heads, q_len, k_len]
             let mut scores = q.matmul(&k_t) * (scale as f64);
 
-            // Causal mask only when processing multiple query tokens (prompt phase);
-            // for q_len == 1 (decode) all past positions are valid — no mask.
-            if q_len > 1 {
+            if let Some(mask) = attn_mask.as_ref() {
+                // Explicit additive mask supplied by the batched path; it fully
+                // determines which (q, kv) pairs are valid, so skip the inline tril.
+                scores = broadcast_add(&scores, mask)?;
+            } else if q_len > 1 {
+                // Causal mask only when processing multiple query tokens (prompt
+                // phase); for q_len == 1 (decode) all past positions are valid.
                 let mask = Tensor::ones([q_len, k_len], (tch::Kind::Float, device)).tril(0);
                 let mask = mask.unsqueeze(0).unsqueeze(0).expand_as(&scores);
                 scores = scores.masked_fill(&mask.eq(0.0), -10000.0f64);
@@ -2127,6 +2336,185 @@ impl LlamaModel {
         Ok(hidden_states)
     }
 
+    /// Mask padded vocabulary columns to `-1e10` in-place on a logits tensor.
+    ///
+    /// Shared by the single-sequence and batched forward paths so both produce
+    /// identical logits over the padded columns. No-op when the vocab was not
+    /// padded. `logits` may be `[B, seq, vocab]` or `[rows, vocab]`.
+    fn mask_padded_vocab(&self, logits: &Tensor) {
+        let original_vocab_size = self.config.original_vocab_size;
+        let padded_vocab_size = self.config.vocab_size;
+        if padded_vocab_size <= original_vocab_size || original_vocab_size == 0 {
+            return;
+        }
+        let logits_shape = logits.size();
+        let actual_vocab_size = logits_shape[logits_shape.len() - 1] as u32;
+        if actual_vocab_size != padded_vocab_size {
+            return;
+        }
+        let mask_start = original_vocab_size as i64;
+        let mask_count = (padded_vocab_size - original_vocab_size) as i64;
+        if mask_count <= 0 {
+            return;
+        }
+        let mask_values =
+            Tensor::full([mask_count], -1e10_f64, (logits.kind(), logits.device()));
+        match logits_shape.len() {
+            3 => {
+                for b in 0..logits_shape[0] {
+                    for s in 0..logits_shape[1] {
+                        let slice = logits.select(0, b).select(0, s);
+                        slice.narrow(0, mask_start, mask_count).copy_(&mask_values);
+                    }
+                }
+            }
+            2 => {
+                for i in 0..logits_shape[0] {
+                    let slice = logits.select(0, i);
+                    slice.narrow(0, mask_start, mask_count).copy_(&mask_values);
+                }
+            }
+            _ => {
+                logits.narrow(0, mask_start, mask_count).copy_(&mask_values);
+            }
+        }
+    }
+
+    /// Batched ragged forward for continuous decode (#329, Llama-only).
+    ///
+    /// `sequences[r]` = `(new_token_ids, start_pos, per-sequence KVCacheManager)`.
+    /// All rows share the same query length `q = new_token_ids.len()` (v1 decode
+    /// drives `q == 1`); each row brings its own absolute `start_pos` and isolated
+    /// per-sequence KV cache (tenant isolation). `delta` is the single tenant
+    /// delta shared by every row in the batch (the scheduler groups by delta).
+    ///
+    /// Returns stacked logits `[B, q, vocab]`. The result for row `r` is bit-for-
+    /// bit equivalent (within fp tolerance) to `forward_with_cache_and_delta` run
+    /// on that sequence alone — this is the #329 PR-1 correctness gate.
+    ///
+    /// Inherent impl behind the [`ModelOperations::forward_batched`] override.
+    fn forward_batched_impl(
+        &self,
+        sequences: &mut [(Vec<i64>, usize, std::sync::Arc<parking_lot::Mutex<crate::runtime::kv_cache::KVCacheManager>>)],
+        delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        let batch_size = sequences.len();
+        if batch_size == 0 {
+            return Err(anyhow!("forward_batched: empty batch"));
+        }
+        let q_len = sequences[0].0.len();
+        if q_len == 0 {
+            return Err(anyhow!("forward_batched: empty sequence"));
+        }
+        if sequences.iter().any(|(toks, ..)| toks.len() != q_len) {
+            return Err(anyhow!(
+                "forward_batched: ragged query lengths are not supported in v1 (all rows must share q_len)"
+            ));
+        }
+        let device = self.device;
+
+        // Build the [B, q] input id tensor and embed it as one batch.
+        let flat_ids: Vec<i64> = sequences.iter().flat_map(|(t, ..)| t.iter().copied()).collect();
+        let input_ids = Tensor::from_slice(&flat_ids)
+            .reshape([batch_size as i64, q_len as i64])
+            .to_device(device);
+        let mut hidden_states = self.embed_tokens(&input_ids)?;
+
+        // Per-row absolute position ids [q] for RoPE, and post-update KV lengths.
+        let start_positions: Vec<usize> = sequences.iter().map(|&(_, sp, _)| sp).collect();
+        let position_ids: Vec<Tensor> = start_positions
+            .iter()
+            .map(|&sp| {
+                Tensor::arange_start(
+                    sp as i64,
+                    (sp + q_len) as i64,
+                    (tch::Kind::Int64, device),
+                )
+            })
+            .collect();
+        // After this step each row holds start_pos + q_len cached tokens.
+        let kv_lens: Vec<i64> = start_positions.iter().map(|&sp| (sp + q_len) as i64).collect();
+        let kv_max = kv_lens.iter().copied().max().unwrap_or(0);
+
+        // Additive attention mask [B, 1, q, kv_max]: row r, query i (absolute pos
+        // sp_r + i) attends to kv col j iff j <= sp_r + i AND j < kv_len_r. Padding
+        // columns (j >= kv_len_r) and future columns are set to a large negative.
+        let neg = -1.0e9_f64;
+        let mask = Tensor::zeros(
+            [batch_size as i64, 1, q_len as i64, kv_max],
+            (tch::Kind::Float, device),
+        );
+        {
+            // Column index row vector [kv_max].
+            let cols = Tensor::arange(kv_max, (tch::Kind::Int64, device));
+            for r in 0..batch_size {
+                let sp = start_positions[r] as i64;
+                let kv_len = kv_lens[r];
+                for i in 0..q_len as i64 {
+                    let allowed_upto = sp + i; // inclusive causal bound
+                    // valid = (cols <= allowed_upto) & (cols < kv_len)
+                    let valid = cols.le(allowed_upto).logical_and(&cols.lt(kv_len));
+                    let row_mask = valid
+                        .logical_not()
+                        .to_kind(tch::Kind::Float)
+                        * neg; // 0 where valid, neg where invalid
+                    mask.select(0, r as i64)
+                        .select(0, 0)
+                        .select(0, i)
+                        .copy_(&row_mask);
+                }
+            }
+        }
+
+        // Lock all per-sequence cache managers for the whole layer loop (one lock
+        // each, mirroring the single-sequence path's lock-once strategy).
+        let guards: Vec<_> = sequences.iter().map(|(_, _, c)| c.lock()).collect();
+
+        let position_refs: Vec<Tensor> = position_ids; // already per-row [q]
+
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let residual = hidden_states.shallow_clone();
+            hidden_states = layer.input_layernorm.forward(&hidden_states)?;
+
+            // Collect this layer's per-row LayerKVCache mutable refs. DashMap's
+            // get_mut borrows the manager, so we briefly take ownership of each
+            // layer cache via with_layer_cache-equivalent direct access.
+            let attn_output = {
+                let mut layer_caches: Vec<
+                    dashmap::mapref::one::RefMut<usize, crate::runtime::kv_cache::LayerKVCache>,
+                > = Vec::with_capacity(batch_size);
+                for g in guards.iter() {
+                    let cell = g
+                        .layer_cache_ref(idx)
+                        .ok_or_else(|| anyhow!("forward_batched: missing layer cache {idx}"))?;
+                    layer_caches.push(cell);
+                }
+                let mut cache_refs: Vec<&mut crate::runtime::kv_cache::LayerKVCache> =
+                    layer_caches.iter_mut().map(|c| &mut **c).collect();
+                layer.self_attn.forward_batched(
+                    &hidden_states,
+                    &position_refs,
+                    &mut cache_refs,
+                    &start_positions,
+                    &mask,
+                    delta,
+                )?
+            };
+            hidden_states = residual + attn_output;
+
+            let residual = hidden_states.shallow_clone();
+            hidden_states = layer.post_attention_layernorm.forward(&hidden_states)?;
+            let ffn_output = layer.mlp.forward(&hidden_states, delta)?;
+            hidden_states = residual + ffn_output;
+        }
+        drop(guards);
+
+        hidden_states = self.apply_final_norm(&hidden_states)?;
+        let logits = self.lm_head(&hidden_states)?;
+        self.mask_padded_vocab(&logits);
+        Ok(logits)
+    }
+
     /// Run global decoder layers `[range.start..range.end)` — the 2b pipeline
     /// layer-range runner (#314). See the trait docs for the stage contract.
     ///
@@ -2332,6 +2720,18 @@ impl ModelOperations for LlamaModel {
         delta: Option<&crate::training::TenantDelta>,
     ) -> Result<Tensor> {
         self.forward_with_cache_inner(input, start_pos, delta)
+    }
+
+    fn forward_batched(
+        &self,
+        sequences: &mut [(
+            Vec<i64>,
+            usize,
+            std::sync::Arc<parking_lot::Mutex<crate::runtime::kv_cache::KVCacheManager>>,
+        )],
+        delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        self.forward_batched_impl(sequences, delta)
     }
 
     fn embed_tokens(&self, input_ids: &Tensor) -> Result<Tensor> {
@@ -3076,6 +3476,120 @@ mod pipeline_tests {
             // detached path that would make both sides spuriously equal at 0).
             assert!(gw > 0.0, "grad for {k} is zero — autograd path not exercised");
         }
+    }
+
+    // ========================================================================
+    // #329 PR-1 — batched ragged decode == serial decode (CPU merge gate).
+    // ========================================================================
+
+    use crate::runtime::kv_cache::KVCacheManager;
+    use std::sync::Arc;
+    use parking_lot::Mutex;
+
+    fn fresh_cache() -> Arc<Mutex<KVCacheManager>> {
+        Arc::new(Mutex::new(KVCacheManager::new(LAYERS, 64, KVQuantType::None)))
+    }
+
+    /// Decode logits (last position) for one sequence run through the trusted
+    /// batch=1 path: prefill the prompt, then one decode step for `next_tok`.
+    fn serial_decode_logits(prompt: &[i64], next_tok: i64) -> Tensor {
+        let model = whole_model();
+        let cache = Arc::new(Mutex::new(KVCacheManager::new(LAYERS, 64, KVQuantType::None)));
+        // Inject a fresh isolated cache so the batch=1 path actually caches.
+        let model = {
+            let mut m = model;
+            <LlamaModel as ModelOperations>::set_kv_cache(&mut m, cache);
+            m
+        };
+        // Prefill prompt at pos 0.
+        let prompt_t = Tensor::from_slice(prompt).reshape([1, prompt.len() as i64]);
+        let _ = model.forward_with_cache(&prompt_t, 0).unwrap();
+        // Decode one token at pos = prompt.len().
+        let dec = Tensor::from_slice(&[next_tok]).reshape([1, 1]);
+        let logits = model.forward_with_cache(&dec, prompt.len()).unwrap();
+        // [1, 1, vocab] -> [vocab]
+        logits.select(0, 0).select(0, 0)
+    }
+
+    #[test]
+    fn batched_ragged_decode_matches_serial() {
+        // Three sequences with DIFFERENT prompt lengths (ragged KV histories) +
+        // one decode token each. The batched decode step (B=3, q=1, ragged kv)
+        // must match each sequence's serially-run decode logits.
+        let prompts: [&[i64]; 3] = [&[1, 5, 9, 2], &[7, 3], &[4, 8, 6, 1, 0]];
+        let next: [i64; 3] = [11, 13, 6];
+
+        // Reference (serial, trusted batch=1 path).
+        let ref_logits: Vec<Tensor> = prompts
+            .iter()
+            .zip(&next)
+            .map(|(p, &t)| serial_decode_logits(p, t))
+            .collect();
+
+        // Batched path: one model, per-sequence isolated caches.
+        let model = whole_model();
+        let mut seqs: Vec<(Vec<i64>, usize, Arc<Mutex<KVCacheManager>>)> = prompts
+            .iter()
+            .map(|_| (Vec::new(), 0usize, fresh_cache()))
+            .collect();
+
+        // Prefill each sequence's cache individually (batch=1 calls to the batched
+        // path — ragged q across rows is not mixed in v1).
+        for (i, p) in prompts.iter().enumerate() {
+            let mut one = vec![(p.to_vec(), 0usize, seqs[i].2.clone())];
+            let _ = model.forward_batched(&mut one, None).unwrap();
+        }
+
+        // One batched decode step over the ragged histories.
+        for (i, &t) in next.iter().enumerate() {
+            seqs[i].0 = vec![t];
+            seqs[i].1 = prompts[i].len();
+        }
+        let batched = model.forward_batched(&mut seqs, None).unwrap(); // [3, 1, vocab]
+
+        let orig = model.config.original_vocab_size as i64;
+        for (i, ref_l) in ref_logits.iter().enumerate() {
+            let b_l = batched.select(0, i as i64).select(0, 0); // [vocab]
+            let r_c = ref_l.narrow(0, 0, orig);
+            let b_c = b_l.narrow(0, 0, orig);
+            let max_diff = (&r_c - &b_c).abs().max().double_value(&[]);
+            assert!(
+                r_c.allclose(&b_c, 1e-4, 1e-4, false),
+                "batched decode row {i} diverged from serial (max_diff={max_diff})"
+            );
+            // Argmax (sampled token) must agree — the user-visible invariant.
+            assert_eq!(
+                r_c.argmax(0, false).int64_value(&[]),
+                b_c.argmax(0, false).int64_value(&[]),
+                "row {i} argmax token differs",
+            );
+        }
+    }
+
+    #[test]
+    fn batched_single_row_matches_serial_prefill() {
+        // A batch of ONE through forward_batched must equal the batch=1 reference
+        // (guards the padded-dense KV + explicit-mask path against the inline tril).
+        let prompt: [i64; 4] = [1, 5, 9, 2];
+        let next = 11i64;
+        let ref_l = serial_decode_logits(&prompt, next);
+
+        let model = whole_model();
+        let cache = fresh_cache();
+        let mut prefill = vec![(prompt.to_vec(), 0usize, cache.clone())];
+        let _ = model.forward_batched(&mut prefill, None).unwrap();
+        let mut dec = vec![(vec![next], prompt.len(), cache)];
+        let logits = model.forward_batched(&mut dec, None).unwrap();
+        let b_l = logits.select(0, 0).select(0, 0);
+
+        let orig = model.config.original_vocab_size as i64;
+        let r_c = ref_l.narrow(0, 0, orig);
+        let b_c = b_l.narrow(0, 0, orig);
+        let max_diff = (&r_c - &b_c).abs().max().double_value(&[]);
+        assert!(
+            r_c.allclose(&b_c, 1e-4, 1e-4, false),
+            "single-row batched decode diverged from serial (max_diff={max_diff})"
+        );
     }
 
     /// `forward_layers_train` must reject ranges outside the stage's owned window

@@ -1954,6 +1954,20 @@ impl KVCacheManager {
         self.layer_caches.get_mut(&layer_idx).map(|mut cache_ref| f(&mut cache_ref))
     }
 
+    /// Borrow a layer's cache directly as a `RefMut` (for the batched decode path,
+    /// which needs to hold one mutable layer-cache borrow per sequence across a
+    /// batched attention call). Each sequence has its own manager, so the borrows
+    /// never alias. Returns `None` when caching is disabled or the layer is absent.
+    pub fn layer_cache_ref(
+        &self,
+        layer_idx: usize,
+    ) -> Option<dashmap::mapref::one::RefMut<'_, usize, LayerKVCache>> {
+        if !self.enabled {
+            return None;
+        }
+        self.layer_caches.get_mut(&layer_idx)
+    }
+
     /// Check if a layer cache exists (for testing)
     #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::print_stdout)]
