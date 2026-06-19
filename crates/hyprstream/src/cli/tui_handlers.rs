@@ -85,7 +85,7 @@ pub async fn handle_tui_attach(signing_key: &SigningKey, session_id: Option<u32>
         if !si.topic.is_empty() {
             info!(
                 topic = %si.topic,
-                endpoint = %si.sub_endpoint,
+                broadcast_path = %si.broadcast_path,
                 "Stream info received"
             );
         }
@@ -122,7 +122,7 @@ async fn run_attach_loop(
     use hyprstream_rpc::moq_stream::MoqStreamHandle;
     use hyprstream_rpc::streaming::StreamPayload;
 
-    let broadcast_path = stream_info.moq_broadcast_path.clone();
+    let broadcast_path = stream_info.broadcast_path.clone();
     anyhow::ensure!(
         !broadcast_path.is_empty(),
         "TUI service did not return a moq broadcast path — server may be in ZMQ-only mode"
@@ -141,13 +141,13 @@ async fn run_attach_loop(
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
 
-    // #275: dial the producer's networked reach (the TUI service's QUIC `/moq`
+    // #356: dial the producer's networked reach (the TUI service's QUIC `/moq`
     // endpoint) via the shared `MoqStreamHandle::networked` consumer, which prefers
-    // the StreamInfo's reach and falls back to the local moq UDS plane only when no
-    // dialable reach is present. `attach` is a cross-process viewer, so the old
-    // `connect_uds(moq_uds_path)` connected to *this* process's empty plane and
-    // timed out waiting for the producer's broadcast.
-    let reach = stream_info.reach.clone();
+    // the StreamInfo's `announcedAt` reach and falls back to the local moq UDS plane
+    // only when no dialable reach is present. `attach` is a cross-process viewer, so
+    // the old `connect_uds(moq_uds_path)` connected to *this* process's empty plane
+    // and timed out waiting for the producer's broadcast.
+    let reach = stream_info.announced_at.clone();
     let mut handle = MoqStreamHandle::networked(reach, broadcast_path, mac_key, topic);
     let recv_handle = tokio::spawn(async move {
         loop {

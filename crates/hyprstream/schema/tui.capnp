@@ -375,25 +375,29 @@ struct ConnectResult {
   windows @3 :List(WindowInfo);
 }
 
-# Stream connection info
+# Stream connection info.
+#
+# #356: migrated onto the canonical networked reach model (matching the inference
+# StreamInfo in streaming.capnp). The dead UDS/ZMQ fields (`subEndpoint`,
+# `moqUdsPath`, `moqBroadcastPath`) are gone — the same-host UDS fast path is
+# resolved from LOCAL config and is NEVER advertised on the wire. A cross-process
+# viewer dials the first `announcedAt` reach it supports and subscribes to
+# `broadcastPath`.
 struct StreamInfo {
-  # Topic to subscribe to for frame data
+  # Opaque DH-derived topic to subscribe to for frame data.
   topic @0 :Text;
-  # SUB endpoint (ZMQ path; empty when moq is active)
-  subEndpoint @1 :Text;
-  # MAC key for HMAC verification (32 bytes)
-  macKey @2 :Data;
-  # moq broadcast path: "{prefix}/{topic}" (empty when ZMQ is active)
-  moqBroadcastPath @3 :Text;
-  # UDS socket path for the moq streaming plane (empty when ZMQ is active)
-  moqUdsPath @4 :Text;
-  # #275: network-routable ways to reach the producer's moq plane (mirrors the
-  # inference StreamInfo's `announcedAt`). A cross-process viewer dials the first
-  # reach it supports (see `dial_stream`) and subscribes to `moqBroadcastPath`,
-  # rather than connecting to its OWN local moq UDS plane — which only carries the
-  # producer's broadcast when the producer is co-located in the very same process.
-  # Co-located clients ignore this and use the same-host UDS fast path (`moqUdsPath`).
-  reach @5 :List(Destination);
+  # MAC key for the chained-HMAC verification (32 bytes).
+  macKey @1 :Data;
+  # moq broadcast path: "{prefix}/{topic}".
+  broadcastPath @2 :Text;
+  # Network-routable ways to reach the producer's moq plane (mirrors the inference
+  # StreamInfo's `announcedAt`). A cross-process viewer dials the first reach it
+  # supports (see `dial_stream`) and subscribes to `broadcastPath`, rather than
+  # connecting to its OWN local moq UDS plane — which only carries the producer's
+  # broadcast when the producer is co-located in the very same process. Co-located
+  # viewers ignore this and use the same-host UDS fast path resolved from LOCAL
+  # config (never advertised here).
+  announcedAt @3 :List(Destination);
 }
 
 # Window information

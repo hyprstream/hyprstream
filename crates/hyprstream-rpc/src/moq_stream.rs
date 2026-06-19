@@ -41,7 +41,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use moq_net::{BroadcastProducer, Group, OriginConsumer, OriginProducer, Track, TrackProducer};
 use parking_lot::Mutex;
@@ -824,6 +824,87 @@ fn reach_to_transport_config(
     }
 }
 
+/// A live moq subscriber connection resolved from a producer's reach (#356).
+///
+/// Holds the `OriginConsumer` callers `announced_broadcast` + `subscribe_track`
+/// against, plus the underlying `moq_net::Session` which MUST be kept alive for
+/// the duration of the subscription (dropping it tears the transport down).
+pub struct MoqReachConnection {
+    /// The consumer side of the client origin the producer's broadcast is
+    /// announced into. Subscribe to the producer's `broadcast_path` on this.
+    pub consumer: OriginConsumer,
+    /// The live moq session. Held only to keep the transport open; not used
+    /// directly by callers, but must not be dropped before the consumer.
+    _session: moq_net::Session,
+}
+
+/// Resolve a producer's reach into a live moq subscriber connection (#356).
+///
+/// This is the **single** reach→connection resolver shared by every networked
+/// subscriber (the inference [`MoqStreamHandle::networked`] task and the CLI
+/// model-load / `notify subscribe` consumers). It enforces one transport policy
+/// in one place:
+///
+///   1. **Networked first** — dial the first dialable `Destination` in `reach`
+///      (the producer's wire-advertised QUIC/`/moq` endpoint) via
+///      [`crate::dial::dial_stream`]. This is the source of truth: the stream
+///      lives wherever the *producer* advertised, so cross-process / cross-
+///      instance subscribers reach it (fixes #142 + the TUI cross-process bug).
+///   2. **Local UDS fallback** — only when `reach` carries NO dialable network
+///      reach (UDS-only / unit-test deployments) do we connect to *this
+///      process's* local moq UDS plane ([`global_moq_uds_path`]). The UDS path is
+///      resolved from LOCAL knowledge, never from the wire — a same-host fast
+///      path, never advertised.
+///   3. **Fail closed** — if neither is available, return an error rather than
+///      connecting to an empty/wrong plane and timing out.
+///
+/// The UDS fast path is NEVER preferred over a present networked reach: the local
+/// UDS plane only carries the producer's broadcast when the producer is co-located
+/// in this very process, so preferring it silently breaks cross-process delivery.
+pub async fn connect_moq_reach(
+    reach: &[crate::stream_info::Destination],
+) -> Result<MoqReachConnection> {
+    use crate::transport::uds_session::{connect_uds, PLANE_MOQ};
+    use moq_net::{Client as MoqClient, Origin};
+
+    let client_origin = Origin::random().produce();
+    let consumer = client_origin.consume();
+    let moq_client = MoqClient::new().with_consume(client_origin);
+
+    // 1. Networked reach (source of truth): dial the first reach we can resolve.
+    let mut last_err: Option<String> = None;
+    for dest in reach {
+        let Some(cfg) = reach_to_transport_config(dest) else {
+            continue;
+        };
+        match crate::dial::dial_stream(&cfg).await {
+            Ok(stream_session) => match stream_session.connect_moq(&moq_client).await {
+                Ok(session) => return Ok(MoqReachConnection { consumer, _session: session }),
+                Err(e) => last_err = Some(format!("moq handshake: {e}")),
+            },
+            Err(e) => last_err = Some(e.to_string()),
+        }
+    }
+
+    // 2. Local UDS fallback (same-host fast path, resolved from LOCAL config).
+    if let Some(uds) = global_moq_uds_path() {
+        let session = connect_uds(uds, PLANE_MOQ)
+            .await
+            .with_context(|| format!("moq UDS connect {}", uds.display()))?;
+        let session = moq_client
+            .connect(session)
+            .await
+            .map_err(|e| anyhow!("moq UDS handshake: {e}"))?;
+        return Ok(MoqReachConnection { consumer, _session: session });
+    }
+
+    // 3. Fail closed.
+    Err(anyhow!(
+        "no dialable reach in StreamInfo and no local moq UDS plane — cannot subscribe to broadcast{}",
+        last_err.map(|e| format!(" (last dial error: {e})")).unwrap_or_default()
+    ))
+}
+
 /// Networked variant of [`moq_stream_handle_task`]: dial a `/moq`
 /// `web_transport_quinn` session from the `reach` list instead of the UDS
 /// plane, then run the identical subscribe + chained-HMAC verify loop (#274).
@@ -836,41 +917,20 @@ async fn moq_stream_handle_task_networked(
     cancel: tokio_util::sync::CancellationToken,
 ) {
     use crate::streaming::StreamVerifier;
-    use moq_net::{Client as MoqClient, Origin, Track};
+    use moq_net::Track;
 
-    // Dial the first reach we can resolve + connect.
-    let mut session = None;
-    let mut last_err: Option<String> = None;
-    for opt in &reach {
-        let Some(cfg) = reach_to_transport_config(opt) else {
-            continue;
-        };
-        match crate::dial::dial_stream(&cfg).await {
-            Ok(s) => {
-                session = Some(s);
-                break;
-            }
-            Err(e) => last_err = Some(e.to_string()),
-        }
-    }
-    let Some(session) = session else {
-        let msg = last_err.unwrap_or_else(|| "no dialable reach in StreamInfo".to_owned());
-        let _ = tx.send(Err(anyhow!("moq networked dial failed: {msg}"))).await;
-        return;
-    };
-
-    let client_origin = Origin::random().produce();
-    let client_consumer = client_origin.consume();
-    let moq_client = MoqClient::new().with_consume(client_origin);
-    // `session` is a `MoqStreamSession` (quinn or iroh, #282) — dispatch the moq
-    // handshake to the concrete transport.
-    let _session = match session.connect_moq(&moq_client).await {
-        Ok(s) => s,
+    // Resolve the producer's reach into a live moq connection via the single
+    // shared resolver (networked-first, local-UDS fallback, fail-closed; #356).
+    let conn = match connect_moq_reach(&reach).await {
+        Ok(c) => c,
         Err(e) => {
-            let _ = tx.send(Err(anyhow!("moq handshake: {e}"))).await;
+            let _ = tx.send(Err(anyhow!("moq networked dial failed: {e}"))).await;
             return;
         }
     };
+    // Borrow the consumer from `conn`; `conn` (and its session) stays alive for
+    // the whole subscribe loop.
+    let client_consumer = &conn.consumer;
     let bc = match tokio::time::timeout(
         BROADCAST_ANNOUNCE_TIMEOUT,
         client_consumer.announced_broadcast(&broadcast_path),

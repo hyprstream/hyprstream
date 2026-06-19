@@ -1476,14 +1476,15 @@ pub async fn handle_load(
         }).await?;
 
         anyhow::ensure!(
-            !sub_resp.moq_uds_path.is_empty(),
-            "NotificationService did not return a moq UDS path — server may be in ZMQ-only mode"
+            !sub_resp.broadcast_path.is_empty(),
+            "NotificationService did not return a moq broadcast path — server may be in ZMQ-only mode"
         );
 
         debug!(
             subscription_id = %sub_resp.subscription_id,
             topic = %sub_resp.assigned_topic,
-            uds_path = %sub_resp.moq_uds_path,
+            broadcast_path = %sub_resp.broadcast_path,
+            reach_count = sub_resp.announced_at.len(),
             "Subscribed to notification stream via moq"
         );
 
@@ -1540,8 +1541,8 @@ pub async fn handle_load(
         );
 
         let result = wait_for_model_notification(
-            &sub_resp.moq_uds_path,
-            &sub_resp.moq_broadcast_path,
+            &sub_resp.announced_at,
+            &sub_resp.broadcast_path,
             &sub_resp.assigned_topic,
             &decryptor,
             model_ref_str,
@@ -1577,9 +1578,15 @@ enum NotificationOutcome {
     Failed { error: String },
 }
 
-/// Wait for a model.loaded or model.failed notification via moq UDS.
+/// Wait for a model.loaded or model.failed notification over the moq plane.
+///
+/// #142/#356: consumes the NotificationService's NETWORKED reach (`announcedAt`)
+/// via the shared [`connect_moq_reach`] resolver, so a model loaded on a DIFFERENT
+/// PDS instance is reached by dialing the producer's QUIC `/moq` endpoint. The
+/// old UDS-only path connected to *this* process's local moq plane, which never
+/// carries another instance's broadcast — silently failing cross-instance.
 async fn wait_for_model_notification(
-    uds_path: &str,
+    reach: &[hyprstream_rpc::stream_info::Destination],
     broadcast_path: &str,
     topic: &str,
     decryptor: &hyprstream_rpc::crypto::notification::BroadcastDecryptor,
@@ -1587,19 +1594,13 @@ async fn wait_for_model_notification(
     deadline: tokio::time::Instant,
 ) -> Result<NotificationOutcome> {
     use crate::events::{EventEnvelope, EventPayload};
-    use hyprstream_rpc::moq_stream::STREAM_TRACK;
-    use hyprstream_rpc::transport::uds_session::{connect_uds, PLANE_MOQ};
-    use moq_net::{Client as MoqClient, Origin};
+    use hyprstream_rpc::moq_stream::{connect_moq_reach, STREAM_TRACK};
 
-    let session = connect_uds(uds_path, PLANE_MOQ).await
-        .context("moq UDS connect for notifications")?;
-    let client_origin = Origin::random().produce();
-    let client_consumer = client_origin.consume();
-    let _session = MoqClient::new().with_consume(client_origin).connect(session).await
-        .context("moq handshake for notifications")?;
+    let conn = connect_moq_reach(reach).await
+        .context("moq connect for notifications")?;
     let bc = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        client_consumer.announced_broadcast(broadcast_path),
+        conn.consumer.announced_broadcast(broadcast_path),
     ).await
     .context("timeout waiting for notification broadcast")?
     .ok_or_else(|| anyhow::anyhow!("notification broadcast {} not found", broadcast_path))?;
@@ -1783,30 +1784,26 @@ async fn handle_notify_subscribe(
     }).await?;
 
     anyhow::ensure!(
-        !sub_resp.moq_uds_path.is_empty(),
-        "NotificationService did not return a moq UDS path — server may be in ZMQ-only mode"
+        !sub_resp.broadcast_path.is_empty(),
+        "NotificationService did not return a moq broadcast path — server may be in ZMQ-only mode"
     );
 
     eprintln!("Subscribed to: {}", pattern);
     eprintln!("  Subscription ID: {}", sub_resp.subscription_id);
     eprintln!("  Topic: {}", sub_resp.assigned_topic);
 
-    use hyprstream_rpc::moq_stream::STREAM_TRACK;
-    use hyprstream_rpc::transport::uds_session::{connect_uds, PLANE_MOQ};
-    use moq_net::{Client as MoqClient, Origin};
+    use hyprstream_rpc::moq_stream::{connect_moq_reach, STREAM_TRACK};
 
-    let session = connect_uds(&sub_resp.moq_uds_path, PLANE_MOQ).await
-        .context("moq UDS connect for notifications")?;
-    let client_origin = Origin::random().produce();
-    let client_consumer = client_origin.consume();
-    let _session = MoqClient::new().with_consume(client_origin).connect(session).await
-        .context("moq handshake for notifications")?;
+    // #142/#356: dial the NotificationService's networked reach (or local UDS
+    // fast path) via the shared resolver, so cross-instance notifications work.
+    let conn = connect_moq_reach(&sub_resp.announced_at).await
+        .context("moq connect for notifications")?;
     let bc = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        client_consumer.announced_broadcast(&sub_resp.moq_broadcast_path),
+        conn.consumer.announced_broadcast(&sub_resp.broadcast_path),
     ).await
     .context("timeout waiting for notification broadcast")?
-    .ok_or_else(|| anyhow::anyhow!("notification broadcast {} not found", sub_resp.moq_broadcast_path))?;
+    .ok_or_else(|| anyhow::anyhow!("notification broadcast {} not found", sub_resp.broadcast_path))?;
     let mut track = bc.subscribe_track(&moq_net::Track::new(STREAM_TRACK))
         .context("subscribe_track for notifications")?;
 
