@@ -652,9 +652,14 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
 fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating WorkerService");
 
-    use hyprstream_workers::config::{BackendType, ImageConfig, PoolConfig};
+    use hyprstream_workers::config::{BackendType, PoolConfig};
+    #[cfg(feature = "kata-vm")]
+    use hyprstream_workers::config::ImageConfig;
+    #[cfg(feature = "kata-vm")]
     use hyprstream_workers::image::RafsStore;
-    use hyprstream_workers::{WorkerService, SandboxBackend, KataBackend, NspawnBackend, NspawnConfig};
+    #[cfg(feature = "kata-vm")]
+    use hyprstream_workers::KataBackend;
+    use hyprstream_workers::{WorkerService, SandboxBackend, NspawnBackend, NspawnConfig};
 
     let config = load_config();
     let worker_quic_port = config.worker.as_ref().and_then(|w| w.quic_port);
@@ -685,6 +690,8 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         ..PoolConfig::default()
     };
 
+    // RAFS/nydus image store is only built for the VM path (kata-vm feature).
+    #[cfg(feature = "kata-vm")]
     let image_config = ImageConfig {
         blobs_dir: data_dir.join("images/blobs"),
         bootstrap_dir: data_dir.join("images/bootstrap"),
@@ -694,11 +701,20 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         ..ImageConfig::default()
     };
 
+    #[cfg(feature = "kata-vm")]
     let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
 
-    // Construct the sandbox backend based on configuration
+    // Construct the sandbox backend based on configuration.
     let backend: Arc<dyn SandboxBackend> = match backend_type {
+        #[cfg(feature = "kata-vm")]
         BackendType::Kata => Arc::new(KataBackend::new(image_config, Arc::clone(&rafs_store))),
+        #[cfg(not(feature = "kata-vm"))]
+        BackendType::Kata => {
+            return Err(anyhow::anyhow!(
+                "worker backend `kata` requires the `kata-vm` feature; \
+                 this binary was built without kata-vm support (use the `nspawn` backend)"
+            ));
+        }
         BackendType::Nspawn => Arc::new(NspawnBackend::new(NspawnConfig::default())),
     };
 
@@ -711,6 +727,7 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let mut worker_service = WorkerService::new(
         pool_config,
         backend,
+        #[cfg(feature = "kata-vm")]
         rafs_store,
         ctx.transport("worker", SocketKind::Rep),
         sk.clone(),

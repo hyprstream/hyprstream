@@ -27,6 +27,7 @@ use crate::events::{
     serialize_container_started, serialize_container_stopped,
     serialize_sandbox_started, serialize_sandbox_stopped,
 };
+#[cfg(feature = "kata-vm")]
 use crate::image::RafsStore;
 // Import generated wire types (canonical OCI-aligned names)
 use crate::generated::worker_client::{
@@ -65,7 +66,9 @@ pub struct WorkerService {
     /// Sandbox pool for VM management
     sandbox_pool: Arc<SandboxPool>,
 
-    /// RAFS store for image management
+    /// RAFS store for image management (VM path only). Without `kata-vm`,
+    /// CRI image operations return a clear "built without kata-vm support" error.
+    #[cfg(feature = "kata-vm")]
     rafs_store: Arc<RafsStore>,
 
     /// Active containers (container_id -> Container)
@@ -102,7 +105,9 @@ impl WorkerService {
     pub fn new(
         pool_config: PoolConfig,
         backend: Arc<dyn super::backend::SandboxBackend>,
-        rafs_store: Arc<RafsStore>,
+        // RAFS image store is only meaningful for the VM/CH path; the parameter
+        // is compiled away when `kata-vm` is disabled.
+        #[cfg(feature = "kata-vm")] rafs_store: Arc<RafsStore>,
         transport: TransportConfig,
         signing_key: SigningKey,
     ) -> AnyhowResult<Self> {
@@ -114,6 +119,7 @@ impl WorkerService {
         let stream_channel = Arc::new(StreamChannel::new(signing_key.clone()));
         Ok(Self {
             sandbox_pool,
+            #[cfg(feature = "kata-vm")]
             rafs_store,
             containers: RwLock::new(HashMap::new()),
             container_sandbox_map: RwLock::new(HashMap::new()),
@@ -1233,47 +1239,97 @@ impl ContainerHandler for WorkerService {
 
 }
 
+// CRI image operations are backed by the RAFS/nydus store, which only compiles
+// under `kata-vm`. When the feature is off the handlers stay wired (the RPC
+// surface is unchanged) but return a clear "built without kata-vm support" error
+// instead of failing to compile.
+#[cfg(not(feature = "kata-vm"))]
+fn image_ops_unsupported<T>() -> AnyhowResult<T> {
+    Err(anyhow::anyhow!(
+        "CRI image operations require the `kata-vm` feature (RAFS/nydus image store); \
+         this binary was built without kata-vm support"
+    ))
+}
+
 #[async_trait::async_trait(?Send)]
 impl ImageHandler for WorkerService {
     async fn handle_list(&self, _ctx: &EnvelopeContext, _request_id: u64, filter: &ImageFilter) -> AnyhowResult<Vec<ImageInfo>> {
         let _ = filter; // filter not yet used
-        let images = self.rafs_store.list_images().await?;
-        Ok(images)
+        #[cfg(feature = "kata-vm")]
+        {
+            let images = self.rafs_store.list_images().await?;
+            Ok(images)
+        }
+        #[cfg(not(feature = "kata-vm"))]
+        {
+            image_ops_unsupported()
+        }
     }
 
     async fn handle_status(&self, _ctx: &EnvelopeContext, _request_id: u64, request: &ImageStatusRequest) -> AnyhowResult<ImageStatusResult> {
-        let image_ref = &request.image.image;
-        let status = self.rafs_store.image_status(image_ref, request.verbose).await?;
-        Ok(status)
+        #[cfg(feature = "kata-vm")]
+        {
+            let image_ref = &request.image.image;
+            let status = self.rafs_store.image_status(image_ref, request.verbose).await?;
+            Ok(status)
+        }
+        #[cfg(not(feature = "kata-vm"))]
+        {
+            let _ = request;
+            image_ops_unsupported()
+        }
     }
 
     async fn handle_pull(&self, _ctx: &EnvelopeContext, _request_id: u64, data: &PullImageRequest) -> AnyhowResult<String> {
-        let image_ref = &data.image.image;
-        let auth = if !data.auth.username.is_empty() {
-            Some(crate::image::AuthConfig {
-                username: data.auth.username.clone(),
-                password: data.auth.password.clone(),
-                auth: String::new(),
-                server_address: String::new(),
-                identity_token: String::new(),
-                registry_token: String::new(),
-            })
-        } else {
-            None
-        };
-        let image_id = self.rafs_store.pull_with_auth(image_ref, auth.as_ref()).await?;
-        Ok(image_id)
+        #[cfg(feature = "kata-vm")]
+        {
+            let image_ref = &data.image.image;
+            let auth = if !data.auth.username.is_empty() {
+                Some(crate::image::AuthConfig {
+                    username: data.auth.username.clone(),
+                    password: data.auth.password.clone(),
+                    auth: String::new(),
+                    server_address: String::new(),
+                    identity_token: String::new(),
+                    registry_token: String::new(),
+                })
+            } else {
+                None
+            };
+            let image_id = self.rafs_store.pull_with_auth(image_ref, auth.as_ref()).await?;
+            Ok(image_id)
+        }
+        #[cfg(not(feature = "kata-vm"))]
+        {
+            let _ = data;
+            image_ops_unsupported()
+        }
     }
 
     async fn handle_remove(&self, _ctx: &EnvelopeContext, _request_id: u64, data: &ImageSpec) -> AnyhowResult<()> {
-        let image_ref = &data.image;
-        self.rafs_store.remove_image(image_ref).await?;
-        Ok(())
+        #[cfg(feature = "kata-vm")]
+        {
+            let image_ref = &data.image;
+            self.rafs_store.remove_image(image_ref).await?;
+            Ok(())
+        }
+        #[cfg(not(feature = "kata-vm"))]
+        {
+            let _ = data;
+            image_ops_unsupported()
+        }
     }
 
     async fn handle_fs_info(&self, _ctx: &EnvelopeContext, _request_id: u64) -> AnyhowResult<Vec<FilesystemUsage>> {
-        let usage = self.rafs_store.fs_info().await?;
-        Ok(usage)
+        #[cfg(feature = "kata-vm")]
+        {
+            let usage = self.rafs_store.fs_info().await?;
+            Ok(usage)
+        }
+        #[cfg(not(feature = "kata-vm"))]
+        {
+            image_ops_unsupported()
+        }
     }
 }
 
@@ -1336,7 +1392,9 @@ impl RequestService for WorkerService {
     }
 }
 
-#[cfg(test)]
+// These tests exercise the VM lifecycle (RafsStore + KataBackend), so they only
+// build/run under `kata-vm`.
+#[cfg(all(test, feature = "kata-vm"))]
 #[allow(clippy::print_stderr)]
 mod tests {
     use super::*;

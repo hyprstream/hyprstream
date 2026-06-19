@@ -15,7 +15,8 @@ hyprstream-vfs = { path = "../hyprstream-vfs" }
 # FS-A's vhost-user-fs server (native-only): serves a composed per-sandbox
 # Namespace to a Cloud Hypervisor guest. FS-D wires the compose→serve→attach
 # flow. Native-only (vhost-user-fs/fuse-backend-rs transport are Linux-only).
-hyprstream-vfs-server = { path = "../hyprstream-vfs-server" }
+# Gated behind `kata-vm`: only the VM/CH ShareFs path attaches this server.
+hyprstream-vfs-server = { path = "../hyprstream-vfs-server", optional = true }
 hyprstream-tcl = { path = "../hyprstream-tcl" }
 
 # Async runtime
@@ -54,27 +55,29 @@ which = { workspace = true }
 # D-Bus integration (optional, for container D-Bus proxy)
 zbus = { version = "4", features = ["tokio"], optional = true }
 
-# Nydus libraries (Dragonfly-native blob fetching)
+# Nydus libraries (Dragonfly-native blob fetching) — gated behind `kata-vm`.
+# Only the RAFS image-pull + virtiofs path (consumed by the Kata/CH VM backend)
+# needs these; the lightweight nspawn backend bind-mounts the host root.
 # NOTE: Using git deps because published crates.io versions have API mismatch
 # (nydus-storage 0.7.1 references field missing from nydus-api 0.4.0)
-nydus-api = { git = "https://github.com/dragonflyoss/nydus", tag = "v2.4.0" }
-nydus-storage = { git = "https://github.com/dragonflyoss/nydus", tag = "v2.4.0", features = [
+nydus-api = { git = "https://github.com/dragonflyoss/nydus", tag = "v2.4.0", optional = true }
+nydus-storage = { git = "https://github.com/dragonflyoss/nydus", tag = "v2.4.0", optional = true, features = [
     "backend-registry",
     "backend-localfs",
 ] }
 # FS-B0: in-process RAFS bootstrap builder. TarballBuilder converts pulled OCI
 # layer tarballs into a RAFS bootstrap (.meta) + dedup data blobs, no external
 # nydus-image binary required.
-nydus-builder = { git = "https://github.com/dragonflyoss/nydus", tag = "v2.4.0" }
-nydus-rafs = { git = "https://github.com/dragonflyoss/nydus", tag = "v2.4.0" }
-nydus-utils = { git = "https://github.com/dragonflyoss/nydus", tag = "v2.4.0" }
+nydus-builder = { git = "https://github.com/dragonflyoss/nydus", tag = "v2.4.0", optional = true }
+nydus-rafs = { git = "https://github.com/dragonflyoss/nydus", tag = "v2.4.0", optional = true }
+nydus-utils = { git = "https://github.com/dragonflyoss/nydus", tag = "v2.4.0", optional = true }
 
 # Phase 2: VM Runtime (nydus-service for virtiofs)
-nydus-service = { git = "https://github.com/dragonflyoss/nydus", tag = "v2.4.0" }
+nydus-service = { git = "https://github.com/dragonflyoss/nydus", tag = "v2.4.0", optional = true }
 # 0.13 to unify with nydus (`nydus-rafs` v2.4.0 builds against 0.13.1): FS-B
 # (#363) wraps the in-process RAFS `Rafs` as an overlay lower, so its `Layer`
 # type must match `hyprstream-vfs`'s `BoxedLayer`.
-fuse-backend-rs = "0.13"
+fuse-backend-rs = { version = "0.13", optional = true }
 
 # Minimal HTTP for manifest fetching only (blobs go through nydus-storage)
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
@@ -91,16 +94,36 @@ blake3 = { workspace = true }
 rand = { workspace = true }
 zeroize = { workspace = true }
 
-# Kata Containers runtime-rs (hypervisor abstraction)
-kata-hypervisor = { git = "https://github.com/kata-containers/kata-containers", tag = "3.31.0", package = "hypervisor", features = ["cloud-hypervisor"] }
-kata-types = { git = "https://github.com/kata-containers/kata-containers", tag = "3.31.0" }
-kata-sys-util = { git = "https://github.com/kata-containers/kata-containers", tag = "3.31.0" }
-ch-config = { git = "https://github.com/kata-containers/kata-containers", tag = "3.31.0" }
+# Kata Containers runtime-rs (hypervisor abstraction) — gated behind `kata-vm`.
+kata-hypervisor = { git = "https://github.com/kata-containers/kata-containers", tag = "3.31.0", package = "hypervisor", features = ["cloud-hypervisor"], optional = true }
+kata-types = { git = "https://github.com/kata-containers/kata-containers", tag = "3.31.0", optional = true }
+kata-sys-util = { git = "https://github.com/kata-containers/kata-containers", tag = "3.31.0", optional = true }
+ch-config = { git = "https://github.com/kata-containers/kata-containers", tag = "3.31.0", optional = true }
 
 [features]
 default = []
-# Enable Dragonball built-in VMM support (alternative to cloud-hypervisor)
-dragonball = ["kata-hypervisor/dragonball"]
+# Kata/Cloud-Hypervisor VM backend + the RAFS/nydus image-pull + virtiofs
+# toolchain it consumes. Opt-in so casual users who only want the lightweight
+# `systemd-nspawn` backend don't compile the entire VM stack. When this feature
+# is off, `BackendType::Kata` selection and CRI image ops return a clean
+# runtime error rather than failing to compile.
+kata-vm = [
+    "dep:kata-hypervisor",
+    "dep:kata-types",
+    "dep:kata-sys-util",
+    "dep:ch-config",
+    "dep:nydus-api",
+    "dep:nydus-storage",
+    "dep:nydus-builder",
+    "dep:nydus-rafs",
+    "dep:nydus-utils",
+    "dep:nydus-service",
+    "dep:fuse-backend-rs",
+    "dep:hyprstream-vfs-server",
+]
+# Enable Dragonball built-in VMM support (alternative to cloud-hypervisor).
+# Implies `kata-vm` since it tunes the kata hypervisor abstraction.
+dragonball = ["kata-vm", "kata-hypervisor/dragonball"]
 # Enable D-Bus bridge for container access to host D-Bus services
 dbus = ["dep:zbus"]
 # Systemd integration (socket activation, service units)
