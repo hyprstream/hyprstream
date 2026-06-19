@@ -32,7 +32,9 @@
 
 mod client;
 mod manifest;
-mod rafs_builder;
+// `pub(crate)` so sibling-module tests (e.g. runtime::sandbox_fs, FS-D #365)
+// can synthesize RAFS images. The builder fn stays crate-internal.
+pub(crate) mod rafs_builder;
 // FS-B (#363): per-sandbox RootfsMount = OverlayFs(in-process RAFS lower +
 // writable upper). Native-only (the overlay/RAFS FileSystem stack is Linux).
 #[cfg(not(target_arch = "wasm32"))]

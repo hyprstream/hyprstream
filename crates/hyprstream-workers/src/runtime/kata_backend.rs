@@ -24,14 +24,15 @@ use crate::image::RafsStore;
 use super::backend::{SandboxBackend, SandboxHandle};
 use super::client::PodSandboxConfig;
 use super::sandbox::PodSandbox;
+use super::sandbox_fs::{SandboxFs, SandboxFsServer, VFS_SOCKET_NAME};
 use super::virtiofs::SandboxVirtiofs;
+use hyprstream_vfs::{Subject, SyntheticNode};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Handle
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Kata-specific state stored on each `PodSandbox`.
-#[derive(Debug)]
 pub struct KataHandle {
     /// The Kata hypervisor handle for VM lifecycle management.
     pub hypervisor: Arc<dyn Hypervisor>,
@@ -41,6 +42,22 @@ pub struct KataHandle {
     pub virtiofs_daemon: Option<Arc<SandboxVirtiofs>>,
     /// Path to the virtiofs socket.
     pub virtiofs_socket: Option<PathBuf>,
+    /// Per-sandbox composed VFS server (FS-D, #365). When set, the guest's
+    /// filesystem is the hyprstream VFS (rootfs + injected mounts) served by
+    /// `hyprstream-vfs-server` rather than the external `nydusd` RAFS share.
+    /// Held for the VM's lifetime so the serving thread + injected registries
+    /// outlive the guest; dropped on sandbox teardown.
+    pub vfs_server: Option<SandboxFsServer>,
+}
+
+impl std::fmt::Debug for KataHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KataHandle")
+            .field("api_socket", &self.api_socket)
+            .field("virtiofs_socket", &self.virtiofs_socket)
+            .field("vfs_socket", &self.vfs_server.as_ref().map(SandboxFsServer::socket_path))
+            .finish_non_exhaustive()
+    }
 }
 
 impl SandboxHandle for KataHandle {
@@ -213,6 +230,63 @@ impl KataBackend {
         Ok(())
     }
 
+    /// Annotation key carrying the sandbox's policy principal (the [`Subject`]
+    /// at the VFS Mount boundary, #353/#319/#328). When absent, the sandbox id is
+    /// used as a stable per-sandbox principal so isolation still holds.
+    const SUBJECT_ANNOTATION: &'static str = "hyprstream.io/subject";
+
+    /// Resolve the [`Subject`] this sandbox's VFS is served under.
+    fn sandbox_subject(sandbox: &PodSandbox, annotations: &HashMap<String, String>) -> Subject {
+        annotations
+            .get(Self::SUBJECT_ANNOTATION)
+            .filter(|s| !s.is_empty())
+            .map(Subject::new)
+            .unwrap_or_else(|| Subject::new(sandbox.id.clone()))
+    }
+
+    /// Compose the per-sandbox VFS namespace (rootfs + injected mounts) and serve
+    /// it over a per-sandbox Unix socket (FS-D, #365).
+    ///
+    /// Returns the running [`SandboxFsServer`] whose socket the caller attaches to
+    /// CH. The namespace is forked per sandbox and bound to `subject`, so it
+    /// exposes only this sandbox's rootfs + injected paths — never another
+    /// sandbox's tree.
+    ///
+    /// `serve` blocks, so it runs on a dedicated thread inside `serve_on`; we
+    /// pass the current tokio runtime handle for the down-adapter's async→sync
+    /// bridge. Compose is CPU/IO-bound (RAFS load), so we run it on a blocking
+    /// thread to avoid stalling the async runtime.
+    async fn compose_and_serve_vfs(
+        &self,
+        sandbox: &PodSandbox,
+        image_id: &str,
+        subject: Subject,
+    ) -> Result<SandboxFsServer> {
+        let socket_path = sandbox.sandbox_path().join(VFS_SOCKET_NAME);
+        let rt = tokio::runtime::Handle::current();
+        let rafs_store = self.rafs_store.clone();
+        let image_id = image_id.to_owned();
+        let sandbox_dir = sandbox.sandbox_path().clone();
+
+        // RAFS load + overlay setup is blocking; do it off the async executor.
+        tokio::task::spawn_blocking(move || {
+            let fs = SandboxFs::compose(
+                &rafs_store,
+                &image_id,
+                &sandbox_dir,
+                subject,
+                // Models / deltas injected listings: empty mount points for now
+                // (the worker runtime populates them per tenant). The mount
+                // points exist so the guest sees /models and /deltas.
+                SyntheticNode::dir(),
+                SyntheticNode::dir(),
+            )?;
+            fs.serve_on(socket_path, rt)
+        })
+        .await
+        .map_err(|e| WorkerError::SandboxCreationFailed(format!("VFS compose task join: {e}")))?
+    }
+
     /// Generate cloud-init ISO for a sandbox.
     async fn generate_cloud_init_iso(sandbox: &PodSandbox, iso_path: &Path) -> Result<()> {
         let sandbox_runtime_dir = iso_path
@@ -317,21 +391,24 @@ impl SandboxBackend for KataBackend {
             Self::generate_cloud_init_iso(sandbox, &cloud_init_iso).await?;
         }
 
-        let mut virtiofs_daemon = None;
-        let mut virtiofs_sock = None;
+        // FS-D (#365): compose a per-sandbox VFS (rootfs at `/` from FS-B's
+        // OverlayFs(RAFS lower + per-sandbox writable upper) + the native
+        // injected mounts `/stream`/`/models`/`/deltas`), forked into its own
+        // Namespace bound to this sandbox's Subject, and serve it over a
+        // per-sandbox Unix socket via FS-A's `hyprstream-vfs-server`. The guest
+        // mounts this composed VFS — no external `nydusd`. Each sandbox's
+        // namespace/socket/Subject/writable-upper is private, so sandbox A's
+        // namespace cannot expose sandbox B's rootfs or injected paths.
+        let virtiofs_daemon: Option<Arc<SandboxVirtiofs>> = None;
+        let mut vfs_server: Option<SandboxFsServer> = None;
+        let mut share_socket: Option<PathBuf> = None;
         if let Some(ref image_id) = sandbox.image_id {
-            let mut virtiofs = SandboxVirtiofs::new(
-                sandbox.id.clone(),
-                virtiofs_socket.clone(),
-                &self.rafs_store,
-                image_id.clone(),
-            )
-            .await?;
-
-            virtiofs.start(&self.rafs_store, &self.image_config).await?;
-            virtiofs_sock = Some(virtiofs_socket.clone());
-            virtiofs_daemon = Some(Arc::new(virtiofs));
+            let subject = Self::sandbox_subject(sandbox, annotations);
+            let server = self.compose_and_serve_vfs(sandbox, image_id, subject).await?;
+            share_socket = Some(server.socket_path().to_path_buf());
+            vfs_server = Some(server);
         }
+        let virtiofs_sock = share_socket.clone();
 
         let hypervisor =
             Self::create_hypervisor(pool_config, sandbox, &api_socket, &virtiofs_socket).await?;
@@ -341,10 +418,9 @@ impl SandboxBackend for KataBackend {
             .await
             .map_err(|e| WorkerError::VmStartFailed(format!("failed to prepare VM: {e}")))?;
 
-        // Attach the vhost-user-fs share (RAFS image rootfs and/or the
-        // hyprstream-vfs-server VFS down-adapter) as a CH ShareFs device, after
-        // prepare_vm and before start_vm so it is folded into the boot VmConfig.
-        if let Some(ref socket) = virtiofs_sock {
+        // Attach the composed VFS socket as a CH ShareFs device, after prepare_vm
+        // and before start_vm so it is folded into the boot VmConfig.
+        if let Some(ref socket) = share_socket {
             Self::attach_share_fs(&hypervisor, &sandbox.id, socket, "hyprstream-vfs").await?;
         }
 
@@ -367,6 +443,7 @@ impl SandboxBackend for KataBackend {
             api_socket,
             virtiofs_daemon,
             virtiofs_socket: virtiofs_sock,
+            vfs_server,
         });
 
         Ok(handle)
@@ -443,6 +520,9 @@ impl SandboxBackend for KataBackend {
                     api_socket: kata.api_socket.clone(),
                     virtiofs_daemon: None,
                     virtiofs_socket: None,
+                    // The per-sandbox VFS server is not reusable across resets;
+                    // a recycled sandbox composes a fresh one on next start.
+                    vfs_server: None,
                 });
                 sandbox.backend_handle = Some(fresh);
             }
@@ -543,6 +623,7 @@ mod tests {
             api_socket: sandbox_path.join("test.sock"),
             virtiofs_daemon: None,
             virtiofs_socket: Some(sandbox_path.join("virtiofs.sock")),
+            vfs_server: None,
         })
     }
 
