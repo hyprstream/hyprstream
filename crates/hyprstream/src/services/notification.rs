@@ -6,8 +6,9 @@
 //!
 //! # Flow
 //!
-//! 1. Subscriber calls `subscribe(scope, ephemeral_pubkey)` → NS registers
-//!    topic with StreamService, returns topic + endpoint
+//! 1. Subscriber calls `subscribe(scope, ephemeral_pubkey)` → NS allocates a
+//!    DH-derived topic and returns topic + endpoint (the moq stream plane
+//!    publishes topics lazily, so no pre-registration is needed)
 //! 2. Publisher calls `publishIntent(scope, publisher_pubkey)` → NS returns
 //!    rerandomized (blinded) subscriber pubkeys
 //! 3. Publisher encrypts payload, wraps data_key per subscriber, calls `deliver`
@@ -293,7 +294,7 @@ pub struct NotificationService {
     subscribers: Arc<RwLock<SubscriberRegistry>>,
     pending_intents: Arc<RwLock<HashMap<String, PendingIntent>>>,
     delivery_counter: AtomicU64,
-    /// StreamChannel for topic registration and publishing to StreamService.
+    /// StreamChannel for publishing capsules to subscriber topics on the moq stream plane.
     stream_channel: StreamChannel,
     // Auth
     signing_key: Arc<SigningKey>,
@@ -426,17 +427,8 @@ impl NotificationHandler for NotificationService {
         let topic = self.generate_topic();
         let subject = ctx.subject().to_string();
 
-        // Pre-register topic with StreamService so messages are buffered
-        // even before the subscriber connects their SUB socket.
-        let expiry = chrono::Utc::now().timestamp() + ttl_secs as i64;
-        if let Err(e) = self.stream_channel.register_topic(&topic, expiry, None).await {
-            warn!("Failed to register topic {} with StreamService: {}", topic, e);
-            return Ok(NotificationResponseVariant::Error(ErrorInfo {
-                message: "Failed to register notification topic".to_owned(),
-                code: "STREAM_ERROR".to_owned(),
-                details: e.to_string(),
-            }));
-        }
+        // Topics need no pre-registration on the moq stream plane: the
+        // `MoqStreamPublisher` publishes them lazily on the first frame.
 
         let subscriber = Subscriber {
             id: sub_id,

@@ -305,20 +305,6 @@ struct StreamError {
 }
 
 # =============================================================================
-# Reconnection / Resume
-# =============================================================================
-
-# Stream resume request - for retransmission after disconnect
-#
-# Client sends the last HMAC it successfully verified. StreamService finds
-# this HMAC in its buffer and resends all subsequent chunks. This provides
-# zero-knowledge of sequence numbers - the HMAC chain is the ordering proof.
-struct StreamResume {
-  topic @0 :Text;           # Topic to resume
-  resumeFromHmac @1 :Data;  # Last verified HMAC (server resends chunks after this)
-}
-
-# =============================================================================
 # Control Channel (Consumer -> Producer)
 # =============================================================================
 
