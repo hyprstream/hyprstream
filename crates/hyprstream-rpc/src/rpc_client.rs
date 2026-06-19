@@ -143,6 +143,18 @@ pub struct RpcClientImpl<S: Signer, T: Transport + 'static> {
     pub server_verifying_key: Option<VerifyingKey>,
     token_provider: Option<TokenProviderBox>,
     request_id: AtomicU64,
+    /// Per-client response-verify policy override (#275/#277). `None` means "not
+    /// explicitly set" — in that case `unwrap_response` consults the process-
+    /// global response verify config ([`crate::envelope::global_response_verify_policy`]),
+    /// which is fail-closed `Hybrid` when the daemon installed it (or when
+    /// uninstalled in production). `Some(_)` pins the policy for this client,
+    /// bypassing the global default (advanced / tests).
+    response_verify_policy: Option<crate::crypto::CryptoPolicy>,
+    /// Per-client kid-anchored ML-DSA-65 trust store used to resolve the server's
+    /// PQ key for `ResponseEnvelope` verification (required under `Hybrid`). `None`
+    /// falls back to the process-global response store
+    /// ([`crate::envelope::global_response_pq_store`]).
+    response_pq_store: Option<std::sync::Arc<dyn crate::envelope::PqTrustStore>>,
 }
 
 impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
@@ -157,7 +169,32 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             server_verifying_key,
             token_provider: None,
             request_id: AtomicU64::new(1),
+            response_verify_policy: None,
+            response_pq_store: None,
         }
+    }
+
+    /// Enforce Hybrid (EdDSA + ML-DSA-65) verification of responses (#275),
+    /// anchoring the server's ML-DSA-65 key via `pq_store`. Under this policy a
+    /// classical-only, stripped-outer, self-cert, or unanchored response is
+    /// REJECTED (fail-closed, no silent downgrade). Mirrors the request-side
+    /// Hybrid verify config.
+    pub fn with_response_pq_store(
+        mut self,
+        pq_store: std::sync::Arc<dyn crate::envelope::PqTrustStore>,
+    ) -> Self {
+        self.response_pq_store = Some(pq_store);
+        self.response_verify_policy = Some(crate::crypto::CryptoPolicy::Hybrid);
+        self
+    }
+
+    /// Set the response-verify policy explicitly (advanced). Under `Hybrid` a
+    /// PQ trust store MUST also be set via [`Self::with_response_pq_store`].
+    /// Setting this pins the policy for this client and bypasses the process-
+    /// global response default consulted by [`Self::unwrap_response`].
+    pub fn with_response_verify_policy(mut self, policy: crate::crypto::CryptoPolicy) -> Self {
+        self.response_verify_policy = Some(policy);
+        self
     }
 
     /// Set a dynamic token provider called on every RPC request.
@@ -190,10 +227,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         let signed_bytes = self.sign_envelope(request_id, payload, None, self.effective_jwt(), None).await?;
         let timeout = self.calculate_timeout();
         let response_bytes = self.transport.send(signed_bytes, timeout).await?;
-        let (_req_id, inner) = envelope::unwrap_response(
-            &response_bytes,
-            self.server_verifying_key.as_ref(),
-        )?;
+        let (_req_id, inner) = self.unwrap_response(&response_bytes)?;
         Ok(inner)
     }
 
@@ -211,10 +245,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             .await?;
         let timeout = self.calculate_timeout();
         let response_bytes = self.transport.send(signed_bytes, timeout).await?;
-        let (_req_id, inner) = envelope::unwrap_response(
-            &response_bytes,
-            self.server_verifying_key.as_ref(),
-        )?;
+        let (_req_id, inner) = self.unwrap_response(&response_bytes)?;
         Ok(inner)
     }
 
@@ -234,10 +265,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             .await?;
         let timeout = self.calculate_timeout();
         let response_bytes = self.transport.send(signed_bytes, timeout).await?;
-        let (_req_id, inner) = envelope::unwrap_response(
-            &response_bytes,
-            self.server_verifying_key.as_ref(),
-        )?;
+        let (_req_id, inner) = self.unwrap_response(&response_bytes)?;
         Ok(inner)
     }
 
@@ -257,16 +285,64 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             .await?;
         let timeout = self.calculate_timeout();
         let response_bytes = self.transport.send(signed_bytes, timeout).await?;
-        let (_req_id, inner) = envelope::unwrap_response(
-            &response_bytes,
-            self.server_verifying_key.as_ref(),
-        )?;
+        let (_req_id, inner) = self.unwrap_response(&response_bytes)?;
         Ok(inner)
     }
 
     /// Get the next monotonically increasing request ID.
     pub fn next_id(&self) -> u64 {
         self.request_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Unwrap + verify a `ResponseEnvelope` (#275/#277).
+    ///
+    /// Resolves the effective response-verify policy and PQ trust store: a
+    /// per-client override (set via [`Self::with_response_pq_store`] /
+    /// [`Self::with_response_verify_policy`]) wins; otherwise the process-global
+    /// response default ([`envelope::global_response_verify_policy`] +
+    /// [`envelope::global_response_pq_store`]) is consulted. That global default
+    /// is fail-closed `Hybrid` in production — symmetric to the request-side
+    /// `global_verify_policy` — so a classical-only / stripped response is
+    /// rejected by default unless an operator opted into the `classical` escape
+    /// hatch. Under `Hybrid` the server's kid-anchored ML-DSA-65 layer is
+    /// required (no silent downgrade).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn unwrap_response(&self, response_bytes: &[u8]) -> Result<(u64, Vec<u8>)> {
+        let policy = self
+            .response_verify_policy
+            .unwrap_or_else(envelope::global_response_verify_policy);
+        // Prefer the per-client store; else the process-global one. Hold the Arc
+        // so the borrow passed to `unwrap_response_with` outlives the call.
+        let global_store = if self.response_pq_store.is_none() {
+            envelope::global_response_pq_store()
+        } else {
+            None
+        };
+        let store: Option<&dyn envelope::PqTrustStore> = self
+            .response_pq_store
+            .as_deref()
+            .or(global_store.as_deref());
+        envelope::unwrap_response_with(
+            response_bytes,
+            self.server_verifying_key.as_ref(),
+            store,
+            policy,
+        )
+    }
+
+    /// WASM response unwrap (#277 scope boundary): no process-global response
+    /// config exists on wasm, so this keeps the per-client behavior. The wasm
+    /// verify policy is owned by #158 (`wasm_api.rs`) and is intentionally NOT
+    /// changed here.
+    #[cfg(target_arch = "wasm32")]
+    fn unwrap_response(&self, response_bytes: &[u8]) -> Result<(u64, Vec<u8>)> {
+        envelope::unwrap_response_with(
+            response_bytes,
+            self.server_verifying_key.as_ref(),
+            self.response_pq_store.as_deref(),
+            self.response_verify_policy
+                .unwrap_or(crate::crypto::CryptoPolicy::Classical),
+        )
     }
 
     /// Build, sign, and serialize a request envelope.
@@ -291,19 +367,74 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         }
 
         let canonical = envelope.to_bytes();
+        let ed_pubkey = self.signer.pubkey();
+
+        // Raw EdDSA signature (sig/cnf) retained for signer-pubkey advertisement
+        // + the JWT cnf key-binding path.
         let signature = self.signer.sign(&canonical).await?;
 
-        let pq_sig = self.signer.pq_sign(&canonical).await?;
-        let pq_cnf = self.signer.pq_pubkey();
+        // Build the COSE composite (M3 #152) by signing each entry's
+        // Sig_structure out-of-band via the (possibly async/WASM) Signer.
+        let aad = crate::crypto::cose_sign1::build_external_aad(
+            crate::envelope::ENVELOPE_SCHEMA_ID,
+            crate::envelope::REQUEST_ENVELOPE_TYPE_ID,
+        );
+        // Nested SNS composite: sign the inner EdDSA layer first, then sign the
+        // outer ML-DSA-65 layer over `canonical ‖ inner_eddsa_signature` so the
+        // inner signature is bound into the outer (Strong-Non-Separable).
+        //
+        // Hybrid iff the signer exposes an ML-DSA-65 key. In Hybrid mode the inner
+        // EdDSA layer binds the hybrid-composite alg-id into its AAD (#278), making
+        // it byte-distinct from a Classical inner layer.
+        let hybrid = self.signer.pq_pubkey().is_some();
+        let ed_kid = ed_pubkey.to_vec();
+        let ed_tbs = crate::crypto::cose_sign::inner_tbs(ed_kid.clone(), &canonical, &aad, hybrid);
+        let ed_sig = self.signer.sign(&ed_tbs).await?.to_vec();
+
+        // Hybrid component when the signer exposes an ML-DSA-65 key.
+        let pq_entry = if let Some(pq_kid) = self.signer.pq_pubkey() {
+            let pq_tbs = crate::crypto::cose_sign::outer_tbs(
+                pq_kid.clone(),
+                &canonical,
+                &ed_sig,
+                &aad,
+            );
+            // The inner EdDSA above was already bound to the hybrid-composite
+            // alg-id (`hybrid = pq_pubkey().is_some()`), so it cannot fall back to
+            // a classical inner. A signer that advertises a PQ key but declines to
+            // sign must therefore be a HARD ERROR, not a silent downgrade that
+            // would desync inner-AAD (hybrid) from outer-presence (none) and make
+            // the peer's inner verification fail (#278 review).
+            let pq_sig = self
+                .signer
+                .pq_sign(&pq_tbs)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "signer exposes a PQ public key but pq_sign() returned no \
+                         signature; refusing to emit a hybrid-bound inner without \
+                         its ML-DSA-65 outer (#278)"
+                    )
+                })?;
+            Some((pq_kid, pq_sig))
+        } else {
+            None
+        };
+        let policy = if pq_entry.is_some() {
+            crate::crypto::CryptoPolicy::Hybrid
+        } else {
+            crate::crypto::CryptoPolicy::Classical
+        };
+        let cose = crate::crypto::cose_sign::assemble_composite_nested((ed_kid, ed_sig), pq_entry)?;
 
         let signed = SignedEnvelope {
             envelope,
             sig: signature,
-            cnf: self.signer.pubkey(),
+            cnf: ed_pubkey,
             encrypted_envelope: None,
             client_ephemeral_public: None,
-            pq_sig,
-            pq_cnf,
+            cose,
+            policy,
             pq_kem_ciphertext: None,
         };
 
@@ -389,8 +520,10 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
 
 /// Parse StreamInfo from Cap'n Proto response bytes.
 fn parse_stream_info(bytes: &[u8]) -> Result<crate::stream_info::StreamInfo> {
-    let reader = capnp::serialize::read_message(
-        &mut std::io::Cursor::new(bytes),
+    // Borrowing (zero-copy) reader: the capnp `Reader` references `bytes` directly.
+    let mut slice: &[u8] = bytes;
+    let reader = capnp::serialize::read_message_from_flat_slice(
+        &mut slice,
         capnp::message::ReaderOptions::default(),
     )?;
     // StreamInfo may be nested inside a service response variant.

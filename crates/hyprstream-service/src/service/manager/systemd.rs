@@ -56,8 +56,11 @@ pub struct SystemdManager {
 impl SystemdManager {
     /// Create a new SystemdManager.
     ///
-    /// Connects to the user D-Bus instance and enables user linger so
-    /// services persist across logouts on headless machines.
+    /// Connects to the user session D-Bus for systemd1 and the system D-Bus
+    /// for login1 (logind). logind lives on the system bus only — connecting
+    /// LoginProxy to the session bus caused set_user_linger() to hang forever
+    /// waiting for a response that never arrives. Enabling user linger keeps
+    /// services persisting across logouts on headless machines.
     pub async fn new() -> Result<Self> {
         let connection = user_systemd_connection().await?;
         let systemd = ManagerProxy::new(&connection).await?;

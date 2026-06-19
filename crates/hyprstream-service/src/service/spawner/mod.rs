@@ -2,7 +2,7 @@
 //!
 //! Provides unified interfaces for spawning:
 //! - Raw processes via `ProcessSpawner` (Standalone or Systemd backends)
-//! - ZMQ services via `ServiceSpawner` (Tokio, Thread, or Subprocess modes)
+//! - RPC services via `ServiceSpawner` (Tokio, Thread, or Subprocess modes)
 //!
 //! # Architecture
 //!
@@ -14,7 +14,7 @@
 //!     └── SystemdBackend (systemd-run)
 //!         └── Transient units in hyprstream-workers.slice
 //!
-//! ServiceSpawner (ZmqService hosting)
+//! ServiceSpawner (RequestService hosting)
 //!     ├── Tokio mode (tokio::spawn)
 //!     ├── Thread mode (std::thread + runtime)
 //!     └── Subprocess mode (ProcessSpawner)
@@ -48,7 +48,7 @@ mod systemd;
 pub use standalone::StandaloneBackend;
 pub use process::ProcessSpawner;
 pub use service::{
-    DualSpawnable, LoadBalancerService, ProxyService, ServiceKind, ServiceMode,
+    DualSpawnable, ServiceKind, ServiceMode,
     ServiceSpawner, Spawnable, SpawnedService,
     InprocManager, UnifiedServiceConfig,
 };

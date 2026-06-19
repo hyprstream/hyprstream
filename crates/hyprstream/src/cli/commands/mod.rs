@@ -231,10 +231,6 @@ pub enum ServiceAction {
         #[arg(long)]
         ipc: bool,
 
-        /// Callback endpoint for inference service callback mode
-        #[arg(long)]
-        callback: Option<String>,
-
         /// Comma-separated list of services to start in multi-service foreground mode
         ///
         /// When used with --foreground, starts all listed services in a single process.

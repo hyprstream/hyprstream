@@ -44,7 +44,7 @@ impl JsTokenProvider {
 /// WebTransport connection exported to JavaScript.
 ///
 /// Constructed separately from the RPC client, matching how native code
-/// constructs `ZmqConnection::new(endpoint)` before building a client.
+/// constructs a transport before building a client.
 #[wasm_bindgen(js_name = "WtConnection")]
 pub struct WasmWtConnection {
     inner: WtConnection,
@@ -72,7 +72,7 @@ impl WasmWtConnection {
 /// Unified RPC client exported to JavaScript as `RpcClient`.
 ///
 /// Wraps `RpcClientImpl<JsSigner, WtConnection>` — same envelope construction,
-/// signing, and response verification as the native `RpcClientImpl<LocalSigner, ZmqConnection>`.
+/// signing, and response verification as the native `RpcClientImpl<LocalSigner, LazyUdsTransport>`.
 ///
 /// TypeScript consumers use this via generated client classes that call
 /// `client.call(payload)` with Cap'n Proto bytes.
@@ -242,7 +242,7 @@ impl WasmRpcClient {
 /// Verified stream handle exported to JavaScript as `StreamHandle`.
 ///
 /// Wraps `StreamHandleImpl<WtConnection>` — same HMAC verification, same
-/// Cap'n Proto parsing as the native `StreamHandle<ZmqConnection>`.
+/// Cap'n Proto parsing as the native `StreamHandle<LazyUdsTransport>`.
 #[wasm_bindgen(js_name = "StreamHandle")]
 pub struct WasmStreamHandle {
     inner: StreamHandleImpl<WtConnection>,

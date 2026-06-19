@@ -562,6 +562,205 @@ fn extract_union_variants(
 }
 
 // ---------------------------------------------------------------------------
+// Field / union-arm extraction
+// ---------------------------------------------------------------------------
+
+/// Annotation node IDs used when building a `FieldDef` from a slot.
+///
+/// Bundled into a struct so the same set can be threaded through the struct-field
+/// loop and the union-arm group-leaf loop without drift.
+#[derive(Clone, Copy)]
+struct FieldAnnotationIds {
+    mcp_desc_id: Option<u64>,
+    param_desc_id: Option<u64>,
+    fixed_size_id: Option<u64>,
+    optional_id: Option<u64>,
+    serde_rename_id: Option<u64>,
+}
+
+/// Build a `FieldDef` from a `Slot` field reader.
+///
+/// Shared by the struct-field loop and the union-arm group-leaf loop so the two
+/// can't drift in how they resolve type names, sections, offsets, and annotations.
+fn field_def_from_slot(
+    field: capnp::schema_capnp::field::Reader,
+    slot: capnp::schema_capnp::field::slot::Reader,
+    node_map: &BTreeMap<u64, NodeInfo>,
+    ann: FieldAnnotationIds,
+) -> Result<FieldDef, String> {
+    let field_name = field
+        .get_name()
+        .map_err(|e| format!("{e}"))?
+        .to_str()
+        .map_err(|e| format!("{e}"))?
+        .to_owned();
+
+    let type_reader = slot.get_type().map_err(|e| format!("{e}"))?;
+    let type_name = resolve_type_name(type_reader, node_map);
+    let slot_offset = slot.get_offset();
+    let section = field_section_from_type(type_reader);
+    let disc = field.get_discriminant_value();
+
+    let description = {
+        let annotations = field.get_annotations().map_err(|e| format!("{e}"))?;
+        let desc = extract_annotation_text(annotations, ann.param_desc_id);
+        if desc.is_empty() {
+            extract_annotation_text(
+                field.get_annotations().map_err(|e| format!("{e}"))?,
+                ann.mcp_desc_id,
+            )
+        } else {
+            desc
+        }
+    };
+
+    let fixed_size = extract_annotation_u32(
+        field.get_annotations().map_err(|e| format!("{e}"))?,
+        ann.fixed_size_id,
+    );
+
+    let optional = has_annotation(
+        field.get_annotations().map_err(|e| format!("{e}"))?,
+        ann.optional_id,
+    );
+
+    let serde_rename = {
+        let sr = extract_annotation_text(
+            field.get_annotations().map_err(|e| format!("{e}"))?,
+            ann.serde_rename_id,
+        );
+        if sr.is_empty() {
+            None
+        } else {
+            Some(sr)
+        }
+    };
+
+    Ok(FieldDef {
+        name: field_name,
+        type_name,
+        description,
+        fixed_size,
+        optional,
+        slot_offset,
+        section,
+        discriminant_value: disc,
+        serde_rename,
+    })
+}
+
+/// Extract the structured union arms from a struct node.
+///
+/// For each field with `discriminant_value != 0xFFFF` (sorted by discriminant),
+/// classify the arm payload:
+/// - `Slot` of `Void`  → `ArmPayload::Void`
+/// - `Slot` of any other type → `ArmPayload::Type(name)`
+/// - `Group` → `ArmPayload::Group(leaf FieldDefs)`, resolved by looking up the
+///   synthetic nested struct node via `Group::get_type_id()`.
+///
+/// Returns an error on a missing group node id or a nested `Group` inside a group
+/// arm (unsupported — capnp groups don't nest in a way this codegen models).
+fn extract_union_arms(
+    struct_reader: capnp::schema_capnp::node::struct_::Reader,
+    nodes: &capnp::struct_list::Reader<capnp::schema_capnp::node::Owned>,
+    node_map: &BTreeMap<u64, NodeInfo>,
+    ann: FieldAnnotationIds,
+) -> Result<Vec<UnionArm>, String> {
+    let fields = struct_reader.get_fields().map_err(|e| format!("{e}"))?;
+
+    // Collect union fields (discriminant != 0xFFFF), sorted by discriminant.
+    let mut union_fields: Vec<(u16, u32)> = Vec::new();
+    for i in 0..fields.len() {
+        let field = fields.get(i);
+        let disc = field.get_discriminant_value();
+        if disc != 0xFFFF {
+            union_fields.push((disc, i));
+        }
+    }
+    union_fields.sort_by_key(|(disc, _)| *disc);
+
+    let mut arms = Vec::with_capacity(union_fields.len());
+    for (disc, idx) in union_fields {
+        let field = fields.get(idx);
+        let name = field
+            .get_name()
+            .map_err(|e| format!("{e}"))?
+            .to_str()
+            .map_err(|e| format!("{e}"))?
+            .to_owned();
+
+        let description = {
+            let annotations = field.get_annotations().map_err(|e| format!("{e}"))?;
+            let desc = extract_annotation_text(annotations, ann.param_desc_id);
+            if desc.is_empty() {
+                extract_annotation_text(
+                    field.get_annotations().map_err(|e| format!("{e}"))?,
+                    ann.mcp_desc_id,
+                )
+            } else {
+                desc
+            }
+        };
+
+        let payload = match field.which() {
+            Ok(capnp::schema_capnp::field::Slot(slot)) => {
+                let type_reader = slot.get_type().map_err(|e| format!("{e}"))?;
+                let tn = resolve_type_name(type_reader, node_map);
+                if tn == "Void" {
+                    ArmPayload::Void
+                } else {
+                    ArmPayload::Type(tn)
+                }
+            }
+            Ok(capnp::schema_capnp::field::Group(g)) => {
+                let group_type_id = g.get_type_id();
+                let group_info = node_map.get(&group_type_id).ok_or_else(|| {
+                    format!(
+                        "union arm '{name}': group type id {group_type_id} not found in node map"
+                    )
+                })?;
+                let group_node = nodes.get(group_info.index);
+                let group_struct = match group_node.which() {
+                    Ok(capnp::schema_capnp::node::Struct(s)) => s,
+                    _ => {
+                        return Err(format!(
+                            "union arm '{name}': group type id {group_type_id} is not a struct node"
+                        ))
+                    }
+                };
+                let group_fields = group_struct.get_fields().map_err(|e| format!("{e}"))?;
+                let mut leaves = Vec::with_capacity(group_fields.len() as usize);
+                for k in 0..group_fields.len() {
+                    let leaf = group_fields.get(k);
+                    match leaf.which() {
+                        Ok(capnp::schema_capnp::field::Slot(leaf_slot)) => {
+                            leaves.push(field_def_from_slot(leaf, leaf_slot, node_map, ann)?);
+                        }
+                        Ok(capnp::schema_capnp::field::Group(_)) => {
+                            return Err(format!(
+                                "union arm '{name}': nested groups inside a group arm are unsupported"
+                            ))
+                        }
+                        Err(e) => return Err(format!("group leaf error in arm '{name}': {e}")),
+                    }
+                }
+                ArmPayload::Group(leaves)
+            }
+            Err(e) => return Err(format!("union arm '{name}' field error: {e}")),
+        };
+
+        arms.push(UnionArm {
+            name,
+            discriminant_value: disc,
+            description,
+            payload,
+        });
+    }
+
+    Ok(arms)
+}
+
+// ---------------------------------------------------------------------------
 // Struct extraction
 // ---------------------------------------------------------------------------
 
@@ -570,6 +769,7 @@ fn extract_union_variants(
 fn extract_struct_from_node(
     node: capnp::schema_capnp::node::Reader,
     info: &NodeInfo,
+    nodes: &capnp::struct_list::Reader<capnp::schema_capnp::node::Owned>,
     node_map: &BTreeMap<u64, NodeInfo>,
     mcp_desc_id: Option<u64>,
     param_desc_id: Option<u64>,
@@ -583,6 +783,15 @@ fn extract_struct_from_node(
         Ok(capnp::schema_capnp::node::Struct(s)) => s,
         _ => return Ok(None),
     };
+
+    // Synthetic group nodes (capnp emits one per `:group { ... }` arm, named
+    // `Parent.armName`) are NOT standalone types in any language binding — their
+    // leaf fields are inlined into the parent. Their dotted name is also not a
+    // valid Rust/TS identifier. Skip them: their structured shape is captured in
+    // the parent union's `union_arms`.
+    if struct_reader.get_is_group() {
+        return Ok(None);
+    }
 
     let domain_type = {
         let annotations = node.get_annotations().map_err(|e| format!("{e}"))?;
@@ -604,6 +813,14 @@ fn extract_struct_from_node(
     let mut fields = Vec::new();
     let mut has_union = false;
 
+    let ann = FieldAnnotationIds {
+        mcp_desc_id,
+        param_desc_id,
+        fixed_size_id,
+        optional_id,
+        serde_rename_id,
+    };
+
     for j in 0..fields_reader.len() {
         let field = fields_reader.get(j);
         let disc = field.get_discriminant_value();
@@ -612,79 +829,94 @@ fn extract_struct_from_node(
             has_union = true;
         }
 
-        let field_name = field
-            .get_name()
-            .map_err(|e| format!("{e}"))?
-            .to_str()
-            .map_err(|e| format!("{e}"))?
-            .to_owned();
-
-        let (type_name, slot_offset, section) = match field.which() {
+        // Slot fields go through the shared `field_def_from_slot` helper (also used
+        // by the union-arm group-leaf loop) so the two can't drift. Group fields
+        // keep the flat `("Group", 0, Group)` fallback so the TS/wire-format path is
+        // byte-for-byte unchanged — their structured shape lives in `union_arms`.
+        let field_def = match field.which() {
             Ok(capnp::schema_capnp::field::Slot(slot)) => {
-                let type_reader = slot.get_type().map_err(|e| format!("{e}"))?;
-                let tn = resolve_type_name(type_reader, node_map);
-                let offset = slot.get_offset();
-                let sec = field_section_from_type(type_reader);
-                (tn, offset, sec)
+                field_def_from_slot(field, slot, node_map, ann)?
             }
-            Ok(capnp::schema_capnp::field::Group(_)) => ("Group".into(), 0, FieldSection::Group),
+            Ok(capnp::schema_capnp::field::Group(_)) => {
+                let field_name = field
+                    .get_name()
+                    .map_err(|e| format!("{e}"))?
+                    .to_str()
+                    .map_err(|e| format!("{e}"))?
+                    .to_owned();
+                let description = {
+                    let annotations = field.get_annotations().map_err(|e| format!("{e}"))?;
+                    let desc = extract_annotation_text(annotations, param_desc_id);
+                    if desc.is_empty() {
+                        extract_annotation_text(
+                            field.get_annotations().map_err(|e| format!("{e}"))?,
+                            mcp_desc_id,
+                        )
+                    } else {
+                        desc
+                    }
+                };
+                let fixed_size = extract_annotation_u32(
+                    field.get_annotations().map_err(|e| format!("{e}"))?,
+                    fixed_size_id,
+                );
+                let optional = has_annotation(
+                    field.get_annotations().map_err(|e| format!("{e}"))?,
+                    optional_id,
+                );
+                let serde_rename = {
+                    let sr = extract_annotation_text(
+                        field.get_annotations().map_err(|e| format!("{e}"))?,
+                        serde_rename_id,
+                    );
+                    if sr.is_empty() {
+                        None
+                    } else {
+                        Some(sr)
+                    }
+                };
+                FieldDef {
+                    name: field_name,
+                    type_name: "Group".into(),
+                    description,
+                    fixed_size,
+                    optional,
+                    slot_offset: 0,
+                    section: FieldSection::Group,
+                    discriminant_value: disc,
+                    serde_rename,
+                }
+            }
             Err(e) => return Err(format!("Field error: {e}")),
         };
 
-        let description = {
-            let annotations = field.get_annotations().map_err(|e| format!("{e}"))?;
-            let desc = extract_annotation_text(annotations, param_desc_id);
-            if desc.is_empty() {
-                extract_annotation_text(
-                    field.get_annotations().map_err(|e| format!("{e}"))?,
-                    mcp_desc_id,
-                )
-            } else {
-                desc
-            }
-        };
-
-        let fixed_size = extract_annotation_u32(
-            field.get_annotations().map_err(|e| format!("{e}"))?,
-            fixed_size_id,
-        );
-
-        let optional = has_annotation(
-            field.get_annotations().map_err(|e| format!("{e}"))?,
-            optional_id,
-        );
-
-        let serde_rename = {
-            let sr = extract_annotation_text(
-                field.get_annotations().map_err(|e| format!("{e}"))?,
-                serde_rename_id,
-            );
-            if sr.is_empty() {
-                None
-            } else {
-                Some(sr)
-            }
-        };
-
-        // For non-union fields, skip adding to fields if it's a union member
-        // (union members are handled by the variant extraction path)
-        // We include ALL fields now (including union members) for wire format completeness
-        fields.push(FieldDef {
-            name: field_name,
-            type_name,
-            description,
-            fixed_size,
-            optional,
-            slot_offset,
-            section,
-            discriminant_value: disc,
-            serde_rename,
-        });
+        // We include ALL fields (including union members) for wire-format completeness.
+        fields.push(field_def);
     }
 
     if struct_reader.get_discriminant_count() > 0 {
         has_union = true;
     }
+
+    // Structured union-arm view (Void / single-type / group) for Rust enum codegen.
+    // Only populated for unions; non-union structs leave this empty so the flat
+    // `fields` path is byte-for-byte unchanged.
+    let union_arms = if discriminant_count > 0 {
+        extract_union_arms(
+            struct_reader,
+            nodes,
+            node_map,
+            FieldAnnotationIds {
+                mcp_desc_id,
+                param_desc_id,
+                fixed_size_id,
+                optional_id,
+                serde_rename_id,
+            },
+        )?
+    } else {
+        Vec::new()
+    };
 
     Ok(Some(StructDef {
         name: info.short_name.clone(),
@@ -696,6 +928,7 @@ fn extract_struct_from_node(
         pointer_words,
         discriminant_count,
         discriminant_offset,
+        union_arms,
     }))
 }
 
@@ -729,6 +962,7 @@ fn extract_all_structs(
         if let Some(s) = extract_struct_from_node(
             node,
             info,
+            nodes,
             node_map,
             mcp_desc_id,
             param_desc_id,
@@ -757,6 +991,19 @@ fn extract_all_structs(
         for s in &structs {
             for f in &s.fields {
                 collect_type_refs(&f.type_name, &mut referenced_names);
+            }
+            // Group-arm leaf types are not in the flat `fields` list, so feed them
+            // (and single-type arm payloads, for robustness) into the ref collector.
+            for arm in &s.union_arms {
+                match &arm.payload {
+                    ArmPayload::Type(name) => collect_type_refs(name, &mut referenced_names),
+                    ArmPayload::Group(leaves) => {
+                        for leaf in leaves {
+                            collect_type_refs(&leaf.type_name, &mut referenced_names);
+                        }
+                    }
+                    ArmPayload::Void => {}
+                }
             }
         }
 
@@ -796,6 +1043,7 @@ fn extract_all_structs(
                     if let Some(s) = extract_struct_from_node(
                         node,
                         info,
+                        nodes,
                         node_map,
                         mcp_desc_id,
                         param_desc_id,

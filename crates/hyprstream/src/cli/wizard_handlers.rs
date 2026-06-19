@@ -90,6 +90,9 @@ pub async fn handle_wizard_tui(models_dir: &Path, config_services: &[String]) ->
 /// Handle `hyprstream wizard` — interactive setup wizard.
 ///
 /// When `bootstrap_only` is true, only phase 1 (trust-root setup) runs.
+/// `initial_user_role` overrides the default "admin" role assigned to the
+/// local user under `--non-interactive`; use "operator" or "viewer" for
+/// least-privilege test setups (#184).
 pub async fn handle_wizard(
     models_dir: &Path,
     config_services: &[String],
@@ -97,6 +100,7 @@ pub async fn handle_wizard(
     start_services: bool,
     bootstrap_only: bool,
     enable_federation: bool,
+    initial_user_role: &str,
 ) -> Result<()> {
     // Install systemd units before entering spawn_blocking (async operation).
     if !bootstrap_only && hyprstream_rpc::has_systemd() {
@@ -106,6 +110,7 @@ pub async fn handle_wizard(
     let rt = tokio::runtime::Handle::current();
     let models_dir = models_dir.to_path_buf();
     let config_services = config_services.to_vec();
+    let initial_user_role = initial_user_role.to_owned();
 
     tokio::task::spawn_blocking(move || {
         let mut backend =
@@ -116,6 +121,7 @@ pub async fn handle_wizard(
             bootstrap_only,
             start_services,
             enable_federation,
+            &initial_user_role,
             &config_services,
         )
     })
@@ -134,6 +140,7 @@ fn run_text_wizard(
     bootstrap_only: bool,
     start_services_flag: bool,
     enable_federation: bool,
+    initial_user_role: &str,
     config_services: &[String],
 ) -> Result<()> {
     println!();
@@ -157,7 +164,7 @@ fn run_text_wizard(
     text_phase_templates(backend, non_interactive, enable_federation, &mut summary)?;
 
     // Phase 4: User/role creation
-    text_phase_users(backend, non_interactive, &mut summary)?;
+    text_phase_users(backend, non_interactive, initial_user_role, &mut summary)?;
 
     // Phase 5: Token generation
     text_phase_tokens(backend, non_interactive, &mut summary)?;
@@ -434,6 +441,7 @@ fn apply_federation_template(backend: &mut impl WizardBackend, summary: &mut Tex
 fn text_phase_users(
     backend: &mut impl WizardBackend,
     non_interactive: bool,
+    initial_user_role: &str,
     summary: &mut TextWizardSummary,
 ) -> Result<()> {
     println!("  Phase 4: Users & Roles");
@@ -442,11 +450,11 @@ fn text_phase_users(
 
     if non_interactive {
         let local_user = backend.local_username();
-        backend.add_user(&local_user, "admin");
-        print_check(&local_user, CheckStatus::Ok, "admin");
+        backend.add_user(&local_user, initial_user_role);
+        print_check(&local_user, CheckStatus::Ok, initial_user_role);
         summary
             .users_created
-            .push((local_user, "admin".to_owned()));
+            .push((local_user, initial_user_role.to_owned()));
         println!();
         return Ok(());
     }

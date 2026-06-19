@@ -1,4 +1,4 @@
-//! ZMQ-based StreamSpawner and ToolCaller for ChatApp inference.
+//! RPC-backed StreamSpawner and ToolCaller for ChatApp inference.
 //!
 //! Deduplicated from `shell_handlers.rs` and `service.rs` — both callers now
 //! use `make_chat_spawner` and (optionally) `make_tool_caller` from this module.
@@ -61,11 +61,17 @@ pub fn make_chat_spawner(
             rt.block_on(async move {
                 // Resolve model service key via PolicyClient.
                 let policy_vk = sk_inner.verifying_key();
-                let policy_client = crate::services::PolicyClient::for_service(
+                let policy_client = match crate::services::PolicyClient::for_service(
                     sk_inner.clone(),
                     policy_vk,
                     None,
-                );
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(ChatEvent::StreamError(format!("Failed to create PolicyClient: {e}")));
+                        return;
+                    }
+                };
                 let model_key_resp = match policy_client.resolve_service_key(
                     &crate::services::generated::policy_client::ResolveServiceKey {
                         service_name: "model".to_owned(),
@@ -91,7 +97,13 @@ pub fn make_chat_spawner(
                     }
                 };
                 let model_client =
-                    ModelClient::for_service(sk_inner.clone(), model_vk, None);
+                    match ModelClient::for_service(sk_inner.clone(), model_vk, None) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let _ = tx.send(ChatEvent::StreamError(format!("Failed to create ModelClient: {e}")));
+                            return;
+                        }
+                    };
 
                 // Map ChatHistoryEntry → ChatMessage, handling all roles.
                 // Skip the trailing empty assistant placeholder — it's only a
@@ -251,7 +263,6 @@ pub fn make_chat_spawner(
 pub fn make_tool_caller(
     signing_key: &SigningKey,
 ) -> (hyprstream_tui::chat_app::ToolCaller, HashMap<String, String>, Vec<serde_json::Value>) {
-    use hyprstream_rpc::registry::{global as registry, SocketKind};
     use crate::services::generated::mcp_client::McpClient as GenMcpClient;
     use hyprstream_tui::chat_app::ChatEvent;
 
@@ -263,7 +274,6 @@ pub fn make_tool_caller(
     let sk_fetch = sk.clone();
     let (descriptions, openai_tools): (HashMap<String, String>, Vec<serde_json::Value>) =
         std::thread::spawn(move || {
-            let endpoint = registry().endpoint("mcp", SocketKind::Rep).to_zmq_string();
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -275,7 +285,7 @@ pub fn make_tool_caller(
                     sk_fetch.clone(),
                     policy_vk,
                     None,
-                );
+                ).ok()?;
                 let mcp_key_resp = policy_client.resolve_service_key(
                     &crate::services::generated::policy_client::ResolveServiceKey {
                         service_name: "mcp".to_owned(),
@@ -285,7 +295,7 @@ pub fn make_tool_caller(
                     mcp_key_resp.verifying_key.as_slice().try_into().ok()?
                 ).ok()?;
                 let gen: GenMcpClient =
-                    GenMcpClient::for_endpoint(&endpoint, sk_fetch, mcp_vk, None);
+                    GenMcpClient::for_service(sk_fetch, mcp_vk, None).ok()?;
                 let tool_list = gen.list_tools().await.ok()?;
                 let mut descs = HashMap::new();
                 let mut tools = Vec::new();
@@ -318,7 +328,6 @@ pub fn make_tool_caller(
             let uuid_c = uuid.clone();
             std::thread::spawn(move || {
                 let result_str: String = (move || {
-                    let endpoint = registry().endpoint("mcp", SocketKind::Rep).to_zmq_string();
                     let rt = match tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
@@ -329,11 +338,14 @@ pub fn make_tool_caller(
                     rt.block_on(async move {
                         // Resolve MCP service key via PolicyClient.
                         let policy_vk = sk_c.verifying_key();
-                        let policy_client = crate::services::PolicyClient::for_service(
+                        let policy_client = match crate::services::PolicyClient::for_service(
                             sk_c.clone(),
                             policy_vk,
                             None,
-                        );
+                        ) {
+                            Ok(c) => c,
+                            Err(e) => return format!("error: failed to create PolicyClient: {e}"),
+                        };
                         let mcp_vk = match policy_client.resolve_service_key(
                             &crate::services::generated::policy_client::ResolveServiceKey {
                                 service_name: "mcp".to_owned(),
@@ -351,7 +363,11 @@ pub fn make_tool_caller(
                             },
                             Err(e) => return format!("error: failed to resolve MCP key: {e}"),
                         };
-                        match GenMcpClient::for_endpoint(&endpoint, sk_c, mcp_vk, None)
+                        let mcp_client = match GenMcpClient::for_service(sk_c, mcp_vk, None) {
+                            Ok(c) => c,
+                            Err(e) => return format!("error: failed to create McpClient: {e}"),
+                        };
+                        match mcp_client
                             .call_tool(&crate::services::generated::mcp_client::CallTool {
                                 tool_name: uuid_c,
                                 arguments,

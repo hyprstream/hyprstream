@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Result;
 use futures::StreamExt;
 
-use crate::crypto::{derive_stream_keys, keyed_mac_truncated};
+use crate::crypto::{derive_stream_keys, keyed_mac_truncated, keyed_mac_truncated_parts};
 use crate::stream_info::StreamInfo;
 use crate::streaming_capnp;
 use crate::transport_traits::{PublishSink, Transport};
@@ -53,21 +53,84 @@ pub enum StreamPayload {
 // StreamVerifier — HMAC chain verifier (pure crypto)
 // ============================================================================
 
+/// Consumer-side ordering contract (#163/#213). The full `StreamOpt` (schema) carries
+/// producer-side QoS too (delivery/retention/overflow); the consumer only needs ordering
+/// + completion to *verify*. Cross-target so native and the wasm/browser consumer share it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamOrdering {
+    /// In-order, gap-fatal: each block's `sequenceNumber` must equal the previous + 1.
+    Ordered,
+    /// Out-of-order media: gaps tolerated (skip-to-live); a block whose `sequenceNumber` is
+    /// at/under `last_seen - anti_replay_window` is rejected as a replay.
+    Unordered { anti_replay_window: u32 },
+}
+
+/// Consumer-side truncation contract (#163/#213). Maps to the schema `Completion` axis
+/// (schema `none` → `Open`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Completion {
+    /// A `Complete`/`Error` payload must be observed before EOF; EOF-without-terminal is a
+    /// truncation and must be rejected by the consumer (see [`StreamVerifier::requires_terminal`]).
+    /// Matches schema `endOfStream` (gRPC END_STREAM / HTTP/2 DATA+END_STREAM).
+    EndOfStream,
+    /// EOF is accepted; truncation is not detectable (the explicit choice for inference/live).
+    Open,
+}
+
+/// The consumer's slice of the stream's API contract (#213), set from the service's
+/// `$streamQos` via codegen (#217) — NOT from the wire, so it can't be downgraded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifierContract {
+    pub ordering: StreamOrdering,
+    pub completion: Completion,
+}
+
 /// HMAC chain verifier for StreamBlock.
 pub struct StreamVerifier {
     key: [u8; 32],
     prev_mac: Option<[u8; 16]>,
     topic: String,
+    /// Verifier contract enforcement (#163). `None` ⇒ legacy behaviour (MAC chain only, no
+    /// `seq`/completion checks). Set via [`StreamVerifier::with_policy`] by codegen-generated
+    /// consumers; default `new()` keeps `None` so existing call sites are unchanged.
+    policy: Option<VerifierContract>,
+    /// Next expected `seq` (ordered) / highest `seq` seen (media). `None` until the first
+    /// block, so a late-join starting at an arbitrary offset is accepted, then enforced.
+    seq_cursor: Option<u64>,
+    /// Whether a terminal (`Complete`/`Error`) payload has been observed (for `completion`).
+    terminal_seen: bool,
 }
 
 impl StreamVerifier {
-    /// Create a new verifier.
+    /// Create a new verifier with **no** policy enforcement (MAC chain only) — legacy behaviour.
     pub fn new(key: [u8; 32], topic: String) -> Self {
         Self {
             key,
             prev_mac: None,
             topic,
+            policy: None,
+            seq_cursor: None,
+            terminal_seen: false,
         }
+    }
+
+    /// Create a verifier that enforces `policy` (#163) — used by codegen-generated consumers,
+    /// where the contract is a compile-time constant from the service's API contract.
+    pub fn with_policy(key: [u8; 32], topic: String, policy: VerifierContract) -> Self {
+        let mut v = Self::new(key, topic);
+        v.policy = Some(policy);
+        v
+    }
+
+    /// True if this stream's policy requires a terminal payload before EOF; the consumer must
+    /// reject an EOF when this is true and [`StreamVerifier::terminal_seen`] is false.
+    pub fn requires_terminal(&self) -> bool {
+        matches!(self.policy.map(|p| p.completion), Some(Completion::EndOfStream))
+    }
+
+    /// True once a terminal (`Complete`/`Error`) payload has been observed.
+    pub fn terminal_seen(&self) -> bool {
+        self.terminal_seen
     }
 
     /// Verify frames and return parsed payloads.
@@ -77,11 +140,23 @@ impl StreamVerifier {
         if frames.len() != 3 {
             anyhow::bail!("Expected 3 frames, got {}", frames.len());
         }
+        self.verify_parts(&frames[0], &frames[1], &frames[2])
+    }
 
-        let received_topic = &frames[0];
-        let capnp_data = &frames[1];
-        let received_mac = &frames[2];
-
+    /// Zero-copy variant of [`verify`](Self::verify) over borrowed slices.
+    ///
+    /// `verify` is a thin wrapper over this. The moq path calls it directly with
+    /// slices into the received `Bytes` frame (`verify_moq_frame`), so a large
+    /// payload (e.g. a pipeline activation tensor) is never copied into owned
+    /// per-frame `Vec`s — combined with the multi-part MAC and
+    /// `read_message_from_flat_slice` below, the block stays a view into the
+    /// receive buffer end-to-end.
+    pub fn verify_parts(
+        &mut self,
+        received_topic: &[u8],
+        capnp_data: &[u8],
+        received_mac: &[u8],
+    ) -> Result<Vec<StreamPayload>> {
         if received_mac.len() != 16 {
             anyhow::bail!("Expected 16-byte MAC, got {}", received_mac.len());
         }
@@ -90,15 +165,15 @@ impl StreamVerifier {
             anyhow::bail!("Topic mismatch");
         }
 
-        // Compute expected MAC
-        let mut input = Vec::with_capacity(64 + capnp_data.len());
-        match &self.prev_mac {
-            None => input.extend_from_slice(self.topic.as_bytes()),
-            Some(prev) => input.extend_from_slice(prev),
-        }
-        input.extend_from_slice(capnp_data);
-
-        let expected_mac = keyed_mac_truncated(&self.key, &input);
+        // Compute the expected MAC over `prev_mac ‖ capnp_data` (or `topic ‖ capnp_data`
+        // for the first block) WITHOUT allocating a joined buffer. The multi-part MAC is
+        // byte-identical to MAC-of-concatenation, so the payload is never copied into a
+        // scratch `Vec` — this matters for large frames (e.g. pipeline activation tensors).
+        let prefix: &[u8] = match &self.prev_mac {
+            None => self.topic.as_bytes(),
+            Some(prev) => &prev[..],
+        };
+        let expected_mac = keyed_mac_truncated_parts(&self.key, &[prefix, capnp_data]);
 
         if !constant_time_eq(received_mac, &expected_mac) {
             anyhow::bail!("MAC verification failed");
@@ -109,12 +184,47 @@ impl StreamVerifier {
         new_prev.copy_from_slice(received_mac);
         self.prev_mac = Some(new_prev);
 
-        // Parse StreamBlock
-        let reader = capnp::serialize::read_message(
-            &mut std::io::Cursor::new(capnp_data),
+        // Parse StreamBlock with a borrowing (zero-copy) reader: the capnp `Reader`
+        // references `capnp_data` directly instead of copying the whole block into an
+        // owned message, so a large payload stays a view into the receive buffer.
+        let mut slice: &[u8] = capnp_data;
+        let reader = capnp::serialize::read_message_from_flat_slice(
+            &mut slice,
             capnp::message::ReaderOptions::default(),
         )?;
         let block = reader.get_root::<streaming_capnp::stream_block::Reader>()?;
+
+        // Policy-selected ordering/replay enforcement (#163). The MAC already authenticates
+        // `sequenceNumber` (it's inside the block, #219), so a tampered sequenceNumber fails
+        // MAC above; here we enforce *position*. `None` policy ⇒ legacy behaviour (MAC chain
+        // only, no sequenceNumber/completion checks).
+        if let Some(policy) = self.policy {
+            let sequence_number = block.get_sequence_number();
+            match policy.ordering {
+                StreamOrdering::Ordered => {
+                    if let Some(expected) = self.seq_cursor {
+                        if sequence_number != expected {
+                            anyhow::bail!(
+                                "stream ordering violation: expected sequenceNumber {expected}, \
+                                 got {sequence_number} (gap/reorder on an ordered stream)"
+                            );
+                        }
+                    }
+                    // First block (late-join): accept its sequenceNumber, then enforce contiguity.
+                    self.seq_cursor = Some(sequence_number.saturating_add(1));
+                }
+                StreamOrdering::Unordered { .. } => {
+                    // Media (out-of-order) needs a per-Group *self-authenticating* MAC, not the
+                    // chained prev_mac this verifier uses — the chain assumes contiguous
+                    // delivery, which moq's out-of-order/eviction model breaks. Fail closed
+                    // until the per-Group MAC scheme lands (producer + consumer); see #163.
+                    anyhow::bail!(
+                        "unordered/media stream policy not yet supported: needs the per-Group \
+                         self-authenticating MAC (the chained MAC assumes in-order delivery) — #163 follow-on"
+                    );
+                }
+            }
+        }
 
         let payloads_reader = block.get_payloads()?;
         let mut payloads = Vec::with_capacity(payloads_reader.len() as usize);
@@ -148,6 +258,10 @@ impl StreamVerifier {
                 }
             };
 
+            // Track terminal observation for the `completion` axis (#163).
+            if matches!(payload, StreamPayload::Complete(_) | StreamPayload::Error(_)) {
+                self.terminal_seen = true;
+            }
             payloads.push(payload);
         }
 
@@ -160,16 +274,9 @@ impl StreamVerifier {
     }
 }
 
-/// Constant-time byte slice comparison.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
 }
 
 // ============================================================================
@@ -204,16 +311,27 @@ impl<T: Transport> StreamHandleImpl<T> {
         client_secret: &[u8; 32],
         client_pubkey: &[u8; 32],
     ) -> Result<Self> {
-        // Pure crypto — same code, both targets
-        let shared_secret = dh_compute_raw(client_secret, &stream_info.server_pubkey)?;
-        let keys = derive_stream_keys(&shared_secret, client_pubkey, &stream_info.server_pubkey)?;
+        // Pure crypto — same code, both targets.
+        // `dh_public` is the server's ephemeral Ristretto255 DH public key (one
+        // input to the ECDH that derives the topic + MAC keys). Trust in this
+        // field comes from the signed RPC `ResponseEnvelope` wrapping StreamInfo,
+        // not from the field itself. As of #275 the `ResponseEnvelope` carries a
+        // COSE composite (EdDSA + ML-DSA-65 under Hybrid), so StreamInfo
+        // authentication reaches PQ strength on a par with the request-side
+        // `SignedEnvelope`. See `ResponseEnvelope`.
+        let shared_secret = dh_compute_raw(client_secret, &stream_info.dh_public)?;
+        let keys = derive_stream_keys(&shared_secret, client_pubkey, &stream_info.dh_public)?;
 
         // Transport-abstracted — ZMQ or WebTransport
         let subscriber = transport.subscribe(keys.topic.as_bytes()).await?;
         let publisher = transport.publish(keys.ctrl_topic.as_bytes()).await.ok();
 
-        // Pure crypto
-        let verifier = StreamVerifier::new(*keys.mac_key, keys.topic.clone());
+        // QoS contract from the signed StreamInfo handshake — enforced for both native and WASM paths.
+        let verifier = StreamVerifier::with_policy(
+            *keys.mac_key,
+            keys.topic.clone(),
+            stream_info.qos.into(),
+        );
 
         Ok(Self {
             subscriber,
@@ -364,5 +482,158 @@ impl StreamHandle for Box<dyn StreamHandle> {
 
     fn is_completed(&self) -> bool {
         (**self).is_completed()
+    }
+}
+
+// ─── Conversion from wire StreamOpt ───────────────────────────────────────────
+
+/// Convert the full wire `StreamOpt` (5 axes) to the consumer's 2-axis slice.
+///
+/// The delivery, retention, and overflow_policy axes are producer-side concerns;
+/// the consumer only enforces ordering + completion.
+impl From<crate::stream_info::StreamOpt> for VerifierContract {
+    fn from(q: crate::stream_info::StreamOpt) -> Self {
+        let ordering = match q.ordering {
+            crate::stream_info::Ordering::Ordered => StreamOrdering::Ordered,
+            crate::stream_info::Ordering::Unordered { anti_replay_window } => {
+                StreamOrdering::Unordered { anti_replay_window }
+            }
+        };
+        let completion = match q.completion {
+            crate::stream_info::Completion::EndOfStream => Completion::EndOfStream,
+            crate::stream_info::Completion::None => Completion::Open,
+        };
+        VerifierContract { ordering, completion }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod policy_tests {
+    use super::*;
+
+    /// Build one `[topic, capnp StreamBlock, mac]` frame, chaining the MAC exactly as the
+    /// producer does (`prev` ‖ capnp, or topic for the first block).
+    fn frame(
+        key: &[u8; 32],
+        topic: &str,
+        prev: Option<[u8; 16]>,
+        sequence_number: u64,
+        terminal: bool,
+    ) -> (Vec<Vec<u8>>, [u8; 16]) {
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut b = msg.init_root::<streaming_capnp::stream_block::Builder>();
+            let pm: Vec<u8> = match prev {
+                Some(p) => p.to_vec(),
+                None => topic.as_bytes().iter().take(16).copied().collect(),
+            };
+            b.set_prev_mac(&pm);
+            b.set_sequence_number(sequence_number);
+            b.set_epoch(0);
+            let mut list = b.init_payloads(1);
+            let mut p = list.reborrow().get(0);
+            if terminal {
+                p.set_complete(b"done");
+            } else {
+                p.set_data(b"x");
+            }
+        }
+        let mut capnp_bytes = Vec::new();
+        capnp::serialize::write_message(&mut capnp_bytes, &msg).unwrap();
+        let mut input = Vec::new();
+        match prev {
+            None => input.extend_from_slice(topic.as_bytes()),
+            Some(p) => input.extend_from_slice(&p),
+        }
+        input.extend_from_slice(&capnp_bytes);
+        let mac = keyed_mac_truncated(key, &input);
+        (vec![topic.as_bytes().to_vec(), capnp_bytes, mac.to_vec()], mac)
+    }
+
+    #[test]
+    fn tampered_mac_is_rejected() {
+        // Exercises the subtle::ConstantTimeEq path in StreamVerifier::verify.
+        let key = [0xAAu8; 32];
+        let topic = "tamper";
+        let mut v = StreamVerifier::with_policy(
+            key,
+            topic.to_owned(),
+            VerifierContract { ordering: StreamOrdering::Ordered, completion: Completion::Open },
+        );
+        let (mut frame, _) = frame(&key, topic, None, 0, false);
+        // Corrupt the MAC part (last element of the frame).
+        let mac = frame.last_mut().unwrap();
+        mac[0] ^= 0xFF; // flip a bit — constant_time_eq must reject this
+        let err = v.verify(&frame).unwrap_err().to_string();
+        assert!(
+            err.contains("MAC") || err.contains("mac") || err.contains("HMAC") || err.contains("invalid"),
+            "tampered MAC should be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn ordered_accepts_contiguous_and_rejects_gap() {
+        let key = [7u8; 32];
+        let topic = "tok";
+        let mut v = StreamVerifier::with_policy(
+            key,
+            topic.to_owned(),
+            VerifierContract { ordering: StreamOrdering::Ordered, completion: Completion::Open },
+        );
+        let (f5, m5) = frame(&key, topic, None, 5, false); // late-join at seq 5
+        v.verify(&f5).unwrap();
+        let (f6, m6) = frame(&key, topic, Some(m5), 6, false);
+        v.verify(&f6).unwrap();
+        let (f9, _) = frame(&key, topic, Some(m6), 9, false); // gap: expected 7
+        let err = v.verify(&f9).unwrap_err().to_string();
+        assert!(err.contains("ordering violation"), "got: {err}");
+    }
+
+    #[test]
+    fn no_policy_keeps_legacy_behaviour() {
+        let key = [3u8; 32];
+        let topic = "leg";
+        let mut v = StreamVerifier::new(key, topic.to_owned()); // no policy
+        let (f5, m5) = frame(&key, topic, None, 5, false);
+        v.verify(&f5).unwrap();
+        // Big seq jump is accepted — no enforcement without a policy (unchanged behaviour).
+        let (f9, _) = frame(&key, topic, Some(m5), 9, false);
+        v.verify(&f9).unwrap();
+    }
+
+    #[test]
+    fn unordered_rejected_until_per_group_mac() {
+        let key = [1u8; 32];
+        let topic = "med";
+        let mut v = StreamVerifier::with_policy(
+            key,
+            topic.to_owned(),
+            VerifierContract {
+                ordering: StreamOrdering::Unordered { anti_replay_window: 4 },
+                completion: Completion::Open,
+            },
+        );
+        let (f0, _) = frame(&key, topic, None, 0, false);
+        assert!(v.verify(&f0).is_err());
+    }
+
+    #[test]
+    fn completion_tracks_terminal() {
+        let key = [5u8; 32];
+        let topic = "fin";
+        let mut v = StreamVerifier::with_policy(
+            key,
+            topic.to_owned(),
+            VerifierContract { ordering: StreamOrdering::Ordered, completion: Completion::EndOfStream },
+        );
+        assert!(v.requires_terminal());
+        assert!(!v.terminal_seen());
+        let (f0, m0) = frame(&key, topic, None, 0, false);
+        v.verify(&f0).unwrap();
+        assert!(!v.terminal_seen());
+        let (f1, _) = frame(&key, topic, Some(m0), 1, true); // terminal payload
+        v.verify(&f1).unwrap();
+        assert!(v.terminal_seen());
     }
 }

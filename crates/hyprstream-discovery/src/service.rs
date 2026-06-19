@@ -1,10 +1,10 @@
-//! Discovery service — exposes EndpointRegistry over ZMQ RPC.
+//! Discovery service — exposes EndpointRegistry over RPC.
 //!
 //! Allows remote clients to discover registered services, their endpoints,
-//! socket kinds, and schemas via the standard ZMQ REQ/REP transport.
+//! socket kinds, and schemas via the standard REQ/REP transport.
 
 use async_trait::async_trait;
-use hyprstream_rpc::service::{EnvelopeContext, ZmqService};
+use hyprstream_rpc::service::{EnvelopeContext, RequestService};
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc::registry::{self, EndpointRegistry, SocketKind};
 use hyprstream_rpc::resolver::Resolver;
@@ -86,7 +86,7 @@ fn unix_seconds_now() -> i64 {
         .unwrap_or(0)
 }
 
-/// Discovery service that exposes EndpointRegistry over ZMQ RPC.
+/// Discovery service that exposes EndpointRegistry over RPC.
 pub struct DiscoveryService {
     /// Timestamp when the service was created
     started_at: Instant,
@@ -94,7 +94,7 @@ pub struct DiscoveryService {
     signing_key: Arc<SigningKey>,
     /// JWT verifying key for service JWT verification (derived from root via HKDF)
     jwt_verifying_key: hyprstream_rpc::prelude::VerifyingKey,
-    /// JWT key source for client JWT verification (ZmqService trait)
+    /// JWT key source for client JWT verification (RequestService trait)
     jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
     /// OAuth issuer URL for RFC 9728 metadata (None = not configured)
     oauth_issuer_url: Option<String>,
@@ -110,7 +110,7 @@ pub struct DiscoveryService {
     /// Consumed by FederationKeyResolver before falling back to HTTPS.
     entity_statements: RwLock<HashMap<String, CachedEntityStatement>>,
     /// Phase 0.5 Stage D — cached envelope COSE_KeySets per service did:web.
-    /// Pushed by each service at startup + rotation. Consumed by ZmqService
+    /// Pushed by each service at startup + rotation. Consumed by RequestService
     /// receivers verifying COSE_Sign1 envelope signatures.
     envelope_keysets: RwLock<HashMap<String, CachedEnvelopeKeyset>>,
     /// Pre-computed TLS endorsement: Sign(tls_key, ed25519_pubkey || domain).
@@ -119,7 +119,6 @@ pub struct DiscoveryService {
     /// Domain the TLS endorsement covers (empty when no endorsement).
     tls_domain: String,
     // Infrastructure (for Spawnable)
-    context: Arc<zmq::Context>,
     transport: TransportConfig,
 }
 
@@ -132,7 +131,6 @@ impl DiscoveryService {
     pub fn new(
         signing_key: Arc<SigningKey>,
         jwt_verifying_key: hyprstream_rpc::prelude::VerifyingKey,
-        context: Arc<zmq::Context>,
         transport: TransportConfig,
     ) -> Self {
         Self {
@@ -148,7 +146,6 @@ impl DiscoveryService {
             envelope_keysets: RwLock::new(HashMap::new()),
             tls_endorsement: Vec::new(),
             tls_domain: String::new(),
-            context,
             transport,
         }
     }
@@ -338,7 +335,7 @@ impl DiscoveryHandler for DiscoveryService {
                 .iter()
                 .map(|(kind, transport)| EndpointInfo {
                     socket_kind: socket_kind_to_string(*kind).to_owned(),
-                    endpoint: transport.to_zmq_string(),
+                    endpoint: transport.endpoint_string(),
                     service_jwt: String::new(),
                     tls_endorsement: self.tls_endorsement.clone(),
                     tls_domain: self.tls_domain.clone(),
@@ -723,11 +720,11 @@ impl DiscoveryHandler for DiscoveryService {
 }
 
 // ============================================================================
-// ZmqService implementation
+// RequestService implementation
 // ============================================================================
 
 #[async_trait(?Send)]
-impl ZmqService for DiscoveryService {
+impl RequestService for DiscoveryService {
     async fn handle_request(
         &self,
         ctx: &EnvelopeContext,
@@ -743,10 +740,6 @@ impl ZmqService for DiscoveryService {
 
     fn name(&self) -> &str {
         "discovery"
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
     }
 
     fn transport(&self) -> &TransportConfig {

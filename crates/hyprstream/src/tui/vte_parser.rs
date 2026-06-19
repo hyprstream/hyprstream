@@ -671,11 +671,9 @@ impl<'a> vte::Perform for PanePerformer<'a> {
         }
         // OSC 0 or 2: set title
         match params[0] {
-            b"0" | b"2" => {
-                if params.len() > 1 {
-                    if let Ok(title) = std::str::from_utf8(params[1]) {
-                        self.pane.title = title.to_owned();
-                    }
+            b"0" | b"2" if params.len() > 1 => {
+                if let Ok(title) = std::str::from_utf8(params[1]) {
+                    self.pane.title = title.to_owned();
                 }
             }
             _ => {}
@@ -1018,7 +1016,7 @@ mod tests {
         }
         // Bottom row (row 9, 0-indexed) should have been cleared with the
         // current background color, not Color::Reset.
-        let last_row = (pane.primary.buffer.area().height - 1) as u16;
+        let last_row = pane.primary.buffer.area().height - 1;
         let cell = &pane.primary.buffer[(0, last_row)];
         assert_eq!(
             cell.bg,

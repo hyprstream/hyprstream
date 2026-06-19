@@ -21,20 +21,19 @@ use crate::services::generated::tui_client::{TuiClient, ConnectRequest, DisplayM
 
 /// Create a TuiClient for RPC calls.
 ///
-/// Resolves the TUI service endpoint from the registry and creates a client
-/// with the given signing key and local identity. Uses PolicyClient to resolve
-/// the TUI service's verifying key at runtime.
+/// Resolves the TUI service verifying key via PolicyService, then dials the
+/// TUI service via the registry (inproc or QUIC — transport-agnostic).
 pub fn create_tui_client(signing_key: &SigningKey) -> TuiClient {
-    use hyprstream_rpc::registry::{global as registry, SocketKind};
-
-    let endpoint = registry().endpoint("tui", SocketKind::Rep).to_zmq_string();
     let sk = signing_key.clone();
 
     // Bootstrap: PolicyService uses the root key in inproc mode
     let policy_vk = signing_key.verifying_key();
-    let policy_client = crate::services::PolicyClient::for_service(
+    let policy_client = match crate::services::PolicyClient::for_service(
         sk.clone(), policy_vk, None,
-    );
+    ) {
+        Ok(c) => c,
+        Err(e) => panic!("Failed to create PolicyClient: {e}"),
+    };
     let server_vk = {
         let resp = tokio::task::block_in_place(|| {
             let rt = tokio::runtime::Handle::current();
@@ -56,7 +55,10 @@ pub fn create_tui_client(signing_key: &SigningKey) -> TuiClient {
         }
     };
 
-    TuiClient::for_endpoint(&endpoint, sk, server_vk, None)
+    match TuiClient::for_service(sk, server_vk, None) {
+        Ok(c) => c,
+        Err(e) => panic!("Failed to create TuiClient: {e}"),
+    }
 }
 
 /// Attach to an existing TUI session.
@@ -108,32 +110,24 @@ pub async fn handle_tui_attach(signing_key: &SigningKey, session_id: Option<u32>
     Ok(())
 }
 
-/// Run the attach loop: subscribe to frames, enter raw mode, proxy I/O.
+/// Run the attach loop: subscribe to frames via moq UDS, enter raw mode, proxy I/O.
 ///
-/// Uses `StreamVerifier` for Blake3 HMAC chain verification of incoming
-/// StreamBlock messages. The verifier checks that each block's MAC is
-/// valid relative to the previous block, ensuring no reordering or tampering.
+/// Subscribes to the viewer's moq broadcast via a UDS socket, verifying each
+/// frame's Blake3 HMAC chain before rendering ANSI data to the terminal.
 async fn run_attach_loop(
     stream_info: &crate::services::generated::tui_client::StreamInfo,
     client: &TuiClient,
     viewer_id: u32,
 ) -> Result<()> {
-    use hyprstream_rpc::registry::{global as endpoint_registry, SocketKind};
-    use hyprstream_rpc::streaming::{StreamPayload, StreamVerifier};
+    use hyprstream_rpc::moq_stream::MoqStreamHandle;
+    use hyprstream_rpc::streaming::StreamPayload;
 
-    let zmq_ctx = zmq::Context::new();
+    let broadcast_path = stream_info.moq_broadcast_path.clone();
+    anyhow::ensure!(
+        !broadcast_path.is_empty(),
+        "TUI service did not return a moq broadcast path — server may be in ZMQ-only mode"
+    );
 
-    // Connect directly via ZMQ SUB to the XPUB endpoint
-    let sub_endpoint = endpoint_registry()
-        .endpoint("streams", SocketKind::Sub)
-        .to_zmq_string();
-
-    let sub_socket = zmq_ctx.socket(zmq::SUB)?;
-    sub_socket.connect(&sub_endpoint)?;
-    sub_socket.set_subscribe(stream_info.topic.as_bytes())?;
-    sub_socket.set_linger(0)?;
-
-    // Create verifier with the mac_key from ConnectResult.stream_info
     let mac_key: [u8; 32] = stream_info.mac_key.as_slice()
         .try_into()
         .context("mac_key must be 32 bytes")?;
@@ -145,42 +139,29 @@ async fn run_attach_loop(
 
     let mut stdout = std::io::stdout();
 
-    // ZMQ recv loop in spawn_blocking — collects full multipart [topic, capnp, mac]
-    // and verifies via StreamVerifier before sending ANSI data
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
 
-    let recv_handle = tokio::task::spawn_blocking(move || {
-        let mut verifier = StreamVerifier::new(mac_key, topic);
-
+    // #275: dial the producer's networked reach (the TUI service's QUIC `/moq`
+    // endpoint) via the shared `MoqStreamHandle::networked` consumer, which prefers
+    // the StreamInfo's reach and falls back to the local moq UDS plane only when no
+    // dialable reach is present. `attach` is a cross-process viewer, so the old
+    // `connect_uds(moq_uds_path)` connected to *this* process's empty plane and
+    // timed out waiting for the producer's broadcast.
+    let reach = stream_info.reach.clone();
+    let mut handle = MoqStreamHandle::networked(reach, broadcast_path, mac_key, topic);
+    let recv_handle = tokio::spawn(async move {
         loop {
-            // Receive full multipart message
-            let mut frames: Vec<Vec<u8>> = Vec::with_capacity(3);
-            match sub_socket.recv_bytes(0) {
-                Ok(frame) => frames.push(frame),
-                Err(_) => break,
-            }
-            while sub_socket.get_rcvmore().unwrap_or(false) {
-                match sub_socket.recv_bytes(0) {
-                    Ok(frame) => frames.push(frame),
-                    Err(_) => break,
+            match handle.recv_next().await {
+                Ok(Some(StreamPayload::Data(data))) => {
+                    if tx.send(data).await.is_err() { return; }
                 }
-            }
-
-            // Verify HMAC chain and extract payloads
-            match verifier.verify(&frames) {
-                Ok(payloads) => {
-                    for payload in payloads {
-                        if let StreamPayload::Data(data) = payload {
-                            if tx.blocking_send(data).is_err() {
-                                return;
-                            }
-                        }
-                    }
+                Ok(Some(StreamPayload::Complete(_))) | Ok(None) => return,
+                Ok(Some(StreamPayload::Error(msg))) => {
+                    tracing::warn!("moq stream error: {msg}");
+                    return;
                 }
-                Err(e) => {
-                    tracing::warn!("Stream verification failed: {}", e);
-                    // Continue — transient errors (e.g. first block) shouldn't kill attach
-                }
+                Ok(Some(_)) => continue,
+                Err(e) => { tracing::warn!("moq frame recv: {e}"); return; }
             }
         }
     });

@@ -25,11 +25,13 @@ use crate::config::OAuthConfig;
 /// Populated at startup from the ML-DSA rotation store's current slots.
 /// Updated by the rotation task after each promotion. Services read from this
 /// via their `JwtKeySource` implementation.
-#[cfg(feature = "pq-hybrid")]
+// Cross-crate `Arc<std::sync::RwLock<..>>` contract with `JwtKeySource` and the
+// service factory; intentionally `std::sync::RwLock`, not `parking_lot`.
+#[allow(clippy::disallowed_types)]
 static ML_DSA_VERIFYING_KEYS: std::sync::OnceLock<std::sync::Arc<std::sync::RwLock<Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>>>> = std::sync::OnceLock::new();
 
 /// Get or initialize the global ML-DSA verifying keys Arc.
-#[cfg(feature = "pq-hybrid")]
+#[allow(clippy::disallowed_types)]
 pub fn global_ml_dsa_verifying_keys() -> std::sync::Arc<std::sync::RwLock<Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>>> {
     ML_DSA_VERIFYING_KEYS.get_or_init(|| {
         std::sync::Arc::new(std::sync::RwLock::new(Vec::new()))
@@ -40,13 +42,11 @@ pub fn global_ml_dsa_verifying_keys() -> std::sync::Arc<std::sync::RwLock<Vec<hy
 ///
 /// Ensures all services (PolicyService, OAuthService, rotation task) share
 /// the same store instance — rotation applies universally.
-#[cfg(feature = "pq-hybrid")]
 static ML_DSA_SIGNING_STORE: std::sync::OnceLock<Arc<MlDsaSigningKeyStore>> = std::sync::OnceLock::new();
 
 /// Get or initialize the global ML-DSA signing key store.
 ///
 /// First call initializes from disk; subsequent calls return the same Arc.
-#[cfg(feature = "pq-hybrid")]
 pub fn global_ml_dsa_key_store(secrets_dir: &Path, config: &OAuthConfig) -> Arc<MlDsaSigningKeyStore> {
     ML_DSA_SIGNING_STORE.get_or_init(|| {
         Arc::new(load_or_init_ml_dsa_key_store(secrets_dir, config))
@@ -174,10 +174,11 @@ fn load_slot(secrets_dir: &Path, name: &str) -> Option<KeySlot> {
 }
 
 fn persist_slot(secrets_dir: &Path, name: &str, slot: &KeySlot) -> anyhow::Result<()> {
-    let (key_path, meta_path) = slot_paths(secrets_dir, name);
-    std::fs::write(&key_path, slot.key.to_bytes())?;
+    // Atomic write + 0600 perms (#179) — replaces bare std::fs::write which
+    // used 0644 (world-readable) and was non-atomic (torn file on crash).
+    super::identity_store::write_secret(secrets_dir, &format!("jwt-signing-key.{name}"), &slot.key.to_bytes())?;
     let meta = SlotMeta { nbf: slot.nbf, exp: slot.exp };
-    std::fs::write(&meta_path, serde_json::to_vec(&meta)?)?;
+    super::identity_store::write_secret(secrets_dir, &format!("jwt-signing-key.{name}.meta"), &serde_json::to_vec(&meta)?)?;
     Ok(())
 }
 
@@ -307,7 +308,6 @@ pub async fn rotate_jwt_keys(
 /// Additional stores to rotate alongside the primary Ed25519 store.
 pub struct RotationStores {
     pub es256: Option<Arc<Es256SigningKeyStore>>,
-    #[cfg(feature = "pq-hybrid")]
     pub ml_dsa: Option<Arc<MlDsaSigningKeyStore>>,
 }
 
@@ -329,12 +329,11 @@ pub fn spawn_rotation_task(
             if let Some(ref es256) = extra.es256 {
                 rotate_es256_keys(&config, &secrets_dir, es256, now).await;
             }
-            #[cfg(feature = "pq-hybrid")]
             if let Some(ref ml_dsa) = extra.ml_dsa {
                 rotate_ml_dsa_keys(&config, &secrets_dir, ml_dsa, now).await;
                 // Refresh the global verifying key snapshot.
                 let vks: Vec<_> = ml_dsa.all_slots_snapshot().await.iter()
-                    .map(|slot| slot.verifying_key())
+                    .map(ml_dsa_rotation::MlDsaKeySlot::verifying_key)
                     .collect();
                 let shared = global_ml_dsa_verifying_keys();
                 let _ = shared.write().map(|mut guard| *guard = vks);
@@ -422,10 +421,10 @@ fn load_es256_slot(secrets_dir: &Path, name: &str) -> Option<Es256KeySlot> {
 }
 
 fn persist_es256_slot(secrets_dir: &Path, name: &str, slot: &Es256KeySlot) -> anyhow::Result<()> {
-    let (key_path, meta_path) = es256_slot_paths(secrets_dir, name);
-    std::fs::write(&key_path, slot.key.to_bytes())?;
+    // Atomic write + 0600 perms (#179).
+    super::identity_store::write_secret(secrets_dir, &format!("es256-signing-key.{name}"), &slot.key.to_bytes())?;
     let meta = SlotMeta { nbf: slot.nbf, exp: slot.exp };
-    std::fs::write(&meta_path, serde_json::to_vec(&meta)?)?;
+    super::identity_store::write_secret(secrets_dir, &format!("es256-signing-key.{name}.meta"), &serde_json::to_vec(&meta)?)?;
     Ok(())
 }
 
@@ -533,10 +532,9 @@ pub async fn rotate_es256_keys(
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// ML-DSA-65 Key Rotation Store (pq-hybrid feature)
+// ML-DSA-65 Key Rotation Store (always compiled; runtime CryptoPolicy)
 // ════════════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "pq-hybrid")]
 mod ml_dsa_rotation {
     use super::*;
     use hyprstream_rpc::crypto::pq::{
@@ -618,11 +616,11 @@ mod ml_dsa_rotation {
     }
 
     pub(super) fn persist_ml_dsa_slot(secrets_dir: &Path, name: &str, slot: &MlDsaKeySlot) -> anyhow::Result<()> {
-        let (key_path, meta_path) = ml_dsa_slot_paths(secrets_dir, name);
+        // Atomic write + 0600 perms (#179).
         let seed = ml_dsa_sk_to_seed(&slot.key);
-        std::fs::write(&key_path, seed)?;
+        super::super::identity_store::write_secret(secrets_dir, &format!("ml-dsa-signing-key.{name}"), &seed)?;
         let meta = SlotMeta { nbf: slot.nbf, exp: slot.exp };
-        std::fs::write(&meta_path, serde_json::to_vec(&meta)?)?;
+        super::super::identity_store::write_secret(secrets_dir, &format!("ml-dsa-signing-key.{name}.meta"), &serde_json::to_vec(&meta)?)?;
         Ok(())
     }
 
@@ -684,8 +682,9 @@ mod ml_dsa_rotation {
         let drain_secs = config.drain_secs();
 
         // Phase 1: promote lead → active
-        if let Some(ref lead) = slots.lead {
-            if lead.nbf <= now {
+        let lead_ready = slots.lead.as_ref().is_some_and(|lead| lead.nbf <= now);
+        if lead_ready {
+            if let Some(new_active) = slots.lead.take() {
                 if let Some(old_active) = slots.active.take() {
                     delete_ml_dsa_slot(secrets_dir, "drain");
                     if let Err(e) = persist_ml_dsa_slot(secrets_dir, "drain", &old_active) {
@@ -693,7 +692,6 @@ mod ml_dsa_rotation {
                     }
                     slots.drain = Some(old_active);
                 }
-                let new_active = slots.lead.take().unwrap();
                 if let Err(e) = persist_ml_dsa_slot(secrets_dir, "active", &new_active) {
                     warn!("ML-DSA: failed to persist promoted active: {e}");
                 }
@@ -729,7 +727,6 @@ mod ml_dsa_rotation {
     }
 }
 
-#[cfg(feature = "pq-hybrid")]
 pub use ml_dsa_rotation::{MlDsaKeySlot, MlDsaKeySlots, MlDsaSigningKeyStore, load_or_init_ml_dsa_key_store, rotate_ml_dsa_keys};
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -927,7 +924,6 @@ mod tests {
 
     // ── ML-DSA store tests ─────────────────────────────────────────────────
 
-    #[cfg(feature = "pq-hybrid")]
     #[test]
     fn ml_dsa_load_or_init_creates_active_key() {
         let dir = TempDir::new().unwrap();
@@ -938,7 +934,6 @@ mod tests {
         assert!(key.is_some());
     }
 
-    #[cfg(feature = "pq-hybrid")]
     #[test]
     fn ml_dsa_persist_and_reload() {
         let dir = TempDir::new().unwrap();
@@ -957,7 +952,6 @@ mod tests {
         assert_eq!(vk1, vk2, "ML-DSA key must survive reload from disk");
     }
 
-    #[cfg(feature = "pq-hybrid")]
     #[tokio::test]
     async fn ml_dsa_rotate_promotes_lead() {
         use super::ml_dsa_rotation::*;

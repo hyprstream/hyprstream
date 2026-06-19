@@ -7,12 +7,15 @@ fn main() {
     println!("ROCm GPU Detection Test");
     println!("=======================");
 
-    // Set environment for ROCm
-    std::env::set_var("ROCM_PATH", "/usr");
+    // Set environment for ROCm — use /opt/rocm (standard install path) and let
+    // the runtime auto-detect the GPU ISA. HSA_OVERRIDE_GFX_VERSION=9.0.0 was
+    // removed: it forced MI210/gfx90a kernels on all GPUs, breaking gfx1151
+    // (Strix Halo / Radeon 8060S) by loading the wrong ISA and silently
+    // falling back to CPU (#228).
+    std::env::set_var("ROCM_PATH", "/opt/rocm");
     std::env::set_var("HIP_VISIBLE_DEVICES", "0");
-    std::env::set_var("HSA_OVERRIDE_GFX_VERSION", "9.0.0");
 
-    println!("Environment set for ROCm MI210");
+    println!("Environment set for ROCm (auto-detect GPU architecture)");
 
     // Check device
     let device = Device::cuda_if_available();

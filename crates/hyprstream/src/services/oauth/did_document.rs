@@ -8,9 +8,18 @@
 //!   - `GET /clients/:client_id/did.json` — per-client DID document (for Tier 3
 //!     confidential clients with registered keys)
 //!
-//! All documents follow the W3C DID Core 1.0 + did:web 1.0 conventions plus
-//! the `Ed25519VerificationKey2020` verification-method type (Multibase z6Mk
-//! encoding per the spec).
+//! All documents follow the W3C DID Core 1.0 + did:web 1.0 conventions. All
+//! key-bearing verification methods use the `Multikey` type with a
+//! multicodec-prefixed `publicKeyMultibase` (ed25519 z6Mk form; p256 / ML-DSA-65
+//! likewise), matching the atproto `#atproto` VM and the `did:key` encoding.
+//!
+//! The **root** document is additionally **atproto-compatible** (#154): when an
+//! ES256 key store is present it carries a P-256 `#atproto` `Multikey`, an
+//! `#atproto_pds` service, and `alsoKnownAs at://{handle}` — the shape existing
+//! atproto resolvers expect. Our Ed25519 mesh verification method and any typed
+//! transport `service` entries (IrohTransport/QuicTransport/OnionTransport) are
+//! **optional, additive**, and ignored by atproto (which matches by id/type).
+//! P-256 satisfies atproto (it accepts p256/k256); k256 is not used.
 //!
 //! The format produced here matches the architecture-doc Subject Identity
 //! Format section and is consumed by:
@@ -58,14 +67,120 @@ fn ed25519_to_multibase(vk: &VerifyingKey) -> String {
     format!("z{}", bs58::encode(payload).into_string())
 }
 
+/// Extract the origin (scheme://authority) from the OAuth issuer URL.
+///
+/// atproto's `#atproto_pds` serviceEndpoint must be an origin only — scheme,
+/// host, optional port — with no path. (atproto/specs/did)
+fn issuer_origin(issuer_url: &str) -> Option<String> {
+    let (scheme, rest) = issuer_url.split_once("://")?;
+    let authority = rest.split('/').next().unwrap_or(rest);
+    if authority.is_empty() {
+        None
+    } else {
+        Some(format!("{scheme}://{authority}"))
+    }
+}
+
+/// Build the multibase z-encoded P-256 public key per the `Multikey` /
+/// did:key conventions used by atproto.
+///
+/// Multibase prefix `z` (base58btc); payload is the multicodec `p256-pub`
+/// unsigned-varint header (`0x1200` → bytes `0x80 0x24`) followed by the
+/// **compressed** SEC1 point (33 bytes). atproto requires compressed pubkeys.
+fn p256_to_multibase(vk: &p256::ecdsa::VerifyingKey) -> String {
+    let point = vk.to_encoded_point(true); // compressed
+    let compressed = point.as_bytes();
+    let mut payload = Vec::with_capacity(2 + compressed.len());
+    payload.push(0x80);
+    payload.push(0x24);
+    payload.extend_from_slice(compressed);
+    format!("z{}", bs58::encode(payload).into_string())
+}
+
+/// multicodec `ml-dsa-65-pub` unsigned-varint prefix.
+///
+/// Code point `0x1211` (FIPS 204 / ML-DSA-65 public key) from the multiformats
+/// multicodec registry (status: draft); see also draft-ietf-cose-mldsa. As an
+/// unsigned varint `0x1211` encodes to the two bytes `0x91 0x24` — same shape as
+/// `p256-pub` (`0x1200` → `0x80 0x24`).
+const MULTICODEC_ML_DSA_65_PUB: [u8; 2] = [0x91, 0x24];
+
+/// Build the multibase z-encoded ML-DSA-65 public key as a `Multikey`-compatible
+/// `publicKeyMultibase` value.
+///
+/// Multibase prefix `z` (base58btc); payload is the multicodec `ml-dsa-65-pub`
+/// unsigned-varint header (`0x1211` → bytes `0x91 0x24`) followed by the raw
+/// ML-DSA-65 verifying-key bytes (1952 bytes, FIPS 204). The input is the raw
+/// public-key bytes (e.g. from `Signer::pq_pubkey()` / `ml_dsa_vk_bytes`), so
+/// this helper stays decoupled from the concrete `ml_dsa` key type and can be
+/// called by #157 when it publishes the `#mesh` PQ key.
+fn mldsa65_to_multibase(vk_bytes: &[u8]) -> String {
+    let mut payload = Vec::with_capacity(MULTICODEC_ML_DSA_65_PUB.len() + vk_bytes.len());
+    payload.extend_from_slice(&MULTICODEC_ML_DSA_65_PUB);
+    payload.extend_from_slice(vk_bytes);
+    format!("z{}", bs58::encode(payload).into_string())
+}
+
+/// The node's atproto-native identity to embed in the root DID document:
+/// the P-256 signing key (published as the `#atproto` Multikey) plus the
+/// account handle (published in `alsoKnownAs` as `at://{handle}`).
+pub struct AtprotoIdentity<'a> {
+    pub p256_vk: &'a p256::ecdsa::VerifyingKey,
+    pub handle: &'a str,
+}
+
+/// An optional, additive transport endpoint advertised as a typed `service`
+/// entry (DIDComm-style map). atproto resolvers ignore these; the mesh dial
+/// resolves by `service.type`.
+pub struct TransportEndpoint {
+    /// Fragment id, e.g. `"iroh"` → `{did}#iroh`.
+    pub fragment: String,
+    /// Service `type`, e.g. `"IrohTransport"`.
+    pub vm_type: String,
+    /// The `serviceEndpoint` map (e.g. `{ "uri": ..., "accept": [...] }`).
+    pub endpoint: Value,
+}
+
+/// Build the atproto `#atproto` verification method (P-256 `Multikey`).
+fn atproto_verification_method(did: &str, vk: &p256::ecdsa::VerifyingKey) -> Value {
+    json!({
+        "id": format!("{did}#atproto"),
+        "type": "Multikey",
+        "controller": did,
+        "publicKeyMultibase": p256_to_multibase(vk),
+    })
+}
+
 /// Build the verification-method JSON for a single Ed25519 key under a
 /// did:web subject.
+///
+/// Emitted as `type: "Multikey"` (W3C / atproto canonical VM type): the
+/// `publicKeyMultibase` value `ed25519_to_multibase` produces is already the
+/// multicodec-prefixed (`0xed01`) base58btc form `Multikey` requires, so this
+/// is the same shape used for `#atproto` (p256) and matches the `did:key`
+/// encoding (multicodec/multibase) for cross-tool interop.
 fn ed25519_verification_method(did: &str, key_id: &str, vk: &VerifyingKey) -> Value {
     json!({
         "id": format!("{did}#{key_id}"),
-        "type": "Ed25519VerificationKey2020",
+        "type": "Multikey",
         "controller": did,
         "publicKeyMultibase": ed25519_to_multibase(vk),
+    })
+}
+
+/// Build the verification-method JSON for an ML-DSA-65 (post-quantum) key under
+/// a did:web subject, emitted as a `Multikey` with the registered
+/// `ml-dsa-65-pub` multicodec (`0x1211`).
+///
+/// `vk_bytes` is the raw ML-DSA-65 verifying-key (1952 bytes). The root DID
+/// document publishes the node's mesh ML-DSA-65 key as `#mesh-pq` (#157) so
+/// peers can anchor it in their `KeyedPqTrustStore`.
+fn mldsa65_verification_method(did: &str, key_id: &str, vk_bytes: &[u8]) -> Value {
+    json!({
+        "id": format!("{did}#{key_id}"),
+        "type": "Multikey",
+        "controller": did,
+        "publicKeyMultibase": mldsa65_to_multibase(vk_bytes),
     })
 }
 
@@ -88,39 +203,97 @@ fn ed25519_verification_method_jwk(did: &str, key_id: &str, vk: &VerifyingKey) -
 ///
 /// `did` is the full did:web identifier; `keys` is the ordered list of
 /// `(key_id, VerifyingKey)` pairs to include as verification methods.
+/// `atproto` (when `Some`) makes this an atproto-compatible identity document:
+/// the P-256 `#atproto` Multikey is listed FIRST in `verificationMethod`, an
+/// `#atproto_pds` service is added FIRST in `service`, and `alsoKnownAs` carries
+/// `at://{handle}`. The Ed25519 `keys` remain as additional (mesh) verification
+/// methods, and `transports` are additional typed `service` entries — both are
+/// ignored by atproto resolvers (which match by id/type) but used by our mesh.
 fn build_did_document(
     did: &str,
     issuer_url: &str,
     keys: &[(String, VerifyingKey)],
+    atproto: Option<&AtprotoIdentity<'_>>,
+    transports: &[TransportEndpoint],
+    mesh_pq_vk: Option<&[u8]>,
 ) -> Value {
-    let mut verification_methods = Vec::with_capacity(keys.len() * 2);
-    let mut authentication_refs = Vec::with_capacity(keys.len() * 2);
+    let mut verification_methods = Vec::with_capacity(keys.len() * 2 + 2);
+    let mut authentication_refs = Vec::with_capacity(keys.len() * 2 + 2);
+    let mut assertion_refs = Vec::with_capacity(keys.len() * 2 + 2);
 
+    // atproto signing key FIRST (atproto takes the first matching entry).
+    if let Some(at) = atproto {
+        verification_methods.push(atproto_verification_method(did, at.p256_vk));
+        let atproto_vm_id = format!("{did}#atproto");
+        authentication_refs.push(Value::String(atproto_vm_id.clone()));
+        assertion_refs.push(Value::String(atproto_vm_id));
+    }
+
+    // Ed25519 mesh / OAuth verification methods (multibase + JWK).
     for (key_id, vk) in keys {
         let vm_id = format!("{did}#{key_id}");
         let vm_id_jwk = format!("{did}#{key_id}-jwk");
         verification_methods.push(ed25519_verification_method(did, key_id, vk));
         verification_methods.push(ed25519_verification_method_jwk(did, key_id, vk));
-        authentication_refs.push(Value::String(vm_id));
-        authentication_refs.push(Value::String(vm_id_jwk));
+        authentication_refs.push(Value::String(vm_id.clone()));
+        authentication_refs.push(Value::String(vm_id_jwk.clone()));
+        assertion_refs.push(Value::String(vm_id));
+        assertion_refs.push(Value::String(vm_id_jwk));
     }
 
-    json!({
+    // Mesh post-quantum verification method (#157): the node's ML-DSA-65 mesh
+    // key, published as `#mesh-pq` so peers can anchor it in their PQ trust
+    // store. Additive and ignored by atproto resolvers (matched by id/type).
+    if let Some(vk_bytes) = mesh_pq_vk {
+        verification_methods.push(mldsa65_verification_method(did, "mesh-pq", vk_bytes));
+        let vm_id = format!("{did}#mesh-pq");
+        authentication_refs.push(Value::String(vm_id.clone()));
+        assertion_refs.push(Value::String(vm_id));
+    }
+
+    // Services: atproto PDS first, then the legacy HyprstreamService, then any
+    // typed transport endpoints (optional, atproto-ignored).
+    let mut services = Vec::with_capacity(2 + transports.len());
+    if atproto.is_some() {
+        if let Some(origin) = issuer_origin(issuer_url) {
+            services.push(json!({
+                "id": format!("{did}#atproto_pds"),
+                "type": "AtprotoPersonalDataServer",
+                "serviceEndpoint": origin,
+            }));
+        }
+    }
+    services.push(json!({
+        "id": format!("{did}#hyprstream"),
+        "type": "HyprstreamService",
+        "serviceEndpoint": issuer_url,
+    }));
+    for t in transports {
+        services.push(json!({
+            "id": format!("{did}#{}", t.fragment),
+            "type": t.vm_type,
+            "serviceEndpoint": t.endpoint,
+        }));
+    }
+
+    let mut doc = json!({
         "@context": [
             "https://www.w3.org/ns/did/v1",
-            "https://w3id.org/security/suites/ed25519-2020/v1",
+            "https://w3id.org/security/multikey/v1",
             "https://w3id.org/security/suites/jws-2020/v1",
         ],
         "id": did,
         "verificationMethod": verification_methods,
         "authentication": authentication_refs,
-        "assertionMethod": authentication_refs,
-        "service": [{
-            "id": format!("{did}#hyprstream"),
-            "type": "HyprstreamService",
-            "serviceEndpoint": issuer_url,
-        }],
-    })
+        "assertionMethod": assertion_refs,
+        "service": services,
+    });
+
+    if let Some(at) = atproto {
+        doc["alsoKnownAs"] = json!([format!("at://{}", at.handle)]);
+    }
+
+    doc
 }
 
 /// `GET /.well-known/did.json` — root deployment DID document.
@@ -149,7 +322,83 @@ pub async fn root_did_document(
     };
     let vk = sk.verifying_key();
 
-    let doc = build_did_document(&did, &state.issuer_url, &[("key-1".to_owned(), vk)]);
+    // atproto-native identity: the active P-256 key from the ES256 rotation
+    // store becomes the `#atproto` Multikey; the issuer authority is the handle.
+    let atproto_sk = match state.es256_key_store.as_ref() {
+        Some(store) => store.active_key().await,
+        None => None,
+    };
+    // The atproto handle is a bare hostname (no port); strip any port the
+    // authority carries (the DID identifier keeps the port, the handle does not).
+    let handle = authority.split(':').next().unwrap_or(authority.as_str());
+    let atproto_vk = atproto_sk.as_ref().map(|sk| sk.verifying_key());
+    let atproto = atproto_vk.map(|vk| AtprotoIdentity {
+        p256_vk: vk,
+        handle,
+    });
+
+    // Transport `service` entries: populate QUIC entry when cert hash is available (#185).
+    // The cert hash was set at OAuthService startup from the node's QUIC TLS cert,
+    // closing the two-trust-roots gap: peers dialing by DID can now pin the cert
+    // instead of accepting it on TOFU.
+    let mut transports: Vec<TransportEndpoint> = Vec::new();
+    if !state.quic_cert_hashes.is_empty() {
+        if let Some(ref quic_uri) = state.quic_public_uri {
+            let auth = match hyprstream_rpc::transport::QuicServerAuth::pinned(
+                state.quic_cert_hashes.clone(),
+            ) {
+                Ok(auth) => auth,
+                Err(_) => hyprstream_rpc::transport::QuicServerAuth::web_pki(),
+            };
+            transports.push(TransportEndpoint {
+                fragment: "quic".to_owned(),
+                vm_type: "QuicTransport".to_owned(),
+                endpoint: hyprstream_rpc::service_entry::encode_quic(
+                    quic_uri,
+                    &auth,
+                    &["hyprstream-rpc/1"],
+                ),
+            });
+        }
+    }
+
+    // #282: iroh transport entry — published ONLY when the iroh substrate is
+    // bound (the daemon set `iroh_node_id`). Advertises the `#iroh` Ed25519
+    // verification method (the node_id, as a Multikey) AND an `IrohTransport`
+    // service entry accepting both ALPNs, so a peer can dial either plane by
+    // node_id (reachability via the advertised relays or pkarr/DNS discovery).
+    let mut extra_vms: Vec<(String, VerifyingKey)> = Vec::new();
+    if let Some(node_id) = state.iroh_node_id {
+        // The iroh node key is the node's Ed25519 endpoint id; publish it as the
+        // `#iroh` VM so the #137 key-binding stage can match an inbound iroh
+        // peer's `remote_id()` against this DID.
+        if let Ok(vk) = VerifyingKey::from_bytes(&node_id) {
+            extra_vms.push(("iroh".to_owned(), vk));
+        }
+        transports.push(TransportEndpoint {
+            fragment: "iroh".to_owned(),
+            vm_type: "IrohTransport".to_owned(),
+            endpoint: hyprstream_rpc::service_entry::encode_iroh(
+                &node_id,
+                &state.iroh_relays,
+                &["hyprstream-rpc/1", "moql"],
+            ),
+        });
+    }
+
+    // Root verification methods: the OAuth signing key plus the `#iroh` node key
+    // (when bound). `build_did_document` emits each as a Multikey VM.
+    let mut keys: Vec<(String, VerifyingKey)> = vec![("key-1".to_owned(), vk)];
+    keys.extend(extra_vms);
+
+    let doc = build_did_document(
+        &did,
+        &state.issuer_url,
+        &keys,
+        atproto.as_ref(),
+        &transports,
+        state.mesh_pq_verifying_key.as_deref(),
+    );
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/did+json")],
@@ -201,7 +450,7 @@ pub async fn user_did_document(
         None => Vec::new(),
     };
 
-    let doc = build_did_document(&did, &state.issuer_url, &keys);
+    let doc = build_did_document(&did, &state.issuer_url, &keys, None, &[], None);
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/did+json")],
@@ -240,7 +489,7 @@ pub async fn client_did_document(
     // lookup + extract_ed25519_keys_from_jwks call.
     let keys: Vec<(String, VerifyingKey)> = Vec::new();
 
-    let doc = build_did_document(&did, &state.issuer_url, &keys);
+    let doc = build_did_document(&did, &state.issuer_url, &keys, None, &[], None);
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/did+json")],
@@ -340,10 +589,19 @@ mod tests {
             did,
             "https://hyprstream.example.com",
             &[("key-1".to_owned(), sk.verifying_key())],
+            None,
+            &[],
+            None,
         );
         assert_eq!(doc["id"].as_str().unwrap(), did);
         assert!(doc["@context"].is_array());
         assert_eq!(doc["verificationMethod"].as_array().unwrap().len(), 2); // multibase + jwk
+        // The ed25519 VM is emitted as a Multikey (#280) with a multibase key.
+        let vm = &doc["verificationMethod"][0];
+        assert_eq!(vm["type"].as_str().unwrap(), "Multikey");
+        assert!(vm["publicKeyMultibase"].as_str().unwrap().starts_with('z'));
+        // The JWK fallback VM is retained.
+        assert_eq!(doc["verificationMethod"][1]["type"].as_str().unwrap(), "JsonWebKey2020");
         assert_eq!(doc["service"][0]["type"].as_str().unwrap(), "HyprstreamService");
         assert_eq!(
             doc["service"][0]["serviceEndpoint"].as_str().unwrap(),
@@ -354,10 +612,76 @@ mod tests {
     #[test]
     fn build_did_doc_empty_keys_is_valid() {
         let did = "did:web:example.com:users:alice";
-        let doc = build_did_document(did, "https://example.com", &[]);
+        let doc = build_did_document(did, "https://example.com", &[], None, &[], None);
         assert_eq!(doc["id"].as_str().unwrap(), did);
         assert_eq!(doc["verificationMethod"].as_array().unwrap().len(), 0);
         assert_eq!(doc["authentication"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn p256_multibase_format() {
+        let sk = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let mb = p256_to_multibase(sk.verifying_key());
+        assert!(mb.starts_with('z'), "must use base58btc multibase prefix");
+        let decoded = bs58::decode(&mb[1..]).into_vec().unwrap();
+        // multicodec p256-pub = 0x1200 → unsigned-varint [0x80, 0x24].
+        assert_eq!(decoded[0], 0x80);
+        assert_eq!(decoded[1], 0x24);
+        // Compressed SEC1 point: 33 bytes, leading 0x02/0x03.
+        assert_eq!(decoded.len(), 2 + 33);
+        assert!(decoded[2] == 0x02 || decoded[2] == 0x03);
+    }
+
+    #[test]
+    fn build_did_doc_atproto_identity() {
+        let ed = SigningKey::generate(&mut OsRng);
+        let p256_sk = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let p256_vk = p256_sk.verifying_key();
+        let did = "did:web:hyprstream.example.com";
+        let atproto = AtprotoIdentity { p256_vk, handle: "hyprstream.example.com" };
+        let transports = [TransportEndpoint {
+            fragment: "iroh".to_owned(),
+            vm_type: "IrohTransport".to_owned(),
+            endpoint: json!({ "uri": "iroh:abc", "accept": ["hyprstream-rpc/1", "moql"] }),
+        }];
+        let doc = build_did_document(
+            did,
+            // issuer URL with a path — origin must strip it for #atproto_pds.
+            "https://hyprstream.example.com/oauth",
+            &[("key-1".to_owned(), ed.verifying_key())],
+            Some(&atproto),
+            &transports,
+            None,
+        );
+
+        // #atproto Multikey is FIRST and p256.
+        let vms = doc["verificationMethod"].as_array().unwrap();
+        assert_eq!(vms[0]["id"].as_str().unwrap(), format!("{did}#atproto"));
+        assert_eq!(vms[0]["type"].as_str().unwrap(), "Multikey");
+        assert!(vms[0]["publicKeyMultibase"].as_str().unwrap().starts_with('z'));
+        // Ed25519 mesh VMs still present after it.
+        assert_eq!(vms.len(), 1 + 2);
+        // The ed25519 mesh VM is also a Multikey (#280), not the deprecated
+        // Ed25519VerificationKey2020 type, with a multibase key; JWK fallback kept.
+        assert_eq!(vms[1]["type"].as_str().unwrap(), "Multikey");
+        assert!(vms[1]["publicKeyMultibase"].as_str().unwrap().starts_with('z'));
+        assert_eq!(vms[2]["type"].as_str().unwrap(), "JsonWebKey2020");
+
+        // #atproto_pds first, origin-only (no path), correct type.
+        let svcs = doc["service"].as_array().unwrap();
+        assert_eq!(svcs[0]["id"].as_str().unwrap(), format!("{did}#atproto_pds"));
+        assert_eq!(svcs[0]["type"].as_str().unwrap(), "AtprotoPersonalDataServer");
+        assert_eq!(
+            svcs[0]["serviceEndpoint"].as_str().unwrap(),
+            "https://hyprstream.example.com"
+        );
+        // transport entry present as a typed map service.
+        let iroh = svcs.iter().find(|s| s["type"] == "IrohTransport").unwrap();
+        assert_eq!(iroh["id"].as_str().unwrap(), format!("{did}#iroh"));
+        assert!(iroh["serviceEndpoint"]["accept"].is_array());
+
+        // alsoKnownAs handle.
+        assert_eq!(doc["alsoKnownAs"][0].as_str().unwrap(), "at://hyprstream.example.com");
     }
 
     #[test]
@@ -372,5 +696,193 @@ mod tests {
         let keys = extract_ed25519_keys_from_jwks(&Some(jwks));
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].0, "good");
+    }
+
+    #[test]
+    fn mesh_ed25519_vm_is_multikey() {
+        // The `#mesh` verification method must be emitted as a Multikey (#280),
+        // not the deprecated Ed25519VerificationKey2020 type.
+        let sk = SigningKey::generate(&mut OsRng);
+        let did = "did:web:hyprstream.example.com";
+        let vm = ed25519_verification_method(did, "mesh", &sk.verifying_key());
+        assert_eq!(vm["id"].as_str().unwrap(), format!("{did}#mesh"));
+        assert_eq!(vm["type"].as_str().unwrap(), "Multikey");
+        assert_eq!(vm["controller"].as_str().unwrap(), did);
+        let mb = vm["publicKeyMultibase"].as_str().unwrap();
+        assert!(mb.starts_with('z'), "Multikey publicKeyMultibase must be base58btc multibase");
+        // The encoded key carries the ed25519-pub multicodec prefix (0xed 0x01).
+        let decoded = bs58::decode(&mb[1..]).into_vec().unwrap();
+        assert_eq!(&decoded[..2], &[0xed, 0x01]);
+        assert_eq!(&decoded[2..], sk.verifying_key().as_bytes());
+    }
+
+    #[test]
+    fn mldsa65_multibase_multicodec_round_trip() {
+        // ML-DSA-65 public keys are 1952 bytes (FIPS 204). Use a stand-in buffer
+        // of the correct length to exercise the multicodec/multibase encoding.
+        let vk_bytes = vec![0xABu8; 1952];
+        let mb = mldsa65_to_multibase(&vk_bytes);
+        assert!(mb.starts_with('z'), "must use base58btc multibase prefix");
+        let decoded = bs58::decode(&mb[1..]).into_vec().unwrap();
+        // multicodec ml-dsa-65-pub = 0x1211 → unsigned-varint [0x91, 0x24].
+        assert_eq!(&decoded[..2], &[0x91, 0x24]);
+        // Remaining bytes are the verifying-key payload, unmodified.
+        assert_eq!(&decoded[2..], vk_bytes.as_slice());
+        assert_eq!(decoded.len(), 2 + 1952);
+    }
+
+    #[test]
+    fn build_did_doc_publishes_mesh_pq_vm() {
+        // #157: when a mesh ML-DSA-65 vk is provided, build_did_document emits a
+        // `#mesh-pq` Multikey VM with the ml-dsa-65-pub multicodec, listed after
+        // the Ed25519 VMs, and referenced in authentication/assertionMethod.
+        let sk = SigningKey::generate(&mut OsRng);
+        let did = "did:web:hyprstream.example.com";
+        let vk_bytes = vec![0x42u8; 1952];
+        let doc = build_did_document(
+            did,
+            "https://hyprstream.example.com",
+            &[("key-1".to_owned(), sk.verifying_key())],
+            None,
+            &[],
+            Some(&vk_bytes),
+        );
+        let vms = doc["verificationMethod"].as_array().unwrap();
+        // key-1 multibase + key-1 jwk + mesh-pq = 3.
+        assert_eq!(vms.len(), 3);
+        let pq = vms.iter().find(|v| v["id"] == format!("{did}#mesh-pq")).unwrap();
+        assert_eq!(pq["type"].as_str().unwrap(), "Multikey");
+        let mb = pq["publicKeyMultibase"].as_str().unwrap();
+        let decoded = bs58::decode(&mb[1..]).into_vec().unwrap();
+        assert_eq!(&decoded[..2], &[0x91, 0x24]); // ml-dsa-65-pub multicodec
+        assert_eq!(&decoded[2..], vk_bytes.as_slice());
+        // Referenced as both an authentication and assertion method.
+        let mesh_pq_id = format!("{did}#mesh-pq");
+        assert!(doc["authentication"].as_array().unwrap().iter().any(|v| *v == mesh_pq_id));
+        assert!(doc["assertionMethod"].as_array().unwrap().iter().any(|v| *v == mesh_pq_id));
+    }
+
+    #[test]
+    fn mesh_pq_vm_matches_derived_signing_key() {
+        // #157 scope #1/#2 consistency: the `#mesh-pq` VM published from the
+        // OAuth signing key must equal the ML-DSA-65 verifying key the mesh
+        // actually signs with (derive_mesh_mldsa_key over the same Ed25519 key).
+        let sk = SigningKey::generate(&mut OsRng);
+        let pq_sk = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&sk);
+        let pq_vk_bytes = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq_sk);
+
+        let did = "did:web:hyprstream.example.com";
+        let doc = build_did_document(
+            did,
+            "https://hyprstream.example.com",
+            &[("key-1".to_owned(), sk.verifying_key())],
+            None,
+            &[],
+            Some(&pq_vk_bytes),
+        );
+        let vms = doc["verificationMethod"].as_array().unwrap();
+        let pq = vms.iter().find(|v| v["id"] == format!("{did}#mesh-pq")).unwrap();
+        let mb = pq["publicKeyMultibase"].as_str().unwrap();
+        let decoded = bs58::decode(&mb[1..]).into_vec().unwrap();
+        assert_eq!(&decoded[2..], pq_vk_bytes.as_slice(),
+            "published #mesh-pq key must equal the derived mesh signing key's public key");
+    }
+
+    #[test]
+    fn root_doc_advertises_iroh_vm_and_transport_when_bound() {
+        // #282: when the iroh substrate is bound, root_did_document adds the
+        // `#iroh` Ed25519 VM (the node_id) AND an IrohTransport service entry
+        // accepting both ALPNs. Mirror the exact construction root_did_document
+        // does (node_id → #iroh VM key + encode_iroh transport entry).
+        let oauth_sk = SigningKey::generate(&mut OsRng);
+        let node_sk = SigningKey::generate(&mut OsRng);
+        let node_id = node_sk.verifying_key().to_bytes();
+        let did = "did:web:hyprstream.example.com";
+
+        let iroh_vk = VerifyingKey::from_bytes(&node_id).unwrap();
+        let keys = vec![
+            ("key-1".to_owned(), oauth_sk.verifying_key()),
+            ("iroh".to_owned(), iroh_vk),
+        ];
+        let transports = [TransportEndpoint {
+            fragment: "iroh".to_owned(),
+            vm_type: "IrohTransport".to_owned(),
+            endpoint: hyprstream_rpc::service_entry::encode_iroh(
+                &node_id,
+                &[],
+                &["hyprstream-rpc/1", "moql"],
+            ),
+        }];
+        let doc = build_did_document(
+            did,
+            "https://hyprstream.example.com",
+            &keys,
+            None,
+            &transports,
+            None,
+        );
+
+        // The `#iroh` VM is present and carries the node_id as a Multikey.
+        let vms = doc["verificationMethod"].as_array().unwrap();
+        let iroh_vm = vms
+            .iter()
+            .find(|v| v["id"] == format!("{did}#iroh"))
+            .expect("`#iroh` verification method must be advertised");
+        assert_eq!(iroh_vm["type"].as_str().unwrap(), "Multikey");
+        let mb = iroh_vm["publicKeyMultibase"].as_str().unwrap();
+        let decoded = bs58::decode(&mb[1..]).into_vec().unwrap();
+        assert_eq!(&decoded[..2], &[0xed, 0x01], "ed25519-pub multicodec");
+        assert_eq!(&decoded[2..], &node_id, "`#iroh` VM key must equal the node_id");
+
+        // The IrohTransport service entry accepts BOTH ALPNs.
+        let svcs = doc["service"].as_array().unwrap();
+        let iroh_svc = svcs
+            .iter()
+            .find(|s| s["type"] == "IrohTransport")
+            .expect("IrohTransport service entry must be advertised");
+        assert_eq!(iroh_svc["id"].as_str().unwrap(), format!("{did}#iroh"));
+        let accept = iroh_svc["serviceEndpoint"]["accept"].as_array().unwrap();
+        let accept: Vec<&str> = accept.iter().filter_map(|v| v.as_str()).collect();
+        assert!(accept.contains(&"hyprstream-rpc/1"));
+        assert!(accept.contains(&"moql"));
+    }
+
+    #[test]
+    fn root_doc_omits_iroh_when_not_bound() {
+        // No iroh transport configured → no `#iroh` VM, no IrohTransport entry.
+        let sk = SigningKey::generate(&mut OsRng);
+        let did = "did:web:hyprstream.example.com";
+        let doc = build_did_document(
+            did,
+            "https://hyprstream.example.com",
+            &[("key-1".to_owned(), sk.verifying_key())],
+            None,
+            &[],
+            None,
+        );
+        let vms = doc["verificationMethod"].as_array().unwrap();
+        assert!(
+            !vms.iter().any(|v| v["id"] == format!("{did}#iroh")),
+            "no `#iroh` VM when iroh is not bound"
+        );
+        let svcs = doc["service"].as_array().unwrap();
+        assert!(
+            !svcs.iter().any(|s| s["type"] == "IrohTransport"),
+            "no IrohTransport entry when iroh is not bound"
+        );
+    }
+
+    #[test]
+    fn mldsa65_verification_method_is_multikey() {
+        let did = "did:web:hyprstream.example.com";
+        let vk_bytes = vec![0x07u8; 1952];
+        let vm = mldsa65_verification_method(did, "mesh-pq", &vk_bytes);
+        assert_eq!(vm["id"].as_str().unwrap(), format!("{did}#mesh-pq"));
+        assert_eq!(vm["type"].as_str().unwrap(), "Multikey");
+        assert_eq!(vm["controller"].as_str().unwrap(), did);
+        let mb = vm["publicKeyMultibase"].as_str().unwrap();
+        let decoded = bs58::decode(&mb[1..]).into_vec().unwrap();
+        assert_eq!(&decoded[..2], &[0x91, 0x24]); // ml-dsa-65-pub multicodec
+        assert_eq!(&decoded[2..], vk_bytes.as_slice());
     }
 }

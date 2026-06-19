@@ -47,13 +47,13 @@ pub enum RekeyPolicy {
 impl RekeyPolicy {
     pub fn validate(&self) -> Result<(), String> {
         match self {
-            Self::Scheduled { interval } | Self::Jittered { interval, .. } => {
-                if *interval > MAX_KEY_LIFETIME {
-                    return Err(format!(
-                        "interval {:?} exceeds MAX_KEY_LIFETIME ({:?})",
-                        interval, MAX_KEY_LIFETIME
-                    ));
-                }
+            Self::Scheduled { interval } | Self::Jittered { interval, .. }
+                if *interval > MAX_KEY_LIFETIME =>
+            {
+                return Err(format!(
+                    "interval {:?} exceeds MAX_KEY_LIFETIME ({:?})",
+                    interval, MAX_KEY_LIFETIME
+                ));
             }
             _ => {}
         }

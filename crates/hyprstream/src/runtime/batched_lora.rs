@@ -135,9 +135,15 @@ impl BatchedLoRAForward {
                 // A: [rank, in_features] -> A^T: [in_features, rank]
                 // B: [out_features, rank] -> B^T: [rank, out_features]
                 // output = scaling * (x_i @ A^T @ B^T)
-                let intermediate = x[i].matmul(&a.tr()); // [1, seq_len, rank]
+                // A/B are stored in fp32; cast x to A's dtype for the matmul (CPU addmm
+                // requires matching operand dtypes), then cast the correction back to x's
+                // dtype so callers can add it to a base-dtype (e.g. BF16) tensor. Both
+                // casts are device-agnostic no-ops when dtypes already match.
+                let input_kind = x[i].kind();
+                let xi = x[i].to_kind(a.kind());
+                let intermediate = xi.matmul(&a.tr()); // [1, seq_len, rank]
                 let output = intermediate.matmul(&b.tr()); // [1, seq_len, out_features]
-                results.push(output * self.scaling);
+                results.push((output * self.scaling).to_kind(input_kind));
             } else {
                 // No delta for this tenant — zero correction
                 let shape = x[i].size();

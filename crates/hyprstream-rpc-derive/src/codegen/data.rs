@@ -49,6 +49,13 @@ pub fn generate_data_structs(
         collect_list_struct_types(resolved.raw)
     };
     for type_name in &list_struct_types {
+        // Synthetic capnp group nodes are named `Parent.armName` (e.g.
+        // `Ordering.unordered`). They are not standalone Rust types — their leaf
+        // fields are folded into the parent union's enum variant — and the dotted
+        // name is not a valid Rust identifier, so skip them here.
+        if type_name.contains('.') {
+            continue;
+        }
         if let Some(s) = resolved.find_struct(type_name) {
             // Skip Option* wrapper structs — they become Option<T> fields, not standalone types
             if s.option_inner_type().is_some() {
@@ -92,6 +99,17 @@ pub fn generate_data_structs(
                 service_name,
                 types_crate,
             );
+
+            // Pure tagged-union structs (a capnp `union { ... }` with no sibling
+            // non-union fields) become native Rust enums — one variant per arm —
+            // instead of an (empty) struct. Option<T> wrappers are handled above.
+            if s.is_pure_union() && s.option_inner_type().is_none() {
+                tokens.extend(generate_union_enum(type_name, s, resolved));
+                tokens.extend(generate_union_to_capnp_impl(type_name, s, resolved, &capnp_mod, service_name, types_crate));
+                tokens.extend(generate_union_from_capnp_impl(type_name, s, resolved, &capnp_mod, service_name, types_crate));
+                continue;
+            }
+
             tokens.extend(generate_data_struct(type_name, s, resolved));
             tokens.extend(generate_to_capnp_impl(type_name, s, resolved, &capnp_mod, service_name, types_crate));
             tokens.extend(generate_from_capnp_impl(type_name, s, resolved, &capnp_mod, service_name, types_crate));
@@ -184,10 +202,319 @@ fn generate_data_struct(
 
     quote! {
         #[doc = #doc]
-        #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+        #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
         #[serde(rename_all = "camelCase")]
         pub struct #data_name {
             #(#fields,)*
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tagged-union (pure-union struct) → Rust enum generation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Owned Rust type tokens for a single-type union-arm payload.
+fn arm_payload_type_tokens(type_name: &str, resolved: &ResolvedSchema) -> TokenStream {
+    rust_type_tokens(&resolved.resolve_type(type_name).rust_owned)
+}
+
+/// Generate a Rust `enum` for a pure-union capnp struct.
+///
+/// Each arm maps to a variant: Void → unit, single-type → tuple, group → struct.
+/// The discriminant-0 arm carries `#[default]`.
+fn generate_union_enum(
+    type_name: &str,
+    s: &StructDef,
+    resolved: &ResolvedSchema,
+) -> TokenStream {
+    let enum_name = format_ident!("{}", type_name);
+    let doc = format!("Generated from Cap'n Proto union {type_name}");
+
+    // The discriminant-0 arm is the capnp zero-fill default. If it's a Void arm
+    // we can use `#[derive(Default)]` + `#[default]` (requires a unit variant);
+    // otherwise we drop `Default` from the derive and emit a manual `impl Default`
+    // that builds the @0 variant with default-valued payload.
+    let default_arm = s.union_arms.iter().find(|a| a.discriminant_value == 0);
+    let default_is_unit = matches!(default_arm.map(|a| &a.payload), Some(ArmPayload::Void));
+
+    let variants: Vec<TokenStream> = s
+        .union_arms
+        .iter()
+        .map(|arm| {
+            let variant_ident = resolved.name(&arm.name).pascal_ident.clone();
+            let default_attr = if arm.discriminant_value == 0 && default_is_unit {
+                quote! { #[default] }
+            } else {
+                TokenStream::new()
+            };
+            match &arm.payload {
+                ArmPayload::Void => quote! { #default_attr #variant_ident },
+                ArmPayload::Type(t) => {
+                    let ty = arm_payload_type_tokens(t, resolved);
+                    quote! { #default_attr #variant_ident(#ty) }
+                }
+                ArmPayload::Group(leaves) => {
+                    let fields: Vec<TokenStream> = leaves
+                        .iter()
+                        .map(|leaf| {
+                            let leaf_name = resolved.name(&leaf.name).snake_ident.clone();
+                            let leaf_ty = arm_payload_type_tokens(&leaf.type_name, resolved);
+                            quote! { #leaf_name: #leaf_ty }
+                        })
+                        .collect();
+                    quote! { #default_attr #variant_ident { #(#fields,)* } }
+                }
+            }
+        })
+        .collect();
+
+    let (derive_default, manual_default) = if default_is_unit {
+        (quote! { Default, }, TokenStream::new())
+    } else {
+        // Manual Default for a data-carrying @0 arm.
+        let manual = default_arm.map(|arm| {
+            let variant_ident = resolved.name(&arm.name).pascal_ident.clone();
+            let ctor = match &arm.payload {
+                ArmPayload::Void => quote! { Self::#variant_ident },
+                ArmPayload::Type(_) => quote! { Self::#variant_ident(Default::default()) },
+                ArmPayload::Group(leaves) => {
+                    let fields: Vec<TokenStream> = leaves.iter().map(|leaf| {
+                        let leaf_name = resolved.name(&leaf.name).snake_ident.clone();
+                        quote! { #leaf_name: Default::default() }
+                    }).collect();
+                    quote! { Self::#variant_ident { #(#fields,)* } }
+                }
+            };
+            quote! {
+                impl Default for #enum_name {
+                    fn default() -> Self { #ctor }
+                }
+            }
+        }).unwrap_or_default();
+        (TokenStream::new(), manual)
+    };
+
+    quote! {
+        #[doc = #doc]
+        #[derive(Debug, Clone, #derive_default PartialEq, serde::Serialize, serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        pub enum #enum_name {
+            #(#variants,)*
+        }
+        #manual_default
+    }
+}
+
+/// Generate the value-setter for a scalar/Text/Data/enum/struct union-arm payload.
+///
+/// `value` is a binding (e.g. `v`) holding `&T` for the arm's owned Rust type.
+/// `setter`/`init` are the capnp builder method idents for this arm.
+fn union_arm_value_setter(
+    type_name: &str,
+    value: &TokenStream,
+    setter: &proc_macro2::Ident,
+    init: &proc_macro2::Ident,
+    resolved: &ResolvedSchema,
+    capnp_mod: &TokenStream,
+    service_name: &str,
+    types_crate: Option<&syn::Path>,
+) -> TokenStream {
+    let ct = resolved.resolve_type(type_name).capnp_type.clone();
+    match ct {
+        CapnpType::Bool | CapnpType::UInt8 | CapnpType::UInt16 | CapnpType::UInt32 | CapnpType::UInt64
+        | CapnpType::Int8 | CapnpType::Int16 | CapnpType::Int32 | CapnpType::Int64
+        | CapnpType::Float32 | CapnpType::Float64 => {
+            quote! { builder.#setter(*#value); }
+        }
+        CapnpType::Text => quote! { builder.#setter(#value.as_str()); },
+        CapnpType::Data => quote! { builder.#setter(#value.as_slice()); },
+        CapnpType::Enum(ref name) => {
+            if let Some(e) = resolved.find_enum(name) {
+                let field_capnp_mod = resolve_capnp_mod(
+                    lookup_origin_file(name, resolved),
+                    service_name,
+                    types_crate,
+                );
+                let enum_rust = format_ident!("{}", name);
+                let type_ident = format_ident!("{}", name);
+                let arms: Vec<TokenStream> = e.variants.iter().map(|(vname, _)| {
+                    let vp = resolved.name(vname).pascal_ident.clone();
+                    quote! { #enum_rust::#vp => #field_capnp_mod::#type_ident::#vp }
+                }).collect();
+                quote! { builder.#setter(match #value { #(#arms,)* }); }
+            } else {
+                TokenStream::new()
+            }
+        }
+        CapnpType::Struct(_) => {
+            quote! {
+                let mut __arm = builder.reborrow().#init();
+                hyprstream_rpc::capnp::ToCapnp::write_to(#value, &mut __arm);
+            }
+        }
+        _ => {
+            let _ = capnp_mod;
+            TokenStream::new()
+        }
+    }
+}
+
+/// Generate `ToCapnp` for a pure-union enum.
+fn generate_union_to_capnp_impl(
+    type_name: &str,
+    s: &StructDef,
+    resolved: &ResolvedSchema,
+    capnp_mod: &TokenStream,
+    service_name: &str,
+    types_crate: Option<&syn::Path>,
+) -> TokenStream {
+    let enum_name = format_ident!("{}", type_name);
+    let capnp_struct = format_ident!("{}", to_capnp_module_name(type_name));
+
+    let arms: Vec<TokenStream> = s.union_arms.iter().map(|arm| {
+        let variant = resolved.name(&arm.name).pascal_ident.clone();
+        let arm_snake = &resolved.name(&arm.name).snake;
+        let setter = format_ident!("set_{}", arm_snake);
+        let init = format_ident!("init_{}", arm_snake);
+        match &arm.payload {
+            ArmPayload::Void => {
+                quote! { Self::#variant => builder.#setter(()), }
+            }
+            ArmPayload::Type(t) => {
+                let value = quote! { v };
+                let set = union_arm_value_setter(t, &value, &setter, &init, resolved, capnp_mod, service_name, types_crate);
+                quote! { Self::#variant(v) => { #set } }
+            }
+            ArmPayload::Group(leaves) => {
+                let leaf_binds: Vec<TokenStream> = leaves.iter().map(|leaf| {
+                    let leaf_name = resolved.name(&leaf.name).snake_ident.clone();
+                    quote! { #leaf_name }
+                }).collect();
+                let leaf_sets: Vec<TokenStream> = leaves.iter().map(|leaf| {
+                    let leaf_snake = &resolved.name(&leaf.name).snake;
+                    let leaf_name = resolved.name(&leaf.name).snake_ident.clone();
+                    let leaf_setter = format_ident!("set_{}", leaf_snake);
+                    let ct = resolved.resolve_type(&leaf.type_name).capnp_type.clone();
+                    match ct {
+                        CapnpType::Text => quote! { __g.#leaf_setter(#leaf_name.as_str()); },
+                        CapnpType::Data => quote! { __g.#leaf_setter(#leaf_name.as_slice()); },
+                        CapnpType::Struct(_) => quote! {
+                            hyprstream_rpc::capnp::ToCapnp::write_to(#leaf_name, &mut __g.reborrow().#leaf_setter());
+                        },
+                        _ => quote! { __g.#leaf_setter(*#leaf_name); },
+                    }
+                }).collect();
+                quote! {
+                    Self::#variant { #(#leaf_binds,)* } => {
+                        let mut __g = builder.reborrow().#init();
+                        #(#leaf_sets)*
+                    }
+                }
+            }
+        }
+    }).collect();
+
+    quote! {
+        impl hyprstream_rpc::capnp::ToCapnp for #enum_name {
+            type Builder<'a> = #capnp_mod::#capnp_struct::Builder<'a>;
+
+            #[allow(unused_variables, unused_mut)]
+            fn write_to(&self, builder: &mut Self::Builder<'_>) {
+                match self {
+                    #(#arms)*
+                }
+            }
+        }
+    }
+}
+
+/// Generate `FromCapnp` for a pure-union enum.
+fn generate_union_from_capnp_impl(
+    type_name: &str,
+    s: &StructDef,
+    resolved: &ResolvedSchema,
+    capnp_mod: &TokenStream,
+    service_name: &str,
+    types_crate: Option<&syn::Path>,
+) -> TokenStream {
+    let enum_name = format_ident!("{}", type_name);
+    let capnp_struct = format_ident!("{}", to_capnp_module_name(type_name));
+    let union_mod = format_ident!("{}", to_capnp_module_name(type_name));
+
+    let arms: Vec<TokenStream> = s.union_arms.iter().map(|arm| {
+        let variant = resolved.name(&arm.name).pascal_ident.clone();
+        match &arm.payload {
+            ArmPayload::Void => {
+                quote! { #capnp_mod::#union_mod::Which::#variant(()) => Self::#variant, }
+            }
+            ArmPayload::Type(t) => {
+                let ct = resolved.resolve_type(t).capnp_type.clone();
+                match ct {
+                    // Scalars bind the value directly; no Result.
+                    CapnpType::Bool | CapnpType::UInt8 | CapnpType::UInt16 | CapnpType::UInt32 | CapnpType::UInt64
+                    | CapnpType::Int8 | CapnpType::Int16 | CapnpType::Int32 | CapnpType::Int64
+                    | CapnpType::Float32 | CapnpType::Float64 => {
+                        quote! { #capnp_mod::#union_mod::Which::#variant(v) => Self::#variant(v), }
+                    }
+                    // Text / Data / Struct bind a Result<Reader> — unwrap with `?`.
+                    CapnpType::Text => {
+                        quote! { #capnp_mod::#union_mod::Which::#variant(v) => Self::#variant(v?.to_str()?.to_string()), }
+                    }
+                    CapnpType::Data => {
+                        quote! { #capnp_mod::#union_mod::Which::#variant(v) => Self::#variant(v?.to_vec()), }
+                    }
+                    CapnpType::Enum(ref name) => {
+                        if let Some(e) = resolved.find_enum(name) {
+                            let field_capnp_mod = resolve_capnp_mod(
+                                lookup_origin_file(name, resolved),
+                                service_name,
+                                types_crate,
+                            );
+                            let enum_rust = format_ident!("{}", name);
+                            let type_ident = format_ident!("{}", name);
+                            let match_arms: Vec<TokenStream> = e.variants.iter().map(|(vname, _)| {
+                                let vp = resolved.name(vname).pascal_ident.clone();
+                                quote! { #field_capnp_mod::#type_ident::#vp => #enum_rust::#vp }
+                            }).collect();
+                            quote! { #capnp_mod::#union_mod::Which::#variant(v) => Self::#variant(match v? { #(#match_arms,)* }), }
+                        } else {
+                            quote! { #capnp_mod::#union_mod::Which::#variant(_) => Self::#variant(Default::default()), }
+                        }
+                    }
+                    CapnpType::Struct(_) => {
+                        quote! { #capnp_mod::#union_mod::Which::#variant(r) => Self::#variant(hyprstream_rpc::capnp::FromCapnp::read_from(r?)?), }
+                    }
+                    _ => quote! { #capnp_mod::#union_mod::Which::#variant(_) => Self::#variant(Default::default()), },
+                }
+            }
+            ArmPayload::Group(leaves) => {
+                let leaf_reads: Vec<TokenStream> = leaves.iter().map(|leaf| {
+                    let leaf_name = resolved.name(&leaf.name).snake_ident.clone();
+                    let leaf_getter = format_ident!("get_{}", resolved.name(&leaf.name).snake);
+                    let ct = resolved.resolve_type(&leaf.type_name).capnp_type.clone();
+                    match ct {
+                        CapnpType::Text => quote! { #leaf_name: g.#leaf_getter()?.to_str()?.to_string() },
+                        CapnpType::Data => quote! { #leaf_name: g.#leaf_getter()?.to_vec() },
+                        CapnpType::Struct(_) => quote! { #leaf_name: hyprstream_rpc::capnp::FromCapnp::read_from(g.#leaf_getter()?)? },
+                        _ => quote! { #leaf_name: g.#leaf_getter() },
+                    }
+                }).collect();
+                quote! { #capnp_mod::#union_mod::Which::#variant(g) => Self::#variant { #(#leaf_reads,)* }, }
+            }
+        }
+    }).collect();
+
+    quote! {
+        impl hyprstream_rpc::capnp::FromCapnp for #enum_name {
+            type Reader<'a> = #capnp_mod::#capnp_struct::Reader<'a>;
+
+            #[allow(unused_variables)]
+            fn read_from(reader: Self::Reader<'_>) -> anyhow::Result<Self> {
+                Ok(match reader.which()? {
+                    #(#arms)*
+                })
+            }
         }
     }
 }
@@ -472,10 +799,14 @@ fn generate_data_field_reader(
                     if n <= 32 {
                         quote! { #rust_name: {
                             let v = reader.#getter_name()?;
-                            if v.is_empty() { None } else {
+                            if v.is_empty() {
+                                None
+                            } else if v.len() == #n_usize {
                                 let mut arr = [0u8; #n_usize];
                                 arr.copy_from_slice(&v[..#n_usize]);
                                 Some(arr)
+                            } else {
+                                anyhow::bail!("optional fixed-size field: expected {} bytes, got {}", #n_usize, v.len());
                             }
                         }, }
                     } else {

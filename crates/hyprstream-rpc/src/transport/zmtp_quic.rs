@@ -37,7 +37,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::Notify;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, trace};
 
 // Re-export pure framing types from zmtp_framing (single source of truth).
 pub use crate::zmtp_framing::{ZmqSocketType, GREETING_SIZE, ZMTP_VERSION_MAJOR, ZMTP_VERSION_MINOR, MECHANISM_NULL};
@@ -384,7 +384,7 @@ impl QuicRep {
         Ok(())
     }
 
-    /// Accept loop for ZmqService handlers.
+    /// Accept loop for RequestService handlers.
     ///
     /// This variant handles the full envelope processing pipeline:
     /// 1. ZMTP handshake
@@ -392,11 +392,11 @@ impl QuicRep {
     /// 3. Service handle_request dispatch
     /// 4. Signed response serialization
     ///
-    /// Uses `spawn_local` because `ZmqService` is `?Send`.
+    /// Uses `spawn_local` because `RequestService` is `?Send`.
     ///
     /// # Arguments
     ///
-    /// * `service` - ZmqService implementation (wrapped in Rc)
+    /// * `service` - RequestService implementation (wrapped in Rc)
     /// * `server_pubkey` - Server's Ed25519 verifying key
     /// * `signing_key` - Server's Ed25519 signing key
     /// * `nonce_cache` - Nonce cache for replay protection (wrapped in Arc)
@@ -410,7 +410,7 @@ impl QuicRep {
         shutdown: Arc<Notify>,
     ) -> Result<()>
     where
-        S: crate::service::ZmqService + 'static,
+        S: crate::service::RequestService + 'static,
     {
         loop {
             tokio::select! {
@@ -419,7 +419,7 @@ impl QuicRep {
                     let nonce_cache = Arc::clone(&nonce_cache);
                     let signing_key = signing_key.clone();  // Clone before spawn
 
-                    // Use spawn_local because ZmqService is ?Send
+                    // Use spawn_local because RequestService is ?Send
                     tokio::task::spawn_local(async move {
                         match incoming.await {
                             Ok(conn) => {
@@ -459,7 +459,7 @@ impl QuicRep {
         nonce_cache: Arc<crate::envelope::InMemoryNonceCache>,
     ) -> Result<()>
     where
-        S: crate::service::ZmqService + 'static,
+        S: crate::service::RequestService + 'static,
     {
         let remote = conn.remote_address();
         debug!(?remote, "QUIC connection established");
@@ -508,7 +508,7 @@ impl QuicRep {
         nonce_cache: Arc<crate::envelope::InMemoryNonceCache>,
     ) -> Result<()>
     where
-        S: crate::service::ZmqService + 'static,
+        S: crate::service::RequestService + 'static,
     {
         let mut stream = ZmtpStream::new(QuicStream { send, recv });
 
@@ -529,7 +529,7 @@ impl QuicRep {
         // just don't pin it to the server's own key. JWT claims + Casbin handle
         // authorization.
         // subsecond::call wraps dispatch for hot-patching during dev
-        let (response_bytes, continuation) = subsecond::call(|| process_request(
+        let response_bytes = subsecond::call(|| crate::service::dispatch::process_request(
             raw_bytes,
             &*service,
             EnvelopeVerification::AnySigner,
@@ -543,14 +543,9 @@ impl QuicRep {
         };
         stream.send_multipart(&response.parts).await?;
 
-        // Signal end of response
+        // Signal end of response. Any streaming pump was already spawned inside
+        // process_request (#186).
         stream.stream.send.finish()?;
-
-        // Handle continuation if present (for streaming)
-        if let Some(cont) = continuation {
-            // Spawn continuation on LocalSet (streaming handler is ?Send)
-            tokio::task::spawn_local(cont);
-        }
 
         Ok(())
     }
@@ -1178,65 +1173,18 @@ impl AsyncWrite for QuicStream {
     }
 }
 
-/// Wrapper for h3-webtransport bidi stream halves to implement AsyncRead/AsyncWrite.
-/// Same pattern as QuicStream above, but for the H3 WebTransport layer.
-struct WtStream<S, R> {
-    send: S,
-    recv: R,
-}
-
-impl<S: Unpin, R: AsyncRead + Unpin> AsyncRead for WtStream<S, R> {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.recv).poll_read(cx, buf)
-    }
-}
-
-impl<S: AsyncWrite + Unpin, R: Unpin> AsyncWrite for WtStream<S, R> {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.send)
-            .poll_write(cx, buf)
-            .map_err(std::io::Error::other)
-    }
-
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.send)
-            .poll_flush(cx)
-            .map_err(std::io::Error::other)
-    }
-
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.send)
-            .poll_shutdown(cx)
-            .map_err(std::io::Error::other)
-    }
-}
-
 // ============================================================================
 // QuicServiceLoop - QUIC Transport Service Loop
 // ============================================================================
 
-/// Service loop for hosting ZmqService over QUIC transport.
+/// Service loop for hosting RequestService over QUIC transport.
 ///
-/// This struct wraps a `QuicRep` socket and a `ZmqService` implementation,
+/// This struct wraps a `QuicRep` socket and a `RequestService` implementation,
 /// running the QUIC accept loop in a dedicated thread with its own tokio runtime.
 ///
 /// # Threading Model
 ///
-/// `ZmqService` is `#[async_trait(?Send)]` - handlers are not `Send`. This requires:
+/// `RequestService` is `#[async_trait(?Send)]` - handlers are not `Send`. This requires:
 /// - Single-threaded runtime (`new_current_thread`)
 /// - `LocalSet` for non-Send futures
 /// - `spawn_local` instead of `tokio::spawn`
@@ -1260,14 +1208,13 @@ impl<S: AsyncWrite + Unpin, R: Unpin> AsyncWrite for WtStream<S, R> {
 /// ```
 pub struct QuicServiceLoop<S>
 where
-    S: crate::service::ZmqService + Send + Sync + 'static,
+    S: crate::service::RequestService + Send + Sync + 'static,
 {
     rep: QuicRep,
     service: S,
-    /// Server certificate DER bytes (for registration)
-    _cert_der: Vec<u8>,
-    /// ZMQ context (for Spawnable trait)
-    context: Arc<zmq::Context>,
+    /// Server leaf certificate DER bytes — used to pin the registered QUIC
+    /// endpoint (self-signed, so clients pin the SHA-256 rather than CA-validate).
+    cert_der: Vec<u8>,
     /// Service name
     name: String,
     /// QUIC endpoint address
@@ -1276,7 +1223,7 @@ where
 
 impl<S> QuicServiceLoop<S>
 where
-    S: crate::service::ZmqService + Send + Sync + 'static,
+    S: crate::service::RequestService + Send + Sync + 'static,
 {
     /// Create a new QUIC service loop.
     pub fn new(rep: QuicRep, service: S, cert_der: Vec<u8>) -> Result<Self> {
@@ -1285,8 +1232,7 @@ where
         Ok(Self {
             rep,
             service,
-            _cert_der: cert_der,
-            context: Arc::new(zmq::Context::new()),
+            cert_der,
             name,
             addr,
         })
@@ -1300,21 +1246,20 @@ where
 
 impl<S> crate::service::Spawnable for QuicServiceLoop<S>
 where
-    S: crate::service::ZmqService + Send + Sync + 'static,
+    S: crate::service::RequestService + Send + Sync + 'static,
 {
     fn name(&self) -> &str {
         &self.name
     }
 
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
-    }
-
     fn registrations(&self) -> Vec<(crate::registry::SocketKind, crate::transport::TransportConfig)> {
-        // Register QUIC endpoint
+        // Register the QUIC endpoint *pinned* by the self-signed leaf cert's
+        // SHA-256 — a plain (WebPki) registration would make clients CA-validate
+        // a self-signed cert and fail.
+        let pin = crate::transport::quinn_transport::cert_sha256(&self.cert_der);
         vec![(
             crate::registry::SocketKind::Rep,
-            crate::transport::TransportConfig::quic(self.addr, "hyprstream.local"),
+            crate::transport::TransportConfig::quic_pinned(self.addr, "hyprstream.local", pin),
         )]
     }
 
@@ -1351,504 +1296,6 @@ where
     }
 }
 
-// ============================================================================
-// WebTransport Server (browser clients)
-// ============================================================================
-
-/// WebTransport server for browser clients.
-///
-/// Accepts WebTransport sessions (HTTP/3) from browsers and handles
-/// ZMTP requests using the same ZmqService handlers as native QUIC.
-///
-/// # Browser Compatibility
-///
-/// Uses `serverCertificateHashes` in the WebTransport constructor to accept
-/// self-signed certificates. The browser passes the SHA-256 hash of the cert.
-///
-/// # Usage
-///
-/// ```ignore
-/// let (tls, cert_der) = server_tls_self_signed("localhost")?;
-/// let cert_hash = sha256(&cert_der);
-///
-/// let wt_server = WebTransportServer::bind(addr, tls)?;
-///
-/// // In browser:
-/// // const wt = new WebTransport('https://localhost:4433', {
-/// //   serverCertificateHashes: [{
-/// //     algorithm: 'sha-256',
-/// //     value: Uint8Array.from(atob(certHashBase64), c => c.charCodeAt(0))
-/// //   }]
-/// // });
-/// ```
-pub struct WebTransportServer {
-    endpoint: quinn::Endpoint,
-    /// Serialized RFC 9728 metadata JSON for GET /.well-known/oauth-protected-resource
-    protected_resource_json: Option<Vec<u8>>,
-    /// DER-encoded server certificate (for cert-hash endpoint)
-    cert_der: Vec<u8>,
-}
-
-/// Concrete h3-quinn stream types used throughout WebTransportServer.
-type H3QuinnBidiStream = h3_quinn::BidiStream<bytes::Bytes>;
-type H3QuinnRequestStream = h3::server::RequestStream<H3QuinnBidiStream, bytes::Bytes>;
-type H3QuinnConnection = h3::server::Connection<h3_quinn::Connection, bytes::Bytes>;
-type WtSession = h3_webtransport::server::WebTransportSession<h3_quinn::Connection, bytes::Bytes>;
-type WtBidiStream = h3_webtransport::stream::BidiStream<H3QuinnBidiStream, bytes::Bytes>;
-
-impl WebTransportServer {
-    /// Bind an HTTP/3 + WebTransport server to the given address with a certificate.
-    ///
-    /// Uses h3 + h3-quinn + h3-webtransport to serve both regular HTTP/3 GET requests
-    /// (e.g. `.well-known/oauth-protected-resource`) and WebTransport CONNECT sessions
-    /// (for ZMTP-framed Cap'n Proto RPC) on the same QUIC port.
-    ///
-    /// # Arguments
-    ///
-    /// * `addr` - Socket address to bind to
-    /// * `cert_der` - DER-encoded certificate
-    /// * `key_der` - DER-encoded private key
-    pub fn bind(
-        addr: SocketAddr,
-        cert_chain: Vec<Vec<u8>>,
-        key_der: Vec<u8>,
-    ) -> Result<Self> {
-        let tls = webtransport_tls_config(cert_chain.clone(), key_der)?;
-        let quic_cfg = quinn::ServerConfig::with_crypto(Arc::new(
-            quinn::crypto::rustls::QuicServerConfig::try_from(tls)
-                .map_err(|e| anyhow!("QUIC server config failed: {}", e))?
-        ));
-        let endpoint = quinn::Endpoint::server(quic_cfg, addr)?;
-
-        // Store leaf cert for cert-hash endpoint
-        let cert_der = cert_chain.into_iter().next().unwrap_or_default();
-        Ok(Self { endpoint, protected_resource_json: None, cert_der })
-    }
-
-    /// Set RFC 9728 Protected Resource Metadata served at /.well-known/oauth-protected-resource.
-    pub fn with_protected_resource_metadata(mut self, json_bytes: Vec<u8>) -> Self {
-        self.protected_resource_json = Some(json_bytes);
-        self
-    }
-
-    /// Get the actual bound address from the QUIC endpoint.
-    ///
-    /// This returns the real OS-assigned address, which matters when
-    /// binding to port 0 (ephemeral port assignment).
-    pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.endpoint.local_addr().map_err(Into::into)
-    }
-
-    /// Accept connections and dispatch HTTP/3 + WebTransport.
-    ///
-    /// Uses `spawn_local` because `ZmqService` is `?Send`.
-    pub async fn accept_loop_service<S>(
-        self,
-        service: Rc<S>,
-        server_pubkey: ed25519_dalek::VerifyingKey,
-        signing_key: ed25519_dalek::SigningKey,
-        nonce_cache: Arc<crate::envelope::InMemoryNonceCache>,
-        shutdown: Arc<Notify>,
-    ) -> Result<()>
-    where
-        S: crate::service::ZmqService + 'static,
-    {
-        let metadata_json = self.protected_resource_json.map(Arc::new);
-        let cert_hash_hex = Arc::new(cert_hash_hex(&self.cert_der));
-
-        loop {
-            tokio::select! {
-                incoming = self.endpoint.accept() => {
-                    let Some(incoming) = incoming else { break; };
-                    let service = Rc::clone(&service);
-                    let nonce_cache = Arc::clone(&nonce_cache);
-                    let signing_key = signing_key.clone();
-                    let metadata = metadata_json.clone();
-                    let cert_hash = Arc::clone(&cert_hash_hex);
-
-                    tokio::task::spawn_local(async move {
-                        if let Err(e) = Self::handle_connection(
-                            incoming, service, server_pubkey, signing_key,
-                            nonce_cache, metadata, cert_hash,
-                        ).await {
-                            debug!("H3 connection error: {}", e);
-                        }
-                    });
-                }
-                _ = shutdown.notified() => {
-                    debug!("WebTransport accept loop shutting down");
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Handle an individual QUIC connection via h3.
-    ///
-    /// Routes incoming requests: WebTransport CONNECT upgrades go to
-    /// `handle_webtransport_session`, regular HTTP/3 GETs go to `handle_http_request`.
-    async fn handle_connection<S>(
-        incoming: quinn::Incoming,
-        service: Rc<S>,
-        server_pubkey: ed25519_dalek::VerifyingKey,
-        signing_key: ed25519_dalek::SigningKey,
-        nonce_cache: Arc<crate::envelope::InMemoryNonceCache>,
-        metadata_json: Option<Arc<Vec<u8>>>,
-        cert_hash_hex: Arc<String>,
-    ) -> Result<()>
-    where
-        S: crate::service::ZmqService + 'static,
-    {
-        let quinn_conn = incoming.await?;
-        let h3_conn = h3_quinn::Connection::new(quinn_conn);
-        let mut h3_server: H3QuinnConnection = h3::server::builder()
-            .enable_webtransport(true)
-            .max_webtransport_sessions(64)
-            .enable_datagram(true)
-            .enable_extended_connect(true)
-            .build(h3_conn)
-            .await
-            .map_err(|e| anyhow!("h3 server build failed: {}", e))?;
-
-        // Accept requests — route HTTP/3 GETs vs WebTransport CONNECT
-        loop {
-            match h3_server.accept().await {
-                Ok(Some(resolver)) => {
-                    let (req, stream) = resolver.resolve_request().await
-                        .map_err(|e| anyhow!("h3 resolve request failed: {}", e))?;
-
-                    // Check for WebTransport CONNECT upgrade
-                    let is_webtransport = req.method() == http::Method::CONNECT
-                        && req.extensions().get::<h3::ext::Protocol>()
-                            == Some(&h3::ext::Protocol::WEB_TRANSPORT);
-
-                    if is_webtransport {
-                        // Upgrade to WebTransport session (consumes h3 connection)
-                        let session: WtSession = h3_webtransport::server::WebTransportSession::accept(
-                            req, stream, h3_server,
-                        ).await
-                        .map_err(|e| anyhow!("WebTransport session accept failed: {}", e))?;
-
-                        Self::handle_webtransport_session(
-                            session, service, server_pubkey, signing_key,
-                            nonce_cache, metadata_json,
-                        ).await?;
-                        break; // session consumed the connection
-                    } else {
-                        // Regular HTTP/3 request
-                        Self::handle_http_request(req, stream, metadata_json.as_ref(), &cert_hash_hex).await?;
-                        // Continue accepting more requests on this connection
-                    }
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    debug!("H3 accept error: {}", e);
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Serve HTTP/3 requests: `.well-known/*` endpoints and `/health`.
-    async fn handle_http_request(
-        req: http::Request<()>,
-        mut stream: H3QuinnRequestStream,
-        metadata_json: Option<&Arc<Vec<u8>>>,
-        cert_hash_hex: &str,
-    ) -> Result<()> {
-        let (status, content_type, body) = match req.uri().path() {
-            "/.well-known/oauth-protected-resource" => {
-                if let Some(json) = metadata_json {
-                    (http::StatusCode::OK, "application/json", json.as_ref().clone())
-                } else {
-                    (http::StatusCode::NOT_FOUND, "text/plain", b"Not configured".to_vec())
-                }
-            }
-            "/.well-known/tui-cert-hash" => {
-                (http::StatusCode::OK, "text/plain", cert_hash_hex.as_bytes().to_vec())
-            }
-            "/health" => (http::StatusCode::OK, "text/plain", b"ok".to_vec()),
-            _ => (http::StatusCode::NOT_FOUND, "text/plain", b"Not found".to_vec()),
-        };
-
-        let response = http::Response::builder()
-            .status(status)
-            .header("content-type", content_type)
-            .body(())
-            .map_err(|e| anyhow!("failed to build HTTP response: {}", e))?;
-
-        stream.send_response(response).await
-            .map_err(|e| anyhow!("failed to send HTTP response: {}", e))?;
-        stream.send_data(bytes::Bytes::from(body)).await
-            .map_err(|e| anyhow!("failed to send HTTP body: {}", e))?;
-        stream.finish().await
-            .map_err(|e| anyhow!("failed to finish HTTP stream: {}", e))?;
-        Ok(())
-    }
-
-    /// Handle a WebTransport session: accept bidi streams for ZMTP-framed RPC,
-    /// and also handle any in-session HTTP/3 requests (via `AcceptedBi::Request`).
-    async fn handle_webtransport_session<S>(
-        session: WtSession,
-        service: Rc<S>,
-        server_pubkey: ed25519_dalek::VerifyingKey,
-        signing_key: ed25519_dalek::SigningKey,
-        nonce_cache: Arc<crate::envelope::InMemoryNonceCache>,
-        metadata_json: Option<Arc<Vec<u8>>>,
-    ) -> Result<()>
-    where
-        S: crate::service::ZmqService + 'static,
-    {
-        debug!("WebTransport session established");
-        loop {
-            match session.accept_bi().await {
-                Ok(Some(h3_webtransport::server::AcceptedBi::BidiStream(_session_id, stream))) => {
-                    let service = Rc::clone(&service);
-                    let nonce_cache = Arc::clone(&nonce_cache);
-                    let signing_key = signing_key.clone();
-                    tokio::task::spawn_local(async move {
-                        if let Err(e) = Self::handle_wt_stream(
-                            stream, service, server_pubkey, signing_key, nonce_cache,
-                        ).await {
-                            warn!("WebTransport stream error: {}", e);
-                        }
-                    });
-                }
-                Ok(Some(h3_webtransport::server::AcceptedBi::Request(req, stream))) => {
-                    // HTTP/3 request within WebTransport session
-                    if let Err(e) = Self::handle_http_request(req, stream, metadata_json.as_ref(), "").await {
-                        debug!("WebTransport in-session HTTP request error: {}", e);
-                    }
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    debug!("WebTransport session closed: {}", e);
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Handle a single WebTransport bidi stream: length-prefixed Cap'n Proto RPC
-    /// or stream subscription (detected by payload format).
-    ///
-    /// Detection: A Cap'n Proto SignedEnvelope starts with a segment table where the
-    /// first 4 bytes are typically 0x00000000 (1 segment). A subscription topic is a
-    /// short UTF-8 hex string (10-100 bytes). We try RPC first; on envelope verification
-    /// failure, fall back to subscription.
-    /// Handle a WebTransport bidi stream using ZMTP-Lite framing.
-    ///
-    /// Protocol: first frame is a ZMTP command with name "STREAM_TYPE" and body
-    /// "REQ" (RPC) or "SUB" (subscription). Remaining frames use standard ZMTP
-    /// multipart framing. No ZMTP greeting/READY exchange — both endpoints are
-    /// our code and TLS 1.3 via H3 handles authentication.
-    async fn handle_wt_stream<S>(
-        stream: WtBidiStream,
-        service: Rc<S>,
-        _server_pubkey: ed25519_dalek::VerifyingKey,
-        signing_key: ed25519_dalek::SigningKey,
-        nonce_cache: Arc<crate::envelope::InMemoryNonceCache>,
-    ) -> Result<()>
-    where
-        S: crate::service::ZmqService + 'static,
-    {
-        use h3::quic::BidiStream as H3BidiStream;
-        let (send, recv) = H3BidiStream::split(stream);
-        let mut zmtp = ZmtpStream::new(WtStream { send, recv });
-
-        // Read first frame — must be a STREAM_TYPE command
-        let cmd = zmtp.recv_command().await?;
-        ensure!(cmd.name == "STREAM_TYPE", "Expected STREAM_TYPE command, got '{}'", cmd.name);
-
-        let stream_type = std::str::from_utf8(&cmd.body)
-            .map_err(|_| anyhow!("Invalid STREAM_TYPE body"))?;
-
-        match stream_type {
-            "REQ" => {
-                // RPC path: read multipart request, process, send multipart response
-                let request = zmtp.recv_multipart().await?;
-                ensure!(!request.parts.is_empty(), "Empty RPC request");
-                let raw_bytes = &request.parts[0];
-
-                match subsecond::call(|| process_request(
-                    raw_bytes,
-                    &*service,
-                    EnvelopeVerification::AnySigner,
-                    &signing_key,
-                    &nonce_cache,
-                )).await {
-                    Ok((response_bytes, continuation)) => {
-                        zmtp.send_multipart(&[Bytes::from(response_bytes)]).await?;
-                        zmtp.stream.send.shutdown().await
-                            .map_err(std::io::Error::other)?;
-
-                        if let Some(cont) = continuation {
-                            tokio::task::spawn_local(cont);
-                        }
-                    }
-                    Err(e) => {
-                        warn!("WebTransport RPC error: {}", e);
-                        // Send error as a single-frame multipart so client gets a response
-                        let error_msg = format!("RPC error: {}", e);
-                        zmtp.send_multipart(&[Bytes::from(error_msg.into_bytes())]).await?;
-                        zmtp.stream.send.shutdown().await
-                            .map_err(std::io::Error::other)?;
-                    }
-                }
-            }
-            "SUB" => {
-                // Subscription path: read topic from next multipart, then forward blocks
-                let topic_msg = zmtp.recv_multipart().await?;
-                ensure!(!topic_msg.parts.is_empty(), "SUB: missing topic");
-                let topic_bytes = &topic_msg.parts[0];
-
-                debug!(topic_len = topic_bytes.len(), "WebTransport SUB stream");
-                Self::handle_stream_subscription_zmtp(zmtp, topic_bytes).await?;
-            }
-            "PUB" => {
-                // Client→server publish: read topic, forward ZMTP multipart into ZMQ PUSH.
-                // Used for ctrl channel messages (cancel, etc.) from browser clients.
-                let topic_msg = zmtp.recv_multipart().await?;
-                ensure!(!topic_msg.parts.is_empty(), "PUB: missing topic");
-                let topic_bytes = &topic_msg.parts[0];
-
-                debug!(topic_len = topic_bytes.len(), "WebTransport PUB stream");
-                Self::handle_stream_publish_zmtp(zmtp, topic_bytes).await?;
-            }
-            other => bail!("Unknown STREAM_TYPE: {}", other),
-        }
-
-        Ok(())
-    }
-
-
-
-    /// Handle a stream subscription using ZMTP multipart framing.
-    ///
-    /// Like `handle_stream_subscription` but sends each block as a ZMTP multipart
-    /// message (3 frames: topic, capnp, mac) instead of length-prefixed bytes.
-    async fn handle_stream_subscription_zmtp<S: AsyncRead + AsyncWrite + Unpin>(
-        mut zmtp: ZmtpStream<S>,
-        topic_bytes: &[u8],
-    ) -> Result<()> {
-        use crate::registry::{global as endpoint_registry, SocketKind};
-
-        let topic = std::str::from_utf8(topic_bytes)
-            .map_err(|e| anyhow!("Invalid UTF-8 subscription topic: {}", e))?;
-
-        debug!(topic = %topic, "WebTransport ZMTP stream subscription started");
-
-        let sub_endpoint = endpoint_registry()
-            .endpoint("streams", SocketKind::Sub)
-            .to_zmq_string();
-
-        // Channel carries multipart frames: Vec<Vec<u8>>
-        let (block_tx, mut block_rx) = tokio::sync::mpsc::channel::<Vec<Vec<u8>>>(64);
-        let topic_owned = topic.to_owned();
-        let sub_endpoint_owned = sub_endpoint.clone();
-
-        std::thread::spawn(move || {
-            let zmq_ctx = zmq::Context::new();
-            let sub_socket = match zmq_ctx.socket(zmq::SUB) {
-                Ok(s) => s,
-                Err(e) => { warn!("Failed to create SUB socket: {}", e); return; }
-            };
-            if let Err(e) = sub_socket.connect(&sub_endpoint_owned) {
-                warn!("SUB connect failed: {} endpoint={}", e, sub_endpoint_owned);
-                return;
-            }
-            if let Err(e) = sub_socket.set_subscribe(topic_owned.as_bytes()) {
-                warn!("SUB set_subscribe failed: {}", e);
-                return;
-            }
-            let _ = sub_socket.set_linger(0);
-            let _ = sub_socket.set_rcvtimeo(100);
-
-            loop {
-                if block_tx.is_closed() { break; }
-
-                // Receive full multipart: [topic, capnp_block, mac?]
-                match sub_socket.recv_multipart(0) {
-                    Ok(frames) => {
-                        if block_tx.blocking_send(frames).is_err() { break; }
-                    }
-                    Err(zmq::Error::EAGAIN) => continue,
-                    Err(e) => { warn!("ZMQ SUB recv error: {}", e); break; }
-                }
-            }
-        });
-
-        debug!(topic = %topic, endpoint = %sub_endpoint, "ZMQ SUB connected for ZMTP bridge");
-
-        // Forward loop: channel → ZMTP multipart on WebTransport stream
-        while let Some(frames) = block_rx.recv().await {
-            let parts: Vec<Bytes> = frames.into_iter().map(Bytes::from).collect();
-            if let Err(e) = zmtp.send_multipart(&parts).await {
-                debug!(topic = %topic, "ZMTP send error: {}", e);
-                break;
-            }
-        }
-
-        debug!(topic = %topic, "WebTransport ZMTP stream subscription ended");
-        Ok(())
-    }
-
-    /// Handle a client→server PUB stream using ZMTP multipart framing.
-    ///
-    /// Reads ZMTP multipart messages from the WebTransport stream and forwards
-    /// them into the ZMQ PUSH infrastructure. The existing `spawn_ctrl_listener`
-    /// SUB socket picks them up — same path as native ZMQ PUSH ctrl messages.
-    ///
-    /// Wire format per message: `[ctrl_topic, capnp_payload, mac]`
-    async fn handle_stream_publish_zmtp<S: AsyncRead + AsyncWrite + Unpin>(
-        mut zmtp: ZmtpStream<S>,
-        topic_bytes: &[u8],
-    ) -> Result<()> {
-        use crate::registry::{global as endpoint_registry, SocketKind};
-
-        let topic = std::str::from_utf8(topic_bytes)
-            .map_err(|e| anyhow!("Invalid UTF-8 PUB topic: {}", e))?;
-
-        debug!(topic = %topic, "WebTransport ZMTP PUB stream started");
-
-        let push_endpoint = endpoint_registry()
-            .endpoint("streams", SocketKind::Push)
-            .to_zmq_string();
-
-        // Create a sync ZMQ PUSH socket to forward ctrl messages
-        let zmq_ctx = zmq::Context::new();
-        let push_socket = zmq_ctx.socket(zmq::PUSH)
-            .map_err(|e| anyhow!("Failed to create PUSH socket: {}", e))?;
-        push_socket.connect(&push_endpoint)
-            .map_err(|e| anyhow!("PUSH connect to {}: {}", push_endpoint, e))?;
-        let _ = push_socket.set_linger(0);
-
-        // Read loop: ZMTP multipart from WebTransport → ZMQ PUSH
-        while let Ok(msg) = zmtp.recv_multipart().await {
-            if msg.parts.is_empty() {
-                continue;
-            }
-            // Forward all frames via ZMQ PUSH
-            for (i, frame) in msg.parts.iter().enumerate() {
-                let flags = if i < msg.parts.len() - 1 {
-                    zmq::SNDMORE | zmq::DONTWAIT
-                } else {
-                    zmq::DONTWAIT
-                };
-                if let Err(e) = push_socket.send(frame.as_ref(), flags) {
-                    warn!(topic = %topic, "PUSH send failed: {}", e);
-                    break;
-                }
-            }
-        }
-
-        debug!(topic = %topic, "WebTransport ZMTP PUB stream ended");
-        Ok(())
-    }
-}
 
 /// Compute SHA-256 hash of certificate for browser `serverCertificateHashes` (base64).
 pub fn cert_hash(cert_der: &[u8]) -> String {
@@ -1856,15 +1303,6 @@ pub fn cert_hash(cert_der: &[u8]) -> String {
     use sha2::{Sha256, Digest};
     let hash = Sha256::digest(cert_der);
     base64::engine::general_purpose::STANDARD.encode(hash)
-}
-
-/// Compute SHA-256 hash of certificate as hex string.
-///
-/// Used by `/.well-known/tui-cert-hash` — tests expect hex encoding.
-pub fn cert_hash_hex(cert_der: &[u8]) -> String {
-    use sha2::{Sha256, Digest};
-    let hash = Sha256::digest(cert_der);
-    hex::encode(hash)
 }
 
 // ============================================================================
@@ -1877,27 +1315,6 @@ pub fn cert_hash_hex(cert_der: &[u8]) -> String {
 /// No-op if already installed (safe to call multiple times).
 pub fn ensure_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
-}
-
-/// Build TLS config for HTTP/3 + WebTransport (ALPN: h3).
-///
-/// Accepts a certificate chain (leaf first, then intermediates/CA).
-/// For self-signed certs, the chain is just `vec![leaf]`.
-/// For CA-signed certs (e.g. mkcert), include leaf + CA cert.
-fn webtransport_tls_config(
-    cert_chain: Vec<Vec<u8>>,
-    key_der: Vec<u8>,
-) -> Result<rustls::ServerConfig> {
-    ensure_crypto_provider();
-    let key = rustls::pki_types::PrivateKeyDer::from(
-        rustls::pki_types::PrivatePkcs8KeyDer::from(key_der)
-    );
-    let certs = cert_chain.into_iter().map(Into::into).collect();
-    let mut cfg = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
-    cfg.alpn_protocols = vec![b"h3".to_vec()];
-    Ok(cfg)
 }
 
 /// Generate a self-signed TLS certificate for development/testing.
@@ -1969,119 +1386,8 @@ pub fn client_tls_system_roots() -> Result<rustls::ClientConfig> {
 /// verification. The only difference is step 1 of 4 in the verification pipeline.
 pub use crate::envelope::EnvelopeVerification;
 
-/// Process a request through the full envelope verification pipeline.
-///
-/// Unified handler for both ZMQ (ROUTER) and WebTransport paths. The only
-/// difference is envelope signer verification, controlled by `verification`.
-///
-/// # Pipeline
-///
-/// 1. Unwrap `SignedEnvelope` and verify Ed25519 signature (mode-dependent)
-/// 2. Verify JWT claims (`sub`, `exp`, `aud`, `scope`, downgrade protection)
-/// 3. Dispatch to `service.handle_request()` with verified `EnvelopeContext`
-/// 4. Sign response with server's `signing_key`
-///
-/// # Arguments
-///
-/// * `raw_bytes` - Raw Cap'n Proto bytes containing a `SignedEnvelope`
-/// * `service` - The ZmqService to dispatch to
-/// * `verification` - Envelope signer verification mode
-/// * `signing_key` - Server's signing key for response
-/// * `nonce_cache` - Nonce cache for replay protection
-///
-/// # Returns
-///
-/// * `Ok((response_bytes, continuation))` - Signed response and optional continuation
-/// * `Err(e)` - Processing error (already logged)
-pub async fn process_request<S>(
-    raw_bytes: &[u8],
-    service: &S,
-    verification: EnvelopeVerification<'_>,
-    signing_key: &ed25519_dalek::SigningKey,
-    nonce_cache: &crate::envelope::InMemoryNonceCache,
-) -> Result<(Vec<u8>, Option<crate::service::Continuation>)>
-where
-    S: crate::service::ZmqService,
-{
-    use crate::ToCapnp;
-    use crate::envelope::ResponseEnvelope;
-    use capnp::message::Builder;
-    use capnp::serialize;
-    use tracing::warn;
-
-    // 1. Unwrap, verify, and optionally decrypt the SignedEnvelope.
-    let opts = match verification {
-        EnvelopeVerification::FixedSigner(pubkey) =>
-            crate::envelope::UnwrapOptions::fixed_signer(pubkey, nonce_cache),
-        EnvelopeVerification::AnySigner =>
-            crate::envelope::UnwrapOptions::any_signer(nonce_cache),
-    }.with_decryption_key(signing_key);
-
-    let (mut ctx, payload) = match crate::envelope::unwrap_envelope(raw_bytes, &opts) {
-        Ok(result) => result,
-        Err(e) => {
-            warn!("{} envelope verification failed: {}", service.name(), e);
-            // Build error response with request_id=0 (envelope is invalid)
-            let error_payload = service.build_error_payload(0, &format!("envelope verification failed: {}", e));
-            let signed_response = ResponseEnvelope::new_signed(0, error_payload, signing_key);
-
-            let mut message = Builder::new_default();
-            let mut builder = message.init_root::<crate::common_capnp::response_envelope::Builder>();
-            signed_response.write_to(&mut builder);
-
-            let mut bytes = Vec::new();
-            serialize::write_message(&mut bytes, &message)?;
-            return Ok((bytes, None));
-        }
-    };
-
-    let request_id = ctx.request_id;
-    debug!(
-        "{} verified request from {} (id={})",
-        service.name(),
-        ctx.subject(),
-        request_id
-    );
-
-    // 2. Verify claims (E2E JWT, downgrade protection)
-    if let Err(e) = service.verify_claims(&mut ctx).await {
-        warn!(
-            "{} claims verification failed for {} (id={}): {}",
-            service.name(), ctx.subject(), request_id, e
-        );
-        let error_payload = service.build_error_payload(request_id, &e.to_string());
-        let signed_response = ResponseEnvelope::new_signed(request_id, error_payload, signing_key);
-
-        let mut message = Builder::new_default();
-        let mut builder = message.init_root::<crate::common_capnp::response_envelope::Builder>();
-        signed_response.write_to(&mut builder);
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-        return Ok((bytes, None));
-    }
-
-    // 3. Handle request
-    let (response_payload, continuation) = match service.handle_request(&ctx, &payload).await {
-        Ok((resp, cont)) => (resp, cont),
-        Err(e) => {
-            error!("{} request handling error: {}", service.name(), e);
-            (service.build_error_payload(request_id, &e.to_string()), None)
-        }
-    };
-
-    // 4. Sign and serialize response
-    let signed_response = ResponseEnvelope::new_signed(request_id, response_payload, signing_key);
-
-    let mut message = Builder::new_default();
-    let mut builder = message.init_root::<crate::common_capnp::response_envelope::Builder>();
-    signed_response.write_to(&mut builder);
-
-    let mut bytes = Vec::new();
-    serialize::write_message(&mut bytes, &message)?;
-
-    Ok((bytes, continuation))
-}
+// process_request moved to crate::service::dispatch (#148) — transport-neutral
+// dispatch core, shared by RequestLoop / WebTransport / LocalServiceBridge.
 
 // ============================================================================
 // Tests
