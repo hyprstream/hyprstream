@@ -92,10 +92,10 @@ rand = { workspace = true }
 zeroize = { workspace = true }
 
 # Kata Containers runtime-rs (hypervisor abstraction)
-kata-hypervisor = { git = "https://github.com/kata-containers/kata-containers", tag = "3.25.0", package = "hypervisor", features = ["cloud-hypervisor"] }
-kata-types = { git = "https://github.com/kata-containers/kata-containers", tag = "3.25.0" }
-kata-sys-util = { git = "https://github.com/kata-containers/kata-containers", tag = "3.25.0" }
-ch-config = { git = "https://github.com/kata-containers/kata-containers", tag = "3.25.0" }
+kata-hypervisor = { git = "https://github.com/kata-containers/kata-containers", tag = "3.31.0", package = "hypervisor", features = ["cloud-hypervisor"] }
+kata-types = { git = "https://github.com/kata-containers/kata-containers", tag = "3.31.0" }
+kata-sys-util = { git = "https://github.com/kata-containers/kata-containers", tag = "3.31.0" }
+ch-config = { git = "https://github.com/kata-containers/kata-containers", tag = "3.31.0" }
 
 [features]
 default = []
