@@ -18,5 +18,15 @@ tokio = { version = "1", features = ["sync", "rt"] }
 # Error handling
 anyhow = { workspace = true }
 
+# Native filesystem backends for the FsMount overlay adapter (FS-C #364).
+# fuse-backend-rs provides the FileSystem trait, OverlayFs (v1 overlay engine)
+# and PassthroughFs. The overlayfs/passthrough modules are Linux-only, so the
+# dependency is gated to non-wasm targets (the adapter/overlay code is too).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+fuse-backend-rs = "0.12"
+libc = "0.2"
+parking_lot = { workspace = true }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
+tempfile = "3"

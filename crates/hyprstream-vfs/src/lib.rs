@@ -16,11 +16,24 @@
 //!
 //! All types are WASM-compatible. Transport is abstracted via traits.
 
+mod fsmount;
 mod mount;
 mod namespace;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod proxy;
 
+// Native-only: the `FileSystem → FsMount` up-adapter and the OverlayFs-backed
+// v1 overlay engine. Both wrap `fuse_backend_rs`, whose overlay/passthrough
+// backends are Linux-only.
+#[cfg(not(target_arch = "wasm32"))]
+mod fuse_adapter;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod overlay;
+
+pub use fsmount::{FsMount, SetAttr};
 pub use hyprstream_rpc::Subject;
 pub use mount::{DirEntry, Fid, Mount, MountError, Stat, OREAD, OWRITE, ORDWR, OTRUNC, ORCLOSE};
 pub use namespace::{BindFlag, MountTarget, Namespace, NamespaceError};
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use fuse_adapter::FuseFileSystemMount;
