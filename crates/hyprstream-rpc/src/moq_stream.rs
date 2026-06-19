@@ -107,6 +107,11 @@ pub struct NodeStreamReach {
     pub server_name: String,
     /// Acceptable leaf-cert SHA-256 pins (self-signed mesh; rotation = multiple).
     pub cert_hashes: Vec<[u8; 32]>,
+    /// The node's own iroh `EndpointId` (Ed25519 public key, 32 bytes) when the
+    /// iroh substrate is bound (#357). `None` when iroh is disabled / unbound —
+    /// the node then advertises the Quic reach only. Native peers prefer this
+    /// direct, NAT-traversing, pkarr-discoverable reach (see [`producer_reach`]).
+    pub iroh_node_id: Option<[u8; 32]>,
 }
 
 /// Register the node's network-routable moq reach (idempotent — first wins).
@@ -123,6 +128,27 @@ pub fn global_producer_reach() -> Option<&'static NodeStreamReach> {
     GLOBAL_PRODUCER_REACH.get()
 }
 
+/// The node's own iroh `EndpointId` (Ed25519 public key) once the iroh substrate
+/// is bound (#357). Registered separately from [`GLOBAL_PRODUCER_REACH`] because
+/// the QUIC reach is set when the quinn server binds, whereas iroh binds slightly
+/// later in the same bootstrap; folding it back into the first-wins
+/// [`NodeStreamReach`] would require reordering the bind sequence.
+static GLOBAL_IROH_NODE_ID: OnceLock<[u8; 32]> = OnceLock::new();
+
+/// Register the node's iroh `EndpointId` so [`producer_reach`] can advertise an
+/// iroh-direct [`Destination`] for native peers (#357). Idempotent (first wins).
+///
+/// Called once when the daemon binds its iroh substrate (the `node_id` ==
+/// `signing_key.verifying_key()`, already covered by the node's DID).
+pub fn init_global_iroh_node_id(node_id: [u8; 32]) -> bool {
+    GLOBAL_IROH_NODE_ID.set(node_id).is_ok()
+}
+
+/// Borrow the node's registered iroh `EndpointId`, if the iroh substrate is bound.
+pub fn global_iroh_node_id() -> Option<&'static [u8; 32]> {
+    GLOBAL_IROH_NODE_ID.get()
+}
+
 /// Build the `StreamInfo.reach` list for a producer on this node (#274).
 ///
 /// Centralised so every producer site emits an identical reach, sourced from the
@@ -130,18 +156,35 @@ pub fn global_producer_reach() -> Option<&'static NodeStreamReach> {
 /// the node has no networked reach (UDS-only); co-located clients fall back to
 /// the same-host UDS fast path and ignore `reach` entirely.
 pub fn producer_reach() -> Vec<crate::stream_info::Destination> {
-    use crate::stream_info::{QuicReach, Destination, Role, TransportConfig};
-    match global_producer_reach() {
-        Some(r) => vec![Destination {
+    use crate::stream_info::{IrohReach, QuicReach, Destination, Role, TransportConfig};
+    let mut reach = Vec::new();
+
+    // iroh-direct first (#357): native peers prefer the NAT-traversing,
+    // pkarr-discoverable direct path. Listed ahead of Quic so the shared
+    // resolver (`connect_moq_reach`) tries it before the Quic/UDS fallbacks.
+    // The node_id comes from the iroh substrate bind (== signing_key pubkey),
+    // and is `None` when iroh is disabled/unbound (Quic-only advertisement).
+    if let Some(node_id) = global_iroh_node_id() {
+        reach.push(Destination {
+            role: Role::Direct,
+            transport: TransportConfig::Iroh(IrohReach { node_id: *node_id }),
+        });
+    }
+
+    // Quic / WebTransport reach: directly-reachable peers + browsers. Kept as a
+    // fallback alongside iroh (S1's fallbacks are preserved).
+    if let Some(r) = global_producer_reach() {
+        reach.push(Destination {
             role: Role::Direct,
             transport: TransportConfig::Quic(QuicReach {
                 addr: r.addr.to_string(),
                 server_name: r.server_name.clone(),
                 cert_hashes: r.cert_hashes.iter().map(|h| h.to_vec()).collect(),
             }),
-        }],
-        None => Vec::new(),
+        });
     }
+
+    reach
 }
 
 /// Start a UDS moq server in the background, serving the moq origin's consumer
@@ -813,14 +856,13 @@ fn reach_to_transport_config(
             };
             Some(TransportConfig::quic_with_auth(addr, q.server_name.clone(), auth))
         }
-        // #282 SEAM: `dial_stream` now dials an iroh `moql` reach
-        // (`EndpointType::Iroh { node_id, .. }`), but the **wire** reach enum's
-        // `Iroh` variant is a unit variant carrying no `node_id`/relay payload
-        // (it is code-generated from `stream.capnp`). Until that schema grows a
-        // `nodeId`/`relays` field, a StreamInfo cannot publish a dialable iroh
-        // reach, so this maps to `None` (publishers carry the Quic reach). The
-        // local `dial_stream` iroh arm is covered by the dial.rs loopback test.
-        ReachTransport::Iroh => None,
+        // #357: dial the wire-advertised iroh reach by node_id alone. iroh binds
+        // the dialed `moql` connection to this `EndpointId` (its Ed25519 pubkey),
+        // and the shared client endpoint's pkarr / n0 DNS discovery (`presets::N0`)
+        // resolves the routable addresses — so no direct addrs / relay are carried
+        // on the wire (see `IrohReach` in streaming.capnp). `dial_stream`'s iroh
+        // arm consumes this and opens the `moql` session.
+        ReachTransport::Iroh(i) => Some(TransportConfig::iroh(i.node_id, Vec::new(), None)),
     }
 }
 
@@ -1167,6 +1209,53 @@ mod tests {
             reach_to_transport_config(&reach).is_some(),
             "a Quic reach must resolve to a dialable TransportConfig (selects the \
              networked dial_stream path, not the local UDS)"
+        );
+    }
+
+    /// #357: an advertised iroh reach (carrying only the producer's node_id) must
+    /// resolve to a dialable `EndpointType::Iroh { node_id, .. }` — the dial-by-
+    /// node_id-alone path `dial_stream` opens over the `moql` ALPN (pkarr / n0 DNS
+    /// discovery resolves the addresses on the shared client endpoint). This is
+    /// the encode→resolve round-trip for the iroh-direct reach.
+    #[test]
+    fn iroh_reach_resolves_to_node_id() {
+        use crate::stream_info::{Destination, IrohReach, Role, TransportConfig as ReachTransport};
+        use crate::transport::EndpointType;
+
+        let node_id = [0x7u8; 32];
+        // This is exactly the Destination `producer_reach()` emits for the iroh arm.
+        let reach = Destination {
+            role: Role::Direct,
+            transport: ReachTransport::Iroh(IrohReach { node_id }),
+        };
+        assert_eq!(reach.role, Role::Direct, "iroh reach is a direct producer reach");
+
+        let cfg = reach_to_transport_config(&reach)
+            .expect("an iroh reach with a node_id must resolve to a dialable TransportConfig");
+        match cfg.endpoint {
+            EndpointType::Iroh { node_id: got, direct_addrs, relay_url } => {
+                assert_eq!(got, node_id, "resolved node_id must round-trip the advertised one");
+                // S2 advertises node_id alone; discovery supplies reachability.
+                assert!(direct_addrs.is_empty(), "S2 iroh reach carries no direct addrs (pkarr)");
+                assert!(relay_url.is_none(), "S2 iroh reach carries no relay URL (pkarr)");
+            }
+            other => panic!("iroh reach must resolve to EndpointType::Iroh, got {other:?}"),
+        }
+    }
+
+    /// #357: an iroh-only reach list must be classified as dialable, so a
+    /// native peer routes to the producer's iroh reach rather than falling
+    /// through to the local UDS plane (the source-of-truth ordering S1 established).
+    #[test]
+    fn iroh_reach_is_dialable() {
+        use crate::stream_info::{Destination, IrohReach, Role, TransportConfig as ReachTransport};
+        let reach = [Destination {
+            role: Role::Direct,
+            transport: ReachTransport::Iroh(IrohReach { node_id: [0xABu8; 32] }),
+        }];
+        assert!(
+            reach.iter().any(|d| reach_to_transport_config(d).is_some()),
+            "an iroh reach must resolve to a dialable TransportConfig"
         );
     }
 

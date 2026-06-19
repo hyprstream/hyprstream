@@ -169,10 +169,10 @@ struct TransportConfig {
   union {
     # Quic / WebTransport (web-transport-quinn). Dialed over `web_transport_quinn`.
     quic @0 :QuicReach;
-    # Reserved for NAT-traversing iroh dial (#274 follow-up). Capnp requires a
-    # union to have >= 2 members; this placeholder leaves room without a wire
-    # break when the iroh reach lands.
-    iroh @1 :Void;
+    # NAT-traversing iroh dial (#357). Carries the producer's iroh node_id so a
+    # native peer can dial-by-node_id over the `moql` ALPN, resolving addresses
+    # via pkarr / n0 DNS discovery (the shared client endpoint's `presets::N0`).
+    iroh @1 :IrohReach;
   }
 }
 
@@ -181,6 +181,18 @@ struct QuicReach {
   addr       @0 :Text;        # "host:port" socket address to dial.
   serverName @1 :Text;        # TLS SNI / WebPKI validation name.
   certHashes @2 :List(Data);  # Acceptable leaf-cert SHA-256 pins (self-signed mesh).
+}
+
+# Dial parameters for the iroh (NAT-traversing) arm (#357).
+#
+# Only the `nodeId` (the producer's iroh `EndpointId` = its Ed25519 public key)
+# is carried: iroh binds the dialed connection to this identity, and pkarr / n0
+# DNS discovery resolves the routable addresses on the shared client endpoint, so
+# a native peer dials by node_id alone (no addrs/relay on the wire). Reachability
+# hints (direct addrs, relay URL) are a deliberate follow-up (S6) — keeping the
+# advertised reach to the identity avoids leaking the producer's network topology.
+struct IrohReach {
+  nodeId @0 :Data $fixedSize(32);  # iroh EndpointId (Ed25519 public key, 32 bytes).
 }
 
 # Stream metadata returned when starting a stream

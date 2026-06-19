@@ -287,20 +287,15 @@ pub async fn dial_stream(
             };
             Ok(MoqStreamSession::Quinn(session))
         }
-        EndpointType::Iroh { direct_addrs, relay_url, .. }
-            if direct_addrs.is_empty() && relay_url.is_none() =>
-        {
-            // No reachability supplied → fail fast rather than hand iroh a bare
-            // EndpointId that falls through to discovery and times out (~10-30s).
-            // (Dial-by-node_id-alone via pkarr/DNS discovery is available on the
-            // shared endpoint, but the resolver is expected to supply at least a
-            // relay; see #282 pkarr seam.)
-            bail!(
-                "dial_stream(): iroh streaming reach has neither direct addrs nor a \
-                 relay URL — not dialable; the resolver must supply reachability"
-            )
-        }
         EndpointType::Iroh { node_id, direct_addrs, relay_url } => {
+            // #357: dial-by-node_id-alone is now supported — when no direct addrs
+            // or relay are supplied, the shared client endpoint's pkarr / n0 DNS
+            // discovery (`presets::N0`) resolves the routable addresses from the
+            // `EndpointId`. This is the S2 native-peer direct path (the wire
+            // `IrohReach` carries only the node_id). When the resolver *does*
+            // supply direct addrs / a relay, they are used as hints to skip /
+            // accelerate discovery (faster than waiting on pkarr).
+            //
             // #282: dial the iroh `moql` ALPN from the shared process-wide client
             // endpoint (the SAME endpoint the daemon's inbound iroh substrate
             // listens on, installed once at startup), then wrap the authenticated
@@ -483,12 +478,22 @@ mod tests {
     }
 
     #[test]
-    fn dial_stream_iroh_without_reach_fails_fast() {
-        // An iroh reach with neither direct addrs nor a relay is not dialable —
-        // dial_stream must fail fast rather than hang in discovery.
+    fn dial_stream_iroh_node_id_alone_requires_installed_endpoint() {
+        // #357: dial-by-node_id-alone is supported (pkarr / n0 DNS discovery
+        // resolves addresses from the EndpointId on the shared client endpoint),
+        // so an iroh reach with no direct addrs / relay is no longer rejected
+        // up-front. With no client endpoint installed, the dial still fails — but
+        // because the shared dialer is missing, not because reachability is absent.
         let cfg = TransportConfig::iroh([1u8; 32], Vec::new(), None);
-        let res = futures::executor::block_on(dial_stream(&cfg));
-        assert!(res.is_err(), "iroh reach with no reachability must fail fast");
+        let err = match futures::executor::block_on(dial_stream(&cfg)) {
+            Ok(_) => panic!("dial must fail with no installed iroh client endpoint"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("no iroh client endpoint installed"),
+            "expected an install-endpoint error (node_id-alone is dialable once an \
+             endpoint is installed); got: {err}"
+        );
     }
 
     /// #282: `dial_stream`'s iroh arm dials the `moql` ALPN and returns a live
