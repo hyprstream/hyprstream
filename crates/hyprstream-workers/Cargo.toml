@@ -12,6 +12,10 @@ hyprstream-rpc = { path = "../hyprstream-rpc" }
 hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }
 hyprstream-service = { path = "../hyprstream-service" }
 hyprstream-vfs = { path = "../hyprstream-vfs" }
+# FS-A's vhost-user-fs server (native-only): serves a composed per-sandbox
+# Namespace to a Cloud Hypervisor guest. FS-D wires the compose→serve→attach
+# flow. Native-only (vhost-user-fs/fuse-backend-rs transport are Linux-only).
+hyprstream-vfs-server = { path = "../hyprstream-vfs-server" }
 hyprstream-tcl = { path = "../hyprstream-tcl" }
 
 # Async runtime
@@ -114,6 +118,8 @@ tempfile = { workspace = true }
 # FS-B0 RAFS bootstrap builder tests: synthesize small OCI layer tarballs.
 tar = "0.4"
 flate2 = "1"
+# FS-D down-adapter test: S_IFMT/S_IFDIR constants when driving the FileSystem.
+libc = "0.2"
 
 [lints]
 workspace = true

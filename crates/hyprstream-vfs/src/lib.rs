@@ -22,6 +22,11 @@ mod namespace;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod proxy;
 
+// Native injected mounts (FS-D, #365): the `Send + Sync` ports of the wasm-only
+// `/stream` / synthetic injected mounts, suitable for serving to a CH guest.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod injected;
+
 // Native-only: the `FileSystem → FsMount` up-adapter and the OverlayFs-backed
 // v1 overlay engine. Both wrap `fuse_backend_rs`, whose overlay/passthrough
 // backends are Linux-only.
@@ -40,6 +45,9 @@ pub use namespace::{BindFlag, MountTarget, Namespace, NamespaceError};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use fuse_adapter::FuseFileSystemMount;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use injected::{StreamMount, StreamRegistry, SyntheticMount, SyntheticNode};
 
 // Overlay composition surface (FS-C v1 engine). Re-exported so downstream crates
 // (FS-B) can build a RAFS lower as a `BoxedLayer` via [`overlay::layer_from_fs`]

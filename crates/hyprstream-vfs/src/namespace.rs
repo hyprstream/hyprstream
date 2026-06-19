@@ -404,6 +404,13 @@ impl Namespace {
         let path = normalize_path(path);
 
         for entry in &self.mounts {
+            // A root mount ("/") is the catch-all: every path resolves to it
+            // with the full path as remainder. Guarded specially because
+            // `format!("{}/", "/")` would be "//", which `starts_with` never
+            // matches — so a `/`-rooted rootfs (FS-D) would otherwise be unreachable.
+            if entry.prefix == "/" {
+                return Ok((&entry.targets, path));
+            }
             if path == entry.prefix || path.starts_with(&format!("{}/", entry.prefix)) {
                 let remainder = path[entry.prefix.len()..].to_owned();
                 return Ok((&entry.targets, remainder));
@@ -617,6 +624,24 @@ mod tests {
 
         let data = child.cat("/srv/model/status", &test_subject()).await.unwrap();
         assert_eq!(data, b"loaded");
+    }
+
+    /// A `/`-rooted mount (FS-D rootfs) is the catch-all: deep paths resolve to
+    /// it, and longer prefixes still win over it (longest-prefix order).
+    #[tokio::test]
+    async fn root_mount_is_catch_all() {
+        let mut ns = Namespace::new();
+        let rootfs: MountTarget = Arc::new(MemMount::new(vec![("etc/hostname", b"host\n")]));
+        ns.mount("/", rootfs).unwrap();
+        let stream: MountTarget = Arc::new(MemMount::new(vec![("job/data", b"chunk")]));
+        ns.mount("/stream", stream).unwrap();
+
+        // Deep rootfs path resolves through "/".
+        assert_eq!(ns.cat("/etc/hostname", &test_subject()).await.unwrap(), b"host\n");
+        // A longer prefix still wins over the root catch-all.
+        assert_eq!(ns.cat("/stream/job/data", &test_subject()).await.unwrap(), b"chunk");
+        // The rootfs itself is reachable at "/".
+        assert!(ns.resolve_targets("/").is_ok());
     }
 
     #[tokio::test]
