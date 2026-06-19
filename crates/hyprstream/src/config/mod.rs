@@ -1603,6 +1603,18 @@ pub struct RuntimeConfig {
     /// consumed by `runtime::DevicePool`.
     #[serde(default)]
     pub devices: Vec<usize>,
+    /// Fail fast when a *requested* GPU is unavailable instead of silently
+    /// downgrading to CPU (#315, epic #310).
+    ///
+    /// A process told to run on GPU 3 that silently lands on CPU tanks a pipeline
+    /// split, so strictness is the safe default for the multi-GPU path. This only
+    /// affects the case where a GPU was *explicitly* requested (`use_gpu` with an
+    /// explicit `gpu_device_id`/`devices`); pure auto-detect (`use_gpu` with no
+    /// device requested) still falls back to CPU so the legacy single-GPU
+    /// "use a GPU if there is one" behavior is unchanged.
+    /// Defaults to `true`; override with `HYPRSTREAM_STRICT_DEVICE=0`.
+    #[serde(default = "default_strict_device")]
+    pub strict_device: bool,
     /// GPU layers to offload (None = auto)
     pub gpu_layers: Option<usize>,
     /// Use memory mapping for model files
@@ -1616,6 +1628,15 @@ pub struct RuntimeConfig {
     pub max_concurrent_generations: usize,
     pub default_generation_timeout_ms: u64,
     pub default_model_load_timeout_ms: u64,
+}
+
+/// Default for [`RuntimeConfig::strict_device`]: strict (fail-fast) unless
+/// `HYPRSTREAM_STRICT_DEVICE` is set to a falsy value. Strictness is the safe
+/// default for the multi-GPU path (#315).
+fn default_strict_device() -> bool {
+    std::env::var("HYPRSTREAM_STRICT_DEVICE")
+        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true)
 }
 
 impl Default for RuntimeConfig {
@@ -1660,6 +1681,7 @@ impl Default for RuntimeConfig {
             use_gpu: true,
             gpu_device_id, // From env or None (auto-detect device 0)
             devices,       // From HYPRSTREAM_GPU_DEVICES or empty (→ fall back to gpu_device_id)
+            strict_device: default_strict_device(),
             gpu_layers: None,
             mmap: true,
             kv_cache_size_mb: 2048,
@@ -2668,6 +2690,34 @@ mod tests {
                 cfg.resolve_explicit_multi_device_indices().unwrap(),
                 Some(vec![5])
             );
+        }
+    }
+
+    /// Serializes tests mutating the shared `HYPRSTREAM_STRICT_DEVICE` env var.
+    static STRICT_DEVICE_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// #315: strict_device defaults to fail-fast, and can be opted out via env.
+    #[test]
+    fn strict_device_defaults_to_true_and_respects_env() {
+        let _serial = STRICT_DEVICE_ENV_LOCK.lock();
+
+        {
+            let _g = EnvVarGuard::unset("HYPRSTREAM_STRICT_DEVICE");
+            assert!(
+                RuntimeConfig::default().strict_device,
+                "strict_device must default to true (safe default for multi-GPU)"
+            );
+        }
+        for falsy in ["0", "false", "no", "off"] {
+            let _g = EnvVarGuard::set("HYPRSTREAM_STRICT_DEVICE", falsy);
+            assert!(
+                !RuntimeConfig::default().strict_device,
+                "HYPRSTREAM_STRICT_DEVICE={falsy} must disable strict_device"
+            );
+        }
+        {
+            let _g = EnvVarGuard::set("HYPRSTREAM_STRICT_DEVICE", "1");
+            assert!(RuntimeConfig::default().strict_device);
         }
     }
 
