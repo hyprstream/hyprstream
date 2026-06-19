@@ -378,6 +378,10 @@ where
         Ok(Self::entry_stat("", &attr))
     }
 
+    fn as_fsmount(&self) -> Option<&dyn FsMount> {
+        Some(self)
+    }
+
     async fn clunk(&self, fid: Fid, _caller: &Subject) {
         let ctx = context();
         let Some(inner) = fid.downcast_ref::<FuseFid>() else {

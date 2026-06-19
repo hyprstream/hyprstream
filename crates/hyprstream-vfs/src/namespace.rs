@@ -342,6 +342,59 @@ impl Namespace {
         }
     }
 
+    /// Resolve a path to its mount targets (bind order) and the path components
+    /// **relative to the matched mount root**.
+    ///
+    /// This is the public, fid-level routing entry point used by FS-A's
+    /// `Namespace → FileSystem` down-adapter, which (unlike `cat`/`ls`/`echo`)
+    /// drives `walk`/`open`/`read`/`write`/`clunk` on the mount itself and needs
+    /// the raw targets plus the component slice. Returns the targets in bind
+    /// order (`Before` first, `After` last) so the caller can apply the same
+    /// union/fallthrough policy the convenience helpers do.
+    ///
+    /// `path` is normalised (`.`/`..` resolved, leading `/` enforced) before the
+    /// longest-prefix match, identical to the convenience helpers.
+    pub fn resolve_targets(&self, path: &str) -> Result<(Vec<MountTarget>, Vec<String>), NamespaceError> {
+        let (targets, remainder) = self.resolve(path)?;
+        let components = split_path(&remainder).into_iter().map(str::to_owned).collect();
+        Ok((targets.to_vec(), components))
+    }
+
+    /// Whether `path` is an *intermediate* directory — a path that is not itself
+    /// a mount prefix but is a strict ancestor of one (e.g. `/srv` when only
+    /// `/srv/model` is mounted). Used by the down-adapter to synthesise
+    /// directory inodes for the parts of the tree the namespace spans implicitly.
+    ///
+    /// Returns the synthetic child directory names if so (deduped, no order
+    /// guarantee), or `None` if `path` is neither a mount nor an ancestor.
+    pub fn intermediate_children(&self, path: &str) -> Option<Vec<String>> {
+        let normalized = normalize_path(path);
+        // A real mount prefix is not "intermediate".
+        if self.mounts.iter().any(|m| m.prefix == normalized) {
+            return None;
+        }
+        let prefix_with_slash = if normalized == "/" {
+            "/".to_owned()
+        } else {
+            format!("{normalized}/")
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut names = Vec::new();
+        for m in &self.mounts {
+            if let Some(rest) = m.prefix.strip_prefix(&prefix_with_slash[..]) {
+                let next = rest.split('/').next().unwrap_or("");
+                if !next.is_empty() && seen.insert(next.to_owned()) {
+                    names.push(next.to_owned());
+                }
+            }
+        }
+        if names.is_empty() {
+            None
+        } else {
+            Some(names)
+        }
+    }
+
     // ── Internal ────────────────────────────────────────────────────────────
 
     /// Resolve a path to (list of MountTargets, remainder after prefix).

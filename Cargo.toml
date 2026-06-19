@@ -18,6 +18,7 @@ members = [
     "crates/hyprstream-compositor",
     "crates/hyprstream-tui",
     "crates/hyprstream-vfs",
+    "crates/hyprstream-vfs-server",
     "crates/hyprstream-tcl",
     "crates/chat-core",
     "crates/hyprstream-rpc-std",
