@@ -1071,6 +1071,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::unwrap_used)]
+    #[allow(clippy::expect_used)]
     fn flat_slice_parses_unaligned_block() {
         // The zero-copy verifier (`stream_consumer`) parses StreamBlocks via
         // `read_message_from_flat_slice` over `Bytes` that come straight from the
