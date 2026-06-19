@@ -341,14 +341,25 @@ impl TorchEngine {
         let device = if config.use_gpu {
             // Use specified GPU device ID, or auto-detect
             let gpu_device = if let Some(device_id) = config.gpu_device_id {
-                // Check if CUDA/ROCm is available at all
+                // A GPU was *explicitly* requested. Check if CUDA/ROCm is available.
                 if Device::cuda_if_available() != Device::Cpu {
                     Device::Cuda(device_id)
+                } else if config.strict_device {
+                    // No-fragile-fallbacks (#315): a process told to use GPU N that
+                    // silently lands on CPU tanks the pipeline. Fail fast instead.
+                    return Err(anyhow!(
+                        "GPU {device_id} explicitly requested but CUDA/ROCm is not available; \
+                         refusing to silently fall back to CPU (strict_device). \
+                         Set HYPRSTREAM_STRICT_DEVICE=0 to allow CPU fallback."
+                    ));
                 } else {
                     info!("⚠️  GPU {} requested but CUDA/ROCm not available, falling back to CPU", device_id);
                     Device::Cpu
                 }
             } else {
+                // Pure auto-detect ("use a GPU if there is one"): CPU fallback is
+                // the intended behavior here even under strict_device, since no
+                // specific device was requested.
                 Device::cuda_if_available()
             };
 

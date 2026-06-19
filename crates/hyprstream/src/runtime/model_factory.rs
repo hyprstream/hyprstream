@@ -7,13 +7,65 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::Path;
 use tch::{Device, Kind as DType, Tensor};
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 use super::architectures::{gemma::GemmaModel, llama::LlamaModel, ModelOperations};
 use super::KVQuantType;
 use super::model_config::{ModelArchitecture, ModelConfig};
 use super::torch_utils::{safe_to_device, estimate_tensor_size_mb};
 use crate::services::WorktreeClient;
+
+/// Strict-loader opt-in (#315): when set truthy, multi-shard models that lack a
+/// `model.safetensors.index.json` manifest are rejected instead of silently
+/// reconstructing the shard set from a filename glob (which is fragile across
+/// model families and can silently drop/duplicate shards).
+const STRICT_LOADER_ENV: &str = "HYPRSTREAM_STRICT_LOADER";
+
+fn strict_loader_enabled() -> bool {
+    std::env::var(STRICT_LOADER_ENV)
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// Glob-fallback shard discovery, shared by the sync/async loader paths.
+///
+/// Loud by design (#315): a multi-shard model reached via glob (no index.json) is
+/// a silent-degrade path — it warns, and under [`STRICT_LOADER_ENV`] it is a hard
+/// error. A single globbed shard is unambiguous and passes quietly.
+fn glob_shard_files(model_path: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let mut shard_files = Vec::new();
+    for entry in std::fs::read_dir(model_path)? {
+        let entry = entry?;
+        if let Some(name) = entry.file_name().to_str() {
+            if (name.starts_with("model-") || name.starts_with("model.safetensors-"))
+                && name.ends_with(".safetensors")
+            {
+                shard_files.push(entry.path());
+            }
+        }
+    }
+    shard_files.sort();
+
+    if shard_files.len() > 1 {
+        if strict_loader_enabled() {
+            return Err(anyhow!(
+                "{} multi-shard safetensors files found in {} but no \
+                 model.safetensors.index.json manifest; refusing to reconstruct the \
+                 shard set from a filename glob under {STRICT_LOADER_ENV}. \
+                 Provide the index.json manifest.",
+                shard_files.len(),
+                model_path.display()
+            ));
+        }
+        warn!(
+            "⚠️ No model.safetensors.index.json in {}; reconstructing {} shards from a \
+             filename glob (fragile). Set {STRICT_LOADER_ENV}=1 to require the manifest.",
+            model_path.display(),
+            shard_files.len()
+        );
+    }
+    Ok(shard_files)
+}
 
 /// Factory for creating models with proper configuration management
 pub struct ModelFactory;
@@ -135,20 +187,8 @@ impl ModelFactory {
             return Ok(vec![single_file]);
         }
 
-        // 3. Fallback: glob for known shard naming patterns
-        let mut shard_files = Vec::new();
-        for entry in std::fs::read_dir(model_path)? {
-            let entry = entry?;
-            if let Some(name) = entry.file_name().to_str() {
-                if (name.starts_with("model-") || name.starts_with("model.safetensors-"))
-                    && name.ends_with(".safetensors")
-                {
-                    shard_files.push(entry.path());
-                }
-            }
-        }
-        shard_files.sort();
-        Ok(shard_files)
+        // 3. Fallback: glob for known shard naming patterns (loud / strict-gated)
+        glob_shard_files(model_path)
     }
 
     /// Parse shard filenames from `model.safetensors.index.json`.
@@ -245,20 +285,8 @@ impl ModelFactory {
                 if index_path.exists() {
                     return Self::shard_files_from_index(&model_path_buf, &index_path);
                 }
-                // Fallback glob
-                let mut files = Vec::new();
-                for entry in std::fs::read_dir(&model_path_buf)? {
-                    let entry = entry?;
-                    if let Some(name) = entry.file_name().to_str() {
-                        if (name.starts_with("model-") || name.starts_with("model.safetensors-"))
-                            && name.ends_with(".safetensors")
-                        {
-                            files.push(entry.path());
-                        }
-                    }
-                }
-                files.sort();
-                Ok(files)
+                // Fallback glob (loud / strict-gated)
+                glob_shard_files(&model_path_buf)
             })
             .await??;
 
@@ -285,10 +313,16 @@ impl ModelFactory {
         device: &Device,
         dtype: DType,
     ) -> Result<()> {
-        // Check if mmap is enabled via environment variable
+        // Check if mmap is enabled via environment variable.
+        //
+        // #315 note: mmap is an opt-in *optimization* selected solely by this env
+        // var (it is independent of `RuntimeConfig.mmap`, which today gates nothing
+        // here). It is not a correctness fallback — both paths deserialize the same
+        // tensors — so it is left as-is, but logged so the chosen path is explicit.
         let use_mmap = std::env::var("HYPRSTREAM_USE_MMAP")
             .map(|v| v.to_lowercase() == "true" || v == "1")
             .unwrap_or(false);
+        debug!("safetensors load path: {}", if use_mmap { "mmap" } else { "read" });
 
         // Load file data in a blocking task to avoid blocking the async runtime
         let path_buf = path.to_path_buf();
