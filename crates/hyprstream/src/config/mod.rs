@@ -1628,6 +1628,41 @@ pub struct RuntimeConfig {
     pub max_concurrent_generations: usize,
     pub default_generation_timeout_ms: u64,
     pub default_model_load_timeout_ms: u64,
+
+    /// Continuous / in-flight batching (#329, epic #310). **Default: off.**
+    ///
+    /// When enabled, the inference scheduler groups concurrent decode steps of
+    /// same-tenant-delta sequences into a single batched forward (Llama only).
+    /// When off, each stream runs the unchanged batch=1 decode path. Override
+    /// with `HYPRSTREAM_CONTINUOUS_BATCH` (truthy = on). Off by default while the
+    /// scheduler wiring lands incrementally — the batched kernel is correctness-
+    /// gated by `batched_ragged_decode_matches_serial`.
+    #[serde(default = "default_continuous_batching")]
+    pub continuous_batching: bool,
+    /// Max sequences fused into one batched decode step when
+    /// [`Self::continuous_batching`] is on (spike default 16). Tunable via
+    /// `HYPRSTREAM_CONTINUOUS_BATCH_MAX`.
+    #[serde(default = "default_continuous_batch_max")]
+    pub continuous_batch_max: usize,
+}
+
+/// Default for [`RuntimeConfig::continuous_batching`]: off unless
+/// `HYPRSTREAM_CONTINUOUS_BATCH` is set truthy (#329). Off is the safe default —
+/// the batch=1 path is the verified reference.
+fn default_continuous_batching() -> bool {
+    std::env::var("HYPRSTREAM_CONTINUOUS_BATCH")
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// Default for [`RuntimeConfig::continuous_batch_max`] (#329): 16 (spike rec),
+/// overridable via `HYPRSTREAM_CONTINUOUS_BATCH_MAX`.
+fn default_continuous_batch_max() -> usize {
+    std::env::var("HYPRSTREAM_CONTINUOUS_BATCH_MAX")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(16)
 }
 
 /// Default for [`RuntimeConfig::strict_device`]: strict (fail-fast) unless
@@ -1690,6 +1725,8 @@ impl Default for RuntimeConfig {
             max_concurrent_generations: 10,
             default_generation_timeout_ms: 120000, // 2 minutes
             default_model_load_timeout_ms: 300000, // 5 minutes
+            continuous_batching: default_continuous_batching(),
+            continuous_batch_max: default_continuous_batch_max(),
         }
     }
 }

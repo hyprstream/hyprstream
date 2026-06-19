@@ -240,6 +240,30 @@ pub trait ModelOperations: Send {
         self.forward_with_cache(input, start_pos)
     }
 
+    /// Batched ragged forward for continuous decode (#329, epic #310).
+    ///
+    /// Each entry is `(new_token_ids, start_pos, per-sequence KVCacheManager)`;
+    /// all rows share the same query length and the single `delta` (the scheduler
+    /// groups by tenant delta). Returns stacked logits `[B, q, vocab]`. Per-row
+    /// results are equivalent to running each sequence through
+    /// `forward_with_cache_and_delta` serially (CPU-verified merge gate).
+    ///
+    /// Default: unsupported. Only architectures with batched-decode support
+    /// (Llama in v1) override this; callers fall back to the batch=1 path.
+    fn forward_batched(
+        &self,
+        _sequences: &mut [(
+            Vec<i64>,
+            usize,
+            std::sync::Arc<parking_lot::Mutex<crate::runtime::kv_cache::KVCacheManager>>,
+        )],
+        _delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        Err(anyhow!(
+            "continuous batching (forward_batched) is not supported for this architecture"
+        ))
+    }
+
     /// Get token embeddings for input IDs
     fn embed_tokens(&self, _input_ids: &Tensor) -> Result<Tensor> {
         Err(anyhow!("embed_tokens not implemented for this architecture"))

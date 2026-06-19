@@ -1030,6 +1030,41 @@ impl TorchEngine {
         Ok(last_token_logits)
     }
 
+    /// Batched ragged decode step over several same-delta sequences (#329).
+    ///
+    /// Each entry is `(new_token_ids, start_pos, per-sequence KVCacheManager)`.
+    /// Returns last-token logits per row `[B, vocab]`. Delegates to the model's
+    /// `forward_batched` (Llama-only; other architectures return an error so the
+    /// caller falls back to per-stream `forward_with_delta_cached`). Tensors stay
+    /// on this (bridge) thread; only the Send token/logits metadata crosses.
+    pub fn forward_batched_step(
+        &self,
+        sequences: &mut [(
+            Vec<i64>,
+            usize,
+            std::sync::Arc<parking_lot::Mutex<crate::runtime::kv_cache::KVCacheManager>>,
+        )],
+        delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        let model_arc = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("Persistent model not initialized"))?;
+        if !self.is_persistent_model_ready() {
+            return Err(anyhow!("Model not properly initialized"));
+        }
+
+        let model = model_arc.lock();
+        let logits = {
+            let _no_grad = tch::no_grad_guard();
+            model.forward_batched(sequences, delta)?
+        };
+
+        // logits: [B, q, vocab] -> last-token logits [B, vocab].
+        let seq_len = logits.size()[1];
+        Ok(logits.narrow(1, seq_len - 1, 1).squeeze_dim(1))
+    }
+
     /// Run full forward pass with optional delta injection (no KV cache)
     pub fn forward_with_delta_full(
         &self,
