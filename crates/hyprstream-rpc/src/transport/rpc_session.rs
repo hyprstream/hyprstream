@@ -196,31 +196,57 @@ where
 
 /// Read an entire stream into [`Bytes`], capping the total at `cap` bytes.
 ///
-/// [`RecvStream::read_all`] is unbounded and a hostile peer could exhaust
-/// memory with it. This loops over [`RecvStream::read`] into a growing buffer,
-/// erroring out if the peer sends more than `cap` bytes before FIN.
+/// Uses [`RecvStream::read_chunk`] (a defaulted trait method): quinn and iroh
+/// override it to return `Bytes` referencing the QUIC receive buffer, so a
+/// control message that arrives as a **single chunk** (the common case) is
+/// returned **fully zero-copy** — no allocation, no copy. The UDS impl inherits
+/// the trait's one-copy default (local socket, fine). Multi-chunk frames pay at
+/// most one concatenation. Errors out if the peer sends more than `cap` bytes
+/// before FIN (`RecvStream::read_all` is unbounded — a hostile peer could
+/// exhaust memory with it).
+///
+/// This is the **control plane** (`MAX_FRAME_BYTES` = 4 MiB). Bulk/tensor
+/// payloads ride the streaming plane, where moq-net already yields `Bytes`.
 pub async fn read_to_cap<R: RecvStream>(recv: &mut R, cap: usize) -> Result<Bytes> {
-    // Chunk size for each read. Bounded so a single read can't over-allocate.
-    const CHUNK: usize = 64 * 1024;
-    let mut out: Vec<u8> = Vec::new();
-    let mut scratch = vec![0u8; CHUNK];
+    let mut first: Option<Bytes> = None;
+    let mut acc: Option<bytes::BytesMut> = None;
+    let mut total: usize = 0;
     loop {
+        // +1 so a chunk that would push us over `cap` is still surfaced, then rejected.
+        let max = cap.saturating_sub(total).saturating_add(1);
         match recv
-            .read(&mut scratch)
+            .read_chunk(max)
             .await
-            .map_err(|e| anyhow!("recv read: {e}"))?
+            .map_err(|e| anyhow!("recv read_chunk: {e}"))?
         {
             None => break, // FIN
-            Some(0) => continue,
-            Some(n) => {
-                if out.len() + n > cap {
+            Some(chunk) if chunk.is_empty() => continue,
+            Some(chunk) => {
+                total += chunk.len();
+                if total > cap {
                     bail!("frame exceeds {cap} byte cap");
                 }
-                out.extend_from_slice(&scratch[..n]);
+                match (first.take(), acc.as_mut()) {
+                    // Keep the first chunk as-is (zero-copy if it's the only one).
+                    (None, None) => first = Some(chunk),
+                    // Second chunk: start accumulating from the held first.
+                    (Some(f), None) => {
+                        let mut b = bytes::BytesMut::with_capacity(total);
+                        b.extend_from_slice(&f);
+                        b.extend_from_slice(&chunk);
+                        acc = Some(b);
+                    }
+                    (None, Some(b)) => b.extend_from_slice(&chunk),
+                    (Some(_), Some(_)) => unreachable!("first is taken once acc exists"),
+                }
             }
         }
     }
-    Ok(Bytes::from(out))
+    Ok(match (first, acc) {
+        (Some(f), None) => f,          // single chunk: fully zero-copy
+        (None, Some(b)) => b.freeze(), // multi-chunk: one concatenation
+        _ => Bytes::new(),             // empty / FIN-first
+    })
 }
 
 // ============================================================================
@@ -328,7 +354,10 @@ async fn handle_stream<S>(
         }
     };
 
-    if let Err(e) = send.write_all(&response).await {
+    // Zero-copy reply: `write_chunk` takes the `Bytes` by value; quinn/iroh write it
+    // without copying the buffer (UDS falls back to the trait default). The response
+    // envelope is moved, never cloned.
+    if let Err(e) = send.write_chunk(response).await {
         tracing::warn!(error = ?e, "rpc-session: failed writing response");
         return;
     }
@@ -440,9 +469,11 @@ impl<S: Session> Transport for SessionRpcTransport<S> {
                 .open_bi()
                 .await
                 .map_err(|e| anyhow!("session open_bi: {e}"))?;
-            send.write_all(&payload)
+            // Zero-copy request: `Bytes::from(Vec)` is a move (no copy), and
+            // `write_chunk` writes it without copying on quinn/iroh.
+            send.write_chunk(bytes::Bytes::from(payload))
                 .await
-                .map_err(|e| anyhow!("session write_all: {e}"))?;
+                .map_err(|e| anyhow!("session write_chunk: {e}"))?;
             send.finish().map_err(|e| anyhow!("session finish: {e}"))?;
             let buf = read_to_cap(&mut recv, MAX_FRAME_BYTES).await?;
             Ok::<Vec<u8>, anyhow::Error>(buf.to_vec())

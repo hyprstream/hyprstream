@@ -180,7 +180,21 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 # All three crates must track together — generated code from capnpc
 # targets specific internal APIs in capnp; mismatched majors break
 # RawStructSchema struct construction.
-capnp = "0.24"
+# `unaligned`: read capnp messages directly from network buffers (moq/quinn `Bytes`)
+# that can start at any byte offset — required for the zero-copy
+# `read_message_from_flat_slice` path on the streaming + RPC planes (otherwise capnp
+# errors with UnalignedSegment).
+#
+# SAFE in Rust — and NOT the same as C++'s `-DCAPNP_ALLOW_UNALIGNED`. The C++ flag only
+# disables the alignment *check* and leaves genuine UB (unaligned access is UB in C/C++;
+# compilers may emit SIMD / assume a pointer's low bits are zero), which is why capnp's
+# author recommends copying into an aligned buffer instead (StackOverflow Q 75006774).
+# Rust's `unaligned` feature instead changes the access *mechanism*: each word becomes
+# `Raw = [u8; N]` (alignment 1) read via `from_le_bytes(*raw)` (capnp `private/primitive.rs`)
+# — the canonical, fully-defined Rust idiom for unaligned reads, with no UB. On x86_64/ARM64
+# it lowers to a single hardware unaligned load (~free) and does NOT memcpy or sacrifice
+# zero-copy. See PR #330.
+capnp = { version = "0.24", features = ["unaligned"] }
 capnp-futures = "0.24"
 
 # Utilities

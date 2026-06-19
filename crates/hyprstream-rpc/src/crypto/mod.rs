@@ -64,7 +64,7 @@ impl CryptoPolicy {
     }
 }
 
-pub use backend::{derive_key, keyed_mac, keyed_mac_truncated};
+pub use backend::{derive_key, keyed_mac, keyed_mac_truncated, keyed_mac_truncated_parts};
 pub use hmac::StreamHmacState;
 pub use key_exchange::{
     derive_notification_keys, derive_stream_keys, DefaultKeyExchange, KeyExchange,

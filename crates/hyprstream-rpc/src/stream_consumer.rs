@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Result;
 use futures::StreamExt;
 
-use crate::crypto::{derive_stream_keys, keyed_mac_truncated};
+use crate::crypto::{derive_stream_keys, keyed_mac_truncated, keyed_mac_truncated_parts};
 use crate::stream_info::StreamInfo;
 use crate::streaming_capnp;
 use crate::transport_traits::{PublishSink, Transport};
@@ -140,11 +140,23 @@ impl StreamVerifier {
         if frames.len() != 3 {
             anyhow::bail!("Expected 3 frames, got {}", frames.len());
         }
+        self.verify_parts(&frames[0], &frames[1], &frames[2])
+    }
 
-        let received_topic = &frames[0];
-        let capnp_data = &frames[1];
-        let received_mac = &frames[2];
-
+    /// Zero-copy variant of [`verify`](Self::verify) over borrowed slices.
+    ///
+    /// `verify` is a thin wrapper over this. The moq path calls it directly with
+    /// slices into the received `Bytes` frame (`verify_moq_frame`), so a large
+    /// payload (e.g. a pipeline activation tensor) is never copied into owned
+    /// per-frame `Vec`s — combined with the multi-part MAC and
+    /// `read_message_from_flat_slice` below, the block stays a view into the
+    /// receive buffer end-to-end.
+    pub fn verify_parts(
+        &mut self,
+        received_topic: &[u8],
+        capnp_data: &[u8],
+        received_mac: &[u8],
+    ) -> Result<Vec<StreamPayload>> {
         if received_mac.len() != 16 {
             anyhow::bail!("Expected 16-byte MAC, got {}", received_mac.len());
         }
@@ -153,15 +165,15 @@ impl StreamVerifier {
             anyhow::bail!("Topic mismatch");
         }
 
-        // Compute expected MAC
-        let mut input = Vec::with_capacity(64 + capnp_data.len());
-        match &self.prev_mac {
-            None => input.extend_from_slice(self.topic.as_bytes()),
-            Some(prev) => input.extend_from_slice(prev),
-        }
-        input.extend_from_slice(capnp_data);
-
-        let expected_mac = keyed_mac_truncated(&self.key, &input);
+        // Compute the expected MAC over `prev_mac ‖ capnp_data` (or `topic ‖ capnp_data`
+        // for the first block) WITHOUT allocating a joined buffer. The multi-part MAC is
+        // byte-identical to MAC-of-concatenation, so the payload is never copied into a
+        // scratch `Vec` — this matters for large frames (e.g. pipeline activation tensors).
+        let prefix: &[u8] = match &self.prev_mac {
+            None => self.topic.as_bytes(),
+            Some(prev) => &prev[..],
+        };
+        let expected_mac = keyed_mac_truncated_parts(&self.key, &[prefix, capnp_data]);
 
         if !constant_time_eq(received_mac, &expected_mac) {
             anyhow::bail!("MAC verification failed");
@@ -172,9 +184,12 @@ impl StreamVerifier {
         new_prev.copy_from_slice(received_mac);
         self.prev_mac = Some(new_prev);
 
-        // Parse StreamBlock
-        let reader = capnp::serialize::read_message(
-            &mut std::io::Cursor::new(capnp_data),
+        // Parse StreamBlock with a borrowing (zero-copy) reader: the capnp `Reader`
+        // references `capnp_data` directly instead of copying the whole block into an
+        // owned message, so a large payload stays a view into the receive buffer.
+        let mut slice: &[u8] = capnp_data;
+        let reader = capnp::serialize::read_message_from_flat_slice(
+            &mut slice,
             capnp::message::ReaderOptions::default(),
         )?;
         let block = reader.get_root::<streaming_capnp::stream_block::Reader>()?;
