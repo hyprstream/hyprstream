@@ -22,8 +22,14 @@ anyhow = { workspace = true }
 # fuse-backend-rs provides the FileSystem trait, OverlayFs (v1 overlay engine)
 # and PassthroughFs. The overlayfs/passthrough modules are Linux-only, so the
 # dependency is gated to non-wasm targets (the adapter/overlay code is too).
+#
+# Pinned to 0.13 to match the version nydus (`nydus-rafs`, v2.4.0) builds
+# against, so the RAFS `Rafs` `Layer`/`FileSystem` impl is the *same* type as
+# this crate's `BoxedLayer`/up-adapter — FS-B (#363) passes a RAFS lower into
+# `rootfs_overlay` directly. The OverlayFs/PassthroughFs/FileSystem APIs used
+# here are identical between 0.12 and 0.13.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-fuse-backend-rs = "0.12"
+fuse-backend-rs = "0.13"
 libc = "0.2"
 parking_lot = { workspace = true }
 

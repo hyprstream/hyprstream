@@ -5112,26 +5112,6 @@ dependencies = [
 
 [[package]]
 name = "fuse-backend-rs"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49f251e5fd17ca8206cad5d8863f080d11d29646b21a614dba1f1912fa6e4747"
-dependencies = [
- "arc-swap",
- "bitflags 1.3.2",
- "caps",
- "core-foundation-sys",
- "lazy_static",
- "libc",
- "log",
- "mio 0.8.11",
- "nix 0.24.3",
- "radix_trie",
- "vm-memory 0.14.1",
- "vmm-sys-util 0.12.1",
-]
-
-[[package]]
-name = "fuse-backend-rs"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39179fe2c126f4695984992b6ce08b3b90994b1b1b581c3c58ca29585a56ca81"
@@ -6888,7 +6868,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "fuse-backend-rs 0.12.1",
+ "fuse-backend-rs 0.13.1",
  "hyprstream-rpc",
  "libc",
  "parking_lot 0.12.4",
@@ -6912,7 +6892,7 @@ dependencies = [
  "dashmap",
  "ed25519-dalek 2.2.0",
  "flate2",
- "fuse-backend-rs 0.12.1",
+ "fuse-backend-rs 0.13.1",
  "futures",
  "glob",
  "hex",

@@ -29,6 +29,9 @@ pub mod proxy;
 mod fuse_adapter;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod overlay;
+// Shim that makes a handleless `Layer` (e.g. RAFS) usable as an OverlayFs lower.
+#[cfg(not(target_arch = "wasm32"))]
+mod zero_open;
 
 pub use fsmount::{FsMount, SetAttr};
 pub use hyprstream_rpc::Subject;
@@ -37,3 +40,12 @@ pub use namespace::{BindFlag, MountTarget, Namespace, NamespaceError};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use fuse_adapter::FuseFileSystemMount;
+
+// Overlay composition surface (FS-C v1 engine). Re-exported so downstream crates
+// (FS-B) can build a RAFS lower as a `BoxedLayer` via [`overlay::layer_from_fs`]
+// and compose it with [`overlay::rootfs_overlay`] without depending on
+// `fuse-backend-rs`'s overlay internals directly.
+#[cfg(not(target_arch = "wasm32"))]
+pub use fuse_backend_rs::overlayfs::BoxedLayer;
+#[cfg(not(target_arch = "wasm32"))]
+pub use zero_open::ZeroOpenLayer;
