@@ -1068,4 +1068,36 @@ mod tests {
         assert_eq!(block.get_sequence_number(), 42);
         assert_eq!(block.get_epoch(), 7);
     }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn flat_slice_parses_unaligned_block() {
+        // The zero-copy verifier (`stream_consumer`) parses StreamBlocks via
+        // `read_message_from_flat_slice` over `Bytes` that come straight from the
+        // moq/quinn receive buffer — and those can start at ANY byte offset, not
+        // an 8-byte boundary. capnp's flat-slice reader requires 8-byte alignment
+        // unless the `unaligned` feature is on, so this guards that we keep it on.
+        let payloads = vec![StreamPayloadData::Data(b"hello".to_vec())];
+        let bytes = encode_stream_block(&[0u8; 16], 42, 7, &payloads).unwrap();
+        // Force a deliberately unaligned view: offset the message by 1 byte.
+        let mut padded = vec![0u8; 1];
+        padded.extend_from_slice(&bytes);
+        let unaligned = &padded[1..];
+        assert_ne!(
+            unaligned.as_ptr() as usize % 8,
+            0,
+            "test precondition: slice must be unaligned"
+        );
+        let mut slice: &[u8] = unaligned;
+        let reader = capnp::serialize::read_message_from_flat_slice(
+            &mut slice,
+            capnp::message::ReaderOptions::default(),
+        )
+        .expect("flat-slice reader must parse from an unaligned buffer");
+        let block = reader
+            .get_root::<crate::streaming_capnp::stream_block::Reader>()
+            .unwrap();
+        assert_eq!(block.get_sequence_number(), 42);
+        assert_eq!(block.get_epoch(), 7);
+    }
 }

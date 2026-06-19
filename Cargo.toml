@@ -180,7 +180,11 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 # All three crates must track together — generated code from capnpc
 # targets specific internal APIs in capnp; mismatched majors break
 # RawStructSchema struct construction.
-capnp = "0.24"
+# `unaligned`: read capnp messages directly from network buffers (moq/quinn `Bytes`)
+# that can start at any byte offset — required for the zero-copy
+# `read_message_from_flat_slice` path on the streaming + RPC planes (otherwise capnp
+# errors with UnalignedSegment). Byte-wise word access; keeps the read zero-copy.
+capnp = { version = "0.24", features = ["unaligned"] }
 capnp-futures = "0.24"
 
 # Utilities
