@@ -1001,10 +1001,20 @@ impl Qwen3_5FullAttention {
         // Saves ~9 GPU kernels per call (generate_embeddings) after the first token.
         // Same pattern as LlamaModel::apply_rope.
         use std::cell::RefCell;
+        // Cache key includes the DEVICE: the cached RoPE holds sin/cos tables on
+        // a specific device. Under a pipeline split (#314) the same `layer_idx`
+        // could legitimately run on different devices on one thread, so omitting
+        // device would hand back tables on the wrong device. We encode the device
+        // as an i64 (`-1` = CPU, otherwise the CUDA ordinal) since tch::Device is
+        // not Hash. On the single-device path this just adds one constant key dim.
         thread_local! {
-            static ROPE_CACHE: RefCell<HashMap<(usize, u32), RoPE>> =
+            static ROPE_CACHE: RefCell<HashMap<(usize, u32, i64), RoPE>> =
                 RefCell::new(HashMap::new());
         }
+        let device_key: i64 = match device {
+            Device::Cuda(i) => i as i64,
+            _ => -1,
+        };
 
         let rd = self.rotary_dim as i64;
         let seq = x.size()[1];
@@ -1014,7 +1024,7 @@ impl Qwen3_5FullAttention {
 
         ROPE_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
-            let key = (self.layer_idx, self.rope_theta.to_bits());
+            let key = (self.layer_idx, self.rope_theta.to_bits(), device_key);
             let rope = match cache.entry(key) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::hash_map::Entry::Vacant(e) => {
@@ -1499,13 +1509,16 @@ impl Qwen3_5Model {
         };
 
         let (_, seq) = (hidden.size()[0], hidden.size()[1]);
-        let device = self.device;
 
-        // Position IDs for full-attention RoPE
+        // Position IDs for full-attention RoPE. Build on the HIDDEN-state device,
+        // not `self.device` — under a pipeline split (#314) the first owned layer
+        // may have been moved off `self.device`, and a mismatched position_ids
+        // device would fault at SDPA. (llama already does this; see
+        // forward_with_cache_inner.) On the single-device path this is identical.
         let position_ids = Tensor::arange_start(
             start_pos as i64,
             start_pos as i64 + seq,
-            (Kind::Int64, device),
+            (Kind::Int64, hidden.device()),
         );
 
         let mut conv_guard = self.conv_states.lock();

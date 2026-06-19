@@ -2,6 +2,7 @@
 
 use super::{ArchitectureConfig, ModelArchitecture, ModelOperations};
 // use super::lora_adapter::ArchitectureAwareLoRAAdapter; // Module removed
+use crate::runtime::device_pool::LayerDeviceMap;
 use crate::runtime::rope::RoPE;
 use crate::runtime::tensor_helpers::{
     broadcast_add, broadcast_mul, dims3, dims4, scalar_tensor, square_tensor,
@@ -42,6 +43,17 @@ impl LinearProjection {
     #[inline]
     pub(crate) fn with_scale(weight: Tensor, scale: Tensor) -> Self {
         Self { weight, bias: None, scale: Some(scale) }
+    }
+
+    /// Move all owned tensors to `device` (no-op per tensor already there).
+    /// Used by the 2b pipeline to place a layer on its mapped device (#314).
+    #[inline]
+    pub(crate) fn into_device(self, device: Device) -> Self {
+        Self {
+            weight: self.weight.to_device(device),
+            bias: self.bias.map(|b| b.to_device(device)),
+            scale: self.scale.map(|s| s.to_device(device)),
+        }
     }
 
     /// Apply projection to input: output = input @ weight + bias
@@ -333,6 +345,20 @@ pub struct LlamaModel {
     #[allow(dead_code)]
     dtype: DType,
 
+    /// Per-global-layer device assignment (#314, 2b pipeline). For the unsplit
+    /// fast path this is a single-device map of length `num_hidden_layers`
+    /// (`is_single_device() == true`); for a pipeline shard it is the *global*
+    /// map (still length `num_hidden_layers`) and `layer_offset` selects the
+    /// owned window. Drives both per-layer placement at construction and the lone
+    /// boundary `to_device` in `forward_layers`.
+    device_map: LayerDeviceMap,
+
+    /// Global index of `self.layers[0]`. `0` for a whole model; `a` for a shard
+    /// owning global layers `[a..a+self.layers.len())`. The single place a global
+    /// index is needed at runtime is mapping a local KV-cache slot / device
+    /// lookup back to its global layer.
+    layer_offset: usize,
+
     // Model weights
     embed_tokens: Option<Tensor>,
     layers: Vec<LlamaLayer>,
@@ -366,6 +392,20 @@ struct LlamaLayer {
 unsafe impl Send for LlamaLayer {}
 unsafe impl Sync for LlamaLayer {}
 
+impl LlamaLayer {
+    /// Move every weight in this layer to `device` (#314 pipeline placement).
+    /// A no-op per tensor already resident on `device`.
+    #[inline]
+    fn into_device(self, device: Device) -> Self {
+        Self {
+            self_attn: self.self_attn.into_device(device),
+            mlp: self.mlp.into_device(device),
+            input_layernorm: self.input_layernorm.into_device(device),
+            post_attention_layernorm: self.post_attention_layernorm.into_device(device),
+        }
+    }
+}
+
 /// Llama attention with optional GQA support
 struct LlamaAttention {
     q_proj: LinearProjection,
@@ -393,6 +433,20 @@ unsafe impl Send for LlamaAttention {}
 unsafe impl Sync for LlamaAttention {}
 
 impl LlamaAttention {
+    /// Move all projection + QK-norm weights to `device` (#314 pipeline placement).
+    #[inline]
+    fn into_device(self, device: Device) -> Self {
+        Self {
+            q_proj: self.q_proj.into_device(device),
+            k_proj: self.k_proj.into_device(device),
+            v_proj: self.v_proj.into_device(device),
+            o_proj: self.o_proj.into_device(device),
+            q_norm: self.q_norm.map(|t| t.to_device(device)),
+            k_norm: self.k_norm.map(|t| t.to_device(device)),
+            ..self
+        }
+    }
+
     /// Apply attention with optional GQA, KV caching, and delta injection
     fn forward(
         &self,
@@ -864,6 +918,18 @@ unsafe impl Send for LlamaMLP {}
 unsafe impl Sync for LlamaMLP {}
 
 impl LlamaMLP {
+    /// Move all projection weights to `device` (#314 pipeline placement).
+    #[inline]
+    fn into_device(self, device: Device) -> Self {
+        Self {
+            gate_proj: self.gate_proj.into_device(device),
+            up_proj: self.up_proj.into_device(device),
+            down_proj: self.down_proj.into_device(device),
+            activation: self.activation,
+            layer_idx: self.layer_idx,
+        }
+    }
+
     pub(crate) fn forward(
         &self,
         hidden_states: &Tensor,
@@ -1016,6 +1082,14 @@ unsafe impl Send for RMSNorm {}
 unsafe impl Sync for RMSNorm {}
 
 impl RMSNorm {
+    /// Move the norm weight to `device` (#314 pipeline placement).
+    #[inline]
+    fn into_device(self, device: Device) -> Self {
+        Self { weight: self.weight.to_device(device), eps: self.eps }
+    }
+}
+
+impl RMSNorm {
     pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // Compute RMS, preserving the original dtype
         let original_dtype = x.kind();
@@ -1047,10 +1121,16 @@ impl LlamaModel {
         // Load weights from SafeTensors (simplified)
         let layers = Vec::new();
 
+        // Whole-model single-device map (this simplified path has no layers yet;
+        // size the map to the declared depth so the invariant holds).
+        let device_map = LayerDeviceMap::single(*device, (config.num_hidden_layers as usize).max(1))?;
+
         Ok(Self {
             config,
             device: *device,
             dtype,
+            device_map,
+            layer_offset: 0,
             embed_tokens: None,
             layers,
             norm: None,
@@ -1223,10 +1303,17 @@ impl LlamaModel {
             None
         };
 
+        // Unsplit fast path: every layer on the one device. This keeps the
+        // whole-model forward byte-identical — `forward_layers` over this
+        // single-device map performs zero cross-device copies (#314).
+        let device_map = LayerDeviceMap::single(*device, layers.len().max(1))?;
+
         Ok(Self {
             config,
             device: *device,
             dtype,
+            device_map,
+            layer_offset: 0,
             embed_tokens,
             layers,
             norm,
@@ -1235,6 +1322,182 @@ impl LlamaModel {
             kv_cache,
             vs: None, // No VarStore for weight loading - weights are stored directly
         })
+    }
+
+    /// Build a **single pipeline stage** of a Llama model (#314, 2b layer-split).
+    ///
+    /// Loads only global decoder layers `[layer_range.start..layer_range.end)`
+    /// onto their mapped devices (`devices.device_for(g)`), and gates the
+    /// non-layer weights by stage position so middle stages carry none (M-LOAD
+    /// seam #1):
+    /// - `is_first` (`layer_range.start == 0`)  → keep `embed_tokens`.
+    /// - `is_last`  (`layer_range.end == devices.len()`) → keep `norm` + `lm_head`
+    ///   (or the tied transpose).
+    ///
+    /// `weights` must already contain (at least) this stage's tensors; the loader
+    /// is responsible for shard selection (a later ticket). Tensors not on the
+    /// target device are moved with a single `.to()` at construction — the *only*
+    /// placement cost; the forward path then does zero intra-stage copies.
+    ///
+    /// State sizing follows the **owned** layer count, not the global count
+    /// (M-LOAD seam #2): the KV-cache manager and `self.layers` are both sized to
+    /// `layer_range.len()`, and the forward loop indexes them locally.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_from_weights_with_config(
+        weights: &mut HashMap<String, Tensor>,
+        mut config: LlamaConfig,
+        devices: &LayerDeviceMap,
+        layer_range: std::ops::Range<usize>,
+        dtype: DType,
+        kv_quant_type: crate::runtime::KVQuantType,
+    ) -> Result<Self> {
+        let num_global = config.num_hidden_layers as usize;
+        if devices.len() != num_global {
+            return Err(anyhow!(
+                "stage_from_weights: device map covers {} layers but config has {} \
+                 (num_hidden_layers)",
+                devices.len(),
+                num_global
+            ));
+        }
+        if layer_range.end > num_global || layer_range.start >= layer_range.end {
+            return Err(anyhow!(
+                "stage_from_weights: invalid layer range {:?} for {} layers",
+                layer_range,
+                num_global
+            ));
+        }
+
+        let is_first = layer_range.start == 0;
+        let is_last = layer_range.end == num_global;
+        let layer_offset = layer_range.start;
+        // Stage device = device of this stage's first owned layer (its inputs and
+        // KV cache live here). `embed_tokens`, when present, lives on the first
+        // stage's first device, which is exactly this when is_first.
+        let stage_device = devices.device_for(layer_range.start);
+
+        // --- Non-layer weights, gated by stage position (M-LOAD seam #1) ---
+        let original_vocab_size = config.vocab_size;
+        let padded_vocab_size = calculate_padded_vocab_size(original_vocab_size);
+        config.original_vocab_size = original_vocab_size;
+        if padded_vocab_size != original_vocab_size {
+            config.vocab_size = padded_vocab_size;
+        }
+
+        let embed_tokens = if is_first {
+            let embed = weights
+                .get("model.embed_tokens.weight")
+                .or_else(|| weights.get("embed_tokens.weight"))
+                .map(|w| Self::pad_embedding_to(w, padded_vocab_size, stage_device))
+                .ok_or_else(|| {
+                    anyhow!("stage_from_weights: first stage requires model.embed_tokens.weight")
+                })?;
+            Some(embed)
+        } else {
+            None
+        };
+
+        let (lm_head, norm) = if is_last {
+            let lm_head = weights
+                .get("lm_head.weight")
+                .or_else(|| weights.get("model.lm_head.weight"))
+                .map(|w| {
+                    Self::pad_embedding_to(w, padded_vocab_size, stage_device)
+                        .transpose(0, 1)
+                        .contiguous()
+                });
+            let norm = weights
+                .get("model.norm.weight")
+                .or_else(|| weights.get("norm.weight"))
+                .map(|w| RMSNorm {
+                    weight: w.shallow_clone().to_device(stage_device),
+                    eps: config.rms_norm_eps,
+                });
+            if norm.is_none() {
+                return Err(anyhow!(
+                    "stage_from_weights: last stage requires model.norm.weight"
+                ));
+            }
+            (lm_head, norm)
+        } else {
+            (None, None)
+        };
+
+        // Tied lm_head: only meaningful on the last stage, and only if it also
+        // holds embed_tokens (single-stage model). A middle/last stage that does
+        // not own the embedding cannot tie — it must ship an explicit lm_head.
+        let lm_head_transposed = if is_last && lm_head.is_none() {
+            embed_tokens
+                .as_ref()
+                .map(|embed| embed.transpose(0, 1).contiguous())
+        } else {
+            None
+        };
+        if is_last && lm_head.is_none() && lm_head_transposed.is_none() {
+            return Err(anyhow!(
+                "stage_from_weights: last stage requires lm_head.weight (no tied embedding present)"
+            ));
+        }
+
+        // --- Owned decoder layers, each on its mapped device (per-layer .to) ---
+        let mut layers = Vec::with_capacity(layer_range.len());
+        for g in layer_range.clone() {
+            let target = devices.device_for(g);
+            match Self::build_layer(g, weights, &config, &target)? {
+                Some(layer) => layers.push(layer.into_device(target)),
+                None => {
+                    return Err(anyhow!(
+                        "stage_from_weights: expected weights for global layer {g} but none found"
+                    ))
+                }
+            }
+        }
+
+        // KV cache sized to the OWNED layer count (M-LOAD seam #2); indexed
+        // locally in the forward loop. Lives on the stage device.
+        let kv_cache = if layers.is_empty() {
+            None
+        } else {
+            Some(std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::runtime::kv_cache::KVCacheManager::new(
+                    layers.len(),
+                    config.max_position_embeddings as usize,
+                    kv_quant_type,
+                ),
+            )))
+        };
+
+        let device_map = devices.clone();
+
+        Ok(Self {
+            config,
+            device: stage_device,
+            dtype,
+            device_map,
+            layer_offset,
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            lm_head_transposed,
+            kv_cache,
+            vs: None,
+        })
+    }
+
+    /// Pad an embedding/lm_head weight `[vocab, hidden]` up to `padded_vocab` (a
+    /// no-op shallow clone when already large enough) and place it on `device`.
+    fn pad_embedding_to(w: &Tensor, padded_vocab: u32, device: Device) -> Tensor {
+        let vocab_size = w.size()[0] as u32;
+        let hidden_size = w.size()[1];
+        let placed = if padded_vocab > vocab_size {
+            let padded = Tensor::zeros([padded_vocab as i64, hidden_size], (w.kind(), w.device()));
+            padded.narrow(0, 0, vocab_size as i64).copy_(w);
+            padded
+        } else {
+            w.shallow_clone()
+        };
+        placed.to_device(device)
     }
 
     /// Detect configuration from weight tensor shapes
@@ -1565,6 +1828,28 @@ impl LlamaModel {
     pub fn parse_config(json_str: &str) -> Result<LlamaConfig> {
         let json: serde_json::Value = serde_json::from_str(json_str)?;
 
+        // Mandatory architectural dimensions — never silently defaulted (mirrors
+        // #315's no-magic-number hardening in model_config.rs). A wrong layer or
+        // head count silently truncates / mis-shapes a pipeline split (#314).
+        let require_u64 = |field: &str| -> Result<u64> {
+            json[field].as_u64().ok_or_else(|| {
+                anyhow!(
+                    "config.json is missing required field `{field}` \
+                     (or it is not a non-negative integer)"
+                )
+            })
+        };
+        let num_attention_heads = require_u64("num_attention_heads")? as u32;
+        let hidden_size = require_u64("hidden_size")? as u32;
+        let num_hidden_layers = require_u64("num_hidden_layers")? as u32;
+        if num_attention_heads == 0 || hidden_size == 0 || num_hidden_layers == 0 {
+            return Err(anyhow!(
+                "config.json has a zero architectural dimension \
+                 (num_attention_heads={num_attention_heads}, hidden_size={hidden_size}, \
+                 num_hidden_layers={num_hidden_layers})"
+            ));
+        }
+
         // Detect version from config
         let version = if json.get("rope_scaling").is_some() {
             3
@@ -1576,27 +1861,24 @@ impl LlamaModel {
 
         let mut config = LlamaConfig {
             version,
-            num_attention_heads: json["num_attention_heads"].as_u64().unwrap_or(32) as u32,
+            num_attention_heads,
+            // num_key_value_heads legitimately defaults to num_attention_heads
+            // (MHA) when absent — an HF-spec optional field, not a magic number.
             num_key_value_heads: json
                 .get("num_key_value_heads")
                 .and_then(serde_json::Value::as_u64)
-                .unwrap_or_else(|| json["num_attention_heads"].as_u64().unwrap_or(32))
-                as u32,
-            hidden_size: json["hidden_size"].as_u64().unwrap_or(4096) as u32,
+                .map(|v| v as u32)
+                .unwrap_or(num_attention_heads),
+            hidden_size,
             head_dim: json
                 .get("head_dim")
                 .and_then(serde_json::Value::as_u64)
                 .map(|v| v as u32)
                 .unwrap_or_else(|| {
-                    // If head_dim not specified, calculate from hidden_size / num_attention_heads
-                    let heads = json
-                        .get("num_attention_heads")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(32) as u32;
-                    let hidden = json
-                        .get("hidden_size")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(4096) as u32;
+                    // head_dim is optional in HF configs; derive it from the now-
+                    // mandatory hidden_size / num_attention_heads.
+                    let heads = num_attention_heads;
+                    let hidden = hidden_size;
                     // Common head_dim values are 64, 128, 256
                     if hidden.is_multiple_of(heads * 256) {
                         256
@@ -1614,7 +1896,7 @@ impl LlamaModel {
             rms_norm_eps: json["rms_norm_eps"].as_f64().unwrap_or(1e-5) as f32,
             vocab_size: json["vocab_size"].as_u64().unwrap_or(32000) as u32,
             original_vocab_size: json["vocab_size"].as_u64().unwrap_or(32000) as u32,  // Initially same
-            num_hidden_layers: json["num_hidden_layers"].as_u64().unwrap_or(32) as u32,
+            num_hidden_layers,
             rope_theta: json
                 .get("rope_theta")
                 .and_then(serde_json::Value::as_f64)
@@ -1839,6 +2121,102 @@ impl LlamaModel {
                     }
                 }
             }
+        }
+
+        Ok(hidden_states)
+    }
+
+    /// Run global decoder layers `[range.start..range.end)` — the 2b pipeline
+    /// layer-range runner (#314). See the trait docs for the stage contract.
+    ///
+    /// Layers are remapped to local `self.layers` indices via `layer_offset`; the
+    /// per-layer KV cache is indexed locally (sized to the owned count). The lone
+    /// cross-device copy is `hidden.to_device(next)`, inserted only when the next
+    /// layer's mapped device differs from where `hidden` currently lives — never
+    /// within a stage, never when source == dest (the unsplit map is a no-op).
+    fn forward_layers_inner(
+        &self,
+        hidden: &Tensor,
+        range: std::ops::Range<usize>,
+        start_pos: usize,
+        delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        let num_global = self.config.num_hidden_layers as usize;
+        if range.end > num_global || range.start >= range.end {
+            return Err(anyhow!(
+                "forward_layers: invalid global range {range:?} for {num_global} layers"
+            ));
+        }
+        // The owned window must contain the requested range.
+        let owned = self.layer_offset..self.layer_offset + self.layers.len();
+        if range.start < owned.start || range.end > owned.end {
+            return Err(anyhow!(
+                "forward_layers: range {range:?} not within this stage's owned layers {owned:?}"
+            ));
+        }
+
+        let mut hidden_states = hidden.shallow_clone();
+
+        // position_ids recomputed from start_pos + seq (never carried across a
+        // boundary). Built on the *input* device (the first owned layer's), so a
+        // moved first layer still matches at SDPA.
+        let seq_len = hidden_states.size()[1];
+        let position_ids = if start_pos == 0 {
+            Tensor::arange(seq_len, (tch::Kind::Int64, hidden_states.device()))
+        } else {
+            Tensor::arange_start(
+                start_pos as i64,
+                (start_pos + seq_len as usize) as i64,
+                (tch::Kind::Int64, hidden_states.device()),
+            )
+        };
+        // position_ids must follow `hidden` across device boundaries; track it.
+        let mut position_ids = position_ids;
+
+        let cache_guard = self.kv_cache.as_ref().map(|cache_ref| cache_ref.lock());
+
+        for g in range {
+            let local_idx = g - self.layer_offset;
+            let layer = &self.layers[local_idx];
+
+            // The single cross-device transfer: only when this layer's device
+            // differs from where `hidden` currently is (zero-copy otherwise).
+            let target = self.device_map.device_for(g);
+            if hidden_states.device() != target {
+                hidden_states = hidden_states.to_device(target);
+                position_ids = position_ids.to_device(target);
+            }
+
+            let residual = hidden_states.shallow_clone();
+            hidden_states = layer.input_layernorm.forward(&hidden_states)?;
+
+            let attn_output = if let Some(ref cache_manager) = cache_guard {
+                if let Some(result) = cache_manager.with_layer_cache(local_idx, |layer_cache| {
+                    layer.self_attn.forward(
+                        &hidden_states,
+                        Some(&position_ids),
+                        Some(layer_cache),
+                        start_pos,
+                        delta,
+                    )
+                }) {
+                    result?
+                } else {
+                    layer
+                        .self_attn
+                        .forward(&hidden_states, Some(&position_ids), None, start_pos, delta)?
+                }
+            } else {
+                layer
+                    .self_attn
+                    .forward(&hidden_states, Some(&position_ids), None, start_pos, delta)?
+            };
+            hidden_states = residual + attn_output;
+
+            let residual = hidden_states.shallow_clone();
+            hidden_states = layer.post_attention_layernorm.forward(&hidden_states)?;
+            let ffn_output = layer.mlp.forward(&hidden_states, delta)?;
+            hidden_states = residual + ffn_output;
         }
 
         Ok(hidden_states)
@@ -2153,6 +2531,16 @@ impl ModelOperations for LlamaModel {
         Ok((hidden_states, None))
     }
 
+    fn forward_layers(
+        &self,
+        hidden: &Tensor,
+        range: std::ops::Range<usize>,
+        start_pos: usize,
+        delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        self.forward_layers_inner(hidden, range, start_pos, delta)
+    }
+
     fn apply_final_norm(&self, hidden_states: &Tensor) -> Result<Tensor> {
         if let Some(norm) = &self.norm {
             norm.forward(hidden_states)
@@ -2264,3 +2652,231 @@ impl ModelOperations for LlamaModel {
 }
 
 // KV cache methods are now defined in the ModelOperations trait implementation above
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod pipeline_tests {
+    use super::*;
+    use crate::runtime::device_pool::LayerDeviceMap;
+    use crate::runtime::KVQuantType;
+
+    const HIDDEN: i64 = 16;
+    const HEADS: i64 = 2;
+    const HEAD_DIM: i64 = 8; // HEADS * HEAD_DIM == HIDDEN
+    const INTER: i64 = 32;
+    const VOCAB: i64 = 48; // multiple of 64? no → padded to 64; both paths pad identically
+    const LAYERS: usize = 4;
+
+    fn tiny_config() -> LlamaConfig {
+        LlamaConfig {
+            version: 2,
+            num_attention_heads: HEADS as u32,
+            num_key_value_heads: HEADS as u32,
+            hidden_size: HIDDEN as u32,
+            head_dim: HEAD_DIM as u32,
+            intermediate_size: INTER as u32,
+            max_position_embeddings: 64,
+            rms_norm_eps: 1e-5,
+            vocab_size: VOCAB as u32,
+            original_vocab_size: VOCAB as u32,
+            num_hidden_layers: LAYERS as u32,
+            rope_theta: 10000.0,
+            rope_scaling: None,
+            hidden_activation: "silu".to_owned(),
+            query_pre_attn_scalar: None,
+            use_qk_norm: false,
+            scale_embeddings: false,
+            layer_types: vec![],
+            rope_local_base_freq: None,
+        }
+    }
+
+    /// Deterministic small weight set on CPU/f32 so the two construction paths are
+    /// numerically comparable. HF stores projections as `[out, in]`.
+    ///
+    /// Uses a fixed, RNG-free pattern (a bounded sin of the flat index) rather
+    /// than `Tensor::randn`: tests run in parallel and `manual_seed` is global, so
+    /// two `randn`-based builds could interleave and diverge. This makes every
+    /// call byte-identical regardless of scheduling.
+    fn tiny_weights() -> HashMap<String, Tensor> {
+        let opt = (DType::Float, Device::Cpu);
+        let mut w = HashMap::new();
+        let randn = |dims: &[i64]| {
+            let n: i64 = dims.iter().product();
+            // Deterministic small values in roughly [-0.05, 0.05].
+            (Tensor::arange(n, opt) * 0.017).sin().reshape(dims) * 0.05
+        };
+
+        w.insert("model.embed_tokens.weight".to_owned(), randn(&[VOCAB, HIDDEN]));
+        w.insert("model.norm.weight".to_owned(), Tensor::ones([HIDDEN], opt));
+        w.insert("lm_head.weight".to_owned(), randn(&[VOCAB, HIDDEN]));
+
+        for i in 0..LAYERS {
+            let p = format!("model.layers.{i}");
+            // attention projections: q/k/v are [heads*head_dim, hidden]; o is [hidden, heads*head_dim]
+            w.insert(format!("{p}.self_attn.q_proj.weight"), randn(&[HEADS * HEAD_DIM, HIDDEN]));
+            w.insert(format!("{p}.self_attn.k_proj.weight"), randn(&[HEADS * HEAD_DIM, HIDDEN]));
+            w.insert(format!("{p}.self_attn.v_proj.weight"), randn(&[HEADS * HEAD_DIM, HIDDEN]));
+            w.insert(format!("{p}.self_attn.o_proj.weight"), randn(&[HIDDEN, HEADS * HEAD_DIM]));
+            // mlp
+            w.insert(format!("{p}.mlp.gate_proj.weight"), randn(&[INTER, HIDDEN]));
+            w.insert(format!("{p}.mlp.up_proj.weight"), randn(&[INTER, HIDDEN]));
+            w.insert(format!("{p}.mlp.down_proj.weight"), randn(&[HIDDEN, INTER]));
+            // norms
+            w.insert(format!("{p}.input_layernorm.weight"), Tensor::ones([HIDDEN], opt));
+            w.insert(format!("{p}.post_attention_layernorm.weight"), Tensor::ones([HIDDEN], opt));
+        }
+        w
+    }
+
+    fn whole_model() -> LlamaModel {
+        let mut w = tiny_weights();
+        LlamaModel::from_weights_with_config(&mut w, tiny_config(), &Device::Cpu, DType::Float, KVQuantType::None)
+            .unwrap()
+    }
+
+    /// Orchestrate the pipeline path on a model the way an engine would:
+    /// embed → forward_layers(0..N) → final norm → lm_head.
+    fn orchestrated_logits(m: &LlamaModel, input: &Tensor) -> Tensor {
+        let emb = m.embed_tokens(input).unwrap();
+        let h = m.forward_layers(&emb, 0..m.num_layers(), 0, None).unwrap();
+        let h = m.apply_final_norm(&h).unwrap();
+        m.lm_head(&h).unwrap()
+    }
+
+    #[test]
+    fn forward_layers_full_range_matches_whole_model_forward() {
+        // An all-CPU LayerDeviceMap means forward_layers(0..N) must equal the
+        // whole-model single-device forward (the byte-identity equivalence test).
+        let input = Tensor::from_slice(&[1i64, 5, 9, 2]).reshape([1, 4]);
+
+        // Reference: whole-model forward (embed→loop→norm→lm_head w/ vocab mask).
+        let reference = whole_model();
+        let ref_logits = reference.forward_with_cache(&input, 0).unwrap();
+
+        // Pipeline path on a fresh model (independent KV), full range over a
+        // single-device map. Compare on the ORIGINAL vocab columns (the whole-
+        // model path additionally masks padded columns; lm_head() does not).
+        let piped = whole_model();
+        let pipe_logits = orchestrated_logits(&piped, &input);
+
+        let orig = reference.config.original_vocab_size as i64;
+        let ref_c = ref_logits.narrow(2, 0, orig);
+        let pipe_c = pipe_logits.narrow(2, 0, orig);
+        let max_diff = (&ref_c - &pipe_c).abs().max().double_value(&[]);
+        assert!(
+            ref_c.allclose(&pipe_c, 1e-4, 1e-4, false),
+            "forward_layers(0..N) over a single-device map must equal whole-model forward \
+             (max_diff={max_diff}, ref_shape={:?})",
+            ref_c.size()
+        );
+        // Sanity: the device map for a whole model is single-device (zero-copy).
+        assert!(piped.device_map.is_single_device());
+        assert_eq!(piped.layer_offset, 0);
+    }
+
+    #[test]
+    fn staged_split_equals_whole_model() {
+        // Build TWO stages over an all-CPU 2-way split and run them as a pipeline:
+        // stage0: embed → forward_layers(0..b); stage1: forward_layers(b..N) →
+        // norm → lm_head. Result must equal the whole-model forward. This
+        // exercises the global↔local remap, is_first/is_last gating, and the
+        // (zero, since same-device) boundary copy.
+        let input = Tensor::from_slice(&[3i64, 7, 1, 4]).reshape([1, 4]);
+
+        let reference = whole_model();
+        let ref_logits = reference.forward_with_cache(&input, 0).unwrap();
+
+        // Single CPU device but split the layer RANGE across two stages.
+        let map = LayerDeviceMap::single(Device::Cpu, LAYERS).unwrap();
+        let split = LAYERS / 2;
+
+        let mut w0 = tiny_weights();
+        let stage0 = LlamaModel::stage_from_weights_with_config(
+            &mut w0, tiny_config(), &map, 0..split, DType::Float, KVQuantType::None,
+        )
+        .unwrap();
+        assert_eq!(stage0.layer_offset, 0);
+        assert!(stage0.embed_tokens.is_some(), "first stage keeps embed");
+        assert!(stage0.norm.is_none() && stage0.lm_head.is_none(), "first stage has no head");
+
+        let mut w1 = tiny_weights();
+        let stage1 = LlamaModel::stage_from_weights_with_config(
+            &mut w1, tiny_config(), &map, split..LAYERS, DType::Float, KVQuantType::None,
+        )
+        .unwrap();
+        assert_eq!(stage1.layer_offset, split);
+        assert!(stage1.embed_tokens.is_none(), "last stage has no embed");
+        assert!(stage1.norm.is_some(), "last stage keeps final norm");
+
+        // Drive the pipeline.
+        let emb = stage0.embed_tokens(&input).unwrap();
+        let h0 = stage0.forward_layers(&emb, 0..split, 0, None).unwrap();
+        let h1 = stage1.forward_layers(&h0, split..LAYERS, 0, None).unwrap();
+        let h1 = stage1.apply_final_norm(&h1).unwrap();
+        let logits = stage1.lm_head(&h1).unwrap();
+
+        let orig = reference.config.original_vocab_size as i64;
+        let ref_c = ref_logits.narrow(2, 0, orig);
+        let pipe_c = logits.narrow(2, 0, orig);
+        // 1e-4: the lm_head() trait casts the weight and uses f_matmul; the whole-
+        // model path uses plain matmul — float reassociation, not a logic diff.
+        let max_diff = (&ref_c - &pipe_c).abs().max().double_value(&[]);
+        assert!(
+            ref_c.allclose(&pipe_c, 1e-4, 1e-4, false),
+            "two-stage split (same device) must equal whole-model forward (max_diff={max_diff})"
+        );
+        // The last stage built an explicit lm_head (not the tied transpose).
+        assert!(stage1.lm_head_transposed.is_none());
+    }
+
+    #[test]
+    fn forward_layers_rejects_out_of_window_range() {
+        // A stage that owns [2..4) must reject a range outside its window.
+        let map = LayerDeviceMap::single(Device::Cpu, LAYERS).unwrap();
+        let mut w = tiny_weights();
+        let stage = LlamaModel::stage_from_weights_with_config(
+            &mut w, tiny_config(), &map, 2..LAYERS, DType::Float, KVQuantType::None,
+        )
+        .unwrap();
+        let emb = Tensor::randn([1, 3, HIDDEN], (DType::Float, Device::Cpu));
+        assert!(stage.forward_layers(&emb, 0..2, 0, None).is_err(), "range below window");
+        assert!(stage.forward_layers(&emb, 2..LAYERS, 0, None).is_ok(), "owned range ok");
+    }
+
+    #[test]
+    fn boundary_copy_skipped_when_same_device() {
+        // With a single-device map, no layer is a boundary, so forward_layers does
+        // zero `to_device` calls. We can only assert the predicate directly here
+        // (tch gives no copy counter), which the device-map test also covers.
+        let map = LayerDeviceMap::single(Device::Cpu, LAYERS).unwrap();
+        for g in 1..LAYERS {
+            assert!(!map.is_boundary(Device::Cpu, g));
+        }
+    }
+
+    #[test]
+    fn stage_loader_rejects_missing_required_weights() {
+        // Last stage with no norm weight must error (M-LOAD seam #1 gating).
+        let map = LayerDeviceMap::single(Device::Cpu, LAYERS).unwrap();
+        let mut w = tiny_weights();
+        w.remove("model.norm.weight");
+        let result = LlamaModel::stage_from_weights_with_config(
+            &mut w, tiny_config(), &map, 0..LAYERS, DType::Float, KVQuantType::None,
+        );
+        match result {
+            Ok(_) => panic!("last stage without norm weight must error"),
+            Err(e) => assert!(e.to_string().contains("norm"), "got: {e}"),
+        }
+    }
+
+    #[test]
+    fn parse_config_requires_core_dims() {
+        // #315 follow-up: mandatory architectural dims, no silent magic numbers.
+        let ok = r#"{"num_attention_heads":2,"hidden_size":16,"num_hidden_layers":4}"#;
+        assert!(LlamaModel::parse_config(ok).is_ok());
+        let missing = r#"{"hidden_size":16,"num_hidden_layers":4}"#;
+        let err = LlamaModel::parse_config(missing).unwrap_err();
+        assert!(err.to_string().contains("num_attention_heads"), "got: {err}");
+    }
+}

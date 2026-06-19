@@ -334,6 +334,56 @@ pub trait ModelOperations: Send {
         self.decode_layer(layer_idx, hidden_states, attention_mask, position_ids, past_kv)
     }
 
+    /// Run a contiguous range of decoder layers — the 2b intra-host pipeline
+    /// (layer-split) primitive (#314).
+    ///
+    /// This is the missing layer-range runner that complements the already-
+    /// exposed `embed_tokens` / `forward_from_embeddings` / `apply_final_norm` /
+    /// `lm_head` / `num_layers`. Arch-agnostic orchestration composes them:
+    /// - **stage 0** : `embed_tokens` → `forward_layers(0..b)`
+    /// - **middle**  : `forward_layers(a..b)`
+    /// - **last**    : `forward_layers(a..N)` → `apply_final_norm` → `lm_head`
+    ///
+    /// `is_first`/`is_last` are *implicit* in `range` (`range.start == 0` /
+    /// `range.end == num_layers()`); the runner itself only applies decoder
+    /// layers — never embeddings, final norm, or the LM head.
+    ///
+    /// # Stage-boundary contract
+    /// The only state carried across a stage boundary is `hidden` + `start_pos`.
+    /// `position_ids` is recomputed inside from `start_pos` + seq. Per-layer KV
+    /// cache (and any SSM `conv`/`rec` state) is **stage-local and never
+    /// transferred**. `range` is in **global** layer indices; an implementation
+    /// that owns a shard remaps to its local `self.layers` via the
+    /// `layer_offset` it was constructed with.
+    ///
+    /// # Device placement
+    /// Layer `g` runs on its mapped device; the single cross-device copy is
+    /// `hidden.to_device(next)` inserted only at a boundary where the device
+    /// actually changes (zero copies within a stage or when source == dest).
+    /// The returned tensor lives on the **last owned layer's device**.
+    ///
+    /// # Arguments
+    /// * `hidden` - `[batch, seq, hidden]`; embeddings if `range.start == 0`,
+    ///   otherwise the previous stage's output.
+    /// * `range` - global layer indices this stage owns, `[a..b)`.
+    /// * `start_pos` - KV-cache start position for this forward.
+    /// * `delta` - optional per-tenant LoRA delta (delta-aware inference).
+    ///
+    /// The default implementation errors; only architectures that support the
+    /// pipeline split (Llama; Qwen3.5) override it. The single-device whole-model
+    /// `forward*` paths are unaffected — this method is purely additive.
+    fn forward_layers(
+        &self,
+        _hidden: &Tensor,
+        _range: std::ops::Range<usize>,
+        _start_pos: usize,
+        _delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        Err(anyhow!(
+            "forward_layers (pipeline layer-split) not implemented for this architecture"
+        ))
+    }
+
     /// Apply final layer normalization
     fn apply_final_norm(&self, _hidden_states: &Tensor) -> Result<Tensor> {
         Err(anyhow!("apply_final_norm not implemented for this architecture"))
