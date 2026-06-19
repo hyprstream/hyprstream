@@ -23,6 +23,21 @@ static LAYER_REGEX: LazyLock<Option<Regex>> = LazyLock::new(|| {
     Regex::new(r"layers\.(\d+)").ok()
 });
 
+/// Regex for extracting **decoder** layer indices from a shard manifest's
+/// `weight_map` keys (#314 follow-up to #315).
+///
+/// Anchored to the language-model decoder namespace — `model.layers.<i>.` or
+/// `language_model.model.layers.<i>.` — so a multimodal checkpoint's *vision
+/// tower* (e.g. `vision_model.encoder.layers.<j>.` /
+/// `visual.blocks.<j>.`) cannot inflate the decoder layer count and corrupt a
+/// pipeline split. The trailing `.` ensures we match a true layer-index segment
+/// (`model.layers.12.` ) and not an unrelated key that merely contains the
+/// substring. Correct for llama/qwen3_5, whose decoder weights are
+/// `model.layers.<i>.…`.
+static DECODER_LAYER_REGEX: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    Regex::new(r"(?:^|\.)(?:language_model\.)?model\.layers\.(\d+)\.").ok()
+});
+
 /// Unified model configuration that combines all sources
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
@@ -648,8 +663,11 @@ impl ModelConfig {
             )
         })?;
 
+        // Count only DECODER layers (`model.layers.<i>.`), not a multimodal
+        // vision tower's own `.layers.N` — those would inflate the count and
+        // corrupt a pipeline split (#314 follow-up to #315).
         let mut layer_indices = std::collections::HashSet::new();
-        if let Some(ref regex) = *LAYER_REGEX {
+        if let Some(ref regex) = *DECODER_LAYER_REGEX {
             for key in weight_map.keys() {
                 if let Some(captures) = regex.captures(key) {
                     if let Ok(idx) = captures[1].parse::<usize>() {
@@ -948,6 +966,51 @@ mod tests {
         let cfg = ModelConfig::load(dir.path(), &empty_weights())
             .expect("matching layer counts must load");
         assert_eq!(cfg.num_hidden_layers, 3);
+    }
+
+    /// #314 follow-up: a multimodal vision tower's own `.layers.N` must NOT
+    /// inflate the decoder layer count when cross-checking against the manifest.
+    /// Decoder has 3 layers; the vision tower has 24 — only the decoder counts.
+    #[test]
+    fn vision_tower_layers_do_not_inflate_decoder_count() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "config.json", &valid_config_json(3));
+        write(
+            dir.path(),
+            "model.safetensors.index.json",
+            r#"{"weight_map":{
+                "model.layers.0.self_attn.q_proj.weight":"a.safetensors",
+                "model.layers.1.self_attn.q_proj.weight":"a.safetensors",
+                "model.layers.2.self_attn.q_proj.weight":"a.safetensors",
+                "vision_model.encoder.layers.0.self_attn.q_proj.weight":"v.safetensors",
+                "vision_model.encoder.layers.10.self_attn.q_proj.weight":"v.safetensors",
+                "vision_model.encoder.layers.23.self_attn.q_proj.weight":"v.safetensors",
+                "visual.blocks.5.attn.qkv.weight":"v.safetensors"
+            }}"#,
+        );
+        let cfg = ModelConfig::load(dir.path(), &empty_weights())
+            .expect("decoder layer count (3) must match despite a 24-layer vision tower");
+        assert_eq!(cfg.num_hidden_layers, 3);
+    }
+
+    /// The decoder regex also accepts the `language_model.model.layers.<i>.`
+    /// nesting used by some multimodal checkpoints.
+    #[test]
+    fn nested_language_model_layers_are_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "config.json", &valid_config_json(2));
+        write(
+            dir.path(),
+            "model.safetensors.index.json",
+            r#"{"weight_map":{
+                "language_model.model.layers.0.self_attn.q_proj.weight":"a.safetensors",
+                "language_model.model.layers.1.self_attn.q_proj.weight":"a.safetensors",
+                "vision_model.encoder.layers.0.self_attn.q_proj.weight":"v.safetensors"
+            }}"#,
+        );
+        let cfg = ModelConfig::load(dir.path(), &empty_weights())
+            .expect("nested language_model decoder layers must be counted");
+        assert_eq!(cfg.num_hidden_layers, 2);
     }
 
     /// A zero architectural dimension is rejected (avoids div-by-zero / corruption).

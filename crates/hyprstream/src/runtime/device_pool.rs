@@ -207,6 +207,152 @@ impl DevicePool {
     }
 }
 
+/// A per-layer device assignment for **2b intra-host pipeline** (#314).
+///
+/// This is the layer→device `device_map` the [`DevicePool`] doc-comment
+/// anticipates. It is a thin, validated newtype over the per-global-layer
+/// `Vec<Device>` derived from a [`DevicePool`]: entry `g` is the device that
+/// owns global decoder layer `g`. A *stage* is a contiguous run of layers that
+/// map to the same device; the only cross-device copy in the forward pass is a
+/// single `hidden.to_device(next)` at a boundary where consecutive layers map to
+/// different devices (see [`LayerDeviceMap::is_boundary`]).
+///
+/// # Why a map over `num_hidden_layers`, not the stage-local count
+///
+/// The map is **global** — indexed by global layer index, length
+/// `num_hidden_layers` — so a single source of truth drives both shard-aware
+/// construction (per-layer placement + per-layer type/RoPE selection, which need
+/// the global index) and the forward loop. A stage that owns layers `[a..b)`
+/// queries the same global map; the architecture is responsible for the
+/// global↔local remap of its own `self.layers` / KV / SSM vectors via the
+/// `layer_offset = a` it was built with.
+///
+/// # Send / Sync
+///
+/// Holds only [`Device`] values (`Copy`, no tensors), so it is `Send + Sync` and
+/// may be handed to an engine-owning thread. Like [`DevicePool`], **never** add a
+/// `Tensor`/`VarStore` field — see the module-level `!Send` boundary note.
+#[derive(Debug, Clone)]
+pub struct LayerDeviceMap {
+    /// One device per global layer index. Always non-empty; `len()` equals the
+    /// model's `num_hidden_layers`.
+    per_layer: Vec<Device>,
+}
+
+impl LayerDeviceMap {
+    /// All layers on a single device — the unsplit fast path.
+    ///
+    /// Used both by single-GPU inference and by the CPU-only equivalence tests
+    /// (`forward_layers(0..N)` over an all-CPU map must equal the whole-model
+    /// forward). `num_layers` must be non-zero.
+    pub fn single(device: Device, num_layers: usize) -> Result<Self> {
+        if num_layers == 0 {
+            return Err(anyhow!("LayerDeviceMap requires num_layers >= 1 (got 0)"));
+        }
+        Ok(Self {
+            per_layer: vec![device; num_layers],
+        })
+    }
+
+    /// Build an explicit per-layer map, validating it is non-empty.
+    ///
+    /// `per_layer[g]` is the device that owns global layer `g`.
+    pub fn from_per_layer(per_layer: Vec<Device>) -> Result<Self> {
+        if per_layer.is_empty() {
+            return Err(anyhow!("LayerDeviceMap requires at least one layer (got none)"));
+        }
+        Ok(Self { per_layer })
+    }
+
+    /// Spread `num_layers` contiguously across a [`DevicePool`]'s devices in
+    /// requested order, balanced as evenly as possible (capacity-symmetric).
+    ///
+    /// Earlier stages get the extra layer when `num_layers` is not divisible by
+    /// the device count, matching the natural prefix-heavy split. This is the
+    /// parameter-balanced planner; the capacity-aware (asymmetric-VRAM) variant
+    /// is a later epic concern (plan §H) and would replace this constructor
+    /// without touching the forward path.
+    ///
+    /// Layers are assigned in **contiguous runs** so each device owns a single
+    /// pipeline stage `[a..b)` — never interleaved — which keeps boundary copies
+    /// to exactly `(num_stages - 1)` per forward.
+    pub fn even_split(pool: &DevicePool, num_layers: usize) -> Result<Self> {
+        if num_layers == 0 {
+            return Err(anyhow!("LayerDeviceMap requires num_layers >= 1 (got 0)"));
+        }
+        let devices = pool.devices();
+        let n_dev = devices.len();
+        let base = num_layers / n_dev;
+        let rem = num_layers % n_dev;
+
+        let mut per_layer = Vec::with_capacity(num_layers);
+        for (d, &dev) in devices.iter().enumerate() {
+            // First `rem` devices get one extra layer (prefix-heavy split).
+            let count = base + usize::from(d < rem);
+            for _ in 0..count {
+                per_layer.push(dev);
+            }
+        }
+        debug_assert_eq!(per_layer.len(), num_layers);
+        Ok(Self { per_layer })
+    }
+
+    /// Device owning global layer `global_layer_idx`.
+    ///
+    /// # Panics
+    /// Panics if `global_layer_idx >= len()` — a programming error (the caller
+    /// iterates a known global range). Use [`Self::try_device_for`] for a checked
+    /// variant.
+    #[must_use]
+    pub fn device_for(&self, global_layer_idx: usize) -> Device {
+        self.per_layer[global_layer_idx]
+    }
+
+    /// Checked [`Self::device_for`].
+    pub fn try_device_for(&self, global_layer_idx: usize) -> Result<Device> {
+        self.per_layer
+            .get(global_layer_idx)
+            .copied()
+            .ok_or_else(|| {
+                anyhow!(
+                    "LayerDeviceMap: global layer index {global_layer_idx} out of range \
+                     (map covers {} layers)",
+                    self.per_layer.len()
+                )
+            })
+    }
+
+    /// Whether a cross-device boundary copy is needed *before* running layer
+    /// `global_layer_idx`, given the device the previous layer's output is on.
+    ///
+    /// Returns `false` for the first layer of a stage when its device equals
+    /// `prev_device` (zero-copy within a stage and across same-device stages), and
+    /// `true` only when the device actually changes. This is the single point
+    /// that gates the lone `hidden.to_device()` in the forward loop.
+    #[must_use]
+    pub fn is_boundary(&self, prev_device: Device, global_layer_idx: usize) -> bool {
+        self.device_for(global_layer_idx) != prev_device
+    }
+
+    /// Number of global layers covered (equals the model's `num_hidden_layers`).
+    #[must_use]
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.per_layer.len()
+    }
+
+    /// Whether every layer maps to the same device (the unsplit fast path).
+    ///
+    /// When true, `forward_layers` performs zero cross-device copies and is
+    /// numerically identical to the single-device whole-model forward.
+    #[must_use]
+    pub fn is_single_device(&self) -> bool {
+        self.per_layer
+            .first()
+            .is_some_and(|&first| self.per_layer.iter().all(|&d| d == first))
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -276,5 +422,85 @@ mod tests {
         // no tensors, so it must be Send + Sync for the replication design.
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<DevicePool>();
+        // The layer→device map crosses to the engine thread too, so it must also
+        // be Send + Sync (it holds only Device values).
+        assert_send_sync::<LayerDeviceMap>();
+    }
+
+    #[test]
+    fn layer_map_single_is_zero_copy() {
+        let map = LayerDeviceMap::single(Device::Cpu, 4).unwrap();
+        assert_eq!(map.len(), 4);
+        assert!(map.is_single_device());
+        for g in 0..4 {
+            assert_eq!(map.device_for(g), Device::Cpu);
+        }
+        // No boundary anywhere when every layer is the same device.
+        for g in 1..4 {
+            assert!(!map.is_boundary(Device::Cpu, g));
+        }
+    }
+
+    #[test]
+    fn layer_map_single_rejects_zero() {
+        assert!(LayerDeviceMap::single(Device::Cpu, 0).is_err());
+        assert!(LayerDeviceMap::from_per_layer(vec![]).is_err());
+        let pool = DevicePool::from_devices(vec![Device::Cpu]).unwrap();
+        assert!(LayerDeviceMap::even_split(&pool, 0).is_err());
+    }
+
+    #[test]
+    fn even_split_is_contiguous_and_prefix_heavy() {
+        // 5 layers over 2 devices → [d0,d0,d0, d1,d1] (prefix gets the extra).
+        let pool =
+            DevicePool::from_devices(vec![Device::Cpu, Device::Cuda(0)]).unwrap();
+        let map = LayerDeviceMap::even_split(&pool, 5).unwrap();
+        assert_eq!(map.len(), 5);
+        assert_eq!(map.device_for(0), Device::Cpu);
+        assert_eq!(map.device_for(1), Device::Cpu);
+        assert_eq!(map.device_for(2), Device::Cpu);
+        assert_eq!(map.device_for(3), Device::Cuda(0));
+        assert_eq!(map.device_for(4), Device::Cuda(0));
+        assert!(!map.is_single_device());
+
+        // Exactly one boundary, at the device change (layer 3).
+        let mut boundaries = 0;
+        let mut prev = map.device_for(0);
+        for g in 1..map.len() {
+            if map.is_boundary(prev, g) {
+                boundaries += 1;
+            }
+            prev = map.device_for(g);
+        }
+        assert_eq!(boundaries, 1, "contiguous 2-device split has exactly one boundary");
+    }
+
+    #[test]
+    fn even_split_balanced_when_divisible() {
+        let pool = DevicePool::from_devices(vec![
+            Device::Cpu,
+            Device::Cuda(0),
+            Device::Cuda(1),
+        ])
+        .unwrap();
+        let map = LayerDeviceMap::even_split(&pool, 6).unwrap();
+        assert_eq!(
+            (0..6).map(|g| map.device_for(g)).collect::<Vec<_>>(),
+            vec![
+                Device::Cpu,
+                Device::Cpu,
+                Device::Cuda(0),
+                Device::Cuda(0),
+                Device::Cuda(1),
+                Device::Cuda(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn try_device_for_is_checked() {
+        let map = LayerDeviceMap::single(Device::Cpu, 2).unwrap();
+        assert_eq!(map.try_device_for(1).unwrap(), Device::Cpu);
+        assert!(map.try_device_for(2).unwrap_err().to_string().contains("out of range"));
     }
 }
