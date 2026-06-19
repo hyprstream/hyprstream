@@ -919,8 +919,9 @@ unsafe impl Sync for LlamaMLP {}
 
 impl LlamaMLP {
     /// Move all projection weights to `device` (#314 pipeline placement).
+    /// `pub(crate)` so qwen3_5's dense-MLP stage placement can reuse it.
     #[inline]
-    fn into_device(self, device: Device) -> Self {
+    pub(crate) fn into_device(self, device: Device) -> Self {
         Self {
             gate_proj: self.gate_proj.into_device(device),
             up_proj: self.up_proj.into_device(device),
