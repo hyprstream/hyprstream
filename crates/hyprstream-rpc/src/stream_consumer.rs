@@ -88,6 +88,11 @@ pub struct VerifierContract {
 /// HMAC chain verifier for StreamBlock.
 pub struct StreamVerifier {
     key: [u8; 32],
+    /// Transport-level AEAD key (#321). `Some` ⇒ a `Tagged` payload is opened
+    /// (AES-256-GCM, AAD bound to topic+epoch) back into Data/Complete; `None` ⇒
+    /// `Tagged` payloads pass through unchanged (the E2E notification path, which
+    /// the app layer decrypts itself).
+    enc_key: Option<[u8; 32]>,
     prev_mac: Option<[u8; 16]>,
     topic: String,
     /// Verifier contract enforcement (#163). `None` ⇒ legacy behaviour (MAC chain only, no
@@ -103,15 +108,29 @@ pub struct StreamVerifier {
 
 impl StreamVerifier {
     /// Create a new verifier with **no** policy enforcement (MAC chain only) — legacy behaviour.
+    ///
+    /// AEAD opening is OFF (`enc_key = None`); use [`StreamVerifier::with_enc_key`] to
+    /// open transport-sealed `Tagged` payloads (#321).
     pub fn new(key: [u8; 32], topic: String) -> Self {
         Self {
             key,
+            enc_key: None,
             prev_mac: None,
             topic,
             policy: None,
             seq_cursor: None,
             terminal_seen: false,
         }
+    }
+
+    /// Set the transport AEAD key so sealed `Tagged` payloads are opened (#321).
+    ///
+    /// Builder-style; pass the `enc_key` from `derive_client_stream_keys`. With it
+    /// set, the verifier decrypts each `Tagged` block back into Data/Complete and
+    /// fails closed on tamper / wrong key.
+    pub fn with_enc_key(mut self, enc_key: [u8; 32]) -> Self {
+        self.enc_key = Some(enc_key);
+        self
     }
 
     /// Create a verifier that enforces `policy` (#163) — used by codegen-generated consumers,
@@ -226,6 +245,10 @@ impl StreamVerifier {
             }
         }
 
+        // #321: the AEAD AAD binds each sealed payload to (topic, epoch); read the
+        // block epoch so a sealed Tagged payload can only open under its own epoch.
+        let block_epoch = block.get_epoch();
+
         let payloads_reader = block.get_payloads()?;
         let mut payloads = Vec::with_capacity(payloads_reader.len() as usize);
 
@@ -249,11 +272,25 @@ impl StreamVerifier {
                 }
                 Which::Tagged(tagged_result) => {
                     let tagged = tagged_result?;
-                    StreamPayload::Tagged {
-                        tag: tagged.get_tag()?.to_vec(),
-                        payload: tagged.get_payload()?.to_vec(),
-                        nonce: tagged.get_nonce()?.to_vec(),
-                        key_commitment: tagged.get_key_commitment()?.to_vec(),
+                    match self.enc_key {
+                        // #321: transport AEAD ON — open the sealed payload back into
+                        // Data/Complete (fails closed on tamper / wrong key).
+                        Some(ref enc_key) => open_sealed_payload(
+                            enc_key,
+                            &self.topic,
+                            block_epoch,
+                            tagged.get_tag()?,
+                            tagged.get_payload()?,
+                            tagged.get_nonce()?,
+                            tagged.get_key_commitment()?,
+                        )?,
+                        // No transport key (E2E notification path): pass Tagged through.
+                        None => StreamPayload::Tagged {
+                            tag: tagged.get_tag()?.to_vec(),
+                            payload: tagged.get_payload()?.to_vec(),
+                            nonce: tagged.get_nonce()?.to_vec(),
+                            key_commitment: tagged.get_key_commitment()?.to_vec(),
+                        },
                     }
                 }
             };
@@ -277,6 +314,68 @@ impl StreamVerifier {
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
     a.ct_eq(b).into()
+}
+
+// ============================================================================
+// #321 — transport-level AEAD framing (cross-target seal/open glue).
+//
+// The seal side lives in `moq_stream` (native publisher); the open side here is
+// cross-target so the wasm/browser consumer opens sealed blocks too. Both sides
+// share this AAD + kind-tag framing.
+// ============================================================================
+
+/// Plaintext kind tag prepended inside the AEAD-sealed bytes so the open path can
+/// restore the original payload variant (`Data` vs `Complete`) without a schema
+/// change. Authenticated as part of the AEAD plaintext.
+pub(crate) const SEALED_KIND_DATA: u8 = 0x00;
+pub(crate) const SEALED_KIND_COMPLETE: u8 = 0x01;
+
+/// Build the AEAD AAD (also the `encrypt_event` "prefix") binding each sealed
+/// payload to its `topic` and key-`epoch` (#321/#223). Reused verbatim by the
+/// publisher seal path; a block replayed under a different epoch fails AEAD open.
+pub(crate) fn stream_aead_aad(topic: &str, epoch: u64) -> String {
+    format!("{topic}|stream-aead-v1|epoch={epoch}")
+}
+
+/// Open an AEAD-sealed `Tagged` payload (#321), restoring the original
+/// Data/Complete variant. Returns `Err` on tamper / wrong key (fail-closed).
+///
+/// `epoch` is the StreamBlock's epoch and MUST match the seal-side AAD.
+pub(crate) fn open_sealed_payload(
+    enc_key: &[u8; 32],
+    topic: &str,
+    epoch: u64,
+    tag: &[u8],
+    ciphertext: &[u8],
+    nonce: &[u8],
+    key_commitment: &[u8],
+) -> Result<StreamPayload> {
+    use crate::crypto::event_crypto::{check_key_commitment, decrypt_event_full};
+
+    let nonce12: [u8; 12] = nonce
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("stream AEAD: bad nonce length {}", nonce.len()))?;
+    let commitment16: [u8; 16] = key_commitment.try_into().map_err(|_| {
+        anyhow::anyhow!("stream AEAD: bad key_commitment length {}", key_commitment.len())
+    })?;
+
+    // Fast committing-AEAD rejection of a wrong-key block before the GCM open.
+    if !check_key_commitment(enc_key, &nonce12, &commitment16) {
+        anyhow::bail!("stream AEAD: key commitment mismatch (wrong key or tampered block)");
+    }
+
+    let aad = stream_aead_aad(topic, epoch);
+    let plaintext = decrypt_event_full(enc_key, &nonce12, tag, ciphertext, &aad)
+        .map_err(|e| anyhow::anyhow!("stream AEAD open failed: {e}"))?;
+
+    let (&kind, body) = plaintext
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("stream AEAD: empty sealed plaintext (missing kind tag)"))?;
+    match kind {
+        SEALED_KIND_DATA => Ok(StreamPayload::Data(body.to_vec())),
+        SEALED_KIND_COMPLETE => Ok(StreamPayload::Complete(body.to_vec())),
+        other => anyhow::bail!("stream AEAD: unknown sealed kind tag {other:#x}"),
+    }
 }
 
 // ============================================================================
@@ -327,11 +426,13 @@ impl<T: Transport> StreamHandleImpl<T> {
         let publisher = transport.publish(keys.ctrl_topic.as_bytes()).await.ok();
 
         // QoS contract from the signed StreamInfo handshake — enforced for both native and WASM paths.
+        // #321: AEAD ON for this DH-keyed (mesh/networked) stream — open sealed Tagged blocks.
         let verifier = StreamVerifier::with_policy(
             *keys.mac_key,
             keys.topic.clone(),
             stream_info.qos.into(),
-        );
+        )
+        .with_enc_key(*keys.enc_key);
 
         Ok(Self {
             subscriber,

@@ -448,13 +448,14 @@ fn generate_trait_method_impl(
                 if info.broadcast_path.is_empty() {
                     anyhow::bail!("Server did not provide moq broadcast path — moq transport not initialized");
                 }
-                let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
+                let (mac_key, enc_key, topic) = hyprstream_rpc::derive_client_stream_keys(
                     &client_secret, &client_pubkey_bytes, &info.dh_public,
                 )?;
                 // #274: subscribe over the resolved `reach` (the same-host UDS
                 // fast path is preferred automatically when co-located).
+                // #321: enc_key opens the transport-AEAD-sealed Tagged blocks.
                 Ok(hyprstream_rpc::moq_stream::MoqStreamHandle::networked(
-                    info.announced_at, info.broadcast_path, mac_key, topic,
+                    info.announced_at, info.broadcast_path, mac_key, enc_key, topic,
                 ))
             }
         })

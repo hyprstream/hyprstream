@@ -148,7 +148,11 @@ async fn run_attach_loop(
     // `connect_uds(moq_uds_path)` connected to *this* process's empty plane and
     // timed out waiting for the producer's broadcast.
     let reach = stream_info.reach.clone();
-    let mut handle = MoqStreamHandle::networked(reach, broadcast_path, mac_key, topic);
+    // #321: the TUI stdout stream is published AEAD-off (the viewer gets only
+    // `mac_key`+`topic` out of band), so the transport enc_key is never exercised
+    // here — derive a stable one from mac_key purely to satisfy the consumer API.
+    let enc_key = *hyprstream_rpc::crypto::StreamKeys::new(topic.clone(), mac_key).enc_key;
+    let mut handle = MoqStreamHandle::networked(reach, broadcast_path, mac_key, enc_key, topic);
     let recv_handle = tokio::spawn(async move {
         loop {
             match handle.recv_next().await {

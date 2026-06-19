@@ -150,6 +150,8 @@ pub mod service;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod streaming;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod stream_provenance;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod moq_stream;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod moq_authz;

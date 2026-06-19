@@ -245,6 +245,25 @@ struct StreamBlock {
   # re-key / producer restart so (epoch, sequenceNumber) is globally unique.
   # 0 until the epoch lifecycle lands; ordinal reserved so that change is wire-safe.
   epoch @3 :UInt64;
+  # Per-host provenance signature (#321 / C-PROV / threat T3). Additive, wire-safe:
+  # the HMAC chain proves "held the DH key + in order", NOT "host-X computed this".
+  # `provenance` attaches the producing host's per-host hybrid COSE signature
+  # (EdDSA + ML-DSA-65, #328 `derive_mesh_mldsa_key`) over the canonical signed
+  # region (prevMac ‖ sequenceNumber ‖ epoch ‖ serialized payloads). The consumer
+  # verifies the signature AND that the signer is in the mesh_peers roster (fail-
+  # closed). An absent/zero-length `provenance` (default) means no in-band signer
+  # was attached (the legacy chained-HMAC-only block). Verification is a layer ON
+  # TOP of AEAD + HMAC.
+  provenance @4 :Provenance;
+}
+
+# Per-host provenance for a StreamBlock (#321). `signerKid` is the producing
+# host's key id (its Ed25519 verifying-key bytes, matching the COSE inner kid);
+# `sig` is the CBOR-encoded hybrid COSE_Sign composite over the block's canonical
+# signed region. Empty `sig` ⇒ no provenance attached.
+struct Provenance {
+  signerKid @0 :Data;
+  sig @1 :Data;
 }
 
 # =============================================================================
