@@ -1315,7 +1315,7 @@ dependencies = [
  "bitflags 2.11.0",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -3805,7 +3805,7 @@ dependencies = [
  "thiserror 1.0.69",
  "vfio-bindings 0.3.1",
  "vfio-ioctls",
- "virtio-queue",
+ "virtio-queue 0.7.1",
  "vm-memory 0.10.0",
  "vmm-sys-util 0.11.2",
 ]
@@ -3881,9 +3881,9 @@ dependencies = [
  "thiserror 1.0.69",
  "threadpool",
  "timerfd",
- "vhost",
- "virtio-bindings",
- "virtio-queue",
+ "vhost 0.6.1",
+ "virtio-bindings 0.1.0",
+ "virtio-queue 0.7.1",
  "vm-memory 0.10.0",
  "vmm-sys-util 0.11.2",
 ]
@@ -4320,7 +4320,7 @@ dependencies = [
  "tracing",
  "vfio-bindings 0.3.1",
  "vfio-ioctls",
- "virtio-queue",
+ "virtio-queue 0.7.1",
  "vm-memory 0.10.0",
  "vmm-sys-util 0.11.2",
 ]
@@ -5105,7 +5105,7 @@ dependencies = [
  "log",
  "mio 0.8.11",
  "nix 0.24.3",
- "virtio-queue",
+ "virtio-queue 0.7.1",
  "vm-memory 0.10.0",
  "vmm-sys-util 0.11.2",
 ]
@@ -5129,6 +5129,7 @@ dependencies = [
  "radix_trie",
  "versionize",
  "versionize_derive",
+ "virtio-queue 0.12.0",
  "vm-memory 0.14.1",
  "vmm-sys-util 0.12.1",
 ]
@@ -6331,7 +6332,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.0",
  "system-configuration 0.6.1",
  "tokio",
  "tower-service",
@@ -6874,6 +6875,26 @@ dependencies = [
  "parking_lot 0.12.4",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "hyprstream-vfs-server"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "fuse-backend-rs 0.13.1",
+ "hyprstream-rpc",
+ "hyprstream-vfs",
+ "libc",
+ "parking_lot 0.12.4",
+ "tokio",
+ "tracing",
+ "vhost 0.11.0",
+ "vhost-user-backend",
+ "virtio-bindings 0.2.7",
+ "virtio-queue 0.12.0",
+ "vm-memory 0.14.1",
+ "vmm-sys-util 0.12.1",
 ]
 
 [[package]]
@@ -9603,7 +9624,7 @@ dependencies = [
  "pin-project-lite",
  "rustc-hash",
  "rustls 0.23.40",
- "socket2 0.5.10",
+ "socket2 0.6.0",
  "thiserror 2.0.17",
  "tokio",
  "tokio-stream",
@@ -9646,7 +9667,7 @@ checksum = "78633d1fe1bde91d12bcabb230ac9edb890857414c6d44f3212e0d309525b5ff"
 dependencies = [
  "cfg_aliases",
  "libc",
- "socket2 0.5.10",
+ "socket2 0.6.0",
  "tracing",
  "windows-sys 0.61.0",
 ]
@@ -12273,7 +12294,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.40",
- "socket2 0.5.10",
+ "socket2 0.6.0",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
@@ -12312,7 +12333,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.0",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -16251,7 +16272,7 @@ dependencies = [
  "log",
  "thiserror 2.0.17",
  "vfio-bindings 0.6.1",
- "vm-memory 0.10.0",
+ "vm-memory 0.14.1",
  "vmm-sys-util 0.15.0",
 ]
 
@@ -16268,10 +16289,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "vhost"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6be08d1166d41a78861ad50212ab3f9eca0729c349ac3a7a8f557c62406b87cc"
+dependencies = [
+ "bitflags 2.11.0",
+ "libc",
+ "vm-memory 0.14.1",
+ "vmm-sys-util 0.12.1",
+]
+
+[[package]]
+name = "vhost-user-backend"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f0ffb1dd8e00a708a0e2c32d5efec5812953819888591fff9ff68236b8a5096"
+dependencies = [
+ "libc",
+ "log",
+ "vhost 0.11.0",
+ "virtio-bindings 0.2.7",
+ "virtio-queue 0.12.0",
+ "vm-memory 0.14.1",
+ "vmm-sys-util 0.12.1",
+]
+
+[[package]]
 name = "virtio-bindings"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ff512178285488516ed85f15b5d0113a7cdb89e9e8a760b269ae4f02b84bd6b"
+
+[[package]]
+name = "virtio-bindings"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "091f1f09cfbf2a78563b562e7a949465cce1aef63b6065645188d995162f8868"
 
 [[package]]
 name = "virtio-queue"
@@ -16280,9 +16334,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ba81e2bcc21c0d2fc5e6683e79367e26ad219197423a498df801d79d5ba77bd"
 dependencies = [
  "log",
- "virtio-bindings",
+ "virtio-bindings 0.1.0",
  "vm-memory 0.10.0",
  "vmm-sys-util 0.11.2",
+]
+
+[[package]]
+name = "virtio-queue"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07d8406e7250c934462de585d8f2d2781c31819bca1fbb7c5e964ca6bbaabfe8"
+dependencies = [
+ "log",
+ "virtio-bindings 0.2.7",
+ "vm-memory 0.14.1",
+ "vmm-sys-util 0.12.1",
 ]
 
 [[package]]
@@ -16308,6 +16374,7 @@ version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c3aba5064cc5f6f7740cddc8dae34d2d9a311cac69b60d942af7f3ab8fc49f4"
 dependencies = [
+ "arc-swap",
  "libc",
  "thiserror 1.0.69",
  "winapi",

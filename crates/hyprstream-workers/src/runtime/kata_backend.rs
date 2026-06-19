@@ -10,9 +10,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use kata_hypervisor::ch::CloudHypervisor;
+use kata_hypervisor::device::DeviceType;
 #[cfg(feature = "dragonball")]
 use kata_hypervisor::dragonball::Dragonball;
-use kata_hypervisor::Hypervisor;
+use kata_hypervisor::{Hypervisor, ShareFsConfig, ShareFsDevice};
 use kata_types::config::hypervisor::{Hypervisor as HypervisorConfig, RootlessUser};
 use kata_types::rootless;
 
@@ -152,6 +153,66 @@ impl KataBackend {
         Ok(hypervisor)
     }
 
+    /// Attach a vhost-user-fs share to the hypervisor as a ShareFs device.
+    ///
+    /// This closes the gap noted in the FS spike (the virtiofs socket was created
+    /// but never wired into the VM): it adds the existing vhost-user-fs socket as
+    /// a Cloud Hypervisor `ShareFs` (virtio-fs) device via the **embedded**
+    /// runtime-rs hypervisor crate (#343 = embed), so the guest can mount the
+    /// share. The same path is used whether the socket is served by `nydusd`
+    /// (RAFS image rootfs) or by hyprstream's own `hyprstream-vfs-server`
+    /// (the VFS down-adapter).
+    ///
+    /// # Ordering
+    ///
+    /// Must be called **after `prepare_vm`** (which sets the hypervisor's
+    /// `vm_path`) and **before `start_vm`**. When the VM is not yet running, the
+    /// CH backend queues the device into its `pending_devices` and folds it into
+    /// the `VmConfig.fs` at boot — no virtiofsd is spawned by the crate; CH
+    /// connects to the socket we hand it. An **absolute** `sock_path` is used so
+    /// CH does not re-root it under the sandbox dir.
+    ///
+    /// `fs_type` must be the literal `"virtio-fs"` or the CH backend rejects the
+    /// device.
+    async fn attach_share_fs(
+        hypervisor: &Arc<dyn Hypervisor>,
+        sandbox_id: &str,
+        socket_path: &Path,
+        mount_tag: &str,
+    ) -> Result<()> {
+        let sock_path = socket_path.to_str().ok_or_else(|| {
+            WorkerError::SandboxCreationFailed("virtiofs socket path contains invalid UTF-8".into())
+        })?;
+
+        let config = ShareFsConfig {
+            // CH never reads host_shared_path/options/mount_config — the daemon
+            // that serves `sock_path` owns the exported tree. Only the socket,
+            // tag, type, and queue geometry matter for the boot-time attach.
+            fs_type: "virtio-fs".to_owned(),
+            sock_path: sock_path.to_owned(),
+            mount_tag: mount_tag.to_owned(),
+            queue_num: 1,
+            queue_size: 1024,
+            ..Default::default()
+        };
+        let device = ShareFsDevice::new(&format!("share-fs-{sandbox_id}"), &config);
+
+        hypervisor
+            .add_device(DeviceType::ShareFs(device))
+            .await
+            .map_err(|e| {
+                WorkerError::VmStartFailed(format!("failed to attach vhost-user-fs share: {e}"))
+            })?;
+
+        tracing::info!(
+            sandbox_id = %sandbox_id,
+            socket = %socket_path.display(),
+            mount_tag = %mount_tag,
+            "Attached vhost-user-fs ShareFs device to hypervisor"
+        );
+        Ok(())
+    }
+
     /// Generate cloud-init ISO for a sandbox.
     async fn generate_cloud_init_iso(sandbox: &PodSandbox, iso_path: &Path) -> Result<()> {
         let sandbox_runtime_dir = iso_path
@@ -279,6 +340,13 @@ impl SandboxBackend for KataBackend {
             .prepare_vm(&sandbox.id, None, annotations, None)
             .await
             .map_err(|e| WorkerError::VmStartFailed(format!("failed to prepare VM: {e}")))?;
+
+        // Attach the vhost-user-fs share (RAFS image rootfs and/or the
+        // hyprstream-vfs-server VFS down-adapter) as a CH ShareFs device, after
+        // prepare_vm and before start_vm so it is folded into the boot VmConfig.
+        if let Some(ref socket) = virtiofs_sock {
+            Self::attach_share_fs(&hypervisor, &sandbox.id, socket, "hyprstream-vfs").await?;
+        }
 
         let timeout_secs = i32::try_from(pool_config.create_timeout_secs).unwrap_or(i32::MAX);
         tracing::debug!(sandbox_id = %sandbox.id, timeout_secs, "Starting VM");
