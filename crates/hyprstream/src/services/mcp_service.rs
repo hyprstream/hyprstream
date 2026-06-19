@@ -439,16 +439,16 @@ fn register_scoped_tools_recursive(
 
                             let handle = match decode_stream_reach(&stream_info_json)? {
                                 DecodedStreamReach::Networked { dh_public, reach, broadcast_path } => {
-                                    let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
+                                    let (mac_key, enc_key, topic) = hyprstream_rpc::derive_client_stream_keys(
                                         &client_secret, &client_pubkey_bytes, &dh_public,
                                     )?;
-                                    MoqStreamHandle::networked(reach, broadcast_path, mac_key, topic)
+                                    MoqStreamHandle::networked(reach, broadcast_path, mac_key, enc_key, topic)
                                 }
                                 DecodedStreamReach::Uds { dh_public, uds_path, broadcast_path } => {
-                                    let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
+                                    let (mac_key, enc_key, topic) = hyprstream_rpc::derive_client_stream_keys(
                                         &client_secret, &client_pubkey_bytes, &dh_public,
                                     )?;
-                                    MoqStreamHandle::new(uds_path, broadcast_path, mac_key, topic)
+                                    MoqStreamHandle::new(uds_path, broadcast_path, mac_key, enc_key, topic)
                                 }
                             };
 
@@ -603,16 +603,16 @@ fn register_streaming_tool(
 
                 let handle = match decode_stream_reach(&stream_info_json)? {
                     DecodedStreamReach::Networked { dh_public, reach, broadcast_path } => {
-                        let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
+                        let (mac_key, enc_key, topic) = hyprstream_rpc::derive_client_stream_keys(
                             &client_secret, &client_pubkey_bytes, &dh_public,
                         )?;
-                        MoqStreamHandle::networked(reach, broadcast_path, mac_key, topic)
+                        MoqStreamHandle::networked(reach, broadcast_path, mac_key, enc_key, topic)
                     }
                     DecodedStreamReach::Uds { dh_public, uds_path, broadcast_path } => {
-                        let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
+                        let (mac_key, enc_key, topic) = hyprstream_rpc::derive_client_stream_keys(
                             &client_secret, &client_pubkey_bytes, &dh_public,
                         )?;
-                        MoqStreamHandle::new(uds_path, broadcast_path, mac_key, topic)
+                        MoqStreamHandle::new(uds_path, broadcast_path, mac_key, enc_key, topic)
                     }
                 };
 

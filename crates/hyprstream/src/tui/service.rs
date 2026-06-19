@@ -332,8 +332,13 @@ impl TuiService {
         // DH key exchange derives context from client's ephemeral pubkey.
         // If no pubkey (local/test connections), generate random standalone contexts.
         let make_stream_ctx = |label: &str| -> Result<StreamContext> {
+            // #321: the TUI PTY/shell viewer receives only `(mac_key, topic)` out of
+            // band (see tui_handlers / shell_handlers) and never derives the DH
+            // `enc_key`, so transport AEAD is disabled for these same-host streams.
+            // The blocks remain HMAC-chain authenticated. (AEAD stays mandatory + ON
+            // for the DH-keyed mesh inference stream, whose consumer derives enc_key.)
             match ctx.ephemeral_pubkey() {
-                Some(pubkey) => StreamContext::from_dh(&pubkey),
+                Some(pubkey) => Ok(StreamContext::from_dh(&pubkey)?.without_aead()),
                 None => {
                     use rand::RngCore;
                     let mut rng = rand::thread_rng();
