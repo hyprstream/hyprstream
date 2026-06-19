@@ -7,10 +7,15 @@
 //!
 //! Architecture:
 //! ```text
-//! ManifestFetcher (HTTP)  →  nydus-storage Registry backend  →  TarballBuilder
+//! ManifestFetcher (HTTP)  →  nydus-storage Registry backend  →  rafs_builder (TarballBuilder)
 //!      │                              │                              │
-//!      └── OCI manifests only         └── Dragonfly P2P for blobs    └── RAFS output
+//!      └── OCI manifests only         └── Dragonfly P2P for blobs    └── RAFS bootstrap (.meta)
 //! ```
+//!
+//! `pull()` downloads the OCI layer tarballs into the CAS and then converts them
+//! in-process into a RAFS bootstrap (`.meta`) via [`rafs_builder`], so
+//! [`RafsStore::bootstrap_path`] resolves to a real RAFS bootstrap consumable by
+//! an in-process RAFS `FileSystem` (FS-B, #363) or nydusd (FS-B0, #366).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -183,6 +188,37 @@ impl RafsStore {
         // 6. Generate image ID (SHA256 of config)
         let config_data = tokio::fs::read(&config_path).await?;
         let image_id = format!("sha256:{}", hex::encode(Sha256::digest(&config_data)));
+
+        // 6b. Build the RAFS bootstrap (.meta) from the pulled OCI layer tarballs.
+        //
+        // FS-B0 (#366): the layers above were downloaded into the CAS, but RAFS /
+        // nydusd consume a RAFS *bootstrap*, not raw OCI tarballs. Convert them
+        // in-process via nydus-builder so `bootstrap_path()` resolves to a real
+        // bootstrap. This MUST succeed; a missing/JSON bootstrap is a hard error.
+        let layer_blob_paths: Vec<PathBuf> = manifest
+            .layers
+            .iter()
+            .map(|l| self.blobs_dir.join(digest_to_filename(&l.digest)))
+            .collect();
+        let bootstrap_path = self.bootstrap_path(&image_id);
+        let blobs_dir = self.blobs_dir.clone();
+        let build_layers = layer_blob_paths.clone();
+        let build_bootstrap = bootstrap_path.clone();
+        tracing::info!(
+            image = %image_ref,
+            layers = %build_layers.len(),
+            bootstrap = %build_bootstrap.display(),
+            "Building RAFS bootstrap from OCI layers"
+        );
+        tokio::task::spawn_blocking(move || {
+            super::rafs_builder::build_rafs_bootstrap(&build_layers, &blobs_dir, &build_bootstrap)
+        })
+        .await
+        .map_err(|e| WorkerError::RafsError(format!("RAFS build task panicked: {e}")))?
+        .map_err(|e| WorkerError::ImagePullFailed {
+            image: image_ref.to_owned(),
+            reason: format!("RAFS bootstrap build failed: {e}"),
+        })?;
 
         // 7. Write metadata
         let metadata = ImageMetadata {
@@ -474,6 +510,12 @@ impl RafsStore {
             tokio::fs::remove_file(&metadata_path).await?;
         }
 
+        // Remove the RAFS bootstrap (.meta) built by FS-B0.
+        let bootstrap_path = self.bootstrap_path(image_id);
+        if bootstrap_path.exists() {
+            tokio::fs::remove_file(&bootstrap_path).await?;
+        }
+
         // Note: Blobs are not removed immediately as they may be shared
         // Run gc() to clean up unreferenced blobs
 
@@ -490,15 +532,31 @@ impl RafsStore {
         if self.bootstrap_dir.exists() {
             for entry in std::fs::read_dir(&self.bootstrap_dir)? {
                 let entry = entry?;
-                if entry.path().extension().is_some_and(|e| e == "json") {
-                    if let Ok(metadata_str) = std::fs::read_to_string(entry.path()) {
-                        if let Ok(metadata) = serde_json::from_str::<ImageMetadata>(&metadata_str) {
-                            referenced.insert(digest_to_filename(&metadata.config_digest));
-                            for layer in &metadata.layers {
-                                referenced.insert(digest_to_filename(layer));
+                let path = entry.path();
+                match path.extension().and_then(|e| e.to_str()) {
+                    Some("json") => {
+                        if let Ok(metadata_str) = std::fs::read_to_string(&path) {
+                            if let Ok(metadata) = serde_json::from_str::<ImageMetadata>(&metadata_str)
+                            {
+                                referenced.insert(digest_to_filename(&metadata.config_digest));
+                                for layer in &metadata.layers {
+                                    referenced.insert(digest_to_filename(layer));
+                                }
                             }
                         }
                     }
+                    // RAFS bootstraps reference data blobs by their RAFS blob
+                    // hash (not OCI layer digests), so mark those as referenced
+                    // too — otherwise GC would delete blobs a live bootstrap
+                    // depends on.
+                    Some("meta") => {
+                        if let Ok(blob_ids) = super::rafs_builder::bootstrap_blob_ids(&path) {
+                            for blob_id in blob_ids {
+                                referenced.insert(blob_id);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }

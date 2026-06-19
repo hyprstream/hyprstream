@@ -32,6 +32,7 @@
 
 mod client;
 mod manifest;
+mod rafs_builder;
 mod store;
 
 pub use crate::generated::worker_client::{

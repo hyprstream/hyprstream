@@ -58,6 +58,12 @@ nydus-storage = { git = "https://github.com/dragonflyoss/nydus", tag = "v2.4.0",
     "backend-registry",
     "backend-localfs",
 ] }
+# FS-B0: in-process RAFS bootstrap builder. TarballBuilder converts pulled OCI
+# layer tarballs into a RAFS bootstrap (.meta) + dedup data blobs, no external
+# nydus-image binary required.
+nydus-builder = { git = "https://github.com/dragonflyoss/nydus", tag = "v2.4.0" }
+nydus-rafs = { git = "https://github.com/dragonflyoss/nydus", tag = "v2.4.0" }
+nydus-utils = { git = "https://github.com/dragonflyoss/nydus", tag = "v2.4.0" }
 
 # Phase 2: VM Runtime (nydus-service for virtiofs)
 nydus-service = { git = "https://github.com/dragonflyoss/nydus", tag = "v2.4.0" }
@@ -102,6 +108,9 @@ hyprstream-rpc-build = { workspace = true }
 [dev-dependencies]
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
+# FS-B0 RAFS bootstrap builder tests: synthesize small OCI layer tarballs.
+tar = "0.4"
+flate2 = "1"
 
 [lints]
 workspace = true
