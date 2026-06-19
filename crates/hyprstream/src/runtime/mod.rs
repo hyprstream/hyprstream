@@ -33,6 +33,7 @@ pub mod generation_metrics; // Quality metrics for self-supervised training
 // KV cache quantization — re-export the generated Cap'n Proto enum as canonical type
 pub use crate::services::generated::model_client::KVQuantType;
 pub mod tensor_sampling; // Device-agnostic tensor-based sampling
+pub mod device_pool; // Multi-GPU device abstraction (DevicePool) — Send+Sync, holds only Device values
 pub mod image_utils; // Image loading and preprocessing for multimodal models
 pub mod kv_cache; // Key-Value caching for efficient autoregressive generation
 pub mod model_config; // Unified model configuration management
@@ -47,6 +48,9 @@ pub mod weight_provider; // Weight provider for streaming large models
 
 // Primary exports - use TorchEngine as default
 pub use torch_engine::{TorchEngine, TextStream, GenerationStats};
+
+// Multi-GPU device abstraction
+pub use device_pool::DevicePool;
 
 // KV cache exports for multi-session support
 pub use kv_cache::{CacheConfig, CacheOwner, KVCacheManager, KVCacheRegistry};

@@ -315,6 +315,28 @@ impl TorchEngine {
 
     /// Internal sync constructor
     fn new_sync(config: RuntimeConfig) -> Result<Self> {
+        // Multi-GPU foundation (#313, epic #310): when devices are *explicitly*
+        // requested via `RuntimeConfig.devices` / `HYPRSTREAM_GPU_DEVICES`,
+        // resolve them through `DevicePool`, which validates them fail-fast (no
+        // silent CPU downgrade) and is the seam for later replication (#313/2a)
+        // and the layer device_map (#314). This PR only uses the pool's *primary*
+        // device, so single-GPU runtime behavior is unchanged; the legacy
+        // single-`gpu_device_id` path below is left intact (including its
+        // existing soft CPU fallback) to avoid changing that behavior here.
+        if config.use_gpu {
+            if let Some(indices) = config.resolve_explicit_multi_device_indices()? {
+                let pool = crate::runtime::DevicePool::from_cuda_indices(&indices)?;
+                let device = pool.primary();
+                info!(
+                    "🚀 Multi-GPU DevicePool resolved {} device(s) {:?}; using primary {:?}",
+                    pool.len(),
+                    pool.devices(),
+                    device
+                );
+                return Self::with_device(config, device);
+            }
+        }
+
         // Determine device based on configuration
         let device = if config.use_gpu {
             // Use specified GPU device ID, or auto-detect
@@ -353,6 +375,16 @@ impl TorchEngine {
             Device::Cpu
         };
 
+        Self::with_device(config, device)
+    }
+
+    /// Construct an engine pinned to an already-resolved [`Device`].
+    ///
+    /// Single-device by design: a `TorchEngine` owns exactly one immutable
+    /// device and stays thread-pinned because `tch` tensors are `!Send`. The
+    /// multi-device `DevicePool` selects *which* device (its primary, for now);
+    /// the multi-engine/replication routing across the pool is a later PR (#313/2a).
+    fn with_device(config: RuntimeConfig, device: Device) -> Result<Self> {
         Ok(Self {
             var_store: Arc::new(Mutex::new(None)),
             model_architecture: Arc::new(Mutex::new(None)),
