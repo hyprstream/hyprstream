@@ -15,6 +15,7 @@ pub mod data_loader;
 pub mod delta_pool;
 pub mod merge;
 pub mod muon;
+pub mod pipeline;
 pub mod quality_filter;
 pub mod tenant_delta;
 pub mod ttt;
@@ -40,3 +41,5 @@ pub use tenant_delta::{TenantDelta, TenantDeltaConfig, SharedTenantDelta, serial
 pub use merge::{MergeStrategy, merge_state_dicts};
 
 pub use ttt::{TTTConfig, TTTContext, TTTOverrides, TTTResult, TTTVerifier, TestTimeTrainer, RankOracle, RankOracleConfig, GradientGatingConfig};
+
+pub use pipeline::{compute_ntp_loss_split, forward_train_pipeline, stage_ranges, TrainStage};

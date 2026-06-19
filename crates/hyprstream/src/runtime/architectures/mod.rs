@@ -384,6 +384,50 @@ pub trait ModelOperations: Send {
         ))
     }
 
+    /// Training-path sibling of [`Self::forward_layers`] — the cross-device
+    /// autograd primitive for **TTT-on-split** (#316, M-TRAIN-COUPLING).
+    ///
+    /// TTT is inference-time training that must traverse the **same** layer
+    /// partition inference uses, so the backward pass materializes grads on each
+    /// parameter's own device. This runner builds that autograd graph across the
+    /// [`crate::runtime::device_pool::LayerDeviceMap`]; the lone stage-boundary
+    /// `hidden.to_device(next)` is autograd-transparent (tch `to_device` is
+    /// differentiable), so gradients flow back through it to the previous stage's
+    /// device.
+    ///
+    /// # How it differs from the inference [`Self::forward_layers`]
+    /// The inference and training paths are kept deliberately separate (as the
+    /// whole-model paths already are). The training path:
+    /// - uses **no KV cache** — full causal attention over the entire context;
+    /// - pins **`start_pos = 0`** — `position_ids` are `0..seq`;
+    /// - uses **fresh, call-local recurrent (SSM) state** for hybrid
+    ///   architectures — the persistent inference `conv`/`rec` state is never read
+    ///   or written, so a TTT step cannot pollute the inference recurrent state
+    ///   (and the split is numerically identical to the whole-model training
+    ///   forward, since per-layer recurrent state never crosses a layer boundary).
+    ///
+    /// Everything else — the global↔local layer remap via `layer_offset`, the
+    /// single boundary copy, per-layer delta injection keyed by global index —
+    /// matches [`Self::forward_layers`]. The arch-agnostic stage orchestration is
+    /// identical (`embed_tokens` → `forward_layers_train(0..b)` → … →
+    /// `forward_layers_train(a..N)` → `apply_final_norm` → `lm_head`), and the
+    /// loss/backward is driven by the caller (e.g. the TTT trainer).
+    ///
+    /// The default implementation errors; only architectures that support the
+    /// pipeline split (Llama; Qwen3.5) override it. The single-device whole-model
+    /// training path ([`crate::runtime::TorchEngine::forward_with_delta`]) is
+    /// unaffected — this method is purely additive.
+    fn forward_layers_train(
+        &self,
+        _hidden: &Tensor,
+        _range: std::ops::Range<usize>,
+        _delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        Err(anyhow!(
+            "forward_layers_train (pipeline layer-split training) not implemented for this architecture"
+        ))
+    }
+
     /// Apply final layer normalization
     fn apply_final_norm(&self, _hidden_states: &Tensor) -> Result<Tensor> {
         Err(anyhow!("apply_final_norm not implemented for this architecture"))
