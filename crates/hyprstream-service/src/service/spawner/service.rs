@@ -175,6 +175,10 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                         addr: advertise_addr,
                         server_name: qc.server_name.clone(),
                         cert_hashes: vec![pin],
+                        // The iroh node_id is registered separately once the iroh
+                        // substrate binds (it is not known at the QUIC-bind point);
+                        // see init_global_iroh_node_id below (#357).
+                        iroh_node_id: None,
                     },
                 );
                 if let Some(cb) = qc.on_quic_bound.take() {
@@ -235,6 +239,10 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                             let _ = hyprstream_rpc::transport::lazy_iroh::install_iroh_client_endpoint(
                                 substrate.endpoint().clone(),
                             );
+                            // #357: register our iroh node_id so producer_reach()
+                            // advertises an iroh-direct Destination for native
+                            // peers (dial-by-node_id via pkarr; NAT + cross-instance).
+                            let _ = hyprstream_rpc::moq_stream::init_global_iroh_node_id(node_id);
                             // Advertise the `#iroh` VM only now that iroh is bound.
                             if let Some(cb) = qc.on_iroh_bound.take() {
                                 cb(service_name.clone(), node_id);
