@@ -51,6 +51,10 @@ pub mod error;
 pub use hyprstream_rpc::paths;
 
 pub mod runtime;
+// The `image` module is the RAFS/nydus image store — only the VM path consumes
+// it. Gated behind `kata-vm`; the lightweight nspawn backend bind-mounts the
+// host root and never touches RAFS.
+#[cfg(feature = "kata-vm")]
 pub mod image;
 pub mod workflow;
 pub mod events;
@@ -63,7 +67,10 @@ pub use config::{BackendType, HypervisorType, ImageConfig, PoolConfig, WorkerCon
 pub use error::WorkerError;
 
 // Re-export service types
-pub use runtime::{WorkerService, SandboxBackend, SandboxHandle, KataBackend, NspawnBackend, NspawnConfig};
+pub use runtime::{WorkerService, SandboxBackend, SandboxHandle, NspawnBackend, NspawnConfig};
+#[cfg(feature = "kata-vm")]
+pub use runtime::KataBackend;
+#[cfg(feature = "kata-vm")]
 pub use image::RafsStore;
 pub use workflow::WorkflowService;
 pub use events::{

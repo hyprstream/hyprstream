@@ -49,7 +49,9 @@ use hyprstream_core::storage::{GitRef, ModelRef};
 use hyprstream_core::services::{PolicyClient, RegistryClient};
 // Worker service for Kata-based workload execution
 use hyprstream_workers::runtime::WorkerService;
-use hyprstream_workers::{ImageConfig, PoolConfig};
+#[cfg(feature = "kata-vm")]
+use hyprstream_workers::ImageConfig;
+use hyprstream_workers::PoolConfig;
 use std::sync::Arc;
 // Unified service manager API
 use hyprstream_service::{get_factory, InprocManager, ServiceContext, ServiceManager};
@@ -1062,6 +1064,7 @@ fn handle_quick_command(
                         cloud_init_dir: data_dir.join("cloud-init"),
                         ..PoolConfig::default()
                     };
+                    #[cfg(feature = "kata-vm")]
                     let image_config = ImageConfig {
                         blobs_dir: data_dir.join("images/blobs"),
                         bootstrap_dir: data_dir.join("images/bootstrap"),
@@ -1072,17 +1075,33 @@ fn handle_quick_command(
                     };
 
                     let _worker_handle = if !worker_already_running {
-                        use hyprstream_workers::image::RafsStore;
-                        use hyprstream_workers::runtime::{SandboxBackend, KataBackend};
-                        let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
-                        let backend: Arc<dyn SandboxBackend> = Arc::new(
-                            KataBackend::new(image_config, Arc::clone(&rafs_store)),
-                        );
+                        use hyprstream_workers::runtime::SandboxBackend;
+
+                        // VM path (kata-vm): Kata backend + RAFS image store.
+                        #[cfg(feature = "kata-vm")]
+                        let rafs_store = {
+                            use hyprstream_workers::image::RafsStore;
+                            Arc::new(RafsStore::new(image_config.clone())?)
+                        };
+                        #[cfg(feature = "kata-vm")]
+                        let backend: Arc<dyn SandboxBackend> = {
+                            use hyprstream_workers::runtime::KataBackend;
+                            Arc::new(KataBackend::new(image_config, Arc::clone(&rafs_store)))
+                        };
+                        // Without kata-vm the CLI worker entrypoint falls back to
+                        // the lightweight nspawn backend.
+                        #[cfg(not(feature = "kata-vm"))]
+                        let backend: Arc<dyn SandboxBackend> = {
+                            use hyprstream_workers::{NspawnBackend, NspawnConfig};
+                            Arc::new(NspawnBackend::new(NspawnConfig::default()))
+                        };
+
                         let worker_transport =
                             TransportConfig::inproc("hyprstream/workers");
                         let mut worker_service = WorkerService::new(
                             pool_config,
                             backend,
+                            #[cfg(feature = "kata-vm")]
                             rafs_store,
                             worker_transport,
                             signing_key.clone(),
