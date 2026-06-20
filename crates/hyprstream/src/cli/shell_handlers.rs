@@ -254,7 +254,10 @@ pub async fn handle_shell_tui(
     // which timed out because the PTY broadcast lives on the *TUI service's* plane,
     // a different process from this viewer.)
     let reach = stdout_stream.announced_at.clone();
-    let mut handle = MoqStreamHandle::networked(reach, broadcast_path, mac_key, topic);
+    // #358: a shell stdout attach is a live pipe → direct-first (default
+    // StreamOpt = Retention::Live); selection only reorders advertised reaches.
+    let qos = hyprstream_rpc::stream_info::StreamOpt::default();
+    let mut handle = MoqStreamHandle::networked(reach, &qos, broadcast_path, mac_key, topic);
     let _recv_handle = tokio::spawn(async move {
         loop {
             match handle.recv_next().await {

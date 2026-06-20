@@ -669,6 +669,19 @@ pub struct QuicLoopConfig {
     /// entry in the DID document only when iroh is actually bound.
     #[cfg(not(target_arch = "wasm32"))]
     pub on_iroh_bound: Option<Box<dyn FnOnce(String, [u8; 32]) + Send>>,
+    /// #358: the producer-chosen moq RELAY this node rendezvouses through, in
+    /// wire-reach form ([`crate::stream_info::TransportConfig`]). When set, the
+    /// spawner registers it via [`crate::moq_stream::init_global_relay_reach`] (so
+    /// `producer_reach()` advertises a `Role::Relay` reach) and links this node's
+    /// streaming origin UP to the relay
+    /// ([`crate::moq_stream::serve_origin_to_relay_background`]) — restoring the
+    /// rendezvous property: neither publisher nor subscriber need be directly
+    /// reachable by the other. Sourced from the resolved relay DID transport entry
+    /// (default: the PDS / federation anchor) decoded by the shared
+    /// [`crate::service_entry`] codec, so the stream relay and DID addresses never
+    /// drift. `None` = direct-only (the S1/S2 behaviour). Native-only.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub moq_relay: Option<crate::stream_info::TransportConfig>,
 }
 
 /// Handle for a running service

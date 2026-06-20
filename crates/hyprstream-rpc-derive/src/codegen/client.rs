@@ -453,8 +453,10 @@ fn generate_trait_method_impl(
                 )?;
                 // #274: subscribe over the resolved `reach` (the same-host UDS
                 // fast path is preferred automatically when co-located).
+                // #358: pass the service-signed `qos` so direct-vs-relay topology
+                // is selected from it (relay-first for retained/fan-out streams).
                 Ok(hyprstream_rpc::moq_stream::MoqStreamHandle::networked(
-                    info.announced_at, info.broadcast_path, mac_key, topic,
+                    info.announced_at, &info.qos, info.broadcast_path, mac_key, topic,
                 ))
             }
         })

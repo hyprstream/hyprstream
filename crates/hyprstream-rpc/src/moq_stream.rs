@@ -149,6 +149,56 @@ pub fn global_iroh_node_id() -> Option<&'static [u8; 32]> {
     GLOBAL_IROH_NODE_ID.get()
 }
 
+// ============================================================================
+// Process-global producer-chosen moq RELAY (#358) — the rendezvous endpoint a
+// producing service advertises so that NEITHER the publisher NOR the subscriber
+// must be directly reachable by the other: both rendezvous through this relay.
+//
+// The relay is *producer-chosen* (default = the service's PDS / federation
+// anchor) and set once when the producing node learns its relay. It is the
+// network-routable `TransportConfig` of the relay's moq plane — the SAME codec
+// the DID document's transport `service` entries use ([`crate::service_entry`]),
+// so the advertised stream relay and the DID transport address never drift.
+//
+// The relay carries AEAD-sealed ciphertext it cannot read (the `enc_key` /
+// `TaggedPayload` path seals at source) and never holds the `mac_key` /
+// `enc_key`: it is blind by construction, not by trust. Per-PDS, shared, and
+// oblivious relays are therefore all safe for content confidentiality.
+// ============================================================================
+
+/// The producer-chosen moq relay this node rendezvouses through (#358).
+///
+/// Held as the wire-form [`crate::stream_info::TransportConfig`] (the reach
+/// codec), so the SAME value is both advertised verbatim in `StreamInfo.reach`
+/// and dialed (via the shared [`reach_to_transport_config`] resolver) by the
+/// relay client — no per-site assembly, no drift between the advertised stream
+/// relay and the dialed one.
+///
+/// `None` until the node is configured with a relay (no relay = direct-only
+/// advertisement, the S1/S2 behaviour). The default deployment co-locates this
+/// with the node's `#atproto_pds` DID service entry where the node is the PDS.
+static GLOBAL_RELAY_REACH: OnceLock<crate::stream_info::TransportConfig> = OnceLock::new();
+
+/// Register the producer-chosen moq relay endpoint (idempotent — first wins).
+///
+/// `relay` is the relay's network-routable transport in wire-reach form
+/// ([`crate::stream_info::TransportConfig`] — Quic / WebTransport or iroh). A
+/// node sources this from its resolved DID transport entry decoded by the SAME
+/// [`crate::service_entry`] codec the DID document uses (default: the PDS /
+/// federation anchor), never hand-assembled — see [`relay_reach_from_decoded`].
+///
+/// After this is set, [`producer_reach`] advertises a `Role::Relay`
+/// [`Destination`] and [`serve_origin_to_relay_background`] should be spawned to
+/// announce this node's broadcasts UP to the relay.
+pub fn init_global_relay_reach(relay: crate::stream_info::TransportConfig) -> bool {
+    GLOBAL_RELAY_REACH.set(relay).is_ok()
+}
+
+/// Borrow the producer-chosen relay endpoint (wire-reach form), if configured.
+pub fn global_relay_reach() -> Option<&'static crate::stream_info::TransportConfig> {
+    GLOBAL_RELAY_REACH.get()
+}
+
 /// Build the `StreamInfo.reach` list for a producer on this node (#274).
 ///
 /// Centralised so every producer site emits an identical reach, sourced from the
@@ -184,7 +234,51 @@ pub fn producer_reach() -> Vec<crate::stream_info::Destination> {
         });
     }
 
+    // Relay reach (#358): the producer-chosen rendezvous endpoint. Advertised so
+    // a subscriber that cannot (or, per QoS, prefers not to) reach the producer
+    // directly rendezvouses through the relay instead — neither side needs to be
+    // directly reachable by the other. Listed AFTER the direct reaches so the
+    // reach list is "direct first" in wire order; the QoS-aware selector
+    // (`select_reach`) reorders relay-first for resumable/retained/fan-out
+    // streams (Job/Log). A service that wants its stream relay-ONLY (anonymized)
+    // simply omits the direct reaches by not registering a producer/iroh reach;
+    // the client can only route among what is advertised here (server authority).
+    if let Some(relay) = global_relay_reach() {
+        reach.push(Destination { role: Role::Relay, transport: relay.clone() });
+    }
+
     reach
+}
+
+/// Build the producer-chosen relay's wire-reach [`crate::stream_info::TransportConfig`]
+/// from a DID-document transport entry decoded by [`crate::service_entry`] (#358).
+///
+/// This is the bridge that keeps the stream relay address and the DID transport
+/// address from drifting: a node resolves its relay's DID service entry (default
+/// `#atproto_pds`), decodes it with the shared [`crate::service_entry::decode_service_entry`]
+/// codec, and passes the resulting [`crate::transport::TransportConfig`] here to
+/// obtain the wire-reach form to register via [`init_global_relay_reach`].
+///
+/// Returns `None` for same-host transports (`ipc`/`inproc`/`systemd-fd`), which
+/// are never network-routable relay endpoints.
+pub fn relay_reach_from_decoded(
+    config: &crate::transport::TransportConfig,
+) -> Option<crate::stream_info::TransportConfig> {
+    use crate::stream_info::{IrohReach, QuicReach, TransportConfig as ReachTransport};
+    use crate::transport::EndpointType;
+    match &config.endpoint {
+        EndpointType::Quic { addr, server_name, auth } => Some(ReachTransport::Quic(QuicReach {
+            addr: addr.to_string(),
+            server_name: server_name.clone(),
+            cert_hashes: auth.accept_cert_hashes().iter().map(|h| h.to_vec()).collect(),
+        })),
+        EndpointType::Iroh { node_id, .. } => {
+            Some(ReachTransport::Iroh(IrohReach { node_id: *node_id }))
+        }
+        EndpointType::Ipc { .. }
+        | EndpointType::SystemdFd { .. }
+        | EndpointType::Inproc { .. } => None,
+    }
 }
 
 /// Start a UDS moq server in the background, serving the moq origin's consumer
@@ -633,12 +727,25 @@ impl MoqStreamHandle {
     /// the TUI daemon serving its PTY/shell stdout stream) would otherwise connect
     /// to its own empty plane and time out waiting for the model service's
     /// broadcast that was published on a *different* process's plane (#275).
+    ///
+    /// ## QoS-driven direct-vs-relay routing (#358)
+    ///
+    /// `qos` is the service-signed [`crate::stream_info::StreamOpt`]; it selects the
+    /// preferred *topology* (direct vs relay) via [`select_reach`] — relay-first for
+    /// retained/resumable/fan-out streams (Job/Log), direct-first for live pipes
+    /// (`Retention::Live`). This is a stable reorder of the SERVICE-advertised reach
+    /// only: the client never invents a reach, so a relay-only (anonymized) stream
+    /// stays relay-only. Topology is orthogonal to the delivery/integrity contract.
     pub fn networked(
         reach: Vec<crate::stream_info::Destination>,
+        qos: &crate::stream_info::StreamOpt,
         broadcast_path: String,
         mac_key: [u8; 32],
         topic: String,
     ) -> Self {
+        // QoS-aware topology selection over the SERVICE-advertised reach (server
+        // authority preserved: stable reorder, never an invented/forced reach).
+        let reach = select_reach(&reach, qos);
         let cancel = tokio_util::sync::CancellationToken::new();
         let (tx, rx) =
             tokio::sync::mpsc::channel::<anyhow::Result<crate::streaming::StreamPayload>>(64);
@@ -945,6 +1052,150 @@ pub async fn connect_moq_reach(
         "no dialable reach in StreamInfo and no local moq UDS plane — cannot subscribe to broadcast{}",
         last_err.map(|e| format!(" (last dial error: {e})")).unwrap_or_default()
     ))
+}
+
+// ============================================================================
+// QoS-driven reach selection (#358) — topology, orthogonal to delivery/integrity
+//
+// Topology (direct vs relay) is NOT a new QoS integrity axis: the delivery /
+// ordering / completion / retention contract (`StreamOpt`) stays orthogonal to
+// where the bytes flow. The selector only REORDERS the reaches the SERVICE
+// advertised so the preferred topology is tried first; `connect_moq_reach`'s
+// in-order try-then-fallback loop then provides automatic reachability fallback
+// (direct → relay, or relay → direct) within the advertised set.
+//
+// **Server-authority invariant (enforced here):** selection is a stable reorder
+// of `advertised` — it never invents a reach, never fabricates a `direct` reach
+// the service didn't publish, and never drops a reach. So a service that
+// published a stream relay-ONLY (omitting any direct reach to keep the producer
+// anonymized) stays relay-only: there is no direct reach to promote, and the
+// client cannot force one. The client READS qos/reach; it never writes them.
+// ============================================================================
+
+/// Reorder the service-advertised `reach` list by the QoS-preferred topology
+/// (#358), returning a new list the caller hands to [`connect_moq_reach`].
+///
+/// - `Retention::Live` (Pipe / live console, lowest-latency) → **direct-first**:
+///   a live pipe wants the shortest path; the relay is the fallback only if the
+///   producer is not directly reachable.
+/// - retained / resumable / fan-out (Job / Log, `Retention::{Blocks,Seconds}`)
+///   → **relay-first**: the relay is the natural late-join / retained / fan-out
+///   surface, and lets a subscriber rendezvous without dialing the producer.
+///
+/// The reorder is **stable** (it preserves the service's relative ordering within
+/// each role), so direct reaches keep their advertised priority (e.g. iroh before
+/// Quic) and the only change is whether the relay group floats to the front.
+pub fn select_reach(
+    advertised: &[crate::stream_info::Destination],
+    qos: &crate::stream_info::StreamOpt,
+) -> Vec<crate::stream_info::Destination> {
+    use crate::stream_info::{Retention, Role};
+    let relay_first = !matches!(qos.retention, Retention::Live);
+    let mut ordered: Vec<crate::stream_info::Destination> = Vec::with_capacity(advertised.len());
+    // Stable partition: pull the preferred role to the front, keep within-role order.
+    let prefer = if relay_first { Role::Relay } else { Role::Direct };
+    ordered.extend(advertised.iter().filter(|d| d.role == prefer).cloned());
+    ordered.extend(advertised.iter().filter(|d| d.role != prefer).cloned());
+    ordered
+}
+
+/// Resolve a service-advertised reach into a live moq connection, honouring the
+/// QoS-preferred topology (#358).
+///
+/// Thin composition of [`select_reach`] (QoS reorder, server-authority-safe) and
+/// [`connect_moq_reach`] (in-order dial with automatic direct↔relay fallback).
+/// This is the single entry point networked subscribers should use when they
+/// have the signed `StreamOpt` in hand, so direct-vs-relay routing lives in ONE
+/// place and the reach the service published is the only thing ever dialed.
+pub async fn connect_moq_reach_for_qos(
+    reach: &[crate::stream_info::Destination],
+    qos: &crate::stream_info::StreamOpt,
+) -> Result<MoqReachConnection> {
+    let ordered = select_reach(reach, qos);
+    connect_moq_reach(&ordered).await
+}
+
+// ============================================================================
+// moq relay client (#358) — producer-side announce UP to the relay.
+//
+// Restores the rendezvous property the ZMQ→moq migration removed: a producing
+// node that has a configured relay opens a moq link to it and announces its
+// local origin's broadcasts UP to the relay (`with_origin`), so a subscriber
+// that dials the relay sees the SAME broadcast by the SAME `broadcastPath`
+// without ever dialing the producer. Mirrors the event-plane UDS link
+// ([`connect_event_moq_uds_background`] / [`run_event_client_link`]) but points
+// at a REMOTE relay via [`crate::dial::dial_stream`] instead of `connect_uds`.
+//
+// Relay-blind: the link carries the AEAD-sealed, chained-HMAC frames opaquely
+// (`Bytes`); the relay holds no `enc_key` / `mac_key` and never decrypts.
+// ============================================================================
+
+/// Reconnect backoff for the producer→relay link.
+const RELAY_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Announce this node's streaming origin UP to the producer-chosen relay (#358).
+///
+/// Spawns a background task that dials the relay via [`crate::dial::dial_stream`],
+/// runs the moq handshake with `with_origin(producer)` (so the producer's
+/// broadcasts are announced UP to the relay and re-served to its subscribers),
+/// holds the session open, and reconnects on failure. The task runs for the
+/// process lifetime.
+///
+/// Called once by the producing service's factory after [`init_global_relay_reach`]
+/// — typically with `global_moq_origin().producer()`. No-op-safe to omit when the
+/// node has no relay (direct-only deployments).
+pub fn serve_origin_to_relay_background(
+    producer: OriginProducer,
+    relay: crate::stream_info::TransportConfig,
+) {
+    tokio::spawn(async move {
+        loop {
+            if let Err(e) = run_relay_announce_link(&producer, &relay).await {
+                tracing::debug!(
+                    "moq relay announce link ended: {e}; reconnecting in {:?}",
+                    RELAY_RECONNECT_DELAY
+                );
+            }
+            tokio::time::sleep(RELAY_RECONNECT_DELAY).await;
+        }
+    });
+}
+
+/// One connect-and-hold cycle of the producer→relay announce link (#358).
+///
+/// Dials the relay, runs the moq handshake bidirectionally (`with_origin`), and
+/// returns when the session closes so the caller can reconnect. The relay
+/// ingests the announced broadcasts and re-serves them to its subscribers by
+/// track name — the producer never learns who subscribes, the subscriber never
+/// dials the producer.
+///
+/// Exposed (rather than only via [`serve_origin_to_relay_background`]) so a
+/// caller that owns its own reconnect/lifecycle — and the rendezvous test — can
+/// drive a single connect cycle directly.
+pub async fn run_relay_announce_link(
+    producer: &OriginProducer,
+    relay: &crate::stream_info::TransportConfig,
+) -> Result<()> {
+    use moq_net::Client as MoqClient;
+
+    // Reuse the ONE wire-reach → dial-config resolver so the relay is dialed by
+    // the same code path (Quic / WebTransport / iroh) every direct reach uses.
+    let dest = crate::stream_info::Destination { role: crate::stream_info::Role::Relay, transport: relay.clone() };
+    let cfg = reach_to_transport_config(&dest)
+        .ok_or_else(|| anyhow!("relay reach is not a dialable network transport"))?;
+
+    let stream_session = crate::dial::dial_stream(&cfg).await?;
+    // `with_origin` makes the link bidirectional: this node's broadcasts are
+    // announced UP to the relay; the relay re-serves them to its subscribers.
+    let moq_client = MoqClient::new().with_origin(producer.clone());
+    let moq_session = stream_session
+        .connect_moq(&moq_client)
+        .await
+        .map_err(|e| anyhow!("relay moq handshake: {e}"))?;
+
+    tracing::info!("moq relay announce link established");
+    let reason = moq_session.closed().await;
+    Err(anyhow!("moq relay session closed: {reason:?}"))
 }
 
 /// Networked variant of [`moq_stream_handle_task`]: dial a `/moq`
@@ -1293,8 +1544,10 @@ mod tests {
             }),
         }];
 
+        let qos = crate::stream_info::StreamOpt::default();
         let mut handle = MoqStreamHandle::networked(
             reach,
+            &qos,
             "local/streams/test/deadbeef".to_owned(),
             [0u8; 32],
             "deadbeef".repeat(8),
@@ -1333,5 +1586,112 @@ mod tests {
         assert!(!gated.authorize_signer(&[2u8; 32]));
         // No gate -> accept all.
         assert!(origin().authorize_signer(&[9u8; 32]));
+    }
+
+    // ── #358 relay reach / selection unit tests ─────────────────────────────
+
+    use crate::stream_info::{
+        Destination, IrohReach, Job, Log, Pipe, QuicReach, Role, StreamOpt, StreamOptPreset,
+        TransportConfig as ReachTransport,
+    };
+
+    fn direct_iroh(b: u8) -> Destination {
+        Destination { role: Role::Direct, transport: ReachTransport::Iroh(IrohReach { node_id: [b; 32] }) }
+    }
+    fn relay_quic(addr: &str) -> Destination {
+        Destination {
+            role: Role::Relay,
+            transport: ReachTransport::Quic(QuicReach {
+                addr: addr.to_owned(),
+                server_name: "relay".to_owned(),
+                cert_hashes: vec![vec![0u8; 32]],
+            }),
+        }
+    }
+
+    /// `producer_reach()` advertises a `Role::Relay` Destination once a relay is
+    /// registered — populating the existing schema, no new field.
+    #[test]
+    fn producer_reach_advertises_relay_when_configured() {
+        let relay = ReachTransport::Quic(QuicReach {
+            addr: "10.0.0.9:4433".to_owned(),
+            server_name: "pds".to_owned(),
+            cert_hashes: vec![vec![1u8; 32]],
+        });
+        // OnceLock: only assert the Role::Relay shape if we won the set (test
+        // isolation across the shared global), else skip — the construction logic
+        // is what we verify, and `relay_reach_from_decoded` covers it key-free.
+        if init_global_relay_reach(relay.clone()) {
+            let reach = producer_reach();
+            assert!(
+                reach.iter().any(|d| d.role == Role::Relay && d.transport == relay),
+                "producer_reach must advertise the configured Role::Relay reach"
+            );
+        }
+    }
+
+    /// QoS-driven selection: live pipes prefer DIRECT, retained/fan-out prefer RELAY.
+    #[test]
+    fn select_reach_orders_by_qos_topology() {
+        let advertised = vec![direct_iroh(1), relay_quic("10.0.0.1:4433"), direct_iroh(2)];
+
+        // Pipe (Retention::Live) → direct-first; within-role order preserved.
+        let pipe = Pipe::stream_opt();
+        let ordered = select_reach(&advertised, &pipe);
+        assert_eq!(ordered[0].role, Role::Direct, "live pipe must try direct first");
+        assert_eq!(ordered[2].role, Role::Relay, "relay falls to the back for a live pipe");
+        assert_eq!(ordered[0], direct_iroh(1), "within-role advertised order preserved");
+        assert_eq!(ordered[1], direct_iroh(2));
+
+        // Job (retained/resumable) → relay-first.
+        let job = Job::stream_opt();
+        let ordered = select_reach(&advertised, &job);
+        assert_eq!(ordered[0].role, Role::Relay, "retained job must try relay first");
+
+        // Log (retained) → relay-first.
+        let log = Log::stream_opt();
+        assert_eq!(select_reach(&advertised, &log)[0].role, Role::Relay);
+    }
+
+    /// Server authority: selection NEVER invents, fabricates `direct`, or drops a
+    /// reach. A relay-ONLY advertisement (anonymized stream) stays relay-only even
+    /// for a live-pipe QoS that would *prefer* direct — there is nothing to promote.
+    #[test]
+    fn select_reach_preserves_server_authority() {
+        let relay_only = vec![relay_quic("10.0.0.1:4433")];
+
+        // Even with default (Live → direct-preferred) qos, no direct reach appears.
+        let ordered = select_reach(&relay_only, &StreamOpt::default());
+        assert_eq!(ordered.len(), 1, "selection must not add or drop reaches");
+        assert_eq!(ordered[0].role, Role::Relay, "a relay-only stream stays relay-only");
+        assert!(
+            !ordered.iter().any(|d| d.role == Role::Direct),
+            "the client must NOT fabricate a direct reach the service didn't advertise"
+        );
+
+        // It is also a pure permutation: same multiset in, same multiset out.
+        let advertised = vec![direct_iroh(1), relay_quic("a:1"), direct_iroh(2)];
+        let mut a = advertised.clone();
+        let mut b = select_reach(&advertised, &Job::stream_opt());
+        a.sort_by_key(|d| (d.role == Role::Relay, format!("{d:?}")));
+        b.sort_by_key(|d| (d.role == Role::Relay, format!("{d:?}")));
+        assert_eq!(a, b, "selection must be a permutation of the advertised reach");
+    }
+
+    /// `relay_reach_from_decoded` round-trips a DID-decoded transport into the
+    /// wire-reach form advertised as the relay — the shared codec, no drift.
+    #[test]
+    fn relay_reach_from_decoded_round_trips() {
+        // iroh decoded config → iroh wire reach carrying the same node_id.
+        let cfg = crate::transport::TransportConfig::iroh([0x5u8; 32], Vec::new(), None);
+        match relay_reach_from_decoded(&cfg) {
+            Some(ReachTransport::Iroh(i)) => assert_eq!(i.node_id, [0x5u8; 32]),
+            other => panic!("expected iroh wire reach, got {other:?}"),
+        }
+        // Same-host transports are never relay endpoints.
+        assert!(
+            relay_reach_from_decoded(&crate::transport::TransportConfig::ipc("/tmp/x.sock")).is_none(),
+            "a same-host ipc transport is not a network-routable relay"
+        );
     }
 }
