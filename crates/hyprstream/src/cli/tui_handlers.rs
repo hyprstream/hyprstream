@@ -148,7 +148,11 @@ async fn run_attach_loop(
     // the old `connect_uds(moq_uds_path)` connected to *this* process's empty plane
     // and timed out waiting for the producer's broadcast.
     let reach = stream_info.announced_at.clone();
-    let mut handle = MoqStreamHandle::networked(reach, broadcast_path, mac_key, topic);
+    // #358: a console attach is a live pipe → direct-first topology (the default
+    // StreamOpt is `Retention::Live`). `select_reach` only reorders the
+    // service-advertised reach, so this never invents/forces a reach.
+    let qos = hyprstream_rpc::stream_info::StreamOpt::default();
+    let mut handle = MoqStreamHandle::networked(reach, &qos, broadcast_path, mac_key, topic);
     let recv_handle = tokio::spawn(async move {
         loop {
             match handle.recv_next().await {

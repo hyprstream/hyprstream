@@ -185,6 +185,28 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                     cb(service_name.clone(), advertise_addr, qc.server_name.clone());
                 }
 
+                // #358: if a producer-chosen relay is configured, register it so
+                // `producer_reach()` advertises a `Role::Relay` reach, and link
+                // this node's streaming origin UP to the relay so subscribers can
+                // rendezvous through it without dialing the producer. Idempotent
+                // (first-wins) across services sharing the process-global origin.
+                if let Some(relay) = qc.moq_relay.take() {
+                    let registered =
+                        hyprstream_rpc::moq_stream::init_global_relay_reach(relay.clone());
+                    if registered {
+                        if let Some(origin) = hyprstream_rpc::moq_stream::global_moq_origin() {
+                            hyprstream_rpc::moq_stream::serve_origin_to_relay_background(
+                                origin.producer().clone(),
+                                relay,
+                            );
+                            tracing::info!(
+                                service = %service_name,
+                                "moq relay rendezvous enabled (announcing origin UP to relay; advertising Role::Relay reach)"
+                            );
+                        }
+                    }
+                }
+
                 // #282: bind an iroh substrate in PARALLEL to the quinn endpoint,
                 // serving BOTH ALPNs (`hyprstream-rpc/1` + `moql`) with the SAME
                 // request processor + moq origin. The iroh endpoint's node key is

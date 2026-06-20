@@ -58,6 +58,14 @@ pub struct QuinnRpcServer {
     /// WebTransport CONNECT URL path is [`crate::dial::MOQ_PATH`] are handed to
     /// `moq_net::Server::accept` instead of the RPC core. `None` = RPC only.
     moq_consumer: Option<moq_net::OriginConsumer>,
+    /// Optional moq RELAY origin (#358). When set, the `/moq` plane runs in
+    /// *relay* (bidirectional) mode: `moq_net::Server::with_origin` ingests a
+    /// connected producer's announced broadcasts into this origin AND re-serves
+    /// them to subscribers by track name — so a publisher and a subscriber
+    /// rendezvous through this node without either dialing the other. Takes
+    /// precedence over [`Self::moq_consumer`] (serve-only). The relay carries the
+    /// AEAD-sealed, chained-HMAC frames opaquely and holds no stream keys.
+    moq_relay_origin: Option<moq_net::OriginProducer>,
     /// #276 subscribe-authz + per-tenant announce-scoping config for the `/moq`
     /// plane. Defaults to "off" (open subscribe preserved).
     moq_authz: crate::transport::iroh_moq::MoqAuthzConfig,
@@ -93,6 +101,7 @@ impl QuinnRpcServer {
             )),
             read_timeout: super::rpc_session::REQUEST_READ_TIMEOUT,
             moq_consumer: None,
+            moq_relay_origin: None,
             moq_authz: crate::transport::iroh_moq::MoqAuthzConfig::default(),
             shutdown: CancellationToken::new(),
         }
@@ -107,6 +116,24 @@ impl QuinnRpcServer {
     /// over a per-connection iroh ALPN — here the multiplex is by URL path.
     pub fn with_moq_consumer(mut self, consumer: moq_net::OriginConsumer) -> Self {
         self.moq_consumer = Some(consumer);
+        self
+    }
+
+    /// Run the `/moq` plane as a RELAY (bidirectional) over `origin` (#358).
+    ///
+    /// In relay mode each `/moq` session is served via
+    /// `moq_net::Server::with_origin`, so a connected producer's announced
+    /// broadcasts are ingested into `origin` and re-served to every subscriber by
+    /// track name. This is the rendezvous endpoint a producer advertises as a
+    /// `Role::Relay` reach: a publisher links UP to it
+    /// ([`crate::moq_stream::serve_origin_to_relay_background`]) and a subscriber
+    /// dials it for the SAME `broadcastPath` — neither dials the other.
+    ///
+    /// The relay is **blind by construction**: frames are AEAD-sealed and
+    /// chained-HMAC'd at the source; this node holds no `enc_key` / `mac_key` and
+    /// forwards opaque `Bytes`. Takes precedence over [`Self::with_moq_consumer`].
+    pub fn with_moq_relay(mut self, origin: moq_net::OriginProducer) -> Self {
+        self.moq_relay_origin = Some(origin);
         self
     }
 
@@ -255,6 +282,7 @@ impl QuinnRpcServer {
                     let read_timeout = self.read_timeout;
                     let shutdown = self.shutdown.clone();
                     let moq_consumer = self.moq_consumer.clone();
+                    let moq_relay_origin = self.moq_relay_origin.clone();
                     let moq_authz = self.moq_authz.clone();
                     tokio::spawn(async move {
                         let _conn_permit = conn_permit; // released when this connection ends
@@ -286,6 +314,30 @@ impl QuinnRpcServer {
                         };
 
                         if is_moq {
+                            // Relay (bidirectional) mode takes precedence (#358):
+                            // ingest a producer's announced broadcasts into the
+                            // shared origin AND re-serve them to subscribers by
+                            // track name, so publisher and subscriber rendezvous
+                            // here without either dialing the other. The relay
+                            // holds no stream keys — frames pass through opaquely.
+                            if let Some(relay_origin) = moq_relay_origin {
+                                let server = moq_net::Server::new().with_origin(relay_origin);
+                                match server.accept(session).await {
+                                    Ok(moq_session) => {
+                                        tokio::select! {
+                                            biased;
+                                            _ = shutdown.cancelled() => {}
+                                            res = moq_session.closed() => {
+                                                tracing::debug!(result = ?res, "quinn-moq-relay: session closed");
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!(error = ?e, "quinn-moq-relay: accept failed");
+                                    }
+                                }
+                                return;
+                            }
                             match moq_consumer {
                                 Some(consumer) => {
                                     // #276: the `/moq` WebTransport CONNECT is NOT

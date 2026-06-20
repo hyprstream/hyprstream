@@ -442,7 +442,8 @@ fn register_scoped_tools_recursive(
                             let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
                                 &client_secret, &client_pubkey_bytes, &dh_public,
                             )?;
-                            let handle = MoqStreamHandle::networked(reach, broadcast_path, mac_key, topic);
+                            let qos = hyprstream_rpc::stream_info::StreamOpt::default(); // #358: MCP tool stream consumed live → direct-first; selection only reorders advertised reaches.
+                            let handle = MoqStreamHandle::networked(reach, &qos, broadcast_path, mac_key, topic);
 
                             Ok(ToolResult::Stream(Box::new(handle)))
                         })
@@ -598,7 +599,9 @@ fn register_streaming_tool(
                 let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
                     &client_secret, &client_pubkey_bytes, &dh_public,
                 )?;
-                let handle = MoqStreamHandle::networked(reach, broadcast_path, mac_key, topic);
+                // #358: MCP tool stream consumed live → direct-first; selection only reorders advertised reaches.
+                let qos = hyprstream_rpc::stream_info::StreamOpt::default();
+                let handle = MoqStreamHandle::networked(reach, &qos, broadcast_path, mac_key, topic);
 
                 Ok(ToolResult::Stream(Box::new(handle)))
             })

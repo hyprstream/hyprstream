@@ -1285,6 +1285,42 @@ fn handle_quick_command(
 /// to verify responses from a target service.
 ///
 /// Returns `None` if bootstrap-pubkeys is not available (wizard not run).
+/// Resolve the configured `[quic] relay` URI into the wire-reach
+/// [`TransportConfig`] a producer advertises as its `Role::Relay` reach (#358).
+///
+/// Reuses the SAME [`hyprstream_rpc::service_entry`] codec the DID document uses
+/// (by constructing the equivalent `QuicTransport` service entry and decoding it),
+/// then projecting to wire-reach form via
+/// [`hyprstream_rpc::moq_stream::relay_reach_from_decoded`] — so the advertised
+/// stream relay and the DID transport address are produced by one codec and never
+/// drift. WebPKI (public PDS / federation anchor) is the default; a self-signed
+/// mesh relay carries its leaf-cert SHA-256 pins after `#` in the URI fragment.
+fn resolve_moq_relay_reach(
+    relay_uri: &str,
+) -> Result<hyprstream_rpc::stream_info::TransportConfig> {
+    use serde_json::json;
+    // Optional `#<multibase certHash>[,<multibase certHash>...]` fragment pins a
+    // self-signed mesh relay; absent ⇒ WebPKI (public CA-fronted relay).
+    let (uri, cert_hashes): (&str, Vec<String>) = match relay_uri.split_once('#') {
+        Some((u, frag)) => (u, frag.split(',').map(str::to_owned).collect()),
+        None => (relay_uri, Vec::new()),
+    };
+    let webpki = cert_hashes.is_empty();
+    let entry = json!({
+        "type": "QuicTransport",
+        "serviceEndpoint": {
+            "uri": uri,
+            "webpki": webpki,
+            "certHashes": cert_hashes,
+            "accept": ["moql"],
+        },
+    });
+    let decoded = hyprstream_rpc::service_entry::decode_service_entry(&entry)
+        .map_err(|e| anyhow::anyhow!("relay URI decode: {e}"))?;
+    hyprstream_rpc::moq_stream::relay_reach_from_decoded(&decoded.config)
+        .ok_or_else(|| anyhow::anyhow!("relay URI is not a network-routable transport"))
+}
+
 fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
     let trust = hyprstream_service::global_trust_store();
     // Fast path: already populated (service startup seeded it)
@@ -1962,6 +1998,25 @@ fn main() -> Result<()> {
                                         println!("QUIC/WebTransport cert hash: {}", hash);
                                     }
 
+                                    // #358: resolve the producer-chosen moq relay
+                                    // (if configured) into wire-reach form via the
+                                    // SAME service_entry codec the DID doc uses, so
+                                    // the stream relay address and DID address can't
+                                    // drift. Empty = direct-only.
+                                    let moq_relay = if qc.relay.trim().is_empty() {
+                                        None
+                                    } else {
+                                        match resolve_moq_relay_reach(&qc.relay) {
+                                            Ok(reach) => Some(reach),
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    relay = %qc.relay,
+                                                    "ignoring invalid [quic] relay; continuing direct-only: {e}"
+                                                );
+                                                None
+                                            }
+                                        }
+                                    };
                                     let shared = hyprstream_service::QuicSharedConfig {
                                         cert_chain,
                                         key_der,
@@ -1971,6 +2026,8 @@ fn main() -> Result<()> {
                                         jwt_verifying_key: Some(ctx.jwt_verifying_key()),
                                         // #282: bind iroh in parallel to quinn when opted in.
                                         iroh_enabled: qc.iroh,
+                                        // #358: producer-chosen relay rendezvous (None = direct-only).
+                                        moq_relay,
                                     };
                                     ctx = ctx.with_quic(shared);
                                 }
