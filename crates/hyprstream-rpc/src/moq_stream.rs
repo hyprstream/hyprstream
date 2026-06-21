@@ -865,12 +865,24 @@ async fn moq_stream_handle_task(
 ///
 /// Only the network-routable transports map; same-host endpoints are never
 /// carried in `reach` (co-located clients use the UDS fast path).
-fn reach_to_transport_config(
+pub fn reach_to_transport_config(
     reach: &crate::stream_info::Destination,
+) -> Option<crate::transport::TransportConfig> {
+    wire_transport_to_dial(&reach.transport)
+}
+
+/// The single wire→dial reach codec (#274/#320): map one wire
+/// [`crate::stream_info::TransportConfig`] union arm to the local dialable
+/// [`crate::transport::TransportConfig`]. Returns `None` for an un-routable arm
+/// (e.g. an iroh reach with no relay). Shared by the streaming plane
+/// ([`reach_to_transport_config`]) and the RPC inference router (#320), so there
+/// is exactly ONE iroh/quic reach decoding.
+pub fn wire_transport_to_dial(
+    wire: &crate::stream_info::TransportConfig,
 ) -> Option<crate::transport::TransportConfig> {
     use crate::stream_info::TransportConfig as ReachTransport;
     use crate::transport::{QuicServerAuth, TransportConfig};
-    match &reach.transport {
+    match wire {
         ReachTransport::Quic(q) => {
             let addr: std::net::SocketAddr = q.addr.parse().ok()?;
             // Fixed-size cert pins (SHA-256 = 32 bytes); skip any malformed entry.
@@ -887,14 +899,54 @@ fn reach_to_transport_config(
             };
             Some(TransportConfig::quic_with_auth(addr, q.server_name.clone(), auth))
         }
-        // #282 SEAM: `dial_stream` now dials an iroh `moql` reach
-        // (`EndpointType::Iroh { node_id, .. }`), but the **wire** reach enum's
-        // `Iroh` variant is a unit variant carrying no `node_id`/relay payload
-        // (it is code-generated from `stream.capnp`). Until that schema grows a
-        // `nodeId`/`relays` field, a StreamInfo cannot publish a dialable iroh
-        // reach, so this maps to `None` (publishers carry the Quic reach). The
-        // local `dial_stream` iroh arm is covered by the dial.rs loopback test.
-        ReachTransport::Iroh => None,
+        // #320: the wire `iroh` arm now carries the dialable `IrohReach`
+        // (nodeId + relay). Decode it into `EndpointType::Iroh`; `dial_stream`'s
+        // iroh arm (#282/S2) dials the `moql` ALPN from it. An empty `relayUrl`
+        // (and no direct addrs, which the wire reach never carries) leaves the
+        // reach un-dialable — `dial`/`dial_stream` fail-fast on it rather than
+        // hang in discovery (pkarr dial-by-node_id alone is deferred to #282).
+        ReachTransport::Iroh(i) => {
+            let relay_url = if i.relay_url.is_empty() { None } else { Some(i.relay_url.clone()) };
+            Some(TransportConfig::iroh(i.node_id, Vec::new(), relay_url))
+        }
+    }
+}
+
+/// The single dial→wire reach codec (#320): map a local dialable
+/// [`crate::transport::TransportConfig`] to a wire-publishable
+/// [`crate::stream_info::TransportConfig`] union arm.
+///
+/// Returns `None` for same-host endpoints (`Inproc`/`Ipc`/`SystemdFd`) — these
+/// are NEVER advertised on the wire (a remote caller could not dial them; a
+/// co-located caller resolves them from local config). So a co-located-only
+/// service yields an empty published reach list. The inverse of
+/// [`wire_transport_to_dial`]; both live here as the one reach codec.
+pub fn dial_transport_to_wire(
+    dial: &crate::transport::TransportConfig,
+) -> Option<crate::stream_info::TransportConfig> {
+    use crate::stream_info::{IrohReach, QuicReach, TransportConfig as ReachTransport};
+    use crate::transport::EndpointType;
+    match &dial.endpoint {
+        EndpointType::Quic { addr, server_name, auth } => Some(ReachTransport::Quic(QuicReach {
+            addr: addr.to_string(),
+            server_name: server_name.clone(),
+            cert_hashes: auth.accept_cert_hashes().iter().map(|h| h.to_vec()).collect(),
+        })),
+        // The wire iroh reach carries identity (nodeId) + relay only; direct
+        // addrs are not published (privacy + iroh discovery), matching the
+        // DID-doc `IrohTransport` entry shape (#280/#282).
+        EndpointType::Iroh { node_id, relay_url, .. } => Some(ReachTransport::Iroh(IrohReach {
+            node_id: *node_id,
+            alpn: String::from_utf8_lossy(
+                crate::transport::iroh_substrate::ALPN_HYPRSTREAM_RPC,
+            )
+            .into_owned(),
+            relay_url: relay_url.clone().unwrap_or_default(),
+        })),
+        // Same-host endpoints are never wire-advertised (#320).
+        EndpointType::Inproc { .. }
+        | EndpointType::Ipc { .. }
+        | EndpointType::SystemdFd { .. } => None,
     }
 }
 
@@ -1254,6 +1306,60 @@ mod tests {
         assert!(matches!(&got[0], StreamPayload::Data(d) if d == b"ping"));
         assert!(matches!(&got[1], StreamPayload::Complete(_)));
         Ok(())
+    }
+
+    /// #320: the iroh reach codec round-trips dial↔wire and preserves identity
+    /// (nodeId) + relay; an empty-relay reach is decoded but is not dialable
+    /// (dial/dial_stream fail-fast on it — pkarr-only is deferred to #282).
+    #[test]
+    fn iroh_reach_dial_wire_roundtrip() {
+        use crate::transport::{EndpointType, TransportConfig};
+        let node_id = [0x42u8; 32];
+        let dial = TransportConfig::iroh(node_id, Vec::new(), Some("https://relay.example".to_owned()));
+        let wire = dial_transport_to_wire(&dial).expect("iroh dial → wire");
+        match &wire {
+            crate::stream_info::TransportConfig::Iroh(i) => {
+                assert_eq!(i.node_id, node_id);
+                assert_eq!(i.relay_url, "https://relay.example");
+                assert_eq!(i.alpn, "hyprstream-rpc/1");
+            }
+            other => panic!("expected wire Iroh, got {other:?}"),
+        }
+        let back = wire_transport_to_dial(&wire).expect("iroh wire → dial");
+        match back.endpoint {
+            EndpointType::Iroh { node_id: n, relay_url, direct_addrs } => {
+                assert_eq!(n, node_id);
+                assert_eq!(relay_url.as_deref(), Some("https://relay.example"));
+                assert!(direct_addrs.is_empty(), "wire iroh reach never carries direct addrs");
+            }
+            other => panic!("expected dial Iroh, got {other:?}"),
+        }
+    }
+
+    /// #320: same-host endpoints (Inproc/Ipc) are NEVER advertised on the wire —
+    /// `dial_transport_to_wire` returns None (a co-located-only service yields an
+    /// empty published reach list).
+    #[test]
+    fn same_host_endpoints_never_wire_advertised() {
+        use crate::transport::TransportConfig;
+        assert!(dial_transport_to_wire(&TransportConfig::inproc("hyprstream/inference-x")).is_none());
+        assert!(dial_transport_to_wire(&TransportConfig::ipc("/tmp/x.sock")).is_none());
+    }
+
+    /// #320: a wire iroh reach with an empty relayUrl decodes (identity preserved)
+    /// but is not dialable — `dial` fails fast rather than hang in discovery.
+    #[test]
+    fn iroh_reach_empty_relay_decodes_but_not_dialable() {
+        use crate::stream_info::{IrohReach, TransportConfig as ReachTransport};
+        let wire = ReachTransport::Iroh(IrohReach {
+            node_id: [9u8; 32],
+            alpn: "moql".to_owned(),
+            relay_url: String::new(),
+        });
+        let dial = wire_transport_to_dial(&wire).expect("decodes");
+        // No relay + no direct addrs ⇒ dial() fail-fast.
+        let signer = crate::signer::LocalSigner::new(crate::crypto::SigningKey::generate(&mut rand::rngs::OsRng));
+        assert!(crate::dial::dial(&dial, signer, None, None).is_err(), "unreachable iroh reach must not dial");
     }
 
     /// #275: a StreamInfo carrying a dialable Quic reach must be classified as

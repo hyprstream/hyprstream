@@ -165,14 +165,20 @@ enum Role {
 # Network-routable transport for a reach. A union so new transports (e.g. Iroh)
 # can be added later without a wire break. Each arm is a struct so its fields —
 # including `List(Data)` cert pins — are covered by the generated codec.
+#
+# Only network-routable reaches are encoded here. Same-host endpoints
+# (`inproc`/`ipc`/UDS) are NEVER carried on the wire: a co-located caller
+# resolves them from LOCAL config / the in-process dial registry, never from an
+# advertised reach (#320). An empty reach list therefore means "co-located fast
+# path only" — there is intentionally no Inproc arm.
 struct TransportConfig {
   union {
     # Quic / WebTransport (web-transport-quinn). Dialed over `web_transport_quinn`.
     quic @0 :QuicReach;
-    # Reserved for NAT-traversing iroh dial (#274 follow-up). Capnp requires a
-    # union to have >= 2 members; this placeholder leaves room without a wire
-    # break when the iroh reach lands.
-    iroh @1 :Void;
+    # NAT-traversing iroh dial (#320, dial side wired by #282/S2). The `nodeId`
+    # IS the peer's Ed25519 identity, so this arm is identity-bound at the
+    # transport (RFC 7250), unlike QUIC's channel-only cert pin.
+    iroh @1 :IrohReach;
   }
 }
 
@@ -181,6 +187,17 @@ struct QuicReach {
   addr       @0 :Text;        # "host:port" socket address to dial.
   serverName @1 :Text;        # TLS SNI / WebPKI validation name.
   certHashes @2 :List(Data);  # Acceptable leaf-cert SHA-256 pins (self-signed mesh).
+}
+
+# Dial parameters for the iroh arm (#320). The single capnp encoding of an iroh
+# reach — `dial()`/`dial_stream` consume the decoded form
+# (`EndpointType::Iroh`); the DID-doc `IrohTransport` service-entry codec
+# (`service_entry.rs`) is the JSON projection of this same shape (one source of
+# truth: ed25519 nodeId + relay).
+struct IrohReach {
+  nodeId   @0 :Data $fixedSize(32);  # ed25519 node_id — real identity binding.
+  alpn     @1 :Text;                  # e.g. "hyprstream-rpc/1" (RPC) or "moql" (stream).
+  relayUrl @2 :Text;                  # optional iroh relay; empty = direct/pkarr (#282).
 }
 
 # Stream metadata returned when starting a stream
