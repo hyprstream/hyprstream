@@ -524,6 +524,21 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
                 Self::dial_transport(&transport, signing_key, destination, token)
             }
 
+            /// Create a client for an already-resolved typed
+            /// [`hyprstream_rpc::transport::TransportConfig`] (the Inproc arm for
+            /// a co-located service, or a networked Quic/Iroh reach). Prefer this
+            /// over [`Self::for_endpoint`] when the caller already holds a typed
+            /// transport (e.g. the inference router, #320) — it skips string
+            /// parsing and routes straight through [`hyprstream_rpc::dial::dial`].
+            pub fn for_transport(
+                transport: &hyprstream_rpc::transport::TransportConfig,
+                signing_key: hyprstream_rpc::crypto::SigningKey,
+                destination: hyprstream_rpc::crypto::VerifyingKey,
+                token: Option<String>,
+            ) -> anyhow::Result<Self> {
+                Self::dial_transport(transport, signing_key, destination, token)
+            }
+
             /// Build a client for an already-resolved `TransportConfig` (the one
             /// place the generated client meets `dial()`).
             fn dial_transport(
