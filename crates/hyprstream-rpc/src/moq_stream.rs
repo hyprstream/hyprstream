@@ -199,55 +199,175 @@ pub fn global_relay_reach() -> Option<&'static crate::stream_info::TransportConf
     GLOBAL_RELAY_REACH.get()
 }
 
+// ============================================================================
+// Per-server reach context (#384) — de-singletonize GLOBAL_RELAY_REACH.
+//
+// Relay/reach choice is logically PER-STREAM, but was historically wired
+// PER-PROCESS through three `OnceLock` singletons (`GLOBAL_IROH_NODE_ID`,
+// `GLOBAL_PRODUCER_REACH`, `GLOBAL_RELAY_REACH`). That granularity prevented a
+// relay-only-anonymized stream X from coexisting with a direct stream Y in the
+// same process, blocked per-tenant relay isolation, and the first-write-wins
+// `OnceLock` semantics silently clobbered later writes.
+//
+// [`ProducerReachConfig`] carries the node/server's reach inputs as plain,
+// `Clone` config data (trivially `Send + Sync`). The reach list is built by its
+// [`ProducerReachConfig::reach`] METHOD reading its OWN fields — never process
+// globals. A per-stream relay override
+// ([`ProducerReachConfig::reach_with_relay`]) lets one stream pick a different
+// relay (or go relay-only / anonymized) while another in the same process stays
+// direct — the heterogeneous-anonymization property #384 requires.
+//
+// The process globals remain ONLY as a populated-once compatibility source for
+// the deprecated free-function [`producer_reach`]; new code threads a
+// `ProducerReachConfig` (see [`global_reach_config`]). (Tier 3 — scheduled
+// relay selection — is deliberately not built but not structurally precluded:
+// a scheduler can simply hand a per-stream override to `reach_with_relay`.)
+// ============================================================================
+
+/// A node/server's moq reach inputs (#384) — the per-server context that builds
+/// a producer's `StreamInfo.reach`, replacing the three `OnceLock` singletons.
+///
+/// Plain config data (`Clone`, `Send + Sync`). The common-case relay is a
+/// server-global value (often an anycast PDS / federation-anchor address)
+/// carried in [`relay`]; a per-stream override is supplied at build time via
+/// [`ProducerReachConfig::reach_with_relay`].
+#[derive(Clone, Debug, Default)]
+pub struct ProducerReachConfig {
+    /// The node's own iroh `EndpointId` (Ed25519 public key, 32 bytes) when the
+    /// iroh substrate is bound (#357). `None` → no iroh-direct reach advertised.
+    pub iroh_node_id: Option<[u8; 32]>,
+    /// The node's network-routable Quic / WebTransport reach (the bound QUIC
+    /// address + TLS name + leaf-cert pins). `None` → no Quic-direct reach
+    /// (UDS-only / unit-test deployments).
+    pub quic_reach: Option<NodeStreamReach>,
+    /// The server-global producer-chosen relay (#358), in wire-reach form.
+    /// `None` → direct-only advertisement (S1/S2 behaviour). A per-stream
+    /// override may supersede this for an individual stream.
+    pub relay: Option<crate::stream_info::TransportConfig>,
+}
+
+impl ProducerReachConfig {
+    /// Build this server's `StreamInfo.reach` using its server-global relay.
+    ///
+    /// Equivalent to `reach_with_relay(RelayChoice::ServerDefault)`. See
+    /// [`ProducerReachConfig::reach_with_relay`] for the per-stream override and
+    /// the reach-ordering contract.
+    pub fn reach(&self) -> Vec<crate::stream_info::Destination> {
+        self.reach_with_relay(RelayChoice::ServerDefault)
+    }
+
+    /// Build a stream's `StreamInfo.reach`, applying a per-stream relay choice (#384).
+    ///
+    /// Reach ORDERING contract (unchanged — `select_reach` does the QoS reorder
+    /// downstream): **iroh-direct first, then Quic, then relay** ("direct-first"
+    /// wire order). Server authority is preserved: the client may only route
+    /// among the reaches advertised here, so a relay-only stream
+    /// ([`RelayChoice::Only`]) omits the direct reaches and stays anonymized.
+    pub fn reach_with_relay(
+        &self,
+        relay_choice: RelayChoice,
+    ) -> Vec<crate::stream_info::Destination> {
+        use crate::stream_info::{Destination, IrohReach, QuicReach, Role, TransportConfig};
+        let mut reach = Vec::new();
+
+        // A per-stream `Only` (relay-only / anonymized) override omits ALL direct
+        // reaches so the client cannot route around the relay (server authority).
+        let relay_only = matches!(relay_choice, RelayChoice::Only(_));
+
+        if !relay_only {
+            // iroh-direct first (#357): native peers prefer the NAT-traversing,
+            // pkarr-discoverable direct path. Listed ahead of Quic so the shared
+            // resolver (`connect_moq_reach`) tries it before the Quic/UDS
+            // fallbacks. `None` when iroh is disabled/unbound (Quic-only).
+            if let Some(node_id) = self.iroh_node_id {
+                reach.push(Destination {
+                    role: Role::Direct,
+                    transport: TransportConfig::Iroh(IrohReach { node_id }),
+                });
+            }
+
+            // Quic / WebTransport reach: directly-reachable peers + browsers.
+            // Kept as a fallback alongside iroh (S1's fallbacks preserved).
+            if let Some(r) = &self.quic_reach {
+                reach.push(Destination {
+                    role: Role::Direct,
+                    transport: TransportConfig::Quic(QuicReach {
+                        addr: r.addr.to_string(),
+                        server_name: r.server_name.clone(),
+                        cert_hashes: r.cert_hashes.iter().map(|h| h.to_vec()).collect(),
+                    }),
+                });
+            }
+        }
+
+        // Relay reach (#358): the rendezvous endpoint. A subscriber that cannot
+        // (or, per QoS, prefers not to) reach the producer directly rendezvouses
+        // through it instead. Listed AFTER the direct reaches ("direct-first"
+        // wire order); the QoS-aware `select_reach` reorders relay-first for
+        // resumable/retained/fan-out streams (Job/Log).
+        //
+        // The per-stream choice picks WHICH relay (or none):
+        //   - `ServerDefault` → this server's `self.relay` (the common case),
+        //   - `Override(r)`   → a per-stream relay (per-tenant isolation),
+        //   - `Only(r)`       → a per-stream relay, direct reaches omitted,
+        //   - `None`          → no relay reach (direct-only for this stream).
+        let relay = match relay_choice {
+            RelayChoice::ServerDefault => self.relay.clone(),
+            RelayChoice::Override(r) | RelayChoice::Only(r) => Some(r),
+            RelayChoice::None => None,
+        };
+        if let Some(relay) = relay {
+            reach.push(Destination { role: Role::Relay, transport: relay });
+        }
+
+        reach
+    }
+}
+
+/// Per-stream relay selection for [`ProducerReachConfig::reach_with_relay`] (#384).
+///
+/// Lets one stream pick a relay (or go relay-only / direct-only) independently
+/// of another in the SAME process — the heterogeneous-anonymization property.
+#[derive(Clone, Debug, Default)]
+pub enum RelayChoice {
+    /// Use the server-global relay ([`ProducerReachConfig::relay`]) — the common
+    /// case. Falls back to direct-only when the server has no relay configured.
+    #[default]
+    ServerDefault,
+    /// Override the server-global relay with a per-stream relay (e.g. per-tenant
+    /// isolation). Direct reaches are still advertised alongside it.
+    Override(crate::stream_info::TransportConfig),
+    /// Relay-ONLY (anonymized): use this per-stream relay and OMIT all direct
+    /// reaches, so the client can only route through the relay (server authority).
+    Only(crate::stream_info::TransportConfig),
+    /// No relay reach for this stream — advertise the direct reaches only.
+    None,
+}
+
+/// Snapshot the process globals into a [`ProducerReachConfig`] (#384 compat).
+///
+/// Bridges the deprecated [`producer_reach`] free function (and call sites not
+/// yet threaded with a `ProducerReachConfig`) to the per-server context. New
+/// code should thread an explicit [`ProducerReachConfig`] instead — this reads
+/// the `OnceLock` singletons whose first-write-wins clobbering #384 removes.
+pub fn global_reach_config() -> ProducerReachConfig {
+    ProducerReachConfig {
+        iroh_node_id: global_iroh_node_id().copied(),
+        quic_reach: global_producer_reach().cloned(),
+        relay: global_relay_reach().cloned(),
+    }
+}
+
 /// Build the `StreamInfo.reach` list for a producer on this node (#274).
 ///
-/// Centralised so every producer site emits an identical reach, sourced from the
-/// one [`NodeStreamReach`] the QUIC bind registered. Returns an empty list when
-/// the node has no networked reach (UDS-only); co-located clients fall back to
-/// the same-host UDS fast path and ignore `reach` entirely.
+/// **Deprecated (#384):** reads the process-global `OnceLock` singletons, which
+/// cannot express per-stream / per-tenant relay choice and clobber on a second
+/// write. New code should construct a [`ProducerReachConfig`] (threaded from the
+/// daemon bind site) and call [`ProducerReachConfig::reach`] /
+/// [`ProducerReachConfig::reach_with_relay`]. Retained as a thin compatibility
+/// shim over [`global_reach_config`] for call sites not yet threaded.
 pub fn producer_reach() -> Vec<crate::stream_info::Destination> {
-    use crate::stream_info::{IrohReach, QuicReach, Destination, Role, TransportConfig};
-    let mut reach = Vec::new();
-
-    // iroh-direct first (#357): native peers prefer the NAT-traversing,
-    // pkarr-discoverable direct path. Listed ahead of Quic so the shared
-    // resolver (`connect_moq_reach`) tries it before the Quic/UDS fallbacks.
-    // The node_id comes from the iroh substrate bind (== signing_key pubkey),
-    // and is `None` when iroh is disabled/unbound (Quic-only advertisement).
-    if let Some(node_id) = global_iroh_node_id() {
-        reach.push(Destination {
-            role: Role::Direct,
-            transport: TransportConfig::Iroh(IrohReach { node_id: *node_id }),
-        });
-    }
-
-    // Quic / WebTransport reach: directly-reachable peers + browsers. Kept as a
-    // fallback alongside iroh (S1's fallbacks are preserved).
-    if let Some(r) = global_producer_reach() {
-        reach.push(Destination {
-            role: Role::Direct,
-            transport: TransportConfig::Quic(QuicReach {
-                addr: r.addr.to_string(),
-                server_name: r.server_name.clone(),
-                cert_hashes: r.cert_hashes.iter().map(|h| h.to_vec()).collect(),
-            }),
-        });
-    }
-
-    // Relay reach (#358): the producer-chosen rendezvous endpoint. Advertised so
-    // a subscriber that cannot (or, per QoS, prefers not to) reach the producer
-    // directly rendezvouses through the relay instead — neither side needs to be
-    // directly reachable by the other. Listed AFTER the direct reaches so the
-    // reach list is "direct first" in wire order; the QoS-aware selector
-    // (`select_reach`) reorders relay-first for resumable/retained/fan-out
-    // streams (Job/Log). A service that wants its stream relay-ONLY (anonymized)
-    // simply omits the direct reaches by not registering a producer/iroh reach;
-    // the client can only route among what is advertised here (server authority).
-    if let Some(relay) = global_relay_reach() {
-        reach.push(Destination { role: Role::Relay, transport: relay.clone() });
-    }
-
-    reach
+    global_reach_config().reach()
 }
 
 /// Build the producer-chosen relay's wire-reach [`crate::stream_info::TransportConfig`]
@@ -1609,8 +1729,11 @@ mod tests {
         }
     }
 
-    /// `producer_reach()` advertises a `Role::Relay` Destination once a relay is
-    /// registered — populating the existing schema, no new field.
+    /// A [`ProducerReachConfig`] with a server-global relay advertises a
+    /// `Role::Relay` Destination — populating the existing schema, no new field.
+    ///
+    /// No `OnceLock` dance (#384): the config is per-instance, so this is
+    /// deterministic regardless of process-global state or test ordering.
     #[test]
     fn producer_reach_advertises_relay_when_configured() {
         let relay = ReachTransport::Quic(QuicReach {
@@ -1618,16 +1741,84 @@ mod tests {
             server_name: "pds".to_owned(),
             cert_hashes: vec![vec![1u8; 32]],
         });
-        // OnceLock: only assert the Role::Relay shape if we won the set (test
-        // isolation across the shared global), else skip — the construction logic
-        // is what we verify, and `relay_reach_from_decoded` covers it key-free.
-        if init_global_relay_reach(relay.clone()) {
-            let reach = producer_reach();
-            assert!(
-                reach.iter().any(|d| d.role == Role::Relay && d.transport == relay),
-                "producer_reach must advertise the configured Role::Relay reach"
-            );
-        }
+        let cfg = ProducerReachConfig { relay: Some(relay.clone()), ..Default::default() };
+        let reach = cfg.reach();
+        assert!(
+            reach.iter().any(|d| d.role == Role::Relay && d.transport == relay),
+            "ProducerReachConfig::reach must advertise the configured Role::Relay reach"
+        );
+    }
+
+    /// #384 regression: two DIFFERENT reach contexts in ONE process produce
+    /// DIFFERENT reach — a relay-only-anonymized stream X coexists with a
+    /// direct stream Y. This is the heterogeneous-anonymization property the
+    /// `OnceLock` singletons structurally prevented (first-write-wins clobber).
+    #[test]
+    fn heterogeneous_reach_in_one_process() {
+        let relay_x = ReachTransport::Quic(QuicReach {
+            addr: "10.0.0.9:4433".to_owned(),
+            server_name: "relay-x".to_owned(),
+            cert_hashes: vec![vec![7u8; 32]],
+        });
+        // A server with BOTH a direct (iroh) reach and a server-global relay.
+        let cfg = ProducerReachConfig {
+            iroh_node_id: Some([3u8; 32]),
+            quic_reach: None,
+            relay: Some(relay_x.clone()),
+        };
+
+        // Stream Y: server default → direct (iroh) THEN relay, direct-first order.
+        let reach_y = cfg.reach();
+        assert_eq!(reach_y[0].role, Role::Direct, "Y must advertise its direct reach first");
+        assert!(
+            reach_y.iter().any(|d| d.role == Role::Relay),
+            "Y must also advertise the server-global relay"
+        );
+
+        // Stream X: relay-ONLY (anonymized) override → NO direct reach, only the
+        // per-stream relay — same process, same config instance, different result.
+        let relay_only = ReachTransport::Quic(QuicReach {
+            addr: "10.0.0.50:4433".to_owned(),
+            server_name: "relay-anon".to_owned(),
+            cert_hashes: vec![vec![9u8; 32]],
+        });
+        let reach_x = cfg.reach_with_relay(RelayChoice::Only(relay_only.clone()));
+        assert_eq!(reach_x.len(), 1, "relay-only stream X must omit all direct reaches");
+        assert_eq!(reach_x[0].role, Role::Relay, "X is relay-only (anonymized)");
+        assert_eq!(reach_x[0].transport, relay_only, "X uses its per-stream relay override");
+        assert!(
+            !reach_x.iter().any(|d| d.role == Role::Direct),
+            "X must NOT leak a direct reach (server authority / anonymization)"
+        );
+
+        // The two streams genuinely differ in the same process — the property the
+        // singletons precluded.
+        assert_ne!(reach_x, reach_y, "X (relay-only) and Y (direct+relay) must differ");
+    }
+
+    /// Per-stream relay `Override` swaps the relay but KEEPS the direct reaches
+    /// (per-tenant isolation without anonymization), preserving direct-first order.
+    #[test]
+    fn per_stream_relay_override_keeps_direct() {
+        let server_relay = ReachTransport::Quic(QuicReach {
+            addr: "10.0.0.1:4433".to_owned(),
+            server_name: "server".to_owned(),
+            cert_hashes: vec![vec![1u8; 32]],
+        });
+        let tenant_relay = ReachTransport::Quic(QuicReach {
+            addr: "10.0.0.2:4433".to_owned(),
+            server_name: "tenant".to_owned(),
+            cert_hashes: vec![vec![2u8; 32]],
+        });
+        let cfg = ProducerReachConfig {
+            iroh_node_id: Some([4u8; 32]),
+            quic_reach: None,
+            relay: Some(server_relay.clone()),
+        };
+        let reach = cfg.reach_with_relay(RelayChoice::Override(tenant_relay.clone()));
+        assert_eq!(reach[0].role, Role::Direct, "override keeps the direct reach, listed first");
+        let relay_d = reach.iter().find(|d| d.role == Role::Relay).expect("relay advertised");
+        assert_eq!(relay_d.transport, tenant_relay, "per-stream override replaces the server relay");
     }
 
     /// QoS-driven selection: live pipes prefer DIRECT, retained/fan-out prefer RELAY.
