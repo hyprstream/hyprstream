@@ -1045,13 +1045,13 @@ mod tests {
     // written to survive the future tiles.run / atproto authz alignment: the
     // new model has to satisfy the same invariants, so these double as a
     // conformance harness. Resource identifiers go through the helpers below so
-    // that when model resources move toward MIR / AT-URI form the naming changes
+    // that when model resources move toward AT-URI form the naming changes
     // in one place, not every assertion. (OAuth scope-vocabulary tests are
     // intentionally deferred — hyprstream's `action:service:*` scopes are not
     // the access gate and will be replaced by atproto scopes.)
     // ========================================================================
 
-    /// Resource string for a model branch. Centralized for atproto/MIR forward-compat.
+    /// Resource string for a model branch. Centralized for atproto forward-compat.
     fn model_resource(name: &str, branch: &str) -> String {
         format!("model:{name}:{branch}")
     }
