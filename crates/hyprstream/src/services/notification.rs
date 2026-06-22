@@ -468,7 +468,10 @@ impl NotificationHandler for NotificationService {
         // subscribers dial the producer directly (fixes #142). Co-located
         // subscribers fall back to the same-host UDS fast path (resolved from
         // LOCAL config by `connect_moq_reach`) — never advertised on the wire.
-        let announced_at = hyprstream_rpc::moq_stream::producer_reach();
+        // #384: notification streams are node infrastructure (not per-tenant), so
+        // they use the server-global reach (ServerDefault) directly rather than a
+        // per-stream RelayChoice — no anonymized/per-tenant relay posture applies.
+        let announced_at = hyprstream_rpc::moq_stream::global_reach_config().reach();
 
         Ok(NotificationResponseVariant::SubscribeResult(SubscribeResponse {
             subscription_id: sub_id.to_string(),

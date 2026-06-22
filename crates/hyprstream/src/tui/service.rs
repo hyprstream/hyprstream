@@ -1604,11 +1604,12 @@ impl TuiService {
 
             // #356: the node's network-routable moq reach (the bound QUIC `/moq`
             // endpoint, registered when the daemon's web_transport_quinn server
-            // binds), sourced from the single shared `producer_reach()` builder.
-            // Shared across all FD streams — they all live on this node's one moq
-            // plane. A cross-process viewer dials this reach instead of its own
-            // local moq UDS plane (see StreamInfo.announcedAt docs / connect_moq_reach).
-            let reach = hyprstream_rpc::moq_stream::producer_reach();
+            // binds). Shared across all FD streams — they all live on this node's
+            // one moq plane. A cross-process viewer dials this reach instead of its
+            // own local moq UDS plane (see StreamInfo.announcedAt docs / connect_moq_reach).
+            // #384: TUI FD streams are node-local infrastructure → server-global
+            // reach (ServerDefault); no per-stream RelayChoice posture applies.
+            let reach = hyprstream_rpc::moq_stream::global_reach_config().reach();
 
             // FD-indexed streams: [0]=stdin (input relay), [1]=stdout (frames)
             let mut stream_list = connect.reborrow().init_streams(streams.len() as u32);

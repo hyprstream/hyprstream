@@ -28,7 +28,8 @@ use ed25519_dalek::SigningKey;
 use rand::RngCore;
 
 use hyprstream_rpc::moq_stream::{
-    connect_moq_reach_for_qos, run_relay_announce_link, MoqStreamOrigin, STREAM_TRACK,
+    connect_moq_reach_for_qos, run_relay_announce_link, MoqStreamOrigin, ProducerReachConfig,
+    RelayChoice, NodeStreamReach, STREAM_TRACK,
 };
 use hyprstream_rpc::stream_info::{
     Destination, QuicReach, Role, StreamOpt, TransportConfig as ReachTransport,
@@ -205,6 +206,145 @@ async fn moq_relay_rendezvous() -> Result<()> {
     );
 
     // Teardown.
+    relay_shutdown.cancel();
+    link_task.abort();
+    let _ = relay_task.await;
+    drop(producer_origin);
+    Ok(())
+}
+
+/// End-to-end anonymization (#384): a producer that HAS a direct reach but builds
+/// its stream with [`RelayChoice::Only`] advertises a relay-ONLY reach list, and
+/// the stream still delivers through the relay. This proves the per-stream relay
+/// override actually anonymizes — the direct path exists in the node's config yet
+/// is deliberately withheld from the wire for this stream, so a subscriber CANNOT
+/// learn or dial the producer's direct address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn relay_choice_only_anonymizes_stream_end_to_end() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // ── RELAY: bidirectional /moq endpoint, no keys (same as rendezvous) ───────
+    let relay_producer = moq_net::Origin::random().produce();
+    let relay_consumer = relay_producer.consume();
+    let relay_origin = MoqStreamOrigin::from_pair(relay_producer.clone(), relay_consumer);
+
+    let (relay_server, relay_addr, relay_cert) = build_server()?;
+    let relay_processor =
+        hyprstream_rpc::transport::rpc_session::from_fn(|req: bytes::Bytes| async move { Ok(req) });
+    let relay_rpc = QuinnRpcServer::with_capacity(
+        relay_server,
+        Arc::new(relay_processor),
+        fresh_signing_key(),
+        hyprstream_rpc::transport::rpc_session::DEFAULT_STREAM_LIMIT,
+    )
+    .with_moq_relay(relay_origin.producer().clone());
+    let relay_shutdown = relay_rpc.shutdown_token();
+    let relay_task = tokio::spawn(relay_rpc.run());
+
+    let relay_pin = cert_sha256(&relay_cert);
+    let relay_reach = ReachTransport::Quic(QuicReach {
+        addr: relay_addr.to_string(),
+        server_name: "localhost".to_owned(),
+        cert_hashes: vec![relay_pin.to_vec()],
+    });
+
+    // ── The node's per-server reach config: a REAL direct Quic reach is present
+    //    alongside the relay. A naive build would advertise the direct address. ──
+    let direct_addr: std::net::SocketAddr = "203.0.113.7:443".parse()?; // TEST-NET-3, unreachable
+    let server_cfg = ProducerReachConfig {
+        iroh_node_id: Some([0x11u8; 32]),
+        quic_reach: Some(NodeStreamReach {
+            addr: direct_addr,
+            server_name: "producer.invalid".to_owned(),
+            cert_hashes: vec![[0x22u8; 32]],
+            iroh_node_id: Some([0x11u8; 32]),
+        }),
+        relay: Some(relay_reach.clone()),
+    };
+
+    // ── ASSERT the anonymization property at the reach-construction layer ───────
+    // ServerDefault would leak the direct reaches; Only(relay) must withhold them.
+    let default_reach = server_cfg.reach_with_relay(RelayChoice::ServerDefault);
+    assert!(
+        default_reach.iter().any(|d| d.role == Role::Direct),
+        "ServerDefault must advertise the configured direct reach(es)"
+    );
+    let only_reach = server_cfg.reach_with_relay(RelayChoice::Only(relay_reach.clone()));
+    assert!(
+        only_reach.iter().all(|d| d.role == Role::Relay),
+        "RelayChoice::Only must omit ALL direct reaches (anonymized): {only_reach:?}"
+    );
+    assert_eq!(only_reach.len(), 1, "Only advertises exactly the one relay reach");
+    assert!(
+        only_reach[0].transport == relay_reach,
+        "the sole advertised reach is the relay"
+    );
+
+    // ── Heterogeneity in one process: a sibling stream stays direct ────────────
+    // (Proves two streams on the SAME node/config can differ — the property the
+    // process-global singleton made impossible.)
+    let sibling_reach = server_cfg.reach_with_relay(RelayChoice::None);
+    assert!(
+        sibling_reach.iter().all(|d| d.role == Role::Direct),
+        "a sibling RelayChoice::None stream stays direct-only while Only is anonymized"
+    );
+
+    // ── Now drive ACTUAL delivery using ONLY the advertised (relay-only) reach ──
+    let (_client_secret, client_pub) = hyprstream_rpc::crypto::generate_ephemeral_keypair();
+    let ctx = StreamContext::from_dh(&client_pub.to_bytes())?;
+    let topic = ctx.topic().to_owned();
+    let mac_key = *ctx.mac_key();
+
+    // Producer is a LOCAL origin, never network-bound — reachable ONLY via relay.
+    let producer_origin = {
+        let p = moq_net::Origin::random().produce();
+        let c = p.consume();
+        MoqStreamOrigin::from_pair(p, c)
+    };
+    let broadcast_path = producer_origin.broadcast_path(&topic);
+    let mut publisher = producer_origin.publisher(&ctx)?;
+
+    let link_relay = relay_reach.clone();
+    let link_producer = producer_origin.producer().clone();
+    let link_task = tokio::spawn(async move {
+        let _ = run_relay_announce_link(&link_producer, &link_relay).await;
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // The subscriber dials EXACTLY the anonymized reach the producer advertised —
+    // the relay-only list. It has no direct address to fall back to.
+    let qos = StreamOpt::default();
+    let conn = connect_moq_reach_for_qos(&only_reach, &qos)
+        .await
+        .map_err(|e| anyhow!("subscriber failed to connect via anonymized relay reach: {e}"))?;
+
+    let bc = tokio::time::timeout(
+        Duration::from_secs(5),
+        conn.consumer.announced_broadcast(&broadcast_path),
+    )
+    .await
+    .map_err(|_| anyhow!("timeout: broadcast not announced via relay"))?
+    .ok_or_else(|| anyhow!("broadcast not announced via relay"))?;
+    let track = bc.subscribe_track(&moq_net::Track::new(STREAM_TRACK))?;
+
+    let mut verifier = StreamVerifier::new(mac_key, topic.clone());
+    // Publish FIRST, then read the group (the moq group exists once published) —
+    // matches the `next_frame` ordering in `moq_relay_rendezvous`.
+    publisher.publish_data(b"anon").await?;
+    let mut group = tokio::time::timeout(Duration::from_secs(10), track.get_group(0))
+        .await
+        .map_err(|_| anyhow!("timed out waiting for relayed group 0"))??
+        .ok_or_else(|| anyhow!("relay track ended early"))?;
+    let frame = tokio::time::timeout(Duration::from_secs(10), group.read_frame())
+        .await
+        .map_err(|_| anyhow!("timed out reading relayed frame"))??
+        .ok_or_else(|| anyhow!("relayed group 0 had no frame"))?;
+    let got = hyprstream_rpc::moq_stream::verify_moq_frame(&mut verifier, &topic, &frame)?;
+    assert!(
+        matches!(got.first(), Some(StreamPayload::Data(d)) if d == b"anon"),
+        "anonymized stream must deliver through the relay: {got:?}"
+    );
+
     relay_shutdown.cancel();
     link_task.abort();
     let _ = relay_task.await;
