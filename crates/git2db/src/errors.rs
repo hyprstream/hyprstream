@@ -19,6 +19,14 @@ pub enum LfsErrorKind {
     ParseError,
     /// Failed to convert hash formats
     HashConversion,
+    /// Pointer is missing the `xet-merkle` extension required for Hub-free XET smudge.
+    ///
+    /// The legacy `LfsPointer::to_merkle_hash()` path reinterprets the LFS SHA-256 OID
+    /// as a XET `MerkleHash`, which is unsound — see issue #386. Real XET content is
+    /// keyed by BLAKE3-over-DAG and cannot be recovered from the SHA-256 of the raw
+    /// bytes, so the smudge path now requires the self-describing `xet-merkle`
+    /// extension rather than silently mis-converting.
+    MissingXetMerkle,
     /// File size doesn't match pointer metadata
     SizeMismatch,
     /// SHA256 hash doesn't match pointer metadata
