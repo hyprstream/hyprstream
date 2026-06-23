@@ -190,6 +190,13 @@ pub struct StreamContext {
     cancel_token: CancellationToken,
     /// QoS options advertised in StreamInfo and honoured by MoqStreamPublisher (#169).
     qos: crate::stream_info::StreamOpt,
+    /// Per-stream relay selection applied when building this stream's reach (#384).
+    ///
+    /// Server-authored (like `qos` — never client-supplied). Defaults to
+    /// [`crate::moq_stream::RelayChoice::ServerDefault`] (the node's server-global
+    /// relay). Set to `Only` for an anonymized, relay-only stream, or `Override`
+    /// for per-tenant relay isolation.
+    relay_choice: crate::moq_stream::RelayChoice,
 }
 
 impl StreamContext {
@@ -209,6 +216,7 @@ impl StreamContext {
             ctrl_mac_key: [0u8; 32],
             cancel_token: CancellationToken::new(),
             qos: crate::stream_info::StreamOpt::default(),
+            relay_choice: crate::moq_stream::RelayChoice::default(),
         }
     }
 
@@ -245,6 +253,7 @@ impl StreamContext {
             ctrl_mac_key: *keys.ctrl_mac_key,
             cancel_token: CancellationToken::new(),
             qos: crate::stream_info::StreamOpt::default(),
+            relay_choice: crate::moq_stream::RelayChoice::default(),
         })
     }
 
@@ -300,6 +309,30 @@ impl StreamContext {
     /// Get the QoS options for this stream (#169).
     pub fn qos(&self) -> &crate::stream_info::StreamOpt {
         &self.qos
+    }
+
+    /// Set the per-stream relay choice (#384). Server-authored — never from a
+    /// client request. Use [`crate::moq_stream::RelayChoice::Only`] for an
+    /// anonymized relay-only stream, or `Override` for per-tenant isolation.
+    pub fn with_relay_choice(mut self, relay_choice: crate::moq_stream::RelayChoice) -> Self {
+        self.relay_choice = relay_choice;
+        self
+    }
+
+    /// Get the per-stream relay choice (#384).
+    pub fn relay_choice(&self) -> &crate::moq_stream::RelayChoice {
+        &self.relay_choice
+    }
+
+    /// Build this stream's `StreamInfo.reach` from the node's per-server reach
+    /// config and this stream's [`relay_choice`](Self::relay_choice) (#384).
+    ///
+    /// This is the threaded replacement for the deprecated free-function
+    /// `producer_reach()`: a producer that holds a `StreamContext` calls this so
+    /// the stream's relay/anonymization posture is honoured per-stream instead of
+    /// resolving the process-global default.
+    pub fn reach(&self) -> Vec<crate::stream_info::Destination> {
+        crate::moq_stream::global_reach_config().reach_with_relay(self.relay_choice.clone())
     }
 }
 
