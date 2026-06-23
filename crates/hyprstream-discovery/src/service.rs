@@ -214,16 +214,6 @@ fn socket_kind_to_string(kind: SocketKind) -> &'static str {
     match kind {
         SocketKind::Req => "req",
         SocketKind::Rep => "rep",
-        SocketKind::Dealer => "dealer",
-        SocketKind::Router => "router",
-        SocketKind::Pub => "pub",
-        SocketKind::Sub => "sub",
-        SocketKind::XPub => "xpub",
-        SocketKind::XSub => "xsub",
-        SocketKind::Push => "push",
-        SocketKind::Pull => "pull",
-        SocketKind::Pair => "pair",
-        SocketKind::Stream => "stream",
         SocketKind::Quic => "quic",
     }
 }
