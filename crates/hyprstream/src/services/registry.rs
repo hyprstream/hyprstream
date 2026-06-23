@@ -160,6 +160,11 @@ fn now_epoch_secs() -> u64 {
 }
 
 /// Build a Qid from filesystem metadata.
+///
+/// Advisory identity hint only — see the qid-soundness invariant on
+/// `hyprstream_vfs::Stat`. `path = inode` is rename-stable but subject to
+/// inode reuse; `version = ctime` is truncated. No authz may key on this. The
+/// content-CID-derived qid lands in #387.
 #[cfg(unix)]
 fn qid_from_metadata(meta: &std::fs::Metadata) -> Qid {
     use std::os::unix::fs::MetadataExt;
@@ -171,6 +176,9 @@ fn qid_from_metadata(meta: &std::fs::Metadata) -> Qid {
 }
 
 /// Build a Qid from metadata (non-Unix fallback).
+///
+/// `path = 0` by the "0 = unknown" convention (no inode available); this qid
+/// is NOT a usable identity. See `hyprstream_vfs::Stat`.
 #[cfg(not(unix))]
 fn qid_from_metadata(meta: &std::fs::Metadata) -> Qid {
     Qid {
@@ -180,7 +188,7 @@ fn qid_from_metadata(meta: &std::fs::Metadata) -> Qid {
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as u32)
             .unwrap_or(0),
-        path: 0, // No inode on non-Unix
+        path: 0, // No inode on non-Unix — "0 = unknown" per vfs::Stat convention
     }
 }
 

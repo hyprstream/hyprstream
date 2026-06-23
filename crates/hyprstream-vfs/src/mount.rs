@@ -90,12 +90,52 @@ pub struct DirEntry {
 }
 
 /// File metadata.
+///
+/// # Qid soundness invariant — SECURITY
+///
+/// In 9P, a file's `qid` is its *identity*: two files are the same file if
+/// and only if their qids are equal. A qid is the triple `{qtype, version,
+/// path}`. Historically this struct carried only `qtype`, flattening the qid
+/// and destroying the identity signal — every file looked like the same file
+/// to any qid-keyed consumer.
+///
+/// `version` and `path` are now threaded end-to-end so the surface is sound,
+/// but the *values* are not yet a strong identity:
+///   - Synthetic mounts set `version = 1` constant and `path = fnv64(path)`,
+///     which is non-cryptographic and changes on rename.
+///   - Registry-backed mounts set `path = inode` (rename-stable but subject to
+///     inode reuse) and `version = ctime` (truncated).
+///
+/// **Convention:** `path == 0` means "unknown / not provided" (e.g. non-Unix
+/// registry fallback, or a mount that has no meaningful file identity). It is
+/// NOT a valid identity and must not be treated as one.
+///
+/// **No server authz, cache key, or dedup logic may key on `qid` (version or
+/// path) as a sound identity until #387 lands a content-CID-derived qid with
+/// an AFS-style data-version uniquifier.** Treat the qid fields here as an
+/// advisory identity *hint* only. Authz must continue to key on the verified
+/// `Subject` plus path resolution, never on qid.
 #[derive(Clone, Debug)]
 pub struct Stat {
     pub qtype: u8,
+    /// Qid version (data-version). Advisory hint only — see type-level invariant.
+    pub version: u32,
+    /// Qid path (file identity). `0` means unknown. Advisory hint only — see type-level invariant.
+    pub path: u64,
     pub size: u64,
     pub name: String,
     pub mtime: u64,
+}
+
+impl Stat {
+    /// Construct a `Stat` with `version = 0, path = 0` (qid unknown).
+    ///
+    /// Use this for mounts that have no meaningful file identity (e.g. purely
+    /// synthetic test mounts). The result carries qtype/size/name/mtime and
+    /// signals via `path == 0` that the qid is not a usable identity.
+    pub fn unknown_qid(qtype: u8, size: u64, name: String, mtime: u64) -> Self {
+        Self { qtype, version: 0, path: 0, size, name, mtime }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -499,7 +499,7 @@ mod tests {
 
         async fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
             let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
-            Ok(Stat { qtype: 0, size: 0, name: inner.path.clone(), mtime: 0 })
+            Ok(Stat::unknown_qid(0, 0, inner.path.clone(), 0))
         }
 
         async fn clunk(&self, _fid: Fid, _caller: &Subject) {}
@@ -608,7 +608,7 @@ mod tests {
             async fn write(&self, _fid: &Fid, _o: u64, d: &[u8], _c: &Subject) -> Result<u32, MountError> { Ok(d.len() as u32) }
             async fn readdir(&self, _fid: &Fid, _c: &Subject) -> Result<Vec<DirEntry>, MountError> { Ok(vec![]) }
             async fn stat(&self, _fid: &Fid, _c: &Subject) -> Result<crate::mount::Stat, MountError> {
-                Ok(crate::mount::Stat { qtype: 0, size: 0, name: String::new(), mtime: 0 })
+                Ok(crate::mount::Stat::unknown_qid(0, 0, String::new(), 0))
             }
             async fn clunk(&self, _fid: Fid, _c: &Subject) {}
         }

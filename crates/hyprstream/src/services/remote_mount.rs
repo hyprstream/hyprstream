@@ -257,6 +257,13 @@ impl Mount for RemoteModelMount {
 
         Ok(Stat {
             qtype: np_stat.qid.qtype,
+            // Thread the wire qid version/path through instead of discarding
+            // them. `nine.capnp` already carries these; we were flattening the
+            // qid to qtype only. See the qid-soundness invariant on
+            // `hyprstream_vfs::Stat` — these are advisory identity hints, not
+            // yet a strong identity (content-CID qid lands in #387).
+            version: np_stat.qid.version,
+            path: np_stat.qid.path,
             size: np_stat.length,
             name: np_stat.name.clone(),
             mtime: np_stat.mtime as u64,
@@ -286,7 +293,7 @@ impl Mount for RemoteModelMount {
 /// Parse packed 9P stat entries from a directory read response.
 ///
 /// Each stat entry is: `[2-byte LE size][stat bytes]`.
-/// We extract the name and qtype for DirEntry conversion.
+/// We extract qid (type/version/path), length, mtime, and name for DirEntry.
 fn parse_dir_stats(data: &[u8]) -> Vec<DirEntry> {
     let mut entries = Vec::new();
     let mut offset = 0;
@@ -302,21 +309,31 @@ fn parse_dir_stats(data: &[u8]) -> Vec<DirEntry> {
         let entry_data = &data[offset..offset + entry_size];
         offset += entry_size;
 
-        // 9P stat layout (simplified):
-        //   size(2) + type(2) + dev(4) + qid(13) + mode(4) + atime(4) + mtime(4) + length(8) +
-        //   name_len(2) + name + uid_len(2) + uid + gid_len(2) + gid + muid_len(2) + muid
+        // 9P stat layout. The outer 2-byte size has already been consumed; the
+        // inner bytes are:
+        //   type(2) dev(4) qid.type(1) qid.vers(4) qid.path(8)
+        //   mode(4) atime(4) mtime(4) length(8)   = 39 bytes
+        //   then name_len(2) name ...
         //
-        // But the outer size has already been consumed. The inner layout is:
-        //   type(2) + dev(4) + qid.type(1) + qid.vers(4) + qid.path(8) + mode(4) + atime(4) + mtime(4) + length(8)
-        //   = 39 bytes before name_len
+        // Offsets:
+        //   qid.type  @ 6            (1 byte)
+        //   qid.vers  @ 7..11        (u32 LE)
+        //   qid.path  @ 11..19       (u64 LE)
+        //   mode      @ 19..23
+        //   atime     @ 23..27
+        //   mtime     @ 27..31       (u32 LE)
+        //   length    @ 31..39       (u64 LE)
+        //   name_len  @ 39..41       (u16 LE)
         if entry_data.len() < 41 {
             continue;
         }
 
-        let qtype = entry_data[6]; // qid.type at offset 6 (after type(2) + dev(4))
-        let length = u64::from_le_bytes(entry_data[27..35].try_into().unwrap_or([0; 8]));
+        let qtype = entry_data[6];
+        let qvers = u32::from_le_bytes(entry_data[7..11].try_into().unwrap_or([0; 4]));
+        let qpath = u64::from_le_bytes(entry_data[11..19].try_into().unwrap_or([0; 8]));
+        let mtime = u32::from_le_bytes(entry_data[27..31].try_into().unwrap_or([0; 4])) as u64;
+        let length = u64::from_le_bytes(entry_data[31..39].try_into().unwrap_or([0; 8]));
 
-        // name_len at offset 39
         let name_len = u16::from_le_bytes([entry_data[39], entry_data[40]]) as usize;
         if entry_data.len() < 41 + name_len {
             continue;
@@ -329,9 +346,11 @@ fn parse_dir_stats(data: &[u8]) -> Vec<DirEntry> {
             size: length,
             stat: Some(Stat {
                 qtype,
+                version: qvers,
+                path: qpath,
                 size: length,
                 name,
-                mtime: 0,
+                mtime,
             }),
         });
     }
@@ -353,5 +372,52 @@ mod tests {
         // Size says 100 bytes but only 5 available — should not panic.
         let data = [100, 0, 0, 0, 0];
         assert!(parse_dir_stats(&data).is_empty());
+    }
+
+    /// Build one packed 9P stat entry (inner layout, no outer 2-byte size) and
+    /// verify qid type/version/path, length, mtime, and name are all decoded.
+    #[test]
+    fn parse_dir_stats_decodes_qid_and_fields() {
+        let qtype: u8 = 0x80; // QTDIR
+        let qvers: u32 = 0x0A0B_0C0D;
+        let qpath: u64 = 0x0102_0304_0506_0708;
+        let mtime: u32 = 0x1122_3344;
+        let length: u64 = 0x99AA_BBCC_DDDE_EEF0;
+        let name = b"model-dir";
+
+        // Inner stat: type(2) dev(4) qid.type(1) qid.vers(4) qid.path(8)
+        //             mode(4) atime(4) mtime(4) length(8) name_len(2) name
+        let mut inner = Vec::new();
+        inner.extend_from_slice(&0u16.to_le_bytes()); // type
+        inner.extend_from_slice(&0u32.to_le_bytes()); // dev
+        inner.push(qtype);
+        inner.extend_from_slice(&qvers.to_le_bytes());
+        inner.extend_from_slice(&qpath.to_le_bytes());
+        inner.extend_from_slice(&0u32.to_le_bytes()); // mode
+        inner.extend_from_slice(&0u32.to_le_bytes()); // atime
+        inner.extend_from_slice(&mtime.to_le_bytes());
+        inner.extend_from_slice(&length.to_le_bytes());
+        inner.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        inner.extend_from_slice(name);
+
+        // Prepend the 2-byte LE entry size.
+        let mut data = (inner.len() as u16).to_le_bytes().to_vec();
+        data.extend_from_slice(&inner);
+
+        let entries = parse_dir_stats(&data);
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e.name, "model-dir");
+        assert!(e.is_dir);
+        assert_eq!(e.size, length);
+        let stat = match e.stat.as_ref() {
+            Some(s) => s,
+            None => panic!("stat must be present on parsed dir entry"),
+        };
+        assert_eq!(stat.qtype, qtype);
+        assert_eq!(stat.version, qvers, "qid version must be decoded, not flattened");
+        assert_eq!(stat.path, qpath, "qid path must be decoded, not flattened");
+        assert_eq!(stat.size, length);
+        assert_eq!(stat.mtime, mtime as u64);
     }
 }
