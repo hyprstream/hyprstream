@@ -298,12 +298,12 @@ impl Mount for GenericServiceMount {
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
         let (svc_name, _) = self.service.metadata();
         let name = state.path.last().map(|s| s.as_str()).unwrap_or(svc_name);
-        Ok(Stat {
-            qtype: if state.path.is_empty() { 0x80 } else { 0 },
-            size: 0,
-            name: name.to_string(),
-            mtime: 0,
-        })
+        Ok(Stat::unknown_qid(
+            if state.path.is_empty() { 0x80 } else { 0 },
+            0,
+            name.to_string(),
+            0,
+        ))
     }
 
     async fn clunk(&self, _fid: Fid, _caller: &Subject) {}
@@ -386,12 +386,12 @@ impl Mount for DocMount {
         let state = fid.downcast_ref::<VfsFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
         let name = state.path.last().map(|s| s.as_str()).unwrap_or("doc");
-        Ok(Stat {
-            qtype: if state.path.is_empty() { 0x80 } else { 0 },
-            size: 0,
-            name: name.to_string(),
-            mtime: 0,
-        })
+        Ok(Stat::unknown_qid(
+            if state.path.is_empty() { 0x80 } else { 0 },
+            0,
+            name.to_string(),
+            0,
+        ))
     }
 
     async fn clunk(&self, _fid: Fid, _caller: &Subject) {}
