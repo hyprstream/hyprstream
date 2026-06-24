@@ -38,5 +38,17 @@ tokio-test = { workspace = true }
 # Tracing init helper (git2db logs; harmless if already initialized).
 tracing-subscriber = { workspace = true }
 
+# E7 (#421) two-node federation harness — adds the Iroh-loopback transport seam
+# on top of the E1 content-addressing deps. Two independent in-process nodes
+# (distinct node keys + DIDs + PDS stores) dial each other over a real Iroh
+# endpoint, so Node B fetches Node A's CAR proof + content blob across an actual
+# federation transport boundary (not an in-process call). Light deps only — no
+# libtorch — keeping `cargo test -p hyprstream-pds` fast under host throttle.
+iroh = { workspace = true }
+# did:key derivation from the Ed25519 node key (ed25519_to_did_key) + the
+# IrohSubstrate two-plane transport are re-exported by hyprstream-rpc (already a
+# dev-dep above); ed25519-dalek provides the SigningKey type the node key uses.
+ed25519-dalek = { workspace = true }
+
 [lints]
 workspace = true
