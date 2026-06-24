@@ -21,5 +21,22 @@ anyhow = { workspace = true }
 # Random signing keys for round-trip / tamper tests.
 rand = { workspace = true }
 
+# E1 (#421) end-to-end content-addressing + identity test. The dev-deps are the
+# three crates whose composition the test validates: git2db (repo → commit OID),
+# hyprstream-rpc (OID → git-raw CID string), and the PDS layers exercised via the
+# integration test binary itself. They only compile for `cargo test -p
+# hyprstream-pds`; the library's normal build stays the minimal crypto layer.
+git2db = { path = "../git2db" }
+hyprstream-rpc = { path = "../hyprstream-rpc" }
+# git2 re-exported by git2db; used to seed a local repo and read the commit OID.
+git2 = { workspace = true }
+# Temp dirs for the git2db registry + source repos.
+tempfile = { workspace = true }
+# Async test runtime (git2db commit/clone are async).
+tokio = { workspace = true }
+tokio-test = { workspace = true }
+# Tracing init helper (git2db logs; harmless if already initialized).
+tracing-subscriber = { workspace = true }
+
 [lints]
 workspace = true
