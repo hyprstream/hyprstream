@@ -1392,7 +1392,11 @@ impl LlamaModel {
             kv_quant_type
         );
 
-        // Extract key tensors (with padding for models that need it)
+        // Extract key tensors (with padding for models that need it).
+        // #405: place top-level weights on `device` here, mirroring the
+        // `build_layer`→`into_device` move applied to decoder layers. Without
+        // this, constructing from CPU weights with device=Cuda(0) leaves
+        // embed_tokens on CPU while layers move to CUDA — a mixed-device model.
         let embed_tokens = weights
             .get("model.embed_tokens.weight")
             .or_else(|| weights.get("embed_tokens.weight"))
@@ -1403,7 +1407,7 @@ impl LlamaModel {
                 // Pad vocabulary size to multiple of 64 for models that need it
                 let padded_vocab_size = calculate_padded_vocab_size(vocab_size);
 
-                if padded_vocab_size > vocab_size {
+                let placed = if padded_vocab_size > vocab_size {
                     tracing::info!(
                         "Padding embedding vocab size from {} to {} (multiple of 64)",
                         vocab_size, padded_vocab_size
@@ -1420,7 +1424,8 @@ impl LlamaModel {
                     padded
                 } else {
                     w.shallow_clone()
-                }
+                };
+                placed.to_device(*device)
             });
 
         // Update config with padded vocab size if needed
@@ -1473,8 +1478,9 @@ impl LlamaModel {
                     w.shallow_clone()
                 };
 
-                // We need [hidden_size, vocab_size] for matmul
-                padded_w.transpose(0, 1).contiguous()
+                // We need [hidden_size, vocab_size] for matmul.
+                // #405: place on `device` (see embed_tokens note above).
+                padded_w.transpose(0, 1).contiguous().to_device(*device)
             });
 
         // Pre-compute transposed lm_head for tied weights case
@@ -1490,12 +1496,12 @@ impl LlamaModel {
             None
         };
 
-        // Extract final layer norm
+        // Extract final layer norm (#405: place on `device`).
         let norm = weights
             .get("model.norm.weight")
             .or_else(|| weights.get("norm.weight"))
             .map(|w| RMSNorm {
-                weight: w.shallow_clone(),
+                weight: w.shallow_clone().to_device(*device),
                 eps: config.rms_norm_eps,
             });
 

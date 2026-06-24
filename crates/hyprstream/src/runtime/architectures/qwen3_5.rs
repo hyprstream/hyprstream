@@ -1451,10 +1451,16 @@ impl Qwen3_5Model {
         // Remove MTP (multi-token prediction) weights silently
         weights.retain(|k, _| !k.starts_with("mtp."));
 
+        // #405: place top-level weights on `device`, mirroring the
+        // `into_device` move that `stage_from_weights_with_config` applies.
+        // Without this, constructing from CPU weights with device=Cuda(0)
+        // leaves embed/norm/lm_head on CPU — a mixed-device model.
         let embed = weights.remove("model.embed_tokens.weight")
-            .ok_or_else(|| anyhow!("Missing model.embed_tokens.weight"))?;
+            .ok_or_else(|| anyhow!("Missing model.embed_tokens.weight"))?
+            .to_device(*device);
         let norm_w = weights.remove("model.norm.weight")
-            .ok_or_else(|| anyhow!("Missing model.norm.weight"))?;
+            .ok_or_else(|| anyhow!("Missing model.norm.weight"))?
+            .to_device(*device);
         let lm_head_w = if let Some(w) = weights.remove("lm_head.weight") {
             // Cast FP8 lm_head to BF16, applying the companion block scale if present.
             // Without this the raw FP8 values (~448) are used instead of the true weights (~0.09),
@@ -1470,12 +1476,12 @@ impl Qwen3_5Model {
                         let bc = ws[1] / ss[1];
                         let w_4d = w_bf.view([ss[0], br, ss[1], bc]);
                         let s_4d = s.to_kind(tch::Kind::BFloat16).view([ss[0], 1i64, ss[1], 1i64]);
-                        Some((w_4d * s_4d).reshape([ws[0], ws[1]]))
+                        Some((w_4d * s_4d).reshape([ws[0], ws[1]]).to_device(*device))
                     } else {
-                        Some(w_bf)
+                        Some(w_bf.to_device(*device))
                     }
                 }
-                _ => Some(w),
+                _ => Some(w.to_device(*device)),
             }
         } else {
             None
