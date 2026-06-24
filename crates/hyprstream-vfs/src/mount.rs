@@ -18,6 +18,12 @@ pub const OTRUNC: u8 = 0x10;
 /// Remove on clunk (OR'd with above)
 pub const ORCLOSE: u8 = 0x40;
 
+/// Plan 9 `DMDIR` permission bit. OR'd into `perm` for `create` to make a directory.
+///
+/// Matches the kernel/lib9 value (`0x80000000`) and the registry service's
+/// `DMDIR` constant in `services/types.rs`.
+pub const DMDIR: u32 = 0x8000_0000;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Error type
 // ─────────────────────────────────────────────────────────────────────────────
@@ -156,6 +162,37 @@ pub trait Mount: Send + Sync {
 
     /// Open a walked fid for I/O. `mode`: OREAD=0, OWRITE=1, ORDWR=2.
     async fn open(&self, fid: &mut Fid, mode: u8, caller: &Subject) -> Result<(), MountError>;
+
+    /// Create a new file or directory under a walked *directory* fid (9P `Tcreate`).
+    ///
+    /// On success, `fid` is replaced by an opened fid on the new file (the
+    /// directory fid is consumed, exactly as in 9P). `perm` carries the Unix
+    /// mode bits; OR in [`DMDIR`] to create a directory. `mode` is the open
+    /// mode for the newly created file (the new fid is opened writable).
+    ///
+    /// # Default
+    ///
+    /// Returns [`MountError::NotSupported`]. Read-only / synthetic mounts
+    /// (the common case) inherit this default and remain writable-mount-free.
+    /// Only the registry worktree mount (the writable upper layer of the union)
+    /// overrides it — see `RemoteRegistryMount::create`.
+    ///
+    /// # Copy-up
+    ///
+    /// The union namespace performs copy-up *before* reaching here: a write to
+    /// a path that exists only in a read-only lower layer is redirected to the
+    /// writable upper layer, which may `create` the file first. See
+    /// `Namespace::echo` / `Namespace::create`.
+    async fn create(
+        &self,
+        _fid: &mut Fid,
+        _name: &str,
+        _perm: u32,
+        _mode: u8,
+        _caller: &Subject,
+    ) -> Result<Stat, MountError> {
+        Err(MountError::NotSupported("create is not supported on this mount".into()))
+    }
 
     /// Read bytes from an open fid at offset.
     async fn read(&self, fid: &Fid, offset: u64, count: u32, caller: &Subject) -> Result<Vec<u8>, MountError>;

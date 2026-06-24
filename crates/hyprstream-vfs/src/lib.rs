@@ -22,7 +22,7 @@ mod namespace;
 pub mod proxy;
 
 pub use hyprstream_rpc::Subject;
-pub use mount::{DirEntry, Fid, Mount, MountError, Stat, OREAD, OWRITE, ORDWR, OTRUNC, ORCLOSE};
+pub use mount::{DirEntry, Fid, Mount, MountError, Stat, OREAD, OWRITE, ORDWR, OTRUNC, ORCLOSE, DMDIR};
 pub use namespace::{BindFlag, MountTarget, Namespace, NamespaceError};
 
 // ─────────────────────────────────────────────────────────────────────────────

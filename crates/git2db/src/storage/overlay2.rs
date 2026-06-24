@@ -18,7 +18,19 @@ inventory::submit!(DriverFactory::new(
 
 /// Overlay2 storage driver (Linux overlayfs)
 ///
-/// Automatically tries mount methods in order: kernel → userns → fuse
+/// Automatically tries mount methods in order: kernel → userns → fuse.
+///
+/// # Role in the writable union (#394)
+///
+/// This driver mounts the per-worktree overlay whose **upper** directory is
+/// the node-local, append-only writable layer of the union namespace. The
+/// union copy-up primitive lives in `hyprstream_vfs::Namespace` (above this
+/// driver): a write to a path that exists only in the read-only `/oid` floor
+/// is redirected to the writable upper, which the kernel overlayfs presents as
+/// a regular filesystem. Promote (`hyprstream::git::promote`) snapshots the
+/// upper via `stageAll` + `commit`, draining it into an immutable
+/// content-addressed registry commit; after promote the upper is empty and the
+/// floor advances to the new commit.
 #[allow(dead_code)] // Constructed via inventory::submit! when overlayfs feature enabled
 pub struct Overlay2Driver;
 
