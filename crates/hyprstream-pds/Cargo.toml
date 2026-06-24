@@ -1,0 +1,25 @@
+[package]
+name = "hyprstream-pds"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "atproto PDS record store — DAG-CBOR records, MST, signed commits, CAR proofs (#392)"
+
+[dependencies]
+# P-256 ES256 signing for atproto commits (#atproto verification method).
+p256 = { workspace = true }
+# SHA-256 — signing digest + CIDv1 dag-cbor multihash for all repo blocks.
+sha2 = { workspace = true }
+# Error handling.
+anyhow = { workspace = true }
+# Note: DAG-CBOR + CIDv1 + varints are hand-rolled in src/dag_cbor.rs and
+# src/cid.rs to enforce the determinism invariants (sorted keys, minimal ints,
+# tag-42 links) that serde-driven CBOR cannot guarantee. No CBOR/CID crate dep.
+
+[dev-dependencies]
+# Random signing keys for round-trip / tamper tests.
+rand = { workspace = true }
+
+[lints]
+workspace = true
