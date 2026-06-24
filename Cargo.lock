@@ -6698,6 +6698,7 @@ dependencies = [
  "capnp",
  "capnpc",
  "console_error_panic_hook",
+ "hyprstream-9p",
  "hyprstream-rpc",
  "hyprstream-rpc-build",
  "hyprstream-rpc-derive",
