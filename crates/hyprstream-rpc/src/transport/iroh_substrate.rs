@@ -42,6 +42,19 @@ impl IrohSubstrate {
     /// fallback. Operators wanting self-hosted discovery should bypass this
     /// constructor and use [`IrohSubstrate::from_endpoint`] with a
     /// pre-configured `iroh::Endpoint`.
+    ///
+    /// #385 threat — discovery metadata leak (S8 close-out):
+    /// pkarr records are *public, signed-but-not-encrypted* packets published on
+    /// the open Mainline DHT. A passive network observer can enumerate which node
+    /// IDs are reachable, observe their home-relay binding, and correlate lookup
+    /// traffic (who is asking for whom) — i.e. discovery is a metadata side
+    /// channel by construction. This is inherent to DHT discovery; the streaming
+    /// plane never claims discovery-metadata privacy. Content confidentiality is
+    /// unaffected (frames are E2E AEAD-sealed at the source; the relay and the
+    /// DHT are blind to plaintext). The mitigation is oblivious-relay (#361):
+    /// hide the lookup pattern itself. Until #361 lands, operators that consider
+    /// the side channel actionable should run a self-hosted `iroh-dns-server`
+    /// via [`Self::from_endpoint`] to keep discovery traffic off the public DHT.
     pub async fn new<M, R>(
         secret_key_bytes: [u8; 32],
         moq_handler: M,
