@@ -194,6 +194,17 @@ pub struct LlamaConfig {
     pub layer_types: Vec<String>,
     /// RoPE theta for local attention layers (Gemma3)
     pub rope_local_base_freq: Option<f32>,
+    /// The *real* model architecture this LlamaModel stands in for.
+    ///
+    /// `LlamaModel` is reused as the runtime for several architecturally-llama
+    /// families (Llama, Qwen, Mistral). The tokenizer-config dispatch keys on
+    /// `ModelOperations::architecture()`, so a Qwen3 checkpoint loaded via
+    /// `create_qwen_model` must report `Qwen` here — otherwise the
+    /// `QwenTokenizerConfig` (which pads the tokenizer vocab up to the model's
+    /// embedding size) is never applied and the tokenizer/embedding vocab
+    /// mismatch silently causes a CUDA index-out-of-bounds on the embedding
+    /// lookup (#143). Defaults to `Llama`; `create_qwen_model` overrides it.
+    pub model_architecture: ModelArchitecture,
 }
 
 /// RoPE scaling configuration (Llama 3)
@@ -227,6 +238,7 @@ impl Default for LlamaConfig {
             scale_embeddings: false,
             layer_types: vec![],
             rope_local_base_freq: None,
+            model_architecture: ModelArchitecture::Llama { version: 2 },
         }
     }
 }
@@ -258,6 +270,7 @@ impl LlamaConfig {
             scale_embeddings: false,
             layer_types: vec![],
             rope_local_base_freq: None,
+            model_architecture: ModelArchitecture::Llama { version: 3 },
         }
     }
 
@@ -287,6 +300,7 @@ impl LlamaConfig {
             scale_embeddings: false,
             layer_types: vec![],
             rope_local_base_freq: None,
+            model_architecture: ModelArchitecture::Llama { version: 3 },
         }
     }
 }
@@ -2124,6 +2138,31 @@ impl LlamaModel {
             scale_embeddings: false, // Will be set based on vocab size or explicit config
             layer_types: vec![],
             rope_local_base_freq: None,
+            // Best-effort architecture hint from model_type so tokenizer-config
+            // dispatch sees Qwen when this path is used directly. The factory's
+            // authoritative `create_*_model` path overwrites this via the unified
+            // ModelConfig (#143).
+            model_architecture: json
+                .get("model_type")
+                .and_then(|v| v.as_str())
+                .map(|mt| {
+                    let mt = mt.to_lowercase();
+                    match mt.as_str() {
+                        "qwen" | "qwen2" | "qwen3" => ModelArchitecture::Qwen {
+                            version: if mt.starts_with("qwen3") { 3 }
+                                else if mt.starts_with("qwen2") { 2 }
+                                else { 1 },
+                            is_moe: false,
+                            context_length: json["max_position_embeddings"]
+                                .as_u64()
+                                .unwrap_or(4096) as usize,
+                        },
+                        "mistral" => ModelArchitecture::Mistral,
+                        "gemma" => ModelArchitecture::Gemma,
+                        _ => ModelArchitecture::Llama { version: 2 },
+                    }
+                })
+                .unwrap_or(ModelArchitecture::Llama { version: 2 }),
         };
 
         // Parse rope scaling if present
@@ -2687,8 +2726,17 @@ impl LlamaModel {
 
 impl ModelOperations for LlamaModel {
     fn architecture(&self) -> ModelArchitecture {
-        ModelArchitecture::Llama {
-            version: self.config.version,
+        // Report the *real* family (Qwen/Mistral/...), not the Llama stand-in,
+        // so architecture-keyed dispatch (notably tokenizer-config padding for
+        // Qwen, #143) targets the correct implementation. Falls back to Llama
+        // with the parsed version when no override was set.
+        match &self.config.model_architecture {
+            ModelArchitecture::Llama { .. } | ModelArchitecture::Custom(_) => {
+                ModelArchitecture::Llama {
+                    version: self.config.version,
+                }
+            }
+            other => other.clone(),
         }
     }
 
@@ -3171,6 +3219,7 @@ mod pipeline_tests {
             scale_embeddings: false,
             layer_types: vec![],
             rope_local_base_freq: None,
+            model_architecture: ModelArchitecture::Llama { version: 2 },
         }
     }
 
