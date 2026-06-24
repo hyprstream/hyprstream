@@ -341,10 +341,12 @@ pub struct QuicConfig {
     #[serde(default)]
     pub key_path: String,
 
-    /// #282: bind an iroh substrate (ALPNs `hyprstream-rpc/1` + `moql`) in
-    /// PARALLEL to the quinn/WebTransport endpoint, enabling node_id-addressed
-    /// (pkarr/DNS-discoverable) federation reach. Off by default — quinn-only is
-    /// the unchanged baseline; opt in with `[quic] iroh = true`. Native-only.
+    /// #410/#282: bind an iroh substrate (ALPNs `hyprstream-rpc/1` + `moql`)
+    /// as the PRIMARY production transport, in parallel with the quinn/WebTransport
+    /// endpoint (kept for back-compat). Iroh is ON by default — it provides
+    /// node_id-addressed (pkarr/N0-DNS-discoverable) federation reach, NAT
+    /// traversal, self-certifying Ed25519 identity, and PQ-hybrid key exchange.
+    /// Opt out with `[quic] iroh = false` to run quinn-only (legacy). Native-only.
     #[serde(default = "default_iroh_enabled")]
     pub iroh: bool,
 }
@@ -475,9 +477,10 @@ impl QuicConfig {
             server_name: self.server_name.clone(),
             protected_resource_json: meta_json,
             on_quic_bound: None,
-            // #282: iroh is opt-in and provisioned by the daemon bootstrap
-            // (`QuicSharedConfig`), not this minimal builder. Off here.
-            iroh_enabled: false,
+            // #410: iroh is the primary production transport (on by default).
+            // This minimal builder mirrors the daemon bootstrap default; the
+            // full `QuicSharedConfig` path in `main.rs` honours `[quic] iroh`.
+            iroh_enabled: default_iroh_enabled(),
             iroh_admission: None,
             on_iroh_bound: None,
         })
@@ -485,9 +488,9 @@ impl QuicConfig {
 }
 
 fn default_quic_enabled() -> bool { true }
-/// #282: iroh substrate is opt-in (defaults off) so the quinn-only baseline is
-/// unchanged for existing deployments.
-fn default_iroh_enabled() -> bool { false }
+/// #410: iroh substrate is the PRIMARY production transport — on by default.
+/// The quinn-only baseline is the legacy path; opt out with `[quic] iroh = false`.
+fn default_iroh_enabled() -> bool { true }
 fn default_quic_bind_addr() -> String { "0.0.0.0:4433".to_owned() }
 fn default_quic_server_name() -> String { "localhost".to_owned() }
 
