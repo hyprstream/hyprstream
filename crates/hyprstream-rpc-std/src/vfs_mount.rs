@@ -456,6 +456,21 @@ impl_service_dispatch!(InferenceDispatch, crate::inference_client);
 // ============================================================================
 
 /// Build a VFS namespace with codegen-driven service mounts.
+///
+/// Per #389 + #391 (Option 1: shared content model), this builder mounts the
+/// same content trees as the native namespace builder
+/// (`hyprstream::cli::shell_handlers`) so `/srv/registry` and `/srv/model`
+/// resolve to the same spine-backed content in either context. The transport
+/// leaf (DMA/SAB ring buffers here vs ZMQ in the native builder) is
+/// correctly-scoped glue and is NOT part of the convergence contract — see
+/// `hyprstream_vfs::STANDARD_NAMESPACE_PATHS`.
+///
+/// Note: `/worktree` is bind-mounted to `/srv/registry` for path-shape
+/// parity with the native namespace. In the browser this exposes the
+/// GenericServiceMount (ctl-style service-as-files: `ls`, `cat`, `ctl`);
+/// in the native namespace the same path exposes the worktree filesystem
+/// (`RemoteRegistryMount`, real qids). The convergence is at the path +
+/// backing-service level; the access style differs by transport capability.
 pub fn build_browser_namespace(
     registry_client: Arc<dyn RpcClient>,
     model_client: Arc<dyn RpcClient>,
@@ -464,9 +479,14 @@ pub fn build_browser_namespace(
     let mut ns = hyprstream_vfs::Namespace::new();
 
     // Service mounts — all use GenericServiceMount with generated dispatch
-    ns.mount("/srv/registry", Arc::new(GenericServiceMount::new(
+    let registry_mount: Arc<GenericServiceMount> = Arc::new(GenericServiceMount::new(
         Arc::clone(&registry_client), Box::new(RegistryDispatch), Arc::clone(&stream_registry),
-    ))).expect("mount /srv/registry");
+    ));
+    ns.mount("/srv/registry", registry_mount.clone()).expect("mount /srv/registry");
+    // `/worktree` aliases `/srv/registry` for path-shape parity with the
+    // native namespace (see `hyprstream_vfs::STANDARD_NAMESPACE_PATHS`).
+    ns.bind_mount("/worktree", registry_mount, hyprstream_vfs::BindFlag::After)
+        .expect("bind mount /worktree");
     ns.mount("/srv/model", Arc::new(GenericServiceMount::new(
         Arc::clone(&model_client), Box::new(ModelDispatch), Arc::clone(&stream_registry),
     ))).expect("mount /srv/model");

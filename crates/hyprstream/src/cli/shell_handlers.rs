@@ -359,6 +359,31 @@ pub async fn handle_shell_tui(
             std::sync::Arc::new(remote_model_mount),
         );
 
+        // Mount the registry service's worktree filesystem via RPC proxy.
+        // RemoteRegistryMount is the registry analogue of RemoteModelMount:
+        // it proxies 9P operations to the registry service's
+        // `WorktreeClient` (real qids, real filesystem). 2-level scope:
+        //   /srv/registry/{repo_name}/{worktree_name}/<...rest...>
+        // Per #389 + #391 (Option 1, shared content model): the TUI namespace
+        // now mirrors the browser namespace's `/srv/registry` mount, both
+        // backed at the hyprstream spine. See `STANDARD_NAMESPACE_PATHS` in
+        // hyprstream-vfs for the convergence contract.
+        let remote_registry_mount = crate::services::remote_registry_mount::RemoteRegistryMount::new(
+            Clone::clone(&registry),
+        );
+        let registry_mount: std::sync::Arc<crate::services::remote_registry_mount::RemoteRegistryMount> =
+            std::sync::Arc::new(remote_registry_mount);
+        let _ = ns.mount("/srv/registry", registry_mount.clone());
+        // `/worktree` is an alias for `/srv/registry` — same backing mount,
+        // exposed under the short path for ergonomic worktree access. Both
+        // `/worktree/{repo}/{wt}` and `/srv/registry/{repo}/{wt}` resolve to
+        // the same worktree content.
+        let _ = ns.bind_mount(
+            "/worktree",
+            registry_mount,
+            hyprstream_vfs::BindFlag::After,
+        );
+
         // /bin/ — static directory entries for listing purposes.
         // Actual command execution goes through TclShell builtins via VFS proxy,
         // not through these nodes. These exist so `ls /bin` shows available commands.

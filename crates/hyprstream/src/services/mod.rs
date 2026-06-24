@@ -80,6 +80,7 @@ pub mod policy;
 pub mod registry;
 pub mod fs;
 pub mod remote_mount;
+pub mod remote_registry_mount;
 pub mod rpc_types;
 pub mod typed;
 pub mod worker;
