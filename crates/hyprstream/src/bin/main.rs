@@ -41,7 +41,7 @@ use hyprstream_core::cli::{
 use hyprstream_core::cli::commands::{PolicyCommand, RoleCommand, TokenCommand, UserCommand, UserKeysCommand};
 
 #[cfg(feature = "experimental")]
-use hyprstream_core::cli::{handle_commit, handle_merge, handle_push, MergeOptions};
+use hyprstream_core::cli::{handle_commit, handle_merge, handle_promote, handle_push, MergeOptions};
 use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
 
@@ -705,6 +705,29 @@ fn handle_quick_command(
                     allow_empty,
                     dry_run,
                     verbose,
+                )
+                .await
+            },
+        ),
+
+        #[cfg(feature = "experimental")]
+        QuickCommand::Promote {
+            model,
+            branch,
+            author_name,
+            author_email,
+        } => with_runtime(
+            RuntimeConfig {
+                device: DeviceConfig::request_cpu(),
+                multi_threaded: true,
+            },
+            || async move {
+                handle_promote(
+                    ctx.registry(),
+                    &model,
+                    &branch,
+                    author_name,
+                    author_email,
                 )
                 .await
             },

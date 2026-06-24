@@ -40,7 +40,7 @@ use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
 use hyprstream_rpc::Subject;
 
 use crate::services::generated::registry_client::{
-    NpClunk, NpOpen, NpRead, NpStatReq, NpWalk, NpWrite, RegistryClient, WorktreeClient,
+    NpClunk, NpCreate, NpOpen, NpRead, NpStatReq, NpWalk, NpWrite, RegistryClient, WorktreeClient,
 };
 use crate::services::types::QTDIR;
 
@@ -227,6 +227,63 @@ impl Mount for RemoteRegistryMount {
         state.opened = true;
 
         Ok(())
+    }
+
+    /// Create a file/dir under a walked *directory* fid, then open it.
+    ///
+    /// This is the writable-layer primitive that powers the union's copy-up
+    /// (#394). The registry service's `handle_create` consumes the directory
+    /// fid and replaces it with an opened fid on the new file, so on success we
+    /// flip `opened = true` locally and thread the new file's qid back as the
+    /// returned `Stat` (the union's copy-up caller uses it for logging only —
+    /// it does not key authz on it; see the qid-soundness invariant on
+    /// `hyprstream_vfs::Stat`).
+    async fn create(
+        &self,
+        fid: &mut Fid,
+        name: &str,
+        perm: u32,
+        mode: u8,
+        _caller: &Subject,
+    ) -> Result<Stat, MountError> {
+        let key = fid
+            .downcast_ref::<RemoteFidKey>()
+            .ok_or_else(|| MountError::InvalidArgument("bad fid type".into()))?;
+        let local_id = key.0;
+
+        let mut state = self
+            .fids
+            .get_mut(&local_id)
+            .ok_or_else(|| MountError::NotFound(format!("fid {} not found", local_id)))?;
+
+        let create_req = NpCreate {
+            fid: state.remote_fid,
+            name: name.to_owned(),
+            perm,
+            mode,
+        };
+
+        let result = self
+            .rt
+            .block_on(state.worktree.create(&create_req))
+            .map_err(Self::map_err)?;
+
+        // The directory fid has been replaced on the server with the opened new
+        // file. Mirror that transition locally so subsequent read/write/stat hit
+        // the new file rather than a stale directory handle.
+        state.qtype = result.qid.qtype;
+        state.opened = true;
+
+        Ok(Stat {
+            qtype: result.qid.qtype,
+            // Advisory identity hint only — see the qid-soundness invariant on
+            // `hyprstream_vfs::Stat`. Content-CID qid lands in #387.
+            version: result.qid.version,
+            path: result.qid.path,
+            size: 0,
+            name: name.to_owned(),
+            mtime: 0,
+        })
     }
 
     async fn read(
