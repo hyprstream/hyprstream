@@ -711,6 +711,33 @@ impl ModelFactory {
             scale_embeddings: config.scale_embeddings,
             layer_types: vec![],
             rope_local_base_freq: None,
+            // Preserve the *real* architecture so tokenizer-config dispatch (and
+            // any other architecture-keyed behavior) sees Qwen/Mistral rather
+            // than the Llama stand-in. Without this, a Qwen3 checkpoint loaded
+            // via create_qwen_model→create_llama_model reports `Llama`, the
+            // QwenTokenizerConfig (which pads the tokenizer vocab to the model's
+            // embedding size) is never applied, and the tokenizer/embedding vocab
+            // mismatch causes a CUDA index-out-of-bounds on the embedding lookup (#143).
+            model_architecture: match config.architecture {
+                super::model_config::ModelArchitecture::Qwen => {
+                    super::architectures::ModelArchitecture::Qwen {
+                        version: config.version as u8,
+                        is_moe: config.is_moe,
+                        context_length: config.max_position_embeddings,
+                    }
+                }
+                super::model_config::ModelArchitecture::Mistral => {
+                    super::architectures::ModelArchitecture::Mistral
+                }
+                super::model_config::ModelArchitecture::Gemma => {
+                    super::architectures::ModelArchitecture::Gemma
+                }
+                // Llama, Janus, Qwen3_5 (not routed through LlamaModel), and unknowns
+                // keep the Llama identity with the parsed version.
+                _ => super::architectures::ModelArchitecture::Llama {
+                    version: config.version as u8,
+                },
+            },
         };
 
         info!(
@@ -798,6 +825,7 @@ impl ModelFactory {
                 scale_embeddings: config.scale_embeddings,
                 layer_types: vec!["global".to_owned(); config.num_hidden_layers],
                 rope_local_base_freq: None,
+                model_architecture: super::architectures::ModelArchitecture::Llama { version: 3 },
             }),
             vision_config: VisionEncoderConfig {
                 encoder_type: VisionEncoderType::SigLIP {
