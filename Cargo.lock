@@ -6590,6 +6590,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyprstream-pds"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "p256",
+ "rand 0.8.5",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "hyprstream-rpc"
 version = "0.1.0"
 dependencies = [
