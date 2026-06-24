@@ -76,6 +76,17 @@ pub struct LoadedModel {
     /// Client for communicating with the InferenceService (built from
     /// `transport` via `dial()` — the co-located fast path).
     pub client: InferenceClient,
+    /// #322 leaf cell-router state for this model. Holds the session→owner
+    /// affinity map (heartbeat-lease renewal, KV-cache stickiness) and the
+    /// per-node load/health counters used by HRW placement. In v1 this is a
+    /// single co-located node (the router fast-paths to `client`); the
+    /// `load_state` set grows to multiple nodes when cross-host replicas are
+    /// resolved via the Resolver.
+    pub router: crate::services::router::CellRouter,
+    /// Replica-set snapshot for the router (one entry per known inference
+    /// server serving this model's OID). Updated as the Resolver yields new
+    /// reaches; consumed by HRW placement.
+    pub load_state: Vec<crate::services::router::InferenceServerInfo>,
     /// When the model was loaded
     pub loaded_at: Instant,
     /// When the model was last used
@@ -264,19 +275,44 @@ impl ModelService {
             .collect()
     }
 
-    /// Router seam (#320): single-select ONE InferenceService for a request from
-    /// a loaded model's reach. Today a model maps 1:1 to one InferenceService, so
-    /// this returns that service's client — preferring the co-located fast path
-    /// (the in-process `Inproc` client built at load time) when present, else it
-    /// would dial a networked (Iroh) reach. This is req/rep single-select: NO
-    /// load-balancing, NO fanout. The reach `List` is left as the seam for future
-    /// replica balancing (round-robin / least-loaded / GPU-affinity).
-    fn select_inference_server(model: &LoadedModel) -> InferenceClient {
-        // The co-located fast path: `model.client` was dialed from the resolved
-        // transport at load time (the `Inproc` arm locally, or a networked Iroh
-        // reach for a remote service). When a model gains multiple network
-        // replicas, this is where ONE reach is single-selected and dialed.
-        //
+    /// Router seam (#322 leaf cell-router over the #320 single-select base):
+    /// pick ONE InferenceService for a request from a loaded model's replica
+    /// set, applying capacity-weighted HRW + session affinity.
+    ///
+    /// Today a model still maps 1:1 to one co-located InferenceService, so the
+    /// router's `load_state` has a single entry and HRW trivially picks it; the
+    /// fast path returns the in-process `model.client` directly (no dial). When
+    /// the replica set grows (cross-host reaches resolved via the Resolver per
+    /// the federated-model-addressing spike), this is where HRW single-selects a
+    /// networked (Iroh) reach and dials it. The router body operates on the
+    /// resolved replica set; OID/reach resolution is the entry's job.
+    ///
+    /// `session_id` is the placement key (defaults to "default" when the caller
+    /// has no session — keeps HRW stable for non-session-scoped requests like
+    /// `apply_chat_template`).
+    fn select_inference_server(
+        model: &mut LoadedModel,
+        session_id: &str,
+    ) -> InferenceClient {
+        let now = Instant::now();
+        if let Some(placement) = model.router.place(session_id, &model.load_state, now) {
+            // In v1 the co-located node is always in the replica set (seeded at
+            // load). If HRW picks it, use the in-process fast path — no dial.
+            if placement.node_id == Self::co_located_node_id(model) {
+                return model.client.clone();
+            }
+            // Networked selection: a future branch dials the chosen Iroh reach
+            // (after the #319/#328 mesh-authz gate). Not wired in v1 — fall back
+            // to the co-located client so requests still succeed while the
+            // federation entry is being built. See the AUTHZ SEAM note below.
+            debug!(
+                "router placed session {session_id} on remote node {:?} but no \
+                 networked dial path is wired yet — using co-located fallback",
+                placement.node_id
+            );
+        }
+        model.client.clone()
+
         // AUTHZ SEAM (#319/#328 mesh policy) — GAP, intentionally not wired here:
         // a co-located `Inproc` selection is an in-process call within the same
         // trust domain, so no mesh policy fires. When this seam grows a branch
@@ -289,9 +325,21 @@ impl ModelService {
         // enforcement call belongs on that future networked branch, not on the
         // co-located fast path. (Per-host identity:
         // `hyprstream_rpc::node_identity::mesh_host_subject`.) Cross-host
-        // inference spawn/discovery is deferred to #282, so no networked
-        // selection happens in #320 yet.
-        model.client.clone()
+        // inference spawn/discovery is deferred to #282.
+    }
+
+    /// Identity of the co-located InferenceService = our own Ed25519 verifying
+    /// key. Used by [`Self::select_inference_server`] to recognise the HRW
+    /// winner as the in-process fast path.
+    fn co_located_node_id(model: &LoadedModel) -> crate::services::router::NodeId {
+        // `load_state[0]` is the co-located entry (seeded first at load). All
+        // entries share the model's signing identity in v1; in a multi-replica
+        // future each entry carries its own node_id.
+        model
+            .load_state
+            .first()
+            .map(|info| info.node_id)
+            .unwrap_or([0u8; 32])
     }
 
     /// Resolve a model identifier string to a [`ModelRef`].
@@ -461,9 +509,22 @@ impl ModelService {
                 model_ref_str.to_owned(),
                 LoadedModel {
                     model_ref: model_ref_str.to_owned(),
-                    transport,
+                    transport: transport.clone(),
                     service_handle,
                     client,
+                    // #322 leaf cell-router. v1: single co-located replica (the
+                    // service's own verifying key as the node identity). The
+                    // router fast-paths to `client` when HRW picks the
+                    // co-located node; the replica set grows when cross-host
+                    // reaches are resolved via the Resolver.
+                    router: crate::services::router::CellRouter::default(),
+                    load_state: vec![crate::services::router::InferenceServerInfo {
+                        node_id: self.signing_key.verifying_key().to_bytes(),
+                        transport: transport.clone(),
+                        gpu_memory_free: 0,
+                        active_sessions: 0,
+                        last_heartbeat: Instant::now(),
+                    }],
                     loaded_at: Instant::now(),
                     last_used: Instant::now(),
                     ttt_config,
@@ -614,8 +675,14 @@ impl ModelService {
             .get_mut(model_ref_str)
             .ok_or_else(|| anyhow!("Model {} not found after loading", model_ref_str))?;
         model.last_used = Instant::now();
-        // Router seam (#320): single-select one InferenceService for this request.
-        let client = Self::select_inference_server(model);
+        // #322 placement key. The envelope does not yet carry an explicit
+        // session_id; use the authenticated subject as a stable per-caller key
+        // (keeps HRW affinity effective for repeat requests from the same
+        // caller). When a real session_id is plumbed through `EnvelopeContext`,
+        // swap it in here — the router body is session_id-keyed, not
+        // subject-keyed, by design.
+        let placement_key = ctx.subject().to_string();
+        let client = Self::select_inference_server(model, &placement_key);
         // TODO: Forward user JWT to worker via per-call builder (delegated_bearer or
         // request().jwt(token).call(payload)) once inference methods support CallOptions.
         // The previous with_jwt() call was mutating shared state — unsafe with pooling.
