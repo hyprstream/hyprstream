@@ -7,6 +7,10 @@
 //! - `training checkpoint` - Commit dirty adapter changes
 // CLI handlers intentionally print to stdout/stderr for user interaction
 #![allow(clippy::print_stdout, clippy::print_stderr)]
+// TODO(#395): migrate `model_ref.model` reads to `model_ref.name()` as part of the
+// name-layer retirement. Suppressed here so this prep PR stays focused on the CID
+// encoder + grammar; the deprecation is enforced at the ModelRef type definition.
+#![allow(deprecated)]
 
 use anyhow::{bail, Result};
 use tracing::{info, warn};

@@ -168,6 +168,47 @@ impl std::ops::Deref for ModelService {
     fn deref(&self) -> &Self::Target { &self.inner }
 }
 
+/// Prefix-dispatch arm for the `modelRef` grammar (#395).
+///
+/// `modelRef :Text` stays `Text` in the capnp schema; the Rust-side grammar is:
+///
+/// ```text
+/// modelRef ::= "at://" <at-uri>   # federated (resolve via atproto NAME → git OID)
+///            | "did:" <did>       # federated, bare-DID form
+///            | <name> [":" <gitref>]  # local ModelRef (unchanged, backward-compatible)
+/// ```
+///
+/// `at://` and `did:` are federated; everything else is the legacy local
+/// [`ModelRef::parse`] path. This enum is split out from
+/// [`ModelService::resolve_model_ref`] so the grammar is unit-testable without
+/// constructing a full [`ModelService`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelRefDispatch<'a> {
+    /// `at://…` or `did:…` — federated resolution (atproto record store, #392).
+    Federated {
+        /// The matched scheme prefix (`"at://"` or `"did:"`).
+        scheme: &'static str,
+        /// The ModelRef string with the scheme prefix stripped.
+        rest: &'a str,
+    },
+    /// No federated prefix — fall through to the local [`ModelRef::parse`].
+    Local,
+}
+
+/// Classify a `modelRef` string into its grammar arm (#395 prefix dispatch).
+///
+/// This is the pure prefix-detection core of [`ModelService::resolve_model_ref`];
+/// it performs no I/O and no validation, so it can be unit-tested in isolation.
+pub fn model_ref_dispatch(s: &str) -> ModelRefDispatch<'_> {
+    if let Some(rest) = s.strip_prefix("at://") {
+        ModelRefDispatch::Federated { scheme: "at://", rest }
+    } else if let Some(rest) = s.strip_prefix("did:") {
+        ModelRefDispatch::Federated { scheme: "did:", rest }
+    } else {
+        ModelRefDispatch::Local
+    }
+}
+
 impl ModelService {
     /// Create a new model service with infrastructure
     pub async fn new(
@@ -344,10 +385,43 @@ impl ModelService {
 
     /// Resolve a model identifier string to a [`ModelRef`].
     ///
-    /// Accepts a registry name / HF repo id (e.g. `Qwen3-0.6B`, optionally
-    /// `name:ref`).
+    /// Accepts three prefixes (#395 prefix-dispatch grammar, no capnp/wire change
+    /// — `modelRef` stays `Text` in the schema):
+    ///
+    /// ```text
+    /// modelRef ::= "at://" <at-uri>   # federated (resolve via atproto NAME → git OID)
+    ///            | "did:" <did>       # federated, bare-DID form
+    ///            | <name> [":" <gitref>]  # local ModelRef (unchanged)
+    /// ```
+    ///
+    /// The federated branch (`at://`, `did:`) is resolved via the atproto record
+    /// store from #392 (PDS record → git OID). Until that store is wired up the
+    /// federated branch logs the attempt and falls through to the local
+    /// [`ModelRef::parse`], preserving backward compatibility — every existing
+    /// `name:ref` caller keeps working unchanged.
+    ///
+    /// Local ModelRefs (no `at://` / `did:` prefix) are parsed by
+    /// [`ModelRef::parse`] exactly as before.
     async fn resolve_model_ref(&self, model_ref_str: &str) -> Result<ModelRef> {
-        ModelRef::parse(model_ref_str)
+        match model_ref_dispatch(model_ref_str) {
+            ModelRefDispatch::Federated { scheme, rest } => {
+                // Federated resolution (#392 PDS record store): at:// → DID → record
+                // → git OID → local ModelRef. The record store is not yet wired up,
+                // so log the federated attempt and fall through to the local parser.
+                // Once #392 lands this branch returns early with the resolved OID.
+                warn!(
+                    scheme,
+                    target = %rest,
+                    "federated ModelRef resolution not yet implemented (#392); falling through to local ModelRef::parse"
+                );
+                // Fall through: attempt local parse so existing callers see the same
+                // error they would have pre-#395 (most at:// / did: strings fail
+                // ModelRef::parse validation, which is the correct "not yet supported"
+                // signal until #392 lands).
+                ModelRef::parse(model_ref_str)
+            }
+            ModelRefDispatch::Local => ModelRef::parse(model_ref_str),
+        }
     }
 
     /// Load a model by reference with optional per-model config, returns the inference endpoint
@@ -392,8 +466,8 @@ impl ModelService {
         let model_ref = self.resolve_model_ref(model_ref_str).await?;
 
         // Get model path from registry
-        let tracked = self.registry.get_by_name(&model_ref.model).await
-            .map_err(|e| anyhow!("Model '{}' not found in registry: {}", model_ref.model, e))?;
+        let tracked = self.registry.get_by_name(model_ref.name()).await
+            .map_err(|e| anyhow!("Model '{}' not found in registry: {}", model_ref.name(), e))?;
         let repo_client = self.registry.repo(&tracked.id);
 
         let branch_name = match &model_ref.git_ref {
@@ -402,11 +476,11 @@ impl ModelService {
         };
         let worktrees = repo_client.list_worktrees().await?;
         if !worktrees.iter().any(|wt| wt.branch_name == branch_name) {
-            return Err(anyhow!("worktree for {}:{} not found", model_ref.model, branch_name));
+            return Err(anyhow!("worktree for {}:{} not found", model_ref.name(), branch_name));
         }
         // Derive worktree path locally
         let storage_paths = crate::storage::StoragePaths::new()?;
-        let model_path = storage_paths.worktree_path(&model_ref.model, &branch_name)?;
+        let model_path = storage_paths.worktree_path(model_ref.name(), &branch_name)?;
 
         if !model_path.exists() {
             return Err(anyhow!(
@@ -863,8 +937,8 @@ impl TttHandler for ModelService {
     ) -> Result<()> {
         // 1. Parse/resolve model ref and resolve worktree path
         let parsed = self.resolve_model_ref(model_ref).await?;
-        let tracked = self.registry.get_by_name(&parsed.model).await
-            .map_err(|e| anyhow!("Model '{}' not found in registry: {}", parsed.model, e))?;
+        let tracked = self.registry.get_by_name(parsed.name()).await
+            .map_err(|e| anyhow!("Model '{}' not found in registry: {}", parsed.name(), e))?;
         let repo_client = self.registry.repo(&tracked.id);
 
         let branch_name = match &parsed.git_ref {
@@ -873,7 +947,7 @@ impl TttHandler for ModelService {
         };
 
         let storage_paths = crate::storage::StoragePaths::new()?;
-        let model_path = storage_paths.worktree_path(&parsed.model, &branch_name)?;
+        let model_path = storage_paths.worktree_path(parsed.name(), &branch_name)?;
 
         if !model_path.exists() {
             return Err(anyhow!("Model worktree not found for {}", model_ref));
@@ -963,8 +1037,8 @@ impl AdapterHandler for ModelService {
     ) -> Result<AdapterInfo> {
         // Resolve model_ref to a worktree client (does NOT require model loaded in memory)
         let parsed = self.resolve_model_ref(model_ref).await?;
-        let tracked = self.registry.get_by_name(&parsed.model).await
-            .map_err(|e| anyhow!("Model '{}' not found in registry: {}", parsed.model, e))?;
+        let tracked = self.registry.get_by_name(parsed.name()).await
+            .map_err(|e| anyhow!("Model '{}' not found in registry: {}", parsed.name(), e))?;
         let repo_client = self.registry.repo(&tracked.id);
         let branch_name = match &parsed.git_ref {
             crate::storage::GitRef::Branch(name) => name.clone(),
@@ -1566,6 +1640,81 @@ mod tests {
         match &reach[0] {
             WireTransportConfig::Iroh(i) => assert_eq!(i.node_id, node_id),
             other => panic!("expected wire Iroh reach, got {other:?}"),
+        }
+    }
+
+    // ---- #395 ModelRef prefix-dispatch grammar ----
+
+    #[test]
+    fn model_ref_dispatch_at_uri_is_federated() {
+        // at:// → federated arm, scheme captured, prefix stripped from `rest`.
+        assert_eq!(
+            model_ref_dispatch("at://did:plc:x123/hyprstream.models/qwen3/v1"),
+            ModelRefDispatch::Federated {
+                scheme: "at://",
+                rest: "did:plc:x123/hyprstream.models/qwen3/v1",
+            }
+        );
+    }
+
+    #[test]
+    fn model_ref_dispatch_bare_did_is_federated() {
+        // did: → federated arm (bare-DID form). Note `did:` (no `//`) is matched
+        // literally, and `at://` is NOT — `did:plc:...` must not be confused with
+        // an at-uri.
+        assert_eq!(
+            model_ref_dispatch("did:plc:abcdef"),
+            ModelRefDispatch::Federated {
+                scheme: "did:",
+                rest: "plc:abcdef",
+            }
+        );
+        // did:web variant too.
+        assert_eq!(
+            model_ref_dispatch("did:web:hyprstream.example.com"),
+            ModelRefDispatch::Federated {
+                scheme: "did:",
+                rest: "web:hyprstream.example.com",
+            }
+        );
+    }
+
+    #[test]
+    fn model_ref_dispatch_local_name_is_local() {
+        // Bare name, no federated prefix → local ModelRef arm.
+        assert_eq!(model_ref_dispatch("qwen3"), ModelRefDispatch::Local);
+        // name:ref — still local (the colon does not make it federated).
+        assert_eq!(model_ref_dispatch("qwen3:main"), ModelRefDispatch::Local);
+        assert_eq!(
+            model_ref_dispatch("Qwen3-0.6B:tags/v1.0"),
+            ModelRefDispatch::Local
+        );
+        // HuggingFace-style repo id (slash, no colon).
+        assert_eq!(
+            model_ref_dispatch("org/model-name"),
+            ModelRefDispatch::Local
+        );
+    }
+
+    #[test]
+    fn model_ref_dispatch_uuid_is_local() {
+        // UUID (backwards-compat) has no federated prefix → local arm.
+        assert_eq!(
+            model_ref_dispatch("550e8400-e29b-41d4-a716-446655440000"),
+            ModelRefDispatch::Local
+        );
+    }
+
+    #[test]
+    fn model_ref_dispatch_local_arms_parse_unchanged() {
+        // Every `Local` dispatch must parse via ModelRef::parse exactly as it did
+        // pre-#395 — backward compatibility contract.
+        for s in &["qwen3", "qwen3:main", "Qwen3-0.6B:tags/v1.0"] {
+            assert_eq!(model_ref_dispatch(s), ModelRefDispatch::Local);
+            assert!(
+                ModelRef::parse(s).is_ok(),
+                "local ModelRef '{s}' must still parse after #395"
+            );
         }
     }
 }
