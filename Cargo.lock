@@ -6594,9 +6594,16 @@ name = "hyprstream-pds"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "git2",
+ "git2db",
+ "hyprstream-rpc",
  "p256",
  "rand 0.8.5",
  "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tokio-test",
+ "tracing-subscriber",
 ]
 
 [[package]]
