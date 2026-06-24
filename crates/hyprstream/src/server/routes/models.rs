@@ -16,7 +16,7 @@ async fn resolve_model_path(
     registry: &crate::services::RegistryClient,
     model_ref: &crate::storage::ModelRef,
 ) -> anyhow::Result<String> {
-    let tracked = registry.get_by_name(&model_ref.model).await?;
+    let tracked = registry.get_by_name(model_ref.name()).await?;
     let repo = registry.repo(&tracked.id);
     let branch = match &model_ref.git_ref {
         crate::storage::GitRef::Branch(name) => name.clone(),
@@ -25,11 +25,11 @@ async fn resolve_model_path(
     // Verify worktree exists
     let wts = repo.list_worktrees().await?;
     if !wts.iter().any(|wt| wt.branch_name == branch) {
-        anyhow::bail!("worktree for {}:{} not found", model_ref.model, branch);
+        anyhow::bail!("worktree for {}:{} not found", model_ref.name(), branch);
     }
     // Derive path locally
     let storage_paths = StoragePaths::new()?;
-    Ok(storage_paths.worktree_path(&model_ref.model, &branch)?
+    Ok(storage_paths.worktree_path(model_ref.name(), &branch)?
         .to_string_lossy().to_string())
 }
 
@@ -167,7 +167,7 @@ async fn get_model_info(
         if let Ok(_path) = path_result {
             // Create metadata for the found model
             let metadata = crate::storage::ModelMetadata {
-                name: model_ref.model.clone(),
+                name: model_ref.name().to_owned(),
                 display_name: Some(id.clone()),
                 model_type: "language_model".to_owned(),
                 created_at: chrono::Utc::now().timestamp(),

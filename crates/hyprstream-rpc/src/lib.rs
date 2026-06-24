@@ -114,6 +114,7 @@ pub mod streaming_types {
 }
 
 pub mod capnp;
+pub mod cid;
 pub mod crypto;
 pub mod envelope;
 pub mod error;

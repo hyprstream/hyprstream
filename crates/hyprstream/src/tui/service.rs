@@ -1416,7 +1416,7 @@ impl TuiService {
                         _ => "main".to_owned(),
                     };
                     crate::storage::StoragePaths::new().ok()
-                        .and_then(|sp| sp.worktree_path(&mr.model, &branch).ok())
+                        .and_then(|sp| sp.worktree_path(mr.name(), &branch).ok())
                 })
                 .map(|path| {
                     let arch = crate::runtime::model_config::ModelConfig::detect_architecture(&path);
