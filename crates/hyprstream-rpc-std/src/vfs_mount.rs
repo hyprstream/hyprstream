@@ -516,60 +516,28 @@ pub fn build_browser_namespace(
 }
 
 // ============================================================================
-// WanixMount wiring — #409 Path B (Wanix-native VFS access)
+// WanixMount wiring — #409/#391 (Wanix-native VFS access)
 // ============================================================================
 
-/// Wire [`hyprstream_9p::wanix_mount::WanixMount`] into an existing browser
-/// namespace at `/wanix`.
+/// Mount the Wanix 9P filesystem into the namespace at `/wanix` (#409/#391).
 ///
-/// # Why a separate helper, not a `build_browser_namespace` parameter
+/// `client` is a `P9Client` already connected over a `P9Transport` (e.g. the
+/// `DmaTransport` SharedArrayBuffer bridge). Every VFS op under `/wanix` is
+/// translated to 9P2000.L and forwarded — the Wanix half of the "browser
+/// both-paths" model, riding the same wasm transport substrate as the service
+/// mounts above.
 ///
-/// `build_browser_namespace` is synchronous; constructing a `WanixMount`
-/// requires the 9P2000.L version + attach handshake ([`P9Client::connect`]),
-/// which is async because the DMA transport round-trips to the Wanix Go host
-/// over the SharedArrayBuffer. Rather than force the whole namespace builder
-/// to be async for an optional path, the caller invokes this helper after
-/// `build_browser_namespace` when it actually has a Wanix SAB.
-///
-/// # Arguments
-///
-/// * `ns` — The namespace to mount into (must be behind a `RefCell`/`Mutex` if
-///   shared, since this mutates it).
-/// * `sab` — The `SharedArrayBuffer` shared with the Wanix host's DMA ring.
-///   Layout is documented in `hyprstream_9p::dma` (control region + two ring
-///   buffers); the Wanix host allocates and hands this to the browser.
-/// * `uname`, `aname` — 9P attach credentials / root aname. Pass `"root"`
-///   / `"/"` for the Wanix root tree.
-///
-/// # Errors
-///
-/// Returns an error if the 9P handshake (version/attach) fails — typically
-/// because the Wanix host isn't responding on the DMA ring or speaks an
-/// incompatible 9P variant.
-///
-/// # Coexistence
-///
-/// `/wanix` coexists with the RPC-client-backed paths (`/srv/registry`,
-/// `/srv/model`, `/stream`, etc.). The two access styles serve different
-/// needs: `/wanix` exposes the Wanix-native filesystem (real `walk`/`stat`
-/// qids over DMA), while `/srv/*` exposes hyprstream services via
-/// `GenericServiceMount` (ctl-style service-as-files over WebTransport RPC).
-pub async fn mount_wanix(
+/// This is the rpc-std seam that makes `WanixMount` reachable from the browser
+/// namespace now that `hyprstream-9p` is a wasm32 dependency.
+pub fn mount_wanix<T>(
     ns: &mut hyprstream_vfs::Namespace,
-    sab: &js_sys::SharedArrayBuffer,
-    uname: &str,
-    aname: &str,
-) -> anyhow::Result<()> {
-    use hyprstream_9p::client::P9Client;
-    use hyprstream_9p::dma::DmaTransport;
-    use hyprstream_9p::wanix_mount::WanixMount;
-
-    // `client_endpoint = true`: we write T-messages to chan0, read R-messages
-    // from chan1 (the Wanix Go host has the reverse assignment).
-    let transport = DmaTransport::new(sab, true);
-    let client = P9Client::connect(transport, uname, aname).await?;
-    let mount: hyprstream_vfs::MountTarget = Arc::new(WanixMount::new(client));
-    ns.mount("/wanix", mount)
-        .map_err(|e| anyhow::anyhow!("mount /wanix failed: {e}"))?;
-    Ok(())
+    client: hyprstream_9p::client::P9Client<T>,
+) -> Result<(), hyprstream_vfs::NamespaceError>
+where
+    T: hyprstream_9p::client::P9Transport + 'static,
+{
+    ns.mount(
+        "/wanix",
+        Arc::new(hyprstream_9p::wanix_mount::WanixMount::new(client)),
+    )
 }
