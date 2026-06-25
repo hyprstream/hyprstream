@@ -28,8 +28,8 @@
 // `Role` / `TransportConfig` / `QuicReach` types — is also code-generated here
 // from `streaming.capnp` (native capnp, no JSON-in-Text on the wire).
 pub use crate::streaming_types::{
-    Completion, Delivery, Ordering, OverflowPolicy, QuicReach, Destination, Retention, Role,
-    StreamInfo, StreamOpt, TransportConfig,
+    Completion, Delivery, IrohReach, Ordering, OverflowPolicy, QuicReach, Destination, Retention,
+    Role, StreamInfo, StreamOpt, TransportConfig,
 };
 
 /// Marker trait for typed stream QoS presets.

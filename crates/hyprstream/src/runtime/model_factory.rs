@@ -7,13 +7,66 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::Path;
 use tch::{Device, Kind as DType, Tensor};
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 use super::architectures::{gemma::GemmaModel, llama::LlamaModel, ModelOperations};
+use super::device_pool::DevicePool;
 use super::KVQuantType;
 use super::model_config::{ModelArchitecture, ModelConfig};
 use super::torch_utils::{safe_to_device, estimate_tensor_size_mb};
 use crate::services::WorktreeClient;
+
+/// Strict-loader opt-in (#315): when set truthy, multi-shard models that lack a
+/// `model.safetensors.index.json` manifest are rejected instead of silently
+/// reconstructing the shard set from a filename glob (which is fragile across
+/// model families and can silently drop/duplicate shards).
+const STRICT_LOADER_ENV: &str = "HYPRSTREAM_STRICT_LOADER";
+
+fn strict_loader_enabled() -> bool {
+    std::env::var(STRICT_LOADER_ENV)
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// Glob-fallback shard discovery, shared by the sync/async loader paths.
+///
+/// Loud by design (#315): a multi-shard model reached via glob (no index.json) is
+/// a silent-degrade path — it warns, and under [`STRICT_LOADER_ENV`] it is a hard
+/// error. A single globbed shard is unambiguous and passes quietly.
+fn glob_shard_files(model_path: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let mut shard_files = Vec::new();
+    for entry in std::fs::read_dir(model_path)? {
+        let entry = entry?;
+        if let Some(name) = entry.file_name().to_str() {
+            if (name.starts_with("model-") || name.starts_with("model.safetensors-"))
+                && name.ends_with(".safetensors")
+            {
+                shard_files.push(entry.path());
+            }
+        }
+    }
+    shard_files.sort();
+
+    if shard_files.len() > 1 {
+        if strict_loader_enabled() {
+            return Err(anyhow!(
+                "{} multi-shard safetensors files found in {} but no \
+                 model.safetensors.index.json manifest; refusing to reconstruct the \
+                 shard set from a filename glob under {STRICT_LOADER_ENV}. \
+                 Provide the index.json manifest.",
+                shard_files.len(),
+                model_path.display()
+            ));
+        }
+        warn!(
+            "⚠️ No model.safetensors.index.json in {}; reconstructing {} shards from a \
+             filename glob (fragile). Set {STRICT_LOADER_ENV}=1 to require the manifest.",
+            model_path.display(),
+            shard_files.len()
+        );
+    }
+    Ok(shard_files)
+}
 
 /// Factory for creating models with proper configuration management
 pub struct ModelFactory;
@@ -82,13 +135,26 @@ impl ModelFactory {
 
     /// Create a model from a directory containing weights and optionally config.json
     /// This is the ONLY way models should be created to ensure consistency
-    #[instrument(name = "model_factory.create", skip(device, dtype), fields(model_path = %model_path.display()))]
+    ///
+    /// # Multi-device pipeline (#314 wiring, #310 epic)
+    ///
+    /// Pass `device_pool = Some(pool)` with a pool of >1 device to build the model
+    /// as a single multi-device pipeline stage: decoder layers are spread across
+    /// the pool's devices via [`LayerDeviceMap::even_split`], and the model's
+    /// `forward_layers` performs the lone cross-device copy at each stage boundary.
+    /// `device` must be the pool's primary (first) device — non-layer weights
+    /// (embeddings, final norm, lm_head) live there. When `device_pool` is `None`
+    /// or holds a single device, construction is unchanged (whole model on
+    /// `device`). At runtime this depends on #405 (from_weights device-placement
+    /// fix) to actually place per-layer tensors on non-primary devices.
+    #[instrument(name = "model_factory.create", skip(device, dtype, device_pool), fields(model_path = %model_path.display()))]
     pub async fn create(
         model_path: &Path,
         device: &Device,
         dtype: DType,
         max_context: Option<usize>,
         kv_quant_type: KVQuantType,
+        device_pool: Option<&DevicePool>,
     ) -> Result<Box<dyn ModelOperations>> {
         info!("Loading model: {}", model_path.display());
         if let Some(mc) = max_context {
@@ -96,6 +162,17 @@ impl ModelFactory {
         }
         if kv_quant_type != KVQuantType::None {
             info!("Using KV cache quantization: {:?}", kv_quant_type);
+        }
+        if let Some(pool) = device_pool {
+            if !pool.is_single() {
+                info!(
+                    "🔀 Multi-device pipeline: spreading layers across {} device(s) {:?} \
+                     (primary {:?}); depends on #405 for correct per-layer placement",
+                    pool.len(),
+                    pool.devices(),
+                    pool.primary(),
+                );
+            }
         }
 
         // Check if we have sharded files that need incremental loading
@@ -107,12 +184,12 @@ impl ModelFactory {
                 "📦 Using incremental loading for {} shards",
                 shard_files.len()
             );
-            Self::create_incremental(model_path, device, dtype, shard_files, max_context, kv_quant_type).await
+            Self::create_incremental(model_path, device, dtype, shard_files, max_context, kv_quant_type, device_pool).await
         } else {
             // Standard loading for single files or small models
             let weights = Self::load_weights(model_path, device, dtype).await?;
             let config = ModelConfig::load(model_path, &weights)?;
-            let model = Self::create_model_from_config(config, weights, device, dtype, max_context, kv_quant_type, model_path)?;
+            let model = Self::create_model_from_config(config, weights, device, dtype, max_context, kv_quant_type, model_path, device_pool)?;
             info!("✅ ModelFactory: Model created successfully");
             Ok(model)
         }
@@ -135,20 +212,8 @@ impl ModelFactory {
             return Ok(vec![single_file]);
         }
 
-        // 3. Fallback: glob for known shard naming patterns
-        let mut shard_files = Vec::new();
-        for entry in std::fs::read_dir(model_path)? {
-            let entry = entry?;
-            if let Some(name) = entry.file_name().to_str() {
-                if (name.starts_with("model-") || name.starts_with("model.safetensors-"))
-                    && name.ends_with(".safetensors")
-                {
-                    shard_files.push(entry.path());
-                }
-            }
-        }
-        shard_files.sort();
-        Ok(shard_files)
+        // 3. Fallback: glob for known shard naming patterns (loud / strict-gated)
+        glob_shard_files(model_path)
     }
 
     /// Parse shard filenames from `model.safetensors.index.json`.
@@ -185,7 +250,7 @@ impl ModelFactory {
     }
 
     /// Create model using incremental loading for large sharded models
-    #[instrument(name = "model_factory.create_incremental", skip(device, dtype, shard_files), fields(shard_count = shard_files.len()))]
+    #[instrument(name = "model_factory.create_incremental", skip(device, dtype, shard_files, device_pool), fields(shard_count = shard_files.len()))]
     async fn create_incremental(
         model_path: &Path,
         device: &Device,
@@ -193,6 +258,7 @@ impl ModelFactory {
         shard_files: Vec<std::path::PathBuf>,
         max_context: Option<usize>,
         kv_quant_type: KVQuantType,
+        device_pool: Option<&DevicePool>,
     ) -> Result<Box<dyn ModelOperations>> {
         // For now, we still need to load all weights, but we do it more efficiently
         // by processing shards sequentially and immediately transferring to GPU
@@ -215,7 +281,7 @@ impl ModelFactory {
 
         // Load config and create model
         let config = ModelConfig::load(model_path, &all_weights)?;
-        let model = Self::create_model_from_config(config, all_weights, device, dtype, max_context, kv_quant_type, model_path)?;
+        let model = Self::create_model_from_config(config, all_weights, device, dtype, max_context, kv_quant_type, model_path, device_pool)?;
 
         info!("Model loaded");
         Ok(model)
@@ -245,20 +311,8 @@ impl ModelFactory {
                 if index_path.exists() {
                     return Self::shard_files_from_index(&model_path_buf, &index_path);
                 }
-                // Fallback glob
-                let mut files = Vec::new();
-                for entry in std::fs::read_dir(&model_path_buf)? {
-                    let entry = entry?;
-                    if let Some(name) = entry.file_name().to_str() {
-                        if (name.starts_with("model-") || name.starts_with("model.safetensors-"))
-                            && name.ends_with(".safetensors")
-                        {
-                            files.push(entry.path());
-                        }
-                    }
-                }
-                files.sort();
-                Ok(files)
+                // Fallback glob (loud / strict-gated)
+                glob_shard_files(&model_path_buf)
             })
             .await??;
 
@@ -285,10 +339,16 @@ impl ModelFactory {
         device: &Device,
         dtype: DType,
     ) -> Result<()> {
-        // Check if mmap is enabled via environment variable
+        // Check if mmap is enabled via environment variable.
+        //
+        // #315 note: mmap is an opt-in *optimization* selected solely by this env
+        // var (it is independent of `RuntimeConfig.mmap`, which today gates nothing
+        // here). It is not a correctness fallback — both paths deserialize the same
+        // tensors — so it is left as-is, but logged so the chosen path is explicit.
         let use_mmap = std::env::var("HYPRSTREAM_USE_MMAP")
             .map(|v| v.to_lowercase() == "true" || v == "1")
             .unwrap_or(false);
+        debug!("safetensors load path: {}", if use_mmap { "mmap" } else { "read" });
 
         // Load file data in a blocking task to avoid blocking the async runtime
         let path_buf = path.to_path_buf();
@@ -601,6 +661,7 @@ impl ModelFactory {
         max_context: Option<usize>,
         kv_quant_type: KVQuantType,
         model_path: &Path,
+        device_pool: Option<&DevicePool>,
     ) -> Result<Box<dyn ModelOperations>> {
         // Run TTN analysis: Tier 1 (embedded) → Tier 2 (cached) → Tier 3 (weight entropy SVD).
         // Weights are available here, enabling Tier 3 for unknown models.
@@ -610,14 +671,20 @@ impl ModelFactory {
             tracing::warn!("TTN profile analysis failed (non-fatal): {e}");
         }
 
+        // Multi-device is only wired for Llama-family architectures today (the
+        // only family with a `stage_from_weights_with_config` that honors a
+        // `LayerDeviceMap`). Other architectures log and fall back to the
+        // single-device path on the primary device.
+        let wants_multi = device_pool.is_some_and(|p| !p.is_single());
+
         match config.architecture {
             ModelArchitecture::Llama => {
                 info!("Creating Llama model");
-                Self::create_llama_model(config, weights, device, dtype, max_context, kv_quant_type)
+                Self::create_llama_model(config, weights, device, dtype, max_context, kv_quant_type, device_pool)
             }
             ModelArchitecture::Qwen => {
                 info!("Creating Qwen model");
-                Self::create_qwen_model(config, weights, device, dtype, max_context, kv_quant_type)
+                Self::create_qwen_model(config, weights, device, dtype, max_context, kv_quant_type, device_pool)
             }
             ModelArchitecture::Gemma => {
                 info!("Creating Gemma model");
@@ -626,7 +693,7 @@ impl ModelFactory {
             ModelArchitecture::Mistral => {
                 info!("Creating Mistral model");
                 // For now, Mistral uses Llama architecture
-                Self::create_llama_model(config, weights, device, dtype, max_context, kv_quant_type)
+                Self::create_llama_model(config, weights, device, dtype, max_context, kv_quant_type, device_pool)
             }
             ModelArchitecture::Janus => {
                 info!("Creating Janus multimodal model");
@@ -634,6 +701,13 @@ impl ModelFactory {
             }
             ModelArchitecture::Qwen3_5 => {
                 info!("Creating Qwen3.5 hybrid SSM/attention model");
+                if wants_multi {
+                    warn!(
+                        "Multi-device requested for Qwen3.5, which does not yet implement the \
+                         layer-split path; building single-device on {:?}",
+                        device
+                    );
+                }
                 Self::create_qwen3_5_model(config, weights, device, dtype, max_context, kv_quant_type)
             }
             ModelArchitecture::Unknown(arch) => Err(anyhow!("Unknown architecture: {}", arch)),
@@ -647,8 +721,10 @@ impl ModelFactory {
         dtype: DType,
         max_context: Option<usize>,
         kv_quant_type: KVQuantType,
+        device_pool: Option<&DevicePool>,
     ) -> Result<Box<dyn ModelOperations>> {
         use super::architectures::llama::LlamaConfig;
+        use super::device_pool::LayerDeviceMap;
 
         // Apply max_context override if specified
         let effective_max_pos = max_context.unwrap_or(config.max_position_embeddings);
@@ -677,6 +753,33 @@ impl ModelFactory {
             scale_embeddings: config.scale_embeddings,
             layer_types: vec![],
             rope_local_base_freq: None,
+            // Preserve the *real* architecture so tokenizer-config dispatch (and
+            // any other architecture-keyed behavior) sees Qwen/Mistral rather
+            // than the Llama stand-in. Without this, a Qwen3 checkpoint loaded
+            // via create_qwen_model→create_llama_model reports `Llama`, the
+            // QwenTokenizerConfig (which pads the tokenizer vocab to the model's
+            // embedding size) is never applied, and the tokenizer/embedding vocab
+            // mismatch causes a CUDA index-out-of-bounds on the embedding lookup (#143).
+            model_architecture: match config.architecture {
+                super::model_config::ModelArchitecture::Qwen => {
+                    super::architectures::ModelArchitecture::Qwen {
+                        version: config.version as u8,
+                        is_moe: config.is_moe,
+                        context_length: config.max_position_embeddings,
+                    }
+                }
+                super::model_config::ModelArchitecture::Mistral => {
+                    super::architectures::ModelArchitecture::Mistral
+                }
+                super::model_config::ModelArchitecture::Gemma => {
+                    super::architectures::ModelArchitecture::Gemma
+                }
+                // Llama, Janus, Qwen3_5 (not routed through LlamaModel), and unknowns
+                // keep the Llama identity with the parsed version.
+                _ => super::architectures::ModelArchitecture::Llama {
+                    version: config.version as u8,
+                },
+            },
         };
 
         info!(
@@ -684,14 +787,41 @@ impl ModelFactory {
             llama_config.max_position_embeddings
         );
 
-        // Pass mutable reference to allow incremental tensor freeing during construction
-        let model = LlamaModel::from_weights_with_config(
-            &mut weights,
-            llama_config,
-            device,
-            dtype,
-            kv_quant_type,
-        )?;
+        // Multi-device pipeline (#314 wiring): when a multi-device `DevicePool`
+        // is present, spread all decoder layers `[0..num_hidden_layers)` across
+        // the pool via an even (parameter-balanced) split and build the model as
+        // a single stage owning the full range with that device map. The
+        // architecture's `forward_layers` then performs the lone cross-device
+        // copy at each stage boundary. Single-device pools and `None` take the
+        // original whole-model path unchanged.
+        let num_layers = llama_config.num_hidden_layers as usize;
+        let model = if let Some(pool) = device_pool.filter(|p| !p.is_single()) {
+            let device_map = LayerDeviceMap::even_split(pool, num_layers)?;
+            info!(
+                "🔀 Building Llama model as a multi-device pipeline: {} layer(s) across \
+                 {} device(s) ({} stage boundary copies per forward)",
+                num_layers,
+                pool.len(),
+                pool.len() - 1,
+            );
+            LlamaModel::stage_from_weights_with_config(
+                &mut weights,
+                llama_config,
+                &device_map,
+                0..num_layers,
+                dtype,
+                kv_quant_type,
+            )?
+        } else {
+            // Pass mutable reference to allow incremental tensor freeing during construction
+            LlamaModel::from_weights_with_config(
+                &mut weights,
+                llama_config,
+                device,
+                dtype,
+                kv_quant_type,
+            )?
+        };
 
         Ok(Box::new(model))
     }
@@ -703,12 +833,13 @@ impl ModelFactory {
         dtype: DType,
         max_context: Option<usize>,
         kv_quant_type: KVQuantType,
+        device_pool: Option<&DevicePool>,
     ) -> Result<Box<dyn ModelOperations>> {
         // Qwen uses Llama architecture with specific configuration
         // The key difference is in the config values, not the architecture
         info!("   Using Llama architecture with Qwen configuration");
         info!("   rope_theta: {} (from config)", config.rope_theta);
-        Self::create_llama_model(config, weights, device, dtype, max_context, kv_quant_type)
+        Self::create_llama_model(config, weights, device, dtype, max_context, kv_quant_type, device_pool)
     }
 
     fn create_gemma_model(
@@ -764,6 +895,7 @@ impl ModelFactory {
                 scale_embeddings: config.scale_embeddings,
                 layer_types: vec!["global".to_owned(); config.num_hidden_layers],
                 rope_local_base_freq: None,
+                model_architecture: super::architectures::ModelArchitecture::Llama { version: 3 },
             }),
             vision_config: VisionEncoderConfig {
                 encoder_type: VisionEncoderType::SigLIP {
@@ -866,7 +998,7 @@ impl ModelFactory {
     /// Uses FsOps::read_file() instead of direct filesystem access.
     /// The `model_path` is still needed for ModelConfig and architecture detection
     /// (which parse config.json), but weight data is read through FsOps.
-    #[instrument(name = "model_factory.create_with_fs", skip(device, dtype, fs), fields(model_path = %model_path.display()))]
+    #[instrument(name = "model_factory.create_with_fs", skip(device, dtype, fs, device_pool), fields(model_path = %model_path.display()))]
     pub async fn create_with_fs(
         model_path: &Path,
         device: &Device,
@@ -874,6 +1006,7 @@ impl ModelFactory {
         max_context: Option<usize>,
         kv_quant_type: KVQuantType,
         fs: &WorktreeClient,
+        device_pool: Option<&DevicePool>,
     ) -> Result<Box<dyn ModelOperations>> {
         info!("Loading model via FsOps: {}", model_path.display());
 
@@ -885,7 +1018,7 @@ impl ModelFactory {
 
         let weights = Self::load_weights_fs(fs, &shard_names, device, dtype).await?;
         let config = ModelConfig::load(model_path, &weights)?;
-        let model = Self::create_model_from_config(config, weights, device, dtype, max_context, kv_quant_type, model_path)?;
+        let model = Self::create_model_from_config(config, weights, device, dtype, max_context, kv_quant_type, model_path, device_pool)?;
         info!("Model created successfully via FsOps");
         Ok(model)
     }

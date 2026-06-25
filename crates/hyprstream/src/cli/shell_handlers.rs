@@ -254,7 +254,11 @@ pub async fn handle_shell_tui(
     // because the PTY broadcast lives on the *TUI service's* plane, a different
     // process from this viewer.)
     let reach = stdout_stream.reach.clone();
-    let mut handle = MoqStreamHandle::networked(reach, broadcast_path, mac_key, topic);
+    // #321: the TUI stdout stream is published AEAD-off (the viewer gets only
+    // `mac_key`+`topic` out of band), so the transport enc_key is never exercised
+    // here — derive a stable one from mac_key purely to satisfy the consumer API.
+    let enc_key = *hyprstream_rpc::crypto::StreamKeys::new(topic.clone(), mac_key).enc_key;
+    let mut handle = MoqStreamHandle::networked(reach, broadcast_path, mac_key, enc_key, topic);
     let _recv_handle = tokio::spawn(async move {
         loop {
             match handle.recv_next().await {
@@ -353,6 +357,31 @@ pub async fn handle_shell_tui(
         );
         let _ = ns.mount("/srv/model",
             std::sync::Arc::new(remote_model_mount),
+        );
+
+        // Mount the registry service's worktree filesystem via RPC proxy.
+        // RemoteRegistryMount is the registry analogue of RemoteModelMount:
+        // it proxies 9P operations to the registry service's
+        // `WorktreeClient` (real qids, real filesystem). 2-level scope:
+        //   /srv/registry/{repo_name}/{worktree_name}/<...rest...>
+        // Per #389 + #391 (Option 1, shared content model): the TUI namespace
+        // now mirrors the browser namespace's `/srv/registry` mount, both
+        // backed at the hyprstream spine. See `STANDARD_NAMESPACE_PATHS` in
+        // hyprstream-vfs for the convergence contract.
+        let remote_registry_mount = crate::services::remote_registry_mount::RemoteRegistryMount::new(
+            Clone::clone(&registry),
+        );
+        let registry_mount: std::sync::Arc<crate::services::remote_registry_mount::RemoteRegistryMount> =
+            std::sync::Arc::new(remote_registry_mount);
+        let _ = ns.mount("/srv/registry", registry_mount.clone());
+        // `/worktree` is an alias for `/srv/registry` — same backing mount,
+        // exposed under the short path for ergonomic worktree access. Both
+        // `/worktree/{repo}/{wt}` and `/srv/registry/{repo}/{wt}` resolve to
+        // the same worktree content.
+        let _ = ns.bind_mount(
+            "/worktree",
+            registry_mount,
+            hyprstream_vfs::BindFlag::After,
         );
 
         // /bin/ — static directory entries for listing purposes.

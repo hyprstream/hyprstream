@@ -93,6 +93,58 @@ async fn handle_cleanup(data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Locate the directory containing a host GPU driver library (e.g.
+/// `libcuda.so.1`, `libamdhip64.so`).
+///
+/// The host driver lib is shipped by the NVIDIA/AMD driver, never bundled with
+/// the libtorch variant, but libtorch's CUDA/ROCm `.so`s dlopen it at runtime.
+/// Resolution order: explicit `HYPRSTREAM_DRIVER_LIBDIR` override → `ldconfig`
+/// cache → well-known driver lib directories.
+fn find_host_driver_libdir(lib: &str) -> Option<String> {
+    // 1) Explicit operator override.
+    if let Ok(dir) = std::env::var("HYPRSTREAM_DRIVER_LIBDIR") {
+        if !dir.is_empty() && Path::new(&dir).is_dir() {
+            return Some(dir);
+        }
+    }
+
+    // 2) Ask the dynamic linker cache where the lib actually lives.
+    if let Ok(out) = std::process::Command::new("ldconfig").arg("-p").output() {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                if line.contains(lib) {
+                    if let Some(path) = line.rsplit("=> ").next() {
+                        if let Some(parent) = Path::new(path.trim()).parent() {
+                            return Some(parent.display().to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3) Scan well-known driver lib locations.
+    for candidate in [
+        "/usr/lib64",
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib",
+        "/usr/lib64/nvidia",
+        "/usr/lib/nvidia",
+        "/usr/lib/x86_64-linux-gnu/nvidia",
+    ] {
+        if Path::new(candidate).join(lib).exists() {
+            return Some(candidate.to_owned());
+        }
+    }
+
+    warn!(
+        "Could not locate host GPU driver lib '{lib}'; GPU may be unavailable. \
+         Set HYPRSTREAM_DRIVER_LIBDIR to the directory containing it."
+    );
+    None
+}
+
 /// Re-exec into the installed GPU variant binary.
 ///
 /// Sets LD_LIBRARY_PATH and uses the `exec` crate to replace the current process.
@@ -110,8 +162,27 @@ pub fn re_exec_variant(data_dir: &Path, variant_id: &str, version: &str) -> ! {
     let binary = variant_dir.join("hyprstream");
     let libtorch_lib = variant_dir.join("libtorch/lib");
 
+    // The bundled libtorch (variant/libtorch/lib) does NOT include the host
+    // GPU driver library — libcuda.so.1 (NVIDIA) / libamdhip64.so (ROCm) ship
+    // with the host driver and are dlopen'd by libtorch_cuda.so at runtime. If
+    // that dir is not reachable, tch::Cuda::is_available() returns false and we
+    // silently fall back to CPU. Append the host driver lib dir for GPU variants
+    // so libcuda.so.1 resolves. (gpu-cuda-availability)
+    let mut path_entries: Vec<String> = vec![libtorch_lib.display().to_string()];
+    if variant_id.starts_with("cuda") {
+        if let Some(dir) = find_host_driver_libdir("libcuda.so.1") {
+            path_entries.push(dir);
+        }
+    } else if variant_id.starts_with("rocm") {
+        if let Some(dir) = find_host_driver_libdir("libamdhip64.so") {
+            path_entries.push(dir);
+        }
+    }
     let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-    let new_path = format!("{}:{}", libtorch_lib.display(), existing);
+    if !existing.is_empty() {
+        path_entries.push(existing);
+    }
+    let new_path = path_entries.join(":");
 
     // Construct the new argv from the original, replacing argv[0]
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();

@@ -660,18 +660,21 @@ impl GemmaModel {
         device: &Device,
         dtype: DType,
     ) -> Result<Self> {
-        // Extract embeddings
+        // Extract embeddings.
+        // #405: place top-level weights on `device` here. Without this,
+        // constructing from CPU weights with device=Cuda(0) leaves
+        // embed/lm_head/norm on CPU while layers move to CUDA.
         let embed_tokens = weights
             .get("model.embed_tokens.weight")
             .or_else(|| weights.get("embed_tokens.weight"))
-            .map(tch::Tensor::shallow_clone);
+            .map(|w| w.shallow_clone().to_device(*device));
 
         // Gemma uses weight tying - lm_head shares weights with embed_tokens
         // Keep lm_head as [vocab_size, hidden_size], transpose during use
         let lm_head = weights
             .get("lm_head.weight")
             .or_else(|| weights.get("model.lm_head.weight"))
-            .map(tch::Tensor::shallow_clone);
+            .map(|w| w.shallow_clone().to_device(*device));
 
         if lm_head.is_none() && embed_tokens.is_some() {
             tracing::info!("Gemma model uses weight tying (lm_head = embed_tokens.T)");
@@ -684,7 +687,7 @@ impl GemmaModel {
             .get("model.norm.weight")
             .or_else(|| weights.get("norm.weight"))
             .map(|w| RMSNorm {
-                weight: w.shallow_clone(),
+                weight: w.shallow_clone().to_device(*device),
                 eps: config.rms_norm_eps,
                 add_unit_offset: is_gemma3,
             });

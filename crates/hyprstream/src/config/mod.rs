@@ -341,10 +341,12 @@ pub struct QuicConfig {
     #[serde(default)]
     pub key_path: String,
 
-    /// #282: bind an iroh substrate (ALPNs `hyprstream-rpc/1` + `moql`) in
-    /// PARALLEL to the quinn/WebTransport endpoint, enabling node_id-addressed
-    /// (pkarr/DNS-discoverable) federation reach. Off by default — quinn-only is
-    /// the unchanged baseline; opt in with `[quic] iroh = true`. Native-only.
+    /// #410/#282: bind an iroh substrate (ALPNs `hyprstream-rpc/1` + `moql`)
+    /// as the PRIMARY production transport, in parallel with the quinn/WebTransport
+    /// endpoint (kept for back-compat). Iroh is ON by default — it provides
+    /// node_id-addressed (pkarr/N0-DNS-discoverable) federation reach, NAT
+    /// traversal, self-certifying Ed25519 identity, and PQ-hybrid key exchange.
+    /// Opt out with `[quic] iroh = false` to run quinn-only (legacy). Native-only.
     #[serde(default = "default_iroh_enabled")]
     pub iroh: bool,
 }
@@ -475,9 +477,10 @@ impl QuicConfig {
             server_name: self.server_name.clone(),
             protected_resource_json: meta_json,
             on_quic_bound: None,
-            // #282: iroh is opt-in and provisioned by the daemon bootstrap
-            // (`QuicSharedConfig`), not this minimal builder. Off here.
-            iroh_enabled: false,
+            // #410: iroh is the primary production transport (on by default).
+            // This minimal builder mirrors the daemon bootstrap default; the
+            // full `QuicSharedConfig` path in `main.rs` honours `[quic] iroh`.
+            iroh_enabled: default_iroh_enabled(),
             iroh_admission: None,
             on_iroh_bound: None,
         })
@@ -485,9 +488,9 @@ impl QuicConfig {
 }
 
 fn default_quic_enabled() -> bool { true }
-/// #282: iroh substrate is opt-in (defaults off) so the quinn-only baseline is
-/// unchanged for existing deployments.
-fn default_iroh_enabled() -> bool { false }
+/// #410: iroh substrate is the PRIMARY production transport — on by default.
+/// The quinn-only baseline is the legacy path; opt out with `[quic] iroh = false`.
+fn default_iroh_enabled() -> bool { true }
 fn default_quic_bind_addr() -> String { "0.0.0.0:4433".to_owned() }
 fn default_quic_server_name() -> String { "localhost".to_owned() }
 
@@ -1589,8 +1592,32 @@ pub struct RuntimeConfig {
     pub cpu_threads: Option<usize>,
     /// Use GPU acceleration
     pub use_gpu: bool,
-    /// GPU device ID (None = auto-detect, typically device 0)
+    /// GPU device ID (None = auto-detect, typically device 0).
+    ///
+    /// Legacy single-GPU selector. For multi-GPU, prefer [`Self::devices`];
+    /// this field remains the back-compat fallback when `devices` is empty.
     pub gpu_device_id: Option<usize>,
+    /// Explicit set of GPU device indices for multi-GPU (#313, epic #310).
+    ///
+    /// Empty = unset → fall back to the single [`Self::gpu_device_id`] /
+    /// `HYPRSTREAM_GPU_DEVICE` (existing single-GPU behavior is unchanged).
+    /// Parsed from `HYPRSTREAM_GPU_DEVICES` (comma-separated, e.g. `0,1`).
+    /// Resolution + validation lives in [`Self::resolve_device_indices`] and is
+    /// consumed by `runtime::DevicePool`.
+    #[serde(default)]
+    pub devices: Vec<usize>,
+    /// Fail fast when a *requested* GPU is unavailable instead of silently
+    /// downgrading to CPU (#315, epic #310).
+    ///
+    /// A process told to run on GPU 3 that silently lands on CPU tanks a pipeline
+    /// split, so strictness is the safe default for the multi-GPU path. This only
+    /// affects the case where a GPU was *explicitly* requested (`use_gpu` with an
+    /// explicit `gpu_device_id`/`devices`); pure auto-detect (`use_gpu` with no
+    /// device requested) still falls back to CPU so the legacy single-GPU
+    /// "use a GPU if there is one" behavior is unchanged.
+    /// Defaults to `true`; override with `HYPRSTREAM_STRICT_DEVICE=0`.
+    #[serde(default = "default_strict_device")]
+    pub strict_device: bool,
     /// GPU layers to offload (None = auto)
     pub gpu_layers: Option<usize>,
     /// Use memory mapping for model files
@@ -1604,6 +1631,50 @@ pub struct RuntimeConfig {
     pub max_concurrent_generations: usize,
     pub default_generation_timeout_ms: u64,
     pub default_model_load_timeout_ms: u64,
+
+    /// Continuous / in-flight batching (#329, epic #310). **Default: off.**
+    ///
+    /// When enabled, the inference scheduler groups concurrent decode steps of
+    /// same-tenant-delta sequences into a single batched forward (Llama only).
+    /// When off, each stream runs the unchanged batch=1 decode path. Override
+    /// with `HYPRSTREAM_CONTINUOUS_BATCH` (truthy = on). Off by default while the
+    /// scheduler wiring lands incrementally — the batched kernel is correctness-
+    /// gated by `batched_ragged_decode_matches_serial`.
+    #[serde(default = "default_continuous_batching")]
+    pub continuous_batching: bool,
+    /// Max sequences fused into one batched decode step when
+    /// [`Self::continuous_batching`] is on (spike default 16). Tunable via
+    /// `HYPRSTREAM_CONTINUOUS_BATCH_MAX`.
+    #[serde(default = "default_continuous_batch_max")]
+    pub continuous_batch_max: usize,
+}
+
+/// Default for [`RuntimeConfig::continuous_batching`]: off unless
+/// `HYPRSTREAM_CONTINUOUS_BATCH` is set truthy (#329). Off is the safe default —
+/// the batch=1 path is the verified reference.
+fn default_continuous_batching() -> bool {
+    std::env::var("HYPRSTREAM_CONTINUOUS_BATCH")
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// Default for [`RuntimeConfig::continuous_batch_max`] (#329): 16 (spike rec),
+/// overridable via `HYPRSTREAM_CONTINUOUS_BATCH_MAX`.
+fn default_continuous_batch_max() -> usize {
+    std::env::var("HYPRSTREAM_CONTINUOUS_BATCH_MAX")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(16)
+}
+
+/// Default for [`RuntimeConfig::strict_device`]: strict (fail-fast) unless
+/// `HYPRSTREAM_STRICT_DEVICE` is set to a falsy value. Strictness is the safe
+/// default for the multi-GPU path (#315).
+fn default_strict_device() -> bool {
+    std::env::var("HYPRSTREAM_STRICT_DEVICE")
+        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true)
 }
 
 impl Default for RuntimeConfig {
@@ -1614,6 +1685,15 @@ impl Default for RuntimeConfig {
         let gpu_device_id = std::env::var("HYPRSTREAM_GPU_DEVICE")
             .ok()
             .and_then(|s| s.parse::<usize>().ok());
+
+        // `devices` is populated leniently here (Default cannot return errors);
+        // the authoritative strict parse + validation lives in
+        // `RuntimeConfig::resolve_device_indices`, which re-reads the env var and
+        // turns parse errors into hard errors.
+        let devices = std::env::var("HYPRSTREAM_GPU_DEVICES")
+            .ok()
+            .and_then(|s| Self::parse_device_list(&s).ok())
+            .unwrap_or_default();
 
         let max_context = std::env::var("HYPRSTREAM_MAX_CONTEXT")
             .ok()
@@ -1638,6 +1718,8 @@ impl Default for RuntimeConfig {
             cpu_threads: None,
             use_gpu: true,
             gpu_device_id, // From env or None (auto-detect device 0)
+            devices,       // From HYPRSTREAM_GPU_DEVICES or empty (→ fall back to gpu_device_id)
+            strict_device: default_strict_device(),
             gpu_layers: None,
             mmap: true,
             kv_cache_size_mb: 2048,
@@ -1646,7 +1728,98 @@ impl Default for RuntimeConfig {
             max_concurrent_generations: 10,
             default_generation_timeout_ms: 120000, // 2 minutes
             default_model_load_timeout_ms: 300000, // 5 minutes
+            continuous_batching: default_continuous_batching(),
+            continuous_batch_max: default_continuous_batch_max(),
         }
+    }
+}
+
+impl RuntimeConfig {
+    /// Parse a comma-separated GPU device list (e.g. `"0,1"`), strictly.
+    ///
+    /// Whitespace around entries is trimmed. Any non-numeric entry, or a
+    /// trailing/empty field (e.g. `"0,"` or `"0,,1"`), is a hard error — there
+    /// is no silent default. Returns the parsed indices (possibly with
+    /// duplicates; dedup/validation is the caller's job).
+    fn parse_device_list(raw: &str) -> anyhow::Result<Vec<usize>> {
+        raw.split(',')
+            .map(|part| {
+                let trimmed = part.trim();
+                trimmed.parse::<usize>().map_err(|e| {
+                    anyhow::anyhow!(
+                        "invalid GPU device index {trimmed:?} in HYPRSTREAM_GPU_DEVICES={raw:?}: {e}"
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Resolve the explicitly-requested *multi-GPU* device set, fail-fast.
+    ///
+    /// This is the seam the multi-GPU foundation uses to decide whether to engage
+    /// the new `DevicePool` path. It considers **only** the explicit multi-GPU
+    /// inputs and deliberately excludes the legacy single [`Self::gpu_device_id`]
+    /// so that existing single-GPU behavior is left entirely on its old code
+    /// path (#313 introduces the pool without changing single-GPU runtime
+    /// behavior). Precedence:
+    ///
+    /// 1. `HYPRSTREAM_GPU_DEVICES` env var (re-parsed here strictly, so a
+    ///    malformed value is a hard error rather than a silent fallback).
+    /// 2. The [`Self::devices`] field (e.g. from a config file / CLI).
+    ///
+    /// Returns `Ok(None)` when no explicit multi-GPU set was requested,
+    /// `Ok(Some(indices))` (non-empty, duplicate-free) otherwise, and `Err` on
+    /// parse errors or duplicate indices.
+    pub fn resolve_explicit_multi_device_indices(&self) -> anyhow::Result<Option<Vec<usize>>> {
+        // (1) env var wins and is parsed strictly here. An absent or
+        //     empty/whitespace-only value is treated as "unset" so resolution
+        //     falls through to (2) the struct field (config file / CLI).
+        let env_raw = std::env::var("HYPRSTREAM_GPU_DEVICES").ok();
+        let env_trimmed = env_raw.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let indices = match env_trimmed {
+            Some(raw) => Self::parse_device_list(raw)?,
+            None => self.devices.clone(),
+        };
+
+        Self::validate_index_set(indices)
+    }
+
+    /// Resolve the GPU device indices to use, fail-fast, including the legacy
+    /// single-GPU fallback.
+    ///
+    /// This is the full-precedence resolver consumed by
+    /// `runtime::DevicePool::from_config`. It is
+    /// [`Self::resolve_explicit_multi_device_indices`] plus a final fallback to
+    /// the legacy single [`Self::gpu_device_id`] (mapped to a one-element set),
+    /// preserving back-compat for callers that build a pool directly from config.
+    ///
+    /// `Ok(None)` means nothing was requested (caller should auto-detect).
+    pub fn resolve_device_indices(&self) -> anyhow::Result<Option<Vec<usize>>> {
+        if let Some(indices) = self.resolve_explicit_multi_device_indices()? {
+            return Ok(Some(indices));
+        }
+        // Legacy single-GPU selector as the final fallback.
+        match self.gpu_device_id {
+            Some(id) => Self::validate_index_set(vec![id]),
+            None => Ok(None),
+        }
+    }
+
+    /// Shared post-processing for a resolved index list: empty → `None`, reject
+    /// duplicates, otherwise `Some(indices)`.
+    fn validate_index_set(indices: Vec<usize>) -> anyhow::Result<Option<Vec<usize>>> {
+        if indices.is_empty() {
+            return Ok(None);
+        }
+        let mut seen = std::collections::HashSet::with_capacity(indices.len());
+        for &idx in &indices {
+            if !seen.insert(idx) {
+                return Err(anyhow::anyhow!(
+                    "duplicate GPU device index {idx} in requested set {indices:?}"
+                ));
+            }
+        }
+        Ok(Some(indices))
     }
 }
 
@@ -2451,6 +2624,168 @@ mod tests {
         let cfg = result.expect("config should parse with env var");
         assert_eq!(cfg.oauth.jwt_key_active_secs, Some(30), "jwt_key_active_secs should be 30 from env");
         assert_eq!(cfg.oauth.active_secs(), 30);
+    }
+
+    // ---- Multi-GPU device resolution (#313) ----
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn parse_device_list_basic() {
+        assert_eq!(RuntimeConfig::parse_device_list("0,1").unwrap(), vec![0, 1]);
+        // Whitespace around entries is tolerated.
+        assert_eq!(RuntimeConfig::parse_device_list(" 0 , 2 ").unwrap(), vec![0, 2]);
+        assert_eq!(RuntimeConfig::parse_device_list("3").unwrap(), vec![3]);
+    }
+
+    #[test]
+    fn parse_device_list_rejects_garbage() {
+        // Non-numeric, empty fields, and negatives are hard errors (no silent default).
+        assert!(RuntimeConfig::parse_device_list("0,foo").is_err());
+        assert!(RuntimeConfig::parse_device_list("0,").is_err());
+        assert!(RuntimeConfig::parse_device_list("0,,1").is_err());
+        assert!(RuntimeConfig::parse_device_list("-1").is_err());
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn validate_index_set_dedup_and_empty() {
+        // Empty → None (auto-detect).
+        assert_eq!(RuntimeConfig::validate_index_set(vec![]).unwrap(), None);
+        // Duplicates → error.
+        assert!(RuntimeConfig::validate_index_set(vec![0, 0]).is_err());
+        // Distinct → Some, order preserved.
+        assert_eq!(
+            RuntimeConfig::validate_index_set(vec![2, 0, 1]).unwrap(),
+            Some(vec![2, 0, 1])
+        );
+    }
+
+    /// Serializes the two tests that mutate the shared `HYPRSTREAM_GPU_DEVICES`
+    /// process env var so they don't race under the parallel test runner.
+    static GPU_DEVICES_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn resolve_uses_devices_field_and_legacy_fallback() {
+        let _serial = GPU_DEVICES_ENV_LOCK.lock();
+        // Guard against the env var leaking from the ambient environment so the
+        // struct-field/legacy precedence is exercised deterministically.
+        let _guard = EnvVarGuard::unset("HYPRSTREAM_GPU_DEVICES");
+
+        // Explicit multi-device field wins.
+        let mut cfg = RuntimeConfig::default();
+        cfg.devices = vec![0, 1];
+        cfg.gpu_device_id = Some(7);
+        assert_eq!(
+            cfg.resolve_explicit_multi_device_indices().unwrap(),
+            Some(vec![0, 1])
+        );
+        assert_eq!(cfg.resolve_device_indices().unwrap(), Some(vec![0, 1]));
+
+        // No explicit multi-device set → explicit resolver is None, but the full
+        // resolver falls back to the legacy single gpu_device_id.
+        let mut legacy = RuntimeConfig::default();
+        legacy.devices = vec![];
+        legacy.gpu_device_id = Some(3);
+        assert_eq!(legacy.resolve_explicit_multi_device_indices().unwrap(), None);
+        assert_eq!(legacy.resolve_device_indices().unwrap(), Some(vec![3]));
+
+        // Nothing requested anywhere → None (auto-detect path preserved).
+        let mut none = RuntimeConfig::default();
+        none.devices = vec![];
+        none.gpu_device_id = None;
+        assert_eq!(none.resolve_device_indices().unwrap(), None);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn resolve_env_var_overrides_and_is_strict() {
+        let _serial = GPU_DEVICES_ENV_LOCK.lock();
+        let mut cfg = RuntimeConfig::default();
+        cfg.devices = vec![5];
+        cfg.gpu_device_id = Some(9);
+
+        {
+            let _g = EnvVarGuard::set("HYPRSTREAM_GPU_DEVICES", "0,1,2");
+            assert_eq!(
+                cfg.resolve_explicit_multi_device_indices().unwrap(),
+                Some(vec![0, 1, 2]),
+                "env var must override the devices field"
+            );
+        }
+        {
+            // Malformed env var is a hard error (not a silent fallback to field).
+            let _g = EnvVarGuard::set("HYPRSTREAM_GPU_DEVICES", "0,nope");
+            assert!(cfg.resolve_explicit_multi_device_indices().is_err());
+        }
+        {
+            // Duplicate in env var → error.
+            let _g = EnvVarGuard::set("HYPRSTREAM_GPU_DEVICES", "1,1");
+            assert!(cfg.resolve_explicit_multi_device_indices().is_err());
+        }
+        {
+            // Explicitly-empty env var is treated as unset (falls back to field).
+            let _g = EnvVarGuard::set("HYPRSTREAM_GPU_DEVICES", "  ");
+            assert_eq!(
+                cfg.resolve_explicit_multi_device_indices().unwrap(),
+                Some(vec![5])
+            );
+        }
+    }
+
+    /// Serializes tests mutating the shared `HYPRSTREAM_STRICT_DEVICE` env var.
+    static STRICT_DEVICE_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// #315: strict_device defaults to fail-fast, and can be opted out via env.
+    #[test]
+    fn strict_device_defaults_to_true_and_respects_env() {
+        let _serial = STRICT_DEVICE_ENV_LOCK.lock();
+
+        {
+            let _g = EnvVarGuard::unset("HYPRSTREAM_STRICT_DEVICE");
+            assert!(
+                RuntimeConfig::default().strict_device,
+                "strict_device must default to true (safe default for multi-GPU)"
+            );
+        }
+        for falsy in ["0", "false", "no", "off"] {
+            let _g = EnvVarGuard::set("HYPRSTREAM_STRICT_DEVICE", falsy);
+            assert!(
+                !RuntimeConfig::default().strict_device,
+                "HYPRSTREAM_STRICT_DEVICE={falsy} must disable strict_device"
+            );
+        }
+        {
+            let _g = EnvVarGuard::set("HYPRSTREAM_STRICT_DEVICE", "1");
+            assert!(RuntimeConfig::default().strict_device);
+        }
+    }
+
+    /// RAII guard to set/unset a process env var for the duration of a test and
+    /// restore the previous value, keeping env-mutating tests from leaking state.
+    struct EnvVarGuard {
+        key: String,
+        prev: Option<String>,
+    }
+    impl EnvVarGuard {
+        fn set(key: &str, val: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, val);
+            Self { key: key.to_owned(), prev }
+        }
+        fn unset(key: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key: key.to_owned(), prev }
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(&self.key, v),
+                None => std::env::remove_var(&self.key),
+            }
+        }
     }
 }
 

@@ -448,13 +448,14 @@ fn generate_trait_method_impl(
                 if info.broadcast_path.is_empty() {
                     anyhow::bail!("Server did not provide moq broadcast path — moq transport not initialized");
                 }
-                let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
+                let (mac_key, enc_key, topic) = hyprstream_rpc::derive_client_stream_keys(
                     &client_secret, &client_pubkey_bytes, &info.dh_public,
                 )?;
                 // #274: subscribe over the resolved `reach` (the same-host UDS
                 // fast path is preferred automatically when co-located).
+                // #321: enc_key opens the transport-AEAD-sealed Tagged blocks.
                 Ok(hyprstream_rpc::moq_stream::MoqStreamHandle::networked(
-                    info.announced_at, info.broadcast_path, mac_key, topic,
+                    info.announced_at, info.broadcast_path, mac_key, enc_key, topic,
                 ))
             }
         })
@@ -521,6 +522,21 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
             ) -> anyhow::Result<Self> {
                 let transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(endpoint);
                 Self::dial_transport(&transport, signing_key, destination, token)
+            }
+
+            /// Create a client for an already-resolved typed
+            /// [`hyprstream_rpc::transport::TransportConfig`] (the Inproc arm for
+            /// a co-located service, or a networked Quic/Iroh reach). Prefer this
+            /// over [`Self::for_endpoint`] when the caller already holds a typed
+            /// transport (e.g. the inference router, #320) — it skips string
+            /// parsing and routes straight through [`hyprstream_rpc::dial::dial`].
+            pub fn for_transport(
+                transport: &hyprstream_rpc::transport::TransportConfig,
+                signing_key: hyprstream_rpc::crypto::SigningKey,
+                destination: hyprstream_rpc::crypto::VerifyingKey,
+                token: Option<String>,
+            ) -> anyhow::Result<Self> {
+                Self::dial_transport(transport, signing_key, destination, token)
             }
 
             /// Build a client for an already-resolved `TransportConfig` (the one

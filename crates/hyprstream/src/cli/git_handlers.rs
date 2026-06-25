@@ -1,6 +1,10 @@
 //! Handlers for git-style CLI commands
 // CLI handlers intentionally print to stdout/stderr for user interaction
 #![allow(clippy::print_stdout, clippy::print_stderr)]
+// TODO(#395): migrate `model_ref.model` reads to `model_ref.name()` as part of the
+// name-layer retirement. Suppressed here so this prep PR stays focused on the CID
+// encoder + grammar; the deprecation is enforced at the ModelRef type definition.
+#![allow(deprecated)]
 
 use crate::runtime::GenerationRequest;
 use crate::services::generated::inference_client::ChatMessage;
@@ -383,6 +387,75 @@ pub async fn handle_commit(
     }
 
     Ok(())
+}
+
+/// Handle the `promote` command (#394).
+///
+/// Snapshots the node-local upper layer into a deterministic registry commit
+/// (`stageAll` + `commit`) and advances the atproto pointer record. This is
+/// the single-verb entry point for the promote saga — see
+/// [`crate::git::promote`] for the eventual-consistency contract and the
+/// single-writer-per-layer enforcement.
+///
+/// `author_name` / `author_email` default to the process identity when
+/// `None`; for deterministic cross-node promotes the caller should pin a
+/// stable identity (the registry service derives it from the verified
+/// `Subject`).
+#[cfg(feature = "experimental")]
+pub async fn handle_promote(
+    registry: &RegistryClient,
+    model_ref_str: &str,
+    branch: &str,
+    author_name: Option<String>,
+    author_email: Option<String>,
+) -> Result<()> {
+    use crate::git::promote::{promote, PromoteAuthor, PromoteError, PromoteLeaseTable};
+    use std::sync::Arc;
+
+    info!("Promoting {} (branch {})", model_ref_str, branch);
+
+    let model_ref = ModelRef::parse(model_ref_str)?;
+    let tracked = registry.get_by_name(&model_ref.model).await
+        .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
+    let repo_client = registry.repo(&tracked.id);
+    let wt = repo_client.worktree(branch);
+
+    let author = PromoteAuthor {
+        name: author_name.unwrap_or_else(|| "hyprstream".to_owned()),
+        email: author_email.unwrap_or_else(|| "promote@hyprstream.local".to_owned()),
+    };
+
+    // The lease table is per-process; in a multi-node deployment each node has
+    // its own table and the distributed single-writer invariant is enforced by
+    // the atproto pointer-record version check (see git::promote).
+    let lease_table = Arc::new(PromoteLeaseTable::new());
+
+    match promote(&model_ref.model, branch, &wt, &author, &lease_table).await {
+        Ok(outcome) => {
+            println!("✓ Promoted {} ({})", model_ref_str, branch);
+            println!("  Commit: {}", outcome.commit_oid);
+            if outcome.pointer_advanced {
+                println!("  atproto pointer advanced");
+            }
+            Ok(())
+        }
+        Err(PromoteError::LeaseHeld(_)) => {
+            anyhow::bail!("another promote is in progress for {}/{}", model_ref.model, branch)
+        }
+        Err(PromoteError::LocalCommit(e)) => {
+            anyhow::bail!("promote failed during local commit: {e}")
+        }
+        Err(PromoteError::PointerStale(e)) => {
+            // Content is committed; only the pointer lags. Warn, don't fail.
+            warn!(
+                model = %model_ref.model, branch, error = %e,
+                "promote: content committed but atproto pointer is stale; next promote will advance it"
+            );
+            println!("⚠ Promoted {} ({}) — content committed, pointer stale", model_ref_str, branch);
+            println!("  The atproto pointer will advance on the next successful promote.");
+            Ok(())
+        }
+    }
 }
 
 /// Print model status in a nice format using generated RepositoryStatus

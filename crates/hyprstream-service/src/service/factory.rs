@@ -52,9 +52,10 @@ pub struct QuicSharedConfig {
     /// JWT verifying key (derived from root via HKDF "hyprstream-jwt-v1").
     /// Published as `x_root_pubkey` in RFC 9728 metadata for client-side trust pinning.
     pub jwt_verifying_key: Option<ed25519_dalek::VerifyingKey>,
-    /// #282: bind an iroh substrate (ALPNs `hyprstream-rpc/1` + `moql`) in
-    /// parallel to the quinn endpoint for every QUIC-enabled service. Off by
-    /// default; an operator opts in via `[quic] iroh = true`.
+    /// #410/#282: bind an iroh substrate (ALPNs `hyprstream-rpc/1` + `moql`)
+    /// as the PRIMARY production transport, in parallel to the quinn endpoint
+    /// (kept for back-compat), for every QUIC-enabled service. On by default;
+    /// an operator opts out via `[quic] iroh = false` to run quinn-only (legacy).
     pub iroh_enabled: bool,
 }
 
@@ -569,6 +570,9 @@ impl ServiceContext {
                 fetcher.clone(),
             );
             let source = source.with_ml_dsa_verifying_keys(self.ml_dsa_verifying_keys.clone());
+            // Authoritative local CA key for offline service-JWT resolution
+            // (no dependency on the HTTP /oauth/jwks endpoint at startup).
+            let source = source.with_local_ca_key(self.jwt_verifying_key());
             std::sync::Arc::new(source)
         } else {
             let source = hyprstream_rpc::auth::ClusterKeySource::new(

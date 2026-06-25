@@ -8,8 +8,8 @@
 
 use hyprstream_rpc::capnp::{FromCapnp, ToCapnp};
 use hyprstream_rpc::stream_info::{
-    Completion, Delivery, Job, Log, Ordering, OverflowPolicy, Pipe, QuicReach, Destination,
-    Retention, Role, StreamInfo, StreamOpt, StreamOptPreset, TransportConfig,
+    Completion, Delivery, IrohReach, Job, Log, Ordering, OverflowPolicy, Pipe, QuicReach,
+    Destination, Retention, Role, StreamInfo, StreamOpt, StreamOptPreset, TransportConfig,
 };
 
 /// Serialize a `StreamInfo` through a Cap'n Proto message and read it back.
@@ -94,6 +94,89 @@ fn non_default_arms_roundtrip() {
         retention: Retention::Seconds(300),
         ..StreamOpt::default()
     });
+}
+
+/// Round-trip a single wire `TransportConfig` union through capnp and back.
+fn roundtrip_transport(t: &TransportConfig) -> TransportConfig {
+    let mut message = capnp::message::Builder::new_default();
+    {
+        let mut builder =
+            message.init_root::<hyprstream_rpc::streaming_capnp::transport_config::Builder>();
+        t.write_to(&mut builder);
+    }
+    let mut bytes = Vec::new();
+    capnp::serialize::write_message(&mut bytes, &message).expect("write_message");
+    let reader = capnp::serialize::read_message(
+        &mut std::io::Cursor::new(&bytes),
+        capnp::message::ReaderOptions::default(),
+    )
+    .expect("read_message");
+    let r = reader
+        .get_root::<hyprstream_rpc::streaming_capnp::transport_config::Reader>()
+        .expect("get_root");
+    TransportConfig::read_from(r).expect("read_from")
+}
+
+#[test]
+fn transport_config_iroh_arm_roundtrips() {
+    // #320: the iroh arm now carries a real IrohReach (nodeId + alpn + relay).
+    let t = TransportConfig::Iroh(IrohReach {
+        node_id: [0x5Au8; 32],
+        alpn: "hyprstream-rpc/1".to_owned(),
+        relay_url: "https://relay.example".to_owned(),
+    });
+    let back = roundtrip_transport(&t);
+    assert_eq!(t, back);
+    match back {
+        TransportConfig::Iroh(i) => {
+            assert_eq!(i.node_id, [0x5Au8; 32]);
+            assert_eq!(i.alpn, "hyprstream-rpc/1");
+            assert_eq!(i.relay_url, "https://relay.example");
+        }
+        other => panic!("expected Iroh, got {other:?}"),
+    }
+}
+
+#[test]
+fn transport_config_iroh_empty_relay_roundtrips() {
+    // Empty relayUrl (= direct/pkarr, #282) survives the round-trip as empty.
+    let t = TransportConfig::Iroh(IrohReach {
+        node_id: [1u8; 32],
+        alpn: "moql".to_owned(),
+        relay_url: String::new(),
+    });
+    assert_eq!(t, roundtrip_transport(&t));
+}
+
+#[test]
+fn transport_config_quic_arm_roundtrips() {
+    let t = TransportConfig::Quic(QuicReach {
+        addr: "10.0.0.1:4433".to_owned(),
+        server_name: "mesh.local".to_owned(),
+        cert_hashes: vec![vec![9u8; 32]],
+    });
+    assert_eq!(t, roundtrip_transport(&t));
+}
+
+/// #320: a `StreamInfo` whose reach carries the iroh arm round-trips end to end.
+#[test]
+fn stream_info_iroh_reach_roundtrips() {
+    let info = StreamInfo {
+        stream_id: "stream-320".to_owned(),
+        dh_public: [3u8; 32],
+        qos: StreamOpt::default(),
+        broadcast_path: "local/streams/iroh".to_owned(),
+        announced_at: vec![Destination {
+            role: Role::Direct,
+            transport: TransportConfig::Iroh(IrohReach {
+                node_id: [0x7Bu8; 32],
+                alpn: "moql".to_owned(),
+                relay_url: "https://r.example".to_owned(),
+            }),
+        }],
+    };
+    let back = roundtrip(&info);
+    assert_eq!(info.announced_at, back.announced_at);
 }
 
 #[test]

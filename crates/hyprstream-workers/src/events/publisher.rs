@@ -36,6 +36,27 @@ impl EventPublisher {
         Ok(Self { inner })
     }
 
+    /// Create a new publisher for `source` that ALSO mirrors every event to the
+    /// per-OID (#393) publication track for `oid`. This is the transition path:
+    /// legacy flat-track subscribers keep working while #393 per-OID subscribers
+    /// get wire-level selectivity.
+    pub fn new_with_oid(source: &str, oid: &str) -> Result<Self> {
+        let origin = global_moq_event_origin()
+            .ok_or_else(|| anyhow!("moq event bus not initialized; start the event service first"))?;
+        let inner = origin.publisher_with_oid(source, oid)?;
+        Ok(Self { inner })
+    }
+
+    /// Create a new publisher that writes ONLY to the per-OID (#393) publication
+    /// track for `oid` (no flat-track mirror). Use once every subscriber of this
+    /// source has migrated to per-OID subscription.
+    pub fn new_oid_only(source: &str, oid: &str) -> Result<Self> {
+        let origin = global_moq_event_origin()
+            .ok_or_else(|| anyhow!("moq event bus not initialized; start the event service first"))?;
+        let inner = origin.publisher_oid_only(source, oid)?;
+        Ok(Self { inner })
+    }
+
     /// Publish an event asynchronously.
     ///
     /// Creates a topic from `{source}.{entity}.{event}` and writes a frame
