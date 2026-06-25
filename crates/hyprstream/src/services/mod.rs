@@ -82,6 +82,7 @@ pub mod registry;
 pub mod fs;
 pub mod remote_mount;
 pub mod remote_registry_mount;
+pub mod kata_9p_backend;
 pub mod rpc_types;
 pub mod typed;
 pub mod worker;
