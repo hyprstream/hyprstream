@@ -2993,8 +2993,6 @@ impl MetricsRegistryClient for RegistryClient {
 
 
 
-#[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::print_stdout)]
 /// Parse a git-xet / git-lfs pointer file and report whether its content-hash
 /// field EXACTLY equals `merkle_hex`. This is an exact field match, not a loose
 /// substring scan — an arbitrary text blob that merely contains the hex string
