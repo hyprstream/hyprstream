@@ -816,14 +816,21 @@ impl RegistryService {
         found
     }
 
-    /// Authorize a getBlob request. Enforces BOTH security conditions:
+    /// Authorize a getBlob request, HuggingFace-Xet-compatible. The CAS is GLOBAL
+    /// and content-addressed (cross-repo dedup preserved); isolation is enforced
+    /// at the READ-AUTHORIZATION layer per HF's rule — "you can only read chunks
+    /// required to reproduce files you have access to, and no more." Enforces BOTH:
     ///   (a) the authenticated caller may access `grant_repo` (Casbin query on
     ///       `model:{name}`), AND
-    ///   (b) `grant_repo` actually contains/references the requested content
-    ///       address.
+    ///   (b) the requested content address is the **reconstruction target of a
+    ///       file in `grant_repo`** — for git OIDs, the object exists in the repo;
+    ///       for XET merkles, a tracked git-xet/lfs file's content-OID equals the
+    ///       merkle (file-level entitlement-by-reconstruction; see
+    ///       `repo_contains_xet_merkle`). Merely naming the hash in a checked-in
+    ///       blob does NOT authorize it.
     /// The content hash is NEVER a capability — possessing the hash grants
-    /// nothing; entitlement keys entirely on `grant_repo` access. Returns the
-    /// resolved (repo, content-address) on success; `Err` denies (no bytes).
+    /// nothing; entitlement keys on `grant_repo` access AND the content being a
+    /// reconstruction target there. `Err` denies (no bytes).
     ///
     /// Returns the resolved content address string for downstream reconstruction.
     async fn authorize_get_blob(
@@ -861,8 +868,12 @@ impl RegistryService {
             .await
             .map_err(|e| anyhow!("getBlob denied: {}", e))?;
 
-        // ── Condition (b): grantRepo actually contains the address. ──
-        // Prevents naming a public repo to exfiltrate private content not in it.
+        // ── Condition (b): the address is a reconstruction target in grantRepo. ──
+        // HF-compatible read-authorization over global dedup: permit iff a file in
+        // grantRepo genuinely reconstructs FROM this address (git OID exists, or a
+        // tracked xet/lfs pointer's content-OID equals the merkle). Prevents both
+        // naming an unrelated repo to fish bytes AND planting a bare hex reference
+        // to borrow read access to content the caller isn't entitled to reproduce.
         let contained = if is_git_oid {
             self.repo_contains_git_oid(&repo.id, &address).await?
         } else {
@@ -895,20 +906,28 @@ impl RegistryService {
 
     // (helper `xet_pointer_references_merkle` defined at module scope below)
 
-    /// Condition-(b) check for a XET merkle root: grantRepo must reference the
-    /// merkle via a checked-in git-xet pointer whose merkle field EXACTLY equals
-    /// the requested hash. Content addresses are predictable (the CAS is global
-    /// and content-addressed), so presence in the store alone is NOT sufficient —
-    /// the grant repo must actually reference it.
+    /// Condition-(b) check for a XET merkle root, HuggingFace-Xet-compatible:
+    /// entitlement is by *reconstruction*, not by mere reference. grantRepo
+    /// satisfies (b) iff it tracks a git-xet / git-lfs file whose **content-OID
+    /// field equals the requested merkle** — i.e. a file in this repo genuinely
+    /// reconstructs *from* this address. The merkle being the file's OID is what
+    /// makes the caller entitled to the bytes; a blob that merely names the hex
+    /// (planted reference) does NOT qualify, since that file does not reconstruct
+    /// from it.
     ///
-    /// LIMITATION (tracked in #436): this verifies *reference*, not *provenance*.
-    /// Because the CAS is global and non-namespaced, a writer can reference a
-    /// merkle they did not upload. This is sound for public / same-trust-domain
-    /// content (the only XET fetch enabled today), but NOT sufficient isolation
-    /// for PRIVATE multitenant XET content — that path must stay gated until #436
-    /// (per-tenant CAS namespacing or commit-provenance verification) lands.
-    /// A real git-xet pointer is parsed and the merkle field is matched exactly
-    /// (not a loose substring of arbitrary blob text).
+    /// This matches HF Xet's model: the CAS stays GLOBAL and content-addressed
+    /// (cross-repo dedup is preserved — the storage win), and isolation is
+    /// enforced at the READ-AUTHORIZATION layer: "you can only read chunks
+    /// required to reproduce files you have access to, and no more." Possessing a
+    /// content hash is never a capability; access keys on repo permission
+    /// (condition (a)) AND the content being a reconstruction target in that repo.
+    ///
+    /// Granularity (#436): the binding here is FILE-LEVEL — the requested merkle
+    /// must equal a tracked file's xet/lfs content-OID. Chunk-range-level
+    /// entitlement (verifying a requested chunk address is in a file's mdb_shard
+    /// reconstruction manifest) is sound but heavier and is DEFERRED; getBlob's
+    /// content union addresses whole files by their OID, so file-level binding is
+    /// the correct grain for the current wire.
     async fn repo_contains_xet_merkle(
         &self,
         repo_id: &git2db::RepoId,
@@ -2993,15 +3012,22 @@ impl MetricsRegistryClient for RegistryClient {
 
 
 
-/// Parse a git-xet / git-lfs pointer file and report whether its content-hash
-/// field EXACTLY equals `merkle_hex`. This is an exact field match, not a loose
-/// substring scan — an arbitrary text blob that merely contains the hex string
-/// (e.g. in a comment or unrelated field) does NOT count as a reference.
+/// Parse a git-xet / git-lfs pointer file and report whether `merkle_hex` is the
+/// pointer's **content-hash / OID field** — i.e. the address this tracked file
+/// genuinely reconstructs *from*. This is the entitlement-by-reconstruction
+/// primitive: a `true` result means "the requested merkle is the content-OID of
+/// this file," not merely "the file's text mentions the hex somewhere."
+///
+/// The match is on the OID field only (exact, case-insensitive on the hex). An
+/// arbitrary text blob that contains the hex in a comment or unrelated field does
+/// NOT count — that was the planted-reference gap (#436): a writer could check in
+/// a blob naming a merkle they aren't entitled to and (under a substring scan)
+/// borrow read access to it over the global dedup store. Binding to the OID field
+/// closes it, because the file only reconstructs from its own content-OID.
 ///
 /// Recognized forms (one key=value / `key value` per line):
 ///   - git-lfs:  `oid sha256:<hex>`
 ///   - git-xet:  `xet://<hex>` or `merkle: <hex>` / `merklehash = <hex>`
-/// Matching is case-insensitive on the hex.
 fn xet_pointer_references_merkle(text: &str, merkle_hex: &str) -> bool {
     let want = merkle_hex.trim().to_ascii_lowercase();
     if want.is_empty() {
@@ -3082,6 +3108,38 @@ mod xet_pointer_tests {
     fn rejects_empty_merkle() {
         let ptr = format!("version https://git-lfs.github.com/spec/v1\noid sha256:{HEX}\n");
         assert!(!xet_pointer_references_merkle(&ptr, ""));
+    }
+
+    #[test]
+    fn rejects_pointer_naming_merkle_in_non_oid_field() {
+        // The #436 entitlement-by-reconstruction core: a real, pointer-SHAPED file
+        // (it has the version marker) that names the requested merkle somewhere
+        // OTHER than its content-OID field — here as a trailing comment and as the
+        // `size` value — does NOT authorize the merkle. Its own OID is unrelated,
+        // so this file does not reconstruct from the requested address. Under the
+        // old reference/substring model this planted reference would have leaked
+        // read access over the global dedup store.
+        let other = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let planted = format!(
+            "version https://git-lfs.github.com/spec/v1\n\
+             oid sha256:{other}\n\
+             size {HEX}\n\
+             # see also {HEX}\n"
+        );
+        assert!(
+            !xet_pointer_references_merkle(&planted, HEX),
+            "merkle named outside the OID field must NOT count as a reconstruction target"
+        );
+        // Sanity: the same pointer DOES authorize its genuine content-OID.
+        assert!(xet_pointer_references_merkle(&planted, other));
+    }
+
+    #[test]
+    fn xet_merkle_field_is_reconstruction_target() {
+        // A git-xet pointer whose merkle field equals the requested hash is a
+        // genuine reconstruction target → entitled.
+        let ptr = format!("version https://xet.example/v1\nmerklehash = {HEX}\nsize 42\n");
+        assert!(xet_pointer_references_merkle(&ptr, HEX));
     }
 }
 
@@ -3239,6 +3297,174 @@ mod tests {
             "getBlob with empty grantRepo must be denied (hash is not a capability), got: {res:?}"
         );
         let _ = handle.stop().await;
+    }
+
+    // ── #436 entitlement-by-reconstruction (file-level) over global dedup ──────
+    // These exercise condition (b) for XET against a REAL registered repo with a
+    // committed git-lfs pointer. The fix: a merkle is authorized iff it is the
+    // content-OID a tracked file reconstructs FROM (file-level entitlement), not
+    // merely because some blob in the repo names the hex.
+
+    /// Build a RegistryService (not spawned over a transport) whose base_dir
+    /// already tracks one non-bare repo. `commit_files` are written + committed
+    /// into that repo's working tree at HEAD before the service opens base_dir.
+    /// Returns the service and the registered RepoId.
+    async fn registry_with_committed_repo(
+        base_dir: &std::path::Path,
+        repo_name: &str,
+        commit_files: &[(&str, &str)],
+    ) -> (RegistryService, RepoId) {
+        use git2::{Repository, Signature};
+        use hyprstream_service::InprocManager;
+        use hyprstream_rpc::transport::TransportConfig;
+
+        let _ = hyprstream_rpc::envelope::install_verify_config(
+            hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+                policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
+                pq_store: None,
+            },
+        );
+
+        // 1. Create a non-bare git repo with a working tree + committed files.
+        let repo_path = base_dir.join(repo_name);
+        std::fs::create_dir_all(&repo_path).expect("test: mkdir repo");
+        let repo = Repository::init(&repo_path).expect("test: git init");
+        {
+            let mut index = repo.index().expect("test: index");
+            for (rel, contents) in commit_files {
+                std::fs::write(repo_path.join(rel), contents).expect("test: write file");
+                index.add_path(std::path::Path::new(rel)).expect("test: index add");
+            }
+            index.write().expect("test: index write");
+            let tree_oid = index.write_tree().expect("test: write tree");
+            let tree = repo.find_tree(tree_oid).expect("test: find tree");
+            let sig = Signature::now("Test", "test@example.com").expect("test: sig");
+            repo.commit(Some("HEAD"), &sig, &sig, "fixture", &tree, &[])
+                .expect("test: commit");
+        }
+
+        // 2. Register the repo with Git2DB via the builder API.
+        let repo_id = RepoId::new();
+        {
+            let mut git2db = Git2DB::open(base_dir).await.expect("test: open git2db");
+            git2db
+                .register(repo_id.clone())
+                .name(repo_name)
+                .worktree_path(&repo_path)
+                .url(String::new())
+                .exec()
+                .await
+                .expect("test: register repo");
+        }
+
+        // 3. Construct the service over the now-populated base_dir. A real (but
+        // unused-by-these-tests) PolicyService backs the client so for_endpoint
+        // resolves; repo_contains_xet_merkle never touches it.
+        let (signing_key, _vk) = generate_signing_keypair();
+        let policy_ep = format!("test-policy-436-{repo_name}");
+        let policy_manager =
+            Arc::new(PolicyManager::permissive().await.expect("test: policy manager"));
+        let policy_git2db = Arc::new(tokio::sync::RwLock::new(
+            Git2DB::open(base_dir).await.expect("test: open git2db for policy"),
+        ));
+        let policy_service = PolicyService::new(
+            policy_manager,
+            Arc::new(signing_key.clone()),
+            crate::config::TokenConfig::default(),
+            policy_git2db,
+            TransportConfig::inproc(&policy_ep),
+        );
+        let manager = InprocManager::new();
+        let policy_handle = manager
+            .spawn(Box::new(policy_service))
+            .await
+            .expect("test: start policy");
+        std::mem::forget(policy_handle);
+        let policy_client: PolicyClient = PolicyClient::for_endpoint(
+            &format!("inproc://{policy_ep}"),
+            signing_key.clone(),
+            signing_key.verifying_key(),
+            None,
+        )
+        .expect("test: policy client");
+        let registry_transport = TransportConfig::inproc(&format!("test-registry-436-{repo_name}"));
+        let service = RegistryService::new(base_dir, policy_client, registry_transport, signing_key)
+            .await
+            .expect("test: create registry service");
+        (service, repo_id)
+    }
+
+    const MERKLE_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const MERKLE_B: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    #[tokio::test]
+    async fn test_xet_merkle_permitted_when_file_reconstructs_from_it() {
+        // (a) PERMIT: the repo tracks a git-lfs pointer whose content-OID equals
+        // the requested merkle → the file genuinely reconstructs from this
+        // address → entitled.
+        let temp_dir = TempDir::new().expect("test: temp dir");
+        let pointer = format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{MERKLE_A}\nsize 4096\n"
+        );
+        let (service, repo_id) = registry_with_committed_repo(
+            temp_dir.path(),
+            "model-permit",
+            &[("model.safetensors", &pointer)],
+        )
+        .await;
+
+        let permitted = service
+            .repo_contains_xet_merkle(&repo_id, MERKLE_A)
+            .await
+            .expect("test: containment check");
+        assert!(
+            permitted,
+            "merkle that equals a tracked file's content-OID must be a reconstruction target"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_xet_merkle_denied_for_planted_reference() {
+        // (b) DENY — the core #436 fix: the repo tracks a real pointer (so it has
+        // SOME xet content), and ALSO checks in a blob that merely NAMES MERKLE_B
+        // (the private content the caller is not entitled to) outside any OID
+        // field. MERKLE_B is not the content-OID of any file the caller can
+        // reconstruct here → must be denied. Under the old reference/substring
+        // model this planted reference would have leaked read access to MERKLE_B
+        // over the global dedup store.
+        let temp_dir = TempDir::new().expect("test: temp dir");
+        let legit_pointer = format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{MERKLE_A}\nsize 4096\n"
+        );
+        // A pointer-shaped file that names MERKLE_B only in non-OID positions.
+        let planted = format!(
+            "version https://git-lfs.github.com/spec/v1\n\
+             oid sha256:{MERKLE_A}\n\
+             size {MERKLE_B}\n\
+             # borrowed: {MERKLE_B}\n"
+        );
+        let (service, repo_id) = registry_with_committed_repo(
+            temp_dir.path(),
+            "model-planted",
+            &[("model.safetensors", &legit_pointer), ("planted.txt", &planted)],
+        )
+        .await;
+
+        let denied = service
+            .repo_contains_xet_merkle(&repo_id, MERKLE_B)
+            .await
+            .expect("test: containment check");
+        assert!(
+            !denied,
+            "a planted reference that is not any file's content-OID must NOT authorize the merkle"
+        );
+
+        // Sanity: the legitimately-tracked merkle (MERKLE_A) IS still permitted.
+        let still_permitted = service
+            .repo_contains_xet_merkle(&repo_id, MERKLE_A)
+            .await
+            .expect("test: containment check");
+        assert!(still_permitted, "the genuine content-OID must remain entitled");
     }
 
     #[tokio::test]
