@@ -494,17 +494,18 @@ impl LlamaAttention {
             for (name, proj) in [("q_proj", &mut q), ("k_proj", &mut k), ("v_proj", &mut v)] {
                 if delta.has_module(name, self.layer_idx) {
                     let correction = delta.forward_2d(&hidden_states_2d, name, self.layer_idx)?;
-                    let kind = proj.kind();
                     if start_pos == 0 && self.layer_idx == 0 {
                         tracing::info!("[TTT] Layer 0 {}: correction_norm={:.6}, proj_norm={:.4}, ratio={:.6}",
                             name, correction.norm().double_value(&[]),
                             proj.norm().double_value(&[]),
                             correction.norm().double_value(&[]) / (proj.norm().double_value(&[]) + 1e-10));
                     }
-                    *proj = proj.f_add(&correction.to_kind(kind))
+                    // #139/#440: coerce fp32 delta to base dtype before adding (shared helper).
+                    let correction_size = correction.size();
+                    *proj = proj.f_add(&correction.to_kind(proj.kind()))
                         .map_err(|e| anyhow::anyhow!(
                             "Delta correction shape mismatch at layer {} {}: proj {:?} vs correction {:?}: {}",
-                            self.layer_idx, name, proj.size(), correction.size(), e
+                            self.layer_idx, name, proj.size(), correction_size, e
                         ))?;
                 }
             }
