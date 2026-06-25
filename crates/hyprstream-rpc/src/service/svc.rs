@@ -358,10 +358,31 @@ pub trait RequestService: 'static {
         None
     }
 
-    /// Resolve a signer key to an authorization subject via the trust store.
+    /// Resolve a verified signer key to an authorization subject (#446).
     ///
-    /// Returns `Some(subject)` if the key is cached and not expired.
-    /// Default implementation returns `None` (no trust store available).
+    /// Consulted by `verify_claims` for an unauthenticated (no-JWT) request: the
+    /// envelope `cnf` (the signer's Ed25519 pubkey, already verified by the COSE
+    /// signature check) is mapped to its authoritative subject so a *signed*
+    /// service-to-service IPC caller resolves as its `service:<name>` identity
+    /// instead of `anonymous`.
+    ///
+    /// The default routes through the process-global [key→subject
+    /// resolver](crate::auth::key_subject_resolver), which the trust-store layer
+    /// (`hyprstream-service`, populated fail-closed under #441) installs at
+    /// startup. This wires *every* service — including those whose crate cannot
+    /// depend on the trust store (e.g. `DiscoveryService`) — without each one
+    /// re-implementing the lookup.
+    ///
+    /// Fail-closed: an unregistered key resolves to `None` → `anonymous`, so a
+    /// genuinely anonymous caller stays denied for policy-gated writes. Override
+    /// only to bypass or narrow this resolution; never to fabricate identity.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn resolve_key_subject(&self, signer_pubkey: &[u8; 32]) -> Option<crate::envelope::Subject> {
+        crate::auth::key_subject_resolver::resolve_subject(signer_pubkey)
+    }
+
+    /// Resolve a signer key to a subject (WASM: no trust store available).
+    #[cfg(target_arch = "wasm32")]
     fn resolve_key_subject(&self, _signer_pubkey: &[u8; 32]) -> Option<crate::envelope::Subject> {
         None
     }
@@ -870,6 +891,127 @@ mod empty_iss_gate_tests {
         // from_callback_service is a genuine in-process self-call.
         let cb = EnvelopeContext::from_callback_service(1, "inference");
         assert!(cb.is_local_caller());
+    }
+}
+
+/// Service-to-service IPC identity resolution (#446).
+///
+/// A signed IPC request carries the caller's verified Ed25519 signer pubkey in
+/// `cnf` (the `AnySigner` plane used by UDS/iroh verifies the COSE composite
+/// against it). Without a JWT, `verify_claims` must map that key to its
+/// authoritative `service:<name>` subject via the process-global key→subject
+/// resolver (the trust-store seam installed under #441) — instead of falling
+/// back to `anonymous`. A genuinely anonymous caller (unregistered key) must
+/// STILL resolve to `anonymous` so policy-gated writes stay denied (fail-closed).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod ipc_key_identity_tests {
+    use super::*;
+    use crate::auth::key_subject_resolver::{set_global as set_key_resolver, KeySubjectResolver};
+    use crate::transport::TransportConfig;
+    use ed25519_dalek::SigningKey;
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+
+    /// Serializes tests that install the process-global key→subject resolver.
+    static RESOLVER_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Minimal service that uses the DEFAULT `resolve_key_subject` (the #446
+    /// seam under test) — it does not override identity resolution.
+    struct PlainService {
+        signing_key: SigningKey,
+        transport: TransportConfig,
+    }
+
+    #[async_trait(?Send)]
+    impl RequestService for PlainService {
+        async fn handle_request(&self, _ctx: &EnvelopeContext, _payload: &[u8]) -> Result<(Vec<u8>, Option<Continuation>)> {
+            Ok((vec![], None))
+        }
+        fn name(&self) -> &str { "discovery" }
+        fn transport(&self) -> &TransportConfig { &self.transport }
+        fn signing_key(&self) -> SigningKey { self.signing_key.clone() }
+        fn pq_signing_key(&self) -> Option<crate::crypto::pq::MlDsaSigningKey> { None }
+    }
+
+    /// Test resolver mapping a fixed set of pubkeys → subjects (the trust store
+    /// stand-in). Unknown keys resolve to `None`.
+    struct MapResolver {
+        bindings: HashMap<[u8; 32], String>,
+    }
+
+    impl KeySubjectResolver for MapResolver {
+        fn resolve_subject(&self, signer_pubkey: &[u8; 32]) -> Option<Subject> {
+            self.bindings.get(signer_pubkey).map(|s| Subject::new(s.clone()))
+        }
+    }
+
+    /// Build a no-JWT context whose `cnf` is the given signer pubkey (the
+    /// AnySigner/UDS plane: identity carried only by the verified signer key).
+    fn ctx_for_signer(signer_pubkey: [u8; 32]) -> EnvelopeContext {
+        EnvelopeContext {
+            request_id: 1,
+            claims: None,
+            jwt_token: None,
+            key_derived_subject: Subject::anonymous(),
+            jwt_subject: None,
+            cnf: signer_pubkey,
+            envelope_wit_hash: None,
+            client_dh_public: None,
+            // AnySigner / networked-or-UDS plane.
+            is_local_caller: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_service_key_resolves_as_service_subject() {
+        let _guard = RESOLVER_LOCK.lock();
+
+        let caller = SigningKey::from_bytes(&[11u8; 32]);
+        let caller_pub = caller.verifying_key().to_bytes();
+
+        // Trust store has the caller's key bound to service:discovery (#441).
+        let mut bindings = HashMap::new();
+        bindings.insert(caller_pub, "service:discovery".to_owned());
+        set_key_resolver(std::sync::Arc::new(MapResolver { bindings }));
+
+        let svc = PlainService {
+            signing_key: SigningKey::from_bytes(&[22u8; 32]),
+            transport: TransportConfig::inproc("discovery"),
+        };
+
+        let mut ctx = ctx_for_signer(caller_pub);
+        svc.verify_claims(&mut ctx).await.expect("verify_claims ok");
+
+        // The signed IPC caller resolves as its authoritative service identity,
+        // NOT anonymous — so the existing discovery:* grant applies.
+        assert_eq!(ctx.subject().to_string(), "service:discovery");
+        assert!(!ctx.subject().is_anonymous());
+    }
+
+    #[tokio::test]
+    async fn unregistered_key_stays_anonymous() {
+        let _guard = RESOLVER_LOCK.lock();
+
+        // Resolver knows ONLY about some other (registered) key.
+        let registered = SigningKey::from_bytes(&[33u8; 32]).verifying_key().to_bytes();
+        let mut bindings = HashMap::new();
+        bindings.insert(registered, "service:discovery".to_owned());
+        set_key_resolver(std::sync::Arc::new(MapResolver { bindings }));
+
+        let svc = PlainService {
+            signing_key: SigningKey::from_bytes(&[22u8; 32]),
+            transport: TransportConfig::inproc("discovery"),
+        };
+
+        // A genuinely anonymous caller signs with an UNREGISTERED key.
+        let anon_pub = SigningKey::from_bytes(&[44u8; 32]).verifying_key().to_bytes();
+        let mut ctx = ctx_for_signer(anon_pub);
+        svc.verify_claims(&mut ctx).await.expect("verify_claims ok");
+
+        // Fail-closed: no registered binding → anonymous → still denied writes.
+        assert!(ctx.subject().is_anonymous());
+        assert_eq!(ctx.subject().to_string(), "anonymous");
     }
 }
 

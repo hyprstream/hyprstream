@@ -217,13 +217,45 @@ impl Default for TrustStore {
     }
 }
 
+/// Adapter exposing the global trust store as the `hyprstream-rpc`
+/// signer-key → subject resolver (#446).
+///
+/// `hyprstream-rpc`'s dispatch core cannot reference the trust store directly
+/// (the dependency points the other way), so it defines a
+/// [`hyprstream_rpc::auth::KeySubjectResolver`] seam. This adapter wires the
+/// authoritative trust store (populated fail-closed under #441) into that seam
+/// so a signed service-to-service IPC caller resolves as its `service:<name>`
+/// identity instead of `anonymous`. Unregistered keys resolve to `None`
+/// (fail-closed); resolution never fabricates an identity.
+struct TrustStoreSubjectResolver;
+
+impl hyprstream_rpc::auth::KeySubjectResolver for TrustStoreSubjectResolver {
+    fn resolve_subject(
+        &self,
+        signer_pubkey: &[u8; 32],
+    ) -> Option<hyprstream_rpc::envelope::Subject> {
+        global_trust_store().resolve_subject(signer_pubkey)
+    }
+}
+
 /// Global trust store singleton.
 ///
 /// Set once during startup (before any service threads spawn), readable
 /// from any thread thereafter. This is the "CA bundle" — the set of
 /// keys the process trusts.
-static TRUST_STORE: once_cell::sync::Lazy<TrustStore> =
-    once_cell::sync::Lazy::new(TrustStore::new);
+///
+/// On first access the trust store also installs itself as the process-global
+/// `hyprstream-rpc` key→subject resolver (#446), so every dispatched request
+/// (across all service crates) maps a verified signer key to its authoritative
+/// `service:<name>`/user subject via this store. The trust store is always
+/// touched during startup, so this guarantees the resolver is wired before any
+/// request is served.
+static TRUST_STORE: once_cell::sync::Lazy<TrustStore> = once_cell::sync::Lazy::new(|| {
+    hyprstream_rpc::auth::set_global_key_subject_resolver(std::sync::Arc::new(
+        TrustStoreSubjectResolver,
+    ));
+    TrustStore::new()
+});
 
 /// Get the global trust store.
 pub fn global_trust_store() -> &'static TrustStore {
@@ -380,5 +412,39 @@ mod tests {
 
         store.remove(&key);
         assert!(!store.is_authorized(&key, "model"));
+    }
+
+    /// #446: accessing the global trust store installs it as the `hyprstream-rpc`
+    /// signer-key → subject resolver, and a registered service key resolves to
+    /// its authoritative `service:<scope>` subject through that seam (so a signed
+    /// service-to-service IPC caller is no longer anonymous). An unregistered key
+    /// resolves to `None` (fail-closed → anonymous).
+    #[test]
+    fn global_resolver_resolves_registered_service_key() {
+        // Touching the global store installs the global key→subject resolver.
+        let store = global_trust_store();
+        let (_, service_key) = random_key();
+        let (_, unregistered) = random_key();
+        store.insert(service_key, make_attestation(&["discovery"], 0));
+
+        // The rpc-layer global resolver routes through this same trust store.
+        let registered = hyprstream_rpc::auth::key_subject_resolver::resolve_subject(
+            &service_key.to_bytes(),
+        );
+        assert_eq!(
+            registered.map(|s| s.to_string()),
+            Some("service:discovery".to_owned()),
+            "registered service key must resolve as service:discovery, not anonymous"
+        );
+
+        // Fail-closed: an unregistered key resolves to None → anonymous.
+        assert!(
+            hyprstream_rpc::auth::key_subject_resolver::resolve_subject(&unregistered.to_bytes())
+                .is_none(),
+            "unregistered key must NOT resolve to any identity"
+        );
+
+        // Cleanup so we don't leak into other tests sharing the global store.
+        store.remove(&service_key);
     }
 }
