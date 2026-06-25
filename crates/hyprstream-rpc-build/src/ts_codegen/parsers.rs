@@ -946,14 +946,17 @@ fn emit_union_struct_list_field_expr(
             uf.discriminant_value, uf.name
         ));
         let data_expr = emit_inner_variant_read_from("_el", Some(uf), &uf.type_name, schema, 0);
+        // `as const` narrows the literal so the mapped array types as the typed
+        // discriminated union (e.g. StreamPayload[]) rather than widening to
+        // `{ variant: string; ... }[]`.
         s.push_str(&format!(
-            "        return {{ {nuf_str}{nuf_comma}variant: '{}', data: {data_expr} }};\n",
+            "        return {{ {nuf_str}{nuf_comma}variant: '{}' as const, data: {data_expr} }};\n",
             uf.name
         ));
     }
 
     s.push_str(&format!(
-        "      default:\n        return {{ {nuf_str}{nuf_comma}variant: 'unknown', data: null }};\n"
+        "      default:\n        return {{ {nuf_str}{nuf_comma}variant: 'unknown' as const, data: null }};\n"
     ));
     s.push_str("    }\n");
     s.push_str("  })");
