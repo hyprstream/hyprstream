@@ -770,7 +770,8 @@ impl GatedDeltaNetLayer {
         let projected = if let Some((delta, layer_idx)) = delta {
             if delta.has_module("o_proj", layer_idx) {
                 // forward_2d(flat): [B*seq, val_dim] → [B*seq, hidden_size]
-                &projected + delta.forward_2d(&flat, "o_proj", layer_idx)?
+                // #139/#440: coerce fp32 delta to base dtype before adding.
+                super::add_delta(&projected, delta.forward_2d(&flat, "o_proj", layer_idx)?)
             } else {
                 projected
             }
@@ -916,14 +917,16 @@ impl Qwen3_5FullAttention {
                 } else {
                     q_correction.narrow(1, 0, q_half)
                 };
-                let corrected_q = &q_part + &q_correction;
+                // #139/#440: coerce fp32 delta to base dtype before adding (after narrow).
+                let corrected_q = super::add_delta(&q_part, q_correction);
                 Tensor::cat(&[corrected_q, gate_part], 1)
             } else {
                 q_raw
             };
 
             let v_out = if d.has_module("v_proj", layer_idx) {
-                &v_raw + d.forward_2d(&h2, "v_proj", layer_idx)?
+                // #139/#440: coerce fp32 delta to base dtype before adding.
+                super::add_delta(&v_raw, d.forward_2d(&h2, "v_proj", layer_idx)?)
             } else {
                 v_raw
             };
@@ -1032,7 +1035,8 @@ impl Qwen3_5FullAttention {
         // Delta injection on o_proj (after gate, before linear projection)
         let ctx_gated = if let Some((d, layer_idx)) = delta {
             if d.has_module("o_proj", layer_idx) {
-                &ctx_gated + d.forward_2d(&ctx_gated, "o_proj", layer_idx)?
+                // #139/#440: coerce fp32 delta to base dtype before adding.
+                super::add_delta(&ctx_gated, d.forward_2d(&ctx_gated, "o_proj", layer_idx)?)
             } else {
                 ctx_gated
             }
@@ -2834,6 +2838,46 @@ mod pipeline_tests {
             );
             assert!(gw > 0.0, "grad for {k} is zero — autograd path not exercised");
         }
+    }
+
+    /// #440 regression guard: BF16 base model + fp32 TTT/LoRA delta must NOT panic
+    /// in the delta-injection path (the #139 class of dtype mismatch).
+    ///
+    /// The base model is built BF16 (`Kind::BFloat16`) while `tiny_delta()` builds
+    /// an fp32 delta (matching `ttn_profile.rs` forcing `Kind::Float`). Before the
+    /// #440 fix the qwen3_5 delta adds (`q_proj`/`v_proj`/`o_proj`) added fp32
+    /// directly to bf16 activations → `addmm_impl_cpu_` panic. This drives a full
+    /// forward through both mixer kinds (GDN + full-attn) with the delta active.
+    #[test]
+    fn forward_with_bf16_base_and_fp32_delta_does_not_panic() {
+        let _g = tch::no_grad_guard();
+        let dtype = Kind::BFloat16;
+
+        // Build the model in BF16 (cast tiny_weights to bf16 first).
+        let mut w = tiny_weights();
+        for (_k, t) in w.iter_mut() {
+            *t = t.to_kind(dtype);
+        }
+        let model = Qwen3_5Model::from_weights(
+            &mut w, tiny_config(), None, &Device::Cpu, dtype, KVQuantType::None,
+        )
+        .unwrap();
+
+        // fp32 delta (tiny_delta builds Kind::Float A/B), exercising o_proj on both
+        // mixer kinds across all layers.
+        let delta = tiny_delta();
+
+        let input = Tensor::from_slice(&[3i64, 7, 1, 4, 9, 2]).reshape([1, 6]);
+        let emb = model.embed_tokens(&input).unwrap();
+        assert_eq!(emb.kind(), dtype, "bf16 embeddings");
+
+        // The forward with delta must not panic on bf16 + fp32 mismatch...
+        let out = model
+            .forward_layers(&emb, 0..LAYERS, 0, Some(&delta))
+            .expect("bf16 base + fp32 delta forward must not error");
+        // ...and must remain in the base (bf16) dtype.
+        assert_eq!(out.kind(), dtype, "delta-injected forward must stay bf16");
+        assert!(out.isfinite().all().int64_value(&[]) == 1, "output must be finite");
     }
 
     #[test]

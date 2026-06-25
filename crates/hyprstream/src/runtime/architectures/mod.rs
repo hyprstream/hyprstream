@@ -20,6 +20,21 @@ pub mod siglip;
 pub use config::{ArchitectureConfig, AttentionConfig};
 // pub use lora_adapter::ArchitectureAwareLoRAAdapter; // Module removed
 
+/// Add a TTT/LoRA delta correction to a base activation, coercing the correction
+/// to the base tensor's dtype first.
+///
+/// The base model may run in BF16 while the delta matrix is forced to fp32
+/// (see `runtime/ttn_profile.rs`). Adding fp32 directly to a bf16 tensor panics
+/// in `addmm_impl_cpu_` ("expected m1 and m2 to have the same dtype").
+///
+/// This helper is the single place that performs the dtype coercion so the fix
+/// cannot be missed when a new architecture adds a delta-injection site.
+/// See #139 (original llama fix) and #440 (qwen3_5 regression).
+#[inline]
+pub fn add_delta(base: &Tensor, correction: Tensor) -> Tensor {
+    base + correction.to_kind(base.kind())
+}
+
 /// Supported model architectures
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModelArchitecture {
@@ -553,5 +568,19 @@ mod tests {
             ModelArchitecture::Custom("MyModel".to_owned()).name(),
             "MyModel"
         );
+    }
+
+    /// #139/#440 regression guard: adding an fp32 delta correction to a BF16 base
+    /// activation must NOT panic in addmm/add and must yield a BF16 result.
+    #[test]
+    fn add_delta_coerces_fp32_correction_to_bf16_base() {
+        use tch::{Device, Kind, Tensor};
+        let base = Tensor::ones([2, 4], (Kind::BFloat16, Device::Cpu));
+        let correction = Tensor::ones([2, 4], (Kind::Float, Device::Cpu)) * 0.5;
+        // Without the coercion this panics: "expected m1 and m2 to have the same dtype".
+        let out = add_delta(&base, correction);
+        assert_eq!(out.kind(), Kind::BFloat16, "result must match base dtype");
+        // 1.0 (bf16) + 0.5 (coerced) = 1.5, representable in bf16.
+        assert!((out.double_value(&[0, 0]) - 1.5).abs() < 1e-2);
     }
 }
