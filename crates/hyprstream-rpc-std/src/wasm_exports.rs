@@ -52,10 +52,12 @@ impl VfsShell {
     ) -> Result<VfsShell, JsError> {
         console_error_panic_hook::set_once();
 
-        use hyprstream_rpc::rpc_client::{RpcClientImpl, RpcClient};
-        use hyprstream_rpc::signer::JsSigner;
-        use hyprstream_rpc::web_transport::WtConnection;
         use hyprstream_rpc::crypto::VerifyingKey;
+        // #409 Path A: route through the wasm32 `dial()` factory instead of
+        // hand-assembling `RpcClientImpl` here. This is the browser counterpart
+        // to native `dial()` — same `Arc<dyn RpcClient>` return, hiding the
+        // concrete `WtConnection` transport behind the object-safe trait.
+        use hyprstream_rpc::dial_wasm;
 
         // TODO: Get server verifying key from discovery endpoint
         let server_key = VerifyingKey::from_bytes(&[0u8; 32]).unwrap_or_else(|_| {
@@ -69,24 +71,32 @@ impl VfsShell {
 
         // Connect to registry
         web_sys::console::log_1(&"[VfsShell] Connecting to registry...".into());
-        let reg_transport = WtConnection::connect(registry_url, cert_hash.as_deref())
-            .await.map_err(|e| JsError::new(&e.to_string()))?;
-        let reg_signer = JsSigner::new(signer_pubkey, sign_fn.clone())
+        let reg_signer = hyprstream_rpc::signer::JsSigner::new(signer_pubkey, sign_fn.clone())
             .map_err(|e| JsError::new(&e.to_string()))?;
-        let reg_client: Arc<dyn RpcClient> = Arc::new(
-            RpcClientImpl::new(reg_signer, reg_transport, Some(server_key.clone()))
-        );
+        let reg_client: Arc<dyn hyprstream_rpc::rpc_client::RpcClient> = dial_wasm::dial(
+            registry_url,
+            cert_hash.as_deref(),
+            reg_signer,
+            Some(server_key.clone()),
+            None,
+        )
+        .await
+        .map_err(|e| JsError::new(&e.to_string()))?;
         web_sys::console::log_1(&"[VfsShell] Registry connected".into());
 
         // Connect to model
         web_sys::console::log_1(&"[VfsShell] Connecting to model...".into());
-        let model_transport = WtConnection::connect(model_url, cert_hash.as_deref())
-            .await.map_err(|e| JsError::new(&e.to_string()))?;
-        let model_signer = JsSigner::new(signer_pubkey, sign_fn)
+        let model_signer = hyprstream_rpc::signer::JsSigner::new(signer_pubkey, sign_fn)
             .map_err(|e| JsError::new(&e.to_string()))?;
-        let model_client: Arc<dyn RpcClient> = Arc::new(
-            RpcClientImpl::new(model_signer, model_transport, Some(server_key))
-        );
+        let model_client: Arc<dyn hyprstream_rpc::rpc_client::RpcClient> = dial_wasm::dial(
+            model_url,
+            cert_hash.as_deref(),
+            model_signer,
+            Some(server_key),
+            None,
+        )
+        .await
+        .map_err(|e| JsError::new(&e.to_string()))?;
         web_sys::console::log_1(&"[VfsShell] Model connected".into());
 
         // Build VFS namespace

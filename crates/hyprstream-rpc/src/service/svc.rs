@@ -691,11 +691,12 @@ pub struct QuicLoopConfig {
     /// Callback invoked after QUIC binding succeeds, with (service_name, actual_addr, server_name).
     /// Used to announce endpoints to the DiscoveryService.
     pub on_quic_bound: Option<Box<dyn FnOnce(String, std::net::SocketAddr, String) + Send>>,
-    /// #282: when `true`, the spawner binds an `IrohSubstrate` in PARALLEL to the
-    /// quinn endpoint, serving BOTH ALPNs (`hyprstream-rpc/1` + `moql`) with the
-    /// same request processor + moq origin, and installs the shared client
-    /// endpoint for outbound iroh dials. Native-only. Defaults to `false`
-    /// (off) so the working quinn-only deployment is unchanged unless opted in.
+    /// #410/#282: when `true` (the default), the spawner binds an `IrohSubstrate`
+    /// as the PRIMARY production endpoint, serving BOTH ALPNs
+    /// (`hyprstream-rpc/1` + `moql`) with the same request processor + moq
+    /// origin, and installs the shared client endpoint for outbound iroh dials.
+    /// The quinn endpoint is bound in parallel for back-compat. Native-only.
+    /// Set `false` (via `[quic] iroh = false`) to run quinn-only (legacy).
     #[cfg(not(target_arch = "wasm32"))]
     pub iroh_enabled: bool,
     /// #282: optional #137 federation admission hook applied at the iroh accept

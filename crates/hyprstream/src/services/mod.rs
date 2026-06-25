@@ -79,6 +79,7 @@ pub mod oauth;
 pub mod oai;
 pub mod policy;
 pub mod registry;
+pub mod router;
 pub mod fs;
 pub mod remote_mount;
 pub mod remote_registry_mount;

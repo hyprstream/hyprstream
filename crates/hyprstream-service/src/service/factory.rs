@@ -52,9 +52,10 @@ pub struct QuicSharedConfig {
     /// JWT verifying key (derived from root via HKDF "hyprstream-jwt-v1").
     /// Published as `x_root_pubkey` in RFC 9728 metadata for client-side trust pinning.
     pub jwt_verifying_key: Option<ed25519_dalek::VerifyingKey>,
-    /// #282: bind an iroh substrate (ALPNs `hyprstream-rpc/1` + `moql`) in
-    /// parallel to the quinn endpoint for every QUIC-enabled service. Off by
-    /// default; an operator opts in via `[quic] iroh = true`.
+    /// #410/#282: bind an iroh substrate (ALPNs `hyprstream-rpc/1` + `moql`)
+    /// as the PRIMARY production transport, in parallel to the quinn endpoint
+    /// (kept for back-compat), for every QUIC-enabled service. On by default;
+    /// an operator opts out via `[quic] iroh = false` to run quinn-only (legacy).
     pub iroh_enabled: bool,
 }
 

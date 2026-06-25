@@ -221,7 +221,7 @@ async fn resolve_model_path(
 
     // Inline model path resolution
     let path_result: Result<std::path::PathBuf, _> = async {
-        let tracked = state.registry.get_by_name(&model_ref.model).await?;
+        let tracked = state.registry.get_by_name(model_ref.name()).await?;
         let repo = state.registry.repo(&tracked.id);
         let branch = match &model_ref.git_ref {
             crate::storage::GitRef::Branch(name) => name.clone(),
@@ -230,11 +230,11 @@ async fn resolve_model_path(
         // Verify worktree exists
         let wts = repo.list_worktrees().await?;
         if !wts.iter().any(|wt| wt.branch_name == branch) {
-            anyhow::bail!("worktree for {}:{} not found", model_ref.model, branch);
+            anyhow::bail!("worktree for {}:{} not found", model_ref.name(), branch);
         }
         // Derive path locally
         let storage_paths = crate::storage::StoragePaths::new()?;
-        storage_paths.worktree_path(&model_ref.model, &branch)
+        storage_paths.worktree_path(model_ref.name(), &branch)
     }.await;
 
     match path_result {
@@ -609,7 +609,7 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
         };
 
         let model_path = match async {
-            let tracked = state.registry.get_by_name(&model_ref.model).await?;
+            let tracked = state.registry.get_by_name(model_ref.name()).await?;
             let repo = state.registry.repo(&tracked.id);
             let branch = match &model_ref.git_ref {
                 crate::storage::GitRef::Branch(name) => name.clone(),
@@ -622,7 +622,7 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
             }
             // Derive path locally
             let storage_paths = crate::storage::StoragePaths::new()?;
-            storage_paths.worktree_path(&model_ref.model, &branch)
+            storage_paths.worktree_path(model_ref.name(), &branch)
         }.await {
             Ok(path) => path,
             Err(e) => {

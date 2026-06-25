@@ -17,6 +17,23 @@ pub use git2db::GitRef;
 ///   "llama3:HEAD~1"   -> model "llama3" with GitRef::Revspec("HEAD~1")
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ModelRef {
+    /// Local registry name of the model (e.g. `Qwen3-0.6B`).
+    ///
+    /// # Deprecation notice (#395)
+    ///
+    /// The name layer is being retired in favor of federated `at://` / `did:`
+    /// ModelRefs (see `services::model::ModelService::resolve_model_ref`). New
+    /// code should treat a model's identity as its content-addressed CID, not its
+    /// local registry name. Use [`ModelRef::name`] for read access — direct field
+    /// access is `#[deprecated]` to mark the direction without breaking callers.
+    ///
+    /// The field itself stays `pub` (and the constructor / parser remain) so the
+    /// migration is opt-in: every existing caller keeps compiling. The name layer
+    /// dies when all callers have migrated to `at://`.
+    #[deprecated(
+        since = "0.1.0",
+        note = "prefer at:// / did: federated ModelRefs (#395); use ModelRef::name() for read access"
+    )]
     pub model: String,
     pub git_ref: GitRef,
 }
@@ -24,6 +41,7 @@ pub struct ModelRef {
 
 impl ModelRef {
     /// Create a new ModelRef with default branch
+    #[allow(deprecated)] // constructs via field init; the field itself carries the deprecation
     pub fn new(model: String) -> Self {
         Self {
             model,
@@ -32,11 +50,25 @@ impl ModelRef {
     }
 
     /// Create a new ModelRef with a specific git reference
+    #[allow(deprecated)] // constructs via field init; the field itself carries the deprecation
     pub fn with_ref(model: String, git_ref: GitRef) -> Self {
         Self { model, git_ref }
     }
 
+    /// Read the local registry name.
+    ///
+    /// Non-deprecated accessor for the [`ModelRef::model`] field so internal
+    /// callers (registry lookup, worktree paths) don't trip the field-level
+    /// `#[deprecated]` lint during the name-layer retirement (#395). External
+    /// consumers reading `.model` by name get the deprecation notice; this
+    /// accessor is the sanctioned read path until the name layer is removed.
+    #[allow(deprecated)]
+    pub fn name(&self) -> &str {
+        &self.model
+    }
+
     /// Parse a model reference string
+    #[allow(deprecated)] // constructs via field init; the field itself carries the deprecation
     pub fn parse(s: &str) -> Result<Self> {
         // Still support UUID for backwards compatibility
         if let Ok(uuid) = Uuid::parse_str(s) {
@@ -78,8 +110,8 @@ impl ModelRef {
 impl fmt::Display for ModelRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.git_ref {
-            GitRef::DefaultBranch => write!(f, "{}", self.model),
-            _ => write!(f, "{}:{}", self.model, self.git_ref.display_name()),
+            GitRef::DefaultBranch => write!(f, "{}", self.name()),
+            _ => write!(f, "{}:{}", self.name(), self.git_ref.display_name()),
         }
     }
 }
@@ -165,6 +197,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(deprecated)] // asserts the deprecated `.model` field still carries the parsed name
     fn test_parse_model_ref() -> Result<()> {
         // Model only (default branch)
         let ref1 = ModelRef::parse("llama3")?;

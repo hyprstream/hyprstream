@@ -76,6 +76,17 @@ pub struct LoadedModel {
     /// Client for communicating with the InferenceService (built from
     /// `transport` via `dial()` — the co-located fast path).
     pub client: InferenceClient,
+    /// #322 leaf cell-router state for this model. Holds the session→owner
+    /// affinity map (heartbeat-lease renewal, KV-cache stickiness) and the
+    /// per-node load/health counters used by HRW placement. In v1 this is a
+    /// single co-located node (the router fast-paths to `client`); the
+    /// `load_state` set grows to multiple nodes when cross-host replicas are
+    /// resolved via the Resolver.
+    pub router: crate::services::router::CellRouter,
+    /// Replica-set snapshot for the router (one entry per known inference
+    /// server serving this model's OID). Updated as the Resolver yields new
+    /// reaches; consumed by HRW placement.
+    pub load_state: Vec<crate::services::router::InferenceServerInfo>,
     /// When the model was loaded
     pub loaded_at: Instant,
     /// When the model was last used
@@ -155,6 +166,47 @@ impl Clone for ModelService {
 impl std::ops::Deref for ModelService {
     type Target = ModelServiceInner;
     fn deref(&self) -> &Self::Target { &self.inner }
+}
+
+/// Prefix-dispatch arm for the `modelRef` grammar (#395).
+///
+/// `modelRef :Text` stays `Text` in the capnp schema; the Rust-side grammar is:
+///
+/// ```text
+/// modelRef ::= "at://" <at-uri>   # federated (resolve via atproto NAME → git OID)
+///            | "did:" <did>       # federated, bare-DID form
+///            | <name> [":" <gitref>]  # local ModelRef (unchanged, backward-compatible)
+/// ```
+///
+/// `at://` and `did:` are federated; everything else is the legacy local
+/// [`ModelRef::parse`] path. This enum is split out from
+/// [`ModelService::resolve_model_ref`] so the grammar is unit-testable without
+/// constructing a full [`ModelService`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelRefDispatch<'a> {
+    /// `at://…` or `did:…` — federated resolution (atproto record store, #392).
+    Federated {
+        /// The matched scheme prefix (`"at://"` or `"did:"`).
+        scheme: &'static str,
+        /// The ModelRef string with the scheme prefix stripped.
+        rest: &'a str,
+    },
+    /// No federated prefix — fall through to the local [`ModelRef::parse`].
+    Local,
+}
+
+/// Classify a `modelRef` string into its grammar arm (#395 prefix dispatch).
+///
+/// This is the pure prefix-detection core of [`ModelService::resolve_model_ref`];
+/// it performs no I/O and no validation, so it can be unit-tested in isolation.
+pub fn model_ref_dispatch(s: &str) -> ModelRefDispatch<'_> {
+    if let Some(rest) = s.strip_prefix("at://") {
+        ModelRefDispatch::Federated { scheme: "at://", rest }
+    } else if let Some(rest) = s.strip_prefix("did:") {
+        ModelRefDispatch::Federated { scheme: "did:", rest }
+    } else {
+        ModelRefDispatch::Local
+    }
 }
 
 impl ModelService {
@@ -264,19 +316,44 @@ impl ModelService {
             .collect()
     }
 
-    /// Router seam (#320): single-select ONE InferenceService for a request from
-    /// a loaded model's reach. Today a model maps 1:1 to one InferenceService, so
-    /// this returns that service's client — preferring the co-located fast path
-    /// (the in-process `Inproc` client built at load time) when present, else it
-    /// would dial a networked (Iroh) reach. This is req/rep single-select: NO
-    /// load-balancing, NO fanout. The reach `List` is left as the seam for future
-    /// replica balancing (round-robin / least-loaded / GPU-affinity).
-    fn select_inference_server(model: &LoadedModel) -> InferenceClient {
-        // The co-located fast path: `model.client` was dialed from the resolved
-        // transport at load time (the `Inproc` arm locally, or a networked Iroh
-        // reach for a remote service). When a model gains multiple network
-        // replicas, this is where ONE reach is single-selected and dialed.
-        //
+    /// Router seam (#322 leaf cell-router over the #320 single-select base):
+    /// pick ONE InferenceService for a request from a loaded model's replica
+    /// set, applying capacity-weighted HRW + session affinity.
+    ///
+    /// Today a model still maps 1:1 to one co-located InferenceService, so the
+    /// router's `load_state` has a single entry and HRW trivially picks it; the
+    /// fast path returns the in-process `model.client` directly (no dial). When
+    /// the replica set grows (cross-host reaches resolved via the Resolver per
+    /// the federated-model-addressing spike), this is where HRW single-selects a
+    /// networked (Iroh) reach and dials it. The router body operates on the
+    /// resolved replica set; OID/reach resolution is the entry's job.
+    ///
+    /// `session_id` is the placement key (defaults to "default" when the caller
+    /// has no session — keeps HRW stable for non-session-scoped requests like
+    /// `apply_chat_template`).
+    fn select_inference_server(
+        model: &mut LoadedModel,
+        session_id: &str,
+    ) -> InferenceClient {
+        let now = Instant::now();
+        if let Some(placement) = model.router.place(session_id, &model.load_state, now) {
+            // In v1 the co-located node is always in the replica set (seeded at
+            // load). If HRW picks it, use the in-process fast path — no dial.
+            if placement.node_id == Self::co_located_node_id(model) {
+                return model.client.clone();
+            }
+            // Networked selection: a future branch dials the chosen Iroh reach
+            // (after the #319/#328 mesh-authz gate). Not wired in v1 — fall back
+            // to the co-located client so requests still succeed while the
+            // federation entry is being built. See the AUTHZ SEAM note below.
+            debug!(
+                "router placed session {session_id} on remote node {:?} but no \
+                 networked dial path is wired yet — using co-located fallback",
+                placement.node_id
+            );
+        }
+        model.client.clone()
+
         // AUTHZ SEAM (#319/#328 mesh policy) — GAP, intentionally not wired here:
         // a co-located `Inproc` selection is an in-process call within the same
         // trust domain, so no mesh policy fires. When this seam grows a branch
@@ -289,17 +366,62 @@ impl ModelService {
         // enforcement call belongs on that future networked branch, not on the
         // co-located fast path. (Per-host identity:
         // `hyprstream_rpc::node_identity::mesh_host_subject`.) Cross-host
-        // inference spawn/discovery is deferred to #282, so no networked
-        // selection happens in #320 yet.
-        model.client.clone()
+        // inference spawn/discovery is deferred to #282.
+    }
+
+    /// Identity of the co-located InferenceService = our own Ed25519 verifying
+    /// key. Used by [`Self::select_inference_server`] to recognise the HRW
+    /// winner as the in-process fast path.
+    fn co_located_node_id(model: &LoadedModel) -> crate::services::router::NodeId {
+        // `load_state[0]` is the co-located entry (seeded first at load). All
+        // entries share the model's signing identity in v1; in a multi-replica
+        // future each entry carries its own node_id.
+        model
+            .load_state
+            .first()
+            .map(|info| info.node_id)
+            .unwrap_or([0u8; 32])
     }
 
     /// Resolve a model identifier string to a [`ModelRef`].
     ///
-    /// Accepts a registry name / HF repo id (e.g. `Qwen3-0.6B`, optionally
-    /// `name:ref`).
+    /// Accepts three prefixes (#395 prefix-dispatch grammar, no capnp/wire change
+    /// — `modelRef` stays `Text` in the schema):
+    ///
+    /// ```text
+    /// modelRef ::= "at://" <at-uri>   # federated (resolve via atproto NAME → git OID)
+    ///            | "did:" <did>       # federated, bare-DID form
+    ///            | <name> [":" <gitref>]  # local ModelRef (unchanged)
+    /// ```
+    ///
+    /// The federated branch (`at://`, `did:`) is resolved via the atproto record
+    /// store from #392 (PDS record → git OID). Until that store is wired up the
+    /// federated branch logs the attempt and falls through to the local
+    /// [`ModelRef::parse`], preserving backward compatibility — every existing
+    /// `name:ref` caller keeps working unchanged.
+    ///
+    /// Local ModelRefs (no `at://` / `did:` prefix) are parsed by
+    /// [`ModelRef::parse`] exactly as before.
     async fn resolve_model_ref(&self, model_ref_str: &str) -> Result<ModelRef> {
-        ModelRef::parse(model_ref_str)
+        match model_ref_dispatch(model_ref_str) {
+            ModelRefDispatch::Federated { scheme, rest } => {
+                // Federated resolution (#392 PDS record store): at:// → DID → record
+                // → git OID → local ModelRef. The record store is not yet wired up,
+                // so log the federated attempt and fall through to the local parser.
+                // Once #392 lands this branch returns early with the resolved OID.
+                warn!(
+                    scheme,
+                    target = %rest,
+                    "federated ModelRef resolution not yet implemented (#392); falling through to local ModelRef::parse"
+                );
+                // Fall through: attempt local parse so existing callers see the same
+                // error they would have pre-#395 (most at:// / did: strings fail
+                // ModelRef::parse validation, which is the correct "not yet supported"
+                // signal until #392 lands).
+                ModelRef::parse(model_ref_str)
+            }
+            ModelRefDispatch::Local => ModelRef::parse(model_ref_str),
+        }
     }
 
     /// Load a model by reference with optional per-model config, returns the inference endpoint
@@ -344,8 +466,8 @@ impl ModelService {
         let model_ref = self.resolve_model_ref(model_ref_str).await?;
 
         // Get model path from registry
-        let tracked = self.registry.get_by_name(&model_ref.model).await
-            .map_err(|e| anyhow!("Model '{}' not found in registry: {}", model_ref.model, e))?;
+        let tracked = self.registry.get_by_name(model_ref.name()).await
+            .map_err(|e| anyhow!("Model '{}' not found in registry: {}", model_ref.name(), e))?;
         let repo_client = self.registry.repo(&tracked.id);
 
         let branch_name = match &model_ref.git_ref {
@@ -354,11 +476,11 @@ impl ModelService {
         };
         let worktrees = repo_client.list_worktrees().await?;
         if !worktrees.iter().any(|wt| wt.branch_name == branch_name) {
-            return Err(anyhow!("worktree for {}:{} not found", model_ref.model, branch_name));
+            return Err(anyhow!("worktree for {}:{} not found", model_ref.name(), branch_name));
         }
         // Derive worktree path locally
         let storage_paths = crate::storage::StoragePaths::new()?;
-        let model_path = storage_paths.worktree_path(&model_ref.model, &branch_name)?;
+        let model_path = storage_paths.worktree_path(model_ref.name(), &branch_name)?;
 
         if !model_path.exists() {
             return Err(anyhow!(
@@ -461,9 +583,22 @@ impl ModelService {
                 model_ref_str.to_owned(),
                 LoadedModel {
                     model_ref: model_ref_str.to_owned(),
-                    transport,
+                    transport: transport.clone(),
                     service_handle,
                     client,
+                    // #322 leaf cell-router. v1: single co-located replica (the
+                    // service's own verifying key as the node identity). The
+                    // router fast-paths to `client` when HRW picks the
+                    // co-located node; the replica set grows when cross-host
+                    // reaches are resolved via the Resolver.
+                    router: crate::services::router::CellRouter::default(),
+                    load_state: vec![crate::services::router::InferenceServerInfo {
+                        node_id: self.signing_key.verifying_key().to_bytes(),
+                        transport: transport.clone(),
+                        gpu_memory_free: 0,
+                        active_sessions: 0,
+                        last_heartbeat: Instant::now(),
+                    }],
                     loaded_at: Instant::now(),
                     last_used: Instant::now(),
                     ttt_config,
@@ -614,8 +749,14 @@ impl ModelService {
             .get_mut(model_ref_str)
             .ok_or_else(|| anyhow!("Model {} not found after loading", model_ref_str))?;
         model.last_used = Instant::now();
-        // Router seam (#320): single-select one InferenceService for this request.
-        let client = Self::select_inference_server(model);
+        // #322 placement key. The envelope does not yet carry an explicit
+        // session_id; use the authenticated subject as a stable per-caller key
+        // (keeps HRW affinity effective for repeat requests from the same
+        // caller). When a real session_id is plumbed through `EnvelopeContext`,
+        // swap it in here — the router body is session_id-keyed, not
+        // subject-keyed, by design.
+        let placement_key = ctx.subject().to_string();
+        let client = Self::select_inference_server(model, &placement_key);
         // TODO: Forward user JWT to worker via per-call builder (delegated_bearer or
         // request().jwt(token).call(payload)) once inference methods support CallOptions.
         // The previous with_jwt() call was mutating shared state — unsafe with pooling.
@@ -796,8 +937,8 @@ impl TttHandler for ModelService {
     ) -> Result<()> {
         // 1. Parse/resolve model ref and resolve worktree path
         let parsed = self.resolve_model_ref(model_ref).await?;
-        let tracked = self.registry.get_by_name(&parsed.model).await
-            .map_err(|e| anyhow!("Model '{}' not found in registry: {}", parsed.model, e))?;
+        let tracked = self.registry.get_by_name(parsed.name()).await
+            .map_err(|e| anyhow!("Model '{}' not found in registry: {}", parsed.name(), e))?;
         let repo_client = self.registry.repo(&tracked.id);
 
         let branch_name = match &parsed.git_ref {
@@ -806,7 +947,7 @@ impl TttHandler for ModelService {
         };
 
         let storage_paths = crate::storage::StoragePaths::new()?;
-        let model_path = storage_paths.worktree_path(&parsed.model, &branch_name)?;
+        let model_path = storage_paths.worktree_path(parsed.name(), &branch_name)?;
 
         if !model_path.exists() {
             return Err(anyhow!("Model worktree not found for {}", model_ref));
@@ -896,8 +1037,8 @@ impl AdapterHandler for ModelService {
     ) -> Result<AdapterInfo> {
         // Resolve model_ref to a worktree client (does NOT require model loaded in memory)
         let parsed = self.resolve_model_ref(model_ref).await?;
-        let tracked = self.registry.get_by_name(&parsed.model).await
-            .map_err(|e| anyhow!("Model '{}' not found in registry: {}", parsed.model, e))?;
+        let tracked = self.registry.get_by_name(parsed.name()).await
+            .map_err(|e| anyhow!("Model '{}' not found in registry: {}", parsed.name(), e))?;
         let repo_client = self.registry.repo(&tracked.id);
         let branch_name = match &parsed.git_ref {
             crate::storage::GitRef::Branch(name) => name.clone(),
@@ -1499,6 +1640,81 @@ mod tests {
         match &reach[0] {
             WireTransportConfig::Iroh(i) => assert_eq!(i.node_id, node_id),
             other => panic!("expected wire Iroh reach, got {other:?}"),
+        }
+    }
+
+    // ---- #395 ModelRef prefix-dispatch grammar ----
+
+    #[test]
+    fn model_ref_dispatch_at_uri_is_federated() {
+        // at:// → federated arm, scheme captured, prefix stripped from `rest`.
+        assert_eq!(
+            model_ref_dispatch("at://did:plc:x123/hyprstream.models/qwen3/v1"),
+            ModelRefDispatch::Federated {
+                scheme: "at://",
+                rest: "did:plc:x123/hyprstream.models/qwen3/v1",
+            }
+        );
+    }
+
+    #[test]
+    fn model_ref_dispatch_bare_did_is_federated() {
+        // did: → federated arm (bare-DID form). Note `did:` (no `//`) is matched
+        // literally, and `at://` is NOT — `did:plc:...` must not be confused with
+        // an at-uri.
+        assert_eq!(
+            model_ref_dispatch("did:plc:abcdef"),
+            ModelRefDispatch::Federated {
+                scheme: "did:",
+                rest: "plc:abcdef",
+            }
+        );
+        // did:web variant too.
+        assert_eq!(
+            model_ref_dispatch("did:web:hyprstream.example.com"),
+            ModelRefDispatch::Federated {
+                scheme: "did:",
+                rest: "web:hyprstream.example.com",
+            }
+        );
+    }
+
+    #[test]
+    fn model_ref_dispatch_local_name_is_local() {
+        // Bare name, no federated prefix → local ModelRef arm.
+        assert_eq!(model_ref_dispatch("qwen3"), ModelRefDispatch::Local);
+        // name:ref — still local (the colon does not make it federated).
+        assert_eq!(model_ref_dispatch("qwen3:main"), ModelRefDispatch::Local);
+        assert_eq!(
+            model_ref_dispatch("Qwen3-0.6B:tags/v1.0"),
+            ModelRefDispatch::Local
+        );
+        // HuggingFace-style repo id (slash, no colon).
+        assert_eq!(
+            model_ref_dispatch("org/model-name"),
+            ModelRefDispatch::Local
+        );
+    }
+
+    #[test]
+    fn model_ref_dispatch_uuid_is_local() {
+        // UUID (backwards-compat) has no federated prefix → local arm.
+        assert_eq!(
+            model_ref_dispatch("550e8400-e29b-41d4-a716-446655440000"),
+            ModelRefDispatch::Local
+        );
+    }
+
+    #[test]
+    fn model_ref_dispatch_local_arms_parse_unchanged() {
+        // Every `Local` dispatch must parse via ModelRef::parse exactly as it did
+        // pre-#395 — backward compatibility contract.
+        for s in &["qwen3", "qwen3:main", "Qwen3-0.6B:tags/v1.0"] {
+            assert_eq!(model_ref_dispatch(s), ModelRefDispatch::Local);
+            assert!(
+                ModelRef::parse(s).is_ok(),
+                "local ModelRef '{s}' must still parse after #395"
+            );
         }
     }
 }

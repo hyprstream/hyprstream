@@ -90,11 +90,23 @@ impl DevicePool {
         }
 
         // Fail-fast: devices were explicitly requested, so a CPU downgrade is an
-        // error, not a fallback (no `Device::cuda_if_available()` here).
+        // error, not a fallback (no `Device::cuda_if_available()` here). Surface
+        // the actual cause: a bare "not available" hid a libcuda.so.1 / wrong-
+        // backend problem on the live cuda130 node and made it undiagnosable.
         if !tch::Cuda::is_available() {
+            let has_cuda = tch::utils::has_cuda();
+            let has_hip = tch::utils::has_hip();
+            let device_count = tch::Cuda::device_count();
+            let ld_path =
+                std::env::var("LD_LIBRARY_PATH").unwrap_or_else(|_| "<unset>".to_owned());
             return Err(anyhow!(
                 "DevicePool: GPU devices {indices:?} requested but no CUDA/ROCm device is \
-                 available (refusing to silently fall back to CPU)"
+                 available (refusing to silently fall back to CPU). \
+                 Diagnostics: has_cuda={has_cuda}, has_hip={has_hip}, \
+                 device_count={device_count}, LD_LIBRARY_PATH={ld_path}. If has_cuda=true \
+                 but device_count=0, the host driver lib (libcuda.so.1) is not loadable — \
+                 add the NVIDIA driver lib dir to LD_LIBRARY_PATH. If has_cuda=false, a \
+                 CPU-only libtorch/backend is installed."
             ));
         }
 

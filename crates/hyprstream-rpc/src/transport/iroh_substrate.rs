@@ -1,18 +1,25 @@
-//! Iroh transport substrate — Phase 1 of Epic #131 (ZMQ → moq-net + iroh).
+//! Iroh transport substrate — the PRIMARY production transport for Epic #131
+//! (ZMQ → moq-net + iroh), promoted to default in #410.
 //!
 //! Builds a shared `iroh::Endpoint` from an Ed25519 node key and wires an
 //! [`iroh::protocol::Router`] with two ALPN slots:
 //!
-//! - [`ALPN_MOQ_LITE`] (`moql`) — moq-net session handler. Wired in Phase 3
-//!   (issue hyprstream/hyprstream#134) to dispatch into an in-process
-//!   `moq_net::Origin` for the streaming plane.
+//! - [`ALPN_MOQ_LITE`] (`moql`) — moq-net session handler, wired by the daemon
+//!   spawner (#282) to dispatch into the shared global `moq_stream::Origin`
+//!   for the streaming plane.
 //! - [`ALPN_HYPRSTREAM_RPC`] (`hyprstream-rpc/1`) — raw Cap'n Proto bidi
-//!   handler. Wired in Phase 2 (issue hyprstream/hyprstream#133) to terminate
-//!   `IrohRpcTransport` for the RPC plane.
+//!   handler, wired by the daemon spawner (#282) to terminate
+//!   `IrohRpcProtocolHandler` for the RPC plane.
 //!
-//! Phase 1 ships the substrate, a [`NoopHandler`] placeholder, and a smoke
+//! Phase 1 shipped the substrate, a [`NoopHandler`] placeholder, and a smoke
 //! test verifying that two endpoints can dial each other directly and open a
-//! bidi stream on each ALPN. No production code consumes this module yet.
+//! bidi stream on each ALPN. As of #410, production code DOES consume this
+//! module: the daemon spawner (`hyprstream-service::service::spawner`) binds
+//! one `IrohSubstrate` per QUIC-enabled service as the PRIMARY production
+//! endpoint (on by default; `[quic] iroh = false` opts out to quinn-only). The
+//! real `moql` and `hyprstream-rpc/1` handlers are threaded in by the spawner
+//! (#282), and the OAuth/DID-controller identity binds its own canonical
+//! federation substrate (`build_oauth_iroh_substrate`).
 
 use anyhow::Result;
 use iroh::endpoint::{Connection, presets};

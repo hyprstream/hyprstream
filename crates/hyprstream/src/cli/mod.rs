@@ -37,7 +37,7 @@ pub use git_handlers::{
 };
 
 #[cfg(feature = "experimental")]
-pub use git_handlers::{handle_commit, handle_merge, handle_push, MergeOptions};
+pub use git_handlers::{handle_commit, handle_merge, handle_promote, handle_push, MergeOptions};
 pub use training_handlers::{
     handle_training_batch, handle_training_checkpoint, handle_training_infer, handle_training_init,
 };
