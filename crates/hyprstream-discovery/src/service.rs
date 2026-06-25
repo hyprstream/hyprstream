@@ -16,6 +16,7 @@ use crate::generated::discovery_client::{
     PingInfo, AuthMetadata, AuthMetadataList, ServiceAnnouncement,
     RegisterEntityStatementRequest, RegisterEnvelopeKeysetRequest,
     EntityStatement, EnvelopeKeyset, IssuerList,
+    GetRecordRequest, RecordCar,
     dispatch_discovery, serialize_response,
 };
 
@@ -44,6 +45,51 @@ pub trait AuthorizationProvider: Send + Sync {
         resource: &str,
         operation: &str,
     ) -> Result<bool>;
+}
+
+// ============================================================================
+// RecordResolver trait (#431)
+// ============================================================================
+
+/// A record returned as a CARv1 proof (the in-memory form of `RecordCar`).
+///
+/// `uri` is the at:// URI this CAR answers; `car` is the CARv1 bytes
+/// (roots = [commit CID]; blocks = commit + MST path + record). The caller
+/// validates it offline via `hyprstream_pds::car::verify_record_proof` — the
+/// DiscoveryService is an untrusted relay, so integrity comes from the signed
+/// proof, never from trusting the responder.
+#[derive(Clone, Debug)]
+pub struct RecordCarData {
+    pub uri: String,
+    pub car: Vec<u8>,
+}
+
+/// Trait for resolving atproto records/repos from the node's local PDS.
+///
+/// Decouples DiscoveryService from `hyprstream-pds` (a pure crypto/metadata
+/// crate with no networking) and from the per-account record stores held by the
+/// main `hyprstream` crate. The main crate provides a `PdsRecordResolver` that
+/// builds CAR proofs via `hyprstream_pds::car::build_record_proof_car`.
+///
+/// IMPORTANT: a resolver MUST NOT perform access control — confidentiality is
+/// enforced by the DiscoveryService handler's Casbin check on the target
+/// DID/collection *before* the resolver is consulted. The resolver only answers
+/// "does this record exist, and what is its signed CAR proof".
+#[async_trait(?Send)]
+pub trait RecordResolver: Send + Sync {
+    /// Resolve a single record to a CAR proof. `collection` is the NSID
+    /// (e.g. `ai.hyprstream.model`), `rkey` the TID record key. Returns
+    /// `Ok(None)` when the DID/collection/rkey does not name a stored record.
+    async fn resolve_record(
+        &self,
+        did: &str,
+        collection: &str,
+        rkey: &str,
+    ) -> Result<Option<RecordCarData>>;
+
+    /// Resolve a full repo CAR for a DID (commit + MST + all records).
+    /// Returns `Ok(None)` when no repo is stored for the DID.
+    async fn resolve_repo(&self, did: &str) -> Result<Option<RecordCarData>>;
 }
 
 // ============================================================================
@@ -78,6 +124,25 @@ struct CachedEnvelopeKeyset {
     fetched_at: i64,
 }
 
+/// Parse an `at://<did>/<collection>/<rkey>` URI into its three components.
+///
+/// The DID itself may contain `:` (e.g. `did:web:alice.example.com`,
+/// `did:plc:abc123`) but no `/`, so splitting the post-`at://` remainder on `/`
+/// yields exactly `[did, collection, rkey]`. Returns an error for any other shape.
+fn parse_at_uri(uri: &str) -> Result<(String, String, String)> {
+    let rest = uri
+        .strip_prefix("at://")
+        .ok_or_else(|| anyhow::anyhow!("at-uri must start with \"at://\": {uri:?}"))?;
+    let mut parts = rest.splitn(3, '/');
+    let did = parts.next().filter(|s| !s.is_empty());
+    let collection = parts.next().filter(|s| !s.is_empty());
+    let rkey = parts.next().filter(|s| !s.is_empty());
+    match (did, collection, rkey) {
+        (Some(d), Some(c), Some(r)) => Ok((d.to_owned(), c.to_owned(), r.to_owned())),
+        _ => anyhow::bail!("at-uri must be at://<did>/<collection>/<rkey>: {uri:?}"),
+    }
+}
+
 fn unix_seconds_now() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -102,6 +167,9 @@ pub struct DiscoveryService {
     expected_audience: Option<String>,
     /// Authorization provider (None = no authorization)
     auth_provider: Option<Box<dyn AuthorizationProvider>>,
+    /// Record resolver backing getRecord/getRepo (#431). None = no local PDS,
+    /// so getRecord/getRepo report NOT_FOUND for everything.
+    record_resolver: Option<Box<dyn RecordResolver>>,
     /// Endpoints announced by other services (cross-process).
     /// Maps service_name → Vec<AnnouncedEndpoint>.
     announced_endpoints: RwLock<HashMap<String, Vec<AnnouncedEndpoint>>>,
@@ -141,6 +209,7 @@ impl DiscoveryService {
             oauth_issuer_url: None,
             expected_audience: None,
             auth_provider: None,
+            record_resolver: None,
             announced_endpoints: RwLock::new(HashMap::new()),
             entity_statements: RwLock::new(HashMap::new()),
             envelope_keysets: RwLock::new(HashMap::new()),
@@ -185,6 +254,12 @@ impl DiscoveryService {
     /// Set the authorization provider for access control.
     pub fn with_auth_provider(mut self, provider: Box<dyn AuthorizationProvider>) -> Self {
         self.auth_provider = Some(provider);
+        self
+    }
+
+    /// Set the record resolver backing getRecord/getRepo (#431).
+    pub fn with_record_resolver(mut self, resolver: Box<dyn RecordResolver>) -> Self {
+        self.record_resolver = Some(resolver);
         self
     }
 
@@ -707,6 +782,139 @@ impl DiscoveryHandler for DiscoveryService {
         let issuers: Vec<String> = map.keys().cloned().collect();
         Ok(DiscoveryResponseVariant::ListKnownIssuersResult(IssuerList { issuers }))
     }
+
+    // ────────────────────────────────────────────────────────────────────
+    // #431 — federated record lookup as a verifiable CAR proof
+    // ────────────────────────────────────────────────────────────────────
+
+    async fn handle_get_record(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &GetRecordRequest,
+    ) -> Result<DiscoveryResponseVariant> {
+        // Resolve the three components from either the at:// URI or the structured
+        // fields. When `uri` is set it wins (the fields are ignored, per schema).
+        let (did, collection, rkey) = if !data.uri.is_empty() {
+            match parse_at_uri(&data.uri) {
+                Ok(parts) => parts,
+                Err(e) => {
+                    return Ok(DiscoveryResponseVariant::Error(ErrorInfo {
+                        message: format!("invalid at-uri: {e}"),
+                        code: "INVALID_ARGUMENT".to_owned(),
+                        details: String::new(),
+                    }));
+                }
+            }
+        } else if !data.did.is_empty() && !data.collection.is_empty() && !data.rkey.is_empty() {
+            (data.did.clone(), data.collection.clone(), data.rkey.clone())
+        } else {
+            return Ok(DiscoveryResponseVariant::Error(ErrorInfo {
+                message: "getRecord requires either `uri` or all of (did, collection, rkey)".to_owned(),
+                code: "INVALID_ARGUMENT".to_owned(),
+                details: String::new(),
+            }));
+        };
+
+        // ── Access control (CONFIDENTIALITY — the load-bearing check) ──
+        // The schema's auto-generated discovery:query gate already ran in dispatch,
+        // but that only authorizes "may call getRecord at all". An atproto record's
+        // CID is content-derived and predictable, so presenting a valid at:// / CID
+        // must NOT by itself grant a read. Independently require the caller to be
+        // permitted to read THIS target DID's collection. Integrity (the signed CAR
+        // proof, verified offline) does NOT substitute for this check.
+        let resource = format!("discovery:record:{did}/{collection}");
+        if let Err(e) = self.authorize(ctx, &resource, "query").await {
+            return Ok(DiscoveryResponseVariant::Error(ErrorInfo {
+                message: format!("unauthorized to read {resource}: {e}"),
+                code: "UNAUTHORIZED".to_owned(),
+                details: String::new(),
+            }));
+        }
+
+        let resolver = match &self.record_resolver {
+            Some(r) => r,
+            None => {
+                return Ok(DiscoveryResponseVariant::Error(ErrorInfo {
+                    message: "no record resolver configured on this node".to_owned(),
+                    code: "NOT_FOUND".to_owned(),
+                    details: String::new(),
+                }));
+            }
+        };
+
+        match resolver.resolve_record(&did, &collection, &rkey).await {
+            Ok(Some(rec)) => Ok(DiscoveryResponseVariant::GetRecordResult(RecordCar {
+                uri: rec.uri,
+                car: rec.car,
+            })),
+            Ok(None) => Ok(DiscoveryResponseVariant::Error(ErrorInfo {
+                message: format!("no record at at://{did}/{collection}/{rkey}"),
+                code: "NOT_FOUND".to_owned(),
+                details: String::new(),
+            })),
+            Err(e) => Ok(DiscoveryResponseVariant::Error(ErrorInfo {
+                message: format!("record resolution failed: {e}"),
+                code: "INTERNAL".to_owned(),
+                details: String::new(),
+            })),
+        }
+    }
+
+    async fn handle_get_repo(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        value: &str,
+    ) -> Result<DiscoveryResponseVariant> {
+        let did = value;
+        if did.is_empty() {
+            return Ok(DiscoveryResponseVariant::Error(ErrorInfo {
+                message: "getRepo requires a non-empty DID".to_owned(),
+                code: "INVALID_ARGUMENT".to_owned(),
+                details: String::new(),
+            }));
+        }
+
+        // Access control: a full repo CAR exposes every record in the DID's
+        // collections, so gate on the DID itself (broadest read of that repo).
+        let resource = format!("discovery:record:{did}");
+        if let Err(e) = self.authorize(ctx, &resource, "query").await {
+            return Ok(DiscoveryResponseVariant::Error(ErrorInfo {
+                message: format!("unauthorized to read repo {did}: {e}"),
+                code: "UNAUTHORIZED".to_owned(),
+                details: String::new(),
+            }));
+        }
+
+        let resolver = match &self.record_resolver {
+            Some(r) => r,
+            None => {
+                return Ok(DiscoveryResponseVariant::Error(ErrorInfo {
+                    message: "no record resolver configured on this node".to_owned(),
+                    code: "NOT_FOUND".to_owned(),
+                    details: String::new(),
+                }));
+            }
+        };
+
+        match resolver.resolve_repo(did).await {
+            Ok(Some(rec)) => Ok(DiscoveryResponseVariant::GetRepoResult(RecordCar {
+                uri: rec.uri,
+                car: rec.car,
+            })),
+            Ok(None) => Ok(DiscoveryResponseVariant::Error(ErrorInfo {
+                message: format!("no repo stored for DID {did}"),
+                code: "NOT_FOUND".to_owned(),
+                details: String::new(),
+            })),
+            Err(e) => Ok(DiscoveryResponseVariant::Error(ErrorInfo {
+                message: format!("repo resolution failed: {e}"),
+                code: "INTERNAL".to_owned(),
+                details: String::new(),
+            })),
+        }
+    }
 }
 
 // ============================================================================
@@ -755,5 +963,300 @@ impl RequestService for DiscoveryService {
             details: String::new(),
         });
         serialize_response(request_id, &variant).unwrap_or_default()
+    }
+}
+
+// ============================================================================
+// #431 — getRecord / getRepo handler tests (access control + CAR proof)
+// ============================================================================
+
+#[cfg(test)]
+mod get_record_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    use super::*;
+
+    use std::collections::BTreeMap;
+
+    use hyprstream_pds::car::{build_record_proof_car, parse_car_v1, verify_record_proof};
+    use hyprstream_pds::cid::Cid as PdsCid;
+    use hyprstream_pds::commit::{Commit, UnsignedCommit};
+    use hyprstream_pds::mst::{Node, Proof};
+    use hyprstream_pds::record::{ModelRecord, COLLECTION_NSID};
+    use hyprstream_pds::tid::Tid;
+    use p256::ecdsa::{SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey};
+
+    const TEST_DID: &str = "did:web:alice.example.com";
+
+    /// Mock authorization provider: allows exactly the (resource, operation)
+    /// pairs in its allow-list, denies everything else. Mirrors the Casbin gate
+    /// the production PolicyAuthProvider wraps.
+    struct MockAuth {
+        allow: Vec<(String, String)>,
+    }
+    #[async_trait(?Send)]
+    impl AuthorizationProvider for MockAuth {
+        async fn check(
+            &self,
+            _subject: &str,
+            _domain: &str,
+            resource: &str,
+            operation: &str,
+        ) -> Result<bool> {
+            Ok(self
+                .allow
+                .iter()
+                .any(|(r, o)| r == resource && o == operation))
+        }
+    }
+
+    /// Mock record resolver backed by a real PDS-built CAR proof, so a returned
+    /// RecordCar verifies under `verify_record_proof`. `None` records → NOT_FOUND.
+    struct MockResolver {
+        /// (collection, rkey) → (car bytes, uri). Built once in `build`.
+        records: BTreeMap<(String, String), (Vec<u8>, String)>,
+    }
+
+    /// Build a small repo with `n` records and return the resolver plus the
+    /// published `#atproto` verifying key, target rkey, target record, and proof
+    /// so tests can independently verify the CAR the handler returns.
+    fn build_repo(
+        n: u64,
+    ) -> (
+        MockResolver,
+        P256VerifyingKey,
+        String,             // target rkey
+        ModelRecord,        // target record
+        PdsCid,             // target record CID
+        Proof,              // target inclusion proof
+    ) {
+        let signing_key = P256SigningKey::random(&mut rand::rngs::OsRng);
+        let verifying_key = P256VerifyingKey::from(&signing_key);
+
+        let mut records: BTreeMap<Tid, ModelRecord> = BTreeMap::new();
+        let mut record_cids: BTreeMap<Tid, PdsCid> = BTreeMap::new();
+        for i in 0..n {
+            let tid = Tid::from_micros(1_700_000_000_000_000 + i * 1000, i as u16);
+            let rec = ModelRecord::new(
+                format!("at://{TEST_DID}"),
+                format!("bafyreiexampleoid{i:020}"),
+                "2026-06-24T00:00:00.000Z",
+            )
+            .unwrap();
+            record_cids.insert(tid, rec.cid());
+            records.insert(tid, rec);
+        }
+        let tree = Node::from_records(COLLECTION_NSID, &record_cids);
+        let root = tree.root_cid();
+        let unsigned = UnsignedCommit::new(TEST_DID.to_owned(), root, Tid::now(), None);
+        let commit = Commit::sign(&unsigned, &signing_key);
+        let (_root_data, node_blocks) = tree.to_node_data_with_blocks();
+
+        // Pick a middle record as the target.
+        let target_tid = *records.keys().nth((n / 2) as usize).unwrap();
+        let target_record = records.get(&target_tid).cloned().unwrap();
+        let target_cid = record_cids[&target_tid];
+        let target_rkey = target_tid.encode();
+
+        // Build a CAR proof for EVERY record so the resolver can answer any rkey.
+        let mut out = BTreeMap::new();
+        for (tid, rec) in &records {
+            let proof = tree.proof(COLLECTION_NSID, tid).unwrap();
+            let car = build_record_proof_car(&commit, &proof, &node_blocks, rec);
+            let rkey = tid.encode();
+            let uri = format!("at://{TEST_DID}/{COLLECTION_NSID}/{rkey}");
+            out.insert((COLLECTION_NSID.to_owned(), rkey), (car, uri));
+        }
+        let target_proof = tree.proof(COLLECTION_NSID, &target_tid).unwrap();
+
+        (
+            MockResolver { records: out },
+            verifying_key,
+            target_rkey,
+            target_record,
+            target_cid,
+            target_proof,
+        )
+    }
+
+    #[async_trait(?Send)]
+    impl RecordResolver for MockResolver {
+        async fn resolve_record(
+            &self,
+            _did: &str,
+            collection: &str,
+            rkey: &str,
+        ) -> Result<Option<RecordCarData>> {
+            Ok(self
+                .records
+                .get(&(collection.to_owned(), rkey.to_owned()))
+                .map(|(car, uri)| RecordCarData {
+                    uri: uri.clone(),
+                    car: car.clone(),
+                }))
+        }
+        async fn resolve_repo(&self, _did: &str) -> Result<Option<RecordCarData>> {
+            Ok(self
+                .records
+                .values()
+                .next()
+                .map(|(car, uri)| RecordCarData {
+                    uri: uri.clone(),
+                    car: car.clone(),
+                }))
+        }
+    }
+
+    fn service_with(
+        allow: Vec<(&str, &str)>,
+        resolver: MockResolver,
+    ) -> DiscoveryService {
+        let (sk, vk) = hyprstream_rpc::crypto::generate_signing_keypair();
+        let allow = allow
+            .into_iter()
+            .map(|(r, o)| (r.to_owned(), o.to_owned()))
+            .collect();
+        DiscoveryService::new(
+            Arc::new(sk),
+            vk,
+            hyprstream_rpc::transport::TransportConfig::inproc("discovery-test"),
+        )
+        .with_auth_provider(Box::new(MockAuth { allow }))
+        .with_record_resolver(Box::new(resolver))
+    }
+
+    fn test_ctx() -> EnvelopeContext {
+        // A genuine service-identity caller; subject() → "service:test-caller".
+        EnvelopeContext::from_callback_service(1, "test-caller")
+    }
+
+    /// (a) An accessible record returns a valid CAR proof that verifies offline.
+    #[tokio::test]
+    async fn get_record_returns_verifiable_car_when_authorized() {
+        let (resolver, vk, rkey, target_record, target_cid, proof) = build_repo(6);
+        let resource = format!("discovery:record:{TEST_DID}/{COLLECTION_NSID}");
+        let svc = service_with(vec![(&resource, "query")], resolver);
+
+        let req = GetRecordRequest {
+            uri: format!("at://{TEST_DID}/{COLLECTION_NSID}/{rkey}"),
+            did: String::new(),
+            collection: String::new(),
+            rkey: String::new(),
+        };
+        let resp = svc.handle_get_record(&test_ctx(), 1, &req).await.unwrap();
+        let car = match resp {
+            DiscoveryResponseVariant::GetRecordResult(rc) => rc,
+            other => panic!("expected GetRecordResult, got {other:?}"),
+        };
+
+        // The CAR parses and contains the target record block.
+        let (roots, blocks) = parse_car_v1(&car.car).unwrap();
+        assert!(!roots.is_empty(), "CAR must have a root commit CID");
+        let block_cids: std::collections::BTreeSet<PdsCid> =
+            blocks.iter().map(|(c, _)| *c).collect();
+        assert!(
+            block_cids.contains(&target_cid),
+            "CAR must carry the target record block"
+        );
+
+        // The returned proof verifies offline against the published #atproto key.
+        let commit = blocks
+            .iter()
+            .find(|(c, _)| *c == roots[0])
+            .map(|(_, b)| Commit::from_dag_cbor(b).unwrap())
+            .expect("CAR must contain its commit block");
+        verify_record_proof(&commit, &vk, &proof, &target_record)
+            .expect("the returned CAR proof must verify offline (D5 untrusted-relay)");
+    }
+
+    /// (b) THE LOAD-BEARING TEST: denied when the caller lacks read permission
+    /// for the target DID/collection — even though the at:// / CID is valid.
+    #[tokio::test]
+    async fn get_record_denied_without_read_permission() {
+        let (resolver, _vk, rkey, _rec, _cid, _proof) = build_repo(6);
+        // Allow-list does NOT include discovery:record:<did>/<collection>.
+        let svc = service_with(vec![("discovery:something-else", "query")], resolver);
+
+        let req = GetRecordRequest {
+            uri: format!("at://{TEST_DID}/{COLLECTION_NSID}/{rkey}"),
+            did: String::new(),
+            collection: String::new(),
+            rkey: String::new(),
+        };
+        let resp = svc.handle_get_record(&test_ctx(), 1, &req).await.unwrap();
+        match resp {
+            DiscoveryResponseVariant::Error(e) => {
+                assert_eq!(e.code, "UNAUTHORIZED", "deny must surface as UNAUTHORIZED");
+                // CRITICAL: the deny must NOT leak the record bytes.
+                assert!(
+                    !e.message.is_empty(),
+                    "unauthorized error should explain the denied resource"
+                );
+            }
+            DiscoveryResponseVariant::GetRecordResult(_) => {
+                panic!("ACCESS-CONTROL FAILURE: a valid at:// returned a record without read permission");
+            }
+            other => panic!("expected UNAUTHORIZED error, got {other:?}"),
+        }
+    }
+
+    /// (c) A missing record errors cleanly with NOT_FOUND (authorized caller).
+    #[tokio::test]
+    async fn get_record_missing_returns_not_found() {
+        let (resolver, _vk, _rkey, _rec, _cid, _proof) = build_repo(6);
+        let resource = format!("discovery:record:{TEST_DID}/{COLLECTION_NSID}");
+        let svc = service_with(vec![(&resource, "query")], resolver);
+
+        let req = GetRecordRequest {
+            uri: format!("at://{TEST_DID}/{COLLECTION_NSID}/3zzzzzzzzzzzz"),
+            did: String::new(),
+            collection: String::new(),
+            rkey: String::new(),
+        };
+        let resp = svc.handle_get_record(&test_ctx(), 1, &req).await.unwrap();
+        match resp {
+            DiscoveryResponseVariant::Error(e) => {
+                assert_eq!(e.code, "NOT_FOUND", "absent record must be NOT_FOUND");
+            }
+            other => panic!("expected NOT_FOUND error, got {other:?}"),
+        }
+    }
+
+    /// at:// parser: rejects malformed URIs, accepts the canonical 3-part form.
+    #[test]
+    fn parse_at_uri_round_trip() {
+        let (did, coll, rkey) =
+            parse_at_uri("at://did:web:alice.example.com/ai.hyprstream.model/3zztslq4be52u")
+                .unwrap();
+        assert_eq!(did, "did:web:alice.example.com");
+        assert_eq!(coll, "ai.hyprstream.model");
+        assert_eq!(rkey, "3zztslq4be52u");
+
+        assert!(parse_at_uri("https://x").is_err());
+        assert!(parse_at_uri("at://did:web:x").is_err()); // no collection/rkey
+        assert!(parse_at_uri("at://did:web:x/coll").is_err()); // no rkey
+    }
+
+    /// getRecord with structured (did, collection, rkey) fields (uri empty).
+    #[tokio::test]
+    async fn get_record_by_structured_fields() {
+        let (resolver, _vk, rkey, _rec, target_cid, _proof) = build_repo(4);
+        let resource = format!("discovery:record:{TEST_DID}/{COLLECTION_NSID}");
+        let svc = service_with(vec![(&resource, "query")], resolver);
+
+        let req = GetRecordRequest {
+            uri: String::new(),
+            did: TEST_DID.to_owned(),
+            collection: COLLECTION_NSID.to_owned(),
+            rkey: rkey.clone(),
+        };
+        let resp = svc.handle_get_record(&test_ctx(), 1, &req).await.unwrap();
+        let car = match resp {
+            DiscoveryResponseVariant::GetRecordResult(rc) => rc,
+            other => panic!("expected GetRecordResult, got {other:?}"),
+        };
+        let (_roots, blocks) = parse_car_v1(&car.car).unwrap();
+        let block_cids: std::collections::BTreeSet<PdsCid> =
+            blocks.iter().map(|(c, _)| *c).collect();
+        assert!(block_cids.contains(&target_cid));
     }
 }
