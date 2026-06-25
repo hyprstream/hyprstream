@@ -637,6 +637,21 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     }
     model_service = model_service.with_jwt_key_source(ctx.cluster_key_source());
 
+    // #431 — DiscoveryClient for federated at:// record resolution. The discovery
+    // key is in the trust store (depends_on includes "discovery"). Best-effort:
+    // if discovery isn't resolvable, ModelService simply has no federation client
+    // and at:// refs fall through to local resolution.
+    if let Some(discovery_vk) = hyprstream_service::global_trust_store().resolve_one("discovery") {
+        match crate::services::DiscoveryClient::for_service(sk.clone(), discovery_vk, None) {
+            Ok(dc) => {
+                model_service = model_service.with_discovery_client(std::sync::Arc::new(dc));
+            }
+            Err(e) => {
+                tracing::warn!("ModelService: failed to build DiscoveryClient for federation: {e}");
+            }
+        }
+    }
+
     Ok(ctx.into_spawnable_quic(model_service, config.model.quic_port))
 }
 
@@ -1262,11 +1277,21 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("discovery"))?;
     let auth_provider = crate::services::discovery::PolicyAuthProvider::new(policy_client);
 
+    // #431 — record resolver backing getRecord/getRepo. Built over an in-memory
+    // PDS record store; the publishing side (populating the store on model
+    // register + atproto-pointer advance, #394) is wired separately, so the
+    // store starts empty (getRecord reports NOT_FOUND until records are
+    // published). The access-control gate + CAR-proof wire are fully active.
+    let pds_store = std::sync::Arc::new(crate::services::discovery::PdsRecordStore::new());
+    let record_resolver = crate::services::discovery::PdsRecordResolver::new(pds_store);
+
     let mut discovery_service = DiscoveryService::new(
         Arc::new(sk),
         ctx.jwt_verifying_key(),
         ctx.transport("discovery", SocketKind::Rep),
-    ).with_auth_provider(Box::new(auth_provider));
+    )
+    .with_auth_provider(Box::new(auth_provider))
+    .with_record_resolver(Box::new(record_resolver));
     if let Some(issuer) = ctx.oauth_issuer_url() {
         discovery_service = discovery_service.with_oauth_issuer(issuer.to_owned());
         // Use the issuer URL as the audience for discovery tokens
