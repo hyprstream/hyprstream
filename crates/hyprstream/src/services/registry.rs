@@ -3156,28 +3156,26 @@ mod xet_pointer_tests {
         assert!(xet_pointer_references_merkle(&ptr, HEX));
     }
 
+    // KNOWN-OPEN (#436): a caller-committed pointer with a target private merkle
+    // in its `oid sha256:` field must NOT authorize a read — the writer is a
+    // planter, not the owner; only server-authoritative upload provenance (the
+    // repo's mdb_shard manifest) distinguishes them. The pointer-only check
+    // CANNOT yet make that distinction, so this asserts the CORRECT (deny)
+    // behavior and is #[ignore]'d until provenance verification lands. It is a
+    // failing tracking test for the fix, NOT a lock-in of current behavior.
     #[test]
-    fn residual_gap_oid_field_planted_pointer_still_passes() {
-        // #436 NOT FULLY CLOSED — documents the residual private-multitenant gap.
-        // The pointer is entirely CALLER-CONTROLLED: a writer can put a TARGET
-        // private merkle directly in the `oid sha256:` field (the merkle is
-        // publicly computable for public-derived content). This check, which only
-        // inspects the committed pointer, accepts it — because it cannot tell a
-        // legitimate owner from a planter without a SERVER-AUTHORITATIVE provenance
-        // record (the bytes were uploaded through this repo). This is the boundary
-        // the exact-field parse does NOT close; private cross-tenant XET stays
-        // gated until provenance (mdb_shard at upload time) is checked.
+    #[ignore = "#436: needs server-side upload-provenance; pointer-only check cannot deny a planted OID-field pointer yet"]
+    fn oid_field_planted_pointer_must_be_denied() {
         let target_private = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
         let planted_in_oid = format!(
             "version https://git-lfs.github.com/spec/v1\noid sha256:{target_private}\nsize 4096\n"
         );
-        // This SHOULD ideally be false for a non-owner, but is true today — the
-        // check trusts the committed pointer. Asserting the current (gated) behavior
-        // so a future provenance fix that flips it to `false` updates this test.
+        // Provenance-aware containment must reject a pointer the caller simply
+        // committed naming someone else's content as its OID. (Fails today: the
+        // pointer-only check returns true — that's the #436 gap.)
         assert!(
-            xet_pointer_references_merkle(&planted_in_oid, target_private),
-            "documents residual gap: an OID-field planted pointer is accepted by the \
-             pointer-only check; closing #436 requires server-side upload provenance"
+            !xet_pointer_references_merkle(&planted_in_oid, target_private),
+            "a caller-committed OID-field pointer must not by itself prove entitlement"
         );
     }
 }
