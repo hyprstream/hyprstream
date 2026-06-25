@@ -928,6 +928,20 @@ impl RegistryService {
     /// reconstruction manifest) is sound but heavier and is DEFERRED; getBlob's
     /// content union addresses whole files by their OID, so file-level binding is
     /// the correct grain for the current wire.
+    ///
+    /// LIMITATION — STILL GATED for PRIVATE multitenant XET (#436 NOT fully
+    /// closed). This check trusts a CALLER-COMMITTED pointer file as evidence of
+    /// entitlement. The pointer is entirely caller-controlled: a writer with
+    /// access to their own repo can commit a well-formed pointer whose
+    /// `oid sha256:` field is a target private merkle (publicly computable for
+    /// public-derived content) and pass condition (b). Closing this requires a
+    /// SERVER-AUTHORITATIVE provenance record — the bytes for this merkle were
+    /// uploaded *through this repo* (the mdb_shard reconstruction manifest the
+    /// repo owns at upload time), not a client-supplied pointer. Until that lands,
+    /// the XET path is sound for PUBLIC / same-trust-domain content only; private
+    /// cross-tenant XET fetch must stay disabled. (The exact-OID-field parse below
+    /// is still an improvement — it closes the comment/size/substring sub-vector —
+    /// but it is NOT the isolation boundary.)
     async fn repo_contains_xet_merkle(
         &self,
         repo_id: &git2db::RepoId,
@@ -3140,6 +3154,31 @@ mod xet_pointer_tests {
         // genuine reconstruction target → entitled.
         let ptr = format!("version https://xet.example/v1\nmerklehash = {HEX}\nsize 42\n");
         assert!(xet_pointer_references_merkle(&ptr, HEX));
+    }
+
+    #[test]
+    fn residual_gap_oid_field_planted_pointer_still_passes() {
+        // #436 NOT FULLY CLOSED — documents the residual private-multitenant gap.
+        // The pointer is entirely CALLER-CONTROLLED: a writer can put a TARGET
+        // private merkle directly in the `oid sha256:` field (the merkle is
+        // publicly computable for public-derived content). This check, which only
+        // inspects the committed pointer, accepts it — because it cannot tell a
+        // legitimate owner from a planter without a SERVER-AUTHORITATIVE provenance
+        // record (the bytes were uploaded through this repo). This is the boundary
+        // the exact-field parse does NOT close; private cross-tenant XET stays
+        // gated until provenance (mdb_shard at upload time) is checked.
+        let target_private = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let planted_in_oid = format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{target_private}\nsize 4096\n"
+        );
+        // This SHOULD ideally be false for a non-owner, but is true today — the
+        // check trusts the committed pointer. Asserting the current (gated) behavior
+        // so a future provenance fix that flips it to `false` updates this test.
+        assert!(
+            xet_pointer_references_merkle(&planted_in_oid, target_private),
+            "documents residual gap: an OID-field planted pointer is accepted by the \
+             pointer-only check; closing #436 requires server-side upload provenance"
+        );
     }
 }
 
