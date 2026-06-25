@@ -737,6 +737,14 @@ async fn do_bootstrap(
                     .join("credentials")
             });
 
+        // Local issuer URL stamped into service JWTs so they verify on the
+        // local IPC/AnySigner plane without tripping the #328 empty-`iss` gate.
+        // Must match the issuer the services' ClusterKeySource trusts
+        // (oauth.issuer_url(), the same value `cluster_key_source()` uses).
+        let local_issuer_url = crate::config::HyprConfig::load()
+            .map(|c| c.oauth.issuer_url())
+            .unwrap_or_default();
+
         // CA JWT signing key (purpose-derived for JWT signature separation).
         // Derived BEFORE writing ca-pubkey so we can store the JWT key's verifying key,
         // not the root key's verifying key. Services verify JWTs with the derived key.
@@ -785,7 +793,7 @@ async fn do_bootstrap(
             let service_vk = service_key.verifying_key();
 
             let jwt = crate::auth::service_jwt::issue_or_load_service_jwt(
-                &credentials_dir, service_name, &ca_jwt_key, &service_vk, now,
+                &credentials_dir, service_name, &ca_jwt_key, &service_vk, &local_issuer_url, now,
             )?;
             identity_store::write_service_jwt(&credentials_dir, service_name, &jwt)?;
 
