@@ -264,6 +264,25 @@ mod tests {
         assert!(!store.is_authorized(&key, "policy"));
     }
 
+    /// #441 invariant: authoritative service-key resolution.
+    /// A registered service resolves to *exactly* the registered key; an
+    /// unregistered service resolves to `None` (which `handle_resolve_service_key`
+    /// turns into a "service key '<name>' not registered" error — never a
+    /// CA-derived guess).
+    #[test]
+    fn resolve_one_returns_registered_key_or_none() {
+        let store = TrustStore::new();
+        let (_, registered) = random_key();
+        store.insert(registered, make_attestation(&["model"], 0));
+
+        // Registered → exactly the registered key.
+        assert_eq!(store.resolve_one("model"), Some(registered));
+
+        // Unregistered scope → None (handler converts this to a clear error;
+        // it must NOT derive a fallback key).
+        assert_eq!(store.resolve_one("worker"), None);
+    }
+
     #[test]
     fn expired_attestation_is_not_authorized() {
         let store = TrustStore::new();
