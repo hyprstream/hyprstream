@@ -109,114 +109,25 @@ impl CasServer {
         }
     }
 
-    /// Reassemble a file from its reconstruction shard: load the shard, fetch
-    /// each referenced xorb, and concatenate the segment bytes in order.
+    /// Reassemble a file from its reconstruction shard. Delegates to the shared
+    /// `CasStore` reconstruction core (`cas_serve::store`) so the binary and
+    /// in-process embedders (registry `getBlob`) share one implementation.
     async fn handle_get_file(&self, hash: &str) -> Response {
-        let _file_hash = match Request::parse_hash(hash) {
-            Ok(h) => h,
-            Err(e) => return Response::error(ErrorCode::InvalidHash, e),
-        };
-
-        // 1. Look for a reconstruction shard (chunked/multi-xorb file path).
-        let shard_path = self.shard_path(hash);
-        if shard_path.exists() {
-            return self.reassemble_from_shard(hash, &shard_path).await;
-        }
-
-        // 2. Fall back to a directly-stored raw blob under the xorbs dir. This
-        //    preserves compatibility with clients that uploaded a whole file as
-        //    a single XORB via the legacy `UploadXorb` path (where the XORB
-        //    hash == the data hash of the whole blob). `compute_data_hash` over
-        //    a whole blob equals the file hash only for a single-chunk file, so
-        //    this is exactly the small-file degenerate case.
-        let xorb_path = self.xorb_path(hash);
-        match tokio::fs::read(&xorb_path).await {
+        let store = cas_serve::CasStore::new(&self.storage_path);
+        match store.get_file_bytes(hash).await {
             Ok(data) => {
-                debug!("GetFile {hash}: served as raw blob (no shard)");
+                debug!("GetFile {hash}: reassembled {} bytes", data.len());
                 Response::file(&data)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Response::error(ErrorCode::NotFound, format!("File not found: {hash}"))
+            Err(cas_serve::StoreError::InvalidHash(e)) => {
+                Response::error(ErrorCode::InvalidHash, e)
             }
-            Err(e) => Response::error(ErrorCode::IoError, format!("Failed to read file: {e}")),
+            Err(cas_serve::StoreError::NotFound(e)) => Response::error(ErrorCode::NotFound, e),
+            Err(cas_serve::StoreError::CorruptShard(e)) => {
+                Response::error(ErrorCode::StorageError, e)
+            }
+            Err(cas_serve::StoreError::Io(e)) => Response::error(ErrorCode::IoError, e),
         }
-    }
-
-    /// Load the `.mdb` shard, fetch each referenced xorb, and concatenate the
-    /// segment bytes to reconstruct the file. Reconstruction walks the shard's
-    /// File-Info segments (each naming a xorb + local chunk range), reads each
-    /// xorb's raw bytes, and slices the segment's byte range out of it.
-    async fn reassemble_from_shard(&self, file_hash: &str, shard_path: &PathBuf) -> Response {
-        let mdb_bytes = match tokio::fs::read(shard_path).await {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Response::error(
-                    ErrorCode::NotFound,
-                    format!("Shard not found: {file_hash}"),
-                )
-            }
-            Err(e) => {
-                return Response::error(ErrorCode::IoError, format!("Failed to read shard: {e}"))
-            }
-        };
-
-        let file_hash_parsed = match Request::parse_hash(file_hash) {
-            Ok(h) => h,
-            Err(e) => return Response::error(ErrorCode::InvalidHash, e),
-        };
-
-        let segments = match Shard::segments(&mdb_bytes, &file_hash_parsed) {
-            Ok(s) => s,
-            Err(e) => {
-                return Response::error(ErrorCode::StorageError, format!("Corrupt shard: {e}"))
-            }
-        };
-
-        // The shard's materialized_bytes is the authoritative file length.
-        let expected_len: u64 = segments.iter().map(|s| s.byte_len).sum();
-        let mut out = Vec::with_capacity(expected_len as usize);
-        for seg in &segments {
-            let xorb_hex = seg.xorb_hash.hex();
-            let xorb_path = self.xorb_path(&xorb_hex);
-            let xorb_bytes = match tokio::fs::read(&xorb_path).await {
-                Ok(b) => b,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Response::error(
-                        ErrorCode::NotFound,
-                        format!("Missing xorb {xorb_hex} for file {file_hash}"),
-                    )
-                }
-                Err(e) => {
-                    return Response::error(
-                        ErrorCode::IoError,
-                        format!("Failed to read xorb {xorb_hex}: {e}"),
-                    )
-                }
-            };
-            // cas-serve stores raw concatenated xorbs and every segment spans
-            // the whole xorb (chunk_start=0), so the segment's byte range is
-            // `[0, byte_len)`. Slice defensively in case a future writer emits
-            // partial spans.
-            let len = (seg.byte_len as usize).min(xorb_bytes.len());
-            out.extend_from_slice(&xorb_bytes[..len]);
-        }
-
-        if out.len() as u64 != expected_len {
-            return Response::error(
-                ErrorCode::StorageError,
-                format!(
-                    "Reconstructed {} bytes but shard expected {expected_len} for {file_hash}",
-                    out.len()
-                ),
-            );
-        }
-
-        debug!(
-            "GetFile {file_hash}: reassembled {} bytes across {} xorb(s)",
-            out.len(),
-            segments.len()
-        );
-        Response::file(&out)
     }
 
     async fn handle_exists(&self, hash: &str) -> Response {

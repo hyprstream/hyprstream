@@ -47,6 +47,7 @@ toml.workspace = true
 serde_yaml.workspace = true
 git2.workspace = true  # Still needed by git2db internally
 git2db = { path = "../git2db", features = ["overlayfs"] }  # High-level git library with overlayfs
+cas-serve = { path = "../cas-serve" }  # Content-addressed store reconstruction (getBlob #432)
 hyprstream-rpc = { path = "../hyprstream-rpc" }  # RPC infrastructure (Cap'n Proto + ZMQ)
 moq-net.workspace = true  # moq-lite streaming for cross-process subscriber (M2b)
 ml-dsa = { workspace = true }  # ML-DSA-65 — always compiled (runtime CryptoPolicy selects PQ). See M3 #152.

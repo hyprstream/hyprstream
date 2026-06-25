@@ -8,5 +8,7 @@ pub mod chunker;
 pub mod mdb_shard;
 pub mod protocol;
 pub mod shard;
+pub mod store;
 
 pub use protocol::{ErrorCode, Request, Response};
+pub use store::{CasStore, StoreError};
