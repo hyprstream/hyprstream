@@ -84,9 +84,11 @@ impl IdCounter {
 pub enum ServiceDispatchResult {
     /// Normal JSON response string.
     Response(String),
-    /// Streaming — JSON string of parsed StreamInfo + ephemeral keypair for ECDH.
+    /// Streaming — the VERIFIED-capnp `StreamInfo` library type (decoded +
+    /// COSE-verified upstream, carried typed — NOT a JSON string to re-parse,
+    /// #468) + ephemeral keypair for ECDH.
     Stream {
-        json: String,
+        info: hyprstream_rpc::stream_info::StreamInfo,
         /// 64 bytes: [secret(32) | pubkey(32)]
         ephemeral_keypair: Vec<u8>,
     },
@@ -217,30 +219,15 @@ impl Mount for GenericServiceMount {
 
         let resp = match dispatch_result {
             ServiceDispatchResult::Response(json) => json.into_bytes(),
-            ServiceDispatchResult::Stream { json: stream_json, ephemeral_keypair } => {
-                // Streaming response — use open_stream() to set up verified subscription
-                let parsed: serde_json::Value = serde_json::from_str(&stream_json)
-                    .map_err(|e| MountError::Io(format!("parse stream response: {e}")))?;
-
-                // The dispatch already sent the streaming request and got StreamInfo back.
-                // Now we need to open a stream handle. But open_stream() does the full
-                // flow (send + ECDH + subscribe). Since dispatch already sent the request,
-                // we need to do the ECDH + subscribe part manually using the StreamInfo.
+            ServiceDispatchResult::Stream { info, ephemeral_keypair } => {
+                // #468: `info` is the VERIFIED-capnp StreamInfo library type carried
+                // typed through dispatch (decoded + COSE-verified upstream) — no
+                // serde_json round-trip / re-parse at this boundary.
                 //
-                // TODO: Refactor dispatch to return raw payload bytes so open_stream()
-                // can handle the full flow. For now, use StreamHandle::open() directly.
-                let inner = if let Some(obj) = parsed.as_object() {
-                    if obj.len() == 1 {
-                        obj.values().next().unwrap().clone()
-                    } else {
-                        parsed.clone()
-                    }
-                } else {
-                    parsed.clone()
-                };
-                let info: hyprstream_rpc::stream_info::StreamInfo = serde_json::from_value(inner)
-                    .map_err(|e| MountError::Io(format!("parse StreamInfo: {e}")))?;
-
+                // The dispatch already sent the streaming request and got StreamInfo back.
+                // Now we open a stream handle. open_stream() would do the full flow
+                // (send + ECDH + subscribe), but dispatch already sent the request, so we
+                // do the ECDH + subscribe part here using the verified StreamInfo.
                 let client_secret = &ephemeral_keypair[..32];
                 let client_pubkey = &ephemeral_keypair[32..64];
                 let mut secret_32 = [0u8; 32];
@@ -433,8 +420,8 @@ macro_rules! impl_service_dispatch {
 
                 Ok(match result {
                     svc::DispatchResult::Response(json) => ServiceDispatchResult::Response(json),
-                    svc::DispatchResult::Stream(json) => ServiceDispatchResult::Stream {
-                        json,
+                    svc::DispatchResult::Stream(info) => ServiceDispatchResult::Stream {
+                        info,
                         ephemeral_keypair: keypair,
                     },
                 })

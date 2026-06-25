@@ -88,6 +88,7 @@ fn decode_jwt_iss(jwt: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;

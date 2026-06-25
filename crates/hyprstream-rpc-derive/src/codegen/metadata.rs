@@ -257,14 +257,15 @@ fn generate_json_dispatcher(
 
     let streaming_method = quote! {
         /// Dispatch a streaming method call by name with JSON arguments and an ephemeral public key.
-        /// Returns the StreamInfo as a JSON value.
+        /// Returns the verified-capnp `StreamInfo` library type (decoded + COSE-verified
+        /// inside `call_streaming`) — NOT a re-serialized `serde_json::Value` (#468).
         #[allow(unused_variables)]
         pub async fn call_streaming_method(
             &self,
             method: &str,
             args: &serde_json::Value,
             ephemeral_pubkey: [u8; 32],
-        ) -> anyhow::Result<serde_json::Value> {
+        ) -> anyhow::Result<hyprstream_rpc::stream_info::StreamInfo> {
             match method {
                 #(#main_streaming_arms)*
                 _ => anyhow::bail!("Unknown streaming method: {}", method),
@@ -402,18 +403,22 @@ fn generate_json_streaming_dispatch_arm(
     let method_name = format_ident!("{}", method_name_str);
     let ct = resolved.resolve_type(&v.type_name).capnp_type.clone();
 
+    // #468: streaming methods ALWAYS resolve to the verified-capnp `StreamInfo`
+    // library type (decoded + COSE-verified inside `call_streaming`). The JSON
+    // dispatch wrappers return that native type directly — NO `serde_json::to_value`
+    // round-trip — so the signed artifact flows through typed to MCP/VFS consumers.
     match ct {
         CapnpType::Void => quote! {
             #method_name_str => {
                 let result = self.#method_name(ephemeral_pubkey).await?;
-                Ok(serde_json::to_value(&result)?)
+                Ok(result)
             }
         },
         CapnpType::Text => quote! {
             #method_name_str => {
                 let value = args[#method_name_str].as_str().or_else(|| args["value"].as_str()).unwrap_or_default();
                 let result = self.#method_name(value, ephemeral_pubkey).await?;
-                Ok(serde_json::to_value(&result)?)
+                Ok(result)
             }
         },
         _ => {
@@ -426,7 +431,7 @@ fn generate_json_streaming_dispatch_arm(
                     quote! {
                         #method_name_str => {
                             let result = self.#method_name(ephemeral_pubkey).await?;
-                            Ok(serde_json::to_value(&result)?)
+                            Ok(result)
                         }
                     }
                 } else {
@@ -436,7 +441,7 @@ fn generate_json_streaming_dispatch_arm(
                         #method_name_str => {
                             let __req: #data_name = serde_json::from_value(args.clone())?;
                             let result = self.#method_name(&__req, ephemeral_pubkey).await?;
-                            Ok(serde_json::to_value(&result)?)
+                            Ok(result)
                         }
                     }
                 }
@@ -499,13 +504,14 @@ fn generate_scoped_dispatcher_block(
 
     let scoped_streaming_method = quote! {
         /// Dispatch a scoped streaming method call by name with JSON arguments and an ephemeral public key.
+        /// Returns the verified-capnp `StreamInfo` library type (#468).
         #[allow(unused_variables)]
         pub async fn call_streaming_method(
             &self,
             method: &str,
             args: &serde_json::Value,
             ephemeral_pubkey: [u8; 32],
-        ) -> anyhow::Result<serde_json::Value> {
+        ) -> anyhow::Result<hyprstream_rpc::stream_info::StreamInfo> {
             match method {
                 #(#scoped_streaming_arms)*
                 _ => anyhow::bail!("Unknown scoped streaming method: {}", method),
@@ -679,7 +685,7 @@ fn generate_call_scoped_streaming_method_for_client(
             method: &str,
             args: &serde_json::Value,
             ephemeral_pubkey: [u8; 32],
-        ) -> anyhow::Result<serde_json::Value> {
+        ) -> anyhow::Result<hyprstream_rpc::stream_info::StreamInfo> {
             if scopes.is_empty() {
                 return self.call_streaming_method(method, args, ephemeral_pubkey).await;
             }
@@ -711,7 +717,7 @@ fn collect_call_scoped_streaming_method_recursive(
                         method: &str,
                         args: &serde_json::Value,
                         ephemeral_pubkey: [u8; 32],
-                    ) -> anyhow::Result<serde_json::Value> {
+                    ) -> anyhow::Result<hyprstream_rpc::stream_info::StreamInfo> {
                         if scopes.is_empty() {
                             return self.call_streaming_method(method, args, ephemeral_pubkey).await;
                         }
@@ -739,7 +745,7 @@ fn collect_call_scoped_streaming_method_recursive(
                         method: &str,
                         args: &serde_json::Value,
                         ephemeral_pubkey: [u8; 32],
-                    ) -> anyhow::Result<serde_json::Value> {
+                    ) -> anyhow::Result<hyprstream_rpc::stream_info::StreamInfo> {
                         if scopes.is_empty() {
                             return self.call_streaming_method(method, args, ephemeral_pubkey).await;
                         }
