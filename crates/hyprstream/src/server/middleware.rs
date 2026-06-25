@@ -8,7 +8,9 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use hyprstream_rpc::auth::JtiBlocklist as _;
 use std::time::Instant;
+use subtle::ConstantTimeEq as _;
 use tracing::{debug, info, warn};
 
 /// Authenticated identity extracted from token
@@ -35,95 +37,162 @@ impl std::fmt::Debug for AuthenticatedUser {
 
 /// JWT authentication middleware
 ///
-/// Validates JWT tokens (eyJ...) via Ed25519 signature verification.
+/// Validates JWT tokens via Ed25519 signature verification.
+/// Accepts `Authorization: Bearer <token>` and `Authorization: DPoP <token>`.
+///
+/// When the token carries a `cnf.jkt` claim (DPoP-bound token per RFC 9449),
+/// the `Authorization: DPoP` scheme MUST be used and a valid `DPoP` proof
+/// header MUST accompany the request — plain Bearer is rejected to prevent
+/// token replay after theft.
+///
+/// Revoked tokens (via `POST /oauth/revoke`) are rejected via JTI blocklist.
 ///
 /// On success, inserts `AuthenticatedUser` into request extensions.
-/// JWT `sub` claim contains bare username (e.g., "alice").
 pub async fn auth_middleware(
     State(state): State<ServerState>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    // Get JWT token from Authorization header (RFC 6750: Bearer scheme is case-insensitive)
-    let token = request
+    // Accept both Bearer and DPoP schemes (RFC 6750, RFC 9449)
+    let auth_hdr = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|h| {
-            if h.len() > 7 && h[..7].eq_ignore_ascii_case("bearer ") {
-                Some(h[7..].trim())
-            } else {
-                None
-            }
-        });
+        .map(str::to_owned);
 
-    // SECURITY: No anonymous access — require Bearer token
-    let Some(token) = token else {
-        let www_authenticate = build_www_authenticate(&state);
-        return unauthorized_response("Authentication required", &www_authenticate);
+    let (scheme, token) = match auth_hdr.as_deref().and_then(|h| {
+        if h.len() > 7 && h[..7].eq_ignore_ascii_case("bearer ") {
+            Some(("bearer", h[7..].trim().to_owned()))
+        } else if h.len() > 5 && h[..5].eq_ignore_ascii_case("dpop ") {
+            Some(("dpop", h[5..].trim().to_owned()))
+        } else {
+            None
+        }
+    }) {
+        Some(pair) => pair,
+        None => {
+            let www_authenticate = build_www_authenticate(&state);
+            return unauthorized_response("Authentication required", &www_authenticate);
+        }
     };
 
     // Build WWW-Authenticate header for 401 responses (RFC 9728)
     let www_authenticate = build_www_authenticate(&state);
 
-    // Try JWT validation (stateless)
-    if token.contains('.') {
-        // Extract iss from token payload without signature verification
-        let iss = extract_iss_from_token(token);
+    if !token.contains('.') {
+        debug!("Invalid token format");
+        return unauthorized_response("Authentication failed", &www_authenticate);
+    }
 
-        let local_issuers: &[&str] = &[&*state.oauth_issuer_url];
-        let result = if hyprstream_rpc::auth::is_local_iss(&iss, local_issuers) {
-            // Local token: verify with local key
-            jwt::decode(token, &state.verifying_key, Some(&state.resource_url))
-        } else {
-            // Federated token: pre-check trust before acquiring async lock
-            if !state.federation_resolver.is_trusted(&iss) {
-                debug!("Untrusted federation issuer: {}", iss);
-                return unauthorized_response("Authentication failed", &www_authenticate);
-            }
-            match state.federation_resolver.get_key(&iss).await {
-                Ok(key) => jwt::decode_with_key(token, &key, Some(&state.resource_url)),
-                Err(e) => {
-                    debug!("Federation key resolution failed for issuer {}: {}", iss, e);
-                    return unauthorized_response("Authentication failed", &www_authenticate);
-                }
-            }
-        };
-
-        match result {
-            Ok(claims) => {
-                debug!("JWT validated for user: {}", claims.sub);
-                let subject = claims.subject(local_issuers);
-                // Validate local subjects for safe characters. Federated subjects
-                // (containing "://") bypass this check — they are validated at JWT decode time.
-                if let Err(e) = subject.validate() {
-                    debug!("JWT sub validation failed: {}", e);
-                    return unauthorized_response("Authentication failed", &www_authenticate);
-                }
-                let user_str = match subject.name() {
-                    Some(n) => n.to_owned(),
-                    None => {
-                        debug!("JWT has empty sub");
-                        return unauthorized_response("Authentication failed", &www_authenticate);
-                    }
-                };
-                let user = AuthenticatedUser {
-                    user: user_str,
-                    token: Some(token.to_owned()),
-                    exp: Some(claims.exp),
-                };
-                request.extensions_mut().insert(user);
-                return next.run(request).await;
-            }
+    // Extract iss for key routing
+    let iss = extract_iss_from_token(&token);
+    let local_issuers: &[&str] = &[&*state.oauth_issuer_url];
+    let result = if hyprstream_rpc::auth::is_local_iss(&iss, local_issuers) {
+        jwt::decode(&token, &state.verifying_key, Some(&state.resource_url))
+    } else {
+        if !state.federation_resolver.is_trusted(&iss) {
+            debug!("Untrusted federation issuer: {}", iss);
+            return unauthorized_response("Authentication failed", &www_authenticate);
+        }
+        match state.federation_resolver.get_key(&iss).await {
+            Ok(key) => jwt::decode_with_key(&token, &key, Some(&state.resource_url)),
             Err(e) => {
-                debug!("JWT validation failed: {}", e);
+                debug!("Federation key resolution failed for issuer {}: {}", iss, e);
                 return unauthorized_response("Authentication failed", &www_authenticate);
             }
         }
+    };
+
+    let claims = match result {
+        Ok(c) => c,
+        Err(e) => {
+            debug!("JWT validation failed: {}", e);
+            return unauthorized_response("Authentication failed", &www_authenticate);
+        }
+    };
+
+    // JTI revocation check (RFC 7009) — shared blocklist with OAuth revocation endpoint.
+    if let Some(ref jti) = claims.jti {
+        if state.jti_blocklist.is_revoked(jti) {
+            warn!(jti = %jti, sub = %claims.sub, "Revoked token presented");
+            return unauthorized_response("Authentication failed", &www_authenticate);
+        }
     }
 
-    debug!("Invalid token format");
-    unauthorized_response("Authentication failed", &www_authenticate)
+    // DPoP binding enforcement (RFC 9449).
+    // A token with cnf.jkt MUST be presented with Authorization: DPoP + DPoP proof header.
+    // Accepting it as Bearer would let a stolen token replay without proof of key possession.
+    if let Some(expected_jkt) = claims.cnf_jkt() {
+        if scheme != "dpop" {
+            warn!(sub = %claims.sub, "DPoP-bound token presented with Bearer scheme — rejected");
+            return unauthorized_response("Authentication failed", &www_authenticate);
+        }
+        let dpop_proof = match request.headers().get("DPoP").and_then(|v| v.to_str().ok()) {
+            Some(p) => p.to_owned(),
+            None => {
+                debug!("DPoP-bound token missing DPoP proof header");
+                return unauthorized_response("Authentication failed", &www_authenticate);
+            }
+        };
+        let method = request.method().as_str().to_owned();
+        let path = request.uri().path().to_owned();
+        // Build absolute htu from the server's resource_url (scheme + host) + request path.
+        // Axum doesn't populate scheme/host in the URI for HTTPS behind a TLS terminator,
+        // so we use the pre-configured resource_url as the authority base.
+        let htu = format!("{}{}", state.resource_url.trim_end_matches('/'), path);
+        let proof = match crate::services::oauth::dpop::verify_dpop_proof(
+            &dpop_proof,
+            &method,
+            &htu,
+            Some(&token),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!("DPoP proof verification failed: {}", e);
+                return unauthorized_response("Authentication failed", &www_authenticate);
+            }
+        };
+        // Replay prevention: each DPoP jti is accepted at most once (within iat ±60s window).
+        {
+            let now = chrono::Utc::now().timestamp();
+            let expiry = proof.iat + 120; // iat ± 60s → window ends at iat + 60; store until iat + 120
+            let mut seen = state.dpop_jti_seen.write();
+            seen.retain(|_, exp| *exp > now);
+            if seen.contains_key(&proof.jti) {
+                debug!("DPoP proof jti already used: {}", proof.jti);
+                return unauthorized_response("Authentication failed", &www_authenticate);
+            }
+            seen.insert(proof.jti.clone(), expiry);
+        }
+        // cnf.jkt must match the DPoP proof key thumbprint.
+        if expected_jkt.as_bytes().ct_eq(proof.jkt.as_bytes()).unwrap_u8() == 0 {
+            warn!(sub = %claims.sub, "cnf.jkt mismatch — DPoP proof key does not match token binding");
+            return unauthorized_response("Authentication failed", &www_authenticate);
+        }
+    }
+
+    debug!("JWT validated for user: {}", claims.sub);
+    let subject = claims.subject(local_issuers);
+    // Validate local subjects for safe characters. Federated subjects
+    // (containing "://") bypass this check — they are validated at JWT decode time.
+    if let Err(e) = subject.validate() {
+        debug!("JWT sub validation failed: {}", e);
+        return unauthorized_response("Authentication failed", &www_authenticate);
+    }
+    let user_str = match subject.name() {
+        Some(n) => n.to_owned(),
+        None => {
+            debug!("JWT has empty sub");
+            return unauthorized_response("Authentication failed", &www_authenticate);
+        }
+    };
+    let user = AuthenticatedUser {
+        user: user_str,
+        token: Some(token),
+        exp: Some(claims.exp),
+    };
+    request.extensions_mut().insert(user);
+    next.run(request).await
 }
 
 /// Request logging middleware

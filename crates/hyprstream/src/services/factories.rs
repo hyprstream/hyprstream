@@ -884,6 +884,11 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
             resource_url,
             oauth_issuer_url,
             &config.oauth.trusted_issuers,
+            // Share the PolicyService-owned JTI blocklist so POST /oauth/revoke
+            // immediately invalidates tokens at the OAI resource server.
+            SHARED_JTI_BLOCKLIST.get()
+                .map(Arc::clone)
+                .unwrap_or_else(|| Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new())),
         ))
     })
     .context("Failed to create server state")?;

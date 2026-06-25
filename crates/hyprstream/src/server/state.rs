@@ -3,6 +3,7 @@
 use crate::services::{RegistryClient, PolicyClient};
 use crate::services::generated::model_client::{ModelClient, LoadModelRequest};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -48,6 +49,14 @@ pub struct ServerState {
     /// Federation key resolver for multi-issuer JWT verification.
     /// Contains trusted issuers (empty if none configured).
     pub federation_resolver: Arc<crate::auth::FederationKeyResolver>,
+
+    /// Shared JTI blocklist for access token revocation (RFC 7009).
+    /// Populated by the OAuth revocation endpoint; checked on every request.
+    pub jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
+
+    /// Per-request DPoP JTI dedup map (RFC 9449 §11.1 replay prevention).
+    /// Maps jti → expiry (iat + 60s grace). Periodically cleaned up.
+    pub dpop_jti_seen: Arc<parking_lot::RwLock<HashMap<String, i64>>>,
 }
 
 /// Metrics collector
@@ -91,7 +100,8 @@ impl ServerState {
         jwt_verifying_key: VerifyingKey,
         resource_url: String,
         oauth_issuer_url: String,
-        trusted_issuers: &std::collections::HashMap<String, crate::config::TrustedIssuerConfig>,
+        trusted_issuers: &HashMap<String, crate::config::TrustedIssuerConfig>,
+        jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
     ) -> Result<Self, anyhow::Error> {
         let signing_key = Arc::new(signing_key);
         // Use the CA JWT verifying key (not the service's own key) so HTTP Bearer tokens
@@ -137,6 +147,8 @@ impl ServerState {
             resource_url,
             oauth_issuer_url,
             federation_resolver,
+            jti_blocklist,
+            dpop_jti_seen: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         })
     }
 
