@@ -570,6 +570,9 @@ impl ServiceContext {
                 fetcher.clone(),
             );
             let source = source.with_ml_dsa_verifying_keys(self.ml_dsa_verifying_keys.clone());
+            // Authoritative local CA key for offline service-JWT resolution
+            // (no dependency on the HTTP /oauth/jwks endpoint at startup).
+            let source = source.with_local_ca_key(self.jwt_verifying_key());
             std::sync::Arc::new(source)
         } else {
             let source = hyprstream_rpc::auth::ClusterKeySource::new(
