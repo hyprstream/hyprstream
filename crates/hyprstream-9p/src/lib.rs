@@ -1,23 +1,33 @@
-//! Minimal 9P2000.L server for bridging hyprstream VFS to Wanix via DMA.
+//! 9P2000.L codec and server-side translator for hyprstream.
 //!
-//! Implements only the message types needed for filesystem access:
-//! - Tversion/Rversion — protocol negotiation
-//! - Tattach/Rattach — attach to root
-//! - Twalk/Rwalk — path traversal
-//! - Tlopen/Rlopen — open file (9P2000.L variant)
-//! - Tread/Rread — read data
-//! - Twrite/Rwrite — write data
-//! - Treaddir/Rreaddir — list directory
-//! - Tgetattr/Rgetattr — stat file
-//! - Tclunk/Rclunk — close fid
-//! - Rlerror — error response
+//! Two halves:
 //!
-//! Wire format: all messages are length-prefixed (4-byte LE), matching
-//! the DMA ring buffer's message framing.
+//! - **Codec** ([`msg`]): the full 9P2000.L wire format. `read_from` / `write_to`
+//!   style helpers for *both* client and server sides — T-message parsers +
+//!   R-message encoders live alongside the original client-side encoders +
+//!   R-message parsers.
+//!
+//! - **Translator** ([`translator`]): a server that accepts 9P connections
+//!   (TCP transport now; virtio-9P later), maintains a server-side fid table,
+//!   and translates each T-message into a [`backend::Backend`] call. The
+//!   backend is the capnp-RPC seam: the `hyprstream` binary crate ships a
+//!   `ModelBackend` that turns each call into a `nine.capnp` envelope against
+//!   the model service's `fs` scope — the inverse of `RemoteModelMount`
+//!   (VFS → RPC).
+//!
+//! The client side ([`client`], [`dma`], [`wanix_mount`]) bridges hyprstream's
+//! VFS to Wanix via DMA and is unchanged.
 
 pub mod msg;
 pub mod client;
+pub mod backend;
+pub mod memory;
+pub mod translator;
+
 #[cfg(target_arch = "wasm32")]
 pub mod dma;
 #[cfg(target_arch = "wasm32")]
 pub mod wanix_mount;
+
+pub use backend::{Backend, OpenResult, StatResult, WalkResult};
+pub use translator::{FidTable, Translator};

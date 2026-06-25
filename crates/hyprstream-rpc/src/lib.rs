@@ -114,6 +114,7 @@ pub mod streaming_types {
 }
 
 pub mod capnp;
+pub mod cid;
 pub mod crypto;
 pub mod envelope;
 pub mod error;
@@ -150,6 +151,8 @@ pub mod service;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod streaming;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod stream_provenance;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod moq_stream;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod moq_authz;
@@ -180,6 +183,11 @@ pub mod socket;
 pub mod wasm_api;
 #[cfg(target_arch = "wasm32")]
 pub mod web_transport;
+// #409 Path A: browser counterpart to native `dial`. Compiles only on wasm32;
+// see `dial_wasm.rs` for why this is a separate module rather than an arm in
+// native `dial()` (which is itself `#[cfg(not(target_arch = "wasm32"))]`).
+#[cfg(target_arch = "wasm32")]
+pub mod dial_wasm;
 
 // ============================================================================
 // Re-exports available on ALL targets

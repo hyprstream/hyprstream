@@ -15,11 +15,22 @@ name = "cas-serve"
 path = "src/main.rs"
 
 [dependencies]
-# XET core dependencies
+# XET core dependencies.
+# `merklehash` provides the spec-defined hashing: BLAKE3 keyed with the global
+# DATA_KEY (chunk hash), the Merkle-root xorb hash, and the HMAC'd file hash.
 merklehash.workspace = true
+# `gearhash` is the exact CDC crate xet-core uses (content-defined chunking via
+# the FastCDC rolling hash). Reusing it gives byte-identical chunk boundaries to
+# the upstream xet-core `Chunker` (see `chunker.rs`) without dragging the full
+# xet_config/xet_runtime/mdb_shard tree into this lightweight crate.
+gearhash = "0.1"
 
 # Async runtime
 tokio = { workspace = true, features = ["rt-multi-thread", "io-util", "macros", "io-std", "fs"] }
+
+# Byte buffer type for chunk data (reuses the same `bytes` crate xet-core's
+# `Chunk` uses).
+bytes.workspace = true
 
 # Serialization - using JSON for simplicity and debuggability
 serde = { workspace = true, features = ["derive"] }
@@ -37,6 +48,9 @@ tracing-subscriber.workspace = true
 base64 = "0.22"
 dirs = "5.0"
 shellexpand = "3.1"
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

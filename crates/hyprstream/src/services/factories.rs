@@ -76,10 +76,78 @@ fn get_or_init_git2db(models_dir: &std::path::Path) -> anyhow::Result<Arc<RwLock
     Ok(Arc::clone(SHARED_GIT2DB.get_or_init(|| shared)))
 }
 
+/// Resolve the credentials directory used to load service JWTs at startup.
+///
+/// Mirrors the resolution in `main.rs`: systemd/IPC mode honors
+/// `HYPRSTREAM__SECRETS__PATH`; otherwise it is `<config_dir>/credentials`.
+/// This is the same on-disk location the wizard/bootstrap manager writes
+/// service JWTs to (`credentials/{service}/service-jwt`).
+fn credentials_dir() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("HYPRSTREAM__SECRETS__PATH") {
+        return std::path::PathBuf::from(p);
+    }
+    HyprConfig::load()
+        .map(|c| c.config_dir().join("credentials"))
+        .unwrap_or_else(|_| {
+            dirs::config_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                .join("hyprstream")
+                .join("credentials")
+        })
+}
+
+/// Resolve the CA-signed JWT used to register a service's signing key.
+///
+/// Fail-closed (issue #441): returns the JWT (preferring one already in the
+/// trust store, falling back to the authoritative on-disk credential), or an
+/// ERROR naming the real cause. It never silently returns "skip" — a service
+/// that cannot produce its JWT must not come up serving signed responses.
+fn resolve_registration_jwt(
+    service_name: &str,
+    creds_dir: &std::path::Path,
+    from_trust: Option<String>,
+) -> anyhow::Result<String> {
+    if let Some(jwt) = from_trust {
+        return Ok(jwt);
+    }
+    match crate::auth::identity_store::load_service_jwt(creds_dir, service_name) {
+        Ok(Some(jwt)) => Ok(jwt),
+        Ok(None) => anyhow::bail!(
+            "service '{service_name}' cannot register its signing key: \
+             no CA-signed JWT found in trust store or on disk at {}. \
+             Run 'hyprstream wizard' to provision service credentials; \
+             a service must not serve signed responses without a registered key.",
+            creds_dir.display(),
+        ),
+        Err(e) => anyhow::bail!(
+            "service '{service_name}' cannot register its signing key: \
+             failed to read CA-signed JWT from {}: {e}",
+            creds_dir.display(),
+        ),
+    }
+}
+
 /// Register this service's verifying key with the PolicyService CA.
 ///
 /// Called by each non-policy factory so that peer services can resolve
 /// our pubkey via `resolveServiceKey` RPC.  No-op for PolicyService itself.
+///
+/// # Fail-closed (issue #441)
+///
+/// A service that cannot obtain its CA-signed JWT (and therefore cannot
+/// register its signing key) MUST NOT come up serving signed responses —
+/// every peer would resolve a key/JWT that disagrees with what we actually
+/// sign with, surfacing three layers away as a cryptic "Response signed by
+/// unexpected key". So registration is a hard precondition: if we cannot get
+/// a JWT, we return an error and the factory (and thus the service) fails to
+/// start, naming the real cause.
+///
+/// The authoritative source of the service JWT is on disk
+/// (`credentials/{service}/service-jwt`), written by the wizard/bootstrap
+/// manager. At process startup only the bootstrap *pubkeys* are seeded into
+/// the trust store (with `jwt: None`); the JWT itself is loaded here and
+/// seeded into the trust store so that peer-client construction
+/// (`service_token`) and the background renewal task can read it.
 fn register_service_key(
     _ctx: &ServiceContext,
     service_name: &str,
@@ -90,23 +158,40 @@ fn register_service_key(
         return Ok(());
     }
 
-    let jwt = {
+    let creds_dir = credentials_dir();
+
+    // The JWT may already be in the trust store (e.g. seeded by an earlier
+    // registration in this process); otherwise load it from disk — the
+    // authoritative location the wizard/bootstrap manager wrote it to.
+    let from_trust = {
         let trust = hyprstream_service::global_trust_store();
-        let vk = match trust.resolve_one(service_name) {
-            Some(vk) => vk,
-            None => {
-                tracing::warn!(service = service_name, "trust store has no key — skipping registerServiceKey");
-                return Ok(());
-            }
-        };
-        match trust.get(&vk).and_then(|att| att.jwt.clone()) {
-            Some(jwt) => jwt,
-            None => {
-                tracing::warn!(service = service_name, "trust store has no JWT — skipping registerServiceKey");
-                return Ok(());
-            }
-        }
+        trust
+            .resolve_one(service_name)
+            .and_then(|vk| trust.get(&vk))
+            .and_then(|att| att.jwt.clone())
     };
+    let jwt = resolve_registration_jwt(service_name, &creds_dir, from_trust)?;
+
+    // Seed the loaded JWT into the trust store so that peer-client construction
+    // (`service_token`) and the background renewal task can read it. Bind it to
+    // this service's own verifying key — the key we actually sign with — so the
+    // advertised key == the actual signer (the #441 invariant).
+    {
+        let vk = signing_key.verifying_key();
+        let trust = hyprstream_service::global_trust_store();
+        let expires_at = decode_jwt_exp(&jwt).unwrap_or(0);
+        let mut att = trust.get(&vk).unwrap_or_else(|| hyprstream_service::Attestation {
+            scopes: std::iter::once(service_name.to_owned()).collect(),
+            subject: None,
+            jwt: None,
+            expires_at: 0,
+            attested_by: None,
+        });
+        att.scopes.insert(service_name.to_owned());
+        att.jwt = Some(jwt.clone());
+        att.expires_at = expires_at;
+        trust.insert(vk, att);
+    }
 
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
@@ -131,15 +216,7 @@ fn register_service_key(
     info!(service = service_name, "Registered verifying key with PolicyService");
 
     // Spawn background JWT renewal for this service
-    let credentials_dir = HyprConfig::load()
-        .map(|c| c.config_dir().join("credentials"))
-        .unwrap_or_else(|_| {
-            dirs::config_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-                .join("hyprstream")
-                .join("credentials")
-        });
-    spawn_jwt_renewal_task(service_name, signing_key.clone(), credentials_dir);
+    spawn_jwt_renewal_task(service_name, signing_key.clone(), creds_dir);
 
     Ok(())
 }
@@ -636,6 +713,21 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
         model_service = model_service.with_expected_audience(issuer.to_owned());
     }
     model_service = model_service.with_jwt_key_source(ctx.cluster_key_source());
+
+    // #431 — DiscoveryClient for federated at:// record resolution. The discovery
+    // key is in the trust store (depends_on includes "discovery"). Best-effort:
+    // if discovery isn't resolvable, ModelService simply has no federation client
+    // and at:// refs fall through to local resolution.
+    if let Some(discovery_vk) = hyprstream_service::global_trust_store().resolve_one("discovery") {
+        match crate::services::DiscoveryClient::for_service(sk.clone(), discovery_vk, None) {
+            Ok(dc) => {
+                model_service = model_service.with_discovery_client(std::sync::Arc::new(dc));
+            }
+            Err(e) => {
+                tracing::warn!("ModelService: failed to build DiscoveryClient for federation: {e}");
+            }
+        }
+    }
 
     Ok(ctx.into_spawnable_quic(model_service, config.model.quic_port))
 }
@@ -1262,11 +1354,21 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("discovery"))?;
     let auth_provider = crate::services::discovery::PolicyAuthProvider::new(policy_client);
 
+    // #431 — record resolver backing getRecord/getRepo. Built over an in-memory
+    // PDS record store; the publishing side (populating the store on model
+    // register + atproto-pointer advance, #394) is wired separately, so the
+    // store starts empty (getRecord reports NOT_FOUND until records are
+    // published). The access-control gate + CAR-proof wire are fully active.
+    let pds_store = std::sync::Arc::new(crate::services::discovery::PdsRecordStore::new());
+    let record_resolver = crate::services::discovery::PdsRecordResolver::new(pds_store);
+
     let mut discovery_service = DiscoveryService::new(
         Arc::new(sk),
         ctx.jwt_verifying_key(),
         ctx.transport("discovery", SocketKind::Rep),
-    ).with_auth_provider(Box::new(auth_provider));
+    )
+    .with_auth_provider(Box::new(auth_provider))
+    .with_record_resolver(Box::new(record_resolver));
     if let Some(issuer) = ctx.oauth_issuer_url() {
         discovery_service = discovery_service.with_oauth_issuer(issuer.to_owned());
         // Use the issuer URL as the audience for discovery tokens
@@ -1485,6 +1587,46 @@ mod tests {
         msg.extend_from_slice(ed25519_pubkey);
         msg.extend_from_slice(domain.as_bytes());
         msg
+    }
+
+    /// #441 fail-closed: with no JWT in the trust store and none on disk,
+    /// registration MUST error (naming the real cause) rather than silently
+    /// skip — a service that can't register its key must not serve signed
+    /// responses.
+    #[test]
+    fn resolve_registration_jwt_fails_closed_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = resolve_registration_jwt("model", dir.path(), None)
+            .expect_err("missing JWT must fail closed, not skip");
+        let msg = err.to_string();
+        assert!(msg.contains("model"), "error names the service: {msg}");
+        assert!(
+            msg.contains("cannot register its signing key"),
+            "error names the real cause: {msg}",
+        );
+    }
+
+    /// A JWT already present in the trust store is used directly (no disk read).
+    #[test]
+    fn resolve_registration_jwt_prefers_trust_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let jwt = resolve_registration_jwt(
+            "model",
+            dir.path(),
+            Some("trust.jwt.token".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(jwt, "trust.jwt.token");
+    }
+
+    /// When not in the trust store, the authoritative on-disk JWT is loaded.
+    #[test]
+    fn resolve_registration_jwt_falls_back_to_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::auth::identity_store::write_service_jwt(dir.path(), "model", "disk.jwt.token")
+            .unwrap();
+        let jwt = resolve_registration_jwt("model", dir.path(), None).unwrap();
+        assert_eq!(jwt, "disk.jwt.token");
     }
 
     #[test]

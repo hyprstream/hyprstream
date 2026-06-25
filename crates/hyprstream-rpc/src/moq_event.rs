@@ -19,6 +19,32 @@
 //! No chained HMAC or policy axes — events are best-effort lifecycle signals, not
 //! auditable streams. `SecureEventPublisher` / `SecureEventSubscriber` (Phase 7)
 //! layer group-key encryption on top and are unaffected by this transport change.
+//!
+//! # #393 — per-OID broadcast paths
+//!
+//! The original design (above) is a flat single-track fan-out: every event for
+//! every model OID lands on the same `events` track, and subscribers filter
+//! post-read. That is the firehose problem — O(whole-network) reads. The fix
+//! mirrors the streaming plane (`moq_stream`: `{tenant}/{service}/{topic}/{instance}`):
+//! each model OID gets its OWN broadcast path, `local/events/publications/{oid_hash}`,
+//! so moq's `scope(&[Path])` makes wire-level selectivity automatic (one QUIC
+//! uni-stream per group per subscribed track). A node tracking N of M OIDs reads
+//! N tracks, not M.
+//!
+//! The flat `local/events/{source}` track is RETAINED as a transition fallback:
+//! publishers that mirror to both paths keep legacy subscribers working while
+//! new subscribers read the selective per-OID track. No capnp change — the event
+//! payload format is unchanged; only the track naming/routing changes.
+//!
+//! ## Late-join retention (decision A: firehose-backfill)
+//!
+//! moq's per-track cache evicts groups older than `MAX_GROUP_AGE` (5s) — too
+//! short for a scheduler reconstructing publication history. On first
+//! subscription to an OID's track, [`BackfillMode`] checks whether history is
+//! available via the optional atproto firehose (`sh.tangled.git.refUpdate`) /
+//! registry; if so it replays that history before switching to live MoQ. If the
+//! firehose is unavailable the subscriber starts live-only (graceful
+//! degradation) — the firehose is the cold-start path, MoQ is the live path.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -28,6 +54,7 @@ use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use moq_net::{BroadcastProducer, Group, Origin, OriginConsumer, OriginProducer, Path, Track, TrackProducer};
 use parking_lot::Mutex;
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 // ============================================================================
@@ -59,6 +86,36 @@ pub const EVENT_TRACK: &str = "events";
 /// Broadcast path prefix (the `local/events` root under which per-source
 /// broadcasts are registered).
 pub const EVENT_PREFIX: &str = "local/events";
+
+/// Broadcast path segment under which per-OID (#393) publication broadcasts
+/// live: `local/events/publications/{oid_hash}`. Mirrors the streaming plane's
+/// `{tenant}/{service}/{topic}/{instance}` shape so `scope(&[Path])` gives
+/// wire-level selectivity — a node tracking N of M OIDs reads N tracks, not M.
+pub const PUBLICATIONS_SEGMENT: &str = "publications";
+
+/// Full prefix for per-OID publication broadcasts.
+pub const PUBLICATIONS_PREFIX: &str = "local/events/publications";
+
+/// Number of hex characters of the SHA-256 OID hash used in the broadcast path.
+/// 16 hex chars (64 bits) keeps paths short while making collisions negligible
+/// across any realistic OID namespace (birthday bound ≈ 2^32 models).
+pub const OID_HASH_LEN: usize = 16;
+
+/// Stable, filesystem/moq-safe identifier for a model OID.
+///
+/// The OID is hashed (SHA-256, truncated to [`OID_HASH_LEN`] hex chars) so the
+/// broadcast path is unguessable from the OID alone and contains no characters
+/// that are illegal in a moq path segment. Two distinct OIDs map to distinct
+/// paths with overwhelming probability.
+pub fn oid_hash(oid: &str) -> String {
+    let digest = Sha256::digest(oid.as_bytes());
+    hex::encode(&digest[..OID_HASH_LEN / 2])
+}
+
+/// Build the per-OID publication broadcast path: `local/events/publications/{oid_hash}`.
+pub fn publication_broadcast_path(oid: &str) -> String {
+    format!("{}/{}", PUBLICATIONS_PREFIX, oid_hash(oid))
+}
 
 // ============================================================================
 // MoqEventOrigin
@@ -131,7 +188,63 @@ impl MoqEventOrigin {
             track,
             source: source.to_owned(),
             next_group: 0,
+            oid_track: None,
         })
+    }
+
+    /// Create an event publisher for `source` (e.g. `"worker"`, `"system"`) that
+    /// ALSO mirrors every event to the per-OID (#393) publication track for `oid`.
+    ///
+    /// This is the transition path: the publisher writes each event to BOTH the
+    /// legacy flat `local/events/{source}` broadcast (so existing subscribers
+    /// keep working) AND the selective `local/events/publications/{oid_hash}`
+    /// broadcast (so #393 subscribers get wire-level per-OID selectivity). Once
+    /// all subscribers have migrated to per-OID tracks the flat mirror can be
+    /// dropped (see [`MoqEventOrigin::publisher_oid_only`]).
+    ///
+    /// `oid` is the model OID whose publications this publisher emits; it is
+    /// hashed via [`oid_hash`] for the broadcast path.
+    pub fn publisher_with_oid(&self, source: &str, oid: &str) -> Result<MoqEventPublisher> {
+        let flat = self.publisher(source)?;
+        let oid_track = self.oid_track(oid)?;
+        Ok(MoqEventPublisher {
+            track: flat.track,
+            source: flat.source,
+            next_group: flat.next_group,
+            oid_track: Some(oid_track),
+        })
+    }
+
+    /// Create an event publisher that writes ONLY to the per-OID (#393)
+    /// publication track for `oid` — no flat-track mirror. Use once every
+    /// subscriber of this source has migrated to per-OID subscription.
+    ///
+    /// `source` is retained for topic-prefix semantics and `publish()` topic
+    /// construction, but nothing is announced under `local/events/{source}`.
+    pub fn publisher_oid_only(&self, source: &str, oid: &str) -> Result<MoqEventPublisher> {
+        let oid_track = self.oid_track(oid)?;
+        Ok(MoqEventPublisher {
+            track: oid_track,
+            source: source.to_owned(),
+            next_group: 0,
+            oid_track: None,
+        })
+    }
+
+    /// Open (creating if needed) the per-OID publication track for `oid` and
+    /// retain its broadcast producer. Returns the track producer.
+    fn oid_track(&self, oid: &str) -> Result<TrackProducer> {
+        let path = publication_broadcast_path(oid);
+        let mut broadcast = self
+            .inner
+            .producer
+            .create_broadcast(path.as_str())
+            .ok_or_else(|| anyhow!("create_broadcast denied for {path}"))?;
+        let track = broadcast.create_track(Track::new(EVENT_TRACK))?;
+        // Keyed by the full path so distinct OIDs accumulate distinct producers
+        // and re-registration of the same OID replaces the stale producer.
+        self.inner.broadcasts.lock().insert(path, broadcast);
+        Ok(track)
     }
 
     /// Clone the origin consumer (for subscriber background tasks).
@@ -376,16 +489,31 @@ async fn run_event_client_link(origin: &MoqEventOrigin, path: &std::path::Path) 
 ///
 /// Publishes topic+payload pairs to the `local/events/{source}` broadcast.
 /// Each `publish_raw` call writes one moq Group (one Frame) on the `events` track.
+///
+/// When constructed via [`MoqEventOrigin::publisher_with_oid`], each event is
+/// ALSO mirrored to the per-OID (#393) publication track so selective
+/// subscribers receive it without the firehose. When constructed via
+/// [`MoqEventOrigin::publisher_oid_only`], `track` IS the OID track and
+/// `oid_track` is `None`.
 pub struct MoqEventPublisher {
     track: TrackProducer,
     source: String,
     next_group: u64,
+    /// Per-OID mirror track. `Some` when the publisher writes to BOTH the flat
+    /// source track and the OID track (transition path); `None` when `track` is
+    /// already the OID track (post-migration) or when no OID was supplied.
+    oid_track: Option<TrackProducer>,
 }
 
 impl MoqEventPublisher {
     /// Publish a raw topic + payload.
     ///
     /// Frame format: `[4 bytes topic_len BE][topic bytes][payload bytes]`.
+    ///
+    /// If this publisher was created with an OID mirror, the frame is written to
+    /// both the flat source track and the per-OID publication track (one Group
+    /// on each, sharing the same group id so consumers on either track see a
+    /// consistent sequence).
     pub fn publish_raw(&mut self, topic: &str, payload: &[u8]) -> Result<()> {
         let topic_bytes = topic.as_bytes();
         let topic_len = topic_bytes.len() as u32;
@@ -398,9 +526,12 @@ impl MoqEventPublisher {
         let group_id = self.next_group;
         self.next_group += 1;
 
-        let mut group = self.track.create_group(Group::from(group_id))?;
-        group.write_frame(Bytes::from(frame))?;
-        group.finish()?;
+        // Write to the primary track.
+        write_group(&mut self.track, group_id, &frame)?;
+        // Mirror to the per-OID track if one is attached (#393 transition).
+        if let Some(oid_track) = &mut self.oid_track {
+            write_group(oid_track, group_id, &frame)?;
+        }
         Ok(())
     }
 
@@ -420,6 +551,81 @@ impl MoqEventPublisher {
     pub fn source(&self) -> &str {
         &self.source
     }
+
+    /// True if this publisher mirrors events to a per-OID (#393) publication track.
+    pub fn has_oid_mirror(&self) -> bool {
+        self.oid_track.is_some()
+    }
+}
+
+/// Write one Group (one Frame) carrying `frame` bytes to `track` at `group_id`.
+fn write_group(track: &mut TrackProducer, group_id: u64, frame: &[u8]) -> Result<()> {
+    let mut group = track.create_group(Group::from(group_id))?;
+    group.write_frame(Bytes::copy_from_slice(frame))?;
+    group.finish()?;
+    Ok(())
+}
+
+// ============================================================================
+// #393 — Firehose backfill for late-join (decision A)
+//
+// moq's per-track cache evicts groups older than MAX_GROUP_AGE (5s). A scheduler
+// reconstructing publication history for an OID needs more than 5s of backlog.
+// On first subscription to an OID's track we consult an optional BackfillSource
+// (atproto firehose `sh.tangled.git.refUpdate` / registry); if it can serve
+// history for that OID we replay it before switching to live MoQ. If no source
+// is available the subscriber starts live-only (graceful degradation): the
+// firehose is the cold-start path, MoQ is the live path.
+// ============================================================================
+
+/// A source of historical publication events for firehose-backfill late-join (#393).
+///
+/// Implementations typically wrap the atproto firehose (`sh.tangled.git.refUpdate`)
+/// or a registry snapshot. All methods are fallible and best-effort: returning an
+/// error or empty iterator from any of them causes [`BackfillMode`] to gracefully
+/// degrade to live-only MoQ (no backfill), never to fail the subscription.
+///
+/// This is a trait object interface so the transport-agnostic `hyprstream-rpc`
+/// crate can express the backfill contract without depending on the atproto /
+/// firehose wiring (which lives in the `hyprstream` app crate).
+pub trait BackfillSource: Send + Sync {
+    /// True if this source can serve history for `oid` right now.
+    ///
+    /// Returning `false` (e.g. firehose offline, registry unreachable) makes the
+    /// subscriber skip backfill and start live-only.
+    fn has_history(&self, oid: &str) -> bool;
+
+    /// Replay historical publication events for `oid` to `tx`, oldest-first.
+    ///
+    /// Each item is the same `(topic, payload)` pair a live MoQ subscriber would
+    /// yield. Implementations should bound the replay (event count / wall time)
+    /// and return once the backlog is drained; the caller then switches to live.
+    /// Errors are logged and treated as "no history available".
+    fn replay<'a>(
+        &'a self,
+        oid: &'a str,
+        tx: &'a mpsc::Sender<(String, Vec<u8>)>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+}
+
+/// Late-join retention mode for a per-OID (#393) subscriber.
+///
+/// Decision A: on first subscription to an OID's track, optionally replay
+/// history from a [`BackfillSource`] (atproto firehose / registry), then switch
+/// to live MoQ. The firehose is the cold-start path; MoQ is the live path.
+#[derive(Default)]
+pub enum BackfillMode {
+    /// No backfill: subscribe live-only. The default; matches pre-#393 behaviour
+    /// and is the graceful-degradation fallback when no firehose is available.
+    #[default]
+    LiveOnly,
+    /// Attempt backfill from the supplied source for `oid` before going live.
+    /// If the source reports no history (`has_history` false) or `replay` errors,
+    /// the subscriber silently falls back to [`BackfillMode::LiveOnly`].
+    FirehoseBackfill {
+        oid: String,
+        source: Arc<dyn BackfillSource>,
+    },
 }
 
 // ============================================================================
@@ -432,9 +638,28 @@ impl MoqEventPublisher {
 /// dot-separated prefix semantics as ZMQ (`"worker."` matches all worker events,
 /// `""` matches everything). Backed by a background Tokio task that watches the
 /// origin consumer for new source broadcasts and reads their `events` tracks.
+///
+/// # #393 — per-OID subscription
+///
+/// [`Self::subscribe_oid`] scopes the subscriber to a single model OID's
+/// publication track (`local/events/publications/{oid_hash}`), so only that
+/// OID's events cross the wire — not the whole firehose. This is mutually
+/// exclusive with the flat-pattern [`Self::subscribe`] API: a subscriber is
+/// either pattern-based (legacy firehose + in-memory filter) or OID-scoped.
 pub struct MoqEventSubscriber {
     /// Patterns added via `subscribe()`. Finalized before `recv()` is called.
+    /// Empty when this subscriber is OID-scoped (no flat-track filtering).
     patterns: Vec<String>,
+    /// The OID whose per-OID track this subscriber reads (`None` ⇒ legacy
+    /// pattern-based subscription over the flat `local/events/{source}` tracks).
+    oid_subscription: Option<String>,
+    /// Late-join retention mode (decision A). Defaults to [`BackfillMode::LiveOnly`].
+    backfill: BackfillMode,
+    /// Explicit origin consumer for tests (bypasses the process-global
+    /// `OnceLock`, which is single-writer and so cannot be reset between tests
+    /// in one binary). `None` in production ⇒ resolve the global at `recv()`.
+    #[cfg(test)]
+    test_consumer: Option<OriginConsumer>,
     /// Receiving end of the background task's channel. `None` until first `recv()`.
     rx: Option<mpsc::Receiver<(String, Vec<u8>)>>,
     /// Background task handle (kept alive for the subscriber's lifetime).
@@ -446,9 +671,26 @@ impl MoqEventSubscriber {
     pub fn new() -> Self {
         Self {
             patterns: Vec::new(),
+            oid_subscription: None,
+            backfill: BackfillMode::LiveOnly,
+            #[cfg(test)]
+            test_consumer: None,
             rx: None,
             _task: None,
         }
+    }
+
+    /// Create a subscriber bound to an explicit origin consumer (tests only).
+    ///
+    /// Production code resolves the process-global origin at `recv()` time (see
+    /// [`ensure_started`]); that global is a `OnceLock` and cannot be reset
+    /// between tests in a single binary, so tests that need an isolated origin
+    /// pass its consumer here instead.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(consumer: OriginConsumer) -> Self {
+        let mut s = Self::new();
+        s.test_consumer = Some(consumer);
+        s
     }
 
     /// Add a topic-prefix filter (prefix match, ZMQ semantics).
@@ -457,10 +699,14 @@ impl MoqEventSubscriber {
     /// - `"worker.sandbox123.started"` — exact topic
     /// - `""` — all events (subscribe-all)
     ///
-    /// Must be called before the first `recv()`.
+    /// Must be called before the first `recv()`. Mutually exclusive with
+    /// [`Self::subscribe_oid`] (legacy flat-track subscription).
     pub fn subscribe(&mut self, pattern: &str) -> Result<()> {
         if self.rx.is_some() {
             return Err(anyhow!("subscribe() must be called before recv()"));
+        }
+        if self.oid_subscription.is_some() {
+            return Err(anyhow!("subscribe() is mutually exclusive with subscribe_oid()"));
         }
         self.patterns.push(pattern.to_owned());
         Ok(())
@@ -480,17 +726,69 @@ impl MoqEventSubscriber {
         Ok(())
     }
 
+    /// Subscribe to a single model OID's per-OID publication track (#393).
+    ///
+    /// The subscriber scopes its origin consumer to
+    /// `local/events/publications/{oid_hash}` and reads only that track, so only
+    /// events published for `oid` cross the wire (one QUIC uni-stream per group
+    /// on the wire). This replaces the flat firehose + in-memory filter.
+    ///
+    /// Mutually exclusive with [`Self::subscribe`] / [`Self::subscribe_all`].
+    /// Must be called before the first `recv()`.
+    pub fn subscribe_oid(&mut self, oid: &str) -> Result<()> {
+        if self.rx.is_some() {
+            return Err(anyhow!("subscribe_oid() must be called before recv()"));
+        }
+        if !self.patterns.is_empty() {
+            return Err(anyhow!("subscribe_oid() is mutually exclusive with subscribe()"));
+        }
+        self.oid_subscription = Some(oid.to_owned());
+        Ok(())
+    }
+
+    /// Set the late-join retention mode (decision A: firehose-backfill).
+    ///
+    /// Only meaningful for OID-scoped subscribers (see [`Self::subscribe_oid`]):
+    /// on first `recv()`, a [`BackfillMode::FirehoseBackfill`] subscriber asks
+    /// its [`BackfillSource`] for `oid` history and replays it before going live.
+    /// If the source is unavailable the subscriber silently degrades to
+    /// live-only (never fails). Must be called before the first `recv()`.
+    pub fn with_backfill(&mut self, mode: BackfillMode) -> Result<()> {
+        if self.rx.is_some() {
+            return Err(anyhow!("with_backfill() must be called before recv()"));
+        }
+        self.backfill = mode;
+        Ok(())
+    }
+
     /// Lazily start the background task and return a mutable reference to the channel receiver.
     fn ensure_started(&mut self) -> Result<&mut mpsc::Receiver<(String, Vec<u8>)>> {
         if self.rx.is_none() {
-            let origin = global_moq_event_origin()
-                .ok_or_else(|| anyhow!("moq event bus not initialized; call init_global_moq_event_origin first"))?;
+            #[cfg(test)]
+            let consumer = if let Some(c) = self.test_consumer.clone() {
+                c
+            } else {
+                global_moq_event_origin()
+                    .ok_or_else(|| anyhow!("moq event bus not initialized; call init_global_moq_event_origin first"))?
+                    .consumer()
+            };
+            #[cfg(not(test))]
+            let consumer = global_moq_event_origin()
+                .ok_or_else(|| anyhow!("moq event bus not initialized; call init_global_moq_event_origin first"))?
+                .consumer();
 
             let (tx, rx) = mpsc::channel(256);
-            let consumer = origin.consumer();
-            let patterns = self.patterns.clone();
 
-            let task = tokio::spawn(run_subscriber_task(consumer, patterns, tx));
+            let task = if let Some(oid) = self.oid_subscription.clone() {
+                // #393 per-OID subscription: scope to the OID's track path and
+                // run the (optional) backfill before going live.
+                let backfill = std::mem::replace(&mut self.backfill, BackfillMode::LiveOnly);
+                tokio::spawn(run_oid_subscriber_task(consumer, oid, backfill, tx))
+            } else {
+                // Legacy flat-track pattern subscription.
+                let patterns = self.patterns.clone();
+                tokio::spawn(run_subscriber_task(consumer, patterns, tx))
+            };
             self.rx = Some(rx);
             self._task = Some(task);
         }
@@ -677,6 +975,122 @@ async fn read_event_broadcast(
     let _ = path; // kept for debugging context; unused in the hot path
 }
 
+/// #393 per-OID subscriber task.
+///
+/// Scopes the origin consumer to `local/events/publications/{oid_hash}` so only
+/// that OID's events cross the wire. If `backfill` carries a [`BackfillSource`]
+/// that reports history for `oid`, that history is replayed to `tx` first
+/// (cold-start), then the task subscribes to the live track. Any backfill error
+/// or "no history" result degrades silently to live-only — the subscription
+/// never fails just because the firehose is down.
+async fn run_oid_subscriber_task(
+    mut consumer: OriginConsumer,
+    oid: String,
+    backfill: BackfillMode,
+    tx: mpsc::Sender<(String, Vec<u8>)>,
+) {
+    // 1) Optional cold-start backfill (decision A). Run BEFORE scoping the live
+    //    consumer so the scheduler sees history before new events regardless of
+    //    when (or whether) the live track is announced.
+    if let BackfillMode::FirehoseBackfill { oid: bf_oid, source } = &backfill {
+        if bf_oid == &oid && source.has_history(&oid) {
+            match source.replay(&oid, &tx).await {
+                Ok(()) => tracing::debug!(oid = %oid, "event backfill replay complete"),
+                Err(e) => tracing::warn!(oid = %oid, error = %e, "event backfill failed; continuing live-only"),
+            }
+        } else {
+            tracing::debug!(oid = %oid, "no backfill history available; starting live-only");
+        }
+    }
+
+    // 2) Scope the consumer to the publications subtree. We scope to the PREFIX
+    //    only (not the OID hash) so the announced() stream keeps flowing even
+    //    before this OID's broadcast exists — late-join then picks up the OID's
+    //    broadcast by matching its hash in the announcement path. This avoids the
+    //    race where a subscriber starts before the publisher announces.
+    let want_hash = oid_hash(&oid);
+    let scoped = match consumer.scope(&[Path::new(PUBLICATIONS_PREFIX)]) {
+        Some(c) => c,
+        None => {
+            tracing::debug!(oid = %oid, "publications subtree not announced; subscriber idle");
+            return;
+        }
+    };
+    consumer = scoped;
+
+    // 3) Wait for the OID's broadcast to be announced and read its `events` track.
+    //    We filter announcements by the OID hash so a per-OID subscriber sees
+    //    exactly one broadcast (the OID's) — no in-memory pattern filtering on
+    //    event topics is needed; the scope + hash match already narrowed the wire.
+    loop {
+        let (path, broadcast) = match consumer.announced().await {
+            None => break,                // origin closed
+            Some((_, None)) => continue,  // unannounce — re-await
+            Some((path, Some(b))) => (path, b),
+        };
+        // Only read announcements whose final path segment is this OID's hash.
+        // Other OIDs' broadcasts are ignored — they stay on their own tracks.
+        // Match the full final segment (not a bare suffix) so two hashes that
+        // happen to share a tail cannot cross-subscribe.
+        let last_segment = path.as_str().rsplit('/').next().unwrap_or("");
+        if last_segment != want_hash.as_str() {
+            continue;
+        }
+        read_oid_event_broadcast(broadcast, tx.clone()).await;
+    }
+}
+
+/// Read all groups from a per-OID publication broadcast's `events` track and
+/// relay every frame to `tx`. Unlike [`read_event_broadcast`] there is NO
+/// pattern filtering — the consumer scope already limited the wire to one OID.
+async fn read_oid_event_broadcast(broadcast: moq_net::BroadcastConsumer, tx: mpsc::Sender<(String, Vec<u8>)>) {
+    let mut track = match broadcast.subscribe_track(&Track::new(EVENT_TRACK)) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+
+    loop {
+        let mut group = match tokio::time::timeout(
+            crate::moq_stream::GROUP_IDLE_TIMEOUT,
+            track.next_group(),
+        ).await {
+            Ok(Ok(Some(g))) => g,
+            Ok(Ok(None)) | Ok(Err(_)) => break,
+            Err(_elapsed) => {
+                tracing::debug!("per-OID event subscriber idle timeout — broadcast may be gone");
+                break;
+            }
+        };
+
+        let frame = match group.read_frame().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!(error = %e, "per-OID event broadcast: frame read error");
+                break;
+            }
+        };
+
+        // Decode: [4 bytes topic_len BE][topic][payload]
+        if frame.len() < 4 {
+            continue;
+        }
+        let topic_len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+        if frame.len() < 4 + topic_len {
+            continue;
+        }
+        let topic = match std::str::from_utf8(&frame[4..4 + topic_len]) {
+            Ok(t) => t.to_owned(),
+            Err(_) => continue,
+        };
+        let payload = frame[4 + topic_len..].to_vec();
+
+        if tx.send((topic, payload)).await.is_err() {
+            break; // receiver dropped
+        }
+    }
+}
+
 /// True if `topic` matches any pattern in `patterns` (prefix match).
 fn topic_matches_patterns(topic: &str, patterns: &[String]) -> bool {
     for pat in patterns {
@@ -844,6 +1258,286 @@ mod tests {
         assert_eq!(topic, "worker.sandbox123.started");
         assert_eq!(payload, b"payload");
 
+        Ok(())
+    }
+
+    // ========================================================================
+    // #393 — per-OID broadcast paths + firehose-backfill late-join
+    // ========================================================================
+
+    #[test]
+    fn oid_hash_is_stable_and_distinct() {
+        let a = oid_hash("at://did:web:node.example.com/models/qwen3-4b/v1");
+        let b = oid_hash("at://did:web:node.example.com/models/qwen3-4b/v1");
+        assert_eq!(a, b, "same OID must hash to the same path");
+        assert_eq!(a.len(), OID_HASH_LEN, "hash is truncated to OID_HASH_LEN hex chars");
+
+        let c = oid_hash("at://did:web:node.example.com/models/llama3-8b/v1");
+        assert_ne!(a, c, "distinct OIDs must hash to distinct paths");
+
+        // The hash must contain only filesystem/moq-safe characters (hex).
+        assert!(a.chars().all(|ch| ch.is_ascii_hexdigit()), "non-hex char in {a}");
+    }
+
+    #[test]
+    fn publication_broadcast_path_shape() {
+        // Mirrors the streaming plane's path-selective shape.
+        let path = publication_broadcast_path("my-oid");
+        assert_eq!(
+            path,
+            format!("{}/{}", PUBLICATIONS_PREFIX, oid_hash("my-oid")),
+            "path must be {PUBLICATIONS_PREFIX}/{{oid_hash}}"
+        );
+        assert!(path.starts_with(PUBLICATIONS_PREFIX));
+    }
+
+    /// A per-OID subscriber receives ONLY that OID's events — not events for
+    /// other OIDs and not the flat firehose. This is the core #393 fix: a node
+    /// tracking N of M OIDs reads N tracks, not M.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn per_oid_subscription_receives_only_that_oid() -> Result<()> {
+        let origin = MoqEventOrigin::new();
+
+        // Two publishers for two distinct OIDs, each mirroring to its own track.
+        let mut pub_a = origin.publisher_with_oid("registry", "oid-alpha")?;
+        let mut pub_b = origin.publisher_with_oid("registry", "oid-beta")?;
+
+        // Subscriber scoped to oid-alpha only (uses an explicit origin consumer
+        // so it does not fight other tests over the process-global OnceLock).
+        let mut sub = MoqEventSubscriber::new_for_test(origin.consumer());
+        sub.subscribe_oid("oid-alpha")?;
+
+        // Publish one event to each OID's track.
+        pub_a.publish("qwen3-4b", "published", b"alpha-event")?;
+        pub_b.publish("llama3-8b", "published", b"beta-event")?;
+
+        // Let the announcement propagate.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // The subscriber should receive oid-alpha's event...
+        let got = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await;
+        let (topic, payload) = match got {
+            Ok(Ok(tp)) => tp,
+            Ok(Err(e)) => panic!("recv error: {e}"),
+            Err(_) => panic!("recv timeout — oid-alpha event never arrived"),
+        };
+        assert_eq!(topic, "registry.qwen3-4b.published");
+        assert_eq!(payload, b"alpha-event");
+
+        // ...and NOT oid-beta's. Poll briefly: any further recv should time out
+        // (the subscriber is scoped to oid-alpha, so beta's event never reaches it).
+        let next = sub.recv_timeout(Duration::from_millis(300)).await?;
+        assert!(
+            next.is_none(),
+            "per-OID subscriber received an event for a DIFFERENT OID: {next:?}"
+        );
+
+        // Hold the publishers alive so their broadcasts stay announced for the
+        // lifetime of the subscriber task.
+        drop(pub_a);
+        drop(pub_b);
+        Ok(())
+    }
+
+    /// The legacy flat `events` track still receives events from a publisher
+    /// created with `publisher_with_oid` (back-compat fallback during the #393
+    /// transition). A `publisher_with_oid` mirrors to BOTH the flat
+    /// `local/events/registry` track and the per-OID publication track, so a
+    /// legacy subscriber reading the flat track sees the same event as a #393
+    /// per-OID subscriber.
+    ///
+    /// This reads the flat broadcast directly (the way `EventSubscriber` does in
+    /// production via `OriginConsumer::announced()` + `subscribe_track`), rather
+    /// than going through the `MoqEventSubscriber` background task, to isolate
+    /// the back-compat guarantee (#393 must not break the flat track) from a
+    /// pre-existing two-level-scope race in `scope_consumer_for_patterns`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flat_track_back_compat_with_oid_mirror() -> Result<()> {
+        use moq_net::{Track as MoqTrack};
+
+        let origin = MoqEventOrigin::new();
+
+        // Publisher mirrors to both flat `local/events/registry` and per-OID track.
+        let mut pub_ = origin.publisher_with_oid("registry", "oid-x")?;
+        assert!(pub_.has_oid_mirror(), "publisher_with_oid must mirror to an OID track");
+        pub_.publish("qwen3-4b", "published", b"mirrored")?;
+
+        // Read the flat `local/events/registry` broadcast directly.
+        let consumer = origin.consumer();
+        let scoped = consumer
+            .scope(&[Path::new(EVENT_PREFIX)])
+            .ok_or_else(|| anyhow!("no events scope"))?;
+
+        let recv = tokio::spawn(async move {
+            let mut scoped = scoped;
+            loop {
+                let (_path, bc) = match scoped.announced().await {
+                    None => return None,
+                    Some((_, None)) => continue,
+                    Some((p, Some(b))) => (p, b),
+                };
+                let mut track = match bc.subscribe_track(&MoqTrack::new(EVENT_TRACK)) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                let mut group = match track.next_group().await {
+                    Ok(Some(g)) => g,
+                    _ => continue,
+                };
+                if let Ok(Some(frame)) = group.read_frame().await {
+                    return Some(frame.to_vec());
+                }
+            }
+        });
+
+        // Re-publish to cover the announcement-propagation race.
+        let publish_loop = async {
+            for _ in 0..50 {
+                let _ = pub_.publish("qwen3-4b", "published", b"mirrored");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            std::future::pending::<()>().await;
+        };
+
+        let got: Option<Vec<u8>> = tokio::select! {
+            r = recv => r.ok().flatten(),
+            _ = publish_loop => None,
+            _ = tokio::time::sleep(Duration::from_secs(10)) => None,
+        };
+
+        let frame = got.expect("flat-track subscriber never received the mirrored event");
+        assert!(frame.len() >= 4, "frame too short");
+        let topic_len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+        let topic = std::str::from_utf8(&frame[4..4 + topic_len]).unwrap();
+        let payload = &frame[4 + topic_len..];
+        assert_eq!(topic, "registry.qwen3-4b.published");
+        assert_eq!(payload, b"mirrored");
+
+        Ok(())
+    }
+
+    /// subscribe() and subscribe_oid() are mutually exclusive — a subscriber is
+    /// either flat-pattern-based or OID-scoped, never both.
+    #[test]
+    fn subscribe_and_subscribe_oid_are_mutually_exclusive() -> Result<()> {
+        let mut s = MoqEventSubscriber::new();
+        s.subscribe("worker.")?;
+        assert!(s.subscribe_oid("oid").is_err(), "subscribe_oid after subscribe must fail");
+
+        let mut s = MoqEventSubscriber::new();
+        s.subscribe_oid("oid")?;
+        assert!(s.subscribe("worker.").is_err(), "subscribe after subscribe_oid must fail");
+
+        Ok(())
+    }
+
+    /// A no-op BackfillSource used to test firehose-backfill graceful degradation.
+    struct NullBackfillSource {
+        /// What `has_history` returns.
+        has_history: bool,
+        /// History to replay (if any).
+        history: Vec<(String, Vec<u8>)>,
+    }
+
+    impl BackfillSource for NullBackfillSource {
+        fn has_history(&self, _oid: &str) -> bool {
+            self.has_history
+        }
+        fn replay<'a>(
+            &'a self,
+            _oid: &'a str,
+            tx: &'a mpsc::Sender<(String, Vec<u8>)>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+            let history = self.history.clone();
+            Box::pin(async move {
+                for (topic, payload) in history {
+                    if tx.send((topic, payload)).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(())
+            })
+        }
+    }
+
+    /// When the firehose has history, backfill replays it BEFORE live events
+    /// arrive (cold-start path). The live MoQ events then follow.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backfill_replays_history_before_live() -> Result<()> {
+        let origin = MoqEventOrigin::new();
+
+        let source = Arc::new(NullBackfillSource {
+            has_history: true,
+            history: vec![
+                ("registry.qwen3-4b.published".to_owned(), b"backfill-1".to_vec()),
+                ("registry.qwen3-4b.published".to_owned(), b"backfill-2".to_vec()),
+            ],
+        });
+
+        let mut sub = MoqEventSubscriber::new_for_test(origin.consumer());
+        sub.subscribe_oid("oid-backfill")?;
+        sub.with_backfill(BackfillMode::FirehoseBackfill {
+            oid: "oid-backfill".to_owned(),
+            source,
+        })?;
+
+        // Drive the backfill + a live publish concurrently.
+        let mut pub_ = origin.publisher_oid_only("registry", "oid-backfill")?;
+        pub_.publish("qwen3-4b", "published", b"live")?;
+
+        // First two events should be the backfilled history (cold-start), then live.
+        let e1 = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .expect("backfill[0] timed out")?;
+        assert_eq!(e1.1, b"backfill-1");
+
+        let e2 = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .expect("backfill[1] timed out")?;
+        assert_eq!(e2.1, b"backfill-2");
+
+        // Then the live event.
+        let e3 = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .expect("live event timed out")?;
+        assert_eq!(e3.1, b"live");
+
+        drop(pub_);
+        Ok(())
+    }
+
+    /// When the firehose is UNAVAILABLE (has_history false), backfill mode
+    /// gracefully degrades to live-only — the subscription does not fail and
+    /// live events still arrive (the firehose is the cold-start path; MoQ is
+    /// the live path).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backfill_gracefully_degrades_when_firehose_unavailable() -> Result<()> {
+        let origin = MoqEventOrigin::new();
+
+        let source = Arc::new(NullBackfillSource {
+            has_history: false, // firehose offline / no history
+            history: vec![("never".to_owned(), b"never".to_vec())],
+        });
+
+        let mut sub = MoqEventSubscriber::new_for_test(origin.consumer());
+        sub.subscribe_oid("oid-degrade")?;
+        sub.with_backfill(BackfillMode::FirehoseBackfill {
+            oid: "oid-degrade".to_owned(),
+            source,
+        })?;
+
+        let mut pub_ = origin.publisher_oid_only("registry", "oid-degrade")?;
+        pub_.publish("qwen3-4b", "published", b"live")?;
+
+        // Despite requesting backfill, with the firehose down we still get the
+        // live event (and never the spurious "never" history item).
+        let got = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .expect("live event timed out (degradation failed)")?;
+        assert_eq!(got.1, b"live", "degraded subscriber must receive live events");
+        assert_ne!(got.1, b"never", "firehose history must NOT leak when unavailable");
+
+        drop(pub_);
         Ok(())
     }
 }

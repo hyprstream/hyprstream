@@ -228,6 +228,7 @@ impl KVCacheRegistry {
                     self.default_config.num_layers,
                     self.default_config.max_seq_len,
                     pool.clone(),
+                    owner.clone(),
                 )))
             } else {
                 tracing::warn!("Paged mode requested but block pool not initialized, falling back to contiguous");
@@ -425,6 +426,31 @@ pub const BLOCK_SIZE: usize = 256;
 /// Opaque handle to a block in the pool.
 pub type BlockId = usize;
 
+/// Failure to allocate a block from the shared pool because no free blocks remain.
+///
+/// This is a *fail-soft* signal — distinct from a real error — so a scheduler can
+/// turn it into admission-defer (retry the sequence on a later step once other
+/// sequences release blocks) rather than failing the request outright. Callers
+/// that receive an [`anyhow::Error`] from cache `update` can recover the typed
+/// reason via `err.downcast_ref::<BlockPoolExhausted>()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockPoolExhausted {
+    /// Number of blocks the pool can hold in total.
+    pub total_blocks: usize,
+}
+
+impl std::fmt::Display for BlockPoolExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "block pool exhausted (all {} blocks in use)",
+            self.total_blocks
+        )
+    }
+}
+
+impl std::error::Error for BlockPoolExhausted {}
+
 /// Shared pool of fixed-size GPU tensor blocks for KV cache storage.
 ///
 /// All KV cache memory is pre-allocated in this pool at startup. Sessions
@@ -439,6 +465,11 @@ pub struct BlockPool {
     blocks: Vec<Tensor>,
     /// Free block IDs available for allocation (LIFO stack for cache locality).
     free_list: Vec<BlockId>,
+    /// Current owner of each block (indexed by `BlockId`); `None` when free.
+    ///
+    /// Enforces tenant isolation in the shared pool: a block allocated by one
+    /// [`CacheOwner`] cannot be freed or used by another (see [`BlockPool::free`]).
+    block_owner: Vec<Option<CacheOwner>>,
     /// Block tensor shape: [1, BLOCK_SIZE, num_kv_heads, head_dim]
     block_shape: [i64; 4],
     /// Device the blocks are allocated on
@@ -484,6 +515,7 @@ impl BlockPool {
         Ok(Self {
             blocks,
             free_list,
+            block_owner: vec![None; num_blocks],
             block_shape,
             device,
             dtype,
@@ -491,15 +523,61 @@ impl BlockPool {
         })
     }
 
-    /// Allocate a block from the pool. Returns None if the pool is exhausted.
-    pub fn allocate(&mut self) -> Option<BlockId> {
-        self.free_list.pop()
+    /// Allocate a block from the pool on behalf of `owner`.
+    ///
+    /// Returns [`BlockPoolExhausted`] (a fail-soft signal a scheduler can turn
+    /// into admission-defer) when no free blocks remain. The allocated block is
+    /// tagged with `owner` so it can only be freed/used by that same owner.
+    pub fn allocate(&mut self, owner: &CacheOwner) -> Result<BlockId, BlockPoolExhausted> {
+        match self.free_list.pop() {
+            Some(id) => {
+                self.block_owner[id] = Some(owner.clone());
+                Ok(id)
+            }
+            None => Err(BlockPoolExhausted {
+                total_blocks: self.total_blocks,
+            }),
+        }
     }
 
     /// Return a block to the pool.
-    pub fn free(&mut self, id: BlockId) {
+    ///
+    /// Panics (in debug) / logs and refuses (in release) if `owner` does not
+    /// match the owner the block was allocated to — this enforces tenant
+    /// isolation: one [`CacheOwner`] can never free another's block.
+    pub fn free(&mut self, owner: &CacheOwner, id: BlockId) {
         debug_assert!(id < self.total_blocks, "Invalid block ID: {}", id);
-        self.free_list.push(id);
+        if id >= self.total_blocks {
+            return;
+        }
+        match &self.block_owner[id] {
+            Some(current) if current == owner => {
+                self.block_owner[id] = None;
+                self.free_list.push(id);
+            }
+            Some(current) => {
+                debug_assert!(
+                    false,
+                    "cross-owner block free rejected: block {} owned by {:?}, freed by {:?}",
+                    id, current, owner
+                );
+                tracing::error!(
+                    "cross-owner block free rejected: block {} owned by {:?}, freed by {:?}",
+                    id,
+                    current,
+                    owner
+                );
+            }
+            None => {
+                debug_assert!(false, "double-free of block {}", id);
+                tracing::error!("double-free of block {} (already in free list)", id);
+            }
+        }
+    }
+
+    /// Owner currently holding `id`, if any (for tests/metrics).
+    pub fn owner_of(&self, id: BlockId) -> Option<&CacheOwner> {
+        self.block_owner.get(id).and_then(|o| o.as_ref())
     }
 
     /// Get a reference to a block's tensor.
@@ -875,6 +953,8 @@ enum KVStorage {
     /// pool of fixed-size blocks. `get()` assembles blocks into a contiguous
     /// view via `torch.cat`. Inspired by PagedAttention (vLLM, SOSP 2023).
     Paged {
+        /// Owner of the blocks held here (for pool ownership assertions).
+        owner: CacheOwner,
         /// Block IDs for key tensors (one per BLOCK_SIZE tokens)
         key_blocks: Vec<BlockId>,
         /// Block IDs for value tensors
@@ -960,10 +1040,11 @@ impl LayerKVCache {
         }
     }
 
-    /// Create a new layer KV cache using paged block storage.
-    pub fn new_paged(max_seq_len: usize, pool: Arc<Mutex<BlockPool>>) -> Self {
+    /// Create a new layer KV cache using paged block storage owned by `owner`.
+    pub fn new_paged(max_seq_len: usize, pool: Arc<Mutex<BlockPool>>, owner: CacheOwner) -> Self {
         Self {
             storage: KVStorage::Paged {
+                owner,
                 key_blocks: Vec::new(),
                 value_blocks: Vec::new(),
                 pool,
@@ -975,6 +1056,36 @@ impl LayerKVCache {
             max_seq_len,
             allocated_capacity: 0,
             quant_type: KVQuantType::None,
+        }
+    }
+
+    /// Release any paged blocks held by this layer back to the shared pool.
+    ///
+    /// Shared by [`LayerKVCache::clear`] and the [`Drop`] impl so that blocks
+    /// always return to the [`BlockPool`] free list — even when the cache is
+    /// dropped via registry eviction (`caches.remove`) without an explicit
+    /// `clear()` (the source of the original paged-pool leak).
+    fn release_paged_blocks(&mut self) {
+        if let KVStorage::Paged {
+            owner,
+            key_blocks,
+            value_blocks,
+            pool,
+            ..
+        } = &mut self.storage
+        {
+            if key_blocks.is_empty() && value_blocks.is_empty() {
+                return;
+            }
+            let mut pool_guard = pool.lock();
+            for &id in key_blocks.iter() {
+                pool_guard.free(owner, id);
+            }
+            for &id in value_blocks.iter() {
+                pool_guard.free(owner, id);
+            }
+            key_blocks.clear();
+            value_blocks.clear();
         }
     }
 
@@ -1267,6 +1378,7 @@ impl LayerKVCache {
                 }
             }
             KVStorage::Paged {
+                owner,
                 key_blocks,
                 value_blocks,
                 pool,
@@ -1289,12 +1401,20 @@ impl LayerKVCache {
                     let offset_in_block = pos % BLOCK_SIZE;
                     let tokens_this_block = (BLOCK_SIZE - offset_in_block).min(seq_len - token_offset);
 
-                    // Ensure we have enough blocks allocated
+                    // Ensure we have enough blocks allocated. Allocation failure
+                    // surfaces as the typed `BlockPoolExhausted` (fail-soft) so a
+                    // scheduler can admission-defer this sequence rather than fail it.
                     while key_blocks.len() <= block_idx {
-                        let kid = pool_guard.allocate()
-                            .ok_or_else(|| anyhow!("Block pool exhausted (keys)"))?;
-                        let vid = pool_guard.allocate()
-                            .ok_or_else(|| anyhow!("Block pool exhausted (values)"))?;
+                        let kid = pool_guard.allocate(owner)?;
+                        let vid = match pool_guard.allocate(owner) {
+                            Ok(vid) => vid,
+                            Err(e) => {
+                                // Roll back the just-allocated key block so the pair
+                                // stays balanced and the key block isn't leaked.
+                                pool_guard.free(owner, kid);
+                                return Err(e.into());
+                            }
+                        };
                         key_blocks.push(kid);
                         value_blocks.push(vid);
                     }
@@ -1412,6 +1532,7 @@ impl LayerKVCache {
                 cached_keys,
                 cached_values,
                 cached_valid_len,
+                ..
             } => {
                 // Return cached view if still valid
                 if *cached_valid_len == self.seq_pos {
@@ -1502,27 +1623,20 @@ impl LayerKVCache {
                 *dtype = None;
                 *device = None;
             }
-            KVStorage::Paged {
-                key_blocks,
-                value_blocks,
-                pool,
-                cached_keys,
-                cached_values,
-                cached_valid_len,
-            } => {
-                // Return all blocks to the pool
-                let mut pool_guard = pool.lock();
-                for &id in key_blocks.iter() {
-                    pool_guard.free(id);
+            KVStorage::Paged { .. } => {
+                // Return all blocks to the pool, then reset the cached view.
+                self.release_paged_blocks();
+                if let KVStorage::Paged {
+                    cached_keys,
+                    cached_values,
+                    cached_valid_len,
+                    ..
+                } = &mut self.storage
+                {
+                    *cached_keys = None;
+                    *cached_values = None;
+                    *cached_valid_len = 0;
                 }
-                for &id in value_blocks.iter() {
-                    pool_guard.free(id);
-                }
-                key_blocks.clear();
-                value_blocks.clear();
-                *cached_keys = None;
-                *cached_values = None;
-                *cached_valid_len = 0;
             }
         }
         self.seq_pos = 0;
@@ -1552,6 +1666,7 @@ impl LayerKVCache {
                 self.clear();
             }
             KVStorage::Paged {
+                owner,
                 key_blocks,
                 value_blocks,
                 pool,
@@ -1564,10 +1679,10 @@ impl LayerKVCache {
                 if key_blocks.len() > blocks_needed {
                     let mut pool_guard = pool.lock();
                     for &id in &key_blocks[blocks_needed..] {
-                        pool_guard.free(id);
+                        pool_guard.free(owner, id);
                     }
                     for &id in &value_blocks[blocks_needed..] {
-                        pool_guard.free(id);
+                        pool_guard.free(owner, id);
                     }
                     key_blocks.truncate(blocks_needed);
                     value_blocks.truncate(blocks_needed);
@@ -1718,6 +1833,17 @@ impl LayerKVCache {
     }
 }
 
+impl Drop for LayerKVCache {
+    /// Return paged blocks to the shared pool when the cache is dropped.
+    ///
+    /// Without this, registry eviction (`caches.remove`) would drop paged caches
+    /// without returning their blocks, leaking pool capacity until restart.
+    /// Non-paged storage owns its own tensors and needs no special handling.
+    fn drop(&mut self) {
+        self.release_paged_blocks();
+    }
+}
+
 /// Get current timestamp in milliseconds since UNIX_EPOCH
 fn current_timestamp_ms() -> u64 {
     SystemTime::now()
@@ -1786,15 +1912,23 @@ impl KVCacheManager {
     /// Create a new KV cache manager using paged block storage.
     ///
     /// All layers share the same `BlockPool` for zero-fragmentation memory management.
-    pub fn new_paged(num_layers: usize, max_seq_len: usize, pool: Arc<Mutex<BlockPool>>) -> Self {
+    pub fn new_paged(
+        num_layers: usize,
+        max_seq_len: usize,
+        pool: Arc<Mutex<BlockPool>>,
+        owner: CacheOwner,
+    ) -> Self {
         tracing::info!(
-            "[KVCacheManager::new_paged] Creating paged cache for {} layers, max_seq_len={}",
-            num_layers, max_seq_len,
+            "[KVCacheManager::new_paged] Creating paged cache for {} layers, max_seq_len={}, owner={:?}",
+            num_layers, max_seq_len, owner,
         );
 
         let layer_caches = DashMap::new();
         for layer_idx in 0..num_layers {
-            layer_caches.insert(layer_idx, LayerKVCache::new_paged(max_seq_len, pool.clone()));
+            layer_caches.insert(
+                layer_idx,
+                LayerKVCache::new_paged(max_seq_len, pool.clone(), owner.clone()),
+            );
         }
 
         Self {
@@ -1818,6 +1952,20 @@ impl KVCacheManager {
             return None;
         }
         self.layer_caches.get_mut(&layer_idx).map(|mut cache_ref| f(&mut cache_ref))
+    }
+
+    /// Borrow a layer's cache directly as a `RefMut` (for the batched decode path,
+    /// which needs to hold one mutable layer-cache borrow per sequence across a
+    /// batched attention call). Each sequence has its own manager, so the borrows
+    /// never alias. Returns `None` when caching is disabled or the layer is absent.
+    pub fn layer_cache_ref(
+        &self,
+        layer_idx: usize,
+    ) -> Option<dashmap::mapref::one::RefMut<'_, usize, LayerKVCache>> {
+        if !self.enabled {
+            return None;
+        }
+        self.layer_caches.get_mut(&layer_idx)
     }
 
     /// Check if a layer cache exists (for testing)
@@ -2147,37 +2295,39 @@ mod tests {
         let device = Device::Cpu;
         let dtype = DType::Float;
         let mut pool = BlockPool::new(4, 2, 8, device, dtype)?;
+        let owner = CacheOwner::Stateless(1);
 
         assert_eq!(pool.total_blocks(), 4);
         assert_eq!(pool.free_block_count(), 4);
         assert_eq!(pool.used_blocks(), 0);
 
         // Allocate 3 blocks
-        let b0 = pool.allocate().expect("should allocate");
-        let b1 = pool.allocate().expect("should allocate");
-        let b2 = pool.allocate().expect("should allocate");
+        let b0 = pool.allocate(&owner).expect("should allocate");
+        let b1 = pool.allocate(&owner).expect("should allocate");
+        let b2 = pool.allocate(&owner).expect("should allocate");
         assert_eq!(pool.used_blocks(), 3);
         assert_eq!(pool.free_block_count(), 1);
 
         // Allocate last block
-        let _b3 = pool.allocate().expect("should allocate");
+        let _b3 = pool.allocate(&owner).expect("should allocate");
         assert_eq!(pool.free_block_count(), 0);
 
-        // Pool exhausted
-        assert!(pool.allocate().is_none());
+        // Pool exhausted — fail-soft typed error, not a generic failure
+        let exhausted = pool.allocate(&owner);
+        assert_eq!(exhausted, Err(BlockPoolExhausted { total_blocks: 4 }));
 
         // Free a block — now one available
-        pool.free(b1);
+        pool.free(&owner, b1);
         assert_eq!(pool.free_block_count(), 1);
 
-        let reused = pool.allocate().expect("should allocate freed block");
+        let reused = pool.allocate(&owner).expect("should allocate freed block");
         assert_eq!(reused, b1); // LIFO: should get back the same block
 
         // Free all
-        pool.free(b0);
-        pool.free(reused);
-        pool.free(b2);
-        pool.free(_b3);
+        pool.free(&owner, b0);
+        pool.free(&owner, reused);
+        pool.free(&owner, b2);
+        pool.free(&owner, _b3);
         assert_eq!(pool.free_block_count(), 4);
 
         Ok(())
@@ -2195,7 +2345,7 @@ mod tests {
             BlockPool::new(8, num_kv_heads, head_dim, device, dtype)?
         ));
 
-        let mut cache = LayerKVCache::new_paged(1024, pool.clone());
+        let mut cache = LayerKVCache::new_paged(1024, pool.clone(), CacheOwner::Stateless(1));
 
         // Write 10 tokens (less than one block of 256)
         let keys = Tensor::ones([1, 10, num_kv_heads as i64, head_dim as i64], (dtype, device));
@@ -2332,5 +2482,113 @@ mod tests {
         // [sys user1_ask_weather asst_toolcall tool_resp user2_followup asst2 user3]
         let turn3_tokens = vec![10, 100, 101, 200, 201, 202, 300, 301, 110, 111, 210, 120];
         assert_eq!(manager.prefix_match_len(&turn3_tokens), 10);
+    }
+
+    // ========================================================================
+    // PR-0: paged-pool correctness (free-on-drop, fail-soft, ownership)
+    // ========================================================================
+
+    /// Dropping a paged cache (e.g. via registry eviction) must return its
+    /// blocks to the pool free list — the original leak was no `Drop` impl.
+    #[test]
+    fn test_paged_cache_frees_blocks_on_drop() -> Result<()> {
+        let device = Device::Cpu;
+        let dtype = DType::Float;
+        let pool = Arc::new(Mutex::new(BlockPool::new(8, 2, 4, device, dtype)?));
+        assert_eq!(pool.lock().used_blocks(), 0);
+
+        {
+            let mut cache = LayerKVCache::new_paged(1024, pool.clone(), CacheOwner::Stateless(7));
+            let keys = Tensor::ones([1, 10, 2, 4], (dtype, device));
+            let values = Tensor::ones([1, 10, 2, 4], (dtype, device));
+            cache.update(&keys, &values, 0)?;
+            assert_eq!(pool.lock().used_blocks(), 2); // 1 K + 1 V block
+            // `cache` dropped here WITHOUT an explicit clear()
+        }
+
+        // Drop must have returned both blocks to the pool.
+        assert_eq!(pool.lock().used_blocks(), 0);
+        assert_eq!(pool.lock().free_block_count(), 8);
+        Ok(())
+    }
+
+    /// A `KVCacheManager` dropped via the registry (`caches.remove`) must not
+    /// leak its layers' blocks.
+    #[test]
+    fn test_paged_manager_frees_blocks_on_drop() -> Result<()> {
+        let device = Device::Cpu;
+        let dtype = DType::Float;
+        let pool = Arc::new(Mutex::new(BlockPool::new(16, 2, 4, device, dtype)?));
+
+        {
+            let manager = KVCacheManager::new_paged(3, 1024, pool.clone(), CacheOwner::Session("s".into()));
+            for layer in 0..3 {
+                manager.with_layer_cache(layer, |c| {
+                    let k = Tensor::ones([1, 5, 2, 4], (dtype, device));
+                    let v = Tensor::ones([1, 5, 2, 4], (dtype, device));
+                    c.update(&k, &v, 0).unwrap();
+                });
+            }
+            assert_eq!(pool.lock().used_blocks(), 6); // 3 layers x (1 K + 1 V)
+        }
+
+        assert_eq!(pool.lock().used_blocks(), 0);
+        Ok(())
+    }
+
+    /// Exhaustion surfaces as the typed, downcastable `BlockPoolExhausted`
+    /// (fail-soft) rather than an opaque error — a scheduler can admission-defer.
+    #[test]
+    fn test_paged_update_exhaustion_is_fail_soft() -> Result<()> {
+        let device = Device::Cpu;
+        let dtype = DType::Float;
+        // Only 1 block: cannot satisfy even a single (K + V) pair.
+        let pool = Arc::new(Mutex::new(BlockPool::new(1, 2, 4, device, dtype)?));
+        let mut cache = LayerKVCache::new_paged(1024, pool.clone(), CacheOwner::Stateless(1));
+
+        let keys = Tensor::ones([1, 10, 2, 4], (dtype, device));
+        let values = Tensor::ones([1, 10, 2, 4], (dtype, device));
+        let err = cache.update(&keys, &values, 0).expect_err("should fail-soft on exhaustion");
+
+        let exhausted = err.downcast_ref::<BlockPoolExhausted>();
+        assert!(exhausted.is_some(), "expected BlockPoolExhausted, got: {err:?}");
+        assert_eq!(exhausted.unwrap().total_blocks, 1);
+
+        // The key block allocated before the value alloc failed must be rolled
+        // back so the pool is not partially consumed by a failed admission.
+        assert_eq!(pool.lock().used_blocks(), 0);
+        Ok(())
+    }
+
+    /// A block allocated by one owner cannot be freed by another (tenant
+    /// isolation). In debug builds this panics; assert via catch_unwind.
+    #[test]
+    fn test_cross_owner_free_is_rejected() -> Result<()> {
+        let device = Device::Cpu;
+        let dtype = DType::Float;
+        let mut pool = BlockPool::new(4, 2, 4, device, dtype)?;
+
+        let alice = CacheOwner::Session("alice".into());
+        let bob = CacheOwner::Session("bob".into());
+
+        let block = pool.allocate(&alice).expect("alice allocates");
+        assert_eq!(pool.owner_of(block), Some(&alice));
+
+        // Bob attempting to free Alice's block must be rejected. The debug_assert
+        // fires in debug builds, so guard the call with catch_unwind.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.free(&bob, block);
+        }));
+        assert!(result.is_err(), "cross-owner free should be rejected (panicked in debug)");
+
+        // Block is still owned by Alice and still in use.
+        assert_eq!(pool.owner_of(block), Some(&alice));
+        assert_eq!(pool.used_blocks(), 1);
+
+        // Alice can free her own block.
+        pool.free(&alice, block);
+        assert_eq!(pool.used_blocks(), 0);
+        assert_eq!(pool.owner_of(block), None);
+        Ok(())
     }
 }

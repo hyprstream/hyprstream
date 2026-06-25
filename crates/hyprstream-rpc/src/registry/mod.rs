@@ -20,12 +20,12 @@
 //! // Services with multiple endpoints
 //! let _reg = ServiceRegistration::multi("model", vec![
 //!     (SocketKind::Rep, rep_endpoint),
-//!     (SocketKind::Router, router_endpoint),
+//!     (SocketKind::Quic, quic_endpoint),
 //! ], None)?;
 //!
 //! // Clients discover endpoints by socket type
 //! let rep_endpoint = global().endpoint("model", SocketKind::Rep);
-//! let router_endpoint = global().endpoint("model", SocketKind::Router);
+//! let quic_endpoint = global().endpoint("model", SocketKind::Quic);
 //! ```
 
 use crate::transport::TransportConfig;
@@ -35,33 +35,33 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Socket type identifier for endpoint registration.
+///
+/// Reduced (#380) from the historical ZMQ-era taxonomy to the variants that are
+/// actually constructed by live code:
+/// - [`SocketKind::Rep`] — the server-side RPC socket used by every service
+///   registration and client resolution today.
+/// - [`SocketKind::Req`] — the client-side RPC socket, the logical counterpart
+///   of `Rep`. Currently no in-tree client constructs it (the resolver/registry
+///   are kind-symmetric), but it is retained to keep the client/server pair
+///   self-documenting and to avoid forcing future clients to misuse `Rep`.
+/// - [`SocketKind::Quic`] — the QUIC/WebTransport transport used by the moq
+///   stream plane; branched on by the registry's `default_endpoint`, the
+///   `DidWebResolver`, and the discovery auth-metadata lookup.
+///
+/// The dropped variants (`Dealer`, `Router`, `Pub`, `Sub`, `XPub`, `XSub`,
+/// `Push`, `Pull`, `Pair`, `Stream`) were ZMQ socket kinds carried by the
+/// pre-moq stack; the moq migration replaced Pub/Sub and the rest were never
+/// constructed by live code (only exhaustive match arms and registry-suffix
+/// tests referenced them). `SocketKind` is an internal identifier — it is not
+/// serialized onto the wire (only its lowercase name string is, in
+/// `ServiceSummary::socket_kinds`), so this reduction is wire-compatible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SocketKind {
-    /// REQ socket (client request)
+    /// REQ socket (client request) — logical client-side counterpart to `Rep`.
     Req,
-    /// REP socket (server reply)
+    /// REP socket (server reply) — the live server-side RPC socket.
     Rep,
-    /// DEALER socket (async request)
-    Dealer,
-    /// ROUTER socket (async reply with routing)
-    Router,
-    /// PUB socket (publish)
-    Pub,
-    /// SUB socket (subscribe)
-    Sub,
-    /// XPUB socket (extended publish with subscriptions)
-    XPub,
-    /// XSUB socket (extended subscribe)
-    XSub,
-    /// PUSH socket (pipeline push)
-    Push,
-    /// PULL socket (pipeline pull)
-    Pull,
-    /// PAIR socket (exclusive pair)
-    Pair,
-    /// STREAM socket (raw TCP)
-    Stream,
-    /// QUIC/WebTransport transport type
+    /// QUIC/WebTransport transport type — the moq stream-plane socket.
     Quic,
 }
 
@@ -70,17 +70,7 @@ impl SocketKind {
     pub fn suffix(&self) -> &'static str {
         match self {
             SocketKind::Rep => "",
-            SocketKind::Router => "-router",
-            SocketKind::Pub => "-pub",
-            SocketKind::XPub => "-xpub",
-            SocketKind::Sub => "-sub",
-            SocketKind::XSub => "-xsub",
-            SocketKind::Dealer => "-dealer",
             SocketKind::Req => "-req",
-            SocketKind::Push => "-push",
-            SocketKind::Pull => "-pull",
-            SocketKind::Pair => "-pair",
-            SocketKind::Stream => "-stream",
             SocketKind::Quic => "-quic",
         }
     }
@@ -426,12 +416,12 @@ pub fn try_global() -> Option<impl std::ops::Deref<Target = EndpointRegistry> + 
 /// let _reg = ServiceRegistration::new("policy", endpoint, None)?;
 ///
 /// // Specific socket type
-/// let _reg = ServiceRegistration::with_socket_type("inference", SocketKind::XPub, endpoint, None)?;
+/// let _reg = ServiceRegistration::with_socket_type("inference", SocketKind::Quic, endpoint, None)?;
 ///
 /// // Multiple endpoints
 /// let _reg = ServiceRegistration::multi("model", vec![
 ///     (SocketKind::Rep, rep_endpoint),
-///     (SocketKind::Router, router_endpoint),
+///     (SocketKind::Quic, quic_endpoint),
 /// ], None)?;
 /// ```
 pub struct ServiceRegistration {
@@ -561,13 +551,9 @@ mod tests {
         let endpoint = global().endpoint("policy", SocketKind::Rep);
         assert_eq!(endpoint.endpoint_string(), "inproc://hyprstream/policy");
 
-        // ROUTER socket (with suffix)
-        let endpoint = global().endpoint("model", SocketKind::Router);
-        assert_eq!(endpoint.endpoint_string(), "inproc://hyprstream/model-router");
-
-        // XPUB socket (with suffix)
-        let endpoint = global().endpoint("inference", SocketKind::XPub);
-        assert_eq!(endpoint.endpoint_string(), "inproc://hyprstream/inference-xpub");
+        // REQ socket (with suffix)
+        let endpoint = global().endpoint("model", SocketKind::Req);
+        assert_eq!(endpoint.endpoint_string(), "inproc://hyprstream/model-req");
     }
 
     #[test]
@@ -580,9 +566,9 @@ mod tests {
         let endpoint = global().endpoint("policy", SocketKind::Rep);
         assert_eq!(endpoint.endpoint_string(), "ipc:///run/hyprstream/policy.sock");
 
-        // ROUTER socket (with suffix)
-        let endpoint = global().endpoint("model", SocketKind::Router);
-        assert_eq!(endpoint.endpoint_string(), "ipc:///run/hyprstream/model-router.sock");
+        // REQ socket (with suffix)
+        let endpoint = global().endpoint("model", SocketKind::Req);
+        assert_eq!(endpoint.endpoint_string(), "ipc:///run/hyprstream/model-req.sock");
     }
 
     #[test]
@@ -619,7 +605,7 @@ mod tests {
                 "model",
                 vec![
                     (SocketKind::Rep, TransportConfig::inproc("model/rep")),
-                    (SocketKind::Router, TransportConfig::inproc("model/router")),
+                    (SocketKind::Quic, TransportConfig::inproc("model/quic")),
                 ],
                 Some("Model service"),
             )?;
@@ -628,16 +614,17 @@ mod tests {
             let rep_ep = global().endpoint("model", SocketKind::Rep);
             assert_eq!(rep_ep.endpoint_string(), "inproc://model/rep");
 
-            let router_ep = global().endpoint("model", SocketKind::Router);
-            assert_eq!(router_ep.endpoint_string(), "inproc://model/router");
+            let quic_ep = global().endpoint("model", SocketKind::Quic);
+            assert_eq!(quic_ep.endpoint_string(), "inproc://model/quic");
         }
 
-        // After drop, both fall back to defaults
+        // After drop, Rep falls back to its inproc default; Quic falls back to
+        // its QUIC default (the :0 placeholder — distinct path from Rep).
         let rep_ep = global().endpoint("model", SocketKind::Rep);
         assert_eq!(rep_ep.endpoint_string(), "inproc://hyprstream/model");
 
-        let router_ep = global().endpoint("model", SocketKind::Router);
-        assert_eq!(router_ep.endpoint_string(), "inproc://hyprstream/model-router");
+        let quic_ep = global().endpoint("model", SocketKind::Quic);
+        assert!(quic_ep.endpoint_string().starts_with("quic://"));
         Ok(())
     }
 
@@ -678,7 +665,7 @@ mod tests {
         init(EndpointMode::Inproc, None);
 
         global().register("svc1", SocketKind::Rep, TransportConfig::inproc("a"), None);
-        global().register("svc2", SocketKind::Router, TransportConfig::inproc("b"), None);
+        global().register("svc2", SocketKind::Quic, TransportConfig::inproc("b"), None);
 
         let services = global().list_services();
         assert!(services.contains(&"svc1".to_owned()));

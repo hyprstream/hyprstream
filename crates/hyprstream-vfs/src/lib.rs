@@ -22,5 +22,36 @@ mod namespace;
 pub mod proxy;
 
 pub use hyprstream_rpc::Subject;
-pub use mount::{DirEntry, Fid, Mount, MountError, Stat, OREAD, OWRITE, ORDWR, OTRUNC, ORCLOSE};
+pub use mount::{DirEntry, Fid, Mount, MountError, Stat, OREAD, OWRITE, ORDWR, OTRUNC, ORCLOSE, DMDIR};
 pub use namespace::{BindFlag, MountTarget, Namespace, NamespaceError};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Standard namespace paths
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Canonical mount paths every hyprstream namespace exposes, regardless of
+/// transport (native TUI vs WASM browser).
+///
+/// This is the convergence contract from #389 + #391 (Option 1: shared content
+/// model). Both the native namespace builder
+/// (`hyprstream::cli::shell_handlers`) and the browser namespace builder
+/// (`hyprstream_rpc_std::vfs_mount::build_browser_namespace`) mount these
+/// content trees backed at the hyprstream spine — so `/srv/registry/foo/main`
+/// resolves to the same repo/worktree content in either context.
+///
+/// The transport leaf (DMA/SAB ring buffers for the browser, ZMQ for native)
+/// is correctly-scoped glue and is NOT part of this contract — only the
+/// backing content trees are converged.
+///
+/// # Paths
+///
+/// | Path             | Backing                                            |
+/// |------------------|----------------------------------------------------|
+/// | `/srv/model`     | Model service: synthetic tree (status, load, ...)  |
+/// | `/srv/registry`  | Registry service: worktree FS (real qids)          |
+/// | `/worktree`      | Alias of `/srv/registry` (short ergonomic path)    |
+///
+/// Per-target paths (NOT part of the convergence contract):
+///   - `/bin`, `/env`, `/lang/tcl` — native-only local synthetic mounts
+///   - `/stream`, `/srv/{service}/doc` — browser-only GenericServiceMount extras
+pub const STANDARD_NAMESPACE_PATHS: &[&str] = &["/srv/model", "/srv/registry", "/worktree"];

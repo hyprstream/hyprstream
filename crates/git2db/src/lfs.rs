@@ -44,6 +44,18 @@ use tracing::{debug, info, warn};
 #[cfg(feature = "xet-storage")]
 use crate::xet::{StorageBackend, XetConfig, XetStorage};
 
+/// Well-known LFS pointer extension key carrying the XET `MerkleHash` (BLAKE3 keyed
+/// with `DATA_KEY` over the content-defined chunk DAG) for the blob, as a 64-char
+/// lowercase hex string. Per the LFS spec, unknown extension lines are ignored by
+/// vanilla git-lfs clients, so this rides the existing `extensions` map without
+/// breaking back-compat. See issue #386.
+pub const XET_MERKLE_EXT_KEY: &str = "xet-merkle";
+
+/// Well-known LFS pointer extension key carrying an opaque shard/cas-location hint
+/// (e.g. a shard index or replication-group identifier) for the blob. Optional;
+/// consumed by smudge code that needs a locality hint beyond the Merkle hash.
+pub const XET_SHARD_EXT_KEY: &str = "xet-shard";
+
 /// Parsed Git LFS pointer with spec-compliant fields
 ///
 /// Per the Git LFS specification, pointer files contain:
@@ -197,9 +209,29 @@ impl LfsPointer {
         &self.extensions
     }
 
-    /// Convert LFS OID (SHA256) to MerkleHash format for XET
+    /// Convert the LFS SHA-256 OID to a XET `MerkleHash` by hex re-interpretation.
+    ///
+    /// **Deprecated and unsound.** A XET `MerkleHash` is BLAKE3 keyed with the global
+    /// `DATA_KEY` over the content-defined chunk DAG, NOT the SHA-256 of the raw
+    /// bytes. The two hash families are unrelated; this conversion only succeeds by
+    /// coincidence when the upload side also (incorrectly) used the SHA-256 as a
+    /// MerkleHash, which real XET never does. Feeding this into `smudge_from_hash`
+    /// therefore cannot resolve real XET content.
+    ///
+    /// New code must populate the `xet-merkle` extension at promote time and read it
+    /// back via [`LfsPointer::xet_merkle_hash`]. The smudge path no longer calls this.
+    /// Kept temporarily for back-compat callers; emits a `tracing::warn!` so misuse is
+    /// observable in logs. See issue #386.
     #[cfg(feature = "xet-storage")]
+    #[deprecated(
+        since = "0.1.0",
+        note = "unsound: reinterprets LFS SHA-256 as a XET MerkleHash; use the xet-merkle extension via xet_merkle_hash() instead — see #386"
+    )]
     pub fn to_merkle_hash(&self) -> Git2DBResult<merklehash::MerkleHash> {
+        warn!(
+            oid = %self.oid,
+            "LfsPointer::to_merkle_hash() is unsound (SHA-256 != XET MerkleHash); use the xet-merkle extension instead — see #386"
+        );
         merklehash::MerkleHash::from_hex(&self.oid).map_err(|e| {
             Git2DBError::lfs(
                 LfsErrorKind::HashConversion,
@@ -207,15 +239,77 @@ impl LfsPointer {
             )
         })
     }
+
+    /// Get the `xet-merkle` extension value (64-char hex `MerkleHash`), if present.
+    ///
+    /// Returns `None` for vanilla LFS pointers that carry no XET metadata. Presence of
+    /// this field indicates the pointer is self-describing for Hub-free XET smudge.
+    #[cfg(feature = "xet-storage")]
+    pub fn xet_merkle_hex(&self) -> Option<&str> {
+        self.extensions.get(XET_MERKLE_EXT_KEY).map(String::as_str)
+    }
+
+    /// Get the `xet-shard` extension value (opaque locality hint), if present.
+    pub fn xet_shard(&self) -> Option<&str> {
+        self.extensions.get(XET_SHARD_EXT_KEY).map(String::as_str)
+    }
+
+    /// Resolve the XET `MerkleHash` for this pointer from the `xet-merkle` extension.
+    ///
+    /// This is the correct, Hub-free derivation: the hash is read verbatim from the
+    /// pointer rather than mis-converted from the LFS SHA-256 OID. Returns a
+    /// [`LfsErrorKind::MissingXetMerkle`] error if the extension is absent, so callers
+    /// cannot silently fall through to the unsound legacy path.
+    #[cfg(feature = "xet-storage")]
+    pub fn xet_merkle_hash(&self) -> Git2DBResult<merklehash::MerkleHash> {
+        match self.xet_merkle_hex() {
+            Some(hex) => merklehash::MerkleHash::from_hex(hex).map_err(|e| {
+                Git2DBError::lfs(
+                    LfsErrorKind::HashConversion,
+                    format!("Invalid xet-merkle extension (expected 64 hex chars): {e}"),
+                )
+            }),
+            None => Err(Git2DBError::lfs(
+                LfsErrorKind::MissingXetMerkle,
+                "missing xet-merkle; to_merkle_hash() is unsound — see #386",
+            )),
+        }
+    }
+
+    /// Set the `xet-merkle` and (optionally) `xet-shard` extensions in place.
+    ///
+    /// Intended for promote-time code that has just computed the real XET `MerkleHash`
+    /// for the blob's content-defined chunk DAG and wants to record it on the pointer
+    /// so downstream smudge is Hub-free and self-describing. Overwrites any prior
+    /// value for these keys; other extensions are preserved.
+    #[cfg(feature = "xet-storage")]
+    pub fn set_xet_extensions(&mut self, merkle: &merklehash::MerkleHash, shard: Option<&str>) {
+        self.extensions
+            .insert(XET_MERKLE_EXT_KEY.to_owned(), merkle.to_string());
+        if let Some(s) = shard {
+            self.extensions
+                .insert(XET_SHARD_EXT_KEY.to_owned(), s.to_owned());
+        }
+    }
 }
 
 impl std::fmt::Display for LfsPointer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Mandatory fields first, then extension lines (sorted for deterministic output).
+        // Per the LFS spec, unknown extension keys are allowed and ignored by vanilla
+        // git-lfs clients, so the well-known `xet-merkle` / `xet-shard` keys round-trip
+        // transparently through unmodified tooling.
         write!(
             f,
             "version {}\noid {}:{}\nsize {}\n",
             self.version, self.hash_method, self.oid, self.size
-        )
+        )?;
+        let mut keys: Vec<&String> = self.extensions.keys().collect();
+        keys.sort_unstable();
+        for key in keys {
+            writeln!(f, "{} {}", key, self.extensions[key])?;
+        }
+        Ok(())
     }
 }
 
@@ -257,14 +351,14 @@ pub trait LfsSmudge {
 #[async_trait]
 impl LfsSmudge for XetStorage {
     async fn smudge_lfs(&self, pointer: &LfsPointer) -> Git2DBResult<Vec<u8>> {
-        let hash = pointer.to_merkle_hash()?;
+        let hash = pointer.xet_merkle_hash()?;
         self.smudge_from_hash(&hash).await.map_err(|e| {
             Git2DBError::lfs(LfsErrorKind::SmudgeFailed, format!("XET smudge failed: {e}"))
         })
     }
 
     async fn smudge_lfs_to_file(&self, pointer: &LfsPointer, path: &Path) -> Git2DBResult<()> {
-        let hash = pointer.to_merkle_hash()?;
+        let hash = pointer.xet_merkle_hash()?;
         self.smudge_from_hash_to_file(&hash, path).await.map_err(|e| {
             Git2DBError::lfs(
                 LfsErrorKind::SmudgeFailed,
@@ -987,6 +1081,112 @@ size 1024
         assert!(display.contains("version https://git-lfs.github.com/spec/v1"));
         assert!(display.contains("oid sha256:"));
         assert!(display.contains("size 1024"));
+        Ok(())
+    }
+
+    // ---- #386: xet-merkle / xet-shard extension round-trip ----
+
+    /// A vanilla LFS pointer (no xet-* extensions) must still parse and carry no
+    /// xet-merkle.
+    #[test]
+    fn test_lfs_pointer_vanilla_no_xet_merkle() -> crate::Git2DBResult<()> {
+        let content = r#"version https://git-lfs.github.com/spec/v1
+oid sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890
+size 1024
+"#;
+        let pointer = LfsPointer::parse(content)?;
+        assert_eq!(pointer.xet_merkle_hex(), None);
+        assert_eq!(pointer.xet_shard(), None);
+        Ok(())
+    }
+
+    /// Round-trip: an extended pointer parses, the xet-merkle/xet-shard values are
+    /// recoverable, and re-displaying yields a pointer that parses back to the same
+    /// values.
+    #[test]
+    fn test_lfs_pointer_xet_extensions_round_trip() -> crate::Git2DBResult<()> {
+        // An unrelated XET MerkleHash (64 hex chars) — distinct from the LFS SHA-256 OID,
+        // which is exactly the case the old to_merkle_hash() got wrong.
+        let merkle_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let shard = "shard-7";
+        let content = format!(
+            "version https://git-lfs.github.com/spec/v1\n\
+             oid sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890\n\
+             size 1024\n\
+             {XET_MERKLE_EXT_KEY} {merkle_hex}\n\
+             {XET_SHARD_EXT_KEY} {shard}\n"
+        );
+
+        let pointer = LfsPointer::parse(&content)?;
+        assert_eq!(pointer.xet_merkle_hex(), Some(merkle_hex));
+        assert_eq!(pointer.xet_shard(), Some(shard));
+
+        // Re-display and re-parse; values must survive a round-trip (Display sorts keys).
+        let redisplayed = pointer.to_string();
+        let reparsed = LfsPointer::parse(&redisplayed)?;
+        assert_eq!(reparsed.xet_merkle_hex(), Some(merkle_hex));
+        assert_eq!(reparsed.xet_shard(), Some(shard));
+        // Mandatory fields are unchanged.
+        assert_eq!(reparsed.oid(), pointer.oid());
+        assert_eq!(reparsed.size(), pointer.size());
+        Ok(())
+    }
+
+    #[cfg(feature = "xet-storage")]
+    #[test]
+    fn test_lfs_pointer_set_xet_extensions() -> crate::Git2DBResult<()> {
+        let oid = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let mut pointer = LfsPointer::new(
+            "https://git-lfs.github.com/spec/v1".to_owned(),
+            oid.to_owned(),
+            2048,
+        )?;
+
+        // A real XET MerkleHash computed by the uploader over the chunk DAG.
+        let merkle = merklehash::MerkleHash::from_hex(
+            "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+        )
+        .map_err(|e| {
+            Git2DBError::lfs(
+                LfsErrorKind::HashConversion,
+                format!("invalid test merkle hex: {e}"),
+            )
+        })?;
+        pointer.set_xet_extensions(&merkle, Some("shard-3"));
+
+        // Round-trips through hex verbatim.
+        let expected_hex = merkle.to_string();
+        assert_eq!(pointer.xet_merkle_hex(), Some(expected_hex.as_str()));
+        assert_eq!(pointer.xet_merkle_hash()?, merkle);
+        assert_eq!(pointer.xet_shard(), Some("shard-3"));
+
+        // Display serializes the extension, and parsing recovers it.
+        let reparsed = LfsPointer::parse(&pointer.to_string())?;
+        assert_eq!(reparsed.xet_merkle_hash()?, merkle);
+        Ok(())
+    }
+
+    #[cfg(feature = "xet-storage")]
+    #[test]
+    fn test_lfs_pointer_xet_merkle_hash_missing_errors() -> crate::Git2DBResult<()> {
+        // Vanilla pointer, no xet-merkle: the smudge path must error clearly rather
+        // than silently mis-converting the SHA-256 OID into a MerkleHash.
+        let oid = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let pointer = LfsPointer::new(
+            "https://git-lfs.github.com/spec/v1".to_owned(),
+            oid.to_owned(),
+            1024,
+        )?;
+
+        match pointer.xet_merkle_hash() {
+            Err(e) => {
+                assert_eq!(e.lfs_kind(), Some(LfsErrorKind::MissingXetMerkle));
+                let msg = e.to_string();
+                assert!(msg.contains("xet-merkle"), "error must name the missing extension: {msg}");
+                assert!(msg.contains("#386"), "error must reference issue #386: {msg}");
+            }
+            Ok(h) => panic!("vanilla pointer unexpectedly resolved a MerkleHash: {h}"),
+        }
         Ok(())
     }
 }

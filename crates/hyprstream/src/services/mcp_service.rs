@@ -437,13 +437,17 @@ fn register_scoped_tools_recursive(
                                 _ => anyhow::bail!("No scoped streaming dispatch for service: {service}"),
                             };
 
+                            // #356: single networked reach shape (UDS-only resolves
+                            // to the same-host fast path inside `networked`).
                             let DecodedStreamReach { dh_public, reach, broadcast_path } =
                                 decode_stream_reach(&stream_info_json)?;
-                            let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
+                            // #321: derive_client_stream_keys yields the AEAD enc_key.
+                            let (mac_key, enc_key, topic) = hyprstream_rpc::derive_client_stream_keys(
                                 &client_secret, &client_pubkey_bytes, &dh_public,
                             )?;
-                            let qos = hyprstream_rpc::stream_info::StreamOpt::default(); // #358: MCP tool stream consumed live → direct-first; selection only reorders advertised reaches.
-                            let handle = MoqStreamHandle::networked(reach, &qos, broadcast_path, mac_key, topic);
+                            // #358: MCP tool stream consumed live → direct-first; selection only reorders advertised reaches.
+                            let qos = hyprstream_rpc::stream_info::StreamOpt::default();
+                            let handle = MoqStreamHandle::networked(reach, &qos, broadcast_path, mac_key, enc_key, topic);
 
                             Ok(ToolResult::Stream(Box::new(handle)))
                         })
@@ -594,14 +598,17 @@ fn register_streaming_tool(
                     _ => anyhow::bail!("No streaming support for service: {}", service),
                 };
 
+                // #356: single networked reach shape (UDS-only resolves to the
+                // same-host fast path inside `networked`).
                 let DecodedStreamReach { dh_public, reach, broadcast_path } =
                     decode_stream_reach(&stream_info_json)?;
-                let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
+                // #321: derive_client_stream_keys yields the AEAD enc_key.
+                let (mac_key, enc_key, topic) = hyprstream_rpc::derive_client_stream_keys(
                     &client_secret, &client_pubkey_bytes, &dh_public,
                 )?;
                 // #358: MCP tool stream consumed live → direct-first; selection only reorders advertised reaches.
                 let qos = hyprstream_rpc::stream_info::StreamOpt::default();
-                let handle = MoqStreamHandle::networked(reach, &qos, broadcast_path, mac_key, topic);
+                let handle = MoqStreamHandle::networked(reach, &qos, broadcast_path, mac_key, enc_key, topic);
 
                 Ok(ToolResult::Stream(Box::new(handle)))
             })
