@@ -893,11 +893,22 @@ impl RegistryService {
         .await
     }
 
+    // (helper `xet_pointer_references_merkle` defined at module scope below)
+
     /// Condition-(b) check for a XET merkle root: grantRepo must reference the
-    /// merkle via a checked-in git-xet pointer. We scan the repo's tracked files
-    /// for a XET pointer naming this merkle hash. Content hashes are predictable
-    /// (global dedup), so presence in the CAS store alone is NOT sufficient — the
-    /// grant repo must actually reference it.
+    /// merkle via a checked-in git-xet pointer whose merkle field EXACTLY equals
+    /// the requested hash. Content addresses are predictable (the CAS is global
+    /// and content-addressed), so presence in the store alone is NOT sufficient —
+    /// the grant repo must actually reference it.
+    ///
+    /// LIMITATION (tracked in #436): this verifies *reference*, not *provenance*.
+    /// Because the CAS is global and non-namespaced, a writer can reference a
+    /// merkle they did not upload. This is sound for public / same-trust-domain
+    /// content (the only XET fetch enabled today), but NOT sufficient isolation
+    /// for PRIVATE multitenant XET content — that path must stay gated until #436
+    /// (per-tenant CAS namespacing or commit-provenance verification) lands.
+    /// A real git-xet pointer is parsed and the merkle field is matched exactly
+    /// (not a loose substring of arbitrary blob text).
     async fn repo_contains_xet_merkle(
         &self,
         repo_id: &git2db::RepoId,
@@ -910,17 +921,16 @@ impl RegistryService {
                 None => return Ok(false),
             };
             let mut found = false;
-            // Walk the HEAD tree; for each blob, check if it is a git-xet pointer
-            // that references the requested merkle hash.
+            // Walk the HEAD tree; for each pointer-sized blob, parse it as a
+            // git-xet / git-lfs pointer and match the merkle/oid field EXACTLY.
             head.walk(git2::TreeWalkMode::PreOrder, |_dir, entry| {
                 if entry.kind() == Some(git2::ObjectType::Blob) {
                     if let Ok(obj) = entry.to_object(&repo) {
                         if let Some(blob) = obj.as_blob() {
-                            // git-xet pointers are small text files; only scan
-                            // pointer-sized blobs to avoid reading large content.
+                            // Pointers are small text files; bound the read.
                             if blob.size() <= 4096 {
                                 if let Ok(text) = std::str::from_utf8(blob.content()) {
-                                    if text.contains(&merkle_hex) {
+                                    if xet_pointer_references_merkle(text, &merkle_hex) {
                                         found = true;
                                         return git2::TreeWalkResult::Abort;
                                     }
@@ -2985,6 +2995,99 @@ impl MetricsRegistryClient for RegistryClient {
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::print_stdout)]
+/// Parse a git-xet / git-lfs pointer file and report whether its content-hash
+/// field EXACTLY equals `merkle_hex`. This is an exact field match, not a loose
+/// substring scan — an arbitrary text blob that merely contains the hex string
+/// (e.g. in a comment or unrelated field) does NOT count as a reference.
+///
+/// Recognized forms (one key=value / `key value` per line):
+///   - git-lfs:  `oid sha256:<hex>`
+///   - git-xet:  `xet://<hex>` or `merkle: <hex>` / `merklehash = <hex>`
+/// Matching is case-insensitive on the hex.
+fn xet_pointer_references_merkle(text: &str, merkle_hex: &str) -> bool {
+    let want = merkle_hex.trim().to_ascii_lowercase();
+    if want.is_empty() {
+        return false;
+    }
+    // Only treat blobs that look like a pointer file (have a version/oid/xet
+    // marker) as candidates — avoids matching arbitrary checked-in text.
+    let looks_like_pointer = text.lines().any(|l| {
+        let l = l.trim_start();
+        l.starts_with("version https://git-lfs")
+            || l.starts_with("version https://xet")
+            || l.starts_with("# xet")
+            || l.starts_with("xet://")
+    });
+    if !looks_like_pointer {
+        return false;
+    }
+    for line in text.lines() {
+        let line = line.trim();
+        // Extract the candidate hash token from known field shapes.
+        let candidate = if let Some(rest) = line.strip_prefix("oid sha256:") {
+            Some(rest.trim())
+        } else if let Some(rest) = line.strip_prefix("xet://") {
+            Some(rest.trim())
+        } else if let Some(rest) = line.strip_prefix("merkle:") {
+            Some(rest.trim())
+        } else if let Some(rest) = line.strip_prefix("merklehash") {
+            // `merklehash = <hex>` or `merklehash <hex>`
+            Some(rest.trim_start_matches([' ', '=', '\t']).trim())
+        } else {
+            None
+        };
+        if let Some(c) = candidate {
+            if c.to_ascii_lowercase() == want {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod xet_pointer_tests {
+    use super::xet_pointer_references_merkle;
+
+    const HEX: &str = "abc123def456abc123def456abc123def456abc123def456abc123def456abcd";
+
+    #[test]
+    fn matches_lfs_pointer_exact_oid() {
+        let ptr = format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{HEX}\nsize 1234\n"
+        );
+        assert!(xet_pointer_references_merkle(&ptr, HEX));
+    }
+
+    #[test]
+    fn matches_xet_pointer_scheme() {
+        let ptr = format!("version https://xet.example/v1\nxet://{HEX}\n");
+        assert!(xet_pointer_references_merkle(&ptr, HEX));
+    }
+
+    #[test]
+    fn rejects_non_pointer_text_containing_hex() {
+        // An arbitrary checked-in file that merely contains the hex string is
+        // NOT a reference — this is the sub-gap the old substring scan allowed.
+        let doc = format!("# notes\nsome unrelated text mentioning {HEX} in passing\n");
+        assert!(!xet_pointer_references_merkle(&doc, HEX));
+    }
+
+    #[test]
+    fn rejects_pointer_with_different_oid() {
+        let other = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let ptr = format!("version https://git-lfs.github.com/spec/v1\noid sha256:{other}\n");
+        assert!(!xet_pointer_references_merkle(&ptr, HEX));
+    }
+
+    #[test]
+    fn rejects_empty_merkle() {
+        let ptr = format!("version https://git-lfs.github.com/spec/v1\noid sha256:{HEX}\n");
+        assert!(!xet_pointer_references_merkle(&ptr, ""));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::PolicyManager;
