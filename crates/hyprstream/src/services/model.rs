@@ -433,26 +433,38 @@ impl ModelService {
                     match self.resolve_federated_at_uri(model_ref_str).await {
                         Ok(Some(model_ref)) => return Ok(model_ref),
                         Ok(None) => {
-                            // No discovery client / not a resolvable at-uri — fall through.
+                            // Attempted-but-unresolvable federated ref. FAIL CLOSED
+                            // with a clear error rather than falling through to
+                            // ModelRef::parse — which would mis-split `at://did:..`
+                            // on the first ':' into model="at", git_ref="//did:..",
+                            // a garbage local ref that fails later with a misleading
+                            // "not found". `Ok(None)` means either no DiscoveryClient
+                            // is configured (federation not enabled) or the string is
+                            // not a full at://<did>/<collection>/<rkey>.
+                            if self.inner.discovery_client.is_none() {
+                                anyhow::bail!(
+                                    "federation not enabled: cannot resolve federated ref '{model_ref_str}' \
+                                     (no DiscoveryClient configured on this node)"
+                                );
+                            }
+                            anyhow::bail!(
+                                "federated ref not resolvable: '{model_ref_str}' is not a full \
+                                 at://<did>/<collection>/<rkey>"
+                            );
                         }
                         Err(e) => {
-                            // A federated resolution that was attempted but failed is a
-                            // real error (record denied, missing, or proof invalid):
-                            // surface it rather than silently masking it with a local
-                            // parse that would give a misleading "not found".
+                            // Attempted and failed (record denied/missing/proof invalid):
+                            // surface it; never mask with a local parse.
                             return Err(e);
                         }
                     }
                 }
-                warn!(
-                    scheme,
-                    target = %rest,
-                    "federated ModelRef not resolved via discovery; falling through to local ModelRef::parse"
-                );
-                // Fall through: attempt local parse so existing callers see the same
-                // error they would have pre-#395 (most at:// / did: strings fail
-                // ModelRef::parse validation, the correct "not supported" signal).
-                ModelRef::parse(model_ref_str)
+                // `did:` (bare-DID) is reserved for federated resolution but has no
+                // record-fetch path yet — fail closed, do NOT reinterpret as local.
+                anyhow::bail!(
+                    "federated ModelRef scheme '{scheme}' for '{rest}' is not resolvable on this node \
+                     (bare did: resolution not implemented; use a full at:// record ref)"
+                )
             }
             ModelRefDispatch::Local => ModelRef::parse(model_ref_str),
         }
