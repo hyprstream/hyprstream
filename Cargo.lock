@@ -6344,6 +6344,7 @@ dependencies = [
  "capnp",
  "capnp-futures",
  "capnpc",
+ "cas-serve",
  "casbin",
  "chrono",
  "clap",
