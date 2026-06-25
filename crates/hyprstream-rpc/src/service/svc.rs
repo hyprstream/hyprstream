@@ -256,6 +256,50 @@ impl EnvelopeContext {
         self.is_local_caller
     }
 
+    /// Emit an accounting / audit record for an authorization decision (#445).
+    ///
+    /// This is the **Accounting** leg of AAA: it makes every authorization
+    /// decision attributable after the fact to the *cryptographically verified*
+    /// subject (`self.subject()`), never a caller-asserted field. It is called
+    /// by generated dispatch code at the authorization decision point — the
+    /// single DRY chokepoint where the verified subject, the resource, the
+    /// operation, and the allow/deny effect are all in scope.
+    ///
+    /// The record is a structured `tracing` event on the dedicated `audit`
+    /// target so it can be filtered/routed independently (e.g. shipped to an
+    /// audit sink) without coupling to the rest of the daemon's logs. Fields:
+    /// `subject`, `resource`, `action`, `decision` (`allow`/`deny`), and
+    /// `request_id` for correlation. It records only identity + resource +
+    /// action + decision — never key material or request payloads.
+    ///
+    /// Allow is logged at `info`; deny at `warn` (deny is the security-relevant
+    /// event), but both carry identical structured fields so "who did what" is
+    /// reconstructable for the allow path AND the deny path.
+    pub fn audit_authz(&self, resource: &str, operation: &str, allowed: bool) {
+        let subject = self.subject();
+        if allowed {
+            tracing::info!(
+                target: "audit",
+                subject = %subject,
+                resource = %resource,
+                action = %operation,
+                decision = "allow",
+                request_id = self.request_id,
+                "authz decision"
+            );
+        } else {
+            tracing::warn!(
+                target: "audit",
+                subject = %subject,
+                resource = %resource,
+                action = %operation,
+                decision = "deny",
+                request_id = self.request_id,
+                "authz decision"
+            );
+        }
+    }
+
 }
 
 /// Trait for RPC services.
@@ -907,5 +951,156 @@ mod stripping_defense_tests {
     fn stripping_unknown_alg_is_empty() {
         assert!(composite_alg_components("HS256").is_empty());
         assert!(composite_alg_components("none").is_empty());
+    }
+}
+
+/// Accounting (#445): the **A** of AAA. `EnvelopeContext::audit_authz` is the
+/// single chokepoint generated dispatch uses to attribute every authorization
+/// decision to the cryptographically-verified subject. These tests capture the
+/// emitted `tracing` events and assert the structured audit record carries the
+/// right subject + decision for an ALLOWED and a DENIED request.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod accounting_audit_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::subscriber::with_default;
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+    use tracing_subscriber::Registry;
+
+    /// One captured audit record (the structured fields we care about).
+    #[derive(Default, Debug, Clone)]
+    struct AuditRecord {
+        target: String,
+        subject: String,
+        resource: String,
+        action: String,
+        decision: String,
+    }
+
+    /// A `tracing` layer that records every event on the `audit` target into a
+    /// shared buffer so the test can assert on the structured fields.
+    struct CaptureLayer {
+        records: Arc<Mutex<Vec<AuditRecord>>>,
+    }
+
+    struct FieldVisitor<'a>(&'a mut AuditRecord);
+
+    impl Visit for FieldVisitor<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            // %Display fields arrive here as Debug of the formatted string; strip
+            // surrounding quotes that the Debug formatter may add.
+            let raw = format!("{value:?}");
+            let val = raw.trim_matches('"').to_owned();
+            match field.name() {
+                "subject" => self.0.subject = val,
+                "resource" => self.0.resource = val,
+                "action" => self.0.action = val,
+                "decision" => self.0.decision = val,
+                _ => {}
+            }
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            match field.name() {
+                "subject" => self.0.subject = value.to_owned(),
+                "resource" => self.0.resource = value.to_owned(),
+                "action" => self.0.action = value.to_owned(),
+                "decision" => self.0.decision = value.to_owned(),
+                _ => {}
+            }
+        }
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for CaptureLayer {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            let mut rec = AuditRecord {
+                target: event.metadata().target().to_owned(),
+                ..Default::default()
+            };
+            event.record(&mut FieldVisitor(&mut rec));
+            self.records.lock().unwrap().push(rec);
+        }
+    }
+
+    /// Build a context whose verified subject is the given username (the
+    /// key-derived path, i.e. cryptographically proven, not caller-asserted).
+    fn ctx_for_user(name: &str) -> EnvelopeContext {
+        EnvelopeContext {
+            request_id: 42,
+            claims: None,
+            jwt_token: None,
+            key_derived_subject: Subject::new(name),
+            jwt_subject: None,
+            cnf: [0u8; 32],
+            envelope_wit_hash: None,
+            client_dh_public: None,
+            is_local_caller: true,
+        }
+    }
+
+    fn capture<F: FnOnce()>(f: F) -> Vec<AuditRecord> {
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let layer = CaptureLayer { records: records.clone() };
+        let subscriber = Registry::default().with(layer);
+        with_default(subscriber, f);
+        let out = records.lock().unwrap().clone();
+        out
+    }
+
+    #[test]
+    fn audit_emits_allow_with_verified_subject() {
+        let ctx = ctx_for_user("testuser");
+        let records = capture(|| {
+            ctx.audit_authz("registry:*", "write", /* allowed */ true);
+        });
+
+        let audit: Vec<_> = records.iter().filter(|r| r.target == "audit").collect();
+        assert_eq!(audit.len(), 1, "exactly one audit record expected: {records:?}");
+        let r = audit[0];
+        assert_eq!(r.subject, "testuser", "subject must be the verified subject");
+        assert_eq!(r.resource, "registry:*");
+        assert_eq!(r.action, "write");
+        assert_eq!(r.decision, "allow");
+    }
+
+    #[test]
+    fn audit_emits_deny_with_verified_subject() {
+        // anonymous denied a write — the security-relevant deny path.
+        let ctx = EnvelopeContext {
+            request_id: 7,
+            claims: None,
+            jwt_token: None,
+            key_derived_subject: Subject::anonymous(),
+            jwt_subject: None,
+            cnf: [0u8; 32],
+            envelope_wit_hash: None,
+            client_dh_public: None,
+            is_local_caller: false,
+        };
+        let records = capture(|| {
+            ctx.audit_authz("registry:*", "write", /* allowed */ false);
+        });
+
+        let audit: Vec<_> = records.iter().filter(|r| r.target == "audit").collect();
+        assert_eq!(audit.len(), 1, "exactly one audit record expected: {records:?}");
+        let r = audit[0];
+        assert_eq!(r.subject, "anonymous", "anonymous deny must be attributed as 'anonymous'");
+        assert_eq!(r.resource, "registry:*");
+        assert_eq!(r.action, "write");
+        assert_eq!(r.decision, "deny");
+    }
+
+    #[test]
+    fn audit_attributes_authenticated_deny() {
+        // An authenticated-but-unprivileged subject denied a write is still
+        // attributable to that subject (who attempted what).
+        let ctx = ctx_for_user("viewer-probe");
+        let records = capture(|| {
+            ctx.audit_authz("registry:*", "write", /* allowed */ false);
+        });
+        let r = records.iter().find(|r| r.target == "audit").expect("audit record");
+        assert_eq!(r.subject, "viewer-probe");
+        assert_eq!(r.decision, "deny");
     }
 }
