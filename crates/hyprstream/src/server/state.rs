@@ -57,6 +57,9 @@ pub struct ServerState {
     /// Per-request DPoP JTI dedup map (RFC 9449 §11.1 replay prevention).
     /// Maps jti → expiry (iat + 60s grace). Periodically cleaned up.
     pub dpop_jti_seen: Arc<parking_lot::RwLock<HashMap<String, i64>>>,
+
+    /// Per-subject request rate limiter (fixed window, 300 req/60s default).
+    pub rate_limiter: Arc<crate::server::middleware::RateLimiter>,
 }
 
 /// Metrics collector
@@ -149,6 +152,7 @@ impl ServerState {
             federation_resolver,
             jti_blocklist,
             dpop_jti_seen: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            rate_limiter: Arc::new(crate::server::middleware::RateLimiter::new(300, 60)),
         })
     }
 

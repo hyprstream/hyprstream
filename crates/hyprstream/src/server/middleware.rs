@@ -53,6 +53,10 @@ pub async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
+    let client_ip = extract_client_ip(&request);
+    let method = request.method().as_str().to_owned();
+    let path = request.uri().path().to_owned();
+
     // Accept both Bearer and DPoP schemes (RFC 6750, RFC 9449)
     let auth_hdr = request
         .headers()
@@ -80,7 +84,7 @@ pub async fn auth_middleware(
     let www_authenticate = build_www_authenticate(&state);
 
     if !token.contains('.') {
-        debug!("Invalid token format");
+        warn!(client_ip = %client_ip, method = %method, path = %path, "Auth failure: malformed token");
         return unauthorized_response("Authentication failed", &www_authenticate);
     }
 
@@ -91,13 +95,13 @@ pub async fn auth_middleware(
         jwt::decode(&token, &state.verifying_key, Some(&state.resource_url))
     } else {
         if !state.federation_resolver.is_trusted(&iss) {
-            debug!("Untrusted federation issuer: {}", iss);
+            warn!(client_ip = %client_ip, method = %method, path = %path, issuer = %iss, "Auth failure: untrusted federation issuer");
             return unauthorized_response("Authentication failed", &www_authenticate);
         }
         match state.federation_resolver.get_key(&iss).await {
             Ok(key) => jwt::decode_with_key(&token, &key, Some(&state.resource_url)),
             Err(e) => {
-                debug!("Federation key resolution failed for issuer {}: {}", iss, e);
+                warn!(client_ip = %client_ip, method = %method, path = %path, issuer = %iss, error = %e, "Auth failure: federation key resolution failed");
                 return unauthorized_response("Authentication failed", &www_authenticate);
             }
         }
@@ -106,7 +110,7 @@ pub async fn auth_middleware(
     let claims = match result {
         Ok(c) => c,
         Err(e) => {
-            debug!("JWT validation failed: {}", e);
+            warn!(client_ip = %client_ip, method = %method, path = %path, error = %e, "Auth failure: JWT validation failed");
             return unauthorized_response("Authentication failed", &www_authenticate);
         }
     };
@@ -215,12 +219,74 @@ pub async fn logging_middleware(request: Request, next: Next) -> Response {
     response
 }
 
-/// Rate limiting middleware (simplified)
+/// Fixed-window per-subject rate limiter.
+///
+/// Tracks request counts per authenticated subject (JWT sub).
+/// The window resets cleanly at the end of each window period.
+pub struct RateLimiter {
+    /// subject → (request_count, window_start_unix)
+    counters: parking_lot::RwLock<std::collections::HashMap<String, (u32, i64)>>,
+    max_requests: u32,
+    window_secs: i64,
+}
+
+impl RateLimiter {
+    pub fn new(max_requests: u32, window_secs: i64) -> Self {
+        Self {
+            counters: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            max_requests,
+            window_secs,
+        }
+    }
+
+    /// Check + increment. Returns `true` if the caller is over quota.
+    pub fn check_and_increment(&self, subject: &str) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        let mut map = self.counters.write();
+        // Evict stale entries to bound memory growth
+        if map.len() > 10_000 {
+            let window_secs = self.window_secs;
+            map.retain(|_, (_, ws)| now - ws < window_secs * 2);
+        }
+        let entry = map.entry(subject.to_owned()).or_insert((0, now));
+        if now - entry.1 >= self.window_secs {
+            // New window: reset
+            *entry = (1, now);
+            false
+        } else if entry.0 >= self.max_requests {
+            true // over quota
+        } else {
+            entry.0 += 1;
+            false
+        }
+    }
+}
+
+/// Rate limiting middleware — enforces per-authenticated-subject request quotas.
+///
+/// Runs after `auth_middleware` (which inserts `AuthenticatedUser`).
+/// Defaults: 300 requests per 60-second window (~5 req/s sustained).
+/// Returns 429 when the window quota is exceeded.
 pub async fn rate_limit_middleware(
-    State(_state): State<ServerState>,
+    State(state): State<ServerState>,
     request: Request,
     next: Next,
 ) -> Response {
+    let subject = request
+        .extensions()
+        .get::<AuthenticatedUser>()
+        .map(|u| u.user.clone())
+        .unwrap_or_else(|| "anonymous".to_owned());
+
+    if state.rate_limiter.check_and_increment(&subject) {
+        warn!(subject = %subject, "Rate limit exceeded");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Rate limit exceeded — retry after window expires",
+        )
+            .into_response();
+    }
+
     next.run(request).await
 }
 
@@ -285,6 +351,26 @@ pub fn extract_kid_from_token(token: &str) -> Option<String> {
     let header_bytes = URL_SAFE_NO_PAD.decode(header_b64).ok()?;
     let header: serde_json::Value = serde_json::from_slice(&header_bytes).ok()?;
     header.get("kid").and_then(|v| v.as_str()).map(str::to_owned)
+}
+
+/// Extract the client IP from `X-Forwarded-For` or `X-Real-IP` headers.
+/// Falls back to `"unknown"` when no header is present (e.g. direct connection
+/// where ConnectInfo is not available in this middleware form).
+fn extract_client_ip(request: &Request) -> String {
+    if let Some(xff) = request.headers().get("x-forwarded-for") {
+        if let Ok(s) = xff.to_str() {
+            // Take the leftmost (original client) IP
+            if let Some(ip) = s.split(',').next() {
+                return ip.trim().to_owned();
+            }
+        }
+    }
+    if let Some(xri) = request.headers().get("x-real-ip") {
+        if let Ok(s) = xri.to_str() {
+            return s.trim().to_owned();
+        }
+    }
+    "unknown".to_owned()
 }
 
 /// CORS middleware configuration
