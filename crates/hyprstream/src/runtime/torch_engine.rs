@@ -24,6 +24,53 @@ use tch::{nn::VarStore, Device, Tensor};
 use tokenizers::Tokenizer;
 use tracing::{info, instrument, warn};
 
+/// Build a self-explaining diagnostic for why CUDA/ROCm is unavailable.
+///
+/// `tch::Cuda::is_available()` returns a bare `false` with no cause, which made
+/// the GPU→CPU fallback nearly impossible to diagnose in the field (e.g. an RTX
+/// 5090 node with a CUDA libtorch bundled that still logged a one-line "not
+/// available"). This collects the underlying signals so the operator can tell
+/// *why*:
+///
+/// - `has_cuda` / `has_cudart`: was this libtorch even compiled with CUDA? If
+///   `false`, an install/active-backend mismatch bundled a CPU build.
+/// - `device_count`: 0 with a CUDA build almost always means the driver lib
+///   (`libcuda.so.1`, shipped by the host NVIDIA driver — *never* by the
+///   AppImage) could not be loaded, i.e. `LD_LIBRARY_PATH` does not reach the
+///   host driver path. A negative count is a CUDA-internal error.
+/// - The current `LD_LIBRARY_PATH` is echoed so the operator can immediately
+///   see whether the host driver path is missing.
+fn cuda_unavailable_diagnostics() -> String {
+    let has_cuda = tch::utils::has_cuda();
+    let has_cudart = tch::utils::has_cudart();
+    let has_hip = tch::utils::has_hip();
+    let device_count = tch::Cuda::device_count();
+    let ld_path = std::env::var("LD_LIBRARY_PATH").unwrap_or_else(|_| "<unset>".to_owned());
+
+    // Best-effort, actionable interpretation of the signals above.
+    let hint = if !has_cuda && !has_hip {
+        "this libtorch was NOT built with CUDA/ROCm support (CPU-only build). \
+         Check the installed/active backend — an install likely selected a 'cpu' \
+         variant (verify ~/.local/share/hyprstream/active-backend / active-version)."
+    } else if device_count <= 0 {
+        "libtorch has CUDA/ROCm support but reports 0 devices. This is almost \
+         always the host driver library (libcuda.so.1) failing to load: it ships \
+         with the NVIDIA driver and is never bundled in the AppImage. Ensure the \
+         host driver lib dir is on LD_LIBRARY_PATH (e.g. /usr/lib64, \
+         /usr/lib/x86_64-linux-gnu, or the libcuda.so.1 location from \
+         `ldconfig -p | grep libcuda`), or that ldconfig has it cached."
+    } else {
+        "CUDA/ROCm reports devices but is_available() is false — possible \
+         driver/runtime version mismatch or a CUDA-internal init error."
+    };
+
+    format!(
+        "is_available()=false; has_cuda={has_cuda}, has_cudart={has_cudart}, \
+         has_hip={has_hip}, device_count={device_count}, \
+         LD_LIBRARY_PATH={ld_path}. Likely cause: {hint}"
+    )
+}
+
 /// Basic context state for tracking generation state
 #[derive(Debug, Clone)]
 pub struct ContextState {
@@ -392,14 +439,22 @@ impl TorchEngine {
                     Device::Cuda(device_id)
                 } else if config.strict_device {
                     // No-fragile-fallbacks (#315): a process told to use GPU N that
-                    // silently lands on CPU tanks the pipeline. Fail fast instead.
+                    // silently lands on CPU tanks the pipeline. Fail fast instead,
+                    // and surface the *actual* reason CUDA was unavailable so the
+                    // operator can fix it (driver lib / wrong backend / mismatch).
+                    let diag = cuda_unavailable_diagnostics();
                     return Err(anyhow!(
                         "GPU {device_id} explicitly requested but CUDA/ROCm is not available; \
                          refusing to silently fall back to CPU (strict_device). \
-                         Set HYPRSTREAM_STRICT_DEVICE=0 to allow CPU fallback."
+                         Set HYPRSTREAM_STRICT_DEVICE=0 to allow CPU fallback. \
+                         Diagnostics: {diag}"
                     ));
                 } else {
-                    info!("⚠️  GPU {} requested but CUDA/ROCm not available, falling back to CPU", device_id);
+                    warn!(
+                        "⚠️  GPU {} requested but CUDA/ROCm not available, falling back to CPU. {}",
+                        device_id,
+                        cuda_unavailable_diagnostics()
+                    );
                     Device::Cpu
                 }
             } else {
@@ -424,7 +479,13 @@ impl TorchEngine {
                 }
                 gpu_device
             } else {
-                info!("⚠️  GPU requested but not available, falling back to CPU");
+                // The live RTX 5090 / cuda130 node hit exactly this branch: a
+                // bare "not available" with no cause. Always surface *why* now
+                // (most commonly libcuda.so.1 missing from LD_LIBRARY_PATH).
+                warn!(
+                    "⚠️  GPU requested but not available, falling back to CPU. {}",
+                    cuda_unavailable_diagnostics()
+                );
                 Device::Cpu
             }
         } else {
