@@ -38,8 +38,9 @@ allow = [
     "MPL-2.0",
     "Zlib",
     "OpenSSL",
-    "BSL-1.0",    # Boost Software License (permissive)
-    "Unlicense",  # public domain equivalent (permissive)
+    "BSL-1.0",       # Boost Software License (permissive)
+    "Unlicense",     # public domain equivalent (permissive)
+    "bzip2-1.0.6",  # bzip2-sys: permissive BSD-like, FSF-free
 ]
 
 # huggingface/xet-core (tag git-xet-v0.2.0) internal workspace crates don't
