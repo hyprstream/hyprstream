@@ -126,8 +126,10 @@ async fn moq_relay_rendezvous() -> Result<()> {
         let _ = run_relay_announce_link(&link_producer, &link_relay).await;
     });
 
-    // Give the producer→relay link time to handshake + announce the broadcast UP.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // No fixed sleep: the `timeout(announced_broadcast)` below is the deterministic
+    // wait — it resolves once the relay origin actually has the announced broadcast,
+    // so a wall-clock delay here would only add latency / flake (matches the
+    // `relay_choice_only_anonymizes_stream_end_to_end` pattern).
 
     // ── SUBSCRIBER: dials ONLY the relay's Role::Relay reach ───────────────────
     // The reach list carries the relay ONLY (no direct producer reach) — a
