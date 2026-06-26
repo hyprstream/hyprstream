@@ -43,13 +43,17 @@ jobs:
             $PM config-manager --set-enabled crb || \
               $PM config-manager --set-enabled powertools || true
           fi
-          $PM install -y \
+          # NOTE: do not list `curl` here — Rocky 9 ships `curl-minimal`, and
+          # `dnf install curl` errors with a curl/curl-minimal file conflict.
+          # The curl binary is already present (curl-minimal on Rocky, curl on
+          # Fedora) and is used by the rustup step below.
+          $PM install -y --allowerasing \
             rpm-build rpmdevtools \
             gcc gcc-c++ cmake make pkgconfig \
             openssl-devel systemd-devel capnproto \
             perl-interpreter perl-FindBin \
             git git-lfs ca-certificates \
-            curl tar gzip findutils which
+            tar gzip findutils which
 
       - name: Install Rust (rustup; distro rust is often too old)
         run: |
@@ -78,6 +82,10 @@ jobs:
 
       - name: Build RPM
         run: |
+          # pipefail so a build-rpm.sh / rpmbuild failure fails this step instead
+          # of being masked by `tee` (which would leave $RPM unset and surface as
+          # a confusing "RPM: unbound variable" in the install step).
+          set -euo pipefail
           chmod +x packaging/rpm/build-rpm.sh
           packaging/rpm/build-rpm.sh "${{ steps.ver.outputs.version }}" | tee /tmp/build.log
           grep '^RPM=' /tmp/build.log | tail -1 >> "$GITHUB_ENV"
