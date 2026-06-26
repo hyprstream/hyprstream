@@ -406,6 +406,35 @@ pub async fn root_did_document(
     ).into_response()
 }
 
+/// `GET /.well-known/atproto-did` — atproto handle→DID resolution (HTTP method).
+///
+/// Per the atproto Handle spec (https://atproto.com/specs/handle), the HTTPS
+/// well-known method returns the **bare DID string** as `text/plain` (no JSON
+/// or wrapper) so this deployment's handle (its authority hostname) resolves to
+/// its `did:web:{authority}`. Companion to `/.well-known/did.json`, which serves
+/// the full W3C DID document for the same subject.
+///
+/// Consumed by the frontend handle resolver
+/// (`www-cyberdione-ai/src/api/atproto.ts:resolveHandleToDid`). This is a
+/// CORS-simple GET (no custom request headers → no preflight), so it needs only
+/// cross-origin readability from the public CORS layer, not permissive headers.
+pub async fn atproto_did(
+    State(state): State<Arc<OAuthState>>,
+) -> Response {
+    let Some(authority) = issuer_authority(&state.issuer_url) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "issuer URL has no authority",
+        ).into_response();
+    };
+    let did = format!("did:web:{authority}");
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        did,
+    ).into_response()
+}
+
 /// `GET /users/:username/did.json` — per-user DID document.
 ///
 /// `id = did:web:{authority}:users:{username}`. Verification methods:
