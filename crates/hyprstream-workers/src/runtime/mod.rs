@@ -27,6 +27,9 @@ mod container;
 #[cfg(feature = "kata-vm")]
 pub mod kata_backend;
 pub mod nspawn;
+// Podman/docker rootless OCI backend (#346) — gated behind `podman` feature.
+#[cfg(feature = "podman")]
+pub mod podman;
 mod pool;
 mod sandbox;
 // Per-sandbox VFS composition + serve (FS-D, #365): native-only + VM-only
@@ -81,6 +84,8 @@ pub use backend::{SandboxBackend, SandboxHandle};
 #[cfg(feature = "kata-vm")]
 pub use kata_backend::{KataBackend, KataHandle};
 pub use nspawn::{NspawnBackend, NspawnConfig, NspawnHandle};
+#[cfg(feature = "podman")]
+pub use podman::{PodmanBackend, PodmanConfig, PodmanHandle};
 // Domain entities (business logic only)
 pub use container::Container;
 pub use pool::{PoolStats, SandboxPool};

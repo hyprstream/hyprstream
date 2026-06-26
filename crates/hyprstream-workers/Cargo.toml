@@ -124,6 +124,10 @@ kata-vm = [
 # Enable Dragonball built-in VMM support (alternative to cloud-hypervisor).
 # Implies `kata-vm` since it tunes the kata hypervisor abstraction.
 dragonball = ["kata-vm", "kata-hypervisor/dragonball"]
+# Rootless podman/docker OCI backend (#346). Requires `podman` or `docker` in
+# PATH at runtime; no compile-time toolchain overhead. Enabled by default since
+# podman availability is checked at runtime via `is_available()`.
+podman = []
 # Enable D-Bus bridge for container access to host D-Bus services
 dbus = ["dep:zbus"]
 # Systemd integration (socket activation, service units)
