@@ -8,7 +8,11 @@
 //! `SHELL_CTX` set up in `PythonShell::new()`.
 //!
 //! VFS calls are synchronous bridges over the async namespace:
-//! - Native: `tokio::runtime::Handle::current().block_on(...)`.
+//! - Native: the async op is `spawn`ed onto a dedicated bridge runtime and the
+//!   interpreter thread blocks on a plain channel for the result. We must NOT
+//!   use `Handle::current().block_on()` here — the interpreter owner loop drives
+//!   the VM from inside its own tokio runtime, and re-entering a runtime on the
+//!   same thread panics with "Cannot start a runtime from within a runtime".
 //! - WASM32: VFS builtins return a Python RuntimeError (not supported).
 
 use crate::SHELL_CTX;
@@ -24,6 +28,15 @@ use rustpython_vm::{
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Remove dangerous builtins. Called after stdlib is loaded inside `interp.enter`.
+///
+/// NOTE (isolation is best-effort, not a hard security boundary):
+/// Removing `__import__` blocks *fresh* `import foo` statements (they look up
+/// `builtins.__import__`), but it does NOT block modules already cached in
+/// `sys.modules` at startup, nor `importlib`-driven imports (importlib's
+/// bootstrap machinery does not go through `builtins.__import__`).
+///
+/// The amount of isolation we promise is a security-posture decision still
+/// pending review (see crate-level docs). Do not treat this list as a sandbox.
 pub(crate) fn harden(vm: &VirtualMachine) {
     let dict = vm.builtins.dict();
     for name in &["open", "exec", "compile", "breakpoint", "__import__"] {
@@ -65,18 +78,51 @@ where
     })
 }
 
+/// Dedicated multi-threaded runtime used only to drive VFS futures for the
+/// synchronous Python builtins.
+///
+/// The interpreter owner loop runs the (`!Send`) VM from inside its own tokio
+/// runtime, so we cannot `block_on`/`block_in_place` on the owner thread. This
+/// runtime has its own worker thread that polls the spawned VFS future while the
+/// owner thread blocks on a std channel for the result.
+#[cfg(not(target_arch = "wasm32"))]
+fn vfs_bridge_runtime() -> &'static tokio::runtime::Runtime {
+    use std::sync::OnceLock;
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("hyprstream-python-vfs")
+            .enable_all()
+            .build()
+            .expect("failed to build hyprstream-python VFS bridge runtime")
+    })
+}
+
 /// Run an async VFS operation from a synchronous Python builtin.
+///
+/// Clones the namespace handle + subject out of the thread-local on the
+/// interpreter-owner thread, then runs the future on the dedicated bridge
+/// runtime (see [`vfs_bridge_runtime`]) and blocks for the result. The VFS
+/// namespace is `Send + Sync`, so the future can be moved to another thread.
 #[cfg(not(target_arch = "wasm32"))]
 fn vfs_async<F, Fut, T>(vm: &VirtualMachine, f: F) -> PyResult<T>
 where
     F: FnOnce(std::sync::Arc<hyprstream_vfs::Namespace>, hyprstream_vfs::Subject) -> Fut,
-    Fut: std::future::Future<Output = Result<T, String>>,
+    Fut: std::future::Future<Output = Result<T, String>> + Send + 'static,
+    T: Send + 'static,
 {
-    let result = with_ctx(vm, |ns, sub| {
-        tokio::runtime::Handle::try_current()
-            .map_err(|_| "no tokio runtime".to_owned())
-            .and_then(|h| h.block_on(f(ns, sub)))
-    })?;
+    let (ns, sub) = with_ctx(vm, |ns, sub| (ns, sub))?;
+    let fut = f(ns, sub);
+
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    vfs_bridge_runtime().spawn(async move {
+        // Receiver may be gone only if the owner thread unwound; ignore.
+        let _ = tx.send(fut.await);
+    });
+    let result = rx
+        .recv()
+        .map_err(|_| vm.new_runtime_error("VFS bridge task did not complete".to_owned()))?;
     result.map_err(|e| vm.new_runtime_error(e))
 }
 
