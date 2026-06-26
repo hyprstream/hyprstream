@@ -57,12 +57,12 @@ allow = ["MIT", "AGPL-3.0-only"]
 [[licenses.exceptions]]
 name = "systemd"
 version = "*"
-allow = ["LGPL-2.1-or-later"]
+allow = ["LGPL-2.1-or-later WITH GCC-exception-2.0"]
 
 [[licenses.exceptions]]
 name = "libsystemd-sys"
 version = "*"
-allow = ["LGPL-2.1-or-later"]
+allow = ["LGPL-2.1-or-later WITH GCC-exception-2.0"]
 
 # huggingface/xet-core (tag git-xet-v0.2.0) internal workspace crates don't
 # declare `license` in their per-crate Cargo.toml; the root repo is Apache-2.0.
