@@ -689,7 +689,7 @@ impl WorkflowHandler for WorkflowService {
         _request_id: u64,
         request: &SubscribeRequest,
     ) -> AnyhowResult<WorkflowResponseVariant> {
-        let sub_id = format!("sub-{}-{}", request.workflow_id, uuid_v4_simple());
+        let sub_id = format!("sub-{}-{}", request.workflow_id, uuid::Uuid::new_v4());
         let trigger = EventTrigger::Custom {
             topic: format!("workflow.{}", request.workflow_id),
             pattern: String::new(),
@@ -806,18 +806,4 @@ fn extract_triggers(workflow: &Workflow) -> Vec<EventTrigger> {
         "schedule" | "training" => EventTrigger::Custom { topic: format!("training.{event}"), pattern: String::new() },
         _ => EventTrigger::Custom { topic: format!("repo.{event}"), pattern: String::new() },
     }).collect()
-}
-
-/// Generate a compact random-ish identifier for subscription IDs.
-///
-/// Uses the system time + thread id — no external deps needed, not
-/// cryptographic, only needs to be unique within a service lifetime.
-fn uuid_v4_simple() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tid = std::thread::current().id();
-    format!("{ts:x}-{tid:?}")
 }
