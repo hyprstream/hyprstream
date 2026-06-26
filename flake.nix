@@ -194,9 +194,14 @@
         ];
 
       in {
+        # GPU variants depend on cudaPackages/rocmPackages, which only resolve on
+        # x86_64-linux. Guard them so evaluation (nix flake show/check) succeeds on
+        # other systems (macOS, aarch64) with just the CPU variant present, instead
+        # of erroring out while forcing the GPU package attrs.
         packages = {
           hyprstream     = mkHyprstream "cpu"     libtorchVariants.cpu     [];
           hyprstream-cpu = mkHyprstream "cpu"     libtorchVariants.cpu     [];
+        } // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
           hyprstream-cuda128 = mkHyprstream "cuda128" libtorchVariants.cuda128 cuda12Libs;
           hyprstream-cuda130 = mkHyprstream "cuda130" libtorchVariants.cuda130 cuda12Libs;
           hyprstream-rocm71  = mkHyprstream "rocm71"  libtorchVariants.rocm71  rocm71Libs;
