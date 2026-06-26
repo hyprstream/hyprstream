@@ -9,17 +9,17 @@
 use anyhow::{bail, Result};
 use clap::{Arg, ArgMatches, Command};
 use ed25519_dalek::SigningKey;
-use hyprstream_rpc::RequestIdentity;
-use hyprstream_rpc::service::metadata::ScopedClientTreeNode;
+use hyprstream_service::ScopedClientTreeNode;
 use serde_json::Value;
 
 use crate::services::generated::{
     inference_client, model_client, policy_client, registry_client,
 };
 use hyprstream_workers::generated::{worker_client, workflow_client};
-use crate::services::{
-    InferenceZmqClient, ModelZmqClient, PolicyClient, GenRegistryClient, WorkerZmqClient,
-};
+use crate::services::{PolicyClient, RegistryClient};
+use crate::services::generated::inference_client::InferenceClient;
+use crate::services::generated::model_client::ModelClient;
+use hyprstream_workers::runtime::WorkerClient;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MethodSchemaLike trait — unifies per-module MethodSchema types
@@ -75,7 +75,7 @@ macro_rules! extract_methods {
 }
 
 /// Convert a slice of MethodMeta into MethodView values.
-fn methods_to_views(methods: &[hyprstream_rpc::service::metadata::MethodMeta]) -> Vec<MethodView> {
+fn methods_to_views(methods: &[hyprstream_service::MethodMeta]) -> Vec<MethodView> {
     methods
         .iter()
         .map(|m| MethodView {
@@ -102,7 +102,7 @@ fn methods_to_views(methods: &[hyprstream_rpc::service::metadata::MethodMeta]) -
 
 /// Convert scoped metadata (service, scope, methods) into MethodView values.
 fn scoped_methods_to_views(
-    metadata_fn: hyprstream_rpc::service::metadata::ScopedSchemaMetadataFn,
+    metadata_fn: hyprstream_service::ScopedSchemaMetadataFn,
 ) -> Vec<MethodView> {
     let (_service_name, _scope_name, methods) = metadata_fn();
     methods_to_views(methods)
@@ -355,6 +355,29 @@ pub async fn handle_schema_command(
     Ok(())
 }
 
+/// Resolve a service verifying key via PolicyService.
+///
+/// Creates a PolicyClient using the root key (inproc mode) and resolves the
+/// given service name to its verifying key.
+async fn resolve_key_via_policy(
+    signing_key: &SigningKey,
+    service_name: &str,
+) -> Result<hyprstream_rpc::crypto::VerifyingKey> {
+    let policy_vk = signing_key.verifying_key();
+    let policy_client = PolicyClient::for_service(
+        signing_key.clone(), policy_vk, None,
+    )?;
+    let resp = policy_client.resolve_service_key(
+        &crate::services::generated::policy_client::ResolveServiceKey {
+            service_name: service_name.to_owned(),
+        },
+    ).await.map_err(|e| anyhow::anyhow!("Failed to resolve key for '{}': {e}", service_name))?;
+    hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+        resp.verifying_key.as_slice().try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid key length for '{}'", service_name))?,
+    ).map_err(|e| anyhow::anyhow!("Invalid key for '{}': {e}", service_name))
+}
+
 /// Dispatch a top-level (non-scoped) method call.
 async fn dispatch_top_level(
     service: &str,
@@ -362,26 +385,28 @@ async fn dispatch_top_level(
     args: &Value,
     signing_key: SigningKey,
 ) -> Result<Value> {
-    let identity = RequestIdentity::local();
-
     match service {
         "registry" => {
-            let client: GenRegistryClient = crate::services::create_service_client(
-                &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
-                signing_key, identity,
-            );
+            let server_vk = resolve_key_via_policy(&signing_key, "registry").await?;
+            let client: RegistryClient = RegistryClient::for_service(
+                signing_key, server_vk, None,
+            )?;
             client.call_method(method, args).await
         }
         "model" => {
-            let client = ModelZmqClient::new(signing_key, identity);
-            client.gen.call_method(method, args).await
+            let server_vk = resolve_key_via_policy(&signing_key, "model").await?;
+            let client = ModelClient::for_service(signing_key, server_vk, None)?;
+            client.call_method(method, args).await
         }
         "inference" => {
-            let client = InferenceZmqClient::new(signing_key, identity);
-            client.gen.call_method(method, args).await
+            let server_vk = resolve_key_via_policy(&signing_key, "inference").await?;
+            let client = InferenceClient::for_service(signing_key, server_vk, None)?;
+            client.call_method(method, args).await
         }
         "policy" => {
-            let client = PolicyClient::new(signing_key, identity);
+            // Bootstrap: PolicyService uses the root key
+            let server_vk = signing_key.verifying_key();
+            let client = PolicyClient::for_service(signing_key, server_vk, None)?;
             client.call_method(method, args).await
         }
         "worker" => {
@@ -402,23 +427,23 @@ async fn dispatch_scoped_dynamic(
     args: &Value,
     signing_key: SigningKey,
 ) -> Result<Value> {
-    let identity = RequestIdentity::local();
-
     match service {
         "registry" => {
-            let client: GenRegistryClient = crate::services::create_service_client(
-                &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
-                signing_key, identity,
-            );
+            let server_vk = resolve_key_via_policy(&signing_key, "registry").await?;
+            let client: RegistryClient = RegistryClient::for_service(
+                signing_key, server_vk, None,
+            )?;
             client.call_scoped_method(scope_chain, method, args).await
         }
         "model" => {
-            let client = ModelZmqClient::new(signing_key, identity);
-            client.gen.call_scoped_method(scope_chain, method, args).await
+            let server_vk = resolve_key_via_policy(&signing_key, "model").await?;
+            let client = ModelClient::for_service(signing_key, server_vk, None)?;
+            client.call_scoped_method(scope_chain, method, args).await
         }
         "worker" => {
-            let client = WorkerZmqClient::new(signing_key, identity);
-            client.gen().call_scoped_method(scope_chain, method, args).await
+            let server_vk = resolve_key_via_policy(&signing_key, "worker").await?;
+            let client = WorkerClient::for_service(signing_key, server_vk, None)?;
+            client.call_scoped_method(scope_chain, method, args).await
         }
         _ => bail!("Service '{}' has no scoped methods", service),
     }

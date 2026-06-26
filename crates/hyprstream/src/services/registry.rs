@@ -3,14 +3,12 @@
 //! This service wraps git2db and provides a ZMQ REQ/REP interface for
 //! repository operations. It uses Cap'n Proto for serialization.
 
-use crate::auth::Operation;
 use crate::services::PolicyClient;
 use crate::services::types::{MAX_FDS_GLOBAL, MAX_FDS_PER_CLIENT};
 use hyprstream_containedfs::{ContainedFs, FsError, FsHandle};
-use crate::services::{EnvelopeContext, ZmqService};
+use crate::services::{EnvelopeContext, RequestService};
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc::prelude::*;
-use hyprstream_rpc::registry::{global as endpoint_registry, SocketKind};
 use hyprstream_rpc::{StreamChannel, StreamContext};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -29,11 +27,12 @@ use uuid::Uuid;
 
 // Generated client types
 use crate::services::generated::registry_client::{
-    RegistryClient as GenRegistryClient, RegistryResponseVariant,
+    RegistryClient, RegistryResponseVariant,
     RegistryHandler, RepoHandler, WorktreeHandler, CtlHandler,
     dispatch_registry, serialize_response,
     StreamInfo, ErrorInfo, HealthStatus, DetailedStatusInfo, RemoteInfo,
     CloneRequest, RegisterRequest,
+    GetBlobRequest, GetBlobRequestContent,
     CreateWorktreeRequest, RemoveWorktreeRequest,
     BranchRequest, CheckoutRequest, StageFilesRequest,
     CommitRequest, MergeRequest, ContinueMergeRequest,
@@ -45,13 +44,13 @@ use crate::services::generated::registry_client::{
     NpStatReq, NpWstat, NpFlush,
     RWalk, ROpen, RRead, RWrite, RStat,
     NpStat as NpStatData, Qid as QidData,
-    EnsureWorktreeRequest,
     FileStatus, LogEntry, ValidationResult, FileInfo,
     CtlLogRequest, CtlDiffRequest, CtlCheckoutRequest,
     EditOpenRequest, EditApplyRequest,
-    DocFormatEnum,
+    DocFormat,
 };
-use crate::services::editing::{self, EditingTable, DocFormat};
+use crate::services::editing::{self, EditingTable};
+use crate::services::generated::policy_client::PolicyCheck;
 use automerge::ReadDoc as _;
 // Conflicting names — use canonical path at usage sites:
 //   registry_client::TrackedRepository, registry_client::RepositoryStatus, registry_client::WorktreeInfo
@@ -126,6 +125,8 @@ enum FidState {
         qid: Qid,
         iounit: u32,
         mode: u8,
+        /// Relative path within the worktree (needed for directory reads).
+        rel_path: String,
     },
 }
 
@@ -160,6 +161,11 @@ fn now_epoch_secs() -> u64 {
 }
 
 /// Build a Qid from filesystem metadata.
+///
+/// Advisory identity hint only — see the qid-soundness invariant on
+/// `hyprstream_vfs::Stat`. `path = inode` is rename-stable but subject to
+/// inode reuse; `version = ctime` is truncated. No authz may key on this. The
+/// content-CID-derived qid lands in #387.
 #[cfg(unix)]
 fn qid_from_metadata(meta: &std::fs::Metadata) -> Qid {
     use std::os::unix::fs::MetadataExt;
@@ -171,6 +177,9 @@ fn qid_from_metadata(meta: &std::fs::Metadata) -> Qid {
 }
 
 /// Build a Qid from metadata (non-Unix fallback).
+///
+/// `path = 0` by the "0 = unknown" convention (no inode available); this qid
+/// is NOT a usable identity. See `hyprstream_vfs::Stat`.
 #[cfg(not(unix))]
 fn qid_from_metadata(meta: &std::fs::Metadata) -> Qid {
     Qid {
@@ -180,7 +189,7 @@ fn qid_from_metadata(meta: &std::fs::Metadata) -> Qid {
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as u32)
             .unwrap_or(0),
-        path: 0, // No inode on non-Unix
+        path: 0, // No inode on non-Unix — "0 = unknown" per vfs::Stat convention
     }
 }
 
@@ -296,7 +305,7 @@ impl FidTable {
 /// 4. Continuation publishes clone progress via PUB/SUB
 ///
 /// The registry is wrapped in RwLock for interior mutability since some operations
-/// (like clone) require mutable access but ZmqService::handle_request takes &self.
+/// (like clone) require mutable access but RequestService::handle_request takes &self.
 pub struct RegistryService {
     // Business logic
     registry: Arc<RwLock<Git2DB>>,
@@ -305,7 +314,6 @@ pub struct RegistryService {
     /// Policy client for authorization checks (uses ZMQ to PolicyService)
     policy_client: PolicyClient,
     // Infrastructure (for Spawnable)
-    context: Arc<zmq::Context>,
     transport: TransportConfig,
     signing_key: SigningKey,
     /// 9P fid table for filesystem operations.
@@ -314,6 +322,10 @@ pub struct RegistryService {
     contained_roots: DashMap<(String, String), Arc<dyn ContainedFs>>,
     /// CRDT editing sessions for collaborative file editing.
     editing_table: Arc<EditingTable>,
+    /// Expected JWT audience for token validation (RFC 8707).
+    expected_audience: Option<String>,
+    /// JWT key source for token verification.
+    jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
 }
 
 /// Progress reporter that sends updates via a tokio mpsc channel.
@@ -334,14 +346,20 @@ impl CloneProgressReporter {
 
 impl git2db::callback_config::ProgressReporter for CloneProgressReporter {
     fn report(&self, stage: &str, current: usize, total: usize) {
-        // Use blocking_send since we're in a sync context (spawn_blocking)
-        // Log if channel is full instead of silently dropping
-        if let Err(e) = self.sender.blocking_send(hyprstream_rpc::streaming::ProgressUpdate::Progress {
+        // Use try_send to avoid deadlocking the single-threaded runtime
+        // when called from async context (e.g., LFS progress). Progress is best-effort.
+        match self.sender.try_send(hyprstream_rpc::streaming::ProgressUpdate::Progress {
             stage: stage.to_owned(),
             current,
             total,
         }) {
-            tracing::trace!("Progress channel full, dropping update: {}", e);
+            Ok(()) => {},
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                tracing::trace!("Progress channel full, dropping update");
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                tracing::trace!("Progress channel closed");
+            }
         }
     }
 }
@@ -353,7 +371,6 @@ impl RegistryService {
     pub async fn new(
         base_dir: impl AsRef<Path>,
         policy_client: PolicyClient,
-        context: Arc<zmq::Context>,
         transport: TransportConfig,
         signing_key: SigningKey,
     ) -> Result<Self> {
@@ -375,15 +392,31 @@ impl RegistryService {
             registry: worker_registry,
             base_dir,
             policy_client,
-            context,
             transport,
             signing_key,
             fid_table,
             contained_roots: DashMap::new(),
             editing_table,
+            expected_audience: None,
+            jwt_key_source: None,
         };
 
         Ok(service)
+    }
+
+    /// Set the expected JWT audience for token validation.
+    pub fn with_expected_audience(mut self, audience: String) -> Self {
+        self.expected_audience = Some(audience);
+        self
+    }
+
+    /// Set the JWT key source for token verification.
+    pub fn with_jwt_key_source(
+        mut self,
+        src: std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>,
+    ) -> Self {
+        self.jwt_key_source = Some(src);
+        self
     }
 
     /// Validate that a path is within the base directory (I5/I6 fix).
@@ -464,7 +497,7 @@ impl RegistryService {
             .with_progress(git2db::callback_config::ProgressConfig::Channel(reporter));
 
         // Execute clone and stream progress concurrently
-        let result = stream_channel.with_publisher(&stream_ctx, |mut publisher| async move {
+        let result = stream_channel.run_stream(&stream_ctx, |mut publisher| async move {
             // Spawn clone task - runs concurrently with progress streaming
             let registry_clone = Arc::clone(&registry);
 
@@ -489,31 +522,26 @@ impl RegistryService {
             // (Ignore Complete/Error from channel - we'll send our own based on clone_result)
             while let Some(update) = progress_rx.recv().await {
                 if let ProgressUpdate::Progress { stage, current, total } = update {
-                    publisher.publish_progress(&stage, current, total).await?;
+                    if let Err(e) = publisher.publish_progress(&stage, current, total).await {
+                        return (publisher, Err(e));
+                    }
                 }
             }
 
             // Wait for clone to complete and send final status
-            match clone_handle.await {
+            let result = match clone_handle.await {
                 Ok(Ok(repo)) => {
                     let metadata = serde_json::json!({
                         "repo_id": repo.id.to_string(),
                         "name": repo.name,
                         "url": repo.url,
                     });
-                    publisher.complete_ref(metadata.to_string().as_bytes()).await?;
-                    Ok(())
+                    publisher.complete_ref(metadata.to_string().as_bytes()).await
                 }
-                Ok(Err(e)) => {
-                    publisher.publish_error(&e.to_string()).await?;
-                    Err(e)
-                }
-                Err(e) => {
-                    let err = anyhow!("Clone task panicked: {}", e);
-                    publisher.publish_error(&err.to_string()).await?;
-                    Err(err)
-                }
-            }
+                Ok(Err(e)) => Err(e),  // framework sends Error frame automatically
+                Err(e) => Err(anyhow!("Clone task panicked: {}", e)),  // framework sends Error frame
+            };
+            (publisher, result)
         }).await;
 
         if let Err(e) = result {
@@ -525,16 +553,7 @@ impl RegistryService {
         }
     }
 
-    /// Check if a request is authorized (returns bool for generated handler methods).
-    async fn is_authorized(&self, ctx: &EnvelopeContext, resource: &str, operation: Operation) -> bool {
-        let subject = ctx.subject();
-        self.policy_client.check(&subject.to_string(), "*", resource, operation.as_str())
-            .await
-            .unwrap_or_else(|e| {
-                warn!("Policy check failed for {} on {}: {} - denying access", subject, resource, e);
-                false
-            })
-    }
+
 
     /// Parse a RepoId from string
     fn parse_repo_id(id_str: &str) -> Result<RepoId> {
@@ -642,44 +661,6 @@ impl RegistryService {
         Ok(())
     }
 
-    /// Handle checkout
-    async fn handle_checkout(&self, repo_id: &str, ref_name: &str) -> Result<()> {
-        let id = Self::parse_repo_id(repo_id)?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&id)?;
-        handle.branch().checkout(ref_name).await?;
-        Ok(())
-    }
-
-    /// Handle stage all
-    async fn handle_stage_all(&self, repo_id: &str) -> Result<()> {
-        let id = Self::parse_repo_id(repo_id)?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&id)?;
-        handle.staging().add_all().await?;
-        Ok(())
-    }
-
-    /// Handle commit
-    async fn handle_commit(&self, repo_id: &str, message: &str) -> Result<String> {
-        let id = Self::parse_repo_id(repo_id)?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&id)?;
-        let oid = handle.commit(message).await?;
-        Ok(oid.to_string())
-    }
-
-    /// Handle merge
-    async fn handle_merge(&self, repo_id: &str, source: &str, message: Option<&str>) -> Result<String> {
-        let id = Self::parse_repo_id(repo_id)?;
-        let source = source.to_owned();
-        let message = message.map(std::borrow::ToOwned::to_owned);
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&id)?;
-        let oid = handle.merge(&source, message.as_deref()).await?;
-        Ok(oid.to_string())
-    }
-
     /// Handle status
     async fn handle_status(&self, repo_id: &str) -> Result<git2db::RepositoryStatus> {
         let id = Self::parse_repo_id(repo_id)?;
@@ -767,10 +748,7 @@ impl RegistryService {
             .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
 
         // Create StreamChannel for DH key exchange and publishing
-        let stream_channel = StreamChannel::new(
-            Arc::clone(&self.context),
-            self.signing_key.clone(),
-        );
+        let stream_channel = StreamChannel::new(self.signing_key.clone());
 
         // 10 minutes expiry for clone operations
         let stream_ctx = stream_channel.prepare_stream(client_pub_bytes, 600).await?;
@@ -781,14 +759,15 @@ impl RegistryService {
             "Clone stream prepared (DH + pre-authorization via StreamChannel)"
         );
 
-        let stream_endpoint = endpoint_registry()
-            .endpoint("streams", SocketKind::Sub)
-            .to_zmq_string();
-
+        let broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()
+            .map(|o| o.broadcast_path(stream_ctx.topic()))
+            .unwrap_or_default();
         let stream_info = StreamInfo {
             stream_id: stream_ctx.stream_id().to_owned(),
-            endpoint: stream_endpoint,
-            server_pubkey: *stream_ctx.server_pubkey(),
+            dh_public: *stream_ctx.server_pubkey(),
+            broadcast_path,
+            announced_at: hyprstream_rpc::moq_stream::producer_reach(),
+            ..Default::default()
         };
 
         // Build continuation that executes the clone and streams progress
@@ -813,6 +792,237 @@ impl RegistryService {
         Ok((stream_info, continuation))
     }
 
+    // ========================================================================
+    // Content-addressed blob fetch (getBlob, #432)
+    // ========================================================================
+
+    /// Resolve a grantRepo identifier (at-uri / id / name / url) to a tracked
+    /// repository. Federation-portable at-uris are matched by their trailing
+    /// component against the repo name; we also accept an exact UUID, name, or
+    /// URL match so callers can use whichever they resolved.
+    async fn resolve_grant_repo(&self, grant_repo: &str) -> Option<TrackedRepository> {
+        let registry = self.registry.read().await;
+        // at-uri form: take the trailing path segment as the repo name candidate.
+        let name_candidate = grant_repo.rsplit('/').next().unwrap_or(grant_repo);
+        let found = registry
+            .list()
+            .find(|r| {
+                r.id.to_string() == grant_repo
+                    || r.url == grant_repo
+                    || r.name.as_deref() == Some(grant_repo)
+                    || r.name.as_deref() == Some(name_candidate)
+            })
+            .cloned();
+        found
+    }
+
+    /// Authorize a getBlob request. Enforces BOTH security conditions:
+    ///   (a) the authenticated caller may access `grant_repo` (Casbin query on
+    ///       `model:{name}`), AND
+    ///   (b) `grant_repo` actually contains/references the requested content
+    ///       address.
+    /// The content hash is NEVER a capability — possessing the hash grants
+    /// nothing; entitlement keys entirely on `grant_repo` access. Returns the
+    /// resolved (repo, content-address) on success; `Err` denies (no bytes).
+    ///
+    /// Returns the resolved content address string for downstream reconstruction.
+    async fn authorize_get_blob(
+        &self,
+        ctx: &EnvelopeContext,
+        data: &GetBlobRequest,
+    ) -> Result<String> {
+        // Extract the content address from the union.
+        let address = match &data.content {
+            GetBlobRequestContent::GitOid(oid) => oid.clone(),
+            GetBlobRequestContent::XetMerkle(m) => m.clone(),
+        };
+        let is_git_oid = matches!(&data.content, GetBlobRequestContent::GitOid(_));
+
+        if data.grant_repo.trim().is_empty() {
+            anyhow::bail!("getBlob denied: grantRepo is required (the hash is not a capability)");
+        }
+        if address.trim().is_empty() {
+            anyhow::bail!("getBlob denied: empty content address");
+        }
+
+        // Resolve grantRepo → tracked repo. Unknown repo = deny.
+        let repo = self
+            .resolve_grant_repo(&data.grant_repo)
+            .await
+            .ok_or_else(|| anyhow!("getBlob denied: grantRepo '{}' not found", data.grant_repo))?;
+        let repo_name = repo.name.clone().unwrap_or_default();
+        if repo_name.is_empty() {
+            anyhow::bail!("getBlob denied: grantRepo has no name for authz");
+        }
+
+        // ── Condition (a): caller may access grantRepo (registry/model scope). ──
+        // Reuse the standard Casbin query gate used elsewhere in this service.
+        RegistryHandler::authorize(self, ctx, &format!("model:{}", repo_name), "query")
+            .await
+            .map_err(|e| anyhow!("getBlob denied: {}", e))?;
+
+        // ── Condition (b): grantRepo actually contains the address. ──
+        // Prevents naming a public repo to exfiltrate private content not in it.
+        let contained = if is_git_oid {
+            self.repo_contains_git_oid(&repo.id, &address).await?
+        } else {
+            self.repo_contains_xet_merkle(&repo.id, &address).await?
+        };
+        if !contained {
+            anyhow::bail!(
+                "getBlob denied: grantRepo '{}' does not contain address '{}'",
+                data.grant_repo,
+                address
+            );
+        }
+
+        Ok(address)
+    }
+
+    /// Condition-(b) check for a git OID: the object must exist in grantRepo's
+    /// object database.
+    async fn repo_contains_git_oid(&self, repo_id: &git2db::RepoId, oid_hex: &str) -> Result<bool> {
+        let oid_hex = oid_hex.to_owned();
+        self.with_repo_blocking(repo_id, move |repo| {
+            let oid = match git2::Oid::from_str(&oid_hex) {
+                Ok(o) => o,
+                Err(_) => return Ok(false), // malformed OID → not contained
+            };
+            Ok(repo.odb().map(|odb| odb.exists(oid)).unwrap_or(false))
+        })
+        .await
+    }
+
+    // (helper `xet_pointer_references_merkle` defined at module scope below)
+
+    /// Condition-(b) check for a XET merkle root: grantRepo must reference the
+    /// merkle via a checked-in git-xet pointer whose merkle field EXACTLY equals
+    /// the requested hash. Content addresses are predictable (the CAS is global
+    /// and content-addressed), so presence in the store alone is NOT sufficient —
+    /// the grant repo must actually reference it.
+    ///
+    /// LIMITATION (tracked in #436): this verifies *reference*, not *provenance*.
+    /// Because the CAS is global and non-namespaced, a writer can reference a
+    /// merkle they did not upload. This is sound for public / same-trust-domain
+    /// content (the only XET fetch enabled today), but NOT sufficient isolation
+    /// for PRIVATE multitenant XET content — that path must stay gated until #436
+    /// (per-tenant CAS namespacing or commit-provenance verification) lands.
+    /// A real git-xet pointer is parsed and the merkle field is matched exactly
+    /// (not a loose substring of arbitrary blob text).
+    async fn repo_contains_xet_merkle(
+        &self,
+        repo_id: &git2db::RepoId,
+        merkle_hex: &str,
+    ) -> Result<bool> {
+        let merkle_hex = merkle_hex.to_owned();
+        self.with_repo_blocking(repo_id, move |repo| {
+            let head = match repo.head().ok().and_then(|h| h.peel_to_tree().ok()) {
+                Some(t) => t,
+                None => return Ok(false),
+            };
+            let mut found = false;
+            // Walk the HEAD tree; for each pointer-sized blob, parse it as a
+            // git-xet / git-lfs pointer and match the merkle/oid field EXACTLY.
+            head.walk(git2::TreeWalkMode::PreOrder, |_dir, entry| {
+                if entry.kind() == Some(git2::ObjectType::Blob) {
+                    if let Ok(obj) = entry.to_object(&repo) {
+                        if let Some(blob) = obj.as_blob() {
+                            // Pointers are small text files; bound the read.
+                            if blob.size() <= 4096 {
+                                if let Ok(text) = std::str::from_utf8(blob.content()) {
+                                    if xet_pointer_references_merkle(text, &merkle_hex) {
+                                        found = true;
+                                        return git2::TreeWalkResult::Abort;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                git2::TreeWalkResult::Ok
+            })
+            .ok();
+            Ok(found)
+        })
+        .await
+    }
+
+    /// Prepare a streaming getBlob: DH key exchange + a continuation that
+    /// reconstructs the content-addressed bytes via the shared cas-serve store
+    /// (CDC→xorbs→mdb_shard→bytes) and publishes them over the moq plane.
+    /// Mirrors `prepare_clone_stream`'s StreamInfo production path.
+    async fn prepare_get_blob_stream(
+        &self,
+        address: String,
+        client_ephemeral_pubkey: Option<&[u8]>,
+    ) -> Result<(StreamInfo, hyprstream_rpc::service::Continuation)> {
+        let client_pub_bytes = client_ephemeral_pubkey
+            .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
+
+        let stream_channel = StreamChannel::new(self.signing_key.clone());
+        // 10 minutes expiry — weights are GB-scale.
+        let stream_ctx = stream_channel.prepare_stream(client_pub_bytes, 600).await?;
+
+        debug!(
+            stream_id = %stream_ctx.stream_id(),
+            topic = %stream_ctx.topic(),
+            "getBlob stream prepared (DH + pre-authorization via StreamChannel)"
+        );
+
+        let broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()
+            .map(|o| o.broadcast_path(stream_ctx.topic()))
+            .unwrap_or_default();
+        let stream_info = StreamInfo {
+            stream_id: stream_ctx.stream_id().to_owned(),
+            dh_public: *stream_ctx.server_pubkey(),
+            broadcast_path,
+            announced_at: hyprstream_rpc::moq_stream::producer_reach(),
+            ..Default::default()
+        };
+
+        let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
+            Self::execute_get_blob_stream(stream_channel, stream_ctx, address).await;
+        });
+
+        Ok((stream_info, continuation))
+    }
+
+    /// Continuation body: reconstruct bytes and stream them. Reuses
+    /// `cas_serve::CasStore` for reconstruction (no reimplementation).
+    async fn execute_get_blob_stream(
+        stream_channel: StreamChannel,
+        stream_ctx: StreamContext,
+        address: String,
+    ) {
+        // 64 KiB publish frames — bound per-message size for GB-scale weights.
+        const CHUNK: usize = 64 * 1024;
+
+        let result = stream_channel
+            .run_stream(&stream_ctx, |mut publisher| async move {
+                let store = cas_serve::CasStore::from_env();
+                let bytes = match store.get_file_bytes(&address).await {
+                    Ok(b) => b,
+                    Err(e) => return (publisher, Err(anyhow!("getBlob reconstruction failed: {}", e))),
+                };
+                for frame in bytes.chunks(CHUNK) {
+                    if let Err(e) = publisher.publish_data(frame).await {
+                        return (publisher, Err(e));
+                    }
+                }
+                let result = publisher.complete_ref(b"").await;
+                (publisher, result)
+            })
+            .await;
+
+        if let Err(e) = result {
+            error!(
+                stream_id = %stream_ctx.stream_id(),
+                error = %e,
+                "getBlob stream failed"
+            );
+        }
+    }
+
     /// Handle list worktrees
     async fn handle_list_worktrees(&self, repo_id: &str) -> Result<Vec<crate::services::generated::registry_client::WorktreeInfo>> {
         let id = Self::parse_repo_id(repo_id)?;
@@ -820,6 +1030,7 @@ impl RegistryService {
         let handle = registry.repo(&id)?;
         let mut worktrees = handle.get_worktrees().await?;
 
+        let archetype_registry = crate::archetypes::global_registry();
         let mut result = Vec::with_capacity(worktrees.len());
         for wt in &mut worktrees {
             // Extract branch name from worktree path (last component)
@@ -837,36 +1048,58 @@ impl RegistryService {
                 .and_then(|s| s.head.map(|h| h.to_string()))
                 .unwrap_or_default();
 
+            // Detect capabilities from worktree path (server-side, same machine as files)
+            let capabilities: Vec<String> = archetype_registry
+                .detect(wt.path())
+                .to_detected_domains()
+                .capabilities
+                .to_ids()
+                .into_iter()
+                .map(std::borrow::ToOwned::to_owned)
+                .collect();
+
             result.push(crate::services::generated::registry_client::WorktreeInfo {
-                path: wt.path().to_string_lossy().to_string(),
+                path_removed: (), // field removed from schema
                 branch_name,
                 head_oid,
                 is_locked: false,
                 is_dirty,
+                capabilities,
             });
         }
         Ok(result)
     }
 
-    /// Handle create worktree
+    /// Handle create worktree (idempotent — no-op if worktree already exists)
     async fn handle_create_worktree(
         &self,
         repo_id: &str,
-        path: &str,
         branch: &str,
-    ) -> Result<PathBuf> {
-        let id = Self::parse_repo_id(repo_id)?;
-        let path = PathBuf::from(path);
-        // I6: Validate path is within base_dir
-        self.validate_path_within_base(&path)?;
-        // Validate branch name
+    ) -> Result<()> {
+        // Validate branch name (rejects .., control chars, path traversal)
         hyprstream_containedfs::validate_ref_name(branch)
             .map_err(|e| anyhow!("Invalid branch name: {}", e))?;
-        let branch = branch.to_owned();
+
+        let id = Self::parse_repo_id(repo_id)?;
         let registry = self.registry.read().await;
         let handle = registry.repo(&id)?;
-        let worktree = handle.create_worktree(&path, &branch).await?;
-        Ok(worktree.path().to_path_buf())
+
+        // Check if worktree already exists (idempotent)
+        // Use status().branch instead of file_name() to handle hierarchical
+        // branch names like "feature/my-branch" correctly.
+        let mut worktrees = handle.get_worktrees().await?;
+        for wt in &mut worktrees {
+            let wt_branch = wt.status().await
+                .ok()
+                .and_then(|s| s.branch);
+            if wt_branch.as_deref() == Some(branch) {
+                return Ok(());
+            }
+        }
+
+        // Create — empty path lets git2db derive safe worktrees/{branch} path
+        handle.create_worktree(Path::new(""), branch).await?;
+        Ok(())
     }
 
     /// Handle register operation
@@ -915,36 +1148,37 @@ impl RegistryService {
         Ok(())
     }
 
-    /// Handle remove worktree operation
-    async fn handle_remove_worktree(&self, repo_id: &str, worktree_path: &str) -> Result<()> {
+    /// Handle remove worktree operation (accepts branch name, resolves path internally)
+    async fn handle_remove_worktree(&self, repo_id: &str, branch: &str) -> Result<()> {
+        hyprstream_containedfs::validate_ref_name(branch)
+            .map_err(|e| anyhow!("Invalid branch name: {}", e))?;
         let id = Self::parse_repo_id(repo_id)?;
-        let worktree_path = PathBuf::from(worktree_path);
         let registry = self.registry.read().await;
         let handle = registry.repo(&id)?;
 
-        // Get base repo path
-        let repo_path = handle.worktree()?;
+        // Find worktree by branch name using status().branch
+        let mut worktrees = handle.get_worktrees().await?;
+        let mut found = None;
+        for wt in &mut worktrees {
+            let wt_branch = wt.status().await.ok().and_then(|s| s.branch);
+            if wt_branch.as_deref() == Some(branch) {
+                found = Some(wt.path().to_path_buf());
+                break;
+            }
+        }
+        let matched_wt = found
+            .ok_or_else(|| anyhow!("No worktree for branch '{}'", branch))?;
 
-        // Extract worktree name from path
-        let worktree_name = worktree_path
+        let worktree_name = matched_wt
             .file_name()
             .and_then(|s| s.to_str())
             .ok_or_else(|| anyhow!("Invalid worktree path"))?;
 
+        // Get base repo path
+        let repo_path = handle.worktree()?;
+
         // Use GitManager to remove worktree
         git2db::GitManager::global().remove_worktree(repo_path, worktree_name, None)?;
-        Ok(())
-    }
-
-    /// Handle stage files operation
-    async fn handle_stage_files(&self, repo_id: &str, files: Vec<String>) -> Result<()> {
-        let id = Self::parse_repo_id(repo_id)?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&id)?;
-
-        for file in files {
-            handle.staging().add(&file).await?;
-        }
         Ok(())
     }
 
@@ -1026,6 +1260,30 @@ impl RegistryService {
         tokio::task::spawn_blocking(move || {
             let repo = git2::Repository::open(&repo_path)
                 .map_err(|e| anyhow!("Failed to open repository: {}", e))?;
+            f(repo)
+        })
+        .await
+        .map_err(|e| anyhow!("Task join error: {}", e))?
+    }
+
+    /// Execute a blocking git2 operation on a specific worktree (by branch name).
+    ///
+    /// Unlike `with_repo_blocking` which guesses the worktree via `resolve_worktree_path`,
+    /// this takes an explicit branch/worktree name.
+    async fn with_worktree_blocking<F, T>(&self, id: &git2db::RepoId, branch: &str, f: F) -> Result<T>
+    where
+        F: FnOnce(git2::Repository) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let registry = self.registry.read().await;
+        let handle = registry.repo(id)?;
+        let wt = handle.get_worktree(branch).await
+            .map_err(|e| anyhow!("Worktree '{}' not found: {}", branch, e))?
+            .ok_or_else(|| anyhow!("Worktree '{}' not found", branch))?;
+        let wt_path = wt.path().to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let repo = git2::Repository::open(&wt_path)
+                .map_err(|e| anyhow!("Failed to open worktree: {}", e))?;
             f(repo)
         })
         .await
@@ -1130,73 +1388,6 @@ impl RegistryService {
     }
 
     // ========================================================================
-    // Advanced Commit Operations
-    // ========================================================================
-
-    /// Handle amend commit operation
-    async fn handle_amend_commit(&self, repo_id: &str, message: &str) -> Result<String> {
-        let id = Self::parse_repo_id(repo_id)?;
-        let message = message.to_owned();
-        self.with_repo_blocking(&id, move |repo| {
-            Ok(crate::git::ops::amend_head(&repo, &message)?.to_string())
-        }).await
-    }
-
-    /// Handle commit with author operation
-    async fn handle_commit_with_author(
-        &self,
-        repo_id: &str,
-        message: &str,
-        author_name: &str,
-        author_email: &str,
-    ) -> Result<String> {
-        let id = Self::parse_repo_id(repo_id)?;
-        let message = message.to_owned();
-        let author_name = author_name.to_owned();
-        let author_email = author_email.to_owned();
-        self.with_repo_blocking(&id, move |repo| {
-            Ok(crate::git::ops::commit_with_author(&repo, &message, &author_name, &author_email)?.to_string())
-        }).await
-    }
-
-    /// Handle stage all including untracked operation
-    async fn handle_stage_all_including_untracked(&self, repo_id: &str) -> Result<()> {
-        let id = Self::parse_repo_id(repo_id)?;
-        self.with_repo_blocking(&id, |repo| {
-            crate::git::ops::stage_all_with_untracked(&repo)
-        }).await
-    }
-
-    // ========================================================================
-    // Merge Conflict Resolution
-    // ========================================================================
-
-    /// Handle abort merge operation
-    async fn handle_abort_merge(&self, repo_id: &str) -> Result<()> {
-        let id = Self::parse_repo_id(repo_id)?;
-        self.with_repo_blocking(&id, |repo| {
-            crate::git::ops::abort_merge(&repo)
-        }).await
-    }
-
-    /// Handle continue merge operation
-    async fn handle_continue_merge(&self, repo_id: &str, message: Option<&str>) -> Result<String> {
-        let id = Self::parse_repo_id(repo_id)?;
-        let message = message.map(std::borrow::ToOwned::to_owned);
-        self.with_repo_blocking(&id, move |repo| {
-            Ok(crate::git::ops::continue_merge(&repo, message.as_deref())?.to_string())
-        }).await
-    }
-
-    /// Handle quit merge operation
-    async fn handle_quit_merge(&self, repo_id: &str) -> Result<()> {
-        let id = Self::parse_repo_id(repo_id)?;
-        self.with_repo_blocking(&id, |repo| {
-            crate::git::ops::quit_merge(&repo)
-        }).await
-    }
-
-    // ========================================================================
     // Tag Operations
     // ========================================================================
 
@@ -1281,13 +1472,8 @@ impl RegistryService {
         let worktree_path = if let Some(p) = worktree_path {
             p
         } else if worktree == "." || worktree.is_empty() {
-            let repo = handle.open_repo()
-                .map_err(|e| FsError::NotFound(e.to_string()))?;
-            repo.workdir()
-                .map(std::path::Path::to_path_buf)
-                .ok_or_else(|| FsError::NotFound(
-                    format!("worktree '{}' not found for repo '{}'", worktree, repo_id),
-                ))?
+            handle.resolve_worktree_path().await
+                .map_err(|e| FsError::NotFound(e.to_string()))?
         } else {
             return Err(FsError::NotFound(
                 format!("worktree '{}' not found for repo '{}'", worktree, repo_id),
@@ -1354,17 +1540,25 @@ impl RegistryService {
 // ============================================================================
 
 fn tracked_repo_to_data(repo: &TrackedRepository) -> crate::services::generated::registry_client::TrackedRepository {
+    tracked_repo_to_data_with_worktrees(repo, vec![])
+}
+
+fn tracked_repo_to_data_with_worktrees(
+    repo: &TrackedRepository,
+    worktrees: Vec<crate::services::generated::registry_client::WorktreeInfo>,
+) -> crate::services::generated::registry_client::TrackedRepository {
     crate::services::generated::registry_client::TrackedRepository {
         id: repo.id.to_string(),
         name: repo.name.clone().unwrap_or_default(),
         url: repo.url.clone(),
-        worktree_path: repo.worktree_path.to_string_lossy().to_string(),
+        worktree_path_removed: (), // field removed from schema
         tracking_ref: match &repo.tracking_ref {
             GitRef::Branch(b) => b.clone(),
             _ => String::new(),
         },
         current_oid: repo.current_oid.clone().unwrap_or_default(),
         registered_at: repo.registered_at,
+        worktrees,
     }
 }
 
@@ -1390,21 +1584,59 @@ fn reg_error(msg: &str) -> RegistryResponseVariant {
 #[async_trait::async_trait(?Send)]
 impl RegistryHandler for RegistryService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
-        let op = operation.parse::<Operation>()?;
-        if self.is_authorized(ctx, resource, op).await {
+        // Pass the operation string as-is to the policy check rather than
+        // round-tripping through Operation enum (which maps "query" → "query.status").
+        let subject = ctx.subject();
+        let allowed = self.policy_client.check(&PolicyCheck {
+            subject: subject.to_string(),
+            domain: "*".to_owned(),
+            resource: resource.to_owned(),
+            operation: operation.to_owned(),
+        }).await.unwrap_or_else(|e| {
+            warn!("Policy check RPC error: sub={} obj={} act={} err={} - denying access", subject, resource, operation, e);
+            false
+        });
+        if allowed {
             Ok(())
         } else {
-            anyhow::bail!("Unauthorized: {} cannot {} on {}", ctx.subject(), operation, resource)
+            anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource)
         }
     }
 
-    async fn handle_list(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<RegistryResponseVariant> {
-        match self.handle_list().await {
-            Ok(repos) => Ok(RegistryResponseVariant::ListResult(
-                repos.iter().map(tracked_repo_to_data).collect()
-            )),
-            Err(e) => Ok(reg_error(&e.to_string())),
+    async fn handle_list(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<RegistryResponseVariant> {
+        let repos = match self.handle_list().await {
+            Ok(r) => r,
+            Err(e) => return Ok(reg_error(&e.to_string())),
+        };
+
+        let subject = ctx.subject().to_string();
+        let mut result = Vec::with_capacity(repos.len());
+
+        for repo in &repos {
+            let name = repo.name.clone().unwrap_or_default();
+            if name.is_empty() { continue; }
+
+            // Policy gate: only include repos the caller has at least query access to
+            let resource = format!("model:{}", name);
+            let permitted = self.policy_client
+                .check(&PolicyCheck { subject: subject.clone(), domain: "*".to_owned(), resource: resource.clone(), operation: "query".to_owned() })
+                .await
+                .unwrap_or(true); // default allow if policy service unavailable
+            if !permitted { continue; }
+
+            // Collect worktrees with capabilities (holds registry read lock internally)
+            let worktrees = match self.handle_list_worktrees(&repo.id.to_string()).await {
+                Ok(wts) => wts,
+                Err(e) => {
+                    warn!("Failed to list worktrees for '{}': {}", name, e);
+                    vec![]
+                }
+            };
+
+            result.push(tracked_repo_to_data_with_worktrees(repo, worktrees));
         }
+
+        Ok(RegistryResponseVariant::ListResult(result))
     }
 
     async fn handle_get(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> Result<RegistryResponseVariant> {
@@ -1440,7 +1672,23 @@ impl RegistryHandler for RegistryService {
         let name_opt = if data.name.is_empty() { None } else { Some(data.name.as_str()) };
         let branch_opt = if data.branch.is_empty() { None } else { Some(data.branch.as_str()) };
         let client_ephemeral_pubkey = ctx.ephemeral_pubkey();
-        self.prepare_clone_stream(&data.url, name_opt, data.shallow, Some(data.depth), branch_opt, client_ephemeral_pubkey).await
+        self.prepare_clone_stream(&data.url, name_opt, data.shallow, Some(data.depth), branch_opt, client_ephemeral_pubkey.as_ref().map(<[u8; 32]>::as_slice)).await
+    }
+
+    async fn handle_get_blob(&self, ctx: &EnvelopeContext, _request_id: u64,
+        data: &GetBlobRequest,
+    ) -> Result<(StreamInfo, hyprstream_rpc::service::Continuation)> {
+        // SECURITY: enforce BOTH conditions (caller-may-access-grantRepo AND
+        // grantRepo-contains-address) BEFORE any bytes are served. The hash is
+        // not a capability. A denial returns Err → the request loop emits an
+        // error response (no StreamInfo, no continuation, no bytes).
+        let address = self.authorize_get_blob(ctx, data).await?;
+        let client_ephemeral_pubkey = ctx.ephemeral_pubkey();
+        self.prepare_get_blob_stream(
+            address,
+            client_ephemeral_pubkey.as_ref().map(<[u8; 32]>::as_slice),
+        )
+        .await
     }
 
     async fn handle_register(&self, _ctx: &EnvelopeContext, _request_id: u64,
@@ -1481,9 +1729,8 @@ impl RegistryHandler for RegistryService {
 impl RepoHandler for RegistryService {
     async fn handle_create_worktree(&self, _ctx: &EnvelopeContext, _request_id: u64,
         repo_id: &str, data: &CreateWorktreeRequest,
-    ) -> Result<String> {
-        let path_buf = self.handle_create_worktree(repo_id, &data.path, &data.branch_name).await?;
-        Ok(path_buf.to_string_lossy().to_string())
+    ) -> Result<()> {
+        self.handle_create_worktree(repo_id, &data.branch).await
     }
 
     async fn handle_list_worktrees(&self, _ctx: &EnvelopeContext, _request_id: u64,
@@ -1495,7 +1742,7 @@ impl RepoHandler for RegistryService {
     async fn handle_remove_worktree(&self, _ctx: &EnvelopeContext, _request_id: u64,
         repo_id: &str, data: &RemoveWorktreeRequest,
     ) -> Result<()> {
-        self.handle_remove_worktree(repo_id, &data.worktree_path).await
+        self.handle_remove_worktree(repo_id, &data.branch).await
     }
 
     async fn handle_create_branch(&self, _ctx: &EnvelopeContext, _request_id: u64,
@@ -1511,56 +1758,54 @@ impl RepoHandler for RegistryService {
         self.handle_list_branches(repo_id).await
     }
 
+    // DEPRECATED — these operations moved to WorktreeRequest scope.
+    // Kept for wire compatibility; return errors directing callers to the new API.
     async fn handle_checkout(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &CheckoutRequest,
+        _repo_id: &str, _data: &CheckoutRequest,
     ) -> Result<()> {
-        self.handle_checkout(repo_id, &data.ref_name).await
+        Err(anyhow!("checkout moved to worktree scope — use worktree(branch).checkout()"))
     }
 
     async fn handle_stage_all(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str,
+        _repo_id: &str,
     ) -> Result<()> {
-        self.handle_stage_all(repo_id).await
+        Err(anyhow!("stageAll moved to worktree scope — use worktree(branch).stageAll()"))
     }
 
     async fn handle_stage_files(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &StageFilesRequest,
+        _repo_id: &str, _data: &StageFilesRequest,
     ) -> Result<()> {
-        self.handle_stage_files(repo_id, data.files.clone()).await
+        Err(anyhow!("stageFiles moved to worktree scope — use worktree(branch).stageFiles()"))
     }
 
     async fn handle_commit(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &CommitRequest,
+        _repo_id: &str, _data: &CommitRequest,
     ) -> Result<String> {
-        self.handle_commit(repo_id, &data.message).await
+        Err(anyhow!("commit moved to worktree scope — use worktree(branch).commit()"))
     }
 
     async fn handle_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &MergeRequest,
+        _repo_id: &str, _data: &MergeRequest,
     ) -> Result<()> {
-        let msg = if data.message.is_empty() { None } else { Some(data.message.as_str()) };
-        self.handle_merge(repo_id, &data.source, msg).await?;
-        Ok(())
+        Err(anyhow!("merge moved to worktree scope — use worktree(branch).merge()"))
     }
 
     async fn handle_abort_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str,
+        _repo_id: &str,
     ) -> Result<()> {
-        self.handle_abort_merge(repo_id).await
+        Err(anyhow!("abortMerge moved to worktree scope — use worktree(branch).abortMerge()"))
     }
 
     async fn handle_continue_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &ContinueMergeRequest,
+        _repo_id: &str, _data: &ContinueMergeRequest,
     ) -> Result<()> {
-        let msg = if data.message.is_empty() { None } else { Some(data.message.as_str()) };
-        self.handle_continue_merge(repo_id, msg).await?;
-        Ok(())
+        Err(anyhow!("continueMerge moved to worktree scope — use worktree(branch).continueMerge()"))
     }
 
     async fn handle_quit_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str,
+        _repo_id: &str,
     ) -> Result<()> {
-        self.handle_quit_merge(repo_id).await
+        Err(anyhow!("quitMerge moved to worktree scope — use worktree(branch).quitMerge()"))
     }
 
     async fn handle_get_head(&self, _ctx: &EnvelopeContext, _request_id: u64,
@@ -1633,22 +1878,23 @@ impl RepoHandler for RegistryService {
         self.handle_push(repo_id, &data.remote, &data.refspec, data.force).await
     }
 
+    // DEPRECATED — moved to WorktreeRequest scope.
     async fn handle_amend_commit(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &AmendCommitRequest,
+        _repo_id: &str, _data: &AmendCommitRequest,
     ) -> Result<String> {
-        self.handle_amend_commit(repo_id, &data.message).await
+        Err(anyhow!("amendCommit moved to worktree scope — use worktree(branch).amendCommit()"))
     }
 
     async fn handle_commit_with_author(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &CommitWithAuthorRequest,
+        _repo_id: &str, _data: &CommitWithAuthorRequest,
     ) -> Result<String> {
-        self.handle_commit_with_author(repo_id, &data.message, &data.author_name, &data.author_email).await
+        Err(anyhow!("commitWithAuthor moved to worktree scope — use worktree(branch).commitWithAuthor()"))
     }
 
     async fn handle_stage_all_including_untracked(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str,
+        _repo_id: &str,
     ) -> Result<()> {
-        self.handle_stage_all_including_untracked(repo_id).await
+        Err(anyhow!("stageAllIncludingUntracked moved to worktree scope — use worktree(branch).stageAllIncludingUntracked()"))
     }
 
     async fn handle_list_tags(&self, _ctx: &EnvelopeContext, _request_id: u64,
@@ -1677,33 +1923,6 @@ impl RepoHandler for RegistryService {
         self.handle_update(repo_id, r).await
     }
 
-    async fn handle_ensure_worktree(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &EnsureWorktreeRequest,
-    ) -> Result<String> {
-        let id = Self::parse_repo_id(repo_id)?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&id)?;
-
-        // Check if a worktree for this branch already exists
-        let worktrees = handle.get_worktrees().await?;
-        for wt in &worktrees {
-            let wt_branch = wt
-                .path()
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default();
-            if wt_branch == data.branch {
-                return Ok(wt.path().to_string_lossy().to_string());
-            }
-        }
-
-        // Not found — create it
-        let worktree = handle.create_worktree(
-            &PathBuf::from(&data.branch),
-            &data.branch,
-        ).await?;
-        Ok(worktree.path().to_string_lossy().to_string())
-    }
 }
 
 // ============================================================================
@@ -1737,28 +1956,6 @@ impl RegistryService {
         Ok(content)
     }
 
-    /// Convert generated DocFormatEnum to our editing DocFormat.
-    fn to_doc_format(fmt: DocFormatEnum) -> DocFormat {
-        match fmt {
-            DocFormatEnum::Toml => DocFormat::Toml,
-            DocFormatEnum::Json => DocFormat::Json,
-            DocFormatEnum::Yaml => DocFormat::Yaml,
-            DocFormatEnum::Csv => DocFormat::Csv,
-            DocFormatEnum::Text => DocFormat::Text,
-        }
-    }
-
-    /// Convert editing DocFormat to generated DocFormatEnum.
-    #[allow(dead_code)]
-    fn from_doc_format(fmt: DocFormat) -> DocFormatEnum {
-        match fmt {
-            DocFormat::Toml => DocFormatEnum::Toml,
-            DocFormat::Json => DocFormatEnum::Json,
-            DocFormat::Yaml => DocFormatEnum::Yaml,
-            DocFormat::Csv => DocFormatEnum::Csv,
-            DocFormat::Text => DocFormatEnum::Text,
-        }
-    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -1771,12 +1968,10 @@ impl CtlHandler for RegistryService {
         let rel_path = self.fid_rel_path(fid, &subject)?;
 
         let id = Self::parse_repo_id(repo_id)?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&id)?;
-        let repo = handle.open_repo()?;
-
-        let status = repo.status_file(std::path::Path::new(&rel_path))?;
-        let state = format!("{:?}", status);
+        let state = self.with_repo_blocking(&id, move |repo| {
+            let status = repo.status_file(std::path::Path::new(&rel_path))?;
+            Ok(format!("{:?}", status))
+        }).await?;
         Ok(FileStatus { state })
     }
 
@@ -1788,58 +1983,54 @@ impl CtlHandler for RegistryService {
         let rel_path = self.fid_rel_path(fid, &subject)?;
 
         let id = Self::parse_repo_id(repo_id)?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&id)?;
-        let repo = handle.open_repo()?;
-
+        let ref_name = data.ref_name.clone();
         let max_count = if data.max_count == 0 { 20 } else { data.max_count as usize };
 
-        // Set up revwalk
-        let mut revwalk = repo.revwalk()?;
-        if data.ref_name.is_empty() {
-            revwalk.push_head()?;
-        } else {
-            let obj = repo.revparse_single(&data.ref_name)?;
-            revwalk.push(obj.id())?;
-        }
-        revwalk.set_sorting(git2::Sort::TIME)?;
-
-        let mut entries = Vec::new();
-        for oid_result in revwalk {
-            if entries.len() >= max_count {
-                break;
-            }
-            let oid = oid_result?;
-            let commit = repo.find_commit(oid)?;
-
-            // Check if this commit touches our file
-            let dominated = if commit.parent_count() == 0 {
-                // Initial commit — check if tree contains the file
-                commit.tree()?.get_path(std::path::Path::new(&rel_path)).is_ok()
+        self.with_repo_blocking(&id, move |repo| {
+            let mut revwalk = repo.revwalk()?;
+            if ref_name.is_empty() {
+                revwalk.push_head()?;
             } else {
-                let parent = commit.parent(0)?;
-                let diff = repo.diff_tree_to_tree(
-                    Some(&parent.tree()?),
-                    Some(&commit.tree()?),
-                    None,
-                )?;
-                diff.deltas().any(|d| {
-                    d.new_file().path().is_some_and(|p| p == std::path::Path::new(&rel_path))
-                    || d.old_file().path().is_some_and(|p| p == std::path::Path::new(&rel_path))
-                })
-            };
-
-            if dominated {
-                let author = commit.author();
-                entries.push(LogEntry {
-                    oid: oid.to_string(),
-                    message: commit.message().unwrap_or("").to_owned(),
-                    author: author.name().unwrap_or("").to_owned(),
-                    timestamp: commit.time().seconds() as u64,
-                });
+                let obj = repo.revparse_single(&ref_name)?;
+                revwalk.push(obj.id())?;
             }
-        }
-        Ok(entries)
+            revwalk.set_sorting(git2::Sort::TIME)?;
+
+            let mut entries = Vec::new();
+            for oid_result in revwalk {
+                if entries.len() >= max_count {
+                    break;
+                }
+                let oid = oid_result?;
+                let commit = repo.find_commit(oid)?;
+
+                let dominated = if commit.parent_count() == 0 {
+                    commit.tree()?.get_path(std::path::Path::new(&rel_path)).is_ok()
+                } else {
+                    let parent = commit.parent(0)?;
+                    let diff = repo.diff_tree_to_tree(
+                        Some(&parent.tree()?),
+                        Some(&commit.tree()?),
+                        None,
+                    )?;
+                    diff.deltas().any(|d| {
+                        d.new_file().path().is_some_and(|p| p == std::path::Path::new(&rel_path))
+                        || d.old_file().path().is_some_and(|p| p == std::path::Path::new(&rel_path))
+                    })
+                };
+
+                if dominated {
+                    let author = commit.author();
+                    entries.push(LogEntry {
+                        oid: oid.to_string(),
+                        message: commit.message().unwrap_or("").to_owned(),
+                        author: author.name().unwrap_or("").to_owned(),
+                        timestamp: commit.time().seconds() as u64,
+                    });
+                }
+            }
+            Ok(entries)
+        }).await
     }
 
     /// Diff this file against a ref.
@@ -1850,36 +2041,35 @@ impl CtlHandler for RegistryService {
         let rel_path = self.fid_rel_path(fid, &subject)?;
 
         let id = Self::parse_repo_id(repo_id)?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&id)?;
-        let repo = handle.open_repo()?;
+        let ref_name = if data.ref_name.is_empty() { "HEAD".to_owned() } else { data.ref_name.clone() };
 
-        let ref_name = if data.ref_name.is_empty() { "HEAD" } else { &data.ref_name };
-        let obj = repo.revparse_single(ref_name)?;
-        let commit = obj.peel_to_commit()?;
-        let tree = commit.tree()?;
+        self.with_repo_blocking(&id, move |repo| {
+            let obj = repo.revparse_single(&ref_name)?;
+            let commit = obj.peel_to_commit()?;
+            let tree = commit.tree()?;
 
-        let mut diff_opts = git2::DiffOptions::new();
-        diff_opts.pathspec(&rel_path);
+            let mut diff_opts = git2::DiffOptions::new();
+            diff_opts.pathspec(&rel_path);
 
-        let diff = repo.diff_tree_to_workdir_with_index(
-            Some(&tree),
-            Some(&mut diff_opts),
-        )?;
+            let diff = repo.diff_tree_to_workdir_with_index(
+                Some(&tree),
+                Some(&mut diff_opts),
+            )?;
 
-        let mut output = String::new();
-        diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
-            let origin = line.origin();
-            if origin == '+' || origin == '-' || origin == ' ' {
-                output.push(origin);
-            }
-            if let Ok(s) = std::str::from_utf8(line.content()) {
-                output.push_str(s);
-            }
-            true
-        })?;
+            let mut output = String::new();
+            diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
+                let origin = line.origin();
+                if origin == '+' || origin == '-' || origin == ' ' {
+                    output.push(origin);
+                }
+                if let Ok(s) = std::str::from_utf8(line.content()) {
+                    output.push_str(s);
+                }
+                true
+            })?;
 
-        Ok(output)
+            Ok(output)
+        }).await
     }
 
     /// Git blame for this file.
@@ -1890,26 +2080,25 @@ impl CtlHandler for RegistryService {
         let rel_path = self.fid_rel_path(fid, &subject)?;
 
         let id = Self::parse_repo_id(repo_id)?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&id)?;
-        let repo = handle.open_repo()?;
 
-        let blame = repo.blame_file(std::path::Path::new(&rel_path), None)?;
+        self.with_repo_blocking(&id, move |repo| {
+            let blame = repo.blame_file(std::path::Path::new(&rel_path), None)?;
 
-        let mut output = String::new();
-        for i in 0..blame.len() {
-            if let Some(hunk) = blame.get_index(i) {
-                let sig = hunk.final_signature();
-                let name = sig.name().unwrap_or("?");
-                let oid = hunk.final_commit_id();
-                let line_start = hunk.final_start_line();
-                let line_count = hunk.lines_in_hunk();
-                use std::fmt::Write;
-                writeln!(output, "{:.8} ({} L{}-{}) ",
-                    oid, name, line_start, line_start + line_count - 1)?;
+            let mut output = String::new();
+            for i in 0..blame.len() {
+                if let Some(hunk) = blame.get_index(i) {
+                    let sig = hunk.final_signature();
+                    let name = sig.name().unwrap_or("?");
+                    let oid = hunk.final_commit_id();
+                    let line_start = hunk.final_start_line();
+                    let line_count = hunk.lines_in_hunk();
+                    use std::fmt::Write;
+                    writeln!(output, "{:.8} ({} L{}-{}) ",
+                        oid, name, line_start, line_start + line_count - 1)?;
+                }
             }
-        }
-        Ok(output)
+            Ok(output)
+        }).await
     }
 
     /// Restore file content from a ref.
@@ -1920,24 +2109,25 @@ impl CtlHandler for RegistryService {
         let rel_path = self.fid_rel_path(fid, &subject)?;
 
         let id = Self::parse_repo_id(repo_id)?;
-        let registry = self.registry.read().await;
-        let handle = registry.repo(&id)?;
-        let repo = handle.open_repo()?;
+        let ref_name = if data.ref_name.is_empty() { "HEAD".to_owned() } else { data.ref_name.clone() };
+        let rel_path_clone = rel_path.clone();
 
-        let ref_name = if data.ref_name.is_empty() { "HEAD" } else { &data.ref_name };
-        let obj = repo.revparse_single(ref_name)?;
-        let commit = obj.peel_to_commit()?;
-        let tree = commit.tree()?;
-        let entry = tree.get_path(std::path::Path::new(&rel_path))?;
-        let blob = repo.find_blob(entry.id())?;
+        let blob_content = self.with_repo_blocking(&id, move |repo| {
+            let obj = repo.revparse_single(&ref_name)?;
+            let commit = obj.peel_to_commit()?;
+            let tree = commit.tree()?;
+            let entry = tree.get_path(std::path::Path::new(&rel_path_clone))?;
+            let blob = repo.find_blob(entry.id())?;
+            Ok(blob.content().to_vec())
+        }).await?;
 
-        // Write blob content to the worktree file
+        // Write blob content to the worktree file (no registry lock held)
         let root = self.get_contained_root(repo_id, name).await
             .map_err(|e| anyhow!("{}", e))?;
         let mut file = root.open(&rel_path, hyprstream_containedfs::OpenMode::OWRITE | hyprstream_containedfs::OpenMode::OTRUNC)
             .map_err(|e| anyhow!("{}", e))?;
         use std::io::Write as _;
-        file.write_all(blob.content())?;
+        file.write_all(&blob_content)?;
         file.flush()?;
 
         Ok(())
@@ -2008,11 +2198,11 @@ impl CtlHandler for RegistryService {
             .and_then(|s| s.to_str())
             .unwrap_or("");
         let format = match ext {
-            "toml" => DocFormatEnum::Toml,
-            "json" => DocFormatEnum::Json,
-            "yaml" | "yml" => DocFormatEnum::Yaml,
-            "csv" => DocFormatEnum::Csv,
-            _ => DocFormatEnum::Text,
+            "toml" => DocFormat::Toml,
+            "json" => DocFormat::Json,
+            "yaml" | "yml" => DocFormat::Yaml,
+            "csv" => DocFormat::Csv,
+            _ => DocFormat::Text,
         };
 
         let editing = self.editing_table.fid_has_session(&subject, fid);
@@ -2042,7 +2232,7 @@ impl CtlHandler for RegistryService {
         let subject = ctx.subject().to_string();
         let rel_path = self.fid_rel_path(fid, &subject)?;
         let content = self.read_fid_content(repo_id, name, fid, &subject).await?;
-        let format = Self::to_doc_format(data.format);
+        let format = data.format;
 
         self.editing_table.open(
             &subject, fid, repo_id, name, &rel_path, format, &content,
@@ -2169,6 +2359,23 @@ impl WorktreeHandler for RegistryService {
         let root = self.get_contained_root(repo_id, name).await
             .map_err(|e| anyhow!("{}", e))?;
 
+        // Validate each wname is a single safe path component (defense-in-depth;
+        // pathrs also enforces containment at the kernel level via openat2).
+        for wname in &data.wnames {
+            if wname.is_empty() {
+                anyhow::bail!("wname must not be empty");
+            }
+            if wname == ".." {
+                anyhow::bail!("path traversal via '..' rejected");
+            }
+            if wname.contains('/') {
+                anyhow::bail!("wname {:?} contains slash (must be a single component)", wname);
+            }
+            if wname.as_bytes().contains(&0) {
+                anyhow::bail!("wname contains NUL byte");
+            }
+        }
+
         // Join wnames into a path (empty wnames = root)
         let path = if data.wnames.is_empty() {
             ".".to_owned()
@@ -2185,6 +2392,10 @@ impl WorktreeHandler for RegistryService {
         let subject = ctx.subject().to_string();
         // Use client-specified newfid, or auto-allocate
         let fid = if data.newfid > 0 {
+            // Reject if the fid is already in use (prevents overwriting another client's fid)
+            if self.fid_table.fids.contains_key(&data.newfid) {
+                anyhow::bail!("fid {} is already in use", data.newfid);
+            }
             data.newfid
         } else {
             self.fid_table.alloc_fid(&subject)
@@ -2237,6 +2448,9 @@ impl WorktreeHandler for RegistryService {
             }
         };
 
+        // Extract rel_path before consuming the walk_handle
+        let rel_path = walk_handle.rel_path().to_owned();
+
         let write = (data.mode & OWRITE) != 0 || (data.mode & ORDWR) != 0;
         let file = walk_handle.open_file(write)
             .map_err(|e| anyhow!("{}", e))?;
@@ -2255,6 +2469,7 @@ impl WorktreeHandler for RegistryService {
                 qid: qid.clone(),
                 iounit,
                 mode: data.mode,
+                rel_path,
             },
             owner_identity: subject,
             last_accessed: AtomicU64::new(now_epoch_secs()),
@@ -2271,6 +2486,20 @@ impl WorktreeHandler for RegistryService {
         repo_id: &str, name: &str, data: &NpCreate,
     ) -> Result<ROpen> {
         let subject = ctx.subject().to_string();
+
+        // Validate the name is a single safe path component (defense-in-depth)
+        if data.name.is_empty() {
+            anyhow::bail!("create name must not be empty");
+        }
+        if data.name == "." || data.name == ".." {
+            anyhow::bail!("create name {:?} is not a valid file name", data.name);
+        }
+        if data.name.contains('/') {
+            anyhow::bail!("create name {:?} must be a single component (no slashes)", data.name);
+        }
+        if data.name.as_bytes().contains(&0) {
+            anyhow::bail!("create name contains NUL byte");
+        }
 
         // Take the fid to get ownership of the WalkHandle (directory we're creating in)
         let entry = self.fid_table.take(data.fid)
@@ -2352,6 +2581,7 @@ impl WorktreeHandler for RegistryService {
                     qid: qid.clone(),
                     iounit,
                     mode,
+                    rel_path: child_path,
                 },
                 owner_identity: subject,
                 last_accessed: AtomicU64::new(now_epoch_secs()),
@@ -2366,23 +2596,55 @@ impl WorktreeHandler for RegistryService {
 
     /// Read: offset+count read, bounded by iounit. This is THE fix for the
     /// readFile bug — no unbounded allocation possible.
+    /// For directories, returns entries in wire format: name_len(u32le) + name(utf8) + is_dir(u8) + size(u64le).
     async fn handle_read(&self, ctx: &EnvelopeContext, _request_id: u64,
-        _repo_id: &str, _name: &str, data: &NpRead,
+        repo_id: &str, name: &str, data: &NpRead,
     ) -> Result<RRead> {
         let subject = ctx.subject().to_string();
         let entry = self.fid_table.get_verified(data.fid, &subject)
             .map_err(|e| anyhow!("{}", e))?;
 
         match &entry.state {
-            FidState::Opened { file, iounit, .. } => {
-                // Clamp count to iounit — structurally prevents unbounded reads
-                let count = std::cmp::min(data.count, *iounit) as usize;
-                let mut buf = vec![0u8; count];
-                let mut f = file.lock();
-                f.seek(SeekFrom::Start(data.offset))?;
-                let n = f.read(&mut buf)?;
-                buf.truncate(n);
-                Ok(RRead { data: buf })
+            FidState::Opened { file, qid, iounit, rel_path, .. } => {
+                if qid.qtype & QTDIR != 0 {
+                    // Directory read: encode entries as wire format
+                    let root = self.get_contained_root(repo_id, name).await
+                        .map_err(|e| anyhow!("{}", e))?;
+                    let entries = root.readdir(rel_path)
+                        .map_err(|e| anyhow!("{}", e))?;
+
+                    // Serialize all entries into wire format:
+                    // name_len(u32le) + name(utf8) + is_dir(u8) + size(u64le)
+                    //
+                    // Directory listings are served only at offset=0 to prevent
+                    // mid-record splits. The client reads in a loop and stops
+                    // on empty response, so returning empty for offset>0 signals EOF.
+                    if data.offset != 0 {
+                        return Ok(RRead { data: vec![] });
+                    }
+
+                    let mut wire = Vec::new();
+                    for entry in &entries {
+                        let name_bytes = entry.name.as_bytes();
+                        wire.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+                        wire.extend_from_slice(name_bytes);
+                        wire.push(if entry.is_dir { 1 } else { 0 });
+                        wire.extend_from_slice(&entry.size.to_le_bytes());
+                    }
+
+                    let count = std::cmp::min(data.count, *iounit) as usize;
+                    let end = std::cmp::min(count, wire.len());
+                    Ok(RRead { data: wire[..end].to_vec() })
+                } else {
+                    // Regular file read
+                    let count = std::cmp::min(data.count, *iounit) as usize;
+                    let mut buf = vec![0u8; count];
+                    let mut f = file.lock();
+                    f.seek(SeekFrom::Start(data.offset))?;
+                    let n = f.read(&mut buf)?;
+                    buf.truncate(n);
+                    Ok(RRead { data: buf })
+                }
             }
             _ => anyhow::bail!("fid {} is not opened for I/O", data.fid),
         }
@@ -2511,10 +2773,144 @@ impl WorktreeHandler for RegistryService {
         // No-op for synchronous operations
         Ok(())
     }
+
+    // ========================================================================
+    // Worktree-scoped git operations (moved from RepositoryRequest)
+    // ========================================================================
+
+    /// Stage all tracked modified files in this worktree (git add -u).
+    async fn handle_stage_all(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str,
+    ) -> Result<()> {
+        let id = Self::parse_repo_id(repo_id)?;
+        self.with_worktree_blocking(&id, name, |repo| {
+            crate::git::ops::stage_all(&repo)
+        }).await
+    }
+
+    /// Stage specific files in this worktree.
+    async fn handle_stage_files(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, data: &StageFilesRequest,
+    ) -> Result<()> {
+        let id = Self::parse_repo_id(repo_id)?;
+        let files = data.files.clone();
+        self.with_worktree_blocking(&id, name, move |repo| {
+            let file_refs: Vec<&str> = files.iter().map(std::string::String::as_str).collect();
+            crate::git::ops::stage_files(&repo, &file_refs)
+        }).await
+    }
+
+    /// Stage all files including untracked in this worktree (git add -A).
+    async fn handle_stage_all_including_untracked(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str,
+    ) -> Result<()> {
+        let id = Self::parse_repo_id(repo_id)?;
+        self.with_worktree_blocking(&id, name, |repo| {
+            crate::git::ops::stage_all_with_untracked(&repo)
+        }).await
+    }
+
+    /// Commit staged changes in this worktree.
+    async fn handle_commit(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, data: &CommitRequest,
+    ) -> Result<String> {
+        let id = Self::parse_repo_id(repo_id)?;
+        let message = data.message.clone();
+        let author = data.author.clone();
+        let email = data.email.clone();
+        self.with_worktree_blocking(&id, name, move |repo| {
+            let oid = if !author.is_empty() && !email.is_empty() {
+                crate::git::ops::commit_with_author(&repo, &message, &author, &email)?
+            } else {
+                crate::git::ops::commit_index(&repo, &message)?
+            };
+            Ok(oid.to_string())
+        }).await
+    }
+
+    /// Commit staged changes with specified author.
+    async fn handle_commit_with_author(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, data: &CommitWithAuthorRequest,
+    ) -> Result<String> {
+        let id = Self::parse_repo_id(repo_id)?;
+        let message = data.message.clone();
+        let author_name = data.author_name.clone();
+        let author_email = data.author_email.clone();
+        self.with_worktree_blocking(&id, name, move |repo| {
+            Ok(crate::git::ops::commit_with_author(&repo, &message, &author_name, &author_email)?.to_string())
+        }).await
+    }
+
+    /// Amend the last commit in this worktree.
+    async fn handle_amend_commit(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, data: &AmendCommitRequest,
+    ) -> Result<String> {
+        let id = Self::parse_repo_id(repo_id)?;
+        let message = data.message.clone();
+        self.with_worktree_blocking(&id, name, move |repo| {
+            Ok(crate::git::ops::amend_head(&repo, &message)?.to_string())
+        }).await
+    }
+
+    /// Checkout a ref in this worktree.
+    async fn handle_checkout(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, data: &CheckoutRequest,
+    ) -> Result<()> {
+        let id = Self::parse_repo_id(repo_id)?;
+        let ref_name = data.ref_name.clone();
+        self.with_worktree_blocking(&id, name, move |repo| {
+            crate::git::ops::ensure_branch(&repo, &ref_name)
+        }).await
+    }
+
+    /// Merge a branch into this worktree.
+    async fn handle_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, data: &MergeRequest,
+    ) -> Result<()> {
+        let id = Self::parse_repo_id(repo_id)?;
+        let source = data.source.clone();
+        let message = if data.message.is_empty() { None } else { Some(data.message.clone()) };
+        self.with_worktree_blocking(&id, name, move |repo| {
+            crate::git::ops::merge(&repo, &source, message.as_deref())?;
+            Ok(())
+        }).await
+    }
+
+    /// Abort an in-progress merge in this worktree.
+    async fn handle_abort_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str,
+    ) -> Result<()> {
+        let id = Self::parse_repo_id(repo_id)?;
+        self.with_worktree_blocking(&id, name, |repo| {
+            crate::git::ops::abort_merge(&repo)
+        }).await
+    }
+
+    /// Continue a merge after resolving conflicts.
+    async fn handle_continue_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str, data: &ContinueMergeRequest,
+    ) -> Result<()> {
+        let id = Self::parse_repo_id(repo_id)?;
+        let message = if data.message.is_empty() { None } else { Some(data.message.clone()) };
+        self.with_worktree_blocking(&id, name, move |repo| {
+            crate::git::ops::continue_merge(&repo, message.as_deref())?;
+            Ok(())
+        }).await
+    }
+
+    /// Exit merge state without committing.
+    async fn handle_quit_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        repo_id: &str, name: &str,
+    ) -> Result<()> {
+        let id = Self::parse_repo_id(repo_id)?;
+        self.with_worktree_blocking(&id, name, |repo| {
+            crate::git::ops::quit_merge(&repo)
+        }).await
+    }
 }
 
 #[async_trait(?Send)]
-impl ZmqService for RegistryService {
+impl RequestService for RegistryService {
     async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
         dispatch_registry(self, ctx, payload).await
     }
@@ -2523,16 +2919,20 @@ impl ZmqService for RegistryService {
         "registry"
     }
 
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
-    }
-
     fn transport(&self) -> &TransportConfig {
         &self.transport
     }
 
     fn signing_key(&self) -> SigningKey {
         self.signing_key.clone()
+    }
+
+    fn expected_audience(&self) -> Option<&str> {
+        self.expected_audience.as_deref()
+    }
+
+    fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>> {
+        self.jwt_key_source.clone()
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
@@ -2554,7 +2954,7 @@ use hyprstream_metrics::checkpoint::manager::{
 };
 
 #[async_trait]
-impl MetricsRegistryClient for GenRegistryClient {
+impl MetricsRegistryClient for RegistryClient {
     async fn get_by_name(
         &self,
         name: &str,
@@ -2563,7 +2963,7 @@ impl MetricsRegistryClient for GenRegistryClient {
             .await
             .map_err(|e| MetricsRegistryError::Operation(e.to_string()))?;
         Ok(Some(variant_to_tracked_repository(
-            &r.id, &r.name, &r.url, &r.worktree_path, &r.tracking_ref, &r.current_oid, r.registered_at,
+            &r.id, &r.name, &r.url, "", &r.tracking_ref, &r.current_oid, r.registered_at,
         ).map_err(|e| MetricsRegistryError::Operation(e.to_string()))?))
     }
 
@@ -2576,7 +2976,11 @@ impl MetricsRegistryClient for GenRegistryClient {
         let path_str = path
             .to_str()
             .ok_or_else(|| MetricsRegistryError::Operation("Invalid path encoding".to_owned()))?;
-        self.register(path_str, name.unwrap_or(""), "")
+        self.register(&RegisterRequest {
+            path: path_str.to_owned(),
+            name: name.unwrap_or("").to_owned(),
+            tracking_ref: String::new(),
+        })
             .await
             .map(|_| ())
             .map_err(|e| MetricsRegistryError::Operation(e.to_string()))
@@ -2589,22 +2993,130 @@ impl MetricsRegistryClient for GenRegistryClient {
 
 
 
+/// Parse a git-xet / git-lfs pointer file and report whether its content-hash
+/// field EXACTLY equals `merkle_hex`. This is an exact field match, not a loose
+/// substring scan — an arbitrary text blob that merely contains the hex string
+/// (e.g. in a comment or unrelated field) does NOT count as a reference.
+///
+/// Recognized forms (one key=value / `key value` per line):
+///   - git-lfs:  `oid sha256:<hex>`
+///   - git-xet:  `xet://<hex>` or `merkle: <hex>` / `merklehash = <hex>`
+///
+/// Matching is case-insensitive on the hex.
+fn xet_pointer_references_merkle(text: &str, merkle_hex: &str) -> bool {
+    let want = merkle_hex.trim().to_ascii_lowercase();
+    if want.is_empty() {
+        return false;
+    }
+    // Only treat blobs that look like a pointer file (have a version/oid/xet
+    // marker) as candidates — avoids matching arbitrary checked-in text.
+    let looks_like_pointer = text.lines().any(|l| {
+        let l = l.trim_start();
+        l.starts_with("version https://git-lfs")
+            || l.starts_with("version https://xet")
+            || l.starts_with("# xet")
+            || l.starts_with("xet://")
+    });
+    if !looks_like_pointer {
+        return false;
+    }
+    for line in text.lines() {
+        let line = line.trim();
+        // Extract the candidate hash token from known field shapes.
+        let candidate = if let Some(rest) = line.strip_prefix("oid sha256:") {
+            Some(rest.trim())
+        } else if let Some(rest) = line.strip_prefix("xet://") {
+            Some(rest.trim())
+        } else if let Some(rest) = line.strip_prefix("merkle:") {
+            Some(rest.trim())
+        } else {
+            // `merklehash = <hex>` or `merklehash <hex>`
+            line.strip_prefix("merklehash")
+                .map(|rest| rest.trim_start_matches([' ', '=', '\t']).trim())
+        };
+        if let Some(c) = candidate {
+            if c.to_ascii_lowercase() == want {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::print_stdout)]
+mod xet_pointer_tests {
+    use super::xet_pointer_references_merkle;
+
+    const HEX: &str = "abc123def456abc123def456abc123def456abc123def456abc123def456abcd";
+
+    #[test]
+    fn matches_lfs_pointer_exact_oid() {
+        let ptr = format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{HEX}\nsize 1234\n"
+        );
+        assert!(xet_pointer_references_merkle(&ptr, HEX));
+    }
+
+    #[test]
+    fn matches_xet_pointer_scheme() {
+        let ptr = format!("version https://xet.example/v1\nxet://{HEX}\n");
+        assert!(xet_pointer_references_merkle(&ptr, HEX));
+    }
+
+    #[test]
+    fn rejects_non_pointer_text_containing_hex() {
+        // An arbitrary checked-in file that merely contains the hex string is
+        // NOT a reference — this is the sub-gap the old substring scan allowed.
+        let doc = format!("# notes\nsome unrelated text mentioning {HEX} in passing\n");
+        assert!(!xet_pointer_references_merkle(&doc, HEX));
+    }
+
+    #[test]
+    fn rejects_pointer_with_different_oid() {
+        let other = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let ptr = format!("version https://git-lfs.github.com/spec/v1\noid sha256:{other}\n");
+        assert!(!xet_pointer_references_merkle(&ptr, HEX));
+    }
+
+    #[test]
+    fn rejects_empty_merkle() {
+        let ptr = format!("version https://git-lfs.github.com/spec/v1\noid sha256:{HEX}\n");
+        assert!(!xet_pointer_references_merkle(&ptr, ""));
+    }
+}
+
+#[cfg(test)]
+// Test-only: panics-on-error and ergonomic literals are acceptable in fixtures.
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::str_to_string,
+    clippy::needless_borrow,
+    clippy::mem_forget
+)]
 mod tests {
     use super::*;
     use crate::auth::PolicyManager;
     use crate::services::{PolicyService, PolicyClient};
     use hyprstream_rpc::crypto::generate_signing_keypair;
+    use hyprstream_service::ServiceManager;
     use tempfile::TempDir;
 
     #[tokio::test]
     async fn test_registry_service_health_check() {
-        use hyprstream_rpc::service::InprocManager;
+        use hyprstream_service::InprocManager;
         use hyprstream_rpc::transport::TransportConfig;
 
+        // Tests use Classical (EdDSA-only) keys — install Classical verify
+        // policy so the global fail-closed Hybrid default doesn't reject them.
+        let _ = hyprstream_rpc::envelope::install_verify_config(
+            hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+                policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
+                pq_store: None,
+            },
+        );
+
         let temp_dir = TempDir::new().expect("test: create temp dir");
-        let context = crate::zmq::global_context();
 
         // Generate keypair for signing/verification
         let (signing_key, _verifying_key) = generate_signing_keypair();
@@ -2620,41 +3132,139 @@ mod tests {
             Arc::new(signing_key.clone()),
             crate::config::TokenConfig::default(),
             git2db,
-            context.clone(),
             policy_transport,
         );
         let manager = InprocManager::new();
         let _policy_handle = manager.spawn(Box::new(policy_service)).await.expect("test: start policy service");
 
         // Create policy client for RegistryService
-        let policy_client: PolicyClient = crate::services::core::create_service_client(
+        let policy_client: PolicyClient = PolicyClient::for_endpoint(
             "inproc://test-policy-health",
             signing_key.clone(),
-            RequestIdentity::local(),
-        );
+            signing_key.verifying_key(),
+            None,
+        ).expect("test: create policy client");
 
         // Start the registry service with policy client
         let registry_transport = TransportConfig::inproc("test-registry-health");
         let registry_service = RegistryService::new(
             temp_dir.path(),
             policy_client,
-            context.clone(),
             registry_transport,
             signing_key.clone(),
         ).await.expect("test: create registry service");
         let mut handle = manager.spawn(Box::new(registry_service)).await.expect("test: start registry service");
 
         // Create signed client with matching key and local identity
-        let client: GenRegistryClient = crate::services::core::create_service_client(
+        let client: RegistryClient = RegistryClient::for_endpoint(
             "inproc://test-registry-health",
-            signing_key,
-            RequestIdentity::local(),
-        );
+            signing_key.clone(),
+            signing_key.verifying_key(),
+            None,
+        ).expect("test: create registry client");
         // health_check returns () on success
         let result = client.health_check().await;
         assert!(result.is_ok(), "health_check should succeed: {:?}", result.err());
 
         // Stop the service
+        let _ = handle.stop().await;
+    }
+
+    // ── #432 getBlob authz: the hash is NOT a capability ──────────────────────
+    // These deny-path tests are the load-bearing security checks: a caller that
+    // presents a valid-looking content address but no legitimate grant must be
+    // refused, because XET global-dedup makes content hashes predictable for any
+    // public-derived content. Both conditions (grantRepo access AND grantRepo
+    // contains the address) gate the bytes; here we exercise the cheap denials
+    // (empty / unknown grantRepo) that need no content setup.
+    async fn spawn_registry_for_authz_test(
+        temp_dir: &TempDir,
+        suffix: &str,
+    ) -> (RegistryClient, hyprstream_service::InprocManager, hyprstream_service::SpawnedService) {
+        use hyprstream_service::InprocManager;
+        use hyprstream_rpc::transport::TransportConfig;
+
+        let _ = hyprstream_rpc::envelope::install_verify_config(
+            hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+                policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
+                pq_store: None,
+            },
+        );
+        let (signing_key, _vk) = generate_signing_keypair();
+        let policy_manager = Arc::new(PolicyManager::permissive().await.expect("test: policy manager"));
+        let policy_transport = TransportConfig::inproc(format!("test-policy-{suffix}"));
+        let git2db = Arc::new(tokio::sync::RwLock::new(
+            git2db::Git2DB::open(temp_dir.path()).await.expect("test: open git2db"),
+        ));
+        let policy_service = PolicyService::new(
+            policy_manager,
+            Arc::new(signing_key.clone()),
+            crate::config::TokenConfig::default(),
+            git2db,
+            policy_transport,
+        );
+        let manager = InprocManager::new();
+        let _policy_handle = manager.spawn(Box::new(policy_service)).await.expect("test: start policy");
+        let policy_client: PolicyClient = PolicyClient::for_endpoint(
+            &format!("inproc://test-policy-{suffix}"),
+            signing_key.clone(),
+            signing_key.verifying_key(),
+            None,
+        ).expect("test: policy client");
+        let registry_transport = TransportConfig::inproc(format!("test-registry-{suffix}"));
+        let registry_service = RegistryService::new(
+            temp_dir.path(),
+            policy_client,
+            registry_transport,
+            signing_key.clone(),
+        ).await.expect("test: create registry service");
+        let handle = manager.spawn(Box::new(registry_service)).await.expect("test: start registry");
+        let client: RegistryClient = RegistryClient::for_endpoint(
+            &format!("inproc://test-registry-{suffix}"),
+            signing_key.clone(),
+            signing_key.verifying_key(),
+            None,
+        ).expect("test: registry client");
+        // Leak the policy handle for the test's lifetime (dropped at process exit).
+        std::mem::forget(_policy_handle);
+        (client, manager, handle)
+    }
+
+    #[tokio::test]
+    async fn test_get_blob_denied_empty_grant_repo() {
+        // A predictable-looking git OID with NO grant context must be refused:
+        // possessing the hash grants nothing.
+        let temp_dir = TempDir::new().expect("test: temp dir");
+        let (client, _manager, mut handle) =
+            spawn_registry_for_authz_test(&temp_dir, "blob-empty").await;
+        let req = GetBlobRequest {
+            content: GetBlobRequestContent::GitOid("a".repeat(40)),
+            grant_repo: String::new(),
+        };
+        let res = client.get_blob(&req, [0u8; 32]).await;
+        assert!(
+            res.is_err(),
+            "getBlob with empty grantRepo must be denied (hash is not a capability), got: {res:?}"
+        );
+        let _ = handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_blob_denied_unknown_grant_repo() {
+        // A grant repo the registry doesn't track must be refused before any
+        // content lookup — a caller can't name an arbitrary repo to fish bytes.
+        let temp_dir = TempDir::new().expect("test: temp dir");
+        let (client, _manager, mut handle) =
+            spawn_registry_for_authz_test(&temp_dir, "blob-unknown").await;
+        let req = GetBlobRequest {
+            content: GetBlobRequestContent::XetMerkle("bafyunknownmerkleroot".to_string()),
+            grant_repo: "at://did:web:nope.example/ai.hyprstream.model/missing".to_string(),
+        };
+        let res = client.get_blob(&req, [0u8; 32]).await;
+        assert!(
+            res.is_err(),
+            "getBlob with unknown grantRepo must be denied, got: {res:?}"
+        );
         let _ = handle.stop().await;
     }
 }

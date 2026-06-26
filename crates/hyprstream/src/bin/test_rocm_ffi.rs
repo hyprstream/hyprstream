@@ -18,10 +18,11 @@ fn main() {
     println!("ROCm Direct FFI Test");
     println!("====================");
 
-    // Set ROCm environment
-    std::env::set_var("ROCM_PATH", "/usr");
+    // Set ROCm environment — use /opt/rocm (standard install path); let runtime
+    // auto-detect PYTORCH_ROCM_ARCH. The hardcoded gfx90a (MI210) caused silent
+    // CPU fallback on gfx1151 (Strix Halo / Radeon 8060S) (#228).
+    std::env::set_var("ROCM_PATH", "/opt/rocm");
     std::env::set_var("HIP_VISIBLE_DEVICES", "0");
-    std::env::set_var("PYTORCH_ROCM_ARCH", "gfx90a");
 
     unsafe {
         let available = torch_cuda_is_available();

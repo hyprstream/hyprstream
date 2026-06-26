@@ -1,0 +1,22 @@
+[package]
+name = "hyprstream-vfs"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Plan9-inspired VFS namespace multiplexer for hyprstream"
+
+[dependencies]
+# RPC types (Subject for caller identity)
+hyprstream-rpc = { path = "../hyprstream-rpc" }
+
+# Async trait support
+async-trait = "0.1"
+
+# Async runtime (sync/rt for VFS proxy)
+tokio = { version = "1", features = ["sync", "rt"] }
+
+# Error handling
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

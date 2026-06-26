@@ -1,0 +1,16 @@
+[package]
+name = "hyprstream-tcl"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT"
+description = "Tcl (molt) shell for hyprstream VFS namespace"
+
+[dependencies]
+molt = { git = "https://github.com/hyprstream/hyprstream-molt.git", branch = "hyprstream" }
+hyprstream-vfs = { path = "../hyprstream-vfs" }
+async-trait = "0.1"
+serde_json = "1"
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

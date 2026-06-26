@@ -1,11 +1,71 @@
 //! JWT claims for authentication.
 //!
-//! Authorization is enforced server-side via Casbin policies, not JWT scopes.
+//! Two claim types:
+//! - [`Claims`] — access token claims used throughout the RPC layer.
+//!   Authorization is enforced server-side via Casbin policies, not JWT scopes.
+//! - [`IdTokenClaims`] — OIDC ID Token claims (Section 2 of OpenID Connect
+//!   Core 1.0). Only used by the OAuth token endpoint when `scope=openid`.
 
 use crate::common_capnp;
 use crate::capnp::{ToCapnp, FromCapnp};
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer, Deserializer};
+
+/// Compute the RFC 7638 JWK Thumbprint for an Ed25519 key.
+///
+/// Delegates to [`crate::auth::jwk_thumbprint`] — kept as a named entry-point
+/// so callers that only have a raw `[u8; 32]` don't need to construct a
+/// [`crate::auth::JwkThumbprintInput`] themselves. (#155 cleanup)
+pub fn compute_jkt(key_bytes: &[u8; 32]) -> String {
+    crate::auth::jwk_thumbprint(&crate::auth::JwkThumbprintInput::Ed25519 { x: key_bytes })
+}
+
+/// Returns true if `iss` belongs to a local node.
+///
+/// Used for pre-decode key routing (before a `Claims` object exists) and by
+/// [`Claims::is_local_to`] for post-decode subject derivation — both use
+/// identical criteria so routing and subject resolution are always consistent.
+///
+/// Rules:
+/// - Empty `iss` is always local (cluster-internal tokens have no issuer claim).
+/// - If `local_issuers` is non-empty: `iss` must exactly match one entry.
+/// - If `local_issuers` is empty (unconfigured node): only an empty `iss` is
+///   accepted as local; any non-empty `iss` is treated as federated.
+pub fn is_local_iss(iss: &str, local_issuers: &[&str]) -> bool {
+    if iss.is_empty() {
+        return true;
+    }
+    if local_issuers.is_empty() {
+        false
+    } else {
+        local_issuers.contains(&iss)
+    }
+}
+
+/// JWK (JSON Web Key) for an Ed25519 public key — RFC 7517 OKP key type.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CnfJwk {
+    pub kty: String,
+    pub crv: String,
+    /// Base64url-encoded Ed25519 public key (32 bytes), RFC 8037 §2.
+    pub x: String,
+}
+
+/// RFC 8705 Proof-of-Possession `cnf` claim.
+///
+/// Two key-binding modes:
+/// - `jwk`: Full OKP JWK object — used for WIMSE service WITs (`cnf.jwk`).
+/// - `jkt`: JWK Thumbprint (RFC 7638 SHA-256, base64url) — used for DPoP user
+///   tokens (`cnf.jkt`, per RFC 9449 § 6).
+///
+/// Both fields are optional so the struct serialises correctly for each mode.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Cnf {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jwk: Option<CnfJwk>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jkt: Option<String>,
+}
 
 /// JWT claims for authentication.
 ///
@@ -13,12 +73,29 @@ use serde::{Deserialize, Serialize};
 /// Scopes are NOT embedded in JWTs.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Claims {
+    /// Issuer URL — the hyprstream node that minted this token.
+    /// Matches the OAuth issuer URL (e.g. "https://cloud-a.example.com").
+    /// Required for federation: receiving nodes use this to fetch JWKS.
+    /// Defaults to empty string for backward compat (treated as local-only).
+    #[serde(default)]
+    pub iss: String,
     pub sub: String,
     pub exp: i64,
     pub iat: i64,
+    /// RFC 7519 JWT ID — unique token identifier for revocation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jti: Option<String>,
     /// RFC 8707 audience claim for resource indicator binding.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aud: Option<String>,
+    /// RFC 8705 / WIMSE proof-of-possession confirmation claim.
+    ///
+    /// Binds the Ed25519 signing key to the JWT-attested identity via a standard
+    /// JWK object (`cnf.jwk`). For service tokens (WIT), derived by the CA from
+    /// the root key. For user tokens, set during OAuth flow from the verified
+    /// Ed25519 challenge-response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cnf: Option<Cnf>,
     /// Original JWT token for end-to-end verification.
     /// When present, downstream services MUST verify this token
     /// independently rather than trusting the envelope claims alone.
@@ -36,10 +113,13 @@ pub struct Claims {
 impl std::fmt::Debug for Claims {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Claims")
+            .field("iss", &self.iss)
             .field("sub", &self.sub)
             .field("exp", &self.exp)
             .field("iat", &self.iat)
+            .field("jti", &self.jti)
             .field("aud", &self.aud)
+            .field("cnf", &self.cnf)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
             .finish()
     }
@@ -58,6 +138,14 @@ impl ToCapnp for Claims {
         }
         if let Some(ref token) = self.token {
             builder.set_token(token);
+        }
+        if !self.iss.is_empty() {
+            builder.set_iss(&self.iss);
+        }
+        if let Some(ref cnf) = self.cnf {
+            if let Some(ref jwk) = cnf.jwk {
+                builder.set_pub_key(&jwk.x);
+            }
         }
         // Write empty scopes list for wire compatibility
         builder.reborrow().init_scopes(0);
@@ -79,11 +167,31 @@ impl FromCapnp for Claims {
             .map(std::borrow::ToOwned::to_owned)
             .filter(|s| !s.is_empty());
 
+        let iss = reader.get_iss().ok()
+            .and_then(|s| s.to_str().ok())
+            .map(std::borrow::ToOwned::to_owned)
+            .unwrap_or_default();
+
+        let cnf = reader.get_pub_key().ok()
+            .and_then(|s| s.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .map(|x| Cnf {
+                jwk: Some(CnfJwk {
+                    kty: "OKP".to_owned(),
+                    crv: "Ed25519".to_owned(),
+                    x: x.to_owned(),
+                }),
+                jkt: None,
+            });
+
         Ok(Self {
+            iss,
             sub: reader.get_sub()?.to_str()?.to_owned(),
             exp: reader.get_exp(),
             iat: reader.get_iat(),
+            jti: None,
             aud,
+            cnf,
             token,
         })
     }
@@ -93,12 +201,32 @@ impl Claims {
     /// Create new claims.
     pub fn new(sub: String, iat: i64, exp: i64) -> Self {
         Self {
+            iss: String::new(),
             sub,
             exp,
             iat,
+            jti: None,
             aud: None,
+            cnf: None,
             token: None,
         }
+    }
+
+    /// Set a random JWT ID (RFC 7519 `jti` claim) for revocation support.
+    pub fn with_jti(mut self) -> Self {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use rand::RngCore as _;
+        let mut bytes = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        self.jti = Some(URL_SAFE_NO_PAD.encode(bytes));
+        self
+    }
+
+    /// Set the issuer URL (RFC 7519 `iss` claim).
+    /// Should be the OAuth issuer URL of the hyprstream node that issued this token.
+    pub fn with_issuer(mut self, issuer: String) -> Self {
+        self.iss = issuer;
+        self
     }
 
     /// Create new claims with an audience (RFC 8707 resource indicator).
@@ -113,6 +241,49 @@ impl Claims {
         self
     }
 
+    /// Set the RFC 8705 `cnf.jwk` confirmation claim (WIMSE WIT key binding).
+    ///
+    /// `key_bytes` is the raw 32-byte Ed25519 public key. Produces a standard
+    /// OKP JWK object with `kty: "OKP"`, `crv: "Ed25519"`, `x: <base64url>`.
+    pub fn with_cnf_jwk(mut self, key_bytes: &[u8; 32]) -> Self {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        self.cnf = Some(Cnf {
+            jwk: Some(CnfJwk {
+                kty: "OKP".to_owned(),
+                crv: "Ed25519".to_owned(),
+                x: URL_SAFE_NO_PAD.encode(key_bytes),
+            }),
+            jkt: None,
+        });
+        self
+    }
+
+    /// Set the RFC 9449 `cnf.jkt` confirmation claim (DPoP JWK thumbprint).
+    ///
+    /// `key_bytes` is the raw 32-byte Ed25519 public key. The thumbprint is
+    /// computed per RFC 7638: SHA-256 of the lexicographic canonical JWK JSON,
+    /// base64url-encoded.
+    pub fn with_cnf_jkt(mut self, key_bytes: &[u8; 32]) -> Self {
+        self.cnf = Some(Cnf {
+            jwk: None,
+            jkt: Some(compute_jkt(key_bytes)),
+        });
+        self
+    }
+
+    /// Extract the raw 32-byte Ed25519 public key from `cnf.jwk.x`, if present.
+    pub fn cnf_key_bytes(&self) -> Option<[u8; 32]> {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let x = self.cnf.as_ref()?.jwk.as_ref()?.x.as_str();
+        let bytes = URL_SAFE_NO_PAD.decode(x).ok()?;
+        bytes.try_into().ok()
+    }
+
+    /// Return the `cnf.jkt` thumbprint string, if present.
+    pub fn cnf_jkt(&self) -> Option<&str> {
+        self.cnf.as_ref()?.jkt.as_deref()
+    }
+
     /// Independently verify the embedded JWT token.
     ///
     /// Returns the verified claims if the token is present and valid.
@@ -123,19 +294,43 @@ impl Claims {
     pub fn verify_token(
         &self,
         verifying_key: &ed25519_dalek::VerifyingKey,
+        expected_aud: Option<&str>,
     ) -> std::result::Result<Option<Claims>, super::jwt::JwtError> {
         match &self.token {
             Some(token) => {
-                let verified = super::jwt::decode(token, verifying_key)?;
+                let verified = super::jwt::decode(token, verifying_key, expected_aud)?;
                 Ok(Some(verified))
             }
             None => Ok(None),
         }
     }
 
-    /// Check if token is expired.
+    /// Check if token is expired (with 5-second leeway for clock skew).
     pub fn is_expired(&self) -> bool {
-        chrono::Utc::now().timestamp() > self.exp
+        chrono::Utc::now().timestamp() > self.exp + 5
+    }
+
+    /// True if this token was issued by a local node.
+    ///
+    /// Delegates to [`is_local_iss`] using this token's `iss` field.
+    pub fn is_local_to(&self, local_issuers: &[&str]) -> bool {
+        is_local_iss(&self.iss, local_issuers)
+    }
+
+    /// Derive the Casbin authorization subject from these claims.
+    ///
+    /// Local tokens (issued by this node) produce bare subjects (`"alice"`)
+    /// matching existing Casbin rules.  Federated tokens produce namespaced
+    /// subjects (`"https://other.node:alice"`) to prevent cross-node spoofing.
+    pub fn subject(&self, local_issuers: &[&str]) -> crate::envelope::Subject {
+        if self.sub.is_empty() {
+            return crate::envelope::Subject::anonymous();
+        }
+        if self.is_local_to(local_issuers) {
+            crate::envelope::Subject::new(self.sub.clone())
+        } else {
+            crate::envelope::Subject::federated(&self.iss, &self.sub)
+        }
     }
 }
 
@@ -150,8 +345,16 @@ mod tests {
         assert_eq!(claims.sub, "alice");
         assert_eq!(claims.iat, 1000);
         assert_eq!(claims.exp, 2000);
+        assert_eq!(claims.iss, "");
         assert!(claims.aud.is_none());
         assert!(claims.token.is_none());
+    }
+
+    #[test]
+    fn test_claims_with_issuer() {
+        let claims = Claims::new("alice".to_owned(), 1000, 2000)
+            .with_issuer("https://a.example.com".to_owned());
+        assert_eq!(claims.iss, "https://a.example.com");
     }
 
     #[test]
@@ -191,5 +394,323 @@ mod tests {
         use crate::envelope::Subject;
         let claims = Claims::new("alice".to_owned(), 1000, 2000);
         assert_eq!(Subject::from(&claims), Subject::new("alice"));
+    }
+
+    #[test]
+    fn test_claims_is_local_to() {
+        let local = Claims::new("alice".to_owned(), 0, 9999)
+            .with_issuer("https://local.example.com".to_owned());
+        let federated = Claims::new("bob".to_owned(), 0, 9999)
+            .with_issuer("https://other.example.com".to_owned());
+        let legacy = Claims::new("carol".to_owned(), 0, 9999); // empty iss
+
+        assert!(local.is_local_to(&["https://local.example.com"]));
+        assert!(!local.is_local_to(&["https://other.example.com"]));
+        assert!(!federated.is_local_to(&["https://local.example.com"]));
+        // Empty iss is always local — cluster-internal tokens have no issuer claim
+        assert!(legacy.is_local_to(&[]));
+        assert!(legacy.is_local_to(&["https://local.example.com"]));
+    }
+
+    #[test]
+    fn test_claims_subject_method() {
+        use crate::envelope::Subject;
+
+        let local = Claims::new("alice".to_owned(), 0, 9999)
+            .with_issuer("https://node.example.com".to_owned());
+        let federated = Claims::new("bob".to_owned(), 0, 9999)
+            .with_issuer("https://other.example.com".to_owned());
+        let no_sub = Claims::new(String::new(), 0, 9999);
+
+        assert_eq!(local.subject(&["https://node.example.com"]), Subject::new("alice"));
+        assert_eq!(federated.subject(&["https://node.example.com"]), Subject::federated("https://other.example.com", "bob"));
+        assert_eq!(no_sub.subject(&[]), Subject::anonymous());
+    }
+
+    #[test]
+    fn test_claims_roundtrip_with_iss() {
+        use super::super::jwt;
+        use ed25519_dalek::SigningKey;
+
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+
+        let claims = Claims::new("alice".to_owned(), 0, 9_999_999_999)
+            .with_issuer("https://a.example.com".to_owned());
+
+        let token = jwt::encode(&claims, &signing_key);
+        let decoded = jwt::decode(&token, &verifying_key, None).expect("decode failed");
+
+        assert_eq!(decoded.iss, "https://a.example.com");
+        assert_eq!(decoded.sub, "alice");
+        assert_eq!(decoded.exp, 9_999_999_999);
+    }
+
+    #[test]
+    fn test_claims_iss_absent_defaults_to_empty() {
+        // Simulate an old token without the `iss` field.
+        // `#[serde(default)]` must ensure deserialization succeeds with iss = "".
+        let json = r#"{"sub":"bob","exp":9999999999,"iat":0}"#;
+        let claims: Claims = serde_json::from_str(json)
+            .expect("old token without iss should deserialize successfully");
+        assert_eq!(claims.iss, "");
+        assert_eq!(claims.sub, "bob");
+    }
+
+    #[test]
+    fn test_claims_iss_not_in_json_when_empty() {
+        // Empty iss is serialized as `"iss":""` (no skip_serializing_if),
+        // but we do NOT skip it — that is intentional per the field design.
+        // This test just confirms iss is present in JSON output.
+        let claims = Claims::new("alice".to_owned(), 0, 9_999_999_999)
+            .with_issuer("https://cloud.example.com".to_owned());
+        let json = serde_json::to_string(&claims).unwrap();
+        assert!(json.contains("\"iss\":\"https://cloud.example.com\""));
+    }
+}
+
+// ─── OIDC ID Token Claims ──────────────────────────────────────────────────
+
+/// A value that serializes as either a single string or an array of strings.
+///
+/// OIDC Core Section 2 says `aud` is a JSON string or array. Many RPs break
+/// if they receive an unexpected format, so we serialize as a string when there
+/// is exactly one value and as an array otherwise.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OneOrMany {
+    /// Single value — serialized as a JSON string.
+    One(String),
+    /// Multiple values — serialized as a JSON array.
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    /// Create from a single value.
+    pub fn one(value: impl Into<String>) -> Self {
+        Self::One(value.into())
+    }
+
+    /// Create from a list. Collapses to `One` when the list has a single element.
+    pub fn from_vec(mut values: Vec<String>) -> Self {
+        if values.len() == 1 {
+            Self::One(values.swap_remove(0))
+        } else {
+            Self::Many(values)
+        }
+    }
+
+    /// Get the values as a slice-like iterator.
+    pub fn as_slice(&self) -> &[String] {
+        match self {
+            Self::One(v) => std::slice::from_ref(v),
+            Self::Many(v) => v,
+        }
+    }
+}
+
+impl Serialize for OneOrMany {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::One(v) => serializer.serialize_str(v),
+            Self::Many(v) => v.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OneOrMany {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::String(s) => Ok(Self::One(s)),
+            serde_json::Value::Array(arr) => {
+                let strings: std::result::Result<Vec<String>, _> = arr
+                    .into_iter()
+                    .map(|v| {
+                        v.as_str()
+                            .map(String::from)
+                            .ok_or_else(|| serde::de::Error::custom("aud array must contain strings"))
+                    })
+                    .collect();
+                Ok(Self::from_vec(strings?))
+            }
+            _ => Err(serde::de::Error::custom("aud must be a string or array")),
+        }
+    }
+}
+
+/// OIDC ID Token claims (OpenID Connect Core 1.0, Section 2).
+///
+/// Separate from [`Claims`] because:
+/// - `aud` is the `client_id` (not the resource indicator)
+/// - Includes user profile claims (name, email)
+/// - Only issued by the OAuth token endpoint, not used in the RPC layer
+/// - Different `typ` header (`"JWT"` vs `"at+jwt"` for access tokens)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IdTokenClaims {
+    // ── Required (OIDC Core Section 2) ──────────────────────────────────
+    /// Issuer URL.
+    pub iss: String,
+    /// Subject identifier — a stable UUID, not a username.
+    pub sub: String,
+    /// Audience — the client_id. Supports single string or array.
+    pub aud: OneOrMany,
+    /// Expiration time (Unix timestamp).
+    pub exp: i64,
+    /// Issued at (Unix timestamp).
+    pub iat: i64,
+
+    // ── Conditional ─────────────────────────────────────────────────────
+    /// OIDC nonce echoed from the authorization request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<String>,
+    /// Time of user authentication (Unix timestamp).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_time: Option<i64>,
+    /// Authorized party (REQUIRED when aud has multiple values).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub azp: Option<String>,
+
+    // ── Profile claims (included based on requested scopes) ─────────────
+    /// Full name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Email address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// Whether the email is verified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email_verified: Option<bool>,
+    /// Preferred display username.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferred_username: Option<String>,
+}
+
+impl IdTokenClaims {
+    /// Create minimal id_token claims (required fields only).
+    pub fn new(iss: String, sub: String, aud: String, iat: i64, exp: i64) -> Self {
+        Self {
+            iss,
+            sub,
+            aud: OneOrMany::one(aud),
+            exp,
+            iat,
+            nonce: None,
+            auth_time: None,
+            azp: None,
+            name: None,
+            email: None,
+            email_verified: None,
+            preferred_username: None,
+        }
+    }
+
+    /// Set the OIDC nonce (echoed from the authorization request).
+    pub fn with_nonce(mut self, nonce: Option<String>) -> Self {
+        self.nonce = nonce;
+        self
+    }
+
+    /// Set the authentication time.
+    pub fn with_auth_time(mut self, auth_time: i64) -> Self {
+        self.auth_time = Some(auth_time);
+        self
+    }
+
+    /// Set profile claims from a user profile.
+    pub fn with_profile(
+        mut self,
+        name: Option<String>,
+        email: Option<String>,
+        email_verified: Option<bool>,
+        preferred_username: Option<String>,
+    ) -> Self {
+        self.name = name;
+        self.email = email;
+        self.email_verified = email_verified;
+        self.preferred_username = preferred_username;
+        self
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod id_token_tests {
+    use super::*;
+
+    #[test]
+    fn test_id_token_claims_serialization() {
+        let claims = IdTokenClaims::new(
+            "https://example.com".into(),
+            "f47ac10b-58cc-4372-a567-0e02b2c3d479".into(),
+            "my-client".into(),
+            1000,
+            2000,
+        );
+        let json = serde_json::to_string(&claims).unwrap();
+        // aud should be a single string, not array
+        assert!(json.contains("\"aud\":\"my-client\""));
+        assert!(json.contains("\"sub\":\"f47ac10b-"));
+        // Optional fields should not appear
+        assert!(!json.contains("nonce"));
+        assert!(!json.contains("name"));
+        assert!(!json.contains("email"));
+    }
+
+    #[test]
+    fn test_id_token_claims_with_profile() {
+        let claims = IdTokenClaims::new(
+            "https://example.com".into(),
+            "uuid-123".into(),
+            "client-1".into(),
+            1000,
+            2000,
+        )
+        .with_nonce(Some("abc123".into()))
+        .with_auth_time(999)
+        .with_profile(
+            Some("Alice".into()),
+            Some("alice@example.com".into()),
+            Some(true),
+            Some("alice".into()),
+        );
+        let json = serde_json::to_string(&claims).unwrap();
+        assert!(json.contains("\"nonce\":\"abc123\""));
+        assert!(json.contains("\"auth_time\":999"));
+        assert!(json.contains("\"name\":\"Alice\""));
+        assert!(json.contains("\"email\":\"alice@example.com\""));
+        assert!(json.contains("\"email_verified\":true"));
+        assert!(json.contains("\"preferred_username\":\"alice\""));
+    }
+
+    #[test]
+    fn test_one_or_many_single() {
+        let aud = OneOrMany::one("client-1");
+        let json = serde_json::to_string(&aud).unwrap();
+        assert_eq!(json, "\"client-1\"");
+    }
+
+    #[test]
+    fn test_one_or_many_multiple() {
+        let aud = OneOrMany::from_vec(vec!["a".into(), "b".into()]);
+        let json = serde_json::to_string(&aud).unwrap();
+        assert_eq!(json, "[\"a\",\"b\"]");
+    }
+
+    #[test]
+    fn test_one_or_many_deserialize_string() {
+        let aud: OneOrMany = serde_json::from_str("\"client-1\"").unwrap();
+        assert_eq!(aud, OneOrMany::One("client-1".into()));
+    }
+
+    #[test]
+    fn test_one_or_many_deserialize_array() {
+        let aud: OneOrMany = serde_json::from_str("[\"a\",\"b\"]").unwrap();
+        assert_eq!(aud, OneOrMany::Many(vec!["a".into(), "b".into()]));
+    }
+
+    #[test]
+    fn test_one_or_many_collapse_single_element() {
+        let aud = OneOrMany::from_vec(vec!["only-one".into()]);
+        assert_eq!(aud, OneOrMany::One("only-one".into()));
     }
 }

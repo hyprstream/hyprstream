@@ -51,6 +51,12 @@ pub struct StreamKeys {
     pub topic: String,
     /// HMAC key for MAC chain (zeroized on drop).
     pub mac_key: Zeroizing<[u8; 32]>,
+    /// AES-256-GCM key for transport-level AEAD of stream payloads (#321,
+    /// zeroized on drop). Distinct from `mac_key` via its own derivation context
+    /// (`"hyprstream stream-keys v1 enc"`). The mesh stream plane seals each
+    /// Data/Complete payload under this key; the chained HMAC still runs over the
+    /// (now-encrypted) block, so ordering / anti-replay are unchanged.
+    pub enc_key: Zeroizing<[u8; 32]>,
     /// Control channel topic (64 hex chars, derived from same DH secret).
     pub ctrl_topic: String,
     /// Control channel HMAC key (zeroized on drop).
@@ -59,25 +65,33 @@ pub struct StreamKeys {
 
 impl StreamKeys {
     /// Create from raw topic and mac_key bytes.
+    ///
+    /// The AEAD `enc_key` is deterministically derived from `mac_key` via a
+    /// dedicated context so this constructor stays source-compatible while still
+    /// producing a stable, non-zero, key-separated AEAD key.
     pub fn new(topic: String, mac_key: [u8; 32]) -> Self {
+        let enc_key = derive_key("hyprstream stream-keys v1 enc", &mac_key);
         Self {
             topic,
             mac_key: Zeroizing::new(mac_key),
+            enc_key: Zeroizing::new(enc_key),
             ctrl_topic: String::new(),
             ctrl_mac_key: Zeroizing::new([0u8; 32]),
         }
     }
 
-    /// Create with both data and control channel keys.
+    /// Create with both data and control channel keys plus the AEAD enc_key.
     pub fn with_ctrl(
         topic: String,
         mac_key: [u8; 32],
+        enc_key: [u8; 32],
         ctrl_topic: String,
         ctrl_mac_key: [u8; 32],
     ) -> Self {
         Self {
             topic,
             mac_key: Zeroizing::new(mac_key),
+            enc_key: Zeroizing::new(enc_key),
             ctrl_topic,
             ctrl_mac_key: Zeroizing::new(ctrl_mac_key),
         }
@@ -167,6 +181,12 @@ pub fn derive_stream_keys(
     // Derive mac_key (32 bytes)
     let mac_key = derive_key("hyprstream stream-keys v1 mac", &ikm);
 
+    // Derive AEAD enc_key (32 bytes, #321) — a DISTINCT context from `mac`, so the
+    // transport-AEAD key is cryptographically separated from the HMAC-chain key
+    // (mirrors `derive_notification_keys`'s enc/mac split). The mesh stream plane
+    // seals each Data/Complete payload under this key.
+    let enc_key = derive_key("hyprstream stream-keys v1 enc", &ikm);
+
     // Derive control channel topic (32 bytes -> 64 hex chars)
     let ctrl_topic_bytes = derive_key("hyprstream stream-keys v1 ctrl-topic", &ikm);
     let ctrl_topic = hex::encode(ctrl_topic_bytes);
@@ -174,7 +194,77 @@ pub fn derive_stream_keys(
     // Derive control channel mac_key (32 bytes)
     let ctrl_mac_key = derive_key("hyprstream stream-keys v1 ctrl-mac", &ikm);
 
-    Ok(StreamKeys::with_ctrl(topic, mac_key, ctrl_topic, ctrl_mac_key))
+    // Zeroize IKM containing the shared secret (mirrors derive_notification_keys).
+    ikm.zeroize();
+
+    Ok(StreamKeys::with_ctrl(topic, mac_key, enc_key, ctrl_topic, ctrl_mac_key))
+}
+
+// ============================================================================
+// Notification Key Derivation (Broadcast Encryption)
+// ============================================================================
+
+/// Derived keys for notification broadcast encryption.
+///
+/// Contains:
+/// - `enc_key`: AES-256-GCM key for wrapping per-subscriber data keys
+/// - `mac_key`: One-shot MAC key for ciphertext authentication
+///
+/// Both publisher and subscriber derive identical keys from their DH shared secret.
+pub struct NotificationKeys {
+    /// AES-256-GCM key for data_key wrapping (zeroized on drop).
+    pub enc_key: Zeroizing<[u8; 32]>,
+    /// One-shot MAC key (zeroized on drop).
+    pub mac_key: Zeroizing<[u8; 32]>,
+}
+
+/// Derive notification keys (enc_key and mac_key) from DH shared secret.
+///
+/// Uses the crypto backend (Blake3 or HKDF-SHA256) with:
+/// - IKM: shared_secret || salt (where salt = XOR of publisher_pub and subscriber_pub)
+/// - Context: notification-specific domain separation strings
+///
+/// # Arguments
+///
+/// * `shared_secret` - 32-byte DH shared secret
+/// * `publisher_pub` - Publisher's ephemeral Ristretto public key (32 bytes)
+/// * `subscriber_pub` - Subscriber's (possibly blinded) Ristretto public key (32 bytes)
+///
+/// # Errors
+///
+/// Returns `EnvelopeError::KeyExchange` if publisher and subscriber keys are identical.
+pub fn derive_notification_keys(
+    shared_secret: &[u8; 32],
+    publisher_pub: &[u8; 32],
+    subscriber_pub: &[u8; 32],
+) -> EnvelopeResult<NotificationKeys> {
+    if is_self_connection(publisher_pub, subscriber_pub) {
+        return Err(EnvelopeError::KeyExchange(
+            "publisher and subscriber keys are identical".into(),
+        ));
+    }
+
+    // XOR public keys for salt
+    let mut salt = [0u8; 32];
+    for i in 0..32 {
+        salt[i] = publisher_pub[i] ^ subscriber_pub[i];
+    }
+
+    // Build IKM: shared_secret || salt
+    let mut ikm = [0u8; 64];
+    ikm[..32].copy_from_slice(shared_secret);
+    ikm[32..64].copy_from_slice(&salt);
+
+    let enc_key = derive_key("hyprstream notification-keys v1 enc", &ikm);
+    let mac_key = derive_key("hyprstream notification-keys v1 mac", &ikm);
+
+    // Zeroize IKM containing shared secret
+    ikm.zeroize();
+
+    Ok(NotificationKeys {
+        enc_key: Zeroizing::new(enc_key),
+        mac_key: Zeroizing::new(mac_key),
+    })
 }
 
 /// Shared secret from DH key exchange.
@@ -271,6 +361,16 @@ mod ristretto_impl {
     pub struct RistrettoSecret(Scalar);
 
     impl RistrettoSecret {
+        /// Reconstruct a secret key from a scalar.
+        ///
+        /// Returns `None` if the scalar is zero (identity element, unsafe for DH).
+        pub fn from_scalar(scalar: Scalar) -> Option<Self> {
+            if bool::from(scalar.ct_eq(&Scalar::ZERO)) {
+                return None;
+            }
+            Some(Self(scalar))
+        }
+
         /// Get the underlying scalar for DH computation.
         pub fn scalar(&self) -> &Scalar {
             &self.0
@@ -405,12 +505,117 @@ mod ristretto_impl {
         let shared_point = their_public.point() * secret.scalar();
         shared_point.compress().to_bytes()
     }
+
+    /// Rerandomize a Ristretto255 public key: `blinded = pubkey + r * G`.
+    ///
+    /// Used by NotificationService to make subscriber pubkeys unlinkable across
+    /// different publish intents. Each intent uses a fresh random blinding scalar.
+    ///
+    /// Returns `(blinded_pubkey, blinding_scalar_bytes)`.
+    pub fn rerandomize_pubkey(pubkey: &RistrettoPublic) -> (RistrettoPublic, [u8; 32]) {
+        let r = Scalar::random(&mut rand::thread_rng());
+        let blinded_point = pubkey.point() + r * RISTRETTO_BASEPOINT_POINT;
+        let blinded = RistrettoPublic::from_point(blinded_point);
+        (blinded, r.to_bytes())
+    }
+
+    /// Perform blinding-aware DH: `shared = (secret + blinding_scalar) * their_pubkey`.
+    ///
+    /// Used by subscribers who received a blinding scalar `r_i` from the
+    /// NotificationService. The subscriber computes `(s_sub + r_i) * P_pub`,
+    /// which equals the publisher's `s_pub * (P_sub + r_i * G)` by DH commutativity.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - The blinding scalar bytes are not a valid Ristretto scalar
+    /// - The resulting combined scalar is zero
+    pub fn blinded_dh(
+        secret: &RistrettoSecret,
+        blinding_scalar_bytes: &[u8; 32],
+        their_pubkey: &RistrettoPublic,
+    ) -> EnvelopeResult<[u8; 32]> {
+        let r = Scalar::from_canonical_bytes(*blinding_scalar_bytes)
+            .into_option()
+            .ok_or_else(|| EnvelopeError::KeyExchange("invalid blinding scalar".into()))?;
+        let combined = secret.scalar() + r;
+        if bool::from(combined.ct_eq(&Scalar::ZERO)) {
+            return Err(EnvelopeError::KeyExchange(
+                "combined scalar is zero".into(),
+            ));
+        }
+        let shared_point = their_pubkey.point() * combined;
+        Ok(shared_point.compress().to_bytes())
+    }
+
+    // =========================================================================
+    // Raw-bytes DH wrappers (for notification broadcast encryption)
+    // =========================================================================
+
+    /// Ristretto255 DH from raw scalar and pubkey bytes.
+    ///
+    /// Used by `BroadcastEncryptor` where typed key objects aren't available.
+    pub fn ristretto_dh_raw(secret_bytes: &[u8; 32], their_pub_bytes: &[u8; 32]) -> EnvelopeResult<[u8; 32]> {
+        let scalar = Scalar::from_canonical_bytes(*secret_bytes)
+            .into_option()
+            .ok_or_else(|| EnvelopeError::KeyExchange("invalid secret scalar".into()))?;
+        let compressed = CompressedRistretto::from_slice(their_pub_bytes)
+            .map_err(|_| EnvelopeError::KeyExchange("invalid public key length".into()))?;
+        let point = compressed
+            .decompress()
+            .ok_or_else(|| EnvelopeError::KeyExchange("invalid ristretto255 point".into()))?;
+        Ok((point * scalar).compress().to_bytes())
+    }
+
+    /// Blinding-aware DH from raw bytes: `(secret + blinding_scalar) * their_pubkey`.
+    ///
+    /// Used by `BroadcastDecryptor` where typed key objects aren't available.
+    pub fn blinded_dh_raw(
+        secret_bytes: &[u8; 32],
+        blinding_scalar_bytes: &[u8; 32],
+        their_pub_bytes: &[u8; 32],
+    ) -> EnvelopeResult<[u8; 32]> {
+        let s = Scalar::from_canonical_bytes(*secret_bytes)
+            .into_option()
+            .ok_or_else(|| EnvelopeError::KeyExchange("invalid subscriber secret".into()))?;
+        let r = Scalar::from_canonical_bytes(*blinding_scalar_bytes)
+            .into_option()
+            .ok_or_else(|| EnvelopeError::KeyExchange("invalid blinding scalar".into()))?;
+        let combined = s + r;
+        if bool::from(combined.ct_eq(&Scalar::ZERO)) {
+            return Err(EnvelopeError::KeyExchange("combined scalar is zero".into()));
+        }
+        let compressed = CompressedRistretto::from_slice(their_pub_bytes)
+            .map_err(|_| EnvelopeError::KeyExchange("invalid public key length".into()))?;
+        let point = compressed
+            .decompress()
+            .ok_or_else(|| EnvelopeError::KeyExchange("invalid ristretto255 point".into()))?;
+        Ok((point * combined).compress().to_bytes())
+    }
+
+    /// Reconstruct a blinded pubkey from raw bytes: `P_sub + r * G`.
+    pub fn reconstruct_blinded_pub_raw(
+        subscriber_pub_bytes: &[u8; 32],
+        blinding_scalar_bytes: &[u8; 32],
+    ) -> EnvelopeResult<[u8; 32]> {
+        let r = Scalar::from_canonical_bytes(*blinding_scalar_bytes)
+            .into_option()
+            .ok_or_else(|| EnvelopeError::KeyExchange("invalid blinding scalar".into()))?;
+        let compressed = CompressedRistretto::from_slice(subscriber_pub_bytes)
+            .map_err(|_| EnvelopeError::KeyExchange("invalid subscriber pubkey length".into()))?;
+        let sub_point = compressed
+            .decompress()
+            .ok_or_else(|| EnvelopeError::KeyExchange("invalid subscriber ristretto point".into()))?;
+        let blinded = sub_point + r * RISTRETTO_BASEPOINT_POINT;
+        Ok(blinded.compress().to_bytes())
+    }
 }
 
 #[cfg(not(feature = "fips"))]
 pub use ristretto_impl::{
-    generate_ephemeral_keypair, ristretto_dh, RistrettoKeyExchange, RistrettoPublic,
-    RistrettoSecret,
+    blinded_dh, blinded_dh_raw, generate_ephemeral_keypair,
+    reconstruct_blinded_pub_raw, rerandomize_pubkey, ristretto_dh, ristretto_dh_raw,
+    RistrettoKeyExchange, RistrettoPublic, RistrettoSecret,
 };
 
 // ============================================================================
@@ -658,6 +863,24 @@ mod tests {
     }
 
     #[test]
+    fn test_derive_stream_keys_enc_key_distinct_and_deterministic(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // #321: the AEAD enc_key must be deterministic, key-separated from mac_key,
+        // and distinct from the control keys (own derivation context).
+        let shared_secret = [0x42u8; 32];
+        let client_pub = [0x01u8; 32];
+        let server_pub = [0x02u8; 32];
+
+        let keys1 = derive_stream_keys(&shared_secret, &client_pub, &server_pub)?;
+        let keys2 = derive_stream_keys(&shared_secret, &client_pub, &server_pub)?;
+
+        assert_eq!(*keys1.enc_key, *keys2.enc_key, "enc_key must be deterministic");
+        assert_ne!(*keys1.enc_key, *keys1.mac_key, "enc_key must differ from mac_key");
+        assert_ne!(*keys1.enc_key, *keys1.ctrl_mac_key, "enc_key must differ from ctrl_mac_key");
+        Ok(())
+    }
+
+    #[test]
     fn test_derive_stream_keys_symmetric() -> Result<(), Box<dyn std::error::Error>> {
         // Order of pubkeys shouldn't matter (XOR is commutative)
         let shared_secret = [0x42u8; 32];
@@ -775,9 +998,9 @@ mod tests {
     #[cfg(not(feature = "fips"))]
     #[test]
     fn test_stream_keys_e2e_mac_verification() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::crypto::hmac::ChainedStreamHmac;
+        use crate::crypto::StreamHmacState;
 
-        // Full E2E test: DH → stream keys → MAC chain
+        // Full E2E test: DH → stream keys → MAC chain (matches wire format)
         let (client_secret, client_pubkey) = generate_ephemeral_keypair();
         let (server_secret, server_pubkey) = generate_ephemeral_keypair();
 
@@ -796,21 +1019,20 @@ mod tests {
             &server_pubkey.to_bytes(),
         )?;
 
-        // Server produces MAC chain
-        // Use topic prefix as initial prev_mac (converted to u64 for request_id)
-        let prefix = server_keys.topic_prefix_bytes()?;
-        let request_id = u64::from_le_bytes(prefix[..8].try_into()?);
+        // Both sides should derive identical topic + mac_key
+        assert_eq!(client_keys.topic, server_keys.topic);
 
-        let mut producer = ChainedStreamHmac::from_bytes(*server_keys.mac_key, request_id);
+        // Server produces 16-byte truncated MACs (wire format)
+        let mut producer = StreamHmacState::new(*server_keys.mac_key, server_keys.topic.clone());
         let mac1 = producer.compute_next(b"token 1");
         let mac2 = producer.compute_next(b"token 2");
         let mac3 = producer.compute_next(b"[DONE]");
 
-        // Client verifies MAC chain
-        let mut verifier = ChainedStreamHmac::from_bytes(*client_keys.mac_key, request_id);
-        verifier.verify_next(b"token 1", &mac1)?;
-        verifier.verify_next(b"token 2", &mac2)?;
-        verifier.verify_next(b"[DONE]", &mac3)?;
+        // Client verifies the same chain
+        let mut verifier = StreamHmacState::new(*client_keys.mac_key, client_keys.topic);
+        assert!(verifier.verify_next(b"token 1", &mac1));
+        assert!(verifier.verify_next(b"token 2", &mac2));
+        assert!(verifier.verify_next(b"[DONE]", &mac3));
         Ok(())
     }
 

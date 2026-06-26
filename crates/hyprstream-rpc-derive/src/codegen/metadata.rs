@@ -7,6 +7,35 @@ use crate::resolve::ResolvedSchema;
 use crate::schema::types::*;
 use crate::util::*;
 
+/// Generate schema metadata + render_doc only (no JSON dispatcher).
+/// Used by `generate_rpc_client!` (client-only, compiles on all targets).
+pub fn generate_metadata_client_only(service_name: &str, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
+    let metadata_structs = generate_metadata_structs();
+    let pascal = to_pascal_case(service_name);
+    let schema_metadata = generate_schema_metadata_fn(
+        service_name,
+        &pascal,
+        &resolved.raw.request_variants,
+        &resolved.raw.response_variants,
+        resolved,
+        &resolved.raw.scoped_clients,
+    );
+    let scoped_client_tree = generate_scoped_client_tree(&resolved.raw.scoped_clients, types_crate);
+    let render_doc = generate_render_doc(
+        service_name,
+        &resolved.raw.request_variants,
+        &resolved.raw.response_variants,
+        resolved,
+        &resolved.raw.scoped_clients,
+    );
+    quote! {
+        #metadata_structs
+        #schema_metadata
+        #scoped_client_tree
+        #render_doc
+    }
+}
+
 /// Generate schema metadata functions + JSON dispatchers.
 pub fn generate_metadata(service_name: &str, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
     let pascal = to_pascal_case(service_name);
@@ -28,18 +57,26 @@ pub fn generate_metadata(service_name: &str, resolved: &ResolvedSchema, types_cr
         &resolved.raw.scoped_clients,
     );
     let scoped_client_tree = generate_scoped_client_tree(&resolved.raw.scoped_clients, types_crate);
+    let render_doc = generate_render_doc(
+        service_name,
+        &resolved.raw.request_variants,
+        &resolved.raw.response_variants,
+        resolved,
+        &resolved.raw.scoped_clients,
+    );
 
     quote! {
         #metadata_structs
         #schema_metadata
         #json_dispatcher
         #scoped_client_tree
+        #render_doc
     }
 }
 
 fn generate_metadata_structs() -> TokenStream {
     quote! {
-        pub use hyprstream_rpc::service::metadata::{ParamMeta as ParamSchema, MethodMeta as MethodSchema};
+        pub use hyprstream_rpc::metadata::{ParamMeta as ParamSchema, MethodMeta as MethodSchema};
     }
 }
 
@@ -90,6 +127,7 @@ fn generate_method_schema_entry(
     let method_name = to_snake_case(&v.name);
     let method_desc = &v.description;
     let scope_str = v.scope.as_str();
+    let doc_example = &v.doc_example;
     let is_streaming = is_streaming_variant(&v.name, response_variants, is_scoped_streaming_check);
     let cli_hidden = v.cli_hidden;
     let ct = CapnpType::classify_primitive(&v.type_name);
@@ -98,8 +136,7 @@ fn generate_method_schema_entry(
         CapnpType::Void => vec![],
         CapnpType::Struct(_) | CapnpType::Unknown(_) => {
             if let Some(sdef) = resolved.find_struct(&v.type_name) {
-                sdef.fields
-                    .iter()
+                sdef.non_union_fields()
                     .map(|f| {
                         let fname = to_snake_case(&f.name);
                         let ftype = &f.type_name;
@@ -134,6 +171,7 @@ fn generate_method_schema_entry(
             scope: #scope_str,
             is_streaming: #is_streaming,
             hidden: #cli_hidden,
+            doc_example: #doc_example,
         }
     }
 }
@@ -219,14 +257,15 @@ fn generate_json_dispatcher(
 
     let streaming_method = quote! {
         /// Dispatch a streaming method call by name with JSON arguments and an ephemeral public key.
-        /// Returns the StreamInfo as a JSON value.
+        /// Returns the verified-capnp `StreamInfo` library type (decoded + COSE-verified
+        /// inside `call_streaming`) — NOT a re-serialized `serde_json::Value` (#468).
         #[allow(unused_variables)]
         pub async fn call_streaming_method(
             &self,
             method: &str,
             args: &serde_json::Value,
             ephemeral_pubkey: [u8; 32],
-        ) -> anyhow::Result<serde_json::Value> {
+        ) -> anyhow::Result<hyprstream_rpc::stream_info::StreamInfo> {
             match method {
                 #(#main_streaming_arms)*
                 _ => anyhow::bail!("Unknown streaming method: {}", method),
@@ -322,38 +361,27 @@ fn generate_json_method_dispatch_arm(
         },
         _ => {
             if let Some(sdef) = resolved.find_struct(&v.type_name) {
-                let settable_fields: Vec<&FieldDef> = sdef
-                    .fields
-                    .iter()
-                    .filter(|f| !is_union_only_struct(&f.type_name, resolved))
-                    .collect();
+                let nuf: Vec<_> = sdef.non_union_fields().collect();
+                let is_void_wrapper = nuf.is_empty()
+                    || (nuf.len() == 1 && nuf[0].type_name == "Void");
 
-                let extractions: Vec<TokenStream> = settable_fields
-                    .iter()
-                    .map(|f| {
-                        let fname = format_ident!("{}", to_snake_case(&f.name));
-                        let fname_str = to_snake_case(&f.name);
-                        json_field_extraction_token(&fname, &fname_str, &f.type_name, f.optional, resolved)
-                    })
-                    .collect();
-
-                let args_list: Vec<TokenStream> = settable_fields
-                    .iter()
-                    .map(|f| {
-                        let fname = format_ident!("{}", to_snake_case(&f.name));
-                        if resolved.resolve_type(&f.type_name).is_by_ref {
-                            quote! { &#fname }
-                        } else {
-                            quote! { #fname }
+                if is_void_wrapper {
+                    // Void wrapper struct: call with no args
+                    quote! {
+                        #method_name_str => {
+                            let result = self.#method_name().await?;
+                            Ok(serde_json::to_value(&result)?)
                         }
-                    })
-                    .collect();
+                    }
+                } else {
+                    let data_name = format_ident!("{}", v.type_name);
 
-                quote! {
-                    #method_name_str => {
-                        #(#extractions)*
-                        let result = self.#method_name(#(#args_list),*).await?;
-                        Ok(serde_json::to_value(&result)?)
+                    quote! {
+                        #method_name_str => {
+                            let __req: #data_name = serde_json::from_value(args.clone())?;
+                            let result = self.#method_name(&__req).await?;
+                            Ok(serde_json::to_value(&result)?)
+                        }
                     }
                 }
             } else {
@@ -375,54 +403,46 @@ fn generate_json_streaming_dispatch_arm(
     let method_name = format_ident!("{}", method_name_str);
     let ct = resolved.resolve_type(&v.type_name).capnp_type.clone();
 
+    // #468: streaming methods ALWAYS resolve to the verified-capnp `StreamInfo`
+    // library type (decoded + COSE-verified inside `call_streaming`). The JSON
+    // dispatch wrappers return that native type directly — NO `serde_json::to_value`
+    // round-trip — so the signed artifact flows through typed to MCP/VFS consumers.
     match ct {
         CapnpType::Void => quote! {
             #method_name_str => {
                 let result = self.#method_name(ephemeral_pubkey).await?;
-                Ok(serde_json::to_value(&result)?)
+                Ok(result)
             }
         },
         CapnpType::Text => quote! {
             #method_name_str => {
                 let value = args[#method_name_str].as_str().or_else(|| args["value"].as_str()).unwrap_or_default();
                 let result = self.#method_name(value, ephemeral_pubkey).await?;
-                Ok(serde_json::to_value(&result)?)
+                Ok(result)
             }
         },
         _ => {
             if let Some(sdef) = resolved.find_struct(&v.type_name) {
-                let settable_fields: Vec<&FieldDef> = sdef
-                    .fields
-                    .iter()
-                    .filter(|f| !is_union_only_struct(&f.type_name, resolved))
-                    .collect();
+                let nuf: Vec<_> = sdef.non_union_fields().collect();
+                let is_void_wrapper = nuf.is_empty()
+                    || (nuf.len() == 1 && nuf[0].type_name == "Void");
 
-                let extractions: Vec<TokenStream> = settable_fields
-                    .iter()
-                    .map(|f| {
-                        let fname = format_ident!("{}", to_snake_case(&f.name));
-                        let fname_str = to_snake_case(&f.name);
-                        json_field_extraction_token(&fname, &fname_str, &f.type_name, f.optional, resolved)
-                    })
-                    .collect();
-
-                let args_list: Vec<TokenStream> = settable_fields
-                    .iter()
-                    .map(|f| {
-                        let fname = format_ident!("{}", to_snake_case(&f.name));
-                        if resolved.resolve_type(&f.type_name).is_by_ref {
-                            quote! { &#fname }
-                        } else {
-                            quote! { #fname }
+                if is_void_wrapper {
+                    quote! {
+                        #method_name_str => {
+                            let result = self.#method_name(ephemeral_pubkey).await?;
+                            Ok(result)
                         }
-                    })
-                    .collect();
+                    }
+                } else {
+                    let data_name = format_ident!("{}", v.type_name);
 
-                quote! {
-                    #method_name_str => {
-                        #(#extractions)*
-                        let result = self.#method_name(#(#args_list,)* ephemeral_pubkey).await?;
-                        Ok(serde_json::to_value(&result)?)
+                    quote! {
+                        #method_name_str => {
+                            let __req: #data_name = serde_json::from_value(args.clone())?;
+                            let result = self.#method_name(&__req, ephemeral_pubkey).await?;
+                            Ok(result)
+                        }
                     }
                 }
             } else {
@@ -484,13 +504,14 @@ fn generate_scoped_dispatcher_block(
 
     let scoped_streaming_method = quote! {
         /// Dispatch a scoped streaming method call by name with JSON arguments and an ephemeral public key.
+        /// Returns the verified-capnp `StreamInfo` library type (#468).
         #[allow(unused_variables)]
         pub async fn call_streaming_method(
             &self,
             method: &str,
             args: &serde_json::Value,
             ephemeral_pubkey: [u8; 32],
-        ) -> anyhow::Result<serde_json::Value> {
+        ) -> anyhow::Result<hyprstream_rpc::stream_info::StreamInfo> {
             match method {
                 #(#scoped_streaming_arms)*
                 _ => anyhow::bail!("Unknown scoped streaming method: {}", method),
@@ -664,7 +685,7 @@ fn generate_call_scoped_streaming_method_for_client(
             method: &str,
             args: &serde_json::Value,
             ephemeral_pubkey: [u8; 32],
-        ) -> anyhow::Result<serde_json::Value> {
+        ) -> anyhow::Result<hyprstream_rpc::stream_info::StreamInfo> {
             if scopes.is_empty() {
                 return self.call_streaming_method(method, args, ephemeral_pubkey).await;
             }
@@ -696,7 +717,7 @@ fn collect_call_scoped_streaming_method_recursive(
                         method: &str,
                         args: &serde_json::Value,
                         ephemeral_pubkey: [u8; 32],
-                    ) -> anyhow::Result<serde_json::Value> {
+                    ) -> anyhow::Result<hyprstream_rpc::stream_info::StreamInfo> {
                         if scopes.is_empty() {
                             return self.call_streaming_method(method, args, ephemeral_pubkey).await;
                         }
@@ -724,7 +745,7 @@ fn collect_call_scoped_streaming_method_recursive(
                         method: &str,
                         args: &serde_json::Value,
                         ephemeral_pubkey: [u8; 32],
-                    ) -> anyhow::Result<serde_json::Value> {
+                    ) -> anyhow::Result<hyprstream_rpc::stream_info::StreamInfo> {
                         if scopes.is_empty() {
                             return self.call_streaming_method(method, args, ephemeral_pubkey).await;
                         }
@@ -758,8 +779,8 @@ fn generate_scoped_client_tree(
 
     quote! {
         /// Returns the scoped client tree metadata for dynamic CLI/MCP dispatch.
-        pub fn scoped_client_tree() -> &'static [hyprstream_rpc::service::metadata::ScopedClientTreeNode] {
-            use hyprstream_rpc::service::metadata::ScopedClientTreeNode;
+        pub fn scoped_client_tree() -> &'static [hyprstream_rpc::metadata::ScopedClientTreeNode] {
+            use hyprstream_rpc::metadata::ScopedClientTreeNode;
             #(#consts)*
             static TREE: &[ScopedClientTreeNode] = &[#(#top_refs),*];
             TREE
@@ -810,170 +831,291 @@ fn generate_tree_consts(
     names_out.push(const_name);
 }
 
-/// Check if a type name refers to a union-only struct (no regular fields).
-fn is_union_only_struct(type_name: &str, resolved: &ResolvedSchema) -> bool {
-    if let Some(s) = resolved.find_struct(type_name) {
-        s.has_union && s.fields.is_empty()
-    } else {
-        false
+// ---------------------------------------------------------------------------
+// render_doc() generation — man page rendering from schema metadata
+// ---------------------------------------------------------------------------
+
+/// Generate `render_doc(path: &[&str]) -> Option<String>` for service documentation.
+fn generate_render_doc(
+    service_name: &str,
+    request_variants: &[UnionVariant],
+    _response_variants: &[UnionVariant],
+    resolved: &ResolvedSchema,
+    scoped_clients: &[ScopedClient],
+) -> TokenStream {
+    let scoped_names: Vec<&str> = scoped_clients
+        .iter()
+        .map(|sc| sc.factory_name.as_str())
+        .collect();
+
+    let overview = format_service_overview(service_name, request_variants, &scoped_names, scoped_clients);
+
+    let method_arms: Vec<TokenStream> = request_variants
+        .iter()
+        .filter(|v| !scoped_names.contains(&v.name.as_str()) && !v.cli_hidden)
+        .map(|v| {
+            let method_snake = to_snake_case(&v.name);
+            let page = format_man_page(service_name, &method_snake, v, resolved, request_variants, &scoped_names);
+            quote! { #method_snake => ::core::option::Option::Some(#page.to_owned()), }
+        })
+        .collect();
+
+    let mut scope_single_arms = Vec::new();
+    let mut scope_multi_arms = Vec::new();
+
+    for sc in scoped_clients {
+        let scope_snake = to_snake_case(&sc.factory_name);
+        let scope_overview = format_scope_overview(service_name, &scope_snake, sc);
+
+        let scope_method_arms: Vec<TokenStream> = sc
+            .inner_request_variants
+            .iter()
+            .filter(|v| !v.cli_hidden)
+            .map(|v| {
+                let m_name = to_snake_case(&v.name);
+                let page = format_scoped_man_page(service_name, &scope_snake, &m_name, v, resolved, &sc.inner_request_variants);
+                quote! { #m_name => ::core::option::Option::Some(#page.to_owned()), }
+            })
+            .collect();
+
+        let nested_single_arms: Vec<TokenStream> = sc
+            .nested_clients
+            .iter()
+            .map(|nsc| {
+                let nscope_snake = to_snake_case(&nsc.factory_name);
+                let nested_overview = format_scope_overview(service_name, &format!("{} {}", scope_snake, nscope_snake), nsc);
+                quote! { [#nscope_snake] => ::core::option::Option::Some(#nested_overview.to_owned()), }
+            })
+            .collect();
+
+        let nested_multi_arms: Vec<TokenStream> = sc
+            .nested_clients
+            .iter()
+            .map(|nsc| {
+                let nscope_snake = to_snake_case(&nsc.factory_name);
+                let nested_method_arms: Vec<TokenStream> = nsc
+                    .inner_request_variants
+                    .iter()
+                    .filter(|v| !v.cli_hidden)
+                    .map(|v| {
+                        let m_name = to_snake_case(&v.name);
+                        let page = format_scoped_man_page(
+                            service_name,
+                            &format!("{} {}", scope_snake, nscope_snake),
+                            &m_name, v, resolved, &nsc.inner_request_variants,
+                        );
+                        quote! { [#nscope_snake, #m_name] => ::core::option::Option::Some(#page.to_owned()), }
+                    })
+                    .collect();
+                quote! { #(#nested_method_arms)* }
+            })
+            .collect();
+
+        scope_single_arms.push(quote! {
+            #scope_snake => ::core::option::Option::Some(#scope_overview.to_owned()),
+        });
+
+        scope_multi_arms.push(quote! {
+            [#scope_snake, method] => match *method {
+                #(#scope_method_arms)*
+                _ => ::core::option::Option::None,
+            },
+            [#scope_snake, rest @ ..] => match rest {
+                #(#nested_single_arms)*
+                #(#nested_multi_arms)*
+                _ => ::core::option::Option::None,
+            },
+        });
+    }
+
+    quote! {
+        /// Render documentation for this service.
+        pub fn render_doc(path: &[&str]) -> ::core::option::Option<String> {
+            match path {
+                [] | [""] => ::core::option::Option::Some(#overview.to_owned()),
+                [single] => match *single {
+                    #(#method_arms)*
+                    #(#scope_single_arms)*
+                    _ => ::core::option::Option::None,
+                },
+                multi => match multi {
+                    #(#scope_multi_arms)*
+                    _ => ::core::option::Option::None,
+                },
+            }
+        }
     }
 }
 
-fn json_field_extraction_token(
-    fname: &syn::Ident,
-    fname_str: &str,
-    type_name: &str,
-    optional: bool,
-    resolved: &ResolvedSchema,
-) -> TokenStream {
-    let ct = resolved.resolve_type(type_name).capnp_type.clone();
+fn format_service_overview(
+    service_name: &str, request_variants: &[UnionVariant],
+    scoped_names: &[&str], scoped_clients: &[ScopedClient],
+) -> String {
+    let mut out = format!("NAME\n    {} \u{2014} service\n\nMETHODS\n", service_name);
+    for v in request_variants {
+        if scoped_names.contains(&v.name.as_str()) || v.cli_hidden { continue; }
+        let name = to_snake_case(&v.name);
+        let desc = doc_first_sentence(&v.description);
+        if desc.is_empty() {
+            out.push_str(&format!("    {}\n", name));
+        } else {
+            out.push_str(&format!("    {:20} {}\n", name, desc));
+        }
+    }
+    if !scoped_clients.is_empty() {
+        out.push_str("\nSCOPED\n");
+        for sc in scoped_clients {
+            let scope_name = to_snake_case(&sc.factory_name);
+            let n = sc.inner_request_variants.iter().filter(|v| !v.cli_hidden).count();
+            out.push_str(&format!("    {:20} ({} methods)\n", format!("{}/", scope_name), n));
+        }
+    }
+    out.push_str(&format!("\nUsage: man {} <method>\n", service_name));
+    out
+}
+
+fn format_scope_overview(service_name: &str, scope_path: &str, sc: &ScopedClient) -> String {
+    let scope_field = sc.scope_fields.first().map(|f| to_snake_case(&f.name)).unwrap_or_default();
+    let mut out = format!("NAME\n    {} {} \u{2014} scoped operations (by {})\n\nMETHODS\n", service_name, scope_path, scope_field);
+    for v in &sc.inner_request_variants {
+        if v.cli_hidden { continue; }
+        let name = to_snake_case(&v.name);
+        let desc = doc_first_sentence(&v.description);
+        if desc.is_empty() {
+            out.push_str(&format!("    {}\n", name));
+        } else {
+            out.push_str(&format!("    {:20} {}\n", name, desc));
+        }
+    }
+    if !sc.nested_clients.is_empty() {
+        out.push_str("\nNESTED\n");
+        for nsc in &sc.nested_clients {
+            let n = to_snake_case(&nsc.factory_name);
+            let cnt = nsc.inner_request_variants.iter().filter(|v| !v.cli_hidden).count();
+            out.push_str(&format!("    {:20} ({} methods)\n", format!("{}/", n), cnt));
+        }
+    }
+    out.push_str(&format!("\nUsage: man {} {} <method>\n", service_name, scope_path));
+    out
+}
+
+fn format_man_page(
+    service_name: &str, method_name: &str, v: &UnionVariant,
+    resolved: &ResolvedSchema, all_variants: &[UnionVariant], scoped_names: &[&str],
+) -> String {
+    let mut out = String::new();
+    let desc = doc_first_sentence(&v.description);
+    if desc.is_empty() {
+        out.push_str(&format!("NAME\n    {} {}\n", service_name, method_name));
+    } else {
+        out.push_str(&format!("NAME\n    {} {} \u{2014} {}\n", service_name, method_name, desc));
+    }
+    let synopsis = doc_format_synopsis(service_name, method_name, v, resolved);
+    out.push_str(&format!("\nSYNOPSIS\n    {}\n", synopsis));
+    let scope = if v.scope.is_empty() { "query" } else { &v.scope };
+    out.push_str(&format!("\nSCOPE\n    {}\n", scope));
+    if !v.description.is_empty() {
+        out.push_str(&format!("\nDESCRIPTION\n    {}\n", v.description));
+    }
+    let params = doc_format_params(v, resolved);
+    if !params.is_empty() { out.push_str(&format!("\nPARAMETERS\n{}", params)); }
+    if !v.doc_example.is_empty() {
+        out.push_str(&format!("\nEXAMPLES\n    {}\n", v.doc_example));
+    }
+    let see_also = doc_format_see_also(service_name, method_name, all_variants, scoped_names);
+    if !see_also.is_empty() { out.push_str(&format!("\nSEE ALSO\n    {}\n", see_also)); }
+    out
+}
+
+fn format_scoped_man_page(
+    service_name: &str, scope_path: &str, method_name: &str,
+    v: &UnionVariant, resolved: &ResolvedSchema, sibling_variants: &[UnionVariant],
+) -> String {
+    let mut out = String::new();
+    let desc = doc_first_sentence(&v.description);
+    if desc.is_empty() {
+        out.push_str(&format!("NAME\n    {} {} {}\n", service_name, scope_path, method_name));
+    } else {
+        out.push_str(&format!("NAME\n    {} {} {} \u{2014} {}\n", service_name, scope_path, method_name, desc));
+    }
+    let scope = if v.scope.is_empty() { "query" } else { &v.scope };
+    out.push_str(&format!("\nSCOPE\n    {}\n", scope));
+    if !v.description.is_empty() {
+        out.push_str(&format!("\nDESCRIPTION\n    {}\n", v.description));
+    }
+    let params = doc_format_params(v, resolved);
+    if !params.is_empty() { out.push_str(&format!("\nPARAMETERS\n{}", params)); }
+    if !v.doc_example.is_empty() {
+        out.push_str(&format!("\nEXAMPLES\n    {}\n", v.doc_example));
+    }
+    let siblings: Vec<String> = sibling_variants.iter()
+        .filter(|sv| !sv.cli_hidden && to_snake_case(&sv.name) != method_name)
+        .map(|sv| format!("{} {} {}", service_name, scope_path, to_snake_case(&sv.name)))
+        .collect();
+    if !siblings.is_empty() { out.push_str(&format!("\nSEE ALSO\n    {}\n", siblings.join(", "))); }
+    out
+}
+
+fn doc_format_synopsis(service_name: &str, method_name: &str, v: &UnionVariant, resolved: &ResolvedSchema) -> String {
+    let ct = CapnpType::classify_primitive(&v.type_name);
     match ct {
-        CapnpType::Text => if optional { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_str()).unwrap_or("");
-        }} else { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid string field '{}'", #fname_str))?;
-        }},
-        CapnpType::Bool => quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_bool()).unwrap_or(false);
-        },
-        CapnpType::UInt8 => if optional { quote! {
-            let #fname: u8 = args.get(#fname_str).and_then(|v| v.as_u64())
-                .unwrap_or(0).try_into().unwrap_or(0);
-        }} else { quote! {
-            let #fname: u8 = args.get(#fname_str).and_then(|v| v.as_u64())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid u8 field '{}'", #fname_str))?
-                .try_into().map_err(|_| anyhow::anyhow!("u8 overflow for field '{}'", #fname_str))?;
-        }},
-        CapnpType::UInt16 => if optional { quote! {
-            let #fname: u16 = args.get(#fname_str).and_then(|v| v.as_u64())
-                .unwrap_or(0).try_into().unwrap_or(0);
-        }} else { quote! {
-            let #fname: u16 = args.get(#fname_str).and_then(|v| v.as_u64())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid u16 field '{}'", #fname_str))?
-                .try_into().map_err(|_| anyhow::anyhow!("u16 overflow for field '{}'", #fname_str))?;
-        }},
-        CapnpType::UInt32 => if optional { quote! {
-            let #fname: u32 = args.get(#fname_str).and_then(|v| v.as_u64())
-                .unwrap_or(0).try_into().unwrap_or(0);
-        }} else { quote! {
-            let #fname: u32 = args.get(#fname_str).and_then(|v| v.as_u64())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid u32 field '{}'", #fname_str))?
-                .try_into().map_err(|_| anyhow::anyhow!("u32 overflow for field '{}'", #fname_str))?;
-        }},
-        CapnpType::UInt64 => if optional { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_u64()).unwrap_or(0);
-        }} else { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_u64())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid u64 field '{}'", #fname_str))?;
-        }},
-        CapnpType::Int8 => if optional { quote! {
-            let #fname: i8 = args.get(#fname_str).and_then(|v| v.as_i64())
-                .unwrap_or(0).try_into().unwrap_or(0);
-        }} else { quote! {
-            let #fname: i8 = args.get(#fname_str).and_then(|v| v.as_i64())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid i8 field '{}'", #fname_str))?
-                .try_into().map_err(|_| anyhow::anyhow!("i8 overflow for field '{}'", #fname_str))?;
-        }},
-        CapnpType::Int16 => if optional { quote! {
-            let #fname: i16 = args.get(#fname_str).and_then(|v| v.as_i64())
-                .unwrap_or(0).try_into().unwrap_or(0);
-        }} else { quote! {
-            let #fname: i16 = args.get(#fname_str).and_then(|v| v.as_i64())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid i16 field '{}'", #fname_str))?
-                .try_into().map_err(|_| anyhow::anyhow!("i16 overflow for field '{}'", #fname_str))?;
-        }},
-        CapnpType::Int32 => if optional { quote! {
-            let #fname: i32 = args.get(#fname_str).and_then(|v| v.as_i64())
-                .unwrap_or(0).try_into().unwrap_or(0);
-        }} else { quote! {
-            let #fname: i32 = args.get(#fname_str).and_then(|v| v.as_i64())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid i32 field '{}'", #fname_str))?
-                .try_into().map_err(|_| anyhow::anyhow!("i32 overflow for field '{}'", #fname_str))?;
-        }},
-        CapnpType::Int64 => if optional { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_i64()).unwrap_or(0);
-        }} else { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_i64())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid i64 field '{}'", #fname_str))?;
-        }},
-        CapnpType::Float32 => if optional { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-        }} else { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_f64())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid f32 field '{}'", #fname_str))? as f32;
-        }},
-        CapnpType::Float64 => if optional { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_f64()).unwrap_or(0.0);
-        }} else { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_f64())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid f64 field '{}'", #fname_str))?;
-        }},
-        CapnpType::Data => if optional { quote! {
-            let #fname: Vec<u8> = args.get(#fname_str).and_then(|v| v.as_str())
-                .map(|s| s.as_bytes().to_vec()).unwrap_or_default();
-        }} else { quote! {
-            let #fname: Vec<u8> = args.get(#fname_str).and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid data field '{}'", #fname_str))?
-                .as_bytes().to_vec();
-        }},
-        CapnpType::ListText => if optional { quote! {
-            let #fname: Vec<String> = args.get(#fname_str).and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default();
-        }} else { quote! {
-            let #fname: Vec<String> = args.get(#fname_str).and_then(|v| v.as_array())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid array field '{}'", #fname_str))?
-                .iter().map(|v| v.as_str().map(String::from)
-                    .ok_or_else(|| anyhow::anyhow!("non-string element in array field '{}'", #fname_str)))
-                .collect::<Result<Vec<_>, _>>()?;
-        }},
-        CapnpType::ListData => if optional { quote! {
-            let #fname: Vec<Vec<u8>> = args.get(#fname_str).and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.as_bytes().to_vec())).collect())
-                .unwrap_or_default();
-        }} else { quote! {
-            let #fname: Vec<Vec<u8>> = args.get(#fname_str).and_then(|v| v.as_array())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid array field '{}'", #fname_str))?
-                .iter().map(|v| v.as_str().map(|s| s.as_bytes().to_vec())
-                    .ok_or_else(|| anyhow::anyhow!("non-string element in array field '{}'", #fname_str)))
-                .collect::<Result<Vec<_>, _>>()?;
-        }},
-        CapnpType::ListPrimitive(_) => {
-            let rust_type = rust_type_tokens(&ct.rust_owned_type());
-            quote! {
-                let #fname: #rust_type = serde_json::from_value(
-                    args.get(#fname_str).cloned().unwrap_or(serde_json::Value::Array(vec![]))
-                ).unwrap_or_default();
+        CapnpType::Void => format!("ctl /srv/{} {}", service_name, method_name),
+        CapnpType::Struct(_) | CapnpType::Unknown(_) => {
+            if let Some(sdef) = resolved.find_struct(&v.type_name) {
+                let fields: Vec<String> = sdef.non_union_fields()
+                    .map(|f: &FieldDef| format!("\"{}\": ...", to_snake_case(&f.name)))
+                    .collect();
+                if fields.is_empty() {
+                    format!("ctl /srv/{} {}", service_name, method_name)
+                } else {
+                    format!("ctl /srv/{} {} '{{{{ {} }}}}'", service_name, method_name, fields.join(", "))
+                }
+            } else {
+                format!("ctl /srv/{} {} <{}>", service_name, method_name, v.type_name)
             }
         }
-        CapnpType::ListStruct(ref inner) => {
-            let data_name = format_ident!("{}", inner);
-            quote! {
-                let #fname: Vec<#data_name> = serde_json::from_value(
-                    args.get(#fname_str).cloned().unwrap_or(serde_json::Value::Array(vec![]))
-                ).unwrap_or_default();
-            }
-        }
-        CapnpType::Struct(ref name) => {
-            let data_name = format_ident!("{}", name);
-            quote! {
-                let #fname: #data_name = serde_json::from_value(
-                    args.get(#fname_str).cloned().unwrap_or_default()
-                ).unwrap_or_default();
-            }
-        }
-        CapnpType::Enum(_) => if optional { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_str()).unwrap_or("");
-        }} else { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid enum field '{}'", #fname_str))?;
-        }},
-        _ => if optional { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_str()).unwrap_or("");
-        }} else { quote! {
-            let #fname = args.get(#fname_str).and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("missing or invalid field '{}'", #fname_str))?;
-        }},
+        _ => format!("ctl /srv/{} {} <{}>", service_name, method_name, v.type_name),
     }
 }
+
+fn doc_format_params(v: &UnionVariant, resolved: &ResolvedSchema) -> String {
+    let ct = CapnpType::classify_primitive(&v.type_name);
+    match ct {
+        CapnpType::Struct(_) | CapnpType::Unknown(_) => {
+            if let Some(sdef) = resolved.find_struct(&v.type_name) {
+                let mut out = String::new();
+                for f in sdef.non_union_fields() {
+                    let fname = to_snake_case(&f.name);
+                    let req = if f.optional || f.type_name == "Bool" { "optional" } else { "required" };
+                    if f.description.is_empty() {
+                        out.push_str(&format!("    {:16} {:10} ({})\n", fname, f.type_name, req));
+                    } else {
+                        out.push_str(&format!("    {:16} {:10} ({}) \u{2014} {}\n", fname, f.type_name, req, f.description));
+                    }
+                }
+                out
+            } else {
+                String::new()
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+fn doc_format_see_also(service_name: &str, method_name: &str, all_variants: &[UnionVariant], scoped_names: &[&str]) -> String {
+    let siblings: Vec<String> = all_variants.iter()
+        .filter(|v| !v.cli_hidden && !scoped_names.contains(&v.name.as_str()) && to_snake_case(&v.name) != method_name)
+        .map(|v| format!("{} {}", service_name, to_snake_case(&v.name)))
+        .collect();
+    siblings.join(", ")
+}
+
+fn doc_first_sentence(desc: &str) -> &str {
+    if desc.is_empty() { return desc; }
+    if let Some(pos) = desc.find(". ") {
+        &desc[..pos + 1]
+    } else {
+        desc
+    }
+}
+

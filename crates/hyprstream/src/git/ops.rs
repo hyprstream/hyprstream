@@ -8,7 +8,7 @@ use anyhow::{anyhow, Result};
 use git2::Repository;
 use std::path::Path;
 
-use crate::services::generated::registry_client::{DetailedStatusInfo, FileChangeTypeEnum, FileStatusInfo};
+use crate::services::generated::registry_client::{DetailedStatusInfo, FileChangeType, FileStatusInfo};
 
 // === Commit Operations ===
 
@@ -77,6 +77,14 @@ pub fn amend_head(repo: &Repository, message: &str) -> Result<git2::Oid> {
 }
 
 // === Staging Operations ===
+
+/// Stage all tracked modified files (git add -u)
+pub fn stage_all(repo: &Repository) -> Result<()> {
+    let mut index = repo.index()?;
+    index.update_all(["*"].iter(), None)?;
+    index.write()?;
+    Ok(())
+}
 
 /// Stage all files including untracked (git add -A)
 pub fn stage_all_with_untracked(repo: &Repository) -> Result<()> {
@@ -176,34 +184,34 @@ pub fn detailed_status(repo: &Repository) -> Result<DetailedStatusInfo> {
 
             // Index status
             let index_status = if status.contains(git2::Status::INDEX_NEW) {
-                FileChangeTypeEnum::Added
+                FileChangeType::Added
             } else if status.contains(git2::Status::INDEX_MODIFIED) {
-                FileChangeTypeEnum::Modified
+                FileChangeType::Modified
             } else if status.contains(git2::Status::INDEX_DELETED) {
-                FileChangeTypeEnum::Deleted
+                FileChangeType::Deleted
             } else if status.contains(git2::Status::INDEX_RENAMED) {
-                FileChangeTypeEnum::Renamed
+                FileChangeType::Renamed
             } else if status.contains(git2::Status::INDEX_TYPECHANGE) {
-                FileChangeTypeEnum::TypeChanged
+                FileChangeType::TypeChanged
             } else {
-                FileChangeTypeEnum::None
+                FileChangeType::None
             };
 
             // Worktree status
             let worktree_status = if status.contains(git2::Status::WT_NEW) {
-                FileChangeTypeEnum::Untracked
+                FileChangeType::Untracked
             } else if status.contains(git2::Status::WT_MODIFIED) {
-                FileChangeTypeEnum::Modified
+                FileChangeType::Modified
             } else if status.contains(git2::Status::WT_DELETED) {
-                FileChangeTypeEnum::Deleted
+                FileChangeType::Deleted
             } else if status.contains(git2::Status::WT_RENAMED) {
-                FileChangeTypeEnum::Renamed
+                FileChangeType::Renamed
             } else if status.contains(git2::Status::WT_TYPECHANGE) {
-                FileChangeTypeEnum::TypeChanged
+                FileChangeType::TypeChanged
             } else if status.contains(git2::Status::CONFLICTED) {
-                FileChangeTypeEnum::Conflicted
+                FileChangeType::Conflicted
             } else {
-                FileChangeTypeEnum::None
+                FileChangeType::None
             };
 
             files.push(FileStatusInfo {
@@ -250,6 +258,53 @@ pub fn detailed_status(repo: &Repository) -> Result<DetailedStatusInfo> {
 }
 
 // === Merge Operations ===
+
+/// Merge a source branch into the current branch
+pub fn merge(repo: &Repository, source: &str, message: Option<&str>) -> Result<git2::Oid> {
+    let source_ref = repo.revparse_single(source)?;
+    let source_commit = source_ref.peel_to_commit()?;
+
+    let annotated = repo.find_annotated_commit(source_commit.id())?;
+    let (analysis, _) = repo.merge_analysis(&[&annotated])?;
+
+    if analysis.is_up_to_date() {
+        return Ok(source_commit.id());
+    }
+
+    if analysis.is_fast_forward() {
+        let refname = format!("refs/heads/{}", repo.head()?.shorthand().unwrap_or("HEAD"));
+        repo.reference(&refname, source_commit.id(), true,
+            &format!("Fast-forward to {}", source))?;
+        repo.set_head(&refname)?;
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
+        return Ok(source_commit.id());
+    }
+
+    // Normal merge
+    repo.merge(&[&annotated], None, None)?;
+
+    let mut index = repo.index()?;
+    if index.has_conflicts() {
+        return Err(anyhow!("Merge conflicts detected. Resolve and use continueMerge."));
+    }
+
+    let tree_id = index.write_tree()?;
+    let tree = repo.find_tree(tree_id)?;
+    let sig = repo.signature()?;
+    let head = repo.head()?.peel_to_commit()?;
+
+    let merge_msg = message.map(String::from).unwrap_or_else(|| {
+        format!("Merge '{}' into {}", source, head.summary().unwrap_or("HEAD"))
+    });
+
+    let oid = repo.commit(
+        Some("HEAD"), &sig, &sig, &merge_msg, &tree,
+        &[&head, &source_commit],
+    )?;
+
+    repo.cleanup_state()?;
+    Ok(oid)
+}
 
 /// Abort merge: reset to ORIG_HEAD, cleanup state
 pub fn abort_merge(repo: &Repository) -> Result<()> {

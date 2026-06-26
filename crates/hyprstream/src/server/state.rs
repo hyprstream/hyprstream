@@ -1,6 +1,7 @@
 //! Server state management
 
-use crate::services::{GenRegistryClient, ModelZmqClient, PolicyClient};
+use crate::services::{RegistryClient, PolicyClient};
+use crate::services::generated::model_client::{ModelClient, LoadModelRequest};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -15,13 +16,13 @@ pub use hyprstream_metrics::storage::context::{ContextRecord, ContextStore, Sear
 #[derive(Clone)]
 pub struct ServerState {
     /// Model client for inference operations via ZMQ
-    pub model_client: ModelZmqClient,
+    pub model_client: ModelClient,
 
     /// Policy client for authorization checks via ZMQ
     pub policy_client: PolicyClient,
 
     /// Registry client for model operations
-    pub registry: GenRegistryClient,
+    pub registry: RegistryClient,
 
     /// Server configuration (from unified config system)
     pub config: Arc<ServerConfig>,
@@ -40,6 +41,13 @@ pub struct ServerState {
 
     /// Cached resource URL for WWW-Authenticate headers (avoids per-request config reload)
     pub resource_url: String,
+
+    /// OAuth issuer URL for local tokens (matches the `iss` claim in locally-issued JWTs).
+    pub oauth_issuer_url: String,
+
+    /// Federation key resolver for multi-issuer JWT verification.
+    /// Contains trusted issuers (empty if none configured).
+    pub federation_resolver: Arc<crate::auth::FederationKeyResolver>,
 }
 
 /// Metrics collector
@@ -76,22 +84,30 @@ impl ServerState {
     /// respective services in main.rs.
     pub async fn new(
         config: ServerConfig,
-        model_client: ModelZmqClient,
+        model_client: ModelClient,
         policy_client: PolicyClient,
-        registry: GenRegistryClient,
+        registry: RegistryClient,
         signing_key: SigningKey,
+        jwt_verifying_key: VerifyingKey,
         resource_url: String,
+        oauth_issuer_url: String,
+        trusted_issuers: &std::collections::HashMap<String, crate::config::TrustedIssuerConfig>,
     ) -> Result<Self, anyhow::Error> {
-        let verifying_key = signing_key.verifying_key();
         let signing_key = Arc::new(signing_key);
-        let verifying_key = Arc::new(verifying_key);
+        // Use the CA JWT verifying key (not the service's own key) so HTTP Bearer tokens
+        // issued by PolicyService can be verified correctly.
+        let verifying_key = Arc::new(jwt_verifying_key);
 
         // Preload models for faster first request
         if !config.preload_models.is_empty() {
             tracing::info!("Preloading {} models", config.preload_models.len());
             for model_name in &config.preload_models {
                 tracing::info!("Preloading model: {}", model_name);
-                match model_client.load(model_name, None).await {
+                match model_client.load(&LoadModelRequest {
+                    model_ref: model_name.to_owned(),
+                    max_context: None,
+                    kv_quant: None,
+                }).await {
                     Ok(_) => tracing::info!("Preloaded: {}", model_name),
                     Err(e) => tracing::warn!("Failed to preload model '{}': {}", model_name, e),
                 }
@@ -100,6 +116,14 @@ impl ServerState {
 
         // Initialize metrics
         let metrics = Arc::new(Metrics::default());
+
+        // Wire the unified federation:register PolicyService gate. Same
+        // gate as CIMD client registration — single atproto-style
+        // trust decision applies to both clients and peers.
+        let federation_resolver = Arc::new(
+            crate::auth::FederationKeyResolver::new(trusted_issuers)
+                .with_policy_client(Arc::new(policy_client.clone()))
+        );
 
         Ok(Self {
             model_client,
@@ -111,6 +135,8 @@ impl ServerState {
             verifying_key,
             context_store: None, // Initialize via enable_context_store() if needed
             resource_url,
+            oauth_issuer_url,
+            federation_resolver,
         })
     }
 

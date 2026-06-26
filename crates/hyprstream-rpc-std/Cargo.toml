@@ -1,0 +1,43 @@
+[package]
+name = "hyprstream-rpc-std"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT"
+description = "Standard hyprstream service schemas and generated clients"
+links = "hyprstream_rpc_std"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+hyprstream-rpc = { path = "../hyprstream-rpc" }
+hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }
+
+capnp = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+subsecond = { workspace = true }
+hyprstream-vfs = { path = "../hyprstream-vfs" }
+hyprstream-tcl = { path = "../hyprstream-tcl" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+serde-wasm-bindgen = "0.6"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+web-sys = { version = "0.3", features = ["console"] }
+# WanixMount 9P-over-DMA bridge (#409/#391). wasm32-only: the WanixMount and its
+# P9Client/DmaTransport are entirely `#[cfg(target_arch = "wasm32")]`, so this is
+# gated to the browser target to keep mount_wanix buildable in the wasm bundle.
+hyprstream-9p = { path = "../hyprstream-9p" }
+
+[build-dependencies]
+capnpc = { workspace = true }
+hyprstream-rpc-build = { path = "../hyprstream-rpc-build" }
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false

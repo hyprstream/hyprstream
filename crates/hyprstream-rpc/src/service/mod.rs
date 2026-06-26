@@ -1,28 +1,26 @@
 //! Service-side RPC infrastructure.
 //!
 //! This module provides:
-//! - `ZmqService`, `RequestLoop`, `ZmqClient` - ZMQ REQ/REP service infrastructure
+//! - `RequestService` - RPC service trait
 //! - `EnvelopeContext` - Verified request context passed to handlers
 //! - `ServiceHandle` - Handle for managing running services
 //! - `RpcService`, `RpcHandler` - Lower-level RPC traits
-//! - `spawner` - Process and service spawning abstractions
-//! - `manager` - Service lifecycle management (systemd/standalone)
+//!
+//! Spawner, factory, and manager have moved to the `hyprstream-service` crate.
+//! Metadata types remain here (used by proc macro codegen across all crates).
 
 mod traits;
-mod zmq;
-pub mod spawner;
-pub mod manager;
-pub mod streaming;
-pub mod factory;
+mod svc;
+pub mod dispatch;
+pub mod serve;
+pub mod spawnable;
 pub mod metadata;
+pub mod doc;
 
 pub use traits::{RpcHandler, RpcRequest, RpcService};
-pub use zmq::{AuthorizeFn, CallOptions, Continuation, EnvelopeContext, ServiceHandle, RequestLoop, ZmqClient, ZmqService};
-pub use streaming::StreamService;
-pub use spawner::{InprocManager, Spawnable, SpawnedService};
-pub use factory::{get_factory, list_factories, ServiceClient, ServiceContext, ServiceFactory};
-
-// Re-export service manager types
-pub use manager::{detect as detect_service_manager, ServiceManager, StandaloneManager};
-#[cfg(feature = "systemd")]
-pub use manager::SystemdManager;
+/// Transport-neutral request dispatch core (#148) — shared by all front-ends.
+pub use dispatch::process_request;
+pub use svc::{AuthorizeFn, Continuation, EnvelopeContext, QuicLoopConfig, ServiceHandle, RequestService};
+pub use spawnable::Spawnable;
+pub use metadata::{MethodMeta, ParamMeta, SchemaMetadataFn, ScopedSchemaMetadataFn, ScopedClientTreeNode};
+pub use doc::DocFs;

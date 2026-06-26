@@ -39,6 +39,56 @@ jobs:
     - name: Run Clippy
       run: cargo clippy --workspace --all-targets --features download-libtorch -- -D warnings
 
+  deny:
+    name: cargo-deny (bans + licenses)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install cargo-deny
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-deny
+    - name: Check bans
+      # ZMQ crates are deny-listed in deny.toml (#138 complete). This gate must
+      # be able to fail — do NOT add `|| true`.
+      # Unset RUSTC_WRAPPER: job-level env: "" doesn't clear workflow-level env on GHA.
+      run: |
+        unset RUSTC_WRAPPER
+        cargo deny check bans licenses
+
+  wasm:
+    name: WASM (browser client)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    # capnproto only — the wasm browser client (hyprstream-rpc) has no libtorch/systemd deps.
+    - name: Install build dependencies
+      run: sudo apt-get update && sudo apt-get install -y capnproto pkg-config
+
+    - name: Install Rust toolchain (wasm32)
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: wasm32-unknown-unknown
+
+    - name: Setup sccache
+      uses: mozilla-actions/sccache-action@v0.0.9
+      with:
+        key: rust-sccache
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: rust-wasm
+
+    # Guards the browser/WebTransport build (#225/#226): getrandom wasm_js (Cargo.toml) +
+    # the web_sys_unstable_apis rustflag for WebTransport. Catches wasm-only breakage the
+    # native clippy/build jobs miss (e.g. the PQ-crypto getrandom regression).
+    - name: Check wasm32 browser build
+      run: cargo check --target wasm32-unknown-unknown -p hyprstream-rpc
+      env:
+        RUSTFLAGS: "--cfg=web_sys_unstable_apis"
+
   build:
     runs-on: ubuntu-latest
     needs: clippy  # Only build if clippy passes

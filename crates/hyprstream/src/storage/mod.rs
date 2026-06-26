@@ -12,6 +12,7 @@ pub mod adapter_manager;
 pub mod errors;
 pub mod model_ref;
 pub mod paths;
+pub mod release_store;
 
 // Re-export types for backward compatibility
 pub use adapter_manager::{AdapterConfig, AdapterInfo, AdapterManager};

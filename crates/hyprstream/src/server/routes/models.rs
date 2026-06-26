@@ -11,22 +11,26 @@ use axum::{
 use chrono;
 use serde::{Deserialize, Serialize};
 
-/// Resolve a ModelRef to its worktree path via registry.
+/// Resolve a ModelRef to its worktree path (locally derived, not from RPC).
 async fn resolve_model_path(
-    registry: &crate::services::GenRegistryClient,
+    registry: &crate::services::RegistryClient,
     model_ref: &crate::storage::ModelRef,
 ) -> anyhow::Result<String> {
-    let tracked = registry.get_by_name(&model_ref.model).await?;
+    let tracked = registry.get_by_name(model_ref.name()).await?;
     let repo = registry.repo(&tracked.id);
     let branch = match &model_ref.git_ref {
         crate::storage::GitRef::Branch(name) => name.clone(),
         _ => repo.get_head().await?,
     };
+    // Verify worktree exists
     let wts = repo.list_worktrees().await?;
-    wts.iter()
-        .find(|wt| wt.branch_name == branch)
-        .map(|wt| wt.path.clone())
-        .ok_or_else(|| anyhow::anyhow!("worktree for {}:{} not found", model_ref.model, branch))
+    if !wts.iter().any(|wt| wt.branch_name == branch) {
+        anyhow::bail!("worktree for {}:{} not found", model_ref.name(), branch);
+    }
+    // Derive path locally
+    let storage_paths = StoragePaths::new()?;
+    Ok(storage_paths.worktree_path(model_ref.name(), &branch)?
+        .to_string_lossy().to_string())
 }
 
 /// Create model management router
@@ -75,7 +79,12 @@ async fn list_models(
     auth_user: Option<Extension<AuthenticatedUser>>,
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
-    if !state.policy_client.check(&user, "*", "registry:*", Operation::Query.as_str()).await.unwrap_or(false) {
+    if !state.policy_client.check(&crate::services::generated::policy_client::PolicyCheck {
+        subject: user.clone(),
+        domain: "*".to_owned(),
+        resource: "registry:*".to_owned(),
+        operation: Operation::Query.as_str().to_owned(),
+    }).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -103,7 +112,7 @@ async fn list_models(
                             architecture: "language_model".to_owned(),
                             size_bytes: 0,
                             is_cached: true,
-                            local_path: Some(wt.path.clone()),
+                            local_path: None, // path no longer exposed via RPC
                         });
                     }
                 }
@@ -135,7 +144,12 @@ async fn get_model_info(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{id}");
-    if !state.policy_client.check(&user, "*", &resource, Operation::Query.as_str()).await.unwrap_or(false) {
+    if !state.policy_client.check(&crate::services::generated::policy_client::PolicyCheck {
+        subject: user.clone(),
+        domain: "*".to_owned(),
+        resource: resource.clone(),
+        operation: Operation::Query.as_str().to_owned(),
+    }).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -148,22 +162,12 @@ async fn get_model_info(
     use crate::storage::model_ref::ModelRef;
     if let Ok(model_ref) = ModelRef::parse(&id) {
         let path_result: Result<String, anyhow::Error> = async {
-            let tracked = state.registry.get_by_name(&model_ref.model).await?;
-            let repo = state.registry.repo(&tracked.id);
-            let branch = match &model_ref.git_ref {
-                crate::storage::GitRef::Branch(name) => name.clone(),
-                _ => repo.get_head().await?,
-            };
-            let wts = repo.list_worktrees().await?;
-            wts.iter()
-                .find(|wt| wt.branch_name == branch)
-                .map(|wt| wt.path.clone())
-                .ok_or_else(|| anyhow::anyhow!("worktree not found"))
+            resolve_model_path(&state.registry, &model_ref).await
         }.await;
         if let Ok(_path) = path_result {
             // Create metadata for the found model
             let metadata = crate::storage::ModelMetadata {
-                name: model_ref.model.clone(),
+                name: model_ref.name().to_owned(),
                 display_name: Some(id.clone()),
                 model_type: "language_model".to_owned(),
                 created_at: chrono::Utc::now().timestamp(),
@@ -192,7 +196,12 @@ async fn download_model(
     Json(request): Json<DownloadModelRequest>,
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
-    if !state.policy_client.check(&user, "*", "registry:*", Operation::Write.as_str()).await.unwrap_or(false) {
+    if !state.policy_client.check(&crate::services::generated::policy_client::PolicyCheck {
+        subject: user.clone(),
+        domain: "*".to_owned(),
+        resource: "registry:*".to_owned(),
+        operation: Operation::Write.as_str().to_owned(),
+    }).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -261,7 +270,13 @@ async fn download_model(
     }
 
     // Use registry client to clone model (no duplicate service)
-    if let Err(e) = state.registry.clone(&request.uri, &model_name, true, 1, "").await {
+    if let Err(e) = state.registry.clone(&crate::services::generated::registry_client::CloneRequest {
+        url: request.uri.clone(),
+        name: model_name.clone(),
+        shallow: true,
+        depth: 1,
+        branch: String::new(),
+    }).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -303,7 +318,12 @@ async fn load_model(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{id}");
-    if !state.policy_client.check(&user, "*", &resource, Operation::Manage.as_str()).await.unwrap_or(false) {
+    if !state.policy_client.check(&crate::services::generated::policy_client::PolicyCheck {
+        subject: user.clone(),
+        domain: "*".to_owned(),
+        resource: resource.clone(),
+        operation: Operation::Manage.as_str().to_owned(),
+    }).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -357,7 +377,12 @@ async fn unload_model(
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
     let resource = format!("model:{id}");
-    if !state.policy_client.check(&user, "*", &resource, Operation::Manage.as_str()).await.unwrap_or(false) {
+    if !state.policy_client.check(&crate::services::generated::policy_client::PolicyCheck {
+        subject: user.clone(),
+        domain: "*".to_owned(),
+        resource: resource.clone(),
+        operation: Operation::Manage.as_str().to_owned(),
+    }).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -379,7 +404,12 @@ async fn refresh_cache(
     auth_user: Option<Extension<AuthenticatedUser>>,
 ) -> impl IntoResponse {
     let user = server::extract_user(auth_user.as_ref());
-    if !state.policy_client.check(&user, "*", "registry:*", Operation::Manage.as_str()).await.unwrap_or(false) {
+    if !state.policy_client.check(&crate::services::generated::policy_client::PolicyCheck {
+        subject: user.clone(),
+        domain: "*".to_owned(),
+        resource: "registry:*".to_owned(),
+        operation: Operation::Manage.as_str().to_owned(),
+    }).await.unwrap_or(false) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({

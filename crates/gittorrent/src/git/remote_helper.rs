@@ -363,8 +363,19 @@ impl GitRemoteHelper {
                 // Try to query repository metadata from P2P network
                 match self.service.query_repository(&repo_identifier).await? {
                     Some(metadata) => {
-                        let repo = self.init_git_repo(local_repo)?;
-                        self.create_git_repo_from_metadata(&repo, &metadata, ref_name, url).await?;
+                        let path = local_repo.to_path_buf();
+                        let ref_name = ref_name.to_owned();
+                        let url_clone = url.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let repo = if !path.join(".git").exists() {
+                                git2::Repository::init_bare(&path)?
+                            } else {
+                                git2::Repository::open(&path)?
+                            };
+                            Self::create_git_repo_from_metadata_sync(&repo, &metadata, &ref_name, &url_clone)
+                        })
+                        .await
+                        .map_err(|e| crate::Error::other(format!("Task join error: {e}")))??;
                     }
                     None => {
                         tracing::info!("Repository metadata not found in P2P network, creating basic repository");
@@ -376,15 +387,6 @@ impl GitRemoteHelper {
 
         tracing::debug!("Successfully fetched repository data to {}", local_repo.display());
         Ok(())
-    }
-
-    /// Initialize or open Git repository
-    fn init_git_repo(&self, local_repo: &Path) -> Result<git2::Repository> {
-        if !local_repo.join(".git").exists() {
-            git2::Repository::init_bare(local_repo).map_err(Error::from)
-        } else {
-            git2::Repository::open(local_repo).map_err(Error::from)
-        }
     }
 
     /// Clone repository from DHT using merkle tree traversal
@@ -413,12 +415,61 @@ impl GitRemoteHelper {
     async fn create_basic_repository(
         &self,
         local_repo: &Path,
-        identifier: &str,
+        _identifier: &str,
         ref_name: &str,
         url: &GitTorrentUrl,
     ) -> Result<()> {
-        let repo = self.init_git_repo(local_repo)?;
-        self.create_functional_git_repo(&repo, identifier, ref_name, url).await
+        let path = local_repo.to_path_buf();
+        let ref_name = ref_name.to_owned();
+        let url_str = url.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            // Init or open the repository
+            let repo = if !path.join(".git").exists() {
+                git2::Repository::init_bare(&path)?
+            } else {
+                git2::Repository::open(&path)?
+            };
+
+            // Create initial commit with empty tree (same as create_functional_git_repo)
+            let sig = git2::Signature::new("GitTorrent", "gittorrent@example.com", &git2::Time::new(1234567890, 0))?;
+
+            let tree_id = {
+                let mut tree_builder = repo.treebuilder(None)?;
+                let readme_content = format!("# GitTorrent Repository\n\nThis repository is hosted via GitTorrent.\n\nURL: {url_str}\n");
+                let readme_oid = repo.blob(readme_content.as_bytes())?;
+                tree_builder.insert("README.md", readme_oid, 0o100644)?;
+                tree_builder.write()?
+            };
+
+            let tree = repo.find_tree(tree_id)?;
+
+            let commit_id = repo.commit(
+                None,
+                &sig,
+                &sig,
+                "Initial GitTorrent commit",
+                &tree,
+                &[],
+            )?;
+
+            let ref_name_normalized = if ref_name.starts_with("refs/") {
+                ref_name.clone()
+            } else {
+                format!("refs/heads/{ref_name}")
+            };
+
+            repo.reference(&ref_name_normalized, commit_id, true, "Initial commit")?;
+
+            if ref_name.contains("main") || ref_name.contains("master") {
+                repo.set_head(&ref_name_normalized)?;
+            }
+
+            tracing::debug!("Created functional Git repository with commit {}", commit_id);
+            Ok(())
+        })
+        .await
+        .map_err(|e| crate::Error::other(format!("Task join error: {e}")))?
     }
 
     /// Push repository data to P2P network
@@ -444,22 +495,17 @@ impl GitRemoteHelper {
     }
 
     /// Create a Git repository from P2P network metadata
-    async fn create_git_repo_from_metadata(
-        &self,
+    fn create_git_repo_from_metadata_sync(
         repo: &git2::Repository,
         metadata: &crate::service::RepositoryMetadata,
         ref_name: &str,
         url: &GitTorrentUrl,
     ) -> Result<()> {
-        // Create initial commit with README that includes metadata
-        let sig = git2::Signature::new("GitTorrent", "gittorrent@example.com", &git2::Time::new(1234567890, 0))
-            .map_err(Error::from)?;
+        let sig = git2::Signature::new("GitTorrent", "gittorrent@example.com", &git2::Time::new(1234567890, 0))?;
 
-        // Create tree with README and metadata info
         let tree_id = {
-            let mut tree_builder = repo.treebuilder(None).map_err(Error::from)?;
+            let mut tree_builder = repo.treebuilder(None)?;
 
-            // Add a README file with repository information
             let readme_content = format!(
                 "# GitTorrent Repository\n\nThis repository is hosted via GitTorrent P2P network.\n\n\
                 URL: {}\n\
@@ -476,95 +522,41 @@ impl GitRemoteHelper {
                 metadata.last_updated
             );
 
-            let readme_oid = repo.blob(readme_content.as_bytes()).map_err(Error::from)?;
-            tree_builder.insert("README.md", readme_oid, 0o100644).map_err(Error::from)?;
+            let readme_oid = repo.blob(readme_content.as_bytes())?;
+            tree_builder.insert("README.md", readme_oid, 0o100644)?;
 
-            // Add a metadata file for debugging
             let metadata_content = serde_json::to_string_pretty(metadata)
                 .map_err(|e| Error::other(format!("Failed to serialize metadata: {e}")))?;
-            let metadata_oid = repo.blob(metadata_content.as_bytes()).map_err(Error::from)?;
-            tree_builder.insert(".gittorrent-metadata.json", metadata_oid, 0o100644).map_err(Error::from)?;
+            let metadata_oid = repo.blob(metadata_content.as_bytes())?;
+            tree_builder.insert(".gittorrent-metadata.json", metadata_oid, 0o100644)?;
 
-            tree_builder.write().map_err(Error::from)?
+            tree_builder.write()?
         };
 
-        let tree = repo.find_tree(tree_id).map_err(Error::from)?;
+        let tree = repo.find_tree(tree_id)?;
 
-        // Create initial commit
         let commit_id = repo.commit(
-            None, // Don't update any reference yet
+            None,
             &sig,
             &sig,
             "Initial GitTorrent commit from P2P network",
             &tree,
-            &[] // No parents for initial commit
-        ).map_err(Error::from)?;
+            &[],
+        )?;
 
-        // Update the reference to point to this commit
         let ref_name_normalized = if ref_name.starts_with("refs/") {
             ref_name.to_owned()
         } else {
             format!("refs/heads/{ref_name}")
         };
 
-        repo.reference(&ref_name_normalized, commit_id, true, "Initial commit from P2P")
-            .map_err(Error::from)?;
+        repo.reference(&ref_name_normalized, commit_id, true, "Initial commit from P2P")?;
 
-        // Set HEAD if this is a main/master branch
         if ref_name.contains("main") || ref_name.contains("master") {
-            repo.set_head(&ref_name_normalized).map_err(Error::from)?;
+            repo.set_head(&ref_name_normalized)?;
         }
 
         tracing::debug!("Created Git repository from P2P metadata with commit {}", commit_id);
-        Ok(())
-    }
-
-    /// Create a functional Git repository with proper Git objects
-    async fn create_functional_git_repo(&self, repo: &git2::Repository, _commit_hash: &str, ref_name: &str, url: &GitTorrentUrl) -> Result<()> {
-        // Create initial commit with empty tree
-        let sig = git2::Signature::new("GitTorrent", "gittorrent@example.com", &git2::Time::new(1234567890, 0))
-            .map_err(Error::from)?;
-
-        // Create empty tree
-        let tree_id = {
-            let mut tree_builder = repo.treebuilder(None).map_err(Error::from)?;
-
-            // Add a README file to make it a non-empty repository
-            let readme_content = format!("# GitTorrent Repository\n\nThis repository is hosted via GitTorrent.\n\nURL: {url}\n");
-
-            let readme_oid = repo.blob(readme_content.as_bytes()).map_err(Error::from)?;
-            tree_builder.insert("README.md", readme_oid, 0o100644).map_err(Error::from)?;
-            tree_builder.write().map_err(Error::from)?
-        };
-
-        let tree = repo.find_tree(tree_id).map_err(Error::from)?;
-
-        // Create initial commit
-        let commit_id = repo.commit(
-            None, // Don't update any reference yet
-            &sig,
-            &sig,
-            "Initial GitTorrent commit",
-            &tree,
-            &[] // No parents for initial commit
-        ).map_err(Error::from)?;
-
-        // Update the reference to point to this commit
-        let ref_name_normalized = if ref_name.starts_with("refs/") {
-            ref_name.to_owned()
-        } else {
-            format!("refs/heads/{ref_name}")
-        };
-
-        repo.reference(&ref_name_normalized, commit_id, true, "Initial commit")
-            .map_err(Error::from)?;
-
-        // If this is a main/master branch, also update HEAD
-        if ref_name.contains("main") || ref_name.contains("master") {
-            repo.set_head(&ref_name_normalized).map_err(Error::from)?;
-        }
-
-        tracing::debug!("Created functional Git repository with commit {}", commit_id);
         Ok(())
     }
 
@@ -599,40 +591,42 @@ impl GitRemoteHelper {
 
     /// Get repository references using git2
     async fn get_repository_refs_git2(&self, repo_path: &Path) -> Result<HashMap<String, String>> {
-        let mut refs = HashMap::new();
-
         if !repo_path.exists() {
-            return Ok(refs);
+            return Ok(HashMap::new());
         }
 
-        // Open repository with git2
-        let repo = match git2::Repository::open(repo_path) {
-            Ok(repo) => repo,
-            Err(_) => return Ok(refs), // Not a git repository
-        };
+        let path = repo_path.to_path_buf();
+        let refs = super::with_repo_blocking(path.clone(), |repo| {
+            let mut refs = HashMap::new();
 
-        // Iterate through all references
-        let ref_iter = repo.references().map_err(Error::from)?;
-        for reference in ref_iter {
-            let reference = reference.map_err(Error::from)?;
+            let ref_iter = repo.references().map_err(Error::from)?;
+            for reference in ref_iter {
+                let reference = reference.map_err(Error::from)?;
 
-            if let Some(name) = reference.name() {
-                // Get the target OID
-                if let Some(target) = reference.target() {
-                    refs.insert(name.to_owned(), target.to_string());
-                } else if let Some(symbolic_target) = reference.symbolic_target() {
-                    // Handle symbolic references (like HEAD)
-                    if let Ok(resolved) = repo.resolve_reference_from_short_name(symbolic_target) {
-                        if let Some(target) = resolved.target() {
-                            refs.insert(name.to_owned(), target.to_string());
+                if let Some(name) = reference.name() {
+                    if let Some(target) = reference.target() {
+                        refs.insert(name.to_owned(), target.to_string());
+                    } else if let Some(symbolic_target) = reference.symbolic_target() {
+                        if let Ok(resolved) = repo.resolve_reference_from_short_name(symbolic_target) {
+                            if let Some(target) = resolved.target() {
+                                refs.insert(name.to_owned(), target.to_string());
+                            }
                         }
                     }
                 }
             }
-        }
 
-        tracing::debug!("Found {} references in repository at {}", refs.len(), repo_path.display());
-        Ok(refs)
+            Ok(refs)
+        }).await;
+
+        // If open fails (not a git repo), return empty map
+        match refs {
+            Ok(r) => {
+                tracing::debug!("Found {} references in repository at {}", r.len(), repo_path.display());
+                Ok(r)
+            }
+            Err(_) => Ok(HashMap::new()),
+        }
     }
 }
 

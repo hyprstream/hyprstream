@@ -20,20 +20,23 @@
 //! 3. Backend services enforce authorization via Casbin policies
 
 use async_trait::async_trait;
-use crate::services::{ModelZmqClient, GenRegistryClient, PolicyClient};
+use crate::services::{RegistryClient, PolicyClient};
+use crate::services::generated::model_client::ModelClient;
+use crate::services::generated::tui_client::TuiClient;
 use http::header::AUTHORIZATION;
 use crate::services::generated::mcp_client::{
     McpHandler, McpResponseVariant, ToolDefinition, ServiceStatus,
     ToolList, ServiceMetrics, CallTool, dispatch_mcp, serialize_response,
     ErrorInfo,
 };
+use crate::services::generated::policy_client::PolicyCheck;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::future::BoxFuture;
 use hyprstream_rpc::auth::jwt;
-use hyprstream_rpc::envelope::RequestIdentity;
-use hyprstream_rpc::service::factory::ServiceContext;
-use hyprstream_rpc::service::ZmqService;
-use hyprstream_rpc::streaming::{StreamHandle, StreamPayload};
+use hyprstream_service::ServiceContext;
+use hyprstream_rpc::service::RequestService;
+use hyprstream_rpc::moq_stream::MoqStreamHandle;
+use hyprstream_rpc::streaming::StreamPayload;
 use hyprstream_rpc::transport::TransportConfig;
 use rmcp::{
     model::{
@@ -48,7 +51,8 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, trace};
+use parking_lot::RwLock;
+use tracing::{trace, warn};
 use uuid::Uuid;
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -64,6 +68,69 @@ const MCP_NS: Uuid = Uuid::from_bytes([
     0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
 ]);
 
+// b07676df-be7f-56eb-9cd8-e91cfd689158 = UUID v5(MCP_NS, "mcp.refresh_tools")
+const REFRESH_TOOLS_UUID: Uuid = Uuid::from_bytes([
+    0xb0, 0x76, 0x76, 0xdf, 0xbe, 0x7f, 0x56, 0xeb,
+    0x9c, 0xd8, 0xe9, 0x1c, 0xfd, 0x68, 0x91, 0x58,
+]);
+
+/// Normalize MCP tool arguments for backend deserialization.
+///
+/// MCP tool schemas expose snake_case parameter names with string types,
+/// but the generated request structs use `#[serde(rename_all = "camelCase")]`
+/// with native numeric types. This function:
+/// 1. Converts object keys from snake_case to camelCase
+/// 2. Coerces string values to numbers/booleans where possible
+fn normalize_mcp_args(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let converted: serde_json::Map<String, Value> = map
+                .into_iter()
+                .map(|(k, v)| {
+                    let camel = snake_to_camel(&k);
+                    (camel, normalize_mcp_args(v))
+                })
+                .collect();
+            Value::Object(converted)
+        }
+        Value::Array(arr) => Value::Array(arr.into_iter().map(normalize_mcp_args).collect()),
+        Value::String(ref s) if s.is_empty() => value,
+        Value::String(ref s) => {
+            if s == "true" { return Value::Bool(true); }
+            if s == "false" { return Value::Bool(false); }
+            if let Ok(n) = s.parse::<u64>() {
+                return Value::Number(n.into());
+            }
+            if let Ok(n) = s.parse::<i64>() {
+                return Value::Number(n.into());
+            }
+            if let Ok(n) = s.parse::<f64>() {
+                if let Some(num) = serde_json::Number::from_f64(n) {
+                    return Value::Number(num);
+                }
+            }
+            value
+        }
+        other => other,
+    }
+}
+
+fn snake_to_camel(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut capitalize_next = false;
+    for ch in s.chars() {
+        if ch == '_' {
+            capitalize_next = true;
+        } else if capitalize_next {
+            result.extend(ch.to_uppercase());
+            capitalize_next = false;
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Configuration
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -73,16 +140,19 @@ const MCP_NS: Uuid = Uuid::from_bytes([
 pub struct McpConfig {
     /// Ed25519 public key for JWT verification
     pub verifying_key: VerifyingKey,
-    /// ZMQ context for backend clients
-    pub zmq_context: Arc<zmq::Context>,
-    /// Ed25519 signing key for creating ZMQ clients
+    /// Ed25519 signing key for creating RPC clients
     pub signing_key: SigningKey,
-    /// ZMQ transport for control plane
+    /// RPC transport for control plane
     pub transport: TransportConfig,
     /// Service context for client construction (optional for backward compat)
     pub ctx: Option<Arc<ServiceContext>>,
+    /// PolicyService verifying key — used to create the internal PolicyClient
+    /// for peer key resolution and authorization checks.
+    pub policy_verifying_key: VerifyingKey,
     /// Expected audience (resource URL) for future defense-in-depth
     pub expected_audience: Option<String>,
+    /// JWT key source for verifying JWTs on ZMQ path (unified local + federated).
+    pub jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -93,19 +163,35 @@ pub struct McpConfig {
 pub enum ToolResult {
     /// Immediate JSON result (REQ/REP tools)
     Sync(Value),
-    /// Streaming result — StreamHandle encapsulates DH, SUB, HMAC verification
-    Stream(Box<StreamHandle>),
+    /// Streaming result — MoqStreamHandle encapsulates DH, moq subscribe, HMAC verification
+    Stream(Box<MoqStreamHandle>),
 }
 
-/// Context passed to handler — carries auth + ZMQ infra + optional ServiceContext
+/// Context passed to handler — carries auth + optional ServiceContext
 pub struct ToolCallContext {
     pub args: Value,
     pub signing_key: SigningKey,
-    pub zmq_context: Arc<zmq::Context>,
-    /// Authenticated identity propagated to backend services
-    pub identity: RequestIdentity,
+    /// Authenticated user string propagated to backend services
+    pub user: String,
     /// ServiceContext for typed_client() / client() access (optional for backward compat)
     pub ctx: Option<Arc<ServiceContext>>,
+    /// PolicyClient for resolving peer verifying keys
+    pub policy_client: PolicyClient,
+}
+
+impl ToolCallContext {
+    /// Resolve a peer service's verifying key via PolicyService RPC.
+    pub async fn resolve_peer_key(&self, service_name: &str) -> anyhow::Result<VerifyingKey> {
+        let resp = self.policy_client.resolve_service_key(
+            &crate::services::generated::policy_client::ResolveServiceKey {
+                service_name: service_name.to_owned(),
+            },
+        ).await?;
+        let bytes: [u8; 32] = resp.verifying_key.as_slice().try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid verifying key length from PolicyService"))?;
+        VerifyingKey::from_bytes(&bytes)
+            .map_err(|e| anyhow::anyhow!("Invalid Ed25519 key: {e}"))
+    }
 }
 
 type ToolHandler = Arc<dyn Fn(ToolCallContext) -> BoxFuture<'static, anyhow::Result<ToolResult>> + Send + Sync>;
@@ -158,7 +244,7 @@ impl ToolRegistry {
 /// Scope and streaming flags are read from MethodSchema.
 fn register_schema_tools(reg: &mut ToolRegistry) {
     use crate::services::generated::{
-        model_client, registry_client, policy_client,
+        model_client, registry_client, policy_client, tui_client,
     };
     // Each service generates its own MethodSchema type, so we use a macro
     // to iterate each service's methods with the correct type.
@@ -166,6 +252,8 @@ fn register_schema_tools(reg: &mut ToolRegistry) {
         ($reg:expr, $schema_fn:expr) => {{
             let (service_name, methods) = $schema_fn;
             for method in methods {
+                // FIX-7: respect $cliHidden — don't expose internal methods as MCP tools
+                if method.hidden { continue; }
                 let tool_name = format!("{service_name}.{}", method.name);
                 let params: Vec<(&str, &str, bool, &str)> = method.params.iter()
                     .map(|p| (p.name, p.type_name, p.required, p.description))
@@ -196,6 +284,7 @@ fn register_schema_tools(reg: &mut ToolRegistry) {
     register_top_level!(reg, model_client::schema_metadata());
     register_top_level!(reg, registry_client::schema_metadata());
     register_top_level!(reg, policy_client::schema_metadata());
+    register_top_level!(reg, tui_client::schema_metadata());
     // Scoped tools: recursive tree walk for all services with nested scopes
     register_scoped_tools_recursive(reg, "registry", registry_client::scoped_client_tree(), "registry", &[]);
     register_scoped_tools_recursive(reg, "model", model_client::scoped_client_tree(), "model", &[]);
@@ -213,7 +302,7 @@ type ScopeInfo = (&'static str, &'static str, &'static str); // (scope_name, fie
 fn register_scoped_tools_recursive(
     reg: &mut ToolRegistry,
     service_name: &str,
-    nodes: &'static [hyprstream_rpc::service::metadata::ScopedClientTreeNode],
+    nodes: &'static [hyprstream_service::ScopedClientTreeNode],
     prefix: &str,
     parent_scopes: &[ScopeInfo],
 ) {
@@ -232,6 +321,8 @@ fn register_scoped_tools_recursive(
         }
 
         for method in methods {
+            // FIX-7: respect $cliHidden — don't expose internal methods as MCP tools
+            if method.hidden { continue; }
             let tool_name = format!("{}.{}", new_prefix, method.name);
 
             // Build JSON schema: method params + all scope fields from ancestors
@@ -308,9 +399,11 @@ fn register_scoped_tools_recursive(
                         let scope_pairs = scope_pairs.clone();
                         Box::pin(async move {
                             // Build scope chain from args BEFORE moving ctx fields
+                            // Args are already normalized to camelCase by normalize_mcp_args()
                             let scope_chain: Vec<(String, String)> = scope_pairs.iter()
                                 .map(|(scope_name, field_name)| {
-                                    let val_str = ctx.args.get(field_name.as_str())
+                                    let camel_key = snake_to_camel(field_name);
+                                    let val_str = ctx.args.get(camel_key.as_str())
                                         .map(|v| match v {
                                             Value::String(s) => s.clone(),
                                             Value::Number(n) => n.to_string(),
@@ -328,31 +421,35 @@ fn register_scoped_tools_recursive(
                             let (client_secret, client_pubkey) = hyprstream_rpc::generate_ephemeral_keypair();
                             let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
 
-                            let stream_info_json = match service.as_str() {
+                            // #468: the streaming-method client returns the VERIFIED-capnp
+                            // StreamInfo library type directly (no serde_json::Value round-trip).
+                            let stream_info: hyprstream_rpc::stream_info::StreamInfo = match service.as_str() {
                                 "registry" => {
-                                    let client: GenRegistryClient = crate::services::core::create_service_client(
-                                        &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
-                                        ctx.signing_key, ctx.identity.clone(),
-                                    );
+                                    let server_vk = ctx.resolve_peer_key("registry").await?;
+                                    let client: RegistryClient = RegistryClient::for_service(
+                                        ctx.signing_key, server_vk, None,
+                                    )?;
                                     client.call_scoped_streaming_method(&scope_refs, &method, &ctx.args, client_pubkey_bytes).await?
                                 }
                                 "model" => {
-                                    let client = ModelZmqClient::new(ctx.signing_key, ctx.identity.clone());
-                                    client.gen.call_scoped_streaming_method(&scope_refs, &method, &ctx.args, client_pubkey_bytes).await?
+                                    let server_vk = ctx.resolve_peer_key("model").await?;
+                                    let client = ModelClient::for_service(ctx.signing_key, server_vk, None)?;
+                                    client.call_scoped_streaming_method(&scope_refs, &method, &ctx.args, client_pubkey_bytes).await?
                                 }
                                 _ => anyhow::bail!("No scoped streaming dispatch for service: {service}"),
                             };
 
-                            let (stream_id, endpoint, server_pubkey) = parse_stream_info(&stream_info_json)?;
-
-                            let handle = StreamHandle::new(
-                                &ctx.zmq_context,
-                                stream_id,
-                                &endpoint,
-                                &server_pubkey,
-                                &client_secret,
-                                &client_pubkey_bytes,
+                            // #356: single networked reach shape (UDS-only resolves
+                            // to the same-host fast path inside `networked`).
+                            let DecodedStreamReach { dh_public, reach, broadcast_path } =
+                                decode_stream_reach(stream_info)?;
+                            // #321: derive_client_stream_keys yields the AEAD enc_key.
+                            let (mac_key, enc_key, topic) = hyprstream_rpc::derive_client_stream_keys(
+                                &client_secret, &client_pubkey_bytes, &dh_public,
                             )?;
+                            // #358: MCP tool stream consumed live → direct-first; selection only reorders advertised reaches.
+                            let qos = hyprstream_rpc::stream_info::StreamOpt::default();
+                            let handle = MoqStreamHandle::networked(reach, &qos, broadcast_path, mac_key, enc_key, topic);
 
                             Ok(ToolResult::Stream(Box::new(handle)))
                         })
@@ -373,9 +470,11 @@ fn register_scoped_tools_recursive(
                         let scope_pairs = scope_pairs.clone();
                         Box::pin(async move {
                             // Build scope chain from args: [("repo", repo_id_val), ("worktree", name_val), ...]
+                            // Args are already normalized to camelCase by normalize_mcp_args()
                             let scope_chain: Vec<(String, String)> = scope_pairs.iter()
                                 .map(|(scope_name, field_name)| {
-                                    let val_str = ctx.args.get(field_name.as_str())
+                                    let camel_key = snake_to_camel(field_name);
+                                    let val_str = ctx.args.get(camel_key.as_str())
                                         .map(|v| match v {
                                             Value::String(s) => s.clone(),
                                             Value::Number(n) => n.to_string(),
@@ -414,15 +513,16 @@ async fn dispatch_scoped_call(
 ) -> anyhow::Result<ToolResult> {
     let result = match service {
         "registry" => {
-            let client: GenRegistryClient = crate::services::core::create_service_client(
-                &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
-                ctx.signing_key.clone(), ctx.identity.clone(),
-            );
+            let server_vk = ctx.resolve_peer_key("registry").await?;
+            let client: RegistryClient = RegistryClient::for_service(
+                ctx.signing_key.clone(), server_vk, None,
+            )?;
             client.call_scoped_method(scopes, method, &ctx.args).await?
         }
         "model" => {
-            let client = ModelZmqClient::new(ctx.signing_key.clone(), ctx.identity.clone());
-            client.gen.call_scoped_method(scopes, method, &ctx.args).await?
+            let server_vk = ctx.resolve_peer_key("model").await?;
+            let client = ModelClient::for_service(ctx.signing_key.clone(), server_vk, None)?;
+            client.call_scoped_method(scopes, method, &ctx.args).await?
         }
         _ => anyhow::bail!("No scoped dispatch for service: {service}"),
     };
@@ -479,31 +579,39 @@ fn register_streaming_tool(
                 let (client_secret, client_pubkey) = hyprstream_rpc::generate_ephemeral_keypair();
                 let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
 
-                let stream_info_json = match service.as_str() {
+                // #468: verified-capnp StreamInfo returned directly (no serde_json round-trip).
+                let stream_info: hyprstream_rpc::stream_info::StreamInfo = match service.as_str() {
                     "registry" => {
-                        let client: GenRegistryClient = crate::services::core::create_service_client(
-                            &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
-                            ctx.signing_key, ctx.identity.clone(),
-                        );
+                        let server_vk = ctx.resolve_peer_key("registry").await?;
+                        let client: RegistryClient = RegistryClient::for_service(
+                            ctx.signing_key, server_vk, None,
+                        )?;
                         client.call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?
                     }
                     "model" => {
-                        let client = ModelZmqClient::new(ctx.signing_key, ctx.identity.clone());
-                        client.gen.call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?
+                        let server_vk = ctx.resolve_peer_key("model").await?;
+                        let client = ModelClient::for_service(ctx.signing_key, server_vk, None)?;
+                        client.call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?
+                    }
+                    "tui" => {
+                        let server_vk = ctx.resolve_peer_key("tui").await?;
+                        let client = TuiClient::for_service(ctx.signing_key, server_vk, None)?;
+                        client.call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?
                     }
                     _ => anyhow::bail!("No streaming support for service: {}", service),
                 };
 
-                let (stream_id, endpoint, server_pubkey) = parse_stream_info(&stream_info_json)?;
-
-                let handle = StreamHandle::new(
-                    &ctx.zmq_context,
-                    stream_id,
-                    &endpoint,
-                    &server_pubkey,
-                    &client_secret,
-                    &client_pubkey_bytes,
+                // #356: single networked reach shape (UDS-only resolves to the
+                // same-host fast path inside `networked`).
+                let DecodedStreamReach { dh_public, reach, broadcast_path } =
+                    decode_stream_reach(stream_info)?;
+                // #321: derive_client_stream_keys yields the AEAD enc_key.
+                let (mac_key, enc_key, topic) = hyprstream_rpc::derive_client_stream_keys(
+                    &client_secret, &client_pubkey_bytes, &dh_public,
                 )?;
+                // #358: MCP tool stream consumed live → direct-first; selection only reorders advertised reaches.
+                let qos = hyprstream_rpc::stream_info::StreamOpt::default();
+                let handle = MoqStreamHandle::networked(reach, &qos, broadcast_path, mac_key, enc_key, topic);
 
                 Ok(ToolResult::Stream(Box::new(handle)))
             })
@@ -549,40 +657,68 @@ fn params_to_json_schema(params: &[(&str, &str, bool, &str)]) -> Value {
     })
 }
 
-/// Parse stream_id, endpoint, and server_pubkey from a streaming response JSON.
-fn parse_stream_info(json: &Value) -> anyhow::Result<(String, String, Vec<u8>)> {
-    let stream_id = json["stream_id"].as_str()
-        .ok_or_else(|| anyhow::anyhow!("missing stream_id in streaming response"))?.to_owned();
-    let endpoint = json["endpoint"].as_str()
-        .or_else(|| json["stream_endpoint"].as_str())
-        .ok_or_else(|| anyhow::anyhow!("missing endpoint in streaming response"))?.to_owned();
-    let server_pubkey: Vec<u8> = json["server_pubkey"].as_array()
-        .ok_or_else(|| anyhow::anyhow!("missing server_pubkey in streaming response"))?
-        .iter()
-        .map(|v| v.as_u64().unwrap_or(0) as u8)
-        .collect();
-    Ok((stream_id, endpoint, server_pubkey))
+/// The transport-resolved shape of a decoded streaming response (#356).
+///
+/// A single networked shape: every producer now advertises its moq reach via the
+/// canonical `StreamInfo.announcedAt` list (or an empty list when UDS-only, which
+/// `connect_moq_reach`/`MoqStreamHandle::networked` resolve to the same-host UDS
+/// fast path from LOCAL config). There is no longer a wire-published UDS path.
+struct DecodedStreamReach {
+    dh_public: [u8; 32],
+    reach: Vec<hyprstream_rpc::stream_info::Destination>,
+    broadcast_path: String,
+}
+
+/// Decode a streaming response into its moq reach (#356).
+///
+/// Takes the VERIFIED-capnp `StreamInfo` library type as returned by the
+/// streaming-method client (decoded + COSE-verified inside `call_streaming`,
+/// `rpc_client.rs`) — NO `serde_json` round-trip (#468) — yielding the
+/// native-capnp `announcedAt` reach list + `broadcastPath`.
+/// Fails closed when the response carries no broadcast path or DH key.
+fn decode_stream_reach(
+    info: hyprstream_rpc::stream_info::StreamInfo,
+) -> anyhow::Result<DecodedStreamReach> {
+    if info.broadcast_path.is_empty() {
+        anyhow::bail!(
+            "missing broadcastPath in streaming response — server did not initialize moq transport"
+        );
+    }
+    if info.dh_public == [0u8; 32] {
+        anyhow::bail!("server did not provide DH public key for streaming");
+    }
+    Ok(DecodedStreamReach {
+        dh_public: info.dh_public,
+        reach: info.announced_at,
+        broadcast_path: info.broadcast_path,
+    })
 }
 
 /// Dispatch a method call to the appropriate generated client.
 async fn dispatch_schema_call(service: &str, method: &str, ctx: &ToolCallContext) -> anyhow::Result<Value> {
     let signing_key = ctx.signing_key.clone();
-    let identity = ctx.identity.clone();
 
     match service {
         "model" => {
-            let client = ModelZmqClient::new(signing_key, identity);
-            client.gen.call_method(method, &ctx.args).await
+            let server_vk = ctx.resolve_peer_key("model").await?;
+            let client = ModelClient::for_service(signing_key, server_vk, None)?;
+            client.call_method(method, &ctx.args).await
         }
         "registry" => {
-            let client: GenRegistryClient = crate::services::core::create_service_client(
-                &hyprstream_rpc::registry::global().endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep).to_zmq_string(),
-                signing_key, identity,
-            );
+            let server_vk = ctx.resolve_peer_key("registry").await?;
+            let client: RegistryClient = RegistryClient::for_service(
+                signing_key, server_vk, None,
+            )?;
             client.call_method(method, &ctx.args).await
         }
         "policy" => {
-            let client = PolicyClient::new(signing_key, identity);
+            let server_vk = ctx.resolve_peer_key("policy").await?;
+            let client = PolicyClient::for_service(signing_key, server_vk, None)?;
+            client.call_method(method, &ctx.args).await
+        }
+        "tui" => {
+            let server_vk = ctx.resolve_peer_key("tui").await?;
+            let client = TuiClient::for_service(signing_key, server_vk, None)?;
             client.call_method(method, &ctx.args).await
         }
         _ => anyhow::bail!("Unknown service: {service}"),
@@ -595,21 +731,23 @@ async fn dispatch_schema_call(service: &str, method: &str, ctx: &ToolCallContext
 
 /// MCP service implementation — UUID-keyed tool registry
 pub struct McpService {
-    /// UUID-keyed tool registry
-    registry: Arc<ToolRegistry>,
+    /// UUID-keyed tool registry (RwLock for live refresh)
+    registry: Arc<RwLock<ToolRegistry>>,
     /// Raw HYPRSTREAM_TOKEN from env (stdio transport — decoded per-request)
     stdio_token: Option<String>,
     /// Verifying key for JWT validation
     verifying_key: VerifyingKey,
-    // === ZmqService infrastructure ===
-    context: Arc<zmq::Context>,
+    // === RequestService infrastructure ===
     transport: TransportConfig,
     signing_key: SigningKey,
     /// ServiceContext for typed_client() / client() access
     service_ctx: Option<Arc<ServiceContext>>,
-    /// Expected audience for tokens (resource URL, for future defense-in-depth)
-    #[allow(dead_code)]
+    /// Expected audience for tokens (resource URL, for defense-in-depth)
     expected_audience: Option<String>,
+    /// JWT key source for verifying JWTs on ZMQ path (unified local + federated).
+    jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
+    /// Policy client for authorization checks (shared, avoids per-call socket creation)
+    policy_client: PolicyClient,
 }
 
 impl McpService {
@@ -625,21 +763,42 @@ impl McpService {
             tool_reg.by_uuid.len(),
         );
 
+        let policy_client = PolicyClient::for_service(
+            config.signing_key.clone(),
+            config.policy_verifying_key,
+            None,
+        )?;
+
         Ok(Self {
-            registry: Arc::new(tool_reg),
+            registry: Arc::new(RwLock::new(tool_reg)),
             stdio_token,
             verifying_key: config.verifying_key,
-            context: config.zmq_context.clone(),
             transport: config.transport,
             signing_key: config.signing_key,
             service_ctx: config.ctx,
             expected_audience: config.expected_audience,
+            jwt_key_source: config.jwt_key_source,
+            policy_client,
         })
     }
 
-    /// Convert registry to rmcp Tool list
+    /// Resolve a peer service's verifying key via PolicyService RPC.
+    async fn resolve_peer_key(&self, service_name: &str) -> anyhow::Result<VerifyingKey> {
+        let resp = self.policy_client.resolve_service_key(
+            &crate::services::generated::policy_client::ResolveServiceKey {
+                service_name: service_name.to_owned(),
+            },
+        ).await?;
+        let bytes: [u8; 32] = resp.verifying_key.as_slice().try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid verifying key length from PolicyService"))?;
+        VerifyingKey::from_bytes(&bytes)
+            .map_err(|e| anyhow::anyhow!("Invalid Ed25519 key: {e}"))
+    }
+
+    /// Convert registry to rmcp Tool list (includes built-in refresh_tools meta-tool)
     fn tools_list(&self) -> Vec<Tool> {
-        self.registry.list().map(|entry| {
+        let reg = self.registry.read();
+        let mut tools: Vec<Tool> = reg.list().map(|entry| {
             let schema: JsonObject = match &entry.args_schema {
                 Value::Object(m) => m.clone(),
                 _ => JsonObject::new(),
@@ -655,91 +814,94 @@ impl McpService {
                     read_only_hint: Some(entry.required_scope.starts_with("query:")),
                     destructive_hint: Some(!entry.required_scope.starts_with("query:")),
                     open_world_hint: Some(false),
-                    idempotent_hint: Some(true),
+                    // FIX-8: only query-scoped tools are idempotent; write/train/manage ops are not
+                    idempotent_hint: Some(entry.required_scope.starts_with("query:")),
                 }),
                 icons: None,
                 meta: None,
             }
-        }).collect()
+        }).collect();
+
+        tools.push(Tool {
+            name: Cow::Owned(REFRESH_TOOLS_UUID.to_string()),
+            title: Some("mcp.refresh_tools".to_owned()),
+            description: Some(Cow::Borrowed(
+                "Rebuild the tool registry from current service schemas and notify \
+                 this session to re-fetch the tool list. Call after new services come \
+                 online to discover their tools without reconnecting.",
+            )),
+            input_schema: Arc::new(JsonObject::new()),
+            output_schema: None,
+            annotations: Some(ToolAnnotations {
+                title: Some("mcp.refresh_tools".to_owned()),
+                read_only_hint: Some(false),
+                destructive_hint: Some(false),
+                open_world_hint: Some(false),
+                idempotent_hint: Some(true),
+            }),
+            icons: None,
+            meta: None,
+        });
+
+        tools
     }
 
-    /// Extract identity from HTTP Bearer token or fall back to env/local.
+    /// Extract identity from validated middleware state or fall back to env/local.
     ///
     /// This is pure authentication (identity extraction). No audience checks,
     /// no scope filtering — ZMQ backends handle authorization via Casbin.
     ///
     /// Priority:
-    /// 1. HTTP transport: extract from `Authorization: Bearer <token>` header
-    ///    - Valid token → `RequestIdentity::api_token(sub, "mcp")`
-    ///    - Invalid/expired token → `RequestIdentity::anonymous()` (let ZMQ reject)
-    ///    - No token → `RequestIdentity::anonymous()` (NOT local!)
-    /// 2. Stdio/ZMQ transport (no HTTP Parts): use env var claims or `local()`
-    fn extract_identity(&self, context: &RequestContext<RoleServer>) -> RequestIdentity {
-        // Check for HTTP transport by looking for http::request::Parts in extensions
+    /// 1. HTTP transport: use `AuthenticatedUser` from middleware (already validated)
+    /// 2. Stdio/ZMQ transport (no HTTP Parts): use env var JWT claims or `"anonymous"`
+    fn extract_user(&self, context: &RequestContext<RoleServer>) -> String {
         if let Some(parts) = context.extensions.get::<http::request::Parts>() {
-            // HTTP transport — extract Bearer token from Authorization header
-            trace!(
-                "MCP HTTP auth: has Authorization header: {}, all headers: {:?}",
-                parts.headers.contains_key(AUTHORIZATION),
-                parts.headers.keys().collect::<Vec<_>>()
-            );
-            let token = parts
-                .headers
-                .get(AUTHORIZATION)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|h| h.strip_prefix("Bearer ").map(str::trim));
-
-            match token {
-                Some(token) => {
-                    trace!("MCP HTTP auth: Bearer token present, len={}", token.len());
-                    match jwt::decode(token, &self.verifying_key) {
-                        Ok(claims) => {
-                            trace!("MCP HTTP auth: token validated for {}", claims.sub);
-                            RequestIdentity::api_token(&claims.sub, "mcp")
-                        }
-                        Err(e) => {
-                            trace!("MCP HTTP auth: token validation failed: {}", e);
-                            RequestIdentity::anonymous()
-                        }
-                    }
-                }
-                None => {
-                    trace!("MCP HTTP auth: no Bearer token found in Authorization header");
-                    RequestIdentity::anonymous()
-                }
+            if let Some(auth_user) = parts.extensions.get::<crate::server::middleware::AuthenticatedUser>() {
+                trace!("MCP HTTP auth: using validated identity for {}", auth_user.user);
+                return auth_user.user.clone();
             }
+
+            if parts.headers.contains_key(AUTHORIZATION) {
+                warn!("MCP HTTP auth: Authorization header present but no AuthenticatedUser — middleware should have rejected");
+            } else {
+                trace!("MCP HTTP auth: no Authorization header, anonymous access");
+            }
+            "anonymous".to_owned()
         } else {
             trace!("MCP HTTP auth: no http::request::Parts in extensions (stdio/zmq transport)");
-            // Stdio/ZMQ transport — decode env token per-request
             match &self.stdio_token {
                 Some(token) => {
-                    match jwt::decode(token, &self.verifying_key) {
-                        Ok(claims) => RequestIdentity::api_token(&claims.sub, "mcp"),
+                    match jwt::decode(token, &self.verifying_key, self.expected_audience.as_deref()) {
+                        Ok(claims) => claims.sub.clone(),
                         Err(e) => {
-                            debug!("MCP stdio auth: token invalid ({}), using local identity", e);
-                            RequestIdentity::local()
+                            warn!("MCP stdio auth: token decode failed ({}), downgrading to anonymous", e);
+                            "anonymous".to_owned()
                         }
                     }
                 }
-                None => RequestIdentity::local(),
+                None => "anonymous".to_owned(),
             }
         }
     }
 
     /// Dispatch a tool call by UUID with a specific identity
-    async fn dispatch_tool(&self, uuid: &Uuid, args: Value, identity: RequestIdentity) -> Result<CallToolResult, ErrorData> {
-        let entry = self.registry.get(uuid)
-            .ok_or_else(|| ErrorData::invalid_request(format!("Unknown tool: {}", uuid), None))?;
-
-        let ctx = ToolCallContext {
-            args,
-            signing_key: self.signing_key.clone(),
-            zmq_context: self.context.clone(),
-            identity,
-            ctx: self.service_ctx.clone(),
+    async fn dispatch_tool(&self, uuid: &Uuid, args: Value, user: String) -> Result<CallToolResult, ErrorData> {
+        let handler = {
+            let reg = self.registry.read();
+            let entry = reg.get(uuid)
+                .ok_or_else(|| ErrorData::invalid_request(format!("Unknown tool: {}", uuid), None))?;
+            entry.handler.clone()
         };
 
-        let result = (entry.handler)(ctx).await
+        let ctx = ToolCallContext {
+            args: normalize_mcp_args(args),
+            signing_key: self.signing_key.clone(),
+            user,
+            ctx: self.service_ctx.clone(),
+            policy_client: self.policy_client.clone(),
+        };
+
+        let result = handler(ctx).await
             .map_err(|e| ErrorData::internal_error(format!("Tool failed: {}", e), None))?;
 
         match result {
@@ -749,7 +911,7 @@ impl McpService {
             ToolResult::Stream(mut handle) => {
                 // Consume StreamHandle — DH, SUB, HMAC all handled internally
                 let mut contents = Vec::new();
-                while let Some(payload) = handle.recv_next()
+                while let Some(payload) = handle.recv_next().await
                     .map_err(|e| ErrorData::internal_error(format!("Stream error: {}", e), None))?
                 {
                     match payload {
@@ -766,6 +928,9 @@ impl McpService {
                         }
                         StreamPayload::Error(msg) => {
                             return Err(ErrorData::internal_error(msg, None));
+                        }
+                        StreamPayload::Tagged { .. } => {
+                            // encrypted event payload, skip
                         }
                     }
                 }
@@ -785,6 +950,7 @@ impl ServerHandler for McpService {
             protocol_version: Default::default(),
             capabilities: ServerCapabilities::builder()
                 .enable_tools()
+                .enable_tool_list_changed()
                 .build(),
             server_info: rmcp::model::Implementation {
                 name: "hyprstream".into(),
@@ -820,17 +986,35 @@ impl ServerHandler for McpService {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<CallToolResult, ErrorData>> + Send + '_ {
-        let identity = self.extract_identity(&context);
+        let user = self.extract_user(&context);
         async move {
             let uuid = Uuid::parse_str(&request.name)
                 .map_err(|e| ErrorData::invalid_request(format!("Invalid UUID: {}", e), None))?;
+
+            if uuid == REFRESH_TOOLS_UUID {
+                let old_count;
+                let new_count;
+                {
+                    let mut reg = self.registry.write();
+                    old_count = reg.by_uuid.len();
+                    let mut fresh = ToolRegistry::new();
+                    register_schema_tools(&mut fresh);
+                    new_count = fresh.by_uuid.len();
+                    *reg = fresh;
+                }
+                let _ = context.peer.notify_tool_list_changed().await;
+                tracing::info!("MCP refresh_tools: {} -> {} tools", old_count, new_count);
+                return Ok(CallToolResult::success(vec![Content::text(
+                    format!("Refreshed tool registry: {} tools (was {})", new_count, old_count),
+                )]));
+            }
 
             let args = match request.arguments {
                 Some(map) => Value::Object(map),
                 None => Value::Object(serde_json::Map::new()),
             };
 
-            self.dispatch_tool(&uuid, args, identity).await
+            self.dispatch_tool(&uuid, args, user).await
         }
     }
 }
@@ -841,6 +1025,30 @@ impl ServerHandler for McpService {
 
 #[async_trait::async_trait(?Send)]
 impl McpHandler for McpService {
+    async fn authorize(&self, ctx: &crate::services::EnvelopeContext, resource: &str, operation: &str) -> anyhow::Result<()> {
+        let subject = ctx.subject().to_string();
+        let result = self.policy_client.check(&PolicyCheck {
+            subject: subject.clone(),
+            domain: "*".to_owned(),
+            resource: resource.to_owned(),
+            operation: operation.to_owned(),
+        }).await;
+        match result {
+            Ok(allowed) => {
+                if allowed {
+                    Ok(())
+                } else {
+                    tracing::info!("MCP policy denied: sub={} obj={} act={}", subject, resource, operation);
+                    anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource)
+                }
+            }
+            Err(e) => {
+                tracing::warn!("MCP policy check RPC error: sub={} obj={} act={} err={}", subject, resource, operation, e);
+                anyhow::bail!("Unauthorized: {} cannot {} on {} (policy check error: {})", subject, operation, resource, e)
+            }
+        }
+    }
+
     async fn handle_get_status(
         &self,
         _ctx: &crate::services::EnvelopeContext,
@@ -848,8 +1056,13 @@ impl McpHandler for McpService {
     ) -> anyhow::Result<McpResponseVariant> {
         let loaded_model_count = {
             // Status check uses local identity (internal health check, no user context)
-            let client = ModelZmqClient::new(self.signing_key.clone(), RequestIdentity::local());
-            client.list().await
+            let server_vk = self.resolve_peer_key("model").await?;
+            let client = ModelClient::for_service(
+                self.signing_key.clone(),
+                server_vk,
+                None,
+            )?;
+            client.status(&crate::services::generated::model_client::StatusRequest { model_ref: String::new() }).await
                 .map(|models| models.len() as u32)
                 .unwrap_or(0)
         };
@@ -859,7 +1072,7 @@ impl McpHandler for McpService {
             loaded_model_count,
             is_authenticated: self.stdio_token.is_some(),
             authenticated_user: self.stdio_token.as_ref()
-                .and_then(|t| jwt::decode(t, &self.verifying_key).ok())
+                .and_then(|t| jwt::decode(t, &self.verifying_key, self.expected_audience.as_deref()).ok())
                 .map(|c| c.sub)
                 .unwrap_or_default(),
             scopes: vec![],  // Scopes no longer in JWT; authorization via Casbin
@@ -871,7 +1084,8 @@ impl McpHandler for McpService {
         _ctx: &crate::services::EnvelopeContext,
         _request_id: u64,
     ) -> anyhow::Result<McpResponseVariant> {
-        let tools: Vec<ToolDefinition> = self.registry.list().map(|entry| {
+        let reg = self.registry.read();
+        let tools: Vec<ToolDefinition> = reg.list().map(|entry| {
             ToolDefinition {
                 name: entry.uuid.to_string(),
                 description: entry.description.clone(),
@@ -913,9 +1127,8 @@ impl McpHandler for McpService {
             serde_json::from_str(&data.arguments)?
         };
 
-        // ZMQ transport: use envelope identity (already authenticated by ZMQ layer)
-        let identity = RequestIdentity::api_token(ctx.user(), "mcp");
-        let result = self.dispatch_tool(&uuid, args, identity).await;
+        let user = ctx.user().to_owned();
+        let result = self.dispatch_tool(&uuid, args, user).await;
 
         match result {
             Ok(call_result) => {
@@ -945,11 +1158,11 @@ impl McpHandler for McpService {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ZmqService Implementation (internal control plane)
+// RequestService Implementation (internal control plane)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[async_trait(?Send)]
-impl ZmqService for McpService {
+impl RequestService for McpService {
     async fn handle_request(&self, ctx: &crate::services::EnvelopeContext, payload: &[u8]) -> anyhow::Result<(Vec<u8>, Option<crate::services::Continuation>)> {
         trace!(
             "McpService request from {} (id={})",
@@ -963,16 +1176,20 @@ impl ZmqService for McpService {
         "mcp"
     }
 
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
-    }
-
     fn transport(&self) -> &TransportConfig {
         &self.transport
     }
 
     fn signing_key(&self) -> SigningKey {
         self.signing_key.clone()
+    }
+
+    fn expected_audience(&self) -> Option<&str> {
+        self.expected_audience.as_deref()
+    }
+
+    fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>> {
+        self.jwt_key_source.clone()
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {

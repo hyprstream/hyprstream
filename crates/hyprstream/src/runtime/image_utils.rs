@@ -108,6 +108,43 @@ pub fn load_image(
     Ok(tensor.to_device(device))
 }
 
+/// Load an image from raw bytes (PNG, JPEG, or other formats supported by `image` crate)
+pub fn load_image_from_bytes(
+    bytes: &[u8],
+    config: &ImagePreprocessConfig,
+    device: Device,
+) -> Result<Tensor> {
+    debug!("Loading image from {} bytes", bytes.len());
+
+    let img = image::load_from_memory(bytes)
+        .map_err(|e| anyhow!("Failed to decode image bytes: {}", e))?;
+
+    let img = img.to_rgb8();
+
+    let img = image::imageops::resize(
+        &img,
+        config.image_size as u32,
+        config.image_size as u32,
+        image::imageops::FilterType::Lanczos3,
+    );
+
+    let (width, height) = img.dimensions();
+    let img_vec: Vec<f32> = img
+        .into_raw()
+        .iter()
+        .map(|&x| x as f32 / 255.0)
+        .collect();
+
+    let tensor = Tensor::from_slice(&img_vec)
+        .reshape([height as i64, width as i64, 3]);
+
+    let tensor = tensor.permute([2, 0, 1]);
+    let tensor = normalize_tensor(&tensor, &config.mean, &config.std)?;
+    let tensor = tensor.unsqueeze(0);
+
+    Ok(tensor.to_device(device))
+}
+
 /// Load multiple images and batch them
 pub fn load_images(
     paths: &[&Path],

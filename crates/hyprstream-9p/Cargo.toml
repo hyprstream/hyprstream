@@ -1,0 +1,30 @@
+[package]
+name = "hyprstream-9p"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT"
+description = "9P2000.L codec and server-side translator bridging 9P to hyprstream RPC (capnp)"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+hyprstream-vfs = { path = "../hyprstream-vfs" }
+hyprstream-rpc = { path = "../hyprstream-rpc" }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+tokio = { version = "1", features = ["net", "io-util", "rt", "sync", "macros"] }
+tracing = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[features]
+default = []

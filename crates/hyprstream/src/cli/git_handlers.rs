@@ -1,19 +1,29 @@
 //! Handlers for git-style CLI commands
 // CLI handlers intentionally print to stdout/stderr for user interaction
 #![allow(clippy::print_stdout, clippy::print_stderr)]
+// TODO(#395): migrate `model_ref.model` reads to `model_ref.name()` as part of the
+// name-layer retirement. Suppressed here so this prep PR stays focused on the CID
+// encoder + grammar; the deprecation is enforced at the ModelRef type definition.
+#![allow(deprecated)]
 
-use crate::config::GenerationRequest;
-use crate::api::openai_compat::ChatMessage;
-use crate::services::{ModelZmqClient, GenRegistryClient};
+use crate::runtime::GenerationRequest;
+use crate::services::generated::inference_client::ChatMessage;
+use crate::services::generated::model_client::ChatTemplateRequest;
+use crate::services::generated::notification_client::{SubscribeRequest, UnsubscribeRequest};
+use crate::services::generated::registry_client::{
+    BranchRequest, CheckoutRequest, CloneRequest, CreateWorktreeRequest,
+    RemoveWorktreeRequest, UpdateRequest,
+};
+use crate::services::RegistryClient;
+use crate::services::generated::model_client::{ModelClient, LoadModelRequest, UnloadModelRequest, StatusRequest};
 #[cfg(feature = "experimental")]
-use crate::services::generated::registry_client::FileChangeTypeEnum;
-use crate::zmq::global_context;
+use crate::services::generated::registry_client::FileChangeType;
 use crate::storage::ModelRef;
 #[cfg(feature = "experimental")]
 use crate::storage::GitRef;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use hyprstream_rpc::prelude::*;
-use hyprstream_rpc::streaming::{StreamHandle, StreamPayload};
+use hyprstream_rpc::streaming::StreamPayload;
 use hyprstream_rpc::crypto::generate_ephemeral_keypair;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -21,7 +31,7 @@ use tracing::{debug, info, warn};
 
 /// Handle branch command
 pub async fn handle_branch(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model: &str,
     branch_name: &str,
     from_ref: Option<String>,
@@ -34,7 +44,10 @@ pub async fn handle_branch(
     let repo_client = registry.repo(&tracked.id);
 
     // Create branch via service
-    repo_client.create_branch(branch_name, from_ref.as_deref().unwrap_or("")).await
+    repo_client.create_branch(&BranchRequest {
+        branch_name: branch_name.to_owned(),
+        start_point: from_ref.as_deref().unwrap_or("").to_owned(),
+    }).await
         .map_err(|e| anyhow::anyhow!("Failed to create branch '{}': {}", branch_name, e))?;
 
     println!("✓ Created branch {branch_name}");
@@ -44,9 +57,11 @@ pub async fn handle_branch(
     }
 
     // Create worktree for the branch via service
-    let worktree_path = repo_client.create_worktree("", branch_name, false).await
+    repo_client.create_worktree(&CreateWorktreeRequest {
+        branch: branch_name.to_owned(),
+    }).await
         .map_err(|e| anyhow::anyhow!("Failed to create worktree: {}", e))?;
-    println!("✓ Created worktree at {}", worktree_path);
+    println!("✓ Created worktree for branch {branch_name}");
 
     // Apply policy template if specified
     if let Some(ref template_name) = policy_template {
@@ -55,7 +70,7 @@ pub async fn handle_branch(
 
     // Show helpful next steps
     println!("\n→ Next steps:");
-    println!("  cd {}", worktree_path);
+    println!("  hyprstream worktree info {model} {branch_name}");
     println!("  hyprstream status {model}:{branch_name}");
     println!("  hyprstream lt {model}:{branch_name} --adapter my-adapter");
 
@@ -64,7 +79,7 @@ pub async fn handle_branch(
 
 /// Handle checkout command
 pub async fn handle_checkout(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model_ref_str: &str,
     create_branch: bool,
     force: bool,
@@ -109,13 +124,24 @@ pub async fn handle_checkout(
     // If create_branch, create branch first
     if create_branch {
         if let crate::storage::GitRef::Branch(name) = &model_ref.git_ref {
-            repo_client.create_branch(name, &previous_oid).await
+            repo_client.create_branch(&BranchRequest {
+                branch_name: name.to_owned(),
+                start_point: previous_oid.clone(),
+            }).await
                 .map_err(|e| anyhow::anyhow!("Failed to create branch: {}", e))?;
         }
     }
 
-    // Checkout via service layer
-    repo_client.checkout(&ref_spec, false).await
+    // Checkout via worktree-scoped service layer
+    // Determine which worktree to operate on
+    let worktree_name = match &model_ref.git_ref {
+        crate::storage::GitRef::Branch(name) => name.clone(),
+        _ => tracked.tracking_ref.clone(),
+    };
+    repo_client.worktree(&worktree_name).checkout(&CheckoutRequest {
+        ref_name: ref_spec.clone(),
+        create_branch: false,
+    }).await
         .map_err(|e| anyhow::anyhow!("Failed to checkout '{}': {}", ref_spec, e))?;
 
     // Get new HEAD
@@ -134,7 +160,7 @@ pub async fn handle_checkout(
 
 /// Handle status command
 pub async fn handle_status(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model: Option<String>,
     verbose: bool,
 ) -> Result<()> {
@@ -176,23 +202,23 @@ pub async fn handle_status(
 ///
 /// Git status --short style single-character indicator.
 #[cfg(feature = "experimental")]
-fn status_char(s: FileChangeTypeEnum) -> char {
+fn status_char(s: FileChangeType) -> char {
     match s {
-        FileChangeTypeEnum::None => ' ',
-        FileChangeTypeEnum::Added => 'A',
-        FileChangeTypeEnum::Modified => 'M',
-        FileChangeTypeEnum::Deleted => 'D',
-        FileChangeTypeEnum::Renamed => 'R',
-        FileChangeTypeEnum::Untracked => '?',
-        FileChangeTypeEnum::TypeChanged => 'T',
-        FileChangeTypeEnum::Conflicted => 'U',
+        FileChangeType::None => ' ',
+        FileChangeType::Added => 'A',
+        FileChangeType::Modified => 'M',
+        FileChangeType::Deleted => 'D',
+        FileChangeType::Renamed => 'R',
+        FileChangeType::Untracked => '?',
+        FileChangeType::TypeChanged => 'T',
+        FileChangeType::Conflicted => 'U',
     }
 }
 
 /// **EXPERIMENTAL**: This feature is behind the `experimental` flag.
 #[cfg(feature = "experimental")]
 pub async fn handle_commit(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model_ref_str: &str,
     message: &str,
     all: bool,
@@ -244,11 +270,12 @@ pub async fn handle_commit(
 
     // Check if worktree exists
     let wts = repo_client.list_worktrees().await?;
-    let _worktree_path = wts.iter().find(|wt| wt.branch_name == branch_name).map(|wt| wt.path.clone())
-        .ok_or_else(|| anyhow::anyhow!(
+    if !wts.iter().any(|wt| wt.branch_name == branch_name) {
+        anyhow::bail!(
             "Worktree '{}' does not exist for model '{}'.\n\nCreate it first with:\n  hyprstream branch {} {}",
             branch_name, model_ref.model, model_ref.model, branch_name
-        ))?;
+        );
+    }
 
     // Use RepositoryClient.detailed_status() for file-level change information
     let detailed_status = repo_client.detailed_status().await?;
@@ -271,7 +298,7 @@ pub async fn handle_commit(
             }
         } else {
             // Show only staged files (index)
-            for file in detailed_status.files.iter().filter(|f| !matches!(f.index_status, FileChangeTypeEnum::None)) {
+            for file in detailed_status.files.iter().filter(|f| !matches!(f.index_status, FileChangeType::None)) {
                 println!("  {}  {}", status_char(file.index_status), file.path);
             }
         }
@@ -299,21 +326,24 @@ pub async fn handle_commit(
         return Ok(());
     }
 
+    // Use worktree-scoped client for all staging/commit operations
+    let wt = repo_client.worktree(&branch_name);
+
     // Stage files based on mode
     if all_untracked {
         // Stage all files including untracked (git add -A)
         info!("Staging all files including untracked");
-        repo_client.stage_all_including_untracked().await?;
+        wt.stage_all_including_untracked().await?;
     } else if all {
         // Stage all tracked files only (git add -u)
         info!("Staging all tracked files");
-        repo_client.stage_all().await?;
+        wt.stage_all().await?;
     }
 
     // Perform commit operation
     let commit_oid = if amend {
         info!("Amending previous commit");
-        repo_client.amend_commit(message).await?
+        wt.amend_commit(message).await?
     } else if author.is_some() || author_name.is_some() || author_email.is_some() {
         // Parse author information
         let (name, email) = if let Some(author_str) = author {
@@ -340,11 +370,11 @@ pub async fn handle_commit(
             (name, email)
         };
 
-        repo_client.commit_with_author(message, &name, &email).await?
+        wt.commit_with_author(message, &name, &email).await?
     } else {
         // Simple commit
-        repo_client.stage_all().await?;
-        repo_client.commit(message).await?
+        wt.stage_all().await?;
+        wt.commit(message).await?
     };
 
     // Success output
@@ -357,6 +387,75 @@ pub async fn handle_commit(
     }
 
     Ok(())
+}
+
+/// Handle the `promote` command (#394).
+///
+/// Snapshots the node-local upper layer into a deterministic registry commit
+/// (`stageAll` + `commit`) and advances the atproto pointer record. This is
+/// the single-verb entry point for the promote saga — see
+/// [`crate::git::promote`] for the eventual-consistency contract and the
+/// single-writer-per-layer enforcement.
+///
+/// `author_name` / `author_email` default to the process identity when
+/// `None`; for deterministic cross-node promotes the caller should pin a
+/// stable identity (the registry service derives it from the verified
+/// `Subject`).
+#[cfg(feature = "experimental")]
+pub async fn handle_promote(
+    registry: &RegistryClient,
+    model_ref_str: &str,
+    branch: &str,
+    author_name: Option<String>,
+    author_email: Option<String>,
+) -> Result<()> {
+    use crate::git::promote::{promote, PromoteAuthor, PromoteError, PromoteLeaseTable};
+    use std::sync::Arc;
+
+    info!("Promoting {} (branch {})", model_ref_str, branch);
+
+    let model_ref = ModelRef::parse(model_ref_str)?;
+    let tracked = registry.get_by_name(&model_ref.model).await
+        .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
+    let repo_client = registry.repo(&tracked.id);
+    let wt = repo_client.worktree(branch);
+
+    let author = PromoteAuthor {
+        name: author_name.unwrap_or_else(|| "hyprstream".to_owned()),
+        email: author_email.unwrap_or_else(|| "promote@hyprstream.local".to_owned()),
+    };
+
+    // The lease table is per-process; in a multi-node deployment each node has
+    // its own table and the distributed single-writer invariant is enforced by
+    // the atproto pointer-record version check (see git::promote).
+    let lease_table = Arc::new(PromoteLeaseTable::new());
+
+    match promote(&model_ref.model, branch, &wt, &author, &lease_table).await {
+        Ok(outcome) => {
+            println!("✓ Promoted {} ({})", model_ref_str, branch);
+            println!("  Commit: {}", outcome.commit_oid);
+            if outcome.pointer_advanced {
+                println!("  atproto pointer advanced");
+            }
+            Ok(())
+        }
+        Err(PromoteError::LeaseHeld(_)) => {
+            anyhow::bail!("another promote is in progress for {}/{}", model_ref.model, branch)
+        }
+        Err(PromoteError::LocalCommit(e)) => {
+            anyhow::bail!("promote failed during local commit: {e}")
+        }
+        Err(PromoteError::PointerStale(e)) => {
+            // Content is committed; only the pointer lags. Warn, don't fail.
+            warn!(
+                model = %model_ref.model, branch, error = %e,
+                "promote: content committed but atproto pointer is stale; next promote will advance it"
+            );
+            println!("⚠ Promoted {} ({}) — content committed, pointer stale", model_ref_str, branch);
+            println!("  The atproto pointer will advance on the next successful promote.");
+            Ok(())
+        }
+    }
 }
 
 /// Print model status in a nice format using generated RepositoryStatus
@@ -399,119 +498,190 @@ fn print_model_status(model_name: &str, status: &crate::services::GenRepositoryS
     }
 }
 
-/// Handle list command
+/// Parse `--filter key=regex` strings into compiled `(key, Regex)` pairs.
+///
+/// Patterns are unanchored by default. Use `^`/`$` to anchor, `(?i)` for
+/// case-insensitive, `|` for alternation. `status` is not a valid filter key —
+/// use `--status`/`-s` instead.
+///
+/// Returns an error for unknown keys or invalid regex patterns.
+pub fn parse_filters(raw: &[String]) -> Result<Vec<(String, regex::Regex)>> {
+    const VALID_KEYS: &[&str] = &["name", "domains", "access", "ref", "commit", "size"];
+    let mut out = Vec::with_capacity(raw.len());
+    for s in raw {
+        let (k, v) = s.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("--filter '{}': expected KEY=REGEX format", s)
+        })?;
+        let key = k.to_lowercase();
+        if key == "status" {
+            anyhow::bail!(
+                "--filter '{}': 'status' cannot be used with --filter. Use --status/-s instead (e.g. -s loaded,loading)",
+                s
+            );
+        }
+        if !VALID_KEYS.contains(&key.as_str()) {
+            anyhow::bail!(
+                "--filter '{}': unknown column '{}'. Valid columns: {}",
+                s, key, VALID_KEYS.join(", ")
+            );
+        }
+        let re = regex::Regex::new(v).map_err(|e| {
+            anyhow::anyhow!("--filter '{}': invalid regex pattern '{}': {}", s, v, e)
+        })?;
+        out.push((key, re));
+    }
+    Ok(out)
+}
+
+/// Parse `--status`/`-s` values into a `HashSet` of accepted status strings.
+///
+/// Each argument may be a single value or comma-separated list. Multiple `-s`
+/// flags are OR'd together. Empty result means no status filter (all statuses shown).
+///
+/// Valid values: `loaded`, `loading`, `unloaded`.
+pub fn parse_status_filter(raw: &[String]) -> Result<std::collections::HashSet<String>> {
+    const VALID: &[&str] = &["loaded", "loading", "unloaded"];
+    let mut out = std::collections::HashSet::new();
+    for s in raw {
+        for part in s.split(',') {
+            let val = part.trim().to_lowercase();
+            if val.is_empty() { continue; }
+            if !VALID.contains(&val.as_str()) {
+                anyhow::bail!(
+                    "--status '{}': unknown status '{}'. Valid values: {}",
+                    s, val, VALID.join(", ")
+                );
+            }
+            out.insert(val);
+        }
+    }
+    Ok(out)
+}
+
 pub async fn handle_list(
-    registry: &GenRegistryClient,
-    policy_manager: Option<&crate::auth::PolicyManager>,
+    registry: &RegistryClient,
+    model_client: ModelClient,
+    filters: &[(String, regex::Regex)],
+    status_filter: &std::collections::HashSet<String>,
 ) -> Result<()> {
     info!("Listing models");
 
-    // Get list of tracked repositories from service
-    let repos = registry.list().await
+    // Fetch registry list and model service status in parallel
+    let all_status_req = StatusRequest { model_ref: String::new() };
+    let (repos_result, status_result) = tokio::join!(
+        registry.list(),
+        model_client.status(&all_status_req),
+    );
+
+    let repos = repos_result
         .map_err(|e| anyhow::anyhow!("Failed to list repositories: {}", e))?;
 
     if repos.is_empty() {
         println!("No models found.");
-        println!("Try: hyprstream clone https://huggingface.co/Qwen/Qwen2-1.5B-Instruct");
+        println!("Try: hyprstream clone https://huggingface.co/Qwen/Qwen3-0.6B");
         return Ok(());
     }
 
-    // Get current user for permission checks (OS user for CLI)
-    let current_user = hyprstream_rpc::envelope::RequestIdentity::local().user().to_owned();
+    // Build status lookup: model_ref -> status string
+    let status_map: std::collections::HashMap<String, String> = match status_result {
+        Ok(entries) => entries.into_iter().map(|e| (e.model_ref, e.status)).collect(),
+        Err(e) => {
+            warn!("Model service unavailable for status: {}", e);
+            std::collections::HashMap::new()
+        }
+    };
 
-    // Get archetype registry for capability detection
-    let archetype_registry = crate::archetypes::global_registry();
-
-    // Collect models with git info and capabilities
-    struct ModelInfo {
+    struct RowInfo {
         display_name: String,
+        domains_str: String,
+        access_str: String,
         git_ref: String,
         commit: String,
-        is_dirty: bool,
-        size_bytes: Option<u64>,
-        domains: crate::archetypes::DetectedDomains,
-        access_str: String,
+        load_status: String,
+        size_str: String,
     }
 
-    let mut models_with_info = Vec::new();
+    let mut rows = Vec::new();
 
     for tracked in repos {
-        if !tracked.name.is_empty() {
-            let name = &tracked.name;
-            let repo_client = registry.repo(&tracked.id);
+        if tracked.name.is_empty() { continue; }
+        let name = &tracked.name;
 
-            // Get worktrees for this model
-            let worktrees = match repo_client.list_worktrees().await {
-                Ok(wts) => wts,
-                Err(e) => {
-                    warn!("Failed to list worktrees for '{}': {}", name, e);
-                    continue;
-                }
+        for wt in &tracked.worktrees {
+            let branch_name = if wt.branch_name.is_empty() { "detached".to_owned() } else { wt.branch_name.clone() };
+            let display_name = format!("{}:{}", name, branch_name);
+            let commit = wt.head_oid.chars().take(7).collect::<String>();
+
+            // Capabilities come from the server — no local filesystem access needed
+            let domains_str = if wt.capabilities.is_empty() {
+                "n/a".to_owned()
+            } else {
+                wt.capabilities.join(",")
             };
+            // All capabilities returned are already policy-filtered by the server
+            let access_str = domains_str.clone();
 
-            // Get commit hash via service layer
-            let commit = match repo_client.get_head().await {
-                Ok(head_oid) => head_oid.chars().take(7).collect::<String>(),
-                Err(_) => "unknown".to_owned(),
-            };
+            // Load status: join with model service response
+            let model_ref = format!("{}:{}", name, branch_name);
+            let load_status = status_map
+                .get(&model_ref)
+                .cloned()
+                .unwrap_or_else(|| "unloaded".to_owned());
 
-            for wt in worktrees {
-                let branch_name = if wt.branch_name.is_empty() { "detached".to_owned() } else { wt.branch_name.clone() };
-                let display_name = format!("{}:{}", name, branch_name);
+            let size_str = "n/a".to_owned();
 
-                // Detect capabilities from worktree path (from service)
-                let wt_path = std::path::Path::new(&wt.path);
-                let detected = archetype_registry.detect(wt_path);
-                let domains = detected.to_detected_domains();
-
-                // Compute access string based on user permissions
-                let resource = format!("model:{}", name);
-                let access_str = if let Some(pm) = policy_manager {
-                    crate::auth::capabilities_to_access_string(pm, &current_user, &resource, &domains.capabilities)
-                } else {
-                    // No policy manager = full access (show all capabilities)
-                    domains.capabilities.to_ids().join(",")
-                };
-
-                models_with_info.push(ModelInfo {
-                    display_name,
-                    git_ref: branch_name,
-                    commit: commit.clone(),
-                    is_dirty: wt.is_dirty,
-                    size_bytes: None, // Could be computed if needed
-                    domains,
-                    access_str,
-                });
-            }
+            rows.push(RowInfo {
+                display_name,
+                domains_str,
+                access_str,
+                git_ref: branch_name,
+                commit,
+                load_status,
+                size_str,
+            });
         }
     }
 
-    if models_with_info.is_empty() {
-        println!("No models found.");
-        println!("Try: hyprstream clone https://huggingface.co/Qwen/Qwen2-1.5B-Instruct");
+    // Apply --status filter (OR semantics: row must match one of the specified statuses)
+    let rows: Vec<_> = if status_filter.is_empty() {
+        rows
+    } else {
+        rows.into_iter()
+            .filter(|r| status_filter.contains(r.load_status.as_str()))
+            .collect()
+    };
+
+    // Apply --filter predicates (AND semantics, unanchored regex match)
+    let rows: Vec<_> = rows.into_iter().filter(|r| {
+        filters.iter().all(|(key, re)| {
+            let haystack = match key.as_str() {
+                "name"    => &r.display_name,
+                "domains" => &r.domains_str,
+                "access"  => &r.access_str,
+                "ref"     => &r.git_ref,
+                "commit"  => &r.commit,
+                "size"    => &r.size_str,
+                _         => return true,
+            };
+            re.is_match(haystack)
+        })
+    }).collect();
+
+    if rows.is_empty() {
+        println!("No models match the given filters.");
         return Ok(());
     }
 
-    // Table format with DOMAINS and ACCESS columns
     println!(
-        "{:<30} {:<16} {:<16} {:<15} {:<8} {:<6} {:<10}",
-        "MODEL NAME", "DOMAINS", "ACCESS", "REF", "COMMIT", "STATUS", "SIZE"
+        "{:<35} {:<16} {:<15} {:<8} {:<10}",
+        "MODEL NAME", "DOMAINS", "REF", "COMMIT", "STATUS"
     );
-    println!("{}", "-".repeat(111));
+    println!("{}", "-".repeat(90));
 
-    for info in &models_with_info {
-        let size_str = if let Some(size) = info.size_bytes {
-            format!("{:.1}GB", size as f64 / (1024.0 * 1024.0 * 1024.0))
-        } else {
-            "n/a".to_owned()
-        };
-
-        let domains_str = info.domains.domains_display();
-        let status = if info.is_dirty { "dirty" } else { "clean" };
-
+    for r in &rows {
         println!(
-            "{:<30} {:<16} {:<16} {:<15} {:<8} {:<6} {:<10}",
-            info.display_name, domains_str, info.access_str, info.git_ref, info.commit, status, size_str
+            "{:<35} {:<16} {:<15} {:<8} {:<10}",
+            r.display_name, r.domains_str, r.git_ref, r.commit, r.load_status
         );
     }
 
@@ -521,7 +691,7 @@ pub async fn handle_list(
 /// Handle clone command with streaming progress
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_clone(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     repo_url: &str,
     name: Option<String>,
     branch: Option<String>,
@@ -581,7 +751,13 @@ pub async fn handle_clone(
         if verbose {
             warn!("Streaming clone failed, falling back to non-streaming: {}", e);
         }
-        registry.clone(repo_url, &model_name, shallow, clone_depth, branch.as_deref().unwrap_or("")).await
+        registry.clone(&CloneRequest {
+            url: repo_url.to_owned(),
+            name: model_name.clone(),
+            shallow,
+            depth: clone_depth,
+            branch: branch.as_deref().unwrap_or("").to_owned(),
+        }).await
             .map_err(|e| anyhow::anyhow!("Failed to clone model: {}", e))?;
     }
 
@@ -594,20 +770,23 @@ pub async fn handle_clone(
     // Use requested branch or fall back to default branch (usually "main")
     let worktree_branch = if let Some(ref b) = branch {
         b.clone()
+    } else if !tracked.tracking_ref.is_empty() {
+        tracked.tracking_ref.clone()
     } else {
-        repo_client.get_head().await
-            .unwrap_or_else(|_| "main".to_owned())
+        "main".to_owned()
     };
 
     if !quiet {
         println!("   Creating worktree for branch: {worktree_branch}");
     }
-    let worktree_path = repo_client.create_worktree("", &worktree_branch, false).await
+    repo_client.create_worktree(&CreateWorktreeRequest {
+        branch: worktree_branch.clone(),
+    }).await
         .map_err(|e| anyhow::anyhow!("Failed to create worktree: {}", e))?;
 
     if !quiet {
         println!("✅ Model '{}' cloned successfully!", model_name);
-        println!("   Location: {}", worktree_path);
+        println!("✓ Worktree: {model_name}:{worktree_branch}");
     }
 
     // Apply policy template if specified
@@ -623,7 +802,7 @@ pub async fn handle_clone(
 /// Uses DH-authenticated streaming to receive clone progress updates.
 #[allow(clippy::too_many_arguments)]
 async fn clone_with_streaming(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     repo_url: &str,
     model_name: &str,
     shallow: bool,
@@ -632,34 +811,16 @@ async fn clone_with_streaming(
     quiet: bool,
     verbose: bool,
 ) -> Result<()> {
-    // Generate ephemeral keypair for DH key exchange
-    let (client_secret, client_pubkey) = generate_ephemeral_keypair();
-    let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
-
-    // Call clone_stream to initiate streaming clone
-    let stream_info = registry
-        .clone_stream(repo_url, model_name, shallow, depth, branch.unwrap_or(""), client_pubkey_bytes)
+    use crate::services::generated::registry_client::RegistryRpc;
+    let mut stream_handle = RegistryRpc::clone_stream(registry, &CloneRequest {
+            url: repo_url.to_owned(),
+            name: model_name.to_owned(),
+            shallow,
+            depth,
+            branch: branch.unwrap_or("").to_owned(),
+        })
         .await
         .map_err(|e| anyhow::anyhow!("Failed to start streaming clone: {}", e))?;
-
-    if verbose {
-        debug!(
-            stream_id = %stream_info.stream_id,
-            endpoint = %stream_info.endpoint,
-            "Started streaming clone"
-        );
-    }
-
-    // Create stream handle for receiving progress
-    let ctx = global_context();
-    let mut stream_handle = StreamHandle::new(
-        &ctx,
-        stream_info.stream_id.clone(),
-        &stream_info.endpoint,
-        &stream_info.server_pubkey,
-        &client_secret,
-        &client_pubkey_bytes,
-    )?;
 
     if !quiet {
         print!("   Progress: ");
@@ -667,8 +828,9 @@ async fn clone_with_streaming(
     }
 
     // Receive and display progress
+    let mut current_stage = String::new();
     loop {
-        match stream_handle.recv_next()? {
+        match stream_handle.recv_next().await? {
             Some(StreamPayload::Data(data)) => {
                 // Parse progress message (format: "stage:current:total")
                 if let Ok(text) = String::from_utf8(data) {
@@ -677,9 +839,39 @@ async fn clone_with_streaming(
                         let parts: Vec<&str> = text.split(':').collect();
                         if parts.len() >= 3 {
                             let stage = parts[0];
-                            if verbose {
-                                println!("\r   {}: {}/{}", stage, parts[1], parts[2]);
-                            } else {
+                            let current = parts[1];
+                            let total = parts[2];
+
+                            // Detect stage transitions and print stage names
+                            let is_transition = stage != current_stage;
+                            if is_transition {
+                                if !current_stage.is_empty() && !verbose {
+                                    println!();
+                                }
+                                let stage_label = match stage {
+                                    "fetch" => "Fetching objects",
+                                    "indexing" => "Indexing",
+                                    "smudge" => "Downloading model files",
+                                    "lfs" => "Downloading LFS files",
+                                    other => other,
+                                };
+                                current_stage = stage.to_owned();
+                                if verbose {
+                                    println!("   {stage_label}...");
+                                } else {
+                                    print!("   {stage_label}...");
+                                    io::stdout().flush()?;
+                                }
+                            }
+
+                            if verbose && !is_transition {
+                                if total == "0" {
+                                    // Indeterminate total (e.g. smudge)
+                                    println!("   {}: {} files", stage, current);
+                                } else {
+                                    println!("   {}: {}/{}", stage, current, total);
+                                }
+                            } else if !verbose {
                                 print!(".");
                                 io::stdout().flush()?;
                             }
@@ -704,6 +896,9 @@ async fn clone_with_streaming(
                 }
                 return Err(anyhow::anyhow!("Clone stream error: {}", message));
             }
+            Some(StreamPayload::Tagged { .. }) => {
+                // Tagged payloads not expected in clone streams; skip
+            }
             None => {
                 // Stream ended without completion
                 if !quiet {
@@ -721,7 +916,7 @@ async fn clone_with_streaming(
 ///
 /// TODO: Adapter listing still uses local filesystem access. Consider moving to ModelService.
 pub async fn handle_info(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model: &str,
     verbose: bool,
     adapters_only: bool,
@@ -756,10 +951,6 @@ pub async fn handle_info(
         ))
     };
 
-    // Get model path from worktree info via service
-    let worktrees = repo_client.list_worktrees().await
-        .map_err(|e| anyhow::anyhow!("Failed to list worktrees: {}", e))?;
-
     // Find the worktree matching the requested branch/ref
     let branch_name = match &model_ref.git_ref {
         crate::storage::GitRef::DefaultBranch => {
@@ -769,15 +960,10 @@ pub async fn handle_info(
         _ => "main".to_owned(),
     };
 
-    let model_path = worktrees.iter()
-        .find(|wt| wt.branch_name == branch_name)
-        .map(|wt| PathBuf::from(&wt.path))
-        .unwrap_or_else(|| {
-            // Fallback: use first available worktree
-            worktrees.first()
-                .map(|wt| PathBuf::from(&wt.path))
-                .unwrap_or_else(|| PathBuf::from("."))
-        });
+    // Resolve worktree path locally (not from RPC response)
+    let storage_paths = crate::storage::StoragePaths::new()?;
+    let model_path = storage_paths.worktree_path(&model_ref.model, &branch_name)
+        .unwrap_or_else(|_| PathBuf::from("."));
 
     // If adapters_only is true, skip the general model info
     if !adapters_only {
@@ -849,9 +1035,9 @@ pub async fn handle_info(
         }
     }
 
-    // Size calculation - this could be moved to RepositoryClient as get_repo_size()
-    // Get bare repo path from TrackedRepository (already fetched above)
-    let bare_repo_path = Some(PathBuf::from(&tracked_repo.worktree_path));
+    // Size calculation - derive bare repo path locally from models_dir
+    let bare_repo_path = storage_paths.models_dir().ok()
+        .map(|d| d.join(&model_ref.model).join(format!("{}.git", &model_ref.model)));
 
     if let Some(ref bare_repo_path) = bare_repo_path {
         if bare_repo_path.exists() {
@@ -1017,7 +1203,7 @@ pub async fn handle_info(
 /// This is a helper used by branch, clone, and worktree commands to apply
 /// policy templates when the --policy flag is specified.
 pub async fn apply_policy_template_to_model(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model: &str,
     template_name: &str,
 ) -> Result<()> {
@@ -1031,17 +1217,13 @@ pub async fn apply_policy_template_to_model(
             template_name
         ))?;
 
-    // Get the policies directory - derive models_dir from TrackedRepository
-    let tracked = registry.get_by_name(model).await
+    // Validate model exists in registry
+    let _tracked = registry.get_by_name(model).await
         .map_err(|e| anyhow::anyhow!("Failed to get repository: {}", e))?;
 
-    // TrackedRepository.worktree_path is bare repo: models/{name}/{name}.git
-    // Navigate up 2 levels to get models_dir
-    let bare_repo_path = PathBuf::from(&tracked.worktree_path);
-    let models_dir = bare_repo_path
-        .parent()  // models/{name}
-        .and_then(|p| p.parent())  // models/
-        .ok_or_else(|| anyhow::anyhow!("Invalid repository path structure"))?;
+    // Derive models_dir from StoragePaths (not from RPC response)
+    let storage_paths = crate::storage::StoragePaths::new()?;
+    let models_dir = storage_paths.models_dir()?;
 
     let registry_path = models_dir.join(".registry");
     let policies_dir = registry_path.join("policies");
@@ -1061,7 +1243,7 @@ pub async fn apply_policy_template_to_model(
     };
 
     // Check if template rules already exist
-    let rules = template.expanded_rules();
+    let rules = template.to_csv();
     if existing_content.contains(rules.trim()) {
         println!("✓ Policy template '{template_name}' already applied");
         return Ok(());
@@ -1153,19 +1335,44 @@ pub async fn handle_infer(
     let _ = ModelRef::parse(model_ref_str)?;
 
     // ModelService is already running (started by main.rs in inproc mode, or by systemd in ipc-systemd mode).
-    let model_client = ModelZmqClient::new(signing_key.clone(), RequestIdentity::local());
+    let model_server_vk = {
+        let policy_vk = signing_key.verifying_key();
+        let policy_client = crate::services::PolicyClient::for_service(
+            signing_key.clone(), policy_vk, None,
+        )?;
+        let resp = policy_client.resolve_service_key(
+            &crate::services::generated::policy_client::ResolveServiceKey {
+                service_name: "model".to_owned(),
+            },
+        ).await.map_err(|e| anyhow::anyhow!("Failed to resolve model key: {e}"))?;
+        hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+            resp.verifying_key.as_slice().try_into()
+                .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
+        ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?
+    };
+    let model_client = ModelClient::for_service(
+        signing_key.clone(),
+        model_server_vk,
+        None,
+    )?;
 
     // Apply chat template to the prompt via ModelService
     let messages = vec![ChatMessage {
         role: "user".to_owned(),
-        content: Some(prompt.to_owned()),
-        function_call: None,
-        tool_calls: None,
-        tool_call_id: None,
+        content: prompt.to_owned(),
+        tool_calls: vec![],
+        tool_call_id: String::new(),
     }];
 
-    let formatted_prompt = match model_client.apply_chat_template(model_ref_str, &messages, true, None).await {
-        Ok(formatted) => formatted,
+    let formatted_prompt = match model_client.infer(model_ref_str).apply_chat_template(&ChatTemplateRequest {
+        messages: messages.clone(),
+        add_generation_prompt: true,
+        tools_json: Some(String::new()),
+        max_tokens: None,
+        enable_thinking: None,
+        template_vars_json: None,
+    }).await {
+        Ok(prompt_str) => crate::config::TemplatedPrompt::new(prompt_str),
         Err(e) => {
             tracing::warn!("Could not apply chat template: {}. Using raw prompt.", e);
             crate::config::TemplatedPrompt::new(prompt.to_owned())
@@ -1173,70 +1380,41 @@ pub async fn handle_infer(
     };
 
     // Build generation request with CLI overrides (ModelService applies model defaults)
-    let mut request_builder = GenerationRequest::builder(formatted_prompt.into_inner())
-        .max_tokens(max_tokens.unwrap_or(2048));
-
-    // Apply CLI overrides only if specified
-    if let Some(t) = temperature {
-        request_builder = request_builder.temperature(t);
-    }
-    if let Some(p) = top_p {
-        request_builder = request_builder.top_p(p);
-    }
-    if let Some(k) = top_k {
-        request_builder = request_builder.top_k(Some(k));
-    }
-    if let Some(r) = repeat_penalty {
-        request_builder = request_builder.repeat_penalty(r);
-    }
-    if let Some(s) = seed {
-        request_builder = request_builder.seed(Some(s as u64));
-    }
+    let mut request = GenerationRequest {
+        prompt: formatted_prompt.into_inner(),
+        max_tokens: Some(max_tokens.unwrap_or(2048) as u32),
+        temperature,
+        top_p,
+        top_k: top_k.map(|v| v as u32),
+        repeat_penalty,
+        seed,
+        ..Default::default()
+    };
 
     // Add image path if provided (for multimodal models)
     if let Some(img_path) = image_path {
         info!("Using image: {}", img_path);
-        request_builder = request_builder.image_path(std::path::PathBuf::from(img_path));
+        let img_bytes = std::fs::read(&img_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read image {}: {}", img_path, e))?;
+        request.images = Some(vec![img_bytes]);
     }
 
-    let request = request_builder.build();
-
     info!(
-        "Generating response: max_tokens={}, temperature={}, top_p={}, top_k={:?}, repeat_penalty={}",
+        "Generating response: max_tokens={:?}, temperature={:?}, top_p={:?}, top_k={:?}, repeat_penalty={:?}",
         request.max_tokens, request.temperature, request.top_p, request.top_k, request.repeat_penalty
     );
 
     // Generate via ModelService (handles model loading, adapter loading, training collection, auth)
     if !sync {
-        // Generate client ephemeral keypair for DH key exchange
-        let (client_secret, client_pubkey) = generate_ephemeral_keypair();
-        let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
-
-        // Start stream with client ephemeral pubkey
-        let stream_info = model_client.infer_stream(model_ref_str, &request, client_pubkey_bytes).await?;
-
-        debug!(
-            stream_id = %stream_info.stream_id,
-            endpoint = %stream_info.endpoint,
-            "Started inference stream"
-        );
-
-        // Create stream handle for receiving tokens (handles DH, subscription, verification)
-        let ctx = global_context();
-        let mut stream_handle = StreamHandle::new(
-            &ctx,
-            stream_info.stream_id.clone(),
-            &stream_info.endpoint,
-            &stream_info.server_pubkey,
-            &client_secret,
-            &client_pubkey_bytes,
-        )?;
+        // Start stream with E2E authenticated handle (DH key exchange)
+        use crate::services::generated::model_client::InferRpc;
+        let mut stream_handle = InferRpc::generate_stream(&model_client.infer(model_ref_str), &request).await?;
 
         println!();
 
         // Receive and print tokens
         loop {
-            match stream_handle.recv_next()? {
+            match stream_handle.recv_next().await? {
                 Some(StreamPayload::Data(data)) => {
                     // Token data is UTF-8 text
                     if let Ok(text) = String::from_utf8(data) {
@@ -1252,6 +1430,9 @@ pub async fn handle_infer(
                     warn!("Stream error: {}", message);
                     bail!("Inference stream error: {}", message);
                 }
+                Some(StreamPayload::Tagged { .. }) => {
+                    // Tagged payloads not expected here; skip
+                }
                 None => {
                     // Stream ended
                     break;
@@ -1262,23 +1443,13 @@ pub async fn handle_infer(
         println!();
     } else {
         // Non-streaming: collect stream into full response
-        let (client_secret, client_pubkey) = generate_ephemeral_keypair();
-        let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
-        let stream_info = model_client.infer_stream(model_ref_str, &request, client_pubkey_bytes).await?;
-        let ctx = global_context();
-        let mut handle = StreamHandle::new(
-            &ctx,
-            stream_info.stream_id.clone(),
-            &stream_info.endpoint,
-            &stream_info.server_pubkey,
-            &client_secret,
-            &client_pubkey_bytes,
-        )?;
+        use crate::services::generated::model_client::InferRpc;
+        let mut handle = InferRpc::generate_stream(&model_client.infer(model_ref_str), &request).await?;
 
         let mut text = String::new();
         loop {
-            match handle.try_next() {
-                Ok(Some(payload)) => match payload {
+            match handle.recv_next().await? {
+                Some(payload) => match payload {
                     StreamPayload::Data(data) => {
                         text.push_str(&String::from_utf8_lossy(&data));
                     }
@@ -1306,15 +1477,10 @@ pub async fn handle_infer(
                     StreamPayload::Error(msg) => {
                         bail!("Generation error: {msg}");
                     }
+                    StreamPayload::Tagged { .. } => {}
                 },
-                Ok(None) if handle.is_completed() => {
+                None => {
                     bail!("Stream ended without completion");
-                }
-                Ok(None) => {
-                    tokio::task::yield_now().await;
-                }
-                Err(e) => {
-                    bail!("Stream error: {e}");
                 }
             }
         }
@@ -1324,48 +1490,489 @@ pub async fn handle_infer(
 }
 
 /// Handle load command - pre-load a model with optional runtime config
+///
+/// `wait` is `None` for fire-and-forget, or `Some(timeout_secs)` to subscribe
+/// to notification events and wait for model.loaded/model.failed.
 pub async fn handle_load(
     model_ref_str: &str,
     max_context: Option<usize>,
-    kv_quant: crate::runtime::kv_quant::KVQuantType,
+    kv_quant: crate::runtime::KVQuantType,
+    wait: Option<u64>,
     signing_key: SigningKey,
 ) -> Result<()> {
-    use crate::services::model::ModelLoadConfig;
-
     info!("Loading model: {}", model_ref_str);
 
     // Validate model reference format
-    let _ = ModelRef::parse(model_ref_str)?;
+    let model_ref = ModelRef::parse(model_ref_str)?;
 
-    let model_client = ModelZmqClient::new(signing_key, RequestIdentity::local());
+    let load_max_context = max_context.map(|v| v as u32);
+    let load_kv_quant = if kv_quant == crate::runtime::KVQuantType::None {
+        None
+    } else {
+        Some(kv_quant)
+    };
 
-    // Build config if any options specified
-    let config = if max_context.is_some() || kv_quant != crate::runtime::kv_quant::KVQuantType::None {
-        Some(ModelLoadConfig {
-            max_context,
-            kv_quant: if kv_quant == crate::runtime::kv_quant::KVQuantType::None {
-                None
-            } else {
-                Some(kv_quant)
+    // Resolve service keys via PolicyClient
+    let policy_vk = signing_key.verifying_key();
+    let policy_client = crate::services::PolicyClient::for_service(
+        signing_key.clone(), policy_vk, None,
+    )?;
+
+    // If --wait, subscribe to notifications BEFORE issuing load request
+    // (ensures no events are missed between load and subscribe)
+    let notification_state = if let Some(timeout_secs) = wait {
+        let scope_pattern = format!("serve:model:{}", model_ref.model);
+        println!("Subscribing to model events: {}", scope_pattern);
+
+        let (sub_secret, sub_pubkey) = generate_ephemeral_keypair();
+        let sub_pub_bytes = sub_pubkey.to_bytes();
+
+        let notif_key_resp = policy_client.resolve_service_key(
+            &crate::services::generated::policy_client::ResolveServiceKey {
+                service_name: "notification".to_owned(),
             },
-        })
+        ).await.map_err(|e| anyhow::anyhow!("Failed to resolve notification key: {e}"))?;
+        let notif_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+            notif_key_resp.verifying_key.as_slice().try_into()
+                .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
+        ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?;
+        let notif_client = crate::services::NotificationClient::for_service(
+            signing_key.clone(),
+            notif_vk,
+            None,
+        )?;
+
+        let sub_resp = notif_client.subscribe(&SubscribeRequest {
+            scope_pattern: scope_pattern.clone(),
+            ephemeral_pubkey: sub_pub_bytes.to_vec(),
+            ttl_seconds: timeout_secs.min(3600) as u32,
+        }).await?;
+
+        anyhow::ensure!(
+            !sub_resp.broadcast_path.is_empty(),
+            "NotificationService did not return a moq broadcast path — server may be in ZMQ-only mode"
+        );
+
+        debug!(
+            subscription_id = %sub_resp.subscription_id,
+            topic = %sub_resp.assigned_topic,
+            broadcast_path = %sub_resp.broadcast_path,
+            reach_count = sub_resp.announced_at.len(),
+            "Subscribed to notification stream via moq"
+        );
+
+        Some((sub_secret, sub_pub_bytes, notif_client, sub_resp, timeout_secs))
     } else {
         None
     };
 
-    let endpoint = model_client.load(model_ref_str, config.as_ref()).await?;
+    // Await the load RPC directly — the model service returns "accepted" immediately
+    // (Continuation pattern), so this completes in milliseconds.
+    // fire-and-forget via tokio::spawn caused the task to never run: the CLI runtime
+    // drops before the spawned task executes.
+    let model_key_resp = policy_client.resolve_service_key(
+        &crate::services::generated::policy_client::ResolveServiceKey {
+            service_name: "model".to_owned(),
+        },
+    ).await.map_err(|e| anyhow::anyhow!("Failed to resolve model key: {e}"))?;
+    let model_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+        model_key_resp.verifying_key.as_slice().try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
+    ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?;
+    let model_client = ModelClient::for_service(
+        signing_key.clone(),
+        model_vk,
+        None,
+    )?;
+    let model_ref_owned = model_ref_str.to_owned();
+    match model_client.load(&LoadModelRequest {
+        model_ref: model_ref_owned.clone(),
+        max_context: load_max_context,
+        kv_quant: load_kv_quant.filter(|q| *q != crate::runtime::KVQuantType::None),
+    }).await {
+        Ok(_) => debug!("Load RPC accepted for {}", model_ref_owned),
+        Err(e) => warn!("Load RPC failed for {}: {}", model_ref_owned, e),
+    }
 
-    println!("✓ Model {} loaded", model_ref_str);
-    println!("  Endpoint: {}", endpoint);
+    println!("Load initiated for model: {}", model_ref_str);
     if let Some(max_ctx) = max_context {
         println!("  Max context: {}", max_ctx);
     }
-    if kv_quant != crate::runtime::kv_quant::KVQuantType::None {
+    if kv_quant != crate::runtime::KVQuantType::None {
         println!("  KV quantization: {:?}", kv_quant);
+    }
+
+    // If --wait, block on notification events until model.loaded or model.failed
+    if let Some((sub_secret, sub_pub_bytes, notif_client, sub_resp, timeout_secs)) = notification_state {
+        println!("Waiting for model to load (timeout: {}s)...", timeout_secs);
+
+        let wait_start = tokio::time::Instant::now();
+        let deadline = wait_start + std::time::Duration::from_secs(timeout_secs);
+        let decryptor = hyprstream_rpc::crypto::notification::BroadcastDecryptor::new(
+            &sub_secret.scalar().to_bytes(),
+            &sub_pub_bytes,
+        );
+
+        let result = wait_for_model_notification(
+            &sub_resp.announced_at,
+            &sub_resp.broadcast_path,
+            &sub_resp.assigned_topic,
+            &decryptor,
+            model_ref_str,
+            deadline,
+        ).await;
+
+        // Clean up subscription
+        let _ = notif_client.unsubscribe(&UnsubscribeRequest {
+            subscription_id: sub_resp.subscription_id.clone(),
+        }).await;
+
+        match result {
+            Ok(NotificationOutcome::Loaded { endpoint }) => {
+                println!("✓ Model {} loaded", model_ref_str);
+                println!("  Endpoint: {}", endpoint);
+            }
+            Ok(NotificationOutcome::Failed { error }) => {
+                bail!("Model {} failed to load: {}", model_ref_str, error);
+            }
+            Err(_) => {
+                bail!("Timeout waiting for model load notification ({}s elapsed)",
+                    wait_start.elapsed().as_secs());
+            }
+        }
     }
 
     Ok(())
 }
+
+/// Outcome from waiting on a model notification.
+enum NotificationOutcome {
+    Loaded { endpoint: String },
+    Failed { error: String },
+}
+
+/// Wait for a model.loaded or model.failed notification over the moq plane.
+///
+/// #142/#356: consumes the NotificationService's NETWORKED reach (`announcedAt`)
+/// via the shared [`connect_moq_reach`] resolver, so a model loaded on a DIFFERENT
+/// PDS instance is reached by dialing the producer's QUIC `/moq` endpoint. The
+/// old UDS-only path connected to *this* process's local moq plane, which never
+/// carries another instance's broadcast — silently failing cross-instance.
+async fn wait_for_model_notification(
+    reach: &[hyprstream_rpc::stream_info::Destination],
+    broadcast_path: &str,
+    topic: &str,
+    decryptor: &hyprstream_rpc::crypto::notification::BroadcastDecryptor,
+    model_ref: &str,
+    deadline: tokio::time::Instant,
+) -> Result<NotificationOutcome> {
+    use crate::events::{EventEnvelope, EventPayload};
+    use hyprstream_rpc::moq_stream::{connect_moq_reach, STREAM_TRACK};
+
+    let conn = connect_moq_reach(reach).await
+        .context("moq connect for notifications")?;
+    let bc = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        conn.consumer.announced_broadcast(broadcast_path),
+    ).await
+    .context("timeout waiting for notification broadcast")?
+    .ok_or_else(|| anyhow::anyhow!("notification broadcast {} not found", broadcast_path))?;
+    let mut track = bc.subscribe_track(&moq_net::Track::new(STREAM_TRACK))
+        .context("subscribe_track for notifications")?;
+
+    // topic is logged for diagnostics only; HMAC verification is not used for
+    // notifications because the transport MAC key is not conveyed to subscribers
+    // (the payload is end-to-end encrypted, providing authenticity instead).
+    let _ = topic;
+
+    loop {
+        let mut group = match tokio::time::timeout_at(deadline, track.next_group()).await {
+            Ok(Ok(Some(g))) => g,
+            Ok(Ok(None)) => bail!("Notification stream closed"),
+            Ok(Err(e)) => { debug!("moq next_group: {e}"); bail!("moq stream error") }
+            Err(_) => bail!("Timeout"),
+        };
+        let frame: bytes::Bytes = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            group.read_frame(),
+        ).await {
+            Ok(Ok(Some(f))) => f,
+            _ => continue,
+        };
+        if frame.len() < 16 { continue; }
+        let capnp_data = &frame[..frame.len() - 16];
+        let payload_data = match parse_stream_block_data(capnp_data) {
+            Ok(data) => data,
+            Err(e) => { debug!("Failed to parse StreamBlock: {e}"); continue; }
+        };
+        let block = match parse_notification_block(&payload_data) {
+            Ok(b) => b,
+            Err(e) => { debug!("Failed to parse NotificationBlock: {e}"); continue; }
+        };
+        let plaintext = match decryptor.decrypt(
+            &block.publisher_pubkey, &block.blinding_scalar, &block.wrapped_key,
+            &block.key_nonce, &block.encrypted_payload, &block.nonce,
+            &block.publisher_mac, &block.intent_id, &block.scope,
+        ) {
+            Ok(pt) => pt,
+            Err(e) => { debug!("Failed to decrypt notification: {e}"); continue; }
+        };
+        let event: EventEnvelope = match serde_json::from_slice(&plaintext) {
+            Ok(e) => e,
+            Err(e) => { debug!("Failed to parse event: {e}"); continue; }
+        };
+        match &event.payload {
+            EventPayload::ModelLoaded { model_ref: ref mr, endpoint }
+                if mr.contains(model_ref) || model_ref.contains(mr.as_str()) =>
+                return Ok(NotificationOutcome::Loaded { endpoint: endpoint.clone() }),
+            EventPayload::ModelFailed { model_ref: ref mr, error }
+                if mr.contains(model_ref) || model_ref.contains(mr.as_str()) =>
+                return Ok(NotificationOutcome::Failed { error: error.clone() }),
+            _ => { debug!("Ignoring unrelated event: {:?}", event.topic); continue; }
+        }
+    }
+}
+
+/// Parsed notification block fields.
+struct NotificationBlockFields {
+    publisher_pubkey: [u8; 32],
+    blinding_scalar: [u8; 32],
+    wrapped_key: Vec<u8>,
+    key_nonce: [u8; 12],
+    encrypted_payload: Vec<u8>,
+    nonce: [u8; 12],
+    intent_id: String,
+    scope: String,
+    publisher_mac: [u8; 32],
+}
+
+/// Parse a StreamBlock's first data payload from Cap'n Proto bytes.
+fn parse_stream_block_data(capnp_data: &[u8]) -> Result<Vec<u8>> {
+    let reader = capnp::serialize::read_message(
+        &mut std::io::Cursor::new(capnp_data),
+        capnp::message::ReaderOptions::default(),
+    )?;
+    let block = reader.get_root::<crate::streaming_capnp::stream_block::Reader>()?;
+
+    // StreamBlock has payloads: List(StreamPayload) — extract first Data variant
+    let payloads = block.get_payloads()?;
+    for i in 0..payloads.len() {
+        let payload = payloads.get(i);
+        if let crate::streaming_capnp::stream_payload::Which::Data(data) = payload.which()? {
+            return Ok(data?.to_vec());
+        }
+    }
+
+    bail!("StreamBlock contains no Data payload")
+}
+
+/// Parse a NotificationBlock from Cap'n Proto bytes.
+fn parse_notification_block(data: &[u8]) -> Result<NotificationBlockFields> {
+    let reader = capnp::serialize::read_message(
+        &mut std::io::Cursor::new(data),
+        capnp::message::ReaderOptions::default(),
+    )?;
+    let block = reader.get_root::<crate::notification_capnp::notification_block::Reader>()?;
+
+    let publisher_pubkey: [u8; 32] = block.get_publisher_pubkey()?
+        .try_into().map_err(|_| anyhow::anyhow!("publisher_pubkey not 32 bytes"))?;
+    let blinding_scalar: [u8; 32] = block.get_blinding_scalar()?
+        .try_into().map_err(|_| anyhow::anyhow!("blinding_scalar not 32 bytes"))?;
+    let wrapped_key = block.get_wrapped_key()?.to_vec();
+    let key_nonce: [u8; 12] = block.get_key_nonce()?
+        .try_into().map_err(|_| anyhow::anyhow!("key_nonce not 12 bytes"))?;
+    let encrypted_payload = block.get_encrypted_payload()?.to_vec();
+    let nonce: [u8; 12] = block.get_nonce()?
+        .try_into().map_err(|_| anyhow::anyhow!("nonce not 12 bytes"))?;
+    let intent_id = block.get_intent_id()?.to_string()?;
+    let scope = block.get_scope()?.to_string()?;
+    let publisher_mac: [u8; 32] = block.get_publisher_mac()?
+        .try_into().map_err(|_| anyhow::anyhow!("publisher_mac not 32 bytes"))?;
+
+    Ok(NotificationBlockFields {
+        publisher_pubkey,
+        blinding_scalar,
+        wrapped_key,
+        key_nonce,
+        encrypted_payload,
+        nonce,
+        intent_id,
+        scope,
+        publisher_mac,
+    })
+}
+
+/// Handle the `notify` subcommands.
+pub async fn handle_notify_command(
+    command: crate::cli::quick::NotifyCommand,
+    signing_key: SigningKey,
+) -> Result<()> {
+    use crate::cli::quick::NotifyCommand;
+
+    match command {
+        NotifyCommand::Subscribe { pattern, json, timeout, count } => {
+            handle_notify_subscribe(&pattern, json, timeout, count, signing_key).await
+        }
+    }
+}
+
+/// Handle `notify subscribe` — listen for and print decrypted notification events.
+async fn handle_notify_subscribe(
+    pattern: &str,
+    json_output: bool,
+    timeout_secs: u64,
+    max_count: u64,
+    signing_key: SigningKey,
+) -> Result<()> {
+    use crate::events::EventEnvelope;
+
+    let (sub_secret, sub_pubkey) = generate_ephemeral_keypair();
+    let sub_pub_bytes = sub_pubkey.to_bytes();
+
+    let policy_vk = signing_key.verifying_key();
+    let policy_client = crate::services::PolicyClient::for_service(
+        signing_key.clone(), policy_vk, None,
+    )?;
+    let notif_key_resp = policy_client.resolve_service_key(
+        &crate::services::generated::policy_client::ResolveServiceKey {
+            service_name: "notification".to_owned(),
+        },
+    ).await.map_err(|e| anyhow::anyhow!("Failed to resolve notification key: {e}"))?;
+    let notif_server_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+        notif_key_resp.verifying_key.as_slice().try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
+    ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?;
+    let notif_client = crate::services::NotificationClient::for_service(
+        signing_key,
+        notif_server_vk,
+        None,
+    )?;
+
+    // Subscribe with maximum TTL for long-running listeners
+    let ttl = if timeout_secs == 0 { 3600u32 } else { (timeout_secs as u32).min(3600) };
+    let sub_resp = notif_client.subscribe(&SubscribeRequest {
+        scope_pattern: pattern.to_owned(),
+        ephemeral_pubkey: sub_pub_bytes.to_vec(),
+        ttl_seconds: ttl,
+    }).await?;
+
+    anyhow::ensure!(
+        !sub_resp.broadcast_path.is_empty(),
+        "NotificationService did not return a moq broadcast path — server may be in ZMQ-only mode"
+    );
+
+    eprintln!("Subscribed to: {}", pattern);
+    eprintln!("  Subscription ID: {}", sub_resp.subscription_id);
+    eprintln!("  Topic: {}", sub_resp.assigned_topic);
+
+    use hyprstream_rpc::moq_stream::{connect_moq_reach, STREAM_TRACK};
+
+    // #142/#356: dial the NotificationService's networked reach (or local UDS
+    // fast path) via the shared resolver, so cross-instance notifications work.
+    let conn = connect_moq_reach(&sub_resp.announced_at).await
+        .context("moq connect for notifications")?;
+    let bc = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        conn.consumer.announced_broadcast(&sub_resp.broadcast_path),
+    ).await
+    .context("timeout waiting for notification broadcast")?
+    .ok_or_else(|| anyhow::anyhow!("notification broadcast {} not found", sub_resp.broadcast_path))?;
+    let mut track = bc.subscribe_track(&moq_net::Track::new(STREAM_TRACK))
+        .context("subscribe_track for notifications")?;
+
+    let decryptor = hyprstream_rpc::crypto::notification::BroadcastDecryptor::new(
+        &sub_secret.scalar().to_bytes(),
+        &sub_pub_bytes,
+    );
+
+    let deadline = if timeout_secs > 0 {
+        Some(tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs))
+    } else {
+        None
+    };
+
+    let mut received = 0u64;
+
+    loop {
+        if max_count > 0 && received >= max_count {
+            break;
+        }
+
+        let mut group = if let Some(dl) = deadline {
+            match tokio::time::timeout_at(dl, track.next_group()).await {
+                Ok(Ok(Some(g))) => g,
+                Ok(Ok(None)) => break,
+                Ok(Err(e)) => { debug!("moq next_group: {e}"); break; }
+                Err(_) => { eprintln!("Timeout reached"); break; }
+            }
+        } else {
+            match track.next_group().await {
+                Ok(Some(g)) => g,
+                Ok(None) => break,
+                Err(e) => { debug!("moq next_group: {e}"); break; }
+            }
+        };
+
+        let frame: bytes::Bytes = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            group.read_frame(),
+        ).await {
+            Ok(Ok(Some(f))) => f,
+            _ => continue,
+        };
+        if frame.len() < 16 { continue; }
+        let capnp_data = &frame[..frame.len() - 16];
+
+        let payload_data = match parse_stream_block_data(capnp_data) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let block = match parse_notification_block(&payload_data) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let plaintext = match decryptor.decrypt(
+            &block.publisher_pubkey, &block.blinding_scalar, &block.wrapped_key,
+            &block.key_nonce, &block.encrypted_payload, &block.nonce,
+            &block.publisher_mac, &block.intent_id, &block.scope,
+        ) {
+            Ok(pt) => pt,
+            Err(e) => { debug!("Decrypt failed: {e}"); continue; }
+        };
+
+        if json_output {
+            if let Ok(s) = String::from_utf8(plaintext.clone()) {
+                println!("{}", s);
+            }
+        } else {
+            match serde_json::from_slice::<EventEnvelope>(&plaintext) {
+                Ok(event) => {
+                    println!("[{}] {} (source: {})",
+                        event.timestamp.format("%H:%M:%S"),
+                        event.topic,
+                        event.source,
+                    );
+                    println!("  {:?}", event.payload);
+                }
+                Err(_) => {
+                    if let Ok(s) = String::from_utf8(plaintext) {
+                        println!("{}", s);
+                    }
+                }
+            }
+        }
+
+        received += 1;
+    }
+
+    let _ = notif_client.unsubscribe(&UnsubscribeRequest {
+        subscription_id: sub_resp.subscription_id.clone(),
+    }).await;
+    eprintln!("Received {} events", received);
+
+    Ok(())
+}
+
 
 /// Handle unload command - unload a model from memory
 pub async fn handle_unload(
@@ -1377,9 +1984,24 @@ pub async fn handle_unload(
     // Validate model reference format
     let _ = ModelRef::parse(model_ref_str)?;
 
-    let model_client = ModelZmqClient::new(signing_key, RequestIdentity::local());
+    let model_server_vk = {
+        let policy_vk = signing_key.verifying_key();
+        let policy_client = crate::services::PolicyClient::for_service(
+            signing_key.clone(), policy_vk, None,
+        )?;
+        let resp = policy_client.resolve_service_key(
+            &crate::services::generated::policy_client::ResolveServiceKey {
+                service_name: "model".to_owned(),
+            },
+        ).await.map_err(|e| anyhow::anyhow!("Failed to resolve model key: {e}"))?;
+        hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+            resp.verifying_key.as_slice().try_into()
+                .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
+        ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?
+    };
+    let model_client = ModelClient::for_service(signing_key, model_server_vk, None)?;
 
-    model_client.unload(model_ref_str).await?;
+    model_client.unload(&UnloadModelRequest { model_ref: model_ref_str.to_owned() }).await?;
 
     println!("✓ Model {} unloaded", model_ref_str);
 
@@ -1391,7 +2013,7 @@ pub async fn handle_unload(
 /// **EXPERIMENTAL**: This feature is behind the `experimental` flag.
 #[cfg(feature = "experimental")]
 pub async fn handle_push(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model: &str,
     remote: Option<String>,
     branch: Option<String>,
@@ -1442,7 +2064,7 @@ pub async fn handle_push(
 /// - fetch_remote(remote, refspec)
 /// - merge_with_strategy(ref, strategy)
 pub async fn handle_pull(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model: &str,
     remote: Option<String>,
     branch: Option<String>,
@@ -1463,7 +2085,9 @@ pub async fn handle_pull(
 
     // Use RepositoryClient.update() to fetch and merge
     // Note: This does a basic fetch+merge, doesn't expose merge analysis or fast-forward control
-    repo_client.update(refspec.as_deref().unwrap_or("")).await?;
+    repo_client.update(&UpdateRequest {
+        refspec: refspec.as_deref().unwrap_or("").to_owned(),
+    }).await?;
 
     println!("✓ Pulled latest changes for model {model}");
     println!("  Remote: {remote_name}");
@@ -1510,7 +2134,7 @@ pub struct MergeOptions {
 /// resolution (--abort, --continue, --quit) still needs service layer implementation.
 #[cfg(feature = "experimental")]
 pub async fn handle_merge(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     target: &str,
     source: &str,
     options: MergeOptions,
@@ -1539,8 +2163,16 @@ pub async fn handle_merge(
         None
     };
 
-    // Perform merge via service layer
-    let merge_result = repo_client.merge(source, message).await;
+    // Determine target branch for worktree-scoped merge
+    let target_branch = match &target_ref.git_ref {
+        crate::storage::GitRef::Branch(b) => b.clone(),
+        crate::storage::GitRef::DefaultBranch => repo_client.get_head().await
+            .unwrap_or_else(|_| "main".to_owned()),
+        _ => anyhow::bail!("Merge target must be a branch reference"),
+    };
+
+    // Perform merge via worktree-scoped service layer
+    let merge_result = repo_client.worktree(&target_branch).merge(source, message).await;
 
     match merge_result {
         Ok(merge_oid) => {
@@ -1589,7 +2221,7 @@ pub async fn handle_merge(
 /// **EXPERIMENTAL**: This is behind the `experimental` flag.
 #[cfg(feature = "experimental")]
 async fn handle_merge_conflict_resolution(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     target: &str,
     options: MergeOptions,
 ) -> Result<()> {
@@ -1609,13 +2241,12 @@ async fn handle_merge_conflict_resolution(
 
     // Verify worktree exists
     let wts = repo_client.list_worktrees().await?;
-    let worktree_path = wts.iter().find(|wt| wt.branch_name == target_branch).map(|wt| wt.path.clone())
-        .ok_or_else(|| anyhow::anyhow!("Worktree not found for branch {}", target_branch))?;
-
-    let worktree_path_buf = PathBuf::from(&worktree_path);
-    if !worktree_path_buf.exists() {
-        bail!("Worktree not found: {}", worktree_path);
+    if !wts.iter().any(|wt| wt.branch_name == target_branch) {
+        bail!("Worktree not found for branch {}", target_branch);
     }
+
+    // Use worktree-scoped client for merge operations
+    let wt = repo_client.worktree(&target_branch);
 
     if options.abort {
         // Abort merge: restore pre-merge state
@@ -1623,7 +2254,7 @@ async fn handle_merge_conflict_resolution(
             println!("→ Aborting merge...");
         }
 
-        repo_client.abort_merge().await?;
+        wt.abort_merge().await?;
 
         if !options.quiet {
             println!("✓ Merge aborted, restored pre-merge state");
@@ -1634,7 +2265,7 @@ async fn handle_merge_conflict_resolution(
             println!("→ Continuing merge...");
         }
 
-        let merge_oid = repo_client.continue_merge(options.message.as_deref()).await?;
+        let merge_oid = wt.continue_merge(options.message.as_deref()).await?;
 
         if !options.quiet {
             println!("✓ Merge completed successfully");
@@ -1648,7 +2279,7 @@ async fn handle_merge_conflict_resolution(
             println!("→ Quitting merge (keeping changes)...");
         }
 
-        repo_client.quit_merge().await?;
+        wt.quit_merge().await?;
 
         if !options.quiet {
             println!("✓ Merge state removed, changes retained");
@@ -1664,7 +2295,7 @@ async fn handle_merge_conflict_resolution(
 /// Removal is handled by the RegistryService which manages both
 /// registry entries and file cleanup.
 pub async fn handle_remove(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model: &str,
     force: bool,
     _registry_only: bool,
@@ -1701,7 +2332,7 @@ pub async fn handle_remove(
 
         // Show what will be removed
         println!("Worktree '{}:{}' removal plan:", model_ref.model, branch);
-        println!("  📁 Remove worktree at: {}", wt.path);
+        println!("  Remove worktree for branch: {}", wt.branch_name);
 
         // Confirmation prompt unless forced
         if !force {
@@ -1718,8 +2349,11 @@ pub async fn handle_remove(
             }
         }
 
-        // Remove the worktree via service
-        repo_client.remove_worktree(&wt.path, false).await
+        // Remove the worktree via service (pass branch name, not path)
+        repo_client.remove_worktree(&RemoveWorktreeRequest {
+            branch: wt.branch_name.clone(),
+            force: false,
+        }).await
             .map_err(|e| anyhow::anyhow!("Failed to remove worktree: {}", e))?;
 
         println!("✓ Worktree '{}:{}' removed successfully", model_ref.model, branch);

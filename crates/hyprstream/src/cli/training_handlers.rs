@@ -7,6 +7,10 @@
 //! - `training checkpoint` - Commit dirty adapter changes
 // CLI handlers intentionally print to stdout/stderr for user interaction
 #![allow(clippy::print_stdout, clippy::print_stderr)]
+// TODO(#395): migrate `model_ref.model` reads to `model_ref.name()` as part of the
+// name-layer retirement. Suppressed here so this prep PR stays focused on the CID
+// encoder + grammar; the deprecation is enforced at the ModelRef type definition.
+#![allow(deprecated)]
 
 use anyhow::{bail, Result};
 use tracing::{info, warn};
@@ -17,10 +21,15 @@ use crate::config::{
     TTTTrainingConfig,
 };
 use crate::runtime::model_config::ModelConfig;
-use crate::runtime::template_engine::ChatMessage;
-use crate::services::{InferenceZmqClient, PolicyClient, GenRegistryClient, WorktreeClient, INFERENCE_ENDPOINT};
+use crate::services::generated::inference_client::{ChatMessage, ChatTemplateRequest};
+use crate::services::generated::registry_client::{
+    BranchRequest, CreateWorktreeRequest, StageFilesRequest, CommitRequest, PushRequest,
+};
+use crate::services::{InferenceServiceConfig, RegistryClient, WorktreeClient, INFERENCE_ENDPOINT};
+use crate::services::generated::inference_client::InferenceClient;
 use crate::storage::ModelRef;
-use hyprstream_rpc::{RequestIdentity, SigningKey, VerifyingKey};
+use hyprstream_rpc::{SigningKey, VerifyingKey};
+use hyprstream_service::ServiceSpawner;
 use std::path::PathBuf;
 
 /// Handle `training init` command
@@ -28,7 +37,7 @@ use std::path::PathBuf;
 /// Initializes a LoRA adapter for training. Optionally creates a new branch/worktree.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_training_init(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model_ref_str: &str,
     branch_name: Option<String>,
     adapter_name: Option<String>,
@@ -54,7 +63,7 @@ pub async fn handle_training_init(
         // Create branch from model_ref's git_ref
         let from_ref = model_ref.git_ref.to_ref_string();
         repo_client
-            .create_branch(&new_branch, from_ref.as_deref().unwrap_or(""))
+            .create_branch(&BranchRequest { branch_name: new_branch.clone(), start_point: from_ref.as_deref().unwrap_or("").to_owned() })
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create branch: {}", e))?;
         println!(
@@ -63,15 +72,19 @@ pub async fn handle_training_init(
             model_ref.git_ref.display_name()
         );
 
-        // Create worktree for new branch (server determines path)
-        let worktree_path = repo_client.create_worktree("", &new_branch, false).await
+        // Create worktree for new branch
+        repo_client.create_worktree(&CreateWorktreeRequest { branch: new_branch.clone() }).await
             .map_err(|e| anyhow::anyhow!("Failed to create worktree: {}", e))?;
-        println!("✓ Created worktree at {}", worktree_path);
+        println!("✓ Created worktree for branch {new_branch}");
+
+        // Derive worktree path locally for adapter initialization
+        let storage_paths = crate::storage::StoragePaths::new()?;
+        let worktree_path = storage_paths.worktree_path(&model_ref.model, &new_branch)?;
 
         // Initialize adapter in worktree (use FsOps from repo_client)
         let fs = repo_client.worktree(&new_branch);
         init_adapter_at_path(
-            std::path::Path::new(&worktree_path),
+            &worktree_path,
             adapter_name.as_deref(),
             index,
             rank,
@@ -112,23 +125,23 @@ pub async fn handle_training_init(
         }
     };
 
+    // Verify worktree exists
     let worktrees = repo_client.list_worktrees().await
         .map_err(|e| anyhow::anyhow!("Failed to list worktrees: {}", e))?;
-    let model_path = std::path::PathBuf::from(
-        &worktrees.iter()
-            .find(|wt| wt.branch_name == branch_name)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Worktree '{}' does not exist for model '{}'. Create with:\n  \
-                     hyprstream training init {} --branch {}",
-                    branch_name,
-                    model_ref.model,
-                    model_ref.model,
-                    branch_name
-                )
-            })?
-            .path,
-    );
+    if !worktrees.iter().any(|wt| wt.branch_name == branch_name) {
+        anyhow::bail!(
+            "Worktree '{}' does not exist for model '{}'. Create with:\n  \
+             hyprstream training init {} --branch {}",
+            branch_name,
+            model_ref.model,
+            model_ref.model,
+            branch_name
+        );
+    }
+
+    // Derive worktree path locally
+    let storage_paths = crate::storage::StoragePaths::new()?;
+    let model_path = storage_paths.worktree_path(&model_ref.model, &branch_name)?;
 
     let fs = repo_client.worktree(&branch_name);
     init_adapter_at_path(
@@ -284,6 +297,8 @@ fn save_training_config(
             max_grad_norm: 1.0,
             min_input_length: 32,
             max_ttt_context: 512,
+            rank_oracle: None,
+            gradient_gating: None,
         },
     };
 
@@ -309,7 +324,7 @@ fn save_training_config(
 /// Runs inference with TTT enabled, making dirty writes to adapter weights.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_training_infer(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model_ref_str: &str,
     prompt: &str,
     image_path: Option<String>,
@@ -325,7 +340,6 @@ pub async fn handle_training_infer(
     verifying_key: VerifyingKey,
 ) -> Result<()> {
     use crate::runtime::RuntimeConfig;
-    use crate::services::InferenceService;
 
     info!(
         "Training inference: model={}, prompt_len={}",
@@ -343,12 +357,13 @@ pub async fn handle_training_infer(
         _ => repo_client.get_head().await.unwrap_or_else(|_| "main".to_owned()),
     };
     let worktrees = repo_client.list_worktrees().await?;
-    let model_path = std::path::PathBuf::from(
-        &worktrees.iter()
-            .find(|wt| wt.branch_name == branch_name)
-            .ok_or_else(|| anyhow::anyhow!("worktree for {}:{} not found", model_ref.model, branch_name))?
-            .path,
-    );
+    if !worktrees.iter().any(|wt| wt.branch_name == branch_name) {
+        bail!("worktree for {}:{} not found", model_ref.model, branch_name);
+    }
+
+    // Derive worktree path locally
+    let storage_paths = crate::storage::StoragePaths::new()?;
+    let model_path = storage_paths.worktree_path(&model_ref.model, &branch_name)?;
 
     if !model_path.exists() {
         bail!("Model '{}' not found. Use 'hyprstream list' to see available models", model_ref.model);
@@ -359,35 +374,51 @@ pub async fn handle_training_infer(
 
     info!("Using model at: {} (TTT enabled)", model_path.display());
 
-    // Create policy client
-    let policy_client = PolicyClient::new(signing_key.clone(), RequestIdentity::local());
-
     // Configure runtime
     let runtime_config = RuntimeConfig {
-        max_context,
+        max_context: max_context.map(|v| v as u32),
         kv_quant_type: kv_quant.into(),
         ..Default::default()
     };
 
     // Start InferenceService with TTT enabled
-    let mut service_handle = InferenceService::start_at(
+    let transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(INFERENCE_ENDPOINT);
+    let service_config = InferenceServiceConfig::new(
         &model_path,
         runtime_config,
         verifying_key,
         signing_key.clone(),
-        policy_client,
-        INFERENCE_ENDPOINT,
+        transport,
         None, // CLI: no FsOps
-    )
-    .await?;
+    );
+    let spawner = ServiceSpawner::threaded();
+    let mut service_handle = spawner.spawn(service_config).await
+        .map_err(|e| anyhow::anyhow!("Failed to spawn inference service: {}", e))?;
 
-    // Create client for service communication
-    let client = InferenceZmqClient::new(signing_key, RequestIdentity::local());
+    // Create client for service communication — resolve inference key via PolicyService
+    let policy_vk = signing_key.verifying_key();
+    let policy_client = crate::services::PolicyClient::for_service(
+        signing_key.clone(), policy_vk, None,
+    )?;
+    let key_resp = policy_client.resolve_service_key(
+        &crate::services::generated::policy_client::ResolveServiceKey {
+            service_name: "inference".to_owned(),
+        },
+    ).await.map_err(|e| anyhow::anyhow!("Failed to resolve inference key: {e}"))?;
+    let inference_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+        key_resp.verifying_key.as_slice().try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
+    ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?;
+    let client = InferenceClient::for_service(
+        signing_key.clone(),
+        inference_vk,
+        None,
+    )?;
 
     // Apply chat template
-    let messages = vec![ChatMessage { role: "user".into(), content: Some(prompt.into()), ..Default::default() }];
+    let messages = vec![ChatMessage { role: "user".into(), content: prompt.into(), tool_calls: vec![], tool_call_id: String::new() }];
 
-    let formatted_prompt = match client.apply_chat_template(&messages, true).await {
+    let formatted_prompt = match client.apply_chat_template(&ChatTemplateRequest { messages: messages.clone(), add_generation_prompt: true, tools_json: Some(String::new()), max_tokens: None, enable_thinking: None, template_vars_json: None }).await {
         Ok(formatted) => formatted,
         Err(e) => {
             warn!("Could not apply chat template: {}. Using raw prompt.", e);
@@ -396,35 +427,35 @@ pub async fn handle_training_infer(
     };
 
     // Build generation request
-    let sampling_params = crate::config::SamplingParams::from_model_path(&model_path)
+    let mut params = crate::config::SamplingParams::from_model_path(&model_path)
         .await
         .unwrap_or_default();
-    let mut request_builder = crate::runtime::GenerationRequest::builder(formatted_prompt)
-        .apply_config(&sampling_params);
 
     if let Some(t) = temperature {
-        request_builder = request_builder.temperature(t);
+        params.temperature = Some(t);
     }
     if let Some(p) = top_p {
-        request_builder = request_builder.top_p(p);
+        params.top_p = Some(p);
     }
     if let Some(k) = top_k {
-        request_builder = request_builder.top_k(Some(k));
+        params.top_k = Some(k);
     }
     if let Some(r) = repeat_penalty {
-        request_builder = request_builder.repeat_penalty(r);
+        params.repeat_penalty = Some(r);
     }
     if let Some(m) = max_tokens {
-        request_builder = request_builder.max_tokens(m);
+        params.max_tokens = Some(m);
     }
+
+    let mut request = params.into_generation_request(formatted_prompt);
 
     // Add image path if provided (for multimodal models)
     if let Some(img_path) = image_path {
         info!("Using image: {}", img_path);
-        request_builder = request_builder.image_path(std::path::PathBuf::from(img_path));
+        let img_bytes = std::fs::read(&img_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read image {}: {}", img_path, e))?;
+        request.images = Some(vec![img_bytes]);
     }
-
-    let request = request_builder.build();
 
     // Generate with TTT
     if sync {
@@ -435,10 +466,13 @@ pub async fn handle_training_infer(
         // Stream tokens live to stdout
         use hyprstream_rpc::streaming::StreamPayload;
         use std::io::Write;
-        let mut handle = client.generate_stream_handle(&request).await?;
+        let mut handle = {
+            use crate::services::generated::inference_client::InferenceRpc;
+            InferenceRpc::generate_stream(&client, &request).await?
+        };
         println!();
         loop {
-            match handle.recv_next()? {
+            match handle.recv_next().await? {
                 Some(StreamPayload::Data(data)) => {
                     if let Ok(text) = String::from_utf8(data) {
                         print!("{text}");
@@ -447,6 +481,7 @@ pub async fn handle_training_infer(
                 }
                 Some(StreamPayload::Complete(_)) | None => break,
                 Some(StreamPayload::Error(msg)) => bail!("Generation error: {msg}"),
+                Some(StreamPayload::Tagged { .. }) => continue,
             }
         }
         println!();
@@ -483,17 +518,18 @@ fn ensure_ttt_enabled(model_path: &std::path::Path) -> Result<()> {
 ///
 /// Replaces the removed `InferenceZmqClient::generate()` sync method.
 async fn collect_inference_stream(
-    client: &InferenceZmqClient,
+    client: &InferenceClient,
     request: &crate::runtime::GenerationRequest,
 ) -> Result<crate::config::GenerationResult> {
     use hyprstream_rpc::streaming::StreamPayload;
 
-    let mut handle = client.generate_stream_handle(request).await?;
+    use crate::services::generated::inference_client::InferenceRpc;
+    let mut handle = InferenceRpc::generate_stream(client, request).await?;
     let mut text = String::new();
 
     loop {
-        match handle.try_next() {
-            Ok(Some(payload)) => match payload {
+        match handle.recv_next().await? {
+            Some(payload) => match payload {
                 StreamPayload::Data(data) => {
                     text.push_str(&String::from_utf8_lossy(&data));
                 }
@@ -522,15 +558,13 @@ async fn collect_inference_stream(
                 StreamPayload::Error(msg) => {
                     bail!("Generation error: {msg}");
                 }
+                StreamPayload::Tagged { .. } => {
+                    // encrypted event payload, skip
+                    continue;
+                }
             },
-            Ok(None) if handle.is_completed() => {
+            None => {
                 bail!("Stream ended without completion");
-            }
-            Ok(None) => {
-                tokio::task::yield_now().await;
-            }
-            Err(e) => {
-                bail!("Stream error: {e}");
             }
         }
     }
@@ -542,7 +576,7 @@ async fn collect_inference_stream(
 /// Each file's content is sent as a generation request, triggering TTT adaptation.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_training_batch(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model_ref_str: &str,
     input_files: Vec<String>,
     input_dir: Option<PathBuf>,
@@ -561,7 +595,6 @@ pub async fn handle_training_batch(
     verifying_key: VerifyingKey,
 ) -> Result<()> {
     use crate::runtime::RuntimeConfig;
-    use crate::services::{InferenceService, INFERENCE_ENDPOINT};
     use crate::storage::AdapterManager;
     use glob::glob;
 
@@ -579,21 +612,20 @@ pub async fn handle_training_batch(
         _ => repo_client.get_head().await.unwrap_or_else(|_| "main".to_owned()),
     };
     let worktrees = repo_client.list_worktrees().await?;
-    let model_path = std::path::PathBuf::from(
-        &worktrees.iter()
-            .find(|wt| wt.branch_name == branch_name_resolved)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Worktree '{}' not found for model {}.\n\
-                     Run: hyprstream training init {} --branch {}",
-                    branch_name_resolved,
-                    model_ref.model,
-                    model_ref.model,
-                    branch_name_resolved,
-                )
-            })?
-            .path,
-    );
+    if !worktrees.iter().any(|wt| wt.branch_name == branch_name_resolved) {
+        bail!(
+            "Worktree '{}' not found for model {}.\n\
+             Run: hyprstream training init {} --branch {}",
+            branch_name_resolved,
+            model_ref.model,
+            model_ref.model,
+            branch_name_resolved,
+        );
+    }
+
+    // Derive worktree path locally
+    let storage_paths = crate::storage::StoragePaths::new()?;
+    let model_path = storage_paths.worktree_path(&model_ref.model, &branch_name_resolved)?;
 
     // Collect input files
     let mut files: Vec<PathBuf> = Vec::new();
@@ -652,25 +684,44 @@ pub async fn handle_training_batch(
     // Start InferenceService with TTT enabled
     println!("Starting InferenceService for {model_ref_str}...");
     let runtime_config = RuntimeConfig {
-        max_context,
+        max_context: max_context.map(|v| v as u32),
         kv_quant_type: kv_quant.into(),
         ..Default::default()
     };
 
-    let policy_client = PolicyClient::new(signing_key.clone(), RequestIdentity::local());
     // Start InferenceService with TTT enabled
-    let mut service_handle = InferenceService::start_at(
+    let transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(INFERENCE_ENDPOINT);
+    let service_config = InferenceServiceConfig::new(
         &model_path,
         runtime_config,
         verifying_key,
         signing_key.clone(),
-        policy_client,
-        INFERENCE_ENDPOINT,
+        transport,
         None, // CLI: no FsOps
-    )
-    .await?;
+    );
+    let spawner = ServiceSpawner::threaded();
+    let mut service_handle = spawner.spawn(service_config).await
+        .map_err(|e| anyhow::anyhow!("Failed to spawn inference service: {}", e))?;
 
-    let client = InferenceZmqClient::new(signing_key, RequestIdentity::local());
+    // Resolve inference key via PolicyService
+    let policy_vk = signing_key.verifying_key();
+    let policy_client = crate::services::PolicyClient::for_service(
+        signing_key.clone(), policy_vk, None,
+    )?;
+    let key_resp = policy_client.resolve_service_key(
+        &crate::services::generated::policy_client::ResolveServiceKey {
+            service_name: "inference".to_owned(),
+        },
+    ).await.map_err(|e| anyhow::anyhow!("Failed to resolve inference key: {e}"))?;
+    let inference_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
+        key_resp.verifying_key.as_slice().try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
+    ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?;
+    let client = InferenceClient::for_service(
+        signing_key.clone(),
+        inference_vk,
+        None,
+    )?;
 
     // Get adapter info for checkpoint saves
     let adapter_manager = AdapterManager::new(&model_path);
@@ -710,10 +761,12 @@ pub async fn handle_training_batch(
             _ => chunk.clone(), // "text" format - use as-is
         };
 
-        let request = crate::runtime::GenerationRequest::builder(prompt)
-            .max_tokens(max_tokens)
-            .temperature(0.7)
-            .build();
+        let request = crate::runtime::GenerationRequest {
+            prompt,
+            max_tokens: Some(max_tokens as u32),
+            temperature: Some(0.7),
+            ..Default::default()
+        };
 
         // Send generation request via collect-stream — InferenceService applies TTT during this call
         match collect_inference_stream(&client, &request).await {
@@ -772,7 +825,7 @@ pub async fn handle_training_batch(
 ///
 /// Commits dirty adapter changes to git.
 pub async fn handle_training_checkpoint(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model_ref_str: &str,
     message: Option<String>,
     push: bool,
@@ -832,7 +885,9 @@ pub async fn handle_training_checkpoint(
         }
     }
 
-    repo_client.stage_files(&files_to_stage).await
+    // Use worktree-scoped client for staging and commit
+    let wt = repo_client.worktree(&branch_for_fs);
+    wt.stage_files(&StageFilesRequest { files: files_to_stage.clone() }).await
         .map_err(|e| anyhow::anyhow!("Failed to stage files: {}", e))?;
 
     // Create commit using service layer
@@ -844,7 +899,7 @@ pub async fn handle_training_checkpoint(
         )
     });
 
-    let commit_id = repo_client.commit(&commit_message, "", "").await
+    let commit_id = wt.commit(&CommitRequest { message: commit_message, author: String::new(), email: String::new() }).await
         .map_err(|e| anyhow::anyhow!("Failed to create commit: {}", e))?;
 
     println!("\n✓ Created commit: {}", &commit_id[..8.min(commit_id.len())]);
@@ -858,7 +913,7 @@ pub async fn handle_training_checkpoint(
             model_ref.git_ref,
             model_ref.git_ref
         );
-        repo_client.push(remote, &refspec, false).await
+        repo_client.push(&PushRequest { remote: remote.to_owned(), refspec, force: false }).await
             .map_err(|e| anyhow::anyhow!("Failed to push: {}", e))?;
         println!("✓ Pushed to {remote}");
     }

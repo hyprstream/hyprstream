@@ -9,6 +9,10 @@ pub enum EnvelopeError {
     #[error("signature verification failed: {0}")]
     InvalidSignature(#[from] ed25519_dalek::SignatureError),
 
+    /// Post-quantum signature verification failed.
+    #[error("PQ signature verification failed: {0}")]
+    PqSignatureInvalid(String),
+
     /// Signer public key doesn't match expected key.
     #[error("signer pubkey mismatch: expected {expected}, got {actual}")]
     SignerMismatch { expected: String, actual: String },
@@ -44,6 +48,18 @@ pub enum EnvelopeError {
     /// Invalid topic format (not valid hex).
     #[error("invalid topic format: expected valid hex string")]
     InvalidTopicFormat,
+
+    /// AES-GCM encryption failed.
+    #[error("encryption failed: {0}")]
+    Encryption(String),
+
+    /// AES-GCM decryption failed (wrong key, tampered ciphertext, or AAD mismatch).
+    #[error("decryption failed: {0}")]
+    Decryption(String),
+
+    /// MAC verification failed.
+    #[error("MAC verification failed")]
+    MacVerification,
 }
 
 /// Result type alias for envelope operations.
@@ -67,10 +83,6 @@ pub enum RpcError {
     /// Invalid operation for this backend/mode.
     #[error("invalid operation: {0}")]
     InvalidOperation(String),
-
-    /// ZMQ error.
-    #[error("zmq error: {0}")]
-    Zmq(#[from] zmq::Error),
 
     /// IO error.
     #[error("io error: {0}")]

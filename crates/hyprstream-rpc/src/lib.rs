@@ -2,15 +2,15 @@
 //!
 //! This crate provides:
 //! - `ToCapnp` / `FromCapnp` traits and derive macros for Cap'n Proto serialization
-//! - ZMQ transport implementation
+//! - ZMTP framing over UDS/QUIC/iroh transports
 //! - Service dispatch helpers
 //! - Ed25519 signed envelopes for request authentication
 //! - DH key exchange + HMAC for streaming response authentication
 //!
 //! # Security Model
 //!
-//! All ZMQ messages are wrapped in signed envelopes:
-//! - **Transport layer**: CURVE encryption (TCP only)
+//! All RPC messages are wrapped in signed envelopes:
+//! - **Transport layer**: TLS 1.3 (QUIC) or UDS peer credentials (IPC)
 //! - **Application layer**: Ed25519 signatures (survives message forwarding)
 //!
 //! Streaming responses use HMAC-SHA256 derived from DH shared secrets.
@@ -37,9 +37,11 @@
 //! }
 //! ```
 
+// ============================================================================
+// Modules available on ALL targets (including wasm32)
+// ============================================================================
+
 // Cap'n Proto generated modules
-// Note: Generated code uses unwrap/expect internally - this is standard capnp-rust behavior
-// These modules are excluded from clippy checks via cargo configuration
 pub mod common_capnp {
     #![allow(dead_code, unused_imports)]
     #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
@@ -54,6 +56,14 @@ pub mod events_capnp {
     #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
     #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
     include!(concat!(env!("OUT_DIR"), "/events_capnp.rs"));
+}
+
+pub mod nine_capnp {
+    #![allow(dead_code, unused_imports)]
+    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
+    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    include!(concat!(env!("OUT_DIR"), "/nine_capnp.rs"));
 }
 
 pub mod streaming_capnp {
@@ -72,51 +82,203 @@ pub mod annotations_capnp {
     include!(concat!(env!("OUT_DIR"), "/annotations_capnp.rs"));
 }
 
-pub mod auth;
+pub mod optional_capnp {
+    #![allow(dead_code, unused_imports)]
+    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
+    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    include!(concat!(env!("OUT_DIR"), "/optional_capnp.rs"));
+}
+
+pub mod common_types {
+    #![allow(dead_code, unused_imports, unused_variables)]
+    #![allow(clippy::all)]
+    extern crate self as hyprstream_rpc;
+    hyprstream_rpc_derive::generate_rpc_service!("common");
+}
+
+/// Code-generated streaming data types (#273): `StreamInfo`, `StreamOpt`, and the
+/// five QoS axis unions (`Ordering`/`Delivery`/`Completion`/`Retention`/
+/// `OverflowPolicy`). Re-exported through `stream_info` (the canonical hub) so
+/// service codegen and call sites keep resolving `hyprstream_rpc::stream_info::*`.
+///
+/// NOTE: this module also generates the wire types (`StreamBlock`, `StreamPayload`,
+/// `StreamControl`, etc.). Those are NOT re-exported — `streaming.rs` remains the
+/// authoritative hand-written implementation for the wire path; the generated
+/// duplicates live here unused (`#![allow(dead_code)]`).
+pub mod streaming_types {
+    #![allow(dead_code, unused_imports, unused_variables)]
+    #![allow(clippy::all)]
+    extern crate self as hyprstream_rpc;
+    hyprstream_rpc_derive::generate_rpc_service!("streaming");
+}
+
 pub mod capnp;
+pub mod cid;
 pub mod crypto;
 pub mod envelope;
 pub mod error;
-pub mod registry;
-pub mod service;
-pub mod streaming;
-pub mod transport;
+pub mod platform;
+pub mod rpc_client;
+pub mod stream_info;
+pub mod zmtp_framing;
 
-/// Prelude for convenient imports.
-///
-/// Re-exports the most commonly used types for `use hyprstream_rpc::prelude::*;`
+// ============================================================================
+// Cross-platform modules (available on all targets including wasm32)
+// ============================================================================
+
+/// Schema introspection metadata types — used by proc macro codegen on all targets.
+pub mod metadata {
+    pub use crate::_metadata::*;
+}
+mod _metadata;
+
+// ============================================================================
+// Transport traits (available on ALL targets)
+pub mod transport_traits;
+pub mod stream_consumer;
+
+// Native-only modules (not compiled for wasm32)
+// ============================================================================
+
+pub mod auth;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod registry;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod resolver;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod service;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod streaming;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod stream_provenance;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod moq_stream;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod moq_authz;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod moq_event;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod transport;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod dial;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod service_entry;
+// Shared `did:key` (Ed25519) codec — compiled on all targets so the native
+// `did_web` resolver and the wasm32 `iroh_peer` identity helpers share one
+// implementation (#475). `did_web` re-exports its public fns for compatibility.
+pub mod did_key;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod did_web;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod admission;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod notify;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod paths;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod socket;
+
+// ============================================================================
+// WASM-bindgen API (wasm32 target only)
+// ============================================================================
+
+#[cfg(target_arch = "wasm32")]
+pub mod wasm_api;
+#[cfg(target_arch = "wasm32")]
+pub mod web_transport;
+// #409 Path A: browser counterpart to native `dial`. Compiles only on wasm32;
+// see `dial_wasm.rs` for why this is a separate module rather than an arm in
+// native `dial()` (which is itself `#[cfg(not(target_arch = "wasm32"))]`).
+#[cfg(target_arch = "wasm32")]
+pub mod dial_wasm;
+// Phase 2: iroh peer identity + pkarr helpers for wasm32. Adds iroh as a
+// first-class wasm32 dep — browser gets own NodeId, did:key conversion,
+// and native pkarr lookup. Full dial_iroh_reach() is Phase 3.
+#[cfg(target_arch = "wasm32")]
+pub mod iroh_peer;
+
+// ============================================================================
+// Re-exports available on ALL targets
+// ============================================================================
+
+pub use capnp::{serialize_message, FromCapnp, ToCapnp};
+pub use rpc_client::{CallOptions, RequestBuilder, RpcClient, RpcClientImpl};
+pub use transport_traits::{PublishSink, Signer, Transport};
+pub mod identity;
+pub mod node_identity;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod federated_identity;
+pub mod signer;
+pub use stream_info::StreamInfo;
+pub use crypto::{
+    generate_signing_keypair, signing_key_from_bytes, verifying_key_from_bytes,
+    DefaultKeyExchange, KeyExchange, SharedSecret, SigningKey, StreamHmacState, VerifyingKey,
+};
+
+#[cfg(not(feature = "fips"))]
+pub use crypto::{generate_ephemeral_keypair, ristretto_dh, RistrettoPublic, RistrettoSecret};
+
+pub use envelope::{
+    unwrap_and_verify,
+    Authorization, EnvelopeVerification, FederatedToken, InMemoryNonceCache, KeyedPqTrustStore,
+    NonceCache, PqTrustStore, RequestEnvelope, ResponseEnvelope, SignedEnvelope, Subject,
+    TokenClaims, UnwrapOptions, MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use envelope::unwrap_envelope;
+pub use error::{EnvelopeError, EnvelopeResult, Result, RpcError};
+
+// ============================================================================
+// Native-only re-exports
+// ============================================================================
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use hyprstream_rpc_derive::{authorize, service_factory, FromCapnp, ToCapnp};
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use resolver::Resolver;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use registry::SocketKind;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use service::{Continuation, EnvelopeContext, Spawnable, ServiceHandle, RequestService};
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use streaming::{
+    ChannelProgressReporter, derive_client_stream_keys,
+    progress_channel, ProgressUpdate, ResponseStream, StreamChannel, StreamContext,
+    StreamPayload, StreamPayloadData, StreamVerifier,
+};
+
+// ============================================================================
+// Prelude (native only — too many native-only types)
+// ============================================================================
+
+#[cfg(not(target_arch = "wasm32"))]
 pub mod prelude {
-    // Re-export from crate root (DRY - single source of truth)
     pub use crate::{
         // Serialization
         serialize_message, FromCapnp, ToCapnp,
         // Crypto
         generate_signing_keypair, signing_key_from_bytes, verifying_key_from_bytes,
-        ChainedStreamHmac, DefaultKeyExchange, HmacKey, KeyExchange, SharedSecret,
-        SigningKey, VerifyingKey,
+        DefaultKeyExchange, KeyExchange, SharedSecret, SigningKey, StreamHmacState, VerifyingKey,
         // Envelope
-        unwrap_envelope, InMemoryNonceCache, NonceCache, RequestEnvelope, RequestIdentity,
-        ResponseEnvelope, SignedEnvelope, Subject, MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
+        unwrap_envelope, unwrap_and_verify, Authorization, EnvelopeVerification,
+        InMemoryNonceCache, NonceCache, RequestEnvelope, ResponseEnvelope,
+        SignedEnvelope, Subject, UnwrapOptions,
+        MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
         // Error
         EnvelopeError, EnvelopeResult, Result, RpcError,
-        // Service
-        EnvelopeContext, RequestLoop, ServiceClient, ServiceHandle, ZmqClient, ZmqService,
+        // Service (transport)
+        EnvelopeContext, ServiceHandle, RequestService,
         // Streaming
-        StreamContext, StreamPublisher,
-        // Spawner
-        ProcessBackend, ProcessConfig, ProcessKind, ProcessSpawner,
-        ProxyService, ServiceKind, ServiceMode, ServiceSpawner,
-        Spawnable, SpawnedProcess, SpawnedService, SpawnerBackend, StandaloneBackend,
-        SystemdBackend,
-        // Service manager
-        detect_service_manager, ServiceManager, StandaloneManager,
+        StreamContext,
     };
 
     #[cfg(not(feature = "fips"))]
     pub use crate::{generate_ephemeral_keypair, ristretto_dh, RistrettoPublic, RistrettoSecret};
-
-    #[cfg(feature = "systemd")]
-    pub use crate::SystemdManager;
 
     // Registry (with renamed imports for convenience)
     pub use crate::registry::{
@@ -125,55 +287,19 @@ pub mod prelude {
     };
 
     // Transport
-    pub use crate::transport::{AsyncTransport, Transport, TransportConfig};
+    pub use crate::transport::TransportConfig;
 }
 
-// Utility modules (merged from hyprstream-utils)
-pub mod notify;
-pub mod paths;
-pub mod socket;
+// ============================================================================
+// Systemd helpers (native only)
+// ============================================================================
 
-// Re-export key types at crate root
-pub use capnp::{serialize_message, FromCapnp, ToCapnp};
-pub use crypto::{
-    generate_signing_keypair, signing_key_from_bytes, verifying_key_from_bytes, ChainedStreamHmac,
-    DefaultKeyExchange, HmacKey, KeyExchange, SharedSecret, SigningKey, VerifyingKey,
-};
-
-#[cfg(not(feature = "fips"))]
-pub use crypto::{generate_ephemeral_keypair, ristretto_dh, RistrettoPublic, RistrettoSecret};
-pub use envelope::{
-    unwrap_envelope, InMemoryNonceCache, NonceCache, RequestEnvelope, RequestIdentity,
-    ResponseEnvelope, SignedEnvelope, Subject, MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
-};
-pub use error::{EnvelopeError, EnvelopeResult, Result, RpcError};
-pub use hyprstream_rpc_derive::{authorize, service_factory, FromCapnp, ToCapnp};
-pub use service::{Continuation, EnvelopeContext, RequestLoop, ServiceClient, ServiceHandle, ZmqClient, ZmqService};
-pub use streaming::{
-    ChannelProgressReporter, forward_progress_to_stream, progress_channel,
-    ProgressUpdate, ResponseStream, StreamChannel, StreamContext, StreamHandle,
-    StreamPayload, StreamPublisher, StreamVerifier,
-};
-pub use service::spawner::{
-    ProcessBackend, ProcessConfig, ProcessKind, ProcessSpawner,
-    ProxyService, ServiceKind, ServiceMode, ServiceSpawner,
-    Spawnable, SpawnedProcess, SpawnedService, SpawnerBackend, StandaloneBackend,
-    SystemdBackend,
-};
-
-// Service manager re-exports
-pub use service::{detect_service_manager, ServiceManager, StandaloneManager};
-pub use service::metadata::{MethodMeta, ParamMeta};
-#[cfg(feature = "systemd")]
-pub use service::SystemdManager;
-
-/// Check if system booted with systemd
-#[cfg(feature = "systemd")]
+#[cfg(all(not(target_arch = "wasm32"), feature = "systemd"))]
 pub fn has_systemd() -> bool {
     systemd::daemon::booted().unwrap_or(false)
 }
 
-#[cfg(not(feature = "systemd"))]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "systemd")))]
 pub fn has_systemd() -> bool {
     false
 }

@@ -1,11 +1,11 @@
 [package]
 name = "hyprstream"
-version = "0.2.0"
+version = "0.5.0"
 edition.workspace = true
 description = "Agentic Infrastructure"
 documentation = "https://docs.rs/hyprstream"
 readme = "README.md"
-license.workspace = true
+license = "MIT OR AGPL-3.0-only"
 exclude = [
     "**/*.pyc",
     "**/__pycache__/",
@@ -21,6 +21,7 @@ doctest = true
 name = "hyprstream"
 path = "src/bin/main.rs"
 
+
 [dependencies]
 # Arrow and DataFusion dependencies removed - focused on ML inference only
 bytes.workspace = true
@@ -31,6 +32,7 @@ async-trait.workspace = true
 tokio-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+subsecond.workspace = true
 json-threat-protection.workspace = true
 nix.workspace = true
 users.workspace = true
@@ -45,14 +47,25 @@ toml.workspace = true
 serde_yaml.workspace = true
 git2.workspace = true  # Still needed by git2db internally
 git2db = { path = "../git2db", features = ["overlayfs"] }  # High-level git library with overlayfs
+cas-serve = { path = "../cas-serve" }  # Content-addressed store reconstruction (getBlob #432)
 hyprstream-rpc = { path = "../hyprstream-rpc" }  # RPC infrastructure (Cap'n Proto + ZMQ)
+moq-net.workspace = true  # moq-lite streaming for cross-process subscriber (M2b)
+ml-dsa = { workspace = true }  # ML-DSA-65 — always compiled (runtime CryptoPolicy selects PQ). See M3 #152.
+hyprstream-rpc-std = { path = "../hyprstream-rpc-std" }  # Standard service schemas + clients
+hyprstream-discovery = { path = "../hyprstream-discovery" }  # Service discovery
+hyprstream-pds = { path = "../hyprstream-pds" }  # atproto PDS record store: DAG-CBOR + MST + signed commit + CAR proof (#392/#431)
+hyprstream-service = { path = "../hyprstream-service" }  # Service orchestration
 hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }  # RPC code generation proc macros
 hyprstream-flight = { path = "../hyprstream-flight" }  # Flight SQL server and client
 hyprstream-metrics = { path = "../hyprstream-metrics" }  # Metrics storage (for RegistryClient trait)
 hyprstream-workers = { path = "../hyprstream-workers" }  # Worker runtime (Kata containers)
+hyprstream-vfs = { path = "../hyprstream-vfs" }  # VFS namespace (Mount trait)
+hyprstream-9p = { path = "../hyprstream-9p" }  # 9P codec + Kata translator (Backend, Translator)
+hyprstream-tcl = { path = "../hyprstream-tcl" }  # Tcl shell (TclMount, TclCommand)
 inventory.workspace = true  # Service factory registration
 gittorrent = { workspace = true, optional = true }  # P2P transport
 clap.workspace = true
+inquire = "0.7"
 tracing.workspace = true
 tracing-opentelemetry = { workspace = true, optional = true }
 opentelemetry = { workspace = true, optional = true }
@@ -67,10 +80,11 @@ dirs = "5"  # User directory paths for CLI
 
 rmcp = { version = "0.14", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
 http = "1"  # HTTP types (request::Parts) for MCP identity extraction
-schemars = "1.2"
 
 tracing-log.workspace = true
 tracing-appender.workspace = true
+tui-logger = { version = "0.18", default-features = false }
+log = "0.4"
 bincode.workspace = true
 tokio-stream.workspace = true
 hex.workspace = true
@@ -81,6 +95,12 @@ sha2.workspace = true  # SHA256 validation for LFS files
 hmac.workspace = true  # HMAC for authenticated stream chunks
 daemonize.workspace = true
 prost.workspace = true
+rcgen.workspace = true  # Self-signed TLS cert generation for QUIC
+rustls.workspace = true  # TLS runtime (ring crypto provider for axum-server)
+rustls-pemfile.workspace = true  # PEM file parsing for TLS certs
+rustls-acme.workspace = true  # ACME (Let's Encrypt / step-ca) automatic cert provisioning
+zeroize.workspace = true  # Zeroing private key material on drop
+time = "0.3"  # Datetime types for certificate validity
 
 # HTTP socket activation (systemd)
 listenfd = { version = "1.0", optional = true }
@@ -90,7 +110,7 @@ thiserror.workspace = true
 rayon.workspace = true  # Parallel processing for tensor operations
 memmap2.workspace = true
 rand.workspace = true
-tch = { git = "https://github.com/hyprstream/tch-rs", branch = "hip" }
+tch = { git = "https://github.com/hyprstream/tch-rs", branch = "hyprstream" }
 bitsandbytes-sys = { path = "../bitsandbytes-sys", optional = true }  # KV cache quantization
 
 # Candle ML Framework - REMOVED: Fully migrated to Tch (PyTorch Rust bindings)
@@ -113,17 +133,23 @@ minijinja.workspace = true
 
 uuid.workspace = true
 automerge = "0.5"  # CRDT collaborative editing
-tmq.workspace = true  # Tokio ZeroMQ bindings for event bus
-zmq.workspace = true  # Underlying libzmq bindings
 capnp.workspace = true  # Cap'n Proto runtime
 capnp-futures.workspace = true  # Cap'n Proto async support
 glob.workspace = true
 walkdir.workspace = true
 reqwest.workspace = true
+jsonwebtoken = { workspace = true }
 notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
 libc = "0.2"  # For system calls in overlay2 driver
 reflink-copy = "0.1"  # COW file copying (reflink when available)
 hyprstream-containedfs.workspace = true  # Path-contained filesystem operations
+rocksdb = "0.23"  # User credential store (RocksDbUserStore)
+fred = { version = "9", optional = true }  # Async Redis/Valkey client (ValkeyUserStore, ValkeyTokenStore)
+hyprstream-tui = { path = "../hyprstream-tui" }  # Setup wizard TUI (WizardBackend trait + WizardApp)
+hyprstream-compositor = { path = "../hyprstream-compositor" }  # Pure TUI compositor (chrome state machine)
+waxterm = { path = "../waxterm", features = ["avt"] }  # Terminal abstraction for TUI rendering
+ratatui = { version = "0.30", default-features = false }  # TUI framework for pane buffers
+vte = "0.13"  # VT100/ANSI escape sequence parser for TUI pane ingestion
 
 [target.'cfg(target_os = "linux")'.dependencies]
 lru.workspace = true  # LRU cache for model caching and Git repository handles
@@ -138,29 +164,47 @@ blake3.workspace = true                  # Fast cryptographic hashing for checks
 tempfile.workspace = true                # Temporary files for model conversion
 base64.workspace = true                  # JWT token encoding
 ed25519-dalek.workspace = true           # JWT Ed25519 signatures
+p256.workspace = true                    # ES256 DPoP verification (atproto interop)
+keyring = { version = "3", features = ["linux-native"] }  # OS keyring — Linux keyutils
 curve25519-dalek.workspace = true        # Ristretto255 DH for stream authentication
 hkdf.workspace = true                    # HKDF key derivation
+bs58 = "0.5"                             # Base58 encoding for device fingerprints
 subtle.workspace = true                  # Constant-time operations
+ring = "0.17"                            # TLS endorsement signing (key-type-agnostic)
 
 # HTTP API dependencies
 axum.workspace = true
+axum-server.workspace = true
 tower-http.workspace = true
 url.workspace = true
 urlencoding.workspace = true
-half.workspace = true
 shellexpand.workspace = true
+
+# macOS/iOS: Keychain via apple-native
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+# Windows: Credential Manager via windows-native
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+# FreeBSD/OpenBSD: DBus Secret Service (requires libdbus-1-dev + a running daemon)
+[target.'cfg(any(target_os = "freebsd", target_os = "openbsd"))'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
 [features]
 default = ["gittorrent", "xet", "systemd", "otel"]
 cuda = []
+valkey = ["dep:fred"]  # Enable Valkey/Redis-backed user and token stores
 bnb = ["dep:bitsandbytes-sys"]  # Enable bitsandbytes KV cache quantization (requires compatible ROCm/CUDA)
 xet = ["git2db/xet-storage"]  # Enable XET large file storage
 otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:opentelemetry-semantic-conventions", "dep:opentelemetry-stdout"]
 gittorrent = ["dep:gittorrent", "git2db/gittorrent-transport"]  # Enable P2P model sharing via gittorrent transport
 download-libtorch = ["tch/download-libtorch"]
 overlayfs = ["git2db/overlayfs"]  # Enable overlayfs-backed worktrees (delegated to git2db)
-systemd = ["hyprstream-rpc/systemd", "hyprstream-workers/systemd", "dep:listenfd"]  # Systemd integration (socket activation, service units)
-experimental = []  # EXPERIMENTAL: Enable git write operations (commit/push/merge - need service layer implementation)
+systemd = ["hyprstream-rpc/systemd", "hyprstream-service/systemd", "hyprstream-workers/systemd", "dep:listenfd"]  # Systemd integration (socket activation, service units)
+experimental = ["hyprstream-compositor/experimental"]  # EXPERIMENTAL: Enable service/worker panels, git write operations
+pq-hybrid = []  # NO-OP alias: PQ primitives always compiled; Classical/Hybrid selected at runtime. See M3 #152.
 
 [build-dependencies]
 capnpc.workspace = true  # Cap'n Proto schema compiler
@@ -172,6 +216,9 @@ hyprstream-rpc-build.workspace = true  # Shared annotation extraction
 criterion.workspace = true
 tempfile.workspace = true
 tokio-stream.workspace = true
+# Test-only: iroh substrate types used by `tests/policy_over_iroh.rs`.
+iroh.workspace = true
+rand.workspace = true
 
 [lints]
 workspace = true

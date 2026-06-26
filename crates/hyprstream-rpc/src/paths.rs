@@ -7,6 +7,18 @@
 
 use std::path::PathBuf;
 
+/// Apply HYPRSTREAM_INSTANCE namespacing to a base path.
+///
+/// When `HYPRSTREAM_INSTANCE` is set and non-empty, appends `instances/{value}`
+/// to the base path.  This allows multiple hyprstream instances to coexist on
+/// the same host without IPC socket or data directory collisions.
+fn apply_instance_namespace(base: PathBuf) -> PathBuf {
+    match std::env::var("HYPRSTREAM_INSTANCE") {
+        Ok(inst) if !inst.is_empty() => base.join("instances").join(inst),
+        _ => base,
+    }
+}
+
 /// Get the appropriate runtime directory based on execution context
 ///
 /// Path selection follows FHS 3.0 and XDG Base Directory specifications:
@@ -14,13 +26,14 @@ use std::path::PathBuf;
 /// - User service: `$XDG_RUNTIME_DIR/hyprstream/`
 /// - Fallback (no systemd): `/tmp/hyprstream-<uid>/`
 pub fn runtime_dir() -> PathBuf {
-    if nix::unistd::geteuid().is_root() {
+    let base = if nix::unistd::geteuid().is_root() {
         PathBuf::from("/run/hyprstream")
     } else if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
         PathBuf::from(xdg).join("hyprstream")
     } else {
         PathBuf::from(format!("/tmp/hyprstream-{}", nix::unistd::getuid()))
-    }
+    };
+    apply_instance_namespace(base)
 }
 
 /// Socket directory for EventService
@@ -168,8 +181,11 @@ pub fn bin_dir() -> Option<PathBuf> {
 }
 
 /// Hyprstream data directory (`~/.local/share/hyprstream`)
+///
+/// When `HYPRSTREAM_INSTANCE` is set, returns
+/// `~/.local/share/hyprstream/instances/{instance}`.
 pub fn data_dir() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|d| d.join("hyprstream"))
+    dirs::data_local_dir().map(|d| apply_instance_namespace(d.join("hyprstream")))
 }
 
 /// Versions directory (`~/.local/share/hyprstream/versions`)
@@ -240,5 +256,32 @@ mod tests {
     fn test_sandboxes_dir() {
         let dir = sandboxes_dir();
         assert!(dir.to_string_lossy().contains("sandboxes"));
+    }
+
+    #[test]
+    fn test_instance_namespace_default() {
+        // When HYPRSTREAM_INSTANCE is unset, paths should not contain "instances"
+        std::env::remove_var("HYPRSTREAM_INSTANCE");
+        let base = PathBuf::from("/tmp/test-hyprstream");
+        let result = apply_instance_namespace(base.clone());
+        assert_eq!(result, base);
+    }
+
+    #[test]
+    fn test_instance_namespace_set() {
+        std::env::set_var("HYPRSTREAM_INSTANCE", "foo");
+        let base = PathBuf::from("/tmp/test-hyprstream");
+        let result = apply_instance_namespace(base);
+        assert_eq!(result, PathBuf::from("/tmp/test-hyprstream/instances/foo"));
+        std::env::remove_var("HYPRSTREAM_INSTANCE");
+    }
+
+    #[test]
+    fn test_instance_namespace_empty_string() {
+        std::env::set_var("HYPRSTREAM_INSTANCE", "");
+        let base = PathBuf::from("/tmp/test-hyprstream");
+        let result = apply_instance_namespace(base.clone());
+        assert_eq!(result, base, "empty HYPRSTREAM_INSTANCE should be treated as unset");
+        std::env::remove_var("HYPRSTREAM_INSTANCE");
     }
 }

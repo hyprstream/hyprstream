@@ -93,7 +93,9 @@ pub fn estimate_tensor_size_mb(shape: &[i64], dtype: tch::Kind) -> f64 {
     let bytes_per_element = match dtype {
         tch::Kind::Double | tch::Kind::Int64 => 8,
         tch::Kind::Half | tch::Kind::BFloat16 | tch::Kind::Int16 => 2,
-        tch::Kind::Int8 | tch::Kind::Uint8 => 1,
+        tch::Kind::Int8 | tch::Kind::Uint8
+            | tch::Kind::Float8e4m3fn | tch::Kind::Float8e5m2
+            | tch::Kind::Float8e4m3fnuz | tch::Kind::Float8e5m2fnuz => 1,
         // Float, Int, and all other types default to 4 bytes
         _ => 4,
     };

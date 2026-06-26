@@ -3,14 +3,15 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use crate::cli::git_handlers::apply_policy_template_to_model;
-use crate::services::GenRegistryClient;
+use crate::services::RegistryClient;
+use crate::services::generated::registry_client::{CreateWorktreeRequest, RemoveWorktreeRequest};
 use anyhow::Result;
 use std::io::{self, Write};
 use tracing::info;
 
 /// Handle worktree add command - create worktree from existing branch
 pub async fn handle_worktree_add(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model: &str,
     branch: &str,
     policy_template: Option<String>,
@@ -25,12 +26,11 @@ pub async fn handle_worktree_add(
     let worktrees = repo_client.list_worktrees().await
         .map_err(|e| anyhow::anyhow!("Failed to list worktrees: {}", e))?;
 
-    if let Some(existing) = worktrees.iter().find(|wt| wt.branch_name == branch) {
+    if worktrees.iter().any(|wt| wt.branch_name == branch) {
         anyhow::bail!(
-            "Worktree {} already exists for model {} at:\n  {}",
+            "Worktree already exists for branch '{}' in model {}",
             branch,
             model,
-            existing.path
         );
     }
 
@@ -52,12 +52,12 @@ pub async fn handle_worktree_add(
         );
     }
 
-    // Create worktree via service - service determines the path
-    let worktree_path = repo_client.create_worktree("", branch, false).await
+    // Create worktree via service
+    repo_client.create_worktree(&CreateWorktreeRequest { branch: branch.to_owned() }).await
         .map_err(|e| anyhow::anyhow!("Failed to create worktree: {}", e))?;
 
     println!("Created worktree {model}/{branch}:");
-    println!("  Path: {}", worktree_path);
+    println!("  Branch: {branch}");
 
     // Apply policy template if specified
     if let Some(ref template_name) = policy_template {
@@ -69,7 +69,7 @@ pub async fn handle_worktree_add(
 
 /// Handle worktree list command
 pub async fn handle_worktree_list(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model: &str,
     show_all: bool,
 ) -> Result<()> {
@@ -124,7 +124,6 @@ pub async fn handle_worktree_list(
             let branch_name = &wt.branch_name;
             let dirty_marker = if wt.is_dirty { " [dirty]" } else { "" };
             println!("  {branch_name} ({model}){dirty_marker}");
-            println!("    Path: {}", wt.path);
             println!();
         }
     }
@@ -134,7 +133,7 @@ pub async fn handle_worktree_list(
 
 /// Handle worktree info command
 pub async fn handle_worktree_info(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model: &str,
     branch: &str,
 ) -> Result<()> {
@@ -154,7 +153,6 @@ pub async fn handle_worktree_info(
 
     println!("Worktree: {model}/{branch}\n");
     println!("Status: Active");
-    println!("Path: {}", wt.path);
     println!("Branch: {branch}");
     if wt.is_dirty {
         println!("Dirty: yes (uncommitted changes)");
@@ -165,7 +163,7 @@ pub async fn handle_worktree_info(
 
 /// Handle worktree remove command
 pub async fn handle_worktree_remove(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model: &str,
     branch: &str,
     force: bool,
@@ -176,21 +174,18 @@ pub async fn handle_worktree_remove(
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
     let repo_client = registry.repo(&tracked.id);
 
-    // Get worktree info from service
+    // Verify worktree exists
     let worktrees = repo_client.list_worktrees().await
         .map_err(|e| anyhow::anyhow!("Failed to list worktrees: {}", e))?;
 
-    let wt = worktrees.iter()
-        .find(|wt| wt.branch_name == branch)
-        .ok_or_else(|| anyhow::anyhow!("Worktree {} does not exist for model {}", branch, model))?;
-
-    let worktree_path = &wt.path;
+    if !worktrees.iter().any(|wt| wt.branch_name == branch) {
+        anyhow::bail!("Worktree {} does not exist for model {}", branch, model);
+    }
 
     // Confirm removal unless forced
     if !force {
-        println!("Warning: This will remove the worktree at:");
-        println!("    {}", worktree_path);
-        println!("\n  Any uncommitted changes will be lost!");
+        println!("Warning: This will remove the worktree for branch '{branch}'");
+        println!("  Any uncommitted changes will be lost!");
         print!("\n  Continue? [y/N] ");
         io::stdout().flush()?;
 
@@ -203,8 +198,8 @@ pub async fn handle_worktree_remove(
         }
     }
 
-    // Remove the worktree via service
-    repo_client.remove_worktree(worktree_path, false).await
+    // Remove the worktree via service (pass branch name, not path)
+    repo_client.remove_worktree(&RemoveWorktreeRequest { branch: branch.to_owned(), force: false }).await
         .map_err(|e| anyhow::anyhow!("Failed to remove worktree: {}", e))?;
 
     println!("Removed worktree {model}/{branch}");

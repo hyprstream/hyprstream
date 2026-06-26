@@ -1064,8 +1064,8 @@ pub fn register_scopes(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// # Usage
 ///
 /// ```ignore
-/// use hyprstream_rpc::service::factory::ServiceContext;
-/// use hyprstream_rpc::service::spawner::Spawnable;
+/// use hyprstream_service::ServiceContext;
+/// use hyprstream_rpc::service::Spawnable;
 /// use hyprstream_rpc_derive::service_factory;
 ///
 /// #[service_factory("policy")]
@@ -1090,7 +1090,7 @@ pub fn register_scopes(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// }
 ///
 /// inventory::submit! {
-///     hyprstream_rpc::service::factory::ServiceFactory::new(
+///     hyprstream_service::ServiceFactory::new(
 ///         "policy",
 ///         create_policy_service
 ///     )
@@ -1110,18 +1110,25 @@ pub fn service_factory(attr: TokenStream, item: TokenStream) -> TokenStream {
     let func_name = &func.sig.ident;
     let name = &args.name;
 
+    let deps = &args.depends_on;
+    let depends_on_chain = if deps.is_empty() {
+        quote! {}
+    } else {
+        quote! { .with_depends_on(&[#(#deps),*]) }
+    };
+
     let expanded = match (&args.schema, &args.metadata) {
         (Some(schema_path), Some(metadata_path)) => {
             quote! {
                 #func
 
                 inventory::submit! {
-                    hyprstream_rpc::service::factory::ServiceFactory::with_metadata(
+                    hyprstream_service::ServiceFactory::with_metadata(
                         #name,
                         #func_name,
                         include_bytes!(#schema_path),
                         #metadata_path
-                    )
+                    )#depends_on_chain
                 }
             }
         }
@@ -1130,11 +1137,11 @@ pub fn service_factory(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #func
 
                 inventory::submit! {
-                    hyprstream_rpc::service::factory::ServiceFactory::with_schema(
+                    hyprstream_service::ServiceFactory::with_schema(
                         #name,
                         #func_name,
                         include_bytes!(#schema_path)
-                    )
+                    )#depends_on_chain
                 }
             }
         }
@@ -1143,10 +1150,10 @@ pub fn service_factory(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #func
 
                 inventory::submit! {
-                    hyprstream_rpc::service::factory::ServiceFactory::new(
+                    hyprstream_service::ServiceFactory::new(
                         #name,
                         #func_name
-                    )
+                    )#depends_on_chain
                 }
             }
         }
@@ -1161,10 +1168,12 @@ pub fn service_factory(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// - `#[service_factory("name")]` — no schema
 /// - `#[service_factory("name", schema = "path/to/schema.capnp")]` — with schema
 /// - `#[service_factory("name", schema = "...", metadata = path::to::schema_metadata)]` — with metadata
+/// - `#[service_factory("name", depends_on = ["policy", "registry"])]` — with dependencies
 struct ServiceFactoryArgs {
     name: syn::LitStr,
     schema: Option<syn::LitStr>,
     metadata: Option<syn::Path>,
+    depends_on: Vec<syn::LitStr>,
 }
 
 impl syn::parse::Parse for ServiceFactoryArgs {
@@ -1172,6 +1181,7 @@ impl syn::parse::Parse for ServiceFactoryArgs {
         let name: syn::LitStr = input.parse()?;
         let mut schema = None;
         let mut metadata = None;
+        let mut depends_on = Vec::new();
 
         while input.peek(syn::Token![,]) {
             input.parse::<syn::Token![,]>()?;
@@ -1187,13 +1197,19 @@ impl syn::parse::Parse for ServiceFactoryArgs {
                 "metadata" => {
                     metadata = Some(input.parse::<syn::Path>()?);
                 }
+                "depends_on" => {
+                    let content;
+                    syn::bracketed!(content in input);
+                    let deps = content.parse_terminated(|input: syn::parse::ParseStream<'_>| input.parse::<syn::LitStr>(), syn::Token![,])?;
+                    depends_on = deps.into_iter().collect();
+                }
                 other => {
                     return Err(syn::Error::new(ident.span(), format!("unknown attribute: {other}")));
                 }
             }
         }
 
-        Ok(ServiceFactoryArgs { name, schema, metadata })
+        Ok(ServiceFactoryArgs { name, schema, metadata, depends_on })
     }
 }
 
@@ -1263,91 +1279,57 @@ pub fn generate_rpc_service(input: TokenStream) -> TokenStream {
     let name = service_name.value();
     let types_crate = args.types_crate.as_ref();
 
-    // Try CGR-based parser first (reads binary from OUT_DIR, includes full type
-    // resolution and annotations). Falls back to text parser if CGR unavailable.
+    // Parse from CGR (binary CodeGeneratorRequest produced by build.rs).
+    // CGR includes full cross-schema type resolution and annotations.
     let parsed = match schema::parse_from_cgr(&name) {
         Ok(p) => p,
-        Err(cgr_err) => {
-            // Fallback: text parser + metadata JSON merge
-            // CGR parser failed — fall back to text parser silently.
-            let _ = cgr_err;
-
-            let manifest_dir = match std::env::var("CARGO_MANIFEST_DIR") {
-                Ok(d) => d,
-                Err(_) => {
-                    return syn::Error::new(service_name.span(), "CARGO_MANIFEST_DIR not set")
-                        .to_compile_error()
-                        .into()
-                }
-            };
-
-            let schema_dir = match std::fs::canonicalize(format!("{manifest_dir}/schema")) {
-                Ok(d) => d,
-                Err(e) => {
-                    return syn::Error::new(
-                        service_name.span(),
-                        format!("Cannot resolve schema directory: {e}"),
-                    )
-                    .to_compile_error()
-                    .into()
-                }
-            };
-            let schema_path = match std::fs::canonicalize(schema_dir.join(format!("{name}.capnp"))) {
-                Ok(p) if p.starts_with(&schema_dir) => p,
-                Ok(p) => {
-                    return syn::Error::new(
-                        service_name.span(),
-                        format!("Schema path escapes build environment: {}", p.display()),
-                    )
-                    .to_compile_error()
-                    .into()
-                }
-                Err(e) => {
-                    return syn::Error::new(
-                        service_name.span(),
-                        format!("Cannot resolve schema '{name}.capnp': {e}"),
-                    )
-                    .to_compile_error()
-                    .into()
-                }
-            };
-            let schema_text = match std::fs::read_to_string(&schema_path) {
-                Ok(t) => t,
-                Err(e) => {
-                    return syn::Error::new(
-                        service_name.span(),
-                        format!("Cannot read {}: {e}", schema_path.display()),
-                    )
-                    .to_compile_error()
-                    .into()
-                }
-            };
-
-            let mut parsed = match schema::parse_capnp_schema(&schema_text, &name) {
-                Some(p) => p,
-                None => {
-                    return syn::Error::new(
-                        service_name.span(),
-                        format!("Failed to parse schema for '{name}'"),
-                    )
-                    .to_compile_error()
-                    .into()
-                }
-            };
-
-            // Try to load annotation metadata from OUT_DIR (generated by build.rs)
-            if let Ok(out_dir) = std::env::var("OUT_DIR") {
-                let metadata_path = std::path::Path::new(&out_dir).join(format!("{name}_metadata.json"));
-                if let Ok(metadata_text) = std::fs::read_to_string(&metadata_path) {
-                    if let Err(e) = schema::merge_annotations_from_metadata(&mut parsed, &metadata_text) {
-                        let _ = e; // annotation metadata load failed; non-fatal
-                    }
-                }
-            }
-
-            parsed
+        Err(e) => {
+            return syn::Error::new(
+                service_name.span(),
+                format!("CGR parse failed for '{name}': {e}. Ensure build.rs compiles this schema."),
+            )
+            .to_compile_error()
+            .into()
         }
     };
 
     codegen::generate_service(&name, &parsed, types_crate, args.scope_handlers).into()
+}
+
+/// Generate client-only code from a Cap'n Proto service schema.
+///
+/// Like `generate_rpc_service!` but emits only data structs, response enums,
+/// and metadata — no server handler traits, no ZMQ deps, no async runtime.
+/// Compiles to all targets including wasm32.
+///
+/// # Usage
+///
+/// ```ignore
+/// pub mod model_client {
+///     hyprstream_rpc_derive::generate_rpc_client!("model");
+/// }
+/// ```
+#[proc_macro]
+pub fn generate_rpc_client(input: TokenStream) -> TokenStream {
+    let args: RpcServiceArgs = match syn::parse(input) {
+        Ok(a) => a,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let service_name = &args.name;
+    let name = service_name.value();
+    let types_crate = args.types_crate.as_ref();
+
+    let parsed = match schema::parse_from_cgr(&name) {
+        Ok(p) => p,
+        Err(e) => {
+            return syn::Error::new(
+                service_name.span(),
+                format!("CGR parse failed for '{name}': {e}. Ensure build.rs compiles this schema."),
+            )
+            .to_compile_error()
+            .into()
+        }
+    };
+
+    codegen::generate_client_only(&name, &parsed, types_crate).into()
 }

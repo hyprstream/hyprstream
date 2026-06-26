@@ -4,25 +4,24 @@ pub mod flight;
 pub mod git;
 pub mod policy;
 pub mod training;
+pub mod user;
 pub mod worker;
 
 pub use flight::FlightArgs;
 pub use git::{GitAction, GitCommand};
-pub use policy::{PolicyCommand, TokenCommand};
+pub use policy::{PolicyCommand, RoleCommand, TokenCommand};
 pub use training::{TrainingAction, TrainingCommand};
+pub use user::{UserCommand, UserKeysCommand, UserKeysImportFormat};
 pub use worker::{ImageCommand, WorkerAction};
 
 use clap::{Subcommand, ValueEnum};
 
-use crate::runtime::kv_quant::KVQuantType;
+use crate::runtime::KVQuantType;
 
-/// KV cache quantization type for inference
+/// KV cache quantization type for CLI argument parsing.
 ///
-/// Quantization reduces GPU memory usage at a slight quality cost:
-/// - `none`: Full precision (default)
-/// - `int8`: 50% memory savings, minimal quality loss
-/// - `nf4`: 75% memory savings, best quality for 4-bit
-/// - `fp4`: 75% memory savings, standard 4-bit quantization
+/// Thin wrapper for `clap::ValueEnum` (can't derive on foreign types).
+/// Converts to the generated `KVQuantType` via `From`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KVQuantArg {
@@ -51,15 +50,11 @@ impl From<KVQuantArg> for KVQuantType {
 /// Overall execution mode for the hyprstream CLI and services
 ///
 /// This determines how services are spawned and managed:
-/// - **Inproc**: Single process, all services in-process, inproc:// ZMQ transport (mobile/embedded)
 /// - **IpcStandalone**: Multiple processes spawned directly, ipc:// ZMQ transport (default)
 /// - **IpcSystemd**: Multiple systemd services with socket activation, ipc:// ZMQ transport
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExecutionMode {
-    /// In-process mode with all services in a single process (mobile/embedded builds)
-    Inproc,
-
     /// Standalone mode with forked processes (default for desktop/server/containers)
     /// Services spawned via ProcessSpawner with StandaloneBackend
     #[default]
@@ -76,9 +71,6 @@ impl ExecutionMode {
     /// Returns:
     /// - `IpcSystemd` if systemd is available
     /// - `IpcStandalone` otherwise (default for desktop/server/containers)
-    ///
-    /// Note: `Inproc` mode is reserved for special builds (mobile/embedded)
-    /// and must be explicitly requested via CLI flag (future feature).
     pub fn detect() -> Self {
         #[cfg(feature = "systemd")]
         {
@@ -92,17 +84,12 @@ impl ExecutionMode {
 
     /// Get the EndpointMode for this execution mode
     pub fn endpoint_mode(&self) -> hyprstream_rpc::registry::EndpointMode {
-        match self {
-            ExecutionMode::Inproc => hyprstream_rpc::registry::EndpointMode::Inproc,
-            ExecutionMode::IpcStandalone | ExecutionMode::IpcSystemd => {
-                hyprstream_rpc::registry::EndpointMode::Ipc
-            }
-        }
+        hyprstream_rpc::registry::EndpointMode::Ipc
     }
 
     /// Whether this mode uses IPC sockets
     pub fn uses_ipc(&self) -> bool {
-        matches!(self, ExecutionMode::IpcStandalone | ExecutionMode::IpcSystemd)
+        true
     }
 
     /// Whether this mode uses systemd
@@ -114,41 +101,53 @@ impl ExecutionMode {
 impl std::fmt::Display for ExecutionMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ExecutionMode::Inproc => write!(f, "inproc"),
             ExecutionMode::IpcStandalone => write!(f, "ipc-standalone"),
             ExecutionMode::IpcSystemd => write!(f, "ipc-systemd"),
         }
     }
 }
 
-/// Top-level commands for the hyprstream CLI.
-///
-/// Schema-driven commands (registry, model, inference, policy) are built
-/// at runtime from Cap'n Proto schema metadata — see `schema_cli.rs`.
-///
-/// This enum only contains commands that require hand-coded dispatch:
-/// `quick` (orchestrated workflows), `worker`, `service`, and `flight`.
+/// TUI display server actions
 #[derive(Subcommand)]
-pub enum Commands {
-    /// Quick workflows — multi-step convenience commands
-    ///
-    /// These commands involve multiple RPC calls, interactive prompts,
-    /// progress bars, or other complex orchestration.
-    Quick {
-        #[command(subcommand)]
-        command: super::quick::QuickCommand,
+pub enum TuiAction {
+    /// Attach to an existing session (or create new if none exist)
+    Attach {
+        /// Session ID to attach to (0 = most recent)
+        #[arg(default_value = "0")]
+        session: u32,
     },
 
-    /// Flight SQL client to query datasets
-    Flight(FlightArgs),
+    /// Create a new session
+    New,
 
-    /// Service management and lifecycle commands
+    /// List active sessions
+    List,
+
+    /// Detach from current session
+    Detach,
+
+    /// Play an asciicast v2 recording in a TUI pane
+    Play {
+        /// Path to the .cast file
+        cast_file: std::path::PathBuf,
+
+        /// Session ID to play in (0 = most recent)
+        #[arg(long, default_value = "0")]
+        session: u32,
+
+        /// Loop playback continuously instead of exiting when finished
+        #[arg(long, short = 'l')]
+        loop_playback: bool,
+    },
+
+    /// Run hyprstream as an interactive shell client embedded in a TUI pane
     ///
-    /// Install, manage, and control hyprstream services. Supports both systemd
-    /// (when available) and standalone process management.
-    Service {
-        #[command(subcommand)]
-        action: ServiceAction,
+    /// Renders the full ShellClient chrome (status bar, window tabs, F-key legend)
+    /// into a TuiService pane. Useful for Playwright/WebTransport testing.
+    Shell {
+        /// Session ID (0 = most recent)
+        #[arg(long, default_value = "0")]
+        session: u32,
     },
 }
 
@@ -203,13 +202,36 @@ pub enum ServiceAction {
         #[arg(long, short = 'd')]
         daemon: bool,
 
+        /// Run all services in a single foreground process
+        ///
+        /// Starts every configured service in-process without systemd.
+        /// Useful for containers, testing, and environments without a
+        /// systemd user session.
+        #[arg(long, conflicts_with_all = ["foreground", "daemon", "services"])]
+        standalone: bool,
+
         /// Use IPC sockets for distributed mode
         #[arg(long)]
         ipc: bool,
 
-        /// Callback endpoint for inference service callback mode
+        /// Comma-separated list of services to start in multi-service foreground mode
+        ///
+        /// When used with --foreground, starts all listed services in a single process.
+        /// Example: --services registry,policy,model,streams,event
+        #[arg(long, value_delimiter = ',')]
+        services: Option<Vec<String>>,
+
+        /// Bind address for QUIC/WebTransport server (e.g., 127.0.0.1:4433)
+        ///
+        /// Enables WebTransport access to services via HTTP/3. Use port 0 for random port.
         #[arg(long)]
-        callback: Option<String>,
+        quic_bind: Option<String>,
+
+        /// Print the SHA-256 hash of the QUIC TLS certificate and include it in startup output
+        ///
+        /// The hash is suitable for use in browser's serverCertificateHashes WebTransport option.
+        #[arg(long)]
+        print_cert_hash: bool,
     },
 
     /// Stop services

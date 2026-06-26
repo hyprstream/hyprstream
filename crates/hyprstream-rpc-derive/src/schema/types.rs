@@ -1,79 +1,107 @@
 //! Type definitions for parsed Cap'n Proto schemas.
+//!
+//! Re-exported from `hyprstream_rpc_build::schema::types` — the canonical definitions
+//! live in the build crate so they can be shared between the proc-macro and the
+//! TypeScript codegen binary.
 
-#[derive(Debug)]
-pub struct ParsedSchema {
-    /// Request union variants
-    pub request_variants: Vec<UnionVariant>,
-    /// Response union variants
-    pub response_variants: Vec<UnionVariant>,
-    /// Struct definitions referenced by variants
-    pub structs: Vec<StructDef>,
-    /// Scoped clients detected from nested union patterns
-    pub scoped_clients: Vec<ScopedClient>,
-    /// Enum definitions parsed from schema
-    pub enums: Vec<EnumDef>,
+pub use hyprstream_rpc_build::schema::types::*;
+
+/// Collect all struct names that need Data structs generated.
+pub fn collect_list_struct_types(schema: &ParsedSchema) -> Vec<String> {
+    let mut types = Vec::new();
+
+    let add_type = |type_name: &str, types: &mut Vec<String>| {
+        if type_name.starts_with("List(") {
+            let inner = &type_name[5..type_name.len() - 1];
+            if !is_primitive_capnp_type(inner)
+                && !types.contains(&inner.to_owned())
+                && schema.enums.iter().all(|e| e.name != inner)
+            {
+                types.push(inner.to_owned());
+            }
+        } else if !is_primitive_capnp_type(type_name)
+            && !type_name.starts_with("List(")
+            && schema.enums.iter().all(|e| e.name != type_name)
+            && schema.structs.iter().any(|s| s.name == type_name)
+            && !types.contains(&type_name.to_owned())
+        {
+            types.push(type_name.to_owned());
+        }
+    };
+
+    for v in &schema.response_variants {
+        add_type(&v.type_name, &mut types);
+    }
+    for sc in &schema.scoped_clients {
+        for v in &sc.inner_response_variants {
+            add_type(&v.type_name, &mut types);
+        }
+    }
+    for s in &schema.structs {
+        for f in s.non_union_fields() {
+            add_type(&f.type_name, &mut types);
+        }
+        // Union-arm payload types are referenced by the generated enum variants
+        // (e.g. `WorktreeResult(WorktreeResponse)`), so they must be generated too.
+        // The flat `non_union_fields` walk above does not cover them.
+        for arm in &s.union_arms {
+            match &arm.payload {
+                ArmPayload::Void => {}
+                ArmPayload::Type(name) => add_type(name, &mut types),
+                ArmPayload::Group(leaves) => {
+                    for leaf in leaves {
+                        add_type(&leaf.type_name, &mut types);
+                    }
+                }
+            }
+        }
+    }
+    for v in &schema.request_variants {
+        add_type(&v.type_name, &mut types);
+        if let Some(s) = schema.structs.iter().find(|s| s.name == v.type_name) {
+            for f in s.non_union_fields() {
+                add_type(&f.type_name, &mut types);
+            }
+        }
+    }
+    for sc in &schema.scoped_clients {
+        collect_from_scoped(sc, schema, &mut types);
+    }
+
+    types
 }
 
-#[derive(Debug)]
-pub struct UnionVariant {
-    pub name: String,
-    pub type_name: String,
-    pub description: String,
-    /// MCP scope override (e.g., "write:model:*"). Empty string means use default.
-    pub scope: String,
-    /// Whether this method is hidden from CLI (internal-only).
-    pub cli_hidden: bool,
-}
-
-#[derive(Debug)]
-pub struct StructDef {
-    pub name: String,
-    pub fields: Vec<FieldDef>,
-    pub has_union: bool,
-    /// Domain type path from `$domainType` annotation (e.g., "runtime::VersionResponse").
-    /// When set, the generated client returns this type via `FromCapnp::read_from()`.
-    pub domain_type: Option<String>,
-    /// Origin file stem for imported types (e.g., `Some("streaming")` for types from streaming.capnp).
-    /// `None` means the type is local to the service's own schema file.
-    pub origin_file: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct FieldDef {
-    pub name: String,
-    pub type_name: String,
-    pub description: String,
-    /// From `$fixedSize(N)` annotation: generates `[u8; N]` instead of `Vec<u8>` for Data fields.
-    pub fixed_size: Option<u32>,
-    /// From `$optional` annotation: field is optional in MCP tool schemas and uses
-    /// type-appropriate zero-value defaults when absent at runtime.
-    pub optional: bool,
-}
-
-#[derive(Debug)]
-pub struct EnumDef {
-    pub name: String,
-    pub variants: Vec<(String, u32)>,
-    /// Origin file stem for imported types (e.g., `Some("streaming")` for types from streaming.capnp).
-    /// `None` means the type is local to the service's own schema file.
-    pub origin_file: Option<String>,
-}
-
-/// A scoped client detected from nested union patterns in the schema.
-#[derive(Debug)]
-pub struct ScopedClient {
-    /// Factory method name on parent client (e.g., "repo", "session")
-    pub factory_name: String,
-    /// Generated client struct name (e.g., "RepositoryClient", "ModelSessionClient")
-    pub client_name: String,
-    /// Curried scope fields from the inner struct
-    pub scope_fields: Vec<FieldDef>,
-    /// Inner union variants from the request struct
-    pub inner_request_variants: Vec<UnionVariant>,
-    /// Inner union variants from the response struct
-    pub inner_response_variants: Vec<UnionVariant>,
-    /// Cap'n Proto module name for the inner response struct (snake_case)
-    pub capnp_inner_response: String,
-    /// Nested scoped clients detected within this scope (e.g., Fs within Repository)
-    pub nested_clients: Vec<ScopedClient>,
+fn collect_from_scoped(sc: &ScopedClient, schema: &ParsedSchema, types: &mut Vec<String>) {
+    let add_type = |type_name: &str, types: &mut Vec<String>| {
+        if type_name.starts_with("List(") {
+            let inner = &type_name[5..type_name.len() - 1];
+            if !is_primitive_capnp_type(inner)
+                && !types.contains(&inner.to_owned())
+                && schema.enums.iter().all(|e| e.name != inner)
+            {
+                types.push(inner.to_owned());
+            }
+        } else if !is_primitive_capnp_type(type_name)
+            && !type_name.starts_with("List(")
+            && schema.enums.iter().all(|e| e.name != type_name)
+            && schema.structs.iter().any(|s| s.name == type_name)
+            && !types.contains(&type_name.to_owned())
+        {
+            types.push(type_name.to_owned());
+        }
+    };
+    for v in &sc.inner_response_variants {
+        add_type(&v.type_name, types);
+    }
+    for v in &sc.inner_request_variants {
+        add_type(&v.type_name, types);
+        if let Some(s) = schema.structs.iter().find(|s| s.name == v.type_name) {
+            for f in s.non_union_fields() {
+                add_type(&f.type_name, types);
+            }
+        }
+    }
+    for nested in &sc.nested_clients {
+        collect_from_scoped(nested, schema, types);
+    }
 }

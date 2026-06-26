@@ -18,6 +18,7 @@ use crate::storage::paths::StoragePaths;
 use config::{Config, ConfigError, Environment, File};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use zeroize::{Zeroize, Zeroizing};
 
 /// Unified configuration for the Hyprstream system
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,10 +85,428 @@ pub struct HyprConfig {
     #[serde(default)]
     pub oauth: OAuthConfig,
 
+    /// Credentials storage backend (user profiles, pubkeys, refresh tokens).
+    #[serde(default)]
+    pub credentials: CredentialsConfig,
+
     /// StreamService configuration (buffer sizes, TTL, etc.)
     #[serde(default)]
     pub streaming: StreamingConfig,
+
+    /// RPC transport server tunables (stream cap, connection cap, timeouts).
+    ///
+    /// All values default to the process-wide constants in `hyprstream-rpc`
+    /// (`DEFAULT_STREAM_LIMIT=64`, `DEFAULT_CONNECTION_LIMIT=256`, etc.).
+    /// Override via `[rpc]` in the config file or `HYPRSTREAM__RPC__*` env vars.
+    #[serde(default)]
+    pub rpc: RpcServerConfig,
+
+    /// TLS configuration for HTTP services (OAI, OAuth, MCP)
+    ///
+    /// Enabled by default. Auto-generates self-signed cert when paths are unset.
+    /// Per-service `tls_cert`/`tls_key` overrides take precedence.
+    #[serde(default)]
+    pub tls: TlsConfig,
+
+    /// QUIC/WebTransport configuration
+    ///
+    /// Enabled by default. Services expose a WebTransport endpoint alongside ZMQ,
+    /// allowing browsers to connect directly via HTTP/3 + QUIC.
+    /// Set `enabled = false` to disable.
+    #[serde(default)]
+    pub quic: QuicConfig,
+
+    /// Event proxy service configuration
+    #[serde(default)]
+    pub event: EventServiceConfig,
+
+    /// Registry service configuration
+    #[serde(default)]
+    pub registry: RegistryServiceConfig,
+
+    /// Policy service configuration
+    #[serde(default)]
+    pub policy: PolicyServiceConfig,
+
+    /// Discovery service configuration
+    #[serde(default)]
+    pub discovery: DiscoveryServiceConfig,
+
+    /// TUI display server configuration
+    #[serde(default)]
+    pub tui: TuiServiceConfig,
+
+    /// Metrics service configuration (DuckDB/DataFusion ingest + query)
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+
+    /// Hex-encoded Ed25519 node signing key bytes (bypasses OS keyring lookup).
+    ///
+    /// **TEST USE ONLY.** Set via `HYPRSTREAM__SIGNING_KEY` env var to inject a
+    /// pre-generated key in isolated test environments where a keyring daemon is
+    /// unavailable. Never set this in production config files.
+    #[serde(default, skip_serializing)]
+    pub signing_key: Option<String>,
+
+    /// Persistent secrets storage configuration.
+    ///
+    /// Controls where signing keys and TLS materials are read from and written to.
+    /// On systemd, overridden at runtime by
+    /// `HYPRSTREAM__SECRETS__PATH=%d` in the service unit (pointing to the
+    /// systemd credentials directory).
+    #[serde(default)]
+    pub secrets: SecretsConfig,
 }
+
+/// Persistent secrets storage configuration.
+///
+/// Determines the directory used for reading and writing persistent secret key
+/// material: signing keys and TLS certificates/keys.
+///
+/// On systemd, the generated service unit sets
+/// `Environment=HYPRSTREAM__SECRETS__PATH=%d` so that at runtime `path` resolves
+/// to the systemd credentials directory (non-swappable ramfs, access-restricted).
+///
+/// On non-systemd systems the default (`<config_dir>/credentials`) is used.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SecretsConfig {
+    /// Override the directory from which secret files are read (and written on
+    /// first run).  `None` → resolved at runtime to `<config_dir>/credentials`.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+}
+
+impl SecretsConfig {
+    /// Resolve the secrets directory.
+    ///
+    /// Returns `path` if set, otherwise `<config_dir>/credentials`.
+    pub fn resolve_dir(&self, config_dir: &Path) -> PathBuf {
+        self.path.clone().unwrap_or_else(|| config_dir.join("credentials"))
+    }
+
+    /// Return the default secrets directory when no config is available.
+    ///
+    /// Routes through `StoragePaths` so `XDG_CONFIG_HOME` is respected
+    /// consistently with every other directory in the application.
+    /// Falls back to `/etc/hyprstream/credentials` if XDG resolution fails.
+    pub fn default_dir() -> PathBuf {
+        StoragePaths::new()
+            .and_then(|p| p.config_dir())
+            .map(|d| d.join("credentials"))
+            .unwrap_or_else(|_| PathBuf::from("/etc/hyprstream/credentials"))
+    }
+}
+
+/// TLS configuration for HTTP services (OAI, OAuth, MCP).
+///
+/// When `cert_path`/`key_path` are unset, a self-signed ECDSA P-256 certificate
+/// is auto-generated at startup with 365-day validity. Per-service overrides
+/// (`tls_cert`/`tls_key` on OAI/OAuth/MCP configs) take precedence.
+///
+/// # Example TOML
+///
+/// ```toml
+/// [tls]
+/// mode = "self-signed"   # or "acme" or "files"
+/// server_name = "localhost"
+/// # ACME mode:
+/// # acme_domain = "node.example.com"
+/// # acme_contact = "mailto:ops@example.com"
+/// # acme_cache_dir = "/var/lib/hyprstream/acme"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TlsMode {
+    /// Auto-generate a self-signed certificate at startup (dev/air-gapped only).
+    #[default]
+    SelfSigned,
+    /// Obtain a certificate automatically via ACME (RFC 8555) — Let's Encrypt or step-ca.
+    Acme,
+    /// Load certificate and key from `cert_path`/`key_path` (operator-managed).
+    Files,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsConfig {
+    /// Whether TLS is enabled for HTTP services (defaults to true)
+    #[serde(default = "default_tls_enabled")]
+    pub enabled: bool,
+
+    /// TLS provisioning mode. Defaults to `self-signed` when cert_path/key_path are unset.
+    #[serde(default)]
+    pub mode: TlsMode,
+
+    /// Path to TLS certificate (PEM). Used when mode = "files".
+    #[serde(default)]
+    pub cert_path: Option<PathBuf>,
+
+    /// Path to TLS private key (PEM). Used when mode = "files".
+    #[serde(default)]
+    pub key_path: Option<PathBuf>,
+
+    /// Server name for TLS certificate (self-signed CN or ACME domain).
+    #[serde(default = "default_tls_server_name")]
+    pub server_name: String,
+
+    /// ACME: domain to obtain a certificate for. Required when mode = "acme".
+    #[serde(default)]
+    pub acme_domain: Option<String>,
+
+    /// ACME: contact email URI, e.g. "mailto:ops@example.com".
+    #[serde(default)]
+    pub acme_contact: Option<String>,
+
+    /// ACME: directory URL. Defaults to Let's Encrypt production.
+    /// Set to a step-ca or Pebble URL for self-hosted ACME.
+    #[serde(default)]
+    pub acme_directory: Option<String>,
+
+    /// ACME: directory for certificate cache and account keys.
+    #[serde(default)]
+    pub acme_cache_dir: Option<PathBuf>,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: TlsMode::SelfSigned,
+            cert_path: None,
+            key_path: None,
+            server_name: default_tls_server_name(),
+            acme_domain: None,
+            acme_contact: None,
+            acme_directory: None,
+            acme_cache_dir: None,
+        }
+    }
+}
+
+impl TlsConfig {
+    /// Effective TLS mode, resolving legacy cert_path/key_path into Files mode.
+    pub fn effective_mode(&self) -> TlsMode {
+        // Explicit mode overrides; legacy cert_path/key_path implies Files.
+        if self.mode != TlsMode::SelfSigned {
+            return self.mode.clone();
+        }
+        if self.cert_path.is_some() && self.key_path.is_some() {
+            return TlsMode::Files;
+        }
+        TlsMode::SelfSigned
+    }
+
+    /// Check if self-signed certificate should be generated.
+    pub fn use_self_signed(&self) -> bool {
+        self.effective_mode() == TlsMode::SelfSigned
+    }
+}
+
+fn default_tls_enabled() -> bool { true }
+fn default_tls_server_name() -> String { "localhost".to_owned() }
+
+/// QUIC/WebTransport transport configuration.
+///
+/// Enables WebTransport alongside ZMQ for browser-direct RPC.
+/// When `cert_path` is empty, a self-signed certificate is generated at startup.
+///
+/// # Example TOML
+///
+/// ```toml
+/// [quic]
+/// enabled = true
+/// bind_addr = "0.0.0.0:4433"
+/// server_name = "localhost"
+/// cert_path = ""
+/// key_path = ""
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuicConfig {
+    /// Whether QUIC/WebTransport is enabled (defaults to true)
+    #[serde(default = "default_quic_enabled")]
+    pub enabled: bool,
+
+    /// Address to bind the WebTransport server
+    #[serde(default = "default_quic_bind_addr")]
+    pub bind_addr: String,
+
+    /// Server name for TLS certificate (used in self-signed cert generation)
+    #[serde(default = "default_quic_server_name")]
+    pub server_name: String,
+
+    /// Path to TLS certificate (PEM). Empty = generate self-signed.
+    #[serde(default)]
+    pub cert_path: String,
+
+    /// Path to TLS private key (PEM). Empty = generate self-signed.
+    #[serde(default)]
+    pub key_path: String,
+
+    /// #410/#282: bind an iroh substrate (ALPNs `hyprstream-rpc/1` + `moql`)
+    /// as the PRIMARY production transport, in parallel with the quinn/WebTransport
+    /// endpoint (kept for back-compat). Iroh is ON by default — it provides
+    /// node_id-addressed (pkarr/N0-DNS-discoverable) federation reach, NAT
+    /// traversal, self-certifying Ed25519 identity, and PQ-hybrid key exchange.
+    /// Opt out with `[quic] iroh = false` to run quinn-only (legacy). Native-only.
+    #[serde(default = "default_iroh_enabled")]
+    pub iroh: bool,
+
+    /// #358: the producer-chosen moq RELAY this node rendezvouses through, as a
+    /// dialable URI (`https://host:port` for the relay's WebTransport `/moq`
+    /// endpoint, or an iroh node URI). Empty = direct-only (the baseline). When
+    /// set, every QUIC-enabled service advertises a `Role::Relay` reach and links
+    /// its streaming origin UP to the relay, so neither publisher nor subscriber
+    /// need be directly reachable by the other. Default deployments point this at
+    /// the node's PDS / federation anchor (the `#atproto_pds` DID service entry).
+    #[serde(default)]
+    pub relay: String,
+}
+
+impl Default for QuicConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bind_addr: default_quic_bind_addr(),
+            server_name: default_quic_server_name(),
+            cert_path: String::new(),
+            key_path: String::new(),
+            iroh: default_iroh_enabled(),
+            relay: String::new(),
+        }
+    }
+}
+
+impl QuicConfig {
+    /// Parse bind_addr into a SocketAddr.
+    pub fn socket_addr(&self) -> anyhow::Result<std::net::SocketAddr> {
+        self.bind_addr.parse().map_err(|e| anyhow::anyhow!("invalid quic.bind_addr '{}': {}", self.bind_addr, e))
+    }
+
+    /// Check if self-signed certificate should be generated.
+    ///
+    /// Warns when only one of cert_path/key_path is set (misconfiguration).
+    pub fn use_self_signed(&self) -> bool {
+        match (self.cert_path.is_empty(), self.key_path.is_empty()) {
+            (true, true) => true,
+            (false, false) => false,
+            (false, true) => {
+                tracing::warn!(
+                    "quic.cert_path is set but quic.key_path is missing — generating self-signed cert"
+                );
+                true
+            }
+            (true, false) => {
+                tracing::warn!(
+                    "quic.key_path is set but quic.cert_path is missing — generating self-signed cert"
+                );
+                true
+            }
+        }
+    }
+
+    /// Generate or load TLS materials, returning `(cert_der, key_der)`.
+    ///
+    /// `key_der` is wrapped in `Zeroizing` to ensure it is zeroed on drop.
+    ///
+    /// For self-signed certs, loads persisted ECDSA P-256 materials from the secrets
+    /// directory (generating on first run) with ≤14 day validity, as required by
+    /// WebTransport `serverCertificateHashes` (W3C spec).
+    ///
+    /// QUIC uses a separate cert (`quic-cert`) from the HTTP cert (`tls-cert`) because
+    /// WebTransport requires ≤14-day validity while HTTP allows 365 days.
+    /// Load TLS materials for QUIC/WebTransport.
+    ///
+    /// Returns a certificate **chain** (leaf first, then intermediates/CA) and the
+    /// private key. When loading from PEM files, all certificates in the file are
+    /// included — this allows CA-signed certs (e.g. mkcert) to work by bundling
+    /// the leaf + CA cert in a single PEM file.
+    pub fn load_tls_materials(&self) -> anyhow::Result<(Vec<Vec<u8>>, Zeroizing<Vec<u8>>)> {
+        if self.use_self_signed() {
+            let secrets_dir = HyprConfig::resolve_secrets_dir();
+            // Use quic-specific secret names so QUIC and HTTP certs have different
+            // validity windows without stomping each other's files.
+            let materials = crate::auth::identity_store::load_or_generate_tls_materials_named(
+                &secrets_dir,
+                &self.server_name,
+                14,
+                "quic-key",
+                "quic-cert",
+            )?;
+            // Self-signed: chain is just the leaf cert
+            Ok((vec![materials.cert_der], materials.key_der))
+        } else {
+            // Load from files
+            let cert_pem = std::fs::read(&self.cert_path)
+                .map_err(|e| anyhow::anyhow!("failed to read cert_path '{}': {}", self.cert_path, e))?;
+            let key_pem = std::fs::read(&self.key_path)
+                .map_err(|e| anyhow::anyhow!("failed to read key_path '{}': {}", self.key_path, e))?;
+
+            // Parse ALL certs from PEM (leaf + intermediates + CA)
+            let cert_chain: Vec<Vec<u8>> = rustls_pemfile::certs(&mut &cert_pem[..])
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow::anyhow!("invalid certificate PEM: {}", e))?
+                .into_iter()
+                .map(|c| c.to_vec())
+                .collect();
+            if cert_chain.is_empty() {
+                return Err(anyhow::anyhow!("no certificate found in {}", self.cert_path));
+            }
+
+            let key_der = Zeroizing::new(
+                rustls_pemfile::private_key(&mut &key_pem[..])
+                    .map_err(|e| anyhow::anyhow!("invalid key PEM: {}", e))?
+                    .ok_or_else(|| anyhow::anyhow!("no private key found in {}", self.key_path))?
+                    .secret_der()
+                    .to_vec(),
+            );
+
+            Ok((cert_chain, key_der))
+        }
+    }
+
+    /// Build a `QuicLoopConfig` for use with `RequestLoop`.
+    ///
+    /// Optionally embeds RFC 9728 Protected Resource Metadata so HTTP/3 clients
+    /// can discover the OAuth authorization server for this QUIC endpoint.
+    pub fn to_loop_config(
+        &self,
+        service_name: &str,
+        oauth_issuer_url: Option<&str>,
+    ) -> anyhow::Result<hyprstream_rpc::service::QuicLoopConfig> {
+        let addr = self.socket_addr()?;
+        let (cert_chain, key_der) = self.load_tls_materials()?;
+        let meta_json = oauth_issuer_url.map(|issuer| {
+            let meta = crate::services::oauth::protected_resource_metadata(
+                &format!("https://{}/{}", self.server_name, service_name),
+                issuer,
+            );
+            serde_json::to_vec(&meta).unwrap_or_default()
+        });
+        Ok(hyprstream_rpc::service::QuicLoopConfig {
+            cert_chain,
+            key_der,
+            bind_addr: addr,
+            server_name: self.server_name.clone(),
+            protected_resource_json: meta_json,
+            on_quic_bound: None,
+            // #410: iroh is the primary production transport (on by default).
+            // This minimal builder mirrors the daemon bootstrap default; the
+            // full `QuicSharedConfig` path in `main.rs` honours `[quic] iroh`.
+            iroh_enabled: default_iroh_enabled(),
+            iroh_admission: None,
+            on_iroh_bound: None,
+            // #358: relay rendezvous is provisioned by the daemon bootstrap
+            // (`QuicSharedConfig`), not this minimal builder. Direct-only here.
+            moq_relay: None,
+        })
+    }
+}
+
+fn default_quic_enabled() -> bool { true }
+/// #410: iroh substrate is the PRIMARY production transport — on by default.
+/// The quinn-only baseline is the legacy path; opt out with `[quic] iroh = false`.
+fn default_iroh_enabled() -> bool { true }
+fn default_quic_bind_addr() -> String { "0.0.0.0:4433".to_owned() }
+fn default_quic_server_name() -> String { "localhost".to_owned() }
 
 /// JWT token issuance configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,14 +521,14 @@ pub struct TokenConfig {
 impl Default for TokenConfig {
     fn default() -> Self {
         Self {
-            default_ttl_seconds: 300,   // 5 minutes
-            max_ttl_seconds: 3600,      // 1 hour
+            default_ttl_seconds: 172_800, // 48 hours
+            max_ttl_seconds: 172_800,    // 48 hours
         }
     }
 }
 
-fn default_token_ttl() -> u32 { 300 }
-fn default_max_token_ttl() -> u32 { 3600 }
+fn default_token_ttl() -> u32 { 172_800 }    // 48 hours
+fn default_max_token_ttl() -> u32 { 172_800 } // 48 hours
 
 /// OpenAI-compatible HTTP API configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,6 +561,10 @@ pub struct OAIConfig {
     /// CORS configuration
     #[serde(default)]
     pub cors: server::CorsConfig,
+
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
 }
 
 impl Default for OAIConfig {
@@ -154,18 +577,25 @@ impl Default for OAIConfig {
             tls_key: None,
             request_timeout_secs: default_oai_timeout(),
             cors: server::CorsConfig::default(),
+            quic_port: None,
         }
     }
 }
 
 impl OAIConfig {
     /// Get the resource URL, using external_url if set, otherwise deriving from host:port.
+    /// Auto-derives `https://` when global TLS is enabled.
     pub fn resource_url(&self) -> String {
         if let Some(ref url) = self.external_url {
             url.clone()
         } else {
+            let scheme = if HyprConfig::load().map(|c| c.tls.enabled).unwrap_or(false) {
+                "https"
+            } else {
+                "http"
+            };
             let host = if self.host == "0.0.0.0" { "localhost" } else { &self.host };
-            format!("http://{}:{}", host, self.port)
+            format!("{scheme}://{host}:{}", self.port)
         }
     }
 }
@@ -196,6 +626,10 @@ pub struct FlightConfig {
     /// TLS private key path (optional)
     #[serde(default)]
     pub tls_key: Option<PathBuf>,
+
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
 }
 
 impl Default for FlightConfig {
@@ -206,6 +640,7 @@ impl Default for FlightConfig {
             default_dataset: None,
             tls_cert: None,
             tls_key: None,
+            quic_port: None,
         }
     }
 }
@@ -231,6 +666,22 @@ pub struct MCPConfig {
     /// Auto-derived from host:http_port if not set.
     #[serde(default)]
     pub external_url: Option<String>,
+
+    /// TLS certificate path (optional, overrides global [tls])
+    #[serde(default)]
+    pub tls_cert: Option<PathBuf>,
+
+    /// TLS private key path (optional, overrides global [tls])
+    #[serde(default)]
+    pub tls_key: Option<PathBuf>,
+
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
+
+    /// CORS configuration for the MCP HTTP/SSE server
+    #[serde(default)]
+    pub cors: server::CorsConfig,
 }
 
 impl Default for MCPConfig {
@@ -239,24 +690,273 @@ impl Default for MCPConfig {
             host: default_mcp_host(),
             http_port: default_mcp_port(),
             external_url: None,
+            tls_cert: None,
+            tls_key: None,
+            quic_port: None,
+            cors: server::CorsConfig::default(),
         }
     }
 }
 
 impl MCPConfig {
     /// Get the resource URL, using external_url if set, otherwise deriving from host:http_port.
+    /// Auto-derives `https://` when global TLS is enabled.
     pub fn resource_url(&self) -> String {
         if let Some(ref url) = self.external_url {
             url.clone()
         } else {
+            let scheme = if HyprConfig::load().map(|c| c.tls.enabled).unwrap_or(false) {
+                "https"
+            } else {
+                "http"
+            };
             let host = if self.host == "0.0.0.0" { "localhost" } else { &self.host };
-            format!("http://{}:{}", host, self.http_port)
+            format!("{scheme}://{host}:{}", self.http_port)
         }
     }
 }
 
 fn default_mcp_host() -> String { "0.0.0.0".to_owned() }
 fn default_mcp_port() -> u16 { 6790 }
+
+/// Configuration for a trusted external OIDC issuer.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TrustedIssuerConfig {
+    /// Override the JWKS URI directly (skips AS metadata discovery).
+    /// If absent, JWKS URI is auto-discovered from `{issuer}/.well-known/oauth-authorization-server`.
+    #[serde(default)]
+    pub jwks_uri: Option<String>,
+    /// How long to cache the JWKS before re-fetching (default: 300 seconds).
+    #[serde(default = "default_jwks_cache_ttl")]
+    pub jwks_cache_ttl_secs: u64,
+    /// Allow plain HTTP for JWKS fetches (default: false).
+    ///
+    /// **SECURITY WARNING:** Enabling this allows MITM attacks on the JWKS endpoint.
+    /// Only use for internal networks or local development. Never enable in production.
+    #[serde(default)]
+    pub allow_http: bool,
+}
+
+fn default_jwks_cache_ttl() -> u64 { 300 }
+
+/// Configuration for a trusted mesh peer's post-quantum signing identity (#157).
+///
+/// Admin-anchored entry binding a peer's Ed25519 mesh **signer** identity (the
+/// envelope/COSE signer key, used as the kid anchor) to its trusted ML-DSA-65
+/// mesh verifying key. These entries populate the process-global
+/// `KeyedPqTrustStore` eagerly at startup; the store is immutable thereafter.
+///
+/// Both keys are supplied **inline**, out-of-band, as `Multikey`
+/// `publicKeyMultibase` strings (base58btc, multicodec-prefixed) — the same
+/// encoding the node publishes in its DID document (`#mesh` ed25519-pub `0xed01`
+/// and `#mesh-pq` ml-dsa-65-pub `0x1211`). An operator copies a peer's
+/// `#mesh` and `#mesh-pq` `publicKeyMultibase` values from that peer's DID doc.
+///
+/// This matches the `KeyedPqTrustStore` contract ("Entries MUST be established
+/// out-of-band") and the Tiles interop admission model: only keys an operator
+/// configured are trusted. If `mesh_peers` is empty, the store is empty and
+/// behavior is unchanged (Hybrid fails closed for unknown peers).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshPeerConfig {
+    /// Peer's Ed25519 mesh signer public key as a `Multikey` `publicKeyMultibase`
+    /// string (base58btc `z…`, multicodec `ed25519-pub` `0xed01`). This is the
+    /// kid anchor the COSE composite is verified against.
+    pub ed25519_multibase: String,
+    /// Peer's ML-DSA-65 mesh verifying key as a `Multikey` `publicKeyMultibase`
+    /// string (base58btc `z…`, multicodec `ml-dsa-65-pub` `0x1211`). The trusted
+    /// post-quantum key bound to `ed25519_multibase`.
+    pub mldsa65_multibase: String,
+}
+
+/// Protocol kind for an external OAuth/OIDC provider.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderKind {
+    /// Full OpenID Connect — discovery document + id_token JWT verification. Default.
+    #[default]
+    Oidc,
+    /// Generic OAuth 2.0 with a userinfo endpoint. No discovery, no id_token.
+    /// Requires `authorization_endpoint`, `token_endpoint_url`, and `userinfo_endpoint`.
+    OAuth2,
+}
+
+/// Claim field name overrides for mapping a userinfo JSON response to standard claims.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimMapping {
+    /// Field name for the stable subject identifier. Default: `"sub"`.
+    /// GitHub uses `"id"` (numeric integer, coerced to string).
+    /// Discord uses `"id"` (string snowflake).
+    #[serde(default = "default_claim_sub")]
+    pub sub: String,
+    /// Field name for display name. `None` omits the name from the synthetic claims.
+    #[serde(default = "default_claim_name")]
+    pub name: Option<String>,
+    /// Field name for email address. `None` omits email.
+    #[serde(default = "default_claim_email")]
+    pub email: Option<String>,
+    /// Field name for the email-verified boolean.
+    /// `None`, or a field that is absent/null in the response, is treated as `false`.
+    #[serde(default = "default_claim_email_verified")]
+    pub email_verified: Option<String>,
+}
+
+impl Default for ClaimMapping {
+    fn default() -> Self {
+        Self {
+            sub: default_claim_sub(),
+            name: default_claim_name(),
+            email: default_claim_email(),
+            email_verified: default_claim_email_verified(),
+        }
+    }
+}
+
+fn default_claim_sub() -> String { "sub".into() }
+fn default_claim_name() -> Option<String> { Some("name".into()) }
+fn default_claim_email() -> Option<String> { Some("email".into()) }
+fn default_claim_email_verified() -> Option<String> { Some("email_verified".into()) }
+
+/// Configuration for an external OIDC provider (login delegation).
+///
+/// Hyprstream acts as an OIDC Relying Party to this provider. Users authenticate
+/// with the provider; hyprstream validates the external id_token and issues its
+/// own JWT with scopes from the policy engine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OidcProviderConfig {
+    /// Provider protocol kind. Default: `"oidc"`.
+    #[serde(default)]
+    pub kind: ProviderKind,
+    /// OIDC issuer URL. Required for `kind = "oidc"`.
+    /// Must support `/.well-known/openid-configuration`.
+    #[serde(default)]
+    pub issuer_url: Option<String>,
+    /// Authorization endpoint URL. Required for `kind = "oauth2"`.
+    #[serde(default)]
+    pub authorization_endpoint: Option<String>,
+    /// Token endpoint URL. Required for `kind = "oauth2"`. Named `token_endpoint_url`
+    /// to avoid collision with method names on OIDC metadata types.
+    #[serde(default)]
+    pub token_endpoint_url: Option<String>,
+    /// Userinfo endpoint URL. Required for `kind = "oauth2"`.
+    #[serde(default)]
+    pub userinfo_endpoint: Option<String>,
+    /// Whether the provider supports PKCE (`code_challenge`). Default: `true`.
+    /// Set to `false` for providers that reject the parameter (e.g. GitHub).
+    #[serde(default = "default_pkce_supported")]
+    pub pkce_supported: bool,
+    /// Claim field name overrides for mapping userinfo JSON to synthetic claims.
+    #[serde(default)]
+    pub claim_mapping: ClaimMapping,
+    /// Client ID registered with the external provider.
+    pub client_id: String,
+    /// Client secret (optional — omit for public client with PKCE).
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// Scopes to request from the provider.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Display name for the login UI (e.g., "Sign in with GitHub").
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Allow plain HTTP for discovery (dev only).
+    #[serde(default)]
+    pub allow_http: bool,
+    /// User identity mapping strategy.
+    #[serde(default)]
+    pub user_mapping: UserMappingStrategy,
+    /// User provisioning mode.
+    #[serde(default)]
+    pub provisioning: ProvisioningMode,
+    /// Allowed email domains (when provisioning = allowlist).
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    /// Default hyprstream scopes for auto-provisioned users.
+    #[serde(default)]
+    pub default_scopes: Vec<String>,
+    /// Clock skew tolerance for JWT validation (seconds). OIDC only.
+    #[serde(default = "default_clock_skew")]
+    pub clock_skew_seconds: u64,
+}
+
+fn default_pkce_supported() -> bool { true }
+
+impl OidcProviderConfig {
+    pub fn effective_authorization_endpoint(&self) -> Option<&str> {
+        self.authorization_endpoint.as_deref()
+    }
+
+    pub fn effective_token_endpoint_url(&self) -> Option<&str> {
+        self.token_endpoint_url.as_deref()
+    }
+
+    pub fn effective_userinfo_endpoint(&self) -> Option<&str> {
+        self.userinfo_endpoint.as_deref()
+    }
+
+    pub fn effective_pkce_supported(&self) -> bool {
+        self.pkce_supported
+    }
+
+    pub fn effective_claim_mapping(&self) -> ClaimMapping {
+        self.claim_mapping.clone()
+    }
+
+    pub fn effective_scopes(&self) -> Vec<String> {
+        if !self.scopes.is_empty() {
+            return self.scopes.clone();
+        }
+        match self.kind {
+            ProviderKind::Oidc => default_oidc_scopes(),
+            ProviderKind::OAuth2 => vec![],
+        }
+    }
+}
+
+fn default_oidc_scopes() -> Vec<String> {
+    vec!["openid".into(), "profile".into(), "email".into()]
+}
+fn default_clock_skew() -> u64 { 60 }
+
+/// How to map an external OIDC identity to a local hyprstream subject.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum UserMappingStrategy {
+    /// `provider_slug:external_sub` (e.g., `keycloak:12345`). Default.
+    #[default]
+    Namespaced,
+    /// Use the `email` claim (requires `email_verified=true`).
+    Email,
+    /// Use a specific claim value.
+    Claim {
+        /// The claim name to use as the local subject.
+        name: String,
+    },
+    /// `did:web:{issuer_authority}:users:{external_sub}` per Phase 0.5
+    /// architecture-doc Subject Identity Format.
+    ///
+    /// Uses the OAuth issuer URL's authority (host[:port]) as the DID
+    /// method-specific identifier and the external `sub` claim as the
+    /// user path component. Example: `did:web:hyprstream.example.com:users:12345`.
+    ///
+    /// **Opt-in**: existing deployments continue to use [`Namespaced`] by
+    /// default so Casbin policies don't break. Operators migrating to
+    /// did:web should land Phase 0e (Casbin policy migration) before
+    /// switching this strategy.
+    DidWeb,
+}
+
+/// Whether to auto-create users on first external login.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ProvisioningMode {
+    /// Reject unknown users (admin must pre-create).
+    #[default]
+    Deny,
+    /// Auto-provision on first login.
+    Auto,
+    /// Auto-provision only for matching `allowed_domains`.
+    Allowlist,
+}
 
 /// OAuth 2.1 authorization server configuration
 ///
@@ -289,6 +989,119 @@ pub struct OAuthConfig {
     /// Refresh token TTL in seconds (default: 72 hours)
     #[serde(default = "default_refresh_token_ttl")]
     pub refresh_token_ttl_seconds: u32,
+
+    /// TLS certificate path (optional, overrides global [tls])
+    #[serde(default)]
+    pub tls_cert: Option<PathBuf>,
+
+    /// TLS private key path (optional, overrides global [tls])
+    #[serde(default)]
+    pub tls_key: Option<PathBuf>,
+
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
+
+    /// CORS configuration for the OAuth HTTP server
+    #[serde(default = "default_oauth_cors")]
+    pub cors: server::CorsConfig,
+
+    /// Trusted external OIDC issuers for federation.
+    /// Key = issuer URL (must match JWT `iss` claim exactly).
+    /// Value = configuration for fetching/caching that issuer's JWKS.
+    #[serde(default)]
+    pub trusted_issuers: std::collections::HashMap<String, TrustedIssuerConfig>,
+
+    /// Trusted mesh peers' post-quantum signing identities (#157).
+    /// Key = an operator-chosen peer label (informational only).
+    /// Value = the peer's Ed25519 mesh signer key + ML-DSA-65 mesh verifying
+    /// key, supplied inline as out-of-band `Multikey` strings. Populates the
+    /// process-global `KeyedPqTrustStore` eagerly at startup (admin-anchored,
+    /// immutable). Empty = empty store = unchanged behavior (Hybrid fails
+    /// closed for unknown peers). Distinct from `trusted_issuers`.
+    #[serde(default)]
+    pub mesh_peers: std::collections::HashMap<String, MeshPeerConfig>,
+
+    /// OpenID Federation 1.0 Trust Anchor URLs (optional).
+    /// When set, included as `authority_hints` in the entity configuration JWT,
+    /// making this node discoverable within the named federations.
+    /// Example: `["https://federation.example.org"]`
+    #[serde(default)]
+    pub authority_hints: Vec<String>,
+
+    /// External OIDC providers for login delegation (IdP-agnostic).
+    ///
+    /// Users authenticate with the external provider; hyprstream validates the
+    /// external id_token and issues its own JWT with scopes from the policy engine.
+    /// Separate from `trusted_issuers` which is for hyprstream federation (direct
+    /// JWT acceptance between nodes).
+    #[serde(default)]
+    pub oidc_providers: std::collections::HashMap<String, OidcProviderConfig>,
+
+    /// Hex-encoded Ed25519 private key bytes for the local user identity (bypasses OS keyring).
+    ///
+    /// **TEST USE ONLY.** Set via `HYPRSTREAM__OAUTH__USER_SIGNING_KEY` env var.
+    /// Allows the `sign-challenge` CLI and wizard to use a pre-generated key in
+    /// isolated test environments without a keyring daemon.
+    /// Never set this in production config files.
+    #[serde(default, skip_serializing)]
+    pub user_signing_key: Option<String>,
+
+    /// How long to cache a third-party OAuth client's JWKS fetched
+    /// via `jwks_uri` (RFC 7591 §2.1). Applies to `private_key_jwt`
+    /// client authentication at the token endpoint.
+    ///
+    /// Clients that rotate signing keys faster than this should keep
+    /// the old key in their JWKS for at least one cache window so
+    /// verification spans the rotation (standard JWKS rotation
+    /// hygiene). Default: 3600 seconds (1 hour).
+    ///
+    /// Distinct from `trusted_issuers[*].jwks_cache_ttl_secs` (which
+    /// configures hyprstream federation peers, not OAuth clients).
+    #[serde(default = "default_client_jwks_uri_cache_ttl")]
+    pub client_jwks_uri_cache_ttl_secs: u64,
+
+    /// How many days a JWT signing key remains in the active (issuance) slot.
+    #[serde(default = "default_jwt_key_active_days")]
+    pub jwt_key_active_days: u32,
+
+    /// How many days before active-key expiry a lead key is pre-generated.
+    #[serde(default = "default_jwt_key_lead_days")]
+    pub jwt_key_lead_days: u32,
+
+    /// How many extra days after active-key expiry the drain key remains in JWKS for verification.
+    #[serde(default = "default_jwt_key_drain_days")]
+    pub jwt_key_drain_days: u32,
+
+    /// Override active key lifetime in seconds (takes precedence over `jwt_key_active_days`).
+    /// Intended for integration tests with short rotation cycles.
+    #[serde(default)]
+    pub jwt_key_active_secs: Option<u32>,
+
+    /// Override lead key pre-generation window in seconds (takes precedence over `jwt_key_lead_days`).
+    #[serde(default)]
+    pub jwt_key_lead_secs: Option<u32>,
+
+    /// Override drain key retention window in seconds (takes precedence over `jwt_key_drain_days`).
+    #[serde(default)]
+    pub jwt_key_drain_secs: Option<u32>,
+
+    /// Override rotation check interval in seconds (default: 21600 = 6 hours).
+    #[serde(default)]
+    pub jwt_key_rotation_check_secs: Option<u64>,
+
+    /// Enforce RFC 9126 Pushed Authorization Requests at `/oauth/authorize`.
+    ///
+    /// When `true`, the authorization endpoint rejects any request that does
+    /// not arrive via a `request_uri` referencing a prior `/oauth/par` call.
+    /// Advertised in server metadata as `require_pushed_authorization_requests`.
+    /// Defaults to `false` for compatibility.
+    #[serde(default)]
+    pub require_pushed_authorization_requests: bool,
+}
+
+fn default_oauth_cors() -> server::CorsConfig {
+    server::CorsConfig::public()
 }
 
 impl Default for OAuthConfig {
@@ -300,24 +1113,118 @@ impl Default for OAuthConfig {
             default_scopes: default_oauth_scopes(),
             token_ttl_seconds: default_oauth_token_ttl(),
             refresh_token_ttl_seconds: default_refresh_token_ttl(),
+            client_jwks_uri_cache_ttl_secs: default_client_jwks_uri_cache_ttl(),
+            tls_cert: None,
+            tls_key: None,
+            quic_port: None,
+            cors: default_oauth_cors(),
+            trusted_issuers: std::collections::HashMap::new(),
+            mesh_peers: std::collections::HashMap::new(),
+            authority_hints: Vec::new(),
+            oidc_providers: std::collections::HashMap::new(),
+            user_signing_key: None,
+            jwt_key_active_days: default_jwt_key_active_days(),
+            jwt_key_lead_days: default_jwt_key_lead_days(),
+            jwt_key_drain_days: default_jwt_key_drain_days(),
+            jwt_key_active_secs: None,
+            jwt_key_lead_secs: None,
+            jwt_key_drain_secs: None,
+            jwt_key_rotation_check_secs: None,
+            require_pushed_authorization_requests: false,
         }
     }
 }
 
 impl OAuthConfig {
+    /// Active key lifetime in seconds (`_secs` override wins over `_days * 86400`).
+    pub fn active_secs(&self) -> i64 {
+        self.jwt_key_active_secs.map_or_else(
+            || i64::from(self.jwt_key_active_days) * 86400,
+            i64::from,
+        )
+    }
+
+    /// Lead pre-generation window in seconds.
+    pub fn lead_secs(&self) -> i64 {
+        self.jwt_key_lead_secs.map_or_else(
+            || i64::from(self.jwt_key_lead_days) * 86400,
+            i64::from,
+        )
+    }
+
+    /// Drain retention window in seconds.
+    pub fn drain_secs(&self) -> i64 {
+        self.jwt_key_drain_secs.map_or_else(
+            || i64::from(self.jwt_key_drain_days) * 86400,
+            i64::from,
+        )
+    }
+
+    /// Rotation check interval (default 6 hours).
+    pub fn rotation_check_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.jwt_key_rotation_check_secs.unwrap_or(6 * 3600))
+    }
+
     /// Get the issuer URL, using external_url if set, otherwise deriving from host:port.
+    /// Auto-derives `https://` when global TLS is enabled.
     pub fn issuer_url(&self) -> String {
         if let Some(ref url) = self.external_url {
             url.clone()
         } else {
+            let scheme = if HyprConfig::load().map(|c| c.tls.enabled).unwrap_or(false) {
+                "https"
+            } else {
+                "http"
+            };
             let host = if self.host == "0.0.0.0" { "localhost" } else { &self.host };
-            format!("http://{}:{}", host, self.port)
+            format!("{scheme}://{host}:{}", self.port)
         }
     }
 }
 
 fn default_oauth_host() -> String { "0.0.0.0".to_owned() }
 fn default_oauth_port() -> u16 { 6791 }
+
+/// Which backend stores user credentials and refresh tokens.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CredentialsBackend {
+    #[default]
+    Rocksdb,
+    Valkey,
+}
+
+/// Valkey connection settings (used when `backend = "valkey"`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValkeyCredentialsConfig {
+    #[serde(default = "default_valkey_url")]
+    pub url: String,
+}
+
+fn default_valkey_url() -> String { "redis://127.0.0.1:6379".to_owned() }
+
+impl Default for ValkeyCredentialsConfig {
+    fn default() -> Self { Self { url: default_valkey_url() } }
+}
+
+/// Credentials storage configuration.
+///
+/// Selects the backend for user profiles, pubkeys, and refresh tokens.
+///
+/// # Example TOML
+/// ```toml
+/// [credentials]
+/// backend = "valkey"
+/// [credentials.valkey]
+/// url = "redis://127.0.0.1:6379"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CredentialsConfig {
+    #[serde(default)]
+    pub backend: CredentialsBackend,
+    #[serde(default)]
+    pub valkey: ValkeyCredentialsConfig,
+}
 fn default_oauth_scopes() -> Vec<String> {
     vec![
         "read:*:*".to_owned(),
@@ -326,27 +1233,88 @@ fn default_oauth_scopes() -> Vec<String> {
     ]
 }
 fn default_oauth_token_ttl() -> u32 { 3600 }
-fn default_refresh_token_ttl() -> u32 { 259_200 } // 72 hours
+fn default_refresh_token_ttl() -> u32 { 2_628_000 } // 730 hours (~30 days)
+fn default_client_jwks_uri_cache_ttl() -> u64 { 3600 } // 1 hour
+fn default_jwt_key_active_days() -> u32 { 14 }
+fn default_jwt_key_lead_days() -> u32 { 7 }
+fn default_jwt_key_drain_days() -> u32 { 30 }
 
 /// StreamService configuration
 ///
-/// Controls the PULL/XPUB streaming proxy behavior including buffer sizes,
-/// message TTL, retransmission settings, and StreamBlock batching.
+/// RPC transport server tunables. Mirrors `hyprstream_rpc::transport::rpc_session::RpcConfig`
+/// so operators can tune these via the config file or `HYPRSTREAM__RPC__*` env vars.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcServerConfig {
+    /// Max concurrent in-flight bidi streams (server-wide semaphore).
+    #[serde(default = "default_rpc_stream_limit")]
+    pub stream_limit: usize,
+    /// Max concurrent accepted connections per server.
+    #[serde(default = "default_rpc_connection_limit")]
+    pub connection_limit: usize,
+    /// Max wall-clock seconds to read a single request frame.
+    #[serde(default = "default_rpc_request_read_timeout_secs")]
+    pub request_read_timeout_secs: u64,
+    /// Max seconds for a peer's QUIC/WebTransport handshake to complete.
+    #[serde(default = "default_rpc_handshake_timeout_secs")]
+    pub handshake_timeout_secs: u64,
+    /// Grace period (seconds) after writing a response for the peer to ack FIN.
+    #[serde(default = "default_rpc_stopped_grace_secs")]
+    pub stopped_grace_secs: u64,
+    /// Max seconds for graceful drain on shutdown.
+    #[serde(default = "default_rpc_drain_timeout_secs")]
+    pub drain_timeout_secs: u64,
+}
+
+impl Default for RpcServerConfig {
+    fn default() -> Self {
+        use hyprstream_rpc::transport::rpc_session as rpc;
+        Self {
+            stream_limit: rpc::DEFAULT_STREAM_LIMIT,
+            connection_limit: rpc::DEFAULT_CONNECTION_LIMIT,
+            request_read_timeout_secs: rpc::REQUEST_READ_TIMEOUT.as_secs(),
+            handshake_timeout_secs: rpc::HANDSHAKE_TIMEOUT.as_secs(),
+            stopped_grace_secs: rpc::STOPPED_GRACE.as_secs(),
+            drain_timeout_secs: rpc::DRAIN_TIMEOUT.as_secs(),
+        }
+    }
+}
+
+fn default_rpc_stream_limit() -> usize { hyprstream_rpc::transport::rpc_session::DEFAULT_STREAM_LIMIT }
+fn default_rpc_connection_limit() -> usize { hyprstream_rpc::transport::rpc_session::DEFAULT_CONNECTION_LIMIT }
+fn default_rpc_request_read_timeout_secs() -> u64 { hyprstream_rpc::transport::rpc_session::REQUEST_READ_TIMEOUT.as_secs() }
+fn default_rpc_handshake_timeout_secs() -> u64 { hyprstream_rpc::transport::rpc_session::HANDSHAKE_TIMEOUT.as_secs() }
+fn default_rpc_stopped_grace_secs() -> u64 { hyprstream_rpc::transport::rpc_session::STOPPED_GRACE.as_secs() }
+fn default_rpc_drain_timeout_secs() -> u64 { hyprstream_rpc::transport::rpc_session::DRAIN_TIMEOUT.as_secs() }
+
+impl RpcServerConfig {
+    /// Convert to the `hyprstream_rpc` wire type consumed by server builders.
+    // TODO: wire into serve_bridged / QuinnRpcServer init paths (tracking issue #197)
+    pub fn to_rpc_config(&self) -> hyprstream_rpc::transport::rpc_session::RpcConfig {
+        use std::time::Duration;
+        hyprstream_rpc::transport::rpc_session::RpcConfig {
+            stream_limit: self.stream_limit,
+            connection_limit: self.connection_limit,
+            request_read_timeout: Duration::from_secs(self.request_read_timeout_secs),
+            handshake_timeout: Duration::from_secs(self.handshake_timeout_secs),
+            stopped_grace: Duration::from_secs(self.stopped_grace_secs),
+            drain_timeout: Duration::from_secs(self.drain_timeout_secs),
+        }
+    }
+}
+
+/// moq streaming plane configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamingConfig {
-    /// Maximum pending messages per topic (for pre-subscribe queue and retransmit buffer)
-    /// Default: 1000
-    #[serde(default = "default_max_pending_per_topic")]
+    /// Deprecated ZMQ-era field — no longer used. Retained for config compat.
+    #[serde(default = "default_max_pending_per_topic", skip_serializing)]
     pub max_pending_per_topic: usize,
 
-    /// Message TTL in seconds - messages older than this are dropped
-    /// Default: 30
-    #[serde(default = "default_message_ttl_secs")]
+    /// Deprecated ZMQ-era field — no longer used. Retained for config compat.
+    #[serde(default = "default_message_ttl_secs", skip_serializing)]
     pub message_ttl_secs: u64,
 
-    /// Interval between compaction runs in seconds
-    /// Default: 5
-    #[serde(default = "default_compact_interval_secs")]
+    /// Deprecated ZMQ-era field — no longer used. Retained for config compat.
+    #[serde(default = "default_compact_interval_secs", skip_serializing)]
     pub compact_interval_secs: u64,
 
     /// StreamBlock batching configuration (rate control)
@@ -356,6 +1324,29 @@ pub struct StreamingConfig {
     /// Lower rates → smaller batches (reduced latency).
     #[serde(flatten, default)]
     pub batching: hyprstream_rpc::streaming::BatchingConfig,
+
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
+
+    /// Timeout (seconds) waiting for the moq origin to announce a broadcast.
+    /// Default: 10
+    // TODO: wire into moq_stream.rs BROADCAST_ANNOUNCE_TIMEOUT constant (tracking issue #NNN)
+    #[serde(default = "default_broadcast_announce_timeout_secs")]
+    pub broadcast_announce_timeout_secs: u64,
+
+    /// Timeout (seconds) between consecutive moq Groups on a subscribed track.
+    /// A subscriber that sees no new Group for this long treats the publisher as gone.
+    /// Default: 30
+    // TODO: wire into moq_stream.rs GROUP_IDLE_TIMEOUT constant (tracking issue #NNN)
+    #[serde(default = "default_group_idle_timeout_secs")]
+    pub group_idle_timeout_secs: u64,
+
+    /// Timeout (seconds) reading a single Frame from an already-opened moq Group.
+    /// Default: 5
+    // TODO: wire into moq_stream.rs FRAME_READ_TIMEOUT constant (tracking issue #NNN)
+    #[serde(default = "default_frame_read_timeout_secs")]
+    pub frame_read_timeout_secs: u64,
 }
 
 impl Default for StreamingConfig {
@@ -365,6 +1356,10 @@ impl Default for StreamingConfig {
             message_ttl_secs: default_message_ttl_secs(),
             compact_interval_secs: default_compact_interval_secs(),
             batching: hyprstream_rpc::streaming::BatchingConfig::default(),
+            quic_port: None,
+            broadcast_announce_timeout_secs: default_broadcast_announce_timeout_secs(),
+            group_idle_timeout_secs: default_group_idle_timeout_secs(),
+            frame_read_timeout_secs: default_frame_read_timeout_secs(),
         }
     }
 }
@@ -372,6 +1367,15 @@ impl Default for StreamingConfig {
 fn default_max_pending_per_topic() -> usize { 1000 }
 fn default_message_ttl_secs() -> u64 { 30 }
 fn default_compact_interval_secs() -> u64 { 5 }
+fn default_broadcast_announce_timeout_secs() -> u64 {
+    hyprstream_rpc::moq_stream::BROADCAST_ANNOUNCE_TIMEOUT.as_secs()
+}
+fn default_group_idle_timeout_secs() -> u64 {
+    hyprstream_rpc::moq_stream::GROUP_IDLE_TIMEOUT.as_secs()
+}
+fn default_frame_read_timeout_secs() -> u64 {
+    hyprstream_rpc::moq_stream::FRAME_READ_TIMEOUT.as_secs()
+}
 
 /// Storage paths and directories configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -416,6 +1420,105 @@ impl Default for StorageConfig {
     }
 }
 
+/// Event proxy service configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EventServiceConfig {
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
+}
+
+/// Registry service configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RegistryServiceConfig {
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
+}
+
+/// Policy service configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PolicyServiceConfig {
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
+}
+
+/// Discovery service configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DiscoveryServiceConfig {
+    /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
+}
+
+/// TUI display server configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuiServiceConfig {
+    /// QUIC/WebTransport port for TUI viewers. None = no QUIC.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
+    /// Maximum concurrent sessions.
+    #[serde(default = "default_tui_max_sessions")]
+    pub max_sessions: u32,
+    /// Scrollback lines per pane.
+    #[serde(default = "default_tui_scrollback")]
+    pub scrollback_lines: usize,
+    /// WebTransport certificate validity in days (max 14).
+    #[serde(default = "default_tui_wt_cert_days")]
+    pub wt_cert_validity_days: u32,
+}
+
+fn default_tui_max_sessions() -> u32 { 16 }
+fn default_tui_scrollback() -> usize { 2000 }
+fn default_tui_wt_cert_days() -> u32 { 14 }
+
+impl Default for TuiServiceConfig {
+    fn default() -> Self {
+        Self {
+            quic_port: None,
+            max_sessions: default_tui_max_sessions(),
+            scrollback_lines: default_tui_scrollback(),
+            wt_cert_validity_days: default_tui_wt_cert_days(),
+        }
+    }
+}
+
+/// Metrics service configuration (DuckDB-backed time-series ingest + DataFusion query).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsConfig {
+    /// DuckDB connection string. ":memory:" for in-process, or a file path.
+    /// Use the same path as flight config to share data between services.
+    #[serde(default = "default_metrics_db")]
+    pub db_path: String,
+
+    /// Background checkpoint interval in seconds. 0 = disabled.
+    #[serde(default = "default_checkpoint_interval_secs")]
+    pub checkpoint_interval_secs: u64,
+
+    /// QUIC/WebTransport port. None = no QUIC.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
+}
+
+fn default_metrics_db() -> String {
+    ":memory:".to_owned()
+}
+
+fn default_checkpoint_interval_secs() -> u64 {
+    300
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            db_path: default_metrics_db(),
+            checkpoint_interval_secs: default_checkpoint_interval_secs(),
+            quic_port: None,
+        }
+    }
+}
+
 /// Service management configuration
 ///
 /// Controls which services are started at startup in ipc-systemd mode.
@@ -442,13 +1545,17 @@ fn default_startup_services() -> Vec<String> {
         "event".to_owned(),     // Must start first (message bus)
         "registry".to_owned(),  // Model registry
         "policy".to_owned(),    // Authorization
-        "streams".to_owned(),   // Streaming proxy with JWT validation
-        "worker".to_owned(),    // Container workloads
-        "model".to_owned(),     // Model management
+        "streams".to_owned(),       // Streaming proxy with JWT validation
+        "notification".to_owned(),  // Encrypted notification relay (uses streams)
+        "worker".to_owned(),        // Container workloads
+        "model".to_owned(),         // Model management (publishes to notification)
         "oauth".to_owned(),     // OAuth 2.1 authorization server
         "oai".to_owned(),       // OpenAI-compatible HTTP API
         "flight".to_owned(),    // Arrow Flight SQL server
+        "discovery".to_owned(), // Endpoint discovery (RFC 9728 metadata)
         "mcp".to_owned(),       // Model Context Protocol service
+        "tui".to_owned(),       // Terminal multiplexer display server
+        "metrics".to_owned(),   // Metrics ingest and query (DuckDB/DataFusion)
     ]
 }
 
@@ -463,6 +1570,9 @@ pub struct ModelConfig {
     pub architecture: String,
     /// Expected parameter count
     pub parameters: Option<u64>,
+    /// QUIC/WebTransport port for model service. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
 }
 
 impl Default for ModelConfig {
@@ -472,6 +1582,7 @@ impl Default for ModelConfig {
             name: String::new(),
             architecture: String::new(),
             parameters: None,
+            quic_port: None,
         }
     }
 }
@@ -484,19 +1595,43 @@ pub struct RuntimeConfig {
     /// Maximum context length override for KV cache allocation.
     /// None = use model's max_position_embeddings (can be very large, e.g., 40K tokens)
     /// Some(n) = cap KV cache at n tokens (significantly reduces GPU memory)
-    pub max_context: Option<usize>,
+    pub max_context: Option<u32>,
     /// KV cache quantization type (None, INT8, NF4, FP4).
     /// Reduces GPU memory by 50-75% at slight quality cost.
     #[serde(default)]
-    pub kv_quant_type: crate::runtime::kv_quant::KVQuantType,
+    pub kv_quant_type: crate::runtime::KVQuantType,
     /// Batch processing size
     pub batch_size: usize,
     /// CPU threads (None = auto-detect)
     pub cpu_threads: Option<usize>,
     /// Use GPU acceleration
     pub use_gpu: bool,
-    /// GPU device ID (None = auto-detect, typically device 0)
+    /// GPU device ID (None = auto-detect, typically device 0).
+    ///
+    /// Legacy single-GPU selector. For multi-GPU, prefer [`Self::devices`];
+    /// this field remains the back-compat fallback when `devices` is empty.
     pub gpu_device_id: Option<usize>,
+    /// Explicit set of GPU device indices for multi-GPU (#313, epic #310).
+    ///
+    /// Empty = unset → fall back to the single [`Self::gpu_device_id`] /
+    /// `HYPRSTREAM_GPU_DEVICE` (existing single-GPU behavior is unchanged).
+    /// Parsed from `HYPRSTREAM_GPU_DEVICES` (comma-separated, e.g. `0,1`).
+    /// Resolution + validation lives in [`Self::resolve_device_indices`] and is
+    /// consumed by `runtime::DevicePool`.
+    #[serde(default)]
+    pub devices: Vec<usize>,
+    /// Fail fast when a *requested* GPU is unavailable instead of silently
+    /// downgrading to CPU (#315, epic #310).
+    ///
+    /// A process told to run on GPU 3 that silently lands on CPU tanks a pipeline
+    /// split, so strictness is the safe default for the multi-GPU path. This only
+    /// affects the case where a GPU was *explicitly* requested (`use_gpu` with an
+    /// explicit `gpu_device_id`/`devices`); pure auto-detect (`use_gpu` with no
+    /// device requested) still falls back to CPU so the legacy single-GPU
+    /// "use a GPU if there is one" behavior is unchanged.
+    /// Defaults to `true`; override with `HYPRSTREAM_STRICT_DEVICE=0`.
+    #[serde(default = "default_strict_device")]
+    pub strict_device: bool,
     /// GPU layers to offload (None = auto)
     pub gpu_layers: Option<usize>,
     /// Use memory mapping for model files
@@ -510,6 +1645,50 @@ pub struct RuntimeConfig {
     pub max_concurrent_generations: usize,
     pub default_generation_timeout_ms: u64,
     pub default_model_load_timeout_ms: u64,
+
+    /// Continuous / in-flight batching (#329, epic #310). **Default: off.**
+    ///
+    /// When enabled, the inference scheduler groups concurrent decode steps of
+    /// same-tenant-delta sequences into a single batched forward (Llama only).
+    /// When off, each stream runs the unchanged batch=1 decode path. Override
+    /// with `HYPRSTREAM_CONTINUOUS_BATCH` (truthy = on). Off by default while the
+    /// scheduler wiring lands incrementally — the batched kernel is correctness-
+    /// gated by `batched_ragged_decode_matches_serial`.
+    #[serde(default = "default_continuous_batching")]
+    pub continuous_batching: bool,
+    /// Max sequences fused into one batched decode step when
+    /// [`Self::continuous_batching`] is on (spike default 16). Tunable via
+    /// `HYPRSTREAM_CONTINUOUS_BATCH_MAX`.
+    #[serde(default = "default_continuous_batch_max")]
+    pub continuous_batch_max: usize,
+}
+
+/// Default for [`RuntimeConfig::continuous_batching`]: off unless
+/// `HYPRSTREAM_CONTINUOUS_BATCH` is set truthy (#329). Off is the safe default —
+/// the batch=1 path is the verified reference.
+fn default_continuous_batching() -> bool {
+    std::env::var("HYPRSTREAM_CONTINUOUS_BATCH")
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// Default for [`RuntimeConfig::continuous_batch_max`] (#329): 16 (spike rec),
+/// overridable via `HYPRSTREAM_CONTINUOUS_BATCH_MAX`.
+fn default_continuous_batch_max() -> usize {
+    std::env::var("HYPRSTREAM_CONTINUOUS_BATCH_MAX")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(16)
+}
+
+/// Default for [`RuntimeConfig::strict_device`]: strict (fail-fast) unless
+/// `HYPRSTREAM_STRICT_DEVICE` is set to a falsy value. Strictness is the safe
+/// default for the multi-GPU path (#315).
+fn default_strict_device() -> bool {
+    std::env::var("HYPRSTREAM_STRICT_DEVICE")
+        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true)
 }
 
 impl Default for RuntimeConfig {
@@ -521,20 +1700,29 @@ impl Default for RuntimeConfig {
             .ok()
             .and_then(|s| s.parse::<usize>().ok());
 
+        // `devices` is populated leniently here (Default cannot return errors);
+        // the authoritative strict parse + validation lives in
+        // `RuntimeConfig::resolve_device_indices`, which re-reads the env var and
+        // turns parse errors into hard errors.
+        let devices = std::env::var("HYPRSTREAM_GPU_DEVICES")
+            .ok()
+            .and_then(|s| Self::parse_device_list(&s).ok())
+            .unwrap_or_default();
+
         let max_context = std::env::var("HYPRSTREAM_MAX_CONTEXT")
             .ok()
-            .and_then(|s| s.parse::<usize>().ok());
+            .and_then(|s| s.parse::<u32>().ok());
 
         let kv_quant_type = std::env::var("HYPRSTREAM_KV_QUANT")
             .ok()
             .and_then(|s| match s.to_lowercase().as_str() {
-                "int8" => Some(crate::runtime::kv_quant::KVQuantType::Int8),
-                "nf4" => Some(crate::runtime::kv_quant::KVQuantType::Nf4),
-                "fp4" => Some(crate::runtime::kv_quant::KVQuantType::Fp4),
-                "none" | "" => Some(crate::runtime::kv_quant::KVQuantType::None),
+                "int8" => Some(crate::runtime::KVQuantType::Int8),
+                "nf4" => Some(crate::runtime::KVQuantType::Nf4),
+                "fp4" => Some(crate::runtime::KVQuantType::Fp4),
+                "none" | "" => Some(crate::runtime::KVQuantType::None),
                 _ => None,
             })
-            .unwrap_or(crate::runtime::kv_quant::KVQuantType::None);
+            .unwrap_or(crate::runtime::KVQuantType::None);
 
         Self {
             context_length: 4096,
@@ -544,6 +1732,8 @@ impl Default for RuntimeConfig {
             cpu_threads: None,
             use_gpu: true,
             gpu_device_id, // From env or None (auto-detect device 0)
+            devices,       // From HYPRSTREAM_GPU_DEVICES or empty (→ fall back to gpu_device_id)
+            strict_device: default_strict_device(),
             gpu_layers: None,
             mmap: true,
             kv_cache_size_mb: 2048,
@@ -552,7 +1742,98 @@ impl Default for RuntimeConfig {
             max_concurrent_generations: 10,
             default_generation_timeout_ms: 120000, // 2 minutes
             default_model_load_timeout_ms: 300000, // 5 minutes
+            continuous_batching: default_continuous_batching(),
+            continuous_batch_max: default_continuous_batch_max(),
         }
+    }
+}
+
+impl RuntimeConfig {
+    /// Parse a comma-separated GPU device list (e.g. `"0,1"`), strictly.
+    ///
+    /// Whitespace around entries is trimmed. Any non-numeric entry, or a
+    /// trailing/empty field (e.g. `"0,"` or `"0,,1"`), is a hard error — there
+    /// is no silent default. Returns the parsed indices (possibly with
+    /// duplicates; dedup/validation is the caller's job).
+    fn parse_device_list(raw: &str) -> anyhow::Result<Vec<usize>> {
+        raw.split(',')
+            .map(|part| {
+                let trimmed = part.trim();
+                trimmed.parse::<usize>().map_err(|e| {
+                    anyhow::anyhow!(
+                        "invalid GPU device index {trimmed:?} in HYPRSTREAM_GPU_DEVICES={raw:?}: {e}"
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Resolve the explicitly-requested *multi-GPU* device set, fail-fast.
+    ///
+    /// This is the seam the multi-GPU foundation uses to decide whether to engage
+    /// the new `DevicePool` path. It considers **only** the explicit multi-GPU
+    /// inputs and deliberately excludes the legacy single [`Self::gpu_device_id`]
+    /// so that existing single-GPU behavior is left entirely on its old code
+    /// path (#313 introduces the pool without changing single-GPU runtime
+    /// behavior). Precedence:
+    ///
+    /// 1. `HYPRSTREAM_GPU_DEVICES` env var (re-parsed here strictly, so a
+    ///    malformed value is a hard error rather than a silent fallback).
+    /// 2. The [`Self::devices`] field (e.g. from a config file / CLI).
+    ///
+    /// Returns `Ok(None)` when no explicit multi-GPU set was requested,
+    /// `Ok(Some(indices))` (non-empty, duplicate-free) otherwise, and `Err` on
+    /// parse errors or duplicate indices.
+    pub fn resolve_explicit_multi_device_indices(&self) -> anyhow::Result<Option<Vec<usize>>> {
+        // (1) env var wins and is parsed strictly here. An absent or
+        //     empty/whitespace-only value is treated as "unset" so resolution
+        //     falls through to (2) the struct field (config file / CLI).
+        let env_raw = std::env::var("HYPRSTREAM_GPU_DEVICES").ok();
+        let env_trimmed = env_raw.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let indices = match env_trimmed {
+            Some(raw) => Self::parse_device_list(raw)?,
+            None => self.devices.clone(),
+        };
+
+        Self::validate_index_set(indices)
+    }
+
+    /// Resolve the GPU device indices to use, fail-fast, including the legacy
+    /// single-GPU fallback.
+    ///
+    /// This is the full-precedence resolver consumed by
+    /// `runtime::DevicePool::from_config`. It is
+    /// [`Self::resolve_explicit_multi_device_indices`] plus a final fallback to
+    /// the legacy single [`Self::gpu_device_id`] (mapped to a one-element set),
+    /// preserving back-compat for callers that build a pool directly from config.
+    ///
+    /// `Ok(None)` means nothing was requested (caller should auto-detect).
+    pub fn resolve_device_indices(&self) -> anyhow::Result<Option<Vec<usize>>> {
+        if let Some(indices) = self.resolve_explicit_multi_device_indices()? {
+            return Ok(Some(indices));
+        }
+        // Legacy single-GPU selector as the final fallback.
+        match self.gpu_device_id {
+            Some(id) => Self::validate_index_set(vec![id]),
+            None => Ok(None),
+        }
+    }
+
+    /// Shared post-processing for a resolved index list: empty → `None`, reject
+    /// duplicates, otherwise `Some(indices)`.
+    fn validate_index_set(indices: Vec<usize>) -> anyhow::Result<Option<Vec<usize>>> {
+        if indices.is_empty() {
+            return Ok(None);
+        }
+        let mut seen = std::collections::HashSet::with_capacity(indices.len());
+        for &idx in &indices {
+            if !seen.insert(idx) {
+                return Err(anyhow::anyhow!(
+                    "duplicate GPU device index {idx} in requested set {indices:?}"
+                ));
+            }
+        }
+        Ok(Some(indices))
     }
 }
 
@@ -636,6 +1917,14 @@ pub struct HyprConfigBuilder {
     mcp: MCPConfig,
     oauth: OAuthConfig,
     streaming: StreamingConfig,
+    tls: TlsConfig,
+    quic: QuicConfig,
+    event: EventServiceConfig,
+    registry: RegistryServiceConfig,
+    policy: PolicyServiceConfig,
+    discovery: DiscoveryServiceConfig,
+    tui: TuiServiceConfig,
+    metrics: MetricsConfig,
 }
 
 impl HyprConfigBuilder {
@@ -657,6 +1946,14 @@ impl HyprConfigBuilder {
             mcp: MCPConfig::default(),
             oauth: OAuthConfig::default(),
             streaming: StreamingConfig::default(),
+            tls: TlsConfig::default(),
+            quic: QuicConfig::default(),
+            event: EventServiceConfig::default(),
+            registry: RegistryServiceConfig::default(),
+            policy: PolicyServiceConfig::default(),
+            discovery: DiscoveryServiceConfig::default(),
+            tui: TuiServiceConfig::default(),
+            metrics: MetricsConfig::default(),
         }
     }
 
@@ -678,6 +1975,14 @@ impl HyprConfigBuilder {
             mcp: config.mcp,
             oauth: config.oauth,
             streaming: config.streaming,
+            tls: config.tls,
+            quic: config.quic,
+            event: config.event,
+            registry: config.registry,
+            policy: config.policy,
+            discovery: config.discovery,
+            tui: config.tui,
+            metrics: config.metrics,
         }
     }
 
@@ -710,7 +2015,19 @@ impl HyprConfigBuilder {
             flight: self.flight,
             mcp: self.mcp,
             oauth: self.oauth,
+            credentials: Default::default(),
             streaming: self.streaming,
+            rpc: Default::default(),
+            tls: self.tls,
+            quic: self.quic,
+            event: self.event,
+            registry: self.registry,
+            policy: self.policy,
+            discovery: self.discovery,
+            tui: self.tui,
+            metrics: self.metrics,
+            signing_key: None,
+            secrets: Default::default(),
         }
     }
 
@@ -854,14 +2171,6 @@ impl HyprConfig {
     }
 
     /// Create generation request from config + prompt
-    ///
-    /// Note: The prompt should already be templated (via apply_chat_template).
-    pub fn create_request(&self, prompt: TemplatedPrompt) -> GenerationRequest {
-        let mut request = GenerationRequest::from(&self.generation);
-        request.prompt = prompt;
-        request
-    }
-
     /// Save configuration to default location
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
         let storage = StoragePaths::new()?;
@@ -873,6 +2182,64 @@ impl HyprConfig {
 
         tracing::info!("✅ Configuration saved to: {}", config_path.display());
         Ok(())
+    }
+
+    // ── Secrets / key bypass helpers ────────────────────────────────────────
+
+    /// Resolve the secrets directory from config, or the platform XDG default.
+    ///
+    /// Prefer calling this over inlining the fallback logic everywhere.
+    pub fn resolve_secrets_dir() -> PathBuf {
+        match Self::load() {
+            Ok(cfg) => cfg.secrets.resolve_dir(cfg.config_dir()),
+            Err(_) => SecretsConfig::default_dir(),
+        }
+    }
+
+    /// Check for the `HYPRSTREAM__SIGNING_KEY` test bypass.
+    ///
+    /// Returns `Ok(Some(key))` when the bypass is set and valid,
+    /// `Ok(None)` when not configured, `Err` when malformed.
+    pub fn node_signing_key_bypass() -> anyhow::Result<Option<ed25519_dalek::SigningKey>> {
+        if let Ok(cfg) = Self::load() {
+            if let Some(ref hex_key) = cfg.signing_key {
+                let mut bytes = hex::decode(hex_key)
+                    .map_err(|e| anyhow::anyhow!("HYPRSTREAM__SIGNING_KEY: invalid hex: {e}"))?;
+                let mut arr: [u8; 32] = bytes.as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("HYPRSTREAM__SIGNING_KEY: expected 32 bytes"))?;
+                let sk = ed25519_dalek::SigningKey::from_bytes(&arr);
+                bytes.zeroize();
+                arr.zeroize();
+                tracing::info!("Using node signing key from config (test bypass)");
+                return Ok(Some(sk));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Check for the `HYPRSTREAM__OAUTH__USER_SIGNING_KEY` test bypass.
+    ///
+    /// Returns `Ok(Some((sk, vk)))` when the bypass is set and valid,
+    /// `Ok(None)` when not configured, `Err` when malformed.
+    pub fn user_signing_key_bypass(
+    ) -> anyhow::Result<Option<(ed25519_dalek::SigningKey, ed25519_dalek::VerifyingKey)>> {
+        if let Ok(cfg) = Self::load() {
+            if let Some(ref hex_key) = cfg.oauth.user_signing_key {
+                let mut bytes = hex::decode(hex_key)
+                    .map_err(|e| anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: invalid hex: {e}"))?;
+                let mut arr: [u8; 32] = bytes.as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: expected 32 bytes"))?;
+                let sk = ed25519_dalek::SigningKey::from_bytes(&arr);
+                bytes.zeroize();
+                arr.zeroize();
+                let vk = sk.verifying_key();
+                tracing::info!("Using user signing key from config (test bypass)");
+                return Ok(Some((sk, vk)));
+            }
+        }
+        Ok(None)
     }
 
     /// Create a default configuration for a specific model path
@@ -897,23 +2264,6 @@ impl HyprConfig {
 
         Ok(config)
     }
-}
-
-/// Model information returned after loading
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelInfo {
-    pub name: String,
-    pub parameters: u64,
-    pub context_length: usize,
-    pub vocab_size: usize,
-    pub hidden_size: usize,
-    pub intermediate_size: Option<usize>,
-    pub num_attention_heads: Option<usize>,
-    pub num_key_value_heads: Option<usize>,
-    pub head_dim: Option<usize>,
-    pub num_hidden_layers: Option<usize>,
-    pub architecture: String,
-    pub quantization: Option<String>,
 }
 
 /// A prompt string that has been processed through the chat template engine.
@@ -953,44 +2303,6 @@ impl std::fmt::Display for TemplatedPrompt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
-}
-
-/// Generation request with all parameters
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct GenerationRequest {
-    pub prompt: TemplatedPrompt,
-    pub max_tokens: usize,
-    pub temperature: f32,
-    pub top_p: f32,
-    pub top_k: Option<usize>,
-    pub repeat_penalty: f32,
-    #[serde(default)]
-    pub repeat_last_n: usize,
-    pub stop_tokens: Vec<String>,
-    pub seed: Option<u32>,
-    /// Optional image paths for multimodal models
-    #[serde(default)]
-    pub images: Vec<String>,
-    // Async configuration fields
-    #[serde(default)]
-    pub timeout: Option<u64>, // Duration in milliseconds
-    /// Enable quality metrics collection for self-supervised training.
-    /// Default: false (disabled for performance - metrics add ~10x overhead)
-    #[serde(default)]
-    pub collect_metrics: bool,
-    // TTT (test-time training) overrides
-    /// Override: enable/disable TTT for this request
-    #[serde(default)]
-    pub ttt_enabled: bool,
-    /// Override: number of gradient steps (0 = use server default)
-    #[serde(default)]
-    pub ttt_gradient_steps: u32,
-    /// Override: learning rate (0.0 = use server default)
-    #[serde(default)]
-    pub ttt_learning_rate: f32,
-    /// If true, auto-commit adaptation based on quality gate
-    #[serde(default)]
-    pub auto_commit: bool,
 }
 
 /// Unified sampling parameters with Option fields for clean precedence merging.
@@ -1098,6 +2410,26 @@ impl SamplingParams {
         }
     }
 
+    /// Build a `GenerationRequest` from these sampling params and a prompt.
+    ///
+    /// Applies `SamplingParams` fields as `Option<T>` — `None` means "not specified",
+    /// letting the engine use its defaults.
+    pub fn into_generation_request(self, prompt: String) -> crate::services::generated::inference_client::GenerationRequest {
+        crate::services::generated::inference_client::GenerationRequest {
+            prompt,
+            max_tokens: self.max_tokens.map(|v| v as u32),
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k.map(|v| v as u32),
+            repeat_penalty: self.repeat_penalty,
+            repeat_last_n: self.repeat_last_n.map(|v| v as u32),
+            stop_tokens: self.stop_tokens,
+            seed: self.seed.map(|v| v as u32),
+            timeout_ms: self.timeout_ms,
+            ..Default::default()
+        }
+    }
+
     /// Resolve to concrete values with defaults
     pub fn resolve(self) -> ResolvedSamplingParams {
         ResolvedSamplingParams {
@@ -1139,139 +2471,6 @@ pub struct ResolvedSamplingParams {
     pub timeout_ms: u64,
 }
 
-/// Builder for generation requests using the unified SamplingParams precedence system
-pub struct GenerationRequestBuilder {
-    prompt: String,
-    params: SamplingParams,
-    images: Vec<String>,
-    collect_metrics: bool,
-}
-
-impl GenerationRequestBuilder {
-    pub fn new(prompt: impl Into<String>) -> Self {
-        Self {
-            prompt: prompt.into(),
-            params: SamplingParams::default(),
-            images: vec![],
-            collect_metrics: false, // Default: off for performance
-        }
-    }
-
-    /// Apply a config layer (server defaults, model defaults, or user overrides).
-    /// Later calls take precedence over earlier calls.
-    pub fn apply_config(mut self, config: &SamplingParams) -> Self {
-        self.params = self.params.merge(config.clone());
-        self
-    }
-    pub fn temperature(mut self, value: f32) -> Self {
-        self.params.temperature = Some(value);
-        self
-    }
-
-    pub fn max_tokens(mut self, value: usize) -> Self {
-        self.params.max_tokens = Some(value);
-        self
-    }
-
-    pub fn top_p(mut self, value: f32) -> Self {
-        self.params.top_p = Some(value);
-        self
-    }
-
-    pub fn top_k(mut self, value: Option<usize>) -> Self {
-        self.params.top_k = value;
-        self
-    }
-
-    pub fn repeat_penalty(mut self, value: f32) -> Self {
-        self.params.repeat_penalty = Some(value);
-        self
-    }
-
-    pub fn repeat_last_n(mut self, value: usize) -> Self {
-        self.params.repeat_last_n = Some(value);
-        self
-    }
-
-    pub fn stop_tokens(mut self, value: Vec<String>) -> Self {
-        self.params.stop_tokens = Some(value);
-        self
-    }
-
-    pub fn seed(mut self, value: Option<u64>) -> Self {
-        self.params.seed = value;
-        self
-    }
-
-    pub fn image_path(mut self, value: std::path::PathBuf) -> Self {
-        self.images.push(value.to_string_lossy().to_string());
-        self
-    }
-
-    pub fn images(mut self, value: Vec<String>) -> Self {
-        self.images = value;
-        self
-    }
-
-    // Async configuration methods
-    pub fn timeout(mut self, timeout: std::time::Duration) -> Self {
-        self.params.timeout_ms = Some(timeout.as_millis() as u64);
-        self
-    }
-
-    pub fn timeout_ms(mut self, timeout_ms: u64) -> Self {
-        self.params.timeout_ms = Some(timeout_ms);
-        self
-    }
-
-    pub fn build_v2(self) -> GenerationRequestV2 {
-        GenerationRequestV2 {
-            prompt: self.prompt,
-            params: self.params.resolve(),
-        }
-    }
-
-    /// Enable quality metrics collection (expensive - ~10x slowdown)
-    pub fn collect_metrics(mut self, value: bool) -> Self {
-        self.collect_metrics = value;
-        self
-    }
-
-    pub fn build(self) -> GenerationRequest {
-        let resolved = self.params.resolve();
-        GenerationRequest {
-            prompt: TemplatedPrompt::new(self.prompt),
-            max_tokens: resolved.max_tokens,
-            temperature: resolved.temperature,
-            top_p: resolved.top_p,
-            top_k: resolved.top_k,
-            repeat_penalty: resolved.repeat_penalty,
-            repeat_last_n: resolved.repeat_last_n,
-            stop_tokens: resolved.stop_tokens,
-            seed: resolved.seed.map(|s| s as u32),
-            images: self.images,
-            timeout: Some(resolved.timeout_ms),
-            collect_metrics: self.collect_metrics,
-            ttt_enabled: false,
-            ttt_gradient_steps: 0,
-            ttt_learning_rate: 0.0,
-            auto_commit: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct GenerationRequestV2 {
-    pub prompt: String,
-    pub params: ResolvedSamplingParams,
-}
-
-impl GenerationRequest {
-    pub fn builder(prompt: impl Into<String>) -> GenerationRequestBuilder {
-        GenerationRequestBuilder::new(prompt)
-    }
-}
-
 impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
     fn from(defaults: &crate::config::server::SamplingParamDefaults) -> Self {
         Self {
@@ -1293,28 +2492,6 @@ impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
     }
 }
 
-impl From<&GenerationConfig> for GenerationRequest {
-    fn from(config: &GenerationConfig) -> Self {
-        Self {
-            prompt: TemplatedPrompt::new(String::new()),
-            max_tokens: config.max_tokens,
-            temperature: config.temperature,
-            top_p: config.top_p,
-            top_k: config.top_k,
-            repeat_penalty: config.repeat_penalty,
-            repeat_last_n: 64, // Default repeat_last_n
-            stop_tokens: config.stop_tokens.clone(),
-            images: vec![],  // No images in conversion
-            seed: config.seed,
-            timeout: None, // Not in GenerationConfig
-            collect_metrics: false, // Default: off for performance
-            ttt_enabled: false,
-            ttt_gradient_steps: 0,
-            ttt_learning_rate: 0.0,
-            auto_commit: false,
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1333,17 +2510,20 @@ mod tests {
     }
 
     #[test]
-    fn test_generation_request_builder() {
-        let request = GenerationRequest::builder("test prompt")
-            .temperature(0.8)
-            .top_k(Some(30))
-            .max_tokens(1000)
-            .build();
+    fn test_sampling_params_into_generation_request() {
+        let params = SamplingParams {
+            temperature: Some(0.8),
+            top_k: Some(30),
+            max_tokens: Some(1000),
+            ..Default::default()
+        };
 
-        assert_eq!(request.prompt, TemplatedPrompt::new("test prompt".to_owned()));
-        assert_eq!(request.temperature, 0.8);
+        let request = params.into_generation_request("test prompt".to_owned());
+
+        assert_eq!(request.prompt, "test prompt");
+        assert_eq!(request.temperature, Some(0.8));
         assert_eq!(request.top_k, Some(30));
-        assert_eq!(request.max_tokens, 1000);
+        assert_eq!(request.max_tokens, Some(1000));
     }
 
     #[test]
@@ -1397,18 +2577,20 @@ mod tests {
             ..Default::default()
         };
 
-        let request = GenerationRequest::builder("test prompt")
-            .apply_config(&server_params)
-            .apply_config(&model_params)
-            .temperature(0.8)
-            .max_tokens(512)
-            .build();
+        let user_overrides = SamplingParams {
+            temperature: Some(0.8),
+            max_tokens: Some(512),
+            ..Default::default()
+        };
 
-        assert_eq!(request.prompt, TemplatedPrompt::new("test prompt".to_owned()));
-        assert_eq!(request.temperature, 0.8);
-        assert_eq!(request.max_tokens, 512);
-        assert_eq!(request.top_p, 0.95);
-        assert_eq!(request.repeat_penalty, 1.2);
+        let params = server_params.merge(model_params).merge(user_overrides);
+        let request = params.into_generation_request("test prompt".to_owned());
+
+        assert_eq!(request.prompt, "test prompt");
+        assert_eq!(request.temperature, Some(0.8));
+        assert_eq!(request.max_tokens, Some(512));
+        assert_eq!(request.top_p, Some(0.95));
+        assert_eq!(request.repeat_penalty, Some(1.2));
     }
 
     #[test]
@@ -1426,6 +2608,198 @@ mod tests {
         assert_eq!(resolved.top_p, 0.95);
         assert_eq!(resolved.repeat_penalty, 1.0);
         assert!(resolved.do_sample);
+    }
+
+    #[test]
+    fn test_oauth_secs_overrides() {
+        let mut config = OAuthConfig::default();
+        assert_eq!(config.active_secs(), i64::from(config.jwt_key_active_days) * 86400);
+        config.jwt_key_active_secs = Some(30);
+        config.jwt_key_lead_secs = Some(25);
+        config.jwt_key_drain_secs = Some(20);
+        config.jwt_key_rotation_check_secs = Some(3);
+        assert_eq!(config.active_secs(), 30);
+        assert_eq!(config.lead_secs(), 25);
+        assert_eq!(config.drain_secs(), 20);
+        assert_eq!(config.rotation_check_interval(), std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn test_oauth_secs_from_env() {
+        // Simulate env vars the same way HyprConfig::load() does
+        std::env::set_var("HYPRSTREAM__OAUTH__JWT_KEY_ACTIVE_SECS", "30");
+        let result = config::Config::builder()
+            .add_source(config::Config::try_from(&HyprConfig::default()).unwrap())
+            .add_source(config::Environment::with_prefix("HYPRSTREAM").separator("__").try_parsing(true))
+            .build()
+            .and_then(config::Config::try_deserialize::<HyprConfig>);
+        std::env::remove_var("HYPRSTREAM__OAUTH__JWT_KEY_ACTIVE_SECS");
+        let cfg = result.expect("config should parse with env var");
+        assert_eq!(cfg.oauth.jwt_key_active_secs, Some(30), "jwt_key_active_secs should be 30 from env");
+        assert_eq!(cfg.oauth.active_secs(), 30);
+    }
+
+    // ---- Multi-GPU device resolution (#313) ----
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn parse_device_list_basic() {
+        assert_eq!(RuntimeConfig::parse_device_list("0,1").unwrap(), vec![0, 1]);
+        // Whitespace around entries is tolerated.
+        assert_eq!(RuntimeConfig::parse_device_list(" 0 , 2 ").unwrap(), vec![0, 2]);
+        assert_eq!(RuntimeConfig::parse_device_list("3").unwrap(), vec![3]);
+    }
+
+    #[test]
+    fn parse_device_list_rejects_garbage() {
+        // Non-numeric, empty fields, and negatives are hard errors (no silent default).
+        assert!(RuntimeConfig::parse_device_list("0,foo").is_err());
+        assert!(RuntimeConfig::parse_device_list("0,").is_err());
+        assert!(RuntimeConfig::parse_device_list("0,,1").is_err());
+        assert!(RuntimeConfig::parse_device_list("-1").is_err());
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn validate_index_set_dedup_and_empty() {
+        // Empty → None (auto-detect).
+        assert_eq!(RuntimeConfig::validate_index_set(vec![]).unwrap(), None);
+        // Duplicates → error.
+        assert!(RuntimeConfig::validate_index_set(vec![0, 0]).is_err());
+        // Distinct → Some, order preserved.
+        assert_eq!(
+            RuntimeConfig::validate_index_set(vec![2, 0, 1]).unwrap(),
+            Some(vec![2, 0, 1])
+        );
+    }
+
+    /// Serializes the two tests that mutate the shared `HYPRSTREAM_GPU_DEVICES`
+    /// process env var so they don't race under the parallel test runner.
+    static GPU_DEVICES_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn resolve_uses_devices_field_and_legacy_fallback() {
+        let _serial = GPU_DEVICES_ENV_LOCK.lock();
+        // Guard against the env var leaking from the ambient environment so the
+        // struct-field/legacy precedence is exercised deterministically.
+        let _guard = EnvVarGuard::unset("HYPRSTREAM_GPU_DEVICES");
+
+        // Explicit multi-device field wins.
+        let mut cfg = RuntimeConfig::default();
+        cfg.devices = vec![0, 1];
+        cfg.gpu_device_id = Some(7);
+        assert_eq!(
+            cfg.resolve_explicit_multi_device_indices().unwrap(),
+            Some(vec![0, 1])
+        );
+        assert_eq!(cfg.resolve_device_indices().unwrap(), Some(vec![0, 1]));
+
+        // No explicit multi-device set → explicit resolver is None, but the full
+        // resolver falls back to the legacy single gpu_device_id.
+        let mut legacy = RuntimeConfig::default();
+        legacy.devices = vec![];
+        legacy.gpu_device_id = Some(3);
+        assert_eq!(legacy.resolve_explicit_multi_device_indices().unwrap(), None);
+        assert_eq!(legacy.resolve_device_indices().unwrap(), Some(vec![3]));
+
+        // Nothing requested anywhere → None (auto-detect path preserved).
+        let mut none = RuntimeConfig::default();
+        none.devices = vec![];
+        none.gpu_device_id = None;
+        assert_eq!(none.resolve_device_indices().unwrap(), None);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn resolve_env_var_overrides_and_is_strict() {
+        let _serial = GPU_DEVICES_ENV_LOCK.lock();
+        let mut cfg = RuntimeConfig::default();
+        cfg.devices = vec![5];
+        cfg.gpu_device_id = Some(9);
+
+        {
+            let _g = EnvVarGuard::set("HYPRSTREAM_GPU_DEVICES", "0,1,2");
+            assert_eq!(
+                cfg.resolve_explicit_multi_device_indices().unwrap(),
+                Some(vec![0, 1, 2]),
+                "env var must override the devices field"
+            );
+        }
+        {
+            // Malformed env var is a hard error (not a silent fallback to field).
+            let _g = EnvVarGuard::set("HYPRSTREAM_GPU_DEVICES", "0,nope");
+            assert!(cfg.resolve_explicit_multi_device_indices().is_err());
+        }
+        {
+            // Duplicate in env var → error.
+            let _g = EnvVarGuard::set("HYPRSTREAM_GPU_DEVICES", "1,1");
+            assert!(cfg.resolve_explicit_multi_device_indices().is_err());
+        }
+        {
+            // Explicitly-empty env var is treated as unset (falls back to field).
+            let _g = EnvVarGuard::set("HYPRSTREAM_GPU_DEVICES", "  ");
+            assert_eq!(
+                cfg.resolve_explicit_multi_device_indices().unwrap(),
+                Some(vec![5])
+            );
+        }
+    }
+
+    /// Serializes tests mutating the shared `HYPRSTREAM_STRICT_DEVICE` env var.
+    static STRICT_DEVICE_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// #315: strict_device defaults to fail-fast, and can be opted out via env.
+    #[test]
+    fn strict_device_defaults_to_true_and_respects_env() {
+        let _serial = STRICT_DEVICE_ENV_LOCK.lock();
+
+        {
+            let _g = EnvVarGuard::unset("HYPRSTREAM_STRICT_DEVICE");
+            assert!(
+                RuntimeConfig::default().strict_device,
+                "strict_device must default to true (safe default for multi-GPU)"
+            );
+        }
+        for falsy in ["0", "false", "no", "off"] {
+            let _g = EnvVarGuard::set("HYPRSTREAM_STRICT_DEVICE", falsy);
+            assert!(
+                !RuntimeConfig::default().strict_device,
+                "HYPRSTREAM_STRICT_DEVICE={falsy} must disable strict_device"
+            );
+        }
+        {
+            let _g = EnvVarGuard::set("HYPRSTREAM_STRICT_DEVICE", "1");
+            assert!(RuntimeConfig::default().strict_device);
+        }
+    }
+
+    /// RAII guard to set/unset a process env var for the duration of a test and
+    /// restore the previous value, keeping env-mutating tests from leaking state.
+    struct EnvVarGuard {
+        key: String,
+        prev: Option<String>,
+    }
+    impl EnvVarGuard {
+        fn set(key: &str, val: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, val);
+            Self { key: key.to_owned(), prev }
+        }
+        fn unset(key: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key: key.to_owned(), prev }
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(&self.key, v),
+                None => std::env::remove_var(&self.key),
+            }
+        }
     }
 }
 
@@ -1598,7 +2972,7 @@ pub struct TTTTrainingConfig {
 
     /// Number of gradient steps per input
     #[serde(default = "default_ttt_gradient_steps")]
-    pub gradient_steps: usize,
+    pub gradient_steps: u32,
 
     /// Maximum gradient norm for clipping
     #[serde(default = "default_ttt_max_grad_norm")]
@@ -1606,26 +2980,34 @@ pub struct TTTTrainingConfig {
 
     /// Minimum input length (tokens) to trigger TTT
     #[serde(default = "default_ttt_min_input_length")]
-    pub min_input_length: usize,
+    pub min_input_length: u32,
 
     /// Maximum input length to process for TTT
     #[serde(default = "default_ttt_max_context")]
-    pub max_ttt_context: usize,
+    pub max_ttt_context: u32,
+
+    /// Rank oracle configuration (optional — omit to disable runtime rank adaptation)
+    #[serde(default)]
+    pub rank_oracle: Option<crate::training::RankOracleConfig>,
+
+    /// Per-layer gradient gating (optional — enabled by default)
+    #[serde(default)]
+    pub gradient_gating: Option<crate::training::GradientGatingConfig>,
 }
 
 fn default_ttt_learning_rate() -> f64 {
     3e-4
 }
-fn default_ttt_gradient_steps() -> usize {
+fn default_ttt_gradient_steps() -> u32 {
     3
 }
 fn default_ttt_max_grad_norm() -> f64 {
     1.0
 }
-fn default_ttt_min_input_length() -> usize {
+fn default_ttt_min_input_length() -> u32 {
     32
 }
-fn default_ttt_max_context() -> usize {
+fn default_ttt_max_context() -> u32 {
     512
 }
 
@@ -1637,6 +3019,8 @@ impl Default for TTTTrainingConfig {
             max_grad_norm: default_ttt_max_grad_norm(),
             min_input_length: default_ttt_min_input_length(),
             max_ttt_context: default_ttt_max_context(),
+            rank_oracle: None,
+            gradient_gating: None,
         }
     }
 }

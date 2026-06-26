@@ -11,16 +11,29 @@ use std::path::Path;
 
 // Re-export everything from the unified config
 pub use crate::config::{
-    FinishReason, GenerationConfig, GenerationRequest, GenerationResult, HyprConfig,
-    ModelConfig, ModelInfo, RuntimeConfig,
+    FinishReason, GenerationConfig, GenerationResult, HyprConfig,
+    ModelConfig, RuntimeConfig,
 };
 
+/// Generation request — uses the generated Cap'n Proto struct directly.
+///
+/// All sampling parameters are `Option<T>` to represent "not specified",
+/// enabling clean precedence: Server defaults → Model defaults → User overrides.
+/// The engine resolves `None` to defaults at generation time.
+pub use crate::services::generated::inference_client::GenerationRequest;
+
+/// Model information — uses the generated Cap'n Proto struct directly.
+pub use crate::services::generated::inference_client::ModelInfo;
+
 pub mod architectures; // Architecture-specific model implementations (includes Janus placeholder utils)
+pub mod ttn_profile;  // TTN analysis pipeline: adaptive layer profiling + embedded profiles
 pub mod batched_lora; // Batched multi-tenant LoRA forward pass
 // REMOVED: pub mod conversation_router; // Dead code - VDB TemporalStreamingLayer removed
 pub mod generation_metrics; // Quality metrics for self-supervised training
-pub mod kv_quant; // KV cache quantization types
+// KV cache quantization — re-export the generated Cap'n Proto enum as canonical type
+pub use crate::services::generated::model_client::KVQuantType;
 pub mod tensor_sampling; // Device-agnostic tensor-based sampling
+pub mod device_pool; // Multi-GPU device abstraction (DevicePool) — Send+Sync, holds only Device values
 pub mod image_utils; // Image loading and preprocessing for multimodal models
 pub mod kv_cache; // Key-Value caching for efficient autoregressive generation
 pub mod model_config; // Unified model configuration management
@@ -35,6 +48,9 @@ pub mod weight_provider; // Weight provider for streaming large models
 
 // Primary exports - use TorchEngine as default
 pub use torch_engine::{TorchEngine, TextStream, GenerationStats};
+
+// Multi-GPU device abstraction
+pub use device_pool::DevicePool;
 
 // KV cache exports for multi-session support
 pub use kv_cache::{CacheConfig, CacheOwner, KVCacheManager, KVCacheRegistry};
@@ -95,6 +111,19 @@ pub trait RuntimeEngine: Send + Sync {
             formatted.push_str("assistant: ");
         }
         Ok(formatted)
+    }
+
+    /// Apply chat template with extended parameters (thinking mode, extra vars).
+    fn apply_chat_template_with_vars(
+        &self,
+        messages: &[template_engine::ChatMessage],
+        add_generation_prompt: bool,
+        tools: Option<&serde_json::Value>,
+        _enable_thinking: Option<bool>,
+        _template_vars_json: Option<&str>,
+    ) -> Result<String> {
+        // Default: delegate to basic apply_chat_template (ignores extended params)
+        self.apply_chat_template(messages, add_generation_prompt, tools)
     }
 
 }

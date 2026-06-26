@@ -1,0 +1,48 @@
+name: Nix
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+    paths:
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'nix/**'
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'nix/**'
+  release:
+    types: [ published ]
+
+jobs:
+  flake-check:
+    name: nix flake check (CPU)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create sccache directory
+        run: sudo mkdir -p /var/cache/sccache && sudo chmod 1777 /var/cache/sccache
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            max-jobs = auto
+            cores = 0
+            extra-sandbox-paths = /var/cache/sccache
+
+      - name: Cache sccache artifacts
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/sccache
+          key: nix-sccache-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            nix-sccache-${{ runner.os }}-
+
+      - name: nix flake check
+        run: nix flake check -L

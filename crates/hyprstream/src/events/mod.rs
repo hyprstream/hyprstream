@@ -33,6 +33,8 @@ pub enum EventSource {
     Training,
     /// Git repository events
     Git2db,
+    /// Model lifecycle events (load, unload, fail)
+    Model,
 }
 
 impl std::fmt::Display for EventSource {
@@ -42,6 +44,7 @@ impl std::fmt::Display for EventSource {
             EventSource::Metrics => write!(f, "metrics"),
             EventSource::Training => write!(f, "training"),
             EventSource::Git2db => write!(f, "git2db"),
+            EventSource::Model => write!(f, "model"),
         }
     }
 }
@@ -139,6 +142,31 @@ pub enum EventPayload {
         success: bool,
         /// Execution time in milliseconds
         duration_ms: u64,
+    },
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Model Lifecycle Events
+    // ─────────────────────────────────────────────────────────────────────
+    /// Model loaded and ready for inference
+    ModelLoaded {
+        /// Model reference (e.g., "qwen3:main")
+        model_ref: String,
+        /// Inference endpoint for this model
+        endpoint: String,
+    },
+
+    /// Model load failed
+    ModelFailed {
+        /// Model reference
+        model_ref: String,
+        /// Error message
+        error: String,
+    },
+
+    /// Model unloaded
+    ModelUnloaded {
+        /// Model reference
+        model_ref: String,
     },
 
     // ─────────────────────────────────────────────────────────────────────

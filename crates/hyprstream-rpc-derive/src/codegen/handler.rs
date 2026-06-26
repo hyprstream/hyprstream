@@ -300,7 +300,7 @@ fn handler_method_params(
             if let Some(sdef) = resolved.find_struct(name) {
                 // Union-only struct (e.g., scope structs like RuntimeRequest):
                 // handler needs raw payload to dispatch the inner union
-                if sdef.has_union && sdef.fields.is_empty() {
+                if sdef.is_pure_union() {
                     return vec![quote! { payload: &[u8] }];
                 }
                 // Option 2: Accept whole struct instead of individual fields
@@ -319,7 +319,7 @@ fn handler_method_params(
 fn is_union_only_struct_variant(v: &UnionVariant, resolved: &ResolvedSchema) -> bool {
     if let CapnpType::Struct(ref name) = resolved.resolve_type(&v.type_name).capnp_type {
         if let Some(sdef) = resolved.find_struct(name) {
-            return sdef.has_union && sdef.fields.is_empty();
+            return sdef.is_pure_union();
         }
     }
     false
@@ -433,8 +433,12 @@ fn generate_dispatch_fn(
                 // Generate auth error return for streaming variants
                 let streaming_auth_stmt = if let Some((ref action, ref service)) = auth_check {
                     let err_response_type = format_ident!("{}ResponseVariant", pascal);
+                    let variant_str = variant_pascal.to_string();
                     quote! {
-                        if let Err(e) = #trait_name::authorize(handler, ctx, #service, #action).await {
+                        let __audit_resource = format!("{}:{}", #service, #variant_str);
+                        let __authz = #trait_name::authorize(handler, ctx, &__audit_resource, #action).await;
+                        ctx.audit_authz(&__audit_resource, #action, __authz.is_ok());
+                        if let Err(e) = __authz {
                             let err_variant = #err_response_type::Error(ErrorInfo {
                                 message: e.to_string(),
                                 code: "UNAUTHORIZED".to_string(),
@@ -452,14 +456,15 @@ fn generate_dispatch_fn(
                             Which::#variant_pascal(()) => {
                                 #streaming_auth_stmt
                                 let (stream_info, continuation) = #call?;
+                                let guarded = hyprstream_rpc::streaming::StreamGuard::wrap(continuation);
                                 let variant = #response_type::#resp_variant_pascal(stream_info);
-                                return Ok((serialize_response(request_id, &variant)?, Some(continuation)));
+                                return Ok((serialize_response(request_id, &variant)?, Some(guarded)));
                             }
                         }
                     },
                     CapnpType::Struct(ref name) => {
                         if let Some(sdef) = resolved.find_struct(name) {
-                            if sdef.has_union && sdef.fields.is_empty() {
+                            if sdef.is_pure_union() {
                                 let call = call_handler!(payload);
                                 quote! {
                                     Which::#variant_pascal(_) => {
@@ -479,8 +484,9 @@ fn generate_dispatch_fn(
                                         let data = hyprstream_rpc::capnp::FromCapnp::read_from(v)?;
                                         #streaming_auth_stmt
                                         let (stream_info, continuation) = #call?;
+                                        let guarded = hyprstream_rpc::streaming::StreamGuard::wrap(continuation);
                                         let variant = #response_type::#resp_variant_pascal(stream_info);
-                                        return Ok((serialize_response(request_id, &variant)?, Some(continuation)));
+                                        return Ok((serialize_response(request_id, &variant)?, Some(guarded)));
                                     }
                                 }
                             }
@@ -501,10 +507,14 @@ fn generate_dispatch_fn(
                 CapnpType::Void => {
                     let call = call_handler!();
                     if let Some((ref action, ref service)) = auth_check {
-                        // Void: resource = "{service}"
+                        // Void: resource = "{service}:{VariantName}"
+                        let variant_str = variant_pascal.to_string();
                         quote! {
                             Which::#variant_pascal(()) => {
-                                #trait_name::authorize(handler, ctx, #service, #action).await?;
+                                let __audit_resource = format!("{}:{}", #service, #variant_str);
+                                let __authz = #trait_name::authorize(handler, ctx, &__audit_resource, #action).await;
+                                ctx.audit_authz(&__audit_resource, #action, __authz.is_ok());
+                                __authz?;
                                 #call
                             }
                         }
@@ -525,7 +535,10 @@ fn generate_dispatch_fn(
                         quote! {
                             Which::#variant_pascal(val) => {
                                 let v = val?.to_str()?;
-                                #trait_name::authorize(handler, ctx, &format!("{}:{}", #service, v), #action).await?;
+                                let __audit_resource = format!("{}:{}", #service, v);
+                                let __authz = #trait_name::authorize(handler, ctx, &__audit_resource, #action).await;
+                                ctx.audit_authz(&__audit_resource, #action, __authz.is_ok());
+                                __authz?;
                                 #call
                             }
                         }
@@ -547,9 +560,13 @@ fn generate_dispatch_fn(
                         quote! { handler.#handler_method(ctx, request_id, v?).await }
                     };
                     if let Some((ref action, ref service)) = auth_check {
+                        let variant_str = variant_pascal.to_string();
                         quote! {
                             Which::#variant_pascal(v) => {
-                                #trait_name::authorize(handler, ctx, #service, #action).await?;
+                                let __audit_resource = format!("{}:{}", #service, #variant_str);
+                                let __authz = #trait_name::authorize(handler, ctx, &__audit_resource, #action).await;
+                                ctx.audit_authz(&__audit_resource, #action, __authz.is_ok());
+                                __authz?;
                                 #call
                             }
                         }
@@ -566,9 +583,13 @@ fn generate_dispatch_fn(
                         quote! { handler.#handler_method(ctx, request_id, v).await }
                     };
                     if let Some((ref action, ref service)) = auth_check {
+                        let variant_str = variant_pascal.to_string();
                         quote! {
                             Which::#variant_pascal(v) => {
-                                #trait_name::authorize(handler, ctx, #service, #action).await?;
+                                let __audit_resource = format!("{}:{}", #service, #variant_str);
+                                let __authz = #trait_name::authorize(handler, ctx, &__audit_resource, #action).await;
+                                ctx.audit_authz(&__audit_resource, #action, __authz.is_ok());
+                                __authz?;
                                 #call
                             }
                         }
@@ -581,7 +602,7 @@ fn generate_dispatch_fn(
                 CapnpType::Struct(ref name) => {
                     if let Some(sdef) = resolved.find_struct(name) {
                         // Union-only struct (e.g., scope structs): pass raw payload
-                        if sdef.has_union && sdef.fields.is_empty() {
+                        if sdef.is_pure_union() {
                             let call = if scope_handlers {
                                 quote! { #trait_name::#handler_method(handler, ctx, request_id, payload).await }
                             } else {
@@ -603,8 +624,15 @@ fn generate_dispatch_fn(
                         };
 
                         let auth_stmt = if let Some((ref action, ref service)) = auth_check {
-                            // Struct: resource = "{service}"
-                            quote! { #trait_name::authorize(handler, ctx, #service, #action).await?; }
+                            // Struct: resource = "{service}:{VariantName}"
+                            // e.g. authorize(ctx, "policy:resolveServiceKey", "query")
+                            let variant_str = variant_pascal.to_string();
+                            quote! {
+                                let __audit_resource = format!("{}:{}", #service, #variant_str);
+                                let __authz = #trait_name::authorize(handler, ctx, &__audit_resource, #action).await;
+                                ctx.audit_authz(&__audit_resource, #action, __authz.is_ok());
+                                __authz?;
+                            }
                         } else {
                             TokenStream::new()
                         };
@@ -1040,7 +1068,7 @@ fn scope_handler_method_params(
         }
         CapnpType::Struct(ref name) => {
             if let Some(sdef) = resolved.find_struct(name) {
-                if sdef.has_union && sdef.fields.is_empty() {
+                if sdef.is_pure_union() {
                     return vec![quote! { payload: &[u8] }];
                 }
                 // Option 2: Accept whole struct instead of individual fields
@@ -1546,7 +1574,7 @@ fn generate_scope_params_enum(
                 },
                 CapnpType::Struct(ref name) => {
                     if let Some(sdef) = resolved.find_struct(name) {
-                        if sdef.has_union && sdef.fields.is_empty() {
+                        if sdef.is_pure_union() {
                             quote! { #variant_pascal }
                         } else {
                             let struct_ident = format_ident!("{}", name);
@@ -1641,7 +1669,7 @@ fn generate_scope_extraction_phase(
                 },
                 CapnpType::Struct(ref name) => {
                     if let Some(sdef) = resolved.find_struct(name) {
-                        if sdef.has_union && sdef.fields.is_empty() {
+                        if sdef.is_pure_union() {
                             quote! {
                                 Which::#variant_pascal(_) => {
                                     (#tag_enum::#variant_pascal, #params_enum::#variant_pascal)
@@ -1768,19 +1796,17 @@ fn generate_scope_dispatch_phase(
             // Returns Error(ErrorInfo) on auth failure instead of propagating via ?.
             let auth_stmt = if let Some(action) = parse_scope_for_auth(&v.scope) {
                 let action_str = action.to_owned();
-                let auth_call = if let Some(first_scope_field) = scope_field_idents.first() {
-                    let svc = service_name.to_owned();
-                    quote! {
-                        #parent_trait::authorize(handler, ctx, &format!("{}:{}", #svc, #first_scope_field), #action_str).await
-                    }
+                let svc = service_name.to_owned();
+                let resource_expr = if let Some(first_scope_field) = scope_field_idents.first() {
+                    quote! { format!("{}:{}", #svc, #first_scope_field) }
                 } else {
-                    let svc = service_name.to_owned();
-                    quote! {
-                        #parent_trait::authorize(handler, ctx, #svc, #action_str).await
-                    }
+                    quote! { (#svc).to_string() }
                 };
                 quote! {
-                    if let Err(e) = #auth_call {
+                    let __audit_resource = #resource_expr;
+                    let __authz = #parent_trait::authorize(handler, ctx, &__audit_resource, #action_str).await;
+                    ctx.audit_authz(&__audit_resource, #action_str, __authz.is_ok());
+                    if let Err(e) = __authz {
                         let err_variant = #response_type::Error(ErrorInfo {
                             message: e.to_string(),
                             code: "UNAUTHORIZED".to_string(),
@@ -1857,19 +1883,7 @@ fn generate_scope_dispatch_phase(
                             }
                         }
                     },
-                    CapnpType::Text => {
-                        quote! {
-                            #tag_enum::#variant_pascal => {
-                                let #params_enum::#variant_pascal(v) = params else { unreachable!() };
-                                #auth_stmt
-                                match #scope_trait::#handler_method(handler, ctx, request_id, #(#scope_field_args,)* &v).await {
-                                    #ok_wrap,
-                                    #err_wrap,
-                                }
-                            }
-                        }
-                    },
-                    CapnpType::Data => {
+                    CapnpType::Text | CapnpType::Data => {
                         quote! {
                             #tag_enum::#variant_pascal => {
                                 let #params_enum::#variant_pascal(v) = params else { unreachable!() };
@@ -2070,7 +2084,7 @@ fn generate_nested_scope_extraction_phase(
                 },
                 CapnpType::Struct(ref name) => {
                     if let Some(sdef) = resolved.find_struct(name) {
-                        if sdef.has_union && sdef.fields.is_empty() {
+                        if sdef.is_pure_union() {
                             quote! {
                                 Which::#variant_pascal(_) => {
                                     (#tag_enum::#variant_pascal, #params_enum::#variant_pascal)
@@ -2185,19 +2199,17 @@ fn generate_nested_scope_dispatch_phase(
             // Generate auth check — returns Error(ErrorInfo) on failure instead of propagating via ?
             let auth_stmt = if let Some(action) = parse_scope_for_auth(&v.scope) {
                 let action_str = action.to_owned();
-                let auth_call = if let Some(first_parent_field) = ancestor_scope_idents.first() {
-                    let svc = service_name.to_owned();
-                    quote! {
-                        #parent_trait::authorize(handler, ctx, &format!("{}:{}", #svc, #first_parent_field), #action_str).await
-                    }
+                let svc = service_name.to_owned();
+                let resource_expr = if let Some(first_parent_field) = ancestor_scope_idents.first() {
+                    quote! { format!("{}:{}", #svc, #first_parent_field) }
                 } else {
-                    let svc = service_name.to_owned();
-                    quote! {
-                        #parent_trait::authorize(handler, ctx, #svc, #action_str).await
-                    }
+                    quote! { (#svc).to_string() }
                 };
                 quote! {
-                    if let Err(e) = #auth_call {
+                    let __audit_resource = #resource_expr;
+                    let __authz = #parent_trait::authorize(handler, ctx, &__audit_resource, #action_str).await;
+                    ctx.audit_authz(&__audit_resource, #action_str, __authz.is_ok());
+                    if let Err(e) = __authz {
                         let err_variant = #response_type::Error(ErrorInfo {
                             message: e.to_string(),
                             code: "UNAUTHORIZED".to_string(),
@@ -2278,21 +2290,7 @@ fn generate_nested_scope_dispatch_phase(
                             }
                         }
                     },
-                    CapnpType::Text => {
-                        quote! {
-                            #tag_enum::#variant_pascal => {
-                                let #params_enum::#variant_pascal(v) = params else { unreachable!() };
-                                #auth_stmt
-                                match #nested_trait::#handler_method(
-                                    handler, ctx, request_id, #(#parent_scope_args,)* #(#nested_scope_args,)* &v
-                                ).await {
-                                    #ok_wrap,
-                                    #err_wrap,
-                                }
-                            }
-                        }
-                    },
-                    CapnpType::Data => {
+                    CapnpType::Text | CapnpType::Data => {
                         quote! {
                             #tag_enum::#variant_pascal => {
                                 let #params_enum::#variant_pascal(v) = params else { unreachable!() };

@@ -16,6 +16,24 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tracing::{debug, info, trace};
 
+/// Ensures libgit2's secondary subsystems (attr cache, ODB cache, config file
+/// locator, etc.) are fully initialized before any concurrent use begins.
+///
+/// git2-rs wraps `git_libgit2_init()` in a `std::sync::Once`, but internal
+/// libgit2 subsystems have their own deferred initialization that races when
+/// multiple threads call their first git2 operation concurrently. Calling a
+/// benign operation here — before the `spawn_blocking` thread pool fans out —
+/// serializes all secondary initialization.
+static LIBGIT2_INIT: OnceCell<()> = OnceCell::new();
+
+fn ensure_libgit2_initialized() {
+    LIBGIT2_INIT.get_or_init(|| {
+        // Triggers git_libgit2_init() + all secondary global init via git2-rs.
+        // open_default() reads system + global git config, initializing those caches.
+        let _ = git2::Config::open_default();
+    });
+}
+
 use crate::clone_options::CloneOptions;
 use crate::config::Git2DBConfig;
 use crate::errors::{Git2DBError, Git2DBResult};
@@ -68,14 +86,21 @@ pub struct GitManager {
     transport_registry: Arc<TransportRegistry>,
     /// Storage driver registry (Docker's graphdriver pattern)
     driver_registry: Arc<DriverRegistry>,
-    /// Background cleanup task handle (kept alive for the lifetime of GitManager)
+    /// Background cleanup thread handle (kept alive for the lifetime of GitManager).
+    ///
+    /// Using std::thread instead of tokio::spawn so the cleanup loop is not coupled
+    /// to any particular tokio runtime — tests create and destroy runtimes freely,
+    /// and a tokio task would be cancelled when its originating runtime shuts down.
     #[allow(dead_code)]
-    cleanup_handle: Option<tokio::task::JoinHandle<()>>,
+    cleanup_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl GitManager {
     /// Create a new GitManager with the given configuration
     pub fn new(config: Git2DBConfig) -> Self {
+        // Eagerly initialize libgit2 secondary subsystems before any concurrent use.
+        ensure_libgit2_initialized();
+
         let repo_cache = Arc::new(DashMap::new());
 
         let cleanup_handle = if config.performance.auto_cleanup {
@@ -83,6 +108,7 @@ impl GitManager {
                 repo_cache.clone(),
                 Duration::from_secs(config.performance.repo_cache_ttl_secs),
                 config.performance.max_repo_cache,
+                Duration::from_secs(config.performance.cleanup_interval_secs),
             ))
         } else {
             None
@@ -102,16 +128,20 @@ impl GitManager {
         }
     }
 
-    /// Start background cleanup task for expired cache entries
+    /// Start background cleanup thread for expired cache entries.
+    ///
+    /// Uses std::thread (not tokio::spawn) so the cleanup loop survives across
+    /// tokio runtime lifetimes — important for tests that create and destroy
+    /// runtimes while the global GitManager singleton stays alive.
     fn start_cleanup_task(
         cache: Arc<DashMap<PathBuf, CacheEntry>>,
         ttl: Duration,
         max_size: usize,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
+        interval: Duration,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
             loop {
-                interval.tick().await;
+                std::thread::sleep(interval);
 
                 // Remove expired entries
                 let expired: Vec<PathBuf> = cache
@@ -173,18 +203,19 @@ impl GitManager {
     /// # }
     /// ```
     pub fn init_with_config(config: Git2DBConfig) -> Result<(), crate::errors::Git2DBError> {
-        if GLOBAL_GIT_MANAGER.get().is_some() {
-            return Err(crate::errors::Git2DBError::configuration(
-                "GitManager is already initialized. Cannot reinitialize with new configuration.",
-            ));
-        }
-
+        // Use OnceCell::set atomically — no pre-check needed.
+        // A pre-check would be a TOCTOU: two threads could both pass `get().is_some()`
+        // and both call GitManager::new(), racing on set(). The loser's cleanup
+        // thread would be orphaned (harmless — sleeps with a dropped cache Arc) but
+        // the double-init is still a programmer error, so we return an error.
         GLOBAL_GIT_MANAGER
             .set(GitManager::new(config))
-            .map_err(|_| {
-                crate::errors::Git2DBError::internal("Failed to initialize global GitManager")
-            })
             .map(|_| ())
+            .map_err(|_| {
+                crate::errors::Git2DBError::configuration(
+                    "GitManager is already initialized. Cannot reinitialize.",
+                )
+            })
     }
 
     /// Get the global GitManager instance

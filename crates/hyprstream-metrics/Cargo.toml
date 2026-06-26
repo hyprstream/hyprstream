@@ -2,7 +2,7 @@
 name = "hyprstream-metrics"
 version = "0.1.0"
 edition = "2021"
-license = "AGPL-3.0"
+license = "MIT"
 repository = "https://github.com/hyprstream/hyprstream"
 description = "Metrics storage, aggregation, and query engine with DuckDB and DataFusion"
 

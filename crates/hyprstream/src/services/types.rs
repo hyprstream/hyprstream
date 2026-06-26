@@ -72,3 +72,13 @@ pub struct FsDirEntryInfo {
     pub is_dir: bool,
     pub size: u64,
 }
+
+impl From<hyprstream_vfs::DirEntry> for FsDirEntryInfo {
+    fn from(e: hyprstream_vfs::DirEntry) -> Self {
+        Self {
+            name: e.name,
+            is_dir: e.is_dir,
+            size: e.size,
+        }
+    }
+}

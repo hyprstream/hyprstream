@@ -1,5 +1,6 @@
 @0xa1b2c3d4e5f60718;
 
+using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".paramDescription;
 using import "/annotations.capnp".mcpScope;
@@ -61,12 +62,6 @@ struct WorkflowResponse {
 # =============================================================================
 # Common Types
 # =============================================================================
-
-struct ErrorInfo {
-  message @0 :Text;
-  code @1 :Text;
-  details @2 :Text;
-}
 
 struct KeyValue {
   key @0 :Text;

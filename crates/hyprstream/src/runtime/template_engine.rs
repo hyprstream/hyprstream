@@ -19,9 +19,47 @@ pub struct ChatMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<serde_json::Value>>,
+    pub tool_calls: Option<Vec<TemplatToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+}
+
+/// Tool call representation for template rendering.
+///
+/// Unlike the RPC/OpenAI `ToolCall` (where `arguments` is a JSON string),
+/// this type stores `arguments` as a `serde_json::Value` so that Jinja2
+/// templates can iterate with `|items` (e.g. Qwen3.5's template does
+/// `for args_name, args_value in tool_call.arguments|items`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemplatToolCall {
+    pub id: String,
+    #[serde(rename = "type", default)]
+    pub tool_type: String,
+    pub function: TemplateToolCallFunction,
+}
+
+/// Tool call function with parsed arguments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemplateToolCallFunction {
+    pub name: String,
+    /// Arguments as a structured JSON value (not a string).
+    /// Parsed from the RPC `ToolCallFunction.arguments` JSON string
+    /// at the ChatMessage conversion boundary.
+    pub arguments: serde_json::Value,
+}
+
+impl From<&crate::services::generated::inference_client::ToolCall> for TemplatToolCall {
+    fn from(tc: &crate::services::generated::inference_client::ToolCall) -> Self {
+        Self {
+            id: tc.id.clone(),
+            tool_type: tc.tool_type.clone(),
+            function: TemplateToolCallFunction {
+                name: tc.function.name.clone(),
+                arguments: serde_json::from_str(&tc.function.arguments)
+                    .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+            },
+        }
+    }
 }
 
 /// Template configuration loaded from tokenizer_config.json
@@ -124,6 +162,17 @@ impl TemplateEngine {
         add_generation_prompt: Option<bool>,
         tools: Option<&serde_json::Value>,
     ) -> Result<String> {
+        self.apply_chat_template_with_vars(messages, add_generation_prompt, tools, None, None)
+    }
+
+    pub fn apply_chat_template_with_vars(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: Option<bool>,
+        tools: Option<&serde_json::Value>,
+        enable_thinking: Option<bool>,
+        template_vars_json: Option<&str>,
+    ) -> Result<String> {
         // Use provided template or fall back to a default
         let template_str = self
             .config
@@ -157,8 +206,14 @@ impl TemplateEngine {
             None => Value::UNDEFINED,
         };
 
-        // Render the template
-        let rendered = tmpl.render(context! {
+        // enable_thinking: pass as Value so None → UNDEFINED (template uses its own default)
+        let thinking_value = match enable_thinking {
+            Some(v) => Value::from(v),
+            None => Value::UNDEFINED,
+        };
+
+        // Build base context
+        let mut ctx = context! {
             messages => messages,
             tools => tools_value,
             bos_token => self.config.bos_token.as_deref().unwrap_or(""),
@@ -169,7 +224,22 @@ impl TemplateEngine {
             cls_token => self.config.cls_token.as_deref().unwrap_or(""),
             additional_special_tokens => &self.config.additional_special_tokens,
             add_generation_prompt => add_gen,
-        })?;
+            enable_thinking => thinking_value,
+        };
+
+        // Merge additional template variables from JSON into context.
+        // minijinja's context! macro doesn't support dynamic keys, so we
+        // build a BTreeMap and merge via from_serialize.
+        if let Some(vars_json) = template_vars_json {
+            if !vars_json.is_empty() {
+                if let Ok(vars) = serde_json::from_str::<serde_json::Value>(vars_json) {
+                    ctx = context! { ..ctx, ..Value::from_serialize(&vars) };
+                }
+            }
+        }
+
+        // Render the template
+        let rendered = tmpl.render(ctx)?;
 
         Ok(rendered)
     }
@@ -670,5 +740,186 @@ CONTENT:{{ content }}
             transform_split_calls(r#"x.split("sep")[0]"#),
             "x|split_first('sep')"
         );
+    }
+
+    // ========================================================================
+    // Multi-turn and tool use tests
+    // ========================================================================
+
+    /// Simple ChatML template that handles all roles including tool
+    const CHATML_TEMPLATE: &str = r#"{% for message in messages %}{{'<|im_start|>' + message['role'] + '
+' + message['content'] + '<|im_end|>' + '
+'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant
+' }}{% endif %}"#;
+
+    /// ChatML template with tools support (simplified Qwen3-style)
+    const CHATML_WITH_TOOLS_TEMPLATE: &str = r#"{% if tools %}
+<|im_start|>system
+You are a helpful assistant with access to the following tools:
+
+{{ tools | tojson }}
+
+When you need to use a tool, respond with a tool_call block.<|im_end|>
+{% endif %}{% for message in messages %}{{'<|im_start|>' + message['role'] + '
+' + message['content'] + '<|im_end|>' + '
+'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant
+' }}{% endif %}"#;
+
+    fn make_tool(name: &str, description: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "location": { "type": "string", "description": "City name" }
+                    },
+                    "required": ["location"]
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn test_qwen3_template_with_tools() -> Result<()> {
+        let config = TemplateConfig {
+            chat_template: Some(CHATML_WITH_TOOLS_TEMPLATE.to_owned()),
+            ..Default::default()
+        };
+        let engine = TemplateEngine::new(config)?;
+
+        let messages = vec![
+            ChatMessage { role: "user".into(), content: Some("What's the weather?".into()), ..Default::default() },
+        ];
+        let tools = serde_json::json!([make_tool("get_weather", "Get current weather")]);
+
+        let result = engine.apply_chat_template(&messages, Some(true), Some(&tools))?;
+
+        // Tool definitions should appear in system message
+        assert!(result.contains("get_weather"), "should contain tool name");
+        assert!(result.contains("Get current weather"), "should contain tool description");
+        // User message present
+        assert!(result.contains("What's the weather?"));
+        // Generation prompt present
+        assert!(result.contains("<|im_start|>assistant"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_multi_turn_template_rendering() -> Result<()> {
+        let config = TemplateConfig {
+            chat_template: Some(CHATML_TEMPLATE.to_owned()),
+            ..Default::default()
+        };
+        let engine = TemplateEngine::new(config)?;
+
+        let messages = vec![
+            ChatMessage { role: "system".into(), content: Some("You are helpful.".into()), ..Default::default() },
+            ChatMessage { role: "user".into(), content: Some("Hello".into()), ..Default::default() },
+            ChatMessage { role: "assistant".into(), content: Some("Hi! How can I help?".into()), ..Default::default() },
+            ChatMessage { role: "user".into(), content: Some("Tell me a joke.".into()), ..Default::default() },
+        ];
+
+        let result = engine.apply_chat_template(&messages, Some(true), None)?;
+
+        // All messages in order
+        assert!(result.contains("You are helpful."));
+        assert!(result.contains("Hello"));
+        assert!(result.contains("Hi! How can I help?"));
+        assert!(result.contains("Tell me a joke."));
+
+        // Verify ordering: system before user, assistant before second user
+        let sys_pos = result.find("You are helpful.").unwrap();
+        let user1_pos = result.find("Hello").unwrap();
+        let asst_pos = result.find("Hi! How can I help?").unwrap();
+        let user2_pos = result.find("Tell me a joke.").unwrap();
+        assert!(sys_pos < user1_pos);
+        assert!(user1_pos < asst_pos);
+        assert!(asst_pos < user2_pos);
+
+        // Generation prompt at the end
+        let gen_pos = result.rfind("<|im_start|>assistant").unwrap();
+        assert!(gen_pos > user2_pos, "generation prompt should be after last user message");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_template_with_tool_call_history() -> Result<()> {
+        let config = TemplateConfig {
+            chat_template: Some(CHATML_TEMPLATE.to_owned()),
+            ..Default::default()
+        };
+        let engine = TemplateEngine::new(config)?;
+
+        // Full tool use conversation: user asks → assistant calls tool → tool responds → user follows up
+        let messages = vec![
+            ChatMessage { role: "user".into(), content: Some("What's the weather in NYC?".into()), ..Default::default() },
+            ChatMessage {
+                role: "assistant".into(),
+                content: Some(r#"<tool_call>{"name": "get_weather", "arguments": {"location": "NYC"}}</tool_call>"#.into()),
+                ..Default::default()
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some(r#"{"temperature": 72, "condition": "sunny"}"#.into()),
+                tool_call_id: Some("call_123".into()),
+                ..Default::default()
+            },
+            ChatMessage { role: "user".into(), content: Some("And in LA?".into()), ..Default::default() },
+        ];
+
+        let result = engine.apply_chat_template(&messages, Some(true), None)?;
+
+        // All roles rendered
+        assert!(result.contains("<|im_start|>user"));
+        assert!(result.contains("<|im_start|>assistant"));
+        assert!(result.contains("<|im_start|>tool"));
+
+        // Content preserved
+        assert!(result.contains("What's the weather in NYC?"));
+        assert!(result.contains("get_weather"));
+        assert!(result.contains("temperature"));
+        assert!(result.contains("And in LA?"));
+
+        // Proper ordering
+        let tool_call_pos = result.find("get_weather").unwrap();
+        let tool_resp_pos = result.find("temperature").unwrap();
+        let followup_pos = result.find("And in LA?").unwrap();
+        assert!(tool_call_pos < tool_resp_pos);
+        assert!(tool_resp_pos < followup_pos);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_template_tool_response_message() -> Result<()> {
+        let config = TemplateConfig {
+            chat_template: Some(CHATML_TEMPLATE.to_owned()),
+            ..Default::default()
+        };
+        let engine = TemplateEngine::new(config)?;
+
+        let messages = vec![
+            ChatMessage {
+                role: "tool".into(),
+                content: Some(r#"{"result": "success"}"#.into()),
+                tool_call_id: Some("call_abc".into()),
+                ..Default::default()
+            },
+        ];
+
+        let result = engine.apply_chat_template(&messages, Some(false), None)?;
+
+        // Tool role rendered distinctly
+        assert!(result.contains("<|im_start|>tool"));
+        assert!(result.contains(r#"{"result": "success"}"#));
+        // No generation prompt (add_generation_prompt = false)
+        assert!(!result.contains("<|im_start|>assistant"));
+
+        Ok(())
     }
 }

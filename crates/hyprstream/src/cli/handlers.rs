@@ -1,6 +1,7 @@
 //! CLI handlers for adaptive ML inference server
 
-use crate::services::GenRegistryClient;
+use crate::services::RegistryClient;
+use crate::services::generated::registry_client::CreateTagRequest;
 use crate::training::{CheckpointManager, WeightFormat, WeightSnapshot};
 use ::config::{Config, File};
 use reqwest::Client;
@@ -291,7 +292,7 @@ pub async fn handle_pretrain(
 
 /// Handle checkpoint write command
 pub async fn handle_write_checkpoint(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     model_id: String,
     _name: Option<String>,
     step: Option<usize>,
@@ -301,19 +302,19 @@ pub async fn handle_write_checkpoint(
     // Resolve model path via registry
     let model_ref = crate::storage::ModelRef::parse(&model_id)?;
     let branch_override = model_ref.git_ref_str();
-    let tracked = registry.get_by_name(&model_ref.model).await?;
+    let tracked = registry.get_by_name(model_ref.name()).await?;
     let repo_client = registry.repo(&tracked.id);
     let branch_name = match branch_override.as_deref() {
         Some(b) => b.to_owned(),
         None => repo_client.get_head().await?,
     };
     let worktrees = repo_client.list_worktrees().await?;
-    let model_path = std::path::PathBuf::from(
-        &worktrees.iter()
-            .find(|wt| wt.branch_name == branch_name)
-            .ok_or_else(|| anyhow::anyhow!("worktree for {}:{} not found", model_ref.model, branch_name))?
-            .path,
-    );
+    if !worktrees.iter().any(|wt| wt.branch_name == branch_name) {
+        return Err(format!("worktree for {}:{} not found", model_ref.name(), branch_name).into());
+    }
+    // Derive worktree path locally
+    let storage_paths = crate::storage::StoragePaths::new()?;
+    let model_path = storage_paths.worktree_path(model_ref.name(), &branch_name)?;
 
     // Create checkpoint manager
     let checkpoint_mgr = CheckpointManager::new(model_path.clone())?;
@@ -343,7 +344,7 @@ pub async fn handle_write_checkpoint(
 
 /// Handle checkpoint commit command
 pub async fn handle_commit_checkpoint(
-    registry: &GenRegistryClient,
+    registry: &RegistryClient,
     checkpoint_path: String,
     message: Option<String>,
     branch: Option<String>,
@@ -399,7 +400,7 @@ pub async fn handle_commit_checkpoint(
     // Create tag if requested
     if let Some(tag_name) = tag {
         if let Some(client) = &repo_client {
-            client.create_tag(&tag_name, "").await.map_err(|e| {
+            client.create_tag(&CreateTagRequest { name: tag_name.clone(), target: String::new() }).await.map_err(|e| {
                 error!("Failed to create tag '{}': {}", tag_name, e);
                 e
             })?;

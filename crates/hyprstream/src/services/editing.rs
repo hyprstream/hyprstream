@@ -21,14 +21,9 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 /// Document format for parsing/serialization.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DocFormat {
-    Toml,
-    Json,
-    Yaml,
-    Csv,
-    Text,
-}
+///
+/// Re-exports the generated Cap'n Proto enum — canonical OCI-aligned type.
+pub use crate::services::generated::registry_client::DocFormat;
 
 /// Shared CRDT document for a file, accessed by multiple clients.
 ///

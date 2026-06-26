@@ -7,66 +7,31 @@
 //! - Memory-mapped disk persistence
 //! - FlightSQL interface for embeddings and similarity search
 
-// Re-export annotations_capnp and streaming_capnp from hyprstream-rpc (compiled once, shared by all crates)
+// Re-export capnp modules from hyprstream-rpc (compiled once, shared by all crates)
 pub use hyprstream_rpc::annotations_capnp;
+pub use hyprstream_rpc::common_capnp;
 pub use hyprstream_rpc::streaming_capnp;
+pub use hyprstream_rpc::optional_capnp;
+pub use hyprstream_rpc::nine_capnp;
 
-// Cap'n Proto generated modules (must be at crate root for path resolution)
-// Note: common_capnp is in hyprstream-rpc crate (envelope types)
-pub mod events_capnp {
+// Cap'n Proto service modules — re-exported from hyprstream-rpc-std (MIT)
+pub use hyprstream_rpc_std::service_events_capnp as events_capnp;
+pub use hyprstream_rpc_std::inference_capnp;
+pub use hyprstream_rpc_std::registry_capnp;
+pub use hyprstream_rpc_std::policy_capnp;
+pub use hyprstream_rpc_std::model_capnp;
+pub use hyprstream_rpc_std::mcp_capnp;
+pub use hyprstream_rpc_std::notification_capnp;
+pub use hyprstream_rpc_std::metrics_capnp;
+pub use hyprstream_rpc_std::oauth_capnp;
+
+// TUI-specific Cap'n Proto modules (remain in hyprstream)
+pub mod tui_capnp {
     #![allow(dead_code, unused_imports)]
     #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
     #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
     #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-    include!(concat!(env!("OUT_DIR"), "/events_capnp.rs"));
-}
-
-pub mod inference_capnp {
-    #![allow(dead_code, unused_imports)]
-    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
-    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-    include!(concat!(env!("OUT_DIR"), "/inference_capnp.rs"));
-}
-
-pub mod registry_capnp {
-    #![allow(dead_code, unused_imports)]
-    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
-    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-    include!(concat!(env!("OUT_DIR"), "/registry_capnp.rs"));
-}
-
-pub mod policy_capnp {
-    #![allow(dead_code, unused_imports)]
-    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
-    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-    include!(concat!(env!("OUT_DIR"), "/policy_capnp.rs"));
-}
-
-pub mod model_capnp {
-    #![allow(dead_code, unused_imports)]
-    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
-    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-    include!(concat!(env!("OUT_DIR"), "/model_capnp.rs"));
-}
-
-pub mod mcp_capnp {
-    #![allow(dead_code, unused_imports)]
-    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
-    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-    include!(concat!(env!("OUT_DIR"), "/mcp_capnp.rs"));
-}
-
-pub mod worker_capnp {
-    #![allow(dead_code, unused_imports)]
-    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
-    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-    include!(concat!(env!("OUT_DIR"), "/worker_capnp.rs"));
+    include!(concat!(env!("OUT_DIR"), "/tui_capnp.rs"));
 }
 
 pub mod api;
@@ -87,7 +52,7 @@ pub mod storage;
 #[cfg(unix)]
 pub mod systemd;
 pub mod training;
-pub mod zmq;
+pub mod tui;
 
 // Storage exports removed
 pub use runtime::{

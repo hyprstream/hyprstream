@@ -1,8 +1,18 @@
 //! OAuth 2.1 Authorization Endpoint.
 //!
-//! Handles the authorization code flow with PKCE (S256).
-//! - GET /oauth/authorize — validates params, renders consent page
-//! - POST /oauth/authorize — on approval, generates auth code and redirects
+//! Handles the authorization code flow with PKCE (S256) and Ed25519 user authentication.
+//! - GET /oauth/authorize — validates params, renders Ed25519 challenge form
+//! - POST /oauth/authorize — verifies Ed25519 signature, generates auth code and redirects
+//!
+//! The consent page was replaced with an Ed25519 challenge-response form. The nonce is
+//! stored server-side (`OAuthState::pending_nonces`, 5-min TTL) and embedded as a hidden
+//! form field. On POST, the server verifies the nonce was issued by itself and consumes it
+//! (single-use). Challenge format:
+//!   `"{fingerprint}:{nonce}:{code_challenge}"`
+//! The `code_challenge` binding prevents the signature from being reused against a different
+//! PKCE session; the server-side nonce store enforces TTL and prevents replay. The client
+//! never asserts a username — the server resolves it from `fingerprint` via the
+//! `pubkey:{fingerprint} → username` reverse index in the UserStore.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,11 +27,13 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::RngCore;
 use serde::Deserialize;
 
-use super::registration::{fetch_client_metadata, validate_redirect_uri};
+use super::challenge;
+use super::device::html_escape;
+use super::registration::{resolve_cimd_client, validate_redirect_uri};
 use super::state::{OAuthState, PendingAuthCode};
 
 /// Authorization request query parameters
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AuthorizeParams {
     pub client_id: String,
     pub redirect_uri: String,
@@ -35,9 +47,47 @@ pub struct AuthorizeParams {
     /// RFC 8707 resource indicator
     #[serde(default)]
     pub resource: Option<String>,
+    /// OIDC nonce — echoed into id_token (OpenID Connect Core 1.0, Section 3.1.2.1)
+    #[serde(default)]
+    pub nonce: Option<String>,
 }
 
-/// Consent form submission
+/// Loosely-typed authorize query.
+///
+/// Accepts either inline parameters (the original authorize URL form) or a
+/// `request_uri` reference to a Pushed Authorization Request (RFC 9126).
+/// When `request_uri` is present, the inline parameters (except `client_id`)
+/// are ignored and the pushed snapshot is used instead.
+#[derive(Debug, Deserialize)]
+pub struct AuthorizeQuery {
+    #[serde(default)]
+    pub request_uri: Option<String>,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub redirect_uri: Option<String>,
+    #[serde(default)]
+    pub code_challenge: Option<String>,
+    #[serde(default)]
+    pub code_challenge_method: Option<String>,
+    #[serde(default)]
+    pub response_type: Option<String>,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub resource: Option<String>,
+    #[serde(default)]
+    pub nonce: Option<String>,
+}
+
+/// Consent form submission (Ed25519 challenge-response).
+///
+/// The client supplies its key fingerprint (not a username). The server
+/// resolves the username from the `pubkey:{fingerprint} → username` reverse
+/// index, then verifies the signature. The challenge string is
+/// `"{fingerprint}:{nonce}:{code_challenge}"`.
 #[derive(Debug, Deserialize)]
 pub struct ConsentForm {
     pub client_id: String,
@@ -48,14 +98,29 @@ pub struct ConsentForm {
     pub state: Option<String>,
     #[serde(default)]
     pub resource: Option<String>,
-    pub action: String,
+    /// Ed25519 nonce (from hidden form field; validated server-side against pending_nonces)
+    pub nonce: String,
+    /// SSH-style key fingerprint (`SHA256:...`) of the signing key.
+    pub fingerprint: String,
+    /// Base64-encoded Ed25519 signature
+    pub signature: String,
+    /// OIDC nonce (passed through from authorize request, stored in auth code)
+    #[serde(default)]
+    pub oidc_nonce: Option<String>,
 }
 
-/// GET /oauth/authorize — validate params and render consent page
+/// GET /oauth/authorize — validate params and render Ed25519 challenge form
 pub async fn authorize_get(
     State(state): State<Arc<OAuthState>>,
-    Query(params): Query<AuthorizeParams>,
+    Query(query): Query<AuthorizeQuery>,
 ) -> Response {
+    // Resolve params: either from a Pushed Authorization Request (RFC 9126)
+    // referenced by `request_uri`, or from inline query parameters.
+    let params = match resolve_authorize_query(&state, query).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+
     // Validate response_type
     if params.response_type != "code" {
         return error_response(
@@ -82,17 +147,23 @@ pub async fn authorize_get(
         );
     }
 
+    // Require UserStore for identity verification
+    if !state.has_user_store() {
+        return Html(render_error_page(
+            "Server Not Configured",
+            "This server is not configured for local user authentication. \
+             Contact your administrator to set up the user credential store.",
+        )).into_response();
+    }
+
     // Resolve client
     let (client_name, redirect_uris) = if params.client_id.starts_with("https://") {
-        // Client ID Metadata Document flow
-        match fetch_client_metadata(&state, &params.client_id).await {
-            Ok(client) => {
-                let name = client.client_name.clone();
-                let uris = client.redirect_uris.clone();
-                // Cache the client
-                state.clients.write().await.insert(client.client_id.clone(), client);
-                (name.unwrap_or_else(|| params.client_id.clone()), uris)
-            }
+        // Client ID Metadata Document flow (cache-aside via cimd_cache).
+        match resolve_cimd_client(&state, &params.client_id).await {
+            Ok(client) => (
+                client.client_name.unwrap_or_else(|| params.client_id.clone()),
+                client.redirect_uris,
+            ),
             Err(e) => {
                 return error_response(
                     StatusCode::BAD_REQUEST,
@@ -139,8 +210,18 @@ pub async fn authorize_get(
         .and_then(|u| u.host_str().map(std::borrow::ToOwned::to_owned))
         .unwrap_or_else(|| params.redirect_uri.clone());
 
-    // Render consent page
-    let html = render_consent_page(
+    // MCP spec § Localhost Redirect URI Risks: warn when the registered
+    // client only ever uses loopback redirect URIs. Such a client cannot
+    // be distinguished from another process on the same host binding the
+    // same loopback range, so users should be told explicitly that the
+    // app they're authorizing only proves local-machine presence.
+    let localhost_warning = compute_localhost_warning(&redirect_uris);
+
+    // Generate a nonce, store it server-side (5-min TTL, single-use on POST).
+    let nonce = issue_nonce(&state).await;
+
+    // Render challenge form
+    let html = render_challenge_page(
         &client_name,
         &scopes,
         &redirect_host,
@@ -149,29 +230,124 @@ pub async fn authorize_get(
         &params.code_challenge,
         params.state.as_deref().unwrap_or(""),
         params.resource.as_deref().unwrap_or(""),
+        &nonce,
+        params.nonce.as_deref().unwrap_or(""),
+        None,
+        localhost_warning.as_deref(),
     );
 
     Html(html).into_response()
 }
 
-/// POST /oauth/authorize — handle consent form submission
+/// POST /oauth/authorize — verify Ed25519 signature, issue auth code
 pub async fn authorize_post(
     State(state): State<Arc<OAuthState>>,
     Form(form): Form<ConsentForm>,
 ) -> Response {
-    if form.action == "deny" {
-        // Redirect with error
-        let mut redirect_url = form.redirect_uri.clone();
-        redirect_url.push_str("?error=access_denied&error_description=User+denied+access");
-        if let Some(ref s) = form.state {
-            redirect_url.push_str(&format!("&state={}", s));
+    // Validate and consume the nonce. Rejects forged nonces and enforces the 5-min TTL.
+    // Single-use: remove from pending_nonces whether valid or expired.
+    let nonce_valid = {
+        let mut nonces = state.pending_nonces.write().await;
+        match nonces.remove(&form.nonce) {
+            Some(expiry) => Instant::now() < expiry,
+            None => false,
         }
-        return Redirect::to(&redirect_url).into_response();
+    };
+    if !nonce_valid {
+        // Nonce was not issued by this server, already consumed, or expired.
+        // Validate redirect_uri and re-derive client info from the registry.
+        // If either fails, return an error page rather than re-rendering with
+        // attacker-controlled values.
+        let Some((client_name, redirect_host, localhost_warning)) =
+            derive_display_info(&state, &form.client_id, &form.redirect_uri).await
+        else {
+            return Html(render_error_page(
+                "Invalid Request",
+                "Unknown client or redirect URI. Please restart the authorization flow.",
+            )).into_response();
+        };
+        let fresh_nonce = issue_nonce(&state).await;
+        let html = render_challenge_page(
+            &client_name,
+            &form.scope,
+            &redirect_host,
+            &form.client_id,
+            &form.redirect_uri,
+            &form.code_challenge,
+            form.state.as_deref().unwrap_or(""),
+            form.resource.as_deref().unwrap_or(""),
+            &fresh_nonce,
+            form.oidc_nonce.as_deref().unwrap_or(""),
+            Some("Authorization request expired. Please try again."),
+            localhost_warning.as_deref(),
+        );
+        return Html(html).into_response();
     }
 
-    // Generate 32-byte random auth code
+    // Reconstruct challenge: "{fingerprint}:{nonce}:{code_challenge}"
+    // Binds signature to the key identity and the PKCE session. The server
+    // does not trust client-declared usernames — it resolves the username
+    // from the pubkey reverse index keyed by `form.fingerprint`.
+    let challenge_str = format!("{}:{}:{}", form.fingerprint, form.nonce, form.code_challenge);
+
+    // Get user store
+    let user_store = match state.user_store_reader() {
+        Some(store) => store,
+        None => {
+            return Html(render_error_page(
+                "Server Not Configured",
+                "User credential store not configured on this server.",
+            )).into_response();
+        }
+    };
+
+    // Verify Ed25519 challenge-response. The resolved username comes back
+    // from the reverse index; the client never asserts an identity.
+    let (resolved_username, verifying_key) = match challenge::verify_ed25519_response_by_fingerprint(
+        user_store.as_ref(),
+        &form.fingerprint,
+        &challenge_str,
+        &form.signature,
+    ).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            if matches!(e, challenge::ChallengeError::UserStoreError(_)) {
+                tracing::error!(fingerprint = %form.fingerprint, "UserStore lookup error during authorize");
+            }
+            // Validate redirect_uri and re-derive client display info from the registry.
+            // Never trust the POST body for display values; return an error page if
+            // the client or redirect_uri is no longer valid.
+            let Some((client_name, redirect_host, localhost_warning)) =
+                derive_display_info(&state, &form.client_id, &form.redirect_uri).await
+            else {
+                return Html(render_error_page(
+                    "Invalid Request",
+                    "Unknown client or redirect URI. Please restart the authorization flow.",
+                )).into_response();
+            };
+            // Issue a fresh nonce so re-render shows a signable challenge.
+            let fresh_nonce = issue_nonce(&state).await;
+            let html = render_challenge_page(
+                &client_name,
+                &form.scope,
+                &redirect_host,
+                &form.client_id,
+                &form.redirect_uri,
+                &form.code_challenge,
+                form.state.as_deref().unwrap_or(""),
+                form.resource.as_deref().unwrap_or(""),
+                &fresh_nonce,
+                form.oidc_nonce.as_deref().unwrap_or(""),
+                Some(e.message()),
+                localhost_warning.as_deref(),
+            );
+            return Html(html).into_response();
+        }
+    };
+
+    // Signature valid — generate auth code
     let mut code_bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut code_bytes);
+    rand::rngs::OsRng.fill_bytes(&mut code_bytes);
     let code = URL_SAFE_NO_PAD.encode(code_bytes);
 
     let scopes: Vec<String> = form.scope.split_whitespace().map(std::borrow::ToOwned::to_owned).collect();
@@ -183,26 +359,213 @@ pub async fn authorize_post(
         redirect_uri: form.redirect_uri.clone(),
         code_challenge: form.code_challenge.clone(),
         scopes,
+        oidc_nonce: form.oidc_nonce.clone(),
         resource,
         created_at: Instant::now(),
         expires_at: Instant::now() + Duration::from_secs(60),
+        username: resolved_username.clone(),
+        verifying_key: Some(verifying_key),
     };
 
     state.pending_codes.write().await.insert(code.clone(), pending);
 
     tracing::info!(
         client_id = %form.client_id,
+        username = %resolved_username,
+        fingerprint = %form.fingerprint,
         redirect_uri = %form.redirect_uri,
         "Authorization code issued, redirecting"
     );
 
-    // Redirect with code
-    let mut redirect_url = format!("{}?code={}", form.redirect_uri, code);
-    if let Some(ref s) = form.state {
-        redirect_url.push_str(&format!("&state={}", s));
-    }
+    // Build redirect URL using url::Url to ensure proper percent-encoding of `state`.
+    let redirect_url = match url::Url::parse(&form.redirect_uri) {
+        Ok(mut u) => {
+            {
+                let mut q = u.query_pairs_mut();
+                q.append_pair("code", &code);
+                if let Some(ref s) = form.state {
+                    q.append_pair("state", s);
+                }
+            }
+            u.to_string()
+        }
+        Err(_) => {
+            // redirect_uri was validated on GET; this should not happen
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "Invalid redirect_uri",
+            );
+        }
+    };
 
     Redirect::to(&redirect_url).into_response()
+}
+
+/// Resolve an `AuthorizeQuery` into a concrete `AuthorizeParams`.
+///
+/// Two paths:
+/// - **PAR (RFC 9126):** if `request_uri` is set, look it up in
+///   `pending_par_requests`, check TTL, consume (single-use), and return the
+///   stored snapshot. If a `client_id` is also present on the URL, it must
+///   match the pushed snapshot's `client_id` (RFC 9126 §4).
+/// - **Inline:** require the same fields the legacy URL form required.
+async fn resolve_authorize_query(
+    state: &OAuthState,
+    query: AuthorizeQuery,
+) -> Result<AuthorizeParams, Response> {
+    if let Some(request_uri) = query.request_uri.as_deref() {
+        let entry = {
+            let mut store = state.pending_par_requests.write().await;
+            store.remove(request_uri)
+        };
+        let Some(entry) = entry else {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Unknown or already-consumed request_uri",
+            ));
+        };
+        if entry.is_expired() {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "request_uri expired",
+            ));
+        }
+        // RFC 9126 §4: client_id MAY appear alongside request_uri; if present,
+        // it MUST match the pushed snapshot.
+        if let Some(client_id) = query.client_id.as_deref() {
+            if client_id != entry.params.client_id {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "client_id does not match pushed authorization request",
+                ));
+            }
+        }
+        return Ok(entry.params);
+    }
+
+    // Enforce PAR-required mode (RFC 9126 §10.1): when the server requires PAR,
+    // inline parameters without a request_uri must be rejected.
+    if state.require_pushed_authorization_requests {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "This server requires a Pushed Authorization Request (RFC 9126). \
+             Submit your authorization parameters to /oauth/par first and use the returned request_uri.",
+        ));
+    }
+
+    // Inline path: enforce the originally-required fields.
+    let AuthorizeQuery {
+        client_id,
+        redirect_uri,
+        code_challenge,
+        code_challenge_method,
+        response_type,
+        state: state_param,
+        scope,
+        resource,
+        nonce,
+        ..
+    } = query;
+    let missing = |field: &str| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            &format!("{field} is required"),
+        )
+    };
+    Ok(AuthorizeParams {
+        client_id: client_id.ok_or_else(|| missing("client_id"))?,
+        redirect_uri: redirect_uri.ok_or_else(|| missing("redirect_uri"))?,
+        code_challenge: code_challenge.ok_or_else(|| missing("code_challenge"))?,
+        code_challenge_method: code_challenge_method
+            .ok_or_else(|| missing("code_challenge_method"))?,
+        response_type: response_type.ok_or_else(|| missing("response_type"))?,
+        state: state_param,
+        scope,
+        resource,
+        nonce,
+    })
+}
+
+/// Generate a fresh nonce and record it in `pending_nonces` with a 5-min expiry.
+async fn issue_nonce(state: &OAuthState) -> String {
+    let mut nonce_bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = URL_SAFE_NO_PAD.encode(nonce_bytes);
+    let expiry = Instant::now() + Duration::from_secs(300);
+    state.pending_nonces.write().await.insert(nonce.clone(), expiry);
+    nonce
+}
+
+/// Re-derive client display name and redirect host from the registry, validating
+/// that `redirect_uri` is registered for the client.
+///
+/// Returns `None` if the client is not in the registry or `redirect_uri` is not
+/// among its registered URIs — callers must return an error page in that case.
+/// This ensures that POST body values are never trusted for UI display without
+/// first being validated against the canonical server-side registry.
+async fn derive_display_info(
+    state: &OAuthState,
+    client_id: &str,
+    redirect_uri: &str,
+) -> Option<(String, String, Option<String>)> {
+    // CIMD-shaped client_ids (HTTPS URLs) live in cimd_cache; DCR-issued
+    // UUIDs live in state.clients. Try CIMD first since the cache hit
+    // path is cheap and CIMD URLs never collide with DCR UUIDs.
+    let client = if client_id.starts_with("https://") {
+        state.cimd_cache.get(client_id).await?
+    } else {
+        state.clients.read().await.get(client_id)?.clone()
+    };
+
+    // Validate redirect_uri against the client's registered URIs before displaying it.
+    if !validate_redirect_uri(redirect_uri, &client.redirect_uris) {
+        return None;
+    }
+
+    let client_name = client
+        .client_name
+        .clone()
+        .unwrap_or_else(|| client_id.to_owned());
+    let redirect_host = url::Url::parse(redirect_uri)
+        .ok()
+        .and_then(|u| u.host_str().map(std::borrow::ToOwned::to_owned))
+        .unwrap_or_else(|| redirect_uri.to_owned());
+    let localhost_warning = compute_localhost_warning(&client.redirect_uris);
+    Some((client_name, redirect_host, localhost_warning))
+}
+
+/// Build the consent-screen localhost warning when every registered
+/// redirect URI is loopback. Returns `None` if at least one non-loopback
+/// URI is registered (the client can prove ownership via that URI).
+///
+/// MCP 2025-11-25 § Localhost Redirect URI Risks: a malicious app on the
+/// same host can claim any localhost port, so a localhost-only client
+/// cannot be cryptographically distinguished from an impostor. Users
+/// SHOULD see a clear warning.
+fn compute_localhost_warning(redirect_uris: &[String]) -> Option<String> {
+    if redirect_uris.is_empty() {
+        return None;
+    }
+    let all_loopback = redirect_uris
+        .iter()
+        .all(|u| super::registration::is_loopback_uri(u));
+    if !all_loopback {
+        return None;
+    }
+    Some(format!(
+        "This application only redirects to localhost. \
+         Any program running on this machine can claim to be it — \
+         only authorize if you started this flow yourself. \
+         ({} loopback URI{} registered)",
+        redirect_uris.len(),
+        if redirect_uris.len() == 1 { "" } else { "s" },
+    ))
 }
 
 fn error_response(status: StatusCode, error: &str, description: &str) -> Response {
@@ -215,9 +578,38 @@ fn error_response(status: StatusCode, error: &str, description: &str) -> Respons
     ).into_response()
 }
 
-/// Render the minimal consent page HTML.
+/// Render an error page (HTML) for configuration errors.
+fn render_error_page(title: &str, message: &str) -> String {
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title_esc} — hyprstream</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         max-width: 480px; margin: 60px auto; padding: 0 20px; color: #1a1a1a; background: #fafafa; }}
+  .card {{ background: #fff; border-radius: 12px; padding: 32px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }}
+  h1 {{ font-size: 1.4rem; margin: 0 0 8px; color: #cc0000; }}
+  p {{ color: #555; line-height: 1.5; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>{title_esc}</h1>
+  <p>{message_esc}</p>
+</div>
+</body>
+</html>"#,
+        title_esc = html_escape(title),
+        message_esc = html_escape(message),
+    )
+}
+
+/// Render the Ed25519 challenge form (replaces the old Approve/Deny consent page).
 #[allow(clippy::too_many_arguments)]
-fn render_consent_page(
+fn render_challenge_page(
     client_name: &str,
     scopes: &str,
     redirect_host: &str,
@@ -226,14 +618,18 @@ fn render_consent_page(
     code_challenge: &str,
     state: &str,
     resource: &str,
+    nonce: &str,
+    oidc_nonce: &str,
+    error: Option<&str>,
+    localhost_warning: Option<&str>,
 ) -> String {
-    // HTML-escape helper (basic)
-    let esc = |s: &str| -> String {
-        s.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-            .replace('\'', "&#x27;")
+    let error_html = match error {
+        Some(msg) => format!(r#"<div class="error">{}</div>"#, html_escape(msg)),
+        None => String::new(),
+    };
+    let warning_html = match localhost_warning {
+        Some(msg) => format!(r#"<div class="warn">{}</div>"#, html_escape(msg)),
+        None => String::new(),
     };
 
     format!(
@@ -245,31 +641,45 @@ fn render_consent_page(
 <title>Authorize — hyprstream</title>
 <style>
   body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-         max-width: 480px; margin: 60px auto; padding: 0 20px; color: #1a1a1a; background: #fafafa; }}
+         max-width: 520px; margin: 60px auto; padding: 0 20px; color: #1a1a1a; background: #fafafa; }}
   .card {{ background: #fff; border-radius: 12px; padding: 32px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }}
   h1 {{ font-size: 1.4rem; margin: 0 0 8px; }}
   .client {{ color: #0066cc; font-weight: 600; }}
   .scopes {{ background: #f5f5f5; border-radius: 8px; padding: 12px 16px; margin: 16px 0;
              font-family: monospace; font-size: 0.9rem; }}
   .redirect {{ font-size: 0.85rem; color: #666; margin: 12px 0; }}
-  .actions {{ display: flex; gap: 12px; margin-top: 24px; }}
-  button {{ flex: 1; padding: 12px; border: none; border-radius: 8px; font-size: 1rem;
-           cursor: pointer; font-weight: 500; }}
-  .approve {{ background: #0066cc; color: #fff; }}
-  .approve:hover {{ background: #0052a3; }}
-  .deny {{ background: #e8e8e8; color: #333; }}
-  .deny:hover {{ background: #d0d0d0; }}
+  .error {{ background: #fff0f0; color: #cc0000; border-radius: 8px; padding: 12px 16px;
+            margin: 12px 0; font-size: 0.9rem; }}
+  .warn {{ background: #fff7e6; color: #8a5a00; border-left: 3px solid #d4960c;
+           border-radius: 0 8px 8px 0; padding: 12px 14px; margin: 12px 0; font-size: 0.88rem; }}
+  .step {{ background: #f0f6ff; border-left: 3px solid #0066cc; padding: 10px 14px;
+           margin: 12px 0; border-radius: 0 6px 6px 0; font-size: 0.88rem; color: #333; }}
+  code {{ background: #f0f0f0; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; word-break: break-all; }}
+  label {{ display: block; margin-top: 16px; color: #333; font-size: 0.9rem; font-weight: 500; }}
+  input[type=text] {{ width: 100%; padding: 10px; font-size: 0.9rem; border: 2px solid #ddd;
+                       border-radius: 8px; box-sizing: border-box; margin-top: 4px; }}
+  input[type=text]:focus {{ border-color: #0066cc; outline: none; }}
+  button {{ width: 100%; padding: 12px; border: none; border-radius: 8px; font-size: 1rem;
+           cursor: pointer; font-weight: 500; background: #0066cc; color: #fff; margin-top: 24px; }}
+  button:hover {{ background: #0052a3; }}
 </style>
 </head>
 <body>
 <div class="card">
   <h1>Authorize Application</h1>
-  <p><span class="client">{client_name}</span> wants to access your hyprstream resources.</p>
+  <p><span class="client">{client_name_esc}</span> wants to access your hyprstream resources.</p>
   <div class="scopes">
     <strong>Requested scopes:</strong><br>
     {scopes_display}
   </div>
-  <p class="redirect">Will redirect to: <code>{redirect_host}</code></p>
+  <p class="redirect">Will redirect to: <code>{redirect_host_esc}</code></p>
+  {warning_html}
+  {error_html}
+  <div class="step">
+    <strong>Sign the challenge on your workstation:</strong><br/>
+    <code>hyprstream sign-challenge --nonce {nonce_esc} --code-challenge {code_challenge_esc}</code><br/>
+    Copy the printed <em>Fingerprint</em> and <em>Signature</em> below.
+  </div>
   <form method="post" action="/oauth/authorize">
     <input type="hidden" name="client_id" value="{client_id_val}">
     <input type="hidden" name="redirect_uri" value="{redirect_uri_val}">
@@ -277,25 +687,76 @@ fn render_consent_page(
     <input type="hidden" name="scope" value="{scope_val}">
     <input type="hidden" name="state" value="{state_val}">
     <input type="hidden" name="resource" value="{resource_val}">
-    <div class="actions">
-      <button type="submit" name="action" value="deny" class="deny">Deny</button>
-      <button type="submit" name="action" value="approve" class="approve">Approve</button>
-    </div>
+    <input type="hidden" name="nonce" value="{nonce_val}">
+    <input type="hidden" name="oidc_nonce" value="{oidc_nonce_val}">
+    <label>Key fingerprint (SHA256:...):
+      <input type="text" name="fingerprint" required autocomplete="off" autofocus
+             placeholder="SHA256:..." spellcheck="false"/>
+    </label>
+    <label>Signature (base64, 88 chars):
+      <input type="text" name="signature" required size="88" autocomplete="off"
+             placeholder="base64-encoded Ed25519 signature"/>
+    </label>
+    <button type="submit">Authorize</button>
   </form>
 </div>
 </body>
 </html>"#,
-        client_name = esc(client_name),
+        client_name_esc = html_escape(client_name),
         scopes_display = scopes.split_whitespace()
-            .map(|s| format!("<code>{}</code>", esc(s)))
+            .map(|s| format!("<code>{}</code>", html_escape(s)))
             .collect::<Vec<_>>()
             .join(", "),
-        redirect_host = esc(redirect_host),
-        client_id_val = esc(client_id),
-        redirect_uri_val = esc(redirect_uri),
-        code_challenge_val = esc(code_challenge),
-        scope_val = esc(scopes),
-        state_val = esc(state),
-        resource_val = esc(resource),
+        redirect_host_esc = html_escape(redirect_host),
+        warning_html = warning_html,
+        error_html = error_html,
+        nonce_esc = html_escape(nonce),
+        code_challenge_esc = html_escape(code_challenge),
+        client_id_val = html_escape(client_id),
+        redirect_uri_val = html_escape(redirect_uri),
+        code_challenge_val = html_escape(code_challenge),
+        scope_val = html_escape(scopes),
+        state_val = html_escape(state),
+        resource_val = html_escape(resource),
+        nonce_val = html_escape(nonce),
+        oidc_nonce_val = html_escape(oidc_nonce),
     )
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn localhost_warning_fires_when_all_loopback() {
+        let uris = vec![
+            "http://127.0.0.1:3000/cb".to_owned(),
+            "http://localhost:8080/cb".to_owned(),
+        ];
+        let warn = compute_localhost_warning(&uris).unwrap();
+        assert!(warn.contains("localhost"));
+        assert!(warn.contains('2'), "should mention the count");
+    }
+
+    #[test]
+    fn localhost_warning_suppressed_when_any_public_uri() {
+        let uris = vec![
+            "http://127.0.0.1:3000/cb".to_owned(),
+            "https://app.example.com/cb".to_owned(),
+        ];
+        assert!(compute_localhost_warning(&uris).is_none());
+    }
+
+    #[test]
+    fn localhost_warning_singular_count_grammar() {
+        let uris = vec!["http://localhost:3000/cb".to_owned()];
+        let warn = compute_localhost_warning(&uris).unwrap();
+        assert!(warn.contains("1 loopback URI registered"));
+    }
+
+    #[test]
+    fn localhost_warning_empty_returns_none() {
+        assert!(compute_localhost_warning(&[]).is_none());
+    }
 }

@@ -24,7 +24,9 @@ use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::config::{GenerationRequest, GenerationResult, ModelInfo};
+use crate::config::GenerationResult;
+use crate::runtime::GenerationRequest;
+use crate::runtime::ModelInfo;
 use crate::training::TenantDeltaConfig;
 use crate::runtime::kv_cache::CacheOwner;
 use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
@@ -129,13 +131,14 @@ impl LocalInferenceService {
         // Initialize KV cache registry for session-based cache isolation
         // This enables concurrent inference with isolated context per session
         let model_info = engine.model_info();
-        let num_layers = model_info.num_hidden_layers.unwrap_or(32);
-        let max_seq_len = config.max_context.unwrap_or(model_info.context_length);
+        let num_layers = model_info.num_hidden_layers.unwrap_or(32) as usize;
+        let max_seq_len = config.max_context.unwrap_or(model_info.context_length) as usize;
+        let kv_budget = engine.compute_kv_budget();
         engine.initialize_kv_registry(
             num_layers,
             max_seq_len,
             config.kv_quant_type,
-            None, // No memory budget limit for now
+            kv_budget,
         );
         info!(
             "KV cache registry initialized: {} layers, max_seq_len={}",
@@ -250,6 +253,11 @@ impl LocalInferenceService {
                 let _ = reply.send(result);
             }
 
+            InferenceRequest::Embed { images, reply } => {
+                let result = self.handle_embed(images).await;
+                let _ = reply.send(result);
+            }
+
             InferenceRequest::HealthCheck { reply } => {
                 // Service is healthy if we can respond
                 let _ = reply.send(Ok(()));
@@ -313,6 +321,16 @@ impl LocalInferenceService {
                 let _ = stats_sender.send(StreamStats::default());
             }
         }
+    }
+
+    /// Handle embedding request.
+    async fn handle_embed(
+        &self,
+        images: Vec<Vec<u8>>,
+    ) -> Result<Vec<Vec<f32>>, InferenceError> {
+        self.engine
+            .embed_images(&images)
+            .map_err(|e| InferenceError::Generation(e.to_string()))
     }
 }
 
@@ -467,6 +485,17 @@ impl InferenceClient for LocalInferenceClient {
         self.sender
             .send(InferenceRequest::ReleaseSession {
                 session_id: session_id.to_owned(),
+                reply: tx,
+            })
+            .map_err(|_| InferenceError::Unavailable)?;
+        rx.await.map_err(|_| InferenceError::channel("No response"))?
+    }
+
+    async fn embed(&self, images: &[Vec<u8>]) -> Result<Vec<Vec<f32>>, InferenceError> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(InferenceRequest::Embed {
+                images: images.to_vec(),
                 reply: tx,
             })
             .map_err(|_| InferenceError::Unavailable)?;

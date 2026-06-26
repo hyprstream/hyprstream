@@ -49,7 +49,7 @@ pub fn ensure_units(services: &[String]) -> bool {
     };
 
     rt.block_on(async {
-        let manager = match hyprstream_rpc::detect_service_manager().await {
+        let manager = match hyprstream_service::detect_service_manager().await {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!("Failed to detect service manager: {}", e);

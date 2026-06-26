@@ -18,7 +18,19 @@ inventory::submit!(DriverFactory::new(
 
 /// Overlay2 storage driver (Linux overlayfs)
 ///
-/// Automatically tries mount methods in order: kernel → userns → fuse
+/// Automatically tries mount methods in order: kernel → userns → fuse.
+///
+/// # Role in the writable union (#394)
+///
+/// This driver mounts the per-worktree overlay whose **upper** directory is
+/// the node-local, append-only writable layer of the union namespace. The
+/// union copy-up primitive lives in `hyprstream_vfs::Namespace` (above this
+/// driver): a write to a path that exists only in the read-only `/oid` floor
+/// is redirected to the writable upper, which the kernel overlayfs presents as
+/// a regular filesystem. Promote (`hyprstream::git::promote`) snapshots the
+/// upper via `stageAll` + `commit`, draining it into an immutable
+/// content-addressed registry commit; after promote the upper is empty and the
+/// floor advances to the new commit.
 #[allow(dead_code)] // Constructed via inventory::submit! when overlayfs feature enabled
 pub struct Overlay2Driver;
 
@@ -108,8 +120,13 @@ impl Driver for Overlay2Driver {
         info!("Successfully mounted using {}", mount_method);
 
         // Create git worktree at the desired path
-        self.create_git_worktree(&opts.base_repo, &opts.worktree_path, &opts.ref_spec)
+        self.create_git_worktree(&opts.base_repo, &opts.worktree_path, &opts.ref_spec, opts.progress.clone())
             .await?;
+
+        // Apply pathspec filter if requested
+        if let Some(ref paths) = opts.checkout_paths {
+            super::vfs::apply_pathspec_filter(&opts.worktree_path, paths)?;
+        }
 
         // Create handle with cleanup
         let mount_point = mount_dir.clone();
@@ -448,67 +465,86 @@ impl Overlay2Driver {
         base_repo: &Path,
         worktree_path: &Path,
         ref_spec: &str,
+        progress: Option<std::sync::Arc<dyn crate::callback_config::ProgressReporter>>,
     ) -> Git2DBResult<()> {
-        // Open the base repository
-        let repo = git2::Repository::open(base_repo)
-            .map_err(|e| Git2DBError::internal(format!("Failed to open repository: {e}")))?;
+        let base_repo = base_repo.to_path_buf();
+        let worktree_path = worktree_path.to_path_buf();
+        let ref_spec = ref_spec.to_owned();
 
-        // Resolve ref_spec to a commit
-        let object = repo.revparse_single(ref_spec).map_err(|e| {
-            Git2DBError::internal(format!("Failed to resolve ref '{ref_spec}': {e}"))
-        })?;
+        tokio::task::spawn_blocking(move || {
+            // Set up smudge progress hook if progress reporter is available
+            if let Some(ref reporter) = progress {
+                let r = std::sync::Arc::clone(reporter);
+                git_xet_filter::set_smudge_progress(std::sync::Arc::new(move |count, _path| {
+                    r.report("smudge", count, 0);
+                }));
+            }
 
-        let commit = object.peel_to_commit().map_err(|e| {
-            Git2DBError::internal(format!(
-                "Ref '{ref_spec}' does not point to a commit: {e}"
-            ))
-        })?;
+            let result = (|| -> Git2DBResult<()> {
+                let repo = git2::Repository::open(&base_repo)
+                    .map_err(|e| Git2DBError::internal(format!("Failed to open repository: {e}")))?;
 
-        // Check if this is a branch
-        let branch_ref_name = format!("refs/heads/{ref_spec}");
-        let is_branch = repo.find_reference(&branch_ref_name).is_ok();
+                let object = repo.revparse_single(&ref_spec).map_err(|e| {
+                    Git2DBError::internal(format!("Failed to resolve ref '{ref_spec}': {e}"))
+                })?;
 
-        // Create worktree name
-        let worktree_name = worktree_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| {
-                Git2DBError::invalid_path(worktree_path.to_path_buf(), "Invalid worktree path")
-            })?;
+                let commit = object.peel_to_commit().map_err(|e| {
+                    Git2DBError::internal(format!(
+                        "Ref '{ref_spec}' does not point to a commit: {e}"
+                    ))
+                })?;
 
-        // Create worktree at the desired path (no conflict now since mount is elsewhere)
-        if is_branch {
-            let reference = repo.find_reference(&branch_ref_name)?;
-            repo.worktree(
-                worktree_name,
-                worktree_path,
-                Some(git2::WorktreeAddOptions::new().reference(Some(&reference))),
-            )
-            .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {e}")))?;
+                let branch_ref_name = format!("refs/heads/{ref_spec}");
+                let is_branch = repo.find_reference(&branch_ref_name).is_ok();
 
-            info!(
-                "Created overlay2 worktree at {} for branch '{}' (commit: {})",
-                worktree_path.display(),
-                ref_spec,
-                commit.id()
-            );
-        } else {
-            repo.worktree(worktree_name, worktree_path, None)
-                .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {e}")))?;
+                let worktree_name = worktree_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| {
+                        Git2DBError::invalid_path(worktree_path.clone(), "Invalid worktree path")
+                    })?;
 
-            let wt_repo = git2::Repository::open(worktree_path)?;
-            wt_repo.set_head_detached(commit.id())?;
-            wt_repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
+                if is_branch {
+                    let reference = repo.find_reference(&branch_ref_name)?;
+                    repo.worktree(
+                        worktree_name,
+                        &worktree_path,
+                        Some(git2::WorktreeAddOptions::new().reference(Some(&reference))),
+                    )
+                    .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {e}")))?;
 
-            info!(
-                "Created overlay2 worktree at {} for ref '{}' (detached HEAD at {})",
-                worktree_path.display(),
-                ref_spec,
-                commit.id()
-            );
-        }
+                    info!(
+                        "Created overlay2 worktree at {} for branch '{}' (commit: {})",
+                        worktree_path.display(),
+                        ref_spec,
+                        commit.id()
+                    );
+                } else {
+                    repo.worktree(worktree_name, &worktree_path, None)
+                        .map_err(|e| Git2DBError::internal(format!("Failed to create worktree: {e}")))?;
 
-        Ok(())
+                    let wt_repo = git2::Repository::open(&worktree_path)?;
+                    wt_repo.set_head_detached(commit.id())?;
+                    wt_repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
+
+                    info!(
+                        "Created overlay2 worktree at {} for ref '{}' (detached HEAD at {})",
+                        worktree_path.display(),
+                        ref_spec,
+                        commit.id()
+                    );
+                }
+
+                Ok(())
+            })();
+
+            // Always clear smudge progress hook
+            git_xet_filter::clear_smudge_progress();
+
+            result
+        })
+        .await
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?
     }
 
     /// Check if a worktree is managed by overlay2 driver

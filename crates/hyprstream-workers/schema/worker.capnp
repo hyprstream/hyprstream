@@ -1,5 +1,7 @@
 @0xb3c4d5e6f7a8b9c0;
 
+using import "/common.capnp".ErrorInfo;
+using import "/common.capnp".Timestamp;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".paramDescription;
 using import "/annotations.capnp".mcpScope;
@@ -215,21 +217,9 @@ struct ImageResponse {
 # Common Types
 # =============================================================================
 
-struct ErrorInfo {
-  message @0 :Text;
-  code @1 :Text;
-  details @2 :Text;
-}
-
 struct KeyValue {
   key @0 :Text;
   value @1 :Text;
-}
-
-# UTC timestamp with nanosecond precision
-struct Timestamp {
-  seconds @0 :Int64;   # Seconds since Unix epoch (1970-01-01T00:00:00Z)
-  nanos @1 :Int32;     # Nanosecond offset [0, 999999999]
 }
 
 # =============================================================================

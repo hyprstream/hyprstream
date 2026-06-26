@@ -19,7 +19,7 @@ pub mod registry_client {
 pub mod policy_client {
     #![allow(dead_code, unused_imports, unused_variables)]
     #![allow(clippy::all)]
-    hyprstream_rpc_derive::generate_rpc_service!("policy");
+    hyprstream_rpc_derive::generate_rpc_service!("policy", scope_handlers);
 }
 
 pub mod inference_client {
@@ -31,8 +31,34 @@ pub mod inference_client {
 pub mod mcp_client {
     #![allow(dead_code, unused_imports, unused_variables)]
     #![allow(clippy::all)]
-    hyprstream_rpc_derive::generate_rpc_service!("mcp");
+    hyprstream_rpc_derive::generate_rpc_service!("mcp", scope_handlers);
+}
+
+pub use hyprstream_discovery::generated::discovery_client;
+
+pub mod notification_client {
+    #![allow(dead_code, unused_imports, unused_variables)]
+    #![allow(clippy::all)]
+    hyprstream_rpc_derive::generate_rpc_service!("notification", scope_handlers);
+}
+
+pub mod tui_client {
+    #![allow(dead_code, unused_imports, unused_variables)]
+    #![allow(clippy::all)]
+    hyprstream_rpc_derive::generate_rpc_service!("tui", scope_handlers);
+}
+
+pub mod metrics_client {
+    #![allow(dead_code, unused_imports, unused_variables)]
+    #![allow(clippy::all)]
+    hyprstream_rpc_derive::generate_rpc_service!("metrics", scope_handlers);
 }
 
 // worker_client — use hyprstream_workers::generated::worker_client instead.
 // workflow_client — use hyprstream_workers::generated::workflow_client instead.
+
+pub mod oauth_client {
+    #![allow(dead_code, unused_imports, unused_variables)]
+    #![allow(clippy::all)]
+    hyprstream_rpc_derive::generate_rpc_service!("oauth", scope_handlers);
+}

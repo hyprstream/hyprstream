@@ -44,17 +44,23 @@ pub async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
-    // Get JWT token from Authorization header
+    // Get JWT token from Authorization header (RFC 6750: Bearer scheme is case-insensitive)
     let token = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .map(str::trim);
+        .and_then(|h| {
+            if h.len() > 7 && h[..7].eq_ignore_ascii_case("bearer ") {
+                Some(h[7..].trim())
+            } else {
+                None
+            }
+        });
 
-    // If no token provided, allow anonymous access
+    // SECURITY: No anonymous access — require Bearer token
     let Some(token) = token else {
-        return next.run(request).await;
+        let www_authenticate = build_www_authenticate(&state);
+        return unauthorized_response("Authentication required", &www_authenticate);
     };
 
     // Build WWW-Authenticate header for 401 responses (RFC 9728)
@@ -62,34 +68,62 @@ pub async fn auth_middleware(
 
     // Try JWT validation (stateless)
     if token.contains('.') {
-        match jwt::decode(token, &state.verifying_key) {
+        // Extract iss from token payload without signature verification
+        let iss = extract_iss_from_token(token);
+
+        let local_issuers: &[&str] = &[&*state.oauth_issuer_url];
+        let result = if hyprstream_rpc::auth::is_local_iss(&iss, local_issuers) {
+            // Local token: verify with local key
+            jwt::decode(token, &state.verifying_key, Some(&state.resource_url))
+        } else {
+            // Federated token: pre-check trust before acquiring async lock
+            if !state.federation_resolver.is_trusted(&iss) {
+                debug!("Untrusted federation issuer: {}", iss);
+                return unauthorized_response("Authentication failed", &www_authenticate);
+            }
+            match state.federation_resolver.get_key(&iss).await {
+                Ok(key) => jwt::decode_with_key(token, &key, Some(&state.resource_url)),
+                Err(e) => {
+                    debug!("Federation key resolution failed for issuer {}: {}", iss, e);
+                    return unauthorized_response("Authentication failed", &www_authenticate);
+                }
+            }
+        };
+
+        match result {
             Ok(claims) => {
                 debug!("JWT validated for user: {}", claims.sub);
+                let subject = claims.subject(local_issuers);
+                // Validate local subjects for safe characters. Federated subjects
+                // (containing "://") bypass this check — they are validated at JWT decode time.
+                if let Err(e) = subject.validate() {
+                    debug!("JWT sub validation failed: {}", e);
+                    return unauthorized_response("Authentication failed", &www_authenticate);
+                }
+                let user_str = match subject.name() {
+                    Some(n) => n.to_owned(),
+                    None => {
+                        debug!("JWT has empty sub");
+                        return unauthorized_response("Authentication failed", &www_authenticate);
+                    }
+                };
                 let user = AuthenticatedUser {
-                    user: claims.sub.clone(),
+                    user: user_str,
                     token: Some(token.to_owned()),
                     exp: Some(claims.exp),
                 };
                 request.extensions_mut().insert(user);
                 return next.run(request).await;
             }
-            Err(jwt::JwtError::Expired) => {
-                debug!("JWT expired");
-                return unauthorized_response("Token expired", &www_authenticate);
-            }
-            Err(jwt::JwtError::InvalidSignature) => {
-                debug!("JWT signature invalid");
-                return unauthorized_response("Invalid token signature", &www_authenticate);
-            }
             Err(e) => {
                 debug!("JWT validation failed: {}", e);
-                return unauthorized_response("Invalid token", &www_authenticate);
+                return unauthorized_response("Authentication failed", &www_authenticate);
             }
         }
     }
 
-    warn!("Invalid token format");
-    unauthorized_response("Invalid token format", &www_authenticate)
+    debug!("Invalid token format");
+    unauthorized_response("Authentication failed", &www_authenticate)
 }
 
 /// Request logging middleware
@@ -143,6 +177,45 @@ fn unauthorized_response(message: &str, www_authenticate: &str) -> Response {
         );
     }
     response
+}
+
+/// Extract the `iss` claim from a JWT payload without signature verification.
+/// Exported for use in other middleware-like contexts (e.g. MCP inline auth).
+/// Returns an empty string on any parse failure.
+pub fn extract_iss_from_token(token: &str) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let parts: Vec<&str> = token.splitn(3, '.').collect();
+    if parts.len() < 2 {
+        return String::new();
+    }
+    // Guard against adversarially large payloads (real JWT payloads are < 1KB)
+    if parts[1].len() > 8192 {
+        return String::new();
+    }
+    let payload_bytes = match URL_SAFE_NO_PAD.decode(parts[1]) {
+        Ok(b) => b,
+        Err(_) => return String::new(),
+    };
+    let payload: serde_json::Value = match serde_json::from_slice(&payload_bytes) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    payload.get("iss")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// Extract `kid` from a JWT header without full validation.
+pub fn extract_kid_from_token(token: &str) -> Option<String> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let header_b64 = token.split('.').next()?;
+    if header_b64.len() > 4096 {
+        return None;
+    }
+    let header_bytes = URL_SAFE_NO_PAD.decode(header_b64).ok()?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes).ok()?;
+    header.get("kid").and_then(|v| v.as_str()).map(str::to_owned)
 }
 
 /// CORS middleware configuration
@@ -234,4 +307,32 @@ pub fn cors_layer(config: &crate::server::state::CorsConfig) -> tower_http::cors
     }
 
     cors
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_iss_from_token() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+        // Craft a JWT with iss in payload: header.payload.sig
+        // payload = base64url({"iss":"https://node-a","sub":"alice","exp":9999999999,"iat":0})
+        let payload = URL_SAFE_NO_PAD.encode(
+            r#"{"iss":"https://node-a","sub":"alice","exp":9999999999,"iat":0}"#
+        );
+        let token = format!("eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.{}.fakesig", payload);
+        assert_eq!(extract_iss_from_token(&token), "https://node-a");
+
+        // Token without iss
+        let payload2 = URL_SAFE_NO_PAD.encode(
+            r#"{"sub":"alice","exp":9999999999,"iat":0}"#
+        );
+        let token2 = format!("eyJhbGciOiJFZERTQSJ9.{}.fakesig", payload2);
+        assert_eq!(extract_iss_from_token(&token2), "");
+
+        // Garbage input
+        assert_eq!(extract_iss_from_token("notavalidtoken"), "");
+    }
 }

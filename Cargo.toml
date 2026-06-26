@@ -8,10 +8,21 @@ members = [
     "crates/hyprstream-flight",
     "crates/cas-serve",
     "crates/hyprstream-rpc",
+    "crates/hyprstream-service",
+    "crates/hyprstream-discovery",
     "crates/hyprstream-rpc-build",
     "crates/hyprstream-rpc-derive",
     "crates/hyprstream-workers",
     "crates/hyprstream-containedfs",
+    "crates/waxterm",
+    "crates/hyprstream-compositor",
+    "crates/hyprstream-tui",
+    "crates/hyprstream-vfs",
+    "crates/hyprstream-tcl",
+    "crates/chat-core",
+    "crates/hyprstream-rpc-std",
+    "crates/hyprstream-9p",
+    "crates/hyprstream-pds",
 ]
 # bitsandbytes-sys is standalone - only built when bnb feature is enabled
 exclude = ["crates/bitsandbytes-sys"]
@@ -19,7 +30,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-license = "AGPL-3.0"
+license = "MIT"
 repository = "https://github.com/hyprstream/hyprstream.git"
 
 [workspace.dependencies]
@@ -30,7 +41,7 @@ libc = "0.2"
 
 # Async runtime
 tokio = { version = "1.43.0", features = ["rt-multi-thread", "signal", "fs", "process", "sync", "time", "macros"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["rt", "compat"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 tokio-test = "0.4"
 tokio-rustls = "0.26.1"
@@ -103,13 +114,35 @@ futures = { version = "0.3.31", features = ["alloc"] }
 futures-util = "0.3.31"
 pin-project-lite = "0.2"
 tonic = { version = "0.12.3", features = ["transport", "codegen", "prost", "tls"] }
-rustls = "0.23.1"
+rustls = { version = "0.23.1", features = ["ring"] }
 rustls-pemfile = "2.1.0"
+rustls-acme = { version = "0.11", features = ["tokio"] }
 axum = { version = "0.7", features = ["macros", "tokio"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "timeout"] }
 reqwest = { version = "0.11", features = ["json", "stream"] }
 url = "2.5"
 urlencoding = "2.1"
+
+# QUIC transport (HTTP/3 + WebTransport + ZMTP over QUIC)
+quinn = { version = "0.11", features = ["rustls-ring", "futures-io"] }
+rcgen = "0.13"
+h3 = { version = "0.0.8", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
+h3-quinn = { version = "0.0.10", features = ["datagram"] }
+h3-webtransport = "0.1.2"
+http = "1"
+
+# Iroh + Media-over-QUIC (Epic #131 — Phase 1 substrate)
+# iroh re-exported via web-transport-iroh — match its major to avoid duplicate copies.
+# Note: web-transport-iroh 0.5.x pins iroh =1.0.0-rc.0 exactly; co-bump these together.
+iroh = { version = "=1.0.0-rc.0", default-features = false, features = ["tls-ring"] }
+moq-net = "0.1"
+web-transport-iroh = { version = "0.5.1", default-features = false, features = ["ring"] }
+web-transport-quinn = { version = "0.11.9", default-features = false, features = ["ring"] }
+web-transport-trait = "0.3"
+# Stream multiplexer for the UDS transport (`web_transport_trait::Session` over a
+# single UnixStream). Already in the lock graph via libp2p/iroh — no new tree.
+yamux = "0.13"
 
 # Data processing
 polars = "0.45.1"
@@ -117,7 +150,7 @@ sqlparser = "0.39.0"
 json-threat-protection = "0.1.1"
 
 # System utilities
-nix = { version = "0.27", features = ["process", "signal", "user"] }
+nix = { version = "0.27", features = ["fs", "process", "signal", "socket", "user"] }
 users = "0.11"
 rlimit = "0.10"
 clap = { version = "4.4", features = ["derive", "env"] }
@@ -144,14 +177,26 @@ minijinja = { version = "2.12.0", features = ["builtins", "loop_controls"] }
 half = "2.6.0"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
-# Messaging
-tmq = { git = "https://github.com/hyprstream/tmq", branch = "xpubsub" }  # TMQ with XPUB/XSUB support
-zmq = "0.10"  # Underlying libzmq bindings
-zmq-sys = "0.12"  # Raw libzmq FFI for ZMQ_USE_FD socket option (version matches zmq 0.10's dependency)
-
 # Cap'n Proto (zero-copy serialization)
-capnp = "0.20"
-capnp-futures = "0.20"
+# All three crates must track together — generated code from capnpc
+# targets specific internal APIs in capnp; mismatched majors break
+# RawStructSchema struct construction.
+# `unaligned`: read capnp messages directly from network buffers (moq/quinn `Bytes`)
+# that can start at any byte offset — required for the zero-copy
+# `read_message_from_flat_slice` path on the streaming + RPC planes (otherwise capnp
+# errors with UnalignedSegment).
+#
+# SAFE in Rust — and NOT the same as C++'s `-DCAPNP_ALLOW_UNALIGNED`. The C++ flag only
+# disables the alignment *check* and leaves genuine UB (unaligned access is UB in C/C++;
+# compilers may emit SIMD / assume a pointer's low bits are zero), which is why capnp's
+# author recommends copying into an aligned buffer instead (StackOverflow Q 75006774).
+# Rust's `unaligned` feature instead changes the access *mechanism*: each word becomes
+# `Raw = [u8; N]` (alignment 1) read via `from_le_bytes(*raw)` (capnp `private/primitive.rs`)
+# — the canonical, fully-defined Rust idiom for unaligned reads, with no UB. On x86_64/ARM64
+# it lowers to a single hardware unaligned load (~free) and does NOT memcpy or sacrifice
+# zero-copy. See PR #330.
+capnp = { version = "0.24", features = ["unaligned"] }
+capnp-futures = "0.24"
 
 # Utilities
 glob = "0.3"
@@ -167,19 +212,34 @@ whoami = "1.5"  # OS username detection
 
 # Cryptography (for signed envelopes, DH key exchange, stream HMAC)
 base64 = "0.22"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 curve25519-dalek = { version = "4", features = ["rand_core"] }  # Ristretto255 DH for stream authentication
 hkdf = "0.12"
 hmac = "0.12"
 zeroize = { version = "1", features = ["derive"] }
 subtle = "2"
-p256 = { version = "0.13", features = ["ecdh"] }  # FIPS mode alternative (P-256 ECDH)
+aes-gcm = "0.10"  # AES-256-GCM for notification broadcast encryption
+aes-gcm-siv = "0.11"  # AES-256-GCM-SIV for envelope encryption (nonce-misuse resistant)
+p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }  # P-256 ECDH (FIPS) + ECDSA (ES256 DPoP verification)
+ml-dsa = "0.1.0-rc.11"  # ML-DSA-65 (FIPS 204) post-quantum signatures
+ml-kem = { version = "0.3", features = ["getrandom"] }  # ML-KEM-768 (FIPS 203) post-quantum key encapsulation
+# RS256/ES256/EdDSA JWT verification for external OIDC providers + private_key_jwt.
+# v10 introduced a pluggable CryptoProvider model (similar to rustls). We pin
+# `rust_crypto` to keep the existing all-Rust stack rather than pulling in
+# aws-lc-rs (libcrypto C dep).
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+coset = "0.4"       # COSE_Sign1 (RFC 9052) envelope signing
+ciborium = "0.2"    # CBOR runtime (external_aad construction)
+
+# Hot-reloading (dev only — zero overhead in release builds)
+subsecond = "0.7"
 
 # Dev dependencies
 proptest = "1.0"
 quickcheck = "1.0"
 quickcheck_macros = "1.0"
 criterion = "0.5.1"
+
 
 # NOTE: [patch.crates-io] section removed
 # tch backend selection is now handled via features in crates/hyprstream/Cargo.toml:
@@ -204,7 +264,7 @@ version = "0.3"
 path = "crates/hyprstream-rpc-build"
 
 [workspace.dependencies.capnpc]
-version = "0.20"
+version = "0.24"
 
 [profile.dev]
 debug = "line-tables-only"

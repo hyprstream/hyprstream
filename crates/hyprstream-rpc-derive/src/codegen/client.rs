@@ -1,4 +1,4 @@
-//! Client struct, response enum, request methods, and parse_response generation.
+//! Client struct, response enum, request methods, parse_response, and trait generation.
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -6,6 +6,603 @@ use quote::{format_ident, quote};
 use crate::resolve::ResolvedSchema;
 use crate::schema::types::*;
 use crate::util::*;
+
+/// Returns `true` if `type_name` is the canonical streaming `StreamInfo` from
+/// `streaming.capnp`, identified by `origin_file == Some("streaming")`.
+///
+/// This guards against false positives when a service schema defines its own
+/// `StreamInfo` struct with unrelated semantics (e.g., `tui.capnp`).
+fn is_rpc_stream_info(type_name: &str, resolved: &ResolvedSchema) -> bool {
+    type_name == "StreamInfo"
+        && resolved
+            .find_struct("StreamInfo")
+            .map(|s| s.origin_file.as_deref() == Some("streaming"))
+            .unwrap_or(false)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Trait Generation (Phase 2a)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Generate the top-level service trait and all scope traits.
+pub fn generate_service_traits(service_name: &str, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
+    let mut tokens = TokenStream::new();
+
+    // Generate scope traits first (bottom-up: nested → parent → top-level)
+    for sc in &resolved.raw.scoped_clients {
+        tokens.extend(generate_scope_trait_recursive(sc, resolved, types_crate));
+    }
+
+    // Generate top-level service trait
+    tokens.extend(generate_top_level_trait(service_name, resolved, types_crate));
+
+    tokens
+}
+
+/// Generate a scope trait (e.g., RuntimeRpc, ContainerRpc) and recurse into nested scopes.
+fn generate_scope_trait_recursive(sc: &ScopedClient, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
+    let mut tokens = TokenStream::new();
+
+    // Generate nested scope traits first
+    for nested in &sc.nested_clients {
+        tokens.extend(generate_scope_trait_recursive(nested, resolved, types_crate));
+    }
+
+    let trait_name = scope_trait_name(&sc.client_name);
+    let trait_ident = format_ident!("{}", trait_name);
+    let doc = format!("Generated RPC trait for {} scope.", sc.factory_name);
+
+    // Nested scope associated types + factory methods
+    let nested_assoc_types: Vec<TokenStream> = sc.nested_clients.iter().map(|nested| {
+        let assoc_name = format_ident!("{}", to_pascal_case(&nested.factory_name));
+        let nested_trait = format_ident!("{}", scope_trait_name(&nested.client_name));
+        quote! { type #assoc_name: #nested_trait; }
+    }).collect();
+
+    let nested_factory_methods: Vec<TokenStream> = sc.nested_clients.iter().map(|nested| {
+        let method = format_ident!("{}", to_snake_case(&nested.factory_name));
+        let assoc_name = format_ident!("{}", to_pascal_case(&nested.factory_name));
+        let params = scope_factory_params(&nested.scope_fields, resolved);
+        quote! { fn #method(&self #(, #params)*) -> Self::#assoc_name; }
+    }).collect();
+
+    // Trait methods from inner_request_variants
+    let trait_methods: Vec<TokenStream> = sc.inner_request_variants.iter().filter_map(|v| {
+        generate_trait_method(v, &sc.inner_response_variants, resolved, types_crate, true)
+    }).collect();
+
+    tokens.extend(quote! {
+        #[doc = #doc]
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        pub trait #trait_ident: Send + Sync {
+            #(#nested_assoc_types)*
+            #(#nested_factory_methods)*
+            #(#trait_methods)*
+        }
+    });
+
+    tokens
+}
+
+/// Generate the top-level service trait (e.g., WorkerRpc, ModelRpc).
+fn generate_top_level_trait(service_name: &str, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
+    let pascal = to_pascal_case(service_name);
+    let trait_name = format_ident!("{}Rpc", pascal);
+    let doc = format!("Generated RPC trait for the {pascal} service.");
+
+    let scoped_variant_names: Vec<&str> = resolved.raw
+        .scoped_clients
+        .iter()
+        .map(|sc| sc.factory_name.as_str())
+        .collect();
+
+    // Associated types for scoped clients
+    let assoc_types: Vec<TokenStream> = resolved.raw.scoped_clients.iter().map(|sc| {
+        let assoc_name = format_ident!("{}", to_pascal_case(&sc.factory_name));
+        let scope_trait = format_ident!("{}", scope_trait_name(&sc.client_name));
+        quote! { type #assoc_name: #scope_trait; }
+    }).collect();
+
+    // Factory methods for scoped clients
+    let factory_methods: Vec<TokenStream> = resolved.raw.scoped_clients.iter().map(|sc| {
+        let method = format_ident!("{}", to_snake_case(&sc.factory_name));
+        let assoc_name = format_ident!("{}", to_pascal_case(&sc.factory_name));
+        let params = scope_factory_params(&sc.scope_fields, resolved);
+        quote! { fn #method(&self #(, #params)*) -> Self::#assoc_name; }
+    }).collect();
+
+    // Non-scoped methods
+    let trait_methods: Vec<TokenStream> = resolved.raw.request_variants.iter()
+        .filter(|v| !scoped_variant_names.contains(&v.name.as_str()))
+        .filter_map(|v| {
+            generate_trait_method(v, &resolved.raw.response_variants, resolved, types_crate, false)
+        })
+        .collect();
+
+    quote! {
+        #[doc = #doc]
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        pub trait #trait_name: Send + Sync {
+            #(#assoc_types)*
+            #(#factory_methods)*
+            #(#trait_methods)*
+        }
+    }
+}
+
+/// Generate a single trait method signature from a request variant.
+fn generate_trait_method(
+    variant: &UnionVariant,
+    response_variants: &[UnionVariant],
+    resolved: &ResolvedSchema,
+    types_crate: Option<&syn::Path>,
+    is_scoped: bool,
+) -> Option<TokenStream> {
+    let method_name = format_ident!("{}", to_snake_case(&variant.name));
+
+    // Determine return type
+    let return_type = determine_return_type(&variant.name, response_variants, resolved, is_scoped, types_crate)?;
+
+    // Detect streaming — trait methods return StreamHandle directly (no ephemeral_pubkey param)
+    let is_streaming = response_variants
+        .iter()
+        .find(|v| {
+            let expected = if is_scoped { variant.name.clone() } else { format!("{}Result", variant.name) };
+            v.name == expected
+        })
+        .map(|v| is_rpc_stream_info(&v.type_name, resolved))
+        .unwrap_or(false);
+
+    // Streaming methods in the trait don't take ephemeral_pubkey — they return MoqStreamHandle
+    let return_type = if is_streaming {
+        quote! { hyprstream_rpc::moq_stream::MoqStreamHandle }
+    } else {
+        return_type
+    };
+
+    // Determine params from the request variant type
+    let params = match variant.type_name.as_str() {
+        "Void" => Vec::new(),
+        "Text" => vec![quote! { value: &str }],
+        "Data" => vec![quote! { value: &[u8] }],
+        "Bool" => vec![quote! { value: bool }],
+        t if CapnpType::classify_primitive(t).is_numeric() => {
+            let ty = rust_type_tokens(&CapnpType::classify_primitive(t).rust_owned_type());
+            vec![quote! { value: #ty }]
+        }
+        struct_name => {
+            if let Some(s) = resolved.find_struct(struct_name) {
+                let nuf: Vec<_> = s.non_union_fields().collect();
+                if nuf.is_empty() || (nuf.len() == 1 && nuf[0].type_name == "Void") {
+                    Vec::new()
+                } else {
+                    let data_name = format_ident!("{}", struct_name);
+                    vec![quote! { request: &#data_name }]
+                }
+            } else {
+                return None;
+            }
+        }
+    };
+
+    Some(quote! {
+        async fn #method_name(&self #(, #params)*) -> anyhow::Result<#return_type>;
+    })
+}
+
+/// Determine the return type for a trait method.
+fn determine_return_type(
+    request_name: &str,
+    response_variants: &[UnionVariant],
+    resolved: &ResolvedSchema,
+    is_scoped: bool,
+    types_crate: Option<&syn::Path>,
+) -> Option<TokenStream> {
+    let expected_name = if is_scoped {
+        request_name.to_owned()
+    } else {
+        format!("{}Result", request_name)
+    };
+
+    let resp_variant = response_variants.iter().find(|v| v.name == expected_name)?;
+    let ct = resolved.resolve_type(&resp_variant.type_name).capnp_type.clone();
+
+    Some(match ct {
+        CapnpType::Void => quote! { () },
+        CapnpType::Bool => quote! { bool },
+        CapnpType::Text => quote! { String },
+        CapnpType::Data => quote! { Vec<u8> },
+        CapnpType::UInt8 | CapnpType::UInt16 | CapnpType::UInt32 | CapnpType::UInt64
+        | CapnpType::Int8 | CapnpType::Int16 | CapnpType::Int32 | CapnpType::Int64
+        | CapnpType::Float32 | CapnpType::Float64 => {
+            let rust_type = rust_type_tokens(&ct.rust_owned_type());
+            quote! { #rust_type }
+        }
+        CapnpType::ListText => quote! { Vec<String> },
+        CapnpType::ListData => quote! { Vec<Vec<u8>> },
+        CapnpType::ListPrimitive(ref inner) => {
+            let rust_inner = rust_type_tokens(&inner.rust_owned_type());
+            quote! { Vec<#rust_inner> }
+        }
+        CapnpType::ListStruct(ref inner) => {
+            let data_name = format_ident!("{}", inner);
+            quote! { Vec<#data_name> }
+        }
+        CapnpType::Struct(ref name) => {
+            if let Some(s) = resolved.find_struct(name) {
+                if let Some(ref dt) = s.domain_type {
+                    resolve_domain_type(dt, types_crate)
+                } else {
+                    let data_name = format_ident!("{}", name);
+                    quote! { #data_name }
+                }
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// Derive a scope trait name from a scoped client name.
+/// e.g., "RuntimeClient" → "RuntimeRpc", "ContainerClient" → "ContainerRpc"
+fn scope_trait_name(client_name: &str) -> String {
+    if let Some(base) = client_name.strip_suffix("Client") {
+        format!("{}Rpc", base)
+    } else {
+        format!("{}Rpc", client_name)
+    }
+}
+
+/// Generate scope factory method parameters.
+fn scope_factory_params(scope_fields: &[FieldDef], _resolved: &ResolvedSchema) -> Vec<TokenStream> {
+    scope_fields.iter().map(|f| {
+        let name = format_ident!("{}", to_snake_case(&f.name));
+        let ty = rust_type_tokens(&CapnpType::classify_primitive(&f.type_name).rust_param_type());
+        quote! { #name: #ty }
+    }).collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Trait Implementation Generation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Generate trait impl for the top-level client + all scoped clients.
+pub fn generate_trait_impls(service_name: &str, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
+    let mut tokens = TokenStream::new();
+
+    let pascal = to_pascal_case(service_name);
+    let client_ident = format_ident!("{}Client", pascal);
+    let trait_ident = format_ident!("{}Rpc", pascal);
+
+    let scoped_variant_names: Vec<&str> = resolved.raw
+        .scoped_clients
+        .iter()
+        .map(|sc| sc.factory_name.as_str())
+        .collect();
+
+    // Associated type bindings
+    let assoc_bindings: Vec<TokenStream> = resolved.raw.scoped_clients.iter().map(|sc| {
+        let assoc_name = format_ident!("{}", to_pascal_case(&sc.factory_name));
+        let scoped_client = format_ident!("{}", sc.client_name);
+        quote! { type #assoc_name = #scoped_client; }
+    }).collect();
+
+    // Factory method impls
+    let factory_impls: Vec<TokenStream> = resolved.raw.scoped_clients.iter().map(|sc| {
+        let method = format_ident!("{}", to_snake_case(&sc.factory_name));
+        let assoc_name = format_ident!("{}", to_pascal_case(&sc.factory_name));
+        let params = scope_factory_params(&sc.scope_fields, resolved);
+        let param_names: Vec<syn::Ident> = sc.scope_fields.iter().map(|f| {
+            format_ident!("{}", to_snake_case(&f.name))
+        }).collect();
+        quote! {
+            fn #method(&self #(, #params)*) -> Self::#assoc_name {
+                #client_ident::#method(self #(, #param_names),*)
+            }
+        }
+    }).collect();
+
+    // Non-scoped method delegation
+    let method_impls: Vec<TokenStream> = resolved.raw.request_variants.iter()
+        .filter(|v| !scoped_variant_names.contains(&v.name.as_str()))
+        .filter_map(|v| {
+            generate_trait_method_impl(v, &resolved.raw.response_variants, resolved, types_crate, false)
+        })
+        .collect();
+
+    tokens.extend(quote! {
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        impl #trait_ident for #client_ident {
+            #(#assoc_bindings)*
+            #(#factory_impls)*
+            #(#method_impls)*
+        }
+    });
+
+    // Scoped client trait impls
+    for sc in &resolved.raw.scoped_clients {
+        tokens.extend(generate_scope_trait_impl_recursive(sc, resolved, types_crate));
+    }
+
+    tokens
+}
+
+fn generate_scope_trait_impl_recursive(sc: &ScopedClient, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
+    let mut tokens = TokenStream::new();
+
+    let client_ident = format_ident!("{}", sc.client_name);
+    let trait_ident = format_ident!("{}", scope_trait_name(&sc.client_name));
+
+    // Nested associated type bindings + factory impls
+    let nested_assoc: Vec<TokenStream> = sc.nested_clients.iter().map(|nested| {
+        let assoc_name = format_ident!("{}", to_pascal_case(&nested.factory_name));
+        let nested_client = format_ident!("{}", nested.client_name);
+        quote! { type #assoc_name = #nested_client; }
+    }).collect();
+
+    let nested_factory_impls: Vec<TokenStream> = sc.nested_clients.iter().map(|nested| {
+        let method = format_ident!("{}", to_snake_case(&nested.factory_name));
+        let assoc_name = format_ident!("{}", to_pascal_case(&nested.factory_name));
+        let params = scope_factory_params(&nested.scope_fields, resolved);
+        let param_names: Vec<syn::Ident> = nested.scope_fields.iter().map(|f| {
+            format_ident!("{}", to_snake_case(&f.name))
+        }).collect();
+        quote! {
+            fn #method(&self #(, #params)*) -> Self::#assoc_name {
+                #client_ident::#method(self #(, #param_names),*)
+            }
+        }
+    }).collect();
+
+    let method_impls: Vec<TokenStream> = sc.inner_request_variants.iter()
+        .filter_map(|v| {
+            generate_trait_method_impl(v, &sc.inner_response_variants, resolved, types_crate, true)
+        })
+        .collect();
+
+    tokens.extend(quote! {
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        impl #trait_ident for #client_ident {
+            #(#nested_assoc)*
+            #(#nested_factory_impls)*
+            #(#method_impls)*
+        }
+    });
+
+    // Recurse into nested scoped clients
+    for nested in &sc.nested_clients {
+        tokens.extend(generate_scope_trait_impl_recursive(nested, resolved, types_crate));
+    }
+
+    tokens
+}
+
+/// Generate a trait method impl that delegates to the inherent method on the client.
+fn generate_trait_method_impl(
+    variant: &UnionVariant,
+    response_variants: &[UnionVariant],
+    resolved: &ResolvedSchema,
+    types_crate: Option<&syn::Path>,
+    is_scoped: bool,
+) -> Option<TokenStream> {
+    let method_name = format_ident!("{}", to_snake_case(&variant.name));
+
+    let return_type = determine_return_type(&variant.name, response_variants, resolved, is_scoped, types_crate)?;
+
+    let is_streaming = response_variants
+        .iter()
+        .find(|v| {
+            let expected = if is_scoped { variant.name.clone() } else { format!("{}Result", variant.name) };
+            v.name == expected
+        })
+        .map(|v| is_rpc_stream_info(&v.type_name, resolved))
+        .unwrap_or(false);
+
+    // Streaming trait methods return MoqStreamHandle (no ephemeral_pubkey param)
+    let return_type = if is_streaming {
+        quote! { hyprstream_rpc::moq_stream::MoqStreamHandle }
+    } else {
+        return_type
+    };
+
+    // Build params and args
+    let (params, args) = match variant.type_name.as_str() {
+        "Void" => (Vec::new(), Vec::new()),
+        "Text" => (vec![quote! { value: &str }], vec![quote! { value }]),
+        "Data" => (vec![quote! { value: &[u8] }], vec![quote! { value }]),
+        "Bool" => (vec![quote! { value: bool }], vec![quote! { value }]),
+        t if CapnpType::classify_primitive(t).is_numeric() => {
+            let ty = rust_type_tokens(&CapnpType::classify_primitive(t).rust_owned_type());
+            (vec![quote! { value: #ty }], vec![quote! { value }])
+        }
+        struct_name => {
+            if let Some(s) = resolved.find_struct(struct_name) {
+                let nuf: Vec<_> = s.non_union_fields().collect();
+                if nuf.is_empty() || (nuf.len() == 1 && nuf[0].type_name == "Void") {
+                    (Vec::new(), Vec::new())
+                } else {
+                    let data_name = format_ident!("{}", struct_name);
+                    (vec![quote! { request: &#data_name }], vec![quote! { request }])
+                }
+            } else {
+                return None;
+            }
+        }
+    };
+
+    if is_streaming {
+        // Streaming trait impl: generate ephemeral keypair, call raw method, construct MoqStreamHandle
+        Some(quote! {
+            async fn #method_name(&self #(, #params)*) -> anyhow::Result<hyprstream_rpc::moq_stream::MoqStreamHandle> {
+                let (client_secret, client_pubkey) = hyprstream_rpc::crypto::generate_ephemeral_keypair();
+                let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
+                let info = Self::#method_name(self #(, #args)*, client_pubkey_bytes).await?;
+                if info.dh_public == [0u8; 32] {
+                    anyhow::bail!("Server did not provide DH public key for streaming");
+                }
+                if info.broadcast_path.is_empty() {
+                    anyhow::bail!("Server did not provide moq broadcast path — moq transport not initialized");
+                }
+                let (mac_key, enc_key, topic) = hyprstream_rpc::derive_client_stream_keys(
+                    &client_secret, &client_pubkey_bytes, &info.dh_public,
+                )?;
+                // #274: subscribe over the resolved `reach` (the same-host UDS
+                // fast path is preferred automatically when co-located).
+                // #358: pass the service-signed `qos` so direct-vs-relay topology
+                // is selected from it (relay-first for retained/fan-out streams).
+                // #321: enc_key opens the transport-AEAD-sealed Tagged blocks.
+                Ok(hyprstream_rpc::moq_stream::MoqStreamHandle::networked(
+                    info.announced_at, &info.qos, info.broadcast_path, mac_key, enc_key, topic,
+                ))
+            }
+        })
+    } else {
+        Some(quote! {
+            async fn #method_name(&self #(, #params)*) -> anyhow::Result<#return_type> {
+                Self::#method_name(self #(, #args)*).await
+            }
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Constructor Generation (Phase 2b)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Generate `new` and `with_endpoint` constructors on the client struct.
+///
+/// Both constructors are `#[cfg(not(target_arch = "wasm32"))]` because `registry`
+/// and `zmq_context` are non-wasm only.
+pub fn generate_constructors(service_name: &str) -> TokenStream {
+    let pascal = to_pascal_case(service_name);
+    let client_name = format_ident!("{}Client", pascal);
+    let service_name_lit = service_name;
+
+    quote! {
+        #[cfg(not(target_arch = "wasm32"))]
+        impl #client_name {
+            /// The service name used for endpoint resolution.
+            pub const SERVICE_NAME: &'static str = #service_name_lit;
+
+            /// Create a new client by looking up the service endpoint from the global registry.
+            ///
+            /// `destination` is the Ed25519 verifying key of the target service,
+            /// used to verify response envelope signatures. This must be the target service's
+            /// actual pubkey (obtained via service JWT / discovery), NOT the caller's key.
+            ///
+            /// `token` is an optional CA-signed JWT certificate for trust establishment.
+            /// When provided, the token is included in request envelopes so the server
+            /// can bind the caller's Ed25519 key to a subject.
+            pub fn for_service(
+                signing_key: hyprstream_rpc::crypto::SigningKey,
+                destination: hyprstream_rpc::crypto::VerifyingKey,
+                token: Option<String>,
+            ) -> anyhow::Result<Self> {
+                let transport = hyprstream_rpc::registry::try_global()
+                    .map(|r| r.endpoint(#service_name_lit, hyprstream_rpc::registry::SocketKind::Rep))
+                    .unwrap_or_else(|| hyprstream_rpc::transport::TransportConfig::inproc(
+                        concat!("hyprstream/", #service_name_lit)
+                    ));
+                Self::dial_transport(&transport, signing_key, destination, token)
+            }
+
+            /// Create a new client connected to a specific endpoint string
+            /// (`inproc://…` / `ipc://…`). Parsed to a `TransportConfig` and routed
+            /// through [`hyprstream_rpc::dial::dial`] — the one place transport
+            /// selection happens. For networked (quic/iroh) targets, prefer
+            /// [`Self::from_resolver`], which carries the full auth config.
+            pub fn for_endpoint(
+                endpoint: &str,
+                signing_key: hyprstream_rpc::crypto::SigningKey,
+                destination: hyprstream_rpc::crypto::VerifyingKey,
+                token: Option<String>,
+            ) -> anyhow::Result<Self> {
+                let transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(endpoint);
+                Self::dial_transport(&transport, signing_key, destination, token)
+            }
+
+            /// Create a client for an already-resolved typed
+            /// [`hyprstream_rpc::transport::TransportConfig`] (the Inproc arm for
+            /// a co-located service, or a networked Quic/Iroh reach). Prefer this
+            /// over [`Self::for_endpoint`] when the caller already holds a typed
+            /// transport (e.g. the inference router, #320) — it skips string
+            /// parsing and routes straight through [`hyprstream_rpc::dial::dial`].
+            pub fn for_transport(
+                transport: &hyprstream_rpc::transport::TransportConfig,
+                signing_key: hyprstream_rpc::crypto::SigningKey,
+                destination: hyprstream_rpc::crypto::VerifyingKey,
+                token: Option<String>,
+            ) -> anyhow::Result<Self> {
+                Self::dial_transport(transport, signing_key, destination, token)
+            }
+
+            /// Build a client for an already-resolved `TransportConfig` (the one
+            /// place the generated client meets `dial()`).
+            fn dial_transport(
+                transport: &hyprstream_rpc::transport::TransportConfig,
+                signing_key: hyprstream_rpc::crypto::SigningKey,
+                destination: hyprstream_rpc::crypto::VerifyingKey,
+                token: Option<String>,
+            ) -> anyhow::Result<Self> {
+                let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key);
+                let rpc = hyprstream_rpc::dial::dial(transport, signer, Some(destination), token)?;
+                Ok(Self::new(rpc))
+            }
+
+            /// Create a new client by resolving the service endpoint via a `Resolver`.
+            pub async fn from_resolver(
+                resolver: &dyn hyprstream_rpc::Resolver,
+                signing_key: hyprstream_rpc::crypto::SigningKey,
+                destination: hyprstream_rpc::crypto::VerifyingKey,
+                token: Option<String>,
+            ) -> anyhow::Result<Self> {
+                let transport = resolver
+                    .resolve(Self::SERVICE_NAME, hyprstream_rpc::registry::SocketKind::Rep)
+                    .await?;
+                Self::dial_transport(&transport, signing_key, destination, token)
+            }
+
+            /// Create a client from an `IdentityProvider` with automatic endpoint resolution.
+            pub async fn from_provider(
+                provider: &dyn hyprstream_rpc::identity::IdentityProvider,
+            ) -> anyhow::Result<Self> {
+                let transport = hyprstream_rpc::registry::try_global()
+                    .map(|r| r.endpoint(#service_name_lit, hyprstream_rpc::registry::SocketKind::Rep))
+                    .unwrap_or_else(|| hyprstream_rpc::transport::TransportConfig::inproc(
+                        concat!("hyprstream/", #service_name_lit)
+                    ));
+                Self::from_provider_at_transport(&transport, provider).await
+            }
+
+            /// Create a client from an `IdentityProvider` at a specific endpoint string.
+            pub async fn from_provider_at(
+                endpoint: &str,
+                provider: &dyn hyprstream_rpc::identity::IdentityProvider,
+            ) -> anyhow::Result<Self> {
+                let transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(endpoint);
+                Self::from_provider_at_transport(&transport, provider).await
+            }
+
+            async fn from_provider_at_transport(
+                transport: &hyprstream_rpc::transport::TransportConfig,
+                provider: &dyn hyprstream_rpc::identity::IdentityProvider,
+            ) -> anyhow::Result<Self> {
+                let handle = provider.identity_open(concat!("hyprstream-", #service_name_lit, "-v1")).await?;
+                let pubkey = handle.pubkey();
+                let server_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(&pubkey)
+                    .map_err(|e| anyhow::anyhow!("invalid derived pubkey: {}", e))?;
+                let signer = hyprstream_rpc::signer::IdentitySigner::new(handle);
+                let rpc = hyprstream_rpc::dial::dial(transport, signer, Some(server_vk), None)?;
+                Ok(Self::new(rpc))
+            }
+        }
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Domain Type Resolution
@@ -132,13 +729,13 @@ pub fn generate_client(service_name: &str, resolved: &ResolvedSchema, types_crat
         .map(|sc| sc.factory_name.as_str())
         .collect();
 
-    // Request methods (skip scoped variants)
+    // Request methods (portable — uses self.client.call(), not CallOptions)
     let request_methods: Vec<TokenStream> = resolved.raw
         .request_variants
         .iter()
         .filter(|v| !scoped_variant_names.contains(&v.name.as_str()))
         .map(|v| {
-            generate_request_method(
+            generate_request_method_inner(
                 &capnp_mod,
                 &req_type,
                 &response_type,
@@ -166,72 +763,44 @@ pub fn generate_client(service_name: &str, resolved: &ResolvedSchema, types_crat
     let factory_methods: Vec<TokenStream> = resolved.raw
         .scoped_clients
         .iter()
-        .map(generate_scoped_factory_method)
+        .map(generate_portable_scoped_factory_method)
         .collect();
-
-    // ServiceClient impl
-    let service_name_lit = service_name;
 
     quote! {
         #[doc = #doc]
         #[derive(Clone)]
         pub struct #client_name {
-            client: Arc<ZmqClientBase>,
-            claims: Option<std::sync::Arc<hyprstream_rpc::auth::Claims>>,
-        }
-
-        impl ServiceClient for #client_name {
-            const SERVICE_NAME: &'static str = #service_name_lit;
-
-            fn from_zmq(client: ZmqClientBase) -> Self {
-                Self { client: Arc::new(client), claims: None }
-            }
+            client: std::sync::Arc<dyn hyprstream_rpc::RpcClient>,
         }
 
         impl #client_name {
+            /// Create from any RpcClient implementation.
+            pub fn new(client: std::sync::Arc<dyn hyprstream_rpc::RpcClient>) -> Self {
+                Self { client }
+            }
+
             /// Get the next request ID.
             pub fn next_id(&self) -> u64 {
                 self.client.next_id()
             }
 
-            /// Attach claims for e2e verification. All subsequent calls include these claims.
-            pub fn with_claims(mut self, claims: hyprstream_rpc::auth::Claims) -> Self {
-                self.claims = Some(std::sync::Arc::new(claims));
-                self
+            /// Create a per-call request builder for custom authentication options.
+            ///
+            /// The builder is Send+Sync and idempotent — it stores per-call auth
+            /// context without mutating the shared client. Safe for use with
+            /// connection pooling.
+            pub fn request(&self) -> hyprstream_rpc::RequestBuilder<'_> {
+                hyprstream_rpc::RequestBuilder::new(&self.client)
             }
 
             /// Send a raw request and return the raw response bytes.
             pub async fn call(&self, payload: Vec<u8>) -> anyhow::Result<Vec<u8>> {
-                let opts = match &self.claims {
-                    Some(c) => CallOptions::default().claims((**c).clone()),
-                    None => CallOptions::default(),
-                };
-                self.client.call(payload, opts).await
+                self.client.call(payload).await
             }
 
-            /// Send a raw request with custom options and return the raw response bytes.
-            pub async fn call_with_options(&self, payload: Vec<u8>, mut opts: CallOptions) -> anyhow::Result<Vec<u8>> {
-                if opts.claims.is_none() {
-                    if let Some(ref c) = self.claims {
-                        opts = opts.claims((**c).clone());
-                    }
-                }
-                self.client.call(payload, opts).await
-            }
-
-            /// Get the endpoint this client is connected to.
-            pub fn endpoint(&self) -> &str {
-                self.client.endpoint()
-            }
-
-            /// Get the signing key used by this client.
-            pub fn signing_key(&self) -> &hyprstream_rpc::crypto::SigningKey {
-                self.client.signing_key()
-            }
-
-            /// Get the request identity used by this client.
-            pub fn identity(&self) -> &hyprstream_rpc::envelope::RequestIdentity {
-                self.client.identity()
+            /// Send a streaming request with ephemeral DH pubkey.
+            pub async fn call_streaming(&self, payload: Vec<u8>, ephemeral_pubkey: [u8; 32]) -> anyhow::Result<Vec<u8>> {
+                self.client.call_streaming(payload, ephemeral_pubkey).await
             }
 
             #(#request_methods)*
@@ -247,9 +816,25 @@ pub fn generate_client(service_name: &str, resolved: &ResolvedSchema, types_crat
 // Request Method Generation
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Generate a single request method. Used for both top-level and scoped clients.
+/// Generate a portable request method (no CallOptions, no ZMQ deps).
 #[allow(clippy::too_many_arguments)]
-pub fn generate_request_method(
+pub fn generate_portable_request_method(
+    capnp_mod: &TokenStream,
+    req_type: &syn::Ident,
+    response_type: &syn::Ident,
+    variant: &UnionVariant,
+    resolved: &ResolvedSchema,
+    scope: Option<&ScopedMethodContext>,
+    response_variants: Option<&[UnionVariant]>,
+    is_scoped: bool,
+    types_crate: Option<&syn::Path>,
+) -> TokenStream {
+    generate_request_method_inner(capnp_mod, req_type, response_type, variant, resolved, scope, response_variants, is_scoped, types_crate)
+}
+
+/// Inner request method generation (transport-agnostic).
+#[allow(clippy::too_many_arguments)]
+fn generate_request_method_inner(
     capnp_mod: &TokenStream,
     req_type: &syn::Ident,
     response_type: &syn::Ident,
@@ -261,7 +846,12 @@ pub fn generate_request_method(
     types_crate: Option<&syn::Path>,
 ) -> TokenStream {
     let method_name = format_ident!("{}", to_snake_case(&variant.name));
-    let doc = format!("{} ({} variant)", to_snake_case(&variant.name), variant.type_name);
+    let doc = if variant.description.is_empty() {
+        format!("{} ({} variant)", to_snake_case(&variant.name), variant.type_name)
+    } else {
+        let scope_info = if variant.scope.is_empty() { String::new() } else { format!("\n\nScope: {}", variant.scope) };
+        format!("{}{}", variant.description, scope_info)
+    };
 
     // For scoped methods, walk the ScopedMethodContext chain and shadow `req`
     let (outer_req_setup, parse_call) = if let Some(sc) = scope {
@@ -315,27 +905,37 @@ pub fn generate_request_method(
             };
             resp_vars.iter().find(|v| v.name == expected_name)
         })
-        .map(|v| v.type_name == "StreamInfo")
+        .map(|v| is_rpc_stream_info(&v.type_name, resolved))
         .unwrap_or(false);
 
-    let (return_type, response_handling) = if let Some(ref info) = typed_info {
-        let ret = &info.return_type;
-        let match_body = &info.match_body;
-        (quote! { #ret }, quote! { #match_body })
-    } else {
-        (quote! { #response_type }, quote! { #parse_call })
-    };
-
-    let (extra_param, call_expr) = if is_streaming {
+    // For streaming methods, use call_streaming with ephemeral pubkey
+    let (return_type, response_handling, extra_param, call_expr) = if is_streaming {
+        let (rt, rh) = if let Some(ref info) = typed_info {
+            let ret = &info.return_type;
+            let match_body = &info.match_body;
+            (quote! { #ret }, quote! { #match_body })
+        } else {
+            (quote! { #response_type }, quote! { #parse_call })
+        };
         (
+            rt,
+            rh,
             quote! { , ephemeral_pubkey: [u8; 32] },
             quote! {
-                let opts = CallOptions::default().ephemeral_pubkey(ephemeral_pubkey);
-                let response = self.call_with_options(payload, opts).await?;
+                let response = self.call_streaming(payload, ephemeral_pubkey).await?;
             },
         )
     } else {
+        let (rt, rh) = if let Some(ref info) = typed_info {
+            let ret = &info.return_type;
+            let match_body = &info.match_body;
+            (quote! { #ret }, quote! { #match_body })
+        } else {
+            (quote! { #response_type }, quote! { #parse_call })
+        };
         (
+            rt,
+            rh,
             TokenStream::new(),
             quote! { let response = self.call(payload).await?; },
         )
@@ -414,10 +1014,30 @@ pub fn generate_request_method(
                 }
             }
         }
+        t if CapnpType::classify_primitive(t).is_numeric() => {
+            let set_method = format_ident!("set_{}", to_snake_case(&variant.name));
+            let setter = quote! { req.#set_method(value); };
+            let ty = rust_type_tokens(&CapnpType::classify_primitive(t).rust_owned_type());
+            quote! {
+                #[doc = #doc]
+                pub async fn #method_name(&self, value: #ty #extra_param) -> anyhow::Result<#return_type> {
+                    let __request_id = self.next_id();
+                    let payload = hyprstream_rpc::serialize_message(|msg| {
+                        let mut req = msg.init_root::<#capnp_mod::#req_type::Builder>();
+                        req.set_id(__request_id);
+                        #outer_req_setup
+                        #setter
+                    })?;
+                    #call_expr
+                    #response_handling
+                }
+            }
+        }
         struct_name => {
             if let Some(s) = resolved.find_struct(struct_name) {
-                let is_void_wrapper = s.fields.is_empty()
-                    || (s.fields.len() == 1 && s.fields[0].type_name == "Void");
+                let nuf: Vec<_> = s.non_union_fields().collect();
+                let is_void_wrapper = nuf.is_empty()
+                    || (nuf.len() == 1 && nuf[0].type_name == "Void");
 
                 if is_void_wrapper {
                     let init_method = format_ident!("init_{}", to_snake_case(&variant.name));
@@ -437,24 +1057,19 @@ pub fn generate_request_method(
                         }
                     }
                 } else {
-                    let params = generate_method_params(&s.fields, resolved);
+                    let data_name = format_ident!("{}", struct_name);
                     let init_method = format_ident!("init_{}", to_snake_case(&variant.name));
-                    let builder_var = format_ident!("req");
-                    let setters = generate_struct_setters(&s.fields, resolved, capnp_mod, &builder_var);
-
-                    let inner_init = quote! { let mut req = req.#init_method(); };
 
                     quote! {
                         #[doc = #doc]
-                        #[allow(unused_mut)]
-                        pub async fn #method_name(&self #(, #params)* #extra_param) -> anyhow::Result<#return_type> {
+                        pub async fn #method_name(&self, __request: &#data_name #extra_param) -> anyhow::Result<#return_type> {
                             let __request_id = self.next_id();
                             let payload = hyprstream_rpc::serialize_message(|msg| {
                                 let mut req = msg.init_root::<#capnp_mod::#req_type::Builder>();
                                 req.set_id(__request_id);
                                 #outer_req_setup
-                                #inner_init
-                                #(#setters)*
+                                let mut __inner = req.#init_method();
+                                hyprstream_rpc::capnp::ToCapnp::write_to(__request, &mut __inner);
                             })?;
                             #call_expr
                             #response_handling
@@ -648,172 +1263,6 @@ pub struct ScopedMethodContext {
     pub parent: Option<Box<ScopedMethodContext>>,
 }
 
-/// Generate method parameter tokens for a struct's fields.
-fn generate_method_params(
-    fields: &[FieldDef],
-    resolved: &ResolvedSchema,
-) -> Vec<TokenStream> {
-    fields
-        .iter()
-        .filter(|field| {
-            if let CapnpType::Struct(ref name) = resolved.resolve_type(&field.type_name).capnp_type {
-                if let Some(s) = resolved.find_struct(name) {
-                    if s.has_union && s.fields.is_empty() {
-                        return false;
-                    }
-                }
-            }
-            true
-        })
-        .map(|field| {
-            let rust_name = format_ident!("{}", to_snake_case(&field.name));
-            let type_str = &resolved.resolve_type(&field.type_name).rust_param;
-            let rust_type = rust_type_tokens(type_str);
-            quote! { #rust_name: #rust_type }
-        })
-        .collect()
-}
-
-/// Generate setter calls for fields when building a request struct.
-fn generate_struct_setters(
-    fields: &[FieldDef],
-    resolved: &ResolvedSchema,
-    capnp_mod: &TokenStream,
-    builder_var: &syn::Ident,
-) -> Vec<TokenStream> {
-    fields
-        .iter()
-        .map(|field| {
-            let rust_name = format_ident!("{}", to_snake_case(&field.name));
-            let setter_name = format_ident!("set_{}", to_snake_case(&field.name));
-            generate_field_setter(&rust_name, &setter_name, &field.type_name, resolved, capnp_mod, builder_var)
-        })
-        .collect()
-}
-
-fn generate_field_setter(
-    rust_name: &syn::Ident,
-    setter_name: &syn::Ident,
-    type_name: &str,
-    resolved: &ResolvedSchema,
-    capnp_mod: &TokenStream,
-    builder_var: &syn::Ident,
-) -> TokenStream {
-    match type_name {
-        "Text" | "Data" => quote! { #builder_var.#setter_name(#rust_name); },
-        "Bool" | "UInt8" | "UInt16" | "UInt32" | "UInt64" | "Int8" | "Int16" | "Int32" | "Int64" | "Float32" | "Float64" => {
-            quote! { #builder_var.#setter_name(#rust_name); }
-        }
-        t if t.starts_with("List(") => {
-            let inner_type = &t[5..t.len() - 1];
-            generate_list_setter(rust_name, setter_name, inner_type, resolved, capnp_mod, builder_var)
-        }
-        t => {
-            if let Some(e) = resolved.find_enum(t) {
-                let type_ident = format_ident!("{}", t);
-                let match_arms: Vec<TokenStream> = e.variants.iter().map(|(vname, _)| {
-                    let snake = to_snake_case(vname);
-                    let pascal = format_ident!("{}", to_pascal_case(vname));
-                    quote! { #snake => #capnp_mod::#type_ident::#pascal }
-                }).collect();
-                let default_arm = if let Some((first, _)) = e.variants.first() {
-                    let first_pascal = format_ident!("{}", to_pascal_case(first));
-                    quote! { _ => #capnp_mod::#type_ident::#first_pascal }
-                } else {
-                    TokenStream::new()
-                };
-                quote! {
-                    #builder_var.#setter_name(match #rust_name {
-                        #(#match_arms,)*
-                        #default_arm,
-                    });
-                }
-            } else if let Some(s) = resolved.find_struct(t) {
-                let field_snake = to_snake_case(
-                    setter_name.to_string().strip_prefix("set_").unwrap_or(&setter_name.to_string())
-                );
-                if s.has_union && s.fields.is_empty() {
-                    let init_name = format_ident!("init_{}", &field_snake);
-                    quote! { #builder_var.reborrow().#init_name(); }
-                } else {
-                    let init_name = format_ident!("init_{}", &field_snake);
-                    quote! {
-                        hyprstream_rpc::capnp::ToCapnp::write_to(&#rust_name, &mut #builder_var.reborrow().#init_name());
-                    }
-                }
-            } else {
-                let _comment = format!("unknown type: set_{} for {}", to_snake_case(&setter_name.to_string()), t);
-                quote! { /* #_comment */ }
-            }
-        }
-    }
-}
-
-fn generate_list_setter(
-    rust_name: &syn::Ident,
-    setter_name: &syn::Ident,
-    inner_type: &str,
-    resolved: &ResolvedSchema,
-    _capnp_mod: &TokenStream,
-    builder_var: &syn::Ident,
-) -> TokenStream {
-    let init_name = format_ident!(
-        "init_{}",
-        setter_name
-            .to_string()
-            .strip_prefix("set_")
-            .unwrap_or(&setter_name.to_string())
-    );
-
-    match inner_type {
-        "Text" => {
-            quote! {
-                {
-                    let mut list = #builder_var.reborrow().#init_name(#rust_name.len() as u32);
-                    for (i, item) in #rust_name.iter().enumerate() {
-                        list.set(i as u32, item.as_str());
-                    }
-                }
-            }
-        }
-        "Data" => {
-            quote! {
-                {
-                    let mut list = #builder_var.reborrow().#init_name(#rust_name.len() as u32);
-                    for (i, item) in #rust_name.iter().enumerate() {
-                        list.set(i as u32, item.as_slice());
-                    }
-                }
-            }
-        }
-        "Bool" | "UInt8" | "UInt16" | "UInt32" | "UInt64"
-            | "Int8" | "Int16" | "Int32" | "Int64" | "Float32" | "Float64" => {
-            quote! {
-                {
-                    let mut list = #builder_var.reborrow().#init_name(#rust_name.len() as u32);
-                    for (i, item) in #rust_name.iter().enumerate() {
-                        list.set(i as u32, *item);
-                    }
-                }
-            }
-        }
-        struct_name => {
-            if resolved.is_struct(struct_name) {
-                quote! {
-                    {
-                        let mut list = #builder_var.reborrow().#init_name(#rust_name.len() as u32);
-                        for (i, item) in #rust_name.iter().enumerate() {
-                            hyprstream_rpc::capnp::ToCapnp::write_to(item, &mut list.reborrow().get(i as u32));
-                        }
-                    }
-                }
-            } else {
-                quote! { }
-            }
-        }
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // parse_response
 // ─────────────────────────────────────────────────────────────────────────────
@@ -969,7 +1418,9 @@ fn generate_list_parse_arm(
 // Scoped Factory Method
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn generate_scoped_factory_method(sc: &ScopedClient) -> TokenStream {
+
+/// Generate a scoped factory method for portable clients (no jwt_token field).
+fn generate_portable_scoped_factory_method(sc: &ScopedClient) -> TokenStream {
     let method_name = format_ident!("{}", to_snake_case(&sc.factory_name));
     let client_name_ident = format_ident!("{}", sc.client_name);
     let doc = format!("Create a scoped {} client.", sc.factory_name);
@@ -992,8 +1443,7 @@ fn generate_scoped_factory_method(sc: &ScopedClient) -> TokenStream {
         #[doc = #doc]
         pub fn #method_name(&self #(, #params)*) -> #client_name_ident {
             #client_name_ident {
-                client: Arc::clone(&self.client),
-                claims: self.claims.clone(),
+                client: std::sync::Arc::clone(&self.client),
                 #(#field_inits,)*
             }
         }

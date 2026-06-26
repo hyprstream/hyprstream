@@ -13,19 +13,27 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use crate::auth::{jwt, Claims};
-use crate::services::generated::policy_client::PolicyClient;
+use crate::services::generated::policy_client::{
+    PolicyClient, GetHistory, GetDiff, ApplyDraft, RollbackPolicy, PolicyCheck, ApplyTemplate,
+    AddGrouping, RemoveGrouping,
+};
 use anyhow::{Context, Result};
 use chrono::Duration;
 use ed25519_dalek::SigningKey;
-use hyprstream_rpc::prelude::*;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
-use tracing::info;
 
 /// Create a PolicyClient for RPC calls.
-fn create_policy_client(signing_key: &SigningKey) -> PolicyClient {
-    PolicyClient::new(signing_key.clone(), RequestIdentity::local())
+///
+/// Bootstrap: PolicyService key needed to create the PolicyClient for peer key resolution.
+fn create_policy_client(signing_key: &SigningKey) -> Result<PolicyClient> {
+    PolicyClient::for_service(
+        signing_key.clone(),
+        // Bootstrap: PolicyService uses the root key
+        signing_key.verifying_key(),
+        None,
+    )
 }
 
 /// Handle `policy show` - Display the running policy via RPC
@@ -33,7 +41,7 @@ pub async fn handle_policy_show(
     signing_key: &SigningKey,
     raw: bool,
 ) -> Result<()> {
-    let client = create_policy_client(signing_key);
+    let client = create_policy_client(signing_key)?;
     let policy_info = client.get_policy().await
         .context("Failed to get policy from PolicyService. Are services running?")?;
 
@@ -49,7 +57,7 @@ pub async fn handle_policy_show(
         if policy_info.rules.is_empty() && policy_info.groupings.is_empty() {
             println!("No policies defined.");
             println!("\nTo get started, apply a template:");
-            println!("  hyprstream quick policy apply-template local    # local CLI full access");
+            println!("  hyprstream quick policy list-templates  # see all available templates");
             println!("\nOr edit manually:");
             println!("  hyprstream quick policy edit");
             return Ok(());
@@ -105,8 +113,8 @@ pub async fn handle_policy_history(
     count: usize,
     _oneline: bool,
 ) -> Result<()> {
-    let client = create_policy_client(signing_key);
-    let history = client.get_history(count as u32).await
+    let client = create_policy_client(signing_key)?;
+    let history = client.get_history(&GetHistory { count: count as u32 }).await
         .context("Failed to get policy history from PolicyService. Are services running?")?;
 
     if history.entries.is_empty() {
@@ -152,7 +160,7 @@ pub async fn handle_policy_edit(
     }
 
     // Check for draft changes via PolicyService RPC
-    let client = create_policy_client(signing_key);
+    let client = create_policy_client(signing_key)?;
     match client.get_draft_status().await {
         Ok(draft) if draft.has_changes => {
             println!();
@@ -174,10 +182,10 @@ pub async fn handle_policy_diff(
     signing_key: &SigningKey,
     against: Option<String>,
 ) -> Result<()> {
-    let client = create_policy_client(signing_key);
+    let client = create_policy_client(signing_key)?;
     let git_ref = against.as_deref().unwrap_or("");
 
-    let diff_text = client.get_diff(git_ref).await
+    let diff_text = client.get_diff(&GetDiff { git_ref: Some(git_ref.to_owned()) }).await
         .context("Failed to get diff from PolicyService. Are services running?")?;
 
     if diff_text.is_empty() {
@@ -209,7 +217,7 @@ pub async fn handle_policy_apply(
     dry_run: bool,
     message: Option<String>,
 ) -> Result<()> {
-    let client = create_policy_client(signing_key);
+    let client = create_policy_client(signing_key)?;
 
     // Check for uncommitted changes via RPC
     let draft = client.get_draft_status().await
@@ -221,7 +229,7 @@ pub async fn handle_policy_apply(
     }
 
     // Show what would be committed
-    let diff_text = client.get_diff("").await
+    let diff_text = client.get_diff(&GetDiff { git_ref: Some(String::new()) }).await
         .context("Failed to get diff from PolicyService.")?;
 
     println!("Changes to be applied ({}):", draft.summary);
@@ -245,7 +253,7 @@ pub async fn handle_policy_apply(
         format!("policy: update access control rules ({timestamp})")
     });
 
-    let result_msg = client.apply_draft(&commit_msg).await
+    let result_msg = client.apply_draft(&ApplyDraft { message: Some(commit_msg) }).await
         .context("Failed to apply draft via PolicyService.")?;
 
     println!("✓ Policy applied successfully.");
@@ -260,11 +268,11 @@ pub async fn handle_policy_rollback(
     git_ref: &str,
     dry_run: bool,
 ) -> Result<()> {
-    let client = create_policy_client(signing_key);
+    let client = create_policy_client(signing_key)?;
 
     if dry_run {
         // Use history RPC to show what we'd be rolling back to
-        let history = client.get_history(20).await
+        let history = client.get_history(&GetHistory { count: 20 }).await
             .context("Failed to get history from PolicyService. Are services running?")?;
 
         // Find the matching entry
@@ -291,7 +299,7 @@ pub async fn handle_policy_rollback(
     }
 
     // Use PolicyService RPC
-    let result_msg = client.rollback(git_ref).await
+    let result_msg = client.rollback(&RollbackPolicy { git_ref: git_ref.to_owned() }).await
         .context("Failed to rollback via PolicyService. Are services running?")?;
 
     println!();
@@ -308,9 +316,9 @@ pub async fn handle_policy_check(
     resource: &str,
     action: &str,
 ) -> Result<()> {
-    let client = create_policy_client(signing_key);
+    let client = create_policy_client(signing_key)?;
 
-    let allowed = client.check(user, "*", resource, action).await
+    let allowed = client.check(&PolicyCheck { subject: user.to_owned(), domain: "*".to_owned(), resource: resource.to_owned(), operation: action.to_owned() }).await
         .context("Failed to check policy via PolicyService. Are services running?")?;
 
     println!("User:     {user}");
@@ -351,14 +359,8 @@ pub async fn handle_token_create(
         format!("token-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"))
     });
 
-    // Create JWT claims with bare username as subject.
-    // Scopes are not embedded in JWT - Casbin enforces authorization server-side.
-    let now = chrono::Utc::now().timestamp();
-    let exp = (chrono::Utc::now() + duration).timestamp();
-    let claims = Claims::new(user.to_owned(), now, exp);
-
-    // Encode and sign the JWT
-    let token = jwt::encode(&claims, signing_key);
+    // Mint JWT with proper iss/aud claims for OAI middleware compatibility
+    let (token, exp) = mint_local_token(signing_key, user, duration);
 
     // Display the token (only shown once)
     println!();
@@ -395,71 +397,79 @@ pub async fn handle_token_create(
 }
 
 
-/// Load or generate the signing key from .registry/keys/signing.key
+/// Load or generate the Ed25519 node signing key from the configured secrets
+/// directory.
 ///
-/// Security: avoids TOCTOU by opening the file directly instead of
-/// checking existence first. New keys are created with mode 0o600 at
-/// open(2) time so the private key is never world-readable on disk.
-pub async fn load_or_generate_signing_key(keys_dir: &Path) -> Result<SigningKey> {
-    use std::io::Read;
-
-    let key_path = keys_dir.join("signing.key");
-
-    // Try to open existing key first (no TOCTOU — single open call)
-    match std::fs::File::open(&key_path) {
-        Ok(mut file) => {
-            let mut key_bytes = Vec::new();
-            file.read_to_end(&mut key_bytes)?;
-            if key_bytes.len() != 32 {
-                anyhow::bail!("Invalid signing key file: expected 32 bytes, got {}", key_bytes.len());
-            }
-            let mut key_array = [0u8; 32];
-            key_array.copy_from_slice(&key_bytes);
-            let signing_key = SigningKey::from_bytes(&key_array);
-            info!("Loaded signing key from {:?}", key_path);
-            Ok(signing_key)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Generate new key — create directory with restricted permissions
-            tokio::fs::create_dir_all(keys_dir).await?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                tokio::fs::set_permissions(keys_dir, std::fs::Permissions::from_mode(0o700)).await?;
-            }
-
-            let signing_key = SigningKey::generate(&mut rand::thread_rng());
-
-            // Write key with mode 0o600 set at open(2) time — never world-readable
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(&key_path)?;
-                std::io::Write::write_all(&mut file, &signing_key.to_bytes())?;
-            }
-
-            #[cfg(not(unix))]
-            {
-                tokio::fs::write(&key_path, signing_key.to_bytes()).await?;
-            }
-
-            info!("Generated new signing key at {:?}", key_path);
-            Ok(signing_key)
-        }
-        Err(e) => Err(e.into()),
+/// The `_keys_dir` parameter is retained for API compatibility but ignored; the
+/// actual path is always resolved via `HyprConfig::resolve_secrets_dir()`.
+///
+/// Resolution order:
+/// 1. `HYPRSTREAM__SIGNING_KEY` / `config.signing_key` test bypass.
+/// 2. File at `<secrets_dir>/signing-key`.
+/// 3. Generate new key, write to file (writable dir only).
+pub async fn load_or_generate_signing_key(_keys_dir: &Path) -> Result<SigningKey> {
+    if let Some(sk) = crate::config::HyprConfig::node_signing_key_bypass()? {
+        return Ok(sk);
     }
+    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
+    crate::auth::identity_store::load_or_generate_node_signing_key(&secrets_dir)
+}
+
+/// Mint a JWT locally with proper iss/aud claims.
+///
+/// Sets `iss` to the OAuth issuer URL and `aud` to the OAI resource URL,
+/// matching the claim structure expected by the OAI HTTP middleware.
+/// Does NOT require a running PolicyService — signs directly with the local key.
+pub(crate) fn mint_local_token(
+    signing_key: &SigningKey,
+    subject: &str,
+    duration: Duration,
+) -> (String, i64) {
+    let now = chrono::Utc::now().timestamp();
+    let exp = now + duration.num_seconds();
+
+    let config = crate::config::HyprConfig::load();
+    let (issuer, audience) = match config {
+        Ok(ref c) => (c.oauth.issuer_url(), c.oai.resource_url()),
+        Err(_) => {
+            // Fallback to defaults when config is not available
+            ("http://localhost:6791".to_owned(), "http://localhost:6789".to_owned())
+        }
+    };
+
+    let claims = Claims::new(subject.to_owned(), now, exp)
+        .with_issuer(issuer)
+        .with_audience(Some(audience));
+
+    let jwt_key = hyprstream_rpc::node_identity::derive_purpose_key(signing_key, "hyprstream-jwt-v1");
+    let token = jwt::encode(&claims, &jwt_key);
+    (token, exp)
+}
+
+/// Ensure the local user has an Ed25519 signing keypair.
+///
+/// Loads from `<secrets_dir>/user-signing-key`, generating on first run.
+/// This key is per-OS-user (not per-hyprstream-user). The wizard only
+/// registers it for the local admin. Other users generate their own keys.
+#[allow(dead_code)]
+pub(crate) fn ensure_user_signing_key() -> Result<(SigningKey, ed25519_dalek::VerifyingKey)> {
+    if let Some(pair) = crate::config::HyprConfig::user_signing_key_bypass()? {
+        return Ok(pair);
+    }
+    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
+    crate::auth::identity_store::load_or_generate_user_signing_key(&secrets_dir)
 }
 
 /// Parse duration string like "30d", "90d", "1y", "never"
-fn parse_duration(s: &str) -> Result<Option<Duration>> {
+pub(crate) fn parse_duration(s: &str) -> Result<Option<Duration>> {
     let s = s.trim().to_lowercase();
 
-    if s == "never" || s.is_empty() {
+    if s.is_empty() {
         return Ok(None);
+    }
+
+    if s == "never" {
+        return Ok(Some(Duration::days(36500))); // ~100 years
     }
 
     let (num_str, unit) = if s.ends_with('d') {
@@ -510,6 +520,83 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 // Re-export policy templates from shared location
 pub use crate::auth::policy_templates::{PolicyTemplate, get_template, get_templates};
 
+// === Role handlers ===
+
+/// Handle `policy role add <user> <role>` - Assign a role to a user via RPC
+pub async fn handle_policy_role_add(
+    signing_key: &SigningKey,
+    user: &str,
+    role: &str,
+    dry_run: bool,
+) -> Result<()> {
+    if dry_run {
+        println!("Would add: g, {user}, {role}");
+        return Ok(());
+    }
+
+    let client = create_policy_client(signing_key)?;
+    let sha = client.add_grouping(&AddGrouping { user: user.to_owned(), role: role.to_owned() }).await
+        .context("Failed to add role assignment via PolicyService. Are services running?")?;
+
+    println!("Role assigned. Commit: {}", &sha[..sha.len().min(8)]);
+    Ok(())
+}
+
+/// Handle `policy role remove <user> <role>` - Remove a role from a user via RPC
+pub async fn handle_policy_role_remove(
+    signing_key: &SigningKey,
+    user: &str,
+    role: &str,
+    force: bool,
+) -> Result<()> {
+    if !force {
+        print!("Remove role '{role}' from '{user}'? [y/N] ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let client = create_policy_client(signing_key)?;
+    let sha = client.remove_grouping(&RemoveGrouping { user: user.to_owned(), role: role.to_owned() }).await
+        .context("Failed to remove role assignment via PolicyService. Are services running?")?;
+
+    println!("Role removed. Commit: {}", &sha[..sha.len().min(8)]);
+    Ok(())
+}
+
+/// Handle `policy role list` - List role assignments (g-lines) via RPC
+pub async fn handle_policy_role_list(
+    signing_key: &SigningKey,
+    user: Option<&str>,
+    role: Option<&str>,
+) -> Result<()> {
+    let client = create_policy_client(signing_key)?;
+    let policy_info = client.get_policy().await
+        .context("Failed to get policy from PolicyService. Are services running?")?;
+
+    let groupings: Vec<_> = policy_info.groupings.iter()
+        .filter(|g| user.is_none_or(|u| g.user == u))
+        .filter(|g| role.is_none_or(|r| g.role == r))
+        .collect();
+
+    if groupings.is_empty() {
+        println!("No role assignments found.");
+        return Ok(());
+    }
+
+    for g in groupings {
+        println!("g, {}, {}", g.user, g.role);
+    }
+
+    Ok(())
+}
+
 /// Handle `policy list-templates` - List available templates
 pub async fn handle_policy_list_templates() -> Result<()> {
     let templates = get_templates();
@@ -540,14 +627,14 @@ pub async fn handle_policy_apply_template(
             template_name
         ))?;
 
-    let new_content = template.expanded_rules();
+    let rules_csv = template.to_csv();
 
     println!("Applying template: {template_name}");
     println!("Description: {}", template.description);
     println!();
     println!("Rules:");
-    for line in new_content.lines() {
-        if !line.trim().is_empty() && !line.starts_with('#') {
+    for line in rules_csv.lines() {
+        if !line.trim().is_empty() {
             println!("  {line}");
         }
     }
@@ -559,8 +646,8 @@ pub async fn handle_policy_apply_template(
     }
 
     // Use PolicyService RPC to apply the template (writes file, validates, stages, commits)
-    let client = create_policy_client(signing_key);
-    let result_msg = client.apply_template(template_name).await
+    let client = create_policy_client(signing_key)?;
+    let result_msg = client.apply_template(&ApplyTemplate { name: template_name.to_owned() }).await
         .context("Failed to apply template via PolicyService. Are services running?")?;
 
     println!();

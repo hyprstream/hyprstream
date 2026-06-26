@@ -66,6 +66,18 @@ impl Default for CorsConfig {
 }
 
 impl CorsConfig {
+    /// CORS config for public endpoints (OAuth metadata, token, registration).
+    /// Allows any origin but disables credentials (per CORS spec, wildcard + credentials is invalid).
+    pub fn public() -> Self {
+        Self {
+            enabled: true,
+            allowed_origins: vec!["*".to_owned()],
+            allow_credentials: false,
+            max_age: 3600,
+            permissive_headers: false,
+        }
+    }
+
     /// Create CORS config with dynamic port-based origins
     pub fn with_port(port: u16) -> Self {
         let mut config = Self::default();
@@ -153,6 +165,12 @@ pub struct ServerConfig {
     #[serde(default = "default_cancellation_check_interval")]
     pub cancellation_check_interval: u64,
 
+    /// Max concurrent server-side streaming responses **per service** — how many
+    /// streaming RPCs one service may actively push data for at once. Bounds the
+    /// streaming-response tasks spawned by the RPC dispatch core (#186).
+    #[serde(default = "default_max_concurrent_streams_per_service")]
+    pub max_concurrent_streams_per_service: usize,
+
     /// Maximum context length for KV cache allocation.
     /// Overrides model's max_position_embeddings to reduce GPU memory.
     /// None = use model's default, Some(n) = cap at n tokens
@@ -224,6 +242,9 @@ fn default_max_concurrent_requests() -> usize {
 fn default_cancellation_check_interval() -> u64 {
     100
 }
+fn default_max_concurrent_streams_per_service() -> usize {
+    hyprstream_rpc::streaming::DEFAULT_MAX_CONCURRENT_STREAMS_PER_SERVICE
+}
 fn default_tls_min_version() -> String {
     "1.2".to_owned()
 }
@@ -241,6 +262,7 @@ impl Default for ServerConfig {
             request_timeout_secs: default_request_timeout_secs(),
             max_concurrent_requests: default_max_concurrent_requests(),
             cancellation_check_interval: default_cancellation_check_interval(),
+            max_concurrent_streams_per_service: default_max_concurrent_streams_per_service(),
             max_context: None, // Use model's default max_position_embeddings
             kv_quant: KVQuantArg::None,
             cors: CorsConfig::default(),

@@ -16,9 +16,26 @@ pub struct StoragePaths {
 }
 
 impl StoragePaths {
-    /// Create a new storage paths manager
+    /// Create a new storage paths manager.
+    ///
+    /// Respects `HYPRSTREAM_INSTANCE`: when set, uses
+    /// `hyprstream/instances/{value}` as the XDG prefix so that credentials,
+    /// registry state, and models are isolated between concurrent instances on
+    /// the same host (mirrors the socket-path isolation in hyprstream-rpc/paths.rs).
     pub fn new() -> Result<Self> {
-        let base_dirs = BaseDirectories::with_prefix(APP_NAME)
+        let prefix = match std::env::var("HYPRSTREAM_INSTANCE") {
+            Ok(inst) if !inst.is_empty() => {
+                if inst.contains('/') || inst.contains("..") {
+                    return Err(anyhow!(
+                        "HYPRSTREAM_INSTANCE must not contain '/' or '..': {:?}",
+                        inst
+                    ));
+                }
+                format!("{APP_NAME}/instances/{inst}")
+            }
+            _ => APP_NAME.to_owned(),
+        };
+        let base_dirs = BaseDirectories::with_prefix(&prefix)
             .map_err(|e| anyhow!("Failed to create XDG base directories: {}", e))?;
 
         Ok(Self { base_dirs })
@@ -50,11 +67,6 @@ impl StoragePaths {
         let config_dir = self.base_dirs.get_config_home();
         self.ensure_dir_exists(&config_dir)?;
         Ok(config_dir)
-    }
-
-    /// Get the path for HuggingFace authentication token
-    pub fn hf_token_path(&self) -> Result<PathBuf> {
-        Ok(self.config_dir()?.join("hf_token"))
     }
 
     /// Get the temporary download directory
@@ -102,6 +114,11 @@ impl StoragePaths {
 
         loras.sort();
         Ok(loras)
+    }
+
+    /// Resolve worktree host path for a model+branch (CLI-only, not exposed via RPC)
+    pub fn worktree_path(&self, model_name: &str, branch: &str) -> Result<PathBuf> {
+        Ok(self.models_dir()?.join(model_name).join("worktrees").join(branch))
     }
 
     /// Ensure a directory exists, creating it if necessary

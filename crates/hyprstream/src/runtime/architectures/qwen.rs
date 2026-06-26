@@ -32,7 +32,7 @@ impl QwenAdapter {
         _context_length: usize,
         device: &Device,
         dtype: DType,
-        kv_quant_type: crate::runtime::kv_quant::KVQuantType,
+        kv_quant_type: crate::runtime::KVQuantType,
     ) -> Result<Box<dyn ModelOperations>> {
         // Parse the config.json to get proper rope_theta and other settings
         let config = LlamaModel::parse_config(config_json)?;

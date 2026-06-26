@@ -99,6 +99,14 @@ impl CallbackConfig {
         self
     }
 
+    /// Extract the progress reporter (if using Channel config)
+    pub fn progress_reporter(&self) -> Option<Arc<dyn ProgressReporter>> {
+        match &self.progress {
+            ProgressConfig::Channel(reporter) => Some(Arc::clone(reporter)),
+            _ => None,
+        }
+    }
+
     /// Create actual git2::RemoteCallbacks from this configuration
     ///
     /// This is called within spawn_blocking where non-Send is acceptable

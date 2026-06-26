@@ -59,31 +59,28 @@ pub mod events;
 pub mod dbus;
 
 // Re-export main types
-pub use config::{HypervisorType, ImageConfig, PoolConfig, WorkerConfig, WorkflowConfig};
+pub use config::{BackendType, HypervisorType, ImageConfig, PoolConfig, WorkerConfig, WorkflowConfig};
 pub use error::WorkerError;
 
 // Re-export service types
-pub use runtime::{WorkerService, RuntimeClient};
-pub use image::{ImageClient, RafsStore};
-pub use workflow::{WorkflowService, WorkflowClient};
+pub use runtime::{WorkerService, SandboxBackend, SandboxHandle, KataBackend, NspawnBackend, NspawnConfig};
+pub use image::RafsStore;
+pub use workflow::WorkflowService;
 pub use events::{
-    // Spawner types (new API)
-    ProxyService, ServiceSpawner, SpawnedService,
-    // Publisher/Subscriber
-    EventPublisher, EventSubscriber, endpoints,
-    // Endpoint configuration
-    EndpointMode,
+    // Publisher/Subscriber (moq-backed, no ZMQ context needed)
+    EventPublisher, EventSubscriber,
     // Event types
     WorkerEvent, ReceivedEvent,
     SandboxStarted, SandboxStopped, ContainerStarted, ContainerStopped,
     serialize_sandbox_started, serialize_sandbox_stopped,
     serialize_container_started, serialize_container_stopped,
-    // Inproc endpoint constants
-    EVENTS_PUB, EVENTS_SUB,
 };
+// Re-export the moq event origin init function for the factory
+pub use hyprstream_rpc::moq_event::{init_global_moq_event_origin, MoqEventOrigin};
 
-// Re-export annotations_capnp and streaming_capnp from hyprstream-rpc (compiled once, shared by all crates)
+// Re-export capnp modules from hyprstream-rpc (compiled once, shared by all crates)
 pub use hyprstream_rpc::annotations_capnp;
+pub use hyprstream_rpc::common_capnp;
 pub use hyprstream_rpc::streaming_capnp;
 
 /// Generated Cap'n Proto code for resource-scoped worker schema

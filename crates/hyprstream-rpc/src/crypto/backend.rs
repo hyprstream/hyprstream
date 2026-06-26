@@ -96,8 +96,26 @@ pub fn keyed_mac(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
 
 /// Compute a 16-byte truncated keyed MAC (for wire format).
 ///
-/// Used by streaming protocol where 16-byte MACs reduce overhead
-/// while still providing 128-bit security (adequate for stream auth).
+/// Used by streaming protocol (`StreamHmacState`) where 16-byte MACs reduce
+/// overhead while still providing 128-bit authentication strength.
+///
+/// # Wire format dependency
+///
+/// The 16-byte truncation is part of the on-wire stream block format. **Do not**
+/// widen this to 32 bytes without coordinating a protocol version bump on both
+/// server and client — the receiver expects exactly 16 bytes per block trailer.
+///
+/// # Cryptographic properties
+///
+/// 128-bit MAC tags are the standard floor for authentication (GCM, Poly1305,
+/// SIV, CMAC all operate at 128 bits). Both Blake3 and HMAC-SHA256 are PRFs;
+/// truncating to any prefix preserves PRF security. Online forgery probability
+/// per attempt is 2^-128. The 2^64 collision bound does NOT threaten
+/// authentication; it would only matter if you relied on collision-resistance.
+///
+/// First-N-bytes truncation is the standard safe pattern (NIST SP 800-107,
+/// FIPS 198-1). The myth that you need middle/folded truncation came from
+/// ad-hoc constructions on MD5/SHA-1 and does not apply here.
 ///
 /// # Arguments
 ///
@@ -106,11 +124,49 @@ pub fn keyed_mac(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
 ///
 /// # Returns
 ///
-/// 16-byte truncated MAC tag.
+/// 16-byte truncated MAC tag (first 16 bytes of full output).
 pub fn keyed_mac_truncated(key: &[u8; 32], data: &[u8]) -> [u8; 16] {
     let full = keyed_mac(key, data);
     let mut output = [0u8; 16];
     output.copy_from_slice(&full[..16]);
+    output
+}
+
+/// Multi-part variant of [`keyed_mac_truncated`] — authenticates the
+/// concatenation of `parts` **without allocating a joined buffer**.
+///
+/// `keyed_mac_truncated_parts(k, &[a, b])` is byte-for-byte identical to
+/// `keyed_mac_truncated(k, &[a, b].concat())` (both Blake3's keyed hasher and
+/// HMAC are defined over the streamed input), so this is a zero-copy drop-in on
+/// the wire — used by the stream verifier to MAC `prev_mac ‖ block` over a
+/// borrowed payload slice instead of copying the block into a scratch `Vec`.
+#[cfg(not(feature = "fips"))]
+pub fn keyed_mac_truncated_parts(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new_keyed(key);
+    for p in parts {
+        hasher.update(p);
+    }
+    let full = hasher.finalize();
+    let mut output = [0u8; 16];
+    output.copy_from_slice(&full.as_bytes()[..16]);
+    output
+}
+
+#[cfg(feature = "fips")]
+pub fn keyed_mac_truncated_parts(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 16] {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let mut mac = match Hmac::<Sha256>::new_from_slice(key) {
+        Ok(m) => m,
+        Err(_) => unreachable!("HMAC-SHA256 accepts any key size"),
+    };
+    for p in parts {
+        mac.update(p);
+    }
+    let result = mac.finalize();
+    let mut output = [0u8; 16];
+    output.copy_from_slice(&result.into_bytes()[..16]);
     output
 }
 
@@ -121,6 +177,29 @@ pub fn keyed_mac_truncated(key: &[u8; 32], data: &[u8]) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_keyed_mac_truncated_parts_equals_concat() {
+        // The multi-part MAC must be byte-identical to MAC-of-concatenation, so
+        // the zero-copy stream verifier produces the same wire MAC as before.
+        let key = [0x5au8; 32];
+        let prev = [0x11u8; 16];
+        let block = b"a stream block payload of arbitrary length".as_slice();
+
+        let mut joined = Vec::new();
+        joined.extend_from_slice(&prev);
+        joined.extend_from_slice(block);
+
+        assert_eq!(
+            keyed_mac_truncated_parts(&key, &[&prev, block]),
+            keyed_mac_truncated(&key, &joined),
+        );
+        // Empty-parts and single-part degenerate cases.
+        assert_eq!(
+            keyed_mac_truncated_parts(&key, &[block]),
+            keyed_mac_truncated(&key, block),
+        );
+    }
 
     #[test]
     fn test_derive_key_deterministic() {

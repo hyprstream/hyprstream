@@ -11,6 +11,7 @@ use crate::storage::{DriverOpts, WorktreeHandle};
 use crate::stage::StageManager;
 use git2::{Oid, Repository, Signature};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tracing::info;
 
 /// Handle to a tracked repository
@@ -914,6 +915,80 @@ impl<'a> RepositoryHandle<'a> {
         Self::run_git_lfs_pull(repo_path).await
     }
 
+    /// Fetch LFS files for a worktree with progress reporting
+    pub async fn fetch_lfs_files_with_progress(
+        repo_path: &Path,
+        progress: Option<Arc<dyn crate::callback_config::ProgressReporter>>,
+    ) -> Git2DBResult<()> {
+        if !repo_path.exists() {
+            return Err(Git2DBError::internal(format!(
+                "Worktree path does not exist: {}",
+                repo_path.display()
+            )));
+        }
+
+        let gitattributes_path = repo_path.join(".gitattributes");
+
+        let uses_lfs = if gitattributes_path.exists() {
+            tokio::fs::read_to_string(&gitattributes_path)
+                .await
+                .map(|content| content.contains("filter=lfs"))
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if !uses_lfs {
+            tracing::debug!("Repository does not use Git LFS, skipping LFS fetch");
+            return Ok(());
+        }
+
+        // Try XET first if initialized (faster for XET-enabled repos)
+        #[cfg(feature = "xet-storage")]
+        if crate::xet_filter::is_initialized() {
+            tracing::info!("XET initialized, attempting XET fetch for LFS files...");
+            match Self::try_xet_lfs_fetch_with_progress(repo_path, progress.as_ref()).await {
+                Ok(stats) => {
+                    if stats.processed > 0 || stats.skipped > 0 {
+                        tracing::info!(
+                            "XET fetch complete: {} processed, {} skipped, {} failed",
+                            stats.processed, stats.skipped, stats.failed
+                        );
+                        if stats.failed == 0 {
+                            return Ok(());
+                        }
+                        tracing::warn!("Some files failed via XET, falling back to git-lfs for remaining files");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("XET fetch failed: {}. Falling back to git-lfs...", e);
+                }
+            }
+        }
+
+        // Fallback to git lfs pull
+        Self::run_git_lfs_pull(repo_path).await
+    }
+
+    /// Try to fetch LFS files via XET with progress reporting
+    #[cfg(feature = "xet-storage")]
+    async fn try_xet_lfs_fetch_with_progress(
+        repo_path: &Path,
+        progress: Option<&Arc<dyn crate::callback_config::ProgressReporter>>,
+    ) -> Git2DBResult<crate::lfs::ProcessingStats> {
+        use crate::lfs::LfsStorage;
+
+        let config = crate::xet_filter::get_config().ok_or_else(|| {
+            Git2DBError::internal("BUG: XET filter initialized but FILTER_CONFIG was not set")
+        })?;
+
+        let storage = LfsStorage::new(&config).await.map_err(|e| {
+            Git2DBError::internal(format!("Failed to create LFS storage: {e}"))
+        })?;
+
+        storage.process_worktree_with_progress(repo_path, progress).await
+    }
+
     /// Try to fetch LFS files via XET
     #[cfg(feature = "xet-storage")]
     async fn try_xet_lfs_fetch(repo_path: &Path) -> Git2DBResult<crate::lfs::ProcessingStats> {
@@ -989,6 +1064,94 @@ impl<'a> RepositoryHandle<'a> {
         Ok(())
     }
 
+    /// Create a worktree with pathspec-filtered checkout.
+    ///
+    /// Only files matching `checkout_paths` prefixes are materialized.
+    /// Excluded entries get skip-worktree index bits to prevent re-materialization.
+    ///
+    /// # Arguments
+    /// * `worktree_path` - Where to create the worktree (empty = auto-derive)
+    /// * `branch` - Git ref to checkout
+    /// * `checkout_paths` - Path prefixes to materialize (e.g., `["backends/cuda130/", "manifest.toml"]`)
+    pub async fn create_filtered_worktree(
+        &self,
+        worktree_path: &Path,
+        branch: &str,
+        checkout_paths: Vec<String>,
+    ) -> Git2DBResult<WorktreeHandle> {
+        if checkout_paths.is_empty() {
+            return Err(Git2DBError::configuration(
+                "checkout_paths must not be empty; use create_worktree() for a full checkout",
+            ));
+        }
+
+        let tracked_repo = self.metadata()?;
+
+        let worktree_path = if worktree_path.as_os_str().is_empty() {
+            let worktrees_dir = tracked_repo
+                .worktree_path
+                .parent()
+                .ok_or_else(|| Git2DBError::internal("Invalid base repository path"))?
+                .join("worktrees");
+            worktrees_dir.join(branch)
+        } else {
+            worktree_path.to_path_buf()
+        };
+
+        let driver = self.registry.storage_driver().clone();
+
+        info!(
+            "Creating filtered worktree with {} driver: base={}, path={}, ref={}, paths={:?}",
+            driver.name(),
+            tracked_repo.worktree_path.display(),
+            worktree_path.display(),
+            branch,
+            checkout_paths
+        );
+
+        let opts = DriverOpts {
+            base_repo: tracked_repo.worktree_path.clone(),
+            worktree_path: worktree_path.clone(),
+            ref_spec: branch.to_owned(),
+            progress: None,
+            checkout_paths: Some(checkout_paths),
+        };
+
+        let result = driver.create_worktree(&opts).await;
+
+        match result {
+            Ok(mut handle) => {
+                if let Err(e) = Self::fetch_lfs_files(&worktree_path).await {
+                    tracing::error!(
+                        "Failed to fetch LFS files for filtered worktree at {}: {}",
+                        worktree_path.display(),
+                        e
+                    );
+                    tracing::info!("Rolling back worktree creation due to LFS fetch failure");
+                    if let Err(cleanup_err) = handle.cleanup().await {
+                        tracing::error!("Failed to cleanup worktree during rollback: {}", cleanup_err);
+                    }
+                    return Err(Git2DBError::internal(format!(
+                        "Worktree creation failed: LFS fetch error: {e}. Worktree has been rolled back."
+                    )));
+                }
+                Ok(handle)
+            }
+            Err(e) => {
+                tracing::error!("Failed to create filtered worktree at {}: {}", worktree_path.display(), e);
+                if worktree_path.exists() {
+                    tracing::info!("Cleaning up partial worktree at {}", worktree_path.display());
+                    tokio::fs::remove_dir_all(worktree_path)
+                        .await
+                        .unwrap_or_else(|cleanup_err| {
+                            tracing::warn!("Failed to cleanup partial worktree: {}", cleanup_err);
+                        });
+                }
+                Err(e)
+            }
+        }
+    }
+
     pub async fn create_worktree(&self, worktree_path: &Path, branch: &str) -> Git2DBResult<WorktreeHandle> {
         let tracked_repo = self.metadata()?;
 
@@ -1020,6 +1183,8 @@ impl<'a> RepositoryHandle<'a> {
             base_repo: tracked_repo.worktree_path.clone(),
             worktree_path: worktree_path.clone(),
             ref_spec: branch.to_owned(),
+            progress: None,
+            checkout_paths: None,
         };
 
         // Create worktree using driver
