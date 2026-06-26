@@ -108,6 +108,24 @@ pub const SERVICE_BASE_POLICIES: &[ServicePolicyRule] = &[
     ServicePolicyRule { subject: "service:model", domain: "*", resource: "discovery:*", action: "*", effect: "allow" },
     ServicePolicyRule { subject: "service:oai", domain: "*", resource: "discovery:*", action: "*", effect: "allow" },
     ServicePolicyRule { subject: "service:worker", domain: "*", resource: "discovery:*", action: "*", effect: "allow" },
+    // #446: EVERY socket-served service announces its own QUIC endpoint to
+    // DiscoveryService on startup (the generic `factory.rs` announce hook). Now
+    // that those IPC callers resolve as their authoritative `service:<name>`
+    // identity (not `anonymous`), they need the least-privilege grant to write
+    // their OWN announcement. Scoped to `discovery:Announce` + `write` only
+    // (NOT `discovery:*`), so these services can register their endpoint but not
+    // mutate the rest of the discovery namespace. The services already granted
+    // broad `discovery:*` above (discovery/model/oai/worker) are unaffected.
+    ServicePolicyRule { subject: "service:mcp", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
+    ServicePolicyRule { subject: "service:metrics", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
+    ServicePolicyRule { subject: "service:notification", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
+    ServicePolicyRule { subject: "service:registry", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
+    ServicePolicyRule { subject: "service:tui", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
+    ServicePolicyRule { subject: "service:oauth", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
+    ServicePolicyRule { subject: "service:event", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
+    ServicePolicyRule { subject: "service:streams", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
+    ServicePolicyRule { subject: "service:flight", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
+    ServicePolicyRule { subject: "service:policy", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
     // NOTE: Federation (`federation:register` resource) is deny-by-default.
     // This is the single, atproto-style trust gate that governs both:
     //   - third-party clients registering via CIMD (Client ID Metadata
@@ -257,6 +275,79 @@ pub fn get_templates() -> &'static [PolicyTemplate] {
             policies: None,
             groupings: Some(&[
                 ServiceGrouping { user: "ttt.agent", role: "ttt.user" },
+            ]),
+        },
+        // ─────────────────────────────────────────────────────────────────
+        // Inference mesh (#319) — host↔host pipeline RPC authorization.
+        //
+        // SECURITY MODEL (deny-by-default, fail-closed, least-privilege):
+        //   * The mesh AUTHORITY actions (`infer.stage`, `delta.submit`, and the
+        //     `mesh.rpc` umbrella invoke right) are NEVER granted to `*`,
+        //     `service:*`, or `anonymous`. They are granted ONLY to specific,
+        //     non-wildcard `service:inference:host-<id>` subjects (#328), and
+        //     ONLY within a single tenant's domain. A host enrolled for tenant
+        //     `acme` thus cannot stage on tenant `beta` (the Casbin matcher does
+        //     an exact `r.dom == p.dom` check unless the rule's domain is `*`,
+        //     which mesh-authority rules MUST NOT use).
+        //   * The READ ability (`query.status`) MAY be granted to a *group* of
+        //     hosts via Casbin grouping (`g`) — see the `mesh-host-group`
+        //     template — so an operator can give a fleet read visibility without
+        //     per-host duplication. Authority stays per-host.
+        //
+        // RESOURCE SHAPE — `mesh://<tenant>/<job>/<…>` (UCAN-translatable):
+        //   The tenant is BOTH the Casbin domain (for ambient isolation) AND the
+        //   first path segment (so the caveat survives translation to a future
+        //   UCAN delegation, which has no domain column). The 1:1 mapping is:
+        //
+        //     Casbin: p, service:inference:host-7, acme, mesh://acme/job/j7, infer.stage, allow
+        //     UCAN:   { iss: <policy-root>, aud: host-7, sub: <policy-root>,
+        //               cmd: /mesh/infer/stage,
+        //               pol: [["==", ".tenant", "acme"], ["==", ".job", "j7"]] }
+        //
+        //   action ⇄ cmd, subject ⇄ aud, and the tenant/job caveats live in the
+        //   resource path so a future UCAN layer maps without loss. `query.status`
+        //   ⇄ /mesh/query/status, `delta.submit` ⇄ /mesh/delta/submit, the
+        //   `mesh.rpc` umbrella ⇄ /mesh/rpc.
+        //
+        // This template is a WORKED EXAMPLE for two hosts in tenant `acme`.
+        // Operators copy it and substitute their real host labels / tenant /
+        // job via `policy edit` (the per-host authority lines are intentionally
+        // explicit, never wildcarded). It is NOT injected into the base policy.
+        PolicyTemplate {
+            name: "mesh-host",
+            description: "Inference mesh (#319): per-host pipeline RPC grants for tenant `acme` (worked example — substitute real host labels/tenant; authority is strictly non-wildcard per-host)",
+            policies: Some(&[
+                // Router → host: ModelService stages activations onto enrolled
+                // hosts within the tenant. `service:model` is the router identity.
+                ServicePolicyRule { subject: "service:model", domain: "acme", resource: "mesh://acme/*", action: "infer.stage", effect: "allow" },
+                // Host → host: peer activation hand-off + status read.
+                ServicePolicyRule { subject: "service:inference:host-1", domain: "acme", resource: "mesh://acme/*", action: "mesh.rpc", effect: "allow" },
+                ServicePolicyRule { subject: "service:inference:host-1", domain: "acme", resource: "mesh://acme/*", action: "infer.stage", effect: "allow" },
+                ServicePolicyRule { subject: "service:inference:host-1", domain: "acme", resource: "mesh://acme/*", action: "query.status", effect: "allow" },
+                ServicePolicyRule { subject: "service:inference:host-2", domain: "acme", resource: "mesh://acme/*", action: "mesh.rpc", effect: "allow" },
+                ServicePolicyRule { subject: "service:inference:host-2", domain: "acme", resource: "mesh://acme/*", action: "infer.stage", effect: "allow" },
+                ServicePolicyRule { subject: "service:inference:host-2", domain: "acme", resource: "mesh://acme/*", action: "query.status", effect: "allow" },
+                // Host → aggregator: TTT delta submission (authority).
+                ServicePolicyRule { subject: "service:inference:host-1", domain: "acme", resource: "mesh://acme/*", action: "delta.submit", effect: "allow" },
+                ServicePolicyRule { subject: "service:inference:host-2", domain: "acme", resource: "mesh://acme/*", action: "delta.submit", effect: "allow" },
+            ]),
+            groupings: None,
+        },
+        // Group-policy variant: grant the READ ability to a whole fleet via a
+        // Casbin role, WITHOUT per-host duplication, while authority stays
+        // per-host (granted by `mesh-host`). The grouping rule `g,
+        // service:inference:host-<id>, mesh-readers` makes each host inherit the
+        // role's grants; the role gets ONLY `query.status` (read), never an
+        // authority action. Operators add `g, <host>, mesh-readers` per host.
+        PolicyTemplate {
+            name: "mesh-host-group",
+            description: "Inference mesh (#319): grant the read ability (query.status) to the `mesh-readers` host group for tenant `acme` (authority stays per-host via `mesh-host`)",
+            policies: Some(&[
+                ServicePolicyRule { subject: "mesh-readers", domain: "acme", resource: "mesh://acme/*", action: "query.status", effect: "allow" },
+            ]),
+            groupings: Some(&[
+                ServiceGrouping { user: "service:inference:host-1", role: "mesh-readers" },
+                ServiceGrouping { user: "service:inference:host-2", role: "mesh-readers" },
             ]),
         },
         PolicyTemplate {

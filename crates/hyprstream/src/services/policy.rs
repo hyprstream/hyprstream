@@ -1257,11 +1257,17 @@ impl PolicyHandler for PolicyService {
         _request_id: u64,
         data: &ResolveServiceKey,
     ) -> Result<PolicyResponseVariant> {
+        // #441: authoritative resolution — return the REGISTERED key or ERROR.
+        // We never derive an "expected" key from the root CA as a fallback: a
+        // consumer must never receive a key the signer didn't actually register,
+        // because a guessed key produces a silent mis-verify ("Response signed by
+        // unexpected key") three layers away at the envelope check. Registered-or-
+        // error converts that into a clear, early failure.
         let trust = hyprstream_service::global_trust_store();
         let vk = trust.resolve_one(&data.service_name)
-            .ok_or_else(|| anyhow!("No verifying key registered for service '{}'", data.service_name))?;
+            .ok_or_else(|| anyhow!("service key '{}' not registered", data.service_name))?;
         let att = trust.get(&vk)
-            .ok_or_else(|| anyhow!("No attestation for service '{}'", data.service_name))?;
+            .ok_or_else(|| anyhow!("service key '{}' not registered (no attestation)", data.service_name))?;
         debug!("Resolved service key for '{}'", data.service_name);
         Ok(PolicyResponseVariant::ResolveServiceKeyResult(
             ServiceKeyResponse {

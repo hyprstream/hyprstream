@@ -435,7 +435,10 @@ fn generate_dispatch_fn(
                     let err_response_type = format_ident!("{}ResponseVariant", pascal);
                     let variant_str = variant_pascal.to_string();
                     quote! {
-                        if let Err(e) = #trait_name::authorize(handler, ctx, &format!("{}:{}", #service, #variant_str), #action).await {
+                        let __audit_resource = format!("{}:{}", #service, #variant_str);
+                        let __authz = #trait_name::authorize(handler, ctx, &__audit_resource, #action).await;
+                        ctx.audit_authz(&__audit_resource, #action, __authz.is_ok());
+                        if let Err(e) = __authz {
                             let err_variant = #err_response_type::Error(ErrorInfo {
                                 message: e.to_string(),
                                 code: "UNAUTHORIZED".to_string(),
@@ -508,7 +511,10 @@ fn generate_dispatch_fn(
                         let variant_str = variant_pascal.to_string();
                         quote! {
                             Which::#variant_pascal(()) => {
-                                #trait_name::authorize(handler, ctx, &format!("{}:{}", #service, #variant_str), #action).await?;
+                                let __audit_resource = format!("{}:{}", #service, #variant_str);
+                                let __authz = #trait_name::authorize(handler, ctx, &__audit_resource, #action).await;
+                                ctx.audit_authz(&__audit_resource, #action, __authz.is_ok());
+                                __authz?;
                                 #call
                             }
                         }
@@ -529,7 +535,10 @@ fn generate_dispatch_fn(
                         quote! {
                             Which::#variant_pascal(val) => {
                                 let v = val?.to_str()?;
-                                #trait_name::authorize(handler, ctx, &format!("{}:{}", #service, v), #action).await?;
+                                let __audit_resource = format!("{}:{}", #service, v);
+                                let __authz = #trait_name::authorize(handler, ctx, &__audit_resource, #action).await;
+                                ctx.audit_authz(&__audit_resource, #action, __authz.is_ok());
+                                __authz?;
                                 #call
                             }
                         }
@@ -554,7 +563,10 @@ fn generate_dispatch_fn(
                         let variant_str = variant_pascal.to_string();
                         quote! {
                             Which::#variant_pascal(v) => {
-                                #trait_name::authorize(handler, ctx, &format!("{}:{}", #service, #variant_str), #action).await?;
+                                let __audit_resource = format!("{}:{}", #service, #variant_str);
+                                let __authz = #trait_name::authorize(handler, ctx, &__audit_resource, #action).await;
+                                ctx.audit_authz(&__audit_resource, #action, __authz.is_ok());
+                                __authz?;
                                 #call
                             }
                         }
@@ -574,7 +586,10 @@ fn generate_dispatch_fn(
                         let variant_str = variant_pascal.to_string();
                         quote! {
                             Which::#variant_pascal(v) => {
-                                #trait_name::authorize(handler, ctx, &format!("{}:{}", #service, #variant_str), #action).await?;
+                                let __audit_resource = format!("{}:{}", #service, #variant_str);
+                                let __authz = #trait_name::authorize(handler, ctx, &__audit_resource, #action).await;
+                                ctx.audit_authz(&__audit_resource, #action, __authz.is_ok());
+                                __authz?;
                                 #call
                             }
                         }
@@ -612,7 +627,12 @@ fn generate_dispatch_fn(
                             // Struct: resource = "{service}:{VariantName}"
                             // e.g. authorize(ctx, "policy:resolveServiceKey", "query")
                             let variant_str = variant_pascal.to_string();
-                            quote! { #trait_name::authorize(handler, ctx, &format!("{}:{}", #service, #variant_str), #action).await?; }
+                            quote! {
+                                let __audit_resource = format!("{}:{}", #service, #variant_str);
+                                let __authz = #trait_name::authorize(handler, ctx, &__audit_resource, #action).await;
+                                ctx.audit_authz(&__audit_resource, #action, __authz.is_ok());
+                                __authz?;
+                            }
                         } else {
                             TokenStream::new()
                         };
@@ -1776,19 +1796,17 @@ fn generate_scope_dispatch_phase(
             // Returns Error(ErrorInfo) on auth failure instead of propagating via ?.
             let auth_stmt = if let Some(action) = parse_scope_for_auth(&v.scope) {
                 let action_str = action.to_owned();
-                let auth_call = if let Some(first_scope_field) = scope_field_idents.first() {
-                    let svc = service_name.to_owned();
-                    quote! {
-                        #parent_trait::authorize(handler, ctx, &format!("{}:{}", #svc, #first_scope_field), #action_str).await
-                    }
+                let svc = service_name.to_owned();
+                let resource_expr = if let Some(first_scope_field) = scope_field_idents.first() {
+                    quote! { format!("{}:{}", #svc, #first_scope_field) }
                 } else {
-                    let svc = service_name.to_owned();
-                    quote! {
-                        #parent_trait::authorize(handler, ctx, #svc, #action_str).await
-                    }
+                    quote! { (#svc).to_string() }
                 };
                 quote! {
-                    if let Err(e) = #auth_call {
+                    let __audit_resource = #resource_expr;
+                    let __authz = #parent_trait::authorize(handler, ctx, &__audit_resource, #action_str).await;
+                    ctx.audit_authz(&__audit_resource, #action_str, __authz.is_ok());
+                    if let Err(e) = __authz {
                         let err_variant = #response_type::Error(ErrorInfo {
                             message: e.to_string(),
                             code: "UNAUTHORIZED".to_string(),
@@ -2181,19 +2199,17 @@ fn generate_nested_scope_dispatch_phase(
             // Generate auth check — returns Error(ErrorInfo) on failure instead of propagating via ?
             let auth_stmt = if let Some(action) = parse_scope_for_auth(&v.scope) {
                 let action_str = action.to_owned();
-                let auth_call = if let Some(first_parent_field) = ancestor_scope_idents.first() {
-                    let svc = service_name.to_owned();
-                    quote! {
-                        #parent_trait::authorize(handler, ctx, &format!("{}:{}", #svc, #first_parent_field), #action_str).await
-                    }
+                let svc = service_name.to_owned();
+                let resource_expr = if let Some(first_parent_field) = ancestor_scope_idents.first() {
+                    quote! { format!("{}:{}", #svc, #first_parent_field) }
                 } else {
-                    let svc = service_name.to_owned();
-                    quote! {
-                        #parent_trait::authorize(handler, ctx, #svc, #action_str).await
-                    }
+                    quote! { (#svc).to_string() }
                 };
                 quote! {
-                    if let Err(e) = #auth_call {
+                    let __audit_resource = #resource_expr;
+                    let __authz = #parent_trait::authorize(handler, ctx, &__audit_resource, #action_str).await;
+                    ctx.audit_authz(&__audit_resource, #action_str, __authz.is_ok());
+                    if let Err(e) = __authz {
                         let err_variant = #response_type::Error(ErrorInfo {
                             message: e.to_string(),
                             code: "UNAUTHORIZED".to_string(),

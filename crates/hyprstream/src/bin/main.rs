@@ -41,7 +41,7 @@ use hyprstream_core::cli::{
 use hyprstream_core::cli::commands::{PolicyCommand, RoleCommand, TokenCommand, UserCommand, UserKeysCommand};
 
 #[cfg(feature = "experimental")]
-use hyprstream_core::cli::{handle_commit, handle_merge, handle_push, MergeOptions};
+use hyprstream_core::cli::{handle_commit, handle_merge, handle_promote, handle_push, MergeOptions};
 use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
 
@@ -705,6 +705,29 @@ fn handle_quick_command(
                     allow_empty,
                     dry_run,
                     verbose,
+                )
+                .await
+            },
+        ),
+
+        #[cfg(feature = "experimental")]
+        QuickCommand::Promote {
+            model,
+            branch,
+            author_name,
+            author_email,
+        } => with_runtime(
+            RuntimeConfig {
+                device: DeviceConfig::request_cpu(),
+                multi_threaded: true,
+            },
+            || async move {
+                handle_promote(
+                    ctx.registry(),
+                    &model,
+                    &branch,
+                    author_name,
+                    author_email,
                 )
                 .await
             },
@@ -1385,6 +1408,34 @@ fn install_envelope_verify_config(oauth: Option<&hyprstream_core::config::OAuthC
         None => KeyedPqTrustStore::new(),
     };
     tracing::info!("mesh PQ trust store installed with {} peer binding(s)", keyed_store.len());
+
+    // Per-host mesh identity roster (#328): bind each enrolled peer's Ed25519
+    // signer key to its OWN per-host subject (`service:inference:host-<label>`)
+    // in the global trust store, so a verified mesh peer resolves to its
+    // granular principal — never the `"system"` god principal. Reuses the SAME
+    // `mesh_peers` enrollment record as the PQ store above (no new roster type).
+    // A networked peer whose key is NOT enrolled resolves to anonymous
+    // (deny-by-default, fail-closed).
+    if let Some(oauth) = oauth {
+        let roster = hyprstream_core::auth::mesh_trust::build_mesh_identity_roster(oauth);
+        let trust = hyprstream_service::global_trust_store();
+        for (ed_pubkey, subject) in &roster {
+            if let Ok(vk) = VerifyingKey::from_bytes(ed_pubkey) {
+                trust.insert(
+                    vk,
+                    hyprstream_service::Attestation {
+                        scopes: std::iter::once("inference".to_owned()).collect(),
+                        subject: subject.name().map(ToOwned::to_owned),
+                        jwt: None,
+                        // Admin-anchored, out-of-band enrollment: no expiry (0).
+                        expires_at: 0,
+                        attested_by: None,
+                    },
+                );
+            }
+        }
+        tracing::info!("mesh identity roster installed with {} per-host binding(s)", roster.len());
+    }
     // Shared Arc: the SAME admin-anchored store backs both the request-side and
     // response-side verify configs — built once, anchored once (#277 reuse of
     // #157). The server's `#mesh-pq` ML-DSA-65 key (keyed by its Ed25519 mesh

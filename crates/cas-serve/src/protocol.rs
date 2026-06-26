@@ -27,9 +27,20 @@ pub enum Request {
         data: String,
     },
 
-    /// Get file reconstruction info
+    /// Upload a whole file. The server content-defined-chunks it (Gearhash
+    /// CDC), aggregates the chunks into xorbs (≤64 MiB / ≤8192 chunks each),
+    /// stores every xorb content-addressed under its xorb hash, and stores a
+    /// reconstruction shard (manifest) under the file's merkle hash. This is
+    /// the chunked-upload path that unblocks multi-xorb (>64 MiB) file
+    /// transfer (#390).
+    UploadFile {
+        /// Base64-encoded file data
+        data: String,
+    },
+
+    /// Get file reconstruction info (the reconstruction shard / manifest).
     GetReconstructionInfo {
-        /// Hex-encoded merkle hash
+        /// Hex-encoded file merkle hash
         hash: String,
     },
 
@@ -62,9 +73,24 @@ pub enum Response {
         hash: String,
     },
 
-    /// File reconstruction info
+    /// File upload success. The file merkle hash addresses the stored
+    /// reconstruction shard; `xorb_hashes` lists each xorb the file was split
+    /// across (one for a ≤64 MiB file, more for multi-xorb files).
+    UploadFileSuccess {
+        /// Hex-encoded file merkle hash (addresses the reconstruction shard).
+        file_hash: String,
+        /// Total file length in bytes.
+        file_len: u64,
+        /// Hex-encoded xorb hashes the file was split across, in order.
+        xorb_hashes: Vec<String>,
+    },
+
+    /// File reconstruction info (the reconstruction shard). `info` carries the
+    /// raw XET `mdb_shard` binary, base64-encoded so it survives the NDJSON
+    /// text transport. A stock xet-core client decodes the base64 and feeds the
+    /// bytes to its `MDBShardFile` reader / `FileReconstructor`.
     ReconstructionInfo {
-        /// JSON-serialized reconstruction info
+        /// Base64-encoded `mdb_shard` binary (the XET wire format).
         info: String,
     },
 

@@ -277,7 +277,15 @@ impl ProducerReachConfig {
             if let Some(node_id) = self.iroh_node_id {
                 reach.push(Destination {
                     role: Role::Direct,
-                    transport: TransportConfig::Iroh(IrohReach { node_id }),
+                    // moq streaming reach → moql ALPN; relayUrl empty = direct/pkarr (#282).
+                    transport: TransportConfig::Iroh(IrohReach {
+                        node_id,
+                        alpn: String::from_utf8_lossy(
+                            crate::transport::iroh_substrate::ALPN_MOQ_LITE,
+                        )
+                        .into_owned(),
+                        relay_url: String::new(),
+                    }),
                 });
             }
 
@@ -390,8 +398,16 @@ pub fn relay_reach_from_decoded(
             server_name: server_name.clone(),
             cert_hashes: auth.accept_cert_hashes().iter().map(|h| h.to_vec()).collect(),
         })),
-        EndpointType::Iroh { node_id, .. } => {
-            Some(ReachTransport::Iroh(IrohReach { node_id: *node_id }))
+        EndpointType::Iroh { node_id, relay_url, .. } => {
+            // A relay carries the moq stream → moql ALPN; relay_url passes through.
+            Some(ReachTransport::Iroh(IrohReach {
+                node_id: *node_id,
+                alpn: String::from_utf8_lossy(
+                    crate::transport::iroh_substrate::ALPN_MOQ_LITE,
+                )
+                .into_owned(),
+                relay_url: relay_url.clone().unwrap_or_default(),
+            }))
         }
         EndpointType::Ipc { .. }
         | EndpointType::SystemdFd { .. }
@@ -636,6 +652,20 @@ impl MoqStreamOrigin {
     /// chained-HMAC state is seeded from `ctx.mac_key()` / `ctx.topic()` — i.e.
     /// byte-identical to the ZMQ `StreamBuilder`.
     pub fn publisher(&self, ctx: &StreamContext) -> Result<MoqStreamPublisher> {
+        self.publisher_with_provenance(ctx, None)
+    }
+
+    /// Create an in-process publisher that additionally signs each StreamBlock
+    /// with the node's per-host hybrid COSE identity (#321 provenance / C-PROV).
+    ///
+    /// `provenance = Some(signer)` attaches a `StreamBlock.provenance` signature
+    /// so consumers can attribute each block to the producing host (threat T3);
+    /// `None` keeps the legacy chained-HMAC-only block.
+    pub fn publisher_with_provenance(
+        &self,
+        ctx: &StreamContext,
+        provenance: Option<crate::stream_provenance::ProvenanceSigner>,
+    ) -> Result<MoqStreamPublisher> {
         let path = self.broadcast_path(ctx.topic());
         let mut broadcast = self
             .inner
@@ -652,6 +682,11 @@ impl MoqStreamOrigin {
 
         Ok(MoqStreamPublisher {
             hmac_state: StreamHmacState::new(*ctx.mac_key(), ctx.topic().to_owned()),
+            // #321: AEAD enc_key — `Some` only on the DH (mesh) path. `None` on the
+            // keyless `StreamContext::new` path (NotificationService topics, whose
+            // payloads are already E2E-encrypted), where transport AEAD is skipped.
+            enc_key: ctx.enc_key().copied(),
+            provenance,
             track,
             next_group: 0,
             cancel_token: ctx.cancel_token().clone(),
@@ -675,6 +710,13 @@ impl MoqStreamOrigin {
 /// `BatchingConfig` in M2b for granularity parity.
 pub struct MoqStreamPublisher {
     hmac_state: StreamHmacState,
+    /// Transport-level AEAD key (#321). `Some` ⇒ each Data/Complete payload is
+    /// sealed with AES-256-GCM into a `Tagged` payload before the HMAC chain runs;
+    /// `None` ⇒ cleartext (keyless notification path).
+    enc_key: Option<[u8; 32]>,
+    /// Per-host provenance signer (#321). `Some` ⇒ each StreamBlock carries a
+    /// hybrid COSE signature over its canonical signed region.
+    provenance: Option<crate::stream_provenance::ProvenanceSigner>,
     track: TrackProducer,
     next_group: u64,
     cancel_token: CancellationToken,
@@ -731,12 +773,53 @@ impl MoqStreamPublisher {
         // epoch is 0 until the #223 key-epoch lifecycle lands.
         let sequence_number = self.next_group;
         self.next_group += 1;
-        let capnp_bytes = crate::streaming::encode_stream_block(
+        let epoch = 0u64;
+
+        // #321: on the mesh/DH path (`enc_key = Some`), seal each Data/Complete
+        // payload with AES-256-GCM into a `Tagged` payload BEFORE the HMAC chain
+        // runs (so the chain authenticates the ciphertext — no double-encryption,
+        // ordering/anti-replay unchanged). Error frames stay cleartext (operational
+        // status, terminal). The AEAD AAD/key-commitment are bound to the block's
+        // `epoch` (and topic), so a rekey can't replay a block across epochs.
+        let sealed: Vec<StreamPayloadData>;
+        let payloads: &[StreamPayloadData] = match self.enc_key {
+            Some(ref enc_key) => {
+                sealed = payloads
+                    .iter()
+                    .map(|p| seal_payload(enc_key, &self.topic, epoch, p))
+                    .collect::<Result<Vec<_>>>()?;
+                &sealed
+            }
+            None => payloads,
+        };
+
+        // Canonical signed region (#321): the StreamBlock with provenance EMPTY.
+        // This is what the provenance signature covers and what the consumer
+        // reconstructs; it also equals the legacy block when provenance is off.
+        let signed_region = crate::streaming::encode_stream_block(
             self.hmac_state.prev_mac_bytes(),
             sequence_number,
-            0,
+            epoch,
             payloads,
         )?;
+
+        // #321 provenance: sign the signed region with the host's hybrid identity,
+        // then emit the block WITH the provenance field. The HMAC below covers the
+        // full wire bytes (incl. provenance); the sig covers the signed region, so
+        // verification is a layer on top of HMAC. No provenance ⇒ wire == signed_region.
+        let capnp_bytes = match self.provenance {
+            Some(ref signer) => {
+                let (signer_kid, sig) = signer.sign(&signed_region)?;
+                crate::streaming::encode_stream_block_with_provenance(
+                    self.hmac_state.prev_mac_bytes(),
+                    sequence_number,
+                    epoch,
+                    payloads,
+                    Some((&signer_kid, &sig)),
+                )?
+            }
+            None => signed_region,
+        };
         let mac = self.hmac_state.compute_next(&capnp_bytes);
 
         let mut frame = Vec::with_capacity(capnp_bytes.len() + 16);
@@ -811,11 +894,12 @@ impl MoqStreamHandle {
         uds_path: String,
         broadcast_path: String,
         mac_key: [u8; 32],
+        enc_key: [u8; 32],
         topic: String,
     ) -> Self {
         let cancel = tokio_util::sync::CancellationToken::new();
         let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<crate::streaming::StreamPayload>>(64);
-        tokio::spawn(moq_stream_handle_task(uds_path, broadcast_path.clone(), mac_key, topic, tx, cancel.clone()));
+        tokio::spawn(moq_stream_handle_task(uds_path, broadcast_path.clone(), mac_key, enc_key, topic, tx, cancel.clone()));
         Self { rx, broadcast_path, cancel }
     }
 
@@ -859,6 +943,7 @@ impl MoqStreamHandle {
         qos: &crate::stream_info::StreamOpt,
         broadcast_path: String,
         mac_key: [u8; 32],
+        enc_key: [u8; 32],
         topic: String,
     ) -> Self {
         // QoS-aware topology selection over the SERVICE-advertised reach (server
@@ -877,6 +962,7 @@ impl MoqStreamHandle {
                 reach,
                 broadcast_path.clone(),
                 mac_key,
+                enc_key,
                 topic,
                 tx,
                 cancel.clone(),
@@ -887,6 +973,7 @@ impl MoqStreamHandle {
                 uds_path,
                 broadcast_path.clone(),
                 mac_key,
+                enc_key,
                 topic,
                 tx,
                 cancel.clone(),
@@ -945,10 +1032,12 @@ impl futures::Stream for MoqStreamHandle {
 }
 
 // TODO: add reconnect backoff on UDS disconnect (ZMQ auto-reconnect parity)
+#[allow(clippy::too_many_arguments)]
 async fn moq_stream_handle_task(
     uds_path: String,
     broadcast_path: String,
     mac_key: [u8; 32],
+    enc_key: [u8; 32],
     topic: String,
     tx: tokio::sync::mpsc::Sender<anyhow::Result<crate::streaming::StreamPayload>>,
     cancel: tokio_util::sync::CancellationToken,
@@ -986,7 +1075,8 @@ async fn moq_stream_handle_task(
         Ok(t) => t,
         Err(e) => { let _ = tx.send(Err(anyhow!("subscribe_track: {e}"))).await; return; }
     };
-    let mut verifier = StreamVerifier::new(mac_key, topic.clone());
+    // #321: AEAD ON for this DH-keyed mesh stream — open sealed Tagged blocks.
+    let mut verifier = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(enc_key);
     // #145: read groups by EXACT sequence (get_group), not arrival-order next_group.
     // Each Group is served on its own QUIC uni-stream, so Groups can arrive out of
     // order; next_group's monotonic cursor returns the first Group with sequence >=
@@ -1059,12 +1149,24 @@ async fn moq_stream_handle_task(
 ///
 /// Only the network-routable transports map; same-host endpoints are never
 /// carried in `reach` (co-located clients use the UDS fast path).
-fn reach_to_transport_config(
+pub fn reach_to_transport_config(
     reach: &crate::stream_info::Destination,
+) -> Option<crate::transport::TransportConfig> {
+    wire_transport_to_dial(&reach.transport)
+}
+
+/// The single wire→dial reach codec (#274/#320): map one wire
+/// [`crate::stream_info::TransportConfig`] union arm to the local dialable
+/// [`crate::transport::TransportConfig`]. Returns `None` for an un-routable arm
+/// (e.g. an iroh reach with no relay). Shared by the streaming plane
+/// ([`reach_to_transport_config`]) and the RPC inference router (#320), so there
+/// is exactly ONE iroh/quic reach decoding.
+pub fn wire_transport_to_dial(
+    wire: &crate::stream_info::TransportConfig,
 ) -> Option<crate::transport::TransportConfig> {
     use crate::stream_info::TransportConfig as ReachTransport;
     use crate::transport::{QuicServerAuth, TransportConfig};
-    match &reach.transport {
+    match wire {
         ReachTransport::Quic(q) => {
             let addr: std::net::SocketAddr = q.addr.parse().ok()?;
             // Fixed-size cert pins (SHA-256 = 32 bytes); skip any malformed entry.
@@ -1081,13 +1183,55 @@ fn reach_to_transport_config(
             };
             Some(TransportConfig::quic_with_auth(addr, q.server_name.clone(), auth))
         }
-        // #357: dial the wire-advertised iroh reach by node_id alone. iroh binds
-        // the dialed `moql` connection to this `EndpointId` (its Ed25519 pubkey),
-        // and the shared client endpoint's pkarr / n0 DNS discovery (`presets::N0`)
-        // resolves the routable addresses — so no direct addrs / relay are carried
-        // on the wire (see `IrohReach` in streaming.capnp). `dial_stream`'s iroh
-        // arm consumes this and opens the `moql` session.
-        ReachTransport::Iroh(i) => Some(TransportConfig::iroh(i.node_id, Vec::new(), None)),
+        // #320/#357: dial the wire-advertised iroh reach by node_id. iroh binds
+        // the dialed `moql` connection to this `EndpointId` (its Ed25519 pubkey);
+        // `dial_stream`'s iroh arm (#282/S2) consumes it and opens the `moql`
+        // session. When `relayUrl` is empty the shared client endpoint's pkarr /
+        // n0 DNS discovery (`presets::N0`) resolves the routable addresses, so a
+        // native peer can dial by node_id alone (no direct addrs are carried on
+        // the wire — see `IrohReach` in streaming.capnp).
+        ReachTransport::Iroh(i) => {
+            let relay_url = if i.relay_url.is_empty() { None } else { Some(i.relay_url.clone()) };
+            Some(TransportConfig::iroh(i.node_id, Vec::new(), relay_url))
+        }
+    }
+}
+
+/// The single dial→wire reach codec (#320): map a local dialable
+/// [`crate::transport::TransportConfig`] to a wire-publishable
+/// [`crate::stream_info::TransportConfig`] union arm.
+///
+/// Returns `None` for same-host endpoints (`Inproc`/`Ipc`/`SystemdFd`) — these
+/// are NEVER advertised on the wire (a remote caller could not dial them; a
+/// co-located caller resolves them from local config). So a co-located-only
+/// service yields an empty published reach list. The inverse of
+/// [`wire_transport_to_dial`]; both live here as the one reach codec.
+pub fn dial_transport_to_wire(
+    dial: &crate::transport::TransportConfig,
+) -> Option<crate::stream_info::TransportConfig> {
+    use crate::stream_info::{IrohReach, QuicReach, TransportConfig as ReachTransport};
+    use crate::transport::EndpointType;
+    match &dial.endpoint {
+        EndpointType::Quic { addr, server_name, auth } => Some(ReachTransport::Quic(QuicReach {
+            addr: addr.to_string(),
+            server_name: server_name.clone(),
+            cert_hashes: auth.accept_cert_hashes().iter().map(|h| h.to_vec()).collect(),
+        })),
+        // The wire iroh reach carries identity (nodeId) + relay only; direct
+        // addrs are not published (privacy + iroh discovery), matching the
+        // DID-doc `IrohTransport` entry shape (#280/#282).
+        EndpointType::Iroh { node_id, relay_url, .. } => Some(ReachTransport::Iroh(IrohReach {
+            node_id: *node_id,
+            alpn: String::from_utf8_lossy(
+                crate::transport::iroh_substrate::ALPN_HYPRSTREAM_RPC,
+            )
+            .into_owned(),
+            relay_url: relay_url.clone().unwrap_or_default(),
+        })),
+        // Same-host endpoints are never wire-advertised (#320).
+        EndpointType::Inproc { .. }
+        | EndpointType::Ipc { .. }
+        | EndpointType::SystemdFd { .. } => None,
     }
 }
 
@@ -1319,10 +1463,12 @@ pub async fn run_relay_announce_link(
 /// Networked variant of [`moq_stream_handle_task`]: dial a `/moq`
 /// `web_transport_quinn` session from the `reach` list instead of the UDS
 /// plane, then run the identical subscribe + chained-HMAC verify loop (#274).
+#[allow(clippy::too_many_arguments)]
 async fn moq_stream_handle_task_networked(
     reach: Vec<crate::stream_info::Destination>,
     broadcast_path: String,
     mac_key: [u8; 32],
+    enc_key: [u8; 32],
     topic: String,
     tx: tokio::sync::mpsc::Sender<anyhow::Result<crate::streaming::StreamPayload>>,
     cancel: tokio_util::sync::CancellationToken,
@@ -1367,7 +1513,8 @@ async fn moq_stream_handle_task_networked(
             return;
         }
     };
-    let mut verifier = StreamVerifier::new(mac_key, topic.clone());
+    // #321: AEAD ON for this DH-keyed mesh stream — open sealed Tagged blocks.
+    let mut verifier = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(enc_key);
     // #145: read groups by EXACT sequence (get_group), not arrival-order next_group.
     // Each Group is served on its own QUIC uni-stream, so Groups can arrive out of
     // order; next_group's monotonic cursor returns the first Group with sequence >=
@@ -1453,6 +1600,92 @@ pub fn verify_moq_frame(
     verifier.verify_parts(topic.as_bytes(), &frame[..split], &frame[split..])
 }
 
+/// Mesh consumer entry point (#321): verify a moq frame's chained HMAC + AEAD
+/// (via the `verifier`) AND its per-host provenance signature against a roster.
+///
+/// `roster` resolves a signer's anchored ML-DSA-65 key; `is_enrolled` confirms the
+/// signer is a known mesh peer. Provenance is REQUIRED (fail-closed): a block with
+/// no/invalid/unknown signer is rejected. Use [`verify_moq_frame`] for the
+/// non-mesh client path that has no roster.
+pub fn verify_moq_frame_with_provenance(
+    verifier: &mut StreamVerifier,
+    topic: &str,
+    frame: &[u8],
+    roster: &dyn crate::envelope::PqTrustStore,
+    is_enrolled: &dyn Fn(&[u8; 32]) -> bool,
+) -> Result<Vec<crate::streaming::StreamPayload>> {
+    if frame.len() < 16 {
+        anyhow::bail!("moq frame too short: {} bytes", frame.len());
+    }
+    let split = frame.len() - 16;
+    let capnp_data = &frame[..split];
+
+    // 1) Chained HMAC + AEAD open (also rejects topic/order/MAC failures).
+    let payloads = verifier.verify_parts(topic.as_bytes(), capnp_data, &frame[split..])?;
+
+    // 2) Per-host provenance, layered on top: parse the block, reconstruct the
+    //    provenance-cleared signed region, and verify the signature + roster.
+    let mut slice: &[u8] = capnp_data;
+    let reader = capnp::serialize::read_message_from_flat_slice(
+        &mut slice,
+        capnp::message::ReaderOptions::default(),
+    )?;
+    let block = reader.get_root::<crate::streaming_capnp::stream_block::Reader>()?;
+    let prov = block.get_provenance()?;
+    let signer_kid = prov.get_signer_kid()?;
+    let sig = prov.get_sig()?;
+    let signed_region = crate::stream_provenance::signed_region_from_block(&block)?;
+    crate::stream_provenance::verify_provenance(
+        signer_kid,
+        sig,
+        &signed_region,
+        roster,
+        is_enrolled,
+    )?;
+
+    Ok(payloads)
+}
+
+/// Seal a single Data/Complete payload into an AES-256-GCM `Tagged` payload
+/// (#321). The 1-byte kind tag is prepended to the plaintext so the consumer can
+/// restore the original variant. Error/Tagged/other variants pass through
+/// unchanged (Error is operational, already-Tagged is the E2E notification path).
+///
+/// Shares its AAD + kind-tag framing with the cross-target open path
+/// ([`crate::stream_consumer::open_sealed_payload`]).
+fn seal_payload(
+    enc_key: &[u8; 32],
+    topic: &str,
+    epoch: u64,
+    payload: &StreamPayloadData,
+) -> Result<StreamPayloadData> {
+    use crate::crypto::event_crypto::{encrypt_event, EventPrivacy};
+    use crate::stream_consumer::{stream_aead_aad, SEALED_KIND_COMPLETE, SEALED_KIND_DATA};
+
+    let (kind, body): (u8, &[u8]) = match payload {
+        StreamPayloadData::Data(d) => (SEALED_KIND_DATA, d),
+        StreamPayloadData::Complete(d) => (SEALED_KIND_COMPLETE, d),
+        // Leave non-sealed variants untouched.
+        other => return Ok(other.clone()),
+    };
+
+    let mut plaintext = Vec::with_capacity(1 + body.len());
+    plaintext.push(kind);
+    plaintext.extend_from_slice(body);
+
+    let aad = stream_aead_aad(topic, epoch);
+    let (tag, ciphertext, nonce, key_commitment) =
+        encrypt_event(enc_key, &aad, &plaintext, EventPrivacy::ZeroKnowledge)
+            .map_err(|e| anyhow!("stream AEAD seal failed: {e}"))?;
+
+    Ok(StreamPayloadData::Tagged {
+        tag,
+        payload: ciphertext,
+        nonce: nonce.to_vec(),
+        key_commitment: key_commitment.to_vec(),
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -1475,6 +1708,8 @@ mod tests {
         let ctx = StreamContext::from_dh(&client_pub.to_bytes())?;
         let topic = ctx.topic().to_owned();
         let mac_key = *ctx.mac_key();
+        // #321: DH path is AEAD-on; the verifier shares the same enc_key.
+        let enc_key = *ctx.enc_key().expect("DH ctx has enc_key");
 
         let mut pub_ = origin.publisher(&ctx)?;
         pub_.publish_data(b"hello").await?;
@@ -1491,7 +1726,7 @@ mod tests {
         .ok_or_else(|| anyhow!("broadcast not announced"))?;
         let mut track = bc.subscribe_track(&Track::new(STREAM_TRACK))?;
 
-        let mut verifier = StreamVerifier::new(mac_key, topic.clone());
+        let mut verifier = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(enc_key);
         let mut got: Vec<StreamPayload> = Vec::new();
         for _ in 0..3 {
             let mut group = tokio::time::timeout(
@@ -1524,6 +1759,8 @@ mod tests {
         let ctx = StreamContext::from_dh(&client_pub.to_bytes())?;
         let topic = ctx.topic().to_owned();
         let mac_key = *ctx.mac_key();
+        // #321: DH path is AEAD-on; the verifier shares the same enc_key.
+        let enc_key = *ctx.enc_key().expect("DH ctx has enc_key");
 
         let mut any_pub: AnyStreamPublisher = origin.publisher(&ctx)?;
         any_pub.publish_data(b"ping").await?;
@@ -1538,7 +1775,7 @@ mod tests {
         .await?
         .ok_or_else(|| anyhow!("broadcast not announced"))?;
         let mut track = bc.subscribe_track(&Track::new(STREAM_TRACK))?;
-        let mut verifier = StreamVerifier::new(mac_key, topic.clone());
+        let mut verifier = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(enc_key);
         let mut got: Vec<StreamPayload> = Vec::new();
         for _ in 0..2 {
             let mut group = tokio::time::timeout(
@@ -1558,6 +1795,60 @@ mod tests {
         assert!(matches!(&got[0], StreamPayload::Data(d) if d == b"ping"));
         assert!(matches!(&got[1], StreamPayload::Complete(_)));
         Ok(())
+    }
+
+    /// #320: the iroh reach codec round-trips dial↔wire and preserves identity
+    /// (nodeId) + relay; an empty-relay reach is decoded but is not dialable
+    /// (dial/dial_stream fail-fast on it — pkarr-only is deferred to #282).
+    #[test]
+    fn iroh_reach_dial_wire_roundtrip() {
+        use crate::transport::{EndpointType, TransportConfig};
+        let node_id = [0x42u8; 32];
+        let dial = TransportConfig::iroh(node_id, Vec::new(), Some("https://relay.example".to_owned()));
+        let wire = dial_transport_to_wire(&dial).expect("iroh dial → wire");
+        match &wire {
+            crate::stream_info::TransportConfig::Iroh(i) => {
+                assert_eq!(i.node_id, node_id);
+                assert_eq!(i.relay_url, "https://relay.example");
+                assert_eq!(i.alpn, "hyprstream-rpc/1");
+            }
+            other => panic!("expected wire Iroh, got {other:?}"),
+        }
+        let back = wire_transport_to_dial(&wire).expect("iroh wire → dial");
+        match back.endpoint {
+            EndpointType::Iroh { node_id: n, relay_url, direct_addrs } => {
+                assert_eq!(n, node_id);
+                assert_eq!(relay_url.as_deref(), Some("https://relay.example"));
+                assert!(direct_addrs.is_empty(), "wire iroh reach never carries direct addrs");
+            }
+            other => panic!("expected dial Iroh, got {other:?}"),
+        }
+    }
+
+    /// #320: same-host endpoints (Inproc/Ipc) are NEVER advertised on the wire —
+    /// `dial_transport_to_wire` returns None (a co-located-only service yields an
+    /// empty published reach list).
+    #[test]
+    fn same_host_endpoints_never_wire_advertised() {
+        use crate::transport::TransportConfig;
+        assert!(dial_transport_to_wire(&TransportConfig::inproc("hyprstream/inference-x")).is_none());
+        assert!(dial_transport_to_wire(&TransportConfig::ipc("/tmp/x.sock")).is_none());
+    }
+
+    /// #320: a wire iroh reach with an empty relayUrl decodes (identity preserved)
+    /// but is not dialable — `dial` fails fast rather than hang in discovery.
+    #[test]
+    fn iroh_reach_empty_relay_decodes_but_not_dialable() {
+        use crate::stream_info::{IrohReach, TransportConfig as ReachTransport};
+        let wire = ReachTransport::Iroh(IrohReach {
+            node_id: [9u8; 32],
+            alpn: "moql".to_owned(),
+            relay_url: String::new(),
+        });
+        let dial = wire_transport_to_dial(&wire).expect("decodes");
+        // No relay + no direct addrs ⇒ dial() fail-fast.
+        let signer = crate::signer::LocalSigner::new(crate::crypto::SigningKey::generate(&mut rand::rngs::OsRng));
+        assert!(crate::dial::dial(&dial, signer, None, None).is_err(), "unreachable iroh reach must not dial");
     }
 
     /// #275: a StreamInfo carrying a dialable Quic reach must be classified as
@@ -1595,7 +1886,11 @@ mod tests {
         // This is exactly the Destination `producer_reach()` emits for the iroh arm.
         let reach = Destination {
             role: Role::Direct,
-            transport: ReachTransport::Iroh(IrohReach { node_id }),
+            transport: ReachTransport::Iroh(IrohReach {
+                node_id,
+                alpn: "moql".to_owned(),
+                relay_url: String::new(),
+            }),
         };
         assert_eq!(reach.role, Role::Direct, "iroh reach is a direct producer reach");
 
@@ -1620,7 +1915,11 @@ mod tests {
         use crate::stream_info::{Destination, IrohReach, Role, TransportConfig as ReachTransport};
         let reach = [Destination {
             role: Role::Direct,
-            transport: ReachTransport::Iroh(IrohReach { node_id: [0xABu8; 32] }),
+            transport: ReachTransport::Iroh(IrohReach {
+                node_id: [0xABu8; 32],
+                alpn: "moql".to_owned(),
+                relay_url: String::new(),
+            }),
         }];
         assert!(
             reach.iter().any(|d| reach_to_transport_config(d).is_some()),
@@ -1668,6 +1967,7 @@ mod tests {
             &qos,
             "local/streams/test/deadbeef".to_owned(),
             [0u8; 32],
+            [0u8; 32],
             "deadbeef".repeat(8),
         );
 
@@ -1714,7 +2014,14 @@ mod tests {
     };
 
     fn direct_iroh(b: u8) -> Destination {
-        Destination { role: Role::Direct, transport: ReachTransport::Iroh(IrohReach { node_id: [b; 32] }) }
+        Destination {
+            role: Role::Direct,
+            transport: ReachTransport::Iroh(IrohReach {
+                node_id: [b; 32],
+                alpn: String::new(),
+                relay_url: String::new(),
+            }),
+        }
     }
     fn relay_quic(addr: &str) -> Destination {
         Destination {
@@ -1882,5 +2189,145 @@ mod tests {
             relay_reach_from_decoded(&crate::transport::TransportConfig::ipc("/tmp/x.sock")).is_none(),
             "a same-host ipc transport is not a network-routable relay"
         );
+    }
+
+    // ── #321 AEAD seal/open ────────────────────────────────────────────────
+
+    #[test]
+    fn aead_seal_open_roundtrip() {
+        let enc_key = [0x42u8; 32];
+        let topic = "deadbeef";
+        let epoch = 7u64;
+        for payload in [
+            StreamPayloadData::Data(b"hello tokens".to_vec()),
+            StreamPayloadData::Complete(b"{\"done\":true}".to_vec()),
+        ] {
+            let sealed = seal_payload(&enc_key, topic, epoch, &payload).unwrap();
+            let StreamPayloadData::Tagged { tag, payload: ct, nonce, key_commitment } = &sealed
+            else {
+                panic!("seal must produce a Tagged payload");
+            };
+            let opened = crate::stream_consumer::open_sealed_payload(
+                &enc_key, topic, epoch, tag, ct, nonce, key_commitment,
+            )
+            .unwrap();
+            match (&payload, &opened) {
+                (StreamPayloadData::Data(a), StreamPayload::Data(b))
+                | (StreamPayloadData::Complete(a), StreamPayload::Complete(b)) => {
+                    assert_eq!(a, b);
+                }
+                _ => panic!("opened variant must match sealed variant"),
+            }
+        }
+    }
+
+    #[test]
+    fn aead_open_rejects_wrong_key_and_tamper() {
+        let enc_key = [0x42u8; 32];
+        let topic = "t";
+        let epoch = 1u64;
+        let sealed =
+            seal_payload(&enc_key, topic, epoch, &StreamPayloadData::Data(b"secret".to_vec()))
+                .unwrap();
+        let StreamPayloadData::Tagged { tag, payload: ct, nonce, key_commitment } = &sealed else {
+            panic!("expected Tagged");
+        };
+
+        // Wrong key.
+        let wrong = [0x99u8; 32];
+        assert!(crate::stream_consumer::open_sealed_payload(
+            &wrong, topic, epoch, tag, ct, nonce, key_commitment
+        )
+        .is_err());
+
+        // Wrong epoch (AAD mismatch) — anti-replay across epochs.
+        assert!(crate::stream_consumer::open_sealed_payload(
+            &enc_key, topic, 2, tag, ct, nonce, key_commitment
+        )
+        .is_err());
+
+        // Tampered ciphertext.
+        let mut bad_ct = ct.clone();
+        if let Some(b) = bad_ct.first_mut() {
+            *b ^= 0xFF;
+        }
+        assert!(crate::stream_consumer::open_sealed_payload(
+            &enc_key, topic, epoch, tag, &bad_ct, nonce, key_commitment
+        )
+        .is_err());
+    }
+
+    // ── #321 provenance over a published block ─────────────────────────────
+
+    /// Publish a block with provenance ON, then verify HMAC + AEAD + provenance
+    /// against a roster; assert wrong/unknown signers are rejected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provenance_publish_verify_and_reject() -> Result<()> {
+        use crate::envelope::KeyedPqTrustStore;
+        use crate::stream_provenance::ProvenanceSigner;
+        use ed25519_dalek::SigningKey;
+
+        let origin = origin();
+        let (_cs, client_pub) = crate::crypto::generate_ephemeral_keypair();
+        let ctx = StreamContext::from_dh(&client_pub.to_bytes())?;
+        let topic = ctx.topic().to_owned();
+        let mac_key = *ctx.mac_key();
+        let enc_key = *ctx.enc_key().expect("DH ctx has enc_key");
+
+        let host_ed = SigningKey::from_bytes(&[5u8; 32]);
+        let signer = ProvenanceSigner::from_ed25519(host_ed.clone());
+        let kid = signer.signer_kid();
+
+        let mut pub_ = origin.publisher_with_provenance(&ctx, Some(signer))?;
+        pub_.publish_data(b"hi").await?;
+        pub_.complete_ref(b"{}").await?;
+
+        // Drain the two frames from the shared origin.
+        let path = origin.broadcast_path(&topic);
+        let bc = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            origin.consumer().announced_broadcast(path.as_str()),
+        )
+        .await?
+        .ok_or_else(|| anyhow!("broadcast not announced"))?;
+        let mut track = bc.subscribe_track(&Track::new(STREAM_TRACK))?;
+        let mut frames: Vec<bytes::Bytes> = Vec::new();
+        for _ in 0..2 {
+            let mut group = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                track.next_group(),
+            )
+            .await??
+            .ok_or_else(|| anyhow!("next_group None"))?;
+            let frame = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                group.read_frame(),
+            )
+            .await??
+            .ok_or_else(|| anyhow!("read_frame None"))?;
+            frames.push(frame);
+        }
+
+        // Roster anchoring the host's mesh ML-DSA key + enrolled-set closure.
+        use ml_dsa::Keypair;
+        let mut roster = KeyedPqTrustStore::new();
+        roster.bind(kid, &crate::node_identity::derive_mesh_mldsa_key(&host_ed).verifying_key());
+        let enrolled = |k: &[u8; 32]| *k == kid;
+
+        // Valid: verify HMAC + AEAD + provenance.
+        let mut v = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(enc_key);
+        let got = verify_moq_frame_with_provenance(&mut v, &topic, &frames[0], &roster, &enrolled)?;
+        assert!(matches!(&got[0], StreamPayload::Data(d) if d == b"hi"));
+
+        // Unknown signer: empty roster / not enrolled → reject (re-verify frame 0
+        // with a fresh verifier so the HMAC chain restarts at the same block).
+        let empty = KeyedPqTrustStore::new();
+        let none_enrolled = |_: &[u8; 32]| false;
+        let mut v2 = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(enc_key);
+        assert!(verify_moq_frame_with_provenance(
+            &mut v2, &topic, &frames[0], &empty, &none_enrolled
+        )
+        .is_err());
+        Ok(())
     }
 }

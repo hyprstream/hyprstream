@@ -51,6 +51,12 @@ pub struct StreamKeys {
     pub topic: String,
     /// HMAC key for MAC chain (zeroized on drop).
     pub mac_key: Zeroizing<[u8; 32]>,
+    /// AES-256-GCM key for transport-level AEAD of stream payloads (#321,
+    /// zeroized on drop). Distinct from `mac_key` via its own derivation context
+    /// (`"hyprstream stream-keys v1 enc"`). The mesh stream plane seals each
+    /// Data/Complete payload under this key; the chained HMAC still runs over the
+    /// (now-encrypted) block, so ordering / anti-replay are unchanged.
+    pub enc_key: Zeroizing<[u8; 32]>,
     /// Control channel topic (64 hex chars, derived from same DH secret).
     pub ctrl_topic: String,
     /// Control channel HMAC key (zeroized on drop).
@@ -59,25 +65,33 @@ pub struct StreamKeys {
 
 impl StreamKeys {
     /// Create from raw topic and mac_key bytes.
+    ///
+    /// The AEAD `enc_key` is deterministically derived from `mac_key` via a
+    /// dedicated context so this constructor stays source-compatible while still
+    /// producing a stable, non-zero, key-separated AEAD key.
     pub fn new(topic: String, mac_key: [u8; 32]) -> Self {
+        let enc_key = derive_key("hyprstream stream-keys v1 enc", &mac_key);
         Self {
             topic,
             mac_key: Zeroizing::new(mac_key),
+            enc_key: Zeroizing::new(enc_key),
             ctrl_topic: String::new(),
             ctrl_mac_key: Zeroizing::new([0u8; 32]),
         }
     }
 
-    /// Create with both data and control channel keys.
+    /// Create with both data and control channel keys plus the AEAD enc_key.
     pub fn with_ctrl(
         topic: String,
         mac_key: [u8; 32],
+        enc_key: [u8; 32],
         ctrl_topic: String,
         ctrl_mac_key: [u8; 32],
     ) -> Self {
         Self {
             topic,
             mac_key: Zeroizing::new(mac_key),
+            enc_key: Zeroizing::new(enc_key),
             ctrl_topic,
             ctrl_mac_key: Zeroizing::new(ctrl_mac_key),
         }
@@ -167,6 +181,12 @@ pub fn derive_stream_keys(
     // Derive mac_key (32 bytes)
     let mac_key = derive_key("hyprstream stream-keys v1 mac", &ikm);
 
+    // Derive AEAD enc_key (32 bytes, #321) — a DISTINCT context from `mac`, so the
+    // transport-AEAD key is cryptographically separated from the HMAC-chain key
+    // (mirrors `derive_notification_keys`'s enc/mac split). The mesh stream plane
+    // seals each Data/Complete payload under this key.
+    let enc_key = derive_key("hyprstream stream-keys v1 enc", &ikm);
+
     // Derive control channel topic (32 bytes -> 64 hex chars)
     let ctrl_topic_bytes = derive_key("hyprstream stream-keys v1 ctrl-topic", &ikm);
     let ctrl_topic = hex::encode(ctrl_topic_bytes);
@@ -174,7 +194,10 @@ pub fn derive_stream_keys(
     // Derive control channel mac_key (32 bytes)
     let ctrl_mac_key = derive_key("hyprstream stream-keys v1 ctrl-mac", &ikm);
 
-    Ok(StreamKeys::with_ctrl(topic, mac_key, ctrl_topic, ctrl_mac_key))
+    // Zeroize IKM containing the shared secret (mirrors derive_notification_keys).
+    ikm.zeroize();
+
+    Ok(StreamKeys::with_ctrl(topic, mac_key, enc_key, ctrl_topic, ctrl_mac_key))
 }
 
 // ============================================================================
@@ -836,6 +859,24 @@ mod tests {
 
         assert_eq!(keys1.topic, keys2.topic);
         assert_eq!(*keys1.mac_key, *keys2.mac_key);
+        Ok(())
+    }
+
+    #[test]
+    fn test_derive_stream_keys_enc_key_distinct_and_deterministic(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // #321: the AEAD enc_key must be deterministic, key-separated from mac_key,
+        // and distinct from the control keys (own derivation context).
+        let shared_secret = [0x42u8; 32];
+        let client_pub = [0x01u8; 32];
+        let server_pub = [0x02u8; 32];
+
+        let keys1 = derive_stream_keys(&shared_secret, &client_pub, &server_pub)?;
+        let keys2 = derive_stream_keys(&shared_secret, &client_pub, &server_pub)?;
+
+        assert_eq!(*keys1.enc_key, *keys2.enc_key, "enc_key must be deterministic");
+        assert_ne!(*keys1.enc_key, *keys1.mac_key, "enc_key must differ from mac_key");
+        assert_ne!(*keys1.enc_key, *keys1.ctrl_mac_key, "enc_key must differ from ctrl_mac_key");
         Ok(())
     }
 

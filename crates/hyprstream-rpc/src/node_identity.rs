@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
 use hkdf::Hkdf;
 use sha2::Sha256;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use parking_lot::RwLock;
 use zeroize::Zeroize;
 
@@ -24,6 +24,17 @@ use crate::Subject;
 /// Domain-separated HKDF salt for node identity derivation.
 /// Prevents cross-protocol confusion if the same seed material is used elsewhere.
 const NODE_IDENTITY_SALT: &[u8] = b"hyprstream-node-identity-hkdf-v1";
+
+/// Build the per-host mesh-peer subject for an enrolled host label (#328).
+///
+/// Extends the existing `service:<name>` convention (see
+/// `EnvelopeContext::from_callback_service`) with a per-host third segment so
+/// every mesh peer authenticates as its OWN granular principal
+/// (`service:inference:host-<label>`) rather than collapsing to the omnipotent
+/// `"system"` principal. The label is the operator-assigned `mesh_peers` key.
+pub fn mesh_host_subject(label: &str) -> Subject {
+    Subject::new(format!("service:inference:host-{label}"))
+}
 
 /// Derive a purpose-keyed Ed25519 signing key from a root key.
 ///
@@ -91,14 +102,22 @@ impl SigningIdentity for DerivedIdentity {
 
 /// Native identity provider backed by a root Ed25519 key.
 ///
-/// Derives purpose-keyed identities via HKDF. Tracks all derived pubkeys
-/// so `resolve()` can map them back to the node's "system" subject.
+/// Derives purpose-keyed identities via HKDF. Maps every recognized pubkey to a
+/// specific authorization [`Subject`] (#328): the node's own root/derived keys
+/// map to `"system"` (genuine in-process authority), while enrolled mesh-peer
+/// keys map to their per-host subject (`service:inference:host-<label>`). An
+/// unrecognized pubkey resolves to [`Subject::anonymous`] — deny-by-default,
+/// never the `"system"` god principal.
 pub struct NodeIdentityProvider {
     root_seed: [u8; 32],
     #[allow(dead_code)]
     node_pubkey: [u8; 32],
-    /// All pubkeys derived from this node's root — recognized as "system".
-    known_pubkeys: RwLock<HashSet<[u8; 32]>>,
+    /// Recognized pubkey → authorization subject.
+    ///
+    /// The node's own root and purpose-derived keys are inserted with
+    /// `Subject::new("system")`; mesh peers are inserted via
+    /// [`NodeIdentityProvider::register_peer`] with their per-host subject.
+    known_pubkeys: RwLock<HashMap<[u8; 32], Subject>>,
 }
 
 impl Drop for NodeIdentityProvider {
@@ -111,8 +130,9 @@ impl NodeIdentityProvider {
     /// Create from a root signing key.
     pub fn new(root_key: &SigningKey) -> Self {
         let node_pubkey = root_key.verifying_key().to_bytes();
-        let mut known = HashSet::new();
-        known.insert(node_pubkey);
+        let mut known = HashMap::new();
+        // The node's own root key is genuine in-process authority → "system".
+        known.insert(node_pubkey, Subject::new("system"));
         Self {
             root_seed: root_key.to_bytes(),
             node_pubkey,
@@ -140,18 +160,53 @@ impl NodeIdentityProvider {
 
     /// Pre-register a purpose so its derived pubkey is recognized by `resolve()`.
     ///
-    /// Called automatically by `identity_open()`, but can also be called
-    /// at startup to register purposes used by remote peers.
+    /// The derived key belongs to THIS node, so it maps to the in-process
+    /// `"system"` authority. Called automatically by `identity_open()`, but can
+    /// also be called at startup to register purposes used internally.
     pub fn register_purpose(&self, purpose: &str) -> Result<[u8; 32]> {
         let key = self.derive(purpose)?;
         let pubkey = key.verifying_key().to_bytes();
-        self.known_pubkeys.write().insert(pubkey);
+        self.known_pubkeys.write().insert(pubkey, Subject::new("system"));
         Ok(pubkey)
     }
 
-    /// Check if a pubkey belongs to this node (root or any derived purpose).
+    /// Enroll a networked mesh peer's Ed25519 signer key → per-host subject (#328).
+    ///
+    /// The peer authenticates as its OWN granular principal
+    /// (`service:inference:host-<label>`), NEVER as `"system"`. The roster is
+    /// populated from the operator-configured `mesh_peers` enrollment record
+    /// (see `hyprstream::auth::mesh_trust`), so a peer whose key is not enrolled
+    /// resolves to [`Subject::anonymous`] (fail-closed, deny-by-default).
+    ///
+    /// A peer key MUST NOT shadow the node's own `"system"` keys: if the pubkey
+    /// is already registered (e.g. the node's root/derived key), the existing
+    /// binding is kept and the peer entry is rejected to prevent a misconfigured
+    /// roster from downgrading in-process authority.
+    pub fn register_peer(&self, pubkey: [u8; 32], subject: Subject) {
+        let mut map = self.known_pubkeys.write();
+        match map.entry(pubkey) {
+            std::collections::hash_map::Entry::Occupied(existing) => {
+                // `tracing` is a native-only dependency for this crate (see Cargo.toml:
+                // it lives under `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]`),
+                // so the macro must be cfg-gated to keep the wasm32 build compiling (#468).
+                #[cfg(not(target_arch = "wasm32"))]
+                tracing::warn!(
+                    existing = ?existing.get().name(),
+                    rejected = ?subject.name(),
+                    "node_identity: mesh peer key collides with an existing binding; keeping existing, rejecting peer enrollment"
+                );
+                #[cfg(target_arch = "wasm32")]
+                let _ = &existing; // silence unused warning on wasm where tracing is absent
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(subject);
+            }
+        }
+    }
+
+    /// Check if a pubkey is recognized by this node (root, derived, or enrolled peer).
     pub fn is_known(&self, pubkey: &[u8; 32]) -> bool {
-        self.known_pubkeys.read().contains(pubkey)
+        self.known_pubkeys.read().contains_key(pubkey)
     }
 }
 
@@ -161,17 +216,20 @@ impl IdentityProvider for NodeIdentityProvider {
     async fn identity_open(&self, purpose: &str) -> Result<Box<dyn SigningIdentity>> {
         let signing_key = self.derive(purpose)?;
         let pubkey = signing_key.verifying_key().to_bytes();
-        // Track this derived pubkey so resolve() recognizes it
-        self.known_pubkeys.write().insert(pubkey);
+        // Track this derived pubkey so resolve() recognizes it as in-process "system".
+        self.known_pubkeys.write().insert(pubkey, Subject::new("system"));
         Ok(Box::new(DerivedIdentity { signing_key, pubkey }))
     }
 
     fn resolve(&self, pubkey: &[u8; 32]) -> Subject {
-        if self.known_pubkeys.read().contains(pubkey) {
-            Subject::new("system")
-        } else {
-            Subject::anonymous()
-        }
+        // Return the per-key subject: "system" for the node's own root/derived
+        // keys, a per-host subject for enrolled mesh peers, anonymous otherwise
+        // (#328 — no "any known key → system" collapse, deny-by-default).
+        self.known_pubkeys
+            .read()
+            .get(pubkey)
+            .cloned()
+            .unwrap_or_else(Subject::anonymous)
     }
 }
 
@@ -245,6 +303,69 @@ mod tests {
 
         // Unknown key still anonymous
         assert_eq!(provider.resolve(&[0u8; 32]).name(), None);
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn enrolled_peer_resolves_to_per_host_subject() {
+        // #328: an enrolled mesh peer must resolve to its OWN granular per-host
+        // subject, never to "system".
+        let root = SigningKey::generate(&mut rand::rngs::OsRng);
+        let provider = NodeIdentityProvider::new(&root);
+
+        let peer = SigningKey::generate(&mut rand::rngs::OsRng);
+        let peer_pub = peer.verifying_key().to_bytes();
+        provider.register_peer(peer_pub, mesh_host_subject("gpu-node-7"));
+
+        assert_eq!(
+            provider.resolve(&peer_pub).name(),
+            Some("service:inference:host-gpu-node-7"),
+        );
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn unenrolled_peer_resolves_to_anonymous_not_system() {
+        // #328 regression: the old "any known key → system god principal"
+        // behavior is gone. A networked peer key that is NOT in the roster must
+        // resolve to anonymous, never "system".
+        let root = SigningKey::generate(&mut rand::rngs::OsRng);
+        let provider = NodeIdentityProvider::new(&root);
+
+        let stranger = SigningKey::generate(&mut rand::rngs::OsRng);
+        let stranger_pub = stranger.verifying_key().to_bytes();
+
+        let resolved = provider.resolve(&stranger_pub);
+        assert!(resolved.is_anonymous(), "unenrolled peer must be anonymous");
+        assert_ne!(resolved.name(), Some("system"));
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn node_root_key_still_resolves_to_system() {
+        // #328 no-regression: the node's own root key (genuine in-process
+        // authority) must keep resolving to "system".
+        let root = SigningKey::generate(&mut rand::rngs::OsRng);
+        let node_pub = root.verifying_key().to_bytes();
+        let provider = NodeIdentityProvider::new(&root);
+        assert_eq!(provider.resolve(&node_pub).name(), Some("system"));
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn peer_enrollment_cannot_shadow_system_keys() {
+        // #328: a misconfigured roster must not be able to downgrade the node's
+        // own "system" authority by re-binding the node's root key.
+        let root = SigningKey::generate(&mut rand::rngs::OsRng);
+        let node_pub = root.verifying_key().to_bytes();
+        let provider = NodeIdentityProvider::new(&root);
+
+        provider.register_peer(node_pub, mesh_host_subject("evil"));
+        assert_eq!(
+            provider.resolve(&node_pub).name(),
+            Some("system"),
+            "existing system binding must win over a colliding peer enrollment"
+        );
     }
 
     #[allow(clippy::unwrap_used)]

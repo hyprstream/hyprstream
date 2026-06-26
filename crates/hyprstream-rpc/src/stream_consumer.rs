@@ -88,6 +88,11 @@ pub struct VerifierContract {
 /// HMAC chain verifier for StreamBlock.
 pub struct StreamVerifier {
     key: [u8; 32],
+    /// Transport-level AEAD key (#321). `Some` ⇒ a `Tagged` payload is opened
+    /// (AES-256-GCM, AAD bound to topic+epoch) back into Data/Complete; `None` ⇒
+    /// `Tagged` payloads pass through unchanged (the E2E notification path, which
+    /// the app layer decrypts itself).
+    enc_key: Option<[u8; 32]>,
     prev_mac: Option<[u8; 16]>,
     topic: String,
     /// Verifier contract enforcement (#163). `None` ⇒ legacy behaviour (MAC chain only, no
@@ -103,15 +108,29 @@ pub struct StreamVerifier {
 
 impl StreamVerifier {
     /// Create a new verifier with **no** policy enforcement (MAC chain only) — legacy behaviour.
+    ///
+    /// AEAD opening is OFF (`enc_key = None`); use [`StreamVerifier::with_enc_key`] to
+    /// open transport-sealed `Tagged` payloads (#321).
     pub fn new(key: [u8; 32], topic: String) -> Self {
         Self {
             key,
+            enc_key: None,
             prev_mac: None,
             topic,
             policy: None,
             seq_cursor: None,
             terminal_seen: false,
         }
+    }
+
+    /// Set the transport AEAD key so sealed `Tagged` payloads are opened (#321).
+    ///
+    /// Builder-style; pass the `enc_key` from `derive_client_stream_keys`. With it
+    /// set, the verifier decrypts each `Tagged` block back into Data/Complete and
+    /// fails closed on tamper / wrong key.
+    pub fn with_enc_key(mut self, enc_key: [u8; 32]) -> Self {
+        self.enc_key = Some(enc_key);
+        self
     }
 
     /// Create a verifier that enforces `policy` (#163) — used by codegen-generated consumers,
@@ -226,6 +245,10 @@ impl StreamVerifier {
             }
         }
 
+        // #321: the AEAD AAD binds each sealed payload to (topic, epoch); read the
+        // block epoch so a sealed Tagged payload can only open under its own epoch.
+        let block_epoch = block.get_epoch();
+
         let payloads_reader = block.get_payloads()?;
         let mut payloads = Vec::with_capacity(payloads_reader.len() as usize);
 
@@ -249,11 +272,25 @@ impl StreamVerifier {
                 }
                 Which::Tagged(tagged_result) => {
                     let tagged = tagged_result?;
-                    StreamPayload::Tagged {
-                        tag: tagged.get_tag()?.to_vec(),
-                        payload: tagged.get_payload()?.to_vec(),
-                        nonce: tagged.get_nonce()?.to_vec(),
-                        key_commitment: tagged.get_key_commitment()?.to_vec(),
+                    match self.enc_key {
+                        // #321: transport AEAD ON — open the sealed payload back into
+                        // Data/Complete (fails closed on tamper / wrong key).
+                        Some(ref enc_key) => open_sealed_payload(
+                            enc_key,
+                            &self.topic,
+                            block_epoch,
+                            tagged.get_tag()?,
+                            tagged.get_payload()?,
+                            tagged.get_nonce()?,
+                            tagged.get_key_commitment()?,
+                        )?,
+                        // No transport key (E2E notification path): pass Tagged through.
+                        None => StreamPayload::Tagged {
+                            tag: tagged.get_tag()?.to_vec(),
+                            payload: tagged.get_payload()?.to_vec(),
+                            nonce: tagged.get_nonce()?.to_vec(),
+                            key_commitment: tagged.get_key_commitment()?.to_vec(),
+                        },
                     }
                 }
             };
@@ -277,6 +314,68 @@ impl StreamVerifier {
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
     a.ct_eq(b).into()
+}
+
+// ============================================================================
+// #321 — transport-level AEAD framing (cross-target seal/open glue).
+//
+// The seal side lives in `moq_stream` (native publisher); the open side here is
+// cross-target so the wasm/browser consumer opens sealed blocks too. Both sides
+// share this AAD + kind-tag framing.
+// ============================================================================
+
+/// Plaintext kind tag prepended inside the AEAD-sealed bytes so the open path can
+/// restore the original payload variant (`Data` vs `Complete`) without a schema
+/// change. Authenticated as part of the AEAD plaintext.
+pub(crate) const SEALED_KIND_DATA: u8 = 0x00;
+pub(crate) const SEALED_KIND_COMPLETE: u8 = 0x01;
+
+/// Build the AEAD AAD (also the `encrypt_event` "prefix") binding each sealed
+/// payload to its `topic` and key-`epoch` (#321/#223). Reused verbatim by the
+/// publisher seal path; a block replayed under a different epoch fails AEAD open.
+pub(crate) fn stream_aead_aad(topic: &str, epoch: u64) -> String {
+    format!("{topic}|stream-aead-v1|epoch={epoch}")
+}
+
+/// Open an AEAD-sealed `Tagged` payload (#321), restoring the original
+/// Data/Complete variant. Returns `Err` on tamper / wrong key (fail-closed).
+///
+/// `epoch` is the StreamBlock's epoch and MUST match the seal-side AAD.
+pub(crate) fn open_sealed_payload(
+    enc_key: &[u8; 32],
+    topic: &str,
+    epoch: u64,
+    tag: &[u8],
+    ciphertext: &[u8],
+    nonce: &[u8],
+    key_commitment: &[u8],
+) -> Result<StreamPayload> {
+    use crate::crypto::event_crypto::{check_key_commitment, decrypt_event_full};
+
+    let nonce12: [u8; 12] = nonce
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("stream AEAD: bad nonce length {}", nonce.len()))?;
+    let commitment16: [u8; 16] = key_commitment.try_into().map_err(|_| {
+        anyhow::anyhow!("stream AEAD: bad key_commitment length {}", key_commitment.len())
+    })?;
+
+    // Fast committing-AEAD rejection of a wrong-key block before the GCM open.
+    if !check_key_commitment(enc_key, &nonce12, &commitment16) {
+        anyhow::bail!("stream AEAD: key commitment mismatch (wrong key or tampered block)");
+    }
+
+    let aad = stream_aead_aad(topic, epoch);
+    let plaintext = decrypt_event_full(enc_key, &nonce12, tag, ciphertext, &aad)
+        .map_err(|e| anyhow::anyhow!("stream AEAD open failed: {e}"))?;
+
+    let (&kind, body) = plaintext
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("stream AEAD: empty sealed plaintext (missing kind tag)"))?;
+    match kind {
+        SEALED_KIND_DATA => Ok(StreamPayload::Data(body.to_vec())),
+        SEALED_KIND_COMPLETE => Ok(StreamPayload::Complete(body.to_vec())),
+        other => anyhow::bail!("stream AEAD: unknown sealed kind tag {other:#x}"),
+    }
 }
 
 // ============================================================================
@@ -305,6 +404,25 @@ impl<T: Transport> StreamHandleImpl<T> {
     /// Full streaming setup: ECDH → derive keys → subscribe → open ctrl → create verifier.
     ///
     /// Called by `RpcClient::open_stream()` after the streaming RPC returns `StreamInfo`.
+    ///
+    /// #385 INVARIANT (S8 close-out — `dhPublic` authenticity):
+    /// The entire AEAD + chained-HMAC integrity envelope bootstraps from
+    /// `stream_info.dh_public` — the server's ephemeral Ristretto255 DH public
+    /// key. It is trustworthy ONLY because `StreamInfo` arrives over the
+    /// *authenticated* RPC channel: the RPC reply rides the iroh
+    /// node-id-bound / QUIC-cert-pinned transport, and (per #275) is wrapped in
+    /// a `ResponseEnvelope` carrying a COSE composite signature (EdDSA +
+    /// ML-DSA-65 under Hybrid), so `dhPublic` authentication reaches PQ
+    /// strength. A `dh_public` sourced from an *unauthenticated* path would let
+    /// any MITM substitute its own key, derive the stream keys itself, and forge
+    /// frames — defeating the whole envelope. This entry point is the single
+    /// library/codegen boundary that turns a `StreamInfo` into a live stream;
+    /// `dh_public` MUST therefore arrive here already authenticated. Callers
+    /// MUST NOT construct `StreamInfo` from untrusted input (e.g. a forwarded
+    /// relay advertisement or an unsigned lookup result). See
+    /// [`crate::rpc_client::parse_stream_info`] — the only producer of a
+    /// `StreamInfo` from wire bytes, reached solely via the authenticated
+    /// `call_streaming` RPC reply path.
     pub async fn open(
         transport: &T,
         stream_info: StreamInfo,
@@ -312,13 +430,18 @@ impl<T: Transport> StreamHandleImpl<T> {
         client_pubkey: &[u8; 32],
     ) -> Result<Self> {
         // Pure crypto — same code, both targets.
-        // `dh_public` is the server's ephemeral Ristretto255 DH public key (one
-        // input to the ECDH that derives the topic + MAC keys). Trust in this
-        // field comes from the signed RPC `ResponseEnvelope` wrapping StreamInfo,
-        // not from the field itself. As of #275 the `ResponseEnvelope` carries a
-        // COSE composite (EdDSA + ML-DSA-65 under Hybrid), so StreamInfo
-        // authentication reaches PQ strength on a par with the request-side
-        // `SignedEnvelope`. See `ResponseEnvelope`.
+        // #385: assert the INVARIANT above at the entry point — the envelope's
+        // integrity is a consequence of `dh_public`'s authenticity, so a
+        // zero/empty `dh_public` (an obvious "StreamInfo-from-untrusted-input"
+        // signature) fails fast here rather than producing a silently-weak
+        // handshake. (A *substituted* valid key is not detectable at this layer;
+        // it is detected by the consumer's AEAD/MAC verification failing — see
+        // the `relay_dhpublic_substitution_is_rejected` test.)
+        assert!(
+            stream_info.dh_public.iter().any(|&b| b != 0),
+            "#385 INVARIANT: StreamInfo.dh_public must be a real (non-zero) DH key — \
+             never construct StreamInfo from untrusted input"
+        );
         let shared_secret = dh_compute_raw(client_secret, &stream_info.dh_public)?;
         let keys = derive_stream_keys(&shared_secret, client_pubkey, &stream_info.dh_public)?;
 
@@ -327,11 +450,13 @@ impl<T: Transport> StreamHandleImpl<T> {
         let publisher = transport.publish(keys.ctrl_topic.as_bytes()).await.ok();
 
         // QoS contract from the signed StreamInfo handshake — enforced for both native and WASM paths.
+        // #321: AEAD ON for this DH-keyed (mesh/networked) stream — open sealed Tagged blocks.
         let verifier = StreamVerifier::with_policy(
             *keys.mac_key,
             keys.topic.clone(),
             stream_info.qos.into(),
-        );
+        )
+        .with_enc_key(*keys.enc_key);
 
         Ok(Self {
             subscriber,
@@ -635,5 +760,144 @@ mod policy_tests {
         let (f1, _) = frame(&key, topic, Some(m0), 1, true); // terminal payload
         v.verify(&f1).unwrap();
         assert!(v.terminal_seen());
+    }
+
+    // ── #385 S8 — relay dhPublic-substitution rejection ──────────────────────
+    //
+    // Threat (S3 relay + S5 provenance gap): once a relay is interposed, a MITM
+    // relay could try to substitute its OWN `dhPublic` in the handshake so the
+    // consumer derives keys the relay controls. S5 COSE provenance authenticates
+    // each *frame* to the producing host, but the handshake `dhPublic`→producer
+    // binding is not separately tested. This test closes that gap: it shows the
+    // consumer's AEAD verification FAILS when the keys are derived from a
+    // `dhPublic` the relay substituted, because they do not match the keys the
+    // producer sealed the frame under. The consumer, holding the *authenticated*
+    // `dhPublic` (delivered over the RPC channel — see `StreamHandleImpl::open`
+    // INVARIANT), is never fooled: it never re-derives from a relay-supplied
+    // `dhPublic`. The test asserts the negative — *if* the relay's substituted
+    // key reached the key-derivation, AEAD open would fail — which is exactly
+    // the rejection property.
+    #[test]
+    fn relay_dhpublic_substitution_is_rejected() {
+        use crate::crypto::{derive_stream_keys, generate_ephemeral_keypair, ristretto_dh_raw};
+
+        // Consumer generates an ephemeral keypair (the `client_pubkey` it sends
+        // in the streaming RPC request).
+        let (client_secret, client_pub) = generate_ephemeral_keypair();
+        let client_pub_bytes = client_pub.to_bytes();
+        let client_secret_bytes = client_secret.scalar().to_bytes();
+
+        // Producer's REAL ephemeral keypair — its public half is the `dhPublic`
+        // the authenticated RPC reply carries (the value the consumer trusts).
+        let (producer_secret, producer_pub) = generate_ephemeral_keypair();
+        let real_dh_public = producer_pub.to_bytes();
+
+        // The relay's substituted keypair — the MITM key the relay would inject
+        // in place of `dhPublic` to try to own the derived keys.
+        let (_relay_secret, relay_pub) = generate_ephemeral_keypair();
+        let relay_dh_public = relay_pub.to_bytes();
+        assert_ne!(real_dh_public, relay_dh_public, "test setup: keys must differ");
+
+        // Producer derives the REAL stream keys from the real DH (ECDH with the
+        // client's public) — these are the keys it seals every frame under.
+        let producer_shared =
+            ristretto_dh_raw(&producer_secret.scalar().to_bytes(), &client_pub_bytes).unwrap();
+        let real_keys =
+            derive_stream_keys(&producer_shared, &client_pub_bytes, &real_dh_public).unwrap();
+
+        // Build one AEAD-sealed Tagged payload exactly as the producer does
+        // (`moq_stream::seal_payload`), using the REAL enc_key. This is the
+        // ciphertext the relay forwards verbatim (it is blind to the keys).
+        let epoch = 0u64;
+        let topic = real_keys.topic.clone();
+        let real_enc = *real_keys.enc_key;
+        let plaintext = {
+            let mut p = Vec::with_capacity(1 + b"secret-token".len());
+            p.push(SEALED_KIND_DATA);
+            p.extend_from_slice(b"secret-token");
+            p
+        };
+        use crate::crypto::event_crypto::{encrypt_event, EventPrivacy};
+        let aad = stream_aead_aad(&topic, epoch);
+        let (tag, ciphertext, nonce, key_commitment) =
+            encrypt_event(&real_enc, &aad, &plaintext, EventPrivacy::ZeroKnowledge).unwrap();
+
+        // 1) Consumer holding the AUTHENTICATED keys (the real `dhPublic` arrived
+        //    over the RPC channel) opens the relay-forwarded frame: SUCCESS.
+        let consumer_shared = ristretto_dh_raw(&client_secret_bytes, &real_dh_public).unwrap();
+        let consumer_keys =
+            derive_stream_keys(&consumer_shared, &client_pub_bytes, &real_dh_public).unwrap();
+        assert_eq!(
+            *consumer_keys.enc_key,
+            real_enc,
+            "consumer (real dhPublic) and producer derive the same enc_key"
+        );
+        let opened = open_sealed_payload(
+            &consumer_keys.enc_key,
+            &topic,
+            epoch,
+            &tag,
+            &ciphertext,
+            &nonce,
+            &key_commitment,
+        )
+        .expect("consumer with the authenticated dhPublic opens the frame");
+        assert!(matches!(opened, StreamPayload::Data(d) if d == b"secret-token"));
+
+        // 2) Relay-substitution attack: a consumer that (wrongly) re-derived its
+        //    keys from the RELAY's substituted `dhPublic` cannot open the frame —
+        //    AEAD fails (wrong key). This is the rejection: the relay cannot make
+        //    a substituted `dhPublic` stick, because the keys won't line up with
+        //    the producer's sealed ciphertext. (The honest consumer never enters
+        //    this branch — it keeps the authenticated `dhPublic`; this case shows
+        //    what would happen if the substituted key were used.)
+        let sub_shared = ristretto_dh_raw(&client_secret_bytes, &relay_dh_public).unwrap();
+        let sub_keys = derive_stream_keys(&sub_shared, &client_pub_bytes, &relay_dh_public).unwrap();
+        assert_ne!(
+            *sub_keys.enc_key,
+            real_enc,
+            "substituted dhPublic MUST derive a different enc_key"
+        );
+        let subst_err = open_sealed_payload(
+            &sub_keys.enc_key,
+            &topic,
+            epoch,
+            &tag,
+            &ciphertext,
+            &nonce,
+            &key_commitment,
+        )
+        .unwrap_err();
+        let msg = subst_err.to_string();
+        assert!(
+            msg.contains("AEAD") || msg.contains("commitment") || msg.contains("key"),
+            "substituted-dhPublic AEAD open should fail closed, got: {msg}"
+        );
+
+        // 3) The MAC chain has the same property: a frame chained under the real
+        //    mac_key fails verification under the relay's mac_key. This is the
+        //    belt-and-braces check on the chained-HMAC envelope.
+        let real_mac = *real_keys.mac_key;
+        let sub_mac = *sub_keys.mac_key;
+        assert_ne!(real_mac, sub_mac, "substituted dhPublic MUST derive a different mac_key");
+        let (real_frame, _) = frame(&real_mac, &topic, None, 0, false);
+        // Real consumer (real mac_key) verifies the producer's frame.
+        let mut v_real = StreamVerifier::with_policy(
+            real_mac,
+            topic.clone(),
+            VerifierContract { ordering: StreamOrdering::Ordered, completion: Completion::Open },
+        );
+        assert!(v_real.verify(&real_frame).is_ok(), "real mac_key verifies the frame");
+        // Substituted consumer (relay mac_key) CANNOT verify the producer's frame.
+        let mut v_sub = StreamVerifier::with_policy(
+            sub_mac,
+            topic,
+            VerifierContract { ordering: StreamOrdering::Ordered, completion: Completion::Open },
+        );
+        assert!(
+            v_sub.verify(&real_frame).is_err(),
+            "a frame chained under the producer's mac_key MUST NOT verify under the \
+             relay's substituted-dhPublic mac_key (the consumer rejects the substitution)"
+        );
     }
 }

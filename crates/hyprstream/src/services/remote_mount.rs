@@ -5,27 +5,36 @@
 //! VFS namespace to serve `/srv/model` by proxying 9P operations to the model
 //! service, which in turn delegates to its local `FsHandler` / `SyntheticTree`.
 //!
+//! ## Shared bridge
+//!
+//! The sync→async plumbing (embedded tokio runtime, fid allocator, fid map,
+//! `anyhow → MountError` mapping, the opaque fid key, and the packed 9P stat
+//! parser) is shared with `RemoteRegistryMount` via [`NinePBridge`] in
+//! [`crate::services::ninep_bridge`]. Only the model-specific pieces live
+//! here: the `ModelClient`/`ModelFsClient` types, the 1-level scope
+//! extraction (first path component = model ref), and the `stat` (not
+//! `np_stat`) RPC method name.
+//!
 //! ## Fid management
 //!
-//! The mount allocates local fid numbers and tracks them in a `DashMap`. Each
-//! local fid maps to a `RemoteFid` that stores the remote fid number returned
-//! by walk, plus metadata (open mode, qtype) for stat/readdir synthesis.
+//! The mount allocates local fid numbers and tracks them via the bridge's
+//! `DashMap`. Each local fid maps to a `RemoteFidState` that stores the
+//! remote fid number returned by walk, plus metadata (open mode, qtype) for
+//! stat/readdir synthesis.
 //!
 //! ## Timeout / graceful degradation
 //!
-//! A dedicated single-threaded tokio runtime (`self.rt`) drives the async
-//! client. If the model service is unreachable, `block_on` will hang until
-//! the ZMQ socket timeout fires (set on the underlying socket). Callers
-//! see `MountError::Io("service unreachable: ...")`.
-
-use std::sync::atomic::{AtomicU32, Ordering};
+//! A dedicated single-threaded tokio runtime drives the async client. If the
+//! model service is unreachable, `block_on` will hang until the ZMQ socket
+//! timeout fires (set on the underlying socket). Callers see
+//! `MountError::Io("service unreachable: ...")`.
 
 use async_trait::async_trait;
-use dashmap::DashMap;
-use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
 use hyprstream_rpc::Subject;
+use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
 
-use crate::services::generated::model_client::{ModelFsClient, ModelClient};
+use crate::services::generated::model_client::{ModelClient, ModelFsClient};
+use crate::services::ninep_bridge::{fid_key, map_err, parse_dir_stats, NinePBridge, RemoteFidKey};
 use crate::services::types::QTDIR;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -45,10 +54,6 @@ struct RemoteFidState {
     opened: bool,
 }
 
-/// Newtype stored inside the opaque `Fid`.
-#[derive(Clone, Debug)]
-struct RemoteFidKey(u32);
-
 // ─────────────────────────────────────────────────────────────────────────────
 // RemoteModelMount
 // ─────────────────────────────────────────────────────────────────────────────
@@ -57,53 +62,21 @@ struct RemoteFidKey(u32);
 /// via the generated `ModelClient` RPC.
 pub struct RemoteModelMount {
     client: ModelClient,
-    rt: tokio::runtime::Runtime,
-    /// Local fid number → remote fid state.
-    fids: DashMap<u32, RemoteFidState>,
-    /// Monotonic fid allocator.
-    next_fid: AtomicU32,
+    bridge: NinePBridge<RemoteFidState>,
 }
 
 impl RemoteModelMount {
     /// Create a new remote mount wrapping the given model client.
-    #[allow(clippy::expect_used)] // Runtime creation is infallible in practice
     pub fn new(client: ModelClient) -> Self {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to create tokio runtime for RemoteModelMount");
         Self {
             client,
-            rt,
-            fids: DashMap::new(),
-            next_fid: AtomicU32::new(1),
+            bridge: NinePBridge::new("RemoteModelMount"),
         }
-    }
-
-    /// Allocate a new local fid number.
-    fn alloc_fid(&self) -> u32 {
-        self.next_fid.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Get the scoped fs client for a model reference.
     fn fs_client(&self, model_ref: &str) -> ModelFsClient {
         self.client.fs(model_ref)
-    }
-
-    /// Map an `anyhow::Error` to a `MountError::Io`.
-    fn map_err(e: anyhow::Error) -> MountError {
-        let msg = e.to_string();
-        if msg.contains("not found") || msg.contains("No such") {
-            MountError::NotFound(msg)
-        } else if msg.contains("permission denied") {
-            MountError::PermissionDenied(msg)
-        } else if msg.contains("not a directory") {
-            MountError::NotDirectory(msg)
-        } else if msg.contains("is a directory") {
-            MountError::IsDirectory(msg)
-        } else {
-            MountError::Io(msg)
-        }
     }
 }
 
@@ -116,9 +89,12 @@ impl Mount for RemoteModelMount {
         }
 
         let model_ref = components[0];
-        let wnames: Vec<String> = components[1..].iter().map(std::string::ToString::to_string).collect();
+        let wnames: Vec<String> = components[1..]
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
 
-        let local_fid = self.alloc_fid();
+        let local_fid = self.bridge.alloc_fid();
         let remote_newfid = local_fid; // Use same numbering for simplicity.
 
         let fs = self.fs_client(model_ref);
@@ -128,7 +104,11 @@ impl Mount for RemoteModelMount {
             wnames,
         };
 
-        let result = self.rt.block_on(fs.walk(&walk_req)).map_err(Self::map_err)?;
+        let result = self
+            .bridge
+            .rt()
+            .block_on(fs.walk(&walk_req))
+            .map_err(map_err)?;
 
         // Determine qtype from the walk response qid.
         let qtype = result.qid.qtype;
@@ -139,18 +119,15 @@ impl Mount for RemoteModelMount {
             qtype,
             opened: false,
         };
-        self.fids.insert(local_fid, state);
+        self.bridge.insert(local_fid, state);
 
         Ok(Fid::new(RemoteFidKey(local_fid)))
     }
 
     async fn open(&self, fid: &mut Fid, mode: u8, _caller: &Subject) -> Result<(), MountError> {
-        let key = fid.downcast_ref::<RemoteFidKey>()
-            .ok_or_else(|| MountError::InvalidArgument("bad fid type".into()))?;
-        let local_id = key.0;
+        let local_id = fid_key(fid)?.0;
 
-        let mut state = self.fids.get_mut(&local_id)
-            .ok_or_else(|| MountError::NotFound(format!("fid {} not found", local_id)))?;
+        let mut state = self.bridge.get_mut(local_id)?;
 
         let fs = self.fs_client(&state.model_ref);
         let open_req = crate::services::generated::model_client::NpOpen {
@@ -158,19 +135,26 @@ impl Mount for RemoteModelMount {
             mode,
         };
 
-        let _result = self.rt.block_on(fs.open(&open_req)).map_err(Self::map_err)?;
+        let _result = self
+            .bridge
+            .rt()
+            .block_on(fs.open(&open_req))
+            .map_err(map_err)?;
         state.opened = true;
 
         Ok(())
     }
 
-    async fn read(&self, fid: &Fid, offset: u64, count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
-        let key = fid.downcast_ref::<RemoteFidKey>()
-            .ok_or_else(|| MountError::InvalidArgument("bad fid type".into()))?;
-        let local_id = key.0;
+    async fn read(
+        &self,
+        fid: &Fid,
+        offset: u64,
+        count: u32,
+        _caller: &Subject,
+    ) -> Result<Vec<u8>, MountError> {
+        let local_id = fid_key(fid)?.0;
 
-        let state = self.fids.get(&local_id)
-            .ok_or_else(|| MountError::NotFound(format!("fid {} not found", local_id)))?;
+        let state = self.bridge.get(local_id)?;
 
         let fs = self.fs_client(&state.model_ref);
         let read_req = crate::services::generated::model_client::NpRead {
@@ -179,17 +163,24 @@ impl Mount for RemoteModelMount {
             count,
         };
 
-        let result = self.rt.block_on(fs.read(&read_req)).map_err(Self::map_err)?;
+        let result = self
+            .bridge
+            .rt()
+            .block_on(fs.read(&read_req))
+            .map_err(map_err)?;
         Ok(result.data)
     }
 
-    async fn write(&self, fid: &Fid, offset: u64, data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
-        let key = fid.downcast_ref::<RemoteFidKey>()
-            .ok_or_else(|| MountError::InvalidArgument("bad fid type".into()))?;
-        let local_id = key.0;
+    async fn write(
+        &self,
+        fid: &Fid,
+        offset: u64,
+        data: &[u8],
+        _caller: &Subject,
+    ) -> Result<u32, MountError> {
+        let local_id = fid_key(fid)?.0;
 
-        let state = self.fids.get(&local_id)
-            .ok_or_else(|| MountError::NotFound(format!("fid {} not found", local_id)))?;
+        let state = self.bridge.get(local_id)?;
 
         let fs = self.fs_client(&state.model_ref);
         let write_req = crate::services::generated::model_client::NpWrite {
@@ -198,7 +189,11 @@ impl Mount for RemoteModelMount {
             data: data.to_vec(),
         };
 
-        let result = self.rt.block_on(fs.write(&write_req)).map_err(Self::map_err)?;
+        let result = self
+            .bridge
+            .rt()
+            .block_on(fs.write(&write_req))
+            .map_err(map_err)?;
         Ok(result.count)
     }
 
@@ -209,15 +204,15 @@ impl Mount for RemoteModelMount {
         //
         // For now, do a read at offset 0 and parse the response.
         // The model service returns stat-encoded directory entries.
-        let key = fid.downcast_ref::<RemoteFidKey>()
-            .ok_or_else(|| MountError::InvalidArgument("bad fid type".into()))?;
-        let local_id = key.0;
+        let local_id = fid_key(fid)?.0;
 
-        let state = self.fids.get(&local_id)
-            .ok_or_else(|| MountError::NotFound(format!("fid {} not found", local_id)))?;
+        let state = self.bridge.get(local_id)?;
 
         if state.qtype != QTDIR {
-            return Err(MountError::NotDirectory(format!("fid {} is not a directory", local_id)));
+            return Err(MountError::NotDirectory(format!(
+                "fid {} is not a directory",
+                local_id
+            )));
         }
 
         // Read directory data from remote.
@@ -228,35 +223,46 @@ impl Mount for RemoteModelMount {
             count: 65536, // Large enough for most directory listings.
         };
 
-        let result = self.rt.block_on(fs.read(&read_req)).map_err(Self::map_err)?;
+        let result = self
+            .bridge
+            .rt()
+            .block_on(fs.read(&read_req))
+            .map_err(map_err)?;
 
         // Parse stat entries from the raw 9P directory read data.
         // Directory reads return packed NpStat entries. Each entry is preceded
         // by a 2-byte little-endian size. We extract name + qtype from each.
-        let entries = parse_dir_stats(&result.data);
-        Ok(entries)
+        Ok(parse_dir_stats(&result.data))
     }
 
     async fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
-        let key = fid.downcast_ref::<RemoteFidKey>()
-            .ok_or_else(|| MountError::InvalidArgument("bad fid type".into()))?;
-        let local_id = key.0;
+        let local_id = fid_key(fid)?.0;
 
-        let state = self.fids.get(&local_id)
-            .ok_or_else(|| MountError::NotFound(format!("fid {} not found", local_id)))?;
+        let state = self.bridge.get(local_id)?;
 
         let fs = self.fs_client(&state.model_ref);
         let stat_req = crate::services::generated::model_client::NpStatReq {
             fid: state.remote_fid,
         };
 
-        let result = self.rt.block_on(fs.stat(&stat_req)).map_err(Self::map_err)?;
+        let result = self
+            .bridge
+            .rt()
+            .block_on(fs.stat(&stat_req))
+            .map_err(map_err)?;
 
         // Convert the RPC RStat → VFS Stat.
         let np_stat = &result.stat;
 
         Ok(Stat {
             qtype: np_stat.qid.qtype,
+            // Thread the wire qid version/path through instead of discarding
+            // them. `nine.capnp` already carries these; we were flattening the
+            // qid to qtype only. See the qid-soundness invariant on
+            // `hyprstream_vfs::Stat` — these are advisory identity hints, not
+            // yet a strong identity (content-CID qid lands in #387).
+            version: np_stat.qid.version,
+            path: np_stat.qid.path,
             size: np_stat.length,
             name: np_stat.name.clone(),
             mtime: np_stat.mtime as u64,
@@ -264,94 +270,19 @@ impl Mount for RemoteModelMount {
     }
 
     async fn clunk(&self, fid: Fid, _caller: &Subject) {
-        let Some(key) = fid.downcast_ref::<RemoteFidKey>() else { return };
-        let local_id = key.0;
+        let local_id = match fid_key(&fid) {
+            Ok(k) => k.0,
+            Err(_) => return,
+        };
 
-        if let Some((_, state)) = self.fids.remove(&local_id) {
+        if let Some(state) = self.bridge.remove(local_id) {
             let fs = self.fs_client(&state.model_ref);
             let clunk_req = crate::services::generated::model_client::NpClunk {
                 fid: state.remote_fid,
             };
 
             // Best-effort clunk — ignore errors.
-            let _ = self.rt.block_on(fs.clunk(&clunk_req));
+            let _ = self.bridge.rt().block_on(fs.clunk(&clunk_req));
         }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Directory stat parsing
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Parse packed 9P stat entries from a directory read response.
-///
-/// Each stat entry is: `[2-byte LE size][stat bytes]`.
-/// We extract the name and qtype for DirEntry conversion.
-fn parse_dir_stats(data: &[u8]) -> Vec<DirEntry> {
-    let mut entries = Vec::new();
-    let mut offset = 0;
-
-    while offset + 2 <= data.len() {
-        let entry_size = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
-        offset += 2;
-
-        if offset + entry_size > data.len() {
-            break;
-        }
-
-        let entry_data = &data[offset..offset + entry_size];
-        offset += entry_size;
-
-        // 9P stat layout (simplified):
-        //   size(2) + type(2) + dev(4) + qid(13) + mode(4) + atime(4) + mtime(4) + length(8) +
-        //   name_len(2) + name + uid_len(2) + uid + gid_len(2) + gid + muid_len(2) + muid
-        //
-        // But the outer size has already been consumed. The inner layout is:
-        //   type(2) + dev(4) + qid.type(1) + qid.vers(4) + qid.path(8) + mode(4) + atime(4) + mtime(4) + length(8)
-        //   = 39 bytes before name_len
-        if entry_data.len() < 41 {
-            continue;
-        }
-
-        let qtype = entry_data[6]; // qid.type at offset 6 (after type(2) + dev(4))
-        let length = u64::from_le_bytes(entry_data[27..35].try_into().unwrap_or([0; 8]));
-
-        // name_len at offset 39
-        let name_len = u16::from_le_bytes([entry_data[39], entry_data[40]]) as usize;
-        if entry_data.len() < 41 + name_len {
-            continue;
-        }
-        let name = String::from_utf8_lossy(&entry_data[41..41 + name_len]).to_string();
-
-        entries.push(DirEntry {
-            name: name.clone(),
-            is_dir: qtype == QTDIR,
-            size: length,
-            stat: Some(Stat {
-                qtype,
-                size: length,
-                name,
-                mtime: 0,
-            }),
-        });
-    }
-
-    entries
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_empty_dir_stats() {
-        assert!(parse_dir_stats(&[]).is_empty());
-    }
-
-    #[test]
-    fn parse_truncated_dir_stats() {
-        // Size says 100 bytes but only 5 available — should not panic.
-        let data = [100, 0, 0, 0, 0];
-        assert!(parse_dir_stats(&data).is_empty());
     }
 }

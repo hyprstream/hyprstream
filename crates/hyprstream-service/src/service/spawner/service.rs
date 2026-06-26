@@ -206,14 +206,16 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                     }
                 }
 
-                // #282: bind an iroh substrate in PARALLEL to the quinn endpoint,
-                // serving BOTH ALPNs (`hyprstream-rpc/1` + `moql`) with the SAME
-                // request processor + moq origin. The iroh endpoint's node key is
-                // the service's Ed25519 signing key, so its `node_id` (==
-                // `signing_key.verifying_key()`) is already covered by the node's
-                // published DID verification methods — and the #137 gate, when
-                // installed, matches an inbound peer's `remote_id()` against its
-                // DID. Discovery is iroh's built-in pkarr publisher + n0 DNS
+                // #410/#282: bind an iroh substrate as the PRIMARY production
+                // endpoint (on by default; `[quic] iroh = false` opts out), serving
+                // BOTH ALPNs (`hyprstream-rpc/1` + `moql`) with the SAME request
+                // processor + moq origin, in parallel to the quinn endpoint (kept
+                // for back-compat). The iroh endpoint's node key is the service's
+                // Ed25519 signing key, so its `node_id`
+                // (`== signing_key.verifying_key()`) is already covered by the
+                // node's published DID verification methods — and the #137 gate,
+                // when installed, matches an inbound peer's `remote_id()` against
+                // its DID. Discovery is iroh's built-in pkarr publisher + n0 DNS
                 // (`presets::N0`), so this node is dial-by-node_id-discoverable.
                 //
                 // Kept alive in this scope via `_iroh_substrate`; on shutdown the

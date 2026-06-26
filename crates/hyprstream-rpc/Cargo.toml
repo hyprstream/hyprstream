@@ -48,6 +48,7 @@ serde_json = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
 bs58 = "0.5"                              # multibase base58btc for DID-doc transport service entries
+data-encoding = "2.6"                     # multibase base32 (CIDv1 canonical form)
 chrono = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
@@ -99,7 +100,7 @@ url = { workspace = true }
 reqwest = { workspace = true }
 
 # Async runtime
-tokio = { workspace = true, features = ["io-util", "net"] }
+tokio = { workspace = true, features = ["io-util", "net", "sync"] }
 tokio-util = { workspace = true }
 bytes = { workspace = true }
 
@@ -132,6 +133,7 @@ hyprstream-rpc-build = { path = "../hyprstream-rpc-build" }
 
 [dev-dependencies]
 tokio-test = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

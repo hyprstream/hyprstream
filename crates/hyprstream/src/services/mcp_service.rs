@@ -421,7 +421,9 @@ fn register_scoped_tools_recursive(
                             let (client_secret, client_pubkey) = hyprstream_rpc::generate_ephemeral_keypair();
                             let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
 
-                            let stream_info_json = match service.as_str() {
+                            // #468: the streaming-method client returns the VERIFIED-capnp
+                            // StreamInfo library type directly (no serde_json::Value round-trip).
+                            let stream_info: hyprstream_rpc::stream_info::StreamInfo = match service.as_str() {
                                 "registry" => {
                                     let server_vk = ctx.resolve_peer_key("registry").await?;
                                     let client: RegistryClient = RegistryClient::for_service(
@@ -437,13 +439,17 @@ fn register_scoped_tools_recursive(
                                 _ => anyhow::bail!("No scoped streaming dispatch for service: {service}"),
                             };
 
+                            // #356: single networked reach shape (UDS-only resolves
+                            // to the same-host fast path inside `networked`).
                             let DecodedStreamReach { dh_public, reach, broadcast_path } =
-                                decode_stream_reach(&stream_info_json)?;
-                            let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
+                                decode_stream_reach(stream_info)?;
+                            // #321: derive_client_stream_keys yields the AEAD enc_key.
+                            let (mac_key, enc_key, topic) = hyprstream_rpc::derive_client_stream_keys(
                                 &client_secret, &client_pubkey_bytes, &dh_public,
                             )?;
-                            let qos = hyprstream_rpc::stream_info::StreamOpt::default(); // #358: MCP tool stream consumed live → direct-first; selection only reorders advertised reaches.
-                            let handle = MoqStreamHandle::networked(reach, &qos, broadcast_path, mac_key, topic);
+                            // #358: MCP tool stream consumed live → direct-first; selection only reorders advertised reaches.
+                            let qos = hyprstream_rpc::stream_info::StreamOpt::default();
+                            let handle = MoqStreamHandle::networked(reach, &qos, broadcast_path, mac_key, enc_key, topic);
 
                             Ok(ToolResult::Stream(Box::new(handle)))
                         })
@@ -573,7 +579,8 @@ fn register_streaming_tool(
                 let (client_secret, client_pubkey) = hyprstream_rpc::generate_ephemeral_keypair();
                 let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
 
-                let stream_info_json = match service.as_str() {
+                // #468: verified-capnp StreamInfo returned directly (no serde_json round-trip).
+                let stream_info: hyprstream_rpc::stream_info::StreamInfo = match service.as_str() {
                     "registry" => {
                         let server_vk = ctx.resolve_peer_key("registry").await?;
                         let client: RegistryClient = RegistryClient::for_service(
@@ -594,14 +601,17 @@ fn register_streaming_tool(
                     _ => anyhow::bail!("No streaming support for service: {}", service),
                 };
 
+                // #356: single networked reach shape (UDS-only resolves to the
+                // same-host fast path inside `networked`).
                 let DecodedStreamReach { dh_public, reach, broadcast_path } =
-                    decode_stream_reach(&stream_info_json)?;
-                let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
+                    decode_stream_reach(stream_info)?;
+                // #321: derive_client_stream_keys yields the AEAD enc_key.
+                let (mac_key, enc_key, topic) = hyprstream_rpc::derive_client_stream_keys(
                     &client_secret, &client_pubkey_bytes, &dh_public,
                 )?;
                 // #358: MCP tool stream consumed live → direct-first; selection only reorders advertised reaches.
                 let qos = hyprstream_rpc::stream_info::StreamOpt::default();
-                let handle = MoqStreamHandle::networked(reach, &qos, broadcast_path, mac_key, topic);
+                let handle = MoqStreamHandle::networked(reach, &qos, broadcast_path, mac_key, enc_key, topic);
 
                 Ok(ToolResult::Stream(Box::new(handle)))
             })
@@ -661,13 +671,14 @@ struct DecodedStreamReach {
 
 /// Decode a streaming response into its moq reach (#356).
 ///
-/// The signed `StreamInfo` is decoded via the generated library type
-/// (`hyprstream_rpc::stream_info::StreamInfo`) — no bespoke `serde_json` field
-/// scraping — yielding the native-capnp `announcedAt` reach list + `broadcastPath`.
+/// Takes the VERIFIED-capnp `StreamInfo` library type as returned by the
+/// streaming-method client (decoded + COSE-verified inside `call_streaming`,
+/// `rpc_client.rs`) — NO `serde_json` round-trip (#468) — yielding the
+/// native-capnp `announcedAt` reach list + `broadcastPath`.
 /// Fails closed when the response carries no broadcast path or DH key.
-fn decode_stream_reach(json: &Value) -> anyhow::Result<DecodedStreamReach> {
-    let info = serde_json::from_value::<hyprstream_rpc::stream_info::StreamInfo>(json.clone())
-        .map_err(|e| anyhow::anyhow!("failed to decode StreamInfo: {e}"))?;
+fn decode_stream_reach(
+    info: hyprstream_rpc::stream_info::StreamInfo,
+) -> anyhow::Result<DecodedStreamReach> {
     if info.broadcast_path.is_empty() {
         anyhow::bail!(
             "missing broadcastPath in streaming response — server did not initialize moq transport"

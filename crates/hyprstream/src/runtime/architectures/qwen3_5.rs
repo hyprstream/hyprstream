@@ -9,6 +9,7 @@ use super::config::ArchitectureConfig;
 use super::llama::{LlamaMLP, LinearProjection};
 use super::qwen3_5_vision::{Qwen3_5VisionConfig, Qwen3_5VisionEncoder};
 use super::{ModelArchitecture, ModelOperations};
+use crate::runtime::device_pool::LayerDeviceMap;
 use crate::runtime::kv_cache::KVCacheManager;
 use crate::runtime::KVQuantType;
 use crate::runtime::model_config::ModelConfig;
@@ -251,6 +252,17 @@ impl Qwen3_5RMSNorm {
         let one_plus_w = &self.weight_f32 + 1.0f64;
         Ok((normed * one_plus_w).to_kind(orig))
     }
+
+    /// Move both weight copies to `device` (#314 pipeline placement). No-op when
+    /// the tensors already live on `device`.
+    #[inline]
+    fn into_device(self, device: Device) -> Self {
+        Self {
+            weight: self.weight.to_device(device),
+            weight_f32: self.weight_f32.to_device(device),
+            eps: self.eps,
+        }
+    }
 }
 
 unsafe impl Send for Qwen3_5RMSNorm {}
@@ -278,6 +290,16 @@ impl RMSNormGated {
         let normed = &x_f * rrms;
         let g = gate.to_kind(Kind::Float).silu();
         Ok((normed * &self.weight_f32 * g).to_kind(orig))
+    }
+
+    /// Move both weight copies to `device` (#314 pipeline placement).
+    #[inline]
+    fn into_device(self, device: Device) -> Self {
+        Self {
+            weight: self.weight.to_device(device),
+            weight_f32: self.weight_f32.to_device(device),
+            eps: self.eps,
+        }
     }
 }
 
@@ -364,21 +386,40 @@ fn chunked_delta_rule(
 
     // attn = -(k_beta @ k^T * decay_mask).masked_fill(mask0, 0)
     // [B, nv, nc, C, C]
-    let attn = -(k_beta.matmul(&k.transpose(-1, -2)) * &decay_mask)
+    let attn0 = -(k_beta.matmul(&k.transpose(-1, -2)) * &decay_mask)
         .masked_fill(&mask0, 0.0f64);
 
-    // Recursive delta-rule correction (loop over chunk_size positions)
-    for i in 1..CHUNK_SIZE as usize {
-        let i = i as i64;
-        // row = attn[..., i, :i]
-        let row = attn.narrow(-2, i, 1).narrow(-1, 0, i).squeeze_dim(-2); // [B, nv, nc, i]
-        // sub = attn[..., :i, :i]
-        let sub = attn.narrow(-2, 0, i).narrow(-1, 0, i); // [B, nv, nc, i, i]
-        // correction = (row @ sub)  [B, nv, nc, i]
-        let correction = row.unsqueeze(-2).matmul(&sub).squeeze_dim(-2);
-        let new_row = (&row + &correction).unsqueeze(-2); // [B, nv, nc, 1, i]
-        attn.narrow(-2, i, 1).narrow(-1, 0, i).copy_(&new_row);
+    // Recursive delta-rule correction (forward substitution over chunk positions).
+    //
+    // Row `i` of the corrected lower-triangular matrix is
+    //   T[i, :i] = A[i, :i] + A[i, :i] @ T[:i, :i]
+    // i.e. each row depends on the ALREADY-corrected rows above it. The original
+    // implementation built this with an in-place `attn[..i].copy_(row)`, which is
+    // unsafe for autograd (it mutates a tensor saved for backward → "variable
+    // needed for gradient computation modified by an inplace operation"). On the
+    // inference path this ran under `no_grad`; on the TTT-on-split training path
+    // (#316) the graph is live, so we build the rows out-of-place and stack them.
+    // Numerically identical to the in-place form; only the graph differs.
+    let c = CHUNK_SIZE;
+    // Each entry is a full-width row [B, nv, nc, C]; row 0 is unchanged.
+    let mut rows: Vec<Tensor> = Vec::with_capacity(c as usize);
+    rows.push(attn0.narrow(-2, 0, 1).squeeze_dim(-2)); // [B, nv, nc, C]
+    for i in 1..c {
+        // Original row i, columns [0, i) (columns >= i are 0 from mask0).
+        let a_row = attn0.narrow(-2, i, 1).narrow(-1, 0, i).squeeze_dim(-2); // [B, nv, nc, i]
+        // T[:i, :i] — stack the already-corrected rows, take their first i cols.
+        let sub = Tensor::stack(&rows, -2).narrow(-1, 0, i); // [B, nv, nc, i, i]
+        let correction = a_row.unsqueeze(-2).matmul(&sub).squeeze_dim(-2); // [B, nv, nc, i]
+        let corrected = &a_row + &correction; // [B, nv, nc, i]
+        // Re-pad to full width C (columns [i, C) are 0, matching mask0).
+        let pad_cols = c - i;
+        let zeros = Tensor::zeros(
+            [batch, nv, nc, pad_cols],
+            (Kind::Float, device),
+        );
+        rows.push(Tensor::cat(&[corrected, zeros], -1)); // [B, nv, nc, C]
     }
+    let attn = Tensor::stack(&rows, -2); // [B, nv, nc, C, C]
 
     // Add identity
     let eye = Tensor::eye(CHUNK_SIZE, (Kind::Float, device))
@@ -729,7 +770,8 @@ impl GatedDeltaNetLayer {
         let projected = if let Some((delta, layer_idx)) = delta {
             if delta.has_module("o_proj", layer_idx) {
                 // forward_2d(flat): [B*seq, val_dim] → [B*seq, hidden_size]
-                &projected + delta.forward_2d(&flat, "o_proj", layer_idx)?
+                // #139/#440: coerce fp32 delta to base dtype before adding.
+                super::add_delta(&projected, delta.forward_2d(&flat, "o_proj", layer_idx)?)
             } else {
                 projected
             }
@@ -742,6 +784,24 @@ impl GatedDeltaNetLayer {
     fn hidden_size_from_out_proj(&self) -> i64 {
         // weight is stored [in_features, out_features] after transpose at load; size()[1] = out_features = hidden_size
         self.out_proj.weight.size()[1]
+    }
+
+    /// Move every owned tensor to `device` (#314 pipeline placement). The SSM
+    /// runtime state (`conv`/`rec`) is NOT part of the layer — it is stage-local
+    /// and threaded separately — so only the static weights move here.
+    #[inline]
+    fn into_device(self, device: Device) -> Self {
+        Self {
+            in_proj_all: self.in_proj_all.into_device(device),
+            conv1d_weight: self.conv1d_weight.to_device(device),
+            a_log: self.a_log.to_device(device),
+            dt_bias: self.dt_bias.to_device(device),
+            neg_a_exp_f32: self.neg_a_exp_f32.to_device(device),
+            dt_bias_f32: self.dt_bias_f32.to_device(device),
+            norm: self.norm.into_device(device),
+            out_proj: self.out_proj.into_device(device),
+            ..self
+        }
     }
 }
 
@@ -807,6 +867,18 @@ impl Qwen3_5FullAttention {
         })
     }
 
+    /// Move all projection + QK-norm weights to `device` (#314 pipeline placement).
+    #[inline]
+    fn into_device(self, device: Device) -> Self {
+        Self {
+            qkv_proj: self.qkv_proj.into_device(device),
+            o_proj: self.o_proj.into_device(device),
+            q_norm: self.q_norm.into_device(device),
+            k_norm: self.k_norm.into_device(device),
+            ..self
+        }
+    }
+
     fn forward(
         &self,
         hidden: &Tensor,
@@ -845,14 +917,16 @@ impl Qwen3_5FullAttention {
                 } else {
                     q_correction.narrow(1, 0, q_half)
                 };
-                let corrected_q = &q_part + &q_correction;
+                // #139/#440: coerce fp32 delta to base dtype before adding (after narrow).
+                let corrected_q = super::add_delta(&q_part, q_correction);
                 Tensor::cat(&[corrected_q, gate_part], 1)
             } else {
                 q_raw
             };
 
             let v_out = if d.has_module("v_proj", layer_idx) {
-                &v_raw + d.forward_2d(&h2, "v_proj", layer_idx)?
+                // #139/#440: coerce fp32 delta to base dtype before adding.
+                super::add_delta(&v_raw, d.forward_2d(&h2, "v_proj", layer_idx)?)
             } else {
                 v_raw
             };
@@ -961,7 +1035,8 @@ impl Qwen3_5FullAttention {
         // Delta injection on o_proj (after gate, before linear projection)
         let ctx_gated = if let Some((d, layer_idx)) = delta {
             if d.has_module("o_proj", layer_idx) {
-                &ctx_gated + d.forward_2d(&ctx_gated, "o_proj", layer_idx)?
+                // #139/#440: coerce fp32 delta to base dtype before adding.
+                super::add_delta(&ctx_gated, d.forward_2d(&ctx_gated, "o_proj", layer_idx)?)
             } else {
                 ctx_gated
             }
@@ -1001,10 +1076,20 @@ impl Qwen3_5FullAttention {
         // Saves ~9 GPU kernels per call (generate_embeddings) after the first token.
         // Same pattern as LlamaModel::apply_rope.
         use std::cell::RefCell;
+        // Cache key includes the DEVICE: the cached RoPE holds sin/cos tables on
+        // a specific device. Under a pipeline split (#314) the same `layer_idx`
+        // could legitimately run on different devices on one thread, so omitting
+        // device would hand back tables on the wrong device. We encode the device
+        // as an i64 (`-1` = CPU, otherwise the CUDA ordinal) since tch::Device is
+        // not Hash. On the single-device path this just adds one constant key dim.
         thread_local! {
-            static ROPE_CACHE: RefCell<HashMap<(usize, u32), RoPE>> =
+            static ROPE_CACHE: RefCell<HashMap<(usize, u32, i64), RoPE>> =
                 RefCell::new(HashMap::new());
         }
+        let device_key: i64 = match device {
+            Device::Cuda(i) => i as i64,
+            _ => -1,
+        };
 
         let rd = self.rotary_dim as i64;
         let seq = x.size()[1];
@@ -1014,7 +1099,7 @@ impl Qwen3_5FullAttention {
 
         ROPE_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
-            let key = (self.layer_idx, self.rope_theta.to_bits());
+            let key = (self.layer_idx, self.rope_theta.to_bits(), device_key);
             let rope = match cache.entry(key) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::hash_map::Entry::Vacant(e) => {
@@ -1041,6 +1126,16 @@ impl Qwen3_5Expert {
         let gate = self.gate_proj.apply(x).silu();
         let up = self.up_proj.apply(x);
         Ok(self.down_proj.apply(&(gate * up)))
+    }
+
+    /// Move all projection weights to `device` (#314 pipeline placement).
+    #[inline]
+    fn into_device(self, device: Device) -> Self {
+        Self {
+            gate_proj: self.gate_proj.into_device(device),
+            up_proj: self.up_proj.into_device(device),
+            down_proj: self.down_proj.into_device(device),
+        }
     }
 }
 
@@ -1132,6 +1227,24 @@ impl Qwen3_5SparseMoE {
 
         Ok(output + shared_out)
     }
+
+    /// Move the router, stacked expert weights/scales, and shared expert to
+    /// `device` (#314 pipeline placement).
+    #[inline]
+    fn into_device(self, device: Device) -> Self {
+        Self {
+            gate: self.gate.into_device(device),
+            expert_gate_w: self.expert_gate_w.to_device(device),
+            expert_gate_scale: self.expert_gate_scale.map(|s| s.to_device(device)),
+            expert_up_w: self.expert_up_w.to_device(device),
+            expert_up_scale: self.expert_up_scale.map(|s| s.to_device(device)),
+            expert_down_w: self.expert_down_w.to_device(device),
+            expert_down_scale: self.expert_down_scale.map(|s| s.to_device(device)),
+            shared_expert: self.shared_expert.into_device(device),
+            shared_expert_gate: self.shared_expert_gate.map(|g| g.into_device(device)),
+            num_experts_per_tok: self.num_experts_per_tok,
+        }
+    }
 }
 
 unsafe impl Send for Qwen3_5SparseMoE {}
@@ -1161,6 +1274,15 @@ impl Qwen3_5Mlp {
             }
         }
     }
+
+    /// Move the dense or sparse MLP weights to `device` (#314 pipeline placement).
+    #[inline]
+    fn into_device(self, device: Device) -> Self {
+        match self {
+            Qwen3_5Mlp::Dense(mlp) => Qwen3_5Mlp::Dense(mlp.into_device(device)),
+            Qwen3_5Mlp::Sparse(moe) => Qwen3_5Mlp::Sparse(moe.into_device(device)),
+        }
+    }
 }
 
 unsafe impl Send for Qwen3_5Mlp {}
@@ -1175,6 +1297,17 @@ enum LayerMixer {
     FullAttn(Qwen3_5FullAttention),
 }
 
+impl LayerMixer {
+    /// Move the mixer's weights to `device` (#314 pipeline placement).
+    #[inline]
+    fn into_device(self, device: Device) -> Self {
+        match self {
+            LayerMixer::LinearAttn(gdn) => LayerMixer::LinearAttn(gdn.into_device(device)),
+            LayerMixer::FullAttn(attn) => LayerMixer::FullAttn(attn.into_device(device)),
+        }
+    }
+}
+
 unsafe impl Send for LayerMixer {}
 unsafe impl Sync for LayerMixer {}
 
@@ -1183,6 +1316,20 @@ struct Qwen3_5Layer {
     mlp: Qwen3_5Mlp,
     input_layernorm: Qwen3_5RMSNorm,
     post_attention_layernorm: Qwen3_5RMSNorm,
+}
+
+impl Qwen3_5Layer {
+    /// Move every weight in this layer (mixer + MLP + both norms) to `device`
+    /// (#314 pipeline placement). A no-op per tensor already resident on `device`.
+    #[inline]
+    fn into_device(self, device: Device) -> Self {
+        Self {
+            mixer: self.mixer.into_device(device),
+            mlp: self.mlp.into_device(device),
+            input_layernorm: self.input_layernorm.into_device(device),
+            post_attention_layernorm: self.post_attention_layernorm.into_device(device),
+        }
+    }
 }
 
 unsafe impl Send for Qwen3_5Layer {}
@@ -1196,12 +1343,29 @@ pub struct Qwen3_5Model {
     config: Qwen3_5TextConfig,
     device: Device,
     dtype: Kind,
+
+    /// Per-global-layer device assignment (#314, 2b pipeline). For the unsplit
+    /// fast path this is a single-device map of length `num_hidden_layers`
+    /// (`is_single_device() == true`); for a pipeline shard it is the *global*
+    /// map (still length `num_hidden_layers`) and `layer_offset` selects the owned
+    /// window. Drives both per-layer placement at construction and the lone
+    /// boundary `to_device` in `forward_layers`. Mirrors `LlamaModel`.
+    device_map: LayerDeviceMap,
+
+    /// Global index of `self.layers[0]`. `0` for a whole model; `a` for a shard
+    /// owning global layers `[a..a+self.layers.len())`. Used to remap a global
+    /// layer index to its local slot in `self.layers` / KV / conv-rec state, and
+    /// to pick the correct per-global-index `layer_types` entry at load.
+    layer_offset: usize,
+
     embed_tokens: Tensor,
     layers: Vec<Qwen3_5Layer>,
     norm: Qwen3_5RMSNorm,
     lm_head: Option<Tensor>,             // None = tied to embed_tokens
     lm_head_transposed: Option<Tensor>,  // pre-transposed tied weights
-    // Interior-mutable SSM state (required because forward_with_cache takes &self)
+    // Interior-mutable SSM state (required because forward_with_cache takes &self).
+    // Sized to the OWNED layer count (== self.layers.len()), indexed by LOCAL
+    // layer index. Stage-local: never transferred across a pipeline boundary.
     conv_states: Arc<parking_lot::Mutex<Vec<Option<Tensor>>>>,
     rec_states: Arc<parking_lot::Mutex<Vec<Option<Tensor>>>>,
     kv_cache: Option<Arc<parking_lot::Mutex<KVCacheManager>>>,
@@ -1291,10 +1455,16 @@ impl Qwen3_5Model {
         // Remove MTP (multi-token prediction) weights silently
         weights.retain(|k, _| !k.starts_with("mtp."));
 
+        // #405: place top-level weights on `device`, mirroring the
+        // `into_device` move that `stage_from_weights_with_config` applies.
+        // Without this, constructing from CPU weights with device=Cuda(0)
+        // leaves embed/norm/lm_head on CPU — a mixed-device model.
         let embed = weights.remove("model.embed_tokens.weight")
-            .ok_or_else(|| anyhow!("Missing model.embed_tokens.weight"))?;
+            .ok_or_else(|| anyhow!("Missing model.embed_tokens.weight"))?
+            .to_device(*device);
         let norm_w = weights.remove("model.norm.weight")
-            .ok_or_else(|| anyhow!("Missing model.norm.weight"))?;
+            .ok_or_else(|| anyhow!("Missing model.norm.weight"))?
+            .to_device(*device);
         let lm_head_w = if let Some(w) = weights.remove("lm_head.weight") {
             // Cast FP8 lm_head to BF16, applying the companion block scale if present.
             // Without this the raw FP8 values (~448) are used instead of the true weights (~0.09),
@@ -1310,12 +1480,12 @@ impl Qwen3_5Model {
                         let bc = ws[1] / ss[1];
                         let w_4d = w_bf.view([ss[0], br, ss[1], bc]);
                         let s_4d = s.to_kind(tch::Kind::BFloat16).view([ss[0], 1i64, ss[1], 1i64]);
-                        Some((w_4d * s_4d).reshape([ws[0], ws[1]]))
+                        Some((w_4d * s_4d).reshape([ws[0], ws[1]]).to_device(*device))
                     } else {
-                        Some(w_bf)
+                        Some(w_bf.to_device(*device))
                     }
                 }
-                _ => Some(w),
+                _ => Some(w.to_device(*device)),
             }
         } else {
             None
@@ -1325,33 +1495,7 @@ impl Qwen3_5Model {
         let mut layers = Vec::with_capacity(num_layers);
 
         for idx in 0..num_layers {
-            let layer_prefix = format!("model.layers.{idx}");
-            let ln_prefix = &layer_prefix;
-
-            let input_norm_w = weights.remove(&format!("{ln_prefix}.input_layernorm.weight"))
-                .ok_or_else(|| anyhow!("Missing {ln_prefix}.input_layernorm.weight"))?;
-            let post_norm_w = weights.remove(&format!("{ln_prefix}.post_attention_layernorm.weight"))
-                .ok_or_else(|| anyhow!("Missing {ln_prefix}.post_attention_layernorm.weight"))?;
-
-            let layer_type = cfg.layer_types.get(idx).map(|s| s.as_str()).unwrap_or("linear_attention");
-            info!("Loading layer {idx}: {layer_type}");
-
-            let mixer = if layer_type == "full_attention" {
-                let attn_prefix = format!("{layer_prefix}.self_attn");
-                LayerMixer::FullAttn(Qwen3_5FullAttention::load(weights, &attn_prefix, &cfg, idx)?)
-            } else {
-                let lin_prefix = format!("{layer_prefix}.linear_attn");
-                LayerMixer::LinearAttn(GatedDeltaNetLayer::load(weights, &lin_prefix, &cfg, idx)?)
-            };
-
-            let mlp = Self::load_mlp(weights, &format!("{layer_prefix}.mlp"), &cfg, idx)?;
-
-            layers.push(Qwen3_5Layer {
-                mixer,
-                mlp,
-                input_layernorm: Qwen3_5RMSNorm::new(input_norm_w, cfg.rms_norm_eps),
-                post_attention_layernorm: Qwen3_5RMSNorm::new(post_norm_w, cfg.rms_norm_eps),
-            });
+            layers.push(Self::build_layer(weights, &cfg, idx)?);
         }
 
         let lm_head_transposed = if lm_head_w.is_none() {
@@ -1381,10 +1525,17 @@ impl Qwen3_5Model {
             ),
         )));
 
+        // Unsplit fast path: every layer on the one device. This keeps the
+        // whole-model forward byte-identical — `forward_layers` over this
+        // single-device map performs zero cross-device copies (#314).
+        let device_map = LayerDeviceMap::single(*device, num_layers.max(1))?;
+
         Ok(Self {
             config: cfg,
             device: *device,
             dtype,
+            device_map,
+            layer_offset: 0,
             embed_tokens: embed,
             layers,
             norm: Qwen3_5RMSNorm::new(norm_w, 1e-6),
@@ -1473,6 +1624,223 @@ impl Qwen3_5Model {
         }
     }
 
+    /// Build a single decoder layer for **global** index `g`, selecting the
+    /// hybrid mixer (GatedDeltaNet vs full attention) by the *global* per-layer
+    /// type (`cfg.layer_types[g]`). Shared by the whole-model loader and the
+    /// pipeline stage loader — the latter passes the global index so a shard that
+    /// owns `[a..b)` still picks the correct type for each layer it owns.
+    fn build_layer(
+        weights: &mut HashMap<String, Tensor>,
+        cfg: &Qwen3_5TextConfig,
+        g: usize,
+    ) -> Result<Qwen3_5Layer> {
+        let layer_prefix = format!("model.layers.{g}");
+
+        let input_norm_w = weights
+            .remove(&format!("{layer_prefix}.input_layernorm.weight"))
+            .ok_or_else(|| anyhow!("Missing {layer_prefix}.input_layernorm.weight"))?;
+        let post_norm_w = weights
+            .remove(&format!("{layer_prefix}.post_attention_layernorm.weight"))
+            .ok_or_else(|| anyhow!("Missing {layer_prefix}.post_attention_layernorm.weight"))?;
+
+        // Hybrid layer type is selected by GLOBAL index: every Nth layer is full
+        // attention, the rest GatedDeltaNet. A stage owning [a..b) must consult
+        // the global index `g`, not a local one, to load the right mixer.
+        let layer_type = cfg
+            .layer_types
+            .get(g)
+            .map(|s| s.as_str())
+            .unwrap_or("linear_attention");
+        info!("Loading layer {g}: {layer_type}");
+
+        let mixer = if layer_type == "full_attention" {
+            let attn_prefix = format!("{layer_prefix}.self_attn");
+            LayerMixer::FullAttn(Qwen3_5FullAttention::load(weights, &attn_prefix, cfg, g)?)
+        } else {
+            let lin_prefix = format!("{layer_prefix}.linear_attn");
+            LayerMixer::LinearAttn(GatedDeltaNetLayer::load(weights, &lin_prefix, cfg, g)?)
+        };
+
+        let mlp = Self::load_mlp(weights, &format!("{layer_prefix}.mlp"), cfg, g)?;
+
+        Ok(Qwen3_5Layer {
+            mixer,
+            mlp,
+            input_layernorm: Qwen3_5RMSNorm::new(input_norm_w, cfg.rms_norm_eps),
+            post_attention_layernorm: Qwen3_5RMSNorm::new(post_norm_w, cfg.rms_norm_eps),
+        })
+    }
+
+    /// Build a **single pipeline stage** of a Qwen3.5 model (#314, 2b layer-split).
+    ///
+    /// Mirrors `LlamaModel::stage_from_weights_with_config`, plus Qwen3.5's
+    /// specifics:
+    /// - **Hybrid layer type** is chosen by the *global* layer index inside
+    ///   [`Self::build_layer`] (`cfg.layer_types[g]`), so a shard owning `[a..b)`
+    ///   loads the correct GDN/full-attn mixer per global layer.
+    /// - **SSM state** (`conv_states`/`rec_states`) is sized to the OWNED layer
+    ///   count (`layer_range.len()`), indexed by the LOCAL layer index, and is
+    ///   stage-local — never transferred across a pipeline boundary (M-LOAD seam
+    ///   #2). Only `hidden` + `start_pos` cross a boundary.
+    ///
+    /// Non-layer weights are gated by stage position (M-LOAD seam #1):
+    /// - `is_first` (`layer_range.start == 0`)  → keep `embed_tokens`.
+    /// - `is_last`  (`layer_range.end == num_hidden_layers`) → keep `norm` +
+    ///   `lm_head` (or the tied transpose).
+    ///
+    /// Each owned layer is placed on its mapped device (`devices.device_for(g)`)
+    /// via the `into_device` builders — the only placement cost; the forward path
+    /// then performs zero intra-stage copies. Vision weights are out of scope for
+    /// a pipeline stage (text backbone split only).
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_from_weights_with_config(
+        weights: &mut HashMap<String, Tensor>,
+        cfg: Qwen3_5TextConfig,
+        devices: &LayerDeviceMap,
+        layer_range: std::ops::Range<usize>,
+        dtype: Kind,
+        kv_quant_type: KVQuantType,
+    ) -> Result<Self> {
+        let num_global = cfg.num_hidden_layers as usize;
+        if devices.len() != num_global {
+            return Err(anyhow!(
+                "stage_from_weights: device map covers {} layers but config has {} \
+                 (num_hidden_layers)",
+                devices.len(),
+                num_global
+            ));
+        }
+        if layer_range.end > num_global || layer_range.start >= layer_range.end {
+            return Err(anyhow!(
+                "stage_from_weights: invalid layer range {:?} for {} layers",
+                layer_range,
+                num_global
+            ));
+        }
+
+        let is_first = layer_range.start == 0;
+        let is_last = layer_range.end == num_global;
+        let layer_offset = layer_range.start;
+        // Stage device = device of this stage's first owned layer (its inputs and
+        // KV/SSM state live here). `embed_tokens`, when present, lives on the first
+        // stage's first device, which is exactly this when is_first.
+        let stage_device = devices.device_for(layer_range.start);
+
+        // --- Non-layer weights, gated by stage position (M-LOAD seam #1) ---
+        let embed = if is_first {
+            weights
+                .remove("model.embed_tokens.weight")
+                .map(|w| w.to_device(stage_device))
+                .ok_or_else(|| {
+                    anyhow!("stage_from_weights: first stage requires model.embed_tokens.weight")
+                })?
+        } else {
+            // Middle/last stage owns no embedding; a placeholder is never read
+            // (embed_tokens()/forward_inner from-ids paths run only on stage 0).
+            Tensor::zeros([1, cfg.hidden_size as i64], (dtype, stage_device))
+        };
+
+        let (norm, lm_head_w) = if is_last {
+            let norm_w = weights
+                .remove("model.norm.weight")
+                .map(|w| w.to_device(stage_device))
+                .ok_or_else(|| anyhow!("stage_from_weights: last stage requires model.norm.weight"))?;
+            let lm_head_w = weights.remove("lm_head.weight").map(|w| {
+                // Cast FP8 lm_head to BF16 (applying companion scale), mirroring
+                // from_weights. On the test path (plain f32) this is a no-op clone.
+                match w.kind() {
+                    tch::Kind::Float8e4m3fn | tch::Kind::Float8e5m2 => {
+                        let w_bf = w.to_kind(tch::Kind::BFloat16);
+                        if let Some(s) = weights.remove("lm_head.weight_scale_inv") {
+                            let ws = w_bf.size();
+                            let ss = s.size();
+                            let br = ws[0] / ss[0];
+                            let bc = ws[1] / ss[1];
+                            let w_4d = w_bf.view([ss[0], br, ss[1], bc]);
+                            let s_4d = s.to_kind(tch::Kind::BFloat16).view([ss[0], 1i64, ss[1], 1i64]);
+                            (w_4d * s_4d).reshape([ws[0], ws[1]]).to_device(stage_device)
+                        } else {
+                            w_bf.to_device(stage_device)
+                        }
+                    }
+                    _ => w.to_device(stage_device),
+                }
+            });
+            (Some(Qwen3_5RMSNorm::new(norm_w, 1e-6)), lm_head_w)
+        } else {
+            (None, None)
+        };
+
+        // Tied lm_head: only on the last stage, and only if it also holds the
+        // embedding (single-stage model). A multi-stage last shard must ship an
+        // explicit lm_head since it does not own embed_tokens.
+        let lm_head_transposed = if is_last && lm_head_w.is_none() {
+            if !is_first {
+                return Err(anyhow!(
+                    "stage_from_weights: last stage requires lm_head.weight (no tied embedding present)"
+                ));
+            }
+            let embed_bf16 = match embed.kind() {
+                tch::Kind::Float8e4m3fn | tch::Kind::Float8e5m2 => embed.to_kind(tch::Kind::BFloat16),
+                _ => embed.shallow_clone(),
+            };
+            Some(embed_bf16.tr().contiguous())
+        } else {
+            None
+        };
+
+        // --- Owned decoder layers, each on its mapped device (per-layer .to) ---
+        let mut layers = Vec::with_capacity(layer_range.len());
+        for g in layer_range.clone() {
+            let target = devices.device_for(g);
+            let layer = Self::build_layer(weights, &cfg, g)?;
+            layers.push(layer.into_device(target));
+        }
+
+        // SSM + KV state sized to the OWNED layer count (M-LOAD seam #2); indexed
+        // LOCALLY in the forward loop. Stage-local — never crosses a boundary.
+        let owned = layers.len();
+        let conv_states = Arc::new(parking_lot::Mutex::new(
+            (0..owned).map(|_| None::<Tensor>).collect::<Vec<_>>(),
+        ));
+        let rec_states = Arc::new(parking_lot::Mutex::new(
+            (0..owned).map(|_| None::<Tensor>).collect::<Vec<_>>(),
+        ));
+        let kv_cache = Some(Arc::new(parking_lot::Mutex::new(
+            crate::runtime::kv_cache::KVCacheManager::new(
+                owned,
+                cfg.max_position_embeddings as usize,
+                kv_quant_type,
+            ),
+        )));
+
+        let lm_head_norm = norm.unwrap_or_else(|| {
+            // Middle/first stages have no final norm. A placeholder is never
+            // invoked (apply_final_norm runs only on the last stage); sized [1].
+            Qwen3_5RMSNorm::new(Tensor::zeros([1], (dtype, stage_device)), cfg.rms_norm_eps)
+        });
+
+        let device_map = devices.clone();
+
+        Ok(Self {
+            config: cfg,
+            device: stage_device,
+            dtype,
+            device_map,
+            layer_offset,
+            embed_tokens: embed,
+            layers,
+            norm: lm_head_norm,
+            lm_head: lm_head_w,
+            lm_head_transposed,
+            conv_states,
+            rec_states,
+            kv_cache,
+            vision_encoder: None,
+            vision_projector: None,
+        })
+    }
+
     /// Unified forward inner: replaces the old `forward_inner` to avoid
     /// a deadlock that would occur if a no-delta wrapper acquired conv/rec
     /// locks and then delegated to a delta version that also tried to acquire them.
@@ -1499,13 +1867,16 @@ impl Qwen3_5Model {
         };
 
         let (_, seq) = (hidden.size()[0], hidden.size()[1]);
-        let device = self.device;
 
-        // Position IDs for full-attention RoPE
+        // Position IDs for full-attention RoPE. Build on the HIDDEN-state device,
+        // not `self.device` — under a pipeline split (#314) the first owned layer
+        // may have been moved off `self.device`, and a mismatched position_ids
+        // device would fault at SDPA. (llama already does this; see
+        // forward_with_cache_inner.) On the single-device path this is identical.
         let position_ids = Tensor::arange_start(
             start_pos as i64,
             start_pos as i64 + seq,
-            (Kind::Int64, device),
+            (Kind::Int64, hidden.device()),
         );
 
         let mut conv_guard = self.conv_states.lock();
@@ -1532,6 +1903,205 @@ impl Qwen3_5Model {
                     } else {
                         attn.forward(&hidden, Some(&position_ids), None, start_pos, delta_arg)?
                     }
+                }
+            };
+
+            hidden = residual + &mixer_out;
+
+            let residual2 = hidden.shallow_clone();
+            hidden = layer.post_attention_layernorm.forward(&hidden)?;
+            hidden = layer.mlp.forward(&hidden)?;
+            hidden = residual2 + &hidden;
+        }
+        Ok(hidden)
+    }
+
+    /// Run global decoder layers `[range.start..range.end)` — the 2b pipeline
+    /// layer-range runner (#314). See the trait docs for the stage contract.
+    ///
+    /// Mirrors `LlamaModel::forward_layers_inner`, plus Qwen3.5's hybrid mixers
+    /// and second (SSM) state vector:
+    /// - Global layer `g` is remapped to its local slot `g - layer_offset` for
+    ///   `self.layers`, the KV cache, and the `conv`/`rec` SSM state (all sized to
+    ///   the owned layer count).
+    /// - Per-layer GDN-vs-full-attention dispatch is intrinsic to the loaded
+    ///   `LayerMixer`, so no global `layer_types` lookup is needed at runtime.
+    /// - The lone cross-device copy is `hidden.to_device(next)` (carrying
+    ///   `position_ids` with it), inserted only when the next layer's mapped device
+    ///   differs from where `hidden` currently lives. SSM `conv`/`rec` state is
+    ///   stage-local and never transferred across a boundary.
+    fn forward_layers_inner(
+        &self,
+        hidden: &Tensor,
+        range: std::ops::Range<usize>,
+        start_pos: usize,
+        delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        let num_global = self.config.num_hidden_layers as usize;
+        if range.end > num_global || range.start >= range.end {
+            return Err(anyhow!(
+                "forward_layers: invalid global range {range:?} for {num_global} layers"
+            ));
+        }
+        // The owned window must contain the requested range.
+        let owned = self.layer_offset..self.layer_offset + self.layers.len();
+        if range.start < owned.start || range.end > owned.end {
+            return Err(anyhow!(
+                "forward_layers: range {range:?} not within this stage's owned layers {owned:?}"
+            ));
+        }
+
+        let mut hidden = hidden.shallow_clone();
+
+        // position_ids recomputed from start_pos + seq (never carried across a
+        // boundary as state). Built on the *input* device (the first owned
+        // layer's), then moved alongside `hidden` at a device boundary so RoPE /
+        // SDPA always see a matching device.
+        let seq = hidden.size()[1];
+        let mut position_ids = Tensor::arange_start(
+            start_pos as i64,
+            start_pos as i64 + seq,
+            (Kind::Int64, hidden.device()),
+        );
+
+        let mut conv_guard = self.conv_states.lock();
+        let mut rec_guard = self.rec_states.lock();
+
+        for g in range {
+            let local_idx = g - self.layer_offset;
+
+            // The single cross-device transfer: only when this layer's device
+            // differs from where `hidden` currently is (zero-copy otherwise).
+            let target = self.device_map.device_for(g);
+            if hidden.device() != target {
+                hidden = hidden.to_device(target);
+                position_ids = position_ids.to_device(target);
+            }
+
+            let layer = &self.layers[local_idx];
+            let residual = hidden.shallow_clone();
+            hidden = layer.input_layernorm.forward(&hidden)?;
+
+            // Delta module lookup uses the GLOBAL layer index (per-layer LoRA is
+            // keyed by global layer, matching whole-model inference).
+            let delta_arg = delta.map(|d| (d, g));
+
+            let mixer_out = match &layer.mixer {
+                LayerMixer::LinearAttn(gdn) => {
+                    // SSM conv/rec state indexed LOCALLY; stage-local, not moved.
+                    gdn.forward(
+                        &hidden,
+                        &mut conv_guard[local_idx],
+                        &mut rec_guard[local_idx],
+                        delta_arg,
+                    )?
+                }
+                LayerMixer::FullAttn(attn) => {
+                    if let Some(ref cache_arc) = self.kv_cache {
+                        let kv = cache_arc.lock();
+                        kv.with_layer_cache(local_idx, |lc| {
+                            attn.forward(&hidden, Some(&position_ids), Some(lc), start_pos, delta_arg)
+                        })
+                        .ok_or_else(|| anyhow!("No KV cache for local layer {local_idx}"))??
+                    } else {
+                        attn.forward(&hidden, Some(&position_ids), None, start_pos, delta_arg)?
+                    }
+                }
+            };
+
+            hidden = residual + &mixer_out;
+
+            let residual2 = hidden.shallow_clone();
+            hidden = layer.post_attention_layernorm.forward(&hidden)?;
+            hidden = layer.mlp.forward(&hidden)?;
+            hidden = residual2 + &hidden;
+        }
+        Ok(hidden)
+    }
+
+    /// Training-path sibling of [`Self::forward_layers_inner`] — the cross-device
+    /// autograd primitive for TTT-on-split (#316). See the trait
+    /// `forward_layers_train` docs for the contract.
+    ///
+    /// Differs from the inference runner in three deliberate ways:
+    /// - **no KV cache** — full-attention layers run with full causal attention
+    ///   over the entire context (`start_pos = 0`, no cache);
+    /// - **`start_pos = 0`** — `position_ids = 0..seq`;
+    /// - **fresh, call-local recurrent (SSM) state** — `conv`/`rec` start at
+    ///   `None` for every owned layer and are never written back to
+    ///   `self.conv_states` / `self.rec_states`. This keeps a TTT step from
+    ///   polluting the persistent inference recurrent state, and makes the split
+    ///   numerically identical to the whole-model training forward (per-layer
+    ///   recurrent state never crosses a layer boundary, so partitioning the layer
+    ///   range is exact).
+    ///
+    /// The lone cross-device `hidden.to_device(next)` (carrying `position_ids`) is
+    /// autograd-transparent, so `loss.backward()` materializes grads on each
+    /// parameter's own device.
+    fn forward_layers_train_inner(
+        &self,
+        hidden: &Tensor,
+        range: std::ops::Range<usize>,
+        delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        let num_global = self.config.num_hidden_layers as usize;
+        if range.end > num_global || range.start >= range.end {
+            return Err(anyhow!(
+                "forward_layers_train: invalid global range {range:?} for {num_global} layers"
+            ));
+        }
+        let owned = self.layer_offset..self.layer_offset + self.layers.len();
+        if range.start < owned.start || range.end > owned.end {
+            return Err(anyhow!(
+                "forward_layers_train: range {range:?} not within this stage's owned layers {owned:?}"
+            ));
+        }
+
+        let mut hidden = hidden.shallow_clone();
+
+        // Training path: start_pos is always 0 → position_ids = 0..seq, built on
+        // the input device and moved alongside `hidden` at each device boundary.
+        let seq = hidden.size()[1];
+        let mut position_ids =
+            Tensor::arange(seq, (Kind::Int64, hidden.device()));
+
+        // Fresh, call-local SSM state — never touches the persistent inference
+        // `conv_states`/`rec_states`. Sized to the OWNED layer count and indexed
+        // locally, mirroring the persistent vectors' sizing.
+        let mut conv_local: Vec<Option<Tensor>> =
+            (0..self.layers.len()).map(|_| None).collect();
+        let mut rec_local: Vec<Option<Tensor>> =
+            (0..self.layers.len()).map(|_| None).collect();
+
+        for g in range {
+            let local_idx = g - self.layer_offset;
+
+            // The single cross-device transfer (autograd-transparent): only when
+            // this layer's mapped device differs from where `hidden` currently is.
+            let target = self.device_map.device_for(g);
+            if hidden.device() != target {
+                hidden = hidden.to_device(target);
+                position_ids = position_ids.to_device(target);
+            }
+
+            let layer = &self.layers[local_idx];
+            let residual = hidden.shallow_clone();
+            hidden = layer.input_layernorm.forward(&hidden)?;
+
+            // Delta module lookup uses the GLOBAL layer index (per-layer LoRA is
+            // keyed by global layer, matching whole-model training).
+            let delta_arg = delta.map(|d| (d, g));
+
+            let mixer_out = match &layer.mixer {
+                LayerMixer::LinearAttn(gdn) => gdn.forward(
+                    &hidden,
+                    &mut conv_local[local_idx],
+                    &mut rec_local[local_idx],
+                    delta_arg,
+                )?,
+                LayerMixer::FullAttn(attn) => {
+                    // No KV cache (training): full causal attention, start_pos = 0.
+                    attn.forward(&hidden, Some(&position_ids), None, 0, delta_arg)?
                 }
             };
 
@@ -1769,6 +2339,25 @@ impl ModelOperations for Qwen3_5Model {
         self.config.num_hidden_layers as usize
     }
 
+    fn forward_layers(
+        &self,
+        hidden: &Tensor,
+        range: std::ops::Range<usize>,
+        start_pos: usize,
+        delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        self.forward_layers_inner(hidden, range, start_pos, delta)
+    }
+
+    fn forward_layers_train(
+        &self,
+        hidden: &Tensor,
+        range: std::ops::Range<usize>,
+        delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        self.forward_layers_train_inner(hidden, range, delta)
+    }
+
     fn decode_layer(
         &self,
         layer_idx: usize,
@@ -1855,5 +2444,451 @@ impl ModelOperations for Qwen3_5Model {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod pipeline_tests {
+    //! CPU equivalence tests for the 2b pipeline layer-split (#314).
+    //!
+    //! These prove that running qwen3_5's hybrid (GatedDeltaNet + full-attention)
+    //! decoder stack via `forward_layers` — whole-range AND split into two stages
+    //! over an all-CPU [`LayerDeviceMap`] — reproduces the whole-model forward to
+    //! float-reassociation tolerance. The split must hold even though each GDN
+    //! layer carries its own stage-local SSM (`conv`/`rec`) state: if the SSM
+    //! state threading were wrong, the two-stage result would diverge.
+    use super::*;
+    use crate::runtime::device_pool::LayerDeviceMap;
+
+    const HIDDEN: i64 = 16;
+    const HEADS: i64 = 2;
+    const KV_HEADS: i64 = 2;
+    const HEAD_DIM: i64 = 8;
+    const INTER: i64 = 32;
+    const VOCAB: i64 = 48;
+    const LAYERS: usize = 4;
+    // GatedDeltaNet dims (kept tiny + symmetric: num_k_heads == num_v_heads).
+    const LIN_K_HEADS: usize = 1;
+    const LIN_V_HEADS: usize = 1;
+    const LIN_K_DIM: usize = 4;
+    const LIN_V_DIM: usize = 4;
+    const CONV_KERNEL: usize = 4;
+
+    fn tiny_config() -> Qwen3_5TextConfig {
+        // Default hybrid pattern: layer (i+1)%4==0 is full attention, rest GDN.
+        // With LAYERS=4 → [GDN, GDN, GDN, FullAttn]; a split at 2 puts the full-
+        // attention layer in the second stage, exercising both mixer kinds across
+        // the stage boundary.
+        let layer_types = (0..LAYERS)
+            .map(|i| {
+                if (i + 1) % 4 == 0 {
+                    "full_attention".to_owned()
+                } else {
+                    "linear_attention".to_owned()
+                }
+            })
+            .collect();
+        let rotary_dim = ((HEAD_DIM as f32) * 0.25) as usize; // 2
+        Qwen3_5TextConfig {
+            hidden_size: HIDDEN as u32,
+            num_hidden_layers: LAYERS as u32,
+            num_attention_heads: HEADS as u32,
+            num_key_value_heads: KV_HEADS as u32,
+            head_dim: HEAD_DIM as u32,
+            intermediate_size: INTER as u32,
+            vocab_size: VOCAB as u32,
+            max_position_embeddings: 64,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            partial_rotary_factor: 0.25,
+            rotary_dim,
+            layer_types,
+            linear_conv_kernel_dim: CONV_KERNEL,
+            linear_key_head_dim: LIN_K_DIM,
+            linear_value_head_dim: LIN_V_DIM,
+            linear_num_key_heads: LIN_K_HEADS,
+            linear_num_value_heads: LIN_V_HEADS,
+            is_moe: false,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            moe_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
+            has_vision: false,
+            vision_out_hidden_size: 0,
+        }
+    }
+
+    /// Deterministic, RNG-free weights on CPU/f32. tch's global RNG is shared
+    /// across parallel tests, so a `randn`-based build could interleave and
+    /// diverge between the whole-model and staged paths; a fixed sin-of-index
+    /// pattern is byte-identical regardless of scheduling. HF stores projections
+    /// as `[out, in]` (LinearProjection::take transposes to `[in, out]`).
+    fn tiny_weights() -> HashMap<String, Tensor> {
+        let opt = (Kind::Float, Device::Cpu);
+        let mut w = HashMap::new();
+        // Bounded small values in roughly [-0.05, 0.05], offset per-tensor so
+        // different weights are not identical.
+        let mut seed: i64 = 0;
+        let mut pat = |dims: &[i64]| -> Tensor {
+            let n: i64 = dims.iter().product();
+            seed += 7;
+            (Tensor::arange(n, opt) * 0.017 + seed as f64 * 0.013)
+                .sin()
+                .reshape(dims)
+                * 0.05
+        };
+
+        w.insert("model.embed_tokens.weight".to_owned(), pat(&[VOCAB, HIDDEN]));
+        w.insert("model.norm.weight".to_owned(), pat(&[HIDDEN]));
+        w.insert("lm_head.weight".to_owned(), pat(&[VOCAB, HIDDEN]));
+
+        let key_dim = (LIN_K_HEADS * LIN_K_DIM) as i64;
+        let val_dim = (LIN_V_HEADS * LIN_V_DIM) as i64;
+        let conv_dim = key_dim * 2 + val_dim;
+        let nv = LIN_V_HEADS as i64;
+
+        for i in 0..LAYERS {
+            let p = format!("model.layers.{i}");
+            w.insert(format!("{p}.input_layernorm.weight"), pat(&[HIDDEN]));
+            w.insert(format!("{p}.post_attention_layernorm.weight"), pat(&[HIDDEN]));
+
+            let is_full = (i + 1) % 4 == 0;
+            if is_full {
+                // Full attention: q_proj out = nh*hd*2 (q + gate), k/v out = nkv*hd.
+                let ap = format!("{p}.self_attn");
+                w.insert(format!("{ap}.q_proj.weight"), pat(&[HEADS * HEAD_DIM * 2, HIDDEN]));
+                w.insert(format!("{ap}.k_proj.weight"), pat(&[KV_HEADS * HEAD_DIM, HIDDEN]));
+                w.insert(format!("{ap}.v_proj.weight"), pat(&[KV_HEADS * HEAD_DIM, HIDDEN]));
+                w.insert(format!("{ap}.o_proj.weight"), pat(&[HIDDEN, HEADS * HEAD_DIM]));
+                w.insert(format!("{ap}.q_norm.weight"), pat(&[HEAD_DIM]));
+                w.insert(format!("{ap}.k_norm.weight"), pat(&[HEAD_DIM]));
+            } else {
+                // GatedDeltaNet: 4 input projections fused at load.
+                let lp = format!("{p}.linear_attn");
+                w.insert(format!("{lp}.in_proj_qkv.weight"), pat(&[conv_dim, HIDDEN]));
+                w.insert(format!("{lp}.in_proj_z.weight"), pat(&[val_dim, HIDDEN]));
+                w.insert(format!("{lp}.in_proj_b.weight"), pat(&[nv, HIDDEN]));
+                w.insert(format!("{lp}.in_proj_a.weight"), pat(&[nv, HIDDEN]));
+                // conv1d_weight stays raw [conv_dim, 1, kernel_size] (not transposed).
+                w.insert(format!("{lp}.conv1d.weight"), pat(&[conv_dim, 1, CONV_KERNEL as i64]));
+                w.insert(format!("{lp}.A_log"), pat(&[nv]));
+                w.insert(format!("{lp}.dt_bias"), pat(&[nv]));
+                w.insert(format!("{lp}.norm.weight"), pat(&[LIN_V_DIM as i64]));
+                w.insert(format!("{lp}.out_proj.weight"), pat(&[HIDDEN, val_dim]));
+            }
+
+            // Dense MLP.
+            let mp = format!("{p}.mlp");
+            w.insert(format!("{mp}.gate_proj.weight"), pat(&[INTER, HIDDEN]));
+            w.insert(format!("{mp}.up_proj.weight"), pat(&[INTER, HIDDEN]));
+            w.insert(format!("{mp}.down_proj.weight"), pat(&[HIDDEN, INTER]));
+        }
+        w
+    }
+
+    fn whole_model() -> Qwen3_5Model {
+        let mut w = tiny_weights();
+        Qwen3_5Model::from_weights(
+            &mut w, tiny_config(), None, &Device::Cpu, Kind::Float, KVQuantType::None,
+        )
+        .unwrap()
+    }
+
+    /// Drive the pipeline path on one model the way an engine would:
+    /// embed → forward_layers(0..N) → final norm → lm_head.
+    fn orchestrated_logits(m: &Qwen3_5Model, input: &Tensor) -> Tensor {
+        let emb = m.embed_tokens(input).unwrap();
+        let h = m.forward_layers(&emb, 0..m.num_layers(), 0, None).unwrap();
+        let h = m.apply_final_norm(&h).unwrap();
+        m.lm_head(&h).unwrap()
+    }
+
+    #[test]
+    fn forward_layers_full_range_matches_whole_model_forward() {
+        // An all-CPU LayerDeviceMap means forward_layers(0..N) must equal the
+        // whole-model single-device forward (the byte-identity equivalence test).
+        let input = Tensor::from_slice(&[1i64, 5, 9, 2]).reshape([1, 4]);
+
+        // Reference: whole-model forward over the full sequence (NOT
+        // forward_with_cache, which only returns the last position's logits).
+        let reference = whole_model();
+        let ref_logits = reference.forward(&input, None).unwrap();
+
+        // Pipeline path on a fresh model (independent SSM/KV state), full range
+        // over the implicit single-device map.
+        let piped = whole_model();
+        let pipe_logits = orchestrated_logits(&piped, &input);
+
+        let max_diff = (&ref_logits - &pipe_logits).abs().max().double_value(&[]);
+        assert!(
+            ref_logits.allclose(&pipe_logits, 1e-4, 1e-4, false),
+            "forward_layers(0..N) over a single-device map must equal whole-model forward \
+             (max_diff={max_diff}, shape={:?})",
+            ref_logits.size()
+        );
+        assert!(piped.device_map.is_single_device());
+        assert_eq!(piped.layer_offset, 0);
+    }
+
+    #[test]
+    fn staged_split_equals_whole_model() {
+        // Build TWO stages over an all-CPU 2-way split and run them as a pipeline:
+        // stage0: embed → forward_layers(0..k); stage1: forward_layers(k..N) →
+        // norm → lm_head. The split point (k=2) puts the full-attention layer in
+        // stage1, so this exercises the global↔local remap, is_first/is_last
+        // gating, per-global-index hybrid layer selection, and — critically —
+        // that each stage's GDN SSM state is sized to its OWNED layer count and
+        // indexed locally. Result must equal the whole-model forward.
+        let input = Tensor::from_slice(&[3i64, 7, 1, 4]).reshape([1, 4]);
+
+        let reference = whole_model();
+        let ref_logits = reference.forward(&input, None).unwrap();
+
+        let map = LayerDeviceMap::single(Device::Cpu, LAYERS).unwrap();
+        let split = LAYERS / 2;
+
+        let mut w0 = tiny_weights();
+        let stage0 = Qwen3_5Model::stage_from_weights_with_config(
+            &mut w0, tiny_config(), &map, 0..split, Kind::Float, KVQuantType::None,
+        )
+        .unwrap();
+        assert_eq!(stage0.layer_offset, 0);
+        assert_eq!(stage0.layers.len(), split, "stage0 owns exactly its layers");
+        assert!(stage0.lm_head.is_none(), "first (non-last) stage has no head");
+        // SSM state sized to OWNED count, not global.
+        assert_eq!(stage0.conv_states.lock().len(), split);
+        assert_eq!(stage0.rec_states.lock().len(), split);
+
+        let mut w1 = tiny_weights();
+        let stage1 = Qwen3_5Model::stage_from_weights_with_config(
+            &mut w1, tiny_config(), &map, split..LAYERS, Kind::Float, KVQuantType::None,
+        )
+        .unwrap();
+        assert_eq!(stage1.layer_offset, split);
+        assert_eq!(stage1.layers.len(), LAYERS - split);
+        assert_eq!(stage1.conv_states.lock().len(), LAYERS - split);
+
+        // Drive the pipeline. Only `hidden` crosses the (same-device) boundary;
+        // each stage's SSM state stays local.
+        let emb = stage0.embed_tokens(&input).unwrap();
+        let h0 = stage0.forward_layers(&emb, 0..split, 0, None).unwrap();
+        let h1 = stage1.forward_layers(&h0, split..LAYERS, 0, None).unwrap();
+        let h1 = stage1.apply_final_norm(&h1).unwrap();
+        let logits = stage1.lm_head(&h1).unwrap();
+
+        let max_diff = (&ref_logits - &logits).abs().max().double_value(&[]);
+        assert!(
+            ref_logits.allclose(&logits, 1e-4, 1e-4, false),
+            "two-stage split (same device) must equal whole-model forward \
+             (max_diff={max_diff}); a mismatch here means the stage-local SSM state \
+             threading is wrong"
+        );
+    }
+
+    #[test]
+    fn forward_layers_rejects_out_of_window_range() {
+        // A stage that owns [2..4) must reject a range outside its window.
+        let map = LayerDeviceMap::single(Device::Cpu, LAYERS).unwrap();
+        let mut w = tiny_weights();
+        let stage = Qwen3_5Model::stage_from_weights_with_config(
+            &mut w, tiny_config(), &map, 2..LAYERS, Kind::Float, KVQuantType::None,
+        )
+        .unwrap();
+        let emb = Tensor::randn([1, 3, HIDDEN], (Kind::Float, Device::Cpu));
+        assert!(stage.forward_layers(&emb, 0..2, 0, None).is_err(), "range below window");
+        assert!(stage.forward_layers(&emb, 2..LAYERS, 0, None).is_ok(), "owned range ok");
+    }
+
+    #[test]
+    fn stage_loader_rejects_missing_required_weights() {
+        // Last stage with no norm weight must error (M-LOAD seam #1 gating).
+        let map = LayerDeviceMap::single(Device::Cpu, LAYERS).unwrap();
+        let mut w = tiny_weights();
+        w.remove("model.norm.weight");
+        let result = Qwen3_5Model::stage_from_weights_with_config(
+            &mut w, tiny_config(), &map, 0..LAYERS, Kind::Float, KVQuantType::None,
+        );
+        match result {
+            Ok(_) => panic!("last stage without norm weight must error"),
+            Err(e) => assert!(e.to_string().contains("norm"), "got: {e}"),
+        }
+    }
+
+    // ========================================================================
+    // #316 — TTT-on-split cross-device autograd equivalence (CPU-verifiable),
+    // exercising the hybrid GDN + full-attention stack across a stage boundary.
+    // ========================================================================
+
+    use crate::training::tenant_delta::{TenantDelta, TenantDeltaConfig};
+
+    /// Per-layer o_proj LoRA delta on CPU. o_proj is the one module BOTH mixer
+    /// kinds inject (GDN out_proj: in=val_dim; full-attn: in=nh*hd), so its dims
+    /// differ per layer type — supplied via per_layer_dims (mirrors
+    /// `TorchEngine::get_per_layer_lora_dims`). Seeds deterministic non-zero A and
+    /// B so gradients w.r.t. both are non-trivial.
+    fn tiny_delta() -> TenantDelta {
+        let hidden = HIDDEN as usize;
+        let gdn_in = LIN_V_HEADS * LIN_V_DIM; // out_proj input dim for GDN layers
+        let full_in = (HEADS * HEAD_DIM) as usize; // o_proj input dim for full-attn layers
+        let mut per_layer: std::collections::HashMap<usize, std::collections::HashMap<String, (usize, usize)>> =
+            std::collections::HashMap::new();
+        for i in 0..LAYERS {
+            let is_full = (i + 1) % 4 == 0;
+            let mut m = std::collections::HashMap::new();
+            let in_dim = if is_full { full_in } else { gdn_in };
+            m.insert("o_proj".to_owned(), (in_dim, hidden));
+            per_layer.insert(i, m);
+        }
+        let cfg = TenantDeltaConfig {
+            rank: 2,
+            alpha: 2.0,
+            target_modules: vec!["o_proj".to_owned()],
+            ..Default::default()
+        };
+        let flat: std::collections::HashMap<String, (usize, usize)> = std::collections::HashMap::new();
+        let delta = TenantDelta::new_with_per_layer_dims(
+            &cfg, &flat, Device::Cpu, LAYERS, Some(&per_layer),
+        ).unwrap();
+
+        // Seed by a STABLE per-key offset (HashMap iteration order is not
+        // deterministic, so independent builds must agree key-for-key).
+        let key_offset = |key: &str| -> i64 {
+            key.bytes().map(|b| b as i64).sum::<i64>() % 17
+        };
+        let _g = tch::no_grad_guard();
+        for (k, a) in delta.lora_a.iter() {
+            let n: i64 = a.size().iter().product();
+            let vals = (Tensor::arange(n, (Kind::Float, Device::Cpu)) + key_offset(k)).sin() * 0.1;
+            // copy_ needs &mut; shallow_clone shares storage so the delta param is mutated.
+            a.shallow_clone().copy_(&vals.reshape(a.size()));
+        }
+        for (k, b) in delta.lora_b.iter() {
+            let n: i64 = b.size().iter().product();
+            let vals = (Tensor::arange(n, (Kind::Float, Device::Cpu)) + key_offset(k) + 7).cos() * 0.1;
+            b.shallow_clone().copy_(&vals.reshape(b.size()));
+        }
+        delta
+    }
+
+    fn grad_snapshot(delta: &TenantDelta) -> std::collections::HashMap<String, f64> {
+        let mut out = std::collections::HashMap::new();
+        for (k, a) in &delta.lora_a {
+            assert!(a.grad().defined(), "A grad undefined for {k}");
+            out.insert(format!("A:{k}"), a.grad().norm().double_value(&[]));
+        }
+        for (k, b) in &delta.lora_b {
+            assert!(b.grad().defined(), "B grad undefined for {k}");
+            out.insert(format!("B:{k}"), b.grad().norm().double_value(&[]));
+        }
+        out
+    }
+
+    /// The #316 correctness guardrail for the hybrid architecture: a TTT/training
+    /// step (forward_layers_train → NTP loss → backward) over a two-stage CPU split
+    /// must produce the SAME delta gradients as the whole-model training forward,
+    /// within ~1e-4. The split point (k=2) keeps the full-attention layer in stage1
+    /// and GDN layers in stage0, so this proves cross-device autograd is correct
+    /// across both mixer kinds AND the (fresh, stage-local) SSM state threading.
+    #[test]
+    fn ttt_split_autograd_matches_whole_model_grads() {
+        use crate::training::pipeline::{compute_ntp_loss_split, TrainStage};
+
+        let input = Tensor::from_slice(&[3i64, 7, 1, 4, 9, 2]).reshape([1, 6]);
+
+        // (a) whole-model training forward over a single-device map.
+        let whole = whole_model();
+        let whole_delta = tiny_delta();
+        let whole_stage = [TrainStage { model: &whole, range: 0..LAYERS }];
+        let loss_whole = compute_ntp_loss_split(&whole_stage, &input, Some(&whole_delta)).unwrap();
+        loss_whole.backward();
+        let whole_grads = grad_snapshot(&whole_delta);
+        whole_delta.zero_grad();
+
+        // (b) two-stage split over an all-CPU map.
+        let map = LayerDeviceMap::single(Device::Cpu, LAYERS).unwrap();
+        let split = LAYERS / 2;
+        let mut w0 = tiny_weights();
+        let stage0 = Qwen3_5Model::stage_from_weights_with_config(
+            &mut w0, tiny_config(), &map, 0..split, Kind::Float, KVQuantType::None,
+        ).unwrap();
+        let mut w1 = tiny_weights();
+        let stage1 = Qwen3_5Model::stage_from_weights_with_config(
+            &mut w1, tiny_config(), &map, split..LAYERS, Kind::Float, KVQuantType::None,
+        ).unwrap();
+        let split_delta = tiny_delta();
+        let stages = [
+            TrainStage { model: &stage0, range: 0..split },
+            TrainStage { model: &stage1, range: split..LAYERS },
+        ];
+        let loss_split = compute_ntp_loss_split(&stages, &input, Some(&split_delta)).unwrap();
+        loss_split.backward();
+        let split_grads = grad_snapshot(&split_delta);
+
+        let lw = loss_whole.double_value(&[]);
+        let ls = loss_split.double_value(&[]);
+        assert!((lw - ls).abs() < 1e-4, "loss diverged: whole={lw} split={ls}");
+
+        assert_eq!(whole_grads.len(), split_grads.len());
+        for (k, &gw) in &whole_grads {
+            let gs = *split_grads.get(k).unwrap_or_else(|| panic!("missing grad {k}"));
+            assert!(
+                (gw - gs).abs() <= 1e-4 + 1e-4 * gw.abs(),
+                "grad norm diverged for {k}: whole={gw} split={gs}"
+            );
+            assert!(gw > 0.0, "grad for {k} is zero — autograd path not exercised");
+        }
+    }
+
+    /// #440 regression guard: BF16 base model + fp32 TTT/LoRA delta must NOT panic
+    /// in the delta-injection path (the #139 class of dtype mismatch).
+    ///
+    /// The base model is built BF16 (`Kind::BFloat16`) while `tiny_delta()` builds
+    /// an fp32 delta (matching `ttn_profile.rs` forcing `Kind::Float`). Before the
+    /// #440 fix the qwen3_5 delta adds (`q_proj`/`v_proj`/`o_proj`) added fp32
+    /// directly to bf16 activations → `addmm_impl_cpu_` panic. This drives a full
+    /// forward through both mixer kinds (GDN + full-attn) with the delta active.
+    #[test]
+    fn forward_with_bf16_base_and_fp32_delta_does_not_panic() {
+        let _g = tch::no_grad_guard();
+        let dtype = Kind::BFloat16;
+
+        // Build the model in BF16 (cast tiny_weights to bf16 first).
+        let mut w = tiny_weights();
+        for (_k, t) in w.iter_mut() {
+            *t = t.to_kind(dtype);
+        }
+        let model = Qwen3_5Model::from_weights(
+            &mut w, tiny_config(), None, &Device::Cpu, dtype, KVQuantType::None,
+        )
+        .unwrap();
+
+        // fp32 delta (tiny_delta builds Kind::Float A/B), exercising o_proj on both
+        // mixer kinds across all layers.
+        let delta = tiny_delta();
+
+        let input = Tensor::from_slice(&[3i64, 7, 1, 4, 9, 2]).reshape([1, 6]);
+        let emb = model.embed_tokens(&input).unwrap();
+        assert_eq!(emb.kind(), dtype, "bf16 embeddings");
+
+        // The forward with delta must not panic on bf16 + fp32 mismatch...
+        let out = model
+            .forward_layers(&emb, 0..LAYERS, 0, Some(&delta))
+            .expect("bf16 base + fp32 delta forward must not error");
+        // ...and must remain in the base (bf16) dtype.
+        assert_eq!(out.kind(), dtype, "delta-injected forward must stay bf16");
+        assert!(out.isfinite().all().int64_value(&[]) == 1, "output must be finite");
+    }
+
+    #[test]
+    fn forward_layers_train_rejects_out_of_window_range() {
+        let map = LayerDeviceMap::single(Device::Cpu, LAYERS).unwrap();
+        let mut w = tiny_weights();
+        let stage = Qwen3_5Model::stage_from_weights_with_config(
+            &mut w, tiny_config(), &map, 2..LAYERS, Kind::Float, KVQuantType::None,
+        ).unwrap();
+        let emb = Tensor::randn([1, 3, HIDDEN], (Kind::Float, Device::Cpu));
+        assert!(stage.forward_layers_train(&emb, 0..2, None).is_err(), "range below window");
+        assert!(stage.forward_layers_train(&emb, 2..LAYERS, None).is_ok(), "owned range ok");
     }
 }

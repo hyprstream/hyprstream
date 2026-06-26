@@ -95,6 +95,8 @@ impl<T: P9Transport + 'static> Mount for WanixMount<T> {
             .map_err(|e| MountError::Io(e.to_string()))?;
         Ok(Stat {
             qtype: qid.qtype,
+            version: qid.version,
+            path: qid.path,
             size,
             name: String::new(), // name comes from walk, not stat
             mtime,

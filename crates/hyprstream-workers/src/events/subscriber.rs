@@ -60,6 +60,26 @@ impl EventSubscriber {
         self.inner.unsubscribe(pattern)
     }
 
+    /// Subscribe to a single model OID's per-OID publication track (#393).
+    ///
+    /// The subscriber scopes to `local/events/publications/{oid_hash}` and
+    /// receives only events published for `oid` — not the whole firehose. This
+    /// is mutually exclusive with [`Self::subscribe`] / [`Self::subscribe_all`]
+    /// and must be called before the first `recv()`.
+    pub fn subscribe_oid(&mut self, oid: &str) -> Result<()> {
+        self.inner.subscribe_oid(oid)
+    }
+
+    /// Set the late-join retention mode (#393 decision A: firehose-backfill).
+    ///
+    /// On first `recv()`, a [`BackfillMode::FirehoseBackfill`] subscriber asks
+    /// its [`BackfillSource`] for `oid` history and replays it before going live.
+    /// If the source is unavailable the subscriber silently degrades to
+    /// live-only (never fails). Must be called before the first `recv()`.
+    pub fn with_backfill(&mut self, mode: hyprstream_rpc::moq_event::BackfillMode) -> Result<()> {
+        self.inner.with_backfill(mode)
+    }
+
     /// Receive the next event asynchronously.
     ///
     /// Returns `(topic, payload)`. Blocks until an event arrives.

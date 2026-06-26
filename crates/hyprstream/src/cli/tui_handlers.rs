@@ -152,7 +152,11 @@ async fn run_attach_loop(
     // StreamOpt is `Retention::Live`). `select_reach` only reorders the
     // service-advertised reach, so this never invents/forces a reach.
     let qos = hyprstream_rpc::stream_info::StreamOpt::default();
-    let mut handle = MoqStreamHandle::networked(reach, &qos, broadcast_path, mac_key, topic);
+    // #321: the TUI stdout stream is published AEAD-off (the viewer gets only
+    // `mac_key`+`topic` out of band), so the transport enc_key is never exercised
+    // here — derive a stable one from mac_key purely to satisfy the consumer API.
+    let enc_key = *hyprstream_rpc::crypto::StreamKeys::new(topic.clone(), mac_key).enc_key;
+    let mut handle = MoqStreamHandle::networked(reach, &qos, broadcast_path, mac_key, enc_key, topic);
     let recv_handle = tokio::spawn(async move {
         loop {
             match handle.recv_next().await {
