@@ -29,7 +29,12 @@ wasm-bindgen-futures = "0.4"
 serde-wasm-bindgen = "0.6"
 js-sys = "0.3"
 console_error_panic_hook = "0.1"
-web-sys = { version = "0.3", features = ["console"] }
+web-sys = { version = "0.3", features = [
+  "console",
+  "Worker",
+  "WorkerOptions",
+  "WorkerType",
+] }
 # #409 Path B: WanixMount (Wanix-native VFS via 9P2000.L over SharedArrayBuffer
 # DMA). Only needed on the browser target; the DMA + WanixMount modules in
 # hyprstream-9p are themselves `#[cfg(target_arch = "wasm32")]`.

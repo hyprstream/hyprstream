@@ -169,3 +169,5 @@ pub mod stream_mount;
 pub mod wasm_exports;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_rpc_client;
+#[cfg(target_arch = "wasm32")]
+pub mod moq_worker;
