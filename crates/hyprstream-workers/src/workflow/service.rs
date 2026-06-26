@@ -1,6 +1,7 @@
 //! WorkflowService - RequestService implementation for workflow orchestration
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
@@ -90,6 +91,12 @@ pub struct WorkflowService {
     /// Per-repo workflow subscriptions (O(1) lookup)
     repo_workflows: RwLock<HashMap<String, Vec<WorkflowSubscription>>>,
 
+    /// Registered repo paths (repo_id → filesystem root)
+    repo_paths: RwLock<HashMap<String, PathBuf>>,
+
+    /// Active subscriptions (sub_id → WorkflowSubscription)
+    subscriptions: RwLock<HashMap<String, WorkflowSubscription>>,
+
     /// Event handlers for different event types
     handlers: RwLock<Vec<Box<dyn EventHandler>>>,
 
@@ -124,6 +131,8 @@ impl WorkflowService {
             workflows: RwLock::new(HashMap::new()),
             runs: Arc::new(RwLock::new(HashMap::new())),
             repo_workflows: RwLock::new(HashMap::new()),
+            repo_paths: RwLock::new(HashMap::new()),
+            subscriptions: RwLock::new(HashMap::new()),
             handlers: RwLock::new(Vec::new()),
             event_loop_handle: tokio::sync::Mutex::new(None),
             transport,
@@ -131,6 +140,15 @@ impl WorkflowService {
             authorize_fn: None,
             runner: None,
         }
+    }
+
+    /// Register the filesystem root for a repo_id.
+    ///
+    /// Once registered, `scan_repo(repo_id)` will glob
+    /// `<root>/.github/workflows/*.yml` to discover workflows.
+    pub async fn register_repo_path(&self, repo_id: impl Into<String>, path: PathBuf) {
+        let mut repo_paths = self.repo_paths.write().await;
+        repo_paths.insert(repo_id.into(), path);
     }
 
     /// Set the VFS namespace for workflow execution.
@@ -146,10 +164,22 @@ impl WorkflowService {
         self.authorize_fn = Some(authorize_fn);
     }
 
-    /// Initialize the service
+    /// Initialize the service: scan all registered repos and register their workflows.
     pub async fn initialize(&self) -> Result<()> {
-        // TODO: Scan all registered repos for workflows
-        // TODO: Create handlers for each workflow trigger
+        let repo_ids: Vec<String> = {
+            let repo_paths = self.repo_paths.read().await;
+            repo_paths.keys().cloned().collect()
+        };
+
+        for repo_id in repo_ids {
+            match self.rescan_repo(&repo_id).await {
+                Ok(()) => {}
+                Err(e) => {
+                    tracing::warn!(repo_id = %repo_id, error = %e, "Failed to scan repo during init");
+                }
+            }
+        }
+
         tracing::info!("WorkflowService initialized");
         Ok(())
     }
@@ -161,10 +191,12 @@ impl WorkflowService {
     pub async fn start(self: Arc<Self>) -> Result<()> {
         let mut subscriber = EventSubscriber::new()?;
 
-        // Subscribe to worker events (sandbox/container lifecycle)
-        subscriber.subscribe("worker.")?;
+        // Subscribe to all event categories that can trigger or affect workflows.
+        for prefix in &["worker.", "repo.", "training.", "metrics."] {
+            subscriber.subscribe(prefix)?;
+        }
 
-        tracing::info!("WorkflowService subscribed to worker.* events");
+        tracing::info!("WorkflowService subscribed to worker/repo/training/metrics events");
 
         let service = self.clone();
         let handle = tokio::spawn(async move {
@@ -262,13 +294,83 @@ impl WorkflowService {
         handlers.push(handler);
     }
 
-    /// Scan a repository for workflows
+    /// Scan a repository for `.github/workflows/*.yml` files.
+    ///
+    /// Uses the path registered via `register_repo_path`. Returns an empty
+    /// Vec (not an error) if no path is registered for the repo or if the
+    /// workflows directory does not exist.
     pub(crate) async fn scan_repo(&self, repo_id: &str) -> Result<Vec<WorkflowDef>> {
-        // TODO: Read .github/workflows/*.yml from repo
-        // TODO: Parse each workflow file
-        // TODO: Return list of workflow definitions
         tracing::info!(repo_id = %repo_id, "Scanning repository for workflows");
-        Ok(Vec::new())
+
+        let root = {
+            let repo_paths = self.repo_paths.read().await;
+            match repo_paths.get(repo_id) {
+                Some(p) => p.clone(),
+                None => {
+                    tracing::debug!(repo_id = %repo_id, "No path registered for repo — skipping scan");
+                    return Ok(Vec::new());
+                }
+            }
+        };
+
+        let workflow_dir = root.join(".github").join("workflows");
+        if !workflow_dir.is_dir() {
+            tracing::debug!(
+                repo_id = %repo_id,
+                dir = %workflow_dir.display(),
+                "No .github/workflows dir found"
+            );
+            return Ok(Vec::new());
+        }
+
+        let mut defs = Vec::new();
+        let read_dir = std::fs::read_dir(&workflow_dir).map_err(|e| {
+            crate::error::WorkerError::WorkflowParseError(format!(
+                "Failed to read workflows dir {}: {e}",
+                workflow_dir.display()
+            ))
+        })?;
+
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if ext != "yml" && ext != "yaml" {
+                continue;
+            }
+
+            let yaml = match std::fs::read_to_string(&path) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "Failed to read workflow file");
+                    continue;
+                }
+            };
+
+            let workflow = match Workflow::parse(&yaml) {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "Failed to parse workflow");
+                    continue;
+                }
+            };
+
+            let rel_path = path
+                .strip_prefix(&root)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+
+            let triggers = extract_triggers(&workflow);
+
+            defs.push(WorkflowDef {
+                path: rel_path,
+                repo_id: repo_id.to_owned(),
+                workflow,
+                triggers,
+            });
+        }
+
+        tracing::info!(repo_id = %repo_id, count = defs.len(), "Scan complete");
+        Ok(defs)
     }
 
     /// Register a workflow
@@ -504,12 +606,16 @@ impl WorkflowHandler for WorkflowService {
     ) -> AnyhowResult<WorkflowResponseVariant> {
         let workflows = self.scan_repo(repo_id).await?;
         Ok(WorkflowResponseVariant::ScanRepoResult(
-            workflows.iter().map(|wf| WorkflowDefWire {
-                path: wf.path.clone(),
-                repo_id: wf.repo_id.clone(),
-                name: wf.workflow.name.clone(),
-                triggers: Vec::new(), // EventTrigger is empty struct for now
-                yaml: String::new(),  // TODO: serialize workflow back to YAML
+            workflows.iter().map(|wf| {
+                let yaml = serde_yaml::to_string(&wf.workflow)
+                    .unwrap_or_default();
+                WorkflowDefWire {
+                    path: wf.path.clone(),
+                    repo_id: wf.repo_id.clone(),
+                    name: wf.workflow.name.clone(),
+                    triggers: Vec::new(),
+                    yaml,
+                }
             }).collect()
         ))
     }
@@ -520,16 +626,23 @@ impl WorkflowHandler for WorkflowService {
         _request_id: u64,
         data: &WorkflowDefWire,
     ) -> AnyhowResult<WorkflowResponseVariant> {
-        let workflow_def = WorkflowDef {
-            path: data.path.clone(),
-            repo_id: data.repo_id.clone(),
-            workflow: Workflow {
+        let workflow = if data.yaml.is_empty() {
+            // Build a minimal Workflow from wire fields when no YAML is provided.
+            Workflow {
                 name: data.name.clone(),
                 on: super::parser::WorkflowTrigger::List(Vec::new()),
                 env: HashMap::new(),
                 jobs: HashMap::new(),
-            },
-            triggers: Vec::new(), // TODO: convert EventTrigger to EventTrigger
+            }
+        } else {
+            Workflow::parse(&data.yaml)?
+        };
+        let triggers = extract_triggers(&workflow);
+        let workflow_def = WorkflowDef {
+            path: data.path.clone(),
+            repo_id: data.repo_id.clone(),
+            workflow,
+            triggers,
         };
         let workflow_id = self.register_workflow(workflow_def).await?;
         Ok(WorkflowResponseVariant::RegisterResult(workflow_id))
@@ -564,11 +677,30 @@ impl WorkflowHandler for WorkflowService {
         _request_id: u64,
         request: &SubscribeRequest,
     ) -> AnyhowResult<WorkflowResponseVariant> {
-        // TODO: implement subscription via event handler registration
-        tracing::info!(workflow_id = %request.workflow_id, "Subscribe request (not yet implemented)");
-        Ok(WorkflowResponseVariant::SubscribeResult(
-            format!("sub-{}", request.workflow_id)
-        ))
+        let sub_id = format!("sub-{}-{}", request.workflow_id, uuid_v4_simple());
+        let trigger = EventTrigger::Custom {
+            topic: format!("workflow.{}", request.workflow_id),
+            pattern: String::new(),
+        };
+        let subscription = WorkflowSubscription::new(request.workflow_id.clone(), trigger);
+
+        {
+            let mut subs = self.subscriptions.write().await;
+            subs.insert(sub_id.clone(), subscription.clone());
+        }
+        {
+            let mut repo_workflows = self.repo_workflows.write().await;
+            // Extract repo_id from workflow_id ("repo_id:path" convention).
+            let repo_id = request.workflow_id
+                .split(':')
+                .next()
+                .unwrap_or(&request.workflow_id)
+                .to_owned();
+            repo_workflows.entry(repo_id).or_default().push(subscription);
+        }
+
+        tracing::info!(workflow_id = %request.workflow_id, sub_id = %sub_id, "Subscribed");
+        Ok(WorkflowResponseVariant::SubscribeResult(sub_id))
     }
 
     async fn handle_unsubscribe(
@@ -577,8 +709,15 @@ impl WorkflowHandler for WorkflowService {
         _request_id: u64,
         sub_id: &str,
     ) -> AnyhowResult<WorkflowResponseVariant> {
-        // TODO: implement unsubscription
-        tracing::info!(sub_id = %sub_id, "Unsubscribe request (not yet implemented)");
+        let removed = {
+            let mut subs = self.subscriptions.write().await;
+            subs.remove(sub_id).is_some()
+        };
+        if removed {
+            tracing::info!(sub_id = %sub_id, "Unsubscribed");
+        } else {
+            tracing::debug!(sub_id = %sub_id, "Unsubscribe: subscription not found");
+        }
         Ok(WorkflowResponseVariant::UnsubscribeResult)
     }
 
@@ -632,4 +771,41 @@ impl RequestService for WorkflowService {
     fn signing_key(&self) -> SigningKey {
         self.signing_key.clone()
     }
+}
+
+/// Build `EventTrigger`s from a parsed `Workflow`'s `on:` field.
+///
+/// Maps GitHub Actions event names to the closest `EventTrigger` variant.
+fn extract_triggers(workflow: &Workflow) -> Vec<EventTrigger> {
+    use super::parser::WorkflowTrigger;
+    use super::triggers::RepoEventType;
+
+    let event_names: Vec<String> = match &workflow.on {
+        WorkflowTrigger::Simple(event) => vec![event.clone()],
+        WorkflowTrigger::List(events) => events.clone(),
+        WorkflowTrigger::Complex(map) => map.keys().cloned().collect(),
+    };
+
+    event_names.iter().map(|event| match event.as_str() {
+        "push" => EventTrigger::RepositoryEvent { event_type: RepoEventType::Push, pattern: None },
+        "pull_request" => EventTrigger::RepositoryEvent { event_type: RepoEventType::PullRequest, pattern: None },
+        "create" | "tag" => EventTrigger::RepositoryEvent { event_type: RepoEventType::Tag, pattern: None },
+        "workflow_dispatch" => EventTrigger::WorkflowDispatch { inputs: std::collections::HashMap::new() },
+        "schedule" | "training" => EventTrigger::Custom { topic: format!("training.{event}"), pattern: String::new() },
+        _ => EventTrigger::Custom { topic: format!("repo.{event}"), pattern: String::new() },
+    }).collect()
+}
+
+/// Generate a compact random-ish identifier for subscription IDs.
+///
+/// Uses the system time + thread id — no external deps needed, not
+/// cryptographic, only needs to be unique within a service lifetime.
+fn uuid_v4_simple() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tid = std::thread::current().id();
+    format!("{ts:x}-{tid:?}")
 }
