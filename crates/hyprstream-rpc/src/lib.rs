@@ -164,6 +164,10 @@ pub mod transport;
 pub mod dial;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod service_entry;
+// Shared `did:key` (Ed25519) codec — compiled on all targets so the native
+// `did_web` resolver and the wasm32 `iroh_peer` identity helpers share one
+// implementation (#475). `did_web` re-exports its public fns for compatibility.
+pub mod did_key;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod did_web;
 #[cfg(not(target_arch = "wasm32"))]
