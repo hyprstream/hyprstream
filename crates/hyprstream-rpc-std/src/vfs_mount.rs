@@ -9,7 +9,7 @@
 //!   /srv/{service}/doc → DocMount (man pages from schema annotations)
 //!   /wanix             → WanixMount (Wanix-native VFS via 9P2000.L over DMA;
 //!                        optional — mounted only when running under Wanix,
-//!                        see [`mount_wanix`]). #409 Path B.
+//!                        see [`mount_wanix`]). #409/#391.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -510,7 +510,7 @@ pub fn build_browser_namespace(
 
     // `/wanix` is NOT mounted here: it needs a Wanix-provided SharedArrayBuffer
     // that the browser only has when running under Wanix. Wire it separately
-    // via [`mount_wanix`] after this builder returns. See #409 Path B.
+    // via [`mount_wanix`] after this builder returns. See #409/#391.
 
     (ns, stream_registry)
 }
@@ -529,6 +529,18 @@ pub fn build_browser_namespace(
 ///
 /// This is the rpc-std seam that makes `WanixMount` reachable from the browser
 /// namespace now that `hyprstream-9p` is a wasm32 dependency.
+///
+/// # Breaking change (#465)
+///
+/// This signature replaces the previous `async fn mount_wanix(ns, sab, uname,
+/// aname) -> anyhow::Result<()>`, which performed the 9P version/attach handshake
+/// internally over a `DmaTransport` built from a `SharedArrayBuffer`. The handshake
+/// (and transport construction) now happen at the call site, so callers pass an
+/// already-connected `P9Client<T>` and this function is **synchronous**, returning
+/// [`hyprstream_vfs::NamespaceError`] instead of `anyhow::Result<()>`. Update call
+/// sites: `mount_wanix(ns, &sab, uname, aname).await?` →
+/// `let client = P9Client::connect(DmaTransport::new(&sab, true), uname, aname).await?;
+/// mount_wanix(ns, client)?;`.
 pub fn mount_wanix<T>(
     ns: &mut hyprstream_vfs::Namespace,
     client: hyprstream_9p::client::P9Client<T>,
