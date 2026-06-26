@@ -42,6 +42,7 @@ allow = [
     "Unlicense",          # public domain equivalent (permissive)
     "bzip2-1.0.6",        # bzip2-sys: permissive BSD-like, FSF-free
     "CDLA-Permissive-2.0", # Community Data License Agreement (permissive data license — webpki-roots CA certs)
+    "Python-2.0.1",        # Python License 2.0.1 — bundled CPython stdlib docs in rustpython-doc (permissive)
 ]
 
 # hyprstream itself is dual-licensed MIT OR AGPL-3.0-only (first-party).
@@ -168,6 +169,34 @@ name = "xet_runtime"
 version = "*"
 expression = "Apache-2.0"
 license-files = []
+
+# malachite family: LGPL-3.0-only — pulled in transitively by rustpython-vm (big integer backend).
+# LGPL-3.0 is compatible with AGPL-3.0+ and can be used without copyleft propagation when
+# dynamically linked. Users can substitute the library. No exception needed for the binary.
+[[licenses.exceptions]]
+name = "malachite"
+version = "*"
+allow = ["LGPL-3.0-only"]
+
+[[licenses.exceptions]]
+name = "malachite-base"
+version = "*"
+allow = ["LGPL-3.0-only"]
+
+[[licenses.exceptions]]
+name = "malachite-bigint"
+version = "*"
+allow = ["LGPL-3.0-only"]
+
+[[licenses.exceptions]]
+name = "malachite-nz"
+version = "*"
+allow = ["LGPL-3.0-only"]
+
+[[licenses.exceptions]]
+name = "malachite-q"
+version = "*"
+allow = ["LGPL-3.0-only"]
 
 [sources]
 unknown-registry = "warn"
