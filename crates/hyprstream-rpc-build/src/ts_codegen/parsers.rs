@@ -33,18 +33,42 @@ pub fn generate_parsers(out: &mut String, service_name: &str, schema: &ParsedSch
         .map(|sc| (sc.factory_name.as_str(), sc))
         .collect();
 
-    // Response result interface
-    out.push_str(&format!("export interface {pascal}ResponseResult {{\n"));
-    for f in &non_union_fields {
-        out.push_str(&format!(
-            "  {}: {};\n",
-            to_camel_case(&f.name),
-            capnp_to_ts_type(&f.type_name)
-        ));
+    // Response result type — a typed discriminated union when the response is a
+    // union envelope, so callers narrow on `result.variant`. Each arm mirrors the
+    // parser's per-variant `return` (shared non-union fields + `{ variant, data }`).
+    if resp_struct.has_union {
+        let shared_fields: Vec<String> = non_union_fields
+            .iter()
+            .map(|f| format!("{}: {}", to_camel_case(&f.name), capnp_to_ts_type(&f.type_name)))
+            .collect();
+        let arms: Vec<(String, String)> = schema
+            .response_variants
+            .iter()
+            .map(|v| {
+                let data_ty = resp_struct
+                    .fields
+                    .iter()
+                    .find(|f| f.name == v.name && f.discriminant_value != 0xFFFF)
+                    .map(super::union_variant_data_type)
+                    .unwrap_or_else(|| "unknown".to_owned());
+                (v.name.clone(), data_ty)
+            })
+            .collect();
+        emit_result_union_alias(out, &format!("{pascal}ResponseResult"), &shared_fields, &arms);
+    } else {
+        // Data-only response (no union) — plain interface, unchanged shape.
+        out.push_str(&format!("export interface {pascal}ResponseResult {{\n"));
+        for f in &non_union_fields {
+            out.push_str(&format!(
+                "  {}: {};\n",
+                to_camel_case(&f.name),
+                capnp_to_ts_type(&f.type_name)
+            ));
+        }
+        out.push_str("  variant: string;\n");
+        out.push_str("  data: unknown;\n");
+        out.push_str("}\n\n");
     }
-    out.push_str("  variant: string;\n");
-    out.push_str("  data: unknown;\n");
-    out.push_str("}\n\n");
 
     // Parser function
     out.push_str(&format!(
@@ -190,7 +214,7 @@ pub fn generate_parsers(out: &mut String, service_name: &str, schema: &ParsedSch
     let comma = if fields_str.is_empty() { "" } else { ", " };
     out.push_str("    default:\n");
     out.push_str(&format!(
-        "      return {{ {fields_str}{comma}variant: 'unknown', data: null }};\n"
+        "      return {{ {fields_str}{comma}variant: 'unknown' as const, data: null }};\n"
     ));
     out.push_str("  }\n");
     out.push_str("}\n\n");
@@ -237,26 +261,32 @@ pub fn generate_struct_parsers(out: &mut String, schema: &ParsedSchema) {
 
         let disc_byte_off = sd.discriminant_offset * 2;
 
-        // Result interface
-        out.push_str(&format!("export interface {}Result {{\n", sd.name));
-        for f in &non_union_fields {
-            let ts_type = capnp_to_ts_type(&f.type_name);
-            // Struct pointer fields may be null when the capnp pointer is null.
-            let ts_type = if f.section == FieldSection::Pointer
-                && !f.type_name.starts_with("List(")
-                && f.type_name != "Text"
-                && f.type_name != "Data"
-                && !super::is_primitive(&f.type_name)
-            {
-                format!("{ts_type} | null")
-            } else {
-                ts_type
-            };
-            out.push_str(&format!("  {}: {};\n", to_camel_case(&f.name), ts_type));
-        }
-        out.push_str("  variant: string;\n");
-        out.push_str("  data: unknown;\n");
-        out.push_str("}\n\n");
+        // Result type — typed discriminated union so callers narrow on `.variant`.
+        // One arm per union variant (data type mirroring the parser output) plus a
+        // shared block of non-union fields and the parser's `unknown` default arm.
+        let shared_fields: Vec<String> = non_union_fields
+            .iter()
+            .map(|f| {
+                let ts_type = capnp_to_ts_type(&f.type_name);
+                // Struct pointer fields may be null when the capnp pointer is null.
+                let ts_type = if f.section == FieldSection::Pointer
+                    && !f.type_name.starts_with("List(")
+                    && f.type_name != "Text"
+                    && f.type_name != "Data"
+                    && !super::is_primitive(&f.type_name)
+                {
+                    format!("{ts_type} | null")
+                } else {
+                    ts_type
+                };
+                format!("{}: {}", to_camel_case(&f.name), ts_type)
+            })
+            .collect();
+        let arms: Vec<(String, String)> = union_fields
+            .iter()
+            .map(|f| (f.name.clone(), super::union_variant_data_type(f)))
+            .collect();
+        emit_result_union_alias(out, &format!("{}Result", sd.name), &shared_fields, &arms);
 
         // Parser function
         out.push_str(&format!(
@@ -369,7 +399,7 @@ pub fn generate_struct_parsers(out: &mut String, schema: &ParsedSchema) {
         let comma = if fields_str.is_empty() { "" } else { ", " };
         out.push_str("    default:\n");
         out.push_str(&format!(
-            "      return {{ {fields_str}{comma}variant: 'unknown', data: null }};\n"
+            "      return {{ {fields_str}{comma}variant: 'unknown' as const, data: null }};\n"
         ));
         out.push_str("  }\n");
         out.push_str("}\n\n");
@@ -1045,8 +1075,45 @@ fn emit_return(
         .collect();
     let fields_str = fields.join(", ");
     let comma = if fields_str.is_empty() { "" } else { ", " };
+    // `as const` narrows the discriminant literal so the return matches the
+    // corresponding arm of the typed `…Result` discriminated union.
     out.push_str(&format!(
-        "      return {{ {fields_str}{comma}variant: '{variant_name}', data: {data_expr} }};\n"
+        "      return {{ {fields_str}{comma}variant: '{variant_name}' as const, data: {data_expr} }};\n"
+    ));
+}
+
+/// Emit a typed discriminated-union `type` alias for a parser result.
+///
+/// Shape (one arm per union variant plus the parser's `unknown` default case):
+/// ```text
+/// export type {name} =
+///   | { {shared}variant: '{v}'; data: {ty} }
+///   | { {shared}variant: 'unknown'; data: null };
+/// ```
+/// `shared_fields` are the non-union field declarations (`name: type`) repeated in
+/// every arm — matching what every parser `return` carries alongside `variant`/`data`.
+/// Keeping the arm `data` types aligned with the parser's per-variant output lets
+/// callers narrow on `result.variant`.
+fn emit_result_union_alias(
+    out: &mut String,
+    name: &str,
+    shared_fields: &[String],
+    arms: &[(String, String)],
+) {
+    let shared = shared_fields.join("; ");
+    let shared_prefix = if shared.is_empty() {
+        String::new()
+    } else {
+        format!("{shared}; ")
+    };
+    out.push_str(&format!("export type {name} =\n"));
+    for (variant, data_ty) in arms {
+        out.push_str(&format!(
+            "  | {{ {shared_prefix}variant: '{variant}'; data: {data_ty} }}\n"
+        ));
+    }
+    out.push_str(&format!(
+        "  | {{ {shared_prefix}variant: 'unknown'; data: null }};\n\n"
     ));
 }
 
@@ -1129,4 +1196,101 @@ fn emit_option_read_expr(
          return _optR.getUint16({disc_byte_off}) === 1 ? {read_val} : undefined; }})()",
         field.slot_offset, opt_struct.data_words, opt_struct.pointer_words
     )
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use std::path::Path;
+
+    use hyprstream_rpc_build::schema::parse_from_cgr_path;
+    use hyprstream_rpc_build::schema::types::ParsedSchema;
+
+    /// A union struct with a shared non-union field plus Void / Text / scalar arms.
+    const UNION_SCHEMA: &str = r#"
+@0xd00dfeedd00dfeed;
+
+struct Payload {
+  seq @0 :UInt32;
+  union {
+    none @1 :Void;
+    text @2 :Text;
+    count @3 :UInt64;
+  }
+}
+"#;
+
+    fn parse_union_schema() -> ParsedSchema {
+        let tmp =
+            std::env::temp_dir().join(format!("hyprstream_ts_union_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+
+        let capnp_path = tmp.join("payload.capnp");
+        std::fs::write(&capnp_path, UNION_SCHEMA).expect("write payload.capnp");
+
+        let cgr_path = tmp.join("payload.cgr");
+        capnpc::CompilerCommand::new()
+            .src_prefix(&tmp)
+            .file(&capnp_path)
+            .raw_code_generator_request_path(&cgr_path)
+            .run()
+            .expect("compile payload.capnp to CGR");
+
+        let parsed = parse_from_cgr_path(Path::new(&cgr_path), "payload").expect("parse CGR");
+        let _ = std::fs::remove_dir_all(&tmp);
+        parsed
+    }
+
+    #[test]
+    fn struct_parser_emits_typed_discriminated_union() {
+        let schema = parse_union_schema();
+        let mut out = String::new();
+        super::generate_struct_parsers(&mut out, &schema);
+
+        // The result type must be a typed discriminated union — NOT the old
+        // `interface … { variant: string; data: unknown }` stub.
+        assert!(
+            out.contains("export type PayloadResult ="),
+            "expected a typed union alias, got:\n{out}"
+        );
+        assert!(
+            !out.contains("variant: string;"),
+            "must not emit the degenerate `variant: string` stub:\n{out}"
+        );
+        assert!(
+            !out.contains("data: unknown;"),
+            "must not emit the degenerate `data: unknown` stub:\n{out}"
+        );
+
+        // Each arm carries the shared non-union field and a typed `data` slot.
+        assert!(
+            out.contains("| { seq: number; variant: 'none'; data: undefined }"),
+            "Void arm shape wrong:\n{out}"
+        );
+        assert!(
+            out.contains("| { seq: number; variant: 'text'; data: string }"),
+            "Text arm shape wrong:\n{out}"
+        );
+        assert!(
+            out.contains("| { seq: number; variant: 'count'; data: bigint }"),
+            "scalar arm shape wrong:\n{out}"
+        );
+        // Plus the parser's default `unknown` arm.
+        assert!(
+            out.contains("| { seq: number; variant: 'unknown'; data: null };"),
+            "fallback arm shape wrong:\n{out}"
+        );
+
+        // Parser `return`s narrow the discriminant with `as const` so they match
+        // the union arms.
+        assert!(
+            out.contains("variant: 'text' as const"),
+            "variant return missing `as const`:\n{out}"
+        );
+        assert!(
+            out.contains("variant: 'unknown' as const"),
+            "default return missing `as const`:\n{out}"
+        );
+    }
 }
