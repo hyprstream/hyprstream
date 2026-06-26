@@ -843,14 +843,23 @@ async fn run_subscriber_task(
 
     let patterns = Arc::new(patterns);
 
-    // Scope the consumer to the `local/events` subtree, then further narrow by
-    // source names extracted from the patterns.
+    // Scope the consumer to the relevant `local/events/{source}` broadcast paths.
+    //
+    // #148: `scope_consumer_for_patterns` now does a SINGLE scope() call on the root
+    // consumer using absolute broadcast paths (`"local/events/{source}"`). The scoped
+    // consumer registers at the leaf node of the shared origin tree, so:
+    //   • if the publisher already created the broadcast, `consume_initial` replays it
+    //     into this consumer's pending queue immediately;
+    //   • if the publisher hasn't registered the broadcast yet, the consumer's `announced()`
+    //     loop below will block until the announcement arrives — no race, no abort.
+    //
+    // `scope()` on a root consumer always succeeds (it creates the leaf node), so
+    // `scope_consumer_for_patterns` only returns `None` when the origin is closed.
     match scope_consumer_for_patterns(&consumer, &patterns) {
         Some(c) => consumer = c,
         None => {
-            // Origin has no `local/events` tree yet — using the root consumer would
-            // expose all RPC traffic to the event channel. Abort instead.
-            tracing::warn!("event subscriber: origin has no event scope; subscriber task exiting");
+            // Origin is closed — nothing to subscribe to.
+            tracing::warn!("event subscriber: origin closed; subscriber task exiting");
             return;
         }
     }
@@ -878,21 +887,30 @@ async fn run_subscriber_task(
 
 /// Scope the origin consumer to `local/events/{sources}` based on patterns.
 ///
-/// If any pattern is `""` (subscribe-all), returns `None` and the caller uses
-/// an unscoped consumer rooted at `local/events`.
+/// Returns a consumer scoped to all source-specific broadcast paths that the
+/// given patterns require. If any pattern is `""` (subscribe-all), returns a
+/// consumer scoped to the whole `local/events` subtree.
+///
+/// # Two-level scope fix
+///
+/// The original code did two `scope()` calls: first to `"local/events"`, then a
+/// second relative scope to each source name. The second call failed silently
+/// because after the first `scope()` the consumer's internal nodes are keyed
+/// with absolute paths (e.g. `"local/events"`), not relative ones — so passing
+/// `"worker"` to the second `scope()` finds no matching node and returns `None`.
+///
+/// The fix: build full absolute broadcast paths (`"local/events/{source}"`) and
+/// call `scope()` only ONCE on the original root consumer.
 fn scope_consumer_for_patterns(
     consumer: &OriginConsumer,
     patterns: &[String],
 ) -> Option<OriginConsumer> {
-    // Scope to local/events first
-    let events_consumer = consumer.scope(&[Path::new(EVENT_PREFIX)])?;
-
-    // If subscribe-all pattern present, return events-scoped consumer
+    // If subscribe-all pattern present, scope to the whole local/events subtree.
     if patterns.iter().any(String::is_empty) {
-        return Some(events_consumer);
+        return consumer.scope(&[Path::new(EVENT_PREFIX)]);
     }
 
-    // Extract unique source names from patterns (e.g., "worker." → "worker")
+    // Extract unique source names from patterns (e.g., "worker." → "worker").
     let sources: Vec<String> = patterns
         .iter()
         .filter_map(|p| {
@@ -908,11 +926,20 @@ fn scope_consumer_for_patterns(
         .collect();
 
     if sources.is_empty() {
-        return Some(events_consumer);
+        // No recognizable source prefix in any pattern — subscribe to everything.
+        return consumer.scope(&[Path::new(EVENT_PREFIX)]);
     }
 
-    let path_refs: Vec<Path<'_>> = sources.iter().map(|s| Path::new(s.as_str())).collect();
-    events_consumer.scope(&path_refs)
+    // Build ABSOLUTE broadcast paths (`"local/events/{source}"`) so we can
+    // scope the root consumer in a single call — avoids the two-level-scope bug
+    // where relative names ("worker") don't match the absolute keys held in a
+    // previously-scoped consumer ("local/events").
+    let full_paths: Vec<String> = sources
+        .iter()
+        .map(|s| format!("{}/{}", EVENT_PREFIX, s))
+        .collect();
+    let path_refs: Vec<Path<'_>> = full_paths.iter().map(|s| Path::new(s.as_str())).collect();
+    consumer.scope(&path_refs)
 }
 
 /// Read all groups from a single source broadcast's `events` track and relay
@@ -1131,34 +1158,41 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn moq_event_pub_sub_roundtrip() -> Result<()> {
         let origin = MoqEventOrigin::new();
-        init_global_moq_event_origin(origin.clone());
 
-        // Publisher
-        let mut pub_ = origin.publisher("worker")?;
-
-        // Subscriber
-        let mut sub = MoqEventSubscriber::new();
+        // Use new_for_test so this test has an isolated origin consumer and does
+        // not race with other tests over the process-global OnceLock (#148).
+        // The OnceLock is single-writer; a second init_global_moq_event_origin call
+        // in the same binary is silently ignored, so any test that relies on ::new()
+        // picking up the right global is inherently order-dependent.
+        let mut sub = MoqEventSubscriber::new_for_test(origin.consumer());
         sub.subscribe("worker.")?;
 
-        // Start subscriber background task (lazy; triggered by recv)
-        // Publish before recv so the broadcast is announced when the task starts.
+        // Publisher created AFTER the subscriber is set up so we can also exercise
+        // the #148 wait-for-subtree path: recv() starts the background task before
+        // the publisher has registered its broadcast.
+        // The subscriber task must wait until the broadcast appears rather than abort.
+        let recv_task = tokio::spawn(async move { sub.recv().await });
+
+        // Small yield to let the subscriber background task start and block on
+        // the wait-for-subtree loop before we create the publisher.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        // Publisher registers the broadcast (creates `local/events/worker`).
+        let mut pub_ = origin.publisher("worker")?;
         pub_.publish("sandbox123", "started", b"payload")?;
 
-        // Give the origin a moment to propagate the announcement.
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        // Manually start the task by calling ensure_started and check recv.
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            sub.recv(),
+            recv_task,
         ).await;
 
         match result {
-            Ok(Ok((topic, payload))) => {
+            Ok(Ok(Ok((topic, payload)))) => {
                 assert_eq!(topic, "worker.sandbox123.started");
                 assert_eq!(payload, b"payload");
             }
-            Ok(Err(e)) => panic!("recv error: {e}"),
+            Ok(Ok(Err(e))) => panic!("recv error: {e}"),
+            Ok(Err(e)) => panic!("task panicked: {e}"),
             Err(_) => panic!("recv timeout"),
         }
 
