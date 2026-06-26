@@ -564,16 +564,6 @@ impl OAuthState {
         self
     }
 
-    /// Attach a shared JTI blocklist for access token revocation (RFC 7009).
-    ///
-    /// Should be the same `Arc` as the one held by the OAI resource server's
-    /// `ServerState` so that `POST /oauth/revoke` immediately invalidates tokens
-    /// at the resource server without waiting for expiry.
-    pub fn with_jti_blocklist(mut self, blocklist: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>) -> Self {
-        self.jti_blocklist = Some(blocklist);
-        self
-    }
-
     /// Get read access to the user store via the UserService.
     /// Returns None if no user store is configured.
     pub fn user_store_reader(&self) -> Option<Arc<dyn UserStore>> {

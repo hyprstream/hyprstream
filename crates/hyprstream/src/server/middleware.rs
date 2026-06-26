@@ -246,7 +246,7 @@ impl RateLimiter {
         // Evict stale entries to bound memory growth
         if map.len() > 10_000 {
             let window_secs = self.window_secs;
-            map.retain(|_, (_, ws)| now - ws < window_secs * 2);
+            map.retain(|_, (_, ws)| now - *ws < window_secs * 2);
         }
         let entry = map.entry(subject.to_owned()).or_insert((0, now));
         if now - entry.1 >= self.window_secs {
