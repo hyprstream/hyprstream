@@ -5,7 +5,7 @@ edition.workspace = true
 description = "Agentic Infrastructure"
 documentation = "https://docs.rs/hyprstream"
 readme = "README.md"
-license = "MIT OR AGPL-3.0"
+license = "MIT OR AGPL-3.0-only"
 exclude = [
     "**/*.pyc",
     "**/__pycache__/",
