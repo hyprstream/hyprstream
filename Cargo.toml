@@ -19,6 +19,7 @@ members = [
     "crates/hyprstream-tui",
     "crates/hyprstream-vfs",
     "crates/hyprstream-tcl",
+    "crates/hyprstream-python",
     "crates/chat-core",
     "crates/hyprstream-rpc-std",
     "crates/hyprstream-9p",
