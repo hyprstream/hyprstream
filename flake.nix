@@ -217,6 +217,10 @@
           buildInputs = [ rustToolchain ];
 
           shellHook = ''
+            # inputsFrom pulls the package build env into the shell, including the
+            # sccache wrapper config. Strip it so `cargo build` in `nix develop`
+            # works without requiring sccache and the /var/cache/sccache path.
+            unset RUSTC_WRAPPER SCCACHE_DIR SCCACHE_CACHE_SIZE
             export LIBTORCH="${devLibtorch}"
             export LD_LIBRARY_PATH="${devLibtorch}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             export LIBTORCH_BYPASS_VERSION_CHECK=1
