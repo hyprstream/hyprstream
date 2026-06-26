@@ -84,6 +84,13 @@ impl KataBackend {
         }
     }
 
+    /// Runtime prerequisite probe for the backend registry: a `cloud-hypervisor`
+    /// binary must be on PATH. Mirrors the instance-level
+    /// [`SandboxBackend::is_available`] check.
+    fn registry_is_available() -> bool {
+        which::which("cloud-hypervisor").is_ok()
+    }
+
     /// Build a `HypervisorConfig` from `PoolConfig`.
     fn build_hypervisor_config(pool_config: &PoolConfig) -> HypervisorConfig {
         let mut config = HypervisorConfig::default();
@@ -557,6 +564,31 @@ impl SandboxBackend for KataBackend {
         Err(WorkerError::ExecFailed(
             "not supported by Kata backend (requires agent)".into(),
         ))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Backend registry self-registration (#507 / #518)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// This whole file only compiles under `kata-vm` (see runtime/mod.rs), so this
+// `submit!` is feature-gated by construction: the `kata` backend is a selectable
+// name *only* in builds that include the VM toolchain. In a non-`kata-vm` binary
+// there is no registration, and selecting `kata` fails closed with a build hint.
+//
+// Highest priority → preferred by `auto` (strongest isolation). Construction
+// pulls the RAFS image store from the per-call BackendCtx.
+inventory::submit! {
+    crate::runtime::selection::BackendRegistration {
+        name: "kata",
+        priority: 100,
+        is_available: KataBackend::registry_is_available,
+        construct: |ctx| {
+            Ok(Arc::new(KataBackend::new(
+                ctx.image_config.clone(),
+                Arc::clone(&ctx.rafs_store),
+            )) as Arc<dyn crate::runtime::SandboxBackend>)
+        },
     }
 }
 

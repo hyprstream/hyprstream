@@ -652,22 +652,24 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
 fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating WorkerService");
 
-    use hyprstream_workers::config::{BackendType, PoolConfig};
+    use hyprstream_workers::config::PoolConfig;
     #[cfg(feature = "kata-vm")]
     use hyprstream_workers::config::ImageConfig;
     #[cfg(feature = "kata-vm")]
     use hyprstream_workers::image::RafsStore;
-    #[cfg(feature = "kata-vm")]
-    use hyprstream_workers::KataBackend;
-    use hyprstream_workers::{WorkerService, SandboxBackend, NspawnBackend, NspawnConfig};
+    use hyprstream_workers::{resolve_backend, BackendCtx, SandboxBackend, WorkerService};
 
     let config = load_config();
     let worker_quic_port = config.worker.as_ref().and_then(|w| w.quic_port);
-    let backend_type = config.worker.as_ref()
-        .map(|w| w.backend)
-        .unwrap_or_default();
+    // Operator-selected backend name ("auto" or a registered backend); resolved
+    // fail-closed against the inventory registry below.
+    let backend_name: String = config
+        .worker
+        .as_ref()
+        .map(|w| w.backend.clone())
+        .unwrap_or_else(|| "auto".to_owned());
 
-    info!("WorkerService using {} backend", backend_type);
+    info!("WorkerService backend selection: {}", backend_name);
 
     // Use default paths based on XDG directories
     let data_dir = dirs::data_local_dir()
@@ -704,19 +706,19 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     #[cfg(feature = "kata-vm")]
     let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
 
-    // Construct the sandbox backend based on configuration.
-    let backend: Arc<dyn SandboxBackend> = match backend_type {
+    // Resolve + construct the backend fail-closed against the inventory registry
+    // (config-driven by name; explicit requests are authoritative, missing
+    // prerequisites error out rather than silently downgrading isolation; "auto"
+    // picks the strongest available). Single seam — no scattered cfg, no
+    // `_ => nspawn` fallback (#507 / #518).
+    let backend_ctx = BackendCtx {
+        pool_config: pool_config.clone(),
         #[cfg(feature = "kata-vm")]
-        BackendType::Kata => Arc::new(KataBackend::new(image_config, Arc::clone(&rafs_store))),
-        #[cfg(not(feature = "kata-vm"))]
-        BackendType::Kata => {
-            return Err(anyhow::anyhow!(
-                "worker backend `kata` requires the `kata-vm` feature; \
-                 this binary was built without kata-vm support (use the `nspawn` backend)"
-            ));
-        }
-        BackendType::Nspawn => Arc::new(NspawnBackend::new(NspawnConfig::default())),
+        image_config,
+        #[cfg(feature = "kata-vm")]
+        rafs_store: Arc::clone(&rafs_store),
     };
+    let backend: Arc<dyn SandboxBackend> = resolve_backend(&backend_name, &backend_ctx)?;
 
     let sk = ctx.service_signing_key("worker");
 

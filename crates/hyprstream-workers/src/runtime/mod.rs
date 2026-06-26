@@ -33,6 +33,8 @@ mod sandbox;
 // (composes a RAFS rootfs and serves it over vhost-user-fs to a CH guest).
 #[cfg(all(not(target_arch = "wasm32"), feature = "kata-vm"))]
 pub mod sandbox_fs;
+// Canonical backend taxonomy + fail-closed selection (Phase 0 of #508, #507).
+pub mod selection;
 mod service;
 pub mod spawner;
 // VirtioFS daemon wrapper (nydus-service) — VM-only.
@@ -81,6 +83,8 @@ pub use backend::{SandboxBackend, SandboxHandle};
 #[cfg(feature = "kata-vm")]
 pub use kata_backend::{KataBackend, KataHandle};
 pub use nspawn::{NspawnBackend, NspawnConfig, NspawnHandle};
+// Inventory-based backend registry + fail-closed selection spine (#507)
+pub use selection::{resolve_backend, BackendCtx, BackendRegistration};
 // Domain entities (business logic only)
 pub use container::Container;
 pub use pool::{PoolStats, SandboxPool};

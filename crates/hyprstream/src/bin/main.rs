@@ -1075,26 +1075,36 @@ fn handle_quick_command(
                     };
 
                     let _worker_handle = if !worker_already_running {
-                        use hyprstream_workers::runtime::SandboxBackend;
+                        use hyprstream_workers::runtime::{
+                            resolve_backend, BackendCtx, SandboxBackend,
+                        };
 
-                        // VM path (kata-vm): Kata backend + RAFS image store.
+                        // RAFS image store is only built on the VM path (kata-vm).
                         #[cfg(feature = "kata-vm")]
                         let rafs_store = {
                             use hyprstream_workers::image::RafsStore;
                             Arc::new(RafsStore::new(image_config.clone())?)
                         };
-                        #[cfg(feature = "kata-vm")]
-                        let backend: Arc<dyn SandboxBackend> = {
-                            use hyprstream_workers::runtime::KataBackend;
-                            Arc::new(KataBackend::new(image_config, Arc::clone(&rafs_store)))
+
+                        // Resolve + construct the backend fail-closed against the
+                        // inventory registry: "auto" (default) picks the strongest
+                        // available backend; an explicit name must be registered
+                        // and available, else error. No silent nspawn fallback.
+                        let backend_name: String = ctx
+                            .config()
+                            .worker
+                            .as_ref()
+                            .map(|w| w.backend.clone())
+                            .unwrap_or_else(|| "auto".to_owned());
+                        let backend_ctx = BackendCtx {
+                            pool_config: pool_config.clone(),
+                            #[cfg(feature = "kata-vm")]
+                            image_config,
+                            #[cfg(feature = "kata-vm")]
+                            rafs_store: Arc::clone(&rafs_store),
                         };
-                        // Without kata-vm the CLI worker entrypoint falls back to
-                        // the lightweight nspawn backend.
-                        #[cfg(not(feature = "kata-vm"))]
-                        let backend: Arc<dyn SandboxBackend> = {
-                            use hyprstream_workers::{NspawnBackend, NspawnConfig};
-                            Arc::new(NspawnBackend::new(NspawnConfig::default()))
-                        };
+                        let backend: Arc<dyn SandboxBackend> =
+                            resolve_backend(&backend_name, &backend_ctx)?;
 
                         let worker_transport =
                             TransportConfig::inproc("hyprstream/workers");
