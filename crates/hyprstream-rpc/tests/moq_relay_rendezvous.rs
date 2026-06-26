@@ -250,14 +250,17 @@ async fn relay_choice_only_anonymizes_stream_end_to_end() -> Result<()> {
 
     // ── The node's per-server reach config: a REAL direct Quic reach is present
     //    alongside the relay. A naive build would advertise the direct address. ──
+    // The iroh-direct reach is sourced from `ProducerReachConfig.iroh_node_id`
+    // (the live field `reach_with_relay` reads) — NOT from `NodeStreamReach`,
+    // which carries no node id (#384: that dead field was removed).
+    let iroh_node_id = [0x11u8; 32];
     let direct_addr: std::net::SocketAddr = "203.0.113.7:443".parse()?; // TEST-NET-3, unreachable
     let server_cfg = ProducerReachConfig {
-        iroh_node_id: Some([0x11u8; 32]),
+        iroh_node_id: Some(iroh_node_id),
         quic_reach: Some(NodeStreamReach {
             addr: direct_addr,
             server_name: "producer.invalid".to_owned(),
             cert_hashes: vec![[0x22u8; 32]],
-            iroh_node_id: Some([0x11u8; 32]),
         }),
         relay: Some(relay_reach.clone()),
     };
@@ -268,6 +271,17 @@ async fn relay_choice_only_anonymizes_stream_end_to_end() -> Result<()> {
     assert!(
         default_reach.iter().any(|d| d.role == Role::Direct),
         "ServerDefault must advertise the configured direct reach(es)"
+    );
+    // Prove the iroh-direct reach comes from the LIVE source
+    // (`ProducerReachConfig.iroh_node_id`): the advertised iroh Destination must
+    // carry exactly the configured node id. Before #384 a redundant
+    // `NodeStreamReach.iroh_node_id` masked which field was actually read.
+    assert!(
+        default_reach.iter().any(|d| matches!(
+            &d.transport,
+            ReachTransport::Iroh(r) if r.node_id == iroh_node_id
+        )),
+        "the iroh-direct reach must be built from ProducerReachConfig.iroh_node_id: {default_reach:?}"
     );
     let only_reach = server_cfg.reach_with_relay(RelayChoice::Only(relay_reach.clone()));
     assert!(
@@ -283,10 +297,10 @@ async fn relay_choice_only_anonymizes_stream_end_to_end() -> Result<()> {
     // ── Heterogeneity in one process: a sibling stream stays direct ────────────
     // (Proves two streams on the SAME node/config can differ — the property the
     // process-global singleton made impossible.)
-    let sibling_reach = server_cfg.reach_with_relay(RelayChoice::None);
+    let sibling_reach = server_cfg.reach_with_relay(RelayChoice::NoRelay);
     assert!(
         sibling_reach.iter().all(|d| d.role == Role::Direct),
-        "a sibling RelayChoice::None stream stays direct-only while Only is anonymized"
+        "a sibling RelayChoice::NoRelay stream stays direct-only while Only is anonymized"
     );
 
     // ── Now drive ACTUAL delivery using ONLY the advertised (relay-only) reach ──
@@ -309,7 +323,17 @@ async fn relay_choice_only_anonymizes_stream_end_to_end() -> Result<()> {
     let link_task = tokio::spawn(async move {
         let _ = run_relay_announce_link(&link_producer, &link_relay).await;
     });
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Wait for the announce link to propagate the producer's broadcast UP to the
+    // relay before the subscriber dials, instead of a fixed sleep that can flake
+    // on slow CI. `announced_broadcast` resolves once the relay origin has the
+    // broadcast announced.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        relay_origin.consumer().announced_broadcast(&broadcast_path),
+    )
+    .await
+    .map_err(|_| anyhow!("timeout: producer broadcast not announced to relay"))?
+    .ok_or_else(|| anyhow!("relay origin closed before broadcast was announced"))?;
 
     // The subscriber dials EXACTLY the anonymized reach the producer advertised —
     // the relay-only list. It has no direct address to fall back to.
