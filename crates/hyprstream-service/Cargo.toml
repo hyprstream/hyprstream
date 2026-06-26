@@ -37,10 +37,6 @@ dashmap = { workspace = true }
 parking_lot = { workspace = true }
 once_cell = { workspace = true }
 
-# ZMQ transport
-zmq = { workspace = true }
-zmq-sys = { workspace = true }
-
 # Ed25519 (for factory::ServiceContext)
 ed25519-dalek = { workspace = true }
 
@@ -56,6 +52,10 @@ rand = { workspace = true }
 # Key material zeroization
 zeroize = { workspace = true }
 
+# QUIC / WebTransport server for the daemon RPC + moq planes (#274)
+web-transport-quinn = { workspace = true }
+rustls = { workspace = true }
+
 # Compile-time service registration
 inventory = { workspace = true }
 
@@ -67,7 +67,7 @@ zbus_systemd = { version = "0.0.11", features = ["login1", "systemd1"], optional
 [features]
 default = []
 systemd = ["dep:systemd", "dep:zbus_systemd"]
-pq-hybrid = ["hyprstream-rpc/pq-hybrid"]
+pq-hybrid = []  # NO-OP alias (PQ always compiled; runtime CryptoPolicy). See M3 #152.
 
 [lints]
 workspace = true

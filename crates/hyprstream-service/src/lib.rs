@@ -9,7 +9,7 @@
 //! # Architecture
 //!
 //! ```text
-//! hyprstream-rpc       (transport: ZmqService, RequestLoop, Resolver)
+//! hyprstream-rpc       (transport: RequestService, RequestLoop, Resolver)
 //!     ↑
 //! hyprstream-service   (orchestration: spawner, factory, manager)
 //!     ↑
@@ -21,8 +21,8 @@ pub mod notify;
 
 // Top-level re-exports for convenience
 pub use service::spawner::{
-    DualSpawnable, LoadBalancerService, ProcessBackend, ProcessConfig, ProcessKind,
-    ProcessSpawner, ProxyService, ServiceKind, ServiceMode, ServiceSpawner,
+    DualSpawnable, ProcessBackend, ProcessConfig, ProcessKind,
+    ProcessSpawner, ServiceKind, ServiceMode, ServiceSpawner,
     Spawnable, SpawnedProcess, SpawnedService, SpawnerBackend, StandaloneBackend,
     SystemdBackend, InprocManager, UnifiedServiceConfig,
 };

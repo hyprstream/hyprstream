@@ -35,6 +35,41 @@ pub struct UnionVariant {
     pub doc_example: String,
 }
 
+/// Payload carried by a tagged-union arm.
+///
+/// Distinguishes the three shapes a Cap'n Proto union member can take:
+/// a `Void` arm (no payload), a single-type arm (scalar/Text/Data/enum/struct),
+/// and a `group` arm (an inlined anonymous struct with its own leaf fields).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ArmPayload {
+    /// `arm @N :Void;` — unit variant, no payload.
+    Void,
+    /// `arm @N :T;` — carries a single value of capnp type `T`
+    /// (a scalar, `Text`, `Data`, an enum, or a struct).
+    Type(String),
+    /// `arm @N :group { ... }` — carries an inlined anonymous struct;
+    /// the leaf fields are the group's slots (all non-union).
+    Group(Vec<FieldDef>),
+}
+
+/// A single arm of a tagged union (one member of a capnp `union { ... }`).
+///
+/// Populated for pure-union structs so Rust codegen can emit a native `enum`
+/// (one variant per arm) instead of an empty struct. The flat `fields` list on
+/// `StructDef` still carries every union member (for the TS/wire-format path);
+/// `union_arms` is the structured view layered on top.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnionArm {
+    /// capnp arm name (camelCase, e.g. `atLeastOnce`).
+    pub name: String,
+    /// Union discriminant ordinal for this arm.
+    pub discriminant_value: u16,
+    /// Description from `$paramDescription`/`$mcpDescription` (may be empty).
+    pub description: String,
+    /// The payload this arm carries.
+    pub payload: ArmPayload,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StructDef {
     pub name: String,
@@ -55,6 +90,14 @@ pub struct StructDef {
     pub discriminant_count: u16,
     /// Offset of the discriminant in the data section (in u16 units).
     pub discriminant_offset: u32,
+    /// Structured view of the union arms (when `discriminant_count > 0`).
+    ///
+    /// Empty for non-union structs. Layered on top of the flat `fields` list:
+    /// `fields` still carries every union member for the wire-format/TS path,
+    /// while `union_arms` carries the per-arm payload shape (Void / single-type /
+    /// group) that Rust enum codegen consumes.
+    #[serde(default)]
+    pub union_arms: Vec<UnionArm>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

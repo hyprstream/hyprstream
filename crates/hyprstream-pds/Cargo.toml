@@ -1,0 +1,54 @@
+[package]
+name = "hyprstream-pds"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "atproto PDS record store — DAG-CBOR records, MST, signed commits, CAR proofs (#392)"
+
+[dependencies]
+# P-256 ES256 signing for atproto commits (#atproto verification method).
+p256 = { workspace = true }
+# SHA-256 — signing digest + CIDv1 dag-cbor multihash for all repo blocks.
+sha2 = { workspace = true }
+# Error handling.
+anyhow = { workspace = true }
+# Note: DAG-CBOR + CIDv1 + varints are hand-rolled in src/dag_cbor.rs and
+# src/cid.rs to enforce the determinism invariants (sorted keys, minimal ints,
+# tag-42 links) that serde-driven CBOR cannot guarantee. No CBOR/CID crate dep.
+
+[dev-dependencies]
+# Random signing keys for round-trip / tamper tests.
+rand = { workspace = true }
+
+# E1 (#421) end-to-end content-addressing + identity test. The dev-deps are the
+# three crates whose composition the test validates: git2db (repo → commit OID),
+# hyprstream-rpc (OID → git-raw CID string), and the PDS layers exercised via the
+# integration test binary itself. They only compile for `cargo test -p
+# hyprstream-pds`; the library's normal build stays the minimal crypto layer.
+git2db = { path = "../git2db" }
+hyprstream-rpc = { path = "../hyprstream-rpc" }
+# git2 re-exported by git2db; used to seed a local repo and read the commit OID.
+git2 = { workspace = true }
+# Temp dirs for the git2db registry + source repos.
+tempfile = { workspace = true }
+# Async test runtime (git2db commit/clone are async).
+tokio = { workspace = true }
+tokio-test = { workspace = true }
+# Tracing init helper (git2db logs; harmless if already initialized).
+tracing-subscriber = { workspace = true }
+
+# E7 (#421) two-node federation harness — adds the Iroh-loopback transport seam
+# on top of the E1 content-addressing deps. Two independent in-process nodes
+# (distinct node keys + DIDs + PDS stores) dial each other over a real Iroh
+# endpoint, so Node B fetches Node A's CAR proof + content blob across an actual
+# federation transport boundary (not an in-process call). Light deps only — no
+# libtorch — keeping `cargo test -p hyprstream-pds` fast under host throttle.
+iroh = { workspace = true }
+# did:key derivation from the Ed25519 node key (ed25519_to_did_key) + the
+# IrohSubstrate two-plane transport are re-exported by hyprstream-rpc (already a
+# dev-dep above); ed25519-dalek provides the SigningKey type the node key uses.
+ed25519-dalek = { workspace = true }
+
+[lints]
+workspace = true

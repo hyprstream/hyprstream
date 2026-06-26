@@ -6,10 +6,9 @@
 use crate::services::PolicyClient;
 use crate::services::types::{MAX_FDS_GLOBAL, MAX_FDS_PER_CLIENT};
 use hyprstream_containedfs::{ContainedFs, FsError, FsHandle};
-use crate::services::{EnvelopeContext, ZmqService};
+use crate::services::{EnvelopeContext, RequestService};
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc::prelude::*;
-use hyprstream_rpc::registry::{global as endpoint_registry, SocketKind};
 use hyprstream_rpc::{StreamChannel, StreamContext};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -33,6 +32,7 @@ use crate::services::generated::registry_client::{
     dispatch_registry, serialize_response,
     StreamInfo, ErrorInfo, HealthStatus, DetailedStatusInfo, RemoteInfo,
     CloneRequest, RegisterRequest,
+    GetBlobRequest, GetBlobRequestContent,
     CreateWorktreeRequest, RemoveWorktreeRequest,
     BranchRequest, CheckoutRequest, StageFilesRequest,
     CommitRequest, MergeRequest, ContinueMergeRequest,
@@ -161,6 +161,11 @@ fn now_epoch_secs() -> u64 {
 }
 
 /// Build a Qid from filesystem metadata.
+///
+/// Advisory identity hint only — see the qid-soundness invariant on
+/// `hyprstream_vfs::Stat`. `path = inode` is rename-stable but subject to
+/// inode reuse; `version = ctime` is truncated. No authz may key on this. The
+/// content-CID-derived qid lands in #387.
 #[cfg(unix)]
 fn qid_from_metadata(meta: &std::fs::Metadata) -> Qid {
     use std::os::unix::fs::MetadataExt;
@@ -172,6 +177,9 @@ fn qid_from_metadata(meta: &std::fs::Metadata) -> Qid {
 }
 
 /// Build a Qid from metadata (non-Unix fallback).
+///
+/// `path = 0` by the "0 = unknown" convention (no inode available); this qid
+/// is NOT a usable identity. See `hyprstream_vfs::Stat`.
 #[cfg(not(unix))]
 fn qid_from_metadata(meta: &std::fs::Metadata) -> Qid {
     Qid {
@@ -181,7 +189,7 @@ fn qid_from_metadata(meta: &std::fs::Metadata) -> Qid {
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as u32)
             .unwrap_or(0),
-        path: 0, // No inode on non-Unix
+        path: 0, // No inode on non-Unix — "0 = unknown" per vfs::Stat convention
     }
 }
 
@@ -297,7 +305,7 @@ impl FidTable {
 /// 4. Continuation publishes clone progress via PUB/SUB
 ///
 /// The registry is wrapped in RwLock for interior mutability since some operations
-/// (like clone) require mutable access but ZmqService::handle_request takes &self.
+/// (like clone) require mutable access but RequestService::handle_request takes &self.
 pub struct RegistryService {
     // Business logic
     registry: Arc<RwLock<Git2DB>>,
@@ -306,7 +314,6 @@ pub struct RegistryService {
     /// Policy client for authorization checks (uses ZMQ to PolicyService)
     policy_client: PolicyClient,
     // Infrastructure (for Spawnable)
-    context: Arc<zmq::Context>,
     transport: TransportConfig,
     signing_key: SigningKey,
     /// 9P fid table for filesystem operations.
@@ -364,7 +371,6 @@ impl RegistryService {
     pub async fn new(
         base_dir: impl AsRef<Path>,
         policy_client: PolicyClient,
-        context: Arc<zmq::Context>,
         transport: TransportConfig,
         signing_key: SigningKey,
     ) -> Result<Self> {
@@ -386,7 +392,6 @@ impl RegistryService {
             registry: worker_registry,
             base_dir,
             policy_client,
-            context,
             transport,
             signing_key,
             fid_table,
@@ -743,10 +748,7 @@ impl RegistryService {
             .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
 
         // Create StreamChannel for DH key exchange and publishing
-        let stream_channel = StreamChannel::new(
-            Arc::clone(&self.context),
-            self.signing_key.clone(),
-        );
+        let stream_channel = StreamChannel::new(self.signing_key.clone());
 
         // 10 minutes expiry for clone operations
         let stream_ctx = stream_channel.prepare_stream(client_pub_bytes, 600).await?;
@@ -757,14 +759,15 @@ impl RegistryService {
             "Clone stream prepared (DH + pre-authorization via StreamChannel)"
         );
 
-        let stream_endpoint = endpoint_registry()
-            .endpoint("streams", SocketKind::Sub)
-            .to_zmq_string();
-
+        let broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()
+            .map(|o| o.broadcast_path(stream_ctx.topic()))
+            .unwrap_or_default();
         let stream_info = StreamInfo {
             stream_id: stream_ctx.stream_id().to_owned(),
-            endpoint: stream_endpoint,
-            server_pubkey: *stream_ctx.server_pubkey(),
+            dh_public: *stream_ctx.server_pubkey(),
+            broadcast_path,
+            announced_at: hyprstream_rpc::moq_stream::producer_reach(),
+            ..Default::default()
         };
 
         // Build continuation that executes the clone and streams progress
@@ -787,6 +790,237 @@ impl RegistryService {
         });
 
         Ok((stream_info, continuation))
+    }
+
+    // ========================================================================
+    // Content-addressed blob fetch (getBlob, #432)
+    // ========================================================================
+
+    /// Resolve a grantRepo identifier (at-uri / id / name / url) to a tracked
+    /// repository. Federation-portable at-uris are matched by their trailing
+    /// component against the repo name; we also accept an exact UUID, name, or
+    /// URL match so callers can use whichever they resolved.
+    async fn resolve_grant_repo(&self, grant_repo: &str) -> Option<TrackedRepository> {
+        let registry = self.registry.read().await;
+        // at-uri form: take the trailing path segment as the repo name candidate.
+        let name_candidate = grant_repo.rsplit('/').next().unwrap_or(grant_repo);
+        let found = registry
+            .list()
+            .find(|r| {
+                r.id.to_string() == grant_repo
+                    || r.url == grant_repo
+                    || r.name.as_deref() == Some(grant_repo)
+                    || r.name.as_deref() == Some(name_candidate)
+            })
+            .cloned();
+        found
+    }
+
+    /// Authorize a getBlob request. Enforces BOTH security conditions:
+    ///   (a) the authenticated caller may access `grant_repo` (Casbin query on
+    ///       `model:{name}`), AND
+    ///   (b) `grant_repo` actually contains/references the requested content
+    ///       address.
+    /// The content hash is NEVER a capability — possessing the hash grants
+    /// nothing; entitlement keys entirely on `grant_repo` access. Returns the
+    /// resolved (repo, content-address) on success; `Err` denies (no bytes).
+    ///
+    /// Returns the resolved content address string for downstream reconstruction.
+    async fn authorize_get_blob(
+        &self,
+        ctx: &EnvelopeContext,
+        data: &GetBlobRequest,
+    ) -> Result<String> {
+        // Extract the content address from the union.
+        let address = match &data.content {
+            GetBlobRequestContent::GitOid(oid) => oid.clone(),
+            GetBlobRequestContent::XetMerkle(m) => m.clone(),
+        };
+        let is_git_oid = matches!(&data.content, GetBlobRequestContent::GitOid(_));
+
+        if data.grant_repo.trim().is_empty() {
+            anyhow::bail!("getBlob denied: grantRepo is required (the hash is not a capability)");
+        }
+        if address.trim().is_empty() {
+            anyhow::bail!("getBlob denied: empty content address");
+        }
+
+        // Resolve grantRepo → tracked repo. Unknown repo = deny.
+        let repo = self
+            .resolve_grant_repo(&data.grant_repo)
+            .await
+            .ok_or_else(|| anyhow!("getBlob denied: grantRepo '{}' not found", data.grant_repo))?;
+        let repo_name = repo.name.clone().unwrap_or_default();
+        if repo_name.is_empty() {
+            anyhow::bail!("getBlob denied: grantRepo has no name for authz");
+        }
+
+        // ── Condition (a): caller may access grantRepo (registry/model scope). ──
+        // Reuse the standard Casbin query gate used elsewhere in this service.
+        RegistryHandler::authorize(self, ctx, &format!("model:{}", repo_name), "query")
+            .await
+            .map_err(|e| anyhow!("getBlob denied: {}", e))?;
+
+        // ── Condition (b): grantRepo actually contains the address. ──
+        // Prevents naming a public repo to exfiltrate private content not in it.
+        let contained = if is_git_oid {
+            self.repo_contains_git_oid(&repo.id, &address).await?
+        } else {
+            self.repo_contains_xet_merkle(&repo.id, &address).await?
+        };
+        if !contained {
+            anyhow::bail!(
+                "getBlob denied: grantRepo '{}' does not contain address '{}'",
+                data.grant_repo,
+                address
+            );
+        }
+
+        Ok(address)
+    }
+
+    /// Condition-(b) check for a git OID: the object must exist in grantRepo's
+    /// object database.
+    async fn repo_contains_git_oid(&self, repo_id: &git2db::RepoId, oid_hex: &str) -> Result<bool> {
+        let oid_hex = oid_hex.to_owned();
+        self.with_repo_blocking(repo_id, move |repo| {
+            let oid = match git2::Oid::from_str(&oid_hex) {
+                Ok(o) => o,
+                Err(_) => return Ok(false), // malformed OID → not contained
+            };
+            Ok(repo.odb().map(|odb| odb.exists(oid)).unwrap_or(false))
+        })
+        .await
+    }
+
+    // (helper `xet_pointer_references_merkle` defined at module scope below)
+
+    /// Condition-(b) check for a XET merkle root: grantRepo must reference the
+    /// merkle via a checked-in git-xet pointer whose merkle field EXACTLY equals
+    /// the requested hash. Content addresses are predictable (the CAS is global
+    /// and content-addressed), so presence in the store alone is NOT sufficient —
+    /// the grant repo must actually reference it.
+    ///
+    /// LIMITATION (tracked in #436): this verifies *reference*, not *provenance*.
+    /// Because the CAS is global and non-namespaced, a writer can reference a
+    /// merkle they did not upload. This is sound for public / same-trust-domain
+    /// content (the only XET fetch enabled today), but NOT sufficient isolation
+    /// for PRIVATE multitenant XET content — that path must stay gated until #436
+    /// (per-tenant CAS namespacing or commit-provenance verification) lands.
+    /// A real git-xet pointer is parsed and the merkle field is matched exactly
+    /// (not a loose substring of arbitrary blob text).
+    async fn repo_contains_xet_merkle(
+        &self,
+        repo_id: &git2db::RepoId,
+        merkle_hex: &str,
+    ) -> Result<bool> {
+        let merkle_hex = merkle_hex.to_owned();
+        self.with_repo_blocking(repo_id, move |repo| {
+            let head = match repo.head().ok().and_then(|h| h.peel_to_tree().ok()) {
+                Some(t) => t,
+                None => return Ok(false),
+            };
+            let mut found = false;
+            // Walk the HEAD tree; for each pointer-sized blob, parse it as a
+            // git-xet / git-lfs pointer and match the merkle/oid field EXACTLY.
+            head.walk(git2::TreeWalkMode::PreOrder, |_dir, entry| {
+                if entry.kind() == Some(git2::ObjectType::Blob) {
+                    if let Ok(obj) = entry.to_object(&repo) {
+                        if let Some(blob) = obj.as_blob() {
+                            // Pointers are small text files; bound the read.
+                            if blob.size() <= 4096 {
+                                if let Ok(text) = std::str::from_utf8(blob.content()) {
+                                    if xet_pointer_references_merkle(text, &merkle_hex) {
+                                        found = true;
+                                        return git2::TreeWalkResult::Abort;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                git2::TreeWalkResult::Ok
+            })
+            .ok();
+            Ok(found)
+        })
+        .await
+    }
+
+    /// Prepare a streaming getBlob: DH key exchange + a continuation that
+    /// reconstructs the content-addressed bytes via the shared cas-serve store
+    /// (CDC→xorbs→mdb_shard→bytes) and publishes them over the moq plane.
+    /// Mirrors `prepare_clone_stream`'s StreamInfo production path.
+    async fn prepare_get_blob_stream(
+        &self,
+        address: String,
+        client_ephemeral_pubkey: Option<&[u8]>,
+    ) -> Result<(StreamInfo, hyprstream_rpc::service::Continuation)> {
+        let client_pub_bytes = client_ephemeral_pubkey
+            .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
+
+        let stream_channel = StreamChannel::new(self.signing_key.clone());
+        // 10 minutes expiry — weights are GB-scale.
+        let stream_ctx = stream_channel.prepare_stream(client_pub_bytes, 600).await?;
+
+        debug!(
+            stream_id = %stream_ctx.stream_id(),
+            topic = %stream_ctx.topic(),
+            "getBlob stream prepared (DH + pre-authorization via StreamChannel)"
+        );
+
+        let broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()
+            .map(|o| o.broadcast_path(stream_ctx.topic()))
+            .unwrap_or_default();
+        let stream_info = StreamInfo {
+            stream_id: stream_ctx.stream_id().to_owned(),
+            dh_public: *stream_ctx.server_pubkey(),
+            broadcast_path,
+            announced_at: hyprstream_rpc::moq_stream::producer_reach(),
+            ..Default::default()
+        };
+
+        let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
+            Self::execute_get_blob_stream(stream_channel, stream_ctx, address).await;
+        });
+
+        Ok((stream_info, continuation))
+    }
+
+    /// Continuation body: reconstruct bytes and stream them. Reuses
+    /// `cas_serve::CasStore` for reconstruction (no reimplementation).
+    async fn execute_get_blob_stream(
+        stream_channel: StreamChannel,
+        stream_ctx: StreamContext,
+        address: String,
+    ) {
+        // 64 KiB publish frames — bound per-message size for GB-scale weights.
+        const CHUNK: usize = 64 * 1024;
+
+        let result = stream_channel
+            .run_stream(&stream_ctx, |mut publisher| async move {
+                let store = cas_serve::CasStore::from_env();
+                let bytes = match store.get_file_bytes(&address).await {
+                    Ok(b) => b,
+                    Err(e) => return (publisher, Err(anyhow!("getBlob reconstruction failed: {}", e))),
+                };
+                for frame in bytes.chunks(CHUNK) {
+                    if let Err(e) = publisher.publish_data(frame).await {
+                        return (publisher, Err(e));
+                    }
+                }
+                let result = publisher.complete_ref(b"").await;
+                (publisher, result)
+            })
+            .await;
+
+        if let Err(e) = result {
+            error!(
+                stream_id = %stream_ctx.stream_id(),
+                error = %e,
+                "getBlob stream failed"
+            );
+        }
     }
 
     /// Handle list worktrees
@@ -1439,6 +1673,22 @@ impl RegistryHandler for RegistryService {
         let branch_opt = if data.branch.is_empty() { None } else { Some(data.branch.as_str()) };
         let client_ephemeral_pubkey = ctx.ephemeral_pubkey();
         self.prepare_clone_stream(&data.url, name_opt, data.shallow, Some(data.depth), branch_opt, client_ephemeral_pubkey.as_ref().map(<[u8; 32]>::as_slice)).await
+    }
+
+    async fn handle_get_blob(&self, ctx: &EnvelopeContext, _request_id: u64,
+        data: &GetBlobRequest,
+    ) -> Result<(StreamInfo, hyprstream_rpc::service::Continuation)> {
+        // SECURITY: enforce BOTH conditions (caller-may-access-grantRepo AND
+        // grantRepo-contains-address) BEFORE any bytes are served. The hash is
+        // not a capability. A denial returns Err → the request loop emits an
+        // error response (no StreamInfo, no continuation, no bytes).
+        let address = self.authorize_get_blob(ctx, data).await?;
+        let client_ephemeral_pubkey = ctx.ephemeral_pubkey();
+        self.prepare_get_blob_stream(
+            address,
+            client_ephemeral_pubkey.as_ref().map(<[u8; 32]>::as_slice),
+        )
+        .await
     }
 
     async fn handle_register(&self, _ctx: &EnvelopeContext, _request_id: u64,
@@ -2660,17 +2910,13 @@ impl WorktreeHandler for RegistryService {
 }
 
 #[async_trait(?Send)]
-impl ZmqService for RegistryService {
+impl RequestService for RegistryService {
     async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
         dispatch_registry(self, ctx, payload).await
     }
 
     fn name(&self) -> &str {
         "registry"
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
     }
 
     fn transport(&self) -> &TransportConfig {
@@ -2747,8 +2993,107 @@ impl MetricsRegistryClient for RegistryClient {
 
 
 
+/// Parse a git-xet / git-lfs pointer file and report whether its content-hash
+/// field EXACTLY equals `merkle_hex`. This is an exact field match, not a loose
+/// substring scan — an arbitrary text blob that merely contains the hex string
+/// (e.g. in a comment or unrelated field) does NOT count as a reference.
+///
+/// Recognized forms (one key=value / `key value` per line):
+///   - git-lfs:  `oid sha256:<hex>`
+///   - git-xet:  `xet://<hex>` or `merkle: <hex>` / `merklehash = <hex>`
+///
+/// Matching is case-insensitive on the hex.
+fn xet_pointer_references_merkle(text: &str, merkle_hex: &str) -> bool {
+    let want = merkle_hex.trim().to_ascii_lowercase();
+    if want.is_empty() {
+        return false;
+    }
+    // Only treat blobs that look like a pointer file (have a version/oid/xet
+    // marker) as candidates — avoids matching arbitrary checked-in text.
+    let looks_like_pointer = text.lines().any(|l| {
+        let l = l.trim_start();
+        l.starts_with("version https://git-lfs")
+            || l.starts_with("version https://xet")
+            || l.starts_with("# xet")
+            || l.starts_with("xet://")
+    });
+    if !looks_like_pointer {
+        return false;
+    }
+    for line in text.lines() {
+        let line = line.trim();
+        // Extract the candidate hash token from known field shapes.
+        let candidate = if let Some(rest) = line.strip_prefix("oid sha256:") {
+            Some(rest.trim())
+        } else if let Some(rest) = line.strip_prefix("xet://") {
+            Some(rest.trim())
+        } else if let Some(rest) = line.strip_prefix("merkle:") {
+            Some(rest.trim())
+        } else {
+            // `merklehash = <hex>` or `merklehash <hex>`
+            line.strip_prefix("merklehash")
+                .map(|rest| rest.trim_start_matches([' ', '=', '\t']).trim())
+        };
+        if let Some(c) = candidate {
+            if c.to_ascii_lowercase() == want {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::print_stdout)]
+mod xet_pointer_tests {
+    use super::xet_pointer_references_merkle;
+
+    const HEX: &str = "abc123def456abc123def456abc123def456abc123def456abc123def456abcd";
+
+    #[test]
+    fn matches_lfs_pointer_exact_oid() {
+        let ptr = format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{HEX}\nsize 1234\n"
+        );
+        assert!(xet_pointer_references_merkle(&ptr, HEX));
+    }
+
+    #[test]
+    fn matches_xet_pointer_scheme() {
+        let ptr = format!("version https://xet.example/v1\nxet://{HEX}\n");
+        assert!(xet_pointer_references_merkle(&ptr, HEX));
+    }
+
+    #[test]
+    fn rejects_non_pointer_text_containing_hex() {
+        // An arbitrary checked-in file that merely contains the hex string is
+        // NOT a reference — this is the sub-gap the old substring scan allowed.
+        let doc = format!("# notes\nsome unrelated text mentioning {HEX} in passing\n");
+        assert!(!xet_pointer_references_merkle(&doc, HEX));
+    }
+
+    #[test]
+    fn rejects_pointer_with_different_oid() {
+        let other = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let ptr = format!("version https://git-lfs.github.com/spec/v1\noid sha256:{other}\n");
+        assert!(!xet_pointer_references_merkle(&ptr, HEX));
+    }
+
+    #[test]
+    fn rejects_empty_merkle() {
+        let ptr = format!("version https://git-lfs.github.com/spec/v1\noid sha256:{HEX}\n");
+        assert!(!xet_pointer_references_merkle(&ptr, ""));
+    }
+}
+
+#[cfg(test)]
+// Test-only: panics-on-error and ergonomic literals are acceptable in fixtures.
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::str_to_string,
+    clippy::needless_borrow,
+    clippy::mem_forget
+)]
 mod tests {
     use super::*;
     use crate::auth::PolicyManager;
@@ -2762,8 +3107,16 @@ mod tests {
         use hyprstream_service::InprocManager;
         use hyprstream_rpc::transport::TransportConfig;
 
+        // Tests use Classical (EdDSA-only) keys — install Classical verify
+        // policy so the global fail-closed Hybrid default doesn't reject them.
+        let _ = hyprstream_rpc::envelope::install_verify_config(
+            hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+                policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
+                pq_store: None,
+            },
+        );
+
         let temp_dir = TempDir::new().expect("test: create temp dir");
-        let context = crate::zmq::global_context();
 
         // Generate keypair for signing/verification
         let (signing_key, _verifying_key) = generate_signing_keypair();
@@ -2779,7 +3132,6 @@ mod tests {
             Arc::new(signing_key.clone()),
             crate::config::TokenConfig::default(),
             git2db,
-            context.clone(),
             policy_transport,
         );
         let manager = InprocManager::new();
@@ -2791,14 +3143,13 @@ mod tests {
             signing_key.clone(),
             signing_key.verifying_key(),
             None,
-        );
+        ).expect("test: create policy client");
 
         // Start the registry service with policy client
         let registry_transport = TransportConfig::inproc("test-registry-health");
         let registry_service = RegistryService::new(
             temp_dir.path(),
             policy_client,
-            context.clone(),
             registry_transport,
             signing_key.clone(),
         ).await.expect("test: create registry service");
@@ -2810,12 +3161,110 @@ mod tests {
             signing_key.clone(),
             signing_key.verifying_key(),
             None,
-        );
+        ).expect("test: create registry client");
         // health_check returns () on success
         let result = client.health_check().await;
         assert!(result.is_ok(), "health_check should succeed: {:?}", result.err());
 
         // Stop the service
+        let _ = handle.stop().await;
+    }
+
+    // ── #432 getBlob authz: the hash is NOT a capability ──────────────────────
+    // These deny-path tests are the load-bearing security checks: a caller that
+    // presents a valid-looking content address but no legitimate grant must be
+    // refused, because XET global-dedup makes content hashes predictable for any
+    // public-derived content. Both conditions (grantRepo access AND grantRepo
+    // contains the address) gate the bytes; here we exercise the cheap denials
+    // (empty / unknown grantRepo) that need no content setup.
+    async fn spawn_registry_for_authz_test(
+        temp_dir: &TempDir,
+        suffix: &str,
+    ) -> (RegistryClient, hyprstream_service::InprocManager, hyprstream_service::SpawnedService) {
+        use hyprstream_service::InprocManager;
+        use hyprstream_rpc::transport::TransportConfig;
+
+        let _ = hyprstream_rpc::envelope::install_verify_config(
+            hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+                policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
+                pq_store: None,
+            },
+        );
+        let (signing_key, _vk) = generate_signing_keypair();
+        let policy_manager = Arc::new(PolicyManager::permissive().await.expect("test: policy manager"));
+        let policy_transport = TransportConfig::inproc(format!("test-policy-{suffix}"));
+        let git2db = Arc::new(tokio::sync::RwLock::new(
+            git2db::Git2DB::open(temp_dir.path()).await.expect("test: open git2db"),
+        ));
+        let policy_service = PolicyService::new(
+            policy_manager,
+            Arc::new(signing_key.clone()),
+            crate::config::TokenConfig::default(),
+            git2db,
+            policy_transport,
+        );
+        let manager = InprocManager::new();
+        let _policy_handle = manager.spawn(Box::new(policy_service)).await.expect("test: start policy");
+        let policy_client: PolicyClient = PolicyClient::for_endpoint(
+            &format!("inproc://test-policy-{suffix}"),
+            signing_key.clone(),
+            signing_key.verifying_key(),
+            None,
+        ).expect("test: policy client");
+        let registry_transport = TransportConfig::inproc(format!("test-registry-{suffix}"));
+        let registry_service = RegistryService::new(
+            temp_dir.path(),
+            policy_client,
+            registry_transport,
+            signing_key.clone(),
+        ).await.expect("test: create registry service");
+        let handle = manager.spawn(Box::new(registry_service)).await.expect("test: start registry");
+        let client: RegistryClient = RegistryClient::for_endpoint(
+            &format!("inproc://test-registry-{suffix}"),
+            signing_key.clone(),
+            signing_key.verifying_key(),
+            None,
+        ).expect("test: registry client");
+        // Leak the policy handle for the test's lifetime (dropped at process exit).
+        std::mem::forget(_policy_handle);
+        (client, manager, handle)
+    }
+
+    #[tokio::test]
+    async fn test_get_blob_denied_empty_grant_repo() {
+        // A predictable-looking git OID with NO grant context must be refused:
+        // possessing the hash grants nothing.
+        let temp_dir = TempDir::new().expect("test: temp dir");
+        let (client, _manager, mut handle) =
+            spawn_registry_for_authz_test(&temp_dir, "blob-empty").await;
+        let req = GetBlobRequest {
+            content: GetBlobRequestContent::GitOid("a".repeat(40)),
+            grant_repo: String::new(),
+        };
+        let res = client.get_blob(&req, [0u8; 32]).await;
+        assert!(
+            res.is_err(),
+            "getBlob with empty grantRepo must be denied (hash is not a capability), got: {res:?}"
+        );
+        let _ = handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_blob_denied_unknown_grant_repo() {
+        // A grant repo the registry doesn't track must be refused before any
+        // content lookup — a caller can't name an arbitrary repo to fish bytes.
+        let temp_dir = TempDir::new().expect("test: temp dir");
+        let (client, _manager, mut handle) =
+            spawn_registry_for_authz_test(&temp_dir, "blob-unknown").await;
+        let req = GetBlobRequest {
+            content: GetBlobRequestContent::XetMerkle("bafyunknownmerkleroot".to_string()),
+            grant_repo: "at://did:web:nope.example/ai.hyprstream.model/missing".to_string(),
+        };
+        let res = client.get_blob(&req, [0u8; 32]).await;
+        assert!(
+            res.is_err(),
+            "getBlob with unknown grantRepo must be denied, got: {res:?}"
+        );
         let _ = handle.stop().await;
     }
 }

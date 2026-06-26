@@ -91,16 +91,22 @@ purpose tag.
 
 ## Wizard behavior
 
-`hyprstream wizard --non-interactive --start` will, for the local OS user:
+Both the non-interactive (`hyprstream wizard --non-interactive --start`, using
+the local OS username) and the interactive path (operator-entered username +
+role) register identity the same way, via `register_local_identity`:
 
 1. Generate `user-signing-key` if absent.
-2. Create a user record using the local OS username.
-3. Call `add_pubkey(<username>, <pubkey>, label="wizard")` to register the
-   pubkey.
-4. Issue an initial bearer token for the user and print it.
+2. Create a user record for the username (OS user, or the entered name).
+3. Call `add_pubkey(<username>, <pubkey>, label="wizard")` to bind the
+   `user-signing-key` pubkey — this is the credential the CLI authenticates
+   with, so it must be bound or the CLI falls back to `anonymous`.
+4. (Non-interactive `--start`) Issue an initial bearer token for the user.
 
-If the user already exists, it leaves the record alone but may re-import the
-pubkey (a no-op when fingerprint matches).
+If the user already exists, the record is left alone and the pubkey bind is a
+no-op when the fingerprint already matches. If the `user-signing-key` pubkey
+was previously bound to a *different* user (e.g. an `anonymous` record left by a
+prior partial run), it is **re-pointed** to the current user — there is exactly
+one local user-signing-key, so it maps to exactly one identity.
 
 ## Key rotation
 

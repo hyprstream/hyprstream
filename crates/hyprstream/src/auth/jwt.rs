@@ -74,7 +74,6 @@ pub fn generate_es256_key() -> Es256SigningKey {
 // ── ML-DSA-65 JWT encoding (draft-ietf-cose-dilithium-11) ──────────────
 
 /// Encode and sign a JWT with ML-DSA-65 (`alg: "ML-DSA-65"`, `kty: "AKP"`).
-#[cfg(feature = "pq-hybrid")]
 pub fn encode_ml_dsa_65(
     claims: &Claims,
     signing_key: &hyprstream_rpc::crypto::pq::MlDsaSigningKey,
@@ -109,7 +108,6 @@ pub fn encode_ml_dsa_65(
 ///
 /// Signature = ML-DSA-65 sig (3309 bytes) ∥ Ed25519 sig (64 bytes).
 /// Per draft-ietf-jose-pq-composite-sigs.
-#[cfg(feature = "pq-hybrid")]
 pub fn encode_composite_ml_dsa_65_ed25519(
     claims: &Claims,
     ml_dsa_key: &hyprstream_rpc::crypto::pq::MlDsaSigningKey,
@@ -155,7 +153,6 @@ pub fn encode_composite_ml_dsa_65_ed25519(
 }
 
 /// Encode a service WIT (`typ: "wit+jwt"`) with ML-DSA-65-Ed25519 composite signature.
-#[cfg(feature = "pq-hybrid")]
 pub fn encode_composite_service_jwt(
     claims: &Claims,
     ml_dsa_key: &hyprstream_rpc::crypto::pq::MlDsaSigningKey,
@@ -201,7 +198,6 @@ pub fn encode_composite_service_jwt(
 }
 
 /// Build a JWK for an ML-DSA-65 key (`kty: "AKP"`).
-#[cfg(feature = "pq-hybrid")]
 pub fn ml_dsa_65_jwk(
     vk: &hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,
 ) -> serde_json::Value {
@@ -222,7 +218,6 @@ pub fn ml_dsa_65_jwk(
 }
 
 /// Build a JWK for a composite ML-DSA-65-Ed25519 key (`kty: "AKP"`).
-#[cfg(feature = "pq-hybrid")]
 pub fn composite_jwk(
     ml_dsa_vk: &hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,
     ed25519_vk: &ed25519_dalek::VerifyingKey,
@@ -313,7 +308,6 @@ mod tests {
         assert!(decoded.jti.is_some());
     }
 
-    #[cfg(feature = "pq-hybrid")]
     #[test]
     fn ml_dsa_65_roundtrip() {
         let (sk, vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
@@ -334,7 +328,6 @@ mod tests {
         assert!(decoded.jti.is_some());
     }
 
-    #[cfg(feature = "pq-hybrid")]
     #[test]
     fn ml_dsa_65_jwk_structure() {
         let (sk, _) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
@@ -347,7 +340,6 @@ mod tests {
         assert!(jwk["pub"].as_str().is_some());
     }
 
-    #[cfg(feature = "pq-hybrid")]
     #[test]
     fn composite_ml_dsa_65_ed25519_roundtrip() {
         let (ml_dsa_sk, ml_dsa_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
@@ -371,7 +363,6 @@ mod tests {
         assert!(decoded.jti.is_some());
     }
 
-    #[cfg(feature = "pq-hybrid")]
     #[test]
     fn composite_jwk_structure() {
         let (ml_dsa_sk, _) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
@@ -387,7 +378,6 @@ mod tests {
         assert!(jwk["pub"].as_str().is_some());
     }
 
-    #[cfg(feature = "pq-hybrid")]
     #[test]
     fn ml_dsa_65_wrong_key_rejects() {
         let (sk, _) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
@@ -397,7 +387,6 @@ mod tests {
         assert!(hyprstream_rpc::auth::jwt::decode_ml_dsa_65(&token, &wrong_vk, None).is_err());
     }
 
-    #[cfg(feature = "pq-hybrid")]
     #[test]
     fn composite_wrong_ed25519_key_rejects() {
         let (ml_dsa_sk, ml_dsa_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
@@ -411,7 +400,6 @@ mod tests {
         ).is_err());
     }
 
-    #[cfg(feature = "pq-hybrid")]
     #[test]
     fn ml_dsa_65_expired_token_rejected() {
         let (sk, vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
@@ -421,7 +409,6 @@ mod tests {
         assert!(matches!(err, hyprstream_rpc::auth::JwtError::Expired));
     }
 
-    #[cfg(feature = "pq-hybrid")]
     #[test]
     fn composite_expired_token_rejected() {
         let (ml_dsa_sk, ml_dsa_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
@@ -435,7 +422,6 @@ mod tests {
         assert!(matches!(err, hyprstream_rpc::auth::JwtError::Expired));
     }
 
-    #[cfg(feature = "pq-hybrid")]
     #[test]
     fn ml_dsa_65_rejects_eddsa_token() {
         let ed25519_sk = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
@@ -445,7 +431,6 @@ mod tests {
         assert!(hyprstream_rpc::auth::jwt::decode_ml_dsa_65(&token, &vk, None).is_err());
     }
 
-    #[cfg(feature = "pq-hybrid")]
     #[test]
     fn ml_dsa_65_lenient_audience() {
         let (sk, vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
@@ -457,7 +442,6 @@ mod tests {
         ).is_ok());
     }
 
-    #[cfg(feature = "pq-hybrid")]
     #[test]
     fn ml_dsa_65_wrong_audience_rejected() {
         let (sk, vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();

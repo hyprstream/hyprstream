@@ -7,7 +7,7 @@
 //! # Architecture
 //!
 //! ```text
-//! WorkerService (ZmqService)
+//! WorkerService (RequestService)
 //!     │
 //!     ├── RuntimeClient trait (client-side interface)
 //!     │     ├── run_pod_sandbox()    → Creates Kata VM
@@ -78,7 +78,7 @@ pub use pool::{PoolStats, SandboxPool};
 pub use sandbox::PodSandbox;
 pub use service::WorkerService;
 // Re-export service infrastructure from hyprstream-rpc for convenience
-pub use hyprstream_rpc::service::{EnvelopeContext, ServiceHandle, ZmqService};
+pub use hyprstream_rpc::service::{EnvelopeContext, ServiceHandle, RequestService};
 pub use virtiofs::{SandboxVirtiofs, SandboxVirtiofsBuilder};
 
 /// CRI runtime version

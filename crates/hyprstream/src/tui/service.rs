@@ -1,6 +1,6 @@
 //! TuiService — ZMQ RPC service for the TUI multiplexer.
 //!
-//! Implements `ZmqService` for the TUI display server. Manages sessions,
+//! Implements `RequestService` for the TUI display server. Manages sessions,
 //! windows, and panes via RPC. Frame publishing is handled separately
 //! by the frame loop task (not in the service struct).
 
@@ -17,11 +17,10 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use hyprstream_rpc::moq_stream::{AnyStreamPublisher, global_moq_origin};
 use hyprstream_rpc::prelude::*;
-use hyprstream_rpc::streaming::{
-    BatchingConfig, StreamChannel, StreamContext, StreamPublisher, StreamPublisherConfig,
-};
-use hyprstream_rpc::{EnvelopeContext, ZmqService, Continuation};
+use hyprstream_rpc::streaming::{StreamChannel, StreamContext};
+use hyprstream_rpc::{EnvelopeContext, RequestService, Continuation};
 
 use crate::tui_capnp;
 use crate::services::PolicyClient;
@@ -47,16 +46,18 @@ pub enum DisplayMode {
 
 /// A connected viewer's handle — tracks its publisher and health.
 ///
-/// This is `!Send` because `StreamPublisher` contains a `tmq::push::Push` socket.
-/// Viewer handles live on the frame loop's local task (spawned via `spawn_local`).
+/// On the moq path `AnyStreamPublisher` wraps a `MoqStreamPublisher`.
+/// (`!Send`); viewer handles therefore live on the frame loop's local task
+/// (spawned via `spawn_local`).  On the moq path the publisher is `Send`, but
+/// `spawn_local` is kept for uniformity.
 struct ViewerHandle {
     /// Viewer ID.
     id: u32,
     /// FD 1 (stdout): dedicated publisher for this viewer's frame stream.
-    publisher: StreamPublisher,
+    publisher: AnyStreamPublisher,
     /// FD 0 (stdin): publisher for relaying viewer input back to the CLI process.
     /// Only populated when a session has a remote process that needs input relay.
-    stdin_publisher: Option<StreamPublisher>,
+    stdin_publisher: Option<AnyStreamPublisher>,
     /// How this viewer wants frames encoded.
     display_mode: DisplayMode,
     /// Consecutive frames that failed to send (HWM full).
@@ -134,11 +135,9 @@ pub struct TuiService {
     state: Arc<RwLock<TuiState>>,
     /// Next viewer ID counter (atomic for Send+Sync).
     next_viewer_id: AtomicU32,
-    /// ZMQ context (required by ZmqService).
-    context: Arc<zmq::Context>,
-    /// Transport config (required by ZmqService).
+    /// Transport config (required by RequestService).
     transport: TransportConfig,
-    /// Signing key (required by ZmqService).
+    /// Signing key (required by RequestService).
     signing_key: SigningKey,
     /// Per-session viewer registration channels + frame loop tokens.
     sessions: SessionRegistry,
@@ -163,14 +162,12 @@ impl TuiService {
     /// Create a new TUI service.
     pub fn new(
         state: Arc<RwLock<TuiState>>,
-        context: Arc<zmq::Context>,
         transport: TransportConfig,
         signing_key: SigningKey,
     ) -> Self {
         Self {
             state,
             next_viewer_id: AtomicU32::new(1),
-            context,
             transport,
             signing_key,
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -335,8 +332,13 @@ impl TuiService {
         // DH key exchange derives context from client's ephemeral pubkey.
         // If no pubkey (local/test connections), generate random standalone contexts.
         let make_stream_ctx = |label: &str| -> Result<StreamContext> {
+            // #321: the TUI PTY/shell viewer receives only `(mac_key, topic)` out of
+            // band (see tui_handlers / shell_handlers) and never derives the DH
+            // `enc_key`, so transport AEAD is disabled for these same-host streams.
+            // The blocks remain HMAC-chain authenticated. (AEAD stays mandatory + ON
+            // for the DH-keyed mesh inference stream, whose consumer derives enc_key.)
             match ctx.ephemeral_pubkey() {
-                Some(pubkey) => StreamContext::from_dh(&pubkey),
+                Some(pubkey) => Ok(StreamContext::from_dh(&pubkey)?.without_aead()),
                 None => {
                     use rand::RngCore;
                     let mut rng = rand::thread_rng();
@@ -357,13 +359,20 @@ impl TuiService {
         let stdin_ctx = make_stream_ctx("stdin")?;
         let stdout_ctx = make_stream_ctx("stdout")?;
 
-        let sub_endpoint = hyprstream_rpc::registry::global()
-            .endpoint("streams", hyprstream_rpc::registry::SocketKind::Sub)
-            .to_zmq_string();
+        // Build the moq broadcast paths when moq is active. The same-host UDS
+        // path is NOT advertised (#356): co-located viewers resolve it from LOCAL
+        // config, and cross-process viewers dial the networked reach instead.
+        let stdin_moq_path = global_moq_origin()
+            .map(|o| o.broadcast_path(stdin_ctx.topic()))
+            .unwrap_or_default();
+        let stdout_moq_path = global_moq_origin()
+            .map(|o| o.broadcast_path(stdout_ctx.topic()))
+            .unwrap_or_default();
 
-        let streams: [(&str, &str, &[u8; 32]); 2] = [
-            (stdin_ctx.topic(), &sub_endpoint, stdin_ctx.mac_key()),
-            (stdout_ctx.topic(), &sub_endpoint, stdout_ctx.mac_key()),
+        // (topic, mac_key, broadcast_path)
+        let streams: [(&str, &[u8; 32], &str); 2] = [
+            (stdin_ctx.topic(), stdin_ctx.mac_key(), &stdin_moq_path),
+            (stdout_ctx.topic(), stdout_ctx.mac_key(), &stdout_moq_path),
         ];
 
         let response = self.build_connect_response(
@@ -382,7 +391,6 @@ impl TuiService {
         // Build continuation: send viewer registration to frame loop
         let sessions_reg = Arc::clone(&self.sessions);
         let tui_state = Arc::clone(&self.state);
-        let zmq_context = Arc::clone(&self.context);
         let sk = self.signing_key.clone();
         let stdin_queues = Arc::clone(&self.stdin_queues);
         let continuation: Continuation = Box::pin(async move {
@@ -393,9 +401,8 @@ impl TuiService {
                 // Spawn frame loop for this session
                 let s = Arc::clone(&tui_state);
                 let c = cancel.clone();
-                let ctx = Arc::clone(&zmq_context);
                 let sq = Arc::clone(&stdin_queues);
-                tokio::task::spawn_local(run_frame_loop(s, sid, rx, ctx, sk, c, sq));
+                tokio::task::spawn_local(run_frame_loop(s, sid, rx, sk, c, sq));
                 info!(session_id = sid, "Frame loop spawned");
                 (tx, cancel)
             });
@@ -825,7 +832,7 @@ impl TuiService {
             self.signing_key.clone(),
             policy_vk,
             None,
-        );
+        )?;
 
         let registry_key_resp = policy_client.resolve_service_key(
             &crate::services::generated::policy_client::ResolveServiceKey {
@@ -848,21 +855,17 @@ impl TuiService {
         ).map_err(|e| anyhow::anyhow!("Invalid model key: {e}"))?;
 
         let models = {
-            let registry_endpoint = hyprstream_rpc::registry::global()
-                .endpoint("registry", hyprstream_rpc::registry::SocketKind::Rep)
-                .to_zmq_string();
             let registry_client: crate::services::RegistryClient =
-                crate::services::RegistryClient::for_endpoint(
-                    &registry_endpoint,
+                crate::services::RegistryClient::for_service(
                     self.signing_key.clone(),
                     registry_vk,
                     None,
-                );
+                )?;
             let model_client_for_status = crate::services::generated::model_client::ModelClient::for_service(
                 self.signing_key.clone(),
                 model_vk,
                 None,
-            );
+            )?;
             let status_timeout = std::time::Duration::from_millis(500);
             let all_status_req = crate::services::generated::model_client::StatusRequest { model_ref: String::new() };
             let (repos_result, status_result) = tokio::join!(
@@ -912,11 +915,17 @@ impl TuiService {
                 let vk  = model_vk_load;
                 // Submit load — returns "accepted" immediately (Continuation pattern).
                 h.block_on(async {
-                    let client = crate::services::generated::model_client::ModelClient::for_service(
+                    let client = match crate::services::generated::model_client::ModelClient::for_service(
                         sk.clone(),
                         vk,
                         None,
-                    );
+                    ) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!("Failed to create ModelClient: {e}");
+                            return;
+                        }
+                    };
                     let _ = client.load(&crate::services::generated::model_client::LoadModelRequest {
                         model_ref: mr.clone(),
                         max_context: None,
@@ -932,11 +941,17 @@ impl TuiService {
                     for _ in 0..60u32 {   // max ~2 minutes (60 × 2 s)
                         std::thread::sleep(std::time::Duration::from_secs(2));
                         let loaded = h_poll.block_on(async {
-                            let client = crate::services::generated::model_client::ModelClient::for_service(
+                            let client = match crate::services::generated::model_client::ModelClient::for_service(
                                 sk_poll.clone(),
                                 vk_poll,
                                 None,
-                            );
+                            ) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    tracing::warn!("Failed to create ModelClient: {e}");
+                                    return false;
+                                }
+                            };
                             client.status(&crate::services::generated::model_client::StatusRequest { model_ref: mr_poll.clone() }).await
                                 .is_ok_and(|es| es.iter().any(|e| e.status == "loaded"))
                         });
@@ -956,11 +971,17 @@ impl TuiService {
             let sk = sk_unload.clone();
             let mr = model_ref.to_owned();
             handle_unload.block_on(async move {
-                let client = crate::services::generated::model_client::ModelClient::for_service(
+                let client = match crate::services::generated::model_client::ModelClient::for_service(
                     sk.clone(),
                     model_vk_unload,
                     None,
-                );
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!("Failed to create ModelClient: {e}");
+                        return false;
+                    }
+                };
                 client.unload(&crate::services::generated::model_client::UnloadModelRequest { model_ref: mr.clone() }).await.is_ok()
             })
         });
@@ -981,7 +1002,13 @@ impl TuiService {
                 let rmd = rmd_clone.clone();
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = crate::services::RegistryClient::for_service(sk, rvk, None);
+                        let registry = match crate::services::RegistryClient::for_service(sk, rvk, None) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                let _ = tx.send(GitOpProgress::Failed(format!("Failed to create RegistryClient: {e}")));
+                                return;
+                            }
+                        };
                         let model_name = name.unwrap_or_else(|| {
                             url.rsplit('/').next().unwrap_or("model")
                                 .trim_end_matches(".git").to_owned()
@@ -1011,7 +1038,7 @@ impl TuiService {
                                             let stage = parts[0];
                                             let current: u64 = parts[1].parse().unwrap_or(0);
                                             let total: u64 = parts[2].parse().unwrap_or(0);
-                                            let pct = if total > 0 { ((current * 70) / total).min(70) as u8 } else { 0 };
+                                            let pct = (current * 70).checked_div(total).map(|v| v.min(70) as u8).unwrap_or(0);
                                             let label = match stage {
                                                 "fetch" => "Fetching objects",
                                                 "indexing" => "Indexing",
@@ -1076,7 +1103,13 @@ impl TuiService {
                 let rvk = rvk_pull;
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = crate::services::RegistryClient::for_service(sk, rvk, None);
+                        let registry = match crate::services::RegistryClient::for_service(sk, rvk, None) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                let _ = tx.send(GitOpProgress::Failed(format!("Failed to create RegistryClient: {e}")));
+                                return;
+                            }
+                        };
                         let model_name = model_ref.split(':').next().unwrap_or(&model_ref);
                         let tracked = match registry.get_by_name(model_name).await {
                             Ok(t) => t,
@@ -1111,7 +1144,13 @@ impl TuiService {
                 let rvk = rvk_push;
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = crate::services::RegistryClient::for_service(sk, rvk, None);
+                        let registry = match crate::services::RegistryClient::for_service(sk, rvk, None) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                let _ = tx.send(GitOpProgress::Failed(format!("Failed to create RegistryClient: {e}")));
+                                return;
+                            }
+                        };
                         let model_name = model_ref.split(':').next().unwrap_or(&model_ref);
                         let branch = model_ref.split(':').nth(1).unwrap_or("main");
                         let tracked = match registry.get_by_name(model_name).await {
@@ -1152,7 +1191,13 @@ impl TuiService {
                 let rvk = rvk_status;
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = crate::services::RegistryClient::for_service(sk, rvk, None);
+                        let registry = match crate::services::RegistryClient::for_service(sk, rvk, None) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::warn!("Failed to create RegistryClient: {e}");
+                                return;
+                            }
+                        };
                         for mr in model_refs {
                             let model_name = mr.split(':').next().unwrap_or(&mr);
                             if let Ok(tracked) = registry.get_by_name(model_name).await {
@@ -1166,10 +1211,75 @@ impl TuiService {
                 });
             });
 
-            GitOps { clone_fn, pull_fn, push_fn, fetch_status_fn }
+            let sk_refresh = self.signing_key.clone();
+            let h_refresh = handle.clone();
+            let rvk_refresh = registry_vk;
+            let mvk_refresh = model_vk;
+            let rmd_refresh = registry_models_dir.clone();
+            let refresh_fn: hyprstream_tui::shell_app::RefreshFn = Box::new(move |tx: GitProgressSender| {
+                let sk = sk_refresh.clone();
+                let h = h_refresh.clone();
+                let rvk = rvk_refresh;
+                let mvk = mvk_refresh;
+                let rmd = rmd_refresh.clone();
+                std::thread::spawn(move || {
+                    h.block_on(async {
+                        let registry_client = match crate::services::RegistryClient::for_service(sk.clone(), rvk, None) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::warn!("model-list refresh: RegistryClient: {e}");
+                                return;
+                            }
+                        };
+                        let model_client = match crate::services::generated::model_client::ModelClient::for_service(sk, mvk, None) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::warn!("model-list refresh: ModelClient: {e}");
+                                return;
+                            }
+                        };
+                        let status_timeout = std::time::Duration::from_millis(500);
+                        let all_status_req = crate::services::generated::model_client::StatusRequest { model_ref: String::new() };
+                        let (repos_result, status_result) = tokio::join!(
+                            registry_client.list(),
+                            tokio::time::timeout(status_timeout, model_client.status(&all_status_req)),
+                        );
+                        let status_map: std::collections::HashMap<String, bool> = match status_result {
+                            Ok(Ok(entries)) => entries.into_iter()
+                                .map(|e| (e.model_ref, e.status == "loaded"))
+                                .collect(),
+                            _ => std::collections::HashMap::new(),
+                        };
+                        let models: Vec<hyprstream_tui::shell_app::ModelEntry> = match repos_result {
+                            Ok(repos) => repos
+                                .into_iter()
+                                .filter(|r| !r.name.is_empty())
+                                .flat_map(|r| {
+                                    let name = r.name.clone();
+                                    let rmd = rmd.clone();
+                                    r.worktrees.into_iter().map(|wt| {
+                                        let branch = if wt.branch_name.is_empty() { "main".to_owned() } else { wt.branch_name };
+                                        let model_ref = format!("{name}:{branch}");
+                                        let loaded = *status_map.get(&model_ref).unwrap_or(&false);
+                                        let path = rmd.join(&name).join("worktrees").join(&branch);
+                                        hyprstream_tui::shell_app::ModelEntry {
+                                            model_ref, path, loaded,
+                                            ahead: 0, behind: 0, is_dirty: false,
+                                        }
+                                    }).collect::<Vec<_>>()
+                                })
+                                .collect(),
+                            Err(_) => vec![],
+                        };
+                        let _ = tx.send(GitOpProgress::ModelList(models));
+                    });
+                });
+            });
+
+            GitOps { clone_fn, pull_fn, push_fn, fetch_status_fn, refresh_fn }
         };
 
-        let app = hyprstream_tui::shell_app::ShellApp::new(models, cols, rows, load_fn, unload_fn, Some(git_ops));
+        let app = hyprstream_tui::shell_app::ShellApp::new(models, cols, rows, load_fn, unload_fn, Some(git_ops), Some(registry_models_dir.clone()));
         let config = waxterm::app::TerminalConfig::new().cols(cols).rows(rows);
         let process = super::process::spawn_app_process(app, config);
 
@@ -1272,12 +1382,12 @@ impl TuiService {
         let model_ref = model_ref.to_owned();
 
         let (tool_caller, tool_descriptions, openai_tools) =
-            super::zmq_transport::make_tool_caller(&self.signing_key);
+            super::rpc_transport::make_tool_caller(&self.signing_key);
 
         let gen_config = std::sync::Arc::new(parking_lot::RwLock::new(
             hyprstream_tui::chat_app::ChatGenConfig::default(),
         ));
-        let spawner = super::zmq_transport::make_chat_spawner(
+        let spawner = super::rpc_transport::make_chat_spawner(
             &self.signing_key,
             &model_ref,
             Some(openai_tools),
@@ -1302,7 +1412,7 @@ impl TuiService {
                         _ => "main".to_owned(),
                     };
                     crate::storage::StoragePaths::new().ok()
-                        .and_then(|sp| sp.worktree_path(&mr.model, &branch).ok())
+                        .and_then(|sp| sp.worktree_path(mr.name(), &branch).ok())
                 })
                 .map(|path| {
                     let arch = crate::runtime::model_config::ModelConfig::detect_architecture(&path);
@@ -1486,7 +1596,8 @@ impl TuiService {
         viewer_id: u32,
         session_id: u32,
         windows: &[(u32, String, Vec<(u32, (u16, u16), bool)>, u32)],
-        streams: &[(&str, &str, &[u8; 32])], // (topic, sub_endpoint, mac_key)
+        // (topic, mac_key, broadcast_path)
+        streams: &[(&str, &[u8; 32], &str)],
     ) -> Result<Vec<u8>> {
         let mut msg = Builder::new_default();
         {
@@ -1496,13 +1607,29 @@ impl TuiService {
             connect.set_viewer_id(viewer_id);
             connect.set_session_id(session_id);
 
+            // #356: the node's network-routable moq reach (the bound QUIC `/moq`
+            // endpoint, registered when the daemon's web_transport_quinn server
+            // binds), sourced from the single shared `producer_reach()` builder.
+            // Shared across all FD streams — they all live on this node's one moq
+            // plane. A cross-process viewer dials this reach instead of its own
+            // local moq UDS plane (see StreamInfo.announcedAt docs / connect_moq_reach).
+            let reach = hyprstream_rpc::moq_stream::producer_reach();
+
             // FD-indexed streams: [0]=stdin (input relay), [1]=stdout (frames)
             let mut stream_list = connect.reborrow().init_streams(streams.len() as u32);
-            for (i, (topic, sub_endpoint, mac_key)) in streams.iter().enumerate() {
+            for (i, (topic, mac_key, broadcast_path)) in streams.iter().enumerate() {
                 let mut si = stream_list.reborrow().get(i as u32);
                 si.set_topic(topic);
-                si.set_sub_endpoint(sub_endpoint);
                 si.set_mac_key(*mac_key);
+                si.set_broadcast_path(broadcast_path);
+                // Encode the networked reach via the shared generated ToCapnp impl
+                // (Destination::write_to), so the wire bytes match the inference
+                // StreamInfo's `announcedAt` 1:1.
+                let mut reach_list = si.reborrow().init_announced_at(reach.len() as u32);
+                for (j, dest) in reach.iter().enumerate() {
+                    let mut db = reach_list.reborrow().get(j as u32);
+                    hyprstream_rpc::capnp::ToCapnp::write_to(dest, &mut db);
+                }
             }
 
             let mut win_list = connect.init_windows(windows.len() as u32);
@@ -1614,7 +1741,7 @@ impl TuiService {
 }
 
 #[async_trait(?Send)]
-impl ZmqService for TuiService {
+impl RequestService for TuiService {
     async fn handle_request(
         &self,
         _ctx: &EnvelopeContext,
@@ -1737,10 +1864,6 @@ impl ZmqService for TuiService {
         "tui"
     }
 
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
-    }
-
     fn transport(&self) -> &TransportConfig {
         &self.transport
     }
@@ -1797,7 +1920,6 @@ pub(crate) async fn run_frame_loop(
     state: Arc<RwLock<TuiState>>,
     session_id: u32,
     mut cmd_rx: CommandReceiver,
-    zmq_context: Arc<zmq::Context>,
     signing_key: SigningKey,
     cancel: CancellationToken,
     stdin_queues: StdinQueues,
@@ -1808,23 +1930,22 @@ pub(crate) async fn run_frame_loop(
         s.subscribe()
     };
 
-    // Viewer list lives here (local, !Send is OK)
+    // Viewer list lives here (local, !Send is OK on ZMQ path)
     let mut viewers: Vec<ViewerHandle> = Vec::new();
     // Hosted processes attached to panes (pane_id → PaneProcess)
     let mut processes: HashMap<u32, super::process::PaneProcess> = HashMap::new();
     // Previous frame snapshot for incremental diffs (per-pane, keyed by pane_id)
     let mut prev_cells: HashMap<u32, Vec<Cell>> = HashMap::new();
     let mut has_damage = false;
-    // Delayed initial frame: after a viewer registers, wait for the ZMQ SUB to connect
-    // before publishing the first frame (avoids "slow joiner" race condition).
+    // Delayed initial frame: after a viewer registers, wait for ZMQ SUB to connect
+    // (slow-joiner race) or for the moq subscriber to appear before the first publish.
     let mut initial_frame_at: Option<tokio::time::Instant> = None;
     // Periodic heartbeat: re-publish a full frame every 2s when viewers are present.
-    // This guarantees late-joining viewers (whose SUB socket connected after the
-    // initial_frame_at fired) receive current state without waiting for new damage.
+    // This guarantees late-joining viewers receive current state without waiting for new damage.
     let mut heartbeat_at = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
 
-    // StreamChannel for creating dedicated publisher sockets
-    let stream_channel = StreamChannel::new(zmq_context, signing_key);
+    // StreamChannel for creating publisher sockets (ZMQ or moq, auto-dispatched).
+    let stream_channel = StreamChannel::new(signing_key);
 
     info!(session_id, "Frame loop started");
 
@@ -1841,31 +1962,13 @@ pub(crate) async fn run_frame_loop(
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
                     FrameLoopCommand::RegisterViewer(pending) => {
-                        // Pre-authorize stream topics with the StreamService proxy.
-                        // Without this, the proxy rejects subscriptions.
-                        let publisher_config = StreamPublisherConfig { sndhwm: 100, dedicated: true };
-                        let batching = BatchingConfig {
-                            min_batch_size: 1,
-                            max_batch_size: 1,
-                            max_block_bytes: 256 * 1024,
-                            min_rate: 1.0,
-                            max_rate: 30.0,
-                        };
-                        let exp = chrono::Utc::now().timestamp() + 86400; // 24h expiry
-
                         // FD 0 (stdin): input relay publisher — only for Capnp-mode viewers
                         // (i.e. the CLI cast player). Ansi-mode viewers don't need it;
                         // their keyboard input falls through to VTE when no producer exists.
-                        let stdin_publisher = if pending.display_mode == DisplayMode::Capnp {
+                        let stdin_publisher: Option<AnyStreamPublisher> = if pending.display_mode == DisplayMode::Capnp {
                             if let Some(stdin_ctx) = pending.stream_ctxs.first() {
-                                let topic = stdin_ctx.topic().to_owned();
-                                if let Err(e) = stream_channel.register_topic(&topic, exp, None).await {
-                                    warn!(viewer_id = pending.id, error = %e, "Failed to register stdin topic");
-                                }
-                                match stream_channel.create_publisher_socket(&publisher_config) {
-                                    Ok(socket) => Some(StreamPublisher::with_dedicated_socket(
-                                        socket, stdin_ctx, batching.clone(),
-                                    )),
+                                match stream_channel.publisher(stdin_ctx).await {
+                                    Ok(pub_) => Some(pub_),
                                     Err(e) => {
                                         warn!(viewer_id = pending.id, error = %e, "Failed to create stdin publisher");
                                         None
@@ -1886,12 +1989,6 @@ pub(crate) async fn run_frame_loop(
                                 continue;
                             }
                         };
-                        let stdout_topic = stdout_ctx.topic().to_owned();
-                        if let Err(e) = stream_channel.register_topic(&stdout_topic, exp, None).await {
-                            warn!(viewer_id = pending.id, error = %e, "Failed to register stdout topic");
-                        } else {
-                            debug!(viewer_id = pending.id, topic = %stdout_topic, "Stream topic registered with proxy");
-                        }
 
                         // Register a stdin queue for Capnp-mode viewers so they can
                         // use pollStdin RPC instead of subscribing to the ZMQ stream.
@@ -1900,11 +1997,11 @@ pub(crate) async fn run_frame_loop(
                             queues.entry(pending.id).or_default();
                         }
 
-                        match stream_channel.create_publisher_socket(&publisher_config) {
-                            Ok(socket) => {
-                                let publisher = StreamPublisher::with_dedicated_socket(
-                                    socket, stdout_ctx, batching,
-                                );
+                        let publisher_result: Result<AnyStreamPublisher, _> =
+                            stream_channel.publisher(stdout_ctx).await;
+
+                        match publisher_result {
+                            Ok(publisher) => {
                                 viewers.push(ViewerHandle {
                                     id: pending.id,
                                     publisher,
@@ -2358,6 +2455,7 @@ pub(crate) async fn run_frame_loop(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -2365,5 +2463,83 @@ mod tests {
     fn test_display_mode() {
         assert_ne!(DisplayMode::Ansi, DisplayMode::Capnp);
         assert_ne!(DisplayMode::Capnp, DisplayMode::Structured);
+    }
+
+    /// #356: the PTY StreamInfo must carry the producer's networked reach so a
+    /// cross-process viewer dials the TUI service's QUIC `/moq` endpoint instead
+    /// of its own local moq UDS plane. This exercises the exact encode path
+    /// `build_connect_response` uses — `producer_reach()` → `Destination::write_to`
+    /// into the tui StreamInfo capnp `announcedAt` field — and reads it back through
+    /// the generated `tui_client::StreamInfo` decoder, asserting the Quic dial params
+    /// survive the round-trip intact (the chat-inference fix relied on the same
+    /// reach being present; the bug was the TUI StreamInfo not carrying it).
+    #[test]
+    fn pty_stream_info_carries_dialable_reach() {
+        use hyprstream_rpc::capnp::FromCapnp;
+        use hyprstream_rpc::moq_stream::{init_global_producer_reach, producer_reach, NodeStreamReach};
+
+        // Register a networked reach exactly as the QUIC bind does (idempotent —
+        // first wins; ignore the result so concurrent tests don't fail this one).
+        let addr: std::net::SocketAddr = "127.0.0.1:4433".parse().expect("addr");
+        let _ = init_global_producer_reach(NodeStreamReach {
+            addr,
+            server_name: "localhost".to_owned(),
+            cert_hashes: vec![[0x11u8; 32]],
+            iroh_node_id: None,
+        });
+        let reach = producer_reach();
+        assert!(
+            !reach.is_empty(),
+            "producer_reach() must be non-empty after registering a NodeStreamReach"
+        );
+
+        // Build a tui StreamInfo capnp the same way build_connect_response does.
+        let mut msg = Builder::new_default();
+        {
+            let mut si = msg.init_root::<tui_capnp::stream_info::Builder<'_>>();
+            si.set_topic("deadbeef");
+            si.set_mac_key(&[7u8; 32]);
+            si.set_broadcast_path("local/streams/deadbeef");
+            let mut reach_list = si.reborrow().init_announced_at(reach.len() as u32);
+            for (j, dest) in reach.iter().enumerate() {
+                let mut db = reach_list.reborrow().get(j as u32);
+                hyprstream_rpc::capnp::ToCapnp::write_to(dest, &mut db);
+            }
+        }
+        let mut buf = Vec::new();
+        serialize::write_message(&mut buf, &msg).expect("serialize");
+
+        // Decode through the generated client StreamInfo and assert the reach
+        // carries the Quic dial parameters intact.
+        let reader = serialize::read_message(&buf[..], capnp::message::ReaderOptions::new())
+            .expect("read");
+        let si_reader = reader
+            .get_root::<tui_capnp::stream_info::Reader<'_>>()
+            .expect("root");
+        let decoded =
+            crate::services::generated::tui_client::StreamInfo::read_from(si_reader).expect("decode");
+
+        assert_eq!(
+            decoded.announced_at.len(),
+            reach.len(),
+            "decoded StreamInfo.announcedAt must round-trip the producer reach"
+        );
+        // The round-tripped reach must match the registered producer reach
+        // exactly. (Compare against the captured `producer_reach()` rather than a
+        // hardcoded cert hash: the process-global `NodeStreamReach` is first-wins,
+        // so a sibling test that registers first wins the OnceLock — what matters
+        // is that the encode/decode round-trip is lossless.)
+        assert_eq!(
+            decoded.announced_at, reach,
+            "decoded StreamInfo.announcedAt must round-trip the producer reach exactly"
+        );
+        match &decoded.announced_at[0].transport {
+            hyprstream_rpc::stream_info::TransportConfig::Quic(q) => {
+                assert_eq!(q.addr, "127.0.0.1:4433");
+                assert_eq!(q.server_name, "localhost");
+                assert_eq!(q.cert_hashes.len(), 1);
+            }
+            other => panic!("expected a Quic reach, got {other:?}"),
+        }
     }
 }

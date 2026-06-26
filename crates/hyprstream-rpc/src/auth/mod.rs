@@ -14,6 +14,8 @@ pub mod jti_blocklist;
 pub mod jwt;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod key_source;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod key_subject_resolver;
 pub mod scope;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod scope_registry;
@@ -25,6 +27,8 @@ pub use federation::FederationKeySource;
 pub use jwt::{decode, decode_unverified, decode_with_key, encode, encode_service_jwt, header_alg, header_kid, jwk_thumbprint, JwkThumbprintInput, JwtError};
 #[cfg(not(target_arch = "wasm32"))]
 pub use key_source::{ClusterKeySource, FederatedKeySource, IssuerResolver, JwksFetcher, JwksKeySource, JwksMode, JwtKeySource};
+#[cfg(not(target_arch = "wasm32"))]
+pub use key_subject_resolver::{KeySubjectResolver, set_global as set_global_key_subject_resolver};
 pub use scope::Scope;
 #[cfg(not(target_arch = "wasm32"))]
 pub use scope_registry::ScopeDefinition;

@@ -209,6 +209,60 @@ let verifying_key = signing_key.verifying_key();
 // All services must load from the same file to interoperate
 ```
 
+## Hybrid (PQ/T) Signatures — WNS posture
+
+**Location:** `crates/hyprstream-rpc/src/crypto/cose_sign.rs`, `envelope.rs`
+
+Envelopes (request `SignedEnvelope` and response `ResponseEnvelope`) carry a nested
+COSE composite: an **inner EdDSA** `COSE_Sign1` and an **outer ML-DSA-65** (FIPS 204)
+`COSE_Sign1` over `payload ‖ inner_sig`. This is a **Weak Non-Separable (WNS)**
+construction in the IETF PQUIP taxonomy: the inner classical signature stays
+*independently verifiable by design*, enabling gradual PQ migration.
+
+### Specs of record
+- **`draft-ietf-pquip-hybrid-signature-spectrums`** (PQUIP WG) — the SNS/WNS spectrum +
+  nested-construction non-separability. Our construction is **WNS**, not SNS (no fusion).
+- **RFC 9794** — PQ/T hybrid terminology.
+- **`draft-ietf-lamps-pq-composite-sigs`** — the composite alg-id `id-MLDSA65-Ed25519`,
+  bound into the COSE `external_aad` (Hybrid mode only) for *signature-level*
+  non-separability: an inner EdDSA lifted out of a Hybrid composite is not a valid
+  standalone Classical signature.
+- **`draft-ietf-cose-mldsa`** — ML-DSA in COSE. Multicodec `ml-dsa-65-pub` = `0x1211`
+  (DID `#mesh-pq` Multikey).
+- PQUIP WG: <https://datatracker.ietf.org/wg/pquip/about/>
+
+### Verification rule (per-identity, NOT blanket fail-closed)
+```rust
+// envelope.rs :: verify_cose (both SignedEnvelope and ResponseEnvelope)
+let anchored_pq = pq_store.and_then(|s| s.ml_dsa_key_for(&self.cnf));
+let require_pq = verify_policy.uses_pq() && anchored_pq.is_some();
+```
+Enforce the ML-DSA-65 outer **only** for signer identities whose PQ key is anchored
+out-of-band (`KeyedPqTrustStore`, keyed by the signer's Ed25519 `cnf`). For an
+**unanchored** signer, fall back to the inner EdDSA (classical floor) rather than
+failing closed.
+
+This is safe because `ed_vk = VerifyingKey::from_bytes(&self.cnf)` — the PQ-lookup
+identity *is* the EdDSA-verified identity — and the response path constant-time-pins
+`cnf == expected_pubkey` when the server key is known:
+
+| Signer state | Behavior | Guarantee |
+|---|---|---|
+| **anchored** | `require_pq = true` → outer enforced | un-downgradable Hybrid (a PQ adversary cannot forge ML-DSA) |
+| **unanchored** | classical inner-EdDSA floor | no weaker than the pre-PQ baseline |
+
+> **Never** reintroduce blanket fail-closed Hybrid for unanchored peers: it rejected
+> all responses on a fresh install (empty `mesh_peers`), including a node verifying its
+> own in-process services. PQ is also **never** resolved from the self-asserted COSE
+> entry (that would reintroduce the self-cert weakness).
+
+### Rollout / known limitation
+The escape hatch `HYPRSTREAM_ENVELOPE_POLICY=classical` downgrades both directions in
+lock-step for staged rollout. In multi-process mode each service signs with its own
+Ed25519 key but only the node/OAuth `#mesh-pq` VM is published, so remote per-service
+identities verify at the classical floor until each service publishes/anchors its own
+`#mesh-pq` via DID resolution (tracked under #137 / #279).
+
 ## Key Exchange
 
 **Location:** `crates/hyprstream-rpc/src/crypto/key_exchange.rs`

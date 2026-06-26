@@ -209,7 +209,230 @@ pub fn treaddir(tag: u16, fid: u32, offset: u64, count: u32) -> Vec<u8> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// R-messages (server → client) — parsed responses
+// T-messages (client → server) — parsed requests  [server-side codec]
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parsed T-message from a client.
+///
+/// Mirrors [`Response`] for the server side. Every variant carries the `tag`
+/// out-of-band via [`parse_request`]'s return so callers don't have to thread
+/// it through each arm.
+#[derive(Debug)]
+pub enum Request {
+    Version { msize: u32, version: String },
+    Attach { fid: u32, afid: u32, uname: String, aname: String },
+    Flush { oldtag: u16 },
+    Walk { fid: u32, newfid: u32, wnames: Vec<String> },
+    Lopen { fid: u32, flags: u32 },
+    Read { fid: u32, offset: u64, count: u32 },
+    Write { fid: u32, offset: u64, data: Vec<u8> },
+    Clunk { fid: u32 },
+    Getattr { fid: u32, request_mask: u64 },
+    Readdir { fid: u32, offset: u64, count: u32 },
+}
+
+/// Parse a T-message from wire bytes (including length prefix).
+///
+/// Server-side counterpart to [`parse_response`]. Unknown message types bail
+/// with an error; the caller may encode an `Rlerror` instead.
+pub fn parse_request(buf: &[u8]) -> anyhow::Result<(u16, Request)> {
+    if buf.len() < 7 {
+        anyhow::bail!("9P request too short: {} bytes", buf.len());
+    }
+
+    let mut r = Cursor::new(buf);
+    let _size = read_u32(&mut r)?;
+    let msg_type = read_u8(&mut r)?;
+    let tag = read_u16(&mut r)?;
+
+    let request = match msg_type {
+        TVERSION => {
+            let msize = read_u32(&mut r)?;
+            let version = read_string(&mut r)?;
+            Request::Version { msize, version }
+        }
+        TATTACH => {
+            let fid = read_u32(&mut r)?;
+            let afid = read_u32(&mut r)?;
+            let uname = read_string(&mut r)?;
+            let aname = read_string(&mut r)?;
+            // 9P2000.L: n_uname (ignored)
+            let _n_uname = read_u32(&mut r)?;
+            Request::Attach { fid, afid, uname, aname }
+        }
+        TFLUSH => {
+            let oldtag = read_u16(&mut r)?;
+            Request::Flush { oldtag }
+        }
+        TWALK => {
+            let fid = read_u32(&mut r)?;
+            let newfid = read_u32(&mut r)?;
+            let nwname = read_u16(&mut r)?;
+            let mut wnames = Vec::with_capacity(nwname as usize);
+            for _ in 0..nwname {
+                wnames.push(read_string(&mut r)?);
+            }
+            Request::Walk { fid, newfid, wnames }
+        }
+        TLOPEN => {
+            let fid = read_u32(&mut r)?;
+            let flags = read_u32(&mut r)?;
+            Request::Lopen { fid, flags }
+        }
+        TREAD => {
+            let fid = read_u32(&mut r)?;
+            let offset = read_u64(&mut r)?;
+            let count = read_u32(&mut r)?;
+            Request::Read { fid, offset, count }
+        }
+        TWRITE => {
+            let fid = read_u32(&mut r)?;
+            let offset = read_u64(&mut r)?;
+            let data = read_data(&mut r)?;
+            Request::Write { fid, offset, data }
+        }
+        TCLUNK => {
+            let fid = read_u32(&mut r)?;
+            Request::Clunk { fid }
+        }
+        TGETATTR => {
+            let fid = read_u32(&mut r)?;
+            let request_mask = read_u64(&mut r)?;
+            Request::Getattr { fid, request_mask }
+        }
+        TREADDIR => {
+            let fid = read_u32(&mut r)?;
+            let offset = read_u64(&mut r)?;
+            let count = read_u32(&mut r)?;
+            Request::Readdir { fid, offset, count }
+        }
+        _ => anyhow::bail!("unknown 9P request type: {msg_type}"),
+    };
+
+    Ok((tag, request))
+}
+
+/// 9P2000.L Tflush — not exercised by the client codec but defined for symmetry.
+pub const TFLUSH: u8 = 108;
+pub const RFLUSH: u8 = 109;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R-messages (server → client) — serialized responses  [server-side codec]
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Serialize an R-message (including length prefix) from a [`Response`].
+///
+/// This is the server-side write path; the client-side reader uses
+/// [`parse_response`]. `tag` is threaded in explicitly since it is a property
+/// of the request being answered, not of the response payload.
+pub fn encode_response(tag: u16, response: &Response) -> Vec<u8> {
+    match response {
+        Response::Error { ecode } => rlerror(tag, *ecode),
+        Response::Version { msize, version } => rversion(tag, *msize, version),
+        Response::Attach { qid } => rattach(tag, qid),
+        Response::Walk { qids } => rwalk(tag, qids),
+        Response::Lopen { qid, iounit } => rlopen(tag, qid, *iounit),
+        Response::Read { data } => rread(tag, data),
+        Response::Write { count } => rwrite(tag, *count),
+        Response::Clunk => rclunk(tag),
+        Response::Getattr { qid, mode, size, mtime_sec } => {
+            rgetattr(tag, qid, *mode, *size, *mtime_sec)
+        }
+        Response::Readdir { data } => rread(tag, data), // same wire shape as Rread
+    }
+}
+
+fn encode_rmessage(tag: u16, msg_type: u8, body: &[u8]) -> Vec<u8> {
+    // identical framing to T-messages
+    encode_tmessage(tag, msg_type, body)
+}
+
+pub fn rlerror(tag: u16, ecode: u32) -> Vec<u8> {
+    encode_rmessage(tag, RLERROR, &ecode.to_le_bytes())
+}
+
+pub fn rversion(tag: u16, msize: u32, version: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&msize.to_le_bytes());
+    write_string(&mut body, version);
+    encode_rmessage(tag, RVERSION, &body)
+}
+
+pub fn rattach(tag: u16, qid: &Qid) -> Vec<u8> {
+    let mut body = Vec::new();
+    qid.write_to(&mut body);
+    encode_rmessage(tag, RATTACH, &body)
+}
+
+pub fn rwalk(tag: u16, qids: &[Qid]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&(qids.len() as u16).to_le_bytes());
+    for q in qids {
+        q.write_to(&mut body);
+    }
+    encode_rmessage(tag, RWALK, &body)
+}
+
+pub fn rlopen(tag: u16, qid: &Qid, iounit: u32) -> Vec<u8> {
+    let mut body = Vec::new();
+    qid.write_to(&mut body);
+    body.extend_from_slice(&iounit.to_le_bytes());
+    encode_rmessage(tag, RLOPEN, &body)
+}
+
+pub fn rread(tag: u16, data: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    body.extend_from_slice(data);
+    encode_rmessage(tag, RREAD, &body)
+}
+
+pub fn rwrite(tag: u16, count: u32) -> Vec<u8> {
+    encode_rmessage(tag, RWRITE, &count.to_le_bytes())
+}
+
+pub fn rclunk(tag: u16) -> Vec<u8> {
+    encode_rmessage(tag, RCLUNK, &[])
+}
+
+pub fn rflush(tag: u16) -> Vec<u8> {
+    encode_rmessage(tag, RFLUSH, &[])
+}
+
+/// Encode an Rgetattr. Only the fields carried by [`Response::Getattr`] are
+/// populated; the rest are zero (matches the subset the client decoder reads).
+#[allow(clippy::too_many_lines)]
+pub fn rgetattr(tag: u16, qid: &Qid, mode: u32, size: u64, mtime_sec: u64) -> Vec<u8> {
+    // valid mask: P9_GETATTR_BASIC = 0x7ff (mode, nlink, uid, gid, rdev, size,
+    // atime, mtime, ctime). We advertise all-basic so Linux clients decode the
+    // fields we do fill.
+    let valid: u64 = 0x7ff;
+    let mut body = Vec::with_capacity(153);
+    body.extend_from_slice(&valid.to_le_bytes());
+    qid.write_to(&mut body);
+    body.extend_from_slice(&mode.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // uid
+    body.extend_from_slice(&0u32.to_le_bytes()); // gid
+    body.extend_from_slice(&1u64.to_le_bytes()); // nlink
+    body.extend_from_slice(&0u64.to_le_bytes()); // rdev
+    body.extend_from_slice(&size.to_le_bytes());
+    body.extend_from_slice(&4096u64.to_le_bytes()); // blksize
+    body.extend_from_slice(&0u64.to_le_bytes()); // blocks
+    body.extend_from_slice(&mtime_sec.to_le_bytes()); // atime_sec
+    body.extend_from_slice(&0u64.to_le_bytes()); // atime_nsec
+    body.extend_from_slice(&mtime_sec.to_le_bytes()); // mtime_sec
+    body.extend_from_slice(&0u64.to_le_bytes()); // mtime_nsec
+    body.extend_from_slice(&mtime_sec.to_le_bytes()); // ctime_sec
+    body.extend_from_slice(&0u64.to_le_bytes()); // ctime_nsec
+    body.extend_from_slice(&0u64.to_le_bytes()); // btime_sec
+    body.extend_from_slice(&0u64.to_le_bytes()); // btime_nsec
+    body.extend_from_slice(&0u64.to_le_bytes()); // gen
+    body.extend_from_slice(&0u64.to_le_bytes()); // data_version
+    encode_rmessage(tag, RGETATTR, &body)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R-messages (server → client) — parsed responses  [client-side codec]
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Parsed R-message from server.

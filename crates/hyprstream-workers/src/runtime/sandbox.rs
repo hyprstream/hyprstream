@@ -46,6 +46,11 @@ pub struct PodSandbox {
 
     /// Image ID being served to this sandbox
     pub(crate) image_id: Option<String>,
+
+    /// Serial console UNIX socket path — set by the backend when the VM starts.
+    /// For Cloud Hypervisor: path to the API socket (or a dedicated serial socket).
+    /// For nspawn: path to the console socket (if enabled).
+    pub(crate) console_socket: Option<PathBuf>,
 }
 
 impl Clone for PodSandbox {
@@ -61,6 +66,7 @@ impl Clone for PodSandbox {
             backend_handle: self.backend_handle.clone(),
             sandbox_path: self.sandbox_path.clone(),
             image_id: self.image_id.clone(),
+            console_socket: self.console_socket.clone(),
         }
     }
 }
@@ -82,6 +88,7 @@ impl PodSandbox {
             backend_handle: None,
             sandbox_path,
             image_id: None,
+            console_socket: None,
         }
     }
 
@@ -108,6 +115,7 @@ impl PodSandbox {
             backend_handle: None,
             sandbox_path: PathBuf::new(),
             image_id: None,
+            console_socket: None,
         }
     }
 
@@ -139,5 +147,10 @@ impl PodSandbox {
     /// Get the sandbox runtime directory path
     pub fn sandbox_path(&self) -> &PathBuf {
         &self.sandbox_path
+    }
+
+    /// Path to the VM serial console UNIX socket, if set by the backend.
+    pub fn console_socket(&self) -> Option<&std::path::Path> {
+        self.console_socket.as_deref()
     }
 }

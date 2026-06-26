@@ -20,6 +20,21 @@ pub mod siglip;
 pub use config::{ArchitectureConfig, AttentionConfig};
 // pub use lora_adapter::ArchitectureAwareLoRAAdapter; // Module removed
 
+/// Add a TTT/LoRA delta correction to a base activation, coercing the correction
+/// to the base tensor's dtype first.
+///
+/// The base model may run in BF16 while the delta matrix is forced to fp32
+/// (see `runtime/ttn_profile.rs`). Adding fp32 directly to a bf16 tensor panics
+/// in `addmm_impl_cpu_` ("expected m1 and m2 to have the same dtype").
+///
+/// This helper is the single place that performs the dtype coercion so the fix
+/// cannot be missed when a new architecture adds a delta-injection site.
+/// See #139 (original llama fix) and #440 (qwen3_5 regression).
+#[inline]
+pub fn add_delta(base: &Tensor, correction: Tensor) -> Tensor {
+    base + correction.to_kind(base.kind())
+}
+
 /// Supported model architectures
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModelArchitecture {
@@ -240,6 +255,30 @@ pub trait ModelOperations: Send {
         self.forward_with_cache(input, start_pos)
     }
 
+    /// Batched ragged forward for continuous decode (#329, epic #310).
+    ///
+    /// Each entry is `(new_token_ids, start_pos, per-sequence KVCacheManager)`;
+    /// all rows share the same query length and the single `delta` (the scheduler
+    /// groups by tenant delta). Returns stacked logits `[B, q, vocab]`. Per-row
+    /// results are equivalent to running each sequence through
+    /// `forward_with_cache_and_delta` serially (CPU-verified merge gate).
+    ///
+    /// Default: unsupported. Only architectures with batched-decode support
+    /// (Llama in v1) override this; callers fall back to the batch=1 path.
+    fn forward_batched(
+        &self,
+        _sequences: &mut [(
+            Vec<i64>,
+            usize,
+            std::sync::Arc<parking_lot::Mutex<crate::runtime::kv_cache::KVCacheManager>>,
+        )],
+        _delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        Err(anyhow!(
+            "continuous batching (forward_batched) is not supported for this architecture"
+        ))
+    }
+
     /// Get token embeddings for input IDs
     fn embed_tokens(&self, _input_ids: &Tensor) -> Result<Tensor> {
         Err(anyhow!("embed_tokens not implemented for this architecture"))
@@ -332,6 +371,100 @@ pub trait ModelOperations: Send {
         _delta: &crate::training::TenantDelta,
     ) -> Result<(Tensor, Option<(Tensor, Tensor)>)> {
         self.decode_layer(layer_idx, hidden_states, attention_mask, position_ids, past_kv)
+    }
+
+    /// Run a contiguous range of decoder layers — the 2b intra-host pipeline
+    /// (layer-split) primitive (#314).
+    ///
+    /// This is the missing layer-range runner that complements the already-
+    /// exposed `embed_tokens` / `forward_from_embeddings` / `apply_final_norm` /
+    /// `lm_head` / `num_layers`. Arch-agnostic orchestration composes them:
+    /// - **stage 0** : `embed_tokens` → `forward_layers(0..b)`
+    /// - **middle**  : `forward_layers(a..b)`
+    /// - **last**    : `forward_layers(a..N)` → `apply_final_norm` → `lm_head`
+    ///
+    /// `is_first`/`is_last` are *implicit* in `range` (`range.start == 0` /
+    /// `range.end == num_layers()`); the runner itself only applies decoder
+    /// layers — never embeddings, final norm, or the LM head.
+    ///
+    /// # Stage-boundary contract
+    /// The only state carried across a stage boundary is `hidden` + `start_pos`.
+    /// `position_ids` is recomputed inside from `start_pos` + seq. Per-layer KV
+    /// cache (and any SSM `conv`/`rec` state) is **stage-local and never
+    /// transferred**. `range` is in **global** layer indices; an implementation
+    /// that owns a shard remaps to its local `self.layers` via the
+    /// `layer_offset` it was constructed with.
+    ///
+    /// # Device placement
+    /// Layer `g` runs on its mapped device; the single cross-device copy is
+    /// `hidden.to_device(next)` inserted only at a boundary where the device
+    /// actually changes (zero copies within a stage or when source == dest).
+    /// The returned tensor lives on the **last owned layer's device**.
+    ///
+    /// # Arguments
+    /// * `hidden` - `[batch, seq, hidden]`; embeddings if `range.start == 0`,
+    ///   otherwise the previous stage's output.
+    /// * `range` - global layer indices this stage owns, `[a..b)`.
+    /// * `start_pos` - KV-cache start position for this forward.
+    /// * `delta` - optional per-tenant LoRA delta (delta-aware inference).
+    ///
+    /// The default implementation errors; only architectures that support the
+    /// pipeline split (Llama; Qwen3.5) override it. The single-device whole-model
+    /// `forward*` paths are unaffected — this method is purely additive.
+    fn forward_layers(
+        &self,
+        _hidden: &Tensor,
+        _range: std::ops::Range<usize>,
+        _start_pos: usize,
+        _delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        Err(anyhow!(
+            "forward_layers (pipeline layer-split) not implemented for this architecture"
+        ))
+    }
+
+    /// Training-path sibling of [`Self::forward_layers`] — the cross-device
+    /// autograd primitive for **TTT-on-split** (#316, M-TRAIN-COUPLING).
+    ///
+    /// TTT is inference-time training that must traverse the **same** layer
+    /// partition inference uses, so the backward pass materializes grads on each
+    /// parameter's own device. This runner builds that autograd graph across the
+    /// [`crate::runtime::device_pool::LayerDeviceMap`]; the lone stage-boundary
+    /// `hidden.to_device(next)` is autograd-transparent (tch `to_device` is
+    /// differentiable), so gradients flow back through it to the previous stage's
+    /// device.
+    ///
+    /// # How it differs from the inference [`Self::forward_layers`]
+    /// The inference and training paths are kept deliberately separate (as the
+    /// whole-model paths already are). The training path:
+    /// - uses **no KV cache** — full causal attention over the entire context;
+    /// - pins **`start_pos = 0`** — `position_ids` are `0..seq`;
+    /// - uses **fresh, call-local recurrent (SSM) state** for hybrid
+    ///   architectures — the persistent inference `conv`/`rec` state is never read
+    ///   or written, so a TTT step cannot pollute the inference recurrent state
+    ///   (and the split is numerically identical to the whole-model training
+    ///   forward, since per-layer recurrent state never crosses a layer boundary).
+    ///
+    /// Everything else — the global↔local layer remap via `layer_offset`, the
+    /// single boundary copy, per-layer delta injection keyed by global index —
+    /// matches [`Self::forward_layers`]. The arch-agnostic stage orchestration is
+    /// identical (`embed_tokens` → `forward_layers_train(0..b)` → … →
+    /// `forward_layers_train(a..N)` → `apply_final_norm` → `lm_head`), and the
+    /// loss/backward is driven by the caller (e.g. the TTT trainer).
+    ///
+    /// The default implementation errors; only architectures that support the
+    /// pipeline split (Llama; Qwen3.5) override it. The single-device whole-model
+    /// training path ([`crate::runtime::TorchEngine::forward_with_delta`]) is
+    /// unaffected — this method is purely additive.
+    fn forward_layers_train(
+        &self,
+        _hidden: &Tensor,
+        _range: std::ops::Range<usize>,
+        _delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        Err(anyhow!(
+            "forward_layers_train (pipeline layer-split training) not implemented for this architecture"
+        ))
     }
 
     /// Apply final layer normalization
@@ -435,5 +568,19 @@ mod tests {
             ModelArchitecture::Custom("MyModel".to_owned()).name(),
             "MyModel"
         );
+    }
+
+    /// #139/#440 regression guard: adding an fp32 delta correction to a BF16 base
+    /// activation must NOT panic in addmm/add and must yield a BF16 result.
+    #[test]
+    fn add_delta_coerces_fp32_correction_to_bf16_base() {
+        use tch::{Device, Kind, Tensor};
+        let base = Tensor::ones([2, 4], (Kind::BFloat16, Device::Cpu));
+        let correction = Tensor::ones([2, 4], (Kind::Float, Device::Cpu)) * 0.5;
+        // Without the coercion this panics: "expected m1 and m2 to have the same dtype".
+        let out = add_delta(&base, correction);
+        assert_eq!(out.kind(), Kind::BFloat16, "result must match base dtype");
+        // 1.0 (bf16) + 0.5 (coerced) = 1.5, representable in bf16.
+        assert!((out.double_value(&[0, 0]) - 1.5).abs() < 1e-2);
     }
 }

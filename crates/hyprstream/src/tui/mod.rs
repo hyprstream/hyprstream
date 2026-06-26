@@ -1,4 +1,4 @@
-//! TUI display server — terminal multiplexer over ZMQ RPC.
+//! TUI display server — terminal multiplexer over RPC.
 //!
 //! Provides session persistence, multi-pane layouts, remote access,
 //! and MCP-controllable display surfaces.
@@ -26,7 +26,7 @@ pub mod backend;
 pub mod vte_parser;
 pub mod shell_client;
 pub mod vfs;
-pub mod zmq_transport;
+pub mod rpc_transport;
 
 pub use state::{
     CursorShape, CursorState, IngestionMode, LayoutNode, PaneBuffer, ScrollOp, TuiEvent,

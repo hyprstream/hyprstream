@@ -67,20 +67,16 @@ pub use runtime::{WorkerService, SandboxBackend, SandboxHandle, KataBackend, Nsp
 pub use image::RafsStore;
 pub use workflow::WorkflowService;
 pub use events::{
-    // Spawner types (new API)
-    ProxyService, ServiceSpawner, SpawnedService,
-    // Publisher/Subscriber
-    EventPublisher, EventSubscriber, endpoints,
-    // Endpoint configuration
-    EndpointMode,
+    // Publisher/Subscriber (moq-backed, no ZMQ context needed)
+    EventPublisher, EventSubscriber,
     // Event types
     WorkerEvent, ReceivedEvent,
     SandboxStarted, SandboxStopped, ContainerStarted, ContainerStopped,
     serialize_sandbox_started, serialize_sandbox_stopped,
     serialize_container_started, serialize_container_stopped,
-    // Inproc endpoint constants
-    EVENTS_PUB, EVENTS_SUB,
 };
+// Re-export the moq event origin init function for the factory
+pub use hyprstream_rpc::moq_event::{init_global_moq_event_origin, MoqEventOrigin};
 
 // Re-export capnp modules from hyprstream-rpc (compiled once, shared by all crates)
 pub use hyprstream_rpc::annotations_capnp;

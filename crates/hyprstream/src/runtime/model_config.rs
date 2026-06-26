@@ -3,7 +3,7 @@
 //! This module provides a single source of truth for model configurations,
 //! resolving the current chaos of multiple override points.
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -21,6 +21,21 @@ static VERSION_REGEX: LazyLock<Option<Regex>> = LazyLock::new(|| {
 /// Regex for extracting layer indices from weight key names
 static LAYER_REGEX: LazyLock<Option<Regex>> = LazyLock::new(|| {
     Regex::new(r"layers\.(\d+)").ok()
+});
+
+/// Regex for extracting **decoder** layer indices from a shard manifest's
+/// `weight_map` keys (#314 follow-up to #315).
+///
+/// Anchored to the language-model decoder namespace — `model.layers.<i>.` or
+/// `language_model.model.layers.<i>.` — so a multimodal checkpoint's *vision
+/// tower* (e.g. `vision_model.encoder.layers.<j>.` /
+/// `visual.blocks.<j>.`) cannot inflate the decoder layer count and corrupt a
+/// pipeline split. The trailing `.` ensures we match a true layer-index segment
+/// (`model.layers.12.` ) and not an unrelated key that merely contains the
+/// substring. Correct for llama/qwen3_5, whose decoder weights are
+/// `model.layers.<i>.…`.
+static DECODER_LAYER_REGEX: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    Regex::new(r"(?:^|\.)(?:language_model\.)?model\.layers\.(\d+)\.").ok()
 });
 
 /// Unified model configuration that combines all sources
@@ -135,22 +150,67 @@ pub struct NestedModelConfig {
     pub torch_dtype: Option<String>,
 }
 
+/// Opt-in escape hatch: when set to a truthy value (`1`/`true`), a missing
+/// `config.json` falls back to the fragile weight-name-scan heuristic instead of
+/// hard-failing. The model's own `config.json` is authoritative; this exists only
+/// for legacy/dev checkpoints that ship raw weights with no metadata.
+const ALLOW_WEIGHT_DETECT_ENV: &str = "HYPRSTREAM_ALLOW_WEIGHT_DETECT";
+
+/// Returns true when an env var is set to a recognized truthy value.
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// Extract a mandatory unsigned integer field from a config JSON object, failing
+/// fast with a clear error (including the config path) when it is absent or not a
+/// non-negative integer. Used for the architectural dimensions that must never be
+/// silently defaulted (#315).
+fn require_u64(source: &serde_json::Value, field: &str, config_path: &Path) -> Result<u64> {
+    source[field].as_u64().with_context(|| {
+        format!(
+            "config.json ({path}) is missing required field `{field}` (or it is not a non-negative integer)",
+            path = config_path.display()
+        )
+    })
+}
+
 impl ModelConfig {
-    /// Load configuration with clear priority:
-    /// 1. config.json (if exists)
-    /// 2. Weight detection (fill missing values)
-    /// 3. Architecture defaults (last resort)
+    /// Load configuration, treating the model's own `config.json` as authoritative.
+    ///
+    /// No-fragile-fallbacks (#315): `config.json` is **required** by default. If it
+    /// is absent, loading is a hard error — a silently-guessed config can corrupt a
+    /// pipeline split (e.g. a wrong layer count). The legacy weight-name-scan
+    /// heuristic remains available only behind the explicit
+    /// `HYPRSTREAM_ALLOW_WEIGHT_DETECT=1` opt-in.
+    ///
+    /// When `model.safetensors.index.json` is present, `num_hidden_layers` is
+    /// cross-checked against the shard manifest's `weight_map`; a mismatch is a
+    /// hard error rather than a silent corruption.
     pub fn load(model_path: &Path, weights: &HashMap<String, Tensor>) -> Result<Self> {
-        // Step 1: Try to load config.json
+        // Step 1: config.json is authoritative and required.
         let config_path = model_path.join("config.json");
         let mut config = if config_path.exists() {
             info!("Loading model configuration");
             Self::from_json_file(&config_path)?
-        } else {
-            info!("⚠️ No config.json found, detecting from weights");
+        } else if env_flag(ALLOW_WEIGHT_DETECT_ENV) {
+            info!(
+                "⚠️ No config.json in {}; {ALLOW_WEIGHT_DETECT_ENV} is set, detecting from weights (fragile)",
+                model_path.display()
+            );
             Self::detect_from_weights(weights)?
+        } else {
+            bail!(
+                "config.json is required but was not found in {}. \
+                 A model's config.json is authoritative for its architecture; refusing to guess. \
+                 Set {ALLOW_WEIGHT_DETECT_ENV}=1 to opt into the legacy weight-name heuristic.",
+                model_path.display()
+            );
         };
 
+        // Step 1b: cross-check num_hidden_layers against the shard manifest.
+        config.validate_against_index(model_path)?;
 
         // Step 2: Validate against weights
         config.validate_with_weights(weights)?;
@@ -205,29 +265,51 @@ impl ModelConfig {
         // Choose config source based on architecture
         let config_source = nested_json_opt.as_ref().unwrap_or(&json);
 
+        // No-fragile-fallbacks (#315): the core architectural dimensions are
+        // *mandatory* when config.json is present. A wrong layer count or hidden
+        // size silently corrupts inference (and a pipeline split), so a
+        // missing/unparseable value is a hard error rather than a magic default.
+        // `num_hidden_layers` falls back to the top-level config for nested
+        // (Janus/Qwen3.5) layouts that carry it outside the sub-config.
+        let num_hidden_layers = config_source["num_hidden_layers"]
+            .as_u64()
+            .or_else(|| json["num_hidden_layers"].as_u64())
+            .map(|v| v as usize)
+            .with_context(|| {
+                format!(
+                    "config.json ({path}) is missing required field `num_hidden_layers`",
+                    path = path.display()
+                )
+            })?;
+        let hidden_size = require_u64(config_source, "hidden_size", path)? as usize;
+        let num_attention_heads = require_u64(config_source, "num_attention_heads", path)? as usize;
+        if num_attention_heads == 0 || num_hidden_layers == 0 || hidden_size == 0 {
+            bail!(
+                "config.json ({}) has invalid zero dimension(s): \
+                 hidden_size={hidden_size}, num_hidden_layers={num_hidden_layers}, \
+                 num_attention_heads={num_attention_heads}",
+                path.display()
+            );
+        }
+
         // Extract all configuration values from the appropriate source
         let config = Self {
             architecture: architecture.clone(),
             model_type: json["model_type"].as_str().unwrap_or("unknown").to_owned(),
             version: Self::detect_version(&json, &architecture),
 
-            hidden_size: config_source["hidden_size"].as_u64().unwrap_or(4096) as usize,
-            num_hidden_layers: config_source["num_hidden_layers"].as_u64()
-                .or_else(|| json["num_hidden_layers"].as_u64())
-                .unwrap_or(32) as usize,
-            num_attention_heads: config_source["num_attention_heads"].as_u64().unwrap_or(32) as usize,
+            hidden_size,
+            num_hidden_layers,
+            num_attention_heads,
+            // KV heads legitimately default to attention heads (MHA, not GQA).
             num_key_value_heads: config_source["num_key_value_heads"]
                 .as_u64()
-                .or_else(|| config_source["num_attention_heads"].as_u64())
-                .unwrap_or(32) as usize,
+                .map(|v| v as usize)
+                .unwrap_or(num_attention_heads),
+            // head_dim is derivable from hidden_size / heads when omitted.
             head_dim: config_source["head_dim"].as_u64()
-                .or_else(|| {
-                    // Calculate from hidden_size / num_attention_heads
-                    let hidden = config_source["hidden_size"].as_u64()?;
-                    let heads = config_source["num_attention_heads"].as_u64()?;
-                    Some(hidden / heads)
-                })
-                .unwrap_or(128) as usize,
+                .map(|v| v as usize)
+                .unwrap_or(hidden_size / num_attention_heads),
             intermediate_size: config_source["intermediate_size"].as_u64().unwrap_or(11008) as usize,
 
             vocab_size: config_source["vocab_size"].as_u64().unwrap_or(32000) as usize,
@@ -264,9 +346,7 @@ impl ModelConfig {
                 None
             },
             layer_types: if architecture == ModelArchitecture::Qwen3_5 {
-                let num_layers = config_source["num_hidden_layers"].as_u64()
-                    .or_else(|| json["num_hidden_layers"].as_u64())
-                    .unwrap_or(32) as usize;
+                let num_layers = num_hidden_layers;
                 config_source["layer_types"].as_array()
                     .map(|a| {
                         a.iter()
@@ -543,16 +623,83 @@ impl ModelConfig {
                     self.rope_theta = 10_000_000.0; // Qwen3.5 uses 10M
                 }
             }
-            ModelArchitecture::Gemma => {
-                if self.vocab_size == 262144 {
-                    self.rope_theta = 1_000_000.0;
-                    self.use_qk_norm = true;
-                    self.scale_embeddings = true;
-                    self.query_pre_attn_scalar = Some(256.0);
-                }
+            ModelArchitecture::Gemma if self.vocab_size == 262144 => {
+                self.rope_theta = 1_000_000.0;
+                self.use_qk_norm = true;
+                self.scale_embeddings = true;
+                self.query_pre_attn_scalar = Some(256.0);
             }
             _ => {}
         }
+    }
+
+    /// Cross-check `num_hidden_layers` against the shard manifest's `weight_map`.
+    ///
+    /// When `model.safetensors.index.json` is present, the number of distinct
+    /// `model.layers.<i>.` (or `*.layers.<i>.` for nested layouts) indices listed
+    /// in its `weight_map` must equal the config's `num_hidden_layers`. A mismatch
+    /// means the config and the actual checkpoint disagree about depth, which would
+    /// silently truncate or over-allocate a pipeline split — so it is a hard error.
+    ///
+    /// If the index file is absent this is a no-op: per #315 the index is required
+    /// only where the *loader* consumes it (multi-shard models, validated in
+    /// `model_factory`); a single-file model legitimately has no manifest.
+    fn validate_against_index(&self, model_path: &Path) -> Result<()> {
+        let index_path = model_path.join("model.safetensors.index.json");
+        if !index_path.exists() {
+            return Ok(());
+        }
+
+        let content = std::fs::read_to_string(&index_path).with_context(|| {
+            format!("failed to read shard manifest {}", index_path.display())
+        })?;
+        let index: serde_json::Value = serde_json::from_str(&content).with_context(|| {
+            format!("failed to parse shard manifest {}", index_path.display())
+        })?;
+        let weight_map = index["weight_map"].as_object().ok_or_else(|| {
+            anyhow::anyhow!(
+                "shard manifest {} is missing required `weight_map` object",
+                index_path.display()
+            )
+        })?;
+
+        // Count only DECODER layers (`model.layers.<i>.`), not a multimodal
+        // vision tower's own `.layers.N` — those would inflate the count and
+        // corrupt a pipeline split (#314 follow-up to #315).
+        let mut layer_indices = std::collections::HashSet::new();
+        if let Some(ref regex) = *DECODER_LAYER_REGEX {
+            for key in weight_map.keys() {
+                if let Some(captures) = regex.captures(key) {
+                    if let Ok(idx) = captures[1].parse::<usize>() {
+                        layer_indices.insert(idx);
+                    }
+                }
+            }
+        }
+
+        // Only enforce when the manifest actually encodes per-layer weights.
+        // (Some manifests for non-transformer components may carry none.)
+        if layer_indices.is_empty() {
+            return Ok(());
+        }
+
+        let manifest_layers = layer_indices.len();
+        if manifest_layers != self.num_hidden_layers {
+            bail!(
+                "num_hidden_layers mismatch: config.json declares {} but \
+                 {} lists {} distinct transformer layers in its weight_map. \
+                 Refusing to load with a layer count that disagrees with the checkpoint.",
+                self.num_hidden_layers,
+                index_path.display(),
+                manifest_layers
+            );
+        }
+
+        info!(
+            "✅ num_hidden_layers ({}) matches shard manifest weight_map",
+            self.num_hidden_layers
+        );
+        Ok(())
     }
 
     /// Validate configuration against actual weights
@@ -681,5 +828,202 @@ impl ModelConfig {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use tch::Tensor;
+
+    fn empty_weights() -> HashMap<String, Tensor> {
+        HashMap::new()
+    }
+
+    fn write(dir: &Path, name: &str, contents: &str) {
+        std::fs::write(dir.join(name), contents).unwrap();
+    }
+
+    /// A minimal-but-valid Llama-style config.json.
+    fn valid_config_json(num_layers: usize) -> String {
+        format!(
+            r#"{{
+                "model_type": "llama",
+                "hidden_size": 4096,
+                "num_hidden_layers": {num_layers},
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "intermediate_size": 11008,
+                "vocab_size": 32000,
+                "max_position_embeddings": 4096,
+                "rms_norm_eps": 1e-5
+            }}"#
+        )
+    }
+
+    /// Happy path: a model that ships a proper config.json loads with the
+    /// declared dimensions (no magic-number substitution).
+    #[test]
+    fn valid_config_loads_with_declared_dims() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "config.json", &valid_config_json(40));
+
+        let cfg = ModelConfig::load(dir.path(), &empty_weights()).expect("valid config must load");
+        assert_eq!(cfg.num_hidden_layers, 40);
+        assert_eq!(cfg.hidden_size, 4096);
+        assert_eq!(cfg.num_attention_heads, 32);
+        // head_dim derived from hidden_size / heads.
+        assert_eq!(cfg.head_dim, 128);
+        // KV heads honored (GQA), not silently set to attention-head count.
+        assert_eq!(cfg.num_key_value_heads, 8);
+    }
+
+    /// #315: a missing config.json is a hard error by default (no silent guess).
+    #[test]
+    fn missing_config_is_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = ModelConfig::load(dir.path(), &empty_weights())
+            .expect_err("missing config.json must fail");
+        assert!(
+            err.to_string().contains("config.json is required"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// #315: the silent magic-number default for num_hidden_layers is gone — a
+    /// config.json present but missing the field is a hard error (not 32).
+    #[test]
+    fn missing_num_hidden_layers_is_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "config.json",
+            r#"{"model_type":"llama","hidden_size":4096,"num_attention_heads":32}"#,
+        );
+        let err = ModelConfig::load(dir.path(), &empty_weights())
+            .expect_err("missing num_hidden_layers must fail");
+        assert!(
+            err.to_string().contains("num_hidden_layers"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// #315: the silent magic-number default for hidden_size is gone.
+    #[test]
+    fn missing_hidden_size_is_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "config.json",
+            r#"{"model_type":"llama","num_hidden_layers":32,"num_attention_heads":32}"#,
+        );
+        let err = ModelConfig::load(dir.path(), &empty_weights())
+            .expect_err("missing hidden_size must fail");
+        assert!(err.to_string().contains("hidden_size"), "unexpected error: {err}");
+    }
+
+    /// #315: num_hidden_layers must match the shard manifest's weight_map.
+    #[test]
+    fn index_layer_count_mismatch_is_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // config says 4 layers...
+        write(dir.path(), "config.json", &valid_config_json(4));
+        // ...but the manifest only has weights for layers 0,1,2 (3 layers).
+        write(
+            dir.path(),
+            "model.safetensors.index.json",
+            r#"{"weight_map":{
+                "model.layers.0.self_attn.q_proj.weight":"model-00001-of-00002.safetensors",
+                "model.layers.1.self_attn.q_proj.weight":"model-00001-of-00002.safetensors",
+                "model.layers.2.self_attn.q_proj.weight":"model-00002-of-00002.safetensors",
+                "model.embed_tokens.weight":"model-00001-of-00002.safetensors"
+            }}"#,
+        );
+        let err = ModelConfig::load(dir.path(), &empty_weights())
+            .expect_err("layer-count mismatch must fail");
+        assert!(
+            err.to_string().contains("num_hidden_layers mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Happy path: config and manifest agree on layer count → loads cleanly.
+    #[test]
+    fn index_layer_count_match_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "config.json", &valid_config_json(3));
+        write(
+            dir.path(),
+            "model.safetensors.index.json",
+            r#"{"weight_map":{
+                "model.layers.0.self_attn.q_proj.weight":"model-00001-of-00002.safetensors",
+                "model.layers.1.self_attn.q_proj.weight":"model-00001-of-00002.safetensors",
+                "model.layers.2.self_attn.q_proj.weight":"model-00002-of-00002.safetensors"
+            }}"#,
+        );
+        let cfg = ModelConfig::load(dir.path(), &empty_weights())
+            .expect("matching layer counts must load");
+        assert_eq!(cfg.num_hidden_layers, 3);
+    }
+
+    /// #314 follow-up: a multimodal vision tower's own `.layers.N` must NOT
+    /// inflate the decoder layer count when cross-checking against the manifest.
+    /// Decoder has 3 layers; the vision tower has 24 — only the decoder counts.
+    #[test]
+    fn vision_tower_layers_do_not_inflate_decoder_count() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "config.json", &valid_config_json(3));
+        write(
+            dir.path(),
+            "model.safetensors.index.json",
+            r#"{"weight_map":{
+                "model.layers.0.self_attn.q_proj.weight":"a.safetensors",
+                "model.layers.1.self_attn.q_proj.weight":"a.safetensors",
+                "model.layers.2.self_attn.q_proj.weight":"a.safetensors",
+                "vision_model.encoder.layers.0.self_attn.q_proj.weight":"v.safetensors",
+                "vision_model.encoder.layers.10.self_attn.q_proj.weight":"v.safetensors",
+                "vision_model.encoder.layers.23.self_attn.q_proj.weight":"v.safetensors",
+                "visual.blocks.5.attn.qkv.weight":"v.safetensors"
+            }}"#,
+        );
+        let cfg = ModelConfig::load(dir.path(), &empty_weights())
+            .expect("decoder layer count (3) must match despite a 24-layer vision tower");
+        assert_eq!(cfg.num_hidden_layers, 3);
+    }
+
+    /// The decoder regex also accepts the `language_model.model.layers.<i>.`
+    /// nesting used by some multimodal checkpoints.
+    #[test]
+    fn nested_language_model_layers_are_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "config.json", &valid_config_json(2));
+        write(
+            dir.path(),
+            "model.safetensors.index.json",
+            r#"{"weight_map":{
+                "language_model.model.layers.0.self_attn.q_proj.weight":"a.safetensors",
+                "language_model.model.layers.1.self_attn.q_proj.weight":"a.safetensors",
+                "vision_model.encoder.layers.0.self_attn.q_proj.weight":"v.safetensors"
+            }}"#,
+        );
+        let cfg = ModelConfig::load(dir.path(), &empty_weights())
+            .expect("nested language_model decoder layers must be counted");
+        assert_eq!(cfg.num_hidden_layers, 2);
+    }
+
+    /// A zero architectural dimension is rejected (avoids div-by-zero / corruption).
+    #[test]
+    fn zero_dimension_is_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "config.json",
+            r#"{"model_type":"llama","hidden_size":4096,"num_hidden_layers":0,"num_attention_heads":32}"#,
+        );
+        let err =
+            ModelConfig::load(dir.path(), &empty_weights()).expect_err("zero dimension must fail");
+        assert!(err.to_string().contains("zero dimension"), "unexpected error: {err}");
     }
 }

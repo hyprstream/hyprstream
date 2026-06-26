@@ -123,7 +123,13 @@ impl OneshotState {
 // Qid generation for synthetic nodes
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Synthetic Qid: deterministic hash of path as inode, monotonic version.
+/// Synthetic Qid: deterministic FNV-1a hash of the path string as the inode,
+/// with a constant version.
+///
+/// Advisory identity hint only — `version` is constant (no change-detection)
+/// and `path` is non-cryptographic and changes on rename. No authz may key on
+/// this. See the qid-soundness invariant on `hyprstream_vfs::Stat`; the
+/// content-CID-derived qid lands in #387.
 #[derive(Clone, Debug)]
 pub struct SyntheticQid {
     pub qtype: u8,
@@ -773,6 +779,12 @@ impl hyprstream_vfs::Mount for SyntheticTree {
         let (qid, name) = self.stat(fid_u32, &caller.to_string()).map_err(hyprstream_vfs::MountError::Io)?;
         Ok(hyprstream_vfs::Stat {
             qtype: qid.qtype,
+            // SyntheticQid version is a constant (no change-detection); path is
+            // fnv64 of the path string (non-cryptographic, rename-mutable). Both
+            // are threaded for surface soundness — see the qid invariant on
+            // `hyprstream_vfs::Stat`. A content-CID qid lands in #387.
+            version: qid.version,
+            path: qid.path,
             size: 0,
             name,
             mtime: 0,

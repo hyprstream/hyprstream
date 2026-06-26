@@ -53,7 +53,6 @@ pub mod storage;
 pub mod systemd;
 pub mod training;
 pub mod tui;
-pub mod zmq;
 
 // Storage exports removed
 pub use runtime::{

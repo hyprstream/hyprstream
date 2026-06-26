@@ -15,7 +15,6 @@
 //!     // Services include infrastructure and are directly Spawnable
 //!     let policy = PolicyService::new(
 //!         ...,
-//!         ctx.zmq_context(),
 //!         ctx.transport("policy", SocketKind::Rep),
 //!         ctx.verifying_key(),
 //!     );
@@ -53,6 +52,19 @@ pub struct QuicSharedConfig {
     /// JWT verifying key (derived from root via HKDF "hyprstream-jwt-v1").
     /// Published as `x_root_pubkey` in RFC 9728 metadata for client-side trust pinning.
     pub jwt_verifying_key: Option<ed25519_dalek::VerifyingKey>,
+    /// #410/#282: bind an iroh substrate (ALPNs `hyprstream-rpc/1` + `moql`)
+    /// as the PRIMARY production transport, in parallel to the quinn endpoint
+    /// (kept for back-compat), for every QUIC-enabled service. On by default;
+    /// an operator opts out via `[quic] iroh = false` to run quinn-only (legacy).
+    pub iroh_enabled: bool,
+    /// #358: the producer-chosen moq RELAY every QUIC-enabled service on this node
+    /// rendezvouses through, in wire-reach form. `None` = direct-only. Sourced
+    /// from the relay DID transport entry (default: the PDS / federation anchor)
+    /// decoded by [`hyprstream_rpc::service_entry`]; see
+    /// [`hyprstream_rpc::moq_stream::relay_reach_from_decoded`]. Threaded into each
+    /// service's [`QuicLoopConfig`] so the spawner advertises a `Role::Relay` reach
+    /// and links the origin UP to the relay.
+    pub moq_relay: Option<hyprstream_rpc::stream_info::TransportConfig>,
 }
 
 impl QuicSharedConfig {
@@ -85,6 +97,17 @@ impl QuicSharedConfig {
             server_name: self.server_name.clone(),
             protected_resource_json: metadata,
             on_quic_bound: None,
+            // #282: bind iroh in parallel when the deployment opted in. The
+            // admission hook + on_iroh_bound advert callback are threaded by the
+            // service factory (which owns PolicyService / OAuthState); left None
+            // here so iroh, when enabled, runs accept-open until that wiring lands
+            // (documented seam — see service.rs spawner).
+            iroh_enabled: self.iroh_enabled,
+            iroh_admission: None,
+            on_iroh_bound: None,
+            // #358: thread the producer-chosen relay through so the spawner
+            // advertises a Role::Relay reach + links the origin up to the relay.
+            moq_relay: self.moq_relay.clone(),
         }
     }
 
@@ -159,11 +182,17 @@ impl QuicSharedConfig {
                         let _ = policy_vk; // suppress unused warning
                     }
 
-                    let client = hyprstream_discovery::DiscoveryClient::for_service(
+                    let client = match hyprstream_discovery::DiscoveryClient::for_service(
                         sk,
                         discovery_vk,
                         None,
-                    );
+                    ) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!("Failed to build DiscoveryClient: {}", e);
+                            return;
+                        }
+                    };
                     match client.announce(&hyprstream_discovery::ServiceAnnouncement {
                         service_name: svc_name,
                         socket_kind: "quic".to_owned(),
@@ -185,9 +214,6 @@ impl QuicSharedConfig {
 /// Contains all shared resources needed by services during initialization.
 /// Passed to factory functions registered via `#[service_factory]`.
 pub struct ServiceContext {
-    /// ZMQ context (shared across all services)
-    zmq_context: Arc<zmq::Context>,
-
     /// Server's signing key (for JWT generation)
     signing_key: SigningKey,
 
@@ -234,14 +260,16 @@ pub struct ServiceContext {
 
     /// Shared ML-DSA-65 verifying keys for PQ-hybrid JWT verification.
     /// Updated by the rotation task; shared across all key sources.
-    #[cfg(feature = "pq-hybrid")]
+    ///
+    /// Uses `std::sync::RwLock` to match the cross-crate `Arc<RwLock<..>>`
+    /// contract with `hyprstream::auth::key_rotation` and `JwtKeySource`.
+    #[allow(clippy::disallowed_types)]
     ml_dsa_verifying_keys: std::sync::Arc<std::sync::RwLock<Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>>>,
 }
 
 impl ServiceContext {
     /// Create a new service context.
     pub fn new(
-        zmq_context: Arc<zmq::Context>,
         signing_key: SigningKey,
         verifying_key: VerifyingKey,
         ipc: bool,
@@ -251,7 +279,6 @@ impl ServiceContext {
             hyprstream_rpc::node_identity::NodeIdentityProvider::new(&signing_key)
         );
         Self {
-            zmq_context,
             signing_key,
             verifying_key,
             identity_provider,
@@ -263,19 +290,21 @@ impl ServiceContext {
             service_keys: HashMap::new(),
             ca_verifying_key: None,
             jwks_fetcher: None,
-            #[cfg(feature = "pq-hybrid")]
-            ml_dsa_verifying_keys: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
+            ml_dsa_verifying_keys: {
+                #[allow(clippy::disallowed_types)]
+                std::sync::Arc::new(std::sync::RwLock::new(Vec::new()))
+            },
         }
     }
 
     /// Set the shared ML-DSA-65 verifying keys for PQ-hybrid JWT verification.
-    #[cfg(feature = "pq-hybrid")]
+    #[allow(clippy::disallowed_types)]
     pub fn set_ml_dsa_verifying_keys(&mut self, keys: std::sync::Arc<std::sync::RwLock<Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>>>) {
         self.ml_dsa_verifying_keys = keys;
     }
 
     /// Get a clone of the shared ML-DSA verifying keys Arc.
-    #[cfg(feature = "pq-hybrid")]
+    #[allow(clippy::disallowed_types)]
     pub fn ml_dsa_verifying_keys_arc(&self) -> std::sync::Arc<std::sync::RwLock<Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>>> {
         self.ml_dsa_verifying_keys.clone()
     }
@@ -466,11 +495,6 @@ impl ServiceContext {
         self
     }
 
-    /// Get the shared ZMQ context.
-    pub fn zmq_context(&self) -> Arc<zmq::Context> {
-        self.zmq_context.clone()
-    }
-
     /// Get the root signing key.
     ///
     /// **Only PolicyService (the CA) should call this.** All other services must
@@ -556,15 +580,16 @@ impl ServiceContext {
                 issuer_url,
                 fetcher.clone(),
             );
-            #[cfg(feature = "pq-hybrid")]
             let source = source.with_ml_dsa_verifying_keys(self.ml_dsa_verifying_keys.clone());
+            // Authoritative local CA key for offline service-JWT resolution
+            // (no dependency on the HTTP /oauth/jwks endpoint at startup).
+            let source = source.with_local_ca_key(self.jwt_verifying_key());
             std::sync::Arc::new(source)
         } else {
             let source = hyprstream_rpc::auth::ClusterKeySource::new(
                 self.jwt_verifying_key(),
                 issuer_url,
             );
-            #[cfg(feature = "pq-hybrid")]
             let source = source.with_ml_dsa_verifying_keys(self.ml_dsa_verifying_keys.clone());
             std::sync::Arc::new(source)
         }
@@ -617,25 +642,7 @@ impl ServiceContext {
         }
     }
 
-    /// Create a typed client for a compile-time-known service.
-    ///
-    /// Uses `RpcClient<LocalSigner, ZmqConnection>` via the generated `connect_to()` constructor.
-    pub fn rpc_client(&self, service: &str) -> std::sync::Arc<dyn hyprstream_rpc::RpcClient> {
-        let endpoint = self.endpoint(service, SocketKind::Rep).to_zmq_string();
-        let signer = hyprstream_rpc::signer::LocalSigner::new(
-            self.signing_key.clone(),
-        );
-        let transport = hyprstream_rpc::zmq_connection::ZmqConnection::new(
-            &endpoint,
-            self.zmq_context.clone(),
-        );
-        let rpc = hyprstream_rpc::rpc_client::RpcClientImpl::new(
-            signer, transport, Some(self.verifying_key),
-        );
-        std::sync::Arc::new(rpc)
-    }
-
-    /// Wrap a ZmqService for spawning with a per-service QUIC port.
+    /// Wrap a RequestService for spawning with a per-service QUIC port.
     ///
     /// - `quic_port: None` → use ephemeral port (0) when QUIC is globally enabled
     /// - `quic_port: Some(0)` → ephemeral (OS-assigned) port
@@ -644,7 +651,7 @@ impl ServiceContext {
     /// When `[quic] enabled = true` in config, all services get QUIC on
     /// auto-assigned ephemeral ports by default. Set an explicit port to
     /// control which port a service uses.
-    pub fn into_spawnable_quic<S: hyprstream_rpc::service::ZmqService + Send + Sync + 'static>(
+    pub fn into_spawnable_quic<S: hyprstream_rpc::service::RequestService + Send + Sync + 'static>(
         &self,
         service: S,
         quic_port: Option<u16>,
@@ -687,10 +694,10 @@ impl ServiceContext {
         }
     }
 
-    /// Wrap a ZmqService for spawning, enabling QUIC when globally configured.
+    /// Wrap a RequestService for spawning, enabling QUIC when globally configured.
     ///
     /// Uses ephemeral port (0) for QUIC when `[quic] enabled = true`.
-    pub fn into_spawnable<S: hyprstream_rpc::service::ZmqService + Send + Sync + 'static>(
+    pub fn into_spawnable<S: hyprstream_rpc::service::RequestService + Send + Sync + 'static>(
         &self,
         service: S,
     ) -> Box<dyn Spawnable> {

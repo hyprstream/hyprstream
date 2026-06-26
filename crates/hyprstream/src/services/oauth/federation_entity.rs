@@ -115,7 +115,6 @@ pub async fn build_entity_configuration_jwt(state: &OAuthState) -> Result<String
     }
 
     // ML-DSA-65 keys from rotation store.
-    #[cfg(feature = "pq-hybrid")]
     if let Some(ref store) = state.ml_dsa_key_store {
         for slot in store.all_slots_snapshot().await {
             let ml_vk = ml_dsa::Keypair::verifying_key(&*slot.key);

@@ -1,6 +1,10 @@
 //! Handlers for git-style CLI commands
 // CLI handlers intentionally print to stdout/stderr for user interaction
 #![allow(clippy::print_stdout, clippy::print_stderr)]
+// TODO(#395): migrate `model_ref.model` reads to `model_ref.name()` as part of the
+// name-layer retirement. Suppressed here so this prep PR stays focused on the CID
+// encoder + grammar; the deprecation is enforced at the ModelRef type definition.
+#![allow(deprecated)]
 
 use crate::runtime::GenerationRequest;
 use crate::services::generated::inference_client::ChatMessage;
@@ -14,17 +18,15 @@ use crate::services::RegistryClient;
 use crate::services::generated::model_client::{ModelClient, LoadModelRequest, UnloadModelRequest, StatusRequest};
 #[cfg(feature = "experimental")]
 use crate::services::generated::registry_client::FileChangeType;
-use crate::zmq::global_context;
 use crate::storage::ModelRef;
 #[cfg(feature = "experimental")]
 use crate::storage::GitRef;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::streaming::StreamPayload;
 use hyprstream_rpc::crypto::generate_ephemeral_keypair;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use tmq::SocketExt;
 use tracing::{debug, info, warn};
 
 /// Handle branch command
@@ -385,6 +387,75 @@ pub async fn handle_commit(
     }
 
     Ok(())
+}
+
+/// Handle the `promote` command (#394).
+///
+/// Snapshots the node-local upper layer into a deterministic registry commit
+/// (`stageAll` + `commit`) and advances the atproto pointer record. This is
+/// the single-verb entry point for the promote saga — see
+/// [`crate::git::promote`] for the eventual-consistency contract and the
+/// single-writer-per-layer enforcement.
+///
+/// `author_name` / `author_email` default to the process identity when
+/// `None`; for deterministic cross-node promotes the caller should pin a
+/// stable identity (the registry service derives it from the verified
+/// `Subject`).
+#[cfg(feature = "experimental")]
+pub async fn handle_promote(
+    registry: &RegistryClient,
+    model_ref_str: &str,
+    branch: &str,
+    author_name: Option<String>,
+    author_email: Option<String>,
+) -> Result<()> {
+    use crate::git::promote::{promote, PromoteAuthor, PromoteError, PromoteLeaseTable};
+    use std::sync::Arc;
+
+    info!("Promoting {} (branch {})", model_ref_str, branch);
+
+    let model_ref = ModelRef::parse(model_ref_str)?;
+    let tracked = registry.get_by_name(&model_ref.model).await
+        .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
+    let repo_client = registry.repo(&tracked.id);
+    let wt = repo_client.worktree(branch);
+
+    let author = PromoteAuthor {
+        name: author_name.unwrap_or_else(|| "hyprstream".to_owned()),
+        email: author_email.unwrap_or_else(|| "promote@hyprstream.local".to_owned()),
+    };
+
+    // The lease table is per-process; in a multi-node deployment each node has
+    // its own table and the distributed single-writer invariant is enforced by
+    // the atproto pointer-record version check (see git::promote).
+    let lease_table = Arc::new(PromoteLeaseTable::new());
+
+    match promote(&model_ref.model, branch, &wt, &author, &lease_table).await {
+        Ok(outcome) => {
+            println!("✓ Promoted {} ({})", model_ref_str, branch);
+            println!("  Commit: {}", outcome.commit_oid);
+            if outcome.pointer_advanced {
+                println!("  atproto pointer advanced");
+            }
+            Ok(())
+        }
+        Err(PromoteError::LeaseHeld(_)) => {
+            anyhow::bail!("another promote is in progress for {}/{}", model_ref.model, branch)
+        }
+        Err(PromoteError::LocalCommit(e)) => {
+            anyhow::bail!("promote failed during local commit: {e}")
+        }
+        Err(PromoteError::PointerStale(e)) => {
+            // Content is committed; only the pointer lags. Warn, don't fail.
+            warn!(
+                model = %model_ref.model, branch, error = %e,
+                "promote: content committed but atproto pointer is stale; next promote will advance it"
+            );
+            println!("⚠ Promoted {} ({}) — content committed, pointer stale", model_ref_str, branch);
+            println!("  The atproto pointer will advance on the next successful promote.");
+            Ok(())
+        }
+    }
 }
 
 /// Print model status in a nice format using generated RepositoryStatus
@@ -1268,7 +1339,7 @@ pub async fn handle_infer(
         let policy_vk = signing_key.verifying_key();
         let policy_client = crate::services::PolicyClient::for_service(
             signing_key.clone(), policy_vk, None,
-        );
+        )?;
         let resp = policy_client.resolve_service_key(
             &crate::services::generated::policy_client::ResolveServiceKey {
                 service_name: "model".to_owned(),
@@ -1283,7 +1354,7 @@ pub async fn handle_infer(
         signing_key.clone(),
         model_server_vk,
         None,
-    );
+    )?;
 
     // Apply chat template to the prompt via ModelService
     let messages = vec![ChatMessage {
@@ -1445,7 +1516,7 @@ pub async fn handle_load(
     let policy_vk = signing_key.verifying_key();
     let policy_client = crate::services::PolicyClient::for_service(
         signing_key.clone(), policy_vk, None,
-    );
+    )?;
 
     // If --wait, subscribe to notifications BEFORE issuing load request
     // (ensures no events are missed between load and subscribe)
@@ -1469,7 +1540,7 @@ pub async fn handle_load(
             signing_key.clone(),
             notif_vk,
             None,
-        );
+        )?;
 
         let sub_resp = notif_client.subscribe(&SubscribeRequest {
             scope_pattern: scope_pattern.clone(),
@@ -1477,25 +1548,20 @@ pub async fn handle_load(
             ttl_seconds: timeout_secs.min(3600) as u32,
         }).await?;
 
+        anyhow::ensure!(
+            !sub_resp.broadcast_path.is_empty(),
+            "NotificationService did not return a moq broadcast path — server may be in ZMQ-only mode"
+        );
+
         debug!(
             subscription_id = %sub_resp.subscription_id,
             topic = %sub_resp.assigned_topic,
-            endpoint = %sub_resp.stream_endpoint,
-            "Subscribed to notification stream"
+            broadcast_path = %sub_resp.broadcast_path,
+            reach_count = sub_resp.announced_at.len(),
+            "Subscribed to notification stream via moq"
         );
 
-        // Connect SUB socket to StreamService XPUB
-        let ctx = global_context();
-        let subscriber = tmq::subscribe::subscribe(&ctx)
-            .connect(&sub_resp.stream_endpoint)
-            .map_err(|e| anyhow::anyhow!("SUB connect to {}: {}", sub_resp.stream_endpoint, e))?
-            .subscribe(sub_resp.assigned_topic.as_bytes())
-            .map_err(|e| anyhow::anyhow!("SUB subscribe to topic: {}", e))?;
-
-        subscriber.set_linger(0)
-            .map_err(|e| anyhow::anyhow!("Failed to set linger on SUB: {}", e))?;
-
-        Some((subscriber, sub_secret, sub_pub_bytes, notif_client, sub_resp, timeout_secs))
+        Some((sub_secret, sub_pub_bytes, notif_client, sub_resp, timeout_secs))
     } else {
         None
     };
@@ -1517,7 +1583,7 @@ pub async fn handle_load(
         signing_key.clone(),
         model_vk,
         None,
-    );
+    )?;
     let model_ref_owned = model_ref_str.to_owned();
     match model_client.load(&LoadModelRequest {
         model_ref: model_ref_owned.clone(),
@@ -1537,7 +1603,7 @@ pub async fn handle_load(
     }
 
     // If --wait, block on notification events until model.loaded or model.failed
-    if let Some((subscriber, sub_secret, sub_pub_bytes, notif_client, sub_resp, timeout_secs)) = notification_state {
+    if let Some((sub_secret, sub_pub_bytes, notif_client, sub_resp, timeout_secs)) = notification_state {
         println!("Waiting for model to load (timeout: {}s)...", timeout_secs);
 
         let wait_start = tokio::time::Instant::now();
@@ -1548,7 +1614,9 @@ pub async fn handle_load(
         );
 
         let result = wait_for_model_notification(
-            subscriber,
+            &sub_resp.announced_at,
+            &sub_resp.broadcast_path,
+            &sub_resp.assigned_topic,
             &decryptor,
             model_ref_str,
             deadline,
@@ -1583,94 +1651,84 @@ enum NotificationOutcome {
     Failed { error: String },
 }
 
-/// Wait for a model.loaded or model.failed notification on the SUB socket.
+/// Wait for a model.loaded or model.failed notification over the moq plane.
+///
+/// #142/#356: consumes the NotificationService's NETWORKED reach (`announcedAt`)
+/// via the shared [`connect_moq_reach`] resolver, so a model loaded on a DIFFERENT
+/// PDS instance is reached by dialing the producer's QUIC `/moq` endpoint. The
+/// old UDS-only path connected to *this* process's local moq plane, which never
+/// carries another instance's broadcast — silently failing cross-instance.
 async fn wait_for_model_notification(
-    mut subscriber: tmq::subscribe::Subscribe,
+    reach: &[hyprstream_rpc::stream_info::Destination],
+    broadcast_path: &str,
+    topic: &str,
     decryptor: &hyprstream_rpc::crypto::notification::BroadcastDecryptor,
     model_ref: &str,
     deadline: tokio::time::Instant,
 ) -> Result<NotificationOutcome> {
-    use futures::StreamExt;
     use crate::events::{EventEnvelope, EventPayload};
+    use hyprstream_rpc::moq_stream::{connect_moq_reach, STREAM_TRACK};
+
+    let conn = connect_moq_reach(reach).await
+        .context("moq connect for notifications")?;
+    let bc = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        conn.consumer.announced_broadcast(broadcast_path),
+    ).await
+    .context("timeout waiting for notification broadcast")?
+    .ok_or_else(|| anyhow::anyhow!("notification broadcast {} not found", broadcast_path))?;
+    let mut track = bc.subscribe_track(&moq_net::Track::new(STREAM_TRACK))
+        .context("subscribe_track for notifications")?;
+
+    // topic is logged for diagnostics only; HMAC verification is not used for
+    // notifications because the transport MAC key is not conveyed to subscribers
+    // (the payload is end-to-end encrypted, providing authenticity instead).
+    let _ = topic;
 
     loop {
-        let recv = tokio::time::timeout_at(deadline, subscriber.next()).await;
-
-        let multipart = match recv {
-            Ok(Some(Ok(msg))) => msg,
-            Ok(Some(Err(e))) => {
-                warn!("SUB receive error: {}", e);
-                continue;
-            }
-            Ok(None) => bail!("Notification stream closed"),
+        let mut group = match tokio::time::timeout_at(deadline, track.next_group()).await {
+            Ok(Ok(Some(g))) => g,
+            Ok(Ok(None)) => bail!("Notification stream closed"),
+            Ok(Err(e)) => { debug!("moq next_group: {e}"); bail!("moq stream error") }
             Err(_) => bail!("Timeout"),
         };
-
-        // StreamService 3-frame: [topic, capnp_data, hmac]
-        let frames: Vec<_> = multipart.iter().collect();
-        if frames.len() < 2 {
-            continue;
-        }
-
-        // Parse StreamBlock to extract the notification data
-        let capnp_data = &frames[1];
+        let frame: bytes::Bytes = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            group.read_frame(),
+        ).await {
+            Ok(Ok(Some(f))) => f,
+            _ => continue,
+        };
+        if frame.len() < 16 { continue; }
+        let capnp_data = &frame[..frame.len() - 16];
         let payload_data = match parse_stream_block_data(capnp_data) {
             Ok(data) => data,
-            Err(e) => {
-                debug!("Failed to parse StreamBlock: {}", e);
-                continue;
-            }
+            Err(e) => { debug!("Failed to parse StreamBlock: {e}"); continue; }
         };
-
-        // Parse NotificationBlock from the StreamPayload data
         let block = match parse_notification_block(&payload_data) {
             Ok(b) => b,
-            Err(e) => {
-                debug!("Failed to parse NotificationBlock: {}", e);
-                continue;
-            }
+            Err(e) => { debug!("Failed to parse NotificationBlock: {e}"); continue; }
         };
-
-        // Decrypt the notification payload
         let plaintext = match decryptor.decrypt(
-            &block.publisher_pubkey,
-            &block.blinding_scalar,
-            &block.wrapped_key,
-            &block.key_nonce,
-            &block.encrypted_payload,
-            &block.nonce,
-            &block.publisher_mac,
-            &block.intent_id,
-            &block.scope,
+            &block.publisher_pubkey, &block.blinding_scalar, &block.wrapped_key,
+            &block.key_nonce, &block.encrypted_payload, &block.nonce,
+            &block.publisher_mac, &block.intent_id, &block.scope,
         ) {
             Ok(pt) => pt,
-            Err(e) => {
-                debug!("Failed to decrypt notification: {}", e);
-                continue;
-            }
+            Err(e) => { debug!("Failed to decrypt notification: {e}"); continue; }
         };
-
-        // Parse EventEnvelope from decrypted payload
         let event: EventEnvelope = match serde_json::from_slice(&plaintext) {
             Ok(e) => e,
-            Err(e) => {
-                debug!("Failed to parse event: {}", e);
-                continue;
-            }
+            Err(e) => { debug!("Failed to parse event: {e}"); continue; }
         };
-
-        // Check if this is our model
         match &event.payload {
-            EventPayload::ModelLoaded { model_ref: ref mr, endpoint } if mr.contains(model_ref) || model_ref.contains(mr.as_str()) => {
-                return Ok(NotificationOutcome::Loaded { endpoint: endpoint.clone() });
-            }
-            EventPayload::ModelFailed { model_ref: ref mr, error } if mr.contains(model_ref) || model_ref.contains(mr.as_str()) => {
-                return Ok(NotificationOutcome::Failed { error: error.clone() });
-            }
-            _ => {
-                debug!("Ignoring unrelated event: {:?}", event.topic);
-                continue;
-            }
+            EventPayload::ModelLoaded { model_ref: ref mr, endpoint }
+                if mr.contains(model_ref) || model_ref.contains(mr.as_str()) =>
+                return Ok(NotificationOutcome::Loaded { endpoint: endpoint.clone() }),
+            EventPayload::ModelFailed { model_ref: ref mr, error }
+                if mr.contains(model_ref) || model_ref.contains(mr.as_str()) =>
+                return Ok(NotificationOutcome::Failed { error: error.clone() }),
+            _ => { debug!("Ignoring unrelated event: {:?}", event.topic); continue; }
         }
     }
 }
@@ -1766,7 +1824,6 @@ async fn handle_notify_subscribe(
     max_count: u64,
     signing_key: SigningKey,
 ) -> Result<()> {
-    use futures::StreamExt;
     use crate::events::EventEnvelope;
 
     let (sub_secret, sub_pubkey) = generate_ephemeral_keypair();
@@ -1775,7 +1832,7 @@ async fn handle_notify_subscribe(
     let policy_vk = signing_key.verifying_key();
     let policy_client = crate::services::PolicyClient::for_service(
         signing_key.clone(), policy_vk, None,
-    );
+    )?;
     let notif_key_resp = policy_client.resolve_service_key(
         &crate::services::generated::policy_client::ResolveServiceKey {
             service_name: "notification".to_owned(),
@@ -1789,7 +1846,7 @@ async fn handle_notify_subscribe(
         signing_key,
         notif_server_vk,
         None,
-    );
+    )?;
 
     // Subscribe with maximum TTL for long-running listeners
     let ttl = if timeout_secs == 0 { 3600u32 } else { (timeout_secs as u32).min(3600) };
@@ -1799,19 +1856,29 @@ async fn handle_notify_subscribe(
         ttl_seconds: ttl,
     }).await?;
 
+    anyhow::ensure!(
+        !sub_resp.broadcast_path.is_empty(),
+        "NotificationService did not return a moq broadcast path — server may be in ZMQ-only mode"
+    );
+
     eprintln!("Subscribed to: {}", pattern);
     eprintln!("  Subscription ID: {}", sub_resp.subscription_id);
     eprintln!("  Topic: {}", sub_resp.assigned_topic);
 
-    // Connect SUB socket
-    let ctx = global_context();
-    let mut subscriber = tmq::subscribe::subscribe(&ctx)
-        .connect(&sub_resp.stream_endpoint)
-        .map_err(|e| anyhow::anyhow!("SUB connect: {}", e))?
-        .subscribe(sub_resp.assigned_topic.as_bytes())
-        .map_err(|e| anyhow::anyhow!("SUB subscribe: {}", e))?;
+    use hyprstream_rpc::moq_stream::{connect_moq_reach, STREAM_TRACK};
 
-    subscriber.set_linger(0)?;
+    // #142/#356: dial the NotificationService's networked reach (or local UDS
+    // fast path) via the shared resolver, so cross-instance notifications work.
+    let conn = connect_moq_reach(&sub_resp.announced_at).await
+        .context("moq connect for notifications")?;
+    let bc = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        conn.consumer.announced_broadcast(&sub_resp.broadcast_path),
+    ).await
+    .context("timeout waiting for notification broadcast")?
+    .ok_or_else(|| anyhow::anyhow!("notification broadcast {} not found", sub_resp.broadcast_path))?;
+    let mut track = bc.subscribe_track(&moq_net::Track::new(STREAM_TRACK))
+        .context("subscribe_track for notifications")?;
 
     let decryptor = hyprstream_rpc::crypto::notification::BroadcastDecryptor::new(
         &sub_secret.scalar().to_bytes(),
@@ -1827,63 +1894,57 @@ async fn handle_notify_subscribe(
     let mut received = 0u64;
 
     loop {
-        // Check count limit
         if max_count > 0 && received >= max_count {
             break;
         }
 
-        // Receive with optional timeout
-        let multipart = if let Some(dl) = deadline {
-            match tokio::time::timeout_at(dl, subscriber.next()).await {
-                Ok(Some(Ok(msg))) => msg,
-                Ok(Some(Err(e))) => { warn!("SUB error: {}", e); continue; }
-                Ok(None) => break,
+        let mut group = if let Some(dl) = deadline {
+            match tokio::time::timeout_at(dl, track.next_group()).await {
+                Ok(Ok(Some(g))) => g,
+                Ok(Ok(None)) => break,
+                Ok(Err(e)) => { debug!("moq next_group: {e}"); break; }
                 Err(_) => { eprintln!("Timeout reached"); break; }
             }
         } else {
-            match subscriber.next().await {
-                Some(Ok(msg)) => msg,
-                Some(Err(e)) => { warn!("SUB error: {}", e); continue; }
-                None => break,
+            match track.next_group().await {
+                Ok(Some(g)) => g,
+                Ok(None) => break,
+                Err(e) => { debug!("moq next_group: {e}"); break; }
             }
         };
 
-        let frames: Vec<_> = multipart.iter().collect();
-        if frames.len() < 2 { continue; }
+        let frame: bytes::Bytes = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            group.read_frame(),
+        ).await {
+            Ok(Ok(Some(f))) => f,
+            _ => continue,
+        };
+        if frame.len() < 16 { continue; }
+        let capnp_data = &frame[..frame.len() - 16];
 
-        let capnp_data = &frames[1];
         let payload_data = match parse_stream_block_data(capnp_data) {
             Ok(d) => d,
             Err(_) => continue,
         };
-
         let block = match parse_notification_block(&payload_data) {
             Ok(b) => b,
             Err(_) => continue,
         };
-
         let plaintext = match decryptor.decrypt(
-            &block.publisher_pubkey,
-            &block.blinding_scalar,
-            &block.wrapped_key,
-            &block.key_nonce,
-            &block.encrypted_payload,
-            &block.nonce,
-            &block.publisher_mac,
-            &block.intent_id,
-            &block.scope,
+            &block.publisher_pubkey, &block.blinding_scalar, &block.wrapped_key,
+            &block.key_nonce, &block.encrypted_payload, &block.nonce,
+            &block.publisher_mac, &block.intent_id, &block.scope,
         ) {
             Ok(pt) => pt,
-            Err(e) => { debug!("Decrypt failed: {}", e); continue; }
+            Err(e) => { debug!("Decrypt failed: {e}"); continue; }
         };
 
         if json_output {
-            // Print raw JSON
             if let Ok(s) = String::from_utf8(plaintext.clone()) {
                 println!("{}", s);
             }
         } else {
-            // Human-readable output
             match serde_json::from_slice::<EventEnvelope>(&plaintext) {
                 Ok(event) => {
                     println!("[{}] {} (source: {})",
@@ -1894,7 +1955,6 @@ async fn handle_notify_subscribe(
                     println!("  {:?}", event.payload);
                 }
                 Err(_) => {
-                    // Not an EventEnvelope, print raw
                     if let Ok(s) = String::from_utf8(plaintext) {
                         println!("{}", s);
                     }
@@ -1905,7 +1965,6 @@ async fn handle_notify_subscribe(
         received += 1;
     }
 
-    // Clean up
     let _ = notif_client.unsubscribe(&UnsubscribeRequest {
         subscription_id: sub_resp.subscription_id.clone(),
     }).await;
@@ -1929,7 +1988,7 @@ pub async fn handle_unload(
         let policy_vk = signing_key.verifying_key();
         let policy_client = crate::services::PolicyClient::for_service(
             signing_key.clone(), policy_vk, None,
-        );
+        )?;
         let resp = policy_client.resolve_service_key(
             &crate::services::generated::policy_client::ResolveServiceKey {
                 service_name: "model".to_owned(),
@@ -1940,7 +1999,7 @@ pub async fn handle_unload(
                 .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
         ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?
     };
-    let model_client = ModelClient::for_service(signing_key, model_server_vk, None);
+    let model_client = ModelClient::for_service(signing_key, model_server_vk, None)?;
 
     model_client.unload(&UnloadModelRequest { model_ref: model_ref_str.to_owned() }).await?;
 

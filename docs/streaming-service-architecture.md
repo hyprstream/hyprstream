@@ -1,69 +1,49 @@
 # Streaming Service Architecture
 
-PULL/XPUB queuing proxy with signed registration for end-to-end authenticated streaming.
+moq-lite streaming plane with HMAC-chained end-to-end authentication.
 
 ## Overview
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                           STREAM SERVICE                                     │
+│                         STREAMING PLANE                                      │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
-│  InferenceService                 StreamService                    Client   │
-│       │                                │                              │     │
-│       │─ SignedEnvelope(Register) ────►│                              │     │
-│       │   [verify sig, check claims]   │                              │     │
-│       │                                │                              │     │
-│       │─ StreamChunk/Block ──────────►│                              │     │
-│       │   [extract topic]              │                              │     │
-│       │   [NO HMAC verification]       │                              │     │
-│       │                                │─ {topic}{message} ──────────►│     │
-│       │                                │   [XPUB prefix routing]      │[verify]
-│       │                                │                              │     │
-│       │                                │◄─ StreamResume(topic,hmac) ──│     │
-│       │                                │   [find hmac in buffer]      │     │
-│       │                                │─ {buffered messages...} ────►│     │
+│  InferenceService              moq-lite Origin            Client            │
+│       │                             │                        │              │
+│       │─ infer_stream (RPC) ────────────────────────────────►│              │
+│       │◄─ {stream_id, moq_uds_path, moq_broadcast_path} ─────┤              │
+│       │                             │                        │              │
+│       │  derive DH keys             │                        │              │
+│       │  topic = DH-derived hex     │                        │              │
+│       │                             │                        │              │
+│       │─ publish(broadcast_path) ──►│                        │              │
+│       │   [token chunks, HMAC]      │                        │              │
+│       │                             │                        │              │
+│       │                             │◄─ subscribe(UDS) ──────┤              │
+│       │                             │   [broadcast_path]     │              │
+│       │                             │                        │              │
+│       │                             │─ chunk ───────────────►│              │
+│       │                             │─ chunk ───────────────►│[verify HMAC] │
+│       │                             │─ StreamComplete ───────►│              │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Location:** `crates/hyprstream-rpc/src/service/streaming.rs`
-
-## Why PUSH/PULL Instead of PUB/XSUB
-
-PUB/SUB drops messages when no subscriber exists, causing a race condition:
-
-```
-Traditional PUB/SUB:                    PUSH/PULL Solution:
-
-Publisher                               Publisher
-    │                                       │
-    │  Starts publishing                    │  Starts publishing
-    │  (messages dropped!)                  │  (buffered at HWM)
-    ▼                                       ▼
-    ...time passes...                   StreamService
-    ▼                                       │
-Subscriber                                  │  Queues per-topic
-    │  Finally subscribes                   ▼
-    │  (missed first messages)          Subscriber
-                                            │  Subscribes
-                                            │  (receives ALL messages)
-```
-
-PUSH/PULL solves the race condition:
-- **PUSH buffers** at HWM (never drops)
-- **StreamService queues** per-topic until subscriber arrives
-- **On subscribe**, queued messages are flushed to client
+The old ZMQ PUSH/PULL → XPUB/XSUB `StreamService` was removed in epic #131/#138. The
+current streaming plane is moq-lite: InferenceService publishes to the process-global
+`MoqEventOrigin`; clients subscribe via a UDS connection to the moq socket and receive
+chunks through `MoqStreamHandle`.
 
 ## Security Model (E2E Authentication)
 
-StreamService is a **blind forwarder** - it does NOT verify HMACs.
+The moq origin is a **blind router** — it does NOT verify HMACs.
 
 | Layer | Responsibility |
 |-------|----------------|
-| **InferenceService** | Derives DH keys, produces HMAC chain, signs responses |
-| **StreamService** | Routes by topic, buffers for retransmit (blind), verifies registrations |
-| **Client** | Derives same DH keys, verifies HMAC chain, verifies response signatures |
+| **InferenceService** | Derives DH keys, produces HMAC chain, signs RPC responses |
+| **moq-lite Origin** | Routes by broadcast path, buffers for late subscribers |
+| **Client** | Derives same DH keys via ephemeral pubkey, verifies HMAC chain |
 
 ### Shared Signing Key
 
@@ -81,16 +61,15 @@ This key is:
 
 | Property | Implementation |
 |----------|----------------|
-| **Topic unpredictability** | DH-derived (InferenceService ↔ Client) |
-| **Registration auth** | SignedEnvelope with Ed25519 signature |
+| **Topic unpredictability** | DH-derived (InferenceService ↔ Client ephemeral key) |
 | **Response auth** | ResponseEnvelope with Ed25519 signature (mandatory) |
-| **Data integrity** | Chained HMAC verified end-to-end by client |
-| **Stream binding** | Claims-based scope: `publish:stream:{topic}` |
-| **Replay protection** | Nonce cache on SignedEnvelope |
+| **Data integrity** | Chained HMAC-SHA256 verified end-to-end by client |
+| **Stream binding** | Claims scope: `publish:stream:{topic}` in StreamInfo |
+| **Replay protection** | Nonce cache on SignedEnvelope (RPC layer) |
 
 ### Request/Response Signing
 
-All ZMQ REQ/REP communication uses signed envelopes:
+All RPC communication uses signed envelopes:
 
 ```
 Request Flow:
@@ -98,564 +77,273 @@ Request Flow:
 │  Client                                          Service   │
 │    │                                                │      │
 │    │─── SignedEnvelope(RequestEnvelope) ───────────►│      │
-│    │       [signed with shared key]                 │      │
+│    │       [signed with client's key]               │      │
 │    │                                     [verify]   │      │
 │    │                                     [process]  │      │
 │    │◄── ResponseEnvelope ──────────────────────────│      │
-│    │       [signed with shared key]                 │      │
+│    │       [signed with server's key]               │      │
 │    │  [verify]                                      │      │
 └────────────────────────────────────────────────────────────┘
 ```
 
-**No bypass possible**: ZmqClient requires `server_verifying_key` at construction and automatically verifies all responses.
+## Stream Lifecycle
 
-## Components
+### 1. Client Initiates Inference Stream
 
-### StreamService
+Client calls `infer_stream` via the generated RPC client. The request carries an
+ephemeral X25519 public key for DH key exchange:
 
-The main queuing proxy that routes messages from publishers to subscribers.
-
-```rust
-pub struct StreamService {
-    name: String,
-    context: Arc<zmq::Context>,
-    pub_transport: TransportConfig,    // XPUB frontend (client-facing)
-    pull_transport: TransportConfig,   // PULL backend (receives from publishers)
-    message_ttl: Duration,             // Default: 30s
-    max_pending_per_topic: usize,      // Default: 1000
-    compact_interval: Duration,        // Default: 5s
-    nonce_cache: Arc<InMemoryNonceCache>,
+```
+RequestEnvelope {
+    payload: InferStreamRequest { model, prompt, ... },
+    ephemeral_pubkey: [32 bytes],  // Client's X25519 public key
 }
 ```
 
-### StreamState
+### 2. InferenceService Responds with moq Paths
 
-Unified state for tracking authorization, subscription, and messages per topic.
+InferenceService derives shared stream keys and returns the moq subscription info:
 
 ```rust
-struct StreamState {
-    /// Expiration from claims (Unix timestamp)
-    exp: i64,
+// Server-side key derivation
+let (topic, mac_key) = derive_client_stream_keys(
+    &server_ephemeral_sk,
+    &request.ephemeral_pubkey,
+    request_id,
+)?;
 
-    /// Whether a client has subscribed
-    subscribed: bool,
+// StreamInfo returned in RPC response
+StreamInfo {
+    stream_id: uuid,
+    moq_uds_path: global_moq_uds_path(),       // /tmp/hyprstream-{pid}/moq.sock
+    moq_broadcast_path: format!("streams/{topic}"),
+    // endpoint field is empty (reserved, formerly ZMQ address)
+}
+```
 
-    /// Message queue (also serves as retransmit buffer)
-    messages: VecDeque<PendingMessage>,
+### 3. Client Connects via MoqStreamHandle
+
+```rust
+let handle = MoqStreamHandle::new(
+    stream_info.moq_uds_path,
+    stream_info.moq_broadcast_path,
+    mac_key,   // Derived from same DH exchange
+    stream_id,
+).await?;
+
+// Async iteration
+while let Some(payload) = handle.recv_next().await? {
+    match payload {
+        StreamPayload::Token(text) => process_token(text),
+        StreamPayload::Complete(stats) => break,
+        StreamPayload::Error(e) => return Err(e.into()),
+    }
+}
+```
+
+`MoqStreamHandle` implements `futures::Stream` and handles:
+- UDS connection to moq socket
+- moq subscription on `broadcast_path`
+- Per-chunk HMAC-SHA256 chain verification
+- Cancellation via `cancel()` / `cancel_token()`
+
+### 4. InferenceService Publishes Chunks
+
+While the RPC response is sent immediately (with the moq paths), InferenceService
+runs token generation in the background and publishes each token chunk:
+
+```rust
+let mut hmac = ChainedStreamHmac::new(mac_key, request_id);
+for token in generate_tokens(...) {
+    let mac = hmac.compute_next(&token);
+    let chunk = StreamChunk { topic: topic.clone(), data: token, hmac: mac };
+    moq_origin.publish(&broadcast_path, serialize(&chunk)).await?;
 }
 
-struct PendingMessage {
-    data: Vec<u8>,           // Original capnp bytes (StreamChunk or StreamBlock)
-    received_at: Instant,    // For TTL expiry
-    hmac: [u8; 32],          // For retransmit buffer indexing
-}
+// Completion marker
+moq_origin.publish(&broadcast_path, serialize(&StreamComplete { stats })).await?;
 ```
 
 ## Message Types
 
 **Schema:** `crates/hyprstream-rpc/schema/streaming.capnp`
 
-### StreamRegister
-
-Registration message wrapped in `SignedEnvelope` for authentication.
-
-```
-SignedEnvelope {
-    envelope: RequestEnvelope {
-        payload: StreamRegister {
-            topic: "abc123...",  // 64 hex chars (DH-derived)
-            exp: 1762974327,     // Unix timestamp
-        },
-        claims: Claims { scopes: ["publish:stream:abc123..."] },
-    },
-    signature: [64 bytes],  // Ed25519
-}
-```
-
-### ResponseEnvelope (REQ/REP Responses)
-
-All service responses are wrapped in signed `ResponseEnvelope`:
-
-```
-ResponseEnvelope {
-    requestId: 12345,           // Correlates with request
-    payload: [bytes],           // Service-specific response data
-    timestamp: 1762974327000,   // Unix timestamp (ms)
-    signature: [64 bytes],      // Ed25519 signature
-    signerPubkey: [32 bytes],   // Server's verifying key
-}
-```
-
-**Verification**: Client verifies `signature` over `(requestId || payload || timestamp)` using `signerPubkey`.
-
-### Wire Formats: StreamChunk vs StreamBlock
-
-Two wire formats are supported for streaming data:
-
-| Format | Use Case | HMAC | Batching |
-|--------|----------|------|----------|
-| **StreamChunk** | Single payloads | 32 bytes (in capnp) | No |
-| **StreamBlock** | Batched payloads | 16 bytes (ZMQ frame) | Yes |
-
-#### StreamChunk (Single Payload)
+### StreamChunk (Single Payload)
 
 Self-contained message with HMAC embedded in capnp structure.
 
-```
-StreamChunk {
-    topic: "abc123...",     // 64 hex chars (DH-derived)
-    data: [bytes],          // Serialized StreamPayload
-    hmac: [32 bytes],       // Chained HMAC-SHA256 (full)
-    prevHmac: [32 bytes],   // Previous chunk's HMAC (empty for first)
+```capnp
+struct StreamChunk {
+    topic    @0 :Text;       # DH-derived hex string
+    data     @1 :Data;       # Serialized StreamPayload
+    hmac     @2 :Data;       # Chained HMAC-SHA256 (32 bytes)
+    prevHmac @3 :Data;       # Previous chunk HMAC (empty for first)
 }
 ```
 
 **MAC Chain:**
 ```
-mac_0 = HMAC(key, topic_bytes || data_0)       // First chunk
-mac_n = HMAC(key, mac_{n-1} || data_n)         // Subsequent chunks
+mac_0 = HMAC(mac_key, topic_bytes || data_0)       // First chunk
+mac_n = HMAC(mac_key, mac_{n-1} || data_n)         // Subsequent chunks
 ```
 
-#### StreamBlock (Batched Payloads)
+### StreamBlock (Batched Payloads)
 
-ZMQ multipart message with truncated HMAC as separate frame.
+Batched format for high-throughput paths. Wire format:
 
 ```
-Wire format (ZMQ multipart):
-  Frame 0:      topic (64 hex chars, DH-derived)
-  Frame 1..N-1: capnp segments (StreamBlock struct)
-  Frame N:      mac (16 bytes, truncated HMAC-SHA256)
+Frame 0:      topic (DH-derived hex string)
+Frame 1..N-1: capnp segments (StreamBlock struct)
+Frame N:      mac (16 bytes, truncated HMAC-SHA256)
 
-StreamBlock (capnp) {
-    prevMac: [16 bytes],           // topic[..16] for block 0, mac_{n-1} for block N
-    payloads: List(StreamPayload), // Multiple payloads batched
+StreamBlock {
+    prevMac:  Data;                    # topic[..16] for block 0, mac_{n-1} for block N
+    payloads: List(StreamPayload);     # Multiple payloads batched
 }
-```
-
-**MAC Chain:**
-```
-Block 0: mac = HMAC(mac_key, topic_bytes || segments)[..16]
-Block N: mac = HMAC(mac_key, prev_mac || segments)[..16]
 ```
 
 ### StreamPayload (Content)
 
 The actual content inside `StreamChunk.data` or `StreamBlock.payloads`:
 
-```
-StreamPayload {
-    streamId: Text,         // Stream identifier for correlation
+```capnp
+struct StreamPayload {
+    streamId @0 :Text;       # Stream identifier for correlation
 
     union {
-        token: Text,              // Generated token text
-        complete: StreamStats,    // Stream completion with stats
-        error: StreamError,       // Error during generation
-        heartbeat: Void,          // Keep-alive (no data)
+        token     @1 :Text;          # Generated token text
+        complete  @2 :StreamStats;   # Completion with stats
+        error     @3 :StreamError;   # Error during generation
+        heartbeat @4 :Void;          # Keep-alive
     }
 }
 ```
 
 #### StreamStats (Completion)
 
-```
-StreamStats {
-    tokensGenerated: UInt32,
-    finishReason: Text,        // "stop", "length", "eos", "error"
-    generationTimeMs: UInt64,
-    tokensPerSecond: Float32,
-    perplexity: Float32,       // Optional quality metric
-    avgEntropy: Float32,       // Optional quality metric
+```capnp
+struct StreamStats {
+    tokensGenerated  @0 :UInt32;
+    finishReason     @1 :Text;     # "stop", "length", "eos", "error"
+    generationTimeMs @2 :UInt64;
+    tokensPerSecond  @3 :Float32;
+    perplexity       @4 :Float32;
+    avgEntropy       @5 :Float32;
 }
 ```
 
-#### StreamError
+### StreamInfo (in RPC response)
 
-```
-StreamError {
-    message: Text,
-    code: Text,      // "timeout", "cancelled", "internal", etc.
-    details: Text,   // Optional additional context
+Returned by streaming RPC calls to tell the client where to subscribe:
+
+```capnp
+struct StreamInfo {
+    streamId         @0 :Text;   # UUID for correlation
+    endpoint         @1 :Text;   # Reserved (empty on moq paths)
+    serverPubkey     @2 :Data;   # Server's ephemeral X25519 public key
+    moqUdsPath       @4 :Text;   # /tmp/hyprstream-{pid}/moq.sock
+    moqBroadcastPath @5 :Text;   # streams/{topic}
 }
 ```
 
-### StreamResume
+## MoqStreamHandle
 
-Client request to retransmit chunks/blocks after the given HMAC.
+**Location:** `crates/hyprstream-rpc/src/moq_stream.rs`
 
-```
-StreamResume {
-    topic: "abc123...",
-    resumeFromHmac: [32 bytes],  // Last valid HMAC received
+```rust
+pub struct MoqStreamHandle {
+    // internal: background task + channel
+}
+
+impl MoqStreamHandle {
+    /// Connect to moq origin and subscribe to broadcast_path.
+    pub async fn new(
+        uds_path: impl AsRef<Path>,
+        broadcast_path: impl Into<String>,
+        mac_key: [u8; 32],
+        stream_id: String,
+    ) -> Result<Self>;
+
+    /// Receive next verified payload.
+    pub async fn recv_next(&mut self) -> Result<Option<StreamPayload>>;
+
+    /// Signal cancellation to the background task.
+    pub fn cancel(&self);
+
+    /// Get a CancellationToken for integration with tokio-util.
+    pub fn cancel_token(&self) -> CancellationToken;
+
+    /// Stream ID for correlation.
+    pub fn stream_id(&self) -> &str;
+}
+
+impl futures::Stream for MoqStreamHandle {
+    type Item = Result<StreamPayload>;
+    // ...
 }
 ```
 
-StreamService finds this HMAC in its buffer and resends all subsequent messages.
+The background task:
+1. Opens a UDS connection to `moq_uds_path`
+2. Issues a moq SUBSCRIBE for `broadcast_path`
+3. For each received object, deserializes and verifies the HMAC chain
+4. Sends verified `StreamPayload` values to the foreground via `mpsc`
+5. Terminates on `cancel()`, connection close, or `StreamComplete`
 
-## Message Flow
+## moq-lite Origin
 
-### 1. Stream Registration
+**Location:** `crates/hyprstream-rpc/src/moq_stream.rs`
 
-```
-InferenceService                        StreamService
-      │                                      │
-      │  1. Derive DH keys with client       │
-      │  2. topic = derive_stream_keys()     │
-      │                                      │
-      │  SignedEnvelope(StreamRegister)      │
-      ├─────────────────────────────────────►│
-      │                                      │  3. Verify signature
-      │                                      │  4. Check claims.scopes
-      │                                      │  5. Create StreamState
-      │                                      │
-```
+The process-global origin is initialized at startup:
 
-### 2. Chunk Publishing (Before Subscriber)
+```rust
+// Startup: initialize origin + start UDS listener
+let origin = init_global_moq_origin().await?;
+serve_moq_uds_background(origin.clone(), shutdown.clone()).await?;
 
-```
-InferenceService                        StreamService
-      │                                      │
-      │  StreamChunk(topic, "Hello", hmac)   │
-      ├─────────────────────────────────────►│
-      │                                      │  Queue in messages
-      │                                      │
-      │  StreamChunk(topic, "World", hmac)   │
-      ├─────────────────────────────────────►│
-      │                                      │  Queue in messages
+// From anywhere in the process
+let uds_path = global_moq_uds_path()
+    .ok_or_else(|| anyhow!("moq not initialized"))?;
 ```
 
-### 3. Subscriber Connects (Flush Queued)
-
-```
-                                        StreamService                Client
-                                             │                          │
-                                             │◄─── SUB("abc123...") ────┤
-                                             │                          │
-                                             │  Mark subscribed=true    │
-                                             │  Flush queued messages   │
-                                             │                          │
-                                             │─── {topic}{StreamChunk} ►│
-                                             │─── {topic}{StreamChunk} ►│
-                                             │                          │ Verify HMAC
-```
-
-### 4. Live Streaming (After Subscriber)
-
-```
-InferenceService                        StreamService                Client
-      │                                      │                          │
-      │  StreamChunk(topic, data, hmac)      │                          │
-      ├─────────────────────────────────────►│                          │
-      │                                      │─── {topic}{StreamChunk} ►│
-      │                                      │     [immediate forward]  │
-      │                                      │                          │ Verify HMAC
-```
-
-### 5. Stream Resume (Recovery)
-
-```
-                                        StreamService                Client
-                                             │                          │
-                                             │◄─ StreamResume(topic, ──┤
-                                             │      last_valid_hmac)    │
-                                             │                          │
-                                             │  Find hmac in buffer     │
-                                             │  Resend subsequent chunks│
-                                             │                          │
-                                             │─── {topic}{chunk_n+1} ──►│
-                                             │─── {topic}{chunk_n+2} ──►│
-```
+The UDS listener accepts external connections (from clients in the same host,
+including subprocess workers) and forwards moq SUBSCRIBE/PUBLISH frames to the
+in-process origin.
 
 ## Memory Management
 
-### Message Lifecycle
+| Mechanism | Trigger | Action |
+|-----------|---------|--------|
+| Stream completion | `StreamComplete` published | Background task exits |
+| Cancellation | `handle.cancel()` | Background task exits |
+| Connection close | UDS peer disconnect | Background task exits |
+| moq buffer limit | Configurable | moq-lite drops oldest cached objects |
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        MESSAGE LIFECYCLE                                 │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  1. Receive StreamChunk/StreamBlock                                      │
-│     ├── Topic not registered? → DROP (unregistered topic)               │
-│     └── Topic registered                                                 │
-│         ├── subscribed=true → Forward + add to buffer                   │
-│         └── subscribed=false → Add to queue/buffer only                 │
-│                                                                          │
-│  2. Buffer management                                                    │
-│     ├── Per-topic limit: 1000 messages (oldest dropped on overflow)     │
-│     └── Message TTL: 30 seconds (expired on flush/compact)              │
-│                                                                          │
-│  3. Stream cleanup                                                       │
-│     ├── Claims expired (compact interval) → Remove StreamState          │
-│     ├── Unsubscribe (0x00) → Remove StreamState entirely                │
-│     └── Empty + not subscribed (compact) → Remove StreamState           │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+The moq origin does not implement per-stream TTLs; streams are expected to complete
+or be cancelled by the client. The `MoqEventBarrierService` holds the origin alive
+for the process lifetime.
 
-### Configuration
+## Integration with Generated Clients
+
+Codegen (`hyprstream-rpc-derive`) generates streaming methods that return `MoqStreamHandle`:
 
 ```rust
-StreamService::new(...)
-    .with_buffer_config(
-        max_pending_per_topic: 1000,     // Max messages per topic
-        message_ttl: Duration::from_secs(30),  // Message expiry
-        compact_interval: Duration::from_secs(5),  // Cleanup frequency
-    )
-```
+// Generated client method (simplified)
+impl InferenceClient {
+    pub async fn infer_stream(
+        &self,
+        request: InferStreamRequest,
+    ) -> Result<MoqStreamHandle> {
+        let (ephemeral_sk, ephemeral_pk) = generate_ephemeral_keypair();
+        let info: StreamInfo = self.call_rpc(request, ephemeral_pk).await?;
 
-### Memory Limits
-
-| Setting | Default | Purpose |
-|---------|---------|---------|
-| `max_pending_per_topic` | 1000 | Prevents unbounded growth per stream |
-| `message_ttl` | 30s | Drops old messages if subscriber never arrives |
-| `compact_interval` | 5s | How often to run expiry checks |
-| Socket HWM | 100,000 | ZMQ high-water mark for buffering |
-
-## Socket Architecture
-
-### PULL Socket (Backend)
-
-Receives messages from publishers (InferenceService uses PUSH).
-
-```rust
-fn setup_pull(&self) -> Result<zmq::Socket> {
-    let pull = self.context.socket(zmq::PULL)?;
-
-    // Buffer up to 100K messages (~10 seconds at 10K msg/s)
-    pull.set_rcvhwm(100_000)?;
-
-    // Bind with transport layer (handles CurveZMQ)
-    self.pull_transport.bind(&mut pull)?;
-
-    // Restrictive permissions for IPC sockets
-    #[cfg(unix)]
-    if let EndpointType::Ipc { path } = &self.pull_transport.endpoint {
-        std::fs::set_permissions(path, Permissions::from_mode(0o600))?;
-    }
-
-    Ok(pull)
-}
-```
-
-### XPUB Socket (Frontend)
-
-Publishes to subscribers with topic-prefix routing.
-
-```rust
-fn setup_xpub(&self) -> Result<zmq::Socket> {
-    let xpub = self.context.socket(zmq::XPUB)?;
-
-    xpub.set_sndhwm(100_000)?;
-
-    // Receive ALL subscribe/unsubscribe notifications
-    xpub.set_xpub_verbose(true)?;
-
-    self.pub_transport.bind(&mut xpub)?;
-
-    Ok(xpub)
-}
-```
-
-### XPUB Subscription Protocol
-
-```
-Client sends:     0x01 + topic_bytes   → Subscribe
-Client sends:     0x00 + topic_bytes   → Unsubscribe
-
-Service receives subscription via xpub.recv_bytes()
-Service sends:    topic_bytes + message_bytes   → Routed to matching subscribers
-```
-
-## Event Loop
-
-The main proxy loop handles three socket types:
-
-```rust
-let mut items = [
-    pull.as_poll_item(zmq::POLLIN),   // Index 0: Publisher messages
-    xpub.as_poll_item(zmq::POLLIN),   // Index 1: Client subscriptions
-    ctrl.as_poll_item(zmq::POLLIN),   // Index 2: Shutdown signal
-];
-
-loop {
-    // Periodic compaction
-    if last_compact.elapsed() >= self.compact_interval {
-        compact_expired_streams(&mut streams);
-    }
-
-    zmq::poll(&mut items, 1000)?;
-
-    // Handle shutdown
-    if items[2].is_readable() { /* TERMINATE */ break; }
-
-    // Handle publisher messages
-    if items[0].is_readable() {
-        match parse_message(&msg) {
-            SignedEnvelope(StreamRegister) => handle_register(),
-            StreamResume => handle_resume(),
-            StreamChunk => handle_chunk(),  // Blind forward
+        if info.moq_uds_path.is_empty() {
+            bail!("Server did not provide moq transport path — moq transport not initialized");
         }
+
+        let mac_key = derive_client_stream_keys(&ephemeral_sk, &info.server_pubkey, ...)?;
+        MoqStreamHandle::new(info.moq_uds_path, info.moq_broadcast_path, mac_key, info.stream_id).await
     }
-
-    // Handle client subscriptions
-    if items[1].is_readable() {
-        match subscription[0] {
-            0x01 => handle_subscribe(),   // Flush queued, mark subscribed
-            0x00 => handle_unsubscribe(), // Remove StreamState
-        }
-    }
-}
-```
-
-## Integration
-
-### With InferenceService
-
-InferenceService receives the shared signing key from ModelService:
-
-```rust
-// ModelService starts InferenceService with shared key
-let service_handle = InferenceService::start_at(
-    &model_path,
-    runtime_config,
-    signing_key.verifying_key(),  // For request verification
-    signing_key.clone(),          // For response signing (MUST match)
-    policy_client,
-    &endpoint,
-).await?;
-```
-
-InferenceService uses the shared key for stream registration and response signing:
-
-```rust
-// InferenceService derives keys and registers stream
-let (topic, mac_key) = derive_stream_keys(&shared_secret, ...)?;
-
-// Send registration via PUSH (signed with shared key)
-let register = StreamRegister { topic: topic.clone(), exp };
-let signed = sign_envelope(register, &signing_key)?;
-push_socket.send(serialize(&signed), 0)?;
-
-// Stream chunks via PUSH (HMAC authenticated)
-let mut hmac = ChainedStreamHmac::from_bytes(mac_key, request_id);
-for token in tokens {
-    let mac = hmac.compute_next(&token);
-    let chunk = StreamChunk { topic: topic.clone(), data: token, hmac: mac };
-    push_socket.send(serialize(&chunk), 0)?;
-}
-
-// REQ/REP responses are signed with ResponseEnvelope (automatic in service loop)
-let response_bytes = {
-    let signed_response = ResponseEnvelope::new_signed(
-        request_id,
-        response_payload,
-        &signing_key,  // Same shared key
-    );
-    serialize(&signed_response)
-};
-```
-
-### With Client
-
-```rust
-// Client subscribes via SUB socket
-sub_socket.set_subscribe(topic.as_bytes())?;
-
-// Client verifies HMAC chain
-let mut verifier = ChainedStreamHmac::from_bytes(mac_key, request_id);
-while let Ok(msg) = sub_socket.recv_bytes(0) {
-    let chunk = parse_stream_chunk(&msg)?;
-    verifier.verify_next(&chunk.data, &chunk.hmac)?;
-    process_token(&chunk.data);
-}
-```
-
-### Spawnable Trait
-
-StreamService implements `Spawnable` for use with `ServiceSpawner`:
-
-```rust
-impl Spawnable for StreamService {
-    fn name(&self) -> &str { &self.name }
-
-    fn context(&self) -> &Arc<zmq::Context> { &self.context }
-
-    fn registrations(&self) -> Vec<(SocketKind, TransportConfig)> {
-        vec![
-            (SocketKind::Sub, self.pub_transport.clone()),   // Clients subscribe
-            (SocketKind::Push, self.pull_transport.clone()), // Publishers push
-        ]
-    }
-
-    fn run(self: Box<Self>, shutdown: Arc<Notify>, on_ready: ...) -> Result<()> {
-        let xpub = self.setup_xpub()?;
-        let pull = self.setup_pull()?;
-
-        if let Some(tx) = on_ready { tx.send(()); }
-
-        self.run_loop_with_sockets(xpub, pull, shutdown)
-    }
-}
-```
-
-## Transport Security
-
-### CurveZMQ Support
-
-Both frontend and backend sockets support CurveZMQ encryption:
-
-```rust
-let service = StreamService::new(
-    "inference-stream",
-    context.clone(),
-    TransportConfig {
-        endpoint: EndpointType::Tcp { port: 5556 },
-        curve: Some(CurveConfig::server(server_keypair)),
-    },
-    TransportConfig {
-        endpoint: EndpointType::Ipc { path: "/run/hyprstream/stream.sock" },
-        curve: None,  // Internal IPC doesn't need encryption
-    },
-);
-```
-
-### IPC Socket Permissions
-
-IPC sockets automatically get restrictive permissions:
-
-```rust
-// Unix only
-std::fs::set_permissions(path, Permissions::from_mode(0o600))?;
-// Owner read/write only
-```
-
-## Message Parsing
-
-### SignedEnvelope Detection
-
-```rust
-fn is_signed_envelope(msg: &[u8]) -> bool {
-    // Parse as capnp
-    let envelope = reader.get_root::<signed_envelope::Reader>()?;
-
-    // Check signature is 64 bytes (Ed25519)
-    // This distinguishes from StreamChunk (32-byte HMAC)
-    envelope.get_signature()?.len() == 64
-}
-```
-
-### StreamChunk Parsing
-
-```rust
-fn parse_stream_chunk(msg: &[u8]) -> Option<(String, Vec<u8>, [u8; 32])> {
-    let chunk = reader.get_root::<stream_chunk::Reader>()?;
-
-    let topic = chunk.get_topic()?.to_str()?.to_string();
-    let data = chunk.get_data()?.to_vec();
-    let hmac = chunk.get_hmac()?;  // 32 bytes
-
-    Some((topic, data, hmac))
 }
 ```
 
@@ -663,13 +351,15 @@ fn parse_stream_chunk(msg: &[u8]) -> Option<(String, Vec<u8>, [u8; 32])> {
 
 | File | Purpose |
 |------|---------|
-| `crates/hyprstream-rpc/src/service/streaming.rs` | StreamService implementation |
+| `crates/hyprstream-rpc/src/moq_stream.rs` | `MoqStreamHandle`, `MoqEventOrigin`, UDS server |
+| `crates/hyprstream-rpc/src/moq_event.rs` | `MoqEventBarrierService`, event bus |
 | `crates/hyprstream-rpc/schema/streaming.capnp` | Cap'n Proto schema |
 | `crates/hyprstream-rpc/src/crypto/hmac.rs` | Chained HMAC for verification |
-| `crates/hyprstream-rpc/src/crypto/key_exchange.rs` | DH key derivation for topics |
+| `crates/hyprstream-rpc/src/crypto/key_exchange.rs` | DH key derivation |
+| `crates/hyprstream-rpc-derive/src/codegen/client.rs` | Generated streaming client methods |
 
 ## Related Documentation
 
-- [Cryptography Architecture](./cryptography-architecture.md) - Key exchange and HMAC details
-- [RPC Architecture](./rpc-architecture.md) - Overall service communication patterns
-- [Policy Service Architecture](./policy-service-architecture.md) - Claims and scope validation
+- [Cryptography Architecture](./cryptography-architecture.md) — Key exchange and HMAC details
+- [RPC Architecture](./rpc-architecture.md) — Overall service communication patterns
+- [EventService Architecture](./eventservice-architecture.md) — Event bus (moq-lite)

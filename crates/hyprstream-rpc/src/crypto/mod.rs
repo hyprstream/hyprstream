@@ -28,16 +28,43 @@
 
 pub mod backend;
 pub mod cose_sign1;
+pub mod cose_sign;
 pub mod envelope_crypto;
 pub mod event_crypto;
 pub mod hmac;
 pub mod key_exchange;
 pub mod notification;
-#[cfg(feature = "pq-hybrid")]
 pub mod pq;
 pub mod signing;
 
-pub use backend::{derive_key, keyed_mac, keyed_mac_truncated};
+/// Runtime crypto mode selecting how envelopes/tokens are signed and verified.
+///
+/// This REPLACES the old compile-time `pq-hybrid` cargo feature. PQ primitives
+/// (ML-DSA-65, ML-KEM-768) are always compiled; the policy chooses whether they
+/// are used at runtime.
+///
+/// - `Hybrid` (default): sign with a COSE composite (EdDSA + ML-DSA-65) and
+///   REQUIRE both components to verify.
+/// - `Classical`: sign with EdDSA only and accept EdDSA-only signatures. A
+///   `Classical` verifier still accepts a `Hybrid`-signed item via its EdDSA
+///   component (RFC 7517 skip-unknown interop).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CryptoPolicy {
+    /// EdDSA only (classical).
+    Classical,
+    /// EdDSA + ML-DSA-65 composite (post-quantum hybrid). Default.
+    #[default]
+    Hybrid,
+}
+
+impl CryptoPolicy {
+    /// Whether this policy emits/requires the post-quantum (ML-DSA-65) component.
+    pub fn uses_pq(self) -> bool {
+        matches!(self, CryptoPolicy::Hybrid)
+    }
+}
+
+pub use backend::{derive_key, keyed_mac, keyed_mac_truncated, keyed_mac_truncated_parts};
 pub use hmac::StreamHmacState;
 pub use key_exchange::{
     derive_notification_keys, derive_stream_keys, DefaultKeyExchange, KeyExchange,
