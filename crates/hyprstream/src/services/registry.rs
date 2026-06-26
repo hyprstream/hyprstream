@@ -5,6 +5,7 @@
 
 use crate::services::PolicyClient;
 use crate::services::types::{MAX_FDS_GLOBAL, MAX_FDS_PER_CLIENT};
+use crate::services::xet_provenance::XetProvenanceStore;
 use hyprstream_containedfs::{ContainedFs, FsError, FsHandle};
 use crate::services::{EnvelopeContext, RequestService};
 use hyprstream_rpc::transport::TransportConfig;
@@ -327,6 +328,10 @@ pub struct RegistryService {
     expected_audience: Option<String>,
     /// JWT key source for token verification.
     jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
+    /// Server-side `(merkle_hex → repo_id)` provenance store backing the
+    /// fail-closed XET `getBlob` gate (#436 / #509). Pointer presence is
+    /// necessary-but-not-sufficient: entitlement requires a provenance record.
+    xet_provenance: Arc<XetProvenanceStore>,
 }
 
 /// Progress reporter that sends updates via a tokio mpsc channel.
@@ -378,6 +383,10 @@ impl RegistryService {
         let base_dir = base_dir.as_ref().to_path_buf();
         let registry = Git2DB::open(&base_dir).await?;
 
+        // Load the XET provenance store (lives alongside registry metadata).
+        // Missing file → empty store → fail-closed XET getBlob (secure default).
+        let xet_provenance = Arc::new(XetProvenanceStore::load(&base_dir).await?);
+
         let worker_registry = Arc::new(RwLock::new(registry));
 
         // Create fid table and editing table, spawn reaper
@@ -400,6 +409,7 @@ impl RegistryService {
             editing_table,
             expected_audience: None,
             jwt_key_source: None,
+            xet_provenance,
         };
 
         Ok(service)
@@ -907,47 +917,40 @@ impl RegistryService {
 
     // (helper `xet_pointer_references_merkle` defined at module scope below)
 
-    /// Condition-(b) check for a XET merkle root, HuggingFace-Xet-compatible:
-    /// entitlement is by *reconstruction*, not by mere reference. grantRepo
-    /// satisfies (b) iff it tracks a git-xet / git-lfs file whose **content-OID
-    /// field equals the requested merkle** — i.e. a file in this repo genuinely
-    /// reconstructs *from* this address. The merkle being the file's OID is what
-    /// makes the caller entitled to the bytes; a blob that merely names the hex
-    /// (planted reference) does NOT qualify, since that file does not reconstruct
-    /// from it.
+    /// Condition-(b) check for a XET merkle root — **provenance-gated and
+    /// fail-closed** (the #436 / #509 fix).
     ///
-    /// This matches HF Xet's model: the CAS stays GLOBAL and content-addressed
-    /// (cross-repo dedup is preserved — the storage win), and isolation is
-    /// enforced at the READ-AUTHORIZATION layer: "you can only read chunks
-    /// required to reproduce files you have access to, and no more." Possessing a
-    /// content hash is never a capability; access keys on repo permission
-    /// (condition (a)) AND the content being a reconstruction target in that repo.
+    /// Entitlement requires BOTH:
+    ///   1. a **server-side provenance record** binding this merkle to
+    ///      `repo_id` (i.e. this repo actually *uploaded* the bytes); AND
+    ///   2. (defense-in-depth) the repo's current HEAD tree still **references**
+    ///      the merkle via a checked-in git-xet / git-lfs pointer whose merkle
+    ///      field EXACTLY equals the requested hash.
     ///
-    /// Granularity (#436): the binding here is FILE-LEVEL — the requested merkle
-    /// must equal a tracked file's xet/lfs content-OID. Chunk-range-level
-    /// entitlement (verifying a requested chunk address is in a file's mdb_shard
-    /// reconstruction manifest) is sound but heavier and is DEFERRED; getBlob's
-    /// content union addresses whole files by their OID, so file-level binding is
-    /// the correct grain for the current wire.
-    ///
-    /// LIMITATION — STILL GATED for PRIVATE multitenant XET (#436 NOT fully
-    /// closed). This check trusts a CALLER-COMMITTED pointer file as evidence of
-    /// entitlement. The pointer is entirely caller-controlled: a writer with
-    /// access to their own repo can commit a well-formed pointer whose
-    /// `oid sha256:` field is a target private merkle (publicly computable for
-    /// public-derived content) and pass condition (b). Closing this requires a
-    /// SERVER-AUTHORITATIVE provenance record — the bytes for this merkle were
-    /// uploaded *through this repo* (the mdb_shard reconstruction manifest the
-    /// repo owns at upload time), not a client-supplied pointer. Until that lands,
-    /// the XET path is sound for PUBLIC / same-trust-domain content only; private
-    /// cross-tenant XET fetch must stay disabled. (The exact-OID-field parse below
-    /// is still an improvement — it closes the comment/size/substring sub-vector —
-    /// but it is NOT the isolation boundary.)
+    /// The provenance record is the authoritative gate. Pointer presence is
+    /// **necessary-but-not-sufficient**: because the CAS is global and
+    /// non-namespaced, a pointer blob is caller-committed and therefore
+    /// *forgeable* — Tenant B can plant `oid sha256:<Tenant A's private merkle>`
+    /// in their own repo. We therefore **deny when no provenance record exists**
+    /// and NEVER fall back to the pointer-only check. See
+    /// [`crate::services::xet_provenance`] for the trust boundary and #509 for
+    /// the authenticated upload-binding that populates provenance.
     async fn repo_contains_xet_merkle(
         &self,
         repo_id: &git2db::RepoId,
         merkle_hex: &str,
     ) -> Result<bool> {
+        // ── Authoritative gate: fail-closed provenance check. ──
+        // No record binding (merkle → repo) ⇒ deny, regardless of any pointer.
+        if !self
+            .xet_provenance
+            .is_bound(merkle_hex, &repo_id.0.to_string())
+            .await
+        {
+            return Ok(false);
+        }
+
+        // ── Defense-in-depth: the repo must still reference the merkle. ──
         let merkle_hex = merkle_hex.to_owned();
         self.with_repo_blocking(repo_id, move |repo| {
             let head = match repo.head().ok().and_then(|h| h.peel_to_tree().ok()) {
