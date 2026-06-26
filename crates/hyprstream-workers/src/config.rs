@@ -13,17 +13,49 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BackendType {
-    /// Kata Containers (default — full VM isolation)
+    /// Auto-detect: probe availability in order Kata → Podman → Nspawn and
+    /// pick the best backend available on the current host.  This is the
+    /// operator-friendly default — the same binary works on a developer laptop
+    /// (podman/nspawn) and a production node (Kata/cloud-hypervisor).
     #[default]
+    Auto,
+    /// Kata Containers — full hardware VM isolation (requires cloud-hypervisor).
     Kata,
-    /// systemd-nspawn (lightweight container, rootless, host filesystem)
+    /// Rootless podman (or docker) OCI containers — no hypervisor.
+    Podman,
+    /// systemd-nspawn — lightweight container, rootless, host filesystem.
     Nspawn,
+}
+
+impl BackendType {
+    /// Probe availability of each concrete backend in priority order and return
+    /// the first one whose binary / runtime is present on the host.
+    ///
+    /// Fallback chain: Kata → Podman → Nspawn.
+    /// `Auto` itself resolves to the result of this function; all other
+    /// variants resolve to themselves (no probing needed).
+    pub fn resolve(self) -> Self {
+        if self != Self::Auto {
+            return self;
+        }
+        #[cfg(feature = "kata-vm")]
+        if which::which("cloud-hypervisor").is_ok() {
+            return Self::Kata;
+        }
+        #[cfg(feature = "podman")]
+        if which::which("podman").is_ok() || which::which("docker").is_ok() {
+            return Self::Podman;
+        }
+        Self::Nspawn
+    }
 }
 
 impl std::fmt::Display for BackendType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Auto => write!(f, "auto"),
             Self::Kata => write!(f, "kata"),
+            Self::Podman => write!(f, "podman"),
             Self::Nspawn => write!(f, "nspawn"),
         }
     }
@@ -299,7 +331,22 @@ mod tests {
 
     #[test]
     fn test_backend_type_default() {
-        assert_eq!(BackendType::default(), BackendType::Kata);
+        // Default is Auto (operator-friendly; resolves at runtime).
+        assert_eq!(BackendType::default(), BackendType::Auto);
+    }
+
+    #[test]
+    fn test_backend_type_resolve_identity() {
+        // Concrete variants are idempotent under resolve().
+        assert_eq!(BackendType::Nspawn.resolve(), BackendType::Nspawn);
+        assert_eq!(BackendType::Kata.resolve(), BackendType::Kata);
+        assert_eq!(BackendType::Podman.resolve(), BackendType::Podman);
+    }
+
+    #[test]
+    fn test_backend_type_auto_resolves_to_concrete() {
+        // Auto must not resolve to itself.
+        assert_ne!(BackendType::Auto.resolve(), BackendType::Auto);
     }
 
     #[test]
@@ -311,12 +358,22 @@ mod tests {
         let yaml = "backend: kata\n";
         let config: WorkerConfig = serde_yaml::from_str(yaml)?;
         assert_eq!(config.backend, BackendType::Kata);
+
+        let yaml = "backend: podman\n";
+        let config: WorkerConfig = serde_yaml::from_str(yaml)?;
+        assert_eq!(config.backend, BackendType::Podman);
+
+        let yaml = "backend: auto\n";
+        let config: WorkerConfig = serde_yaml::from_str(yaml)?;
+        assert_eq!(config.backend, BackendType::Auto);
         Ok(())
     }
 
     #[test]
     fn test_backend_type_display() {
+        assert_eq!(BackendType::Auto.to_string(), "auto");
         assert_eq!(BackendType::Kata.to_string(), "kata");
+        assert_eq!(BackendType::Podman.to_string(), "podman");
         assert_eq!(BackendType::Nspawn.to_string(), "nspawn");
     }
 }

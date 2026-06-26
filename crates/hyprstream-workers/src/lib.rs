@@ -70,6 +70,8 @@ pub use error::WorkerError;
 pub use runtime::{WorkerService, SandboxBackend, SandboxHandle, NspawnBackend, NspawnConfig};
 #[cfg(feature = "kata-vm")]
 pub use runtime::KataBackend;
+#[cfg(feature = "podman")]
+pub use runtime::{PodmanBackend, PodmanConfig};
 #[cfg(feature = "kata-vm")]
 pub use image::RafsStore;
 pub use workflow::WorkflowService;

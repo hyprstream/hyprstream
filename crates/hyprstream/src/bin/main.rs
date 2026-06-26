@@ -1076,24 +1076,39 @@ fn handle_quick_command(
 
                     let _worker_handle = if !worker_already_running {
                         use hyprstream_workers::runtime::SandboxBackend;
+                        use hyprstream_workers::config::BackendType;
 
-                        // VM path (kata-vm): Kata backend + RAFS image store.
+                        // Resolve the backend: read config if available, else auto-detect.
+                        let backend_type = HyprConfig::load()
+                            .ok()
+                            .and_then(|c| c.worker)
+                            .map(|w| w.backend)
+                            .unwrap_or_default()
+                            .resolve();
+
+                        // Always build rafs_store when kata-vm feature is compiled in
+                        // (WorkerService::new requires it regardless of backend chosen).
                         #[cfg(feature = "kata-vm")]
                         let rafs_store = {
                             use hyprstream_workers::image::RafsStore;
                             Arc::new(RafsStore::new(image_config.clone())?)
                         };
-                        #[cfg(feature = "kata-vm")]
-                        let backend: Arc<dyn SandboxBackend> = {
-                            use hyprstream_workers::runtime::KataBackend;
-                            Arc::new(KataBackend::new(image_config, Arc::clone(&rafs_store)))
-                        };
-                        // Without kata-vm the CLI worker entrypoint falls back to
-                        // the lightweight nspawn backend.
-                        #[cfg(not(feature = "kata-vm"))]
-                        let backend: Arc<dyn SandboxBackend> = {
-                            use hyprstream_workers::{NspawnBackend, NspawnConfig};
-                            Arc::new(NspawnBackend::new(NspawnConfig::default()))
+
+                        let backend: Arc<dyn SandboxBackend> = match backend_type {
+                            #[cfg(feature = "kata-vm")]
+                            BackendType::Kata => {
+                                use hyprstream_workers::runtime::KataBackend;
+                                Arc::new(KataBackend::new(image_config, Arc::clone(&rafs_store)))
+                            }
+                            #[cfg(feature = "podman")]
+                            BackendType::Podman => {
+                                use hyprstream_workers::{PodmanBackend, PodmanConfig};
+                                Arc::new(PodmanBackend::new(PodmanConfig::default()))
+                            }
+                            _ => {
+                                use hyprstream_workers::{NspawnBackend, NspawnConfig};
+                                Arc::new(NspawnBackend::new(NspawnConfig::default()))
+                            }
                         };
 
                         let worker_transport =

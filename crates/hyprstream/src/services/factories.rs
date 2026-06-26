@@ -660,14 +660,22 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     #[cfg(feature = "kata-vm")]
     use hyprstream_workers::KataBackend;
     use hyprstream_workers::{WorkerService, SandboxBackend, NspawnBackend, NspawnConfig};
+    #[cfg(feature = "podman")]
+    use hyprstream_workers::{PodmanBackend, PodmanConfig};
 
     let config = load_config();
     let worker_quic_port = config.worker.as_ref().and_then(|w| w.quic_port);
-    let backend_type = config.worker.as_ref()
+    let configured_backend = config.worker.as_ref()
         .map(|w| w.backend)
         .unwrap_or_default();
+    // Resolve auto-detection: substitutes the best available concrete backend.
+    let backend_type = configured_backend.resolve();
 
-    info!("WorkerService using {} backend", backend_type);
+    if configured_backend != backend_type {
+        info!("WorkerService: auto-selected {} backend (configured: {})", backend_type, configured_backend);
+    } else {
+        info!("WorkerService using {} backend", backend_type);
+    }
 
     // Use default paths based on XDG directories
     let data_dir = dirs::data_local_dir()
@@ -705,6 +713,7 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
 
     // Construct the sandbox backend based on configuration.
+    // Note: `Auto` has already been resolved above; only concrete variants remain.
     let backend: Arc<dyn SandboxBackend> = match backend_type {
         #[cfg(feature = "kata-vm")]
         BackendType::Kata => Arc::new(KataBackend::new(image_config, Arc::clone(&rafs_store))),
@@ -712,10 +721,21 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         BackendType::Kata => {
             return Err(anyhow::anyhow!(
                 "worker backend `kata` requires the `kata-vm` feature; \
-                 this binary was built without kata-vm support (use the `nspawn` backend)"
+                 this binary was built without kata-vm support"
+            ));
+        }
+        #[cfg(feature = "podman")]
+        BackendType::Podman => Arc::new(PodmanBackend::new(PodmanConfig::default())),
+        #[cfg(not(feature = "podman"))]
+        BackendType::Podman => {
+            return Err(anyhow::anyhow!(
+                "worker backend `podman` requires the `podman` feature; \
+                 this binary was built without podman support"
             ));
         }
         BackendType::Nspawn => Arc::new(NspawnBackend::new(NspawnConfig::default())),
+        // Auto is resolved before this match — should not reach here.
+        BackendType::Auto => Arc::new(NspawnBackend::new(NspawnConfig::default())),
     };
 
     let sk = ctx.service_signing_key("worker");
