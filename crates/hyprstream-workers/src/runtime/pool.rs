@@ -287,10 +287,13 @@ pub struct PoolStats {
 }
 
 #[cfg(test)]
+#[cfg(any(feature = "kata", feature = "nspawn"))]
 mod tests {
     use super::*;
     use crate::config::{ImageConfig, PoolConfig};
+    #[cfg(feature = "kata")]
     use crate::image::RafsStore;
+    #[cfg(feature = "kata")]
     use crate::runtime::kata_backend::KataBackend;
     use tempfile::TempDir;
 
@@ -325,9 +328,16 @@ mod tests {
         std::fs::create_dir_all(&image_config.cache_dir)?;
         std::fs::create_dir_all(&pool_config.runtime_dir)?;
 
-        let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
-        let backend: Arc<dyn SandboxBackend> =
-            Arc::new(KataBackend::new(image_config, rafs_store));
+        #[cfg(feature = "kata")]
+        let backend: Arc<dyn SandboxBackend> = {
+            let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
+            Arc::new(KataBackend::new(image_config, rafs_store))
+        };
+        #[cfg(not(feature = "kata"))]
+        let backend: Arc<dyn SandboxBackend> = {
+            let _ = image_config;
+            Arc::new(crate::runtime::nspawn::NspawnBackend::new(crate::runtime::nspawn::NspawnConfig::default()))
+        };
         let pool = SandboxPool::new(pool_config, backend);
 
         Ok((pool, temp_dir))

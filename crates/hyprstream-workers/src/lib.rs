@@ -63,7 +63,11 @@ pub use config::{BackendType, HypervisorType, ImageConfig, PoolConfig, WorkerCon
 pub use error::WorkerError;
 
 // Re-export service types
-pub use runtime::{WorkerService, SandboxBackend, SandboxHandle, KataBackend, NspawnBackend, NspawnConfig};
+pub use runtime::{WorkerService, SandboxBackend, SandboxHandle};
+#[cfg(feature = "kata")]
+pub use runtime::KataBackend;
+#[cfg(feature = "nspawn")]
+pub use runtime::{NspawnBackend, NspawnConfig};
 pub use image::RafsStore;
 pub use workflow::WorkflowService;
 pub use events::{

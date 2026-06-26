@@ -17,34 +17,38 @@
 //! [`RafsStore::bootstrap_path`] resolves to a real RAFS bootstrap consumable by
 //! an in-process RAFS `FileSystem` (FS-B, #363) or nydusd (FS-B0, #366).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+#[cfg(feature = "nydus")]
+use std::path::Path;
+#[cfg(feature = "nydus")]
 use std::sync::Arc;
 
+#[cfg(feature = "nydus")]
 use sha2::{Digest, Sha256};
 
+#[cfg(feature = "nydus")]
 use nydus_api::RegistryConfig;
+#[cfg(feature = "nydus")]
 use nydus_storage::backend::registry::Registry;
+#[cfg(feature = "nydus")]
 use nydus_storage::backend::{BlobBackend, BlobBufReader};
 
 use crate::config::ImageConfig;
 use crate::error::{Result, WorkerError};
 
-use super::{AuthConfig as GenAuthConfig, ImageSpec, ImageInfo, ImageStatusResult, FilesystemUsage, FilesystemIdentifier};
+#[cfg(feature = "nydus")]
+use super::AuthConfig as GenAuthConfig;
+use super::{ImageSpec, ImageInfo, ImageStatusResult, FilesystemUsage, FilesystemIdentifier};
+#[cfg(feature = "nydus")]
 use super::manifest::{AuthConfig, ImageReference, ManifestFetcher, ManifestResult};
 
-/// RAFS-backed image store with Dragonfly-native blob fetching
+/// Image store for sandbox workloads.
 ///
-/// Uses nydus-storage's backend-registry for blob operations, which supports
-/// Dragonfly P2P via the `blob_redirected_host` configuration.
-///
-/// Storage layout:
-/// ```text
-/// images/
-/// ├── blobs/sha256/         # Layer blobs (content-addressed)
-/// ├── bootstrap/            # RAFS metadata (per image)
-/// ├── cache/                # nydus-storage blob cache
-/// └── refs/                 # Tag → digest symlinks
-/// ```
+/// When the `nydus` feature is enabled: full RAFS-backed store with
+/// Dragonfly-native blob fetching and chunk-level deduplication.
+/// When disabled: a stub that errors on image ops (suitable for nspawn/podman
+/// backends that manage their own images).
 pub struct RafsStore {
     /// Directory for layer blobs
     blobs_dir: PathBuf,
@@ -58,35 +62,47 @@ pub struct RafsStore {
     /// Cache directory for nydus-storage
     cache_dir: PathBuf,
 
+    #[cfg(feature = "nydus")]
     /// Manifest fetcher (HTTP only, no blob handling)
     manifest_fetcher: Arc<ManifestFetcher>,
 
-    /// Configuration
+    #[cfg_attr(not(feature = "nydus"), allow(dead_code))]
     config: ImageConfig,
 }
 
 impl RafsStore {
-    /// Create a new RafsStore with configuration
+    /// Create a new RafsStore with configuration.
+    ///
+    /// Without the `nydus` feature: returns a stub that errors on image ops.
     pub fn new(config: ImageConfig) -> Result<Self> {
-        let manifest_fetcher = ManifestFetcher::new()
-            .map_err(|e| WorkerError::RafsError(format!("failed to create manifest fetcher: {e}")))?;
+        #[cfg(feature = "nydus")]
+        let manifest_fetcher = {
+            use super::manifest::ManifestFetcher;
+            Arc::new(
+                ManifestFetcher::new()
+                    .map_err(|e| WorkerError::RafsError(format!("failed to create manifest fetcher: {e}")))?,
+            )
+        };
 
         Ok(Self {
             blobs_dir: config.blobs_dir.clone(),
             bootstrap_dir: config.bootstrap_dir.clone(),
             refs_dir: config.refs_dir.clone(),
             cache_dir: config.cache_dir.clone(),
-            manifest_fetcher: Arc::new(manifest_fetcher),
+            #[cfg(feature = "nydus")]
+            manifest_fetcher,
             config,
         })
     }
 
-    /// Pull an image from registry
+    /// Pull an image from registry (requires `nydus` feature).
+    #[cfg(feature = "nydus")]
     pub async fn pull(&self, image_ref: &str) -> Result<String> {
         self.pull_with_auth(image_ref, None).await
     }
 
-    /// Pull an image with authentication
+    /// Pull an image with authentication (requires `nydus` feature).
+    #[cfg(feature = "nydus")]
     pub async fn pull_with_auth(
         &self,
         image_ref: &str,
@@ -258,6 +274,7 @@ impl RafsStore {
     /// Download a blob using nydus-storage's Registry backend.
     ///
     /// This enables Dragonfly P2P when `blob_redirected_host` is configured.
+    #[cfg(feature = "nydus")]
     async fn download_blob(
         &self,
         img_ref: &ImageReference,
@@ -327,6 +344,7 @@ impl RafsStore {
     }
 
     /// Create a nydus-storage RegistryConfig for a blob fetch.
+    #[cfg(feature = "nydus")]
     fn create_registry_config(
         &self,
         img_ref: &ImageReference,
@@ -375,7 +393,8 @@ impl RafsStore {
         config
     }
 
-    /// Ensure storage directories exist
+    /// Ensure storage directories exist (called from pull_with_auth, requires nydus).
+    #[cfg(feature = "nydus")]
     async fn ensure_dirs(&self) -> Result<()> {
         tracing::debug!(path = %self.blobs_dir.display(), "Creating blobs directory");
         tokio::fs::create_dir_all(&self.blobs_dir).await.map_err(|e| {
@@ -404,7 +423,8 @@ impl RafsStore {
         Ok(())
     }
 
-    /// Ensure an image is available locally (pull if needed)
+    /// Ensure an image is available locally (pull if needed). Requires `nydus` feature.
+    #[cfg(feature = "nydus")]
     pub async fn ensure(&self, image_ref: &str) -> Result<String> {
         if self.exists(image_ref) {
             self.get_image_id(image_ref)
@@ -548,7 +568,8 @@ impl RafsStore {
                     // RAFS bootstraps reference data blobs by their RAFS blob
                     // hash (not OCI layer digests), so mark those as referenced
                     // too — otherwise GC would delete blobs a live bootstrap
-                    // depends on.
+                    // depends on. Only available when nydus feature is on.
+                    #[cfg(feature = "nydus")]
                     Some("meta") => {
                         if let Ok(blob_ids) = super::rafs_builder::bootstrap_blob_ids(&path) {
                             for blob_id in blob_ids {
@@ -556,6 +577,8 @@ impl RafsStore {
                             }
                         }
                     }
+                    #[cfg(not(feature = "nydus"))]
+                    Some("meta") => {}
                     _ => {}
                 }
             }

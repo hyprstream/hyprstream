@@ -3,6 +3,9 @@
 //! Provides filesystem service for sandboxes using nydus-service.
 //! Each sandbox gets its own daemon instance to serve RAFS images.
 //!
+//! Requires the `kata` cargo feature (uses nydus-service).
+#![cfg(feature = "kata")]
+//!
 //! # Architecture
 //!
 //! ```text

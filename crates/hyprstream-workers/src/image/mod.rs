@@ -34,10 +34,12 @@ mod client;
 mod manifest;
 // `pub(crate)` so sibling-module tests (e.g. runtime::sandbox_fs, FS-D #365)
 // can synthesize RAFS images. The builder fn stays crate-internal.
+// Requires `nydus` feature (nydus-builder dep).
+#[cfg(feature = "nydus")]
 pub(crate) mod rafs_builder;
 // FS-B (#363): per-sandbox RootfsMount = OverlayFs(in-process RAFS lower +
 // writable upper). Native-only (the overlay/RAFS FileSystem stack is Linux).
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "nydus"))]
 mod rootfs_mount;
 mod store;
 
@@ -46,6 +48,6 @@ pub use crate::generated::worker_client::{
     AuthConfig, FilesystemUsage, FilesystemIdentifier,
 };
 pub use manifest::{ImageReference, ManifestFetcher, ManifestResult, OciManifest};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "nydus"))]
 pub use rootfs_mount::{rootfs_mount_for, rootfs_mount_from_rafs};
 pub use store::{GcStats, ImageMetadata, RafsStore};

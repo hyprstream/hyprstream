@@ -1248,21 +1248,29 @@ impl ImageHandler for WorkerService {
     }
 
     async fn handle_pull(&self, _ctx: &EnvelopeContext, _request_id: u64, data: &PullImageRequest) -> AnyhowResult<String> {
-        let image_ref = &data.image.image;
-        let auth = if !data.auth.username.is_empty() {
-            Some(crate::image::AuthConfig {
-                username: data.auth.username.clone(),
-                password: data.auth.password.clone(),
-                auth: String::new(),
-                server_address: String::new(),
-                identity_token: String::new(),
-                registry_token: String::new(),
-            })
-        } else {
-            None
-        };
-        let image_id = self.rafs_store.pull_with_auth(image_ref, auth.as_ref()).await?;
-        Ok(image_id)
+        #[cfg(feature = "nydus")]
+        {
+            let image_ref = &data.image.image;
+            let auth = if !data.auth.username.is_empty() {
+                Some(crate::image::AuthConfig {
+                    username: data.auth.username.clone(),
+                    password: data.auth.password.clone(),
+                    auth: String::new(),
+                    server_address: String::new(),
+                    identity_token: String::new(),
+                    registry_token: String::new(),
+                })
+            } else {
+                None
+            };
+            let image_id = self.rafs_store.pull_with_auth(image_ref, auth.as_ref()).await?;
+            Ok(image_id)
+        }
+        #[cfg(not(feature = "nydus"))]
+        {
+            let _ = data;
+            Err(anyhow::anyhow!("image pull requires the `nydus` cargo feature"))
+        }
     }
 
     async fn handle_remove(&self, _ctx: &EnvelopeContext, _request_id: u64, data: &ImageSpec) -> AnyhowResult<()> {
@@ -1337,6 +1345,7 @@ impl RequestService for WorkerService {
 }
 
 #[cfg(test)]
+#[cfg(any(feature = "kata", feature = "nspawn"))]
 #[allow(clippy::print_stderr)]
 mod tests {
     use super::*;
@@ -1386,8 +1395,14 @@ mod tests {
         let transport = TransportConfig::inproc("test-worker-service");
         let (signing_key, _verifying_key) = generate_signing_keypair();
 
+        // Use kata backend when available; fall back to nspawn (the default) for light builds.
+        #[cfg(feature = "kata")]
         let backend: Arc<dyn crate::runtime::backend::SandboxBackend> = Arc::new(
             crate::runtime::kata_backend::KataBackend::new(image_config, Arc::clone(&rafs_store)),
+        );
+        #[cfg(not(feature = "kata"))]
+        let backend: Arc<dyn crate::runtime::backend::SandboxBackend> = Arc::new(
+            crate::runtime::nspawn::NspawnBackend::new(crate::runtime::nspawn::NspawnConfig::default()),
         );
         let service = WorkerService::new(pool_config, backend, rafs_store, transport, signing_key)?;
         Ok((service, temp_dir))

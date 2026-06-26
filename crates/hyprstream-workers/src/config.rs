@@ -10,21 +10,42 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Sandbox backend type
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BackendType {
-    /// Kata Containers (default — full VM isolation)
-    #[default]
+    /// Kata Containers (full VM isolation). Requires the `kata` cargo feature.
+    #[cfg(feature = "kata")]
     Kata,
-    /// systemd-nspawn (lightweight container, rootless, host filesystem)
+    /// systemd-nspawn (lightweight container, rootless, host filesystem).
+    /// Requires the `nspawn` cargo feature.
+    #[cfg(feature = "nspawn")]
     Nspawn,
+    /// Podman/Docker rootless OCI container. Requires the `podman` cargo feature.
+    #[cfg(feature = "podman")]
+    Podman,
+}
+
+impl Default for BackendType {
+    fn default() -> Self {
+        // Prefer kata for power installs; fall back to lighter backends.
+        #[cfg(feature = "kata")]
+        return Self::Kata;
+        #[cfg(all(not(feature = "kata"), feature = "nspawn"))]
+        return Self::Nspawn;
+        #[cfg(all(not(feature = "kata"), not(feature = "nspawn"), feature = "podman"))]
+        return Self::Podman;
+    }
 }
 
 impl std::fmt::Display for BackendType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(feature = "kata")]
             Self::Kata => write!(f, "kata"),
+            #[cfg(feature = "nspawn")]
             Self::Nspawn => write!(f, "nspawn"),
+            #[cfg(feature = "podman")]
+            Self::Podman => write!(f, "podman"),
         }
     }
 }
@@ -299,24 +320,39 @@ mod tests {
 
     #[test]
     fn test_backend_type_default() {
+        // Default is kata when kata feature is on, else nspawn, else podman.
+        #[cfg(feature = "kata")]
         assert_eq!(BackendType::default(), BackendType::Kata);
+        #[cfg(all(not(feature = "kata"), feature = "nspawn"))]
+        assert_eq!(BackendType::default(), BackendType::Nspawn);
+        #[cfg(all(not(feature = "kata"), not(feature = "nspawn"), feature = "podman"))]
+        assert_eq!(BackendType::default(), BackendType::Podman);
     }
 
     #[test]
     fn test_backend_type_serialization() -> Result<(), Box<dyn std::error::Error>> {
-        let yaml = "backend: nspawn\n";
-        let config: WorkerConfig = serde_yaml::from_str(yaml)?;
-        assert_eq!(config.backend, BackendType::Nspawn);
-
-        let yaml = "backend: kata\n";
-        let config: WorkerConfig = serde_yaml::from_str(yaml)?;
-        assert_eq!(config.backend, BackendType::Kata);
+        #[cfg(feature = "nspawn")]
+        {
+            let yaml = "backend: nspawn\n";
+            let config: WorkerConfig = serde_yaml::from_str(yaml)?;
+            assert_eq!(config.backend, BackendType::Nspawn);
+        }
+        #[cfg(feature = "kata")]
+        {
+            let yaml = "backend: kata\n";
+            let config: WorkerConfig = serde_yaml::from_str(yaml)?;
+            assert_eq!(config.backend, BackendType::Kata);
+        }
         Ok(())
     }
 
     #[test]
     fn test_backend_type_display() {
+        #[cfg(feature = "kata")]
         assert_eq!(BackendType::Kata.to_string(), "kata");
+        #[cfg(feature = "nspawn")]
         assert_eq!(BackendType::Nspawn.to_string(), "nspawn");
+        #[cfg(feature = "podman")]
+        assert_eq!(BackendType::Podman.to_string(), "podman");
     }
 }

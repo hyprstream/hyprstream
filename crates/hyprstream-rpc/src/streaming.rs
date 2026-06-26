@@ -1093,7 +1093,7 @@ mod tests {
             &mut slice,
             capnp::message::ReaderOptions::default(),
         )
-        .expect("flat-slice reader must parse from an unaligned buffer");
+        .unwrap();
         let block = reader
             .get_root::<crate::streaming_capnp::stream_block::Reader>()
             .unwrap();

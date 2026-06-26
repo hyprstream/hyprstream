@@ -8,6 +8,9 @@
 //! Service discovery uses host-side IPC paths namespaced by
 //! `HYPRSTREAM_INSTANCE` rather than network IP, avoiding timing issues
 //! with veth IP assignment.
+//!
+//! Requires the `nspawn` cargo feature.
+#![cfg(feature = "nspawn")]
 
 use std::any::Any;
 use std::collections::HashMap;

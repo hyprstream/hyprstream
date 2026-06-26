@@ -2,6 +2,9 @@
 //!
 //! Implements `SandboxBackend` using Kata's `Hypervisor` trait for full VM
 //! isolation.  Supports Cloud Hypervisor and Dragonball hypervisors.
+//!
+//! Requires the `kata` cargo feature.
+#![cfg(feature = "kata")]
 
 use std::any::Any;
 use std::collections::HashMap;

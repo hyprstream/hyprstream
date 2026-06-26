@@ -654,7 +654,11 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 
     use hyprstream_workers::config::{BackendType, ImageConfig, PoolConfig};
     use hyprstream_workers::image::RafsStore;
-    use hyprstream_workers::{WorkerService, SandboxBackend, KataBackend, NspawnBackend, NspawnConfig};
+    use hyprstream_workers::{WorkerService, SandboxBackend};
+    #[cfg(feature = "kata")]
+    use hyprstream_workers::KataBackend;
+    #[cfg(feature = "nspawn")]
+    use hyprstream_workers::{NspawnBackend, NspawnConfig};
 
     let config = load_config();
     let worker_quic_port = config.worker.as_ref().and_then(|w| w.quic_port);
@@ -698,8 +702,12 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 
     // Construct the sandbox backend based on configuration
     let backend: Arc<dyn SandboxBackend> = match backend_type {
+        #[cfg(feature = "kata")]
         BackendType::Kata => Arc::new(KataBackend::new(image_config, Arc::clone(&rafs_store))),
+        #[cfg(feature = "nspawn")]
         BackendType::Nspawn => Arc::new(NspawnBackend::new(NspawnConfig::default())),
+        #[cfg(feature = "podman")]
+        BackendType::Podman => anyhow::bail!("podman backend not yet implemented"),
     };
 
     let sk = ctx.service_signing_key("worker");

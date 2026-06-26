@@ -23,15 +23,18 @@
 pub mod backend;
 mod client;
 mod container;
+#[cfg(feature = "kata")]
 pub mod kata_backend;
+#[cfg(feature = "nspawn")]
 pub mod nspawn;
 mod pool;
 mod sandbox;
-// Per-sandbox VFS composition + serve (FS-D, #365): native-only.
-#[cfg(not(target_arch = "wasm32"))]
+// Per-sandbox VFS composition + serve (FS-D, #365): native-only, requires nydus.
+#[cfg(all(not(target_arch = "wasm32"), feature = "nydus"))]
 pub mod sandbox_fs;
 mod service;
 pub mod spawner;
+#[cfg(feature = "kata")]
 mod virtiofs;
 
 // Generated wire types — canonical OCI/CRI-aligned names (no Gen*/Wire/Enum aliases)
@@ -73,17 +76,20 @@ pub use client::{
 };
 // Backend trait and implementations
 pub use backend::{SandboxBackend, SandboxHandle};
+#[cfg(feature = "kata")]
 pub use kata_backend::{KataBackend, KataHandle};
+#[cfg(feature = "nspawn")]
 pub use nspawn::{NspawnBackend, NspawnConfig, NspawnHandle};
 // Domain entities (business logic only)
 pub use container::Container;
 pub use pool::{PoolStats, SandboxPool};
 pub use sandbox::PodSandbox;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "nydus"))]
 pub use sandbox_fs::{InjectedMounts, SandboxFs, SandboxFsServer, VFS_SOCKET_NAME};
 pub use service::WorkerService;
 // Re-export service infrastructure from hyprstream-rpc for convenience
 pub use hyprstream_rpc::service::{EnvelopeContext, ServiceHandle, RequestService};
+#[cfg(feature = "kata")]
 pub use virtiofs::{SandboxVirtiofs, SandboxVirtiofsBuilder};
 
 /// CRI runtime version

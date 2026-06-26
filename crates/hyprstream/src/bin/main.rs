@@ -1073,11 +1073,18 @@ fn handle_quick_command(
 
                     let _worker_handle = if !worker_already_running {
                         use hyprstream_workers::image::RafsStore;
-                        use hyprstream_workers::runtime::{SandboxBackend, KataBackend};
+                        use hyprstream_workers::runtime::SandboxBackend;
                         let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
-                        let backend: Arc<dyn SandboxBackend> = Arc::new(
-                            KataBackend::new(image_config, Arc::clone(&rafs_store)),
-                        );
+                        #[cfg(feature = "kata")]
+                        let backend: Arc<dyn SandboxBackend> = {
+                            use hyprstream_workers::runtime::KataBackend;
+                            Arc::new(KataBackend::new(image_config, Arc::clone(&rafs_store)))
+                        };
+                        #[cfg(all(not(feature = "kata"), feature = "nspawn"))]
+                        let backend: Arc<dyn SandboxBackend> = {
+                            use hyprstream_workers::{NspawnBackend, NspawnConfig};
+                            Arc::new(NspawnBackend::new(NspawnConfig::default()))
+                        };
                         let worker_transport =
                             TransportConfig::inproc("hyprstream/workers");
                         let mut worker_service = WorkerService::new(

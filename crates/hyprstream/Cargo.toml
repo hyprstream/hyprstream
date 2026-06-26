@@ -190,7 +190,16 @@ keyring = { version = "3", features = ["windows-native"] }
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
 [features]
-default = ["gittorrent", "xet", "systemd", "otel"]
+# Power-install default: kata+nydus+nspawn all enabled (backward compat).
+default = ["gittorrent", "xet", "systemd", "otel", "kata", "nydus", "nspawn"]
+# Kata Containers VM backend (enables kata+nydus in the workers crate)
+kata = ["hyprstream-workers/kata"]
+# Nydus RAFS image store (enables nydus in the workers crate)
+nydus = ["hyprstream-workers/nydus"]
+# systemd-nspawn lightweight backend
+nspawn = ["hyprstream-workers/nspawn"]
+# Podman OCI backend (stub, reserved for T2-A)
+podman = ["hyprstream-workers/podman"]
 cuda = []
 valkey = ["dep:fred"]  # Enable Valkey/Redis-backed user and token stores
 bnb = ["dep:bitsandbytes-sys"]  # Enable bitsandbytes KV cache quantization (requires compatible ROCm/CUDA)
