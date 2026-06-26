@@ -22,6 +22,8 @@ pub async fn handle_service_install(
     config_services: &[String],
     services_filter: Option<Vec<String>>,
     start: bool,
+    enable: bool,
+    target: hyprstream_service::ServiceTarget,
     verbose: bool,
 ) -> Result<()> {
     let target_services = services_filter.unwrap_or_else(|| config_services.to_vec());
@@ -61,7 +63,7 @@ pub async fn handle_service_install(
 
     // 3. Install/update systemd units if available
     if hyprstream_rpc::has_systemd() {
-        let manager = hyprstream_service::detect_service_manager().await?;
+        let manager = hyprstream_service::detect_service_manager_with_mode(target).await?;
 
         // Encrypt secrets into the systemd user credstore before generating units.
         // This must happen before manager.install() so that install() can see the
@@ -88,6 +90,18 @@ pub async fn handle_service_install(
             match manager.install(service).await {
                 Ok(_) => println!("\u{2713}"),
                 Err(e) => println!("\u{2717} {}", e),
+            }
+        }
+
+        // If --enable, register units for autostart at boot
+        if enable {
+            println!("  Enabling services for autostart...");
+            for service in &target_services {
+                print!("    \u{25CB} {}... ", service);
+                match manager.enable(service).await {
+                    Ok(_) => println!("\u{2713}"),
+                    Err(e) => println!("\u{2717} {}", e),
+                }
             }
         }
 

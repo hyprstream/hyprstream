@@ -31,6 +31,8 @@ pub enum GitOpProgress {
     Status(String),
     Done { message: String, new_model: Option<ModelEntry> },
     Failed(String),
+    /// Authoritative model list from a background registry re-scan (refresh_fn).
+    ModelList(Vec<ModelEntry>),
 }
 
 pub type GitProgressSender = std::sync::mpsc::Sender<GitOpProgress>;
@@ -38,6 +40,9 @@ pub type CloneFn = Box<dyn Fn(String, Option<String>, Option<String>, GitProgres
 pub type PullFn = Box<dyn Fn(String, GitProgressSender) + Send>;
 pub type PushFn = Box<dyn Fn(String, GitProgressSender) + Send>;
 pub type FetchStatusFn = Box<dyn Fn(Vec<String>, std::sync::mpsc::Sender<(String, u32, u32, bool)>) + Send>;
+/// Re-query the registry for the current model set; results return via
+/// `GitOpProgress::ModelList` on the shared git-progress channel.
+pub type RefreshFn = Box<dyn Fn(GitProgressSender) + Send>;
 
 /// Bundled git operation callbacks injected by the service layer.
 pub struct GitOps {
@@ -45,6 +50,7 @@ pub struct GitOps {
     pub pull_fn: PullFn,
     pub push_fn: PushFn,
     pub fetch_status_fn: FetchStatusFn,
+    pub refresh_fn: RefreshFn,
 }
 
 // ============================================================================
@@ -97,6 +103,35 @@ pub fn discover_models(registry: &std::path::Path) -> Vec<ModelEntry> {
         .collect();
     models.sort_by(|a, b| a.model_ref.cmp(&b.model_ref));
     models
+}
+
+/// Merge an authoritative `incoming` model list against the `existing` entries,
+/// carrying over each existing entry's git status (ahead/behind/dirty — fetched
+/// out-of-band) and returning the index that keeps `selected_ref` selected
+/// (falling back to 0). The authoritative list defines membership, so models
+/// removed upstream drop out and newly-cloned models appear.
+fn merge_models(
+    existing: &[ModelEntry],
+    incoming: Vec<ModelEntry>,
+    selected_ref: Option<&str>,
+) -> (Vec<ModelEntry>, usize) {
+    let prev: std::collections::HashMap<&str, &ModelEntry> =
+        existing.iter().map(|e| (e.model_ref.as_str(), e)).collect();
+    let merged: Vec<ModelEntry> = incoming
+        .into_iter()
+        .map(|mut m| {
+            if let Some(p) = prev.get(m.model_ref.as_str()) {
+                m.ahead = p.ahead;
+                m.behind = p.behind;
+                m.is_dirty = p.is_dirty;
+            }
+            m
+        })
+        .collect();
+    let new_index = selected_ref
+        .and_then(|r| merged.iter().position(|e| e.model_ref == r))
+        .unwrap_or(0);
+    (merged, new_index)
 }
 
 // ============================================================================
@@ -256,6 +291,10 @@ pub struct ShellApp {
     /// Receives per-model status updates (model_ref, ahead, behind, dirty).
     git_status_rx: std::sync::mpsc::Receiver<(String, u32, u32, bool)>,
     git_status_tx: std::sync::mpsc::Sender<(String, u32, u32, bool)>,
+    /// Registry dir the model list was discovered from; re-scanned when the
+    /// ModelList view opens so models cloned out-of-band (CLI, another window)
+    /// appear without restarting the TUI.
+    registry_dir: Option<PathBuf>,
 }
 
 impl ShellApp {
@@ -266,6 +305,7 @@ impl ShellApp {
         load_fn: LoadFn,
         unload_fn: Box<dyn Fn(&str) -> bool + Send>,
         git_ops: Option<GitOps>,
+        registry_dir: Option<PathBuf>,
     ) -> Self {
         let pane_rows = rows.saturating_sub(2);
         let initial = PaneWindow::new("shell".to_owned(), None, cols, pane_rows)
@@ -306,7 +346,37 @@ impl ShellApp {
             git_progress_tx,
             git_status_rx,
             git_status_tx,
+            registry_dir,
         }
+    }
+
+    /// Refresh the model list so a model cloned out-of-band (CLI, another
+    /// window) shows up without restarting the TUI. Called when the ModelList
+    /// view opens. Service-backed: re-query the registry via `refresh_fn`
+    /// (authoritative `name:branch` refs); results arrive asynchronously as
+    /// `GitOpProgress::ModelList` and are merged in `tick`. Standalone (no git
+    /// ops): re-scan the registry dir synchronously.
+    fn refresh_model_list(&mut self) {
+        if let Some(ref git_ops) = self.git_ops {
+            (git_ops.refresh_fn)(self.git_progress_tx.clone());
+            return;
+        }
+        let Some(ref dir) = self.registry_dir else { return };
+        let discovered = discover_models(dir);
+        self.merge_model_list(discovered);
+    }
+
+    /// Merge an authoritative model list into `model_list`, preserving the
+    /// per-entry git status (ahead/behind/dirty) the status thread populated and
+    /// keeping the current selection on the same model where possible.
+    fn merge_model_list(&mut self, incoming: Vec<ModelEntry>) {
+        if incoming.is_empty() {
+            return;
+        }
+        let selected_ref = self.model_list.selected_item().map(|e| e.model_ref.clone());
+        let (merged, new_index) =
+            merge_models(self.model_list.items(), incoming, selected_ref.as_deref());
+        self.model_list = SelectList::new("Models", merged).with_selected(new_index);
     }
 
     pub fn pane_rows(&self) -> u16 {
@@ -600,6 +670,7 @@ impl ShellApp {
             1 => self.close_active(),
             2 => self.cycle_window(),
             3 => {
+                self.refresh_model_list();
                 self.mode = ShellMode::ModelList;
                 self.fetch_git_status();
             }
@@ -760,6 +831,11 @@ impl TerminalApp for ShellApp {
                         _ => {}
                     }
                 }
+                GitOpProgress::ModelList(models) => {
+                    self.merge_model_list(models);
+                    // Refresh git status for any newly-appeared models.
+                    self.fetch_git_status();
+                }
             }
             redraw = true;
         }
@@ -799,3 +875,65 @@ impl TerminalApp for ShellApp {
 
 // Re-export from compositor (canonical implementation).
 pub use hyprstream_compositor::keypress_to_bytes;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(model_ref: &str, loaded: bool, ahead: u32, behind: u32, dirty: bool) -> ModelEntry {
+        ModelEntry {
+            model_ref: model_ref.to_owned(),
+            path: PathBuf::from("/tmp").join(model_ref),
+            loaded,
+            ahead,
+            behind,
+            is_dirty: dirty,
+        }
+    }
+
+    #[test]
+    fn merge_adds_new_models_and_preserves_git_status() {
+        // Existing entry carries out-of-band git status (ahead/behind/dirty).
+        let existing = vec![entry("a:main", true, 2, 1, true)];
+        // Authoritative refresh: same model (loaded flipped) plus a freshly-cloned one.
+        let incoming = vec![
+            entry("a:main", false, 0, 0, false),
+            entry("b:main", false, 0, 0, false),
+        ];
+        let (merged, idx) = merge_models(&existing, incoming, Some("a:main"));
+
+        assert_eq!(merged.len(), 2, "newly-cloned b:main appears");
+        let a = &merged[0];
+        assert_eq!(a.model_ref, "a:main");
+        // loaded comes from the authoritative list...
+        assert!(!a.loaded);
+        // ...but git status is carried over from the existing entry.
+        assert_eq!((a.ahead, a.behind, a.is_dirty), (2, 1, true));
+        // new model has no carried-over status.
+        assert_eq!((merged[1].ahead, merged[1].behind, merged[1].is_dirty), (0, 0, false));
+        // selection stays on a:main.
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn merge_drops_removed_models_and_keeps_selection() {
+        let existing = vec![entry("a:main", false, 0, 0, false), entry("b:main", false, 0, 0, false)];
+        // b was removed upstream; only a remains. Selection was on b.
+        let incoming = vec![entry("a:main", false, 0, 0, false)];
+        let (merged, idx) = merge_models(&existing, incoming, Some("b:main"));
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].model_ref, "a:main");
+        // selection target gone → fall back to 0.
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn merge_keeps_selection_on_moved_index() {
+        let existing = vec![entry("b:main", false, 0, 0, false)];
+        // Refresh returns sorted list; previously-selected b is now at index 1.
+        let incoming = vec![entry("a:main", false, 0, 0, false), entry("b:main", false, 0, 0, false)];
+        let (merged, idx) = merge_models(&existing, incoming, Some("b:main"));
+        assert_eq!(idx, 1, "selection follows the model to its new index");
+        assert_eq!(merged[idx].model_ref, "b:main");
+    }
+}

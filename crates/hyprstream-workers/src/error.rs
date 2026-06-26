@@ -144,8 +144,8 @@ pub enum WorkerError {
     // ─────────────────────────────────────────────────────────────────────
     // Infrastructure Errors
     // ─────────────────────────────────────────────────────────────────────
-    #[error("ZMQ error: {0}")]
-    ZmqError(String),
+    #[error("Transport error: {0}")]
+    TransportError(String),
 
     #[error("Serialization error: {0}")]
     SerializationError(String),

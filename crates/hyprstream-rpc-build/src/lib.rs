@@ -190,14 +190,13 @@ fn extract_annotations(
         let name = annotation_names.get(&ann_id).cloned().unwrap_or_default();
 
         if let Ok(value) = ann.get_value() {
-            match extract_value_json(value) {
-                Some(val) => {
-                    result.push(serde_json::json!({
-                        "id": ann_id,
-                        "name": name,
-                        "value": val,
-                    }));
-                }
+            let val = extract_value_json(value);
+            match val {
+                Some(v) => result.push(serde_json::json!({
+                    "id": ann_id,
+                    "name": name,
+                    "value": v,
+                })),
                 None => {
                     // Void annotations (e.g., $cliHidden) -- presence is the value
                     result.push(serde_json::json!({

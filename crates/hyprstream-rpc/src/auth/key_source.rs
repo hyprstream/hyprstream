@@ -23,6 +23,12 @@
 //! let service = MyService::new(...).with_jwt_key_source(key_source);
 //! ```
 
+// The ML-DSA-65 verifying-key list is shared across crates (the rotation task
+// in `hyprstream` and the service factory in `hyprstream-service`) via an
+// `Arc<std::sync::RwLock<..>>` contract, so this module intentionally uses
+// `std::sync::RwLock` for that field rather than `parking_lot::RwLock`.
+#![allow(clippy::disallowed_types)]
+
 use anyhow::Result;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::VerifyingKey;
@@ -64,7 +70,6 @@ pub trait JwtKeySource: Send + Sync + 'static {
     ///
     /// Returns keys for all rotation slots (drain/active/lead) so that tokens
     /// signed by any current slot can be verified. Empty vec disables PQ verification.
-    #[cfg(feature = "pq-hybrid")]
     fn ml_dsa_verifying_keys(&self) -> Vec<crate::crypto::pq::MlDsaVerifyingKey> {
         vec![]
     }
@@ -90,12 +95,25 @@ pub trait JwtKeySource: Send + Sync + 'static {
 /// This is the common case: all services in a cluster trust one PolicyService,
 /// identified by its OAuth issuer URL. JWTs with empty `iss` or matching the
 /// local issuer URL are verified against the CA key.
+///
+/// # NOT a mesh authority (#328)
+///
+/// `ClusterKeySource` holds a SINGLE shared CA key and treats an empty `iss` as
+/// always-trusted/local. That is correct for the in-cluster bare-`sub` token
+/// plane, but it MUST NOT be the verification authority for networked **mesh
+/// peers**: a single shared key cannot distinguish per-host peers, and the
+/// empty-`iss` shortcut would let a networked peer inherit local trust. Mesh
+/// peer identity is established by the per-host key roster (Ed25519 signer →
+/// `service:inference:host-<label>`, resolved fail-closed via
+/// `RequestService::resolve_key_subject`), and the empty-`iss` shortcut is
+/// confined to genuine in-process callers in `verify_claims`
+/// (`EnvelopeContext::is_local_caller`). For kid-routed multi-key verification
+/// prefer [`JwksKeySource`], which honors the `kid` hint.
 #[derive(Clone)]
 pub struct ClusterKeySource {
     ca_verifying_key: VerifyingKey,
     local_issuer_url: String,
     local_issuers_vec: Vec<String>,
-    #[cfg(feature = "pq-hybrid")]
     ml_dsa_vks: Arc<std::sync::RwLock<Vec<crate::crypto::pq::MlDsaVerifyingKey>>>,
 }
 
@@ -116,7 +134,6 @@ impl ClusterKeySource {
             ca_verifying_key,
             local_issuer_url,
             local_issuers_vec,
-            #[cfg(feature = "pq-hybrid")]
             ml_dsa_vks: Arc::new(std::sync::RwLock::new(Vec::new())),
         }
     }
@@ -124,7 +141,6 @@ impl ClusterKeySource {
     /// Set the shared ML-DSA-65 verifying key list for PQ-hybrid JWT verification.
     ///
     /// The Arc is shared with the rotation task so keys stay current.
-    #[cfg(feature = "pq-hybrid")]
     pub fn with_ml_dsa_verifying_keys(mut self, vks: Arc<std::sync::RwLock<Vec<crate::crypto::pq::MlDsaVerifyingKey>>>) -> Self {
         self.ml_dsa_vks = vks;
         self
@@ -147,7 +163,11 @@ impl JwtKeySource for ClusterKeySource {
     }
 
     fn is_trusted(&self, issuer: &str) -> bool {
-        // Empty issuer is always local
+        // Empty issuer is treated as local here. This is SOUND only because the
+        // empty-`iss` shortcut is gated by transport upstream in
+        // `verify_claims` (#328): a networked / mesh caller presenting an
+        // empty-`iss` token is rejected before this is consulted, so empty `iss`
+        // reaches here only for genuine in-process / IPC callers.
         if issuer.is_empty() {
             return true;
         }
@@ -159,9 +179,8 @@ impl JwtKeySource for ClusterKeySource {
         &self.local_issuers_vec
     }
 
-    #[cfg(feature = "pq-hybrid")]
     fn ml_dsa_verifying_keys(&self) -> Vec<crate::crypto::pq::MlDsaVerifyingKey> {
-        self.ml_dsa_vks.read().unwrap_or_else(|p| p.into_inner()).clone()
+        self.ml_dsa_vks.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 }
 
@@ -214,7 +233,6 @@ impl JwtKeySource for FederatedKeySource {
         self.local.local_issuers()
     }
 
-    #[cfg(feature = "pq-hybrid")]
     fn ml_dsa_verifying_keys(&self) -> Vec<crate::crypto::pq::MlDsaVerifyingKey> {
         self.local.ml_dsa_verifying_keys()
     }
@@ -283,8 +301,19 @@ pub struct JwksKeySource {
     soft_ttl: std::time::Duration,
     /// Negative cache TTL (unknown kids cached as missing for this duration)
     negative_ttl: std::time::Duration,
-    #[cfg(feature = "pq-hybrid")]
     ml_dsa_vks: Arc<std::sync::RwLock<Vec<crate::crypto::pq::MlDsaVerifyingKey>>>,
+    /// Authoritative local CA verifying key (on-disk, from PolicyService).
+    ///
+    /// Lets local-issuer JWTs — notably service-to-service WIT JWTs signed by
+    /// the CA over the local IPC plane — verify WITHOUT a network round-trip to
+    /// `/oauth/jwks`. The HTTP JWKS endpoint is not guaranteed to be up during
+    /// service startup (and #441 makes registration a hard precondition), so
+    /// depending on it for local service auth is a startup-ordering fail.
+    /// Consulted only for local issuers (`is_local`), and only when the JOSE
+    /// `kid` matches this key's JWK thumbprint — so it never overrides a
+    /// rotated/JWKS-published key, and is irrelevant to federated issuers.
+    local_ca_key: Option<VerifyingKey>,
+    local_ca_kid: Option<String>,
 }
 
 impl JwksKeySource {
@@ -305,15 +334,25 @@ impl JwksKeySource {
             fetch_semaphore: Semaphore::new(4),
             soft_ttl: std::time::Duration::from_secs(300),
             negative_ttl: std::time::Duration::from_secs(5),
-            #[cfg(feature = "pq-hybrid")]
             ml_dsa_vks: Arc::new(std::sync::RwLock::new(Vec::new())),
+            local_ca_key: None,
+            local_ca_kid: None,
         }
     }
 
     /// Set the shared ML-DSA-65 verifying key list for PQ-hybrid JWT verification.
-    #[cfg(feature = "pq-hybrid")]
     pub fn with_ml_dsa_verifying_keys(mut self, vks: Arc<std::sync::RwLock<Vec<crate::crypto::pq::MlDsaVerifyingKey>>>) -> Self {
         self.ml_dsa_vks = vks;
+        self
+    }
+
+    /// Provide the authoritative local CA verifying key for offline resolution
+    /// of local-issuer (service) JWTs. See the `local_ca_key` field docs.
+    pub fn with_local_ca_key(mut self, ca_vk: VerifyingKey) -> Self {
+        self.local_ca_kid = Some(crate::auth::jwt::jwk_thumbprint(
+            &crate::auth::jwt::JwkThumbprintInput::Ed25519 { x: ca_vk.as_bytes() },
+        ));
+        self.local_ca_key = Some(ca_vk);
         self
     }
 
@@ -424,6 +463,20 @@ impl JwtKeySource for JwksKeySource {
 
         // Try cache first
         if let Some(kid_str) = kid {
+            // Authoritative local CA key (offline): for a LOCAL issuer whose
+            // `kid` matches the on-disk CA key thumbprint, resolve without any
+            // network fetch. This is the service-to-service WIT JWT path; the
+            // HTTP /oauth/jwks endpoint may not be up yet during startup, and
+            // #441 makes service-key registration a hard precondition, so this
+            // resolution must not depend on it. Never overrides a JWKS-published
+            // (rotated) key because it's keyed on the exact CA thumbprint.
+            if self.is_local(issuer) {
+                if let (Some(ca_kid), Some(ca_key)) = (self.local_ca_kid.as_deref(), self.local_ca_key) {
+                    if ca_kid == kid_str {
+                        return Ok(ca_key);
+                    }
+                }
+            }
             {
                 let cache = self.cache.read().await;
                 if let Some(entry) = cache.get(kid_str) {
@@ -491,9 +544,8 @@ impl JwtKeySource for JwksKeySource {
         &self.local_issuers_vec
     }
 
-    #[cfg(feature = "pq-hybrid")]
     fn ml_dsa_verifying_keys(&self) -> Vec<crate::crypto::pq::MlDsaVerifyingKey> {
-        self.ml_dsa_vks.read().unwrap_or_else(|p| p.into_inner()).clone()
+        self.ml_dsa_vks.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
     fn kid_algs(&self, kid: &str) -> Vec<String> {
@@ -522,6 +574,62 @@ mod tests {
         let key = ks.get_key("http://localhost:9080", None).await?;
         assert_eq!(key, test_ca_key());
         Ok(())
+    }
+
+    /// #441/AAA: a JwksKeySource with a local CA key resolves a local-issuer
+    /// service JWT OFFLINE (no JWKS fetch) when the JOSE `kid` matches the CA
+    /// thumbprint — the service-to-service auth path must not depend on the HTTP
+    /// /oauth/jwks endpoint being up during startup.
+    #[tokio::test]
+    async fn jwks_source_resolves_local_ca_key_offline() -> anyhow::Result<()> {
+        // A fetcher that always fails — proves resolution does NOT touch it.
+        let fetcher: JwksFetcher = std::sync::Arc::new(|_url: String| {
+            Box::pin(async move { anyhow::bail!("network must not be used for local CA resolution") })
+        });
+        let ca_sk = SigningKey::from_bytes(&[7u8; 32]);
+        let ca_vk = ca_sk.verifying_key();
+        let ca_kid = crate::auth::jwt::kid_for_key(&ca_sk);
+
+        let ks = JwksKeySource::new(
+            JwksMode::Isolated { jwks_url: "http://127.0.0.1:1/oauth/jwks".to_owned() },
+            "http://localhost:9080".to_owned(),
+            fetcher,
+        )
+        .with_local_ca_key(ca_vk);
+
+        // Local issuer + matching kid -> resolved offline to the CA key.
+        let key = ks.get_key("http://localhost:9080", Some(&ca_kid)).await?;
+        assert_eq!(key, ca_vk);
+
+        // Empty issuer is also local (in-process plane) -> same offline resolution.
+        let key = ks.get_key("", Some(&ca_kid)).await?;
+        assert_eq!(key, ca_vk);
+
+        Ok(())
+    }
+
+    /// The offline CA fallback must NOT fire for a non-matching kid (forces a
+    /// JWKS fetch, which fails here) nor for a non-local issuer — it is scoped
+    /// strictly to local-issuer tokens signed by the exact CA key.
+    #[tokio::test]
+    async fn jwks_source_local_ca_key_scoped_to_matching_kid_and_local_issuer() {
+        let fetcher: JwksFetcher = std::sync::Arc::new(|_url: String| {
+            Box::pin(async move { anyhow::bail!("no network") })
+        });
+        let ca_vk = SigningKey::from_bytes(&[7u8; 32]).verifying_key();
+        let ks = JwksKeySource::new(
+            JwksMode::Isolated { jwks_url: "http://127.0.0.1:1/oauth/jwks".to_owned() },
+            "http://localhost:9080".to_owned(),
+            fetcher,
+        )
+        .with_local_ca_key(ca_vk);
+
+        // Local issuer but a different kid -> CA fallback does NOT fire; the
+        // JWKS fetch is attempted and fails -> error (not the CA key).
+        assert!(ks.get_key("http://localhost:9080", Some("some-other-kid")).await.is_err());
+
+        // Non-local issuer is untrusted in isolated mode regardless of kid.
+        assert!(ks.get_key("https://evil.example.com", Some("some-other-kid")).await.is_err());
     }
 
     #[tokio::test]

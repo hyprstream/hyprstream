@@ -1,80 +1,46 @@
-//! Event bus infrastructure
+//! Event bus infrastructure — moq-lite backed (#167).
 //!
-//! Provides XPUB/XSUB proxy for reliable event delivery between services.
-//! See `docs/eventservice-architecture.md` for detailed documentation.
+//! Provides fan-out event delivery between services using the moq-lite streaming
+//! plane (Live preset: at-most-once, unbounded). Replaces the former ZMQ
+//! XPUB/XSUB ProxyService.
 //!
 //! # Architecture
 //!
 //! ```text
-//! Publishers                    EventService                Subscribers
-//! ┌─────────────┐              ┌───────────┐              ┌──────────┐
-//! │WorkerService │──PUB──────►│           │──SUB───────►│Workflow- │
-//! │RegistryService│            │   Proxy   │              │ Service  │
-//! │InferenceService│           └───────────┘              └──────────┘
-//! └─────────────┘
+//! Publishers                 MoqEventOrigin (global)       Subscribers
+//! ┌─────────────┐           ┌──────────────────────┐      ┌──────────┐
+//! │WorkerService │──moq────►│ local/events/worker  │─────►│Workflow- │
+//! │RegistryService│          │ local/events/system  │      │ Service  │
+//! │                │         │ local/events/registry│      └──────────┘
+//! └─────────────┘           └──────────────────────┘
 //! ```
-//!
-//! # Endpoint Modes
-//!
-//! The EventService supports three endpoint configurations:
-//!
-//! - **Inproc** (default): In-process transport for monolithic mode
-//! - **IPC**: Unix domain sockets for distributed processes
-//! - **Systemd FD**: Pre-bound file descriptors from socket activation
 //!
 //! # Usage
 //!
 //! ```ignore
-//! use hyprstream_workers::events::{
-//!     endpoints, ProxyService, ServiceSpawner, SpawnedService,
-//!     EventPublisher, EventSubscriber,
-//! };
-//! use hyprstream_workers::events::endpoints::EndpointMode;
+//! use hyprstream_workers::events::{EventPublisher, EventSubscriber};
 //!
-//! // Detect transport configuration
-//! let (pub_transport, sub_transport) = endpoints::detect_transports(EndpointMode::Auto);
-//!
-//! // Create and spawn proxy service
-//! let ctx = Arc::new(zmq::Context::new());
-//! let proxy = ProxyService::new("events", ctx.clone(), pub_transport, sub_transport);
-//! let spawner = ServiceSpawner::threaded();
-//! let service = spawner.spawn(proxy).await?;
-//!
-//! // Create a publisher
-//! let mut publisher = EventPublisher::new(&ctx, "worker")?;
+//! // Create a publisher (no ZMQ context needed)
+//! let mut publisher = EventPublisher::new("worker")?;
 //! publisher.publish("sandbox123", "started", &payload).await?;
 //!
 //! // Create a subscriber
-//! let mut subscriber = EventSubscriber::new(&ctx)?;
+//! let mut subscriber = EventSubscriber::new()?;
 //! subscriber.subscribe("worker.")?;
 //! while let Ok((topic, payload)) = subscriber.recv().await {
 //!     println!("Received: {}", topic);
 //! }
-//!
-//! // Graceful shutdown
-//! service.stop().await?;
 //! ```
 
-pub mod endpoints;
 mod publisher;
 pub mod secure_publisher;
 pub mod secure_subscriber;
-mod service;
-pub mod sockopt;
 mod subscriber;
 pub mod token_manager;
 mod types;
 
 pub use publisher::EventPublisher;
 pub use subscriber::EventSubscriber;
-
-// Re-export spawner types for the recommended API:
-// let proxy = ProxyService::new("events", ctx, pub_transport, sub_transport);
-// let service = ServiceSpawner::threaded().spawn(proxy).await?;
-pub use hyprstream_service::{ProxyService, ServiceSpawner, SpawnedService};
-
-// Re-export endpoint types for convenience
-pub use endpoints::EndpointMode;
 
 // Re-export event types
 pub use types::{
@@ -93,6 +59,3 @@ pub use types::{
 pub use secure_publisher::{SecureEventPublisher, EncryptedEvent, RekeyPolicy, RotationResult};
 pub use secure_subscriber::SecureEventSubscriber;
 pub use token_manager::EventTokenManager;
-
-// Inproc endpoint constants (for backward compatibility)
-pub use endpoints::{PUB as EVENTS_PUB, SUB as EVENTS_SUB};

@@ -339,7 +339,10 @@ pub fn compute_weight_entropy_profile(
             0.95 // Default: near-uniform → low rank
         };
 
-        let recommended_rank = entropy_to_rank(avg_normalized);
+        // Conservative cap: Tier 3 entropy-based ranks are unvalidated for models outside
+        // the embedded profile registry. Cap at 8 (uniform fallback) until ablation
+        // results land (#202). The runtime-correction loop raises utilised rank over time.
+        let recommended_rank = entropy_to_rank(avg_normalized).min(8);
 
         // Target modules: default ["q_proj", "v_proj"] for standard (R2-I4 fix)
         let target_modules = match layer_type {
@@ -449,6 +452,12 @@ pub fn get_layer_profile(
 
     // Tier 3: Compute from weights (~2-5s)
     if let Some(weights) = weights {
+        warn!(
+            model_type = %config.model_type,
+            "Unknown model — Tier 3 entropy-based rank allocation is unvalidated \
+             (no embedded ablation data). Conservative cap (rank ≤ 8) applied until \
+             ablation spike lands (#202). Consider contributing an embedded profile."
+        );
         info!("Computing TTN profile for new model (one-time analysis)...");
         return compute_weight_entropy_profile(weights, config, model_path);
     }

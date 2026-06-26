@@ -13,16 +13,11 @@ use serde::{Deserialize, Serialize, Serializer, Deserializer};
 
 /// Compute the RFC 7638 JWK Thumbprint for an Ed25519 key.
 ///
-/// The thumbprint is SHA-256 of the lexicographic canonical JWK JSON:
-/// `{"crv":"Ed25519","kty":"OKP","x":"<base64url>"}` — keys in lexicographic order.
+/// Delegates to [`crate::auth::jwk_thumbprint`] — kept as a named entry-point
+/// so callers that only have a raw `[u8; 32]` don't need to construct a
+/// [`crate::auth::JwkThumbprintInput`] themselves. (#155 cleanup)
 pub fn compute_jkt(key_bytes: &[u8; 32]) -> String {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-    use sha2::{Digest, Sha256};
-    let x = URL_SAFE_NO_PAD.encode(key_bytes);
-    // Keys in lexicographic order per RFC 7638 § 3.
-    let canonical = format!(r#"{{"crv":"Ed25519","kty":"OKP","x":"{x}"}}"#);
-    let hash = Sha256::digest(canonical.as_bytes());
-    URL_SAFE_NO_PAD.encode(hash)
+    crate::auth::jwk_thumbprint(&crate::auth::JwkThumbprintInput::Ed25519 { x: key_bytes })
 }
 
 /// Returns true if `iss` belongs to a local node.

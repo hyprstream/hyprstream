@@ -7,6 +7,9 @@
 //! Mount points:
 //!   /srv/{service}     → ServiceMount (ctl for mutations, cat for queries)
 //!   /srv/{service}/doc → DocMount (man pages from schema annotations)
+//!   /wanix             → WanixMount (Wanix-native VFS via 9P2000.L over DMA;
+//!                        optional — mounted only when running under Wanix,
+//!                        see [`mount_wanix`]). #409/#391.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -81,9 +84,11 @@ impl IdCounter {
 pub enum ServiceDispatchResult {
     /// Normal JSON response string.
     Response(String),
-    /// Streaming — JSON string of parsed StreamInfo + ephemeral keypair for ECDH.
+    /// Streaming — the VERIFIED-capnp `StreamInfo` library type (decoded +
+    /// COSE-verified upstream, carried typed — NOT a JSON string to re-parse,
+    /// #468) + ephemeral keypair for ECDH.
     Stream {
-        json: String,
+        info: hyprstream_rpc::stream_info::StreamInfo,
         /// 64 bytes: [secret(32) | pubkey(32)]
         ephemeral_keypair: Vec<u8>,
     },
@@ -214,30 +219,15 @@ impl Mount for GenericServiceMount {
 
         let resp = match dispatch_result {
             ServiceDispatchResult::Response(json) => json.into_bytes(),
-            ServiceDispatchResult::Stream { json: stream_json, ephemeral_keypair } => {
-                // Streaming response — use open_stream() to set up verified subscription
-                let parsed: serde_json::Value = serde_json::from_str(&stream_json)
-                    .map_err(|e| MountError::Io(format!("parse stream response: {e}")))?;
-
-                // The dispatch already sent the streaming request and got StreamInfo back.
-                // Now we need to open a stream handle. But open_stream() does the full
-                // flow (send + ECDH + subscribe). Since dispatch already sent the request,
-                // we need to do the ECDH + subscribe part manually using the StreamInfo.
+            ServiceDispatchResult::Stream { info, ephemeral_keypair } => {
+                // #468: `info` is the VERIFIED-capnp StreamInfo library type carried
+                // typed through dispatch (decoded + COSE-verified upstream) — no
+                // serde_json round-trip / re-parse at this boundary.
                 //
-                // TODO: Refactor dispatch to return raw payload bytes so open_stream()
-                // can handle the full flow. For now, use StreamHandle::open() directly.
-                let inner = if let Some(obj) = parsed.as_object() {
-                    if obj.len() == 1 {
-                        obj.values().next().unwrap().clone()
-                    } else {
-                        parsed.clone()
-                    }
-                } else {
-                    parsed.clone()
-                };
-                let info: hyprstream_rpc::stream_info::StreamInfo = serde_json::from_value(inner)
-                    .map_err(|e| MountError::Io(format!("parse StreamInfo: {e}")))?;
-
+                // The dispatch already sent the streaming request and got StreamInfo back.
+                // Now we open a stream handle. open_stream() would do the full flow
+                // (send + ECDH + subscribe), but dispatch already sent the request, so we
+                // do the ECDH + subscribe part here using the verified StreamInfo.
                 let client_secret = &ephemeral_keypair[..32];
                 let client_pubkey = &ephemeral_keypair[32..64];
                 let mut secret_32 = [0u8; 32];
@@ -298,12 +288,12 @@ impl Mount for GenericServiceMount {
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
         let (svc_name, _) = self.service.metadata();
         let name = state.path.last().map(|s| s.as_str()).unwrap_or(svc_name);
-        Ok(Stat {
-            qtype: if state.path.is_empty() { 0x80 } else { 0 },
-            size: 0,
-            name: name.to_string(),
-            mtime: 0,
-        })
+        Ok(Stat::unknown_qid(
+            if state.path.is_empty() { 0x80 } else { 0 },
+            0,
+            name.to_string(),
+            0,
+        ))
     }
 
     async fn clunk(&self, _fid: Fid, _caller: &Subject) {}
@@ -386,12 +376,12 @@ impl Mount for DocMount {
         let state = fid.downcast_ref::<VfsFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
         let name = state.path.last().map(|s| s.as_str()).unwrap_or("doc");
-        Ok(Stat {
-            qtype: if state.path.is_empty() { 0x80 } else { 0 },
-            size: 0,
-            name: name.to_string(),
-            mtime: 0,
-        })
+        Ok(Stat::unknown_qid(
+            if state.path.is_empty() { 0x80 } else { 0 },
+            0,
+            name.to_string(),
+            0,
+        ))
     }
 
     async fn clunk(&self, _fid: Fid, _caller: &Subject) {}
@@ -430,8 +420,8 @@ macro_rules! impl_service_dispatch {
 
                 Ok(match result {
                     svc::DispatchResult::Response(json) => ServiceDispatchResult::Response(json),
-                    svc::DispatchResult::Stream(json) => ServiceDispatchResult::Stream {
-                        json,
+                    svc::DispatchResult::Stream(info) => ServiceDispatchResult::Stream {
+                        info,
                         ephemeral_keypair: keypair,
                     },
                 })
@@ -456,6 +446,21 @@ impl_service_dispatch!(InferenceDispatch, crate::inference_client);
 // ============================================================================
 
 /// Build a VFS namespace with codegen-driven service mounts.
+///
+/// Per #389 + #391 (Option 1: shared content model), this builder mounts the
+/// same content trees as the native namespace builder
+/// (`hyprstream::cli::shell_handlers`) so `/srv/registry` and `/srv/model`
+/// resolve to the same spine-backed content in either context. The transport
+/// leaf (DMA/SAB ring buffers here vs ZMQ in the native builder) is
+/// correctly-scoped glue and is NOT part of the convergence contract — see
+/// `hyprstream_vfs::STANDARD_NAMESPACE_PATHS`.
+///
+/// Note: `/worktree` is bind-mounted to `/srv/registry` for path-shape
+/// parity with the native namespace. In the browser this exposes the
+/// GenericServiceMount (ctl-style service-as-files: `ls`, `cat`, `ctl`);
+/// in the native namespace the same path exposes the worktree filesystem
+/// (`RemoteRegistryMount`, real qids). The convergence is at the path +
+/// backing-service level; the access style differs by transport capability.
 pub fn build_browser_namespace(
     registry_client: Arc<dyn RpcClient>,
     model_client: Arc<dyn RpcClient>,
@@ -464,9 +469,14 @@ pub fn build_browser_namespace(
     let mut ns = hyprstream_vfs::Namespace::new();
 
     // Service mounts — all use GenericServiceMount with generated dispatch
-    ns.mount("/srv/registry", Arc::new(GenericServiceMount::new(
+    let registry_mount: Arc<GenericServiceMount> = Arc::new(GenericServiceMount::new(
         Arc::clone(&registry_client), Box::new(RegistryDispatch), Arc::clone(&stream_registry),
-    ))).expect("mount /srv/registry");
+    ));
+    ns.mount("/srv/registry", registry_mount.clone()).expect("mount /srv/registry");
+    // `/worktree` aliases `/srv/registry` for path-shape parity with the
+    // native namespace (see `hyprstream_vfs::STANDARD_NAMESPACE_PATHS`).
+    ns.bind_mount("/worktree", registry_mount, hyprstream_vfs::BindFlag::After)
+        .expect("bind mount /worktree");
     ns.mount("/srv/model", Arc::new(GenericServiceMount::new(
         Arc::clone(&model_client), Box::new(ModelDispatch), Arc::clone(&stream_registry),
     ))).expect("mount /srv/model");
@@ -498,5 +508,48 @@ pub fn build_browser_namespace(
         Arc::clone(&stream_registry),
     ))).expect("mount /stream");
 
+    // `/wanix` is NOT mounted here: it needs a Wanix-provided SharedArrayBuffer
+    // that the browser only has when running under Wanix. Wire it separately
+    // via [`mount_wanix`] after this builder returns. See #409/#391.
+
     (ns, stream_registry)
+}
+
+// ============================================================================
+// WanixMount wiring — #409/#391 (Wanix-native VFS access)
+// ============================================================================
+
+/// Mount the Wanix 9P filesystem into the namespace at `/wanix` (#409/#391).
+///
+/// `client` is a `P9Client` already connected over a `P9Transport` (e.g. the
+/// `DmaTransport` SharedArrayBuffer bridge). Every VFS op under `/wanix` is
+/// translated to 9P2000.L and forwarded — the Wanix half of the "browser
+/// both-paths" model, riding the same wasm transport substrate as the service
+/// mounts above.
+///
+/// This is the rpc-std seam that makes `WanixMount` reachable from the browser
+/// namespace now that `hyprstream-9p` is a wasm32 dependency.
+///
+/// # Breaking change (#465)
+///
+/// This signature replaces the previous `async fn mount_wanix(ns, sab, uname,
+/// aname) -> anyhow::Result<()>`, which performed the 9P version/attach handshake
+/// internally over a `DmaTransport` built from a `SharedArrayBuffer`. The handshake
+/// (and transport construction) now happen at the call site, so callers pass an
+/// already-connected `P9Client<T>` and this function is **synchronous**, returning
+/// [`hyprstream_vfs::NamespaceError`] instead of `anyhow::Result<()>`. Update call
+/// sites: `mount_wanix(ns, &sab, uname, aname).await?` →
+/// `let client = P9Client::connect(DmaTransport::new(&sab, true), uname, aname).await?;
+/// mount_wanix(ns, client)?;`.
+pub fn mount_wanix<T>(
+    ns: &mut hyprstream_vfs::Namespace,
+    client: hyprstream_9p::client::P9Client<T>,
+) -> Result<(), hyprstream_vfs::NamespaceError>
+where
+    T: hyprstream_9p::client::P9Transport + 'static,
+{
+    ns.mount(
+        "/wanix",
+        Arc::new(hyprstream_9p::wanix_mount::WanixMount::new(client)),
+    )
 }

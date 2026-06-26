@@ -310,6 +310,9 @@ pub struct OAuthState {
     pub token_ttl: u32,
     /// Refresh token TTL in seconds
     pub refresh_token_ttl: u32,
+    /// When true, `/oauth/authorize` rejects inline params and requires a `request_uri`
+    /// from a prior `/oauth/par` call (RFC 9126). Advertised in server metadata.
+    pub require_pushed_authorization_requests: bool,
     /// HTTP client for fetching Client ID Metadata Documents
     pub http_client: reqwest::Client,
     /// Raw Ed25519 verifying key bytes (32 bytes) for the JWKS endpoint.
@@ -367,8 +370,30 @@ pub struct OAuthState {
     /// ES256 (P-256) signing key rotation store for JWKS and DPoP/atproto interop.
     pub es256_key_store: Option<Arc<crate::auth::Es256SigningKeyStore>>,
     /// ML-DSA-65 signing key rotation store for PQ-hybrid JWT issuance.
-    #[cfg(feature = "pq-hybrid")]
     pub ml_dsa_key_store: Option<Arc<crate::auth::MlDsaSigningKeyStore>>,
+    /// QUIC/WebTransport cert hashes (SHA-256 of leaf DER, `sha2-256` multihash encoding).
+    /// Published in the DID-doc `#quic` service entry so peers can pin the cert (#185).
+    /// A set so cert rotation can publish old + new simultaneously.
+    pub quic_cert_hashes: Vec<[u8; 32]>,
+    /// Public QUIC URI (`https://host:port`) for the DID-doc service entry (#185).
+    /// None until the QUIC server is started and the cert hash is known.
+    pub quic_public_uri: Option<String>,
+    /// Raw ML-DSA-65 verifying-key bytes (1952 bytes) for the node's mesh
+    /// post-quantum signing key (#157). Published as the `#mesh-pq` Multikey
+    /// verification method in the root DID document. Derived from the same
+    /// Ed25519 key as [`Self::signing_key`] (via `derive_mesh_mldsa_key`), so
+    /// the published VM equals the key the node signs mesh responses with.
+    /// `None` when the entity signing key is not configured.
+    pub mesh_pq_verifying_key: Option<Vec<u8>>,
+    /// #282: the node's iroh endpoint id (its Ed25519 `node_id`, 32 bytes),
+    /// published as the `#iroh` verification method + an `IrohTransport` service
+    /// entry in the root DID document — **only** when the iroh substrate is
+    /// actually bound. `None` until the daemon binds iroh and reports it.
+    pub iroh_node_id: Option<[u8; 32]>,
+    /// #282: iroh relay URLs to advertise in the `IrohTransport` entry's
+    /// `relays`. Empty = rely on pkarr/DNS discovery for reachability (the
+    /// peer resolves direct paths by node_id alone).
+    pub iroh_relays: Vec<String>,
 }
 
 impl OAuthState {
@@ -392,6 +417,7 @@ impl OAuthState {
             default_scopes: config.default_scopes.clone(),
             token_ttl: config.token_ttl_seconds,
             refresh_token_ttl: config.refresh_token_ttl_seconds,
+            require_pushed_authorization_requests: config.require_pushed_authorization_requests,
             http_client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
                 .build()
@@ -417,8 +443,12 @@ impl OAuthState {
             signing_key_store: None,
             jti_blocklist: None,
             es256_key_store: None,
-            #[cfg(feature = "pq-hybrid")]
             ml_dsa_key_store: None,
+            quic_cert_hashes: Vec::new(),
+            quic_public_uri: None,
+            mesh_pq_verifying_key: None,
+            iroh_node_id: None,
+            iroh_relays: Vec::new(),
         }
     }
 
@@ -456,9 +486,42 @@ impl OAuthState {
     }
 
     /// Attach the ML-DSA-65 key rotation store.
-    #[cfg(feature = "pq-hybrid")]
     pub fn with_ml_dsa_key_store(mut self, store: Arc<crate::auth::MlDsaSigningKeyStore>) -> Self {
         self.ml_dsa_key_store = Some(store);
+        self
+    }
+
+    /// Set the node's QUIC transport info for DID-doc publication (#185).
+    ///
+    /// `cert_hashes` is the set of SHA-256 cert DER hashes currently in use
+    /// (old + new during rotation). `public_uri` is `https://host:port` that
+    /// external peers dial.
+    pub fn with_quic_transport(mut self, public_uri: String, cert_hashes: Vec<[u8; 32]>) -> Self {
+        self.quic_public_uri = Some(public_uri);
+        self.quic_cert_hashes = cert_hashes;
+        self
+    }
+
+    /// Set the node's iroh transport info for DID-doc publication (#282).
+    ///
+    /// Call this only when the iroh substrate is actually bound: it makes
+    /// `root_did_document` advertise the `#iroh` Ed25519 verification method and
+    /// an `IrohTransport` service entry (`accept: [hyprstream-rpc/1, moql]`).
+    /// `relays` may be empty — peers then resolve reachability by node_id alone
+    /// via iroh's pkarr/DNS discovery.
+    pub fn with_iroh_transport(mut self, node_id: [u8; 32], relays: Vec<String>) -> Self {
+        self.iroh_node_id = Some(node_id);
+        self.iroh_relays = relays;
+        self
+    }
+
+    /// Attach the shared JWT ID blocklist (shared with PolicyService).
+    ///
+    /// When set, `POST /oauth/revoke` on access tokens writes the JTI into
+    /// this blocklist so the PolicyService RPC enforcement path also rejects
+    /// revoked tokens — closing the gap between HTTP revocation and RPC auth.
+    pub fn with_jti_blocklist(mut self, bl: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>) -> Self {
+        self.jti_blocklist = Some(bl);
         self
     }
 
@@ -513,7 +576,14 @@ impl OAuthState {
     }
 
     /// Attach the signing key for OpenID Federation 1.0 entity configuration signing.
+    ///
+    /// Also derives and stores the node's mesh ML-DSA-65 verifying key (#157)
+    /// from this same Ed25519 key, so the root DID document's `#mesh-pq`
+    /// Multikey verification method matches the post-quantum key the mesh signs
+    /// with (`derive_mesh_mldsa_key`).
     pub fn with_signing_key(mut self, key: ed25519_dalek::SigningKey) -> Self {
+        let pq_sk = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&key);
+        self.mesh_pq_verifying_key = Some(hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq_sk));
         self.signing_key = Some(key);
         self
     }

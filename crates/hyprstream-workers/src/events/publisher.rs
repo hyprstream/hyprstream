@@ -1,84 +1,66 @@
-//! EventPublisher - Async event publishing using TMQ
+//! EventPublisher — moq-backed async event publishing (#167).
 //!
-//! Each service creates its own publisher instance.
-//! Publishers connect to the EventService proxy's XSUB socket.
+//! Publishers connect to the process-global [`MoqEventOrigin`] and write
+//! events to the `local/events/{source}` broadcast's `events` track.
+//! No ZMQ context is required; the moq origin is process-global.
 
 use anyhow::{anyhow, Result};
-use futures::SinkExt;
-use std::sync::Arc;
-use tmq::{publish, Multipart};
 
-use super::endpoints;
-use hyprstream_rpc::registry::{self, SocketKind};
+use hyprstream_rpc::moq_event::{global_moq_event_origin, MoqEventPublisher};
 
-/// Async event publisher using TMQ PUB socket
+/// Async event publisher backed by moq-lite.
 ///
-/// Publishers connect to the EventService proxy and send events
-/// with topic-based routing. Topics follow the format:
-/// `{source}.{entity}.{event}`
+/// Creates and holds a [`MoqEventPublisher`] for the named source, writing
+/// topic+payload pairs to the moq event bus. All in-process subscribers that
+/// have subscribed to matching topic patterns will receive the events.
 ///
 /// # Example
 ///
 /// ```ignore
-/// let mut publisher = EventPublisher::new(&ctx, "worker")?;
+/// let mut publisher = EventPublisher::new("worker")?;
 /// publisher.publish("sandbox123", "started", &payload).await?;
 /// ```
 pub struct EventPublisher {
-    socket: tmq::Publish,
-    source: String,
+    inner: MoqEventPublisher,
 }
 
 impl EventPublisher {
-    /// Create a new publisher for a service connecting to the default endpoint
+    /// Create a new publisher for the given source name.
     ///
-    /// # Arguments
-    ///
-    /// * `context` - ZMQ context (must be same as EventService for inproc://)
-    /// * `source` - Service name (e.g., "worker", "registry", "model", "inference")
-    ///
-    /// # Endpoint Resolution
-    ///
-    /// Uses EndpointRegistry if initialized, otherwise falls back to default inproc endpoint.
-    pub fn new(context: &Arc<zmq::Context>, source: &str) -> Result<Self> {
-        let endpoint = match registry::try_global() {
-            Some(reg) => reg.endpoint("events", SocketKind::Pub).to_zmq_string(),
-            None => endpoints::PUB.to_owned(),
-        };
-        Self::with_endpoint(context, source, &endpoint)
+    /// Requires the process-global moq event bus to have been initialized via
+    /// `init_global_moq_event_origin` (done by the event-service factory at startup).
+    pub fn new(source: &str) -> Result<Self> {
+        let origin = global_moq_event_origin()
+            .ok_or_else(|| anyhow!("moq event bus not initialized; start the event service first"))?;
+        let inner = origin.publisher(source)?;
+        Ok(Self { inner })
     }
 
-    /// Create a new publisher for a service connecting to a specific endpoint
-    ///
-    /// Use this for IPC sockets in distributed mode.
-    ///
-    /// # Arguments
-    ///
-    /// * `context` - ZMQ context
-    /// * `source` - Service name (e.g., "worker", "registry", "cli")
-    /// * `endpoint` - Endpoint to connect to (e.g., "ipc:///run/user/1000/hyprstream/events/pub.sock")
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let endpoint = format!("ipc://{}", paths::events_pub_socket().display());
-    /// let mut publisher = EventPublisher::with_endpoint(&ctx, "cli", &endpoint)?;
-    /// publisher.publish_raw("system.registry.request", b"").await?;
-    /// ```
-    pub fn with_endpoint(context: &Arc<zmq::Context>, source: &str, endpoint: &str) -> Result<Self> {
-        let socket = publish(context)
-            .connect(endpoint)
-            .map_err(|e| anyhow!("Failed to connect publisher to {}: {}", endpoint, e))?;
-
-        Ok(Self {
-            socket,
-            source: source.to_owned(),
-        })
+    /// Create a new publisher for `source` that ALSO mirrors every event to the
+    /// per-OID (#393) publication track for `oid`. This is the transition path:
+    /// legacy flat-track subscribers keep working while #393 per-OID subscribers
+    /// get wire-level selectivity.
+    pub fn new_with_oid(source: &str, oid: &str) -> Result<Self> {
+        let origin = global_moq_event_origin()
+            .ok_or_else(|| anyhow!("moq event bus not initialized; start the event service first"))?;
+        let inner = origin.publisher_with_oid(source, oid)?;
+        Ok(Self { inner })
     }
 
-    /// Publish an event asynchronously
+    /// Create a new publisher that writes ONLY to the per-OID (#393) publication
+    /// track for `oid` (no flat-track mirror). Use once every subscriber of this
+    /// source has migrated to per-OID subscription.
+    pub fn new_oid_only(source: &str, oid: &str) -> Result<Self> {
+        let origin = global_moq_event_origin()
+            .ok_or_else(|| anyhow!("moq event bus not initialized; start the event service first"))?;
+        let inner = origin.publisher_oid_only(source, oid)?;
+        Ok(Self { inner })
+    }
+
+    /// Publish an event asynchronously.
     ///
-    /// Creates a topic from `{source}.{entity}.{event}` and sends
-    /// a multipart message [topic, payload].
+    /// Creates a topic from `{source}.{entity}.{event}` and writes a frame
+    /// containing the topic length, topic bytes, and payload to the moq track.
     ///
     /// # Arguments
     ///
@@ -88,66 +70,32 @@ impl EventPublisher {
     ///
     /// # Errors
     ///
-    /// Returns error if entity/event contain dots (reserved as separator)
-    /// or if sending fails.
+    /// Returns error if entity/event contain dots (reserved as separator).
     pub async fn publish(&mut self, entity: &str, event: &str, payload: &[u8]) -> Result<()> {
-        // Validate: entity/event cannot contain dots (used as separator)
-        if entity.contains('.') {
-            return Err(anyhow!("Entity name cannot contain '.': {}", entity));
-        }
-        if event.contains('.') {
-            return Err(anyhow!("Event name cannot contain '.': {}", event));
-        }
-
-        let topic = format!("{}.{}.{}", self.source, entity, event);
-
-        // Multipart message: [topic, payload]
-        // Topic is first frame for ZMQ prefix filtering
-        let multipart = Multipart::from(vec![topic.into_bytes(), payload.to_vec()]);
-
-        self.socket
-            .send(multipart)
-            .await
-            .map_err(|e| anyhow!("Failed to publish event: {}", e))?;
-
-        Ok(())
+        self.inner.publish(entity, event, payload)
     }
 
-    /// Publish with a pre-formatted topic
-    ///
-    /// Use this when you need full control over the topic format.
+    /// Publish with a pre-formatted topic.
     pub async fn publish_raw(&mut self, topic: &str, payload: &[u8]) -> Result<()> {
-        let multipart = Multipart::from(vec![topic.as_bytes().to_vec(), payload.to_vec()]);
-
-        self.socket
-            .send(multipart)
-            .await
-            .map_err(|e| anyhow!("Failed to publish event: {}", e))?;
-
-        Ok(())
+        self.inner.publish_raw(topic, payload)
     }
 
-    /// Get the source name for this publisher
+    /// Get the source name for this publisher.
     pub fn source(&self) -> &str {
-        &self.source
+        self.inner.source()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    
-
     #[test]
     fn test_topic_validation() {
-        // Entity with dot should fail
         let entity = "sandbox.123";
         assert!(entity.contains('.'));
 
-        // Event with dot should fail
         let event = "started.ok";
         assert!(event.contains('.'));
 
-        // Valid names
         let valid_entity = "sandbox123";
         let valid_event = "started";
         assert!(!valid_entity.contains('.'));

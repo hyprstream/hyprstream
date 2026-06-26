@@ -6,7 +6,7 @@
 //! # Architecture
 //!
 //! ```text
-//! WorkflowService (ZmqService)
+//! WorkflowService (RequestService)
 //!     │
 //!     ├── scan_repo()       → Discover .github/workflows/*.yml
 //!     ├── subscribe()       → Register event triggers

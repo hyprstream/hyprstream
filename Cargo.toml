@@ -22,6 +22,7 @@ members = [
     "crates/chat-core",
     "crates/hyprstream-rpc-std",
     "crates/hyprstream-9p",
+    "crates/hyprstream-pds",
 ]
 # bitsandbytes-sys is standalone - only built when bnb feature is enabled
 exclude = ["crates/bitsandbytes-sys"]
@@ -40,7 +41,7 @@ libc = "0.2"
 
 # Async runtime
 tokio = { version = "1.43.0", features = ["rt-multi-thread", "signal", "fs", "process", "sync", "time", "macros"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["rt", "compat"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 tokio-test = "0.4"
 tokio-rustls = "0.26.1"
@@ -131,13 +132,25 @@ h3-quinn = { version = "0.0.10", features = ["datagram"] }
 h3-webtransport = "0.1.2"
 http = "1"
 
+# Iroh + Media-over-QUIC (Epic #131 — Phase 1 substrate)
+# iroh re-exported via web-transport-iroh — match its major to avoid duplicate copies.
+# Note: web-transport-iroh 0.5.x pins iroh =1.0.0-rc.0 exactly; co-bump these together.
+iroh = { version = "=1.0.0-rc.0", default-features = false, features = ["tls-ring"] }
+moq-net = "0.1"
+web-transport-iroh = { version = "0.5.1", default-features = false, features = ["ring"] }
+web-transport-quinn = { version = "0.11.9", default-features = false, features = ["ring"] }
+web-transport-trait = "0.3"
+# Stream multiplexer for the UDS transport (`web_transport_trait::Session` over a
+# single UnixStream). Already in the lock graph via libp2p/iroh — no new tree.
+yamux = "0.13"
+
 # Data processing
 polars = "0.45.1"
 sqlparser = "0.39.0"
 json-threat-protection = "0.1.1"
 
 # System utilities
-nix = { version = "0.27", features = ["fs", "process", "signal", "user"] }
+nix = { version = "0.27", features = ["fs", "process", "signal", "socket", "user"] }
 users = "0.11"
 rlimit = "0.10"
 clap = { version = "4.4", features = ["derive", "env"] }
@@ -164,16 +177,25 @@ minijinja = { version = "2.12.0", features = ["builtins", "loop_controls"] }
 half = "2.6.0"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
-# Messaging
-tmq = { git = "https://github.com/hyprstream/tmq", branch = "xpubsub" }  # TMQ with XPUB/XSUB support
-zmq = "0.10"  # Underlying libzmq bindings
-zmq-sys = "0.12"  # Raw libzmq FFI for ZMQ_USE_FD socket option (version matches zmq 0.10's dependency)
-
 # Cap'n Proto (zero-copy serialization)
 # All three crates must track together — generated code from capnpc
 # targets specific internal APIs in capnp; mismatched majors break
 # RawStructSchema struct construction.
-capnp = "0.24"
+# `unaligned`: read capnp messages directly from network buffers (moq/quinn `Bytes`)
+# that can start at any byte offset — required for the zero-copy
+# `read_message_from_flat_slice` path on the streaming + RPC planes (otherwise capnp
+# errors with UnalignedSegment).
+#
+# SAFE in Rust — and NOT the same as C++'s `-DCAPNP_ALLOW_UNALIGNED`. The C++ flag only
+# disables the alignment *check* and leaves genuine UB (unaligned access is UB in C/C++;
+# compilers may emit SIMD / assume a pointer's low bits are zero), which is why capnp's
+# author recommends copying into an aligned buffer instead (StackOverflow Q 75006774).
+# Rust's `unaligned` feature instead changes the access *mechanism*: each word becomes
+# `Raw = [u8; N]` (alignment 1) read via `from_le_bytes(*raw)` (capnp `private/primitive.rs`)
+# — the canonical, fully-defined Rust idiom for unaligned reads, with no UB. On x86_64/ARM64
+# it lowers to a single hardware unaligned load (~free) and does NOT memcpy or sacrifice
+# zero-copy. See PR #330.
+capnp = { version = "0.24", features = ["unaligned"] }
 capnp-futures = "0.24"
 
 # Utilities
@@ -247,6 +269,7 @@ version = "0.24"
 [profile.dev]
 debug = "line-tables-only"
 split-debuginfo = "unpacked"
+codegen-units = 4 # More threads needed for smaller RAM targets
 
 [profile.dev.package."*"]
 opt-level = 2
@@ -255,7 +278,7 @@ debug = false
 [profile.release]
 lto = "thin"
 strip = true
-codegen-units=4
+codegen-units = 4 # More threads needed for smaller RAM targets
 
 [workspace.lints.rust]
 # unsafe_code = "warn"  # Informational only, many FFI calls are necessary

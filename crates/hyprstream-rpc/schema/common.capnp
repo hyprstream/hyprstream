@@ -72,13 +72,18 @@ struct RequestEnvelope {
 #   Decryption: X25519 DH(server_sk, clientEphemeralPublic) -> AES-256-GCM-SIV
 struct SignedEnvelope {
   envelope @0 :RequestEnvelope;    # Cleartext envelope (used when encryptedEnvelope is absent)
-  sig @1 :Data $fixedSize(64);     # Ed25519 signature (64 bytes)
-  cnf @2 :Data $fixedSize(32);     # Ed25519 public key (32 bytes)
+  sig @1 :Data $fixedSize(64);     # Ed25519 signature (64 bytes) — cnf, sig retained for the
+  cnf @2 :Data $fixedSize(32);     # signer-pubkey advertisement + transition; auth comes from `cose`.
   encryptedEnvelope @3 :Data;      # AES-256-GCM-SIV ciphertext of serialized RequestEnvelope
   clientEphemeralPublic @4 :Data $fixedSize(32);  # X25519 ephemeral public key for DH
-  pqSig @5 :Data;                  # ML-DSA-65 signature (3309 bytes when present, pq-hybrid)
-  pqCnf @6 :Data;                  # ML-DSA-65 verifying key (1952 bytes when present, pq-hybrid)
-  pqKemCiphertext @7 :Data;        # ML-KEM-768 ciphertext (1088 bytes when present, pq-hybrid)
+  # M3 (#152): COSE composite signature (RFC 9052 COSE_Sign), detached over the
+  # canonical RequestEnvelope (cleartext) or the encrypted signing-data.
+  #   - Classical mode: ONE EdDSA COSE_Signature entry.
+  #   - Hybrid mode: TWO entries (EdDSA + ML-DSA-65).
+  # The ML-DSA-65 verifying key is NOT carried here; it is resolved by kid from
+  # the trust store (kid-anchored), fixing the prior self-certification gap.
+  cose @5 :Data;                   # CBOR-encoded COSE_Sign (composite signatures)
+  pqKemCiphertext @6 :Data;        # ML-KEM-768 ciphertext (1088 bytes) for hybrid encryption
 }
 
 # Signed response envelope
@@ -91,8 +96,18 @@ struct SignedEnvelope {
 struct ResponseEnvelope {
   requestId @0 :UInt64;    # Correlates with RequestEnvelope.requestId
   payload @1 :Data;        # Serialized inner response
-  sig @2 :Data $fixedSize(64);     # Ed25519 signature (64 bytes)
-  cnf @3 :Data $fixedSize(32);     # Ed25519 public key (32 bytes)
+  sig @2 :Data $fixedSize(64);     # Ed25519 signature (64 bytes) — cnf, sig retained for the
+  cnf @3 :Data $fixedSize(32);     # signer-pubkey advertisement + transition; auth comes from `cose`.
+  # #275: COSE composite signature (RFC 9052 COSE_Sign1), detached over the
+  # response signing-data (requestId || payload). Mirrors SignedEnvelope.cose.
+  #   - Classical mode: ONE EdDSA COSE_Sign1 entry.
+  #   - Hybrid mode: TWO entries (EdDSA + ML-DSA-65), nested (outer signs
+  #     `signing-data || inner_eddsa_signature`).
+  # The signing domain is bound to RESPONSE_ENVELOPE_TYPE_ID (distinct from the
+  # request domain), so a response COSE signature can never verify as a request.
+  # The ML-DSA-65 verifying key is NOT carried here; it is resolved by kid from
+  # the trust store (kid-anchored), fixing the prior self-certification gap.
+  cose @4 :Data;                   # CBOR-encoded nested COSE composite signature
 }
 
 # Authorization subject — bare username or "anonymous".
@@ -107,7 +122,7 @@ struct Subject {
 #
 # The following types are now defined in streaming.capnp:
 #   - StreamInfo, StreamRegister, StartStreamRequest, StreamAuthResponse
-#   - StreamBlock, StreamPayload, StreamStats, StreamError, StreamResume
+#   - StreamBlock, StreamPayload, StreamStats, StreamError
 #
 # Import with: using Streaming = import "streaming.capnp";
 

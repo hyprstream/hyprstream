@@ -9,7 +9,7 @@
 //! # Architecture
 //!
 //! ```text
-//! hyprstream-rpc       (transport: ZmqService, RequestLoop, Resolver)
+//! hyprstream-rpc       (transport: RequestService, RequestLoop, Resolver)
 //!     ↑
 //! hyprstream-service   (orchestration: spawner, factory, manager)
 //!     ↑
@@ -21,8 +21,8 @@ pub mod notify;
 
 // Top-level re-exports for convenience
 pub use service::spawner::{
-    DualSpawnable, LoadBalancerService, ProcessBackend, ProcessConfig, ProcessKind,
-    ProcessSpawner, ProxyService, ServiceKind, ServiceMode, ServiceSpawner,
+    DualSpawnable, ProcessBackend, ProcessConfig, ProcessKind,
+    ProcessSpawner, ServiceKind, ServiceMode, ServiceSpawner,
     Spawnable, SpawnedProcess, SpawnedService, SpawnerBackend, StandaloneBackend,
     SystemdBackend, InprocManager, UnifiedServiceConfig,
 };
@@ -34,10 +34,10 @@ pub use service::factory::{
 
 pub use service::trust_store::{TrustStore, Attestation, global_trust_store};
 
-pub use service::manager::{detect as detect_service_manager, ServiceManager, StandaloneManager};
+pub use service::manager::{detect as detect_service_manager, detect_with_mode as detect_service_manager_with_mode, ServiceManager, ServiceTarget, StandaloneManager};
 
 #[cfg(feature = "systemd")]
-pub use service::manager::SystemdManager;
+pub use service::manager::{SystemdManager, SystemdSystemManager};
 
 #[cfg(feature = "systemd")]
 pub use service::manager::systemd::encrypt_credentials_if_available;

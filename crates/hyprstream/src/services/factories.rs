@@ -25,10 +25,10 @@ use std::sync::Arc;
 use anyhow::Context;
 use git2db::Git2DB;
 use hyprstream_rpc::prelude::*;
-use hyprstream_rpc::registry::{global as global_registry, SocketKind};
-use hyprstream_service::{ProxyService, ServiceContext, Spawnable};
+use hyprstream_rpc::registry::SocketKind;
+use hyprstream_service::{ServiceContext, Spawnable};
 use hyprstream_rpc::service_factory;
-use hyprstream_workers::endpoints;
+use hyprstream_rpc::moq_event::MoqEventOrigin;
 use tokio::sync::RwLock;
 use tracing::info;
 
@@ -36,7 +36,6 @@ use crate::auth::PolicyManager;
 use crate::config::{HyprConfig, TokenConfig};
 use crate::services::{DiscoveryService, McpService, McpConfig, PolicyService, PolicyClient, RegistryService, RegistryClient};
 use crate::services::generated::policy_client::{RefreshServiceTokenRequest, RegisterServiceKey};
-use crate::zmq::global_context;
 
 /// Load HyprConfig, falling back to default on error.
 fn load_config() -> HyprConfig {
@@ -54,6 +53,13 @@ fn service_token(service_name: &str) -> Option<String> {
 /// that needs it. Both PolicyService and RegistryService share this instance.
 static SHARED_GIT2DB: std::sync::OnceLock<Arc<RwLock<Git2DB>>> = std::sync::OnceLock::new();
 
+/// Shared JTI blocklist Arc — set by `create_policy_service`, read by
+/// `create_oauth_service`. Because PolicyService is always created first
+/// (OAuthService `depends_on = ["policy"]`), the lock is always populated
+/// before `create_oauth_service` runs.
+static SHARED_JTI_BLOCKLIST: std::sync::OnceLock<Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>> =
+    std::sync::OnceLock::new();
+
 /// Get or initialize the shared Git2DB registry for the given models directory.
 fn get_or_init_git2db(models_dir: &std::path::Path) -> anyhow::Result<Arc<RwLock<Git2DB>>> {
     if let Some(existing) = SHARED_GIT2DB.get() {
@@ -70,10 +76,78 @@ fn get_or_init_git2db(models_dir: &std::path::Path) -> anyhow::Result<Arc<RwLock
     Ok(Arc::clone(SHARED_GIT2DB.get_or_init(|| shared)))
 }
 
+/// Resolve the credentials directory used to load service JWTs at startup.
+///
+/// Mirrors the resolution in `main.rs`: systemd/IPC mode honors
+/// `HYPRSTREAM__SECRETS__PATH`; otherwise it is `<config_dir>/credentials`.
+/// This is the same on-disk location the wizard/bootstrap manager writes
+/// service JWTs to (`credentials/{service}/service-jwt`).
+fn credentials_dir() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("HYPRSTREAM__SECRETS__PATH") {
+        return std::path::PathBuf::from(p);
+    }
+    HyprConfig::load()
+        .map(|c| c.config_dir().join("credentials"))
+        .unwrap_or_else(|_| {
+            dirs::config_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                .join("hyprstream")
+                .join("credentials")
+        })
+}
+
+/// Resolve the CA-signed JWT used to register a service's signing key.
+///
+/// Fail-closed (issue #441): returns the JWT (preferring one already in the
+/// trust store, falling back to the authoritative on-disk credential), or an
+/// ERROR naming the real cause. It never silently returns "skip" — a service
+/// that cannot produce its JWT must not come up serving signed responses.
+fn resolve_registration_jwt(
+    service_name: &str,
+    creds_dir: &std::path::Path,
+    from_trust: Option<String>,
+) -> anyhow::Result<String> {
+    if let Some(jwt) = from_trust {
+        return Ok(jwt);
+    }
+    match crate::auth::identity_store::load_service_jwt(creds_dir, service_name) {
+        Ok(Some(jwt)) => Ok(jwt),
+        Ok(None) => anyhow::bail!(
+            "service '{service_name}' cannot register its signing key: \
+             no CA-signed JWT found in trust store or on disk at {}. \
+             Run 'hyprstream wizard' to provision service credentials; \
+             a service must not serve signed responses without a registered key.",
+            creds_dir.display(),
+        ),
+        Err(e) => anyhow::bail!(
+            "service '{service_name}' cannot register its signing key: \
+             failed to read CA-signed JWT from {}: {e}",
+            creds_dir.display(),
+        ),
+    }
+}
+
 /// Register this service's verifying key with the PolicyService CA.
 ///
 /// Called by each non-policy factory so that peer services can resolve
 /// our pubkey via `resolveServiceKey` RPC.  No-op for PolicyService itself.
+///
+/// # Fail-closed (issue #441)
+///
+/// A service that cannot obtain its CA-signed JWT (and therefore cannot
+/// register its signing key) MUST NOT come up serving signed responses —
+/// every peer would resolve a key/JWT that disagrees with what we actually
+/// sign with, surfacing three layers away as a cryptic "Response signed by
+/// unexpected key". So registration is a hard precondition: if we cannot get
+/// a JWT, we return an error and the factory (and thus the service) fails to
+/// start, naming the real cause.
+///
+/// The authoritative source of the service JWT is on disk
+/// (`credentials/{service}/service-jwt`), written by the wizard/bootstrap
+/// manager. At process startup only the bootstrap *pubkeys* are seeded into
+/// the trust store (with `jwt: None`); the JWT itself is loaded here and
+/// seeded into the trust store so that peer-client construction
+/// (`service_token`) and the background renewal task can read it.
 fn register_service_key(
     _ctx: &ServiceContext,
     service_name: &str,
@@ -84,23 +158,40 @@ fn register_service_key(
         return Ok(());
     }
 
-    let jwt = {
+    let creds_dir = credentials_dir();
+
+    // The JWT may already be in the trust store (e.g. seeded by an earlier
+    // registration in this process); otherwise load it from disk — the
+    // authoritative location the wizard/bootstrap manager wrote it to.
+    let from_trust = {
         let trust = hyprstream_service::global_trust_store();
-        let vk = match trust.resolve_one(service_name) {
-            Some(vk) => vk,
-            None => {
-                tracing::warn!(service = service_name, "trust store has no key — skipping registerServiceKey");
-                return Ok(());
-            }
-        };
-        match trust.get(&vk).and_then(|att| att.jwt.clone()) {
-            Some(jwt) => jwt,
-            None => {
-                tracing::warn!(service = service_name, "trust store has no JWT — skipping registerServiceKey");
-                return Ok(());
-            }
-        }
+        trust
+            .resolve_one(service_name)
+            .and_then(|vk| trust.get(&vk))
+            .and_then(|att| att.jwt.clone())
     };
+    let jwt = resolve_registration_jwt(service_name, &creds_dir, from_trust)?;
+
+    // Seed the loaded JWT into the trust store so that peer-client construction
+    // (`service_token`) and the background renewal task can read it. Bind it to
+    // this service's own verifying key — the key we actually sign with — so the
+    // advertised key == the actual signer (the #441 invariant).
+    {
+        let vk = signing_key.verifying_key();
+        let trust = hyprstream_service::global_trust_store();
+        let expires_at = decode_jwt_exp(&jwt).unwrap_or(0);
+        let mut att = trust.get(&vk).unwrap_or_else(|| hyprstream_service::Attestation {
+            scopes: std::iter::once(service_name.to_owned()).collect(),
+            subject: None,
+            jwt: None,
+            expires_at: 0,
+            attested_by: None,
+        });
+        att.scopes.insert(service_name.to_owned());
+        att.jwt = Some(jwt.clone());
+        att.expires_at = expires_at;
+        trust.insert(vk, att);
+    }
 
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
@@ -109,7 +200,7 @@ fn register_service_key(
         signing_key.clone(),
         policy_vk,
         Some(jwt.clone()),
-    );
+    )?;
 
     let request = RegisterServiceKey {
         service_name: service_name.to_owned(),
@@ -125,15 +216,7 @@ fn register_service_key(
     info!(service = service_name, "Registered verifying key with PolicyService");
 
     // Spawn background JWT renewal for this service
-    let credentials_dir = HyprConfig::load()
-        .map(|c| c.config_dir().join("credentials"))
-        .unwrap_or_else(|_| {
-            dirs::config_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-                .join("hyprstream")
-                .join("credentials")
-        });
-    spawn_jwt_renewal_task(service_name, signing_key.clone(), credentials_dir);
+    spawn_jwt_renewal_task(service_name, signing_key.clone(), creds_dir);
 
     Ok(())
 }
@@ -206,7 +289,13 @@ fn spawn_jwt_renewal_task(
                 (vk, svc_jwt)
             };
 
-            let policy_client = PolicyClient::for_service(signing_key.clone(), policy_vk, Some(current_jwt));
+            let policy_client = match PolicyClient::for_service(signing_key.clone(), policy_vk, Some(current_jwt)) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(service = service_name, error = %e, "failed to create PolicyClient; skipping JWT renewal");
+                    continue;
+                }
+            };
             let req = RefreshServiceTokenRequest { ttl_seconds: 2_592_000 };
 
             match policy_client.refresh_service_token(&req).await {
@@ -238,21 +327,72 @@ fn spawn_jwt_renewal_task(
 // Event Service Factory
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Factory for EventService (XPUB/XSUB proxy for event distribution)
+/// Factory for EventService — initializes the moq-lite event bus (#167).
+///
+/// Replaces the ZMQ XPUB/XSUB ProxyService with a `MoqEventOrigin` registered
+/// as a process global. Publishers and subscribers use the global origin directly;
+/// no forwarding proxy or thread is needed. The returned service just holds the
+/// shutdown barrier so the orchestrator tracks lifecycle correctly.
 #[service_factory("event")]
-fn create_event_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
-    info!("Creating EventService");
+fn create_event_service(_ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+    info!("Creating EventService (moq-lite event bus)");
 
-    let mode = if ctx.is_ipc() {
-        endpoints::EndpointMode::Ipc
-    } else {
-        endpoints::EndpointMode::Inproc
-    };
+    let origin = MoqEventOrigin::new();
+    hyprstream_rpc::moq_event::init_global_moq_event_origin(origin.clone());
 
-    let (pub_transport, sub_transport) = endpoints::detect_transports(mode);
-    let proxy = ProxyService::new("events", global_context(), pub_transport, sub_transport);
+    // #275: serve the event-bus origin over the well-known cross-process UDS path
+    // so OTHER service processes (worker, model, ...) can publish/subscribe events
+    // to this shared bus. In the same-process (InprocManager) deployment every
+    // service shares this global origin directly; this UDS plane is the bridge
+    // for the systemd / --ipc deployment where each service is its own process.
+    let event_moq_path = hyprstream_rpc::paths::event_socket();
+    hyprstream_rpc::moq_event::serve_event_moq_uds_background(origin, event_moq_path);
 
-    Ok(Box::new(proxy))
+    Ok(Box::new(MoqEventBarrierService::new()))
+}
+
+/// Minimal `Spawnable` that satisfies the service lifecycle contract for the
+/// moq event bus. The bus itself is a process-global `MoqEventOrigin` with no
+/// dedicated thread; this service just waits for shutdown.
+struct MoqEventBarrierService;
+
+impl MoqEventBarrierService {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl Spawnable for MoqEventBarrierService {
+    fn name(&self) -> &str {
+        "event"
+    }
+
+    fn registrations(&self) -> Vec<(hyprstream_rpc::registry::SocketKind, hyprstream_rpc::transport::TransportConfig)> {
+        vec![] // no ZMQ endpoints
+    }
+
+    fn run(
+        self: Box<Self>,
+        shutdown: std::sync::Arc<tokio::sync::Notify>,
+        on_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> hyprstream_rpc::error::Result<()> {
+        if let Some(ready) = on_ready {
+            let _ = ready.send(());
+        }
+        // systemd Type=notify: send READY=1 so the unit reaches `active` rather
+        // than timing out (~45s) and restart-looping. These moq barrier services
+        // don't go through the RPC serve path (serve.rs::signal_ready) that
+        // normally notifies systemd, so they must signal readiness themselves —
+        // the moq origin/event-bus is already initialized in the factory before
+        // run() is called, so the service is genuinely ready here.
+        let _ = hyprstream_rpc::notify::ready();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| hyprstream_rpc::error::RpcError::Other(e.to_string()))?;
+        rt.block_on(shutdown.notified());
+        Ok(())
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -325,7 +465,6 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         Arc::new(ctx.signing_key().clone()),
         TokenConfig::default(),
         git2db,
-        global_context(),
         ctx.transport("policy", SocketKind::Rep),
     );
     if let Some(issuer) = ctx.oauth_issuer_url() {
@@ -338,11 +477,15 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
     let es256_store = crate::auth::key_rotation::global_es256_key_store(&secrets_dir, &config.oauth);
     policy_service = policy_service.with_es256_key_store(es256_store);
-    #[cfg(feature = "pq-hybrid")]
     {
         let ml_dsa_store = crate::auth::key_rotation::global_ml_dsa_key_store(&secrets_dir, &config.oauth);
         policy_service = policy_service.with_ml_dsa_key_store(ml_dsa_store);
     }
+
+    // Publish the JTI blocklist Arc so OAuthService (created later) can share it.
+    // This wires POST /oauth/revoke → PolicyService RPC enforcement: a revoked
+    // access token is rejected by both the HTTP path and the RPC auth check.
+    let _ = SHARED_JTI_BLOCKLIST.set(policy_service.jti_blocklist_arc());
 
     Ok(ctx.into_spawnable_quic(policy_service, config.policy.quic_port))
 }
@@ -356,6 +499,11 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating RegistryService");
 
+    // RegistryService publishes clone-progress streams via StreamChannel::run_stream
+    // (which fails loudly if no moq origin is registered in this process).
+    // Initialize this process's local moq plane. Idempotent.
+    init_local_moq_stream_plane("registry");
+
     let config = load_config();
     let sk = ctx.service_signing_key("registry");
 
@@ -366,7 +514,7 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("registry"));
+    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("registry"))?;
 
     // Create registry service with infrastructure (blocking since we're in sync context)
     let mut registry_service = tokio::task::block_in_place(|| {
@@ -374,7 +522,6 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
         rt.block_on(RegistryService::new(
             ctx.models_dir(),
             policy_client,
-            global_context(),
             ctx.transport("registry", SocketKind::Rep),
             sk.clone(),
         ))
@@ -391,34 +538,122 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
 // Streams Service Factory
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Factory for StreamService (PULL/XPUB queuing proxy with JWT validation)
-#[service_factory("streams")]
-fn create_streams_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
-    info!("Creating StreamService with JWT validation and queuing");
+/// Initialize this process's local moq stream plane (origin + UDS server).
+///
+/// Every service process that **publishes** moq streams (the central `streams`
+/// service, and stream-publisher services such as `tui`/`notification`/`registry`/
+/// `metrics`/`model`) needs its OWN moq plane in-process: the process-global
+/// [`MoqStreamOrigin`] that `StreamChannel::publisher()` appends into, plus a
+/// per-PID UDS moq server so a co-located client can connect directly to the
+/// path returned in the publisher's response.
+///
+/// In a multi-process (systemd one-process-per-service) deployment, only the
+/// `streams` factory used to do this, so other publisher processes had a `None`
+/// origin (nothing to publish to) and returned an empty `moq_uds_path` to the
+/// client (→ client `ensure!` fails). This helper closes that gap.
+///
+/// Idempotent: if the process already has a moq origin (the `streams` factory
+/// ran in this process, or this helper was already called), it returns early
+/// without double-initializing the origin or double-serving the UDS. This lets
+/// it compose with the `streams` factory and with multiple publisher factories
+/// co-located in one process.
+fn init_local_moq_stream_plane(service_name: &str) {
+    // Guard: a moq origin already exists in this process — nothing to do.
+    if hyprstream_rpc::moq_stream::global_moq_origin().is_some() {
+        return;
+    }
 
-    use crate::services::StreamService;
-
-    // XPUB frontend - clients subscribe via SUB
-    let pub_transport = global_registry().endpoint("streams", SocketKind::Sub);
-    // PULL backend - publishers connect via PUSH
-    let pull_transport = global_registry().endpoint("streams", SocketKind::Push);
-
-    let stream_service = StreamService::new(
-        "streams",
-        global_context(),
-        pub_transport,
-        pull_transport,
-        ctx.verifying_key(),
-    )
-    .with_authorize_signer(|pubkey| {
+    let gate = |pubkey: &[u8; 32]| -> bool {
         use ed25519_dalek::VerifyingKey;
         let Ok(vk) = VerifyingKey::from_bytes(pubkey) else {
             return false;
         };
         hyprstream_service::global_trust_store().get(&vk).is_some()
-    });
+    };
 
-    Ok(Box::new(stream_service))
+    // Use DEFAULT_PREFIX ("local/streams") so the publisher's broadcast paths
+    // match what consumers reconstruct (NotificationService builds its consumer
+    // path from DEFAULT_PREFIX; TUI/registry/metrics echo the origin's own
+    // broadcast_path back to the client, so any prefix is self-consistent there).
+    let moq_origin = hyprstream_rpc::moq_stream::MoqStreamOrigin::standalone()
+        .with_prefix(hyprstream_rpc::moq_stream::DEFAULT_PREFIX)
+        .with_authorize_signer(gate)
+        .build();
+
+    // Register the global BEFORE serving — downstream code that calls
+    // StreamChannel::publisher() will see it immediately.
+    if !hyprstream_rpc::moq_stream::init_global_moq_origin(moq_origin.clone()) {
+        // Lost a race to another initializer in this process; that init owns the
+        // UDS server too, so don't start a second one.
+        return;
+    }
+
+    let moq_uds_path = {
+        let dir = std::env::temp_dir()
+            .join(format!("hyprstream-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("moq.sock")
+    };
+    info!(
+        service = service_name,
+        path = %moq_uds_path.display(),
+        "Initializing local moq stream plane",
+    );
+    hyprstream_rpc::moq_stream::serve_moq_uds_background(moq_origin, moq_uds_path);
+}
+
+/// Factory for the moq stream origin (#138 N4 — ZMQ StreamService removed).
+///
+/// Builds the process-global `MoqStreamOrigin`, registers it, and starts the
+/// UDS moq server so cross-process subscribers (e.g. `tui attach`) can
+/// subscribe over moq without any ZMQ sockets.
+#[service_factory("streams")]
+fn create_streams_service(_ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+    info!("Creating moq stream origin (ZMQ StreamService removed)");
+
+    init_local_moq_stream_plane("streams");
+
+    Ok(Box::new(MoqStreamBarrierService::new()))
+}
+
+/// Minimal `Spawnable` that holds the moq stream origin lifetime and satisfies
+/// the service lifecycle contract. The origin itself is a process-global with
+/// no dedicated thread; this service just waits for shutdown.
+struct MoqStreamBarrierService;
+
+impl MoqStreamBarrierService {
+    fn new() -> Self { Self }
+}
+
+impl Spawnable for MoqStreamBarrierService {
+    fn name(&self) -> &str { "streams" }
+
+    fn registrations(&self) -> Vec<(hyprstream_rpc::registry::SocketKind, hyprstream_rpc::transport::TransportConfig)> {
+        vec![]
+    }
+
+    fn run(
+        self: Box<Self>,
+        shutdown: std::sync::Arc<tokio::sync::Notify>,
+        on_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> hyprstream_rpc::error::Result<()> {
+        if let Some(ready) = on_ready {
+            let _ = ready.send(());
+        }
+        // systemd Type=notify: send READY=1 so the unit reaches `active` rather
+        // than timing out (~45s) and restart-looping. These moq barrier services
+        // don't go through the RPC serve path (serve.rs::signal_ready) that
+        // normally notifies systemd, so they must signal readiness themselves —
+        // the moq origin/event-bus is already initialized in the factory before
+        // run() is called, so the service is genuinely ready here.
+        let _ = hyprstream_rpc::notify::ready();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| hyprstream_rpc::error::RpcError::Other(e.to_string()))?;
+        rt.block_on(shutdown.notified());
+        Ok(())
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -429,6 +664,11 @@ fn create_streams_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
 #[service_factory("model", schema = "../../../hyprstream-rpc-std/schema/model.capnp", metadata = crate::services::generated::model_client::schema_metadata, depends_on = ["policy", "registry", "discovery", "notification"])]
 fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating ModelService");
+
+    // ModelService spawns InferenceService instances in-process, which publish
+    // generation streams via StreamChannel::run_stream (fails loudly without a
+    // moq origin). Initialize this process's local moq plane. Idempotent.
+    init_local_moq_stream_plane("model");
 
     use crate::services::{ModelService, ModelServiceConfig};
 
@@ -442,7 +682,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("model"));
+    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("model"))?;
 
     // Create registry client
     let registry_vk = hyprstream_service::global_trust_store()
@@ -452,7 +692,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
         sk.clone(),
         registry_vk,
         service_token("model"),
-    );
+    )?;
 
     #[allow(clippy::expect_used)]
     let mut model_service = tokio::task::block_in_place(|| {
@@ -466,7 +706,6 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
             sk.clone(),
             policy_client,
             registry_client,
-            global_context(),
             ctx.transport("model", SocketKind::Rep),
         ))
     })?;
@@ -474,6 +713,21 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
         model_service = model_service.with_expected_audience(issuer.to_owned());
     }
     model_service = model_service.with_jwt_key_source(ctx.cluster_key_source());
+
+    // #431 — DiscoveryClient for federated at:// record resolution. The discovery
+    // key is in the trust store (depends_on includes "discovery"). Best-effort:
+    // if discovery isn't resolvable, ModelService simply has no federation client
+    // and at:// refs fall through to local resolution.
+    if let Some(discovery_vk) = hyprstream_service::global_trust_store().resolve_one("discovery") {
+        match crate::services::DiscoveryClient::for_service(sk.clone(), discovery_vk, None) {
+            Ok(dc) => {
+                model_service = model_service.with_discovery_client(std::sync::Arc::new(dc));
+            }
+            Err(e) => {
+                tracing::warn!("ModelService: failed to build DiscoveryClient for federation: {e}");
+            }
+        }
+    }
 
     Ok(ctx.into_spawnable_quic(model_service, config.model.quic_port))
 }
@@ -486,7 +740,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
 ///
 /// Note: This service requires worker configuration. If not configured,
 /// the factory will use sensible defaults.
-#[service_factory("worker", depends_on = ["policy", "discovery"])]
+#[service_factory("worker", depends_on = ["policy", "discovery", "event"])]
 fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating WorkerService");
 
@@ -550,7 +804,6 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         pool_config,
         backend,
         rafs_store,
-        global_context(),
         ctx.transport("worker", SocketKind::Rep),
         sk.clone(),
     )?;
@@ -563,7 +816,7 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         sk.clone(),
         policy_vk,
         service_token("worker"),
-    );
+    )?;
     worker_service.set_authorize_fn(super::worker::build_authorize_fn(policy_client));
     if let Some(issuer) = ctx.oauth_issuer_url() {
         worker_service.set_expected_audience(issuer.to_owned());
@@ -600,11 +853,11 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let model_vk = hyprstream_service::global_trust_store()
         .resolve_one("model")
         .ok_or_else(|| anyhow::anyhow!("trust store has no model key"))?;
-    let model_client = ModelClient::for_service(sk.clone(), model_vk, service_token("oai"));
+    let model_client = ModelClient::for_service(sk.clone(), model_vk, service_token("oai"))?;
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("oai"));
+    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("oai"))?;
 
     // Create registry client
     let registry_vk = hyprstream_service::global_trust_store()
@@ -614,7 +867,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         sk.clone(),
         registry_vk,
         service_token("oai"),
-    );
+    )?;
 
     // Create server state (blocking since we're in sync context)
     let resource_url = config.oai.resource_url();
@@ -639,7 +892,6 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         config.oai.clone(),
         config.tls.clone(),
         server_state,
-        global_context(),
         ctx.transport("oai", SocketKind::Rep),
         ctx.verifying_key(),
     );
@@ -675,12 +927,12 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
             let registry_vk = hyprstream_service::global_trust_store()
                 .resolve_one("registry")
                 .ok_or_else(|| anyhow::anyhow!("trust store has no registry key"))?;
-            let zmq_client: RegistryClient = RegistryClient::for_service(
+            let registry_client: RegistryClient = RegistryClient::for_service(
                 sk.clone(),
                 registry_vk,
                 service_token("flight"),
-            );
-            Some(Arc::new(zmq_client))
+            )?;
+            Some(Arc::new(registry_client))
         } else {
             None
         };
@@ -688,7 +940,6 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let flight_service = FlightService::new(
         config.flight.clone(),
         registry_client,
-        global_context(),
         ctx.transport("flight", SocketKind::Rep),
         ctx.verifying_key(),
     );
@@ -719,15 +970,20 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     // Pass signing key instead of a pre-created PolicyClient.
     // OAuthService runs in its own tokio runtime (separate thread), so the
     // PolicyClient must be created inside that runtime for ZMQ async I/O to work.
-    let oauth_service = OAuthService::new(
+    let mut oauth_service = OAuthService::new(
         config.oauth.clone(),
         config.tls.clone(),
         sk,
-        global_context(),
         ctx.transport("oauth", SocketKind::Rep),
         ctx.verifying_key(),
         ctx.jwt_verifying_key(),
-    );
+    )
+    .with_quic_config(config.quic.clone());
+    if let Some(bl) = SHARED_JTI_BLOCKLIST.get() {
+        oauth_service = oauth_service.with_jti_blocklist(Arc::clone(bl));
+    } else {
+        tracing::warn!("JTI blocklist not set by PolicyService factory — revoked access tokens will not be blocked at RPC layer");
+    }
 
     Ok(Box::new(oauth_service))
 }
@@ -765,7 +1021,6 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 
     let mcp_config = McpConfig {
         verifying_key: ctx.verifying_key(),
-        zmq_context: global_context(),
         signing_key: sk,
         transport: ctx.transport("mcp", SocketKind::Rep),
         ctx: None, // ServiceContext not yet available as Arc — handlers use signing_key directly
@@ -800,7 +1055,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                 ctx.service_signing_key("mcp"),
                 policy_vk,
                 service_token("mcp"),
-            ));
+            )?);
             std::sync::Arc::new(
                 crate::auth::FederationKeyResolver::new(&config.oauth.trusted_issuers)
                     .with_policy_client(fallback_policy_client)
@@ -1032,6 +1287,12 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 
     use crate::tui::{TuiState, service::TuiService};
 
+    // TUI publishes terminal frames (stdin/stdout) over moq via
+    // StreamChannel::publisher(), and returns its per-PID moq UDS path to the
+    // client. In a per-process deployment this process has no moq plane unless
+    // we initialize one here. Idempotent — no-op if already set.
+    init_local_moq_stream_plane("tui");
+
     let config = load_config();
     let tui_config = &config.tui;
     let sk = ctx.service_signing_key("tui");
@@ -1048,14 +1309,13 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("tui"));
+    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("tui"))?;
 
     // Build VFS namespace for ChatApps spawned via TUI RPC.
     let (vfs_ns, vfs_subject) = crate::tui::vfs::build_chat_vfs_namespace(&sk)?;
 
     let mut tui_service = TuiService::new(
         state,
-        global_context(),
         ctx.transport("tui", SocketKind::Rep),
         sk.clone(),
     ).with_policy_client(policy_client)
@@ -1091,15 +1351,24 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("discovery"));
+    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("discovery"))?;
     let auth_provider = crate::services::discovery::PolicyAuthProvider::new(policy_client);
+
+    // #431 — record resolver backing getRecord/getRepo. Built over an in-memory
+    // PDS record store; the publishing side (populating the store on model
+    // register + atproto-pointer advance, #394) is wired separately, so the
+    // store starts empty (getRecord reports NOT_FOUND until records are
+    // published). The access-control gate + CAR-proof wire are fully active.
+    let pds_store = std::sync::Arc::new(crate::services::discovery::PdsRecordStore::new());
+    let record_resolver = crate::services::discovery::PdsRecordResolver::new(pds_store);
 
     let mut discovery_service = DiscoveryService::new(
         Arc::new(sk),
         ctx.jwt_verifying_key(),
-        global_context(),
         ctx.transport("discovery", SocketKind::Rep),
-    ).with_auth_provider(Box::new(auth_provider));
+    )
+    .with_auth_provider(Box::new(auth_provider))
+    .with_record_resolver(Box::new(record_resolver));
     if let Some(issuer) = ctx.oauth_issuer_url() {
         discovery_service = discovery_service.with_oauth_issuer(issuer.to_owned());
         // Use the issuer URL as the audience for discovery tokens
@@ -1141,6 +1410,12 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
 fn create_notification_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating NotificationService");
 
+    // NotificationService publishes broadcast frames over moq and returns its
+    // per-PID moq UDS path to subscribers (notification.rs handle_subscribe).
+    // Initialize this process's local moq plane so that path is non-empty and
+    // the origin exists for StreamChannel::publisher(). Idempotent.
+    init_local_moq_stream_plane("notification");
+
     let sk = ctx.service_signing_key("notification");
 
     // Register this service's verifying key with PolicyService
@@ -1149,11 +1424,10 @@ fn create_notification_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn S
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("notification"));
+    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("notification"))?;
 
     let mut notification_service = crate::services::NotificationService::new(
         Arc::new(sk),
-        global_context(),
         ctx.transport("notification", SocketKind::Rep),
     ).with_policy_client(policy_client);
     if let Some(issuer) = ctx.oauth_issuer_url() {
@@ -1172,6 +1446,11 @@ fn create_notification_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn S
 #[service_factory("metrics", schema = "../../../hyprstream-rpc-std/schema/metrics.capnp", metadata = crate::services::generated::metrics_client::schema_metadata, depends_on = ["policy", "discovery"])]
 fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating MetricsService");
+
+    // MetricsService publishes query-result streams via StreamChannel::run_stream
+    // (fails loudly without a moq origin). Initialize this process's local moq
+    // plane. Idempotent.
+    init_local_moq_stream_plane("metrics");
 
     use crate::services::MetricsService;
     use hyprstream_metrics::query::QueryOrchestrator;
@@ -1211,11 +1490,10 @@ fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("metrics"));
+    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("metrics"))?;
 
     let mut metrics_service = MetricsService::new(
         orchestrator,
-        global_context(),
         ctx.transport("metrics", SocketKind::Rep),
         sk,
         policy_client,
@@ -1291,7 +1569,7 @@ fn compute_tls_endorsement(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -1309,6 +1587,46 @@ mod tests {
         msg.extend_from_slice(ed25519_pubkey);
         msg.extend_from_slice(domain.as_bytes());
         msg
+    }
+
+    /// #441 fail-closed: with no JWT in the trust store and none on disk,
+    /// registration MUST error (naming the real cause) rather than silently
+    /// skip — a service that can't register its key must not serve signed
+    /// responses.
+    #[test]
+    fn resolve_registration_jwt_fails_closed_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = resolve_registration_jwt("model", dir.path(), None)
+            .expect_err("missing JWT must fail closed, not skip");
+        let msg = err.to_string();
+        assert!(msg.contains("model"), "error names the service: {msg}");
+        assert!(
+            msg.contains("cannot register its signing key"),
+            "error names the real cause: {msg}",
+        );
+    }
+
+    /// A JWT already present in the trust store is used directly (no disk read).
+    #[test]
+    fn resolve_registration_jwt_prefers_trust_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let jwt = resolve_registration_jwt(
+            "model",
+            dir.path(),
+            Some("trust.jwt.token".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(jwt, "trust.jwt.token");
+    }
+
+    /// When not in the trust store, the authoritative on-disk JWT is loaded.
+    #[test]
+    fn resolve_registration_jwt_falls_back_to_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::auth::identity_store::write_service_jwt(dir.path(), "model", "disk.jwt.token")
+            .unwrap();
+        let jwt = resolve_registration_jwt("model", dir.path(), None).unwrap();
+        assert_eq!(jwt, "disk.jwt.token");
     }
 
     #[test]
@@ -1358,5 +1676,41 @@ mod tests {
         let ed25519_pubkey = [0xAB_u8; 32];
         let result = compute_tls_endorsement(&[0xFF; 32], &ed25519_pubkey, "example.com");
         assert!(result.is_err());
+    }
+
+    /// `init_local_moq_stream_plane` sets both process-global moq state
+    /// (`global_moq_origin` + `global_moq_uds_path`) and is idempotent: a second
+    /// call is a no-op and must not panic (composes with the streams factory and
+    /// multiple co-located publisher factories).
+    ///
+    /// Uses process-global `OnceLock`s, so it runs in a dedicated single-test
+    /// binary (`#[cfg(test)]` integration is impractical for OnceLock); the
+    /// assertions tolerate a plane already initialized by an earlier test in the
+    /// same process — the contract under test is "set after call" + "idempotent".
+    #[tokio::test]
+    async fn init_local_moq_stream_plane_sets_globals_and_is_idempotent() {
+        use hyprstream_rpc::moq_stream::{global_moq_origin, global_moq_uds_path};
+
+        // First call (or pre-set by another test) → plane is initialized.
+        init_local_moq_stream_plane("test");
+        assert!(
+            global_moq_origin().is_some(),
+            "origin must be set after init_local_moq_stream_plane",
+        );
+        let uds = global_moq_uds_path();
+        assert!(
+            uds.is_some(),
+            "uds path must be set after init_local_moq_stream_plane",
+        );
+        let path_after_first = uds.map(std::path::Path::to_path_buf);
+
+        // Second call must be a no-op (idempotent) — no panic, no change.
+        init_local_moq_stream_plane("test");
+        assert!(global_moq_origin().is_some());
+        assert_eq!(
+            global_moq_uds_path().map(std::path::Path::to_path_buf),
+            path_after_first,
+            "second call must not change the served UDS path",
+        );
     }
 }

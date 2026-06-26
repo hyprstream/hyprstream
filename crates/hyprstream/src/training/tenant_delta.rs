@@ -114,12 +114,38 @@ impl TenantDeltaConfig {
         base: &TenantDeltaConfig,
         profile: &crate::runtime::ttn_profile::LayerProfile,
     ) -> Self {
+        Self::from_profile_with_quant_caps(base, profile, None)
+    }
+
+    /// Like [`from_profile`](Self::from_profile) but applies the **static
+    /// rank↔quant coupling cap** (#326): the oracle's recommended per-layer rank
+    /// is clamped by the layer's stored dtype so a coarse-quant layer (e.g.
+    /// block-wise FP8) is not assigned a rank it cannot usefully express.
+    ///
+    /// `layer_dtype_bytes` maps `layer_idx -> stored-weight element size in
+    /// bytes` (1 = FP8/int8, 2 = FP16/BF16, 4 = FP32). Layers absent from the
+    /// map (or `None` for the whole map) are left uncapped — identical to
+    /// `from_profile`.
+    ///
+    /// This is **static** (applied once, here, when the config is built). It is
+    /// deliberately NOT wired into the live `auto_adapt` rank-oracle path, which
+    /// must stay free to adapt rank at runtime without re-deriving quant caps.
+    pub fn from_profile_with_quant_caps(
+        base: &TenantDeltaConfig,
+        profile: &crate::runtime::ttn_profile::LayerProfile,
+        layer_dtype_bytes: Option<&HashMap<usize, usize>>,
+    ) -> Self {
         let mut overrides = HashMap::new();
         for la in &profile.layers {
+            let cap = layer_dtype_bytes
+                .and_then(|m| m.get(&la.layer_idx))
+                .map(|&bytes| crate::training::delta_reducer::rank_cap_for_dtype_bytes(bytes))
+                .unwrap_or(usize::MAX);
+            let capped_rank = la.recommended_rank.min(cap).max(1);
             overrides.insert(
                 la.layer_idx,
                 LayerDeltaConfig {
-                    rank: la.recommended_rank,
+                    rank: capped_rank,
                     target_modules: la.target_modules.clone(),
                 },
             );
@@ -416,13 +442,19 @@ impl TenantDelta {
         let a_eff = a.narrow(0, 0, eff_rank); // [eff_rank, in_features]
         let b_eff = b.narrow(1, 0, eff_rank); // [out_features, eff_rank]
 
+        // Compute the LoRA correction in A/B's dtype (fp32, see forward_2d docs), then
+        // cast the result back to the input activation's dtype so callers can add it to
+        // base-dtype tensors. Without this, a BF16 base activation + an fp32 correction
+        // panics on CPU (addmm requires matching operand dtypes). Casting back is a
+        // device-agnostic no-op when x already matches a.kind().
+        let input_kind = x.kind();
         let x = x.to_kind(a.kind());
         let intermediate = x.f_matmul(&a_eff.tr())
             .map_err(|e| anyhow!("Delta forward matmul A failed for '{}': {}", key, e))?;
         let output = intermediate.f_matmul(&b_eff.tr())
             .map_err(|e| anyhow!("Delta forward matmul B failed for '{}': {}", key, e))?;
 
-        Ok(output * scaling)
+        Ok((output * scaling).to_kind(input_kind))
     }
 
     /// Compute LoRA correction for 2D tensors at a specific layer: output += scaling * (x @ A^T) @ B^T
@@ -457,13 +489,29 @@ impl TenantDelta {
         let a_eff = a.narrow(0, 0, eff_rank); // [eff_rank, in_features]
         let b_eff = b.narrow(1, 0, eff_rank); // [out_features, eff_rank]
 
+        // Compute in A/B's dtype (fp32 — see doc above for the Muon/NS rationale), then
+        // cast the correction back to the input activation's dtype. The base model is
+        // often BF16; the caller adds this correction to a BF16 tensor, and on CPU a
+        // BF16 + fp32 add panics (addmm requires matching dtypes). The cast back is a
+        // device-agnostic no-op when input_kind already equals a.kind().
+        let input_kind = x.kind();
+        let input_device = x.device();
         let x = x.to_kind(a.kind());
+        // Pipeline-split (#316) cross-device autograd: the delta's VarStore lives on
+        // a single `self.device`, but under a layer-split TTT the activation `x` may
+        // be on a different device than this layer's delta params. Move A/B onto the
+        // activation's device so the matmuls are device-consistent; `to_device` is
+        // autograd-transparent, so gradients flow back to the params on `self.device`.
+        // On the single-device path both moves are no-op views (source == dest),
+        // keeping the existing TTT behavior byte-identical.
+        let a_eff = a_eff.to_device(input_device);
+        let b_eff = b_eff.to_device(input_device);
         let intermediate = x.f_matmul(&a_eff.tr())
             .map_err(|e| anyhow!("Delta forward_2d matmul A failed for '{}': {}", key, e))?;
         let output = intermediate.f_matmul(&b_eff.tr())
             .map_err(|e| anyhow!("Delta forward_2d matmul B failed for '{}': {}", key, e))?;
 
-        Ok(output * scaling)
+        Ok((output * scaling).to_kind(input_kind))
     }
 
     /// Compute the ratio of delta norm to a reference norm for drift monitoring
@@ -1220,6 +1268,52 @@ mod tests {
         let x = Tensor::randn([10, 512], (Kind::Float, Device::Cpu));
         let output = delta.forward_2d(&x, "q_proj", 0).unwrap();
         assert_eq!(output.size(), vec![10, 512]);
+    }
+
+    /// Regression test for the CPU dtype-mismatch panic: a BFloat16 base model uses
+    /// fp32-stored LoRA deltas. The delta-application matmul must run without panicking
+    /// and the correction must come back in the base (BF16) dtype so the call site can
+    /// add it to a BF16 activation (CPU `addmm` rejects mixed float dtypes).
+    #[test]
+    fn test_forward_bf16_input_fp32_delta_no_panic() {
+        let config = TenantDeltaConfig {
+            rank: 16,
+            alpha: 32.0,
+            target_modules: vec!["q_proj".to_owned(), "v_proj".to_owned()],
+            ..Default::default()
+        };
+        let dims = test_module_dims();
+        let delta = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
+
+        // Sanity: stored A/B are fp32 (kaiming/zeros default kind).
+        assert_eq!(delta.lora_a["0.q_proj"].kind(), Kind::Float);
+        assert_eq!(delta.lora_b["0.q_proj"].kind(), Kind::Float);
+
+        // BF16 base activation, mirroring a BF16 model on CPU.
+        let x_2d = Tensor::randn([10, 512], (Kind::Float, Device::Cpu)).to_kind(Kind::BFloat16);
+
+        // forward_2d must not panic and must return a BF16 correction.
+        let corr_2d = delta.forward_2d(&x_2d, "q_proj", 0).unwrap();
+        assert_eq!(corr_2d.kind(), Kind::BFloat16);
+        assert_eq!(corr_2d.size(), vec![10, 512]);
+
+        // The exact operation that panicked at the qwen3_5 call site: base + correction,
+        // both BF16. Forcing evaluation (sum) ensures the add actually executes.
+        let base_2d = Tensor::randn([10, 512], (Kind::Float, Device::Cpu)).to_kind(Kind::BFloat16);
+        let combined = &base_2d + &corr_2d;
+        assert_eq!(combined.kind(), Kind::BFloat16);
+        let _ = combined.sum(Kind::Float).double_value(&[]);
+
+        // The 3D `forward` path must behave identically.
+        let x_3d = Tensor::randn([1, 10, 512], (Kind::Float, Device::Cpu)).to_kind(Kind::BFloat16);
+        let corr_3d = delta.forward(&x_3d, "v_proj", 0).unwrap();
+        assert_eq!(corr_3d.kind(), Kind::BFloat16);
+        assert_eq!(corr_3d.size(), vec![1, 10, 512]);
+
+        // fp32 input still yields fp32 output (cast-back is a no-op when dtypes match).
+        let x_f32 = Tensor::randn([10, 512], (Kind::Float, Device::Cpu));
+        let corr_f32 = delta.forward_2d(&x_f32, "q_proj", 0).unwrap();
+        assert_eq!(corr_f32.kind(), Kind::Float);
     }
 
     #[test]

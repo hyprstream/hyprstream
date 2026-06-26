@@ -63,6 +63,16 @@ struct DiscoveryRequest {
 
     # List all known issuer URLs whose entity statements are cached (authenticated)
     listKnownIssuers @14 :Void $mcpScope(query) $mcpDescription("List issuers with cached entity statements");
+
+    # #431 — federated record lookup. Fetch an atproto record (ai.hyprstream.model)
+    # as a verifiable CARv1 proof so the caller can validate it offline. The
+    # auto-generated discovery:query gate runs first; the handler additionally
+    # access-control-checks the *target* DID/collection (an at:// CID is public/
+    # predictable, so a valid address alone must NOT grant a read).
+    getRecord @15 :GetRecordRequest $mcpScope(query) $mcpDescription("Fetch an atproto record (ai.hyprstream.model) as a verifiable CAR proof");
+
+    # #431 — fetch a full atproto repo CAR by DID (commit + MST + all records).
+    getRepo @16 :Text $mcpScope(query) $mcpDescription("Fetch a full atproto repo CAR by DID");
   }
 }
 
@@ -110,6 +120,10 @@ struct DiscoveryResponse {
     registerEnvelopeKeysetResult @13 :Void;
     getEnvelopeKeysetResult @14 :EnvelopeKeyset;
     listKnownIssuersResult @15 :IssuerList;
+
+    # #431 — record/repo lookup results (paired with the requests above).
+    getRecordResult @16 :RecordCar;
+    getRepoResult @17 :RecordCar;
   }
 }
 
@@ -230,4 +244,23 @@ struct ServiceAnnouncement {
   endpoint @2 :Text;
   # Service JWT attesting to the service's pubkey and identity
   serviceJwt @3 :Text $optional;
+}
+
+# #431 — federated record lookup as a verifiable CAR proof.
+
+# A record returned as a CARv1 proof: signed commit + MST path + record block.
+# The caller validates it offline via hyprstream-pds verify_record_proof. The
+# DiscoveryService is treated as an untrusted relay — integrity comes from the
+# signed proof, not from trusting the responder.
+struct RecordCar {
+  uri @0 :Text;   # at:// URI this CAR answers (caller binds the proof to its request)
+  car @1 :Data;   # CARv1 bytes: roots=[commit CID]; blocks = commit + MST path + record
+}
+
+# Resolve a single record by at:// or by (did, collection, rkey).
+struct GetRecordRequest {
+  uri @0 :Text;          # full at://<did>/<collection>/<rkey>; if set, fields below ignored
+  did @1 :Text;
+  collection @2 :Text;   # e.g. "ai.hyprstream.model"
+  rkey @3 :Text;         # the TID record key
 }

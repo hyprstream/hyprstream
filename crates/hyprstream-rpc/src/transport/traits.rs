@@ -75,8 +75,7 @@ pub trait Transport: Send + Sync {
 
 /// Trait for sending frames on a publish/control channel.
 ///
-/// Abstracted because native uses sync `zmq::Socket::send` with `DONTWAIT`,
-/// while WASM uses async WebTransport writes.
+/// Abstracted because native and WASM use different async send primitives.
 #[allow(dead_code)]
 #[async_trait]
 pub trait PublishSink: Send {

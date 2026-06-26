@@ -111,6 +111,18 @@ fn validate_policy_component(component: &str, name: &str) -> Result<(), PolicyEr
         )));
     }
 
+    // NOTE: wildcards ('*') are intentionally NOT rejected here. The Casbin model
+    // (DEFAULT_MODEL_CONF) is wildcard-based: every rule carries domain="*", and
+    // legitimate features rely on wildcard subjects/resources/actions — public
+    // models ("*" subject, see PolicyService::handle_set_branch_visibility),
+    // role-scoped resource grants ("model:*"), action namespaces ("ttt.*"), and
+    // the OIDC self-ownership grant. A blanket '*' ban here broke all of those
+    // (and made add_policy() — which injects domain="*" — always fail) while
+    // adding no real protection: who may mutate policy is enforced at the
+    // PolicyService RPC authz layer (the correct place for anti-escalation), not
+    // by banning '*' in policy *content*. The null/newline/comma/length checks
+    // above remain — those are genuine CSV-injection / DoS guards.
+
     Ok(())
 }
 
@@ -1022,5 +1034,274 @@ mod tests {
         }
 
         assert!(allowed, "service:oauth should be able to query policy:ResolveServiceKey");
+    }
+
+    // ========================================================================
+    // atproto-scoped authorization invariants
+    //
+    // These assert *behavioral* contracts that any authorization model must
+    // hold (deny-by-default, per-identity isolation, public/private visibility,
+    // stream isolation) — NOT the current Casbin mechanism/vocabulary. They are
+    // written to survive the future tiles.run / atproto authz alignment: the
+    // new model has to satisfy the same invariants, so these double as a
+    // conformance harness. Resource identifiers go through the helpers below so
+    // that when model resources move toward AT-URI form the naming changes
+    // in one place, not every assertion. (OAuth scope-vocabulary tests are
+    // intentionally deferred — hyprstream's `action:service:*` scopes are not
+    // the access gate and will be replaced by atproto scopes.)
+    // ========================================================================
+
+    /// Resource string for a model branch. Centralized for atproto forward-compat.
+    fn model_resource(name: &str, branch: &str) -> String {
+        format!("model:{name}:{branch}")
+    }
+    /// Resource pattern for an identity's own namespace (self-ownership).
+    fn user_ns(subject: &str) -> String {
+        format!("user:{subject}:*")
+    }
+    /// Resource string for a moq event-prefix subscribe scope.
+    fn subscribe_scope(prefix: &str) -> String {
+        format!("subscribe:events:{prefix}.*")
+    }
+    /// Resource string for an inference-mesh job (#319). The tenant is the first
+    /// path segment so the caveat survives translation to a UCAN delegation.
+    fn mesh_job(tenant: &str, job: &str) -> String {
+        format!("mesh://{tenant}/job/{job}")
+    }
+    /// Per-host mesh authorization subject (#328).
+    fn mesh_host(id: &str) -> String {
+        format!("service:inference:host-{id}")
+    }
+
+    /// Regression guard for the wildcard-validation bug: `add_policy` injects
+    /// domain="*", so a blanket '*' ban made it always fail (even on
+    /// wildcard-free input). It must succeed and take effect.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    async fn test_add_policy_succeeds_with_default_domain() {
+        let pm = PolicyManager::new_in_memory().await.unwrap();
+        // Wildcard-free 3-arg add_policy (internally domain="*") must succeed.
+        pm.add_policy("alice", &model_resource("qwen3", "main"), "infer.generate")
+            .await
+            .expect("add_policy must succeed (domain=* is the legitimate global domain)");
+        assert!(
+            pm.check("alice", &model_resource("qwen3", "main"), Operation::Infer).await,
+            "the rule add_policy created must take effect"
+        );
+    }
+
+    /// P0a — self-namespace isolation: an identity may reach its own namespace,
+    /// and MUST NOT reach another identity's namespace (cross-identity denial).
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn test_self_namespace_isolation() {
+        let pm = PolicyManager::new_in_memory().await.unwrap();
+        // The self-ownership grant the OIDC callback issues on first login.
+        pm.add_policy_with_domain("alice", "*", &user_ns("alice"), "*", "allow")
+            .await
+            .unwrap();
+        pm.add_policy_with_domain("bob", "*", &user_ns("bob"), "*", "allow")
+            .await
+            .unwrap();
+
+        // Each identity reaches its own namespace.
+        assert!(pm.check_with_domain("alice", "*", "user:alice:model1", "ttt.writeback").await);
+        assert!(pm.check_with_domain("bob", "*", "user:bob:model1", "ttt.writeback").await);
+
+        // Neither identity may reach the other's namespace.
+        assert!(!pm.check_with_domain("alice", "*", "user:bob:model1", "infer.generate").await,
+            "alice must not access bob's namespace");
+        assert!(!pm.check_with_domain("bob", "*", "user:alice:model1", "ttt.writeback").await,
+            "bob must not access alice's namespace");
+    }
+
+    /// P1a — deny-by-default and least-privilege: an unknown subject is denied,
+    /// a scoped grant authorizes only that exact (resource, action) pair, and
+    /// does not leak to other resources or actions.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn test_deny_by_default_and_least_privilege() {
+        let pm = PolicyManager::new_in_memory().await.unwrap();
+        let resource = model_resource("qwen3", "main");
+
+        // Deny-by-default: nobody is authorized until granted.
+        assert!(!pm.check_with_domain("mallory", "*", &resource, "infer.generate").await);
+
+        // Grant alice exactly infer on this model.
+        pm.add_policy_with_domain("alice", "*", &resource, "infer.generate", "allow")
+            .await
+            .unwrap();
+
+        assert!(pm.check_with_domain("alice", "*", &resource, "infer.generate").await);
+        // Grant does not leak to other actions...
+        assert!(!pm.check_with_domain("alice", "*", &resource, "ttt.writeback").await,
+            "infer grant must not confer manage");
+        // ...nor to other resources...
+        assert!(!pm.check_with_domain("alice", "*", &model_resource("llama", "main"), "infer.generate").await,
+            "grant on one model must not confer another");
+        // ...nor to other subjects.
+        assert!(!pm.check_with_domain("mallory", "*", &resource, "infer.generate").await);
+    }
+
+    /// P2a — moq subscribe-prefix isolation: a subscribe grant on one event
+    /// prefix MUST NOT authorize a sibling/private prefix (no cross-tenant leak
+    /// via prefix matching).
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn test_subscribe_prefix_isolation() {
+        let pm = PolicyManager::new_in_memory().await.unwrap();
+        // alice may subscribe under the "public" prefix only.
+        pm.add_policy_with_domain("alice", "*", &subscribe_scope("public"), "subscribe", "allow")
+            .await
+            .unwrap();
+
+        assert!(pm.check_with_domain("alice", "*", "subscribe:events:public.metrics", "subscribe").await,
+            "alice may subscribe within her granted prefix");
+        // A private prefix is NOT covered by the public-prefix grant.
+        assert!(!pm.check_with_domain("alice", "*", "subscribe:events:private.secrets", "subscribe").await,
+            "public-prefix grant must not leak to a private prefix");
+        // An ungranted subject is denied entirely.
+        assert!(!pm.check_with_domain("bob", "*", "subscribe:events:public.metrics", "subscribe").await);
+    }
+
+    // ========================================================================
+    // Inference-mesh authorization invariants (#319)
+    //
+    // The mesh authority actions (`infer.stage`, `delta.submit`, `mesh.rpc`)
+    // must be deny-by-default, granted ONLY to non-wildcard
+    // `service:inference:host-<id>` subjects, scoped to a single tenant. The
+    // read ability (`query.status`) may be granted to a host group. These
+    // mirror the atproto-scoped invariant style above and double as the #319
+    // security harness.
+    // ========================================================================
+
+    /// Apply the worked-example `mesh-host` template rules to an enforcer.
+    /// Mirrors what `policy apply-template mesh-host` does at runtime.
+    #[allow(clippy::unwrap_used)]
+    async fn apply_template(pm: &PolicyManager, name: &str) {
+        let tmpl = crate::auth::policy_templates::get_template(name)
+            .unwrap_or_else(|| panic!("template {name} must exist"));
+        for r in tmpl.expanded_policies() {
+            pm.add_policy_with_domain(r.subject, r.domain, r.resource, r.action, r.effect)
+                .await
+                .unwrap();
+        }
+        if let Some(groupings) = tmpl.groupings {
+            for g in groupings {
+                pm.add_role_for_user(g.user, g.role).await.unwrap();
+            }
+        }
+    }
+
+    /// #319 invariant — the mesh authority actions are NEVER reachable by a
+    /// wildcard (`*`) or `anonymous` subject, even when a `federation-open`-style
+    /// wildcard rule AND the public-inference template are both loaded. Only a
+    /// specific enrolled host subject may stage/submit.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn test_mesh_authority_never_matches_wildcard_or_anonymous() {
+        let pm = PolicyManager::new_in_memory().await.unwrap();
+        // Load a broad wildcard rule (federation-open) and the public-inference
+        // template — neither must leak into mesh authority.
+        apply_template(&pm, "federation-open").await;
+        apply_template(&pm, "public-inference").await;
+        // And the real per-host mesh grants for tenant acme.
+        apply_template(&pm, "mesh-host").await;
+
+        let job = mesh_job("acme", "j7");
+        for action in ["infer.stage", "delta.submit", "mesh.rpc"] {
+            assert!(
+                !pm.check_with_domain("*", "acme", &job, action).await,
+                "wildcard subject must NEVER match mesh authority action {action}"
+            );
+            assert!(
+                !pm.check_with_domain("anonymous", "acme", &job, action).await,
+                "anonymous must NEVER match mesh authority action {action}"
+            );
+            // A non-enrolled host subject is likewise denied.
+            assert!(
+                !pm.check_with_domain(&mesh_host("99"), "acme", &job, action).await,
+                "un-enrolled host must be denied mesh authority action {action}"
+            );
+        }
+        // Positive control: an enrolled host CAN stage within its tenant.
+        assert!(
+            pm.check_with_domain(&mesh_host("1"), "acme", &job, "infer.stage").await,
+            "enrolled host-1 must be able to infer.stage in its tenant"
+        );
+    }
+
+    /// #319 invariant — tenant isolation: a host enrolled for tenant `acme`
+    /// cannot exercise ANY mesh action against tenant `beta`'s resources, even
+    /// for the same job name. The Casbin domain exact-match is the gate.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn test_mesh_tenant_isolation() {
+        let pm = PolicyManager::new_in_memory().await.unwrap();
+        // host-1 is granted on tenant acme via the worked-example template.
+        apply_template(&pm, "mesh-host").await;
+
+        // In its own tenant: allowed.
+        assert!(
+            pm.check_with_domain(&mesh_host("1"), "acme", &mesh_job("acme", "j7"), "infer.stage").await
+        );
+        // Cross-tenant (domain beta): denied for every action, even though the
+        // host holds the same grant in acme.
+        for action in ["infer.stage", "delta.submit", "mesh.rpc", "query.status"] {
+            assert!(
+                !pm.check_with_domain(&mesh_host("1"), "beta", &mesh_job("beta", "j7"), action).await,
+                "acme-scoped host-1 must NOT reach tenant beta for {action}"
+            );
+        }
+        // Even pointing the resource path at beta while claiming the acme domain
+        // must not match the acme rule (resource prefix differs).
+        assert!(
+            !pm.check_with_domain(&mesh_host("1"), "acme", &mesh_job("beta", "j7"), "infer.stage").await,
+            "acme-domain rule must not match a beta resource path"
+        );
+    }
+
+    /// #319 invariant — group read, per-host authority: a host group may be
+    /// granted the read ability (`query.status`) via Casbin grouping, but the
+    /// group MUST NOT confer any authority action.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn test_mesh_group_read_not_authority() {
+        let pm = PolicyManager::new_in_memory().await.unwrap();
+        apply_template(&pm, "mesh-host-group").await;
+
+        let job = mesh_job("acme", "j7");
+        // host-1 inherits the group read grant.
+        assert!(
+            pm.check_with_domain(&mesh_host("1"), "acme", &job, "query.status").await,
+            "grouped host must inherit the read ability"
+        );
+        // But the group does NOT confer authority.
+        for action in ["infer.stage", "delta.submit", "mesh.rpc"] {
+            assert!(
+                !pm.check_with_domain(&mesh_host("1"), "acme", &job, action).await,
+                "read group must NOT confer authority action {action}"
+            );
+        }
+        // A host NOT in the group gets nothing.
+        assert!(
+            !pm.check_with_domain(&mesh_host("3"), "acme", &job, "query.status").await,
+            "un-grouped host must not inherit the read ability"
+        );
+    }
+
+    /// #319 invariant — deny-by-default: with no mesh template applied, an
+    /// enrolled-looking host subject is denied every mesh action.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn test_mesh_deny_by_default() {
+        let pm = PolicyManager::new_in_memory().await.unwrap();
+        let job = mesh_job("acme", "j7");
+        for action in ["infer.stage", "delta.submit", "mesh.rpc", "query.status"] {
+            assert!(
+                !pm.check_with_domain(&mesh_host("1"), "acme", &job, action).await,
+                "un-granted host must be denied {action} (deny-by-default)"
+            );
+        }
     }
 }

@@ -31,7 +31,16 @@ pub fn runtime_dir() -> PathBuf {
     } else if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
         PathBuf::from(xdg).join("hyprstream")
     } else {
-        PathBuf::from(format!("/tmp/hyprstream-{}", nix::unistd::getuid()))
+        // XDG_RUNTIME_DIR not set (e.g. headless SSH before pam_systemd runs).
+        // Prefer /run/user/$UID (set up by PAM on login) over /tmp to avoid
+        // stale sockets surviving reboots.
+        let uid = nix::unistd::getuid().as_raw();
+        let run_user = PathBuf::from(format!("/run/user/{uid}"));
+        if run_user.exists() {
+            run_user.join("hyprstream")
+        } else {
+            PathBuf::from(format!("/tmp/hyprstream-{uid}"))
+        }
     };
     apply_instance_namespace(base)
 }

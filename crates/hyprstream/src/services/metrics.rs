@@ -21,7 +21,7 @@ use hyprstream_rpc::streaming::StreamChannel;
 use hyprstream_rpc::transport::TransportConfig;
 use tracing::{error, trace};
 
-use crate::services::{Continuation, EnvelopeContext, PolicyClient, ZmqService};
+use crate::services::{Continuation, EnvelopeContext, PolicyClient, RequestService};
 use crate::services::generated::policy_client::PolicyCheck;
 use crate::services::generated::metrics_client::{
     MetricsHandler, MetricsResponseVariant,
@@ -55,7 +55,6 @@ struct MetricsInner {
 pub struct MetricsService {
     inner: Arc<MetricsInner>,
     policy_client: PolicyClient,
-    context: Arc<zmq::Context>,
     transport: TransportConfig,
     signing_key: SigningKey,
     expected_audience: Option<String>,
@@ -65,20 +64,17 @@ pub struct MetricsService {
 impl MetricsService {
     pub fn new(
         orchestrator: Arc<QueryOrchestrator>,
-        context: Arc<zmq::Context>,
         transport: TransportConfig,
         signing_key: SigningKey,
         policy_client: PolicyClient,
     ) -> Self {
-        let stream_channel = StreamChannel::new(Arc::clone(&context), signing_key.clone());
-
+        let stream_channel = StreamChannel::new(signing_key.clone());
         Self {
             inner: Arc::new(MetricsInner {
                 orchestrator,
                 stream_channel,
             }),
             policy_client,
-            context,
             transport,
             signing_key,
             expected_audience: None,
@@ -322,10 +318,15 @@ impl MetricsHandler for MetricsService {
             .prepare_stream(&q.ephemeral_pubkey, 600)
             .await?;
 
+        let broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()
+            .map(|o| o.broadcast_path(stream_ctx.topic()))
+            .unwrap_or_default();
         let stream_info = StreamInfo {
             stream_id: stream_ctx.stream_id().to_owned(),
-            endpoint: self.inner.stream_channel.stream_endpoint(),
-            server_pubkey: *stream_ctx.server_pubkey(),
+            dh_public: *stream_ctx.server_pubkey(),
+            broadcast_path,
+            announced_at: stream_ctx.reach(), // #384: per-stream reach via ctx
+            ..Default::default()
         };
         let inner = Arc::clone(&self.inner);
 
@@ -585,11 +586,11 @@ impl MetricsHandler for MetricsService {
 }
 
 // ============================================================================
-// ZmqService
+// RequestService
 // ============================================================================
 
 #[async_trait(?Send)]
-impl ZmqService for MetricsService {
+impl RequestService for MetricsService {
     async fn handle_request(
         &self,
         ctx: &EnvelopeContext,
@@ -601,10 +602,6 @@ impl ZmqService for MetricsService {
 
     fn name(&self) -> &str {
         "metrics"
-    }
-
-    fn context(&self) -> &Arc<zmq::Context> {
-        &self.context
     }
 
     fn transport(&self) -> &TransportConfig {
@@ -655,14 +652,19 @@ mod tests {
         MetricsClient, ViewSpec,
     };
     use crate::services::{PolicyClient, PolicyService};
-    use crate::zmq::global_context;
-
     /// Spin up an in-memory MetricsService and return a typed client + InprocManager handle.
     async fn start_metrics_service(
         tag: &str,
     ) -> (MetricsClient, InprocManager) {
+        // Tests use Classical (EdDSA-only) keys — install Classical verify
+        // policy so the global fail-closed Hybrid default doesn't reject them.
+        let _ = hyprstream_rpc::envelope::install_verify_config(
+            hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+                policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
+                pq_store: None,
+            },
+        );
         let (signing_key, _vk) = generate_signing_keypair();
-        let context = global_context();
 
         // Permissive policy service so authorize() always passes.
         let policy_tag = format!("test-policy-{tag}");
@@ -681,7 +683,6 @@ mod tests {
             Arc::new(signing_key.clone()),
             crate::config::TokenConfig::default(),
             git2db,
-            context.clone(),
             TransportConfig::inproc(&policy_tag),
         );
         let manager = InprocManager::new();
@@ -695,7 +696,7 @@ mod tests {
             signing_key.clone(),
             signing_key.verifying_key(),
             None,
-        );
+        ).expect("create policy client");
 
         // In-memory DuckDB backend + metrics table creation.
         let backend = Arc::new(
@@ -720,7 +721,6 @@ mod tests {
         let svc_tag = format!("test-metrics-{tag}");
         let service = MetricsService::new(
             orchestrator,
-            context.clone(),
             TransportConfig::inproc(&svc_tag),
             signing_key.clone(),
             policy_client,
@@ -735,7 +735,7 @@ mod tests {
             signing_key.clone(),
             signing_key.verifying_key(),
             None,
-        );
+        ).expect("create metrics client");
 
         (client, manager)
     }

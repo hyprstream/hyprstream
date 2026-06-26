@@ -1,11 +1,11 @@
 [package]
 name = "hyprstream"
-version = "0.4.0"
+version = "0.5.0"
 edition.workspace = true
 description = "Agentic Infrastructure"
 documentation = "https://docs.rs/hyprstream"
 readme = "README.md"
-license = "MIT OR AGPL-3.0"
+license = "MIT OR AGPL-3.0-only"
 exclude = [
     "**/*.pyc",
     "**/__pycache__/",
@@ -47,16 +47,20 @@ toml.workspace = true
 serde_yaml.workspace = true
 git2.workspace = true  # Still needed by git2db internally
 git2db = { path = "../git2db", features = ["overlayfs"] }  # High-level git library with overlayfs
+cas-serve = { path = "../cas-serve" }  # Content-addressed store reconstruction (getBlob #432)
 hyprstream-rpc = { path = "../hyprstream-rpc" }  # RPC infrastructure (Cap'n Proto + ZMQ)
-ml-dsa = { workspace = true, optional = true }  # ML-DSA-65 (pq-hybrid JWT signing)
+moq-net.workspace = true  # moq-lite streaming for cross-process subscriber (M2b)
+ml-dsa = { workspace = true }  # ML-DSA-65 — always compiled (runtime CryptoPolicy selects PQ). See M3 #152.
 hyprstream-rpc-std = { path = "../hyprstream-rpc-std" }  # Standard service schemas + clients
 hyprstream-discovery = { path = "../hyprstream-discovery" }  # Service discovery
+hyprstream-pds = { path = "../hyprstream-pds" }  # atproto PDS record store: DAG-CBOR + MST + signed commit + CAR proof (#392/#431)
 hyprstream-service = { path = "../hyprstream-service" }  # Service orchestration
 hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }  # RPC code generation proc macros
 hyprstream-flight = { path = "../hyprstream-flight" }  # Flight SQL server and client
 hyprstream-metrics = { path = "../hyprstream-metrics" }  # Metrics storage (for RegistryClient trait)
 hyprstream-workers = { path = "../hyprstream-workers" }  # Worker runtime (Kata containers)
 hyprstream-vfs = { path = "../hyprstream-vfs" }  # VFS namespace (Mount trait)
+hyprstream-9p = { path = "../hyprstream-9p" }  # 9P codec + Kata translator (Backend, Translator)
 hyprstream-tcl = { path = "../hyprstream-tcl" }  # Tcl shell (TclMount, TclCommand)
 inventory.workspace = true  # Service factory registration
 gittorrent = { workspace = true, optional = true }  # P2P transport
@@ -129,8 +133,6 @@ minijinja.workspace = true
 
 uuid.workspace = true
 automerge = "0.5"  # CRDT collaborative editing
-tmq.workspace = true  # Tokio ZeroMQ bindings for event bus
-zmq.workspace = true  # Underlying libzmq bindings
 capnp.workspace = true  # Cap'n Proto runtime
 capnp-futures.workspace = true  # Cap'n Proto async support
 glob.workspace = true
@@ -202,7 +204,7 @@ download-libtorch = ["tch/download-libtorch"]
 overlayfs = ["git2db/overlayfs"]  # Enable overlayfs-backed worktrees (delegated to git2db)
 systemd = ["hyprstream-rpc/systemd", "hyprstream-service/systemd", "hyprstream-workers/systemd", "dep:listenfd"]  # Systemd integration (socket activation, service units)
 experimental = ["hyprstream-compositor/experimental"]  # EXPERIMENTAL: Enable service/worker panels, git write operations
-pq-hybrid = ["hyprstream-rpc/pq-hybrid", "hyprstream-service/pq-hybrid", "dep:ml-dsa"]  # Post-quantum hybrid: ML-DSA-65 + ML-KEM-768
+pq-hybrid = []  # NO-OP alias: PQ primitives always compiled; Classical/Hybrid selected at runtime. See M3 #152.
 
 [build-dependencies]
 capnpc.workspace = true  # Cap'n Proto schema compiler
@@ -214,6 +216,9 @@ hyprstream-rpc-build.workspace = true  # Shared annotation extraction
 criterion.workspace = true
 tempfile.workspace = true
 tokio-stream.workspace = true
+# Test-only: iroh substrate types used by `tests/policy_over_iroh.rs`.
+iroh.workspace = true
+rand.workspace = true
 
 [lints]
 workspace = true

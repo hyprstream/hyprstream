@@ -270,3 +270,107 @@ WantedBy=default.target
         hardening = hardening,
     ))
 }
+
+/// Generate a systemd socket unit for system-wide (root) installation.
+///
+/// Socket listens on `/run/hyprstream/{service}.sock` and activates the
+/// corresponding service unit on connection.
+pub fn system_socket_unit(service: &str) -> String {
+    format!(
+        r#"[Unit]
+Description=Hyprstream {service} Socket (system)
+
+[Socket]
+ListenStream=/run/hyprstream/{service}.sock
+SocketMode=0660
+SocketGroup=hyprstream
+
+[Install]
+WantedBy=sockets.target
+"#
+    )
+}
+
+/// Generate a systemd service unit for system-wide (root) installation.
+///
+/// The unit runs as the `hyprstream` system user and uses
+/// `RuntimeDirectory=hyprstream` (→ `/run/hyprstream/`) for sockets.
+/// Boots automatically via `WantedBy=multi-user.target`.
+pub fn system_service_unit(service: &str, depends_on: &[&str]) -> Result<String> {
+    let exec = paths::installed_executable_path()
+        .map(Ok)
+        .unwrap_or_else(paths::executable_path)
+        .context("Failed to get executable path")?;
+
+    let is_appimage = std::env::var("APPIMAGE").is_ok()
+        || exec
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("appimage"))
+            .unwrap_or(false)
+        || exec
+            .read_link()
+            .ok()
+            .and_then(|t| t.extension().map(|e| e.eq_ignore_ascii_case("appimage")))
+            .unwrap_or(false);
+
+    let hyprstream_instance = std::env::var("HYPRSTREAM_INSTANCE").ok();
+
+    let env_directives = if is_appimage {
+        vec![hyprstream_instance.map(|v| format!("Environment=HYPRSTREAM_INSTANCE={v}"))]
+    } else {
+        vec![
+            std::env::var("LD_LIBRARY_PATH")
+                .ok()
+                .map(|v| format!("Environment=LD_LIBRARY_PATH={v}")),
+            std::env::var("LIBTORCH")
+                .ok()
+                .map(|v| format!("Environment=LIBTORCH={v}")),
+            hyprstream_instance.map(|v| format!("Environment=HYPRSTREAM_INSTANCE={v}")),
+        ]
+    }
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n");
+
+    let env_section = if env_directives.is_empty() {
+        String::new()
+    } else {
+        format!("\n{env_directives}")
+    };
+
+    let dep_section = if depends_on.is_empty() {
+        String::new()
+    } else {
+        let units: Vec<String> = depends_on
+            .iter()
+            .map(|dep| format!("hyprstream-{dep}.service"))
+            .collect();
+        let unit_list = units.join(" ");
+        format!("\nAfter={unit_list}\nRequires={unit_list}")
+    };
+
+    let hardening = format!(
+        "\nLimitCORE=0\nProtectProc=invisible\nProcSubset=pid{}",
+        if is_appimage { "" } else { "\nPrivateTmp=yes" }
+    );
+
+    Ok(format!(
+        r#"[Unit]
+Description=Hyprstream {service} Service (system){dep_section}
+
+[Service]
+Type=notify
+User=hyprstream
+RuntimeDirectory=hyprstream
+RuntimeDirectoryMode=0750
+ExecStart={exec} service start {service} --foreground{env_section}{hardening}
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target
+"#,
+        exec = exec.display(),
+    ))
+}

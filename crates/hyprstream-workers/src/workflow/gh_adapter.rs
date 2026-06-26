@@ -30,7 +30,7 @@ use super::WorkflowId;
 /// events are received.
 pub struct GitHubActionsAdapter {
     /// Event subscriber for receiving events.
-    /// Wrapped in Mutex because tmq::Subscribe is !Sync.
+    /// Wrapped in Mutex because EventSubscriber is !Sync.
     subscriber: tokio::sync::Mutex<EventSubscriber>,
     /// Event handlers built from workflow triggers.
     handlers: Vec<Box<dyn EventHandler>>,

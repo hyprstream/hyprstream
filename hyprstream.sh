@@ -26,12 +26,17 @@ else
   BITSANDBYTES_LIB_DIR=${BITSANDBYTES_LIB_PATH:-$DEPS_DIR/bitsandbytes/bitsandbytes}
 fi
 
-# GPU architecture — auto-detect from rocminfo if not already set in the environment.
-# PYTORCH_ROCM_ARCH is used by bitsandbytes-sys at build time; at runtime ROCm selects
-# the correct ISA kernels automatically. Hardcoding gfx90a (MI210) breaks other hardware.
-if [ -z "$PYTORCH_ROCM_ARCH" ]; then
-  DETECTED_ARCH=$(rocminfo 2>/dev/null | awk '/^\s+Name:.*gfx/{print $NF; exit}')
-  export PYTORCH_ROCM_ARCH=${DETECTED_ARCH:-gfx90a}
+# GPU architecture: auto-detect via rocminfo rather than hardcoding gfx90a (#228).
+# rocminfo lists "Name: gfxXXXX" for each GPU agent; we take the first match.
+# Falls back to gfx90a (MI210) only when PYTORCH_ROCM_ARCH is already set by the user
+# OR when rocminfo is unavailable (e.g. no ROCm install).
+if [ -z "${PYTORCH_ROCM_ARCH:-}" ]; then
+    _detected_arch=$(rocminfo 2>/dev/null | grep -m1 -oP 'Name:\s+\Kgfx\S+' || true)
+    if [ -n "$_detected_arch" ]; then
+        export PYTORCH_ROCM_ARCH="$_detected_arch"
+    else
+        export PYTORCH_ROCM_ARCH=gfx90a
+    fi
 fi
 
 # Libtorch build settings

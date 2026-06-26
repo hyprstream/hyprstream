@@ -38,6 +38,12 @@ thread_local! {
     static STREAM_HMAC_TABLE: std::cell::RefCell<std::collections::HashMap<u32, crate::crypto::StreamHmacState>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
     static NEXT_HMAC_HANDLE: std::cell::Cell<u32> = std::cell::Cell::new(1);
+
+    // WASM-side PQ trust store: maps Ed25519 pubkey (32 bytes) → ML-DSA-65 vk
+    // bytes. Populated by register_pq_trust(). When a signer is present here,
+    // verify_signed_envelope enforces Hybrid (outer SNS layer required). (#158)
+    static WASM_PQ_BINDINGS: std::cell::RefCell<std::collections::HashMap<[u8; 32], Vec<u8>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 // ============================================================================
@@ -243,7 +249,71 @@ pub fn ecdh_ristretto(
 // Envelope verification
 // ============================================================================
 
+/// Register a peer's ML-DSA-65 verifying key bound to their Ed25519 identity.
+///
+/// Once registered, `verify_signed_envelope` enforces Hybrid policy for
+/// envelopes from this signer — the outer ML-DSA-65 layer is required and
+/// stripping it causes verification to fail (closes #158).
+///
+/// Call this with both keys from the peer's hybrid key bundle (fetched from
+/// JWKS or the key registry at startup). Replaces any prior binding for the
+/// same Ed25519 pubkey.
+///
+/// # Arguments
+///
+/// * `ed25519_pubkey` - 32-byte Ed25519 verifying key
+/// * `ml_dsa_vk` - ML-DSA-65 verifying key bytes (~1952 bytes)
+#[wasm_bindgen]
+pub fn register_pq_trust(ed25519_pubkey: &[u8], ml_dsa_vk: &[u8]) -> Result<(), JsError> {
+    if ed25519_pubkey.len() != 32 {
+        return Err(JsError::new("ed25519_pubkey must be 32 bytes"));
+    }
+    // Validate ML-DSA key before storing (fails fast on malformed input).
+    crate::crypto::pq::ml_dsa_vk_from_bytes(ml_dsa_vk)
+        .map_err(|e| JsError::new(&format!("invalid ML-DSA verifying key: {e}")))?;
+
+    let mut ed = [0u8; 32];
+    ed.copy_from_slice(ed25519_pubkey);
+    WASM_PQ_BINDINGS.with(|bindings| {
+        bindings.borrow_mut().insert(ed, ml_dsa_vk.to_vec());
+    });
+    Ok(())
+}
+
+/// Remove a peer's ML-DSA-65 binding. After this call, envelopes from that
+/// signer are accepted under Classical (EdDSA-only) policy.
+///
+/// # Arguments
+///
+/// * `ed25519_pubkey` - 32-byte Ed25519 verifying key to unregister
+#[wasm_bindgen]
+pub fn unregister_pq_trust(ed25519_pubkey: &[u8]) -> Result<(), JsError> {
+    if ed25519_pubkey.len() != 32 {
+        return Err(JsError::new("ed25519_pubkey must be 32 bytes"));
+    }
+    let mut ed = [0u8; 32];
+    ed.copy_from_slice(ed25519_pubkey);
+    WASM_PQ_BINDINGS.with(|bindings| {
+        bindings.borrow_mut().remove(&ed);
+    });
+    Ok(())
+}
+
+/// Clear all registered PQ trust bindings.
+///
+/// After this call, all signers fall back to Classical (EdDSA-only) policy.
+#[wasm_bindgen]
+pub fn clear_pq_trust() {
+    WASM_PQ_BINDINGS.with(|bindings| bindings.borrow_mut().clear());
+}
+
 /// Verify a signed envelope (for browser-side services receiving requests from server).
+///
+/// When the signer's ML-DSA-65 key has been registered via `register_pq_trust`,
+/// Hybrid policy is enforced: the outer ML-DSA-65 layer is required and an
+/// envelope that omits it is rejected. For signers without a registered ML-DSA
+/// key, Classical (EdDSA-only) policy applies — documented WNS until the
+/// browser trust store is provisioned with the peer's PQ key bundle.
 ///
 /// # Arguments
 ///
@@ -259,19 +329,47 @@ pub fn verify_signed_envelope(
     expected_signer_pubkey: &[u8],
 ) -> Result<Vec<u8>, JsError> {
     use crate::crypto::signing::verifying_key_from_bytes;
-    use crate::envelope::{unwrap_and_verify, UnwrapOptions};
+    use crate::envelope::{unwrap_and_verify, KeyedPqTrustStore, UnwrapOptions};
 
     if expected_signer_pubkey.len() != 32 {
         return Err(JsError::new("expected_signer_pubkey must be 32 bytes"));
     }
 
-    let mut pubkey = [0u8; 32];
-    pubkey.copy_from_slice(expected_signer_pubkey);
-    let verifying_key = verifying_key_from_bytes(&pubkey)
+    let mut pubkey_bytes = [0u8; 32];
+    pubkey_bytes.copy_from_slice(expected_signer_pubkey);
+    let verifying_key = verifying_key_from_bytes(&pubkey_bytes)
         .map_err(|e| JsError::new(&format!("invalid verifying key: {}", e)))?;
 
     let nonce_cache = WASM_NONCE_CACHE.with(|c| c.clone());
+
+    // Build a local PqTrustStore from WASM_PQ_BINDINGS. Track whether the
+    // specific signer has a registered ML-DSA binding; only in that case do we
+    // upgrade to Hybrid (enforcing the outer SNS layer). Signers without a
+    // registered key continue under Classical — documented WNS until their PQ
+    // key is provisioned in the browser trust store. (#158)
+    let mut pq_store = KeyedPqTrustStore::new();
+    let signer_has_pq = WASM_PQ_BINDINGS.with(|bindings| {
+        let b = bindings.borrow();
+        let mut found = false;
+        for (ed_key, ml_dsa_bytes) in b.iter() {
+            if let Ok(ml_dsa_vk) = crate::crypto::pq::ml_dsa_vk_from_bytes(ml_dsa_bytes) {
+                pq_store.bind(*ed_key, &ml_dsa_vk);
+                if ed_key == &pubkey_bytes {
+                    found = true;
+                }
+            }
+        }
+        found
+    });
+
     let opts = UnwrapOptions::fixed_signer(&verifying_key, &*nonce_cache);
+    let opts = if signer_has_pq {
+        // Hybrid: outer ML-DSA-65 required for this signer (policy default is already Hybrid).
+        opts.with_pq_store(&pq_store)
+    } else {
+        // No PQ binding: classical fallback (documented WNS for unprovisioned signers).
+        opts.classical()
+    };
 
     let (_signed, payload) = unwrap_and_verify(envelope_bytes, &opts)
         .map_err(|e| JsError::new(&format!("envelope verification failed: {}", e)))?;

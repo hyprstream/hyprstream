@@ -146,7 +146,13 @@ impl TokenizerConfig for QwenTokenizerConfig {
                 added, missing_count - 1
             );
 
-            // Verify they were actually added
+            // Verify they were actually added. A tokenizer/embedding vocab
+            // mismatch is the documented cause of CUDA index-out-of-bounds on
+            // the embedding lookup (#143): the model can sample or be fed a
+            // token id in [tokenizer_vocab, embedding_vocab), which the
+            // tokenizer cannot decode and which — if the embedding matrix was
+            // allocated to the smaller tokenizer size — faults the GPU. So a
+            // short-fall here is a hard error, not a warning.
             let new_size = tokenizer.get_vocab_size(true);
             if new_size == model_vocab_size {
                 tracing::info!("✅ Vocabulary successfully expanded from {} to {}", current_vocab_size, new_size);
@@ -155,10 +161,20 @@ impl TokenizerConfig for QwenTokenizerConfig {
                     "✅ Vocabulary expanded from {} to {} (added {} tokens)",
                     current_vocab_size, new_size, new_size - current_vocab_size
                 );
-            } else {
-                tracing::warn!(
-                    "⚠️ Failed to expand vocabulary: size remains at {} (expected {})",
-                    new_size, model_vocab_size
+            }
+            // new_size < current_vocab_size only happens if add_special_tokens
+            // no-ops entirely (e.g. all candidates already present) — still a
+            // mismatch when model_vocab_size > new_size.
+            if new_size != model_vocab_size {
+                anyhow::bail!(
+                    "Qwen tokenizer vocab ({}) could not be expanded to the model's \
+                     embedding size ({}): add_special_tokens reported {}, final size {}. \
+                     A tokenizer/embedding vocab mismatch causes a CUDA \
+                     index-out-of-bounds on the embedding lookup; refusing to load.",
+                    current_vocab_size,
+                    model_vocab_size,
+                    added,
+                    new_size
                 );
             }
         }

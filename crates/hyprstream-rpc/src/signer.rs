@@ -15,25 +15,43 @@ use crate::transport_traits::Signer;
 ///
 /// Signs synchronously — the async wrapper resolves immediately.
 /// Used for server-to-server RPC where the signing key is local.
+///
+/// `SigningKey` derives `ZeroizeOnDrop` from ed25519-dalek ≥ 2.0, so the
+/// Ed25519 key bytes are zeroed when the `LocalSigner` is dropped. The ML-DSA
+/// key is an opaque byte buffer (`ml_dsa` crate) without `ZeroizeOnDrop`; we
+/// zero it explicitly in our `Drop` impl.
 pub struct LocalSigner {
     signing_key: SigningKey,
-    #[cfg(feature = "pq-hybrid")]
     pq_signing_key: Option<crate::crypto::pq::MlDsaSigningKey>,
 }
 
+impl std::fmt::Debug for LocalSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalSigner")
+            .field("pubkey", &hex::encode(self.signing_key.verifying_key().to_bytes()))
+            .field("pq_pubkey", &self.pq_signing_key.as_ref().map(|_| "<ml-dsa-65>"))
+            .finish()
+    }
+}
+
 impl LocalSigner {
+    /// Create a native signer.
+    ///
+    /// The post-quantum half is the node's **persistent** mesh ML-DSA-65 key,
+    /// derived deterministically from `signing_key` via
+    /// [`crate::node_identity::derive_mesh_mldsa_key`] (#157). This replaces the
+    /// previous ephemeral keygen so the signer's ML-DSA public key is stable
+    /// across restarts and equals the `#mesh-pq` key peers anchor in their PQ
+    /// trust store. Use [`Self::with_pq_key`] only to override with an
+    /// externally supplied key (e.g. tests).
     pub fn new(signing_key: SigningKey) -> Self {
+        let pq_signing_key = Some(crate::node_identity::derive_mesh_mldsa_key(&signing_key));
         Self {
             signing_key,
-            #[cfg(feature = "pq-hybrid")]
-            pq_signing_key: {
-                let (sk, _) = crate::crypto::pq::ml_dsa_generate_keypair();
-                Some(sk)
-            },
+            pq_signing_key,
         }
     }
 
-    #[cfg(feature = "pq-hybrid")]
     pub fn with_pq_key(mut self, key: crate::crypto::pq::MlDsaSigningKey) -> Self {
         self.pq_signing_key = Some(key);
         self
@@ -57,29 +75,16 @@ impl Signer for LocalSigner {
     }
 
     fn pq_pubkey(&self) -> Option<Vec<u8>> {
-        #[cfg(feature = "pq-hybrid")]
-        {
-            self.pq_signing_key.as_ref().map(|sk| {
-                let vk = ml_dsa::Keypair::verifying_key(sk);
-                crate::crypto::pq::ml_dsa_vk_bytes(&vk)
-            })
-        }
-        #[cfg(not(feature = "pq-hybrid"))]
-        None
+        self.pq_signing_key.as_ref().map(|sk| {
+            let vk = ml_dsa::Keypair::verifying_key(sk);
+            crate::crypto::pq::ml_dsa_vk_bytes(&vk)
+        })
     }
 
     async fn pq_sign(&self, canonical_bytes: &[u8]) -> Result<Option<Vec<u8>>> {
-        #[cfg(feature = "pq-hybrid")]
-        {
-            return match &self.pq_signing_key {
-                Some(sk) => Ok(Some(crate::crypto::pq::ml_dsa_sign(sk, canonical_bytes))),
-                None => Ok(None),
-            };
-        }
-        #[cfg(not(feature = "pq-hybrid"))]
-        {
-            let _ = canonical_bytes;
-            Ok(None)
+        match &self.pq_signing_key {
+            Some(sk) => Ok(Some(crate::crypto::pq::ml_dsa_sign(sk, canonical_bytes))),
+            None => Ok(None),
         }
     }
 }

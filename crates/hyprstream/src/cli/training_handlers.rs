@@ -7,6 +7,10 @@
 //! - `training checkpoint` - Commit dirty adapter changes
 // CLI handlers intentionally print to stdout/stderr for user interaction
 #![allow(clippy::print_stdout, clippy::print_stderr)]
+// TODO(#395): migrate `model_ref.model` reads to `model_ref.name()` as part of the
+// name-layer retirement. Suppressed here so this prep PR stays focused on the CID
+// encoder + grammar; the deprecation is enforced at the ModelRef type definition.
+#![allow(deprecated)]
 
 use anyhow::{bail, Result};
 use tracing::{info, warn};
@@ -24,7 +28,6 @@ use crate::services::generated::registry_client::{
 use crate::services::{InferenceServiceConfig, RegistryClient, WorktreeClient, INFERENCE_ENDPOINT};
 use crate::services::generated::inference_client::InferenceClient;
 use crate::storage::ModelRef;
-use crate::zmq::global_context;
 use hyprstream_rpc::{SigningKey, VerifyingKey};
 use hyprstream_service::ServiceSpawner;
 use std::path::PathBuf;
@@ -385,7 +388,6 @@ pub async fn handle_training_infer(
         runtime_config,
         verifying_key,
         signing_key.clone(),
-        global_context(),
         transport,
         None, // CLI: no FsOps
     );
@@ -397,7 +399,7 @@ pub async fn handle_training_infer(
     let policy_vk = signing_key.verifying_key();
     let policy_client = crate::services::PolicyClient::for_service(
         signing_key.clone(), policy_vk, None,
-    );
+    )?;
     let key_resp = policy_client.resolve_service_key(
         &crate::services::generated::policy_client::ResolveServiceKey {
             service_name: "inference".to_owned(),
@@ -411,7 +413,7 @@ pub async fn handle_training_infer(
         signing_key.clone(),
         inference_vk,
         None,
-    );
+    )?;
 
     // Apply chat template
     let messages = vec![ChatMessage { role: "user".into(), content: prompt.into(), tool_calls: vec![], tool_call_id: String::new() }];
@@ -694,7 +696,6 @@ pub async fn handle_training_batch(
         runtime_config,
         verifying_key,
         signing_key.clone(),
-        global_context(),
         transport,
         None, // CLI: no FsOps
     );
@@ -706,7 +707,7 @@ pub async fn handle_training_batch(
     let policy_vk = signing_key.verifying_key();
     let policy_client = crate::services::PolicyClient::for_service(
         signing_key.clone(), policy_vk, None,
-    );
+    )?;
     let key_resp = policy_client.resolve_service_key(
         &crate::services::generated::policy_client::ResolveServiceKey {
             service_name: "inference".to_owned(),
@@ -720,7 +721,7 @@ pub async fn handle_training_batch(
         signing_key.clone(),
         inference_vk,
         None,
-    );
+    )?;
 
     // Get adapter info for checkpoint saves
     let adapter_manager = AdapterManager::new(&model_path);
