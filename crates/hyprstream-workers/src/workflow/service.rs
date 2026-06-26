@@ -617,19 +617,24 @@ impl WorkflowHandler for WorkflowService {
         repo_id: &str,
     ) -> AnyhowResult<WorkflowResponseVariant> {
         let workflows = self.scan_repo(repo_id).await?;
-        Ok(WorkflowResponseVariant::ScanRepoResult(
-            workflows.iter().map(|wf| {
-                let yaml = serde_yaml::to_string(&wf.workflow)
-                    .unwrap_or_default();
-                WorkflowDefWire {
+        let defs = workflows
+            .iter()
+            .map(|wf| {
+                // Propagate serialization failures instead of defaulting to an
+                // empty yaml string (which would register a broken stub).
+                let yaml = serde_yaml::to_string(&wf.workflow).map_err(|e| {
+                    anyhow::anyhow!("failed to serialize workflow '{}' to YAML: {e}", wf.path)
+                })?;
+                Ok::<_, anyhow::Error>(WorkflowDefWire {
                     path: wf.path.clone(),
                     repo_id: wf.repo_id.clone(),
                     name: wf.workflow.name.clone(),
                     triggers: Vec::new(),
                     yaml,
-                }
-            }).collect()
-        ))
+                })
+            })
+            .collect::<AnyhowResult<Vec<_>>>()?;
+        Ok(WorkflowResponseVariant::ScanRepoResult(defs))
     }
 
     async fn handle_register(
