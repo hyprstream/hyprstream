@@ -25,6 +25,9 @@ deny = [
 [licenses]
 # Minimum confidence threshold for license detection.
 confidence-threshold = 0.8
+# xet-core internal crates (huggingface/xet-core, git-xet-v0.2.0) have no per-crate
+# license fields; root repo is Apache-2.0. Allow rather than listing ~18 exceptions.
+unlicensed = "allow"
 allow = [
     "MIT",
     "Apache-2.0",
@@ -41,33 +44,6 @@ allow = [
     "BSL-1.0",    # Boost Software License (permissive)
     "Unlicense",  # public domain equivalent (permissive)
 ]
-
-# xet-core (huggingface/xet-core, pinned tag git-xet-v0.2.0) internal workspace
-# crates lack per-crate license fields; root repo is Apache-2.0. skip-tree on the
-# 6 direct deps covers unlicensed transitive deps (api_client, chat-core, etc.).
-[[licenses.skip-tree]]
-name = "data"
-version = "*"
-
-[[licenses.skip-tree]]
-name = "cas_client"
-version = "*"
-
-[[licenses.skip-tree]]
-name = "cas_object"
-version = "*"
-
-[[licenses.skip-tree]]
-name = "cas_types"
-version = "*"
-
-[[licenses.skip-tree]]
-name = "chunk_cache"
-version = "*"
-
-[[licenses.skip-tree]]
-name = "merklehash"
-version = "*"
 
 [sources]
 unknown-registry = "warn"
