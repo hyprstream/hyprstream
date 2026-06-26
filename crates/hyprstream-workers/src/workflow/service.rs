@@ -803,12 +803,20 @@ fn extract_triggers(workflow: &Workflow) -> Vec<EventTrigger> {
         WorkflowTrigger::Complex(map) => map.keys().cloned().collect(),
     };
 
-    event_names.iter().map(|event| match event.as_str() {
-        "push" => EventTrigger::RepositoryEvent { event_type: RepoEventType::Push, pattern: None },
-        "pull_request" => EventTrigger::RepositoryEvent { event_type: RepoEventType::PullRequest, pattern: None },
-        "create" | "tag" => EventTrigger::RepositoryEvent { event_type: RepoEventType::Tag, pattern: None },
-        "workflow_dispatch" => EventTrigger::WorkflowDispatch { inputs: std::collections::HashMap::new() },
-        "schedule" | "training" => EventTrigger::Custom { topic: format!("training.{event}"), pattern: String::new() },
-        _ => EventTrigger::Custom { topic: format!("repo.{event}"), pattern: String::new() },
+    event_names.iter().flat_map(|event| match event.as_str() {
+        "push" => vec![EventTrigger::RepositoryEvent { event_type: RepoEventType::Push, pattern: None }],
+        "pull_request" => vec![EventTrigger::RepositoryEvent { event_type: RepoEventType::PullRequest, pattern: None }],
+        // GitHub's `create` event fires for BOTH branch and tag creation. There
+        // is no dedicated branch-create variant in RepoEventType, so emit a Tag
+        // trigger plus a Push trigger (the closest branch-ref match) to avoid
+        // silently dropping branch-creation events.
+        "create" => vec![
+            EventTrigger::RepositoryEvent { event_type: RepoEventType::Tag, pattern: None },
+            EventTrigger::RepositoryEvent { event_type: RepoEventType::Push, pattern: None },
+        ],
+        "tag" => vec![EventTrigger::RepositoryEvent { event_type: RepoEventType::Tag, pattern: None }],
+        "workflow_dispatch" => vec![EventTrigger::WorkflowDispatch { inputs: std::collections::HashMap::new() }],
+        "schedule" | "training" => vec![EventTrigger::Custom { topic: format!("training.{event}"), pattern: String::new() }],
+        _ => vec![EventTrigger::Custom { topic: format!("repo.{event}"), pattern: String::new() }],
     }).collect()
 }
