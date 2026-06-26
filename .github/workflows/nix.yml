@@ -14,9 +14,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Create sccache directory
-        run: sudo mkdir -p /var/cache/sccache && sudo chmod 1777 /var/cache/sccache
-
       - name: Install Nix
         uses: cachix/install-nix-action@v27
         with:
@@ -24,6 +21,17 @@ jobs:
             max-jobs = auto
             cores = 0
             extra-sandbox-paths = /var/cache/sccache
+
+      - name: Create sccache directory
+        # NOT world-writable: only the runner user (cache restore) and the nixbld
+        # build-user group (sandboxed builds) may write, so arbitrary local
+        # processes cannot poison the cache exposed via extra-sandbox-paths.
+        # The setgid bit makes new entries inherit the nixbld group for sharing.
+        # Runs after Install Nix so the nixbld group exists.
+        run: |
+          sudo mkdir -p /var/cache/sccache
+          sudo chown "$(id -un):nixbld" /var/cache/sccache
+          sudo chmod 2775 /var/cache/sccache
 
       - name: Cache sccache artifacts
         uses: actions/cache@v4
