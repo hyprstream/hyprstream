@@ -9,6 +9,10 @@
 using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".mcpScope;
 using import "/annotations.capnp".mcpDescription;
+# #356: the canonical networked moq reach model. A cross-instance subscriber dials
+# the producer's wire-advertised reach rather than its own co-located UDS plane.
+# Shared 1:1 with the inference StreamInfo's `announcedAt` (streaming.capnp).
+using import "/streaming.capnp".Destination;
 
 struct NotificationRequest {
   id @0 :UInt64;
@@ -80,9 +84,15 @@ struct NotificationResponse {
 struct SubscribeResponse {
   subscriptionId @0 :Text;
   assignedTopic @1 :Text;      # moq broadcast track name for the assigned subscription
-  streamEndpoint @2 :Text;     # always empty (ZMQ StreamService removed in #131/#138)
-  moqUdsPath @3 :Text;         # Path to moq UDS socket
-  moqBroadcastPath @4 :Text;   # moq broadcast path for the assigned topic
+  # moq broadcast path for the assigned topic ("{prefix}/{topic}").
+  broadcastPath @2 :Text;
+  # #356: network-routable ways to reach the NotificationService's moq plane,
+  # mirroring the inference StreamInfo's `announcedAt`. A subscriber dials the
+  # first reach it supports (see `dial_stream`) and subscribes to `broadcastPath`,
+  # so cross-instance model-load notifications work (fixes #142). Co-located
+  # subscribers ignore this and use the same-host UDS fast path resolved from
+  # LOCAL config — the UDS path is NEVER advertised on the wire.
+  announcedAt @3 :List(Destination);
 }
 
 struct PublishIntentResponse {

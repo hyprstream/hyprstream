@@ -776,6 +776,19 @@ pub struct QuicLoopConfig {
     /// entry in the DID document only when iroh is actually bound.
     #[cfg(not(target_arch = "wasm32"))]
     pub on_iroh_bound: Option<Box<dyn FnOnce(String, [u8; 32]) + Send>>,
+    /// #358: the producer-chosen moq RELAY this node rendezvouses through, in
+    /// wire-reach form ([`crate::stream_info::TransportConfig`]). When set, the
+    /// spawner registers it via [`crate::moq_stream::init_global_relay_reach`] (so
+    /// `producer_reach()` advertises a `Role::Relay` reach) and links this node's
+    /// streaming origin UP to the relay
+    /// ([`crate::moq_stream::serve_origin_to_relay_background`]) — restoring the
+    /// rendezvous property: neither publisher nor subscriber need be directly
+    /// reachable by the other. Sourced from the resolved relay DID transport entry
+    /// (default: the PDS / federation anchor) decoded by the shared
+    /// [`crate::service_entry`] codec, so the stream relay and DID addresses never
+    /// drift. `None` = direct-only (the S1/S2 behaviour). Native-only.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub moq_relay: Option<crate::stream_info::TransportConfig>,
 }
 
 /// Handle for a running service
@@ -954,11 +967,15 @@ mod ipc_key_identity_tests {
     use crate::auth::key_subject_resolver::{set_global as set_key_resolver, KeySubjectResolver};
     use crate::transport::TransportConfig;
     use ed25519_dalek::SigningKey;
-    use parking_lot::Mutex;
     use std::collections::HashMap;
+    // Async-aware mutex: these tests hold the serialization guard across
+    // `verify_claims(..).await`, so a std/parking_lot guard would trip
+    // clippy's `await_holding_lock` (a real deadlock-risk lint). `tokio::sync::Mutex`
+    // is designed to be held across `.await`. (#468)
+    use tokio::sync::Mutex;
 
     /// Serializes tests that install the process-global key→subject resolver.
-    static RESOLVER_LOCK: Mutex<()> = Mutex::new(());
+    static RESOLVER_LOCK: Mutex<()> = Mutex::const_new(());
 
     /// Minimal service that uses the DEFAULT `resolve_key_subject` (the #446
     /// seam under test) — it does not override identity resolution.
@@ -1009,7 +1026,7 @@ mod ipc_key_identity_tests {
 
     #[tokio::test]
     async fn registered_service_key_resolves_as_service_subject() {
-        let _guard = RESOLVER_LOCK.lock();
+        let _guard = RESOLVER_LOCK.lock().await;
 
         let caller = SigningKey::from_bytes(&[11u8; 32]);
         let caller_pub = caller.verifying_key().to_bytes();
@@ -1035,7 +1052,7 @@ mod ipc_key_identity_tests {
 
     #[tokio::test]
     async fn unregistered_key_stays_anonymous() {
-        let _guard = RESOLVER_LOCK.lock();
+        let _guard = RESOLVER_LOCK.lock().await;
 
         // Resolver knows ONLY about some other (registered) key.
         let registered = SigningKey::from_bytes(&[33u8; 32]).verifying_key().to_bytes();
@@ -1105,7 +1122,10 @@ mod stripping_defense_tests {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod accounting_audit_tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    // parking_lot::Mutex — std::sync::Mutex is workspace-disallowed (clippy.toml).
+    // Held only synchronously here (no `.await` across the guard). (#468)
+    use parking_lot::Mutex;
+    use std::sync::Arc;
     use tracing::field::{Field, Visit};
     use tracing::subscriber::with_default;
     use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
@@ -1161,7 +1181,7 @@ mod accounting_audit_tests {
                 ..Default::default()
             };
             event.record(&mut FieldVisitor(&mut rec));
-            self.records.lock().unwrap().push(rec);
+            self.records.lock().push(rec);
         }
     }
 
@@ -1186,7 +1206,7 @@ mod accounting_audit_tests {
         let layer = CaptureLayer { records: records.clone() };
         let subscriber = Registry::default().with(layer);
         with_default(subscriber, f);
-        let out = records.lock().unwrap().clone();
+        let out = records.lock().clone();
         out
     }
 

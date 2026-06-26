@@ -175,9 +175,11 @@ struct TransportConfig {
   union {
     # Quic / WebTransport (web-transport-quinn). Dialed over `web_transport_quinn`.
     quic @0 :QuicReach;
-    # NAT-traversing iroh dial (#320, dial side wired by #282/S2). The `nodeId`
-    # IS the peer's Ed25519 identity, so this arm is identity-bound at the
-    # transport (RFC 7250), unlike QUIC's channel-only cert pin.
+    # NAT-traversing iroh dial (#320/#357, dial side wired by #282/S2). The
+    # `nodeId` IS the peer's Ed25519 identity, so this arm is identity-bound at
+    # the transport (RFC 7250), unlike QUIC's channel-only cert pin. A native
+    # peer dials by node_id over the iroh ALPN, resolving addresses via pkarr /
+    # n0 DNS discovery (the shared client endpoint's `presets::N0`).
     iroh @1 :IrohReach;
   }
 }
@@ -189,13 +191,18 @@ struct QuicReach {
   certHashes @2 :List(Data);  # Acceptable leaf-cert SHA-256 pins (self-signed mesh).
 }
 
-# Dial parameters for the iroh arm (#320). The single capnp encoding of an iroh
-# reach — `dial()`/`dial_stream` consume the decoded form
-# (`EndpointType::Iroh`); the DID-doc `IrohTransport` service-entry codec
+# Dial parameters for the iroh (NAT-traversing) arm (#320/#357). The single
+# capnp encoding of an iroh reach — `dial()`/`dial_stream` consume the decoded
+# form (`EndpointType::Iroh`); the DID-doc `IrohTransport` service-entry codec
 # (`service_entry.rs`) is the JSON projection of this same shape (one source of
-# truth: ed25519 nodeId + relay).
+# truth: ed25519 nodeId + alpn + relay).
+#
+# The `nodeId` is the producer's iroh `EndpointId` (its Ed25519 public key):
+# iroh binds the dialed connection to this identity, and pkarr / n0 DNS
+# discovery resolves the routable addresses on the shared client endpoint, so a
+# native peer can dial by node_id alone (relayUrl empty = direct/pkarr, #282).
 struct IrohReach {
-  nodeId   @0 :Data $fixedSize(32);  # ed25519 node_id — real identity binding.
+  nodeId   @0 :Data $fixedSize(32);  # iroh EndpointId (Ed25519 public key, 32 bytes) — real identity binding.
   alpn     @1 :Text;                  # e.g. "hyprstream-rpc/1" (RPC) or "moql" (stream).
   relayUrl @2 :Text;                  # optional iroh relay; empty = direct/pkarr (#282).
 }
@@ -338,20 +345,6 @@ struct StreamError {
   message @0 :Text;
   code @1 :Text;                  # "timeout", "cancelled", "internal", etc.
   details @2 :Text;               # Optional additional context
-}
-
-# =============================================================================
-# Reconnection / Resume
-# =============================================================================
-
-# Stream resume request - for retransmission after disconnect
-#
-# Client sends the last HMAC it successfully verified. StreamService finds
-# this HMAC in its buffer and resends all subsequent chunks. This provides
-# zero-knowledge of sequence numbers - the HMAC chain is the ordering proof.
-struct StreamResume {
-  topic @0 :Text;           # Topic to resume
-  resumeFromHmac @1 :Data;  # Last verified HMAC (server resends chunks after this)
 }
 
 # =============================================================================

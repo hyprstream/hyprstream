@@ -100,7 +100,7 @@ url = { workspace = true }
 reqwest = { workspace = true }
 
 # Async runtime
-tokio = { workspace = true, features = ["io-util", "net"] }
+tokio = { workspace = true, features = ["io-util", "net", "sync"] }
 tokio-util = { workspace = true }
 bytes = { workspace = true }
 

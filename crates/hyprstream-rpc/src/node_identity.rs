@@ -186,11 +186,17 @@ impl NodeIdentityProvider {
         let mut map = self.known_pubkeys.write();
         match map.entry(pubkey) {
             std::collections::hash_map::Entry::Occupied(existing) => {
+                // `tracing` is a native-only dependency for this crate (see Cargo.toml:
+                // it lives under `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]`),
+                // so the macro must be cfg-gated to keep the wasm32 build compiling (#468).
+                #[cfg(not(target_arch = "wasm32"))]
                 tracing::warn!(
                     existing = ?existing.get().name(),
                     rejected = ?subject.name(),
                     "node_identity: mesh peer key collides with an existing binding; keeping existing, rejecting peer enrollment"
                 );
+                #[cfg(target_arch = "wasm32")]
+                let _ = &existing; // silence unused warning on wasm where tracing is absent
             }
             std::collections::hash_map::Entry::Vacant(slot) => {
                 slot.insert(subject);
