@@ -28,8 +28,8 @@
 // `Role` / `TransportConfig` / `QuicReach` types — is also code-generated here
 // from `streaming.capnp` (native capnp, no JSON-in-Text on the wire).
 pub use crate::streaming_types::{
-    Completion, Delivery, Ordering, OverflowPolicy, QuicReach, Destination, Retention, Role,
-    StreamInfo, StreamOpt, TransportConfig,
+    Completion, Delivery, IrohReach, Ordering, OverflowPolicy, QuicReach, Destination, Retention,
+    Role, StreamInfo, StreamOpt, TransportConfig,
 };
 
 /// Marker trait for typed stream QoS presets.
@@ -47,7 +47,7 @@ pub trait StreamOptPreset: Clone + Send + Sync + 'static {
 /// last-acked Group, EndOfStream terminator, 256-Group relay retention,
 /// lossless backpressure. Use for InferenceService token streams and model
 /// lifecycle events (#169).
-#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Job;
 
 /// Log / notification streams.
@@ -55,7 +55,7 @@ pub struct Job;
 /// Ordered, at-least-once, no terminator sentinel, 300-second relay
 /// retention. Use for Metrics, Notification, and mobile clients with
 /// intermittent connectivity (#169).
-#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Log;
 
 /// Pipe / console streams.
@@ -63,7 +63,7 @@ pub struct Log;
 /// Ordered, at-least-once with 256-entry dedup, live retention, no
 /// terminator. Use for container I/O attach and the model↔worker callback
 /// DEALER replacement (#170).
-#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Pipe;
 
 impl StreamOptPreset for Job {

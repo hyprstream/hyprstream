@@ -287,6 +287,10 @@ pub fn generate_portable_dispatch(
                         _ => quote! {},
                     };
 
+                    // #468: scoped streaming result variant is `{name}(StreamInfo)`
+                    // (handler.rs:1793/2197) — extract the verified StreamInfo TYPED.
+                    let scoped_resp_variant_pascal = format_ident!("{}", to_pascal_case(&v.name));
+
                     quote! {
                         #full_name => {
                             #(#scope_field_extracts)*
@@ -299,12 +303,14 @@ pub fn generate_portable_dispatch(
                                 #inner_serialize
                             }).map_err(|e| format!("serialize: {e}"))?;
                             let response_bytes = send(payload).await?;
-                            // Parse the scoped streaming response to extract StreamInfo
+                            // #468: pull the verified StreamInfo out TYPED — no JSON round-trip.
+                            // Scoped result variant is `{name}(StreamInfo)`.
                             let variant = #scoped_response_type::parse_scoped_response(&response_bytes)
                                 .map_err(|e| format!("parse streaming response: {e}"))?;
-                            let json = serde_json::to_string(&variant)
-                                .map_err(|e| format!("serialize stream info: {e}"))?;
-                            Ok(DispatchResult::Stream(json))
+                            match variant {
+                                #scoped_response_type::#scoped_resp_variant_pascal(stream_info) => Ok(DispatchResult::Stream(stream_info)),
+                                _ => Err(format!("expected StreamInfo streaming response for method '{}'", #full_name)),
+                            }
                         }
                     }
                 })
@@ -339,10 +345,11 @@ pub fn generate_portable_dispatch(
         pub enum DispatchResult {
             /// Normal response — serialized JSON string.
             Response(String),
-            /// Streaming response — JSON string of the parsed StreamInfo.
-            /// The caller should parse this to get endpoint, dhPublic, streamId,
-            /// then set up the SUB subscription.
-            Stream(String),
+            /// Streaming response — the VERIFIED-capnp `StreamInfo` library type
+            /// (decoded + COSE-verified inside `send`/`call_streaming`), carried
+            /// typed (NOT a JSON string the caller re-parses). The caller reads
+            /// endpoint/dhPublic/streamId off it directly to set up the subscription. (#468)
+            Stream(hyprstream_rpc::stream_info::StreamInfo),
         }
 
         /// Transport-agnostic JSON dispatch for this service.
@@ -522,16 +529,21 @@ fn generate_streaming_dispatch_arm(
         }
     };
 
+    // #468: carry the verified StreamInfo TYPED out of the parsed response
+    // variant — no `serde_json::to_string` round-trip. The top-level result
+    // variant is `{name}Result(StreamInfo)` (mirrors handler.rs).
+    let resp_variant_pascal = format_ident!("{}", to_pascal_case(&format!("{}Result", v.name)));
     quote! {
         #method_name_str => {
             #serialize_body
             let response_bytes = send(payload).await?;
-            // Parse the response to extract StreamInfo variant
+            // Parse the (COSE-verified) response and pull the StreamInfo out typed.
             let variant = #response_type::parse_response(&response_bytes)
                 .map_err(|e| format!("parse streaming response: {e}"))?;
-            let json = serde_json::to_string(&variant)
-                .map_err(|e| format!("serialize stream info: {e}"))?;
-            Ok(DispatchResult::Stream(json))
+            match variant {
+                #response_type::#resp_variant_pascal(stream_info) => Ok(DispatchResult::Stream(stream_info)),
+                _ => Err(format!("expected StreamInfo streaming response for method '{}'", #method_name_str)),
+            }
         }
     }
 }

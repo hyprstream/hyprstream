@@ -175,20 +175,48 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                         addr: advertise_addr,
                         server_name: qc.server_name.clone(),
                         cert_hashes: vec![pin],
+                        // The iroh node_id is registered separately once the iroh
+                        // substrate binds (it is not known at the QUIC-bind point);
+                        // see init_global_iroh_node_id below (#357).
+                        iroh_node_id: None,
                     },
                 );
                 if let Some(cb) = qc.on_quic_bound.take() {
                     cb(service_name.clone(), advertise_addr, qc.server_name.clone());
                 }
 
-                // #282: bind an iroh substrate in PARALLEL to the quinn endpoint,
-                // serving BOTH ALPNs (`hyprstream-rpc/1` + `moql`) with the SAME
-                // request processor + moq origin. The iroh endpoint's node key is
-                // the service's Ed25519 signing key, so its `node_id` (==
-                // `signing_key.verifying_key()`) is already covered by the node's
-                // published DID verification methods — and the #137 gate, when
-                // installed, matches an inbound peer's `remote_id()` against its
-                // DID. Discovery is iroh's built-in pkarr publisher + n0 DNS
+                // #358: if a producer-chosen relay is configured, register it so
+                // `producer_reach()` advertises a `Role::Relay` reach, and link
+                // this node's streaming origin UP to the relay so subscribers can
+                // rendezvous through it without dialing the producer. Idempotent
+                // (first-wins) across services sharing the process-global origin.
+                if let Some(relay) = qc.moq_relay.take() {
+                    let registered =
+                        hyprstream_rpc::moq_stream::init_global_relay_reach(relay.clone());
+                    if registered {
+                        if let Some(origin) = hyprstream_rpc::moq_stream::global_moq_origin() {
+                            hyprstream_rpc::moq_stream::serve_origin_to_relay_background(
+                                origin.producer().clone(),
+                                relay,
+                            );
+                            tracing::info!(
+                                service = %service_name,
+                                "moq relay rendezvous enabled (announcing origin UP to relay; advertising Role::Relay reach)"
+                            );
+                        }
+                    }
+                }
+
+                // #410/#282: bind an iroh substrate as the PRIMARY production
+                // endpoint (on by default; `[quic] iroh = false` opts out), serving
+                // BOTH ALPNs (`hyprstream-rpc/1` + `moql`) with the SAME request
+                // processor + moq origin, in parallel to the quinn endpoint (kept
+                // for back-compat). The iroh endpoint's node key is the service's
+                // Ed25519 signing key, so its `node_id`
+                // (`== signing_key.verifying_key()`) is already covered by the
+                // node's published DID verification methods — and the #137 gate,
+                // when installed, matches an inbound peer's `remote_id()` against
+                // its DID. Discovery is iroh's built-in pkarr publisher + n0 DNS
                 // (`presets::N0`), so this node is dial-by-node_id-discoverable.
                 //
                 // Kept alive in this scope via `_iroh_substrate`; on shutdown the
@@ -235,6 +263,10 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                             let _ = hyprstream_rpc::transport::lazy_iroh::install_iroh_client_endpoint(
                                 substrate.endpoint().clone(),
                             );
+                            // #357: register our iroh node_id so producer_reach()
+                            // advertises an iroh-direct Destination for native
+                            // peers (dial-by-node_id via pkarr; NAT + cross-instance).
+                            let _ = hyprstream_rpc::moq_stream::init_global_iroh_node_id(node_id);
                             // Advertise the `#iroh` VM only now that iroh is bound.
                             if let Some(cb) = qc.on_iroh_bound.take() {
                                 cb(service_name.clone(), node_id);

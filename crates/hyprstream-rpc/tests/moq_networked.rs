@@ -63,6 +63,8 @@ async fn networked_moq_subscribe_receives_mac_verified_frames() -> Result<()> {
     let ctx = StreamContext::from_dh(&client_pub.to_bytes())?;
     let topic = ctx.topic().to_owned();
     let mac_key = *ctx.mac_key();
+    // #321: the DH path is AEAD-on; the consumer shares the same enc_key.
+    let enc_key = *ctx.enc_key().expect("DH StreamContext has an AEAD enc_key");
     let broadcast_path = origin.broadcast_path(&topic);
 
     // Stand up the daemon's RPC+moq endpoint: RPC core on default path, moq on
@@ -98,8 +100,10 @@ async fn networked_moq_subscribe_receives_mac_verified_frames() -> Result<()> {
 
     // Client: networked subscribe — dials `/moq` via dial_stream, subscribes,
     // verifies the chained HMAC, and yields decoded payloads.
-    let mut handle =
-        hyprstream_rpc::moq_stream::MoqStreamHandle::networked(reach, broadcast_path, mac_key, topic);
+    let qos = hyprstream_rpc::stream_info::StreamOpt::default();
+    let mut handle = hyprstream_rpc::moq_stream::MoqStreamHandle::networked(
+        reach, &qos, broadcast_path, mac_key, enc_key, topic,
+    );
 
     // Give the background task time to dial, handshake, and subscribe to the
     // track before the producer pushes group 0 — a late joiner that misses the

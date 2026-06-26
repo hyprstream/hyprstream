@@ -30,6 +30,10 @@ serde-wasm-bindgen = "0.6"
 js-sys = "0.3"
 console_error_panic_hook = "0.1"
 web-sys = { version = "0.3", features = ["console"] }
+# WanixMount 9P-over-DMA bridge (#409/#391). wasm32-only: the WanixMount and its
+# P9Client/DmaTransport are entirely `#[cfg(target_arch = "wasm32")]`, so this is
+# gated to the browser target to keep mount_wanix buildable in the wasm bundle.
+hyprstream-9p = { path = "../hyprstream-9p" }
 
 [build-dependencies]
 capnpc = { workspace = true }

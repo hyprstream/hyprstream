@@ -114,12 +114,38 @@ impl TenantDeltaConfig {
         base: &TenantDeltaConfig,
         profile: &crate::runtime::ttn_profile::LayerProfile,
     ) -> Self {
+        Self::from_profile_with_quant_caps(base, profile, None)
+    }
+
+    /// Like [`from_profile`](Self::from_profile) but applies the **static
+    /// rank↔quant coupling cap** (#326): the oracle's recommended per-layer rank
+    /// is clamped by the layer's stored dtype so a coarse-quant layer (e.g.
+    /// block-wise FP8) is not assigned a rank it cannot usefully express.
+    ///
+    /// `layer_dtype_bytes` maps `layer_idx -> stored-weight element size in
+    /// bytes` (1 = FP8/int8, 2 = FP16/BF16, 4 = FP32). Layers absent from the
+    /// map (or `None` for the whole map) are left uncapped — identical to
+    /// `from_profile`.
+    ///
+    /// This is **static** (applied once, here, when the config is built). It is
+    /// deliberately NOT wired into the live `auto_adapt` rank-oracle path, which
+    /// must stay free to adapt rank at runtime without re-deriving quant caps.
+    pub fn from_profile_with_quant_caps(
+        base: &TenantDeltaConfig,
+        profile: &crate::runtime::ttn_profile::LayerProfile,
+        layer_dtype_bytes: Option<&HashMap<usize, usize>>,
+    ) -> Self {
         let mut overrides = HashMap::new();
         for la in &profile.layers {
+            let cap = layer_dtype_bytes
+                .and_then(|m| m.get(&la.layer_idx))
+                .map(|&bytes| crate::training::delta_reducer::rank_cap_for_dtype_bytes(bytes))
+                .unwrap_or(usize::MAX);
+            let capped_rank = la.recommended_rank.min(cap).max(1);
             overrides.insert(
                 la.layer_idx,
                 LayerDeltaConfig {
-                    rank: la.recommended_rank,
+                    rank: capped_rank,
                     target_modules: la.target_modules.clone(),
                 },
             );
@@ -469,7 +495,17 @@ impl TenantDelta {
         // BF16 + fp32 add panics (addmm requires matching dtypes). The cast back is a
         // device-agnostic no-op when input_kind already equals a.kind().
         let input_kind = x.kind();
+        let input_device = x.device();
         let x = x.to_kind(a.kind());
+        // Pipeline-split (#316) cross-device autograd: the delta's VarStore lives on
+        // a single `self.device`, but under a layer-split TTT the activation `x` may
+        // be on a different device than this layer's delta params. Move A/B onto the
+        // activation's device so the matmuls are device-consistent; `to_device` is
+        // autograd-transparent, so gradients flow back to the params on `self.device`.
+        // On the single-device path both moves are no-op views (source == dest),
+        // keeping the existing TTT behavior byte-identical.
+        let a_eff = a_eff.to_device(input_device);
+        let b_eff = b_eff.to_device(input_device);
         let intermediate = x.f_matmul(&a_eff.tr())
             .map_err(|e| anyhow!("Delta forward_2d matmul A failed for '{}': {}", key, e))?;
         let output = intermediate.f_matmul(&b_eff.tr())

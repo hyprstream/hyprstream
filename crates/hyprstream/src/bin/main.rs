@@ -41,7 +41,7 @@ use hyprstream_core::cli::{
 use hyprstream_core::cli::commands::{PolicyCommand, RoleCommand, TokenCommand, UserCommand, UserKeysCommand};
 
 #[cfg(feature = "experimental")]
-use hyprstream_core::cli::{handle_commit, handle_merge, handle_push, MergeOptions};
+use hyprstream_core::cli::{handle_commit, handle_merge, handle_promote, handle_push, MergeOptions};
 use hyprstream_core::config::HyprConfig;
 use hyprstream_core::storage::{GitRef, ModelRef};
 
@@ -711,6 +711,29 @@ fn handle_quick_command(
         ),
 
         #[cfg(feature = "experimental")]
+        QuickCommand::Promote {
+            model,
+            branch,
+            author_name,
+            author_email,
+        } => with_runtime(
+            RuntimeConfig {
+                device: DeviceConfig::request_cpu(),
+                multi_threaded: true,
+            },
+            || async move {
+                handle_promote(
+                    ctx.registry(),
+                    &model,
+                    &branch,
+                    author_name,
+                    author_email,
+                )
+                .await
+            },
+        ),
+
+        #[cfg(feature = "experimental")]
         QuickCommand::Push {
             model,
             remote,
@@ -1285,6 +1308,42 @@ fn handle_quick_command(
 /// to verify responses from a target service.
 ///
 /// Returns `None` if bootstrap-pubkeys is not available (wizard not run).
+/// Resolve the configured `[quic] relay` URI into the wire-reach
+/// [`TransportConfig`] a producer advertises as its `Role::Relay` reach (#358).
+///
+/// Reuses the SAME [`hyprstream_rpc::service_entry`] codec the DID document uses
+/// (by constructing the equivalent `QuicTransport` service entry and decoding it),
+/// then projecting to wire-reach form via
+/// [`hyprstream_rpc::moq_stream::relay_reach_from_decoded`] — so the advertised
+/// stream relay and the DID transport address are produced by one codec and never
+/// drift. WebPKI (public PDS / federation anchor) is the default; a self-signed
+/// mesh relay carries its leaf-cert SHA-256 pins after `#` in the URI fragment.
+fn resolve_moq_relay_reach(
+    relay_uri: &str,
+) -> Result<hyprstream_rpc::stream_info::TransportConfig> {
+    use serde_json::json;
+    // Optional `#<multibase certHash>[,<multibase certHash>...]` fragment pins a
+    // self-signed mesh relay; absent ⇒ WebPKI (public CA-fronted relay).
+    let (uri, cert_hashes): (&str, Vec<String>) = match relay_uri.split_once('#') {
+        Some((u, frag)) => (u, frag.split(',').map(str::to_owned).collect()),
+        None => (relay_uri, Vec::new()),
+    };
+    let webpki = cert_hashes.is_empty();
+    let entry = json!({
+        "type": "QuicTransport",
+        "serviceEndpoint": {
+            "uri": uri,
+            "webpki": webpki,
+            "certHashes": cert_hashes,
+            "accept": ["moql"],
+        },
+    });
+    let decoded = hyprstream_rpc::service_entry::decode_service_entry(&entry)
+        .map_err(|e| anyhow::anyhow!("relay URI decode: {e}"))?;
+    hyprstream_rpc::moq_stream::relay_reach_from_decoded(&decoded.config)
+        .ok_or_else(|| anyhow::anyhow!("relay URI is not a network-routable transport"))
+}
+
 fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
     let trust = hyprstream_service::global_trust_store();
     // Fast path: already populated (service startup seeded it)
@@ -1349,6 +1408,34 @@ fn install_envelope_verify_config(oauth: Option<&hyprstream_core::config::OAuthC
         None => KeyedPqTrustStore::new(),
     };
     tracing::info!("mesh PQ trust store installed with {} peer binding(s)", keyed_store.len());
+
+    // Per-host mesh identity roster (#328): bind each enrolled peer's Ed25519
+    // signer key to its OWN per-host subject (`service:inference:host-<label>`)
+    // in the global trust store, so a verified mesh peer resolves to its
+    // granular principal — never the `"system"` god principal. Reuses the SAME
+    // `mesh_peers` enrollment record as the PQ store above (no new roster type).
+    // A networked peer whose key is NOT enrolled resolves to anonymous
+    // (deny-by-default, fail-closed).
+    if let Some(oauth) = oauth {
+        let roster = hyprstream_core::auth::mesh_trust::build_mesh_identity_roster(oauth);
+        let trust = hyprstream_service::global_trust_store();
+        for (ed_pubkey, subject) in &roster {
+            if let Ok(vk) = VerifyingKey::from_bytes(ed_pubkey) {
+                trust.insert(
+                    vk,
+                    hyprstream_service::Attestation {
+                        scopes: std::iter::once("inference".to_owned()).collect(),
+                        subject: subject.name().map(ToOwned::to_owned),
+                        jwt: None,
+                        // Admin-anchored, out-of-band enrollment: no expiry (0).
+                        expires_at: 0,
+                        attested_by: None,
+                    },
+                );
+            }
+        }
+        tracing::info!("mesh identity roster installed with {} per-host binding(s)", roster.len());
+    }
     // Shared Arc: the SAME admin-anchored store backs both the request-side and
     // response-side verify configs — built once, anchored once (#277 reuse of
     // #157). The server's `#mesh-pq` ML-DSA-65 key (keyed by its Ed25519 mesh
@@ -1969,6 +2056,25 @@ fn main() -> Result<()> {
                                         println!("QUIC/WebTransport cert hash: {}", hash);
                                     }
 
+                                    // #358: resolve the producer-chosen moq relay
+                                    // (if configured) into wire-reach form via the
+                                    // SAME service_entry codec the DID doc uses, so
+                                    // the stream relay address and DID address can't
+                                    // drift. Empty = direct-only.
+                                    let moq_relay = if qc.relay.trim().is_empty() {
+                                        None
+                                    } else {
+                                        match resolve_moq_relay_reach(&qc.relay) {
+                                            Ok(reach) => Some(reach),
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    relay = %qc.relay,
+                                                    "ignoring invalid [quic] relay; continuing direct-only: {e}"
+                                                );
+                                                None
+                                            }
+                                        }
+                                    };
                                     let shared = hyprstream_service::QuicSharedConfig {
                                         cert_chain,
                                         key_der,
@@ -1978,6 +2084,8 @@ fn main() -> Result<()> {
                                         jwt_verifying_key: Some(ctx.jwt_verifying_key()),
                                         // #282: bind iroh in parallel to quinn when opted in.
                                         iroh_enabled: qc.iroh,
+                                        // #358: producer-chosen relay rendezvous (None = direct-only).
+                                        moq_relay,
                                     };
                                     ctx = ctx.with_quic(shared);
                                 }

@@ -68,7 +68,7 @@ pub use image::RafsStore;
 pub use workflow::WorkflowService;
 pub use events::{
     // Publisher/Subscriber (moq-backed, no ZMQ context needed)
-    EventPublisher, EventSubscriber, endpoints,
+    EventPublisher, EventSubscriber,
     // Event types
     WorkerEvent, ReceivedEvent,
     SandboxStarted, SandboxStopped, ContainerStarted, ContainerStopped,

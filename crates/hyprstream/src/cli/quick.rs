@@ -270,6 +270,27 @@ pub enum QuickCommand {
         verbose: bool,
     },
 
+    /// Promote the node-local upper layer into a content-addressed registry
+    /// commit and advance the atproto pointer (#394).
+    ///
+    /// This is the writable-union promote primitive: it snapshots buffered
+    /// edits (stageAll + commit) into an immutable, deterministic git commit,
+    /// then updates the federated pointer record. See `git::promote` for the
+    /// eventual-consistency contract.
+    #[cfg(feature = "experimental")]
+    Promote {
+        /// Model reference (repo name).
+        model: String,
+        /// Worktree / branch to promote.
+        branch: String,
+        /// Override author name (defaults to the verified subject).
+        #[arg(long)]
+        author_name: Option<String>,
+        /// Override author email (defaults to the subject's account DID).
+        #[arg(long)]
+        author_email: Option<String>,
+    },
+
     /// Push changes to remote
     #[cfg(feature = "experimental")]
     Push {

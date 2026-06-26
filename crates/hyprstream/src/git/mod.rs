@@ -4,3 +4,4 @@
 //! Core git functionality is provided by git2db.
 
 pub mod ops;
+pub mod promote;

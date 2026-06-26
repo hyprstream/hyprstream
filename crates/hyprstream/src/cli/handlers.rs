@@ -302,7 +302,7 @@ pub async fn handle_write_checkpoint(
     // Resolve model path via registry
     let model_ref = crate::storage::ModelRef::parse(&model_id)?;
     let branch_override = model_ref.git_ref_str();
-    let tracked = registry.get_by_name(&model_ref.model).await?;
+    let tracked = registry.get_by_name(model_ref.name()).await?;
     let repo_client = registry.repo(&tracked.id);
     let branch_name = match branch_override.as_deref() {
         Some(b) => b.to_owned(),
@@ -310,11 +310,11 @@ pub async fn handle_write_checkpoint(
     };
     let worktrees = repo_client.list_worktrees().await?;
     if !worktrees.iter().any(|wt| wt.branch_name == branch_name) {
-        return Err(format!("worktree for {}:{} not found", model_ref.model, branch_name).into());
+        return Err(format!("worktree for {}:{} not found", model_ref.name(), branch_name).into());
     }
     // Derive worktree path locally
     let storage_paths = crate::storage::StoragePaths::new()?;
-    let model_path = storage_paths.worktree_path(&model_ref.model, &branch_name)?;
+    let model_path = storage_paths.worktree_path(model_ref.name(), &branch_name)?;
 
     // Create checkpoint manager
     let checkpoint_mgr = CheckpointManager::new(model_path.clone())?;

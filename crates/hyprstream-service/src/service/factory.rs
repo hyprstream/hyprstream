@@ -52,10 +52,19 @@ pub struct QuicSharedConfig {
     /// JWT verifying key (derived from root via HKDF "hyprstream-jwt-v1").
     /// Published as `x_root_pubkey` in RFC 9728 metadata for client-side trust pinning.
     pub jwt_verifying_key: Option<ed25519_dalek::VerifyingKey>,
-    /// #282: bind an iroh substrate (ALPNs `hyprstream-rpc/1` + `moql`) in
-    /// parallel to the quinn endpoint for every QUIC-enabled service. Off by
-    /// default; an operator opts in via `[quic] iroh = true`.
+    /// #410/#282: bind an iroh substrate (ALPNs `hyprstream-rpc/1` + `moql`)
+    /// as the PRIMARY production transport, in parallel to the quinn endpoint
+    /// (kept for back-compat), for every QUIC-enabled service. On by default;
+    /// an operator opts out via `[quic] iroh = false` to run quinn-only (legacy).
     pub iroh_enabled: bool,
+    /// #358: the producer-chosen moq RELAY every QUIC-enabled service on this node
+    /// rendezvouses through, in wire-reach form. `None` = direct-only. Sourced
+    /// from the relay DID transport entry (default: the PDS / federation anchor)
+    /// decoded by [`hyprstream_rpc::service_entry`]; see
+    /// [`hyprstream_rpc::moq_stream::relay_reach_from_decoded`]. Threaded into each
+    /// service's [`QuicLoopConfig`] so the spawner advertises a `Role::Relay` reach
+    /// and links the origin UP to the relay.
+    pub moq_relay: Option<hyprstream_rpc::stream_info::TransportConfig>,
 }
 
 impl QuicSharedConfig {
@@ -96,6 +105,9 @@ impl QuicSharedConfig {
             iroh_enabled: self.iroh_enabled,
             iroh_admission: None,
             on_iroh_bound: None,
+            // #358: thread the producer-chosen relay through so the spawner
+            // advertises a Role::Relay reach + links the origin up to the relay.
+            moq_relay: self.moq_relay.clone(),
         }
     }
 
@@ -569,6 +581,9 @@ impl ServiceContext {
                 fetcher.clone(),
             );
             let source = source.with_ml_dsa_verifying_keys(self.ml_dsa_verifying_keys.clone());
+            // Authoritative local CA key for offline service-JWT resolution
+            // (no dependency on the HTTP /oauth/jwks endpoint at startup).
+            let source = source.with_local_ca_key(self.jwt_verifying_key());
             std::sync::Arc::new(source)
         } else {
             let source = hyprstream_rpc::auth::ClusterKeySource::new(

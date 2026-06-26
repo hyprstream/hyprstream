@@ -6,8 +6,9 @@
 //!
 //! # Flow
 //!
-//! 1. Subscriber calls `subscribe(scope, ephemeral_pubkey)` → NS registers
-//!    topic with StreamService, returns topic + endpoint
+//! 1. Subscriber calls `subscribe(scope, ephemeral_pubkey)` → NS allocates a
+//!    DH-derived topic and returns topic + endpoint (the moq stream plane
+//!    publishes topics lazily, so no pre-registration is needed)
 //! 2. Publisher calls `publishIntent(scope, publisher_pubkey)` → NS returns
 //!    rerandomized (blinded) subscriber pubkeys
 //! 3. Publisher encrypts payload, wraps data_key per subscriber, calls `deliver`
@@ -293,7 +294,7 @@ pub struct NotificationService {
     subscribers: Arc<RwLock<SubscriberRegistry>>,
     pending_intents: Arc<RwLock<HashMap<String, PendingIntent>>>,
     delivery_counter: AtomicU64,
-    /// StreamChannel for topic registration and publishing to StreamService.
+    /// StreamChannel for publishing capsules to subscriber topics on the moq stream plane.
     stream_channel: StreamChannel,
     // Auth
     signing_key: Arc<SigningKey>,
@@ -426,17 +427,8 @@ impl NotificationHandler for NotificationService {
         let topic = self.generate_topic();
         let subject = ctx.subject().to_string();
 
-        // Pre-register topic with StreamService so messages are buffered
-        // even before the subscriber connects their SUB socket.
-        let expiry = chrono::Utc::now().timestamp() + ttl_secs as i64;
-        if let Err(e) = self.stream_channel.register_topic(&topic, expiry, None).await {
-            warn!("Failed to register topic {} with StreamService: {}", topic, e);
-            return Ok(NotificationResponseVariant::Error(ErrorInfo {
-                message: "Failed to register notification topic".to_owned(),
-                code: "STREAM_ERROR".to_owned(),
-                details: e.to_string(),
-            }));
-        }
+        // Topics need no pre-registration on the moq stream plane: the
+        // `MoqStreamPublisher` publishes them lazily on the first frame.
 
         let subscriber = Subscriber {
             id: sub_id,
@@ -463,23 +455,26 @@ impl NotificationHandler for NotificationService {
 
         debug!("Subscriber {} registered for topic {}", sub_id, topic);
 
-        let moq_uds_path = hyprstream_rpc::moq_stream::global_moq_uds_path()
-            .ok_or_else(|| anyhow::anyhow!("moq stream origin not initialized — server misconfiguration"))?
-            .to_string_lossy()
-            .into_owned();
-        let moq_broadcast_path = format!(
+        // The broadcast is served on this node's moq plane; require it to be live.
+        if hyprstream_rpc::moq_stream::global_moq_origin().is_none() {
+            anyhow::bail!("moq stream origin not initialized — server misconfiguration");
+        }
+        let broadcast_path = format!(
             "{}/{}",
             hyprstream_rpc::moq_stream::DEFAULT_PREFIX,
             topic
         );
-        let stream_endpoint = String::new();
+        // #356: advertise the node's network-routable moq reach so cross-instance
+        // subscribers dial the producer directly (fixes #142). Co-located
+        // subscribers fall back to the same-host UDS fast path (resolved from
+        // LOCAL config by `connect_moq_reach`) — never advertised on the wire.
+        let announced_at = hyprstream_rpc::moq_stream::producer_reach();
 
         Ok(NotificationResponseVariant::SubscribeResult(SubscribeResponse {
             subscription_id: sub_id.to_string(),
             assigned_topic: topic,
-            stream_endpoint,
-            moq_uds_path,
-            moq_broadcast_path,
+            broadcast_path,
+            announced_at,
         }))
     }
 
@@ -926,6 +921,7 @@ impl NotificationPublisher {
 // ============================================================================
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -1040,5 +1036,85 @@ mod tests {
         assert_eq!(reg.count(), 1);
         assert_eq!(reg.expire(now), 1);
         assert_eq!(reg.count(), 0);
+    }
+
+    /// #142 regression guard: a `SubscribeResponse` MUST carry the producer's
+    /// NETWORKED reach (`announcedAt`) so a model loaded on a DIFFERENT PDS
+    /// instance is reachable. Before #356 the response only carried a same-host
+    /// `moqUdsPath`, so cross-instance model-load notifications silently failed
+    /// (the subscriber connected to its own empty local moq plane and timed out).
+    ///
+    /// This builds the response the way `handle_subscribe` does (reach from the
+    /// single `producer_reach()` builder), round-trips it through the generated
+    /// capnp codec, and asserts the Quic dial parameters survive intact and that
+    /// no same-host UDS path is advertised on the wire.
+    #[test]
+    fn subscribe_response_carries_networked_reach() {
+        use crate::notification_capnp;
+        use crate::services::generated::notification_client::SubscribeResponse;
+        use capnp::message::Builder;
+        use hyprstream_rpc::capnp::FromCapnp;
+        use hyprstream_rpc::moq_stream::{
+            init_global_producer_reach, producer_reach, NodeStreamReach,
+        };
+
+        // Register a networked reach exactly as the QUIC bind does (idempotent —
+        // first wins; ignore the result so concurrent tests don't fail this one).
+        let addr: std::net::SocketAddr = "127.0.0.1:4433".parse().expect("addr");
+        let _ = init_global_producer_reach(NodeStreamReach {
+            addr,
+            server_name: "localhost".to_owned(),
+            cert_hashes: vec![[0x22u8; 32]],
+            iroh_node_id: None,
+        });
+        let reach = producer_reach();
+        assert!(
+            !reach.is_empty(),
+            "producer_reach() must be non-empty after registering a NodeStreamReach"
+        );
+
+        // Build a SubscribeResponse the same way handle_subscribe does.
+        let mut msg = Builder::new_default();
+        {
+            let mut sr = msg.init_root::<notification_capnp::subscribe_response::Builder<'_>>();
+            sr.set_subscription_id("sub-1");
+            sr.set_assigned_topic("notify/test");
+            sr.set_broadcast_path("local/streams/notify-test");
+            let mut reach_list = sr.reborrow().init_announced_at(reach.len() as u32);
+            for (j, dest) in reach.iter().enumerate() {
+                let mut db = reach_list.reborrow().get(j as u32);
+                hyprstream_rpc::capnp::ToCapnp::write_to(dest, &mut db);
+            }
+        }
+        let mut buf = Vec::new();
+        capnp::serialize::write_message(&mut buf, &msg).expect("serialize");
+
+        // Decode through the generated client type and assert the networked reach.
+        let reader =
+            capnp::serialize::read_message(&buf[..], capnp::message::ReaderOptions::new())
+                .expect("read");
+        let sr_reader = reader
+            .get_root::<notification_capnp::subscribe_response::Reader<'_>>()
+            .expect("root");
+        let decoded = SubscribeResponse::read_from(sr_reader).expect("decode");
+
+        assert!(
+            !decoded.broadcast_path.is_empty(),
+            "SubscribeResponse must carry a broadcast path"
+        );
+        assert_eq!(
+            decoded.announced_at.len(),
+            reach.len(),
+            "SubscribeResponse.announcedAt must round-trip the producer reach (#142)"
+        );
+        let dest = &decoded.announced_at[0];
+        match &dest.transport {
+            hyprstream_rpc::stream_info::TransportConfig::Quic(q) => {
+                assert_eq!(q.addr, "127.0.0.1:4433");
+                assert_eq!(q.server_name, "localhost");
+                assert_eq!(q.cert_hashes.len(), 1);
+            }
+            other => panic!("expected a Quic reach, got {other:?}"),
+        }
     }
 }

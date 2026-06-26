@@ -421,7 +421,9 @@ fn register_scoped_tools_recursive(
                             let (client_secret, client_pubkey) = hyprstream_rpc::generate_ephemeral_keypair();
                             let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
 
-                            let stream_info_json = match service.as_str() {
+                            // #468: the streaming-method client returns the VERIFIED-capnp
+                            // StreamInfo library type directly (no serde_json::Value round-trip).
+                            let stream_info: hyprstream_rpc::stream_info::StreamInfo = match service.as_str() {
                                 "registry" => {
                                     let server_vk = ctx.resolve_peer_key("registry").await?;
                                     let client: RegistryClient = RegistryClient::for_service(
@@ -437,20 +439,17 @@ fn register_scoped_tools_recursive(
                                 _ => anyhow::bail!("No scoped streaming dispatch for service: {service}"),
                             };
 
-                            let handle = match decode_stream_reach(&stream_info_json)? {
-                                DecodedStreamReach::Networked { dh_public, reach, broadcast_path } => {
-                                    let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
-                                        &client_secret, &client_pubkey_bytes, &dh_public,
-                                    )?;
-                                    MoqStreamHandle::networked(reach, broadcast_path, mac_key, topic)
-                                }
-                                DecodedStreamReach::Uds { dh_public, uds_path, broadcast_path } => {
-                                    let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
-                                        &client_secret, &client_pubkey_bytes, &dh_public,
-                                    )?;
-                                    MoqStreamHandle::new(uds_path, broadcast_path, mac_key, topic)
-                                }
-                            };
+                            // #356: single networked reach shape (UDS-only resolves
+                            // to the same-host fast path inside `networked`).
+                            let DecodedStreamReach { dh_public, reach, broadcast_path } =
+                                decode_stream_reach(stream_info)?;
+                            // #321: derive_client_stream_keys yields the AEAD enc_key.
+                            let (mac_key, enc_key, topic) = hyprstream_rpc::derive_client_stream_keys(
+                                &client_secret, &client_pubkey_bytes, &dh_public,
+                            )?;
+                            // #358: MCP tool stream consumed live → direct-first; selection only reorders advertised reaches.
+                            let qos = hyprstream_rpc::stream_info::StreamOpt::default();
+                            let handle = MoqStreamHandle::networked(reach, &qos, broadcast_path, mac_key, enc_key, topic);
 
                             Ok(ToolResult::Stream(Box::new(handle)))
                         })
@@ -580,7 +579,8 @@ fn register_streaming_tool(
                 let (client_secret, client_pubkey) = hyprstream_rpc::generate_ephemeral_keypair();
                 let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
 
-                let stream_info_json = match service.as_str() {
+                // #468: verified-capnp StreamInfo returned directly (no serde_json round-trip).
+                let stream_info: hyprstream_rpc::stream_info::StreamInfo = match service.as_str() {
                     "registry" => {
                         let server_vk = ctx.resolve_peer_key("registry").await?;
                         let client: RegistryClient = RegistryClient::for_service(
@@ -601,20 +601,17 @@ fn register_streaming_tool(
                     _ => anyhow::bail!("No streaming support for service: {}", service),
                 };
 
-                let handle = match decode_stream_reach(&stream_info_json)? {
-                    DecodedStreamReach::Networked { dh_public, reach, broadcast_path } => {
-                        let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
-                            &client_secret, &client_pubkey_bytes, &dh_public,
-                        )?;
-                        MoqStreamHandle::networked(reach, broadcast_path, mac_key, topic)
-                    }
-                    DecodedStreamReach::Uds { dh_public, uds_path, broadcast_path } => {
-                        let (mac_key, topic) = hyprstream_rpc::derive_client_stream_keys(
-                            &client_secret, &client_pubkey_bytes, &dh_public,
-                        )?;
-                        MoqStreamHandle::new(uds_path, broadcast_path, mac_key, topic)
-                    }
-                };
+                // #356: single networked reach shape (UDS-only resolves to the
+                // same-host fast path inside `networked`).
+                let DecodedStreamReach { dh_public, reach, broadcast_path } =
+                    decode_stream_reach(stream_info)?;
+                // #321: derive_client_stream_keys yields the AEAD enc_key.
+                let (mac_key, enc_key, topic) = hyprstream_rpc::derive_client_stream_keys(
+                    &client_secret, &client_pubkey_bytes, &dh_public,
+                )?;
+                // #358: MCP tool stream consumed live → direct-first; selection only reorders advertised reaches.
+                let qos = hyprstream_rpc::stream_info::StreamOpt::default();
+                let handle = MoqStreamHandle::networked(reach, &qos, broadcast_path, mac_key, enc_key, topic);
 
                 Ok(ToolResult::Stream(Box::new(handle)))
             })
@@ -660,63 +657,41 @@ fn params_to_json_schema(params: &[(&str, &str, bool, &str)]) -> Value {
     })
 }
 
-/// The transport-resolved shape of a decoded streaming response (#274).
-enum DecodedStreamReach {
-    /// New `StreamInfo`: subscribe over the wire `reach` (or local UDS fast path).
-    Networked {
-        dh_public: [u8; 32],
-        reach: Vec<hyprstream_rpc::stream_info::Destination>,
-        broadcast_path: String,
-    },
-    /// Legacy UDS-only producers (out-of-scope `tui.capnp` `StreamInfo`).
-    Uds {
-        dh_public: Vec<u8>,
-        uds_path: String,
-        broadcast_path: String,
-    },
+/// The transport-resolved shape of a decoded streaming response (#356).
+///
+/// A single networked shape: every producer now advertises its moq reach via the
+/// canonical `StreamInfo.announcedAt` list (or an empty list when UDS-only, which
+/// `connect_moq_reach`/`MoqStreamHandle::networked` resolve to the same-host UDS
+/// fast path from LOCAL config). There is no longer a wire-published UDS path.
+struct DecodedStreamReach {
+    dh_public: [u8; 32],
+    reach: Vec<hyprstream_rpc::stream_info::Destination>,
+    broadcast_path: String,
 }
 
-/// Decode a streaming response into its moq reach (#274).
+/// Decode a streaming response into its moq reach (#356).
 ///
-/// The signed `StreamInfo` is decoded via the generated library type
-/// (`hyprstream_rpc::stream_info::StreamInfo`) — no bespoke `serde_json` field
-/// scraping for the in-scope path — yielding the native-capnp `reach` list +
-/// `broadcastPath`. Falls back to the legacy UDS fields (`moqUdsPath` /
-/// `moqBroadcastPath`) only for out-of-scope producers (the TUI service's
-/// parallel `tui.capnp` `StreamInfo`, deliberately left on UDS).
-fn decode_stream_reach(json: &Value) -> anyhow::Result<DecodedStreamReach> {
-    // Preferred path: the new streaming.capnp StreamInfo decodes cleanly into the
-    // library type, carrying the native-capnp `reach` list + `broadcastPath`.
-    if let Ok(info) = serde_json::from_value::<hyprstream_rpc::stream_info::StreamInfo>(json.clone()) {
-        if !info.broadcast_path.is_empty() {
-            if info.dh_public == [0u8; 32] {
-                anyhow::bail!("server did not provide DH public key for streaming");
-            }
-            return Ok(DecodedStreamReach::Networked {
-                dh_public: info.dh_public,
-                reach: info.announced_at,
-                broadcast_path: info.broadcast_path,
-            });
-        }
+/// Takes the VERIFIED-capnp `StreamInfo` library type as returned by the
+/// streaming-method client (decoded + COSE-verified inside `call_streaming`,
+/// `rpc_client.rs`) — NO `serde_json` round-trip (#468) — yielding the
+/// native-capnp `announcedAt` reach list + `broadcastPath`.
+/// Fails closed when the response carries no broadcast path or DH key.
+fn decode_stream_reach(
+    info: hyprstream_rpc::stream_info::StreamInfo,
+) -> anyhow::Result<DecodedStreamReach> {
+    if info.broadcast_path.is_empty() {
+        anyhow::bail!(
+            "missing broadcastPath in streaming response — server did not initialize moq transport"
+        );
     }
-
-    // Legacy UDS fallback (out-of-scope producers still on the UDS moq plane).
-    let dh_public: Vec<u8> = json["dhPublic"].as_array()
-        .ok_or_else(|| anyhow::anyhow!("missing dhPublic in streaming response"))?
-        .iter()
-        .enumerate()
-        .map(|(i, v)| {
-            v.as_u64()
-                .and_then(|n| u8::try_from(n).ok())
-                .ok_or_else(|| anyhow::anyhow!("dhPublic[{i}]: value out of u8 range"))
-        })
-        .collect::<anyhow::Result<Vec<u8>>>()?;
-    let uds_path = json["moqUdsPath"].as_str().unwrap_or("").to_owned();
-    let broadcast_path = json["moqBroadcastPath"].as_str().unwrap_or("").to_owned();
-    if uds_path.is_empty() {
-        anyhow::bail!("missing reach/broadcastPath in streaming response — server did not initialize moq transport");
+    if info.dh_public == [0u8; 32] {
+        anyhow::bail!("server did not provide DH public key for streaming");
     }
-    Ok(DecodedStreamReach::Uds { dh_public, uds_path, broadcast_path })
+    Ok(DecodedStreamReach {
+        dh_public: info.dh_public,
+        reach: info.announced_at,
+        broadcast_path: info.broadcast_path,
+    })
 }
 
 /// Dispatch a method call to the appropriate generated client.

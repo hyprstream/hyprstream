@@ -48,6 +48,7 @@ serde_json = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
 bs58 = "0.5"                              # multibase base58btc for DID-doc transport service entries
+data-encoding = "2.6"                     # multibase base32 (CIDv1 canonical form)
 chrono = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
@@ -74,6 +75,30 @@ getrandom = { version = "0.2", features = ["js"] }  # rand 0.8 uses getrandom 0.
 # Declare it (renamed to coexist with the 0.2 entry) so the feature unifies onto the
 # transitive 0.4 dep and the browser/WebTransport consumer compiles for wasm (#225).
 getrandom_v04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+# moq-net → rand 0.9.2 → getrandom 0.3 (distinct from 0.2 and 0.4 above).
+# Must enable wasm_js on this generation too or it refuses to build on wasm32.
+# iroh browser peer (Phase 2): iroh 1.0.0-rc.0 has upstream wasm32 support via
+# cfg(wasm_browser) = cfg(all(target_family="wasm", target_os="unknown")).
+# On wasm32, iroh uses PkarrResolver for peer discovery instead of DNS, and
+# WebTransport/relay as the bearer instead of UDP. The browser becomes a full
+# iroh peer with its own NodeId — same Rust code as native, compiled to wasm32.
+# Enables did:key resolution by NodeId via pkarr natively in the browser,
+# eliminating the pkarr HTTP gateway workaround in atproto.ts.
+iroh = { workspace = true }
+# web-transport-trait: the Session abstraction used by iroh's wasm32 bearer.
+web-transport-trait = { workspace = true }
+# url: needed by iroh_peer.rs to construct the pkarr relay URL for lookups.
+url = { workspace = true }
+# n0-error: iroh's error type (`address_lookup::Error`) is type-erased through
+# n0-error's `AnyError`. iroh_peer.rs needs the `StackError` trait to walk the
+# source chain and downcast a pkarr 404 to `Ok(None)` (#475). Pinned to iroh's
+# transitive version so the `PkarrError` downcast resolves the same type.
+n0-error = "=1.0.0-rc.0"
+# NOTE: moq-net is NOT added here. moq-net 0.1.8 has Session+Sync bounds that
+# conflict with browser WebTransport types (!Sync on wasm32). This requires an
+# upstream fix in moq-net before it can compile for wasm32-unknown-unknown.
+# Tracked separately; moq track subscribe/publish in the browser follows once
+# the upstream Send/Sync bounds are resolved.
 
 # Native-only deps (not compiled for wasm32)
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -99,7 +124,7 @@ url = { workspace = true }
 reqwest = { workspace = true }
 
 # Async runtime
-tokio = { workspace = true, features = ["io-util", "net"] }
+tokio = { workspace = true, features = ["io-util", "net", "sync"] }
 tokio-util = { workspace = true }
 bytes = { workspace = true }
 
@@ -132,6 +157,7 @@ hyprstream-rpc-build = { path = "../hyprstream-rpc-build" }
 
 [dev-dependencies]
 tokio-test = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

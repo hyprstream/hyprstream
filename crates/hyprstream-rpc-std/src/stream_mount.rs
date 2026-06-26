@@ -364,12 +364,7 @@ impl Mount for StreamMount {
             StreamFidState::Info { .. } => (0, "info"),
             StreamFidState::Ctl { .. } => (0, "ctl"),
         };
-        Ok(Stat {
-            qtype,
-            size: 0,
-            name: name.to_string(),
-            mtime: 0,
-        })
+        Ok(Stat::unknown_qid(qtype, 0, name.to_string(), 0))
     }
 
     async fn clunk(&self, _fid: Fid, _caller: &Subject) {}

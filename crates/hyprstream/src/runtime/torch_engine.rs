@@ -24,6 +24,53 @@ use tch::{nn::VarStore, Device, Tensor};
 use tokenizers::Tokenizer;
 use tracing::{info, instrument, warn};
 
+/// Build a self-explaining diagnostic for why CUDA/ROCm is unavailable.
+///
+/// `tch::Cuda::is_available()` returns a bare `false` with no cause, which made
+/// the GPU→CPU fallback nearly impossible to diagnose in the field (e.g. an RTX
+/// 5090 node with a CUDA libtorch bundled that still logged a one-line "not
+/// available"). This collects the underlying signals so the operator can tell
+/// *why*:
+///
+/// - `has_cuda` / `has_cudart`: was this libtorch even compiled with CUDA? If
+///   `false`, an install/active-backend mismatch bundled a CPU build.
+/// - `device_count`: 0 with a CUDA build almost always means the driver lib
+///   (`libcuda.so.1`, shipped by the host NVIDIA driver — *never* by the
+///   AppImage) could not be loaded, i.e. `LD_LIBRARY_PATH` does not reach the
+///   host driver path. A negative count is a CUDA-internal error.
+/// - The current `LD_LIBRARY_PATH` is echoed so the operator can immediately
+///   see whether the host driver path is missing.
+fn cuda_unavailable_diagnostics() -> String {
+    let has_cuda = tch::utils::has_cuda();
+    let has_cudart = tch::utils::has_cudart();
+    let has_hip = tch::utils::has_hip();
+    let device_count = tch::Cuda::device_count();
+    let ld_path = std::env::var("LD_LIBRARY_PATH").unwrap_or_else(|_| "<unset>".to_owned());
+
+    // Best-effort, actionable interpretation of the signals above.
+    let hint = if !has_cuda && !has_hip {
+        "this libtorch was NOT built with CUDA/ROCm support (CPU-only build). \
+         Check the installed/active backend — an install likely selected a 'cpu' \
+         variant (verify ~/.local/share/hyprstream/active-backend / active-version)."
+    } else if device_count <= 0 {
+        "libtorch has CUDA/ROCm support but reports 0 devices. This is almost \
+         always the host driver library (libcuda.so.1) failing to load: it ships \
+         with the NVIDIA driver and is never bundled in the AppImage. Ensure the \
+         host driver lib dir is on LD_LIBRARY_PATH (e.g. /usr/lib64, \
+         /usr/lib/x86_64-linux-gnu, or the libcuda.so.1 location from \
+         `ldconfig -p | grep libcuda`), or that ldconfig has it cached."
+    } else {
+        "CUDA/ROCm reports devices but is_available() is false — possible \
+         driver/runtime version mismatch or a CUDA-internal init error."
+    };
+
+    format!(
+        "is_available()=false; has_cuda={has_cuda}, has_cudart={has_cudart}, \
+         has_hip={has_hip}, device_count={device_count}, \
+         LD_LIBRARY_PATH={ld_path}. Likely cause: {hint}"
+    )
+}
+
 /// Basic context state for tracking generation state
 #[derive(Debug, Clone)]
 pub struct ContextState {
@@ -55,8 +102,20 @@ pub struct TorchEngine {
     tokenizer: Arc<Mutex<Option<Tokenizer>>>,
     /// Template engine for chat formatting
     template_engine: Arc<Mutex<Option<TemplateEngine>>>,
-    /// Device for computation (CPU/CUDA/ROCm) - immutable after construction
+    /// Device for computation (CPU/CUDA/ROCm) - immutable after construction.
+    ///
+    /// For a multi-device engine this is the pool's **primary** (first) device —
+    /// the home of non-layer weights (embeddings, final norm, lm_head) and the
+    /// device inputs are placed on before the first decoder layer. Per-layer
+    /// placement is driven by the model's own `LayerDeviceMap` (`forward_layers`).
     device: Device,
+    /// Resolved multi-device pool, when the engine was built from >1 device
+    /// (#314 wiring). `None` for single-device engines (the common case). When
+    /// `Some` and non-single, the loaded model is built as a single pipeline
+    /// stage spanning `[0..num_hidden_layers)` with a layer→device map derived
+    /// from this pool. Held as `Option<Arc<...>>` because `TorchEngine` is
+    /// `Clone` and the pool is `Send + Sync` (it holds only `Device` values).
+    device_pool: Option<Arc<crate::runtime::DevicePool>>,
     /// Runtime configuration - immutable after construction
     config: RuntimeConfig,
     /// Generation configuration with defaults
@@ -108,6 +167,31 @@ impl TorchEngine {
     /// Get the device this engine is using for computation
     pub fn device(&self) -> Device {
         self.device
+    }
+
+    /// The resolved multi-device pool, if this engine was built with >1 device.
+    ///
+    /// Returns `None` for single-device engines (the common case, including the
+    /// legacy single-`gpu_device_id` path and CPU). When `Some` and non-single,
+    /// the loaded model is built as a single pipeline stage with a layer→device
+    /// map derived from this pool (#314 wiring). The pool's primary equals
+    /// [`Self::device`].
+    #[must_use]
+    pub fn device_pool(&self) -> Option<&crate::runtime::DevicePool> {
+        self.device_pool.as_deref()
+    }
+
+    /// Whether this engine is configured to build a multi-device pipeline.
+    ///
+    /// True exactly when [`Self::device_pool`] is `Some` and holds >1 device.
+    /// The model is constructed with `LayerDeviceMap::even_split` across the
+    /// pool; single-device engines return `false` and build the whole model on
+    /// [`Self::device`].
+    #[must_use]
+    pub fn is_multi_device(&self) -> bool {
+        self.device_pool
+            .as_deref()
+            .is_some_and(|p| !p.is_single())
     }
 
     // ============================================================================
@@ -315,18 +399,68 @@ impl TorchEngine {
 
     /// Internal sync constructor
     fn new_sync(config: RuntimeConfig) -> Result<Self> {
+        // Multi-GPU foundation (#313/#314, epic #310): when devices are
+        // *explicitly* requested via `RuntimeConfig.devices` /
+        // `HYPRSTREAM_GPU_DEVICES`, resolve them through `DevicePool`, which
+        // validates them fail-fast (no silent CPU downgrade). When the pool
+        // holds >1 device the engine keeps the whole pool and threads it into
+        // model construction so the model is built as a single multi-device
+        // pipeline stage (layers spread via `LayerDeviceMap::even_split`,
+        // `forward_layers` performs the stage-boundary copies). Single-pool and
+        // legacy single-`gpu_device_id` paths are unchanged.
+        if config.use_gpu {
+            if let Some(indices) = config.resolve_explicit_multi_device_indices()? {
+                let pool = crate::runtime::DevicePool::from_cuda_indices(&indices)?;
+                let device = pool.primary();
+                if pool.is_single() {
+                    info!(
+                        "🚀 DevicePool resolved a single device {:?}; building single-device engine",
+                        device
+                    );
+                    return Self::with_device(config, device, None);
+                }
+                info!(
+                    "🚀 Multi-GPU DevicePool resolved {} device(s) {:?}; building a multi-device \
+                     pipeline (primary {:?} hosts embeddings/lm_head)",
+                    pool.len(),
+                    pool.devices(),
+                    device
+                );
+                return Self::with_device(config, device, Some(Arc::new(pool)));
+            }
+        }
+
         // Determine device based on configuration
         let device = if config.use_gpu {
             // Use specified GPU device ID, or auto-detect
             let gpu_device = if let Some(device_id) = config.gpu_device_id {
-                // Check if CUDA/ROCm is available at all
+                // A GPU was *explicitly* requested. Check if CUDA/ROCm is available.
                 if Device::cuda_if_available() != Device::Cpu {
                     Device::Cuda(device_id)
+                } else if config.strict_device {
+                    // No-fragile-fallbacks (#315): a process told to use GPU N that
+                    // silently lands on CPU tanks the pipeline. Fail fast instead,
+                    // and surface the *actual* reason CUDA was unavailable so the
+                    // operator can fix it (driver lib / wrong backend / mismatch).
+                    let diag = cuda_unavailable_diagnostics();
+                    return Err(anyhow!(
+                        "GPU {device_id} explicitly requested but CUDA/ROCm is not available; \
+                         refusing to silently fall back to CPU (strict_device). \
+                         Set HYPRSTREAM_STRICT_DEVICE=0 to allow CPU fallback. \
+                         Diagnostics: {diag}"
+                    ));
                 } else {
-                    info!("⚠️  GPU {} requested but CUDA/ROCm not available, falling back to CPU", device_id);
+                    warn!(
+                        "⚠️  GPU {} requested but CUDA/ROCm not available, falling back to CPU. {}",
+                        device_id,
+                        cuda_unavailable_diagnostics()
+                    );
                     Device::Cpu
                 }
             } else {
+                // Pure auto-detect ("use a GPU if there is one"): CPU fallback is
+                // the intended behavior here even under strict_device, since no
+                // specific device was requested.
                 Device::cuda_if_available()
             };
 
@@ -345,7 +479,13 @@ impl TorchEngine {
                 }
                 gpu_device
             } else {
-                info!("⚠️  GPU requested but not available, falling back to CPU");
+                // The live RTX 5090 / cuda130 node hit exactly this branch: a
+                // bare "not available" with no cause. Always surface *why* now
+                // (most commonly libcuda.so.1 missing from LD_LIBRARY_PATH).
+                warn!(
+                    "⚠️  GPU requested but not available, falling back to CPU. {}",
+                    cuda_unavailable_diagnostics()
+                );
                 Device::Cpu
             }
         } else {
@@ -353,6 +493,23 @@ impl TorchEngine {
             Device::Cpu
         };
 
+        Self::with_device(config, device, None)
+    }
+
+    /// Construct an engine pinned to an already-resolved primary [`Device`].
+    ///
+    /// Pass `device_pool = Some(pool)` with a multi-device pool to build the
+    /// model as a single pipeline stage spanning the whole decoder stack with a
+    /// layer→device map (the #314 multi-device path). The engine's `device`
+    /// remains the pool's primary (first) device — the home of embeddings, final
+    /// norm, and lm_head, and where inputs land before the first layer.
+    /// `device_pool = None` (or a single-device pool) preserves the original
+    /// whole-model-on-one-device behavior.
+    fn with_device(
+        config: RuntimeConfig,
+        device: Device,
+        device_pool: Option<Arc<crate::runtime::DevicePool>>,
+    ) -> Result<Self> {
         Ok(Self {
             var_store: Arc::new(Mutex::new(None)),
             model_architecture: Arc::new(Mutex::new(None)),
@@ -361,6 +518,7 @@ impl TorchEngine {
             tokenizer: Arc::new(Mutex::new(None)),
             template_engine: Arc::new(Mutex::new(None)),
             device,
+            device_pool,
             config: config.clone(),
             generation_config: GenerationConfig {
                 max_tokens: 2048,
@@ -569,7 +727,9 @@ impl TorchEngine {
             model_info.architecture = config.model_type.clone();
         }
 
-        // Use the factory to create the model
+        // Use the factory to create the model. When `device_pool` is set and
+        // multi-device, the factory builds the model as a single pipeline stage
+        // spanning all decoder layers with a layer→device map (#314 wiring).
         let factory_start = std::time::Instant::now();
         let model = ModelFactory::create(
             model_path,
@@ -577,6 +737,7 @@ impl TorchEngine {
             tch::Kind::BFloat16,
             self.config.max_context.map(|v| v as usize),
             self.config.kv_quant_type,
+            self.device_pool.as_deref(),
         ).await?;
         let factory_time = factory_start.elapsed();
         info!("✅ Model weights loaded in {:.2}s", factory_time.as_secs_f64());
@@ -985,6 +1146,41 @@ impl TorchEngine {
         let last_token_logits = logits.narrow(1, seq_len - 1, 1).squeeze_dim(1);
 
         Ok(last_token_logits)
+    }
+
+    /// Batched ragged decode step over several same-delta sequences (#329).
+    ///
+    /// Each entry is `(new_token_ids, start_pos, per-sequence KVCacheManager)`.
+    /// Returns last-token logits per row `[B, vocab]`. Delegates to the model's
+    /// `forward_batched` (Llama-only; other architectures return an error so the
+    /// caller falls back to per-stream `forward_with_delta_cached`). Tensors stay
+    /// on this (bridge) thread; only the Send token/logits metadata crosses.
+    pub fn forward_batched_step(
+        &self,
+        sequences: &mut [(
+            Vec<i64>,
+            usize,
+            std::sync::Arc<parking_lot::Mutex<crate::runtime::kv_cache::KVCacheManager>>,
+        )],
+        delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        let model_arc = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("Persistent model not initialized"))?;
+        if !self.is_persistent_model_ready() {
+            return Err(anyhow!("Model not properly initialized"));
+        }
+
+        let model = model_arc.lock();
+        let logits = {
+            let _no_grad = tch::no_grad_guard();
+            model.forward_batched(sequences, delta)?
+        };
+
+        // logits: [B, q, vocab] -> last-token logits [B, vocab].
+        let seq_len = logits.size()[1];
+        Ok(logits.narrow(1, seq_len - 1, 1).squeeze_dim(1))
     }
 
     /// Run full forward pass with optional delta injection (no KV cache)
@@ -1919,6 +2115,7 @@ impl Drop for TorchEngine {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -1945,6 +2142,71 @@ mod tests {
             gen_config.max_tokens, 2048,
             "TorchEngine should initialize with max_tokens=2048"
         );
+    }
+
+    /// `with_device(.., None)` — the single-device path used by every legacy
+    /// caller — must produce an engine that reports single-device and exposes
+    /// no pool. This is the regression guard that the #314 wiring does not
+    /// perturb single-GPU/CPU construction.
+    #[test]
+    fn single_device_engine_is_not_multi_device() {
+        let engine =
+            super::TorchEngine::with_device(RuntimeConfig::default(), Device::Cpu, None).unwrap();
+        assert!(!engine.is_multi_device());
+        assert!(engine.device_pool().is_none());
+        assert_eq!(engine.device(), Device::Cpu);
+    }
+
+    /// `with_device(.., Some(multi_pool))` must mark the engine multi-device and
+    /// expose the pool with the right primary. We build the pool from explicit
+    /// `Device::Cuda` values via `DevicePool::from_devices` (which does not probe
+    /// CUDA), so this runs on CPU-only CI — we never construct a model here, we
+    /// only exercise the engine-struct wiring (#314 selection logic).
+    #[test]
+    fn multi_device_pool_marks_engine_multi_device() {
+        use crate::runtime::device_pool::DevicePool;
+        let pool = DevicePool::from_devices(vec![Device::Cuda(0), Device::Cuda(1)]).unwrap();
+        assert_eq!(pool.len(), 2);
+        let primary = pool.primary();
+        let engine = super::TorchEngine::with_device(
+            RuntimeConfig::default(),
+            primary,
+            Some(std::sync::Arc::new(pool.clone())),
+        )
+        .unwrap();
+        assert!(engine.is_multi_device());
+        let exposed = engine
+            .device_pool()
+            .expect("multi-device engine must expose its pool");
+        assert_eq!(exposed.devices(), pool.devices());
+        assert_eq!(exposed.primary(), primary);
+        assert_eq!(engine.device(), primary);
+    }
+
+    /// The map the factory would build for a 2-device pool must be a contiguous
+    /// prefix-heavy split with exactly one stage boundary — the invariant the
+    /// `forward_layers` path relies on. This pins the planner the wiring hands
+    /// to model construction (#314 → #310 epic).
+    #[test]
+    fn engine_multi_device_map_has_one_boundary_per_stage_gap() {
+        use crate::runtime::device_pool::{DevicePool, LayerDeviceMap};
+        let pool = DevicePool::from_devices(vec![Device::Cuda(0), Device::Cuda(1)]).unwrap();
+        // 7 layers over 2 devices → [0,0,0,0, 1,1,1] (prefix gets the extra).
+        let map = LayerDeviceMap::even_split(&pool, 7).unwrap();
+        assert_eq!(map.len(), 7);
+        let mut boundaries = 0;
+        let mut prev = map.device_for(0);
+        for g in 1..map.len() {
+            if map.is_boundary(prev, g) {
+                boundaries += 1;
+            }
+            prev = map.device_for(g);
+        }
+        assert_eq!(
+            boundaries, 1,
+            "2-device even_split has exactly one cross-device copy per forward"
+        );
+        assert!(!map.is_single_device());
     }
 }
 
