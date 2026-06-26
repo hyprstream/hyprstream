@@ -359,11 +359,9 @@ impl TuiService {
         let stdin_ctx = make_stream_ctx("stdin")?;
         let stdout_ctx = make_stream_ctx("stdout")?;
 
-        // Build moq metadata (broadcast paths + UDS socket) when moq is active.
-        let moq_uds_path = global_moq_origin()
-            .and_then(|_| hyprstream_rpc::moq_stream::global_moq_uds_path())
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        // Build the moq broadcast paths when moq is active. The same-host UDS
+        // path is NOT advertised (#356): co-located viewers resolve it from LOCAL
+        // config, and cross-process viewers dial the networked reach instead.
         let stdin_moq_path = global_moq_origin()
             .map(|o| o.broadcast_path(stdin_ctx.topic()))
             .unwrap_or_default();
@@ -371,12 +369,10 @@ impl TuiService {
             .map(|o| o.broadcast_path(stdout_ctx.topic()))
             .unwrap_or_default();
 
-        let sub_endpoint = String::new();
-
-        // (topic, sub_endpoint, mac_key, moq_broadcast_path, moq_uds_path)
-        let streams: [(&str, &str, &[u8; 32], &str, &str); 2] = [
-            (stdin_ctx.topic(), &sub_endpoint, stdin_ctx.mac_key(), &stdin_moq_path, &moq_uds_path),
-            (stdout_ctx.topic(), &sub_endpoint, stdout_ctx.mac_key(), &stdout_moq_path, &moq_uds_path),
+        // (topic, mac_key, broadcast_path)
+        let streams: [(&str, &[u8; 32], &str); 2] = [
+            (stdin_ctx.topic(), stdin_ctx.mac_key(), &stdin_moq_path),
+            (stdout_ctx.topic(), stdout_ctx.mac_key(), &stdout_moq_path),
         ];
 
         let response = self.build_connect_response(
@@ -1600,8 +1596,8 @@ impl TuiService {
         viewer_id: u32,
         session_id: u32,
         windows: &[(u32, String, Vec<(u32, (u16, u16), bool)>, u32)],
-        // (topic, sub_endpoint, mac_key, moq_broadcast_path, moq_uds_path)
-        streams: &[(&str, &str, &[u8; 32], &str, &str)],
+        // (topic, mac_key, broadcast_path)
+        streams: &[(&str, &[u8; 32], &str)],
     ) -> Result<Vec<u8>> {
         let mut msg = Builder::new_default();
         {
@@ -1611,26 +1607,26 @@ impl TuiService {
             connect.set_viewer_id(viewer_id);
             connect.set_session_id(session_id);
 
-            // #275: the node's network-routable moq reach (the bound QUIC `/moq`
+            // #356: the node's network-routable moq reach (the bound QUIC `/moq`
             // endpoint, registered when the daemon's web_transport_quinn server
             // binds). Shared across all FD streams — they all live on this node's
             // one moq plane. A cross-process viewer dials this reach instead of its
-            // own local moq UDS plane (see StreamInfo.reach docs / MoqStreamHandle::networked).
-            let reach = hyprstream_rpc::moq_stream::producer_reach();
+            // own local moq UDS plane (see StreamInfo.announcedAt docs / connect_moq_reach).
+            // #384: TUI FD streams are node-local infrastructure → server-global
+            // reach (ServerDefault); no per-stream RelayChoice posture applies.
+            let reach = hyprstream_rpc::moq_stream::global_reach_config().reach();
 
             // FD-indexed streams: [0]=stdin (input relay), [1]=stdout (frames)
             let mut stream_list = connect.reborrow().init_streams(streams.len() as u32);
-            for (i, (topic, sub_endpoint, mac_key, moq_path, moq_uds)) in streams.iter().enumerate() {
+            for (i, (topic, mac_key, broadcast_path)) in streams.iter().enumerate() {
                 let mut si = stream_list.reborrow().get(i as u32);
                 si.set_topic(topic);
-                si.set_sub_endpoint(sub_endpoint);
                 si.set_mac_key(*mac_key);
-                si.set_moq_broadcast_path(moq_path);
-                si.set_moq_uds_path(moq_uds);
+                si.set_broadcast_path(broadcast_path);
                 // Encode the networked reach via the shared generated ToCapnp impl
                 // (Destination::write_to), so the wire bytes match the inference
                 // StreamInfo's `announcedAt` 1:1.
-                let mut reach_list = si.reborrow().init_reach(reach.len() as u32);
+                let mut reach_list = si.reborrow().init_announced_at(reach.len() as u32);
                 for (j, dest) in reach.iter().enumerate() {
                     let mut db = reach_list.reborrow().get(j as u32);
                     hyprstream_rpc::capnp::ToCapnp::write_to(dest, &mut db);
@@ -2470,12 +2466,12 @@ mod tests {
         assert_ne!(DisplayMode::Capnp, DisplayMode::Structured);
     }
 
-    /// #275: the PTY StreamInfo must carry the producer's networked reach so a
+    /// #356: the PTY StreamInfo must carry the producer's networked reach so a
     /// cross-process viewer dials the TUI service's QUIC `/moq` endpoint instead
     /// of its own local moq UDS plane. This exercises the exact encode path
     /// `build_connect_response` uses — `producer_reach()` → `Destination::write_to`
-    /// into the tui StreamInfo capnp `reach` field — and reads it back through the
-    /// generated `tui_client::StreamInfo` decoder, asserting the Quic dial params
+    /// into the tui StreamInfo capnp `announcedAt` field — and reads it back through
+    /// the generated `tui_client::StreamInfo` decoder, asserting the Quic dial params
     /// survive the round-trip intact (the chat-inference fix relied on the same
     /// reach being present; the bug was the TUI StreamInfo not carrying it).
     #[test]
@@ -2503,9 +2499,8 @@ mod tests {
             let mut si = msg.init_root::<tui_capnp::stream_info::Builder<'_>>();
             si.set_topic("deadbeef");
             si.set_mac_key(&[7u8; 32]);
-            si.set_moq_broadcast_path("local/streams/deadbeef");
-            si.set_moq_uds_path("/run/hyprstream/moq.sock");
-            let mut reach_list = si.reborrow().init_reach(reach.len() as u32);
+            si.set_broadcast_path("local/streams/deadbeef");
+            let mut reach_list = si.reborrow().init_announced_at(reach.len() as u32);
             for (j, dest) in reach.iter().enumerate() {
                 let mut db = reach_list.reborrow().get(j as u32);
                 hyprstream_rpc::capnp::ToCapnp::write_to(dest, &mut db);
@@ -2525,18 +2520,24 @@ mod tests {
             crate::services::generated::tui_client::StreamInfo::read_from(si_reader).expect("decode");
 
         assert_eq!(
-            decoded.reach.len(),
+            decoded.announced_at.len(),
             reach.len(),
-            "decoded StreamInfo.reach must round-trip the producer reach"
+            "decoded StreamInfo.announcedAt must round-trip the producer reach"
         );
-        // The single reach must be a Quic destination with our dial params.
-        let dest = &decoded.reach[0];
-        match &dest.transport {
+        // The round-tripped reach must match the registered producer reach
+        // exactly. (Compare against the captured `producer_reach()` rather than a
+        // hardcoded cert hash: the process-global `NodeStreamReach` is first-wins,
+        // so a sibling test that registers first wins the OnceLock — what matters
+        // is that the encode/decode round-trip is lossless.)
+        assert_eq!(
+            decoded.announced_at, reach,
+            "decoded StreamInfo.announcedAt must round-trip the producer reach exactly"
+        );
+        match &decoded.announced_at[0].transport {
             hyprstream_rpc::stream_info::TransportConfig::Quic(q) => {
                 assert_eq!(q.addr, "127.0.0.1:4433");
                 assert_eq!(q.server_name, "localhost");
                 assert_eq!(q.cert_hashes.len(), 1);
-                assert_eq!(q.cert_hashes[0], vec![0x11u8; 32]);
             }
             other => panic!("expected a Quic reach, got {other:?}"),
         }

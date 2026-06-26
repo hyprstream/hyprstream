@@ -349,6 +349,16 @@ pub struct QuicConfig {
     /// Opt out with `[quic] iroh = false` to run quinn-only (legacy). Native-only.
     #[serde(default = "default_iroh_enabled")]
     pub iroh: bool,
+
+    /// #358: the producer-chosen moq RELAY this node rendezvouses through, as a
+    /// dialable URI (`https://host:port` for the relay's WebTransport `/moq`
+    /// endpoint, or an iroh node URI). Empty = direct-only (the baseline). When
+    /// set, every QUIC-enabled service advertises a `Role::Relay` reach and links
+    /// its streaming origin UP to the relay, so neither publisher nor subscriber
+    /// need be directly reachable by the other. Default deployments point this at
+    /// the node's PDS / federation anchor (the `#atproto_pds` DID service entry).
+    #[serde(default)]
+    pub relay: String,
 }
 
 impl Default for QuicConfig {
@@ -360,6 +370,7 @@ impl Default for QuicConfig {
             cert_path: String::new(),
             key_path: String::new(),
             iroh: default_iroh_enabled(),
+            relay: String::new(),
         }
     }
 }
@@ -483,6 +494,9 @@ impl QuicConfig {
             iroh_enabled: default_iroh_enabled(),
             iroh_admission: None,
             on_iroh_bound: None,
+            // #358: relay rendezvous is provisioned by the daemon bootstrap
+            // (`QuicSharedConfig`), not this minimal builder. Direct-only here.
+            moq_relay: None,
         })
     }
 }

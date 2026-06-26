@@ -85,7 +85,7 @@ pub async fn handle_tui_attach(signing_key: &SigningKey, session_id: Option<u32>
         if !si.topic.is_empty() {
             info!(
                 topic = %si.topic,
-                endpoint = %si.sub_endpoint,
+                broadcast_path = %si.broadcast_path,
                 "Stream info received"
             );
         }
@@ -122,7 +122,7 @@ async fn run_attach_loop(
     use hyprstream_rpc::moq_stream::MoqStreamHandle;
     use hyprstream_rpc::streaming::StreamPayload;
 
-    let broadcast_path = stream_info.moq_broadcast_path.clone();
+    let broadcast_path = stream_info.broadcast_path.clone();
     anyhow::ensure!(
         !broadcast_path.is_empty(),
         "TUI service did not return a moq broadcast path — server may be in ZMQ-only mode"
@@ -141,18 +141,22 @@ async fn run_attach_loop(
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
 
-    // #275: dial the producer's networked reach (the TUI service's QUIC `/moq`
+    // #356: dial the producer's networked reach (the TUI service's QUIC `/moq`
     // endpoint) via the shared `MoqStreamHandle::networked` consumer, which prefers
-    // the StreamInfo's reach and falls back to the local moq UDS plane only when no
-    // dialable reach is present. `attach` is a cross-process viewer, so the old
-    // `connect_uds(moq_uds_path)` connected to *this* process's empty plane and
-    // timed out waiting for the producer's broadcast.
-    let reach = stream_info.reach.clone();
+    // the StreamInfo's `announcedAt` reach and falls back to the local moq UDS plane
+    // only when no dialable reach is present. `attach` is a cross-process viewer, so
+    // the old `connect_uds(moq_uds_path)` connected to *this* process's empty plane
+    // and timed out waiting for the producer's broadcast.
+    let reach = stream_info.announced_at.clone();
+    // #358: a console attach is a live pipe → direct-first topology (the default
+    // StreamOpt is `Retention::Live`). `select_reach` only reorders the
+    // service-advertised reach, so this never invents/forces a reach.
+    let qos = hyprstream_rpc::stream_info::StreamOpt::default();
     // #321: the TUI stdout stream is published AEAD-off (the viewer gets only
     // `mac_key`+`topic` out of band), so the transport enc_key is never exercised
     // here — derive a stable one from mac_key purely to satisfy the consumer API.
     let enc_key = *hyprstream_rpc::crypto::StreamKeys::new(topic.clone(), mac_key).enc_key;
-    let mut handle = MoqStreamHandle::networked(reach, broadcast_path, mac_key, enc_key, topic);
+    let mut handle = MoqStreamHandle::networked(reach, &qos, broadcast_path, mac_key, enc_key, topic);
     let recv_handle = tokio::spawn(async move {
         loop {
             match handle.recv_next().await {

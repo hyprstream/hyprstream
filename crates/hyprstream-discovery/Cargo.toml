@@ -34,6 +34,13 @@ tracing = { workspace = true }
 # Crypto (for signing keys)
 ed25519-dalek = { workspace = true }
 
+[dev-dependencies]
+# #431 — build/verify real CAR proofs in getRecord handler tests.
+hyprstream-pds = { path = "../hyprstream-pds" }
+p256 = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true }
+
 [build-dependencies]
 capnpc = { workspace = true }
 capnp = { workspace = true }

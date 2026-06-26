@@ -9,6 +9,18 @@
 //! the rest = in-worktree wnames. Repo names resolve to UUIDs via the
 //! registry's `get_by_name` RPC.
 //!
+//! ## Shared bridge
+//!
+//! The sync→async plumbing (embedded tokio runtime, fid allocator, fid map,
+//! `anyhow → MountError` mapping, the opaque fid key) is shared with
+//! `RemoteModelMount` via [`NinePBridge`] in [`crate::services::ninep_bridge`].
+//! Only the registry-specific pieces live here: the
+//! `RegistryClient`/`WorktreeClient` types, the 2-level scope extraction
+//! (repo → worktree, with async `get_by_name` UUID resolution), the `np_stat`
+//! (not `stat`) RPC method name, and the worktree-specific directory-entry
+//! byte format (`name_len+name+is_dir+size`), parsed by
+//! `parse_worktree_dir_entries` below.
+//!
 //! ## Real qids
 //!
 //! Now that #388 widened `vfs::Stat` with `version` + `path`, this mount
@@ -20,28 +32,26 @@
 //!
 //! ## Fid management
 //!
-//! The mount allocates local fid numbers and tracks them in a `DashMap`.
-//! Each local fid maps to a `RemoteFid` that stores the resolved
-//! `WorktreeClient` (curried with `repo_id` + `worktree_name`), the remote
-//! fid number returned by walk, plus qtype for stat/readdir synthesis.
+//! The mount allocates local fid numbers and tracks them via the bridge's
+//! `DashMap`. Each local fid maps to a `RemoteFidState` that stores the
+//! resolved `WorktreeClient` (curried with `repo_id` + `worktree_name`), the
+//! remote fid number returned by walk, plus qtype for stat/readdir synthesis.
 //!
 //! ## Timeout / graceful degradation
 //!
-//! A dedicated single-threaded tokio runtime (`self.rt`) drives the async
-//! client. If the registry service is unreachable, `block_on` will hang
-//! until the ZMQ socket timeout fires (set on the underlying socket).
-//! Callers see `MountError::Io("service unreachable: ...")`.
-
-use std::sync::atomic::{AtomicU32, Ordering};
+//! A dedicated single-threaded tokio runtime drives the async client. If the
+//! registry service is unreachable, `block_on` will hang until the ZMQ socket
+//! timeout fires (set on the underlying socket). Callers see
+//! `MountError::Io("service unreachable: ...")`.
 
 use async_trait::async_trait;
-use dashmap::DashMap;
-use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
 use hyprstream_rpc::Subject;
+use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
 
 use crate::services::generated::registry_client::{
     NpClunk, NpCreate, NpOpen, NpRead, NpStatReq, NpWalk, NpWrite, RegistryClient, WorktreeClient,
 };
+use crate::services::ninep_bridge::{fid_key, map_err, NinePBridge, RemoteFidKey};
 use crate::services::types::QTDIR;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -64,10 +74,6 @@ struct RemoteFidState {
     opened: bool,
 }
 
-/// Newtype stored inside the opaque `Fid`.
-#[derive(Clone, Debug)]
-struct RemoteFidKey(u32);
-
 // ─────────────────────────────────────────────────────────────────────────────
 // RemoteRegistryMount
 // ─────────────────────────────────────────────────────────────────────────────
@@ -83,32 +89,16 @@ struct RemoteFidKey(u32);
 /// forwarded to the worktree's 9P `walk` as `wnames`.
 pub struct RemoteRegistryMount {
     client: RegistryClient,
-    rt: tokio::runtime::Runtime,
-    /// Local fid number → remote fid state.
-    fids: DashMap<u32, RemoteFidState>,
-    /// Monotonic fid allocator.
-    next_fid: AtomicU32,
+    bridge: NinePBridge<RemoteFidState>,
 }
 
 impl RemoteRegistryMount {
     /// Create a new remote registry mount wrapping the given registry client.
-    #[allow(clippy::expect_used)] // Runtime creation is infallible in practice
     pub fn new(client: RegistryClient) -> Self {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to create tokio runtime for RemoteRegistryMount");
         Self {
             client,
-            rt,
-            fids: DashMap::new(),
-            next_fid: AtomicU32::new(1),
+            bridge: NinePBridge::new("RemoteRegistryMount"),
         }
-    }
-
-    /// Allocate a new local fid number.
-    fn alloc_fid(&self) -> u32 {
-        self.next_fid.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Resolve `repo_name` to a `WorktreeClient` scoped to `worktree_name`.
@@ -129,30 +119,17 @@ impl RemoteRegistryMount {
         let worktree_name = worktree_name.to_owned();
         // block_on: the Mount trait is sync; the registry service is async
         // over ZMQ. Same pattern as RemoteModelMount.
-        self.rt.block_on(async move {
-            let tracked = client
-                .get_by_name(&repo_name)
-                .await
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            let repo = client.repo(&tracked.id);
-            Ok(repo.worktree(&worktree_name))
-        }).map_err(Self::map_err)
-    }
-
-    /// Map an `anyhow::Error` to a `MountError`.
-    fn map_err(e: anyhow::Error) -> MountError {
-        let msg = e.to_string();
-        if msg.contains("not found") || msg.contains("No such") {
-            MountError::NotFound(msg)
-        } else if msg.contains("permission denied") {
-            MountError::PermissionDenied(msg)
-        } else if msg.contains("not a directory") {
-            MountError::NotDirectory(msg)
-        } else if msg.contains("is a directory") {
-            MountError::IsDirectory(msg)
-        } else {
-            MountError::Io(msg)
-        }
+        self.bridge
+            .rt()
+            .block_on(async move {
+                let tracked = client
+                    .get_by_name(&repo_name)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                let repo = client.repo(&tracked.id);
+                Ok(repo.worktree(&worktree_name))
+            })
+            .map_err(map_err)
     }
 }
 
@@ -176,7 +153,7 @@ impl Mount for RemoteRegistryMount {
 
         let worktree = self.resolve_worktree(repo_name, worktree_name)?;
 
-        let local_fid = self.alloc_fid();
+        let local_fid = self.bridge.alloc_fid();
         let remote_newfid = local_fid; // Use same numbering for simplicity.
 
         let walk_req = NpWalk {
@@ -186,9 +163,10 @@ impl Mount for RemoteRegistryMount {
         };
 
         let result = self
-            .rt
+            .bridge
+            .rt()
             .block_on(worktree.walk(&walk_req))
-            .map_err(Self::map_err)?;
+            .map_err(map_err)?;
 
         // qid.type from the walk response tells us dir vs file.
         let qtype = result.qid.qtype;
@@ -199,21 +177,15 @@ impl Mount for RemoteRegistryMount {
             qtype,
             opened: false,
         };
-        self.fids.insert(local_fid, state);
+        self.bridge.insert(local_fid, state);
 
         Ok(Fid::new(RemoteFidKey(local_fid)))
     }
 
     async fn open(&self, fid: &mut Fid, mode: u8, _caller: &Subject) -> Result<(), MountError> {
-        let key = fid
-            .downcast_ref::<RemoteFidKey>()
-            .ok_or_else(|| MountError::InvalidArgument("bad fid type".into()))?;
-        let local_id = key.0;
+        let local_id = fid_key(fid)?.0;
 
-        let mut state = self
-            .fids
-            .get_mut(&local_id)
-            .ok_or_else(|| MountError::NotFound(format!("fid {} not found", local_id)))?;
+        let mut state = self.bridge.get_mut(local_id)?;
 
         let open_req = NpOpen {
             fid: state.remote_fid,
@@ -221,12 +193,63 @@ impl Mount for RemoteRegistryMount {
         };
 
         let _result = self
-            .rt
+            .bridge
+            .rt()
             .block_on(state.worktree.open(&open_req))
-            .map_err(Self::map_err)?;
+            .map_err(map_err)?;
         state.opened = true;
 
         Ok(())
+    }
+
+    async fn read(
+        &self,
+        fid: &Fid,
+        offset: u64,
+        count: u32,
+        _caller: &Subject,
+    ) -> Result<Vec<u8>, MountError> {
+        let local_id = fid_key(fid)?.0;
+
+        let state = self.bridge.get(local_id)?;
+
+        let read_req = NpRead {
+            fid: state.remote_fid,
+            offset,
+            count,
+        };
+
+        let result = self
+            .bridge
+            .rt()
+            .block_on(state.worktree.read(&read_req))
+            .map_err(map_err)?;
+        Ok(result.data)
+    }
+
+    async fn write(
+        &self,
+        fid: &Fid,
+        offset: u64,
+        data: &[u8],
+        _caller: &Subject,
+    ) -> Result<u32, MountError> {
+        let local_id = fid_key(fid)?.0;
+
+        let state = self.bridge.get(local_id)?;
+
+        let write_req = NpWrite {
+            fid: state.remote_fid,
+            offset,
+            data: data.to_vec(),
+        };
+
+        let result = self
+            .bridge
+            .rt()
+            .block_on(state.worktree.write(&write_req))
+            .map_err(map_err)?;
+        Ok(result.count)
     }
 
     /// Create a file/dir under a walked *directory* fid, then open it.
@@ -246,15 +269,9 @@ impl Mount for RemoteRegistryMount {
         mode: u8,
         _caller: &Subject,
     ) -> Result<Stat, MountError> {
-        let key = fid
-            .downcast_ref::<RemoteFidKey>()
-            .ok_or_else(|| MountError::InvalidArgument("bad fid type".into()))?;
-        let local_id = key.0;
+        let local_id = fid_key(fid)?.0;
 
-        let mut state = self
-            .fids
-            .get_mut(&local_id)
-            .ok_or_else(|| MountError::NotFound(format!("fid {} not found", local_id)))?;
+        let mut state = self.bridge.get_mut(local_id)?;
 
         let create_req = NpCreate {
             fid: state.remote_fid,
@@ -264,9 +281,10 @@ impl Mount for RemoteRegistryMount {
         };
 
         let result = self
-            .rt
+            .bridge
+            .rt()
             .block_on(state.worktree.create(&create_req))
-            .map_err(Self::map_err)?;
+            .map_err(map_err)?;
 
         // The directory fid has been replaced on the server with the opened new
         // file. Mirror that transition locally so subsequent read/write/stat hit
@@ -286,81 +304,15 @@ impl Mount for RemoteRegistryMount {
         })
     }
 
-    async fn read(
-        &self,
-        fid: &Fid,
-        offset: u64,
-        count: u32,
-        _caller: &Subject,
-    ) -> Result<Vec<u8>, MountError> {
-        let key = fid
-            .downcast_ref::<RemoteFidKey>()
-            .ok_or_else(|| MountError::InvalidArgument("bad fid type".into()))?;
-        let local_id = key.0;
-
-        let state = self
-            .fids
-            .get(&local_id)
-            .ok_or_else(|| MountError::NotFound(format!("fid {} not found", local_id)))?;
-
-        let read_req = NpRead {
-            fid: state.remote_fid,
-            offset,
-            count,
-        };
-
-        let result = self
-            .rt
-            .block_on(state.worktree.read(&read_req))
-            .map_err(Self::map_err)?;
-        Ok(result.data)
-    }
-
-    async fn write(
-        &self,
-        fid: &Fid,
-        offset: u64,
-        data: &[u8],
-        _caller: &Subject,
-    ) -> Result<u32, MountError> {
-        let key = fid
-            .downcast_ref::<RemoteFidKey>()
-            .ok_or_else(|| MountError::InvalidArgument("bad fid type".into()))?;
-        let local_id = key.0;
-
-        let state = self
-            .fids
-            .get(&local_id)
-            .ok_or_else(|| MountError::NotFound(format!("fid {} not found", local_id)))?;
-
-        let write_req = NpWrite {
-            fid: state.remote_fid,
-            offset,
-            data: data.to_vec(),
-        };
-
-        let result = self
-            .rt
-            .block_on(state.worktree.write(&write_req))
-            .map_err(Self::map_err)?;
-        Ok(result.count)
-    }
-
     async fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
         // The registry worktree service encodes directory listings in its
         // read() response using the per-entry format documented in
         // `WorktreeRequest.read`:
         //   name_len(u32) + name(utf8) + is_dir(u8) + size(u64)
         // (See `WorktreeClient::list_dir_path` in worktree_helpers.rs.)
-        let key = fid
-            .downcast_ref::<RemoteFidKey>()
-            .ok_or_else(|| MountError::InvalidArgument("bad fid type".into()))?;
-        let local_id = key.0;
+        let local_id = fid_key(fid)?.0;
 
-        let state = self
-            .fids
-            .get(&local_id)
-            .ok_or_else(|| MountError::NotFound(format!("fid {} not found", local_id)))?;
+        let state = self.bridge.get(local_id)?;
 
         if state.qtype != QTDIR {
             return Err(MountError::NotDirectory(format!(
@@ -377,32 +329,28 @@ impl Mount for RemoteRegistryMount {
         };
 
         let result = self
-            .rt
+            .bridge
+            .rt()
             .block_on(state.worktree.read(&read_req))
-            .map_err(Self::map_err)?;
+            .map_err(map_err)?;
 
         Ok(parse_worktree_dir_entries(&result.data))
     }
 
     async fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
-        let key = fid
-            .downcast_ref::<RemoteFidKey>()
-            .ok_or_else(|| MountError::InvalidArgument("bad fid type".into()))?;
-        let local_id = key.0;
+        let local_id = fid_key(fid)?.0;
 
-        let state = self
-            .fids
-            .get(&local_id)
-            .ok_or_else(|| MountError::NotFound(format!("fid {} not found", local_id)))?;
+        let state = self.bridge.get(local_id)?;
 
         let stat_req = NpStatReq {
             fid: state.remote_fid,
         };
 
         let result = self
-            .rt
+            .bridge
+            .rt()
             .block_on(state.worktree.np_stat(&stat_req))
-            .map_err(Self::map_err)?;
+            .map_err(map_err)?;
 
         // Convert the RPC RStat → VFS Stat, threading the wire qid
         // version/path through. The registry service populates these from
@@ -425,18 +373,18 @@ impl Mount for RemoteRegistryMount {
     }
 
     async fn clunk(&self, fid: Fid, _caller: &Subject) {
-        let Some(key) = fid.downcast_ref::<RemoteFidKey>() else {
-            return;
+        let local_id = match fid_key(&fid) {
+            Ok(k) => k.0,
+            Err(_) => return,
         };
-        let local_id = key.0;
 
-        if let Some((_, state)) = self.fids.remove(&local_id) {
+        if let Some(state) = self.bridge.remove(local_id) {
             let clunk_req = NpClunk {
                 fid: state.remote_fid,
             };
 
             // Best-effort clunk — ignore errors.
-            let _ = self.rt.block_on(state.worktree.clunk(&clunk_req));
+            let _ = self.bridge.rt().block_on(state.worktree.clunk(&clunk_req));
         }
     }
 }
@@ -452,29 +400,28 @@ impl Mount for RemoteRegistryMount {
 ///   `name_len(u32 LE) + name(utf8) + is_dir(u8) + size(u64 LE)`
 ///
 /// This mirrors the parse loop in `WorktreeClient::list_dir_path`.
+///
+/// (The model service uses a different format — packed 9P stats — which is
+/// shared in [`crate::services::ninep_bridge::parse_dir_stats`].)
 fn parse_worktree_dir_entries(data: &[u8]) -> Vec<DirEntry> {
     let mut entries = Vec::new();
     let mut cursor = 0;
 
     while cursor + 4 <= data.len() {
-        let name_len = u32::from_le_bytes(
-            data[cursor..cursor + 4].try_into().unwrap_or([0; 4]),
-        ) as usize;
+        let name_len =
+            u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap_or([0; 4])) as usize;
         cursor += 4;
         if cursor + name_len > data.len() {
             break;
         }
-        let name =
-            String::from_utf8_lossy(&data[cursor..cursor + name_len]).to_string();
+        let name = String::from_utf8_lossy(&data[cursor..cursor + name_len]).to_string();
         cursor += name_len;
         if cursor + 9 > data.len() {
             break;
         }
         let is_dir = data[cursor] != 0;
         cursor += 1;
-        let size = u64::from_le_bytes(
-            data[cursor..cursor + 8].try_into().unwrap_or([0; 8]),
-        );
+        let size = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap_or([0; 8]));
         cursor += 8;
 
         entries.push(DirEntry {

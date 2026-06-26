@@ -77,6 +77,56 @@ impl Drop for BootstrapManager {
     }
 }
 
+/// Resolve the local OS username exactly as the CLI presents it in `sub`.
+///
+/// Must stay in lockstep with `sign_challenge.rs::load_user_signing_key`
+/// (`$USER` → `$LOGNAME` → `"anonymous"`), so the identity the wizard registers
+/// matches the subject the CLI authenticates as.
+fn os_username() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "anonymous".to_owned())
+}
+
+/// Bind a user-signing-key public key to `username`, idempotently and
+/// collision-safely.
+///
+/// `add_pubkey` rejects a fingerprint that is already bound (to the same or a
+/// different user), so we resolve the current binding first:
+/// - already bound to `username` → no-op (the key is already recognized),
+/// - bound to a *different* user (e.g. an `anonymous` record left by a prior
+///   partial run) → re-point it: remove from the old user, add to `username`,
+/// - unbound → add it.
+///
+/// Re-pointing is the least-surprising behavior: there is exactly one local
+/// user-signing-key, so it should map to exactly one identity — the one the
+/// operator is setting up.
+async fn bind_user_signing_key(
+    store: &RocksDbUserStore,
+    username: &str,
+    vk: ed25519_dalek::VerifyingKey,
+) -> anyhow::Result<()> {
+    let fingerprint = crate::auth::user_store::pubkey_fingerprint(&vk);
+
+    match store.get_pubkey_user(&fingerprint).await? {
+        Some(existing) if existing == username => {
+            // Already bound to this user — nothing to do.
+            return Ok(());
+        }
+        Some(existing) => {
+            // Bound to a different (likely stale `anonymous`) user — re-point.
+            tracing::info!("Re-pointing user-signing-key from '{existing}' to '{username}'");
+            store.remove_pubkey(&existing, &fingerprint).await?;
+        }
+        None => {}
+    }
+
+    store
+        .add_pubkey(username, vk, Some("wizard".to_owned()))
+        .await?;
+    Ok(())
+}
+
 /// Returns true if this is the first run (no bootstrap completed yet).
 ///
 /// Used by the no-args entry point to decide between wizard and ShellClient.
@@ -148,31 +198,74 @@ impl BootstrapManager {
             )
     }
 
-    /// Register user identity in UserStore for the local OS user.
+    /// Register a user identity in UserStore and bind the CLI's user-signing-key
+    /// public key to it.
+    ///
+    /// The wizard has the local user-signing-key (the credential the CLI signs
+    /// auth challenges with), so any username it is asked to register — the OS
+    /// user (non-interactive) or an operator-entered name (interactive) — can be
+    /// bound to that key. Without the binding the server can never resolve the
+    /// CLI's signature back to a subject and falls back to `anonymous` (#438).
+    ///
+    /// Idempotent and collision-safe (see `bind_user_signing_key`).
     fn register_local_identity(&mut self, username: &str) {
-        if username != self.local_username().as_str() {
-            return;
-        }
         let credentials_dir = self.credentials_dir();
         let store = match RocksDbUserStore::open(&credentials_dir) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
                     username, ?credentials_dir,
-                    "Failed to load UserStore during bootstrap — user OAuth identity will not be registered: {e}"
+                    "Failed to load UserStore during bootstrap — user identity will not be registered: {e}"
                 );
                 return;
             }
         };
-        if self.rt.block_on(store.get_profile(username)).ok().flatten().is_some() {
-            return; // already registered
+
+        // Register the user record if it doesn't already exist. `register`
+        // overwrites pubkeys on an existing record, so only call it when absent.
+        if self.rt.block_on(store.get_profile(username)).ok().flatten().is_none() {
+            if let Err(e) = self.rt.block_on(store.register(username)) {
+                tracing::warn!(
+                    username,
+                    "Failed to register user identity in UserStore — user identity will not be registered: {e}"
+                );
+                return;
+            }
         }
-        if let Err(e) = self.rt.block_on(store.register(username)) {
+
+        // Load the user-signing-key from the SAME secrets dir the CLI uses, so
+        // the bound fingerprint matches the key the CLI signs with.
+        let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
+        let vk = match identity_store::load_or_generate_user_signing_key(&secrets_dir) {
+            Ok((_sk, vk)) => vk,
+            Err(e) => {
+                tracing::warn!(
+                    username, ?secrets_dir,
+                    "Failed to load user-signing-key — CLI signing key will not be bound to '{username}': {e}"
+                );
+                return;
+            }
+        };
+
+        if let Err(e) = self.bind_user_signing_key(&store, username, vk) {
             tracing::warn!(
                 username,
-                "Failed to register user identity in UserStore — user OAuth identity will not be registered: {e}"
+                "Failed to bind user-signing-key pubkey to '{username}': {e}"
             );
         }
+    }
+
+    /// Bind the user-signing-key public key to `username`.
+    ///
+    /// Blocking wrapper over [`bind_user_signing_key`] (the free async fn holds
+    /// the idempotency/collision logic and is unit-tested directly).
+    fn bind_user_signing_key(
+        &self,
+        store: &RocksDbUserStore,
+        username: &str,
+        vk: ed25519_dalek::VerifyingKey,
+    ) -> anyhow::Result<()> {
+        self.rt.block_on(bind_user_signing_key(store, username, vk))
     }
 
     /// Ensure the signing key is loaded.
@@ -454,7 +547,7 @@ impl WizardBackend for BootstrapManager {
     }
 
     fn local_username(&self) -> String {
-        "anonymous".to_owned()
+        os_username()
     }
 
     fn templates(&self) -> Vec<TemplateInfo> {
@@ -644,6 +737,14 @@ async fn do_bootstrap(
                     .join("credentials")
             });
 
+        // Local issuer URL stamped into service JWTs so they verify on the
+        // local IPC/AnySigner plane without tripping the #328 empty-`iss` gate.
+        // Must match the issuer the services' ClusterKeySource trusts
+        // (oauth.issuer_url(), the same value `cluster_key_source()` uses).
+        let local_issuer_url = crate::config::HyprConfig::load()
+            .map(|c| c.oauth.issuer_url())
+            .unwrap_or_default();
+
         // CA JWT signing key (purpose-derived for JWT signature separation).
         // Derived BEFORE writing ca-pubkey so we can store the JWT key's verifying key,
         // not the root key's verifying key. Services verify JWTs with the derived key.
@@ -692,7 +793,7 @@ async fn do_bootstrap(
             let service_vk = service_key.verifying_key();
 
             let jwt = crate::auth::service_jwt::issue_or_load_service_jwt(
-                &credentials_dir, service_name, &ca_jwt_key, &service_vk, now,
+                &credentials_dir, service_name, &ca_jwt_key, &service_vk, &local_issuer_url, now,
             )?;
             identity_store::write_service_jwt(&credentials_dir, service_name, &jwt)?;
 
@@ -715,4 +816,113 @@ async fn do_bootstrap(
 
     let _ = tx.send(BootstrapPoll::Done(steps));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{RocksDbUserStore, UserStore};
+    use tempfile::TempDir;
+
+    /// Replicates the register + bind sequence performed by
+    /// `register_local_identity` against a temp store/secrets dir, then asserts
+    /// the identity↔key binding the CLI relies on actually exists (#438).
+    #[tokio::test]
+    async fn register_and_bind_creates_identity_and_reverse_maps_pubkey() -> anyhow::Result<()> {
+        let creds = TempDir::new()?;
+        let secrets = TempDir::new()?;
+        let username = "alice";
+
+        // CLI's signing key lives in the secrets dir.
+        let (_sk, vk) =
+            identity_store::load_or_generate_user_signing_key(secrets.path())?;
+
+        let store = RocksDbUserStore::open(creds.path())?;
+        // Register (user did not exist yet) + bind, exactly like the wizard path.
+        store.register(username).await?;
+        bind_user_signing_key(&store, username, vk).await?;
+
+        // 1. UserStore has a record for the username.
+        assert!(
+            store.get_profile(username).await?.is_some(),
+            "expected a UserStore record for '{username}'"
+        );
+
+        // 2. The signing key's fingerprint reverse-maps to that username.
+        let fingerprint = crate::auth::user_store::pubkey_fingerprint(&vk);
+        assert_eq!(
+            store.get_pubkey_user(&fingerprint).await?,
+            Some(username.to_owned()),
+            "user-signing-key fingerprint must reverse-map to '{username}'"
+        );
+
+        Ok(())
+    }
+
+    /// Binding is idempotent (re-running the wizard) and re-points a key left
+    /// bound to a stale `anonymous` record from a prior partial run.
+    #[tokio::test]
+    async fn bind_is_idempotent_and_repoints_from_anonymous() -> anyhow::Result<()> {
+        let creds = TempDir::new()?;
+        let secrets = TempDir::new()?;
+        let (_sk, vk) =
+            identity_store::load_or_generate_user_signing_key(secrets.path())?;
+        let fingerprint = crate::auth::user_store::pubkey_fingerprint(&vk);
+
+        let store = RocksDbUserStore::open(creds.path())?;
+
+        // Simulate a prior partial run: key bound to "anonymous".
+        store.register("anonymous").await?;
+        bind_user_signing_key(&store, "anonymous", vk).await?;
+        assert_eq!(
+            store.get_pubkey_user(&fingerprint).await?,
+            Some("anonymous".to_owned())
+        );
+
+        // Wizard now registers the real user and binds — must re-point.
+        store.register("alice").await?;
+        bind_user_signing_key(&store, "alice", vk).await?;
+        assert_eq!(
+            store.get_pubkey_user(&fingerprint).await?,
+            Some("alice".to_owned()),
+            "key should be re-pointed from anonymous to alice"
+        );
+
+        // Re-running for the same user is a no-op (must not error/duplicate).
+        bind_user_signing_key(&store, "alice", vk).await?;
+        assert_eq!(
+            store.get_pubkey_user(&fingerprint).await?,
+            Some("alice".to_owned())
+        );
+        assert_eq!(
+            store.list_pubkeys("alice").await?.len(),
+            1,
+            "idempotent re-bind must not duplicate the pubkey"
+        );
+
+        Ok(())
+    }
+
+    /// `local_username()` (via `os_username`) returns the OS user — not the old
+    /// hardcoded "anonymous" — matching the `sub` the CLI presents.
+    #[test]
+    fn os_username_returns_user_env_not_anonymous() {
+        // Save/restore env to avoid cross-test contamination.
+        let prev_user = std::env::var("USER").ok();
+        let prev_logname = std::env::var("LOGNAME").ok();
+
+        std::env::set_var("USER", "alice");
+        std::env::remove_var("LOGNAME");
+        assert_eq!(os_username(), "alice");
+        assert_ne!(os_username(), "anonymous");
+
+        // Restore.
+        match prev_user {
+            Some(v) => std::env::set_var("USER", v),
+            None => std::env::remove_var("USER"),
+        }
+        if let Some(v) = prev_logname {
+            std::env::set_var("LOGNAME", v);
+        }
+    }
 }

@@ -271,6 +271,51 @@ pub(crate) fn is_primitive(type_name: &str) -> bool {
     hyprstream_rpc_build::schema::types::is_primitive_capnp_type(type_name)
 }
 
+/// Map a union-member field to the TypeScript type carried in the `data` slot.
+///
+/// Mirrors the per-variant `data` expression produced by the parser emitters:
+/// - `Void`              → `undefined`
+/// - scalars / `Bool`    → the TS scalar (`number` / `bigint` / `boolean`)
+/// - `Text`              → `string`
+/// - `Data`              → `Uint8Array`
+/// - `List(Text)`        → `string[]`
+/// - `List(Struct)`      → `Inner[]` (elements are parsed into objects)
+/// - `Option*` wrapper   → `T | undefined` (absence is `undefined`, never `null`)
+/// - struct              → `TypeName | null` (the parser returns `null` on a null pointer)
+///
+/// Keeping this aligned with the parser guarantees the typed discriminated union
+/// is sound against the runtime values callers actually receive. Shared by both
+/// the interface emitter (`interfaces.rs`) and the parser-result type aliases
+/// (`parsers.rs`).
+pub(crate) fn union_variant_data_type(f: &FieldDef) -> String {
+    let tn = f.type_name.as_str();
+    if tn == "Void" {
+        return "undefined".to_owned();
+    }
+    if tn.starts_with("List(") {
+        // capnp_to_ts_type already maps List(T) → T[].
+        return capnp_to_ts_type(tn);
+    }
+    // `is_primitive` already covers Text/Data (and Void/List); no extra checks.
+    if is_primitive(tn) {
+        return capnp_to_ts_type(tn);
+    }
+    // Option* wrapper structs encode absence as `undefined`
+    // (capnp_to_ts_type maps `OptionUint32` → `number | undefined`); they live in
+    // the pointer section but must NOT get the struct-pointer `| null` suffix.
+    if tn.starts_with("Option") {
+        return capnp_to_ts_type(tn);
+    }
+    // Struct (or enum) reference. Struct pointers can be null at runtime; enums
+    // are data-section and never null, but the only data-section non-scalar union
+    // payloads are enums, which `capnp_to_ts_type` maps to their type name.
+    if matches!(f.section, FieldSection::Pointer) {
+        format!("{} | null", capnp_to_ts_type(tn))
+    } else {
+        capnp_to_ts_type(tn)
+    }
+}
+
 /// Build a TypeScript array literal from an enum's variants (camelCase names as strings).
 ///
 /// Example output: `['active', 'inactive', 'pending']`

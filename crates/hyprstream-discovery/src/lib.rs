@@ -42,12 +42,13 @@ mod service;
 // Re-export key types
 pub use hyprstream_rpc::resolver::Resolver;
 pub use hyprstream_rpc::registry::SocketKind;
-pub use service::{AuthorizationProvider, DiscoveryService};
+pub use service::{AuthorizationProvider, DiscoveryService, RecordCarData, RecordResolver};
 
 // Re-export generated types that consumers need
 pub use generated::discovery_client::{
     DiscoveryClient, DiscoveryHandler, DiscoveryResponseVariant,
     ErrorInfo, ServiceList, ServiceSummary, ServiceEndpoints, EndpointInfo,
     PingInfo, AuthMetadata, AuthMetadataList, ServiceAnnouncement,
+    GetRecordRequest, RecordCar,
     dispatch_discovery, serialize_response,
 };

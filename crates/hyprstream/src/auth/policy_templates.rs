@@ -108,6 +108,24 @@ pub const SERVICE_BASE_POLICIES: &[ServicePolicyRule] = &[
     ServicePolicyRule { subject: "service:model", domain: "*", resource: "discovery:*", action: "*", effect: "allow" },
     ServicePolicyRule { subject: "service:oai", domain: "*", resource: "discovery:*", action: "*", effect: "allow" },
     ServicePolicyRule { subject: "service:worker", domain: "*", resource: "discovery:*", action: "*", effect: "allow" },
+    // #446: EVERY socket-served service announces its own QUIC endpoint to
+    // DiscoveryService on startup (the generic `factory.rs` announce hook). Now
+    // that those IPC callers resolve as their authoritative `service:<name>`
+    // identity (not `anonymous`), they need the least-privilege grant to write
+    // their OWN announcement. Scoped to `discovery:Announce` + `write` only
+    // (NOT `discovery:*`), so these services can register their endpoint but not
+    // mutate the rest of the discovery namespace. The services already granted
+    // broad `discovery:*` above (discovery/model/oai/worker) are unaffected.
+    ServicePolicyRule { subject: "service:mcp", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
+    ServicePolicyRule { subject: "service:metrics", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
+    ServicePolicyRule { subject: "service:notification", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
+    ServicePolicyRule { subject: "service:registry", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
+    ServicePolicyRule { subject: "service:tui", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
+    ServicePolicyRule { subject: "service:oauth", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
+    ServicePolicyRule { subject: "service:event", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
+    ServicePolicyRule { subject: "service:streams", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
+    ServicePolicyRule { subject: "service:flight", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
+    ServicePolicyRule { subject: "service:policy", domain: "*", resource: "discovery:Announce", action: "write", effect: "allow" },
     // NOTE: Federation (`federation:register` resource) is deny-by-default.
     // This is the single, atproto-style trust gate that governs both:
     //   - third-party clients registering via CIMD (Client ID Metadata
