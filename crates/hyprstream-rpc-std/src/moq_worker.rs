@@ -58,10 +58,25 @@ use hyprstream_9p::dma::DmaTransport;
 // ─── Frame envelope helpers ──────────────────────────────────────────────────
 
 /// Encode a single DMA frame: `[2: track_len][track][4: payload_len][payload]`.
+///
+/// The track-length prefix is a `u16`; a track name longer than `u16::MAX`
+/// would silently truncate the length header and desync `decode_frame` for the
+/// rest of the stream. Track names are short by construction (moq track paths),
+/// so we clamp defensively and drop the over-long frame rather than corrupt it.
 pub fn encode_frame(track: &str, payload: &[u8]) -> Vec<u8> {
     let t = track.as_bytes();
+    let track_len = match u16::try_from(t.len()) {
+        Ok(len) => len,
+        Err(_) => {
+            web_sys::console::error_1(
+                &format!("[moq-worker] track name too long ({} bytes), dropping frame", t.len())
+                    .into(),
+            );
+            return Vec::new();
+        }
+    };
     let mut out = Vec::with_capacity(2 + t.len() + 4 + payload.len());
-    out.extend_from_slice(&(t.len() as u16).to_le_bytes());
+    out.extend_from_slice(&track_len.to_le_bytes());
     out.extend_from_slice(t);
     out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     out.extend_from_slice(payload);
@@ -218,10 +233,11 @@ pub async fn moq_worker_main(sab: JsValue, reach_json: String) {
     // Worker is the server endpoint (reads on chan0, writes on chan1).
     let dma = DmaTransport::new(&sab, false);
 
-    web_sys::console::log_1(
-        &format!("[moq-worker] started, reach: {}", &reach_json[..reach_json.len().min(120)])
-            .into(),
-    );
+    // Truncate on a char boundary, not a raw byte index — slicing mid-UTF-8
+    // (an internationalized host or non-ASCII cert encoding) would panic and
+    // kill the worker before the DMA channel is established.
+    let reach_preview: String = reach_json.chars().take(120).collect();
+    web_sys::console::log_1(&format!("[moq-worker] started, reach: {}", reach_preview).into());
 
     // Parse reach config.
     let reach: serde_json::Value = match serde_json::from_str(&reach_json) {

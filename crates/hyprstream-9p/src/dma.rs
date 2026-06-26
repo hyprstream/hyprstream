@@ -188,7 +188,11 @@ impl DmaTransport {
         // Advance head
         self.atomic_store(self.write_head_idx, (head + total) as i32);
         self.atomic_add(self.write_msg_count_idx, 1);
-        self.atomic_notify(self.read_tail_idx); // wake reader
+        // Notify the index we just advanced: a peer reader blocked in
+        // Atomics.wait watches the head it consumes from (this same physical
+        // SAB slot), not the tail. Waking read_tail_idx would signal the wrong
+        // waiter and the reader would never wake under a future waitAsync path.
+        self.atomic_notify(self.write_head_idx); // wake reader waiting on this head
     }
 
     /// Read a length-prefixed message from the ring buffer.
@@ -233,7 +237,10 @@ impl DmaTransport {
             (tail + HEADER_SIZE + msg_len) as i32,
         );
         self.atomic_add(self.read_msg_count_idx, -1);
-        self.atomic_notify(self.write_head_idx); // wake writer
+        // Notify the index we just advanced: a peer writer blocked waiting for
+        // space watches the tail it frees (this same physical SAB slot), not
+        // the head. (Mirror of the write_message notify.)
+        self.atomic_notify(self.read_tail_idx); // wake writer waiting on this tail
 
         Some(data)
     }
