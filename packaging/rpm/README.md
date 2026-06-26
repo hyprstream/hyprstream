@@ -35,7 +35,12 @@ sudo dnf install --setopt=install_weak_deps=False hyprstream
 ```
 
 - NVIDIA: `cuda-toolkit-12-8` (driver ≥ 535) or `cuda-toolkit-13-0` (driver ≥ 555)
-- AMD: `rocm >= 7.1` (gfx1151 needs ≥ 7.2)
+- AMD: `rocm >= 7.2` (gfx1151 support)
+
+Note: this RPM bundles the **CPU** libtorch runtime (PyTorch 2.10.0). The weak
+deps prepare a host for GPU use and let an operator pin/override the vendor
+stack; a GPU-accelerated libtorch build is a separate variant (see the ROCm
+AppImage) and not produced by this spec yet.
 
 ## Notes
 

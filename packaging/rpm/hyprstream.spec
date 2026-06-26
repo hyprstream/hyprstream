@@ -1,16 +1,28 @@
 # RPM spec file for hyprstream
 #
-# Build:   rpmbuild -ba packaging/rpm/hyprstream.spec
+# Build:   packaging/rpm/build-rpm.sh   (wrapper that stages version + tarball)
+#          or: rpmbuild -ba packaging/rpm/hyprstream.spec
 # CI:      see .github/workflows/rpm.yml (release publish + PR build/install check)
 #
 # Notes:
 #   * Uses the existing Cargo build system (build.rs handles codegen).
+#   * libtorch is fetched at build time via the `download-libtorch` feature
+#     (PyTorch 2.10.0 CPU). The hyprstream binary links it as a hard DT_NEEDED
+#     dependency (libtorch_cpu.so, libc10.so), so the .so files are bundled into
+#     a private libdir and the binary's RUNPATH is set to find them. Without this
+#     the binary cannot even exec.
 #   * Forces openssl-sys to link the SYSTEM openssl-devel. rpmbuild exports
 #     CROSS_COMPILE, which makes openssl-sys believe it is cross-compiling and
 #     build OpenSSL from source (fails on missing perl-FindBin). We unset it.
 #   * GPU stacks (CUDA / ROCm) are declared as weak deps (Recommends:) so a user
 #     can override with a locally-installed version, or exclude them entirely with
 #     --setopt=install_weak_deps=False. They require external vendor repos.
+
+# Bundled libtorch is prebuilt and has no debug sources; skip debuginfo packaging.
+%global debug_package %{nil}
+
+# Private libdir for the bundled libtorch shared objects.
+%global torchlibdir %{_libdir}/%{name}
 
 Name:           hyprstream
 Version:        0.5.0
@@ -24,8 +36,11 @@ Source0:        %{url}/archive/v%{version}/hyprstream-%{version}.tar.gz
 ExclusiveArch:  x86_64 aarch64
 
 # Build dependencies
-BuildRequires:  cargo
-BuildRequires:  rust
+#
+# NOTE: the Rust toolchain (cargo/rustc) is intentionally NOT a BuildRequires.
+# It is provided on PATH via rustup (distro rust is often too old, and CI uses
+# rustup). rpmbuild checks BuildRequires against the rpm database, which would
+# not see a rustup toolchain. build-rpm.sh guards that cargo is on PATH.
 BuildRequires:  gcc
 BuildRequires:  gcc-c++
 BuildRequires:  cmake
@@ -34,9 +49,9 @@ BuildRequires:  pkgconfig
 BuildRequires:  openssl-devel
 BuildRequires:  systemd-devel
 BuildRequires:  capnproto
-# openssl-sys may still probe for perl; provide it so a source fallback cannot hang the build
-BuildRequires:  perl-interpreter
-BuildRequires:  perl-FindBin
+BuildRequires:  patchelf
+# NOTE: perl is deliberately NOT required. openssl-sys would only invoke perl
+# for a from-source OpenSSL build, which OPENSSL_NO_VENDOR=1 (below) disables.
 
 # Runtime dependencies
 Requires:       git
@@ -52,7 +67,7 @@ Requires:       ca-certificates
 #   * cuda-toolkit-13-0 : requires NVIDIA driver >= 555
 Recommends:     (cuda-toolkit-12-8 or cuda-toolkit-13-0)
 # AMD ROCm (libtorch is built against ROCm 7.x; gfx1151 needs >= 7.2)
-Recommends:     rocm >= 7.1
+Recommends:     rocm >= 7.2
 
 %description
 HyprStream is an agentic cloud infrastructure for applications that learn,
@@ -68,7 +83,7 @@ Features:
 - Optional GPU acceleration (NVIDIA CUDA, AMD ROCm)
 
 Backend support:
-- CPU: all supported architectures
+- CPU: bundled (PyTorch/libtorch CPU runtime)
 - CUDA: requires the NVIDIA vendor repository
 - ROCm: requires the AMD vendor repository
 
@@ -83,6 +98,12 @@ git add -A
 git commit -q -m "RPM build"
 
 %build
+# rpmbuild injects RUSTFLAGS with -Cdebuginfo=2 for the whole dependency graph
+# (arrow/datafusion/tonic/libtorch ...). We do not ship a -debuginfo subpackage
+# (%%debug_package %%{nil}), so that debug info is pure bloat -- it inflated the
+# build tree past 11 GB and exhausted disk. Build without debuginfo.
+export RUSTFLAGS="-Cdebuginfo=0"
+
 # Force openssl-sys to use the system library instead of a vendored source build.
 # Unsetting CROSS_COMPILE is the critical step: rpmbuild sets it, which otherwise
 # triggers openssl-sys's from-source path.
@@ -93,13 +114,29 @@ export OPENSSL_DIR=%{_prefix}
 export OPENSSL_LIB_DIR=%{_libdir}
 export OPENSSL_INCLUDE_DIR=%{_includedir}
 
-# CPU build. libtorch is fetched at build time via the download-libtorch feature.
+# CPU build. libtorch (PyTorch 2.10.0 CPU) is fetched at build time via the
+# download-libtorch feature and extracted under target/.../torch-sys-*/out.
 env -u CROSS_COMPILE cargo build --release \
     --features download-libtorch,otel,gittorrent,xet
 
 %install
 install -d %{buildroot}%{_bindir}
 install -m 0755 target/release/hyprstream %{buildroot}%{_bindir}/hyprstream
+
+# --- Bundle the libtorch runtime the binary links against -------------------
+# download-libtorch extracts libtorch under the torch-sys build output dir.
+torch_lib_dir="$(find target -type d -path '*/torch-sys-*/out/libtorch/libtorch/lib' | head -1)"
+if [ -z "$torch_lib_dir" ]; then
+    echo "ERROR: bundled libtorch lib dir not found under target/" >&2
+    exit 1
+fi
+install -d %{buildroot}%{torchlibdir}
+# Copy the shared objects (follow into any subdirs the runtime needs).
+cp -a "$torch_lib_dir"/*.so* %{buildroot}%{torchlibdir}/
+
+# Point the binary at the bundled libtorch. RUNPATH into a private %{_libdir}/%{name}
+# subdir is accepted by check-rpaths (it is not a standard library search path).
+patchelf --set-rpath %{torchlibdir} %{buildroot}%{_bindir}/hyprstream
 
 # Documentation
 install -d %{buildroot}%{_docdir}/%{name}
@@ -108,9 +145,10 @@ install -m 0644 README.md %{buildroot}%{_docdir}/%{name}/README.md
 cat > %{buildroot}%{_docdir}/%{name}/GPU-SETUP.md << 'EOF'
 # GPU Backend Setup for HyprStream
 
-GPU acceleration is optional and requires an external vendor repository plus a
-matching driver. The RPM declares these as weak dependencies so they can be
-overridden with a locally-installed version, or skipped entirely:
+The CPU backend (libtorch) is bundled and works out of the box. GPU acceleration
+is optional and requires an external vendor repository plus a matching driver.
+The RPM declares these as weak dependencies so they can be overridden with a
+locally-installed version, or skipped entirely:
 
     sudo dnf install --setopt=install_weak_deps=False hyprstream
 
@@ -128,17 +166,22 @@ overridden with a locally-installed version, or skipped entirely:
 EOF
 
 %check
-# Smoke-check the built binary
-target/release/hyprstream --version
+# Smoke-check the built binary. The install-time RUNPATH points at the final
+# (not-yet-installed) path, so resolve libtorch from the buildroot for this check.
+LD_LIBRARY_PATH=%{buildroot}%{torchlibdir} \
+    %{buildroot}%{_bindir}/hyprstream --version
 
 %files
 %license LICENSE-AGPLV3 LICENSE-MIT
 %doc %{_docdir}/%{name}/README.md
 %doc %{_docdir}/%{name}/GPU-SETUP.md
 %{_bindir}/hyprstream
+%dir %{torchlibdir}
+%{torchlibdir}/*.so*
 
 %changelog
-* Thu Jun 26 2026 hyprstream maintainers <dev@hyprstream.com> - 0.5.0-1
+* Fri Jun 26 2026 hyprstream maintainers <dev@hyprstream.com> - 0.5.0-1
 - Initial RPM packaging wired into CI (release publish + Fedora/Rocky build-install check)
+- Bundle libtorch CPU runtime and set RUNPATH (binary hard-links libtorch_cpu.so)
 - Resolve openssl-sys source-build hang under rpmbuild (unset CROSS_COMPILE)
 - GPU stacks declared as version-pinned weak deps (Recommends) for local override

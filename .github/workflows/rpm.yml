@@ -47,11 +47,13 @@ jobs:
           # `dnf install curl` errors with a curl/curl-minimal file conflict.
           # The curl binary is already present (curl-minimal on Rocky, curl on
           # Fedora) and is used by the rustup step below.
+          # patchelf: set the binary RUNPATH to the bundled libtorch (see spec).
+          # perl is intentionally absent: OPENSSL_NO_VENDOR=1 disables the only
+          # openssl-sys code path that would invoke it.
           $PM install -y --allowerasing \
             rpm-build rpmdevtools \
             gcc gcc-c++ cmake make pkgconfig \
-            openssl-devel systemd-devel capnproto \
-            perl-interpreter perl-FindBin \
+            openssl-devel systemd-devel capnproto patchelf \
             git git-lfs ca-certificates \
             tar gzip findutils which
 
@@ -69,6 +71,15 @@ jobs:
 
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # Cache the cargo registry + git deps (notably the tch-rs git dependency)
+      # to cut PR build time. rpmbuild compiles in ~/rpmbuild/BUILD with its own
+      # target dir, so target-artifact caching does not apply here.
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: rpm-${{ matrix.distro.name }}
+          cache-targets: false
 
       - name: Resolve version
         id: ver
@@ -93,12 +104,17 @@ jobs:
       - name: Install the RPM and verify it runs
         run: |
           set -eux
-          # Exercise the weak-dep override path: GPU stacks must NOT be required.
+          # Weak-dep contract: GPU stacks are Recommends, never hard Requires.
+          # Assert on the package file BEFORE install (vendor repos aren't configured).
+          rpm -qp --requires   "$RPM" | grep -Eiq 'cuda-toolkit|^rocm' && exit 1 || true
+          rpm -qp --recommends "$RPM" | grep -Eiq 'cuda-toolkit' || { echo "missing CUDA recommend"; exit 1; }
+          rpm -qp --recommends "$RPM" | grep -Eiq 'rocm'         || { echo "missing ROCm recommend"; exit 1; }
+
+          # Install with weak deps disabled: must succeed without any GPU stack.
           dnf install -y --setopt=install_weak_deps=False "$RPM"
-          hyprstream --version
           rpm -q hyprstream
-          # Confirm CUDA/ROCm were not pulled in as hard requirements
-          ! rpm -q --requires hyprstream | grep -Eiq 'cuda-toolkit|^rocm'
+          # Bundled libtorch must resolve via RUNPATH (no LD_LIBRARY_PATH set here).
+          hyprstream --version
 
       - name: Upload RPM artifact
         uses: actions/upload-artifact@v4

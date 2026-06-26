@@ -12,6 +12,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SPEC="$SCRIPT_DIR/hyprstream.spec"
 
+# The Rust toolchain is provided on PATH (rustup), not as an rpm BuildRequires.
+# Fail early with a clear message if it is missing.
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "ERROR: cargo not found on PATH. Install the Rust toolchain (e.g. rustup) first." >&2
+    exit 1
+fi
+
 # --- Resolve version ---------------------------------------------------------
 VERSION="${1:-}"
 if [[ -z "$VERSION" ]]; then
