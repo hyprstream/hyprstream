@@ -1221,30 +1221,56 @@ struct Payload {
 }
 "#;
 
-    fn parse_union_schema() -> ParsedSchema {
-        let tmp =
-            std::env::temp_dir().join(format!("hyprstream_ts_union_{}", std::process::id()));
+    /// A service-shaped schema: `{Pascal}Request`/`{Pascal}Response` unions so the
+    /// CGR reader populates `response_struct` and the top-level `generate_parsers`
+    /// path runs.
+    const SERVICE_SCHEMA: &str = r#"
+@0xbeefcafebeefcafe;
+
+struct PayloadRequest {
+  union {
+    ping @0 :Void;
+    echo @1 :Text;
+  }
+}
+
+struct PayloadResponse {
+  seq @0 :UInt32;
+  union {
+    ok @1 :Text;
+    fail @2 :UInt64;
+  }
+}
+"#;
+
+    /// Compile `schema_src` to a CGR keyed on `name` and parse it. Uses a
+    /// per-(pid, name) temp dir so parallel tests don't collide.
+    fn parse_schema(name: &str, schema_src: &str) -> ParsedSchema {
+        let tmp = std::env::temp_dir().join(format!(
+            "hyprstream_ts_{name}_{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&tmp).expect("create temp dir");
 
-        let capnp_path = tmp.join("payload.capnp");
-        std::fs::write(&capnp_path, UNION_SCHEMA).expect("write payload.capnp");
+        let capnp_path = tmp.join(format!("{name}.capnp"));
+        std::fs::write(&capnp_path, schema_src).expect("write capnp");
 
-        let cgr_path = tmp.join("payload.cgr");
+        let cgr_path = tmp.join(format!("{name}.cgr"));
         capnpc::CompilerCommand::new()
             .src_prefix(&tmp)
             .file(&capnp_path)
             .raw_code_generator_request_path(&cgr_path)
             .run()
-            .expect("compile payload.capnp to CGR");
+            .expect("compile capnp to CGR");
 
-        let parsed = parse_from_cgr_path(Path::new(&cgr_path), "payload").expect("parse CGR");
+        let parsed = parse_from_cgr_path(Path::new(&cgr_path), name).expect("parse CGR");
         let _ = std::fs::remove_dir_all(&tmp);
         parsed
     }
 
     #[test]
     fn struct_parser_emits_typed_discriminated_union() {
-        let schema = parse_union_schema();
+        let schema = parse_schema("structfix", UNION_SCHEMA);
         let mut out = String::new();
         super::generate_struct_parsers(&mut out, &schema);
 
@@ -1291,6 +1317,44 @@ struct Payload {
         assert!(
             out.contains("variant: 'unknown' as const"),
             "default return missing `as const`:\n{out}"
+        );
+    }
+
+    #[test]
+    fn top_level_response_parser_emits_typed_discriminated_union() {
+        let schema = parse_schema("payload", SERVICE_SCHEMA);
+        let mut out = String::new();
+        super::generate_parsers(&mut out, "payload", &schema);
+
+        // Top-level `{Service}ResponseResult` is now a typed union, not the
+        // `interface … { variant: string; data: unknown }` stub.
+        assert!(
+            out.contains("export type PayloadResponseResult ="),
+            "expected a typed union alias, got:\n{out}"
+        );
+        assert!(
+            !out.contains("variant: string;"),
+            "must not emit the degenerate `variant: string` stub:\n{out}"
+        );
+        assert!(
+            !out.contains("data: unknown;"),
+            "must not emit the degenerate `data: unknown` stub:\n{out}"
+        );
+        assert!(
+            out.contains("| { seq: number; variant: 'ok'; data: string }"),
+            "Text arm shape wrong:\n{out}"
+        );
+        assert!(
+            out.contains("| { seq: number; variant: 'fail'; data: bigint }"),
+            "scalar arm shape wrong:\n{out}"
+        );
+        assert!(
+            out.contains("| { seq: number; variant: 'unknown'; data: null };"),
+            "fallback arm shape wrong:\n{out}"
+        );
+        assert!(
+            out.contains("variant: 'ok' as const"),
+            "variant return missing `as const`:\n{out}"
         );
     }
 }
