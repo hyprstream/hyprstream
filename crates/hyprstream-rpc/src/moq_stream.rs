@@ -107,11 +107,6 @@ pub struct NodeStreamReach {
     pub server_name: String,
     /// Acceptable leaf-cert SHA-256 pins (self-signed mesh; rotation = multiple).
     pub cert_hashes: Vec<[u8; 32]>,
-    /// The node's own iroh `EndpointId` (Ed25519 public key, 32 bytes) when the
-    /// iroh substrate is bound (#357). `None` when iroh is disabled / unbound —
-    /// the node then advertises the Quic reach only. Native peers prefer this
-    /// direct, NAT-traversing, pkarr-discoverable reach (see [`producer_reach`]).
-    pub iroh_node_id: Option<[u8; 32]>,
 }
 
 /// Register the node's network-routable moq reach (idempotent — first wins).

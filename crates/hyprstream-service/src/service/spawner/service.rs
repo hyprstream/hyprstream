@@ -175,11 +175,10 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                         addr: advertise_addr,
                         server_name: qc.server_name.clone(),
                         cert_hashes: vec![pin],
-                        // The iroh node_id is registered separately once the iroh
-                        // substrate binds (it is not known at the QUIC-bind point);
-                        // see init_global_iroh_node_id below (#357).
-                        iroh_node_id: None,
                     },
+                    // The iroh node_id is registered separately once the iroh
+                    // substrate binds (it is not known at the QUIC-bind point);
+                    // see init_global_iroh_node_id below (#357).
                 );
                 if let Some(cb) = qc.on_quic_bound.take() {
                     cb(service_name.clone(), advertise_addr, qc.server_name.clone());

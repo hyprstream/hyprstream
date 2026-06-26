@@ -2481,7 +2481,6 @@ mod tests {
             addr,
             server_name: "localhost".to_owned(),
             cert_hashes: vec![[0x11u8; 32]],
-            iroh_node_id: None,
         });
         let reach = producer_reach();
         assert!(
