@@ -22,8 +22,6 @@ deny = [
     { name = "zeromq-src", reason = "ZMQ fully removed in #138" },
 ]
 
-warn = []
-
 [licenses]
 # Minimum confidence threshold for license detection.
 confidence-threshold = 0.8
