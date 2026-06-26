@@ -1,6 +1,6 @@
 //! Generate TypeScript interfaces from Cap'n Proto struct and enum definitions.
 
-use hyprstream_rpc_build::schema::types::{EnumDef, FieldDef, FieldSection, ParsedSchema, StructDef};
+use hyprstream_rpc_build::schema::types::{EnumDef, FieldSection, ParsedSchema, StructDef};
 use hyprstream_rpc_build::util::to_camel_case;
 
 use super::capnp_to_ts_type;
@@ -55,7 +55,7 @@ fn emit_struct_interface(out: &mut String, s: &StructDef) {
                 out.push_str(&format!(
                     "  | {{ variant: '{}'; data: {} }}\n",
                     f.name,
-                    union_variant_data_type(f)
+                    super::union_variant_data_type(f)
                 ));
             }
             // Fallback arm matching the parser's `default` case.
@@ -88,39 +88,4 @@ fn emit_struct_interface(out: &mut String, s: &StructDef) {
         ));
     }
     out.push_str("}\n\n");
-}
-
-/// Map a union-member field to the TypeScript type carried in the `data` slot.
-///
-/// Mirrors the per-variant `data` expression produced by the parser emitters:
-/// - `Void`              → `undefined`
-/// - scalars / `Bool`    → the TS scalar (`number` / `bigint` / `boolean`)
-/// - `Text`              → `string`
-/// - `Data`              → `Uint8Array`
-/// - `List(Text)`        → `string[]`
-/// - `List(Struct)`      → `Inner[]` (elements are parsed into objects)
-/// - struct              → `TypeName | null` (the parser returns `null` on a null pointer)
-///
-/// Keeping this aligned with the parser guarantees the typed discriminated union
-/// is sound against the runtime values callers actually receive.
-fn union_variant_data_type(f: &FieldDef) -> String {
-    let tn = f.type_name.as_str();
-    if tn == "Void" {
-        return "undefined".to_owned();
-    }
-    if tn.starts_with("List(") {
-        // capnp_to_ts_type already maps List(T) → T[].
-        return capnp_to_ts_type(tn);
-    }
-    if super::is_primitive(tn) || tn == "Text" || tn == "Data" {
-        return capnp_to_ts_type(tn);
-    }
-    // Struct (or enum) reference. Struct pointers can be null at runtime; enums
-    // are data-section and never null, but the only data-section non-scalar union
-    // payloads are enums, which `capnp_to_ts_type` maps to their type name.
-    if matches!(f.section, FieldSection::Pointer) {
-        format!("{} | null", capnp_to_ts_type(tn))
-    } else {
-        capnp_to_ts_type(tn)
-    }
 }
