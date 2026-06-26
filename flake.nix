@@ -38,6 +38,11 @@
           inherit (pkgs) lib stdenv fetchurl unzip autoAddDriverRunpath patchelf zlib;
         };
 
+        # Package version, read from the hyprstream crate's Cargo.toml so the Nix
+        # package version always tracks the source of truth (avoids drift).
+        cargoToml = builtins.fromTOML (builtins.readFile ./crates/hyprstream/Cargo.toml);
+        version = cargoToml.package.version;
+
         # Rust toolchain from fenix (stable channel)
         rustToolchain = fenix.packages.${system}.stable.toolchain;
 
@@ -77,7 +82,7 @@
         commonArgs = {
           inherit src cargoVendorDir;
           pname = "hyprstream";
-          version = "0.3.0-rc1";
+          inherit version;
 
           nativeBuildInputs = with pkgs; [
             pkg-config
