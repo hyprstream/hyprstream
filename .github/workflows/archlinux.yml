@@ -9,6 +9,8 @@ on:
     branches: [ "main" ]
     paths:
       - 'archlinux/**'
+  release:
+    types: [published]
 
 jobs:
   pkgbuild:
