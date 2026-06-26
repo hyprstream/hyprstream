@@ -76,12 +76,6 @@ expression = "Apache-2.0"
 license-files = []
 
 [[licenses.clarify]]
-name = "chat-core"
-version = "*"
-expression = "Apache-2.0"
-license-files = []
-
-[[licenses.clarify]]
 name = "chunk_cache"
 version = "*"
 expression = "Apache-2.0"
