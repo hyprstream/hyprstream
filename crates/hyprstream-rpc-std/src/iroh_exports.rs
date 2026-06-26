@@ -14,7 +14,7 @@
 //!          irohResolvePkarrRelayUrl } from 'hyprstream-rpc-std';
 //!
 //! // Generate a fresh browser identity.
-//! const peer = IrohPeer.new();
+//! const peer = new IrohPeer();
 //! console.log("NodeId (z32):", peer.nodeIdZ32());
 //! console.log("did:key:", peer.didKey());
 //!
