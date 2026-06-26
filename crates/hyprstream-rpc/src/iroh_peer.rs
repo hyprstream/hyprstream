@@ -96,49 +96,35 @@ impl Default for BrowserIrohPeer {
 // ============================================================================
 // did:key ↔ NodeId conversions
 // ============================================================================
+//
+// The actual `did:key` (Ed25519) codec lives in the cross-target
+// [`crate::did_key`] module — the SAME implementation the native `did_web`
+// resolver uses (#475). An iroh NodeId IS a 32-byte Ed25519 public key, so the
+// NodeId ⇄ did:key mapping is exactly the Ed25519 ⇄ did:key codec. Delegating
+// here keeps the multicodec constant and the DID-URL fragment/query stripping in
+// one place so the native and wasm32 paths can never drift.
 
 /// Convert a 32-byte iroh NodeId to a `did:key:z6Mk...` DID.
 ///
-/// Encodes the pubkey with multicodec prefix `0xed 0x01` (ed25519-pub) in
-/// base58btc, then prepends `did:key:z`.
+/// Thin wasm32 alias for [`crate::did_key::ed25519_to_did_key`] (the NodeId is
+/// the Ed25519 public key).
 pub fn did_key_from_node_id(node_id_bytes: &[u8; 32]) -> String {
-    let mut payload = Vec::with_capacity(34);
-    payload.push(0xed); // multicodec ed25519-pub high byte (varint)
-    payload.push(0x01); // multicodec ed25519-pub low byte
-    payload.extend_from_slice(node_id_bytes);
-    let encoded = bs58::encode(&payload).into_string();
-    format!("did:key:z{encoded}")
+    crate::did_key::ed25519_to_did_key(node_id_bytes)
 }
 
 /// Extract the raw 32-byte NodeId from a `did:key:z6Mk...` DID.
 ///
-/// The `did:key` spec encodes ed25519 keys as multibase base58btc (`z` prefix)
-/// with the `0xed 0x01` multicodec prefix. The 32 bytes following the
-/// multicodec prefix are the iroh `EndpointId`.
+/// Thin wasm32 alias for [`crate::did_key::did_key_to_ed25519`]. The 32 decoded
+/// bytes are the iroh `EndpointId`. Unlike the previous local copy, this strips a
+/// DID URL fragment / query (`did:key:z6Mk…#z6Mk…`) before decoding, matching the
+/// native `did_web` behavior.
 ///
 /// # Errors
 ///
 /// Returns an error if the DID is not base58btc, not an ed25519 key, or
 /// malformed.
 pub fn node_id_from_did_key(did: &str) -> Result<[u8; 32]> {
-    if !did.starts_with("did:key:z") {
-        return Err(anyhow!(
-            "did:key must use base58btc multibase (z-prefix), got: {did}"
-        ));
-    }
-    let encoded = &did["did:key:z".len()..];
-    let decoded = bs58::decode(encoded)
-        .into_vec()
-        .map_err(|e| anyhow!("base58btc decode failed: {e}"))?;
-
-    if decoded.len() < 34 || decoded[0] != 0xed || decoded[1] != 0x01 {
-        return Err(anyhow!(
-            "did:key is not an ed25519 key (expected multicodec 0xed01): {did}"
-        ));
-    }
-    decoded[2..34]
-        .try_into()
-        .map_err(|_| anyhow!("truncated did:key pubkey"))
+    crate::did_key::did_key_to_ed25519(did)
 }
 
 // ============================================================================
