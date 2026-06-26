@@ -25,9 +25,6 @@ deny = [
 [licenses]
 # Minimum confidence threshold for license detection.
 confidence-threshold = 0.8
-# xet-core internal crates (huggingface/xet-core, git-xet-v0.2.0) have no per-crate
-# license fields; root repo is Apache-2.0. Allow rather than listing ~18 exceptions.
-unlicensed = "allow"
 allow = [
     "MIT",
     "Apache-2.0",
@@ -44,6 +41,117 @@ allow = [
     "BSL-1.0",    # Boost Software License (permissive)
     "Unlicense",  # public domain equivalent (permissive)
 ]
+
+# huggingface/xet-core (tag git-xet-v0.2.0) internal workspace crates don't
+# declare `license` in their per-crate Cargo.toml; the root repo is Apache-2.0.
+# Clarify each crate explicitly so cargo-deny knows the license is asserted.
+[[licenses.clarify]]
+name = "api_client"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "cas_client"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "cas_object"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "cas_types"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "ch-config"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "chat-core"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "chunk_cache"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "data"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "deduplication"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "error_printer"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "file_utils"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "hub_client"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "mdb_shard"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "merklehash"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "progress_tracking"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "utils"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "xet_config"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "xet_runtime"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
 
 [sources]
 unknown-registry = "warn"
