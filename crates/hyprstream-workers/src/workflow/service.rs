@@ -732,11 +732,25 @@ impl WorkflowHandler for WorkflowService {
         _request_id: u64,
         sub_id: &str,
     ) -> AnyhowResult<WorkflowResponseVariant> {
-        let removed = {
+        let removed_sub = {
             let mut subs = self.subscriptions.write().await;
-            subs.remove(sub_id).is_some()
+            subs.remove(sub_id)
         };
-        if removed {
+        if let Some(sub) = removed_sub {
+            // Keep repo_workflows in sync: handle_subscribe pushes the same
+            // subscription into the repo bucket, so unsubscribe must remove it
+            // there too (otherwise a dead entry leaks).
+            if let Some(repo_id) = repo_id_from_workflow_id(&sub.workflow_id) {
+                let mut repo_workflows = self.repo_workflows.write().await;
+                if let Some(list) = repo_workflows.get_mut(repo_id) {
+                    if let Some(pos) = list.iter().position(|s| s.workflow_id == sub.workflow_id) {
+                        list.remove(pos);
+                    }
+                    if list.is_empty() {
+                        repo_workflows.remove(repo_id);
+                    }
+                }
+            }
             tracing::info!(sub_id = %sub_id, "Unsubscribed");
         } else {
             tracing::debug!(sub_id = %sub_id, "Unsubscribe: subscription not found");
