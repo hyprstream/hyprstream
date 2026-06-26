@@ -197,6 +197,21 @@ pub struct StreamContext {
     /// relay). Set to `Only` for an anonymized, relay-only stream, or `Override`
     /// for per-tenant relay isolation.
     relay_choice: crate::moq_stream::RelayChoice,
+    /// Per-stream reach inputs — the node/server's iroh + QUIC base reach (#384).
+    ///
+    /// Captured into the context at construction so [`reach`](Self::reach) builds
+    /// the `StreamInfo.reach` from THIS field, never re-reading the process-global
+    /// `OnceLock`s on every call. This is what makes heterogeneous per-server
+    /// reach work: a [`StreamChannel`] threaded with an explicit
+    /// [`ProducerReachConfig`](crate::moq_stream::ProducerReachConfig) via
+    /// [`StreamChannel::with_reach_config`] populates this so the base (iroh/QUIC)
+    /// reach is per-stream too, not just `relay_choice`.
+    ///
+    /// When no explicit config is threaded, [`from_dh`](Self::from_dh) seeds it
+    /// from [`global_reach_config`](crate::moq_stream::global_reach_config) — a
+    /// one-time per-stream snapshot (the documented compat source), not a
+    /// per-`reach()`-call global read.
+    reach_config: crate::moq_stream::ProducerReachConfig,
 }
 
 impl StreamContext {
@@ -217,6 +232,10 @@ impl StreamContext {
             cancel_token: CancellationToken::new(),
             qos: crate::stream_info::StreamOpt::default(),
             relay_choice: crate::moq_stream::RelayChoice::default(),
+            // No DH/server context here (notification + standalone TUI paths,
+            // which never call `reach()`); default to an empty reach config. A
+            // networked producer threads a real one via `with_reach_config`.
+            reach_config: crate::moq_stream::ProducerReachConfig::default(),
         }
     }
 
@@ -254,6 +273,13 @@ impl StreamContext {
             cancel_token: CancellationToken::new(),
             qos: crate::stream_info::StreamOpt::default(),
             relay_choice: crate::moq_stream::RelayChoice::default(),
+            // Snapshot the node's reach inputs ONCE, per-stream, at construction
+            // (#384). `reach()` then reads this captured field instead of the
+            // process globals on every call. A `StreamChannel` with an explicit
+            // per-server `ProducerReachConfig` overrides this via
+            // `with_reach_config` (prepare_stream), making the base reach fully
+            // per-stream rather than global-sourced.
+            reach_config: crate::moq_stream::global_reach_config(),
         })
     }
 
@@ -324,15 +350,36 @@ impl StreamContext {
         &self.relay_choice
     }
 
+    /// Thread an explicit per-server reach config into this stream (#384).
+    ///
+    /// Replaces the [`from_dh`](Self::from_dh) global snapshot with the supplied
+    /// per-server [`ProducerReachConfig`](crate::moq_stream::ProducerReachConfig),
+    /// so the base (iroh/QUIC) reach this stream advertises is the server's own —
+    /// not the process global. [`StreamChannel::prepare_stream_with_claims`]
+    /// calls this when the channel was built with
+    /// [`StreamChannel::with_reach_config`].
+    pub fn with_reach_config(mut self, reach_config: crate::moq_stream::ProducerReachConfig) -> Self {
+        self.reach_config = reach_config;
+        self
+    }
+
+    /// Get this stream's reach config (#384).
+    pub fn reach_config(&self) -> &crate::moq_stream::ProducerReachConfig {
+        &self.reach_config
+    }
+
     /// Build this stream's `StreamInfo.reach` from the node's per-server reach
     /// config and this stream's [`relay_choice`](Self::relay_choice) (#384).
     ///
     /// This is the threaded replacement for the deprecated free-function
     /// `producer_reach()`: a producer that holds a `StreamContext` calls this so
-    /// the stream's relay/anonymization posture is honoured per-stream instead of
-    /// resolving the process-global default.
+    /// the stream's relay/anonymization posture **and** its base iroh/QUIC reach
+    /// are honoured per-stream. Both come from the context's own
+    /// [`reach_config`](Self::reach_config) field — captured at construction (and
+    /// overridable via [`with_reach_config`](Self::with_reach_config)) — so this
+    /// no longer reads the process-global `OnceLock`s on each call.
     pub fn reach(&self) -> Vec<crate::stream_info::Destination> {
-        crate::moq_stream::global_reach_config().reach_with_relay(self.relay_choice.clone())
+        self.reach_config.reach_with_relay(self.relay_choice.clone())
     }
 }
 
@@ -481,6 +528,13 @@ pub struct StreamChannel {
     /// deterministically from the node's persistent Ed25519 signing key (#157)
     /// in [`Self::new`]; override with [`Self::with_pq_key`].
     pq_signing_key: Option<crate::crypto::pq::MlDsaSigningKey>,
+    /// Explicit per-server reach config threaded into every `StreamContext` this
+    /// channel prepares (#384). `None` → each context snapshots
+    /// [`global_reach_config`](crate::moq_stream::global_reach_config) in
+    /// `from_dh` (the compat default). `Some` → heterogeneous per-server reach:
+    /// the channel's own iroh/QUIC/relay inputs are used for the base reach,
+    /// independent of the process globals. Set via [`Self::with_reach_config`].
+    reach_config: Option<crate::moq_stream::ProducerReachConfig>,
 }
 
 impl StreamChannel {
@@ -498,7 +552,24 @@ impl StreamChannel {
         Self {
             signing_key,
             pq_signing_key,
+            reach_config: None,
         }
+    }
+
+    /// Thread an explicit per-server reach config (#384).
+    ///
+    /// Every `StreamContext` this channel prepares is populated with `cfg` (via
+    /// [`StreamContext::with_reach_config`]) so its base iroh/QUIC reach — not
+    /// just its relay choice — comes from this server's own config rather than
+    /// the process-global `OnceLock`s. This is the threading hook that makes
+    /// heterogeneous-per-server reach fully work; a server constructs its
+    /// [`ProducerReachConfig`](crate::moq_stream::ProducerReachConfig) at its
+    /// bind site and hands it here. When unset, contexts fall back to the
+    /// per-stream [`global_reach_config`](crate::moq_stream::global_reach_config)
+    /// snapshot.
+    pub fn with_reach_config(mut self, cfg: crate::moq_stream::ProducerReachConfig) -> Self {
+        self.reach_config = Some(cfg);
+        self
     }
 
     /// Install the node's persistent ML-DSA-65 signing key, replacing the
@@ -548,8 +619,14 @@ impl StreamChannel {
         expiry_secs: i64,
         _claims: Option<Claims>,
     ) -> Result<StreamContext> {
-        // 1. DH key exchange
-        let stream_ctx = StreamContext::from_dh(client_ephemeral_pubkey)?;
+        // 1. DH key exchange. Thread this channel's explicit per-server reach
+        // config when set (#384) so the stream's base iroh/QUIC reach is the
+        // server's own, not the process global; otherwise the context keeps the
+        // per-stream `global_reach_config()` snapshot `from_dh` captured.
+        let mut stream_ctx = StreamContext::from_dh(client_ephemeral_pubkey)?;
+        if let Some(cfg) = &self.reach_config {
+            stream_ctx = stream_ctx.with_reach_config(cfg.clone());
+        }
 
         // Spawn JWT expiry timeout as universal backstop.
         let token = stream_ctx.cancel_token().clone();
