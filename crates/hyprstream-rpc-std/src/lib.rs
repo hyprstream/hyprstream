@@ -169,3 +169,6 @@ pub mod stream_mount;
 pub mod wasm_exports;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_rpc_client;
+// Phase 2: iroh peer identity + pkarr helpers exported to JavaScript.
+#[cfg(target_arch = "wasm32")]
+pub mod iroh_exports;

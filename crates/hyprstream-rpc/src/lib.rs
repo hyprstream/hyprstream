@@ -188,6 +188,11 @@ pub mod web_transport;
 // native `dial()` (which is itself `#[cfg(not(target_arch = "wasm32"))]`).
 #[cfg(target_arch = "wasm32")]
 pub mod dial_wasm;
+// Phase 2: iroh peer identity + pkarr helpers for wasm32. Adds iroh as a
+// first-class wasm32 dep — browser gets own NodeId, did:key conversion,
+// and native pkarr lookup. Full dial_iroh_reach() is Phase 3.
+#[cfg(target_arch = "wasm32")]
+pub mod iroh_peer;
 
 // ============================================================================
 // Re-exports available on ALL targets
