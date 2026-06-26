@@ -74,7 +74,7 @@ impl SandboxPool {
     /// Acquire a sandbox from the pool
     ///
     /// Prefers warm sandboxes, creates new if none available.
-    pub async fn acquire(&self, config: &PodSandboxConfig) -> Result<String> {
+    pub async fn acquire(self: &Arc<Self>, config: &PodSandboxConfig) -> Result<String> {
         // Check capacity
         let active_count = self.active.lock().await.len();
         if active_count >= self.config.max_sandboxes {
@@ -104,7 +104,7 @@ impl SandboxPool {
         self.active.lock().await.insert(sandbox_id.clone(), sandbox);
 
         // Replenish warm pool in background
-        self.replenish_warm_pool();
+        Self::replenish_warm_pool(self.clone());
 
         Ok(sandbox_id)
     }
@@ -267,9 +267,24 @@ impl SandboxPool {
         }
     }
 
-    /// Replenish warm pool in background
-    fn replenish_warm_pool(&self) {
-        // TODO: Spawn background task to replenish warm pool
+    /// Replenish warm pool in background when it drops below target.
+    fn replenish_warm_pool(pool: Arc<Self>) {
+        let target = pool.config.warm_pool_size;
+        tokio::spawn(async move {
+            let warm_count = pool.warm_pool.lock().await.len();
+            if warm_count >= target {
+                return;
+            }
+            match pool.create_warm_sandbox().await {
+                Ok(sandbox) => {
+                    pool.warm_pool.lock().await.push_back(sandbox);
+                    tracing::debug!(target, "Warm pool replenished");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to replenish warm pool");
+                }
+            }
+        });
     }
 }
 
@@ -299,7 +314,7 @@ mod tests {
     async fn create_test_pool(
         max_sandboxes: usize,
         warm_pool_size: usize,
-    ) -> Result<(SandboxPool, TempDir)> {
+    ) -> Result<(Arc<SandboxPool>, TempDir)> {
         let temp_dir = TempDir::new()?;
         let base_path = temp_dir.path();
 
@@ -329,7 +344,7 @@ mod tests {
         let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
         let backend: Arc<dyn SandboxBackend> =
             Arc::new(KataBackend::new(image_config, rafs_store));
-        let pool = SandboxPool::new(pool_config, backend);
+        let pool = Arc::new(SandboxPool::new(pool_config, backend));
 
         Ok((pool, temp_dir))
     }
