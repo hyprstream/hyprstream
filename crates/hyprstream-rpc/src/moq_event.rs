@@ -1173,9 +1173,18 @@ mod tests {
         // The subscriber task must wait until the broadcast appears rather than abort.
         let recv_task = tokio::spawn(async move { sub.recv().await });
 
-        // Small yield to let the subscriber background task start and block on
-        // the wait-for-subtree loop before we create the publisher.
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        // Let the subscriber background task start and block on the #148
+        // wait-for-subtree loop before the publisher registers the broadcast.
+        // A fixed 5ms sleep flaked on loaded CI (the task might not have reached
+        // its wait yet, letting the publisher win the race so the wait path was
+        // never exercised). Fully deterministic ordering would need a
+        // subscriber-readiness signal (a small product hook, flagged separately);
+        // absent that, repeated yields plus a generous bounded settle make the
+        // subscriber-before-publisher ordering reliable.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Publisher registers the broadcast (creates `local/events/worker`).
         let mut pub_ = origin.publisher("worker")?;
