@@ -40,6 +40,33 @@ allow = [
     "OpenSSL",
 ]
 
+# xet-core (huggingface/xet-core, pinned tag git-xet-v0.2.0) internal workspace
+# crates lack per-crate license fields; root repo is Apache-2.0. skip-tree on the
+# 6 direct deps covers unlicensed transitive deps (api_client, chat-core, etc.).
+[[licenses.skip-tree]]
+name = "data"
+version = "*"
+
+[[licenses.skip-tree]]
+name = "cas_client"
+version = "*"
+
+[[licenses.skip-tree]]
+name = "cas_object"
+version = "*"
+
+[[licenses.skip-tree]]
+name = "cas_types"
+version = "*"
+
+[[licenses.skip-tree]]
+name = "chunk_cache"
+version = "*"
+
+[[licenses.skip-tree]]
+name = "merklehash"
+version = "*"
+
 [sources]
 unknown-registry = "warn"
 unknown-git = "warn"
