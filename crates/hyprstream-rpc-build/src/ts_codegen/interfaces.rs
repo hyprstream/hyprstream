@@ -39,14 +39,27 @@ fn emit_enum(out: &mut String, e: &EnumDef) {
 fn emit_struct_interface(out: &mut String, s: &StructDef) {
     let non_union_fields: Vec<_> = s.non_union_fields().collect();
 
-    // Pure union envelopes — emit as a discriminated union type alias
+    // Pure union envelopes — emit as a typed discriminated union type alias.
+    //
+    // Each arm mirrors exactly what the generated parser returns for that
+    // discriminant (`{ variant: '<name>', data: <typed> }`), plus the parser's
+    // default-case `{ variant: 'unknown'; data: null }`. This replaces the
+    // former degenerate `{ variant: string; data: unknown }` stub.
     if non_union_fields.is_empty() && s.has_union {
         let union_fields: Vec<_> = s.union_fields().collect();
         if !union_fields.is_empty() {
-            out.push_str(&format!(
-                "export type {} = {{ variant: string; data: unknown }};\n\n",
-                s.name
-            ));
+            out.push_str(&format!("export type {} =\n", s.name));
+            for f in &union_fields {
+                // Use the raw field name to match the generated parser/builder,
+                // which key the discriminated `variant` on the capnp field name.
+                out.push_str(&format!(
+                    "  | {{ variant: '{}'; data: {} }}\n",
+                    f.name,
+                    super::union_variant_data_type(f)
+                ));
+            }
+            // Fallback arm matching the parser's `default` case.
+            out.push_str("  | { variant: 'unknown'; data: null };\n\n");
         }
         return;
     }
