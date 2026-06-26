@@ -45,11 +45,16 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Install cargo-deny
-      run: cargo install cargo-deny --locked 2>/dev/null || true
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-deny
     - name: Check bans
       # ZMQ crates are deny-listed in deny.toml (#138 complete). This gate must
       # be able to fail — do NOT add `|| true`.
-      run: cargo deny check bans licenses
+      # Unset RUSTC_WRAPPER: job-level env: "" doesn't clear workflow-level env on GHA.
+      run: |
+        unset RUSTC_WRAPPER
+        cargo deny check bans licenses
 
   wasm:
     name: WASM (browser client)

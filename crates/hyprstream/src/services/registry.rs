@@ -766,7 +766,7 @@ impl RegistryService {
             stream_id: stream_ctx.stream_id().to_owned(),
             dh_public: *stream_ctx.server_pubkey(),
             broadcast_path,
-            announced_at: hyprstream_rpc::moq_stream::producer_reach(),
+            announced_at: stream_ctx.reach(), // #384: per-stream reach via ctx
             ..Default::default()
         };
 
@@ -3001,6 +3001,7 @@ impl MetricsRegistryClient for RegistryClient {
 /// Recognized forms (one key=value / `key value` per line):
 ///   - git-lfs:  `oid sha256:<hex>`
 ///   - git-xet:  `xet://<hex>` or `merkle: <hex>` / `merklehash = <hex>`
+///
 /// Matching is case-insensitive on the hex.
 fn xet_pointer_references_merkle(text: &str, merkle_hex: &str) -> bool {
     let want = merkle_hex.trim().to_ascii_lowercase();
@@ -3028,11 +3029,10 @@ fn xet_pointer_references_merkle(text: &str, merkle_hex: &str) -> bool {
             Some(rest.trim())
         } else if let Some(rest) = line.strip_prefix("merkle:") {
             Some(rest.trim())
-        } else if let Some(rest) = line.strip_prefix("merklehash") {
-            // `merklehash = <hex>` or `merklehash <hex>`
-            Some(rest.trim_start_matches([' ', '=', '\t']).trim())
         } else {
-            None
+            // `merklehash = <hex>` or `merklehash <hex>`
+            line.strip_prefix("merklehash")
+                .map(|rest| rest.trim_start_matches([' ', '=', '\t']).trim())
         };
         if let Some(c) = candidate {
             if c.to_ascii_lowercase() == want {
@@ -3086,6 +3086,14 @@ mod xet_pointer_tests {
 }
 
 #[cfg(test)]
+// Test-only: panics-on-error and ergonomic literals are acceptable in fixtures.
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::str_to_string,
+    clippy::needless_borrow,
+    clippy::mem_forget
+)]
 mod tests {
     use super::*;
     use crate::auth::PolicyManager;
@@ -3184,7 +3192,7 @@ mod tests {
         );
         let (signing_key, _vk) = generate_signing_keypair();
         let policy_manager = Arc::new(PolicyManager::permissive().await.expect("test: policy manager"));
-        let policy_transport = TransportConfig::inproc(&format!("test-policy-{suffix}"));
+        let policy_transport = TransportConfig::inproc(format!("test-policy-{suffix}"));
         let git2db = Arc::new(tokio::sync::RwLock::new(
             git2db::Git2DB::open(temp_dir.path()).await.expect("test: open git2db"),
         ));
@@ -3203,7 +3211,7 @@ mod tests {
             signing_key.verifying_key(),
             None,
         ).expect("test: policy client");
-        let registry_transport = TransportConfig::inproc(&format!("test-registry-{suffix}"));
+        let registry_transport = TransportConfig::inproc(format!("test-registry-{suffix}"));
         let registry_service = RegistryService::new(
             temp_dir.path(),
             policy_client,

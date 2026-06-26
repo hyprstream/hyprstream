@@ -9,7 +9,7 @@
 //!   /srv/{service}/doc → DocMount (man pages from schema annotations)
 //!   /wanix             → WanixMount (Wanix-native VFS via 9P2000.L over DMA;
 //!                        optional — mounted only when running under Wanix,
-//!                        see [`mount_wanix`]). #409 Path B.
+//!                        see [`mount_wanix`]). #409/#391.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -84,9 +84,11 @@ impl IdCounter {
 pub enum ServiceDispatchResult {
     /// Normal JSON response string.
     Response(String),
-    /// Streaming — JSON string of parsed StreamInfo + ephemeral keypair for ECDH.
+    /// Streaming — the VERIFIED-capnp `StreamInfo` library type (decoded +
+    /// COSE-verified upstream, carried typed — NOT a JSON string to re-parse,
+    /// #468) + ephemeral keypair for ECDH.
     Stream {
-        json: String,
+        info: hyprstream_rpc::stream_info::StreamInfo,
         /// 64 bytes: [secret(32) | pubkey(32)]
         ephemeral_keypair: Vec<u8>,
     },
@@ -217,30 +219,15 @@ impl Mount for GenericServiceMount {
 
         let resp = match dispatch_result {
             ServiceDispatchResult::Response(json) => json.into_bytes(),
-            ServiceDispatchResult::Stream { json: stream_json, ephemeral_keypair } => {
-                // Streaming response — use open_stream() to set up verified subscription
-                let parsed: serde_json::Value = serde_json::from_str(&stream_json)
-                    .map_err(|e| MountError::Io(format!("parse stream response: {e}")))?;
-
-                // The dispatch already sent the streaming request and got StreamInfo back.
-                // Now we need to open a stream handle. But open_stream() does the full
-                // flow (send + ECDH + subscribe). Since dispatch already sent the request,
-                // we need to do the ECDH + subscribe part manually using the StreamInfo.
+            ServiceDispatchResult::Stream { info, ephemeral_keypair } => {
+                // #468: `info` is the VERIFIED-capnp StreamInfo library type carried
+                // typed through dispatch (decoded + COSE-verified upstream) — no
+                // serde_json round-trip / re-parse at this boundary.
                 //
-                // TODO: Refactor dispatch to return raw payload bytes so open_stream()
-                // can handle the full flow. For now, use StreamHandle::open() directly.
-                let inner = if let Some(obj) = parsed.as_object() {
-                    if obj.len() == 1 {
-                        obj.values().next().unwrap().clone()
-                    } else {
-                        parsed.clone()
-                    }
-                } else {
-                    parsed.clone()
-                };
-                let info: hyprstream_rpc::stream_info::StreamInfo = serde_json::from_value(inner)
-                    .map_err(|e| MountError::Io(format!("parse StreamInfo: {e}")))?;
-
+                // The dispatch already sent the streaming request and got StreamInfo back.
+                // Now we open a stream handle. open_stream() would do the full flow
+                // (send + ECDH + subscribe), but dispatch already sent the request, so we
+                // do the ECDH + subscribe part here using the verified StreamInfo.
                 let client_secret = &ephemeral_keypair[..32];
                 let client_pubkey = &ephemeral_keypair[32..64];
                 let mut secret_32 = [0u8; 32];
@@ -433,8 +420,8 @@ macro_rules! impl_service_dispatch {
 
                 Ok(match result {
                     svc::DispatchResult::Response(json) => ServiceDispatchResult::Response(json),
-                    svc::DispatchResult::Stream(json) => ServiceDispatchResult::Stream {
-                        json,
+                    svc::DispatchResult::Stream(info) => ServiceDispatchResult::Stream {
+                        info,
                         ephemeral_keypair: keypair,
                     },
                 })
@@ -523,66 +510,46 @@ pub fn build_browser_namespace(
 
     // `/wanix` is NOT mounted here: it needs a Wanix-provided SharedArrayBuffer
     // that the browser only has when running under Wanix. Wire it separately
-    // via [`mount_wanix`] after this builder returns. See #409 Path B.
+    // via [`mount_wanix`] after this builder returns. See #409/#391.
 
     (ns, stream_registry)
 }
 
 // ============================================================================
-// WanixMount wiring — #409 Path B (Wanix-native VFS access)
+// WanixMount wiring — #409/#391 (Wanix-native VFS access)
 // ============================================================================
 
-/// Wire [`hyprstream_9p::wanix_mount::WanixMount`] into an existing browser
-/// namespace at `/wanix`.
+/// Mount the Wanix 9P filesystem into the namespace at `/wanix` (#409/#391).
 ///
-/// # Why a separate helper, not a `build_browser_namespace` parameter
+/// `client` is a `P9Client` already connected over a `P9Transport` (e.g. the
+/// `DmaTransport` SharedArrayBuffer bridge). Every VFS op under `/wanix` is
+/// translated to 9P2000.L and forwarded — the Wanix half of the "browser
+/// both-paths" model, riding the same wasm transport substrate as the service
+/// mounts above.
 ///
-/// `build_browser_namespace` is synchronous; constructing a `WanixMount`
-/// requires the 9P2000.L version + attach handshake ([`P9Client::connect`]),
-/// which is async because the DMA transport round-trips to the Wanix Go host
-/// over the SharedArrayBuffer. Rather than force the whole namespace builder
-/// to be async for an optional path, the caller invokes this helper after
-/// `build_browser_namespace` when it actually has a Wanix SAB.
+/// This is the rpc-std seam that makes `WanixMount` reachable from the browser
+/// namespace now that `hyprstream-9p` is a wasm32 dependency.
 ///
-/// # Arguments
+/// # Breaking change (#465)
 ///
-/// * `ns` — The namespace to mount into (must be behind a `RefCell`/`Mutex` if
-///   shared, since this mutates it).
-/// * `sab` — The `SharedArrayBuffer` shared with the Wanix host's DMA ring.
-///   Layout is documented in `hyprstream_9p::dma` (control region + two ring
-///   buffers); the Wanix host allocates and hands this to the browser.
-/// * `uname`, `aname` — 9P attach credentials / root aname. Pass `"root"`
-///   / `"/"` for the Wanix root tree.
-///
-/// # Errors
-///
-/// Returns an error if the 9P handshake (version/attach) fails — typically
-/// because the Wanix host isn't responding on the DMA ring or speaks an
-/// incompatible 9P variant.
-///
-/// # Coexistence
-///
-/// `/wanix` coexists with the RPC-client-backed paths (`/srv/registry`,
-/// `/srv/model`, `/stream`, etc.). The two access styles serve different
-/// needs: `/wanix` exposes the Wanix-native filesystem (real `walk`/`stat`
-/// qids over DMA), while `/srv/*` exposes hyprstream services via
-/// `GenericServiceMount` (ctl-style service-as-files over WebTransport RPC).
-pub async fn mount_wanix(
+/// This signature replaces the previous `async fn mount_wanix(ns, sab, uname,
+/// aname) -> anyhow::Result<()>`, which performed the 9P version/attach handshake
+/// internally over a `DmaTransport` built from a `SharedArrayBuffer`. The handshake
+/// (and transport construction) now happen at the call site, so callers pass an
+/// already-connected `P9Client<T>` and this function is **synchronous**, returning
+/// [`hyprstream_vfs::NamespaceError`] instead of `anyhow::Result<()>`. Update call
+/// sites: `mount_wanix(ns, &sab, uname, aname).await?` →
+/// `let client = P9Client::connect(DmaTransport::new(&sab, true), uname, aname).await?;
+/// mount_wanix(ns, client)?;`.
+pub fn mount_wanix<T>(
     ns: &mut hyprstream_vfs::Namespace,
-    sab: &js_sys::SharedArrayBuffer,
-    uname: &str,
-    aname: &str,
-) -> anyhow::Result<()> {
-    use hyprstream_9p::client::P9Client;
-    use hyprstream_9p::dma::DmaTransport;
-    use hyprstream_9p::wanix_mount::WanixMount;
-
-    // `client_endpoint = true`: we write T-messages to chan0, read R-messages
-    // from chan1 (the Wanix Go host has the reverse assignment).
-    let transport = DmaTransport::new(sab, true);
-    let client = P9Client::connect(transport, uname, aname).await?;
-    let mount: hyprstream_vfs::MountTarget = Arc::new(WanixMount::new(client));
-    ns.mount("/wanix", mount)
-        .map_err(|e| anyhow::anyhow!("mount /wanix failed: {e}"))?;
-    Ok(())
+    client: hyprstream_9p::client::P9Client<T>,
+) -> Result<(), hyprstream_vfs::NamespaceError>
+where
+    T: hyprstream_9p::client::P9Transport + 'static,
+{
+    ns.mount(
+        "/wanix",
+        Arc::new(hyprstream_9p::wanix_mount::WanixMount::new(client)),
+    )
 }

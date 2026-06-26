@@ -233,91 +233,17 @@ pub fn preferred_transport(doc: &Value, kind: Option<SocketKind>) -> Option<Tran
 
 // ── DID-doc → verification-method keys (#137 admission stage 2) ────────────────
 
-/// Multicodec `ed25519-pub` unsigned-varint prefix (`0xed01` → bytes `0xed 0x01`).
-///
-/// Mirrors `hyprstream::auth::mesh_trust::MULTICODEC_ED25519_PUB`; duplicated here
-/// (a 2-byte constant) because `hyprstream-rpc` is the lower crate and cannot
-/// depend on `hyprstream` for the `verificationMethod` decode the admission gate
-/// (#137) needs at this layer.
-const MULTICODEC_ED25519_PUB: [u8; 2] = [0xed, 0x01];
-
-/// Decode a `Multikey` `publicKeyMultibase` string into raw Ed25519 key bytes.
-///
-/// Verifies the base58btc multibase prefix (`z`) and the `ed25519-pub` multicodec
-/// header, returning the 32-byte payload. This is the `did_web`/`hyprstream-rpc`
-/// sibling of `hyprstream::auth::mesh_trust::decode_multikey` (kept local because
-/// `hyprstream-rpc` cannot depend on `hyprstream`); both are exercised against the
-/// same `encode_multikey` output in tests.
-///
-/// Returns `Err` for a wrong multibase, an undecodable base58, a non-Ed25519
-/// codec, or a payload that is not exactly 32 bytes.
-pub fn decode_ed25519_multikey(multibase: &str) -> Result<[u8; 32]> {
-    let body = multibase
-        .strip_prefix('z')
-        .ok_or_else(|| anyhow!("Multikey must use base58btc multibase ('z') prefix"))?;
-    let decoded = bs58::decode(body)
-        .into_vec()
-        .map_err(|e| anyhow!("invalid base58btc Multikey: {e}"))?;
-    if decoded.len() < 2 || decoded[..2] != MULTICODEC_ED25519_PUB {
-        bail!(
-            "unexpected multicodec prefix (expected ed25519-pub {MULTICODEC_ED25519_PUB:02x?}, got {:02x?})",
-            decoded.get(..2).unwrap_or(&decoded)
-        );
-    }
-    let raw: [u8; 32] = decoded[2..]
-        .try_into()
-        .map_err(|_| anyhow!("ed25519 Multikey payload is {} bytes (expected 32)", decoded.len() - 2))?;
-    Ok(raw)
-}
-
-// ── did:key (Ed25519) interop (#281) ──────────────────────────────────────────
-
-/// Decode a `did:key` (Ed25519) identifier into its raw 32-byte Ed25519 key.
-///
-/// Tiles (and the broader did:key ecosystem) uses `did:key` for self-certifying
-/// device/account identity. For Ed25519 a `did:key` is *exactly*
-/// `"did:key:" + multibase-base58btc(0xed01 ‖ pubkey)` — i.e. the method-specific
-/// identifier is the same `Multikey` `publicKeyMultibase` value we already decode
-/// for `verificationMethod` (see [`decode_ed25519_multikey`]). A `did:key` is
-/// therefore **self-contained**: the key *is* the identity, so this is a pure
-/// decode with **no network fetch** (the inverse of `did:web`, which resolves a
-/// document). Reach for a `did:key` peer comes from iroh discovery (#282), not the
-/// DID string.
-///
-/// Returns `Err` for a non-`did:key` identifier, a non-Ed25519 multicodec, a bad
-/// multibase, or a wrong-length payload. A DID URL fragment / query is stripped
-/// (we decode the base identifier).
-pub fn did_key_to_ed25519(did: &str) -> Result<[u8; 32]> {
-    // Strip any DID URL fragment / query (`did:key:z6Mk…#z6Mk…` self-references
-    // the same key; we decode the base method-specific identifier).
-    let did = did.split(['#', '?']).next().unwrap_or(did);
-    let msi = did
-        .strip_prefix("did:key:")
-        .ok_or_else(|| anyhow!("not a did:key identifier: {did}"))?;
-    if msi.is_empty() {
-        bail!("did:key has empty method-specific identifier: {did}");
-    }
-    // The method-specific id IS a Multikey `publicKeyMultibase`; reuse the one
-    // source of truth for the ed25519-pub multicodec (no duplicated 0xed01).
-    decode_ed25519_multikey(msi)
-        .map_err(|e| anyhow!("did:key {did} is not a valid Ed25519 Multikey: {e}"))
-}
-
-/// Encode a raw 32-byte Ed25519 public key as a `did:key` (Ed25519) identifier
-/// (`did:key:z6Mk…`).
-///
-/// Reverse interop for #281: lets our Ed25519 keys (the `#mesh` / `#iroh` VMs)
-/// render as the `did:key` form Tiles and other did:key consumers expect. The
-/// produced string is `"did:key:" + ed25519_to_multibase(key)` and round-trips
-/// with [`did_key_to_ed25519`]; the Multikey body is byte-identical to the
-/// `publicKeyMultibase` our DID documents publish (`#280`'s `ed25519_to_multibase`
-/// over the same `0xed01 ‖ key` payload — one multicodec source of truth).
-pub fn ed25519_to_did_key(key: &[u8; 32]) -> String {
-    let mut payload = Vec::with_capacity(2 + 32);
-    payload.extend_from_slice(&MULTICODEC_ED25519_PUB);
-    payload.extend_from_slice(key);
-    format!("did:key:z{}", bs58::encode(payload).into_string())
-}
+// The `did:key` (Ed25519) codec — `MULTICODEC_ED25519_PUB`,
+// `decode_ed25519_multikey`, `did_key_to_ed25519`, `ed25519_to_did_key` — lives
+// in the cross-target [`crate::did_key`] module so the native `did_web` resolver
+// (#279/#137/#281) and the wasm32 `iroh_peer` browser identity helpers (#475)
+// share one implementation and cannot drift. They are re-exported here so
+// existing `crate::did_web::*` callers (admission gate, federation tests) are
+// unaffected.
+pub use crate::did_key::{decode_ed25519_multikey, did_key_to_ed25519, ed25519_to_did_key};
+// Only the test multikey helper references the raw multicodec constant now.
+#[cfg(test)]
+use crate::did_key::MULTICODEC_ED25519_PUB;
 
 /// Whether `did` is a `did:key` identifier (the self-certifying interop arm).
 ///

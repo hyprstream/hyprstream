@@ -127,6 +127,8 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
         .route("/oauth/revoke", post(revocation::revoke_token))
         // Phase 0c — did:web document endpoints
         .route("/.well-known/did.json", get(did_document::root_did_document))
+        // atproto handle→DID HTTP resolution (#500) — plaintext bare DID
+        .route("/.well-known/atproto-did", get(did_document::atproto_did))
         .route("/users/:username/did.json", get(did_document::user_did_document))
         .route("/clients/:client_id/did.json", get(did_document::client_did_document))
         .route("/oauth/logout", post(handle_logout))

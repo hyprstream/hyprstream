@@ -22,8 +22,6 @@ deny = [
     { name = "zeromq-src", reason = "ZMQ fully removed in #138" },
 ]
 
-warn = []
-
 [licenses]
 # Minimum confidence threshold for license detection.
 confidence-threshold = 0.8
@@ -40,7 +38,136 @@ allow = [
     "MPL-2.0",
     "Zlib",
     "OpenSSL",
+    "BSL-1.0",            # Boost Software License (permissive)
+    "Unlicense",          # public domain equivalent (permissive)
+    "bzip2-1.0.6",        # bzip2-sys: permissive BSD-like, FSF-free
+    "CDLA-Permissive-2.0", # Community Data License Agreement (permissive data license — webpki-roots CA certs)
 ]
+
+# hyprstream itself is dual-licensed MIT OR AGPL-3.0-only (first-party).
+# Allow AGPL only for the root binary crate — not as a blanket allow.
+[[licenses.exceptions]]
+name = "hyprstream"
+version = "*"
+allow = ["MIT", "AGPL-3.0-only"]
+
+# systemd/libsystemd-sys are LGPL + GCC exception.
+# The GCC exception permits non-copyleft software to dynamically link against LGPL libraries
+# without triggering the copyleft requirement; hyprstream links libsystemd dynamically.
+[[licenses.exceptions]]
+name = "systemd"
+version = "*"
+allow = ["LGPL-2.1-or-later WITH GCC-exception-2.0"]
+
+[[licenses.exceptions]]
+name = "libsystemd-sys"
+version = "*"
+allow = ["LGPL-2.1-or-later WITH GCC-exception-2.0"]
+
+# huggingface/xet-core (tag git-xet-v0.2.0) internal workspace crates don't
+# declare `license` in their per-crate Cargo.toml; the root repo is Apache-2.0.
+# Clarify each crate explicitly so cargo-deny knows the license is asserted.
+[[licenses.clarify]]
+name = "api_client"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "cas_client"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "cas_object"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "cas_types"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "ch-config"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "chunk_cache"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "data"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "deduplication"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "error_printer"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "file_utils"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "hub_client"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "mdb_shard"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "merklehash"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "progress_tracking"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "utils"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "xet_config"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "xet_runtime"
+version = "*"
+expression = "Apache-2.0"
+license-files = []
 
 [sources]
 unknown-registry = "warn"

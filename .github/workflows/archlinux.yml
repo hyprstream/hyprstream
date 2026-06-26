@@ -1,0 +1,58 @@
+name: Arch Linux build
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'archlinux/**'
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - 'archlinux/**'
+  release:
+    types: [published]
+
+jobs:
+  pkgbuild:
+    name: makepkg (archlinux container)
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install base-devel + makedepends
+      run: |
+        pacman -Syu --noconfirm
+        pacman -S --noconfirm \
+          base-devel \
+          rustup \
+          cmake \
+          capnproto \
+          openssl \
+          pkg-config \
+          systemd \
+          git
+
+    - name: Set up Rust toolchain
+      run: rustup default stable
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: arch-rust-deps
+
+    - name: Validate PKGBUILD syntax
+      run: |
+        cd archlinux
+        bash -n PKGBUILD
+
+    - name: Build (CPU-only, no CUDA)
+      # Full makepkg would need cuda + python-pytorch-opt-cuda from AUR.
+      # We validate the build itself using the same flags as CI (download-libtorch),
+      # which exercises the same code path without requiring GPU hardware.
+      run: |
+        cargo build --bin hyprstream --release --features download-libtorch
+      env:
+        CARGO_TERM_COLOR: always

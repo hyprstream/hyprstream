@@ -2561,7 +2561,9 @@ mod tests {
     }
 
     /// A block allocated by one owner cannot be freed by another (tenant
-    /// isolation). In debug builds this panics; assert via catch_unwind.
+    /// isolation). In debug builds the impl panics via `debug_assert!`; in
+    /// release builds it logs and silently returns without mutating pool state.
+    /// Both cases must leave block ownership and used-count unchanged.
     #[test]
     fn test_cross_owner_free_is_rejected() -> Result<()> {
         let device = Device::Cpu;
@@ -2574,16 +2576,23 @@ mod tests {
         let block = pool.allocate(&alice).expect("alice allocates");
         assert_eq!(pool.owner_of(block), Some(&alice));
 
-        // Bob attempting to free Alice's block must be rejected. The debug_assert
-        // fires in debug builds, so guard the call with catch_unwind.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // In debug builds, `debug_assert!` fires and the call panics.
+        // In release builds, the impl logs and returns without changing state.
+        // Either way, the security invariant must hold: ownership is preserved
+        // and the block stays in use. Use catch_unwind so the test body can
+        // continue in both profiles to verify the post-condition.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             pool.free(&bob, block);
         }));
-        assert!(result.is_err(), "cross-owner free should be rejected (panicked in debug)");
 
-        // Block is still owned by Alice and still in use.
-        assert_eq!(pool.owner_of(block), Some(&alice));
-        assert_eq!(pool.used_blocks(), 1);
+        // Security invariant: block is still owned by Alice and still in use
+        // regardless of whether a panic occurred.
+        assert_eq!(
+            pool.owner_of(block),
+            Some(&alice),
+            "cross-owner free must not transfer or clear block ownership"
+        );
+        assert_eq!(pool.used_blocks(), 1, "cross-owner free must not return block to free list");
 
         // Alice can free her own block.
         pool.free(&alice, block);
