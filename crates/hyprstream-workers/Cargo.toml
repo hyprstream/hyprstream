@@ -94,10 +94,10 @@ rand = { workspace = true }
 zeroize = { workspace = true }
 
 # Kata Containers runtime-rs (hypervisor abstraction) — optional, gated by `kata` feature.
-kata-hypervisor = { git = "https://github.com/kata-containers/kata-containers", tag = "3.25.0", package = "hypervisor", features = ["cloud-hypervisor"], optional = true }
-kata-types = { git = "https://github.com/kata-containers/kata-containers", tag = "3.25.0", optional = true }
-kata-sys-util = { git = "https://github.com/kata-containers/kata-containers", tag = "3.25.0", optional = true }
-ch-config = { git = "https://github.com/kata-containers/kata-containers", tag = "3.25.0", optional = true }
+kata-hypervisor = { git = "https://github.com/kata-containers/kata-containers", tag = "3.31.0", package = "hypervisor", features = ["cloud-hypervisor"], optional = true }
+kata-types = { git = "https://github.com/kata-containers/kata-containers", tag = "3.31.0", optional = true }
+kata-sys-util = { git = "https://github.com/kata-containers/kata-containers", tag = "3.31.0", optional = true }
+ch-config = { git = "https://github.com/kata-containers/kata-containers", tag = "3.31.0", optional = true }
 
 [features]
 # Kata Containers VM-based sandbox backend (cloud-hypervisor + runtime-rs). Implies nydus.
