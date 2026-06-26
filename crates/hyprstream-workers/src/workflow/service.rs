@@ -313,61 +313,73 @@ impl WorkflowService {
             }
         };
 
-        let workflow_dir = root.join(".github").join("workflows");
-        if !workflow_dir.is_dir() {
-            tracing::debug!(
-                repo_id = %repo_id,
-                dir = %workflow_dir.display(),
-                "No .github/workflows dir found"
-            );
-            return Ok(Vec::new());
-        }
-
-        let mut defs = Vec::new();
-        let read_dir = std::fs::read_dir(&workflow_dir).map_err(|e| {
-            crate::error::WorkerError::WorkflowParseError(format!(
-                "Failed to read workflows dir {}: {e}",
-                workflow_dir.display()
-            ))
-        })?;
-
-        for entry in read_dir.flatten() {
-            let path = entry.path();
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if ext != "yml" && ext != "yaml" {
-                continue;
+        // The directory walk + file reads + YAML parsing are all blocking I/O.
+        // Run them on the blocking thread pool so we don't stall the async
+        // worker (and starve other tasks sharing this runtime).
+        let repo_id_owned = repo_id.to_owned();
+        let defs = tokio::task::spawn_blocking(move || -> Result<Vec<WorkflowDef>> {
+            let workflow_dir = root.join(".github").join("workflows");
+            if !workflow_dir.is_dir() {
+                tracing::debug!(
+                    repo_id = %repo_id_owned,
+                    dir = %workflow_dir.display(),
+                    "No .github/workflows dir found"
+                );
+                return Ok(Vec::new());
             }
 
-            let yaml = match std::fs::read_to_string(&path) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "Failed to read workflow file");
+            let mut defs = Vec::new();
+            let read_dir = std::fs::read_dir(&workflow_dir).map_err(|e| {
+                crate::error::WorkerError::WorkflowParseError(format!(
+                    "Failed to read workflows dir {}: {e}",
+                    workflow_dir.display()
+                ))
+            })?;
+
+            for entry in read_dir.flatten() {
+                let path = entry.path();
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if ext != "yml" && ext != "yaml" {
                     continue;
                 }
-            };
 
-            let workflow = match Workflow::parse(&yaml) {
-                Ok(w) => w,
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "Failed to parse workflow");
-                    continue;
-                }
-            };
+                let yaml = match std::fs::read_to_string(&path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), error = %e, "Failed to read workflow file");
+                        continue;
+                    }
+                };
 
-            let rel_path = path
-                .strip_prefix(&root)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+                let workflow = match Workflow::parse(&yaml) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), error = %e, "Failed to parse workflow");
+                        continue;
+                    }
+                };
 
-            let triggers = extract_triggers(&workflow);
+                let rel_path = path
+                    .strip_prefix(&root)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| path.to_string_lossy().into_owned());
 
-            defs.push(WorkflowDef {
-                path: rel_path,
-                repo_id: repo_id.to_owned(),
-                workflow,
-                triggers,
-            });
-        }
+                let triggers = extract_triggers(&workflow);
+
+                defs.push(WorkflowDef {
+                    path: rel_path,
+                    repo_id: repo_id_owned.clone(),
+                    workflow,
+                    triggers,
+                });
+            }
+
+            Ok(defs)
+        })
+        .await
+        .map_err(|e| {
+            crate::error::WorkerError::WorkflowParseError(format!("scan_repo blocking task failed: {e}"))
+        })??;
 
         tracing::info!(repo_id = %repo_id, count = defs.len(), "Scan complete");
         Ok(defs)
