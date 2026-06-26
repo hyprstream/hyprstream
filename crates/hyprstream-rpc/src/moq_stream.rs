@@ -1392,8 +1392,14 @@ pub async fn connect_moq_reach_for_qos(
 // (`Bytes`); the relay holds no `enc_key` / `mac_key` and never decrypts.
 // ============================================================================
 
-/// Reconnect backoff for the producer→relay link.
-const RELAY_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+/// Base reconnect delay for the producer→relay link; the backoff grows
+/// exponentially from this up to [`RELAY_RECONNECT_MAX`], with jitter.
+const RELAY_RECONNECT_BASE: std::time::Duration = std::time::Duration::from_millis(500);
+/// Cap on the exponential reconnect backoff.
+const RELAY_RECONNECT_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+/// After this many consecutive failures, escalate the reconnect log from
+/// `debug!` to `warn!` so a persistently-unreachable relay is observable.
+const RELAY_RECONNECT_WARN_AFTER: u32 = 5;
 
 /// Announce this node's streaming origin UP to the producer-chosen relay (#358).
 ///
@@ -1411,14 +1417,39 @@ pub fn serve_origin_to_relay_background(
     relay: crate::stream_info::TransportConfig,
 ) {
     tokio::spawn(async move {
+        let mut failures: u32 = 0;
         loop {
-            if let Err(e) = run_relay_announce_link(&producer, &relay).await {
-                tracing::debug!(
-                    "moq relay announce link ended: {e}; reconnecting in {:?}",
-                    RELAY_RECONNECT_DELAY
-                );
+            match run_relay_announce_link(&producer, &relay).await {
+                // A link was established and the session closed; reset the backoff.
+                Ok(()) => failures = 0,
+                Err(e) => {
+                    failures = failures.saturating_add(1);
+                    if failures >= RELAY_RECONNECT_WARN_AFTER {
+                        tracing::warn!(
+                            failures,
+                            "moq relay announce link failing repeatedly: {e}; relay may be unreachable"
+                        );
+                    } else {
+                        tracing::debug!("moq relay announce link ended: {e}; reconnecting");
+                    }
+                }
             }
-            tokio::time::sleep(RELAY_RECONNECT_DELAY).await;
+            // Exponential backoff with equal jitter, capped — de-correlates many
+            // producers reconnecting to a shared relay (avoids a thundering-herd /
+            // self-DoS against the federation anchor). `failures == 0` still waits
+            // ~base, so an instantly-closing session can't spin a tight loop.
+            let shift = failures.min(6); // 2^6 * 500ms = 32s, clamped by MAX below
+            let backoff = RELAY_RECONNECT_BASE
+                .checked_mul(1u32 << shift)
+                .unwrap_or(RELAY_RECONNECT_MAX)
+                .min(RELAY_RECONNECT_MAX);
+            let half = backoff / 2;
+            let jitter = if half.is_zero() {
+                std::time::Duration::ZERO
+            } else {
+                std::time::Duration::from_nanos(rand::random::<u64>() % half.as_nanos() as u64)
+            };
+            tokio::time::sleep(half + jitter).await;
         }
     });
 }
