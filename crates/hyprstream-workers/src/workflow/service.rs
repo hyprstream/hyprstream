@@ -694,6 +694,18 @@ impl WorkflowHandler for WorkflowService {
         _request_id: u64,
         request: &SubscribeRequest,
     ) -> AnyhowResult<WorkflowResponseVariant> {
+        // Validate the "repo_id:path" workflow_id convention up-front. An id
+        // without ':' would otherwise be used wholesale as the repo_id, routing
+        // the subscription into the wrong repo bucket.
+        let repo_id = repo_id_from_workflow_id(&request.workflow_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid workflow_id '{}': expected 'repo_id:path' convention",
+                    request.workflow_id
+                )
+            })?
+            .to_owned();
+
         let sub_id = format!("sub-{}-{}", request.workflow_id, uuid::Uuid::new_v4());
         let trigger = EventTrigger::Custom {
             topic: format!("workflow.{}", request.workflow_id),
@@ -707,12 +719,6 @@ impl WorkflowHandler for WorkflowService {
         }
         {
             let mut repo_workflows = self.repo_workflows.write().await;
-            // Extract repo_id from workflow_id ("repo_id:path" convention).
-            let repo_id = request.workflow_id
-                .split(':')
-                .next()
-                .unwrap_or(&request.workflow_id)
-                .to_owned();
             repo_workflows.entry(repo_id).or_default().push(subscription);
         }
 
@@ -788,6 +794,12 @@ impl RequestService for WorkflowService {
     fn signing_key(&self) -> SigningKey {
         self.signing_key.clone()
     }
+}
+
+/// Extract the `repo_id` from a `workflow_id` following the `repo_id:path`
+/// convention. Returns `None` when the id does not contain a `':'` separator.
+fn repo_id_from_workflow_id(workflow_id: &str) -> Option<&str> {
+    workflow_id.split_once(':').map(|(repo_id, _)| repo_id)
 }
 
 /// Build `EventTrigger`s from a parsed `Workflow`'s `on:` field.
