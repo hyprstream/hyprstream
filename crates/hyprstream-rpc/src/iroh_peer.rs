@@ -31,7 +31,9 @@
 #![cfg(target_arch = "wasm32")]
 
 use anyhow::{anyhow, Result};
+use iroh::address_lookup::PkarrError;
 use iroh::{EndpointId, SecretKey};
+use n0_error::StackError;
 
 // ============================================================================
 // BrowserIrohPeer — ephemeral iroh identity without a full Endpoint bind
@@ -154,10 +156,17 @@ pub async fn resolve_pkarr_relay_url(node_id_bytes: &[u8; 32]) -> Result<Option<
 
     let client = iroh::address_lookup::PkarrRelayClient::new(pkarr_relay_url);
 
-    let signed_packet = client
-        .resolve(node_id)
-        .await
-        .map_err(|e| anyhow!("pkarr resolve failed: {e:?}"))?;
+    let signed_packet = match client.resolve(node_id).await {
+        Ok(packet) => packet,
+        // The pkarr relay returns HTTP 404 when the peer has never published a
+        // record. That is a *negative answer*, not a failure — surface it as
+        // `Ok(None)` so callers can distinguish "peer not found" from a genuine
+        // network/transport error (which stays `Err`). Without this the 404
+        // `PkarrError::HttpRequest` would bubble up as a thrown JsError and the
+        // documented `Ok(None)` branch would be dead code.
+        Err(e) if is_pkarr_not_found(&e) => return Ok(None),
+        Err(e) => return Err(anyhow!("pkarr resolve failed: {e:?}")),
+    };
 
     // Parse the DNS wire packet into EndpointInfo and extract the first relay URL.
     let endpoint_info = iroh::endpoint_info::EndpointInfo::from_pkarr_signed_packet(&signed_packet)
@@ -169,4 +178,22 @@ pub async fn resolve_pkarr_relay_url(node_id_bytes: &[u8; 32]) -> Result<Option<
         .map(|url| url.to_string());
 
     Ok(relay_url)
+}
+
+/// Whether a pkarr resolve error is the "no record for this peer" case (HTTP
+/// 404), as opposed to a genuine network/transport/verification failure.
+///
+/// `PkarrRelayClient::resolve` returns the type-erased
+/// [`iroh::address_lookup::Error`], which wraps the underlying [`PkarrError`]
+/// through n0-error's `AnyError`. We walk the [`StackError`] source chain and
+/// downcast each link to [`PkarrError`], matching the `HttpRequest { status }`
+/// variant carrying a `404 Not Found`. Any other status (or a `HttpSend` /
+/// `Verify` / etc. variant) is a real error the caller should see.
+fn is_pkarr_not_found(err: &iroh::address_lookup::Error) -> bool {
+    err.stack().any(|source| {
+        matches!(
+            source.downcast_ref::<PkarrError>(),
+            Some(PkarrError::HttpRequest { status, .. }) if status.as_u16() == 404
+        )
+    })
 }

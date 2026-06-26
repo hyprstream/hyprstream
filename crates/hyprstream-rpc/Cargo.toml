@@ -89,6 +89,11 @@ iroh = { workspace = true }
 web-transport-trait = { workspace = true }
 # url: needed by iroh_peer.rs to construct the pkarr relay URL for lookups.
 url = { workspace = true }
+# n0-error: iroh's error type (`address_lookup::Error`) is type-erased through
+# n0-error's `AnyError`. iroh_peer.rs needs the `StackError` trait to walk the
+# source chain and downcast a pkarr 404 to `Ok(None)` (#475). Pinned to iroh's
+# transitive version so the `PkarrError` downcast resolves the same type.
+n0-error = "=1.0.0-rc.0"
 # NOTE: moq-net is NOT added here. moq-net 0.1.8 has Session+Sync bounds that
 # conflict with browser WebTransport types (!Sync on wasm32). This requires an
 # upstream fix in moq-net before it can compile for wasm32-unknown-unknown.
