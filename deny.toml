@@ -38,6 +38,8 @@ allow = [
     "MPL-2.0",
     "Zlib",
     "OpenSSL",
+    "BSL-1.0",    # Boost Software License (permissive)
+    "Unlicense",  # public domain equivalent (permissive)
 ]
 
 # xet-core (huggingface/xet-core, pinned tag git-xet-v0.2.0) internal workspace
