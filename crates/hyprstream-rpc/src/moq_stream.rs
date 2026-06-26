@@ -305,11 +305,11 @@ impl ProducerReachConfig {
         //   - `ServerDefault` → this server's `self.relay` (the common case),
         //   - `Override(r)`   → a per-stream relay (per-tenant isolation),
         //   - `Only(r)`       → a per-stream relay, direct reaches omitted,
-        //   - `None`          → no relay reach (direct-only for this stream).
+        //   - `NoRelay`        → no relay reach (direct-only for this stream).
         let relay = match relay_choice {
             RelayChoice::ServerDefault => self.relay.clone(),
             RelayChoice::Override(r) | RelayChoice::Only(r) => Some(r),
-            RelayChoice::None => None,
+            RelayChoice::NoRelay => None,
         };
         if let Some(relay) = relay {
             reach.push(Destination { role: Role::Relay, transport: relay });
@@ -336,7 +336,10 @@ pub enum RelayChoice {
     /// reaches, so the client can only route through the relay (server authority).
     Only(crate::stream_info::TransportConfig),
     /// No relay reach for this stream — advertise the direct reaches only.
-    None,
+    ///
+    /// Named `NoRelay` (not `None`) to avoid shadowing [`Option::None`] under a
+    /// glob import of this enum's variants.
+    NoRelay,
 }
 
 /// Snapshot the process globals into a [`ProducerReachConfig`] (#384 compat).
