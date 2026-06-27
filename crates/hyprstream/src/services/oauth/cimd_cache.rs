@@ -7,24 +7,25 @@
 //!
 //! Design:
 //!
-//! * `entries: HashMap<client_id_url, CachedClient>` — O(1) lookup.
-//! * `heap: BinaryHeap<Reverse<HeapEntry>>` — min-heap of `(expires_at,
-//!   client_id, version)` for O(log n) ordered eviction.
-//! * **Lazy deletion** via per-client version counter: on re-insert we
-//!   push a new heap node but do NOT walk the heap to remove the old one.
-//!   The reaper discards heap nodes whose version no longer matches the
-//!   HashMap entry's version.
-//! * **Inline reap** at every cache access, bounded to `reap_budget` pops
-//!   per call to keep tail latency predictable. No background task.
-//! * **TTL bounds** clamp HTTP `Cache-Control: max-age` / `Expires` to
-//!   `[min_ttl, max_ttl]`. Default `[5min, 24h]`.
-//! * **Capacity bound**: when full, evict the next-to-expire entry.
+//! This cache is a thin OAuth-specific wrapper over the shared
+//! [`TtlCache`](hyprstream_discovery::TtlCache) substrate (extracted in
+//! #524). `TtlCache` provides the eviction machinery — per-entry TTL,
+//! lazy version-tagged deletion on re-insert, bounded inline reaping and
+//! a capacity bound (next-to-expire victim). This wrapper adds:
+//!
+//! * **TTL clamping**: HTTP `Cache-Control: max-age` / `Expires` is
+//!   clamped to `[min_ttl, max_ttl]` (default `[5min, 24h]`) before the
+//!   entry is inserted. Defends against thundering-herd refetch (`max-age=0`)
+//!   and unbounded staleness.
+//! * **`RegisteredClient` keying** by `client_id` URL.
+//!
+//! The public API remains `async` for call-site compatibility; the
+//! underlying `TtlCache` is synchronous (operations are short, in-memory
+//! and never span an `.await`).
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, RwLock};
+use std::time::Duration;
+
+use hyprstream_discovery::TtlCache;
 
 use super::state::RegisteredClient;
 
@@ -49,68 +50,30 @@ pub struct CimdCacheConfig {
 impl Default for CimdCacheConfig {
     fn default() -> Self {
         Self {
-            min_ttl: Duration::from_secs(300),     // 5 min
-            max_ttl: Duration::from_secs(86_400),  // 24 h
+            min_ttl: Duration::from_secs(300),    // 5 min
+            max_ttl: Duration::from_secs(86_400), // 24 h
             max_entries: 10_000,
             reap_budget: 16,
         }
     }
 }
 
-/// A cached client with expiry + version tag for lazy heap deletion.
-#[derive(Debug, Clone)]
-struct CachedClient {
-    client: RegisteredClient,
-    expires_at: Instant,
-    /// Monotonic version per client_id. Bumped on every insert. The
-    /// reaper compares this to the heap node's `version` to detect stale
-    /// nodes left behind by re-inserts.
-    version: u64,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct HeapEntry {
-    expires_at: Instant,
-    client_id: String,
-    version: u64,
-}
-
-// Min-heap by expires_at: smaller expires_at sorts first when wrapped in
-// Reverse. PartialOrd/Ord only consider expires_at; ties broken by string
-// comparison for determinism.
-impl Ord for HeapEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.expires_at
-            .cmp(&other.expires_at)
-            .then_with(|| self.client_id.cmp(&other.client_id))
-    }
-}
-impl PartialOrd for HeapEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
 /// CIMD metadata cache. Thread-safe; cheap to share via `Arc`.
 pub struct CimdCache {
-    entries: RwLock<HashMap<String, CachedClient>>,
-    heap: Mutex<BinaryHeap<Reverse<HeapEntry>>>,
+    cache: TtlCache<String, RegisteredClient>,
     config: CimdCacheConfig,
-    next_version: AtomicU64,
 }
 
 impl CimdCache {
+    #[must_use]
     pub fn new(config: CimdCacheConfig) -> Self {
-        Self {
-            entries: RwLock::new(HashMap::new()),
-            heap: Mutex::new(BinaryHeap::new()),
-            config,
-            next_version: AtomicU64::new(1),
-        }
+        let cache = TtlCache::new(config.max_entries, config.reap_budget);
+        Self { cache, config }
     }
 
     /// Compute a clamped TTL from an optional upstream `max-age` value.
     /// `None` (no cache header) yields `min_ttl`.
+    #[must_use]
     pub fn clamp_ttl(&self, http_max_age: Option<Duration>) -> Duration {
         let ttl = http_max_age.unwrap_or(self.config.min_ttl);
         ttl.clamp(self.config.min_ttl, self.config.max_ttl)
@@ -121,92 +84,27 @@ impl CimdCache {
     /// Performs a bounded inline reap before the lookup. Returns `None`
     /// if absent or expired.
     pub async fn get(&self, client_id: &str) -> Option<RegisteredClient> {
-        self.reap(Instant::now()).await;
-        let entries = self.entries.read().await;
-        let cached = entries.get(client_id)?;
-        if Instant::now() >= cached.expires_at {
-            None
-        } else {
-            Some(cached.client.clone())
-        }
+        self.cache.get(client_id)
     }
 
     /// Insert (or replace) a cached CIMD client with the given TTL.
     ///
     /// If the cache is at capacity, the next-to-expire entry is evicted
-    /// first. The new entry is added to both the HashMap and the heap;
-    /// any prior heap node for this client_id becomes stale and will be
-    /// reaped lazily.
+    /// first. Re-inserting an existing `client_id` refreshes it (bumps
+    /// the version tag); the prior heap node is reaped lazily.
     pub async fn insert(&self, client: RegisteredClient, ttl: Duration) {
-        let now = Instant::now();
-        self.reap(now).await;
-
-        let expires_at = now + ttl;
         let client_id = client.client_id.clone();
-        let version = self.next_version.fetch_add(1, Ordering::Relaxed);
-
-        // Evict if at capacity AND this would be a new key.
-        {
-            let entries = self.entries.read().await;
-            let at_capacity = entries.len() >= self.config.max_entries
-                && !entries.contains_key(&client_id);
-            drop(entries);
-            if at_capacity {
-                self.evict_one().await;
-            }
-        }
-
-        let cached = CachedClient { client, expires_at, version };
-        self.entries.write().await.insert(client_id.clone(), cached);
-        self.heap.lock().await.push(Reverse(HeapEntry { expires_at, client_id, version }));
-    }
-
-    /// Reap expired entries from the heap, bounded by `reap_budget`.
-    /// Stale heap nodes (version mismatch) are discarded without touching
-    /// the HashMap.
-    async fn reap(&self, now: Instant) {
-        let mut heap = self.heap.lock().await;
-        for _ in 0..self.config.reap_budget {
-            let Some(Reverse(top)) = heap.peek() else { break };
-            if top.expires_at > now {
-                break;
-            }
-            let popped = heap.pop().unwrap_or_else(|| unreachable!()).0;
-            // Acquire write lock briefly to remove if version still matches.
-            let mut entries = self.entries.write().await;
-            if let Some(cached) = entries.get(&popped.client_id) {
-                if cached.version == popped.version && cached.expires_at <= now {
-                    entries.remove(&popped.client_id);
-                }
-                // else: stale heap node (entry was refreshed) — drop silently.
-            }
-        }
-    }
-
-    /// Evict the single next-to-expire entry. Called when the cache is at
-    /// capacity and a new key arrives.
-    async fn evict_one(&self) {
-        let mut heap = self.heap.lock().await;
-        while let Some(Reverse(top)) = heap.pop() {
-            let mut entries = self.entries.write().await;
-            if let Some(cached) = entries.get(&top.client_id) {
-                if cached.version == top.version {
-                    entries.remove(&top.client_id);
-                    return;
-                }
-                // Stale heap node — keep popping.
-            }
-        }
+        self.cache.insert(client_id, client, ttl);
     }
 
     /// Current cache size (for metrics / tests).
     pub async fn len(&self) -> usize {
-        self.entries.read().await.len()
+        self.cache.len()
     }
 
     /// True when no entries are cached. Mostly for tests.
     pub async fn is_empty(&self) -> bool {
-        self.entries.read().await.is_empty()
+        self.cache.is_empty()
     }
 }
 
@@ -214,6 +112,7 @@ impl CimdCache {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     fn make_client(id: &str) -> RegisteredClient {
         RegisteredClient {

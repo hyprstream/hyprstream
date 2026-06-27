@@ -38,8 +38,10 @@ pub mod generated {
 }
 
 mod service;
+pub mod ttl_cache;
 
 // Re-export key types
+pub use ttl_cache::TtlCache;
 pub use hyprstream_rpc::resolver::Resolver;
 pub use hyprstream_rpc::registry::SocketKind;
 pub use service::{AuthorizationProvider, DiscoveryService, RecordCarData, RecordResolver};
