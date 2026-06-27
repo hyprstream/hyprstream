@@ -49,6 +49,9 @@ BuildRequires:  pkgconfig
 BuildRequires:  openssl-devel
 BuildRequires:  systemd-devel
 BuildRequires:  capnproto
+# libclang.so for bindgen (aws-lc-sys build script)
+BuildRequires:  clang
+BuildRequires:  clang-devel
 BuildRequires:  patchelf
 # NOTE: perl is deliberately NOT required. openssl-sys would only invoke perl
 # for a from-source OpenSSL build, which OPENSSL_NO_VENDOR=1 (below) disables.
@@ -116,6 +119,9 @@ export OPENSSL_INCLUDE_DIR=%{_includedir}
 
 # CPU build. libtorch (PyTorch 2.10.0 CPU) is fetched at build time via the
 # download-libtorch feature and extracted under target/.../torch-sys-*/out.
+# bindgen (aws-lc-sys) needs libclang; set explicitly so the in-rpmbuild
+# compile finds it even if the environment is scrubbed.
+export LIBCLANG_PATH=%{_libdir}
 env -u CROSS_COMPILE cargo build --release \
     --features download-libtorch,otel,gittorrent,xet
 
