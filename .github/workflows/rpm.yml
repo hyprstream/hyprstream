@@ -53,6 +53,7 @@ jobs:
           $PM install -y --allowerasing \
             rpm-build rpmdevtools \
             gcc gcc-c++ cmake make pkgconfig \
+            clang clang-devel \
             openssl-devel systemd-devel capnproto patchelf \
             git git-lfs ca-certificates \
             tar gzip findutils which
