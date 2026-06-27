@@ -3433,7 +3433,7 @@ mod tests {
             None,
         )
         .expect("test: policy client");
-        let registry_transport = TransportConfig::inproc(&format!("test-registry-436-{repo_name}"));
+        let registry_transport = TransportConfig::inproc(format!("test-registry-436-{repo_name}"));
         let service = RegistryService::new(base_dir, policy_client, registry_transport, signing_key)
             .await
             .expect("test: create registry service");
