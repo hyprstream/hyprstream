@@ -24,6 +24,24 @@
 # Private libdir for the bundled libtorch shared objects.
 %global torchlibdir %{_libdir}/%{name}
 
+# --- Bundled libtorch dependency filtering ----------------------------------
+# The libtorch CPU runtime ships privately under %{torchlibdir} and is resolved
+# at runtime via the binary's RUNPATH. RPM's automatic dependency generator must
+# NOT (a) turn the bundled sonames into unsatisfiable system-level Requires, nor
+# (b) leak them as system-level Provides. Two layers:
+#   1. Path scope: skip auto requires/provides for every .so under the private
+#      bundle dir. This covers the bundled libs' inter-dependencies -- e.g.
+#      libtorch_cpu.so -> the hash-mangled libgomp-<hash>.so.1 (and its GOMP_/OMP_
+#      symbol versions) on Fedora, and libc10.so / libtorch_cpu.so on Rocky.
+#   2. Soname scope: the hyprstream binary itself lives in %{_bindir} (outside the
+#      bundle dir) and hard-links the libtorch family via DT_NEEDED, so also drop
+#      those auto-generated Requires by soname. The regex is scoped to the libtorch
+#      soname family ONLY -- it never matches the cuda-toolkit/rocm weak deps
+#      (Recommends) or the manual git/git-lfs/ca-certificates Requires.
+%global __requires_exclude_from ^%{torchlibdir}/.*\.so.*$
+%global __provides_exclude_from ^%{torchlibdir}/.*\.so.*$
+%global __requires_exclude ^lib(c10.*|torch.*|gomp-[0-9a-f]+.*|caffe2.*|shm.*|gloo.*|tensorpipe.*|nnpack.*|pytorch_qnnpack.*|XNNPACK.*|dnnl.*|asmjit.*|fbgemm.*|cpuinfo.*)\.so.*$
+
 Name:           hyprstream
 Version:        0.5.0
 Release:        1%{?dist}
