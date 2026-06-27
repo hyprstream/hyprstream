@@ -111,49 +111,72 @@ fn install_classical_verify_policy() {
 // through the real `dial()` factory, so the production path is exercised
 // faithfully — only the client-side endpoint is shared, exactly as in prod.
 
-static SHARED_CLIENT: tokio::sync::OnceCell<iroh::Endpoint> = tokio::sync::OnceCell::const_new();
-static SHARED_CLIENT_SUBSTRATE: tokio::sync::OnceCell<Option<IrohSubstrate>> =
-    tokio::sync::OnceCell::const_new();
+// The shared client endpoint is built ONCE on a DEDICATED, never-terminated
+// background runtime so its iroh state-actor + Router tasks outlive every
+// per-test `#[tokio::test]` runtime.
+//
+// The previous `tokio::sync::OnceCell` version ran `IrohSubstrate::new()` (which
+// `bind()`s the endpoint and `spawn()`s the Router) on whichever test called it
+// FIRST. iroh spawns those tasks on the runtime active at `bind()`, so once that
+// first test's `#[tokio::test]` runtime was torn down the endpoint's state actor
+// stopped and every later test's `connect()` flaked with iroh's "Internal
+// consistency error" (`RemoteStateActorStopped`) under CI load. Pinning the
+// substrate `Arc` did NOT help — it's the runtime/tasks, not the Arc, that must
+// survive. Hosting the substrate on a process-lifetime runtime removes the
+// cross-runtime hazard; calling `connect()` from each test's own runtime is fine
+// (iroh drives the long-lived actor over channels — the same shape as prod,
+// where one endpoint serves the whole process).
+static SHARED_CLIENT: std::sync::OnceLock<iroh::Endpoint> = std::sync::OnceLock::new();
 
-/// The shared process-global client endpoint, installing it on first call.
-/// Every test in this binary reuses this one endpoint (matching the daemon's
-/// one-endpoint bootstrap), so `dial()` and `dial_stream()` always see an
-/// installed global no matter which test runs first.
-///
-/// The originating `IrohSubstrate` is kept alive for the process lifetime
-/// (stored in `SHARED_CLIENT_SUBSTRATE`): dropping it would tear down the
-/// Router, which stops the endpoint's internal state actor and makes every
-/// subsequent `connect()` fail with `Internal consistency error`. The endpoint
-/// clone is Arc-backed but is NOT sufficient on its own — the Router's tasks
-/// must keep running.
-async fn shared_client_endpoint() -> iroh::Endpoint {
-    // Initialize the substrate once and pin it for the process lifetime.
-    SHARED_CLIENT_SUBSTRATE
-        .get_or_init(|| async {
-            let substrate = IrohSubstrate::new(
-                fresh_node_key(),
-                NoopHandler::new("shared-client-moq"),
-                NoopHandler::new("shared-client-rpc"),
-            )
-            .await
-            .expect("bind shared client endpoint");
-            Some(substrate)
-        })
-        .await;
-    // Now install + return the endpoint clone.
+/// The shared process-global client endpoint, building + installing it on first
+/// call on a dedicated runtime that lives for the whole test binary. Every test
+/// reuses this one endpoint (matching the daemon's one-endpoint bootstrap), so
+/// `dial()` / `dial_stream()` always see an installed, *live* global no matter
+/// which test runs (or finishes) first.
+fn shared_client_endpoint_blocking() -> iroh::Endpoint {
     SHARED_CLIENT
-        .get_or_init(|| async {
-            // SAFETY: substrate is Some after the init above.
-            let substrate = SHARED_CLIENT_SUBSTRATE
-                .get()
-                .and_then(|o| o.as_ref())
-                .expect("substrate initialized above");
-            let endpoint = substrate.endpoint().clone();
-            let _ = install_iroh_client_endpoint(endpoint.clone());
-            endpoint
+        .get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .name("shared-iroh-client".into())
+                .spawn(move || {
+                    let rt = tokio::runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .build()
+                        .expect("build shared iroh client runtime");
+                    // Build the substrate on `rt` and keep BOTH on this thread's
+                    // stack (never dropped) so the Router + endpoint state actor
+                    // run for the whole process. Dropping the substrate would shut
+                    // the Router down; we publish the endpoint clone, then park.
+                    let _substrate = rt.block_on(async {
+                        let substrate = IrohSubstrate::new(
+                            fresh_node_key(),
+                            NoopHandler::new("shared-client-moq"),
+                            NoopHandler::new("shared-client-rpc"),
+                        )
+                        .await
+                        .expect("bind shared client endpoint");
+                        let endpoint = substrate.endpoint().clone();
+                        let _ = install_iroh_client_endpoint(endpoint.clone());
+                        tx.send(endpoint).expect("publish shared client endpoint");
+                        substrate
+                    });
+                    // Hold the runtime + substrate (and thus the endpoint's tasks)
+                    // alive forever.
+                    loop {
+                        std::thread::park();
+                    }
+                })
+                .expect("spawn shared iroh client thread");
+            rx.recv().expect("receive shared client endpoint")
         })
-        .await
         .clone()
+}
+
+/// Async wrapper so existing `shared_client_endpoint().await` call sites are
+/// unchanged. The endpoint lives on its own runtime (see [`SHARED_CLIENT`]).
+async fn shared_client_endpoint() -> iroh::Endpoint {
+    shared_client_endpoint_blocking()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -674,15 +697,30 @@ async fn one_substrate_serves_both_alpns_rpc_and_moq() -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Sanity: a bare iroh reach with no reachability fails fast at `dial_stream`
-// (mirrors the existing `dial_stream_iroh_without_reach_fails_fast` unit test,
-// but through the integration-test surface). Kept as a regression guard for the
-// `direct_addrs.is_empty() && relay_url.is_none()` fast-fail in `dial_stream`.
+// Sanity: a bare iroh reach (node_id only, no direct addrs / relay) to a node
+// that is NOT discoverable must FAIL — bounded, not hang.
+//
+// #357 changed `dial_stream`'s iroh arm: node_id-alone is now dialable via the
+// shared endpoint's pkarr / n0 DNS discovery, so `dial_stream` no longer
+// fast-fails up-front on `direct_addrs.is_empty() && relay_url.is_none()` (that
+// reachability precondition now lives only in the RPC-plane `dial()` factory).
+// This previously asserted that removed "not dialable / reachability" message
+// and so failed deterministically. The meaningful post-#357 invariant — and the
+// regression guard kept here — is that a reach to an *undiscoverable* random
+// EndpointId resolves to an error in bounded time rather than hanging. (The
+// matching unit test is `dial::tests::dial_stream_iroh_node_id_alone_requires_installed_endpoint`.)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dial_stream_iroh_without_reach_fails_fast() {
-    // EndpointId must be a valid Ed25519 pubkey; use a well-formed nonzero one.
+    // Ensure the shared client endpoint is installed + live (otherwise the dial
+    // would short-circuit on "no iroh client endpoint installed", which is
+    // order-dependent across this binary's tests). With it installed we exercise
+    // the real #357 discovery path against a key that has no published record.
+    let _client_endpoint = shared_client_endpoint().await;
+
+    // EndpointId must be a valid Ed25519 pubkey; use a well-formed nonzero one
+    // that is not published anywhere, so discovery cannot resolve any address.
     let cfg = TransportConfig::iroh(
         EndpointId::from_bytes(&[7u8; 32])
             .map(|id| *id.as_bytes())
@@ -690,16 +728,15 @@ async fn dial_stream_iroh_without_reach_fails_fast() {
         Vec::new(),
         None,
     );
-    let res = dial_stream(&cfg).await;
-    assert!(
-        res.is_err(),
-        "iroh reach with neither direct addrs nor a relay must fail fast, not hang"
-    );
-    // Confirm the error message names the reachability precondition (not, say,
-    // a connection-attempt timeout) — the fast-fail path bails before any dial.
-    let msg = res.err().unwrap().to_string();
-    assert!(
-        msg.contains("not dialable") || msg.contains("reachability"),
-        "expected a reachability fast-fail error, got: {msg}"
-    );
+
+    // Bound the dial: it must COMPLETE with an error, not hang. A `Err(_elapsed)`
+    // here would be a real regression (a node_id-only reach hanging in discovery).
+    let res = tokio::time::timeout(std::time::Duration::from_secs(30), dial_stream(&cfg)).await;
+    match res {
+        Ok(inner) => assert!(
+            inner.is_err(),
+            "iroh reach to an undiscoverable node_id must fail, not succeed"
+        ),
+        Err(_elapsed) => panic!("dial_stream hung on an undiscoverable node_id-only reach"),
+    }
 }
