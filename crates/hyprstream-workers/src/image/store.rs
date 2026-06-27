@@ -463,7 +463,7 @@ impl RafsStore {
                                 id: metadata.image_id.clone(),
                                 repo_tags: vec![metadata.image_ref.clone()],
                                 repo_digests: vec![metadata.config_digest.clone()],
-                                size: 0, // TODO: Calculate from layers
+                                size: self.calculate_image_size(&metadata),
                                 uid: -1,
                                 username: String::new(),
                                 spec: ImageSpec {
@@ -598,6 +598,18 @@ impl RafsStore {
             .join(format!("{}.meta", digest_to_filename(image_id)))
     }
 
+    /// Sum on-disk bytes for each layer blob recorded in `metadata`.
+    fn calculate_image_size(&self, metadata: &ImageMetadata) -> u64 {
+        metadata
+            .layers
+            .iter()
+            .map(|digest| {
+                let path = self.blobs_dir.join(digest_to_filename(digest));
+                std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+            })
+            .sum()
+    }
+
     /// Get layer blob path for a digest
     pub fn blob_path(&self, digest: &str) -> PathBuf {
         self.blobs_dir.join(digest_to_filename(digest))
@@ -631,7 +643,7 @@ impl RafsStore {
                     id: metadata.image_id.clone(),
                     repo_tags: vec![metadata.image_ref.clone()],
                     repo_digests: vec![metadata.config_digest.clone()],
-                    size: 0, // TODO: Calculate from layers
+                    size: self.calculate_image_size(&metadata),
                     uid: -1,
                     username: String::new(),
                     spec: ImageSpec {

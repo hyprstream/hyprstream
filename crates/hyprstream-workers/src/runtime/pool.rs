@@ -4,6 +4,7 @@
 //! Delegates sandbox lifecycle to a pluggable `SandboxBackend`.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -32,6 +33,13 @@ pub struct SandboxPool {
 
     /// Pluggable sandbox backend
     backend: Arc<dyn SandboxBackend>,
+
+    /// Warm sandboxes currently being created (reserved replenishment slots).
+    ///
+    /// Counts creations that have been claimed by `replenish_warm_pool` but
+    /// have not yet been pushed onto `warm_pool`, so concurrent replenish tasks
+    /// can see in-flight work and avoid overshooting `warm_pool_size`.
+    in_flight: AtomicUsize,
 }
 
 impl SandboxPool {
@@ -42,6 +50,7 @@ impl SandboxPool {
             active: Mutex::new(HashMap::new()),
             config,
             backend,
+            in_flight: AtomicUsize::new(0),
         }
     }
 
@@ -74,7 +83,7 @@ impl SandboxPool {
     /// Acquire a sandbox from the pool
     ///
     /// Prefers warm sandboxes, creates new if none available.
-    pub async fn acquire(&self, config: &PodSandboxConfig) -> Result<String> {
+    pub async fn acquire(self: &Arc<Self>, config: &PodSandboxConfig) -> Result<String> {
         // Check capacity
         let active_count = self.active.lock().await.len();
         if active_count >= self.config.max_sandboxes {
@@ -104,18 +113,19 @@ impl SandboxPool {
         self.active.lock().await.insert(sandbox_id.clone(), sandbox);
 
         // Replenish warm pool in background
-        self.replenish_warm_pool();
+        Self::replenish_warm_pool(self.clone());
 
         Ok(sandbox_id)
     }
 
     /// Release a sandbox back to the pool or destroy it
-    pub async fn release(&self, sandbox_id: &str) -> Result<()> {
+    pub async fn release(self: &Arc<Self>, sandbox_id: &str) -> Result<()> {
         let mut active = self.active.lock().await;
 
         let sandbox = active
             .remove(sandbox_id)
             .ok_or_else(|| WorkerError::SandboxNotFound(sandbox_id.to_owned()))?;
+        drop(active);
 
         // Stop the sandbox
         self.backend.stop(&sandbox).await?;
@@ -126,8 +136,11 @@ impl SandboxPool {
             drop(warm);
             // Reset and return to warm pool
             let reset_sandbox = self.reset_sandbox(sandbox).await?;
-            if let Some(s) = reset_sandbox {
-                self.warm_pool.lock().await.push_back(s);
+            match reset_sandbox {
+                Some(s) => self.warm_pool.lock().await.push_back(s),
+                // Backend reported the sandbox as non-reusable and destroyed it,
+                // so the warm pool may now be below target — replenish it.
+                None => Self::replenish_warm_pool(self.clone()),
             }
         } else {
             drop(warm);
@@ -267,9 +280,43 @@ impl SandboxPool {
         }
     }
 
-    /// Replenish warm pool in background
-    fn replenish_warm_pool(&self) {
-        // TODO: Spawn background task to replenish warm pool
+    /// Replenish warm pool in background when it drops below target.
+    ///
+    /// Concurrency-safe: each invocation atomically claims the slots it intends
+    /// to fill (the deficit between `warm_pool_size` and the warm count plus any
+    /// in-flight creations) while holding the warm-pool lock, then creates that
+    /// many sandboxes. Reserving slots up front prevents the TOCTOU race where N
+    /// concurrent tasks each observe the same deficit and overshoot the target,
+    /// and creating the full deficit (rather than a single sandbox) lets the
+    /// pool recover quickly after a burst drains it.
+    fn replenish_warm_pool(pool: Arc<Self>) {
+        let target = pool.config.warm_pool_size;
+        tokio::spawn(async move {
+            // Reserve slots while holding the lock so concurrent replenish tasks
+            // observe each other's claims via `in_flight`.
+            let to_create = {
+                let warm = pool.warm_pool.lock().await;
+                let in_flight = pool.in_flight.load(Ordering::SeqCst);
+                let deficit = target.saturating_sub(warm.len() + in_flight);
+                pool.in_flight.fetch_add(deficit, Ordering::SeqCst);
+                deficit
+            };
+
+            for _ in 0..to_create {
+                match pool.create_warm_sandbox().await {
+                    Ok(sandbox) => {
+                        pool.warm_pool.lock().await.push_back(sandbox);
+                        tracing::debug!(target, "Warm pool replenished");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to replenish warm pool");
+                    }
+                }
+                // Release the reserved slot once this creation completes,
+                // whether it succeeded or failed.
+                pool.in_flight.fetch_sub(1, Ordering::SeqCst);
+            }
+        });
     }
 }
 
@@ -299,7 +346,7 @@ mod tests {
     async fn create_test_pool(
         max_sandboxes: usize,
         warm_pool_size: usize,
-    ) -> Result<(SandboxPool, TempDir)> {
+    ) -> Result<(Arc<SandboxPool>, TempDir)> {
         let temp_dir = TempDir::new()?;
         let base_path = temp_dir.path();
 
@@ -329,7 +376,7 @@ mod tests {
         let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
         let backend: Arc<dyn SandboxBackend> =
             Arc::new(KataBackend::new(image_config, rafs_store));
-        let pool = SandboxPool::new(pool_config, backend);
+        let pool = Arc::new(SandboxPool::new(pool_config, backend));
 
         Ok((pool, temp_dir))
     }
