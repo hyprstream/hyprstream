@@ -106,6 +106,9 @@ async fn moq_relay_rendezvous() -> Result<()> {
     let ctx = StreamContext::from_dh(&client_pub.to_bytes())?;
     let topic = ctx.topic().to_owned();
     let mac_key = *ctx.mac_key();
+    // #321/#528: the DH path seals every frame into a `Tagged` AEAD block, so the
+    // consumer needs the matching `enc_key` to open it back to plaintext `Data`.
+    let enc_key = *ctx.enc_key().expect("DH ctx has enc_key");
 
     // ── PRODUCER: a LOCAL origin, never bound to a network endpoint ────────────
     // The producer is NOT directly reachable (no QuinnRpcServer of its own). Its
@@ -155,8 +158,10 @@ async fn moq_relay_rendezvous() -> Result<()> {
     .ok_or_else(|| anyhow!("broadcast not announced via relay"))?;
     let mut track = bc.subscribe_track(&moq_net::Track::new(STREAM_TRACK))?;
 
-    // ── Publish through the relay; verify the chained-HMAC end-to-end ──────────
-    let mut verifier = StreamVerifier::new(mac_key, topic.clone());
+    // ── Publish through the relay; verify the chained-HMAC + AEAD end-to-end ────
+    // The HMAC chain runs first over the sealed block, then the `Tagged` payload is
+    // AEAD-opened back to `Data`/`Complete` (#528): the consumer holds `enc_key`.
+    let mut verifier = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(enc_key);
     let mut got: Vec<StreamPayload> = Vec::new();
 
     // Publish one group at a time and drain it so the ordered chain is observed.
@@ -310,6 +315,9 @@ async fn relay_choice_only_anonymizes_stream_end_to_end() -> Result<()> {
     let ctx = StreamContext::from_dh(&client_pub.to_bytes())?;
     let topic = ctx.topic().to_owned();
     let mac_key = *ctx.mac_key();
+    // #321/#528: DH path is AEAD-on — the consumer needs the `enc_key` to open the
+    // sealed `Tagged` frames back into plaintext `Data`.
+    let enc_key = *ctx.enc_key().expect("DH ctx has enc_key");
 
     // Producer is a LOCAL origin, never network-bound — reachable ONLY via relay.
     let producer_origin = {
@@ -353,7 +361,7 @@ async fn relay_choice_only_anonymizes_stream_end_to_end() -> Result<()> {
     .ok_or_else(|| anyhow!("broadcast not announced via relay"))?;
     let track = bc.subscribe_track(&moq_net::Track::new(STREAM_TRACK))?;
 
-    let mut verifier = StreamVerifier::new(mac_key, topic.clone());
+    let mut verifier = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(enc_key);
     // Publish FIRST, then read the group (the moq group exists once published) —
     // matches the `next_frame` ordering in `moq_relay_rendezvous`.
     publisher.publish_data(b"anon").await?;
