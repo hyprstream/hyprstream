@@ -58,8 +58,21 @@ zbus = { version = "4", features = ["tokio"], optional = true }
 # Nydus libraries (Dragonfly-native blob fetching) — gated behind `kata-vm`.
 # Only the RAFS image-pull + virtiofs path (consumed by the Kata/CH VM backend)
 # needs these; the lightweight nspawn backend bind-mounts the host root.
-# NOTE: Using git deps because published crates.io versions have API mismatch
-# (nydus-storage 0.7.1 references field missing from nydus-api 0.4.0)
+#
+# Crates.io availability (verified 2026-06-26 against dragonflyoss/nydus v2.4.0):
+#   nydus-api     0.4.1  — ON crates.io, but mixed with git siblings causes type
+#                           mismatch: nydus-storage git uses nydus-api git types
+#                           internally; mixing crates.io nydus-api with git
+#                           nydus-storage/builder/rafs/utils/service produces
+#                           "expected nydus_api::…, found nydus_api::…" errors.
+#   nydus-storage 0.7.2  — ON crates.io (same mixing problem as above)
+#   nydus-builder        — NOT on crates.io; git dep unavoidable
+#   nydus-rafs           — NOT on crates.io; git dep unavoidable
+#   nydus-utils          — NOT on crates.io; git dep unavoidable
+#   nydus-service        — NOT on crates.io; git dep unavoidable
+#
+# Until all six nydus crates are published together on crates.io we must pin
+# the full set to the same git tag to keep types coherent.
 nydus-api = { git = "https://github.com/dragonflyoss/nydus", tag = "v2.4.0", optional = true }
 nydus-storage = { git = "https://github.com/dragonflyoss/nydus", tag = "v2.4.0", optional = true, features = [
     "backend-registry",
