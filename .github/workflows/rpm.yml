@@ -1,0 +1,158 @@
+name: RPM Package
+
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+    paths:
+      - 'packaging/rpm/**'
+      - '.github/workflows/rpm.yml'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Build the RPM and install it inside Fedora and Rocky containers.
+  # Runs on every PR touching packaging/build inputs, and on release tags.
+  build-install:
+    name: Build + install (${{ matrix.distro.name }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - { name: fedora, image: "fedora:43" }
+          - { name: rocky,  image: "rockylinux:9" }
+    container:
+      image: ${{ matrix.distro.image }}
+    steps:
+      - name: Install toolchain and build deps
+        run: |
+          set -eux
+          if command -v dnf >/dev/null; then PM=dnf; else PM=yum; fi
+          # Rocky 9 needs EPEL + CRB for capnproto/systemd-devel
+          if [ "${{ matrix.distro.name }}" = "rocky" ]; then
+            $PM install -y epel-release dnf-plugins-core
+            $PM config-manager --set-enabled crb || \
+              $PM config-manager --set-enabled powertools || true
+          fi
+          # NOTE: do not list `curl` here — Rocky 9 ships `curl-minimal`, and
+          # `dnf install curl` errors with a curl/curl-minimal file conflict.
+          # The curl binary is already present (curl-minimal on Rocky, curl on
+          # Fedora) and is used by the rustup step below.
+          # patchelf: set the binary RUNPATH to the bundled libtorch (see spec).
+          # perl is intentionally absent: OPENSSL_NO_VENDOR=1 disables the only
+          # openssl-sys code path that would invoke it.
+          $PM install -y --allowerasing \
+            rpm-build rpmdevtools \
+            gcc gcc-c++ cmake make pkgconfig \
+            clang clang-devel \
+            openssl-devel systemd-devel capnproto patchelf \
+            git git-lfs ca-certificates \
+            tar gzip findutils which
+
+      - name: Install Rust (rustup; distro rust is often too old)
+        run: |
+          set -eux
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # Cache the cargo registry + git deps (notably the tch-rs git dependency)
+      # to cut PR build time. rpmbuild compiles in ~/rpmbuild/BUILD with its own
+      # target dir, so target-artifact caching does not apply here.
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: rpm-${{ matrix.distro.name }}
+          cache-targets: false
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF_NAME:-}" == v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(grep -m1 '^version' crates/hyprstream/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build RPM
+        run: |
+          # pipefail so a build-rpm.sh / rpmbuild failure fails this step instead
+          # of being masked by `tee` (which would leave $RPM unset and surface as
+          # a confusing "RPM: unbound variable" in the install step).
+          set -euo pipefail
+          chmod +x packaging/rpm/build-rpm.sh
+          packaging/rpm/build-rpm.sh "${{ steps.ver.outputs.version }}" | tee /tmp/build.log
+          grep '^RPM=' /tmp/build.log | tail -1 >> "$GITHUB_ENV"
+
+      - name: Install the RPM and verify it runs
+        run: |
+          set -eux
+          # Weak-dep contract: GPU stacks are Recommends, never hard Requires.
+          # Assert on the package file BEFORE install (vendor repos aren't configured).
+          rpm -qp --requires   "$RPM" | grep -Eiq 'cuda-toolkit|^rocm' && exit 1 || true
+          rpm -qp --recommends "$RPM" | grep -Eiq 'cuda-toolkit' || { echo "missing CUDA recommend"; exit 1; }
+          rpm -qp --recommends "$RPM" | grep -Eiq 'rocm'         || { echo "missing ROCm recommend"; exit 1; }
+
+          # Install with weak deps disabled: must succeed without any GPU stack.
+          dnf install -y --setopt=install_weak_deps=False "$RPM"
+          rpm -q hyprstream
+          # Bundled libtorch must resolve via RUNPATH (no LD_LIBRARY_PATH set here).
+          hyprstream --version
+
+      - name: Upload RPM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-${{ matrix.distro.name }}-${{ steps.ver.outputs.version }}
+          path: ${{ env.RPM }}
+          retention-days: 5
+
+  # Publish the Fedora-built RPM to the GitHub Release (tags only).
+  release:
+    name: Attach RPM to release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build-install
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Extract version
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download built RPMs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: rpm-*-${{ steps.ver.outputs.version }}
+          path: rpms/
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd rpms
+          sha256sum *.rpm > RPM-SHA256SUMS.txt
+          cat RPM-SHA256SUMS.txt
+
+      - name: Publish to release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            rpms/*.rpm
+            rpms/RPM-SHA256SUMS.txt
