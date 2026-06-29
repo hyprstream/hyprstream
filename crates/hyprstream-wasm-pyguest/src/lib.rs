@@ -24,19 +24,18 @@
 //!     byte of the output is a STATUS tag (`OK`/`ERR`/`NONE`), the rest is the payload
 //!     (UTF-8). See [`Op`].
 //!
-//! ## #483 semantics (ported from the native `/lang/python` mount, re-expressed in 0.5)
+//! ## `py_op` semantics
 //!
-//!   * Op::Eval  — evaluate an expression -> `repr(result)` (captured stdout is
-//!                 returned too via the EVAL_STDOUT side channel; see `py_op`).
+//!   * Op::Eval  — evaluate an expression -> `repr(result)`; if the expression also
+//!                 printed, the captured stdout is appended after a `\n---\n` separator.
 //!   * Op::Exec  — execute statements -> captured stdout.
 //!   * Op::ListVars / Op::ListDefs — newline-joined non-dunder global names
 //!                 (defs = callables only).
 //!   * Op::GetVar / Op::GetDef     — `repr` of one named global (NONE if absent).
 //!
 //! The interpreter + its globals dict are PERSISTENT across `py_op` calls (held in a
-//! thread-local `Rc`), so user state survives — exactly like the native shell's
-//! persistent `globals`. wasm32 is single-threaded, so the thread-local is the whole
-//! guest's state.
+//! thread-local), so user state survives. wasm32 is single-threaded, so the
+//! thread-local is the whole guest's state.
 
 use rustpython_vm as vm;
 use std::cell::RefCell;
@@ -439,42 +438,17 @@ pub unsafe extern "C" fn eval(ptr: *const u8, len: usize) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// VFS builtins (#483): expose the host vfs_* capabilities to guest Python.
-//
-// These are thin wrappers so guest scripts can do `cat("/config/x")` etc. The
-// HOST scopes every call to the bound Subject; the guest never names an identity.
-// Reply ABI: first byte status (0 ok / 1 err), rest UTF-8.
+// VFS capability probe (exercises the host vfs_* imports through the guest).
 // ---------------------------------------------------------------------------
 
-/// Read a host vfs_* packed reply `(ptr<<32)|len` back into `(status, body)`.
-///
-/// # Safety
-/// `packed` must be a value returned by one of the `vfs_*` host imports; the host
-/// allocated the buffer via the guest `alloc`, so we own and `dealloc` it here.
-unsafe fn take_reply(packed: i64) -> (u8, String) {
-    let p = packed as u64;
-    let ptr = (p >> 32) as usize as *mut u8;
-    let len = (p & 0xffff_ffff) as usize;
-    if ptr.is_null() || len == 0 {
-        return (TAG_ERR, String::new());
-    }
-    let slice = std::slice::from_raw_parts(ptr, len);
-    let tag = slice[0];
-    let body = String::from_utf8_lossy(&slice[1..]).into_owned();
-    dealloc(ptr, len);
-    (tag, body)
-}
-
-/// #483 capability probe export: drive a VFS op THROUGH the guest so the
-/// `env::vfs_*` host imports are reachable (not dead-code-eliminated) and the
-/// host's Subject-scoping test can exercise a real guest->host->Namespace path.
+/// Capability probe export: drive a VFS op THROUGH the guest so the `env::vfs_*` host
+/// imports are reachable (not dead-code-eliminated) and the host's Subject-scoping
+/// test can exercise a real guest -> host -> Namespace path.
 ///
 /// `op`: 0=cat, 1=ls, 2=echo, 3=ctl. `ptr/len` = path. `dptr/dlen` = body (echo/ctl;
-/// pass 0/0 for cat/ls). Returns the host's packed reply `(ptr<<32)|len` verbatim,
-/// so the HOST reads the status byte + payload and `dealloc`s it. The guest does NOT
-/// own the buffer here (the host allocated it and reads it back).
-///
-/// This is what makes deliverable (1) end-to-end real: a guest call lands in
+/// pass 0/0 for cat/ls). Returns the host's packed reply `(ptr<<32)|len` verbatim, so
+/// the HOST reads the status byte + payload and `dealloc`s it. The guest does NOT own
+/// the buffer here (the host allocated it and reads it back). A guest call lands in
 /// `vfs_cat`/`vfs_echo`/… which the host resolves against the Subject-scoped proxy.
 ///
 /// # Safety
@@ -493,48 +467,5 @@ pub unsafe extern "C" fn vfs_probe(
         2 => vfs_echo(ptr, len, dptr, dlen),
         3 => vfs_ctl(ptr, len, dptr, dlen),
         _ => 0,
-    }
-}
-
-/// Helper the guest-side native builtins would call. Exposed for completeness; the
-/// minimal P2 guest drives VFS via these free functions rather than registering
-/// native Python builtins (which needs `host_env`/extra wiring we deliberately omit).
-/// A follow-up can register these as `cat`/`ls`/`write`/`ctl` Python builtins.
-pub fn guest_cat(path: &str) -> Result<String, String> {
-    // SAFETY: calling the host import with a valid path slice; reply is owned.
-    let (tag, body) = unsafe { take_reply(vfs_cat(path.as_ptr(), path.len())) };
-    if tag == TAG_OK {
-        Ok(body)
-    } else {
-        Err(body)
-    }
-}
-
-pub fn guest_ls(path: &str) -> Result<String, String> {
-    let (tag, body) = unsafe { take_reply(vfs_ls(path.as_ptr(), path.len())) };
-    if tag == TAG_OK {
-        Ok(body)
-    } else {
-        Err(body)
-    }
-}
-
-pub fn guest_echo(path: &str, data: &str) -> Result<(), String> {
-    let (tag, body) =
-        unsafe { take_reply(vfs_echo(path.as_ptr(), path.len(), data.as_ptr(), data.len())) };
-    if tag == TAG_OK {
-        Ok(())
-    } else {
-        Err(body)
-    }
-}
-
-pub fn guest_ctl(path: &str, cmd: &str) -> Result<String, String> {
-    let (tag, body) =
-        unsafe { take_reply(vfs_ctl(path.as_ptr(), path.len(), cmd.as_ptr(), cmd.len())) };
-    if tag == TAG_OK {
-        Ok(body)
-    } else {
-        Err(body)
     }
 }

@@ -20,7 +20,7 @@ description = "RustPython guest compiled to wasm32-unknown-unknown for the #505 
 crate-type = ["cdylib"]
 
 [dependencies]
-# RustPython VM, bumped 0.3 -> 0.5 (the P1 green path; see FINDINGS.md).
+# RustPython VM at 0.5 (see crates/hyprstream-sandbox/README.md for the getrandom rationale).
 #   * 0.5 declares getrandom 0.3 with NO `js` feature, so the wasm32-unknown-unknown
 #     custom getrandom-0.3 backend is actually reachable (0.3.1 force-enabled
 #     getrandom/js, which out-ranked the custom backend and trapped at VM bootstrap).
