@@ -6409,6 +6409,7 @@ dependencies = [
  "opentelemetry_sdk",
  "p256",
  "parking_lot 0.12.4",
+ "proptest",
  "prost 0.13.5",
  "rand 0.8.5",
  "ratatui",
