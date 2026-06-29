@@ -1,8 +1,12 @@
 //! Integration tests for the #505 capability sandbox (P1 host).
 //!
-//! These tests need the guest wasm artifact built first:
-//!   cargo build --release --target wasm32-unknown-unknown \
-//!     --manifest-path crates/hyprstream-wasm-pyguest/Cargo.toml
+//! These tests need the guest wasm artifact built first (build FROM the crate dir):
+//!   (cd crates/hyprstream-wasm-pyguest && cargo build --release --target wasm32-unknown-unknown)
+//!
+//! NOTE: build from the crate directory, not with `--manifest-path` from the repo root.
+//! The `getrandom_backend="custom"` rustflag lives in the pyguest crate's
+//! `.cargo/config.toml`, and Cargo only discovers `.cargo/config.toml` from the CWD, not
+//! from `--manifest-path` — a root `--manifest-path` build FAILS on getrandom/wasm32.
 //!
 //! The guest is an EXCLUDED, standalone package (own target dir), so its artifact
 //! lands at:

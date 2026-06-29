@@ -8,6 +8,14 @@
 # is gone.) `--allow-undefined` lets `host_random` remain a wasm IMPORT rather than a
 # hard link error. `host_random` is then a normal wasm import the wasmtime Linker
 # resolves. With 0.5 the only declared import should be exactly `env::host_random`.
+#
+# IMPORTANT — build location: you MUST build from THIS crate's directory, e.g.
+#   (cd crates/hyprstream-wasm-pyguest && cargo build --release --target wasm32-unknown-unknown)
+# The `getrandom_backend="custom"` rustflag below lives in THIS .cargo/config.toml, and
+# Cargo only discovers .cargo/config.toml by walking up from the CWD, NOT from
+# --manifest-path. So `cargo build --manifest-path crates/hyprstream-wasm-pyguest/Cargo.toml`
+# run from the repo root will NOT pick up this cfg, and the build will FAIL on
+# getrandom/wasm32 ("the wasm32-unknown-unknown target is not supported ... enable wasm_js").
 [target.wasm32-unknown-unknown]
 rustflags = [
     '--cfg', 'getrandom_backend="custom"',

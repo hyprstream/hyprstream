@@ -7,9 +7,13 @@
 //! Anything else (e.g. `import os; os.system(...)`) has nothing to call — inert by
 //! construction.
 //!
-//! Build:
-//!   cargo build --release --target wasm32-unknown-unknown \
-//!     --manifest-path crates/hyprstream-wasm-pyguest/Cargo.toml
+//! Build (MUST run from THIS crate's directory):
+//!   (cd crates/hyprstream-wasm-pyguest && cargo build --release --target wasm32-unknown-unknown)
+//!
+//! The `getrandom_backend="custom"` rustflag lives in this crate's `.cargo/config.toml`,
+//! and Cargo only discovers `.cargo/config.toml` from the CWD (walking up), NOT from
+//! `--manifest-path`. Building with `--manifest-path …pyguest/Cargo.toml` from the repo
+//! root drops the cfg and the build FAILS on getrandom/wasm32 (enable wasm_js error).
 //!
 //! ## ABI
 //!

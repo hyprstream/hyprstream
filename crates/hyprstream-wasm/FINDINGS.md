@@ -17,10 +17,17 @@ green path identified. Two interpreter-version regimes:
 
 | | rustpython-vm 0.3.1 (spec-pinned) | rustpython-vm 0.5.0 (validated resolution) |
 |---|---|---|
-| getrandom major | 0.2.17 (runtime RNG) + 0.3.4 (ahash) | 0.3.x only |
+| getrandom major | 0.2.17 (runtime RNG) + 0.3.4 (ahash) | 0.3.x only **compiled for wasm** [1] |
 | getrandom/js forced? | YES (hard-coded features=["js"]) | NO (features=["std"]) |
 | wasm imports | host_random + ~34 dead __wbindgen_placeholder__ JS/Date/crypto stubs | exactly 1: env::host_random |
 | runtime | traps at VirtualMachine::new (JS getrandom -> undefined __wbg_static_accessor_SELF) | instantiates with 1 capability (Python essential-init is a separate P1 item) |
+
+[1] The pyguest `Cargo.lock` (0.5 path) still lists getrandom 0.2.17, but it is a HOST
+build-dependency of rustpython's codegen tooling only — pulled via
+`unicode_names2_generator` `[build-dependencies]` (rand 0.8 -> rand_core 0.6 ->
+getrandom 0.2.17), which runs on the host during the build. It is NEVER compiled for the
+wasm32-unknown-unknown target. Harmless; the wasm guest uses only getrandom 0.3 with the
+custom backend.
 
 The committed crates use 0.3 (as specced) and document the blocker; the 0.5 path was
 built and its single-import wasm verified with wasm-tools.
@@ -30,7 +37,12 @@ built and its single-import wasm verified with wasm-tools.
 ## 1. What compiles + what the tests do
 
 Builds (both green):
-- `cargo build --target wasm32-unknown-unknown` in crates/hyprstream-wasm-pyguest/
+- `cargo build --target wasm32-unknown-unknown` run FROM INSIDE crates/hyprstream-wasm-pyguest/
+  i.e. `(cd crates/hyprstream-wasm-pyguest && cargo build --release --target wasm32-unknown-unknown)`.
+  MUST build from the crate dir, NOT with `--manifest-path …pyguest/Cargo.toml` from the repo
+  root: the `getrandom_backend="custom"` rustflag lives in that crate's `.cargo/config.toml`,
+  and Cargo only discovers `.cargo/config.toml` from the CWD (walking up), not from
+  `--manifest-path`. A root `--manifest-path` build drops the cfg and FAILS on getrandom/wasm32.
   (standalone, excluded crate) -> hyprstream_wasm_pyguest.wasm (~11 MB release).
   Exports: memory, alloc, dealloc, eval. Imports: env::host_random PLUS dead
   __wbindgen_placeholder__ JS stubs (0.3 only — see section 2).

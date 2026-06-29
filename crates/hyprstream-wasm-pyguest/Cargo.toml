@@ -8,8 +8,15 @@ description = "RustPython guest compiled to wasm32-unknown-unknown for the #505 
 # This crate is intentionally NOT a workspace member. It is listed in the root
 # Cargo.toml [workspace.exclude] so a host-target workspace build never tries to
 # compile a wasm-only cdylib (which would also drag in libtorch deps transitively
-# via the workspace). Build explicitly:
-#   cargo build --target wasm32-unknown-unknown --manifest-path crates/hyprstream-wasm-pyguest/Cargo.toml
+# via the workspace). Build explicitly, FROM THIS CRATE'S DIRECTORY:
+#   (cd crates/hyprstream-wasm-pyguest && cargo build --release --target wasm32-unknown-unknown)
+#
+# MUST build from this crate's directory — the `getrandom_backend="custom"` rustflag
+# lives in this crate's .cargo/config.toml, and Cargo only discovers .cargo/config.toml
+# by walking up from the CWD, NOT from --manifest-path. Running
+# `cargo build --manifest-path crates/hyprstream-wasm-pyguest/Cargo.toml` from the repo
+# root will NOT pick up the cfg and the build will FAIL on getrandom/wasm32
+# ("the wasm32-unknown-unknown target is not supported ... enable wasm_js").
 #
 # Empty [workspace] table makes this a standalone package (own lockfile/target),
 # belt-and-suspenders alongside the root [workspace.exclude] entry. A wasm-only
@@ -52,10 +59,17 @@ rustpython-vm = { version = "0.5", default-features = false, features = ["compil
 # trying to `import encodings` with an empty frozen set.
 rustpython-pylib = { version = "0.5", features = ["freeze-stdlib"] }
 
-# getrandom 0.3 ONLY (the 0.2 dual-backend from the P0 spike is dropped: rustpython 0.5
-# no longer pulls a getrandom-0.2 RNG path that forces `js`). 0.3 selects its backend
-# via the build cfg `getrandom_backend="custom"` (in .cargo/config.toml) plus the
-# `#[no_mangle] __getrandom_v03_custom` extern symbol in lib.rs, both delegating to the
-# single host import `host_random`. No `js`, no `wasm_js`, no WASI.
+# getrandom 0.3 is the ONLY getrandom compiled FOR WASM (the 0.2 dual-backend from the
+# P0 spike is dropped: rustpython 0.5 no longer pulls a getrandom-0.2 RNG path that forces
+# `js`). 0.3 selects its backend via the build cfg `getrandom_backend="custom"` (in
+# .cargo/config.toml) plus the `#[no_mangle] __getrandom_v03_custom` extern symbol in
+# lib.rs, both delegating to the single host import `host_random`. No `js`, no `wasm_js`,
+# no WASI.
+#
+# NOTE: Cargo.lock still contains getrandom 0.2.17. That is a HOST BUILD-DEPENDENCY of
+# rustpython's codegen tooling only — pulled via unicode_names2_generator's
+# [build-dependencies] (rand 0.8 -> rand_core 0.6 -> getrandom 0.2.17), which runs on the
+# HOST during the build. It is NEVER compiled for the wasm32-unknown-unknown target.
+# Harmless; the wasm guest itself uses only getrandom 0.3 with the custom backend.
 [target.wasm32-unknown-unknown.dependencies]
 getrandom = { version = "0.3" }
