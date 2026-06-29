@@ -1,29 +1,28 @@
 [package]
-name = "hyprstream-wasm"
+name = "hyprstream-sandbox"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Embedded wasmtime host for the #505 untrusted-Python capability sandbox (build-viability spike)"
+description = "Embedded wasmtime host for sandboxing untrusted wasm guests behind capability profiles (bespoke-Linker Profile A + WASI Profile B)"
 
 # Workspace member (host target). It does NOT depend on tch/libtorch, so it builds
 # without LIBTORCH. Build/test scoped:
-#   cargo build -p hyprstream-wasm
-#   cargo test  -p hyprstream-wasm
+#   cargo build -p hyprstream-sandbox
+#   cargo test  -p hyprstream-sandbox
 
 # NB: this crate intentionally does NOT add `[lints] workspace = true`. Lint
 # inheritance is opt-in, so the workspace's deny-by-default panic/print lints do
-# not apply — this spike uses unwrap/expect/panic freely in tests. P1 will reinstate.
+# not apply — this crate uses unwrap/expect/panic freely in tests.
 
 [dependencies]
-# Pinned exact: wasmtime 46.0.1 (latest stable as of 2026-06-29). The fuel/epoch
-# API spellings recorded in FINDINGS.md are specific to this major.
+# Pinned exact: wasmtime 46.0.1. The fuel/epoch API spellings (see README) are
+# specific to this major.
 wasmtime = "=46.0.1"
-anyhow = "1"
 rand = "0.8"
 
-# Canonical VFS seam (#483 P2). hyprstream-vfs -> hyprstream-rpc; NEITHER pulls
+# Canonical VFS seam. hyprstream-vfs -> hyprstream-rpc; NEITHER pulls
 # tch/torch (verified: only the top-level `hyprstream` crate links libtorch), so
-# `cargo build -p hyprstream-wasm` stays torch-free. We use:
+# `cargo build -p hyprstream-sandbox` stays torch-free. We use:
 #   * hyprstream_rpc::Subject  — the CANONICAL caller identity (replaces the
 #     crate-local Subject newtype).
 #   * hyprstream_vfs::{Namespace, Mount, Fid, Stat, DirEntry, MountError, ...}
@@ -41,7 +40,7 @@ parking_lot = "0.12"
 # NO `tokio`/`exit`. The `sync::WasiCtxBuilder` is bypassed (it only takes a concrete
 # cap_std::fs::Dir); we build a `WasiCtx` directly and push our own `Box<dyn WasiDir>`
 # VFS preopen. wasi-common -> wasmtime(=46.0.1)/wiggle/cap-std/rustix — NO tch/torch
-# (verified torch-free, see FINDINGS.md §Profile B).
+# (verified torch-free).
 wasi-common = { version = "=46.0.1", default-features = false, features = ["sync", "wasmtime"] }
 # Profile B's `WasiCtx::new` wants `Box<dyn rand::Rng + Send + Sync>` where `Rng` is
 # wasi-common's rand (0.10) — distinct from Profile A's rand 0.8. Aliased so we can
@@ -49,6 +48,5 @@ wasi-common = { version = "=46.0.1", default-features = false, features = ["sync
 wasi-rand = { package = "rand", version = "0.10", default-features = false }
 
 [dev-dependencies]
-anyhow = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
 parking_lot = "0.12"

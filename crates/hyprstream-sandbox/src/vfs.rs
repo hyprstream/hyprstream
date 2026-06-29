@@ -196,7 +196,12 @@ mod tests {
                 write_buf: parking_lot::Mutex::new(Vec::new()),
             }))
         }
-        async fn open(&self, _fid: &mut Fid, _mode: u8, caller: &Subject) -> Result<(), MountError> {
+        async fn open(
+            &self,
+            _fid: &mut Fid,
+            _mode: u8,
+            caller: &Subject,
+        ) -> Result<(), MountError> {
             Self::check(caller)
         }
         async fn read(

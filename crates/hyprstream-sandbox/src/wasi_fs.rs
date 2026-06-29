@@ -1,12 +1,11 @@
 //! Profile B (#506): preview1 `WasiDir`/`WasiFile` backed by a Subject-scoped
 //! `hyprstream_vfs::Mount`.
 //!
-//! This is the make-or-break validation for running a WASI guest whose ENTIRE
-//! filesystem is a virtual VFS [`Mount`] (not the host). The verdict in
-//! `FINDINGS.md` §4 is implemented here: back a WASI preopen with an arbitrary
-//! async `Mount` via the legacy **preview1** [`wasi_common::WasiDir`] /
-//! [`wasi_common::WasiFile`] trait objects, NOT preview2's `wasmtime-wasi` (whose
-//! preopen only takes a concrete `cap_std::fs::Dir`).
+//! This runs a WASI guest whose ENTIRE filesystem is a virtual VFS [`Mount`] (not the
+//! host). It backs a WASI preopen with an arbitrary async `Mount` via the legacy
+//! **preview1** [`wasi_common::WasiDir`] / [`wasi_common::WasiFile`] trait objects,
+//! NOT preview2's `wasmtime-wasi` (whose preopen only takes a concrete
+//! `cap_std::fs::Dir`). See the crate README for the preview1-vs-preview2 rationale.
 //!
 //! ## The ONE policy enforcement point (MAC invariant)
 //!
@@ -64,9 +63,12 @@ fn map_err(e: MountError) -> WasiError {
     }
 }
 
-/// Split a WASI-relative path (`a/b/c`, possibly with a leading/trailing slash)
-/// into Mount path components, joined onto `base`. Rejects `..` and absolute paths
-/// (defense-in-depth path-shape check; the Mount remains the policy point).
+/// Split a WASI-relative path (`a/b/c`, possibly with a leading/trailing slash) into
+/// Mount path components, joined onto `base`. Rejects `..` (no upward traversal past
+/// the preopen). Empty components and `.` are dropped, so a leading `/` is treated as
+/// relative-to-`base` rather than rejected — there is no escape because every
+/// component still lands under `base`, and the Mount remains the policy point. This is
+/// a defense-in-depth path-shape check, NOT an authz check.
 fn resolve(base: &[String], path: &str) -> Result<Vec<String>, WasiError> {
     let mut out = base.to_vec();
     for comp in path.split('/') {

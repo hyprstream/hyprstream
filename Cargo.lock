@@ -7081,6 +7081,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyprstream-sandbox"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hyprstream-rpc",
+ "hyprstream-vfs",
+ "parking_lot 0.12.4",
+ "rand 0.10.1",
+ "rand 0.8.5",
+ "tokio",
+ "wasi-common",
+ "wasmtime",
+]
+
+[[package]]
 name = "hyprstream-service"
 version = "0.1.0"
 dependencies = [
@@ -7185,22 +7200,6 @@ dependencies = [
  "virtio-queue 0.12.0",
  "vm-memory 0.14.1",
  "vmm-sys-util 0.12.1",
-]
-
-[[package]]
-name = "hyprstream-wasm"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "hyprstream-rpc",
- "hyprstream-vfs",
- "parking_lot 0.12.4",
- "rand 0.10.1",
- "rand 0.8.5",
- "tokio",
- "wasi-common",
- "wasmtime",
 ]
 
 [[package]]

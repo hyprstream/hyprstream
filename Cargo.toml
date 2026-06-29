@@ -23,11 +23,12 @@ members = [
     "crates/chat-core",
     "crates/hyprstream-rpc-std",
     "crates/hyprstream-9p",
-    "crates/hyprstream-wasm",
+    "crates/hyprstream-sandbox",
 ]
-# bitsandbytes-sys is standalone - only built when bnb feature is enabled
-# hyprstream-wasm-pyguest is a wasm32-unknown-unknown-only cdylib (RustPython guest,
-# #505 sandbox spike); excluded so a host-target workspace build never compiles it.
+# bitsandbytes-sys is standalone - only built when bnb feature is enabled.
+# The wasm guests (hyprstream-wasm-pyguest = wasm32-unknown-unknown cdylib; the
+# hyprstream-wasm-fsguest = wasm32-wasip1 command) are sandbox GUEST artifacts,
+# excluded so a host-target workspace build never compiles a wasm-only crate.
 exclude = ["crates/bitsandbytes-sys", "crates/hyprstream-wasm-pyguest", "crates/hyprstream-wasm-fsguest"]
 resolver = "2"
 
