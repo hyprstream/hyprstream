@@ -1,30 +1,34 @@
-//! Embedded wasmtime host for the #505 untrusted-Python capability sandbox.
+//! Embedded wasmtime host for sandboxing untrusted wasm guests behind capability
+//! profiles.
 //!
-//! The whole point: run the RustPython guest (`hyprstream-wasm-pyguest`, compiled
-//! to `wasm32-unknown-unknown`) under wasmtime with a BESPOKE `Linker` that exposes
-//! exactly ONE capability host function — `host_random(ptr,len)` — and NOTHING from
-//! WASI. No `wasmtime-wasi`, no `add_to_linker`, no preopens. Therefore the guest's
-//! `import os; os.system(...)` cannot reach a real OS: there is no syscall surface.
+//! This crate is a GENERIC capability-sandbox host: it loads an arbitrary wasm guest
+//! module and runs it under wasmtime with a deny-by-default capability surface plus
+//! DoS bounds. Two profiles are provided:
 //!
-//! P1 additions vs. the P0 spike:
-//!   * The guest now actually RUNS Python: rustpython-vm 0.5 + a single
-//!     `env::host_random` import (verified) means `print(1 + 1)` returns status 0.
-//!   * The `Store` data is generalized from a fixed `HostState` into a
-//!     [`SandboxState`] that carries a per-call [`Subject`] (tenant/identity).
-//!     Capability host fns (today `host_random`, tomorrow VFS — see [`vfs`]) are
-//!     Subject-scoped BY CONSTRUCTION: they read the Subject out of the Store.
-//!   * A real wall-clock DoS bound: an [`EpochTimer`] thread advances the engine
-//!     epoch on a fixed cadence, and [`Sandbox::eval`] sets a per-call epoch
-//!     deadline, so a runaway guest (`while True: pass`) traps within ~the timeout
-//!     in PRODUCTION, not just in the fuel test path.
+//! * **Profile A** ([`Sandbox`], this module): a bespoke `Linker` that exposes
+//!   exactly the host functions we choose — `env::host_random` plus the
+//!   Subject-scoped `env::vfs_*` capabilities (see [`vfs`]) — and wires EVERY other
+//!   declared import to a trap via `define_unknown_imports_as_traps`. No
+//!   `wasmtime-wasi`, no preopens, no syscall surface: a guest that reaches for any
+//!   un-granted host function traps. [`Sandbox::call_export`] drives an arbitrary
+//!   guest export over the guest's `alloc`/`memory` ABI; the [`python`] profile
+//!   module builds its `eval`/shell on top of it.
+//! * **Profile B** ([`wasi_sandbox::WasiSandbox`]): a real WASI preview1 surface whose
+//!   ONLY filesystem is a Subject-scoped [`hyprstream_vfs::Mount`] — no host preopen,
+//!   clocks/random/sockets/sched withheld.
+//!
+//! Capabilities are Subject-scoped BY CONSTRUCTION: the per-call [`SandboxState`]
+//! carries the [`Subject`] the call runs as, and host functions read it out of the
+//! `Store` rather than trusting any guest-supplied identity. There is no
+//! global/thread-local identity state.
 //!
 //! DoS guards on the `Store` (wasmtime 46.0.1 spellings):
 //!   * fuel  (`Config::consume_fuel(true)` + `Store::set_fuel(u64)`)
 //!   * epoch (`Config::epoch_interruption(true)` + `Store::set_epoch_deadline(u64)`
 //!     + `Engine::increment_epoch()`)
 //!
-//! NB: wasmtime 46 ships its OWN error type (`wasmtime::Error` / `wasmtime::Result`,
-//! NOT `anyhow::Error`), with an inherent `wasmtime::Context` trait. We use those.
+//! wasmtime 46 ships its own error type (`wasmtime::Error` / `wasmtime::Result`, not
+//! `anyhow::Error`) with an inherent `wasmtime::Context` trait; this crate uses those.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,7 +40,7 @@ type RngFill = Box<dyn FnMut(&mut [u8]) + Send>;
 use wasmtime::error::Context as _;
 use wasmtime::{bail, Caller, Config, Engine, Extern, Linker, Memory, Module, Result, Store};
 
-pub mod mount;
+pub mod python;
 pub mod vfs;
 pub mod wasi_fs;
 pub mod wasi_sandbox;
@@ -47,11 +51,10 @@ pub mod wasi_sandbox;
 
 /// The identity a sandbox evaluation runs as.
 ///
-/// #483 P2: this is now the CANONICAL [`hyprstream_rpc::Subject`] (re-exported via
-/// `hyprstream_vfs::Subject`), NOT the P1 crate-local newtype. Confirmed torch-free:
-/// `hyprstream-vfs -> hyprstream-rpc` pulls no `tch`/libtorch, so the host crate
-/// still builds without LIBTORCH. Using the canonical Subject means the VFS proxy
-/// the sandbox talks to is scoped to the SAME identity the rest of the daemon uses.
+/// This is the canonical [`hyprstream_rpc::Subject`] (also re-exported via
+/// `hyprstream_vfs::Subject`), so the VFS proxy the sandbox talks to is scoped to the
+/// SAME identity the rest of the daemon uses. Confirmed torch-free: `hyprstream-vfs
+/// -> hyprstream-rpc` pulls no `tch`/libtorch, so this crate builds without LIBTORCH.
 pub use hyprstream_rpc::Subject;
 
 // ---------------------------------------------------------------------------
@@ -60,11 +63,10 @@ pub use hyprstream_rpc::Subject;
 
 /// Per-call host state carried in the wasmtime `Store` data.
 ///
-/// Generalizes the P0 `HostState` (which held only an RNG) to ALSO carry the
-/// [`Subject`] the call runs as. Every capability host function gets a
+/// Carries the [`Subject`] the call runs as. Every capability host function gets a
 /// `Caller<'_, SandboxState>` and so can read `caller.data().subject` — the
 /// capability surface is Subject-parameterized without any global/thread-local
-/// state (the leak that killed the native #488 design).
+/// state.
 pub struct SandboxState {
     /// The identity this evaluation runs as. Capability host-fns (`host_random`,
     /// `vfs_*`) are authorized/scoped against this.
@@ -72,8 +74,8 @@ pub struct SandboxState {
     /// Entropy source for the single `host_random` capability. The HOST has OS
     /// entropy; the guest only ever sees it through this function.
     rng_bytes: RngFill,
-    /// #483: the Subject-scoped VFS proxy handle backing `env::vfs_*`. `None` =
-    /// the sandbox was created without a VFS capability (the `vfs_*` host fns then
+    /// The Subject-scoped VFS proxy handle backing `env::vfs_*`. `None` = the
+    /// sandbox was created without a VFS capability (the `vfs_*` host fns then
     /// return a "no vfs capability" error to the guest — deny-by-default).
     vfs: Option<vfs::VfsProxyHandle>,
 }
@@ -156,7 +158,7 @@ impl EpochTimer {
         let engine = engine.clone();
         let stop_clone = stop.clone();
         let handle = std::thread::Builder::new()
-            .name("hyprstream-wasm-epoch".into())
+            .name("hyprstream-sandbox-epoch".into())
             .spawn(move || {
                 while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
                     std::thread::sleep(tick);
@@ -219,7 +221,7 @@ pub fn build_linker(engine: &Engine, module: &Module) -> Result<Linker<SandboxSt
         },
     )?;
 
-    // ── #483: the VFS capability host fns ──────────────────────────────────
+    // ── The VFS capability host fns ─────────────────────────────────────────
     //
     // Each reads `caller.data().subject` (NEVER a guest-supplied identity) and
     // submits the op to the Subject-scoped proxy handle in the Store data. The op
@@ -395,17 +397,21 @@ fn write_memory(
 /// A loaded, ready-to-run sandbox over a single guest module, bound to one
 /// [`Subject`].
 ///
-/// Constructing a `Sandbox` binds it to a Subject; every `eval` on it runs as that
+/// Constructing a `Sandbox` binds it to a Subject; every call on it runs as that
 /// Subject. Two `Sandbox`es bound to different Subjects keep independent Store
 /// identity (no shared global/thread-local state) — see the `subject_isolation`
 /// test.
+///
+/// This is the GENERIC Profile-A core: [`call_export`](Self::call_export) ships a
+/// byte payload to a named guest export over the guest's `alloc`/`memory` ABI. Profile
+/// modules (e.g. [`crate::python`]) build typed APIs on top of it.
 pub struct Sandbox {
     engine: Engine,
     module: Module,
     linker: Linker<SandboxState>,
     subject: Subject,
-    /// #483: optional Subject-scoped VFS capability handed to every `Store` this
-    /// sandbox builds. `None` = no VFS capability (deny-by-default).
+    /// Optional Subject-scoped VFS capability handed to every `Store` this sandbox
+    /// builds. `None` = no VFS capability (deny-by-default).
     vfs: Option<vfs::VfsProxyHandle>,
 }
 
@@ -444,6 +450,16 @@ impl Sandbox {
         &self.subject
     }
 
+    /// The linker this sandbox instantiates guests with (profile modules reuse it).
+    pub(crate) fn linker(&self) -> &Linker<SandboxState> {
+        &self.linker
+    }
+
+    /// The compiled guest module (profile modules reuse it).
+    pub(crate) fn module(&self) -> &Module {
+        &self.module
+    }
+
     /// Build the per-call host state (subject + optional VFS capability).
     fn make_state(&self) -> SandboxState {
         match self.vfs.clone() {
@@ -454,47 +470,43 @@ impl Sandbox {
 
     /// Fresh per-call Store for this sandbox's subject, with the epoch pushed out
     /// of the way (so the caller chooses fuel- or epoch-bounding explicitly).
-    fn new_store(&self) -> Store<SandboxState> {
+    pub(crate) fn new_store(&self) -> Store<SandboxState> {
         Store::new(&self.engine, self.make_state())
     }
 
-    /// Run `source` in a fresh interpreter with the given fuel budget.
+    /// Call the named guest export with `input` shipped into guest memory, under the
+    /// given fuel budget.
     ///
-    /// Returns the guest `eval` status (0 = ok, nonzero = python error) on normal
-    /// completion, or `Err` if the guest TRAPPED (e.g. ran out of fuel / a dead
-    /// import was actually called). Deterministic; preferred for tests.
-    pub fn eval(&self, source: &str, fuel: u64) -> Result<i32> {
+    /// This is the GENERIC Profile-A entry point. It instantiates a fresh guest
+    /// instance, allocates a buffer via the guest's `alloc` export, writes `input`
+    /// into it, calls `export(ptr, len) -> i32`, then `dealloc`s the buffer. Returns
+    /// the export's i32 status on normal completion, or `Err` if the guest TRAPPED
+    /// (e.g. ran out of fuel, or reached an un-granted, trap-wired import).
+    /// Deterministic (fuel-bounded); the building block profile modules call.
+    ///
+    /// The guest must export `alloc(i32)->i32`, `dealloc(i32,i32)`, `memory`, and the
+    /// named export with signature `(i32,i32)->i32`.
+    pub fn call_export(&self, name: &str, input: &[u8], fuel: u64) -> Result<i32> {
         let mut store = self.new_store();
         // DoS guard #1: instruction budget.
         store.set_fuel(fuel).context("set fuel")?;
-        // Because the engine has epoch_interruption(true), EVERY store defaults to
-        // an epoch deadline of 0 and would trap immediately ("wasm trap: interrupt")
-        // unless we push the deadline out. For the fuel-bounded path we disable the
-        // epoch by setting it effectively infinite, so fuel is the only limiter.
+        // The engine has epoch_interruption(true), so EVERY store defaults to an epoch
+        // deadline of 0 and would trap immediately ("wasm trap: interrupt") unless we
+        // push it out. For the fuel-bounded path the epoch is set effectively infinite
+        // so fuel is the only limiter.
         store.set_epoch_deadline(u64::MAX);
-        self.run(store, source)
+        self.run_export(store, name, input)
     }
 
-    /// Run `source` with a WALL-CLOCK epoch deadline of `ticks` epoch increments.
-    ///
-    /// This is the PRODUCTION DoS bound: paired with an [`EpochTimer`] spawned on
-    /// [`Sandbox::engine`] ticking every `t`, the guest traps with "interrupt"
-    /// after roughly `ticks * t` of wall time. Fuel is set effectively infinite so
-    /// the epoch (not fuel) is the limiter.
-    ///
-    /// The caller owns the [`EpochTimer`]; this method does not start one (so the
-    /// timer cadence/lifetime is explicit and the engine is shared by reference).
-    pub fn eval_with_epoch_deadline(&self, source: &str, ticks: u64) -> Result<i32> {
-        let mut store = self.new_store();
-        // Give plenty of fuel so the EPOCH deadline (not fuel) is the limiter here.
-        store.set_fuel(u64::MAX).context("set fuel")?;
-        // DoS guard #2: epoch deadline. Trap once the engine epoch advances `ticks`.
-        store.set_epoch_deadline(ticks);
-        self.run(store, source)
-    }
-
-    /// Shared instantiate + ship-source + call-eval body.
-    fn run(&self, mut store: Store<SandboxState>, source: &str) -> Result<i32> {
+    /// Like [`call_export`](Self::call_export) but driven by a pre-configured `store`
+    /// (the caller has set fuel and/or the epoch deadline). Profile modules use this
+    /// to express the wall-clock (epoch) bound. See [`new_store`](Self::new_store).
+    pub(crate) fn run_export(
+        &self,
+        mut store: Store<SandboxState>,
+        name: &str,
+        input: &[u8],
+    ) -> Result<i32> {
         let instance = self
             .linker
             .instantiate(&mut store, &self.module)
@@ -502,26 +514,26 @@ impl Sandbox {
 
         let alloc = instance.get_typed_func::<i32, i32>(&mut store, "alloc")?;
         let dealloc = instance.get_typed_func::<(i32, i32), ()>(&mut store, "dealloc")?;
-        let eval = instance.get_typed_func::<(i32, i32), i32>(&mut store, "eval")?;
+        let export = instance.get_typed_func::<(i32, i32), i32>(&mut store, name)?;
         let memory = match instance.get_memory(&mut store, "memory") {
             Some(m) => m,
             None => bail!("guest memory export"),
         };
 
-        let bytes = source.as_bytes();
-        let len = bytes.len() as i32;
+        let len = input.len() as i32;
         let ptr = alloc.call(&mut store, len)?;
         memory
-            .write(&mut store, ptr as usize, bytes)
-            .context("write source into guest")?;
+            .write(&mut store, ptr as usize, input)
+            .context("write input into guest")?;
 
-        let status = eval.call(&mut store, (ptr, len));
+        let status = export.call(&mut store, (ptr, len));
         let _ = dealloc.call(&mut store, (ptr, len));
-        status.context("guest eval trapped")
+        status.with_context(|| format!("guest export `{name}` trapped"))
     }
 
     /// The engine backing this sandbox. Spawn an [`EpochTimer`] on it to enable the
-    /// wall-clock bound used by [`Sandbox::eval_with_epoch_deadline`].
+    /// wall-clock bound used by epoch-deadline call paths (e.g.
+    /// [`crate::python::eval_with_epoch_deadline`]).
     pub fn engine(&self) -> &Engine {
         &self.engine
     }
@@ -531,10 +543,9 @@ impl Sandbox {
     /// Subject-scoped proxy -> `Namespace`).
     ///
     /// `op`: 0=cat, 1=ls, 2=echo, 3=ctl. `path` + optional `body` (echo/ctl). Returns
-    /// the decoded `[status][payload]` reply the host fn produced. This is the
-    /// minimal "a guest script that reads/writes a VFS path goes through the Mount"
-    /// path for deliverable (1); a follow-up registers Python builtins so guest
-    /// Python source itself can call these (see guest `guest_cat`/etc.).
+    /// the decoded `[status][payload]` reply the host fn produced — the minimal
+    /// "a guest call against a VFS path goes through the Mount" exercise of the
+    /// `env::vfs_*` capability.
     pub fn probe_vfs(&self, op: i32, path: &str, body: &[u8]) -> Result<vfs::VfsReply> {
         let mut store = self.new_store();
         store.set_fuel(u64::MAX).context("set fuel")?;
@@ -547,8 +558,8 @@ impl Sandbox {
             .get_memory(&mut store, "memory")
             .ok_or_else(|| wasmtime::Error::msg("guest memory export"))?;
         let alloc = instance.get_typed_func::<i32, i32>(&mut store, "alloc")?;
-        let probe = instance
-            .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&mut store, "vfs_probe")?;
+        let probe =
+            instance.get_typed_func::<(i32, i32, i32, i32, i32), i64>(&mut store, "vfs_probe")?;
 
         // Ship path + body into guest memory.
         let pbytes = path.as_bytes();
@@ -591,187 +602,9 @@ impl Sandbox {
             body: payload,
         })
     }
-
-    /// Open a PERSISTENT `/lang/python` shell over this sandbox (#483 P2).
-    ///
-    /// Unlike [`Sandbox::eval`] (legacy #505, fresh interpreter per call), the
-    /// returned [`PyShell`] holds ONE long-lived `Store` + `Instance`, so the guest's
-    /// persistent interpreter + globals survive across `eval`/`exec` calls — the
-    /// `/lang/python/vars/` + `/defs/` semantics depend on this.
-    ///
-    /// `fuel` is set per `py_op` call (a fresh budget each invocation); the store
-    /// itself is reused. The epoch is pushed out (fuel is the limiter for the shell
-    /// path; a future variant can re-arm the epoch per call).
-    pub fn open_shell(&self, per_call_fuel: u64) -> Result<PyShell> {
-        let mut store = self.new_store();
-        store.set_fuel(per_call_fuel).context("set fuel")?;
-        store.set_epoch_deadline(u64::MAX);
-        let instance = self
-            .linker
-            .instantiate(&mut store, &self.module)
-            .context("instantiate guest")?;
-        let memory = instance
-            .get_memory(&mut store, "memory")
-            .ok_or_else(|| wasmtime::Error::msg("guest memory export"))?;
-        let alloc = instance.get_typed_func::<i32, i32>(&mut store, "alloc")?;
-        let dealloc = instance.get_typed_func::<(i32, i32), ()>(&mut store, "dealloc")?;
-        let py_op = instance.get_typed_func::<(i32, i32, i32), i64>(&mut store, "py_op")?;
-        Ok(PyShell {
-            store,
-            memory,
-            alloc,
-            dealloc,
-            py_op,
-            per_call_fuel,
-        })
-    }
 }
 
-/// The op codes the guest's `py_op` export understands (must match the guest's
-/// `Op` enum byte-for-byte).
-#[derive(Clone, Copy, Debug)]
-#[repr(i32)]
-enum PyOp {
-    Eval = 0,
-    Exec = 1,
-    ListVars = 2,
-    GetVar = 3,
-    ListDefs = 4,
-    GetDef = 5,
-}
-
-/// Status tags in the first byte of a `py_op` reply (must match the guest:
-/// `TAG_OK=0`, `TAG_ERR=1`, `TAG_NONE=2`). Only OK and NONE are matched explicitly;
-/// any other tag (i.e. ERR=1) decodes to [`PyResult::Err`].
-const TAG_OK: u8 = 0;
-const TAG_NONE: u8 = 2;
-
-/// The outcome of a `py_op`: a status tag plus the UTF-8 payload.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PyResult {
-    /// Success — the payload (repr / stdout / newline-joined names).
-    Ok(String),
-    /// A Python-level error — the message.
-    Err(String),
-    /// The requested name was absent (get_var / get_def).
-    None,
-}
-
-impl PyResult {
-    /// The success payload, or `None` for Err/None.
-    pub fn ok(&self) -> Option<&str> {
-        match self {
-            PyResult::Ok(s) => Some(s),
-            _ => None,
-        }
-    }
-}
-
-/// A persistent `/lang/python` shell over a single guest instance (#483 P2).
-///
-/// Holds the long-lived `Store`/`Instance` so the guest interpreter's state
-/// survives across calls. Drives the guest's `py_op` ABI: ship the argument into
-/// guest memory, call `py_op(op, ptr, len)`, decode the packed `(out_ptr<<32)|len`
-/// reply, then `dealloc` the reply buffer.
-///
-/// `!Send`-free at the type level (wasmtime types are `Send`), but a `PyShell` must
-/// be driven from a NON-async thread if its sandbox holds a VFS capability (the
-/// `vfs_*` host fns `blocking_send`).
-pub struct PyShell {
-    store: Store<SandboxState>,
-    memory: Memory,
-    alloc: wasmtime::TypedFunc<i32, i32>,
-    dealloc: wasmtime::TypedFunc<(i32, i32), ()>,
-    py_op: wasmtime::TypedFunc<(i32, i32, i32), i64>,
-    per_call_fuel: u64,
-}
-
-impl PyShell {
-    /// Run one op with `arg` as the UTF-8 argument; decode the reply.
-    fn call(&mut self, op: PyOp, arg: &str) -> Result<PyResult> {
-        // Fresh fuel budget per call (the store is reused, fuel is not).
-        self.store.set_fuel(self.per_call_fuel).context("set fuel")?;
-
-        let bytes = arg.as_bytes();
-        let len = bytes.len() as i32;
-        let ptr = if len > 0 {
-            let p = self.alloc.call(&mut self.store, len)?;
-            self.memory
-                .write(&mut self.store, p as usize, bytes)
-                .context("write py_op arg")?;
-            p
-        } else {
-            0
-        };
-
-        let packed = self
-            .py_op
-            .call(&mut self.store, (op as i32, ptr, len))
-            .context("guest py_op trapped")?;
-        if len > 0 {
-            let _ = self.dealloc.call(&mut self.store, (ptr, len));
-        }
-
-        // Decode (out_ptr<<32)|out_len, read [tag][payload], then dealloc it.
-        let p = packed as u64;
-        let out_ptr = (p >> 32) as usize;
-        let out_len = (p & 0xffff_ffff) as usize;
-        if out_ptr == 0 || out_len == 0 {
-            return Ok(PyResult::Err("empty reply".to_owned()));
-        }
-        let data = self.memory.data(&self.store);
-        if out_ptr + out_len > data.len() {
-            bail!("py_op reply out of bounds");
-        }
-        let tag = data[out_ptr];
-        let body = String::from_utf8_lossy(&data[out_ptr + 1..out_ptr + out_len]).into_owned();
-        let _ = self
-            .dealloc
-            .call(&mut self.store, (out_ptr as i32, out_len as i32));
-
-        Ok(match tag {
-            TAG_OK => PyResult::Ok(body),
-            TAG_NONE => PyResult::None,
-            _ => PyResult::Err(body),
-        })
-    }
-
-    /// Evaluate an expression -> `repr(result)` (with `\n---\n<stdout>` appended if
-    /// the expression printed anything), mirroring the native `eval` file.
-    pub fn eval(&mut self, expr: &str) -> Result<PyResult> {
-        self.call(PyOp::Eval, expr)
-    }
-
-    /// Execute statements -> captured stdout, mirroring the native `stdout` file.
-    pub fn exec(&mut self, src: &str) -> Result<PyResult> {
-        self.call(PyOp::Exec, src)
-    }
-
-    /// Newline-joined non-dunder global variable names (`vars/`).
-    pub fn list_vars(&mut self) -> Result<Vec<String>> {
-        Ok(split_names(self.call(PyOp::ListVars, "")?))
-    }
-
-    /// `repr` of one global variable (`vars/<name>`), or `None` if absent.
-    pub fn get_var(&mut self, name: &str) -> Result<PyResult> {
-        self.call(PyOp::GetVar, name)
-    }
-
-    /// Newline-joined callable global names (`defs/`).
-    pub fn list_defs(&mut self) -> Result<Vec<String>> {
-        Ok(split_names(self.call(PyOp::ListDefs, "")?))
-    }
-
-    /// `repr` of one callable global (`defs/<name>`), or `None` if absent/not callable.
-    pub fn get_def(&mut self, name: &str) -> Result<PyResult> {
-        self.call(PyOp::GetDef, name)
-    }
-}
-
-/// Split a newline-joined name list reply into a `Vec<String>` (empty if not Ok).
-fn split_names(r: PyResult) -> Vec<String> {
-    match r {
-        PyResult::Ok(s) if !s.is_empty() => s.lines().map(|l| l.to_owned()).collect(),
-        _ => Vec::new(),
-    }
-}
+/// Status tag for an "ok" reply in the first byte of a host-serialised guest reply
+/// buffer (the `vfs_*` and `py_op` ABIs share this convention: 0 = ok). Used by
+/// [`Sandbox::probe_vfs`] and the [`python`] profile decoder.
+pub(crate) const TAG_OK: u8 = 0;

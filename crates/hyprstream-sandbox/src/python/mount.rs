@@ -1,55 +1,52 @@
-//! `/lang/python/` VFS mount backed by the WASM-sandboxed guest (#483 P2).
+//! `/lang/python/` VFS mount backed by the wasm-sandboxed python guest.
 //!
-//! This re-exposes the native `/lang/python` layout (from the superseded
-//! `hyprstream-python` crate) but driven by the [`PyShell`](crate::PyShell) over the
-//! wasm guest instead of a native RustPython interpreter. Behaviour/layout are
-//! ported; the interpreter is the sandboxed guest.
+//! Exposes a `/lang/python` layout driven by the [`PyShell`](crate::python::PyShell)
+//! over the wasm guest, so the interpreter is the sandboxed guest rather than a
+//! native one.
 //!
-//! Layout (identical to the native mount):
+//! Layout:
 //! - `/lang/python/eval`    — ctl: write a Python EXPRESSION, read `repr(result)`
 //!   (with `\n---\n<stdout>` appended if it printed)
 //! - `/lang/python/stdout`  — ctl: write Python STATEMENTS, read captured stdout
 //! - `/lang/python/vars/`   — dynamic dir: non-dunder globals as readable files
 //! - `/lang/python/defs/`   — dynamic dir: callable globals (functions/classes)
 //!
-//! ## Why a command channel (same shape as the native mount)
+//! ## Why a command channel
 //!
-//! A [`PyShell`](crate::PyShell) owns a long-lived wasmtime `Store`. When the
+//! A [`PyShell`](crate::python::PyShell) owns a long-lived wasmtime `Store`. When the
 //! sandbox holds a VFS capability, its `vfs_*` host fns `blocking_send` on the proxy
 //! — so the shell MUST be driven from a NON-async (plain) thread, never a tokio
 //! worker. The async [`Mount`] methods therefore cannot call the shell directly:
 //! [`PythonMount`] holds a `tokio::sync::mpsc::Sender<PyCommand>` and forwards each
 //! request to a dedicated interpreter thread that owns the `PyShell` and replies
-//! over a oneshot. This is the exact pattern the native mount used for its `!Send`
-//! interpreter, and it keeps the shell off the async runtime.
+//! over a oneshot, keeping the shell off the async runtime.
 //!
-//! ## #483 daemon wiring (OUT OF SCOPE here — documented TODO)
+//! ## Daemon wiring
 //!
-//! Registering this mount into the RUNNING `/lang/python` namespace lives in the
-//! torch-bound `hyprstream` crate and is intentionally not done here. To plug in:
+//! Registering this mount into a running `/lang/python` namespace lives in the
+//! torch-bound `hyprstream` crate, not here. To plug in:
 //!
 //! ```ignore
-//! // #483 daemon wiring: in the hyprstream daemon, where the per-session
-//! // Namespace is built (alongside the Tcl `/lang/tcl` mount):
-//! let sandbox = hyprstream_wasm::Sandbox::from_bytes_for(GUEST_WASM, subject.clone())
-//!     .with_vfs(hyprstream_wasm::vfs::VfsProxyHandle::new(
+//! // In the daemon, where the per-session Namespace is built (alongside the Tcl
+//! // `/lang/tcl` mount):
+//! let sandbox = hyprstream_sandbox::Sandbox::from_bytes_for(GUEST_WASM, subject.clone())
+//!     .with_vfs(hyprstream_sandbox::vfs::VfsProxyHandle::new(
 //!         hyprstream_vfs::proxy::spawn_vfs_proxy(ns.clone(), subject.clone()),
 //!         subject.clone(),
 //!     ));
-//! let mount = hyprstream_wasm::mount::PythonMount::spawn(sandbox, PER_CALL_FUEL);
+//! let mount = hyprstream_sandbox::python::mount::PythonMount::spawn(sandbox, PER_CALL_FUEL);
 //! ns.mount("/lang/python", std::sync::Arc::new(mount))?;
 //! ```
 //!
 //! The mount owns the interpreter driver thread and joins it on `Drop`, so the
 //! daemon only needs to keep the `Arc<dyn Mount>` alive (in the Namespace).
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat, Subject};
 use parking_lot::Mutex;
 
-use crate::{PyResult, PyShell, Sandbox};
+use crate::python::{PyResult, PyShell};
+use crate::Sandbox;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Commands sent from async Mount methods to the interpreter-owning thread.
@@ -146,7 +143,7 @@ impl PythonMount {
     pub fn spawn(sandbox: Sandbox, per_call_fuel: u64) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<PyCommand>(16);
         let handle = std::thread::Builder::new()
-            .name("hyprstream-wasm-pyshell".into())
+            .name("hyprstream-sandbox-pyshell".into())
             .spawn(move || {
                 // Open the persistent shell on THIS (plain) thread.
                 let mut shell: PyShell = match sandbox.open_shell(per_call_fuel) {
@@ -377,12 +374,6 @@ impl Mount for PythonMount {
     async fn clunk(&self, _fid: Fid, _caller: &Subject) {}
 }
 
-/// Convenience alias so daemon code can keep an `Arc<dyn Mount>` without naming the
-/// concrete type.
-pub fn as_mount(mount: PythonMount) -> Arc<dyn Mount> {
-    Arc::new(mount)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,7 +385,9 @@ mod tests {
             return std::fs::read(&p).ok();
         }
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let guest_dir = manifest.parent().map(|p| p.join("hyprstream-wasm-pyguest"))?;
+        let guest_dir = manifest
+            .parent()
+            .map(|p| p.join("hyprstream-wasm-pyguest"))?;
         for profile in ["release", "debug"] {
             let c = guest_dir
                 .join("target/wasm32-unknown-unknown")
@@ -409,13 +402,31 @@ mod tests {
         None
     }
 
+    /// CI guard: under CI a missing pyguest artifact is a hard failure (the mount
+    /// guarantees must be exercised); locally it still skips.
+    fn guest_wasm_or_ci_fail() -> Option<Vec<u8>> {
+        match guest_wasm() {
+            Some(wasm) => Some(wasm),
+            None => {
+                assert!(
+                    std::env::var("CI").is_err(),
+                    "mount test: pyguest wasm not built but running under CI — build the \
+                     pyguest and set HYPRSTREAM_PYGUEST_WASM"
+                );
+                eprintln!(
+                    "SKIP mount test: guest wasm not built (set CI=1 to make this a failure)"
+                );
+                None
+            }
+        }
+    }
+
     /// End-to-end mount test against an in-memory VFS: write an expr to `eval`, read
     /// the result; exec sets a var, read it back under `vars/`; `readdir` lists the
-    /// layout. Mirrors the native mount's unit tests, driven by the wasm guest.
+    /// layout, driven by the wasm guest.
     #[test]
     fn mount_eval_vars_defs_over_guest() {
-        let Some(wasm) = guest_wasm() else {
-            eprintln!("SKIP mount test: guest wasm not built");
+        let Some(wasm) = guest_wasm_or_ci_fail() else {
             return;
         };
         let rt = tokio::runtime::Builder::new_multi_thread()
