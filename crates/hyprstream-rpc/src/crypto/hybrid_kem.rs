@@ -187,6 +187,16 @@ pub trait KemComponent {
 
     /// Decapsulate `ct` with `decap_key`, returning the shared secret.
     fn decapsulate(&self, decap_key: &[u8], ct: &[u8]) -> Result<Zeroizing<Vec<u8>>>;
+
+    /// Byte length of the deterministic seed consumed by
+    /// [`KemComponent::recipient_from_seed`].
+    fn seed_len(&self) -> usize;
+
+    /// Deterministically derive a recipient keypair from `seed` (length
+    /// [`KemComponent::seed_len`]), returning `(decap_key_bytes, encap_key_bytes)`.
+    /// Stable identity keys (e.g. `#mesh-kem`) use this so they survive restarts,
+    /// unlike the OsRng [`KemComponent::generate_recipient_keypair`].
+    fn recipient_from_seed(&self, seed: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>)>;
 }
 
 fn arr32(b: &[u8]) -> Result<[u8; 32]> {
@@ -260,6 +270,21 @@ impl KemComponent for X25519Kem {
         }
         Ok(Zeroizing::new(ss.to_bytes().to_vec()))
     }
+
+    fn seed_len(&self) -> usize {
+        32
+    }
+
+    fn recipient_from_seed(&self, seed: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>)> {
+        // The 32-byte seed is the X25519 secret scalar (clamped internally by
+        // `x25519-dalek` at DH time); `to_bytes()` round-trips it.
+        let sk = StaticSecret::from(arr32(seed)?);
+        let pk = PublicKey::from(&sk);
+        Ok((
+            Zeroizing::new(sk.to_bytes().to_vec()),
+            pk.to_bytes().to_vec(),
+        ))
+    }
 }
 
 /// ML-KEM-768 (FIPS 203) component. The recipient decapsulation key is carried
@@ -299,6 +324,19 @@ impl KemComponent for MlKem768Kem {
         let dk = pq::ml_kem_decaps_from_seed(&seed);
         let ss = pq::ml_kem_decapsulate(&dk, ct)?;
         Ok(Zeroizing::new(ss.to_vec()))
+    }
+
+    fn seed_len(&self) -> usize {
+        64
+    }
+
+    fn recipient_from_seed(&self, seed: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>)> {
+        // FIPS 203 expandedPrivateKey seed `d ‖ z` (64 bytes); the decap key is
+        // carried as this seed (matching `decapsulate`).
+        let s = arr64(seed)?;
+        let dk = pq::ml_kem_decaps_from_seed(&s);
+        let ek_bytes = pq::ml_kem_ek_of_dk(&dk);
+        Ok((Zeroizing::new(seed.to_vec()), ek_bytes))
     }
 }
 
@@ -593,6 +631,49 @@ pub fn generate_recipient(suite: SuiteId) -> Result<RecipientKeypair> {
     })
 }
 
+/// Deterministically build a recipient keypair for `suite` from per-component
+/// seeds — one per suite component, in suite order, each of that component's
+/// [`KemComponent::seed_len`].
+///
+/// Used for stable identity keys such as `#mesh-kem` (whose component seeds are
+/// HKDF-derived from the node Ed25519 root, see
+/// `crate::node_identity::derive_mesh_kem_recipient`), which MUST be stable
+/// across restarts — unlike [`generate_recipient`], which draws fresh OS
+/// randomness each call.
+pub fn recipient_from_seeds(suite: SuiteId, seeds: &[&[u8]]) -> Result<RecipientKeypair> {
+    let comps = suite.components();
+    if seeds.len() != comps.len() {
+        bail!(
+            "suite {} needs {} component seeds, got {}",
+            suite.as_str(),
+            comps.len(),
+            seeds.len()
+        );
+    }
+    let mut dks = Vec::with_capacity(comps.len());
+    let mut eks = Vec::with_capacity(comps.len());
+    for (i, &kem) in comps.iter().enumerate() {
+        let c = kem.component();
+        if seeds[i].len() != c.seed_len() {
+            bail!(
+                "suite {} component {:?} seed length {} != expected {}",
+                suite.as_str(),
+                kem,
+                seeds[i].len(),
+                c.seed_len()
+            );
+        }
+        let (dk, ek) = c.recipient_from_seed(seeds[i])?;
+        dks.push(dk);
+        eks.push(ek);
+    }
+    Ok(RecipientKeypair {
+        suite_id: suite,
+        dks,
+        eks,
+    })
+}
+
 /// Encapsulate to a recipient's public material, returning the wire
 /// [`HybridKemMaterial`] (the per-component ciphertexts) and the combined 32-byte
 /// shared secret.
@@ -686,6 +767,93 @@ pub fn decapsulate(
     }
 
     Ok(combine(suite, &sss, &cts, &eks))
+}
+
+// ============================================================================
+// #mesh-kem trust store (kid-anchored recipient public keys)
+// ============================================================================
+
+/// Resolves the anchored hybrid-KEM recipient public material for a peer's
+/// Ed25519 signer identity (its `#mesh-kem` keyAgreement key).
+///
+/// The confidentiality-side mirror of [`crate::envelope::PqTrustStore`]: the
+/// binding is established out-of-band (DID `keyAgreement` resolution / peer
+/// attestation), NEVER self-asserted on the wire. **Fail-closed:** an unanchored
+/// peer returns `None`, and callers MUST reject rather than fall back to a
+/// classical or self-asserted key (epic #550 principle 1 — mandatory hybrid, no
+/// in-band downgrade).
+pub trait KemTrustStore: Send + Sync {
+    /// The anchored `#mesh-kem` recipient public bound to `ed25519_pubkey`, or
+    /// `None` if unknown (caller fails closed).
+    fn kem_recipient_for(&self, ed25519_pubkey: &[u8; 32]) -> Option<RecipientPublic>;
+}
+
+/// In-memory kid-anchored `#mesh-kem` trust store: Ed25519 signer identity →
+/// anchored hybrid-KEM [`RecipientPublic`]. Bindings come from the node's own
+/// hybrid identity and from attested peer identities (their resolved DID
+/// `keyAgreement`), established out-of-band — never from wire-asserted material.
+#[derive(Default, Clone)]
+pub struct KeyedKemTrustStore {
+    bindings: std::collections::HashMap<[u8; 32], RecipientPublic>,
+}
+
+impl KeyedKemTrustStore {
+    /// Create an empty store.
+    pub fn new() -> Self {
+        Self {
+            bindings: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Bind an Ed25519 signer identity to its anchored `#mesh-kem` recipient public.
+    pub fn bind(&mut self, ed25519_pubkey: [u8; 32], recipient: RecipientPublic) {
+        self.bindings.insert(ed25519_pubkey, recipient);
+    }
+
+    /// Number of bindings.
+    pub fn len(&self) -> usize {
+        self.bindings.len()
+    }
+
+    /// Whether the store has no bindings.
+    pub fn is_empty(&self) -> bool {
+        self.bindings.is_empty()
+    }
+}
+
+impl KemTrustStore for KeyedKemTrustStore {
+    fn kem_recipient_for(&self, ed25519_pubkey: &[u8; 32]) -> Option<RecipientPublic> {
+        self.bindings.get(ed25519_pubkey).cloned()
+    }
+}
+
+// ============================================================================
+// #mesh-kem prekey seam (forward secrecy for the one-shot envelope, S4 / #555)
+// ============================================================================
+
+/// A short-lived, rotated `#mesh-kem` recipient prekey.
+///
+/// The one-shot request envelope (#555) encapsulates to a *published* recipient
+/// key, so — unlike streams — it cannot get forward secrecy from a per-session
+/// ephemeral key. The standard remedy (X3DH-style) is to publish short-lived
+/// rotated prekeys and drop the matching decapsulation key after expiry, so a
+/// later key compromise cannot decrypt past envelopes. This type is the seam:
+/// the publisher advertises the current `recipient` + `key_id`; the decryptor
+/// keeps the matching [`RecipientKeypair`] only until `not_after_unix_ms`.
+///
+/// The full rotation scheduler + keystore are follow-up work (tracked under
+/// #552); this fixes the wire/identity shape that #555 binds to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KemPrekey {
+    /// Stable id of this prekey, bound into the envelope so the decryptor can
+    /// select the matching decapsulation key.
+    pub key_id: [u8; 16],
+    /// The rotated recipient public material (suite + encap keys).
+    pub recipient: RecipientPublic,
+    /// Expiry (Unix ms). The decryptor MUST drop the matching decap key after
+    /// this instant, which is what gives the envelope forward secrecy across
+    /// rotation.
+    pub not_after_unix_ms: i64,
 }
 
 #[cfg(test)]
@@ -914,6 +1082,61 @@ mod tests {
         // or length-prefixing) was altered — review before updating.
         const KAT: &str = "00f1efc789785e571aa6e985a9f2567cca39dfc7dc272b514380b212524ce031";
         assert_eq!(got, KAT, "combiner KAT changed — construction altered!");
+    }
+
+    // ---- deterministic seed-based recipient (stable identity keys, S1) ----
+
+    #[test]
+    fn recipient_from_seeds_is_deterministic_and_roundtrips() {
+        let suite = SuiteId::HyKemX25519MlKem768;
+        let x_seed = [0x07u8; 32];
+        let m_seed = [0x09u8; 64];
+        let seeds: [&[u8]; 2] = [&x_seed, &m_seed];
+
+        let kp1 = recipient_from_seeds(suite, &seeds).unwrap();
+        let kp2 = recipient_from_seeds(suite, &seeds).unwrap();
+        // Same seeds → identical published encap keys (stable across restarts).
+        assert_eq!(kp1.public(), kp2.public());
+
+        // The deterministic recipient interoperates with encap/decap.
+        let (material, ss_enc) = encapsulate_to(&kp1.public()).unwrap();
+        let ss_dec = decapsulate(&kp2, &material).unwrap();
+        assert_eq!(*ss_enc, *ss_dec);
+    }
+
+    #[test]
+    fn recipient_from_seeds_rejects_wrong_lengths() {
+        let suite = SuiteId::HyKemX25519MlKem768;
+        let bad_x: [&[u8]; 2] = [&[0u8; 31], &[0u8; 64]];
+        assert!(recipient_from_seeds(suite, &bad_x).is_err());
+        let bad_m: [&[u8]; 2] = [&[0u8; 32], &[0u8; 63]];
+        assert!(recipient_from_seeds(suite, &bad_m).is_err());
+        let wrong_count: [&[u8]; 1] = [&[0u8; 32]];
+        assert!(recipient_from_seeds(suite, &wrong_count).is_err());
+    }
+
+    // ---- #mesh-kem trust store (fail-closed, S1) ----
+
+    #[test]
+    fn kem_trust_store_binds_and_fails_closed() {
+        let suite = SuiteId::HyKemX25519MlKem768;
+        let kp = generate_recipient(suite).unwrap();
+        let id = [0x42u8; 32];
+
+        let mut store = KeyedKemTrustStore::new();
+        assert!(store.is_empty());
+        assert!(
+            store.kem_recipient_for(&id).is_none(),
+            "unanchored identity must resolve to None (fail closed)"
+        );
+
+        store.bind(id, kp.public());
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.kem_recipient_for(&id), Some(kp.public()));
+        assert!(
+            store.kem_recipient_for(&[0x43u8; 32]).is_none(),
+            "a different identity stays unanchored"
+        );
     }
 }
 
