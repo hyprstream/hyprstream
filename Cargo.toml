@@ -28,7 +28,7 @@ members = [
 # bitsandbytes-sys is standalone - only built when bnb feature is enabled
 # hyprstream-wasm-pyguest is a wasm32-unknown-unknown-only cdylib (RustPython guest,
 # #505 sandbox spike); excluded so a host-target workspace build never compiles it.
-exclude = ["crates/bitsandbytes-sys", "crates/hyprstream-wasm-pyguest"]
+exclude = ["crates/bitsandbytes-sys", "crates/hyprstream-wasm-pyguest", "crates/hyprstream-wasm-fsguest"]
 resolver = "2"
 
 [workspace.package]

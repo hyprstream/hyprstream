@@ -36,6 +36,17 @@ async-trait = "0.1"
 # `/lang/python` mount fid state uses parking_lot::Mutex for interior mutability
 # through `&Fid` (same pattern as the native mount).
 parking_lot = "0.12"
+# Profile B (#506): preview1 wasi-common at the version matching wasmtime 46.0.1.
+# We use ONLY `sync` (block_on wiggle executor) + `wasmtime` (for add_to_linker);
+# NO `tokio`/`exit`. The `sync::WasiCtxBuilder` is bypassed (it only takes a concrete
+# cap_std::fs::Dir); we build a `WasiCtx` directly and push our own `Box<dyn WasiDir>`
+# VFS preopen. wasi-common -> wasmtime(=46.0.1)/wiggle/cap-std/rustix — NO tch/torch
+# (verified torch-free, see FINDINGS.md §Profile B).
+wasi-common = { version = "=46.0.1", default-features = false, features = ["sync", "wasmtime"] }
+# Profile B's `WasiCtx::new` wants `Box<dyn rand::Rng + Send + Sync>` where `Rng` is
+# wasi-common's rand (0.10) — distinct from Profile A's rand 0.8. Aliased so we can
+# name the matching trait for the deterministic (withheld-OS-entropy) random source.
+wasi-rand = { package = "rand", version = "0.10", default-features = false }
 
 [dev-dependencies]
 anyhow = "1"

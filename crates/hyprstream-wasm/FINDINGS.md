@@ -424,3 +424,172 @@ Canonical seam shapes used (from `crates/hyprstream-vfs/src/proxy.rs`):
   builtins so `cat("/config/x")` works from Python. The capability itself is already
   real and tested through the host fns.
 - No blockers.
+
+---
+
+## P-B RESOLUTIONS (#506, branch `ewindisch/506-wanix-profile-b`) — Profile B: a WASI guest whose filesystem IS a Subject-scoped VFS Mount
+
+**Verdict: VALIDATED (GREEN).** A real, unmodified `wasm32-wasip1` guest doing
+`std::fs` ops runs under our embedded wasmtime with its ENTIRE filesystem backed by
+an in-process `hyprstream_vfs::Mount` — no host preopen, data round-trips, and the
+bound `Subject` is enforced at the Mount. `cargo test -p hyprstream-wasm` = 2 (lib) +
+11 (sandbox) + 2 (profile_b) all green; `cargo clippy -p hyprstream-wasm --tests`
+warning-clean; `cargo tree -p hyprstream-wasm -i tch` empty (torch-free preserved).
+
+This confirms §4's verdict in code: the make-or-break seam is **preview1 `wasi-common`
+`WasiDir`/`WasiFile` trait objects**, NOT preview2 `wasmtime-wasi`.
+
+### 0. Dependency — `wasi-common` at the version matching wasmtime 46.0.1
+
+`wasi-common = { version = "=46.0.1", default-features = false, features = ["sync",
+"wasmtime"] }`. `sync` = the `block_on` wiggle executor (the preview1 host funcs are
+SYNCHRONOUS — every async trait method is expected to poll to `Ready` immediately);
+`wasmtime` = `wasi_common::sync::add_to_linker`. We deliberately do NOT enable
+`tokio` (the async wiggle integration) or `exit`. **Torch-free CONFIRMED:**
+`wasi-common -> wasmtime(=46.0.1)/wiggle/cap-std/rustix/rand(0.10)` — no `tch`/libtorch
+(`cargo tree -i tch` errors "did not match any packages"). A second `rand` major is
+pulled in: `WasiCtx::new` wants `Box<dyn rand::Rng + Send + Sync>` where `Rng` is
+**rand 0.10** (wasi-common's), distinct from Profile A's rand 0.8 — added aliased as
+`wasi-rand = { package = "rand", version = "0.10" }` so we can name the matching trait.
+
+### 1. `WasiDir`/`WasiFile` over `hyprstream_vfs::Mount` (`src/wasi_fs.rs`)
+
+- **`MountDir`** (impl `wasi_common::WasiDir`): `{ mount: Arc<dyn Mount>, subject:
+  Subject, base: Vec<String>, rt: Arc<Runtime> }`. `base` is the Mount path it is
+  rooted at (the preopen root = `[]`); opening a directory yields a child `MountDir`
+  with a deeper `base`. Implements: `open_file` (walk+stat to classify file/dir,
+  then `walk`+`open` the fid; tolerates `NotFound` as "to-be-created", honors
+  O_DIRECTORY/O_EXCLUSIVE/O_TRUNCATE→`OTRUNC`), `readdir` (Mount `readdir` →
+  `ReaddirEntity` stream with cursor resume), `get_filestat`/`get_path_filestat`
+  (Mount `stat`; 9P `qtype & 0x80` ⇒ directory). Mutators (`create_dir`/`unlink`/
+  `rename`/`symlink`/`hard_link`/`set_times`) keep the trait's `not_supported`
+  default — the Profile-B fs surface is read/write-on-existing + create-on-open, the
+  same bounded shape as the proxy seam (no namespace mutation); a future revision can
+  route create/unlink through `Mount::as_fsmount()`.
+- **`MountFile`** (impl `wasi_common::WasiFile`): holds the open Mount `Fid` (in an
+  `Option<Mutex<>>` so `Drop` `clunk`s it exactly once) + a sequential `pos` cursor.
+  Implements BOTH the positional ABI (`read_vectored_at`/`write_vectored_at` =
+  `fd_pread`/`fd_pwrite`) AND the sequential ABI (`read_vectored`/`write_vectored`/
+  `seek` = `fd_read`/`fd_write`/`fd_seek`) — std `File::read`/`write` use the
+  SEQUENTIAL ones; implementing only `_at` yields EBADF (the trait defaults are
+  `Err(badf)`). This was the one real gotcha found during validation.
+- **MAC: ONE policy enforcement point, no parallel check.** `MountDir`/`MountFile`
+  thread the construction-time `Subject` into EVERY Mount call and do NOTHING else —
+  no capability/permission gate of their own. The Mount is the sole PEP (the future
+  S2/#568 label check lands THERE). The only non-Mount check is a path-SHAPE guard
+  (`resolve()` rejects `..`/absolute components) — that is WASI-ABI hygiene, not
+  authz. `MountError` → preview1 errno via `map_err` (`PermissionDenied`→`perm`,
+  `NotFound`→`not_found`, …) so a Mount denial surfaces to the guest as the right WASI
+  error.
+
+### 2. Profile-B `WasiCtx` + instantiation (`src/wasi_sandbox.rs`) and validation
+
+- **`WasiSandbox::wasi_for(wasm, subject, mount: Arc<dyn Mount>)`** — the Profile-B
+  constructor. Store data `WasiState { subject, wasi: WasiCtx }`; links the preview1
+  surface via `wasi_common::sync::add_to_linker(&mut linker, |s| &mut s.wasi)`. Reuses
+  Profile A's `build_engine()` (fuel + epoch) and `EpochTimer` (run via
+  `run_start`/`run_start_with_epoch_deadline`).
+- **The hand-rolled, capability-WITHHOLDING ctx (`make_ctx`).** We BYPASS
+  `sync::WasiCtxBuilder` (whose `preopened_dir` only takes a concrete
+  `cap_std::fs::Dir` — a host dir, the exact escape we must avoid) and build a
+  `WasiCtx` directly:
+  - **Preopen set = EXACTLY ONE:** `ctx.push_preopened_dir(Box::new(MountDir...), "/")`.
+    The VFS Mount at guest path `/`. **No `preopened_dir(host_dir)` anywhere.**
+  - **Clocks = WITHHELD:** `WasiClocks::new()` (both system+monotonic `None`) →
+    `clock_*_get` returns `badf`. The `EpochTimer` is the DoS bound, not a guest clock.
+  - **Random = WITHHELD from host OS:** `wasi_common::random::Deterministic` (a fixed
+    byte cycle), NOT host CSPRNG — `random_get` is deterministic, not OS entropy.
+  - **Sched = DENIED:** `DeniedSched` errors on `poll_oneoff`/`sched_yield`/`sleep`.
+  - **stdio:** `WasiCtx::new` defaults — stdin empty, stdout/stderr sink; no host fd.
+  - **`wasi:sockets` / environ / args:** none (preview1 has no sockets; environ/args
+    left empty). The single-host-preopen-or-ambient-cap caveat from the spec is
+    honored: there is NO host-touching capability besides the VFS preopen.
+- **Validation guest** (`crates/hyprstream-wasm-fsguest`, excluded standalone
+  `wasm32-wasip1` *command*): pure `std::fs` — reads host-seeded `seed.txt`
+  (`"hello-vfs"`), writes `out.txt` (reversed), reads it back, `readdir`s `.`, writes
+  `done.txt`=`"ok"`; exits 0 iff all pass. `wasm-tools` confirms its imports are
+  EXACTLY the `wasi_snapshot_preview1` fs surface (`path_open`/`fd_read`/`fd_write`/
+  `fd_readdir`/`fd_filestat_get`/`fd_seek`/… + `proc_exit`/`environ_*`) — nothing else.
+- **Test results** (`tests/profile_b.rs`, backed by an in-memory Subject-scoped
+  `MemMount`):
+  - `wasi_guest_filesystem_is_the_vfs_mount` (PASS): guest exits 0; `out.txt` =
+    `"sfv-olleh"` and `done.txt` = `"ok"` are found IN THE MOUNT afterward — proving
+    the guest's WASI fs ops resolved to the VFS, the data round-tripped, and the
+    writes landed in the in-memory Mount (no host fs; the only preopen is the Mount).
+  - `wasi_guest_subject_reaches_mount_policy_point` (PASS): the SAME guest under a
+    `denied` Subject fails its first read (the `MemMount` refuses `denied` with
+    `PermissionDenied` → WASI `perm` → guest exits nonzero) — proving the bound
+    Subject reaches the Mount and is enforced THERE, the single PEP.
+
+### 3. Async/sync bridging (the real impedance + its resolution)
+
+`wasi-common`'s `WasiDir`/`WasiFile` are **async traits**, but `sync::add_to_linker`
+uses the `block_on` wiggle executor that drives each host-fn future to `Ready`
+essentially synchronously. The `Mount` is genuinely async. Bridge: each `MountDir`/
+`MountFile` method drives its Mount future to completion on a dedicated
+**current-thread tokio `Runtime`** (owned by the `WasiSandbox`, shared `Arc`) via
+`rt.block_on(mount.op(...))`. Because the whole `WasiSandbox` is driven from a PLAIN
+(non-async) thread — exactly like Profile A's `PyShell` driver thread, and like
+`PythonMount::spawn`'s OS thread — this nested `block_on` is NOT on a tokio worker and
+does not panic. From the wiggle executor's view the host-fn future resolves
+immediately, satisfying the `block_on` contract. (Tests spawn a `std::thread` and call
+`run_start` there; calling it from a `#[tokio::test]` worker would panic — documented
+on `wasi_for`.) This mirrors the existing proxy seam (`vfs.rs` uses `blocking_send` +
+std reply channel for the same reason); here we go ONE level more direct — straight to
+the `Arc<dyn Mount>` — because Profile B wants the full fid-based fs surface
+(walk/open/read/write/readdir/stat), which the path-based proxy `VfsOp`
+(Cat/Ls/Echo/Ctl) does not expose.
+
+### 4. Torch-free + build/test/clippy
+
+- `cargo build -p hyprstream-wasm` — green, no LIBTORCH.
+- `cargo build --release --target wasm32-wasip1 --manifest-path
+  crates/hyprstream-wasm-fsguest/Cargo.toml` — green.
+- `cargo test -p hyprstream-wasm` — 15/15 (lib 2, sandbox 11, profile_b 2) + 1 doctest
+  ignored.
+- `cargo clippy -p hyprstream-wasm --tests` — warning-clean.
+- `cargo tree -p hyprstream-wasm -i tch` — empty (torch-free preserved).
+
+### 5. Wanix-guest next step — DESIGN ONLY (not implemented)
+
+Path to running actual **Wanix** as a Profile-B guest:
+
+1. **ABI / WASI flavor — the gating unknown.** Wanix today ships as a *browser* wasm
+   (Go `js/wasm` GOOS=js, driven by `wasm_exec.js`), NOT a `wasm32-wasip1` command.
+   Running it under our preview1 host requires a wasip1 (or preview2 component) build
+   of the Wanix kernel. Determine: does Wanix have / can it produce a wasip1 target,
+   or do we target the component model? **If wasip1:** the `WasiSandbox` above takes
+   it almost as-is (its fs becomes our VFS preopen). **If component model:** preview2
+   `wasmtime-wasi`'s `WasiView`/`ResourceTable` is required and §4's preview1 verdict
+   does NOT carry over — the VFS would back a preview2 filesystem resource instead (a
+   larger lift). This fork is the first thing to nail down.
+2. **Capability set beyond fs (drives the Profile-B surface).** Wanix is a tiny
+   in-wasm kernel + 9P namespace. Audit whether its kernel needs **sockets** (we
+   withhold `wasi:sockets` — Profile B is fs-only) and **threads**
+   (`wasi-threads`/shared memory — wasi-common notes it remains in-tree precisely for
+   `wasmtime-wasi-threads`). A Wanix that only needs a filesystem + console fits
+   Profile B directly; one that needs sockets/threads needs an explicit, audited
+   capability ADD (each new ambient cap is a potential escape — keep deny-by-default).
+3. **Bind Wanix's 9P namespace to the in-process VFS via the existing 9P seam.**
+   `crates/hyprstream-9p` (`wanix_mount.rs`, today browser-only) is the reusable 9P
+   client. The integration: expose Wanix's `#9p` service over the in-process 9P seam
+   (#391/#412) and `ns.mount(...)` it onto the VFS, so Wanix's namespace and our VFS
+   are one tree — and Wanix's own fs syscalls (through THIS Profile-B `MountDir`)
+   resolve into that shared namespace, all under the bound Subject (still the single
+   PEP at the Mount). Net: Wanix becomes "just another Profile-B guest" whose
+   filesystem is the Subject-scoped VFS. Keep this a documented next step; do not
+   implement until the ABI fork (1) is decided.
+
+### 6. Blockers + precise next step
+
+- **No blocker for the #506 make-or-break** — it is validated and green. The
+  preview1 `wasi-common` `WasiDir`/`WasiFile`-over-`Mount` path works end-to-end.
+- **One gotcha captured** (not a wall): std `File::read`/`write` use the SEQUENTIAL
+  `fd_read`/`fd_write` ABI, so `WasiFile` must implement `read_vectored`/
+  `write_vectored`/`seek` (with an internal cursor), not just the positional `_at`
+  variants — otherwise the guest gets EBADF. Done.
+- **Precise next step (toward Wanix):** decide the Wanix ABI fork (wasip1 vs
+  component model) per §5.1. If wasip1: feed a wasip1 Wanix kernel to
+  `WasiSandbox::wasi_for` and grow the capability set (sockets/threads) only as
+  audited. If component model: re-validate the VFS backing against preview2
+  `wasmtime-wasi`'s resource table (a separate spike — §4's verdict is preview1-only).

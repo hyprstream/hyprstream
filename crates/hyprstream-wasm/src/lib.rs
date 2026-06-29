@@ -38,6 +38,8 @@ use wasmtime::{bail, Caller, Config, Engine, Extern, Linker, Memory, Module, Res
 
 pub mod mount;
 pub mod vfs;
+pub mod wasi_fs;
+pub mod wasi_sandbox;
 
 // ---------------------------------------------------------------------------
 // Subject: the identity/tenant a sandbox call runs as.

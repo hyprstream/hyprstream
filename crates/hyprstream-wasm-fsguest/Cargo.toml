@@ -1,0 +1,27 @@
+[package]
+name = "hyprstream-wasm-fsguest"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Trivial wasm32-wasip1 guest doing file ops, for the #506 Profile-B WASI-over-VFS validation"
+
+# NOT a workspace member (mirrors hyprstream-wasm-pyguest). It is a wasm-only
+# command binary; listed in the root [workspace.exclude] so a host-target build
+# never tries to compile it. Build explicitly:
+#   cargo build --release --target wasm32-wasip1 \
+#       --manifest-path crates/hyprstream-wasm-fsguest/Cargo.toml
+#
+# Empty [workspace] makes it standalone (own lockfile/target).
+[workspace]
+
+[[bin]]
+name = "hyprstream-wasm-fsguest"
+path = "src/main.rs"
+
+[profile.release]
+# Small, fast-to-build guest.
+opt-level = "s"
+lto = false
+panic = "abort"
+
+[dependencies]
