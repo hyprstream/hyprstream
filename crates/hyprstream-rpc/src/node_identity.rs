@@ -80,6 +80,58 @@ pub fn derive_mesh_mldsa_key(ed25519_key: &SigningKey) -> crate::crypto::pq::MlD
     sk
 }
 
+/// HKDF purpose-label namespace for the node's `#mesh-kem` hybrid keyAgreement
+/// identity (S1 / #552). Distinct from the Ed25519, JWT, and [`MESH_MLDSA_PURPOSE`]
+/// labels so the KEM identity is key-separated (PQUIP key separation). Each suite
+/// component derives an independent seed under a per-component sub-label
+/// `"<MESH_KEM_PURPOSE>/<kem>"`.
+pub const MESH_KEM_PURPOSE: &str = "hyprstream-mesh-kem-v1";
+
+/// Expand `out.len()` bytes from the node root via HKDF-SHA256 (node-identity
+/// salt, given `info`). Used for the variable-length `#mesh-kem` component seeds
+/// (X25519 = 32B, ML-KEM-768 = 64B), which [`derive_purpose_key`] (fixed 32B)
+/// cannot produce.
+fn expand_purpose_bytes(root_key: &SigningKey, info: &[u8], out: &mut [u8]) {
+    let hk = Hkdf::<Sha256>::new(Some(NODE_IDENTITY_SALT), &root_key.to_bytes());
+    #[allow(clippy::expect_used)] // HKDF-SHA256 expand of <= 255*32 bytes cannot fail
+    hk.expand(info, out)
+        .expect("HKDF-SHA256 expand within the length bound cannot fail");
+}
+
+/// Deterministically derive the node's `#mesh-kem` hybrid-KEM recipient keypair
+/// (S1 / #552) from its persisted Ed25519 root key — the confidentiality-side
+/// parallel of [`derive_mesh_mldsa_key`].
+///
+/// Each suite component gets an independent HKDF-derived seed under a distinct
+/// per-component sub-label (`"<MESH_KEM_PURPOSE>/<kem>"`), so the X25519 and
+/// ML-KEM-768 legs are independent of each other and key-separated from the
+/// Ed25519 identity and the `#mesh-mldsa` key. Stable across restarts (no key
+/// file). The published [`crate::crypto::hybrid_kem::RecipientPublic`] is what
+/// peers anchor in their [`crate::crypto::hybrid_kem::KemTrustStore`] (resolved
+/// from the DID `keyAgreement` set).
+pub fn derive_mesh_kem_recipient(
+    ed25519_key: &SigningKey,
+) -> anyhow::Result<crate::crypto::hybrid_kem::RecipientKeypair> {
+    use crate::crypto::hybrid_kem::{recipient_from_seeds, KemId, SuiteId};
+    let suite = SuiteId::HyKemX25519MlKem768;
+    // Fail closed if the pinned suite's shape ever changes out from under this
+    // hard-coded per-component seeding (a new suite must update this derivation).
+    debug_assert_eq!(suite.components(), &[KemId::X25519, KemId::MlKem768]);
+
+    let x_info = format!("{MESH_KEM_PURPOSE}/x25519");
+    let m_info = format!("{MESH_KEM_PURPOSE}/mlkem768");
+    let mut x_seed = [0u8; 32];
+    let mut m_seed = [0u8; 64];
+    expand_purpose_bytes(ed25519_key, x_info.as_bytes(), &mut x_seed);
+    expand_purpose_bytes(ed25519_key, m_info.as_bytes(), &mut m_seed);
+
+    let seeds: [&[u8]; 2] = [&x_seed, &m_seed];
+    let kp = recipient_from_seeds(suite, &seeds);
+    x_seed.zeroize();
+    m_seed.zeroize();
+    kp
+}
+
 /// A purpose-derived Ed25519 signing identity.
 /// Inner SigningKey is zeroized on drop via ed25519-dalek's `zeroize` feature.
 struct DerivedIdentity {
@@ -445,6 +497,48 @@ mod tests {
             salted.verifying_key().to_bytes(),
             unsalted.verifying_key().to_bytes(),
             "Salted and unsalted HKDF must produce different keys"
+        );
+    }
+
+    // ---- #mesh-kem hybrid keyAgreement identity (S1 / #552) ----
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn mesh_kem_recipient_is_deterministic() {
+        // Same node root must derive the same #mesh-kem public material so it
+        // survives restarts without a key file.
+        let root = SigningKey::from_bytes(&[5u8; 32]);
+        let a = derive_mesh_kem_recipient(&root).unwrap();
+        let b = derive_mesh_kem_recipient(&root).unwrap();
+        assert_eq!(a.public(), b.public());
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn mesh_kem_recipient_differs_per_node() {
+        let a = derive_mesh_kem_recipient(&SigningKey::from_bytes(&[1u8; 32])).unwrap();
+        let b = derive_mesh_kem_recipient(&SigningKey::from_bytes(&[2u8; 32])).unwrap();
+        assert_ne!(a.public(), b.public());
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn mesh_kem_is_key_separated() {
+        // The #mesh-kem X25519 leg must differ from the Ed25519 identity key and
+        // from the bare purpose-key derivation (PQUIP key separation).
+        let root = SigningKey::from_bytes(&[9u8; 32]);
+        let pubs = derive_mesh_kem_recipient(&root).unwrap().public();
+        let x25519_ek = &pubs.eks[0]; // suite component 0 = X25519 (32 bytes)
+        assert_ne!(
+            x25519_ek.as_slice(),
+            &root.verifying_key().to_bytes()[..],
+            "#mesh-kem X25519 key must differ from the Ed25519 identity key"
+        );
+        let bare = derive_purpose_key(&root, MESH_KEM_PURPOSE).to_bytes();
+        assert_ne!(
+            x25519_ek.as_slice(),
+            &bare[..],
+            "per-component sub-label seed must differ from the bare purpose key"
         );
     }
 }
