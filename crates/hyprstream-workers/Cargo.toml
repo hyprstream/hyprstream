@@ -9,6 +9,11 @@ description = "Isolated workload execution using Kata Containers with CRI-aligne
 [dependencies]
 # Workspace crates
 hyprstream-rpc = { path = "../hyprstream-rpc" }
+# In-process WebAssembly sandbox substrate (#505 P1): the embedded wasmtime
+# `Sandbox` (capability-only Linker, fuel/epoch DoS bounds). Optional — pulled in
+# only under the `wasm` feature so the default/nspawn build stays lean and
+# torch-free (hyprstream-wasm depends only on wasmtime/rand, never tch/libtorch).
+hyprstream-wasm = { path = "../hyprstream-wasm", optional = true }
 hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }
 hyprstream-service = { path = "../hyprstream-service" }
 hyprstream-vfs = { path = "../hyprstream-vfs" }
@@ -137,6 +142,13 @@ kata-vm = [
     "dep:fuse-backend-rs",
     "dep:hyprstream-vfs-server",
 ]
+# In-process WebAssembly sandbox backend (#505 P2). Compiles in `WasmBackend`
+# and the `hyprstream-wasm` wasmtime substrate it consumes. A native in-process
+# sibling under the same `SandboxBackend` seam: no VM, no subprocess — a wasmtime
+# guest bound to a `Subject`, fuel/epoch DoS-bounded. Opt-in so the default build
+# doesn't vendor wasmtime; stays torch-free either way. When off, `wasm`
+# selection fails closed (the backend simply isn't registered).
+wasm = ["dep:hyprstream-wasm"]
 # Enable Dragonball built-in VMM support (alternative to cloud-hypervisor).
 # Implies `kata-vm` since it tunes the kata hypervisor abstraction.
 dragonball = ["kata-vm", "kata-hypervisor/dragonball"]

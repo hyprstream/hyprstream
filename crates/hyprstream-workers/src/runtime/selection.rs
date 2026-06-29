@@ -182,6 +182,7 @@ pub fn resolve_backend(name: &str, ctx: &BackendCtx) -> Result<Arc<dyn SandboxBa
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -296,13 +297,58 @@ mod tests {
 
     #[test]
     fn no_speculative_backends_registered() {
-        // YAGNI: Oci/Cri/Wasm must not be in the registry until built.
-        for name in ["oci", "cri", "wasm"] {
+        // YAGNI: still-speculative tiers (Oci/Cri) must not be in the registry
+        // until built. `wasm` is now a real backend (#505 P2) and is handled
+        // separately below — it registers iff the `wasm` feature is on.
+        for name in ["oci", "cri"] {
             assert!(
                 !inventory::iter::<BackendRegistration>().any(|r| r.name == name),
                 "speculative backend '{name}' must not be registered (YAGNI)"
             );
         }
+    }
+
+    #[test]
+    fn registry_contains_wasm_only_under_feature() {
+        // The in-process wasm backend (#505 P2) registers iff built with
+        // `--features wasm` (which vendors the wasmtime substrate). With the
+        // feature off it must NOT be a selectable name (fail-closed).
+        let has_wasm = inventory::iter::<BackendRegistration>().any(|r| r.name == "wasm");
+        assert_eq!(
+            has_wasm,
+            cfg!(feature = "wasm"),
+            "wasm registration must track the wasm feature"
+        );
+    }
+
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn wasm_is_lowest_priority_in_auto() {
+        // wasm (in-process, weakest isolation tier) must rank below nspawn so
+        // `auto` only picks it when nothing stronger is available.
+        let wasm = inventory::iter::<BackendRegistration>()
+            .find(|r| r.name == "wasm")
+            .expect("wasm registered under the wasm feature");
+        let nspawn = inventory::iter::<BackendRegistration>()
+            .find(|r| r.name == "nspawn")
+            .expect("nspawn always registered");
+        assert!(
+            wasm.priority < nspawn.priority,
+            "wasm (in-process) must rank below nspawn for auto-selection"
+        );
+    }
+
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn wasm_selectable_by_name_and_available() {
+        // Explicit `wasm` request resolves to the wasm registration, and it is
+        // always available once compiled in (wasmtime is vendored in-process).
+        let regs: Vec<&'static BackendRegistration> =
+            inventory::iter::<BackendRegistration>().collect();
+        let reg = select_registration("wasm", &regs, |r| (r.is_available)())
+            .expect("wasm selectable by name when feature on");
+        assert_eq!(reg.name, "wasm");
+        assert!((reg.is_available)(), "wasm is always available once built");
     }
 
     #[cfg(feature = "kata-vm")]
