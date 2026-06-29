@@ -131,8 +131,40 @@ impl Ucan {
     /// Decode a UCAN from canonical CBOR. Pure structural decode — does NOT
     /// verify signatures or attenuation (call [`Ucan::verify_signatures`] then
     /// [`super::chain::validate_chain`]).
+    ///
+    /// Fail-closed DoS guard: a decoded chain whose nesting meets or exceeds
+    /// [`super::chain::MAX_PROOF_DEPTH`] is rejected here, before it is ever
+    /// walked, so a maliciously deep `proofs`-within-`proofs` token cannot reach
+    /// (or exhaust the stack in) the validator. (The validator independently
+    /// re-enforces the same bound during the walk.)
     pub fn from_cbor(bytes: &[u8]) -> Result<Self, UcanError> {
-        ciborium::de::from_reader(bytes).map_err(|e| UcanError::Decode(e.to_string()))
+        let ucan: Ucan =
+            ciborium::de::from_reader(bytes).map_err(|e| UcanError::Decode(e.to_string()))?;
+        // Match the validator's bound exactly: the walk rejects once a link index
+        // reaches `MAX_PROOF_DEPTH` (links `0..MAX_PROOF_DEPTH` are allowed), so a
+        // `proof_depth` of `MAX_PROOF_DEPTH` or more is over-deep.
+        let depth = ucan.proof_depth();
+        if depth >= super::chain::MAX_PROOF_DEPTH {
+            return Err(UcanError::Malformed(format!(
+                "delegation chain nested {depth} deep meets/exceeds maximum proof depth {}",
+                super::chain::MAX_PROOF_DEPTH
+            )));
+        }
+        Ok(ucan)
+    }
+
+    /// The maximum nesting depth of this UCAN's proof chain: `0` for a root (no
+    /// proofs), otherwise `1 + max(proof.proof_depth())`. Used by [`from_cbor`]
+    /// as a parse-time DoS bound. Walks the in-memory tree iteratively-bounded by
+    /// the already-decoded structure (the decode itself is what we cap).
+    ///
+    /// [`from_cbor`]: Ucan::from_cbor
+    pub fn proof_depth(&self) -> usize {
+        self.proofs
+            .iter()
+            .map(|p| 1 + p.proof_depth())
+            .max()
+            .unwrap_or(0)
     }
 
     /// Encode this UCAN to canonical CBOR.
