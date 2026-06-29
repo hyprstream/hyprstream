@@ -76,18 +76,34 @@ fn random_data_key() -> Zeroizing<[u8; 32]> {
 // ============================================================================
 
 /// Encrypt with AES-256-GCM.
-fn aes_gcm_encrypt(key: &[u8; 32], nonce: &[u8; 12], plaintext: &[u8], aad: &[u8]) -> EnvelopeResult<Vec<u8>> {
+fn aes_gcm_encrypt(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> EnvelopeResult<Vec<u8>> {
     let cipher = Aes256Gcm::new(key.into());
-    let payload = Payload { msg: plaintext, aad };
+    let payload = Payload {
+        msg: plaintext,
+        aad,
+    };
     cipher
         .encrypt(Nonce::from_slice(nonce), payload)
         .map_err(|_| EnvelopeError::Encryption("AES-GCM encrypt failed".into()))
 }
 
 /// Decrypt with AES-256-GCM.
-fn aes_gcm_decrypt(key: &[u8; 32], nonce: &[u8; 12], ciphertext: &[u8], aad: &[u8]) -> EnvelopeResult<Vec<u8>> {
+fn aes_gcm_decrypt(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    ciphertext: &[u8],
+    aad: &[u8],
+) -> EnvelopeResult<Vec<u8>> {
     let cipher = Aes256Gcm::new(key.into());
-    let payload = Payload { msg: ciphertext, aad };
+    let payload = Payload {
+        msg: ciphertext,
+        aad,
+    };
     cipher
         .decrypt(Nonce::from_slice(nonce), payload)
         .map_err(|_| EnvelopeError::Decryption("AES-GCM decrypt failed".into()))
@@ -122,35 +138,62 @@ pub fn notification_mac_verify(
 
 /// Standard DH from raw bytes. Delegates to `key_exchange::ristretto_dh_raw`.
 #[cfg(not(feature = "fips"))]
-fn ristretto_dh_raw_impl(secret_bytes: &[u8; 32], their_pub_bytes: &[u8; 32]) -> EnvelopeResult<[u8; 32]> {
+fn ristretto_dh_raw_impl(
+    secret_bytes: &[u8; 32],
+    their_pub_bytes: &[u8; 32],
+) -> EnvelopeResult<[u8; 32]> {
     ristretto_dh_raw(secret_bytes, their_pub_bytes)
 }
 
 #[cfg(feature = "fips")]
-fn ristretto_dh_raw_impl(_secret_bytes: &[u8; 32], _their_pub_bytes: &[u8; 32]) -> EnvelopeResult<[u8; 32]> {
-    Err(EnvelopeError::KeyExchange("notification broadcast encryption requires Ristretto255 (not available in FIPS mode)".into()))
+fn ristretto_dh_raw_impl(
+    _secret_bytes: &[u8; 32],
+    _their_pub_bytes: &[u8; 32],
+) -> EnvelopeResult<[u8; 32]> {
+    Err(EnvelopeError::KeyExchange(
+        "notification broadcast encryption requires Ristretto255 (not available in FIPS mode)"
+            .into(),
+    ))
 }
 
 /// Blinding-aware DH from raw bytes. Delegates to `key_exchange::blinded_dh_raw`.
 #[cfg(not(feature = "fips"))]
-fn blinded_dh_raw_impl(secret_bytes: &[u8; 32], blinding_scalar: &[u8; 32], their_pub: &[u8; 32]) -> EnvelopeResult<[u8; 32]> {
+fn blinded_dh_raw_impl(
+    secret_bytes: &[u8; 32],
+    blinding_scalar: &[u8; 32],
+    their_pub: &[u8; 32],
+) -> EnvelopeResult<[u8; 32]> {
     blinded_dh_raw(secret_bytes, blinding_scalar, their_pub)
 }
 
 #[cfg(feature = "fips")]
-fn blinded_dh_raw_impl(_secret_bytes: &[u8; 32], _blinding_scalar: &[u8; 32], _their_pub: &[u8; 32]) -> EnvelopeResult<[u8; 32]> {
-    Err(EnvelopeError::KeyExchange("notification broadcast requires Ristretto255".into()))
+fn blinded_dh_raw_impl(
+    _secret_bytes: &[u8; 32],
+    _blinding_scalar: &[u8; 32],
+    _their_pub: &[u8; 32],
+) -> EnvelopeResult<[u8; 32]> {
+    Err(EnvelopeError::KeyExchange(
+        "notification broadcast requires Ristretto255".into(),
+    ))
 }
 
 /// Reconstruct blinded pubkey from raw bytes. Delegates to `key_exchange::reconstruct_blinded_pub_raw`.
 #[cfg(not(feature = "fips"))]
-fn reconstruct_blinded_pub_raw_impl(subscriber_pub: &[u8; 32], blinding_scalar: &[u8; 32]) -> EnvelopeResult<[u8; 32]> {
+fn reconstruct_blinded_pub_raw_impl(
+    subscriber_pub: &[u8; 32],
+    blinding_scalar: &[u8; 32],
+) -> EnvelopeResult<[u8; 32]> {
     reconstruct_blinded_pub_raw(subscriber_pub, blinding_scalar)
 }
 
 #[cfg(feature = "fips")]
-fn reconstruct_blinded_pub_raw_impl(_subscriber_pub: &[u8; 32], _blinding_scalar: &[u8; 32]) -> EnvelopeResult<[u8; 32]> {
-    Err(EnvelopeError::KeyExchange("notification broadcast requires Ristretto255".into()))
+fn reconstruct_blinded_pub_raw_impl(
+    _subscriber_pub: &[u8; 32],
+    _blinding_scalar: &[u8; 32],
+) -> EnvelopeResult<[u8; 32]> {
+    Err(EnvelopeError::KeyExchange(
+        "notification broadcast requires Ristretto255".into(),
+    ))
 }
 
 // ============================================================================
@@ -269,7 +312,6 @@ impl BroadcastEncryptor {
             capsules,
         })
     }
-
 }
 
 // ============================================================================
@@ -328,7 +370,8 @@ impl BroadcastDecryptor {
         scope: &str,
     ) -> EnvelopeResult<Vec<u8>> {
         // Step 1: Blinding-aware DH: shared = (s_sub + r) * P_pub
-        let shared_secret = blinded_dh_raw_impl(&self.subscriber_secret, blinding_scalar, publisher_pub)?;
+        let shared_secret =
+            blinded_dh_raw_impl(&self.subscriber_secret, blinding_scalar, publisher_pub)?;
 
         // Step 2: Reconstruct blinded pubkey = P_sub + r * G
         let blinded_pub = reconstruct_blinded_pub_raw_impl(&self.subscriber_pub, blinding_scalar)?;
@@ -343,7 +386,9 @@ impl BroadcastDecryptor {
         let fingerprint = pubkey_fingerprint(&blinded_pub);
         let data_key_bytes = aes_gcm_decrypt(&keys.enc_key, key_nonce, wrapped_key, &fingerprint)?;
         if data_key_bytes.len() != 32 {
-            return Err(EnvelopeError::Decryption("unwrapped key wrong length".into()));
+            return Err(EnvelopeError::Decryption(
+                "unwrapped key wrong length".into(),
+            ));
         }
         let mut data_key = Zeroizing::new([0u8; 32]);
         data_key.copy_from_slice(&data_key_bytes);
@@ -354,7 +399,6 @@ impl BroadcastDecryptor {
 
         Ok(plaintext)
     }
-
 }
 
 impl Drop for BroadcastDecryptor {
@@ -431,10 +475,8 @@ mod tests {
         let capsule = &encrypted.capsules[0];
 
         // Subscriber decrypts
-        let decryptor = BroadcastDecryptor::new(
-            &sub_secret.scalar().to_bytes(),
-            &sub_pubkey.to_bytes(),
-        );
+        let decryptor =
+            BroadcastDecryptor::new(&sub_secret.scalar().to_bytes(), &sub_pubkey.to_bytes());
         let decrypted = decryptor
             .decrypt(
                 &pub_pubkey.to_bytes(),
@@ -470,10 +512,8 @@ mod tests {
             .unwrap();
 
         let capsule = &encrypted.capsules[0];
-        let decryptor = BroadcastDecryptor::new(
-            &sub_secret.scalar().to_bytes(),
-            &sub_pubkey.to_bytes(),
-        );
+        let decryptor =
+            BroadcastDecryptor::new(&sub_secret.scalar().to_bytes(), &sub_pubkey.to_bytes());
 
         // Wrong intent_id → AAD mismatch → AES-GCM decrypt fails
         let result = decryptor.decrypt(
@@ -511,10 +551,8 @@ mod tests {
         encrypted.ciphertext[0] ^= 0xff;
 
         let capsule = &encrypted.capsules[0];
-        let decryptor = BroadcastDecryptor::new(
-            &sub_secret.scalar().to_bytes(),
-            &sub_pubkey.to_bytes(),
-        );
+        let decryptor =
+            BroadcastDecryptor::new(&sub_secret.scalar().to_bytes(), &sub_pubkey.to_bytes());
 
         // MAC verification fails
         let result = decryptor.decrypt(
@@ -558,10 +596,8 @@ mod tests {
         assert_eq!(encrypted.capsules.len(), 2);
 
         // Subscriber 1 decrypts
-        let dec1 = BroadcastDecryptor::new(
-            &sub1_secret.scalar().to_bytes(),
-            &sub1_pubkey.to_bytes(),
-        );
+        let dec1 =
+            BroadcastDecryptor::new(&sub1_secret.scalar().to_bytes(), &sub1_pubkey.to_bytes());
         let plain1 = dec1
             .decrypt(
                 &pub_pubkey.to_bytes(),
@@ -578,10 +614,8 @@ mod tests {
         assert_eq!(plain1, payload);
 
         // Subscriber 2 decrypts
-        let dec2 = BroadcastDecryptor::new(
-            &sub2_secret.scalar().to_bytes(),
-            &sub2_pubkey.to_bytes(),
-        );
+        let dec2 =
+            BroadcastDecryptor::new(&sub2_secret.scalar().to_bytes(), &sub2_pubkey.to_bytes());
         let plain2 = dec2
             .decrypt(
                 &pub_pubkey.to_bytes(),

@@ -159,9 +159,7 @@ pub fn verify_detached<V: CoseVerifier>(
     };
     let expected_alg_int = verifying_key.alg().to_i64();
     if alg_int != expected_alg_int {
-        bail!(
-            "COSE_Sign1 alg mismatch: header={alg_int} expected={expected_alg_int}"
-        );
+        bail!("COSE_Sign1 alg mismatch: header={alg_int} expected={expected_alg_int}");
     }
     let alg_label = format!("{:?}", verifying_key.alg());
 
@@ -231,8 +229,7 @@ pub struct ParsedCoseSign1 {
 
 /// Parse a CBOR-encoded COSE_Sign1 blob. Does not verify the signature.
 pub fn parse(blob: &[u8]) -> Result<ParsedCoseSign1> {
-    let sign1 = CoseSign1::from_slice(blob)
-        .map_err(|e| anyhow!("malformed COSE_Sign1: {e}"))?;
+    let sign1 = CoseSign1::from_slice(blob).map_err(|e| anyhow!("malformed COSE_Sign1: {e}"))?;
     let alg = sign1
         .protected
         .header
@@ -248,7 +245,11 @@ pub fn parse(blob: &[u8]) -> Result<ParsedCoseSign1> {
     if kid.is_empty() {
         bail!("COSE_Sign1 missing kid");
     }
-    Ok(ParsedCoseSign1 { sign1, kid, alg: alg_int })
+    Ok(ParsedCoseSign1 {
+        sign1,
+        kid,
+        alg: alg_int,
+    })
 }
 
 /// Concrete Ed25519 detached-signature wrapper for envelope.rs.
@@ -280,7 +281,8 @@ pub fn verify_ed25519_detached(
     if parsed.alg != expected {
         bail!(
             "COSE_Sign1 alg mismatch: parsed={} expected EdDSA={}",
-            parsed.alg, expected
+            parsed.alg,
+            expected
         );
     }
     let aad = build_external_aad(envelope_schema_id, inner_type_id);
@@ -335,8 +337,7 @@ mod tests {
         assert_eq!(alg, "EdDSA");
         // kid is base64url(no-pad) of the raw 32-byte verifying key
         use base64::Engine;
-        let expected_kid =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vk.to_bytes());
+        let expected_kid = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vk.to_bytes());
         assert_eq!(kid, expected_kid);
     }
 

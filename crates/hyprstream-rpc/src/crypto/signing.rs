@@ -119,7 +119,13 @@ mod tests {
         let signature = sign_message(&signing_key, request_id, identity_bytes, payload);
 
         // Should verify successfully
-        verify_message(&verifying_key, &signature, request_id, identity_bytes, payload)?;
+        verify_message(
+            &verifying_key,
+            &signature,
+            request_id,
+            identity_bytes,
+            payload,
+        )?;
         Ok(())
     }
 
@@ -135,7 +141,13 @@ mod tests {
 
         // Tampered payload should fail
         let tampered = b"tampered payload";
-        let result = verify_message(&verifying_key, &signature, request_id, identity_bytes, tampered);
+        let result = verify_message(
+            &verifying_key,
+            &signature,
+            request_id,
+            identity_bytes,
+            tampered,
+        );
         assert!(result.is_err());
     }
 
@@ -166,7 +178,13 @@ mod tests {
         let signature = sign_message(&signing_key, request_id, identity_bytes, payload);
 
         // Wrong key should fail
-        let result = verify_message(&wrong_verifying_key, &signature, request_id, identity_bytes, payload);
+        let result = verify_message(
+            &wrong_verifying_key,
+            &signature,
+            request_id,
+            identity_bytes,
+            payload,
+        );
         assert!(result.is_err());
     }
 

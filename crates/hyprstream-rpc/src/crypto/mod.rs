@@ -30,7 +30,6 @@ pub mod backend;
 pub mod cose_encrypt;
 pub mod cose_sign;
 pub mod cose_sign1;
-pub mod envelope_crypto;
 pub mod event_crypto;
 pub mod hmac;
 pub mod hybrid_kem;
