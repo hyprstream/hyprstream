@@ -524,6 +524,7 @@ inventory::submit! {
     crate::runtime::selection::BackendRegistration {
         name: "nspawn",
         priority: 10,
+        auto_selectable: true,
         is_available: NspawnBackend::registry_is_available,
         construct: |_ctx| {
             Ok(std::sync::Arc::new(NspawnBackend::new(NspawnConfig::default()))

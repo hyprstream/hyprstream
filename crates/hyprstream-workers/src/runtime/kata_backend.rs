@@ -582,6 +582,7 @@ inventory::submit! {
     crate::runtime::selection::BackendRegistration {
         name: "kata",
         priority: 100,
+        auto_selectable: true,
         is_available: KataBackend::registry_is_available,
         construct: |ctx| {
             Ok(Arc::new(KataBackend::new(

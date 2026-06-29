@@ -441,14 +441,19 @@ impl SandboxBackend for WasmBackend {
 // the feature off, an explicit `wasm` request hits the "unknown backend" error
 // path (the name simply isn't in the registry) rather than silently downgrading.
 //
-// Priority 5: below nspawn (10) and kata (100). An in-process wasm sandbox is the
-// weakest isolation tier of the three (shared address space; the guarantee is the
-// wasm capability boundary, not a kernel/VM boundary), so `auto` only picks it
-// when nothing stronger is available — but it is always *available* once built.
+// An in-process wasm sandbox is the weakest isolation tier (shared host address
+// space; the guarantee is the wasm capability boundary, not a kernel/VM boundary).
+// It is therefore **RuntimeClass-explicit-only**: `auto_selectable: false` keeps
+// it out of `"auto"` entirely so it can never become a silent fallback when
+// stronger backends are absent — that would be a silent isolation downgrade, which
+// the #547 MAC/ZSP model forbids. It remains selectable by its explicit `wasm`
+// name (fail-closed) and is always *available* once built. The `priority` is then
+// only meaningful for explicit selection; it is kept low for documentation.
 inventory::submit! {
     crate::runtime::selection::BackendRegistration {
         name: "wasm",
         priority: 5,
+        auto_selectable: false,
         is_available: WasmBackend::registry_is_available,
         construct: |_ctx| {
             Ok(std::sync::Arc::new(WasmBackend::new(WasmConfig::default()))
