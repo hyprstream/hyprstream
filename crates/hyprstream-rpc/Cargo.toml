@@ -20,6 +20,7 @@ capnp = { workspace = true }
 ed25519-dalek = { workspace = true }
 curve25519-dalek = { workspace = true }  # Ristretto255 DH for stream authentication
 sha2 = { workspace = true }              # Always needed for Ed25519 (Sha512)
+chacha20poly1305 = { workspace = true }  # ChaCha20Poly1305 AEAD for COSE_Encrypt0 (#553)
 blake3 = { workspace = true }            # Default: fast KDF and MAC
 aes-gcm = { workspace = true }          # AES-256-GCM for notification broadcast encryption
 aes-gcm-siv = { workspace = true }     # AES-256-GCM-SIV for envelope encryption (nonce-misuse resistant)
@@ -38,6 +39,10 @@ p256 = { workspace = true, optional = true }
 # CryptoPolicy, not at compile time). See M3 (#152).
 ml-dsa = { workspace = true }
 ml-kem = { workspace = true }
+# Hybrid KEM (#551/S0): X25519 DHKEM leg + KMAC256 transcript-binding combiner.
+# Both pure-Rust (wasm32-safe) and already in the lock graph.
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
+tiny-keccak = { version = "2.0.2", features = ["kmac"] }
 
 # Shared deps — all targets
 anyhow = { workspace = true }

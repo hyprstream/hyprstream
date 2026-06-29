@@ -27,11 +27,13 @@
 //! - `fips`: ECDH P-256 for FIPS 140-2 compliance
 
 pub mod backend;
-pub mod cose_sign1;
+pub mod cose_encrypt;
 pub mod cose_sign;
+pub mod cose_sign1;
 pub mod envelope_crypto;
 pub mod event_crypto;
 pub mod hmac;
+pub mod hybrid_kem;
 pub mod key_exchange;
 pub mod notification;
 pub mod pq;
@@ -71,15 +73,15 @@ pub use key_exchange::{
     NotificationKeys, SharedSecret, StreamKeys,
 };
 pub use signing::{
-    generate_signing_keypair, signing_key_from_bytes,
-    verifying_key_from_bytes, SigningKey, VerifyingKey,
+    generate_signing_keypair, signing_key_from_bytes, verifying_key_from_bytes, SigningKey,
+    VerifyingKey,
 };
 
 #[cfg(not(feature = "fips"))]
 pub use key_exchange::{
-    blinded_dh, blinded_dh_raw, generate_ephemeral_keypair,
-    reconstruct_blinded_pub_raw, rerandomize_pubkey, ristretto_dh, ristretto_dh_raw,
-    RistrettoKeyExchange, RistrettoPublic, RistrettoSecret,
+    blinded_dh, blinded_dh_raw, generate_ephemeral_keypair, reconstruct_blinded_pub_raw,
+    rerandomize_pubkey, ristretto_dh, ristretto_dh_raw, RistrettoKeyExchange, RistrettoPublic,
+    RistrettoSecret,
 };
 
 #[cfg(feature = "fips")]
