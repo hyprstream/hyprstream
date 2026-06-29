@@ -54,7 +54,8 @@ struct RequestEnvelope {
   authorization @4 :Authorization; # Authorization context
   delegationToken @5 :Text $optional;  # Delegation token relayed by a trusted service
   wth @6 :Data $fixedSize(32) $optional;  # SHA-256 of jwtToken (WIT binding)
-  clientDhPublic @7 :Data $fixedSize(32) $optional;  # Ephemeral DH public key for stream key derivation
+  clientDhPublic @7 :Data $fixedSize(32) $optional;  # LEGACY classical DH pubkey (removed at S5 #556; superseded by clientKemPublic)
+  clientKemPublic @8 :Data $optional;  # S3 #554: client ephemeral hybrid-KEM RecipientPublic.encode() (X25519+ML-KEM-768) for PQ stream key agreement
 }
 
 # Signed wrapper - signature covers serialized RequestEnvelope bytes
