@@ -7226,6 +7226,7 @@ dependencies = [
  "hyprstream-rpc",
  "hyprstream-rpc-build",
  "hyprstream-rpc-derive",
+ "hyprstream-sandbox",
  "hyprstream-service",
  "hyprstream-tcl",
  "hyprstream-vfs",
