@@ -1,4 +1,4 @@
-@0xd4e6f8a2b1c3d5e7;
+@0xb8f611bc0de9988b;
 
 using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".scope;

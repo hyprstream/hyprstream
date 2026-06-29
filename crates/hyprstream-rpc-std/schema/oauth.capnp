@@ -1,4 +1,4 @@
-@0xc1d2e3f4a5b60718;
+@0xc6526924e48dc88e;
 
 # Cap'n Proto schema for OAuth user management service
 #

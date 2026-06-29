@@ -1,4 +1,4 @@
-@0xa1b2c3d4e5f60910;
+@0xddd8d4ad187b61df;
 
 # 9P2000-inspired filesystem protocol types.
 #

@@ -1,4 +1,4 @@
-@0xc8d9e0f1a2b3c4d5;
+@0x8b9efac22fbce731;
 
 # Event bus schema for hyprstream EventService
 #

@@ -1,4 +1,4 @@
-@0xa1b2c3d4e5f6a7b8;
+@0xb59f0a7817f11e72;
 
 # Cap'n Proto schema for notification service
 #

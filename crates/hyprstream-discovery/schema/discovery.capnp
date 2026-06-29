@@ -1,4 +1,4 @@
-@0xe7a3b5c9d1f2e4a6;
+@0xe8bc708034927ef4;
 
 # Cap'n Proto schema for discovery service
 #

@@ -1,4 +1,4 @@
-@0xf1a2b3c4d5e6f708;
+@0xfa0212966c7dd7db;
 
 # Cap'n Proto schema for policy service
 #

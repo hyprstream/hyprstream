@@ -1,4 +1,4 @@
-@0xb4e2f8d3a9c1e705;
+@0xa40b1708e6b364c8;
 
 # Cap'n Proto schema for MetricsService
 #

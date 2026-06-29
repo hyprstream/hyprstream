@@ -1,4 +1,4 @@
-@0xb3d7f8e4a2c1e5f9;
+@0xb61b5c83cbffc851;
 
 # Cap'n Proto schema for hyprstream events
 #

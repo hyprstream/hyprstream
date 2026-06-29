@@ -10,7 +10,7 @@
 # DO NOT migrate Text $optional fields to OptionText unless empty-string is a
 # meaningful distinct value — the existing empty-string convention is simpler.
 
-@0xf2172cd64075b94a;
+@0xbe92a6f3960c98dd;
 
 struct OptionFloat32 { union { none @0 :Void; some @1 :Float32; } }
 struct OptionFloat64 { union { none @0 :Void; some @1 :Float64; } }

@@ -1,4 +1,4 @@
-@0xa8c9e2f1d3b5a7c0;
+@0xcf8bf3d833f22b0d;
 
 using import "/common.capnp".ErrorInfo;
 using import "/streaming.capnp".StreamInfo;

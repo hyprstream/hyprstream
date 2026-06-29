@@ -1,4 +1,4 @@
-@0xa1b2c3d4e5f60718;
+@0xb1daac24ab4e9c2f;
 
 using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".mcpDescription;

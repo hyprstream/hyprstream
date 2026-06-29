@@ -1,4 +1,4 @@
-@0xb3e9f4a1c7d82056;
+@0x8e593b39473af5fa;
 
 using import "annotations.capnp".fixedSize;
 using import "annotations.capnp".optional;

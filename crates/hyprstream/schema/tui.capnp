@@ -1,4 +1,4 @@
-@0xd4e8f2a1b3c5d7e9;
+@0xa159a8ac3c898085;
 
 # Cap'n Proto schema for TUI display server
 #

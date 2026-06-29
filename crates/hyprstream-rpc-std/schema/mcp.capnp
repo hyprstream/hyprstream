@@ -1,4 +1,4 @@
-@0x8c9b0a1d2e3f4a5b;
+@0xff98e496304592f7;
 
 # Cap'n Proto schema for MCP (Model Context Protocol) service
 #
