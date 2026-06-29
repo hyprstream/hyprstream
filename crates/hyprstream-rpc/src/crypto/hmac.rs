@@ -159,6 +159,6 @@ mod tests {
 
         let mut verifier = StreamHmacState::new(key, topic);
         assert!(!verifier.verify_next(b"data", &[0u8; 32])); // 32 bytes is wrong
-        assert!(!verifier.verify_next(b"data", &[0u8; 8]));  // 8 bytes is wrong
+        assert!(!verifier.verify_next(b"data", &[0u8; 8])); // 8 bytes is wrong
     }
 }

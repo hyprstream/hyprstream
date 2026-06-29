@@ -197,7 +197,13 @@ pub fn derive_stream_keys(
     // Zeroize IKM containing the shared secret (mirrors derive_notification_keys).
     ikm.zeroize();
 
-    Ok(StreamKeys::with_ctrl(topic, mac_key, enc_key, ctrl_topic, ctrl_mac_key))
+    Ok(StreamKeys::with_ctrl(
+        topic,
+        mac_key,
+        enc_key,
+        ctrl_topic,
+        ctrl_mac_key,
+    ))
 }
 
 // ============================================================================
@@ -540,9 +546,7 @@ mod ristretto_impl {
             .ok_or_else(|| EnvelopeError::KeyExchange("invalid blinding scalar".into()))?;
         let combined = secret.scalar() + r;
         if bool::from(combined.ct_eq(&Scalar::ZERO)) {
-            return Err(EnvelopeError::KeyExchange(
-                "combined scalar is zero".into(),
-            ));
+            return Err(EnvelopeError::KeyExchange("combined scalar is zero".into()));
         }
         let shared_point = their_pubkey.point() * combined;
         Ok(shared_point.compress().to_bytes())
@@ -555,7 +559,10 @@ mod ristretto_impl {
     /// Ristretto255 DH from raw scalar and pubkey bytes.
     ///
     /// Used by `BroadcastEncryptor` where typed key objects aren't available.
-    pub fn ristretto_dh_raw(secret_bytes: &[u8; 32], their_pub_bytes: &[u8; 32]) -> EnvelopeResult<[u8; 32]> {
+    pub fn ristretto_dh_raw(
+        secret_bytes: &[u8; 32],
+        their_pub_bytes: &[u8; 32],
+    ) -> EnvelopeResult<[u8; 32]> {
         let scalar = Scalar::from_canonical_bytes(*secret_bytes)
             .into_option()
             .ok_or_else(|| EnvelopeError::KeyExchange("invalid secret scalar".into()))?;
@@ -603,9 +610,9 @@ mod ristretto_impl {
             .ok_or_else(|| EnvelopeError::KeyExchange("invalid blinding scalar".into()))?;
         let compressed = CompressedRistretto::from_slice(subscriber_pub_bytes)
             .map_err(|_| EnvelopeError::KeyExchange("invalid subscriber pubkey length".into()))?;
-        let sub_point = compressed
-            .decompress()
-            .ok_or_else(|| EnvelopeError::KeyExchange("invalid subscriber ristretto point".into()))?;
+        let sub_point = compressed.decompress().ok_or_else(|| {
+            EnvelopeError::KeyExchange("invalid subscriber ristretto point".into())
+        })?;
         let blinded = sub_point + r * RISTRETTO_BASEPOINT_POINT;
         Ok(blinded.compress().to_bytes())
     }
@@ -613,9 +620,9 @@ mod ristretto_impl {
 
 #[cfg(not(feature = "fips"))]
 pub use ristretto_impl::{
-    blinded_dh, blinded_dh_raw, generate_ephemeral_keypair,
-    reconstruct_blinded_pub_raw, rerandomize_pubkey, ristretto_dh, ristretto_dh_raw,
-    RistrettoKeyExchange, RistrettoPublic, RistrettoSecret,
+    blinded_dh, blinded_dh_raw, generate_ephemeral_keypair, reconstruct_blinded_pub_raw,
+    rerandomize_pubkey, ristretto_dh, ristretto_dh_raw, RistrettoKeyExchange, RistrettoPublic,
+    RistrettoSecret,
 };
 
 // ============================================================================
@@ -827,7 +834,10 @@ mod tests {
         let mut invalid = [0u8; 32];
         invalid[31] = 0x80; // Set high bit - invalid for Ristretto
         let result = RistrettoPublic::from_bytes(&invalid);
-        assert!(result.is_none(), "Non-canonical encoding should be rejected");
+        assert!(
+            result.is_none(),
+            "Non-canonical encoding should be rejected"
+        );
     }
 
     #[cfg(not(feature = "fips"))]
@@ -874,9 +884,18 @@ mod tests {
         let keys1 = derive_stream_keys(&shared_secret, &client_pub, &server_pub)?;
         let keys2 = derive_stream_keys(&shared_secret, &client_pub, &server_pub)?;
 
-        assert_eq!(*keys1.enc_key, *keys2.enc_key, "enc_key must be deterministic");
-        assert_ne!(*keys1.enc_key, *keys1.mac_key, "enc_key must differ from mac_key");
-        assert_ne!(*keys1.enc_key, *keys1.ctrl_mac_key, "enc_key must differ from ctrl_mac_key");
+        assert_eq!(
+            *keys1.enc_key, *keys2.enc_key,
+            "enc_key must be deterministic"
+        );
+        assert_ne!(
+            *keys1.enc_key, *keys1.mac_key,
+            "enc_key must differ from mac_key"
+        );
+        assert_ne!(
+            *keys1.enc_key, *keys1.ctrl_mac_key,
+            "enc_key must differ from ctrl_mac_key"
+        );
         Ok(())
     }
 
@@ -1048,8 +1067,14 @@ mod tests {
 
         let keys = derive_stream_keys(&shared_secret, &client_pub, &server_pub)?;
 
-        assert_ne!(keys.topic, keys.ctrl_topic, "ctrl_topic must differ from data topic");
-        assert_ne!(*keys.mac_key, *keys.ctrl_mac_key, "ctrl_mac_key must differ from data mac_key");
+        assert_ne!(
+            keys.topic, keys.ctrl_topic,
+            "ctrl_topic must differ from data topic"
+        );
+        assert_ne!(
+            *keys.mac_key, *keys.ctrl_mac_key,
+            "ctrl_mac_key must differ from data mac_key"
+        );
         Ok(())
     }
 
