@@ -1,7 +1,7 @@
 @0xd4e6f8a2b1c3d5e7;
 
 using import "/common.capnp".ErrorInfo;
-using import "/annotations.capnp".mcpScope;
+using import "/annotations.capnp".scope;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".docExample;
 using import "/streaming.capnp".StreamInfo;
@@ -42,35 +42,35 @@ struct RegistryRequest {
   # Request payload (union of request types)
   union {
     # List all models available in the registry
-    list @1 :Void $mcpScope(query)
+    list @1 :Void $scope(query)
         $mcpDescription("List all repositories registered in the local registry.")
         $docExample("ls /srv/registry");
     # Get repository information by ID
-    get @2 :Text $mcpScope(query);
+    get @2 :Text $scope(query);
     # Get repository information by name
-    getByName @3 :Text $mcpScope(query)
+    getByName @3 :Text $scope(query)
         $mcpDescription("Get repository information by its display name.")
         $docExample("cat /srv/registry/my-model");
     # Clone a model repository from a URL
-    clone @4 :CloneRequest $mcpScope(write)
+    clone @4 :CloneRequest $scope(write)
         $mcpDescription("Clone a model repository from a URL into the local registry.")
         $docExample("ctl /srv/registry clone '{\"url\": \"https://huggingface.co/org/model\"}'");
     # Register an existing local repository
-    register @5 :RegisterRequest $mcpScope(write);
+    register @5 :RegisterRequest $scope(write);
     # Remove a repository from the registry
-    remove @6 :Text $mcpScope(manage);
+    remove @6 :Text $scope(manage);
     # Check registry service health
-    healthCheck @7 :Void $mcpScope(query)
+    healthCheck @7 :Void $scope(query)
         $mcpDescription("Check if the registry service is healthy and responding.")
         $docExample("cat /srv/registry/health");
     # Clone a model repository from a URL (streaming progress)
-    cloneStream @8 :CloneRequest $mcpScope(write) $mcpDescription("Clone a model repository from a URL (streaming progress)");
+    cloneStream @8 :CloneRequest $scope(write) $mcpDescription("Clone a model repository from a URL (streaming progress)");
 
     # Repository-scoped operations (requires repoId)
     repo @9 :RepositoryRequest;
 
     # Fetch content-addressed bytes (git OID or XET merkle root) as a stream.
-    getBlob @10 :GetBlobRequest $mcpScope(query) $mcpDescription("Fetch content-addressed bytes (git OID or XET merkle root) as a stream");
+    getBlob @10 :GetBlobRequest $scope(query) $mcpDescription("Fetch content-addressed bytes (git OID or XET merkle root) as a stream");
   }
 }
 
@@ -81,58 +81,60 @@ struct RepositoryRequest {
   repoId @0 :Text;
   union {
     # Create a new worktree for the repository
-    createWorktree @1 :CreateWorktreeRequest $mcpScope(write)
+    createWorktree @1 :CreateWorktreeRequest $scope(write)
         $mcpDescription("Ensure a worktree exists for a branch, creating if needed");
     # List all worktrees for the repository
-    listWorktrees @2 :Void $mcpScope(query);
+    listWorktrees @2 :Void $scope(query);
     # Remove a worktree from the repository
-    removeWorktree @3 :RemoveWorktreeRequest $mcpScope(manage);
+    removeWorktree @3 :RemoveWorktreeRequest $scope(manage);
     # Create a new branch in the repository
-    createBranch @4 :BranchRequest $mcpScope(write);
+    createBranch @4 :BranchRequest $scope(write);
     # List all branches in the repository
-    listBranches @5 :Void $mcpScope(query);
+    listBranches @5 :Void $scope(query);
     # DEPRECATED — moved to WorktreeRequest. Kept for wire compatibility.
     # Handlers return an error directing callers to the worktree-scoped API.
-    checkout @6 :CheckoutRequest;
-    stageAll @7 :Void;
-    stageFiles @8 :StageFilesRequest;
-    commit @9 :CommitRequest;
-    merge @10 :MergeRequest;
-    abortMerge @11 :Void;
-    continueMerge @12 :ContinueMergeRequest;
-    quitMerge @13 :Void;
+    # Scoped $scope(write) per mandatory-scope (S3): mutating git ops; the
+    # deprecated stub still requires a non-public scope so it can't widen access.
+    checkout @6 :CheckoutRequest $scope(write);
+    stageAll @7 :Void $scope(write);
+    stageFiles @8 :StageFilesRequest $scope(write);
+    commit @9 :CommitRequest $scope(write);
+    merge @10 :MergeRequest $scope(write);
+    abortMerge @11 :Void $scope(write);
+    continueMerge @12 :ContinueMergeRequest $scope(write);
+    quitMerge @13 :Void $scope(write);
     # Get the current HEAD reference
-    getHead @14 :Void $mcpScope(query);
+    getHead @14 :Void $scope(query);
     # Get information about a specific reference
-    getRef @15 :GetRefRequest $mcpScope(query);
+    getRef @15 :GetRefRequest $scope(query);
     # Get repository status (short format)
-    status @16 :Void $mcpScope(query);
+    status @16 :Void $scope(query);
     # Get detailed repository status with file changes
-    detailedStatus @17 :Void $mcpScope(query);
+    detailedStatus @17 :Void $scope(query);
     # List all remotes for the repository
-    listRemotes @18 :Void $mcpScope(query);
+    listRemotes @18 :Void $scope(query);
     # Add a new remote to the repository
-    addRemote @19 :AddRemoteRequest $mcpScope(write);
+    addRemote @19 :AddRemoteRequest $scope(write);
     # Remove a remote from the repository
-    removeRemote @20 :RemoveRemoteRequest $mcpScope(manage);
+    removeRemote @20 :RemoveRemoteRequest $scope(manage);
     # Set the URL for a remote
-    setRemoteUrl @21 :SetRemoteUrlRequest $mcpScope(write);
+    setRemoteUrl @21 :SetRemoteUrlRequest $scope(write);
     # Rename a remote
-    renameRemote @22 :RenameRemoteRequest $mcpScope(write);
+    renameRemote @22 :RenameRemoteRequest $scope(write);
     # Push commits to a remote repository
-    push @23 :PushRequest $mcpScope(write);
+    push @23 :PushRequest $scope(write);
     # DEPRECATED — moved to WorktreeRequest. Kept for wire compatibility.
-    amendCommit @24 :AmendCommitRequest;
-    commitWithAuthor @25 :CommitWithAuthorRequest;
-    stageAllIncludingUntracked @26 :Void;
+    amendCommit @24 :AmendCommitRequest $scope(write);
+    commitWithAuthor @25 :CommitWithAuthorRequest $scope(write);
+    stageAllIncludingUntracked @26 :Void $scope(write);
     # List all tags in the repository
-    listTags @27 :Void $mcpScope(query);
+    listTags @27 :Void $scope(query);
     # Create a new tag
-    createTag @28 :CreateTagRequest $mcpScope(write);
+    createTag @28 :CreateTagRequest $scope(write);
     # Delete a tag from the repository
-    deleteTag @29 :DeleteTagRequest $mcpScope(manage);
+    deleteTag @29 :DeleteTagRequest $scope(manage);
     # Pull and update from remote repository
-    update @30 :UpdateRequest $mcpScope(write);
+    update @30 :UpdateRequest $scope(write);
     # Worktree-scoped filesystem operations
     worktree @31 :WorktreeRequest;
   }
@@ -207,61 +209,61 @@ struct WorktreeRequest {
   name @0 :Text;
   union {
     # Walk: resolve path components to get a fid (like 9P Twalk)
-    walk @1 :NpWalk $mcpScope(query)
+    walk @1 :NpWalk $scope(query)
         $mcpDescription("Resolve path components to a fid (9P walk). Use the returned fid for open (I/O) or ctl operations (git log/diff/blame). Each use requires a separate fid.");
     # Open: open a walked fid for I/O (like 9P Topen)
-    open @2 :NpOpen $mcpScope(write)
+    open @2 :NpOpen $scope(write)
         $mcpDescription("Open a walked fid for read/write I/O. After open, the fid can only be used for read/write — ctl operations (log, diff, blame) require a separate walked-not-opened fid.");
     # Create: create a file/dir under a walked directory fid (like 9P Tcreate)
-    create @3 :NpCreate $mcpScope(write)
+    create @3 :NpCreate $scope(write)
         $mcpDescription("Create a file or directory under a walked directory fid. The fid is then opened for I/O on the new file.");
     # Read: offset+count read, server clamps to iounit (like 9P Tread)
-    read @4 :NpRead
+    read @4 :NpRead $scope(query)
         $mcpDescription("Read file content or directory listing at offset+count (bounded by iounit). For directories, returns entries as binary: name_len(u32) + name + is_dir(u8) + size(u64).");
     # Write: offset+data write, server rejects if > iounit (like 9P Twrite)
-    write @5 :NpWrite
+    write @5 :NpWrite $scope(write)
         $mcpDescription("Write data to an opened file at offset. Data size must not exceed iounit.");
     # Clunk: release a fid (like 9P Tclunk)
-    clunk @6 :NpClunk
+    clunk @6 :NpClunk $scope(query)
         $mcpDescription("Release a fid (like close). Frees server resources. Always clunk fids when done.");
     # Remove: clunk + delete file/dir (like 9P Tremove)
-    remove @7 :NpRemove $mcpScope(manage)
+    remove @7 :NpRemove $scope(manage)
         $mcpDescription("Remove a file or directory and release its fid.");
     # Stat: get file metadata (like 9P Tstat)
-    npStat @8 :NpStatReq $mcpScope(query)
+    npStat @8 :NpStatReq $scope(query)
         $mcpDescription("Get file metadata (size, mode, timestamps). Works on both walked and opened fids.");
     # Wstat: modify file metadata (like 9P Twstat)
-    wstat @9 :NpWstat $mcpScope(write)
+    wstat @9 :NpWstat $scope(write)
         $mcpDescription("Modify file metadata (truncate, rename). Requires an opened fid for truncate.");
     # Flush: cancel pending operation (like 9P Tflush)
-    flush @10 :NpFlush
+    flush @10 :NpFlush $scope(query)
         $mcpDescription("Cancel a pending operation by its tag.");
     # Per-file control operations, scoped by fid
     ctl @11 :CtlRequest;
 
     # Worktree-scoped git operations
     stageAll @12 :Void
-        $mcpScope(write) $mcpDescription("Stage all modified tracked files in this worktree");
+        $scope(write) $mcpDescription("Stage all modified tracked files in this worktree");
     stageFiles @13 :StageFilesRequest
-        $mcpScope(write) $mcpDescription("Stage specific files in this worktree");
+        $scope(write) $mcpDescription("Stage specific files in this worktree");
     stageAllIncludingUntracked @14 :Void
-        $mcpScope(write) $mcpDescription("Stage all files including untracked in this worktree");
+        $scope(write) $mcpDescription("Stage all files including untracked in this worktree");
     commit @15 :CommitRequest
-        $mcpScope(write) $mcpDescription("Commit staged changes in this worktree");
+        $scope(write) $mcpDescription("Commit staged changes in this worktree");
     commitWithAuthor @16 :CommitWithAuthorRequest
-        $mcpScope(write) $mcpDescription("Commit staged changes with specified author");
+        $scope(write) $mcpDescription("Commit staged changes with specified author");
     amendCommit @17 :AmendCommitRequest
-        $mcpScope(write) $mcpDescription("Amend the last commit in this worktree");
+        $scope(write) $mcpDescription("Amend the last commit in this worktree");
     checkout @18 :CheckoutRequest
-        $mcpScope(write) $mcpDescription("Checkout a ref in this worktree");
+        $scope(write) $mcpDescription("Checkout a ref in this worktree");
     merge @19 :MergeRequest
-        $mcpScope(write) $mcpDescription("Merge a branch into this worktree");
+        $scope(write) $mcpDescription("Merge a branch into this worktree");
     abortMerge @20 :Void
-        $mcpScope(write) $mcpDescription("Abort an in-progress merge in this worktree");
+        $scope(write) $mcpDescription("Abort an in-progress merge in this worktree");
     continueMerge @21 :ContinueMergeRequest
-        $mcpScope(write) $mcpDescription("Continue a merge after resolving conflicts");
+        $scope(write) $mcpDescription("Continue a merge after resolving conflicts");
     quitMerge @22 :Void
-        $mcpScope(write) $mcpDescription("Exit merge state without committing");
+        $scope(write) $mcpDescription("Exit merge state without committing");
   }
 }
 
@@ -554,23 +556,23 @@ struct CtlRequest {
   fid @0 :UInt32;           # scope field (curried in generated CtlClient)
   union {
     # ── Git introspection ──
-    status    @1 :Void               $mcpScope(query)  $mcpDescription("Git status of this file. Requires a walked (not opened) fid.");
-    log       @2 :CtlLogRequest      $mcpScope(query)  $mcpDescription("Commits touching this file. Requires a walked (not opened) fid.");
-    diff      @3 :CtlDiffRequest     $mcpScope(query)  $mcpDescription("Diff this file against a ref. Requires a walked (not opened) fid.");
-    blame     @4 :Void               $mcpScope(query)  $mcpDescription("Git blame for this file. Requires a walked (not opened) fid.");
-    checkout  @5 :CtlCheckoutRequest $mcpScope(write)  $mcpDescription("Restore file content from a ref");
+    status    @1 :Void               $scope(query)  $mcpDescription("Git status of this file. Requires a walked (not opened) fid.");
+    log       @2 :CtlLogRequest      $scope(query)  $mcpDescription("Commits touching this file. Requires a walked (not opened) fid.");
+    diff      @3 :CtlDiffRequest     $scope(query)  $mcpDescription("Diff this file against a ref. Requires a walked (not opened) fid.");
+    blame     @4 :Void               $scope(query)  $mcpDescription("Git blame for this file. Requires a walked (not opened) fid.");
+    checkout  @5 :CtlCheckoutRequest $scope(write)  $mcpDescription("Restore file content from a ref");
 
     # ── File control ──
-    validate  @6 :Void               $mcpScope(query)  $mcpDescription("Validate file format. Requires a walked (not opened) fid.");
-    info      @7 :Void               $mcpScope(query)  $mcpDescription("File metadata and git state. Requires a walked (not opened) fid.");
+    validate  @6 :Void               $scope(query)  $mcpDescription("Validate file format. Requires a walked (not opened) fid.");
+    info      @7 :Void               $scope(query)  $mcpDescription("File metadata and git state. Requires a walked (not opened) fid.");
 
     # ── CRDT editing ──
-    editOpen  @8  :EditOpenRequest   $mcpScope(write)  $mcpDescription("Open file for CRDT editing");
-    editState @9  :Void              $mcpScope(query)  $mcpDescription("Get current CRDT document state");
-    editApply @10 :EditApplyRequest  $mcpScope(write)  $mcpDescription("Apply automerge CRDT change");
-    editClose @11 :Void              $mcpScope(write)  $mcpDescription("Close CRDT editing session");
+    editOpen  @8  :EditOpenRequest   $scope(write)  $mcpDescription("Open file for CRDT editing");
+    editState @9  :Void              $scope(query)  $mcpDescription("Get current CRDT document state");
+    editApply @10 :EditApplyRequest  $scope(write)  $mcpDescription("Apply automerge CRDT change");
+    editClose @11 :Void              $scope(write)  $mcpDescription("Close CRDT editing session");
     # Flush: serialize CRDT state to disk (does NOT stage or commit)
-    ctlFlush  @12 :Void              $mcpScope(write)  $mcpDescription("Write CRDT state to disk file");
+    ctlFlush  @12 :Void              $scope(write)  $mcpDescription("Write CRDT state to disk file");
   }
 }
 

@@ -8,7 +8,7 @@
 # Uses REQ/REP pattern. Runs on multi-threaded runtime.
 
 using import "/common.capnp".ErrorInfo;
-using import "/annotations.capnp".mcpScope;
+using import "/annotations.capnp".scope;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".optional;
 
@@ -20,59 +20,61 @@ struct DiscoveryRequest {
   # Request payload (union of request types)
   union {
     # List all registered services with descriptions
-    listServices @1 :Void $mcpScope(query) $mcpDescription("List all registered services with descriptions");
+    listServices @1 :Void $scope(query) $mcpDescription("List all registered services with descriptions");
 
     # Get all endpoints for a named service
-    getEndpoints @2 :Text $mcpScope(query) $mcpDescription("Get all endpoints for a named service");
+    getEndpoints @2 :Text $scope(query) $mcpDescription("Get all endpoints for a named service");
 
     # Get schema bytes for a service
-    getSchema @3 :Text $mcpScope(query) $mcpDescription("Get schema bytes for a service");
+    getSchema @3 :Text $scope(query) $mcpDescription("Get schema bytes for a service");
 
     # Health check
-    ping @4 :Void $mcpScope(query) $mcpDescription("Health check");
+    ping @4 :Void $scope(query) $mcpDescription("Health check");
 
     # Get OAuth protected resource metadata (RFC 9728) for services
     # Text parameter filters by service name (empty = all services)
-    getAuthMetadata @5 :Text $mcpScope(query) $mcpDescription("Get OAuth protected resource metadata for services");
+    getAuthMetadata @5 :Text $scope(query) $mcpDescription("Get OAuth protected resource metadata for services");
 
     # Removed: prepareStream (was insecure — bypassed DH key exchange).
     # Use StreamChannel::prepare_stream for authenticated streaming.
-    prepareStream @6 :Void;
+    # Reserved tombstone wire slots — scoped $manage so the dead handler stays
+    # non-public under mandatory-scope (S3, #547).
+    prepareStream @6 :Void $scope(manage);
 
     # Removed: getStream
-    getStream @7 :Void;
+    getStream @7 :Void $scope(manage);
 
     # Removed: listStreams
-    listStreams @8 :Void;
+    listStreams @8 :Void $scope(manage);
 
     # Announce a service endpoint (used by services after QUIC binding)
-    announce @9 :ServiceAnnouncement $mcpScope(write) $mcpDescription("Announce a service endpoint for discovery");
+    announce @9 :ServiceAnnouncement $scope(write) $mcpDescription("Announce a service endpoint for discovery");
 
     # Phase 0.5 Stage D — federation directory
     # Push a signed OpenID Federation 1.0 entity statement for an issuer (called by IdP/OAuth service)
-    registerEntityStatement @10 :RegisterEntityStatementRequest $mcpScope(write) $mcpDescription("Register a signed OIDF entity statement for an issuer");
+    registerEntityStatement @10 :RegisterEntityStatementRequest $scope(write) $mcpDescription("Register a signed OIDF entity statement for an issuer");
 
     # Fetch a cached signed entity statement for an issuer (used by FederationKeyResolver before HTTPS fallback)
-    getEntityStatement @11 :Text $mcpScope(query) $mcpDescription("Fetch cached signed entity statement for issuer URL");
+    getEntityStatement @11 :Text $scope(query) $mcpDescription("Fetch cached signed entity statement for issuer URL");
 
     # Push a COSE_KeySet (CBOR) for a service's envelope-signing keys (called by each service at startup + rotation)
-    registerEnvelopeKeyset @12 :RegisterEnvelopeKeysetRequest $mcpScope(write) $mcpDescription("Register envelope COSE_KeySet for a service");
+    registerEnvelopeKeyset @12 :RegisterEnvelopeKeysetRequest $scope(write) $mcpDescription("Register envelope COSE_KeySet for a service");
 
     # Fetch a cached COSE_KeySet for a service's envelope keys
-    getEnvelopeKeyset @13 :Text $mcpScope(query) $mcpDescription("Fetch cached envelope COSE_KeySet for service DID");
+    getEnvelopeKeyset @13 :Text $scope(query) $mcpDescription("Fetch cached envelope COSE_KeySet for service DID");
 
     # List all known issuer URLs whose entity statements are cached (authenticated)
-    listKnownIssuers @14 :Void $mcpScope(query) $mcpDescription("List issuers with cached entity statements");
+    listKnownIssuers @14 :Void $scope(query) $mcpDescription("List issuers with cached entity statements");
 
     # #431 — federated record lookup. Fetch an atproto record (ai.hyprstream.model)
     # as a verifiable CARv1 proof so the caller can validate it offline. The
     # auto-generated discovery:query gate runs first; the handler additionally
     # access-control-checks the *target* DID/collection (an at:// CID is public/
     # predictable, so a valid address alone must NOT grant a read).
-    getRecord @15 :GetRecordRequest $mcpScope(query) $mcpDescription("Fetch an atproto record (ai.hyprstream.model) as a verifiable CAR proof");
+    getRecord @15 :GetRecordRequest $scope(query) $mcpDescription("Fetch an atproto record (ai.hyprstream.model) as a verifiable CAR proof");
 
     # #431 — fetch a full atproto repo CAR by DID (commit + MST + all records).
-    getRepo @16 :Text $mcpScope(query) $mcpDescription("Fetch a full atproto repo CAR by DID");
+    getRepo @16 :Text $scope(query) $mcpDescription("Fetch a full atproto repo CAR by DID");
   }
 }
 

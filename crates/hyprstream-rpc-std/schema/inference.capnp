@@ -3,7 +3,7 @@
 using import "/common.capnp".ErrorInfo;
 using import "/streaming.capnp".StreamInfo;
 using import "/annotations.capnp".optional;
-using import "/annotations.capnp".mcpScope;
+using import "/annotations.capnp".scope;
 using import "/annotations.capnp".paramDescription;
 using import "/annotations.capnp".serdeRename;
 using Opt = import "/optional.capnp";
@@ -35,63 +35,63 @@ struct InferenceRequest {
 
   # Request payload (union of request types)
   union {
-    generateStream @1 :GenerationRequest $mcpScope(infer);
-    modelInfo @2 :Void $mcpScope(query);
-    isReady @3 :Void $mcpScope(query);
-    applyChatTemplate @4 :ChatTemplateRequest $mcpScope(query);
+    generateStream @1 :GenerationRequest $scope(infer);
+    modelInfo @2 :Void $scope(query);
+    isReady @3 :Void $scope(query);
+    applyChatTemplate @4 :ChatTemplateRequest $scope(query);
 
     # LoRA operations
-    createLora @5 :LoraConfig $mcpScope(write);
-    loadLora @6 :Text $mcpScope(write);       # path
-    saveLora @7 :Text $mcpScope(write);       # path
-    unloadLora @8 :Void $mcpScope(write);
-    hasLora @9 :Void $mcpScope(query);
+    createLora @5 :LoraConfig $scope(write);
+    loadLora @6 :Text $scope(write);       # path
+    saveLora @7 :Text $scope(write);       # path
+    unloadLora @8 :Void $scope(write);
+    hasLora @9 :Void $scope(query);
 
     # Session operations
-    setSession @10 :Text $mcpScope(write);    # session_id
-    clearSession @11 :Void $mcpScope(write);
-    releaseSession @12 :Text $mcpScope(write);
+    setSession @10 :Text $scope(write);    # session_id
+    clearSession @11 :Void $scope(write);
+    releaseSession @12 :Text $scope(write);
 
     # Health/Lifecycle
-    healthCheck @13 :Void $mcpScope(query);
-    shutdown @14 :Void $mcpScope(manage);
+    healthCheck @13 :Void $scope(query);
+    shutdown @14 :Void $scope(manage);
 
     # Training loop control — tenant-aware TTT (identity from auth envelope)
-    tttWriteback @15 :Void $mcpScope(train);
-    tttEvict @16 :Void $mcpScope(train);
-    trainStep @17 :TrainStepRequest $mcpScope(train);
-    tttZero @18 :Void $mcpScope(manage);
+    tttWriteback @15 :Void $scope(train);
+    tttEvict @16 :Void $scope(train);
+    trainStep @17 :TrainStepRequest $scope(train);
+    tttZero @18 :Void $scope(manage);
 
     # Persistence operations (identity from auth envelope)
-    getDeltaStatus @19 :Void $mcpScope(query);
-    saveAdaptation @20 :SaveAdaptationRequest $mcpScope(write);
-    snapshotDelta @21 :Void $mcpScope(write);
+    getDeltaStatus @19 :Void $scope(query);
+    saveAdaptation @20 :SaveAdaptationRequest $scope(write);
+    snapshotDelta @21 :Void $scope(write);
 
     # Streaming training (returns immediately, results via PUB/SUB)
-    trainStepStream @22 :TrainStepRequest $mcpScope(train);
+    trainStepStream @22 :TrainStepRequest $scope(train);
 
     # Export delta as PEFT adapter directory (identity from auth envelope)
-    exportPeftAdapter @23 :ExportPeftRequest $mcpScope(write);
+    exportPeftAdapter @23 :ExportPeftRequest $scope(write);
 
     # Merge an on-disk adapter into the loaded base_delta
-    mergeLora @24 :MergeLoraRequest $mcpScope(write);
+    mergeLora @24 :MergeLoraRequest $scope(write);
 
     # Streaming variants — return StreamInfo immediately, results via PUB/SUB.
     # Use these instead of the non-streaming versions for operations that may
     # involve significant compute or I/O (GPU alloc, disk writes, merges).
-    createLoraStream @25 :LoraConfig $mcpScope(write);
-    loadLoraStream @26 :Text $mcpScope(write);          # path
-    saveLoraStream @27 :Text $mcpScope(write);          # path
-    saveAdaptationStream @28 :SaveAdaptationRequest $mcpScope(write);
-    snapshotDeltaStream @29 :Void $mcpScope(write);
-    exportPeftAdapterStream @30 :ExportPeftRequest $mcpScope(write);
-    mergeLoraStream @31 :MergeLoraRequest $mcpScope(write);
+    createLoraStream @25 :LoraConfig $scope(write);
+    loadLoraStream @26 :Text $scope(write);          # path
+    saveLoraStream @27 :Text $scope(write);          # path
+    saveAdaptationStream @28 :SaveAdaptationRequest $scope(write);
+    snapshotDeltaStream @29 :Void $scope(write);
+    exportPeftAdapterStream @30 :ExportPeftRequest $scope(write);
+    mergeLoraStream @31 :MergeLoraRequest $scope(write);
 
     # Vision embeddings (synchronous — returns all embeddings in one response)
-    embed @32 :EmbedImagesRequest $mcpScope(infer);
+    embed @32 :EmbedImagesRequest $scope(infer);
 
     # TTN layer profile (returns JSON-encoded LayerProfile for diagnostics/tooling)
-    getLayerProfile @33 :Void $mcpScope(query);
+    getLayerProfile @33 :Void $scope(query);
   }
 }
 

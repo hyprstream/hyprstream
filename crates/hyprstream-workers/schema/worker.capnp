@@ -4,7 +4,7 @@ using import "/common.capnp".ErrorInfo;
 using import "/common.capnp".Timestamp;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".paramDescription;
-using import "/annotations.capnp".mcpScope;
+using import "/annotations.capnp".scope;
 using import "/annotations.capnp".cliHidden;
 using import "/streaming.capnp".StreamInfo;
 
@@ -41,10 +41,10 @@ struct RuntimeRequest {
   union {
     version @0 :Text
       $mcpDescription("Get runtime version information")
-      $mcpScope(query);
+      $scope(query);
     status @1 :StatusRequest
       $mcpDescription("Get runtime status and conditions")
-      $mcpScope(query);
+      $scope(query);
   }
 }
 
@@ -56,25 +56,25 @@ struct SandboxRequest {
   union {
     run @0 :PodSandboxConfig
       $mcpDescription("Create and start a pod sandbox (Kata VM)")
-      $mcpScope(write);
+      $scope(write);
     stop @1 :Text
       $mcpDescription("Stop a running pod sandbox")
-      $mcpScope(write);
+      $scope(write);
     remove @2 :Text
       $mcpDescription("Remove a pod sandbox")
-      $mcpScope(write);
+      $scope(write);
     status @3 :PodSandboxStatusRequest
       $mcpDescription("Get pod sandbox status")
-      $mcpScope(query);
+      $scope(query);
     list @4 :PodSandboxFilter
       $mcpDescription("List pod sandboxes matching optional filter")
-      $mcpScope(query);
+      $scope(query);
     stats @5 :Text
       $mcpDescription("Get stats for a pod sandbox")
-      $mcpScope(query);
+      $scope(query);
     listStats @6 :PodSandboxStatsFilter
       $mcpDescription("List pod sandbox stats")
-      $mcpScope(query);
+      $scope(query);
   }
 }
 
@@ -86,35 +86,35 @@ struct ContainerRequest {
   union {
     create @0 :CreateContainerRequest
       $mcpDescription("Create a container in a pod sandbox")
-      $mcpScope(write);
+      $scope(write);
     start @1 :Text
       $mcpDescription("Start a created container")
-      $mcpScope(write);
+      $scope(write);
     stop @2 :StopContainerRequest
       $mcpDescription("Stop a running container")
-      $mcpScope(write);
+      $scope(write);
     remove @3 :Text
       $mcpDescription("Remove a container")
-      $mcpScope(write);
+      $scope(write);
     status @4 :ContainerStatusRequest
       $mcpDescription("Get container status")
-      $mcpScope(query);
+      $scope(query);
     list @5 :ContainerFilter
       $mcpDescription("List containers matching optional filter")
-      $mcpScope(query);
+      $scope(query);
     stats @6 :Text
       $mcpDescription("Get stats for a container")
-      $mcpScope(query);
+      $scope(query);
     listStats @7 :ContainerStatsFilter
       $mcpDescription("List container stats")
-      $mcpScope(query);
+      $scope(query);
     exec @8 :ExecSyncRequest
       $mcpDescription("Execute a command synchronously in a container")
-      $mcpScope(write);
+      $scope(write);
     attach @9 :AttachRequest
-      $cliHidden;
+      $cliHidden $scope(write);
     detach @10 :Text
-      $cliHidden;
+      $cliHidden $scope(write);
   }
 }
 
@@ -126,19 +126,19 @@ struct ImageRequest {
   union {
     list @0 :ImageFilter
       $mcpDescription("List container images matching optional filter")
-      $mcpScope(query);
+      $scope(query);
     status @1 :ImageStatusRequest
       $mcpDescription("Get status of a container image")
-      $mcpScope(query);
+      $scope(query);
     pull @2 :PullImageRequest
       $mcpDescription("Pull a container image from a registry")
-      $mcpScope(write);
+      $scope(write);
     remove @3 :ImageSpec
       $mcpDescription("Remove a container image")
-      $mcpScope(write);
+      $scope(write);
     fsInfo @4 :Void
       $mcpDescription("Get filesystem usage information for images")
-      $mcpScope(query);
+      $scope(query);
   }
 }
 

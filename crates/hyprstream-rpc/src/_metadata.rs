@@ -1,7 +1,7 @@
 //! RPC schema introspection metadata types.
 //!
 //! These types represent metadata extracted from Cap'n Proto schema annotations
-//! (`$mcpScope`, `$mcpDescription`, `$cliHidden`, `$paramDescription`).
+//! (`$scope`/`$capability`, `$mcpDescription`, `$cliHidden`, `$paramDescription`).
 //! They are the shared source of truth used by both the `generate_rpc_service!`
 //! codegen macro and the runtime `ServiceFactory` inventory.
 
@@ -21,13 +21,15 @@ pub struct ParamMeta {
 /// Schema metadata for a single RPC method.
 ///
 /// Extracted from Cap'n Proto union variants and schema annotations
-/// (`$mcpScope`, `$mcpDescription`, `$cliHidden`).
+/// (`$scope`/`$capability`, `$mcpDescription`, `$cliHidden`).
 #[derive(Debug, Clone)]
 pub struct MethodMeta {
     pub name: &'static str,
     pub params: &'static [ParamMeta],
     pub description: &'static str,
-    /// Required authorization scope action (from `$mcpScope`). Empty = default (`"query"`).
+    /// Required authorization scope action from `$scope`/`$capability` — one of the
+    /// `ScopeAction` enumerants (S3, #547). Mandatory: empty only for a method that
+    /// declared `$scopeExempt`. Maps 1:1 onto `hyprstream::auth::Operation`.
     pub scope: &'static str,
     pub is_streaming: bool,
     pub is_scoped: bool,

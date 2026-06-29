@@ -6,7 +6,7 @@
 # streaming query results, view management, and health checks over ZMQ REQ/REP.
 
 using import "/common.capnp".ErrorInfo;
-using import "/annotations.capnp".mcpScope;
+using import "/annotations.capnp".scope;
 using import "/annotations.capnp".mcpDescription;
 using import "/streaming.capnp".StreamInfo;
 
@@ -79,25 +79,25 @@ struct MetricsRequest {
 
   union {
     ingest       @1 :IngestRequest
-      $mcpScope(write) $mcpDescription("Ingest metric records into the time-series store");
+      $scope(write) $mcpDescription("Ingest metric records into the time-series store");
 
     query        @2 :MetricQuery
-      $mcpScope(query) $mcpDescription("Execute a structured or raw SQL aggregation query");
+      $scope(query) $mcpDescription("Execute a structured or raw SQL aggregation query");
 
     queryStream  @3 :MetricQuery
-      $mcpScope(query) $mcpDescription("Stream query results as Arrow IPC RecordBatch chunks");
+      $scope(query) $mcpDescription("Stream query results as Arrow IPC RecordBatch chunks");
 
     createView   @4 :ViewSpec
-      $mcpScope(manage) $mcpDescription("Create a materialized view over the metrics table");
+      $scope(manage) $mcpDescription("Create a materialized view over the metrics table");
 
     listViews    @5 :Void
-      $mcpScope(query) $mcpDescription("List all materialized views");
+      $scope(query) $mcpDescription("List all materialized views");
 
     dropView     @6 :Text
-      $mcpScope(manage) $mcpDescription("Drop a materialized view by name");
+      $scope(manage) $mcpDescription("Drop a materialized view by name");
 
     health       @7 :Void
-      $mcpScope(query) $mcpDescription("Check service health and row count");
+      $scope(query) $mcpDescription("Check service health and row count");
   }
 }
 

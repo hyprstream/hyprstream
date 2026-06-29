@@ -102,6 +102,58 @@ impl Operation {
         }
     }
 
+    /// The unified scope-action vocabulary (S3, epic #547).
+    ///
+    /// Returns this operation's `ScopeAction` enumerant name — the SAME token used
+    /// by the `$scope`/`$capability` capnp annotation and stored in
+    /// [`crate::auth::Scope::action`]. There is one action vocabulary, not two:
+    /// the schema annotation, the runtime `Scope`, and this enum all agree.
+    ///
+    /// This is the canonical bridge between the compile-time TE baseline (schema
+    /// annotation) and runtime enforcement. `MeshStatus` shares `query` because the
+    /// mesh read ability IS the canonical status read (#319), matching `as_str()`.
+    pub fn as_capability(&self) -> &'static str {
+        match self {
+            Operation::Query | Operation::MeshStatus => "query",
+            Operation::Write => "write",
+            Operation::Manage => "manage",
+            Operation::Infer => "infer",
+            Operation::Train => "train",
+            Operation::Serve => "serve",
+            Operation::Context => "context",
+            Operation::Spawn => "spawn",
+            Operation::Create => "create",
+            Operation::MeshInvoke => "meshInvoke",
+            Operation::MeshStage => "meshStage",
+            Operation::MeshDelta => "meshDelta",
+        }
+    }
+
+    /// Parse an [`Operation`] from a unified scope-action token (a `ScopeAction`
+    /// enumerant name — what the `$scope`/`$capability` annotation emits and what
+    /// [`crate::auth::Scope::action`] carries). The inverse of [`Self::as_capability`].
+    ///
+    /// Returns `None` for an unknown token; callers MUST fail closed (no default-allow).
+    pub fn from_capability(action: &str) -> Option<Self> {
+        Some(match action {
+            "query" => Operation::Query,
+            "write" => Operation::Write,
+            "manage" => Operation::Manage,
+            "infer" => Operation::Infer,
+            "train" => Operation::Train,
+            "serve" => Operation::Serve,
+            "context" => Operation::Context,
+            "subscribe" => Operation::Context, // notification subscribe ⊑ context read-side
+            "publish" => Operation::Serve,     // notification publish ⊑ serve authority
+            "spawn" => Operation::Spawn,
+            "create" => Operation::Create,
+            "meshInvoke" => Operation::MeshInvoke,
+            "meshStage" => Operation::MeshStage,
+            "meshDelta" => Operation::MeshDelta,
+            _ => return None,
+        })
+    }
+
     /// Get the dot-namespaced operation name for policy matching.
     ///
     /// Returns the canonical dot-namespaced string for this operation variant.

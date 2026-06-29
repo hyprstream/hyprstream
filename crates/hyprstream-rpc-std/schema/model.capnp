@@ -3,7 +3,7 @@
 using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".paramDescription;
-using import "/annotations.capnp".mcpScope;
+using import "/annotations.capnp".scope;
 using import "/annotations.capnp".docExample;
 using import "/annotations.capnp".optional;
 using import "/annotations.capnp".serdeRename;
@@ -51,11 +51,11 @@ struct ModelRequest {
 
   # Request payload (union of request types)
   union {
-    load @1 :LoadModelRequest $mcpDescription("Load a model into memory for inference") $mcpScope(write);
-    unload @2 :UnloadModelRequest $mcpDescription("Unload a model from memory to free resources") $mcpScope(write);
-    status @3 :StatusRequest $mcpDescription("Get status of all loaded/loading models (empty modelRef) or a specific model") $mcpScope(query)
+    load @1 :LoadModelRequest $mcpDescription("Load a model into memory for inference") $scope(write);
+    unload @2 :UnloadModelRequest $mcpDescription("Unload a model from memory to free resources") $scope(write);
+    status @3 :StatusRequest $mcpDescription("Get status of all loaded/loading models (empty modelRef) or a specific model") $scope(query)
         $docExample("cat /srv/model/status");
-    healthCheck @4 :Void $mcpDescription("Check model service health and status") $mcpScope(query)
+    healthCheck @4 :Void $mcpDescription("Check model service health and status") $scope(query)
         $docExample("cat /srv/model/health");
 
     # Scoped interfaces (require modelRef)
@@ -76,14 +76,17 @@ struct ModelRequest {
 struct ModelFsRequest {
   modelRef @0 :Text $paramDescription("Model reference (e.g., 'qwen3:main'). Empty for root directory.");
   union {
-    walk @1 :Nine.NpWalk $mcpDescription("Walk path components to get a fid");
-    open @2 :Nine.NpOpen $mcpDescription("Open a walked fid for I/O");
-    read @3 :Nine.NpRead $mcpDescription("Read from an opened fid");
-    write @4 :Nine.NpWrite $mcpDescription("Write to an opened fid");
-    clunk @5 :Nine.NpClunk $mcpDescription("Release a fid");
-    stat @6 :Nine.NpStatReq $mcpDescription("Get file metadata");
-    create @7 :Nine.NpCreate $mcpDescription("Create a file/dir under a directory fid");
-    remove @8 :Nine.NpRemove $mcpDescription("Remove a file/dir");
+    # 9P ops. Baseline TE: read-side ops (walk/open/read/stat/clunk) are
+    # side-effect-free → query; mutating ops (write/create/remove) → write.
+    # Per-(op, path) enforcement (S2) refines this with the node's object-label.
+    walk @1 :Nine.NpWalk $scope(query) $mcpDescription("Walk path components to get a fid");
+    open @2 :Nine.NpOpen $scope(query) $mcpDescription("Open a walked fid for I/O");
+    read @3 :Nine.NpRead $scope(query) $mcpDescription("Read from an opened fid");
+    write @4 :Nine.NpWrite $scope(write) $mcpDescription("Write to an opened fid");
+    clunk @5 :Nine.NpClunk $scope(query) $mcpDescription("Release a fid");
+    stat @6 :Nine.NpStatReq $scope(query) $mcpDescription("Get file metadata");
+    create @7 :Nine.NpCreate $scope(write) $mcpDescription("Create a file/dir under a directory fid");
+    remove @8 :Nine.NpRemove $scope(write) $mcpDescription("Remove a file/dir");
   }
 }
 
@@ -112,27 +115,27 @@ struct ModelFsResponse {
 struct TttRequest {
   modelRef @0 :Text;
   union {
-    init @1 :LoraConfig
+    init @1 :LoraConfig $scope(train)
       $mcpDescription("Initialize the training infrastructure (LoRA parameters, optimizer, delta pool) on a loaded model. Required before ttt.train or TTT-enabled inference. Configure rank, alpha, target modules, and learning rate.");
-    train @2 :TrainStepRequest
+    train @2 :TrainStepRequest $scope(train)
       $mcpDescription("Run TTT gradient steps on input text WITHOUT generating a response. Pure training — use for pre-training on domain text before asking questions. Returns loss metrics and recommendation. Use adaptationStrategy=speculative to keep pending, then call ttt.writeback or ttt.evict.");
-    trainStream @3 :TrainStepRequest
+    trainStream @3 :TrainStepRequest $scope(train)
       $mcpDescription("Stream TTT training on input text. Returns progress and results via streaming. Use for long-running training that would timeout via ttt.train.");
-    writeback @4 :Void
+    writeback @4 :Void $scope(manage)
       $mcpDescription("Write back a pending TTT adaptation to the tenant delta accumulator. Call after reviewing onlineTrainingMetrics.recommendation from infer.generateStream. Must be called within the pending rollback window (default 60 seconds, configurable via pending_rollback_ms). If the window expires, the adaptation is auto-evicted and this call will return an error.");
-    evict @5 :Void
+    evict @5 :Void $scope(manage)
       $mcpDescription("Evict (discard) a pending TTT adaptation, restoring the tenant delta accumulator to its pre-adaptation state. Call within the pending rollback window (default 60 seconds, configurable via pending_rollback_ms) if recommendation was false or output quality was poor. If multiple adaptations were stacked, evict restores to the state before the earliest pending adaptation.");
-    zero @6 :Void
+    zero @6 :Void $scope(manage)
       $mcpDescription("Zero the tenant delta accumulator, clearing all accumulated training. Use after ttt.save or ttt.export to free capacity.");
-    status @7 :Void
+    status @7 :Void $scope(query)
       $mcpDescription("Get tenant delta accumulator metrics: step count, loss improvement, drift. Use to decide if adaptations should be persisted via ttt.save or ttt.export.");
-    save @8 :SaveAdaptationRequest
+    save @8 :SaveAdaptationRequest $scope(write)
       $mcpDescription("Merge the tenant delta accumulator into an on-disk adapter file using a configurable merge strategy (replace/additive/do_merge). For incremental refinement of existing adapters. Call ttt.status first to verify quality. The result is committed to the model's git repository.");
-    snapshot @9 :Void
+    snapshot @9 :Void $scope(write)
       $mcpDescription("Snapshot the tenant delta accumulator to content-addressed storage without merging into an adapter file.");
-    export @10 :ExportPeftRequest
+    export @10 :ExportPeftRequest $scope(write)
       $mcpDescription("Export the tenant delta accumulator as a standalone PEFT-compatible adapter directory (adapter_config.json + adapter_model.safetensors). For interop with HuggingFace and external tools. The exported adapter can be reloaded via adapter.load.");
-    writeTttConfig @11 :WriteTttConfigRequest
+    writeTttConfig @11 :WriteTttConfigRequest $scope(write)
       $mcpDescription("Write hyprstream_training configuration to the model worktree's config.json and optionally reload. Required before ttt.train or TTT-enabled inference. Sets training mode to test_time_training and configures LoRA rank/alpha, target modules, and learning rate.");
   }
 }
@@ -150,15 +153,15 @@ struct TttRequest {
 struct AdapterRequest {
   modelRef @0 :Text;
   union {
-    load @1 :Text
+    load @1 :Text $scope(write)
       $mcpDescription("Load a PEFT adapter from disk into the base_delta register. Applied to all inference until unloaded. Path is relative within the model worktree (e.g. 'adapters/my-adapter').");
-    unload @2 :Void
+    unload @2 :Void $scope(write)
       $mcpDescription("Clear the base_delta register, removing the loaded adapter from GPU/CPU memory.");
-    status @3 :Void
+    status @3 :Void $scope(query)
       $mcpDescription("Check if a LoRA adapter is currently loaded in the base_delta register.");
-    inspect @4 :Text
+    inspect @4 :Text $scope(query)
       $mcpDescription("Validate an on-disk PEFT adapter directory and return its metadata (rank, alpha, target modules, base model). Does not load anything into memory.");
-    merge @5 :MergeLoraRequest
+    merge @5 :MergeLoraRequest $scope(write)
       $mcpDescription("Read a PEFT adapter from disk and merge it into the currently loaded base_delta register using a configurable merge strategy (replace/additive/do_merge). Requires an adapter already loaded via adapter.load.");
   }
 }
@@ -171,13 +174,13 @@ struct AdapterRequest {
 struct InferRequest {
   modelRef @0 :Text;
   union {
-    generateStream @1 :GenerationRequest
+    generateStream @1 :GenerationRequest $scope(infer)
       $mcpDescription("Run inference with automatic domain adaptation. When TTT is enabled, the model adapts to your prompt BEFORE generating — the response is always produced using the adapted weights, even when adaptationStrategy=speculative. Check onlineTrainingMetrics.recommendation in the response, then call ttt.writeback (if true) or ttt.evict (if false) within the pending rollback window (default 60 seconds). If you call generateStream again before resolving a pending adaptation, the new adaptation stacks on top and evict will restore to the state before the first pending adaptation. Pending adaptations auto-evict after the timeout if writeback/evict is not called.");
-    applyChatTemplate @2 :ChatTemplateRequest
+    applyChatTemplate @2 :ChatTemplateRequest $scope(query)
       $mcpDescription("Apply chat template to messages for a loaded model");
-    status @3 :Void
+    status @3 :Void $scope(query)
       $mcpDescription("Get detailed status information about a model including online training configuration");
-    embed @4 :EmbedImagesRequest
+    embed @4 :EmbedImagesRequest $scope(infer)
       $mcpDescription("Compute embeddings for one or more images. Returns embedding vectors from the model's vision encoder (e.g. SigLIP). Synchronous — returns all embeddings in a single response.");
   }
 }

@@ -3,7 +3,7 @@
 using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".paramDescription;
-using import "/annotations.capnp".mcpScope;
+using import "/annotations.capnp".scope;
 
 # Cap'n Proto schema for workflow service (independent service)
 #
@@ -19,28 +19,28 @@ struct WorkflowRequest {
   union {
     scanRepo @1 :Text
       $mcpDescription("Scan a repository for workflow definitions")
-      $mcpScope(query);
+      $scope(query);
     register @2 :WorkflowDef
       $mcpDescription("Register a workflow definition")
-      $mcpScope(write);
+      $scope(write);
     list @3 :Void
       $mcpDescription("List all registered workflows")
-      $mcpScope(query);
+      $scope(query);
     dispatch @4 :DispatchRequest
       $mcpDescription("Dispatch a workflow run with input parameters")
-      $mcpScope(write);
+      $scope(write);
     subscribe @5 :SubscribeRequest
       $mcpDescription("Subscribe to workflow events")
-      $mcpScope(write);
+      $scope(write);
     unsubscribe @6 :Text
       $mcpDescription("Unsubscribe from workflow events")
-      $mcpScope(write);
+      $scope(write);
     getRun @7 :Text
       $mcpDescription("Get status of a workflow run")
-      $mcpScope(query);
+      $scope(query);
     listRuns @8 :Text
       $mcpDescription("List runs for a workflow")
-      $mcpScope(query);
+      $scope(query);
   }
 }
 
