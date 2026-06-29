@@ -7,11 +7,11 @@
 
 use anyhow::Result;
 use ml_dsa::{
-    MlDsa65, EncodedVerifyingKey, Generate, KeyExport, Keypair, SignatureEncoding, Signer, Verifier,
+    EncodedVerifyingKey, Generate, KeyExport, Keypair, MlDsa65, SignatureEncoding, Signer, Verifier,
 };
 use ml_kem::{
-    MlKem768,
     kem::{Decapsulate, Encapsulate, Kem, TryKeyInit},
+    MlKem768,
 };
 
 // ── ML-DSA-65 type aliases ──────────────────────────────────────────────────
@@ -58,8 +58,9 @@ pub fn ml_dsa_sk_to_vk_bytes(key: &MlDsaSigningKey) -> Vec<u8> {
 }
 
 pub fn ml_dsa_vk_from_bytes(bytes: &[u8]) -> Result<MlDsaVerifyingKey> {
-    let encoded = EncodedVerifyingKey::<MlDsa65>::try_from(bytes)
-        .map_err(|_| anyhow::anyhow!("invalid ML-DSA-65 verifying key length (expected 1952 bytes)"))?;
+    let encoded = EncodedVerifyingKey::<MlDsa65>::try_from(bytes).map_err(|_| {
+        anyhow::anyhow!("invalid ML-DSA-65 verifying key length (expected 1952 bytes)")
+    })?;
     Ok(MlDsaVerifyingKey::decode(&encoded))
 }
 
@@ -85,16 +86,19 @@ pub fn ml_kem_generate_keypair() -> (MlKemDecapsKey, MlKemEncapsKey) {
 
 /// Encapsulate a shared secret. Returns `(ciphertext, shared_secret)`.
 pub fn ml_kem_encapsulate(ek: &MlKemEncapsKey) -> (Vec<u8>, [u8; 32]) {
-    let (ct, ss): (ml_kem::Ciphertext<MlKem768>, ml_kem::kem::SharedKey<MlKem768>) =
-        ek.encapsulate();
+    let (ct, ss): (
+        ml_kem::Ciphertext<MlKem768>,
+        ml_kem::kem::SharedKey<MlKem768>,
+    ) = ek.encapsulate();
     let mut shared = [0u8; 32];
     shared.copy_from_slice(ss.as_slice());
     (ct.as_slice().to_vec(), shared)
 }
 
 pub fn ml_kem_decapsulate(dk: &MlKemDecapsKey, ct: &[u8]) -> Result<[u8; 32]> {
-    let ss = dk.decapsulate_slice(ct)
-        .map_err(|_| anyhow::anyhow!("invalid ML-KEM-768 ciphertext length (expected 1088 bytes)"))?;
+    let ss = dk.decapsulate_slice(ct).map_err(|_| {
+        anyhow::anyhow!("invalid ML-KEM-768 ciphertext length (expected 1088 bytes)")
+    })?;
     let mut shared = [0u8; 32];
     shared.copy_from_slice(ss.as_slice());
     Ok(shared)
@@ -104,9 +108,38 @@ pub fn ml_kem_ek_bytes(key: &MlKemEncapsKey) -> Vec<u8> {
     ml_kem::kem::KeyExport::to_bytes(key).to_vec()
 }
 
+/// Reconstruct an ML-KEM-768 decapsulation key from its 64-byte FIPS 203 seed
+/// (`d ‖ z`). Deterministic — the matching encapsulation key is recovered via
+/// [`MlKemDecapsKey::encapsulation_key`]. This 64-byte seed is the canonical byte
+/// form used by the hybrid-KEM component (#551) and by `#mesh-kem` key derivation
+/// (#552), mirroring [`ml_dsa_sk_from_seed`].
+pub fn ml_kem_decaps_from_seed(seed: &[u8; 64]) -> MlKemDecapsKey {
+    let s = ml_kem::Seed::from(*seed);
+    MlKemDecapsKey::from_seed(s)
+}
+
+/// Serialize an ML-KEM-768 decapsulation key to its 64-byte seed.
+///
+/// Returns `None` only if the key was built from the (deprecated) expanded form
+/// rather than a seed; keys from [`ml_kem_generate_keypair`] or
+/// [`ml_kem_decaps_from_seed`] are always seed-backed.
+pub fn ml_kem_dk_to_seed(dk: &MlKemDecapsKey) -> Option<[u8; 64]> {
+    dk.to_seed().map(|s| {
+        let mut out = [0u8; 64];
+        out.copy_from_slice(s.as_ref());
+        out
+    })
+}
+
+/// The encapsulation-key bytes (1184 B) corresponding to a decapsulation key.
+pub fn ml_kem_ek_of_dk(dk: &MlKemDecapsKey) -> Vec<u8> {
+    ml_kem_ek_bytes(dk.encapsulation_key())
+}
+
 pub fn ml_kem_ek_from_bytes(bytes: &[u8]) -> Result<MlKemEncapsKey> {
-    let key_array = ml_kem::kem::Key::<MlKemEncapsKey>::try_from(bytes)
-        .map_err(|_| anyhow::anyhow!("invalid ML-KEM-768 encapsulation key length (expected 1184 bytes)"))?;
+    let key_array = ml_kem::kem::Key::<MlKemEncapsKey>::try_from(bytes).map_err(|_| {
+        anyhow::anyhow!("invalid ML-KEM-768 encapsulation key length (expected 1184 bytes)")
+    })?;
     <MlKemEncapsKey as TryKeyInit>::new(&key_array)
         .map_err(|_| anyhow::anyhow!("invalid ML-KEM-768 encapsulation key"))
 }
