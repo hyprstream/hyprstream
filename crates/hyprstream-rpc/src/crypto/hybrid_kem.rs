@@ -542,6 +542,75 @@ impl RecipientKeypair {
     }
 }
 
+impl RecipientPublic {
+    /// Canonical length-prefixed encoding of the recipient's per-component
+    /// encapsulation keys, mirroring [`HybridKemMaterial::encode`]:
+    /// `be16(suite_id) ‖ be16(n) ‖ Σ_i (be16(kem_id) ‖ be32(len) ‖ ek_bytes)`.
+    ///
+    /// This is what the stream client sends as its ephemeral public material
+    /// (`RequestEnvelope.clientKemPublic`, S3 #554), and what `#mesh-kem`
+    /// publishes for the envelope path (S4 #555).
+    pub fn encode(&self) -> Vec<u8> {
+        let comps = self.suite_id.components();
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.suite_id.as_u16().to_be_bytes());
+        out.extend_from_slice(&(self.eks.len() as u16).to_be_bytes());
+        for (i, ek) in self.eks.iter().enumerate() {
+            // Component order is the suite's; tag each ek with its kem id so the
+            // decoder can fail closed on a reordered / wrong-suite encoding.
+            out.extend_from_slice(&comps[i].as_u16().to_be_bytes());
+            out.extend_from_slice(&(ek.len() as u32).to_be_bytes());
+            out.extend_from_slice(ek);
+        }
+        out
+    }
+
+    /// Parse + validate the canonical encoding. Rejects unknown suites/kem-ids,
+    /// wrong component count or order, wrong ek length, truncation, or trailing
+    /// bytes — fail-closed against malformed client public material.
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        let mut r = Reader { buf, pos: 0 };
+        let suite_id = SuiteId::from_u16(r.u16()?)
+            .ok_or_else(|| anyhow::anyhow!("unknown hybrid-KEM suite id"))?;
+        let n = r.u16()? as usize;
+        let comps = suite_id.components();
+        if n != comps.len() {
+            bail!(
+                "ek count {n} does not match suite {} ({} components)",
+                suite_id.as_str(),
+                comps.len()
+            );
+        }
+        let mut eks = Vec::with_capacity(n);
+        for (i, &want) in comps.iter().enumerate() {
+            let kem_id =
+                KemId::from_u16(r.u16()?).ok_or_else(|| anyhow::anyhow!("unknown kem id"))?;
+            if kem_id != want {
+                bail!(
+                    "ek {i} kem id {:?} does not match suite component {:?}",
+                    kem_id,
+                    want
+                );
+            }
+            let len = r.u32()? as usize;
+            let bytes = r.take(len)?.to_vec();
+            if bytes.len() != want.component().ek_len() {
+                bail!(
+                    "ek {i} ({:?}) length {} != expected {}",
+                    want,
+                    bytes.len(),
+                    want.component().ek_len()
+                );
+            }
+            eks.push(bytes);
+        }
+        if r.pos != buf.len() {
+            bail!("trailing bytes after recipient public material");
+        }
+        Ok(Self { suite_id, eks })
+    }
+}
+
 // ============================================================================
 // High-level hybrid KEM API
 // ============================================================================
@@ -1068,5 +1137,47 @@ mod tests {
             store.kem_recipient_for(&[0x43u8; 32]).is_none(),
             "a different identity stays unanchored"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod recipient_public_codec_tests {
+    use super::*;
+
+    #[test]
+    fn recipient_public_roundtrip() {
+        let kp = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        let pubmat = kp.public();
+        let enc = pubmat.encode();
+        let dec = RecipientPublic::decode(&enc).unwrap();
+        assert_eq!(dec, pubmat);
+        assert_eq!(dec.encode(), enc, "encoding is canonical");
+        // The decoded public actually works for encapsulation.
+        let (material, _secret) = encapsulate_to(&dec).unwrap();
+        assert_eq!(material.suite_id, SuiteId::HyKemX25519MlKem768);
+    }
+
+    #[test]
+    fn recipient_public_rejects_malformed() {
+        assert!(RecipientPublic::decode(&[]).is_err());
+        assert!(RecipientPublic::decode(b"garbage bytes here").is_err());
+        let kp = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        // Truncation.
+        let mut enc = kp.public().encode();
+        enc.truncate(enc.len() - 1);
+        assert!(RecipientPublic::decode(&enc).is_err());
+        // Trailing bytes.
+        let mut enc2 = kp.public().encode();
+        enc2.push(0xff);
+        assert!(RecipientPublic::decode(&enc2).is_err());
+    }
+
+    #[test]
+    fn recipient_public_rejects_wrong_ek_length() {
+        let kp = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        let mut bad = kp.public();
+        bad.eks[0] = vec![0u8; 31]; // wrong X25519 ek length (must be 32)
+        assert!(RecipientPublic::decode(&bad.encode()).is_err());
     }
 }
