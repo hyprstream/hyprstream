@@ -187,6 +187,30 @@ pub struct PolicyApproval {
     pub approved_hash: [u8; 32],
 }
 
+impl PolicyApproval {
+    /// **S5 → S4 keystone (#571 M2, additive).** Convert a *verified* UCAN approval
+    /// binding into the [`PolicyApproval`] this loader requires. This is the one
+    /// wire that lets the S5 compiler's output reach the S4 loader: the reviewer
+    /// signs a UCAN approval whose `bundle_hash` is exactly
+    /// [`CompiledPolicy::policy_hash`]; once the signature is verified
+    /// (`SignedApproval::verify` / `verify_binds`, hybrid COSE) the resulting
+    /// [`ApprovalBinding`](hyprstream_rpc::auth::ucan::approval::ApprovalBinding)'s
+    /// `(generation, bundle_hash)` ARE the `(generation, approved_hash)` the loader
+    /// matches against — with the loader RECOMPUTING the hash itself (it never
+    /// trusts a transmitted hash; see [`PolicyLoader::load`]).
+    ///
+    /// Pass only a binding you have already verified — borrowing the
+    /// `&ApprovalBinding` returned by `SignedApproval::verify`/`verify_binds` makes
+    /// that the natural call shape. No `did:key`/crypto happens here: this is a pure
+    /// field projection of an already-trusted binding.
+    pub fn from_verified(binding: &hyprstream_rpc::auth::ucan::approval::ApprovalBinding) -> Self {
+        Self {
+            generation: binding.generation,
+            approved_hash: binding.bundle_hash,
+        }
+    }
+}
+
 /// PEP side: verify signature + (optionally) match against an approval, then yield the
 /// [`CompiledPolicy`] ready to feed a [`crate::mac::te::LatticeTeEvaluator`]. Fail-closed:
 /// any failure returns an error and NO policy is loaded (the PEP keeps denying).
@@ -294,7 +318,9 @@ pub enum PolicyDistError {
     NoMatchingApproval { generation: u64 },
     #[error("generation mismatch: outer={outer} inner={inner}")]
     GenerationMismatch { outer: u64, inner: u64 },
-    #[error("embedded lattice version {lattice} != policy generation {policy} (S1↔S4 bit-desync guard)")]
+    #[error(
+        "embedded lattice version {lattice} != policy generation {policy} (S1↔S4 bit-desync guard)"
+    )]
     LatticeGenerationMismatch { policy: u64, lattice: u64 },
 }
 
@@ -451,7 +477,10 @@ mod tests {
         let loader = PolicyLoader::new(StubVerifier { key });
         assert!(matches!(
             loader.load(&signed),
-            Err(PolicyDistError::LatticeGenerationMismatch { policy: 9, lattice: 2 })
+            Err(PolicyDistError::LatticeGenerationMismatch {
+                policy: 9,
+                lattice: 2
+            })
         ));
     }
 
@@ -472,7 +501,10 @@ mod tests {
         // Flip a byte in the policy body — recomputed hash diverges → signature fails.
         signed.policy_bytes[0] ^= 0xFF;
         let loader = PolicyLoader::new(StubVerifier { key });
-        assert!(loader.load(&signed).is_err(), "tampered policy must be rejected");
+        assert!(
+            loader.load(&signed).is_err(),
+            "tampered policy must be rejected"
+        );
     }
 
     #[test]

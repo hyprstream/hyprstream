@@ -56,6 +56,7 @@
 
 pub mod avc;
 pub mod compiled;
+pub mod compiler;
 pub mod lattice;
 pub mod te;
 
@@ -75,4 +76,12 @@ pub use lattice::{
 pub use te::{
     Action, Decision, LatticeTeEvaluator, ObjectCtx, ObjectType, ScopeAction, SubjectCtx,
     SubjectType, TeEvaluator, TeMatrix, TeRule,
+};
+// S5 milestone-2 (#571): the vocabulary-independent UCAN→TE emitter + faithfulness
+// framework + fail-closed signing gate. Concrete homes (here, not `hyprstream-rpc`)
+// for the M1 `BundleEmitter` / `FaithfulnessCheck` seams, which need both the UCAN
+// model and S4's `TeMatrix`/`CompiledPolicy`.
+pub use compiler::{
+    compile_and_bind, AccessRequest, CapabilityVocab, CompileError, Counterexample, EmitError,
+    EmittedBundle, Faithfulness, ReferenceInterpreter, TeBundleEmitter,
 };
