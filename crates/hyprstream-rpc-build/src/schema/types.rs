@@ -126,6 +126,11 @@ pub struct FieldDef {
     pub discriminant_value: u16,
     /// From `$serdeRename("...")` annotation: generates `#[serde(rename = "...")]` on the Rust field.
     pub serde_rename: Option<String>,
+    /// From a field-level `$domainType("path::Type")` annotation: the field maps to this
+    /// Rust newtype while keeping its capnp wire type (e.g. `Text`). The generated struct
+    /// uses this type; ToCapnp writes via `.as_str()` and FromCapnp reads via `Type::new(...)`.
+    #[serde(default)]
+    pub domain_type: Option<String>,
 }
 
 /// Which section of a Cap'n Proto struct a field resides in.

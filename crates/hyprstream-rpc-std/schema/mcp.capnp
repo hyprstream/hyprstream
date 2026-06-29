@@ -13,6 +13,7 @@
 using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".scope;
 using import "/annotations.capnp".mcpDescription;
+using import "/annotations.capnp".domainType;
 
 # Unified MCP request with union discriminator
 struct McpRequest {
@@ -46,7 +47,7 @@ struct CallTool {
 
   # Optional caller identity for authorization
   # If None, uses the ZMQ request's identity
-  callerIdentity @2 :Text;
+  callerIdentity @2 :Text $domainType("hyprstream_rpc::identity::Did");
 }
 
 # Unified MCP response

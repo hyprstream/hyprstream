@@ -371,7 +371,7 @@ pub fn make_tool_caller(
                             .call_tool(&crate::services::generated::mcp_client::CallTool {
                                 tool_name: uuid_c,
                                 arguments,
-                                caller_identity: String::new(),
+                                caller_identity: hyprstream_rpc::identity::Did::new(String::new()),
                             })
                             .await
                         {

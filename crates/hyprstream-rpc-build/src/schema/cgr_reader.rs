@@ -674,6 +674,7 @@ struct FieldAnnotationIds {
     fixed_size_id: Option<u64>,
     optional_id: Option<u64>,
     serde_rename_id: Option<u64>,
+    domain_type_id: Option<u64>,
 }
 
 /// Build a `FieldDef` from a `Slot` field reader.
@@ -734,6 +735,20 @@ fn field_def_from_slot(
         }
     };
 
+    // Field-level `$domainType("path::Type")`: maps this field to a Rust newtype while
+    // keeping its capnp wire type. Mirrors the struct-level read in `extract_struct_from_node`.
+    let domain_type = {
+        let dt = extract_annotation_text(
+            field.get_annotations().map_err(|e| format!("{e}"))?,
+            ann.domain_type_id,
+        );
+        if dt.is_empty() {
+            None
+        } else {
+            Some(dt)
+        }
+    };
+
     Ok(FieldDef {
         name: field_name,
         type_name,
@@ -744,6 +759,7 @@ fn field_def_from_slot(
         section,
         discriminant_value: disc,
         serde_rename,
+        domain_type,
     })
 }
 
@@ -917,6 +933,7 @@ fn extract_struct_from_node(
         fixed_size_id,
         optional_id,
         serde_rename_id,
+        domain_type_id,
     };
 
     for j in 0..fields_reader.len() {
@@ -983,6 +1000,8 @@ fn extract_struct_from_node(
                     section: FieldSection::Group,
                     discriminant_value: disc,
                     serde_rename,
+                    // Group fields carry no field-level $domainType (they are inlined unions).
+                    domain_type: None,
                 }
             }
             Err(e) => return Err(format!("Field error: {e}")),
@@ -1010,6 +1029,7 @@ fn extract_struct_from_node(
                 fixed_size_id,
                 optional_id,
                 serde_rename_id,
+                domain_type_id,
             },
         )?
     } else {
