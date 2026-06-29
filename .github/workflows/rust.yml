@@ -100,6 +100,11 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     needs: clippy  # Only build if clippy passes
+    # Merge-gate backstop: fail before the merge queue's 120min timeout (ruleset
+    # check_response_timeout_minutes) so a hang yields a definitive failure and the
+    # queue keeps moving instead of timing out and kicking every queued PR. Healthy
+    # build+test is ~90min (Build ~13m / Run tests ~76m), so 115 leaves margin.
+    timeout-minutes: 115
 
     steps:
     - uses: actions/checkout@v4
@@ -120,5 +125,17 @@ jobs:
     - name: Build
       run: cargo build --release --verbose --features download-libtorch
 
-    - name: Run tests
-      run: cargo test --release --verbose --features download-libtorch
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@nextest
+
+    - name: Run tests (nextest, per-test timeout)
+      # nextest enforces the per-TEST slow-timeout from .config/nextest.toml
+      # ([profile.ci]): a single deadlocked test is SIGKILLed after ~3min and fails
+      # fast, instead of stalling the job until the 115min job / 120min queue
+      # timeout. The cap is per-test on purpose — the legit suite is long (~76min),
+      # so a per-step timeout could not tell a hang from healthy runtime.
+      run: cargo nextest run --release --profile ci --features download-libtorch
+
+    - name: Run doctests
+      # nextest does not run doctests; keep them in the merge gate.
+      run: cargo test --release --doc --features download-libtorch
