@@ -240,7 +240,10 @@ fn decode_composite(bytes: &[u8]) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
         _ => bail!("nested COSE composite must be a CBOR array"),
     };
     if arr.len() != 2 {
-        bail!("nested COSE composite must have exactly 2 elements, got {}", arr.len());
+        bail!(
+            "nested COSE composite must have exactly 2 elements, got {}",
+            arr.len()
+        );
     }
     let inner = match &arr[0] {
         CborValue::Bytes(b) => b.clone(),
@@ -506,7 +509,10 @@ pub fn verify_composite(
                     bail!("Hybrid policy requires an anchored ML-DSA-65 key, none provided");
                 }
                 // Classical verifier without an anchor: ignore the outer layer.
-                return Ok(CompositeVerified { eddsa: eddsa_ok, ml_dsa: false });
+                return Ok(CompositeVerified {
+                    eddsa: eddsa_ok,
+                    ml_dsa: false,
+                });
             };
             let outer = CoseSign1::from_slice(ob)
                 .map_err(|e| anyhow!("malformed outer ML-DSA COSE_Sign1: {e}"))?;
@@ -544,7 +550,10 @@ pub fn verify_composite(
         bail!("Hybrid policy: outer ML-DSA-65 layer missing or unverified");
     }
 
-    Ok(CompositeVerified { eddsa: eddsa_ok, ml_dsa: ml_dsa_ok })
+    Ok(CompositeVerified {
+        eddsa: eddsa_ok,
+        ml_dsa: ml_dsa_ok,
+    })
 }
 
 /// Extract the IANA alg integer from a COSE_Sign1 protected header.
@@ -589,7 +598,8 @@ mod tests {
         let ed = SigningKey::generate(&mut OsRng);
         let payload = b"classical payload";
         let cose = sign_composite(&ed, None, payload, &aad()).unwrap();
-        let res = verify_composite(&cose, &ed.verifying_key(), None, payload, &aad(), false).unwrap();
+        let res =
+            verify_composite(&cose, &ed.verifying_key(), None, payload, &aad(), false).unwrap();
         assert!(res.eddsa);
         assert!(!res.ml_dsa);
     }
@@ -600,7 +610,15 @@ mod tests {
         let (pq_sk, pq_vk) = ml_dsa_generate_keypair();
         let payload = b"hybrid payload";
         let cose = sign_composite(&ed, Some(&pq_sk), payload, &aad()).unwrap();
-        let res = verify_composite(&cose, &ed.verifying_key(), Some(&pq_vk), payload, &aad(), true).unwrap();
+        let res = verify_composite(
+            &cose,
+            &ed.verifying_key(),
+            Some(&pq_vk),
+            payload,
+            &aad(),
+            true,
+        )
+        .unwrap();
         assert!(res.eddsa);
         assert!(res.ml_dsa);
     }
@@ -612,7 +630,8 @@ mod tests {
         let payload = b"cross payload";
         let cose = sign_composite(&ed, Some(&pq_sk), payload, &aad()).unwrap();
         // Classical verifier: no PQ key, require_pq=false → inner EdDSA only.
-        let res = verify_composite(&cose, &ed.verifying_key(), None, payload, &aad(), false).unwrap();
+        let res =
+            verify_composite(&cose, &ed.verifying_key(), None, payload, &aad(), false).unwrap();
         assert!(res.eddsa);
         assert!(!res.ml_dsa);
     }
@@ -624,8 +643,18 @@ mod tests {
         let payload = b"classical only";
         let cose = sign_composite(&ed, None, payload, &aad()).unwrap();
         // Hybrid verifier requires the outer layer → absent → rejected.
-        let res = verify_composite(&cose, &ed.verifying_key(), Some(&pq_vk), payload, &aad(), true);
-        assert!(res.is_err(), "hybrid policy must reject classical-only (no outer layer)");
+        let res = verify_composite(
+            &cose,
+            &ed.verifying_key(),
+            Some(&pq_vk),
+            payload,
+            &aad(),
+            true,
+        );
+        assert!(
+            res.is_err(),
+            "hybrid policy must reject classical-only (no outer layer)"
+        );
     }
 
     #[test]
@@ -635,8 +664,18 @@ mod tests {
         let (_other_sk, other_vk) = ml_dsa_generate_keypair();
         let payload = b"anchored";
         let cose = sign_composite(&ed, Some(&pq_sk), payload, &aad()).unwrap();
-        let res = verify_composite(&cose, &ed.verifying_key(), Some(&other_vk), payload, &aad(), true);
-        assert!(res.is_err(), "PQ key not matching kid-anchored key must be rejected");
+        let res = verify_composite(
+            &cose,
+            &ed.verifying_key(),
+            Some(&other_vk),
+            payload,
+            &aad(),
+            true,
+        );
+        assert!(
+            res.is_err(),
+            "PQ key not matching kid-anchored key must be rejected"
+        );
     }
 
     #[test]
@@ -644,7 +683,14 @@ mod tests {
         let ed = SigningKey::generate(&mut OsRng);
         let (pq_sk, pq_vk) = ml_dsa_generate_keypair();
         let cose = sign_composite(&ed, Some(&pq_sk), b"orig", &aad()).unwrap();
-        let res = verify_composite(&cose, &ed.verifying_key(), Some(&pq_vk), b"tampered", &aad(), true);
+        let res = verify_composite(
+            &cose,
+            &ed.verifying_key(),
+            Some(&pq_vk),
+            b"tampered",
+            &aad(),
+            true,
+        );
         assert!(res.is_err());
     }
 
@@ -670,8 +716,18 @@ mod tests {
         let (inner, _outer) = decode_composite(&cose).unwrap();
         let stripped = encode_composite(inner, None).unwrap();
 
-        let res = verify_composite(&stripped, &ed.verifying_key(), Some(&pq_vk), payload, &aad(), true);
-        assert!(res.is_err(), "stripping the outer ML-DSA layer must fail Hybrid policy");
+        let res = verify_composite(
+            &stripped,
+            &ed.verifying_key(),
+            Some(&pq_vk),
+            payload,
+            &aad(),
+            true,
+        );
+        assert!(
+            res.is_err(),
+            "stripping the outer ML-DSA layer must fail Hybrid policy"
+        );
     }
 
     /// inner→outer binding: tampering with the inner EdDSA signature invalidates the outer,
@@ -694,8 +750,18 @@ mod tests {
 
         // Verify under the ORIGINAL ed_vk + anchored pq_vk: inner kid mismatch
         // OR outer-binding mismatch → reject.
-        let res = verify_composite(&tampered, &ed.verifying_key(), Some(&pq_vk), payload, &aad(), true);
-        assert!(res.is_err(), "tampering the inner EdDSA must invalidate the composite");
+        let res = verify_composite(
+            &tampered,
+            &ed.verifying_key(),
+            Some(&pq_vk),
+            payload,
+            &aad(),
+            true,
+        );
+        assert!(
+            res.is_err(),
+            "tampering the inner EdDSA must invalidate the composite"
+        );
     }
 
     /// Hybrid policy with no anchored PQ key must fail closed.
@@ -716,7 +782,10 @@ mod tests {
     fn hybrid_external_aad_binds_alg_id_and_differs() {
         let base = aad();
         let hybrid = build_hybrid_external_aad(&base);
-        assert_ne!(hybrid, base, "hybrid AAD must differ from the bare base AAD");
+        assert_ne!(
+            hybrid, base,
+            "hybrid AAD must differ from the bare base AAD"
+        );
         // Determinism.
         assert_eq!(hybrid, build_hybrid_external_aad(&base));
         // The composite alg-id bytes appear in the encoded hybrid AAD.
@@ -794,7 +863,8 @@ mod tests {
         let ed = SigningKey::generate(&mut OsRng);
         let payload = b"classical unchanged";
         let cose = sign_composite(&ed, None, payload, &aad()).unwrap();
-        let res = verify_composite(&cose, &ed.verifying_key(), None, payload, &aad(), false).unwrap();
+        let res =
+            verify_composite(&cose, &ed.verifying_key(), None, payload, &aad(), false).unwrap();
         assert!(res.eddsa);
         assert!(!res.ml_dsa);
     }
@@ -816,6 +886,9 @@ mod tests {
         let res = inner_cose.verify_detached_signature(payload, &hybrid_aad, |sig, tbs| {
             ed_verify(&ed.verifying_key(), tbs, sig)
         });
-        assert!(res.is_err(), "classical inner must not verify under the hybrid AAD");
+        assert!(
+            res.is_err(),
+            "classical inner must not verify under the hybrid AAD"
+        );
     }
 }

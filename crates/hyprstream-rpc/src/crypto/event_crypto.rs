@@ -224,11 +224,7 @@ pub fn key_commitment(group_key: &[u8; 32], nonce: &[u8; 12]) -> [u8; 16] {
 /// Check key commitment for fast rejection before AEAD.
 ///
 /// Uses constant-time comparison to avoid timing side-channels.
-pub fn check_key_commitment(
-    group_key: &[u8; 32],
-    nonce: &[u8; 12],
-    expected: &[u8; 16],
-) -> bool {
+pub fn check_key_commitment(group_key: &[u8; 32], nonce: &[u8; 12], expected: &[u8; 16]) -> bool {
     let computed = key_commitment(group_key, nonce);
     bool::from(computed.ct_eq(expected))
 }
@@ -365,11 +361,13 @@ mod tests {
         let group_key = [0xABu8; 32];
         let sub_hash = [0x01u8; 32];
 
-        let wrapped =
-            wrap_group_key(&wrap_key, &group_key, &sub_hash, "prefix-a").unwrap();
+        let wrapped = wrap_group_key(&wrap_key, &group_key, &sub_hash, "prefix-a").unwrap();
         let result = unwrap_group_key(&wrap_key, &wrapped, &sub_hash, "prefix-b");
 
-        assert!(result.is_err(), "cross-prefix unwrap must fail due to AAD mismatch");
+        assert!(
+            result.is_err(),
+            "cross-prefix unwrap must fail due to AAD mismatch"
+        );
     }
 
     #[test]
@@ -383,7 +381,10 @@ mod tests {
         let wrapped = wrap_group_key(&wrap_key, &group_key, &sub_hash_a, prefix).unwrap();
         let result = unwrap_group_key(&wrap_key, &wrapped, &sub_hash_b, prefix);
 
-        assert!(result.is_err(), "cross-subscriber unwrap must fail due to AAD mismatch");
+        assert!(
+            result.is_err(),
+            "cross-subscriber unwrap must fail due to AAD mismatch"
+        );
     }
 
     #[test]
@@ -408,8 +409,7 @@ mod tests {
         assert!(check_key_commitment(&group_key, &nonce, &commitment));
 
         // Decrypt with full AAD binding
-        let decrypted =
-            decrypt_event_full(&group_key, &nonce, &tag, &ciphertext, prefix).unwrap();
+        let decrypted = decrypt_event_full(&group_key, &nonce, &tag, &ciphertext, prefix).unwrap();
 
         assert_eq!(decrypted, plaintext);
     }
@@ -420,15 +420,18 @@ mod tests {
         let prefix = "test";
         let plaintext = b"simple test";
 
-        let (tag, ciphertext, nonce, _commitment) =
-            encrypt_event(&group_key, prefix, plaintext, EventPrivacy::LimitedKnowledge)
-                .unwrap();
+        let (tag, ciphertext, nonce, _commitment) = encrypt_event(
+            &group_key,
+            prefix,
+            plaintext,
+            EventPrivacy::LimitedKnowledge,
+        )
+        .unwrap();
 
         // Reconstruct combined ciphertext||tag for simple decrypt (no AAD)
         // Note: simple decrypt uses empty AAD, so this will fail because
         // encrypt uses prefix as AAD. Use decrypt_event_full instead.
-        let decrypted =
-            decrypt_event_full(&group_key, &nonce, &tag, &ciphertext, prefix).unwrap();
+        let decrypted = decrypt_event_full(&group_key, &nonce, &tag, &ciphertext, prefix).unwrap();
 
         assert_eq!(decrypted, plaintext);
     }
@@ -475,14 +478,20 @@ mod tests {
         let group_key = [0x42u8; 32];
         let plaintext = b"sensitive data";
 
-        let (tag, ciphertext, nonce, _) =
-            encrypt_event(&group_key, "prefix-a", plaintext, EventPrivacy::ZeroKnowledge)
-                .unwrap();
+        let (tag, ciphertext, nonce, _) = encrypt_event(
+            &group_key,
+            "prefix-a",
+            plaintext,
+            EventPrivacy::ZeroKnowledge,
+        )
+        .unwrap();
 
         // Decrypt with wrong prefix must fail
-        let result =
-            decrypt_event_full(&group_key, &nonce, &tag, &ciphertext, "prefix-b");
-        assert!(result.is_err(), "cross-prefix decryption must fail due to AAD mismatch");
+        let result = decrypt_event_full(&group_key, &nonce, &tag, &ciphertext, "prefix-b");
+        assert!(
+            result.is_err(),
+            "cross-prefix decryption must fail due to AAD mismatch"
+        );
     }
 
     #[test]
@@ -589,10 +598,12 @@ mod tests {
             encrypt_event(&group_key, prefix, b"", EventPrivacy::ZeroKnowledge).unwrap();
 
         assert!(check_key_commitment(&group_key, &nonce, &commitment));
-        assert!(ciphertext.is_empty(), "empty plaintext produces empty ciphertext body");
+        assert!(
+            ciphertext.is_empty(),
+            "empty plaintext produces empty ciphertext body"
+        );
 
-        let decrypted =
-            decrypt_event_full(&group_key, &nonce, &tag, &ciphertext, prefix).unwrap();
+        let decrypted = decrypt_event_full(&group_key, &nonce, &tag, &ciphertext, prefix).unwrap();
         assert!(decrypted.is_empty());
     }
 
@@ -609,8 +620,13 @@ mod tests {
         assert_eq!(dec_zk, plaintext);
 
         // LimitedKnowledge mode
-        let (tag_lk, ct_lk, nonce_lk, _) =
-            encrypt_event(&group_key, prefix, plaintext, EventPrivacy::LimitedKnowledge).unwrap();
+        let (tag_lk, ct_lk, nonce_lk, _) = encrypt_event(
+            &group_key,
+            prefix,
+            plaintext,
+            EventPrivacy::LimitedKnowledge,
+        )
+        .unwrap();
         let dec_lk = decrypt_event_full(&group_key, &nonce_lk, &tag_lk, &ct_lk, prefix).unwrap();
         assert_eq!(dec_lk, plaintext);
     }
