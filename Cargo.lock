@@ -7005,6 +7005,7 @@ dependencies = [
  "bytes",
  "capnp",
  "capnpc",
+ "chacha20poly1305",
  "chrono",
  "ciborium",
  "coset",
