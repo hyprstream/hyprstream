@@ -26,6 +26,10 @@ pub mod key_subject_resolver;
 pub mod scope;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod scope_registry;
+/// UCAN → Casbin/TE compiler foundation (S5, #571): the UCAN token model,
+/// delegation-chain + ceiling/attenuation validation, and the signed
+/// `(UCAN, bundle_hash)` approval binding (hybrid EdDSA + ML-DSA-65 COSE).
+pub mod ucan;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use atproto_perimeter::{AtprotoPerimeterGateway, Ed25519Vk, EnrolledPeer, EnrollmentStore, IdentityKeys, IdentityResolver, MlDsaVk};
@@ -47,3 +51,7 @@ pub use key_subject_resolver::{KeySubjectResolver, set_global as set_global_key_
 pub use scope::Scope;
 #[cfg(not(target_arch = "wasm32"))]
 pub use scope_registry::ScopeDefinition;
+pub use ucan::{
+    set_attenuates, Ability, ApprovalBinding, ApprovalError, Capability, CaveatValue, Caveats,
+    ChainError, Did, Resource, SignedApproval, Ucan, UcanError, UcanPayload, UcanVerifier,
+};
