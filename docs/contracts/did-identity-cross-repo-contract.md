@@ -74,3 +74,9 @@ hyprstream publishes extra `service` entries (`type: "IrohTransport"` / `"QuicTr
 
 ---
 *Maintained by the hyprstream identity owner (pane 1:3.0). Frontend sync: pane 1:6.0.*
+
+## 9. Resolved edge cases (frontend ↔ canonical)
+- **Missing `#atproto_pds`:** **HARD-ERROR (fail-closed).** Do not fall back to another typed `serviceEndpoint` for the PDS.
+- **Service precedence:** `#atproto_pds` (`type: AtprotoPersonalDataServer`) is the **sole atproto-canonical PDS** service; hyprstream emits it **first** (`did_document.rs`: "atproto PDS first, then legacy HyprstreamService"). **`HyprstreamService` is legacy** — prefer `#atproto_pds`, do not prefer it. `serviceEndpoint` is **origin-only** (scheme+host+port).
+- **Path-based `did:web`:** enforce **`doc.id === requested DID`** (anti-spoof); **percent-encode the port** (`did:web:example.com%3A6791:users:alice` → `https://example.com:6791/users/alice/did.json`); path form uses `/<path>/did.json` (`.well-known` only when there is no path).
+- **`did:plc` directory base:** **configurable, default `https://plc.directory`.** hyprstream does not resolve `did:plc` (the frontend owns it); pin the default, allow override for self-hosted/dev/federation.
