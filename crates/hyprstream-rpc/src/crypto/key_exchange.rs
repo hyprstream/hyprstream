@@ -197,7 +197,88 @@ pub fn derive_stream_keys(
     // Zeroize IKM containing the shared secret (mirrors derive_notification_keys).
     ikm.zeroize();
 
-    Ok(StreamKeys::with_ctrl(topic, mac_key, enc_key, ctrl_topic, ctrl_mac_key))
+    Ok(StreamKeys::with_ctrl(
+        topic,
+        mac_key,
+        enc_key,
+        ctrl_topic,
+        ctrl_mac_key,
+    ))
+}
+
+// ============================================================================
+// Hybrid post-quantum stream key agreement (S3 #554, epic #550)
+// ============================================================================
+//
+// Replaces the classical Ristretto255/X25519 stream DH with the S0 hybrid
+// multi-KEM (`crate::crypto::hybrid_kem`). The combiner secret is already
+// transcript-bound (it mixes every component ciphertext + recipient ek) and is
+// fed into `derive_stream_keys` as the IKM. The two 32-byte salt halves that
+// `derive_stream_keys` expects are domain-separated digests of the client public
+// material and the server ciphertexts — guaranteed distinct (different labels) so
+// the self-connection check never trips.
+//
+// Direction: stream data flows server -> client, so the CLIENT is the KEM
+// recipient (it decapsulates). The client sends a fresh ephemeral
+// `RecipientPublic` (forward secrecy via the ephemeral X25519 + ML-KEM legs); the
+// server encapsulates and returns the ciphertexts in `StreamInfo`.
+
+const HYBRID_CLIENT_SALT_CTX: &str = "hyprstream hybrid-stream client v1";
+const HYBRID_SERVER_SALT_CTX: &str = "hyprstream hybrid-stream server v1";
+
+/// Domain-separated 32-byte digest of handshake transcript bytes (a salt half
+/// for [`derive_stream_keys`]).
+fn hybrid_salt(label: &str, bytes: &[u8]) -> [u8; 32] {
+    derive_key(label, bytes)
+}
+
+/// Server side of the hybrid stream handshake (S3 #554).
+///
+/// `client_kem_public` is the client's encoded ephemeral
+/// [`RecipientPublic`](crate::crypto::hybrid_kem::RecipientPublic) from
+/// `RequestEnvelope.clientKemPublic`. Encapsulate to it, derive the stream keys
+/// from the hybrid combiner secret, and return the per-component ciphertexts to
+/// emit in `StreamInfo.kemCiphertexts`. Fail-closed on malformed/wrong-suite input.
+pub fn server_hybrid_stream_keys(
+    client_kem_public: &[u8],
+) -> EnvelopeResult<(crate::crypto::hybrid_kem::HybridKemMaterial, StreamKeys)> {
+    let client_pub = crate::crypto::hybrid_kem::RecipientPublic::decode(client_kem_public)
+        .map_err(|e| EnvelopeError::KeyExchange(format!("invalid client KEM public: {e}")))?;
+    let (material, secret) = crate::crypto::hybrid_kem::encapsulate_to(&client_pub)
+        .map_err(|e| EnvelopeError::KeyExchange(format!("hybrid encapsulate failed: {e}")))?;
+    let client_salt = hybrid_salt(HYBRID_CLIENT_SALT_CTX, client_kem_public);
+    let server_salt = hybrid_salt(HYBRID_SERVER_SALT_CTX, &material.encode());
+    let keys = derive_stream_keys(&secret, &client_salt, &server_salt)?;
+    Ok((material, keys))
+}
+
+/// Client side of the hybrid stream handshake (S3 #554).
+///
+/// Given the client's ephemeral
+/// [`RecipientKeypair`](crate::crypto::hybrid_kem::RecipientKeypair) and the
+/// server's encoded ciphertexts from `StreamInfo.kemCiphertexts`, decapsulate and
+/// derive the SAME [`StreamKeys`].
+pub fn client_hybrid_stream_keys(
+    keypair: &crate::crypto::hybrid_kem::RecipientKeypair,
+    kem_ciphertexts: &[u8],
+) -> EnvelopeResult<StreamKeys> {
+    let material = crate::crypto::hybrid_kem::HybridKemMaterial::decode(kem_ciphertexts)
+        .map_err(|e| EnvelopeError::KeyExchange(format!("invalid KEM ciphertexts: {e}")))?;
+    let secret = crate::crypto::hybrid_kem::decapsulate(keypair, &material)
+        .map_err(|e| EnvelopeError::KeyExchange(format!("hybrid decapsulate failed: {e}")))?;
+    let client_salt = hybrid_salt(HYBRID_CLIENT_SALT_CTX, &keypair.public().encode());
+    let server_salt = hybrid_salt(HYBRID_SERVER_SALT_CTX, kem_ciphertexts);
+    derive_stream_keys(&secret, &client_salt, &server_salt)
+}
+
+/// One-way epoch ratchet for long-lived streams (S3 #554 / #223).
+///
+/// Derive the next epoch's key from the current one via a one-way KDF: a
+/// compromise of the current epoch key cannot recover any earlier epoch (forward
+/// secrecy across rekeys). Bump `epoch`, ratchet the key, reset `seq` — keeping
+/// the `(epoch, seq)` AEAD nonce (see `crypto::cose_encrypt`) unique-forever.
+pub fn ratchet_stream_key(current: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    Zeroizing::new(derive_key("hyprstream stream ratchet v1", current))
 }
 
 // ============================================================================
@@ -540,9 +621,7 @@ mod ristretto_impl {
             .ok_or_else(|| EnvelopeError::KeyExchange("invalid blinding scalar".into()))?;
         let combined = secret.scalar() + r;
         if bool::from(combined.ct_eq(&Scalar::ZERO)) {
-            return Err(EnvelopeError::KeyExchange(
-                "combined scalar is zero".into(),
-            ));
+            return Err(EnvelopeError::KeyExchange("combined scalar is zero".into()));
         }
         let shared_point = their_pubkey.point() * combined;
         Ok(shared_point.compress().to_bytes())
@@ -555,7 +634,10 @@ mod ristretto_impl {
     /// Ristretto255 DH from raw scalar and pubkey bytes.
     ///
     /// Used by `BroadcastEncryptor` where typed key objects aren't available.
-    pub fn ristretto_dh_raw(secret_bytes: &[u8; 32], their_pub_bytes: &[u8; 32]) -> EnvelopeResult<[u8; 32]> {
+    pub fn ristretto_dh_raw(
+        secret_bytes: &[u8; 32],
+        their_pub_bytes: &[u8; 32],
+    ) -> EnvelopeResult<[u8; 32]> {
         let scalar = Scalar::from_canonical_bytes(*secret_bytes)
             .into_option()
             .ok_or_else(|| EnvelopeError::KeyExchange("invalid secret scalar".into()))?;
@@ -603,9 +685,9 @@ mod ristretto_impl {
             .ok_or_else(|| EnvelopeError::KeyExchange("invalid blinding scalar".into()))?;
         let compressed = CompressedRistretto::from_slice(subscriber_pub_bytes)
             .map_err(|_| EnvelopeError::KeyExchange("invalid subscriber pubkey length".into()))?;
-        let sub_point = compressed
-            .decompress()
-            .ok_or_else(|| EnvelopeError::KeyExchange("invalid subscriber ristretto point".into()))?;
+        let sub_point = compressed.decompress().ok_or_else(|| {
+            EnvelopeError::KeyExchange("invalid subscriber ristretto point".into())
+        })?;
         let blinded = sub_point + r * RISTRETTO_BASEPOINT_POINT;
         Ok(blinded.compress().to_bytes())
     }
@@ -613,9 +695,9 @@ mod ristretto_impl {
 
 #[cfg(not(feature = "fips"))]
 pub use ristretto_impl::{
-    blinded_dh, blinded_dh_raw, generate_ephemeral_keypair,
-    reconstruct_blinded_pub_raw, rerandomize_pubkey, ristretto_dh, ristretto_dh_raw,
-    RistrettoKeyExchange, RistrettoPublic, RistrettoSecret,
+    blinded_dh, blinded_dh_raw, generate_ephemeral_keypair, reconstruct_blinded_pub_raw,
+    rerandomize_pubkey, ristretto_dh, ristretto_dh_raw, RistrettoKeyExchange, RistrettoPublic,
+    RistrettoSecret,
 };
 
 // ============================================================================
@@ -827,7 +909,10 @@ mod tests {
         let mut invalid = [0u8; 32];
         invalid[31] = 0x80; // Set high bit - invalid for Ristretto
         let result = RistrettoPublic::from_bytes(&invalid);
-        assert!(result.is_none(), "Non-canonical encoding should be rejected");
+        assert!(
+            result.is_none(),
+            "Non-canonical encoding should be rejected"
+        );
     }
 
     #[cfg(not(feature = "fips"))]
@@ -874,9 +959,18 @@ mod tests {
         let keys1 = derive_stream_keys(&shared_secret, &client_pub, &server_pub)?;
         let keys2 = derive_stream_keys(&shared_secret, &client_pub, &server_pub)?;
 
-        assert_eq!(*keys1.enc_key, *keys2.enc_key, "enc_key must be deterministic");
-        assert_ne!(*keys1.enc_key, *keys1.mac_key, "enc_key must differ from mac_key");
-        assert_ne!(*keys1.enc_key, *keys1.ctrl_mac_key, "enc_key must differ from ctrl_mac_key");
+        assert_eq!(
+            *keys1.enc_key, *keys2.enc_key,
+            "enc_key must be deterministic"
+        );
+        assert_ne!(
+            *keys1.enc_key, *keys1.mac_key,
+            "enc_key must differ from mac_key"
+        );
+        assert_ne!(
+            *keys1.enc_key, *keys1.ctrl_mac_key,
+            "enc_key must differ from ctrl_mac_key"
+        );
         Ok(())
     }
 
@@ -1048,8 +1142,14 @@ mod tests {
 
         let keys = derive_stream_keys(&shared_secret, &client_pub, &server_pub)?;
 
-        assert_ne!(keys.topic, keys.ctrl_topic, "ctrl_topic must differ from data topic");
-        assert_ne!(*keys.mac_key, *keys.ctrl_mac_key, "ctrl_mac_key must differ from data mac_key");
+        assert_ne!(
+            keys.topic, keys.ctrl_topic,
+            "ctrl_topic must differ from data topic"
+        );
+        assert_ne!(
+            *keys.mac_key, *keys.ctrl_mac_key,
+            "ctrl_mac_key must differ from data mac_key"
+        );
         Ok(())
     }
 
@@ -1122,5 +1222,67 @@ mod tests {
         assert_ne!(client_keys.topic, client_keys.ctrl_topic);
         assert_ne!(*client_keys.mac_key, *client_keys.ctrl_mac_key);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod hybrid_stream_tests {
+    use super::*;
+    use crate::crypto::hybrid_kem::{generate_recipient, SuiteId};
+
+    #[test]
+    fn hybrid_stream_handshake_roundtrip() {
+        // Client makes a fresh ephemeral hybrid keypair + sends its public; server
+        // encapsulates + derives keys; client decapsulates + derives the SAME keys.
+        let client_kp = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        let client_pub_enc = client_kp.public().encode();
+
+        let (material, server_keys) = server_hybrid_stream_keys(&client_pub_enc).unwrap();
+        let client_keys = client_hybrid_stream_keys(&client_kp, &material.encode()).unwrap();
+
+        assert_eq!(server_keys.topic, client_keys.topic);
+        assert_eq!(*server_keys.mac_key, *client_keys.mac_key);
+        assert_eq!(*server_keys.enc_key, *client_keys.enc_key);
+        assert_eq!(server_keys.ctrl_topic, client_keys.ctrl_topic);
+        assert_eq!(*server_keys.ctrl_mac_key, *client_keys.ctrl_mac_key);
+    }
+
+    #[test]
+    fn hybrid_stream_wrong_keypair_diverges() {
+        let client_kp = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        let (material, server_keys) =
+            server_hybrid_stream_keys(&client_kp.public().encode()).unwrap();
+        // A different keypair → different decapsulated secret (ML-KEM implicit
+        // rejection + different X25519 DH) AND a different transcript salt → keys diverge.
+        let other_kp = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        let other_keys = client_hybrid_stream_keys(&other_kp, &material.encode()).unwrap();
+        assert_ne!(server_keys.topic, other_keys.topic);
+        assert_ne!(*server_keys.mac_key, *other_keys.mac_key);
+    }
+
+    #[test]
+    fn hybrid_stream_rejects_malformed_client_public() {
+        // Fail-closed: a classical-only / missing / garbage clientKemPublic is rejected.
+        assert!(server_hybrid_stream_keys(b"not a recipient public").is_err());
+        assert!(server_hybrid_stream_keys(&[]).is_err());
+    }
+
+    #[test]
+    fn hybrid_stream_rejects_malformed_ciphertexts() {
+        let client_kp = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        assert!(client_hybrid_stream_keys(&client_kp, b"garbage").is_err());
+        assert!(client_hybrid_stream_keys(&client_kp, &[]).is_err());
+    }
+
+    #[test]
+    fn epoch_ratchet_is_one_way_and_deterministic() {
+        let k0 = [7u8; 32];
+        let k1 = ratchet_stream_key(&k0);
+        let k1b = ratchet_stream_key(&k0);
+        assert_eq!(*k1, *k1b, "ratchet must be deterministic");
+        assert_ne!(*k1, k0, "ratchet must advance the key");
+        let k2 = ratchet_stream_key(&k1);
+        assert_ne!(*k2, *k1, "each epoch key differs");
     }
 }
