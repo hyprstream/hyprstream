@@ -44,6 +44,7 @@ pub mod error;
 pub mod events;
 pub mod git;
 pub mod inference;
+pub mod mac;
 pub mod runtime;
 pub mod schema;
 pub mod server;
