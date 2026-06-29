@@ -38,6 +38,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `cargo test -p hyprstream-sandbox` transitively builds hyprstream-rpc,
+      # whose build.rs invokes the `capnp` compiler. (The guest builds above don't
+      # need it, but the test step does.) Mirrors rust.yml's wasm-job deps.
+      - name: Install system deps (capnproto)
+        run: sudo apt-get update && sudo apt-get install -y capnproto pkg-config libssl-dev
+
       - name: Install Rust toolchain (host + wasm targets)
         uses: dtolnay/rust-toolchain@stable
         with:
