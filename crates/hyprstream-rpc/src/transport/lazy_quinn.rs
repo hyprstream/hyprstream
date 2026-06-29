@@ -197,7 +197,7 @@ mod tests {
     /// server cert's SHA-256 pin, and a shutdown token. (Mirrors the harness in
     /// `quinn_transport::tests`; `build_server` there is test-private.)
     fn spawn_echo_server() -> (SocketAddr, [u8; 32], CancellationToken) {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::transport::pq_provider::install_pq_crypto_provider();
 
         let cert_key =
             rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();

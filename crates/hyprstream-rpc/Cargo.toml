@@ -110,7 +110,7 @@ n0-error = "=1.0.0-rc.0"
 # QUIC transport (HTTP/3 + WebTransport + ZMTP over QUIC)
 quinn = { workspace = true }
 rcgen = { workspace = true }
-rustls = { workspace = true, features = ["ring"] }
+rustls = { workspace = true, features = ["ring", "aws_lc_rs"] }
 h3 = { workspace = true }
 h3-quinn = { workspace = true }
 h3-webtransport = { workspace = true }

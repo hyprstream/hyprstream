@@ -68,7 +68,7 @@ fn build_server() -> Result<(web_transport_quinn::Server, std::net::SocketAddr, 
 /// ever learns the other's address.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn moq_relay_rendezvous() -> Result<()> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    hyprstream_rpc::transport::install_pq_crypto_provider();
 
     // ── RELAY: a bidirectional /moq endpoint (ingest + re-serve), no keys ──────
     // Its origin starts EMPTY — the broadcast exists only on the producer until
@@ -228,7 +228,7 @@ async fn moq_relay_rendezvous() -> Result<()> {
 /// learn or dial the producer's direct address.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn relay_choice_only_anonymizes_stream_end_to_end() -> Result<()> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    hyprstream_rpc::transport::install_pq_crypto_provider();
 
     // ── RELAY: bidirectional /moq endpoint, no keys (same as rendezvous) ───────
     let relay_producer = moq_net::Origin::random().produce();

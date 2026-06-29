@@ -1309,12 +1309,14 @@ pub fn cert_hash(cert_der: &[u8]) -> String {
 // TLS Helpers
 // ============================================================================
 
-/// Install the ring crypto provider for rustls (required for QUIC/TLS).
+/// Install the PQ-hybrid (aws-lc-rs, X25519MLKEM768) crypto provider for rustls
+/// (required for QUIC/TLS), replacing the former ring provider (#557 / S6).
 ///
 /// Must be called before creating any rustls `ServerConfig` or quinn endpoint.
-/// No-op if already installed (safe to call multiple times).
+/// No-op if already installed (safe to call multiple times). See
+/// [`crate::transport::pq_provider`].
 pub fn ensure_crypto_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    crate::transport::pq_provider::install_pq_crypto_provider();
 }
 
 /// Generate a self-signed TLS certificate for development/testing.
