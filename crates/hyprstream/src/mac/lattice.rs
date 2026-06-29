@@ -57,6 +57,7 @@ pub fn ifc_join(inputs: &[SecurityLabel]) -> SecurityLabel {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

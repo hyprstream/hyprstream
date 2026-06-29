@@ -1,11 +1,11 @@
 //! Compiled-policy distribution + signing (S4 / #570).
 //!
-//! The PolicyService (PDP authority) compiles policy into a [`CompiledPolicy`] (the TE matrix
-//! + the lattice generation it is valid for), serializes it canonically, hashes it, and signs
-//! `(generation, policy_hash)` with the hybrid COSE composite (EdDSA + ML-DSA-65; design §13a,
-//! §14). Nodes (PEPs) load the signed artifact and the [`PolicyLoader`] **rejects any policy
-//! whose signature does not verify** and (per design §14 / S5 containment backstop) whose hash
-//! does not match an approval.
+//! The PolicyService (PDP authority) compiles policy into a [`CompiledPolicy`] (the TE
+//! matrix plus the lattice generation it is valid for), serializes it canonically, hashes
+//! it, and signs `(generation, policy_hash)` with the hybrid COSE composite (EdDSA +
+//! ML-DSA-65; design §13a, §14). Nodes (PEPs) load the signed artifact and the
+//! [`PolicyLoader`] **rejects any policy whose signature does not verify** and (per design
+//! §14 / S5 containment backstop) whose hash does not match an approval.
 //!
 //! This module is the *transport/verification* boundary; the per-op hot path (`te` + `avc`)
 //! never touches it. Signature verification happens **once at load**, never per op (design §7,
