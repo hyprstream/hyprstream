@@ -3,10 +3,12 @@
 //! This is ticket **S4 (#570)** of the native-MAC security epic (#547): the data-plane
 //! authorization engine. It implements, against an assumed S1 lattice interface:
 //!
-//! - [`lattice`] — the **assumed S1 contract** (`Lattice` trait + `SecurityLabel`). S1 (#567)
-//!   owns the real implementation; everything here is built against the trait so the two
-//!   streams reconcile by S1 satisfying the documented `S1-ASSUMPTION` notes. Ships a clearly
-//!   marked `StubLinearLattice` so S4 is testable before S1 lands.
+//! - [`lattice`] — a thin **re-export of S1's canonical types** (#567): the structured
+//!   `SecurityLabel` (Level × Assurance × CompartmentSet, `Copy + Ord + Hash`, no `Default`),
+//!   the `Lattice` *policy object* (closed compartment name↔bit vocabulary, versioned), and
+//!   `SecurityContext`. Dominance/join are INTRINSIC to the label, not trait methods — the
+//!   PDP floor calls them directly. (The original S4 stub lattice was deleted at
+//!   reconciliation; see the `lattice` module docs.)
 //! - [`te`] — the **type-enforcement evaluator**: a TOTAL, default-deny
 //!   `(subject_ctx, object_label, action) → Decision` over the compiled TE matrix AND the
 //!   independent lattice floor. Small + verifiable. This is the PDP core.
@@ -47,7 +49,8 @@
 //! ## TCB note
 //!
 //! The per-op TCB is intentionally tiny: a hash lookup ([`avc`]), and on a miss a set lookup
-//! plus one lattice `dominates` call ([`te`]). All heavy/bug-prone logic (Casbin matching,
+//! plus one intrinsic `SecurityLabel::dominates` call ([`te`]). All heavy/bug-prone logic
+//! (Casbin matching,
 //! UCAN chain validation, compilation, signature verification) is concentrated off the hot
 //! path — in PolicyService and the [`compiled`] loader, the one audited place (design §2).
 
@@ -62,8 +65,14 @@ pub use compiled::{
     sign_policy, CompiledPolicy, PolicyApproval, PolicyDistError, PolicyLoader, PolicySigner,
     PolicyVerifier, SignedPolicy,
 };
-pub use lattice::{ifc_join, Lattice, SecurityLabel};
+// Lattice surface is now S1's canonical types (#567), re-exported through `lattice` so the
+// PDP has one import path. `ifc_join` is the local forwarder over the intrinsic join.
+pub use lattice::{
+    ifc_join, Assurance, Compartment, CompartmentSet, LabelError, Lattice, LatticeCodecError,
+    LatticeDecodeError, LatticeVersion, Level, SecurityContext, SecurityLabel,
+    SubjectContextClaims, VerifiedKeyMaterial, MAX_COMPARTMENTS,
+};
 pub use te::{
-    Action, Decision, LatticeTeEvaluator, ObjectCtx, ObjectType, SubjectCtx, SubjectType,
-    TeEvaluator, TeMatrix, TeRule,
+    Action, Decision, LatticeTeEvaluator, ObjectCtx, ObjectType, ScopeAction, SubjectCtx,
+    SubjectType, TeEvaluator, TeMatrix, TeRule,
 };

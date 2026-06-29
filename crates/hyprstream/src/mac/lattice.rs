@@ -1,184 +1,123 @@
-//! Lattice interface — the **assumed S1 contract** (ticket #567/S1 owns the impl).
+//! Lattice surface for the PDP — **re-export of S1's canonical types** (#567).
 //!
-//! S4 (this ticket, #570) develops the TE evaluator + AVC against this interface so the
-//! two streams can proceed in parallel. EVERYTHING in this file marked `S1-ASSUMPTION`
-//! is a requirement the S1 lattice implementation must satisfy for reconciliation. If S1
-//! lands a different shape, only this file changes — `te.rs` / `avc.rs` depend solely on
-//! the traits/types declared here.
+//! S4 (#570) originally developed the TE evaluator + AVC against a *stub* lattice
+//! (`StubLinearLattice` + a local `SecurityLabel(u32)` + a `Lattice` dominance
+//! trait) so the two streams could proceed in parallel. **S1 has landed**
+//! (`feature/security-mac-ucan` @ `406ff9fdc`) with the real, canonical types in
+//! [`hyprstream_rpc::auth::mac`], and this file is now a thin re-export so the rest
+//! of the PDP (`te.rs`, `avc.rs`, `compiled.rs`) consumes S1 directly. The stub is
+//! deleted.
 //!
-//! ## The contract S1 must satisfy
+//! ## What changed at reconciliation (the S1 contract, as landed)
 //!
-//! 1. A [`SecurityLabel`] is a small, cheap-to-clone, content-bound identifier for a point
-//!    in the lattice. It is `Copy` (a compact id), `Ord`+`Hash` (so it can key the AVC and
-//!    the compiled TE matrix), and totally serializable.
-//! 2. The lattice is a *partial* order with a [`Lattice::dominates`] (`⊒`) test and a
-//!    [`Lattice::join`] (least-upper-bound, for IFC of derived layers). Both are TOTAL —
-//!    defined for every pair of labels the lattice knows — and never panic.
-//! 3. There is a designated **bottom** (public / least-classified) and the lattice can
-//!    report whether a raw label id is *known* ([`Lattice::is_known`]). An unknown label is
-//!    treated as denied by the floor (design §1 invariant 2: unlabeled = denied).
+//! - [`SecurityLabel`] is no longer an opaque `u32` interned id. It is S1's
+//!   **structured value** — a point in the product lattice
+//!   `Level × Assurance × CompartmentSet` — and is `Copy + Ord + Hash`
+//!   (compartments are a packed `u64` bitset), so it still keys the AVC directly
+//!   with no interning indirection. Crucially it has **no `Default`**: an
+//!   unlabeled subject/object is `Option::None` ⇒ deny, never a permissive
+//!   default.
+//! - Dominance (`⊒`) and join (`⊔`) are **intrinsic** to the value
+//!   ([`SecurityLabel::dominates`], [`SecurityLabel::join`] /
+//!   [`SecurityLabel::join_all`]), and re-exposed on
+//!   [`SecurityContext::dominates`] for a verified subject. They are NOT methods
+//!   on a `Lattice` trait — content truth, no policy argument. The old
+//!   `Lattice::dominates`/`join` trait is gone; the PDP floor now calls the
+//!   intrinsic order (see `te.rs`).
+//! - [`Lattice`] is now S1's **policy object** (the closed, versioned compartment
+//!   name↔bit vocabulary). The PDP holds it to (a) align its TE matrix columns to
+//!   the exact bits a label carries via [`Lattice::compartment_names`], (b)
+//!   [`validate`](Lattice::validate) labels at enrollment/seal, and (c) embed it,
+//!   via [`Lattice::to_bytes`], inside the signed `CompiledPolicy` so every
+//!   process reconstructs the **identical** bit map ([`compiled`](crate::mac::compiled)).
+//!   [`LatticeVersion`] is bound to `CompiledPolicy.generation`.
 //!
-//! The MAC floor (per-op `subject.ctx ⊒ object.label` + IFC join) is computed against this
-//! trait and is **independent of any grant/token/UCAN** (design §3, §10).
+//! The MAC floor (per-op `subject.ctx ⊒ object.label` + IFC join) is computed
+//! against the intrinsic order and is **independent of any grant/token/UCAN**
+//! (design §3, §10).
 
-use serde::{Deserialize, Serialize};
-use std::fmt;
+// Re-export S1's canonical MAC types from the RPC crate (the TCB seam). Everything
+// the PDP needs flows through here so a future S1 shape change is a one-file edit.
+pub use hyprstream_rpc::auth::mac::{
+    Assurance, Compartment, CompartmentSet, LabelError, Lattice, LatticeCodecError,
+    LatticeDecodeError, LatticeVersion, Level, SecurityContext, SecurityLabel,
+    SubjectContextClaims, VerifiedKeyMaterial, MAX_COMPARTMENTS,
+};
 
-/// Compact, content-bound identifier for a point in the security lattice.
-///
-/// S1-ASSUMPTION: a label is representable as a `u32` interned id (one per distinct
-/// MLS-level×compartment-set or type-lattice point). The actual semantic content (level +
-/// compartments) lives in the S1 lattice; the evaluator/AVC only ever compare *ids* on the
-/// hot path — comparing structured labels per op would blow the latency budget.
-///
-/// `0` is reserved for [`SecurityLabel::BOTTOM`] (public / least). The interner is owned by
-/// S1; ids are stable for the lifetime of a compiled policy generation (see
-/// `compiled::CompiledPolicy::generation`).
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
-#[serde(transparent)]
-pub struct SecurityLabel(pub u32);
-
-impl SecurityLabel {
-    /// The bottom of the lattice (public / least-classified). Dominated by everything.
-    pub const BOTTOM: SecurityLabel = SecurityLabel(0);
-
-    /// Raw interned id.
-    #[inline]
-    pub const fn id(self) -> u32 {
-        self.0
-    }
-}
-
-impl fmt::Display for SecurityLabel {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "L{}", self.0)
-    }
-}
-
-/// The lattice engine S1 provides: dominance (`⊒`) + IFC join (least-upper-bound).
-///
-/// S1-ASSUMPTION: implementations are pure, total, deterministic, and `Send + Sync`. No
-/// method allocates on the hot path beyond what's stated, and none panics for any input —
-/// unknown ids fail closed (see [`Lattice::dominates`]).
-pub trait Lattice: Send + Sync {
-    /// `clearance ⊒ label` — does the subject clearance dominate (is at least as high as)
-    /// the object label? This is the MAC floor's core comparison (design §3 per-op
-    /// dominance, §13 "exact lattice comparison").
-    ///
-    /// S1-ASSUMPTION: TOTAL. For two *known* labels returns the exact partial-order
-    /// result. If EITHER label is unknown to this lattice generation, MUST return `false`
-    /// (fail closed — unlabeled = denied, design §1 invariant 2). Never panics.
-    fn dominates(&self, clearance: SecurityLabel, label: SecurityLabel) -> bool;
-
-    /// IFC join — least upper bound of two labels (design §3: a derived layer's label =
-    /// join(inputs); aggregation can't launder classification).
-    ///
-    /// S1-ASSUMPTION: TOTAL and well-defined for every known pair (the lattice has a top,
-    /// or joins are closed). If either input is unknown, MUST return the lattice **top**
-    /// (the most restrictive label) so an unknown input can only *raise* classification,
-    /// never lower it. Returned label is always known.
-    fn join(&self, a: SecurityLabel, b: SecurityLabel) -> SecurityLabel;
-
-    /// Whether `label` is a known point in *this* lattice generation. Used by the floor to
-    /// reject unlabeled subjects/objects before any grant logic runs.
-    ///
-    /// S1-ASSUMPTION: `is_known(SecurityLabel::BOTTOM)` is always `true`.
-    fn is_known(&self, label: SecurityLabel) -> bool;
-
-    /// The lattice top (most restrictive / highest). Used as the fail-closed join result.
-    ///
-    /// S1-ASSUMPTION: dominated-by-nothing-below; `dominates(top, x) == true` for all known
-    /// `x`.
-    fn top(&self) -> SecurityLabel;
-}
-
-/// IFC convenience: join a slice of input labels into the derived label (design §3 — sealed
-/// at rollup). Folds with [`Lattice::join`]; empty input yields BOTTOM. This is the function
-/// S6/seal-time labeling calls; it lives here because it is pure lattice algebra.
-pub fn ifc_join<L: Lattice + ?Sized>(lattice: &L, inputs: &[SecurityLabel]) -> SecurityLabel {
-    inputs
-        .iter()
-        .copied()
-        .fold(SecurityLabel::BOTTOM, |acc, x| lattice.join(acc, x))
-}
-
-// ---------------------------------------------------------------------------------------
-// A minimal in-tree lattice so S4 is testable/runnable BEFORE S1 lands. This is a STUB:
-// a flat MLS chain (BOTTOM=0 ⊑ 1 ⊑ 2 ⊑ ...) with no compartments. S1 replaces it. The TE
-// evaluator and AVC never reference this type — only the `Lattice` trait — so swapping in
-// S1's implementation is a one-line change at construction sites.
-// ---------------------------------------------------------------------------------------
-
-/// Stub linear-order lattice for S4-local testing. **Replace with S1.**
-///
-/// Levels `0..=max` form a total chain; `dominates(a,b) = a >= b`; `join(a,b) = max(a,b)`.
-/// No compartments, no real type lattice. Marked clearly so it is not mistaken for the real
-/// engine.
-#[derive(Debug, Clone)]
-pub struct StubLinearLattice {
-    max_level: u32,
-}
-
-impl StubLinearLattice {
-    /// Levels `0..=max_level` are known.
-    pub fn new(max_level: u32) -> Self {
-        Self { max_level }
-    }
-}
-
-impl Lattice for StubLinearLattice {
-    fn dominates(&self, clearance: SecurityLabel, label: SecurityLabel) -> bool {
-        if !self.is_known(clearance) || !self.is_known(label) {
-            return false; // fail closed
-        }
-        clearance.0 >= label.0
-    }
-
-    fn join(&self, a: SecurityLabel, b: SecurityLabel) -> SecurityLabel {
-        if !self.is_known(a) || !self.is_known(b) {
-            return self.top(); // fail closed — unknown can only raise
-        }
-        SecurityLabel(a.0.max(b.0))
-    }
-
-    fn is_known(&self, label: SecurityLabel) -> bool {
-        label.0 <= self.max_level
-    }
-
-    fn top(&self) -> SecurityLabel {
-        SecurityLabel(self.max_level)
-    }
+/// IFC convenience: join a slice of input labels into the derived label (design
+/// §3 — sealed at rollup). Thin forwarder over S1's intrinsic
+/// [`SecurityLabel::join_all`]; an empty input yields the lattice bottom ⊥ (the
+/// join identity), which the seal/rollup policy (S2) must treat as suspicious. This
+/// is the function S6/seal-time labeling calls; it lives here so PDP callers have a
+/// single entry-point without reaching across crates.
+#[inline]
+#[must_use]
+pub fn ifc_join(inputs: &[SecurityLabel]) -> SecurityLabel {
+    SecurityLabel::join_all(inputs.iter())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn stub_dominance_is_chain() {
-        let l = StubLinearLattice::new(3);
-        assert!(l.dominates(SecurityLabel(2), SecurityLabel(1)));
-        assert!(l.dominates(SecurityLabel(1), SecurityLabel(1)));
-        assert!(!l.dominates(SecurityLabel(1), SecurityLabel(2)));
+    fn lattice() -> Lattice {
+        Lattice::new(
+            LatticeVersion(1),
+            [
+                Compartment::new("pii"),
+                Compartment::new("finance"),
+                Compartment::new("tenant:acme"),
+            ],
+        )
     }
 
     #[test]
-    fn unknown_label_fails_closed() {
-        let l = StubLinearLattice::new(3);
-        // 9 is unknown -> dominates must be false either way (fail closed)
-        assert!(!l.dominates(SecurityLabel(9), SecurityLabel(1)));
-        assert!(!l.dominates(SecurityLabel(3), SecurityLabel(9)));
-        // join with unknown returns top
-        assert_eq!(l.join(SecurityLabel(9), SecurityLabel(1)), l.top());
+    fn intrinsic_dominance_is_product_order() {
+        let l = lattice();
+        let cleared = l
+            .label(
+                Level::Secret,
+                Assurance::PqHybrid,
+                [Compartment::new("pii"), Compartment::new("finance")],
+            )
+            .unwrap();
+        let needs_pii = l
+            .label(Level::Confidential, Assurance::Classical, [Compartment::new("pii")])
+            .unwrap();
+        // dominates on every axis (level ≥, assurance ≥, compartments ⊇).
+        assert!(cleared.dominates(&needs_pii));
+        assert!(!needs_pii.dominates(&cleared));
     }
 
     #[test]
-    fn ifc_join_raises_to_max() {
-        let l = StubLinearLattice::new(3);
-        let labels = [SecurityLabel(1), SecurityLabel(3), SecurityLabel(2)];
-        assert_eq!(ifc_join(&l, &labels), SecurityLabel(3));
-        assert_eq!(ifc_join(&l, &[]), SecurityLabel::BOTTOM);
+    fn ifc_join_raises_to_lub() {
+        let l = lattice();
+        let secret = l
+            .label(Level::Secret, Assurance::PqHybrid, [Compartment::new("pii")])
+            .unwrap();
+        let public = l
+            .label(Level::Public, Assurance::Classical, [])
+            .unwrap();
+        let derived = ifc_join(&[secret, public]);
+        assert_eq!(derived.level, Level::Secret);
+        assert_eq!(derived.assurance, Assurance::PqHybrid);
+        assert!(derived.dominates(&secret));
+        assert!(derived.dominates(&public));
+        // empty input folds to the join identity ⊥.
+        assert!(ifc_join(&[]).is_bottom());
+    }
+
+    #[test]
+    fn lattice_validate_and_bytes_roundtrip() {
+        // The desync-proof property compiled.rs relies on: same bytes → identical
+        // bit assignment in every process.
+        let l = lattice();
+        let restored = Lattice::from_bytes(&l.to_bytes()).unwrap();
+        assert_eq!(restored.compartment_names(), l.compartment_names());
+        let label = l
+            .label(Level::Internal, Assurance::Classical, [Compartment::new("tenant:acme")])
+            .unwrap();
+        assert!(restored.validate(&label).is_ok());
+        assert_eq!(restored.bit_of(&Compartment::new("tenant:acme")), Some(2));
     }
 }

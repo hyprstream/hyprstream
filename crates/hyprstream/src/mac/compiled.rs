@@ -22,25 +22,58 @@
 //! no crypto dependency and so tests can use a trivial signer. The production wiring (using
 //! `MlDsaSigningKeyStore` + Ed25519) is in [`cose`].
 
+use crate::mac::lattice::{Lattice, LatticeCodecError};
 use crate::mac::te::TeMatrix;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// A compiled, distributable policy artifact: the TE matrix plus the lattice generation it is
-/// valid against. `generation` ties the matrix to a specific lattice generation (S1) AND is
-/// the AVC's cache-invalidation key — bumping it invalidates every cached decision.
+/// A compiled, distributable policy artifact: the TE matrix, **the S1 lattice it was
+/// compiled against (embedded verbatim)**, and the generation that binds them. `generation`
+/// ties the matrix to a specific lattice generation (S1) AND is the AVC's cache-invalidation
+/// key — bumping it invalidates every cached decision.
+///
+/// ## S1 reconciliation (#570): embed the lattice, bind the version (desync-proof)
+///
+/// The signed policy carries the lattice's **canonical CBOR bytes** ([`Lattice::to_bytes`] —
+/// the same codec the COSE signing path uses). Because those bytes are the closed
+/// compartment vocabulary in bit-index order, every process that loads this policy
+/// reconstructs the **identical** name↔bit map: same bytes in → identical bits out, so a
+/// [`SecurityLabel`](crate::mac::lattice::SecurityLabel)'s compartment bits mean the same
+/// thing in the compiler, the PDP, and every distributed AVC. The loader additionally
+/// enforces `lattice.version().generation() == generation` — a compiled matrix is valid
+/// ONLY against the lattice generation that minted its bit assignments.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledPolicy {
-    /// Monotonic policy generation. Must equal the lattice generation it was compiled
-    /// against (reconciliation point with S1 — see BLOCKER list).
+    /// Monotonic policy generation. Equals the embedded lattice's
+    /// [`LatticeVersion::generation`](crate::mac::lattice::LatticeVersion::generation)
+    /// (enforced at construction and re-checked on load).
     pub generation: u64,
     /// The compiled TE allow/escalate matrix (produced by S5's compiler).
     pub matrix: TeMatrix,
+    /// The S1 lattice policy, serialized to its canonical CBOR byte form. Embedded so the
+    /// PDP and every distributed AVC reconstruct an identical name↔bit vocabulary (no
+    /// cross-process compartment-bit desync). Reconstruct via [`CompiledPolicy::lattice`].
+    pub lattice_bytes: Vec<u8>,
 }
 
 impl CompiledPolicy {
-    pub fn new(generation: u64, matrix: TeMatrix) -> Self {
-        Self { generation, matrix }
+    /// Compile a policy against an S1 [`Lattice`]. The generation is taken from the lattice
+    /// version — they are definitionally equal (#570): the lattice that minted the
+    /// compartment bits IS the policy generation. The lattice is embedded verbatim (its
+    /// canonical CBOR bytes) so it travels inside the signature.
+    pub fn new(matrix: TeMatrix, lattice: &Lattice) -> Self {
+        Self {
+            generation: lattice.version().generation(),
+            matrix,
+            lattice_bytes: lattice.to_bytes(),
+        }
+    }
+
+    /// Reconstruct the embedded S1 [`Lattice`] from its canonical bytes. Fail-closed: a
+    /// malformed / tampered vocabulary (duplicate names, over-width) is rejected rather than
+    /// silently yielding a different lattice (the desync-proof property).
+    pub fn lattice(&self) -> Result<Lattice, LatticeCodecError> {
+        Lattice::from_bytes(&self.lattice_bytes)
     }
 
     /// Canonical bytes for hashing/signing. Deterministic: same policy → identical bytes
@@ -61,12 +94,15 @@ impl CompiledPolicy {
 
 /// Order-stable view of a [`CompiledPolicy`] for canonical encoding. The `TeMatrix` stores
 /// rules in `HashSet`s (O(1) hot-path lookup); for hashing we project to sorted vecs so the
-/// hash is deterministic regardless of set iteration order.
+/// hash is deterministic regardless of set iteration order. The embedded `lattice_bytes` are
+/// already canonical (S1's deterministic CBOR), so the policy hash binds the exact lattice
+/// vocabulary too — a tampered compartment map changes the hash and fails the signature.
 #[derive(Serialize, Deserialize)]
 struct CanonicalPolicy {
     generation: u64,
     allow: Vec<crate::mac::te::TeRule>,
     escalate: Vec<crate::mac::te::TeRule>,
+    lattice_bytes: Vec<u8>,
 }
 
 impl From<&CompiledPolicy> for CanonicalPolicy {
@@ -80,6 +116,7 @@ impl From<&CompiledPolicy> for CanonicalPolicy {
             generation: p.generation,
             allow,
             escalate,
+            lattice_bytes: p.lattice_bytes.clone(),
         }
     }
 }
@@ -187,13 +224,34 @@ impl<V: PolicyVerifier> PolicyLoader<V> {
             canonical.allow.iter().copied().collect(),
             canonical.escalate.iter().copied().collect(),
         );
-        let policy = CompiledPolicy::new(canonical.generation, matrix);
+        // Reassemble preserving the embedded lattice bytes verbatim (do NOT re-derive the
+        // generation here — we must round-trip the exact transmitted bytes to recompute the
+        // same hash; the generation/version binding is checked explicitly below).
+        let policy = CompiledPolicy {
+            generation: canonical.generation,
+            matrix,
+            lattice_bytes: canonical.lattice_bytes,
+        };
 
         // The out-of-band generation must match the signed-in generation (no mismatch routing).
         if policy.generation != signed.generation {
             return Err(PolicyDistError::GenerationMismatch {
                 outer: signed.generation,
                 inner: policy.generation,
+            });
+        }
+
+        // S1 reconciliation (#570): the embedded lattice must reconstruct (fail-closed on a
+        // tampered/over-width vocabulary) AND its version must equal the policy generation —
+        // a matrix is only valid against the lattice generation that minted its bits.
+        let lattice = policy
+            .lattice()
+            .map_err(|e| PolicyDistError::Decode(e.to_string()))?;
+        let lattice_gen = lattice.version().generation();
+        if lattice_gen != policy.generation {
+            return Err(PolicyDistError::LatticeGenerationMismatch {
+                policy: policy.generation,
+                lattice: lattice_gen,
             });
         }
 
@@ -236,6 +294,8 @@ pub enum PolicyDistError {
     NoMatchingApproval { generation: u64 },
     #[error("generation mismatch: outer={outer} inner={inner}")]
     GenerationMismatch { outer: u64, inner: u64 },
+    #[error("embedded lattice version {lattice} != policy generation {policy} (S1↔S4 bit-desync guard)")]
+    LatticeGenerationMismatch { policy: u64, lattice: u64 },
 }
 
 // ---------------------------------------------------------------------------------------
@@ -293,8 +353,10 @@ pub mod cose {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::mac::lattice::{Compartment, LatticeVersion};
     use crate::mac::te::{Action, ObjectType, SubjectType, TeRule};
     use std::collections::HashSet;
 
@@ -306,11 +368,20 @@ mod tests {
         }
     }
 
+    /// A lattice at the given generation/version (the bit-vocabulary the policy binds).
+    fn lattice(gen: u32) -> Lattice {
+        Lattice::new(
+            LatticeVersion(gen),
+            [Compartment::new("pii"), Compartment::new("finance")],
+        )
+    }
+
     fn policy(gen: u64) -> CompiledPolicy {
         let mut allow = HashSet::new();
         allow.insert(rule(1, 1, 1));
         allow.insert(rule(1, 2, 1));
-        CompiledPolicy::new(gen, TeMatrix::from_allow(allow))
+        // Generation is taken from the lattice version (they are definitionally equal).
+        CompiledPolicy::new(TeMatrix::from_allow(allow), &lattice(gen as u32))
     }
 
     /// A trivial HMAC-free stub signer for unit tests: signature = blake3(key || input).
@@ -350,9 +421,38 @@ mod tests {
         let mut b = HashSet::new();
         b.insert(rule(2, 3, 4));
         b.insert(rule(1, 1, 1));
-        let pa = CompiledPolicy::new(5, TeMatrix::from_allow(a));
-        let pb = CompiledPolicy::new(5, TeMatrix::from_allow(b));
+        let pa = CompiledPolicy::new(TeMatrix::from_allow(a), &lattice(5));
+        let pb = CompiledPolicy::new(TeMatrix::from_allow(b), &lattice(5));
         assert_eq!(pa.policy_hash().unwrap(), pb.policy_hash().unwrap());
+    }
+
+    #[test]
+    fn embedded_lattice_roundtrips_and_binds_generation() {
+        // #570 desync-proof: the policy carries the lattice; reconstruction yields the same
+        // bit vocabulary, and the version equals the generation.
+        let p = policy(4);
+        assert_eq!(p.generation, 4);
+        let l = p.lattice().unwrap();
+        assert_eq!(l.version().generation(), 4);
+        assert_eq!(l.bit_of(&Compartment::new("finance")), Some(1));
+    }
+
+    #[test]
+    fn loader_rejects_lattice_generation_mismatch() {
+        // Hand-craft a policy whose embedded lattice version disagrees with the generation:
+        // the loader must reject it (bit-desync guard), even with a valid signature.
+        let key = [7u8; 32];
+        let mut allow = HashSet::new();
+        allow.insert(rule(1, 1, 1));
+        let mut p = CompiledPolicy::new(TeMatrix::from_allow(allow), &lattice(2));
+        // Force a mismatch: claim generation 9 but the embedded lattice is version 2.
+        p.generation = 9;
+        let signed = sign_policy(&p, &StubSigner { key }).unwrap();
+        let loader = PolicyLoader::new(StubVerifier { key });
+        assert!(matches!(
+            loader.load(&signed),
+            Err(PolicyDistError::LatticeGenerationMismatch { policy: 9, lattice: 2 })
+        ));
     }
 
     #[test]

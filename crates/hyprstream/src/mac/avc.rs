@@ -13,10 +13,13 @@
 //!                                └miss→  evaluator.evaluate(...) ; insert ; return
 //! ```
 //!
-//! The cache KEY is `(generation, subject_type, clearance, object_type, label, action)` —
-//! all interned ids, so the key is `Copy` and hashes cheaply. We deliberately key on the
-//! *resolved interned context*, not on raw strings/paths: string matching (Casbin's job) is
-//! done once at compile time, never per op.
+//! The cache KEY is `(generation, subject_type, clearance, object_type, label, action)`. The
+//! TE types are interned ids and the `clearance`/`label` are S1's structured
+//! [`SecurityLabel`]s — which are `Copy + Hash` (a packed `level/assurance/u64-bitset`, S1
+//! confirmed cheap), so the whole key is `Copy` and hashes cheaply with **no dominance walk
+//! and no signature verify on a hit** (#570 requirement). We deliberately key on the
+//! *resolved context*, not on raw strings/paths: string matching (Casbin's job) is done once
+//! at compile time, never per op.
 //!
 //! ## Token = distributed AVC entry (design §2, §6)
 //!
@@ -237,9 +240,12 @@ impl<E: TeEvaluator> Avc for CachingAvc<E> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::mac::lattice::{SecurityLabel, StubLinearLattice};
+    use crate::mac::lattice::{
+        Assurance, Compartment, CompartmentSet, Lattice, LatticeVersion, Level, SecurityLabel,
+    };
     use crate::mac::te::{LatticeTeEvaluator, TeMatrix, TeRule};
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -252,33 +258,47 @@ mod tests {
             action: Action(a),
         }
     }
-    fn subj(t: u32, clr: u32) -> SubjectCtx {
-        SubjectCtx { subject_type: SubjectType(t), clearance: SecurityLabel(clr) }
-    }
-    fn obj(t: u32, lbl: u32) -> ObjectCtx {
-        ObjectCtx { object_type: ObjectType(t), label: SecurityLabel(lbl) }
+
+    fn lattice() -> Lattice {
+        Lattice::new(LatticeVersion(1), [Compartment::new("pii")])
     }
 
-    fn avc() -> CachingAvc<LatticeTeEvaluator<StubLinearLattice>> {
+    /// A high (Secret/pq-hybrid) clearance that dominates the low object label below.
+    fn high() -> SecurityLabel {
+        SecurityLabel::new(Level::Secret, Assurance::PqHybrid, CompartmentSet::EMPTY)
+    }
+    /// A low (Public/classical) object label, dominated by `high()`.
+    fn low() -> SecurityLabel {
+        SecurityLabel::new(Level::Public, Assurance::Classical, CompartmentSet::EMPTY)
+    }
+
+    fn subj(t: u32, clr: SecurityLabel) -> SubjectCtx {
+        SubjectCtx { subject_type: SubjectType(t), clearance: clr }
+    }
+    fn obj(t: u32, lbl: SecurityLabel) -> ObjectCtx {
+        ObjectCtx { object_type: ObjectType(t), label: lbl }
+    }
+
+    fn avc() -> CachingAvc<LatticeTeEvaluator> {
         let mut allow = HashSet::new();
         allow.insert(rule(1, 1, 1));
-        let e = LatticeTeEvaluator::new(TeMatrix::from_allow(allow), StubLinearLattice::new(3), 1);
+        let e = LatticeTeEvaluator::new(TeMatrix::from_allow(allow), lattice());
         CachingAvc::new(Arc::new(e))
     }
 
     #[test]
     fn hit_returns_cached_decision() {
         let a = avc();
-        assert_eq!(a.decide(subj(1, 2), obj(1, 1), Action(1)), Decision::Permit);
-        assert_eq!(a.decide(subj(1, 2), obj(1, 1), Action(1)), Decision::Permit);
+        assert_eq!(a.decide(subj(1, high()), obj(1, low()), Action(1)), Decision::Permit);
+        assert_eq!(a.decide(subj(1, high()), obj(1, low()), Action(1)), Decision::Permit);
         assert_eq!(a.len(), 1, "second call must hit the cache, not add a new entry");
     }
 
     #[test]
     fn default_deny_cached_too() {
         let a = avc();
-        assert_eq!(a.decide(subj(1, 2), obj(1, 1), Action(9)), Decision::Deny);
-        assert_eq!(a.decide(subj(1, 2), obj(1, 1), Action(9)), Decision::Deny);
+        assert_eq!(a.decide(subj(1, high()), obj(1, low()), Action(9)), Decision::Deny);
+        assert_eq!(a.decide(subj(1, high()), obj(1, low()), Action(9)), Decision::Deny);
     }
 
     /// The evaluator must be consulted exactly ONCE per distinct key — proving the cache
@@ -286,7 +306,7 @@ mod tests {
     #[test]
     fn evaluator_consulted_once_per_key() {
         struct Counting {
-            inner: LatticeTeEvaluator<StubLinearLattice>,
+            inner: LatticeTeEvaluator,
             calls: AtomicU32,
         }
         impl TeEvaluator for Counting {
@@ -300,12 +320,12 @@ mod tests {
         }
         let mut allow = HashSet::new();
         allow.insert(rule(1, 1, 1));
-        let inner = LatticeTeEvaluator::new(TeMatrix::from_allow(allow), StubLinearLattice::new(3), 1);
+        let inner = LatticeTeEvaluator::new(TeMatrix::from_allow(allow), lattice());
         let counting = Arc::new(Counting { inner, calls: AtomicU32::new(0) });
         let a = CachingAvc::new(counting.clone());
 
         for _ in 0..10 {
-            a.decide(subj(1, 2), obj(1, 1), Action(1));
+            a.decide(subj(1, high()), obj(1, low()), Action(1));
         }
         assert_eq!(counting.calls.load(Ordering::SeqCst), 1, "PDP must be hit once, then cached");
     }
@@ -314,12 +334,12 @@ mod tests {
     fn token_gate_denies_op_outside_op_set() {
         let a = avc();
         let token = TokenScope {
-            label_ceiling: SecurityLabel(3),
+            label_ceiling: high(),
             op_set: Arc::from(vec![Action(2)]), // does NOT include Action(1)
             valid_until: Instant::now() + Duration::from_secs(60),
         };
         assert_eq!(
-            a.decide_with_token(subj(1, 2), obj(1, 1), Action(1), &token),
+            a.decide_with_token(subj(1, high()), obj(1, low()), Action(1), &token),
             Decision::Deny,
             "action not in token op_set must be denied"
         );
@@ -329,12 +349,12 @@ mod tests {
     fn token_gate_permits_when_pdp_and_token_agree() {
         let a = avc();
         let token = TokenScope {
-            label_ceiling: SecurityLabel(3),
+            label_ceiling: high(),
             op_set: Arc::from(vec![Action(1)]),
             valid_until: Instant::now() + Duration::from_secs(60),
         };
         assert_eq!(
-            a.decide_with_token(subj(1, 2), obj(1, 1), Action(1), &token),
+            a.decide_with_token(subj(1, high()), obj(1, low()), Action(1), &token),
             Decision::Permit
         );
     }
@@ -343,12 +363,12 @@ mod tests {
     fn expired_token_fails_closed() {
         let a = avc();
         let token = TokenScope {
-            label_ceiling: SecurityLabel(3),
+            label_ceiling: high(),
             op_set: Arc::from(vec![Action(1)]),
             valid_until: Instant::now() - Duration::from_secs(1), // already expired
         };
         assert_eq!(
-            a.decide_with_token(subj(1, 2), obj(1, 1), Action(1), &token),
+            a.decide_with_token(subj(1, high()), obj(1, low()), Action(1), &token),
             Decision::Deny
         );
     }
@@ -356,7 +376,7 @@ mod tests {
     #[test]
     fn flush_clears_cache() {
         let a = avc();
-        a.decide(subj(1, 2), obj(1, 1), Action(1));
+        a.decide(subj(1, high()), obj(1, low()), Action(1));
         assert_eq!(a.len(), 1);
         a.flush();
         assert!(a.is_empty());
