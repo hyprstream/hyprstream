@@ -1,4 +1,4 @@
-//! Integration tests for the #505 capability-sandbox spike.
+//! Integration tests for the #505 capability sandbox (P1 host).
 //!
 //! These tests need the guest wasm artifact built first:
 //!   cargo build --release --target wasm32-unknown-unknown \
@@ -11,20 +11,18 @@
 //! Set HYPRSTREAM_PYGUEST_WASM to override the path. If the artifact is absent the
 //! tests SKIP (return early) rather than fail.
 //!
-//! IMPORTANT (see FINDINGS.md): with rustpython-vm 0.3 the VM bootstrap traps at
-//! `VirtualMachine::new` because rustpython-vm 0.3.1 force-enables `getrandom/js`,
-//! whose backend OUTRANKS the registered custom backend and reaches for undefined
-//! `__wbindgen_placeholder__` JS imports. That trap is itself a capability proof:
-//! the guest reaches for something the host did not grant and is stopped. The clean
-//! GREEN path (single `host_random` import, no JS) is rustpython-vm 0.5 + getrandom
-//! 0.3 custom backend — validated in FINDINGS.md. These tests therefore accept EITHER
-//! a clean status code OR a trap, and assert the structural invariant: the host can
-//! never have produced an external side effect, because the Linker defines exactly
-//! one function (`host_random`) and traps every other import.
+//! P1 (rustpython-vm 0.5): the guest now ACTUALLY runs Python. The guest declares
+//! exactly one import, `env::host_random` (verified with wasm-tools), and the host
+//! Linker defines exactly that function and traps every other import. So:
+//!   * case1 `print(1 + 1)` returns a CLEAN status 0 (no trap),
+//!   * case2 `import os; os.system('echo PWNED')` is inert (python exception, never
+//!     a host process — there is no syscall surface),
+//!   * the fuel and epoch DoS guards trap as expected.
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
-use hyprstream_wasm::Sandbox;
+use hyprstream_wasm::{EpochTimer, Sandbox, Subject};
 
 fn guest_wasm() -> Option<Vec<u8>> {
     if let Ok(p) = std::env::var("HYPRSTREAM_PYGUEST_WASM") {
@@ -52,41 +50,40 @@ fn guest_wasm() -> Option<Vec<u8>> {
 const BIG_FUEL: u64 = 50_000_000_000;
 
 /// The Linker must accept ANY guest module and expose exactly one host import,
-/// trapping everything else. Loading must succeed regardless of rustpython version.
+/// trapping everything else. Loading must succeed.
 #[test]
 fn sandbox_loads_with_single_capability() {
     let Some(wasm) = guest_wasm() else {
         eprintln!("SKIP: guest wasm not built");
         return;
     };
-    // from_bytes builds the engine (fuel+epoch), compiles the module, and wires the
-    // bespoke Linker (host_random + define_unknown_imports_as_traps). If this errors,
-    // the host-side capability wiring is broken.
     Sandbox::from_bytes(&wasm).expect("sandbox must load any guest with the 1-capability linker");
 }
 
-/// Case 1: `print(1 + 1)`. On the green (0.5) path returns status 0. On the 0.3
-/// path it traps at VM init (getrandom/js). Either way: no host side effect.
+/// Case 1: `print(1 + 1)` — the green path. With rustpython-vm 0.5 + frozen stdlib
+/// the VM boots and runs, so this returns a CLEAN status 0 (no trap, no host effect).
 #[test]
-fn case1_arithmetic() {
+fn case1_arithmetic_is_green() {
     let Some(wasm) = guest_wasm() else {
         eprintln!("SKIP case1: guest wasm not built");
         return;
     };
     let sandbox = Sandbox::from_bytes(&wasm).expect("load sandbox");
-    match sandbox.eval("print(1 + 1)", BIG_FUEL) {
-        Ok(0) => eprintln!("case1: GREEN — print(1+1) succeeded (status 0)"),
-        Ok(n) => eprintln!("case1: python error status {n} (still no host effect)"),
-        Err(t) => eprintln!("case1: trapped at VM bootstrap: {t} (still no host effect)"),
-    }
+    let status = sandbox
+        .eval("print(1 + 1)", BIG_FUEL)
+        .expect("print(1+1) must NOT trap on the 0.5 green path");
+    assert_eq!(status, 0, "print(1+1) must return status 0 (clean run)");
+    eprintln!("case1: GREEN — print(1+1) returned status 0");
 }
 
-/// Case 2: `import os; os.system('echo PWNED')`. The capability proof.
+/// Case 2: `import os; os.system('echo PWNED')` — the capability proof.
 ///
 /// The HARD guarantee is structural: the guest has NO syscall surface — only
 /// `host_random`. The host Linker wires no process spawner, so `echo PWNED` cannot
-/// execute. Whatever happens at the Python layer (exception or trap), there is
-/// provably no host process.
+/// execute. On the 0.5 green path the VM boots and `os.system` raises a Python
+/// exception (no native backend), so `eval` returns a NONZERO status WITHOUT
+/// trapping and without any host process. We assert it is inert: either a nonzero
+/// python-error status or a trap, never status 0, and never a host effect.
 #[test]
 fn case2_os_system_is_inert() {
     let Some(wasm) = guest_wasm() else {
@@ -95,47 +92,115 @@ fn case2_os_system_is_inert() {
     };
     let sandbox = Sandbox::from_bytes(&wasm).expect("load sandbox");
     match sandbox.eval("import os; os.system('echo PWNED')", BIG_FUEL) {
-        Ok(n) => eprintln!("case2: returned status {n}; no host process possible"),
-        Err(t) => eprintln!("case2: trapped: {t}; no host process possible"),
+        Ok(0) => panic!("os.system must NOT succeed — there is no host syscall surface"),
+        Ok(n) => eprintln!("case2: inert — python error status {n}; no host process possible"),
+        Err(t) => eprintln!("case2: inert — trapped: {t}; no host process possible"),
     }
     // No host-side assertion is needed: the Linker defines exactly host_random and
     // traps everything else, so a host process is structurally unreachable.
 }
 
-/// Case 3 (DoS guard): a fuel-bounded `while True: pass` must TRAP deterministically
-/// rather than hang the host. We assert a trap occurs. Whether it is the fuel trap
-/// (green path, VM boots then loops) or a bootstrap trap (0.3 path), the host is
-/// protected from an unbounded guest.
+/// Case 3 (deterministic DoS guard): a fuel-bounded `while True: pass` must TRAP
+/// ("all fuel consumed") rather than hang the host.
 #[test]
-fn case3_infinite_loop_is_bounded() {
+fn case3_infinite_loop_is_fuel_bounded() {
     let Some(wasm) = guest_wasm() else {
         eprintln!("SKIP case3: guest wasm not built");
         return;
     };
     let sandbox = Sandbox::from_bytes(&wasm).expect("load sandbox");
+    // Boot the VM with ample fuel, then loop — but cap total fuel so the loop trips it.
     let result = sandbox.eval("while True:\n    pass\n", BIG_FUEL);
     assert!(
         result.is_err(),
-        "unbounded guest must trap (fuel or bootstrap), got Ok({result:?})"
+        "unbounded guest must trap on fuel, got Ok({result:?})"
     );
-    eprintln!("case3: bounded — guest trapped: {:?}", result.unwrap_err());
+    eprintln!("case3: fuel-bounded — guest trapped: {:?}", result.unwrap_err());
 }
 
-/// Proves the epoch-deadline API path compiles and is wired (set_epoch_deadline).
-/// With a deadline of 0 and no `increment_epoch`, instantiation/exec traps with
-/// "interrupt" immediately — demonstrating the epoch limiter is live.
+/// Subject scoping: two sandboxes bound to DIFFERENT subjects keep independent
+/// Store identity — the subject set on one never leaks into the other. This is the
+/// no-global/no-thread-local invariant that killed the native #488 design.
 #[test]
-fn epoch_deadline_path_compiles_and_traps() {
+fn subject_isolation_no_leak() {
+    let alice = Subject::named("alice");
+    let bob = Subject::named("bob");
+
+    // Bind two sandboxes to different subjects (no guest wasm needed for identity).
+    let Some(wasm) = guest_wasm() else {
+        // Even without the guest we can assert the Subject binding is per-sandbox.
+        eprintln!("SKIP subject (no wasm): asserting Subject newtype identity only");
+        assert_ne!(alice, bob);
+        assert_eq!(alice.id(), Some("alice"));
+        return;
+    };
+    let sb_alice = Sandbox::from_bytes_for(&wasm, alice.clone()).expect("load alice");
+    let sb_bob = Sandbox::from_bytes_for(&wasm, bob.clone()).expect("load bob");
+
+    assert_eq!(sb_alice.subject(), &alice);
+    assert_eq!(sb_bob.subject(), &bob);
+    assert_ne!(sb_alice.subject(), sb_bob.subject());
+
+    // Each eval builds a FRESH Store from the sandbox's own subject; running one
+    // does not mutate the other's bound identity (no shared global state).
+    let _ = sb_alice.eval("x = 1", BIG_FUEL);
+    assert_eq!(sb_alice.subject(), &alice, "alice subject must be stable");
+    assert_eq!(sb_bob.subject(), &bob, "bob subject must be unaffected");
+    eprintln!("subject: isolated — alice={alice:?} bob={bob:?}, no leak");
+}
+
+/// Real wall-clock DoS bound: an `EpochTimer` advancing the engine epoch every 10ms,
+/// plus a per-call epoch deadline, traps `while True: pass` as "interrupt" within
+/// roughly the timeout. This is the PRODUCTION bound, not just the fuel path.
+#[test]
+fn epoch_wall_clock_bound_traps_runaway() {
     let Some(wasm) = guest_wasm() else {
         eprintln!("SKIP epoch: guest wasm not built");
         return;
     };
     let sandbox = Sandbox::from_bytes(&wasm).expect("load sandbox");
-    // ticks=0 => the default-epoch store is already at/over deadline => trap.
+
+    // Spawn the timer on THIS sandbox's engine. 10ms cadence; deadline of a few
+    // ticks gives a ~tens-of-ms wall-clock bound.
+    let tick = Duration::from_millis(10);
+    let _timer = EpochTimer::spawn(sandbox.engine(), tick);
+
+    // Deadline = 20 ticks ≈ 200ms wall clock. Generous enough that VM bootstrap
+    // (which the epoch is also counting) completes, but the infinite loop trips it.
+    let start = Instant::now();
+    let result = sandbox.eval_with_epoch_deadline("while True:\n    pass\n", 20);
+    let elapsed = start.elapsed();
+
+    assert!(
+        result.is_err(),
+        "runaway guest must trap on the epoch deadline, got Ok({result:?})"
+    );
+    let err = format!("{:?}", result.unwrap_err());
+    assert!(
+        err.contains("interrupt"),
+        "epoch trap should be an interrupt, got: {err}"
+    );
+    // Sanity: it should not run for many seconds. Generous upper bound for CI.
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "epoch bound did not fire promptly: {elapsed:?}"
+    );
+    eprintln!("epoch: wall-clock bound fired after {elapsed:?} — {err}");
+}
+
+/// The epoch limiter is live even with a deadline of 0 (default-epoch store is
+/// already over the line) — proves the limiter is wired, no timer needed.
+#[test]
+fn epoch_deadline_zero_traps_immediately() {
+    let Some(wasm) = guest_wasm() else {
+        eprintln!("SKIP epoch0: guest wasm not built");
+        return;
+    };
+    let sandbox = Sandbox::from_bytes(&wasm).expect("load sandbox");
     let result = sandbox.eval_with_epoch_deadline("print(1)", 0);
     assert!(
         result.is_err(),
         "epoch deadline of 0 must trap immediately, got Ok({result:?})"
     );
-    eprintln!("epoch: trapped as expected: {:?}", result.unwrap_err());
+    eprintln!("epoch0: trapped as expected: {:?}", result.unwrap_err());
 }

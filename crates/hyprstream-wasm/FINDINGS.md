@@ -1,5 +1,12 @@
 # #505 P0 — WASM substrate build-viability spike: FINDINGS
 
+> **P1 UPDATE (host crate, branch `ewindisch/505-wasm-p1-host`).** The P0 blockers
+> below are RESOLVED. The guest now actually runs Python: `Sandbox::eval("print(1 + 1)")`
+> returns status **0** (no trap), and `wasm-tools print` confirms the guest imports
+> EXACTLY `{ env::host_random }` (zero JS/WASI/wasm-bindgen). See the appended
+> **"P1 RESOLUTIONS"** section at the end of this file for the exact APIs used; the P0
+> body below is preserved for historical context.
+
 Goal: prove RustPython can run as a `wasm32-unknown-unknown` guest under an embedded
 wasmtime host with ZERO WASI and a host-provided RNG — an untrusted-Python capability
 sandbox where `import os; os.system(...)` is inert by construction.
@@ -204,3 +211,103 @@ epoch bound):
 3. Add a real epoch bound: spawn an Engine::increment_epoch() timer thread and set a
    per-call set_epoch_deadline(n) so wall-clock DoS (not just fuel) is enforced; keep
    define_unknown_imports_as_traps as the deny-by-default capability fence.
+
+---
+
+## P1 RESOLUTIONS (branch `ewindisch/505-wasm-p1-host`)
+
+All four P1 deliverables landed; `cargo test -p hyprstream-wasm` is 9/9 green and
+`cargo clippy -p hyprstream-wasm --tests` is warning-clean.
+
+### 1. Green path — `print(1 + 1)` returns status 0; guest imports = `{ env::host_random }`
+
+- **Guest bump 0.3 -> 0.5.** `rustpython-vm = "0.5"` declares getrandom 0.3 (NO `js`),
+  so the custom getrandom-0.3 backend is finally reachable. Dropped the getrandom-0.2
+  dual backend entirely; the guest now keeps ONLY:
+  - `.cargo/config.toml`: `--cfg getrandom_backend="custom"` (+ `-C link-arg=--allow-undefined`)
+  - `lib.rs`: `#[no_mangle] unsafe fn __getrandom_v03_custom(*mut u8, usize) -> Result<(), getrandom::Error>`
+    delegating to the host import `host_random`.
+- **Frozen-stdlib construction (the exact 0.5 API).** `Interpreter::without_stdlib` +
+  `freeze-stdlib` panics in `VirtualMachine::initialize` ("essential initialization
+  failed") because it registers an EMPTY frozen set and essential init then fails to
+  `import encodings`. The supported embedded path is the BUILDER, registering the
+  frozen stdlib from the **`rustpython-pylib`** crate:
+
+  ```rust
+  use rustpython_vm as vm;
+  vm::Interpreter::builder(vm::Settings::default())
+      .add_frozen_modules(rustpython_pylib::FROZEN_STDLIB)
+      .build()
+  ```
+
+  KEY GOTCHA: on rustpython-vm 0.5 the `freeze-stdlib` cargo feature is merely an
+  alias for `encodings` — it does NOT itself embed the stdlib bytecode. You MUST add
+  `rustpython-pylib = { version = "0.5", features = ["freeze-stdlib"] }` as a direct
+  dependency and pass `rustpython_pylib::FROZEN_STDLIB` (a `&FrozenLib`, which iterates
+  as `(&'static str, FrozenModule)` — exactly what `add_frozen_modules` wants).
+- **`print` needs the `stdio` feature.** With `default-features=false` and no `stdio`,
+  `sys.stdout` is `None` and `print(...)` raises (eval returned status 1). Enabling the
+  `stdio` feature WITHOUT `host_env` selects the VM's SANDBOX stdio path
+  (`stdlib::sys::SandboxStdio` -> `std::io::stdout()`), which on
+  wasm32-unknown-unknown discards output (no real fd) — a capability WIN: `print`
+  succeeds (status 0) with ZERO host effect. Final guest feature set:
+  `["compiler", "encodings", "freeze-stdlib", "stdio"]`. We deliberately OMIT
+  `host_env` (would wire native `posix`/`os`), `wasmbind` (pulls wasm-bindgen/js — the
+  exact thing we eliminated), `gc`, `jit`, `threading`.
+- **Verified imports.** `wasm-tools print … | grep '(import '` on the release guest
+  shows EXACTLY `(import "env" "host_random" …)` — nothing else.
+- **`import os; os.system('echo PWNED')` is inert.** With `host_env` off there is no
+  native posix backend, so `os.system` raises a Python exception (eval status 1, NOT a
+  trap, NOT a host process). `case2_os_system_is_inert` asserts it never returns 0.
+
+### 2. Subject-scoped Store
+
+- New LOCAL newtype `Subject(pub Option<String>)` in `hyprstream-wasm` (no dep on
+  hyprstream-rpc/hyprstream-vfs yet — just the seam). `Subject::anonymous()` /
+  `Subject::named(id)` / `id()`.
+- P0's fixed `HostState` is generalized to `SandboxState { subject: Subject, rng_bytes }`,
+  carried as the wasmtime `Store` data. `host_random` reads `caller.data().subject` —
+  capability host fns are Subject-scoped by construction.
+- `Sandbox` is bound to one `Subject` at construction (`from_bytes_for(wasm, subject)`;
+  `from_bytes` = anonymous). Each `eval` builds a FRESH `Store` from the sandbox's own
+  subject — no global/thread-local state (the leak that killed native #488).
+- `subject_isolation_no_leak` test: two sandboxes bound to `alice` / `bob` keep
+  independent subjects across evals — PASSES.
+
+### 3. Real wall-clock DoS bound
+
+- New `EpochTimer::spawn(engine, tick)` — a background thread calling
+  `engine.increment_epoch()` every `tick` (default test cadence 10ms); `Drop` stops it.
+  The `Engine` is cheaply cloned (shared epoch counter) into the thread.
+- `Sandbox::eval_with_epoch_deadline(src, ticks)` sets `store.set_fuel(u64::MAX)` so the
+  EPOCH (not fuel) is the limiter, then `store.set_epoch_deadline(ticks)`. The P0 gotcha
+  holds: with `epoch_interruption(true)` every store defaults to deadline 0 and traps
+  immediately unless pushed out — the fuel path sets `set_epoch_deadline(u64::MAX)`.
+- `epoch_wall_clock_bound_traps_runaway` test: timer at 10ms + deadline 20 ticks traps
+  `while True: pass` with "wasm trap: interrupt" within ~hundreds of ms — PASSES. Fuel
+  remains the deterministic test option (`eval(src, fuel)`,
+  `case3_infinite_loop_is_fuel_bounded`).
+
+### 4. VFS host-fn seam (sketch for #483)
+
+- New module `hyprstream_wasm::vfs`. Trait `VfsCapability` with the Profile-A surface:
+  `vfs_walk / vfs_open / vfs_read / vfs_write / vfs_stat / vfs_ls / vfs_create`, each
+  taking `&Subject` (matching `hyprstream_vfs::Mount`'s methods, which already take
+  `&Subject`). `UnimplementedVfs` is the `Err(VfsError::Unimplemented)` default; an
+  in-memory test stub proves the Subject threads through and scopes (a "denied" subject
+  is refused). A `// P1b/#483:` comment documents that the real backing is
+  `hyprstream_vfs::spawn_vfs_proxy(ns, subject) -> Sender<VfsRequest>` held in Store
+  data, with sync wasm host fns submitting `VfsRequest { op, reply }` over it (the
+  proxy's `VfsOp` deliberately excludes mount/bind/unmount). `hyprstream-vfs` is NOT
+  pulled in (would drag the RPC/tokio stack into this minimal crate).
+
+### Remaining notes / next step
+
+- `import io` (the pure-Python frozen `io` module) still returns status 1 — it is not
+  needed for `print` (which uses native `_io` + sandbox stdio directly) and no test
+  depends on it. If a future guest needs `io`, investigate the frozen `io` module's
+  init under the sandbox stdio path. NOT a blocker for P1.
+- Next step (P1b/#483): replace `vfs::UnimplementedVfs` with the real
+  `spawn_vfs_proxy`-backed impl held in `SandboxState`, and add the `env::vfs_*` host
+  fns to `build_linker` (sync shims over the proxy `Sender`), reading
+  `caller.data().subject` for scoping.
