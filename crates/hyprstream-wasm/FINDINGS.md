@@ -311,3 +311,116 @@ All four P1 deliverables landed; `cargo test -p hyprstream-wasm` is 9/9 green an
   `spawn_vfs_proxy`-backed impl held in `SandboxState`, and add the `env::vfs_*` host
   fns to `build_linker` (sync shims over the proxy `Sender`), reading
   `caller.data().subject` for scoping.
+
+---
+
+## P2 RESOLUTIONS (branch `ewindisch/483-python-profile-a`) — #483 `/lang/python`
+
+All three P2 deliverables landed. `cargo test -p hyprstream-wasm` is GREEN (1 lib +
+11 integration + 1 mount unit test); the guest builds to `wasm32-unknown-unknown`
+importing EXACTLY `{ env::host_random, env::vfs_cat, env::vfs_ls, env::vfs_echo,
+env::vfs_ctl }` (verified with `wasm-tools print`).
+
+### 0. hyprstream-vfs torch-free verdict: CONFIRMED
+
+`cargo build -p hyprstream-wasm` with `hyprstream-vfs` + `hyprstream-rpc` added as
+deps builds with NO LIBTORCH. Neither crate references `tch`/`torch` — libtorch is
+linked ONLY by the top-level `hyprstream` crate. So the canonical VFS seam is usable
+directly from the wasm host. The P1 crate-local `Subject` newtype is REPLACED by
+`pub use hyprstream_rpc::Subject` (re-exported as `hyprstream_vfs::Subject`).
+
+Canonical seam shapes used (from `crates/hyprstream-vfs/src/proxy.rs`):
+- `spawn_vfs_proxy(ns: Arc<Namespace>, subject: Subject) -> tokio::sync::mpsc::Sender<VfsRequest>`
+  — the proxy is PINNED to one Subject at spawn time (identity is implicit, not
+  per-request — the guest cannot change identity).
+- `struct VfsRequest { op: VfsOp, reply: std::sync::mpsc::SyncSender<Result<Vec<u8>, String>> }`
+- `enum VfsOp { Cat{path}, Ls{path}, Echo{path,data}, Ctl{path,cmd}, MountPrefixes }`
+  — PATH-based, and DELIBERATELY excludes mount/bind/unmount (its security
+  invariant). We backed the capability against this real seam rather than the P1
+  fid-based sketch (`Mount::walk/open/read/...`), so the #483 capability is exactly
+  the proxy's bounded surface.
+
+### 1. Real VFS host-fn backing (the capability is real)
+
+- New `vfs::VfsProxyHandle { tx: Sender<VfsRequest>, subject }` stored in
+  `SandboxState` (`Option` — `None` = deny-by-default). `submit(op)` is the
+  sync-over-async bridge: `tx.blocking_send(VfsRequest { op, reply })` then block on a
+  `std::sync::mpsc::sync_channel(1)` reply receiver. (blocking_send => the driver must
+  be a plain thread, NOT a tokio worker.)
+- `build_linker` now wires `env::vfs_cat/vfs_ls/vfs_echo/vfs_ctl`. Each reads
+  `caller.data().subject` for audit and submits via `caller.data().vfs` — NEVER a
+  guest-supplied identity. The reply is serialised into a guest buffer (allocated via
+  the guest's own `alloc` export) as `[status_byte][payload]` and returned packed as
+  `(out_ptr<<32)|out_len` (the i64 ABI the guest's `take_reply` decodes).
+- `define_unknown_imports_as_traps` still fences everything else (deny-by-default).
+- TEST `vfs_e2e::guest_vfs_is_subject_scoped` (PASSES): a GUEST `vfs_probe` call
+  (cat/echo) goes guest -> `env::vfs_*` -> Subject-scoped proxy -> in-memory `Mount`.
+  `alice` reads `/config/temp`, writes `0.9`, reads it back; a `denied` Subject is
+  refused at the `Mount` (`permission denied`) — proving the Subject reaches the
+  backend. `guest_vfs_deny_by_default` (PASSES): a sandbox WITHOUT `.with_vfs(...)`
+  gets the "no capability" reply, never touching a Namespace.
+
+### 2. Guest `/lang/python` semantics (re-expressed on RustPython 0.5)
+
+- Guest gained a PERSISTENT interpreter: a `thread_local Shell { interp, globals }`
+  built once (wasm32 is single-threaded, so the thread-local is the whole guest
+  state). `globals` is a persistent `PyDictRef` reused across calls via
+  `Scope::with_builtins(None, globals.clone(), vm)` — user state survives between
+  calls (the native shell's design).
+- New guest export `py_op(op, ptr, len) -> i64` (packed reply ABI):
+  - eval  -> `repr(result)` (+ `\n---\n<stdout>` if it printed)
+  - exec  -> captured stdout
+  - list_vars / list_defs -> newline-joined non-dunder names (defs = callables only)
+  - get_var / get_def     -> repr of one named global (NONE tag if absent)
+- STDOUT CAPTURE on 0.5: the pure-Python `__Capture` surrogate is PORTED verbatim
+  (`sys.stdout = __Capture()` with a list buffer + `getvalue()`; drained back to a
+  no-op `__Sink`). No `io.StringIO` (avoids extra frozen-module init under the
+  sandbox-stdio path). A `__Sink` baseline is installed at shell construction so
+  stray `print()` never crashes on a `None` stdout. 0.5 API notes: `run_code_string`
+  -> `run_string`; `PyStr::as_str()` is gone — use `to_str()/to_string_lossy()`.
+- Host driver `PyShell` (in lib.rs): holds ONE long-lived `Store`+`Instance` so guest
+  persistence is real, exposes `eval/exec/list_vars/get_var/list_defs/get_def`
+  returning `PyResult::{Ok,Err,None}`. The legacy `eval(ptr,len)->i32` export
+  (fresh-interpreter #505 path) is KEPT so all original #505 host tests still pass.
+- TESTS `pyshell_eval_exec_and_persistent_scope` + `pyshell_vars_and_defs` (PASS):
+  `2+3 -> "5"`, `print('hello') -> "hello\n"`, a var set by exec is visible in a later
+  eval, vars/defs enumeration + dunder exclusion + callable-only defs all verified.
+
+### 3. `/lang/python` Mount (torch-free placement)
+
+- New module `hyprstream_wasm::mount` (INSIDE `hyprstream-wasm` => stays
+  scoped-buildable; no new crate needed). `PythonMount` implements the canonical
+  `hyprstream_vfs::Mount` with the EXACT native layout: `eval` (ctl: expr->repr),
+  `stdout` (ctl: stmts->captured stdout), `vars/` (dir of non-dunder globals),
+  `defs/` (dir of callables). `walk/open/read/write/readdir/stat/clunk` ported.
+- Because `PyShell` must run off the async runtime (its `vfs_*` host fns
+  `blocking_send`), `PythonMount` holds a `tokio::mpsc::Sender<PyCommand>` and
+  `PythonMount::spawn(sandbox, fuel)` starts a dedicated OS thread that owns the
+  `PyShell` and serves commands via `rx.blocking_recv()` — the same channel pattern
+  the native mount used for its `!Send` interpreter. `spawn` returns a single
+  `PythonMount` that OWNS the driver `JoinHandle`; on `Drop` it drops the command
+  sender FIRST (so the driver's `blocking_recv` returns `None` and the loop exits)
+  THEN joins — folding both into one type avoids a drop-ordering deadlock where a
+  separate guard would join while the sender is still alive.
+- TEST `mount::tests::mount_eval_vars_defs_over_guest` (PASSES) against an in-memory
+  VFS: write `2 + 3` to `eval` -> read `5`; exec `x = 42` via `stdout` -> read `42`
+  under `vars/x`; `def f()` -> `f` appears in `defs/` readdir.
+
+### Stubbed / deferred + precise next step
+
+- DAEMON NAMESPACE WIRING (out of scope, documented): registering this mount into the
+  running `/lang/python` namespace lives in the torch-bound `hyprstream` crate. A
+  `// #483 daemon wiring:` block in `mount.rs` gives the exact snippet
+  (`Sandbox::from_bytes_for(..).with_vfs(VfsProxyHandle::new(spawn_vfs_proxy(ns,subj),
+  subj))` -> `PythonMount::spawn` -> `ns.mount("/lang/python", Arc::new(mount))`).
+  NEXT STEP: in the daemon's per-session Namespace builder (where `/lang/tcl` is
+  mounted), embed the guest `.wasm` (build artifact / `include_bytes!`) and call that
+  snippet with the session's verified Subject + the session Namespace.
+- GUEST PYTHON BUILTINS for VFS: the guest exposes `vfs_*` end-to-end via the
+  `vfs_probe` export and Rust helpers (`guest_cat`/`guest_ls`/`guest_echo`/
+  `guest_ctl`), but does NOT yet register them as Python builtins (`cat`/`ls`/`write`/
+  `ctl`) callable from guest source — that needs native-module registration which the
+  current feature set (no `host_env`) omits. Follow-up: register them as native
+  builtins so `cat("/config/x")` works from Python. The capability itself is already
+  real and tested through the host fns.
+- No blockers.

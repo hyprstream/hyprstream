@@ -7108,7 +7108,12 @@ name = "hyprstream-wasm"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "hyprstream-rpc",
+ "hyprstream-vfs",
+ "parking_lot 0.12.4",
  "rand 0.8.5",
+ "tokio",
  "wasmtime",
 ]
 

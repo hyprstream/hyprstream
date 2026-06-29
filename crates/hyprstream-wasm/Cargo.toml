@@ -21,5 +21,23 @@ wasmtime = "=46.0.1"
 anyhow = "1"
 rand = "0.8"
 
+# Canonical VFS seam (#483 P2). hyprstream-vfs -> hyprstream-rpc; NEITHER pulls
+# tch/torch (verified: only the top-level `hyprstream` crate links libtorch), so
+# `cargo build -p hyprstream-wasm` stays torch-free. We use:
+#   * hyprstream_rpc::Subject  — the CANONICAL caller identity (replaces the
+#     crate-local Subject newtype).
+#   * hyprstream_vfs::{Namespace, Mount, Fid, Stat, DirEntry, MountError, ...}
+#     and spawn_vfs_proxy / VfsRequest / VfsOp — the real proxy seam.
+hyprstream-vfs = { path = "../hyprstream-vfs" }
+hyprstream-rpc = { path = "../hyprstream-rpc" }
+# The proxy reply channel is std::sync::mpsc; the proxy task needs a tokio runtime.
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread"] }
+async-trait = "0.1"
+# `/lang/python` mount fid state uses parking_lot::Mutex for interior mutability
+# through `&Fid` (same pattern as the native mount).
+parking_lot = "0.12"
+
 [dev-dependencies]
 anyhow = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+parking_lot = "0.12"

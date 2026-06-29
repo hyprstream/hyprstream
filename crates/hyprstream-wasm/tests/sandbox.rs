@@ -22,7 +22,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use hyprstream_wasm::{EpochTimer, Sandbox, Subject};
+use hyprstream_wasm::{EpochTimer, PyResult, Sandbox, Subject};
 
 fn guest_wasm() -> Option<Vec<u8>> {
     if let Ok(p) = std::env::var("HYPRSTREAM_PYGUEST_WASM") {
@@ -123,15 +123,15 @@ fn case3_infinite_loop_is_fuel_bounded() {
 /// no-global/no-thread-local invariant that killed the native #488 design.
 #[test]
 fn subject_isolation_no_leak() {
-    let alice = Subject::named("alice");
-    let bob = Subject::named("bob");
+    let alice = Subject::new("alice");
+    let bob = Subject::new("bob");
 
     // Bind two sandboxes to different subjects (no guest wasm needed for identity).
     let Some(wasm) = guest_wasm() else {
         // Even without the guest we can assert the Subject binding is per-sandbox.
-        eprintln!("SKIP subject (no wasm): asserting Subject newtype identity only");
+        eprintln!("SKIP subject (no wasm): asserting Subject identity only");
         assert_ne!(alice, bob);
-        assert_eq!(alice.id(), Some("alice"));
+        assert_eq!(alice.name(), Some("alice"));
         return;
     };
     let sb_alice = Sandbox::from_bytes_for(&wasm, alice.clone()).expect("load alice");
@@ -203,4 +203,313 @@ fn epoch_deadline_zero_traps_immediately() {
         "epoch deadline of 0 must trap immediately, got Ok({result:?})"
     );
     eprintln!("epoch0: trapped as expected: {:?}", result.unwrap_err());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #483 P2 — /lang/python semantics over the persistent guest shell.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Generous per-call fuel for the persistent shell. The interpreter is built once
+/// (on the first op), so subsequent ops are cheaper, but bootstrap is expensive.
+const SHELL_FUEL: u64 = 50_000_000_000;
+
+/// eval: an expression returns its repr; exec: statements capture stdout; and the
+/// interpreter scope PERSISTS across calls (a var set by exec is visible later).
+#[test]
+fn pyshell_eval_exec_and_persistent_scope() {
+    let Some(wasm) = guest_wasm() else {
+        eprintln!("SKIP pyshell: guest wasm not built");
+        return;
+    };
+    let sandbox = Sandbox::from_bytes(&wasm).expect("load sandbox");
+    let mut shell = sandbox.open_shell(SHELL_FUEL).expect("open shell");
+
+    // eval an expression -> repr.
+    let r = shell.eval("2 + 3").expect("eval 2+3");
+    assert_eq!(r, PyResult::Ok("5".to_owned()), "eval should repr to 5");
+
+    // exec stdout capture (pure-Python __Capture surrogate).
+    let r = shell.exec("print('hello')").expect("exec print");
+    assert_eq!(
+        r,
+        PyResult::Ok("hello\n".to_owned()),
+        "exec should capture stdout"
+    );
+
+    // PERSISTENT scope: a var set in one exec is visible in a later eval.
+    let _ = shell.exec("x = 41").expect("exec assign");
+    let r = shell.eval("x + 1").expect("eval persisted var");
+    assert_eq!(
+        r,
+        PyResult::Ok("42".to_owned()),
+        "interpreter scope must persist across calls"
+    );
+    eprintln!("pyshell: eval/exec/persistent-scope all green");
+}
+
+/// vars/ enumerates non-dunder globals; defs/ enumerates callables only; get_var /
+/// get_def return the repr of one named global (None if absent).
+#[test]
+fn pyshell_vars_and_defs() {
+    let Some(wasm) = guest_wasm() else {
+        eprintln!("SKIP pyshell vars/defs: guest wasm not built");
+        return;
+    };
+    let sandbox = Sandbox::from_bytes(&wasm).expect("load sandbox");
+    let mut shell = sandbox.open_shell(SHELL_FUEL).expect("open shell");
+
+    // Define a var and a function.
+    let _ = shell.exec("answer = 42").expect("set var");
+    let _ = shell
+        .exec("def greet(n):\n    return 'hi ' + n\n")
+        .expect("def func");
+
+    // vars/ lists both names (no dunders).
+    let vars = shell.list_vars().expect("list vars");
+    assert!(vars.contains(&"answer".to_owned()), "vars: {vars:?}");
+    assert!(vars.contains(&"greet".to_owned()), "vars: {vars:?}");
+    assert!(
+        !vars.iter().any(|v| v.starts_with("__")),
+        "vars must exclude dunders: {vars:?}"
+    );
+
+    // defs/ lists ONLY the callable.
+    let defs = shell.list_defs().expect("list defs");
+    assert!(defs.contains(&"greet".to_owned()), "defs: {defs:?}");
+    assert!(
+        !defs.contains(&"answer".to_owned()),
+        "defs must exclude non-callables: {defs:?}"
+    );
+
+    // get_var / get_def repr.
+    assert_eq!(
+        shell.get_var("answer").expect("get_var"),
+        PyResult::Ok("42".to_owned())
+    );
+    assert!(matches!(
+        shell.get_def("greet").expect("get_def"),
+        PyResult::Ok(_)
+    ));
+    // Absent name -> None.
+    assert_eq!(
+        shell.get_var("nope").expect("get_var absent"),
+        PyResult::None
+    );
+    // A non-callable is not a def.
+    assert_eq!(
+        shell.get_def("answer").expect("get_def non-callable"),
+        PyResult::None
+    );
+    eprintln!("pyshell: vars/defs/get_* all green");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #483 P2 — REAL VFS capability: guest -> host vfs_* -> Subject-scoped proxy ->
+// in-memory Namespace. Deliverable (1): the proof the capability is real.
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod vfs_e2e {
+    use super::*;
+    use hyprstream_vfs::proxy::spawn_vfs_proxy;
+    use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Namespace, Stat};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// In-memory mount; a `denied` Subject is refused at every op.
+    struct MemMount {
+        files: parking_lot::Mutex<HashMap<String, Vec<u8>>>,
+    }
+    struct MemFid {
+        path: String,
+        wbuf: parking_lot::Mutex<Vec<u8>>,
+    }
+    impl MemMount {
+        fn new(files: Vec<(&str, &[u8])>) -> Self {
+            Self {
+                files: parking_lot::Mutex::new(
+                    files
+                        .into_iter()
+                        .map(|(k, v)| (k.to_owned(), v.to_vec()))
+                        .collect(),
+                ),
+            }
+        }
+        fn check(c: &Subject) -> Result<(), MountError> {
+            if c.name() == Some("denied") {
+                Err(MountError::PermissionDenied("denied".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl Mount for MemMount {
+        async fn walk(&self, comps: &[&str], c: &Subject) -> Result<Fid, MountError> {
+            Self::check(c)?;
+            Ok(Fid::new(MemFid {
+                path: comps.join("/"),
+                wbuf: parking_lot::Mutex::new(Vec::new()),
+            }))
+        }
+        async fn open(&self, _f: &mut Fid, _m: u8, c: &Subject) -> Result<(), MountError> {
+            Self::check(c)
+        }
+        async fn read(
+            &self,
+            f: &Fid,
+            off: u64,
+            _n: u32,
+            c: &Subject,
+        ) -> Result<Vec<u8>, MountError> {
+            Self::check(c)?;
+            let i = f.downcast_ref::<MemFid>().unwrap();
+            let d = self
+                .files
+                .lock()
+                .get(&i.path)
+                .cloned()
+                .ok_or_else(|| MountError::NotFound(i.path.clone()))?;
+            let s = (off as usize).min(d.len());
+            Ok(d[s..].to_vec())
+        }
+        async fn write(
+            &self,
+            f: &Fid,
+            _o: u64,
+            data: &[u8],
+            c: &Subject,
+        ) -> Result<u32, MountError> {
+            Self::check(c)?;
+            let i = f.downcast_ref::<MemFid>().unwrap();
+            i.wbuf.lock().extend_from_slice(data);
+            self.files
+                .lock()
+                .insert(i.path.clone(), i.wbuf.lock().clone());
+            Ok(data.len() as u32)
+        }
+        async fn readdir(&self, f: &Fid, c: &Subject) -> Result<Vec<DirEntry>, MountError> {
+            Self::check(c)?;
+            let i = f.downcast_ref::<MemFid>().unwrap();
+            let prefix = if i.path.is_empty() {
+                String::new()
+            } else {
+                format!("{}/", i.path)
+            };
+            let mut out = Vec::new();
+            for k in self.files.lock().keys() {
+                if let Some(rest) = k.strip_prefix(&prefix) {
+                    if !rest.contains('/') {
+                        out.push(DirEntry {
+                            name: rest.to_owned(),
+                            is_dir: false,
+                            size: 0,
+                            stat: None,
+                        });
+                    }
+                }
+            }
+            Ok(out)
+        }
+        async fn stat(&self, f: &Fid, c: &Subject) -> Result<Stat, MountError> {
+            Self::check(c)?;
+            let i = f.downcast_ref::<MemFid>().unwrap();
+            Ok(Stat {
+                qtype: 0,
+                size: 0,
+                name: i.path.clone(),
+                mtime: 0,
+            })
+        }
+        async fn clunk(&self, _f: Fid, _c: &Subject) {}
+    }
+
+    fn make_ns() -> Arc<Namespace> {
+        let mut ns = Namespace::new();
+        ns.mount("/config", Arc::new(MemMount::new(vec![("temp", b"0.7")])))
+            .unwrap();
+        Arc::new(ns)
+    }
+
+    /// A GUEST `vfs_probe` call (op=cat/echo) goes through the host `env::vfs_*` fn,
+    /// the Subject-scoped proxy, and the in-memory Mount. An allowed Subject can
+    /// read/write; a `denied` Subject is refused — proving Subject-scoping is
+    /// enforced at the backend and the guest cannot forge identity.
+    #[test]
+    fn guest_vfs_is_subject_scoped() {
+        let Some(wasm) = guest_wasm() else {
+            eprintln!("SKIP guest_vfs: guest wasm not built");
+            return;
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let ns = make_ns();
+        let alice = Subject::new("alice");
+        let denied = Subject::new("denied");
+
+        let alice_tx = rt.block_on(async { spawn_vfs_proxy(Arc::clone(&ns), alice.clone()) });
+        let denied_tx = rt.block_on(async { spawn_vfs_proxy(Arc::clone(&ns), denied.clone()) });
+
+        let alice_h = hyprstream_wasm::vfs::VfsProxyHandle::new(alice_tx, alice.clone());
+        let denied_h = hyprstream_wasm::vfs::VfsProxyHandle::new(denied_tx, denied.clone());
+
+        let sb_alice = Sandbox::from_bytes_for(&wasm, alice)
+            .expect("load alice")
+            .with_vfs(alice_h);
+        let sb_denied = Sandbox::from_bytes_for(&wasm, denied)
+            .expect("load denied")
+            .with_vfs(denied_h);
+
+        // blocking_send must NOT run on a tokio worker — drive from a plain thread.
+        let h = std::thread::spawn(move || {
+            // op 0 = cat. Allowed subject reads an existing file THROUGH THE GUEST.
+            let r = sb_alice.probe_vfs(0, "/config/temp", b"").expect("alice cat");
+            assert!(r.ok, "alice cat should succeed: {:?}", String::from_utf8_lossy(&r.body));
+            assert_eq!(r.body, b"0.7");
+
+            // op 2 = echo, then cat back: write persists through the Mount.
+            let w = sb_alice
+                .probe_vfs(2, "/config/temp", b"0.9")
+                .expect("alice echo");
+            assert!(w.ok, "alice echo should succeed");
+            let r2 = sb_alice.probe_vfs(0, "/config/temp", b"").expect("alice cat2");
+            assert!(r2.ok);
+            assert_eq!(r2.body, b"0.9");
+
+            // Denied subject is refused at the Mount — Subject reached the backend.
+            let d = sb_denied.probe_vfs(0, "/config/temp", b"").expect("denied cat");
+            assert!(!d.ok, "denied subject must be refused");
+            assert!(
+                String::from_utf8_lossy(&d.body).contains("permission denied"),
+                "got: {}",
+                String::from_utf8_lossy(&d.body)
+            );
+            eprintln!("guest_vfs: guest->host->proxy->Mount is Subject-scoped (alice ok, denied refused)");
+        });
+        h.join().expect("vfs thread");
+    }
+
+    /// A sandbox with NO vfs capability granted: the guest `vfs_*` call returns the
+    /// deny-by-default reply (no capability), never reaching any Namespace.
+    #[test]
+    fn guest_vfs_deny_by_default() {
+        let Some(wasm) = guest_wasm() else {
+            eprintln!("SKIP guest_vfs_deny: guest wasm not built");
+            return;
+        };
+        // No .with_vfs() -> no capability.
+        let sb = Sandbox::from_bytes_for(&wasm, Subject::new("alice")).expect("load");
+        let h = std::thread::spawn(move || {
+            let r = sb.probe_vfs(0, "/config/temp", b"").expect("probe");
+            assert!(!r.ok, "no-capability sandbox must deny");
+            assert!(
+                String::from_utf8_lossy(&r.body).contains("no capability"),
+                "got: {}",
+                String::from_utf8_lossy(&r.body)
+            );
+        });
+        h.join().expect("deny thread");
+    }
 }

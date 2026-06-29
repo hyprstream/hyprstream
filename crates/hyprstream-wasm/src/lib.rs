@@ -36,6 +36,7 @@ type RngFill = Box<dyn FnMut(&mut [u8]) + Send>;
 use wasmtime::error::Context as _;
 use wasmtime::{bail, Caller, Config, Engine, Extern, Linker, Memory, Module, Result, Store};
 
+pub mod mount;
 pub mod vfs;
 
 // ---------------------------------------------------------------------------
@@ -44,32 +45,12 @@ pub mod vfs;
 
 /// The identity a sandbox evaluation runs as.
 ///
-/// Modelled as a LOCAL newtype for now (P1): deliberately NOT a dependency on
-/// `hyprstream-rpc`/`hyprstream-vfs` yet — we are only defining the seam so that
-/// future capability host-fns are Subject-scoped by construction. When #483 / the
-/// native MAC authz epic re-cuts this, swap the inner representation for the real
-/// `RequestIdentity` / VFS namespace key without touching the Linker wiring.
-///
-/// `None` is the anonymous subject (no bound identity).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Subject(pub Option<String>);
-
-impl Subject {
-    /// An anonymous subject (no bound identity).
-    pub fn anonymous() -> Self {
-        Self(None)
-    }
-
-    /// A subject bound to a named identity/tenant.
-    pub fn named(id: impl Into<String>) -> Self {
-        Self(Some(id.into()))
-    }
-
-    /// The bound identity, if any.
-    pub fn id(&self) -> Option<&str> {
-        self.0.as_deref()
-    }
-}
+/// #483 P2: this is now the CANONICAL [`hyprstream_rpc::Subject`] (re-exported via
+/// `hyprstream_vfs::Subject`), NOT the P1 crate-local newtype. Confirmed torch-free:
+/// `hyprstream-vfs -> hyprstream-rpc` pulls no `tch`/libtorch, so the host crate
+/// still builds without LIBTORCH. Using the canonical Subject means the VFS proxy
+/// the sandbox talks to is scoped to the SAME identity the rest of the daemon uses.
+pub use hyprstream_rpc::Subject;
 
 // ---------------------------------------------------------------------------
 // Per-call Store data.
@@ -83,16 +64,20 @@ impl Subject {
 /// capability surface is Subject-parameterized without any global/thread-local
 /// state (the leak that killed the native #488 design).
 pub struct SandboxState {
-    /// The identity this evaluation runs as. Future capability host-fns
-    /// (`vfs_*`, etc.) are authorized/scoped against this.
+    /// The identity this evaluation runs as. Capability host-fns (`host_random`,
+    /// `vfs_*`) are authorized/scoped against this.
     pub subject: Subject,
     /// Entropy source for the single `host_random` capability. The HOST has OS
     /// entropy; the guest only ever sees it through this function.
     rng_bytes: RngFill,
+    /// #483: the Subject-scoped VFS proxy handle backing `env::vfs_*`. `None` =
+    /// the sandbox was created without a VFS capability (the `vfs_*` host fns then
+    /// return a "no vfs capability" error to the guest — deny-by-default).
+    vfs: Option<vfs::VfsProxyHandle>,
 }
 
 impl SandboxState {
-    /// Host state for the given subject, drawing randomness from the OS.
+    /// Host state for the given subject, drawing randomness from the OS. No VFS.
     pub fn new(subject: Subject) -> Self {
         Self {
             subject,
@@ -100,7 +85,15 @@ impl SandboxState {
                 use rand::RngCore;
                 rand::thread_rng().fill_bytes(buf);
             }),
+            vfs: None,
         }
+    }
+
+    /// Host state with a Subject-scoped VFS capability backing `env::vfs_*`.
+    pub fn with_vfs(subject: Subject, vfs: vfs::VfsProxyHandle) -> Self {
+        let mut s = Self::new(subject);
+        s.vfs = Some(vfs);
+        s
     }
 
     /// Deterministic host state for tests (fills with a fixed pattern).
@@ -112,6 +105,7 @@ impl SandboxState {
                     *b = seed.wrapping_add(i as u8);
                 }
             }),
+            vfs: None,
         }
     }
 
@@ -223,11 +217,159 @@ pub fn build_linker(engine: &Engine, module: &Module) -> Result<Linker<SandboxSt
         },
     )?;
 
+    // ── #483: the VFS capability host fns ──────────────────────────────────
+    //
+    // Each reads `caller.data().subject` (NEVER a guest-supplied identity) and
+    // submits the op to the Subject-scoped proxy handle in the Store data. The op
+    // result is written back into a guest buffer (allocated via the guest's own
+    // `alloc` export) as `[status_byte][payload...]` and returned packed as
+    // `(out_ptr<<32)|out_len` — the i64 ABI the guest's `take_reply` decodes.
+    //
+    // If the sandbox has NO vfs handle, the call returns a deny reply
+    // (deny-by-default): the capability is only present when explicitly granted.
+
+    // vfs_cat(path_ptr, path_len) -> i64
+    linker.func_wrap(
+        "env",
+        "vfs_cat",
+        |mut caller: Caller<'_, SandboxState>, ptr: i32, len: i32| -> Result<i64> {
+            let path = read_guest_string(&mut caller, ptr, len)?;
+            let reply = match caller.data().vfs.clone() {
+                Some(h) => h.cat(&path),
+                None => no_vfs_reply(),
+            };
+            write_reply(&mut caller, reply)
+        },
+    )?;
+
+    // vfs_ls(path_ptr, path_len) -> i64
+    linker.func_wrap(
+        "env",
+        "vfs_ls",
+        |mut caller: Caller<'_, SandboxState>, ptr: i32, len: i32| -> Result<i64> {
+            let path = read_guest_string(&mut caller, ptr, len)?;
+            let reply = match caller.data().vfs.clone() {
+                Some(h) => h.ls(&path),
+                None => no_vfs_reply(),
+            };
+            write_reply(&mut caller, reply)
+        },
+    )?;
+
+    // vfs_echo(path_ptr, path_len, data_ptr, data_len) -> i64
+    linker.func_wrap(
+        "env",
+        "vfs_echo",
+        |mut caller: Caller<'_, SandboxState>,
+         pptr: i32,
+         plen: i32,
+         dptr: i32,
+         dlen: i32|
+         -> Result<i64> {
+            let path = read_guest_string(&mut caller, pptr, plen)?;
+            let data = read_guest_bytes(&mut caller, dptr, dlen)?;
+            let reply = match caller.data().vfs.clone() {
+                Some(h) => h.echo(&path, &data),
+                None => no_vfs_reply(),
+            };
+            write_reply(&mut caller, reply)
+        },
+    )?;
+
+    // vfs_ctl(path_ptr, path_len, cmd_ptr, cmd_len) -> i64
+    linker.func_wrap(
+        "env",
+        "vfs_ctl",
+        |mut caller: Caller<'_, SandboxState>,
+         pptr: i32,
+         plen: i32,
+         cptr: i32,
+         clen: i32|
+         -> Result<i64> {
+            let path = read_guest_string(&mut caller, pptr, plen)?;
+            let cmd = read_guest_bytes(&mut caller, cptr, clen)?;
+            let reply = match caller.data().vfs.clone() {
+                Some(h) => h.ctl(&path, &cmd),
+                None => no_vfs_reply(),
+            };
+            write_reply(&mut caller, reply)
+        },
+    )?;
+
     // Wire every OTHER declared import to a trap. This is the explicit, auditable
     // statement that the guest gets NO other host capability.
     linker.define_unknown_imports_as_traps(module)?;
 
     Ok(linker)
+}
+
+/// The deny-by-default reply when a sandbox has no VFS capability granted.
+fn no_vfs_reply() -> vfs::VfsReply {
+    vfs::VfsReply {
+        ok: false,
+        body: b"vfs: no capability granted to this sandbox".to_vec(),
+    }
+}
+
+/// Read `len` bytes of guest memory at `ptr` as a (lossy) UTF-8 string.
+fn read_guest_string(caller: &mut Caller<'_, SandboxState>, ptr: i32, len: i32) -> Result<String> {
+    let bytes = read_guest_bytes(caller, ptr, len)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Read `len` bytes of guest memory at `ptr`.
+fn read_guest_bytes(caller: &mut Caller<'_, SandboxState>, ptr: i32, len: i32) -> Result<Vec<u8>> {
+    if len <= 0 {
+        return Ok(Vec::new());
+    }
+    let memory = match caller.get_export("memory") {
+        Some(Extern::Memory(m)) => m,
+        _ => bail!("guest has no exported memory"),
+    };
+    let data = memory.data(&caller);
+    let start = ptr as usize;
+    let end = start
+        .checked_add(len as usize)
+        .ok_or_else(|| wasmtime::Error::msg("vfs arg length overflow"))?;
+    if end > data.len() {
+        bail!("vfs arg out of bounds");
+    }
+    Ok(data[start..end].to_vec())
+}
+
+/// Serialise a [`vfs::VfsReply`] into a freshly guest-`alloc`ated buffer as
+/// `[status_byte][payload...]` and return the packed `(ptr<<32)|len` i64. The
+/// guest reads it back and `dealloc`s the buffer (see the guest's `take_reply`).
+fn write_reply(caller: &mut Caller<'_, SandboxState>, reply: vfs::VfsReply) -> Result<i64> {
+    // status: 0 = ok, 1 = err (matches the guest's TAG_OK / TAG_ERR).
+    let status: u8 = if reply.ok { 0 } else { 1 };
+    let total = 1 + reply.body.len();
+
+    // Allocate the reply buffer inside the guest via its own allocator so the
+    // guest's `dealloc(ptr, len)` matches.
+    let alloc = caller
+        .get_export("alloc")
+        .and_then(Extern::into_func)
+        .ok_or_else(|| wasmtime::Error::msg("guest has no alloc export"))?
+        .typed::<i32, i32>(&caller)?;
+    let out_ptr = alloc.call(&mut *caller, total as i32)?;
+
+    let memory = match caller.get_export("memory") {
+        Some(Extern::Memory(m)) => m,
+        _ => bail!("guest has no exported memory"),
+    };
+    let mem = memory.data_mut(&mut *caller);
+    let start = out_ptr as usize;
+    let end = start
+        .checked_add(total)
+        .ok_or_else(|| wasmtime::Error::msg("reply length overflow"))?;
+    if end > mem.len() {
+        bail!("reply write out of bounds");
+    }
+    mem[start] = status;
+    mem[start + 1..end].copy_from_slice(&reply.body);
+
+    Ok(((out_ptr as u64) << 32 | total as u64) as i64)
 }
 
 fn write_memory(
@@ -260,6 +402,9 @@ pub struct Sandbox {
     module: Module,
     linker: Linker<SandboxState>,
     subject: Subject,
+    /// #483: optional Subject-scoped VFS capability handed to every `Store` this
+    /// sandbox builds. `None` = no VFS capability (deny-by-default).
+    vfs: Option<vfs::VfsProxyHandle>,
 }
 
 impl Sandbox {
@@ -278,7 +423,18 @@ impl Sandbox {
             module,
             linker,
             subject,
+            vfs: None,
         })
+    }
+
+    /// Grant this sandbox a Subject-scoped VFS capability (`env::vfs_*`).
+    ///
+    /// The `handle` should be a [`vfs::VfsProxyHandle`] from
+    /// `spawn_vfs_proxy(ns, subject)` with the SAME subject the sandbox is bound to,
+    /// so the capability is scoped to this sandbox's identity. Builder-style.
+    pub fn with_vfs(mut self, handle: vfs::VfsProxyHandle) -> Self {
+        self.vfs = Some(handle);
+        self
     }
 
     /// The subject this sandbox is bound to.
@@ -286,10 +442,18 @@ impl Sandbox {
         &self.subject
     }
 
+    /// Build the per-call host state (subject + optional VFS capability).
+    fn make_state(&self) -> SandboxState {
+        match self.vfs.clone() {
+            Some(h) => SandboxState::with_vfs(self.subject.clone(), h),
+            None => SandboxState::new(self.subject.clone()),
+        }
+    }
+
     /// Fresh per-call Store for this sandbox's subject, with the epoch pushed out
     /// of the way (so the caller chooses fuel- or epoch-bounding explicitly).
     fn new_store(&self) -> Store<SandboxState> {
-        Store::new(&self.engine, SandboxState::new(self.subject.clone()))
+        Store::new(&self.engine, self.make_state())
     }
 
     /// Run `source` in a fresh interpreter with the given fuel budget.
@@ -358,5 +522,254 @@ impl Sandbox {
     /// wall-clock bound used by [`Sandbox::eval_with_epoch_deadline`].
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// Drive the guest's `vfs_probe` export: make the GUEST call an `env::vfs_*`
+    /// host fn, proving the capability is real end-to-end (guest -> host fn ->
+    /// Subject-scoped proxy -> `Namespace`).
+    ///
+    /// `op`: 0=cat, 1=ls, 2=echo, 3=ctl. `path` + optional `body` (echo/ctl). Returns
+    /// the decoded `[status][payload]` reply the host fn produced. This is the
+    /// minimal "a guest script that reads/writes a VFS path goes through the Mount"
+    /// path for deliverable (1); a follow-up registers Python builtins so guest
+    /// Python source itself can call these (see guest `guest_cat`/etc.).
+    pub fn probe_vfs(&self, op: i32, path: &str, body: &[u8]) -> Result<vfs::VfsReply> {
+        let mut store = self.new_store();
+        store.set_fuel(u64::MAX).context("set fuel")?;
+        store.set_epoch_deadline(u64::MAX);
+        let instance = self
+            .linker
+            .instantiate(&mut store, &self.module)
+            .context("instantiate guest")?;
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or_else(|| wasmtime::Error::msg("guest memory export"))?;
+        let alloc = instance.get_typed_func::<i32, i32>(&mut store, "alloc")?;
+        let probe = instance
+            .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&mut store, "vfs_probe")?;
+
+        // Ship path + body into guest memory.
+        let pbytes = path.as_bytes();
+        let plen = pbytes.len() as i32;
+        let pptr = if plen > 0 {
+            let p = alloc.call(&mut store, plen)?;
+            memory.write(&mut store, p as usize, pbytes)?;
+            p
+        } else {
+            0
+        };
+        let blen = body.len() as i32;
+        let bptr = if blen > 0 {
+            let p = alloc.call(&mut store, blen)?;
+            memory.write(&mut store, p as usize, body)?;
+            p
+        } else {
+            0
+        };
+
+        let packed = probe
+            .call(&mut store, (op, pptr, plen, bptr, blen))
+            .context("guest vfs_probe trapped")?;
+
+        // The host wrote the reply via the guest allocator; decode it.
+        let p = packed as u64;
+        let out_ptr = (p >> 32) as usize;
+        let out_len = (p & 0xffff_ffff) as usize;
+        if out_ptr == 0 || out_len == 0 {
+            bail!("vfs_probe empty reply");
+        }
+        let data = memory.data(&store);
+        if out_ptr + out_len > data.len() {
+            bail!("vfs_probe reply out of bounds");
+        }
+        let status = data[out_ptr];
+        let payload = data[out_ptr + 1..out_ptr + out_len].to_vec();
+        Ok(vfs::VfsReply {
+            ok: status == TAG_OK,
+            body: payload,
+        })
+    }
+
+    /// Open a PERSISTENT `/lang/python` shell over this sandbox (#483 P2).
+    ///
+    /// Unlike [`Sandbox::eval`] (legacy #505, fresh interpreter per call), the
+    /// returned [`PyShell`] holds ONE long-lived `Store` + `Instance`, so the guest's
+    /// persistent interpreter + globals survive across `eval`/`exec` calls — the
+    /// `/lang/python/vars/` + `/defs/` semantics depend on this.
+    ///
+    /// `fuel` is set per `py_op` call (a fresh budget each invocation); the store
+    /// itself is reused. The epoch is pushed out (fuel is the limiter for the shell
+    /// path; a future variant can re-arm the epoch per call).
+    pub fn open_shell(&self, per_call_fuel: u64) -> Result<PyShell> {
+        let mut store = self.new_store();
+        store.set_fuel(per_call_fuel).context("set fuel")?;
+        store.set_epoch_deadline(u64::MAX);
+        let instance = self
+            .linker
+            .instantiate(&mut store, &self.module)
+            .context("instantiate guest")?;
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or_else(|| wasmtime::Error::msg("guest memory export"))?;
+        let alloc = instance.get_typed_func::<i32, i32>(&mut store, "alloc")?;
+        let dealloc = instance.get_typed_func::<(i32, i32), ()>(&mut store, "dealloc")?;
+        let py_op = instance.get_typed_func::<(i32, i32, i32), i64>(&mut store, "py_op")?;
+        Ok(PyShell {
+            store,
+            memory,
+            alloc,
+            dealloc,
+            py_op,
+            per_call_fuel,
+        })
+    }
+}
+
+/// The op codes the guest's `py_op` export understands (must match the guest's
+/// `Op` enum byte-for-byte).
+#[derive(Clone, Copy, Debug)]
+#[repr(i32)]
+enum PyOp {
+    Eval = 0,
+    Exec = 1,
+    ListVars = 2,
+    GetVar = 3,
+    ListDefs = 4,
+    GetDef = 5,
+}
+
+/// Status tags in the first byte of a `py_op` reply (must match the guest:
+/// `TAG_OK=0`, `TAG_ERR=1`, `TAG_NONE=2`). Only OK and NONE are matched explicitly;
+/// any other tag (i.e. ERR=1) decodes to [`PyResult::Err`].
+const TAG_OK: u8 = 0;
+const TAG_NONE: u8 = 2;
+
+/// The outcome of a `py_op`: a status tag plus the UTF-8 payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PyResult {
+    /// Success — the payload (repr / stdout / newline-joined names).
+    Ok(String),
+    /// A Python-level error — the message.
+    Err(String),
+    /// The requested name was absent (get_var / get_def).
+    None,
+}
+
+impl PyResult {
+    /// The success payload, or `None` for Err/None.
+    pub fn ok(&self) -> Option<&str> {
+        match self {
+            PyResult::Ok(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
+/// A persistent `/lang/python` shell over a single guest instance (#483 P2).
+///
+/// Holds the long-lived `Store`/`Instance` so the guest interpreter's state
+/// survives across calls. Drives the guest's `py_op` ABI: ship the argument into
+/// guest memory, call `py_op(op, ptr, len)`, decode the packed `(out_ptr<<32)|len`
+/// reply, then `dealloc` the reply buffer.
+///
+/// `!Send`-free at the type level (wasmtime types are `Send`), but a `PyShell` must
+/// be driven from a NON-async thread if its sandbox holds a VFS capability (the
+/// `vfs_*` host fns `blocking_send`).
+pub struct PyShell {
+    store: Store<SandboxState>,
+    memory: Memory,
+    alloc: wasmtime::TypedFunc<i32, i32>,
+    dealloc: wasmtime::TypedFunc<(i32, i32), ()>,
+    py_op: wasmtime::TypedFunc<(i32, i32, i32), i64>,
+    per_call_fuel: u64,
+}
+
+impl PyShell {
+    /// Run one op with `arg` as the UTF-8 argument; decode the reply.
+    fn call(&mut self, op: PyOp, arg: &str) -> Result<PyResult> {
+        // Fresh fuel budget per call (the store is reused, fuel is not).
+        self.store.set_fuel(self.per_call_fuel).context("set fuel")?;
+
+        let bytes = arg.as_bytes();
+        let len = bytes.len() as i32;
+        let ptr = if len > 0 {
+            let p = self.alloc.call(&mut self.store, len)?;
+            self.memory
+                .write(&mut self.store, p as usize, bytes)
+                .context("write py_op arg")?;
+            p
+        } else {
+            0
+        };
+
+        let packed = self
+            .py_op
+            .call(&mut self.store, (op as i32, ptr, len))
+            .context("guest py_op trapped")?;
+        if len > 0 {
+            let _ = self.dealloc.call(&mut self.store, (ptr, len));
+        }
+
+        // Decode (out_ptr<<32)|out_len, read [tag][payload], then dealloc it.
+        let p = packed as u64;
+        let out_ptr = (p >> 32) as usize;
+        let out_len = (p & 0xffff_ffff) as usize;
+        if out_ptr == 0 || out_len == 0 {
+            return Ok(PyResult::Err("empty reply".to_owned()));
+        }
+        let data = self.memory.data(&self.store);
+        if out_ptr + out_len > data.len() {
+            bail!("py_op reply out of bounds");
+        }
+        let tag = data[out_ptr];
+        let body = String::from_utf8_lossy(&data[out_ptr + 1..out_ptr + out_len]).into_owned();
+        let _ = self
+            .dealloc
+            .call(&mut self.store, (out_ptr as i32, out_len as i32));
+
+        Ok(match tag {
+            TAG_OK => PyResult::Ok(body),
+            TAG_NONE => PyResult::None,
+            _ => PyResult::Err(body),
+        })
+    }
+
+    /// Evaluate an expression -> `repr(result)` (with `\n---\n<stdout>` appended if
+    /// the expression printed anything), mirroring the native `eval` file.
+    pub fn eval(&mut self, expr: &str) -> Result<PyResult> {
+        self.call(PyOp::Eval, expr)
+    }
+
+    /// Execute statements -> captured stdout, mirroring the native `stdout` file.
+    pub fn exec(&mut self, src: &str) -> Result<PyResult> {
+        self.call(PyOp::Exec, src)
+    }
+
+    /// Newline-joined non-dunder global variable names (`vars/`).
+    pub fn list_vars(&mut self) -> Result<Vec<String>> {
+        Ok(split_names(self.call(PyOp::ListVars, "")?))
+    }
+
+    /// `repr` of one global variable (`vars/<name>`), or `None` if absent.
+    pub fn get_var(&mut self, name: &str) -> Result<PyResult> {
+        self.call(PyOp::GetVar, name)
+    }
+
+    /// Newline-joined callable global names (`defs/`).
+    pub fn list_defs(&mut self) -> Result<Vec<String>> {
+        Ok(split_names(self.call(PyOp::ListDefs, "")?))
+    }
+
+    /// `repr` of one callable global (`defs/<name>`), or `None` if absent/not callable.
+    pub fn get_def(&mut self, name: &str) -> Result<PyResult> {
+        self.call(PyOp::GetDef, name)
+    }
+}
+
+/// Split a newline-joined name list reply into a `Vec<String>` (empty if not Ok).
+fn split_names(r: PyResult) -> Vec<String> {
+    match r {
+        PyResult::Ok(s) if !s.is_empty() => s.lines().map(|l| l.to_owned()).collect(),
+        _ => Vec::new(),
     }
 }
