@@ -6917,6 +6917,7 @@ dependencies = [
  "hyprstream-tcl",
  "hyprstream-vfs",
  "hyprstream-vfs-server",
+ "inventory",
  "kata-sys-util",
  "kata-types",
  "libc",

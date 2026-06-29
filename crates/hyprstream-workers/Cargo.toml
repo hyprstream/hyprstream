@@ -50,6 +50,9 @@ glob = { workspace = true }
 nix = { workspace = true }
 which = { workspace = true }
 
+# Compile-time backend registry (sandbox backends self-register via inventory::submit!)
+inventory = { workspace = true }
+
 # Service management utilities (merged into hyprstream-rpc)
 
 # D-Bus integration (optional, for container D-Bus proxy)

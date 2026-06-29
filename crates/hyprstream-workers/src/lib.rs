@@ -63,11 +63,13 @@ pub mod events;
 pub mod dbus;
 
 // Re-export main types
-pub use config::{BackendType, HypervisorType, ImageConfig, PoolConfig, WorkerConfig, WorkflowConfig};
+pub use config::{HypervisorType, ImageConfig, PoolConfig, WorkerConfig, WorkflowConfig};
 pub use error::WorkerError;
 
 // Re-export service types
 pub use runtime::{WorkerService, SandboxBackend, SandboxHandle, NspawnBackend, NspawnConfig};
+// Inventory-based backend registry + fail-closed selection spine (#507)
+pub use runtime::{resolve_backend, BackendCtx, BackendRegistration};
 #[cfg(feature = "kata-vm")]
 pub use runtime::KataBackend;
 #[cfg(feature = "kata-vm")]
