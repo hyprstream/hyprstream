@@ -1,4 +1,4 @@
-@0xf1c2d3e4a5b6c7d8;
+@0xae3b014583213580;
 
 # Custom annotations for MCP tool generation and documentation.
 #
@@ -17,22 +17,34 @@
 #
 # Each action is designed to map 1:1 onto a future UCAN `cmd` (epic #547 §11).
 # Invalid action = capnp compile error (type-safe enumerant).
+# Ordinals are grouped into contiguous SEMANTIC BLOCKS (S3, #569). The ordering is
+# intentional and meaningful — read-class first, then resource/model authority, then
+# the highest-privilege admin gate, then the cross-host mesh-authority block — so the
+# numeric ordinal alone tells you the privilege class. The runtime mirror
+# `hyprstream::auth::Operation` is kept 1:1 with this ordinal layout (variant order +
+# as_capability/from_capability). This is a CLEAN BREAK: there is no wire-compat with
+# the previous flat numbering; codegen resolves `$scope(name)` back to the enumerant
+# NAME (not the ordinal), and the runtime `Scope`/`Operation` are keyed on those names,
+# so the names are the stable contract and the ordinals are free to be re-grouped.
 enum ScopeAction {
-  # Read-only / side-effect-free (9p read = no side effects). TE object-class: "read".
+  # ── Block A: read-class — side-effect-free (9p read = no side effects).
+  #            TE object-class: "read". Cheap to grant to a group.
   query      @0;  # read status/state/list           (UCAN cmd: /query)
-  # Mutating / authority actions.                       TE object-class: "write".
-  write      @1;  # create/update/delete persistent   (UCAN cmd: /persist)
-  manage     @2;  # administrative / policy / lifecycle(UCAN cmd: /manage)
-  infer      @3;  # run model inference               (UCAN cmd: /infer)
-  train      @4;  # train/fine-tune                   (UCAN cmd: /train)
-  serve      @5;  # serve via API surface             (UCAN cmd: /serve)
-  context    @6;  # context-augmented generation      (UCAN cmd: /context)
-  subscribe  @7;  # subscribe to stream/notification  (UCAN cmd: /subscribe)
-  publish    @8;  # publish/broadcast to subscribers  (UCAN cmd: /publish)
+  subscribe  @1;  # subscribe to stream/notification  (UCAN cmd: /subscribe)
+  # ── Block B: write/authority-class — mutating or capability-bearing actions on
+  #            models/resources. TE object-class: "write". Least-privilege per-node.
+  write      @2;  # create/update/delete persistent   (UCAN cmd: /persist)
+  create     @3;  # create a resource                 (UCAN cmd: /create)
+  publish    @4;  # publish/broadcast to subscribers  (UCAN cmd: /publish)
+  infer      @5;  # run model inference               (UCAN cmd: /infer)
+  train      @6;  # train/fine-tune                   (UCAN cmd: /train)
+  context    @7;  # context-augmented generation      (UCAN cmd: /context)
+  serve      @8;  # serve via API surface             (UCAN cmd: /serve)
   spawn      @9;  # spawn a process/task              (UCAN cmd: /spawn)
-  create     @10; # create a resource                 (UCAN cmd: /create)
-  # Inference-mesh authority actions (#319) — distinct from model actions so a
-  # model grant can never satisfy a mesh-authority gate.
+  # ── Block C: admin authority — highest-privilege lifecycle/policy gate.
+  manage     @10; # administrative / policy / lifecycle(UCAN cmd: /manage)
+  # ── Block D: inference-mesh authority (#319) — host↔host pipeline rights, distinct
+  #            from model actions so a model grant can never satisfy a mesh gate.
   meshInvoke @11; # umbrella mesh invoke right         (UCAN cmd: /mesh/rpc)
   meshStage  @12; # submit activation/stage to peer    (UCAN cmd: /mesh/infer/stage)
   meshDelta  @13; # submit TTT delta to peer/aggregator(UCAN cmd: /mesh/delta/submit)

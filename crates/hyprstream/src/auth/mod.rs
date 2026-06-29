@@ -36,31 +36,47 @@ pub use valkey::ValkeyUserStore;
 
 /// Operation types that can be controlled via policies
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+//
+// VARIANT ORDER IS LOAD-BEARING (S3, #569): the first 14 variants are kept 1:1
+// (in order) with the `ScopeAction` enum ordinals in
+// `crates/hyprstream-rpc/schema/annotations.capnp`. The semantic blocks are:
+//   Block A read-class:        Query @0, Subscribe @1
+//   Block B write/authority:   Write @2, Create @3, Publish @4, Infer @5,
+//                              Train @6, Context @7, Serve @8, Spawn @9
+//   Block C admin authority:   Manage @10
+//   Block D mesh authority:    MeshInvoke @11, MeshStage @12, MeshDelta @13
+// `MeshStatus` is appended AFTER the 14 ScopeAction-mirrored variants: it is NOT a
+// distinct ScopeAction (it shares the `query`/`query.status` wire action), so it has
+// no ordinal in the schema enum and is excluded from the exact-inverse round-trip.
 pub enum Operation {
+    // ── Block A: read-class (ScopeAction @0..@1) ──────────────────────────
+    /// Query data (q)
+    Query,
+    /// Subscribe to a stream/notification (b)
+    Subscribe,
+    // ── Block B: write/authority-class (ScopeAction @2..@9) ───────────────
+    /// Write data (w)
+    Write,
+    /// Create a resource (r)
+    Create,
+    /// Publish/broadcast to subscribers (l)
+    Publish,
     /// Run model inference (i)
     Infer,
     /// Train/fine-tune model (t)
     Train,
-    /// Query data (q)
-    Query,
-    /// Write data (w)
-    Write,
-    /// Serve via API (s)
-    Serve,
-    /// Admin operations (m)
-    Manage,
     /// Context-augmented generation (c)
     Context,
-    /// Subscribe to a stream/notification (b)
-    Subscribe,
-    /// Publish/broadcast to subscribers (l)
-    Publish,
+    /// Serve via API (s)
+    Serve,
     /// Spawn a process or task (p)
     Spawn,
-    /// Create a resource (r)
-    Create,
+    // ── Block C: admin authority (ScopeAction @10) ────────────────────────
+    /// Admin operations (m)
+    Manage,
     // ─────────────────────────────────────────────────────────────────────
-    // Inference-mesh (#319) — host↔host pipeline RPC abilities.
+    // Block D: Inference-mesh (#319) — host↔host pipeline RPC abilities.
+    // (ScopeAction @11..@13)
     //
     // These gate calls between inference hosts on the cluster mesh (e.g. the
     // router→host activation hand-off and host→aggregator delta submission).
@@ -119,18 +135,24 @@ impl Operation {
     /// annotation) and runtime enforcement. `MeshStatus` shares `query` because the
     /// mesh read ability IS the canonical status read (#319), matching `as_str()`.
     pub fn as_capability(&self) -> &'static str {
+        // Arms follow the ScopeAction ordinal blocks (annotations.capnp):
+        // A read, B write/authority, C admin, D mesh-authority.
         match self {
+            // Block A (@0..@1)
             Operation::Query | Operation::MeshStatus => "query",
+            Operation::Subscribe => "subscribe",
+            // Block B (@2..@9)
             Operation::Write => "write",
-            Operation::Manage => "manage",
+            Operation::Create => "create",
+            Operation::Publish => "publish",
             Operation::Infer => "infer",
             Operation::Train => "train",
-            Operation::Serve => "serve",
             Operation::Context => "context",
-            Operation::Subscribe => "subscribe",
-            Operation::Publish => "publish",
+            Operation::Serve => "serve",
             Operation::Spawn => "spawn",
-            Operation::Create => "create",
+            // Block C (@10)
+            Operation::Manage => "manage",
+            // Block D (@11..@13)
             Operation::MeshInvoke => "meshInvoke",
             Operation::MeshStage => "meshStage",
             Operation::MeshDelta => "meshDelta",
@@ -143,24 +165,28 @@ impl Operation {
     ///
     /// Returns `None` for an unknown token; callers MUST fail closed (no default-allow).
     pub fn from_capability(action: &str) -> Option<Self> {
+        // Exact inverse of `as_capability`, arms ordered by ScopeAction ordinal blocks.
+        // 1:1 with `ScopeAction` (#547/#569): `subscribe`/`publish` are distinct enforced
+        // abilities — NOT collapsed into `context`/`serve`. Collapsing them made
+        // `from_capability` non-invertible, so a granted `subscribe:notification:*` /
+        // `publish:notification:*` scope was enforced as `context`/`serve` (granted ≠
+        // enforced).
         Some(match action {
+            // Block A (@0..@1)
             "query" => Operation::Query,
+            "subscribe" => Operation::Subscribe,
+            // Block B (@2..@9)
             "write" => Operation::Write,
-            "manage" => Operation::Manage,
+            "create" => Operation::Create,
+            "publish" => Operation::Publish,
             "infer" => Operation::Infer,
             "train" => Operation::Train,
-            "serve" => Operation::Serve,
             "context" => Operation::Context,
-            // 1:1 with `ScopeAction` (#547/#569): `subscribe`/`publish` are distinct
-            // enforced abilities — NOT collapsed into `context`/`serve`. Collapsing
-            // them made `from_capability` non-invertible, so a granted
-            // `subscribe:notification:*` / `publish:notification:*` scope was enforced
-            // as `context`/`serve` (granted ≠ enforced). These arms are the exact
-            // inverse of `as_capability`.
-            "subscribe" => Operation::Subscribe,
-            "publish" => Operation::Publish,
+            "serve" => Operation::Serve,
             "spawn" => Operation::Spawn,
-            "create" => Operation::Create,
+            // Block C (@10)
+            "manage" => Operation::Manage,
+            // Block D (@11..@13)
             "meshInvoke" => Operation::MeshInvoke,
             "meshStage" => Operation::MeshStage,
             "meshDelta" => Operation::MeshDelta,
