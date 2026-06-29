@@ -50,7 +50,7 @@ fn build_server() -> Result<(web_transport_quinn::Server, std::net::SocketAddr, 
 /// via `dial_stream`, subscribes, and receives MAC-verified frames.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn networked_moq_subscribe_receives_mac_verified_frames() -> Result<()> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    hyprstream_rpc::transport::install_pq_crypto_provider();
 
     // Server-side moq origin (the shared broadcast tree external subscribers see).
     let producer = moq_net::Origin::random().produce();

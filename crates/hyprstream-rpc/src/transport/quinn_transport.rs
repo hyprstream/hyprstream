@@ -629,7 +629,7 @@ mod tests {
     /// with a 0xCD marker prefix, client asserts on the response.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn quinn_rpc_round_trip() -> Result<()> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::transport::pq_provider::install_pq_crypto_provider();
 
         let processor = crate::transport::rpc_session::from_fn(|req: Bytes| async move {
             let mut out = Vec::with_capacity(1 + req.len());
@@ -659,7 +659,7 @@ mod tests {
     /// wrong => Err, empty set => Err = fail-closed).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn verify_peer_cert_pinned_accepts_right_rejects_wrong() -> Result<()> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::transport::pq_provider::install_pq_crypto_provider();
         let processor =
             crate::transport::rpc_session::from_fn(|req: Bytes| async move { Ok(req) });
         let (server, addr, cert_der) = build_server()?;
@@ -684,7 +684,7 @@ mod tests {
     /// rejected while the first is still live. The first keeps working.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn quinn_connection_cap_rejects_excess() -> Result<()> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::transport::pq_provider::install_pq_crypto_provider();
 
         let processor =
             crate::transport::rpc_session::from_fn(|req: Bytes| async move { Ok(req) });
@@ -733,7 +733,7 @@ mod tests {
     /// with "now safe to shut down" — no wall-clock sleep races.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn quinn_shutdown_drains_in_flight() -> Result<()> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::transport::pq_provider::install_pq_crypto_provider();
 
         let entered = Arc::new(tokio::sync::Notify::new());
         let entered_c = Arc::clone(&entered);
