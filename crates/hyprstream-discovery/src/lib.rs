@@ -52,3 +52,74 @@ pub use generated::discovery_client::{
     GetRecordRequest, RecordCar,
     dispatch_discovery, serialize_response,
 };
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod did_field_domain_type_tests {
+    use super::*;
+    use generated::discovery_client::{EnvelopeKeyset, RegisterEnvelopeKeysetRequest};
+    use hyprstream_rpc::identity::Did;
+    use hyprstream_rpc::{serialize_message, FromCapnp, ToCapnp};
+
+    /// Field-level `$domainType("hyprstream_rpc::identity::Did")` on
+    /// `EnvelopeKeyset.serviceDid` must generate a `Did` newtype field (not `String`),
+    /// and the value must round-trip through the capnp wire (which stays `Text`).
+    #[test]
+    fn envelope_keyset_service_did_is_did_and_roundtrips() {
+        let original = EnvelopeKeyset {
+            service_did: Did::new("did:web:registry.example".to_owned()),
+            cose_keyset_cbor: vec![1, 2, 3, 4],
+            fetched_at: 1234,
+        };
+        // Type-level proof: the codegen emitted a `Did` field, not a `String`.
+        let _typecheck: &Did = &original.service_did;
+
+        let bytes = serialize_message(|msg| {
+            let mut b = msg.init_root::<discovery_capnp::envelope_keyset::Builder>();
+            original.write_to(&mut b);
+        })
+        .expect("serialize");
+
+        let reader =
+            capnp::serialize::read_message(&mut &bytes[..], capnp::message::ReaderOptions::new())
+                .expect("read message");
+        let root = reader
+            .get_root::<discovery_capnp::envelope_keyset::Reader>()
+            .expect("root reader");
+        let back = EnvelopeKeyset::read_from(root).expect("read_from");
+
+        assert_eq!(back.service_did, original.service_did);
+        assert_eq!(back.service_did.as_str(), "did:web:registry.example");
+        assert!(back.service_did.is_did_web());
+        assert_eq!(back.cose_keyset_cbor, vec![1, 2, 3, 4]);
+        assert_eq!(back.fetched_at, 1234);
+    }
+
+    /// Same for the request struct's `serviceDid` field.
+    #[test]
+    fn register_envelope_keyset_request_service_did_roundtrips() {
+        let original = RegisterEnvelopeKeysetRequest {
+            service_did: Did::new("did:key:z6Mkexample".to_owned()),
+            cose_keyset_cbor: vec![9, 9, 9],
+        };
+        let _typecheck: &Did = &original.service_did;
+
+        let bytes = serialize_message(|msg| {
+            let mut b =
+                msg.init_root::<discovery_capnp::register_envelope_keyset_request::Builder>();
+            original.write_to(&mut b);
+        })
+        .expect("serialize");
+
+        let reader =
+            capnp::serialize::read_message(&mut &bytes[..], capnp::message::ReaderOptions::new())
+                .expect("read message");
+        let root = reader
+            .get_root::<discovery_capnp::register_envelope_keyset_request::Reader>()
+            .expect("root reader");
+        let back = RegisterEnvelopeKeysetRequest::read_from(root).expect("read_from");
+
+        assert_eq!(back.service_did.as_str(), "did:key:z6Mkexample");
+        assert!(back.service_did.is_did_key());
+    }
+}

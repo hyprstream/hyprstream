@@ -8,9 +8,6 @@ on:
     paths:
       - 'packaging/rpm/**'
       - '.github/workflows/rpm.yml'
-      - 'crates/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
   workflow_dispatch:
 
 env:
@@ -18,7 +15,7 @@ env:
 
 jobs:
   # Build the RPM and install it inside Fedora and Rocky containers.
-  # Runs on every PR touching packaging/build inputs, and on release tags.
+  # Runs on PRs that touch the RPM packaging, and on release tags.
   build-install:
     name: Build + install (${{ matrix.distro.name }})
     runs-on: ubuntu-latest
