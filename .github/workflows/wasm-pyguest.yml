@@ -1,0 +1,94 @@
+name: WASM pyguest
+
+# Build the RustPython wasm guest (#483/#505) FROM ITS CRATE DIRECTORY and assert
+# its host ABI. This crate is [workspace.exclude] with its own empty [workspace], so
+# the `wasm` job in rust.yml (cargo check -p hyprstream-rpc) never compiles it.
+#
+# WHY a dedicated job: the guest's `getrandom_backend="custom"` rustflag lives in
+# crates/hyprstream-wasm-pyguest/.cargo/config.toml, which cargo only discovers by
+# walking up from the CWD — NOT from --manifest-path. Building from the repo root
+# (or with --manifest-path) silently drops the cfg and the wasm build fails on
+# getrandom. So this job MUST `cd` into the crate dir (working-directory below);
+# it deliberately does not use --manifest-path.
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'crates/hyprstream-wasm-pyguest/**'
+      - '.github/workflows/wasm-pyguest.yml'
+  pull_request:
+    paths:
+      - 'crates/hyprstream-wasm-pyguest/**'
+      - '.github/workflows/wasm-pyguest.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-guest:
+    name: build wasm guest (from crate dir)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (wasm32)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      # wabt provides wasm-objdump, used below to read the guest's import section.
+      - name: Install wabt
+        run: sudo apt-get update && sudo apt-get install -y wabt
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Standalone crate (own lockfile/target dir), so cache it on its own.
+          workspaces: crates/hyprstream-wasm-pyguest
+          key: wasm-pyguest
+
+      - name: Build guest from its crate dir
+        # MUST run from the crate dir so cargo discovers the crate-local
+        # .cargo/config.toml carrying getrandom_backend="custom". Do NOT switch this
+        # to --manifest-path from the repo root — the cfg would be dropped and the
+        # build would fail on getrandom/wasm32. See the crate's Cargo.toml.
+        working-directory: crates/hyprstream-wasm-pyguest
+        run: cargo build --release --target wasm32-unknown-unknown
+
+      - name: Assert guest imports are exactly the host ABI
+        # The guest must import ONLY the host capability functions from module `env`
+        # and nothing else — in particular no wasm_js / wasi / wbindgen backend may
+        # leak in (that would mean getrandom picked a non-custom backend, i.e. the
+        # cfg was dropped, or a dependency pulled a JS shim). #483/#505 capability
+        # boundary: the host resolves exactly these five imports via the wasmtime Linker.
+        working-directory: crates/hyprstream-wasm-pyguest
+        run: |
+          set -euo pipefail
+          WASM=$(find target/wasm32-unknown-unknown/release -maxdepth 1 -name '*.wasm' | head -1)
+          if [ -z "$WASM" ]; then echo "::error::no wasm artifact produced"; exit 1; fi
+          echo "Inspecting imports of: $WASM"
+
+          # wasm-objdump prints import entries as: "... <- env.host_random"
+          ACTUAL=$(wasm-objdump -x "$WASM" \
+            | grep -oE '<- [A-Za-z0-9_]+\.[A-Za-z0-9_]+' \
+            | sed -E 's/<- ([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)/\1::\2/' \
+            | sort -u)
+          EXPECTED=$(printf '%s\n' \
+            env::host_random env::vfs_cat env::vfs_ls env::vfs_echo env::vfs_ctl \
+            | sort -u)
+
+          echo "--- actual imports ---";   echo "$ACTUAL"
+          echo "--- expected imports ---"; echo "$EXPECTED"
+
+          if ! diff <(echo "$EXPECTED") <(echo "$ACTUAL"); then
+            echo "::error::wasm guest imports do not match the expected host ABI (see diff above: < expected, > actual)"
+            exit 1
+          fi
+
+          # Belt-and-suspenders: an explicit, clearer failure if a forbidden backend
+          # ever appears (redundant with the exact-match diff above, but names the cause).
+          if echo "$ACTUAL" | grep -Eiq 'wasm_js|wasi|__wbindgen|wbg'; then
+            echo "::error::forbidden import backend present (wasm_js/wasi/wbindgen) — getrandom cfg likely dropped"
+            exit 1
+          fi
+          echo "OK: guest imports are exactly the five host ABI functions."
