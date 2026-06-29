@@ -7,6 +7,10 @@
 //! - Compile-time scope registration via inventory pattern
 //! - JWT key source abstraction for unified key resolution
 
+/// ATProto perimeter gateway: external-DID → assurance binding (#549, first half).
+/// Native-only — depends on the admission gate (`did:web`/`did:key` resolution).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod atproto_perimeter;
 pub mod claims;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod federation;
@@ -23,6 +27,8 @@ pub mod scope;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod scope_registry;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub use atproto_perimeter::{AtprotoPerimeterGateway, Ed25519Vk, EnrolledPeer, EnrollmentStore, IdentityKeys, IdentityResolver, MlDsaVk};
 pub use claims::{Claims, Cnf, CnfJwk, IdTokenClaims, OneOrMany, compute_jkt, is_local_iss};
 pub use jti_blocklist::{InMemoryJtiBlocklist, JtiBlocklist};
 pub use mac::{
