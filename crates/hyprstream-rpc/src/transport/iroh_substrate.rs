@@ -73,6 +73,10 @@ impl IrohSubstrate {
     {
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(SecretKey::from_bytes(&secret_key_bytes))
+            // PQ-hybrid TLS: pin X25519MLKEM768 on the iroh QUIC channel (#557 / S6).
+            // Overrides the preset's default (ring) provider; RFC 7250 raw-public-key
+            // identity binding is orthogonal to kx_groups and unaffected.
+            .crypto_provider(crate::transport::pq_provider::pq_crypto_provider())
             .bind()
             .await
             .map_err(|e| anyhow::anyhow!("iroh endpoint bind: {e}"))?;
