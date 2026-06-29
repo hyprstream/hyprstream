@@ -27,8 +27,9 @@ pub use claims::{Claims, Cnf, CnfJwk, IdTokenClaims, OneOrMany, compute_jkt, is_
 pub use jti_blocklist::{InMemoryJtiBlocklist, JtiBlocklist};
 pub use mac::{
     Assurance, Compartment, CompartmentSet, ContentBoundLabel, GenesisMap, GenesisReport,
-    LabelError, LabeledObject, Lattice, LatticeVersion, Level, SecurityContext, SecurityLabel,
-    StaticNodeLabel, SubjectContextClaims, VerifiedKeyMaterial, MAX_COMPARTMENTS,
+    LabelError, LabeledObject, Lattice, LatticeCodecError, LatticeDecodeError, LatticeVersion,
+    Level, SecurityContext, SecurityLabel, StaticNodeLabel, SubjectContextClaims,
+    VerifiedKeyMaterial, MAX_COMPARTMENTS,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use federation::FederationKeySource;

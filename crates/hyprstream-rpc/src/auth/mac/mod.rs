@@ -113,7 +113,7 @@ pub use genesis::{GenesisMap, GenesisReport};
 pub use label::{
     Assurance, Compartment, CompartmentSet, Level, SecurityLabel, MAX_COMPARTMENTS,
 };
-pub use lattice::{LabelError, Lattice, LatticeVersion};
+pub use lattice::{LabelError, Lattice, LatticeCodecError, LatticeDecodeError, LatticeVersion};
 pub use manifest::{ContentBoundLabel, LabeledObject, StaticNodeLabel};
 
 #[cfg(test)]
