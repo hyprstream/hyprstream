@@ -212,6 +212,9 @@ struct WorktreeRequest {
     walk @1 :NpWalk $scope(query)
         $mcpDescription("Resolve path components to a fid (9P walk). Use the returned fid for open (I/O) or ctl operations (git log/diff/blame). Each use requires a separate fid.");
     # Open: open a walked fid for I/O (like 9P Topen)
+    # Scope is `write` (NOT `query` like model.capnp's read-only ModelFs.open):
+    # a worktree is a mutable git checkout and `NpOpen` may request a write mode,
+    # so open is gated at the mutating tier here — fail-safe least-privilege.
     open @2 :NpOpen $scope(write)
         $mcpDescription("Open a walked fid for read/write I/O. After open, the fid can only be used for read/write — ctl operations (log, diff, blame) require a separate walked-not-opened fid.");
     # Create: create a file/dir under a walked directory fid (like 9P Tcreate)

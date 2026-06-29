@@ -51,6 +51,10 @@ pub enum Operation {
     Manage,
     /// Context-augmented generation (c)
     Context,
+    /// Subscribe to a stream/notification (b)
+    Subscribe,
+    /// Publish/broadcast to subscribers (l)
+    Publish,
     /// Spawn a process or task (p)
     Spawn,
     /// Create a resource (r)
@@ -91,6 +95,8 @@ impl Operation {
             Operation::Serve => 's',
             Operation::Manage => 'm',
             Operation::Context => 'c',
+            Operation::Subscribe => 'b',
+            Operation::Publish => 'l',
             Operation::Spawn => 'p',
             Operation::Create => 'r',
             // Mesh ops (#319) — distinct codes; not part of the model-capability
@@ -121,6 +127,8 @@ impl Operation {
             Operation::Train => "train",
             Operation::Serve => "serve",
             Operation::Context => "context",
+            Operation::Subscribe => "subscribe",
+            Operation::Publish => "publish",
             Operation::Spawn => "spawn",
             Operation::Create => "create",
             Operation::MeshInvoke => "meshInvoke",
@@ -143,8 +151,14 @@ impl Operation {
             "train" => Operation::Train,
             "serve" => Operation::Serve,
             "context" => Operation::Context,
-            "subscribe" => Operation::Context, // notification subscribe ⊑ context read-side
-            "publish" => Operation::Serve,     // notification publish ⊑ serve authority
+            // 1:1 with `ScopeAction` (#547/#569): `subscribe`/`publish` are distinct
+            // enforced abilities — NOT collapsed into `context`/`serve`. Collapsing
+            // them made `from_capability` non-invertible, so a granted
+            // `subscribe:notification:*` / `publish:notification:*` scope was enforced
+            // as `context`/`serve` (granted ≠ enforced). These arms are the exact
+            // inverse of `as_capability`.
+            "subscribe" => Operation::Subscribe,
+            "publish" => Operation::Publish,
             "spawn" => Operation::Spawn,
             "create" => Operation::Create,
             "meshInvoke" => Operation::MeshInvoke,
@@ -187,6 +201,8 @@ impl Operation {
             Operation::Serve   => "serve.api",
             Operation::Manage  => "ttt.writeback",
             Operation::Context => "context.augment",
+            Operation::Subscribe => "subscribe",
+            Operation::Publish => "publish",
             Operation::Spawn   => "spawn",
             Operation::Create  => "create",
             // Mesh (#319). `mesh.rpc` is the umbrella invoke right (alias
@@ -216,6 +232,8 @@ impl Operation {
             "persist.save" | "persist.export" | "persist.snapshot" | "write" => Some(Self::Write),
             "context.augment" | "context" => Some(Self::Context),
             "serve.api" | "serve" => Some(Self::Serve),
+            "subscribe" => Some(Self::Subscribe),
+            "publish" => Some(Self::Publish),
             "spawn" => Some(Self::Spawn),
             "create" => Some(Self::Create),
             // Mesh (#319). `query.status` (the mesh read ability) is owned by
@@ -237,6 +255,8 @@ impl Operation {
             's' => Some(Operation::Serve),
             'm' => Some(Operation::Manage),
             'c' => Some(Operation::Context),
+            'b' => Some(Operation::Subscribe),
+            'l' => Some(Operation::Publish),
             'p' => Some(Operation::Spawn),
             'r' => Some(Operation::Create),
             // Mesh (#319)
@@ -410,6 +430,45 @@ mod tests {
         for op in &[Operation::MeshInvoke, Operation::MeshStage, Operation::MeshDelta, Operation::MeshStatus] {
             assert!(!Operation::all().contains(op));
         }
+    }
+
+    #[test]
+    fn test_capability_token_is_exact_inverse() {
+        // `as_capability`/`from_capability` are the canonical scope-action bridge and
+        // MUST be exact inverses (1:1 with `ScopeAction`). Regression guard for the
+        // grant/enforcement divergence (#569 peer review): `subscribe`/`publish` were
+        // collapsed into `context`/`serve`, so a granted `subscribe`/`publish` scope was
+        // enforced as a different ability (granted ≠ enforced).
+        let ops = [
+            Operation::Query,
+            Operation::Write,
+            Operation::Manage,
+            Operation::Infer,
+            Operation::Train,
+            Operation::Serve,
+            Operation::Context,
+            Operation::Subscribe,
+            Operation::Publish,
+            Operation::Spawn,
+            Operation::Create,
+            Operation::MeshInvoke,
+            Operation::MeshStage,
+            Operation::MeshDelta,
+        ];
+        for op in ops {
+            assert_eq!(
+                Operation::from_capability(op.as_capability()),
+                Some(op),
+                "capability token round-trip is not 1:1 for {op:?}",
+            );
+        }
+        // `subscribe`/`publish` are distinct enforced abilities — NOT context/serve.
+        assert_eq!(Operation::from_capability("subscribe"), Some(Operation::Subscribe));
+        assert_eq!(Operation::from_capability("publish"), Some(Operation::Publish));
+        assert_eq!(Operation::Subscribe.as_capability(), "subscribe");
+        assert_eq!(Operation::Publish.as_capability(), "publish");
+        // Unknown tokens fail closed.
+        assert_eq!(Operation::from_capability("nope"), None);
     }
 
     #[test]

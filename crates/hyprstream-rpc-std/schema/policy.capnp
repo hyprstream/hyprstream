@@ -7,6 +7,7 @@
 
 using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".scope;
+using import "/annotations.capnp".scopeExempt;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".optional;
 using Opt = import "/optional.capnp";

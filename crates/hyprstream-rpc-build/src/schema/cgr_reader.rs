@@ -167,7 +167,6 @@ fn parse_cgr(
                 mcp_scope_id,
                 cli_hidden_id,
                 doc_example_id,
-                true, // request methods: scope mandatory (S3, #547)
             )?;
             let rs = extract_union_variants(
                 response_node,
@@ -178,7 +177,6 @@ fn parse_cgr(
                 mcp_scope_id,
                 cli_hidden_id,
                 doc_example_id,
-                false, // response variants carry no scope
             )?;
 
             if rv.is_empty() || rs.is_empty() {
@@ -475,14 +473,12 @@ fn extract_annotation_enum(
     target_id: Option<u64>,
     nodes: &capnp::struct_list::Reader<capnp::schema_capnp::node::Owned>,
     node_map: &BTreeMap<u64, NodeInfo>,
+    scope_ann_ids: &std::collections::BTreeSet<u64>,
 ) -> String {
     let _ = target_id;
-    // Annotation ids whose node short-name is `scope` or its alias `capability`.
-    let scope_ann_ids: std::collections::BTreeSet<u64> = node_map
-        .values()
-        .filter(|info| info.short_name == "scope" || info.short_name == "capability")
-        .map(|info| info.id)
-        .collect();
+    // `scope_ann_ids` (the annotation ids whose node short-name is `scope` or its
+    // alias `capability`) is computed once per struct by the caller, NOT rebuilt
+    // per field — this runs on the build hot path (once per union variant).
     if scope_ann_ids.is_empty() {
         return String::new();
     }
@@ -571,7 +567,6 @@ fn extract_union_variants(
     mcp_scope_id: Option<u64>,
     cli_hidden_id: Option<u64>,
     doc_example_id: Option<u64>,
-    require_scope: bool,
 ) -> Result<Vec<UnionVariant>, String> {
     let struct_reader = match struct_node.which() {
         Ok(capnp::schema_capnp::node::Struct(s)) => s,
@@ -580,6 +575,15 @@ fn extract_union_variants(
 
     let fields = struct_reader.get_fields().map_err(|e| format!("{e}"))?;
     let mut variants = Vec::new();
+
+    // Annotation ids whose node short-name is `scope` or its alias `capability`.
+    // Computed once per struct (not per field) — `extract_annotation_enum` runs on
+    // the build hot path (once per union variant).
+    let scope_ann_ids: std::collections::BTreeSet<u64> = node_map
+        .values()
+        .filter(|info| info.short_name == "scope" || info.short_name == "capability")
+        .map(|info| info.id)
+        .collect();
 
     // Collect union fields (discriminant != 0xFFFF), sorted by discriminant for determinism
     let mut union_fields: Vec<(u16, u32)> = Vec::new();
@@ -617,12 +621,11 @@ fn extract_union_variants(
             mcp_scope_id,
             nodes,
             node_map,
+            &scope_ann_ids,
         );
         // S3 (#547): scope is MANDATORY on leaf methods — enforced in
         // `validate_mandatory_scope` after scoped-client dispatchers are detected
-        // (a dispatcher variant carries no scope; its leaves do). `require_scope`
-        // is retained for callers that want the in-extractor guard in the future.
-        let _ = require_scope;
+        // (a dispatcher variant carries no scope; its leaves do).
         // `$scopeExempt("reason")` is the explicit, audited exemption from
         // mandatory scope. Resolve its annotation id by name from the node graph.
         let scope_exempt_id = node_map
@@ -1354,7 +1357,6 @@ fn build_scoped_client_for_variant(
         mcp_scope_id,
         cli_hidden_id,
         doc_example_id,
-        true, // scoped-client methods: scope mandatory (S3, #547)
     )?;
 
     let resp_node_id = match find_struct_node_id(node_map, &resp_variant.type_name) {
@@ -1371,7 +1373,6 @@ fn build_scoped_client_for_variant(
         mcp_scope_id,
         cli_hidden_id,
         doc_example_id,
-        false, // response variants carry no scope
     )?;
 
     if inner_req_variants.is_empty() || inner_resp_variants.is_empty() {
