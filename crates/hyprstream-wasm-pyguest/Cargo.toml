@@ -1,0 +1,47 @@
+[package]
+name = "hyprstream-wasm-pyguest"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "RustPython guest compiled to wasm32-unknown-unknown for the #505 capability sandbox spike"
+
+# This crate is intentionally NOT a workspace member. It is listed in the root
+# Cargo.toml [workspace.exclude] so a host-target workspace build never tries to
+# compile a wasm-only cdylib (which would also drag in libtorch deps transitively
+# via the workspace). Build explicitly:
+#   cargo build --target wasm32-unknown-unknown -p hyprstream-wasm-pyguest
+# or via this manifest path.
+
+# Empty [workspace] table makes this a standalone package (own lockfile/target),
+# belt-and-suspenders alongside the root [workspace.exclude] entry. A wasm-only
+# cdylib has no business in the host workspace's dependency resolution.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# RustPython VM. default-features=false strips the std/threading/jit pieces that
+# do not exist on wasm32-unknown-unknown. We keep:
+#   compiler       — compile source -> bytecode (no precompiled-only mode)
+#   encodings      — text codecs (utf-8 etc.), needed for str handling
+#   freeze-stdlib  — embed the pure-python stdlib into the binary so there is NO
+#                    filesystem import path at all (capability point: no FS = no os.* host effect)
+rustpython-vm = { version = "0.3", default-features = false, features = ["compiler", "encodings", "freeze-stdlib"] }
+
+# RESOLVED via `cargo tree -i getrandom` (see FINDINGS.md):
+#   The RUNTIME-critical RNG path is getrandom 0.2.17:
+#     getrandom 0.2.17 <- rand_core 0.6.4 <- rand 0.8.6 <- rustpython-common <- rustpython-vm
+#   (There is also a getrandom 0.3.4 in the tree via ahash<-hashbrown<-malachite, but
+#    ahash only touches getrandom for its optional runtime-rng and is not the VM RNG.)
+#
+# Two getrandom MAJORs are in the tree and BOTH must be satisfied on wasm:
+#   * getrandom 0.2.17 (runtime RNG: rand 0.8 <- rustpython-common <- rustpython-vm)
+#       -> `custom` feature + `register_custom_getrandom!` macro (lib.rs)
+#   * getrandom 0.3.4  (ahash runtime-rng <- hashbrown <- malachite)
+#       -> build cfg `getrandom_backend="custom"` (.cargo/config.toml) + the
+#          `#[no_mangle] __getrandom_v03_custom` extern symbol (lib.rs)
+# Both delegate to the same host import `host_random`.
+[target.wasm32-unknown-unknown.dependencies]
+getrandom02 = { package = "getrandom", version = "0.2", features = ["custom"] }
+getrandom03 = { package = "getrandom", version = "0.3" }

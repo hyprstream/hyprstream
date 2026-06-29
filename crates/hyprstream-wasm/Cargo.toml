@@ -1,0 +1,25 @@
+[package]
+name = "hyprstream-wasm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Embedded wasmtime host for the #505 untrusted-Python capability sandbox (build-viability spike)"
+
+# Workspace member (host target). It does NOT depend on tch/libtorch, so it builds
+# without LIBTORCH. Build/test scoped:
+#   cargo build -p hyprstream-wasm
+#   cargo test  -p hyprstream-wasm
+
+# NB: this crate intentionally does NOT add `[lints] workspace = true`. Lint
+# inheritance is opt-in, so the workspace's deny-by-default panic/print lints do
+# not apply — this spike uses unwrap/expect/panic freely in tests. P1 will reinstate.
+
+[dependencies]
+# Pinned exact: wasmtime 46.0.1 (latest stable as of 2026-06-29). The fuel/epoch
+# API spellings recorded in FINDINGS.md are specific to this major.
+wasmtime = "=46.0.1"
+anyhow = "1"
+rand = "0.8"
+
+[dev-dependencies]
+anyhow = "1"
