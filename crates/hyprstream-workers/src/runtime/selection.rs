@@ -421,11 +421,16 @@ mod tests {
         );
 
         // And with nspawn alongside it, `"auto"` resolves to nspawn — never wasm.
+        // Inject a deterministic availability oracle (everything available) so this
+        // does NOT depend on the runner actually having nspawn installed: nspawn is
+        // auto_selectable (and outranks), wasm is auto_selectable:false (excluded), so
+        // auto must return nspawn. (Real-runtime availability is exercised elsewhere;
+        // here we assert the selection *logic*, env-independently.)
         let nspawn = inventory::iter::<BackendRegistration>()
             .find(|r| r.name == "nspawn")
             .expect("nspawn always registered");
         let both = vec![wasm, nspawn];
-        let r = select_registration("auto", &both, |r| (r.is_available)()).unwrap();
+        let r = select_registration("auto", &both, |_| true).unwrap();
         assert_eq!(r.name, "nspawn", "auto must pick nspawn, never wasm");
     }
 
