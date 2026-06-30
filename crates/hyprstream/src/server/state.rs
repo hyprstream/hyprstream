@@ -3,6 +3,7 @@
 use crate::services::{RegistryClient, PolicyClient};
 use crate::services::generated::model_client::{ModelClient, LoadModelRequest};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use hyprstream_util::TtlCache;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -54,9 +55,10 @@ pub struct ServerState {
     /// Populated by the OAuth revocation endpoint; checked on every request.
     pub jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
 
-    /// Per-request DPoP JTI dedup map (RFC 9449 §11.1 replay prevention).
-    /// Maps jti → expiry (iat + 60s grace). Periodically cleaned up.
-    pub dpop_jti_seen: Arc<parking_lot::RwLock<HashMap<String, i64>>>,
+    /// Per-request DPoP JTI dedup cache (RFC 9449 §11.1 replay prevention).
+    /// Backed by the shared `TtlCache` with atomic check-and-record
+    /// (`insert_if_absent`); TTL = iat + 120s; self-evicting.
+    pub dpop_jti_seen: Arc<TtlCache<String, ()>>,
 
     /// Per-subject request rate limiter (fixed window, 300 req/60s default).
     pub rate_limiter: Arc<crate::server::middleware::RateLimiter>,
@@ -151,7 +153,7 @@ impl ServerState {
             oauth_issuer_url,
             federation_resolver,
             jti_blocklist,
-            dpop_jti_seen: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            dpop_jti_seen: Arc::new(TtlCache::new(10_000, 64)),
             rate_limiter: Arc::new(crate::server::middleware::RateLimiter::new(300, 60)),
         })
     }

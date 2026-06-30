@@ -10,6 +10,7 @@ use axum::{
 };
 use hyprstream_rpc::auth::JtiBlocklist as _;
 use std::time::Instant;
+use std::time::Duration;
 use subtle::ConstantTimeEq as _;
 use tracing::{debug, info, warn};
 
@@ -156,17 +157,18 @@ pub async fn auth_middleware(
                 return unauthorized_response("Authentication failed", &www_authenticate);
             }
         };
-        // Replay prevention: each DPoP jti is accepted at most once (within iat ±60s window).
+        // Replay prevention: each DPoP jti is accepted at most once (within
+        // iat ±60s window). Atomic check-and-record on the shared TtlCache.
         {
             let now = chrono::Utc::now().timestamp();
-            let expiry = proof.iat + 120; // iat ± 60s → window ends at iat + 60; store until iat + 120
-            let mut seen = state.dpop_jti_seen.write();
-            seen.retain(|_, exp| *exp > now);
-            if seen.contains_key(&proof.jti) {
+            let ttl_secs = ((proof.iat + 120) - now).max(0) as u64;
+            if !state
+                .dpop_jti_seen
+                .insert_if_absent(proof.jti.clone(), (), Duration::from_secs(ttl_secs))
+            {
                 debug!("DPoP proof jti already used: {}", proof.jti);
                 return unauthorized_response("Authentication failed", &www_authenticate);
             }
-            seen.insert(proof.jti.clone(), expiry);
         }
         // cnf.jkt must match the DPoP proof key thumbprint.
         if expected_jkt.as_bytes().ct_eq(proof.jkt.as_bytes()).unwrap_u8() == 0 {

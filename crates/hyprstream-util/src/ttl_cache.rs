@@ -143,6 +143,49 @@ where
         }));
     }
 
+    /// Atomically insert `key` only if no live (unexpired) entry exists
+    /// for it, returning `true` if the key was newly inserted.
+    ///
+    /// Returns `false` when a live entry already exists — i.e. this key
+    /// is a duplicate/replay within its validity window. The check and
+    /// the insert happen under a single lock, so concurrent callers for
+    /// the same key cannot both observe "absent" (the race that a
+    /// `get`-then-`insert` sequence would open). Expired entries are
+    /// reaped inline first, so an expired entry does not block insertion.
+    ///
+    /// This is the primitive for replay/dedup caches (e.g. DPoP `jti`
+    /// replay prevention, RFC 9449 §11.1): a caller proceeds only when
+    /// this returns `true`, and rejects on `false`.
+    pub fn insert_if_absent(&self, key: K, value: V, ttl: Duration) -> bool {
+        let now = Instant::now();
+        let expires_at = now + ttl;
+        let version = self.next_version.fetch_add(1, Ordering::Relaxed);
+
+        let mut inner = self.inner.lock();
+        Self::reap(&mut inner, now, self.reap_budget);
+
+        if inner.entries.contains_key(&key) {
+            return false;
+        }
+        if inner.entries.len() >= self.max_entries {
+            Self::evict_one(&mut inner);
+        }
+        inner.entries.insert(
+            key.clone(),
+            Entry {
+                value,
+                expires_at,
+                version,
+            },
+        );
+        inner.heap.push(Reverse(HeapEntry {
+            expires_at,
+            key,
+            version,
+        }));
+        true
+    }
+
     /// Look up `key`, returning a clone of the value if present and not
     /// yet expired. Performs a bounded inline reap first.
     ///
@@ -318,5 +361,22 @@ mod tests {
         // get triggers a reap that pops the stale (expired) v0 node.
         assert_eq!(cache.get("a"), Some(1));
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn insert_if_absent_rejects_duplicate_within_window() {
+        let cache: TtlCache<String, ()> = TtlCache::new(10, 16);
+        assert!(cache.insert_if_absent("jti-1".to_owned(), (), Duration::from_secs(60)));
+        assert!(!cache.insert_if_absent("jti-1".to_owned(), (), Duration::from_secs(60)));
+        assert!(cache.insert_if_absent("jti-2".to_owned(), (), Duration::from_secs(60)));
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn insert_if_absent_accepts_after_expiry() {
+        let cache: TtlCache<String, ()> = TtlCache::new(10, 16);
+        assert!(cache.insert_if_absent("jti".to_owned(), (), Duration::from_millis(5)));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(cache.insert_if_absent("jti".to_owned(), (), Duration::from_secs(60)));
     }
 }

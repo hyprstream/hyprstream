@@ -1122,9 +1122,9 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                     let jwt_key_source = jwt_key_source.clone();
                     // Capture shared JTI blocklist for revocation checks (RFC 7009)
                     let mcp_jti_blocklist = SHARED_JTI_BLOCKLIST.get().map(Arc::clone);
-                    // DPoP JTI replay map (separate from OAI server's, RFC 9449)
-                    let mcp_dpop_jti_seen: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<String, i64>>> =
-                        std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+                    // DPoP JTI replay cache (separate from OAI server's, RFC 9449).
+                    let mcp_dpop_jti_seen: std::sync::Arc<hyprstream_util::TtlCache<String, ()>> =
+                        std::sync::Arc::new(hyprstream_util::TtlCache::new(10_000, 64));
                     move |mut req: axum::extract::Request, next: axum::middleware::Next| {
                         let www_authenticate = www_authenticate.clone();
                         let mcp_resource_url = mcp_resource_url.clone();
@@ -1261,13 +1261,15 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                                         return res;
                                     }
                                 };
-                                // Replay prevention: each DPoP jti accepted at most once per iat window
+                                // Replay prevention: atomic check-and-record on the shared TtlCache.
                                 {
                                     let now = chrono::Utc::now().timestamp();
-                                    let expiry = proof.iat + 120;
-                                    let mut seen = dpop_jti_seen.write();
-                                    seen.retain(|_, exp| *exp > now);
-                                    if seen.contains_key(&proof.jti) {
+                                    let ttl_secs = ((proof.iat + 120) - now).max(0) as u64;
+                                    if !dpop_jti_seen.insert_if_absent(
+                                        proof.jti.clone(),
+                                        (),
+                                        std::time::Duration::from_secs(ttl_secs),
+                                    ) {
                                         tracing::debug!(%method, %uri, jti = %proof.jti, "MCP: DPoP jti replayed");
                                         let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
                                         if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
@@ -1275,7 +1277,6 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                                         }
                                         return res;
                                     }
-                                    seen.insert(proof.jti.clone(), expiry);
                                 }
                                 // cnf.jkt must match proof key thumbprint (constant-time)
                                 if expected_jkt.as_bytes().ct_eq(proof.jkt.as_bytes()).unwrap_u8() == 0 {

@@ -122,7 +122,7 @@ pub async fn require_bearer_token(
             }
         };
         // JTI replay prevention for resource requests (RFC 9449 §11.1).
-        if !state.check_and_record_dpop_jti(&proof.jti, proof.iat).await {
+        if !state.check_and_record_dpop_jti(&proof.jti, proof.iat) {
             return (
                 StatusCode::UNAUTHORIZED,
                 [(header::WWW_AUTHENTICATE, "Bearer error=\"invalid_token\"")],
