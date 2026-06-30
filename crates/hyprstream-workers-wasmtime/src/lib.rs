@@ -11,8 +11,9 @@
 //!   declared import to a trap via `define_unknown_imports_as_traps`. No
 //!   `wasmtime-wasi`, no preopens, no syscall surface: a guest that reaches for any
 //!   un-granted host function traps. [`Sandbox::call_export`] drives an arbitrary
-//!   guest export over the guest's `alloc`/`memory` ABI; the [`python`] profile
-//!   module builds its `eval`/shell on top of it.
+//!   guest export over the guest's `alloc`/`memory` ABI; language profiles (e.g. the
+//!   `hyprstream-workers-python` crate's `eval`/shell) build on top of it. This crate
+//!   is LANGUAGE-AGNOSTIC: it carries no Python (or other language) awareness.
 //! * **Profile B** ([`wasi_sandbox::WasiSandbox`]): a real WASI preview1 surface whose
 //!   ONLY filesystem is a Subject-scoped [`hyprstream_vfs::Mount`] — no host preopen,
 //!   clocks/random/sockets/sched withheld.
@@ -40,7 +41,6 @@ type RngFill = Box<dyn FnMut(&mut [u8]) + Send>;
 use wasmtime::error::Context as _;
 use wasmtime::{bail, Caller, Config, Engine, Extern, Linker, Memory, Module, Result, Store};
 
-pub mod python;
 pub mod vfs;
 pub mod wasi_fs;
 pub mod wasi_sandbox;
@@ -450,16 +450,6 @@ impl Sandbox {
         &self.subject
     }
 
-    /// The linker this sandbox instantiates guests with (profile modules reuse it).
-    pub(crate) fn linker(&self) -> &Linker<SandboxState> {
-        &self.linker
-    }
-
-    /// The compiled guest module (profile modules reuse it).
-    pub(crate) fn module(&self) -> &Module {
-        &self.module
-    }
-
     /// Build the per-call host state (subject + optional VFS capability).
     fn make_state(&self) -> SandboxState {
         match self.vfs.clone() {
@@ -499,9 +489,9 @@ impl Sandbox {
     }
 
     /// Like [`call_export`](Self::call_export) but driven by a pre-configured `store`
-    /// (the caller has set fuel and/or the epoch deadline). Profile modules use this
-    /// to express the wall-clock (epoch) bound. See [`new_store`](Self::new_store).
-    pub(crate) fn run_export(
+    /// (the caller has set fuel and/or the epoch deadline). Used internally by the
+    /// fuel- and epoch-bounded entry points. See [`new_store`](Self::new_store).
+    fn run_export(
         &self,
         mut store: Store<SandboxState>,
         name: &str,
@@ -533,9 +523,62 @@ impl Sandbox {
 
     /// The engine backing this sandbox. Spawn an [`EpochTimer`] on it to enable the
     /// wall-clock bound used by epoch-deadline call paths (e.g.
-    /// [`crate::python::eval_with_epoch_deadline`]).
+    /// [`Sandbox::call_export_with_epoch`]).
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// Like [`call_export`](Self::call_export) but bounded by a WALL-CLOCK epoch
+    /// deadline of `ticks` epoch increments instead of fuel.
+    ///
+    /// This is the PRODUCTION DoS bound: paired with an [`EpochTimer`] spawned on
+    /// [`engine`](Self::engine) ticking every `t`, the guest traps with "interrupt"
+    /// after roughly `ticks * t` of wall time. Fuel is set effectively infinite so the
+    /// epoch (not fuel) is the limiter. The caller owns the [`EpochTimer`]; this method
+    /// does not start one. Generic over the named `(i32,i32)->i32` export — language
+    /// profiles (e.g. python `eval`) drive their entry through it.
+    pub fn call_export_with_epoch(&self, name: &str, input: &[u8], ticks: u64) -> Result<i32> {
+        let mut store = self.new_store();
+        // Give plenty of fuel so the EPOCH deadline (not fuel) is the limiter here.
+        store.set_fuel(u64::MAX).context("set fuel")?;
+        // DoS guard: epoch deadline. Trap once the engine epoch advances `ticks`.
+        store.set_epoch_deadline(ticks);
+        self.run_export(store, name, input)
+    }
+
+    /// Open a PERSISTENT guest instance over this sandbox for the packed-op ABI.
+    ///
+    /// Unlike [`call_export`](Self::call_export) (a fresh instance per call), the
+    /// returned [`PersistentInstance`] holds ONE long-lived `Store` + `Instance`, so
+    /// guest interpreter state survives across calls. This is the generic substrate a
+    /// language profile (e.g. the python shell's persistent interpreter, whose
+    /// `/lang/python/vars` + `/defs` semantics depend on persistence) builds on.
+    ///
+    /// `per_call_fuel` is applied per [`PersistentInstance::call_op`] (a fresh budget
+    /// each invocation); the store itself is reused. The epoch is pushed out (fuel is
+    /// the limiter for this path). The guest must export `alloc(i32)->i32`,
+    /// `dealloc(i32,i32)`, `memory`, and the packed-op export named in `call_op`.
+    pub fn open_instance(&self, per_call_fuel: u64) -> Result<PersistentInstance> {
+        let mut store = self.new_store();
+        store.set_fuel(per_call_fuel).context("set fuel")?;
+        store.set_epoch_deadline(u64::MAX);
+        let instance = self
+            .linker
+            .instantiate(&mut store, &self.module)
+            .context("instantiate guest")?;
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or_else(|| wasmtime::Error::msg("guest memory export"))?;
+        let alloc = instance.get_typed_func::<i32, i32>(&mut store, "alloc")?;
+        let dealloc = instance.get_typed_func::<(i32, i32), ()>(&mut store, "dealloc")?;
+        Ok(PersistentInstance {
+            store,
+            memory,
+            alloc,
+            dealloc,
+            instance,
+            per_call_fuel,
+        })
     }
 
     /// Drive the guest's `vfs_probe` export: make the GUEST call an `env::vfs_*`
@@ -604,7 +647,85 @@ impl Sandbox {
     }
 }
 
+/// A persistent guest instance over a single [`Sandbox`], driving the generic
+/// packed-op ABI.
+///
+/// Holds the long-lived `Store`/`Instance` so guest state survives across calls.
+/// [`call_op`](Self::call_op) ships the argument into guest memory, calls
+/// `op(op_code, ptr, len) -> i64`, decodes the packed `(out_ptr<<32)|out_len` reply,
+/// reads `[tag][payload]`, then `dealloc`s the reply buffer — returning `(tag,
+/// payload)`. This crate assigns NO meaning to `op_code` or `tag` beyond the shared
+/// [`TAG_OK`] convention; a language profile crate (e.g. `hyprstream-workers-python`)
+/// layers its own op codes / result decoding on top.
+///
+/// A `PersistentInstance` must be driven from a NON-async thread if its sandbox holds
+/// a VFS capability (the `vfs_*` host fns `blocking_send`).
+pub struct PersistentInstance {
+    store: Store<SandboxState>,
+    memory: Memory,
+    alloc: wasmtime::TypedFunc<i32, i32>,
+    dealloc: wasmtime::TypedFunc<(i32, i32), ()>,
+    instance: wasmtime::Instance,
+    per_call_fuel: u64,
+}
+
+impl PersistentInstance {
+    /// Call the named packed-op export `(i32 op, i32 ptr, i32 len) -> i64` with `arg`
+    /// shipped into guest memory under a fresh per-call fuel budget; decode the
+    /// `(out_ptr<<32)|out_len` reply into `(tag, payload)`.
+    ///
+    /// Returns `Err` if the guest TRAPPED (fuel exhaustion, un-granted import, etc.)
+    /// or the reply was malformed (empty / out of bounds).
+    pub fn call_op(&mut self, export: &str, op: i32, arg: &[u8]) -> Result<(u8, Vec<u8>)> {
+        // Fresh fuel budget per call (the store is reused, fuel is not).
+        self.store
+            .set_fuel(self.per_call_fuel)
+            .context("set fuel")?;
+
+        let op_fn = self
+            .instance
+            .get_typed_func::<(i32, i32, i32), i64>(&mut self.store, export)?;
+
+        let len = arg.len() as i32;
+        let ptr = if len > 0 {
+            let p = self.alloc.call(&mut self.store, len)?;
+            self.memory
+                .write(&mut self.store, p as usize, arg)
+                .context("write packed-op arg")?;
+            p
+        } else {
+            0
+        };
+
+        let packed = op_fn
+            .call(&mut self.store, (op, ptr, len))
+            .with_context(|| format!("guest packed-op `{export}` trapped"))?;
+        if len > 0 {
+            let _ = self.dealloc.call(&mut self.store, (ptr, len));
+        }
+
+        let p = packed as u64;
+        let out_ptr = (p >> 32) as usize;
+        let out_len = (p & 0xffff_ffff) as usize;
+        if out_ptr == 0 || out_len == 0 {
+            bail!("packed-op empty reply");
+        }
+        let data = self.memory.data(&self.store);
+        if out_ptr + out_len > data.len() {
+            bail!("packed-op reply out of bounds");
+        }
+        let tag = data[out_ptr];
+        let body = data[out_ptr + 1..out_ptr + out_len].to_vec();
+        let _ = self
+            .dealloc
+            .call(&mut self.store, (out_ptr as i32, out_len as i32));
+        Ok((tag, body))
+    }
+}
+
 /// Status tag for an "ok" reply in the first byte of a host-serialised guest reply
-/// buffer (the `vfs_*` and `py_op` ABIs share this convention: 0 = ok). Used by
-/// [`Sandbox::probe_vfs`] and the [`python`] profile decoder.
-pub(crate) const TAG_OK: u8 = 0;
+/// buffer (the `vfs_*` and packed-op ABIs share this convention: 0 = ok). Used by
+/// [`Sandbox::probe_vfs`] and the generic [`PersistentInstance`] packed-op decoder.
+/// Public so language profile crates (e.g. `hyprstream-workers-python`) can match
+/// the shared ABI tag without redefining it.
+pub const TAG_OK: u8 = 0;

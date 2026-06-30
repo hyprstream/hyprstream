@@ -7249,6 +7249,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyprstream-workers-python"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hyprstream-vfs",
+ "hyprstream-workers-wasmtime",
+ "parking_lot 0.12.4",
+ "serde_json",
+ "tokio",
+ "wasmtime",
+]
+
+[[package]]
 name = "hyprstream-workers-wasmtime"
 version = "0.1.0"
 dependencies = [

@@ -23,7 +23,6 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use hyprstream_workers_wasmtime::python::PyResult;
 use hyprstream_workers_wasmtime::{EpochTimer, Sandbox, Subject};
 
 fn guest_wasm() -> Option<Vec<u8>> {
@@ -93,7 +92,7 @@ fn case1_arithmetic_is_green() {
     };
     let sandbox = Sandbox::from_bytes(&wasm).expect("load sandbox");
     let status = sandbox
-        .eval("print(1 + 1)", BIG_FUEL)
+        .call_export("eval", b"print(1 + 1)", BIG_FUEL)
         .expect("print(1+1) must NOT trap on the 0.5 green path");
     assert_eq!(status, 0, "print(1+1) must return status 0 (clean run)");
     eprintln!("case1: GREEN — print(1+1) returned status 0");
@@ -113,7 +112,7 @@ fn case2_os_system_is_inert() {
         return;
     };
     let sandbox = Sandbox::from_bytes(&wasm).expect("load sandbox");
-    match sandbox.eval("import os; os.system('echo PWNED')", BIG_FUEL) {
+    match sandbox.call_export("eval", b"import os; os.system('echo PWNED')", BIG_FUEL) {
         Ok(0) => panic!("os.system must NOT succeed — there is no host syscall surface"),
         Ok(n) => eprintln!("case2: inert — python error status {n}; no host process possible"),
         Err(t) => eprintln!("case2: inert — trapped: {t}; no host process possible"),
@@ -131,7 +130,7 @@ fn case3_infinite_loop_is_fuel_bounded() {
     };
     let sandbox = Sandbox::from_bytes(&wasm).expect("load sandbox");
     // Boot the VM with ample fuel, then loop — but cap total fuel so the loop trips it.
-    let result = sandbox.eval("while True:\n    pass\n", BIG_FUEL);
+    let result = sandbox.call_export("eval", b"while True:\n    pass\n", BIG_FUEL);
     assert!(
         result.is_err(),
         "unbounded guest must trap on fuel, got Ok({result:?})"
@@ -166,7 +165,7 @@ fn subject_isolation_no_leak() {
 
     // Each eval builds a FRESH Store from the sandbox's own subject; running one
     // does not mutate the other's bound identity (no shared global state).
-    let _ = sb_alice.eval("x = 1", BIG_FUEL);
+    let _ = sb_alice.call_export("eval", b"x = 1", BIG_FUEL);
     assert_eq!(sb_alice.subject(), &alice, "alice subject must be stable");
     assert_eq!(sb_bob.subject(), &bob, "bob subject must be unaffected");
     eprintln!("subject: isolated — alice={alice:?} bob={bob:?}, no leak");
@@ -190,7 +189,7 @@ fn epoch_wall_clock_bound_traps_runaway() {
     // Deadline = 20 ticks ≈ 200ms wall clock. Generous enough that VM bootstrap
     // (which the epoch is also counting) completes, but the infinite loop trips it.
     let start = Instant::now();
-    let result = sandbox.eval_with_epoch_deadline("while True:\n    pass\n", 20);
+    let result = sandbox.call_export_with_epoch("eval", b"while True:\n    pass\n", 20);
     let elapsed = start.elapsed();
 
     assert!(
@@ -218,108 +217,12 @@ fn epoch_deadline_zero_traps_immediately() {
         return;
     };
     let sandbox = Sandbox::from_bytes(&wasm).expect("load sandbox");
-    let result = sandbox.eval_with_epoch_deadline("print(1)", 0);
+    let result = sandbox.call_export_with_epoch("eval", b"print(1)", 0);
     assert!(
         result.is_err(),
         "epoch deadline of 0 must trap immediately, got Ok({result:?})"
     );
     eprintln!("epoch0: trapped as expected: {:?}", result.unwrap_err());
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// #483 P2 — /lang/python semantics over the persistent guest shell.
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Generous per-call fuel for the persistent shell. The interpreter is built once
-/// (on the first op), so subsequent ops are cheaper, but bootstrap is expensive.
-const SHELL_FUEL: u64 = 50_000_000_000;
-
-/// eval: an expression returns its repr; exec: statements capture stdout; and the
-/// interpreter scope PERSISTS across calls (a var set by exec is visible later).
-#[test]
-fn pyshell_eval_exec_and_persistent_scope() {
-    let Some(wasm) = guest_wasm_or_ci_fail("pyshell") else {
-        return;
-    };
-    let sandbox = Sandbox::from_bytes(&wasm).expect("load sandbox");
-    let mut shell = sandbox.open_shell(SHELL_FUEL).expect("open shell");
-
-    // eval an expression -> repr.
-    let r = shell.eval("2 + 3").expect("eval 2+3");
-    assert_eq!(r, PyResult::Ok("5".to_owned()), "eval should repr to 5");
-
-    // exec stdout capture (pure-Python __Capture surrogate).
-    let r = shell.exec("print('hello')").expect("exec print");
-    assert_eq!(
-        r,
-        PyResult::Ok("hello\n".to_owned()),
-        "exec should capture stdout"
-    );
-
-    // PERSISTENT scope: a var set in one exec is visible in a later eval.
-    let _ = shell.exec("x = 41").expect("exec assign");
-    let r = shell.eval("x + 1").expect("eval persisted var");
-    assert_eq!(
-        r,
-        PyResult::Ok("42".to_owned()),
-        "interpreter scope must persist across calls"
-    );
-    eprintln!("pyshell: eval/exec/persistent-scope all green");
-}
-
-/// vars/ enumerates non-dunder globals; defs/ enumerates callables only; get_var /
-/// get_def return the repr of one named global (None if absent).
-#[test]
-fn pyshell_vars_and_defs() {
-    let Some(wasm) = guest_wasm_or_ci_fail("pyshell_vars_defs") else {
-        return;
-    };
-    let sandbox = Sandbox::from_bytes(&wasm).expect("load sandbox");
-    let mut shell = sandbox.open_shell(SHELL_FUEL).expect("open shell");
-
-    // Define a var and a function.
-    let _ = shell.exec("answer = 42").expect("set var");
-    let _ = shell
-        .exec("def greet(n):\n    return 'hi ' + n\n")
-        .expect("def func");
-
-    // vars/ lists both names (no dunders).
-    let vars = shell.list_vars().expect("list vars");
-    assert!(vars.contains(&"answer".to_owned()), "vars: {vars:?}");
-    assert!(vars.contains(&"greet".to_owned()), "vars: {vars:?}");
-    assert!(
-        !vars.iter().any(|v| v.starts_with("__")),
-        "vars must exclude dunders: {vars:?}"
-    );
-
-    // defs/ lists ONLY the callable.
-    let defs = shell.list_defs().expect("list defs");
-    assert!(defs.contains(&"greet".to_owned()), "defs: {defs:?}");
-    assert!(
-        !defs.contains(&"answer".to_owned()),
-        "defs must exclude non-callables: {defs:?}"
-    );
-
-    // get_var / get_def repr.
-    assert_eq!(
-        shell.get_var("answer").expect("get_var"),
-        PyResult::Ok("42".to_owned())
-    );
-    assert!(matches!(
-        shell.get_def("greet").expect("get_def"),
-        PyResult::Ok(_)
-    ));
-    // Absent name -> None.
-    assert_eq!(
-        shell.get_var("nope").expect("get_var absent"),
-        PyResult::None
-    );
-    // A non-callable is not a def.
-    assert_eq!(
-        shell.get_def("answer").expect("get_def non-callable"),
-        PyResult::None
-    );
-    eprintln!("pyshell: vars/defs/get_* all green");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
