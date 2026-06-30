@@ -8,6 +8,16 @@ use crate::schema::types::collect_list_struct_types;
 use crate::schema::types::*;
 use crate::util::*;
 
+/// Resolve a field-level `$domainType("path::Type")` annotation to its Rust type tokens.
+///
+/// Unlike the struct-level `resolve_domain_type` (which prepends the generated crate prefix
+/// for return-type wrappers), field newtypes live in shared crates and are referenced by their
+/// absolute path verbatim (e.g. `hyprstream_rpc::identity::Did`), so the path resolves
+/// identically from every generated module regardless of `types_crate`.
+fn resolve_field_domain_type(domain_path: &str) -> TokenStream {
+    domain_path.parse().unwrap_or_else(|_| quote! { String })
+}
+
 /// Resolve the capnp module path for a type based on its origin file.
 fn resolve_capnp_mod(
     origin_file: Option<&str>,
@@ -163,7 +173,10 @@ fn generate_data_struct(
                 .and_then(|s| s.option_inner_type())
                 .map(|inner_name| rust_type_tokens(&resolved.resolve_type(inner_name).rust_owned));
 
-            let inner_type = if field.type_name == "Data" && field.fixed_size.is_some() {
+            let inner_type = if let Some(dt) = field.domain_type.as_deref() {
+                // Field-level `$domainType`: use the newtype (wire type unchanged).
+                resolve_field_domain_type(dt)
+            } else if field.type_name == "Data" && field.fixed_size.is_some() {
                 let n = field.fixed_size.unwrap_or(0);
                 // Arrays > 32 don't implement Default/Serialize/Deserialize via derive,
                 // so use Vec<u8> in the struct. ToCapnp/FromCapnp handle length validation.
@@ -783,6 +796,17 @@ fn generate_data_field_setter_inner(
     };
 
     match ct {
+        // Field-level `$domainType` newtype over `Text`: write via `.as_str()`.
+        CapnpType::Text if field.domain_type.is_some() => {
+            // Accessor without a leading `&`: optional → `__val` (already `&T`),
+            // non-optional → `self.field`; `.as_str()` borrows in both cases.
+            let val_accessor = if field.optional {
+                quote! { __val }
+            } else {
+                quote! { self.#rust_name }
+            };
+            quote! { builder.#setter_name(#val_accessor.as_str()); }
+        }
         CapnpType::Text | CapnpType::Data => {
             quote! { builder.#setter_name(#val_borrowed); }
         }
@@ -1015,6 +1039,11 @@ fn generate_data_field_reader(
         let getter_name = format_ident!("get_{}", resolved.name(&field.name).snake);
         let ct = resolved.resolve_type(&field.type_name).capnp_type.clone();
         match ct {
+            // Optional field-level `$domainType` newtype over `Text`: empty → None, else `Some(Type::new(..))`.
+            CapnpType::Text if field.domain_type.is_some() => {
+                let dt = resolve_field_domain_type(field.domain_type.as_deref().unwrap_or_default());
+                quote! { #rust_name: { let v = reader.#getter_name()?.to_str()?; if v.is_empty() { None } else { Some(#dt::new(v.to_string())) } }, }
+            }
             CapnpType::Text => {
                 quote! { #rust_name: { let v = reader.#getter_name()?.to_str()?; if v.is_empty() { None } else { Some(v.to_string()) } }, }
             }
@@ -1164,6 +1193,11 @@ fn generate_data_field_reader_inner(
 
     match ct {
         CapnpType::Void => quote! { #rust_name: (), },
+        // Field-level `$domainType` newtype over `Text`: read via `Type::new(String)`.
+        CapnpType::Text if field.domain_type.is_some() => {
+            let dt = resolve_field_domain_type(field.domain_type.as_deref().unwrap_or_default());
+            quote! { #rust_name: #dt::new(reader.#getter_name()?.to_str()?.to_string()), }
+        }
         CapnpType::Text => quote! { #rust_name: reader.#getter_name()?.to_str()?.to_string(), },
         CapnpType::Data if field.fixed_size.is_some() => {
             let n = field.fixed_size.unwrap_or(0);
@@ -1291,5 +1325,109 @@ fn generate_data_field_reader_inner(
             }
         }
         _ => quote! { #rust_name: Default::default(), },
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod field_domain_type_tests {
+    use super::*;
+    use crate::resolve::ResolvedSchema;
+    use crate::schema::types::{FieldDef, FieldSection, ParsedSchema, StructDef};
+
+    fn text_field(name: &str, domain_type: Option<&str>) -> FieldDef {
+        FieldDef {
+            name: name.into(),
+            type_name: "Text".into(),
+            description: String::new(),
+            fixed_size: None,
+            optional: false,
+            slot_offset: 0,
+            section: FieldSection::Pointer,
+            discriminant_value: 0xFFFF,
+            serde_rename: None,
+            domain_type: domain_type.map(String::from),
+        }
+    }
+
+    fn data_only_schema(s: StructDef) -> ParsedSchema {
+        ParsedSchema {
+            request_variants: vec![],
+            response_variants: vec![],
+            structs: vec![s],
+            scoped_clients: vec![],
+            enums: vec![],
+            request_struct: None,
+            response_struct: None,
+        }
+    }
+
+    /// A field carrying `$domainType("hyprstream_rpc::identity::Did")` must emit the newtype
+    /// as the field's Rust type, write via `.as_str()`, and read via `Did::new(...)` — while a
+    /// sibling plain `Text` field stays a `String`.
+    #[test]
+    fn field_level_domain_type_emits_newtype() {
+        let s = StructDef {
+            name: "Sample".into(),
+            fields: vec![
+                text_field("serviceDid", Some("hyprstream_rpc::identity::Did")),
+                text_field("plain", None),
+            ],
+            has_union: false,
+            domain_type: None,
+            origin_file: None,
+            data_words: 0,
+            pointer_words: 2,
+            discriminant_count: 0,
+            discriminant_offset: 0,
+            union_arms: vec![],
+        };
+        let schema = data_only_schema(s);
+        let resolved = ResolvedSchema::from(&schema);
+        let out = generate_data_structs(&resolved, "discovery", None).to_string();
+
+        // Struct field uses the newtype, not String (TokenStream spaces out `::`).
+        assert!(
+            out.contains("service_did : hyprstream_rpc :: identity :: Did"),
+            "expected Did-typed field, got:\n{out}"
+        );
+        // ToCapnp writes the newtype via `.as_str()`.
+        assert!(
+            out.contains("set_service_did") && out.contains("as_str ()"),
+            "expected `.as_str()` write for domain field, got:\n{out}"
+        );
+        // FromCapnp reads via `Did::new(...)`.
+        assert!(
+            out.contains("hyprstream_rpc :: identity :: Did :: new"),
+            "expected `Did::new(...)` read for domain field, got:\n{out}"
+        );
+        // The sibling plain Text field stays a String.
+        assert!(
+            out.contains("plain : String"),
+            "expected plain Text field to remain String, got:\n{out}"
+        );
+    }
+
+    /// Struct-level `$domainType` must keep its existing behavior (it does not turn the
+    /// struct's own fields into newtypes — only field-level annotations do).
+    #[test]
+    fn struct_level_domain_type_unaffected() {
+        let s = StructDef {
+            name: "Wrapped".into(),
+            fields: vec![text_field("value", None)],
+            has_union: false,
+            domain_type: Some("some::DomainType".into()),
+            origin_file: None,
+            data_words: 0,
+            pointer_words: 1,
+            discriminant_count: 0,
+            discriminant_offset: 0,
+            union_arms: vec![],
+        };
+        let schema = data_only_schema(s);
+        let resolved = ResolvedSchema::from(&schema);
+        let out = generate_data_structs(&resolved, "discovery", None).to_string();
+        // Field without a field-level annotation stays a String regardless of struct-level $domainType.
+        assert!(out.contains("value : String"), "got:\n{out}");
     }
 }

@@ -12,6 +12,9 @@ pub mod claims;
 pub mod federation;
 pub mod jti_blocklist;
 pub mod jwt;
+/// Native MAC: security labels, lattice, subject contexts, genesis labeling
+/// (S1, #567). Platform-independent (no std-only deps) so it compiles for wasm.
+pub mod mac;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod key_source;
 #[cfg(not(target_arch = "wasm32"))]
@@ -22,6 +25,12 @@ pub mod scope_registry;
 
 pub use claims::{Claims, Cnf, CnfJwk, IdTokenClaims, OneOrMany, compute_jkt, is_local_iss};
 pub use jti_blocklist::{InMemoryJtiBlocklist, JtiBlocklist};
+pub use mac::{
+    Assurance, Compartment, CompartmentSet, ContentBoundLabel, GenesisMap, GenesisReport,
+    LabelError, LabeledObject, Lattice, LatticeCodecError, LatticeDecodeError, LatticeVersion,
+    Level, SecurityContext, SecurityLabel, StaticNodeLabel, SubjectContextClaims,
+    VerifiedKeyMaterial, MAX_COMPARTMENTS,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use federation::FederationKeySource;
 pub use jwt::{decode, decode_unverified, decode_with_key, encode, encode_service_jwt, header_alg, header_kid, jwk_thumbprint, JwkThumbprintInput, JwtError};

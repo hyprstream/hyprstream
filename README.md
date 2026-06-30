@@ -551,3 +551,13 @@ Built with:
 - [Casbin](https://casbin.org/) - Authorization library for policy engine
 - [Kata Containers](https://katacontainers.io/) - VM-based container isolation (experimental)
 - [cloud-hypervisor](https://www.cloudhypervisor.org/) - Virtual machine monitor (experimental)
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=hyprstream%2Fhyprstream&type=date&logscale=&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=hyprstream/hyprstream&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=hyprstream/hyprstream&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=hyprstream/hyprstream&type=date&legend=top-left" />
+ </picture>
+</a>

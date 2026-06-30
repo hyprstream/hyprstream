@@ -169,3 +169,48 @@ pub mod stream_mount;
 pub mod wasm_exports;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_rpc_client;
+// Phase 2: iroh peer identity + pkarr helpers exported to JavaScript.
+#[cfg(target_arch = "wasm32")]
+pub mod iroh_exports;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod did_field_domain_type_tests {
+    use crate::mcp_client::CallTool;
+    use hyprstream_rpc::identity::Did;
+    use hyprstream_rpc::{serialize_message, FromCapnp, ToCapnp};
+
+    /// Field-level `$domainType("hyprstream_rpc::identity::Did")` on
+    /// `CallTool.callerIdentity` must generate a `Did` newtype field (not `String`),
+    /// and the value must round-trip through the capnp wire (which stays `Text`).
+    #[test]
+    fn call_tool_caller_identity_is_did_and_roundtrips() {
+        let original = CallTool {
+            tool_name: "model_list".to_owned(),
+            arguments: "{}".to_owned(),
+            caller_identity: Did::new("did:key:z6MkcallerExample".to_owned()),
+        };
+        // Type-level proof: the codegen emitted a `Did` field, not a `String`.
+        let _typecheck: &Did = &original.caller_identity;
+
+        let bytes = serialize_message(|msg| {
+            let mut b = msg.init_root::<crate::mcp_capnp::call_tool::Builder>();
+            original.write_to(&mut b);
+        })
+        .expect("serialize");
+
+        let reader =
+            capnp::serialize::read_message(&mut &bytes[..], capnp::message::ReaderOptions::new())
+                .expect("read message");
+        let root = reader
+            .get_root::<crate::mcp_capnp::call_tool::Reader>()
+            .expect("root reader");
+        let back = CallTool::read_from(root).expect("read_from");
+
+        assert_eq!(back.caller_identity, original.caller_identity);
+        assert_eq!(back.caller_identity.as_str(), "did:key:z6MkcallerExample");
+        assert!(back.caller_identity.is_did_key());
+        assert_eq!(back.tool_name, "model_list");
+        assert_eq!(back.arguments, "{}");
+    }
+}
