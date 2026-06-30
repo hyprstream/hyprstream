@@ -18,11 +18,10 @@ use ed25519_dalek::{Signer, SigningKey};
 use tokio::sync::RwLock;
 use zeroize::Zeroizing;
 
-use hyprstream_rpc::crypto::event_crypto::{
-    EventPrivacy, encrypt_event, build_event_sig_message,
-    derive_wrap_key, wrap_group_key,
-};
 use hyprstream_rpc::crypto::backend::keyed_mac;
+use hyprstream_rpc::crypto::event_crypto::{
+    build_event_sig_message, derive_wrap_key, encrypt_event, wrap_group_key, EventPrivacy,
+};
 
 /// Maximum key lifetime (24 hours). Keys MUST be rotated before this.
 pub const MAX_KEY_LIFETIME: Duration = Duration::from_secs(86400);
@@ -34,6 +33,30 @@ pub const DEFAULT_ROTATION_INTERVAL: Duration = Duration::from_secs(3600);
 pub const GRACE_PERIOD: Duration = Duration::from_secs(120);
 
 /// Rekey policy configuration.
+///
+/// # Cost / forward-secrecy tradeoff (#606)
+///
+/// Rotation re-wraps the group key for every known subscriber: O(M) DH +
+/// AEAD-wrap operations per rotation, M = group size (see
+/// [`SecureEventPublisher::rotate_key`]).
+///
+/// - [`Self::Immediate`] rotates on EVERY revocation — prompt
+///   forward-secrecy (a revoked member loses access immediately), but O(M)
+///   PER revocation. M sequential departures cost O(M²) total. Use only for
+///   an explicit revocation / suspected-compromise event on a specific
+///   prefix, not as a blanket policy for routine membership churn.
+/// - [`Self::Scheduled`] bounds the cost to O(M) per `interval` regardless
+///   of churn, but DEFERS revocation: a removed member can still decrypt
+///   until the next scheduled rotation (up to `interval`, capped by
+///   [`MAX_KEY_LIFETIME`]). This is the default — routine join/leave should
+///   not pay an O(M) rewrap per event.
+/// - [`Self::Jittered`] is `Scheduled` plus timing-attack resistance on
+///   exactly when the rotation fires; same cost/latency tradeoff as
+///   `Scheduled`.
+///
+/// Recommended use: `Scheduled`/`Jittered` for the steady state; switch a
+/// specific prefix to `Immediate` only around an explicit revocation, then
+/// switch back.
 #[derive(Clone, Debug)]
 pub enum RekeyPolicy {
     /// Rotate on fixed schedule. Revocations deferred to next rotation.
@@ -41,7 +64,21 @@ pub enum RekeyPolicy {
     /// Rotate immediately on revocation.
     Immediate,
     /// Scheduled with jitter for timing attack resistance.
-    Jittered { interval: Duration, jitter: Duration },
+    Jittered {
+        interval: Duration,
+        jitter: Duration,
+    },
+}
+
+impl Default for RekeyPolicy {
+    /// `Scheduled` at [`DEFAULT_ROTATION_INTERVAL`] — bounded O(M) cost
+    /// regardless of membership churn. See the cost/forward-secrecy tradeoff
+    /// doc on [`RekeyPolicy`] before reaching for `Immediate` as a default.
+    fn default() -> Self {
+        Self::Scheduled {
+            interval: DEFAULT_ROTATION_INTERVAL,
+        }
+    }
 }
 
 impl RekeyPolicy {
@@ -168,10 +205,10 @@ impl SecureEventPublisher {
         let group_key = &state.key_state.current;
 
         // DH(publisher_secret, subscriber_pubkey) → shared secret
-        let shared_secret = Zeroizing::new(hyprstream_rpc::crypto::ristretto_dh_raw(
-            &state.ephemeral_secret,
-            subscriber_pubkey,
-        ).map_err(|e| format!("DH failed: {e}"))?);
+        let shared_secret = Zeroizing::new(
+            hyprstream_rpc::crypto::ristretto_dh_raw(&state.ephemeral_secret, subscriber_pubkey)
+                .map_err(|e| format!("DH failed: {e}"))?,
+        );
 
         let wrap_key = derive_wrap_key(&shared_secret, subscriber_pubkey, &state.ephemeral_pubkey);
         wrap_group_key(&wrap_key, group_key, &sub_hash, prefix)
@@ -197,14 +234,13 @@ impl SecureEventPublisher {
         for sub_pubkey in subscriber_pubkeys {
             let sub_hash = hash_pubkey(sub_pubkey);
 
-            let shared_secret = Zeroizing::new(hyprstream_rpc::crypto::ristretto_dh_raw(
-                &state.ephemeral_secret,
-                sub_pubkey,
-            ).map_err(|e| format!("DH failed: {e}"))?);
+            let shared_secret = Zeroizing::new(
+                hyprstream_rpc::crypto::ristretto_dh_raw(&state.ephemeral_secret, sub_pubkey)
+                    .map_err(|e| format!("DH failed: {e}"))?,
+            );
 
             let wrap_key = derive_wrap_key(&shared_secret, sub_pubkey, &state.ephemeral_pubkey);
-            let wrapped =
-                wrap_group_key(&wrap_key, &state.key_state.current, &sub_hash, prefix)?;
+            let wrapped = wrap_group_key(&wrap_key, &state.key_state.current, &sub_hash, prefix)?;
             state.subscribers.insert(sub_hash, *sub_pubkey);
             results.push((sub_hash, wrapped));
         }
@@ -215,11 +251,7 @@ impl SecureEventPublisher {
     ///
     /// Returns the encrypted payload components and Ed25519 signature.
     /// The caller is responsible for sending these via StreamService.
-    pub async fn publish(
-        &self,
-        topic: &str,
-        payload: &[u8],
-    ) -> Result<EncryptedEvent, String> {
+    pub async fn publish(&self, topic: &str, payload: &[u8]) -> Result<EncryptedEvent, String> {
         let prefix = topic.split('.').next().unwrap_or(topic);
 
         // Take write lock to potentially promote pending key
@@ -279,8 +311,7 @@ impl SecureEventPublisher {
                 RekeyPolicy::Jittered { interval, jitter } => {
                     let jitter_offset = {
                         let h = hash_prefix_bytes(prefix.as_bytes());
-                        let frac =
-                            (h[0] as u64 * 256 + h[1] as u64) as f64 / 65536.0;
+                        let frac = (h[0] as u64 * 256 + h[1] as u64) as f64 / 65536.0;
                         Duration::from_secs_f64(jitter.as_secs_f64() * frac)
                     };
                     age >= *interval + jitter_offset
@@ -321,14 +352,13 @@ impl SecureEventPublisher {
         // Wrap new key for all known subscribers using the NEW ephemeral keypair
         let mut wrapped_keys = Vec::with_capacity(state.subscribers.len());
         for (sub_hash, sub_pubkey) in &state.subscribers {
-            let shared_secret = Zeroizing::new(hyprstream_rpc::crypto::ristretto_dh_raw(
-                &new_ephemeral_secret,
-                sub_pubkey,
-            ).map_err(|e| format!("DH failed: {e}"))?);
+            let shared_secret = Zeroizing::new(
+                hyprstream_rpc::crypto::ristretto_dh_raw(&new_ephemeral_secret, sub_pubkey)
+                    .map_err(|e| format!("DH failed: {e}"))?,
+            );
 
             let wrap_key = derive_wrap_key(&shared_secret, sub_pubkey, &new_ephemeral_pubkey);
-            let wrapped =
-                wrap_group_key(&wrap_key, &new_group_key, sub_hash, prefix)?;
+            let wrapped = wrap_group_key(&wrap_key, &new_group_key, sub_hash, prefix)?;
             let mut routing_tag = [0u8; 16];
             rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut routing_tag);
             wrapped_keys.push(WrappedKeyEntry {
@@ -534,27 +564,24 @@ mod tests {
         assert!(wrapped.len() > 12);
 
         // Subscriber unwraps: DH(sub_secret, publisher_pubkey)
-        let shared_secret = Zeroizing::new(hyprstream_rpc::crypto::ristretto_dh_raw(
-            &sub_secret_bytes,
-            &pub_pubkey,
-        ).unwrap());
+        let shared_secret = Zeroizing::new(
+            hyprstream_rpc::crypto::ristretto_dh_raw(&sub_secret_bytes, &pub_pubkey).unwrap(),
+        );
         let wrap_key = derive_wrap_key(&shared_secret, &pub_pubkey, &sub_pubkey_bytes);
         let sub_hash = hash_pubkey(&sub_pubkey_bytes);
         let group_key = unwrap_group_key(&wrap_key, &wrapped, &sub_hash, "worker").unwrap();
 
         // Verify: encrypt with the group key, then decrypt
         let plaintext = b"end-to-end test";
-        let encrypted = publisher
-            .publish("worker.test", plaintext)
-            .await
-            .unwrap();
+        let encrypted = publisher.publish("worker.test", plaintext).await.unwrap();
         let decrypted = decrypt_event_full(
             &group_key,
             &encrypted.nonce,
             &encrypted.tag,
             &encrypted.ciphertext,
             "worker",
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
@@ -616,7 +643,10 @@ mod tests {
         // Verify pending is cleared after publish
         let prefixes = publisher.prefixes.read().await;
         let state = prefixes.get("worker").unwrap();
-        assert!(state.key_state.pending.is_none(), "pending should be promoted to current");
+        assert!(
+            state.key_state.pending.is_none(),
+            "pending should be promoted to current"
+        );
     }
 
     #[tokio::test]

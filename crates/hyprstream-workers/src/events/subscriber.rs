@@ -35,7 +35,9 @@ impl EventSubscriber {
     ///
     /// No background task is started until the first `recv()` call.
     pub fn new() -> Result<Self> {
-        Ok(Self { inner: Inner::new() })
+        Ok(Self {
+            inner: Inner::new(),
+        })
     }
 
     /// Subscribe to a topic pattern (prefix match).
@@ -80,6 +82,32 @@ impl EventSubscriber {
         self.inner.with_backfill(mode)
     }
 
+    /// Select the delivery QoS (#606). Pass
+    /// `hyprstream_rpc::stream_info::EventReliable::stream_opt()` for
+    /// at-least-once delivery (events that must not be silently dropped).
+    /// Defaults to `EventLive` (at-most-once, drop-oldest) if never called.
+    /// Must be called before the first `recv()`.
+    pub fn with_qos(&mut self, qos: hyprstream_rpc::stream_info::StreamOpt) -> Result<()> {
+        self.inner.with_qos(qos)
+    }
+
+    /// Skip live events already delivered in a prior session (offset-resume,
+    /// #606). See [`hyprstream_rpc::moq_event::MoqEventSubscriber::with_resume_from`]
+    /// for the multi-source caveat. Must be called before the first `recv()`.
+    pub fn with_resume_from(&mut self, sequence: u64) -> Result<()> {
+        self.inner.with_resume_from(sequence)
+    }
+
+    /// Highest live-group sequence delivered so far (resume hint, #606).
+    pub fn last_sequence(&self) -> u64 {
+        self.inner.last_sequence()
+    }
+
+    /// Count of items evicted under drop-oldest backpressure (#606).
+    pub fn dropped_count(&self) -> u64 {
+        self.inner.dropped_count()
+    }
+
     /// Receive the next event asynchronously.
     ///
     /// Returns `(topic, payload)`. Blocks until an event arrives.
@@ -106,10 +134,10 @@ mod tests {
     #[test]
     fn test_subscription_patterns() {
         let patterns = vec![
-            "",                           // All events
-            "worker.",                    // All worker events
-            "worker.sandbox123.",         // Specific sandbox
-            "worker.sandbox123.started",  // Exact match
+            "",                          // All events
+            "worker.",                   // All worker events
+            "worker.sandbox123.",        // Specific sandbox
+            "worker.sandbox123.started", // Exact match
         ];
 
         for pattern in patterns {

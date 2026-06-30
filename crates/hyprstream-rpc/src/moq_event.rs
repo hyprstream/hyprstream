@@ -15,10 +15,23 @@
 //! `OriginConsumer::announced()`, subscribe to their `events` track, and do
 //! in-memory topic-prefix filtering (matching ZMQ's prefix-filter semantics).
 //!
-//! This is the "Live" preset for the event bus: fan-out, unbounded, at-most-once.
-//! No chained HMAC or policy axes — events are best-effort lifecycle signals, not
+//! By default a subscriber uses the `EventLive` delivery preset: fan-out,
+//! at-most-once, drop-oldest-on-backpressure (matches the historic "unbounded,
+//! best-effort" behaviour, but bounded — see #606). No chained HMAC or
+//! confidentiality axes here — events are best-effort lifecycle signals, not
 //! auditable streams. `SecureEventPublisher` / `SecureEventSubscriber` (Phase 7)
 //! layer group-key encryption on top and are unaffected by this transport change.
+//!
+//! ## QoS (#606)
+//!
+//! `MoqEventSubscriber` reuses the EXISTING `StreamOpt` contract from
+//! `streaming.capnp` / [`crate::stream_info`] (#213/#273) rather than a parallel
+//! event-specific QoS type — see [`crate::stream_info::EventLive`] (default) and
+//! [`crate::stream_info::EventReliable`] (at-least-once + retained, for events
+//! that must not be silently dropped, e.g. `model.loaded`). Only `delivery` and
+//! `overflow_policy` are enforced client-side today (`ordering`/`completion` are
+//! reserved for a future chained-integrity layer, same as the flat at-most-once
+//! default already implies `Ordering::Ordered` is not currently checked).
 //!
 //! # #393 — per-OID broadcast paths
 //!
@@ -46,16 +59,21 @@
 //! firehose is unavailable the subscriber starts live-only (graceful
 //! degradation) — the firehose is the cold-start path, MoQ is the live path.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
-use moq_net::{BroadcastProducer, Group, Origin, OriginConsumer, OriginProducer, Path, Track, TrackProducer};
+use moq_net::{
+    BroadcastProducer, Group, Origin, OriginConsumer, OriginProducer, Path, Track, TrackProducer,
+};
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
+
+use crate::stream_info::{OverflowPolicy, StreamOpt, StreamOptPreset};
 
 // ============================================================================
 // Process-global moq event bus origin — set once at startup by the factory.
@@ -182,7 +200,10 @@ impl MoqEventOrigin {
 
         // Retain the broadcast producer so it stays announced for the publisher's lifetime.
         // HashMap keyed by source: re-registration replaces the stale producer atomically.
-        self.inner.broadcasts.lock().insert(source.to_owned(), broadcast);
+        self.inner
+            .broadcasts
+            .lock()
+            .insert(source.to_owned(), broadcast);
 
         Ok(MoqEventPublisher {
             track,
@@ -629,6 +650,192 @@ pub enum BackfillMode {
 }
 
 // ============================================================================
+// Event delivery channel — QoS-aware overflow policy (#606)
+// ============================================================================
+//
+// Replaces the previous unconditional `mpsc::channel(256)` + blocking
+// `.send().await`. That gave every subscriber a single fixed-size lossless
+// channel: a slow consumer that stopped calling `recv()` would back up its
+// OWN per-broadcast read tasks indefinitely (no resubscribe, no eviction).
+//
+// `StreamOpt::overflow_policy` (reused, not reinvented — see module docs)
+// now selects the behaviour per subscriber:
+//   - `Block`      — lossless backpressure, same semantics as the old
+//                    `mpsc` channel (correct for the `EventReliable` /
+//                    at-least-once preset, which must not silently drop).
+//   - `DropOldest` — ring-buffer: a full queue evicts its oldest entry
+//                    rather than stalling the producer-side read tasks
+//                    (the new default via `EventLive`, #606 finding: a
+//                    shared/slow consumer must not wedge delivery).
+//
+// This is per-subscriber state (each `MoqEventSubscriber` owns one channel;
+// its own per-broadcast read tasks share the sender half via `clone()`), so
+// a slow subscriber only ever affects its own delivery — not other
+// subscribers reading the same broadcast.
+
+type EventItem = (String, Vec<u8>);
+
+struct EventChannelState {
+    queue: VecDeque<EventItem>,
+    capacity: usize,
+    overflow: OverflowPolicy,
+    closed: bool,
+}
+
+struct EventChannelInner {
+    state: Mutex<EventChannelState>,
+    item_ready: tokio::sync::Notify,
+    space_ready: tokio::sync::Notify,
+    /// Live `EventChannelSender` clones. The last drop closes the channel
+    /// (see `EventChannelSender`'s `Clone`/`Drop` impls) so a parked
+    /// `recv()` wakes with `None` instead of waiting forever.
+    sender_count: AtomicUsize,
+}
+
+/// Sender half of a subscriber's QoS-aware delivery channel. Cloneable —
+/// each per-broadcast read task gets its own clone. Closes the channel when
+/// the last clone is dropped (manual `Clone`/`Drop`, refcounted via
+/// `EventChannelInner::sender_count` — `#[derive(Clone)]` would NOT track
+/// this, which is why this impl is hand-written rather than derived).
+struct EventChannelSender {
+    inner: Arc<EventChannelInner>,
+    dropped_count: Arc<AtomicU64>,
+}
+
+/// Receiver half, owned by the [`MoqEventSubscriber`].
+struct EventChannelReceiver {
+    inner: Arc<EventChannelInner>,
+}
+
+/// Overflow capacity for a channel built from `overflow_policy`: the
+/// `DropOldest` high-water-mark, or a fixed depth for lossless `Block`
+/// channels (matches the historic `mpsc::channel(256)` default).
+fn event_channel_capacity(overflow: &OverflowPolicy) -> usize {
+    match overflow {
+        OverflowPolicy::Block => 256,
+        OverflowPolicy::DropOldest { high_water_mark } => (*high_water_mark).max(1) as usize,
+    }
+}
+
+fn event_channel(
+    overflow: OverflowPolicy,
+    dropped_count: Arc<AtomicU64>,
+) -> (EventChannelSender, EventChannelReceiver) {
+    let capacity = event_channel_capacity(&overflow);
+    let inner = Arc::new(EventChannelInner {
+        state: Mutex::new(EventChannelState {
+            queue: VecDeque::with_capacity(capacity.min(1024)),
+            capacity,
+            overflow,
+            closed: false,
+        }),
+        item_ready: tokio::sync::Notify::new(),
+        space_ready: tokio::sync::Notify::new(),
+        sender_count: AtomicUsize::new(1),
+    });
+    (
+        EventChannelSender {
+            inner: inner.clone(),
+            dropped_count,
+        },
+        EventChannelReceiver { inner },
+    )
+}
+
+impl EventChannelSender {
+    /// Send an item honouring the configured overflow policy. Returns `false`
+    /// once the receiver has been dropped — the caller should stop reading.
+    async fn send(&self, item: EventItem) -> bool {
+        loop {
+            {
+                let mut state = self.inner.state.lock();
+                if state.closed {
+                    return false;
+                }
+                if state.queue.len() < state.capacity {
+                    state.queue.push_back(item);
+                    drop(state);
+                    self.inner.item_ready.notify_one();
+                    return true;
+                }
+                // At capacity.
+                match state.overflow {
+                    OverflowPolicy::Block => {
+                        // Fall through: wait for the receiver to free space.
+                    }
+                    OverflowPolicy::DropOldest { .. } => {
+                        state.queue.pop_front();
+                        state.queue.push_back(item);
+                        drop(state);
+                        self.dropped_count.fetch_add(1, Ordering::Relaxed);
+                        self.inner.item_ready.notify_one();
+                        return true;
+                    }
+                }
+            }
+            self.inner.space_ready.notified().await;
+        }
+    }
+}
+
+impl Clone for EventChannelSender {
+    fn clone(&self) -> Self {
+        self.inner.sender_count.fetch_add(1, Ordering::AcqRel);
+        Self {
+            inner: self.inner.clone(),
+            dropped_count: self.dropped_count.clone(),
+        }
+    }
+}
+
+impl Drop for EventChannelSender {
+    fn drop(&mut self) {
+        // Last sender clone gone: close the channel and wake a parked
+        // `recv()` so it observes `closed` instead of waiting forever.
+        // In-flight queued items are still delivered first — `recv()` only
+        // returns `None` once the queue has also drained (see `recv()`).
+        if self.inner.sender_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let mut state = self.inner.state.lock();
+            state.closed = true;
+            drop(state);
+            self.inner.item_ready.notify_waiters();
+        }
+    }
+}
+
+impl EventChannelReceiver {
+    async fn recv(&mut self) -> Option<EventItem> {
+        loop {
+            {
+                let mut state = self.inner.state.lock();
+                if let Some(item) = state.queue.pop_front() {
+                    drop(state);
+                    self.inner.space_ready.notify_one();
+                    return Some(item);
+                }
+                if state.closed {
+                    return None;
+                }
+            }
+            self.inner.item_ready.notified().await;
+        }
+    }
+
+    fn try_recv(&mut self) -> Result<Option<EventItem>, ()> {
+        let mut state = self.inner.state.lock();
+        if let Some(item) = state.queue.pop_front() {
+            drop(state);
+            self.inner.space_ready.notify_one();
+            return Ok(Some(item));
+        }
+        if state.closed {
+            return Err(());
+        }
+        Ok(None)
+    }
+}
+
+// ============================================================================
 // MoqEventSubscriber
 // ============================================================================
 
@@ -655,13 +862,35 @@ pub struct MoqEventSubscriber {
     oid_subscription: Option<String>,
     /// Late-join retention mode (decision A). Defaults to [`BackfillMode::LiveOnly`].
     backfill: BackfillMode,
+    /// Delivery QoS (#606). Reuses [`StreamOpt`] — defaults to
+    /// [`crate::stream_info::EventLive`] (at-most-once, drop-oldest), matching
+    /// the pre-#606 behaviour but with a bounded, never-wedging queue instead
+    /// of an unconditionally-blocking one.
+    qos: StreamOpt,
+    /// Skip live groups with `sequence <= resume_from` (offset-resume, #606).
+    /// `None` (the default) skips nothing — sequence numbers start at 0, so a
+    /// bare `u64` threshold could not distinguish "unset" from "resume after
+    /// the very first group". Only meaningful per-broadcast; see
+    /// [`Self::with_resume_from`] docs for the multi-source-pattern caveat.
+    resume_from: Option<u64>,
+    /// Highest live-group sequence delivered so far, shared with the
+    /// background read task(s). Best-effort hint for callers implementing
+    /// resume — see [`Self::last_sequence`].
+    last_sequence: Arc<AtomicU64>,
+    /// Count of items evicted under `OverflowPolicy::DropOldest` (#606).
+    dropped_count: Arc<AtomicU64>,
+    /// Count of idle-timeout-and-resume cycles on the live read loop (#606) —
+    /// a quiet (low event rate) but still-live broadcast no longer causes the
+    /// subscriber to silently exit; this counts how often that recovery fired.
+    idle_resumes: Arc<AtomicU64>,
     /// Explicit origin consumer for tests (bypasses the process-global
     /// `OnceLock`, which is single-writer and so cannot be reset between tests
     /// in one binary). `None` in production ⇒ resolve the global at `recv()`.
     #[cfg(test)]
     test_consumer: Option<OriginConsumer>,
-    /// Receiving end of the background task's channel. `None` until first `recv()`.
-    rx: Option<mpsc::Receiver<(String, Vec<u8>)>>,
+    /// Receiving end of the background task's QoS-aware channel (#606).
+    /// `None` until first `recv()`.
+    rx: Option<EventChannelReceiver>,
     /// Background task handle (kept alive for the subscriber's lifetime).
     _task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -673,6 +902,11 @@ impl MoqEventSubscriber {
             patterns: Vec::new(),
             oid_subscription: None,
             backfill: BackfillMode::LiveOnly,
+            qos: crate::stream_info::EventLive::stream_opt(),
+            resume_from: None,
+            last_sequence: Arc::new(AtomicU64::new(0)),
+            dropped_count: Arc::new(AtomicU64::new(0)),
+            idle_resumes: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             test_consumer: None,
             rx: None,
@@ -706,7 +940,9 @@ impl MoqEventSubscriber {
             return Err(anyhow!("subscribe() must be called before recv()"));
         }
         if self.oid_subscription.is_some() {
-            return Err(anyhow!("subscribe() is mutually exclusive with subscribe_oid()"));
+            return Err(anyhow!(
+                "subscribe() is mutually exclusive with subscribe_oid()"
+            ));
         }
         self.patterns.push(pattern.to_owned());
         Ok(())
@@ -740,7 +976,9 @@ impl MoqEventSubscriber {
             return Err(anyhow!("subscribe_oid() must be called before recv()"));
         }
         if !self.patterns.is_empty() {
-            return Err(anyhow!("subscribe_oid() is mutually exclusive with subscribe()"));
+            return Err(anyhow!(
+                "subscribe_oid() is mutually exclusive with subscribe()"
+            ));
         }
         self.oid_subscription = Some(oid.to_owned());
         Ok(())
@@ -761,8 +999,57 @@ impl MoqEventSubscriber {
         Ok(())
     }
 
+    /// Select the delivery QoS (#606). Reuses [`StreamOpt`] — pass
+    /// [`crate::stream_info::EventReliable::stream_opt()`] for at-least-once
+    /// delivery (events that must not be silently dropped, e.g.
+    /// `model.loaded`), or any other `StreamOpt` combination. Defaults to
+    /// [`crate::stream_info::EventLive`] if never called. Must be called
+    /// before the first `recv()`.
+    pub fn with_qos(&mut self, qos: StreamOpt) -> Result<()> {
+        if self.rx.is_some() {
+            return Err(anyhow!("with_qos() must be called before recv()"));
+        }
+        self.qos = qos;
+        Ok(())
+    }
+
+    /// Skip live groups with `sequence <= resume_from` (offset-resume, #606).
+    /// Combine with [`Self::last_sequence`] to persist a cursor across
+    /// reconnects for `EventReliable`-style at-least-once delivery.
+    ///
+    /// Caveat: a `MoqEventSubscriber` using the legacy flat-pattern
+    /// [`Self::subscribe`] API may read from MULTIPLE independent source
+    /// broadcasts (each with its own group-sequence counter); `resume_from`
+    /// is applied per-broadcast, so a single threshold is only unambiguous
+    /// for [`Self::subscribe_oid`] (one broadcast). Multi-source resume
+    /// requires a per-source cursor map, which is out of scope here.
+    /// Must be called before the first `recv()`.
+    pub fn with_resume_from(&mut self, sequence: u64) -> Result<()> {
+        if self.rx.is_some() {
+            return Err(anyhow!("with_resume_from() must be called before recv()"));
+        }
+        self.resume_from = Some(sequence);
+        Ok(())
+    }
+
+    /// Highest live-group sequence delivered so far (best-effort hint for
+    /// resume; see [`Self::with_resume_from`]). `0` before the first delivery.
+    pub fn last_sequence(&self) -> u64 {
+        self.last_sequence.load(Ordering::Relaxed)
+    }
+
+    /// Count of items evicted under `OverflowPolicy::DropOldest` (#606).
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped_count.load(Ordering::Relaxed)
+    }
+
+    /// Count of idle-timeout-and-resume cycles on the live read loop (#606).
+    pub fn idle_resumes(&self) -> u64 {
+        self.idle_resumes.load(Ordering::Relaxed)
+    }
+
     /// Lazily start the background task and return a mutable reference to the channel receiver.
-    fn ensure_started(&mut self) -> Result<&mut mpsc::Receiver<(String, Vec<u8>)>> {
+    fn ensure_started(&mut self) -> Result<&mut EventChannelReceiver> {
         if self.rx.is_none() {
             #[cfg(test)]
             let consumer = if let Some(c) = self.test_consumer.clone() {
@@ -774,31 +1061,58 @@ impl MoqEventSubscriber {
             };
             #[cfg(not(test))]
             let consumer = global_moq_event_origin()
-                .ok_or_else(|| anyhow!("moq event bus not initialized; call init_global_moq_event_origin first"))?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "moq event bus not initialized; call init_global_moq_event_origin first"
+                    )
+                })?
                 .consumer();
 
-            let (tx, rx) = mpsc::channel(256);
+            let (tx, rx) =
+                event_channel(self.qos.overflow_policy.clone(), self.dropped_count.clone());
+            let resume_from = self.resume_from;
+            let last_sequence = self.last_sequence.clone();
+            let idle_resumes = self.idle_resumes.clone();
 
             let task = if let Some(oid) = self.oid_subscription.clone() {
                 // #393 per-OID subscription: scope to the OID's track path and
                 // run the (optional) backfill before going live.
                 let backfill = std::mem::replace(&mut self.backfill, BackfillMode::LiveOnly);
-                tokio::spawn(run_oid_subscriber_task(consumer, oid, backfill, tx))
+                tokio::spawn(run_oid_subscriber_task(
+                    consumer,
+                    oid,
+                    backfill,
+                    tx,
+                    resume_from,
+                    last_sequence,
+                    idle_resumes,
+                ))
             } else {
                 // Legacy flat-track pattern subscription.
                 let patterns = self.patterns.clone();
-                tokio::spawn(run_subscriber_task(consumer, patterns, tx))
+                tokio::spawn(run_subscriber_task(
+                    consumer,
+                    patterns,
+                    tx,
+                    resume_from,
+                    last_sequence,
+                    idle_resumes,
+                ))
             };
             self.rx = Some(rx);
             self._task = Some(task);
         }
-        self.rx.as_mut().ok_or_else(|| anyhow!("subscriber channel not initialized"))
+        self.rx
+            .as_mut()
+            .ok_or_else(|| anyhow!("subscriber channel not initialized"))
     }
 
     /// Receive the next event. Blocks until an event arrives or the bus is closed.
     pub async fn recv(&mut self) -> Result<(String, Vec<u8>)> {
         let rx = self.ensure_started()?;
-        rx.recv().await.ok_or_else(|| anyhow!("event subscriber closed"))
+        rx.recv()
+            .await
+            .ok_or_else(|| anyhow!("event subscriber closed"))
     }
 
     /// Receive with timeout.
@@ -813,11 +1127,8 @@ impl MoqEventSubscriber {
     pub fn try_recv(&mut self) -> Result<Option<(String, Vec<u8>)>> {
         let rx = self.ensure_started()?;
         match rx.try_recv() {
-            Ok(msg) => Ok(Some(msg)),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Ok(None),
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                Err(anyhow!("event subscriber closed"))
-            }
+            Ok(msg) => Ok(msg),
+            Err(()) => Err(anyhow!("event subscriber closed")),
         }
     }
 }
@@ -837,7 +1148,10 @@ impl Default for MoqEventSubscriber {
 async fn run_subscriber_task(
     mut consumer: OriginConsumer,
     patterns: Vec<String>,
-    tx: mpsc::Sender<(String, Vec<u8>)>,
+    tx: EventChannelSender,
+    resume_from: Option<u64>,
+    last_sequence: Arc<AtomicU64>,
+    idle_resumes: Arc<AtomicU64>,
 ) {
     use tokio::task::JoinSet;
 
@@ -868,9 +1182,20 @@ async fn run_subscriber_task(
         let tx2 = tx.clone();
         let patterns2 = patterns.clone();
         let path_str = path.as_str().to_owned();
+        let last_sequence2 = last_sequence.clone();
+        let idle_resumes2 = idle_resumes.clone();
 
         tasks.spawn(async move {
-            read_event_broadcast(broadcast, path_str, patterns2, tx2).await;
+            read_event_broadcast(
+                broadcast,
+                path_str,
+                patterns2,
+                tx2,
+                resume_from,
+                last_sequence2,
+                idle_resumes2,
+            )
+            .await;
         });
     }
     // Dropping `tasks` here cancels all per-broadcast read tasks.
@@ -921,7 +1246,10 @@ async fn read_event_broadcast(
     broadcast: moq_net::BroadcastConsumer,
     path: String,
     patterns: Arc<Vec<String>>,
-    tx: mpsc::Sender<(String, Vec<u8>)>,
+    tx: EventChannelSender,
+    resume_from: Option<u64>,
+    last_sequence: Arc<AtomicU64>,
+    idle_resumes: Arc<AtomicU64>,
 ) {
     let mut track = match broadcast.subscribe_track(&Track::new(EVENT_TRACK)) {
         Ok(t) => t,
@@ -929,21 +1257,42 @@ async fn read_event_broadcast(
     };
 
     loop {
-        let mut group = match tokio::time::timeout(
-            crate::moq_stream::GROUP_IDLE_TIMEOUT,
-            track.next_group(),
-        ).await {
-            Ok(Ok(Some(g))) => g,
-            Ok(Ok(None)) | Ok(Err(_)) => break,
-            Err(_elapsed) => {
-                tracing::debug!("event subscriber idle timeout — source broadcast may be gone");
-                break;
+        let mut group =
+            match tokio::time::timeout(crate::moq_stream::GROUP_IDLE_TIMEOUT, track.next_group())
+                .await
+            {
+                Ok(Ok(Some(g))) => g,
+                Ok(Ok(None)) | Ok(Err(_)) => break,
+                Err(_elapsed) => {
+                    // #606: a quiet (low event rate) broadcast is NOT the same as a
+                    // gone one. Previously this `break`-ed, permanently dropping
+                    // the subscriber after one idle period — silently losing every
+                    // later event. Keep waiting; only `next_group()` itself
+                    // returning `None`/`Err` (above) means the broadcast actually
+                    // ended. `next_group()` is safe to re-poll after its previous
+                    // future was dropped by the timeout (it does not consume
+                    // internal cursor state on cancellation).
+                    tracing::debug!(
+                        "event subscriber idle — source broadcast still live, resuming wait"
+                    );
+                    idle_resumes.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
+
+        // Offset-resume (#606): skip groups already delivered in a prior
+        // session. Only unambiguous for a single-broadcast subscription; see
+        // `MoqEventSubscriber::with_resume_from` docs for the multi-source
+        // caveat that also applies here.
+        if let Some(threshold) = resume_from {
+            if group.sequence <= threshold {
+                continue;
             }
-        };
+        }
 
         let frame = match group.read_frame().await {
             Ok(Some(f)) => f,
-            Ok(None) => break,   // group ended without a frame
+            Ok(None) => break, // group ended without a frame
             Err(e) => {
                 tracing::warn!(error = %e, "event broadcast: frame read error");
                 break;
@@ -965,10 +1314,11 @@ async fn read_event_broadcast(
         let payload = frame[4 + topic_len..].to_vec();
 
         // Apply pattern filter (prefix match, ZMQ semantics)
-        if topic_matches_patterns(&topic, &patterns)
-            && tx.send((topic, payload)).await.is_err()
-        {
-            break; // receiver dropped
+        if topic_matches_patterns(&topic, &patterns) {
+            last_sequence.fetch_max(group.sequence, Ordering::Relaxed);
+            if !tx.send((topic, payload)).await {
+                break; // receiver dropped
+            }
         }
     }
 
@@ -987,16 +1337,43 @@ async fn run_oid_subscriber_task(
     mut consumer: OriginConsumer,
     oid: String,
     backfill: BackfillMode,
-    tx: mpsc::Sender<(String, Vec<u8>)>,
+    tx: EventChannelSender,
+    resume_from: Option<u64>,
+    last_sequence: Arc<AtomicU64>,
+    idle_resumes: Arc<AtomicU64>,
 ) {
     // 1) Optional cold-start backfill (decision A). Run BEFORE scoping the live
     //    consumer so the scheduler sees history before new events regardless of
     //    when (or whether) the live track is announced.
-    if let BackfillMode::FirehoseBackfill { oid: bf_oid, source } = &backfill {
+    //
+    //    `BackfillSource::replay` is a PUBLIC trait implemented outside this
+    //    crate (#393 doc) and is typed against `mpsc::Sender` — #606 does not
+    //    change that public contract. Instead, bridge: replay into a small
+    //    plain `mpsc` channel and forward each item into the QoS-aware `tx` so
+    //    backfilled items get the same overflow-policy treatment as live ones.
+    if let BackfillMode::FirehoseBackfill {
+        oid: bf_oid,
+        source,
+    } = &backfill
+    {
         if bf_oid == &oid && source.has_history(&oid) {
-            match source.replay(&oid, &tx).await {
+            let (bridge_tx, mut bridge_rx) = mpsc::channel::<(String, Vec<u8>)>(64);
+            let fwd_tx = tx.clone();
+            let forward = tokio::spawn(async move {
+                while let Some(item) = bridge_rx.recv().await {
+                    if !fwd_tx.send(item).await {
+                        break;
+                    }
+                }
+            });
+            let replay_result = source.replay(&oid, &bridge_tx).await;
+            drop(bridge_tx); // close so the forwarder's recv() loop ends
+            let _ = forward.await;
+            match replay_result {
                 Ok(()) => tracing::debug!(oid = %oid, "event backfill replay complete"),
-                Err(e) => tracing::warn!(oid = %oid, error = %e, "event backfill failed; continuing live-only"),
+                Err(e) => {
+                    tracing::warn!(oid = %oid, error = %e, "event backfill failed; continuing live-only");
+                }
             }
         } else {
             tracing::debug!(oid = %oid, "no backfill history available; starting live-only");
@@ -1024,8 +1401,8 @@ async fn run_oid_subscriber_task(
     //    event topics is needed; the scope + hash match already narrowed the wire.
     loop {
         let (path, broadcast) = match consumer.announced().await {
-            None => break,                // origin closed
-            Some((_, None)) => continue,  // unannounce — re-await
+            None => break,               // origin closed
+            Some((_, None)) => continue, // unannounce — re-await
             Some((path, Some(b))) => (path, b),
         };
         // Only read announcements whose final path segment is this OID's hash.
@@ -1036,31 +1413,55 @@ async fn run_oid_subscriber_task(
         if last_segment != want_hash.as_str() {
             continue;
         }
-        read_oid_event_broadcast(broadcast, tx.clone()).await;
+        read_oid_event_broadcast(
+            broadcast,
+            tx.clone(),
+            resume_from,
+            last_sequence.clone(),
+            idle_resumes.clone(),
+        )
+        .await;
     }
 }
 
 /// Read all groups from a per-OID publication broadcast's `events` track and
 /// relay every frame to `tx`. Unlike [`read_event_broadcast`] there is NO
 /// pattern filtering — the consumer scope already limited the wire to one OID.
-async fn read_oid_event_broadcast(broadcast: moq_net::BroadcastConsumer, tx: mpsc::Sender<(String, Vec<u8>)>) {
+async fn read_oid_event_broadcast(
+    broadcast: moq_net::BroadcastConsumer,
+    tx: EventChannelSender,
+    resume_from: Option<u64>,
+    last_sequence: Arc<AtomicU64>,
+    idle_resumes: Arc<AtomicU64>,
+) {
     let mut track = match broadcast.subscribe_track(&Track::new(EVENT_TRACK)) {
         Ok(t) => t,
         Err(_) => return,
     };
 
     loop {
-        let mut group = match tokio::time::timeout(
-            crate::moq_stream::GROUP_IDLE_TIMEOUT,
-            track.next_group(),
-        ).await {
-            Ok(Ok(Some(g))) => g,
-            Ok(Ok(None)) | Ok(Err(_)) => break,
-            Err(_elapsed) => {
-                tracing::debug!("per-OID event subscriber idle timeout — broadcast may be gone");
-                break;
+        let mut group =
+            match tokio::time::timeout(crate::moq_stream::GROUP_IDLE_TIMEOUT, track.next_group())
+                .await
+            {
+                Ok(Ok(Some(g))) => g,
+                Ok(Ok(None)) | Ok(Err(_)) => break,
+                Err(_elapsed) => {
+                    // #606: see read_event_broadcast — quiet != gone, keep waiting.
+                    tracing::debug!(
+                        "per-OID event subscriber idle — broadcast still live, resuming wait"
+                    );
+                    idle_resumes.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
+
+        // Offset-resume (#606): unambiguous here — exactly one broadcast.
+        if let Some(threshold) = resume_from {
+            if group.sequence <= threshold {
+                continue;
             }
-        };
+        }
 
         let frame = match group.read_frame().await {
             Ok(Some(f)) => f,
@@ -1085,7 +1486,8 @@ async fn read_oid_event_broadcast(broadcast: moq_net::BroadcastConsumer, tx: mps
         };
         let payload = frame[4 + topic_len..].to_vec();
 
-        if tx.send((topic, payload)).await.is_err() {
+        last_sequence.fetch_max(group.sequence, Ordering::Relaxed);
+        if !tx.send((topic, payload)).await {
             break; // receiver dropped
         }
     }
@@ -1116,7 +1518,10 @@ mod tests {
     #[test]
     fn test_topic_matches_patterns() {
         let patterns = vec!["worker.".to_owned()];
-        assert!(topic_matches_patterns("worker.sandbox123.started", &patterns));
+        assert!(topic_matches_patterns(
+            "worker.sandbox123.started",
+            &patterns
+        ));
         assert!(!topic_matches_patterns("system.event.ready", &patterns));
         assert!(!topic_matches_patterns("worker", &patterns)); // no trailing dot match
 
@@ -1124,8 +1529,67 @@ mod tests {
         assert!(topic_matches_patterns("any.thing", &patterns_all));
 
         let patterns_exact = vec!["worker.abc.started".to_owned()];
-        assert!(topic_matches_patterns("worker.abc.started", &patterns_exact));
-        assert!(!topic_matches_patterns("worker.abc.stopped", &patterns_exact));
+        assert!(topic_matches_patterns(
+            "worker.abc.started",
+            &patterns_exact
+        ));
+        assert!(!topic_matches_patterns(
+            "worker.abc.stopped",
+            &patterns_exact
+        ));
+    }
+
+    // ── #606: EventChannel unit tests (no MoQ transport — deterministic) ──────
+
+    #[tokio::test]
+    async fn event_channel_drop_oldest_evicts_and_counts() {
+        let dropped = Arc::new(AtomicU64::new(0));
+        let (tx, mut rx) = event_channel(
+            OverflowPolicy::DropOldest { high_water_mark: 2 },
+            dropped.clone(),
+        );
+
+        // Fill to capacity, then overflow by one: item "a" must be evicted.
+        assert!(tx.send(("t".into(), b"a".to_vec())).await);
+        assert!(tx.send(("t".into(), b"b".to_vec())).await);
+        assert!(tx.send(("t".into(), b"c".to_vec())).await);
+
+        assert_eq!(dropped.load(Ordering::Relaxed), 1, "exactly one eviction");
+
+        let (_, first) = rx.recv().await.expect("first item");
+        let (_, second) = rx.recv().await.expect("second item");
+        assert_eq!(first, b"b", "oldest (\"a\") was evicted, \"b\" survives");
+        assert_eq!(second, b"c");
+    }
+
+    #[tokio::test]
+    async fn event_channel_block_policy_waits_for_space_not_drop() {
+        let dropped = Arc::new(AtomicU64::new(0));
+        let (tx, mut rx) = event_channel(OverflowPolicy::Block, dropped.clone());
+
+        // Capacity for OverflowPolicy::Block is the fixed 256 default — send a
+        // third send concurrently while only 2 are buffered; it must complete
+        // once we drain one, never by silently dropping (dropped_count stays 0).
+        assert!(tx.send(("t".into(), b"a".to_vec())).await);
+        assert!(tx.send(("t".into(), b"b".to_vec())).await);
+
+        let (item, _) = rx.recv().await.expect("drain one");
+        assert_eq!(item, "t");
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            0,
+            "Block policy never evicts"
+        );
+    }
+
+    #[tokio::test]
+    async fn event_channel_closes_when_all_senders_dropped() {
+        let dropped = Arc::new(AtomicU64::new(0));
+        let (tx, mut rx) = event_channel(OverflowPolicy::Block, dropped);
+        let tx2 = tx.clone();
+        drop(tx);
+        drop(tx2);
+        assert_eq!(rx.recv().await, None, "recv must wake with None, not hang");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1188,8 +1652,8 @@ mod tests {
         use std::time::Duration;
 
         // Unique, stable socket path for this test (cross-"process" rendezvous).
-        let sock = std::env::temp_dir()
-            .join(format!("hyprstream-event-test-{}.sock", std::process::id()));
+        let sock =
+            std::env::temp_dir().join(format!("hyprstream-event-test-{}.sock", std::process::id()));
 
         // ── "event service" process: serve a SERVER-mode origin over UDS ──────
         let server_origin = MoqEventOrigin::new();
@@ -1277,13 +1741,20 @@ mod tests {
         let a = oid_hash("at://did:web:node.example.com/models/qwen3-4b/v1");
         let b = oid_hash("at://did:web:node.example.com/models/qwen3-4b/v1");
         assert_eq!(a, b, "same OID must hash to the same path");
-        assert_eq!(a.len(), OID_HASH_LEN, "hash is truncated to OID_HASH_LEN hex chars");
+        assert_eq!(
+            a.len(),
+            OID_HASH_LEN,
+            "hash is truncated to OID_HASH_LEN hex chars"
+        );
 
         let c = oid_hash("at://did:web:node.example.com/models/llama3-8b/v1");
         assert_ne!(a, c, "distinct OIDs must hash to distinct paths");
 
         // The hash must contain only filesystem/moq-safe characters (hex).
-        assert!(a.chars().all(|ch| ch.is_ascii_hexdigit()), "non-hex char in {a}");
+        assert!(
+            a.chars().all(|ch| ch.is_ascii_hexdigit()),
+            "non-hex char in {a}"
+        );
     }
 
     #[test]
@@ -1360,13 +1831,16 @@ mod tests {
     /// pre-existing two-level-scope race in `scope_consumer_for_patterns`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn flat_track_back_compat_with_oid_mirror() -> Result<()> {
-        use moq_net::{Track as MoqTrack};
+        use moq_net::Track as MoqTrack;
 
         let origin = MoqEventOrigin::new();
 
         // Publisher mirrors to both flat `local/events/registry` and per-OID track.
         let mut pub_ = origin.publisher_with_oid("registry", "oid-x")?;
-        assert!(pub_.has_oid_mirror(), "publisher_with_oid must mirror to an OID track");
+        assert!(
+            pub_.has_oid_mirror(),
+            "publisher_with_oid must mirror to an OID track"
+        );
         pub_.publish("qwen3-4b", "published", b"mirrored")?;
 
         // Read the flat `local/events/registry` broadcast directly.
@@ -1429,11 +1903,17 @@ mod tests {
     fn subscribe_and_subscribe_oid_are_mutually_exclusive() -> Result<()> {
         let mut s = MoqEventSubscriber::new();
         s.subscribe("worker.")?;
-        assert!(s.subscribe_oid("oid").is_err(), "subscribe_oid after subscribe must fail");
+        assert!(
+            s.subscribe_oid("oid").is_err(),
+            "subscribe_oid after subscribe must fail"
+        );
 
         let mut s = MoqEventSubscriber::new();
         s.subscribe_oid("oid")?;
-        assert!(s.subscribe("worker.").is_err(), "subscribe after subscribe_oid must fail");
+        assert!(
+            s.subscribe("worker.").is_err(),
+            "subscribe after subscribe_oid must fail"
+        );
 
         Ok(())
     }
@@ -1476,8 +1956,14 @@ mod tests {
         let source = Arc::new(NullBackfillSource {
             has_history: true,
             history: vec![
-                ("registry.qwen3-4b.published".to_owned(), b"backfill-1".to_vec()),
-                ("registry.qwen3-4b.published".to_owned(), b"backfill-2".to_vec()),
+                (
+                    "registry.qwen3-4b.published".to_owned(),
+                    b"backfill-1".to_vec(),
+                ),
+                (
+                    "registry.qwen3-4b.published".to_owned(),
+                    b"backfill-2".to_vec(),
+                ),
             ],
         });
 
@@ -1541,8 +2027,14 @@ mod tests {
         let got = tokio::time::timeout(Duration::from_secs(5), sub.recv())
             .await
             .expect("live event timed out (degradation failed)")?;
-        assert_eq!(got.1, b"live", "degraded subscriber must receive live events");
-        assert_ne!(got.1, b"never", "firehose history must NOT leak when unavailable");
+        assert_eq!(
+            got.1, b"live",
+            "degraded subscriber must receive live events"
+        );
+        assert_ne!(
+            got.1, b"never",
+            "firehose history must NOT leak when unavailable"
+        );
 
         drop(pub_);
         Ok(())
