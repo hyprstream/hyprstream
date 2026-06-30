@@ -124,6 +124,9 @@ jobs:
       - name: Run hyprstream-sandbox tests (guests required; skips become failures under CI)
         env:
           # The test harness fails (not skips) when these are unreadable AND CI is set.
-          HYPRSTREAM_PYGUEST_WASM: crates/hyprstream-wasm-pyguest/target/wasm32-unknown-unknown/release/hyprstream_wasm_pyguest.wasm
-          HYPRSTREAM_FSGUEST_WASM: crates/hyprstream-wasm-fsguest/target/wasm32-wasip1/release/hyprstream-wasm-fsguest.wasm
+          # ABSOLUTE paths: cargo runs `-p` tests with CWD = the crate dir, so a
+          # repo-root-relative path would resolve wrong (and the env-var-set short-
+          # circuits the CARGO_MANIFEST_DIR fallback) -> the guest would appear missing.
+          HYPRSTREAM_PYGUEST_WASM: ${{ github.workspace }}/crates/hyprstream-wasm-pyguest/target/wasm32-unknown-unknown/release/hyprstream_wasm_pyguest.wasm
+          HYPRSTREAM_FSGUEST_WASM: ${{ github.workspace }}/crates/hyprstream-wasm-fsguest/target/wasm32-wasip1/release/hyprstream-wasm-fsguest.wasm
         run: cargo test -p hyprstream-sandbox
