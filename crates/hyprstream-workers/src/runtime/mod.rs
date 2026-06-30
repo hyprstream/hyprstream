@@ -30,7 +30,7 @@ pub mod nspawn;
 mod pool;
 mod sandbox;
 // In-process WebAssembly sandbox backend (#505 P2) — gated behind `wasm`
-// (pulls the wasmtime-bearing `hyprstream-sandbox` substrate). A native in-process
+// (pulls the wasmtime-bearing `hyprstream-workers-wasmtime` substrate). A native in-process
 // sibling under the SandboxBackend seam; the default build stays lean + torch-free.
 #[cfg(feature = "wasm")]
 pub mod wasm_backend;

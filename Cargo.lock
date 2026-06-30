@@ -7081,21 +7081,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hyprstream-sandbox"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "hyprstream-rpc",
- "hyprstream-vfs",
- "parking_lot 0.12.4",
- "rand 0.10.1",
- "rand 0.8.5",
- "tokio",
- "wasi-common",
- "wasmtime",
-]
-
-[[package]]
 name = "hyprstream-service"
 version = "0.1.0"
 dependencies = [
@@ -7226,11 +7211,11 @@ dependencies = [
  "hyprstream-rpc",
  "hyprstream-rpc-build",
  "hyprstream-rpc-derive",
- "hyprstream-sandbox",
  "hyprstream-service",
  "hyprstream-tcl",
  "hyprstream-vfs",
  "hyprstream-vfs-server",
+ "hyprstream-workers-wasmtime",
  "inventory",
  "kata-sys-util",
  "kata-types",
@@ -7261,6 +7246,21 @@ dependencies = [
  "which 7.0.3",
  "zbus 4.4.0",
  "zeroize",
+]
+
+[[package]]
+name = "hyprstream-workers-wasmtime"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hyprstream-rpc",
+ "hyprstream-vfs",
+ "parking_lot 0.12.4",
+ "rand 0.10.1",
+ "rand 0.8.5",
+ "tokio",
+ "wasi-common",
+ "wasmtime",
 ]
 
 [[package]]

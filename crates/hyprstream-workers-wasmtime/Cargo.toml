@@ -1,5 +1,5 @@
 [package]
-name = "hyprstream-sandbox"
+name = "hyprstream-workers-wasmtime"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
@@ -7,8 +7,8 @@ description = "Embedded wasmtime host for sandboxing untrusted wasm guests behin
 
 # Workspace member (host target). It does NOT depend on tch/libtorch, so it builds
 # without LIBTORCH. Build/test scoped:
-#   cargo build -p hyprstream-sandbox
-#   cargo test  -p hyprstream-sandbox
+#   cargo build -p hyprstream-workers-wasmtime
+#   cargo test  -p hyprstream-workers-wasmtime
 
 # NB: this crate intentionally does NOT add `[lints] workspace = true`. Lint
 # inheritance is opt-in, so the workspace's deny-by-default panic/print lints do
@@ -22,7 +22,7 @@ rand = "0.8"
 
 # Canonical VFS seam. hyprstream-vfs -> hyprstream-rpc; NEITHER pulls
 # tch/torch (verified: only the top-level `hyprstream` crate links libtorch), so
-# `cargo build -p hyprstream-sandbox` stays torch-free. We use:
+# `cargo build -p hyprstream-workers-wasmtime` stays torch-free. We use:
 #   * hyprstream_rpc::Subject  — the CANONICAL caller identity (replaces the
 #     crate-local Subject newtype).
 #   * hyprstream_vfs::{Namespace, Mount, Fid, Stat, DirEntry, MountError, ...}

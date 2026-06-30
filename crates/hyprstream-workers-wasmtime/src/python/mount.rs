@@ -29,12 +29,12 @@
 //! ```ignore
 //! // In the daemon, where the per-session Namespace is built (alongside the Tcl
 //! // `/lang/tcl` mount):
-//! let sandbox = hyprstream_sandbox::Sandbox::from_bytes_for(GUEST_WASM, subject.clone())
-//!     .with_vfs(hyprstream_sandbox::vfs::VfsProxyHandle::new(
+//! let sandbox = hyprstream_workers_wasmtime::Sandbox::from_bytes_for(GUEST_WASM, subject.clone())
+//!     .with_vfs(hyprstream_workers_wasmtime::vfs::VfsProxyHandle::new(
 //!         hyprstream_vfs::proxy::spawn_vfs_proxy(ns.clone(), subject.clone()),
 //!         subject.clone(),
 //!     ));
-//! let mount = hyprstream_sandbox::python::mount::PythonMount::spawn(sandbox, PER_CALL_FUEL);
+//! let mount = hyprstream_workers_wasmtime::python::mount::PythonMount::spawn(sandbox, PER_CALL_FUEL);
 //! ns.mount("/lang/python", std::sync::Arc::new(mount))?;
 //! ```
 //!
@@ -143,7 +143,7 @@ impl PythonMount {
     pub fn spawn(sandbox: Sandbox, per_call_fuel: u64) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<PyCommand>(16);
         let handle = std::thread::Builder::new()
-            .name("hyprstream-sandbox-pyshell".into())
+            .name("hyprstream-workers-wasmtime-pyshell".into())
             .spawn(move || {
                 // Open the persistent shell on THIS (plain) thread.
                 let mut shell: PyShell = match sandbox.open_shell(per_call_fuel) {

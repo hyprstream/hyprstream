@@ -1,4 +1,4 @@
-# hyprstream-sandbox
+# hyprstream-workers-wasmtime
 
 Embedded [wasmtime] host for sandboxing untrusted wasm guests behind capability
 profiles. The crate loads an arbitrary guest module and runs it with a
@@ -49,7 +49,7 @@ when `CI` is set):
 ```sh
 export HYPRSTREAM_PYGUEST_WASM=crates/hyprstream-wasm-pyguest/target/wasm32-unknown-unknown/release/hyprstream_wasm_pyguest.wasm
 export HYPRSTREAM_FSGUEST_WASM=crates/hyprstream-wasm-fsguest/target/wasm32-wasip1/release/hyprstream-wasm-fsguest.wasm
-cargo test -p hyprstream-sandbox
+cargo test -p hyprstream-workers-wasmtime
 ```
 
 ## wasmtime 46 notes (durable gotchas)

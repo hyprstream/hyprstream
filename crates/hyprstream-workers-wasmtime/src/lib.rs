@@ -158,7 +158,7 @@ impl EpochTimer {
         let engine = engine.clone();
         let stop_clone = stop.clone();
         let handle = std::thread::Builder::new()
-            .name("hyprstream-sandbox-epoch".into())
+            .name("hyprstream-workers-wasmtime-epoch".into())
             .spawn(move || {
                 while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
                     std::thread::sleep(tick);

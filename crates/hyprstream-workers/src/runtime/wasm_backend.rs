@@ -3,7 +3,7 @@
 //! A *native, in-process* sibling under the [`SandboxBackend`] seam. Unlike Kata
 //! (full VM) or nspawn (systemd container subprocess), this backend runs the
 //! workload as a WebAssembly guest inside *this* process via the embedded
-//! wasmtime substrate ([`hyprstream_sandbox::Sandbox`]). There is no hypervisor and
+//! wasmtime substrate ([`hyprstream_workers_wasmtime::Sandbox`]). There is no hypervisor and
 //! no child process: isolation is the wasm sandbox itself — a bespoke capability
 //! `Linker` exposing exactly `env::host_random` (Profile A: zero WASI,
 //! capability-only) plus `define_unknown_imports_as_traps` for everything else,
@@ -48,9 +48,9 @@ use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
 // The consolidated sandbox crate (renamed from `hyprstream-wasm`). It re-exports
-// the canonical `hyprstream_rpc::Subject` as `hyprstream_sandbox::Subject`, so the
+// the canonical `hyprstream_rpc::Subject` as `hyprstream_workers_wasmtime::Subject`, so the
 // guest runs as the SAME identity the rest of the daemon uses.
-use hyprstream_sandbox::{EpochTimer, Sandbox, Subject};
+use hyprstream_workers_wasmtime::{EpochTimer, Sandbox, Subject};
 
 use crate::config::PoolConfig;
 use crate::error::{Result, WorkerError};
@@ -437,7 +437,7 @@ impl SandboxBackend for WasmBackend {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // The wasm backend is registered ONLY when compiled with `--features wasm`
-// (which is what pulls in the wasmtime-bearing `hyprstream-sandbox` dep). Mirrors
+// (which is what pulls in the wasmtime-bearing `hyprstream-workers-wasmtime` dep). Mirrors
 // how `kata` registers only under `kata-vm`. Selection stays fail-closed: with
 // the feature off, an explicit `wasm` request hits the "unknown backend" error
 // path (the name simply isn't in the registry) rather than silently downgrading.

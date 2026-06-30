@@ -12,10 +12,10 @@ hyprstream-rpc = { path = "../hyprstream-rpc" }
 # In-process WebAssembly sandbox substrate (#505 P1): the embedded wasmtime
 # `Sandbox` (capability-only Linker, fuel/epoch DoS bounds). This is the
 # consolidated crate formerly named `hyprstream-wasm` (renamed to
-# `hyprstream-sandbox` in the quality reset). Optional — pulled in only under the
+# `hyprstream-workers-wasmtime` in the quality reset). Optional — pulled in only under the
 # `wasm` feature so the default/nspawn build stays lean and torch-free
-# (hyprstream-sandbox depends only on wasmtime/rand/vfs/rpc, never tch/libtorch).
-hyprstream-sandbox = { path = "../hyprstream-sandbox", optional = true }
+# (hyprstream-workers-wasmtime depends only on wasmtime/rand/vfs/rpc, never tch/libtorch).
+hyprstream-workers-wasmtime = { path = "../hyprstream-workers-wasmtime", optional = true }
 hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }
 hyprstream-service = { path = "../hyprstream-service" }
 hyprstream-vfs = { path = "../hyprstream-vfs" }
@@ -145,12 +145,12 @@ kata-vm = [
     "dep:hyprstream-vfs-server",
 ]
 # In-process WebAssembly sandbox backend (#505 P2). Compiles in `WasmBackend`
-# and the `hyprstream-sandbox` wasmtime substrate it consumes. A native in-process
+# and the `hyprstream-workers-wasmtime` wasmtime substrate it consumes. A native in-process
 # sibling under the same `SandboxBackend` seam: no VM, no subprocess — a wasmtime
 # guest bound to a `Subject`, fuel/epoch DoS-bounded. Opt-in so the default build
 # doesn't vendor wasmtime; stays torch-free either way. When off, `wasm`
 # selection fails closed (the backend simply isn't registered).
-wasm = ["dep:hyprstream-sandbox"]
+wasm = ["dep:hyprstream-workers-wasmtime"]
 # Enable Dragonball built-in VMM support (alternative to cloud-hypervisor).
 # Implies `kata-vm` since it tunes the kata hypervisor abstraction.
 dragonball = ["kata-vm", "kata-hypervisor/dragonball"]

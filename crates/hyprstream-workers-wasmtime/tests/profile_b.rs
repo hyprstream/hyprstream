@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use hyprstream_sandbox::wasi_sandbox::WasiSandbox;
+use hyprstream_workers_wasmtime::wasi_sandbox::WasiSandbox;
 use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat, Subject};
 
 fn guest_wasm() -> Option<Vec<u8>> {
