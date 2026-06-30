@@ -10,12 +10,12 @@ on:
     branches: [ "main" ]
     paths:
       - 'crates/hyprstream-workers/**'
-      - 'crates/hyprstream-sandbox/**'
+      - 'crates/hyprstream-workers-wasmtime/**'
       - '.github/workflows/workers-wasm-tests.yml'
   pull_request:
     paths:
       - 'crates/hyprstream-workers/**'
-      - 'crates/hyprstream-sandbox/**'
+      - 'crates/hyprstream-workers-wasmtime/**'
       - '.github/workflows/workers-wasm-tests.yml'
 
 env:
