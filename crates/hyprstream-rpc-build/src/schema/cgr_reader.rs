@@ -1534,6 +1534,7 @@ pub fn is_primitive_type(type_name: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod mandatory_scope_tests {
     use super::*;
 
