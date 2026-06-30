@@ -8,7 +8,7 @@
 //! Design:
 //!
 //! This cache is a thin OAuth-specific wrapper over the shared
-//! [`TtlCache`](hyprstream_discovery::TtlCache) substrate (extracted in
+//! [`TtlCache`](hyprstream_util::TtlCache) substrate (extracted in
 //! #524). `TtlCache` provides the eviction machinery — per-entry TTL,
 //! lazy version-tagged deletion on re-insert, bounded inline reaping and
 //! a capacity bound (next-to-expire victim). This wrapper adds:
@@ -25,7 +25,7 @@
 
 use std::time::Duration;
 
-use hyprstream_discovery::TtlCache;
+use hyprstream_util::TtlCache;
 
 use super::state::RegisteredClient;
 
