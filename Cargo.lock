@@ -7219,6 +7219,8 @@ dependencies = [
  "nydus-storage 0.7.1",
  "nydus-utils 0.5.0",
  "parking_lot 0.12.4",
+ "protobuf",
+ "protocols",
  "rand 0.8.5",
  "reqwest 0.11.27",
  "serde",
@@ -7232,7 +7234,9 @@ dependencies = [
  "tokio-test",
  "tokio-util",
  "tracing",
+ "ttrpc",
  "uuid 1.18.1",
+ "vsock 0.5.4",
  "walkdir",
  "which 7.0.3",
  "zbus 4.4.0",
@@ -9925,6 +9929,19 @@ name = "nix"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
+dependencies = [
+ "bitflags 2.11.0",
+ "cfg-if 1.0.3",
+ "cfg_aliases",
+ "libc",
+ "memoffset 0.9.1",
+]
+
+[[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
 dependencies = [
  "bitflags 2.11.0",
  "cfg-if 1.0.3",
@@ -15854,7 +15871,7 @@ dependencies = [
  "futures",
  "libc",
  "tokio",
- "vsock",
+ "vsock 0.3.0",
 ]
 
 [[package]]
@@ -16874,6 +16891,16 @@ checksum = "4c8e1df0bf1e1b28095c24564d1b90acae64ca69b097ed73896e342fa6649c57"
 dependencies = [
  "libc",
  "nix 0.24.3",
+]
+
+[[package]]
+name = "vsock"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ba782755fc073877e567c2253c0be48e4aa9a254c232d36d3985dfae0bd5205"
+dependencies = [
+ "libc",
+ "nix 0.31.3",
 ]
 
 [[package]]
