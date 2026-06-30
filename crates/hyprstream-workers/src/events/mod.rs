@@ -32,13 +32,20 @@
 //! }
 //! ```
 
-pub mod group_key;
 mod publisher;
 pub mod secure_publisher;
 pub mod secure_subscriber;
 mod subscriber;
 pub mod token_manager;
 mod types;
+
+// The generic keyable-group primitive (GroupKeyRegistry, GroupRef,
+// MembershipResolver, RekeyPolicy, EncryptedEvent, …) lives in
+// `hyprstream-rpc::crypto::group_key` — re-exported here for consumers that
+// reach it via `hyprstream_workers::events`.
+pub use hyprstream_rpc::crypto::group_key::{
+    DenyAllResolver, GroupKeyRegistry, GroupMembership, GroupRef, MembershipResolver,
+};
 
 pub use publisher::EventPublisher;
 pub use subscriber::EventSubscriber;

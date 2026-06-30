@@ -24,42 +24,14 @@ use hyprstream_rpc::crypto::event_crypto::{
 };
 use hyprstream_rpc::crypto::backend::keyed_mac;
 
-/// Maximum key lifetime (24 hours). Keys MUST be rotated before this.
-pub const MAX_KEY_LIFETIME: Duration = Duration::from_secs(86400);
-
-/// Default rotation interval (1 hour).
-pub const DEFAULT_ROTATION_INTERVAL: Duration = Duration::from_secs(3600);
-
-/// Grace period for old key acceptance after rotation (120 seconds).
-pub const GRACE_PERIOD: Duration = Duration::from_secs(120);
-
-/// Rekey policy configuration.
-#[derive(Clone, Debug)]
-pub enum RekeyPolicy {
-    /// Rotate on fixed schedule. Revocations deferred to next rotation.
-    Scheduled { interval: Duration },
-    /// Rotate immediately on revocation.
-    Immediate,
-    /// Scheduled with jitter for timing attack resistance.
-    Jittered { interval: Duration, jitter: Duration },
-}
-
-impl RekeyPolicy {
-    pub fn validate(&self) -> Result<(), String> {
-        match self {
-            Self::Scheduled { interval } | Self::Jittered { interval, .. }
-                if *interval > MAX_KEY_LIFETIME =>
-            {
-                return Err(format!(
-                    "interval {:?} exceeds MAX_KEY_LIFETIME ({:?})",
-                    interval, MAX_KEY_LIFETIME
-                ));
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-}
+// The generic keyable-group primitive (RekeyPolicy, EncryptedEvent,
+// RotationResult, WrappedKeyEntry) now lives in `hyprstream-rpc::crypto::group_key`
+// so EventService, placement, and future fan-out consumers share one
+// implementation. Re-exported here for API stability with existing callers.
+pub use hyprstream_rpc::crypto::group_key::{
+    EncryptedEvent, RekeyPolicy, RotationResult, WrappedKeyEntry,
+    DEFAULT_ROTATION_INTERVAL, GRACE_PERIOD, MAX_KEY_LIFETIME,
+};
 
 /// State for a single topic prefix's group key.
 struct GroupKeyState {
@@ -390,41 +362,6 @@ fn maybe_promote_pending(state: &mut PrefixState) {
             state.key_state.pending = Some(pending);
         }
     }
-}
-
-/// Result of encrypting an event.
-#[derive(Debug, Clone)]
-pub struct EncryptedEvent {
-    pub topic: String,
-    pub tag: Vec<u8>,
-    pub ciphertext: Vec<u8>,
-    pub nonce: [u8; 12],
-    pub key_commitment: [u8; 16],
-    /// LK mode routing tag (keyed HMAC of prefix). Empty in ZK mode.
-    pub lk_tag: Vec<u8>,
-    /// Ed25519 signature over the event.
-    pub signature: Vec<u8>,
-    /// Publisher's Ed25519 verifying key.
-    pub publisher_pubkey: [u8; 32],
-    /// Event timestamp (unix millis).
-    pub timestamp: i64,
-}
-
-/// Result of a key rotation.
-#[derive(Debug)]
-pub struct RotationResult {
-    pub new_ephemeral_pubkey: [u8; 32],
-    pub wrapped_keys: Vec<WrappedKeyEntry>,
-    pub effective_at_millis: i64,
-}
-
-/// A wrapped key entry for a single subscriber.
-#[derive(Debug)]
-pub struct WrappedKeyEntry {
-    /// Random 16-byte routing tag (unlinkable across rekeys).
-    pub routing_tag: [u8; 16],
-    /// Opaque wrapped group key blob.
-    pub wrapped_blob: Vec<u8>,
 }
 
 /// Hash a pubkey for use as subscriber identity.
