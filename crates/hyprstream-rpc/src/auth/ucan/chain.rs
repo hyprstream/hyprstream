@@ -176,8 +176,8 @@ fn validate_edge(delegate: &Ucan, delegator: &Ucan, link: usize) -> Result<(), C
     // 1. Linkage: authority flows delegator.audience → delegate.issuer.
     if delegate.issuer() != delegator.audience() {
         return Err(ChainError::BrokenLinkage {
-            delegate_issuer: delegate.issuer().0.clone(),
-            delegator_audience: delegator.audience().0.clone(),
+            delegate_issuer: delegate.issuer().as_str().to_owned(),
+            delegator_audience: delegator.audience().as_str().to_owned(),
         });
     }
     // 2. Attenuation: the delegator's capabilities must cover the delegate's.
@@ -516,7 +516,7 @@ mod tests {
             nonce: vec![],
         };
         let alice_ok = resign(&alice, alice_ok_payload, vec![root_ok]);
-        let _ = Did::new("did:key:placeholder"); // keep Did import used
+        let _ = Did::new("did:key:placeholder".to_owned()); // keep Did import used
         assert!(validate(&alice_ok, &store(&[&root, &alice]), NOW).is_ok());
     }
 

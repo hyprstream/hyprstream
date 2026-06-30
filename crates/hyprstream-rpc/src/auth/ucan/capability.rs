@@ -25,7 +25,7 @@
 //!
 //! The mapping from an [`Ability`]/[`Resource`] to S3's concrete
 //! `ScopeAction`/`Operation` + object types — i.e. *what the verbs mean to the
-//! enforcement layer* — is the [`super::seam`] that lands after S3 (#582). This
+//! enforcement layer* — is the action vocabulary that lands after S3 (#582). This
 //! module never needs it: attenuation is purely structural.
 
 use serde::{Deserialize, Serialize};
@@ -102,7 +102,7 @@ impl fmt::Display for Resource {
 /// Subset is namespace containment over `/`-delimited verb segments: `a/b` ⊆
 /// `a/*` ⊆ `*`. This mirrors the UCAN ability convention and is intentionally
 /// independent of S3's `ScopeAction` enum — the verb→`ScopeAction` mapping is the
-/// deferred [`super::seam`].
+/// deferred action vocabulary (#582).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Ability(pub String);
@@ -152,9 +152,8 @@ impl fmt::Display for Ability {
 /// value; the child may carry extra keys (extra restrictions).
 ///
 /// The value-aware algebra (a child `{"max": 5}` being covered by a parent
-/// `{"max": 10}`) is a milestone-2 seam — see the module docs and
-/// [`super::seam`]. Until then we never *widen* on caveats, which is the
-/// fail-closed direction.
+/// `{"max": 10}`) is deferred — see the module docs. Until then we never *widen*
+/// on caveats, which is the fail-closed direction.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Caveats(pub BTreeMap<String, CaveatValue>);

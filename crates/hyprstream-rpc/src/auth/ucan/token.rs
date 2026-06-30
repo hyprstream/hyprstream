@@ -31,43 +31,27 @@
 //! and is isolated for that reason).
 
 use super::capability::Capability;
-use crate::did_key::did_key_to_ed25519;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// A decentralized identifier. Milestone 1 supports `did:key` (Ed25519)
-/// exclusively — the self-contained form the rest of `hyprstream-rpc` already
-/// uses (`crate::did_key`). The string is the canonical identity; the resolved
-/// Ed25519 key is derived on demand for signature verification.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct Did(pub String);
+/// The canonical decentralized identifier — there is exactly **one** `did:key`
+/// type and parser in the TCB (#578). S5 milestone 1 originally carried a local
+/// `Did(String)` + its own `did_key_to_ed25519` call; milestone 2 (#571) folds it
+/// onto [`crate::identity::Did`] so no second DID type or parser survives. The
+/// UCAN layer still supports `did:key` (Ed25519) exclusively — the Ed25519 key is
+/// resolved on demand via [`crate::identity::Did::to_ed25519`] (which delegates to
+/// the SAME `crate::did_key` parser the rest of `hyprstream-rpc` uses).
+pub use crate::identity::Did;
 
-impl Did {
-    pub fn new(s: impl Into<String>) -> Self {
-        Did(s.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    /// Resolve the Ed25519 verifying key bytes this `did:key` encodes. The
-    /// classical half of the hybrid identity; the ML-DSA-65 anchor is resolved
-    /// separately by the verifier's trust store (see [`UcanVerifier`]). Errors
-    /// (fail-closed) if this is not a well-formed `did:key` Ed25519 identifier.
-    pub fn ed25519_key(&self) -> Result<[u8; 32], UcanError> {
-        did_key_to_ed25519(&self.0).map_err(|e| UcanError::BadDid {
-            did: self.0.clone(),
-            reason: e.to_string(),
-        })
-    }
-}
-
-impl fmt::Display for Did {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
+/// Resolve the Ed25519 verifying-key bytes a UCAN `did:key` issuer/audience
+/// encodes, mapped to a fail-closed [`UcanError`]. Thin adapter over the canonical
+/// [`Did::to_ed25519`] so the UCAN signature/structure paths keep their typed
+/// error without re-implementing any `did:key` parsing (single parser, #578).
+fn did_ed25519_key(did: &Did) -> Result<[u8; 32], UcanError> {
+    did.to_ed25519().map_err(|e| UcanError::BadDid {
+        did: did.as_str().to_owned(),
+        reason: e.to_string(),
+    })
 }
 
 /// The signed body of a UCAN: everything an issuer commits to with their
@@ -195,8 +179,8 @@ impl Ucan {
     /// proof is recursively checked. Fail-closed on any malformation.
     pub fn validate_structure(&self) -> Result<(), UcanError> {
         // DIDs must be resolvable did:key identifiers.
-        let _ = self.payload.issuer.ed25519_key()?;
-        let _ = self.payload.audience.ed25519_key()?;
+        let _ = did_ed25519_key(&self.payload.issuer)?;
+        let _ = did_ed25519_key(&self.payload.audience)?;
         if let (Some(nbf), Some(exp)) = (self.payload.not_before, self.payload.expiration) {
             if nbf > exp {
                 return Err(UcanError::Malformed(format!(
@@ -239,7 +223,7 @@ impl Ucan {
     /// This does NOT check attenuation/delegation linkage — that is
     /// [`super::chain::validate_chain`], deliberately separate.
     pub fn verify_signatures<V: UcanVerifier>(&self, verifier: &V) -> Result<(), UcanError> {
-        let ed_bytes = self.payload.issuer.ed25519_key()?;
+        let ed_bytes = did_ed25519_key(&self.payload.issuer)?;
         let payload_bytes = self.payload.signing_bytes()?;
         verifier.verify(
             &self.payload.issuer,
@@ -317,7 +301,6 @@ pub(super) mod test_support {
     use crate::auth::ucan::capability::{Ability, Capability, Resource};
     use crate::crypto::cose_sign::{sign_composite, verify_composite};
     use crate::crypto::pq::{ml_dsa_generate_keypair, MlDsaSigningKey, MlDsaVerifyingKey};
-    use crate::did_key::ed25519_to_did_key;
     use ed25519_dalek::{SigningKey, VerifyingKey};
     use std::collections::HashMap;
 
@@ -349,7 +332,7 @@ pub(super) mod test_support {
         }
 
         pub fn did(&self) -> Did {
-            Did::new(ed25519_to_did_key(&self.ed_vk.to_bytes()))
+            Did::from_ed25519(&self.ed_vk.to_bytes())
         }
     }
 
@@ -396,7 +379,8 @@ pub(super) mod test_support {
             }
         }
         pub fn anchor(&mut self, id: &TestIdentity) {
-            self.pq_by_did.insert(id.did().0, id.pq_vk.clone());
+            self.pq_by_did
+                .insert(id.did().into_string(), id.pq_vk.clone());
         }
     }
 
@@ -410,7 +394,7 @@ pub(super) mod test_support {
         ) -> Result<(), UcanError> {
             let ed_vk = VerifyingKey::from_bytes(ed_key)
                 .map_err(|e| UcanError::BadSignature(e.to_string()))?;
-            let pq_vk = self.pq_by_did.get(&issuer.0);
+            let pq_vk = self.pq_by_did.get(issuer.as_str());
             verify_composite(signature, &ed_vk, pq_vk, payload, UCAN_AAD, true)
                 .map(|_| ())
                 .map_err(|e| UcanError::BadSignature(e.to_string()))
@@ -462,7 +446,7 @@ mod tests {
     fn validate_structure_rejects_bad_did() {
         let alice = TestIdentity::generate();
         let mut u = signed_ucan(&alice, &alice.did(), vec![], vec![]);
-        u.payload.audience = Did::new("did:web:example.com");
+        u.payload.audience = Did::new("did:web:example.com".to_owned());
         assert!(matches!(
             u.validate_structure(),
             Err(UcanError::BadDid { .. })

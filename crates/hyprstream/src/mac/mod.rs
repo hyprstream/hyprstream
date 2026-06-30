@@ -49,13 +49,14 @@
 //! ## TCB note
 //!
 //! The per-op TCB is intentionally tiny: a hash lookup ([`avc`]), and on a miss a set lookup
-//! plus one intrinsic `SecurityLabel::dominates` call ([`te`]). All heavy/bug-prone logic
+//! plus one intrinsic `SecurityLabel::can_access` call ([`te`]). All heavy/bug-prone logic
 //! (Casbin matching,
 //! UCAN chain validation, compilation, signature verification) is concentrated off the hot
 //! path — in PolicyService and the [`compiled`] loader, the one audited place (design §2).
 
 pub mod avc;
 pub mod compiled;
+pub mod compiler;
 pub mod lattice;
 pub mod te;
 
@@ -75,4 +76,12 @@ pub use lattice::{
 pub use te::{
     Action, Decision, LatticeTeEvaluator, ObjectCtx, ObjectType, ScopeAction, SubjectCtx,
     SubjectType, TeEvaluator, TeMatrix, TeRule,
+};
+// S5 (#571): the UCAN→TE policy compiler — compile a validated grant into a
+// CompiledPolicy, verify it grants no privilege beyond the grant, and sign it
+// (fail-closed). Lives here (not `hyprstream-rpc`) because it needs both the UCAN
+// model and S4's `TeMatrix`/`CompiledPolicy`.
+pub use compiler::{
+    authorize, authorize_at, check_no_escalation, compile, compile_policy, missing_permission,
+    AccessRequest, CompileError, PermissionMap, PrivilegeEscalation,
 };
