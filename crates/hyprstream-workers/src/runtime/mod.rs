@@ -96,6 +96,8 @@ pub use nspawn::{NspawnBackend, NspawnConfig, NspawnHandle};
 pub use wasm_backend::{WasmBackend, WasmConfig, WasmHandle};
 // Inventory-based backend registry + fail-closed selection spine (#507)
 pub use selection::{resolve_backend, BackendCtx, BackendRegistration};
+// Wizard/CLI selection diagnostics (#348)
+pub use selection::{list_backends_for_wizard, BackendStatus};
 // Domain entities (business logic only)
 pub use container::Container;
 pub use pool::{PoolStats, SandboxPool};

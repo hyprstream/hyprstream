@@ -207,6 +207,80 @@ pub fn resolve_backend(name: &str, ctx: &BackendCtx) -> Result<Arc<dyn SandboxBa
     })
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Wizard / CLI diagnostics (#348)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// `resolve_backend` answers "which backend do I get"; the functions below add
+// the backend-local "why not" knowledge a `hyprstream service` CLI subcommand
+// or an interactive setup wizard needs — per-backend prerequisite sub-reasons
+// and a status snapshot of the compiled-in registry. None of this changes
+// selection semantics; it is read-only introspection over the same registry.
+//
+// The generic filter→rank→select explain trace (`SelectionReport<C>`) is owned
+// by the #628 scheduling substrate (`hyprstream-discovery::scheduling`);
+// `selection.rs` will adopt it once the substrate reaches main, rather than
+// carrying a second, backend-specific copy here.
+
+/// Backend-specific sub-reason for why `is_available()` returned `false`,
+/// e.g. "cloud-hypervisor not on PATH" for `kata`. Falls back to a generic
+/// message for backends this function doesn't have specific knowledge of.
+///
+/// This mirrors the prerequisite probes in each backend's
+/// `registry_is_available()` (see `kata_backend.rs`, `nspawn.rs`,
+/// `wasm_backend.rs`) but is allowed to drift from them in detail since it is
+/// diagnostic-only — it never gates selection itself.
+fn unavailable_reason(name: &str) -> String {
+    match name {
+        "kata" => "runtime prerequisites missing: `cloud-hypervisor` not found on PATH".to_owned(),
+        "nspawn" => {
+            "runtime prerequisites missing: `systemd-nspawn` and/or `machinectl` not found on PATH"
+                .to_owned()
+        }
+        "podman" => "runtime prerequisites missing: `podman` not found on PATH".to_owned(),
+        "wasm" => "wasm runtime prerequisites are not satisfied".to_owned(),
+        other => format!("runtime prerequisites for '{other}' are not satisfied"),
+    }
+}
+
+/// Wizard/CLI-facing snapshot of one registered backend's status. A future
+/// `hyprstream service` subcommand can render `Vec<BackendStatus>` as a table
+/// (name / priority / auto-eligible / available / why-not).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendStatus {
+    pub name: &'static str,
+    pub priority: i32,
+    pub auto_selectable: bool,
+    pub available: bool,
+    pub reason_if_unavailable: Option<String>,
+}
+
+/// List every compiled-in backend with its live availability, for wizard/CLI
+/// display. Ordered by descending priority (matching `"auto"`'s preference
+/// order), name ascending as a tiebreak.
+pub fn list_backends_for_wizard() -> Vec<BackendStatus> {
+    let mut regs: Vec<&'static BackendRegistration> =
+        inventory::iter::<BackendRegistration>().collect();
+    regs.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.name.cmp(b.name)));
+
+    regs.into_iter()
+        .map(|reg| {
+            let available = (reg.is_available)();
+            BackendStatus {
+                name: reg.name,
+                priority: reg.priority,
+                auto_selectable: reg.auto_selectable,
+                available,
+                reason_if_unavailable: if available {
+                    None
+                } else {
+                    Some(unavailable_reason(reg.name))
+                },
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -460,5 +534,100 @@ mod tests {
             kata.priority > nspawn.priority,
             "kata (VM) must outrank nspawn for auto-selection"
         );
+    }
+
+    // ── N-backend fallback-chain semantics (#348) ──
+    //
+    // Synthetic 3-tier registry modeling a future kata > podman > nspawn world
+    // (podman lands under #346; until then this just proves the *logic*
+    // generalizes past two backends — it does not depend on #346 landing).
+
+    const MID: BackendRegistration = BackendRegistration {
+        name: "mid-tier",
+        priority: 50,
+        auto_selectable: true,
+        is_available: || true,
+        construct: never_available,
+    };
+
+    fn three_tier_regs() -> Vec<&'static BackendRegistration> {
+        vec![&HIGH, &MID, &LOW]
+    }
+
+    #[test]
+    fn auto_three_tier_all_available_picks_highest() {
+        let r = select_registration("auto", &three_tier_regs(), |_| true).unwrap();
+        assert_eq!(r.name, "high-tier");
+    }
+
+    #[test]
+    fn auto_three_tier_degrades_through_priority_order_one_by_one() {
+        // Simulate backends disappearing one at a time, strongest first —
+        // exactly the "kata missing -> try podman -> try nspawn" chain a
+        // wizard cares about. Each step must fall exactly one tier, never
+        // skip ahead and never error while something remains available.
+        let regs = three_tier_regs();
+
+        let r = select_registration("auto", &regs, |reg| reg.name != "high-tier").unwrap();
+        assert_eq!(r.name, "mid-tier", "first degradation: high unavailable -> mid");
+
+        let r = select_registration("auto", &regs, |reg| reg.name == "low-tier").unwrap();
+        assert_eq!(r.name, "low-tier", "second degradation: only low remains");
+    }
+
+    #[test]
+    fn auto_three_tier_errors_only_when_all_unavailable() {
+        let err = select_registration("auto", &three_tier_regs(), |_| false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no available sandbox backend"), "got: {msg}");
+        // Must list all three registered names so the operator knows what to install.
+        assert!(msg.contains("high-tier") && msg.contains("mid-tier") && msg.contains("low-tier"));
+    }
+
+    #[test]
+    fn auto_three_tier_skips_middle_unavailable_tier() {
+        // Mid-tier specifically down (e.g. podman not installed) must not
+        // wrongly fall all the way to low; high still wins if available, and
+        // if high is also down it must land on low (skipping mid), not error.
+        let regs = three_tier_regs();
+        let r = select_registration("auto", &regs, |reg| reg.name != "mid-tier").unwrap();
+        assert_eq!(r.name, "high-tier", "high still available, mid down -> high wins");
+
+        let r =
+            select_registration("auto", &regs, |reg| reg.name == "low-tier").unwrap();
+        assert_eq!(r.name, "low-tier", "high and mid down -> falls through mid to low");
+    }
+
+    // ── unavailable_reason (#348 wizard diagnostics) ──
+
+    #[test]
+    fn unavailable_reason_has_per_backend_specifics() {
+        assert!(unavailable_reason("kata").contains("cloud-hypervisor"));
+        assert!(unavailable_reason("nspawn").contains("systemd-nspawn"));
+        assert!(unavailable_reason("podman").contains("podman"));
+        // Unknown backend still gets a non-empty, non-panicking message.
+        assert!(unavailable_reason("future-backend").contains("future-backend"));
+    }
+
+    // ── list_backends_for_wizard (#348) ──
+
+    #[test]
+    fn wizard_list_reflects_the_real_compiled_registry() {
+        let statuses = list_backends_for_wizard();
+        let real_count = inventory::iter::<BackendRegistration>().count();
+        assert_eq!(statuses.len(), real_count);
+
+        let nspawn = statuses.iter().find(|s| s.name == "nspawn");
+        assert!(nspawn.is_some(), "nspawn must always appear in the wizard list");
+
+        // Ordered by descending priority.
+        for pair in statuses.windows(2) {
+            assert!(pair[0].priority >= pair[1].priority, "not sorted by priority: {statuses:?}");
+        }
+
+        // Unavailable backends must carry a reason; available ones must not.
+        for s in &statuses {
+            assert_eq!(s.reason_if_unavailable.is_some(), !s.available);
+        }
     }
 }
