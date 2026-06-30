@@ -392,7 +392,7 @@ mod tests {
 
         let pq_object =
             SecurityLabel::new(Level::Public, Assurance::PqHybrid, CompartmentSet::EMPTY);
-        assert!(!peer.context.dominates(&pq_object));
+        assert!(!peer.context.can_access(&pq_object));
         assert_eq!(peer.context.assurance(), Assurance::Classical);
     }
 

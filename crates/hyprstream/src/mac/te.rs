@@ -14,14 +14,14 @@
 //! ```
 //!
 //! The lattice floor is the **intrinsic** dominance on S1's [`SecurityLabel`]
-//! ([`SecurityLabel::dominates`]) — it takes no policy argument and no `Lattice` lookup, so it
+//! ([`SecurityLabel::can_access`]) — it takes no policy argument and no `Lattice` lookup, so it
 //! is uncircumventable: no TE entry, grant, or token can relax it (design §1 invariant 3).
 //! Default is DENY: an unknown subject type, object type, action, or a non-dominating /
 //! unlabeled clearance → DENY. There is no permissive mode.
 //!
 //! ## S1 reconciliation (#567 landed)
 //!
-//! - The floor is S1's intrinsic [`SecurityLabel::dominates`], not a `Lattice::dominates`
+//! - The floor is S1's intrinsic [`SecurityLabel::can_access`], not a `Lattice::can_access`
 //!   trait method. The evaluator still holds the S1 [`Lattice`] policy object, but only for
 //!   *well-formedness* concerns (column alignment / validation / version binding), never for
 //!   the per-op order.
@@ -248,7 +248,7 @@ pub trait TeEvaluator: Send + Sync {
 /// allocation-free on the hot path. This is the verifiable TCB core.
 ///
 /// The [`Lattice`] is held for *well-formedness* and *column alignment*, NOT for the per-op
-/// order: the floor uses S1's intrinsic [`SecurityLabel::dominates`]. The PDP's `generation`
+/// order: the floor uses S1's intrinsic [`SecurityLabel::can_access`]. The PDP's `generation`
 /// is bound to `lattice.version().generation()` at construction — the desync-proof binding
 /// (#570): the same lattice bytes that minted a label's compartment bits also tag the
 /// compiled policy that evaluates it.
@@ -300,7 +300,7 @@ impl TeEvaluator for LatticeTeEvaluator {
         //    uncircumventable. Fail-closed: a non-dominating clearance → DENY, regardless of
         //    what the TE matrix says (design §1 inv.3, §10). Unlabeled subject/object never
         //    reach here (the PEP denies on `None` before constructing the contexts).
-        if !subject.clearance.dominates(&object.label) {
+        if !subject.clearance.can_access(&object.label) {
             return Decision::Deny;
         }
         // 2. Compiled TE decision (the authority gate). Default-deny by construction.

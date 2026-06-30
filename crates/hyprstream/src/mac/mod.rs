@@ -49,7 +49,7 @@
 //! ## TCB note
 //!
 //! The per-op TCB is intentionally tiny: a hash lookup ([`avc`]), and on a miss a set lookup
-//! plus one intrinsic `SecurityLabel::dominates` call ([`te`]). All heavy/bug-prone logic
+//! plus one intrinsic `SecurityLabel::can_access` call ([`te`]). All heavy/bug-prone logic
 //! (Casbin matching,
 //! UCAN chain validation, compilation, signature verification) is concentrated off the hot
 //! path — in PolicyService and the [`compiled`] loader, the one audited place (design §2).

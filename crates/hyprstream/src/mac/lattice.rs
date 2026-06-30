@@ -18,11 +18,11 @@
 //!   unlabeled subject/object is `Option::None` ⇒ deny, never a permissive
 //!   default.
 //! - Dominance (`⊒`) and join (`⊔`) are **intrinsic** to the value
-//!   ([`SecurityLabel::dominates`], [`SecurityLabel::join`] /
+//!   ([`SecurityLabel::can_access`], [`SecurityLabel::join`] /
 //!   [`SecurityLabel::join_all`]), and re-exposed on
-//!   [`SecurityContext::dominates`] for a verified subject. They are NOT methods
+//!   [`SecurityContext::can_access`] for a verified subject. They are NOT methods
 //!   on a `Lattice` trait — content truth, no policy argument. The old
-//!   `Lattice::dominates`/`join` trait is gone; the PDP floor now calls the
+//!   `Lattice::can_access`/`join` trait is gone; the PDP floor now calls the
 //!   intrinsic order (see `te.rs`).
 //! - [`Lattice`] is now S1's **policy object** (the closed, versioned compartment
 //!   name↔bit vocabulary). The PDP holds it to (a) align its TE matrix columns to
@@ -86,8 +86,8 @@ mod tests {
             .label(Level::Confidential, Assurance::Classical, [Compartment::new("pii")])
             .unwrap();
         // dominates on every axis (level ≥, assurance ≥, compartments ⊇).
-        assert!(cleared.dominates(&needs_pii));
-        assert!(!needs_pii.dominates(&cleared));
+        assert!(cleared.can_access(&needs_pii));
+        assert!(!needs_pii.can_access(&cleared));
     }
 
     #[test]
@@ -102,8 +102,8 @@ mod tests {
         let derived = ifc_join(&[secret, public]);
         assert_eq!(derived.level, Level::Secret);
         assert_eq!(derived.assurance, Assurance::PqHybrid);
-        assert!(derived.dominates(&secret));
-        assert!(derived.dominates(&public));
+        assert!(derived.can_access(&secret));
+        assert!(derived.can_access(&public));
         // empty input folds to the join identity ⊥.
         assert!(ifc_join(&[]).is_bottom());
     }

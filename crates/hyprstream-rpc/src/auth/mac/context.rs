@@ -119,7 +119,7 @@ impl SecurityContext {
     }
 
     /// The clearance label. This is the `subject.ctx` the monitor feeds into
-    /// `dominates(object_label)`.
+    /// `can_access(object_label)`.
     pub fn clearance(&self) -> &SecurityLabel {
         &self.clearance
     }
@@ -128,8 +128,8 @@ impl SecurityContext {
     /// content-bound label? The per-op MAC floor (design §10). Pure forward to
     /// the intrinsic lattice order.
     #[must_use]
-    pub fn dominates(&self, object_label: &SecurityLabel) -> bool {
-        self.clearance.dominates(object_label)
+    pub fn can_access(&self, object_label: &SecurityLabel) -> bool {
+        self.clearance.can_access(object_label)
     }
 
     pub fn level(&self) -> Level {
@@ -228,7 +228,7 @@ mod tests {
     fn classical_context_cannot_dominate_pqc_object() {
         let ctx = SecurityContext::new(Level::Secret, comps(&[0]), VerifiedKeyMaterial::Classical);
         let pqc_object = SecurityLabel::new(Level::Public, Assurance::PqHybrid, CompartmentSet::EMPTY);
-        assert!(!ctx.dominates(&pqc_object));
+        assert!(!ctx.can_access(&pqc_object));
     }
 
     struct FakeClaims(Option<SecurityLabel>);
