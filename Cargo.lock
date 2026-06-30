@@ -6742,10 +6742,10 @@ dependencies = [
  "hyprstream-rpc-derive",
  "hyprstream-rpc-std",
  "hyprstream-service",
- "hyprstream-tcl",
  "hyprstream-tui",
  "hyprstream-vfs",
  "hyprstream-workers",
+ "hyprstream-workers-tcl",
  "image",
  "indicatif",
  "inquire",
@@ -7068,8 +7068,8 @@ dependencies = [
  "hyprstream-rpc",
  "hyprstream-rpc-build",
  "hyprstream-rpc-derive",
- "hyprstream-tcl",
  "hyprstream-vfs",
+ "hyprstream-workers-tcl",
  "js-sys",
  "serde",
  "serde-wasm-bindgen",
@@ -7113,17 +7113,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hyprstream-tcl"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "hyprstream-vfs",
- "molt",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "hyprstream-tui"
 version = "0.1.0"
 dependencies = [
@@ -7136,8 +7125,8 @@ dependencies = [
  "dirs-next",
  "edtui",
  "hyprstream-compositor",
- "hyprstream-tcl",
  "hyprstream-vfs",
+ "hyprstream-workers-tcl",
  "landlock",
  "libc",
  "parking_lot 0.12.4",
@@ -7212,9 +7201,9 @@ dependencies = [
  "hyprstream-rpc-build",
  "hyprstream-rpc-derive",
  "hyprstream-service",
- "hyprstream-tcl",
  "hyprstream-vfs",
  "hyprstream-vfs-server",
+ "hyprstream-workers-tcl",
  "hyprstream-workers-wasmtime",
  "inventory",
  "kata-sys-util",
@@ -7259,6 +7248,17 @@ dependencies = [
  "serde_json",
  "tokio",
  "wasmtime",
+]
+
+[[package]]
+name = "hyprstream-workers-tcl"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hyprstream-vfs",
+ "molt",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

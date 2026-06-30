@@ -339,7 +339,7 @@ pub async fn handle_shell_tui(
 
     // Build VFS namespace for `/path` routing in ChatApps.
     #[allow(clippy::type_complexity)]
-    let (vfs_ns, tcl_mount_rx): (std::sync::Arc<hyprstream_vfs::Namespace>, std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>) = {
+    let (vfs_ns, tcl_mount_rx): (std::sync::Arc<hyprstream_vfs::Namespace>, std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_workers_tcl::TclCommand>>>) = {
         use crate::services::fs::{SyntheticNode, SyntheticTree};
 
         let mut ns = hyprstream_vfs::Namespace::new();
@@ -439,8 +439,8 @@ pub async fn handle_shell_tui(
 
         // Create /lang/tcl mount channel — the TclMount exposes interpreter state
         // as files. The receiver is polled by ChatApp::tick().
-        let (tcl_mount_tx, tcl_mount_rx) = hyprstream_tcl::create_mount_channel();
-        let tcl_mount = std::sync::Arc::new(hyprstream_tcl::TclMount::new(tcl_mount_tx));
+        let (tcl_mount_tx, tcl_mount_rx) = hyprstream_workers_tcl::create_mount_channel();
+        let tcl_mount = std::sync::Arc::new(hyprstream_workers_tcl::TclMount::new(tcl_mount_tx));
         let _ = ns.mount("/lang/tcl", tcl_mount);
 
         let ns = std::sync::Arc::new(ns);
@@ -892,7 +892,7 @@ async fn dispatch_outputs(
     vfs_ns: &std::sync::Arc<hyprstream_vfs::Namespace>,
     vfs_subject: &hyprstream_rpc::Subject,
     vfs_proxy_tx: &tokio::sync::mpsc::Sender<hyprstream_vfs::proxy::VfsRequest>,
-    tcl_mount_rx: &std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>,
+    tcl_mount_rx: &std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_workers_tcl::TclCommand>>>,
     outputs: Vec<CompositorOutput>,
 ) -> bool {
     for output in outputs {
@@ -955,7 +955,7 @@ async fn handle_rpc(
     vfs_ns: &std::sync::Arc<hyprstream_vfs::Namespace>,
     vfs_subject: &hyprstream_rpc::Subject,
     vfs_proxy_tx: &tokio::sync::mpsc::Sender<hyprstream_vfs::proxy::VfsRequest>,
-    tcl_mount_rx: &std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>,
+    tcl_mount_rx: &std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_workers_tcl::TclCommand>>>,
     req: RpcRequest,
 ) -> Vec<CompositorInput> {
     let session_id = compositor.chrome.session_id;

@@ -24,7 +24,7 @@ hyprstream-vfs = { path = "../hyprstream-vfs" }
 # flow. Native-only (vhost-user-fs/fuse-backend-rs transport are Linux-only).
 # Gated behind `kata-vm`: only the VM/CH ShareFs path attaches this server.
 hyprstream-vfs-server = { path = "../hyprstream-vfs-server", optional = true }
-hyprstream-tcl = { path = "../hyprstream-tcl" }
+hyprstream-workers-tcl = { path = "../hyprstream-workers-tcl" }
 
 # Async runtime
 tokio = { workspace = true }

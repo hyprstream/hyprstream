@@ -365,12 +365,12 @@ pub struct ChatApp {
     /// 1. It is always `None` when ChatApp crosses a thread boundary
     /// 2. It is only constructed inside `ensure_tcl_shell()` on the app thread
     /// 3. It is only accessed from that same thread thereafter
-    tcl_shell: Option<AssertSend<hyprstream_tcl::TclShell>>,
+    tcl_shell: Option<AssertSend<hyprstream_workers_tcl::TclShell>>,
     /// Deferred init data for tcl_shell (Send-safe). Consumed on first access.
     tcl_shell_init: Option<(hyprstream_vfs::Subject, std::sync::Arc<hyprstream_vfs::Namespace>)>,
     /// Receiver for TclMount commands (polled in tick()). Shared across tabs.
     #[cfg(not(target_os = "wasi"))]
-    tcl_mount_rx: Option<std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>>,
+    tcl_mount_rx: Option<std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_workers_tcl::TclCommand>>>>,
 }
 
 impl ChatApp {
@@ -579,11 +579,11 @@ impl ChatApp {
 
     /// Attach the receiver end of a `/lang/tcl` mount channel.
     ///
-    /// The corresponding [`hyprstream_tcl::TclMount`] must be mounted in the
+    /// The corresponding [`hyprstream_workers_tcl::TclMount`] must be mounted in the
     /// namespace at `/lang/tcl` before this is called. The ChatApp drains this
     /// channel in `tick()`, forwarding commands to the Tcl interpreter.
     #[cfg(not(target_os = "wasi"))]
-    pub fn with_tcl_mount_rx(mut self, rx: std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>) -> Self {
+    pub fn with_tcl_mount_rx(mut self, rx: std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_workers_tcl::TclCommand>>>) -> Self {
         self.tcl_mount_rx = Some(rx);
         self
     }
@@ -830,7 +830,7 @@ impl ChatApp {
         if self.tcl_shell.is_none() {
             if let Some((subject, namespace)) = self.tcl_shell_init.take() {
                 self.tcl_shell = Some(AssertSend(std::cell::UnsafeCell::new(
-                    hyprstream_tcl::TclShell::new(subject, namespace),
+                    hyprstream_workers_tcl::TclShell::new(subject, namespace),
                 )));
             }
         }

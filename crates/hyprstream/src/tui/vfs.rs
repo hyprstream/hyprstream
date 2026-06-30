@@ -228,8 +228,8 @@ pub fn build_chat_vfs_namespace(
     let _ = ns.mount("/env", Arc::new(env_tree));
 
     // /lang/tcl mount.
-    let (tcl_mount_tx, _tcl_mount_rx) = hyprstream_tcl::create_mount_channel();
-    let tcl_mount = Arc::new(hyprstream_tcl::TclMount::new(tcl_mount_tx));
+    let (tcl_mount_tx, _tcl_mount_rx) = hyprstream_workers_tcl::create_mount_channel();
+    let tcl_mount = Arc::new(hyprstream_workers_tcl::TclMount::new(tcl_mount_tx));
     let _ = ns.mount("/lang/tcl", tcl_mount);
 
     Ok((Arc::new(ns), subject))
