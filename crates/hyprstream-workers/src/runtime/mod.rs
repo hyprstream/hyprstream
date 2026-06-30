@@ -23,6 +23,9 @@
 pub mod backend;
 mod client;
 mod container;
+// `/exec/instances/` VFS projection of `SandboxPool` (#608 P2 / #610) — a
+// `hyprstream_vfs::Mount` impl, so it has no `kata-vm`/`wasm` dependency.
+pub mod exec_mount;
 // Kata/CH VM backend — gated behind `kata-vm` (pulls the kata/nydus toolchain).
 #[cfg(feature = "kata-vm")]
 pub mod kata_backend;
@@ -85,6 +88,8 @@ pub use client::{
 };
 // Backend trait and implementations
 pub use backend::{SandboxBackend, SandboxHandle};
+// `/exec/instances/` Plan9 projection of the pool (#608 P2 / #610)
+pub use exec_mount::ExecMount;
 #[cfg(feature = "kata-vm")]
 pub use kata_backend::{KataBackend, KataHandle};
 pub use nspawn::{NspawnBackend, NspawnConfig, NspawnHandle};
