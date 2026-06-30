@@ -77,11 +77,11 @@ pub use te::{
     Action, Decision, LatticeTeEvaluator, ObjectCtx, ObjectType, ScopeAction, SubjectCtx,
     SubjectType, TeEvaluator, TeMatrix, TeRule,
 };
-// S5 milestone-2 (#571): the vocabulary-independent UCAN→TE emitter + faithfulness
-// framework + fail-closed signing gate. Concrete homes (here, not `hyprstream-rpc`)
-// for the M1 `BundleEmitter` / `FaithfulnessCheck` seams, which need both the UCAN
+// S5 (#571): the UCAN→TE policy compiler — compile a validated grant into a
+// CompiledPolicy, verify it grants no privilege beyond the grant, and sign it
+// (fail-closed). Lives here (not `hyprstream-rpc`) because it needs both the UCAN
 // model and S4's `TeMatrix`/`CompiledPolicy`.
 pub use compiler::{
-    compile_and_bind, AccessRequest, CapabilityVocab, CompileError, Counterexample, EmitError,
-    EmittedBundle, Faithfulness, ReferenceInterpreter, TeBundleEmitter,
+    authorize, authorize_at, check_no_escalation, compile, compile_policy, missing_permission,
+    AccessRequest, CompileError, PermissionMap, PrivilegeEscalation,
 };
