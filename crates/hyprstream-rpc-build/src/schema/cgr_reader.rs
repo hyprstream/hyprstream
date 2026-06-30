@@ -118,7 +118,10 @@ fn parse_cgr(
     // Find annotation node IDs by display_name
     let mcp_desc_id = find_annotation_id(&nodes, &node_map, "mcpDescription");
     let param_desc_id = find_annotation_id(&nodes, &node_map, "paramDescription");
-    let mcp_scope_id = find_annotation_id(&nodes, &node_map, "mcpScope");
+    // S3 (#547): the mandatory scope annotation is `$scope` (alias `$capability`).
+    // Either annotation id (whichever the schema imports) feeds the same extraction.
+    let mcp_scope_id = find_annotation_id(&nodes, &node_map, "scope")
+        .or_else(|| find_annotation_id(&nodes, &node_map, "capability"));
     let cli_hidden_id = find_annotation_id(&nodes, &node_map, "cliHidden");
     let domain_type_id = find_annotation_id(&nodes, &node_map, "domainType");
     let fixed_size_id = find_annotation_id(&nodes, &node_map, "fixedSize");
@@ -240,6 +243,11 @@ fn parse_cgr(
         (refs, req, resp)
     };
 
+    // S3 (#547): scope is MANDATORY on every leaf method. Validate after scoped-
+    // client detection so dispatcher variants (which carry no scope of their own;
+    // their leaves do) are correctly exempt.
+    validate_mandatory_scope(service_name, &request_variants, &scoped_clients)?;
+
     Ok(ParsedSchema {
         request_variants,
         response_variants,
@@ -249,6 +257,63 @@ fn parse_cgr(
         request_struct,
         response_struct,
     })
+}
+
+/// S3 (#547): enforce that every leaf RPC method declares a `$scope`/`$capability`.
+///
+/// A method with no scope is a BUILD ERROR — there are no silently-public methods.
+/// Dispatcher variants (whose payload is a nested scoped `*Request` union) are exempt:
+/// they route into a sub-client whose own leaf methods carry the scope. Such a
+/// dispatcher is recognized by its variant name matching a detected scoped client's
+/// `factory_name`; its leaves are validated recursively.
+fn validate_mandatory_scope(
+    service_name: &str,
+    request_variants: &[UnionVariant],
+    scoped_clients: &[ScopedClient],
+) -> Result<(), String> {
+    fn err(service_name: &str, path: &str, name: &str) -> String {
+        format!(
+            "service `{service_name}`: method `{path}{name}` has no `$scope`/`$capability` annotation \
+             — scope is mandatory (S3, epic #547). Add e.g. `$scope(query)` for a read-only \
+             (side-effect-free) method or `$scope(write)` for a mutating one; or, only if the method \
+             genuinely cannot require authorization, declare `$scopeExempt(\"<reason>\")`."
+        )
+    }
+
+    // Recurse into a scoped client's leaves + nested dispatchers.
+    fn check_scoped(service_name: &str, path: &str, sc: &ScopedClient) -> Result<(), String> {
+        let here = format!("{path}{} ", sc.factory_name);
+        let nested_names: Vec<&str> =
+            sc.nested_clients.iter().map(|n| n.factory_name.as_str()).collect();
+        for v in &sc.inner_request_variants {
+            // A nested dispatcher inside this scope is itself exempt; recurse instead.
+            if nested_names.contains(&v.name.as_str()) {
+                continue;
+            }
+            if v.scope.is_empty() && !v.scope_exempt {
+                return Err(err(service_name, &here, &v.name));
+            }
+        }
+        for n in &sc.nested_clients {
+            check_scoped(service_name, &here, n)?;
+        }
+        Ok(())
+    }
+
+    let dispatcher_names: Vec<&str> =
+        scoped_clients.iter().map(|sc| sc.factory_name.as_str()).collect();
+    for v in request_variants {
+        if dispatcher_names.contains(&v.name.as_str()) {
+            continue; // dispatcher: leaves validated via check_scoped below
+        }
+        if v.scope.is_empty() && !v.scope_exempt {
+            return Err(err(service_name, "", &v.name));
+        }
+    }
+    for sc in scoped_clients {
+        check_scoped(service_name, "", sc)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -399,22 +464,31 @@ fn extract_annotation_u32(
 }
 
 /// Extract an enum annotation value by resolving the ordinal to a variant name.
+///
+/// Matches by the annotation node's short name (`scope` or its alias `capability`)
+/// rather than a single id, so either spelling resolves to the same action vocabulary.
+/// `target_id` is retained only as a hint for the common single-annotation case.
 fn extract_annotation_enum(
     annotations: capnp::struct_list::Reader<capnp::schema_capnp::annotation::Owned>,
     target_id: Option<u64>,
     nodes: &capnp::struct_list::Reader<capnp::schema_capnp::node::Owned>,
     node_map: &BTreeMap<u64, NodeInfo>,
+    scope_ann_ids: &std::collections::BTreeSet<u64>,
 ) -> String {
-    let target_id = match target_id {
-        Some(id) => id,
-        None => return String::new(),
-    };
+    let _ = target_id;
+    // `scope_ann_ids` (the annotation ids whose node short-name is `scope` or its
+    // alias `capability`) is computed once per struct by the caller, NOT rebuilt
+    // per field — this runs on the build hot path (once per union variant).
+    if scope_ann_ids.is_empty() {
+        return String::new();
+    }
     for i in 0..annotations.len() {
         let ann = annotations.get(i);
-        if ann.get_id() == target_id {
+        let ann_id = ann.get_id();
+        if scope_ann_ids.contains(&ann_id) {
             if let Ok(value) = ann.get_value() {
                 if let Ok(capnp::schema_capnp::value::Enum(ordinal)) = value.which() {
-                    if let Some(ann_info) = node_map.get(&target_id) {
+                    if let Some(ann_info) = node_map.get(&ann_id) {
                         let ann_node = nodes.get(ann_info.index);
                         if let Ok(capnp::schema_capnp::node::Annotation(ann_reader)) =
                             ann_node.which()
@@ -502,6 +576,15 @@ fn extract_union_variants(
     let fields = struct_reader.get_fields().map_err(|e| format!("{e}"))?;
     let mut variants = Vec::new();
 
+    // Annotation ids whose node short-name is `scope` or its alias `capability`.
+    // Computed once per struct (not per field) — `extract_annotation_enum` runs on
+    // the build hot path (once per union variant).
+    let scope_ann_ids: std::collections::BTreeSet<u64> = node_map
+        .values()
+        .filter(|info| info.short_name == "scope" || info.short_name == "capability")
+        .map(|info| info.id)
+        .collect();
+
     // Collect union fields (discriminant != 0xFFFF), sorted by discriminant for determinism
     let mut union_fields: Vec<(u16, u32)> = Vec::new();
     for i in 0..fields.len() {
@@ -538,6 +621,20 @@ fn extract_union_variants(
             mcp_scope_id,
             nodes,
             node_map,
+            &scope_ann_ids,
+        );
+        // S3 (#547): scope is MANDATORY on leaf methods — enforced in
+        // `validate_mandatory_scope` after scoped-client dispatchers are detected
+        // (a dispatcher variant carries no scope; its leaves do).
+        // `$scopeExempt("reason")` is the explicit, audited exemption from
+        // mandatory scope. Resolve its annotation id by name from the node graph.
+        let scope_exempt_id = node_map
+            .values()
+            .find(|info| info.short_name == "scopeExempt")
+            .map(|info| info.id);
+        let scope_exempt = has_annotation(
+            field.get_annotations().map_err(|e| format!("{e}"))?,
+            scope_exempt_id,
         );
         let cli_hidden = has_annotation(
             field.get_annotations().map_err(|e| format!("{e}"))?,
@@ -553,6 +650,7 @@ fn extract_union_variants(
             type_name,
             description,
             scope,
+            scope_exempt,
             cli_hidden,
             doc_example,
         });
@@ -1433,4 +1531,81 @@ fn detect_nested_scoped_clients_cgr(
 /// implementation. Kept for backward compatibility with existing callers.
 pub fn is_primitive_type(type_name: &str) -> bool {
     is_primitive_capnp_type(type_name)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod mandatory_scope_tests {
+    use super::*;
+
+    fn variant(name: &str, scope: &str, exempt: bool) -> UnionVariant {
+        UnionVariant {
+            name: name.to_owned(),
+            type_name: "Void".to_owned(),
+            description: String::new(),
+            scope: scope.to_owned(),
+            scope_exempt: exempt,
+            cli_hidden: false,
+            doc_example: String::new(),
+        }
+    }
+
+    fn scoped(factory: &str, inner: Vec<UnionVariant>, nested: Vec<ScopedClient>) -> ScopedClient {
+        ScopedClient {
+            factory_name: factory.to_owned(),
+            client_name: format!("{factory}Client"),
+            scope_fields: vec![],
+            inner_request_variants: inner,
+            inner_response_variants: vec![],
+            capnp_inner_response: String::new(),
+            nested_clients: nested,
+        }
+    }
+
+    #[test]
+    fn scoped_method_passes() {
+        let reqs = vec![variant("load", "write", false), variant("status", "query", false)];
+        assert!(validate_mandatory_scope("model", &reqs, &[]).is_ok());
+    }
+
+    #[test]
+    fn unscoped_leaf_is_build_error() {
+        let reqs = vec![variant("load", "write", false), variant("oops", "", false)];
+        let err = validate_mandatory_scope("model", &reqs, &[]).unwrap_err();
+        assert!(err.contains("oops"), "{err}");
+        assert!(err.contains("mandatory"), "{err}");
+    }
+
+    #[test]
+    fn scope_exempt_satisfies_requirement() {
+        let reqs = vec![variant("check", "", true)];
+        assert!(validate_mandatory_scope("policy", &reqs, &[]).is_ok());
+    }
+
+    #[test]
+    fn dispatcher_variant_is_exempt_but_its_leaves_are_checked() {
+        // Top-level `ttt` is a dispatcher (matches scoped_clients factory_name) and
+        // carries no scope — that's fine. Its leaves must each carry a scope.
+        let reqs = vec![variant("ttt", "", false)];
+        let good = scoped("ttt", vec![variant("train", "train", false)], vec![]);
+        assert!(validate_mandatory_scope("model", &reqs, &[good]).is_ok());
+
+        let bad = scoped("ttt", vec![variant("train", "", false)], vec![]);
+        let err = validate_mandatory_scope("model", &reqs, &[bad]).unwrap_err();
+        assert!(err.contains("ttt train"), "{err}");
+    }
+
+    #[test]
+    fn nested_dispatcher_leaves_are_checked() {
+        // worktree -> ctl (nested dispatcher); ctl's leaf must carry a scope.
+        let reqs = vec![variant("worktree", "", false)];
+        let ctl_bad = scoped("ctl", vec![variant("log", "", false)], vec![]);
+        let worktree = scoped(
+            "worktree",
+            vec![variant("read", "query", false), variant("ctl", "", false)],
+            vec![ctl_bad],
+        );
+        let err = validate_mandatory_scope("registry", &reqs, &[worktree]).unwrap_err();
+        assert!(err.contains("log"), "{err}");
+    }
 }

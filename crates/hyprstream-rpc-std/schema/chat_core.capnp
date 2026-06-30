@@ -1,4 +1,4 @@
-@0xb7c4e8f2a1d3e5c0;
+@0xb8b2fdca21f1727e;
 
 # Chat Core IPC Schema
 #

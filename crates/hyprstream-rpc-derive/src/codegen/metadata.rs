@@ -1012,7 +1012,8 @@ fn format_man_page(
     }
     let synopsis = doc_format_synopsis(service_name, method_name, v, resolved);
     out.push_str(&format!("\nSYNOPSIS\n    {}\n", synopsis));
-    let scope = if v.scope.is_empty() { "query" } else { &v.scope };
+    // S3 (#547): scope is mandatory; empty only means a `$scopeExempt` method.
+    let scope = if v.scope.is_empty() { "exempt" } else { &v.scope };
     out.push_str(&format!("\nSCOPE\n    {}\n", scope));
     if !v.description.is_empty() {
         out.push_str(&format!("\nDESCRIPTION\n    {}\n", v.description));
@@ -1038,7 +1039,8 @@ fn format_scoped_man_page(
     } else {
         out.push_str(&format!("NAME\n    {} {} {} \u{2014} {}\n", service_name, scope_path, method_name, desc));
     }
-    let scope = if v.scope.is_empty() { "query" } else { &v.scope };
+    // S3 (#547): scope is mandatory; empty only means a `$scopeExempt` method.
+    let scope = if v.scope.is_empty() { "exempt" } else { &v.scope };
     out.push_str(&format!("\nSCOPE\n    {}\n", scope));
     if !v.description.is_empty() {
         out.push_str(&format!("\nDESCRIPTION\n    {}\n", v.description));

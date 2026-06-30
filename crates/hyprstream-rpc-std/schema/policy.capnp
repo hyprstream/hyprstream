@@ -1,4 +1,4 @@
-@0xf1a2b3c4d5e6f708;
+@0xfa0212966c7dd7db;
 
 # Cap'n Proto schema for policy service
 #
@@ -6,7 +6,8 @@
 # Uses REQ/REP pattern. Runs on multi-threaded runtime.
 
 using import "/common.capnp".ErrorInfo;
-using import "/annotations.capnp".mcpScope;
+using import "/annotations.capnp".scope;
+using import "/annotations.capnp".scopeExempt;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".optional;
 using Opt = import "/optional.capnp";
@@ -20,74 +21,77 @@ struct PolicyRequest {
   union {
     # Authorization check
     # Intentionally unscoped — authorization check cannot require authorization (circular dependency)
-    check @1 :PolicyCheck;
+    check @1 :PolicyCheck
+      $scopeExempt("the authz check itself cannot require authz — circular dependency");
 
     # JWT token issuance
-    issueToken @2 :IssueToken $mcpScope(manage);
+    issueToken @2 :IssueToken $scope(manage);
 
     # List all supported authorization scopes discovered from service schemas
-    listScopes @3 :Void $mcpScope(query) $mcpDescription("List all supported authorization scopes discovered from service schemas");
+    listScopes @3 :Void $scope(query) $mcpDescription("List all supported authorization scopes discovered from service schemas");
 
     # Get current policy rules and role assignments
-    getPolicy @4 :Void $mcpScope(query) $mcpDescription("Get current policy rules and role assignments");
+    getPolicy @4 :Void $scope(query) $mcpDescription("Get current policy rules and role assignments");
 
     # Apply a built-in template (overwrites policy.csv)
-    applyTemplate @5 :ApplyTemplate $mcpScope(manage) $mcpDescription("Apply a built-in policy template");
+    applyTemplate @5 :ApplyTemplate $scope(manage) $mcpDescription("Apply a built-in policy template");
 
     # Commit draft changes (uncommitted policy.csv edits)
-    applyDraft @6 :ApplyDraft $mcpScope(manage) $mcpDescription("Commit draft policy changes");
+    applyDraft @6 :ApplyDraft $scope(manage) $mcpDescription("Commit draft policy changes");
 
     # Rollback to a previous policy version
-    rollback @7 :RollbackPolicy $mcpScope(manage) $mcpDescription("Rollback to a previous policy version");
+    rollback @7 :RollbackPolicy $scope(manage) $mcpDescription("Rollback to a previous policy version");
 
     # Get policy commit history
-    getHistory @8 :GetHistory $mcpScope(query) $mcpDescription("Get policy commit history");
+    getHistory @8 :GetHistory $scope(query) $mcpDescription("Get policy commit history");
 
     # Get diff of uncommitted policy changes vs a ref (default HEAD)
-    getDiff @9 :GetDiff $mcpScope(query) $mcpDescription("Get diff of uncommitted policy changes");
+    getDiff @9 :GetDiff $scope(query) $mcpDescription("Get diff of uncommitted policy changes");
 
     # Check if there are uncommitted policy changes
-    getDraftStatus @10 :Void $mcpScope(query) $mcpDescription("Check if there are uncommitted policy changes");
+    getDraftStatus @10 :Void $scope(query) $mcpDescription("Check if there are uncommitted policy changes");
 
     # Assign a role to a user
-    addGrouping @11 :AddGrouping $mcpScope(manage) $mcpDescription("Assign a role to a user");
+    addGrouping @11 :AddGrouping $scope(manage) $mcpDescription("Assign a role to a user");
 
     # Remove a role from a user
-    removeGrouping @12 :RemoveGrouping $mcpScope(manage) $mcpDescription("Remove a role from a user");
+    removeGrouping @12 :RemoveGrouping $scope(manage) $mcpDescription("Remove a role from a user");
 
     # Set a model branch as public or private
-    setBranchVisibility @13 :SetBranchVisibility $mcpScope(manage) $mcpDescription("Set a model branch as public or private");
+    setBranchVisibility @13 :SetBranchVisibility $scope(manage) $mcpDescription("Set a model branch as public or private");
 
     # Register an event prefix for publishing
-    registerEventPrefix @14 :RegisterEventPrefix $mcpScope(manage) $mcpDescription("Register an event prefix for publishing");
+    registerEventPrefix @14 :RegisterEventPrefix $scope(manage) $mcpDescription("Register an event prefix for publishing");
 
     # Subscribe to an event prefix
-    subscribeEventPrefix @15 :SubscribeEventPrefix $mcpScope(manage) $mcpDescription("Subscribe to an event prefix");
+    subscribeEventPrefix @15 :SubscribeEventPrefix $scope(manage) $mcpDescription("Subscribe to an event prefix");
 
     # Get pending subscribers for a prefix
-    getPendingSubscribers @16 :GetPendingSubscribers $mcpScope(query) $mcpDescription("Get pending subscribers for a prefix");
+    getPendingSubscribers @16 :GetPendingSubscribers $scope(query) $mcpDescription("Get pending subscribers for a prefix");
 
     # Deposit wrapped keys for subscribers
-    depositWrappedKeys @17 :DepositWrappedKeys $mcpScope(manage) $mcpDescription("Deposit wrapped keys for subscribers");
+    depositWrappedKeys @17 :DepositWrappedKeys $scope(manage) $mcpDescription("Deposit wrapped keys for subscribers");
 
     # Resolve a service name to its Ed25519 verifying key
-    resolveServiceKey @18 :ResolveServiceKey $mcpScope(query) $mcpDescription("Resolve a service name to its Ed25519 verifying key");
+    resolveServiceKey @18 :ResolveServiceKey $scope(query) $mcpDescription("Resolve a service name to its Ed25519 verifying key");
 
     # Register a service's verifying key with the CA
     # Internal CA operation — any caller with a valid CA-signed JWT can register.
     # No authorization scope required; the JWT itself proves CA attestation.
-    registerServiceKey @19 :RegisterServiceKey $mcpDescription("Register a service verifying key with the CA");
+    registerServiceKey @19 :RegisterServiceKey
+      $scopeExempt("gated by CA-signed JWT attestation, not by a scope")
+      $mcpDescription("Register a service verifying key with the CA");
 
     # Renew the caller's service JWT. Identity is taken from the signed envelope —
     # no explicit subject field; the CA signs a fresh 30-day JWT for the caller.
     refreshServiceToken @20 :RefreshServiceTokenRequest
-      $mcpScope(manage) $mcpDescription("Renew the caller's service JWT; identity from signed envelope");
+      $scope(manage) $mcpDescription("Renew the caller's service JWT; identity from signed envelope");
 
     # Exchange the caller's envelope WIT for an OAuth at+jwt.
     # Identity and cnf.jwk are read from the verified envelope — no credential submission.
     # Requires 'exchange' permission on 'policy:exchange-wit' in Casbin policy.
     exchangeWit @21 :ExchangeWit
-      $mcpScope(manage) $mcpDescription("Exchange the caller's envelope WIT for an OAuth at+jwt; identity from signed envelope");
+      $scope(manage) $mcpDescription("Exchange the caller's envelope WIT for an OAuth at+jwt; identity from signed envelope");
   }
 }
 
