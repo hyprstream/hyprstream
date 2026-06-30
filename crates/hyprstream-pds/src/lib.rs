@@ -52,6 +52,7 @@ pub mod cid;
 pub mod commit;
 pub mod dag_cbor;
 pub mod event_group;
+pub mod list_record;
 pub mod mst;
 pub mod record;
 pub mod tid;
