@@ -115,11 +115,22 @@ pub fn read_from_offset(data: &[u8], offset: u64) -> Vec<u8> {
 /// handler, whose result is latched and served on the next read.
 ///
 /// Generic over the handler closure `F`. Construct with [`ControlFile::new`];
-/// the closure receives the written bytes (owned) and returns a boxed future
-/// resolving to the response bytes, or a [`MountError`] (rendered as-is —
-/// callers that want Wanix-style `"error: ..."` text on the read side should
-/// fold that into `F`'s `Ok` arm rather than returning `Err`, exactly as both
-/// `TclMount`/`PythonMount` already do for interpreter-level errors).
+/// the closure receives the written bytes **by value** (`Vec<u8>`, not `&[u8]`)
+/// and returns a boxed `'static` future resolving to the response bytes, or a
+/// [`MountError`] (rendered as-is — callers that want Wanix-style
+/// `"error: ..."` text on the read side should fold that into `F`'s `Ok` arm
+/// rather than returning `Err`, exactly as both `TclMount`/`PythonMount`
+/// already do for interpreter-level errors).
+///
+/// Taking owned bytes (rather than `&[u8]`) is a deliberate API choice: a
+/// `Fn(&'a [u8]) -> DevFuture<'a, _>` would need to be higher-ranked over
+/// `'a` (`for<'a> Fn(&'a [u8]) -> ...`), which closures capturing `move`d
+/// state can satisfy in principle but which the compiler frequently fails to
+/// infer for boxed closure literals in practice (the closure's `Fn` impl
+/// collapses to one concrete lifetime instead of being universally
+/// quantified). Owned input avoids the whole class of error and mirrors how
+/// both existing mounts already shuttle owned `String`/`Vec<u8>` across their
+/// command channels.
 ///
 /// # Fid contract
 ///
@@ -132,7 +143,7 @@ pub struct ControlFile<F> {
 
 impl<F> ControlFile<F>
 where
-    F: for<'a> Fn(&'a [u8]) -> DevFuture<'a, Result<Vec<u8>, MountError>> + Send + Sync,
+    F: Fn(Vec<u8>) -> DevFuture<'static, Result<Vec<u8>, MountError>> + Send + Sync,
 {
     /// Build a control file around an async handler.
     pub fn new(handler: F) -> Self {
@@ -149,9 +160,10 @@ where
     /// directly, NOT latched, matching `Mount::write`'s `Result` surface) into
     /// `state`, and return the byte count written on success.
     pub async fn handle_write(&self, state: &DevFileState, data: &[u8]) -> Result<u32, MountError> {
-        let result = (self.handler)(data).await?;
+        let len = data.len();
+        let result = (self.handler)(data.to_vec()).await?;
         state.latch(result);
-        Ok(data.len() as u32)
+        Ok(len as u32)
     }
 
     /// Handle a `Mount::read`: serve the latched result (empty if nothing
@@ -335,9 +347,9 @@ mod tests {
 
     #[tokio::test]
     async fn control_file_write_then_read_latches_result() {
-        let ctl = ControlFile::new(|data: &[u8]| {
-            let s = String::from_utf8_lossy(data).into_owned();
-            Box::pin(async move { Ok(format!("echo: {s}").into_bytes()) }) as DevFuture<'_, _>
+        let ctl = ControlFile::new(|data: Vec<u8>| {
+            let s = String::from_utf8_lossy(&data).into_owned();
+            Box::pin(async move { Ok(format!("echo: {s}").into_bytes()) }) as DevFuture<'static, _>
         });
         let state = ctl.new_fid();
 
@@ -353,8 +365,8 @@ mod tests {
 
     #[tokio::test]
     async fn control_file_offset_slices_latched_result() {
-        let ctl = ControlFile::new(|_data: &[u8]| {
-            Box::pin(async move { Ok(b"0123456789".to_vec()) }) as DevFuture<'_, _>
+        let ctl = ControlFile::new(|_data: Vec<u8>| {
+            Box::pin(async move { Ok(b"0123456789".to_vec()) }) as DevFuture<'static, _>
         });
         let state = ctl.new_fid();
         ctl.handle_write(&state, b"x").await.unwrap();
@@ -364,8 +376,8 @@ mod tests {
 
     #[tokio::test]
     async fn control_file_handler_error_propagates_not_latched() {
-        let ctl = ControlFile::new(|_data: &[u8]| {
-            Box::pin(async move { Err(MountError::Io("boom".into())) }) as DevFuture<'_, _>
+        let ctl = ControlFile::new(|_data: Vec<u8>| {
+            Box::pin(async move { Err(MountError::Io("boom".into())) }) as DevFuture<'static, _>
         });
         let state = ctl.new_fid();
         let res = ctl.handle_write(&state, b"x").await;
@@ -376,10 +388,7 @@ mod tests {
 
     #[tokio::test]
     async fn control_file_second_write_replaces_latch() {
-        let ctl = ControlFile::new(|data: &[u8]| {
-            let v = data.to_vec();
-            Box::pin(async move { Ok(v) }) as DevFuture<'_, _>
-        });
+        let ctl = ControlFile::new(|data: Vec<u8>| Box::pin(async move { Ok(data) }) as DevFuture<'static, _>);
         let state = ctl.new_fid();
         ctl.handle_write(&state, b"first").await.unwrap();
         assert_eq!(ctl.handle_read(&state, 0), b"first");
@@ -477,7 +486,7 @@ mod tests {
         ctl_state: DevFileState,
     }
 
-    type CtlHandler = Box<dyn for<'a> Fn(&'a [u8]) -> DevFuture<'a, Result<Vec<u8>, MountError>> + Send + Sync>;
+    type CtlHandler = Box<dyn Fn(Vec<u8>) -> DevFuture<'static, Result<Vec<u8>, MountError>> + Send + Sync>;
     type ListFn = Box<dyn Fn() -> DevFuture<'static, Vec<String>> + Send + Sync>;
     type GetFn = Box<dyn Fn(String) -> DevFuture<'static, Option<Vec<u8>>> + Send + Sync>;
 
@@ -490,13 +499,8 @@ mod tests {
         vars: DynamicDir<ListFn, GetFn>,
     }
 
-    /// Free fn (not a closure literal) so its `for<'a> Fn(&'a [u8]) -> DevFuture<'a, _>`
-    /// signature is exactly what the compiler infers — boxing a closure literal
-    /// directly into a higher-ranked `dyn Fn` trait object requires an explicit
-    /// signature like this one to avoid lifetime-inference ending up
-    /// non-higher-ranked.
-    fn uppercase_ctl(data: &[u8]) -> DevFuture<'_, Result<Vec<u8>, MountError>> {
-        let s = String::from_utf8_lossy(data).to_uppercase();
+    fn uppercase_ctl(data: Vec<u8>) -> DevFuture<'static, Result<Vec<u8>, MountError>> {
+        let s = String::from_utf8_lossy(&data).to_uppercase();
         Box::pin(async move { Ok(s.into_bytes()) })
     }
 
