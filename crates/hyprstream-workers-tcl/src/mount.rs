@@ -86,7 +86,7 @@ struct TclFid {
 
 type EvalCtl = ControlFile<Box<dyn Fn(Vec<u8>) -> DevFuture<'static, Result<Vec<u8>, MountError>> + Send + Sync>>;
 type ListFn = Box<dyn Fn() -> DevFuture<'static, Vec<String>> + Send + Sync>;
-type GetFn = Box<dyn Fn(String) -> DevFuture<'static, Option<Vec<u8>>> + Send + Sync>;
+type GetFn = Box<dyn Fn(String) -> DevFuture<'static, Result<Option<Vec<u8>>, MountError>> + Send + Sync>;
 type VarsDir = DynamicDir<ListFn, GetFn>;
 type ProcsDir = DynamicDir<ListFn, GetFn>;
 
@@ -133,11 +133,8 @@ impl TclMount {
             Box::new(move |name: String| {
                 let tx = vars_get_tx.clone();
                 Box::pin(async move {
-                    request(&tx, |resp| TclCommand::GetVar { name, resp })
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(String::into_bytes)
+                    let val: Option<String> = request(&tx, |resp| TclCommand::GetVar { name, resp }).await?;
+                    Ok(val.map(String::into_bytes))
                 }) as DevFuture<'static, _>
             }) as GetFn,
         );
@@ -153,11 +150,8 @@ impl TclMount {
             Box::new(move |name: String| {
                 let tx = procs_get_tx.clone();
                 Box::pin(async move {
-                    request(&tx, |resp| TclCommand::GetProc { name, resp })
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(String::into_bytes)
+                    let val: Option<String> = request(&tx, |resp| TclCommand::GetProc { name, resp }).await?;
+                    Ok(val.map(String::into_bytes))
                 }) as DevFuture<'static, _>
             }) as GetFn,
         );

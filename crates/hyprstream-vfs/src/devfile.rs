@@ -293,9 +293,17 @@ pub struct DynamicDir<L, G> {
 impl<L, G> DynamicDir<L, G>
 where
     L: Fn() -> DevFuture<'static, Vec<String>> + Send + Sync,
-    G: Fn(String) -> DevFuture<'static, Option<Vec<u8>>> + Send + Sync,
+    G: Fn(String) -> DevFuture<'static, Result<Option<Vec<u8>>, MountError>> + Send + Sync,
 {
     /// Build a dynamic directory from a name-lister and a per-name getter.
+    ///
+    /// The getter returns `Result<Option<Vec<u8>>, MountError>` (not just
+    /// `Option<Vec<u8>>`) so callers can distinguish a genuine transport/
+    /// backend failure (propagated as-is) from "this name doesn't currently
+    /// resolve" (`Ok(None)`, surfaced by [`DynamicDir::read`] as
+    /// [`MountError::NotFound`]) — e.g. a `vars/<name>` lookup racing an
+    /// `unset` is `Ok(None)`, but the interpreter channel being closed is a
+    /// distinct `Err`.
     pub fn new(list: L, get: G) -> Self {
         Self { list, get }
     }
@@ -316,10 +324,11 @@ where
     }
 
     /// `Mount::read` for a `<dir>/<name>` leaf: fetch and slice from
-    /// `offset`, or [`MountError::NotFound`] if the name no longer resolves.
+    /// `offset`. [`MountError::NotFound`] if the name no longer resolves;
+    /// any other error from the getter propagates unchanged.
     pub async fn read(&self, name: &str, offset: u64) -> Result<Vec<u8>, MountError> {
         let data = (self.get)(name.to_string())
-            .await
+            .await?
             .ok_or_else(|| MountError::NotFound(name.to_string()))?;
         Ok(read_from_offset(&data, offset))
     }
@@ -453,11 +462,11 @@ mod tests {
             || Box::pin(async { vec!["a".to_string(), "b".to_string()] }) as DevFuture<'static, _>,
             |name: String| {
                 Box::pin(async move {
-                    match name.as_str() {
+                    Ok(match name.as_str() {
                         "a" => Some(b"1".to_vec()),
                         "b" => Some(b"2".to_vec()),
                         _ => None,
-                    }
+                    })
                 }) as DevFuture<'static, _>
             },
         );
@@ -469,7 +478,18 @@ mod tests {
 
         assert_eq!(dir.read("a", 0).await.unwrap(), b"1");
         assert_eq!(dir.read("b", 0).await.unwrap(), b"2");
-        assert!(dir.read("z", 0).await.is_err());
+        assert!(matches!(dir.read("z", 0).await, Err(MountError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn dynamic_dir_getter_error_propagates_distinct_from_not_found() {
+        // A getter `Err` (e.g. the backing channel is gone) must surface as
+        // that error, not be folded into NotFound the way `Ok(None)` is.
+        let dir = DynamicDir::new(
+            || Box::pin(async { vec!["a".to_string()] }) as DevFuture<'static, _>,
+            |_name: String| Box::pin(async { Err(MountError::Io("backend gone".into())) }) as DevFuture<'static, _>,
+        );
+        assert!(matches!(dir.read("a", 0).await, Err(MountError::Io(_))));
     }
 
     // ── End-to-end: a trivial Mount built entirely from these primitives ───
@@ -488,7 +508,7 @@ mod tests {
 
     type CtlHandler = Box<dyn Fn(Vec<u8>) -> DevFuture<'static, Result<Vec<u8>, MountError>> + Send + Sync>;
     type ListFn = Box<dyn Fn() -> DevFuture<'static, Vec<String>> + Send + Sync>;
-    type GetFn = Box<dyn Fn(String) -> DevFuture<'static, Option<Vec<u8>>> + Send + Sync>;
+    type GetFn = Box<dyn Fn(String) -> DevFuture<'static, Result<Option<Vec<u8>>, MountError>> + Send + Sync>;
 
     /// A minimal `Mount` exercising `ControlFile` (an `eval` ctl file that
     /// uppercases its input) and `DynamicDir` (a `vars/` dir over a fixed
@@ -514,11 +534,11 @@ mod tests {
                 }) as ListFn,
                 Box::new(|name: String| {
                     Box::pin(async move {
-                        match name.as_str() {
+                        Ok(match name.as_str() {
                             "x" => Some(b"42".to_vec()),
                             "y" => Some(b"hello".to_vec()),
                             _ => None,
-                        }
+                        })
                     }) as DevFuture<'static, _>
                 }) as GetFn,
             );
