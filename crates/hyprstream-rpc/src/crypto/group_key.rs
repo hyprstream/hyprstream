@@ -45,7 +45,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::RwLock;
+use parking_lot::RwLock;
 use zeroize::Zeroizing;
 
 use crate::crypto::backend::keyed_mac;
@@ -307,7 +307,7 @@ impl<R: MembershipResolver> GroupKeyRegistry<R> {
             members: HashMap::new(),
         };
 
-        let mut groups = self.groups.write().await;
+        let mut groups = self.groups.write();
         if groups.contains_key(&group) {
             return Err(format!("group {group:?} already registered"));
         }
@@ -334,7 +334,7 @@ impl<R: MembershipResolver> GroupKeyRegistry<R> {
             return Err("resolver returned mismatched membership".to_owned());
         }
 
-        let mut groups = self.groups.write().await;
+        let mut groups = self.groups.write();
         let state = groups
             .get_mut(group)
             .ok_or_else(|| format!("group {group:?} not registered"))?;
@@ -377,7 +377,7 @@ impl<R: MembershipResolver> GroupKeyRegistry<R> {
         let mut new_key = Zeroizing::new([0u8; 32]);
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *new_key);
 
-        let mut groups = self.groups.write().await;
+        let mut groups = self.groups.write();
         let state = groups
             .get_mut(group)
             .ok_or_else(|| format!("group {group:?} not registered"))?;
@@ -398,7 +398,7 @@ impl<R: MembershipResolver> GroupKeyRegistry<R> {
         group: &GroupRef,
         now: Instant,
     ) -> Result<bool, String> {
-        let mut groups = self.groups.write().await;
+        let mut groups = self.groups.write();
         let state = groups
             .get_mut(group)
             .ok_or_else(|| format!("group {group:?} not registered"))?;
@@ -420,13 +420,13 @@ impl<R: MembershipResolver> GroupKeyRegistry<R> {
     /// The current `K_group` for a group, if registered. Consumers use this for
     /// downstream keyed-PRF derivations (e.g. EventService's topic key).
     pub async fn k_group(&self, group: &GroupRef) -> Option<[u8; 32]> {
-        let groups = self.groups.read().await;
+        let groups = self.groups.read();
         groups.get(group).map(|s| *s.key_state.current)
     }
 
     /// `(keyset_id, epoch)` for a group, if registered.
     pub async fn keyset(&self, group: &GroupRef) -> Option<(String, u64)> {
-        let groups = self.groups.read().await;
+        let groups = self.groups.read();
         groups
             .get(group)
             .map(|s| (s.key_state.keyset_id.clone(), s.key_state.epoch))
@@ -539,7 +539,7 @@ mod tests {
         let g = grp("at://did:web:a/g1");
         registry.register_group(g.clone()).await.unwrap();
         assert!(registry.k_group(&g).await.is_some());
-        assert_eq!(registry.keyset(&g).await, Some(("ks-1".to_string(), 0)));
+        assert_eq!(registry.keyset(&g).await, Some(("ks-1".to_owned(), 0)));
     }
 
     #[tokio::test]
