@@ -387,12 +387,12 @@ mod tests {
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let guest_dir = manifest
             .parent()
-            .map(|p| p.join("hyprstream-wasm-pyguest"))?;
+            .map(|p| p.join("hyprstream-workers-python-guest"))?;
         for profile in ["release", "debug"] {
             let c = guest_dir
                 .join("target/wasm32-unknown-unknown")
                 .join(profile)
-                .join("hyprstream_wasm_pyguest.wasm");
+                .join("hyprstream_workers_python_guest.wasm");
             if c.exists() {
                 if let Ok(b) = std::fs::read(&c) {
                     return Some(b);

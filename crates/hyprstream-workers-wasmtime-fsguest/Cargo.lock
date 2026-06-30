@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "hyprstream-wasm-fsguest"
+name = "hyprstream-workers-wasmtime-fsguest"
 version = "0.1.0"

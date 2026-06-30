@@ -1,5 +1,5 @@
 [package]
-name = "hyprstream-wasm-pyguest"
+name = "hyprstream-workers-python-guest"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
@@ -9,7 +9,7 @@ description = "RustPython guest compiled to wasm32-unknown-unknown for the #505 
 # Cargo.toml [workspace.exclude] so a host-target workspace build never tries to
 # compile a wasm-only cdylib (which would also drag in libtorch deps transitively
 # via the workspace). Build explicitly:
-#   cargo build --target wasm32-unknown-unknown --manifest-path crates/hyprstream-wasm-pyguest/Cargo.toml
+#   cargo build --target wasm32-unknown-unknown --manifest-path crates/hyprstream-workers-python-guest/Cargo.toml
 #
 # Empty [workspace] table makes this a standalone package (own lockfile/target),
 # belt-and-suspenders alongside the root [workspace.exclude] entry. A wasm-only

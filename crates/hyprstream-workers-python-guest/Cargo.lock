@@ -455,7 +455,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "hyprstream-wasm-pyguest"
+name = "hyprstream-workers-python-guest"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",

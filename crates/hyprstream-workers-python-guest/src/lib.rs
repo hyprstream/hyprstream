@@ -9,7 +9,7 @@
 //!
 //! Build:
 //!   cargo build --release --target wasm32-unknown-unknown \
-//!     --manifest-path crates/hyprstream-wasm-pyguest/Cargo.toml
+//!     --manifest-path crates/hyprstream-workers-python-guest/Cargo.toml
 //!
 //! ## ABI
 //!

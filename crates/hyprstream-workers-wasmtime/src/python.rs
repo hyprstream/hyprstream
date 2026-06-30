@@ -1,5 +1,5 @@
 //! The Python profile: run untrusted Python on the RustPython guest
-//! (`hyprstream-wasm-pyguest`, compiled to `wasm32-unknown-unknown`) inside the
+//! (`hyprstream-workers-python-guest`, compiled to `wasm32-unknown-unknown`) inside the
 //! generic Profile-A [`Sandbox`](crate::Sandbox).
 //!
 //! This module is the ONE python-aware layer in the crate; the core

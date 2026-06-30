@@ -2,11 +2,11 @@
 //!
 //! These tests need the guest wasm artifact built first:
 //!   cargo build --release --target wasm32-unknown-unknown \
-//!     --manifest-path crates/hyprstream-wasm-pyguest/Cargo.toml
+//!     --manifest-path crates/hyprstream-workers-python-guest/Cargo.toml
 //!
 //! The guest is an EXCLUDED, standalone package (own target dir), so its artifact
 //! lands at:
-//!   crates/hyprstream-wasm-pyguest/target/wasm32-unknown-unknown/{release,debug}/hyprstream_wasm_pyguest.wasm
+//!   crates/hyprstream-workers-python-guest/target/wasm32-unknown-unknown/{release,debug}/hyprstream_workers_python_guest.wasm
 //!
 //! Set HYPRSTREAM_PYGUEST_WASM to override the path. If the artifact is absent the
 //! tests SKIP locally, but FAIL under CI (`CI` env var set) — the security/DoS
@@ -33,12 +33,12 @@ fn guest_wasm() -> Option<Vec<u8>> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let guest_dir = manifest
         .parent()
-        .map(|p| p.join("hyprstream-wasm-pyguest"))?;
+        .map(|p| p.join("hyprstream-workers-python-guest"))?;
     for profile in ["release", "debug"] {
         let candidate = guest_dir
             .join("target/wasm32-unknown-unknown")
             .join(profile)
-            .join("hyprstream_wasm_pyguest.wasm");
+            .join("hyprstream_workers_python_guest.wasm");
         if candidate.exists() {
             if let Ok(bytes) = std::fs::read(&candidate) {
                 return Some(bytes);
@@ -63,7 +63,7 @@ fn guest_wasm_or_ci_fail(label: &str) -> Option<Vec<u8>> {
                 std::env::var("CI").is_err(),
                 "{label}: guest wasm not built but running under CI — build the pyguest \
                  (cargo build --release --target wasm32-unknown-unknown --manifest-path \
-                 crates/hyprstream-wasm-pyguest/Cargo.toml) and set HYPRSTREAM_PYGUEST_WASM"
+                 crates/hyprstream-workers-python-guest/Cargo.toml) and set HYPRSTREAM_PYGUEST_WASM"
             );
             eprintln!("SKIP {label}: guest wasm not built (set CI=1 to make this a failure)");
             None

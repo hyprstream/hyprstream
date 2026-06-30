@@ -4,10 +4,10 @@
 //! Build the guest first. These tests SKIP locally when the artifact is absent, but
 //! FAIL under CI (`CI` env var set) — the no-host-escape guarantee must be exercised:
 //!   cargo build --release --target wasm32-wasip1 \
-//!     --manifest-path crates/hyprstream-wasm-fsguest/Cargo.toml
+//!     --manifest-path crates/hyprstream-workers-wasmtime-fsguest/Cargo.toml
 //!
 //! Artifact (excluded standalone crate):
-//!   crates/hyprstream-wasm-fsguest/target/wasm32-wasip1/{release,debug}/hyprstream-wasm-fsguest.wasm
+//!   crates/hyprstream-workers-wasmtime-fsguest/target/wasm32-wasip1/{release,debug}/hyprstream-workers-wasmtime-fsguest.wasm
 //! Override with HYPRSTREAM_FSGUEST_WASM.
 //!
 //! What this proves:
@@ -33,12 +33,12 @@ fn guest_wasm() -> Option<Vec<u8>> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let guest_dir = manifest
         .parent()
-        .map(|p| p.join("hyprstream-wasm-fsguest"))?;
+        .map(|p| p.join("hyprstream-workers-wasmtime-fsguest"))?;
     for profile in ["release", "debug"] {
         let c = guest_dir
             .join("target/wasm32-wasip1")
             .join(profile)
-            .join("hyprstream-wasm-fsguest.wasm");
+            .join("hyprstream-workers-wasmtime-fsguest.wasm");
         if c.exists() {
             if let Ok(b) = std::fs::read(&c) {
                 return Some(b);
@@ -58,7 +58,7 @@ fn guest_wasm_or_ci_fail(label: &str) -> Option<Vec<u8>> {
                 std::env::var("CI").is_err(),
                 "{label}: fsguest wasm not built but running under CI — build the fsguest \
                  (cargo build --release --target wasm32-wasip1 --manifest-path \
-                 crates/hyprstream-wasm-fsguest/Cargo.toml) and set HYPRSTREAM_FSGUEST_WASM"
+                 crates/hyprstream-workers-wasmtime-fsguest/Cargo.toml) and set HYPRSTREAM_FSGUEST_WASM"
             );
             eprintln!("SKIP {label}: fsguest wasm not built (set CI=1 to make this a failure)");
             None
