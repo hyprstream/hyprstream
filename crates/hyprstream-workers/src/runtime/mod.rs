@@ -30,6 +30,11 @@ pub mod exec_mount;
 #[cfg(feature = "kata-vm")]
 pub mod kata_backend;
 pub mod nspawn;
+// Rootless podman OCI sandbox backend (#346, T2-A of #341) — gated behind
+// `podman`. Shells out to the `podman` CLI at runtime; no extra build-time
+// dependencies, so this is a thin opt-in atop the always-built nspawn shape.
+#[cfg(feature = "podman")]
+pub mod podman;
 mod pool;
 mod sandbox;
 // In-process WebAssembly sandbox backend (#505 P2) — gated behind `wasm`
@@ -92,6 +97,8 @@ pub use exec_mount::ExecMount;
 #[cfg(feature = "kata-vm")]
 pub use kata_backend::{KataBackend, KataHandle};
 pub use nspawn::{NspawnBackend, NspawnConfig, NspawnHandle};
+#[cfg(feature = "podman")]
+pub use podman::{PodmanBackend, PodmanConfig, PodmanHandle};
 #[cfg(feature = "wasm")]
 pub use wasm_backend::{WasmBackend, WasmConfig, WasmHandle};
 // Inventory-based backend registry + fail-closed selection spine (#507)

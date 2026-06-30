@@ -172,6 +172,12 @@ wasm = ["dep:hyprstream-workers-wasmtime"]
 # Enable Dragonball built-in VMM support (alternative to cloud-hypervisor).
 # Implies `kata-vm` since it tunes the kata hypervisor abstraction.
 dragonball = ["kata-vm", "kata-hypervisor/dragonball"]
+# Rootless podman OCI sandbox backend (#346, T2-A of #341). Compiles in
+# `PodmanBackend`, which shells out to the `podman` CLI at runtime — no extra
+# Rust dependencies, just the inventory registration. Opt-in (mirrors
+# `kata-vm`/`wasm`) so the default build doesn't carry an extra selectable
+# backend; when off, `podman` selection fails closed (not registered).
+podman = []
 # Enable D-Bus bridge for container access to host D-Bus services
 dbus = ["dep:zbus"]
 # Systemd integration (socket activation, service units)
