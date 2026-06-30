@@ -7151,6 +7151,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "fuse-backend-rs 0.13.1",
+ "futures",
  "hyprstream-rpc",
  "libc",
  "parking_lot 0.12.4",
