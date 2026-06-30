@@ -232,5 +232,10 @@ pub fn build_chat_vfs_namespace(
     let tcl_mount = Arc::new(hyprstream_workers_tcl::TclMount::new(tcl_mount_tx));
     let _ = ns.mount("/lang/tcl", tcl_mount);
 
+    // /lang/python mount (mirrors /lang/tcl).
+    let (py_mount_tx, _py_mount_rx) = hyprstream_workers_python::create_mount_channel();
+    let py_mount = Arc::new(hyprstream_workers_python::PythonMount::new(py_mount_tx));
+    let _ = ns.mount("/lang/python", py_mount);
+
     Ok((Arc::new(ns), subject))
 }

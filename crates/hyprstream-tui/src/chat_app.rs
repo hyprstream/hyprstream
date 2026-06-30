@@ -371,6 +371,15 @@ pub struct ChatApp {
     /// Receiver for TclMount commands (polled in tick()). Shared across tabs.
     #[cfg(not(target_os = "wasi"))]
     tcl_mount_rx: Option<std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_workers_tcl::TclCommand>>>>,
+    /// Receiver for PythonMount commands (polled in tick()). Shared across tabs.
+    ///
+    /// Drained in `tick()` so `/lang/python` writers never block on a full channel.
+    /// The sandboxed [`PythonShell`](hyprstream_workers_python::PythonShell) that would
+    /// serve these is NOT yet constructed here (it needs the python guest wasm bytes +
+    /// a VFS proxy handle; see the TODO in `drain_py_mount`), so for now each command
+    /// is answered with a "not wired" error.
+    #[cfg(not(target_os = "wasi"))]
+    py_mount_rx: Option<std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_workers_python::PyCommand>>>>,
 }
 
 impl ChatApp {
@@ -416,6 +425,8 @@ impl ChatApp {
             tcl_shell_init: None,
             #[cfg(not(target_os = "wasi"))]
             tcl_mount_rx: None,
+            #[cfg(not(target_os = "wasi"))]
+            py_mount_rx: None,
         }
     }
 
@@ -449,6 +460,8 @@ impl ChatApp {
             tcl_shell_init: None,
             #[cfg(not(target_os = "wasi"))]
             tcl_mount_rx: None,
+            #[cfg(not(target_os = "wasi"))]
+            py_mount_rx: None,
         }
     }
 
@@ -528,6 +541,8 @@ impl ChatApp {
             tcl_shell_init: None,
             #[cfg(not(target_os = "wasi"))]
             tcl_mount_rx: None,
+            #[cfg(not(target_os = "wasi"))]
+            py_mount_rx: None,
         }
     }
 
@@ -585,6 +600,17 @@ impl ChatApp {
     #[cfg(not(target_os = "wasi"))]
     pub fn with_tcl_mount_rx(mut self, rx: std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_workers_tcl::TclCommand>>>) -> Self {
         self.tcl_mount_rx = Some(rx);
+        self
+    }
+
+    /// Attach the receiver end of a `/lang/python` mount channel.
+    ///
+    /// The corresponding [`hyprstream_workers_python::PythonMount`] must be mounted in
+    /// the namespace at `/lang/python` before this is called. The ChatApp drains this
+    /// channel in `tick()` (see [`drain_py_mount`](Self::drain_py_mount)).
+    #[cfg(not(target_os = "wasi"))]
+    pub fn with_py_mount_rx(mut self, rx: std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_workers_python::PyCommand>>>) -> Self {
+        self.py_mount_rx = Some(rx);
         self
     }
 
@@ -835,6 +861,60 @@ impl ChatApp {
             }
         }
     }
+
+    /// Drain pending `/lang/python` mount commands.
+    ///
+    /// The mount channel is drained every `tick()` so writers to `/lang/python/eval`
+    /// (etc.) never block on a full channel.
+    ///
+    // TODO(/lang/python wiring): construct and drive the sandboxed python interpreter
+    // here, mirroring `ensure_tcl_shell` + the tcl drain above. Unlike `TclShell`
+    // (which is built from just `(subject, namespace)`), `PythonShell` needs the
+    // RustPython guest wasm bytes plus a VFS proxy capability, i.e. roughly:
+    //
+    //   let wasm = /* python guest bytes: env HYPRSTREAM_PYGUEST_WASM or an embedded
+    //                 hyprstream_workers_python_guest.wasm */;
+    //   let sandbox = hyprstream_workers_wasmtime::Sandbox::from_bytes_for(&wasm, subject.clone())
+    //       .with_vfs(hyprstream_workers_wasmtime::vfs::VfsProxyHandle::new(
+    //           hyprstream_vfs::proxy::spawn_vfs_proxy(ns.clone(), subject.clone()),
+    //           subject.clone(),
+    //       ));
+    //   let mut shell = hyprstream_workers_python::PythonShell::open(&sandbox, PER_CALL_FUEL)?;
+    //   // then, per drained cmd: shell.process_command(cmd);
+    //
+    // The shell owner must drive it from a NON-async thread (the guest's `vfs_*` host
+    // fns `blocking_send`), so this may need a dedicated driver thread rather than the
+    // in-tick poll the tcl shell uses. Until that lands, answer each command with a
+    // "not wired" error so the mount is responsive (no hangs) but inert.
+    #[cfg(not(target_os = "wasi"))]
+    fn drain_py_mount(&mut self) {
+        use hyprstream_workers_python::{PyCommand, PyResult};
+        let Some(ref rx_arc) = self.py_mount_rx else {
+            return;
+        };
+        let Ok(mut rx) = rx_arc.try_lock() else {
+            return;
+        };
+        let not_wired =
+            || PyResult::Err("/lang/python interpreter not yet wired in this session".to_owned());
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                PyCommand::Eval { resp, .. } | PyCommand::Exec { resp, .. } => {
+                    let _ = resp.send(not_wired());
+                }
+                PyCommand::GetVar { resp, .. } | PyCommand::GetDef { resp, .. } => {
+                    let _ = resp.send(PyResult::None);
+                }
+                PyCommand::ListVars { resp } | PyCommand::ListDefs { resp } => {
+                    let _ = resp.send(Vec::new());
+                }
+            }
+        }
+    }
+
+    /// No-op `/lang/python` drain on WASI (no mount channel there).
+    #[cfg(target_os = "wasi")]
+    fn drain_py_mount(&mut self) {}
 
     /// Poll a `!Send` future to completion on the current thread.
     ///
@@ -1453,6 +1533,9 @@ impl TerminalApp for ChatApp {
                 }
             }
         }
+
+        // Process pending PythonMount requests from /lang/python VFS mount.
+        self.drain_py_mount();
 
         // Advance spinner while tool calls are in flight.
         if self.pending_tool_calls > 0 {

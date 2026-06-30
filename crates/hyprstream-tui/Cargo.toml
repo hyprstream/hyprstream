@@ -17,6 +17,7 @@ path = "src/main.rs"
 avt = "0.17"
 hyprstream-compositor = { path = "../hyprstream-compositor" }
 hyprstream-workers-tcl = { path = "../hyprstream-workers-tcl" }
+hyprstream-workers-python = { path = "../hyprstream-workers-python" }
 hyprstream-vfs = { path = "../hyprstream-vfs" }
 ratatui = { version = "0.30", default-features = false, features = ["layout-cache"] }
 serde = { version = "1", features = ["derive"] }

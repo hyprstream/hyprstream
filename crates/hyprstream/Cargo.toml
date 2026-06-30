@@ -59,6 +59,7 @@ hyprstream-metrics = { path = "../hyprstream-metrics" }  # Metrics storage (for 
 hyprstream-workers = { path = "../hyprstream-workers" }  # Worker runtime (Kata containers)
 hyprstream-vfs = { path = "../hyprstream-vfs" }  # VFS namespace (Mount trait)
 hyprstream-workers-tcl = { path = "../hyprstream-workers-tcl" }  # Tcl shell (TclMount, TclCommand)
+hyprstream-workers-python = { path = "../hyprstream-workers-python" }  # Python shell (PythonMount, PyCommand)
 inventory.workspace = true  # Service factory registration
 gittorrent = { workspace = true, optional = true }  # P2P transport
 clap.workspace = true
