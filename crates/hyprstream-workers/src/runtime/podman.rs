@@ -65,6 +65,7 @@ use crate::error::{Result, WorkerError};
 use super::backend::{SandboxBackend, SandboxHandle};
 use super::client::{LinuxContainerResources, PodSandboxConfig};
 use super::sandbox::PodSandbox;
+use crate::generated::worker_client::Protocol;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -220,6 +221,38 @@ impl PodmanBackend {
             .unwrap_or_else(|| self.config.base_image.clone())
     }
 
+    /// Reject image references that podman would parse as a flag.
+    ///
+    /// The resolved image is pushed onto the `podman run` argv as a bare
+    /// positional (the image MUST be positional — `--` before it would make
+    /// podman treat it as part of the command). Because the image can come
+    /// from a caller-controlled annotation (`hyprstream.io/worker-image`), a
+    /// value starting with `-` (e.g. `--privileged`, `--network=host`,
+    /// `-v /:/host`) would be parsed by podman as an injected flag rather
+    /// than as the image — a sandbox-escape / privilege-escalation vector.
+    /// Refuse such values rather than risk silent flag injection.
+    ///
+    /// Note on shell injection: there is none — [`Command`] uses `execvp`
+    /// directly with no shell, and every other config-derived value is passed
+    /// in `--flag=value` form (so `--hostname=--privileged` sets the hostname
+    /// to the literal `--privileged`, not a flag). The image is the *only*
+    /// field that lands as a bare positional, hence this dedicated guard.
+    fn validate_image(image: &str) -> Result<()> {
+        let trimmed = image.trim();
+        if trimmed.is_empty() {
+            return Err(WorkerError::ConfigError(
+                "podman worker image is empty".into(),
+            ));
+        }
+        if trimmed.starts_with('-') {
+            return Err(WorkerError::ConfigError(format!(
+                "podman worker image {image:?} looks like a flag (starts with '-'); \
+                 refusing to pass a caller-controlled annotation as a podman flag"
+            )));
+        }
+        Ok(())
+    }
+
     /// Translate `PodSandboxConfig` + resolved rootless mode into `podman
     /// run` arguments. Pure (no I/O) so it can be unit-tested directly.
     fn build_run_args(
@@ -268,8 +301,17 @@ impl PodmanBackend {
             } else {
                 format!("{}:", pm.host_ip)
             };
+            // Podman defaults the protocol to tcp when omitted; honor an
+            // explicit udp/sctp request instead of silently mapping every
+            // port to tcp (which would expose a udp service on the wrong
+            // protocol).
+            let proto = match pm.protocol {
+                Protocol::Tcp => "",
+                Protocol::Udp => "/udp",
+                Protocol::Sctp => "/sctp",
+            };
             args.push(format!(
-                "--publish={host_ip}{}:{}",
+                "--publish={host_ip}{}:{}{proto}",
                 pm.host_port, pm.container_port
             ));
         }
@@ -351,6 +393,7 @@ impl SandboxBackend for PodmanBackend {
         annotations: &HashMap<String, String>,
     ) -> Result<Arc<dyn SandboxHandle>> {
         let image = self.resolve_image(annotations);
+        Self::validate_image(&image)?;
         let name = container_name(&sandbox.id);
         let rootless = self.detect_rootless().await;
 
@@ -359,7 +402,7 @@ impl SandboxBackend for PodmanBackend {
         // though podman containers don't bind-mount it by default.
         let sandbox_path = pool_config.runtime_dir.join(&sandbox.id);
         tokio::fs::create_dir_all(&sandbox_path).await?;
-        sandbox.sandbox_path = sandbox_path;
+        sandbox.sandbox_path = sandbox_path.clone();
 
         let args = self.build_run_args(&name, &image, config, rootless);
 
@@ -378,6 +421,18 @@ impl SandboxBackend for PodmanBackend {
             .map_err(|e| WorkerError::VmStartFailed(format!("podman run failed: {e}")))?;
 
         if !output.status.success() {
+            // `start()` created the sandbox dir and may have left a container
+            // behind (some non-zero exits leave the container around even with
+            // `--rm`). Since we're about to return Err the pool won't call
+            // `destroy()`, so clean up both here to avoid leaks on partial
+            // failure.
+            let _ = tokio::process::Command::new("podman")
+                .args(["rm", "--force", &name])
+                .status()
+                .await;
+            if sandbox_path.exists() {
+                let _ = tokio::fs::remove_dir_all(&sandbox_path).await;
+            }
             return Err(WorkerError::VmStartFailed(format!(
                 "podman run exited non-zero for sandbox {}: {}",
                 sandbox.id,
@@ -560,7 +615,6 @@ inventory::submit! {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::generated::worker_client::Protocol;
     use crate::runtime::client::{
         DNSConfig, LinuxPodSandboxConfig, LinuxSandboxSecurityContext, PortMapping,
     };
@@ -711,6 +765,53 @@ mod tests {
             args.contains(&"--publish=18080:8080".to_owned()),
             "got: {args:?}"
         );
+    }
+
+    #[test]
+    fn test_build_run_args_port_mappings_udp_honored() {
+        // Regression: the protocol suffix used to be dropped, silently mapping
+        // a udp service onto tcp. udp/sctp must produce an explicit suffix.
+        let b = PodmanBackend::new(PodmanConfig::default());
+        let mut cfg = base_config();
+        cfg.port_mappings = vec![PortMapping {
+            protocol: Protocol::Udp,
+            container_port: 53,
+            host_port: 1053,
+            host_ip: String::new(),
+        }];
+        let args = b.build_run_args("n", "img", &cfg, false);
+        assert!(
+            args.contains(&"--publish=1053:53/udp".to_owned()),
+            "udp port mapping must carry /udp suffix, got: {args:?}"
+        );
+    }
+
+    // ── Image flag-injection guard ──
+    //
+    // The resolved image is the one field pushed as a bare positional on the
+    // `podman run` argv; an annotation value starting with `-` would be parsed
+    // by podman as an injected flag. validate_image must refuse such values.
+
+    #[test]
+    fn test_validate_image_accepts_normal_ref() {
+        assert!(PodmanBackend::validate_image("ghcr.io/hyprstream/worker:latest").is_ok());
+        assert!(PodmanBackend::validate_image("busybox").is_ok());
+        assert!(PodmanBackend::validate_image("  registry.example.com/a:b  ").is_ok());
+    }
+
+    #[test]
+    fn test_validate_image_rejects_flag_like_annotation() {
+        // The escape vector: a caller-controlled annotation that looks like a
+        // podman flag must not reach the argv as a positional.
+        let err = PodmanBackend::validate_image("--privileged").unwrap_err();
+        assert!(
+            matches!(err, WorkerError::ConfigError(_)),
+            "flag-like image must be a ConfigError, got {err:?}"
+        );
+        assert!(PodmanBackend::validate_image("--network=host").is_err());
+        assert!(PodmanBackend::validate_image("-v /:/host").is_err());
+        assert!(PodmanBackend::validate_image("").is_err());
+        assert!(PodmanBackend::validate_image("   ").is_err());
     }
 
     #[test]
