@@ -78,6 +78,23 @@ pub struct LazyIrohTransport {
     relay_url: Option<String>,
     /// Cached session + reconnect backoff (#156).
     state: Mutex<LazyState<IrohTransport>>,
+    /// Test-only dial endpoint override.
+    ///
+    /// Production always dials from the process-global install-once endpoint
+    /// ([`iroh_client_endpoint`]); there is exactly one tokio runtime for the
+    /// whole process, so that endpoint lives for the process lifetime.
+    ///
+    /// Under `cargo test`, however, every `#[tokio::test]` spins up and tears
+    /// down its OWN runtime. iroh's `Endpoint` spawns its magicsock/router
+    /// background tasks on the runtime active at `bind()`, so the install-once
+    /// global endpoint dies with whichever test's runtime installed it. A later
+    /// test that reuses the (now dead) global hits iroh's
+    /// `RemoteStateActorStopped` → "Internal consistency error". Injecting a
+    /// per-test endpoint that lives on the *current* test's runtime makes the
+    /// dialing tests deterministic regardless of order (and lets them avoid
+    /// polluting the global at all).
+    #[cfg(test)]
+    endpoint_override: Option<iroh::Endpoint>,
 }
 
 impl LazyIrohTransport {
@@ -89,7 +106,39 @@ impl LazyIrohTransport {
             direct_addrs,
             relay_url,
             state: Mutex::new(LazyState::default()),
+            #[cfg(test)]
+            endpoint_override: None,
         }
+    }
+
+    /// Test-only constructor that dials from a caller-supplied endpoint instead
+    /// of the process-global one. See [`Self::endpoint_override`] for why tests
+    /// need this (per-test tokio runtimes vs. an install-once global endpoint).
+    #[cfg(test)]
+    pub(crate) fn new_with_endpoint(
+        node_id: [u8; 32],
+        direct_addrs: Vec<SocketAddr>,
+        relay_url: Option<String>,
+        endpoint: iroh::Endpoint,
+    ) -> Self {
+        Self {
+            node_id,
+            direct_addrs,
+            relay_url,
+            state: Mutex::new(LazyState::default()),
+            endpoint_override: Some(endpoint),
+        }
+    }
+
+    /// The endpoint to dial from: the injected per-test endpoint when present,
+    /// otherwise the process-global install-once client endpoint. In production
+    /// builds this is exactly [`iroh_client_endpoint`].
+    fn dial_endpoint(&self) -> Option<iroh::Endpoint> {
+        #[cfg(test)]
+        if let Some(ep) = self.endpoint_override.clone() {
+            return Some(ep);
+        }
+        iroh_client_endpoint()
     }
 
     /// Build the iroh `EndpointAddr` for the peer from the stored primitives.
@@ -120,7 +169,7 @@ impl LazyIrohTransport {
                 "iroh peer is in reconnect backoff — retry in {remaining:.1?}"
             ));
         }
-        let endpoint = iroh_client_endpoint().ok_or_else(|| {
+        let endpoint = self.dial_endpoint().ok_or_else(|| {
             anyhow!(
                 "no iroh client endpoint installed — call \
                  install_iroh_client_endpoint() at startup before dialing iroh peers"
@@ -214,7 +263,12 @@ mod tests {
         let server_id = server.endpoint_id();
         let direct: Vec<SocketAddr> = server.endpoint().bound_sockets().into_iter().collect();
 
-        // Client substrate (originates only); install its endpoint as the global.
+        // Client substrate (originates only). Dial from THIS test's endpoint via
+        // `new_with_endpoint` rather than the process-global install-once one: the
+        // global is bound to whichever test's tokio runtime installed it and dies
+        // with that runtime, which made this test flake with iroh's "Internal
+        // consistency error" (RemoteStateActorStopped) when it ran after another
+        // iroh test. A per-test endpoint on the current runtime is deterministic.
         let client = IrohSubstrate::new(
             fresh_key(),
             NoopHandler::new("client moq"),
@@ -222,10 +276,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let _ = install_iroh_client_endpoint(client.endpoint().clone());
 
         let node_id: [u8; 32] = *server_id.as_bytes();
-        let t = LazyIrohTransport::new(node_id, direct, None);
+        let t = LazyIrohTransport::new_with_endpoint(node_id, direct, None, client.endpoint().clone());
         assert!(t.state.lock().await.cached.is_none(), "no connection before first send");
 
         // EchoHandler echoes the bytes written on the bidi stream, which is the
@@ -240,10 +293,9 @@ mod tests {
         assert!(t.state.lock().await.cached.is_some(), "session cached after first send");
 
         server.shutdown().await.unwrap();
-        // NOTE: do NOT shut down `client` — its endpoint is installed in the
-        // process-global IROH_CLIENT_ENDPOINT (install-once), so tearing it down
-        // would break the shared dialer for any other test. Drop it; the global
-        // Arc clone keeps the endpoint alive (matches the never-reset prod lifecycle).
+        // `client`'s endpoint was injected into `t` (not installed globally), so it
+        // is local to this test. The dial is already complete; drop it. The
+        // endpoint Arc clone held by `t` keeps it alive until `t` drops.
         drop(client);
     }
 
@@ -253,6 +305,9 @@ mod tests {
         let server = IrohSubstrate::new(fresh_key(), EchoHandler, EchoHandler).await.unwrap();
         let direct: Vec<SocketAddr> = server.endpoint().bound_sockets().into_iter().collect();
 
+        // Dial from this test's own endpoint (see `lazy_iroh_connects_*` above and
+        // `endpoint_override`'s docs): the install-once global is bound to another
+        // test's runtime and would flake with "Internal consistency error".
         let client = IrohSubstrate::new(
             fresh_key(),
             NoopHandler::new("client moq"),
@@ -260,8 +315,6 @@ mod tests {
         )
         .await
         .unwrap();
-        // First-write-wins; may already be installed by another test (same global).
-        let _ = install_iroh_client_endpoint(client.endpoint().clone());
 
         // A *valid* but wrong EndpointId (a third node's), so this tests handshake
         // identity rejection — not a malformed key.
@@ -270,7 +323,7 @@ mod tests {
             .unwrap();
         let wrong_id: [u8; 32] = *other.endpoint_id().as_bytes();
 
-        let t = LazyIrohTransport::new(wrong_id, direct, None);
+        let t = LazyIrohTransport::new_with_endpoint(wrong_id, direct, None, client.endpoint().clone());
         let res = tokio::time::timeout(Duration::from_secs(8), t.send(b"x".to_vec(), Some(3_000)))
             .await
             .expect("send must complete (with an error) — wrong identity should reject, not hang");
@@ -279,10 +332,8 @@ mod tests {
 
         other.shutdown().await.unwrap();
         server.shutdown().await.unwrap();
-        // NOTE: do NOT shut down `client` — its endpoint is installed in the
-        // process-global IROH_CLIENT_ENDPOINT (install-once), so tearing it down
-        // would break the shared dialer for any other test. Drop it; the global
-        // Arc clone keeps the endpoint alive (matches the never-reset prod lifecycle).
+        // `client`'s endpoint was injected into `t` (not installed globally), so it
+        // is local to this test; drop it. The Arc clone held by `t` keeps it alive.
         drop(client);
     }
 

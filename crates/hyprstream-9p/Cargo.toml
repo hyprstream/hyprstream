@@ -13,12 +13,20 @@ hyprstream-vfs = { path = "../hyprstream-vfs" }
 hyprstream-rpc = { path = "../hyprstream-rpc" }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
-tokio = { version = "1", features = ["net", "io-util", "rt", "sync", "macros"] }
 tracing = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
 
+# Native: full tokio with `net` for the server-side TCP accept loop (translator).
+# `net` pulls `mio`, which has no wasm32-unknown-unknown backend, so it must stay
+# off the wasm target (the browser path uses the DMA/Wanix transport instead).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["net", "io-util", "rt", "sync", "macros"] }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+# wasm32: tokio without `net` (no `mio`). The translator (TCP server) is
+# cfg-gated out of the wasm build; only the codec + client/DMA paths compile.
+tokio = { version = "1", default-features = false, features = ["sync", "macros"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"

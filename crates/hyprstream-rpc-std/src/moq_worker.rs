@@ -53,6 +53,7 @@
 use wasm_bindgen::prelude::*;
 use web_sys::{Worker, WorkerOptions, WorkerType};
 
+use hyprstream_9p::client::P9Transport;
 use hyprstream_9p::dma::DmaTransport;
 
 // ─── Frame envelope helpers ──────────────────────────────────────────────────

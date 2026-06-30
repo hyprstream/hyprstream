@@ -325,7 +325,7 @@ impl MetricsHandler for MetricsService {
             stream_id: stream_ctx.stream_id().to_owned(),
             dh_public: *stream_ctx.server_pubkey(),
             broadcast_path,
-            announced_at: hyprstream_rpc::moq_stream::producer_reach(),
+            announced_at: stream_ctx.reach(), // #384: per-stream reach via ctx
             ..Default::default()
         };
         let inner = Arc::clone(&self.inner);

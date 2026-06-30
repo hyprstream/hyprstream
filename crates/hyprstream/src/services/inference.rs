@@ -595,7 +595,9 @@ impl InferenceService {
         let broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()
             .map(|o| o.broadcast_path(stream_ctx.topic()))
             .unwrap_or_default();
-        let reach = hyprstream_rpc::moq_stream::producer_reach();
+        // #384: per-stream reach (server-authored RelayChoice on the ctx);
+        // ServerDefault unless set to Only/Override for anonymized/per-tenant.
+        let reach = stream_ctx.reach();
 
         // Delta lookup deferred to execute_stream (after TTT may modify it)
         let pending = PendingWork::Generation {
@@ -1054,7 +1056,7 @@ impl InferenceService {
             dh_public: server_pubkey,
             qos: stream_ctx.qos().clone(),
             broadcast_path,
-            announced_at: hyprstream_rpc::moq_stream::producer_reach(),
+            announced_at: stream_ctx.reach(), // #384: per-stream reach via ctx
         };
 
         Ok((stream_info, stream_ctx))
@@ -2110,7 +2112,7 @@ impl InferenceHandler for InferenceService {
             dh_public: server_pubkey,
             qos: stream_ctx.qos().clone(),
             broadcast_path,
-            announced_at: hyprstream_rpc::moq_stream::producer_reach(),
+            announced_at: stream_ctx.reach(), // #384: per-stream reach via ctx
         };
 
         let adaptation_strategy = map_adaptation_strategy(data.adaptation_strategy, data.writeback_threshold);
