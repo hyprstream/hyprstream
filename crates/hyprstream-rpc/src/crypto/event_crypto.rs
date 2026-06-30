@@ -37,6 +37,12 @@ use super::backend::{derive_key, keyed_mac};
 /// Privacy mode for event transport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventPrivacy {
+    /// No group-key encryption: payload is written to the moq track unmodified
+    /// (wire-identical to the pre-EV1 plaintext event bus). Use for the
+    /// public/interop firehose profile, or any event with no confidentiality
+    /// requirement. `EventPublisher::new`/`new_with_oid`/`new_oid_only`
+    /// default to this mode.
+    Public,
     /// All events on one broadcast stream. StreamService learns nothing about interests.
     ZeroKnowledge,
     /// Per-prefix direct circuits. Efficient but reveals topology.

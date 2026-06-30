@@ -4,9 +4,10 @@
 //! `WorkflowService`, builds `EventHandler`s from `on:` triggers, and
 //! dispatches matching workflows when events arrive.
 //!
-//! This adapter uses the existing `EventSubscriber` (XPUB/XSUB proxy).
-//! When Phase 7 (Secure Event Transport) is complete, this will be updated
-//! to use `SecureEventSubscriber` for group-key encrypted event delivery.
+//! This adapter uses the canonical `EventSubscriber` (moq-lite backed, #167).
+//! It currently subscribes in `Public` (plaintext) mode; group-key encrypted
+//! delivery is available by calling `EventSubscriber::join_prefix` for the
+//! prefixes this adapter cares about — not yet wired here.
 
 use std::sync::Arc;
 

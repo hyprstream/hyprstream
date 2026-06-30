@@ -230,7 +230,7 @@ impl WorkerService {
     ///
     /// Topic format: worker.{entity_id}.{event_name}
     async fn publish_event(&self, entity_id: &str, event: &str, payload: &[u8]) {
-        let mut publisher = self.event_publisher.lock().await;
+        let publisher = self.event_publisher.lock().await;
         if let Err(e) = publisher.publish(entity_id, event, payload).await {
             tracing::warn!(
                 entity_id = %entity_id,
