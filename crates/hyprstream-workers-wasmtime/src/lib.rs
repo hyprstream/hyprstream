@@ -403,8 +403,8 @@ fn write_memory(
 /// test.
 ///
 /// This is the GENERIC Profile-A core: [`call_export`](Self::call_export) ships a
-/// byte payload to a named guest export over the guest's `alloc`/`memory` ABI. Profile
-/// modules (e.g. [`crate::python`]) build typed APIs on top of it.
+/// byte payload to a named guest export over the guest's `alloc`/`memory` ABI. Language
+/// profile crates (e.g. `hyprstream-workers-python`) build typed APIs on top of it.
 pub struct Sandbox {
     engine: Engine,
     module: Module,
