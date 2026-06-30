@@ -1,0 +1,47 @@
+name: workers wasm backend
+
+# CI-enforce the in-process wasm SandboxBackend (#505 P2 / #597): build + run the
+# `hyprstream-workers --features wasm` tests so the backend's capability/DoS/ZSP
+# guarantees are pipeline-verified, not just local. The wasm_backend tests use an
+# inline WAT guest (compiled by wasmtime at runtime), so there is no wasm32 cross-build
+# or guest artifact — the tests always RUN (no skip path to guard). Torch-free.
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'crates/hyprstream-workers/**'
+      - 'crates/hyprstream-sandbox/**'
+      - '.github/workflows/workers-wasm-tests.yml'
+  pull_request:
+    paths:
+      - 'crates/hyprstream-workers/**'
+      - 'crates/hyprstream-sandbox/**'
+      - '.github/workflows/workers-wasm-tests.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  workers-wasm:
+    name: build + test hyprstream-workers --features wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # hyprstream-workers -> hyprstream-rpc, whose build.rs invokes the capnp compiler.
+      - name: Install system deps (capnproto)
+        run: sudo apt-get update && sudo apt-get install -y capnproto pkg-config libssl-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      # The wasm SandboxBackend tests use an inline WAT guest (no wasm32 artifact),
+      # so they always RUN. This includes the explicit-only / ZSP selection tests
+      # (`wasm` is auto_selectable:false — never auto-picked).
+      - name: Build + test workers --features wasm
+        run: |
+          cargo build -p hyprstream-workers --features wasm
+          cargo test -p hyprstream-workers --features wasm
