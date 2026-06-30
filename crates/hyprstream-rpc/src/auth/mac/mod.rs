@@ -35,8 +35,8 @@
 //!      [`context::SubjectContextClaims::security_context`] (clearance from
 //!      verified claims, assurance derived from verified key material) — `None`
 //!      ⇒ DENY (unlabeled subject);
-//!   3. evaluates the MAC floor [`context::SecurityContext::dominates`]
-//!      (≡ [`SecurityLabel::dominates`]) — `false` ⇒ DENY.
+//!   3. evaluates the MAC floor [`context::SecurityContext::can_access`]
+//!      (≡ [`SecurityLabel::can_access`]) — `false` ⇒ DENY.
 //!   The monitor takes object labels ONLY from `LabeledObject`, never from a
 //!   token/UCAN/caveat (design §3, §14). It needs no `Lattice` on the hot path:
 //!   dominance is intrinsic.
@@ -121,7 +121,7 @@ pub use manifest::{ContentBoundLabel, LabeledObject, StaticNodeLabel};
 mod integration_tests {
     //! End-to-end shape of the per-op check S2 will perform, exercised against
     //! the S1 seams only (object via `LabeledObject`, subject via
-    //! `SubjectContextClaims`, floor via `dominates`).
+    //! `SubjectContextClaims`, floor via `can_access`).
     use super::*;
 
     struct StubClaims(Option<SecurityLabel>);
@@ -145,7 +145,7 @@ mod integration_tests {
         let Some(ctx) = claims.security_context(key_material) else {
             return false; // unlabeled subject → deny
         };
-        ctx.dominates(&object_label)
+        ctx.can_access(&object_label)
     }
 
     /// A compartment bitset from bit indices (bit 0 = "pii", 1 = "finance", … in

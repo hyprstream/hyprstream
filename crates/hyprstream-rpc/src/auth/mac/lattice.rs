@@ -373,15 +373,15 @@ impl Lattice {
     }
 
     /// Dominance, re-exposed at the policy object for callers that hold a
-    /// `Lattice`. Identical to [`SecurityLabel::dominates`] — the policy does
+    /// `Lattice`. Identical to [`SecurityLabel::can_access`] — the policy does
     /// NOT change the order; this is purely an ergonomic forwarder. Debug
     /// builds assert both labels are well-formed (a mis-labeled object reaching
     /// the monitor is a genesis bug).
     #[must_use]
-    pub fn dominates(&self, subject: &SecurityLabel, object: &SecurityLabel) -> bool {
+    pub fn can_access(&self, subject: &SecurityLabel, object: &SecurityLabel) -> bool {
         debug_assert!(self.validate(subject).is_ok(), "subject label ill-formed");
         debug_assert!(self.validate(object).is_ok(), "object label ill-formed");
-        subject.dominates(object)
+        subject.can_access(object)
     }
 
     /// IFC join, re-exposed at the policy object. Identical algebra to
@@ -467,7 +467,7 @@ mod tests {
                 [comp("pii"), comp("finance"), comp("tenant:acme")],
             )
             .unwrap();
-        assert!(p.dominates(&top, &arbitrary));
+        assert!(p.can_access(&top, &arbitrary));
     }
 
     #[test]
@@ -477,10 +477,10 @@ mod tests {
         let any = p
             .label(Level::Internal, Assurance::Classical, [comp("pii")])
             .unwrap();
-        assert!(any.dominates(&bottom));
+        assert!(any.can_access(&bottom));
         // bottom only dominates bottom.
-        assert!(!bottom.dominates(&any));
-        assert!(bottom.dominates(&bottom));
+        assert!(!bottom.can_access(&any));
+        assert!(bottom.can_access(&bottom));
     }
 
     #[test]
@@ -492,7 +492,7 @@ mod tests {
         let b = p
             .label(Level::Secret, Assurance::PqHybrid, [comp("finance")])
             .unwrap();
-        assert_eq!(p.dominates(&a, &b), a.dominates(&b));
+        assert_eq!(p.can_access(&a, &b), a.can_access(&b));
         assert_eq!(p.join(&a, &b), a.join(&b));
     }
 
