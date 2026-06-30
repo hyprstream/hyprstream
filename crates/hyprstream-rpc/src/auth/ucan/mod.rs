@@ -41,28 +41,22 @@
 //!   signed with hybrid COSE. Its `bundle_hash` is exactly S4's
 //!   `CompiledPolicy::policy_hash()` so it drops into the S4 loader's
 //!   `PolicyApproval`.
-//! - [`seam`] — milestone-2 interfaces left unimplemented: the action-vocabulary
-//!   mapping (gated on S3/#582), Casbin/TE bundle emission, and the faithfulness
-//!   framework. Scaffolded only.
 //!
 //! ## Relationship to S4 (#570/#583)
 //!
 //! S4's PDP (in the `hyprstream` crate, `mac::compiled::CompiledPolicy`) is the
-//! consumer of this compiler's output. The emitted bundle is a
+//! consumer of the compiler's output. The compiled policy is a
 //! `hyprstream::mac::TeMatrix` wrapped in a `CompiledPolicy` whose
 //! `generation == LatticeVersion::generation()` and whose `policy_hash()` is the
-//! `bundle_hash` this module's approval binds. Bundle emission needs the
-//! `hyprstream`-crate TE types, so it is a [`seam`] (milestone 2); the
-//! milestone-1 core lives here in `hyprstream-rpc` and needs only S1 + crypto.
+//! hash this module's approval binds. The compiler lives in the `hyprstream` crate
+//! because it needs the TE types; the UCAN model here needs only S1 + crypto.
 
 pub mod approval;
 pub mod capability;
 pub mod chain;
-pub mod seam;
 pub mod token;
 
 pub use approval::{ucan_cid, ApprovalBinding, ApprovalError, SignedApproval, APPROVAL_AAD};
 pub use capability::{set_attenuates, Ability, Capability, CaveatValue, Caveats, Resource};
 pub use chain::{validate, validate_chain, ChainError};
-pub use seam::{ActionVocabulary, BundleEmitter, FaithfulnessCheck};
 pub use token::{Did, Ucan, UcanError, UcanPayload, UcanVerifier};
