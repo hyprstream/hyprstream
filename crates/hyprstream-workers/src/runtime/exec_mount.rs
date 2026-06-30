@@ -49,6 +49,11 @@ use async_trait::async_trait;
 use tokio::sync::Mutex as AsyncMutex;
 
 use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat, Subject};
+// `parking_lot::Mutex` for the ctl write→read latch (interior mutability
+// through the `&Fid` that `Mount::write` receives). When this branch is
+// rebased onto a base containing #615, swap this hand-rolled latch for
+// `hyprstream_vfs::devfile::DevFileState` (same parking_lot::Mutex shape).
+use parking_lot::Mutex as PmMutex;
 
 use super::client::PodSandboxState;
 use super::pool::SandboxPool;
@@ -126,8 +131,11 @@ enum ExecFidKind {
 /// Fid state for the exec mount.
 struct ExecFid {
     kind: ExecFidKind,
-    /// Buffer for the ctl write→read pattern (verb result message).
-    write_buf: Vec<u8>,
+    /// Latch for the ctl write→read pattern (verb result message). A
+    /// `parking_lot::Mutex<Vec<u8>>` provides safe interior mutability through
+    /// the `&Fid` that `Mount::read`/`Mount::write` receive — so we avoid the
+    /// `unsafe *mut` cast-through-`&` hazard. Unused for non-ctl fid kinds.
+    write_buf: PmMutex<Vec<u8>>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -319,7 +327,7 @@ impl Mount for ExecMount {
 
         Ok(Fid::new(ExecFid {
             kind,
-            write_buf: Vec::new(),
+            write_buf: PmMutex::new(Vec::new()),
         }))
     }
 
@@ -341,7 +349,7 @@ impl Mount for ExecMount {
         let data = match &inner.kind {
             ExecFidKind::Ctl(_) => {
                 // Ctl pattern: after a write, read returns the verb result.
-                inner.write_buf.clone()
+                inner.write_buf.lock().clone()
             }
             ExecFidKind::Status(id) => self.read_status(id).await?.into_bytes(),
             ExecFidKind::Exit(id) => self.read_exit(id).await?.into_bytes(),
@@ -380,17 +388,16 @@ impl Mount for ExecMount {
                     Ok(s) => s.into_bytes(),
                     Err(e) => format!("error: {e}\n").into_bytes(),
                 };
-                // Ctl write→read pattern: stash the result for a subsequent
-                // read on the same fid. The Mount trait takes `&self`, so we
-                // need interior mutability here; mirrors the established
-                // pattern in `hyprstream-workers-tcl`/`-python`'s ctl files.
-                // SAFETY: single fid, no concurrent access to this fid's
-                // `write_buf` is expected (a fid is owned by one caller's
-                // walk→open→write→read sequence).
-                let fid_ptr = inner as *const ExecFid as *mut ExecFid;
-                unsafe {
-                    (*fid_ptr).write_buf = response_bytes;
-                }
+                // Ctl write→read pattern: latch the result for a subsequent
+                // read on the same fid. The `Mount::write(&self, &Fid, ..)`
+                // signature needs interior mutability; `parking_lot::Mutex`
+                // gives it safely through `&` (the same primitive
+                // `hyprstream-workers-tcl`/`-python` and `devfile::DevFileState`
+                // use on bases that contain #615), avoiding the `unsafe *mut`
+                // cast-through-`&` the pre-review draft used — that would be a
+                // data race if two futures ever held `&Fid` to one fid
+                // concurrently (e.g. a 9P server multiplexing Twrite on one fid).
+                *inner.write_buf.lock() = response_bytes;
                 Ok(data.len() as u32)
             }
             _ => Err(MountError::NotSupported("read-only".into())),
@@ -774,5 +781,45 @@ mod tests {
         let st = mount.stat(&fid, &subject()).await.unwrap();
         assert_eq!(st.qtype, 0x80);
         assert_eq!(st.name, "instances");
+    }
+
+    /// Regression: the ctl write→latch must be safe under concurrent access
+    /// to the same fid. The `Mount::write`/`read` signatures take `&Fid`
+    /// (shared), so the latch must use interior mutability. Before this fix
+    /// the mount used an `unsafe *mut` cast through `&` to mutate `write_buf`,
+    /// which was a data race / UB if two futures holding `&Fid` were polled
+    /// concurrently (e.g. a 9P server multiplexing Twrite on one fid). Here a
+    /// single ctl fid is shared across `join3`-concurrent writers: under the
+    /// old `unsafe` cast Miri flags this as UB; under the `parking_lot::Mutex`
+    /// latch it is sound, and exactly one writer's response wins the latch.
+    #[tokio::test]
+    async fn ctl_concurrent_writes_to_one_fid_are_safe() {
+        let pool = make_pool().await;
+        let id = pool.acquire(&PodSandboxConfig::default()).await.unwrap();
+        let mount = ExecMount::new(pool);
+
+        // One shared ctl fid; opened RDWR.
+        let mut fid = mount.walk(&[&id, "ctl"], &subject()).await.unwrap();
+        mount.open(&mut fid, 2, &subject()).await.unwrap();
+
+        // Drive several concurrent writers against the *same* `&Fid`. The
+        // contract under test is *no UB / no panic* — the final latched value
+        // just has to be a valid ctl response (the latch update must be
+        // atomic, not a torn write).
+        let caller = subject();
+        let w1 = mount.write(&fid, 0, b"stop", &caller);
+        let w2 = mount.write(&fid, 0, b"stop", &caller);
+        let w3 = mount.write(&fid, 0, b"kill", &caller);
+        let (r1, r2, r3) = futures::future::join3(w1, w2, w3).await;
+        for r in [r1, r2, r3] {
+            r.unwrap();
+        }
+
+        let out = mount.read(&fid, 0, 4096, &caller).await.unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.starts_with("ok:"),
+            "expected one of the stop/kill responses latched, got: {text}"
+        );
     }
 }
