@@ -48,6 +48,16 @@ pub use hyprstream_rpc::events::{
     WrappedKeyEntry,
 };
 
+// The generic keyable-group primitive (GroupKeyRegistry, GroupRef,
+// MembershipResolver, GroupMembership, DenyAllResolver) lives in
+// `hyprstream_rpc::crypto::group_key` — re-exported here for consumers that
+// historically imported event primitives via this module. (EncryptedEvent /
+// RekeyPolicy / RotationResult / WrappedKeyEntry are canonical there too, and
+// are also reachable via the `hyprstream_rpc::events` re-export above.)
+pub use hyprstream_rpc::crypto::group_key::{
+    DenyAllResolver, GroupKeyRegistry, GroupMembership, GroupRef, MembershipResolver,
+};
+
 // Re-export event types
 pub use types::{
     // Individual event structs (with ToCapnp/FromCapnp)

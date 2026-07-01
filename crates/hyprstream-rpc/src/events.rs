@@ -92,24 +92,24 @@ use crate::crypto::event_crypto::{
     encrypt_event, unwrap_group_key, wrap_group_key, EventPrivacy,
 };
 use crate::crypto::{generate_ephemeral_keypair, keyed_mac, ristretto_dh_raw};
+// The four shared event types + the rotation constants are canonical in the
+// keyable-group primitive (`crypto::group_key`); re-export them here so the
+// `hyprstream_rpc::events::*` surface downstream consumers already use stays
+// stable. (Only the EventService-specific `EncryptedEvent` wire codec + the
+// `EventPublisher`/`EventSubscriber`/`KeyRing` types are defined in this module.)
+pub use crate::crypto::group_key::{
+    EncryptedEvent, MAX_KEY_LIFETIME, DEFAULT_ROTATION_INTERVAL, GRACE_PERIOD, RekeyPolicy,
+    RotationResult, WrappedKeyEntry,
+};
 use crate::moq_event::{
     global_moq_event_origin, BackfillMode, MoqEventPublisher, MoqEventSubscriber,
 };
 
 // ============================================================================
-// Rekey policy (unchanged from the original SecureEventPublisher design)
+// Rekey policy — the type + its constants live in the keyable-group primitive
+// (`crypto::group_key`); this module re-imports them above. Only the
+// subscriber-side grace constant below is specific to this module.
 // ============================================================================
-
-/// Maximum key lifetime (24 hours). Keys MUST be rotated before this.
-pub const MAX_KEY_LIFETIME: Duration = Duration::from_secs(86400);
-
-/// Default rotation interval (1 hour).
-pub const DEFAULT_ROTATION_INTERVAL: Duration = Duration::from_secs(3600);
-
-/// Grace period for old key acceptance after rotation (publisher side: how
-/// long a not-yet-rekeyed subscriber can still be wrapped against the old
-/// ephemeral keypair before the pending key promotes).
-pub const GRACE_PERIOD: Duration = Duration::from_secs(120);
 
 /// Default grace period a subscriber accepts the previous group key after a
 /// rekey (separate from the publisher-side [`GRACE_PERIOD`] above — this one
@@ -117,93 +117,40 @@ pub const GRACE_PERIOD: Duration = Duration::from_secs(120);
 /// `previous` after [`EventSubscriber::promote_key`]).
 pub const DEFAULT_SUBSCRIBER_GRACE_PERIOD: Duration = Duration::from_secs(30);
 
-/// Rekey policy configuration.
-///
-/// # Cost / forward-secrecy tradeoff (#606)
-///
-/// Rotation re-wraps the group key for every known subscriber: O(M) DH +
-/// AEAD-wrap operations per rotation, M = group size (see
-/// [`EventPublisher::rotate_key`]).
-///
-/// - [`Self::Immediate`] rotates on EVERY revocation — prompt
-///   forward-secrecy (a revoked member loses access immediately), but O(M)
-///   PER revocation. M sequential departures cost O(M²) total. Use only for
-///   an explicit revocation / suspected-compromise event on a specific
-///   prefix, not as a blanket policy for routine membership churn.
-/// - [`Self::Scheduled`] bounds the cost to O(M) per `interval` regardless
-///   of churn, but DEFERS revocation: a removed member can still decrypt
-///   until the next scheduled rotation (up to `interval`, capped by
-///   [`MAX_KEY_LIFETIME`]). This is the default — routine join/leave should
-///   not pay an O(M) rewrap per event.
-/// - [`Self::Jittered`] is `Scheduled` plus timing-attack resistance on
-///   exactly when the rotation fires; same cost/latency tradeoff as
-///   `Scheduled`.
-///
-/// Recommended use: `Scheduled`/`Jittered` for the steady state; switch a
-/// specific prefix to `Immediate` only around an explicit revocation, then
-/// switch back.
-#[derive(Clone, Debug)]
-pub enum RekeyPolicy {
-    /// Rotate on fixed schedule. Revocations deferred to next rotation.
-    Scheduled { interval: Duration },
-    /// Rotate immediately on revocation.
-    Immediate,
-    /// Scheduled with jitter for timing attack resistance.
-    Jittered {
-        interval: Duration,
-        jitter: Duration,
-    },
-}
-
-impl Default for RekeyPolicy {
-    fn default() -> Self {
-        RekeyPolicy::Scheduled {
-            interval: DEFAULT_ROTATION_INTERVAL,
-        }
-    }
-}
-
-impl RekeyPolicy {
-    pub fn validate(&self) -> Result<(), String> {
-        match self {
-            Self::Scheduled { interval } | Self::Jittered { interval, .. }
-                if *interval > MAX_KEY_LIFETIME =>
-            {
-                Err(format!(
-                    "interval {interval:?} exceeds MAX_KEY_LIFETIME ({MAX_KEY_LIFETIME:?})"
-                ))
-            }
-            _ => Ok(()),
-        }
-    }
-}
+// Rekey policy configuration.
+//
+// # Cost / forward-secrecy tradeoff (#606)
+//
+// Rotation re-wraps the group key for every known subscriber: O(M) DH +
+// AEAD-wrap operations per rotation, M = group size (see
+// [`EventPublisher::rotate_key`]).
+//
+// - [`RekeyPolicy::Immediate`] rotates on EVERY revocation — prompt
+//   forward-secrecy (a revoked member loses access immediately), but O(M)
+//   PER revocation. M sequential departures cost O(M²) total. Use only for
+//   an explicit revocation / suspected-compromise event on a specific
+//   prefix, not as a blanket policy for routine membership churn.
+// - [`RekeyPolicy::Scheduled`] bounds the cost to O(M) per `interval` regardless
+//   of churn, but DEFERS revocation: a removed member can still decrypt
+//   until the next scheduled rotation (up to `interval`, capped by
+//   [`MAX_KEY_LIFETIME`]). This is the default — routine join/leave should
+//   not pay an O(M) rewrap per event.
+// - [`RekeyPolicy::Jittered`] is `Scheduled` plus timing-attack resistance on
+//   exactly when the rotation fires; same cost/latency tradeoff as
+//   `Scheduled`.
+//
+// Recommended use: `Scheduled`/`Jittered` for the steady state; switch a
+// specific prefix to `Immediate` only around an explicit revocation, then
+// switch back.
+//
+// The type itself + its `Default`/`validate` impls live in the keyable-group
+// primitive ([`crate::crypto::group_key`]); this module re-uses them.
 
 // ============================================================================
 // EncryptedEvent — wire-encodable result of encrypting an event
 // ============================================================================
 
 const WIRE_VERSION: u8 = 1;
-
-/// Result of encrypting an event, and the unit this module puts on the wire
-/// for `EventPrivacy::ZeroKnowledge` / `LimitedKnowledge` publishes.
-#[derive(Debug, Clone)]
-pub struct EncryptedEvent {
-    pub topic: String,
-    pub tag: Vec<u8>,
-    pub ciphertext: Vec<u8>,
-    pub nonce: [u8; 12],
-    pub key_commitment: [u8; 16],
-    /// LK mode routing tag (keyed HMAC of prefix). Empty in ZK/Public mode.
-    pub lk_tag: Vec<u8>,
-    /// Ed25519 signature over the event (see module docs: self-asserted, not
-    /// yet identity-bound).
-    pub signature: Vec<u8>,
-    /// Publisher's Ed25519 verifying key, embedded so the subscriber needs no
-    /// pre-shared signing identity to check tamper-evidence.
-    pub publisher_pubkey: [u8; 32],
-    /// Event timestamp (unix millis).
-    pub timestamp: i64,
-}
 
 impl EncryptedEvent {
     /// Encode the non-topic fields into a wire frame body (see module docs
@@ -748,22 +695,10 @@ fn maybe_promote_pending(crypto: &mut PrefixCrypto) {
     }
 }
 
-/// Result of a key rotation.
-#[derive(Debug)]
-pub struct RotationResult {
-    pub new_ephemeral_pubkey: [u8; 32],
-    pub wrapped_keys: Vec<WrappedKeyEntry>,
-    pub effective_at_millis: i64,
-}
-
-/// A wrapped key entry for a single subscriber.
-#[derive(Debug)]
-pub struct WrappedKeyEntry {
-    /// Random 16-byte routing tag (unlinkable across rekeys).
-    pub routing_tag: [u8; 16],
-    /// Opaque wrapped group key blob.
-    pub wrapped_blob: Vec<u8>,
-}
+// ============================================================================
+// KeyRing + RekeyEvent — publisher-side state (EventService-specific; the
+// reusable keyable-group primitive is `crypto::group_key::GroupKeyRegistry`).
+// ============================================================================
 
 // ============================================================================
 // EventSubscriber — the canonical broadcast subscriber
