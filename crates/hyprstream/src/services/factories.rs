@@ -572,7 +572,6 @@ fn init_local_moq_stream_plane(service_name: &str) {
     };
 
     // Use DEFAULT_PREFIX ("local/streams") so the publisher's broadcast paths
-    // match what consumers reconstruct (NotificationService builds its consumer
     // path from DEFAULT_PREFIX; TUI/registry/metrics echo the origin's own
     // broadcast_path back to the client, so any prefix is self-consistent there).
     let moq_origin = hyprstream_rpc::moq_stream::MoqStreamOrigin::standalone()
@@ -1503,38 +1502,6 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
 // Notification Service Factory
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Factory for NotificationService (blind relay with broadcast encryption)
-#[service_factory("notification", schema = "../../../hyprstream-rpc-std/schema/notification.capnp", metadata = crate::services::generated::notification_client::schema_metadata, depends_on = ["policy", "discovery"])]
-fn create_notification_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
-    info!("Creating NotificationService");
-
-    // NotificationService publishes broadcast frames over moq and returns its
-    // per-PID moq UDS path to subscribers (notification.rs handle_subscribe).
-    // Initialize this process's local moq plane so that path is non-empty and
-    // the origin exists for StreamChannel::publisher(). Idempotent.
-    init_local_moq_stream_plane("notification");
-
-    let sk = ctx.service_signing_key("notification");
-
-    // Register this service's verifying key with PolicyService
-    register_service_key(ctx, "notification", &sk)?;
-
-    let policy_vk = hyprstream_service::global_trust_store()
-        .resolve_one("policy")
-        .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("notification"))?;
-
-    let mut notification_service = crate::services::NotificationService::new(
-        Arc::new(sk),
-        ctx.transport("notification", SocketKind::Rep),
-    ).with_policy_client(policy_client);
-    if let Some(issuer) = ctx.oauth_issuer_url() {
-        notification_service = notification_service.with_expected_audience(issuer.to_owned());
-    }
-    notification_service = notification_service.with_jwt_key_source(ctx.cluster_key_source());
-
-    Ok(ctx.into_spawnable(notification_service))
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Metrics Service Factory

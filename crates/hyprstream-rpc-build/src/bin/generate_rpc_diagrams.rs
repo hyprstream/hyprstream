@@ -82,8 +82,6 @@ fn client_to_service(client_type: &str) -> Option<&'static str> {
         "RegistryClient" => Some("registry"),
         "ModelClient" => Some("model"),
         "InferenceClient" => Some("inference"),
-        "NotificationClient" => Some("notification"),
-        "NotificationPublisher" => Some("notification"),
         "WorktreeClient" => Some("registry"), // scoped sub-client of registry
         "RepositoryClient" => Some("registry"), // scoped sub-client of registry
         "CtlClient" => Some("registry"),      // scoped sub-client of registry
@@ -103,8 +101,6 @@ const CLIENT_TYPES: &[&str] = &[
     "RegistryClient",
     "ModelClient",
     "InferenceClient",
-    "NotificationClient",
-    "NotificationPublisher",
     "WorktreeClient",
     "RepositoryClient",
     "CtlClient",
@@ -126,7 +122,6 @@ fn filename_to_service(filename: &str) -> Option<&'static str> {
         "registry.rs" => Some("registry"),
         "model.rs" => Some("model"),
         "inference.rs" => Some("inference"),
-        "notification.rs" => Some("notification"),
         "discovery.rs" => Some("discovery"),
         "worker.rs" => Some("worker"),
         "mcp_service.rs" => Some("mcp"),
@@ -432,7 +427,6 @@ fn has_client_prefix(line: &str, method_name: &str) -> bool {
         "model_client",
         "worker_client",
         "inference_client",
-        "notification_client",
         "discovery_client",
         "tui_client",
         "mcp_client",
@@ -442,7 +436,6 @@ fn has_client_prefix(line: &str, method_name: &str) -> bool {
         "model",
         "worker",
         "inference",
-        "notification",
         "discovery",
         // Scoped sub-clients
         "worktree",
@@ -527,9 +520,6 @@ fn resolve_call_target(
             return Some(target.clone());
         }
         if var.contains("inference") && target == "inference" {
-            return Some(target.clone());
-        }
-        if var.contains("notif") && target == "notification" {
             return Some(target.clone());
         }
         if var.contains("discovery") && target == "discovery" {

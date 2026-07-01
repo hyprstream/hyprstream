@@ -33,7 +33,6 @@ fn main() {
         "policy",
         "mcp",
         "metrics",
-        "notification",
         "service_events",
         "chat_core",
         "oauth",
