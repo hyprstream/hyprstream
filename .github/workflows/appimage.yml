@@ -6,11 +6,22 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: read
+  id-token: write
+
 env:
   CARGO_TERM_COLOR: always
   LIBTORCH_VERSION: "2.10.0"
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: "sccache"
+  # sccache S3 backend (OIDC role assumed per-run). Replaces SCCACHE_GHA_ENABLED,
+  # which spammed the 10GB repo cache with thousands of tiny objects for no
+  # cross-run gain (fresh runner each run). Intra-run variant reuse still works
+  # (all variants compile identical Rust — only libtorch differs — so variants
+  # 2..N reuse variant 1's crates from local disk); S3 adds cross-run sharing.
+  RUSTC_WRAPPER: sccache
+  SCCACHE_BUCKET: ${{ vars.AWS_SCCACHE_BUCKET }}
+  SCCACHE_REGION: ${{ vars.AWS_SCCACHE_REGION }}
+  CARGO_INCREMENTAL: 0
 
 jobs:
   # Build all backend variants sequentially on a single runner
@@ -45,10 +56,14 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Configure AWS credentials (OIDC → sccache S3)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_SCCACHE_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_SCCACHE_REGION }}
+
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
-        with:
-          key: appimage-sccache
 
       - name: Cache Cargo registry
         uses: actions/cache@v4
@@ -82,13 +97,18 @@ jobs:
           path: appimage/output/*-cpu-*.AppImage
           retention-days: 5
 
+      # Heavy GPU variants + universal build only on release tags. On push-to-main
+      # we ship just the CPU AppImage — building all 5 every push cost ~70min and
+      # produced ~11GB of artifacts that only matter at release.
       - name: Build CUDA 12.8 AppImage
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           ./appimage/build-appimage.sh build cuda128 --version ${{ steps.version.outputs.version }}
           ./appimage/build-appimage.sh stage cuda128
           ./appimage/build-appimage.sh clean cuda128
 
       - name: Upload CUDA 12.8 AppImage
+        if: startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v4
         with:
           name: appimage-cuda128
@@ -96,12 +116,14 @@ jobs:
           retention-days: 5
 
       - name: Build CUDA 13.0 AppImage
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           ./appimage/build-appimage.sh build cuda130 --version ${{ steps.version.outputs.version }}
           ./appimage/build-appimage.sh stage cuda130
           ./appimage/build-appimage.sh clean cuda130
 
       - name: Upload CUDA 13.0 AppImage
+        if: startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v4
         with:
           name: appimage-cuda130
@@ -109,12 +131,14 @@ jobs:
           retention-days: 5
 
       - name: Build ROCm 7.1 AppImage
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           ./appimage/build-appimage.sh build rocm71 --version ${{ steps.version.outputs.version }}
           ./appimage/build-appimage.sh stage rocm71
           ./appimage/build-appimage.sh clean rocm71
 
       - name: Upload ROCm 7.1 AppImage
+        if: startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v4
         with:
           name: appimage-rocm71
@@ -122,10 +146,12 @@ jobs:
           retention-days: 5
 
       - name: Build Universal AppImage
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           ./appimage/build-appimage.sh build universal --version ${{ steps.version.outputs.version }}
 
       - name: Upload Universal AppImage
+        if: startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v4
         with:
           name: appimage-universal

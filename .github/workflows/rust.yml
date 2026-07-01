@@ -6,10 +6,23 @@ on:
   pull_request:
   merge_group:
 
+# id-token: write lets jobs mint an OIDC token to assume the sccache S3 role
+# (AWS_SCCACHE_ROLE_ARN). No long-lived AWS secrets live in the repo — the role
+# is assumed per-run with a short-lived credential that sccache's S3 backend reads
+# from the standard AWS env vars exported by configure-aws-credentials.
+permissions:
+  contents: read
+  id-token: write
+
 env:
   CARGO_TERM_COLOR: always
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: "sccache"
+  # sccache S3 backend: shared across CI runs AND local devs, keyed on compiler
+  # inputs. Replaces the GHA-cache sccache (3% hit rate, 10GB explosion, write
+  # races) AND Swatinem/rust-cache. Bucket objects expire after 24h (lifecycle).
+  RUSTC_WRAPPER: sccache
+  SCCACHE_BUCKET: ${{ vars.AWS_SCCACHE_BUCKET }}
+  SCCACHE_REGION: ${{ vars.AWS_SCCACHE_REGION }}
+  CARGO_INCREMENTAL: 0
 
 jobs:
   clippy:
@@ -26,18 +39,21 @@ jobs:
       with:
         components: clippy
 
+    - name: Configure AWS credentials (OIDC → sccache S3)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ vars.AWS_SCCACHE_ROLE_ARN }}
+        aws-region: ${{ vars.AWS_SCCACHE_REGION }}
+
     - name: Setup sccache
       uses: mozilla-actions/sccache-action@v0.0.9
-      with:
-        key: rust-sccache
-
-    - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@v2
-      with:
-        shared-key: rust-deps
 
     - name: Run Clippy
       run: cargo clippy --workspace --all-targets --features download-libtorch -- -D warnings
+
+    - name: sccache stats
+      if: always()
+      run: sccache --show-stats
 
   deny:
     name: cargo-deny (bans + licenses)
@@ -51,7 +67,7 @@ jobs:
     - name: Check bans
       # ZMQ crates are deny-listed in deny.toml (#138 complete). This gate must
       # be able to fail — do NOT add `|| true`.
-      # Unset RUSTC_WRAPPER: job-level env: "" doesn't clear workflow-level env on GHA.
+      # No compilation here, so no sccache/AWS. Unset RUSTC_WRAPPER defensively.
       run: |
         unset RUSTC_WRAPPER
         cargo deny check bans licenses
@@ -71,15 +87,14 @@ jobs:
       with:
         targets: wasm32-unknown-unknown
 
+    - name: Configure AWS credentials (OIDC → sccache S3)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ vars.AWS_SCCACHE_ROLE_ARN }}
+        aws-region: ${{ vars.AWS_SCCACHE_REGION }}
+
     - name: Setup sccache
       uses: mozilla-actions/sccache-action@v0.0.9
-      with:
-        key: rust-sccache
-
-    - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@v2
-      with:
-        shared-key: rust-wasm
 
     # Guards the browser/WebTransport build (#225/#226): getrandom wasm_js (Cargo.toml) +
     # the web_sys_unstable_apis rustflag for WebTransport. Catches wasm-only breakage the
@@ -88,6 +103,10 @@ jobs:
       run: cargo check --target wasm32-unknown-unknown -p hyprstream-rpc
       env:
         RUSTFLAGS: "--cfg=web_sys_unstable_apis"
+
+    - name: sccache stats
+      if: always()
+      run: sccache --show-stats
 
   build:
     # MERGE GATE — not a per-PR-push check. The heavy build+test runs in the merge
@@ -102,7 +121,7 @@ jobs:
     # Merge-gate backstop: fail before the merge queue's 120min timeout (ruleset
     # check_response_timeout_minutes) so a hang yields a definitive failure and the
     # queue keeps moving instead of timing out and kicking every queued PR. Healthy
-    # build+test is ~90min (Build ~13m / Run tests ~76m), so 115 leaves margin.
+    # build+test is ~90min (Build ~13m / Run tests ~76min), so 115 leaves margin.
     timeout-minutes: 115
 
     steps:
@@ -111,15 +130,14 @@ jobs:
     - name: Install build dependencies
       run: sudo apt-get update && sudo apt-get install -y capnproto libsystemd-dev pkg-config libssl-dev
 
+    - name: Configure AWS credentials (OIDC → sccache S3)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ vars.AWS_SCCACHE_ROLE_ARN }}
+        aws-region: ${{ vars.AWS_SCCACHE_REGION }}
+
     - name: Setup sccache
       uses: mozilla-actions/sccache-action@v0.0.9
-      with:
-        key: rust-sccache
-
-    - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@v2
-      with:
-        shared-key: rust-deps
 
     - name: Build
       run: cargo build --release --verbose --features download-libtorch
@@ -138,3 +156,7 @@ jobs:
     - name: Run doctests
       # nextest does not run doctests; keep them in the merge gate.
       run: cargo test --release --doc --features download-libtorch
+
+    - name: sccache stats
+      if: always()
+      run: sccache --show-stats
