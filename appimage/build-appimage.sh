@@ -137,6 +137,23 @@ build_binary() {
     log_success "Built hyprstream-$variant"
 }
 
+# Strip host symbol tables from bundled libtorch shared objects.
+# libtorch ships its .so files unstripped; --strip-unneeded removes the symbol table
+# while preserving the dynamic symbols needed for loading/relocation, so runtime
+# behavior (including dlopen of backend libs) is unaffected. GPU device fatbinaries are
+# not touched. Best-effort: any file that can't be stripped is left as-is.
+# NOTE: validate a stripped GPU build actually runs inference before cutting a release.
+strip_libtorch_libs() {
+    local lib_dir="$1"
+    command -v strip &>/dev/null || { log_info "strip not found; skipping"; return 0; }
+    local before after
+    before=$(du -sm "$lib_dir" 2>/dev/null | cut -f1)
+    find "$lib_dir" -type f \( -name '*.so' -o -name '*.so.*' \) -print0 \
+        | xargs -0 -r -n1 strip --strip-unneeded 2>/dev/null || true
+    after=$(du -sm "$lib_dir" 2>/dev/null | cut -f1)
+    log_info "Stripped libtorch libs in $lib_dir: ${before}MB -> ${after}MB"
+}
+
 # Create per-backend AppImage
 create_appimage() {
     local variant="$1"
@@ -151,6 +168,7 @@ create_appimage() {
     cp "$BUILD_DIR/bin/hyprstream-$variant" "$appdir/usr/bin/hyprstream"
     # Copy entire lib directory (includes subdirs with Tensile libraries for ROCm)
     cp -r "$LIBTORCH_CACHE_DIR/$variant/libtorch/lib/"* "$appdir/usr/lib/libtorch/lib/"
+    strip_libtorch_libs "$appdir/usr/lib/libtorch/lib"
 
     sed "s/HYPRSTREAM_VARIANT:-cpu/HYPRSTREAM_VARIANT:-$variant/" \
         "$SCRIPT_DIR/AppRun-single" > "$appdir/AppRun"
@@ -187,6 +205,8 @@ create_universal_appimage() {
             cp -r "$LIBTORCH_CACHE_DIR/$variant/libtorch/lib/"* "$appdir/usr/lib/$variant/libtorch/lib/"
         fi
     done
+
+    strip_libtorch_libs "$appdir/usr/lib"
 
     cp "$SCRIPT_DIR/AppRun" "$appdir/"
     chmod +x "$appdir/AppRun"
