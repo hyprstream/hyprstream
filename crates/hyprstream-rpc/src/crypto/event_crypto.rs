@@ -113,6 +113,78 @@ pub fn build_wrap_aad(sub_hash: &[u8; 32], prefix: &str) -> Vec<u8> {
     aad
 }
 
+// ============================================================================
+// Keyed-topic AEAD (EV3 — confidential profile)
+// ============================================================================
+
+/// Domain separator for the keyed-topic AAD (EV3).
+const TOPIC_AAD_DOMAIN: &str = "hyprstream event-topic-aad v1";
+
+/// Build length-prefixed AAD binding the **keyed routing leaf + epoch** (EV3).
+///
+/// When the semantic topic moves under the payload AEAD (replacing the cleartext
+/// prefix-as-AAD), the AAD MUST bind the keyed topic leaf and the epoch, so a
+/// ciphertext from `(topic A, epoch N)` replayed onto `(topic B, epoch M)` is
+/// rejected by AEAD authentication. Without this binding, replacing the prefix
+/// with an opaque keyed leaf would invite cross-topic / cross-epoch reuse.
+///
+/// Format: `domain || u32_le(len(leaf)) || leaf || epoch_le`
+/// (`leaf` is the hex [`crate::event_subject::topic_leaf`] segment).
+pub fn build_topic_aad(keyed_leaf: &str, epoch: u64) -> Vec<u8> {
+    let leaf = keyed_leaf.as_bytes();
+    let mut aad = Vec::with_capacity(TOPIC_AAD_DOMAIN.len() + 4 + leaf.len() + 8);
+    aad.extend_from_slice(TOPIC_AAD_DOMAIN.as_bytes());
+    aad.extend_from_slice(&(leaf.len() as u32).to_le_bytes());
+    aad.extend_from_slice(leaf);
+    aad.extend_from_slice(&epoch.to_le_bytes());
+    aad
+}
+
+/// Encrypt an event with the **keyed-topic + epoch** bound into the AAD (EV3
+/// confidential profile). Otherwise identical to [`encrypt_event`].
+///
+/// Use when publishing under a [`crate::event_subject::topic_leaf`] routing key;
+/// the recipient reconstructs the same `keyed_leaf` + `epoch` for
+/// [`decrypt_event_keyed`]. The semantic topic name travels inside the encrypted
+/// payload, not in the AAD.
+pub fn encrypt_event_keyed(
+    group_key: &[u8; 32],
+    keyed_leaf: &str,
+    epoch: u64,
+    plaintext: &[u8],
+    _privacy_mode: EventPrivacy,
+) -> Result<(Vec<u8>, Vec<u8>, [u8; 12], [u8; 16]), String> {
+    let nonce = random_nonce();
+    let commitment = key_commitment(group_key, &nonce);
+    let aad = build_topic_aad(keyed_leaf, epoch);
+    let aead_output = aes_gcm_encrypt(group_key, &nonce, plaintext, &aad)?;
+    if aead_output.len() < 16 {
+        return Err("AEAD output too short".to_owned());
+    }
+    let split = aead_output.len() - 16;
+    let ciphertext = aead_output[..split].to_vec();
+    let tag = aead_output[split..].to_vec();
+    Ok((tag, ciphertext, nonce, commitment))
+}
+
+/// Decrypt an event encrypted with [`encrypt_event_keyed`] (keyed-topic + epoch
+/// AAD). The caller must supply the same `keyed_leaf` + `epoch` used at encrypt
+/// time — a mismatch (cross-topic or cross-epoch replay) fails AEAD auth.
+pub fn decrypt_event_keyed(
+    group_key: &[u8; 32],
+    nonce: &[u8; 12],
+    tag: &[u8],
+    ciphertext: &[u8],
+    keyed_leaf: &str,
+    epoch: u64,
+) -> Result<Vec<u8>, String> {
+    let mut combined = Vec::with_capacity(ciphertext.len() + tag.len());
+    combined.extend_from_slice(ciphertext);
+    combined.extend_from_slice(tag);
+    let aad = build_topic_aad(keyed_leaf, epoch);
+    aes_gcm_decrypt(group_key, nonce, &combined, &aad)
+}
+
 /// Derive a wrap key from DH shared secret + pubkey XOR salt.
 ///
 /// Follows the `derive_notification_keys()` convention:
@@ -619,5 +691,35 @@ mod tests {
             encrypt_event(&group_key, prefix, plaintext, EventPrivacy::LimitedKnowledge).unwrap();
         let dec_lk = decrypt_event_full(&group_key, &nonce_lk, &tag_lk, &ct_lk, prefix).unwrap();
         assert_eq!(dec_lk, plaintext);
+    }
+
+    #[test]
+    fn keyed_aead_round_trips_and_binds_topic_epoch() {
+        let group_key = [0x11u8; 32];
+        let plaintext = b"payload-bytes";
+        let leaf = "deadbeef".repeat(8); // 64 hex chars, like topic_leaf output
+        let epoch = 7u64;
+
+        let (tag, ct, nonce, _commitment) =
+            encrypt_event_keyed(&group_key, &leaf, epoch, plaintext, EventPrivacy::ZeroKnowledge)
+                .unwrap();
+        let recovered = decrypt_event_keyed(&group_key, &nonce, &tag, &ct, &leaf, epoch).unwrap();
+        assert_eq!(recovered, plaintext);
+
+        // Cross-epoch replay: same leaf, wrong epoch -> AEAD auth fails.
+        assert!(decrypt_event_keyed(&group_key, &nonce, &tag, &ct, &leaf, epoch + 1).is_err());
+        // Cross-topic replay: wrong leaf, same epoch -> fails.
+        let other_leaf = "cafe".repeat(16);
+        assert!(decrypt_event_keyed(&group_key, &nonce, &tag, &ct, &other_leaf, epoch).is_err());
+        // Wrong group key -> fails.
+        assert!(decrypt_event_keyed(&[0x22u8; 32], &nonce, &tag, &ct, &leaf, epoch).is_err());
+    }
+
+    #[test]
+    fn topic_aad_is_deterministic_and_distinct() {
+        assert_eq!(build_topic_aad("abcd", 1), build_topic_aad("abcd", 1));
+        assert_ne!(build_topic_aad("abcd", 1), build_topic_aad("abcd", 2));
+        assert_ne!(build_topic_aad("abcd", 1), build_topic_aad("abce", 1));
+        assert!(build_topic_aad("abcd", 1).starts_with(b"hyprstream event-topic-aad v1"));
     }
 }
