@@ -42,6 +42,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `cargo test -p hyprstream-workers-wasmtime` transitively builds
+      # hyprstream-rpc, whose build.rs invokes the capnp compiler.
+      - name: Install system deps (capnproto)
+        run: sudo apt-get update && sudo apt-get install -y capnproto pkg-config libssl-dev
+
       - name: Install Rust toolchain (host + wasm targets)
         uses: dtolnay/rust-toolchain@stable
         with:
