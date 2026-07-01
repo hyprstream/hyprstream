@@ -46,9 +46,6 @@ pub mod sandbox_fs;
 pub mod selection;
 mod service;
 pub mod spawner;
-// VirtioFS daemon wrapper (nydus-service) — VM-only.
-#[cfg(feature = "kata-vm")]
-mod virtiofs;
 
 // Generated wire types — canonical OCI/CRI-aligned names (no Gen*/Wire/Enum aliases)
 pub use client::{
@@ -105,8 +102,9 @@ pub use sandbox_fs::{InjectedMounts, SandboxFs, SandboxFsServer, VFS_SOCKET_NAME
 pub use service::WorkerService;
 // Re-export service infrastructure from hyprstream-rpc for convenience
 pub use hyprstream_rpc::service::{EnvelopeContext, ServiceHandle, RequestService};
-#[cfg(feature = "kata-vm")]
-pub use virtiofs::{SandboxVirtiofs, SandboxVirtiofsBuilder};
+// NOTE: the legacy `SandboxVirtiofs` (external-`nydusd` RAFS share) module was
+// removed (#633) — kata's `start()` now serves the composed VFS namespace via
+// `sandbox_fs`/`hyprstream-vfs-server`, not a standalone RAFS share.
 
 /// CRI runtime version
 pub const RUNTIME_VERSION: &str = "0.1.0";

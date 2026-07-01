@@ -27,8 +27,9 @@ use crate::events::{
     serialize_container_started, serialize_container_stopped,
     serialize_sandbox_started, serialize_sandbox_stopped,
 };
-#[cfg(feature = "oci-image")]
-use crate::image::RafsStore;
+// Feature-invariant alias: `Option<Arc<RafsStore>>` when `oci-image` is on,
+// `Option<()>` when off (callers pass `None`). See `RafsStoreOpt` in `lib.rs`.
+use crate::RafsStoreOpt;
 // Import generated wire types (canonical OCI-aligned names)
 use crate::generated::worker_client::{
     // Filter + request types for handler signatures
@@ -66,10 +67,17 @@ pub struct WorkerService {
     /// Sandbox pool for VM management
     sandbox_pool: Arc<SandboxPool>,
 
-    /// RAFS store for image management. Without `oci-image`,
-    /// CRI image operations return a clear "built without oci-image support" error.
-    #[cfg(feature = "oci-image")]
-    rafs_store: Arc<RafsStore>,
+    /// RAFS store for image management. `None` when built without `oci-image`
+    /// (CRI image operations then return a clear "built without oci-image
+    /// support" error). Holding this as an `Option` keeps the struct layout and
+    /// the `new()` signature feature-invariant — only *construction* of the
+    /// store is feature-gated, never the type.
+    ///
+    /// Reads are all inside `#[cfg(feature = "oci-image")]` handler bodies, so
+    /// without the feature this field is only ever written (to `None`) — hence
+    /// the `dead_code` allow for the no-feature build.
+    #[cfg_attr(not(feature = "oci-image"), allow(dead_code))]
+    rafs_store: Option<RafsStoreOpt>,
 
     /// Active containers (container_id -> Container)
     containers: RwLock<HashMap<String, Container>>,
@@ -105,9 +113,10 @@ impl WorkerService {
     pub fn new(
         pool_config: PoolConfig,
         backend: Arc<dyn super::backend::SandboxBackend>,
-        // RAFS image store is the universal image filesystem service; the
-        // parameter is compiled away when `oci-image` is disabled.
-        #[cfg(feature = "oci-image")] rafs_store: Arc<RafsStore>,
+        // RAFS image store — `Some` only when the caller built one (which
+        // requires `oci-image`). The parameter is always present in the
+        // signature; pass `None` for a build without image support.
+        rafs_store: Option<RafsStoreOpt>,
         transport: TransportConfig,
         signing_key: SigningKey,
     ) -> AnyhowResult<Self> {
@@ -119,7 +128,6 @@ impl WorkerService {
         let stream_channel = Arc::new(StreamChannel::new(signing_key.clone()));
         Ok(Self {
             sandbox_pool,
-            #[cfg(feature = "oci-image")]
             rafs_store,
             containers: RwLock::new(HashMap::new()),
             container_sandbox_map: RwLock::new(HashMap::new()),
@@ -1239,10 +1247,12 @@ impl ContainerHandler for WorkerService {
 
 }
 
-// CRI image operations are backed by the RAFS/nydus image store, which only
-// compiles under `oci-image`. When the feature is off the handlers stay wired
-// (the RPC surface is unchanged) but return a clear "built without oci-image
-// support" error instead of failing to compile.
+// CRI image operations are backed by the RAFS/nydus image store, which is only
+// constructed under `oci-image` (held as `Option<RafsStoreOpt>` on the service).
+// When the store is `None` the handlers return a clear "built without oci-image
+// support" error. The method *signatures* are feature-invariant; only the
+// store-touching bodies are cfg-gated, because they reference `crate::image`
+// types that only exist under `oci-image`.
 #[cfg(not(feature = "oci-image"))]
 fn image_ops_unsupported<T>() -> AnyhowResult<T> {
     Err(anyhow::anyhow!(
@@ -1257,21 +1267,20 @@ impl ImageHandler for WorkerService {
         let _ = filter; // filter not yet used
         #[cfg(feature = "oci-image")]
         {
-            let images = self.rafs_store.list_images().await?;
-            Ok(images)
+            let store = self.rafs_store.as_deref()
+                .ok_or_else(|| anyhow::anyhow!("image store not configured"))?;
+            Ok(store.list_images().await?)
         }
         #[cfg(not(feature = "oci-image"))]
-        {
-            image_ops_unsupported()
-        }
+        image_ops_unsupported()
     }
 
     async fn handle_status(&self, _ctx: &EnvelopeContext, _request_id: u64, request: &ImageStatusRequest) -> AnyhowResult<ImageStatusResult> {
         #[cfg(feature = "oci-image")]
         {
-            let image_ref = &request.image.image;
-            let status = self.rafs_store.image_status(image_ref, request.verbose).await?;
-            Ok(status)
+            let store = self.rafs_store.as_deref()
+                .ok_or_else(|| anyhow::anyhow!("image store not configured"))?;
+            Ok(store.image_status(&request.image.image, request.verbose).await?)
         }
         #[cfg(not(feature = "oci-image"))]
         {
@@ -1283,7 +1292,8 @@ impl ImageHandler for WorkerService {
     async fn handle_pull(&self, _ctx: &EnvelopeContext, _request_id: u64, data: &PullImageRequest) -> AnyhowResult<String> {
         #[cfg(feature = "oci-image")]
         {
-            let image_ref = &data.image.image;
+            let store = self.rafs_store.as_deref()
+                .ok_or_else(|| anyhow::anyhow!("image store not configured"))?;
             let auth = if !data.auth.username.is_empty() {
                 Some(crate::image::AuthConfig {
                     username: data.auth.username.clone(),
@@ -1296,8 +1306,7 @@ impl ImageHandler for WorkerService {
             } else {
                 None
             };
-            let image_id = self.rafs_store.pull_with_auth(image_ref, auth.as_ref()).await?;
-            Ok(image_id)
+            Ok(store.pull_with_auth(&data.image.image, auth.as_ref()).await?)
         }
         #[cfg(not(feature = "oci-image"))]
         {
@@ -1309,8 +1318,9 @@ impl ImageHandler for WorkerService {
     async fn handle_remove(&self, _ctx: &EnvelopeContext, _request_id: u64, data: &ImageSpec) -> AnyhowResult<()> {
         #[cfg(feature = "oci-image")]
         {
-            let image_ref = &data.image;
-            self.rafs_store.remove_image(image_ref).await?;
+            let store = self.rafs_store.as_deref()
+                .ok_or_else(|| anyhow::anyhow!("image store not configured"))?;
+            store.remove_image(&data.image).await?;
             Ok(())
         }
         #[cfg(not(feature = "oci-image"))]
@@ -1323,13 +1333,12 @@ impl ImageHandler for WorkerService {
     async fn handle_fs_info(&self, _ctx: &EnvelopeContext, _request_id: u64) -> AnyhowResult<Vec<FilesystemUsage>> {
         #[cfg(feature = "oci-image")]
         {
-            let usage = self.rafs_store.fs_info().await?;
-            Ok(usage)
+            let store = self.rafs_store.as_deref()
+                .ok_or_else(|| anyhow::anyhow!("image store not configured"))?;
+            Ok(store.fs_info().await?)
         }
         #[cfg(not(feature = "oci-image"))]
-        {
-            image_ops_unsupported()
-        }
+        image_ops_unsupported()
     }
 }
 
@@ -1399,6 +1408,7 @@ impl RequestService for WorkerService {
 mod tests {
     use super::*;
     use crate::config::ImageConfig;
+    use crate::image::RafsStore;
     use crate::runtime::{PodSandboxConfig, PodSandboxState, ContainerConfig};
     use hyprstream_rpc::crypto::generate_signing_keypair;
     use hyprstream_rpc::transport::TransportConfig;
@@ -1447,7 +1457,7 @@ mod tests {
         let backend: Arc<dyn crate::runtime::backend::SandboxBackend> = Arc::new(
             crate::runtime::kata_backend::KataBackend::new(image_config, Arc::clone(&rafs_store)),
         );
-        let service = WorkerService::new(pool_config, backend, rafs_store, transport, signing_key)?;
+        let service = WorkerService::new(pool_config, backend, Some(rafs_store), transport, signing_key)?;
         Ok((service, temp_dir))
     }
 

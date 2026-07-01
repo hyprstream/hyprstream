@@ -75,6 +75,19 @@ pub use runtime::{resolve_backend, BackendCtx, BackendRegistration};
 pub use runtime::KataBackend;
 #[cfg(feature = "oci-image")]
 pub use image::RafsStore;
+
+/// Feature-invariant alias so `Option<Arc<RafsStore>>` is spellable in
+/// signatures that must compile with and without `oci-image`. When
+/// `oci-image` is off this resolves to `()`, and callers pass `None`; nothing
+/// in the hot path ever constructs the `()` variant — `None` is the only
+/// well-formed value at runtime when the feature is disabled. Keeping the
+/// type uniform avoids `#[cfg]`-gated struct fields and function parameters
+/// (a viral anti-pattern); only the *construction* of a real `RafsStore` is
+/// feature-gated.
+#[cfg(feature = "oci-image")]
+pub type RafsStoreOpt = std::sync::Arc<RafsStore>;
+#[cfg(not(feature = "oci-image"))]
+pub type RafsStoreOpt = ();
 pub use workflow::WorkflowService;
 pub use events::{
     // Publisher/Subscriber (moq-backed, no ZMQ context needed)

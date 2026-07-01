@@ -730,7 +730,9 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         pool_config,
         backend,
         #[cfg(feature = "kata-vm")]
-        rafs_store,
+        Some(rafs_store),
+        #[cfg(not(feature = "kata-vm"))]
+        None,
         ctx.transport("worker", SocketKind::Rep),
         sk.clone(),
     )?;

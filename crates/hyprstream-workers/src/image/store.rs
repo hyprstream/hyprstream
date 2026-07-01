@@ -1,5 +1,15 @@
 //! RafsStore - Dragonfly-native image storage using nydus-storage
 //!
+//! # TODO (#508 follow-on): make image storage addressable as a 9P service
+//!
+//! `RafsStore` currently manages its on-disk layout (`blobs/`, `bootstrap/`,
+//! `cache/`, `refs/`) and CAS dedup directly via raw `std::fs`/path ops — a
+//! side-channel outside the 9P/VFS namespace. The #633 work moved the *image
+//! filesystem service* (the composed namespace a guest mounts) onto the VFS,
+//! but image *storage* (this CAS) is still bespoke. A future ticket should
+//! expose this store as a 9P/VFS Mount so image content is addressable the
+//! same way everything else under epic #508 is. Out of scope for #633.
+//!
 //! Uses Nydus RAFS format for efficient image storage with:
 //! - Chunk-level deduplication (across all images)
 //! - Lazy loading (on-demand chunk fetch via Dragonfly P2P)
