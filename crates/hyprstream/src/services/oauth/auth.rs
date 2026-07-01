@@ -91,6 +91,17 @@ pub async fn require_bearer_token(
         }
     };
 
+    // DPoP-bound tokens (cnf.jkt) MUST NOT be accepted as plain Bearer (RFC 9449 §7).
+    // A stolen DPoP-bound token presented as Bearer bypasses key-possession binding.
+    if claims.cnf_jkt().is_some() && dpop_proof_str.is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "DPoP error=\"invalid_token\"")],
+            axum::Json(serde_json::json!({"error": "invalid_token", "error_description": "DPoP-bound token must use Authorization: DPoP scheme"})),
+        )
+            .into_response();
+    }
+
     // For DPoP: verify the proof and validate cnf.jkt matches the proof key.
     if let Some(ref proof_str) = dpop_proof_str {
         let method = request.method().as_str();
@@ -111,7 +122,7 @@ pub async fn require_bearer_token(
             }
         };
         // JTI replay prevention for resource requests (RFC 9449 §11.1).
-        if !state.check_and_record_dpop_jti(&proof.jti, proof.iat).await {
+        if !state.check_and_record_dpop_jti(&proof.jti, proof.iat) {
             return (
                 StatusCode::UNAUTHORIZED,
                 [(header::WWW_AUTHENTICATE, "Bearer error=\"invalid_token\"")],

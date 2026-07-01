@@ -11,6 +11,7 @@ using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".mcpScope;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".optional;
+using import "/annotations.capnp".domainType;
 
 # Unified discovery request with union discriminator
 struct DiscoveryRequest {
@@ -217,14 +218,14 @@ struct EntityStatement {
 # Request: push a service's COSE_KeySet (CBOR) for envelope-signing keys
 struct RegisterEnvelopeKeysetRequest {
   # did:web of the service this keyset belongs to
-  serviceDid @0 :Text;
+  serviceDid @0 :Text $domainType("hyprstream_rpc::identity::Did");
   # CBOR-encoded COSE_KeySet (RFC 9052 §7) containing the service's envelope verification keys
   coseKeysetCbor @1 :Data;
 }
 
 # Cached envelope COSE_KeySet
 struct EnvelopeKeyset {
-  serviceDid @0 :Text;
+  serviceDid @0 :Text $domainType("hyprstream_rpc::identity::Did");
   coseKeysetCbor @1 :Data;
   fetchedAt @2 :Int64;
 }

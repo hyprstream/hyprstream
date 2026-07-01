@@ -1818,15 +1818,22 @@ fn main() -> Result<()> {
             let services = config_for_service.services.startup.clone();
 
             match action {
-                ServiceAction::Install { services: filter, start, verbose } => {
+                ServiceAction::Install { services: filter, start, enable, system, systemd_session, verbose } => {
                     let models_dir = config_for_service.models_dir().clone();
+                    let target = if system {
+                        hyprstream_service::ServiceTarget::System
+                    } else if systemd_session {
+                        hyprstream_service::ServiceTarget::UserSession
+                    } else {
+                        hyprstream_service::ServiceTarget::User
+                    };
                     with_runtime(
                         RuntimeConfig {
                             device: DeviceConfig::request_cpu(),
                             multi_threaded: true,
                         },
                         || async move {
-                            handle_service_install(&models_dir, &services, filter, start, verbose).await
+                            handle_service_install(&models_dir, &services, filter, start, enable, target, verbose).await
                         },
                     )?;
                 }
@@ -1990,7 +1997,29 @@ fn main() -> Result<()> {
                                         // Non-policy: swap signing_key to service's own independent key.
                                         // CA key is no longer accessible via ctx.signing_key().
                                         ctx = ctx.swap_signing_key(own_key.clone());
-                                        ctx = ctx.with_service_key(&name, own_key);
+                                        ctx = ctx.with_service_key(&name, own_key.clone());
+
+                                        // In systemd mode the credential dir is flat (%d = secrets_dir).
+                                        // Load our own service-jwt from disk and seed the trust store so
+                                        // that register_service_key() finds it on first call — otherwise
+                                        // the trust store only has pubkeys (jwt: None) from bootstrap-pubkeys
+                                        // and registration is silently skipped.
+                                        if let Ok(Some(jwt_bytes)) = hyprstream_core::auth::identity_store::read_secret(&secrets_dir, "service-jwt") {
+                                            if let Ok(jwt_str) = String::from_utf8(jwt_bytes) {
+                                                let exp = hyprstream_core::auth::identity_store::decode_jwt_exp_raw(&jwt_str).unwrap_or(0);
+                                                hyprstream_service::global_trust_store().insert(
+                                                    own_key.verifying_key(),
+                                                    hyprstream_service::Attestation {
+                                                        scopes: std::iter::once(name.clone()).collect(),
+                                                        subject: None,
+                                                        jwt: Some(jwt_str),
+                                                        expires_at: exp,
+                                                        attested_by: None,
+                                                    },
+                                                );
+                                                tracing::info!(service = %name, "Seeded trust store with own service-jwt from credential dir");
+                                            }
+                                        }
                                     }
                                 } else {
                                     // Single-process mode: load keys from disk (same as IPC).
@@ -2029,11 +2058,30 @@ fn main() -> Result<()> {
                                         secrets_dir.display()
                                     );
 
-                                    // Load signing keys for each service being started
+                                    // Load signing keys for each service being started, and
+                                    // seed own service-jwt into trust store so register_service_key
+                                    // can find it on first call (trust store starts with jwt: None).
                                     for svc_name in &service_names {
                                         let svc_key = hyprstream_core::auth::identity_store::load_or_generate_service_signing_key(&secrets_dir, svc_name)
                                             .with_context(|| format!("Failed to load signing key for service '{}'", svc_name))?;
-                                        ctx = ctx.with_service_key(svc_name, svc_key);
+                                        ctx = ctx.with_service_key(svc_name, svc_key.clone());
+
+                                        if svc_name != "policy" {
+                                            if let Ok(Some(jwt_str)) = hyprstream_core::auth::identity_store::load_service_jwt(&secrets_dir, svc_name) {
+                                                let exp = hyprstream_core::auth::identity_store::decode_jwt_exp_raw(&jwt_str).unwrap_or(0);
+                                                hyprstream_service::global_trust_store().insert(
+                                                    svc_key.verifying_key(),
+                                                    hyprstream_service::Attestation {
+                                                        scopes: std::iter::once(svc_name.clone()).collect(),
+                                                        subject: None,
+                                                        jwt: Some(jwt_str),
+                                                        expires_at: exp,
+                                                        attested_by: None,
+                                                    },
+                                                );
+                                                tracing::info!(service = %svc_name, "Seeded trust store with own service-jwt from credential dir");
+                                            }
+                                        }
                                     }
                                 }
 
@@ -2207,7 +2255,7 @@ fn main() -> Result<()> {
 
                                     // Publish ready events for this stage before starting the next.
                                     for svc_name in stage {
-                                        if let Ok(mut publisher) =
+                                        if let Ok(publisher) =
                                             hyprstream_workers::EventPublisher::new("system")
                                         {
                                             let _ = publisher
@@ -2234,7 +2282,7 @@ fn main() -> Result<()> {
 
                                 // Stop all services
                                 for (svc_name, mut handle) in handles {
-                                    if let Ok(mut publisher) =
+                                    if let Ok(publisher) =
                                         hyprstream_workers::EventPublisher::new("system")
                                     {
                                         let _ = publisher
@@ -2292,7 +2340,7 @@ fn main() -> Result<()> {
                             multi_threaded: true,
                         },
                         || async move {
-                            handle_service_install(&models_dir, &services, None, false, verbose).await
+                            handle_service_install(&models_dir, &services, None, false, false, hyprstream_service::ServiceTarget::User, verbose).await
                         },
                     )?;
                 }

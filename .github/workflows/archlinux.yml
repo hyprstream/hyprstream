@@ -6,7 +6,6 @@ on:
     paths:
       - 'archlinux/**'
   pull_request:
-    branches: [ "main" ]
     paths:
       - 'archlinux/**'
   release:
