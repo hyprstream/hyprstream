@@ -125,12 +125,6 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
         .route("/api/device/challenge", post(device_enrollment::device_challenge_handler))
         .route("/api/device/enroll", post(device_enrollment::device_enroll_handler))
         .route("/oauth/revoke", post(revocation::revoke_token))
-        // Phase 0c — did:web document endpoints
-        .route("/.well-known/did.json", get(did_document::root_did_document))
-        // atproto handle→DID HTTP resolution (#500) — plaintext bare DID
-        .route("/.well-known/atproto-did", get(did_document::atproto_did))
-        .route("/users/:username/did.json", get(did_document::user_did_document))
-        .route("/clients/:client_id/did.json", get(did_document::client_did_document))
         .route("/oauth/logout", post(handle_logout))
         .route(
             "/oauth/external/authorize/:provider",
@@ -182,21 +176,41 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             auth::require_bearer_token,
         ));
 
-    let mut router = public_router
-        .merge(protected_router)
-        .layer(axum::middleware::from_fn(
-            |req: axum::extract::Request, next: axum::middleware::Next| async move {
-                let method = req.method().clone();
-                let uri = req.uri().clone();
-                tracing::info!(%method, %uri, "OAuth request");
-                next.run(req).await
-            },
-        ));
+    // ── DID-document routes ──────────────────────────────────────────────────────
+    // Public, secret-free GET endpoints (did:web + atproto handle resolution).
+    // Per W3C DID Core a DID document is an open identity anchor that must be
+    // fetchable cross-origin with arbitrary request headers, so these get their own
+    // permissive-header CORS layer (CorsConfig::did_document) — kept separate from
+    // the broad public router so the relaxation never reaches secret-bearing
+    // endpoints like /oauth/token (closes #472).
+    let mut did_router = Router::new()
+        // Phase 0c — did:web document endpoints
+        .route("/.well-known/did.json", get(did_document::root_did_document))
+        // atproto handle→DID HTTP resolution (#500) — plaintext bare DID
+        .route("/.well-known/atproto-did", get(did_document::atproto_did))
+        .route("/users/:username/did.json", get(did_document::user_did_document))
+        .route("/clients/:client_id/did.json", get(did_document::client_did_document));
 
-    // CORS outermost (added last = runs first on request)
+    let mut api_router = public_router.merge(protected_router);
+
+    // CORS innermost per route-group, before the shared logging layer.
+    // The broad router keeps the restrictive header allowlist; only the DID routes
+    // opt into permissive headers, and only their paths carry that CORS layer.
     if cors_config.enabled {
-        router = router.layer(crate::server::middleware::cors_layer(cors_config));
+        api_router = api_router.layer(crate::server::middleware::cors_layer(cors_config));
+        did_router = did_router.layer(crate::server::middleware::cors_layer(
+            &crate::config::CorsConfig::did_document(),
+        ));
     }
+
+    let router = api_router.merge(did_router).layer(axum::middleware::from_fn(
+        |req: axum::extract::Request, next: axum::middleware::Next| async move {
+            let method = req.method().clone();
+            let uri = req.uri().clone();
+            tracing::info!(%method, %uri, "OAuth request");
+            next.run(req).await
+        },
+    ));
 
     router.with_state(state)
 }
