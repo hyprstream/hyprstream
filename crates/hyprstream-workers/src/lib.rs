@@ -51,10 +51,11 @@ pub mod error;
 pub use hyprstream_rpc::paths;
 
 pub mod runtime;
-// The `image` module is the RAFS/nydus image store — only the VM path consumes
-// it. Gated behind `kata-vm`; the lightweight nspawn backend bind-mounts the
-// host root and never touches RAFS.
-#[cfg(feature = "kata-vm")]
+// The `image` module is the universal mountable OCI/RAFS image filesystem
+// service (#633): `RafsStore` + `ImageFs` (an `FsMount`). Any backend that
+// composes an image filesystem consumes it; it no longer requires the VM
+// toolchain. Gated behind `oci-image` (which `kata-vm` implies).
+#[cfg(feature = "oci-image")]
 pub mod image;
 pub mod workflow;
 pub mod events;
@@ -72,7 +73,7 @@ pub use runtime::{WorkerService, SandboxBackend, SandboxHandle, NspawnBackend, N
 pub use runtime::{resolve_backend, BackendCtx, BackendRegistration};
 #[cfg(feature = "kata-vm")]
 pub use runtime::KataBackend;
-#[cfg(feature = "kata-vm")]
+#[cfg(feature = "oci-image")]
 pub use image::RafsStore;
 pub use workflow::WorkflowService;
 pub use events::{

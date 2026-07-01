@@ -1,7 +1,7 @@
-//! Per-sandbox **RootfsMount** (FS-B, #363).
+//! **ImageFs** — a universal mountable OCI/RAFS image filesystem service (#633,
+//! spine of epic #508).
 //!
-//! Builds the rootfs filesystem for a sandbox as an
-//! [`FsMount`](hyprstream_vfs::FsMount): an `OverlayFs` whose
+//! An `ImageFs` is an [`FsMount`](hyprstream_vfs::FsMount): an `OverlayFs` whose
 //!
 //! - **lower** is the image's RAFS loaded **in-process** as a
 //!   `fuse_backend_rs::FileSystem` (via `nydus-rafs`'s [`Rafs`], which also
@@ -10,6 +10,12 @@
 //!   nothing is materialised on disk up front; and
 //! - **upper** is a per-sandbox writable directory (the copy-up / whiteout
 //!   target), so writes never touch the shared image.
+//!
+//! "Root" is a mount position, not a type: an `ImageFs` mounted at `/` is the
+//! root purely because the namespace recipe mounted it there. Any backend can
+//! compose one — kata serves it to its guest via virtio-fs today, and
+//! podman/nspawn/wasm wiring is a follow-on (TODO, #633). This module compiles
+//! under the `oci-image` feature alone, with no VM toolchain required.
 //!
 //! Composition is delegated to FS-C's
 //! [`rootfs_overlay`](hyprstream_vfs::overlay::rootfs_overlay) — copy-on-write,
@@ -20,7 +26,7 @@
 //! `FsMount` trait with zero churn here.
 //!
 //! ```text
-//!            RootfsMount  (FsMount)
+//!            ImageFs  (FsMount)
 //!                 │
 //!         OverlayFs (FS-C rootfs_overlay)
 //!          ┌──────┴──────┐
@@ -49,6 +55,16 @@ use hyprstream_vfs::overlay::{layer_from_fs, rootfs_overlay};
 use hyprstream_vfs::{FsMount, FuseFileSystemMount, ZeroOpenLayer};
 
 use crate::error::{Result, WorkerError};
+
+/// The concrete type of a mountable OCI/RAFS image filesystem service.
+///
+/// An `OverlayFs` (FS-C's production overlay) over an in-process RAFS lower and
+/// a per-sandbox writable upper. This is what [`image_fs_for`] /
+/// [`RafsStore::image_fs`](crate::image::RafsStore::image_fs) build; it
+/// implements [`FsMount`], so a backend composes it into a namespace at whatever
+/// mount position it chooses (at `/` it is the root purely by virtue of the
+/// mount). "Root" is a mount position, not a type.
+pub type ImageFs = FuseFileSystemMount<OverlayFs>;
 
 /// Subdirectory under a sandbox dir holding the writable rootfs overlay state.
 const ROOTFS_SUBDIR: &str = "rootfs";
@@ -136,30 +152,30 @@ fn prepare_upper(sandbox_dir: &Path) -> Result<(PathBuf, PathBuf)> {
     Ok((upper, work))
 }
 
-/// Build a sandbox **RootfsMount** from an already-loaded RAFS lower and explicit
+/// Build an [`ImageFs`] from an already-loaded RAFS lower and explicit
 /// upper/work directories.
 ///
 /// The lowest-level constructor: callers that hold a [`Rafs`] (e.g. tests, or a
 /// future caller that loaded RAFS itself) compose it here. Wraps the RAFS as the
 /// single read-only overlay lower and `upper` as the writable layer via FS-C's
 /// [`rootfs_overlay`].
-pub fn rootfs_mount_from_rafs(
+pub fn image_fs_from_rafs(
     rafs: Rafs,
     upper: &Path,
     work: &Path,
 ) -> Result<FuseFileSystemMount<OverlayFs>> {
     let upper_layer = hyprstream_vfs::overlay::passthrough_layer(upper)
-        .map_err(|e| WorkerError::RafsError(format!("rootfs upper layer: {e}")))?;
+        .map_err(|e| WorkerError::RafsError(format!("image-fs upper layer: {e}")))?;
     // The RAFS `Rafs` implements `Layer`, but it is *handleless* (`open` yields
     // no handle), which OverlayFs rejects as ENOENT for a lower. Wrap it in
     // `ZeroOpenLayer` so it presents a constant handle; reads still resolve by
     // inode and writes copy-up to the (handle-based) upper.
     let lower_layer = layer_from_fs(ZeroOpenLayer::new(rafs));
     rootfs_overlay(upper_layer, vec![lower_layer], work)
-        .map_err(|e| WorkerError::RafsError(format!("rootfs overlay: {e}")))
+        .map_err(|e| WorkerError::RafsError(format!("image-fs overlay: {e}")))
 }
 
-/// Build a sandbox **RootfsMount** for `image_id`.
+/// Build an [`ImageFs`] for `image_id`.
 ///
 /// * `bootstrap_path` — the image's RAFS bootstrap (`.meta`).
 /// * `blobs_dir` — the image store's blobs directory (RAFS data blobs).
@@ -167,11 +183,12 @@ pub fn rootfs_mount_from_rafs(
 /// * `sandbox_dir` — the per-sandbox directory; the writable upper + work dirs
 ///   are created under `<sandbox_dir>/rootfs/`.
 ///
-/// Returns the rootfs [`FsMount`]: the RAFS image is the read-only lower, a
+/// Returns the image [`FsMount`]: the RAFS image is the read-only lower, a
 /// per-sandbox directory is the writable upper, composed via `OverlayFs`. The
 /// shared image (RAFS bootstrap + blobs) is never written to — copy-ups and
-/// whiteouts land in the upper.
-pub fn rootfs_mount_for(
+/// whiteouts land in the upper. Mount it wherever the namespace recipe chooses;
+/// at `/` it is the root purely by virtue of the mount position.
+pub fn image_fs_for(
     bootstrap_path: &Path,
     blobs_dir: &Path,
     image_id: &str,
@@ -179,18 +196,18 @@ pub fn rootfs_mount_for(
 ) -> Result<impl FsMount> {
     let rafs = load_rafs_lower(bootstrap_path, blobs_dir, image_id)?;
     let (upper, work) = prepare_upper(sandbox_dir)?;
-    rootfs_mount_from_rafs(rafs, &upper, &work)
+    image_fs_from_rafs(rafs, &upper, &work)
 }
 
 impl crate::image::RafsStore {
-    /// Build the rootfs [`FsMount`] for an image into a per-sandbox directory.
+    /// Build the image [`FsMount`] for an image into a per-sandbox directory.
     ///
     /// Resolves the image's RAFS bootstrap and blobs from this store, loads the
     /// RAFS in-process as the read-only lower, and overlays a per-sandbox
-    /// writable upper under `<sandbox_dir>/rootfs/`. See [`rootfs_mount_for`].
-    pub fn rootfs_mount(&self, image_id: &str, sandbox_dir: &Path) -> Result<impl FsMount> {
+    /// writable upper under `<sandbox_dir>/rootfs/`. See [`image_fs_for`].
+    pub fn image_fs(&self, image_id: &str, sandbox_dir: &Path) -> Result<impl FsMount> {
         let bootstrap = self.bootstrap_path(image_id);
-        rootfs_mount_for(&bootstrap, self.blobs_dir(), image_id, sandbox_dir)
+        image_fs_for(&bootstrap, self.blobs_dir(), image_id, sandbox_dir)
     }
 }
 
@@ -286,7 +303,7 @@ mod tests {
         let before = blobs_snapshot(&blobs_dir);
 
         let sandbox = tmp.path().join("sandbox-1");
-        let mount = rootfs_mount_for(&bootstrap, &blobs_dir, "img:test", &sandbox).unwrap();
+        let mount = image_fs_for(&bootstrap, &blobs_dir, "img:test", &sandbox).unwrap();
         let subj = Subject::new("test");
 
         // 1. Read a file present only in the RAFS lower.
@@ -349,7 +366,7 @@ mod tests {
         std::fs::create_dir_all(&blobs).unwrap();
         let bootstrap = tmp.path().join("nope.meta");
         let sandbox = tmp.path().join("sandbox");
-        let err = rootfs_mount_for(&bootstrap, &blobs, "img:missing", &sandbox);
+        let err = image_fs_for(&bootstrap, &blobs, "img:missing", &sandbox);
         assert!(err.is_err(), "missing RAFS bootstrap must hard-error");
     }
 }

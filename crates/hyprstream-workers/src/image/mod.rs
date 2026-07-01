@@ -35,10 +35,11 @@ mod manifest;
 // `pub(crate)` so sibling-module tests (e.g. runtime::sandbox_fs, FS-D #365)
 // can synthesize RAFS images. The builder fn stays crate-internal.
 pub(crate) mod rafs_builder;
-// FS-B (#363): per-sandbox RootfsMount = OverlayFs(in-process RAFS lower +
+// #633 (spine of #508): the universal mountable OCI/RAFS image filesystem
+// service — `ImageFs`, an `FsMount` = OverlayFs(in-process RAFS lower +
 // writable upper). Native-only (the overlay/RAFS FileSystem stack is Linux).
 #[cfg(not(target_arch = "wasm32"))]
-mod rootfs_mount;
+mod image_fs;
 mod store;
 
 pub use crate::generated::worker_client::{
@@ -47,5 +48,5 @@ pub use crate::generated::worker_client::{
 };
 pub use manifest::{ImageReference, ManifestFetcher, ManifestResult, OciManifest};
 #[cfg(not(target_arch = "wasm32"))]
-pub use rootfs_mount::{rootfs_mount_for, rootfs_mount_from_rafs};
+pub use image_fs::{image_fs_for, image_fs_from_rafs, ImageFs};
 pub use store::{GcStats, ImageMetadata, RafsStore};
