@@ -725,7 +725,7 @@ pub fn notification_mac(mac_key: &[u8], data: &[u8]) -> Result<Vec<u8>, JsError>
 
     let mut key = [0u8; 32];
     key.copy_from_slice(mac_key);
-    let mac = crate::crypto::notification::notification_mac(&key, data);
+    let mac = crate::crypto::broadcast_primitives::notification_mac(&key, data);
     Ok(mac.to_vec())
 }
 
@@ -758,7 +758,7 @@ pub fn notification_mac_verify(
     let mut mac = [0u8; 32];
     mac.copy_from_slice(expected_mac);
 
-    Ok(crate::crypto::notification::notification_mac_verify(&key, data, &mac).is_ok())
+    Ok(crate::crypto::broadcast_primitives::notification_mac_verify(&key, data, &mac).is_ok())
 }
 
 /// Build length-prefixed AAD for notification payload encryption/decryption.
@@ -777,7 +777,7 @@ pub fn notification_mac_verify(
 /// AAD bytes for use with aes_gcm_encrypt/decrypt
 #[wasm_bindgen]
 pub fn notification_build_payload_aad(intent_id: &str, scope: &str) -> Vec<u8> {
-    crate::crypto::notification::build_payload_aad(intent_id, scope)
+    crate::crypto::broadcast_primitives::build_payload_aad(intent_id, scope)
 }
 
 /// Compute a 128-bit pubkey fingerprint: `Blake3(pubkey)[..16]`.
@@ -798,7 +798,7 @@ pub fn notification_pubkey_fingerprint(pubkey: &[u8]) -> Result<Vec<u8>, JsError
     }
     let mut pk = [0u8; 32];
     pk.copy_from_slice(pubkey);
-    Ok(crate::crypto::notification::pubkey_fingerprint(&pk).to_vec())
+    Ok(crate::crypto::broadcast_primitives::pubkey_fingerprint(&pk).to_vec())
 }
 
 /// Build the Ed25519 attestation message for publisher identity verification.
@@ -834,7 +834,7 @@ pub fn notification_build_attestation_message(
     let mut bp = [0u8; 32];
     bp.copy_from_slice(blinded_sub_pubkey);
 
-    Ok(crate::crypto::notification::build_attestation_message(&ep, &bp, scope, intent_id))
+    Ok(crate::crypto::broadcast_primitives::build_attestation_message(&ep, &bp, scope, intent_id))
 }
 
 /// Sign an Ed25519 attestation for publisher identity binding.

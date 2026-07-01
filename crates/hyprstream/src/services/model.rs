@@ -33,7 +33,7 @@ use crate::runtime::KVQuantType;
 use crate::runtime::RuntimeConfig;
 use crate::services::{
     EnvelopeContext,
-    NotificationClient, NotificationPublisher, PolicyClient,
+    PolicyClient,
 };
 use crate::services::generated::inference_client::InferenceClient;
 use crate::services::RegistryClient;
@@ -42,6 +42,7 @@ use crate::services::generated::policy_client::PolicyCheck;
 use crate::storage::ModelRef;
 use anyhow::{anyhow, Result};
 use hyprstream_rpc::prelude::*;
+use hyprstream_rpc::events::EventPublisher;
 use hyprstream_rpc::registry::{global as registry, SocketKind};
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc::stream_info::TransportConfig as WireTransportConfig;
@@ -130,8 +131,9 @@ pub struct ModelServiceInner {
     signing_key: SigningKey,
     /// Policy client for authorization checks in InferenceService
     policy_client: PolicyClient,
-    /// Notification publisher for model lifecycle events
-    notification_publisher: NotificationPublisher,
+    /// Event publisher for model lifecycle events (replaces NotificationService, EV5/#605).
+    /// Plaintext (Public) path; the encrypted-default flip is deferred to #555.
+    event_publisher: EventPublisher,
     /// Registry client for resolving model paths
     registry: RegistryClient,
     // Infrastructure (for Spawnable)
@@ -229,21 +231,9 @@ impl ModelService {
         };
         let cache_size = NonZeroUsize::new(config.max_models).unwrap_or(DEFAULT_CACHE_SIZE);
 
-        let key_resp = policy_client.resolve_service_key(
-            &crate::services::generated::policy_client::ResolveServiceKey {
-                service_name: "notification".to_owned(),
-            },
-        ).await?;
-        let notif_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
-            key_resp.verifying_key.as_slice().try_into()
-                .map_err(|_| anyhow!("Invalid verifying key length"))?,
-        ).map_err(|e| anyhow!("Invalid Ed25519 key: {e}"))?;
-        let notif_client = NotificationClient::for_service(
-            signing_key.clone(),
-            notif_vk,
-            None,
-        )?;
-        let notification_publisher = NotificationPublisher::new(notif_client, signing_key.clone());
+        // EV5/#605: model lifecycle events now ride the unified EventService
+        // (plaintext Public path); the parallel NotificationService is removed.
+        let event_publisher = EventPublisher::new("model")?;
 
         Ok(Self { inner: Arc::new(ModelServiceInner {
             loaded_models: RwLock::new(LruCache::new(cache_size)),
@@ -251,7 +241,7 @@ impl ModelService {
             config,
             signing_key,
             policy_client,
-            notification_publisher,
+            event_publisher,
             registry,
             transport,
             expected_audience: None,
@@ -783,7 +773,7 @@ impl ModelService {
                 },
             );
             if let Ok(payload) = serde_json::to_vec(&event) {
-                let _ = self.notification_publisher.publish(&scope, &payload).await;
+                let _ = self.event_publisher.publish("lifecycle", "unloaded", &payload).await;
             }
             Ok(())
         } else {
@@ -1669,9 +1659,8 @@ impl crate::services::RequestService for ModelService {
                             },
                         );
                         if let Ok(payload) = serde_json::to_vec(&event) {
-                            let n = service.notification_publisher.publish(&scope, &payload).await
-                                .unwrap_or(0);
-                            debug!("Published model.loaded to {} subscriber(s)", n);
+                            let _ = service.event_publisher.publish("lifecycle", "loaded", &payload).await;
+                            debug!("Published model.loaded event");
                         }
                     }
                     Err(e) => {
@@ -1685,7 +1674,7 @@ impl crate::services::RequestService for ModelService {
                             },
                         );
                         if let Ok(payload) = serde_json::to_vec(&event) {
-                            let _ = service.notification_publisher.publish(&scope, &payload).await;
+                            let _ = service.event_publisher.publish("lifecycle", "failed", &payload).await;
                         }
                     }
                 }

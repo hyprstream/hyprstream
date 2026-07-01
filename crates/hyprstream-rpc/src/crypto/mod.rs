@@ -35,6 +35,7 @@ pub mod group_key;
 pub mod hmac;
 pub mod key_exchange;
 pub mod notification;
+pub mod broadcast_primitives;
 pub mod pq;
 pub mod signing;
 
