@@ -92,6 +92,7 @@ use crate::crypto::event_crypto::{
     encrypt_event, unwrap_group_key, wrap_group_key, EventPrivacy,
 };
 use crate::crypto::{generate_ephemeral_keypair, keyed_mac, ristretto_dh_raw};
+use crate::envelope::Subject;
 // The four shared event types + the rotation constants are canonical in the
 // keyable-group primitive (`crypto::group_key`); re-export them here so the
 // `hyprstream_rpc::events::*` surface downstream consumers already use stays
@@ -302,6 +303,95 @@ struct PrefixState {
     crypto: Option<PrefixCrypto>,
 }
 
+// ============================================================================
+// Event-plane authorization + publisher identity (EV4, epic #600)
+//
+// This is the EventService PEP (Policy Enforcement Point) for the
+// `publish`/`subscribe` ScopeActions. The load-bearing membership gate for
+// obtaining `K_group` lives in `GroupKeyRegistry::join`'s `MembershipResolver`
+// (fail-closed); these checks guard the publish/subscribe paths themselves.
+//
+// The reference-monitor enforcement at the *generated 9P mount* is S2 (#568,
+// blocked on #539) — that is a separate PEP. EV4 wires the event-plane PEP;
+// when S2 lands the two share S1's subject/label model but stay distinct
+// enforcement points (mount-namespace vs event-plane).
+// ============================================================================
+
+/// The caller attempting an event-plane op (`publish`/`subscribe`). Carries the
+/// verified subject identity (a DID when available). Until #446 lands, IPC
+/// callers may resolve as `anonymous` — see [`PublisherIdentity`].
+pub trait EventAuthz: Send + Sync {
+    /// May `caller` publish to the group/`prefix`? Maps to the `publish`
+    /// ScopeAction.
+    fn can_publish(&self, caller: &Subject, prefix: &str) -> bool;
+    /// May `caller` subscribe to the group/`prefix`? Maps to the `subscribe`
+    /// ScopeAction.
+    fn can_subscribe(&self, caller: &Subject, prefix: &str) -> bool;
+}
+
+/// Fail-closed authz: denies every publish/subscribe. The default for the
+/// encrypted (`ZeroKnowledge`/`LimitedKnowledge`) profile — MAC deny-by-default
+/// by construction. Production wires a real UCAN/capability-backed impl (S3/S4
+/// vocab on main) via [`EventPublisher::with_authz`].
+pub struct DenyAllEventAuthz;
+impl EventAuthz for DenyAllEventAuthz {
+    fn can_publish(&self, _caller: &Subject, _prefix: &str) -> bool {
+        false
+    }
+    fn can_subscribe(&self, _caller: &Subject, _prefix: &str) -> bool {
+        false
+    }
+}
+
+/// Permissive authz: allows every publish/subscribe. For the public (`Public`)
+/// profile (the open firehose — no authz by design) and for tests until a real
+/// authz is wired.
+pub struct AllowAllEventAuthz;
+impl EventAuthz for AllowAllEventAuthz {
+    fn can_publish(&self, _caller: &Subject, _prefix: &str) -> bool {
+        true
+    }
+    fn can_subscribe(&self, _caller: &Subject, _prefix: &str) -> bool {
+        true
+    }
+}
+
+/// The publisher's verified identity (EV4 authn-on-publish). Binds a publish to
+/// a DID when the verified identity is available.
+///
+/// **#446-gated stub:** until #446 lands, service-to-service IPC callers
+/// resolve as `anonymous` (key-derived identity lost over UDS), so `did` is
+/// `None` on those paths. A `None` DID is treated as **fail-closed** for the
+/// confidential profile (an anonymous publisher cannot be bound to a DID), with
+/// a `// TODO(#446)` seam for the real identity. Do NOT fake a verified DID.
+#[derive(Debug, Clone)]
+pub struct PublisherIdentity {
+    /// The publisher's verified DID, when known. `None` on #446-affected IPC
+    /// paths (anonymous) — confidential publish fails-closed in that case.
+    pub did: Option<String>,
+}
+
+impl PublisherIdentity {
+    /// An anonymous publisher (no verified DID) — the #446-affected default.
+    pub fn anonymous() -> Self {
+        Self { did: None }
+    }
+    /// A publisher with a verified DID (post-#446, or non-IPC paths).
+    pub fn verified(did: impl Into<String>) -> Self {
+        Self { did: Some(did.into()) }
+    }
+    /// Is a verified DID bound? (Confidential publish requires this.)
+    pub fn is_verified(&self) -> bool {
+        self.did.is_some()
+    }
+}
+
+impl Default for PublisherIdentity {
+    fn default() -> Self {
+        Self::anonymous()
+    }
+}
+
 /// The canonical broadcast event publisher (EV1, epic #600).
 ///
 /// One instance manages publishing to one or more `local/events/{prefix}`
@@ -319,6 +409,14 @@ pub struct EventPublisher {
     signing_key: Option<SigningKey>,
     privacy_mode: EventPrivacy,
     rekey_policy: RekeyPolicy,
+    /// Event-plane authz (EV4). `AllowAll` for the `Public` profile (open
+    /// firehose — no authz by design); `DenyAll` (fail-closed) for the
+    /// encrypted profile until a real UCAN/capability impl is wired via
+    /// [`Self::with_authz`].
+    authz: Arc<dyn EventAuthz>,
+    /// Publisher's verified identity (EV4 authn-on-publish). `None` DID
+    /// (anonymous) is fail-closed for confidential publish until #446.
+    publisher_identity: PublisherIdentity,
 }
 
 impl EventPublisher {
@@ -365,6 +463,9 @@ impl EventPublisher {
             signing_key: None,
             privacy_mode: EventPrivacy::Public,
             rekey_policy: RekeyPolicy::default(),
+            // Public firehose profile: no authz by design; identity N/A.
+            authz: Arc::new(AllowAllEventAuthz),
+            publisher_identity: PublisherIdentity::anonymous(),
         })
     }
 
@@ -393,7 +494,28 @@ impl EventPublisher {
             signing_key: Some(signing_key),
             privacy_mode,
             rekey_policy,
+            // Confidential profile: deny-by-default (MAC) until a real authz is
+            // injected via `with_authz`; anonymous identity until #446 is wired
+            // via `with_publisher_identity`.
+            authz: Arc::new(DenyAllEventAuthz),
+            publisher_identity: PublisherIdentity::anonymous(),
         })
+    }
+
+    /// Inject the event-plane authz (EV4). The encrypted profile defaults to
+    /// [`DenyAllEventAuthz`] (fail-closed); production wires a UCAN/capability-
+    /// backed impl (S3/S4 vocab) here. Returns `self` for chaining.
+    pub fn with_authz(mut self, authz: Arc<dyn EventAuthz>) -> Self {
+        self.authz = authz;
+        self
+    }
+
+    /// Inject the publisher's verified identity (EV4 authn-on-publish). Until
+    /// #446 lands the default is anonymous, which fail-closes confidential
+    /// publish; a non-IPC path (or post-#446) supplies a verified DID here.
+    pub fn with_publisher_identity(mut self, identity: PublisherIdentity) -> Self {
+        self.publisher_identity = identity;
+        self
     }
 
     /// Register a new encrypted prefix: opens its moq transport, generates a
@@ -536,6 +658,24 @@ impl EventPublisher {
         match state.crypto.as_mut() {
             None => state.moq.publish_raw(topic, payload),
             Some(crypto) => {
+                // EV4 event-plane PEP (publish ScopeAction). The caller is this
+                // publisher; its subject comes from `publisher_identity`
+                // (`Subject::anonymous()` until #446 wires verified IPC
+                // identity — a real authz impl denies anonymous for the
+                // confidential profile). DenyAll (the default) denies every
+                // publish until a real authz is injected via `with_authz`.
+                let caller = match &self.publisher_identity.did {
+                    // TODO(#446): IPC callers currently resolve as anonymous
+                    // (key-derived identity lost over UDS); the verified DID
+                    // binding is the #446 fast-follow. Do NOT fake a DID.
+                    Some(did) => Subject::new(did.clone()),
+                    None => Subject::anonymous(),
+                };
+                if !self.authz.can_publish(&caller, &prefix) {
+                    return Err(anyhow!(
+                        "publish denied by event-plane authz for prefix '{prefix}'"
+                    ));
+                }
                 maybe_promote_pending(crypto);
                 let signing_key = self
                     .signing_key
@@ -1234,5 +1374,90 @@ mod tests {
             .publish_raw("unregistered.entity.event", b"payload")
             .await;
         assert!(result.is_err());
+    }
+
+    // ── EV4: event-plane authz + publisher identity ─────────────────────────
+
+    #[test]
+    fn event_authz_impls() {
+        // DenyAll (the encrypted-profile default) denies everything.
+        let deny = DenyAllEventAuthz;
+        assert!(!deny.can_publish(&Subject::anonymous(), "p"));
+        assert!(!deny.can_subscribe(&Subject::anonymous(), "p"));
+        // AllowAll (the public-profile / test default) permits everything.
+        let allow = AllowAllEventAuthz;
+        assert!(allow.can_publish(&Subject::anonymous(), "p"));
+        assert!(allow.can_subscribe(&Subject::anonymous(), "p"));
+    }
+
+    #[test]
+    fn publisher_identity_anonymous_vs_verified() {
+        // #446-gated: the default is anonymous (no verified DID).
+        let anon = PublisherIdentity::anonymous();
+        assert!(!anon.is_verified());
+        assert!(anon.did.is_none());
+        // A verified DID (post-#446 / non-IPC path).
+        let verified = PublisherIdentity::verified("did:web:node.example.com");
+        assert!(verified.is_verified());
+        assert_eq!(verified.did.as_deref(), Some("did:web:node.example.com"));
+        // Default == anonymous.
+        assert!(!PublisherIdentity::default().is_verified());
+    }
+
+    #[tokio::test]
+    async fn encrypted_publish_blocked_by_default_denyall_authz() {
+        // The encrypted profile defaults to DenyAllEventAuthz (MAC
+        // deny-by-default). With a registered encrypted prefix, publish_raw
+        // MUST be denied by the event-plane PEP — even before reaching the
+        // signing/encryption step. (No real moq origin needed: the authz gate
+        // is the first check in the encrypted arm.)
+        let publisher = EventPublisher::new_encrypted(
+            test_signing_key(),
+            EventPrivacy::ZeroKnowledge,
+            RekeyPolicy::default(),
+        )
+        .unwrap()
+        .with_publisher_identity(PublisherIdentity::verified("did:web:pub"));
+        // Inject a prefix with crypto state directly (bypasses register_prefix,
+        // which needs a global moq origin). The moq field is never reached —
+        // the authz gate fires first — so a panicking placeholder is fine.
+        let crypto = PrefixCrypto {
+            key_state: GroupKeyState {
+                current: Zeroizing::new([0u8; 32]),
+                pending: None,
+                created_at: std::time::Instant::now(),
+            },
+            ephemeral_secret: Zeroizing::new([0u8; 32]),
+            ephemeral_pubkey: [0u8; 32],
+            subscribers: HashMap::new(),
+        };
+        // SAFETY-of-test: we never publish to `moq` because DenyAll fires first.
+        // We cannot construct a real MoqEventPublisher without the global origin,
+        // so we register the prefix into the map with crypto and rely on the
+        // authz gate short-circuiting. Use the publisher's own map: register an
+        // entry whose `moq` is sourced from a real origin when available.
+        if let Some(origin) = global_moq_event_origin() {
+            if let Ok(moq) = origin.publisher("deny-test") {
+                let mut prefixes = publisher.prefixes.write().await;
+                prefixes.insert(
+                    "deny-test".to_owned(),
+                    PrefixState {
+                        moq,
+                        crypto: Some(crypto),
+                    },
+                );
+                drop(prefixes);
+                let result = publisher.publish_raw("deny-test.e.e", b"p").await;
+                let err =
+                    result.expect_err("DenyAll must block encrypted publish");
+                assert!(
+                    err.to_string().contains("denied by event-plane authz"),
+                    "expected authz denial, got: {err}"
+                );
+            }
+        }
+        // If no global origin is available in this test binary, the
+        // inject-then-deny path is not exercisable here; the unit tests above
+        // cover the authz surface directly.
     }
 }

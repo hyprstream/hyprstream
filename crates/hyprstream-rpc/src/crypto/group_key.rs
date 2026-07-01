@@ -49,7 +49,8 @@ use parking_lot::RwLock;
 use zeroize::Zeroizing;
 
 use crate::crypto::backend::keyed_mac;
-use crate::crypto::event_crypto::{derive_wrap_key, wrap_group_key};
+use crate::crypto::event_crypto::{derive_wrap_key, unwrap_group_key, wrap_group_key};
+use crate::crypto::{blinded_dh_raw, rerandomize_pubkey, RistrettoPublic};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Rekey policy + timing constants
@@ -234,6 +235,76 @@ impl MembershipResolver for DenyAllResolver {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Blinded join (EV4: participant anonymity vs the relay)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// A subscriber's **blinded** presentation for join (EV4 participant anonymity).
+///
+/// The subscriber blinds their stable Ristretto255 public key with a fresh
+/// random scalar `r` (`blinded = P_member + r·G` via [`rerandomize_pubkey`])
+/// and presents `blinded_pubkey` to the publisher's [`GroupKeyRegistry::join`].
+/// The publisher DHs against the blinded pubkey — it never sees, and cannot
+/// recover, the subscriber's stable key. The subscriber retains `blinding` to
+/// unwrap via [`blinded_dh_raw`].
+///
+/// **The blinder is the subscriber (or a DiscoveryService-side step that the
+/// subscriber trusts), NEVER the relay.** A relay that chose `r` could link
+/// presentations; the subscriber choosing `r` keeps that unlinkability.
+///
+/// # Residual (honest)
+/// Anonymity is **vs the relay only**. The publisher still sees the (blinded)
+/// connection and its traffic pattern; a DiscoveryService that authenticates the
+/// join (to authorize it) necessarily de-anonymizes the subscriber at authz
+/// time. The relay observes the anonymous connection-set cardinality + the
+/// per-connection traffic pattern. This is participant *key*-anonymity — it is
+/// NOT per-publish edge-set hiding (the relay can still see who-publishes-to /
+/// who-subscribes-to which track within a group, at the connection level).
+pub struct BlindedMember {
+    /// The blinded pubkey the subscriber presents to `join`.
+    pub blinded_pubkey: [u8; 32],
+    /// The blinding scalar, retained subscriber-side and NEVER sent. Required to
+    /// unwrap the wrapped group key via [`blinded_dh_raw`].
+    pub blinding: [u8; 32],
+}
+
+impl BlindedMember {
+    /// Subscriber-side: blind a stable member public key. `member_pubkey` is the
+    /// subscriber's stable Ristretto255 public key (32 bytes). Returns the
+    /// blinded presentation to send to `join`, plus the blinding scalar to keep.
+    pub fn new(member_pubkey: &[u8; 32]) -> Result<Self, String> {
+        let pub_obj = RistrettoPublic::from_bytes(member_pubkey)
+            .ok_or_else(|| "invalid Ristretto255 member public key".to_owned())?;
+        let (blinded, blinding) = rerandomize_pubkey(&pub_obj);
+        Ok(Self {
+            blinded_pubkey: blinded.to_bytes(),
+            blinding,
+        })
+    }
+
+    /// Subscriber-side: recover `K_group` from the wrapped blob returned by
+    /// [`GroupKeyRegistry::join`], using the blinded-DH. `member_secret` is the
+    /// subscriber's stable secret scalar; `publisher_pubkey` is the ephemeral
+    /// publisher pubkey `join` returned. By DH commutativity this yields the
+    /// same shared secret the publisher computed against the blinded pubkey.
+    pub fn unwrap(
+        &self,
+        member_secret: &[u8; 32],
+        publisher_pubkey: &[u8; 32],
+        wrapped: &[u8],
+        group_uri: &str,
+        subject_did: &str,
+    ) -> Result<Zeroizing<[u8; 32]>, String> {
+        // (s_member + r) · P_publisher  ==  s_publisher · (P_member + r·G)
+        let shared = blinded_dh_raw(member_secret, &self.blinding, publisher_pubkey)
+            .map_err(|e| format!("blinded DH failed: {e}"))?;
+        // Salt is XOR-symmetric over the two pubkeys; join derived with
+        // (blinded_pubkey, publisher_ephemeral) — same two pubs here.
+        let wrap_key = derive_wrap_key(&shared, &self.blinded_pubkey, publisher_pubkey);
+        unwrap_group_key(&wrap_key, wrapped, &keyed_subject_hash(subject_did), group_uri)
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Per-group key state (private)
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -326,9 +397,17 @@ impl<R: MembershipResolver> GroupKeyRegistry<R> {
     /// Join a group: resolve membership (fail-closed via [`MembershipResolver`]),
     /// then DH-wrap the current `K_group` for the member.
     ///
+    /// `member_pubkey` is the key the publisher DHs against — for EV4 participant
+    /// anonymity this SHOULD be a **blinded** presentation ([`BlindedMember`]),
+    /// not the subscriber's stable key. The publisher side is blinding-agnostic:
+    /// `ristretto_dh_raw` is commutative with the subscriber's `blinded_dh_raw`,
+    /// so the same wrap/unwrap round-trips whether `member_pubkey` is raw or
+    /// blinded. Presenting a raw key here is correct but exposes the stable key
+    /// to the publisher/relay — use [`BlindedMember`] for the confidential path.
+    ///
     /// Returns `(wrapped_key_blob, keyset_id, epoch, publisher_ephemeral_pubkey)`.
-    /// The member unwraps with `unwrap_group_key` using the same DH (their secret
-    /// + the returned publisher pubkey).
+    /// The member unwraps with `unwrap_group_key` (raw) or [`BlindedMember::unwrap`]
+    /// (blinded) using the same DH (their secret + the returned publisher pubkey).
     pub async fn join(
         &self,
         group: &GroupRef,
@@ -538,6 +617,46 @@ mod tests {
             "member must be able to unwrap K_group via DH: {:?}",
             unwrapped.err()
         );
+    }
+
+    #[tokio::test]
+    async fn blinded_join_then_unwrap_round_trips() {
+        // EV4: the subscriber presents a BLINDED pubkey to join; the publisher
+        // DHs against the blinded key (blinding-agnostic) and never sees the
+        // stable key. The subscriber unwraps via blinded_dh_raw.
+        let registry =
+            GroupKeyRegistry::new(RekeyPolicy::Immediate, AllowResolver).unwrap();
+        let g = grp("at://did:web:a/g1");
+        registry.register_group(g.clone()).await.unwrap();
+
+        let (member_secret, member_public) = crate::crypto::generate_ephemeral_keypair();
+        let member_secret_bytes = member_secret.scalar().to_bytes();
+        let member_pubkey = member_public.to_bytes();
+
+        // Subscriber blinds their stable key (subscriber-side; r never leaves).
+        let blinded = BlindedMember::new(&member_pubkey).expect("blind");
+        // The blinded pubkey is different from the stable key ( unlinkable).
+        assert_ne!(blinded.blinded_pubkey, member_pubkey);
+
+        // join receives the BLINDED pubkey; the publisher never sees `member_pubkey`.
+        let (wrapped, _keyset_id, _epoch, publisher_pubkey) = registry
+            .join(&g, "did:web:member", blinded.blinded_pubkey)
+            .await
+            .expect("join with blinded pubkey");
+
+        // Subscriber unwraps via the blinded-DH path.
+        let recovered = blinded
+            .unwrap(
+                &member_secret_bytes,
+                &publisher_pubkey,
+                &wrapped,
+                &g.group_uri,
+                "did:web:member",
+            )
+            .expect("blinded unwrap");
+        // And it equals the registry's authoritative K_group.
+        let authoritative = registry.k_group(&g).await.expect("k_group");
+        assert_eq!(*recovered, authoritative);
     }
 
     #[tokio::test]
