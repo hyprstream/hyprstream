@@ -38,6 +38,11 @@
           inherit (pkgs) lib stdenv fetchurl unzip autoAddDriverRunpath patchelf zlib;
         };
 
+        # Package version, read from the hyprstream crate's Cargo.toml so the Nix
+        # package version always tracks the source of truth (avoids drift).
+        cargoToml = builtins.fromTOML (builtins.readFile ./crates/hyprstream/Cargo.toml);
+        version = cargoToml.package.version;
+
         # Rust toolchain from fenix (stable channel)
         rustToolchain = fenix.packages.${system}.stable.toolchain;
 
@@ -77,7 +82,7 @@
         commonArgs = {
           inherit src cargoVendorDir;
           pname = "hyprstream";
-          version = "0.3.0-rc1";
+          inherit version;
 
           nativeBuildInputs = with pkgs; [
             pkg-config
@@ -189,9 +194,14 @@
         ];
 
       in {
+        # GPU variants depend on cudaPackages/rocmPackages, which only resolve on
+        # x86_64-linux. Guard them so evaluation (nix flake show/check) succeeds on
+        # other systems (macOS, aarch64) with just the CPU variant present, instead
+        # of erroring out while forcing the GPU package attrs.
         packages = {
           hyprstream     = mkHyprstream "cpu"     libtorchVariants.cpu     [];
           hyprstream-cpu = mkHyprstream "cpu"     libtorchVariants.cpu     [];
+        } // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
           hyprstream-cuda128 = mkHyprstream "cuda128" libtorchVariants.cuda128 cuda12Libs;
           hyprstream-cuda130 = mkHyprstream "cuda130" libtorchVariants.cuda130 cuda12Libs;
           hyprstream-rocm71  = mkHyprstream "rocm71"  libtorchVariants.rocm71  rocm71Libs;
@@ -207,6 +217,10 @@
           buildInputs = [ rustToolchain ];
 
           shellHook = ''
+            # inputsFrom pulls the package build env into the shell, including the
+            # sccache wrapper config. Strip it so `cargo build` in `nix develop`
+            # works without requiring sccache and the /var/cache/sccache path.
+            unset RUSTC_WRAPPER SCCACHE_DIR SCCACHE_CACHE_SIZE
             export LIBTORCH="${devLibtorch}"
             export LD_LIBRARY_PATH="${devLibtorch}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             export LIBTORCH_BYPASS_VERSION_CHECK=1

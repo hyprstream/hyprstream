@@ -50,8 +50,11 @@ annotation docExample(field) :Text;
 annotation optional(field) :Void;
 
 # Domain type path — generated client returns this Rust type via FromCapnp::read_from().
-# Usage: struct Foo $domainType("runtime::VersionResponse") { ... }
-annotation domainType(struct) :Text;
+# Struct-level: the generated client returns this Rust type for the whole struct.
+#   Usage: struct Foo $domainType("runtime::VersionResponse") { ... }
+# Field-level: the field maps to this Rust newtype (wire type unchanged, e.g. Text).
+#   Usage: serviceDid @0 :Text $domainType("hyprstream_rpc::identity::Did");
+annotation domainType(field, struct) :Text;
 
 # Serde field rename — generates #[serde(rename = "...")] on the Rust field.
 # Usage: toolType @1 :Text $serdeRename("type");

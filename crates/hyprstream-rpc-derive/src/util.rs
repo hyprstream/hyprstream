@@ -219,8 +219,8 @@ mod tests {
         vec![StructDef {
             name: "ModelInfo".into(),
             fields: vec![
-                FieldDef { name: "name".into(), type_name: "Text".into(), description: String::new(), fixed_size: None, optional: false, slot_offset: 0, section: FieldSection::Pointer, discriminant_value: 0xFFFF, serde_rename: None },
-                FieldDef { name: "size".into(), type_name: "UInt64".into(), description: String::new(), fixed_size: None, optional: false, slot_offset: 0, section: FieldSection::Data, discriminant_value: 0xFFFF, serde_rename: None },
+                FieldDef { name: "name".into(), type_name: "Text".into(), description: String::new(), fixed_size: None, optional: false, slot_offset: 0, section: FieldSection::Pointer, discriminant_value: 0xFFFF, serde_rename: None, domain_type: None },
+                FieldDef { name: "size".into(), type_name: "UInt64".into(), description: String::new(), fixed_size: None, optional: false, slot_offset: 0, section: FieldSection::Data, discriminant_value: 0xFFFF, serde_rename: None, domain_type: None },
             ],
             has_union: false,
             domain_type: None,

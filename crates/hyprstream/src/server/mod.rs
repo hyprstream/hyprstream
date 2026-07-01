@@ -53,6 +53,11 @@ pub fn create_app(state: ServerState) -> Router {
         .nest("/oai/v1", routes::openai::create_router())
         // Model management routes
         .nest("/models", routes::models::create_router())
+        // rate_limit added first (inner) → runs after auth sees the authenticated subject
+        .layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            middleware::rate_limit_middleware,
+        ))
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
             middleware::auth_middleware,

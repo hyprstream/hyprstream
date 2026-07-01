@@ -17,8 +17,21 @@
 //!
 //! This is the "Live" preset for the event bus: fan-out, unbounded, at-most-once.
 //! No chained HMAC or policy axes — events are best-effort lifecycle signals, not
-//! auditable streams. `SecureEventPublisher` / `SecureEventSubscriber` (Phase 7)
-//! layer group-key encryption on top and are unaffected by this transport change.
+//! auditable streams. [`crate::events::EventPublisher`] / [`crate::events::EventSubscriber`]
+//! (the canonical broadcast type — see `crate::events`) layer group-key encryption
+//! on top of this transport, selectable via [`crate::crypto::event_crypto::EventPrivacy`].
+//!
+//! ## Two origins: `moq_event` vs `moq_stream`
+//!
+//! Broadcast publish/subscribe (fan-out, N subscribers per source/topic) is
+//! consolidated exclusively on THIS origin (`moq_event` / `MoqEventOrigin`).
+//! The sibling `moq_stream` origin (`crate::moq_stream`) is reserved for
+//! point-to-point token streaming (one producer, one consumer per stream,
+//! DH-derived `StreamKeys`) — it is not a second broadcast plane and new
+//! fan-out use cases should not be added to it. Anything that needs "N
+//! interested parties learn about an event" belongs on `moq_event`; anything
+//! that is a private request/response or token stream between two parties
+//! belongs on `moq_stream`.
 //!
 //! # #393 — per-OID broadcast paths
 //!
@@ -878,8 +891,23 @@ async fn run_subscriber_task(
 
 /// Scope the origin consumer to `local/events/{sources}` based on patterns.
 ///
-/// If any pattern is `""` (subscribe-all), returns `None` and the caller uses
-/// an unscoped consumer rooted at `local/events`.
+/// Returns `None` only when `local/events` itself has no tree yet (the event
+/// origin has never announced anything) — the caller treats that as "nothing
+/// to subscribe to" and aborts. For a subscribe-all pattern (`""`), or when no
+/// source names can be extracted from `patterns`, the broader `local/events`
+/// consumer is returned.
+///
+/// A source-specific second-level scope (e.g. narrowing to `local/events/worker`)
+/// can ALSO return `None` even though `local/events` exists, simply because
+/// that particular source hasn't announced its broadcast yet — a subscriber
+/// commonly starts before its publisher does. That is not "no event scope";
+/// it just means the narrower subtree doesn't exist *yet*. Treating it the
+/// same as the top-level `None` case used to make the subscriber task abort
+/// permanently (see `run_subscriber_task`), so a subscriber that started
+/// before its publisher would never receive anything even after the publisher
+/// came up. Instead, fall back to the broader `local/events`-scoped consumer:
+/// per-frame pattern filtering (`topic_matches_patterns` in
+/// `read_event_broadcast`) still narrows correctly once the source announces.
 fn scope_consumer_for_patterns(
     consumer: &OriginConsumer,
     patterns: &[String],
@@ -912,7 +940,10 @@ fn scope_consumer_for_patterns(
     }
 
     let path_refs: Vec<Path<'_>> = sources.iter().map(|s| Path::new(s.as_str())).collect();
-    events_consumer.scope(&path_refs)
+    // Narrowing can legitimately fail if none of `sources` have announced yet;
+    // fall back to the events-scoped consumer rather than propagating `None`
+    // (which the caller treats as a fatal "no event scope" abort).
+    Some(events_consumer.scope(&path_refs).unwrap_or(events_consumer))
 }
 
 /// Read all groups from a single source broadcast's `events` track and relay
@@ -1131,27 +1162,28 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn moq_event_pub_sub_roundtrip() -> Result<()> {
         let origin = MoqEventOrigin::new();
-        init_global_moq_event_origin(origin.clone());
 
-        // Publisher
-        let mut pub_ = origin.publisher("worker")?;
+        // Isolate this test from the process-global OnceLock. A subscriber
+        // created via `MoqEventSubscriber::new()` reads the global origin; if
+        // another test in the same binary set that global first, this test's
+        // publisher and subscriber would resolve against DIFFERENT origins and
+        // `recv()` would race/fail ("event subscriber closed"). `new_for_test`
+        // binds the subscriber to THIS origin's consumer, making the pub/sub
+        // pairing deterministic regardless of test order.
+        let mut sub = MoqEventSubscriber::new_for_test(origin.consumer());
 
-        // Subscriber
-        let mut sub = MoqEventSubscriber::new();
+        // Source-prefix subscription (not subscribe-all): exercises the
+        // two-level `scope()` path in `scope_consumer_for_patterns` (scope to
+        // `local/events`, then narrow to `worker`), now that its fallback to
+        // the broader events-scoped consumer is fixed.
         sub.subscribe("worker.")?;
 
-        // Start subscriber background task (lazy; triggered by recv)
-        // Publish before recv so the broadcast is announced when the task starts.
+        // Publish BEFORE recv so the broadcast (`local/events/worker`) is already
+        // announced when the subscriber's background task starts — no timing race.
+        let mut pub_ = origin.publisher("worker")?;
         pub_.publish("sandbox123", "started", b"payload")?;
 
-        // Give the origin a moment to propagate the announcement.
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        // Manually start the task by calling ensure_started and check recv.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            sub.recv(),
-        ).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv()).await;
 
         match result {
             Ok(Ok((topic, payload))) => {
@@ -1160,6 +1192,43 @@ mod tests {
             }
             Ok(Err(e)) => panic!("recv error: {e}"),
             Err(_) => panic!("recv timeout"),
+        }
+
+        Ok(())
+    }
+
+    /// Regression test for the `scope_consumer_for_patterns` fallback fix: a
+    /// subscriber that source-prefix-subscribes (`"worker."`) BEFORE its
+    /// publisher has announced anything must still receive events once the
+    /// publisher starts — not abort permanently. Before the fix, the
+    /// second-level `scope()` narrowing to `worker` found no node yet (nothing
+    /// announced under `local/events/worker`) and returned `None`, which
+    /// `scope_consumer_for_patterns` propagated as "no event scope", causing
+    /// `run_subscriber_task` to exit immediately and silently drop the
+    /// subscriber for good.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn event_subscriber_can_start_before_publisher_announces() -> Result<()> {
+        let origin = MoqEventOrigin::new();
+        let mut sub = MoqEventSubscriber::new_for_test(origin.consumer());
+
+        // Subscribe to the source prefix BEFORE any publisher for "worker"
+        // exists — `local/events/worker` has not been announced yet.
+        sub.subscribe("worker.")?;
+
+        // Now create the publisher and publish; this is the first time
+        // `local/events/worker` is announced.
+        let mut pub_ = origin.publisher("worker")?;
+        pub_.publish("sandbox123", "started", b"payload")?;
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv()).await;
+
+        match result {
+            Ok(Ok((topic, payload))) => {
+                assert_eq!(topic, "worker.sandbox123.started");
+                assert_eq!(payload, b"payload");
+            }
+            Ok(Err(e)) => panic!("recv error: {e}"),
+            Err(_) => panic!("recv timeout — subscriber likely aborted on the pre-fix scope-race"),
         }
 
         Ok(())

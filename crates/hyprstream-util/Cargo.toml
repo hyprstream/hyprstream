@@ -1,0 +1,17 @@
+[package]
+name = "hyprstream-util"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/hyprstream/hyprstream"
+description = "Shared generic utility primitives for hyprstream (TTL cache, etc.)"
+
+[lib]
+name = "hyprstream_util"
+path = "src/lib.rs"
+
+[dependencies]
+parking_lot = { workspace = true }
+
+[lints]
+workspace = true
