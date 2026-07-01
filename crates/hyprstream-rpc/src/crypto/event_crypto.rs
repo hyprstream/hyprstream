@@ -21,10 +21,9 @@
 //! - All nonces are random from OsRng (never derived)
 
 use aes_gcm::{
-    aead::{Aead, KeyInit, Payload},
+    aead::{Aead, AeadCore, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
-use rand::RngCore;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
@@ -89,9 +88,11 @@ fn aes_gcm_decrypt(
 
 /// Generate a random 12-byte AES-GCM nonce from OsRng.
 fn random_nonce() -> [u8; 12] {
-    let mut nonce = [0u8; 12];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
-    nonce
+    // Idiomatic aes-gcm nonce generation (CodeQL-recognized CSPRNG).
+    // Equivalent to the prior OsRng.fill_bytes(&mut [0u8;12]) — the value
+    // was always overwritten by OsRng — but without the init literal that
+    // tripped rust/hard-coded-cryptographic-value (false-positive root fix).
+    Aes256Gcm::generate_nonce(&mut rand::rngs::OsRng).into()
 }
 
 // ============================================================================
