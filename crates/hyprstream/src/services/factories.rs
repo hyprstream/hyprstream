@@ -661,7 +661,7 @@ impl Spawnable for MoqStreamBarrierService {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Factory for ModelService (model lifecycle management)
-#[service_factory("model", schema = "../../../hyprstream-rpc-std/schema/model.capnp", metadata = crate::services::generated::model_client::schema_metadata, depends_on = ["policy", "registry", "discovery", "notification"])]
+#[service_factory("model", schema = "../../../hyprstream-rpc-std/schema/model.capnp", metadata = crate::services::generated::model_client::schema_metadata, depends_on = ["policy", "registry", "discovery", ])]
 fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating ModelService");
 
