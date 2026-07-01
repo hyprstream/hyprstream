@@ -8,8 +8,18 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: "sccache"
+  # sccache was removed (June 2026): on the GHA cache backend it delivered a ~3% hit
+  # rate with ~40% of writes failing under concurrent load, and it barely caches the
+  # librocksdb-sys/torch-sys C++ that dominates our build. rust-cache's target/ restore
+  # covers those far better. See PR that introduced this change.
+  CARGO_INCREMENTAL: 0
+
+# Cancel superseded PR runs so a new push frees runners and reduces concurrent cache
+# writers. merge_group (unique gh-readonly-queue ref) and push-to-main never cancel each
+# other, so the merge gate and the cache-warming push always run to completion.
+concurrency:
+  group: rust-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   clippy:
@@ -26,15 +36,17 @@ jobs:
       with:
         components: clippy
 
-    - name: Setup sccache
-      uses: mozilla-actions/sccache-action@v0.0.9
-      with:
-        key: rust-sccache
-
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
       with:
-        shared-key: rust-deps
+        # dev profile / --all-targets — kept distinct from the release `build` key so the
+        # two profiles don't overwrite each other's target/ artifacts.
+        shared-key: rust-clippy
+        # Only main writes the shared cache; PR and merge_group runs restore it. This is
+        # what fixes the hit rate: concurrent runs all sharing one key raced on the GHA
+        # single-writer reservation and every save failed ("Unable to reserve cache"), so
+        # the cache was never populated. push-to-main (after each merge) refreshes it.
+        save-if: ${{ github.ref == 'refs/heads/main' }}
 
     - name: Run Clippy
       run: cargo clippy --workspace --all-targets --features download-libtorch -- -D warnings
@@ -51,10 +63,7 @@ jobs:
     - name: Check bans
       # ZMQ crates are deny-listed in deny.toml (#138 complete). This gate must
       # be able to fail — do NOT add `|| true`.
-      # Unset RUSTC_WRAPPER: job-level env: "" doesn't clear workflow-level env on GHA.
-      run: |
-        unset RUSTC_WRAPPER
-        cargo deny check bans licenses
+      run: cargo deny check bans licenses
 
   wasm:
     name: WASM (browser client)
@@ -71,15 +80,11 @@ jobs:
       with:
         targets: wasm32-unknown-unknown
 
-    - name: Setup sccache
-      uses: mozilla-actions/sccache-action@v0.0.9
-      with:
-        key: rust-sccache
-
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
       with:
         shared-key: rust-wasm
+        save-if: ${{ github.ref == 'refs/heads/main' }}
 
     # Guards the browser/WebTransport build (#225/#226): getrandom wasm_js (Cargo.toml) +
     # the web_sys_unstable_apis rustflag for WebTransport. Catches wasm-only breakage the
@@ -111,15 +116,12 @@ jobs:
     - name: Install build dependencies
       run: sudo apt-get update && sudo apt-get install -y capnproto libsystemd-dev pkg-config libssl-dev
 
-    - name: Setup sccache
-      uses: mozilla-actions/sccache-action@v0.0.9
-      with:
-        key: rust-sccache
-
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
       with:
-        shared-key: rust-deps
+        # release profile — distinct key from clippy's dev profile.
+        shared-key: rust-build
+        save-if: ${{ github.ref == 'refs/heads/main' }}
 
     - name: Build
       run: cargo build --release --verbose --features download-libtorch
