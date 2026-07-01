@@ -43,6 +43,16 @@ use std::fmt;
 /// the SAME `crate::did_key` parser the rest of `hyprstream-rpc` uses).
 pub use crate::identity::Did;
 
+/// Domain-separation AAD for UCAN payload signatures (distinct from the
+/// compiled-policy, approval, audit, and envelope AADs so a UCAN signature can
+/// never be replayed as another message type). Signed and verified by every
+/// producer/consumer of UCANs — the test helpers, the chain validator, the
+/// production `UcanVerifier` (the HTTP grant path's trust-store-backed
+/// verifier), and cross-process consumers. Promoted to a public non-test
+/// constant by S8 (#574) so the production verifier shares the exact AAD the
+/// signers use (a mismatch silently fails signature verification).
+pub const UCAN_AAD: &[u8] = b"hs-mac-ucan-payload-v1";
+
 /// Resolve the Ed25519 verifying-key bytes a UCAN `did:key` issuer/audience
 /// encodes, mapped to a fail-closed [`UcanError`]. Thin adapter over the canonical
 /// [`Did::to_ed25519`] so the UCAN signature/structure paths keep their typed
@@ -222,7 +232,10 @@ impl Ucan {
     ///
     /// This does NOT check attenuation/delegation linkage — that is
     /// [`super::chain::validate_chain`], deliberately separate.
-    pub fn verify_signatures<V: UcanVerifier + ?Sized>(&self, verifier: &V) -> Result<(), UcanError> {
+    pub fn verify_signatures<V: UcanVerifier + ?Sized>(
+        &self,
+        verifier: &V,
+    ) -> Result<(), UcanError> {
         let ed_bytes = did_ed25519_key(&self.payload.issuer)?;
         let payload_bytes = self.payload.signing_bytes()?;
         verifier.verify(
@@ -333,10 +346,8 @@ pub(super) mod test_support {
     use ed25519_dalek::{SigningKey, VerifyingKey};
     use std::collections::HashMap;
 
-    /// Domain-separation AAD for UCAN payload signatures (distinct from the
-    /// compiled-policy and envelope AADs so a UCAN signature can never be
-    /// replayed as another message type).
-    pub const UCAN_AAD: &[u8] = b"hs-mac-ucan-payload-v1";
+    // The UCAN payload-signature AAD is the public `super::UCAN_AAD` constant
+    // (promoted out of `test_support` by S8 so production verifiers share it).
 
     /// A hybrid keypair (Ed25519 + ML-DSA-65) bound to one DID identity.
     pub struct TestIdentity {

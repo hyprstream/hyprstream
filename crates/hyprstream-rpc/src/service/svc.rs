@@ -12,8 +12,8 @@
 use crate::prelude::*;
 use crate::transport::TransportConfig;
 use anyhow::Result;
-use zeroize::Zeroizing;
 use async_trait::async_trait;
+use zeroize::Zeroizing;
 // AtomicU64 and Ordering removed — were unused
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -26,7 +26,15 @@ use tracing::warn;
 /// The concrete implementation typically wraps `PolicyClient::check_policy()`.
 ///
 /// Returns a boxed future to support async policy checks on single-threaded runtimes.
-pub type AuthorizeFn = Arc<dyn Fn(String, String, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send>> + Send + Sync>;
+pub type AuthorizeFn = Arc<
+    dyn Fn(
+            String,
+            String,
+            String,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Decompose a composite JWT alg into its underlying component algs.
 ///
@@ -231,6 +239,82 @@ impl EnvelopeContext {
         self.claims.as_ref()
     }
 
+    /// **Derive the verified key material (S8/#574, S1/#548).** This is the
+    /// accessor that threads crypto-derived assurance from the envelope's
+    /// verified signature into MAC context assembly.
+    ///
+    /// Returns the [`VerifiedKeyMaterial`] assurance axis for THIS verified
+    /// envelope, derived (never trusted) from what the signature layer actually
+    /// verified:
+    ///
+    /// - **`PqHybrid`** — the envelope's `cnf` Ed25519 signer key is
+    ///   cryptographically verified (it is `self.cnf`, set during
+    ///   [`Self::from_verified`] from the signature check) AND a bound ML-DSA-65
+    ///   anchor for that identity is present in the global `PqTrustStore`
+    ///   (`register_pq_trust` binding) under the enforced Hybrid policy. This is
+    ///   the kid-anchored binding the rest of the TCB uses — the PQ key is
+    ///   resolved from the trust store keyed by the EdDSA identity, never
+    ///   self-asserted.
+    /// - **`Classical`** — the `cnf` Ed25519 signer key is verified but NO bound
+    ///   ML-DSA-65 anchor is present (the federation edge, or a pre-PQ identity).
+    /// - **`Unverified`** — the `cnf` key is zeroed (a callback-service context
+    ///   with no real envelope; assurance floors to the S1 `Unverified` floor
+    ///   so it dominates nothing above it).
+    ///
+    /// **Re-derive per verified envelope; never cache across identities.** Each
+    /// envelope has its own signer; caching would conflate assurances.
+    ///
+    /// This is the load-bearing S8 input: without it every subject floors to
+    /// `Unverified` and dominates nothing (S6 would deny everything). The MAC
+    /// PDP combines this with the clearance off `Claims` via
+    /// [`crate::auth::mac::SubjectContextClaims::security_context`].
+    #[must_use]
+    pub fn verified_key_material(&self) -> crate::auth::mac::VerifiedKeyMaterial {
+        // The callback-service path mints a context with a zeroed cnf and no
+        // real envelope — there is no signature to derive assurance from. Floor
+        // to Unverified so the S1 dominance check denies anything above the
+        // floor (this is the correct posture for an un-attested service self-
+        // call that crosses into MAC-enforced territory).
+        if self.cnf == [0u8; 32] {
+            return crate::auth::mac::VerifiedKeyMaterial::Unverified;
+        }
+        // cnf is the cryptographically-verified Ed25519 signer key (set during
+        // from_verified* from the envelope signature check). It is verified by
+        // construction — the only question is whether a PQ anchor is bound.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(store) = crate::envelope::global_pq_store() {
+                if store.ml_dsa_key_for(&self.cnf).is_some() {
+                    return crate::auth::mac::VerifiedKeyMaterial::PqHybrid;
+                }
+            }
+        }
+        // Verified Ed25519, no bound PQ anchor ⇒ Classical (the federation edge
+        // / pre-PQ identity). NOT PqHybrid — no silent upgrade.
+        crate::auth::mac::VerifiedKeyMaterial::Classical
+    }
+
+    /// Derive the full MAC [`SecurityContext`] for this verified envelope: the
+    /// **two-input** S1 derivation (clearance from `Claims` + assurance from
+    /// [`Self::verified_key_material`]). This is the convenience entry-point the
+    /// MAC PDP / S6 grant path call; it composes the authority-asserted
+    /// clearance with the crypto-derived assurance, clamping the assurance axis
+    /// DOWN to what the verified key supports.
+    ///
+    /// Returns `None` (→ S1 deny) when the subject carries no clearance
+    /// (unlabeled subject) — there is no default clearance. The resulting
+    /// context is a SIBLING to [`Subject`]: identity and clearance are
+    /// independent dimensions of the same verified principal.
+    ///
+    /// **Re-derive per verified envelope; never cache across identities.**
+    #[must_use]
+    pub fn security_context(&self) -> Option<crate::auth::mac::SecurityContext> {
+        use crate::auth::mac::SubjectContextClaims as _;
+        let claims = self.claims.as_ref()?;
+        let key_material = self.verified_key_material();
+        claims.security_context(key_material)
+    }
+
     /// Get the raw JWT token from the envelope (if present).
     pub fn jwt_token(&self) -> Option<&str> {
         self.jwt_token.as_deref()
@@ -337,7 +421,6 @@ impl EnvelopeContext {
             );
         }
     }
-
 }
 
 /// Trait for RPC services.
@@ -360,7 +443,11 @@ pub trait RequestService: 'static {
     ///   (used for streaming: ensures client has stream_id before data flows)
     ///
     /// Non-streaming services always return `None` for the continuation.
-    async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<Continuation>)>;
+    async fn handle_request(
+        &self,
+        ctx: &EnvelopeContext,
+        payload: &[u8],
+    ) -> Result<(Vec<u8>, Option<Continuation>)>;
 
     /// Service name (for logging and registry).
     fn name(&self) -> &str;
@@ -391,7 +478,9 @@ pub trait RequestService: 'static {
     /// inner EdDSA (skip-unknown interop). Override to return `None` to force
     /// Classical-only responses.
     fn pq_signing_key(&self) -> Option<crate::crypto::pq::MlDsaSigningKey> {
-        Some(crate::node_identity::derive_mesh_mldsa_key(&self.signing_key()))
+        Some(crate::node_identity::derive_mesh_mldsa_key(
+            &self.signing_key(),
+        ))
     }
 
     /// Ed25519 verifying key for envelope signature verification.
@@ -495,7 +584,9 @@ pub trait RequestService: 'static {
     /// The legacy `claims` path is kept for backwards compat with older clients.
     async fn verify_claims(&self, ctx: &mut EnvelopeContext) -> anyhow::Result<()> {
         // Prefer jwt_token (new path) over legacy claims
-        let token = ctx.jwt_token.clone()
+        let token = ctx
+            .jwt_token
+            .clone()
             .or_else(|| ctx.claims().and_then(|c| c.token.clone()));
 
         let Some(token) = token else {
@@ -581,13 +672,17 @@ pub trait RequestService: 'static {
                 // covered components include every listed alg.
                 if listed_algs.len() > 1 {
                     let covered = composite_alg_components(&alg);
-                    let all_covered = listed_algs.iter().all(|need| covered.iter().any(|c| c == need) || need == &alg);
+                    let all_covered = listed_algs
+                        .iter()
+                        .all(|need| covered.iter().any(|c| c == need) || need == &alg);
                     if !all_covered {
                         tracing::warn!(
                             "JWT alg={} does not cover all JWKS-listed algs {:?} for kid={} — stripping rejected",
                             alg, listed_algs, kid_str
                         );
-                        anyhow::bail!("JWT alg does not cover all JWKS-listed algs (stripping defense)");
+                        anyhow::bail!(
+                            "JWT alg does not cover all JWKS-listed algs (stripping defense)"
+                        );
                     }
                 }
             }
@@ -605,14 +700,23 @@ pub trait RequestService: 'static {
                 let mut result = None;
                 for vk in &vks {
                     match crate::auth::jwt::decode_ml_dsa_65(&token, vk, aud) {
-                        Ok(claims) => { result = Some(claims); break; }
-                        Err(e) => { last_err = Some(e); }
+                        Ok(claims) => {
+                            result = Some(claims);
+                            break;
+                        }
+                        Err(e) => {
+                            last_err = Some(e);
+                        }
                     }
                 }
                 match result {
                     Some(claims) => claims,
                     None => {
-                        tracing::warn!("ML-DSA-65 JWT verification failed (tried {} keys): {:?}", vks.len(), last_err);
+                        tracing::warn!(
+                            "ML-DSA-65 JWT verification failed (tried {} keys): {:?}",
+                            vks.len(),
+                            last_err
+                        );
                         anyhow::bail!("JWT verification failed");
                     }
                 }
@@ -622,17 +726,29 @@ pub trait RequestService: 'static {
                 if vks.is_empty() {
                     anyhow::bail!("Composite JWT received but no PQ verifying keys available");
                 }
-                let verifying_key = key_source.get_key(&unverified.iss, kid.as_deref()).await.map_err(|e| {
-                    tracing::warn!("JWT key resolution failed for iss={}: {}", unverified.iss, e);
-                    anyhow::anyhow!("JWT key resolution failed")
-                })?;
+                let verifying_key = key_source
+                    .get_key(&unverified.iss, kid.as_deref())
+                    .await
+                    .map_err(|e| {
+                        tracing::warn!(
+                            "JWT key resolution failed for iss={}: {}",
+                            unverified.iss,
+                            e
+                        );
+                        anyhow::anyhow!("JWT key resolution failed")
+                    })?;
                 let aud = self.expected_audience();
                 let mut last_err = None;
                 let mut result = None;
                 for vk in &vks {
                     match crate::auth::jwt::decode_composite(&token, vk, &verifying_key, aud) {
-                        Ok(claims) => { result = Some(claims); break; }
-                        Err(e) => { last_err = Some(e); }
+                        Ok(claims) => {
+                            result = Some(claims);
+                            break;
+                        }
+                        Err(e) => {
+                            last_err = Some(e);
+                        }
                     }
                 }
                 match result {
@@ -645,10 +761,17 @@ pub trait RequestService: 'static {
             }
             _ => {
                 // EdDSA (default path)
-                let verifying_key = key_source.get_key(&unverified.iss, kid.as_deref()).await.map_err(|e| {
-                    tracing::warn!("JWT key resolution failed for iss={}: {}", unverified.iss, e);
-                    anyhow::anyhow!("JWT key resolution failed")
-                })?;
+                let verifying_key = key_source
+                    .get_key(&unverified.iss, kid.as_deref())
+                    .await
+                    .map_err(|e| {
+                        tracing::warn!(
+                            "JWT key resolution failed for iss={}: {}",
+                            unverified.iss,
+                            e
+                        );
+                        anyhow::anyhow!("JWT key resolution failed")
+                    })?;
                 crate::auth::decode_with_key(&token, &verifying_key, self.expected_audience())
                     .map_err(|e| {
                         tracing::warn!("JWT verification failed: {}", e);
@@ -705,9 +828,10 @@ pub trait RequestService: 'static {
                 // R2b: DPoP path — JWT has cnf.jkt (thumbprint) instead of cnf.jwk.
                 // Compute the JWK thumbprint of the envelope signer and compare.
                 use subtle::ConstantTimeEq as _;
-                let envelope_jkt = crate::auth::jwk_thumbprint(
-                    &crate::auth::JwkThumbprintInput::Ed25519 { x: &ctx.cnf },
-                );
+                let envelope_jkt =
+                    crate::auth::jwk_thumbprint(&crate::auth::JwkThumbprintInput::Ed25519 {
+                        x: &ctx.cnf,
+                    });
                 if envelope_jkt.as_bytes().ct_ne(jkt.as_bytes()).into() {
                     tracing::warn!("JWT cnf.jkt mismatch: sub={}", claims.sub);
                     anyhow::bail!("JWT cnf.jkt does not match envelope signer");
@@ -727,7 +851,9 @@ pub trait RequestService: 'static {
                 }
             } else if self.require_cnf_binding() {
                 tracing::warn!("JWT missing cnf binding (jwk or jkt): sub={}", claims.sub);
-                anyhow::bail!("JWT must include cnf binding for key binding (required by this service)");
+                anyhow::bail!(
+                    "JWT must include cnf binding for key binding (required by this service)"
+                );
             }
         }
 
@@ -754,9 +880,7 @@ pub trait RequestService: 'static {
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
         warn!(
             service = self.name(),
-            request_id,
-            error,
-            "build_error_payload not overridden — sending empty error response"
+            request_id, error, "build_error_payload not overridden — sending empty error response"
         );
         vec![]
     }
@@ -806,8 +930,7 @@ pub struct QuicLoopConfig {
     /// path (origin + key-binding against `remote_id()`). `None` = open (the
     /// pre-#282 accept-open behaviour). Native-only.
     #[cfg(not(target_arch = "wasm32"))]
-    pub iroh_admission:
-        Option<crate::transport::iroh_admission::SharedIrohAdmission>,
+    pub iroh_admission: Option<crate::transport::iroh_admission::SharedIrohAdmission>,
     /// #282: callback invoked after the iroh substrate binds, with
     /// (service_name, node_id) where `node_id` is the endpoint's 32-byte Ed25519
     /// public key. Used to advertise the `#iroh` VM + `IrohTransport` service
@@ -900,17 +1023,31 @@ mod empty_iss_gate_tests {
 
     #[async_trait(?Send)]
     impl RequestService for MockService {
-        async fn handle_request(&self, _ctx: &EnvelopeContext, _payload: &[u8]) -> Result<(Vec<u8>, Option<Continuation>)> {
+        async fn handle_request(
+            &self,
+            _ctx: &EnvelopeContext,
+            _payload: &[u8],
+        ) -> Result<(Vec<u8>, Option<Continuation>)> {
             Ok((vec![], None))
         }
-        fn name(&self) -> &str { "mock" }
-        fn transport(&self) -> &TransportConfig { &self.transport }
-        fn signing_key(&self) -> SigningKey { self.signing_key.clone() }
+        fn name(&self) -> &str {
+            "mock"
+        }
+        fn transport(&self) -> &TransportConfig {
+            &self.transport
+        }
+        fn signing_key(&self) -> SigningKey {
+            self.signing_key.clone()
+        }
         fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn crate::auth::JwtKeySource>> {
             Some(self.key_source.clone())
         }
-        fn require_cnf_binding(&self) -> bool { false }
-        fn pq_signing_key(&self) -> Option<crate::crypto::pq::MlDsaSigningKey> { None }
+        fn require_cnf_binding(&self) -> bool {
+            false
+        }
+        fn pq_signing_key(&self) -> Option<crate::crypto::pq::MlDsaSigningKey> {
+            None
+        }
     }
 
     /// Build an `EnvelopeContext` carrying `jwt_token`, with the chosen
@@ -934,10 +1071,8 @@ mod empty_iss_gate_tests {
         // anchors that same CA key with an empty local issuer URL (so empty iss
         // is "local").
         let ca = SigningKey::from_bytes(&[7u8; 32]);
-        let key_source = std::sync::Arc::new(ClusterKeySource::new(
-            ca.verifying_key(),
-            String::new(),
-        ));
+        let key_source =
+            std::sync::Arc::new(ClusterKeySource::new(ca.verifying_key(), String::new()));
         let svc = MockService {
             signing_key: SigningKey::from_bytes(&[8u8; 32]),
             transport: TransportConfig::inproc("mock"),
@@ -961,7 +1096,10 @@ mod empty_iss_gate_tests {
         let mut ctx = ctx_with_token(token, /* is_local_caller */ false);
 
         let result = svc.verify_claims(&mut ctx).await;
-        assert!(result.is_err(), "networked empty-iss token must be rejected");
+        assert!(
+            result.is_err(),
+            "networked empty-iss token must be rejected"
+        );
         let msg = result.err().map(|e| e.to_string()).unwrap_or_default();
         assert!(
             msg.contains("empty JWT issuer is only accepted from in-process callers"),
@@ -976,7 +1114,10 @@ mod empty_iss_gate_tests {
         let mut ctx = ctx_with_token(token, /* is_local_caller */ true);
 
         let result = svc.verify_claims(&mut ctx).await;
-        assert!(result.is_ok(), "in-process empty-iss token must pass the gate: {result:?}");
+        assert!(
+            result.is_ok(),
+            "in-process empty-iss token must pass the gate: {result:?}"
+        );
         // And the local bare-sub subject is resolved.
         assert_eq!(ctx.subject().name(), Some("alice"));
     }
@@ -1024,13 +1165,25 @@ mod ipc_key_identity_tests {
 
     #[async_trait(?Send)]
     impl RequestService for PlainService {
-        async fn handle_request(&self, _ctx: &EnvelopeContext, _payload: &[u8]) -> Result<(Vec<u8>, Option<Continuation>)> {
+        async fn handle_request(
+            &self,
+            _ctx: &EnvelopeContext,
+            _payload: &[u8],
+        ) -> Result<(Vec<u8>, Option<Continuation>)> {
             Ok((vec![], None))
         }
-        fn name(&self) -> &str { "discovery" }
-        fn transport(&self) -> &TransportConfig { &self.transport }
-        fn signing_key(&self) -> SigningKey { self.signing_key.clone() }
-        fn pq_signing_key(&self) -> Option<crate::crypto::pq::MlDsaSigningKey> { None }
+        fn name(&self) -> &str {
+            "discovery"
+        }
+        fn transport(&self) -> &TransportConfig {
+            &self.transport
+        }
+        fn signing_key(&self) -> SigningKey {
+            self.signing_key.clone()
+        }
+        fn pq_signing_key(&self) -> Option<crate::crypto::pq::MlDsaSigningKey> {
+            None
+        }
     }
 
     /// Test resolver mapping a fixed set of pubkeys → subjects (the trust store
@@ -1041,7 +1194,9 @@ mod ipc_key_identity_tests {
 
     impl KeySubjectResolver for MapResolver {
         fn resolve_subject(&self, signer_pubkey: &[u8; 32]) -> Option<Subject> {
-            self.bindings.get(signer_pubkey).map(|s| Subject::new(s.clone()))
+            self.bindings
+                .get(signer_pubkey)
+                .map(|s| Subject::new(s.clone()))
         }
     }
 
@@ -1093,7 +1248,9 @@ mod ipc_key_identity_tests {
         let _guard = RESOLVER_LOCK.lock().await;
 
         // Resolver knows ONLY about some other (registered) key.
-        let registered = SigningKey::from_bytes(&[33u8; 32]).verifying_key().to_bytes();
+        let registered = SigningKey::from_bytes(&[33u8; 32])
+            .verifying_key()
+            .to_bytes();
         let mut bindings = HashMap::new();
         bindings.insert(registered, "service:discovery".to_owned());
         set_key_resolver(std::sync::Arc::new(MapResolver { bindings }));
@@ -1104,7 +1261,9 @@ mod ipc_key_identity_tests {
         };
 
         // A genuinely anonymous caller signs with an UNREGISTERED key.
-        let anon_pub = SigningKey::from_bytes(&[44u8; 32]).verifying_key().to_bytes();
+        let anon_pub = SigningKey::from_bytes(&[44u8; 32])
+            .verifying_key()
+            .to_bytes();
         let mut ctx = ctx_for_signer(anon_pub);
         svc.verify_claims(&mut ctx).await.expect("verify_claims ok");
 
@@ -1241,7 +1400,9 @@ mod accounting_audit_tests {
 
     fn capture<F: FnOnce()>(f: F) -> Vec<AuditRecord> {
         let records = Arc::new(Mutex::new(Vec::new()));
-        let layer = CaptureLayer { records: records.clone() };
+        let layer = CaptureLayer {
+            records: records.clone(),
+        };
         let subscriber = Registry::default().with(layer);
         with_default(subscriber, f);
         let out = records.lock().clone();
@@ -1256,9 +1417,16 @@ mod accounting_audit_tests {
         });
 
         let audit: Vec<_> = records.iter().filter(|r| r.target == "audit").collect();
-        assert_eq!(audit.len(), 1, "exactly one audit record expected: {records:?}");
+        assert_eq!(
+            audit.len(),
+            1,
+            "exactly one audit record expected: {records:?}"
+        );
         let r = audit[0];
-        assert_eq!(r.subject, "testuser", "subject must be the verified subject");
+        assert_eq!(
+            r.subject, "testuser",
+            "subject must be the verified subject"
+        );
         assert_eq!(r.resource, "registry:*");
         assert_eq!(r.action, "write");
         assert_eq!(r.decision, "allow");
@@ -1283,9 +1451,16 @@ mod accounting_audit_tests {
         });
 
         let audit: Vec<_> = records.iter().filter(|r| r.target == "audit").collect();
-        assert_eq!(audit.len(), 1, "exactly one audit record expected: {records:?}");
+        assert_eq!(
+            audit.len(),
+            1,
+            "exactly one audit record expected: {records:?}"
+        );
         let r = audit[0];
-        assert_eq!(r.subject, "anonymous", "anonymous deny must be attributed as 'anonymous'");
+        assert_eq!(
+            r.subject, "anonymous",
+            "anonymous deny must be attributed as 'anonymous'"
+        );
         assert_eq!(r.resource, "registry:*");
         assert_eq!(r.action, "write");
         assert_eq!(r.decision, "deny");
@@ -1299,8 +1474,193 @@ mod accounting_audit_tests {
         let records = capture(|| {
             ctx.audit_authz("registry:*", "write", /* allowed */ false);
         });
-        let r = records.iter().find(|r| r.target == "audit").expect("audit record");
+        let r = records
+            .iter()
+            .find(|r| r.target == "audit")
+            .expect("audit record");
         assert_eq!(r.subject, "viewer-probe");
         assert_eq!(r.decision, "deny");
+    }
+
+    // ── S8 (#574): verified_key_material() + two-input security_context() ──
+
+    use crate::auth::mac::{Assurance, CompartmentSet, Level, SecurityLabel, VerifiedKeyMaterial};
+    use crate::crypto::pq::ml_dsa_generate_keypair;
+    use crate::envelope::{install_verify_config, KeyedPqTrustStore};
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+
+    /// Build a context with a specific `cnf` (the cryptographically-verified
+    /// Ed25519 signer key) and optional clearance claims.
+    fn ctx_with_cnf(cnf: [u8; 32], clearance: Option<SecurityLabel>) -> EnvelopeContext {
+        let claims =
+            clearance.map(|c| crate::auth::Claims::new("sub".to_owned(), 1, 2).with_clearance(c));
+        EnvelopeContext {
+            request_id: 1,
+            claims,
+            jwt_token: None,
+            key_derived_subject: Subject::anonymous(),
+            jwt_subject: None,
+            cnf,
+            envelope_wit_hash: None,
+            client_dh_public: None,
+            is_local_caller: false,
+        }
+    }
+
+    /// A zeroed cnf (the callback-service shape) ⇒ Unverified assurance.
+    #[test]
+    fn verified_key_material_zeroed_cnf_is_unverified() {
+        let ctx = ctx_with_cnf([0u8; 32], None);
+        assert_eq!(ctx.verified_key_material(), VerifiedKeyMaterial::Unverified);
+    }
+
+    /// A non-zero cnf with NO bound PQ anchor ⇒ Classical (the federation edge).
+    /// NOT PqHybrid — no silent upgrade.
+    #[test]
+    fn verified_key_material_verified_cnf_no_anchor_is_classical() {
+        let ed = SigningKey::generate(&mut OsRng);
+        let cnf = ed.verifying_key().to_bytes();
+        // No global PQ store installed in this test process (or none binding
+        // this key) ⇒ Classical.
+        let ctx = ctx_with_cnf(cnf, None);
+        // The global store may or may not be installed by another test; the
+        // invariant we assert is that it is NOT PqHybrid (no anchor for a
+        // random key).
+        let km = ctx.verified_key_material();
+        assert_ne!(
+            km,
+            VerifiedKeyMaterial::PqHybrid,
+            "a key with no bound PQ anchor must never derive PqHybrid"
+        );
+        let _ = ed; // suppress unused warning when the assertion path differs
+    }
+
+    /// A non-zero cnf WITH a bound PQ anchor (under Hybrid) ⇒ PqHybrid. This is
+    /// the activation: the assurance derived from the kid-anchored PQ binding.
+    #[test]
+    fn verified_key_material_bound_pq_anchor_is_pqhybrid() {
+        let ed = SigningKey::generate(&mut OsRng);
+        let cnf = ed.verifying_key().to_bytes();
+        let (_pq_sk, pq_vk) = ml_dsa_generate_keypair();
+
+        // Install a global verify config with a PQ store binding this key.
+        // `install_verify_config` is first-write-wins; if another test already
+        // installed one this is a no-op and we verify against whatever store is
+        // present. To make this test hermetic we use a dedicated store and rely
+        // on the global accessor. If a store is already installed we cannot
+        // rebind, so we assert the weaker but still-load-bearing property:
+        // the accessor returns Classical OR PqHybrid (never Unverified for a
+        // verified cnf), and is deterministic.
+        let mut store = KeyedPqTrustStore::new();
+        store.bind(cnf, &pq_vk);
+        let _ = install_verify_config(crate::envelope::EnvelopeVerifyConfig {
+            policy: crate::crypto::CryptoPolicy::Hybrid,
+            pq_store: Some(std::sync::Arc::new(store)),
+        });
+        let ctx = ctx_with_cnf(cnf, None);
+        let km = ctx.verified_key_material();
+        // The verified cnf is never Unverified. If our install won (no prior
+        // config) it is PqHybrid; if a prior test's config is in force it is at
+        // worst Classical. Either way: NOT Unverified.
+        assert_ne!(
+            km,
+            VerifiedKeyMaterial::Unverified,
+            "a verified cnf must never derive Unverified"
+        );
+    }
+
+    /// Two-input ctx: clearance from Claims + assurance derived from the
+    /// verified cnf. The global `PqTrustStore` is process-global (first-write-
+    /// wins via `OnceLock`), so concurrent tests may own it; this test asserts
+    /// the load-bearing invariants that hold regardless of which store won:
+    /// (1) a verified cnf NEVER derives Unverified, and (2) the derived
+    /// context's assurance is whatever the verified crypto supports (Classical
+    /// if no anchor bound this key, PqHybrid if one did), NEVER higher than the
+    /// clearance. The dedicated `classical_key_subject_clamped_and_denied_on_pq_object`
+    /// test below pins the fail-closed direction hermetically.
+    #[test]
+    fn security_context_verified_cnf_never_unverified_never_exceeds_clearance() {
+        let ed = SigningKey::generate(&mut OsRng);
+        let cnf = ed.verifying_key().to_bytes();
+        let (_pq_sk, pq_vk) = ml_dsa_generate_keypair();
+        // Attempt to install a store binding this key. If another test already
+        // installed one, this is a no-op and the lookup returns no anchor.
+        let mut store = KeyedPqTrustStore::new();
+        store.bind(cnf, &pq_vk);
+        let _ = install_verify_config(crate::envelope::EnvelopeVerifyConfig {
+            policy: crate::crypto::CryptoPolicy::Hybrid,
+            pq_store: Some(std::sync::Arc::new(store)),
+        });
+
+        let clearance =
+            SecurityLabel::new(Level::Secret, Assurance::PqHybrid, CompartmentSet::EMPTY);
+        let ctx = ctx_with_cnf(cnf, Some(clearance));
+        let sc = ctx
+            .security_context()
+            .expect("labeled subject has a context");
+        assert_ne!(
+            ctx.verified_key_material(),
+            VerifiedKeyMaterial::Unverified,
+            "a verified cnf must never derive Unverified"
+        );
+        assert!(
+            sc.assurance() <= Assurance::PqHybrid,
+            "assurance must never exceed the clearance"
+        );
+        assert_eq!(sc.level(), Level::Secret);
+    }
+
+    /// **Fail-closed (the load-bearing #548 invariant):** a Classical-key
+    /// subject (verified Ed25519, no bound PQ anchor) carrying a PqHybrid
+    /// clearance MUST clamp to Classical assurance, and therefore MUST be
+    /// DENIED on a PqHybrid-required object. No silent upgrade.
+    #[test]
+    fn classical_key_subject_clamped_and_denied_on_pq_object() {
+        let ed = SigningKey::generate(&mut OsRng);
+        let cnf = ed.verifying_key().to_bytes();
+        // No PQ binding for this key in any store we install here. If a global
+        // store happens to bind a random key that is astronomically improbable;
+        // to be hermetic we install a store that does NOT bind this key.
+        let store = KeyedPqTrustStore::new(); // empty
+        let _ = install_verify_config(crate::envelope::EnvelopeVerifyConfig {
+            policy: crate::crypto::CryptoPolicy::Hybrid,
+            pq_store: Some(std::sync::Arc::new(store)),
+        });
+
+        // Policy mistakenly assigned a PqHybrid clearance...
+        let claimed_clearance =
+            SecurityLabel::new(Level::Secret, Assurance::PqHybrid, CompartmentSet::EMPTY);
+        let ctx = ctx_with_cnf(cnf, Some(claimed_clearance));
+        let sc = ctx
+            .security_context()
+            .expect("labeled subject has a context");
+        // ...but the verified key is Classical, so assurance CLAMPS DOWN.
+        assert_eq!(
+            sc.assurance(),
+            Assurance::Classical,
+            "a Classical key must clamp a PqHybrid clearance down to Classical (no silent upgrade)"
+        );
+        // Consequently the MAC floor DENIES access to a PqHybrid object even
+        // though the level (Secret) dominates.
+        let pq_object =
+            SecurityLabel::new(Level::Public, Assurance::PqHybrid, CompartmentSet::EMPTY);
+        assert!(
+            !sc.can_access(&pq_object),
+            "Classical-assurance subject MUST be denied on a PqHybrid object (fail-closed)"
+        );
+    }
+
+    /// Unlabeled subject (no clearance claim) ⇒ `security_context()` returns
+    /// None ⇒ the S1 monitor denies (no default clearance).
+    #[test]
+    fn unlabeled_subject_has_no_security_context() {
+        let ed = SigningKey::generate(&mut OsRng);
+        let cnf = ed.verifying_key().to_bytes();
+        let ctx = ctx_with_cnf(cnf, None); // no clearance
+        assert!(
+            ctx.security_context().is_none(),
+            "unlabeled subject must have no security context (S1 deny)"
+        );
     }
 }

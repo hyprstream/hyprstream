@@ -52,10 +52,11 @@
 //! - Security labels, clearance, dominance → S1 (`hyprstream_rpc::auth::mac`).
 //! - DPoP sender-binding (#514/#515) → `services::oauth::dpop`.
 //! - JWT signing → `services::oauth` (via `hyprstream_rpc::auth::jwt`).
-//! - Hybrid-PQC signing of the minted tokens → **S8 (#574)**. This module uses
-//!   the existing (classical / composite) signing path and leaves a clear
-//!   `// TODO(S8):` at the mint seam. Hybridization of the *tokens* is not this
-//!   PR; the UCAN/approval signatures it consumes are already hybrid.
+//! - Hybrid-PQC signing of the minted tokens → **S8 (#574) landed**: the
+//!   `mint_grant_token` path now signs via the hybrid composite JWT
+//!   (`encode_composite_ml_dsa_65_ed25519`) when an ML-DSA-65 key is
+//!   provisioned, matching the hybrid signature on the UCAN/approval it
+//!   consumes. Classical Ed25519 is the explicit policy-selected fallback.
 //!
 //! ## Scope of this PR (core, sound, tested) vs. deferred
 //!
@@ -409,14 +410,15 @@ mod tests {
         Assurance, CompartmentSet, Level, SecurityLabel, VerifiedKeyMaterial,
     };
     use hyprstream_rpc::auth::ucan::capability::{Ability, Capability, Resource};
-    use hyprstream_rpc::auth::ucan::token::{Did, Ucan, UcanError, UcanPayload, UcanVerifier};
+    use hyprstream_rpc::auth::ucan::token::{
+        Did, Ucan, UcanError, UcanPayload, UcanVerifier, UCAN_AAD,
+    };
     use hyprstream_rpc::crypto::cose_sign::{sign_composite, verify_composite};
     use hyprstream_rpc::crypto::pq::{ml_dsa_generate_keypair, MlDsaSigningKey, MlDsaVerifyingKey};
     use std::collections::HashMap;
 
-    /// Domain-separation AAD for UCAN payload signatures — matches S5's
-    /// (`hs-mac-ucan-payload-v1`), so signatures produced here verify under S5.
-    const UCAN_AAD: &[u8] = b"hs-mac-ucan-payload-v1";
+    // UCAN payload-signature AAD is the public `hyprstream_rpc::auth::ucan::token::UCAN_AAD`
+    // constant (S8 promoted it so production verifiers and tests share the exact bytes).
 
     /// Trusted `now` inside every test UCAN's validity window
     /// (`not_before: None`, `expiration: 9_999_999_999`).

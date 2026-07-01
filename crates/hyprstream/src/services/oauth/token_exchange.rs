@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 
 use super::state::OAuthState;
 use crate::mac::exchange::{
-    evaluate_grant, GrantDecision, GrantedAccess, GrantError, GrantRequest,
+    evaluate_grant, GrantDecision, GrantError, GrantRequest, GrantedAccess,
 };
 use crate::services::generated::policy_client::IssueToken;
 
@@ -45,7 +45,11 @@ pub async fn exchange_token_exchange(
 ) -> Response {
     // Actor token (delegation) is deferred — RFC 8693 §4.
     if actor_token.is_some() {
-        return tx_error(StatusCode::BAD_REQUEST, "invalid_request", "actor_token is not supported");
+        return tx_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "actor_token is not supported",
+        );
     }
 
     // Only access_token is supported as the requested output type.
@@ -79,12 +83,15 @@ pub async fn exchange_token_exchange(
     // Covers all token types, regardless of whether they carry a jti claim.
     let token_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(subject_token.as_bytes()));
     if !state.check_and_record_dpop_jti(&token_hash, verified.iat) {
-        return tx_error(StatusCode::BAD_REQUEST, "invalid_grant", "subject_token already used (replay)");
+        return tx_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "subject_token already used (replay)",
+        );
     }
 
-    let requested_scopes: Option<Vec<String>> = scope.map(|s| {
-        s.split_whitespace().map(str::to_owned).collect()
-    });
+    let requested_scopes: Option<Vec<String>> =
+        scope.map(|s| s.split_whitespace().map(str::to_owned).collect());
 
     // Encode cnf key bytes for PolicyService (same path as user_pub_key in other flows).
     let user_pub_key = verified.cnf_key_bytes.map(|b| URL_SAFE_NO_PAD.encode(b));
@@ -123,7 +130,11 @@ pub async fn exchange_token_exchange(
         }
         Err(e) => {
             tracing::error!(sub = %verified.sub, error = %e, "Token exchange issuance failed");
-            tx_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "Failed to issue token")
+            tx_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "Failed to issue token",
+            )
         }
     }
 }
@@ -274,46 +285,112 @@ fn tx_error(status: StatusCode, error: &str, description: &str) -> Response {
 // subject's MAC context, calls `evaluate_grant`, and mints the short-ttl
 // sender-bound token the decision authorizes.
 //
-// SCOPE / fail-closed reality: the MAC *clearance* a subject carries is a wire
-// field that lands with S8 (#574, hybrid envelope) — see the S1 BLOCKERS note
-// (`SubjectContextClaims` seam). Until S8 ships `clearance` on `Claims`, the
-// `SubjectContextResolver` below defaults to returning `None`, which
-// `evaluate_grant` maps to `UnlabeledSubject` ⇒ DENY. That is the correct
-// fail-closed posture: there is NO standing access without a verified clearance,
-// and the HTTP path does not fabricate one. The core `evaluate_grant` (with full
-// test coverage of the clearance gate) is the sound, proven core; this handler
-// lights up the happy path automatically the moment S8 supplies a non-`None`
-// resolver.
+// **S8 (#574) activation:** the MAC *clearance* now rides the verified `Claims`
+// (the `clearance` field, signed by the issuing node) and the subject's
+// assurance is derived from the DPoP proof key + the kid-anchored PQ trust
+// store binding. The concrete `ClaimsSubjectContextResolver` does the real
+// two-input S1 derivation. The caller supplies the resolver (built from the
+// subject's verified claims + DPoP-derived key material); passing
+// `DenyUnlabeledResolver` keeps the deny-by-default posture for a node that has
+// not configured subject-clearance resolution.
 
 /// Resolve a UCAN audience DID → the S1 [`SecurityContext`] it presents at grant
 /// time (clearance clamped to verified key material).
 ///
-/// This is the seam S8 (#574) plugs into: once the `clearance` field ships on
-/// the hybrid-signed `Claims`/envelope, an implementor reads it off the verified
-/// identity bound to the audience DID and returns the assembled context. Until
-/// then the default impl returns `None` (→ `UnlabeledSubject` → deny), which is
-/// the fail-closed ZSP posture: no clearance ⇒ no token.
+/// **S8 (#574) ships the real derivation.** The concrete
+/// [`ClaimsSubjectContextResolver`] reads the authority-asserted `clearance`
+/// off verified [`Claims`] and derives assurance from the `VerifiedKeyMaterial`
+/// the caller resolved from the verified crypto (DPoP proof key + PQ trust
+/// store binding). The two-input `security_context(key_material)` clamps the
+/// assurance axis DOWN to what the verified key supports — the load-bearing
+/// #548 invariant.
 ///
 /// SECURITY: the resolution MUST be from *authority-asserted* clearance (a
 /// field the issuing node signed), never from a self-asserted claim in the
 /// UCAN. The UCAN is the grant; the clearance is independent state the MAC
-/// model holds about the subject.
+/// model holds about the subject. `None` (→ `UnlabeledSubject` → deny) remains
+/// the fail-closed posture for a subject the resolver has no verified claims
+/// for.
 pub trait SubjectContextResolver: Send + Sync {
     /// The clearance context for `audience_did`, or `None` if the subject is
     /// unlabeled / unverified. `None` ⇒ `evaluate_grant` denies.
     fn resolve(&self, audience_did: &str) -> Option<hyprstream_rpc::auth::mac::SecurityContext>;
 }
 
-/// A no-op resolver that always returns `None` — the fail-closed default until
-/// S8 (#574) ships a concrete `SubjectContextResolver` reading the `clearance`
-/// field off verified claims.
+/// A no-op resolver that always returns `None` — the explicit fail-closed
+/// choice for a node that has not configured subject-clearance resolution.
+/// Production under MAC SHOULD wire [`ClaimsSubjectContextResolver`] instead.
 pub struct DenyUnlabeledResolver;
 
 impl SubjectContextResolver for DenyUnlabeledResolver {
     fn resolve(&self, _audience_did: &str) -> Option<hyprstream_rpc::auth::mac::SecurityContext> {
-        // Fail-closed: no clearance is known ⇒ no token. See the trait docs and
-        // the S1 BLOCKERS note on why this cannot be loosened before S8.
+        // Fail-closed: no clearance is known ⇒ no token. See the trait docs.
         None
+    }
+}
+
+/// **S8 (#574):** the concrete `SubjectContextResolver` that does the real
+/// two-input MAC context derivation.
+///
+/// Construct it with the subject's verified [`Claims`] (carrying the
+/// authority-asserted `clearance` field) and the [`VerifiedKeyMaterial`]
+/// derived from the verified crypto (the DPoP proof key + the kid-anchored PQ
+/// trust store binding, exactly what
+/// [`EnvelopeContext::verified_key_material`](hyprstream_rpc::service::EnvelopeContext::verified_key_material)
+/// computes). [`SubjectContextResolver::resolve`] then returns the assembled
+/// [`SecurityContext`] — clearance clamped to the crypto-derived assurance.
+///
+/// The resolver matches `audience_did` against the claims' subject (the
+/// principal the clearance was issued to). A mismatch ⇒ `None` ⇒ deny: the
+/// clearance cannot be borrowed across identities.
+///
+/// This is what flips S6 from deny-everything to actually-issuing-tokens for
+/// verified subjects. For a fully-verified PQ subject (PqHybrid key material +
+/// a clearance that dominates the object label), `evaluate_grant` permits; for
+/// a classical-key subject on a PQ-required object, the clamped assurance
+/// floors to Classical and the dominance check denies (fail-closed).
+pub struct ClaimsSubjectContextResolver {
+    /// The audience DID this resolver's claims are bound to. `resolve()` checks
+    /// the grant's audience matches before returning the context (anti-borrow).
+    audience_did: String,
+    /// The subject's verified claims, carrying the authority-asserted clearance.
+    claims: hyprstream_rpc::auth::Claims,
+    /// Assurance derived from the verified crypto (DPoP key + PQ anchor).
+    key_material: hyprstream_rpc::auth::mac::VerifiedKeyMaterial,
+}
+
+impl ClaimsSubjectContextResolver {
+    /// Construct a resolver for a single subject. `claims` is the subject's
+    /// verified JWT claims (signed by the issuing node, so the `clearance` is
+    /// authority-asserted). `key_material` is the assurance derived from the
+    /// verified DPoP proof key + PQ trust store binding. `audience_did` is the
+    /// DID the clearance was issued to; a grant whose audience differs is
+    /// denied (the clearance cannot cross identities).
+    pub fn new(
+        audience_did: impl Into<String>,
+        claims: hyprstream_rpc::auth::Claims,
+        key_material: hyprstream_rpc::auth::mac::VerifiedKeyMaterial,
+    ) -> Self {
+        Self {
+            audience_did: audience_did.into(),
+            claims,
+            key_material,
+        }
+    }
+}
+
+impl SubjectContextResolver for ClaimsSubjectContextResolver {
+    fn resolve(&self, audience_did: &str) -> Option<hyprstream_rpc::auth::mac::SecurityContext> {
+        use hyprstream_rpc::auth::mac::SubjectContextClaims as _;
+        // Anti-borrow: the clearance was issued to `self.audience_did`; a grant
+        // presented for a DIFFERENT audience cannot use this subject's clearance.
+        if audience_did != self.audience_did.as_str() {
+            return None;
+        }
+        // The two-input S1 derivation: clearance (from Claims) + assurance (from
+        // verified key material). SecurityContext::from_clearance clamps the
+        // assurance axis DOWN to what the crypto supports — no silent upgrade.
+        self.claims.security_context(self.key_material)
     }
 }
 
@@ -457,11 +534,9 @@ fn grant_error_response(e: GrantError) -> Response {
         // `insufficient_scope`: the request is not within the grant/label the
         // subject is authorized for. Distinct GrantError variants (different
         // gates) but the same OAuth error shape for the client.
-        GrantError::OverCeiling { .. } | GrantError::InsufficientClearance => (
-            StatusCode::FORBIDDEN,
-            "insufficient_scope",
-            e.to_string(),
-        ),
+        GrantError::OverCeiling { .. } | GrantError::InsufficientClearance => {
+            (StatusCode::FORBIDDEN, "insufficient_scope", e.to_string())
+        }
         GrantError::MissingSenderBinding => {
             (StatusCode::BAD_REQUEST, "invalid_request", e.to_string())
         }
@@ -478,7 +553,10 @@ fn grant_error_response(e: GrantError) -> Response {
 /// `scope` is the S3 `action:resource:identifier` triple (the requested access);
 /// `audience` is the RFC 8707 resource indicator (optional). The object label
 /// is `None` here (resolved separately — see TODO(#572-object-label)).
-fn parse_grant_request(scope: Option<&str>, audience: Option<&str>) -> Result<GrantRequest, String> {
+fn parse_grant_request(
+    scope: Option<&str>,
+    audience: Option<&str>,
+) -> Result<GrantRequest, String> {
     use hyprstream_rpc::auth::ucan::capability::{Ability, Caveats, Resource};
 
     let scope_str = scope.ok_or_else(|| "scope is required for UCAN grant".to_owned())?;
@@ -504,17 +582,23 @@ fn parse_grant_request(scope: Option<&str>, audience: Option<&str>) -> Result<Gr
 /// never the whole grant. It is bound to the DPoP `jkt` (`cnf.jkt`) and carries
 /// a short ttl. A refresh token is stored when a token DB is configured.
 ///
-// TODO(S8): hybrid-PQC sign the minted token (the *envelope* hybridization).
-//   Today the existing (composite-when-available / classical-fallback) signing
-//   path is used. The UCAN grant and approval it consumed are already hybrid;
-//   only the minted OAuth token awaits S8 for its own hybrid signature.
+/// **S8 (#574):** the minted token is signed with the **hybrid** composite JWT
+/// signature (EdDSA + ML-DSA-65, `alg: "ML-DSA-65-Ed25519"`) when the node has
+/// a provisioned ML-DSA-65 key, matching the hybrid signature on the UCAN grant
+/// and approval it consumed. The minted token is the same kind of
+/// confidentiality/integrity-critical authority artifact the rest of the MAC
+/// stack signs hybridly. When no ML-DSA-65 key is provisioned, the token falls
+/// back to the policy-selected classical Ed25519 suite (the explicit pinned
+/// suite — never an in-band downgrade).
 async fn mint_grant_token(
     state: &Arc<OAuthState>,
     granted: &GrantedAccess,
     dpop_jkt: &str,
 ) -> Response {
     let now = chrono::Utc::now().timestamp();
-    let ttl = state.token_ttl.min(crate::mac::exchange::MAX_ACCESS_TOKEN_TTL_SECS);
+    let ttl = state
+        .token_ttl
+        .min(crate::mac::exchange::MAX_ACCESS_TOKEN_TTL_SECS);
     let expires_at = now + ttl as i64;
 
     // The token subject is the grant's audience (the delegate). The capability
@@ -547,18 +631,27 @@ async fn mint_grant_token(
     //   binding + short ttl are the load-bearing controls.
     let _ = scope_str;
 
-    // Sign via the active JWT signing key (composite-PQ when configured, else
-    // Ed25519). Same path as the WIT/access-token minting in PolicyService.
-    let token = match state.active_jwt_signing_key().await {
-        Some(sk) => crate::auth::jwt::encode(&claims, &sk),
-        None => {
-            tracing::error!("no active JWT signing key configured; cannot mint UCAN grant token");
-            return tx_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "token signing not configured",
-            );
-        }
+    // S8 (#574): sign via the hybrid composite (EdDSA + ML-DSA-65) when an
+    // ML-DSA-65 key is provisioned; fall back to the policy-selected classical
+    // Ed25519 suite otherwise. The hybrid path is the same construction the
+    // PolicyService uses for WIT/access-token minting. The UCAN grant and
+    // approval this token was minted from are already hybrid-signed.
+    let Some(ed_sk) = state.active_jwt_signing_key().await else {
+        tracing::error!("no active JWT signing key configured; cannot mint UCAN grant token");
+        return tx_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "token signing not configured",
+        );
+    };
+    let pq_sk = if let Some(store) = &state.ml_dsa_key_store {
+        store.active_key().await
+    } else {
+        None
+    };
+    let token = match pq_sk {
+        Some(pq) => crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(&claims, &pq, &ed_sk),
+        None => crate::auth::jwt::encode(&claims, &ed_sk),
     };
 
     // Optional refresh token (ZSP: refresh re-runs evaluate_grant, not a free
@@ -626,9 +719,120 @@ async fn issue_grant_refresh_token(
     };
 
     if let Some(db) = &state.token_db {
-        if let Err(e) = db.put(&refresh, &entry, state.refresh_token_ttl as u64).await {
+        if let Err(e) = db
+            .put(&refresh, &entry, state.refresh_token_ttl as u64)
+            .await
+        {
             tracing::warn!(error = %e, "failed to persist UCAN grant refresh token");
         }
     }
     refresh
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    //! S8 (#574) activation tests for the concrete `SubjectContextResolver`.
+    //! These cover the two input MAC context derivation (clearance from Claims
+    //! plus assurance from verified key material) and the fail closed
+    //! properties: anti borrow, classical key on PQ object denial, and
+    //! unlabeled denial.
+    use super::*;
+    use hyprstream_rpc::auth::mac::{
+        Assurance, CompartmentSet, Level, SecurityLabel, VerifiedKeyMaterial,
+    };
+
+    /// A compartment bitset from bit indices.
+    fn comps(bits: &[u32]) -> CompartmentSet {
+        bits.iter().copied().collect()
+    }
+
+    /// A PqHybrid-cleared subject mints a context whose assurance is PqHybrid.
+    /// This is the activation: a fully-verified PQ subject gets a real context,
+    /// not a denial.
+    #[test]
+    fn pqhybrid_subject_resolves_to_pqhybrid_context() {
+        let did = "did:key:z6MkpTHR8VNsBxYAAHWutMGeQ4hz2FV6B14xd9CZpkmS5i5o";
+        let clearance = SecurityLabel::new(Level::Secret, Assurance::PqHybrid, comps(&[0, 1]));
+        let claims =
+            hyprstream_rpc::auth::Claims::new("sub".to_owned(), 1, 2).with_clearance(clearance);
+        let resolver =
+            ClaimsSubjectContextResolver::new(did, claims, VerifiedKeyMaterial::PqHybrid);
+
+        let ctx = resolver.resolve(did).expect("PqHybrid subject resolves");
+        assert_eq!(ctx.assurance(), Assurance::PqHybrid);
+        assert_eq!(ctx.level(), Level::Secret);
+    }
+
+    /// Anti-borrow: a grant whose audience DID differs from the one the
+    /// clearance was issued to MUST be denied (`None`). The clearance cannot
+    /// cross identities.
+    #[test]
+    fn resolver_denies_mismatched_audience_did() {
+        let owner = "did:key:z6MkpTHR8VNsBxYAAHWutMGeQ4hz2FV6B14xd9CZpkmS5i5o";
+        let impostor = "did:key:z6MkmFpYUWaBjIA4ZJarQtz5FaGGCLpJ4xjXQqRuV4Dx4q6P";
+        let clearance =
+            SecurityLabel::new(Level::Secret, Assurance::PqHybrid, CompartmentSet::EMPTY);
+        let claims =
+            hyprstream_rpc::auth::Claims::new("sub".to_owned(), 1, 2).with_clearance(clearance);
+        let resolver =
+            ClaimsSubjectContextResolver::new(owner, claims, VerifiedKeyMaterial::PqHybrid);
+
+        assert!(
+            resolver.resolve(impostor).is_none(),
+            "a grant for a different audience MUST NOT borrow this subject's clearance"
+        );
+    }
+
+    /// **Fail-closed (the #548 invariant at the resolver):** a Classical-key
+    /// subject carrying a PqHybrid clearance MUST clamp to Classical assurance.
+    /// The resolver does not grant assurance the key does not back.
+    #[test]
+    fn classical_key_clamps_pqhybrid_clearance_down() {
+        let did = "did:key:z6MkpTHR8VNsBxYAAHWutMGeQ4hz2FV6B14xd9CZpkmS5i5o";
+        // Policy mistakenly assigned PqHybrid...
+        let claimed = SecurityLabel::new(Level::Secret, Assurance::PqHybrid, CompartmentSet::EMPTY);
+        let claims =
+            hyprstream_rpc::auth::Claims::new("sub".to_owned(), 1, 2).with_clearance(claimed);
+        // ...but the verified key is Classical:
+        let resolver =
+            ClaimsSubjectContextResolver::new(did, claims, VerifiedKeyMaterial::Classical);
+
+        let ctx = resolver.resolve(did).expect("labeled subject resolves");
+        assert_eq!(
+            ctx.assurance(),
+            Assurance::Classical,
+            "Classical key must clamp a PqHybrid clearance down (no silent upgrade)"
+        );
+
+        // Consequently the MAC floor DENIES a PqHybrid object.
+        let pq_object =
+            SecurityLabel::new(Level::Public, Assurance::PqHybrid, CompartmentSet::EMPTY);
+        assert!(
+            !ctx.can_access(&pq_object),
+            "Classical-assurance subject MUST be denied on a PqHybrid object (fail-closed)"
+        );
+    }
+
+    /// A subject with no clearance claim ⇒ `None` ⇒ the S1 monitor denies.
+    #[test]
+    fn unlabeled_subject_resolves_to_none() {
+        let did = "did:key:z6MkpTHR8VNsBxYAAHWutMGeQ4hz2FV6B14xd9CZpkmS5i5o";
+        // No `with_clearance` ⇒ no clearance field.
+        let claims = hyprstream_rpc::auth::Claims::new("sub".to_owned(), 1, 2);
+        let resolver =
+            ClaimsSubjectContextResolver::new(did, claims, VerifiedKeyMaterial::PqHybrid);
+
+        assert!(
+            resolver.resolve(did).is_none(),
+            "unlabeled subject MUST resolve to None (S1 deny)"
+        );
+    }
+
+    /// `DenyUnlabeledResolver` remains the explicit deny-by-default choice.
+    #[test]
+    fn deny_unlabeled_resolver_always_denies() {
+        let r = DenyUnlabeledResolver;
+        assert!(r.resolve("did:key:anything").is_none());
+    }
 }
