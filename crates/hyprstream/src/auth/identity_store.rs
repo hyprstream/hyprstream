@@ -405,6 +405,17 @@ pub fn load_or_generate_node_signing_key(secrets_dir: &std::path::Path) -> Resul
     Ok(key)
 }
 
+/// Decode the `exp` claim from a JWT without signature verification.
+/// Returns `None` on any parse error (invalid base64, not JSON, missing exp).
+pub fn decode_jwt_exp_raw(jwt: &str) -> Option<i64> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    let payload_b64 = jwt.split('.').nth(1)?;
+    let payload = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    value["exp"].as_i64()
+}
+
 /// Return the Unix mtime of `secrets_dir/signing-key`, or `now` if missing.
 /// Used to populate the `nbf` field in JWKS entries (key was valid since written).
 pub fn node_signing_key_mtime(secrets_dir: &std::path::Path) -> i64 {

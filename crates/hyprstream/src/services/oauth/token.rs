@@ -283,7 +283,7 @@ async fn verify_dpop_at_token_endpoint(
         }
     };
     // JTI replay check.
-    if !state.check_and_record_dpop_jti(&proof.jti, proof.iat).await {
+    if !state.check_and_record_dpop_jti(&proof.jti, proof.iat) {
         tracing::warn!(jti = %proof.jti, "DPoP JTI replay detected");
         return Some(Err(token_error(StatusCode::BAD_REQUEST, "invalid_dpop_proof", Some("DPoP proof jti already used"))));
     }

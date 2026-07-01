@@ -30,7 +30,15 @@ pub struct CorsConfig {
     #[serde(default = "default_cors_max_age")]
     pub max_age: u64,
 
-    /// Allow all headers (permissive mode for development - NOT recommended for production)
+    /// Allow all headers in CORS preflights (`Access-Control-Allow-Headers: *`).
+    ///
+    /// This deliberately widens the preflight surface and must stay confined to
+    /// fully-public, secret-free GET endpoints whose contents carry no
+    /// authorization — currently only the DID-document routes (see
+    /// [`CorsConfig::did_document`]), where W3C DID Core requires the documents to
+    /// be fetchable cross-origin with arbitrary request headers. It is left
+    /// `false` for the broad public router (`CorsConfig::public`) and every other
+    /// surface so they keep their explicit header allowlist.
     #[serde(default)]
     pub permissive_headers: bool,
 }
@@ -67,7 +75,13 @@ impl Default for CorsConfig {
 
 impl CorsConfig {
     /// CORS config for public endpoints (OAuth metadata, token, registration).
-    /// Allows any origin but disables credentials (per CORS spec, wildcard + credentials is invalid).
+    ///
+    /// Allows any origin but disables credentials (per CORS spec, wildcard +
+    /// credentials is invalid). `permissive_headers` stays `false`: this broad
+    /// router fronts secret-bearing endpoints (`/oauth/token`, `/oauth/register`,
+    /// `/oauth/par`, `/oauth/revoke`, SCIM discovery, …), so it keeps the explicit
+    /// request-header allowlist. The arbitrary-header relaxation needed by public
+    /// DID documents is scoped separately via [`CorsConfig::did_document`].
     pub fn public() -> Self {
         Self {
             enabled: true,
@@ -75,6 +89,28 @@ impl CorsConfig {
             allow_credentials: false,
             max_age: 3600,
             permissive_headers: false,
+        }
+    }
+
+    /// CORS config for the public DID-document routes only.
+    ///
+    /// Per W3C DID Core, a DID document is a public identity anchor that carries
+    /// no authorization and must be fetchable cross-origin with arbitrary request
+    /// headers (e.g. extension/SDK-injected headers, `ngrok-skip-browser-warning`
+    /// for dev tunnels) without preflight rejection. These are secret-free GET
+    /// endpoints, so `permissive_headers` is enabled here and nowhere else.
+    ///
+    /// Applied as a route-group layer on the DID routes (`/.well-known/did.json`,
+    /// `/.well-known/atproto-did`, `/users/:username/did.json`,
+    /// `/clients/:client_id/did.json`) so the relaxation never reaches the broad
+    /// public router (closes #472).
+    pub fn did_document() -> Self {
+        Self {
+            enabled: true,
+            allowed_origins: vec!["*".to_owned()],
+            allow_credentials: false,
+            max_age: 3600,
+            permissive_headers: true,
         }
     }
 

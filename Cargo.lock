@@ -6380,6 +6380,7 @@ dependencies = [
  "hyprstream-service",
  "hyprstream-tcl",
  "hyprstream-tui",
+ "hyprstream-util",
  "hyprstream-vfs",
  "hyprstream-workers",
  "image",
@@ -6515,6 +6516,7 @@ dependencies = [
  "hyprstream-rpc",
  "hyprstream-rpc-build",
  "hyprstream-rpc-derive",
+ "hyprstream-util",
  "p256",
  "parking_lot 0.12.4",
  "rand 0.8.5",
@@ -6819,6 +6821,13 @@ dependencies = [
  "uuid 1.18.1",
  "waxterm",
  "zeroize",
+]
+
+[[package]]
+name = "hyprstream-util"
+version = "0.1.0"
+dependencies = [
+ "parking_lot 0.12.4",
 ]
 
 [[package]]

@@ -22,6 +22,10 @@ pub mod msg;
 pub mod client;
 pub mod backend;
 pub mod memory;
+// The translator is the server-side TCP accept loop (tokio::net). `net` pulls
+// `mio`, which has no wasm32 backend, so the whole module is native-only. The
+// browser/wasm build reaches the backend through the DMA/Wanix client path.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod translator;
 
 #[cfg(target_arch = "wasm32")]
@@ -30,4 +34,5 @@ pub mod dma;
 pub mod wanix_mount;
 
 pub use backend::{Backend, OpenResult, StatResult, WalkResult};
+#[cfg(not(target_arch = "wasm32"))]
 pub use translator::{FidTable, Translator};

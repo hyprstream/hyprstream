@@ -1,0 +1,14 @@
+# cargo-nextest config — consumed by the merge-gate `build` job in
+# .github/workflows/rust.yml (cargo nextest run --profile ci).
+#
+# slow-timeout marks a test "slow" after `period`, then SIGKILLs it after
+# `terminate-after` periods. So a deadlocked test (e.g. a moq relay reconnect
+# that never settles) dies at ~3 x 60s = 3min and fails the run fast, instead of
+# burning the whole job / merge-queue budget (job timeout 115min, queue 120min).
+#
+# This is a per-TEST cap: the legitimate suite is long (~76min on main), so a
+# global/per-step timeout could not distinguish a hang from healthy runtime.
+# If a genuinely-slow-but-correct test trips this, raise `period` (a test is only
+# KILLED after `terminate-after` periods, not merely flagged slow).
+[profile.ci]
+slow-timeout = { period = "60s", terminate-after = 3 }

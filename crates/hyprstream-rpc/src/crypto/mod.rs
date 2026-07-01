@@ -31,6 +31,7 @@ pub mod cose_sign1;
 pub mod cose_sign;
 pub mod envelope_crypto;
 pub mod event_crypto;
+pub mod group_key;
 pub mod hmac;
 pub mod key_exchange;
 pub mod notification;
