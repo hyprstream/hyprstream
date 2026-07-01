@@ -229,7 +229,7 @@ mod tests {
         let s = sub("did:web:n", "ai.hyprstream.model", "v1");
         let p = keyed_broadcast_path(&[1u8; 32], &s, 0);
         assert!(p.starts_with("local/events/publications/"));
-        assert_eq!(p.split('/').last().unwrap().len(), 64);
+        assert_eq!(p.split('/').next_back().unwrap().len(), 64);
         let p2 = keyed_broadcast_path_with("local/events/g", &[1u8; 32], &s, 0);
         assert!(p2.starts_with("local/events/g/"));
     }
