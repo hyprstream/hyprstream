@@ -161,6 +161,8 @@ pub mod moq_event;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod events;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod latch;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod transport;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dial;
