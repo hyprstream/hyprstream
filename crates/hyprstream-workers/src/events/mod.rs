@@ -1,8 +1,7 @@
 //! Event bus infrastructure — moq-lite backed (#167).
 //!
 //! Provides fan-out event delivery between services using the moq-lite streaming
-//! plane (Live preset: at-most-once, unbounded). Replaces the former ZMQ
-//! XPUB/XSUB ProxyService.
+//! plane. Replaces the former ZMQ XPUB/XSUB ProxyService.
 //!
 //! # Architecture
 //!
@@ -15,13 +14,22 @@
 //! └─────────────┘           └──────────────────────┘
 //! ```
 //!
+//! `EventPublisher`/`EventSubscriber` are the canonical broadcast types
+//! (EV1, EventService consolidation epic #600) — they now live in
+//! `hyprstream-rpc::events` alongside the moq transport and crypto they wire
+//! together, and are re-exported here for back-compat with existing callers.
+//! Default privacy mode is `EventPrivacy::Public` (plaintext, wire-identical
+//! to the pre-EV1 behavior of this crate's old standalone wrapper);
+//! `EventPrivacy::ZeroKnowledge`/`LimitedKnowledge` group-key encrypted modes
+//! are also available — see `hyprstream_rpc::events` docs.
+//!
 //! # Usage
 //!
 //! ```ignore
 //! use hyprstream_workers::events::{EventPublisher, EventSubscriber};
 //!
 //! // Create a publisher (no ZMQ context needed)
-//! let mut publisher = EventPublisher::new("worker")?;
+//! let publisher = EventPublisher::new("worker")?;
 //! publisher.publish("sandbox123", "started", &payload).await?;
 //!
 //! // Create a subscriber
@@ -32,15 +40,13 @@
 //! }
 //! ```
 
-mod publisher;
-pub mod secure_publisher;
-pub mod secure_subscriber;
-mod subscriber;
 pub mod token_manager;
 mod types;
 
-pub use publisher::EventPublisher;
-pub use subscriber::EventSubscriber;
+pub use hyprstream_rpc::events::{
+    EncryptedEvent, EventPublisher, EventSubscriber, RekeyEvent, RekeyPolicy, RotationResult,
+    WrappedKeyEntry,
+};
 
 // Re-export event types
 pub use types::{
@@ -55,7 +61,4 @@ pub use types::{
     serialize_sandbox_started, serialize_sandbox_stopped,
 };
 
-// Secure event transport (Phase 7)
-pub use secure_publisher::{SecureEventPublisher, EncryptedEvent, RekeyPolicy, RotationResult};
-pub use secure_subscriber::SecureEventSubscriber;
 pub use token_manager::EventTokenManager;
