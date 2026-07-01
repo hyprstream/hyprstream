@@ -51,11 +51,11 @@ pub mod error;
 pub use hyprstream_rpc::paths;
 
 pub mod runtime;
-// The `image` module is the universal mountable OCI/RAFS image filesystem
-// service (#633): `RafsStore` + `ImageFs` (an `FsMount`). Any backend that
-// composes an image filesystem consumes it; it no longer requires the VM
-// toolchain. Gated behind `oci-image` (which `kata-vm` implies).
-#[cfg(feature = "oci-image")]
+// The `image` module is always compiled: the `ImageStore` trait +
+// `ImageBackendRegistration` inventory seam are feature-invariant, so
+// `WorkerService` can hold `Option<Arc<dyn ImageStore>>` without any cfg
+// mirror (#646). The concrete `RafsStore` impl + its `submit!` are
+// `oci-image`-gated (they pull the nydus deps); the trait surface is not.
 pub mod image;
 pub mod workflow;
 pub mod events;
@@ -73,21 +73,12 @@ pub use runtime::{WorkerService, SandboxBackend, SandboxHandle, NspawnBackend, N
 pub use runtime::{resolve_backend, BackendCtx, BackendRegistration};
 #[cfg(feature = "kata-vm")]
 pub use runtime::KataBackend;
+// The image-store trait seam is always available; only the concrete RAFS impl
+// (`RafsStore`) requires `oci-image`.
+pub use image::{ImageBackendRegistration, ImageStore};
 #[cfg(feature = "oci-image")]
 pub use image::RafsStore;
 
-/// Feature-invariant alias so `Option<Arc<RafsStore>>` is spellable in
-/// signatures that must compile with and without `oci-image`. When
-/// `oci-image` is off this resolves to `()`, and callers pass `None`; nothing
-/// in the hot path ever constructs the `()` variant — `None` is the only
-/// well-formed value at runtime when the feature is disabled. Keeping the
-/// type uniform avoids `#[cfg]`-gated struct fields and function parameters
-/// (a viral anti-pattern); only the *construction* of a real `RafsStore` is
-/// feature-gated.
-#[cfg(feature = "oci-image")]
-pub type RafsStoreOpt = std::sync::Arc<RafsStore>;
-#[cfg(not(feature = "oci-image"))]
-pub type RafsStoreOpt = ();
 pub use workflow::WorkflowService;
 pub use events::{
     // Publisher/Subscriber (moq-backed, no ZMQ context needed)

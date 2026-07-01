@@ -765,3 +765,65 @@ pub struct ImageMetadata {
     /// Repository name
     pub repository: String,
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ImageStore trait impl + inventory registration (#646)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// `RafsStore` already satisfies the `ImageStore` trait structurally (its public
+// methods match the CRI image ops). This impl makes it dispatchable as
+// `Arc<dyn ImageStore>` from `WorkerService` WITHOUT a cfg mirror — the trait
+// surface is always compiled; only this impl (and the nydus deps it rests on)
+// requires `oci-image`. A future non-RAFS image backend adds its own impl +
+// `submit!` with zero changes to `WorkerService`.
+//
+// The inherent methods (e.g. `RafsStore::list_images`) are called via
+// fully-qualified syntax because the trait methods share names — this avoids
+// the recursion ambiguity without renaming the inherent API.
+
+#[async_trait::async_trait]
+impl crate::image::store_trait::ImageStore for RafsStore {
+    async fn list_images(&self) -> anyhow::Result<Vec<crate::image::ImageInfo>> {
+        RafsStore::list_images(self).await.map_err(Into::into)
+    }
+
+    async fn image_status(
+        &self,
+        image_ref: &str,
+        verbose: bool,
+    ) -> anyhow::Result<crate::image::ImageStatusResult> {
+        RafsStore::image_status(self, image_ref, verbose)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn pull_with_auth(
+        &self,
+        image_ref: &str,
+        auth: Option<&crate::image::AuthConfig>,
+    ) -> anyhow::Result<String> {
+        RafsStore::pull_with_auth(self, image_ref, auth)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn remove_image(&self, image_ref: &str) -> anyhow::Result<()> {
+        RafsStore::remove_image(self, image_ref)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn fs_info(&self) -> anyhow::Result<Vec<crate::image::FilesystemUsage>> {
+        RafsStore::fs_info(self).await.map_err(Into::into)
+    }
+}
+
+inventory::submit! {
+    crate::image::store_trait::ImageBackendRegistration {
+        name: "rafs",
+        construct: |config| {
+            let store = RafsStore::new(config.clone()).map_err(anyhow::Error::from)?;
+            Ok(std::sync::Arc::new(store) as std::sync::Arc<dyn crate::image::store_trait::ImageStore>)
+        },
+    }
+}
