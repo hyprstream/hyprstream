@@ -10,7 +10,7 @@
 //!
 //! Module shape mirrors `hyprstream-workers-tcl`:
 //! - `lib.rs` — the [`PythonShell`] + re-exports of the mount items.
-//! - `mount.rs` — [`PythonMount`] (`impl Mount`), [`PyCommand`], [`create_mount_channel`].
+//! - `mount.rs` — [`PythonMount`] (`impl Mount`), [`PyCommand`], [`PythonMount::spawn`].
 //!
 //! ## Guest ABI used here
 //!
@@ -34,7 +34,7 @@ use wasmtime::Result;
 
 pub mod mount;
 
-pub use mount::{create_mount_channel, PyCommand, PythonMount};
+pub use mount::{PyCommand, PythonMount};
 
 /// The packed-op export name on the python guest (the PERSISTENT interpreter ABI).
 const PY_OP_EXPORT: &str = "py_op";

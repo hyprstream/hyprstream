@@ -20,11 +20,10 @@
 //! holds a `tokio::sync::mpsc::Sender<PyCommand>` and forwards each request to the
 //! thread that owns the shell, which replies over a oneshot.
 //!
-//! This mirrors `hyprstream-workers-tcl`'s `TclMount`/`TclCommand`/`create_mount_channel`
-//! model: build the channel with [`create_mount_channel`], mount
-//! `PythonMount::new(tx)` at `/lang/python`, and have the shell owner drain the
-//! `Receiver<PyCommand>` in its event loop (e.g. `ChatApp::tick()`), calling
-//! [`PythonShell::process_command`](crate::PythonShell::process_command).
+//! [`PythonMount::spawn`] wires this end-to-end: it opens the shell, spawns the
+//! driver thread, and keeps the command channel internal. The driver exits when
+//! the mount is dropped. Mount the result at `/lang/python`; the namespace is the
+//! only interface (epic #508, issue #634).
 //!
 //! Built on `hyprstream-vfs`'s `devfile` primitives (`ControlFile` for
 //! `eval`/`stdout`, `DynamicDir` for `vars`/`defs`) rather than hand-rolling
@@ -34,7 +33,7 @@ use async_trait::async_trait;
 use hyprstream_vfs::devfile::{ControlFile, DevFileState, DevFuture, DynamicDir};
 use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat, Subject};
 
-use crate::PyResult;
+use crate::{PyResult, PythonShell};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Commands sent from async Mount methods to the shell-owning thread.
@@ -108,23 +107,69 @@ type FieldDir = DynamicDir<ListFn, GetFn>;
 // PythonMount
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// VFS mount that proxies `/lang/python` requests to a [`PythonShell`](crate::PythonShell)
-/// over a command channel.
+/// VFS mount that proxies `/lang/python` requests to a
+/// [`PythonShell`](crate::PythonShell) owned by the mount itself.
 ///
-/// Mount at `/lang/python` in the namespace. The shell owner must drain the
-/// `Receiver<PyCommand>` returned by [`create_mount_channel`] in its event loop,
-/// forwarding each command to the shell via
-/// [`PythonShell::process_command`](crate::PythonShell::process_command).
+/// Construct with [`PythonMount::spawn`], which spins up a dedicated driver
+/// thread hosting the [`PythonShell`](crate::PythonShell) and drains the
+/// internal command channel. The driver exits cleanly when the mount is dropped
+/// (all command-channel senders live inside the mount). Callers never hold the
+/// shell, the channel sender, or the receiver — the namespace is the only
+/// interface (epic #508, issue #634).
 pub struct PythonMount {
     eval: PyCtl,
     stdout: PyCtl,
     vars: FieldDir,
     defs: FieldDir,
+    /// Sender clone kept for the mount's lifetime; the driver exits when every
+    /// clone (including the ones inside the devfile closures) drops with the
+    /// mount.
+    _driver_tx: tokio::sync::mpsc::Sender<PyCommand>,
 }
 
 impl PythonMount {
-    /// Create a new `PythonMount` from the sending half of a mount channel.
-    pub fn new(tx: tokio::sync::mpsc::Sender<PyCommand>) -> Self {
+    /// Spawn a self-contained `PythonMount` whose driver thread owns a fresh
+    /// [`PythonShell`](crate::PythonShell) over `sandbox` with `per_call_fuel`.
+    ///
+    /// The driver runs on a plain OS thread (the wasmtime `Store` the shell
+    /// holds may `blocking_send` on a VFS capability, so it MUST NOT run on a
+    /// tokio worker). Mount methods forward each request over an internal
+    /// channel and await the reply; the driver pumps the shell between
+    /// requests via [`PythonShell::process_command`](crate::PythonShell::process_command).
+    #[allow(clippy::expect_used)] // Thread creation failure is unrecoverable
+    pub fn spawn(
+        sandbox: hyprstream_workers_wasmtime::Sandbox,
+        per_call_fuel: u64,
+    ) -> wasmtime::Result<Self> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<PyCommand>(16);
+        std::thread::Builder::new()
+            .name("python-mount-driver".into())
+            .spawn(move || {
+                let Ok(mut shell) = PythonShell::open(&sandbox, per_call_fuel) else {
+                    return;
+                };
+                let mut rx = rx;
+                while let Some(cmd) = rx.blocking_recv() {
+                    shell.process_command(cmd);
+                }
+            })
+            .expect("spawn python-mount-driver");
+        // `tx` is moved into `build`, which stores it as `_driver_tx`; the
+        // devfile closures hold their own clones. Every clone drops with the
+        // mount, which is what signals the driver to exit.
+        Ok(Self::build(tx))
+    }
+
+    /// Build a `PythonMount` over an existing command-channel sender.
+    ///
+    /// Internal helper used by tests that drive the shell via a fake owner
+    /// loop instead of `PythonShell::open`.
+    #[cfg(test)]
+    fn new(tx: tokio::sync::mpsc::Sender<PyCommand>) -> Self {
+        Self::build(tx)
+    }
+
+    fn build(tx: tokio::sync::mpsc::Sender<PyCommand>) -> Self {
         let eval_tx = tx.clone();
         let eval_handler = move |data: Vec<u8>| -> DevFuture<'static, Result<Vec<u8>, MountError>> {
             let tx = eval_tx.clone();
@@ -168,7 +213,7 @@ impl PythonMount {
         );
 
         let defs_list_tx = tx.clone();
-        let defs_get_tx = tx;
+        let defs_get_tx = tx.clone();
         let defs = DynamicDir::new(
             Box::new(move || {
                 let tx = defs_list_tx.clone();
@@ -187,7 +232,13 @@ impl PythonMount {
             }) as GetFn,
         );
 
-        Self { eval, stdout, vars, defs }
+        Self {
+            eval,
+            stdout,
+            vars,
+            defs,
+            _driver_tx: tx,
+        }
     }
 }
 
@@ -323,11 +374,8 @@ impl Mount for PythonMount {
     async fn clunk(&self, _fid: Fid, _caller: &Subject) {}
 }
 
-/// Create a `/lang/python` mount channel: the `Sender` goes to a
-/// [`PythonMount::new`], the `Receiver` is drained by the shell owner (which forwards
-/// each [`PyCommand`] to its [`PythonShell`](crate::PythonShell) via
-/// [`process_command`](crate::PythonShell::process_command)).
-pub fn create_mount_channel() -> (
+#[cfg(test)]
+fn create_mount_channel() -> (
     tokio::sync::mpsc::Sender<PyCommand>,
     tokio::sync::mpsc::Receiver<PyCommand>,
 ) {
