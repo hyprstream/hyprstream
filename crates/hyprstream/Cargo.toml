@@ -215,6 +215,7 @@ hyprstream-rpc-build.workspace = true  # Shared annotation extraction
 
 [dev-dependencies]
 criterion.workspace = true
+proptest.workspace = true  # S5 #571 M2: differential faithfulness property tests
 tempfile.workspace = true
 tokio-stream.workspace = true
 # Test-only: iroh substrate types used by `tests/policy_over_iroh.rs`.

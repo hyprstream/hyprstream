@@ -1227,10 +1227,18 @@ struct Payload {
     const SERVICE_SCHEMA: &str = r#"
 @0xbeefcafebeefcafe;
 
+# Mandatory scope (S3, #547): a method with no $scope is a build error. A minimal
+# local `scope` annotation mirrors the real annotations.capnp shape for this fixture.
+enum ScopeAction {
+  query @0;
+  write @1;
+}
+annotation scope(field) :ScopeAction;
+
 struct PayloadRequest {
   union {
-    ping @0 :Void;
-    echo @1 :Text;
+    ping @0 :Void $scope(query);
+    echo @1 :Text $scope(write);
   }
 }
 

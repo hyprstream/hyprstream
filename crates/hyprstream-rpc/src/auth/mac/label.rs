@@ -257,7 +257,7 @@ impl fmt::Debug for CompartmentSet {
 /// The same type is used for an **object's** classification and a **subject's**
 /// clearance (a clearance is just a label the subject is allowed to read up
 /// to). Dominance and join are defined on the inherent
-/// [`SecurityLabel::dominates`] / [`SecurityLabel::join`] helpers below — note
+/// [`SecurityLabel::can_access`] / [`SecurityLabel::join`] helpers below — note
 /// those helpers encode the *fixed* product-lattice algebra and are independent
 /// of any site policy (the policy in [`super::lattice::Lattice`] only constrains
 /// which labels are *well-formed/known*, never how they compare).
@@ -349,19 +349,20 @@ impl SecurityLabel {
             && self.compartments.is_empty()
     }
 
-    /// **Dominance**: does `self` (as a subject clearance) dominate `object`?
+    /// May a subject with this clearance access an object labelled `object`?
     ///
-    /// `self ⊒ object` ⟺ on *every* axis self is ≥ object:
-    /// - `self.level   >= object.level`            (read-down)
-    /// - `self.assurance >= object.assurance`      (#548)
-    /// - `object.compartments ⊆ self.compartments` (cleared into all required)
+    /// This is the **Bell–LaPadula dominance** relation — clearance `self`
+    /// *dominates* the object label (`self ⊒ object`) iff, on *every* axis, the
+    /// subject is at least the object:
+    /// - `self.level     >= object.level`            (no read-up)
+    /// - `self.assurance >= object.assurance`        (#548 crypto-assurance axis)
+    /// - `object.compartments ⊆ self.compartments`   (cleared into all categories)
     ///
-    /// This is the per-op MAC floor (design §3, §10). It is the *fixed*
-    /// product-lattice order and takes no policy argument: dominance is content
-    /// truth, never overridable by a token/UCAN/grant.
+    /// The per-op MAC floor (design §3, §10): the *fixed* product-lattice order,
+    /// content truth, never overridable by a token/UCAN/grant.
     #[inline]
     #[must_use]
-    pub fn dominates(&self, object: &SecurityLabel) -> bool {
+    pub fn can_access(&self, object: &SecurityLabel) -> bool {
         self.level >= object.level
             && self.assurance >= object.assurance
             && object.compartments.is_subset(self.compartments)
@@ -458,15 +459,15 @@ mod tests {
     #[test]
     fn dominance_reflexive() {
         let x = label(Level::Confidential, Assurance::Classical, &[0, 1]);
-        assert!(x.dominates(&x));
+        assert!(x.can_access(&x));
     }
 
     #[test]
     fn dominance_level_read_down() {
         let secret = label(Level::Secret, Assurance::PqHybrid, &[]);
         let public = label(Level::Public, Assurance::PqHybrid, &[]);
-        assert!(secret.dominates(&public));
-        assert!(!public.dominates(&secret));
+        assert!(secret.can_access(&public));
+        assert!(!public.can_access(&secret));
     }
 
     #[test]
@@ -474,8 +475,8 @@ mod tests {
         let cleared = label(Level::Secret, Assurance::PqHybrid, &[0, 1]); // pii, tenant:acme
         let needs_pii = label(Level::Public, Assurance::Unverified, &[0]);
         let needs_other = label(Level::Public, Assurance::Unverified, &[5]); // finance
-        assert!(cleared.dominates(&needs_pii));
-        assert!(!cleared.dominates(&needs_other)); // not cleared into "finance"
+        assert!(cleared.can_access(&needs_pii));
+        assert!(!cleared.can_access(&needs_other)); // not cleared into "finance"
     }
 
     #[test]
@@ -483,18 +484,18 @@ mod tests {
         // #548 acceptance: a classical-DID peer cannot dominate a PQC-required label.
         let classical_subject = label(Level::Secret, Assurance::Classical, &[0]);
         let pqc_object = label(Level::Public, Assurance::PqHybrid, &[]);
-        assert!(!classical_subject.dominates(&pqc_object));
+        assert!(!classical_subject.can_access(&pqc_object));
 
         // a PQC-bound peer can (level/compartments permitting).
         let pqc_subject = label(Level::Secret, Assurance::PqHybrid, &[0]);
-        assert!(pqc_subject.dominates(&pqc_object));
+        assert!(pqc_subject.can_access(&pqc_object));
     }
 
     #[test]
     fn unverified_subject_dominates_nothing_above_floor() {
         let unverified = label(Level::Secret, Assurance::Unverified, &[0]);
         let needs_classical = label(Level::Public, Assurance::Classical, &[]);
-        assert!(!unverified.dominates(&needs_classical));
+        assert!(!unverified.can_access(&needs_classical));
     }
 
     #[test]
@@ -513,8 +514,8 @@ mod tests {
         let a = label(Level::Internal, Assurance::Classical, &[0]);
         let b = label(Level::Confidential, Assurance::Unverified, &[5]);
         let j = a.join(&b);
-        assert!(j.dominates(&a));
-        assert!(j.dominates(&b));
+        assert!(j.can_access(&a));
+        assert!(j.can_access(&b));
     }
 
     #[test]

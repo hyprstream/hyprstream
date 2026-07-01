@@ -200,10 +200,14 @@ fn compute_supported_scopes() -> Vec<String> {
         if let Some(metadata_fn) = factory.metadata {
             let (service_name, methods) = metadata_fn();
             for method in methods {
-                // Fallback is "query" (ScopeAction::query @0), NOT "read"
-                // which doesn't exist in Operation or ScopeAction enums.
-                let action = if method.scope.is_empty() { "query" } else { method.scope };
-                scopes.insert(format!("{}:{}:*", action, service_name));
+                // S3 (#547): scope is mandatory at build time, so `method.scope` is
+                // non-empty for every enforced method. An empty scope here can only be a
+                // `$scopeExempt` method (e.g. the authz check itself) — it requires no
+                // grant, so it contributes no advertised scope. No silent "query" default.
+                if method.scope.is_empty() {
+                    continue;
+                }
+                scopes.insert(format!("{}:{}:*", method.scope, service_name));
             }
         }
     }

@@ -1,4 +1,4 @@
-@0xf9827f99f1d00ad6;
+@0xf808a32774734d81;
 
 # Cap'n Proto schema for compositor/ChatApp IPC via Wanix named pipes.
 #

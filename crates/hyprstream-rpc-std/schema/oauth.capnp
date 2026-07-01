@@ -1,4 +1,4 @@
-@0xc1d2e3f4a5b60718;
+@0xc6526924e48dc88e;
 
 # Cap'n Proto schema for OAuth user management service
 #
@@ -6,7 +6,7 @@
 # Uses REQ/REP pattern.
 
 using import "/common.capnp".ErrorInfo;
-using import "/annotations.capnp".mcpScope;
+using import "/annotations.capnp".scope;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".optional;
 
@@ -15,25 +15,25 @@ struct OauthRequest {
 
   union {
     registerUser @1 :RegisterUser
-      $mcpScope(manage) $mcpDescription("Register a new user");
+      $scope(manage) $mcpDescription("Register a new user");
     getUser @2 :Text
-      $mcpScope(query) $mcpDescription("Get user profile by username");
+      $scope(query) $mcpDescription("Get user profile by username");
     listUsers @3 :ListUsers
-      $mcpScope(query) $mcpDescription("List/search users with optional filter");
+      $scope(query) $mcpDescription("List/search users with optional filter");
     updateUser @4 :UpdateUser
-      $mcpScope(manage) $mcpDescription("Update user profile fields");
+      $scope(manage) $mcpDescription("Update user profile fields");
     suspendUser @5 :Text
-      $mcpScope(manage) $mcpDescription("Suspend user (set active=false)");
+      $scope(manage) $mcpDescription("Suspend user (set active=false)");
     resumeUser @6 :Text
-      $mcpScope(manage) $mcpDescription("Resume suspended user (set active=true)");
+      $scope(manage) $mcpDescription("Resume suspended user (set active=true)");
     removeUser @7 :Text
-      $mcpScope(manage) $mcpDescription("Permanently remove user");
+      $scope(manage) $mcpDescription("Permanently remove user");
     addPubkey @8 :AddPubkey
-      $mcpScope(manage) $mcpDescription("Add an Ed25519 public key to a user");
+      $scope(manage) $mcpDescription("Add an Ed25519 public key to a user");
     removePubkey @9 :RemovePubkey
-      $mcpScope(manage) $mcpDescription("Remove a public key by fingerprint");
+      $scope(manage) $mcpDescription("Remove a public key by fingerprint");
     listPubkeys @10 :Text
-      $mcpScope(query) $mcpDescription("List all public keys for a user");
+      $scope(query) $mcpDescription("List all public keys for a user");
   }
 }
 

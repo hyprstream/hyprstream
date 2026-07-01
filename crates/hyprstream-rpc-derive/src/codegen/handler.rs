@@ -7,10 +7,11 @@ use crate::resolve::ResolvedSchema;
 use crate::schema::types::*;
 use crate::util::*;
 
-/// Parse "$mcpScope" value into the action name for auth dispatch.
+/// Parse the `$scope`/`$capability` value into the action name for auth dispatch.
 ///
-/// With the type-safe ScopeAction enum, scope is now just the action name
-/// (e.g., "write", "query", "manage"). Returns None if scope is empty.
+/// The value is a `ScopeAction` enumerant (e.g. "write", "query", "manage") — the
+/// unified action vocabulary (S3, #547). Returns `None` only for a `$scopeExempt`
+/// method (empty scope), which generates no authorize() gate.
 fn parse_scope_for_auth(scope: &str) -> Option<&str> {
     if scope.is_empty() {
         None
@@ -150,8 +151,9 @@ fn generate_handler_trait(
         let authorize_method = quote! {
             /// Authorize an operation on a resource. Override to enforce policy.
             ///
-            /// Called by generated dispatch functions before handler methods when
-            /// the schema method has a `$mcpScope` annotation.
+            /// Called by generated dispatch functions before handler methods. Every
+            /// method carries a mandatory `$scope`/`$capability` annotation (S3, #547)
+            /// except explicit `$scopeExempt` methods, which are not gated here.
             /// Default: deny all. Services MUST override to enable access.
             async fn authorize(&self, ctx: &hyprstream_rpc::service::EnvelopeContext, resource: &str, operation: &str) -> anyhow::Result<()> {
                 let _ = (ctx, resource, operation);

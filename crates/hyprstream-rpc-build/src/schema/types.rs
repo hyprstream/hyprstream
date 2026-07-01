@@ -27,8 +27,14 @@ pub struct UnionVariant {
     pub name: String,
     pub type_name: String,
     pub description: String,
-    /// MCP scope override (e.g., "write:model:*"). Empty string means use default.
+    /// Authorization action from `$scope`/`$capability` (e.g. "write"). Empty
+    /// only when `scope_exempt` is true (S3, #547): every other method must
+    /// declare a scope or the build fails.
     pub scope: String,
+    /// Explicit, audited exemption from mandatory scope (`$scopeExempt`, S3 #547).
+    /// True iff the method declares `$scopeExempt("<reason>")` instead of a scope.
+    #[serde(default)]
+    pub scope_exempt: bool,
     /// Whether this method is hidden from CLI (internal-only).
     pub cli_hidden: bool,
     /// VFS usage example from `$docExample` annotation. Empty = no example.

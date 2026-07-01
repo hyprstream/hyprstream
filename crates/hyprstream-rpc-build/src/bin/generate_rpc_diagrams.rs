@@ -267,7 +267,7 @@ fn build_method_registry(metadata_dir: &Path) -> Vec<MethodDef> {
                     .flatten()
                 {
                     let ann_name = ann.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                    if ann_name == "mcpScope" {
+                    if ann_name == "scope" || ann_name == "capability" {
                         scope = ann
                             .get("value")
                             .and_then(|v| {
@@ -745,7 +745,7 @@ fn parse_metadata(path: &Path) -> Option<(String, usize, BTreeMap<String, usize>
                 .into_iter()
                 .flatten()
             {
-                if ann.get("name").and_then(|n| n.as_str()) == Some("mcpScope") {
+                if matches!(ann.get("name").and_then(|n| n.as_str()), Some("scope") | Some("capability")) {
                     methods += 1;
                     let scope = ann
                         .get("value")

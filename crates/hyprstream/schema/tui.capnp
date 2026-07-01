@@ -1,4 +1,4 @@
-@0xd4e8f2a1b3c5d7e9;
+@0xa159a8ac3c898085;
 
 # Cap'n Proto schema for TUI display server
 #
@@ -8,7 +8,7 @@
 # Uses REQ/REP pattern. Runs on thread spawner (ratatui Buffer is !Send).
 
 using import "/common.capnp".ErrorInfo;
-using import "/annotations.capnp".mcpScope;
+using import "/annotations.capnp".scope;
 using import "/annotations.capnp".mcpDescription;
 # #275: the moq reach model (network-routable dial parameters) so a cross-process
 # TUI viewer can dial the producer's networked moq plane instead of its own local
@@ -120,74 +120,74 @@ struct TuiRequest {
   union {
     # Connect a new viewer to a session (creates session if needed)
     connect @1 :ConnectRequest
-      $mcpScope(write) $mcpDescription("Connect viewer to TUI session");
+      $scope(write) $mcpDescription("Connect viewer to TUI session");
 
     # Disconnect a viewer
     disconnect @2 :UInt32  # viewer_id
-      $mcpScope(write) $mcpDescription("Disconnect viewer from TUI session");
+      $scope(write) $mcpDescription("Disconnect viewer from TUI session");
 
     # Create a new window in the current session
     createWindow @3 :Void
-      $mcpScope(write) $mcpDescription("Create a new window");
+      $scope(write) $mcpDescription("Create a new window");
 
     # Close a window
     closeWindow @4 :UInt32  # window_id
-      $mcpScope(write) $mcpDescription("Close a window");
+      $scope(write) $mcpDescription("Close a window");
 
     # List all windows in a session
     listWindows @5 :UInt32  # session_id
-      $mcpScope(query) $mcpDescription("List all windows in a session");
+      $scope(query) $mcpDescription("List all windows in a session");
 
     # Focus a window
     focusWindow @6 :UInt32  # window_id
-      $mcpScope(write) $mcpDescription("Focus a window");
+      $scope(write) $mcpDescription("Focus a window");
 
     # Split the active pane
     splitPane @7 :SplitRequest
-      $mcpScope(write) $mcpDescription("Split active pane horizontally or vertically");
+      $scope(write) $mcpDescription("Split active pane horizontally or vertically");
 
     # Close a pane
     closePane @8 :UInt32  # pane_id
-      $mcpScope(write) $mcpDescription("Close a pane");
+      $scope(write) $mcpDescription("Close a pane");
 
     # Focus a pane
     focusPane @9 :UInt32  # pane_id
-      $mcpScope(write) $mcpDescription("Focus a pane");
+      $scope(write) $mcpDescription("Focus a pane");
 
     # Get a snapshot of the current display state
     snapshot @10 :UInt32  # session_id (0 = current)
-      $mcpScope(query) $mcpDescription("Get snapshot of current display");
+      $scope(query) $mcpDescription("Get snapshot of current display");
 
     # Resize the terminal
     resize @11 :ResizeRequest
-      $mcpScope(write) $mcpDescription("Resize terminal dimensions");
+      $scope(write) $mcpDescription("Resize terminal dimensions");
 
     # Send input to the active pane
     sendInput @12 :SendInputRequest
-      $mcpScope(write) $mcpDescription("Send input to active pane");
+      $scope(write) $mcpDescription("Send input to active pane");
 
     # Spawn a shell process in a pane
     spawnShell @13 :SpawnShellRequest
-      $mcpScope(write) $mcpDescription("Spawn a shell in a pane");
+      $scope(write) $mcpDescription("Spawn a shell in a pane");
 
     # Poll for stdin bytes queued for this viewer (alternative to ZMQ SUB relay).
     # Returns all bytes received since the last poll, concatenated.
     pollStdin @14 :UInt32  # viewer_id
-      $mcpScope(query) $mcpDescription("Poll for stdin bytes queued for this viewer");
+      $scope(query) $mcpDescription("Poll for stdin bytes queued for this viewer");
 
     # Spawn the ShellApp chrome process inside TuiService so no fork occurs
     # in the client process (avoids ZMQ signaler assertion after fork).
     spawnChromeShell @15 :SpawnChromeShellRequest
-      $mcpScope(write) $mcpDescription("Spawn ShellApp chrome renderer in a TuiService pane");
+      $scope(write) $mcpDescription("Spawn ShellApp chrome renderer in a TuiService pane");
 
     # Spawn a ChatApp inference pane connected to a loaded model.
     spawnChatApp @16 :SpawnChatAppRequest
-      $mcpScope(write) $mcpDescription("Spawn ChatApp inference pane");
+      $scope(write) $mcpDescription("Spawn ChatApp inference pane");
 
     # Create a private pane whose content is client-owned.
     # The server publishes a [PRIVATE] placeholder to other viewers.
     createPrivatePane @17 :CreatePrivatePaneRequest
-      $mcpScope(write) $mcpDescription("Create a private client-owned pane");
+      $scope(write) $mcpDescription("Create a private client-owned pane");
   }
 }
 

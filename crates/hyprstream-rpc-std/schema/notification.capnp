@@ -1,4 +1,4 @@
-@0xa1b2c3d4e5f6a7b8;
+@0xb59f0a7817f11e72;
 
 # Cap'n Proto schema for notification service
 #
@@ -7,7 +7,7 @@
 # Uses REQ/REP pattern with Continuation for async delivery fanout.
 
 using import "/common.capnp".ErrorInfo;
-using import "/annotations.capnp".mcpScope;
+using import "/annotations.capnp".scope;
 using import "/annotations.capnp".mcpDescription;
 # #356: the canonical networked moq reach model. A cross-instance subscriber dials
 # the producer's wire-advertised reach rather than its own co-located UDS plane.
@@ -19,22 +19,22 @@ struct NotificationRequest {
 
   union {
     subscribe @1 :SubscribeRequest
-      $mcpScope(subscribe) $mcpDescription("Subscribe to notifications matching a claim scope");
+      $scope(subscribe) $mcpDescription("Subscribe to notifications matching a claim scope");
 
     publishIntent @2 :PublishIntentRequest
-      $mcpScope(publish) $mcpDescription("Get subscriber pubkeys for scope-matched broadcast encryption");
+      $scope(publish) $mcpDescription("Get subscriber pubkeys for scope-matched broadcast encryption");
 
     deliver @3 :DeliverRequest
-      $mcpScope(publish) $mcpDescription("Deliver encrypted broadcast to scope-matched subscribers");
+      $scope(publish) $mcpDescription("Deliver encrypted broadcast to scope-matched subscribers");
 
     unsubscribe @4 :UnsubscribeRequest
-      $mcpScope(subscribe) $mcpDescription("Tear down a notification stream");
+      $scope(subscribe) $mcpDescription("Tear down a notification stream");
 
     listSubscriptions @5 :Void
-      $mcpScope(query) $mcpDescription("List active subscriptions for current identity");
+      $scope(query) $mcpDescription("List active subscriptions for current identity");
 
     ping @6 :Void
-      $mcpScope(query) $mcpDescription("Health check");
+      $scope(query) $mcpDescription("Health check");
   }
 }
 
