@@ -67,12 +67,6 @@ pub mod metrics_capnp {
     include!(concat!(env!("OUT_DIR"), "/metrics_capnp.rs"));
 }
 
-pub mod notification_capnp {
-    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
-    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-    include!(concat!(env!("OUT_DIR"), "/notification_capnp.rs"));
-}
 
 pub mod service_events_capnp {
     #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used)]
@@ -136,12 +130,6 @@ pub mod mcp_client {
     hyprstream_rpc_derive::generate_rpc_client!("mcp");
 }
 
-pub mod notification_client {
-    #![allow(dead_code, unused_imports, unused_variables)]
-    #![allow(clippy::all)]
-    extern crate self as hyprstream_rpc_std;
-    hyprstream_rpc_derive::generate_rpc_client!("notification");
-}
 
 pub mod metrics_client {
     #![allow(dead_code, unused_imports, unused_variables)]

@@ -21,7 +21,6 @@ pub use hyprstream_rpc_std::registry_capnp;
 pub use hyprstream_rpc_std::policy_capnp;
 pub use hyprstream_rpc_std::model_capnp;
 pub use hyprstream_rpc_std::mcp_capnp;
-pub use hyprstream_rpc_std::notification_capnp;
 pub use hyprstream_rpc_std::metrics_capnp;
 pub use hyprstream_rpc_std::oauth_capnp;
 
