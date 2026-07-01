@@ -28,7 +28,7 @@
 // `Role` / `TransportConfig` / `QuicReach` types — is also code-generated here
 // from `streaming.capnp` (native capnp, no JSON-in-Text on the wire).
 pub use crate::streaming_types::{
-    Completion, Delivery, IrohReach, Ordering, OverflowPolicy, QuicReach, Destination, Retention,
+    Completion, Delivery, Destination, IrohReach, Ordering, OverflowPolicy, QuicReach, Retention,
     Role, StreamInfo, StreamOpt, TransportConfig,
 };
 
@@ -70,7 +70,10 @@ impl StreamOptPreset for Job {
     fn stream_opt() -> StreamOpt {
         StreamOpt {
             ordering: Ordering::Ordered,
-            delivery: Delivery::AtLeastOnce { dedup_window: 4096, resumable: true },
+            delivery: Delivery::AtLeastOnce {
+                dedup_window: 4096,
+                resumable: true,
+            },
             completion: Completion::EndOfStream,
             retention: Retention::Blocks(256),
             overflow_policy: OverflowPolicy::Block,
@@ -82,7 +85,10 @@ impl StreamOptPreset for Log {
     fn stream_opt() -> StreamOpt {
         StreamOpt {
             ordering: Ordering::Ordered,
-            delivery: Delivery::AtLeastOnce { dedup_window: 4096, resumable: true },
+            delivery: Delivery::AtLeastOnce {
+                dedup_window: 4096,
+                resumable: true,
+            },
             completion: Completion::None,
             retention: Retention::Seconds(300),
             overflow_policy: OverflowPolicy::Block,
@@ -94,9 +100,62 @@ impl StreamOptPreset for Pipe {
     fn stream_opt() -> StreamOpt {
         StreamOpt {
             ordering: Ordering::Ordered,
-            delivery: Delivery::AtLeastOnce { dedup_window: 256, resumable: false },
+            delivery: Delivery::AtLeastOnce {
+                dedup_window: 256,
+                resumable: false,
+            },
             completion: Completion::None,
             retention: Retention::Live,
+            overflow_policy: OverflowPolicy::Block,
+        }
+    }
+}
+
+/// Default event-bus delivery (#606).
+///
+/// At-most-once, drop-oldest-on-backpressure, live retention, no terminator.
+/// Matches the historic `moq_event` "fan-out, at-most-once, best-effort"
+/// behaviour, but BOUNDED: a slow subscriber's local queue evicts its oldest
+/// entry instead of blocking the publisher-side read tasks indefinitely. Use
+/// for lifecycle/telemetry events where the latest state matters more than
+/// every historical transition (e.g. `worker.*.heartbeat`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EventLive;
+
+/// Reliable event-bus delivery (#606).
+///
+/// At-least-once with a 1024-entry dedup window, resumable from last-acked
+/// sequence, retains the last 64 delivery blocks, lossless (block) backpressure.
+/// Use for events that must not be silently dropped, e.g. `model.loaded` /
+/// `model.loadFailed` and other completion/lifecycle-latch signals (see the
+/// EventService consolidation epic, EV7).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EventReliable;
+
+impl StreamOptPreset for EventLive {
+    fn stream_opt() -> StreamOpt {
+        StreamOpt {
+            ordering: Ordering::Ordered,
+            delivery: Delivery::AtMostOnce,
+            completion: Completion::None,
+            retention: Retention::Live,
+            overflow_policy: OverflowPolicy::DropOldest {
+                high_water_mark: 256,
+            },
+        }
+    }
+}
+
+impl StreamOptPreset for EventReliable {
+    fn stream_opt() -> StreamOpt {
+        StreamOpt {
+            ordering: Ordering::Ordered,
+            delivery: Delivery::AtLeastOnce {
+                dedup_window: 1024,
+                resumable: true,
+            },
+            completion: Completion::None,
+            retention: Retention::Blocks(64),
             overflow_policy: OverflowPolicy::Block,
         }
     }

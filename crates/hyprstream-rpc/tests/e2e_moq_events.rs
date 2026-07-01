@@ -154,6 +154,38 @@ async fn per_oid_publisher_with_oid_reaches_subscribe_oid() -> Result<()> {
     Ok(())
 }
 
+/// #606: `with_resume_from(seq)` skips already-delivered groups on a per-OID
+/// (single-broadcast) subscription. Three events are published BEFORE the
+/// subscriber starts; resuming from sequence 0 (the first published event's
+/// sequence — `MoqEventPublisher` starts counting at 0) must skip exactly that
+/// first event and deliver only the second and third.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_from_skips_already_seen_groups() -> Result<()> {
+    let origin = shared_origin();
+    let oid = "at://did:web:node.example.com/models/e6-resume-from/v1";
+
+    let mut publisher = origin.publisher_oid_only("registry", oid)?;
+    publisher.publish("a", "first", b"1")?;
+    publisher.publish("a", "second", b"2")?;
+    publisher.publish("a", "third", b"3")?;
+
+    let mut sub = MoqEventSubscriber::new();
+    sub.subscribe_oid(oid)?;
+    sub.with_resume_from(0)?; // skip the first published group (sequence 0)
+
+    let (_, first_seen) = recv_event(&mut sub).await?;
+    let (_, second_seen) = recv_event(&mut sub).await?;
+    assert_eq!(first_seen, b"2", "sequence-0 group must be skipped");
+    assert_eq!(second_seen, b"3");
+    assert!(
+        sub.last_sequence() >= 2,
+        "last_sequence must track the highest delivered group"
+    );
+
+    drop(publisher);
+    Ok(())
+}
+
 /// Selectivity: a `subscribe_oid(OID-A)` subscriber receives ONLY OID-A's
 /// events. When events for OID-A and OID-B are both published, the OID-A
 /// subscriber sees exactly OID-A's event and never OID-B's. This proves the

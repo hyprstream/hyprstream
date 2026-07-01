@@ -118,6 +118,30 @@ pub const GRACE_PERIOD: Duration = Duration::from_secs(120);
 pub const DEFAULT_SUBSCRIBER_GRACE_PERIOD: Duration = Duration::from_secs(30);
 
 /// Rekey policy configuration.
+///
+/// # Cost / forward-secrecy tradeoff (#606)
+///
+/// Rotation re-wraps the group key for every known subscriber: O(M) DH +
+/// AEAD-wrap operations per rotation, M = group size (see
+/// [`EventPublisher::rotate_key`]).
+///
+/// - [`Self::Immediate`] rotates on EVERY revocation — prompt
+///   forward-secrecy (a revoked member loses access immediately), but O(M)
+///   PER revocation. M sequential departures cost O(M²) total. Use only for
+///   an explicit revocation / suspected-compromise event on a specific
+///   prefix, not as a blanket policy for routine membership churn.
+/// - [`Self::Scheduled`] bounds the cost to O(M) per `interval` regardless
+///   of churn, but DEFERS revocation: a removed member can still decrypt
+///   until the next scheduled rotation (up to `interval`, capped by
+///   [`MAX_KEY_LIFETIME`]). This is the default — routine join/leave should
+///   not pay an O(M) rewrap per event.
+/// - [`Self::Jittered`] is `Scheduled` plus timing-attack resistance on
+///   exactly when the rotation fires; same cost/latency tradeoff as
+///   `Scheduled`.
+///
+/// Recommended use: `Scheduled`/`Jittered` for the steady state; switch a
+/// specific prefix to `Immediate` only around an explicit revocation, then
+/// switch back.
 #[derive(Clone, Debug)]
 pub enum RekeyPolicy {
     /// Rotate on fixed schedule. Revocations deferred to next rotation.
@@ -851,6 +875,32 @@ impl EventSubscriber {
     /// Set the late-join retention mode (#393 decision A: firehose-backfill).
     pub fn with_backfill(&mut self, mode: BackfillMode) -> Result<()> {
         self.inner.with_backfill(mode)
+    }
+
+    /// Select the delivery QoS (#606). Pass
+    /// `hyprstream_rpc::stream_info::EventReliable::stream_opt()` for
+    /// at-least-once delivery (events that must not be silently dropped).
+    /// Defaults to `EventLive` (at-most-once, drop-oldest) if never called.
+    /// Must be called before the first `recv()`.
+    pub fn with_qos(&mut self, qos: crate::stream_info::StreamOpt) -> Result<()> {
+        self.inner.with_qos(qos)
+    }
+
+    /// Skip live events already delivered in a prior session (offset-resume,
+    /// #606). See [`crate::moq_event::MoqEventSubscriber::with_resume_from`]
+    /// for the multi-source caveat. Must be called before the first `recv()`.
+    pub fn with_resume_from(&mut self, sequence: u64) -> Result<()> {
+        self.inner.with_resume_from(sequence)
+    }
+
+    /// Highest live-group sequence delivered so far (resume hint, #606).
+    pub fn last_sequence(&self) -> u64 {
+        self.inner.last_sequence()
+    }
+
+    /// Count of items evicted under drop-oldest backpressure (#606).
+    pub fn dropped_count(&self) -> u64 {
+        self.inner.dropped_count()
     }
 
     /// Join an encrypted prefix: generate an ephemeral keypair, unwrap the

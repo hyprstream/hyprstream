@@ -1,10 +1,12 @@
 @0xc8d9e0f1a2b3c4d5;
 
+using import "streaming.capnp".StreamOpt;
+
 # Event bus schema for hyprstream EventService
 #
 # This schema defines ONLY the generic EventEnvelope used for pub/sub messaging
-# over the XPUB/XSUB proxy. Service-specific event types are defined in
-# their respective crates:
+# over the moq-lite event plane (formerly XPUB/XSUB, see #167). Service-specific
+# event types are defined in their respective crates:
 #   - hyprstream-workers: WorkerEvent (sandbox/container lifecycle)
 #   - hyprstream: RegistryEvent, ModelEvent, InferenceEvent
 #
@@ -55,6 +57,12 @@ struct EventRegistration {
   schema @1 :Text;
   publishScope @2 :Text;
   subscribeScope @3 :Text;
+
+  # Delivery QoS for this prefix (#606). Reuses the EXISTING StreamOpt
+  # contract (#213/#273) rather than a parallel event-specific type — see
+  # hyprstream_rpc::stream_info::{EventLive, EventReliable}. Optional: absent
+  # (capnp zero-fill) resolves to the EventLive default at the call site.
+  qos @4 :StreamOpt;
 }
 
 # V2 envelope with publisher authentication (E2E signed)
