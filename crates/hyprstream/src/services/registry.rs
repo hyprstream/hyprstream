@@ -5,6 +5,7 @@
 
 use crate::services::PolicyClient;
 use crate::services::types::{MAX_FDS_GLOBAL, MAX_FDS_PER_CLIENT};
+use crate::services::xet_provenance::XetProvenanceStore;
 use hyprstream_containedfs::{ContainedFs, FsError, FsHandle};
 use crate::services::{EnvelopeContext, RequestService};
 use hyprstream_rpc::transport::TransportConfig;
@@ -326,6 +327,10 @@ pub struct RegistryService {
     expected_audience: Option<String>,
     /// JWT key source for token verification.
     jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
+    /// Server-side `(merkle_hex → repo_id)` provenance store backing the
+    /// fail-closed XET `getBlob` gate (#436 / #509). Pointer presence is
+    /// necessary-but-not-sufficient: entitlement requires a provenance record.
+    xet_provenance: Arc<XetProvenanceStore>,
 }
 
 /// Progress reporter that sends updates via a tokio mpsc channel.
@@ -377,6 +382,10 @@ impl RegistryService {
         let base_dir = base_dir.as_ref().to_path_buf();
         let registry = Git2DB::open(&base_dir).await?;
 
+        // Load the XET provenance store (lives alongside registry metadata).
+        // Missing file → empty store → fail-closed XET getBlob (secure default).
+        let xet_provenance = Arc::new(XetProvenanceStore::load(&base_dir).await?);
+
         let worker_registry = Arc::new(RwLock::new(registry));
 
         // Create fid table and editing table, spawn reaper
@@ -399,6 +408,7 @@ impl RegistryService {
             editing_table,
             expected_audience: None,
             jwt_key_source: None,
+            xet_provenance,
         };
 
         Ok(service)
@@ -895,25 +905,40 @@ impl RegistryService {
 
     // (helper `xet_pointer_references_merkle` defined at module scope below)
 
-    /// Condition-(b) check for a XET merkle root: grantRepo must reference the
-    /// merkle via a checked-in git-xet pointer whose merkle field EXACTLY equals
-    /// the requested hash. Content addresses are predictable (the CAS is global
-    /// and content-addressed), so presence in the store alone is NOT sufficient —
-    /// the grant repo must actually reference it.
+    /// Condition-(b) check for a XET merkle root — **provenance-gated and
+    /// fail-closed** (the #436 / #509 fix).
     ///
-    /// LIMITATION (tracked in #436): this verifies *reference*, not *provenance*.
-    /// Because the CAS is global and non-namespaced, a writer can reference a
-    /// merkle they did not upload. This is sound for public / same-trust-domain
-    /// content (the only XET fetch enabled today), but NOT sufficient isolation
-    /// for PRIVATE multitenant XET content — that path must stay gated until #436
-    /// (per-tenant CAS namespacing or commit-provenance verification) lands.
-    /// A real git-xet pointer is parsed and the merkle field is matched exactly
-    /// (not a loose substring of arbitrary blob text).
+    /// Entitlement requires BOTH:
+    ///   1. a **server-side provenance record** binding this merkle to
+    ///      `repo_id` (i.e. this repo actually *uploaded* the bytes); AND
+    ///   2. (defense-in-depth) the repo's current HEAD tree still **references**
+    ///      the merkle via a checked-in git-xet / git-lfs pointer whose merkle
+    ///      field EXACTLY equals the requested hash.
+    ///
+    /// The provenance record is the authoritative gate. Pointer presence is
+    /// **necessary-but-not-sufficient**: because the CAS is global and
+    /// non-namespaced, a pointer blob is caller-committed and therefore
+    /// *forgeable* — Tenant B can plant `oid sha256:<Tenant A's private merkle>`
+    /// in their own repo. We therefore **deny when no provenance record exists**
+    /// and NEVER fall back to the pointer-only check. See
+    /// [`crate::services::xet_provenance`] for the trust boundary and #509 for
+    /// the authenticated upload-binding that populates provenance.
     async fn repo_contains_xet_merkle(
         &self,
         repo_id: &git2db::RepoId,
         merkle_hex: &str,
     ) -> Result<bool> {
+        // ── Authoritative gate: fail-closed provenance check. ──
+        // No record binding (merkle → repo) ⇒ deny, regardless of any pointer.
+        if !self
+            .xet_provenance
+            .is_bound(merkle_hex, &repo_id.0.to_string())
+            .await
+        {
+            return Ok(false);
+        }
+
+        // ── Defense-in-depth: the repo must still reference the merkle. ──
         let merkle_hex = merkle_hex.to_owned();
         self.with_repo_blocking(repo_id, move |repo| {
             let head = match repo.head().ok().and_then(|h| h.peel_to_tree().ok()) {
