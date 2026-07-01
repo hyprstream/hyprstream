@@ -222,7 +222,7 @@ impl Ucan {
     ///
     /// This does NOT check attenuation/delegation linkage — that is
     /// [`super::chain::validate_chain`], deliberately separate.
-    pub fn verify_signatures<V: UcanVerifier>(&self, verifier: &V) -> Result<(), UcanError> {
+    pub fn verify_signatures<V: UcanVerifier + ?Sized>(&self, verifier: &V) -> Result<(), UcanError> {
         let ed_bytes = did_ed25519_key(&self.payload.issuer)?;
         let payload_bytes = self.payload.signing_bytes()?;
         verifier.verify(
@@ -260,6 +260,35 @@ pub trait UcanVerifier {
         payload: &[u8],
         signature: &[u8],
     ) -> Result<(), UcanError>;
+}
+
+// Blanket forwarding impls so a `&dyn UcanVerifier` (or `Box<dyn …>`) can be
+// passed anywhere a generic `V: UcanVerifier` is expected — notably S5's
+// `chain::validate<V>` and S6's runtime grant path. Without these, the runtime
+// path would have to be monomorphized on a concrete verifier type, which fights
+// the dynamic trust-store resolution S6 needs.
+impl<V: UcanVerifier + ?Sized> UcanVerifier for &V {
+    fn verify(
+        &self,
+        issuer: &Did,
+        ed_key: &[u8; 32],
+        payload: &[u8],
+        signature: &[u8],
+    ) -> Result<(), UcanError> {
+        (**self).verify(issuer, ed_key, payload, signature)
+    }
+}
+
+impl<V: UcanVerifier + ?Sized> UcanVerifier for std::boxed::Box<V> {
+    fn verify(
+        &self,
+        issuer: &Did,
+        ed_key: &[u8; 32],
+        payload: &[u8],
+        signature: &[u8],
+    ) -> Result<(), UcanError> {
+        (**self).verify(issuer, ed_key, payload, signature)
+    }
 }
 
 /// Errors from UCAN parsing, structure, and signature verification. All map to a

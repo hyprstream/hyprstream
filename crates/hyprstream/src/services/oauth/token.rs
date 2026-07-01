@@ -136,6 +136,21 @@ pub async fn exchange_token(
                 Some(t) => t,
                 None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", Some("subject_token_type is required")),
             };
+            // S6 (#572): the UCAN grant path. Routed on a dedicated
+            // `subject_token_type` so it cannot be confused with the OIDC/WIT
+            // exchange flows. Requires sender-binding (DPoP) — ZSP.
+            if subject_token_type == crate::mac::exchange::UCAN_GRANT_TOKEN_TYPE {
+                let resolver = super::token_exchange::DenyUnlabeledResolver;
+                return super::token_exchange::exchange_ucan_grant(
+                    &state,
+                    &subject_token,
+                    dpop_header.as_deref(),
+                    params.scope.as_deref(),
+                    params.audience.as_deref(),
+                    &resolver,
+                )
+                .await;
+            }
             super::token_exchange::exchange_token_exchange(
                 &state,
                 &subject_token,
