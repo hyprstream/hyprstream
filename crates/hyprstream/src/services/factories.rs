@@ -884,6 +884,11 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
             resource_url,
             oauth_issuer_url,
             &config.oauth.trusted_issuers,
+            // Share the PolicyService-owned JTI blocklist so POST /oauth/revoke
+            // immediately invalidates tokens at the OAI resource server.
+            SHARED_JTI_BLOCKLIST.get()
+                .map(Arc::clone)
+                .unwrap_or_else(|| Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new())),
         ))
     })
     .context("Failed to create server state")?;
@@ -1115,15 +1120,24 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                     let mcp_oauth_issuer_clone = mcp_oauth_issuer.clone();
                     let mcp_federation_resolver = mcp_federation_resolver.clone();
                     let jwt_key_source = jwt_key_source.clone();
-                    move |req: axum::extract::Request, next: axum::middleware::Next| {
+                    // Capture shared JTI blocklist for revocation checks (RFC 7009)
+                    let mcp_jti_blocklist = SHARED_JTI_BLOCKLIST.get().map(Arc::clone);
+                    // DPoP JTI replay cache (separate from OAI server's, RFC 9449).
+                    let mcp_dpop_jti_seen: std::sync::Arc<hyprstream_util::TtlCache<String, ()>> =
+                        std::sync::Arc::new(hyprstream_util::TtlCache::new(10_000, 64));
+                    move |mut req: axum::extract::Request, next: axum::middleware::Next| {
                         let www_authenticate = www_authenticate.clone();
                         let mcp_resource_url = mcp_resource_url.clone();
                         let _mcp_oauth_issuer = mcp_oauth_issuer_clone.clone();
                         let federation_resolver = mcp_federation_resolver.clone();
                         let jwt_key_source = jwt_key_source.clone();
+                        let jti_blocklist = mcp_jti_blocklist.clone();
+                        let dpop_jti_seen = mcp_dpop_jti_seen.clone();
                         async move {
                             use axum::http::{header, StatusCode};
                             use axum::response::IntoResponse;
+                            use hyprstream_rpc::auth::JtiBlocklist as _;
+                            use subtle::ConstantTimeEq as _;
                             let method = req.method().clone();
                             let uri = req.uri().clone();
                             // Allow OAuth discovery endpoint without auth
@@ -1136,68 +1150,152 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                                 .get(header::AUTHORIZATION)
                                 .and_then(|v| v.to_str().ok())
                                 .map(str::to_owned);
-                            // RFC 6750: Bearer scheme is case-insensitive
-                            let token = auth_value.as_deref()
-                                .and_then(|h| {
-                                    if h.len() > 7 && h[..7].eq_ignore_ascii_case("bearer ") {
-                                        Some(h[7..].trim())
-                                    } else {
-                                        None
-                                    }
-                                });
-                            match token {
-                                Some(t) => {
-                                    let iss = crate::server::middleware::extract_iss_from_token(t);
-                                    let kid = crate::server::middleware::extract_kid_from_token(t);
-                                    let result = if let Some(ref key_source) = jwt_key_source {
-                                        match key_source.get_key(&iss, kid.as_deref()).await {
-                                            Ok(key) => crate::auth::jwt::decode(t, &key, Some(mcp_resource_url.as_str())),
-                                            Err(e) => {
-                                                tracing::debug!(%method, %uri, issuer = %iss, error = %e, "MCP JWT key resolution failed");
-                                                let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
-                                                if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
-                                                    res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
-                                                }
-                                                return res;
-                                            }
-                                        }
-                                    } else {
-                                        match federation_resolver.get_key(&iss).await {
-                                            Ok(key) => crate::auth::jwt::decode_with_key(t, &key, Some(mcp_resource_url.as_str())),
-                                            Err(e) => {
-                                                tracing::debug!(%method, %uri, issuer = %iss, error = %e, "MCP federation key resolution failed");
-                                                let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
-                                                if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
-                                                    res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
-                                                }
-                                                return res;
-                                            }
-                                        }
-                                    };
-                                    match result {
-                                        Ok(claims) => {
-                                            tracing::debug!(%method, %uri, sub = %claims.sub, "MCP auth OK");
-                                            next.run(req).await
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(%method, %uri, error = %e, "MCP auth REJECTED");
-                                            let mut res = (StatusCode::UNAUTHORIZED, "Invalid or expired token").into_response();
-                                            if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
-                                                res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
-                                            }
-                                            res
-                                        }
-                                    }
-                                },
+                            // Accept both Bearer (RFC 6750) and DPoP (RFC 9449) schemes
+                            let (scheme, t) = match auth_value.as_deref().and_then(|h| {
+                                if h.len() > 7 && h[..7].eq_ignore_ascii_case("bearer ") {
+                                    Some(("bearer", h[7..].trim().to_owned()))
+                                } else if h.len() > 5 && h[..5].eq_ignore_ascii_case("dpop ") {
+                                    Some(("dpop", h[5..].trim().to_owned()))
+                                } else {
+                                    None
+                                }
+                            }) {
+                                Some(pair) => pair,
                                 None => {
                                     tracing::info!(%method, %uri, has_auth_header, "MCP auth MISSING token");
                                     let mut res = (StatusCode::UNAUTHORIZED, "Authentication required").into_response();
                                     if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
                                         res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
                                     }
-                                    res
+                                    return res;
+                                }
+                            };
+                            let iss = crate::server::middleware::extract_iss_from_token(&t);
+                            let kid = crate::server::middleware::extract_kid_from_token(&t);
+                            let result = if let Some(ref key_source) = jwt_key_source {
+                                match key_source.get_key(&iss, kid.as_deref()).await {
+                                    Ok(key) => crate::auth::jwt::decode(&t, &key, Some(mcp_resource_url.as_str())),
+                                    Err(e) => {
+                                        tracing::debug!(%method, %uri, issuer = %iss, error = %e, "MCP JWT key resolution failed");
+                                        let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
+                                        if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
+                                            res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
+                                        }
+                                        return res;
+                                    }
+                                }
+                            } else {
+                                match federation_resolver.get_key(&iss).await {
+                                    Ok(key) => crate::auth::jwt::decode_with_key(&t, &key, Some(mcp_resource_url.as_str())),
+                                    Err(e) => {
+                                        tracing::debug!(%method, %uri, issuer = %iss, error = %e, "MCP federation key resolution failed");
+                                        let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
+                                        if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
+                                            res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
+                                        }
+                                        return res;
+                                    }
+                                }
+                            };
+                            let claims = match result {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    tracing::warn!(%method, %uri, error = %e, "MCP auth REJECTED");
+                                    let mut res = (StatusCode::UNAUTHORIZED, "Invalid or expired token").into_response();
+                                    if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
+                                        res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
+                                    }
+                                    return res;
+                                }
+                            };
+                            // JTI revocation check (RFC 7009)
+                            if let Some(ref jti) = claims.jti {
+                                let revoked = jti_blocklist.as_ref().map(|bl| bl.is_revoked(jti)).unwrap_or(false);
+                                if revoked {
+                                    tracing::warn!(%method, %uri, %jti, sub = %claims.sub, "MCP: revoked token presented");
+                                    let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
+                                    if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
+                                        res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
+                                    }
+                                    return res;
                                 }
                             }
+                            // DPoP binding enforcement (RFC 9449 §7):
+                            // cnf.jkt tokens MUST be presented with DPoP scheme + proof header.
+                            if let Some(expected_jkt) = claims.cnf_jkt() {
+                                if scheme != "dpop" {
+                                    tracing::warn!(%method, %uri, sub = %claims.sub, "MCP: DPoP-bound token presented with Bearer scheme");
+                                    let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
+                                    if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
+                                        res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
+                                    }
+                                    return res;
+                                }
+                                let dpop_proof = match req.headers().get("DPoP").and_then(|v| v.to_str().ok()) {
+                                    Some(p) => p.to_owned(),
+                                    None => {
+                                        tracing::debug!(%method, %uri, "MCP: DPoP-bound token missing DPoP proof header");
+                                        let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
+                                        if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
+                                            res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
+                                        }
+                                        return res;
+                                    }
+                                };
+                                let method_str = method.as_str().to_owned();
+                                let path = uri.path().to_owned();
+                                let htu = format!("{}{}", mcp_resource_url.trim_end_matches('/'), path);
+                                let proof = match crate::services::oauth::dpop::verify_dpop_proof(
+                                    &dpop_proof,
+                                    &method_str,
+                                    &htu,
+                                    Some(&t),
+                                ) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        tracing::debug!(%method, %uri, error = %e, "MCP: DPoP proof verification failed");
+                                        let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
+                                        if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
+                                            res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
+                                        }
+                                        return res;
+                                    }
+                                };
+                                // Replay prevention: atomic check-and-record on the shared TtlCache.
+                                {
+                                    let now = chrono::Utc::now().timestamp();
+                                    let ttl_secs = ((proof.iat + 120) - now).max(0) as u64;
+                                    if !dpop_jti_seen.insert_if_absent(
+                                        proof.jti.clone(),
+                                        (),
+                                        std::time::Duration::from_secs(ttl_secs),
+                                    ) {
+                                        tracing::debug!(%method, %uri, jti = %proof.jti, "MCP: DPoP jti replayed");
+                                        let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
+                                        if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
+                                            res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
+                                        }
+                                        return res;
+                                    }
+                                }
+                                // cnf.jkt must match proof key thumbprint (constant-time)
+                                if expected_jkt.as_bytes().ct_eq(proof.jkt.as_bytes()).unwrap_u8() == 0 {
+                                    tracing::warn!(%method, %uri, sub = %claims.sub, "MCP: cnf.jkt mismatch");
+                                    let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
+                                    if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
+                                        res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
+                                    }
+                                    return res;
+                                }
+                            }
+                            tracing::debug!(%method, %uri, sub = %claims.sub, "MCP auth OK");
+                            // Insert AuthenticatedUser so MCP handlers see validated identity
+                            req.extensions_mut().insert(crate::server::middleware::AuthenticatedUser {
+                                user: claims.sub.clone(),
+                                token: Some(t.clone()),
+                                exp: Some(claims.exp),
+                            });
+                            next.run(req).await
                         }
                     }
                 }));

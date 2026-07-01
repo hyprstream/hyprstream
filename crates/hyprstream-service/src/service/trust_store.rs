@@ -262,6 +262,7 @@ pub fn global_trust_store() -> &'static TrustStore {
     &TRUST_STORE
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;

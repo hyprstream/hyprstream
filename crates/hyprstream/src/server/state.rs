@@ -3,6 +3,8 @@
 use crate::services::{RegistryClient, PolicyClient};
 use crate::services::generated::model_client::{ModelClient, LoadModelRequest};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use hyprstream_util::TtlCache;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -48,6 +50,18 @@ pub struct ServerState {
     /// Federation key resolver for multi-issuer JWT verification.
     /// Contains trusted issuers (empty if none configured).
     pub federation_resolver: Arc<crate::auth::FederationKeyResolver>,
+
+    /// Shared JTI blocklist for access token revocation (RFC 7009).
+    /// Populated by the OAuth revocation endpoint; checked on every request.
+    pub jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
+
+    /// Per-request DPoP JTI dedup cache (RFC 9449 §11.1 replay prevention).
+    /// Backed by the shared `TtlCache` with atomic check-and-record
+    /// (`insert_if_absent`); TTL = iat + 120s; self-evicting.
+    pub dpop_jti_seen: Arc<TtlCache<String, ()>>,
+
+    /// Per-subject request rate limiter (fixed window, 300 req/60s default).
+    pub rate_limiter: Arc<crate::server::middleware::RateLimiter>,
 }
 
 /// Metrics collector
@@ -91,7 +105,8 @@ impl ServerState {
         jwt_verifying_key: VerifyingKey,
         resource_url: String,
         oauth_issuer_url: String,
-        trusted_issuers: &std::collections::HashMap<String, crate::config::TrustedIssuerConfig>,
+        trusted_issuers: &HashMap<String, crate::config::TrustedIssuerConfig>,
+        jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
     ) -> Result<Self, anyhow::Error> {
         let signing_key = Arc::new(signing_key);
         // Use the CA JWT verifying key (not the service's own key) so HTTP Bearer tokens
@@ -137,6 +152,9 @@ impl ServerState {
             resource_url,
             oauth_issuer_url,
             federation_resolver,
+            jti_blocklist,
+            dpop_jti_seen: Arc::new(TtlCache::new(10_000, 64)),
+            rate_limiter: Arc::new(crate::server::middleware::RateLimiter::new(300, 60)),
         })
     }
 

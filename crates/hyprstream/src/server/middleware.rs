@@ -8,7 +8,10 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use hyprstream_rpc::auth::JtiBlocklist as _;
 use std::time::Instant;
+use std::time::Duration;
+use subtle::ConstantTimeEq as _;
 use tracing::{debug, info, warn};
 
 /// Authenticated identity extracted from token
@@ -35,95 +38,167 @@ impl std::fmt::Debug for AuthenticatedUser {
 
 /// JWT authentication middleware
 ///
-/// Validates JWT tokens (eyJ...) via Ed25519 signature verification.
+/// Validates JWT tokens via Ed25519 signature verification.
+/// Accepts `Authorization: Bearer <token>` and `Authorization: DPoP <token>`.
+///
+/// When the token carries a `cnf.jkt` claim (DPoP-bound token per RFC 9449),
+/// the `Authorization: DPoP` scheme MUST be used and a valid `DPoP` proof
+/// header MUST accompany the request — plain Bearer is rejected to prevent
+/// token replay after theft.
+///
+/// Revoked tokens (via `POST /oauth/revoke`) are rejected via JTI blocklist.
 ///
 /// On success, inserts `AuthenticatedUser` into request extensions.
-/// JWT `sub` claim contains bare username (e.g., "alice").
 pub async fn auth_middleware(
     State(state): State<ServerState>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    // Get JWT token from Authorization header (RFC 6750: Bearer scheme is case-insensitive)
-    let token = request
+    let client_ip = extract_client_ip(&request);
+    let method = request.method().as_str().to_owned();
+    let path = request.uri().path().to_owned();
+
+    // Accept both Bearer and DPoP schemes (RFC 6750, RFC 9449)
+    let auth_hdr = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|h| {
-            if h.len() > 7 && h[..7].eq_ignore_ascii_case("bearer ") {
-                Some(h[7..].trim())
-            } else {
-                None
-            }
-        });
+        .map(str::to_owned);
 
-    // SECURITY: No anonymous access — require Bearer token
-    let Some(token) = token else {
-        let www_authenticate = build_www_authenticate(&state);
-        return unauthorized_response("Authentication required", &www_authenticate);
+    let (scheme, token) = match auth_hdr.as_deref().and_then(|h| {
+        if h.len() > 7 && h[..7].eq_ignore_ascii_case("bearer ") {
+            Some(("bearer", h[7..].trim().to_owned()))
+        } else if h.len() > 5 && h[..5].eq_ignore_ascii_case("dpop ") {
+            Some(("dpop", h[5..].trim().to_owned()))
+        } else {
+            None
+        }
+    }) {
+        Some(pair) => pair,
+        None => {
+            let www_authenticate = build_www_authenticate(&state);
+            return unauthorized_response("Authentication required", &www_authenticate);
+        }
     };
 
     // Build WWW-Authenticate header for 401 responses (RFC 9728)
     let www_authenticate = build_www_authenticate(&state);
 
-    // Try JWT validation (stateless)
-    if token.contains('.') {
-        // Extract iss from token payload without signature verification
-        let iss = extract_iss_from_token(token);
+    if !token.contains('.') {
+        warn!(client_ip = %client_ip, method = %method, path = %path, "Auth failure: malformed token");
+        return unauthorized_response("Authentication failed", &www_authenticate);
+    }
 
-        let local_issuers: &[&str] = &[&*state.oauth_issuer_url];
-        let result = if hyprstream_rpc::auth::is_local_iss(&iss, local_issuers) {
-            // Local token: verify with local key
-            jwt::decode(token, &state.verifying_key, Some(&state.resource_url))
-        } else {
-            // Federated token: pre-check trust before acquiring async lock
-            if !state.federation_resolver.is_trusted(&iss) {
-                debug!("Untrusted federation issuer: {}", iss);
-                return unauthorized_response("Authentication failed", &www_authenticate);
-            }
-            match state.federation_resolver.get_key(&iss).await {
-                Ok(key) => jwt::decode_with_key(token, &key, Some(&state.resource_url)),
-                Err(e) => {
-                    debug!("Federation key resolution failed for issuer {}: {}", iss, e);
-                    return unauthorized_response("Authentication failed", &www_authenticate);
-                }
-            }
-        };
-
-        match result {
-            Ok(claims) => {
-                debug!("JWT validated for user: {}", claims.sub);
-                let subject = claims.subject(local_issuers);
-                // Validate local subjects for safe characters. Federated subjects
-                // (containing "://") bypass this check — they are validated at JWT decode time.
-                if let Err(e) = subject.validate() {
-                    debug!("JWT sub validation failed: {}", e);
-                    return unauthorized_response("Authentication failed", &www_authenticate);
-                }
-                let user_str = match subject.name() {
-                    Some(n) => n.to_owned(),
-                    None => {
-                        debug!("JWT has empty sub");
-                        return unauthorized_response("Authentication failed", &www_authenticate);
-                    }
-                };
-                let user = AuthenticatedUser {
-                    user: user_str,
-                    token: Some(token.to_owned()),
-                    exp: Some(claims.exp),
-                };
-                request.extensions_mut().insert(user);
-                return next.run(request).await;
-            }
+    // Extract iss for key routing
+    let iss = extract_iss_from_token(&token);
+    let local_issuers: &[&str] = &[&*state.oauth_issuer_url];
+    let result = if hyprstream_rpc::auth::is_local_iss(&iss, local_issuers) {
+        jwt::decode(&token, &state.verifying_key, Some(&state.resource_url))
+    } else {
+        if !state.federation_resolver.is_trusted(&iss) {
+            warn!(client_ip = %client_ip, method = %method, path = %path, issuer = %iss, "Auth failure: untrusted federation issuer");
+            return unauthorized_response("Authentication failed", &www_authenticate);
+        }
+        match state.federation_resolver.get_key(&iss).await {
+            Ok(key) => jwt::decode_with_key(&token, &key, Some(&state.resource_url)),
             Err(e) => {
-                debug!("JWT validation failed: {}", e);
+                warn!(client_ip = %client_ip, method = %method, path = %path, issuer = %iss, error = %e, "Auth failure: federation key resolution failed");
                 return unauthorized_response("Authentication failed", &www_authenticate);
             }
         }
+    };
+
+    let claims = match result {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(client_ip = %client_ip, method = %method, path = %path, error = %e, "Auth failure: JWT validation failed");
+            return unauthorized_response("Authentication failed", &www_authenticate);
+        }
+    };
+
+    // JTI revocation check (RFC 7009) — shared blocklist with OAuth revocation endpoint.
+    if let Some(ref jti) = claims.jti {
+        if state.jti_blocklist.is_revoked(jti) {
+            warn!(jti = %jti, sub = %claims.sub, "Revoked token presented");
+            return unauthorized_response("Authentication failed", &www_authenticate);
+        }
     }
 
-    debug!("Invalid token format");
-    unauthorized_response("Authentication failed", &www_authenticate)
+    // DPoP binding enforcement (RFC 9449).
+    // A token with cnf.jkt MUST be presented with Authorization: DPoP + DPoP proof header.
+    // Accepting it as Bearer would let a stolen token replay without proof of key possession.
+    if let Some(expected_jkt) = claims.cnf_jkt() {
+        if scheme != "dpop" {
+            warn!(sub = %claims.sub, "DPoP-bound token presented with Bearer scheme — rejected");
+            return unauthorized_response("Authentication failed", &www_authenticate);
+        }
+        let dpop_proof = match request.headers().get("DPoP").and_then(|v| v.to_str().ok()) {
+            Some(p) => p.to_owned(),
+            None => {
+                debug!("DPoP-bound token missing DPoP proof header");
+                return unauthorized_response("Authentication failed", &www_authenticate);
+            }
+        };
+        let method = request.method().as_str().to_owned();
+        let path = request.uri().path().to_owned();
+        // Build absolute htu from the server's resource_url (scheme + host) + request path.
+        // Axum doesn't populate scheme/host in the URI for HTTPS behind a TLS terminator,
+        // so we use the pre-configured resource_url as the authority base.
+        let htu = format!("{}{}", state.resource_url.trim_end_matches('/'), path);
+        let proof = match crate::services::oauth::dpop::verify_dpop_proof(
+            &dpop_proof,
+            &method,
+            &htu,
+            Some(&token),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!("DPoP proof verification failed: {}", e);
+                return unauthorized_response("Authentication failed", &www_authenticate);
+            }
+        };
+        // Replay prevention: each DPoP jti is accepted at most once (within
+        // iat ±60s window). Atomic check-and-record on the shared TtlCache.
+        {
+            let now = chrono::Utc::now().timestamp();
+            let ttl_secs = ((proof.iat + 120) - now).max(0) as u64;
+            if !state
+                .dpop_jti_seen
+                .insert_if_absent(proof.jti.clone(), (), Duration::from_secs(ttl_secs))
+            {
+                debug!("DPoP proof jti already used: {}", proof.jti);
+                return unauthorized_response("Authentication failed", &www_authenticate);
+            }
+        }
+        // cnf.jkt must match the DPoP proof key thumbprint.
+        if expected_jkt.as_bytes().ct_eq(proof.jkt.as_bytes()).unwrap_u8() == 0 {
+            warn!(sub = %claims.sub, "cnf.jkt mismatch — DPoP proof key does not match token binding");
+            return unauthorized_response("Authentication failed", &www_authenticate);
+        }
+    }
+
+    debug!("JWT validated for user: {}", claims.sub);
+    let subject = claims.subject(local_issuers);
+    // Validate local subjects for safe characters. Federated subjects
+    // (containing "://") bypass this check — they are validated at JWT decode time.
+    if let Err(e) = subject.validate() {
+        debug!("JWT sub validation failed: {}", e);
+        return unauthorized_response("Authentication failed", &www_authenticate);
+    }
+    let user_str = match subject.name() {
+        Some(n) => n.to_owned(),
+        None => {
+            debug!("JWT has empty sub");
+            return unauthorized_response("Authentication failed", &www_authenticate);
+        }
+    };
+    let user = AuthenticatedUser {
+        user: user_str,
+        token: Some(token),
+        exp: Some(claims.exp),
+    };
+    request.extensions_mut().insert(user);
+    next.run(request).await
 }
 
 /// Request logging middleware
@@ -146,12 +221,74 @@ pub async fn logging_middleware(request: Request, next: Next) -> Response {
     response
 }
 
-/// Rate limiting middleware (simplified)
+/// Fixed-window per-subject rate limiter.
+///
+/// Tracks request counts per authenticated subject (JWT sub).
+/// The window resets cleanly at the end of each window period.
+pub struct RateLimiter {
+    /// subject → (request_count, window_start_unix)
+    counters: parking_lot::RwLock<std::collections::HashMap<String, (u32, i64)>>,
+    max_requests: u32,
+    window_secs: i64,
+}
+
+impl RateLimiter {
+    pub fn new(max_requests: u32, window_secs: i64) -> Self {
+        Self {
+            counters: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            max_requests,
+            window_secs,
+        }
+    }
+
+    /// Check + increment. Returns `true` if the caller is over quota.
+    pub fn check_and_increment(&self, subject: &str) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        let mut map = self.counters.write();
+        // Evict stale entries to bound memory growth
+        if map.len() > 10_000 {
+            let window_secs = self.window_secs;
+            map.retain(|_, (_, ws)| now - *ws < window_secs * 2);
+        }
+        let entry = map.entry(subject.to_owned()).or_insert((0, now));
+        if now - entry.1 >= self.window_secs {
+            // New window: reset
+            *entry = (1, now);
+            false
+        } else if entry.0 >= self.max_requests {
+            true // over quota
+        } else {
+            entry.0 += 1;
+            false
+        }
+    }
+}
+
+/// Rate limiting middleware — enforces per-authenticated-subject request quotas.
+///
+/// Runs after `auth_middleware` (which inserts `AuthenticatedUser`).
+/// Defaults: 300 requests per 60-second window (~5 req/s sustained).
+/// Returns 429 when the window quota is exceeded.
 pub async fn rate_limit_middleware(
-    State(_state): State<ServerState>,
+    State(state): State<ServerState>,
     request: Request,
     next: Next,
 ) -> Response {
+    let subject = request
+        .extensions()
+        .get::<AuthenticatedUser>()
+        .map(|u| u.user.clone())
+        .unwrap_or_else(|| "anonymous".to_owned());
+
+    if state.rate_limiter.check_and_increment(&subject) {
+        warn!(subject = %subject, "Rate limit exceeded");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Rate limit exceeded — retry after window expires",
+        )
+            .into_response();
+    }
+
     next.run(request).await
 }
 
@@ -216,6 +353,26 @@ pub fn extract_kid_from_token(token: &str) -> Option<String> {
     let header_bytes = URL_SAFE_NO_PAD.decode(header_b64).ok()?;
     let header: serde_json::Value = serde_json::from_slice(&header_bytes).ok()?;
     header.get("kid").and_then(|v| v.as_str()).map(str::to_owned)
+}
+
+/// Extract the client IP from `X-Forwarded-For` or `X-Real-IP` headers.
+/// Falls back to `"unknown"` when no header is present (e.g. direct connection
+/// where ConnectInfo is not available in this middleware form).
+fn extract_client_ip(request: &Request) -> String {
+    if let Some(xff) = request.headers().get("x-forwarded-for") {
+        if let Ok(s) = xff.to_str() {
+            // Take the leftmost (original client) IP
+            if let Some(ip) = s.split(',').next() {
+                return ip.trim().to_owned();
+            }
+        }
+    }
+    if let Some(xri) = request.headers().get("x-real-ip") {
+        if let Ok(s) = xri.to_str() {
+            return s.trim().to_owned();
+        }
+    }
+    "unknown".to_owned()
 }
 
 /// CORS middleware configuration
