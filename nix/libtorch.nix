@@ -78,8 +78,10 @@ in {
     sha256 = "605532aeea2e22b639c2c4c239d2994f040457adff1a22cfb4c6d12b4b9641f7";
     nativeBuildInputs = [ patchelf ];
     postInstall = ''
-      for lib in libamd_comgr libelf; do
-        so="$out/lib/$lib.so"
+      # Match both unversioned (.so) and versioned (.so.1, .so.1.2, ...) sonames,
+      # since the libtorch ROCm bundle may ship either form; an unversioned-only
+      # match would silently skip versioned libraries.
+      for so in "$out"/lib/libamd_comgr.so* "$out"/lib/libelf.so*; do
         [ -f "$so" ] && ${patchelf}/bin/patchelf --add-rpath "${zlib}/lib" "$so"
       done
     '';
