@@ -1504,7 +1504,7 @@ pub async fn handle_load(
     use crate::events::{EventEnvelope, EventPayload};
 
     info!("Loading model: {}", model_ref_str);
-    let model_ref = ModelRef::parse(model_ref_str)?;
+    let _model_ref = ModelRef::parse(model_ref_str)?;
     let load_max_context = max_context.map(|v| v as u32);
     let load_kv_quant = if kv_quant == crate::runtime::KVQuantType::None { None } else { Some(kv_quant) };
 
