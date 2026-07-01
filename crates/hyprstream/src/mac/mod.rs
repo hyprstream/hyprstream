@@ -54,6 +54,7 @@
 //! UCAN chain validation, compilation, signature verification) is concentrated off the hot
 //! path — in PolicyService and the [`compiled`] loader, the one audited place (design §2).
 
+pub mod audit;
 pub mod avc;
 pub mod compiled;
 pub mod compiler;
@@ -66,6 +67,11 @@ pub mod te;
 
 // Re-export the per-op contract surface S2 (PEP) and S5/S6 (policy producers) consume.
 pub use avc::{Avc, AvcKey, CachingAvc, TokenScope};
+// S7 (#573): tamper-evident audit of every authorization decision + OTel fan-out.
+pub use audit::{
+    audit_signing_input, AuditError, AuditRecord, AuditSigner, AuditSink, AuditVerifier,
+    AuditedAvc, DecisionReason, NullAuditSink, WalAuditStore,
+};
 pub use compiled::{
     sign_policy, CompiledPolicy, PolicyApproval, PolicyDistError, PolicyLoader, PolicySigner,
     PolicyVerifier, SignedPolicy,

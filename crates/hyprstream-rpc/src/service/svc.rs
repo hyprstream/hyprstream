@@ -275,15 +275,26 @@ impl EnvelopeContext {
     /// Allow is logged at `info`; deny at `warn` (deny is the security-relevant
     /// event), but both carry identical structured fields so "who did what" is
     /// reconstructable for the allow path AND the deny path.
+    ///
+    /// **S7 (#573, #453):** this is the *control-plane* (Casbin `#[authorize]`)
+    /// audit surface. The *data-plane* MAC surface (the AVC) emits its own
+    /// records on the same unified `hyprstream.mac.audit` target via
+    /// `hyprstream::mac::audit`. Both targets fan out to OpenTelemetry when the
+    /// `otel` feature is active (OTel is a `tracing` subscriber), so denials
+    /// are first-class observable signals — closing the #453 visibility gap
+    /// where auth failures were previously buried at `debug` level. We also
+    /// mirror the decision onto `hyprstream.mac.audit` here so a single OTel
+    /// subscriber captures the whole authorization audit stream.
     pub fn audit_authz(&self, resource: &str, operation: &str, allowed: bool) {
         let subject = self.subject();
+        let decision = if allowed { "allow" } else { "deny" };
         if allowed {
             tracing::info!(
                 target: "audit",
                 subject = %subject,
                 resource = %resource,
                 action = %operation,
-                decision = "allow",
+                decision = decision,
                 request_id = self.request_id,
                 "authz decision"
             );
@@ -293,9 +304,36 @@ impl EnvelopeContext {
                 subject = %subject,
                 resource = %resource,
                 action = %operation,
-                decision = "deny",
+                decision = decision,
                 request_id = self.request_id,
                 "authz decision"
+            );
+        }
+        // S7 (#453): mirror onto the unified MAC audit target so a single OTel
+        // subscriber captures every authorization decision (control-plane
+        // Casbin + data-plane MAC AVC). Denials become first-class observable,
+        // no longer buried at debug level.
+        if allowed {
+            tracing::info!(
+                target: "hyprstream.mac.audit",
+                decision = decision,
+                subject = %subject,
+                resource = %resource,
+                action = %operation,
+                request_id = self.request_id,
+                plane = "control",
+                "authorization decision"
+            );
+        } else {
+            tracing::warn!(
+                target: "hyprstream.mac.audit",
+                decision = decision,
+                subject = %subject,
+                resource = %resource,
+                action = %operation,
+                request_id = self.request_id,
+                plane = "control",
+                "authorization decision"
             );
         }
     }
