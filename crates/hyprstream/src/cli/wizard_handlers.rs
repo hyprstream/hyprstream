@@ -104,7 +104,7 @@ pub async fn handle_wizard(
 ) -> Result<()> {
     // Install systemd units before entering spawn_blocking (async operation).
     if !bootstrap_only && hyprstream_rpc::has_systemd() {
-        handle_service_install(models_dir, config_services, None, false, false).await?;
+        handle_service_install(models_dir, config_services, None, false, false, hyprstream_service::ServiceTarget::User, false).await?;
     }
 
     let rt = tokio::runtime::Handle::current();

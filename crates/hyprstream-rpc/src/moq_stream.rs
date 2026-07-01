@@ -1,5 +1,12 @@
 //! moq-lite streaming plane (M2a of epic #134).
 //!
+//! Point-to-point / per-recipient streaming only (request/response, token
+//! streams, and per-recipient unique topics such as `NotificationService`'s
+//! blind broadcast — each recipient gets its own topic, not a shared fan-out
+//! track). Broadcast fan-out (N subscribers learning about one event from one
+//! source) is consolidated on the sibling `crate::moq_event` origin instead —
+//! see its module doc for the two-origins split.
+//!
 //! This is the moq-native replacement for the ZMQ PULL→XPUB queuing proxy in
 //! [`crate::service::streaming`]. Instead of a forwarding proxy with a custom
 //! per-topic queue + late-join rejoin buffer, in-process publishers append

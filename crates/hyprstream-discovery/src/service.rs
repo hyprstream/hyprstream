@@ -704,7 +704,7 @@ impl DiscoveryHandler for DiscoveryService {
         _request_id: u64,
         data: &RegisterEnvelopeKeysetRequest,
     ) -> Result<DiscoveryResponseVariant> {
-        if data.service_did.is_empty() {
+        if data.service_did.as_str().is_empty() {
             return Ok(DiscoveryResponseVariant::Error(ErrorInfo {
                 message: "serviceDid is required".to_owned(),
                 code: "INVALID_ARGUMENT".to_owned(),
@@ -724,7 +724,7 @@ impl DiscoveryHandler for DiscoveryService {
             fetched_at: unix_seconds_now(),
         };
         let mut map = self.envelope_keysets.write();
-        map.insert(data.service_did.clone(), cached);
+        map.insert(data.service_did.as_str().to_owned(), cached);
         let total = map.len();
         drop(map);
 
@@ -749,7 +749,7 @@ impl DiscoveryHandler for DiscoveryService {
             Some(cached) => {
                 trace!(service_did = %service_did, "Discovery: envelope keyset cache hit");
                 Ok(DiscoveryResponseVariant::GetEnvelopeKeysetResult(EnvelopeKeyset {
-                    service_did: service_did.to_owned(),
+                    service_did: hyprstream_rpc::identity::Did::new(service_did.to_owned()),
                     cose_keyset_cbor: cached.cose_keyset_cbor.clone(),
                     fetched_at: cached.fetched_at,
                 }))

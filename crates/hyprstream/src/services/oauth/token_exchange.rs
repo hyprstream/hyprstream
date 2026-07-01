@@ -75,7 +75,7 @@ pub async fn exchange_token_exchange(
     // Replay prevention: SHA-256 of the subject token as the replay key.
     // Covers all token types, regardless of whether they carry a jti claim.
     let token_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(subject_token.as_bytes()));
-    if !state.check_and_record_dpop_jti(&token_hash, verified.iat).await {
+    if !state.check_and_record_dpop_jti(&token_hash, verified.iat) {
         return tx_error(StatusCode::BAD_REQUEST, "invalid_grant", "subject_token already used (replay)");
     }
 

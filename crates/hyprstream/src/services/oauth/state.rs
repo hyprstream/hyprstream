@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::user_store::UserStore;
 use crate::config::OAuthConfig;
 use crate::services::{DiscoveryClient, PolicyClient};
+use hyprstream_util::TtlCache;
 use super::token_store::TokenStore;
 use super::user_service::UserService;
 
@@ -339,8 +340,10 @@ pub struct OAuthState {
     pub rsa_jwk: Option<serde_json::Value>,
     /// RSA key kid (for the JWT header).
     pub rsa_kid: Option<String>,
-    /// Seen DPoP JTIs for replay prevention. Value = expiry (iat + 120s).
-    pub dpop_jti_seen: RwLock<HashMap<String, i64>>,
+    /// Seen DPoP JTIs for replay prevention (RFC 9449 §11.1). Backed by
+    /// the shared `TtlCache` with atomic check-and-record — see
+    /// `check_and_record_dpop_jti`. TTL = iat + 120s per entry.
+    pub dpop_jti_seen: TtlCache<String, ()>,
     /// Server-issued DPoP nonces. Value = expiry unix timestamp.
     pub dpop_nonces: RwLock<HashMap<String, i64>>,
     /// Per-client (keyed by DPoP `jkt` thumbprint) nonce-issuance state.
@@ -397,6 +400,12 @@ pub struct OAuthState {
 }
 
 impl OAuthState {
+    /// DPoP jti replay-dedup cache: capacity bound (memory ceiling for the
+    /// `TtlCache<String, ()>`). 120s TTL per entry.
+    const DPOP_JTI_MAX_ENTRIES: usize = 10_000;
+    /// Inline reap budget per access (heap pops). Bounds tail latency.
+    const DPOP_JTI_REAP_BUDGET: usize = 64;
+
     pub fn new(config: &OAuthConfig, policy_client: PolicyClient, discovery_client: DiscoveryClient, verifying_key_bytes: [u8; 32]) -> Self {
         Self {
             clients: RwLock::new(HashMap::new()),
@@ -432,7 +441,7 @@ impl OAuthState {
             rsa_encoding_key: None,
             rsa_jwk: None,
             rsa_kid: None,
-            dpop_jti_seen: RwLock::new(HashMap::new()),
+            dpop_jti_seen: TtlCache::new(Self::DPOP_JTI_MAX_ENTRIES, Self::DPOP_JTI_REAP_BUDGET),
             dpop_nonces: RwLock::new(HashMap::new()),
             dpop_clients_seen: RwLock::new(HashMap::new()),
             trusted_issuers: config.trusted_issuers.clone(),
@@ -623,17 +632,12 @@ impl OAuthState {
     /// Returns `true` when the JTI is fresh (caller should proceed).
     /// Returns `false` when the JTI has been seen within its validity window (replay).
     /// Expired entries are pruned opportunistically on each call.
-    pub async fn check_and_record_dpop_jti(&self, jti: &str, iat: i64) -> bool {
+    pub fn check_and_record_dpop_jti(&self, jti: &str, iat: i64) -> bool {
         let now = chrono::Utc::now().timestamp();
-        let expiry = iat + 120; // ±60s window + 60s buffer
-        let mut store = self.dpop_jti_seen.write().await;
-        // Prune expired entries.
-        store.retain(|_, exp| *exp > now);
-        if store.contains_key(jti) {
-            return false;
-        }
-        store.insert(jti.to_owned(), expiry);
-        true
+        // Window ends at iat + 120s (±60s skew + 60s buffer); TTL = remainder.
+        let ttl_secs = ((iat + 120) - now).max(0) as u64;
+        self.dpop_jti_seen
+            .insert_if_absent(jti.to_owned(), (), Duration::from_secs(ttl_secs))
     }
 
     /// Issue a fresh server-side DPoP nonce (RFC 9449 §8).
@@ -740,7 +744,8 @@ impl OAuthState {
                 // Sweep expired DPoP JTIs and nonces
                 {
                     let now = chrono::Utc::now().timestamp();
-                    state.dpop_jti_seen.write().await.retain(|_, exp| *exp > now);
+                    // dpop_jti_seen is a TtlCache (self-evicting); sweep the
+                    // nonce + client-dedup maps only.
                     state.dpop_nonces.write().await.retain(|_, exp| *exp > now);
                     state.dpop_clients_seen.write().await.retain(|_, exp| *exp > now);
                 }
