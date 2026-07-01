@@ -27,7 +27,7 @@ use crate::events::{
     serialize_container_started, serialize_container_stopped,
     serialize_sandbox_started, serialize_sandbox_stopped,
 };
-#[cfg(feature = "kata-vm")]
+#[cfg(feature = "oci-image")]
 use crate::image::RafsStore;
 // Import generated wire types (canonical OCI-aligned names)
 use crate::generated::worker_client::{
@@ -66,9 +66,9 @@ pub struct WorkerService {
     /// Sandbox pool for VM management
     sandbox_pool: Arc<SandboxPool>,
 
-    /// RAFS store for image management (VM path only). Without `kata-vm`,
-    /// CRI image operations return a clear "built without kata-vm support" error.
-    #[cfg(feature = "kata-vm")]
+    /// RAFS store for image management. Without `oci-image`,
+    /// CRI image operations return a clear "built without oci-image support" error.
+    #[cfg(feature = "oci-image")]
     rafs_store: Arc<RafsStore>,
 
     /// Active containers (container_id -> Container)
@@ -105,9 +105,9 @@ impl WorkerService {
     pub fn new(
         pool_config: PoolConfig,
         backend: Arc<dyn super::backend::SandboxBackend>,
-        // RAFS image store is only meaningful for the VM/CH path; the parameter
-        // is compiled away when `kata-vm` is disabled.
-        #[cfg(feature = "kata-vm")] rafs_store: Arc<RafsStore>,
+        // RAFS image store is the universal image filesystem service; the
+        // parameter is compiled away when `oci-image` is disabled.
+        #[cfg(feature = "oci-image")] rafs_store: Arc<RafsStore>,
         transport: TransportConfig,
         signing_key: SigningKey,
     ) -> AnyhowResult<Self> {
@@ -119,7 +119,7 @@ impl WorkerService {
         let stream_channel = Arc::new(StreamChannel::new(signing_key.clone()));
         Ok(Self {
             sandbox_pool,
-            #[cfg(feature = "kata-vm")]
+            #[cfg(feature = "oci-image")]
             rafs_store,
             containers: RwLock::new(HashMap::new()),
             container_sandbox_map: RwLock::new(HashMap::new()),
@@ -1239,15 +1239,15 @@ impl ContainerHandler for WorkerService {
 
 }
 
-// CRI image operations are backed by the RAFS/nydus store, which only compiles
-// under `kata-vm`. When the feature is off the handlers stay wired (the RPC
-// surface is unchanged) but return a clear "built without kata-vm support" error
-// instead of failing to compile.
-#[cfg(not(feature = "kata-vm"))]
+// CRI image operations are backed by the RAFS/nydus image store, which only
+// compiles under `oci-image`. When the feature is off the handlers stay wired
+// (the RPC surface is unchanged) but return a clear "built without oci-image
+// support" error instead of failing to compile.
+#[cfg(not(feature = "oci-image"))]
 fn image_ops_unsupported<T>() -> AnyhowResult<T> {
     Err(anyhow::anyhow!(
-        "CRI image operations require the `kata-vm` feature (RAFS/nydus image store); \
-         this binary was built without kata-vm support"
+        "CRI image operations require the `oci-image` feature (RAFS/nydus image store); \
+         this binary was built without oci-image support"
     ))
 }
 
@@ -1255,25 +1255,25 @@ fn image_ops_unsupported<T>() -> AnyhowResult<T> {
 impl ImageHandler for WorkerService {
     async fn handle_list(&self, _ctx: &EnvelopeContext, _request_id: u64, filter: &ImageFilter) -> AnyhowResult<Vec<ImageInfo>> {
         let _ = filter; // filter not yet used
-        #[cfg(feature = "kata-vm")]
+        #[cfg(feature = "oci-image")]
         {
             let images = self.rafs_store.list_images().await?;
             Ok(images)
         }
-        #[cfg(not(feature = "kata-vm"))]
+        #[cfg(not(feature = "oci-image"))]
         {
             image_ops_unsupported()
         }
     }
 
     async fn handle_status(&self, _ctx: &EnvelopeContext, _request_id: u64, request: &ImageStatusRequest) -> AnyhowResult<ImageStatusResult> {
-        #[cfg(feature = "kata-vm")]
+        #[cfg(feature = "oci-image")]
         {
             let image_ref = &request.image.image;
             let status = self.rafs_store.image_status(image_ref, request.verbose).await?;
             Ok(status)
         }
-        #[cfg(not(feature = "kata-vm"))]
+        #[cfg(not(feature = "oci-image"))]
         {
             let _ = request;
             image_ops_unsupported()
@@ -1281,7 +1281,7 @@ impl ImageHandler for WorkerService {
     }
 
     async fn handle_pull(&self, _ctx: &EnvelopeContext, _request_id: u64, data: &PullImageRequest) -> AnyhowResult<String> {
-        #[cfg(feature = "kata-vm")]
+        #[cfg(feature = "oci-image")]
         {
             let image_ref = &data.image.image;
             let auth = if !data.auth.username.is_empty() {
@@ -1299,7 +1299,7 @@ impl ImageHandler for WorkerService {
             let image_id = self.rafs_store.pull_with_auth(image_ref, auth.as_ref()).await?;
             Ok(image_id)
         }
-        #[cfg(not(feature = "kata-vm"))]
+        #[cfg(not(feature = "oci-image"))]
         {
             let _ = data;
             image_ops_unsupported()
@@ -1307,13 +1307,13 @@ impl ImageHandler for WorkerService {
     }
 
     async fn handle_remove(&self, _ctx: &EnvelopeContext, _request_id: u64, data: &ImageSpec) -> AnyhowResult<()> {
-        #[cfg(feature = "kata-vm")]
+        #[cfg(feature = "oci-image")]
         {
             let image_ref = &data.image;
             self.rafs_store.remove_image(image_ref).await?;
             Ok(())
         }
-        #[cfg(not(feature = "kata-vm"))]
+        #[cfg(not(feature = "oci-image"))]
         {
             let _ = data;
             image_ops_unsupported()
@@ -1321,12 +1321,12 @@ impl ImageHandler for WorkerService {
     }
 
     async fn handle_fs_info(&self, _ctx: &EnvelopeContext, _request_id: u64) -> AnyhowResult<Vec<FilesystemUsage>> {
-        #[cfg(feature = "kata-vm")]
+        #[cfg(feature = "oci-image")]
         {
             let usage = self.rafs_store.fs_info().await?;
             Ok(usage)
         }
-        #[cfg(not(feature = "kata-vm"))]
+        #[cfg(not(feature = "oci-image"))]
         {
             image_ops_unsupported()
         }
