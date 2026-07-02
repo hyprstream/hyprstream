@@ -21,6 +21,8 @@ async-trait = { workspace = true }
 parking_lot = { workspace = true }
 base64 = { workspace = true }
 subsecond = { workspace = true }
+inventory = { workspace = true }
+tracing = { workspace = true }
 hyprstream-vfs = { path = "../hyprstream-vfs" }
 hyprstream-tcl = { path = "../hyprstream-tcl" }
 
@@ -43,6 +45,9 @@ web-sys = { version = "0.3", features = [
 # P9Client/DmaTransport are entirely `#[cfg(target_arch = "wasm32")]`, so this is
 # gated to the browser target to keep mount_wanix buildable in the wasm bundle.
 hyprstream-9p = { path = "../hyprstream-9p" }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { workspace = true }
 
 [build-dependencies]
 capnpc = { workspace = true }
