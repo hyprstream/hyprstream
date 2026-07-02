@@ -33,6 +33,7 @@ use crate::services::generated::registry_client::{
     StreamInfo, ErrorInfo, HealthStatus, DetailedStatusInfo, RemoteInfo,
     CloneRequest, RegisterRequest,
     GetBlobRequest, GetBlobRequestContent,
+    PutBlobRequest,
     CreateWorktreeRequest, RemoveWorktreeRequest,
     BranchRequest, CheckoutRequest, StageFilesRequest,
     CommitRequest, MergeRequest, ContinueMergeRequest,
@@ -1747,6 +1748,39 @@ impl RegistryHandler for RegistryService {
             Ok(status) => Ok(RegistryResponseVariant::HealthCheckResult(status)),
             Err(e) => Ok(reg_error(&e.to_string())),
         }
+    }
+
+    /// STUB (epic #654) — the authenticated XET write path. NOT IMPLEMENTED:
+    /// this returns a fail-closed error so the wire shape lands (unblocking the
+    /// impl PR) without any behavior change. `main` semantics are unchanged: no
+    /// bytes are ever accepted here.
+    ///
+    /// Precondition (already satisfied by dispatch): the coarse `$scope(write)`
+    /// gate runs before this handler, exactly as `$scope(query)` does for
+    /// `handle_get_blob` (neither method carries `#[authorize]`; the coarse gate
+    /// is the schema-declared baseline, the fine-grained check lives in-handler).
+    ///
+    /// The real implementation (separate PR) will then:
+    ///   1. fine-grained `authorize(ctx, "model:{repo}", "write")` on
+    ///      `data.grant_repo`, mirroring `authorize_get_blob`'s per-repo check
+    ///      one verb up (a read grant never implies write);
+    ///   2. cap `data.bytes` at MAX_INLINE_UPLOAD (DoS guard — unbounded `Data`);
+    ///   3. chunk (Gearhash CDC) + store xorbs via an in-process CasStore write
+    ///      API (to add, mirroring `cas-serve::handle_upload_file`);
+    ///   4. compute the merkle SERVER-SIDE from the stored bytes (never
+    ///      caller-supplied — this is what closes the #436 planting vector);
+    ///   5. `xet_provenance.record(merkle, repo_id)` (the #509/#511 hook, today
+    ///      called only in tests — production population starts here);
+    ///   6. return `PutBlobResult { merkle, xorb_hashes, bytes_stored }`.
+    async fn handle_put_blob(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        _data: &PutBlobRequest,
+    ) -> Result<RegistryResponseVariant> {
+        // Fail closed: the write path is not yet wired. Deny rather than
+        // silently accept bytes with no provenance binding.
+        Ok(reg_error(
+            "putBlob not yet implemented (epic #654): authenticated XET upload + \
+             server-side merkle + provenance recording pending",
+        ))
     }
 
 }
