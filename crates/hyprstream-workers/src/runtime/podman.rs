@@ -8,39 +8,54 @@
 //!
 //! Backend type: `"podman"`.
 //!
+//! # Spine positioning — KNOWN-INTERIM image delivery (see #653)
+//!
+//! Per the spine (#508), a backend should NOT provision images itself: the
+//! image is a `hyprstream_vfs::Mount` composed into a per-sandbox
+//! [`Namespace`](hyprstream_vfs::Namespace) (via
+//! [`SandboxFs::compose`](crate::runtime::sandbox_fs::SandboxFs::compose),
+//! #641), and the backend only *delivers* that composed namespace to its guest
+//! over a transport. Kata delivers it over virtio-fs.
+//!
+//! **This backend does not yet do that**, because the delivery transport it
+//! would need does not exist yet. `podman run --rootfs <dir>` requires the
+//! composed namespace materialized as a **host POSIX directory**, but
+//! `hyprstream-vfs-server` only ships a **vhost-user-fs** transport (guest-memory
+//! vrings for a Cloud Hypervisor VM) — it is built with `fuse-backend-rs`'s
+//! `virtiofs` feature and deliberately *not* `fusedev`, so there is no local
+//! `/dev/fuse` mount that yields a directory podman could consume. Until a
+//! local-FUSE-mount transport lands, this backend uses podman's own image store
+//! (`podman run <image-ref>`) as an **interim, non-spine** image source.
+//!
+//! This is the seam to fix, tracked in **#653**: add a local-FUSE-mount serve
+//! mode to `hyprstream-vfs-server`, then have [`start`](PodmanBackend::start)
+//! compose via `SandboxFs` and pass the mountpoint as `--rootfs`, exactly
+//! mirroring kata's compose-and-serve. The interim path is marked at the
+//! [`resolve_image`](PodmanBackend::resolve_image) / `start` seam below so it is
+//! not mistaken for a spine-aligned implementation.
+//!
 //! # Scope (MVP)
 //!
-//! This is a **podman-only** backend. A prior attempt (#484) advertised a
-//! "docker fallback" but never actually exercised it correctly — `docker
-//! info` does not emit the `{{.Host.Security.Rootless}}` Go-template field
-//! podman does, so the fallback's rootless probe silently parsed as `false`
-//! for every docker host (a mis-detection, not a real fallback). Rather than
-//! half-implement docker support again, this backend is honestly
-//! podman-only: [`is_available`](SandboxBackend::is_available) checks for
-//! `podman` on `PATH` only. A docker backend, if wanted later, should be its
-//! own registration with its own (docker-correct) rootless probe rather than
-//! sharing a code path that silently degrades.
+//! This is a **podman-only** backend: [`is_available`](SandboxBackend::is_available)
+//! checks for `podman` on `PATH` only. Docker is intentionally not a fallback —
+//! `docker info` does not emit the `{{.Host.Security.Rootless}}` Go-template
+//! field podman does, so a shared code path would mis-detect every docker host
+//! as rootful. A docker backend, if wanted later, should be its own
+//! registration with its own docker-correct rootless probe.
 //!
 //! # Rootless detection
 //!
 //! `podman info --format '{{.Host.Security.Rootless}}'` is the correct probe
-//! (verified against `podman-info(1)`: `Host.Security.Rootless` is a real
-//! field in `podman info --format json`). The previous attempt ran this
-//! query in `initialize()` but only logged the result — it never affected
-//! container creation, so "detection" was dead weight. Here the rootless
-//! flag is cached once (`OnceLock`, queried lazily and reused) and threaded
-//! into [`PodmanBackend::start`]: rootless hosts get `--userns=keep-id` so
-//! the in-container UID maps to the invoking host user (required for bind
-//! mounts to be writable without root); rootful hosts skip it (`keep-id` is
-//! a rootless-only podman flag and errors out under a rootful daemon).
+//! (`Host.Security.Rootless` is a real field in `podman info --format json`).
+//! The rootless flag is cached once (`OnceLock`, queried lazily and reused) and
+//! threaded into [`PodmanBackend::start`]: rootless hosts get `--userns=keep-id`
+//! so the in-container UID maps to the invoking host user (required for bind
+//! mounts to be writable without root); rootful hosts skip it (`keep-id` is a
+//! rootless-only podman flag and errors out under a rootful daemon).
 //!
 //! # Config fields used at `start()`
 //!
-//! The prior attempt accepted `_config: &PodSandboxConfig` but never read
-//! it — resources were only ever applied later via the separate
-//! `update_resources` call (which nothing invoked at sandbox-creation time),
-//! so a sandbox's CPU/memory limits and security context were silently
-//! dropped on the floor at `start()`. This implementation reads:
+//! `start()` reads from `PodSandboxConfig`:
 //!
 //! * `config.hostname` → `--hostname`
 //! * `config.dns_config.{servers,searches,options}` → `--dns` / `--dns-search` / `--dns-option`
@@ -213,7 +228,13 @@ impl PodmanBackend {
         pid_str.parse().ok().filter(|&p: &u32| p > 0)
     }
 
-    /// Resolve the OCI image: annotation overrides config default.
+    /// Resolve the OCI image reference: annotation overrides config default.
+    ///
+    /// INTERIM (non-spine, #653): the returned reference is provisioned through
+    /// podman's own image store (`podman run <image-ref>`), not composed from the
+    /// universal image filesystem service (`SandboxFs`). This is the seam that
+    /// moves to `--rootfs <composed-namespace-mountpoint>` once a local-FUSE-mount
+    /// transport exists — see the module-level "Spine positioning" section.
     fn resolve_image(&self, annotations: &HashMap<String, String>) -> String {
         annotations
             .get("hyprstream.io/worker-image")
@@ -392,6 +413,9 @@ impl SandboxBackend for PodmanBackend {
         pool_config: &PoolConfig,
         annotations: &HashMap<String, String>,
     ) -> Result<Arc<dyn SandboxHandle>> {
+        // INTERIM image delivery (non-spine, #653): sources the rootfs from
+        // podman's image store rather than composing the universal image Mount
+        // via SandboxFs. See the module "Spine positioning" section.
         let image = self.resolve_image(annotations);
         Self::validate_image(&image)?;
         let name = container_name(&sandbox.id);
