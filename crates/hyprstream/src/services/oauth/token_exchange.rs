@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 
 use super::state::OAuthState;
 use crate::mac::exchange::{
-    evaluate_grant, GrantDecision, GrantError, GrantRequest, GrantedAccess,
+    evaluate_grant, evaluate_refresh, GrantDecision, GrantError, GrantRequest, GrantedAccess,
 };
 use crate::services::generated::policy_client::IssueToken;
 
@@ -518,7 +518,135 @@ pub async fn exchange_ucan_grant(
     };
 
     // ── 6. Mint the short-ttl sender-bound access token (ZSP) ──────────────
-    mint_grant_token(state, &granted, &dpop_jkt).await
+    // Persist the grant re-evaluation context so a refresh re-runs the S6 gate
+    // chain (B1 #673) rather than free-re-minting. The grant CID binds the
+    // stored blob to exactly this grant.
+    let grant_refresh = super::state::UcanGrantRefresh {
+        grant_cbor_b64: subject_token.to_owned(),
+        grant_cid: blake3::hash(&ucan_bytes).to_hex().to_string(),
+        requested_scope: requested_scope.map(str::to_owned),
+        audience: audience.map(str::to_owned),
+    };
+    mint_grant_token(state, &granted, &dpop_jkt, Some(grant_refresh)).await
+}
+
+/// Re-evaluate a UCAN grant on refresh and re-mint (MAC #547 / B1 #673).
+///
+/// ZSP: a UCAN-grant refresh is NOT a free re-mint. The generic OAuth 2.1
+/// refresh path would rotate the token without re-checking the grant and would
+/// treat DPoP as optional; both break the S6 discipline. This path instead:
+///
+/// 1. requires a **fresh** DPoP proof (mandatory sender-binding — matching the
+///    initial mint), and
+/// 2. re-presents the persisted grant to [`evaluate_refresh`], which runs the
+///    same gate chain as mint against the *current* `now` and verifier state —
+///    so a ceiling that has since been amended/revoked, or a grant that has
+///    since expired, now denies.
+///
+/// The caller (`exchange_refresh_token`) has already atomically consumed
+/// (rotated) the presented refresh token before delegating here. Every failure
+/// is fail-closed. On permit, a new sender-bound access token + rotated refresh
+/// token are minted, re-persisting the grant context for the next refresh.
+pub(crate) async fn exchange_ucan_grant_refresh(
+    state: &Arc<OAuthState>,
+    ucan_grant: &super::state::UcanGrantRefresh,
+    dpop_header: Option<&str>,
+) -> Response {
+    // 1. Fresh DPoP is MANDATORY (ZSP sender-binding) — same as the mint path.
+    let token_endpoint = format!("{}/oauth/token", state.issuer_url.trim_end_matches('/'));
+    let dpop_jkt = match dpop_header.and_then(|h| {
+        super::dpop::verify_dpop_proof(h, "POST", &token_endpoint, None)
+            .ok()
+            .map(|p| p.jkt)
+    }) {
+        Some(jkt) => jkt,
+        None => {
+            return tx_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "UCAN grant refresh requires a valid DPoP proof (sender-binding)",
+            );
+        }
+    };
+
+    // 2. Re-present the persisted grant. Verify the stored blob's content id
+    //    first — a corrupted/substituted grant fails closed.
+    let ucan_bytes = match URL_SAFE_NO_PAD.decode(&ucan_grant.grant_cbor_b64) {
+        Ok(b) => b,
+        Err(_) => {
+            return tx_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "stored UCAN grant is not valid base64url",
+            );
+        }
+    };
+    if blake3::hash(&ucan_bytes).to_hex().to_string() != ucan_grant.grant_cid {
+        return tx_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "stored UCAN grant failed its content-id check",
+        );
+    }
+    let grant = match hyprstream_rpc::auth::ucan::token::Ucan::from_cbor(&ucan_bytes) {
+        Ok(u) => u,
+        Err(e) => {
+            return tx_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                &format!("stored UCAN grant no longer decodes: {e}"),
+            );
+        }
+    };
+
+    // Rebuild the S6 request from the persisted requested access.
+    let request = match parse_grant_request(
+        ucan_grant.requested_scope.as_deref(),
+        ucan_grant.audience.as_deref(),
+    ) {
+        Ok(r) => r,
+        Err(msg) => return tx_error(StatusCode::BAD_REQUEST, "invalid_scope", &msg),
+    };
+
+    // Resolve the subject's MAC context exactly as the mint path does. Mirrors
+    // the production dispatch's deny-by-default resolver until the S8 concrete
+    // resolver is wired (TODO(#572-verifier)/#574) — refresh must not be more
+    // permissive than mint.
+    let subject_ctx = DenyUnlabeledResolver.resolve(grant.audience().as_str());
+
+    // The verifier: same trust-store-anchored construction as mint. Absent ⇒
+    // fail closed (no unverified chain).
+    let Some(verifier) = crate::mac::exchange_ucan_verifier(state) else {
+        return tx_error(
+            StatusCode::FORBIDDEN,
+            "server_error",
+            "UCAN grant verification is not configured on this node",
+        );
+    };
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let decision = evaluate_refresh(
+        &grant,
+        &verifier,
+        now,
+        &request,
+        subject_ctx.as_ref(),
+        true, // sender-bound: a fresh DPoP proof was just verified above
+    );
+
+    let granted = match decision {
+        Ok(GrantDecision::Permit(g)) => g,
+        Ok(GrantDecision::Escalate { .. }) => {
+            return tx_error(
+                StatusCode::FORBIDDEN,
+                "insufficient_scope",
+                "grant request exceeds ceiling; escalation amendment required",
+            );
+        }
+        Err(e) => return grant_error_response(e),
+    };
+
+    // Re-mint + rotate, re-persisting the grant context for the next refresh.
+    mint_grant_token(state, &granted, &dpop_jkt, Some(ucan_grant.clone())).await
 }
 
 /// Map an S6 [`GrantError`] to a concrete OAuth 2.1 error response. Every variant
@@ -594,6 +722,7 @@ async fn mint_grant_token(
     state: &Arc<OAuthState>,
     granted: &GrantedAccess,
     dpop_jkt: &str,
+    grant_refresh: Option<super::state::UcanGrantRefresh>,
 ) -> Response {
     let now = chrono::Utc::now().timestamp();
     let ttl = state
@@ -654,13 +783,12 @@ async fn mint_grant_token(
         None => crate::auth::jwt::encode(&claims, &ed_sk),
     };
 
-    // Optional refresh token (ZSP: refresh re-runs evaluate_grant, not a free
-    // re-mint). Stored only when a token DB is configured.
-    // TODO(#572-refresh-rotation): wire refresh-token rotation + the
-    //   evaluate_refresh re-evaluation end-to-end (store the grant CID +
-    //   request so the refresh path can re-present them).
+    // Optional refresh token (ZSP: refresh re-runs evaluate_refresh, not a free
+    // re-mint). Stored only when a token DB is configured. B1 (#673): the grant
+    // re-evaluation context is persisted with the refresh token so the refresh
+    // path re-presents the grant to the S6 gate chain.
     let refresh_token = if state.token_db.is_some() {
-        Some(issue_grant_refresh_token(state, &sub, expires_at).await)
+        Some(issue_grant_refresh_token(state, &sub, expires_at, grant_refresh).await)
     } else {
         None
     };
@@ -696,6 +824,7 @@ async fn issue_grant_refresh_token(
     state: &Arc<OAuthState>,
     sub: &str,
     access_expires_at: i64,
+    grant_refresh: Option<super::state::UcanGrantRefresh>,
 ) -> String {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use rand::RngCore as _;
@@ -716,6 +845,7 @@ async fn issue_grant_refresh_token(
         resource: None,
         expires_at_unix: chrono::Utc::now().timestamp() + state.refresh_token_ttl as i64,
         verifying_key_bytes: None,
+        ucan_grant: grant_refresh,
     };
 
     if let Some(db) = &state.token_db {
@@ -834,5 +964,54 @@ mod tests {
     fn deny_unlabeled_resolver_always_denies() {
         let r = DenyUnlabeledResolver;
         assert!(r.resolve("did:key:anything").is_none());
+    }
+
+    /// B1 (#673): a persisted refresh token from BEFORE this field existed (no
+    /// `ucan_grant` key) MUST still deserialize — as `None` — so existing stored
+    /// tokens keep working and are simply treated as generic (non-UCAN-grant)
+    /// refresh tokens. Guards the `#[serde(default)]` on the new field.
+    #[test]
+    fn refresh_entry_without_ucan_grant_field_deserializes_as_none() {
+        let legacy = r#"{
+            "client_id": "abc",
+            "username": "alice",
+            "scopes": ["openid"],
+            "resource": null,
+            "expires_at_unix": 9999999999,
+            "verifying_key_bytes": null
+        }"#;
+        let entry: super::super::state::RefreshTokenEntry =
+            serde_json::from_str(legacy).expect("legacy refresh entry must still deserialize");
+        assert!(
+            entry.ucan_grant.is_none(),
+            "a legacy entry is a generic refresh token, never a UCAN grant"
+        );
+    }
+
+    /// B1 (#673): a UCAN-grant refresh entry round-trips through serde with its
+    /// re-evaluation context intact — the grant blob, its content id, and the
+    /// requested access the refresh path re-presents to `evaluate_refresh`.
+    #[test]
+    fn ucan_grant_refresh_entry_roundtrips() {
+        let entry = super::super::state::RefreshTokenEntry {
+            client_id: "ucan-grant:did:key:zAlice".to_owned(),
+            username: "did:key:zAlice".to_owned(),
+            scopes: vec!["urn:hyprstream:grant-type:ucan".to_owned()],
+            resource: None,
+            expires_at_unix: 9999999999,
+            verifying_key_bytes: None,
+            ucan_grant: Some(super::super::state::UcanGrantRefresh {
+                grant_cbor_b64: "Zm9vYmFy".to_owned(),
+                grant_cid: blake3::hash(b"the-grant").to_hex().to_string(),
+                requested_scope: Some("read:model:llama".to_owned()),
+                audience: Some("https://api.example".to_owned()),
+            }),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: super::super::state::RefreshTokenEntry = serde_json::from_str(&json).unwrap();
+        let ug = back.ucan_grant.expect("ucan_grant survives round-trip");
+        assert_eq!(ug.grant_cbor_b64, "Zm9vYmFy");
+        assert_eq!(ug.grant_cid, blake3::hash(b"the-grant").to_hex().to_string());
+        assert_eq!(ug.requested_scope.as_deref(), Some("read:model:llama"));
     }
 }

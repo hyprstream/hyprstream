@@ -477,6 +477,20 @@ async fn exchange_refresh_token(
         );
     }
 
+    // MAC #547 / B1 (#673): a UCAN-grant refresh is re-evaluated through the S6
+    // gate chain with a MANDATORY fresh DPoP proof — never this generic OAuth
+    // rotation path (which treats DPoP as optional and does not re-check the
+    // ceiling). The refresh token has already been rotated (consumed) above, so
+    // the re-evaluation either mints a fresh pair or fails closed.
+    if let Some(ucan_grant) = &entry.ucan_grant {
+        return super::token_exchange::exchange_ucan_grant_refresh(
+            &state,
+            ucan_grant,
+            dpop_header.as_deref(),
+        )
+        .await;
+    }
+
     // Verify DPoP if present.
     let dpop_jkt = match verify_dpop_at_token_endpoint(&state, dpop_header.as_deref()).await {
         None => None,
@@ -696,6 +710,7 @@ async fn issue_token_with_refresh(
                     resource,
                     expires_at_unix: now + state.refresh_token_ttl as i64,
                     verifying_key_bytes: user_verifying_key.map(|vk| *vk.as_bytes()),
+                    ucan_grant: None, // generic OAuth refresh; not a UCAN grant (MAC #547 B1)
                 };
                 if let Err(e) = state.put_refresh_token(&refresh_token, &entry, state.refresh_token_ttl as u64).await {
                     tracing::error!(error = %e, "Failed to persist refresh token");

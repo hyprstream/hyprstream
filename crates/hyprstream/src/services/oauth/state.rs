@@ -256,6 +256,37 @@ pub struct RefreshTokenEntry {
     pub expires_at_unix: i64,
     /// Ed25519 verifying key bytes bound to this token (cnf key continuity on refresh).
     pub verifying_key_bytes: Option<[u8; 32]>,
+    /// Present only for UCAN-grant refresh tokens (`client_id` `ucan-grant:{sub}`).
+    ///
+    /// MAC #547 / B1 (#673): refresh of a UCAN grant is NOT a free re-mint — the
+    /// refresh path must re-run the S6 gate chain (`evaluate_refresh`) against the
+    /// grant, because the ceiling may have been amended or revoked since the
+    /// access token was minted (ZSP: access is re-evaluated on refresh). That
+    /// requires persisting the grant + the requested access so the refresh path
+    /// can re-present them. `None` for every non-UCAN-grant refresh token, which
+    /// keeps the generic OAuth 2.1 rotation path unchanged.
+    #[serde(default)]
+    pub ucan_grant: Option<UcanGrantRefresh>,
+}
+
+/// Re-evaluation context persisted alongside a UCAN-grant refresh token so the
+/// refresh path can re-present the grant to `evaluate_refresh` (MAC #547 / B1
+/// #673). Carrying the grant itself (not just an id) lets the gate chain
+/// re-check the ceiling against current state on every refresh.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UcanGrantRefresh {
+    /// `base64url(CBOR)` of the UCAN grant, re-presented to `evaluate_refresh`
+    /// verbatim (the same encoding the client sent as `subject_token`).
+    pub grant_cbor_b64: String,
+    /// BLAKE3 content id (hex) of the CBOR grant. Binds this refresh entry to
+    /// exactly the grant it was minted from and is checked on every refresh so
+    /// a corrupted/substituted stored blob fails closed.
+    pub grant_cid: String,
+    /// The RFC 8693 requested `scope` (the S3 `action:resource:identifier`
+    /// triple) used to rebuild the `GrantRequest` on refresh.
+    pub requested_scope: Option<String>,
+    /// The RFC 8707 `audience` resource indicator, if any.
+    pub audience: Option<String>,
 }
 
 impl RefreshTokenEntry {
