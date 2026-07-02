@@ -99,22 +99,66 @@ pub use compiler::{
 /// Construct the [`UcanVerifier`] the HTTP grant path uses to validate a
 /// presented UCAN's signatures.
 ///
-/// This is the S6↔trust-store seam: the verifier resolves each UCAN issuer's
-/// anchored ML-DSA-65 verifying key (the same `register_pq_trust` binding the
-/// rest of the TCB uses). Until that binding is wired through the OAuth state,
-/// this returns `None`, which makes the HTTP grant path deny every request
-/// (`evaluate_grant` never runs against an unverified chain — fail-closed).
+/// This is the S6↔trust-store seam. **S8 (#574) wires it to the process-global
+/// `PqTrustStore`** (the same `register_pq_trust` binding the rest of the TCB
+/// uses, installed via `envelope::install_verify_config`). The verifier resolves
+/// each UCAN issuer's anchored ML-DSA-65 verifying key from that store and
+/// verifies the hybrid composite with `require_pq = true` (the Hybrid policy).
+///
+/// Returns `None` (→ the HTTP grant path denies every request, fail-closed) when
+/// no PQ trust store has been installed — a node that has not configured hybrid
+/// verification cannot validate hybrid-signed UCANs, and `evaluate_grant` never
+/// runs against an unverified chain.
 ///
 /// The core `evaluate_grant` is exercised through its own tests with a real
 /// verifier, so the security-critical logic is covered independently of this
-/// wiring landing.
-///
-/// TODO(#572-verifier): wire the trust store's anchored PQ keys into a concrete
-///   `UcanVerifier` and return it from this function.
+/// wiring.
 pub fn exchange_ucan_verifier(
     _state: &crate::services::oauth::state::OAuthState,
 ) -> Option<Box<dyn hyprstream_rpc::auth::ucan::token::UcanVerifier + Send + Sync>> {
-    // Fail-closed: no verifier is wired ⇒ the HTTP grant path denies. The
-    // single authority path; no fallback.
-    None
+    // The verifier needs the kid-anchored PQ store (the same `register_pq_trust`
+    // binding the envelope verifier uses). If none is installed, fail-closed.
+    let pq_store = hyprstream_rpc::envelope::global_pq_store()?;
+    Some(Box::new(GlobalPqUcanVerifier { pq_store }))
+}
+
+/// A `UcanVerifier` backed by the process-global `PqTrustStore` (the same store
+/// the envelope verifier uses). Resolves each UCAN issuer's anchored ML-DSA-65
+/// key and verifies the hybrid composite under the Hybrid policy (`require_pq`).
+///
+/// This is the S8 activation: the HTTP grant path now validates hybrid UCAN
+/// signatures against the node's trust store rather than denying by default.
+struct GlobalPqUcanVerifier {
+    pq_store: std::sync::Arc<dyn hyprstream_rpc::envelope::PqTrustStore>,
+}
+
+impl hyprstream_rpc::auth::ucan::token::UcanVerifier for GlobalPqUcanVerifier {
+    fn verify(
+        &self,
+        issuer: &hyprstream_rpc::auth::ucan::token::Did,
+        ed_key: &[u8; 32],
+        payload: &[u8],
+        signature: &[u8],
+    ) -> Result<(), hyprstream_rpc::auth::ucan::token::UcanError> {
+        use hyprstream_rpc::auth::ucan::token::UcanError;
+        let ed_vk = ed25519_dalek::VerifyingKey::from_bytes(ed_key)
+            .map_err(|e| UcanError::BadSignature(e.to_string()))?;
+        // kid-anchoring: resolve the issuer's trusted ML-DSA-65 key from the
+        // global PQ store, keyed by the Ed25519 identity (the cnf-equivalent).
+        // The `issuer` DID encodes the same Ed25519 key; the store is keyed by
+        // the raw bytes (the canonical anchor), so we resolve via `ed_key`.
+        // No anchor ⇒ fail-closed under Hybrid (require_pq).
+        let _ = issuer; // available for future per-DID anchoring policy.
+        let pq_vk = self.pq_store.ml_dsa_key_for(ed_key);
+        hyprstream_rpc::crypto::cose_sign::verify_composite(
+            signature,
+            &ed_vk,
+            pq_vk.as_ref(),
+            payload,
+            hyprstream_rpc::auth::ucan::token::UCAN_AAD,
+            /* require_pq */ true,
+        )
+        .map(|_| ())
+        .map_err(|e| UcanError::BadSignature(e.to_string()))
+    }
 }

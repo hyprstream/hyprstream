@@ -255,7 +255,11 @@ fn validate_chain_at(ucan: &Ucan, now: u64, link: usize) -> Result<(), ChainErro
 ///
 /// This is the single entry point S5's compiler calls; it guarantees that only a
 /// genuine, currently-live ceiling reaches the (deferred) bundle-emission stage.
-pub fn validate<V: UcanVerifier + ?Sized>(ucan: &Ucan, verifier: &V, now: u64) -> Result<(), ChainError> {
+pub fn validate<V: UcanVerifier + ?Sized>(
+    ucan: &Ucan,
+    verifier: &V,
+    now: u64,
+) -> Result<(), ChainError> {
     ucan.validate_structure().map_err(ChainError::Structure)?;
     ucan.verify_signatures(verifier)
         .map_err(ChainError::Signature)?;
@@ -268,7 +272,7 @@ mod tests {
     use super::super::token::test_support::*;
     use super::*;
     use crate::auth::ucan::capability::{Ability, Capability, CaveatValue, Caveats, Resource};
-    use crate::auth::ucan::token::{Did, Ucan, UcanPayload};
+    use crate::auth::ucan::token::{Did, Ucan, UcanPayload, UCAN_AAD};
     use crate::crypto::cose_sign::sign_composite;
     use std::collections::BTreeMap;
 

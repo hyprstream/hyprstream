@@ -66,10 +66,12 @@
 //!   archival is `TODO(S7-followup):` below.
 //! - **Policy-evolution feedback** — denials feeding back into PolicyService is
 //!   `TODO(S7-followup):` — the records are here, the consumer is not.
-//! - **Hybrid (EdDSA + ML-DSA-65) signing of audit records** — the signer
-//!   trait is hybrid-capable today, but production key management for the
-//!   audit signing identity (the ML-DSA-65 half) lands with S8 (#574);
-//!   `TODO(S8):` markers are at every sign/verify call.
+//! - **Hybrid (EdDSA + ML-DSA-65) signing of audit records** — S8 (#574) made
+//!   the [`cose::CoseAuditSigner`] policy-aware: under a Hybrid crypto policy it
+//!   fails closed if no ML-DSA-65 key is provisioned (no silent downgrade of a
+//!   security-critical accounting artifact). Production wiring of the audited
+//!   AVC (constructing a `WalAuditStore` with the node's PQ audit key and
+//!   installing it in the PEP) is `TODO(S7-followup):`.
 
 use crate::mac::avc::{Avc, TokenScope};
 use crate::mac::lattice::SecurityLabel;
@@ -221,13 +223,15 @@ impl From<std::io::Error> for AuditError {
 /// the hybrid COSE composite (EdDSA + ML-DSA-65) via
 /// [`crate::mac::compiled::cose`]; tests use a trivial stub.
 //
-// TODO(S8 #574): the production audit signer MUST sign with the hybrid
-// composite (EdDSA + ML-DSA-65), the same construction `mac::compiled::cose`
-// already uses. Today `CoseAuditSigner` is hybrid-capable but the ML-DSA-65
-// audit signing key is not provisioned; S8 wires the key store for it. Until
-// then a node running under a Hybrid crypto policy SHOULD pass `Some(pq_sk)`;
-// a Classical-only deployment passes `None` and gets classical EdDSA-only
-// audit signatures (still tamper-evident, not PQ-forgery-resistant).
+// S8 (#574): the production audit signer signs with the hybrid composite
+// (EdDSA + ML-DSA-65), the same construction `mac::compiled::cose` uses. The
+// `CoseAuditSigner` is policy-aware: under a Hybrid policy with `require_pq`
+// it FAILS CLOSED if no ML-DSA-65 key is provisioned, rather than silently
+// emitting a classical-only signature (which would be a downgrade of a
+// security-critical accounting artifact). A Classical-only deployment passes
+// `require_pq = false` and gets classical EdDSA-only audit signatures (still
+// tamper-evident, not PQ-forgery-resistant) — the explicit, policy-selected
+// pinned suite, never an in-band downgrade.
 pub trait AuditSigner: Send + Sync {
     /// Sign the record's signing input (see [`audit_signing_input`]).
     fn sign(&self, signing_input: &[u8]) -> Result<Vec<u8>, AuditError>;
@@ -251,11 +255,16 @@ pub fn audit_signing_input(content_hash: &[u8; 32]) -> Vec<u8> {
 
 /// Production signer/verifier adapters over `hyprstream_rpc::crypto::cose_sign`,
 /// mirroring [`crate::mac::compiled::cose`].
-//
-// TODO(S8 #574): provision the ML-DSA-65 audit signing key (the `pq_sk` half)
-// from the node key store and pass `require_pq = true` at verify under a Hybrid
-// crypto policy. The construction here is already the hybrid nested composite;
-// only the key management is S8's job.
+///
+/// S8 (#574): the signer is policy-aware. Construct it via
+/// [`CoseAuditSigner::new`] with the node's enforced
+/// [`CryptoPolicy`](hyprstream_rpc::crypto::CryptoPolicy). Under a Hybrid policy
+/// it FAILS CLOSED at sign time if no ML-DSA-65 key is provisioned — an audit
+/// record is a security-critical accounting artifact and silently emitting an
+/// Ed25519-only signature under a Hybrid policy would be an in-band downgrade.
+/// The construction is the hybrid nested COSE composite; the key management is
+/// the caller's job (the node provisions the PQ audit key from the same
+/// `MlDsaSigningKeyStore` the token mint uses).
 pub mod cose {
     use super::{AuditError, AuditSigner, AuditVerifier};
     use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -267,17 +276,68 @@ pub mod cose {
     /// another message type).
     pub const AUDIT_AAD: &[u8] = b"hs-mac-audit-v1";
 
-    /// Hybrid (EdDSA + ML-DSA-65) signer for audit records. `pq_sk = None`
-    /// yields a classical-only signature (still tamper-evident).
+    /// Hybrid (EdDSA + ML-DSA-65) signer for audit records, policy-aware.
+    ///
+    /// Construct with [`CoseAuditSigner::new`], passing the node's enforced
+    /// [`CryptoPolicy`](hyprstream_rpc::crypto::CryptoPolicy). Under `Hybrid` the
+    /// ML-DSA-65 key is REQUIRED (fail-closed at sign time if absent); under
+    /// `Classical` it is OPTIONAL and a classical EdDSA-only signature is
+    /// emitted (the explicit, policy-selected pinned suite).
     pub struct CoseAuditSigner<'a> {
-        pub ed_sk: &'a SigningKey,
-        pub pq_sk: Option<&'a MlDsaSigningKey>,
+        ed_sk: &'a SigningKey,
+        pq_sk: Option<&'a MlDsaSigningKey>,
+        require_pq: bool,
+    }
+
+    impl<'a> CoseAuditSigner<'a> {
+        /// Construct a policy-aware audit signer.
+        ///
+        /// `policy` is the node's enforced crypto policy. `pq_sk` is the
+        /// provisioned ML-DSA-65 audit signing key (from the node's
+        /// `MlDsaSigningKeyStore`). Under `Hybrid`: `pq_sk = Some` produces a
+        /// hybrid composite (EdDSA + ML-DSA-65); `pq_sk = None` makes
+        /// construction succeed but every [`AuditSigner::sign`] FAILS CLOSED
+        /// (an audit record cannot be downgraded to classical under a Hybrid
+        /// policy — use [`Self::can_sign`] to check ahead of a hot path;
+        /// production MUST provision the PQ key under Hybrid). Under
+        /// `Classical`: `pq_sk` is ignored and EdDSA-only signatures are
+        /// emitted (the policy-selected suite).
+        pub fn new(
+            ed_sk: &'a SigningKey,
+            pq_sk: Option<&'a MlDsaSigningKey>,
+            policy: hyprstream_rpc::crypto::CryptoPolicy,
+        ) -> Self {
+            Self {
+                ed_sk,
+                // Under Classical the PQ key is ignored; coerce to None so the
+                // sign path unambiguously emits EdDSA-only (no silent hybrid).
+                pq_sk: if policy.uses_pq() { pq_sk } else { None },
+                require_pq: policy.uses_pq(),
+            }
+        }
+
+        /// Whether this signer can produce a signature under its policy: under
+        /// Hybrid this requires the PQ key; under Classical it always can.
+        /// Production wiring SHOULD check this at startup and fail to boot if
+        /// false under Hybrid (no audit signer ⇒ no Permit, per the S7
+        /// fail-closed contract).
+        #[must_use]
+        pub fn can_sign(&self) -> bool {
+            !self.require_pq || self.pq_sk.is_some()
+        }
     }
 
     impl AuditSigner for CoseAuditSigner<'_> {
         fn sign(&self, signing_input: &[u8]) -> Result<Vec<u8>, AuditError> {
-            // TODO(S8): once ML-DSA-65 audit key is provisioned, this is always
-            // hybrid under a Hybrid crypto policy. The call already supports it.
+            // Fail-closed: a Hybrid policy requires the ML-DSA-65 audit key. A
+            // missing key here is a provisioning bug; we refuse to emit a
+            // classical-only audit signature under Hybrid rather than silently
+            // downgrading a security-critical accounting artifact.
+            if self.require_pq && self.pq_sk.is_none() {
+                return Err(AuditError::Sign(
+                    "Hybrid crypto policy requires an ML-DSA-65 audit signing key, none provisioned (fail-closed)".to_owned(),
+                ));
+            }
             sign_composite(self.ed_sk, self.pq_sk, signing_input, AUDIT_AAD)
                 .map_err(|e| AuditError::Sign(e.to_string()))
         }
@@ -428,10 +488,10 @@ impl<S: AuditSigner> WalAuditStore<S> {
         let bytes = stored.canonical_bytes()?;
         let hash = *blake3::hash(&bytes).as_bytes();
 
-        // 2. Sign the domain-separated signing input.
-        // TODO(S8): hybrid (EdDSA + ML-DSA-65) signing is already wired via the
-        // CoseAuditSigner; S8 provisions the PQ audit key. The signer trait
-        // abstracts which mode is in use.
+        // 2. Sign the domain-separated signing input. S8 (#574): the
+        // CoseAuditSigner is policy-aware — under Hybrid it fails closed here
+        // if no ML-DSA-65 key is provisioned (no silent downgrade). The signer
+        // trait abstracts which mode is in use.
         let signing_input = audit_signing_input(&hash);
         let signature = self.signer.sign(&signing_input)?;
 
@@ -1364,5 +1424,97 @@ mod tests {
             let dec = base64_decode(&s).unwrap();
             assert_eq!(dec, case, "roundtrip failed for {case:?}");
         }
+    }
+
+    // ── S8 (#574): policy-aware hybrid audit signing ───────────────────────
+
+    use crate::mac::audit::cose::{CoseAuditSigner, CoseAuditVerifier};
+    use ed25519_dalek::SigningKey;
+    use hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair;
+    use hyprstream_rpc::crypto::CryptoPolicy;
+    use rand::rngs::OsRng;
+
+    /// Under a Hybrid policy, a signer with both keys produces a hybrid composite
+    /// that verifies with `require_pq = true`.
+    #[test]
+    fn cose_audit_signer_hybrid_roundtrips_under_hybrid_policy() {
+        let ed = SigningKey::generate(&mut OsRng);
+        let (pq_sk, pq_vk) = ml_dsa_generate_keypair();
+        let signer = CoseAuditSigner::new(&ed, Some(&pq_sk), CryptoPolicy::Hybrid);
+        assert!(signer.can_sign());
+
+        let input = b"audit-record-signing-input";
+        let sig = signer.sign(input).unwrap();
+
+        let verifier = CoseAuditVerifier {
+            ed_vk: &ed.verifying_key(),
+            pq_vk: Some(&pq_vk),
+            require_pq: true,
+        };
+        assert!(verifier.verify(input, &sig).is_ok());
+    }
+
+    /// Fail-closed: under a Hybrid policy, a signer with NO ML-DSA-65 key MUST
+    /// refuse to sign (no silent downgrade of a security-critical accounting
+    /// artifact). `can_sign()` reflects this.
+    #[test]
+    fn cose_audit_signer_fails_closed_under_hybrid_without_pq_key() {
+        let ed = SigningKey::generate(&mut OsRng);
+        let signer = CoseAuditSigner::new(&ed, None, CryptoPolicy::Hybrid);
+        assert!(!signer.can_sign(), "Hybrid without PQ key cannot sign");
+        let err = signer.sign(b"x").unwrap_err();
+        assert!(
+            matches!(err, AuditError::Sign(ref m) if m.contains("fail-closed")),
+            "expected fail-closed Sign error, got {err:?}"
+        );
+    }
+
+    /// Under a Classical policy, the signer emits an EdDSA-only signature even
+    /// if a PQ key was supplied (the PQ key is ignored — no silent hybrid). The
+    /// classical verifier (`require_pq = false`) accepts it.
+    #[test]
+    fn cose_audit_signer_classical_emits_eddsa_only() {
+        let ed = SigningKey::generate(&mut OsRng);
+        let (pq_sk, _pq_vk) = ml_dsa_generate_keypair();
+        // Classical policy: PQ key is IGNORED.
+        let signer = CoseAuditSigner::new(&ed, Some(&pq_sk), CryptoPolicy::Classical);
+        assert!(signer.can_sign());
+
+        let input = b"classical-audit";
+        let sig = signer.sign(input).unwrap();
+        // Classical verifier accepts the EdDSA-only signature.
+        let verifier = CoseAuditVerifier {
+            ed_vk: &ed.verifying_key(),
+            pq_vk: None,
+            require_pq: false,
+        };
+        assert!(verifier.verify(input, &sig).is_ok());
+
+        // A Hybrid verifier MUST reject the classical-only signature.
+        let (_other_sk, other_vk) = ml_dsa_generate_keypair();
+        let hybrid_verifier = CoseAuditVerifier {
+            ed_vk: &ed.verifying_key(),
+            pq_vk: Some(&other_vk),
+            require_pq: true,
+        };
+        assert!(
+            hybrid_verifier.verify(input, &sig).is_err(),
+            "Hybrid verifier must reject classical-only audit signature"
+        );
+    }
+
+    /// Tampered audit input must fail hybrid verification.
+    #[test]
+    fn cose_audit_signer_tampered_input_rejected() {
+        let ed = SigningKey::generate(&mut OsRng);
+        let (pq_sk, pq_vk) = ml_dsa_generate_keypair();
+        let signer = CoseAuditSigner::new(&ed, Some(&pq_sk), CryptoPolicy::Hybrid);
+        let sig = signer.sign(b"original").unwrap();
+        let verifier = CoseAuditVerifier {
+            ed_vk: &ed.verifying_key(),
+            pq_vk: Some(&pq_vk),
+            require_pq: true,
+        };
+        assert!(verifier.verify(b"tampered", &sig).is_err());
     }
 }

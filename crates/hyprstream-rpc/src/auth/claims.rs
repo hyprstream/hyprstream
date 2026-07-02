@@ -6,10 +6,10 @@
 //! - [`IdTokenClaims`] — OIDC ID Token claims (Section 2 of OpenID Connect
 //!   Core 1.0). Only used by the OAuth token endpoint when `scope=openid`.
 
+use crate::capnp::{FromCapnp, ToCapnp};
 use crate::common_capnp;
-use crate::capnp::{ToCapnp, FromCapnp};
 use anyhow::Result;
-use serde::{Deserialize, Serialize, Serializer, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Compute the RFC 7638 JWK Thumbprint for an Ed25519 key.
 ///
@@ -107,6 +107,26 @@ pub struct Claims {
     /// - Do NOT change to `skip_serializing_if` — that would leak the token in JSON.
     #[serde(skip)]
     pub token: Option<String>,
+
+    /// **MAC clearance (S8/#574, design §3, §11).** The authority-asserted
+    /// clearance the issuing node grants this subject: a `SecurityLabel`
+    /// carrying `level` + `compartments`. This is the **authority-asserted**
+    /// half of the S1 subject context; the issuing node signs the JWT, so the
+    /// clearance cannot be self-asserted by the subject.
+    ///
+    /// **Assurance is NOT carried here.** Per the S1/#548 contract, the
+    /// assurance axis of a subject's context is *derived from the verified key
+    /// material*, never trusted from a claim. The MAC PDP clamps the
+    /// clearance's assurance DOWN to what the verified crypto supports (see
+    /// [`crate::auth::mac::SecurityContext::from_clearance`]). So an Ed25519-only
+    /// identity carrying a `PqHybrid` clearance floors to `Classical` at
+    /// enforcement time — the claim cannot grant assurance the key does not back.
+    ///
+    /// `None` ⇒ unlabeled subject ⇒ the MAC monitor denies (no default
+    /// clearance; the S1 fail-closed rule). Carried on the hybrid-signed
+    /// envelope/JWT so it is itself PQ-forgery-resistant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clearance: Option<crate::auth::mac::SecurityLabel>,
 }
 
 // Custom Debug impl — NEVER log the bearer token
@@ -121,6 +141,7 @@ impl std::fmt::Debug for Claims {
             .field("aud", &self.aud)
             .field("cnf", &self.cnf)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .field("clearance", &self.clearance)
             .finish()
     }
 }
@@ -157,22 +178,30 @@ impl FromCapnp for Claims {
 
     fn read_from(reader: Self::Reader<'_>) -> Result<Self> {
         // Scopes on the wire are ignored - authorization is via Casbin
-        let aud = reader.get_aud().ok()
+        let aud = reader
+            .get_aud()
+            .ok()
             .and_then(|s| s.to_str().ok())
             .map(std::borrow::ToOwned::to_owned)
             .filter(|s| !s.is_empty());
 
-        let token = reader.get_token().ok()
+        let token = reader
+            .get_token()
+            .ok()
             .and_then(|s| s.to_str().ok())
             .map(std::borrow::ToOwned::to_owned)
             .filter(|s| !s.is_empty());
 
-        let iss = reader.get_iss().ok()
+        let iss = reader
+            .get_iss()
+            .ok()
             .and_then(|s| s.to_str().ok())
             .map(std::borrow::ToOwned::to_owned)
             .unwrap_or_default();
 
-        let cnf = reader.get_pub_key().ok()
+        let cnf = reader
+            .get_pub_key()
+            .ok()
             .and_then(|s| s.to_str().ok())
             .filter(|s| !s.is_empty())
             .map(|x| Cnf {
@@ -193,6 +222,11 @@ impl FromCapnp for Claims {
             aud,
             cnf,
             token,
+            // MAC clearance (S8/#574) is not carried on the Cap'n Proto envelope
+            // surface today; it rides the JWT (the hybrid-signed authority token).
+            // The envelope Claims are a distinct carrier from the JWT Claims; the
+            // clearance is read off the verified JWT by the MAC PDP.
+            clearance: None,
         })
     }
 }
@@ -209,6 +243,7 @@ impl Claims {
             aud: None,
             cnf: None,
             token: None,
+            clearance: None,
         }
     }
 
@@ -268,6 +303,16 @@ impl Claims {
             jwk: None,
             jkt: Some(compute_jkt(key_bytes)),
         });
+        self
+    }
+
+    /// Set the MAC clearance claim (S8/#574). The authority-asserted clearance
+    /// the issuing node grants this subject (level + compartments). The
+    /// resulting JWT carries this under its (hybrid) signature, so it is itself
+    /// PQ-forgery-resistant; the assurance axis is NOT carried here — it is
+    /// derived from the verified key material at enforcement time.
+    pub fn with_clearance(mut self, clearance: crate::auth::mac::SecurityLabel) -> Self {
+        self.clearance = Some(clearance);
         self
     }
 
@@ -334,6 +379,27 @@ impl Claims {
     }
 }
 
+// ── MAC subject-context seam (S8/#574, S1/#548) ─────────────────────────────
+//
+// `Claims` is the authority-asserted carrier for a subject's clearance. The S1
+// `SubjectContextClaims` trait is the typed contract the MAC PDP / S6 grant path
+// program against; this impl lights it up for real verified JWT claims. The
+// two-input `security_context(key_material)` combines:
+//   1. the authority-asserted clearance (this `clearance` field — the JWT is
+//      signed by the issuing node, so this is authority-asserted, not self-
+//      asserted), and
+//   2. the assurance derived from the *verified key material* (threaded in from
+//      the envelope signature-verification layer — NEVER trusted from a claim).
+// `SecurityContext::from_clearance` clamps the assurance axis DOWN to what the
+// crypto supports, so a classical key carrying a PqHybrid clearance floors to
+// Classical — the load-bearing #548 invariant: assurance is a property of the
+// verified identity, not a grant.
+impl crate::auth::mac::SubjectContextClaims for Claims {
+    fn clearance_label(&self) -> Option<crate::auth::mac::SecurityLabel> {
+        self.clearance
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -366,15 +432,15 @@ mod tests {
 
     #[test]
     fn test_claims_with_token() {
-        let claims = Claims::new("alice".to_owned(), 1000, 2000)
-            .with_token("eyJ.test.token".to_owned());
+        let claims =
+            Claims::new("alice".to_owned(), 1000, 2000).with_token("eyJ.test.token".to_owned());
         assert_eq!(claims.token, Some("eyJ.test.token".to_owned()));
     }
 
     #[test]
     fn test_claims_token_not_in_json() {
-        let claims = Claims::new("alice".to_owned(), 1000, 2000)
-            .with_token("eyJ.secret.token".to_owned());
+        let claims =
+            Claims::new("alice".to_owned(), 1000, 2000).with_token("eyJ.secret.token".to_owned());
         let json = serde_json::to_string(&claims).unwrap();
         assert!(!json.contains("secret"));
         assert!(!json.contains("token"));
@@ -382,8 +448,8 @@ mod tests {
 
     #[test]
     fn test_claims_debug_redacts_token() {
-        let claims = Claims::new("alice".to_owned(), 1000, 2000)
-            .with_token("eyJ.secret.token".to_owned());
+        let claims =
+            Claims::new("alice".to_owned(), 1000, 2000).with_token("eyJ.secret.token".to_owned());
         let debug = format!("{:?}", claims);
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("secret"));
@@ -422,8 +488,14 @@ mod tests {
             .with_issuer("https://other.example.com".to_owned());
         let no_sub = Claims::new(String::new(), 0, 9999);
 
-        assert_eq!(local.subject(&["https://node.example.com"]), Subject::new("alice"));
-        assert_eq!(federated.subject(&["https://node.example.com"]), Subject::federated("https://other.example.com", "bob"));
+        assert_eq!(
+            local.subject(&["https://node.example.com"]),
+            Subject::new("alice")
+        );
+        assert_eq!(
+            federated.subject(&["https://node.example.com"]),
+            Subject::federated("https://other.example.com", "bob")
+        );
         assert_eq!(no_sub.subject(&[]), Subject::anonymous());
     }
 
@@ -526,9 +598,9 @@ impl<'de> Deserialize<'de> for OneOrMany {
                 let strings: std::result::Result<Vec<String>, _> = arr
                     .into_iter()
                     .map(|v| {
-                        v.as_str()
-                            .map(String::from)
-                            .ok_or_else(|| serde::de::Error::custom("aud array must contain strings"))
+                        v.as_str().map(String::from).ok_or_else(|| {
+                            serde::de::Error::custom("aud array must contain strings")
+                        })
                     })
                     .collect();
                 Ok(Self::from_vec(strings?))
