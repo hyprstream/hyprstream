@@ -405,9 +405,147 @@ impl Mount for DocMount {
 // Per-service dispatch wrappers — thin adapters calling generated dispatch()
 // ============================================================================
 
+// ============================================================================
+// Auto-mount registry (#543, T4) — service → /srv/{name} mount, no manual wiring
+// ============================================================================
+
+/// Resolve an `Arc<dyn RpcClient>` for a service by name. Owns the signing key +
+/// destination-key (trust store) resolution — kept as a boxed closure so
+/// `hyprstream-rpc-std` stays free of the identity/config types.
+#[cfg(not(target_arch = "wasm32"))]
+type ClientDialer = Box<dyn Fn(&str) -> anyhow::Result<Arc<dyn RpcClient>> + Send + Sync>;
+
+/// Context threaded into a [`MountFactory`] to build a service's mount.
+///
+/// A `MountFactory::construct` is a plain `fn` pointer (inventory constraint) and
+/// therefore cannot capture the per-process transport/identity state a
+/// [`GenericServiceMount`] needs — an `Arc<dyn RpcClient>` and the shared
+/// [`StreamRegistry`](crate::stream_mount::StreamRegistry). `MountContext`
+/// carries that state, mirroring how [`ServiceFactory`]'s `fn(&ServiceContext)`
+/// threads spawn-time state. It resolves an `Arc<dyn RpcClient>` per service by
+/// name via the caller-supplied `dial` closure (which owns the signing key +
+/// trust-store lookup), so this crate stays free of identity/config types.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct MountContext {
+    dial: ClientDialer,
+    /// Shared stream registry — all service mounts in one namespace share it so
+    /// `/stream` named pipes are visible across services.
+    stream_registry: Arc<crate::stream_mount::StreamRegistry>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl MountContext {
+    /// Build a context from a per-service client dialer. The `stream_registry`
+    /// is created fresh; use [`with_stream_registry`](Self::with_stream_registry)
+    /// to share one across builders.
+    pub fn new(
+        dial: impl Fn(&str) -> anyhow::Result<Arc<dyn RpcClient>> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            dial: Box::new(dial),
+            stream_registry: Arc::new(crate::stream_mount::StreamRegistry::new()),
+        }
+    }
+
+    /// Use an existing shared [`StreamRegistry`] instead of a fresh one.
+    pub fn with_stream_registry(
+        mut self,
+        stream_registry: Arc<crate::stream_mount::StreamRegistry>,
+    ) -> Self {
+        self.stream_registry = stream_registry;
+        self
+    }
+
+    /// The shared stream registry these mounts publish into.
+    pub fn stream_registry(&self) -> &Arc<crate::stream_mount::StreamRegistry> {
+        &self.stream_registry
+    }
+
+    /// Resolve an `Arc<dyn RpcClient>` for `service`.
+    pub fn dial(&self, service: &str) -> anyhow::Result<Arc<dyn RpcClient>> {
+        (self.dial)(service)
+    }
+}
+
+/// Inventory entry that registers a service's generated mount.
+///
+/// Emitted by [`impl_service_dispatch!`] alongside the per-service dispatch
+/// wrapper (the only site that knows both the service name and the concrete
+/// `ServiceDispatch` type). Mirrors [`ServiceFactory`] for the mount surface:
+/// implement the dispatch, get a `/srv/{name}` mount for free.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct MountFactory {
+    /// Service name; the default mount point is `/srv/{name}` (advisory
+    /// convention — the auto-mount loop's prefix is overridable by the caller's
+    /// later binds, not a contract).
+    pub name: &'static str,
+    /// Construct the service's `Mount` from a [`MountContext`].
+    pub construct: fn(&MountContext) -> anyhow::Result<Arc<dyn Mount>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+inventory::collect!(MountFactory);
+
+/// Mount every inventory-registered service into `ns` at `/srv/{name}`.
+///
+/// This is the auto-wire path (#543): a service that `impl_service_dispatch!`s
+/// gets a `/srv/{name}` mount with no per-service code here. `/srv/{name}` is
+/// advisory convention; a caller may `bind_mount` a different prefix before or
+/// after. A service whose `construct` fails (e.g. its transport can't be
+/// resolved yet) is logged and skipped — one unavailable service does not block
+/// the others.
+///
+/// Mounts land in `ns` directly; because [`Namespace::fork`] clones the mount
+/// table by `Arc`, a namespace forked after this call inherits every auto-mount
+/// (per-sandbox isolation is by *forking* the namespace, FS-D #365 — not by
+/// re-running this loop).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn mount_all_services(
+    ns: &mut hyprstream_vfs::Namespace,
+    ctx: &MountContext,
+) -> usize {
+    let mut mounted = 0;
+    for factory in inventory::iter::<MountFactory> {
+        match (factory.construct)(ctx) {
+            Ok(mount) => {
+                let prefix = format!("/srv/{}", factory.name);
+                if let Err(e) = ns.mount(&prefix, mount) {
+                    tracing::warn!(service = factory.name, %prefix, error = %e, "auto-mount failed");
+                } else {
+                    mounted += 1;
+                }
+            }
+            Err(e) => {
+                tracing::debug!(service = factory.name, error = %e, "service mount unavailable; skipping");
+            }
+        }
+    }
+    mounted
+}
+
 macro_rules! impl_service_dispatch {
-    ($name:ident, $mod:path) => {
+    ($name:ident, $svc_name:literal, $mod:path) => {
         struct $name;
+
+        // Auto-register a `/srv/{svc_name}` mount for this service (#543, T4).
+        // This is the only site with both the service name and the concrete
+        // dispatch type in scope, so the `MountFactory` constructor is emitted
+        // here. `$svc_name` is the same name the service's `schema_metadata()`
+        // reports and matches the `#[service_factory]` registration.
+        #[cfg(not(target_arch = "wasm32"))]
+        inventory::submit! {
+            crate::vfs_mount::MountFactory {
+                name: $svc_name,
+                construct: |ctx: &crate::vfs_mount::MountContext| -> anyhow::Result<std::sync::Arc<dyn Mount>> {
+                    let client = ctx.dial($svc_name)?;
+                    Ok(std::sync::Arc::new(GenericServiceMount::new(
+                        client,
+                        Box::new($name),
+                        std::sync::Arc::clone(ctx.stream_registry()),
+                    )))
+                },
+            }
+        }
 
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -450,11 +588,11 @@ macro_rules! impl_service_dispatch {
     };
 }
 
-impl_service_dispatch!(RegistryDispatch, crate::registry_client);
-impl_service_dispatch!(ModelDispatch, crate::model_client);
-impl_service_dispatch!(PolicyDispatch, crate::policy_client);
-impl_service_dispatch!(McpDispatch, crate::mcp_client);
-impl_service_dispatch!(InferenceDispatch, crate::inference_client);
+impl_service_dispatch!(RegistryDispatch, "registry", crate::registry_client);
+impl_service_dispatch!(ModelDispatch, "model", crate::model_client);
+impl_service_dispatch!(PolicyDispatch, "policy", crate::policy_client);
+impl_service_dispatch!(McpDispatch, "mcp", crate::mcp_client);
+impl_service_dispatch!(InferenceDispatch, "inference", crate::inference_client);
 
 // ============================================================================
 // Builder — construct a Namespace with all service mounts
@@ -599,3 +737,115 @@ const _: () = {
     }
     let _ = assertions;
 };
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod automount_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    use super::*;
+    use hyprstream_rpc::rpc_client::{CallOptions, RpcClient};
+    use hyprstream_rpc::stream_consumer::StreamHandle;
+
+    /// A stand-in `RpcClient` for the auto-mount wiring test. The end-to-end
+    /// path exercised (`mount_all_services` → `walk` → `readdir` at the mount
+    /// root) reads method names from the service's compiled `schema_metadata()`
+    /// and never dials the client, so these methods only need to type-check.
+    struct NoopClient;
+
+    #[async_trait]
+    impl RpcClient for NoopClient {
+        async fn call(&self, _payload: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("NoopClient: no transport")
+        }
+        async fn call_with_options(
+            &self,
+            _payload: Vec<u8>,
+            _options: CallOptions,
+        ) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("NoopClient: no transport")
+        }
+        async fn call_streaming(
+            &self,
+            _payload: Vec<u8>,
+            _ephemeral_pubkey: [u8; 32],
+        ) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("NoopClient: no transport")
+        }
+        async fn open_stream(&self, _payload: Vec<u8>) -> anyhow::Result<Box<dyn StreamHandle>> {
+            anyhow::bail!("NoopClient: no transport")
+        }
+        async fn open_stream_from_info(
+            &self,
+            _stream_info: hyprstream_rpc::stream_info::StreamInfo,
+            _client_secret: [u8; 32],
+            _client_pubkey: [u8; 32],
+        ) -> anyhow::Result<Box<dyn StreamHandle>> {
+            anyhow::bail!("NoopClient: no transport")
+        }
+        fn next_id(&self) -> u64 {
+            0
+        }
+    }
+
+    /// Every service that `impl_service_dispatch!`s registers a `MountFactory`,
+    /// so `mount_all_services` yields a `/srv/{name}` mount with no per-service
+    /// wiring here. Then `walk`/`readdir` works end-to-end through the
+    /// auto-registered mount (listing the service's methods from schema
+    /// metadata — the proof the generated mount is actually reachable).
+    #[tokio::test]
+    async fn auto_mount_registers_and_serves_srv_paths() {
+        // At least the five `impl_service_dispatch!` services must be present.
+        let registered: Vec<&str> = inventory::iter::<MountFactory>
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        for expected in ["registry", "model", "policy", "mcp", "inference"] {
+            assert!(
+                registered.contains(&expected),
+                "service {expected} must self-register a MountFactory; got {registered:?}"
+            );
+        }
+
+        let ctx = MountContext::new(|_service| Ok(Arc::new(NoopClient) as Arc<dyn RpcClient>));
+        let mut ns = hyprstream_vfs::Namespace::new();
+        let mounted = mount_all_services(&mut ns, &ctx);
+        assert_eq!(
+            mounted,
+            registered.len(),
+            "every registered service must mount with the NoopClient dialer"
+        );
+
+        // The auto-mount landed at /srv/{name}.
+        let prefixes = ns.mount_prefixes();
+        assert!(prefixes.contains(&"/srv/registry"), "prefixes: {prefixes:?}");
+        assert!(prefixes.contains(&"/srv/model"), "prefixes: {prefixes:?}");
+
+        // End-to-end through the auto-registered mount: walk the mount root and
+        // readdir it — the entries are the service's methods, served by the
+        // generated GenericServiceMount with no per-service code.
+        let subject = Subject::anonymous();
+        let entries = ns
+            .ls("/srv/registry", &subject)
+            .await
+            .expect("readdir /srv/registry through the auto-mounted service");
+        assert!(
+            !entries.is_empty(),
+            "auto-mounted /srv/registry must expose the registry's methods"
+        );
+    }
+
+    /// A namespace forked after auto-mount inherits every mount (the FS-D #365
+    /// per-sandbox isolation model: fork the namespace, don't re-run the loop).
+    #[tokio::test]
+    async fn forked_namespace_inherits_auto_mounts() {
+        let ctx = MountContext::new(|_service| Ok(Arc::new(NoopClient) as Arc<dyn RpcClient>));
+        let mut ns = hyprstream_vfs::Namespace::new();
+        mount_all_services(&mut ns, &ctx);
+
+        let child = ns.fork();
+        assert!(
+            child.mount_prefixes().contains(&"/srv/registry"),
+            "forked namespace must inherit /srv/registry; got {:?}",
+            child.mount_prefixes()
+        );
+    }
+}
