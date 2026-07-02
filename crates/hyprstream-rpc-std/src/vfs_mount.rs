@@ -11,9 +11,10 @@
 //!                        optional — mounted only when running under Wanix,
 //!                        see [`mount_wanix`]). #409/#391.
 
-#![cfg(target_arch = "wasm32")]
-
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use async_trait::async_trait;
 use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
@@ -41,38 +42,48 @@ fn slice_read(data: Vec<u8>, offset: u64, count: u32) -> Vec<u8> {
     data[start..end].to_vec()
 }
 
+/// Generate an ephemeral ECDH keypair as 64 bytes: `[secret_scalar(32) | pubkey(32)]`.
+///
+/// Same layout the streaming handshake expects (secret first, pubkey at `[32..64]`),
+/// built directly from `DefaultKeyExchange` so it works on native and wasm alike.
+fn ephemeral_keypair_64() -> Result<Vec<u8>, String> {
+    use hyprstream_rpc::crypto::key_exchange::DefaultKeyExchange;
+    use hyprstream_rpc::crypto::KeyExchange;
+
+    let (secret, public) = DefaultKeyExchange::generate_keypair();
+    let mut out = Vec::with_capacity(64);
+    out.extend_from_slice(secret.scalar().as_bytes());
+    out.extend_from_slice(&DefaultKeyExchange::pubkey_to_bytes(&public));
+    if out.len() != 64 {
+        return Err(format!("ephemeral keypair wrong length: {}", out.len()));
+    }
+    Ok(out)
+}
+
 // ============================================================================
 // CtlResponseCache — stores write→read response for ctl pattern
 // ============================================================================
 
-struct CtlResponseCache(std::cell::RefCell<Option<Vec<u8>>>);
-
-// SAFETY: wasm32 is single-threaded.
-unsafe impl Send for CtlResponseCache {}
-unsafe impl Sync for CtlResponseCache {}
+struct CtlResponseCache(Mutex<Option<Vec<u8>>>);
 
 impl CtlResponseCache {
     fn new() -> Self {
-        Self(std::cell::RefCell::new(None))
+        Self(Mutex::new(None))
     }
     fn take(&self) -> Option<Vec<u8>> {
-        self.0.borrow_mut().take()
+        self.0.lock().take()
     }
     fn set(&self, data: Vec<u8>) {
-        *self.0.borrow_mut() = Some(data);
+        *self.0.lock() = Some(data);
     }
 }
 
-/// Atomic-like counter for request IDs, Send+Sync on wasm32.
-struct IdCounter(std::cell::Cell<u64>);
-unsafe impl Send for IdCounter {}
-unsafe impl Sync for IdCounter {}
+/// Monotonic counter for request IDs.
+struct IdCounter(AtomicU64);
 impl IdCounter {
-    fn new() -> Self { Self(std::cell::Cell::new(1)) }
+    fn new() -> Self { Self(AtomicU64::new(1)) }
     fn next(&self) -> u64 {
-        let id = self.0.get();
-        self.0.set(id + 1);
-        id
+        self.0.fetch_add(1, Ordering::Relaxed)
     }
 }
 
@@ -95,8 +106,9 @@ pub enum ServiceDispatchResult {
 }
 
 /// Trait for service-specific dispatch. Implemented via macro from generated code.
-#[async_trait(?Send)]
-trait ServiceDispatch: Send + Sync {
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait ServiceDispatch: Send + Sync {
     async fn dispatch(&self, method: &str, args_json: &str, client: &dyn RpcClient) -> Result<ServiceDispatchResult, String>;
     fn metadata(&self) -> (&'static str, &'static [hyprstream_rpc::metadata::MethodMeta]);
 }
@@ -130,7 +142,8 @@ impl GenericServiceMount {
     }
 }
 
-#[async_trait(?Send)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl Mount for GenericServiceMount {
     async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
         Ok(Fid::new(VfsFidState {
@@ -164,7 +177,7 @@ impl Mount for GenericServiceMount {
         // cat /srv/{service}/{method} → dispatch query method with empty args
         let method = &state.path[0];
         match self.service.dispatch(method, "{}", self.client.as_ref()).await
-            .map_err(|e| MountError::Io(e))? {
+            .map_err(MountError::Io)? {
             ServiceDispatchResult::Response(json) => {
                 Ok(slice_read(json.into_bytes(), offset, count))
             }
@@ -215,7 +228,7 @@ impl Mount for GenericServiceMount {
         let args_str = args_owned.as_str();
 
         let dispatch_result = self.service.dispatch(cmd, args_str, self.client.as_ref()).await
-            .map_err(|e| MountError::Io(e))?;
+            .map_err(MountError::Io)?;
 
         let resp = match dispatch_result {
             ServiceDispatchResult::Response(json) => json.into_bytes(),
@@ -317,7 +330,8 @@ impl DocMount {
     }
 }
 
-#[async_trait(?Send)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl Mount for DocMount {
     async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
         Ok(Fid::new(VfsFidState {
@@ -391,19 +405,158 @@ impl Mount for DocMount {
 // Per-service dispatch wrappers — thin adapters calling generated dispatch()
 // ============================================================================
 
+// ============================================================================
+// Auto-mount registry (#543, T4) — service → /srv/{name} mount, no manual wiring
+// ============================================================================
+
+/// Resolve an `Arc<dyn RpcClient>` for a service by name. Owns the signing key +
+/// destination-key (trust store) resolution — kept as a boxed closure so
+/// `hyprstream-rpc-std` stays free of the identity/config types.
+#[cfg(not(target_arch = "wasm32"))]
+type ClientDialer = Box<dyn Fn(&str) -> anyhow::Result<Arc<dyn RpcClient>> + Send + Sync>;
+
+/// Context threaded into a [`MountFactory`] to build a service's mount.
+///
+/// A `MountFactory::construct` is a plain `fn` pointer (inventory constraint) and
+/// therefore cannot capture the per-process transport/identity state a
+/// [`GenericServiceMount`] needs — an `Arc<dyn RpcClient>` and the shared
+/// [`StreamRegistry`](crate::stream_mount::StreamRegistry). `MountContext`
+/// carries that state, mirroring how [`ServiceFactory`]'s `fn(&ServiceContext)`
+/// threads spawn-time state. It resolves an `Arc<dyn RpcClient>` per service by
+/// name via the caller-supplied `dial` closure (which owns the signing key +
+/// trust-store lookup), so this crate stays free of identity/config types.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct MountContext {
+    dial: ClientDialer,
+    /// Shared stream registry — all service mounts in one namespace share it so
+    /// `/stream` named pipes are visible across services.
+    stream_registry: Arc<crate::stream_mount::StreamRegistry>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl MountContext {
+    /// Build a context from a per-service client dialer. The `stream_registry`
+    /// is created fresh; use [`with_stream_registry`](Self::with_stream_registry)
+    /// to share one across builders.
+    pub fn new(
+        dial: impl Fn(&str) -> anyhow::Result<Arc<dyn RpcClient>> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            dial: Box::new(dial),
+            stream_registry: Arc::new(crate::stream_mount::StreamRegistry::new()),
+        }
+    }
+
+    /// Use an existing shared [`StreamRegistry`] instead of a fresh one.
+    pub fn with_stream_registry(
+        mut self,
+        stream_registry: Arc<crate::stream_mount::StreamRegistry>,
+    ) -> Self {
+        self.stream_registry = stream_registry;
+        self
+    }
+
+    /// The shared stream registry these mounts publish into.
+    pub fn stream_registry(&self) -> &Arc<crate::stream_mount::StreamRegistry> {
+        &self.stream_registry
+    }
+
+    /// Resolve an `Arc<dyn RpcClient>` for `service`.
+    pub fn dial(&self, service: &str) -> anyhow::Result<Arc<dyn RpcClient>> {
+        (self.dial)(service)
+    }
+}
+
+/// Inventory entry that registers a service's generated mount.
+///
+/// Emitted by [`impl_service_dispatch!`] alongside the per-service dispatch
+/// wrapper (the only site that knows both the service name and the concrete
+/// `ServiceDispatch` type). Mirrors [`ServiceFactory`] for the mount surface:
+/// implement the dispatch, get a `/srv/{name}` mount for free.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct MountFactory {
+    /// Service name; the default mount point is `/srv/{name}` (advisory
+    /// convention — the auto-mount loop's prefix is overridable by the caller's
+    /// later binds, not a contract).
+    pub name: &'static str,
+    /// Construct the service's `Mount` from a [`MountContext`].
+    pub construct: fn(&MountContext) -> anyhow::Result<Arc<dyn Mount>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+inventory::collect!(MountFactory);
+
+/// Mount every inventory-registered service into `ns` at `/srv/{name}`.
+///
+/// This is the auto-wire path (#543): a service that `impl_service_dispatch!`s
+/// gets a `/srv/{name}` mount with no per-service code here. `/srv/{name}` is
+/// advisory convention; a caller may `bind_mount` a different prefix before or
+/// after. A service whose `construct` fails (e.g. its transport can't be
+/// resolved yet) is logged and skipped — one unavailable service does not block
+/// the others.
+///
+/// Mounts land in `ns` directly; because [`Namespace::fork`] clones the mount
+/// table by `Arc`, a namespace forked after this call inherits every auto-mount
+/// (per-sandbox isolation is by *forking* the namespace, FS-D #365 — not by
+/// re-running this loop).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn mount_all_services(
+    ns: &mut hyprstream_vfs::Namespace,
+    ctx: &MountContext,
+) -> usize {
+    let mut mounted = 0;
+    for factory in inventory::iter::<MountFactory> {
+        match (factory.construct)(ctx) {
+            Ok(mount) => {
+                let prefix = format!("/srv/{}", factory.name);
+                if let Err(e) = ns.mount(&prefix, mount) {
+                    tracing::warn!(service = factory.name, %prefix, error = %e, "auto-mount failed");
+                } else {
+                    mounted += 1;
+                }
+            }
+            Err(e) => {
+                tracing::debug!(service = factory.name, error = %e, "service mount unavailable; skipping");
+            }
+        }
+    }
+    mounted
+}
+
 macro_rules! impl_service_dispatch {
-    ($name:ident, $mod:path) => {
+    ($name:ident, $svc_name:literal, $mod:path) => {
         struct $name;
 
-        #[async_trait(?Send)]
+        // Auto-register a `/srv/{svc_name}` mount for this service (#543, T4).
+        // This is the only site with both the service name and the concrete
+        // dispatch type in scope, so the `MountFactory` constructor is emitted
+        // here. `$svc_name` is the same name the service's `schema_metadata()`
+        // reports and matches the `#[service_factory]` registration.
+        #[cfg(not(target_arch = "wasm32"))]
+        inventory::submit! {
+            crate::vfs_mount::MountFactory {
+                name: $svc_name,
+                construct: |ctx: &crate::vfs_mount::MountContext| -> anyhow::Result<std::sync::Arc<dyn Mount>> {
+                    let client = ctx.dial($svc_name)?;
+                    Ok(std::sync::Arc::new(GenericServiceMount::new(
+                        client,
+                        Box::new($name),
+                        std::sync::Arc::clone(ctx.stream_registry()),
+                    )))
+                },
+            }
+        }
+
+        #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl ServiceDispatch for $name {
             async fn dispatch(&self, method: &str, args_json: &str, client: &dyn RpcClient) -> Result<ServiceDispatchResult, String> {
                 use $mod as svc;
 
                 // Generate ephemeral keypair upfront — used by streaming methods,
                 // ignored by non-streaming (the send closure decides which transport to use).
-                let keypair = hyprstream_rpc::wasm_api::generate_ephemeral_keypair()
-                    .map_err(|e| format!("keypair: {e:?}"))?;
+                let keypair = crate::vfs_mount::ephemeral_keypair_64()
+                    .map_err(|e| format!("keypair: {e}"))?;
                 let ephemeral_pubkey = keypair[32..64].to_vec();
 
                 let result = svc::dispatch(method, args_json, 0, |payload: Vec<u8>| async move {
@@ -435,11 +588,11 @@ macro_rules! impl_service_dispatch {
     };
 }
 
-impl_service_dispatch!(RegistryDispatch, crate::registry_client);
-impl_service_dispatch!(ModelDispatch, crate::model_client);
-impl_service_dispatch!(PolicyDispatch, crate::policy_client);
-impl_service_dispatch!(McpDispatch, crate::mcp_client);
-impl_service_dispatch!(InferenceDispatch, crate::inference_client);
+impl_service_dispatch!(RegistryDispatch, "registry", crate::registry_client);
+impl_service_dispatch!(ModelDispatch, "model", crate::model_client);
+impl_service_dispatch!(PolicyDispatch, "policy", crate::policy_client);
+impl_service_dispatch!(McpDispatch, "mcp", crate::mcp_client);
+impl_service_dispatch!(InferenceDispatch, "inference", crate::inference_client);
 
 // ============================================================================
 // Builder — construct a Namespace with all service mounts
@@ -461,6 +614,12 @@ impl_service_dispatch!(InferenceDispatch, crate::inference_client);
 /// in the native namespace the same path exposes the worktree filesystem
 /// (`RemoteRegistryMount`, real qids). The convergence is at the path +
 /// backing-service level; the access style differs by transport capability.
+///
+/// Browser-only: it wires the wasm transport clients into the browser namespace.
+/// The `GenericServiceMount`/`DocMount`/`StreamMount` building blocks it uses are
+/// target-agnostic; native callers compose them through the standard namespace
+/// builder + `#[service_factory]` auto-mount (#543) instead.
+#[cfg(target_arch = "wasm32")]
 pub fn build_browser_namespace(
     registry_client: Arc<dyn RpcClient>,
     model_client: Arc<dyn RpcClient>,
@@ -541,6 +700,10 @@ pub fn build_browser_namespace(
 /// sites: `mount_wanix(ns, &sab, uname, aname).await?` →
 /// `let client = P9Client::connect(DmaTransport::new(&sab, true), uname, aname).await?;
 /// mount_wanix(ns, client)?;`.
+///
+/// Wasm-only: `WanixMount`/`P9Client`/`DmaTransport` are SharedArrayBuffer-DMA
+/// types compiled only for the browser target.
+#[cfg(target_arch = "wasm32")]
 pub fn mount_wanix<T>(
     ns: &mut hyprstream_vfs::Namespace,
     client: hyprstream_9p::client::P9Client<T>,
@@ -552,4 +715,137 @@ where
         "/wanix",
         Arc::new(hyprstream_9p::wanix_mount::WanixMount::new(client)),
     )
+}
+
+// ============================================================================
+// Compile-time Send + Sync guarantees (#539 T3)
+// ============================================================================
+
+/// The generic service→9p mounts must be `Send + Sync` to serve behind the
+/// native (multi-threaded) `Mount` trait. These are compiler-enforced, not
+/// assumed — the whole point of the native port.
+#[cfg(not(target_arch = "wasm32"))]
+const _: () = {
+    fn assert_send_sync<T: Send + Sync>() {}
+    fn assertions() {
+        assert_send_sync::<GenericServiceMount>();
+        assert_send_sync::<DocMount>();
+        // The registry is the shared state behind the native mount; it must be
+        // Send + Sync even though a `StreamEntry`'s `Box<dyn StreamHandle>` is
+        // only `Send` (guarded by the registry's `Mutex`).
+        assert_send_sync::<crate::stream_mount::StreamRegistry>();
+    }
+    let _ = assertions;
+};
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod automount_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    use super::*;
+    use hyprstream_rpc::rpc_client::{CallOptions, RpcClient};
+    use hyprstream_rpc::stream_consumer::StreamHandle;
+
+    /// A stand-in `RpcClient` for the auto-mount wiring test. The end-to-end
+    /// path exercised (`mount_all_services` → `walk` → `readdir` at the mount
+    /// root) reads method names from the service's compiled `schema_metadata()`
+    /// and never dials the client, so these methods only need to type-check.
+    struct NoopClient;
+
+    #[async_trait]
+    impl RpcClient for NoopClient {
+        async fn call(&self, _payload: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("NoopClient: no transport")
+        }
+        async fn call_with_options(
+            &self,
+            _payload: Vec<u8>,
+            _options: CallOptions,
+        ) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("NoopClient: no transport")
+        }
+        async fn call_streaming(
+            &self,
+            _payload: Vec<u8>,
+            _ephemeral_pubkey: [u8; 32],
+        ) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("NoopClient: no transport")
+        }
+        async fn open_stream(&self, _payload: Vec<u8>) -> anyhow::Result<Box<dyn StreamHandle>> {
+            anyhow::bail!("NoopClient: no transport")
+        }
+        async fn open_stream_from_info(
+            &self,
+            _stream_info: hyprstream_rpc::stream_info::StreamInfo,
+            _client_secret: [u8; 32],
+            _client_pubkey: [u8; 32],
+        ) -> anyhow::Result<Box<dyn StreamHandle>> {
+            anyhow::bail!("NoopClient: no transport")
+        }
+        fn next_id(&self) -> u64 {
+            0
+        }
+    }
+
+    /// Every service that `impl_service_dispatch!`s registers a `MountFactory`,
+    /// so `mount_all_services` yields a `/srv/{name}` mount with no per-service
+    /// wiring here. Then `walk`/`readdir` works end-to-end through the
+    /// auto-registered mount (listing the service's methods from schema
+    /// metadata — the proof the generated mount is actually reachable).
+    #[tokio::test]
+    async fn auto_mount_registers_and_serves_srv_paths() {
+        // At least the five `impl_service_dispatch!` services must be present.
+        let registered: Vec<&str> = inventory::iter::<MountFactory>
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        for expected in ["registry", "model", "policy", "mcp", "inference"] {
+            assert!(
+                registered.contains(&expected),
+                "service {expected} must self-register a MountFactory; got {registered:?}"
+            );
+        }
+
+        let ctx = MountContext::new(|_service| Ok(Arc::new(NoopClient) as Arc<dyn RpcClient>));
+        let mut ns = hyprstream_vfs::Namespace::new();
+        let mounted = mount_all_services(&mut ns, &ctx);
+        assert_eq!(
+            mounted,
+            registered.len(),
+            "every registered service must mount with the NoopClient dialer"
+        );
+
+        // The auto-mount landed at /srv/{name}.
+        let prefixes = ns.mount_prefixes();
+        assert!(prefixes.contains(&"/srv/registry"), "prefixes: {prefixes:?}");
+        assert!(prefixes.contains(&"/srv/model"), "prefixes: {prefixes:?}");
+
+        // End-to-end through the auto-registered mount: walk the mount root and
+        // readdir it — the entries are the service's methods, served by the
+        // generated GenericServiceMount with no per-service code.
+        let subject = Subject::anonymous();
+        let entries = ns
+            .ls("/srv/registry", &subject)
+            .await
+            .expect("readdir /srv/registry through the auto-mounted service");
+        assert!(
+            !entries.is_empty(),
+            "auto-mounted /srv/registry must expose the registry's methods"
+        );
+    }
+
+    /// A namespace forked after auto-mount inherits every mount (the FS-D #365
+    /// per-sandbox isolation model: fork the namespace, don't re-run the loop).
+    #[tokio::test]
+    async fn forked_namespace_inherits_auto_mounts() {
+        let ctx = MountContext::new(|_service| Ok(Arc::new(NoopClient) as Arc<dyn RpcClient>));
+        let mut ns = hyprstream_vfs::Namespace::new();
+        mount_all_services(&mut ns, &ctx);
+
+        let child = ns.fork();
+        assert!(
+            child.mount_prefixes().contains(&"/srv/registry"),
+            "forked namespace must inherit /srv/registry; got {:?}",
+            child.mount_prefixes()
+        );
+    }
 }

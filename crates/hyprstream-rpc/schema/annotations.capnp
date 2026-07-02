@@ -110,3 +110,33 @@ annotation domainType(field, struct) :Text;
 # Serde field rename — generates #[serde(rename = "...")] on the Rust field.
 # Usage: toolType @1 :Text $serdeRename("type");
 annotation serdeRename(field) :Text;
+
+# ── VFS / 9p projection (epic #539) ───────────────────────────────────────
+# The generated 9p/VFS file surface projected from each service's method
+# structure. Captured at build time (T1, #540); consumed by the mount
+# generator (T2, #541). These are metadata only — declaring them does not
+# emit a mount by itself.
+
+# Node kind a method projects to in the generated mount.
+enum VfsNodeKind {
+  file   @0;   # readable (maybe writable) leaf
+  dir    @1;   # directory (readdir)
+  ctl    @2;   # write-a-verb control file
+  stream @3;   # /stream-style pipe (data/info/ctl)
+  query  @4;   # synthetic clone/query file
+}
+
+# Mount-relative path a method binds to (fid-0 rooted, NEVER absolute).
+# `{braces}` mark param segments that bind method args.
+# Usage: getByName @3 :Text $vfsPath("{name}");
+annotation vfsPath(field, struct) :Text;
+
+# Override the inferred VFS node kind for a method.
+# Usage: clone @4 :CloneRequest $vfsKind(ctl);
+annotation vfsKind(field) :VfsNodeKind;
+
+# Read path returns raw mmap bytes, bypassing capnp (DMA hot path).
+annotation vfsBulk(field) :Void;
+
+# Exclude a method from the generated mount.
+annotation vfsHidden(field) :Void;

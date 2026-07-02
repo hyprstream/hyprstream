@@ -40,6 +40,58 @@ pub struct MethodMeta {
     pub doc_example: &'static str,
 }
 
+/// The 9P/VFS node kind a generated method projects to (epic #539).
+///
+/// Mirrors the `VfsNodeKind` capnp enum. `File`/`Dir`/`Query` are read-only
+/// (side-effect-free 9P reads); `Ctl` is a write-a-verb control file; `Stream`
+/// is a `/stream`-style pipe.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum VfsNodeKind {
+    /// Readable (maybe writable) leaf; `read` renders the method's response.
+    File,
+    /// Directory; `readdir` lists child entries (e.g. a `list` method).
+    Dir,
+    /// Write-a-verb control file; a `write` invokes the method.
+    Ctl,
+    /// `/stream`-style pipe (data/info/ctl) for a streaming method.
+    Stream,
+    /// Synthetic query file: write a spec, read the result.
+    Query,
+}
+
+impl VfsNodeKind {
+    /// Whether a `read` of this node must be side-effect-free (9P read invariant).
+    /// `File`/`Dir`/`Query` are read surfaces; `Ctl`/`Stream` mutate/produce.
+    pub fn is_read_only(self) -> bool {
+        matches!(self, Self::File | Self::Dir | Self::Query)
+    }
+}
+
+/// A single node in a service's generated 9P/VFS projection (epic #539, T2).
+///
+/// Built by codegen from each method's `MethodMeta` + `$vfs*` annotations. The
+/// runtime mount engine (T3) consumes these to serve `/srv/{service}` — `path`
+/// is mount-relative (fid-0 rooted, never absolute); `{braces}` in `path` are
+/// segments that bind the method's scalar argument.
+#[derive(Copy, Clone, Debug)]
+pub struct VfsNode {
+    /// The method this node projects (snake_case), used to dispatch on access.
+    pub method: &'static str,
+    /// Mount-relative path; `{name}` segments bind a scalar arg from the walk.
+    pub path: &'static str,
+    /// The projected node kind (inferred from scope+shape, or `$vfsKind`).
+    pub kind: VfsNodeKind,
+    /// Authorization scope action (from `MethodMeta::scope`).
+    pub scope: &'static str,
+    /// `$vfsBulk`: `read` returns raw mmap bytes, bypassing capnp (DMA path).
+    pub bulk: bool,
+}
+
+/// Function type for a service's VFS node table.
+///
+/// Returns `(service_name, nodes)`.
+pub type VfsNodesFn = fn() -> (&'static str, &'static [VfsNode]);
+
 /// Function type for service schema metadata.
 ///
 /// Returns `(service_name, methods)`.
