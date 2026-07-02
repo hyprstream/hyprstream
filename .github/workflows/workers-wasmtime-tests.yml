@@ -1,5 +1,8 @@
 name: workers-wasmtime tests
 
+permissions:
+  contents: read
+
 # Build BOTH wasm guests, then run the hyprstream-workers-wasmtime security/DoS tests
 # (and the hyprstream-workers-python shell/mount tests) against them. The tests SKIP
 # locally when an artifact is absent, but FAIL under CI (the `CI` env var is always
