@@ -29,6 +29,11 @@ pub mod kata_backend;
 pub mod nspawn;
 mod pool;
 mod sandbox;
+// In-process WebAssembly sandbox backend (#505 P2) — gated behind `wasm`
+// (pulls the wasmtime-bearing `hyprstream-workers-wasmtime` substrate). A native in-process
+// sibling under the SandboxBackend seam; the default build stays lean + torch-free.
+#[cfg(feature = "wasm")]
+pub mod wasm_backend;
 // Per-sandbox VFS composition + serve (FS-D, #365): native-only + VM-only
 // (composes a RAFS rootfs and serves it over vhost-user-fs to a CH guest).
 #[cfg(all(not(target_arch = "wasm32"), feature = "kata-vm"))]
@@ -83,6 +88,8 @@ pub use backend::{SandboxBackend, SandboxHandle};
 #[cfg(feature = "kata-vm")]
 pub use kata_backend::{KataBackend, KataHandle};
 pub use nspawn::{NspawnBackend, NspawnConfig, NspawnHandle};
+#[cfg(feature = "wasm")]
+pub use wasm_backend::{WasmBackend, WasmConfig, WasmHandle};
 // Inventory-based backend registry + fail-closed selection spine (#507)
 pub use selection::{resolve_backend, BackendCtx, BackendRegistration};
 // Domain entities (business logic only)

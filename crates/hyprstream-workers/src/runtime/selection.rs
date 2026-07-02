@@ -19,13 +19,18 @@
 //! Selection is **config-driven** via `worker.backend` (a string: a registered
 //! backend name, or `"auto"`):
 //!
-//! * `"auto"` → pick the highest-[`priority`](BackendRegistration::priority)
-//!   registration whose [`is_available`](BackendRegistration::is_available)
-//!   probe passes. The choice is logged. If nothing is available, error — never
-//!   run a workload without isolation.
+//! * `"auto"` → among registrations that are
+//!   [`auto_selectable`](BackendRegistration::auto_selectable), pick the
+//!   highest-[`priority`](BackendRegistration::priority) one whose
+//!   [`is_available`](BackendRegistration::is_available) probe passes. The choice
+//!   is logged. If none qualifies, error — never run a workload without isolation,
+//!   and never auto-pick a backend that opted out of auto-selection (a silent
+//!   isolation downgrade; see the in-process `wasm` tier, #547 ZSP).
 //! * a concrete name → that registration, **iff** it is registered *and* its
 //!   prerequisites are present. Otherwise error. We never substitute a different
-//!   (weaker) backend (the #486 fail-open bug).
+//!   (weaker) backend (the #486 fail-open bug). An explicit name resolves
+//!   regardless of `auto_selectable`, so an auto-excluded backend (e.g. `wasm`)
+//!   is still reachable when deliberately requested by name.
 //!
 //! The cardinal rule is **fail-closed**: an unavailable or unknown backend
 //! returns an error, never a silent downgrade to weaker isolation.
@@ -73,8 +78,21 @@ pub struct BackendRegistration {
     pub name: &'static str,
 
     /// Auto-selection precedence: higher is preferred. `"auto"` picks the
-    /// highest-priority *available* registration.
+    /// highest-priority *available* registration (among `auto_selectable` ones).
     pub priority: i32,
+
+    /// Whether this backend is eligible for `"auto"` selection.
+    ///
+    /// `true` → `"auto"` may pick it (subject to `priority` and `is_available`).
+    /// `false` → **explicit-name-only**: `"auto"` must never choose it, even if it
+    /// is the highest-priority available (or only) registration. It remains
+    /// selectable by its concrete name (fail-closed).
+    ///
+    /// This exists so weaker-isolation tiers cannot become a silent `"auto"`
+    /// fallback when stronger backends are absent — auto-selecting them would be a
+    /// silent isolation downgrade, which the #547 MAC/ZSP model forbids. The
+    /// in-process `wasm` sandbox (shared host address space) sets this `false`.
+    pub auto_selectable: bool,
 
     /// Runtime prerequisite probe (PATH lookups, socket existence, …). Returns
     /// `true` when this backend can actually run on this host *right now*. Used
@@ -105,8 +123,14 @@ fn select_registration<'a>(
     is_available: impl Fn(&BackendRegistration) -> bool,
 ) -> Result<&'a BackendRegistration> {
     // ── Auto: highest-priority *available* registration wins ──
+    //
+    // Only `auto_selectable` registrations are eligible. A backend that opts out
+    // (e.g. the in-process `wasm` tier) must never be auto-picked, even as a last
+    // resort when nothing stronger is available — that would be a silent isolation
+    // downgrade (#547 ZSP). Such backends remain reachable by explicit name below.
     if name.eq_ignore_ascii_case("auto") {
-        let mut candidates: Vec<&'a BackendRegistration> = regs.to_vec();
+        let mut candidates: Vec<&'a BackendRegistration> =
+            regs.iter().copied().filter(|r| r.auto_selectable).collect();
         // Highest priority first; ties broken by name for determinism.
         candidates.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.name.cmp(b.name)));
         for reg in candidates {
@@ -155,11 +179,13 @@ fn select_registration<'a>(
 /// function both `factories.rs` and `bin/main.rs` route through — no scattered
 /// `#[cfg]`, no `_ => nspawn` fallback.
 ///
-/// * **`"auto"`** → highest-[`priority`](BackendRegistration::priority)
-///   registration whose [`is_available`](BackendRegistration::is_available) is
-///   true; error if none.
-/// * **concrete name** → that registration if present *and* available; otherwise
-///   error (unavailable → fail-closed; unknown → error listing the registry).
+/// * **`"auto"`** → among [`auto_selectable`](BackendRegistration::auto_selectable)
+///   registrations, the highest-[`priority`](BackendRegistration::priority) one
+///   whose [`is_available`](BackendRegistration::is_available) is true; error if
+///   none (auto-excluded backends are never picked here — no silent downgrade).
+/// * **concrete name** → that registration if present *and* available, regardless
+///   of `auto_selectable`; otherwise error (unavailable → fail-closed; unknown →
+///   error listing the registry).
 pub fn resolve_backend(name: &str, ctx: &BackendCtx) -> Result<Arc<dyn SandboxBackend>> {
     let regs: Vec<&'static BackendRegistration> =
         inventory::iter::<BackendRegistration>().collect();
@@ -182,6 +208,7 @@ pub fn resolve_backend(name: &str, ctx: &BackendCtx) -> Result<Arc<dyn SandboxBa
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -198,12 +225,25 @@ mod tests {
     const HIGH: BackendRegistration = BackendRegistration {
         name: "high-tier",
         priority: 100,
+        auto_selectable: true,
         is_available: || true,
         construct: never_available,
     };
     const LOW: BackendRegistration = BackendRegistration {
         name: "low-tier",
         priority: 10,
+        auto_selectable: true,
+        is_available: || true,
+        construct: never_available,
+    };
+
+    /// An auto-excluded (explicit-name-only) backend, modeling the in-process
+    /// `wasm` tier: even at the highest priority and always available, `"auto"`
+    /// must never pick it.
+    const EXPLICIT_ONLY: BackendRegistration = BackendRegistration {
+        name: "explicit-only",
+        priority: 1000,
+        auto_selectable: false,
         is_available: || true,
         construct: never_available,
     };
@@ -233,6 +273,36 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("no available sandbox backend"), "got: {msg}");
         assert!(msg.contains("fail-closed"), "got: {msg}");
+    }
+
+    #[test]
+    fn auto_never_picks_explicit_only_even_as_only_backend() {
+        // An auto-excluded backend that is the *only* registration (and available)
+        // must NOT be auto-selected — `"auto"` errors instead of downgrading.
+        let only_explicit = vec![&EXPLICIT_ONLY];
+        let err = select_registration("auto", &only_explicit, |_| true).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no available sandbox backend"), "got: {msg}");
+        assert!(msg.contains("fail-closed"), "got: {msg}");
+    }
+
+    #[test]
+    fn auto_skips_explicit_only_for_a_weaker_auto_eligible_backend() {
+        // Even though EXPLICIT_ONLY has the highest priority and is available,
+        // `"auto"` must prefer a lower-priority *auto-eligible* backend over it —
+        // never an isolation downgrade to the auto-excluded tier.
+        let regs = vec![&EXPLICIT_ONLY, &LOW];
+        let r = select_registration("auto", &regs, |_| true).unwrap();
+        assert_eq!(r.name, "low-tier", "auto must skip the auto-excluded backend");
+    }
+
+    #[test]
+    fn explicit_only_still_selectable_by_name() {
+        // Auto-exclusion does not remove the backend from the registry: an
+        // explicit request resolves it (fail-closed when unavailable).
+        let regs = vec![&EXPLICIT_ONLY, &LOW];
+        let r = select_registration("explicit-only", &regs, |_| true).unwrap();
+        assert_eq!(r.name, "explicit-only");
     }
 
     #[test]
@@ -296,13 +366,85 @@ mod tests {
 
     #[test]
     fn no_speculative_backends_registered() {
-        // YAGNI: Oci/Cri/Wasm must not be in the registry until built.
-        for name in ["oci", "cri", "wasm"] {
+        // YAGNI: still-speculative tiers (Oci/Cri) must not be in the registry
+        // until built. `wasm` is now a real backend (#505 P2) and is handled
+        // separately below — it registers iff the `wasm` feature is on.
+        for name in ["oci", "cri"] {
             assert!(
                 !inventory::iter::<BackendRegistration>().any(|r| r.name == name),
                 "speculative backend '{name}' must not be registered (YAGNI)"
             );
         }
+    }
+
+    #[test]
+    fn registry_contains_wasm_only_under_feature() {
+        // The in-process wasm backend (#505 P2) registers iff built with
+        // `--features wasm` (which vendors the wasmtime substrate). With the
+        // feature off it must NOT be a selectable name (fail-closed).
+        let has_wasm = inventory::iter::<BackendRegistration>().any(|r| r.name == "wasm");
+        assert_eq!(
+            has_wasm,
+            cfg!(feature = "wasm"),
+            "wasm registration must track the wasm feature"
+        );
+    }
+
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn wasm_is_auto_excluded() {
+        // The in-process wasm backend (shared host address space) must be flagged
+        // explicit-name-only so it can never be auto-picked (#547 ZSP — no silent
+        // isolation downgrade).
+        let wasm = inventory::iter::<BackendRegistration>()
+            .find(|r| r.name == "wasm")
+            .expect("wasm registered under the wasm feature");
+        assert!(
+            !wasm.auto_selectable,
+            "wasm (in-process, shared address space) must be excluded from auto-selection"
+        );
+    }
+
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn auto_never_returns_wasm_even_when_only_available_backend() {
+        // With *only* the real wasm registration present (registered + available),
+        // `"auto"` must still error rather than downgrade to it.
+        let wasm = inventory::iter::<BackendRegistration>()
+            .find(|r| r.name == "wasm")
+            .expect("wasm registered under the wasm feature");
+        let only_wasm = vec![wasm];
+        let err = select_registration("auto", &only_wasm, |r| (r.is_available)()).unwrap_err();
+        assert!(
+            err.to_string().contains("no available sandbox backend"),
+            "auto must not pick wasm; got: {err}"
+        );
+
+        // And with nspawn alongside it, `"auto"` resolves to nspawn — never wasm.
+        // Inject a deterministic availability oracle (everything available) so this
+        // does NOT depend on the runner actually having nspawn installed: nspawn is
+        // auto_selectable (and outranks), wasm is auto_selectable:false (excluded), so
+        // auto must return nspawn. (Real-runtime availability is exercised elsewhere;
+        // here we assert the selection *logic*, env-independently.)
+        let nspawn = inventory::iter::<BackendRegistration>()
+            .find(|r| r.name == "nspawn")
+            .expect("nspawn always registered");
+        let both = vec![wasm, nspawn];
+        let r = select_registration("auto", &both, |_| true).unwrap();
+        assert_eq!(r.name, "nspawn", "auto must pick nspawn, never wasm");
+    }
+
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn wasm_selectable_by_name_and_available() {
+        // Explicit `wasm` request resolves to the wasm registration, and it is
+        // always available once compiled in (wasmtime is vendored in-process).
+        let regs: Vec<&'static BackendRegistration> =
+            inventory::iter::<BackendRegistration>().collect();
+        let reg = select_registration("wasm", &regs, |r| (r.is_available)())
+            .expect("wasm selectable by name when feature on");
+        assert_eq!(reg.name, "wasm");
+        assert!((reg.is_available)(), "wasm is always available once built");
     }
 
     #[cfg(feature = "kata-vm")]

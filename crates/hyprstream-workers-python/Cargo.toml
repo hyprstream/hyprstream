@@ -1,0 +1,38 @@
+[package]
+name = "hyprstream-workers-python"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT"
+description = "RustPython engine + /lang/python 9P shell over the hyprstream-workers-wasmtime sandbox"
+
+# Host-target workspace member. Like the engine crate it does NOT depend on
+# tch/libtorch, so it builds without LIBTORCH. Build/test scoped:
+#   cargo build -p hyprstream-workers-python
+#   cargo test  -p hyprstream-workers-python
+#
+# The Python guest artifact must be built first for tests (mirrors the engine's
+# guest discovery — env HYPRSTREAM_PYGUEST_WASM or the standalone guest target dir):
+#   cargo build --release --target wasm32-unknown-unknown \
+#     --manifest-path crates/hyprstream-workers-python-guest/Cargo.toml
+
+# NB: like the engine crate, this crate intentionally does NOT add
+# `[lints] workspace = true` — it uses unwrap/expect/panic freely in tests.
+
+[dependencies]
+# Generic wasm sandbox engine: Sandbox / call_export / call_export_with_epoch /
+# open_instance (PersistentInstance) / EpochTimer / TAG_OK / Subject. NO python
+# awareness lives there — this crate is the ONE python-aware layer.
+hyprstream-workers-wasmtime = { path = "../hyprstream-workers-wasmtime" }
+# Canonical VFS seam for the /lang/python Mount.
+hyprstream-vfs = { path = "../hyprstream-vfs" }
+async-trait = "0.1"
+serde_json = "1"
+# The mount fid state uses parking_lot::Mutex for interior mutability through `&Fid`.
+parking_lot = "0.12"
+# The proxy reply channel / mount command channel use tokio sync primitives.
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread"] }
+# Errors from the sandbox surface as wasmtime::Error.
+wasmtime = "=46.0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }

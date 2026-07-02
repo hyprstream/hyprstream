@@ -10,8 +10,14 @@
 //! - `/lang/tcl/eval`   — ctl file: write a Tcl script, read the result
 //! - `/lang/tcl/vars/`  — dynamic dir: list Tcl variables as readable files
 //! - `/lang/tcl/procs/` — dynamic dir: list defined procs as readable files
+//!
+//! Built on `hyprstream-vfs`'s `devfile` primitives (`ControlFile` for `eval`,
+//! `DynamicDir` for `vars`/`procs`) rather than hand-rolling the write→latch→
+//! read state machine — see `hyprstream_vfs::devfile` for the shared
+//! implementation (#609).
 
 use async_trait::async_trait;
+use hyprstream_vfs::devfile::{ControlFile, DevFileState, DevFuture, DynamicDir};
 use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat, Subject};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -69,9 +75,20 @@ enum TclFidKind {
 /// Fid state for the Tcl mount.
 struct TclFid {
     kind: TclFidKind,
-    /// Buffer for ctl write→read pattern (eval).
-    write_buf: Vec<u8>,
+    /// `eval` write→latch→read state (devfile::ControlFile). Unused for
+    /// other fid kinds, but cheap (an empty `Vec` behind a `Mutex`).
+    ctl_state: DevFileState,
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// devfile callback type aliases
+// ─────────────────────────────────────────────────────────────────────────────
+
+type EvalCtl = ControlFile<Box<dyn Fn(Vec<u8>) -> DevFuture<'static, Result<Vec<u8>, MountError>> + Send + Sync>>;
+type ListFn = Box<dyn Fn() -> DevFuture<'static, Vec<String>> + Send + Sync>;
+type GetFn = Box<dyn Fn(String) -> DevFuture<'static, Result<Option<Vec<u8>>, MountError>> + Send + Sync>;
+type VarsDir = DynamicDir<ListFn, GetFn>;
+type ProcsDir = DynamicDir<ListFn, GetFn>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TclMount
@@ -83,27 +100,79 @@ struct TclFid {
 /// `Receiver<TclCommand>` returned by [`create_mount_channel`] in its event
 /// loop (e.g., `ChatApp::tick()`).
 pub struct TclMount {
-    tx: tokio::sync::mpsc::Sender<TclCommand>,
+    eval: EvalCtl,
+    vars: VarsDir,
+    procs: ProcsDir,
 }
 
 impl TclMount {
     /// Create a new `TclMount` from the sending half of a mount channel.
     pub fn new(tx: tokio::sync::mpsc::Sender<TclCommand>) -> Self {
-        Self { tx }
-    }
+        let eval_tx = tx.clone();
+        let eval_handler = move |data: Vec<u8>| -> DevFuture<'static, Result<Vec<u8>, MountError>> {
+            let tx = eval_tx.clone();
+            let script = String::from_utf8_lossy(&data).into_owned();
+            Box::pin(async move {
+                let result = request(&tx, |resp| TclCommand::Eval { script, resp }).await?;
+                Ok(match result {
+                    Ok(s) => s.into_bytes(),
+                    Err(e) => format!("error: {e}").into_bytes(),
+                })
+            })
+        };
+        let eval = ControlFile::new(Box::new(eval_handler) as _);
 
-    /// Send a command and await the interpreter response.
-    async fn request<T>(&self, build: impl FnOnce(tokio::sync::oneshot::Sender<T>) -> TclCommand) -> Result<T, MountError> {
-        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        let cmd = build(resp_tx);
-        self.tx
-            .send(cmd)
-            .await
-            .map_err(|_| MountError::Io("tcl interpreter gone".into()))?;
-        resp_rx
-            .await
-            .map_err(|_| MountError::Io("tcl interpreter did not respond".into()))
+        let vars_tx = tx.clone();
+        let vars_get_tx = tx.clone();
+        let vars = DynamicDir::new(
+            Box::new(move || {
+                let tx = vars_tx.clone();
+                Box::pin(async move { request(&tx, |resp| TclCommand::ListVars { resp }).await.unwrap_or_default() })
+                    as DevFuture<'static, _>
+            }) as ListFn,
+            Box::new(move |name: String| {
+                let tx = vars_get_tx.clone();
+                Box::pin(async move {
+                    let val: Option<String> = request(&tx, |resp| TclCommand::GetVar { name, resp }).await?;
+                    Ok(val.map(String::into_bytes))
+                }) as DevFuture<'static, _>
+            }) as GetFn,
+        );
+
+        let procs_tx = tx.clone();
+        let procs_get_tx = tx;
+        let procs = DynamicDir::new(
+            Box::new(move || {
+                let tx = procs_tx.clone();
+                Box::pin(async move { request(&tx, |resp| TclCommand::ListProcs { resp }).await.unwrap_or_default() })
+                    as DevFuture<'static, _>
+            }) as ListFn,
+            Box::new(move |name: String| {
+                let tx = procs_get_tx.clone();
+                Box::pin(async move {
+                    let val: Option<String> = request(&tx, |resp| TclCommand::GetProc { name, resp }).await?;
+                    Ok(val.map(String::into_bytes))
+                }) as DevFuture<'static, _>
+            }) as GetFn,
+        );
+
+        Self { eval, vars, procs }
     }
+}
+
+/// Send a command and await the interpreter response.
+async fn request<T>(
+    tx: &tokio::sync::mpsc::Sender<TclCommand>,
+    build: impl FnOnce(tokio::sync::oneshot::Sender<T>) -> TclCommand,
+) -> Result<T, MountError> {
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    let cmd = build(resp_tx);
+    tx.send(cmd)
+        .await
+        .map_err(|_| MountError::Io("tcl interpreter gone".into()))?;
+    resp_rx
+        .await
+        .map_err(|_| MountError::Io("tcl interpreter did not respond".into()))
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -123,7 +192,7 @@ impl Mount for TclMount {
         };
         Ok(Fid::new(TclFid {
             kind,
-            write_buf: Vec::new(),
+            ctl_state: DevFileState::new(),
         }))
     }
 
@@ -142,42 +211,14 @@ impl Mount for TclMount {
             .downcast_ref::<TclFid>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
 
-        let data = match &inner.kind {
-            TclFidKind::Eval => {
-                // Ctl pattern: after a write, read returns the result.
-                if inner.write_buf.is_empty() {
-                    // No script written yet — return empty.
-                    Vec::new()
-                } else {
-                    inner.write_buf.clone()
-                }
-            }
-            TclFidKind::Var(name) => {
-                let val: Option<String> = self.request(|resp| TclCommand::GetVar {
-                    name: name.clone(),
-                    resp,
-                }).await?;
-                val.map(|s| s.into_bytes())
-                    .ok_or_else(|| MountError::NotFound(format!("vars/{name}")))?
-            }
-            TclFidKind::Proc(name) => {
-                let body: Option<String> = self.request(|resp| TclCommand::GetProc {
-                    name: name.clone(),
-                    resp,
-                }).await?;
-                body.map(|s| s.into_bytes())
-                    .ok_or_else(|| MountError::NotFound(format!("procs/{name}")))?
-            }
+        match &inner.kind {
+            TclFidKind::Eval => Ok(self.eval.handle_read(&inner.ctl_state, offset)),
+            TclFidKind::Var(name) => self.vars.read(name, offset).await,
+            TclFidKind::Proc(name) => self.procs.read(name, offset).await,
             TclFidKind::Root | TclFidKind::VarsDir | TclFidKind::ProcsDir => {
-                return Err(MountError::IsDirectory("use readdir".into()));
+                Err(MountError::IsDirectory("use readdir".into()))
             }
-        };
-
-        let start = offset as usize;
-        if start >= data.len() {
-            return Ok(Vec::new());
         }
-        Ok(data[start..].to_vec())
     }
 
     async fn write(
@@ -192,25 +233,7 @@ impl Mount for TclMount {
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
 
         match &inner.kind {
-            TclFidKind::Eval => {
-                let script = String::from_utf8_lossy(data).into_owned();
-                let result = self.request(|resp| TclCommand::Eval {
-                    script,
-                    resp,
-                }).await?;
-                let response_bytes = match result {
-                    Ok(s) => s.into_bytes(),
-                    Err(e) => format!("error: {e}").into_bytes(),
-                };
-                // Store in the fid's write_buf for subsequent read.
-                // SAFETY: single fid, interior mutability needed for ctl pattern.
-                // The Mount trait takes &self, but we need to store the response.
-                let fid_ptr = inner as *const TclFid as *mut TclFid;
-                unsafe {
-                    (*fid_ptr).write_buf = response_bytes;
-                }
-                Ok(data.len() as u32)
-            }
+            TclFidKind::Eval => self.eval.handle_write(&inner.ctl_state, data).await,
             _ => Err(MountError::NotSupported("read-only".into())),
         }
     }
@@ -241,32 +264,8 @@ impl Mount for TclMount {
                     stat: None,
                 },
             ]),
-            TclFidKind::VarsDir => {
-                let names: Vec<String> =
-                    self.request(|resp| TclCommand::ListVars { resp }).await?;
-                Ok(names
-                    .into_iter()
-                    .map(|name| DirEntry {
-                        name,
-                        is_dir: false,
-                        size: 0,
-                        stat: None,
-                    })
-                    .collect())
-            }
-            TclFidKind::ProcsDir => {
-                let names: Vec<String> =
-                    self.request(|resp| TclCommand::ListProcs { resp }).await?;
-                Ok(names
-                    .into_iter()
-                    .map(|name| DirEntry {
-                        name,
-                        is_dir: false,
-                        size: 0,
-                        stat: None,
-                    })
-                    .collect())
-            }
+            TclFidKind::VarsDir => Ok(self.vars.readdir().await),
+            TclFidKind::ProcsDir => Ok(self.procs.readdir().await),
             _ => Err(MountError::NotDirectory(format!("{:?}", inner.kind))),
         }
     }

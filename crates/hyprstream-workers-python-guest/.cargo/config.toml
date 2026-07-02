@@ -1,0 +1,15 @@
+# getrandom 0.3 selects its entropy backend via a build cfg, NOT a cargo feature.
+# `getrandom_backend="custom"` tells getrandom 0.3 to call an external Rust symbol
+# `__getrandom_v03_custom` which we implement in src/lib.rs to delegate to the
+# wasmtime host import. This keeps the wasm guest free of any WASI / wasm_js path.
+#
+# We only need this for the wasm target. (As of rustpython-vm 0.5 there is only a
+# single getrandom major — 0.3 — in the tree; the P0-era getrandom 0.2 dual backend
+# is gone.) `--allow-undefined` lets `host_random` remain a wasm IMPORT rather than a
+# hard link error. `host_random` is then a normal wasm import the wasmtime Linker
+# resolves. With 0.5 the only declared import should be exactly `env::host_random`.
+[target.wasm32-unknown-unknown]
+rustflags = [
+    '--cfg', 'getrandom_backend="custom"',
+    '-C', 'link-arg=--allow-undefined',
+]

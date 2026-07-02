@@ -19,13 +19,18 @@ members = [
     "crates/hyprstream-tui",
     "crates/hyprstream-vfs",
     "crates/hyprstream-vfs-server",
-    "crates/hyprstream-tcl",
+    "crates/hyprstream-workers-tcl",
     "crates/chat-core",
     "crates/hyprstream-rpc-std",
     "crates/hyprstream-9p",
+    "crates/hyprstream-workers-wasmtime",
+    "crates/hyprstream-workers-python",
 ]
-# bitsandbytes-sys is standalone - only built when bnb feature is enabled
-exclude = ["crates/bitsandbytes-sys"]
+# bitsandbytes-sys is standalone - only built when bnb feature is enabled.
+# The wasm guests (hyprstream-workers-python-guest = wasm32-unknown-unknown cdylib; the
+# hyprstream-workers-wasmtime-fsguest = wasm32-wasip1 command) are sandbox GUEST artifacts,
+# excluded so a host-target workspace build never compiles a wasm-only crate.
+exclude = ["crates/bitsandbytes-sys", "crates/hyprstream-workers-python-guest", "crates/hyprstream-workers-wasmtime-fsguest"]
 resolver = "2"
 
 [workspace.package]

@@ -31,7 +31,7 @@ pub use hyprstream_rpc::wasm_api::*;
 /// ```
 #[wasm_bindgen]
 pub struct VfsShell {
-    shell: std::cell::RefCell<hyprstream_tcl::TclShell>,
+    shell: std::cell::RefCell<hyprstream_workers_tcl::TclShell>,
 }
 
 #[wasm_bindgen]
@@ -97,7 +97,7 @@ impl VfsShell {
 
         // Create Tcl shell
         let subject = hyprstream_rpc::Subject::anonymous();
-        let shell = hyprstream_tcl::TclShell::new(subject, ns);
+        let shell = hyprstream_workers_tcl::TclShell::new(subject, ns);
 
         Ok(VfsShell {
             shell: std::cell::RefCell::new(shell),

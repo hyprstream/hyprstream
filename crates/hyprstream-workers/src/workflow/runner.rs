@@ -14,7 +14,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use hyprstream_tcl::TclShell;
+use hyprstream_workers_tcl::TclShell;
 // VFS proxy no longer needed — TclShell awaits namespace operations directly.
 use hyprstream_vfs::{Namespace, Subject};
 
