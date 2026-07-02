@@ -125,8 +125,14 @@ impl Namespace {
                 }
             }
             BindFlag::Upper => {
+                // The upper is PREPENDED (Before position): overlay semantics
+                // are upper-wins on the read path, and `cat`/`read_one`/
+                // readdir-dedup are all first-success/first-seen in bind order
+                // — so the upper must be tried before any lower. Appending it
+                // would leave union reads returning stale lower content after
+                // a copy-up.
                 if let Some(entry) = self.mounts.iter_mut().find(|m| m.prefix == prefix) {
-                    entry.targets.push(Arc::clone(&target));
+                    entry.targets.insert(0, Arc::clone(&target));
                     entry.upper = Some(target);
                 } else {
                     self.mounts.push(MountEntry {
@@ -1682,5 +1688,47 @@ mod tests {
         let alice = Subject::new("alice");
         ns.echo("/g/secret", b"ok", &alice).await.unwrap();
         assert_eq!(upper.snapshot().get("secret").unwrap(), b"ok");
+    }
+
+    /// Copy-up works through the `/` catch-all (the FS-D rootfs case): a
+    /// `/`-rooted union of a read-only image lower + a designated writable
+    /// upper copy-ups on write, and the designated-upper routing survives the
+    /// catch-all's full-path remainder (`resolve_entry` returns the owning
+    /// `MountEntry` — including `upper` — for the root mount, not just its
+    /// target list).
+    ///
+    /// NOTE: uses a top-level file because namespace copy-up does not yet
+    /// provision intermediate parent directories in the upper — nested-path
+    /// copy-up (e.g. `etc/hostname`) fails on ANY prefix today (pre-existing,
+    /// not catch-all-specific). Tracked with overlay v2 semantics in #656.
+    #[tokio::test]
+    async fn copy_up_through_root_catch_all() {
+        let mut ns = Namespace::new();
+        let image: MountTarget =
+            Arc::new(ReadOnlyMemMount::new(vec![("hostname", b"worker\n")]));
+        let upper = Arc::new(WritableMemMount::empty());
+
+        ns.bind_mount("/", image, BindFlag::Replace).unwrap();
+        ns.bind_mount("/", Arc::clone(&upper) as MountTarget, BindFlag::Upper).unwrap();
+        assert!(ns.has_designated_upper("/"));
+
+        let caller = test_subject();
+
+        // Read-through to the RO lower via the catch-all.
+        assert_eq!(ns.cat("/hostname", &caller).await.unwrap(), b"worker\n");
+
+        // Write to a lower-only path → copy-up into the designated upper,
+        // routed via the MountEntry the catch-all branch returns.
+        ns.echo("/hostname", b"tenant\n", &caller).await.unwrap();
+        assert_eq!(upper.snapshot().get("hostname").unwrap(), b"tenant\n");
+
+        // The lower is untouched and the union now reads the upper's version.
+        assert_eq!(ns.cat("/hostname", &caller).await.unwrap(), b"tenant\n");
+
+        // A longer prefix still wins over the root union (longest-prefix order
+        // is unaffected by the Upper designation on "/").
+        let stream: MountTarget = Arc::new(MemMount::new(vec![("job", b"chunk")]));
+        ns.mount("/stream", stream).unwrap();
+        assert_eq!(ns.cat("/stream/job", &caller).await.unwrap(), b"chunk");
     }
 }
