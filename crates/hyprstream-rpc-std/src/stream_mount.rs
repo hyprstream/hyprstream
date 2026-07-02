@@ -8,35 +8,14 @@
 //! dispatching streaming RPC methods via `RpcClient::open_stream()` and
 //! registered in the StreamRegistry.
 
-#![cfg(target_arch = "wasm32")]
-
 use std::collections::HashMap;
+
+use parking_lot::Mutex;
 
 use async_trait::async_trait;
 use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
 use hyprstream_rpc::Subject;
 use hyprstream_rpc::stream_consumer::{StreamHandle, StreamPayload};
-
-// ============================================================================
-// Send+Sync wrappers for wasm32
-// ============================================================================
-
-/// RefCell wrapper that is Send+Sync on wasm32 (single-threaded).
-struct SyncRefCell<T>(std::cell::RefCell<T>);
-unsafe impl<T> Send for SyncRefCell<T> {}
-unsafe impl<T> Sync for SyncRefCell<T> {}
-
-impl<T> SyncRefCell<T> {
-    fn new(val: T) -> Self {
-        Self(std::cell::RefCell::new(val))
-    }
-    fn borrow(&self) -> std::cell::Ref<'_, T> {
-        self.0.borrow()
-    }
-    fn borrow_mut(&self) -> std::cell::RefMut<'_, T> {
-        self.0.borrow_mut()
-    }
-}
 
 // ============================================================================
 // Stream Registry — tracks active streams
@@ -56,34 +35,29 @@ pub struct StreamEntry {
 
 /// Registry of active streams, keyed by topic.
 pub struct StreamRegistry {
-    streams: SyncRefCell<HashMap<String, StreamEntry>>,
+    streams: Mutex<HashMap<String, StreamEntry>>,
 }
-
-// SAFETY: wasm32 is single-threaded
-unsafe impl Send for StreamRegistry {}
-unsafe impl Sync for StreamRegistry {}
 
 impl StreamRegistry {
     pub fn new() -> Self {
         Self {
-            streams: SyncRefCell::new(HashMap::new()),
+            streams: Mutex::new(HashMap::new()),
         }
     }
 
     /// Register a new stream.
     pub fn register(&self, topic: String, entry: StreamEntry) {
-        self.streams.borrow_mut().insert(topic, entry);
+        self.lock().insert(topic, entry);
     }
 
     /// Check if a topic exists.
     pub fn exists(&self, topic: &str) -> bool {
-        self.streams.borrow().contains_key(topic)
+        self.lock().contains_key(topic)
     }
 
     /// List active topic names (optionally filtered by owner).
     pub fn list_topics(&self, owner_filter: Option<&str>) -> Vec<String> {
-        self.streams
-            .borrow()
+        self.lock()
             .iter()
             .filter(|(_, e)| owner_filter.is_none() || owner_filter == Some(e.owner.as_str()))
             .map(|(k, _)| k.clone())
@@ -92,7 +66,18 @@ impl StreamRegistry {
 
     /// Remove a stream and return it for cleanup.
     pub fn remove(&self, topic: &str) -> Option<StreamEntry> {
-        self.streams.borrow_mut().remove(topic)
+        self.lock().remove(topic)
+    }
+
+    /// Lock the stream map (`parking_lot` — no poison).
+    fn lock(&self) -> parking_lot::MutexGuard<'_, HashMap<String, StreamEntry>> {
+        self.streams.lock()
+    }
+}
+
+impl Default for StreamRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -123,16 +108,26 @@ enum StreamFidState {
 /// Streams appear as directories under `/stream/{topic}/` with `data`, `info`,
 /// and `ctl` pseudo-files. Reading from `data` blocks until the next verified
 /// payload arrives via the StreamHandle.
+///
+/// Wasm-only: the `Mount` `read`/`write` path awaits [`StreamHandle`] methods,
+/// which return `!Send` futures (`#[async_trait(?Send)]` on the trait). Making
+/// this mount a native (`Send`) `Mount` requires `StreamHandle`'s futures to be
+/// `Send` — a separate change in `hyprstream-rpc`'s stream transport, tracked
+/// outside T3. `StreamRegistry`/`StreamEntry` above are target-agnostic so the
+/// generic service mount can register streams on any target.
+#[cfg(target_arch = "wasm32")]
 pub struct StreamMount {
     registry: std::sync::Arc<StreamRegistry>,
 }
 
+#[cfg(target_arch = "wasm32")]
 impl StreamMount {
     pub fn new(registry: std::sync::Arc<StreamRegistry>) -> Self {
         Self { registry }
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 #[async_trait(?Send)]
 impl Mount for StreamMount {
     async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
@@ -187,7 +182,7 @@ impl Mount for StreamMount {
             StreamFidState::Data { topic } => {
                 // Check completion WITHOUT holding borrow across await
                 let is_completed = {
-                    let streams = self.registry.streams.borrow();
+                    let streams = self.registry.lock();
                     let entry = streams
                         .get(topic.as_str())
                         .ok_or_else(|| MountError::NotFound(topic.clone()))?;
@@ -200,7 +195,7 @@ impl Mount for StreamMount {
 
                 // Take handle out temporarily (avoids holding RefCell borrow across await)
                 let mut handle = {
-                    let mut streams = self.registry.streams.borrow_mut();
+                    let mut streams = self.registry.lock();
                     let entry = streams
                         .get_mut(topic.as_str())
                         .ok_or_else(|| MountError::NotFound(topic.clone()))?;
@@ -214,7 +209,7 @@ impl Mount for StreamMount {
                 // Put handle back
                 let is_completed = handle.is_completed();
                 {
-                    let mut streams = self.registry.streams.borrow_mut();
+                    let mut streams = self.registry.lock();
                     if let Some(entry) = streams.get_mut(topic.as_str()) {
                         entry.handle = Some(handle);
                     }
@@ -222,7 +217,7 @@ impl Mount for StreamMount {
 
                 match result {
                     Ok(Some(StreamPayload::Data(data))) => {
-                        let mut streams = self.registry.streams.borrow_mut();
+                        let mut streams = self.registry.lock();
                         if let Some(entry) = streams.get_mut(topic.as_str()) {
                             entry.bytes_received += data.len() as u64;
                             entry.blocks_received += 1;
@@ -230,7 +225,7 @@ impl Mount for StreamMount {
                         Ok(data)
                     }
                     Ok(Some(StreamPayload::Complete(meta))) => {
-                        let mut streams = self.registry.streams.borrow_mut();
+                        let mut streams = self.registry.lock();
                         if let Some(entry) = streams.get_mut(topic.as_str()) {
                             entry.blocks_received += 1;
                         }
@@ -240,7 +235,7 @@ impl Mount for StreamMount {
                         Err(MountError::Io(format!("stream error: {msg}")))
                     }
                     Ok(Some(StreamPayload::Tagged { payload, .. })) => {
-                        let mut streams = self.registry.streams.borrow_mut();
+                        let mut streams = self.registry.lock();
                         if let Some(entry) = streams.get_mut(topic.as_str()) {
                             entry.bytes_received += payload.len() as u64;
                             entry.blocks_received += 1;
@@ -252,7 +247,7 @@ impl Mount for StreamMount {
                 }
             }
             StreamFidState::Info { topic } => {
-                let streams = self.registry.streams.borrow();
+                let streams = self.registry.lock();
                 let entry = streams
                     .get(topic.as_str())
                     .ok_or_else(|| MountError::NotFound(topic.clone()))?;
