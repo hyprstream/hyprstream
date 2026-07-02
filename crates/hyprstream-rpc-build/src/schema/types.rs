@@ -273,6 +273,7 @@ pub struct ScopedClient {
 
 #[cfg(test)]
 mod vfs_metadata_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
     use super::*;
 
     /// The VFS projection fields (epic #539, T1) survive a serde round-trip —
