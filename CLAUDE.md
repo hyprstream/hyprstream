@@ -30,6 +30,16 @@ cargo test --workspace --release
 **Feature flags**: `default = [gittorrent, xet, systemd, otel]`, `cuda` (empty marker), `bnb`, `overlayfs`, `download-libtorch`, `experimental`
 **Backend**: CPU/CUDA/ROCm controlled by tch-rs dependency (fork: github.com/hyprstream/tch-rs branch: hip), NOT cargo features
 
+## Working Tree & Worktrees (multi-agent safety)
+
+**Never run `git checkout`/`switch`/`reset`/`clean` in the shared main checkout. Use a dedicated worktree per branch — always `git worktree add`, never `git checkout -b` in the shared tree.**
+
+Multiple agents may share the one checkout at the repo root. That checkout has a single HEAD + index: a branch switch there drags every other agent's uncommitted edits onto the wrong branch, and a `reset --hard`/`checkout .` silently wipes them. One branch → one worktree isolates this completely.
+
+- **Create:** `git worktree add ../<name>` (or under `.worktrees/<name>` / your session scratchpad) for the branch you're working on. Stack a dependent branch off its base worktree (e.g. `git worktree add .worktrees/mytask <base-branch>`).
+- **Shared checkout stays neutral:** leave the root checkout on `main`; use it only for read-only ops (`fetch`, `log`, `show`, `ls-tree`) and `git worktree add`/`gh` — never for active branch work.
+- **Clean up:** `git worktree remove <path>` when done; `git worktree prune` for stale entries.
+
 ## Crate Map
 
 | Crate | Purpose |
