@@ -11,9 +11,10 @@
 //!                        optional — mounted only when running under Wanix,
 //!                        see [`mount_wanix`]). #409/#391.
 
-#![cfg(target_arch = "wasm32")]
-
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use async_trait::async_trait;
 use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
@@ -41,38 +42,48 @@ fn slice_read(data: Vec<u8>, offset: u64, count: u32) -> Vec<u8> {
     data[start..end].to_vec()
 }
 
+/// Generate an ephemeral ECDH keypair as 64 bytes: `[secret_scalar(32) | pubkey(32)]`.
+///
+/// Same layout the streaming handshake expects (secret first, pubkey at `[32..64]`),
+/// built directly from `DefaultKeyExchange` so it works on native and wasm alike.
+fn ephemeral_keypair_64() -> Result<Vec<u8>, String> {
+    use hyprstream_rpc::crypto::key_exchange::DefaultKeyExchange;
+    use hyprstream_rpc::crypto::KeyExchange;
+
+    let (secret, public) = DefaultKeyExchange::generate_keypair();
+    let mut out = Vec::with_capacity(64);
+    out.extend_from_slice(secret.scalar().as_bytes());
+    out.extend_from_slice(&DefaultKeyExchange::pubkey_to_bytes(&public));
+    if out.len() != 64 {
+        return Err(format!("ephemeral keypair wrong length: {}", out.len()));
+    }
+    Ok(out)
+}
+
 // ============================================================================
 // CtlResponseCache — stores write→read response for ctl pattern
 // ============================================================================
 
-struct CtlResponseCache(std::cell::RefCell<Option<Vec<u8>>>);
-
-// SAFETY: wasm32 is single-threaded.
-unsafe impl Send for CtlResponseCache {}
-unsafe impl Sync for CtlResponseCache {}
+struct CtlResponseCache(Mutex<Option<Vec<u8>>>);
 
 impl CtlResponseCache {
     fn new() -> Self {
-        Self(std::cell::RefCell::new(None))
+        Self(Mutex::new(None))
     }
     fn take(&self) -> Option<Vec<u8>> {
-        self.0.borrow_mut().take()
+        self.0.lock().take()
     }
     fn set(&self, data: Vec<u8>) {
-        *self.0.borrow_mut() = Some(data);
+        *self.0.lock() = Some(data);
     }
 }
 
-/// Atomic-like counter for request IDs, Send+Sync on wasm32.
-struct IdCounter(std::cell::Cell<u64>);
-unsafe impl Send for IdCounter {}
-unsafe impl Sync for IdCounter {}
+/// Monotonic counter for request IDs.
+struct IdCounter(AtomicU64);
 impl IdCounter {
-    fn new() -> Self { Self(std::cell::Cell::new(1)) }
+    fn new() -> Self { Self(AtomicU64::new(1)) }
     fn next(&self) -> u64 {
-        let id = self.0.get();
-        self.0.set(id + 1);
-        id
+        self.0.fetch_add(1, Ordering::Relaxed)
     }
 }
 
@@ -95,8 +106,9 @@ pub enum ServiceDispatchResult {
 }
 
 /// Trait for service-specific dispatch. Implemented via macro from generated code.
-#[async_trait(?Send)]
-trait ServiceDispatch: Send + Sync {
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait ServiceDispatch: Send + Sync {
     async fn dispatch(&self, method: &str, args_json: &str, client: &dyn RpcClient) -> Result<ServiceDispatchResult, String>;
     fn metadata(&self) -> (&'static str, &'static [hyprstream_rpc::metadata::MethodMeta]);
 }
@@ -130,7 +142,8 @@ impl GenericServiceMount {
     }
 }
 
-#[async_trait(?Send)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl Mount for GenericServiceMount {
     async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
         Ok(Fid::new(VfsFidState {
@@ -164,7 +177,7 @@ impl Mount for GenericServiceMount {
         // cat /srv/{service}/{method} → dispatch query method with empty args
         let method = &state.path[0];
         match self.service.dispatch(method, "{}", self.client.as_ref()).await
-            .map_err(|e| MountError::Io(e))? {
+            .map_err(MountError::Io)? {
             ServiceDispatchResult::Response(json) => {
                 Ok(slice_read(json.into_bytes(), offset, count))
             }
@@ -215,7 +228,7 @@ impl Mount for GenericServiceMount {
         let args_str = args_owned.as_str();
 
         let dispatch_result = self.service.dispatch(cmd, args_str, self.client.as_ref()).await
-            .map_err(|e| MountError::Io(e))?;
+            .map_err(MountError::Io)?;
 
         let resp = match dispatch_result {
             ServiceDispatchResult::Response(json) => json.into_bytes(),
@@ -317,7 +330,8 @@ impl DocMount {
     }
 }
 
-#[async_trait(?Send)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl Mount for DocMount {
     async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
         Ok(Fid::new(VfsFidState {
@@ -395,15 +409,16 @@ macro_rules! impl_service_dispatch {
     ($name:ident, $mod:path) => {
         struct $name;
 
-        #[async_trait(?Send)]
+        #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl ServiceDispatch for $name {
             async fn dispatch(&self, method: &str, args_json: &str, client: &dyn RpcClient) -> Result<ServiceDispatchResult, String> {
                 use $mod as svc;
 
                 // Generate ephemeral keypair upfront — used by streaming methods,
                 // ignored by non-streaming (the send closure decides which transport to use).
-                let keypair = hyprstream_rpc::wasm_api::generate_ephemeral_keypair()
-                    .map_err(|e| format!("keypair: {e:?}"))?;
+                let keypair = crate::vfs_mount::ephemeral_keypair_64()
+                    .map_err(|e| format!("keypair: {e}"))?;
                 let ephemeral_pubkey = keypair[32..64].to_vec();
 
                 let result = svc::dispatch(method, args_json, 0, |payload: Vec<u8>| async move {
@@ -461,6 +476,12 @@ impl_service_dispatch!(InferenceDispatch, crate::inference_client);
 /// in the native namespace the same path exposes the worktree filesystem
 /// (`RemoteRegistryMount`, real qids). The convergence is at the path +
 /// backing-service level; the access style differs by transport capability.
+///
+/// Browser-only: it wires the wasm transport clients into the browser namespace.
+/// The `GenericServiceMount`/`DocMount`/`StreamMount` building blocks it uses are
+/// target-agnostic; native callers compose them through the standard namespace
+/// builder + `#[service_factory]` auto-mount (#543) instead.
+#[cfg(target_arch = "wasm32")]
 pub fn build_browser_namespace(
     registry_client: Arc<dyn RpcClient>,
     model_client: Arc<dyn RpcClient>,
@@ -541,6 +562,10 @@ pub fn build_browser_namespace(
 /// sites: `mount_wanix(ns, &sab, uname, aname).await?` →
 /// `let client = P9Client::connect(DmaTransport::new(&sab, true), uname, aname).await?;
 /// mount_wanix(ns, client)?;`.
+///
+/// Wasm-only: `WanixMount`/`P9Client`/`DmaTransport` are SharedArrayBuffer-DMA
+/// types compiled only for the browser target.
+#[cfg(target_arch = "wasm32")]
 pub fn mount_wanix<T>(
     ns: &mut hyprstream_vfs::Namespace,
     client: hyprstream_9p::client::P9Client<T>,
@@ -553,3 +578,24 @@ where
         Arc::new(hyprstream_9p::wanix_mount::WanixMount::new(client)),
     )
 }
+
+// ============================================================================
+// Compile-time Send + Sync guarantees (#539 T3)
+// ============================================================================
+
+/// The generic service→9p mounts must be `Send + Sync` to serve behind the
+/// native (multi-threaded) `Mount` trait. These are compiler-enforced, not
+/// assumed — the whole point of the native port.
+#[cfg(not(target_arch = "wasm32"))]
+const _: () = {
+    fn assert_send_sync<T: Send + Sync>() {}
+    fn assertions() {
+        assert_send_sync::<GenericServiceMount>();
+        assert_send_sync::<DocMount>();
+        // The registry is the shared state behind the native mount; it must be
+        // Send + Sync even though a `StreamEntry`'s `Box<dyn StreamHandle>` is
+        // only `Send` (guarded by the registry's `Mutex`).
+        assert_send_sync::<crate::stream_mount::StreamRegistry>();
+    }
+    let _ = assertions;
+};
