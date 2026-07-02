@@ -551,6 +551,82 @@ fn has_annotation(
     false
 }
 
+/// Resolve the annotation node id whose short name matches `short_name`.
+///
+/// Self-contained lookup used for the VFS projection annotations (epic #539),
+/// mirroring the inline `scopeExempt` id resolution — avoids threading a new id
+/// through every extraction signature for annotations captured in one place.
+fn annotation_id_by_short_name(
+    node_map: &BTreeMap<u64, NodeInfo>,
+    short_name: &str,
+) -> Option<u64> {
+    node_map
+        .values()
+        .find(|info| info.short_name == short_name)
+        .map(|info| info.id)
+}
+
+/// Extract a `VfsKind` enum annotation as its enumerant name (e.g. "ctl").
+///
+/// Resolves the annotation's enum type from the node graph and maps the stored
+/// ordinal back to the enumerant name, mirroring `extract_annotation_enum`.
+/// Empty string when the annotation is absent.
+fn extract_vfs_kind(
+    annotations: capnp::struct_list::Reader<capnp::schema_capnp::annotation::Owned>,
+    target_id: Option<u64>,
+    nodes: &capnp::struct_list::Reader<capnp::schema_capnp::node::Owned>,
+    node_map: &BTreeMap<u64, NodeInfo>,
+) -> String {
+    let target_id = match target_id {
+        Some(id) => id,
+        None => return String::new(),
+    };
+    for i in 0..annotations.len() {
+        let ann = annotations.get(i);
+        if ann.get_id() != target_id {
+            continue;
+        }
+        let Ok(value) = ann.get_value() else { continue };
+        if let Ok(capnp::schema_capnp::value::Enum(ordinal)) = value.which() {
+            let Some(ann_info) = node_map.get(&target_id) else {
+                continue;
+            };
+            let ann_node = nodes.get(ann_info.index);
+            let Ok(capnp::schema_capnp::node::Annotation(ann_reader)) = ann_node.which() else {
+                continue;
+            };
+            let Ok(type_reader) = ann_reader.get_type() else {
+                continue;
+            };
+            let Ok(capnp::schema_capnp::type_::Enum(enum_type)) = type_reader.which() else {
+                continue;
+            };
+            let enum_type_id = enum_type.get_type_id();
+            let Some(enum_info) = node_map.get(&enum_type_id) else {
+                continue;
+            };
+            let enum_node = nodes.get(enum_info.index);
+            let Ok(capnp::schema_capnp::node::Enum(enum_reader)) = enum_node.which() else {
+                continue;
+            };
+            let Ok(enumerants) = enum_reader.get_enumerants() else {
+                continue;
+            };
+            for j in 0..enumerants.len() {
+                let enumerant = enumerants.get(j);
+                if enumerant.get_code_order() == ordinal {
+                    if let Ok(name) = enumerant.get_name() {
+                        if let Ok(s) = name.to_str() {
+                            return s.to_owned();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    String::new()
+}
+
 // ---------------------------------------------------------------------------
 // Union variant extraction
 // ---------------------------------------------------------------------------
@@ -645,6 +721,31 @@ fn extract_union_variants(
             doc_example_id,
         );
 
+        // VFS projection annotations (epic #539, T1). Ids resolved inline by
+        // node short-name — captured only here, so no signature threading.
+        let vfs_path_id = annotation_id_by_short_name(node_map, "vfsPath");
+        let vfs_kind_id = annotation_id_by_short_name(node_map, "vfsKind");
+        let vfs_bulk_id = annotation_id_by_short_name(node_map, "vfsBulk");
+        let vfs_hidden_id = annotation_id_by_short_name(node_map, "vfsHidden");
+        let vfs_path = extract_annotation_text(
+            field.get_annotations().map_err(|e| format!("{e}"))?,
+            vfs_path_id,
+        );
+        let vfs_kind = extract_vfs_kind(
+            field.get_annotations().map_err(|e| format!("{e}"))?,
+            vfs_kind_id,
+            nodes,
+            node_map,
+        );
+        let vfs_bulk = has_annotation(
+            field.get_annotations().map_err(|e| format!("{e}"))?,
+            vfs_bulk_id,
+        );
+        let vfs_hidden = has_annotation(
+            field.get_annotations().map_err(|e| format!("{e}"))?,
+            vfs_hidden_id,
+        );
+
         variants.push(UnionVariant {
             name,
             type_name,
@@ -653,6 +754,10 @@ fn extract_union_variants(
             scope_exempt,
             cli_hidden,
             doc_example,
+            vfs_path,
+            vfs_kind,
+            vfs_bulk,
+            vfs_hidden,
         });
     }
 
@@ -1547,6 +1652,10 @@ mod mandatory_scope_tests {
             scope_exempt: exempt,
             cli_hidden: false,
             doc_example: String::new(),
+            vfs_path: String::new(),
+            vfs_kind: String::new(),
+            vfs_bulk: false,
+            vfs_hidden: false,
         }
     }
 
