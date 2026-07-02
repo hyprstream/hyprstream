@@ -63,6 +63,9 @@ pub mod compiler;
 // sender-binding, consuming S1/S5/the compiler rather than re-implementing.
 pub mod exchange;
 pub mod lattice;
+// #676: the production S3-scope ↔ S5-TE-rule vocabulary (injective + exact;
+// wildcards expand at compile time over a closed registry).
+pub mod permission_map;
 pub mod te;
 
 // Re-export the per-op contract surface S2 (PEP) and S5/S6 (policy producers) consume.

@@ -96,6 +96,65 @@ pub enum ScopeAction {
     Publish = 8,
 }
 
+impl ScopeAction {
+    /// Every canonical action, in schema-discriminant order. The closed action
+    /// vocabulary: a wildcard ability expands over exactly this set (#676).
+    pub const ALL: [ScopeAction; 9] = [
+        ScopeAction::Query,
+        ScopeAction::Write,
+        ScopeAction::Manage,
+        ScopeAction::Infer,
+        ScopeAction::Train,
+        ScopeAction::Serve,
+        ScopeAction::Context,
+        ScopeAction::Subscribe,
+        ScopeAction::Publish,
+    ];
+
+    /// The canonical verb string, exactly as named in the Cap'n Proto
+    /// `ScopeAction` schema enum (`annotations.capnp`). The single string↔id
+    /// assignment shared by the S3 scope parser, the S5 compiler's
+    /// `PermissionMap`, and the PEP — no side tables.
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ScopeAction::Query => "query",
+            ScopeAction::Write => "write",
+            ScopeAction::Manage => "manage",
+            ScopeAction::Infer => "infer",
+            ScopeAction::Train => "train",
+            ScopeAction::Serve => "serve",
+            ScopeAction::Context => "context",
+            ScopeAction::Subscribe => "subscribe",
+            ScopeAction::Publish => "publish",
+        }
+    }
+
+    /// Parse a canonical verb string. `None` for anything else — an
+    /// unrecognized verb grants nothing (fail-closed), never a guess.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|a| a.as_str() == s)
+    }
+
+    /// Recover the enum from an interned [`Action`] id. `None` for an id
+    /// outside the schema enum — such a rule has no recognized meaning and is
+    /// treated as an escalation by `check_no_escalation` (fail-closed).
+    pub const fn from_action(action: Action) -> Option<Self> {
+        match action.0 {
+            0 => Some(ScopeAction::Query),
+            1 => Some(ScopeAction::Write),
+            2 => Some(ScopeAction::Manage),
+            3 => Some(ScopeAction::Infer),
+            4 => Some(ScopeAction::Train),
+            5 => Some(ScopeAction::Serve),
+            6 => Some(ScopeAction::Context),
+            7 => Some(ScopeAction::Subscribe),
+            8 => Some(ScopeAction::Publish),
+            _ => None,
+        }
+    }
+}
+
 impl Action {
     /// Intern a canonical S3 [`ScopeAction`] to its stable [`Action`] id. The id IS the
     /// schema discriminant, so the assignment is fixed across the compiler and every PEP
