@@ -337,9 +337,7 @@ pub async fn handle_shell_tui(
         hyprstream_rpc::Subject::new(pubkey_hex)
     };
 
-    // Build VFS namespace for `/path` routing in ChatApps. The `/lang/*` mounts
-    // are self-contained (own their driver thread); no per-language rx is
-    // handed back (epic #508, issue #634).
+    // Build VFS namespace for `/path` routing in ChatApps.
     let vfs_ns: std::sync::Arc<hyprstream_vfs::Namespace> = {
         use crate::services::fs::{SyntheticNode, SyntheticTree};
 
@@ -438,10 +436,8 @@ pub async fn handle_shell_tui(
             std::sync::Arc::new(env_tree),
         );
 
-        // /lang/tcl mount — self-contained: TclMount::spawn owns its molt
-        // interpreter + driver thread; the namespace is the only interface.
-        // The driver gets a fork() snapshot of the namespace built so far so
-        // `/lang/tcl/eval` can still do `/bin/{cmd}` fallback resolution.
+        // /lang/tcl — the driver gets a fork() snapshot of the namespace so
+        // `/lang/tcl/eval` can do `/bin/{cmd}` fallback resolution.
         let tcl_driver_ns = std::sync::Arc::new(ns.fork());
         let tcl_mount = std::sync::Arc::new(hyprstream_workers_tcl::TclMount::spawn(
             vfs_subject.clone(),
@@ -449,10 +445,8 @@ pub async fn handle_shell_tui(
         ));
         let _ = ns.mount("/lang/tcl", tcl_mount);
 
-        // /lang/python is NOT mounted in the CLI namespace: PythonMount::spawn
-        // needs a wasm Sandbox (pyguest artifact) which this builder does not
-        // hold. The previous mount's receiver was dropped immediately, so
-        // /lang/python already served nothing. Wiring is tracked in #632.
+        // /lang/python needs a wasm Sandbox this builder does not hold; wiring
+        // it is tracked in #632.
 
         std::sync::Arc::new(ns)
     };

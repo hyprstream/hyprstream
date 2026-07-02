@@ -227,15 +227,9 @@ pub fn build_chat_vfs_namespace(
     };
     let _ = ns.mount("/env", Arc::new(env_tree));
 
-    // /lang/tcl mount — self-contained: TclMount::spawn owns its molt
-    // interpreter + driver thread; the namespace is the only interface.
-    // No rx is handed back to the caller (epic #508, issue #634).
-    //
-    // The driver's TclShell needs a namespace for `/bin/{cmd}` fallback
-    // resolution inside `/lang/tcl/eval`. We hand it a `fork()` snapshot of
-    // the namespace built so far (`/srv/model`, `/bin`, `/env`, …) so the
-    // driver does not race with the `/lang/tcl` mount we are about to add,
-    // and so it never needs to observe `/lang/tcl` itself.
+    // /lang/tcl — the driver gets a fork() snapshot of the namespace (taken
+    // before /lang/tcl is mounted, so it never observes itself) for
+    // `/bin/{cmd}` fallback resolution inside `/lang/tcl/eval`.
     let driver_ns = Arc::new(ns.fork());
     let tcl_mount = Arc::new(hyprstream_workers_tcl::TclMount::spawn(
         subject.clone(),
@@ -243,11 +237,8 @@ pub fn build_chat_vfs_namespace(
     ));
     let _ = ns.mount("/lang/tcl", tcl_mount);
 
-    // /lang/python is intentionally NOT mounted here: PythonMount::spawn needs
-    // a wasm Sandbox (pyguest artifact), which the TUI namespace builder does
-    // not hold. Wiring it is tracked separately (#632). The previous call site
-    // mounted a PythonMount whose receiver was dropped immediately, so
-    // /lang/python already served nothing — removing it is not a regression.
+    // /lang/python needs a wasm Sandbox this builder does not hold; wiring it
+    // is tracked in #632.
 
     Ok((Arc::new(ns), subject))
 }

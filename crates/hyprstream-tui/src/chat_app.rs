@@ -1420,10 +1420,6 @@ impl TerminalApp for ChatApp {
 
         let mut redraw = false;
 
-        // `/lang/tcl` and `/lang/python` are served by their own self-contained
-        // mounts (driver thread inside each mount); ChatApp no longer drains any
-        // per-language rx (epic #508, issue #634).
-
         // Advance spinner while tool calls are in flight.
         if self.pending_tool_calls > 0 {
             self.spinner_tick = self.spinner_tick.wrapping_add(1);
