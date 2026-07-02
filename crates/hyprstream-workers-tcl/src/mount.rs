@@ -348,12 +348,7 @@ impl Mount for TclMount {
             TclFidKind::Proc(n) => (n.clone(), 0),
         };
 
-        Ok(Stat {
-            qtype,
-            size: 0,
-            name,
-            mtime: 0,
-        })
+        Ok(Stat::unknown_qid(qtype, 0, name, 0))
     }
 
     async fn clunk(&self, _fid: Fid, _caller: &Subject) {}

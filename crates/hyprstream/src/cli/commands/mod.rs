@@ -159,6 +159,8 @@ pub enum ServiceAction {
     /// Idempotent setup: bootstraps directories, registry, policy files, and
     /// signing key; installs command alias and systemd units.
     /// With --start: also stops and restarts services to pick up changes.
+    /// With --enable: registers units for autostart at boot (systemctl enable).
+    /// With --system: installs to /etc/systemd/system/ (requires root).
     Install {
         /// Operate on specific services only (comma-separated)
         #[arg(long, short = 's', value_delimiter = ',')]
@@ -167,6 +169,21 @@ pub enum ServiceAction {
         /// Stop and start services after installing/updating units
         #[arg(long)]
         start: bool,
+
+        /// Register services for autostart at boot (systemctl enable)
+        #[arg(long)]
+        enable: bool,
+
+        /// Install as system service in /etc/systemd/system/ (requires root)
+        #[arg(long)]
+        system: bool,
+
+        /// Install as a session-scoped user service via the D-Bus session bus.
+        ///
+        /// Use only for services tied to an active login session (e.g. TUI
+        /// multiplexer).  Not suitable for long-lived headless daemons.
+        #[arg(long, conflicts_with = "system")]
+        systemd_session: bool,
 
         /// Show verbose output for repair checks
         #[arg(long, short = 'v')]

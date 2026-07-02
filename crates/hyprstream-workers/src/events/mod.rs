@@ -32,7 +32,6 @@
 //! }
 //! ```
 
-pub mod endpoints;
 mod publisher;
 pub mod secure_publisher;
 pub mod secure_subscriber;

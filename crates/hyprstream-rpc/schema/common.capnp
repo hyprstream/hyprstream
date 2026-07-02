@@ -122,7 +122,7 @@ struct Subject {
 #
 # The following types are now defined in streaming.capnp:
 #   - StreamInfo, StreamRegister, StartStreamRequest, StreamAuthResponse
-#   - StreamBlock, StreamPayload, StreamStats, StreamError, StreamResume
+#   - StreamBlock, StreamPayload, StreamStats, StreamError
 #
 # Import with: using Streaming = import "streaming.capnp";
 

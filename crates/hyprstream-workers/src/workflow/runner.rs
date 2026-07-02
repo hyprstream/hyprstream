@@ -727,12 +727,7 @@ impl hyprstream_vfs::Mount for EnvMount {
         let inner = fid.downcast_ref::<EnvFid>().ok_or_else(|| {
             hyprstream_vfs::MountError::InvalidArgument("bad fid".into())
         })?;
-        Ok(hyprstream_vfs::Stat {
-            qtype: 0,
-            size: 0,
-            name: inner.path.clone(),
-            mtime: 0,
-        })
+        Ok(hyprstream_vfs::Stat::unknown_qid(0, 0, inner.path.clone(), 0))
     }
 
     async fn clunk(&self, _fid: hyprstream_vfs::Fid, _caller: &Subject) {}
@@ -882,12 +877,7 @@ mod tests {
             let inner = fid
                 .downcast_ref::<MemFid>()
                 .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
-            Ok(Stat {
-                qtype: 0,
-                size: 0,
-                name: inner.path.clone(),
-                mtime: 0,
-            })
+            Ok(Stat::unknown_qid(0, 0, inner.path.clone(), 0))
         }
 
         async fn clunk(&self, _fid: Fid, _caller: &Subject) {}

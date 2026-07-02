@@ -8,6 +8,7 @@ using import "/annotations.capnp".docExample;
 using import "/annotations.capnp".optional;
 using import "/annotations.capnp".serdeRename;
 using import "/streaming.capnp".StreamInfo;
+using import "/streaming.capnp".TransportConfig;
 using import "/inference.capnp".ChatMessage;
 using import "/inference.capnp".ToolCall;
 using import "/inference.capnp".ToolCallFunction;
@@ -266,10 +267,18 @@ struct UnloadModelRequest {
   modelRef @0 :Text;
 }
 
-# Response when model is loaded
+# Response when model is loaded.
+#
+# `reach` is the network-routable reach list for this model's InferenceService
+# (#320): the typed `TransportConfig` union resolved via the Resolver, replacing
+# the old local-only `endpoint :Text`. Only network-routable arms (Iroh; Quic)
+# are carried — a co-located caller (same process as ModelService) ignores it and
+# uses the in-process dial registry fast path, so an EMPTY list means
+# "co-located only, no remote reach published". The router single-selects ONE
+# reach per request (List is the seam for future replica balancing).
 struct LoadedModelResponse {
   modelRef @0 :Text;
-  endpoint @1 :Text;  # inproc://hyprstream/inference/{model_ref}
+  reach @1 :List(TransportConfig);
 }
 
 # Status request: empty modelRef = all known models; non-empty = specific model (0 or 1 result)
@@ -294,7 +303,7 @@ struct GenerationDefaults {
 struct ModelStatusEntry {
   modelRef   @0 :Text;
   status     @1 :Text;    # "loaded" | "loading"
-  endpoint   @2 :Text;    # empty if loading
+  reach      @2 :List(TransportConfig);  # network reach (#320); empty if loading or co-located-only
   loadedAt   @3 :Int64;   # ms elapsed since load (0 if loading)
   lastUsed   @4 :Int64;   # ms elapsed since last use (0 if loading)
   onlineTrainingConfig @5 :OnlineTrainingConfig;
@@ -319,7 +328,7 @@ struct ModelStatusResponse {
   loaded @0 :Bool;
   memoryBytes @1 :UInt64;
   sessionCount @2 :UInt32;
-  endpoint @3 :Text;       # Only set if loaded
+  reach @3 :List(TransportConfig);  # network reach (#320); empty if co-located-only / not loaded
 
   # Online training configuration (if model loaded)
   onlineTrainingConfig @4 :OnlineTrainingConfig;
@@ -380,10 +389,11 @@ struct AdapterInfo {
 # socket, and sends Register. ModelService then uses the same connection for
 # commands (LoadModel, Infer, Shutdown). This eliminates race conditions.
 
-# Sent by InferenceService when it connects back to ModelService
+# Sent by InferenceService when it connects back to ModelService.
+# (`streamEndpoint @1 :Text` was a ZMQ-XPUB vestige with no live readers — the
+# stream reach is published in StreamInfo.reach now — removed in #320.)
 struct Register {
   id @0 :Text;              # Instance ID (e.g., "inference-a1b2c3d4")
-  streamEndpoint @1 :Text;  # XPUB endpoint for token streaming
 }
 
 # Response to Register (optional, for acknowledgment)

@@ -68,6 +68,9 @@ struct RegistryRequest {
 
     # Repository-scoped operations (requires repoId)
     repo @9 :RepositoryRequest;
+
+    # Fetch content-addressed bytes (git OID or XET merkle root) as a stream.
+    getBlob @10 :GetBlobRequest $mcpScope(query) $mcpDescription("Fetch content-addressed bytes (git OID or XET merkle root) as a stream");
   }
 }
 
@@ -151,6 +154,8 @@ struct RegistryResponse {
     healthCheckResult @8 :HealthStatus;
     cloneStreamResult @9 :StreamInfo;
     repoResult @10 :RepositoryResponse;
+    # Content-addressed blob fetch — rides the moq streaming plane (StreamInfo).
+    getBlobResult @11 :StreamInfo;
   }
 }
 
@@ -323,6 +328,22 @@ struct RegisterRequest {
   path @0 :Text;
   name @1 :Text;
   trackingRef @2 :Text;
+}
+
+# Get Blob Request — fetch bytes by content address.
+
+struct GetBlobRequest {
+  # The content address — the GLOBAL lookup key (location-independent).
+  union {
+    gitOid    @0 :Text;   # git object id (hex 40 sha1 / 64 sha256)
+    xetMerkle @1 :Text;   # XET merkle root (CIDv1 string)
+  }
+  # Authz GRANT CONTEXT (required) — the repo the caller resolved that references
+  # this content. Server verifies (a) caller may access this repo AND (b) the repo
+  # actually contains the address. Content hashes are NOT secrets (XET global dedup
+  # → predictable for public-derived content), so the hash alone cannot authorize;
+  # entitlement keys on the grant repo.
+  grantRepo @2 :Text;   # at-uri of the owning repo (federation-portable)
 }
 
 # Create Worktree Request (repoId removed — curried into RepositoryClient)

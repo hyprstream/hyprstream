@@ -5,7 +5,7 @@ edition.workspace = true
 description = "Agentic Infrastructure"
 documentation = "https://docs.rs/hyprstream"
 readme = "README.md"
-license = "MIT OR AGPL-3.0"
+license = "MIT OR AGPL-3.0-only"
 exclude = [
     "**/*.pyc",
     "**/__pycache__/",
@@ -47,11 +47,13 @@ toml.workspace = true
 serde_yaml.workspace = true
 git2.workspace = true  # Still needed by git2db internally
 git2db = { path = "../git2db", features = ["overlayfs"] }  # High-level git library with overlayfs
+cas-serve = { path = "../cas-serve" }  # Content-addressed store reconstruction (getBlob #432)
 hyprstream-rpc = { path = "../hyprstream-rpc" }  # RPC infrastructure (Cap'n Proto + ZMQ)
 moq-net.workspace = true  # moq-lite streaming for cross-process subscriber (M2b)
 ml-dsa = { workspace = true }  # ML-DSA-65 — always compiled (runtime CryptoPolicy selects PQ). See M3 #152.
 hyprstream-rpc-std = { path = "../hyprstream-rpc-std" }  # Standard service schemas + clients
 hyprstream-discovery = { path = "../hyprstream-discovery" }  # Service discovery
+hyprstream-pds = { path = "../hyprstream-pds" }  # atproto PDS record store: DAG-CBOR + MST + signed commit + CAR proof (#392/#431)
 hyprstream-service = { path = "../hyprstream-service" }  # Service orchestration
 hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }  # RPC code generation proc macros
 hyprstream-flight = { path = "../hyprstream-flight" }  # Flight SQL server and client
@@ -60,6 +62,7 @@ hyprstream-workers = { path = "../hyprstream-workers" }  # Worker runtime (Kata 
 hyprstream-vfs = { path = "../hyprstream-vfs" }  # VFS namespace (Mount trait)
 hyprstream-workers-tcl = { path = "../hyprstream-workers-tcl" }  # Tcl shell (TclMount, TclCommand)
 hyprstream-workers-python = { path = "../hyprstream-workers-python" }  # Python shell (PythonMount, PyCommand)
+hyprstream-9p = { path = "../hyprstream-9p" }  # 9P codec + Kata translator (Backend, Translator)
 inventory.workspace = true  # Service factory registration
 gittorrent = { workspace = true, optional = true }  # P2P transport
 clap.workspace = true

@@ -12,9 +12,41 @@ use zbus_systemd::login1::ManagerProxy as LoginProxy;
 use zbus_systemd::systemd1::ManagerProxy;
 use zbus_systemd::zbus::Connection;
 
-/// Systemd-based service manager
+/// Connect to the user D-Bus instance for systemd management.
 ///
-/// Manages services via D-Bus calls to systemd.
+/// Tries `$DBUS_SESSION_BUS_ADDRESS` first (set by PAM on both desktop and
+/// headless SSH logins when `systemd --user` is running). Falls back to the
+/// well-known socket path `/run/user/$UID/bus` for environments where the env
+/// var is absent but the socket exists (e.g. running from a cron job or
+/// service that didn't inherit the PAM environment).
+///
+/// Does NOT use the systemd private bus (`/run/user/$UID/systemd/private/bus`)
+/// — that path is an internal bind-mount not accessible from outside systemd.
+async fn user_systemd_connection() -> Result<Connection> {
+    // Primary: $DBUS_SESSION_BUS_ADDRESS (set by pam_systemd on any login).
+    if let Ok(conn) = Connection::session().await {
+        return Ok(conn);
+    }
+
+    // Fallback: well-known socket path that systemd --user maintains.
+    let uid = nix::unistd::getuid().as_raw();
+    let rt = std::env::var("XDG_RUNTIME_DIR")
+        .unwrap_or_else(|_| format!("/run/user/{uid}"));
+    let bus_path = format!("{rt}/bus");
+    zbus_systemd::zbus::ConnectionBuilder::address(
+        format!("unix:path={bus_path}").as_str(),
+    )?
+    .build()
+    .await
+    .with_context(|| format!(
+        "could not connect to user D-Bus (tried $DBUS_SESSION_BUS_ADDRESS and {bus_path})"
+    ))
+}
+
+/// Systemd-based user service manager
+///
+/// Manages per-user services via D-Bus calls to the systemd user instance.
+/// Units are installed to `~/.config/systemd/user/`.
 pub struct SystemdManager {
     #[allow(dead_code)]
     connection: Connection,
@@ -22,17 +54,20 @@ pub struct SystemdManager {
 }
 
 impl SystemdManager {
-    /// Create a new SystemdManager
+    /// Create a new SystemdManager.
     ///
     /// Connects to the user session D-Bus for systemd1 and the system D-Bus
     /// for login1 (logind). logind lives on the system bus only — connecting
     /// LoginProxy to the session bus caused set_user_linger() to hang forever
-    /// waiting for a response that never arrives.
+    /// waiting for a response that never arrives. Enabling user linger keeps
+    /// services persisting across logouts on headless machines.
     pub async fn new() -> Result<Self> {
-        let connection = Connection::session().await?;
+        let connection = user_systemd_connection().await?;
         let systemd = ManagerProxy::new(&connection).await?;
 
         // Enable linger via the system bus (org.freedesktop.login1 is system-only).
+        // This keeps the user systemd instance running after logout so services
+        // registered with WantedBy=default.target survive reboots.
         let system_connection = Connection::system().await?;
         let login = LoginProxy::new(&system_connection).await?;
         let uid = nix::unistd::getuid().as_raw();
@@ -48,6 +83,18 @@ impl SystemdManager {
         })
     }
 
+    /// Create a new SystemdManager using the D-Bus session bus.
+    ///
+    /// Only for session-scoped services (e.g. the TUI multiplexer) that should
+    /// be tied to an active login session.  Do NOT use for long-lived public
+    /// service daemons — the session bus disappears on logout.
+    pub async fn new_session() -> Result<Self> {
+        let connection = Connection::session().await
+            .context("could not connect to D-Bus session bus (is $DBUS_SESSION_BUS_ADDRESS set?)")?;
+        let systemd = ManagerProxy::new(&connection).await?;
+        Ok(Self { connection, systemd })
+    }
+
     #[allow(dead_code)]
     fn socket_unit(service: &str) -> String {
         format!("hyprstream-{service}.socket")
@@ -61,6 +108,126 @@ impl SystemdManager {
         dirs::config_dir()
             .map(|d| d.join("systemd/user"))
             .ok_or_else(|| anyhow!("cannot determine config directory"))
+    }
+}
+
+/// Systemd-based system-wide service manager (requires root)
+///
+/// Manages system services via the system D-Bus. Units are installed to
+/// `/etc/systemd/system/` and run under a dedicated `hyprstream` system user.
+pub struct SystemdSystemManager {
+    #[allow(dead_code)]
+    connection: Connection,
+    systemd: ManagerProxy<'static>,
+}
+
+impl SystemdSystemManager {
+    pub async fn new() -> Result<Self> {
+        let connection = Connection::system().await?;
+        let systemd = ManagerProxy::new(&connection).await?;
+        Ok(Self { connection, systemd })
+    }
+
+    fn service_unit(service: &str) -> String {
+        format!("hyprstream-{service}.service")
+    }
+
+    fn units_dir() -> PathBuf {
+        PathBuf::from("/etc/systemd/system")
+    }
+}
+
+#[async_trait]
+impl ServiceManager for SystemdSystemManager {
+    async fn install(&self, service: &str) -> Result<()> {
+        let units_dir = Self::units_dir();
+        std::fs::create_dir_all(&units_dir)?;
+
+        let depends_on = crate::service::factory::get_factory(service)
+            .map(|f| f.depends_on)
+            .unwrap_or(&[]);
+
+        let service_content = units::system_service_unit(service, depends_on)?;
+        let service_path = units_dir.join(Self::service_unit(service));
+
+        if std::fs::read_to_string(&service_path).ok().as_deref() != Some(&service_content) {
+            std::fs::write(&service_path, &service_content)?;
+            info!("Installed system service unit: {}", service_path.display());
+            self.reload().await?;
+        }
+
+        Ok(())
+    }
+
+    async fn uninstall(&self, service: &str) -> Result<()> {
+        let _ = self.stop(service).await;
+        let path = Self::units_dir().join(Self::service_unit(service));
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+            info!("Removed: {}", path.display());
+        }
+        self.reload().await
+    }
+
+    async fn start(&self, service: &str) -> Result<()> {
+        self.systemd
+            .start_unit(Self::service_unit(service), "replace".into())
+            .await?;
+        info!("Started system service unit: {}", Self::service_unit(service));
+        Ok(())
+    }
+
+    async fn stop(&self, service: &str) -> Result<()> {
+        self.systemd
+            .stop_unit(Self::service_unit(service), "replace".into())
+            .await?;
+        info!("Stopped system service unit: {}", Self::service_unit(service));
+        Ok(())
+    }
+
+    async fn is_active(&self, service: &str) -> Result<bool> {
+        match self.systemd.get_unit(Self::service_unit(service)).await {
+            Ok(unit_path) => {
+                let unit = zbus_systemd::systemd1::UnitProxy::builder(self.systemd.inner().connection())
+                    .path(unit_path)?
+                    .build()
+                    .await?;
+                let state = unit.active_state().await?;
+                Ok(state == "active")
+            }
+            Err(_) => Ok(false),
+        }
+    }
+
+    async fn reload(&self) -> Result<()> {
+        let status = tokio::process::Command::new("systemctl")
+            .arg("daemon-reload")
+            .status()
+            .await
+            .context("failed to spawn systemctl daemon-reload")?;
+        if !status.success() {
+            anyhow::bail!("systemctl daemon-reload failed (exit {})", status);
+        }
+        debug!("Reloaded systemd system daemon");
+        Ok(())
+    }
+
+    async fn enable(&self, service: &str) -> Result<()> {
+        let status = tokio::process::Command::new("systemctl")
+            .args(["enable", &Self::service_unit(service)])
+            .status()
+            .await
+            .context("failed to spawn systemctl enable")?;
+        if !status.success() {
+            anyhow::bail!("systemctl enable {} failed (exit {})", Self::service_unit(service), status);
+        }
+        debug!("Enabled system service unit: {}", Self::service_unit(service));
+        Ok(())
+    }
+
+    async fn spawn(&self, service: Box<dyn Spawnable>) -> Result<SpawnedService> {
+        self.ensure(service.name()).await?;
+        Ok(SpawnedService::dummy())
     }
 }
 
@@ -84,7 +251,8 @@ impl ServiceManager for SystemdManager {
         let service_content = units::service_unit(service, use_creds, depends_on)?;
         let service_path = units_dir.join(Self::service_unit(service));
 
-        // Write service unit if changed (idempotent)
+        // Write service unit if changed (idempotent), then reload so systemd
+        // sees the new unit before any subsequent start() or enable() call.
         if std::fs::read_to_string(&service_path).ok().as_deref() != Some(&service_content) {
             std::fs::write(&service_path, &service_content)?;
             info!("Installed service unit: {}", service_path.display());
@@ -127,8 +295,31 @@ impl ServiceManager for SystemdManager {
     }
 
     async fn reload(&self) -> Result<()> {
-        self.systemd.reload().await?;
-        debug!("Reloaded systemd daemon");
+        // Use systemctl subprocess rather than the D-Bus Reload() call.
+        // The D-Bus call hangs on systemd 258+ (Fedora 43) during daemon-reload
+        // when called from a non-session context.
+        let status = tokio::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status()
+            .await
+            .context("failed to spawn systemctl --user daemon-reload")?;
+        if !status.success() {
+            anyhow::bail!("systemctl --user daemon-reload failed (exit {})", status);
+        }
+        debug!("Reloaded systemd user daemon");
+        Ok(())
+    }
+
+    async fn enable(&self, service: &str) -> Result<()> {
+        let status = tokio::process::Command::new("systemctl")
+            .args(["--user", "enable", &Self::service_unit(service)])
+            .status()
+            .await
+            .context("failed to spawn systemctl --user enable")?;
+        if !status.success() {
+            anyhow::bail!("systemctl --user enable {} failed (exit {})", Self::service_unit(service), status);
+        }
+        debug!("Enabled service unit: {}", Self::service_unit(service));
         Ok(())
     }
 

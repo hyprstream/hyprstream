@@ -351,12 +351,7 @@ mod tests {
 
         async fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
             let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
-            Ok(Stat {
-                qtype: 0,
-                size: 0,
-                name: inner.path.clone(),
-                mtime: 0,
-            })
+            Ok(Stat::unknown_qid(0, 0, inner.path.clone(), 0))
         }
 
         async fn clunk(&self, _fid: Fid, _caller: &Subject) {}

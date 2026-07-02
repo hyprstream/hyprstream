@@ -180,6 +180,12 @@ pub struct StreamContext {
     topic: String,
     /// DH-derived HMAC key for authenticated stream blocks
     mac_key: [u8; 32],
+    /// DH-derived AES-256-GCM key for transport-level AEAD of payloads (#321).
+    /// `Some` only on the DH path (`from_dh`): the mesh/networked stream plane
+    /// seals each Data/Complete payload under this key. `None` on the keyless
+    /// `new()` path (e.g. NotificationService topics, whose payloads are already
+    /// E2E-encrypted at the app layer), where transport AEAD is not applied.
+    enc_key: Option<[u8; 32]>,
     /// Server's ephemeral public key - client needs this for DH
     server_pubkey: [u8; 32],
     /// DH-derived control channel topic (64 hex chars)
@@ -190,6 +196,28 @@ pub struct StreamContext {
     cancel_token: CancellationToken,
     /// QoS options advertised in StreamInfo and honoured by MoqStreamPublisher (#169).
     qos: crate::stream_info::StreamOpt,
+    /// Per-stream relay selection applied when building this stream's reach (#384).
+    ///
+    /// Server-authored (like `qos` — never client-supplied). Defaults to
+    /// [`crate::moq_stream::RelayChoice::ServerDefault`] (the node's server-global
+    /// relay). Set to `Only` for an anonymized, relay-only stream, or `Override`
+    /// for per-tenant relay isolation.
+    relay_choice: crate::moq_stream::RelayChoice,
+    /// Per-stream reach inputs — the node/server's iroh + QUIC base reach (#384).
+    ///
+    /// Captured into the context at construction so [`reach`](Self::reach) builds
+    /// the `StreamInfo.reach` from THIS field, never re-reading the process-global
+    /// `OnceLock`s on every call. This is what makes heterogeneous per-server
+    /// reach work: a [`StreamChannel`] threaded with an explicit
+    /// [`ProducerReachConfig`](crate::moq_stream::ProducerReachConfig) via
+    /// [`StreamChannel::with_reach_config`] populates this so the base (iroh/QUIC)
+    /// reach is per-stream too, not just `relay_choice`.
+    ///
+    /// When no explicit config is threaded, [`from_dh`](Self::from_dh) seeds it
+    /// from [`global_reach_config`](crate::moq_stream::global_reach_config) — a
+    /// one-time per-stream snapshot (the documented compat source), not a
+    /// per-`reach()`-call global read.
+    reach_config: crate::moq_stream::ProducerReachConfig,
 }
 
 impl StreamContext {
@@ -204,11 +232,18 @@ impl StreamContext {
             stream_id,
             topic,
             mac_key,
+            // Keyless path: no shared transport AEAD key (see field docs).
+            enc_key: None,
             server_pubkey,
             ctrl_topic: String::new(),
             ctrl_mac_key: [0u8; 32],
             cancel_token: CancellationToken::new(),
             qos: crate::stream_info::StreamOpt::default(),
+            relay_choice: crate::moq_stream::RelayChoice::default(),
+            // No DH/server context here (notification + standalone TUI paths,
+            // which never call `reach()`); default to an empty reach config. A
+            // networked producer threads a real one via `with_reach_config`.
+            reach_config: crate::moq_stream::ProducerReachConfig::default(),
         }
     }
 
@@ -240,11 +275,21 @@ impl StreamContext {
             stream_id,
             topic: keys.topic,
             mac_key: *keys.mac_key,
+            // DH path: AEAD ON for the mesh stream plane (#321).
+            enc_key: Some(*keys.enc_key),
             server_pubkey: server_pubkey_bytes,
             ctrl_topic: keys.ctrl_topic,
             ctrl_mac_key: *keys.ctrl_mac_key,
             cancel_token: CancellationToken::new(),
             qos: crate::stream_info::StreamOpt::default(),
+            relay_choice: crate::moq_stream::RelayChoice::default(),
+            // Snapshot the node's reach inputs ONCE, per-stream, at construction
+            // (#384). `reach()` then reads this captured field instead of the
+            // process globals on every call. A `StreamChannel` with an explicit
+            // per-server `ProducerReachConfig` overrides this via
+            // `with_reach_config` (prepare_stream), making the base reach fully
+            // per-stream rather than global-sourced.
+            reach_config: crate::moq_stream::global_reach_config(),
         })
     }
 
@@ -261,6 +306,26 @@ impl StreamContext {
     /// Get the MAC key (for HMAC chain).
     pub fn mac_key(&self) -> &[u8; 32] {
         &self.mac_key
+    }
+
+    /// Get the transport AEAD key (#321), if this is a DH-keyed stream.
+    ///
+    /// `Some` on the DH path (mesh/networked stream — AEAD ON), `None` on the
+    /// keyless `new()` path (payloads already E2E-encrypted at the app layer).
+    pub fn enc_key(&self) -> Option<&[u8; 32]> {
+        self.enc_key.as_ref()
+    }
+
+    /// Disable transport-level AEAD for this stream (#321).
+    ///
+    /// Clears the AEAD key so the publisher emits cleartext (HMAC-chained) blocks.
+    /// Used for streams whose consumer receives only `(mac_key, topic)` out of band
+    /// and never derives the DH `enc_key` (e.g. the TUI PTY/shell stdout viewer,
+    /// a same-host stream). AEAD remains mandatory and ON for the DH-keyed mesh
+    /// inference stream, whose consumer derives `enc_key` from the same DH.
+    pub fn without_aead(mut self) -> Self {
+        self.enc_key = None;
+        self
     }
 
     /// Get the server's ephemeral public key (client needs this for DH).
@@ -300,6 +365,51 @@ impl StreamContext {
     /// Get the QoS options for this stream (#169).
     pub fn qos(&self) -> &crate::stream_info::StreamOpt {
         &self.qos
+    }
+
+    /// Set the per-stream relay choice (#384). Server-authored — never from a
+    /// client request. Use [`crate::moq_stream::RelayChoice::Only`] for an
+    /// anonymized relay-only stream, or `Override` for per-tenant isolation.
+    pub fn with_relay_choice(mut self, relay_choice: crate::moq_stream::RelayChoice) -> Self {
+        self.relay_choice = relay_choice;
+        self
+    }
+
+    /// Get the per-stream relay choice (#384).
+    pub fn relay_choice(&self) -> &crate::moq_stream::RelayChoice {
+        &self.relay_choice
+    }
+
+    /// Thread an explicit per-server reach config into this stream (#384).
+    ///
+    /// Replaces the [`from_dh`](Self::from_dh) global snapshot with the supplied
+    /// per-server [`ProducerReachConfig`](crate::moq_stream::ProducerReachConfig),
+    /// so the base (iroh/QUIC) reach this stream advertises is the server's own —
+    /// not the process global. [`StreamChannel::prepare_stream_with_claims`]
+    /// calls this when the channel was built with
+    /// [`StreamChannel::with_reach_config`].
+    pub fn with_reach_config(mut self, reach_config: crate::moq_stream::ProducerReachConfig) -> Self {
+        self.reach_config = reach_config;
+        self
+    }
+
+    /// Get this stream's reach config (#384).
+    pub fn reach_config(&self) -> &crate::moq_stream::ProducerReachConfig {
+        &self.reach_config
+    }
+
+    /// Build this stream's `StreamInfo.reach` from the node's per-server reach
+    /// config and this stream's [`relay_choice`](Self::relay_choice) (#384).
+    ///
+    /// This is the threaded replacement for the deprecated free-function
+    /// `producer_reach()`: a producer that holds a `StreamContext` calls this so
+    /// the stream's relay/anonymization posture **and** its base iroh/QUIC reach
+    /// are honoured per-stream. Both come from the context's own
+    /// [`reach_config`](Self::reach_config) field — captured at construction (and
+    /// overridable via [`with_reach_config`](Self::with_reach_config)) — so this
+    /// no longer reads the process-global `OnceLock`s on each call.
+    pub fn reach(&self) -> Vec<crate::stream_info::Destination> {
+        self.reach_config.reach_with_relay(self.relay_choice.clone())
     }
 }
 
@@ -439,8 +549,8 @@ pub use crate::stream_consumer::StreamVerifier;
 /// publisher.complete(&metadata).await?;
 /// ```
 pub struct StreamChannel {
-    /// Ed25519 signing key for stream authorization (wired into moq publish claims, N7).
-    #[allow(dead_code)]
+    /// Ed25519 signing key for stream authorization (wired into moq publish claims, N7)
+    /// and the per-host provenance signer (#321).
     signing_key: SigningKey,
     /// ML-DSA-65 signing key for the post-quantum half of the StreamRegister
     /// composite signature. Mirrors `LocalSigner` on the RPC plane so the
@@ -448,6 +558,13 @@ pub struct StreamChannel {
     /// deterministically from the node's persistent Ed25519 signing key (#157)
     /// in [`Self::new`]; override with [`Self::with_pq_key`].
     pq_signing_key: Option<crate::crypto::pq::MlDsaSigningKey>,
+    /// Explicit per-server reach config threaded into every `StreamContext` this
+    /// channel prepares (#384). `None` → each context snapshots
+    /// [`global_reach_config`](crate::moq_stream::global_reach_config) in
+    /// `from_dh` (the compat default). `Some` → heterogeneous per-server reach:
+    /// the channel's own iroh/QUIC/relay inputs are used for the base reach,
+    /// independent of the process globals. Set via [`Self::with_reach_config`].
+    reach_config: Option<crate::moq_stream::ProducerReachConfig>,
 }
 
 impl StreamChannel {
@@ -465,7 +582,24 @@ impl StreamChannel {
         Self {
             signing_key,
             pq_signing_key,
+            reach_config: None,
         }
+    }
+
+    /// Thread an explicit per-server reach config (#384).
+    ///
+    /// Every `StreamContext` this channel prepares is populated with `cfg` (via
+    /// [`StreamContext::with_reach_config`]) so its base iroh/QUIC reach — not
+    /// just its relay choice — comes from this server's own config rather than
+    /// the process-global `OnceLock`s. This is the threading hook that makes
+    /// heterogeneous-per-server reach fully work; a server constructs its
+    /// [`ProducerReachConfig`](crate::moq_stream::ProducerReachConfig) at its
+    /// bind site and hands it here. When unset, contexts fall back to the
+    /// per-stream [`global_reach_config`](crate::moq_stream::global_reach_config)
+    /// snapshot.
+    pub fn with_reach_config(mut self, cfg: crate::moq_stream::ProducerReachConfig) -> Self {
+        self.reach_config = Some(cfg);
+        self
     }
 
     /// Install the node's persistent ML-DSA-65 signing key, replacing the
@@ -515,8 +649,14 @@ impl StreamChannel {
         expiry_secs: i64,
         _claims: Option<Claims>,
     ) -> Result<StreamContext> {
-        // 1. DH key exchange
-        let stream_ctx = StreamContext::from_dh(client_ephemeral_pubkey)?;
+        // 1. DH key exchange. Thread this channel's explicit per-server reach
+        // config when set (#384) so the stream's base iroh/QUIC reach is the
+        // server's own, not the process global; otherwise the context keeps the
+        // per-stream `global_reach_config()` snapshot `from_dh` captured.
+        let mut stream_ctx = StreamContext::from_dh(client_ephemeral_pubkey)?;
+        if let Some(cfg) = &self.reach_config {
+            stream_ctx = stream_ctx.with_reach_config(cfg.clone());
+        }
 
         // Spawn JWT expiry timeout as universal backstop.
         let token = stream_ctx.cancel_token().clone();
@@ -545,7 +685,25 @@ impl StreamChannel {
     pub async fn publisher(&self, ctx: &StreamContext) -> Result<crate::moq_stream::AnyStreamPublisher> {
         let origin = crate::moq_stream::global_moq_origin()
             .ok_or_else(|| anyhow::anyhow!("no moq stream origin — server not initialized"))?;
-        origin.publisher(ctx)
+        // #321: on the DH (mesh) path, sign each StreamBlock with the node's per-host
+        // hybrid identity (Ed25519 + the deterministically-derived mesh ML-DSA key)
+        // so consumers can attribute blocks to this host (C-PROV / threat T3). The
+        // keyless notification path (no DH enc_key) carries no provenance.
+        let provenance = if ctx.enc_key().is_some() {
+            let signer = match &self.pq_signing_key {
+                Some(pq) => crate::stream_provenance::ProvenanceSigner::new(
+                    self.signing_key.clone(),
+                    pq.clone(),
+                ),
+                None => crate::stream_provenance::ProvenanceSigner::from_ed25519(
+                    self.signing_key.clone(),
+                ),
+            };
+            Some(signer)
+        } else {
+            None
+        };
+        origin.publisher_with_provenance(ctx, provenance)
     }
 
     /// Run a streaming operation with framework-guaranteed terminal frame.
@@ -819,6 +977,22 @@ pub fn encode_stream_block(
     epoch: u64,
     payloads: &[StreamPayloadData],
 ) -> Result<Vec<u8>> {
+    encode_stream_block_with_provenance(prev_mac, sequence_number, epoch, payloads, None)
+}
+
+/// Encode a `StreamBlock` with an optional per-host provenance signature (#321).
+///
+/// `provenance = None` produces the canonical *signed region* — byte-identical to
+/// [`encode_stream_block`] — over which the provenance signature is computed (and
+/// which the consumer reconstructs to verify). `provenance = Some((signer_kid,
+/// sig))` additionally populates the wire `StreamBlock.provenance` field.
+pub fn encode_stream_block_with_provenance(
+    prev_mac: &[u8],
+    sequence_number: u64,
+    epoch: u64,
+    payloads: &[StreamPayloadData],
+    provenance: Option<(&[u8], &[u8])>,
+) -> Result<Vec<u8>> {
     let mut msg = Builder::new_default();
     {
         let mut block = msg.init_root::<streaming_capnp::stream_block::Builder>();
@@ -827,6 +1001,15 @@ pub fn encode_stream_block(
         // epoch is 0 until the #223 key-epoch lifecycle lands.
         block.set_sequence_number(sequence_number);
         block.set_epoch(epoch);
+
+        // #321: per-host provenance. Set BEFORE the payload list so the canonical
+        // serialization is deterministic regardless of field-set order. Absent ⇒
+        // the field stays default (empty) — the signed-region encoding.
+        if let Some((signer_kid, sig)) = provenance {
+            let mut prov = block.reborrow().init_provenance();
+            prov.set_signer_kid(signer_kid);
+            prov.set_sig(sig);
+        }
 
         // Cap'n Proto uses u32 for list lengths
         let payloads_len = u32::try_from(payloads.len()).unwrap_or(u32::MAX);
@@ -878,7 +1061,7 @@ fn pubkey_to_32(pubkey: &[u8]) -> [u8; 32] {
     }
 }
 
-/// Derive the `(mac_key, topic)` pair from a client-side DH exchange.
+/// Derive the `(mac_key, enc_key, topic)` triple from a client-side DH exchange (#321).
 ///
 /// This is the consumer-side counterpart to `StreamContext::from_dh` (the server side).
 /// Call this before constructing a `MoqStreamHandle` when you have the raw keys from
@@ -887,14 +1070,15 @@ pub fn derive_client_stream_keys(
     client_secret: &DhSecret,
     client_pubkey: &[u8],
     server_pubkey: &[u8],
-) -> anyhow::Result<([u8; 32], String)> {
+) -> anyhow::Result<([u8; 32], [u8; 32], String)> {
     let server_pub = DhPublic::from_slice(server_pubkey)
         .ok_or_else(|| anyhow::anyhow!("invalid server pubkey length"))?;
     let shared = dh_compute(client_secret, &server_pub);
     let client_pub_32 = pubkey_to_32(client_pubkey);
     let server_pub_32 = pubkey_to_32(server_pubkey);
     let keys = crate::crypto::derive_stream_keys(&shared, &client_pub_32, &server_pub_32)?;
-    Ok((*keys.mac_key, keys.topic.clone()))
+    // #321: also return the AEAD enc_key so the moq consumer can open Tagged blocks.
+    Ok((*keys.mac_key, *keys.enc_key, keys.topic.clone()))
 }
 
 // `constant_time_eq` removed with the duplicate StreamVerifier (#224) — the canonical

@@ -55,6 +55,29 @@ pub enum Operation {
     Spawn,
     /// Create a resource (r)
     Create,
+    // ─────────────────────────────────────────────────────────────────────
+    // Inference-mesh (#319) — host↔host pipeline RPC abilities.
+    //
+    // These gate calls between inference hosts on the cluster mesh (e.g. the
+    // router→host activation hand-off and host→aggregator delta submission).
+    // They are split read-vs-authority so an operator can grant a *group* of
+    // hosts the read ability cheaply while keeping the authority abilities
+    // strictly per-host least-privilege (see policy_templates::mesh-host).
+    //
+    // The dot-strings are designed to map 1:1 onto a future UCAN `cmd`:
+    //   Operation::MeshInvoke   ⇄ cmd=/mesh/rpc        (umbrella invoke right)
+    //   Operation::MeshStage    ⇄ cmd=/mesh/infer/stage
+    //   Operation::MeshDelta    ⇄ cmd=/mesh/delta/submit
+    //   Operation::MeshStatus   ⇄ cmd=/mesh/query/status
+    // (resource caveats — tenant/job/layers — live in the `mesh://` path).
+    /// Umbrella mesh invoke right — `inference:peer-call` / `mesh:rpc` (authority).
+    MeshInvoke,
+    /// Submit an inference activation/stage to a peer host (authority).
+    MeshStage,
+    /// Submit a TTT delta to a peer/aggregator host (authority).
+    MeshDelta,
+    /// Read a peer host's mesh job/pipeline status (read-only).
+    MeshStatus,
 }
 
 impl Operation {
@@ -70,6 +93,12 @@ impl Operation {
             Operation::Context => 'c',
             Operation::Spawn => 'p',
             Operation::Create => 'r',
+            // Mesh ops (#319) — distinct codes; not part of the model-capability
+            // bitmask (`all()`), so these never collide in `check_all`.
+            Operation::MeshInvoke => 'e',
+            Operation::MeshStage => 'g',
+            Operation::MeshDelta => 'd',
+            Operation::MeshStatus => 'u',
         }
     }
 
@@ -97,13 +126,26 @@ impl Operation {
         match self {
             Operation::Infer   => "infer.generate",
             Operation::Train   => "ttt.train",
-            Operation::Query   => "query.status",
+            // `Query` (model status) and `MeshStatus` (mesh read ability) are
+            // the SAME wire action `query.status` by design — the mesh read
+            // right IS the canonical status read (#319). `from_dot_str` resolves
+            // the string back to `Query` (its canonical owner).
+            Operation::Query | Operation::MeshStatus => "query.status",
             Operation::Write   => "persist.save",
             Operation::Serve   => "serve.api",
             Operation::Manage  => "ttt.writeback",
             Operation::Context => "context.augment",
             Operation::Spawn   => "spawn",
             Operation::Create  => "create",
+            // Mesh (#319). `mesh.rpc` is the umbrella invoke right (alias
+            // `inference:peer-call` accepted on parse). The authority actions
+            // `infer.stage` / `delta.submit` are deliberately distinct strings
+            // from the model-namespace `infer.generate` / `persist.save` so a
+            // model grant can never satisfy a mesh-authority gate. (The read
+            // ability `MeshStatus` shares the `query.status` arm above.)
+            Operation::MeshInvoke => "mesh.rpc",
+            Operation::MeshStage  => "infer.stage",
+            Operation::MeshDelta  => "delta.submit",
         }
     }
 
@@ -124,6 +166,11 @@ impl Operation {
             "serve.api" | "serve" => Some(Self::Serve),
             "spawn" => Some(Self::Spawn),
             "create" => Some(Self::Create),
+            // Mesh (#319). `query.status` (the mesh read ability) is owned by
+            // `Query` above, so it is intentionally NOT repeated here.
+            "mesh.rpc" | "mesh:rpc" | "inference:peer-call" => Some(Self::MeshInvoke),
+            "infer.stage" => Some(Self::MeshStage),
+            "delta.submit" => Some(Self::MeshDelta),
             _ => None,
         }
     }
@@ -140,6 +187,11 @@ impl Operation {
             'c' => Some(Operation::Context),
             'p' => Some(Operation::Spawn),
             'r' => Some(Operation::Create),
+            // Mesh (#319)
+            'e' => Some(Operation::MeshInvoke),
+            'g' => Some(Operation::MeshStage),
+            'd' => Some(Operation::MeshDelta),
+            'u' => Some(Operation::MeshStatus),
             _ => None,
         }
     }
@@ -278,6 +330,34 @@ mod tests {
             assert_eq!(&parsed, op);
         }
         assert!(Operation::from_str("foo").is_err());
+    }
+
+    #[test]
+    fn test_mesh_operation_vocab() {
+        // Authority + umbrella mesh actions round-trip via their distinct strings.
+        assert_eq!(Operation::MeshInvoke.as_str(), "mesh.rpc");
+        assert_eq!(Operation::MeshStage.as_str(), "infer.stage");
+        assert_eq!(Operation::MeshDelta.as_str(), "delta.submit");
+        assert_eq!(Operation::from_dot_str("mesh.rpc"), Some(Operation::MeshInvoke));
+        assert_eq!(Operation::from_dot_str("mesh:rpc"), Some(Operation::MeshInvoke));
+        assert_eq!(Operation::from_dot_str("inference:peer-call"), Some(Operation::MeshInvoke));
+        assert_eq!(Operation::from_dot_str("infer.stage"), Some(Operation::MeshStage));
+        assert_eq!(Operation::from_dot_str("delta.submit"), Some(Operation::MeshDelta));
+        // The mesh-authority strings are DISTINCT from the model-namespace
+        // strings, so a model grant can never satisfy a mesh-authority gate.
+        assert_ne!(Operation::MeshStage.as_str(), Operation::Infer.as_str());
+        assert_ne!(Operation::MeshDelta.as_str(), Operation::Write.as_str());
+        // The mesh read ability reuses the canonical `query.status` wire action.
+        assert_eq!(Operation::MeshStatus.as_str(), "query.status");
+        assert_eq!(Operation::from_dot_str("query.status"), Some(Operation::Query));
+        // Codes are distinct from the model-capability codes.
+        for op in [Operation::MeshInvoke, Operation::MeshStage, Operation::MeshDelta, Operation::MeshStatus] {
+            assert_eq!(Operation::from_code(op.code()), Some(op));
+        }
+        // Mesh ops are NOT part of the model-capability set.
+        for op in &[Operation::MeshInvoke, Operation::MeshStage, Operation::MeshDelta, Operation::MeshStatus] {
+            assert!(!Operation::all().contains(op));
+        }
     }
 
     #[test]

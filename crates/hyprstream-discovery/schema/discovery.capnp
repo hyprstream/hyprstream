@@ -63,6 +63,22 @@ struct DiscoveryRequest {
 
     # List all known issuer URLs whose entity statements are cached (authenticated)
     listKnownIssuers @14 :Void $mcpScope(query) $mcpDescription("List issuers with cached entity statements");
+
+    # #431 — federated record lookup. Fetch an atproto record (ai.hyprstream.model)
+    # as a verifiable CARv1 proof so the caller can validate it offline. The
+    # auto-generated discovery:query gate runs first; the handler additionally
+    # access-control-checks the *target* DID/collection (an at:// CID is public/
+    # predictable, so a valid address alone must NOT grant a read).
+    getRecord @15 :GetRecordRequest $mcpScope(query) $mcpDescription("Fetch an atproto record (ai.hyprstream.model) as a verifiable CAR proof");
+
+    # #431 — fetch a full atproto repo CAR by DID (commit + MST + all records).
+    getRepo @16 :Text $mcpScope(query) $mcpDescription("Fetch a full atproto repo CAR by DID");
+
+    # #523 P0 / #524 — placement candidate query (the leaf<->federation seam).
+    # Authz-prefiltered per-candidate (fail-closed); bounded result. Selector
+    # matches labels on the durable node records; resources check
+    # (declared - allocatable). (#628 Scheduling Substrate vocabulary.)
+    queryCandidates @17 :QueryCandidatesRequest $mcpScope(query) $mcpDescription("Query placement candidates by label-selector + resource requests");
   }
 }
 
@@ -110,6 +126,13 @@ struct DiscoveryResponse {
     registerEnvelopeKeysetResult @13 :Void;
     getEnvelopeKeysetResult @14 :EnvelopeKeyset;
     listKnownIssuersResult @15 :IssuerList;
+
+    # #431 — record/repo lookup results (paired with the requests above).
+    getRecordResult @16 :RecordCar;
+    getRepoResult @17 :RecordCar;
+
+    # #523 P0 / #524 — placement candidate query result.
+    queryCandidatesResult @18 :PlacementCandidateSet;
   }
 }
 
@@ -230,4 +253,89 @@ struct ServiceAnnouncement {
   endpoint @2 :Text;
   # Service JWT attesting to the service's pubkey and identity
   serviceJwt @3 :Text $optional;
+}
+
+# #431 — federated record lookup as a verifiable CAR proof.
+
+# A record returned as a CARv1 proof: signed commit + MST path + record block.
+# The caller validates it offline via hyprstream-pds verify_record_proof. The
+# DiscoveryService is treated as an untrusted relay — integrity comes from the
+# signed proof, not from trusting the responder.
+struct RecordCar {
+  uri @0 :Text;   # at:// URI this CAR answers (caller binds the proof to its request)
+  car @1 :Data;   # CARv1 bytes: roots=[commit CID]; blocks = commit + MST path + record
+}
+
+# Resolve a single record by at:// or by (did, collection, rkey).
+struct GetRecordRequest {
+  uri @0 :Text;          # full at://<did>/<collection>/<rkey>; if set, fields below ignored
+  did @1 :Text;
+  collection @2 :Text;   # e.g. "ai.hyprstream.model"
+  rkey @3 :Text;         # the TID record key
+}
+
+# ============================================================================
+# #523 P0 / #524 — Scheduling Substrate vocabulary (#628)
+# ============================================================================
+# Shared label/resource/selector vocabulary for every scheduling surface
+# (placement queryCandidates, SandboxPool engine, CellRouter routing, backend
+# selection). One shape — candidates -> filter(predicates) -> rank -> select ->
+# explain — so capability truth is declared once and no surface duplicates
+# filter/rank/explain logic. See the Rust `scheduling` module.
+
+# A named resource amount (k8s-quantity string), e.g. {name: "nvidia.com/gpu",
+# quantity: "8"} or {name: "memory", quantity: "512Gi"}.
+struct Resource {
+  name     @0 :Text;
+  quantity @1 :Text;   # k8s-quantity
+}
+
+# A resource requirement: the candidate must have at least `minQuantity` of
+# `name` allocatable (declared - already-allocated).
+struct ResourceRequest {
+  name        @0 :Text;
+  minQuantity @1 :Text;   # k8s-quantity
+}
+
+# Label-selector match operator (k8s match-expressions).
+enum SelectorOp {
+  in           @0;
+  notIn        @1;
+  exists       @2;
+  doesNotExist @3;
+  gt           @4;
+  lt           @5;
+}
+
+# One label-selector conjunct: `key <op> values`. A query carries a list of
+# these (all must match — AND).
+struct LabelSelector {
+  key    @0 :Text;
+  op     @1 :SelectorOp;
+  values @2 :List(Text);   # for In/NotIn/Gt/Lt (empty for Exists/DoesNotExist)
+}
+
+# A placement candidate returned by queryCandidates. The caller fetches the
+# signed node record via getRecord when it needs the CAR proof.
+struct PlacementCandidate {
+  node          @0 :Text;             # serving node's DID
+  recordUri     @1 :Text;             # at-uri of the node record (for getRecord)
+  loadFraction  @2 :Float32;          # [0,1], live
+  allocatable   @3 :List(Resource);   # capacity free now (live, volatile)
+  lastSeen      @4 :Int64;            # unix millis of last heartbeat
+}
+
+# Bounded result set. `totalMatching` is the full match count before the bound
+# was applied (so callers know if truncation occurred).
+struct PlacementCandidateSet {
+  candidates   @0 :List(PlacementCandidate);
+  totalMatching @1 :UInt32;
+}
+
+# queryCandidates request: all selectors AND, all resources must be satisfiable,
+# bounded to `maxCandidates`.
+struct QueryCandidatesRequest {
+  selectors    @0 :List(LabelSelector);   # ALL must match (AND)
+  resources    @1 :List(ResourceRequest); # ALL must be satisfiable
+  maxCandidates @2 :UInt32;               # bounded set
 }

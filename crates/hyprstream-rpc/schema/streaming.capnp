@@ -165,14 +165,22 @@ enum Role {
 # Network-routable transport for a reach. A union so new transports (e.g. Iroh)
 # can be added later without a wire break. Each arm is a struct so its fields —
 # including `List(Data)` cert pins — are covered by the generated codec.
+#
+# Only network-routable reaches are encoded here. Same-host endpoints
+# (`inproc`/`ipc`/UDS) are NEVER carried on the wire: a co-located caller
+# resolves them from LOCAL config / the in-process dial registry, never from an
+# advertised reach (#320). An empty reach list therefore means "co-located fast
+# path only" — there is intentionally no Inproc arm.
 struct TransportConfig {
   union {
     # Quic / WebTransport (web-transport-quinn). Dialed over `web_transport_quinn`.
     quic @0 :QuicReach;
-    # Reserved for NAT-traversing iroh dial (#274 follow-up). Capnp requires a
-    # union to have >= 2 members; this placeholder leaves room without a wire
-    # break when the iroh reach lands.
-    iroh @1 :Void;
+    # NAT-traversing iroh dial (#320/#357, dial side wired by #282/S2). The
+    # `nodeId` IS the peer's Ed25519 identity, so this arm is identity-bound at
+    # the transport (RFC 7250), unlike QUIC's channel-only cert pin. A native
+    # peer dials by node_id over the iroh ALPN, resolving addresses via pkarr /
+    # n0 DNS discovery (the shared client endpoint's `presets::N0`).
+    iroh @1 :IrohReach;
   }
 }
 
@@ -181,6 +189,22 @@ struct QuicReach {
   addr       @0 :Text;        # "host:port" socket address to dial.
   serverName @1 :Text;        # TLS SNI / WebPKI validation name.
   certHashes @2 :List(Data);  # Acceptable leaf-cert SHA-256 pins (self-signed mesh).
+}
+
+# Dial parameters for the iroh (NAT-traversing) arm (#320/#357). The single
+# capnp encoding of an iroh reach — `dial()`/`dial_stream` consume the decoded
+# form (`EndpointType::Iroh`); the DID-doc `IrohTransport` service-entry codec
+# (`service_entry.rs`) is the JSON projection of this same shape (one source of
+# truth: ed25519 nodeId + alpn + relay).
+#
+# The `nodeId` is the producer's iroh `EndpointId` (its Ed25519 public key):
+# iroh binds the dialed connection to this identity, and pkarr / n0 DNS
+# discovery resolves the routable addresses on the shared client endpoint, so a
+# native peer can dial by node_id alone (relayUrl empty = direct/pkarr, #282).
+struct IrohReach {
+  nodeId   @0 :Data $fixedSize(32);  # iroh EndpointId (Ed25519 public key, 32 bytes) — real identity binding.
+  alpn     @1 :Text;                  # e.g. "hyprstream-rpc/1" (RPC) or "moql" (stream).
+  relayUrl @2 :Text;                  # optional iroh relay; empty = direct/pkarr (#282).
 }
 
 # Stream metadata returned when starting a stream
@@ -245,6 +269,25 @@ struct StreamBlock {
   # re-key / producer restart so (epoch, sequenceNumber) is globally unique.
   # 0 until the epoch lifecycle lands; ordinal reserved so that change is wire-safe.
   epoch @3 :UInt64;
+  # Per-host provenance signature (#321 / C-PROV / threat T3). Additive, wire-safe:
+  # the HMAC chain proves "held the DH key + in order", NOT "host-X computed this".
+  # `provenance` attaches the producing host's per-host hybrid COSE signature
+  # (EdDSA + ML-DSA-65, #328 `derive_mesh_mldsa_key`) over the canonical signed
+  # region (prevMac ‖ sequenceNumber ‖ epoch ‖ serialized payloads). The consumer
+  # verifies the signature AND that the signer is in the mesh_peers roster (fail-
+  # closed). An absent/zero-length `provenance` (default) means no in-band signer
+  # was attached (the legacy chained-HMAC-only block). Verification is a layer ON
+  # TOP of AEAD + HMAC.
+  provenance @4 :Provenance;
+}
+
+# Per-host provenance for a StreamBlock (#321). `signerKid` is the producing
+# host's key id (its Ed25519 verifying-key bytes, matching the COSE inner kid);
+# `sig` is the CBOR-encoded hybrid COSE_Sign composite over the block's canonical
+# signed region. Empty `sig` ⇒ no provenance attached.
+struct Provenance {
+  signerKid @0 :Data;
+  sig @1 :Data;
 }
 
 # =============================================================================
@@ -302,20 +345,6 @@ struct StreamError {
   message @0 :Text;
   code @1 :Text;                  # "timeout", "cancelled", "internal", etc.
   details @2 :Text;               # Optional additional context
-}
-
-# =============================================================================
-# Reconnection / Resume
-# =============================================================================
-
-# Stream resume request - for retransmission after disconnect
-#
-# Client sends the last HMAC it successfully verified. StreamService finds
-# this HMAC in its buffer and resends all subsequent chunks. This provides
-# zero-knowledge of sequence numbers - the HMAC chain is the ordering proof.
-struct StreamResume {
-  topic @0 :Text;           # Topic to resume
-  resumeFromHmac @1 :Data;  # Last verified HMAC (server resends chunks after this)
 }
 
 # =============================================================================

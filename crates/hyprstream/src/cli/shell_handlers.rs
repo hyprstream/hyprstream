@@ -237,7 +237,7 @@ pub async fn handle_shell_tui(
 
     use hyprstream_rpc::moq_stream::MoqStreamHandle;
 
-    let broadcast_path = stdout_stream.moq_broadcast_path.clone();
+    let broadcast_path = stdout_stream.broadcast_path.clone();
     anyhow::ensure!(
         !broadcast_path.is_empty(),
         "TUI service did not return a moq broadcast path — server did not initialize moq transport"
@@ -245,16 +245,23 @@ pub async fn handle_shell_tui(
 
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
 
-    // #275: dial the producer's networked reach (the TUI service's bound QUIC
+    // #356: dial the producer's networked reach (the TUI service's bound QUIC
     // `/moq` endpoint) rather than this process's OWN local moq UDS plane. The
-    // shared `MoqStreamHandle::networked` consumer prefers the StreamInfo's reach
-    // and falls back to the local UDS only when no dialable reach is present —
-    // mirroring the chat-inference consumer that this fix is modeled on. (Before
-    // the fix this bespoke loop did `connect_uds(moq_uds_path)`, which timed out
-    // because the PTY broadcast lives on the *TUI service's* plane, a different
-    // process from this viewer.)
-    let reach = stdout_stream.reach.clone();
-    let mut handle = MoqStreamHandle::networked(reach, broadcast_path, mac_key, topic);
+    // shared `MoqStreamHandle::networked` consumer prefers the StreamInfo's
+    // `announcedAt` reach and falls back to the local UDS only when no dialable
+    // reach is present — mirroring the chat-inference consumer that this fix is
+    // modeled on. (Before the fix this bespoke loop did `connect_uds(moq_uds_path)`,
+    // which timed out because the PTY broadcast lives on the *TUI service's* plane,
+    // a different process from this viewer.)
+    let reach = stdout_stream.announced_at.clone();
+    // #358: a shell stdout attach is a live pipe → direct-first (default
+    // StreamOpt = Retention::Live); selection only reorders advertised reaches.
+    let qos = hyprstream_rpc::stream_info::StreamOpt::default();
+    // #321: the TUI stdout stream is published AEAD-off (the viewer gets only
+    // `mac_key`+`topic` out of band), so the transport enc_key is never exercised
+    // here — derive a stable one from mac_key purely to satisfy the consumer API.
+    let enc_key = *hyprstream_rpc::crypto::StreamKeys::new(topic.clone(), mac_key).enc_key;
+    let mut handle = MoqStreamHandle::networked(reach, &qos, broadcast_path, mac_key, enc_key, topic);
     let _recv_handle = tokio::spawn(async move {
         loop {
             match handle.recv_next().await {
@@ -352,6 +359,31 @@ pub async fn handle_shell_tui(
         );
         let _ = ns.mount("/srv/model",
             std::sync::Arc::new(remote_model_mount),
+        );
+
+        // Mount the registry service's worktree filesystem via RPC proxy.
+        // RemoteRegistryMount is the registry analogue of RemoteModelMount:
+        // it proxies 9P operations to the registry service's
+        // `WorktreeClient` (real qids, real filesystem). 2-level scope:
+        //   /srv/registry/{repo_name}/{worktree_name}/<...rest...>
+        // Per #389 + #391 (Option 1, shared content model): the TUI namespace
+        // now mirrors the browser namespace's `/srv/registry` mount, both
+        // backed at the hyprstream spine. See `STANDARD_NAMESPACE_PATHS` in
+        // hyprstream-vfs for the convergence contract.
+        let remote_registry_mount = crate::services::remote_registry_mount::RemoteRegistryMount::new(
+            Clone::clone(&registry),
+        );
+        let registry_mount: std::sync::Arc<crate::services::remote_registry_mount::RemoteRegistryMount> =
+            std::sync::Arc::new(remote_registry_mount);
+        let _ = ns.mount("/srv/registry", registry_mount.clone());
+        // `/worktree` is an alias for `/srv/registry` — same backing mount,
+        // exposed under the short path for ergonomic worktree access. Both
+        // `/worktree/{repo}/{wt}` and `/srv/registry/{repo}/{wt}` resolve to
+        // the same worktree content.
+        let _ = ns.bind_mount(
+            "/worktree",
+            registry_mount,
+            hyprstream_vfs::BindFlag::After,
         );
 
         // /bin/ — static directory entries for listing purposes.

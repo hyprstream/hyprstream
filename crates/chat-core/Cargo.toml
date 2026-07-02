@@ -2,6 +2,7 @@
 name = "chat-core"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Chat orchestration state machine — token parsing, tool call detection, agentic loop"
 
 [lib]

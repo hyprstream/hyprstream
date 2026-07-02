@@ -13,6 +13,50 @@ log_debug() {
     fi
 }
 
+# Locate the host NVIDIA/AMD driver library directory and add it to
+# LD_LIBRARY_PATH. The driver lib (libcuda.so.1 for NVIDIA, libamdhip64.so /
+# libhsa-runtime64.so for ROCm) ships with the *host* driver and is NEVER
+# bundled in the AppImage; libtorch_cuda.so dlopens it at runtime. If it is not
+# on LD_LIBRARY_PATH (and not in the ldconfig cache), tch::Cuda::is_available()
+# returns false and inference silently falls back to CPU. (gpu-cuda-availability)
+add_host_driver_libpath() {
+    local lib="$1"        # e.g. libcuda.so.1
+    local found_dir=""
+
+    # 1) Honor an explicit operator override first.
+    if [[ -n "${HYPRSTREAM_DRIVER_LIBDIR:-}" && -d "${HYPRSTREAM_DRIVER_LIBDIR}" ]]; then
+        found_dir="${HYPRSTREAM_DRIVER_LIBDIR}"
+    # 2) Ask the dynamic linker cache where the driver lib actually is.
+    elif command -v ldconfig &>/dev/null; then
+        found_dir="$(ldconfig -p 2>/dev/null | awk -v l="$lib" '$1 ~ l {print $NF; exit}' | xargs -r dirname 2>/dev/null || true)"
+    fi
+
+    # 3) Fall back to scanning the well-known driver lib locations.
+    if [[ -z "$found_dir" ]]; then
+        local candidate
+        for candidate in \
+            /usr/lib64 \
+            /usr/lib/x86_64-linux-gnu \
+            /usr/lib \
+            /usr/lib64/nvidia \
+            /usr/lib/nvidia \
+            /usr/lib/x86_64-linux-gnu/nvidia ; do
+            if [[ -e "$candidate/$lib" ]]; then
+                found_dir="$candidate"
+                break
+            fi
+        done
+    fi
+
+    if [[ -n "$found_dir" && -d "$found_dir" ]]; then
+        export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$found_dir"
+        log_debug "Added host driver lib dir to LD_LIBRARY_PATH: $found_dir (found $lib)"
+    else
+        log_debug "WARNING: could not locate host driver lib '$lib'. GPU may be unavailable; \
+set HYPRSTREAM_DRIVER_LIBDIR to the dir containing $lib."
+    fi
+}
+
 # Detect the best available GPU backend
 detect_backend() {
     # Allow user override via environment variable
@@ -139,6 +183,11 @@ if [[ -n "$ACTIVE_BACKEND" && -n "$ACTIVE_VERSION" ]]; then
         export LIBTORCH="$(dirname "$GPU_BINARY")/libtorch"
         export LIBTORCH_BYPASS_VERSION_CHECK=1
         export HYPRSTREAM_LIBTORCH_CONFIGURED=1
+        # Bundled libtorch needs the *host* driver lib (not bundled) to reach GPU.
+        case "$ACTIVE_BACKEND" in
+            cuda*) add_host_driver_libpath "libcuda.so.1" ;;
+            rocm*) add_host_driver_libpath "libamdhip64.so" ;;
+        esac
         log_debug "Using wizard-installed backend: $ACTIVE_BACKEND ($GPU_BINARY)"
         exec "$GPU_BINARY" "$@"
     fi
@@ -161,6 +210,14 @@ fi
 export LD_LIBRARY_PATH="$APPDIR/usr/lib/$BACKEND/libtorch/lib:${LD_LIBRARY_PATH:-}"
 export LIBTORCH="$APPDIR/usr/lib/$BACKEND/libtorch"
 export LIBTORCH_BYPASS_VERSION_CHECK=1
+
+# Bundled CUDA/ROCm libtorch dlopens the host driver lib (libcuda.so.1 /
+# libamdhip64.so), which is never inside the AppImage. Make sure it resolves,
+# otherwise GPU detection fails and we silently degrade to CPU.
+case "$BACKEND" in
+    cuda*) add_host_driver_libpath "libcuda.so.1" ;;
+    rocm*) add_host_driver_libpath "libamdhip64.so" ;;
+esac
 
 # ROCm-specific environment
 if [[ "$BACKEND" == "rocm71" ]]; then

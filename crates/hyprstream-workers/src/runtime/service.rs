@@ -851,7 +851,7 @@ impl WorkerService {
             dh_public: *stream_ctx.server_pubkey(),
             qos: stream_ctx.qos().clone(),
             broadcast_path,
-            announced_at: hyprstream_rpc::moq_stream::producer_reach(),
+            announced_at: stream_ctx.reach(), // #384: per-stream reach via ctx
         };
 
         // Continuation: spawns FD streaming task AFTER REP is sent to client

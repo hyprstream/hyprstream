@@ -114,6 +114,7 @@ pub mod streaming_types {
 }
 
 pub mod capnp;
+pub mod cid;
 pub mod crypto;
 pub mod envelope;
 pub mod error;
@@ -150,6 +151,8 @@ pub mod service;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod streaming;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod stream_provenance;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod moq_stream;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod moq_authz;
@@ -161,6 +164,10 @@ pub mod transport;
 pub mod dial;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod service_entry;
+// Shared `did:key` (Ed25519) codec — compiled on all targets so the native
+// `did_web` resolver and the wasm32 `iroh_peer` identity helpers share one
+// implementation (#475). `did_web` re-exports its public fns for compatibility.
+pub mod did_key;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod did_web;
 #[cfg(not(target_arch = "wasm32"))]
@@ -180,6 +187,16 @@ pub mod socket;
 pub mod wasm_api;
 #[cfg(target_arch = "wasm32")]
 pub mod web_transport;
+// #409 Path A: browser counterpart to native `dial`. Compiles only on wasm32;
+// see `dial_wasm.rs` for why this is a separate module rather than an arm in
+// native `dial()` (which is itself `#[cfg(not(target_arch = "wasm32"))]`).
+#[cfg(target_arch = "wasm32")]
+pub mod dial_wasm;
+// Phase 2: iroh peer identity + pkarr helpers for wasm32. Adds iroh as a
+// first-class wasm32 dep — browser gets own NodeId, did:key conversion,
+// and native pkarr lookup. Full dial_iroh_reach() is Phase 3.
+#[cfg(target_arch = "wasm32")]
+pub mod iroh_peer;
 
 // ============================================================================
 // Re-exports available on ALL targets
