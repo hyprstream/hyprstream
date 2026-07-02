@@ -176,6 +176,20 @@ pub struct Claims {
     /// (mirrors [`Self::clearance`]); reconstructed `None` on the Cap'n Proto path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub act: Option<ActClaim>,
+
+    /// **Attenuated capability subset (ZSP, Fu1/#677, `TODO(#572-scope-claim)`).**
+    /// The least-authority capability the minted token actually encodes, in
+    /// `ability@resource` form. ZSP mints the *subset* that covers the request,
+    /// never the whole grant — this claim puts that subset **on the wire** so the
+    /// downstream PEP (S2) enforces the minted authority (and a refresh can only
+    /// re-grant this subset, never widen). Distinct from Casbin scopes (which are
+    /// NOT in JWTs): this is the MAC/UCAN capability the S6 exchange authorized.
+    ///
+    /// `None` ⇒ not a grant-minted token (ordinary auth token). JWT-carried only
+    /// (mirrors [`Self::clearance`]/[`Self::act`]); reconstructed `None` on the
+    /// Cap'n Proto path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap: Option<String>,
 }
 
 // Custom Debug impl — NEVER log the bearer token
@@ -192,6 +206,7 @@ impl std::fmt::Debug for Claims {
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
             .field("clearance", &self.clearance)
             .field("act", &self.act)
+            .field("cap", &self.cap)
             .finish()
     }
 }
@@ -280,6 +295,8 @@ impl FromCapnp for Claims {
             // `act` (RFC 8693 delegation) likewise rides the JWT, not this
             // envelope surface; reconstructed None here (#680/#681).
             act: None,
+            // `cap` (attenuated capability subset) is JWT-carried too (Fu1/#677).
+            cap: None,
         })
     }
 }
@@ -298,6 +315,7 @@ impl Claims {
             token: None,
             clearance: None,
             act: None,
+            cap: None,
         }
     }
 
@@ -377,6 +395,13 @@ impl Claims {
     /// signer. See [`ActClaim`].
     pub fn with_act(mut self, actor: ActClaim) -> Self {
         self.act = Some(actor);
+        self
+    }
+
+    /// Set the attenuated capability subset (`cap`, ZSP Fu1/#677) the minted
+    /// token encodes, in `ability@resource` form. See [`Self::cap`].
+    pub fn with_cap(mut self, cap: String) -> Self {
+        self.cap = Some(cap);
         self
     }
 
@@ -489,11 +514,19 @@ mod tests {
                 act: None,
             })),
         };
-        let delegated = Claims::new("alice".to_owned(), 1000, 2000).with_act(actor.clone());
+        let delegated = Claims::new("alice".to_owned(), 1000, 2000)
+            .with_act(actor.clone())
+            .with_cap("infer@mac://model/qwen-7b".to_owned());
         let json = serde_json::to_string(&delegated).unwrap();
         let back: Claims = serde_json::from_str(&json).unwrap();
         assert_eq!(back.sub, "alice", "sub stays the delegator");
         assert_eq!(back.act, Some(actor), "act round-trips including the nested hop");
+        assert_eq!(
+            back.cap.as_deref(),
+            Some("infer@mac://model/qwen-7b"),
+            "attenuated capability subset rides the token (Fu1/#677)"
+        );
+        assert!(plain.cap.is_none(), "plain token carries no cap");
         assert_eq!(
             back.act.as_ref().unwrap().act.as_ref().unwrap().sub,
             "service:gateway"
