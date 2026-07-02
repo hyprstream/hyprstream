@@ -58,6 +58,10 @@ pub mod audit;
 pub mod avc;
 pub mod compiled;
 pub mod compiler;
+// S6 (#572): runtime grant path — UCAN grant-request → access/refresh tokens.
+// Pure fail-closed core: grant validation + ceiling-subset + MAC clearance +
+// sender-binding, consuming S1/S5/the compiler rather than re-implementing.
+pub mod exchange;
 pub mod lattice;
 pub mod te;
 
@@ -91,3 +95,26 @@ pub use compiler::{
     authorize, authorize_at, check_no_escalation, compile, compile_policy, missing_permission,
     AccessRequest, CompileError, PermissionMap, PrivilegeEscalation,
 };
+
+/// Construct the [`UcanVerifier`] the HTTP grant path uses to validate a
+/// presented UCAN's signatures.
+///
+/// This is the S6↔trust-store seam: the verifier resolves each UCAN issuer's
+/// anchored ML-DSA-65 verifying key (the same `register_pq_trust` binding the
+/// rest of the TCB uses). Until that binding is wired through the OAuth state,
+/// this returns `None`, which makes the HTTP grant path deny every request
+/// (`evaluate_grant` never runs against an unverified chain — fail-closed).
+///
+/// The core `evaluate_grant` is exercised through its own tests with a real
+/// verifier, so the security-critical logic is covered independently of this
+/// wiring landing.
+///
+/// TODO(#572-verifier): wire the trust store's anchored PQ keys into a concrete
+///   `UcanVerifier` and return it from this function.
+pub fn exchange_ucan_verifier(
+    _state: &crate::services::oauth::state::OAuthState,
+) -> Option<Box<dyn hyprstream_rpc::auth::ucan::token::UcanVerifier + Send + Sync>> {
+    // Fail-closed: no verifier is wired ⇒ the HTTP grant path denies. The
+    // single authority path; no fallback.
+    None
+}

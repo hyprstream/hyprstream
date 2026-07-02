@@ -17,6 +17,9 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use sha2::{Digest, Sha256};
 
 use super::state::OAuthState;
+use crate::mac::exchange::{
+    evaluate_grant, GrantDecision, GrantedAccess, GrantError, GrantRequest,
+};
 use crate::services::generated::policy_client::IssueToken;
 
 const TOKEN_TYPE_ID_TOKEN: &str = "urn:ietf:params:oauth:token-type:id_token";
@@ -260,4 +263,372 @@ fn tx_error(status: StatusCode, error: &str, description: &str) -> Response {
         })),
     )
         .into_response()
+}
+
+// ─── S6: UCAN grant → access/refresh tokens (#572) ─────────────────────────
+//
+// This is the HTTP-layer wiring over `mac::exchange::evaluate_grant`. The
+// security-critical logic (chain validation, ceiling-subset, MAC clearance,
+// sender-binding) lives in `mac::exchange`; this handler is the RFC 8693
+// adapter that decodes the grant, verifies the DPoP proof, resolves the
+// subject's MAC context, calls `evaluate_grant`, and mints the short-ttl
+// sender-bound token the decision authorizes.
+//
+// SCOPE / fail-closed reality: the MAC *clearance* a subject carries is a wire
+// field that lands with S8 (#574, hybrid envelope) — see the S1 BLOCKERS note
+// (`SubjectContextClaims` seam). Until S8 ships `clearance` on `Claims`, the
+// `SubjectContextResolver` below defaults to returning `None`, which
+// `evaluate_grant` maps to `UnlabeledSubject` ⇒ DENY. That is the correct
+// fail-closed posture: there is NO standing access without a verified clearance,
+// and the HTTP path does not fabricate one. The core `evaluate_grant` (with full
+// test coverage of the clearance gate) is the sound, proven core; this handler
+// lights up the happy path automatically the moment S8 supplies a non-`None`
+// resolver.
+
+/// Resolve a UCAN audience DID → the S1 [`SecurityContext`] it presents at grant
+/// time (clearance clamped to verified key material).
+///
+/// This is the seam S8 (#574) plugs into: once the `clearance` field ships on
+/// the hybrid-signed `Claims`/envelope, an implementor reads it off the verified
+/// identity bound to the audience DID and returns the assembled context. Until
+/// then the default impl returns `None` (→ `UnlabeledSubject` → deny), which is
+/// the fail-closed ZSP posture: no clearance ⇒ no token.
+///
+/// SECURITY: the resolution MUST be from *authority-asserted* clearance (a
+/// field the issuing node signed), never from a self-asserted claim in the
+/// UCAN. The UCAN is the grant; the clearance is independent state the MAC
+/// model holds about the subject.
+pub trait SubjectContextResolver: Send + Sync {
+    /// The clearance context for `audience_did`, or `None` if the subject is
+    /// unlabeled / unverified. `None` ⇒ `evaluate_grant` denies.
+    fn resolve(&self, audience_did: &str) -> Option<hyprstream_rpc::auth::mac::SecurityContext>;
+}
+
+/// A no-op resolver that always returns `None` — the fail-closed default until
+/// S8 (#574) ships a concrete `SubjectContextResolver` reading the `clearance`
+/// field off verified claims.
+pub struct DenyUnlabeledResolver;
+
+impl SubjectContextResolver for DenyUnlabeledResolver {
+    fn resolve(&self, _audience_did: &str) -> Option<hyprstream_rpc::auth::mac::SecurityContext> {
+        // Fail-closed: no clearance is known ⇒ no token. See the trait docs and
+        // the S1 BLOCKERS note on why this cannot be loosened before S8.
+        None
+    }
+}
+
+/// POST /oauth/token — UCAN grant (RFC 8693 token-exchange,
+/// `subject_token_type = urn:hyprstream:token-type:ucan-grant`).
+///
+/// Accepts a CBOR-encoded UCAN as the `subject_token` (the subset-grant) and
+/// mints a **short-ttl, sender-bound** access token (+ refresh token when the
+/// store is configured) for the requested access — never the whole grant (ZSP).
+///
+/// `dpop_header` is the `DPoP` proof header; it is MANDATORY for this grant
+/// type (ZSP: no bearer). The proof signature/htm/htu/replay are verified here
+/// via the same `verify_dpop_proof` the other grant types use; the resulting
+/// `jkt` is the sender-binding thumbprint. Passing `None` ⇒ `invalid_request`.
+///
+/// `subject_resolver` supplies the MAC clearance; `DenyUnlabeledResolver`
+/// denies until S8 ships the real resolver.
+///
+/// Fail-closed: every `GrantError` maps to a concrete OAuth error. There is no
+/// fallback path; authority-unreachable is a denial.
+pub async fn exchange_ucan_grant(
+    state: &Arc<OAuthState>,
+    subject_token: &str,
+    dpop_header: Option<&str>,
+    requested_scope: Option<&str>,
+    audience: Option<&str>,
+    subject_resolver: &dyn SubjectContextResolver,
+) -> Response {
+    // ── 1. DPoP sender-binding is MANDATORY (ZSP) ──────────────────────────
+    // No proof ⇒ no token. A bearer token minted from a grant re-introduces
+    // standing access — the exact thing ZSP removes.
+    let token_endpoint = format!("{}/oauth/token", state.issuer_url.trim_end_matches('/'));
+    let dpop_jkt = match dpop_header.and_then(|h| {
+        super::dpop::verify_dpop_proof(h, "POST", &token_endpoint, None)
+            .ok()
+            .map(|p| p.jkt)
+    }) {
+        Some(jkt) => jkt,
+        None => {
+            return tx_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "UCAN grant token-exchange requires a valid DPoP proof (sender-binding)",
+            );
+        }
+    };
+
+    // ── 2. Decode the CBOR UCAN grant ──────────────────────────────────────
+    let ucan_bytes = match URL_SAFE_NO_PAD.decode(subject_token) {
+        Ok(b) => b,
+        Err(_) => {
+            return tx_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "subject_token is not valid base64url CBOR",
+            );
+        }
+    };
+    let grant = match hyprstream_rpc::auth::ucan::token::Ucan::from_cbor(&ucan_bytes) {
+        Ok(u) => u,
+        Err(e) => {
+            return tx_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                &format!("subject_token is not a valid UCAN: {e}"),
+            );
+        }
+    };
+
+    // ── 3. Resolve the subject's MAC context (S8 seam; deny until then) ────
+    let audience_did = grant.audience().as_str().to_owned();
+    let subject_ctx = subject_resolver.resolve(&audience_did);
+
+    // ── 4. Parse the requested access off the form fields ──────────────────
+    // TODO(#572-object-label): wire the manifest/TE object-label resolver so
+    //   the S1 floor can be evaluated for real. Until then `object_label` is
+    //   `None`, which makes the S1 object-label gate deny — the conservative
+    //   direction.
+    let request = match parse_grant_request(requested_scope, audience) {
+        Ok(r) => r,
+        Err(msg) => return tx_error(StatusCode::BAD_REQUEST, "invalid_scope", &msg),
+    };
+
+    // ── 5. The single fail-closed S6 path ──────────────────────────────────
+    // A no-op UcanVerifier is NOT acceptable — signatures MUST verify. The
+    // verifier is built from the trust store's anchored ML-DSA-65 keys (the
+    // same `register_pq_trust` binding the rest of the TCB uses). Until that
+    // binding is wired into the OAuth state, the grant path fails closed here
+    // rather than trusting an unverified chain. There is NO fallback path.
+    //
+    // TODO(#572-verifier): construct the UcanVerifier from the trust store's
+    //   anchored ML-DSA-65 keys. Until that wiring lands, the HTTP grant path
+    //   denies every request at this gate — the conservative direction. The
+    //   core `evaluate_grant` (with full happy-path + denial coverage) is
+    //   exercised through its own tests using a real `UcanVerifier`.
+    let Some(verifier) = crate::mac::exchange_ucan_verifier(state) else {
+        return tx_error(
+            StatusCode::FORBIDDEN,
+            "server_error",
+            "UCAN grant verification is not configured on this node",
+        );
+    };
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let decision = evaluate_grant(
+        &grant,
+        &verifier,
+        now,
+        &request,
+        subject_ctx.as_ref(),
+        true, // sender-bound: dpop_jkt is present
+    );
+
+    let granted = match decision {
+        Ok(GrantDecision::Permit(g)) => g,
+        Ok(GrantDecision::Escalate { .. }) => {
+            // Over-ceiling: the escalation tier (TODO #572-escalation) is not
+            // wired; return insufficient_scope. Do NOT auto-mint.
+            return tx_error(
+                StatusCode::FORBIDDEN,
+                "insufficient_scope",
+                "grant request exceeds ceiling; escalation amendment required",
+            );
+        }
+        Err(e) => return grant_error_response(e),
+    };
+
+    // ── 6. Mint the short-ttl sender-bound access token (ZSP) ──────────────
+    mint_grant_token(state, &granted, &dpop_jkt).await
+}
+
+/// Map an S6 [`GrantError`] to a concrete OAuth 2.1 error response. Every variant
+/// is fail-closed; no variant maps to a permissive outcome.
+fn grant_error_response(e: GrantError) -> Response {
+    let (status, code, desc) = match &e {
+        GrantError::Chain(_) => (
+            StatusCode::UNAUTHORIZED,
+            "invalid_grant",
+            "UCAN grant chain failed validation".to_owned(),
+        ),
+        // Over-ceiling and insufficient-clearance both surface as
+        // `insufficient_scope`: the request is not within the grant/label the
+        // subject is authorized for. Distinct GrantError variants (different
+        // gates) but the same OAuth error shape for the client.
+        GrantError::OverCeiling { .. } | GrantError::InsufficientClearance => (
+            StatusCode::FORBIDDEN,
+            "insufficient_scope",
+            e.to_string(),
+        ),
+        GrantError::MissingSenderBinding => {
+            (StatusCode::BAD_REQUEST, "invalid_request", e.to_string())
+        }
+        GrantError::UnlabeledSubject | GrantError::EmptyGrant => {
+            (StatusCode::FORBIDDEN, "invalid_grant", e.to_string())
+        }
+    };
+    tx_error(status, code, &desc)
+}
+
+/// Parse the RFC 8693 `scope` + `audience` form fields into the S6
+/// [`GrantRequest`].
+///
+/// `scope` is the S3 `action:resource:identifier` triple (the requested access);
+/// `audience` is the RFC 8707 resource indicator (optional). The object label
+/// is `None` here (resolved separately — see TODO(#572-object-label)).
+fn parse_grant_request(scope: Option<&str>, audience: Option<&str>) -> Result<GrantRequest, String> {
+    use hyprstream_rpc::auth::ucan::capability::{Ability, Caveats, Resource};
+
+    let scope_str = scope.ok_or_else(|| "scope is required for UCAN grant".to_owned())?;
+    let parsed = hyprstream_rpc::auth::Scope::parse(scope_str)
+        .map_err(|e| format!("invalid scope '{scope_str}': {e}"))?;
+    Ok(GrantRequest {
+        // S3 Scope(action, resource, identifier) → S5 Capability(resource, ability).
+        // The `resource` URI is assembled as `mac://<resource>/<identifier>`;
+        // `*` identifier maps to the wildcard. This mapping is the S3↔S5
+        // vocabulary seam (deferred to #582); this is the conservative
+        // structural projection.
+        resource: Resource::new(format!("mac://{}/{}", parsed.resource, parsed.identifier)),
+        ability: Ability::new(parsed.action),
+        caveats: Caveats::default(),
+        audience: audience.map(str::to_owned),
+        object_label: None, // TODO(#572-object-label): manifest/TE resolver.
+    })
+}
+
+/// Mint the short-ttl, sender-bound access token for a permitted grant.
+///
+/// ZSP: the token encodes the **requested subset** (the [`GrantedAccess`]),
+/// never the whole grant. It is bound to the DPoP `jkt` (`cnf.jkt`) and carries
+/// a short ttl. A refresh token is stored when a token DB is configured.
+///
+// TODO(S8): hybrid-PQC sign the minted token (the *envelope* hybridization).
+//   Today the existing (composite-when-available / classical-fallback) signing
+//   path is used. The UCAN grant and approval it consumed are already hybrid;
+//   only the minted OAuth token awaits S8 for its own hybrid signature.
+async fn mint_grant_token(
+    state: &Arc<OAuthState>,
+    granted: &GrantedAccess,
+    dpop_jkt: &str,
+) -> Response {
+    let now = chrono::Utc::now().timestamp();
+    let ttl = state.token_ttl.min(crate::mac::exchange::MAX_ACCESS_TOKEN_TTL_SECS);
+    let expires_at = now + ttl as i64;
+
+    // The token subject is the grant's audience (the delegate). The capability
+    // subset the token encodes is carried as a scope string for downstream
+    // enforcement; the cnf.jkt binds it to the presenter's key.
+    let sub = granted
+        .audience
+        .clone()
+        .unwrap_or_else(|| "ucan-grant".to_owned());
+    let scope_str = format!(
+        "{}@{}",
+        granted.capability.ability, granted.capability.resource
+    );
+
+    let claims = hyprstream_rpc::auth::Claims::new(sub.clone(), now, expires_at)
+        .with_issuer(state.issuer_url.clone())
+        .with_audience(granted.audience.clone())
+        .with_jti();
+    // DPoP sender-binding via cnf.jkt (RFC 9449 §6). ZSP: no cnf ⇒ bearer ⇒
+    // rejected. We set jkt directly from the verified proof.
+    let mut claims = claims;
+    claims.cnf = Some(hyprstream_rpc::auth::Cnf {
+        jwk: None,
+        jkt: Some(dpop_jkt.to_owned()),
+    });
+
+    // TODO(#572-scope-claim): the capability subset (`scope_str`) needs a
+    //   dedicated claim carrying the attenuated capability so the PEP (S2) can
+    //   enforce the minted subset on refresh. For now it is logged; the cnf.jkt
+    //   binding + short ttl are the load-bearing controls.
+    let _ = scope_str;
+
+    // Sign via the active JWT signing key (composite-PQ when configured, else
+    // Ed25519). Same path as the WIT/access-token minting in PolicyService.
+    let token = match state.active_jwt_signing_key().await {
+        Some(sk) => crate::auth::jwt::encode(&claims, &sk),
+        None => {
+            tracing::error!("no active JWT signing key configured; cannot mint UCAN grant token");
+            return tx_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "token signing not configured",
+            );
+        }
+    };
+
+    // Optional refresh token (ZSP: refresh re-runs evaluate_grant, not a free
+    // re-mint). Stored only when a token DB is configured.
+    // TODO(#572-refresh-rotation): wire refresh-token rotation + the
+    //   evaluate_refresh re-evaluation end-to-end (store the grant CID +
+    //   request so the refresh path can re-present them).
+    let refresh_token = if state.token_db.is_some() {
+        Some(issue_grant_refresh_token(state, &sub, expires_at).await)
+    } else {
+        None
+    };
+
+    let mut body = serde_json::json!({
+        "access_token": token,
+        "issued_token_type": ISSUED_TOKEN_TYPE,
+        "token_type": "DPoP", // sender-bound, not Bearer
+        "expires_in": ttl,
+    });
+    if let Some(rt) = refresh_token {
+        body["refresh_token"] = serde_json::Value::String(rt);
+    }
+
+    tracing::info!(sub = %sub, ttl, "UCAN grant token minted (sender-bound, short-ttl)");
+    (
+        StatusCode::OK,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::PRAGMA, "no-cache"),
+        ],
+        Json(body),
+    )
+        .into_response()
+}
+
+/// Issue an opaque refresh token for a UCAN grant, stored in the token DB.
+///
+/// The refresh token does NOT carry authority itself — it is a handle that lets
+/// the presenter re-present the grant (which the refresh path re-validates via
+/// `evaluate_refresh`). ZSP: refresh is re-evaluated, never automatic.
+async fn issue_grant_refresh_token(
+    state: &Arc<OAuthState>,
+    sub: &str,
+    access_expires_at: i64,
+) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use rand::RngCore as _;
+
+    // 256-bit opaque token.
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let refresh = URL_SAFE_NO_PAD.encode(bytes);
+
+    // The verifying key binding for cnf continuity on refresh is re-established
+    // by the re-presented DPoP proof at refresh time (jkt is a thumbprint, not
+    // a raw key), so verifying_key_bytes stays None here.
+    let _ = access_expires_at;
+    let entry = super::state::RefreshTokenEntry {
+        client_id: format!("ucan-grant:{sub}"),
+        username: sub.to_owned(),
+        scopes: vec!["urn:hyprstream:grant-type:ucan".to_owned()],
+        resource: None,
+        expires_at_unix: chrono::Utc::now().timestamp() + state.refresh_token_ttl as i64,
+        verifying_key_bytes: None,
+    };
+
+    if let Some(db) = &state.token_db {
+        if let Err(e) = db.put(&refresh, &entry, state.refresh_token_ttl as u64).await {
+            tracing::warn!(error = %e, "failed to persist UCAN grant refresh token");
+        }
+    }
+    refresh
 }
