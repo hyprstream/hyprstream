@@ -49,8 +49,7 @@ pub(crate) mod rafs_builder;
 mod image_fs;
 // The image-store trait + inventory registration seam — ALWAYS compiled
 // (feature-invariant). Concrete backends (RafsStore under `oci-image`) impl
-// `ImageStore` and `inventory::submit!` an `ImageBackendRegistration`. This
-// dissolves the cfg-mirror that used to live in `WorkerService` (#646).
+// `ImageStore` and `inventory::submit!` an `ImageBackendRegistration`.
 pub mod store_trait;
 #[cfg(feature = "oci-image")]
 mod store;

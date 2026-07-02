@@ -68,8 +68,7 @@ zbus = { version = "4", features = ["tokio"], optional = true }
 # Nydus libraries (Dragonfly-native blob fetching) — gated behind `oci-image`.
 # These power the universal mountable OCI/RAFS image filesystem service
 # (`ImageFs` = OverlayFs-over-in-process-RAFS, an `FsMount`). Any backend that
-# composes an image filesystem (kata virtio-fs today; podman/nspawn/wasm are
-# follow-ons, see #633) needs these; the lightweight host-root backends do not.
+# composes an image filesystem needs these; the host-root backends do not.
 #
 # Crates.io availability (verified 2026-06-26 against dragonflyoss/nydus v2.4.0):
 #   nydus-api     0.4.1  — ON crates.io, but mixed with git siblings causes type
@@ -135,8 +134,7 @@ default = []
 # (an `FsMount` = OverlayFs over an in-process RAFS lower + per-sandbox writable
 # upper) — independent of any VM toolchain. "Root" is a mount position, not a
 # type: an `ImageFs` mounted at `/` is the root purely because the namespace
-# recipe mounted it there. Any backend can compose this; kata does so today via
-# virtio-fs, podman/nspawn/wasm rewiring is a follow-on (TODO, #633).
+# recipe mounted it there. Any backend can compose this (#632).
 oci-image = [
     "dep:nydus-api",
     "dep:nydus-storage",
@@ -146,10 +144,8 @@ oci-image = [
     "dep:nydus-service",
     "dep:fuse-backend-rs",
     # FS-A vhost-user-fs server: the transport that serves the composed VFS
-    # namespace (image Mount + injected mounts) to a guest. This is how the
-    # universal image filesystem service reaches any guest — it is NOT
-    # VM-specific, so it lives on `oci-image`, not `kata-vm`. Kata's virtio-fs
-    # path consumes it today; podman/nspawn/wasm follow (#633 TODO).
+    # namespace (image Mount + injected mounts) to a guest. NOT VM-specific, so
+    # it lives on `oci-image`, not `kata-vm`.
     "dep:hyprstream-vfs-server",
 ]
 # Kata/Cloud-Hypervisor VM backend. Implies `oci-image` (kata composes the

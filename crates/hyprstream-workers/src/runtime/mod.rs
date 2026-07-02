@@ -34,12 +34,10 @@ mod sandbox;
 // sibling under the SandboxBackend seam; the default build stays lean + torch-free.
 #[cfg(feature = "wasm")]
 pub mod wasm_backend;
-// Per-sandbox VFS composition + serve (FS-D, #365): native-only + image-service
-// (composes the image Mount + injected mounts into a Namespace and serves it
-// over vhost-user-fs). This is the universal path — it needs the image
-// filesystem service (`oci-image`) but NOT the VM toolchain; any backend that
-// wants to hand a guest a composed 9P/VFS namespace consumes it. Kata's
-// virtio-fs path does so today (`kata-vm`), podman/nspawn/wasm follow (#633).
+// Per-sandbox VFS composition + serve (FS-D, #365): composes the image Mount +
+// injected mounts into a Namespace and serves it over vhost-user-fs. Needs the
+// image filesystem service (`oci-image`) but NOT the VM toolchain, so any
+// backend that hands a guest a composed 9P/VFS namespace consumes it (#632).
 #[cfg(all(not(target_arch = "wasm32"), feature = "oci-image"))]
 pub mod sandbox_fs;
 // Canonical backend taxonomy + fail-closed selection (Phase 0 of #508, #507).
@@ -102,9 +100,6 @@ pub use sandbox_fs::{InjectedMounts, SandboxFs, SandboxFsServer, VFS_SOCKET_NAME
 pub use service::WorkerService;
 // Re-export service infrastructure from hyprstream-rpc for convenience
 pub use hyprstream_rpc::service::{EnvelopeContext, ServiceHandle, RequestService};
-// NOTE: the legacy `SandboxVirtiofs` (external-`nydusd` RAFS share) module was
-// removed (#633) — kata's `start()` now serves the composed VFS namespace via
-// `sandbox_fs`/`hyprstream-vfs-server`, not a standalone RAFS share.
 
 /// CRI runtime version
 pub const RUNTIME_VERSION: &str = "0.1.0";

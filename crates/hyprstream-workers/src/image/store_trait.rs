@@ -5,13 +5,10 @@
 //! future plain-OCI / stargz / squashfs backends). It mirrors the five CRI image
 //! ops the handler dispatches to.
 //!
-//! **Why a trait object, not a `#[cfg]`-gated field:** the previous design gated
-//! `rafs_store` on `oci-image` everywhere, producing a viral cfg/cfg(not) mirror
-//! across `WorkerService` (one gated body + one stub per handler method). With a
-//! trait object, `WorkerService` holds `Option<Arc<dyn ImageStore>>` — always
-//! compiled, feature-invariant — and the handler dispatches through it with a
-//! single fallback error path. The only `#[cfg(feature)]` left is on the
-//! concrete `RafsStore` impl + its `inventory::submit!`, which live in
+//! A trait object keeps `WorkerService` feature-invariant: it holds
+//! `Option<Arc<dyn ImageStore>>` (always compiled) and the handler dispatches
+//! through it with a single fallback error path. The only `#[cfg(feature)]` is
+//! on the concrete `RafsStore` impl + its `inventory::submit!`, which live in
 //! `image/store.rs` next to the nydus deps they pull.
 //!
 //! **Pluggability:** a new image backend is a new `impl ImageStore` + one

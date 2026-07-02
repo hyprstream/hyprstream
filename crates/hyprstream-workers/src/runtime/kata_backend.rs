@@ -38,14 +38,12 @@ pub struct KataHandle {
     /// Path to the VM API socket.
     pub api_socket: PathBuf,
     /// Path to the virtio-fs socket the guest mounts. Served by the composed
-    /// VFS namespace (`vfs_server`), not a standalone RAFS share — the legacy
-    /// external-`nydusd` `SandboxVirtiofs` path was removed (#633).
+    /// VFS namespace (`vfs_server`).
     pub virtiofs_socket: Option<PathBuf>,
     /// Per-sandbox composed VFS server (FS-D, #365). When set, the guest's
     /// filesystem is the hyprstream VFS (rootfs + injected mounts) served by
-    /// `hyprstream-vfs-server` rather than the external `nydusd` RAFS share.
-    /// Held for the VM's lifetime so the serving thread + injected registries
-    /// outlive the guest; dropped on sandbox teardown.
+    /// `hyprstream-vfs-server`. Held for the VM's lifetime so the serving thread
+    /// + injected registries outlive the guest; dropped on sandbox teardown.
     pub vfs_server: Option<SandboxFsServer>,
 }
 
