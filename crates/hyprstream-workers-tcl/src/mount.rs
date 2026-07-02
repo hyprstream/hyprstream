@@ -1,10 +1,10 @@
-//! `/lang/tcl/` VFS mount — exposes Tcl interpreter state as files.
+//! `/lang/tcl/` VFS mount — a **self-contained, stateful 9P file service**.
 //!
-//! The molt `Interp` is `!Send` (uses `Rc`), so the mount cannot hold it directly.
-//! Instead, `TclMount` holds a `SyncSender<TclCommand>` channel. Mount methods
-//! send commands through the channel and block on a oneshot for the response.
-//! The interpreter loop runs on the owning thread (ChatApp), which polls the
-//! receiver in its `tick()` method.
+//! [`TclMount::spawn`] owns its `!Send` molt interpreter + a dedicated driver
+//! thread internally; callers mount it and never touch its channels or state.
+//! The namespace is the only interface — a `/lang/tcl/eval` write is served by
+//! the mount's own driver. There is no external `rx` to drain, so adding a Tcl
+//! shell requires no edits to the dispatch/RPC/UI layer (epic #508, issue #634).
 //!
 //! Layout:
 //! - `/lang/tcl/eval`   — ctl file: write a Tcl script, read the result
@@ -16,9 +16,13 @@
 //! read state machine — see `hyprstream_vfs::devfile` for the shared
 //! implementation (#609).
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use hyprstream_vfs::devfile::{ControlFile, DevFileState, DevFuture, DynamicDir};
-use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat, Subject};
+use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Namespace, Stat, Subject};
+
+use crate::TclShell;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TclCommand — messages sent from mount threads to the interpreter owner
@@ -94,20 +98,75 @@ type ProcsDir = DynamicDir<ListFn, GetFn>;
 // TclMount
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// VFS mount that proxies requests to a `!Send` Tcl interpreter via channels.
+/// VFS mount that proxies `/lang/tcl` requests to a `!Send` Tcl interpreter
+/// owned by the mount itself.
 ///
-/// Mount at `/lang/tcl` in the namespace. The interpreter owner must poll the
-/// `Receiver<TclCommand>` returned by [`create_mount_channel`] in its event
-/// loop (e.g., `ChatApp::tick()`).
+/// Construct with [`TclMount::spawn`], which spins up a dedicated driver thread
+/// hosting the [`TclShell`] and drains the internal command channel. The driver
+/// exits cleanly when the mount is dropped (all command-channel senders live
+/// inside the mount, so the driver's `rx.recv()` returns `None` once they drop).
+/// Callers never hold the interpreter, the channel sender, or the receiver —
+/// the namespace is the only interface.
 pub struct TclMount {
     eval: EvalCtl,
     vars: VarsDir,
     procs: ProcsDir,
+    /// Sender clone kept for the mount's lifetime. Declared LAST so it drops
+    /// after the devfile closures (`eval`/`vars`/`procs`), each of which also
+    /// holds a clone. When `TclMount` is dropped, every clone drops with it and
+    /// the driver's `rx.recv()` returns `None`, exiting the driver thread. The
+    /// field is `_`-prefixed because the struct never sends on it directly; it
+    /// exists to keep one clone alive for the lifetime of the mount.
+    _driver_tx: tokio::sync::mpsc::Sender<TclCommand>,
 }
 
 impl TclMount {
-    /// Create a new `TclMount` from the sending half of a mount channel.
-    pub fn new(tx: tokio::sync::mpsc::Sender<TclCommand>) -> Self {
+    /// Spawn a self-contained `TclMount` whose driver thread owns a fresh
+    /// [`TclShell`] bound to `ns` under `subject`.
+    ///
+    /// The driver runs a `current_thread` tokio runtime + `LocalSet` (the molt
+    /// interpreter is `!Send` and its `eval` is async). Mount methods forward
+    /// each request over an internal channel and await the reply; the driver
+    /// pumps the [`TclShell`] between requests.
+    ///
+    /// `ns` is the namespace this mount will be mounted into — it lets
+    /// `/lang/tcl/eval` reuse the same `/bin/{cmd}` fallback resolution as an
+    /// inline `TclShell` (e.g. `cat /config/foo`).
+    #[allow(clippy::expect_used)] // Thread/runtime creation failure is unrecoverable
+    pub fn spawn(subject: Subject, ns: Arc<Namespace>) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel::<TclCommand>(16);
+
+        std::thread::Builder::new()
+            .name("tcl-mount-driver".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tcl-mount-driver runtime");
+                let local = tokio::task::LocalSet::new();
+                local.block_on(&rt, async move {
+                    let mut shell = TclShell::new(subject, ns);
+                    let mut rx = rx;
+                    while let Some(cmd) = rx.recv().await {
+                        shell.process_command(cmd).await;
+                    }
+                });
+            })
+            .expect("spawn tcl-mount-driver");
+
+        Self::build(tx)
+    }
+
+    /// Build a `TclMount` over an existing command-channel sender.
+    ///
+    /// Internal helper used by [`spawn`]; also used directly by tests that
+    /// drive the interpreter via a fake task instead of a real `TclShell`.
+    #[cfg(test)]
+    fn new(tx: tokio::sync::mpsc::Sender<TclCommand>) -> Self {
+        Self::build(tx)
+    }
+
+    fn build(tx: tokio::sync::mpsc::Sender<TclCommand>) -> Self {
         let eval_tx = tx.clone();
         let eval_handler = move |data: Vec<u8>| -> DevFuture<'static, Result<Vec<u8>, MountError>> {
             let tx = eval_tx.clone();
@@ -140,7 +199,7 @@ impl TclMount {
         );
 
         let procs_tx = tx.clone();
-        let procs_get_tx = tx;
+        let procs_get_tx = tx.clone();
         let procs = DynamicDir::new(
             Box::new(move || {
                 let tx = procs_tx.clone();
@@ -156,7 +215,12 @@ impl TclMount {
             }) as GetFn,
         );
 
-        Self { eval, vars, procs }
+        Self {
+            eval,
+            vars,
+            procs,
+            _driver_tx: tx,
+        }
     }
 }
 
@@ -296,20 +360,22 @@ impl Mount for TclMount {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Channel constructor
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Create a bounded channel pair for the Tcl mount.
-///
-/// Returns `(sender, receiver)`. Pass the sender to [`TclMount::new`] and
-/// poll the receiver from the thread owning the `TclShell`.
-pub fn create_mount_channel() -> (tokio::sync::mpsc::Sender<TclCommand>, tokio::sync::mpsc::Receiver<TclCommand>) {
-    tokio::sync::mpsc::channel(16)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
+//
+// The command channel is internal to [`TclMount`] (constructed inside
+// [`TclMount::spawn`]). These tests drive the devfile wiring directly by
+// building a `TclMount` from an injected sender and routing the receiver to a
+// fake interpreter task, so the mount's request/reply plumbing can be
+// exercised without a real `TclShell`.
+
+#[cfg(test)]
+fn create_mount_channel() -> (
+    tokio::sync::mpsc::Sender<TclCommand>,
+    tokio::sync::mpsc::Receiver<TclCommand>,
+) {
+    tokio::sync::mpsc::channel(16)
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
