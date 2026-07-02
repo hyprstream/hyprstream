@@ -312,7 +312,7 @@ mod tests {
 
         // 2. Write a brand-new file -> lands in the writable upper.
         let new_path = ["etc", "greeting"];
-        mount.create(&new_path, 0o644, &subj).await.unwrap();
+        FsMount::create(&mount, &new_path, 0o644, &subj).await.unwrap();
         let mut fid = mount.walk(&new_path, &subj).await.unwrap();
         mount.open(&mut fid, ORDWR, &subj).await.unwrap();
         let n = mount.write(&fid, 0, b"hello\n", &subj).await.unwrap();
