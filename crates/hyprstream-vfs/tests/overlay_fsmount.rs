@@ -133,7 +133,7 @@ async fn create_new_file_in_upper() {
     let h = harness(&[]);
     let caller = subject();
 
-    h.overlay.create(&["fresh.txt"], 0o644, &caller).await.unwrap();
+    FsMount::create(&h.overlay, &["fresh.txt"], 0o644, &caller).await.unwrap();
 
     // Re-open for write and put content in.
     let mut fid = h.overlay.walk(&["fresh.txt"], &caller).await.unwrap();
@@ -145,7 +145,7 @@ async fn create_new_file_in_upper() {
     assert_eq!(data, b"brand new\n");
 
     // create on an existing name fails closed.
-    let err = h.overlay.create(&["fresh.txt"], 0o644, &caller).await.unwrap_err();
+    let err = FsMount::create(&h.overlay, &["fresh.txt"], 0o644, &caller).await.unwrap_err();
     assert!(matches!(err, MountError::AlreadyExists(_)), "got {err:?}");
 }
 
@@ -155,7 +155,7 @@ async fn mkdir_and_readdir() {
     let caller = subject();
 
     h.overlay.mkdir(&["sub"], 0o755, &caller).await.unwrap();
-    h.overlay.create(&["sub", "nested.txt"], 0o644, &caller).await.unwrap();
+    FsMount::create(&h.overlay, &["sub", "nested.txt"], 0o644, &caller).await.unwrap();
 
     // readdir of root: lower files + new dir all merged by OverlayFs.
     let mut fid = h.overlay.walk(&[], &caller).await.unwrap();

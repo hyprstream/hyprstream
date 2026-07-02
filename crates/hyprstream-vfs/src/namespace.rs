@@ -671,7 +671,7 @@ impl Namespace {
             // `format!("{}/", "/")` would be "//", which `starts_with` never
             // matches — so a `/`-rooted rootfs (FS-D) would otherwise be unreachable.
             if entry.prefix == "/" {
-                return Ok((&entry.targets, path));
+                return Ok((entry, path));
             }
             if path == entry.prefix || path.starts_with(&format!("{}/", entry.prefix)) {
                 let remainder = path[entry.prefix.len()..].to_owned();

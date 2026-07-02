@@ -189,6 +189,8 @@ where
         let is_dir = attr.st_mode & libc::S_IFMT == libc::S_IFDIR;
         Stat {
             qtype: if is_dir { 0x80 } else { 0 },
+            version: 0,
+            path: attr.st_ino,
             size: attr.st_size as u64,
             name: name.to_owned(),
             mtime: attr.st_mtime as u64,

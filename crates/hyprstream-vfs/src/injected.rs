@@ -183,6 +183,8 @@ impl Mount for SyntheticMount {
                 };
                 Ok(Stat {
                     qtype,
+                    version: 0,
+                    path: 0,
                     size,
                     name: st.components.last().cloned().unwrap_or_default(),
                     mtime: 0,
@@ -444,7 +446,7 @@ impl Mount for StreamMount {
             StreamFidState::Info { .. } => (0, "info".to_string()),
             StreamFidState::Ctl { .. } => (0, "ctl".to_string()),
         };
-        Ok(Stat { qtype, size: 0, name, mtime: 0 })
+        Ok(Stat { qtype, version: 0, path: 0, size: 0, name, mtime: 0 })
     }
 
     async fn clunk(&self, _fid: Fid, _caller: &Subject) {}

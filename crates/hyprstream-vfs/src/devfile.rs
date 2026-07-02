@@ -604,7 +604,7 @@ mod tests {
                 DemoFidKind::VarsDir => ("vars".to_string(), 0x80),
                 DemoFidKind::Var(n) => (n.clone(), 0),
             };
-            Ok(Stat { qtype, size: 0, name, mtime: 0 })
+            Ok(Stat { qtype, version: 0, path: 0, size: 0, name, mtime: 0 })
         }
 
         async fn clunk(&self, _fid: Fid, _caller: &Subject) {}
