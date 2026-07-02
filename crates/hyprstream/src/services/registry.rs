@@ -33,6 +33,7 @@ use crate::services::generated::registry_client::{
     StreamInfo, ErrorInfo, HealthStatus, DetailedStatusInfo, RemoteInfo,
     CloneRequest, RegisterRequest,
     GetBlobRequest, GetBlobRequestContent,
+    PutBlobRequest,
     CreateWorktreeRequest, RemoveWorktreeRequest,
     BranchRequest, CheckoutRequest, StageFilesRequest,
     CommitRequest, MergeRequest, ContinueMergeRequest,
@@ -1747,6 +1748,32 @@ impl RegistryHandler for RegistryService {
             Ok(status) => Ok(RegistryResponseVariant::HealthCheckResult(status)),
             Err(e) => Ok(reg_error(&e.to_string())),
         }
+    }
+
+    /// STUB (epic #654, draft) — the authenticated XET write path. NOT
+    /// IMPLEMENTED: this returns a fail-closed error so the wire shape can be
+    /// reviewed without any behavior change. `main` semantics are unchanged.
+    ///
+    /// The real implementation (separate PR) will:
+    ///   1. coarse `$scope(write)` auto-gate already runs before this handler;
+    ///   2. fine-grained `authorize(ctx, "model:{repo}", "write")` on
+    ///      `data.grant_repo`, mirroring `authorize_get_blob`'s per-repo check;
+    ///   3. cap `data.bytes` at MAX_INLINE_UPLOAD (DoS guard);
+    ///   4. chunk (Gearhash CDC) + store xorbs via an in-process CasStore write
+    ///      API (to add, mirroring `cas-serve::handle_upload_file`);
+    ///   5. compute the merkle SERVER-SIDE from the stored bytes;
+    ///   6. `xet_provenance.record(merkle, repo_id)` (the #511 hook, today
+    ///      called only in tests);
+    ///   7. return `PutBlobResult { merkle, xorb_hashes, bytes_stored }`.
+    async fn handle_put_blob(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        _data: &PutBlobRequest,
+    ) -> Result<RegistryResponseVariant> {
+        // Fail closed: the write path is not yet wired. Deny rather than
+        // silently accept bytes with no provenance binding.
+        Ok(reg_error(
+            "putBlob not yet implemented (epic #654): authenticated XET upload + \
+             server-side merkle + provenance recording pending",
+        ))
     }
 
 }
