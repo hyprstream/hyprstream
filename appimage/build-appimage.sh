@@ -138,11 +138,12 @@ build_binary() {
 }
 
 # Strip host symbol tables from bundled libtorch shared objects.
-# libtorch ships its .so files unstripped; --strip-unneeded removes the symbol table
-# while preserving the dynamic symbols needed for loading/relocation, so runtime
-# behavior (including dlopen of backend libs) is unaffected. GPU device fatbinaries are
-# not touched. Best-effort: any file that can't be stripped is left as-is.
-# NOTE: validate a stripped GPU build actually runs inference before cutting a release.
+# libtorch ships its .so files unstripped; --strip-unneeded removes the symbol
+# table while preserving the dynamic symbols needed for loading/relocation, so
+# runtime behavior (including dlopen of backend libs) is unaffected. GPU device
+# fatbinaries are not touched. Best-effort: any file that can't be stripped is
+# left as-is. NOTE: validate a stripped GPU build actually runs inference before
+# cutting a release.
 strip_libtorch_libs() {
     local lib_dir="$1"
     command -v strip &>/dev/null || { log_info "strip not found; skipping"; return 0; }
