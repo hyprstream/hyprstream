@@ -27,7 +27,8 @@ use crate::mac::lattice::Lattice;
 use crate::mac::te::{Decision, TeMatrix, TeRule};
 
 /// Maps a UCAN capability to the TE rules it grants. The injection point for the
-/// concrete action vocabulary (S3, #582).
+/// concrete action vocabulary — the production impl is
+/// [`crate::mac::permission_map::ScopePermissionMap`] (#676).
 pub trait PermissionMap {
     /// The TE rules a single capability grants. Empty for an unrecognized
     /// capability — it grants nothing (fail-closed; never a wildcard rule).
