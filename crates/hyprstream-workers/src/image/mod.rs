@@ -30,8 +30,28 @@
 //! the Dragonfly peer for P2P distribution. This happens transparently via
 //! nydus-storage's `blob_redirected_host` configuration.
 
+// The nydus-bound submodules (client/store/rafs_builder/image_fs) require the
+// `oci-image` feature (they pull nydus + fuse-backend-rs). `manifest` (pure
+// HTTP) and `store_trait` (the trait seam) are nydus-free and always compiled —
+// the trait surface stays feature-invariant so `WorkerService` can hold
+// `Option<Arc<dyn ImageStore>>` with no cfg mirror (#646).
+#[cfg(feature = "oci-image")]
 mod client;
 mod manifest;
+// `pub(crate)` so sibling-module tests (e.g. runtime::sandbox_fs, FS-D #365)
+// can synthesize RAFS images. The builder fn stays crate-internal.
+#[cfg(feature = "oci-image")]
+pub(crate) mod rafs_builder;
+// #633 (spine of #508): the universal mountable OCI/RAFS image filesystem
+// service — `ImageFs`, an `FsMount` = OverlayFs(in-process RAFS lower +
+// writable upper). Native-only (the overlay/RAFS FileSystem stack is Linux).
+#[cfg(all(feature = "oci-image", not(target_arch = "wasm32")))]
+mod image_fs;
+// The image-store trait + inventory registration seam — ALWAYS compiled
+// (feature-invariant). Concrete backends (RafsStore under `oci-image`) impl
+// `ImageStore` and `inventory::submit!` an `ImageBackendRegistration`.
+pub mod store_trait;
+#[cfg(feature = "oci-image")]
 mod store;
 
 pub use crate::generated::worker_client::{
@@ -39,4 +59,10 @@ pub use crate::generated::worker_client::{
     AuthConfig, FilesystemUsage, FilesystemIdentifier,
 };
 pub use manifest::{ImageReference, ManifestFetcher, ManifestResult, OciManifest};
+#[cfg(all(feature = "oci-image", not(target_arch = "wasm32")))]
+pub use image_fs::{image_fs_for, image_fs_from_rafs, ImageFs};
+#[cfg(feature = "oci-image")]
 pub use store::{GcStats, ImageMetadata, RafsStore};
+// The trait seam + inventory registration are always available; only the
+// concrete `RafsStore` impl + its `submit!` require `oci-image`.
+pub use store_trait::{ImageBackendRegistration, ImageStore};

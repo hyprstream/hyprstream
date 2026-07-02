@@ -16,7 +16,8 @@ path = "src/main.rs"
 [dependencies]
 avt = "0.17"
 hyprstream-compositor = { path = "../hyprstream-compositor" }
-hyprstream-tcl = { path = "../hyprstream-tcl" }
+hyprstream-workers-tcl = { path = "../hyprstream-workers-tcl" }
+hyprstream-workers-python = { path = "../hyprstream-workers-python" }
 hyprstream-vfs = { path = "../hyprstream-vfs" }
 ratatui = { version = "0.30", default-features = false, features = ["layout-cache"] }
 serde = { version = "1", features = ["derive"] }
@@ -29,7 +30,7 @@ parking_lot = "0.12"
 rand = "0.8"
 uuid = { version = "1.0", features = ["v4", "v5", "serde"] }
 zeroize = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "rt", "macros"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"

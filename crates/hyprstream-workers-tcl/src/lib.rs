@@ -20,7 +20,7 @@ use molt::types::*;
 use molt::Interp;
 use std::sync::Arc;
 
-pub use mount::{create_mount_channel, TclCommand, TclMount};
+pub use mount::{TclCommand, TclMount};
 
 /// Context stored in the molt interpreter via `save_context()`.
 ///

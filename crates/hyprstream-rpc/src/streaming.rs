@@ -1254,8 +1254,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::unwrap_used)]
-    #[allow(clippy::expect_used)]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
     fn flat_slice_parses_unaligned_block() {
         // The zero-copy verifier (`stream_consumer`) parses StreamBlocks via
         // `read_message_from_flat_slice` over `Bytes` that come straight from the
@@ -1278,7 +1277,7 @@ mod tests {
             &mut slice,
             capnp::message::ReaderOptions::default(),
         )
-        .expect("flat-slice reader must parse from an unaligned buffer");
+        .unwrap();
         let block = reader
             .get_root::<crate::streaming_capnp::stream_block::Reader>()
             .unwrap();

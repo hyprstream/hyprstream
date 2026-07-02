@@ -16,14 +16,49 @@
 //!
 //! All types are WASM-compatible. Transport is abstracted via traits.
 
+pub mod devfile;
+mod fsmount;
 mod mount;
 mod namespace;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod proxy;
 
+// Native injected mounts (FS-D, #365): the `Send + Sync` ports of the wasm-only
+// `/stream` / synthetic injected mounts, suitable for serving to a CH guest.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod injected;
+
+// Native-only: the `FileSystem → FsMount` up-adapter and the OverlayFs-backed
+// v1 overlay engine. Both wrap `fuse_backend_rs`, whose overlay/passthrough
+// backends are Linux-only.
+#[cfg(not(target_arch = "wasm32"))]
+mod fuse_adapter;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod overlay;
+// Shim that makes a handleless `Layer` (e.g. RAFS) usable as an OverlayFs lower.
+#[cfg(not(target_arch = "wasm32"))]
+mod zero_open;
+
+pub use devfile::{ControlFile, DevFileState, DevFuture, DynamicDir, FieldFile, NoSetter};
+pub use fsmount::{FsMount, SetAttr};
 pub use hyprstream_rpc::Subject;
 pub use mount::{DirEntry, Fid, Mount, MountError, Stat, OREAD, OWRITE, ORDWR, OTRUNC, ORCLOSE, DMDIR};
 pub use namespace::{BindFlag, MountTarget, Namespace, NamespaceError};
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use fuse_adapter::FuseFileSystemMount;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use injected::{StreamMount, StreamRegistry, SyntheticMount, SyntheticNode};
+
+// Overlay composition surface (FS-C v1 engine). Re-exported so downstream crates
+// (FS-B) can build a RAFS lower as a `BoxedLayer` via [`overlay::layer_from_fs`]
+// and compose it with [`overlay::rootfs_overlay`] without depending on
+// `fuse-backend-rs`'s overlay internals directly.
+#[cfg(not(target_arch = "wasm32"))]
+pub use fuse_backend_rs::overlayfs::BoxedLayer;
+#[cfg(not(target_arch = "wasm32"))]
+pub use zero_open::ZeroOpenLayer;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Standard namespace paths

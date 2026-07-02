@@ -208,4 +208,24 @@ pub trait Mount: Send + Sync {
 
     /// Release a fid.
     async fn clunk(&self, fid: Fid, caller: &Subject);
+
+    /// Capability downcast: report whether this mount is also a writable
+    /// [`FsMount`](crate::FsMount), returning a borrow if so.
+    ///
+    /// The base [`Mount`] surface is read/write-on-existing-files only; full
+    /// namespace mutation (`create`/`unlink`/`mkdir`/`rename`/…) lives on the
+    /// `FsMount` supertrait. A [`Namespace`](crate::Namespace) stores every mount
+    /// as `Arc<dyn Mount>`, erasing the richer type, so a consumer that holds
+    /// only a `dyn Mount` (e.g. FS-A's `Namespace → FileSystem` down-adapter)
+    /// needs a way back to the `FsMount` vtable to route writes. This hook is the
+    /// idiomatic capability-typed answer to "is this mount writable as a real
+    /// filesystem?" — preferable to probing for `NotSupported` at runtime.
+    ///
+    /// Default: `None` (a plain `Mount` is not a full filesystem). `FsMount`
+    /// impls override this to return `Some(self)`; the blanket impl in
+    /// `fsmount.rs` is *not* possible (it would require `Self: Sized`), so each
+    /// `FsMount` opts in with a one-line override.
+    fn as_fsmount(&self) -> Option<&dyn crate::fsmount::FsMount> {
+        None
+    }
 }

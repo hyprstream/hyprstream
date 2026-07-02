@@ -1,0 +1,52 @@
+[package]
+name = "hyprstream-workers-wasmtime"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Embedded wasmtime host for sandboxing untrusted wasm guests behind capability profiles (bespoke-Linker Profile A + WASI Profile B)"
+
+# Workspace member (host target). It does NOT depend on tch/libtorch, so it builds
+# without LIBTORCH. Build/test scoped:
+#   cargo build -p hyprstream-workers-wasmtime
+#   cargo test  -p hyprstream-workers-wasmtime
+
+# NB: this crate intentionally does NOT add `[lints] workspace = true`. Lint
+# inheritance is opt-in, so the workspace's deny-by-default panic/print lints do
+# not apply — this crate uses unwrap/expect/panic freely in tests.
+
+[dependencies]
+# Pinned exact: wasmtime 46.0.1. The fuel/epoch API spellings (see README) are
+# specific to this major.
+wasmtime = "=46.0.1"
+rand = "0.8"
+
+# Canonical VFS seam. hyprstream-vfs -> hyprstream-rpc; NEITHER pulls
+# tch/torch (verified: only the top-level `hyprstream` crate links libtorch), so
+# `cargo build -p hyprstream-workers-wasmtime` stays torch-free. We use:
+#   * hyprstream_rpc::Subject  — the CANONICAL caller identity (replaces the
+#     crate-local Subject newtype).
+#   * hyprstream_vfs::{Namespace, Mount, Fid, Stat, DirEntry, MountError, ...}
+#     and spawn_vfs_proxy / VfsRequest / VfsOp — the real proxy seam.
+hyprstream-vfs = { path = "../hyprstream-vfs" }
+hyprstream-rpc = { path = "../hyprstream-rpc" }
+# The proxy reply channel is std::sync::mpsc; the proxy task needs a tokio runtime.
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread"] }
+async-trait = "0.1"
+# `/lang/python` mount fid state uses parking_lot::Mutex for interior mutability
+# through `&Fid` (same pattern as the native mount).
+parking_lot = "0.12"
+# Profile B (#506): preview1 wasi-common at the version matching wasmtime 46.0.1.
+# We use ONLY `sync` (block_on wiggle executor) + `wasmtime` (for add_to_linker);
+# NO `tokio`/`exit`. The `sync::WasiCtxBuilder` is bypassed (it only takes a concrete
+# cap_std::fs::Dir); we build a `WasiCtx` directly and push our own `Box<dyn WasiDir>`
+# VFS preopen. wasi-common -> wasmtime(=46.0.1)/wiggle/cap-std/rustix — NO tch/torch
+# (verified torch-free).
+wasi-common = { version = "=46.0.1", default-features = false, features = ["sync", "wasmtime"] }
+# Profile B's `WasiCtx::new` wants `Box<dyn rand::Rng + Send + Sync>` where `Rng` is
+# wasi-common's rand (0.10) — distinct from Profile A's rand 0.8. Aliased so we can
+# name the matching trait for the deterministic (withheld-OS-entropy) random source.
+wasi-rand = { package = "rand", version = "0.10", default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+parking_lot = "0.12"

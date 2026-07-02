@@ -51,6 +51,11 @@ pub mod error;
 pub use hyprstream_rpc::paths;
 
 pub mod runtime;
+// The `image` module is always compiled: the `ImageStore` trait +
+// `ImageBackendRegistration` inventory seam are feature-invariant, so
+// `WorkerService` can hold `Option<Arc<dyn ImageStore>>` without any cfg
+// mirror (#646). The concrete `RafsStore` impl + its `submit!` are
+// `oci-image`-gated (they pull the nydus deps); the trait surface is not.
 pub mod image;
 pub mod workflow;
 pub mod events;
@@ -59,12 +64,21 @@ pub mod events;
 pub mod dbus;
 
 // Re-export main types
-pub use config::{BackendType, HypervisorType, ImageConfig, PoolConfig, WorkerConfig, WorkflowConfig};
+pub use config::{HypervisorType, ImageConfig, PoolConfig, WorkerConfig, WorkflowConfig};
 pub use error::WorkerError;
 
 // Re-export service types
-pub use runtime::{WorkerService, SandboxBackend, SandboxHandle, KataBackend, NspawnBackend, NspawnConfig};
+pub use runtime::{WorkerService, SandboxBackend, SandboxHandle, NspawnBackend, NspawnConfig};
+// Inventory-based backend registry + fail-closed selection spine (#507)
+pub use runtime::{resolve_backend, BackendCtx, BackendRegistration};
+#[cfg(feature = "kata-vm")]
+pub use runtime::KataBackend;
+// The image-store trait seam is always available; only the concrete RAFS impl
+// (`RafsStore`) requires `oci-image`.
+pub use image::{ImageBackendRegistration, ImageStore};
+#[cfg(feature = "oci-image")]
 pub use image::RafsStore;
+
 pub use workflow::WorkflowService;
 pub use events::{
     // Publisher/Subscriber (moq-backed, no ZMQ context needed)

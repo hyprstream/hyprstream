@@ -49,7 +49,9 @@ use hyprstream_core::storage::{GitRef, ModelRef};
 use hyprstream_core::services::{PolicyClient, RegistryClient};
 // Worker service for Kata-based workload execution
 use hyprstream_workers::runtime::WorkerService;
-use hyprstream_workers::{ImageConfig, PoolConfig};
+#[cfg(feature = "kata-vm")]
+use hyprstream_workers::ImageConfig;
+use hyprstream_workers::PoolConfig;
 use std::sync::Arc;
 // Unified service manager API
 use hyprstream_service::{get_factory, InprocManager, ServiceContext, ServiceManager};
@@ -1085,6 +1087,7 @@ fn handle_quick_command(
                         cloud_init_dir: data_dir.join("cloud-init"),
                         ..PoolConfig::default()
                     };
+                    #[cfg(feature = "kata-vm")]
                     let image_config = ImageConfig {
                         blobs_dir: data_dir.join("images/blobs"),
                         bootstrap_dir: data_dir.join("images/bootstrap"),
@@ -1095,18 +1098,46 @@ fn handle_quick_command(
                     };
 
                     let _worker_handle = if !worker_already_running {
-                        use hyprstream_workers::image::RafsStore;
-                        use hyprstream_workers::runtime::{SandboxBackend, KataBackend};
-                        let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
-                        let backend: Arc<dyn SandboxBackend> = Arc::new(
-                            KataBackend::new(image_config, Arc::clone(&rafs_store)),
-                        );
+                        use hyprstream_workers::runtime::{
+                            resolve_backend, BackendCtx, SandboxBackend,
+                        };
+
+                        // RAFS image store is only built on the VM path (kata-vm).
+                        #[cfg(feature = "kata-vm")]
+                        let rafs_store = {
+                            use hyprstream_workers::image::RafsStore;
+                            Arc::new(RafsStore::new(image_config.clone())?)
+                        };
+
+                        // Resolve + construct the backend fail-closed against the
+                        // inventory registry: "auto" (default) picks the strongest
+                        // available backend; an explicit name must be registered
+                        // and available, else error. No silent nspawn fallback.
+                        let backend_name: String = ctx
+                            .config()
+                            .worker
+                            .as_ref()
+                            .map(|w| w.backend.clone())
+                            .unwrap_or_else(|| "auto".to_owned());
+                        let backend_ctx = BackendCtx {
+                            pool_config: pool_config.clone(),
+                            #[cfg(feature = "kata-vm")]
+                            image_config,
+                            #[cfg(feature = "kata-vm")]
+                            rafs_store: Arc::clone(&rafs_store),
+                        };
+                        let backend: Arc<dyn SandboxBackend> =
+                            resolve_backend(&backend_name, &backend_ctx)?;
+
                         let worker_transport =
                             TransportConfig::inproc("hyprstream/workers");
                         let mut worker_service = WorkerService::new(
                             pool_config,
                             backend,
-                            rafs_store,
+                            #[cfg(feature = "kata-vm")]
+                            Some(rafs_store),
+                            #[cfg(not(feature = "kata-vm"))]
+                            None,
                             worker_transport,
                             signing_key.clone(),
                         )?;

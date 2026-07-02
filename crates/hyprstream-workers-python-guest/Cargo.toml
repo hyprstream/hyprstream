@@ -1,0 +1,61 @@
+[package]
+name = "hyprstream-workers-python-guest"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "RustPython guest compiled to wasm32-unknown-unknown for the #505 capability sandbox (P1 host)"
+
+# This crate is intentionally NOT a workspace member. It is listed in the root
+# Cargo.toml [workspace.exclude] so a host-target workspace build never tries to
+# compile a wasm-only cdylib (which would also drag in libtorch deps transitively
+# via the workspace). Build explicitly:
+#   cargo build --target wasm32-unknown-unknown --manifest-path crates/hyprstream-workers-python-guest/Cargo.toml
+#
+# Empty [workspace] table makes this a standalone package (own lockfile/target),
+# belt-and-suspenders alongside the root [workspace.exclude] entry. A wasm-only
+# cdylib has no business in the host workspace's dependency resolution.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# RustPython VM at 0.5 (see crates/hyprstream-workers-wasmtime/README.md for the getrandom rationale).
+#   * 0.5 declares getrandom 0.3 with NO `js` feature, so the wasm32-unknown-unknown
+#     custom getrandom-0.3 backend is actually reachable (0.3.1 force-enabled
+#     getrandom/js, which out-ranked the custom backend and trapped at VM bootstrap).
+# default-features=false strips the std/threading/jit pieces that do not exist on
+# wasm32-unknown-unknown. We keep:
+#   compiler       — compile source -> bytecode
+#   encodings      — text codecs (utf-8 etc.), needed for str handling AND essential init
+#   freeze-stdlib  — make the VM expect the frozen stdlib during init (no FS import path).
+#                    NOTE: on rustpython-vm 0.5 this feature is just an alias for
+#                    `encodings` and does NOT itself embed the stdlib — the frozen
+#                    modules come from the `rustpython-pylib` crate (below), which we
+#                    register via `Interpreter::builder().add_frozen_modules(FROZEN_STDLIB)`.
+#   stdio          — wire `sys.stdout`/`stderr` so `print(...)` works. Crucially we do
+#                    NOT enable `host_env`, so the VM uses its SANDBOX stdio path
+#                    (`SandboxStdio` -> `std::io::stdout()`), which on
+#                    wasm32-unknown-unknown discards output (no real fd) — a capability
+#                    win: print succeeds (status 0) with zero host effect. Without this
+#                    feature `sys.stdout` is `None` and `print()` raises.
+# We deliberately OMIT `host_env` (which would wire the native `posix`/`os` backend),
+# `wasmbind` (which pulls wasm-bindgen/js — the very thing we eliminated), `gc`, `jit`,
+# and `threading`. With host_env off, `import os` resolves to a frozen pure-Python shim
+# whose host-touching functions have no native backend, so `os.system(...)` raises.
+rustpython-vm = { version = "0.5", default-features = false, features = ["compiler", "encodings", "freeze-stdlib", "stdio"] }
+
+# The actual frozen pure-Python stdlib bytecode, embedded into the binary. Required
+# because rustpython-vm 0.5's `freeze-stdlib` feature no longer embeds it itself; the
+# embedder must register `rustpython_pylib::FROZEN_STDLIB` on the InterpreterBuilder.
+# Without this, VirtualMachine::initialize() panics ("essential initialization failed")
+# trying to `import encodings` with an empty frozen set.
+rustpython-pylib = { version = "0.5", features = ["freeze-stdlib"] }
+
+# getrandom 0.3 ONLY (the 0.2 dual-backend from the P0 spike is dropped: rustpython 0.5
+# no longer pulls a getrandom-0.2 RNG path that forces `js`). 0.3 selects its backend
+# via the build cfg `getrandom_backend="custom"` (in .cargo/config.toml) plus the
+# `#[no_mangle] __getrandom_v03_custom` extern symbol in lib.rs, both delegating to the
+# single host import `host_random`. No `js`, no `wasm_js`, no WASI.
+[target.wasm32-unknown-unknown.dependencies]
+getrandom = { version = "0.3" }

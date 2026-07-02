@@ -27,7 +27,11 @@ use crate::events::{
     serialize_container_started, serialize_container_stopped,
     serialize_sandbox_started, serialize_sandbox_stopped,
 };
-use crate::image::RafsStore;
+// ImageStore trait seam — always compiled (feature-invariant). Concrete
+// backends (RafsStore under `oci-image`) register via inventory; the service
+// holds an `Option<Arc<dyn ImageStore>>` and dispatches CRI image ops through
+// it, with no cfg mirror (#646).
+use crate::image::ImageStore;
 // Import generated wire types (canonical OCI-aligned names)
 use crate::generated::worker_client::{
     // Filter + request types for handler signatures
@@ -65,8 +69,14 @@ pub struct WorkerService {
     /// Sandbox pool for VM management
     sandbox_pool: Arc<SandboxPool>,
 
-    /// RAFS store for image management
-    rafs_store: Arc<RafsStore>,
+    /// Image store — the CRI image backend (`RafsStore` under `oci-image`,
+    /// registered via inventory). `None` when no image backend is compiled in;
+    /// CRI image ops then return a clear "built without oci-image support"
+    /// error. Held as `Option<Arc<dyn ImageStore>>` so the field, the `new()`
+    /// signature, AND the handler bodies are all feature-invariant — only the
+    /// concrete impl + its `inventory::submit!` (in `image/store.rs`) are
+    /// `#[cfg(feature = "oci-image")]`. No cfg mirror here (#646).
+    image_store: Option<Arc<dyn ImageStore>>,
 
     /// Active containers (container_id -> Container)
     containers: RwLock<HashMap<String, Container>>,
@@ -102,7 +112,10 @@ impl WorkerService {
     pub fn new(
         pool_config: PoolConfig,
         backend: Arc<dyn super::backend::SandboxBackend>,
-        rafs_store: Arc<RafsStore>,
+        // Image store — `Some` only when the caller built one (which today
+        // requires `oci-image` + the `rafs` registration). Feature-invariant
+        // type; pass `None` for a build without an image backend.
+        image_store: Option<Arc<dyn ImageStore>>,
         transport: TransportConfig,
         signing_key: SigningKey,
     ) -> AnyhowResult<Self> {
@@ -114,7 +127,7 @@ impl WorkerService {
         let stream_channel = Arc::new(StreamChannel::new(signing_key.clone()));
         Ok(Self {
             sandbox_pool,
-            rafs_store,
+            image_store,
             containers: RwLock::new(HashMap::new()),
             container_sandbox_map: RwLock::new(HashMap::new()),
             event_publisher: tokio::sync::Mutex::new(event_publisher),
@@ -1233,22 +1246,33 @@ impl ContainerHandler for WorkerService {
 
 }
 
+// CRI image operations dispatch through the `ImageStore` trait object — ONE
+// body per method, no cfg/cfg(not) mirror (#646). When no image backend is
+// compiled in (build without `oci-image`), `self.image_store` is `None` and the
+// single fallback error is returned. The concrete RAFS impl + its
+// `inventory::submit!` live in `image/store.rs`, gated by `oci-image`.
+fn image_store_missing() -> anyhow::Error {
+    anyhow::anyhow!(
+        "CRI image operations require the `oci-image` feature (RAFS image store); \
+         this binary was built without oci-image support"
+    )
+}
+
 #[async_trait::async_trait(?Send)]
 impl ImageHandler for WorkerService {
     async fn handle_list(&self, _ctx: &EnvelopeContext, _request_id: u64, filter: &ImageFilter) -> AnyhowResult<Vec<ImageInfo>> {
         let _ = filter; // filter not yet used
-        let images = self.rafs_store.list_images().await?;
-        Ok(images)
+        let store = self.image_store.as_ref().ok_or_else(image_store_missing)?;
+        Ok(store.list_images().await?)
     }
 
     async fn handle_status(&self, _ctx: &EnvelopeContext, _request_id: u64, request: &ImageStatusRequest) -> AnyhowResult<ImageStatusResult> {
-        let image_ref = &request.image.image;
-        let status = self.rafs_store.image_status(image_ref, request.verbose).await?;
-        Ok(status)
+        let store = self.image_store.as_ref().ok_or_else(image_store_missing)?;
+        Ok(store.image_status(&request.image.image, request.verbose).await?)
     }
 
     async fn handle_pull(&self, _ctx: &EnvelopeContext, _request_id: u64, data: &PullImageRequest) -> AnyhowResult<String> {
-        let image_ref = &data.image.image;
+        let store = self.image_store.as_ref().ok_or_else(image_store_missing)?;
         let auth = if !data.auth.username.is_empty() {
             Some(crate::image::AuthConfig {
                 username: data.auth.username.clone(),
@@ -1261,19 +1285,18 @@ impl ImageHandler for WorkerService {
         } else {
             None
         };
-        let image_id = self.rafs_store.pull_with_auth(image_ref, auth.as_ref()).await?;
-        Ok(image_id)
+        Ok(store.pull_with_auth(&data.image.image, auth.as_ref()).await?)
     }
 
     async fn handle_remove(&self, _ctx: &EnvelopeContext, _request_id: u64, data: &ImageSpec) -> AnyhowResult<()> {
-        let image_ref = &data.image;
-        self.rafs_store.remove_image(image_ref).await?;
+        let store = self.image_store.as_ref().ok_or_else(image_store_missing)?;
+        store.remove_image(&data.image).await?;
         Ok(())
     }
 
     async fn handle_fs_info(&self, _ctx: &EnvelopeContext, _request_id: u64) -> AnyhowResult<Vec<FilesystemUsage>> {
-        let usage = self.rafs_store.fs_info().await?;
-        Ok(usage)
+        let store = self.image_store.as_ref().ok_or_else(image_store_missing)?;
+        Ok(store.fs_info().await?)
     }
 }
 
@@ -1336,11 +1359,14 @@ impl RequestService for WorkerService {
     }
 }
 
-#[cfg(test)]
+// These tests exercise the VM lifecycle (RafsStore + KataBackend), so they only
+// build/run under `kata-vm`.
+#[cfg(all(test, feature = "kata-vm"))]
 #[allow(clippy::print_stderr)]
 mod tests {
     use super::*;
     use crate::config::ImageConfig;
+    use crate::image::RafsStore;
     use crate::runtime::{PodSandboxConfig, PodSandboxState, ContainerConfig};
     use hyprstream_rpc::crypto::generate_signing_keypair;
     use hyprstream_rpc::transport::TransportConfig;
@@ -1389,7 +1415,7 @@ mod tests {
         let backend: Arc<dyn crate::runtime::backend::SandboxBackend> = Arc::new(
             crate::runtime::kata_backend::KataBackend::new(image_config, Arc::clone(&rafs_store)),
         );
-        let service = WorkerService::new(pool_config, backend, rafs_store, transport, signing_key)?;
+        let service = WorkerService::new(pool_config, backend, Some(rafs_store), transport, signing_key)?;
         Ok((service, temp_dir))
     }
 
