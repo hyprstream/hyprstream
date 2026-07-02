@@ -191,46 +191,35 @@ fn infer_path(kind: NodeKind, method_snake: &str, arg: &CapnpType) -> String {
     }
 }
 
-/// Generate the per-service `vfs_nodes()` table.
+/// Build the `VfsNode` entry token stream for one set of request variants.
 ///
-/// Emits `pub fn vfs_nodes() -> (&'static str, &'static [VfsNode])`. On a
-/// scope/kind contradiction (or bad `$vfsKind`), emits a `compile_error!`
-/// naming the offending method instead.
-pub fn generate_mount(service_name: &str, resolved: &ResolvedSchema) -> TokenStream {
-    // Data-only schemas (no request variants) get no mount.
-    if resolved.raw.request_variants.is_empty() {
-        return TokenStream::new();
-    }
-
-    let scoped_names: Vec<&str> = resolved
-        .raw
-        .scoped_clients
-        .iter()
-        .map(|sc| sc.factory_name.as_str())
-        .collect();
-
+/// Shared by the top-level table and each scoped-client subdir table. Returns
+/// `Err(compile_error_tokens)` on a bad `$vfsKind` or a scope/kind contradiction.
+fn build_node_entries(
+    variants: &[UnionVariant],
+    scoped_names: &[&str],
+    response_variants: &[UnionVariant],
+    resolved: &ResolvedSchema,
+) -> Result<Vec<TokenStream>, TokenStream> {
     let mut node_entries: Vec<TokenStream> = Vec::new();
 
-    for v in &resolved.raw.request_variants {
-        // Scoped clients project as subdirectories — deferred to the nested pass
-        // (their own node tables); skip here. `$vfsHidden` excludes a method.
+    for v in variants {
+        // Scoped clients project as subdirectories with their own tables; skip
+        // them in the flat node list. `$vfsHidden` excludes a method entirely.
         if scoped_names.contains(&v.name.as_str()) || v.vfs_hidden {
             continue;
         }
 
         let method_snake = to_snake_case(&v.name);
         let arg = resolved.resolve_type(&v.type_name).capnp_type.clone();
-        let is_streaming = is_streaming_variant(&v.name, &resolved.raw.response_variants);
+        let is_streaming = is_streaming_variant(&v.name, response_variants);
 
         // Resolve kind ($vfsKind override or inference) — bad annotation ⇒ compile_error.
-        let kind = match resolve_kind(v, &arg, is_streaming) {
-            Ok(k) => k,
-            Err(msg) => return compile_error(&msg),
-        };
+        let kind = resolve_kind(v, &arg, is_streaming).map_err(|msg| compile_error(&msg))?;
 
         // The guard: kind must not contradict scope.
         if let Err(msg) = validate_node(&method_snake, &v.scope, kind) {
-            return compile_error(&msg);
+            return Err(compile_error(&msg));
         }
 
         let path = if v.vfs_path.is_empty() {
@@ -254,6 +243,88 @@ pub fn generate_mount(service_name: &str, resolved: &ResolvedSchema) -> TokenStr
         });
     }
 
+    Ok(node_entries)
+}
+
+/// Generate the per-service `vfs_nodes()` table (plus a `vfs_nodes_<scoped>()`
+/// subdir table for each nested scoped client).
+///
+/// Emits `pub fn vfs_nodes() -> (&'static str, &'static [VfsNode])`. On a
+/// scope/kind contradiction (or bad `$vfsKind`), emits a `compile_error!`
+/// naming the offending method instead. Each scoped client (e.g. `repo`,
+/// which projects as the `repo/{repoId}/` subdir) gets its own
+/// `vfs_nodes_<factory>()` table over its inner variants — mount-relative to
+/// that subdir root — so the projection is recursive, not flat.
+pub fn generate_mount(service_name: &str, resolved: &ResolvedSchema) -> TokenStream {
+    // Data-only schemas (no request variants) get no mount.
+    if resolved.raw.request_variants.is_empty() {
+        return TokenStream::new();
+    }
+
+    let scoped_names: Vec<&str> = resolved
+        .raw
+        .scoped_clients
+        .iter()
+        .map(|sc| sc.factory_name.as_str())
+        .collect();
+
+    let node_entries = match build_node_entries(
+        &resolved.raw.request_variants,
+        &scoped_names,
+        &resolved.raw.response_variants,
+        resolved,
+    ) {
+        Ok(entries) => entries,
+        Err(err) => return err,
+    };
+
+    // One subdir table per scoped client. A scoped client's inner variants are
+    // themselves the leaves of its `{prefix}/` subdir; nested scoped clients
+    // within it recurse the same way (their own `vfs_nodes_<name>()`). The
+    // subdir's mount-relative prefix is the parent variant's `$vfsPath` (e.g.
+    // `repo/{repoId}`) — inferred to the factory name when unannotated.
+    let mut scoped_tables: Vec<TokenStream> = Vec::new();
+    for sc in &resolved.raw.scoped_clients {
+        let inner_scoped: Vec<&str> = sc
+            .nested_clients
+            .iter()
+            .map(|n| n.factory_name.as_str())
+            .collect();
+        let inner_entries = match build_node_entries(
+            &sc.inner_request_variants,
+            &inner_scoped,
+            &sc.inner_response_variants,
+            resolved,
+        ) {
+            Ok(entries) => entries,
+            Err(err) => return err,
+        };
+        // The subdir prefix lives on the parent variant that projects this
+        // scope (the `$vfsPath` on e.g. the `repo` union field).
+        let prefix = resolved
+            .raw
+            .request_variants
+            .iter()
+            .find(|v| v.name == sc.factory_name)
+            .filter(|v| !v.vfs_path.is_empty())
+            .map(|v| v.vfs_path.clone())
+            .unwrap_or_else(|| to_snake_case(&sc.factory_name));
+        let fn_ident = quote::format_ident!("vfs_nodes_{}", to_snake_case(&sc.factory_name));
+        let sub_doc = format!(
+            "Generated 9P/VFS subdir node table for the `{}` scope of the {service_name} service (epic #539). Mount-relative prefix returned alongside the nodes.",
+            sc.factory_name
+        );
+        scoped_tables.push(quote! {
+            #[doc = #sub_doc]
+            pub fn #fn_ident() -> (&'static str, &'static [hyprstream_rpc::metadata::VfsNode]) {
+                static NODES: &[hyprstream_rpc::metadata::VfsNode] = &[
+                    #(#inner_entries,)*
+                ];
+                (#prefix, NODES)
+            }
+        });
+    }
+
     let doc = format!("Generated 9P/VFS node table for the {service_name} service (epic #539).");
 
     quote! {
@@ -264,6 +335,8 @@ pub fn generate_mount(service_name: &str, resolved: &ResolvedSchema) -> TokenStr
             ];
             (#service_name, NODES)
         }
+
+        #(#scoped_tables)*
     }
 }
 
