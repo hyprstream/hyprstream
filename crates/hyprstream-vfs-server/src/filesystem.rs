@@ -65,7 +65,7 @@ use fuse_backend_rs::api::filesystem::{
 use tokio::runtime::Handle;
 
 use hyprstream_vfs::{
-    DirEntry, MountError, MountTarget, Namespace, SetAttr, Subject, ORDWR, OWRITE,
+    DirEntry, FsMount, MountError, MountTarget, Namespace, SetAttr, Subject, ORDWR, OWRITE,
 };
 
 use crate::inode::{HandleTable, InodeData, InodeTable, Kind, OpenFid, ROOT_INODE};
@@ -549,7 +549,7 @@ impl FileSystem for VfsFileSystem {
         // Create, then re-open for writing on the same mount.
         let fid = self.block(async {
             let fs = mount.as_fsmount().ok_or(erofs())?;
-            fs.create(&comp_refs, mode, &self.subject)
+            FsMount::create(fs, &comp_refs, mode, &self.subject)
                 .await
                 .map_err(|e| io_err(&e))?;
             let mut fid = mount.walk(&comp_refs, &self.subject).await.map_err(|e| io_err(&e))?;
