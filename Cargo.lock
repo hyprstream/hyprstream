@@ -7251,6 +7251,7 @@ dependencies = [
  "hex",
  "hypervisor",
  "hyprstream-9p",
+ "hyprstream-discovery",
  "hyprstream-rpc",
  "hyprstream-rpc-build",
  "hyprstream-rpc-derive",
