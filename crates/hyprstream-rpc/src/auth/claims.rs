@@ -67,6 +67,46 @@ pub struct Cnf {
     pub jkt: Option<String>,
 }
 
+/// RFC 8693 §4.1 actor claim — the two-principal carrier for delegated calls
+/// (#680/#681).
+///
+/// A delegated (on-behalf-of) token sets [`Claims::sub`] = the **delegator**
+/// (source of authority, e.g. the user) and [`Claims::act`] = the **actor** that
+/// signs the downstream envelope (e.g. `service:mcp`). This is delegation, not
+/// impersonation: the actor holds no standing access, only the attenuated
+/// authority the delegator granted it.
+///
+/// **Composition (#681):** the effective MAC clearance is `meet(delegator,
+/// actor)` on level/compartments — never either principal alone. The actor's
+/// authority-asserted clearance is carried here so the PDP can take the meet off
+/// the one verified JWT. Like [`Claims::clearance`] it is *authority-asserted*
+/// (the issuing node signs the JWT) and carries **no** assurance: assurance is
+/// derived from the *verified signer* (the actor, who signs the downstream
+/// envelope) and clamped DOWN at enforcement time — never trusted from this claim.
+///
+/// `act` MAY nest (`act.act`) for multi-hop delegation (RFC 8693 §4.1); each hop
+/// composes into the meet. **JWT-carried only** (mirrors [`Claims::clearance`]):
+/// not written to the Cap'n Proto envelope surface — read off the verified JWT by
+/// the MAC PDP.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActClaim {
+    /// The actor's subject identifier (e.g. `service:mcp`). At enforcement time
+    /// this MUST equal the verified downstream envelope signer (`cnf`): an actor
+    /// cannot claim to act as an identity whose key it does not hold — the
+    /// #680 anti-confused-deputy invariant.
+    pub sub: String,
+    /// The actor's authority-asserted MAC clearance, carried so #681 can take
+    /// `meet(delegator, actor)` without a second lookup. `None` ⇒ the actor is
+    /// unlabeled ⇒ the delegated derivation **fails closed** (no default
+    /// clearance for a missing principal; the S1 rule).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clearance: Option<crate::auth::mac::SecurityLabel>,
+    /// Nested actor for multi-hop delegation (RFC 8693 §4.1). Boxed to keep
+    /// [`Claims`] sized. Each hop composes into the clearance meet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub act: Option<Box<ActClaim>>,
+}
+
 /// JWT claims for authentication.
 ///
 /// Note: Authorization is enforced via Casbin policies server-side.
@@ -127,6 +167,15 @@ pub struct Claims {
     /// envelope/JWT so it is itself PQ-forgery-resistant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clearance: Option<crate::auth::mac::SecurityLabel>,
+
+    /// **Delegation actor (RFC 8693 §4.1 `act`, #680/#681).** Present iff this is
+    /// a delegated (on-behalf-of) token: [`Self::sub`] is the delegator (source of
+    /// authority), `act` the actor that signs the downstream envelope. Drives the
+    /// two-principal MAC derivation (#681): clearance = `meet(sub, act)`, assurance
+    /// from the verified signer (the actor). See [`ActClaim`]. JWT-carried only
+    /// (mirrors [`Self::clearance`]); reconstructed `None` on the Cap'n Proto path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub act: Option<ActClaim>,
 }
 
 // Custom Debug impl — NEVER log the bearer token
@@ -142,6 +191,7 @@ impl std::fmt::Debug for Claims {
             .field("cnf", &self.cnf)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
             .field("clearance", &self.clearance)
+            .field("act", &self.act)
             .finish()
     }
 }
@@ -227,6 +277,9 @@ impl FromCapnp for Claims {
             // The envelope Claims are a distinct carrier from the JWT Claims; the
             // clearance is read off the verified JWT by the MAC PDP.
             clearance: None,
+            // `act` (RFC 8693 delegation) likewise rides the JWT, not this
+            // envelope surface; reconstructed None here (#680/#681).
+            act: None,
         })
     }
 }
@@ -244,6 +297,7 @@ impl Claims {
             cnf: None,
             token: None,
             clearance: None,
+            act: None,
         }
     }
 
@@ -313,6 +367,16 @@ impl Claims {
     /// derived from the verified key material at enforcement time.
     pub fn with_clearance(mut self, clearance: crate::auth::mac::SecurityLabel) -> Self {
         self.clearance = Some(clearance);
+        self
+    }
+
+    /// Set the RFC 8693 delegation actor (`act`, #680/#681). Marks this as a
+    /// delegated (on-behalf-of) token: [`Self::sub`] stays the delegator; `actor`
+    /// is the principal that will sign the downstream envelope. The MAC PDP
+    /// derives clearance as `meet(sub, act)` and assurance from the verified
+    /// signer. See [`ActClaim`].
+    pub fn with_act(mut self, actor: ActClaim) -> Self {
+        self.act = Some(actor);
         self
     }
 
@@ -404,6 +468,49 @@ impl crate::auth::mac::SubjectContextClaims for Claims {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_act_claim_serde_roundtrip_and_default_none() {
+        // Non-delegated token: `act` absent, and (skip_serializing_if) omitted
+        // from the JSON entirely — no empty `act` on the wire.
+        let plain = Claims::new("alice".to_owned(), 1000, 2000);
+        assert!(plain.act.is_none());
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(!json.contains("\"act\""), "plain token must not carry act: {json}");
+
+        // Delegated token: sub = delegator (user), act = actor (service:mcp),
+        // with a nested hop to exercise RFC 8693 §4.1 multi-hop.
+        let actor = ActClaim {
+            sub: "service:mcp".to_owned(),
+            clearance: None,
+            act: Some(Box::new(ActClaim {
+                sub: "service:gateway".to_owned(),
+                clearance: None,
+                act: None,
+            })),
+        };
+        let delegated = Claims::new("alice".to_owned(), 1000, 2000).with_act(actor.clone());
+        let json = serde_json::to_string(&delegated).unwrap();
+        let back: Claims = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.sub, "alice", "sub stays the delegator");
+        assert_eq!(back.act, Some(actor), "act round-trips including the nested hop");
+        assert_eq!(
+            back.act.as_ref().unwrap().act.as_ref().unwrap().sub,
+            "service:gateway"
+        );
+    }
+
+    #[test]
+    fn test_debug_shows_act_but_redacts_token() {
+        let claims = Claims::new("alice".to_owned(), 1000, 2000).with_act(ActClaim {
+            sub: "service:mcp".to_owned(),
+            clearance: None,
+            act: None,
+        });
+        let dbg = format!("{claims:?}");
+        assert!(dbg.contains("service:mcp"), "act is not secret, must be visible");
+        assert!(dbg.contains("act:"));
+    }
 
     #[test]
     fn test_claims_new() {
