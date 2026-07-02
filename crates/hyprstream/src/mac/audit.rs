@@ -23,12 +23,34 @@
 //!    before returning `Ok(())`. The caller (the AVC) does not return a Permit
 //!    until `record` returns, so a Permit is never handed out ahead of a
 //!    durable audit entry. See the `wal_record_is_durable_before_return` test.
-//! 4. **Signed** — each record (and the rollup) is signed via the existing
-//!    COSE path ([`crate::mac::compiled::cose`] / `sign_composite`). Tamper
-//!    evidence comes from content-addressing + signature + append-only
-//!    conjoined: an attacker altering a record breaks the hash; altering the
-//!    stored hash breaks the signature; truncating the log is detectable by the
-//!    chained sequence numbers.
+//! 4. **Signed + hash-chained** — each record is signed via the existing COSE
+//!    path ([`crate::mac::compiled::cose`] / `sign_composite`), and each record
+//!    carries the [`prev_hash`](AuditRecord::prev_hash) of its predecessor, so
+//!    the journal is an append-only **chain**. Tamper evidence is conjoint:
+//!    altering a record breaks its hash (and thus its signature); reordering or
+//!    deleting a *middle* record breaks the successor's `prev_hash` link. A
+//!    deleted *tail* leaves a still-valid shorter chain, so it is caught
+//!    instead by the **signed checkpoint** (§ Truncation) — the head anchor
+//!    written out-of-band after every record.
+//!
+//! ## Truncation detection (the actual guarantee — and its limit)
+//!
+//! After every durable append, the store writes a **signed checkpoint** (a
+//! separate `checkpoint` file) recording the current head `(seq, head_hash)`.
+//! On open, the store fails closed if the journal's head sequence is *below*
+//! the checkpoint's — i.e. the tail was truncated. [`WalAuditStore::
+//! verify_journal`] additionally verifies the checkpoint's signature and that
+//! it matches the journal head, so a forged or rolled-back checkpoint is
+//! rejected offline.
+//!
+//! **Residual limit (honest):** the checkpoint is a *local* anchor. An attacker
+//! with write access to BOTH the journal and the checkpoint can truncate both
+//! consistently and evade local detection. Closing that requires an *off-host*
+//! anchor (replicate the signed head to OTel / a second host); that is tracked
+//! as a follow-up and deliberately out of scope here. What this store
+//! guarantees today: no tampering, reordering, or middle-deletion goes
+//! undetected, and tail-truncation is detected unless the checkpoint is
+//! destroyed in the same act.
 //!
 //! ## Complete mediation (the hook point)
 //!
@@ -80,7 +102,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use parking_lot::Mutex;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -108,9 +130,19 @@ use thiserror::Error;
 /// it records.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditRecord {
-    /// Monotonic sequence number within this store's journal. Used to detect
-    /// truncation (a gap in the on-disk sequence = a deleted tail).
+    /// Monotonic sequence number within this store's journal, assigned by the
+    /// store. A gap in the on-disk sequence exposes a *middle* deletion; a
+    /// deleted *tail* is caught instead by [`prev_hash`](Self::prev_hash)
+    /// chaining plus the signed checkpoint (see [`WalAuditStore`]).
     pub seq: u64,
+    /// Hash-chain link: the BLAKE3 content hash of the **previous** record in
+    /// this store's journal (`[0; 32]` for the genesis record). Assigned by the
+    /// store under the same lock that assigns `seq`, and covered by this
+    /// record's own signature (it is part of the hashed content). Reordering,
+    /// or deleting/altering any record, breaks the successor's link — so the
+    /// journal is an append-only chain, not just a sequence of independent
+    /// signed lines.
+    pub prev_hash: [u8; 32],
     /// Wall-clock nanos since UNIX epoch when the decision was recorded.
     pub ts_unix_nanos: u128,
     /// The decision the PDP returned (`Permit` / `Deny` / `Escalate`).
@@ -207,6 +239,18 @@ pub enum AuditError {
     Verify(String),
     #[error("audit sequence regression: journal seq {journal} < counter {counter}")]
     SeqRegression { journal: u64, counter: u64 },
+    /// The `prev_hash` chain is broken at `seq`: this record does not link to
+    /// its predecessor's hash (tampering, reordering, or a middle deletion).
+    #[error("audit chain break at seq {seq}: prev_hash does not match predecessor")]
+    ChainBreak { seq: u64 },
+    /// The signed checkpoint is ahead of the journal head: the journal tail was
+    /// truncated since the last durable write. `journal_seq` is the journal's
+    /// current head seq (`None` if the journal is empty/absent).
+    #[error("audit journal truncated: checkpoint at seq {checkpoint_seq}, journal head {journal_seq:?}")]
+    Truncation {
+        checkpoint_seq: u64,
+        journal_seq: Option<u64>,
+    },
 }
 
 impl From<std::io::Error> for AuditError {
@@ -250,6 +294,17 @@ pub fn audit_signing_input(content_hash: &[u8; 32]) -> Vec<u8> {
     let mut v = Vec::with_capacity(16 + 32);
     v.extend_from_slice(b"hs-mac-audit-v1"); // domain separation tag
     v.extend_from_slice(content_hash);
+    v
+}
+
+/// Domain-separated signing input for the head-anchor checkpoint `(seq,
+/// head_hash)`. The tag differs from [`audit_signing_input`] so a per-record
+/// signature can never be replayed as a checkpoint signature (and vice-versa).
+pub fn checkpoint_signing_input(seq: u64, head_hash: &[u8; 32]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(24 + 8 + 32);
+    v.extend_from_slice(b"hs-mac-audit-checkpoint-v1");
+    v.extend_from_slice(&seq.to_be_bytes());
+    v.extend_from_slice(head_hash);
     v
 }
 
@@ -414,13 +469,16 @@ impl AuditSink for NullAuditSink {
 /// ```text
 /// <root>/
 ///   journal.log       # append-only: one signed record per line (newline-framed
-///                     #              CBOR: <seq>\t<sig_hex>\t<cbor_b64>\n)
-///   cas/<ab>/<cdef…>  # content-addressed blob per distinct record (dedup):
-///                     #   the canonical CBOR bytes, named by its BLAKE3 hex.
+///                     #              <seq>\t<sig_hex>\t<payload_b64>\n)
+///   checkpoint        # signed head anchor, rewritten after every append:
+///                     #              <seq>\t<head_hash_hex>\t<sig_hex>\n
+///   cas/<ab>/<cdef…>  # content-addressed blob per record: the canonical bytes,
+///                     #   named by their BLAKE3 hex (name==bytes tamper check).
 /// ```
-/// The CAS layer gives dedup (same decision → one blob) and a second
-/// tamper-evidence check (the blob's name is its hash). The journal gives
-/// ordering and truncation detection via `seq`.
+/// The CAS layer gives a second tamper-evidence check (the blob's name is its
+/// hash). The journal is an append-only **hash chain** (each record carries its
+/// predecessor's hash), and the signed `checkpoint` anchors the head so a
+/// truncated tail is detected on open (see the module docs).
 ///
 /// ## What is NOT here (deferred)
 /// - TODO(S7-followup): cross-host replication (gossip / OTLP log export to a
@@ -433,32 +491,83 @@ impl AuditSink for NullAuditSink {
 pub struct WalAuditStore<S: AuditSigner> {
     root: PathBuf,
     journal_path: PathBuf,
+    checkpoint_path: PathBuf,
     cas_dir: PathBuf,
     signer: S,
-    seq: AtomicU64,
+    /// The chain head: the next sequence number to assign and the content hash
+    /// of the last record written. Guarded by a mutex because the hash chain
+    /// requires record assignment (seq + prev_hash) and the journal append to
+    /// be serialized — two concurrent appends must not interleave or the chain
+    /// forks. (The previous `AtomicU64` seq did not order the appends.)
+    head: Mutex<ChainHead>,
+}
+
+/// The mutable chain head of a [`WalAuditStore`].
+#[derive(Debug, Clone, Copy)]
+struct ChainHead {
+    /// The sequence number the next record will receive.
+    next_seq: u64,
+    /// BLAKE3 content hash of the last record written (`[0; 32]` before any).
+    head_hash: [u8; 32],
 }
 
 impl<S: AuditSigner> WalAuditStore<S> {
     /// Open (or create) a store at `root`. The journal and CAS dir are created
-    /// if missing. The sequence counter is seeded from the highest `seq`
-    /// already in the journal (so a restart continues monotonically).
+    /// if missing. The chain head (next `seq` + `head_hash`) is seeded from the
+    /// journal's last record so a restart continues the chain monotonically.
+    ///
+    /// **Fail-closed truncation check:** if a signed checkpoint exists and its
+    /// sequence is *ahead* of the journal's last record, the tail was truncated
+    /// since the last durable write — [`open`](Self::open) refuses to start
+    /// (`AuditError::Truncation`) rather than silently continuing on a shortened
+    /// log (which would re-seed the seq counter from the truncated head and
+    /// erase the evidence). Full cryptographic verification of the chain and the
+    /// checkpoint signature is [`verify_journal`](Self::verify_journal).
     pub fn open(root: impl AsRef<Path>, signer: S) -> Result<Self, AuditError> {
         let root = root.as_ref().to_path_buf();
         let journal_path = root.join("journal.log");
+        let checkpoint_path = root.join("checkpoint");
         let cas_dir = root.join("cas");
         std::fs::create_dir_all(&root)?;
         std::fs::create_dir_all(&cas_dir)?;
-        // Seed the sequence from the existing journal so a restart is monotonic:
-        // the next record continues *after* the highest seq already on disk.
-        let starting_seq = highest_seq_in_journal(&journal_path)?
-            .map(|h| h + 1)
-            .unwrap_or(0);
+
+        // Seed the chain head from the journal's last record: the next record
+        // continues *after* the last seq, chained to the last record's hash.
+        let tail = journal_tail(&journal_path)?;
+        let (next_seq, head_hash) = match tail {
+            Some((seq, hash)) => (seq + 1, hash),
+            None => (0, [0u8; 32]),
+        };
+
+        // Fail-closed tail-truncation check against the signed checkpoint. The
+        // checkpoint records the head we last durably committed; if the journal
+        // now has fewer records, its tail was deleted. (A checkpoint that is
+        // *behind* the journal is fine — it just predates the last append, e.g.
+        // a crash between the journal fsync and the checkpoint fsync.)
+        if let Some((cp_seq, _cp_hash, _cp_sig)) = read_checkpoint(&checkpoint_path)? {
+            let journal_head = tail.map(|(seq, _)| seq);
+            let truncated = match journal_head {
+                None => true, // checkpoint exists but journal is empty/gone
+                Some(h) => h < cp_seq,
+            };
+            if truncated {
+                return Err(AuditError::Truncation {
+                    checkpoint_seq: cp_seq,
+                    journal_seq: journal_head,
+                });
+            }
+        }
+
         Ok(Self {
             root,
             journal_path,
+            checkpoint_path,
             cas_dir,
             signer,
-            seq: AtomicU64::new(starting_seq),
+            head: Mutex::new(ChainHead {
+                next_seq,
+                head_hash,
+            }),
         })
     }
 
@@ -471,20 +580,27 @@ impl<S: AuditSigner> WalAuditStore<S> {
     /// after the journal file AND its parent directory are fsynced — so a
     /// Permit returned by the AVC is never ahead of a durable audit entry.
     ///
-    /// The store owns sequence assignment: the incoming `record.seq` is
-    /// **ignored** and overwritten with the store's monotonic counter, so the
-    /// monotonicity invariant cannot be violated by a caller. The caller
-    /// (the AVC) supplies `seq: 0` as a placeholder.
+    /// The store owns sequence + chain assignment: the incoming `record.seq`
+    /// and `record.prev_hash` are **ignored** and overwritten with the store's
+    /// monotonic counter and current chain head, so neither invariant can be
+    /// violated by a caller. The caller (the AVC) supplies `seq: 0` /
+    /// `prev_hash: [0; 32]` as placeholders. The whole critical section runs
+    /// under the head lock so the seq, the `prev_hash` link, and the journal
+    /// append cannot interleave with a concurrent writer (which would fork the
+    /// chain).
     fn record_inner(&self, record: &AuditRecord) -> Result<(), AuditError> {
-        // 0. Stamp the store-owned monotonic sequence number. The store is the
-        //    single authority for seq — a caller cannot forge or regress it.
-        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
+        // 0. Take the chain head. Held across the append so seq assignment,
+        //    prev_hash chaining, and the journal write are one atomic step.
+        //    (parking_lot::Mutex — no poisoning, lock() yields the guard.)
+        let mut head = self.head.lock();
+        let seq = head.next_seq;
         let stored = AuditRecord {
             seq,
+            prev_hash: head.head_hash,
             ..record.clone()
         };
 
-        // 1. Canonical bytes + content hash (content-addressing).
+        // 1. Canonical bytes + content hash (content-addressing + chain link).
         let bytes = stored.canonical_bytes()?;
         let hash = *blake3::hash(&bytes).as_bytes();
 
@@ -537,16 +653,59 @@ impl<S: AuditSigner> WalAuditStore<S> {
         // fsync but before the dir fsync can lose the directory entry.
         sync_dir(&self.root)?;
 
-        // 5. OTel fan-out: emit a structured tracing event so denials are
+        // 5. Advance and durably anchor the chain head. The signed checkpoint
+        //    records `(seq, hash)` out-of-band so a later tail-truncation is
+        //    detectable on open. Written AFTER the journal is durable: if we
+        //    crash between the two, the checkpoint lags the journal (benign —
+        //    open() treats a checkpoint behind the journal as fine); the
+        //    dangerous direction (checkpoint ahead of a shortened journal) only
+        //    arises from truncation, which is exactly what we detect.
+        self.write_checkpoint(seq, &hash)?;
+        head.next_seq = seq + 1;
+        head.head_hash = hash;
+        drop(head);
+
+        // 6. OTel fan-out: emit a structured tracing event so denials are
         //    observable (fixes #453). OTel is a tracing subscriber, so this
         //    reaches OTLP automatically when the `otel` feature is active.
         emit_decision_event(&stored);
         Ok(())
     }
 
-    /// Read the whole journal back, verifying each signature against `verifier`
-    /// and checking the sequence is gap-free. Returns the records in order.
-    /// Used by integrity-check tooling and tests.
+    /// Write the signed head anchor `(seq, head_hash)` to the checkpoint file,
+    /// atomically (temp + rename) and fsynced so it is durable before the
+    /// enclosing `record` returns. The signature is over a domain-separated
+    /// input distinct from the per-record one, so a record signature can never
+    /// be replayed as a checkpoint signature.
+    fn write_checkpoint(&self, seq: u64, head_hash: &[u8; 32]) -> Result<(), AuditError> {
+        let signing_input = checkpoint_signing_input(seq, head_hash);
+        let signature = self.signer.sign(&signing_input)?;
+        let line = format!(
+            "{}\t{}\t{}\n",
+            seq,
+            hex_encode(head_hash),
+            hex_encode(&signature),
+        );
+        let tmp = self.root.join(".checkpoint.tmp");
+        {
+            let mut f = File::create(&tmp)?;
+            f.write_all(line.as_bytes())?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &self.checkpoint_path)?;
+        sync_dir(&self.root)?;
+        Ok(())
+    }
+
+    /// Read the whole journal back and verify it end-to-end: every signature
+    /// against `verifier`, the sequence gap-free, the `prev_hash` **chain**
+    /// intact, and — if present — the signed checkpoint's signature and that it
+    /// anchors the journal's actual head. Returns the records in order.
+    ///
+    /// This is the offline/cryptographic counterpart to [`open`](Self::open)'s
+    /// cheap runtime check: it catches tampering, reordering, and middle
+    /// deletion (chain break) as well as tail truncation and checkpoint
+    /// rollback (checkpoint vs. head mismatch).
     pub fn verify_journal<V: AuditVerifier>(
         &self,
         verifier: &V,
@@ -557,6 +716,8 @@ impl<S: AuditSigner> WalAuditStore<S> {
         let content = std::fs::read_to_string(&self.journal_path)?;
         let mut out = Vec::new();
         let mut expected_seq = 0u64;
+        // The running chain head: each record must name this as its prev_hash.
+        let mut running_head = [0u8; 32];
         for (lineno, raw_line) in content.lines().enumerate() {
             let line = raw_line.trim_end_matches('\r');
             if line.is_empty() {
@@ -587,11 +748,46 @@ impl<S: AuditSigner> WalAuditStore<S> {
             let record: AuditRecord = serde_json::from_slice(&bytes).map_err(|e| {
                 AuditError::Decode(format!("journal line {}: bad record: {}", lineno + 1, e))
             })?;
+            // Chain: this record must link to the previous record's hash.
+            if record.prev_hash != running_head {
+                return Err(AuditError::ChainBreak { seq });
+            }
             // Recompute the content hash and verify the signature over it.
             let hash = *blake3::hash(&bytes).as_bytes();
             let signing_input = audit_signing_input(&hash);
             verifier.verify(&signing_input, &sig)?;
+            running_head = hash;
             out.push(record);
+        }
+
+        // Checkpoint: if one exists, its signature must verify and it must
+        // anchor the journal's actual head — a truncated tail or a rolled-back
+        // checkpoint is caught here. (A checkpoint strictly *behind* the head is
+        // a benign crash between the journal and checkpoint fsyncs.)
+        if let Some((cp_seq, cp_hash, cp_sig)) = read_checkpoint(&self.checkpoint_path)? {
+            let cp_input = checkpoint_signing_input(cp_seq, &cp_hash);
+            verifier.verify(&cp_input, &cp_sig)?;
+            let head_seq = out.last().map(|r| r.seq);
+            match head_seq {
+                // Checkpoint ahead of the journal head ⇒ the tail was truncated.
+                Some(h) if cp_seq > h => {
+                    return Err(AuditError::Truncation {
+                        checkpoint_seq: cp_seq,
+                        journal_seq: Some(h),
+                    });
+                }
+                None => {
+                    return Err(AuditError::Truncation {
+                        checkpoint_seq: cp_seq,
+                        journal_seq: None,
+                    });
+                }
+                // Checkpoint exactly at the head ⇒ verify it names the head hash.
+                Some(h) if cp_seq == h && cp_hash != running_head => {
+                    return Err(AuditError::ChainBreak { seq: cp_seq });
+                }
+                _ => {}
+            }
         }
         Ok(out)
     }
@@ -668,6 +864,9 @@ impl<A: Avc, S: AuditSink> AuditedAvc<A, S> {
             // re-stamp, seq stays as written here (tests use NullAuditSink and
             // don't rely on seq).
             seq: 0,
+            // Placeholder chain link; WalAuditStore assigns the real prev_hash
+            // under its head lock, exactly as it does seq.
+            prev_hash: [0u8; 32],
             ts_unix_nanos: now_unix_nanos(),
             decision: enforced,
             generation: self.generation,
@@ -929,26 +1128,72 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, AuditError> {
     Ok(out)
 }
 
-/// Scan the journal and return the highest `seq` seen, so a restart continues
-/// the sequence monotonically (truncation detection baseline).
-fn highest_seq_in_journal(path: &Path) -> Result<Option<u64>, AuditError> {
+/// Read the journal's last record and return its `(seq, content_hash)` — the
+/// chain head a restart continues from. The hash is recomputed from the stored
+/// payload (BLAKE3 of the canonical bytes), identical to how it was chained on
+/// write, so the next record links correctly. `None` for an empty/absent log.
+fn journal_tail(path: &Path) -> Result<Option<(u64, [u8; 32])>, AuditError> {
     if !path.exists() {
         return Ok(None);
     }
     let content = std::fs::read_to_string(path)?;
-    let mut max: Option<u64> = None;
-    for line in content.lines() {
-        let line = line.trim_end_matches('\r');
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(seq_s) = line.split('\t').next() {
-            if let Ok(seq) = seq_s.parse::<u64>() {
-                max = Some(max.map_or(seq, |m| m.max(seq)));
-            }
-        }
+    let Some(last) = content
+        .lines()
+        .map(|l| l.trim_end_matches('\r'))
+        .rfind(|l| !l.is_empty())
+    else {
+        return Ok(None);
+    };
+    let mut parts = last.split('\t');
+    let seq_s = parts
+        .next()
+        .ok_or_else(|| AuditError::Decode("journal tail missing seq".into()))?;
+    // parts[1] is the signature; parts[2] is the base64 payload.
+    let _sig = parts.next();
+    let payload_b64 = parts
+        .next()
+        .ok_or_else(|| AuditError::Decode("journal tail missing payload".into()))?;
+    let seq: u64 = seq_s
+        .parse()
+        .map_err(|e| AuditError::Decode(format!("journal tail bad seq: {e}")))?;
+    let bytes = base64_decode(payload_b64)?;
+    let hash = *blake3::hash(&bytes).as_bytes();
+    Ok(Some((seq, hash)))
+}
+
+/// Read the signed checkpoint head anchor: `(seq, head_hash, signature)`.
+/// `None` if no checkpoint has been written yet.
+fn read_checkpoint(path: &Path) -> Result<Option<(u64, [u8; 32], Vec<u8>)>, AuditError> {
+    if !path.exists() {
+        return Ok(None);
     }
-    Ok(max)
+    let content = std::fs::read_to_string(path)?;
+    let Some(line) = content
+        .lines()
+        .map(|l| l.trim_end_matches('\r'))
+        .find(|l| !l.is_empty())
+    else {
+        return Ok(None);
+    };
+    let mut parts = line.split('\t');
+    let seq_s = parts
+        .next()
+        .ok_or_else(|| AuditError::Decode("checkpoint missing seq".into()))?;
+    let hash_hex = parts
+        .next()
+        .ok_or_else(|| AuditError::Decode("checkpoint missing head_hash".into()))?;
+    let sig_hex = parts
+        .next()
+        .ok_or_else(|| AuditError::Decode("checkpoint missing sig".into()))?;
+    let seq: u64 = seq_s
+        .parse()
+        .map_err(|e| AuditError::Decode(format!("checkpoint bad seq: {e}")))?;
+    let hash_vec = hex_decode(hash_hex)?;
+    let hash: [u8; 32] = hash_vec
+        .try_into()
+        .map_err(|_| AuditError::Decode("checkpoint head_hash not 32 bytes".into()))?;
+    let sig = hex_decode(sig_hex)?;
+    Ok(Some((seq, hash, sig)))
 }
 
 /// fsync a directory (durability of directory entries: renames, creates).
@@ -1084,6 +1329,7 @@ mod tests {
     fn same_decision_yields_same_content_hash() {
         let mut rec = AuditRecord {
             seq: 1,
+            prev_hash: [0u8; 32],
             ts_unix_nanos: 0,
             decision: Decision::Permit,
             generation: 7,
@@ -1123,6 +1369,7 @@ mod tests {
         let store = WalAuditStore::open(&dir, StubSigner { key: [1; 32] }).unwrap();
         let rec = AuditRecord {
             seq: 0,
+            prev_hash: [0u8; 32],
             ts_unix_nanos: 1,
             decision: Decision::Permit,
             generation: 7,
@@ -1164,6 +1411,7 @@ mod tests {
         let store = WalAuditStore::open(&dir, StubSigner { key: [2; 32] }).unwrap();
         let rec = AuditRecord {
             seq: 0,
+            prev_hash: [0u8; 32],
             ts_unix_nanos: 42,
             decision: Decision::Deny,
             generation: 7,
@@ -1187,10 +1435,10 @@ mod tests {
         assert_eq!(recovered[0].reason, DecisionReason::TeMiss);
         assert_eq!(recovered[0].policy_hash, Some([0xaa; 32]));
 
-        // And the seq counter continued monotonically after reopen: the highest
+        // And the chain head continued monotonically after reopen: the highest
         // on-disk seq was 0, so the reopened counter is seeded to 1 (next write).
         assert_eq!(
-            reopened.seq.load(Ordering::SeqCst),
+            reopened.head.lock().next_seq,
             1,
             "reopened store must continue the sequence monotonically"
         );
@@ -1213,6 +1461,7 @@ mod tests {
         let store = WalAuditStore::open(&dir, StubSigner { key: [3; 32] }).unwrap();
         let rec = AuditRecord {
             seq: 0,
+            prev_hash: [0u8; 32],
             ts_unix_nanos: 1,
             decision: Decision::Permit,
             generation: 7,
@@ -1265,6 +1514,7 @@ mod tests {
         let store = WalAuditStore::open(&dir, StubSigner { key: [4; 32] }).unwrap();
         let base = AuditRecord {
             seq: 0, // ignored — the store assigns seq.
+            prev_hash: [0u8; 32], // ignored — the store assigns the chain link.
             ts_unix_nanos: 1,
             decision: Decision::Permit,
             generation: 7,
@@ -1305,6 +1555,143 @@ mod tests {
             }
             other => panic!("expected SeqRegression, got {other:?}"),
         }
+    }
+
+    // ── B3 (#675): hash-chain + signed checkpoint truncation detection ──────
+
+    /// A permit record with placeholder seq/prev_hash (the store assigns both).
+    fn perm_rec() -> AuditRecord {
+        AuditRecord {
+            seq: 0,
+            prev_hash: [0u8; 32],
+            ts_unix_nanos: 1,
+            decision: Decision::Permit,
+            generation: 7,
+            policy_hash: None,
+            subject_type: SubjectType(1),
+            subject_clearance: high(),
+            object_type: ObjectType(1),
+            object_label: low(),
+            action: Action(1),
+            reason: DecisionReason::Permit,
+        }
+    }
+
+    /// Drop the last journal line (simulate a truncated tail).
+    fn truncate_last_line(journal: &Path) {
+        let content = std::fs::read_to_string(journal).unwrap();
+        let mut lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        lines.pop();
+        std::fs::write(journal, lines.join("\n") + "\n").unwrap();
+    }
+
+    /// The headline B3 fix: deleting the journal tail is detected on reopen via
+    /// the signed checkpoint. The pre-fix store re-seeded its seq counter from
+    /// the truncated journal head and continued silently — this asserts we now
+    /// FAIL CLOSED instead.
+    #[test]
+    fn tail_truncation_is_detected_on_reopen() {
+        let dir = tmp_dir("b3_trunc_reopen");
+        let store = WalAuditStore::open(&dir, StubSigner { key: [7; 32] }).unwrap();
+        for _ in 0..3 {
+            store.record(&perm_rec()).unwrap(); // seq 0,1,2; checkpoint at seq 2
+        }
+        drop(store);
+
+        truncate_last_line(&dir.join("journal.log")); // journal head now seq 1
+
+        // `open` returns `Result<WalAuditStore, _>` and the store is not Debug,
+        // so match on the Result rather than `unwrap_err`.
+        let reopen = WalAuditStore::open(&dir, StubSigner { key: [7; 32] });
+        assert!(
+            matches!(
+                reopen,
+                Err(AuditError::Truncation {
+                    checkpoint_seq: 2,
+                    journal_seq: Some(1)
+                })
+            ),
+            "reopen must fail closed on the truncated tail"
+        );
+    }
+
+    /// The offline verifier catches the same truncation (and would also catch a
+    /// checkpoint that survived but is now ahead of the journal head).
+    #[test]
+    fn tail_truncation_is_detected_by_verify_journal() {
+        let dir = tmp_dir("b3_trunc_verify");
+        let store = WalAuditStore::open(&dir, StubSigner { key: [8; 32] }).unwrap();
+        for _ in 0..3 {
+            store.record(&perm_rec()).unwrap();
+        }
+        truncate_last_line(&dir.join("journal.log"));
+
+        let err = store
+            .verify_journal(&StubVerifier { key: [8; 32] })
+            .unwrap_err();
+        assert!(
+            matches!(err, AuditError::Truncation { checkpoint_seq: 2, .. }),
+            "verify_journal must detect the truncated tail, got {err:?}"
+        );
+    }
+
+    /// A record that is individually valid — correct seq, a real signature — but
+    /// links to the WRONG predecessor hash must break the chain. A checker that
+    /// only validated seq + signature (the pre-B3 behaviour) would accept it.
+    #[test]
+    fn forged_record_with_wrong_prev_hash_breaks_the_chain() {
+        let dir = tmp_dir("b3_chain");
+        let signer = StubSigner { key: [9; 32] };
+        let store = WalAuditStore::open(&dir, StubSigner { key: [9; 32] }).unwrap();
+        store.record(&perm_rec()).unwrap(); // seq 0
+        store.record(&perm_rec()).unwrap(); // seq 1
+        drop(store);
+
+        // Forge a replacement for the seq-1 line: valid seq, valid signature over
+        // its own content, but a bogus prev_hash that does not link to seq 0.
+        let forged = AuditRecord {
+            seq: 1,
+            prev_hash: [0xEE; 32],
+            ..perm_rec()
+        };
+        let bytes = forged.canonical_bytes().unwrap();
+        let hash = *blake3::hash(&bytes).as_bytes();
+        let sig = signer.sign(&audit_signing_input(&hash)).unwrap();
+        let forged_line = format!("1\t{}\t{}", hex_encode(&sig), base64_encode(&bytes));
+
+        let jp = dir.join("journal.log");
+        let content = std::fs::read_to_string(&jp).unwrap();
+        let mut lines: Vec<String> = content.lines().map(str::to_owned).collect();
+        lines[1] = forged_line;
+        std::fs::write(&jp, lines.join("\n") + "\n").unwrap();
+
+        // Reopen succeeds (seq 1 == checkpoint seq, no truncation); the chain
+        // break surfaces in verify_journal — before the signature even matters.
+        let reopened = WalAuditStore::open(&dir, StubSigner { key: [9; 32] }).unwrap();
+        let err = reopened
+            .verify_journal(&StubVerifier { key: [9; 32] })
+            .unwrap_err();
+        assert!(
+            matches!(err, AuditError::ChainBreak { seq: 1 }),
+            "a signed record with a wrong prev_hash must break the chain, got {err:?}"
+        );
+    }
+
+    /// An intact 3-record store verifies cleanly end-to-end (chain links + the
+    /// checkpoint anchors the real head) — the positive control for the above.
+    #[test]
+    fn intact_chain_and_checkpoint_verify() {
+        let dir = tmp_dir("b3_intact");
+        let store = WalAuditStore::open(&dir, StubSigner { key: [10; 32] }).unwrap();
+        for _ in 0..3 {
+            store.record(&perm_rec()).unwrap();
+        }
+        let recs = store
+            .verify_journal(&StubVerifier { key: [10; 32] })
+            .unwrap();
+        assert_eq!(recs.len(), 3);
+        assert_eq!(recs[0].prev_hash, [0u8; 32], "genesis links to zero");
+        assert_ne!(recs[1].prev_hash, [0u8; 32], "later records chain forward");
     }
 
     // ── Complete mediation: every decision is audited ───────────────────────
