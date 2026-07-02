@@ -12,6 +12,7 @@ using import "/annotations.capnp".scope;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".optional;
 using import "/annotations.capnp".domainType;
+using import "/annotations.capnp".vfsPath;
 
 # Unified discovery request with union discriminator
 struct DiscoveryRequest {
@@ -24,17 +25,20 @@ struct DiscoveryRequest {
     listServices @1 :Void $scope(query) $mcpDescription("List all registered services with descriptions");
 
     # Get all endpoints for a named service
-    getEndpoints @2 :Text $scope(query) $mcpDescription("Get all endpoints for a named service");
+    getEndpoints @2 :Text $scope(query) $mcpDescription("Get all endpoints for a named service")
+      $vfsPath("{arg}/endpoints");
 
     # Get schema bytes for a service
-    getSchema @3 :Text $scope(query) $mcpDescription("Get schema bytes for a service");
+    getSchema @3 :Text $scope(query) $mcpDescription("Get schema bytes for a service")
+      $vfsPath("{arg}/schema");
 
     # Health check
     ping @4 :Void $scope(query) $mcpDescription("Health check");
 
     # Get OAuth protected resource metadata (RFC 9728) for services
     # Text parameter filters by service name (empty = all services)
-    getAuthMetadata @5 :Text $scope(query) $mcpDescription("Get OAuth protected resource metadata for services");
+    getAuthMetadata @5 :Text $scope(query) $mcpDescription("Get OAuth protected resource metadata for services")
+      $vfsPath("{arg}/auth-metadata");
 
     # Removed: prepareStream (was insecure — bypassed DH key exchange).
     # Use StreamChannel::prepare_stream for authenticated streaming.
@@ -56,13 +60,15 @@ struct DiscoveryRequest {
     registerEntityStatement @10 :RegisterEntityStatementRequest $scope(write) $mcpDescription("Register a signed OIDF entity statement for an issuer");
 
     # Fetch a cached signed entity statement for an issuer (used by FederationKeyResolver before HTTPS fallback)
-    getEntityStatement @11 :Text $scope(query) $mcpDescription("Fetch cached signed entity statement for issuer URL");
+    getEntityStatement @11 :Text $scope(query) $mcpDescription("Fetch cached signed entity statement for issuer URL")
+      $vfsPath("{arg}/entity-statement");
 
     # Push a COSE_KeySet (CBOR) for a service's envelope-signing keys (called by each service at startup + rotation)
     registerEnvelopeKeyset @12 :RegisterEnvelopeKeysetRequest $scope(write) $mcpDescription("Register envelope COSE_KeySet for a service");
 
     # Fetch a cached COSE_KeySet for a service's envelope keys
-    getEnvelopeKeyset @13 :Text $scope(query) $mcpDescription("Fetch cached envelope COSE_KeySet for service DID");
+    getEnvelopeKeyset @13 :Text $scope(query) $mcpDescription("Fetch cached envelope COSE_KeySet for service DID")
+      $vfsPath("{arg}/envelope-keyset");
 
     # List all known issuer URLs whose entity statements are cached (authenticated)
     listKnownIssuers @14 :Void $scope(query) $mcpDescription("List issuers with cached entity statements");
@@ -75,7 +81,8 @@ struct DiscoveryRequest {
     getRecord @15 :GetRecordRequest $scope(query) $mcpDescription("Fetch an atproto record (ai.hyprstream.model) as a verifiable CAR proof");
 
     # #431 — fetch a full atproto repo CAR by DID (commit + MST + all records).
-    getRepo @16 :Text $scope(query) $mcpDescription("Fetch a full atproto repo CAR by DID");
+    getRepo @16 :Text $scope(query) $mcpDescription("Fetch a full atproto repo CAR by DID")
+      $vfsPath("{arg}/repo");
   }
 }
 
