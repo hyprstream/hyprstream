@@ -149,9 +149,10 @@ pub mod oauth_client {
 // WASM exports (browser only)
 // ============================================================================
 
-#[cfg(target_arch = "wasm32")]
+// Generic codegen-driven service→9p projection (`ServiceMount`) + stream pipes.
+// Native and wasm both: the same generated dispatch drives the file surface on
+// either target. (#539 T3)
 pub mod vfs_mount;
-#[cfg(target_arch = "wasm32")]
 pub mod stream_mount;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_exports;
