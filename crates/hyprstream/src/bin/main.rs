@@ -1112,7 +1112,9 @@ fn handle_quick_command(
                             pool_config,
                             backend,
                             #[cfg(feature = "kata-vm")]
-                            rafs_store,
+                            Some(rafs_store),
+                            #[cfg(not(feature = "kata-vm"))]
+                            None,
                             worker_transport,
                             signing_key.clone(),
                         )?;

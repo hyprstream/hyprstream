@@ -25,7 +25,6 @@ use super::backend::{SandboxBackend, SandboxHandle};
 use super::client::PodSandboxConfig;
 use super::sandbox::PodSandbox;
 use super::sandbox_fs::{SandboxFs, SandboxFsServer, VFS_SOCKET_NAME};
-use super::virtiofs::SandboxVirtiofs;
 use hyprstream_vfs::{Subject, SyntheticNode};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -38,15 +37,13 @@ pub struct KataHandle {
     pub hypervisor: Arc<dyn Hypervisor>,
     /// Path to the VM API socket.
     pub api_socket: PathBuf,
-    /// VirtioFS daemon serving RAFS to this VM (if an image was mounted).
-    pub virtiofs_daemon: Option<Arc<SandboxVirtiofs>>,
-    /// Path to the virtiofs socket.
+    /// Path to the virtio-fs socket the guest mounts. Served by the composed
+    /// VFS namespace (`vfs_server`).
     pub virtiofs_socket: Option<PathBuf>,
     /// Per-sandbox composed VFS server (FS-D, #365). When set, the guest's
     /// filesystem is the hyprstream VFS (rootfs + injected mounts) served by
-    /// `hyprstream-vfs-server` rather than the external `nydusd` RAFS share.
-    /// Held for the VM's lifetime so the serving thread + injected registries
-    /// outlive the guest; dropped on sandbox teardown.
+    /// `hyprstream-vfs-server`. Held for the VM's lifetime so the serving thread
+    /// + injected registries outlive the guest; dropped on sandbox teardown.
     pub vfs_server: Option<SandboxFsServer>,
 }
 
@@ -406,7 +403,6 @@ impl SandboxBackend for KataBackend {
         // mounts this composed VFS — no external `nydusd`. Each sandbox's
         // namespace/socket/Subject/writable-upper is private, so sandbox A's
         // namespace cannot expose sandbox B's rootfs or injected paths.
-        let virtiofs_daemon: Option<Arc<SandboxVirtiofs>> = None;
         let mut vfs_server: Option<SandboxFsServer> = None;
         let mut share_socket: Option<PathBuf> = None;
         if let Some(ref image_id) = sandbox.image_id {
@@ -448,7 +444,6 @@ impl SandboxBackend for KataBackend {
         let handle = Arc::new(KataHandle {
             hypervisor,
             api_socket,
-            virtiofs_daemon,
             virtiofs_socket: virtiofs_sock,
             vfs_server,
         });
@@ -525,7 +520,6 @@ impl SandboxBackend for KataBackend {
                 let fresh = Arc::new(KataHandle {
                     hypervisor: Arc::clone(&kata.hypervisor),
                     api_socket: kata.api_socket.clone(),
-                    virtiofs_daemon: None,
                     virtiofs_socket: None,
                     // The per-sandbox VFS server is not reusable across resets;
                     // a recycled sandbox composes a fresh one on next start.
@@ -655,7 +649,6 @@ mod tests {
         Arc::new(KataHandle {
             hypervisor: Arc::new(ch),
             api_socket: sandbox_path.join("test.sock"),
-            virtiofs_daemon: None,
             virtiofs_socket: Some(sandbox_path.join("virtiofs.sock")),
             vfs_server: None,
         })
@@ -775,7 +768,6 @@ mod tests {
 
         let kata = kata.unwrap();
         assert_eq!(kata.api_socket, temp.path().join("test.sock"));
-        assert!(kata.virtiofs_daemon.is_none());
         assert_eq!(
             kata.virtiofs_socket.as_deref(),
             Some(temp.path().join("virtiofs.sock").as_path())
@@ -874,8 +866,8 @@ mod tests {
             "reset should preserve the same hypervisor instance"
         );
 
-        // virtiofs fields should be cleared
-        assert!(kata.virtiofs_daemon.is_none(), "virtiofs_daemon should be cleared");
+        // virtiofs socket should be cleared on reset (the composed VFS server
+        // is not reused; a recycled sandbox composes a fresh one on next start).
         assert!(kata.virtiofs_socket.is_none(), "virtiofs_socket should be cleared");
 
         // api_socket should be preserved
