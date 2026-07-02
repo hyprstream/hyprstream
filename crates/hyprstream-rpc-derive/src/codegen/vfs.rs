@@ -177,10 +177,24 @@ pub fn validate_node(method_snake: &str, scope: &str, kind: NodeKind) -> Result<
 }
 
 /// Infer the default mount-relative path for a node when `$vfsPath` is unset.
-fn infer_path(kind: NodeKind, method_snake: &str, arg: &CapnpType) -> String {
+///
+/// `dir_is_sole_listing` distinguishes the common single-listing case (the
+/// listing IS the directory root, path `.`) from a struct with several `Dir`
+/// listings (e.g. registry's `repo/{repoId}` scope: `listBranches`/`listTags`/
+/// `listRemotes`/`listWorktrees` are all `query`+`Void` `list*` methods). In
+/// the latter case `.` would silently collide across every listing, so each
+/// gets a name-derived path instead: strip a leading `list_` from the method's
+/// snake-case name if present, else use the name as-is.
+fn infer_path(kind: NodeKind, method_snake: &str, arg: &CapnpType, dir_is_sole_listing: bool) -> String {
     match kind {
-        // A directory listing is the mount root by convention.
-        NodeKind::Dir => ".".to_owned(),
+        // The lone directory listing in this scope is the mount root by
+        // convention. When there's more than one, each needs its own name so
+        // they don't all collide at ".".
+        NodeKind::Dir if dir_is_sole_listing => ".".to_owned(),
+        NodeKind::Dir => method_snake
+            .strip_prefix("list_")
+            .unwrap_or(method_snake)
+            .to_owned(),
         // A scalar-arg file binds the arg from the path segment.
         NodeKind::File if !matches!(arg, CapnpType::Void) => "{arg}".to_owned(),
         // A control file lands at the conventional `ctl` node.
@@ -194,15 +208,28 @@ fn infer_path(kind: NodeKind, method_snake: &str, arg: &CapnpType) -> String {
 /// Build the `VfsNode` entry token stream for one set of request variants.
 ///
 /// Shared by the top-level table and each scoped-client subdir table. Returns
-/// `Err(compile_error_tokens)` on a bad `$vfsKind` or a scope/kind contradiction.
+/// `Err(compile_error_tokens)` on a bad `$vfsKind`, a scope/kind contradiction,
+/// or two methods landing on the same path.
+///
+/// Two passes: the first resolves each method's kind (needed to count how
+/// many un-annotated `Dir` listings this scope has, which decides whether the
+/// lone-listing "." default applies — see [`infer_path`]); the second
+/// resolves paths with that count in hand, then builds the entries and checks
+/// for any same-path collision across the whole scope.
 fn build_node_entries(
     variants: &[UnionVariant],
     scoped_names: &[&str],
     response_variants: &[UnionVariant],
     resolved: &ResolvedSchema,
 ) -> Result<Vec<TokenStream>, TokenStream> {
-    let mut node_entries: Vec<TokenStream> = Vec::new();
+    struct Resolved<'a> {
+        variant: &'a UnionVariant,
+        method_snake: String,
+        arg: CapnpType,
+        kind: NodeKind,
+    }
 
+    let mut resolved_variants: Vec<Resolved> = Vec::new();
     for v in variants {
         // Scoped clients project as subdirectories with their own tables; skip
         // them in the flat node list. `$vfsHidden` excludes a method entirely.
@@ -222,13 +249,47 @@ fn build_node_entries(
             return Err(compile_error(&msg));
         }
 
+        resolved_variants.push(Resolved { variant: v, method_snake, arg, kind });
+    }
+
+    // How many un-annotated methods in this scope infer to `Dir` — decides
+    // whether the sole one gets "." or each gets a name-derived path.
+    let unannotated_dir_count = resolved_variants
+        .iter()
+        .filter(|r| r.kind == NodeKind::Dir && r.variant.vfs_path.is_empty())
+        .count();
+    let dir_is_sole_listing = unannotated_dir_count <= 1;
+
+    let mut node_entries: Vec<TokenStream> = Vec::new();
+    // (path, method_snake) — `Ctl` entries are intentionally excluded: several
+    // write/manage methods sharing one `ctl` file, dispatched by the verb text
+    // written to it, is the designed multiplexing convention (see the module
+    // doc's mapping table), not a collision.
+    let mut seen_paths: Vec<(String, String)> = Vec::new();
+
+    for r in &resolved_variants {
+        let v = r.variant;
         let path = if v.vfs_path.is_empty() {
-            infer_path(kind, &method_snake, &arg)
+            infer_path(r.kind, &r.method_snake, &r.arg, dir_is_sole_listing)
         } else {
             v.vfs_path.clone()
         };
 
-        let kind_tokens = kind.to_tokens();
+        // The guard: two non-`Ctl` methods must not project to the same path
+        // — a 9P read node can only be served by one method. Fires regardless
+        // of whether the collision came from inference or explicit `$vfsPath`.
+        if r.kind != NodeKind::Ctl {
+            if let Some((_, other)) = seen_paths.iter().find(|(p, _)| *p == path) {
+                return Err(compile_error(&format!(
+                    "method `{}` and method `{other}` both project to VFS path `{path}` — set an explicit `$vfsPath` on at least one to disambiguate",
+                    r.method_snake
+                )));
+            }
+            seen_paths.push((path.clone(), r.method_snake.clone()));
+        }
+
+        let kind_tokens = r.kind.to_tokens();
+        let method_snake = r.method_snake.as_str();
         let scope = v.scope.as_str();
         let bulk = v.vfs_bulk;
 
@@ -377,7 +438,7 @@ mod tests {
     fn infers_parameterized_file_for_text_query() {
         let k = infer_kind("query", &CapnpType::Text, "getByName", false);
         assert_eq!(k, NodeKind::File);
-        assert_eq!(infer_path(k, "get_by_name", &CapnpType::Text), "{arg}");
+        assert_eq!(infer_path(k, "get_by_name", &CapnpType::Text, true), "{arg}");
     }
 
     #[test]
@@ -390,7 +451,7 @@ mod tests {
     fn infers_ctl_for_write() {
         let k = infer_kind("write", &CapnpType::Struct("CloneRequest".into()), "clone", false);
         assert_eq!(k, NodeKind::Ctl);
-        assert_eq!(infer_path(k, "clone", &CapnpType::Struct("CloneRequest".into())), "ctl");
+        assert_eq!(infer_path(k, "clone", &CapnpType::Struct("CloneRequest".into()), true), "ctl");
     }
 
     #[test]
@@ -576,5 +637,83 @@ mod tests {
         let resolved = ResolvedSchema::from(&schema);
         let out = generate_mount("dataonly", &resolved).to_string();
         assert!(out.is_empty(), "data-only schema has no mount: {out}");
+    }
+
+    // ── #669: multiple Void-arg listings in one struct must not collide ──────
+
+    #[test]
+    fn multiple_listings_get_distinct_name_derived_paths() {
+        // Mirrors registry's `repo/{repoId}` scope: four query+Void `list*`
+        // methods, none annotated — all would infer to "." without the fix.
+        let schema = schema_with(
+            vec![
+                variant("listBranches", "Void", "query"),
+                variant("listTags", "Void", "query"),
+                variant("listRemotes", "Void", "query"),
+                variant("listWorktrees", "Void", "query"),
+            ],
+            vec![],
+        );
+        let resolved = ResolvedSchema::from(&schema);
+        let out = generate_mount("repo", &resolved).to_string();
+
+        assert!(!out.contains("compile_error"), "no collision guard error: {out}");
+        assert!(out.contains("\"branches\""), "list_ prefix stripped: {out}");
+        assert!(out.contains("\"tags\""), "list_ prefix stripped: {out}");
+        assert!(out.contains("\"remotes\""), "list_ prefix stripped: {out}");
+        assert!(out.contains("\"worktrees\""), "list_ prefix stripped: {out}");
+        // None of the four should still be the bare "." (the pre-fix collision).
+        assert!(!out.contains("path : \".\""), "no method landed on the bare root: {out}");
+    }
+
+    #[test]
+    fn single_listing_still_defaults_to_dot() {
+        // The common case (one Dir-kind listing in the scope) is unaffected.
+        let schema = schema_with(vec![variant("list", "Void", "query")], vec![]);
+        let resolved = ResolvedSchema::from(&schema);
+        let out = generate_mount("registry", &resolved).to_string();
+
+        assert!(!out.contains("compile_error"), "no guard error: {out}");
+        assert!(out.contains("path : \".\""), "sole listing is still the scope root: {out}");
+    }
+
+    #[test]
+    fn explicit_vfs_path_overrides_even_with_multiple_listings() {
+        // Three listings: two explicitly annotated (never collide, whatever
+        // they're set to), one bare. Only the un-annotated ones count toward
+        // "how many listings default in this scope" — with just one bare
+        // listing left, it still gets the sole-listing "." default, and the
+        // explicit paths win over inference for the other two.
+        let mut branches = variant("listBranches", "Void", "query");
+        branches.vfs_path = "custom-branches".into();
+        let mut remotes = variant("listRemotes", "Void", "query");
+        remotes.vfs_path = "custom-remotes".into();
+        let schema = schema_with(
+            vec![branches, remotes, variant("listTags", "Void", "query")],
+            vec![],
+        );
+        let resolved = ResolvedSchema::from(&schema);
+        let out = generate_mount("repo", &resolved).to_string();
+
+        assert!(!out.contains("compile_error"), "no guard error: {out}");
+        assert!(out.contains("\"custom-branches\""), "explicit path wins: {out}");
+        assert!(out.contains("\"custom-remotes\""), "explicit path wins: {out}");
+        assert!(out.contains("path : \".\""), "the sole un-annotated listing still gets the root: {out}");
+    }
+
+    #[test]
+    fn collision_guard_fires_on_same_path() {
+        // Two distinct methods that would both resolve to the same explicit path.
+        let mut a = variant("getByName", "Text", "query");
+        a.vfs_path = "dup".into();
+        let mut b = variant("getById", "Text", "query");
+        b.vfs_path = "dup".into();
+        let schema = schema_with(vec![a, b], vec![]);
+        let resolved = ResolvedSchema::from(&schema);
+        let out = generate_mount("registry", &resolved).to_string();
+
+        assert!(out.contains("compile_error"), "collision is a build error: {out}");
+        assert!(out.contains("get_by_name") && out.contains("get_by_id"), "names both methods: {out}");
+        assert!(out.contains("dup"), "names the colliding path: {out}");
     }
 }
