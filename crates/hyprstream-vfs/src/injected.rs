@@ -181,12 +181,12 @@ impl Mount for SyntheticMount {
                     SyntheticNode::Dir(_) => (0x80, 0),
                     SyntheticNode::File(d) => (0, d.len() as u64),
                 };
-                Ok(Stat {
+                Ok(Stat::unknown_qid(
                     qtype,
                     size,
-                    name: st.components.last().cloned().unwrap_or_default(),
-                    mtime: 0,
-                })
+                    st.components.last().cloned().unwrap_or_default(),
+                    0,
+                ))
             }
             None => Err(MountError::NotFound(st.components.join("/"))),
         }
@@ -444,7 +444,7 @@ impl Mount for StreamMount {
             StreamFidState::Info { .. } => (0, "info".to_string()),
             StreamFidState::Ctl { .. } => (0, "ctl".to_string()),
         };
-        Ok(Stat { qtype, size: 0, name, mtime: 0 })
+        Ok(Stat::unknown_qid(qtype, 0, name, 0))
     }
 
     async fn clunk(&self, _fid: Fid, _caller: &Subject) {}

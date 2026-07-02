@@ -37,6 +37,10 @@
 
 use std::sync::Arc;
 
+use hyprstream_discovery::scheduling::{
+    self, CapabilitySource, Predicate, RejectionReason, Resource, SelectionReport,
+};
+
 use crate::config::PoolConfig;
 use crate::error::{Result, WorkerError};
 
@@ -219,8 +223,8 @@ pub fn resolve_backend(name: &str, ctx: &BackendCtx) -> Result<Arc<dyn SandboxBa
 //
 // The generic filter→rank→select explain trace (`SelectionReport<C>`) is owned
 // by the #628 scheduling substrate (`hyprstream-discovery::scheduling`);
-// `selection.rs` will adopt it once the substrate reaches main, rather than
-// carrying a second, backend-specific copy here.
+// `explain_selection` below composes on it (see the "Scheduling-substrate
+// adoption" section) rather than carrying a second, backend-specific copy.
 
 /// Backend-specific sub-reason for why `is_available()` returned `false`,
 /// e.g. "cloud-hypervisor not on PATH" for `kata`. Falls back to a generic
@@ -279,6 +283,135 @@ pub fn list_backends_for_wizard() -> Vec<BackendStatus> {
             }
         })
         .collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scheduling-substrate adoption (#628)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The explain surface #348 needs is the #628 substrate's generic
+// `filter → rank → select → SelectionReport<C>`. Backend selection is one
+// consumer of that shape: candidates are the compiled-in registrations,
+// availability is a `Predicate` whose `RejectionReason` is sourced from
+// `unavailable_reason`, and rank is by descending priority. `explain_selection`
+// runs the substrate pipeline and returns its `SelectionReport`, so the trace
+// falls out of `select` for free — no bespoke report type here.
+//
+// `resolve_backend`/`select_registration` above remain the authoritative
+// construction path (they encode explicit-name and unknown-name semantics that
+// are not a single generic `select` call); the substrate governs the "auto"
+// explain trace, keeping one explain shape across every scheduling surface.
+//
+// Full resource-aware ranking (GPU/memory/NUMA via `ResourceRequest`) plugs in
+// here as additional predicates + a resource-aware `rank_by`; that is downstream
+// consumer work (#341/#525). This adoption wires availability-as-predicate +
+// explain + the capability-source seam.
+
+/// A cloneable projection of a [`BackendRegistration`] for the substrate's
+/// generic pipeline (`SelectionReport<C>` requires `C: Clone`; a registration
+/// holds `fn` pointers and is not cloneable). Carries exactly what selection
+/// filtering, ranking, and the explain trace need.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendCandidate {
+    /// Registered backend name (`"kata"`, `"nspawn"`, …).
+    pub name: &'static str,
+    /// Auto-selection precedence (higher preferred).
+    pub priority: i32,
+    /// Whether `"auto"` may pick this backend.
+    pub auto_selectable: bool,
+    /// Live availability probe result at the time the candidate was captured.
+    pub available: bool,
+}
+
+impl BackendCandidate {
+    fn from_registration(reg: &BackendRegistration) -> Self {
+        Self {
+            name: reg.name,
+            priority: reg.priority,
+            auto_selectable: reg.auto_selectable,
+            available: (reg.is_available)(),
+        }
+    }
+}
+
+/// Runtime availability + capability truth a backend contributes to the shared
+/// scheduling vocabulary. A node-record publisher aggregates these across every
+/// registered backend so a placement record's `runtime=<name>` labels reflect
+/// what is actually available here (no hand-declaration, no drift — #628).
+impl CapabilitySource for BackendCandidate {
+    fn capability_labels(&self) -> Vec<(String, String)> {
+        vec![
+            ("runtime".to_owned(), self.name.to_owned()),
+            (
+                format!("runtime.{}.available", self.name),
+                self.available.to_string(),
+            ),
+        ]
+    }
+
+    fn capability_resources(&self) -> Vec<Resource> {
+        // Backend selection contributes runtime-availability labels, not
+        // countable capacity; GPU/memory/NUMA capacity comes from other sources
+        // (DevicePool, node liveness). See the module note on resource-aware rank.
+        Vec::new()
+    }
+}
+
+/// Availability predicate: rejects a candidate whose runtime prerequisites are
+/// missing, carrying the backend-specific [`unavailable_reason`] as the
+/// [`RejectionReason`] so it lands in the [`SelectionReport`] trace.
+fn availability_predicate() -> Predicate<BackendCandidate> {
+    Box::new(|c: &BackendCandidate| {
+        if c.available {
+            None
+        } else {
+            Some(RejectionReason(unavailable_reason(c.name)))
+        }
+    })
+}
+
+/// Auto-eligibility predicate: rejects backends excluded from `"auto"` (the
+/// isolation-downgrade guard, #547 ZSP), with the reason recorded in the trace.
+fn auto_eligibility_predicate() -> Predicate<BackendCandidate> {
+    Box::new(|c: &BackendCandidate| {
+        if c.auto_selectable {
+            None
+        } else {
+            Some(RejectionReason(format!(
+                "backend '{}' is explicit-name-only (excluded from auto-selection; \
+                 no silent isolation downgrade)",
+                c.name
+            )))
+        }
+    })
+}
+
+/// Explain what `"auto"` selection would decide over the compiled-in registry,
+/// as the shared [`SelectionReport`]. The winning candidate is the highest-
+/// priority backend that is both auto-eligible and available; every other
+/// candidate carries the [`RejectionReason`] that excluded it.
+///
+/// This is diagnostics only (a wizard/CLI "why this backend?" trace); the
+/// authoritative construction path is [`resolve_backend`]. Both agree on the
+/// same winner for `"auto"` because both rank by descending priority over the
+/// auto-eligible, available set.
+pub fn explain_selection() -> SelectionReport<BackendCandidate> {
+    let candidates: Vec<BackendCandidate> = inventory::iter::<BackendRegistration>()
+        .map(BackendCandidate::from_registration)
+        .collect();
+
+    let predicates = vec![auto_eligibility_predicate(), availability_predicate()];
+
+    let mut report = scheduling::select(
+        &candidates,
+        &predicates,
+        // Highest priority first; name ascending as a deterministic tiebreak —
+        // matching `select_registration`'s "auto" ordering exactly.
+        |a, b| b.priority.cmp(&a.priority).then_with(|| a.name.cmp(b.name)),
+        1, // "auto" selects a single backend
+    );
+    report.requested = "auto".to_owned();
+    report
 }
 
 #[cfg(test)]
@@ -629,5 +762,117 @@ mod tests {
         for s in &statuses {
             assert_eq!(s.reason_if_unavailable.is_some(), !s.available);
         }
+    }
+
+    // ── Scheduling-substrate explain adoption (#628) ──
+    //
+    // These exercise the substrate pipeline over `BackendCandidate` directly (a
+    // deterministic candidate set), proving the migrated explain produces the
+    // shared `SelectionReport<C>` and that `unavailable_reason` flows through as
+    // the `RejectionReason`. `explain_selection()` itself is a thin wrapper that
+    // feeds the real inventory into this same pipeline.
+
+    fn candidate(name: &'static str, priority: i32, auto: bool, avail: bool) -> BackendCandidate {
+        BackendCandidate { name, priority, auto_selectable: auto, available: avail }
+    }
+
+    /// Reusable copy of `explain_selection`'s pipeline over an explicit candidate
+    /// set (so tests don't depend on the host's installed runtimes).
+    fn explain_over(candidates: &[BackendCandidate]) -> SelectionReport<BackendCandidate> {
+        let predicates = vec![auto_eligibility_predicate(), availability_predicate()];
+        let mut report = scheduling::select(
+            candidates,
+            &predicates,
+            |a, b| b.priority.cmp(&a.priority).then_with(|| a.name.cmp(b.name)),
+            1,
+        );
+        report.requested = "auto".to_owned();
+        report
+    }
+
+    #[test]
+    fn explain_selects_highest_priority_available_auto_eligible() {
+        let cands = vec![
+            candidate("kata", 100, true, true),
+            candidate("nspawn", 10, true, true),
+        ];
+        let report = explain_over(&cands);
+        let selected: Vec<&str> =
+            report.candidates.iter().filter(|o| o.selected).map(|o| o.candidate.name).collect();
+        assert_eq!(selected, vec!["kata"], "highest-priority available wins");
+        assert_eq!(report.requested, "auto");
+    }
+
+    #[test]
+    fn explain_reports_unavailable_reason_as_rejection() {
+        // kata unavailable → excluded, and its RejectionReason must be the
+        // backend-specific `unavailable_reason` (the #628 integration point).
+        let cands = vec![
+            candidate("kata", 100, true, false),
+            candidate("nspawn", 10, true, true),
+        ];
+        let report = explain_over(&cands);
+        let kata = report.candidates.iter().find(|o| o.candidate.name == "kata").unwrap();
+        assert!(!kata.selected);
+        assert_eq!(kata.rejection_reason.as_deref(), Some(unavailable_reason("kata").as_str()));
+        assert!(kata.rejection_reason.as_deref().unwrap().contains("cloud-hypervisor"));
+        // nspawn (available, auto-eligible) is the winner.
+        let nspawn = report.candidates.iter().find(|o| o.candidate.name == "nspawn").unwrap();
+        assert!(nspawn.selected);
+    }
+
+    #[test]
+    fn explain_excludes_auto_ineligible_with_reason() {
+        // An explicit-name-only backend (e.g. wasm) at the highest priority and
+        // available must be rejected in the trace, and a weaker auto-eligible
+        // backend selected — matching `select_registration`'s auto semantics.
+        let cands = vec![
+            candidate("wasm", 1000, false, true),
+            candidate("nspawn", 10, true, true),
+        ];
+        let report = explain_over(&cands);
+        let wasm = report.candidates.iter().find(|o| o.candidate.name == "wasm").unwrap();
+        assert!(!wasm.selected);
+        assert!(wasm.rejection_reason.as_deref().unwrap().contains("explicit-name-only"));
+        let nspawn = report.candidates.iter().find(|o| o.candidate.name == "nspawn").unwrap();
+        assert!(nspawn.selected, "auto must pick the auto-eligible backend, never the excluded one");
+    }
+
+    #[test]
+    fn explain_agrees_with_select_registration_on_the_winner() {
+        // The explain trace and the authoritative `select_registration` path must
+        // agree on which backend `"auto"` yields, over the same candidate set.
+        const A: BackendRegistration = BackendRegistration {
+            name: "high-tier", priority: 100, auto_selectable: true,
+            is_available: || true, construct: never_available,
+        };
+        const B: BackendRegistration = BackendRegistration {
+            name: "low-tier", priority: 10, auto_selectable: true,
+            is_available: || true, construct: never_available,
+        };
+        let regs = vec![&A, &B];
+        let winner = select_registration("auto", &regs, |_| true).unwrap();
+
+        let cands: Vec<BackendCandidate> =
+            regs.iter().map(|r| BackendCandidate::from_registration(r)).collect();
+        let report = explain_over(&cands);
+        let explained = report
+            .candidates
+            .iter()
+            .find(|o| o.selected)
+            .map(|o| o.candidate.name)
+            .unwrap();
+        assert_eq!(explained, winner.name, "explain winner must match select_registration");
+    }
+
+    #[test]
+    fn backend_candidate_capability_labels_emit_runtime_truth() {
+        // The capability-source seam: a backend contributes `runtime=<name>` +
+        // availability so a node record can aggregate it (#628, no drift).
+        let c = candidate("kata", 100, true, false);
+        let labels = c.capability_labels();
+        assert!(labels.contains(&("runtime".to_owned(), "kata".to_owned())));
+        assert!(labels.contains(&("runtime.kata.available".to_owned(), "false".to_owned())));
+        assert!(c.capability_resources().is_empty());
     }
 }

@@ -73,6 +73,8 @@ pub use runtime::{WorkerService, SandboxBackend, SandboxHandle, NspawnBackend, N
 pub use runtime::{resolve_backend, BackendCtx, BackendRegistration};
 // Wizard/CLI selection diagnostics (#348)
 pub use runtime::{list_backends_for_wizard, BackendStatus};
+// Scheduling-substrate explain (#628): the shared SelectionReport<C> trace.
+pub use runtime::{explain_selection, BackendCandidate};
 #[cfg(feature = "kata-vm")]
 pub use runtime::KataBackend;
 // The image-store trait seam is always available; only the concrete RAFS impl

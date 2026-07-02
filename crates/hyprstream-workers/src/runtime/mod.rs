@@ -98,6 +98,8 @@ pub use wasm_backend::{WasmBackend, WasmConfig, WasmHandle};
 pub use selection::{resolve_backend, BackendCtx, BackendRegistration};
 // Wizard/CLI selection diagnostics (#348)
 pub use selection::{list_backends_for_wizard, BackendStatus};
+// Scheduling-substrate explain (#628): the shared SelectionReport<C> trace.
+pub use selection::{explain_selection, BackendCandidate};
 // Domain entities (business logic only)
 pub use container::Container;
 pub use pool::{PoolStats, SandboxPool};

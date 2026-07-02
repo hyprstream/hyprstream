@@ -18,6 +18,10 @@ hyprstream-rpc = { path = "../hyprstream-rpc" }
 hyprstream-workers-wasmtime = { path = "../hyprstream-workers-wasmtime", optional = true }
 hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }
 hyprstream-service = { path = "../hyprstream-service" }
+# Shared scheduling substrate (#628): filter→rank→select + SelectionReport<C> +
+# RejectionReason. `selection.rs` composes backend selection on these instead of
+# a bespoke explain shape.
+hyprstream-discovery = { path = "../hyprstream-discovery" }
 hyprstream-vfs = { path = "../hyprstream-vfs" }
 # FS-A's vhost-user-fs server (native-only): serves a composed per-sandbox
 # Namespace to a Cloud Hypervisor guest. FS-D wires the compose→serve→attach
