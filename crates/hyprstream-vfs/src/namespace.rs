@@ -45,6 +45,12 @@ pub enum BindFlag {
     Before,
     /// Append: new mount's entries appear after existing.
     After,
+    /// Append *and* designate this target as the union's writable **upper**
+    /// layer for copy-up (#370). A write to a path that exists only in a
+    /// read-only lower is copied up into this target specifically, rather than
+    /// the first target that happens to accept a `create` (the bind-order
+    /// heuristic used when no upper is designated).
+    Upper,
 }
 
 /// What a mount point routes to — always an in-process Mount impl.
@@ -53,6 +59,11 @@ pub type MountTarget = Arc<dyn Mount>;
 struct MountEntry {
     prefix: String,
     targets: Vec<MountTarget>,
+    /// The designated copy-up upper for this union, if one was bound with
+    /// [`BindFlag::Upper`]. Held as an `Arc` clone (not an index) so it stays
+    /// stable across later `Before` inserts that would shift positions. Always
+    /// also present in `targets` (so reads and readdir-merge see it).
+    upper: Option<MountTarget>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -89,26 +100,40 @@ impl Namespace {
     /// - `Before`: prepends the target — its entries appear first in readdir,
     ///   and walk tries it before existing mounts at the same prefix.
     /// - `After`: appends the target — existing mounts are tried first.
+    /// - `Upper`: appends the target *and* records it as the union's writable
+    ///   copy-up upper (#370). See [`BindFlag::Upper`].
     pub fn bind_mount(&mut self, prefix: &str, target: MountTarget, flag: BindFlag) -> Result<(), NamespaceError> {
         let prefix = normalize_prefix(prefix);
 
         match flag {
             BindFlag::Replace => {
                 self.mounts.retain(|m| m.prefix != prefix);
-                self.mounts.push(MountEntry { prefix, targets: vec![target] });
+                self.mounts.push(MountEntry { prefix, targets: vec![target], upper: None });
             }
             BindFlag::Before => {
                 if let Some(entry) = self.mounts.iter_mut().find(|m| m.prefix == prefix) {
                     entry.targets.insert(0, target);
                 } else {
-                    self.mounts.push(MountEntry { prefix, targets: vec![target] });
+                    self.mounts.push(MountEntry { prefix, targets: vec![target], upper: None });
                 }
             }
             BindFlag::After => {
                 if let Some(entry) = self.mounts.iter_mut().find(|m| m.prefix == prefix) {
                     entry.targets.push(target);
                 } else {
-                    self.mounts.push(MountEntry { prefix, targets: vec![target] });
+                    self.mounts.push(MountEntry { prefix, targets: vec![target], upper: None });
+                }
+            }
+            BindFlag::Upper => {
+                if let Some(entry) = self.mounts.iter_mut().find(|m| m.prefix == prefix) {
+                    entry.targets.push(Arc::clone(&target));
+                    entry.upper = Some(target);
+                } else {
+                    self.mounts.push(MountEntry {
+                        prefix,
+                        targets: vec![Arc::clone(&target)],
+                        upper: Some(target),
+                    });
                 }
             }
         }
@@ -132,6 +157,7 @@ impl Namespace {
             mounts: self.mounts.iter().map(|m| MountEntry {
                 prefix: m.prefix.clone(),
                 targets: m.targets.iter().map(Arc::clone).collect(),
+                upper: m.upper.as_ref().map(Arc::clone),
             }).collect(),
         }
     }
@@ -139,6 +165,22 @@ impl Namespace {
     /// List all mount prefixes (for debugging / `ls /`).
     pub fn mount_prefixes(&self) -> Vec<&str> {
         self.mounts.iter().map(|m| m.prefix.as_str()).collect()
+    }
+
+    /// Whether the union at `prefix` has a designated copy-up upper
+    /// ([`BindFlag::Upper`]).
+    ///
+    /// This is the query side of the union's copy-up policy (#370). It is the
+    /// in-process accessor for what a per-union `ctl` control file will expose
+    /// once namespace mutation is mediated through the reference monitor (#613);
+    /// designating the upper at bind time via `BindFlag::Upper` is the write
+    /// side today.
+    pub fn has_designated_upper(&self, prefix: &str) -> bool {
+        let prefix = normalize_prefix(prefix);
+        self.mounts
+            .iter()
+            .find(|m| m.prefix == prefix)
+            .is_some_and(|m| m.upper.is_some())
     }
 
     // ── Convenience methods ─────────────────────────────────────────────────
@@ -209,12 +251,14 @@ impl Namespace {
 
     /// Write data to a file. Walk + open(write) + write + clunk.
     ///
-    /// With union mounts, this implements **copy-up** (#394):
+    /// With union mounts, this implements **copy-up** (#394, #370):
     ///   1. Try each target in bind order. The first writable target that
     ///      already holds the file (open(OWRITE) succeeds) wins.
     ///   2. If no writable target has the file but a read-only *lower* layer
-    ///      does, the lower-layer bytes are copied to the first writable
-    ///      *upper* layer (create + write) before applying the new data.
+    ///      does, the lower-layer bytes are copied to the writable *upper*
+    ///      layer (create + write) before applying the new data. The upper is
+    ///      the target designated with [`BindFlag::Upper`] if one exists,
+    ///      otherwise the first target that accepts a `create` (bind order).
     ///      The upper layer is node-local and append-only (journal), so this
     ///      never mutates the immutable `/oid` floor in place.
     ///
@@ -222,7 +266,8 @@ impl Namespace {
     /// write to a path that resolves through the union dirty-over-committed
     /// tree lands in the upper layer, leaving the committed floor untouched.
     pub async fn echo(&self, path: &str, data: &[u8], caller: &Subject) -> Result<(), NamespaceError> {
-        let (targets, remainder) = self.resolve(path)?;
+        let (entry, remainder) = self.resolve_entry(path)?;
+        let targets = &entry.targets[..];
         let components: Vec<&str> = split_path(&remainder);
         let mut last_err = None;
 
@@ -251,9 +296,9 @@ impl Namespace {
         }
 
         // Pass 2: copy-up. If no writable target held the file, check whether a
-        // lower layer has it; if so, stage it into the first writable upper
-        // target before writing the new data.
-        if let Some(copied) = self.copy_up(targets, &components, data, caller).await? {
+        // lower layer has it; if so, stage it into the designated (or first
+        // writable) upper target before writing the new data.
+        if let Some(copied) = self.copy_up(targets, entry.upper.as_ref(), &components, data, caller).await? {
             return Ok(copied);
         }
 
@@ -312,8 +357,13 @@ impl Namespace {
 
     /// Copy-up: if `components` exists in a read-only lower layer but not in
     /// any writable upper target, read the lower bytes and stage them into the
-    /// first writable upper target via create+write, then apply `new_data` on
-    /// top at offset 0.
+    /// upper target via create+write, then apply `new_data` on top at offset 0.
+    ///
+    /// `upper` is the target designated with [`BindFlag::Upper`] for this union,
+    /// if any. When set, copy-up writes to it specifically. When `None`, copy-up
+    /// falls back to the first target in bind order that accepts a `create`
+    /// (#394's original heuristic) — preserving behaviour for unions bound
+    /// without an explicit upper.
     ///
     /// Returns `Some(())` if copy-up succeeded (caller treats that as a
     /// successful echo), or `None` if no lower-layer source was found (caller
@@ -329,9 +379,14 @@ impl Namespace {
     /// so the visible result is just `new_data` — copy-up only matters for the
     /// partial-write / append path, but staging unconditionally keeps the upper
     /// layer a faithful snapshot of "floor + edits".
+    ///
+    /// `caller` threads through both the lower read and the upper create+write,
+    /// so copy-up is mediated by the same `Subject` checks as any other op — it
+    /// is not a privileged bypass (matters for MAC enforcement, #547).
     async fn copy_up(
         &self,
         targets: &[MountTarget],
+        upper: Option<&MountTarget>,
         components: &[&str],
         new_data: &[u8],
         caller: &Subject,
@@ -371,9 +426,9 @@ impl Namespace {
         }
         let Some(_lower) = lower_bytes else { return Ok(None); };
 
-        // Stage into the first writable upper target. We only reach copy-up when
-        // the direct open(OWRITE) pass failed on every target, so the upper
-        // target must *create* the file.
+        // Stage into the upper target. We only reach copy-up when the direct
+        // open(OWRITE) pass failed on every target, so the upper target must
+        // *create* the file.
         //
         // `echo` is a full-file write at offset 0, so the new content fully
         // replaces whatever the lower layer held — the staged lower bytes would
@@ -381,10 +436,18 @@ impl Namespace {
         // and write only `new_data`. (Partial-write / append paths that need to
         // preserve the lower prefix go through a different primitive, not
         // `echo`; see the module docs on the append-only upper + journal.)
-        for mount in targets {
-            let new_data_clone = new_data.to_vec();
-            let result: Result<(), MountError> = async {
-                let mut dir_fid = mount.walk(parent, caller).await?;
+        //
+        // Target selection: if the union has a designated upper
+        // ([`BindFlag::Upper`]), copy up into it specifically. Otherwise fall
+        // back to the first target in bind order that accepts the create.
+        let create_into = |mount: &MountTarget| {
+            let mount = Arc::clone(mount);
+            let new_data = new_data.to_vec();
+            let name = name.to_string();
+            let parent: Vec<String> = parent.iter().map(|s| s.to_string()).collect();
+            async move {
+                let parent_refs: Vec<&str> = parent.iter().map(String::as_str).collect();
+                let mut dir_fid = mount.walk(&parent_refs, caller).await?;
                 // Open the parent dir read-only so impls that need an open fid
                 // before create are satisfied.
                 if let Err(e) = mount.open(&mut dir_fid, 0, caller).await {
@@ -392,15 +455,30 @@ impl Namespace {
                     return Err(e);
                 }
                 let _stat = mount
-                    .create(&mut dir_fid, name, 0o644, OWRITE, caller)
+                    .create(&mut dir_fid, &name, 0o644, OWRITE, caller)
                     .await?;
                 // The create consumed the dir fid and replaced it with the
                 // opened new file. Write the caller's full-file content.
-                mount.write(&dir_fid, 0, &new_data_clone, caller).await?;
+                mount.write(&dir_fid, 0, &new_data, caller).await?;
                 mount.clunk(dir_fid, caller).await;
-                Ok(())
-            }.await;
-            match result {
+                Ok::<(), MountError>(())
+            }
+        };
+
+        if let Some(up) = upper {
+            // Explicit upper: copy-up targets it and nothing else. A failure
+            // here is the real result — we do not silently fall through to some
+            // other writable target, because that would defeat the point of
+            // designating the upper.
+            return match create_into(up).await {
+                Ok(()) => Ok(Some(())),
+                Err(MountError::NotSupported(_)) => Ok(None),
+                Err(e) => Err(NamespaceError::Mount(e)),
+            };
+        }
+
+        for mount in targets {
+            match create_into(mount).await {
                 Ok(()) => return Ok(Some(())),
                 Err(MountError::NotSupported(_)) => continue,
                 Err(e) => return Err(NamespaceError::Mount(e)),
@@ -526,12 +604,18 @@ impl Namespace {
     ///
     /// Returns targets in bind order (Before targets first, After targets last).
     fn resolve(&self, path: &str) -> Result<(&[MountTarget], String), NamespaceError> {
+        self.resolve_entry(path).map(|(entry, remainder)| (&entry.targets[..], remainder))
+    }
+
+    /// Resolve a path to its owning `MountEntry` (which carries the designated
+    /// copy-up upper, if any) plus the remainder after the matched prefix.
+    fn resolve_entry(&self, path: &str) -> Result<(&MountEntry, String), NamespaceError> {
         let path = normalize_path(path);
 
         for entry in &self.mounts {
             if path == entry.prefix || path.starts_with(&format!("{}/", entry.prefix)) {
                 let remainder = path[entry.prefix.len()..].to_owned();
-                return Ok((&entry.targets, remainder));
+                return Ok((entry, remainder));
             }
         }
 
@@ -1253,5 +1337,272 @@ mod tests {
             NamespaceError::Mount(MountError::NotSupported(_)) => {}
             other => panic!("expected NotSupported, got {other:?}"),
         }
+    }
+
+    // ── Designated copy-up upper (BindFlag::Upper) tests (#370) ──────────────
+
+    /// A writable mount that denies every op unless the caller is a specific
+    /// subject. Models a MAC-mediated upper: copy-up threads the caller through
+    /// the create+write, so a wrong subject must fail closed.
+    struct SubjectGatedMount {
+        allow: String,
+        files: std::sync::Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    impl SubjectGatedMount {
+        fn new(allow: &str) -> Self {
+            Self { allow: allow.to_owned(), files: std::sync::Mutex::new(HashMap::new()) }
+        }
+        fn snapshot(&self) -> HashMap<String, Vec<u8>> {
+            self.files.lock().unwrap().clone()
+        }
+        fn check(&self, caller: &Subject) -> Result<(), MountError> {
+            if caller.name() == Some(self.allow.as_str()) {
+                Ok(())
+            } else {
+                Err(MountError::PermissionDenied("subject not permitted".into()))
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Mount for SubjectGatedMount {
+        async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
+            Ok(Fid::new(WritableFid { path: components.join("/"), is_open: false, mode: 0 }))
+        }
+        async fn open(&self, fid: &mut Fid, mode: u8, caller: &Subject) -> Result<(), MountError> {
+            let inner = fid.downcast_mut::<WritableFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            if inner.path.is_empty() {
+                inner.is_open = true;
+                inner.mode = mode;
+                return Ok(());
+            }
+            // Writing needs the permitted subject; a read of an existing file is
+            // fine (this mount is only ever a lower in the deny test).
+            if mode & 0x03 == OWRITE {
+                self.check(caller)?;
+            }
+            if !self.files.lock().unwrap().contains_key(&inner.path) {
+                return Err(MountError::NotFound(inner.path.clone()));
+            }
+            inner.is_open = true;
+            inner.mode = mode;
+            Ok(())
+        }
+        async fn read(&self, fid: &Fid, offset: u64, _count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
+            let inner = fid.downcast_ref::<WritableFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            match self.files.lock().unwrap().get(&inner.path) {
+                Some(data) => {
+                    let start = offset as usize;
+                    if start >= data.len() { Ok(vec![]) } else { Ok(data[start..].to_vec()) }
+                }
+                None => Err(MountError::NotFound(inner.path.clone())),
+            }
+        }
+        async fn write(&self, fid: &Fid, offset: u64, data: &[u8], caller: &Subject) -> Result<u32, MountError> {
+            self.check(caller)?;
+            let inner = fid.downcast_ref::<WritableFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            let mut files = self.files.lock().unwrap();
+            let entry = files.entry(inner.path.clone()).or_default();
+            let start = offset as usize;
+            let end = start + data.len();
+            if end > entry.len() {
+                entry.resize(end, 0);
+            }
+            entry[start..end].copy_from_slice(data);
+            Ok(data.len() as u32)
+        }
+        async fn readdir(&self, _fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> { Ok(vec![]) }
+        async fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
+            let inner = fid.downcast_ref::<WritableFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            Ok(Stat::unknown_qid(0, 0, inner.path.clone(), 0))
+        }
+        async fn clunk(&self, _fid: Fid, _caller: &Subject) {}
+        async fn create(&self, fid: &mut Fid, name: &str, _perm: u32, mode: u8, caller: &Subject) -> Result<Stat, MountError> {
+            self.check(caller)?;
+            let inner = fid.downcast_mut::<WritableFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            let child = if inner.path.is_empty() { name.to_owned() } else { format!("{}/{}", inner.path, name) };
+            self.files.lock().unwrap().insert(child.clone(), Vec::new());
+            inner.path = child;
+            inner.is_open = true;
+            inner.mode = mode;
+            Ok(Stat::unknown_qid(0, 0, name.to_owned(), 0))
+        }
+    }
+
+    /// A read-only mount that also lists its files via readdir, so union
+    /// readdir-merge can be exercised. (`ReadOnlyMemMount` returns an empty
+    /// readdir; this one reports its entries.)
+    struct ReadOnlyReaddirMount {
+        files: HashMap<String, Vec<u8>>,
+    }
+
+    impl ReadOnlyReaddirMount {
+        fn new(files: Vec<(&str, &[u8])>) -> Self {
+            Self { files: files.into_iter().map(|(k, v)| (k.to_owned(), v.to_vec())).collect() }
+        }
+    }
+
+    #[async_trait]
+    impl Mount for ReadOnlyReaddirMount {
+        async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
+            Ok(Fid::new(RoFid { path: components.join("/") }))
+        }
+        async fn open(&self, fid: &mut Fid, mode: u8, _caller: &Subject) -> Result<(), MountError> {
+            if mode & 0x03 == OWRITE {
+                return Err(MountError::PermissionDenied("read-only".into()));
+            }
+            let _ = fid.downcast_ref::<RoFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            Ok(())
+        }
+        async fn read(&self, fid: &Fid, offset: u64, _count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
+            let inner = fid.downcast_ref::<RoFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            match self.files.get(&inner.path) {
+                Some(data) => {
+                    let start = offset as usize;
+                    if start >= data.len() { Ok(vec![]) } else { Ok(data[start..].to_vec()) }
+                }
+                // The root dir (empty path) has no bytes but is a valid open target.
+                None if inner.path.is_empty() => Ok(vec![]),
+                None => Err(MountError::NotFound(inner.path.clone())),
+            }
+        }
+        async fn write(&self, _fid: &Fid, _o: u64, _d: &[u8], _c: &Subject) -> Result<u32, MountError> {
+            Err(MountError::PermissionDenied("read-only".into()))
+        }
+        async fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
+            let inner = fid.downcast_ref::<RoFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            let prefix = if inner.path.is_empty() { String::new() } else { format!("{}/", inner.path) };
+            let mut entries = Vec::new();
+            for key in self.files.keys() {
+                if let Some(rest) = key.strip_prefix(&prefix) {
+                    if !rest.contains('/') {
+                        entries.push(DirEntry { name: rest.to_owned(), is_dir: false, size: 0, stat: None });
+                    }
+                }
+            }
+            Ok(entries)
+        }
+        async fn stat(&self, fid: &Fid, _c: &Subject) -> Result<Stat, MountError> {
+            let inner = fid.downcast_ref::<RoFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            Ok(Stat::unknown_qid(0, 0, inner.path.clone(), 0))
+        }
+        async fn clunk(&self, _fid: Fid, _c: &Subject) {}
+    }
+
+    /// Copy-up targets the *designated* upper, not merely the first writable
+    /// target in bind order. Two writable targets are bound After the floor;
+    /// only the one marked `BindFlag::Upper` must receive the copied-up file.
+    #[tokio::test]
+    async fn copy_up_targets_designated_upper_not_bind_order() {
+        let mut ns = Namespace::new();
+        let floor: MountTarget = Arc::new(ReadOnlyMemMount::new(vec![("weights", b"shared-ro")]));
+        // Two writable layers. `first` is bound earlier (would win the bind-order
+        // heuristic); `chosen` is the explicitly designated upper.
+        let first = Arc::new(WritableMemMount::empty());
+        let chosen = Arc::new(WritableMemMount::empty());
+
+        ns.bind_mount("/m", floor, BindFlag::Replace).unwrap();
+        ns.bind_mount("/m", Arc::clone(&first) as MountTarget, BindFlag::After).unwrap();
+        ns.bind_mount("/m", Arc::clone(&chosen) as MountTarget, BindFlag::Upper).unwrap();
+
+        assert!(ns.has_designated_upper("/m"));
+
+        let caller = test_subject();
+        ns.echo("/m/weights", b"tenant-edit", &caller).await.unwrap();
+
+        // The copied-up file landed in the designated upper only.
+        assert_eq!(chosen.snapshot().get("weights").unwrap(), b"tenant-edit");
+        assert!(!first.snapshot().contains_key("weights"), "first writable must NOT receive the copy-up");
+    }
+
+    /// A write to a path already present in the upper goes straight to the
+    /// upper (Pass 1 direct write) — no copy-up create is triggered.
+    #[tokio::test]
+    async fn write_to_existing_upper_file_skips_copy_up() {
+        let mut ns = Namespace::new();
+        let floor: MountTarget = Arc::new(ReadOnlyMemMount::new(vec![("f", b"floor")]));
+        let upper = Arc::new(WritableMemMount::empty());
+        // Seed the upper with the file already present (same length as the new
+        // write so the test mount's non-truncating write leaves no stale tail —
+        // the point here is Pass-1 direct write, not truncation semantics).
+        upper.files.lock().unwrap().insert("f".to_owned(), b"upperorig".to_vec());
+
+        ns.bind_mount("/x", floor, BindFlag::Replace).unwrap();
+        ns.bind_mount("/x", Arc::clone(&upper) as MountTarget, BindFlag::Upper).unwrap();
+
+        let caller = test_subject();
+        ns.echo("/x/f", b"upper-new", &caller).await.unwrap();
+
+        assert_eq!(upper.snapshot().get("f").unwrap(), b"upper-new");
+    }
+
+    /// A write to a brand-new path (in neither layer) creates it in the
+    /// designated upper, unchanged from the pre-#370 create path.
+    #[tokio::test]
+    async fn write_new_path_creates_in_designated_upper() {
+        let mut ns = Namespace::new();
+        let floor: MountTarget = Arc::new(ReadOnlyMemMount::new(vec![("existing", b"ro")]));
+        let upper = Arc::new(WritableMemMount::empty());
+
+        ns.bind_mount("/n", floor, BindFlag::Replace).unwrap();
+        ns.bind_mount("/n", Arc::clone(&upper) as MountTarget, BindFlag::Upper).unwrap();
+
+        let caller = test_subject();
+        // Pass 1 direct write fails (not present); no lower source either, so the
+        // create path in the upper is exercised via create() then echo.
+        ns.create("/n/fresh", 0o644, &caller).await.unwrap();
+        ns.echo("/n/fresh", b"brand-new", &caller).await.unwrap();
+
+        assert_eq!(upper.snapshot().get("fresh").unwrap(), b"brand-new");
+    }
+
+    /// After a copy-up, readdir/ls merges lower + upper and the copied file
+    /// appears exactly once (deduped by name).
+    #[tokio::test]
+    async fn readdir_after_copy_up_shows_file_once() {
+        let mut ns = Namespace::new();
+        // Floor exposes `shared` via readdir; also readable so copy-up can source it.
+        let floor: MountTarget = Arc::new(ReadOnlyReaddirMount::new(vec![("shared", b"floor-bytes")]));
+        let upper = Arc::new(WritableMemMount::empty());
+
+        ns.bind_mount("/r", floor, BindFlag::Replace).unwrap();
+        ns.bind_mount("/r", Arc::clone(&upper) as MountTarget, BindFlag::Upper).unwrap();
+
+        let caller = test_subject();
+        ns.echo("/r/shared", b"edited", &caller).await.unwrap();
+
+        let entries = ns.ls("/r", &caller).await.unwrap();
+        let shared_count = entries.iter().filter(|e| e.name == "shared").count();
+        assert_eq!(shared_count, 1, "copied-up file must appear once, not once per layer");
+    }
+
+    /// Copy-up threads the caller through create+write, so a denied subject on
+    /// the upper fails closed — the copy-up does not succeed with a wrong
+    /// subject, and the upper stays empty.
+    #[tokio::test]
+    async fn copy_up_fails_closed_for_denied_subject() {
+        let mut ns = Namespace::new();
+        let floor: MountTarget = Arc::new(ReadOnlyMemMount::new(vec![("secret", b"floor")]));
+        // Upper only permits subject "alice".
+        let upper = Arc::new(SubjectGatedMount::new("alice"));
+
+        ns.bind_mount("/g", floor, BindFlag::Replace).unwrap();
+        ns.bind_mount("/g", Arc::clone(&upper) as MountTarget, BindFlag::Upper).unwrap();
+
+        // "mallory" is not permitted on the upper.
+        let mallory = Subject::new("mallory");
+        let err = ns.echo("/g/secret", b"evil", &mallory).await.unwrap_err();
+        match err {
+            NamespaceError::Mount(MountError::PermissionDenied(_)) => {}
+            other => panic!("expected PermissionDenied (fail closed), got {other:?}"),
+        }
+        assert!(upper.snapshot().is_empty(), "denied copy-up must not write the upper");
+
+        // The permitted subject succeeds — confirms the deny was about the
+        // subject, not a broken path.
+        let alice = Subject::new("alice");
+        ns.echo("/g/secret", b"ok", &alice).await.unwrap();
+        assert_eq!(upper.snapshot().get("secret").unwrap(), b"ok");
     }
 }
