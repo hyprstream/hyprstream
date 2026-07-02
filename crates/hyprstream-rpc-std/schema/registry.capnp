@@ -71,6 +71,22 @@ struct RegistryRequest {
 
     # Fetch content-addressed bytes (git OID or XET merkle root) as a stream.
     getBlob @10 :GetBlobRequest $scope(query) $mcpDescription("Fetch content-addressed bytes (git OID or XET merkle root) as a stream");
+
+    # Ingest content-addressed bytes IN-BAND (the symmetric write half of getBlob).
+    # Epic #654: the missing authenticated upload path. Today writes bypass
+    # hyprstream entirely (cas-serve over SSH, identity-agnostic), so no
+    # merkle→repo provenance can be bound. putBlob brings the upload onto the
+    # same authenticated RPC plane as reads: the server chunks the bytes,
+    # computes the merkle ITSELF (never caller-supplied), and records
+    # (merkle → grantRepo) provenance from the verified identity. This is what
+    # lets #509/#511's fail-closed read-gate flip on without denying legitimate
+    # reads, and closes the OID-field planting class (#436) by construction.
+    #
+    # Authz: coarse $scope(write) auto-gate (registry:PutBlob, "write") PLUS a
+    # fine-grained handler check authorize(ctx, "model:{repo}", "write") that
+    # mirrors authorize_get_blob's per-repo "query" check, one verb up. A read
+    # grant never implies write.
+    putBlob @11 :PutBlobRequest $scope(write) $mcpDescription("Ingest content-addressed bytes; server computes the merkle and binds merkle→repo provenance");
   }
 }
 
@@ -158,6 +174,9 @@ struct RegistryResponse {
     repoResult @10 :RepositoryResponse;
     # Content-addressed blob fetch — rides the moq streaming plane (StreamInfo).
     getBlobResult @11 :StreamInfo;
+    # Content-addressed blob ingest result — the SERVER-COMPUTED merkle (never
+    # caller-supplied) plus the stored xorb set. See PutBlobResult / epic #654.
+    putBlobResult @12 :PutBlobResult;
   }
 }
 
@@ -349,6 +368,44 @@ struct GetBlobRequest {
   # → predictable for public-derived content), so the hash alone cannot authorize;
   # entitlement keys on the grant repo.
   grantRepo @2 :Text;   # at-uri of the owning repo (federation-portable)
+}
+
+# Put Blob Request — ingest bytes IN-BAND (the symmetric write half of getBlob).
+#
+# The caller supplies raw bytes; it does NOT supply a merkle. The server chunks
+# (Gearhash CDC, same path cas-serve uses), computes the XET merkle root from the
+# real bytes, stores the xorbs (global content-addressed dedup preserved), and
+# records (merkle → grantRepo) provenance from the authenticated identity. The
+# hash-as-capability attack (planting an OID field to borrow read access) is
+# closed by construction: provenance is bound to WHO uploaded WHAT, THROUGH which
+# repo — not to a caller-committed pointer. See epic #654.
+struct PutBlobRequest {
+  # The content to ingest. v1: inline, hard-capped server-side by
+  # MAX_INLINE_UPLOAD (unbounded Data is a DoS surface; large uploads use the
+  # streaming channel below once it lands). Model-weight-scale blobs are NOT
+  # intended for the inline path.
+  bytes @0 :Data;
+  # Authz GRANT CONTEXT (required) — the repo this content is being ingested
+  # into. The caller MUST hold a WRITE capability on it (Casbin
+  # "model:{repo}", "write"); provenance binds the computed merkle to THIS repo.
+  # A read grant never implies write.
+  grantRepo @1 :Text;   # at-uri of the owning repo (federation-portable)
+  # NOTE (decision 2, folded): a streaming upload channel — symmetric to
+  # getBlob's StreamInfo response — is an ADDITIVE follow-up field here (capnp
+  # additive evolution, NOT an ordinal re-spin), so scaling to GB-class blobs
+  # never requires a second auth-surface schema change.
+}
+
+# Put Blob Result — proof-of-ingest returned to the caller so it can commit the
+# git-xet pointer referencing the (now provenance-bound) merkle.
+struct PutBlobResult {
+  # SERVER-COMPUTED XET merkle root of the ingested bytes. Authoritative — the
+  # caller never asserts this; the server derived it from the actual bytes.
+  merkle @0 :Text;
+  # The xorb hashes written/deduped for this content (reconstruction set).
+  xorbHashes @1 :List(Text);
+  # Bytes actually stored after global dedup (0 if fully deduplicated).
+  bytesStored @2 :UInt64;
 }
 
 # Create Worktree Request (repoId removed — curried into RepositoryClient)
