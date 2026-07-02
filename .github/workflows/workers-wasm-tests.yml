@@ -18,6 +18,9 @@ on:
       - 'crates/hyprstream-workers-wasmtime/**'
       - '.github/workflows/workers-wasm-tests.yml'
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
