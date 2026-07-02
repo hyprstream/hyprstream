@@ -3,7 +3,8 @@
 using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".scope;
 using import "/annotations.capnp".mcpDescription;
-using import "/annotations.capnp".docExample;
+using import "/annotations.capnp".vfsKind;
+using import "/annotations.capnp".vfsPath;
 using import "/streaming.capnp".StreamInfo;
 
 # 9P types — shared across all services with fs scope.
@@ -44,30 +45,32 @@ struct RegistryRequest {
     # List all models available in the registry
     list @1 :Void $scope(query)
         $mcpDescription("List all repositories registered in the local registry.")
-        $docExample("ls /srv/registry");
+        $vfsKind(dir) $vfsPath(".");
     # Get repository information by ID
-    get @2 :Text $scope(query);
+    get @2 :Text $scope(query)
+        $mcpDescription("Get repository information by its id.")
+        $vfsKind(file) $vfsPath("by-id/{id}");
     # Get repository information by name
     getByName @3 :Text $scope(query)
         $mcpDescription("Get repository information by its display name.")
-        $docExample("cat /srv/registry/my-model");
+        $vfsKind(file) $vfsPath("{name}");
     # Clone a model repository from a URL
     clone @4 :CloneRequest $scope(write)
         $mcpDescription("Clone a model repository from a URL into the local registry.")
-        $docExample("ctl /srv/registry clone '{\"url\": \"https://huggingface.co/org/model\"}'");
+        $vfsKind(ctl) $vfsPath("ctl");
     # Register an existing local repository
-    register @5 :RegisterRequest $scope(write);
+    register @5 :RegisterRequest $scope(write) $vfsKind(ctl) $vfsPath("ctl");
     # Remove a repository from the registry
-    remove @6 :Text $scope(manage);
+    remove @6 :Text $scope(manage) $vfsKind(ctl) $vfsPath("ctl");
     # Check registry service health
     healthCheck @7 :Void $scope(query)
         $mcpDescription("Check if the registry service is healthy and responding.")
-        $docExample("cat /srv/registry/health");
+        $vfsKind(file) $vfsPath("health");
     # Clone a model repository from a URL (streaming progress)
     cloneStream @8 :CloneRequest $scope(write) $mcpDescription("Clone a model repository from a URL (streaming progress)");
 
     # Repository-scoped operations (requires repoId)
-    repo @9 :RepositoryRequest;
+    repo @9 :RepositoryRequest $vfsKind(dir) $vfsPath("repo/{repoId}");
 
     # Fetch content-addressed bytes (git OID or XET merkle root) as a stream.
     getBlob @10 :GetBlobRequest $scope(query) $mcpDescription("Fetch content-addressed bytes (git OID or XET merkle root) as a stream");

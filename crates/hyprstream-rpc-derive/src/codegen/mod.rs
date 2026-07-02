@@ -6,6 +6,7 @@ pub mod dispatch;
 pub mod handler;
 pub mod metadata;
 pub mod scoped;
+pub mod vfs;
 
 use crate::resolve::ResolvedSchema;
 use crate::schema::types::ParsedSchema;
@@ -60,6 +61,9 @@ pub fn generate_client_only(service_name: &str, schema: &ParsedSchema, types_cra
     // Scoped client structs (same cfg-gated pattern)
     let scoped_clients = scoped::generate_portable_scoped_clients(service_name, &resolved, types_crate);
 
+    // Generated 9P/VFS node table (#539 T2) — must compile to wasm32 too.
+    let vfs_mount = vfs::generate_mount(service_name, &resolved);
+
     quote::quote! {
         #data_structs
         #response_enum
@@ -73,6 +77,7 @@ pub fn generate_client_only(service_name: &str, schema: &ParsedSchema, types_cra
         #scoped_clients
         #metadata_code
         #portable_dispatch
+        #vfs_mount
     }
 }
 
@@ -110,6 +115,9 @@ pub fn generate_service(service_name: &str, schema: &ParsedSchema, types_crate: 
         proc_macro2::TokenStream::new()
     };
 
+    // Generated 9P/VFS node table (#539 T2).
+    let vfs_mount = vfs::generate_mount(service_name, &resolved);
+
     quote::quote! {
         #data_structs
         #response_enum
@@ -121,5 +129,6 @@ pub fn generate_service(service_name: &str, schema: &ParsedSchema, types_crate: 
         #constructors
         #handler
         #metadata_code
+        #vfs_mount
     }
 }
