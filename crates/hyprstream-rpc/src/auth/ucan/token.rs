@@ -183,6 +183,35 @@ impl Ucan {
         &self.payload.capabilities
     }
 
+    /// The **root** of this delegation chain — the self-issued authority at the
+    /// top, the entry with an empty `proofs` vector. For a delegated grant this
+    /// is the resource-owning delegator; its [`issuer`] is the source of
+    /// authority (#680/#681: the `sub`/delegator principal, distinct from the
+    /// leaf [`audience`] = the actor/presenter).
+    ///
+    /// M1 walks the single-delegator-per-link chain via `proofs[0]` (the
+    /// linkage `super::chain::validate` also enforces). Depth is bounded by
+    /// [`super::chain::MAX_PROOF_DEPTH`] at decode, so this cannot runaway.
+    ///
+    /// [`issuer`]: Self::issuer
+    /// [`audience`]: Self::audience
+    #[must_use]
+    pub fn root(&self) -> &Ucan {
+        let mut cur = self;
+        while let Some(delegator) = cur.proofs.first() {
+            cur = delegator;
+        }
+        cur
+    }
+
+    /// The DID of the delegation-chain root's issuer — the ultimate source of
+    /// authority (the resource-owning delegator). Convenience over
+    /// [`Self::root`]`().issuer()`. See [`Self::root`].
+    #[must_use]
+    pub fn root_issuer(&self) -> &Did {
+        self.root().issuer()
+    }
+
     /// **Structural** validation independent of crypto/attenuation: a UCAN is
     /// structurally well-formed iff both its DIDs resolve to valid `did:key`
     /// Ed25519 identities and (if present) `not_before <= expiration`. Each
@@ -544,6 +573,34 @@ mod tests {
             u.verify_signatures(&store),
             Err(UcanError::BadSignature(_))
         ));
+    }
+
+    #[test]
+    fn root_walks_to_the_self_issued_delegator() {
+        // user (root) ⟶ gateway ⟶ mcp. The delegator (source of authority) is
+        // the root's issuer (user); the actor/presenter is the leaf audience (mcp).
+        let user = TestIdentity::generate();
+        let gateway = TestIdentity::generate();
+        let mcp = TestIdentity::generate();
+
+        let root = signed_ucan(&user, &gateway.did(), vec![cap("mac://model/x", "infer")], vec![]);
+        let leaf = signed_ucan(
+            &gateway,
+            &mcp.did(),
+            vec![cap("mac://model/x", "infer")],
+            vec![root.clone()],
+        );
+
+        assert_eq!(leaf.audience(), &mcp.did(), "leaf audience = actor/presenter");
+        assert_eq!(leaf.issuer(), &gateway.did(), "leaf issuer = immediate (intermediate) issuer");
+        assert_eq!(
+            leaf.root_issuer(),
+            &user.did(),
+            "root_issuer = ultimate delegator, NOT the immediate issuer"
+        );
+        assert!(leaf.root().proofs.is_empty(), "root has empty proofs");
+        // A root UCAN is its own root.
+        assert_eq!(root.root_issuer(), &user.did());
     }
 
     #[test]
