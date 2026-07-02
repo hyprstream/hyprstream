@@ -10,9 +10,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use kata_hypervisor::ch::CloudHypervisor;
+use kata_hypervisor::device::DeviceType;
 #[cfg(feature = "dragonball")]
 use kata_hypervisor::dragonball::Dragonball;
-use kata_hypervisor::Hypervisor;
+use kata_hypervisor::{Hypervisor, ShareFsConfig, ShareFsDevice};
 use kata_types::config::hypervisor::{Hypervisor as HypervisorConfig, RootlessUser};
 use kata_types::rootless;
 
@@ -22,24 +23,48 @@ use crate::image::RafsStore;
 
 use super::backend::{SandboxBackend, SandboxHandle};
 use super::client::PodSandboxConfig;
+use super::kata_agent::{AgentAddress, KataAgentClient};
 use super::sandbox::PodSandbox;
-use super::virtiofs::SandboxVirtiofs;
+use super::sandbox_fs::{SandboxFs, SandboxFsServer, VFS_SOCKET_NAME};
+use hyprstream_vfs::{Subject, SyntheticNode};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Handle
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Kata-specific state stored on each `PodSandbox`.
-#[derive(Debug)]
 pub struct KataHandle {
     /// The Kata hypervisor handle for VM lifecycle management.
     pub hypervisor: Arc<dyn Hypervisor>,
     /// Path to the VM API socket.
     pub api_socket: PathBuf,
-    /// VirtioFS daemon serving RAFS to this VM (if an image was mounted).
-    pub virtiofs_daemon: Option<Arc<SandboxVirtiofs>>,
-    /// Path to the virtiofs socket.
+    /// Path to the virtio-fs socket the guest mounts. Served by the composed
+    /// VFS namespace (`vfs_server`).
     pub virtiofs_socket: Option<PathBuf>,
+    /// Per-sandbox composed VFS server (FS-D, #365). When set, the guest's
+    /// filesystem is the hyprstream VFS (rootfs + injected mounts) served by
+    /// `hyprstream-vfs-server`. Held for the VM's lifetime so the serving thread
+    /// + injected registries outlive the guest; dropped on sandbox teardown.
+    pub vfs_server: Option<SandboxFsServer>,
+    /// kata-agent ttrpc/vsock client (#344), connected lazily on first
+    /// `exec_sync` call and cached for subsequent calls. `None` until then,
+    /// or if the guest agent connection could not be established (e.g. the
+    /// VM image has no `kata-agent`, or it hasn't finished booting yet).
+    ///
+    /// Guarded by a `tokio::sync::Mutex` rather than stored as a plain
+    /// `Option` because `exec_sync` takes `&PodSandbox` (shared ref) and
+    /// must be able to lazily populate the connection on first use.
+    pub agent: tokio::sync::Mutex<Option<Arc<KataAgentClient>>>,
+}
+
+impl std::fmt::Debug for KataHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KataHandle")
+            .field("api_socket", &self.api_socket)
+            .field("virtiofs_socket", &self.virtiofs_socket)
+            .field("vfs_socket", &self.vfs_server.as_ref().map(SandboxFsServer::socket_path))
+            .finish_non_exhaustive()
+    }
 }
 
 impl SandboxHandle for KataHandle {
@@ -64,6 +89,13 @@ impl KataBackend {
             image_config,
             rafs_store,
         }
+    }
+
+    /// Runtime prerequisite probe for the backend registry: a `cloud-hypervisor`
+    /// binary must be on PATH. Mirrors the instance-level
+    /// [`SandboxBackend::is_available`] check.
+    fn registry_is_available() -> bool {
+        which::which("cloud-hypervisor").is_ok()
     }
 
     /// Build a `HypervisorConfig` from `PoolConfig`.
@@ -150,6 +182,123 @@ impl KataBackend {
         };
 
         Ok(hypervisor)
+    }
+
+    /// Attach a vhost-user-fs share to the hypervisor as a ShareFs device.
+    ///
+    /// This closes the gap noted in the FS spike (the virtiofs socket was created
+    /// but never wired into the VM): it adds the existing vhost-user-fs socket as
+    /// a Cloud Hypervisor `ShareFs` (virtio-fs) device via the **embedded**
+    /// runtime-rs hypervisor crate (#343 = embed), so the guest can mount the
+    /// share. The same path is used whether the socket is served by `nydusd`
+    /// (RAFS image rootfs) or by hyprstream's own `hyprstream-vfs-server`
+    /// (the VFS down-adapter).
+    ///
+    /// # Ordering
+    ///
+    /// Must be called **after `prepare_vm`** (which sets the hypervisor's
+    /// `vm_path`) and **before `start_vm`**. When the VM is not yet running, the
+    /// CH backend queues the device into its `pending_devices` and folds it into
+    /// the `VmConfig.fs` at boot — no virtiofsd is spawned by the crate; CH
+    /// connects to the socket we hand it. An **absolute** `sock_path` is used so
+    /// CH does not re-root it under the sandbox dir.
+    ///
+    /// `fs_type` must be the literal `"virtio-fs"` or the CH backend rejects the
+    /// device.
+    async fn attach_share_fs(
+        hypervisor: &Arc<dyn Hypervisor>,
+        sandbox_id: &str,
+        socket_path: &Path,
+        mount_tag: &str,
+    ) -> Result<()> {
+        let sock_path = socket_path.to_str().ok_or_else(|| {
+            WorkerError::SandboxCreationFailed("virtiofs socket path contains invalid UTF-8".into())
+        })?;
+
+        let config = ShareFsConfig {
+            // CH never reads host_shared_path/options/mount_config — the daemon
+            // that serves `sock_path` owns the exported tree. Only the socket,
+            // tag, type, and queue geometry matter for the boot-time attach.
+            fs_type: "virtio-fs".to_owned(),
+            sock_path: sock_path.to_owned(),
+            mount_tag: mount_tag.to_owned(),
+            queue_num: 1,
+            queue_size: 1024,
+            ..Default::default()
+        };
+        let device = ShareFsDevice::new(&format!("share-fs-{sandbox_id}"), &config);
+
+        hypervisor
+            .add_device(DeviceType::ShareFs(device))
+            .await
+            .map_err(|e| {
+                WorkerError::VmStartFailed(format!("failed to attach vhost-user-fs share: {e}"))
+            })?;
+
+        tracing::info!(
+            sandbox_id = %sandbox_id,
+            socket = %socket_path.display(),
+            mount_tag = %mount_tag,
+            "Attached vhost-user-fs ShareFs device to hypervisor"
+        );
+        Ok(())
+    }
+
+    /// Annotation key carrying the sandbox's policy principal (the [`Subject`]
+    /// at the VFS Mount boundary, #353/#319/#328). When absent, the sandbox id is
+    /// used as a stable per-sandbox principal so isolation still holds.
+    const SUBJECT_ANNOTATION: &'static str = "hyprstream.io/subject";
+
+    /// Resolve the [`Subject`] this sandbox's VFS is served under.
+    fn sandbox_subject(sandbox: &PodSandbox, annotations: &HashMap<String, String>) -> Subject {
+        annotations
+            .get(Self::SUBJECT_ANNOTATION)
+            .filter(|s| !s.is_empty())
+            .map(Subject::new)
+            .unwrap_or_else(|| Subject::new(sandbox.id.clone()))
+    }
+
+    /// Compose the per-sandbox VFS namespace (rootfs + injected mounts) and serve
+    /// it over a per-sandbox Unix socket (FS-D, #365).
+    ///
+    /// Returns the running [`SandboxFsServer`] whose socket the caller attaches to
+    /// CH. The namespace is forked per sandbox and bound to `subject`, so it
+    /// exposes only this sandbox's rootfs + injected paths — never another
+    /// sandbox's tree.
+    ///
+    /// `serve` blocks, so it runs on a dedicated thread inside `serve_on`; we
+    /// pass the current tokio runtime handle for the down-adapter's async→sync
+    /// bridge. Compose is CPU/IO-bound (RAFS load), so we run it on a blocking
+    /// thread to avoid stalling the async runtime.
+    async fn compose_and_serve_vfs(
+        &self,
+        sandbox: &PodSandbox,
+        image_id: &str,
+        subject: Subject,
+    ) -> Result<SandboxFsServer> {
+        let socket_path = sandbox.sandbox_path().join(VFS_SOCKET_NAME);
+        let rt = tokio::runtime::Handle::current();
+        let rafs_store = self.rafs_store.clone();
+        let image_id = image_id.to_owned();
+        let sandbox_dir = sandbox.sandbox_path().clone();
+
+        // RAFS load + overlay setup is blocking; do it off the async executor.
+        tokio::task::spawn_blocking(move || {
+            let fs = SandboxFs::compose(
+                &rafs_store,
+                &image_id,
+                &sandbox_dir,
+                subject,
+                // Models / deltas injected listings: empty mount points for now
+                // (the worker runtime populates them per tenant). The mount
+                // points exist so the guest sees /models and /deltas.
+                SyntheticNode::dir(),
+                SyntheticNode::dir(),
+            )?;
+            fs.serve_on(socket_path, rt)
+        })
+        .await
+        .map_err(|e| WorkerError::SandboxCreationFailed(format!("VFS compose task join: {e}")))?
     }
 
     /// Generate cloud-init ISO for a sandbox.
@@ -256,21 +405,23 @@ impl SandboxBackend for KataBackend {
             Self::generate_cloud_init_iso(sandbox, &cloud_init_iso).await?;
         }
 
-        let mut virtiofs_daemon = None;
-        let mut virtiofs_sock = None;
+        // FS-D (#365): compose a per-sandbox VFS (rootfs at `/` from FS-B's
+        // OverlayFs(RAFS lower + per-sandbox writable upper) + the native
+        // injected mounts `/stream`/`/models`/`/deltas`), forked into its own
+        // Namespace bound to this sandbox's Subject, and serve it over a
+        // per-sandbox Unix socket via FS-A's `hyprstream-vfs-server`. The guest
+        // mounts this composed VFS — no external `nydusd`. Each sandbox's
+        // namespace/socket/Subject/writable-upper is private, so sandbox A's
+        // namespace cannot expose sandbox B's rootfs or injected paths.
+        let mut vfs_server: Option<SandboxFsServer> = None;
+        let mut share_socket: Option<PathBuf> = None;
         if let Some(ref image_id) = sandbox.image_id {
-            let mut virtiofs = SandboxVirtiofs::new(
-                sandbox.id.clone(),
-                virtiofs_socket.clone(),
-                &self.rafs_store,
-                image_id.clone(),
-            )
-            .await?;
-
-            virtiofs.start(&self.rafs_store, &self.image_config).await?;
-            virtiofs_sock = Some(virtiofs_socket.clone());
-            virtiofs_daemon = Some(Arc::new(virtiofs));
+            let subject = Self::sandbox_subject(sandbox, annotations);
+            let server = self.compose_and_serve_vfs(sandbox, image_id, subject).await?;
+            share_socket = Some(server.socket_path().to_path_buf());
+            vfs_server = Some(server);
         }
+        let virtiofs_sock = share_socket.clone();
 
         let hypervisor =
             Self::create_hypervisor(pool_config, sandbox, &api_socket, &virtiofs_socket).await?;
@@ -279,6 +430,12 @@ impl SandboxBackend for KataBackend {
             .prepare_vm(&sandbox.id, None, annotations, None)
             .await
             .map_err(|e| WorkerError::VmStartFailed(format!("failed to prepare VM: {e}")))?;
+
+        // Attach the composed VFS socket as a CH ShareFs device, after prepare_vm
+        // and before start_vm so it is folded into the boot VmConfig.
+        if let Some(ref socket) = share_socket {
+            Self::attach_share_fs(&hypervisor, &sandbox.id, socket, "hyprstream-vfs").await?;
+        }
 
         let timeout_secs = i32::try_from(pool_config.create_timeout_secs).unwrap_or(i32::MAX);
         tracing::debug!(sandbox_id = %sandbox.id, timeout_secs, "Starting VM");
@@ -297,8 +454,9 @@ impl SandboxBackend for KataBackend {
         let handle = Arc::new(KataHandle {
             hypervisor,
             api_socket,
-            virtiofs_daemon,
             virtiofs_socket: virtiofs_sock,
+            vfs_server,
+            agent: tokio::sync::Mutex::new(None),
         });
 
         Ok(handle)
@@ -373,8 +531,16 @@ impl SandboxBackend for KataBackend {
                 let fresh = Arc::new(KataHandle {
                     hypervisor: Arc::clone(&kata.hypervisor),
                     api_socket: kata.api_socket.clone(),
-                    virtiofs_daemon: None,
                     virtiofs_socket: None,
+                    // The per-sandbox VFS server is not reusable across resets;
+                    // a recycled sandbox composes a fresh one on next start.
+                    vfs_server: None,
+                    // A reused (warm-pool) sandbox keeps the same VM, but the
+                    // container(s) inside it are torn down — drop any cached
+                    // agent connection so the next `exec_sync` reconnects
+                    // against a clean guest state rather than reusing a
+                    // client whose container/exec ids may now be stale.
+                    agent: tokio::sync::Mutex::new(None),
                 });
                 sandbox.backend_handle = Some(fresh);
             }
@@ -397,18 +563,136 @@ impl SandboxBackend for KataBackend {
     }
 
     fn supports_exec(&self) -> bool {
-        false
+        // Real, via the kata-agent ttrpc/vsock client (#344) — see
+        // `exec_sync` below. This is no longer the "host is a black box"
+        // limitation the original stub described.
+        true
     }
 
     async fn exec_sync(
         &self,
-        _sandbox: &PodSandbox,
-        _command: &[String],
-        _timeout_secs: u64,
+        sandbox: &PodSandbox,
+        command: &[String],
+        timeout_secs: u64,
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
-        Err(WorkerError::ExecFailed(
-            "not supported by Kata backend (requires agent)".into(),
-        ))
+        if command.is_empty() {
+            return Err(WorkerError::ExecFailed("empty command".into()));
+        }
+
+        let handle = sandbox
+            .backend_handle
+            .as_ref()
+            .ok_or_else(|| WorkerError::ExecFailed("sandbox has no backend handle".into()))?;
+        let kata = handle
+            .as_any()
+            .downcast_ref::<KataHandle>()
+            .ok_or_else(|| WorkerError::ExecFailed("backend handle is not a KataHandle".into()))?;
+
+        let client = self.guest_agent_client(kata).await?;
+
+        // The container id is the sandbox id: `exec_sync` here targets the
+        // single workload container running in the sandbox's VM (the
+        // CRI-shaped subset this issue scopes — multi-container pods inside
+        // one Kata VM are a separate concern from #344's vsock/ttrpc client).
+        let container_id = sandbox.id.clone();
+
+        match client
+            .exec(&container_id, command, std::time::Duration::from_secs(timeout_secs))
+            .await
+        {
+            Ok(out) => Ok(out),
+            Err(e) => {
+                // The cached ttrpc connection may be stale (the VM died or was
+                // restarted externally without a `reset_sandbox` that would
+                // have cleared it). Drop the cached client so the *next*
+                // `exec_sync` redials against a fresh guest state instead of
+                // reusing a dead connection and failing every subsequent call
+                // until an explicit reset. We do NOT retry in-line: the caller
+                // asked for one exec (not a reconnect loop), and surfacing the
+                // original failure — broken pipe / RpcStatus / timeout — is
+                // more honest than masking it behind a retry that may hit the
+                // same dead VM. The next call re-establishes the connection
+                // via `guest_agent_client`.
+                //
+                // `try_lock`: if another exec is in flight on this sandbox,
+                // leave the cache alone — clearing it under them would race.
+                // Only clear when it still points at the same client we just
+                // used (a concurrent exec may have already swapped in a fresh
+                // one); compare by `Arc::ptr_eq`.
+                if let Ok(mut guard) = kata.agent.try_lock() {
+                    // Only clear when the cache still holds the same client we
+                    // just used (compared by `Arc` pointer identity): a
+                    // concurrent exec on another task may already have swapped
+                    // in a fresh client, and clearing that one would discard a
+                    // good connection.
+                    if guard.as_ref().map(|c| Arc::ptr_eq(c, &client)).unwrap_or(false) {
+                        *guard = None;
+                    }
+                }
+                Err(WorkerError::ExecFailed(format!("kata-agent exec failed: {e:#}")))
+            }
+        }
+    }
+}
+
+impl KataBackend {
+    /// Get (lazily connecting if needed) the cached kata-agent ttrpc client
+    /// for this sandbox's VM.
+    ///
+    /// The connection address comes straight from
+    /// `Hypervisor::get_agent_socket()` — the same call upstream
+    /// kata-containers' own runtime uses
+    /// (`runtime-rs/crates/agent/src/kata/agent.rs::start`) — so this does
+    /// not hardcode the hybrid-vsock UDS path; it asks the hypervisor
+    /// abstraction for it, which keeps Cloud Hypervisor/Dragonball both
+    /// working without an `if hypervisor_type == ...` branch here.
+    async fn guest_agent_client(&self, kata: &KataHandle) -> Result<Arc<KataAgentClient>> {
+        let mut guard = kata.agent.lock().await;
+        if let Some(client) = guard.as_ref() {
+            return Ok(Arc::clone(client));
+        }
+
+        let address = kata
+            .hypervisor
+            .get_agent_socket()
+            .await
+            .map_err(|e| WorkerError::ExecFailed(format!("get_agent_socket failed: {e}")))?;
+        let address = AgentAddress::parse(&address)
+            .map_err(|e| WorkerError::ExecFailed(format!("unparseable agent socket address: {e}")))?;
+
+        let client = KataAgentClient::connect(&address)
+            .await
+            .map_err(|e| WorkerError::ExecFailed(format!("failed to connect to kata-agent: {e:#}")))?;
+        let client = Arc::new(client);
+        *guard = Some(Arc::clone(&client));
+        Ok(client)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Backend registry self-registration (#507 / #518)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// This whole file only compiles under `kata-vm` (see runtime/mod.rs), so this
+// `submit!` is feature-gated by construction: the `kata` backend is a selectable
+// name *only* in builds that include the VM toolchain. In a non-`kata-vm` binary
+// there is no registration, and selecting `kata` fails closed with a build hint.
+//
+// Highest priority → preferred by `auto` (strongest isolation). Construction
+// pulls the RAFS image store from the per-call BackendCtx.
+inventory::submit! {
+    crate::runtime::selection::BackendRegistration {
+        name: "kata",
+        priority: 100,
+        // Full VM isolation (strongest tier) → eligible for `"auto"`.
+        auto_selectable: true,
+        is_available: KataBackend::registry_is_available,
+        construct: |ctx| {
+            Ok(Arc::new(KataBackend::new(
+                ctx.image_config.clone(),
+                Arc::clone(&ctx.rafs_store),
+            )) as Arc<dyn crate::runtime::SandboxBackend>)
+        },
     }
 }
 
@@ -473,8 +757,9 @@ mod tests {
         Arc::new(KataHandle {
             hypervisor: Arc::new(ch),
             api_socket: sandbox_path.join("test.sock"),
-            virtiofs_daemon: None,
             virtiofs_socket: Some(sandbox_path.join("virtiofs.sock")),
+            vfs_server: None,
+            agent: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -490,12 +775,31 @@ mod tests {
 
     #[test]
     fn test_supports_exec() {
+        // #344: exec is real now (kata-agent ttrpc/vsock client), so the
+        // backend advertises support — connection failures surface from
+        // `exec_sync` itself, not from this capability flag.
         let (backend, _, _temp) = create_test_backend();
-        assert!(!backend.supports_exec());
+        assert!(backend.supports_exec());
     }
 
     #[tokio::test]
-    async fn test_exec_sync_returns_error() {
+    async fn test_exec_sync_empty_command_rejected() {
+        let (backend, _, temp) = create_test_backend();
+        let sandbox = create_test_sandbox(temp.path().join("sandbox"));
+
+        let result = backend.exec_sync(&sandbox, &[], 5).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WorkerError::ExecFailed(msg) => assert!(msg.contains("empty command")),
+            other => panic!("Expected ExecFailed, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_exec_sync_no_backend_handle_fails() {
+        // No `backend_handle` set (sandbox never `start()`ed) — exec_sync
+        // must fail fast rather than panic or hang trying to dial an agent.
         let (backend, _, temp) = create_test_backend();
         let sandbox = create_test_sandbox(temp.path().join("sandbox"));
 
@@ -504,14 +808,87 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        match &err {
-            WorkerError::ExecFailed(msg) => {
-                assert!(msg.contains("not supported"), "unexpected message: {msg}");
-            }
+        match result.unwrap_err() {
+            WorkerError::ExecFailed(msg) => assert!(msg.contains("no backend handle")),
             other => panic!("Expected ExecFailed, got: {other:?}"),
         }
     }
+
+    #[tokio::test]
+    async fn test_exec_sync_unreachable_agent_fails_cleanly() {
+        // A KataHandle with a real (but not started) CloudHypervisor: calling
+        // `get_agent_socket()` on a VM that was never `prepare_vm`'d /
+        // `start_vm`'d should error out (no vsock path configured yet)
+        // rather than hang — exec_sync must surface that as ExecFailed.
+        let (backend, _, temp) = create_test_backend();
+        let sandbox_path = temp.path().join("sandbox");
+        std::fs::create_dir_all(&sandbox_path).unwrap();
+        let mut sandbox = create_test_sandbox(sandbox_path.clone());
+        sandbox.backend_handle = Some(create_test_handle(&sandbox_path));
+
+        let result = backend
+            .exec_sync(&sandbox, &["echo".into(), "hello".into()], 1)
+            .await;
+
+        assert!(result.is_err(), "exec against an unprepared VM must fail, not hang");
+    }
+
+    #[tokio::test]
+    async fn test_exec_sync_clears_cached_client_on_failure() {
+        // Regression: if `KataHandle.agent` caches a ttrpc client whose
+        // connection is dead (VM restarted/died without a `reset_sandbox`),
+        // `exec_sync` must NOT keep reusing that stale client on every
+        // subsequent call. It should clear the cache on failure so the next
+        // call redials. We seed the cache with a client connected to a
+        // listener that is then dropped — its first RPC deterministically
+        // fails — and assert the cache is `None` afterward.
+        let (backend, _, temp) = create_test_backend();
+        let sandbox_path = temp.path().join("sandbox");
+        std::fs::create_dir_all(&sandbox_path).unwrap();
+        let mut sandbox = create_test_sandbox(sandbox_path.clone());
+        let handle = create_test_handle(&sandbox_path);
+
+        // Build a client over a connection to a transient listener, then
+        // drop the listener so the connection has no peer — any RPC on it
+        // fails. This mirrors a cached client whose VM has gone away.
+        let dead_sock = sandbox_path.join("dead-agent.sock");
+        let listener = tokio::net::UnixListener::bind(&dead_sock).unwrap();
+        let client = KataAgentClient::from_ttrpc_client(
+            ttrpc::r#async::Client::connect(&format!("unix://{}", dead_sock.display())).unwrap(),
+        );
+        drop(listener);
+
+        handle.agent.lock().await.replace(Arc::new(client));
+        // Keep a clone of the `Arc<KataHandle>` for post-call assertions:
+        // `backend_handle` takes ownership of the reference we stored, but we
+        // still need to inspect `agent` afterward (the `Arc` is shared, so
+        // both observe the same `Mutex`).
+        let handle_for_assert = Arc::clone(&handle);
+        sandbox.backend_handle = Some(handle);
+
+        // Bounded timeout: a stale connection must not hang the call. The
+        // underlying ttrpc context timeout (30s) bounds a silent server, but
+        // a closed peer should fail much faster; cap at 35s to also catch a
+        // regression where the cache-clear path itself wedges.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(35),
+            backend.exec_sync(&sandbox, &["echo".into(), "hi".into()], 1),
+        )
+        .await;
+        assert!(result.is_ok(), "exec_sync against a dead cached client must not hang");
+        assert!(
+            result.unwrap().is_err(),
+            "exec against a dead cached client must fail, not silently succeed"
+        );
+
+        // The fix's core guarantee: the stale client was evicted so the next
+        // call reconnects instead of reusing the dead connection forever.
+        assert!(
+            handle_for_assert.agent.lock().await.is_none(),
+            "cached dead agent client must be cleared on exec failure"
+        );
+    }
+
 
     #[test]
     fn test_is_available() {
@@ -592,7 +969,6 @@ mod tests {
 
         let kata = kata.unwrap();
         assert_eq!(kata.api_socket, temp.path().join("test.sock"));
-        assert!(kata.virtiofs_daemon.is_none());
         assert_eq!(
             kata.virtiofs_socket.as_deref(),
             Some(temp.path().join("virtiofs.sock").as_path())
@@ -691,8 +1067,8 @@ mod tests {
             "reset should preserve the same hypervisor instance"
         );
 
-        // virtiofs fields should be cleared
-        assert!(kata.virtiofs_daemon.is_none(), "virtiofs_daemon should be cleared");
+        // virtiofs socket should be cleared on reset (the composed VFS server
+        // is not reused; a recycled sandbox composes a fresh one on next start).
         assert!(kata.virtiofs_socket.is_none(), "virtiofs_socket should be cleared");
 
         // api_socket should be preserved

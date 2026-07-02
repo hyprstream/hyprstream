@@ -14,6 +14,9 @@ pub mod private_store;
 
 pub mod chat_app;
 
+#[cfg(not(target_os = "wasi"))]
+pub mod shell_driver;
+
 #[cfg(target_os = "wasi")]
 pub mod chat_ui_wasm;
 

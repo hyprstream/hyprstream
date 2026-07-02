@@ -15,8 +15,34 @@ async-trait = "0.1"
 # Async runtime (sync/rt for VFS proxy)
 tokio = { version = "1", features = ["sync", "rt"] }
 
+# BoxFuture/LocalBoxFuture for the devfile (ControlFile/FieldFile/DynamicDir)
+# callback signatures.
+futures = { workspace = true }
+
 # Error handling
 anyhow = { workspace = true }
 
+# Interior mutability for devfile's per-fid write->latch->read buffer
+# (`DevFileState`). Unconditional (not gated to non-wasm like the
+# fuse-backend-rs block below) because `devfile` is meant to be usable from
+# wasm32 mounts too — parking_lot builds fine there. Workspace clippy.toml
+# disallows std::sync::Mutex/RwLock in favor of this.
+parking_lot = { workspace = true }
+
+# Native filesystem backends for the FsMount overlay adapter (FS-C #364).
+# fuse-backend-rs provides the FileSystem trait, OverlayFs (v1 overlay engine)
+# and PassthroughFs. The overlayfs/passthrough modules are Linux-only, so the
+# dependency is gated to non-wasm targets (the adapter/overlay code is too).
+#
+# Pinned to 0.13 to match the version nydus (`nydus-rafs`, v2.4.0) builds
+# against, so the RAFS `Rafs` `Layer`/`FileSystem` impl is the *same* type as
+# this crate's `BoxedLayer`/up-adapter — FS-B (#363) passes a RAFS lower into
+# `rootfs_overlay` directly. The OverlayFs/PassthroughFs/FileSystem APIs used
+# here are identical between 0.12 and 0.13.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+fuse-backend-rs = "0.13"
+libc = "0.2"
+
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "macros", "sync"] }
+tempfile = "3"

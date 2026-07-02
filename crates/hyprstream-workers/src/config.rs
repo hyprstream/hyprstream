@@ -9,33 +9,31 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Sandbox backend type
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum BackendType {
-    /// Kata Containers (default — full VM isolation)
-    #[default]
-    Kata,
-    /// systemd-nspawn (lightweight container, rootless, host filesystem)
-    Nspawn,
-}
-
-impl std::fmt::Display for BackendType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Kata => write!(f, "kata"),
-            Self::Nspawn => write!(f, "nspawn"),
-        }
-    }
+/// Default value for [`WorkerConfig::backend`].
+///
+/// `"auto"` asks the runtime to pick the highest-priority *available* registered
+/// sandbox backend (see [`crate::runtime::resolve_backend`]).
+fn default_backend() -> String {
+    "auto".to_owned()
 }
 
 /// Top-level configuration for the workers crate
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-#[derive(Default)]
 pub struct WorkerConfig {
-    /// Sandbox backend to use for isolation
-    pub backend: BackendType,
+    /// Sandbox backend selection (operator-driven).
+    ///
+    /// A registered backend name or `"auto"`:
+    /// * `"auto"` (default) — pick the highest-priority *available* registered
+    ///   backend.
+    /// * `"kata"` — full VM isolation (only available in `kata-vm` builds).
+    /// * `"nspawn"` — systemd-nspawn lightweight container.
+    ///
+    /// Resolved fail-closed at startup against the inventory backend registry —
+    /// an unavailable or unknown name errors rather than silently downgrading
+    /// isolation. See [`crate::runtime::resolve_backend`].
+    #[serde(default = "default_backend")]
+    pub backend: String,
 
     /// Pool configuration for VM management
     pub pool: PoolConfig,
@@ -52,6 +50,19 @@ pub struct WorkerConfig {
     /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
     #[serde(default)]
     pub quic_port: Option<u16>,
+}
+
+impl Default for WorkerConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_backend(),
+            pool: PoolConfig::default(),
+            images: ImageConfig::default(),
+            workflow: WorkflowConfig::default(),
+            events: EventConfig::default(),
+            quic_port: None,
+        }
+    }
 }
 
 
@@ -298,25 +309,29 @@ mod tests {
     }
 
     #[test]
-    fn test_backend_type_default() {
-        assert_eq!(BackendType::default(), BackendType::Kata);
+    fn test_backend_default_is_auto() {
+        // Default selection is "auto": pick the strongest *available* registered
+        // backend at startup (resolved fail-closed, never silent downgrade).
+        assert_eq!(WorkerConfig::default().backend, "auto");
     }
 
     #[test]
-    fn test_backend_type_serialization() -> Result<(), Box<dyn std::error::Error>> {
-        let yaml = "backend: nspawn\n";
-        let config: WorkerConfig = serde_yaml::from_str(yaml)?;
-        assert_eq!(config.backend, BackendType::Nspawn);
-
-        let yaml = "backend: kata\n";
-        let config: WorkerConfig = serde_yaml::from_str(yaml)?;
-        assert_eq!(config.backend, BackendType::Kata);
+    fn test_backend_string_parses_verbatim() -> Result<(), Box<dyn std::error::Error>> {
+        // `backend` is a free-form string matched against the registry by name;
+        // config parsing does not validate it (resolution does, fail-closed).
+        for name in ["auto", "kata", "nspawn", "anything"] {
+            let yaml = format!("backend: {name}\n");
+            let config: WorkerConfig = serde_yaml::from_str(&yaml)?;
+            assert_eq!(config.backend, name);
+        }
         Ok(())
     }
 
     #[test]
-    fn test_backend_type_display() {
-        assert_eq!(BackendType::Kata.to_string(), "kata");
-        assert_eq!(BackendType::Nspawn.to_string(), "nspawn");
+    fn test_backend_absent_defaults_to_auto() -> Result<(), Box<dyn std::error::Error>> {
+        // Missing `backend` key falls back to the field default ("auto"), not "".
+        let config: WorkerConfig = serde_yaml::from_str("pool:\n  max_sandboxes: 5\n")?;
+        assert_eq!(config.backend, "auto");
+        Ok(())
     }
 }

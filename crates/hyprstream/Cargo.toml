@@ -62,7 +62,8 @@ hyprstream-metrics = { path = "../hyprstream-metrics" }  # Metrics storage (for 
 hyprstream-workers = { path = "../hyprstream-workers" }  # Worker runtime (Kata containers)
 hyprstream-vfs = { path = "../hyprstream-vfs" }  # VFS namespace (Mount trait)
 hyprstream-9p = { path = "../hyprstream-9p" }  # 9P codec + Kata translator (Backend, Translator)
-hyprstream-tcl = { path = "../hyprstream-tcl" }  # Tcl shell (TclMount, TclCommand)
+hyprstream-workers-tcl = { path = "../hyprstream-workers-tcl" }  # Tcl shell (TclMount, TclCommand)
+hyprstream-workers-python = { path = "../hyprstream-workers-python" }  # Python shell (PythonMount, PyCommand)
 inventory.workspace = true  # Service factory registration
 gittorrent = { workspace = true, optional = true }  # P2P transport
 clap.workspace = true
@@ -194,7 +195,7 @@ keyring = { version = "3", features = ["windows-native"] }
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
 [features]
-default = ["gittorrent", "xet", "systemd", "otel"]
+default = ["gittorrent", "xet", "systemd", "otel", "kata-vm"]
 cuda = []
 valkey = ["dep:fred"]  # Enable Valkey/Redis-backed user and token stores
 bnb = ["dep:bitsandbytes-sys"]  # Enable bitsandbytes KV cache quantization (requires compatible ROCm/CUDA)
@@ -204,6 +205,8 @@ gittorrent = ["dep:gittorrent", "git2db/gittorrent-transport"]  # Enable P2P mod
 download-libtorch = ["tch/download-libtorch"]
 overlayfs = ["git2db/overlayfs"]  # Enable overlayfs-backed worktrees (delegated to git2db)
 systemd = ["hyprstream-rpc/systemd", "hyprstream-service/systemd", "hyprstream-workers/systemd", "dep:listenfd"]  # Systemd integration (socket activation, service units)
+oci-image = ["hyprstream-workers/oci-image"]  # Universal mountable OCI/RAFS image filesystem service (ImageFs, an FsMount); composable by any backend (#633)
+kata-vm = ["hyprstream-workers/kata-vm", "oci-image"]  # Kata/Cloud-Hypervisor VM worker backend; implies oci-image (kata serves it via virtio-fs). In default; drop for an nspawn-only build
 experimental = ["hyprstream-compositor/experimental"]  # EXPERIMENTAL: Enable service/worker panels, git write operations
 pq-hybrid = []  # NO-OP alias: PQ primitives always compiled; Classical/Hybrid selected at runtime. See M3 #152.
 

@@ -225,47 +225,6 @@ pub enum ChatMode {
 // ChatApp
 // ============================================================================
 
-/// Create a no-op waker for polling futures that don't need wake notifications.
-///
-/// Safe for TclShell/VFS futures which are purely computational (no IO reactor,
-/// no timers) — they always make progress on each poll without needing external
-/// wake-ups.
-fn noop_waker() -> std::task::Waker {
-    fn noop(_: *const ()) {}
-    fn clone(p: *const ()) -> std::task::RawWaker {
-        std::task::RawWaker::new(p, &VTABLE)
-    }
-    static VTABLE: std::task::RawWakerVTable =
-        std::task::RawWakerVTable::new(clone, noop, noop, noop);
-    // SAFETY: The vtable functions are valid no-ops. The data pointer is never dereferenced.
-    unsafe { std::task::Waker::from_raw(std::task::RawWaker::new(std::ptr::null(), &VTABLE)) }
-}
-
-/// Wrapper that asserts `Send` for a `!Send` value.
-///
-/// **Not thread-local storage** — this is a Send bypass for values that are
-/// constructed and accessed on a single thread but must transit a thread boundary
-/// wrapped in `Option<AssertSend<T>>` where the Option is `None` during the move.
-///
-/// SAFETY: This is used exclusively for `TclShell` which uses `Rc` internally
-/// (making it `!Send`). The wrapper is safe because:
-/// - The value is always wrapped in `Option` that is `None` during cross-thread moves
-/// - It is only populated via `ensure_tcl_shell()` on the app thread
-/// - It is only accessed from that same thread thereafter
-/// - `UnsafeCell` ensures `AssertSend<T>` is `!Sync` (cannot be shared across threads)
-struct AssertSend<T>(std::cell::UnsafeCell<T>);
-
-// SAFETY: See struct-level documentation.
-unsafe impl<T> Send for AssertSend<T> {}
-
-impl<T> std::ops::Deref for AssertSend<T> {
-    type Target = T;
-    fn deref(&self) -> &T { unsafe { &*self.0.get() } }
-}
-impl<T> std::ops::DerefMut for AssertSend<T> {
-    fn deref_mut(&mut self) -> &mut T { unsafe { &mut *self.0.get() } }
-}
-
 /// Double-Esc close window: two Esc presses within this interval close the app.
 #[cfg(not(target_os = "wasi"))]
 const DOUBLE_ESC_MS: u128 = 1500;
@@ -357,20 +316,106 @@ pub struct ChatApp {
     vfs: Option<std::sync::Arc<hyprstream_vfs::Namespace>>,
     /// Caller identity for VFS operations.
     vfs_subject: hyprstream_vfs::Subject,
-    /// Tcl shell for / command evaluation. Created lazily on first use because
-    /// TclShell is !Send (molt Value uses Rc) and ChatApp is moved across threads
-    /// in spawn_app_process. The init data (vfs_tx + subject) IS Send.
+    /// Tcl shell owner for `/` command evaluation. Created lazily on first use
+    /// (see [`ensure_tcl_shell`](Self::ensure_tcl_shell)) because `TclShell` is
+    /// `!Send` (molt `Value` uses `Rc`) and ChatApp is moved across threads in
+    /// `spawn_app_process` — so the shell cannot be constructed until ChatApp has
+    /// settled on its final thread. The init data (subject + namespace) IS Send
+    /// and crosses the thread boundary fine; only the live shell cannot.
     ///
-    /// SAFETY: TclShell is wrapped in `AssertSend` (unsafe Send impl) because:
-    /// 1. It is always `None` when ChatApp crosses a thread boundary
-    /// 2. It is only constructed inside `ensure_tcl_shell()` on the app thread
-    /// 3. It is only accessed from that same thread thereafter
-    tcl_shell: Option<AssertSend<hyprstream_tcl::TclShell>>,
-    /// Deferred init data for tcl_shell (Send-safe). Consumed on first access.
-    tcl_shell_init: Option<(hyprstream_vfs::Subject, std::sync::Arc<hyprstream_vfs::Namespace>)>,
-    /// Receiver for TclMount commands (polled in tick()). Shared across tabs.
+    /// The `TclShell` is never touched outside the dedicated owner thread that
+    /// [`shell_driver::ShellOwner`] spawns for it — there is no unsafe Send bypass
+    /// because the shell never crosses a thread boundary at all.
     #[cfg(not(target_os = "wasi"))]
-    tcl_mount_rx: Option<std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>>,
+    tcl_owner: Option<crate::shell_driver::ShellOwner>,
+    /// Deferred init data for the Tcl shell owner (Send-safe). Consumed on first
+    /// access by [`ensure_tcl_shell`](Self::ensure_tcl_shell).
+    tcl_shell_init: Option<(hyprstream_vfs::Subject, std::sync::Arc<hyprstream_vfs::Namespace>)>,
+    /// Dedicated-thread driver for direct `Namespace` access (`cat`/`ls`), used
+    /// by bare-path slash commands that don't need a Tcl interpreter at all. See
+    /// [`ensure_ns_driver`](Self::ensure_ns_driver) and the routing split in
+    /// [`handle_vfs_command`](Self::handle_vfs_command).
+    #[cfg(not(target_os = "wasi"))]
+    ns_driver: Option<crate::shell_driver::NamespaceDriver>,
+}
+
+// ============================================================================
+// Slash-command routing: decouple simple VFS access from Tcl
+// ============================================================================
+
+/// Classification of a `/`-prefixed command, used to decide whether it can be
+/// served directly from the `Namespace` (no Tcl interpreter involved) or needs
+/// genuine Tcl script evaluation.
+///
+/// This is the decoupling #611 asks for: slash-command routing no longer
+/// assumes Tcl is the only way to reach the VFS. Only commands that are
+/// literally "read a file" or "list a directory" — the two cases the old
+/// bare-path heuristic already special-cased — bypass Tcl; anything with
+/// Tcl-shaped syntax (multiple words, braces, `$vars`, `[brackets]`, other
+/// builtins like `write`/`ctl`/`mount`/`help`, or unrecognized commands) still
+/// goes through the interpreter exactly as before.
+#[cfg(not(target_os = "wasi"))]
+#[derive(Debug)]
+enum VfsCommandClass {
+    /// Bare path (`/srv/model/status`) or explicit `cat <path>` with exactly one
+    /// argument and no Tcl metacharacters in it.
+    Cat(String),
+    /// `ls` or `ls <path>` with at most one argument and no Tcl metacharacters.
+    Ls(Option<String>),
+    /// Anything else — evaluate as Tcl.
+    Eval(String),
+}
+
+/// True if `s` contains characters that would change meaning under Tcl
+/// evaluation (substitution, grouping, command nesting) or any whitespace.
+///
+/// Direct-path arguments containing any of these fall through to `eval` so they
+/// get exactly the semantics they had before this routing split. The Tcl
+/// metacharacters (`$ [ ] { } " ; \`) cover substitution/grouping/command-
+/// nesting. The whitespace check keeps a bare-path fast-path argument
+/// byte-faithful to "literally `cat <this exact string>`": the old bare-path
+/// heuristic built `cat {input}` and let the molt tokenizer split it, so a path
+/// containing e.g. a newline would have been command-split by the interpreter
+/// rather than read as one opaque filename — routing such inputs through Tcl
+/// preserves that. (The VFS resolver returns `NotFound` for whitespace-bearing
+/// paths regardless; all path-safety/authorization lives inside
+/// `Namespace::cat`/`ls`, which the Tcl `cmd_cat`/`cmd_ls` builtins call
+/// unchanged — so this is a faithfulness guard, not a security fix.)
+#[cfg(not(target_os = "wasi"))]
+fn has_tcl_metachars(s: &str) -> bool {
+    s.contains(['$', '[', ']', '{', '}', '"', ';', '\\']) || s.contains(char::is_whitespace)
+}
+
+/// Classify a stripped (no leading `/`) slash-command body for direct-VFS vs.
+/// Tcl-eval routing. `leading_slash_path` mirrors the original bare-path
+/// heuristic in `handle_vfs_command`: a single word containing `/` with no
+/// space (e.g. `srv/model/status`, from input `/srv/model/status`).
+#[cfg(not(target_os = "wasi"))]
+fn classify_vfs_command(stripped: &str, leading_slash_path: bool) -> VfsCommandClass {
+    if leading_slash_path {
+        return if has_tcl_metachars(stripped) {
+            VfsCommandClass::Eval(stripped.to_owned())
+        } else {
+            VfsCommandClass::Cat(format!("/{stripped}"))
+        };
+    }
+
+    let mut parts = stripped.split_whitespace();
+    let Some(cmd) = parts.next() else {
+        return VfsCommandClass::Eval(stripped.to_owned());
+    };
+    let rest: Vec<&str> = parts.collect();
+
+    match cmd {
+        "cat" if rest.len() == 1 && !has_tcl_metachars(rest[0]) => {
+            VfsCommandClass::Cat(rest[0].to_owned())
+        }
+        "ls" if rest.is_empty() => VfsCommandClass::Ls(None),
+        "ls" if rest.len() == 1 && !has_tcl_metachars(rest[0]) => {
+            VfsCommandClass::Ls(Some(rest[0].to_owned()))
+        }
+        _ => VfsCommandClass::Eval(stripped.to_owned()),
+    }
 }
 
 impl ChatApp {
@@ -412,10 +457,9 @@ impl ChatApp {
             spinner_tick: 0,
             vfs: None,
             vfs_subject: hyprstream_vfs::Subject::anonymous(),
-            tcl_shell: None,
+            tcl_owner: None,
             tcl_shell_init: None,
-            #[cfg(not(target_os = "wasi"))]
-            tcl_mount_rx: None,
+            ns_driver: None,
         }
     }
 
@@ -445,10 +489,7 @@ impl ChatApp {
             spinner_tick: 0,
             vfs: None,
             vfs_subject: hyprstream_vfs::Subject::anonymous(),
-            tcl_shell: None,
             tcl_shell_init: None,
-            #[cfg(not(target_os = "wasi"))]
-            tcl_mount_rx: None,
         }
     }
 
@@ -524,10 +565,9 @@ impl ChatApp {
             spinner_tick: 0,
             vfs: None,
             vfs_subject: hyprstream_vfs::Subject::anonymous(),
-            tcl_shell: None,
+            tcl_owner: None,
             tcl_shell_init: None,
-            #[cfg(not(target_os = "wasi"))]
-            tcl_mount_rx: None,
+            ns_driver: None,
         }
     }
 
@@ -550,9 +590,11 @@ impl ChatApp {
 
     /// Attach a VFS namespace for `/path` command routing.
     ///
-    /// The TclShell is created lazily on first use (inside the app thread)
-    /// because it is `!Send` and ChatApp must cross a thread boundary in
-    /// `spawn_app_process`.
+    /// The Tcl shell owner thread and the direct-`Namespace` driver thread (see
+    /// `crate::shell_driver`) are both created lazily on first use, because
+    /// `TclShell` is `!Send` and ChatApp must cross a thread boundary in
+    /// `spawn_app_process` before it can settle on the thread its owner will
+    /// spawn from.
     pub fn with_vfs(mut self, ns: std::sync::Arc<hyprstream_vfs::Namespace>, subject: hyprstream_vfs::Subject) -> Self {
         self.tcl_shell_init = Some((subject.clone(), std::sync::Arc::clone(&ns)));
         self.vfs = Some(ns);
@@ -574,17 +616,6 @@ impl ChatApp {
         self.tcl_shell_init = Some((subject.clone(), std::sync::Arc::clone(&ns)));
         self.vfs = Some(ns);
         self.vfs_subject = subject;
-        self
-    }
-
-    /// Attach the receiver end of a `/lang/tcl` mount channel.
-    ///
-    /// The corresponding [`hyprstream_tcl::TclMount`] must be mounted in the
-    /// namespace at `/lang/tcl` before this is called. The ChatApp drains this
-    /// channel in `tick()`, forwarding commands to the Tcl interpreter.
-    #[cfg(not(target_os = "wasi"))]
-    pub fn with_tcl_mount_rx(mut self, rx: std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<hyprstream_tcl::TclCommand>>>) -> Self {
-        self.tcl_mount_rx = Some(rx);
         self
     }
 
@@ -824,46 +855,61 @@ impl ChatApp {
         self.scroll_offset = 0;
     }
 
-    /// Lazily initialize the TclShell. Must be called from the app thread
-    /// (after the ChatApp has been moved into spawn_app_process).
+    /// Lazily spawn the Tcl shell owner thread. Must be called from the app
+    /// thread (after the ChatApp has been moved into `spawn_app_process`) so
+    /// `tcl_shell_init`'s `Subject`/`Arc<Namespace>` (both `Send`) can cross into
+    /// the dedicated owner thread that [`shell_driver::ShellOwner::spawn`]
+    /// creates — the live `TclShell` itself never crosses any thread boundary.
+    ///
+    /// The owner services the synchronous slash-command `eval()` path only;
+    /// `/lang/tcl` VFS traffic is served by the self-contained `TclMount` in the
+    /// namespace, not by ChatApp.
+    #[cfg(not(target_os = "wasi"))]
     fn ensure_tcl_shell(&mut self) {
-        if self.tcl_shell.is_none() {
+        if self.tcl_owner.is_none() {
             if let Some((subject, namespace)) = self.tcl_shell_init.take() {
-                self.tcl_shell = Some(AssertSend(std::cell::UnsafeCell::new(
-                    hyprstream_tcl::TclShell::new(subject, namespace),
-                )));
+                self.tcl_owner = Some(crate::shell_driver::ShellOwner::spawn(
+                    subject, namespace,
+                ));
             }
         }
     }
 
-    /// Poll a `!Send` future to completion on the current thread.
-    ///
-    /// Works in both contexts: inside an existing tokio runtime (shell_handlers
-    /// compositor loop) and on a bare OS thread (spawn_app_process). Uses a
-    /// noop-waker poll loop — safe because TclShell/VFS futures are pure async
-    /// (no IO reactor, no timers — just trait method dispatch).
-    fn poll_local<F: std::future::Future>(fut: F) -> F::Output {
-        let mut fut = std::pin::pin!(fut);
-        let waker = noop_waker();
-        let mut cx = std::task::Context::from_waker(&waker);
-        loop {
-            match fut.as_mut().poll(&mut cx) {
-                std::task::Poll::Ready(val) => return val,
-                std::task::Poll::Pending => std::thread::yield_now(),
+    /// No-op on WASI: there is no dedicated-thread shell owner there (no VFS,
+    /// no `/`-command routing — see `new_wasm`, which never calls `with_vfs`).
+    #[cfg(target_os = "wasi")]
+    fn ensure_tcl_shell(&mut self) {}
+
+    /// Lazily spawn the direct-`Namespace` driver thread used for bare
+    /// cat/ls-shaped `/`-commands that don't need a Tcl interpreter at all.
+    #[cfg(not(target_os = "wasi"))]
+    fn ensure_ns_driver(&mut self) {
+        if self.ns_driver.is_none() {
+            if let Some(ns) = &self.vfs {
+                self.ns_driver = Some(crate::shell_driver::NamespaceDriver::spawn(
+                    self.vfs_subject.clone(),
+                    std::sync::Arc::clone(ns),
+                ));
             }
         }
     }
 
-    /// Handle a `/`-prefixed command by evaluating it as Tcl against the VFS.
+    /// Handle a `/`-prefixed command.
     ///
-    /// Bare paths (e.g. `/srv/model/status`) are treated as `cat /srv/model/status`.
-    /// Commands (e.g. `/ls /srv/model`) are evaluated directly.
+    /// Bare paths (e.g. `/srv/model/status`) and simple `cat`/`ls` invocations
+    /// are served directly from the `Namespace` via
+    /// [`NamespaceDriver`](crate::shell_driver::NamespaceDriver) — no Tcl
+    /// interpreter is constructed or consulted for these. Anything else (e.g.
+    /// `/write`, `/ctl`, `/mount`, `/help`, or genuine Tcl syntax with
+    /// `$vars`/`[brackets]`/etc.) still evaluates through `TclShell` via
+    /// [`ShellOwner`](crate::shell_driver::ShellOwner), exactly as before — this
+    /// is a routing refactor, not a behavior change for those paths.
+    #[cfg(not(target_os = "wasi"))]
     fn handle_vfs_command(&mut self, input: &str) {
-        self.ensure_tcl_shell();
-        let Some(shell) = &mut self.tcl_shell else {
+        if self.vfs.is_none() {
             self.push_system_message("VFS not available");
             return;
-        };
+        }
 
         // Show the command in history.
         self.history.push(ChatHistoryEntry {
@@ -874,17 +920,38 @@ impl ChatApp {
             tool_call_id: None,
         });
 
-        // Strip leading '/' and decide: bare path vs command.
+        // Strip leading '/' and decide: bare path vs command, mirroring the
+        // original heuristic exactly (single word containing '/' with no space
+        // = bare path), before sub-classifying for direct-vs-Tcl routing.
         let stripped = input.trim_start_matches('/');
-        let script = if !stripped.contains(' ') && stripped.contains('/') {
-            // Bare path like /srv/model/status → cat it.
-            format!("cat {input}")
-        } else {
-            // Command like /ls /srv or /help → eval as-is.
-            stripped.to_owned()
+        let leading_slash_path = !stripped.contains(' ') && stripped.contains('/');
+
+        let class = classify_vfs_command(stripped, leading_slash_path);
+
+        let result = match class {
+            VfsCommandClass::Cat(path) => {
+                self.ensure_ns_driver();
+                match &self.ns_driver {
+                    Some(driver) => driver.cat(&path),
+                    None => Err("VFS not available".to_owned()),
+                }
+            }
+            VfsCommandClass::Ls(path) => {
+                self.ensure_ns_driver();
+                match &self.ns_driver {
+                    Some(driver) => driver.ls(path.as_deref().unwrap_or("/")),
+                    None => Err("VFS not available".to_owned()),
+                }
+            }
+            VfsCommandClass::Eval(script) => {
+                self.ensure_tcl_shell();
+                match &self.tcl_owner {
+                    Some(owner) => owner.eval(&script),
+                    None => Err("VFS not available".to_owned()),
+                }
+            }
         };
 
-        let result = Self::poll_local(shell.eval(&script));
         match result {
             Ok(output) if !output.is_empty() => {
                 self.push_system_message(&output);
@@ -894,6 +961,13 @@ impl ChatApp {
                 self.push_system_message(&format!("error: {e}"));
             }
         }
+    }
+
+    /// No-op on WASI: `/`-command routing requires a VFS namespace, which is
+    /// never attached there (see `new_wasm`).
+    #[cfg(target_os = "wasi")]
+    fn handle_vfs_command(&mut self, _input: &str) {
+        self.push_system_message("VFS not available");
     }
 
     // ── Submit helpers ────────────────────────────────────────────────────────
@@ -1440,20 +1514,6 @@ impl TerminalApp for ChatApp {
 
         let mut redraw = false;
 
-        // Process pending TclMount requests from /lang/tcl VFS mount.
-        if self.tcl_mount_rx.is_some() {
-            self.ensure_tcl_shell();
-            if let (Some(ref rx_arc), Some(ref mut shell)) =
-                (&self.tcl_mount_rx, &mut self.tcl_shell)
-            {
-                if let Ok(mut rx) = rx_arc.try_lock() {
-                    while let Ok(cmd) = rx.try_recv() {
-                        Self::poll_local(shell.process_command(cmd));
-                    }
-                }
-            }
-        }
-
         // Advance spinner while tool calls are in flight.
         if self.pending_tool_calls > 0 {
             self.spinner_tick = self.spinner_tick.wrapping_add(1);
@@ -1605,5 +1665,109 @@ impl TerminalApp for ChatApp {
 
     fn should_quit(&self) -> bool {
         self.quit
+    }
+}
+
+#[cfg(all(test, not(target_os = "wasi")))]
+mod tests {
+    use super::{classify_vfs_command, has_tcl_metachars, VfsCommandClass};
+
+    /// A bare path (single word containing `/`) with no metacharacters routes to
+    /// a direct `Namespace::cat` of the leading-`/`-prefixed path — matching the
+    /// old `format!("cat {input}")` behavior exactly.
+    #[test]
+    fn bare_path_routes_to_direct_cat() {
+        let class = classify_vfs_command("srv/model/status", true);
+        assert!(matches!(class, VfsCommandClass::Cat(p) if p == "/srv/model/status"));
+    }
+
+    /// A bare path containing any Tcl metacharacter falls through to Tcl `eval`
+    /// so the interpreter's substitution/grouping semantics are preserved.
+    #[test]
+    fn bare_path_with_metachar_routes_to_eval() {
+        for bad in ["srv/$x", "srv/[a]", "srv/{b}", "srv/\"q\"", "srv;c", "srv\\d"] {
+            let class = classify_vfs_command(bad, true);
+            assert!(
+                matches!(class, VfsCommandClass::Eval(ref s) if s == bad),
+                "bare path {bad:?} should fall through to Eval, got {class:?}"
+            );
+        }
+    }
+
+    /// A bare path containing whitespace (space/tab/newline) also falls through
+    /// to Tcl: the old heuristic built `cat {input}` and let molt tokenize it, so
+    /// e.g. a newline would have been command-split. See `has_tcl_metachars`.
+    #[test]
+    fn bare_path_with_whitespace_routes_to_eval() {
+        for bad in ["srv/x\t", "srv\ny/z", "srv\r/z"] {
+            // `leading_slash_path` is computed by the caller from "no space AND
+            // contains '/'"; a tab/newline is not a space so the caller would
+            // still set it true — the classifier must then reject via the
+            // whitespace arm of has_tcl_metachars.
+            let class = classify_vfs_command(bad, true);
+            assert!(
+                matches!(class, VfsCommandClass::Eval(ref s) if s == bad),
+                "bare path {bad:?} should fall through to Eval, got {class:?}"
+            );
+        }
+    }
+
+    /// `cat <path>` with exactly one metachar-free argument routes to direct cat.
+    #[test]
+    fn explicit_cat_routes_to_direct_cat() {
+        let class = classify_vfs_command("cat /srv/model/status", false);
+        assert!(matches!(class, VfsCommandClass::Cat(p) if p == "/srv/model/status"));
+    }
+
+    /// `cat` with zero, two, or metachar-bearing arguments falls through to Tcl.
+    #[test]
+    fn cat_wrong_arity_or_meta_routes_to_eval() {
+        assert!(matches!(
+            classify_vfs_command("cat", false),
+            VfsCommandClass::Eval(_)
+        ));
+        assert!(matches!(
+            classify_vfs_command("cat a b", false),
+            VfsCommandClass::Eval(_)
+        ));
+        assert!(matches!(
+            classify_vfs_command("cat $x", false),
+            VfsCommandClass::Eval(_)
+        ));
+    }
+
+    /// `ls` and `ls <path>` route to direct ls.
+    #[test]
+    fn ls_routes_to_direct_ls() {
+        assert!(matches!(classify_vfs_command("ls", false), VfsCommandClass::Ls(None)));
+        assert!(matches!(
+            classify_vfs_command("ls /srv", false),
+            VfsCommandClass::Ls(Some(p)) if p == "/srv"
+        ));
+    }
+
+    /// Everything that isn't a bare path or simple cat/ls — write/ctl/mount/help,
+    /// unknown commands, empty input — falls through to Tcl `eval` unchanged.
+    #[test]
+    fn non_direct_commands_route_to_eval() {
+        for input in ["write /x y", "ctl /svc start", "mount foo", "help", "frobnicate", ""] {
+            assert!(
+                matches!(classify_vfs_command(input, false), VfsCommandClass::Eval(s) if s == input),
+                "input {input:?} should Eval unchanged"
+            );
+        }
+    }
+
+    /// `has_tcl_metachars` is the security-relevant gate: it must reject every
+    /// character that would change meaning under Tcl evaluation, plus whitespace.
+    #[test]
+    fn metachar_detection_is_complete() {
+        // Each Tcl-significant character, in an otherwise-inert string.
+        for c in ['$', '[', ']', '{', '}', '"', ';', '\\', ' ', '\t', '\n', '\r'] {
+            assert!(has_tcl_metachars(&format!("x{c}y")), "failed to flag {c:?}");
+        }
+        // A plain path is clean.
+        assert!(!has_tcl_metachars("/srv/model/status"));
+        assert!(!has_tcl_metachars("bin/foo-bar_2.txt"));
     }
 }

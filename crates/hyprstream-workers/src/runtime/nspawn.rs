@@ -125,6 +125,13 @@ impl NspawnBackend {
         Self { config }
     }
 
+    /// Runtime prerequisite probe for the backend registry: both
+    /// `systemd-nspawn` and `machinectl` must be on PATH. Mirrors the
+    /// instance-level [`SandboxBackend::is_available`] check.
+    fn registry_is_available() -> bool {
+        which::which("systemd-nspawn").is_ok() && which::which("machinectl").is_ok()
+    }
+
     /// Build the `systemd-nspawn` argument list for a sandbox.
     fn build_nspawn_args(
         &self,
@@ -501,6 +508,29 @@ impl SandboxBackend for NspawnBackend {
         }
 
         Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Backend registry self-registration (#507 / #518)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// systemd-nspawn is always compiled in (no feature gate), so it is always a
+// registered selectable backend. It is the lowest-priority auto pick — chosen
+// only when no stronger isolation tier is available. Selection still fails
+// closed: if nspawn's prerequisites are missing, an explicit `nspawn` request or
+// an `auto` with nothing else available errors rather than running unisolated.
+inventory::submit! {
+    crate::runtime::selection::BackendRegistration {
+        name: "nspawn",
+        priority: 10,
+        // Kernel-namespace isolation (real container) → eligible for `"auto"`.
+        auto_selectable: true,
+        is_available: NspawnBackend::registry_is_available,
+        construct: |_ctx| {
+            Ok(std::sync::Arc::new(NspawnBackend::new(NspawnConfig::default()))
+                as std::sync::Arc<dyn crate::runtime::SandboxBackend>)
+        },
     }
 }
 

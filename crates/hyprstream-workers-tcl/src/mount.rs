@@ -1,18 +1,28 @@
-//! `/lang/tcl/` VFS mount — exposes Tcl interpreter state as files.
+//! `/lang/tcl/` VFS mount — a **self-contained, stateful 9P file service**.
 //!
-//! The molt `Interp` is `!Send` (uses `Rc`), so the mount cannot hold it directly.
-//! Instead, `TclMount` holds a `SyncSender<TclCommand>` channel. Mount methods
-//! send commands through the channel and block on a oneshot for the response.
-//! The interpreter loop runs on the owning thread (ChatApp), which polls the
-//! receiver in its `tick()` method.
+//! [`TclMount::spawn`] owns its `!Send` molt interpreter + a dedicated driver
+//! thread internally; callers mount it and never touch its channels or state.
+//! The namespace is the only interface — a `/lang/tcl/eval` write is served by
+//! the mount's own driver. There is no external `rx` to drain, so adding a Tcl
+//! shell requires no edits to the dispatch/RPC/UI layer (epic #508, issue #634).
 //!
 //! Layout:
 //! - `/lang/tcl/eval`   — ctl file: write a Tcl script, read the result
 //! - `/lang/tcl/vars/`  — dynamic dir: list Tcl variables as readable files
 //! - `/lang/tcl/procs/` — dynamic dir: list defined procs as readable files
+//!
+//! Built on `hyprstream-vfs`'s `devfile` primitives (`ControlFile` for `eval`,
+//! `DynamicDir` for `vars`/`procs`) rather than hand-rolling the write→latch→
+//! read state machine — see `hyprstream_vfs::devfile` for the shared
+//! implementation (#609).
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat, Subject};
+use hyprstream_vfs::devfile::{ControlFile, DevFileState, DevFuture, DynamicDir};
+use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Namespace, Stat, Subject};
+
+use crate::TclShell;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TclCommand — messages sent from mount threads to the interpreter owner
@@ -69,41 +79,164 @@ enum TclFidKind {
 /// Fid state for the Tcl mount.
 struct TclFid {
     kind: TclFidKind,
-    /// Buffer for ctl write→read pattern (eval).
-    write_buf: Vec<u8>,
+    /// `eval` write→latch→read state (devfile::ControlFile). Unused for
+    /// other fid kinds, but cheap (an empty `Vec` behind a `Mutex`).
+    ctl_state: DevFileState,
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// devfile callback type aliases
+// ─────────────────────────────────────────────────────────────────────────────
+
+type EvalCtl = ControlFile<Box<dyn Fn(Vec<u8>) -> DevFuture<'static, Result<Vec<u8>, MountError>> + Send + Sync>>;
+type ListFn = Box<dyn Fn() -> DevFuture<'static, Vec<String>> + Send + Sync>;
+type GetFn = Box<dyn Fn(String) -> DevFuture<'static, Result<Option<Vec<u8>>, MountError>> + Send + Sync>;
+type VarsDir = DynamicDir<ListFn, GetFn>;
+type ProcsDir = DynamicDir<ListFn, GetFn>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TclMount
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// VFS mount that proxies requests to a `!Send` Tcl interpreter via channels.
+/// VFS mount that proxies `/lang/tcl` requests to a `!Send` Tcl interpreter
+/// owned by the mount itself.
 ///
-/// Mount at `/lang/tcl` in the namespace. The interpreter owner must poll the
-/// `Receiver<TclCommand>` returned by [`create_mount_channel`] in its event
-/// loop (e.g., `ChatApp::tick()`).
+/// Construct with [`TclMount::spawn`], which spins up a dedicated driver thread
+/// hosting the [`TclShell`] and drains the internal command channel. The driver
+/// exits cleanly when the mount is dropped (all command-channel senders live
+/// inside the mount, so the driver's `rx.recv()` returns `None` once they drop).
+/// Callers never hold the interpreter, the channel sender, or the receiver —
+/// the namespace is the only interface.
 pub struct TclMount {
-    tx: tokio::sync::mpsc::Sender<TclCommand>,
+    eval: EvalCtl,
+    vars: VarsDir,
+    procs: ProcsDir,
+    /// Sender clone kept for the mount's lifetime. Declared LAST so it drops
+    /// after the devfile closures (`eval`/`vars`/`procs`), each of which also
+    /// holds a clone. When `TclMount` is dropped, every clone drops with it and
+    /// the driver's `rx.recv()` returns `None`, exiting the driver thread. The
+    /// field is `_`-prefixed because the struct never sends on it directly; it
+    /// exists to keep one clone alive for the lifetime of the mount.
+    _driver_tx: tokio::sync::mpsc::Sender<TclCommand>,
 }
 
 impl TclMount {
-    /// Create a new `TclMount` from the sending half of a mount channel.
-    pub fn new(tx: tokio::sync::mpsc::Sender<TclCommand>) -> Self {
-        Self { tx }
+    /// Spawn a self-contained `TclMount` whose driver thread owns a fresh
+    /// [`TclShell`] bound to `ns` under `subject`.
+    ///
+    /// The driver runs a `current_thread` tokio runtime + `LocalSet` (the molt
+    /// interpreter is `!Send` and its `eval` is async). Mount methods forward
+    /// each request over an internal channel and await the reply; the driver
+    /// pumps the [`TclShell`] between requests.
+    ///
+    /// `ns` is the namespace this mount will be mounted into — it lets
+    /// `/lang/tcl/eval` reuse the same `/bin/{cmd}` fallback resolution as an
+    /// inline `TclShell` (e.g. `cat /config/foo`).
+    #[allow(clippy::expect_used)] // Thread/runtime creation failure is unrecoverable
+    pub fn spawn(subject: Subject, ns: Arc<Namespace>) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel::<TclCommand>(16);
+
+        std::thread::Builder::new()
+            .name("tcl-mount-driver".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tcl-mount-driver runtime");
+                let local = tokio::task::LocalSet::new();
+                local.block_on(&rt, async move {
+                    let mut shell = TclShell::new(subject, ns);
+                    let mut rx = rx;
+                    while let Some(cmd) = rx.recv().await {
+                        shell.process_command(cmd).await;
+                    }
+                });
+            })
+            .expect("spawn tcl-mount-driver");
+
+        Self::build(tx)
     }
 
-    /// Send a command and await the interpreter response.
-    async fn request<T>(&self, build: impl FnOnce(tokio::sync::oneshot::Sender<T>) -> TclCommand) -> Result<T, MountError> {
-        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        let cmd = build(resp_tx);
-        self.tx
-            .send(cmd)
-            .await
-            .map_err(|_| MountError::Io("tcl interpreter gone".into()))?;
-        resp_rx
-            .await
-            .map_err(|_| MountError::Io("tcl interpreter did not respond".into()))
+    /// Build a `TclMount` over an existing command-channel sender.
+    ///
+    /// Internal helper used by [`spawn`]; also used directly by tests that
+    /// drive the interpreter via a fake task instead of a real `TclShell`.
+    #[cfg(test)]
+    fn new(tx: tokio::sync::mpsc::Sender<TclCommand>) -> Self {
+        Self::build(tx)
     }
+
+    fn build(tx: tokio::sync::mpsc::Sender<TclCommand>) -> Self {
+        let eval_tx = tx.clone();
+        let eval_handler = move |data: Vec<u8>| -> DevFuture<'static, Result<Vec<u8>, MountError>> {
+            let tx = eval_tx.clone();
+            let script = String::from_utf8_lossy(&data).into_owned();
+            Box::pin(async move {
+                let result = request(&tx, |resp| TclCommand::Eval { script, resp }).await?;
+                Ok(match result {
+                    Ok(s) => s.into_bytes(),
+                    Err(e) => format!("error: {e}").into_bytes(),
+                })
+            })
+        };
+        let eval = ControlFile::new(Box::new(eval_handler) as _);
+
+        let vars_tx = tx.clone();
+        let vars_get_tx = tx.clone();
+        let vars = DynamicDir::new(
+            Box::new(move || {
+                let tx = vars_tx.clone();
+                Box::pin(async move { request(&tx, |resp| TclCommand::ListVars { resp }).await.unwrap_or_default() })
+                    as DevFuture<'static, _>
+            }) as ListFn,
+            Box::new(move |name: String| {
+                let tx = vars_get_tx.clone();
+                Box::pin(async move {
+                    let val: Option<String> = request(&tx, |resp| TclCommand::GetVar { name, resp }).await?;
+                    Ok(val.map(String::into_bytes))
+                }) as DevFuture<'static, _>
+            }) as GetFn,
+        );
+
+        let procs_tx = tx.clone();
+        let procs_get_tx = tx.clone();
+        let procs = DynamicDir::new(
+            Box::new(move || {
+                let tx = procs_tx.clone();
+                Box::pin(async move { request(&tx, |resp| TclCommand::ListProcs { resp }).await.unwrap_or_default() })
+                    as DevFuture<'static, _>
+            }) as ListFn,
+            Box::new(move |name: String| {
+                let tx = procs_get_tx.clone();
+                Box::pin(async move {
+                    let val: Option<String> = request(&tx, |resp| TclCommand::GetProc { name, resp }).await?;
+                    Ok(val.map(String::into_bytes))
+                }) as DevFuture<'static, _>
+            }) as GetFn,
+        );
+
+        Self {
+            eval,
+            vars,
+            procs,
+            _driver_tx: tx,
+        }
+    }
+}
+
+/// Send a command and await the interpreter response.
+async fn request<T>(
+    tx: &tokio::sync::mpsc::Sender<TclCommand>,
+    build: impl FnOnce(tokio::sync::oneshot::Sender<T>) -> TclCommand,
+) -> Result<T, MountError> {
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    let cmd = build(resp_tx);
+    tx.send(cmd)
+        .await
+        .map_err(|_| MountError::Io("tcl interpreter gone".into()))?;
+    resp_rx
+        .await
+        .map_err(|_| MountError::Io("tcl interpreter did not respond".into()))
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -123,7 +256,7 @@ impl Mount for TclMount {
         };
         Ok(Fid::new(TclFid {
             kind,
-            write_buf: Vec::new(),
+            ctl_state: DevFileState::new(),
         }))
     }
 
@@ -142,42 +275,14 @@ impl Mount for TclMount {
             .downcast_ref::<TclFid>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
 
-        let data = match &inner.kind {
-            TclFidKind::Eval => {
-                // Ctl pattern: after a write, read returns the result.
-                if inner.write_buf.is_empty() {
-                    // No script written yet — return empty.
-                    Vec::new()
-                } else {
-                    inner.write_buf.clone()
-                }
-            }
-            TclFidKind::Var(name) => {
-                let val: Option<String> = self.request(|resp| TclCommand::GetVar {
-                    name: name.clone(),
-                    resp,
-                }).await?;
-                val.map(|s| s.into_bytes())
-                    .ok_or_else(|| MountError::NotFound(format!("vars/{name}")))?
-            }
-            TclFidKind::Proc(name) => {
-                let body: Option<String> = self.request(|resp| TclCommand::GetProc {
-                    name: name.clone(),
-                    resp,
-                }).await?;
-                body.map(|s| s.into_bytes())
-                    .ok_or_else(|| MountError::NotFound(format!("procs/{name}")))?
-            }
+        match &inner.kind {
+            TclFidKind::Eval => Ok(self.eval.handle_read(&inner.ctl_state, offset)),
+            TclFidKind::Var(name) => self.vars.read(name, offset).await,
+            TclFidKind::Proc(name) => self.procs.read(name, offset).await,
             TclFidKind::Root | TclFidKind::VarsDir | TclFidKind::ProcsDir => {
-                return Err(MountError::IsDirectory("use readdir".into()));
+                Err(MountError::IsDirectory("use readdir".into()))
             }
-        };
-
-        let start = offset as usize;
-        if start >= data.len() {
-            return Ok(Vec::new());
         }
-        Ok(data[start..].to_vec())
     }
 
     async fn write(
@@ -192,25 +297,7 @@ impl Mount for TclMount {
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
 
         match &inner.kind {
-            TclFidKind::Eval => {
-                let script = String::from_utf8_lossy(data).into_owned();
-                let result = self.request(|resp| TclCommand::Eval {
-                    script,
-                    resp,
-                }).await?;
-                let response_bytes = match result {
-                    Ok(s) => s.into_bytes(),
-                    Err(e) => format!("error: {e}").into_bytes(),
-                };
-                // Store in the fid's write_buf for subsequent read.
-                // SAFETY: single fid, interior mutability needed for ctl pattern.
-                // The Mount trait takes &self, but we need to store the response.
-                let fid_ptr = inner as *const TclFid as *mut TclFid;
-                unsafe {
-                    (*fid_ptr).write_buf = response_bytes;
-                }
-                Ok(data.len() as u32)
-            }
+            TclFidKind::Eval => self.eval.handle_write(&inner.ctl_state, data).await,
             _ => Err(MountError::NotSupported("read-only".into())),
         }
     }
@@ -241,32 +328,8 @@ impl Mount for TclMount {
                     stat: None,
                 },
             ]),
-            TclFidKind::VarsDir => {
-                let names: Vec<String> =
-                    self.request(|resp| TclCommand::ListVars { resp }).await?;
-                Ok(names
-                    .into_iter()
-                    .map(|name| DirEntry {
-                        name,
-                        is_dir: false,
-                        size: 0,
-                        stat: None,
-                    })
-                    .collect())
-            }
-            TclFidKind::ProcsDir => {
-                let names: Vec<String> =
-                    self.request(|resp| TclCommand::ListProcs { resp }).await?;
-                Ok(names
-                    .into_iter()
-                    .map(|name| DirEntry {
-                        name,
-                        is_dir: false,
-                        size: 0,
-                        stat: None,
-                    })
-                    .collect())
-            }
+            TclFidKind::VarsDir => Ok(self.vars.readdir().await),
+            TclFidKind::ProcsDir => Ok(self.procs.readdir().await),
             _ => Err(MountError::NotDirectory(format!("{:?}", inner.kind))),
         }
     }
@@ -292,20 +355,22 @@ impl Mount for TclMount {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Channel constructor
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Create a bounded channel pair for the Tcl mount.
-///
-/// Returns `(sender, receiver)`. Pass the sender to [`TclMount::new`] and
-/// poll the receiver from the thread owning the `TclShell`.
-pub fn create_mount_channel() -> (tokio::sync::mpsc::Sender<TclCommand>, tokio::sync::mpsc::Receiver<TclCommand>) {
-    tokio::sync::mpsc::channel(16)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
+//
+// The command channel is internal to [`TclMount`] (constructed inside
+// [`TclMount::spawn`]). These tests drive the devfile wiring directly by
+// building a `TclMount` from an injected sender and routing the receiver to a
+// fake interpreter task, so the mount's request/reply plumbing can be
+// exercised without a real `TclShell`.
+
+#[cfg(test)]
+fn create_mount_channel() -> (
+    tokio::sync::mpsc::Sender<TclCommand>,
+    tokio::sync::mpsc::Receiver<TclCommand>,
+) {
+    tokio::sync::mpsc::channel(16)
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

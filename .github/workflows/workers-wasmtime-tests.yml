@@ -1,0 +1,137 @@
+name: workers-wasmtime tests
+
+permissions:
+  contents: read
+
+# Build BOTH wasm guests, then run the hyprstream-workers-wasmtime security/DoS tests
+# (and the hyprstream-workers-python shell/mount tests) against them. The tests SKIP
+# locally when an artifact is absent, but FAIL under CI (the `CI` env var is always
+# set on GitHub Actions) — so the capability / DoS guarantees can never go silently
+# untested in the pipeline. This job also asserts the guests' import surfaces are
+# unchanged (Profile A exactly 5 `env::*` imports; Profile B fs surface only, no
+# clocks/random/sockets).
+#
+# WHY build each guest FROM ITS CRATE DIRECTORY (not --manifest-path): the python
+# guest's `getrandom_backend="custom"` rustflag lives in
+# crates/hyprstream-workers-python-guest/.cargo/config.toml, which cargo only discovers
+# by walking up from the CWD — NOT from --manifest-path. Building from the repo root
+# (or with --manifest-path) silently drops the cfg and the wasm build fails on
+# getrandom.
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'crates/hyprstream-workers-wasmtime/**'
+      - 'crates/hyprstream-workers-python/**'
+      - 'crates/hyprstream-workers-python-guest/**'
+      - 'crates/hyprstream-workers-wasmtime-fsguest/**'
+      - '.github/workflows/workers-wasmtime-tests.yml'
+  pull_request:
+    paths:
+      - 'crates/hyprstream-workers-wasmtime/**'
+      - 'crates/hyprstream-workers-python/**'
+      - 'crates/hyprstream-workers-python-guest/**'
+      - 'crates/hyprstream-workers-wasmtime-fsguest/**'
+      - '.github/workflows/workers-wasmtime-tests.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  workers-wasmtime-tests:
+    name: build guests + run workers-wasmtime tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `cargo test -p hyprstream-workers-wasmtime` transitively builds
+      # hyprstream-rpc, whose build.rs invokes the capnp compiler.
+      - name: Install system deps (capnproto)
+        run: sudo apt-get update && sudo apt-get install -y capnproto pkg-config libssl-dev
+
+      - name: Install Rust toolchain (host + wasm targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown, wasm32-wasip1
+
+      # wasm-tools reads the guests' import sections for the ABI assertions below.
+      - name: Install wasm-tools
+        run: cargo install wasm-tools --locked || true
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      # --- Profile A guest (wasm32-unknown-unknown) -------------------------------
+      - name: Build python guest from its crate dir
+        # MUST run from the crate dir so cargo discovers the crate-local
+        # .cargo/config.toml carrying getrandom_backend="custom". Do NOT switch this
+        # to --manifest-path from the repo root — the cfg would be dropped and the
+        # build would fail on getrandom/wasm32.
+        working-directory: crates/hyprstream-workers-python-guest
+        run: cargo build --release --target wasm32-unknown-unknown
+
+      - name: Assert python guest imports are exactly the 5-function host ABI
+        # The guest must import ONLY the host capability functions from module `env`
+        # and nothing else — no wasm_js / wasi / wbindgen backend may leak in (that
+        # would mean getrandom picked a non-custom backend, i.e. the cfg was dropped).
+        working-directory: crates/hyprstream-workers-python-guest
+        run: |
+          set -euo pipefail
+          WASM=$(find target/wasm32-unknown-unknown/release -maxdepth 1 -name '*.wasm' | head -1)
+          if [ -z "$WASM" ]; then echo "::error::no python guest wasm artifact produced"; exit 1; fi
+          echo "Inspecting imports of: $WASM"
+          ACTUAL=$(wasm-tools print "$WASM" \
+            | grep -oE '\(import "[A-Za-z0-9_]+" "[A-Za-z0-9_]+"' \
+            | sed -E 's/\(import "([A-Za-z0-9_]+)" "([A-Za-z0-9_]+)"/\1::\2/' \
+            | sort -u)
+          EXPECTED=$(printf '%s\n' \
+            env::host_random env::vfs_cat env::vfs_ls env::vfs_echo env::vfs_ctl \
+            | sort -u)
+          echo "--- actual ---";   echo "$ACTUAL"
+          echo "--- expected ---"; echo "$EXPECTED"
+          if ! diff <(echo "$EXPECTED") <(echo "$ACTUAL"); then
+            echo "::error::python guest imports do not match the expected host ABI (< expected, > actual)"
+            exit 1
+          fi
+          if echo "$ACTUAL" | grep -Eiq 'wasm_js|wasi|__wbindgen|wbg'; then
+            echo "::error::forbidden import backend present (wasm_js/wasi/wbindgen) — getrandom cfg likely dropped"
+            exit 1
+          fi
+          echo "OK: python guest imports are exactly the five host ABI functions."
+
+      # --- Profile B guest (wasm32-wasip1) ----------------------------------------
+      - name: Build fsguest from its crate dir
+        working-directory: crates/hyprstream-workers-wasmtime-fsguest
+        run: cargo build --release --target wasm32-wasip1
+
+      - name: Assert fsguest imports are the fs surface only (no clocks/random/sockets)
+        # Profile B grants a real WASI preview1 fs surface but withholds everything
+        # else. Assert no clock_*, random_get, poll_oneoff/sched_yield, or sock_* import
+        # leaked in — they would each reopen a capability the sandbox deliberately denies.
+        working-directory: crates/hyprstream-workers-wasmtime-fsguest
+        run: |
+          set -euo pipefail
+          WASM=$(find target/wasm32-wasip1/release -maxdepth 1 -name '*.wasm' | head -1)
+          if [ -z "$WASM" ]; then echo "::error::no fsguest wasm artifact produced"; exit 1; fi
+          echo "Inspecting imports of: $WASM"
+          ACTUAL=$(wasm-tools print "$WASM" \
+            | grep -oE '\(import "[A-Za-z0-9_]+" "[A-Za-z0-9_]+"' \
+            | sed -E 's/\(import "([A-Za-z0-9_]+)" "([A-Za-z0-9_]+)"/\1::\2/' \
+            | sort -u)
+          echo "--- fsguest imports ---"; echo "$ACTUAL"
+          if echo "$ACTUAL" | grep -Eiq 'clock_|random_get|poll_oneoff|sched_yield|sock_'; then
+            echo "::error::fsguest declares a withheld capability (clock/random/sched/socket)"
+            exit 1
+          fi
+          echo "OK: fsguest imports are the fs surface only."
+
+      # --- Host tests against the built guests ------------------------------------
+      - name: Run workers-wasmtime + workers-python tests (guests required; skips become failures under CI)
+        env:
+          # The test harnesses fail (not skip) when these are unreadable AND CI is set.
+          HYPRSTREAM_PYGUEST_WASM: ${{ github.workspace }}/crates/hyprstream-workers-python-guest/target/wasm32-unknown-unknown/release/hyprstream_workers_python_guest.wasm
+          HYPRSTREAM_FSGUEST_WASM: ${{ github.workspace }}/crates/hyprstream-workers-wasmtime-fsguest/target/wasm32-wasip1/release/hyprstream-workers-wasmtime-fsguest.wasm
+        run: |
+          cargo test -p hyprstream-workers-wasmtime
+          cargo test -p hyprstream-workers-python
