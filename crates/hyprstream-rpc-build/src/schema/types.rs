@@ -39,6 +39,20 @@ pub struct UnionVariant {
     pub cli_hidden: bool,
     /// VFS usage example from `$docExample` annotation. Empty = no example.
     pub doc_example: String,
+    /// Mount-relative VFS path from `$vfsPath` (epic #539, T1). Empty = unset
+    /// (the mount generator, T2, infers a default from scope + arg shape).
+    #[serde(default)]
+    pub vfs_path: String,
+    /// VFS node kind override from `$vfsKind` — the enumerant name
+    /// ("file"/"dir"/"ctl"/"stream"/"query"). Empty = unset (kind is inferred).
+    #[serde(default)]
+    pub vfs_kind: String,
+    /// `$vfsBulk`: read path returns raw mmap bytes, bypassing capnp (DMA path).
+    #[serde(default)]
+    pub vfs_bulk: bool,
+    /// `$vfsHidden`: exclude this method from the generated mount.
+    #[serde(default)]
+    pub vfs_hidden: bool,
 }
 
 /// Payload carried by a tagged-union arm.
@@ -255,4 +269,54 @@ pub struct ScopedClient {
     pub capnp_inner_response: String,
     /// Nested scoped clients detected within this scope (e.g., Fs within Repository)
     pub nested_clients: Vec<ScopedClient>,
+}
+
+#[cfg(test)]
+mod vfs_metadata_tests {
+    use super::*;
+
+    /// The VFS projection fields (epic #539, T1) survive a serde round-trip —
+    /// this is the JSON-metadata contract the mount generator (T2) consumes.
+    #[test]
+    fn vfs_fields_round_trip() {
+        let v = UnionVariant {
+            name: "getByName".into(),
+            type_name: "Text".into(),
+            description: String::new(),
+            scope: "query".into(),
+            scope_exempt: false,
+            cli_hidden: false,
+            doc_example: String::new(),
+            vfs_path: "{name}".into(),
+            vfs_kind: "file".into(),
+            vfs_bulk: false,
+            vfs_hidden: false,
+        };
+        let json = serde_json::to_string(&v).expect("serialize");
+        let back: UnionVariant = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.vfs_path, "{name}");
+        assert_eq!(back.vfs_kind, "file");
+        assert!(!back.vfs_bulk);
+        assert!(!back.vfs_hidden);
+    }
+
+    /// Metadata predating the VFS fields still deserializes — the `#[serde(default)]`
+    /// keeps the capture additive (no forced schema break).
+    #[test]
+    fn legacy_metadata_defaults_vfs_fields() {
+        let legacy = r#"{
+            "name": "list",
+            "type_name": "Void",
+            "description": "",
+            "scope": "query",
+            "scope_exempt": false,
+            "cli_hidden": false,
+            "doc_example": ""
+        }"#;
+        let v: UnionVariant = serde_json::from_str(legacy).expect("deserialize legacy");
+        assert_eq!(v.vfs_path, "");
+        assert_eq!(v.vfs_kind, "");
+        assert!(!v.vfs_bulk);
+        assert!(!v.vfs_hidden);
+    }
 }
