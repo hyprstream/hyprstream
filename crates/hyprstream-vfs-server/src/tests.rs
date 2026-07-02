@@ -146,6 +146,8 @@ impl Mount for MemFs {
         match nodes.get(&inner.path) {
             Some(val) => Ok(Stat {
                 qtype: if val.is_none() { 0x80 } else { 0 },
+                version: 0,
+                path: 0,
                 size: val.as_ref().map(|d| d.len() as u64).unwrap_or(0),
                 name: inner.path.rsplit('/').next().unwrap_or("").to_owned(),
                 mtime: 0,
@@ -298,7 +300,7 @@ impl Mount for RoMount {
     async fn stat(&self, fid: &Fid, _c: &Subject) -> Result<Stat, MountError> {
         let inner = fid.downcast_ref::<MemFid>().unwrap();
         match self.files.get(&inner.path) {
-            Some(d) => Ok(Stat { qtype: 0, size: d.len() as u64, name: inner.path.clone(), mtime: 0 }),
+            Some(d) => Ok(Stat { qtype: 0, version: 0, path: 0, size: d.len() as u64, name: inner.path.clone(), mtime: 0 }),
             None => Err(MountError::NotFound(inner.path.clone())),
         }
     }

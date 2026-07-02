@@ -180,6 +180,8 @@ impl VfsFileSystem {
             return Ok((
                 hyprstream_vfs::Stat {
                     qtype: 0x80,
+                    version: 0,
+                    path: 0,
                     size: 0,
                     name: components.last().cloned().unwrap_or_default(),
                     mtime: 0,
@@ -196,6 +198,8 @@ impl VfsFileSystem {
             return Ok((
                 hyprstream_vfs::Stat {
                     qtype: 0x80,
+                    version: 0,
+                    path: 0,
                     size: 0,
                     name: components.last().cloned().unwrap_or_default(),
                     mtime: 0,
@@ -309,7 +313,7 @@ impl FileSystem for VfsFileSystem {
     ) -> io::Result<(libc::stat64, Duration)> {
         let data = self.inode_data(inode)?;
         if inode == ROOT_INODE {
-            let st = hyprstream_vfs::Stat { qtype: 0x80, size: 0, name: String::new(), mtime: 0 };
+            let st = hyprstream_vfs::Stat { qtype: 0x80, version: 0, path: 0, size: 0, name: String::new(), mtime: 0 };
             return Ok((Self::fill_attr(inode, &st, Kind::Dir), TTL));
         }
         let (st, is_dir) = self.stat_path(&data.components)?;

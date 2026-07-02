@@ -208,6 +208,8 @@ impl Mount for MemMount {
         if inner.path.is_empty() {
             return Ok(Stat {
                 qtype: 0x80,
+                version: 0,
+                path: 0,
                 size: 0,
                 name: String::new(),
                 mtime: 0,
@@ -218,6 +220,8 @@ impl Mount for MemMount {
             .map(|v| v.len() as u64)
             .ok_or_else(|| MountError::NotFound(inner.path.clone()))?;
         Ok(Stat {
+            version: 0,
+            path: 0,
             qtype: 0,
             size,
             name: inner.path.clone(),

@@ -337,6 +337,8 @@ mod vfs_e2e {
             let i = f.downcast_ref::<MemFid>().unwrap();
             Ok(Stat {
                 qtype: 0,
+                version: 0,
+                path: 0,
                 size: 0,
                 name: i.path.clone(),
                 mtime: 0,

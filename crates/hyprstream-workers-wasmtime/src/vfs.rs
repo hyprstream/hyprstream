@@ -274,6 +274,8 @@ mod tests {
                 .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             Ok(Stat {
                 qtype: 0,
+                version: 0,
+                path: 0,
                 size: 0,
                 name: inner.path.clone(),
                 mtime: 0,

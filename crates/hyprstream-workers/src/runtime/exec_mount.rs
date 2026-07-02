@@ -483,6 +483,8 @@ impl Mount for ExecMount {
 
         Ok(Stat {
             qtype,
+            version: 0,
+            path: 0,
             size: 0,
             name,
             mtime: 0,
