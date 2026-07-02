@@ -16,6 +16,7 @@
 //!
 //! All types are WASM-compatible. Transport is abstracted via traits.
 
+pub mod devfile;
 mod fsmount;
 mod mount;
 mod namespace;
@@ -38,6 +39,7 @@ pub mod overlay;
 #[cfg(not(target_arch = "wasm32"))]
 mod zero_open;
 
+pub use devfile::{ControlFile, DevFileState, DevFuture, DynamicDir, FieldFile, NoSetter};
 pub use fsmount::{FsMount, SetAttr};
 pub use hyprstream_rpc::Subject;
 pub use mount::{DirEntry, Fid, Mount, MountError, Stat, OREAD, OWRITE, ORDWR, OTRUNC, ORCLOSE};

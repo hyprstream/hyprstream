@@ -28,8 +28,8 @@ identity state, and the Mount is the single policy enforcement point.
 
 The guest crates are excluded workspace members compiled to wasm targets:
 
-- `hyprstream-wasm-pyguest` — RustPython, `wasm32-unknown-unknown` (Profile A).
-- `hyprstream-wasm-fsguest` — `wasm32-wasip1` command (Profile B).
+- `hyprstream-workers-python-guest` — RustPython, `wasm32-unknown-unknown` (Profile A).
+- `hyprstream-workers-wasmtime-fsguest` — `wasm32-wasip1` command (Profile B).
 
 > **Footgun:** the pyguest's entropy backend is selected by a build cfg in its own
 > `.cargo/config.toml` (`--cfg getrandom_backend="custom"` + `-C
@@ -39,16 +39,16 @@ The guest crates are excluded workspace members compiled to wasm targets:
 > applies; otherwise the custom getrandom backend is silently not selected.
 
 ```sh
-(cd crates/hyprstream-wasm-pyguest && cargo build --release --target wasm32-unknown-unknown)
-(cd crates/hyprstream-wasm-fsguest && cargo build --release --target wasm32-wasip1)
+(cd crates/hyprstream-workers-python-guest && cargo build --release --target wasm32-unknown-unknown)
+(cd crates/hyprstream-workers-wasmtime-fsguest && cargo build --release --target wasm32-wasip1)
 ```
 
 Point the tests at the artifacts (otherwise they skip locally, and **fail under CI**
 when `CI` is set):
 
 ```sh
-export HYPRSTREAM_PYGUEST_WASM=crates/hyprstream-wasm-pyguest/target/wasm32-unknown-unknown/release/hyprstream_wasm_pyguest.wasm
-export HYPRSTREAM_FSGUEST_WASM=crates/hyprstream-wasm-fsguest/target/wasm32-wasip1/release/hyprstream-wasm-fsguest.wasm
+export HYPRSTREAM_PYGUEST_WASM=crates/hyprstream-workers-python-guest/target/wasm32-unknown-unknown/release/hyprstream_workers_python_guest.wasm
+export HYPRSTREAM_FSGUEST_WASM=crates/hyprstream-workers-wasmtime-fsguest/target/wasm32-wasip1/release/hyprstream-workers-wasmtime-fsguest.wasm
 cargo test -p hyprstream-workers-wasmtime
 ```
 

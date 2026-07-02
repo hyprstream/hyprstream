@@ -23,6 +23,9 @@
 pub mod backend;
 mod client;
 mod container;
+// `/exec/instances/` VFS projection of `SandboxPool` (#608 P2 / #610) — a
+// `hyprstream_vfs::Mount` impl, so it has no `kata-vm`/`wasm` dependency.
+pub mod exec_mount;
 // Kata/CH VM backend — gated behind `kata-vm` (pulls the kata/nydus toolchain).
 #[cfg(feature = "kata-vm")]
 pub mod kata_backend;
@@ -39,17 +42,16 @@ mod sandbox;
 // sibling under the SandboxBackend seam; the default build stays lean + torch-free.
 #[cfg(feature = "wasm")]
 pub mod wasm_backend;
-// Per-sandbox VFS composition + serve (FS-D, #365): native-only + VM-only
-// (composes a RAFS rootfs and serves it over vhost-user-fs to a CH guest).
-#[cfg(all(not(target_arch = "wasm32"), feature = "kata-vm"))]
+// Per-sandbox VFS composition + serve (FS-D, #365): composes the image Mount +
+// injected mounts into a Namespace and serves it over vhost-user-fs. Needs the
+// image filesystem service (`oci-image`) but NOT the VM toolchain, so any
+// backend that hands a guest a composed 9P/VFS namespace consumes it (#632).
+#[cfg(all(not(target_arch = "wasm32"), feature = "oci-image"))]
 pub mod sandbox_fs;
 // Canonical backend taxonomy + fail-closed selection (Phase 0 of #508, #507).
 pub mod selection;
 mod service;
 pub mod spawner;
-// VirtioFS daemon wrapper (nydus-service) — VM-only.
-#[cfg(feature = "kata-vm")]
-mod virtiofs;
 
 // Generated wire types — canonical OCI/CRI-aligned names (no Gen*/Wire/Enum aliases)
 pub use client::{
@@ -90,6 +92,8 @@ pub use client::{
 };
 // Backend trait and implementations
 pub use backend::{SandboxBackend, SandboxHandle};
+// `/exec/instances/` Plan9 projection of the pool (#608 P2 / #610)
+pub use exec_mount::ExecMount;
 #[cfg(feature = "kata-vm")]
 pub use kata_backend::{KataBackend, KataHandle};
 pub use nspawn::{NspawnBackend, NspawnConfig, NspawnHandle};
@@ -101,13 +105,11 @@ pub use selection::{resolve_backend, BackendCtx, BackendRegistration};
 pub use container::Container;
 pub use pool::{PoolStats, SandboxPool};
 pub use sandbox::PodSandbox;
-#[cfg(all(not(target_arch = "wasm32"), feature = "kata-vm"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "oci-image"))]
 pub use sandbox_fs::{InjectedMounts, SandboxFs, SandboxFsServer, VFS_SOCKET_NAME};
 pub use service::WorkerService;
 // Re-export service infrastructure from hyprstream-rpc for convenience
 pub use hyprstream_rpc::service::{EnvelopeContext, ServiceHandle, RequestService};
-#[cfg(feature = "kata-vm")]
-pub use virtiofs::{SandboxVirtiofs, SandboxVirtiofsBuilder};
 
 /// CRI runtime version
 pub const RUNTIME_VERSION: &str = "0.1.0";

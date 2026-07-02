@@ -2,19 +2,19 @@
 //!
 //! This is the end-to-end integration that ties FS-A/FS-B/FS-C together for the
 //! Worker GA filesystem: for **each** sandbox it builds a private VFS
-//! [`Namespace`], composes the rootfs + injected mounts into it, and serves it
-//! over a per-sandbox Unix socket that the Cloud Hypervisor guest attaches as a
-//! virtio-fs ShareFs device.
+//! [`Namespace`], composes the image filesystem + injected mounts into it, and
+//! serves it over a per-sandbox Unix socket that the Cloud Hypervisor guest
+//! attaches as a virtio-fs ShareFs device.
 //!
 //! ```text
 //!   per-sandbox flow (one per sandbox, fully isolated)
 //!
 //!   RafsStore (shared, RO)         injected mounts (per-sandbox)
 //!        │                          /stream  (StreamMount)
-//!   rootfs_mount_for(...)  ──┐      /models  (SyntheticMount)
-//!   (FS-B: RAFS lower +      │      /deltas  (SyntheticMount)
-//!    per-sandbox writable    │          │
-//!    upper, OverlayFs)       ▼          ▼
+//!   image_fs_for(...)      ──┐      /models  (SyntheticMount)
+//!   (ImageFs: RAFS lower +  │      /deltas  (SyntheticMount)
+//!    per-sandbox writable   │          │
+//!    upper, OverlayFs)      ▼          ▼
 //!                       Namespace::fork() + bind_mount  (FS-C)
 //!                              │  bound to this sandbox's Subject
 //!                              ▼
@@ -51,7 +51,7 @@ use hyprstream_vfs::{Mount, Namespace, Subject};
 use hyprstream_vfs_server::{serve, VfsFileSystem};
 
 use crate::error::{Result, WorkerError};
-use crate::image::{rootfs_mount_for, RafsStore};
+use crate::image::{image_fs_for, RafsStore};
 
 /// Default guest mount points for the injected mounts.
 const ROOTFS_PREFIX: &str = "/";
@@ -86,9 +86,10 @@ impl SandboxFs {
     /// Steps (the FS-D core):
     /// 1. Fork an empty base namespace ([`Namespace::fork`] of `new()` — every
     ///    sandbox starts from a clean, private mount table).
-    /// 2. Mount the **rootfs** (FS-B [`rootfs_mount_for`]) at `/`. The RAFS image
+    /// 2. Mount the **image filesystem** ([`image_fs_for`]) at `/`. The RAFS image
     ///    is the shared RO lower; a per-sandbox writable upper under
-    ///    `<sandbox_dir>/rootfs/` is the CoW layer.
+    ///    `<sandbox_dir>/rootfs/` is the CoW layer. It is the root purely because
+    ///    it is mounted at `/` — "root" is a mount position, not a type (#633).
     /// 3. Bind the **injected mounts** — `/stream` (native pipes), `/models`,
     ///    `/deltas` (synthetic, read-only) — into the namespace.
     ///
@@ -106,16 +107,18 @@ impl SandboxFs {
         // 1. Per-sandbox private namespace.
         let mut namespace = Namespace::new().fork();
 
-        // 2. Rootfs at "/" (FS-B: RAFS lower + per-sandbox writable upper).
+        // 2. Image filesystem at "/" (ImageFs: RAFS lower + per-sandbox
+        // writable upper). It is the root purely because the namespace recipe
+        // mounts it here — "root" is a mount position, not a type (#633).
         let bootstrap = rafs_store.bootstrap_path(image_id);
-        let rootfs = rootfs_mount_for(&bootstrap, rafs_store.blobs_dir(), image_id, sandbox_dir)?;
-        // `FsMount: Mount`, so the writable rootfs coerces to the `Arc<dyn Mount>`
+        let image_fs = image_fs_for(&bootstrap, rafs_store.blobs_dir(), image_id, sandbox_dir)?;
+        // `FsMount: Mount`, so the image filesystem coerces to the `Arc<dyn Mount>`
         // the namespace stores; the down-adapter recovers the `FsMount` vtable via
         // `Mount::as_fsmount` for writes/copy-up.
-        let rootfs_mount: Arc<dyn Mount> = Arc::new(rootfs);
+        let root_mount: Arc<dyn Mount> = Arc::new(image_fs);
         namespace
-            .mount(ROOTFS_PREFIX, rootfs_mount)
-            .map_err(|e| WorkerError::SandboxCreationFailed(format!("mount rootfs: {e}")))?;
+            .mount(ROOTFS_PREFIX, root_mount)
+            .map_err(|e| WorkerError::SandboxCreationFailed(format!("mount root: {e}")))?;
 
         // 3. Injected mounts — per-sandbox, never shared with another sandbox.
         let stream_registry = Arc::new(StreamRegistry::new());

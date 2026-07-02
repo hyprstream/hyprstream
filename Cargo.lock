@@ -7151,6 +7151,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "fuse-backend-rs 0.13.1",
+ "futures",
  "hyprstream-rpc",
  "libc",
  "parking_lot 0.12.4",
@@ -10238,7 +10239,7 @@ checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
 [[package]]
 name = "nydus-api"
 version = "0.4.0"
-source = "git+https://github.com/dragonflyoss/nydus?tag=v2.4.0#5a9d42d8b5cae5052b678ce324d79098f8ae19c1"
+source = "git+https://github.com/dragonflyoss/nydus?rev=5a9d42d8#5a9d42d8b5cae5052b678ce324d79098f8ae19c1"
 dependencies = [
  "libc",
  "log",
@@ -10265,7 +10266,7 @@ dependencies = [
 [[package]]
 name = "nydus-builder"
 version = "0.2.0"
-source = "git+https://github.com/dragonflyoss/nydus?tag=v2.4.0#5a9d42d8b5cae5052b678ce324d79098f8ae19c1"
+source = "git+https://github.com/dragonflyoss/nydus?rev=5a9d42d8#5a9d42d8b5cae5052b678ce324d79098f8ae19c1"
 dependencies = [
  "anyhow",
  "base64 0.21.7",
@@ -10291,7 +10292,7 @@ dependencies = [
 [[package]]
 name = "nydus-rafs"
 version = "0.4.0"
-source = "git+https://github.com/dragonflyoss/nydus?tag=v2.4.0#5a9d42d8b5cae5052b678ce324d79098f8ae19c1"
+source = "git+https://github.com/dragonflyoss/nydus?rev=5a9d42d8#5a9d42d8b5cae5052b678ce324d79098f8ae19c1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -10336,7 +10337,7 @@ dependencies = [
 [[package]]
 name = "nydus-service"
 version = "0.4.0"
-source = "git+https://github.com/dragonflyoss/nydus?tag=v2.4.0#5a9d42d8b5cae5052b678ce324d79098f8ae19c1"
+source = "git+https://github.com/dragonflyoss/nydus?rev=5a9d42d8#5a9d42d8b5cae5052b678ce324d79098f8ae19c1"
 dependencies = [
  "fuse-backend-rs 0.13.1",
  "libc",
@@ -10362,7 +10363,7 @@ dependencies = [
 [[package]]
 name = "nydus-storage"
 version = "0.7.1"
-source = "git+https://github.com/dragonflyoss/nydus?tag=v2.4.0#5a9d42d8b5cae5052b678ce324d79098f8ae19c1"
+source = "git+https://github.com/dragonflyoss/nydus?rev=5a9d42d8#5a9d42d8b5cae5052b678ce324d79098f8ae19c1"
 dependencies = [
  "arc-swap",
  "base64 0.21.7",
@@ -10416,7 +10417,7 @@ dependencies = [
 [[package]]
 name = "nydus-upgrade"
 version = "0.2.0"
-source = "git+https://github.com/dragonflyoss/nydus?tag=v2.4.0#5a9d42d8b5cae5052b678ce324d79098f8ae19c1"
+source = "git+https://github.com/dragonflyoss/nydus?rev=5a9d42d8#5a9d42d8b5cae5052b678ce324d79098f8ae19c1"
 dependencies = [
  "dbs-snapshot",
  "sendfd",
@@ -10428,7 +10429,7 @@ dependencies = [
 [[package]]
 name = "nydus-utils"
 version = "0.5.0"
-source = "git+https://github.com/dragonflyoss/nydus?tag=v2.4.0#5a9d42d8b5cae5052b678ce324d79098f8ae19c1"
+source = "git+https://github.com/dragonflyoss/nydus?rev=5a9d42d8#5a9d42d8b5cae5052b678ce324d79098f8ae19c1"
 dependencies = [
  "blake3",
  "crc",

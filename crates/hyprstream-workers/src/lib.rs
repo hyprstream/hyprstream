@@ -51,10 +51,11 @@ pub mod error;
 pub use hyprstream_rpc::paths;
 
 pub mod runtime;
-// The `image` module is the RAFS/nydus image store — only the VM path consumes
-// it. Gated behind `kata-vm`; the lightweight nspawn backend bind-mounts the
-// host root and never touches RAFS.
-#[cfg(feature = "kata-vm")]
+// The `image` module is always compiled: the `ImageStore` trait +
+// `ImageBackendRegistration` inventory seam are feature-invariant, so
+// `WorkerService` can hold `Option<Arc<dyn ImageStore>>` without any cfg
+// mirror (#646). The concrete `RafsStore` impl + its `submit!` are
+// `oci-image`-gated (they pull the nydus deps); the trait surface is not.
 pub mod image;
 pub mod workflow;
 pub mod events;
@@ -72,8 +73,12 @@ pub use runtime::{WorkerService, SandboxBackend, SandboxHandle, NspawnBackend, N
 pub use runtime::{resolve_backend, BackendCtx, BackendRegistration};
 #[cfg(feature = "kata-vm")]
 pub use runtime::KataBackend;
-#[cfg(feature = "kata-vm")]
+// The image-store trait seam is always available; only the concrete RAFS impl
+// (`RafsStore`) requires `oci-image`.
+pub use image::{ImageBackendRegistration, ImageStore};
+#[cfg(feature = "oci-image")]
 pub use image::RafsStore;
+
 pub use workflow::WorkflowService;
 pub use events::{
     // Publisher/Subscriber (moq-backed, no ZMQ context needed)

@@ -20,17 +20,20 @@
 //! holds a `tokio::sync::mpsc::Sender<PyCommand>` and forwards each request to the
 //! thread that owns the shell, which replies over a oneshot.
 //!
-//! This mirrors `hyprstream-workers-tcl`'s `TclMount`/`TclCommand`/`create_mount_channel`
-//! model: build the channel with [`create_mount_channel`], mount
-//! `PythonMount::new(tx)` at `/lang/python`, and have the shell owner drain the
-//! `Receiver<PyCommand>` in its event loop (e.g. `ChatApp::tick()`), calling
-//! [`PythonShell::process_command`](crate::PythonShell::process_command).
+//! [`PythonMount::spawn`] wires this end-to-end: it opens the shell, spawns the
+//! driver thread, and keeps the command channel internal. The driver exits when
+//! the mount is dropped. Mount the result at `/lang/python`; the namespace is the
+//! only interface (epic #508, issue #634).
+//!
+//! Built on `hyprstream-vfs`'s `devfile` primitives (`ControlFile` for
+//! `eval`/`stdout`, `DynamicDir` for `vars`/`defs`) rather than hand-rolling
+//! the write→latch→read state machine — see `hyprstream_vfs::devfile` (#609).
 
 use async_trait::async_trait;
+use hyprstream_vfs::devfile::{ControlFile, DevFileState, DevFuture, DynamicDir};
 use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat, Subject};
-use parking_lot::Mutex;
 
-use crate::PyResult;
+use crate::{PyResult, PythonShell};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Commands sent from async Mount methods to the shell-owning thread.
@@ -83,48 +86,174 @@ enum PyFidKind {
     Def(String),
 }
 
-/// Fid state. `result` buffers the response from a write so a later read returns it
-/// (the Plan9 ctl pattern). `Mutex` for interior mutability through `&Fid`.
+/// Fid state. `ctl_state` buffers the response from a write to `eval`/`stdout`
+/// so a later read returns it (the Plan9 ctl pattern, via
+/// `devfile::ControlFile`). Unused for non-ctl fid kinds.
 struct PyFid {
     kind: PyFidKind,
-    result: Mutex<Vec<u8>>,
+    ctl_state: DevFileState,
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// devfile callback type aliases
+// ─────────────────────────────────────────────────────────────────────────────
+
+type PyCtl = ControlFile<Box<dyn Fn(Vec<u8>) -> DevFuture<'static, Result<Vec<u8>, MountError>> + Send + Sync>>;
+type ListFn = Box<dyn Fn() -> DevFuture<'static, Vec<String>> + Send + Sync>;
+type GetFn = Box<dyn Fn(String) -> DevFuture<'static, Result<Option<Vec<u8>>, MountError>> + Send + Sync>;
+type FieldDir = DynamicDir<ListFn, GetFn>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PythonMount
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// VFS mount that proxies `/lang/python` requests to a [`PythonShell`](crate::PythonShell)
-/// over a command channel.
+/// VFS mount that proxies `/lang/python` requests to a
+/// [`PythonShell`](crate::PythonShell) owned by the mount itself.
 ///
-/// Mount at `/lang/python` in the namespace. The shell owner must drain the
-/// `Receiver<PyCommand>` returned by [`create_mount_channel`] in its event loop,
-/// forwarding each command to the shell via
-/// [`PythonShell::process_command`](crate::PythonShell::process_command).
+/// Construct with [`PythonMount::spawn`], which spins up a dedicated driver
+/// thread hosting the [`PythonShell`](crate::PythonShell) and drains the
+/// internal command channel. The driver exits cleanly when the mount is dropped
+/// (all command-channel senders live inside the mount). Callers never hold the
+/// shell, the channel sender, or the receiver — the namespace is the only
+/// interface (epic #508, issue #634).
 pub struct PythonMount {
-    tx: tokio::sync::mpsc::Sender<PyCommand>,
+    eval: PyCtl,
+    stdout: PyCtl,
+    vars: FieldDir,
+    defs: FieldDir,
+    /// Sender clone kept for the mount's lifetime; the driver exits when every
+    /// clone (including the ones inside the devfile closures) drops with the
+    /// mount.
+    _driver_tx: tokio::sync::mpsc::Sender<PyCommand>,
 }
 
 impl PythonMount {
-    /// Create a new `PythonMount` from the sending half of a mount channel.
-    pub fn new(tx: tokio::sync::mpsc::Sender<PyCommand>) -> Self {
-        Self { tx }
+    /// Spawn a self-contained `PythonMount` whose driver thread owns a fresh
+    /// [`PythonShell`](crate::PythonShell) over `sandbox` with `per_call_fuel`.
+    ///
+    /// The driver runs on a plain OS thread (the wasmtime `Store` the shell
+    /// holds may `blocking_send` on a VFS capability, so it MUST NOT run on a
+    /// tokio worker). Mount methods forward each request over an internal
+    /// channel and await the reply; the driver pumps the shell between
+    /// requests via [`PythonShell::process_command`](crate::PythonShell::process_command).
+    #[allow(clippy::expect_used)] // Thread creation failure is unrecoverable
+    pub fn spawn(
+        sandbox: hyprstream_workers_wasmtime::Sandbox,
+        per_call_fuel: u64,
+    ) -> wasmtime::Result<Self> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<PyCommand>(16);
+        std::thread::Builder::new()
+            .name("python-mount-driver".into())
+            .spawn(move || {
+                let Ok(mut shell) = PythonShell::open(&sandbox, per_call_fuel) else {
+                    return;
+                };
+                let mut rx = rx;
+                while let Some(cmd) = rx.blocking_recv() {
+                    shell.process_command(cmd);
+                }
+            })
+            .expect("spawn python-mount-driver");
+        // `tx` is moved into `build`, which stores it as `_driver_tx`; the
+        // devfile closures hold their own clones. Every clone drops with the
+        // mount, which is what signals the driver to exit.
+        Ok(Self::build(tx))
     }
 
-    /// Send a command and await the shell response.
-    async fn request<T>(
-        &self,
-        build: impl FnOnce(tokio::sync::oneshot::Sender<T>) -> PyCommand,
-    ) -> Result<T, MountError> {
-        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        self.tx
-            .send(build(resp_tx))
-            .await
-            .map_err(|_| MountError::Io("python interpreter gone".into()))?;
-        resp_rx
-            .await
-            .map_err(|_| MountError::Io("python interpreter did not respond".into()))
+    /// Build a `PythonMount` over an existing command-channel sender.
+    ///
+    /// Internal helper used by tests that drive the shell via a fake owner
+    /// loop instead of `PythonShell::open`.
+    #[cfg(test)]
+    fn new(tx: tokio::sync::mpsc::Sender<PyCommand>) -> Self {
+        Self::build(tx)
     }
+
+    fn build(tx: tokio::sync::mpsc::Sender<PyCommand>) -> Self {
+        let eval_tx = tx.clone();
+        let eval_handler = move |data: Vec<u8>| -> DevFuture<'static, Result<Vec<u8>, MountError>> {
+            let tx = eval_tx.clone();
+            let code = String::from_utf8_lossy(&data).into_owned();
+            Box::pin(async move {
+                let r = request(&tx, |resp| PyCommand::Eval { code, resp }).await?;
+                Ok(render(r))
+            })
+        };
+        let eval = ControlFile::new(Box::new(eval_handler) as _);
+
+        let stdout_tx = tx.clone();
+        let stdout_handler = move |data: Vec<u8>| -> DevFuture<'static, Result<Vec<u8>, MountError>> {
+            let tx = stdout_tx.clone();
+            let code = String::from_utf8_lossy(&data).into_owned();
+            Box::pin(async move {
+                let r = request(&tx, |resp| PyCommand::Exec { code, resp }).await?;
+                Ok(render(r))
+            })
+        };
+        let stdout = ControlFile::new(Box::new(stdout_handler) as _);
+
+        let vars_list_tx = tx.clone();
+        let vars_get_tx = tx.clone();
+        let vars = DynamicDir::new(
+            Box::new(move || {
+                let tx = vars_list_tx.clone();
+                Box::pin(async move { request(&tx, |resp| PyCommand::ListVars { resp }).await.unwrap_or_default() })
+                    as DevFuture<'static, _>
+            }) as ListFn,
+            Box::new(move |name: String| {
+                let tx = vars_get_tx.clone();
+                Box::pin(async move {
+                    let r = request(&tx, |resp| PyCommand::GetVar { name, resp }).await?;
+                    Ok(match r {
+                        PyResult::None => None,
+                        other => Some(render(other)),
+                    })
+                }) as DevFuture<'static, _>
+            }) as GetFn,
+        );
+
+        let defs_list_tx = tx.clone();
+        let defs_get_tx = tx.clone();
+        let defs = DynamicDir::new(
+            Box::new(move || {
+                let tx = defs_list_tx.clone();
+                Box::pin(async move { request(&tx, |resp| PyCommand::ListDefs { resp }).await.unwrap_or_default() })
+                    as DevFuture<'static, _>
+            }) as ListFn,
+            Box::new(move |name: String| {
+                let tx = defs_get_tx.clone();
+                Box::pin(async move {
+                    let r = request(&tx, |resp| PyCommand::GetDef { name, resp }).await?;
+                    Ok(match r {
+                        PyResult::None => None,
+                        other => Some(render(other)),
+                    })
+                }) as DevFuture<'static, _>
+            }) as GetFn,
+        );
+
+        Self {
+            eval,
+            stdout,
+            vars,
+            defs,
+            _driver_tx: tx,
+        }
+    }
+}
+
+/// Send a command and await the shell response.
+async fn request<T>(
+    tx: &tokio::sync::mpsc::Sender<PyCommand>,
+    build: impl FnOnce(tokio::sync::oneshot::Sender<T>) -> PyCommand,
+) -> Result<T, MountError> {
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    tx.send(build(resp_tx))
+        .await
+        .map_err(|_| MountError::Io("python interpreter gone".into()))?;
+    resp_rx
+        .await
+        .map_err(|_| MountError::Io("python interpreter did not respond".into()))
 }
 
 /// Render a [`PyResult`] for the `eval`/`stdout` ctl read.
@@ -152,7 +281,7 @@ impl Mount for PythonMount {
         };
         Ok(Fid::new(PyFid {
             kind,
-            result: Mutex::new(Vec::new()),
+            ctl_state: DevFileState::new(),
         }))
     }
 
@@ -170,41 +299,15 @@ impl Mount for PythonMount {
         let inner = fid
             .downcast_ref::<PyFid>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
-        let data: Vec<u8> = match &inner.kind {
-            PyFidKind::Eval | PyFidKind::Stdout => inner.result.lock().clone(),
-            PyFidKind::Var(name) => {
-                let r = self
-                    .request(|resp| PyCommand::GetVar {
-                        name: name.clone(),
-                        resp,
-                    })
-                    .await?;
-                match r {
-                    PyResult::None => return Err(MountError::NotFound(format!("vars/{name}"))),
-                    other => render(other),
-                }
-            }
-            PyFidKind::Def(name) => {
-                let r = self
-                    .request(|resp| PyCommand::GetDef {
-                        name: name.clone(),
-                        resp,
-                    })
-                    .await?;
-                match r {
-                    PyResult::None => return Err(MountError::NotFound(format!("defs/{name}"))),
-                    other => render(other),
-                }
-            }
+        match &inner.kind {
+            PyFidKind::Eval => Ok(self.eval.handle_read(&inner.ctl_state, offset)),
+            PyFidKind::Stdout => Ok(self.stdout.handle_read(&inner.ctl_state, offset)),
+            PyFidKind::Var(name) => self.vars.read(name, offset).await,
+            PyFidKind::Def(name) => self.defs.read(name, offset).await,
             PyFidKind::Root | PyFidKind::VarsDir | PyFidKind::DefsDir => {
-                return Err(MountError::IsDirectory("use readdir".into()))
+                Err(MountError::IsDirectory("use readdir".into()))
             }
-        };
-        let start = offset as usize;
-        if start >= data.len() {
-            return Ok(Vec::new());
         }
-        Ok(data[start..].to_vec())
     }
 
     async fn write(
@@ -218,18 +321,8 @@ impl Mount for PythonMount {
             .downcast_ref::<PyFid>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
         match &inner.kind {
-            PyFidKind::Eval => {
-                let code = String::from_utf8_lossy(data).into_owned();
-                let r = self.request(|resp| PyCommand::Eval { code, resp }).await?;
-                *inner.result.lock() = render(r);
-                Ok(data.len() as u32)
-            }
-            PyFidKind::Stdout => {
-                let code = String::from_utf8_lossy(data).into_owned();
-                let r = self.request(|resp| PyCommand::Exec { code, resp }).await?;
-                *inner.result.lock() = render(r);
-                Ok(data.len() as u32)
-            }
+            PyFidKind::Eval => self.eval.handle_write(&inner.ctl_state, data).await,
+            PyFidKind::Stdout => self.stdout.handle_write(&inner.ctl_state, data).await,
             _ => Err(MountError::NotSupported("read-only".into())),
         }
     }
@@ -251,14 +344,8 @@ impl Mount for PythonMount {
                 mk("vars".into(), true),
                 mk("defs".into(), true),
             ]),
-            PyFidKind::VarsDir => {
-                let names = self.request(|resp| PyCommand::ListVars { resp }).await?;
-                Ok(names.into_iter().map(|n| mk(n, false)).collect())
-            }
-            PyFidKind::DefsDir => {
-                let names = self.request(|resp| PyCommand::ListDefs { resp }).await?;
-                Ok(names.into_iter().map(|n| mk(n, false)).collect())
-            }
+            PyFidKind::VarsDir => Ok(self.vars.readdir().await),
+            PyFidKind::DefsDir => Ok(self.defs.readdir().await),
             _ => Err(MountError::NotDirectory(format!("{:?}", inner.kind))),
         }
     }
@@ -287,11 +374,8 @@ impl Mount for PythonMount {
     async fn clunk(&self, _fid: Fid, _caller: &Subject) {}
 }
 
-/// Create a `/lang/python` mount channel: the `Sender` goes to a
-/// [`PythonMount::new`], the `Receiver` is drained by the shell owner (which forwards
-/// each [`PyCommand`] to its [`PythonShell`](crate::PythonShell) via
-/// [`process_command`](crate::PythonShell::process_command)).
-pub fn create_mount_channel() -> (
+#[cfg(test)]
+fn create_mount_channel() -> (
     tokio::sync::mpsc::Sender<PyCommand>,
     tokio::sync::mpsc::Receiver<PyCommand>,
 ) {
