@@ -23,6 +23,7 @@ use crate::image::RafsStore;
 
 use super::backend::{SandboxBackend, SandboxHandle};
 use super::client::PodSandboxConfig;
+use super::kata_agent::{AgentAddress, KataAgentClient};
 use super::sandbox::PodSandbox;
 use super::sandbox_fs::{SandboxFs, SandboxFsServer, VFS_SOCKET_NAME};
 use hyprstream_vfs::{Subject, SyntheticNode};
@@ -45,6 +46,15 @@ pub struct KataHandle {
     /// `hyprstream-vfs-server`. Held for the VM's lifetime so the serving thread
     /// + injected registries outlive the guest; dropped on sandbox teardown.
     pub vfs_server: Option<SandboxFsServer>,
+    /// kata-agent ttrpc/vsock client (#344), connected lazily on first
+    /// `exec_sync` call and cached for subsequent calls. `None` until then,
+    /// or if the guest agent connection could not be established (e.g. the
+    /// VM image has no `kata-agent`, or it hasn't finished booting yet).
+    ///
+    /// Guarded by a `tokio::sync::Mutex` rather than stored as a plain
+    /// `Option` because `exec_sync` takes `&PodSandbox` (shared ref) and
+    /// must be able to lazily populate the connection on first use.
+    pub agent: tokio::sync::Mutex<Option<Arc<KataAgentClient>>>,
 }
 
 impl std::fmt::Debug for KataHandle {
@@ -446,6 +456,7 @@ impl SandboxBackend for KataBackend {
             api_socket,
             virtiofs_socket: virtiofs_sock,
             vfs_server,
+            agent: tokio::sync::Mutex::new(None),
         });
 
         Ok(handle)
@@ -524,6 +535,12 @@ impl SandboxBackend for KataBackend {
                     // The per-sandbox VFS server is not reusable across resets;
                     // a recycled sandbox composes a fresh one on next start.
                     vfs_server: None,
+                    // A reused (warm-pool) sandbox keeps the same VM, but the
+                    // container(s) inside it are torn down — drop any cached
+                    // agent connection so the next `exec_sync` reconnects
+                    // against a clean guest state rather than reusing a
+                    // client whose container/exec ids may now be stale.
+                    agent: tokio::sync::Mutex::new(None),
                 });
                 sandbox.backend_handle = Some(fresh);
             }
@@ -546,18 +563,109 @@ impl SandboxBackend for KataBackend {
     }
 
     fn supports_exec(&self) -> bool {
-        false
+        // Real, via the kata-agent ttrpc/vsock client (#344) — see
+        // `exec_sync` below. This is no longer the "host is a black box"
+        // limitation the original stub described.
+        true
     }
 
     async fn exec_sync(
         &self,
-        _sandbox: &PodSandbox,
-        _command: &[String],
-        _timeout_secs: u64,
+        sandbox: &PodSandbox,
+        command: &[String],
+        timeout_secs: u64,
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
-        Err(WorkerError::ExecFailed(
-            "not supported by Kata backend (requires agent)".into(),
-        ))
+        if command.is_empty() {
+            return Err(WorkerError::ExecFailed("empty command".into()));
+        }
+
+        let handle = sandbox
+            .backend_handle
+            .as_ref()
+            .ok_or_else(|| WorkerError::ExecFailed("sandbox has no backend handle".into()))?;
+        let kata = handle
+            .as_any()
+            .downcast_ref::<KataHandle>()
+            .ok_or_else(|| WorkerError::ExecFailed("backend handle is not a KataHandle".into()))?;
+
+        let client = self.guest_agent_client(kata).await?;
+
+        // The container id is the sandbox id: `exec_sync` here targets the
+        // single workload container running in the sandbox's VM (the
+        // CRI-shaped subset this issue scopes — multi-container pods inside
+        // one Kata VM are a separate concern from #344's vsock/ttrpc client).
+        let container_id = sandbox.id.clone();
+
+        match client
+            .exec(&container_id, command, std::time::Duration::from_secs(timeout_secs))
+            .await
+        {
+            Ok(out) => Ok(out),
+            Err(e) => {
+                // The cached ttrpc connection may be stale (the VM died or was
+                // restarted externally without a `reset_sandbox` that would
+                // have cleared it). Drop the cached client so the *next*
+                // `exec_sync` redials against a fresh guest state instead of
+                // reusing a dead connection and failing every subsequent call
+                // until an explicit reset. We do NOT retry in-line: the caller
+                // asked for one exec (not a reconnect loop), and surfacing the
+                // original failure — broken pipe / RpcStatus / timeout — is
+                // more honest than masking it behind a retry that may hit the
+                // same dead VM. The next call re-establishes the connection
+                // via `guest_agent_client`.
+                //
+                // `try_lock`: if another exec is in flight on this sandbox,
+                // leave the cache alone — clearing it under them would race.
+                // Only clear when it still points at the same client we just
+                // used (a concurrent exec may have already swapped in a fresh
+                // one); compare by `Arc::ptr_eq`.
+                if let Ok(mut guard) = kata.agent.try_lock() {
+                    // Only clear when the cache still holds the same client we
+                    // just used (compared by `Arc` pointer identity): a
+                    // concurrent exec on another task may already have swapped
+                    // in a fresh client, and clearing that one would discard a
+                    // good connection.
+                    if guard.as_ref().map(|c| Arc::ptr_eq(c, &client)).unwrap_or(false) {
+                        *guard = None;
+                    }
+                }
+                Err(WorkerError::ExecFailed(format!("kata-agent exec failed: {e:#}")))
+            }
+        }
+    }
+}
+
+impl KataBackend {
+    /// Get (lazily connecting if needed) the cached kata-agent ttrpc client
+    /// for this sandbox's VM.
+    ///
+    /// The connection address comes straight from
+    /// `Hypervisor::get_agent_socket()` — the same call upstream
+    /// kata-containers' own runtime uses
+    /// (`runtime-rs/crates/agent/src/kata/agent.rs::start`) — so this does
+    /// not hardcode the hybrid-vsock UDS path; it asks the hypervisor
+    /// abstraction for it, which keeps Cloud Hypervisor/Dragonball both
+    /// working without an `if hypervisor_type == ...` branch here.
+    async fn guest_agent_client(&self, kata: &KataHandle) -> Result<Arc<KataAgentClient>> {
+        let mut guard = kata.agent.lock().await;
+        if let Some(client) = guard.as_ref() {
+            return Ok(Arc::clone(client));
+        }
+
+        let address = kata
+            .hypervisor
+            .get_agent_socket()
+            .await
+            .map_err(|e| WorkerError::ExecFailed(format!("get_agent_socket failed: {e}")))?;
+        let address = AgentAddress::parse(&address)
+            .map_err(|e| WorkerError::ExecFailed(format!("unparseable agent socket address: {e}")))?;
+
+        let client = KataAgentClient::connect(&address)
+            .await
+            .map_err(|e| WorkerError::ExecFailed(format!("failed to connect to kata-agent: {e:#}")))?;
+        let client = Arc::new(client);
+        *guard = Some(Arc::clone(&client));
+        Ok(client)
     }
 }
 
@@ -651,6 +759,7 @@ mod tests {
             api_socket: sandbox_path.join("test.sock"),
             virtiofs_socket: Some(sandbox_path.join("virtiofs.sock")),
             vfs_server: None,
+            agent: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -666,12 +775,31 @@ mod tests {
 
     #[test]
     fn test_supports_exec() {
+        // #344: exec is real now (kata-agent ttrpc/vsock client), so the
+        // backend advertises support — connection failures surface from
+        // `exec_sync` itself, not from this capability flag.
         let (backend, _, _temp) = create_test_backend();
-        assert!(!backend.supports_exec());
+        assert!(backend.supports_exec());
     }
 
     #[tokio::test]
-    async fn test_exec_sync_returns_error() {
+    async fn test_exec_sync_empty_command_rejected() {
+        let (backend, _, temp) = create_test_backend();
+        let sandbox = create_test_sandbox(temp.path().join("sandbox"));
+
+        let result = backend.exec_sync(&sandbox, &[], 5).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WorkerError::ExecFailed(msg) => assert!(msg.contains("empty command")),
+            other => panic!("Expected ExecFailed, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_exec_sync_no_backend_handle_fails() {
+        // No `backend_handle` set (sandbox never `start()`ed) — exec_sync
+        // must fail fast rather than panic or hang trying to dial an agent.
         let (backend, _, temp) = create_test_backend();
         let sandbox = create_test_sandbox(temp.path().join("sandbox"));
 
@@ -680,14 +808,87 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        match &err {
-            WorkerError::ExecFailed(msg) => {
-                assert!(msg.contains("not supported"), "unexpected message: {msg}");
-            }
+        match result.unwrap_err() {
+            WorkerError::ExecFailed(msg) => assert!(msg.contains("no backend handle")),
             other => panic!("Expected ExecFailed, got: {other:?}"),
         }
     }
+
+    #[tokio::test]
+    async fn test_exec_sync_unreachable_agent_fails_cleanly() {
+        // A KataHandle with a real (but not started) CloudHypervisor: calling
+        // `get_agent_socket()` on a VM that was never `prepare_vm`'d /
+        // `start_vm`'d should error out (no vsock path configured yet)
+        // rather than hang — exec_sync must surface that as ExecFailed.
+        let (backend, _, temp) = create_test_backend();
+        let sandbox_path = temp.path().join("sandbox");
+        std::fs::create_dir_all(&sandbox_path).unwrap();
+        let mut sandbox = create_test_sandbox(sandbox_path.clone());
+        sandbox.backend_handle = Some(create_test_handle(&sandbox_path));
+
+        let result = backend
+            .exec_sync(&sandbox, &["echo".into(), "hello".into()], 1)
+            .await;
+
+        assert!(result.is_err(), "exec against an unprepared VM must fail, not hang");
+    }
+
+    #[tokio::test]
+    async fn test_exec_sync_clears_cached_client_on_failure() {
+        // Regression: if `KataHandle.agent` caches a ttrpc client whose
+        // connection is dead (VM restarted/died without a `reset_sandbox`),
+        // `exec_sync` must NOT keep reusing that stale client on every
+        // subsequent call. It should clear the cache on failure so the next
+        // call redials. We seed the cache with a client connected to a
+        // listener that is then dropped — its first RPC deterministically
+        // fails — and assert the cache is `None` afterward.
+        let (backend, _, temp) = create_test_backend();
+        let sandbox_path = temp.path().join("sandbox");
+        std::fs::create_dir_all(&sandbox_path).unwrap();
+        let mut sandbox = create_test_sandbox(sandbox_path.clone());
+        let handle = create_test_handle(&sandbox_path);
+
+        // Build a client over a connection to a transient listener, then
+        // drop the listener so the connection has no peer — any RPC on it
+        // fails. This mirrors a cached client whose VM has gone away.
+        let dead_sock = sandbox_path.join("dead-agent.sock");
+        let listener = tokio::net::UnixListener::bind(&dead_sock).unwrap();
+        let client = KataAgentClient::from_ttrpc_client(
+            ttrpc::r#async::Client::connect(&format!("unix://{}", dead_sock.display())).unwrap(),
+        );
+        drop(listener);
+
+        handle.agent.lock().await.replace(Arc::new(client));
+        // Keep a clone of the `Arc<KataHandle>` for post-call assertions:
+        // `backend_handle` takes ownership of the reference we stored, but we
+        // still need to inspect `agent` afterward (the `Arc` is shared, so
+        // both observe the same `Mutex`).
+        let handle_for_assert = Arc::clone(&handle);
+        sandbox.backend_handle = Some(handle);
+
+        // Bounded timeout: a stale connection must not hang the call. The
+        // underlying ttrpc context timeout (30s) bounds a silent server, but
+        // a closed peer should fail much faster; cap at 35s to also catch a
+        // regression where the cache-clear path itself wedges.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(35),
+            backend.exec_sync(&sandbox, &["echo".into(), "hi".into()], 1),
+        )
+        .await;
+        assert!(result.is_ok(), "exec_sync against a dead cached client must not hang");
+        assert!(
+            result.unwrap().is_err(),
+            "exec against a dead cached client must fail, not silently succeed"
+        );
+
+        // The fix's core guarantee: the stale client was evicted so the next
+        // call reconnects instead of reusing the dead connection forever.
+        assert!(
+            handle_for_assert.agent.lock().await.is_none(),
+            "cached dead agent client must be cleared on exec failure"
+        );
+    }
+
 
     #[test]
     fn test_is_available() {

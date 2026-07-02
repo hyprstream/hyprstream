@@ -29,6 +29,11 @@ pub mod exec_mount;
 // Kata/CH VM backend — gated behind `kata-vm` (pulls the kata/nydus toolchain).
 #[cfg(feature = "kata-vm")]
 pub mod kata_backend;
+// kata-agent ttrpc/vsock client (#344): CreateContainer/StartContainer/
+// ExecProcess/WaitProcess against the guest's kata-agent. Used by
+// `kata_backend::KataBackend::exec_sync`.
+#[cfg(feature = "kata-vm")]
+pub mod kata_agent;
 pub mod nspawn;
 mod pool;
 mod sandbox;

@@ -164,6 +164,24 @@ kata-hypervisor = { git = "https://github.com/kata-containers/kata-containers", 
 kata-types = { git = "https://github.com/kata-containers/kata-containers", tag = "3.31.0", optional = true }
 kata-sys-util = { git = "https://github.com/kata-containers/kata-containers", tag = "3.31.0", optional = true }
 ch-config = { git = "https://github.com/kata-containers/kata-containers", tag = "3.31.0", optional = true }
+# kata-agent ttrpc/protobuf wire types (CreateContainerRequest, ExecProcessRequest,
+# WaitProcessRequest/Response, …) — the SAME crate `kata-hypervisor` already pulls
+# in transitively (with the `async` ttrpc feature enabled), vendored verbatim from
+# upstream kata-containers rather than hand-rolled. Pinned to the same git tag so
+# the message types match what a real `kata-agent` at this version speaks.
+protocols = { git = "https://github.com/kata-containers/kata-containers", tag = "3.31.0", features = ["async", "with-serde"], optional = true }
+ttrpc = { version = "0.8", features = ["async"], optional = true }
+# protobuf::MessageField is used directly when building agent ttrpc requests
+# (CreateContainerRequest.OCI, ExecProcessRequest.process, …); pinned to the
+# same version `protocols` itself depends on (3.7.2 per its Cargo.toml).
+protobuf = { version = "3.7", optional = true }
+# Raw AF_VSOCK socket() syscall support (CID/port dialing) — used for the
+# `vsock://<cid>:<port>` scheme (Firecracker/Dragonball convention). Cloud
+# Hypervisor itself uses *hybrid* vsock (a Unix socket + `CONNECT <port>`
+# handshake, see kata_agent::sock), which needs no extra crate, but we
+# support both schemes for parity with upstream kata-containers' own
+# `runtime-rs/crates/agent/src/sock` dialer.
+vsock = { version = "0.5", optional = true }
 
 [features]
 default = []
@@ -188,17 +206,21 @@ oci-image = [
 ]
 # Kata/Cloud-Hypervisor VM backend. Implies `oci-image` (kata composes the
 # image filesystem service into a namespace and serves it to its guest via
-# virtio-fs) and adds the VM toolchain only (kata hypervisor + CH config).
-# Opt-in so casual users who only want the lightweight `systemd-nspawn`
-# backend don't compile the VM stack. When this feature is off,
-# `BackendType::Kata` selection and CRI image ops return a clean runtime error
-# rather than failing to compile.
+# virtio-fs) and adds the VM toolchain plus the kata-agent vsock/ttrpc client
+# (kata hypervisor + CH config + agent RPC). Opt-in so casual users who only
+# want the lightweight `systemd-nspawn` backend don't compile the VM stack.
+# When this feature is off, `BackendType::Kata` selection and CRI image ops
+# return a clean runtime error rather than failing to compile.
 kata-vm = [
     "oci-image",
     "dep:kata-hypervisor",
     "dep:kata-types",
     "dep:kata-sys-util",
     "dep:ch-config",
+    "dep:protocols",
+    "dep:ttrpc",
+    "dep:protobuf",
+    "dep:vsock",
 ]
 # In-process WebAssembly sandbox backend (#505 P2). Compiles in `WasmBackend`
 # and the `hyprstream-workers-wasmtime` wasmtime substrate it consumes. A native in-process
