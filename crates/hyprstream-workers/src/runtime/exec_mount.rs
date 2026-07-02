@@ -11,9 +11,10 @@
 //!   instance's lifecycle (see [`Verb`] for the grammar)
 //! - `/exec/instances/<id>/status` — read-only: current `PodSandboxState`,
 //!   live/non-blocking poll of pool state
-//! - `/exec/instances/<id>/exit`   — read-only: terminal status if already
-//!   terminal, otherwise an empty "not yet terminal" marker. **STUB** — see
-//!   the `TODO(#607)` below for the real blocking-await wiring.
+//! - `/exec/instances/<id>/exit`   — read-only: blocks until the instance is
+//!   terminal, then returns the terminal status. A read that starts after
+//!   the instance has already terminated returns immediately with the
+//!   retained status (read-then-subscribe, no missed completions).
 //! - `/exec/instances/<id>/ns`     — read-only: best-effort textual listing
 //!   of the sandbox's mount-prefixes/namespace, or an empty placeholder
 //!
@@ -46,8 +47,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::Notify;
 
+use hyprstream_rpc::latch::{Terminal, TerminalStore};
 use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat, Subject};
 // `parking_lot::Mutex` for the ctl write→read latch (interior mutability
 // through the `&Fid` that `Mount::write` receives). When this branch is
@@ -88,13 +90,9 @@ impl Verb {
 // Terminal tracking
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Terminal status recorded for an instance once it has exited (i.e. been
-/// destroyed/stopped-for-good). Populated by the `ctl` `destroy` handler.
-///
-/// This is intentionally tiny: it exists only so `exit` has *something*
-/// non-empty to return once an instance leaves the pool's active map. The
-/// real completion primitive (terminal-latch + read-then-subscribe) is #607
-/// (EventService EV7), not yet implemented anywhere in this repo.
+/// Terminal payload latched into this mount's [`TerminalStore`] once an
+/// instance exits (i.e. is destroyed/stopped-for-good). Populated by the
+/// `ctl` `destroy` handler.
 #[derive(Clone, Debug)]
 struct TerminalStatus {
     /// Final `PodSandboxState` observed before removal.
@@ -150,17 +148,25 @@ struct ExecFid {
 /// issue; see the design doc §4).
 pub struct ExecMount {
     pool: Arc<SandboxPool>,
-    /// Terminal status recorded for instances that have been `destroy`ed
-    /// through this mount. Keyed by instance id.
-    ///
-    /// TODO(#607): this hand-rolled terminal map is the stub. Once EV7
-    /// (terminal-latch + read-then-subscribe) lands in EventService, `exit`
-    /// should subscribe to/await the instance's terminal event instead of
-    /// polling this map, and a blocking `read()` on `exit` should suspend
-    /// until the latch fires rather than returning immediately. The map
-    /// itself (or something shaped like it) likely becomes the read-side of
-    /// that latch rather than being deleted outright.
-    terminal: AsyncMutex<HashMap<String, TerminalStatus>>,
+    /// Retained terminal state (EV7, `hyprstream_rpc::latch`) for instances
+    /// that have been `destroy`ed through this mount. `latch()` is called
+    /// exactly once per instance (write-once), so a late `exit` read is
+    /// served from here immediately.
+    terminal: TerminalStore<String, TerminalStatus>,
+    /// Ids ever latched into `terminal`. `TerminalStore` doesn't expose key
+    /// enumeration (by design — it's a per-key latch/read primitive, not a
+    /// directory), so `readdir` tracks this separately to keep destroyed
+    /// instances listed alongside `pool.list_active()`.
+    terminal_ids: PmMutex<std::collections::HashSet<String>>,
+    /// Per-instance wake for an early `exit` reader blocked on a not-yet-
+    /// latched instance. `ExecMount`'s termination signal is entirely
+    /// in-process (via `apply_verb`'s `Destroy` arm), so a lightweight
+    /// `tokio::sync::Notify` per id is the read-then-subscribe "subscribe"
+    /// half here, in place of `hyprstream_rpc::latch::read_then_subscribe`'s
+    /// moq-backed `EventSubscriber` slow path (which is for cross-process
+    /// fan-out this mount doesn't need). `TerminalStore` is still the single
+    /// source of retained truth; this only wakes waiters once it's written.
+    waiters: PmMutex<HashMap<String, Arc<Notify>>>,
 }
 
 impl ExecMount {
@@ -168,8 +174,20 @@ impl ExecMount {
     pub fn new(pool: Arc<SandboxPool>) -> Self {
         Self {
             pool,
-            terminal: AsyncMutex::new(HashMap::new()),
+            terminal: TerminalStore::new(),
+            terminal_ids: PmMutex::new(std::collections::HashSet::new()),
+            waiters: PmMutex::new(HashMap::new()),
         }
+    }
+
+    /// Get (or create) the `Notify` an `exit` reader waits on for `id`.
+    fn waiter_for(&self, id: &str) -> Arc<Notify> {
+        Arc::clone(
+            self.waiters
+                .lock()
+                .entry(id.to_owned())
+                .or_insert_with(|| Arc::new(Notify::new())),
+        )
     }
 
     /// Resolve the verb against the pool/backend for instance `id`.
@@ -177,7 +195,7 @@ impl ExecMount {
         // Instances already marked terminal (destroyed through this mount)
         // are not present in the pool's active map any more; ctl ops on them
         // are rejected rather than silently no-op'd.
-        if self.terminal.lock().await.contains_key(id) {
+        if self.terminal.is_latched(&id.to_owned()) {
             return Err(MountError::InvalidArgument(format!(
                 "instance {id} is already terminal"
             )));
@@ -217,12 +235,18 @@ impl ExecMount {
                 // above and just drop bookkeeping here. If the id is no
                 // longer active (e.g. concurrently released) that's fine.
                 let _ = self.pool.release(id).await;
-                self.terminal.lock().await.insert(
+                self.terminal.latch(
                     id.to_owned(),
-                    TerminalStatus {
-                        last_state: sandbox.state,
+                    Terminal {
+                        value: TerminalStatus {
+                            last_state: sandbox.state,
+                        },
+                        latched_by: "ctl:destroy".to_owned(),
                     },
                 );
+                self.terminal_ids.lock().insert(id.to_owned());
+                // Wake any `exit` reader already blocked on this id.
+                self.waiter_for(id).notify_waiters();
                 Ok("ok: destroyed\n".to_owned())
             }
         }
@@ -230,8 +254,8 @@ impl ExecMount {
 
     /// Live, non-blocking poll of an instance's current state for `status`.
     async fn read_status(&self, id: &str) -> Result<String, MountError> {
-        if let Some(term) = self.terminal.lock().await.get(id) {
-            return Ok(format!("{:?}\n", term.last_state));
+        if let Some(term) = self.terminal.get(&id.to_owned()) {
+            return Ok(format!("{:?}\n", term.value.last_state));
         }
         let sandbox = self
             .pool
@@ -241,29 +265,38 @@ impl ExecMount {
         Ok(format!("{:?}\n", sandbox.state))
     }
 
-    /// `exit` stub: returns the terminal status if already terminal, or an
-    /// empty "not yet terminal" marker otherwise.
-    ///
-    /// TODO(#607): replace this synchronous poll with a real blocking-await
-    /// on the instance's terminal latch (EventService EV7: terminal-latch +
-    /// read-then-subscribe completion primitive). The semantics this issue
-    /// (#610) intentionally does NOT implement: a `read()` on `exit` should
-    /// block until the instance transitions to a terminal state (or the fid
-    /// is clunked/cancelled), delivering the terminal status exactly once to
-    /// each waiter that arrives before the latch fires, and immediately to
-    /// any waiter that arrives after (read-then-subscribe — no missed
-    /// wakeups). Until #607 lands, callers must poll this file themselves.
+    /// `exit`: blocks until the instance is terminal, then returns the
+    /// retained status. A read that starts after the instance already
+    /// latched terminal (a "late" reader, in read-then-subscribe terms)
+    /// returns immediately with the retained value — no missed completion.
+    /// A read that starts before (an "early" reader) blocks until `apply_verb`
+    /// latches the `Destroy` outcome and wakes this id's waiter.
     async fn read_exit(&self, id: &str) -> Result<String, MountError> {
-        if let Some(term) = self.terminal.lock().await.get(id) {
-            return Ok(term.render());
+        let key = id.to_owned();
+        // Fast path: already latched — serve the retained value immediately,
+        // exactly the "late reader" half of read-then-subscribe.
+        if let Some(term) = self.terminal.get(&key) {
+            return Ok(term.value.render());
         }
         // Confirm the instance actually exists (vs. a bogus id) before
-        // reporting "not yet terminal".
+        // blocking on it.
         if self.pool.get(id).await.is_none() {
             return Err(MountError::NotFound(format!("instances/{id}")));
         }
-        // Plan9-shaped "not done": empty read.
-        Ok(String::new())
+        // Slow path: subscribe to this id's wake, then re-check the store —
+        // closes the race where `apply_verb` latches + notifies between the
+        // fast-path check above and the `notified()` registration below.
+        let notify = self.waiter_for(id);
+        loop {
+            let notified = notify.notified();
+            if let Some(term) = self.terminal.get(&key) {
+                return Ok(term.value.render());
+            }
+            notified.await;
+            if let Some(term) = self.terminal.get(&key) {
+                return Ok(term.value.render());
+            }
+        }
     }
 
     /// Best-effort textual listing of the sandbox's mount-prefixes/namespace.
@@ -319,7 +352,7 @@ impl Mount for ExecMount {
         };
         if let Some(id) = id_to_check {
             let exists =
-                self.pool.get(id).await.is_some() || self.terminal.lock().await.contains_key(id);
+                self.pool.get(id).await.is_some() || self.terminal.is_latched(&id.to_owned());
             if !exists {
                 return Err(MountError::NotFound(components.join("/")));
             }
@@ -421,7 +454,7 @@ impl Mount for ExecMount {
                 // Also surface ids that have been destroyed-through-this-mount
                 // (so `exit`/`status` remain reachable for stragglers that
                 // already read "not yet terminal" and need to poll again).
-                for id in self.terminal.lock().await.keys() {
+                for id in self.terminal_ids.lock().iter() {
                     if !ids.contains(id) {
                         ids.push(id.clone());
                     }
@@ -499,7 +532,7 @@ impl Mount for ExecMount {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::config::PoolConfig;
@@ -679,18 +712,53 @@ mod tests {
         assert!(matches!(result, Err(MountError::InvalidArgument(_))));
     }
 
+    /// Early waiter: a `read()` on `exit` that starts BEFORE the instance is
+    /// terminal blocks, then unblocks with the correct status once
+    /// `apply_verb`'s `Destroy` arm latches it from another task — the core
+    /// EV7 read-then-subscribe guarantee (#668).
     #[tokio::test]
-    async fn exit_before_terminal_is_empty() {
+    async fn exit_blocks_then_unblocks_on_destroy() {
         let pool = make_pool().await;
         let id = pool.acquire(&PodSandboxConfig::default()).await.unwrap();
-        let mount = ExecMount::new(pool);
+        let mount = Arc::new(ExecMount::new(pool));
 
-        let mut fid = mount.walk(&[&id, "exit"], &subject()).await.unwrap();
-        mount.open(&mut fid, 0, &subject()).await.unwrap();
-        let data = mount.read(&fid, 0, 4096, &subject()).await.unwrap();
-        assert!(data.is_empty(), "expected empty 'not yet terminal' marker");
+        let reader = {
+            let mount = Arc::clone(&mount);
+            let id = id.clone();
+            tokio::spawn(async move {
+                let mut fid = mount.walk(&[&id, "exit"], &subject()).await.unwrap();
+                mount.open(&mut fid, 0, &subject()).await.unwrap();
+                mount.read(&fid, 0, 4096, &subject()).await.unwrap()
+            })
+        };
+
+        // The reader should be blocked (not yet resolved) — give it a beat to
+        // reach the `.await` inside `read_exit`'s slow path, then confirm it
+        // hasn't completed on its own.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!reader.is_finished(), "exit read must block before terminal");
+
+        // Destroy from a separate task — this is what latches + wakes the
+        // blocked reader above.
+        let mut ctl_fid = mount.walk(&[&id, "ctl"], &subject()).await.unwrap();
+        mount.open(&mut ctl_fid, 2, &subject()).await.unwrap();
+        mount
+            .write(&ctl_fid, 0, b"destroy", &subject())
+            .await
+            .unwrap();
+        mount.read(&ctl_fid, 0, 4096, &subject()).await.unwrap();
+
+        let data = tokio::time::timeout(std::time::Duration::from_secs(2), reader)
+            .await
+            .expect("exit read did not unblock after destroy")
+            .unwrap();
+        let text = String::from_utf8(data).unwrap();
+        assert!(text.starts_with("exited"), "got: {text}");
     }
 
+    /// Late waiter: a `read()` on `exit` that starts AFTER the instance is
+    /// already terminal is served the retained status immediately, without
+    /// blocking (#668).
     #[tokio::test]
     async fn exit_after_destroy_reports_terminal() {
         let pool = make_pool().await;
@@ -707,14 +775,21 @@ mod tests {
         let ctl_result = mount.read(&ctl_fid, 0, 4096, &subject()).await.unwrap();
         assert!(String::from_utf8(ctl_result).unwrap().starts_with("ok:"));
 
-        // exit should now report terminal status, non-blocking.
+        // exit should now report terminal status immediately (late reader —
+        // the retained value is served without blocking on the store).
         let mut exit_fid = mount.walk(&[&id, "exit"], &subject()).await.unwrap();
         mount.open(&mut exit_fid, 0, &subject()).await.unwrap();
-        let data = mount.read(&exit_fid, 0, 4096, &subject()).await.unwrap();
+        let data = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            mount.read(&exit_fid, 0, 4096, &subject()),
+        )
+        .await
+        .expect("late exit read must not block")
+        .unwrap();
         let text = String::from_utf8(data).unwrap();
         assert!(text.starts_with("exited"), "got: {text}");
 
-        // status should also reflect terminal state via the recorded map.
+        // status should also reflect terminal state via the retained store.
         let mut status_fid = mount.walk(&[&id, "status"], &subject()).await.unwrap();
         mount.open(&mut status_fid, 0, &subject()).await.unwrap();
         let data = mount.read(&status_fid, 0, 4096, &subject()).await.unwrap();
