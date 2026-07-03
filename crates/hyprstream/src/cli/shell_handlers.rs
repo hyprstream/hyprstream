@@ -344,142 +344,17 @@ pub async fn handle_shell_tui(
         hyprstream_rpc::Subject::new(pubkey_hex)
     };
 
-    // Build VFS namespace for `/path` routing in ChatApps.
+    // Build VFS namespace for `/path` routing in ChatApps, via the shared
+    // standard-namespace recipe (see `crate::services::namespace_builder`).
+    // The CLI shell has a registry client available, so it mounts
+    // `/srv/registry` (+ `/worktree` alias) — the TUI ChatApp builder does
+    // not currently have one and omits it.
     let vfs_ns: std::sync::Arc<hyprstream_vfs::Namespace> = {
-        use crate::services::fs::{SyntheticNode, SyntheticTree};
-
-        let mut ns = hyprstream_vfs::Namespace::new();
-
-        // Mount the model service's 9P filesystem via RPC proxy.
-        // RemoteModelMount translates sync Mount trait calls to async ModelClient
-        // RPC requests, so `/srv/model/{model_ref}/status` etc. are served by the
-        // model service's SyntheticTree on the other end of the ZMQ socket.
-        let remote_model_mount = crate::services::remote_mount::RemoteModelMount::new(
-            model_client.clone(),
-        );
-        let _ = ns.mount("/srv/model",
-            std::sync::Arc::new(remote_model_mount),
-        );
-
-        // Mount the registry service's worktree filesystem via RPC proxy.
-        // RemoteRegistryMount is the registry analogue of RemoteModelMount:
-        // it proxies 9P operations to the registry service's
-        // `WorktreeClient` (real qids, real filesystem). 2-level scope:
-        //   /srv/registry/{repo_name}/{worktree_name}/<...rest...>
-        // Per #389 + #391 (Option 1, shared content model): the TUI namespace
-        // now mirrors the browser namespace's `/srv/registry` mount, both
-        // backed at the hyprstream spine. See `STANDARD_NAMESPACE_PATHS` in
-        // hyprstream-vfs for the convergence contract.
-        let remote_registry_mount = crate::services::remote_registry_mount::RemoteRegistryMount::new(
-            Clone::clone(&registry),
-        );
-        let registry_mount: std::sync::Arc<crate::services::remote_registry_mount::RemoteRegistryMount> =
-            std::sync::Arc::new(remote_registry_mount);
-        let _ = ns.mount("/srv/registry", registry_mount.clone());
-        // `/worktree` is an alias for `/srv/registry` — same backing mount,
-        // exposed under the short path for ergonomic worktree access. Both
-        // `/worktree/{repo}/{wt}` and `/srv/registry/{repo}/{wt}` resolve to
-        // the same worktree content.
-        let _ = ns.bind_mount(
-            "/worktree",
-            registry_mount,
-            hyprstream_vfs::BindFlag::After,
-        );
-
-        // /bin/ — static directory entries for listing purposes.
-        // Actual command execution goes through TclShell builtins via VFS proxy,
-        // not through these nodes. These exist so `ls /bin` shows available commands.
-        let bin_tree = {
-            let mut children = std::collections::HashMap::new();
-
-            children.insert("cat".to_owned(), SyntheticNode::ReadFile(Box::new(|| {
-                b"usage: cat <path> [path ...]".to_vec()
-            })));
-            children.insert("ls".to_owned(), SyntheticNode::ReadFile(Box::new(|| {
-                b"usage: ls [path]".to_vec()
-            })));
-            children.insert("help".to_owned(), SyntheticNode::ReadFile(Box::new(|| {
-                let mut out = String::from("VFS commands:\n");
-                out.push_str("  cat <path>           read file contents\n");
-                out.push_str("  ls [path]            list directory\n");
-                out.push_str("  write <path> <data>  write to file\n");
-                out.push_str("  ctl <path> <cmd>     control file (write+read)\n");
-                out.push_str("  json parse <str>     convert JSON to Tcl dict\n");
-                out.push_str("  mount [prefix]       list mount points\n");
-                out.push_str("  help                 this message\n");
-                out.into_bytes()
-            })));
-            children.insert("mount".to_owned(), SyntheticNode::ReadFile(Box::new(|| {
-                b"usage: mount".to_vec()
-            })));
-            children.insert("write".to_owned(), SyntheticNode::ReadFile(Box::new(|| {
-                b"usage: write <path> <data>".to_vec()
-            })));
-
-            SyntheticTree::new(SyntheticNode::Dir { children })
-        };
-        let _ = ns.mount("/bin",
-            std::sync::Arc::new(bin_tree),
-        );
-
-        // Discover .tcl tool scripts and bind them into /bin/ (After = fallback).
-        let tools_dir = std::env::var("XDG_CONFIG_HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                dirs::home_dir().unwrap_or_default().join(".config")
-            })
-            .join("hyprstream/tools");
-        let tools = discover_tools(&tools_dir);
-        if !tools.is_empty() {
-            let tools_tree = SyntheticTree::new(SyntheticNode::Dir { children: tools });
-            let _ = ns.bind_mount("/bin",
-                std::sync::Arc::new(tools_tree),
-                hyprstream_vfs::BindFlag::After,
-            );
-        }
-
-        // /env/ — session variables as files (Plan9 per-process /env/).
-        let env_store: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<String, String>>> =
-            std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
-
-        let env_tree = {
-            let store_list = env_store.clone();
-            let store_resolve = env_store.clone();
-
-            SyntheticTree::new(SyntheticNode::DynamicDir {
-                list: Box::new(move || {
-                    store_list.read().keys().map(|k| hyprstream_vfs::DirEntry {
-                        name: k.clone(),
-                        is_dir: false,
-                        size: 0,
-                        stat: None,
-                    }).collect()
-                }),
-                resolve: Box::new(move |name| {
-                    let store = store_resolve.clone();
-                    let key = name.to_owned();
-                    Some(SyntheticNode::ReadFile(Box::new(move || {
-                        store.read().get(&key).cloned().unwrap_or_default().into_bytes()
-                    })))
-                }),
-            })
-        };
-        let _ = ns.mount("/env",
-            std::sync::Arc::new(env_tree),
-        );
-
-        // /lang/tcl — the driver gets a fork() snapshot of the namespace so
-        // `/lang/tcl/eval` can do `/bin/{cmd}` fallback resolution.
-        let tcl_driver_ns = std::sync::Arc::new(ns.fork());
-        let tcl_mount = std::sync::Arc::new(hyprstream_workers_tcl::TclMount::spawn(
-            vfs_subject.clone(),
-            tcl_driver_ns,
-        ));
-        let _ = ns.mount("/lang/tcl", tcl_mount);
-
-        // /lang/python needs a wasm Sandbox this builder does not hold; wiring
-        // it is tracked in #632.
-
+        let ns = crate::services::build_standard_namespace(crate::services::StandardNamespaceConfig {
+            subject: vfs_subject.clone(),
+            model_client: model_client.clone(),
+            registry: Some(Clone::clone(&registry)),
+        });
         std::sync::Arc::new(ns)
     };
 
@@ -2093,49 +1968,6 @@ fn unpack_color(packed: u32) -> ratatui::style::Color {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Tool discovery from .tcl files
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Scan a directory for `.tcl` scripts and return SyntheticNode entries.
-///
-/// Each `.tcl` file becomes a CtlFile whose handler evaluates the script
-/// contents with the written data available as `$args`. The file stem
-/// (without `.tcl` extension) is used as the tool name.
-///
-/// Returns a HashMap suitable for constructing a `SyntheticNode::Dir`.
-/// Returns an empty map if the directory doesn't exist or is unreadable.
-pub(crate) fn discover_tools(dir: &std::path::Path) -> HashMap<String, crate::services::fs::SyntheticNode> {
-    use crate::services::fs::SyntheticNode;
-
-    let mut tools = HashMap::new();
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return tools,
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("tcl") {
-            continue;
-        }
-        let name = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(n) => n.to_owned(),
-            None => continue,
-        };
-        // Reject names with path separators or dots (safety).
-        if name.contains('/') || name.contains("..") || name.is_empty() {
-            continue;
-        }
-
-        let script_path = path.clone();
-        tools.insert(name, SyntheticNode::ReadFile(Box::new(move || {
-            // Read script from disk at access time so edits take effect immediately.
-            std::fs::read_to_string(&script_path)
-                .unwrap_or_else(|e| format!("# error reading tool script: {e}"))
-                .into_bytes()
-        })));
-    }
-
-    tools
-}
+// Tool discovery from `.tcl` files (used to populate `/bin` with discovered
+// tool scripts) now lives in `crate::services::namespace_builder::discover_tools`
+// as part of the shared standard-namespace recipe (#634).
