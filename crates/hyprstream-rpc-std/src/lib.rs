@@ -160,6 +160,8 @@ pub mod wasm_exports;
 pub mod wasm_rpc_client;
 #[cfg(target_arch = "wasm32")]
 pub mod moq_worker;
+#[cfg(target_arch = "wasm32")]
+pub mod moq_wt_session;
 
 // Phase 2: iroh peer identity + pkarr helpers exported to JavaScript.
 #[cfg(target_arch = "wasm32")]

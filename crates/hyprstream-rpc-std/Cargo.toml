@@ -46,6 +46,20 @@ web-sys = { version = "0.3", features = [
 # gated to the browser target to keep mount_wanix buildable in the wasm bundle.
 hyprstream-9p = { path = "../hyprstream-9p" }
 
+# moq browser subscriber (#484): moq-net (patched fork in third_party/ relaxes the
+# wasm-hostile `SessionInner: Send + Sync` bound) drives the moq consume loop over
+# web-transport-wasm's concrete `web_sys::WebTransport` Session, adapted to
+# `web_transport_trait::Session` in `moq_wt_session.rs`.
+moq-net = { workspace = true }
+web-transport-trait = { workspace = true }
+web-transport-wasm = "0.5"
+bytes = "1"
+url = "2"
+# moq-net's `rand` pulls getrandom 0.3; the browser needs its wasm_js backend.
+# Also requires `RUSTFLAGS=--cfg getrandom_backend="wasm_js"` at build time
+# (set alongside `--cfg=web_sys_unstable_apis` in the frontend's build-wasm.sh).
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { workspace = true }
 

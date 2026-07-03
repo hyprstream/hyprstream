@@ -198,6 +198,82 @@ impl MoqWorkerHandle {
     }
 }
 
+// ─── moq subscribe loop ───────────────────────────────────────────────────────
+
+/// Dial the moq plane over WebTransport, subscribe to the stream broadcast, and
+/// pump each received frame to the main thread over DMA.
+///
+/// Mirrors the native subscriber (`hyprstream-rpc::dial`): open a
+/// `web_transport_trait::Session` (here `web_sys::WebTransport` via
+/// `web-transport-wasm`, adapted in `moq_wt_session`), run the moq handshake with
+/// a consume-side origin, await the announced `broadcast_path`, subscribe to the
+/// single `STREAM_TRACK` ("stream"), and forward every group's frames. Each frame
+/// is a `capnp StreamBlock || mac[16]` the main thread parses/verifies/decrypts.
+///
+/// Returns when the track closes (stream complete) or on the first error.
+async fn run_subscribe(
+    dma: &DmaTransport,
+    url: &str,
+    broadcast_path: &str,
+    cert_hashes: Vec<Vec<u8>>,
+) -> Result<(), String> {
+    use crate::moq_wt_session::WtSession;
+
+    let parsed = url::Url::parse(url).map_err(|e| format!("bad reach url {url:?}: {e}"))?;
+
+    // Cert-pin to the self-signed mesh leaf when hashes are advertised; otherwise
+    // fall back to the browser's system roots (a real did:web PDS with a CA cert).
+    let client = if cert_hashes.is_empty() {
+        web_transport_wasm::ClientBuilder::new().with_system_roots()
+    } else {
+        web_transport_wasm::ClientBuilder::new().with_server_certificate_hashes(cert_hashes)
+    };
+    let wt = client
+        .connect(parsed)
+        .await
+        .map_err(|e| format!("WebTransport connect: {e}"))?;
+    let session = WtSession(wt);
+
+    // moq handshake, consume side: received broadcasts are announced into
+    // `client_consumer` (mirrors `dial.rs`'s loopback subscriber).
+    let client_origin = moq_net::Origin::random().produce();
+    let client_consumer = client_origin.consume();
+    let moq_client = moq_net::Client::new().with_consume(client_origin);
+    let _moq_session = moq_client
+        .connect(session)
+        .await
+        .map_err(|e| format!("moq handshake: {e}"))?;
+
+    let broadcast = client_consumer
+        .announced_broadcast(broadcast_path)
+        .await
+        .ok_or_else(|| format!("broadcast {broadcast_path:?} was not announced"))?;
+    let mut track = broadcast
+        .subscribe_track(&moq_net::Track::new("stream"))
+        .map_err(|e| format!("subscribe_track(stream): {e}"))?;
+
+    // Consume groups in order; each group's frames are pushed to main over DMA.
+    loop {
+        let mut group = match track
+            .next_group()
+            .await
+            .map_err(|e| format!("next_group: {e}"))?
+        {
+            Some(g) => g,
+            None => return Ok(()), // producer closed the track — stream complete.
+        };
+        while let Some(frame) = group
+            .read_frame()
+            .await
+            .map_err(|e| format!("read_frame: {e}"))?
+        {
+            dma.send(&encode_frame("stream", &frame))
+                .await
+                .map_err(|e| format!("DMA send frame: {e}"))?;
+        }
+    }
+}
+
 // ─── Worker entrypoint ────────────────────────────────────────────────────────
 
 /// Entry function called inside the Web Worker.
@@ -209,16 +285,8 @@ impl MoqWorkerHandle {
 /// The WebTransport connection is opened FROM the worker thread, which means
 /// `web_sys::WebTransport` is the only JS object on this thread and the
 /// `!Sync` restriction is logically satisfied (no cross-thread sharing occurs).
-///
-/// # moq-net stub
-///
-/// The `worker_moq_loop` function is currently stubbed — it dials the relay
-/// via WebTransport and echoes a "ready" frame to main, but does not yet
-/// implement full moq SUBSCRIBE/OBJECT framing. This is gated on:
-/// - `moq-net` relaxing its `Session: Sync` bound for wasm32, OR
-/// - A local `[patch.crates-io]` fork (one-line fix; tracked in #484).
-///
-/// The DMA channel and Worker spawn infrastructure are fully functional.
+/// moq-net's over-tight `SessionInner: Send + Sync` bound is relaxed for wasm by
+/// the `third_party/moq-net` fork so this Session can drive the moq consumer.
 #[wasm_bindgen]
 pub async fn moq_worker_main(sab: JsValue, reach_json: String) {
     console_error_panic_hook::set_once();
@@ -279,7 +347,9 @@ pub async fn moq_worker_main(sab: JsValue, reach_json: String) {
                 Err(_) => continue,
             };
             if cmd.get("cmd").and_then(|c| c.as_str()) == Some("subscribe") {
-                let track_name = cmd
+                // `track` is the moq broadcast path (e.g. "local/streams/{topic_hex}");
+                // the token stream itself lives on the single STREAM_TRACK within it.
+                let broadcast_path = cmd
                     .get("track")
                     .and_then(|t| t.as_str())
                     .unwrap_or("")
@@ -289,24 +359,35 @@ pub async fn moq_worker_main(sab: JsValue, reach_json: String) {
                     .and_then(|u| u.as_str())
                     .unwrap_or("")
                     .to_string();
+                // Acceptable leaf-cert SHA-256 pins (base64) for the self-signed mesh,
+                // from the QuicReach the frontend selected. Empty ⇒ use system roots.
+                let cert_hashes: Vec<Vec<u8>> = reach
+                    .get("certHashes")
+                    .and_then(|c| c.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .filter_map(|s| {
+                                use base64::Engine;
+                                base64::engine::general_purpose::STANDARD.decode(s).ok()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
                 web_sys::console::log_1(
-                    &format!("[moq-worker] subscribe track={track_name} url={url}").into(),
+                    &format!("[moq-worker] subscribe broadcast={broadcast_path} url={url}").into(),
                 );
-                // TODO(#484): open WebTransport to `url`, implement moq SUBSCRIBE +
-                // OBJECT consumer, push received OBJECT payloads via:
-                //   dma.send(&encode_frame(&track_name, &object_payload)).await
-                //
-                // Stub: echo an acknowledgment so the main thread knows the subscribe
-                // was received and the DMA channel is working.
-                let ack = encode_frame(
-                    &track_name,
-                    format!("__subscribed_stub__:{url}").as_bytes(),
-                );
-                if let Err(e) = dma.send(&ack).await {
-                    web_sys::console::error_1(
-                        &format!("[moq-worker] DMA send ack error: {e}").into(),
-                    );
-                    break;
+
+                // Runs until the track closes (stream complete) or errors; then the
+                // outer loop resumes waiting for the next command. One inference
+                // stream per worker, so blocking the command loop here is intended.
+                if let Err(e) =
+                    run_subscribe(&dma, &url, &broadcast_path, cert_hashes).await
+                {
+                    web_sys::console::error_1(&format!("[moq-worker] subscribe: {e}").into());
+                    let err = encode_frame("__error__", e.as_bytes());
+                    let _ = dma.send(&err).await;
                 }
             }
         }
