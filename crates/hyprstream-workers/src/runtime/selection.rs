@@ -374,12 +374,11 @@ mod tests {
         // YAGNI: still-speculative tiers must not be in the registry until built.
         // `wasm` (#505 P2) and `oci` (#346) are now real backends, each handled by
         // its own feature-tracking test below; only `cri` remains speculative.
-        for name in ["cri"] {
-            assert!(
-                !inventory::iter::<BackendRegistration>().any(|r| r.name == name),
-                "speculative backend '{name}' must not be registered (YAGNI)"
-            );
-        }
+        let name = "cri";
+        assert!(
+            !inventory::iter::<BackendRegistration>().any(|r| r.name == name),
+            "speculative backend '{name}' must not be registered (YAGNI)"
+        );
     }
 
     #[test]
