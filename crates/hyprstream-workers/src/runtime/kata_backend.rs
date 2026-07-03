@@ -16,13 +16,14 @@ use kata_hypervisor::dragonball::Dragonball;
 use kata_hypervisor::{Hypervisor, ShareFsConfig, ShareFsDevice};
 use kata_types::config::hypervisor::{Hypervisor as HypervisorConfig, RootlessUser};
 use kata_types::rootless;
+use protocols::{agent, oci};
 
 use crate::config::{HypervisorType, ImageConfig, PoolConfig};
 use crate::error::{Result, WorkerError};
 use crate::image::RafsStore;
 
 use super::backend::{SandboxBackend, SandboxHandle};
-use super::client::PodSandboxConfig;
+use super::client::{CpuUsage, LinuxContainerResources, MemoryUsage, PodSandboxConfig};
 use super::kata_agent::{AgentAddress, KataAgentClient};
 use super::sandbox::PodSandbox;
 use super::sandbox_fs::{SandboxFs, SandboxFsServer, VFS_SOCKET_NAME};
@@ -633,9 +634,175 @@ impl SandboxBackend for KataBackend {
             }
         }
     }
+
+    /// Apply new CPU/memory limits to the sandbox's running container by
+    /// driving the kata-agent `UpdateContainer` RPC (the CRI
+    /// `UpdateContainerResources` path). The CRI-shaped
+    /// [`LinuxContainerResources`] is mapped to the guest's
+    /// [`oci::LinuxResources`] and the agent rewrites the in-guest cgroups.
+    ///
+    /// Uses `sandbox.id` as the guest container id — the same single-workload
+    /// convention `exec_sync` uses (see there). Requires a started sandbox
+    /// with a live agent connection; without a backend handle this fails
+    /// rather than silently no-op'ing (unlike the trait default), because a
+    /// caller asking to resize an unstarted sandbox has made a mistake.
+    async fn update_resources(
+        &self,
+        sandbox: &PodSandbox,
+        resources: &LinuxContainerResources,
+    ) -> Result<()> {
+        let handle = sandbox.backend_handle.as_ref().ok_or_else(|| {
+            WorkerError::Internal("update_resources: sandbox has no backend handle".into())
+        })?;
+        let kata = handle.as_any().downcast_ref::<KataHandle>().ok_or_else(|| {
+            WorkerError::Internal("update_resources: backend handle is not a KataHandle".into())
+        })?;
+
+        let client = self.guest_agent_client(kata).await?;
+        let container_id = sandbox.id.clone();
+        let oci_resources = Self::map_linux_resources(resources);
+
+        client
+            .update_container(&container_id, oci_resources)
+            .await
+            .map_err(|e| {
+                WorkerError::Internal(format!("kata-agent update_container failed: {e:#}"))
+            })?;
+
+        tracing::info!(
+            sandbox_id = %sandbox.id,
+            cpu_shares = resources.cpu_shares,
+            cpu_quota = resources.cpu_quota,
+            cpu_period = resources.cpu_period,
+            memory_limit_in_bytes = resources.memory_limit_in_bytes,
+            "Updated container resources via kata-agent UpdateContainer"
+        );
+        Ok(())
+    }
+
+    /// Fetch live CPU/memory usage for the sandbox's container from the guest
+    /// via the kata-agent `StatsContainer` RPC, mapped into the CRI
+    /// [`CpuUsage`]/[`MemoryUsage`] shape.
+    ///
+    /// Returns `Ok(None)` when the sandbox has no backend handle yet (never
+    /// started) so the caller can fall back to placeholder stats rather than
+    /// erroring on a not-yet-running sandbox. A live agent that then fails the
+    /// RPC surfaces as `Err`.
+    async fn container_stats(
+        &self,
+        sandbox: &PodSandbox,
+    ) -> Result<Option<(CpuUsage, MemoryUsage)>> {
+        let Some(handle) = sandbox.backend_handle.as_ref() else {
+            return Ok(None);
+        };
+        let Some(kata) = handle.as_any().downcast_ref::<KataHandle>() else {
+            return Ok(None);
+        };
+
+        let client = self.guest_agent_client(kata).await?;
+        let container_id = sandbox.id.clone();
+
+        let resp = client.stats_container(&container_id).await.map_err(|e| {
+            WorkerError::Internal(format!("kata-agent stats_container failed: {e:#}"))
+        })?;
+
+        Ok(Some(Self::map_container_stats(&resp)))
+    }
 }
 
 impl KataBackend {
+    /// Map the CRI [`LinuxContainerResources`] to the guest
+    /// [`oci::LinuxResources`] the kata-agent's `UpdateContainer` expects.
+    ///
+    /// Only the fields with a meaningful CRI→OCI correspondence are set; the
+    /// rest are left at their protobuf defaults so the agent treats them as
+    /// "unchanged". `memory_swap_limit_in_bytes` maps to OCI `Swap`, and the
+    /// cpuset strings to `Cpus`/`Mems`.
+    fn map_linux_resources(resources: &LinuxContainerResources) -> oci::LinuxResources {
+        let cpu = oci::LinuxCPU {
+            // CRI cpu_shares is i64; OCI Shares is u64. Clamp negatives to 0.
+            Shares: u64::try_from(resources.cpu_shares).unwrap_or(0),
+            Quota: resources.cpu_quota,
+            Period: u64::try_from(resources.cpu_period).unwrap_or(0),
+            Cpus: resources.cpuset_cpus.clone(),
+            Mems: resources.cpuset_mems.clone(),
+            ..Default::default()
+        };
+        let memory = oci::LinuxMemory {
+            Limit: resources.memory_limit_in_bytes,
+            Swap: resources.memory_swap_limit_in_bytes,
+            ..Default::default()
+        };
+        oci::LinuxResources {
+            CPU: protobuf::MessageField::some(cpu),
+            Memory: protobuf::MessageField::some(memory),
+            ..Default::default()
+        }
+    }
+
+    /// Map a kata-agent [`agent::StatsContainerResponse`] (guest cgroup
+    /// counters) into the CRI [`CpuUsage`]/[`MemoryUsage`] shape.
+    ///
+    /// `usage_nano_cores` is left 0: it is a *rate* that requires two samples
+    /// (a delta of `usage_core_nano_seconds` over wall-clock) which a single
+    /// stats call cannot compute — kubelet's own CRI stats provider derives
+    /// it host-side from successive samples, so emitting a fabricated value
+    /// here would be wrong. `working_set_bytes` follows the CRI definition
+    /// (`usage − total_inactive_file`); other fields come straight from the
+    /// cgroup memory counters, reading `rss`/`pgfault`/`pgmajfault` from the
+    /// per-cgroup `stats` map (falling back to 0 when a controller does not
+    /// export them).
+    fn map_container_stats(resp: &agent::StatsContainerResponse) -> (CpuUsage, MemoryUsage) {
+        let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let cgroup = &resp.cgroup_stats;
+
+        let cpu = CpuUsage {
+            timestamp: now_ns,
+            usage_core_nano_seconds: cgroup.cpu_stats.cpu_usage.total_usage,
+            usage_nano_cores: 0,
+        };
+
+        let mem = &cgroup.memory_stats;
+        let usage_bytes = mem.usage.usage;
+        let inactive_file = mem
+            .stats
+            .get("total_inactive_file")
+            .or_else(|| mem.stats.get("inactive_file"))
+            .copied()
+            .unwrap_or(0);
+        let rss_bytes = mem
+            .stats
+            .get("total_rss")
+            .or_else(|| mem.stats.get("rss"))
+            .copied()
+            .unwrap_or(0);
+        let page_faults = mem
+            .stats
+            .get("total_pgfault")
+            .or_else(|| mem.stats.get("pgfault"))
+            .copied()
+            .unwrap_or(0);
+        let major_page_faults = mem
+            .stats
+            .get("total_pgmajfault")
+            .or_else(|| mem.stats.get("pgmajfault"))
+            .copied()
+            .unwrap_or(0);
+        let limit = mem.usage.limit;
+
+        let memory = MemoryUsage {
+            timestamp: now_ns,
+            working_set_bytes: usage_bytes.saturating_sub(inactive_file),
+            available_bytes: limit.saturating_sub(usage_bytes),
+            usage_bytes,
+            rss_bytes,
+            page_faults,
+            major_page_faults,
+        };
+
+        (cpu, memory)
+    }
+
     /// Get (lazily connecting if needed) the cached kata-agent ttrpc client
     /// for this sandbox's VM.
     ///
@@ -1090,6 +1257,98 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────
     // Cloud-init ISO generation (requires genisoimage)
     // ─────────────────────────────────────────────────────────────────────
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Resource / stats mapping (T1-D #345) — pure functions, no VM needed
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_map_linux_resources_maps_cpu_and_memory() {
+        let resources = LinuxContainerResources {
+            cpu_shares: 512,
+            cpu_quota: 50_000,
+            cpu_period: 100_000,
+            memory_limit_in_bytes: 256 * 1024 * 1024,
+            memory_swap_limit_in_bytes: 512 * 1024 * 1024,
+            cpuset_cpus: "0-1".to_owned(),
+            cpuset_mems: "0".to_owned(),
+            ..Default::default()
+        };
+
+        let oci = KataBackend::map_linux_resources(&resources);
+
+        assert_eq!(oci.CPU.Shares, 512);
+        assert_eq!(oci.CPU.Quota, 50_000);
+        assert_eq!(oci.CPU.Period, 100_000);
+        assert_eq!(oci.CPU.Cpus, "0-1");
+        assert_eq!(oci.CPU.Mems, "0");
+        assert_eq!(oci.Memory.Limit, 256 * 1024 * 1024);
+        assert_eq!(oci.Memory.Swap, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_map_linux_resources_clamps_negative_cpu_to_zero() {
+        // CRI cpu_shares/cpu_period are i64; OCI Shares/Period are u64. A
+        // negative "unset" sentinel must not wrap around to a huge u64.
+        let resources = LinuxContainerResources {
+            cpu_shares: -1,
+            cpu_period: -1,
+            ..Default::default()
+        };
+
+        let oci = KataBackend::map_linux_resources(&resources);
+        assert_eq!(oci.CPU.Shares, 0);
+        assert_eq!(oci.CPU.Period, 0);
+    }
+
+    #[test]
+    fn test_map_container_stats_maps_cgroup_counters() {
+        let mut cpu_usage = agent::CpuUsage::new();
+        cpu_usage.total_usage = 123_456;
+        let mut cpu_stats = agent::CpuStats::new();
+        cpu_stats.cpu_usage = protobuf::MessageField::some(cpu_usage);
+
+        let mut mem_data = agent::MemoryData::new();
+        mem_data.usage = 1000;
+        mem_data.limit = 4000;
+        let mut mem_stats = agent::MemoryStats::new();
+        mem_stats.usage = protobuf::MessageField::some(mem_data);
+        mem_stats.stats.insert("total_inactive_file".to_owned(), 200);
+        mem_stats.stats.insert("total_rss".to_owned(), 700);
+        mem_stats.stats.insert("total_pgfault".to_owned(), 42);
+        mem_stats.stats.insert("total_pgmajfault".to_owned(), 7);
+
+        let mut cgroup = agent::CgroupStats::new();
+        cgroup.cpu_stats = protobuf::MessageField::some(cpu_stats);
+        cgroup.memory_stats = protobuf::MessageField::some(mem_stats);
+
+        let mut resp = agent::StatsContainerResponse::new();
+        resp.cgroup_stats = protobuf::MessageField::some(cgroup);
+
+        let (cpu, mem) = KataBackend::map_container_stats(&resp);
+
+        assert_eq!(cpu.usage_core_nano_seconds, 123_456);
+        // usage_nano_cores is a rate needing two samples; single-sample = 0.
+        assert_eq!(cpu.usage_nano_cores, 0);
+        assert_eq!(mem.usage_bytes, 1000);
+        assert_eq!(mem.working_set_bytes, 800, "usage - total_inactive_file");
+        assert_eq!(mem.available_bytes, 3000, "limit - usage");
+        assert_eq!(mem.rss_bytes, 700);
+        assert_eq!(mem.page_faults, 42);
+        assert_eq!(mem.major_page_faults, 7);
+    }
+
+    #[test]
+    fn test_map_container_stats_empty_response_is_zeroed() {
+        // A response with no cgroup_stats (default instances) must not panic
+        // and must yield all-zero counters.
+        let resp = agent::StatsContainerResponse::new();
+        let (cpu, mem) = KataBackend::map_container_stats(&resp);
+        assert_eq!(cpu.usage_core_nano_seconds, 0);
+        assert_eq!(mem.usage_bytes, 0);
+        assert_eq!(mem.working_set_bytes, 0);
+        assert_eq!(mem.available_bytes, 0);
+    }
 
     #[tokio::test]
     #[ignore] // requires genisoimage binary

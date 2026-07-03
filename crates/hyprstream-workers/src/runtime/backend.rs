@@ -13,7 +13,7 @@ use crate::config::PoolConfig;
 use crate::error::Result;
 
 use super::sandbox::PodSandbox;
-use super::client::{LinuxContainerResources, PodSandboxConfig};
+use super::client::{CpuUsage, LinuxContainerResources, MemoryUsage, PodSandboxConfig};
 
 /// Opaque handle stored on each `PodSandbox`.
 ///
@@ -83,5 +83,19 @@ pub trait SandboxBackend: Send + Sync {
         _resources: &LinuxContainerResources,
     ) -> Result<()> {
         Ok(()) // default: no-op
+    }
+
+    /// Fetch live per-container resource usage from the sandbox's guest.
+    ///
+    /// Returns `Some((cpu, memory))` sourced from inside the sandbox (e.g.
+    /// the kata-agent stats RPC / guest cgroups), or `None` when the backend
+    /// cannot observe the guest (default). Callers fall back to
+    /// placeholder/zeroed usage when this is `None`, so a backend that has no
+    /// in-guest visibility does not have to synthesise fake numbers.
+    async fn container_stats(
+        &self,
+        _sandbox: &PodSandbox,
+    ) -> Result<Option<(CpuUsage, MemoryUsage)>> {
+        Ok(None) // default: no guest-level stats available
     }
 }

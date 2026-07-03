@@ -368,6 +368,55 @@ impl KataAgentClient {
         Ok(resp.status)
     }
 
+    /// `UpdateContainer` — apply new cgroup resource limits to a running
+    /// container inside the guest.
+    ///
+    /// This is the RPC a CRI `UpdateContainerResources` maps onto: the
+    /// kata-agent rewrites the container's in-guest cgroups (CPU shares/quota/
+    /// period, memory limit, cpuset, …). It updates the container's slice of
+    /// the *existing* VM; growing the VM itself past its boot size (vCPU /
+    /// memory hotplug) is a separate hypervisor concern and not attempted
+    /// here — matching upstream kata, whose `update_container` handler drives
+    /// the guest cgroup layer, with VM resize handled independently by the
+    /// runtime's resource manager.
+    pub async fn update_container(
+        &self,
+        container_id: &str,
+        resources: oci::LinuxResources,
+    ) -> Result<()> {
+        let req = agent::UpdateContainerRequest {
+            container_id: container_id.to_owned(),
+            resources: protobuf::MessageField::some(resources),
+            ..Default::default()
+        };
+        self.client
+            .update_container(self.ctx(), &req)
+            .await
+            .context("UpdateContainer ttrpc call")?;
+        Ok(())
+    }
+
+    /// `StatsContainer` — fetch the guest cgroup (+ network) stats for a
+    /// container. The returned [`agent::StatsContainerResponse`] carries the
+    /// real in-guest cgroup counters (`cgroup_stats.cpu_stats` /
+    /// `memory_stats`); mapping them into the CRI `ContainerStats` shape is
+    /// the caller's job (see `KataBackend::container_stats`).
+    pub async fn stats_container(
+        &self,
+        container_id: &str,
+    ) -> Result<agent::StatsContainerResponse> {
+        let req = agent::StatsContainerRequest {
+            container_id: container_id.to_owned(),
+            ..Default::default()
+        };
+        let resp = self
+            .client
+            .stats_container(self.ctx(), &req)
+            .await
+            .context("StatsContainer ttrpc call")?;
+        Ok(resp)
+    }
+
     /// Drain available stdout via repeated `ReadStdout` calls until the
     /// agent reports no more data (empty response).
     pub async fn read_stdout_all(&self, container_id: &str, exec_id: &str) -> Result<Vec<u8>> {
