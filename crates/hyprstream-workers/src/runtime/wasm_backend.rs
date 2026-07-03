@@ -356,7 +356,7 @@ impl SandboxBackend for WasmBackend {
         _subject: Subject,
         transport: super::backend::NamespaceTransport,
     ) -> Result<super::backend::NamespaceDelivery> {
-        use super::backend::{NamespaceDelivery, NamespaceTransport};
+        use super::backend::NamespaceTransport;
 
         // Provisional (#635): wasm's guest has no separate OS to mount a
         // namespace into — the "host-imports" model means mount references
@@ -365,17 +365,16 @@ impl SandboxBackend for WasmBackend {
         // (Profile B / Wanix `/task` #612) doesn't exist yet: today's
         // `WasmBackend` links a bespoke zero-WASI capability surface
         // (`env::host_random` only, see module docs) with no filesystem
-        // import at all. This accepts `HostImports` and reports success
-        // without actually exposing `_namespace` to the guest — a stub that
-        // is honest about doing nothing yet, rather than silently no-op'ing
-        // behind a misleadingly "delivered" result for the other transports.
-        match transport {
-            NamespaceTransport::HostImports => Ok(NamespaceDelivery::HostImports),
-            other => Err(WorkerError::Unsupported(format!(
-                "wasm backend only accepts the HostImports namespace transport \
-                 (no guest-OS control-file service wired yet, #612), got {other:?}"
-            ))),
-        }
+        // import at all. Fail closed for every transport, including
+        // `HostImports`, rather than reporting a misleadingly "delivered"
+        // success for a namespace that never actually reached the guest —
+        // matches this codebase's fail-closed convention elsewhere (MAC's
+        // AuditedAvc, PQC hybrid mode). Flip to a real Ok(...) once #612
+        // wires the linker.
+        Err(WorkerError::Unsupported(format!(
+            "wasm backend does not support namespace delivery yet \
+             (no guest-OS control-file service wired, #612), got {transport:?}"
+        )))
     }
 
     fn supports_exec(&self) -> bool {
@@ -700,8 +699,8 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn deliver_namespace_accepts_host_imports_transport() {
-        use super::super::backend::{NamespaceDelivery, NamespaceTransport};
+    async fn deliver_namespace_fails_closed_for_host_imports_transport() {
+        use super::super::backend::NamespaceTransport;
 
         let backend = WasmBackend::new(WasmConfig::default());
         let cfg = pod_config("t", vec![]);
@@ -714,10 +713,12 @@ mod tests {
                 Subject::new("test"),
                 NamespaceTransport::HostImports,
             )
-            .await
-            .expect("wasm backend should accept HostImports");
+            .await;
 
-        assert!(matches!(result, NamespaceDelivery::HostImports));
+        match result {
+            Err(WorkerError::Unsupported(_)) => {}
+            other => panic!("expected Unsupported error (no linker wiring yet, #612), got: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -741,7 +742,7 @@ mod tests {
 
         match result {
             Err(WorkerError::Unsupported(msg)) => {
-                assert!(msg.contains("HostImports"), "unexpected message: {msg}");
+                assert!(msg.contains("#612"), "unexpected message: {msg}");
             }
             other => panic!("expected Unsupported error, got: {other:?}"),
         }
