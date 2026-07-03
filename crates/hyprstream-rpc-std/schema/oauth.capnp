@@ -9,6 +9,7 @@ using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".scope;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".optional;
+using import "/annotations.capnp".vfsPath;
 
 struct OauthRequest {
   id @0 :UInt64;
@@ -33,7 +34,8 @@ struct OauthRequest {
     removePubkey @9 :RemovePubkey
       $scope(manage) $mcpDescription("Remove a public key by fingerprint");
     listPubkeys @10 :Text
-      $scope(query) $mcpDescription("List all public keys for a user");
+      $scope(query) $mcpDescription("List all public keys for a user")
+      $vfsPath("{arg}/pubkeys");
   }
 }
 

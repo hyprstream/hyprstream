@@ -10,6 +10,7 @@
 using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".scope;
 using import "/annotations.capnp".mcpDescription;
+using import "/annotations.capnp".vfsPath;
 # #275: the moq reach model (network-routable dial parameters) so a cross-process
 # TUI viewer can dial the producer's networked moq plane instead of its own local
 # UDS plane. Shared 1:1 with the inference StreamInfo's reach (streaming.capnp).
@@ -136,7 +137,8 @@ struct TuiRequest {
 
     # List all windows in a session
     listWindows @5 :UInt32  # session_id
-      $scope(query) $mcpDescription("List all windows in a session");
+      $scope(query) $mcpDescription("List all windows in a session")
+      $vfsPath("{arg}/windows");
 
     # Focus a window
     focusWindow @6 :UInt32  # window_id
@@ -156,7 +158,8 @@ struct TuiRequest {
 
     # Get a snapshot of the current display state
     snapshot @10 :UInt32  # session_id (0 = current)
-      $scope(query) $mcpDescription("Get snapshot of current display");
+      $scope(query) $mcpDescription("Get snapshot of current display")
+      $vfsPath("{arg}/snapshot");
 
     # Resize the terminal
     resize @11 :ResizeRequest

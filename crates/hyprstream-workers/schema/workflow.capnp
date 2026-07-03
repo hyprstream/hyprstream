@@ -4,6 +4,7 @@ using import "/common.capnp".ErrorInfo;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".paramDescription;
 using import "/annotations.capnp".scope;
+using import "/annotations.capnp".vfsPath;
 
 # Cap'n Proto schema for workflow service (independent service)
 #
@@ -19,7 +20,8 @@ struct WorkflowRequest {
   union {
     scanRepo @1 :Text
       $mcpDescription("Scan a repository for workflow definitions")
-      $scope(query);
+      $scope(query)
+      $vfsPath("{arg}/scan");
     register @2 :WorkflowDef
       $mcpDescription("Register a workflow definition")
       $scope(write);
@@ -37,10 +39,12 @@ struct WorkflowRequest {
       $scope(write);
     getRun @7 :Text
       $mcpDescription("Get status of a workflow run")
-      $scope(query);
+      $scope(query)
+      $vfsPath("{arg}/run");
     listRuns @8 :Text
       $mcpDescription("List runs for a workflow")
-      $scope(query);
+      $scope(query)
+      $vfsPath("{arg}/runs");
   }
 }
 
