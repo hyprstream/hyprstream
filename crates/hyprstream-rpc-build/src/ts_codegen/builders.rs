@@ -471,6 +471,7 @@ pub fn generate_struct_builders(out: &mut String, schema: &ParsedSchema) {
             } else {
                 None
             };
+            let group_leaves = super::group_arm_leaves(sd, variant);
 
             let fn_name = format!("build{}_{}", sd.name, variant.name);
 
@@ -488,6 +489,11 @@ pub fn generate_struct_builders(out: &mut String, schema: &ParsedSchema) {
                     params.push(format!("p: {}", ps.name));
                 } else if is_prim {
                     params.push(format!("p: {}", capnp_to_ts_type(&variant.type_name)));
+                } else if group_leaves.is_some() {
+                    params.push(format!(
+                        "p: {}",
+                        super::group_arm_type_name(&sd.name, &variant.name)
+                    ));
                 }
             }
 
@@ -539,6 +545,17 @@ pub fn generate_struct_builders(out: &mut String, schema: &ParsedSchema) {
                 );
             } else if let Some(ps) = payload_struct {
                 emit_struct_init(out, variant, ps, "msg", "p", "  ", schema, &mut counter);
+            } else if let Some(leaves) = group_leaves {
+                emit_group_arm_setter(
+                    out,
+                    "msg",
+                    "p",
+                    leaves,
+                    "  ",
+                    &schema.enums,
+                    &schema.structs,
+                    &mut counter,
+                );
             }
 
             out.push_str("  return msg.finish();\n");
@@ -803,6 +820,38 @@ fn emit_struct_init(
     }
 }
 
+/// Write an inline union `group` arm's leaf fields onto `builder_var`.
+///
+/// The leaves live in the ENCLOSING struct's sections (a group has no own
+/// pointer), so each is set directly on `builder_var` at its own slot offset —
+/// the same per-field setter path a normal field uses. `data_expr` is the
+/// arm's typed group object.
+fn emit_group_arm_setter(
+    out: &mut String,
+    builder_var: &str,
+    data_expr: &str,
+    leaves: &[FieldDef],
+    indent: &str,
+    enums: &[EnumDef],
+    structs: &[StructDef],
+    counter: &mut u32,
+) {
+    for leaf in leaves {
+        let raw = format!("{data_expr}.{}", to_camel_case(&leaf.name));
+        let val = value_expr_for_field(leaf, &raw, enums);
+        emit_field_setter(
+            out,
+            builder_var,
+            leaf,
+            &val,
+            indent,
+            enums,
+            structs,
+            counter,
+        );
+    }
+}
+
 /// Optional fields carry `T | undefined`; coalesce to the capnp default so
 /// TypeScript strict mode doesn't reject passing `T | undefined` to a setter.
 fn value_expr_for_field(field: &FieldDef, raw_expr: &str, enums: &[EnumDef]) -> String {
@@ -909,7 +958,25 @@ fn emit_union_element_setter(
             uf.discriminant_value, uf.name
         ));
 
-        if uf.type_name == "Void" {
+        if let Some(leaves) = super::group_arm_leaves(sd, uf) {
+            // Inline group arm — write its leaves directly on this struct.
+            out.push_str(&format!("{bi}{{\n"));
+            out.push_str(&format!(
+                "{bi}  const _ugd = {value_var}.data as {};\n",
+                super::group_arm_type_name(&sd.name, &uf.name)
+            ));
+            emit_group_arm_setter(
+                out,
+                builder_var,
+                "_ugd",
+                leaves,
+                &format!("{bi}  "),
+                enums,
+                structs,
+                counter,
+            );
+            out.push_str(&format!("{bi}}}\n"));
+        } else if uf.type_name == "Void" {
             // Nothing to set
         } else if uf.section == FieldSection::Data && is_data_scalar(&uf.type_name) {
             let byte_off = data_byte_offset(uf);

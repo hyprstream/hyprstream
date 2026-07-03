@@ -14,7 +14,9 @@ mod parsers;
 use std::path::Path;
 
 use hyprstream_rpc_build::backend::CodegenBackend;
-use hyprstream_rpc_build::schema::types::{EnumDef, FieldDef, FieldSection, ParsedSchema};
+use hyprstream_rpc_build::schema::types::{
+    ArmPayload, EnumDef, FieldDef, FieldSection, ParsedSchema, StructDef,
+};
 use hyprstream_rpc_build::util::{to_camel_case, to_pascal_case};
 
 /// Generate all output files from parsed schemas using the given backend.
@@ -313,6 +315,49 @@ pub(crate) fn union_variant_data_type(f: &FieldDef) -> String {
         format!("{} | null", capnp_to_ts_type(tn))
     } else {
         capnp_to_ts_type(tn)
+    }
+}
+
+/// If union field `uf` of struct `sd` is an inline `group` arm, return its leaf
+/// fields (from the structured `union_arms` view). `None` for Void/single-type
+/// arms.
+///
+/// A capnp `group` arm carries an inlined anonymous struct whose leaf fields are
+/// allocated their own slots in the ENCLOSING struct's data/pointer sections;
+/// each leaf `FieldDef` therefore already carries a correct `slot_offset` +
+/// `section` (extracted by the same `field_def_from_slot` path as a normal
+/// field), so build/parse can read/write them directly on the enclosing
+/// reader/builder.
+pub(crate) fn group_arm_leaves<'a>(sd: &'a StructDef, uf: &FieldDef) -> Option<&'a [FieldDef]> {
+    if uf.section != FieldSection::Group {
+        return None;
+    }
+    sd.union_arms
+        .iter()
+        .find(|a| a.name == uf.name)
+        .and_then(|a| match &a.payload {
+            ArmPayload::Group(leaves) => Some(leaves.as_slice()),
+            _ => None,
+        })
+}
+
+/// Name of the synthesized TypeScript interface for a group arm, e.g. the
+/// `dropOldest` arm of `OverflowPolicy` → `OverflowPolicyDropOldest`.
+pub(crate) fn group_arm_type_name(struct_name: &str, arm_name: &str) -> String {
+    format!("{struct_name}{}", to_pascal_case(arm_name))
+}
+
+/// The `data:` TypeScript type for one arm of struct `sd`'s discriminated union.
+///
+/// Same as [`union_variant_data_type`] for Void/scalar/struct arms, but a group
+/// arm resolves to its synthesized interface (`{Struct}{Arm}` | null) instead of
+/// the bare, undefined `Group`. Shared by the interface emitter and the parser
+/// result-type aliases so type/build/parse agree.
+pub(crate) fn union_arm_data_type(sd: &StructDef, f: &FieldDef) -> String {
+    if group_arm_leaves(sd, f).is_some() {
+        format!("{} | null", group_arm_type_name(&sd.name, &f.name))
+    } else {
+        union_variant_data_type(f)
     }
 }
 
