@@ -229,6 +229,16 @@ kata-vm = [
 # doesn't vendor wasmtime; stays torch-free either way. When off, `wasm`
 # selection fails closed (the backend simply isn't registered).
 wasm = ["dep:hyprstream-workers-wasmtime"]
+# Rootless OCI container backend (#346, Worker GA epic #341 / taxonomy #508).
+# Compiles in `OciBackend`, a subprocess sibling of nspawn that drives a rootless
+# OCI runtime (podman by default; the runtime binary is configurable) via CLI
+# shell-out — user-namespaced containers from an OCI image, threading the full CRI
+# PodSandboxConfig (name/labels/annotations/resources/security) into the
+# invocation. Torch-free and needs no new dependencies (only the already-present
+# `which`/`nix`/`tokio` process plumbing), so it just gates the module. Opt-in so
+# the lean build doesn't assume a container runtime is installed. When off, `oci`
+# selection fails closed (the backend simply isn't registered).
+oci = []
 # Enable Dragonball built-in VMM support (alternative to cloud-hypervisor).
 # Implies `kata-vm` since it tunes the kata hypervisor abstraction.
 dragonball = ["kata-vm", "kata-hypervisor/dragonball"]

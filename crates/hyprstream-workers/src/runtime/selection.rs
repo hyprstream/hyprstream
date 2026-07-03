@@ -11,10 +11,15 @@
 //!
 //! * `nspawn` — always registered (systemd-nspawn lightweight container).
 //! * `kata`   — registered only under the `kata-vm` feature (full VM isolation).
+//! * `oci`    — registered only under the `oci` feature (rootless OCI/podman
+//!   container, #346).
+//! * `wasm`   — registered only under the `wasm` feature (in-process WebAssembly,
+//!   explicit-name-only).
 //!
-//! YAGNI: speculative tiers (Oci/Cri/Wasm) are intentionally **not** registered.
-//! They gain a `submit!` when their phase actually builds them; until then they
-//! simply do not exist as selectable names (an explicit request errors).
+//! YAGNI: still-speculative tiers (e.g. a raw `cri` shim) are intentionally
+//! **not** registered. They gain a `submit!` when their phase actually builds
+//! them; until then they simply do not exist as selectable names (an explicit
+//! request errors).
 //!
 //! Selection is **config-driven** via `worker.backend` (a string: a registered
 //! backend name, or `"auto"`):
@@ -366,15 +371,46 @@ mod tests {
 
     #[test]
     fn no_speculative_backends_registered() {
-        // YAGNI: still-speculative tiers (Oci/Cri) must not be in the registry
-        // until built. `wasm` is now a real backend (#505 P2) and is handled
-        // separately below — it registers iff the `wasm` feature is on.
-        for name in ["oci", "cri"] {
-            assert!(
-                !inventory::iter::<BackendRegistration>().any(|r| r.name == name),
-                "speculative backend '{name}' must not be registered (YAGNI)"
-            );
-        }
+        // YAGNI: still-speculative tiers must not be in the registry until built.
+        // `wasm` (#505 P2) and `oci` (#346) are now real backends, each handled by
+        // its own feature-tracking test below; only `cri` remains speculative.
+        let name = "cri";
+        assert!(
+            !inventory::iter::<BackendRegistration>().any(|r| r.name == name),
+            "speculative backend '{name}' must not be registered (YAGNI)"
+        );
+    }
+
+    #[test]
+    fn registry_contains_oci_only_under_feature() {
+        // The rootless OCI (podman) backend (#346) registers iff built with
+        // `--features oci`. With the feature off it must NOT be a selectable name
+        // (fail-closed), mirroring `wasm`/`kata`.
+        let has_oci = inventory::iter::<BackendRegistration>().any(|r| r.name == "oci");
+        assert_eq!(
+            has_oci,
+            cfg!(feature = "oci"),
+            "oci registration must track the oci feature"
+        );
+    }
+
+    #[cfg(feature = "oci")]
+    #[test]
+    fn oci_is_auto_selectable_and_outranks_nspawn() {
+        // A rootless container (user namespaces + seccomp + its own image rootfs)
+        // is a real isolation tier, so — unlike the in-process `wasm` backend — it
+        // is auto-selectable and outranks nspawn (host-rootfs sharing).
+        let oci = inventory::iter::<BackendRegistration>()
+            .find(|r| r.name == "oci")
+            .expect("oci registered under the oci feature");
+        let nspawn = inventory::iter::<BackendRegistration>()
+            .find(|r| r.name == "nspawn")
+            .expect("nspawn always registered");
+        assert!(oci.auto_selectable, "oci is a real isolation tier → auto-selectable");
+        assert!(
+            oci.priority > nspawn.priority,
+            "rootless OCI must outrank nspawn for auto-selection"
+        );
     }
 
     #[test]

@@ -35,6 +35,12 @@ pub mod kata_backend;
 #[cfg(feature = "kata-vm")]
 pub mod kata_agent;
 pub mod nspawn;
+// Rootless OCI container backend (#346) — gated behind `oci`. Drives a rootless
+// OCI runtime (podman by default) via CLI shell-out; torch-free, no VM toolchain.
+// A subprocess sibling of nspawn under the SandboxBackend seam. Off by default so
+// the lean build doesn't assume a container runtime is installed.
+#[cfg(feature = "oci")]
+pub mod oci_backend;
 mod pool;
 mod sandbox;
 // In-process WebAssembly sandbox backend (#505 P2) — gated behind `wasm`
@@ -97,6 +103,8 @@ pub use exec_mount::ExecMount;
 #[cfg(feature = "kata-vm")]
 pub use kata_backend::{KataBackend, KataHandle};
 pub use nspawn::{NspawnBackend, NspawnConfig, NspawnHandle};
+#[cfg(feature = "oci")]
+pub use oci_backend::{OciBackend, OciConfig, OciHandle};
 #[cfg(feature = "wasm")]
 pub use wasm_backend::{WasmBackend, WasmConfig, WasmHandle};
 // Inventory-based backend registry + fail-closed selection spine (#507)
