@@ -53,6 +53,13 @@ mod image_fs;
 pub mod store_trait;
 #[cfg(feature = "oci-image")]
 mod store;
+// #652 (follow-on to #633/#641): projects `RafsStore`'s on-disk CAS as a
+// 9P/VFS `Mount` — the storage-layer namespace surface, distinct from
+// `ImageFs` (the composed filesystem a guest mounts). Only needs `RafsStore`
+// itself, not the fuse/overlay stack `image_fs` pulls in, but both are gated
+// on `oci-image` since that's what makes `RafsStore` exist at all.
+#[cfg(feature = "oci-image")]
+mod store_mount;
 
 pub use crate::generated::worker_client::{
     ImageSpec, ImageInfo, ImageStatusResult,
@@ -63,6 +70,8 @@ pub use manifest::{ImageReference, ManifestFetcher, ManifestResult, OciManifest}
 pub use image_fs::{image_fs_for, image_fs_from_rafs, ImageFs};
 #[cfg(feature = "oci-image")]
 pub use store::{GcStats, ImageMetadata, RafsStore};
+#[cfg(feature = "oci-image")]
+pub use store_mount::RafsStoreMount;
 // The trait seam + inventory registration are always available; only the
 // concrete `RafsStore` impl + its `submit!` require `oci-image`.
 pub use store_trait::{ImageBackendRegistration, ImageStore};
