@@ -68,7 +68,7 @@ Multiple agents may share the one checkout at the repo root. That checkout has a
 | `hyprstream-util` | Shared generic utility primitives (TTL cache, etc.) |
 | `hyprstream-service` | Pluggable service orchestration (spawner, factory, manager, trust store) |
 | `hyprstream-discovery` | Service discovery and endpoint resolution |
-| `hyprstream-workers` | Kata-based worker isolation |
+| `hyprstream-workers` | Worker isolation: pluggable sandbox backends (Kata microVM, rootless OCI/podman, nspawn, WASM) |
 | `hyprstream-workers-wasmtime` | Embedded wasmtime host — sandboxes untrusted wasm guests behind capability profiles |
 | `hyprstream-workers-tcl` | Tcl (molt) shell for the hyprstream VFS namespace |
 | `hyprstream-workers-python` | RustPython engine + `/lang/python` 9P shell over the wasmtime sandbox |
@@ -166,7 +166,7 @@ ZMQ/ZeroMQ is **gone**. RPC uses ZMTP 3.1 *framing* (the wire serialization only
 - `crates/hyprstream-rpc/schema/` — `common.capnp` (envelopes, identity, claims), `streaming.capnp`, `events.capnp`, `annotations.capnp`, `nine.capnp` (9P bridge), `optional.capnp`
 - `crates/hyprstream-rpc-std/schema/` — `registry.capnp`, `model.capnp`, `policy.capnp`, `mcp.capnp`, `oauth.capnp`, `inference.capnp`, `metrics.capnp`, `chat_core.capnp`, `service_events.capnp`
 - `crates/hyprstream/schema/` — `tui.capnp`, `compositor_ipc.capnp`
-- `crates/hyprstream-workers/schema/` — `worker.capnp`
+- `crates/hyprstream-workers/schema/` — `worker.capnp`, `workflow.capnp`
 
 ### Key RPC Types (`crates/hyprstream-rpc/src/`)
 
@@ -255,7 +255,7 @@ cargo test -p hyprstream storage::adapter_manager
 cargo build --release
 cargo test --workspace
 cargo run --bin hyprstream -- --help
-cargo run --bin hyprstream serve --port 8080
+cargo run --bin hyprstream service start
 cargo fmt --all
 cargo clippy --all-targets --all-features
 ./appimage/build-appimage.sh build rocm71
@@ -263,7 +263,7 @@ cargo clippy --all-targets --all-features
 
 ## Docs
 
-See: `README.md`, `DEVELOP.md`, `CONTRIBUTING.md`, `crates/git2db/CLAUDE.md`, `docs/` (quickstart, vfs, workers-architecture, rpc-architecture, cryptography-architecture, eventservice-architecture, service-runtime-architecture, streaming-service-architecture, tool calling, KV cache), and the architecture talk: https://talks.cyberdione.ai/hyprstream-wanix
+See: `README.md`, `DEVELOP.md`, `CONTRIBUTING.md`, `crates/git2db/CLAUDE.md`, `docs/` (quickstart, vfs, mac-architecture, workers-architecture, rpc-architecture, cryptography-architecture, eventservice-architecture, service-runtime-architecture, streaming-service-architecture, tui-architecture, tool calling, KV cache), and the architecture talk: https://talks.cyberdione.ai/hyprstream-wanix
 
 ## Licensing
 

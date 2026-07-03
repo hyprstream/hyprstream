@@ -1,6 +1,7 @@
 # Streaming Service Architecture
 
-moq-lite streaming plane with HMAC-chained end-to-end authentication.
+moq-lite streaming plane with HMAC-chained end-to-end authentication and
+transport-level AEAD.
 
 ## Overview
 
@@ -9,31 +10,40 @@ moq-lite streaming plane with HMAC-chained end-to-end authentication.
 │                         STREAMING PLANE                                      │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
-│  InferenceService              moq-lite Origin            Client            │
+│  InferenceService              MoqStreamOrigin             Client            │
 │       │                             │                        │              │
 │       │─ infer_stream (RPC) ────────────────────────────────►│              │
-│       │◄─ {stream_id, moq_uds_path, moq_broadcast_path} ─────┤              │
+│       │◄─ StreamInfo {streamId, dhPublic, qos,               │              │
+│       │              broadcastPath, announcedAt} ────────────┤              │
 │       │                             │                        │              │
 │       │  derive DH keys             │                        │              │
 │       │  topic = DH-derived hex     │                        │              │
 │       │                             │                        │              │
 │       │─ publish(broadcast_path) ──►│                        │              │
-│       │   [token chunks, HMAC]      │                        │              │
+│       │   [StreamBlocks, HMAC]      │                        │              │
+│       │                             │◄─ subscribe ───────────┤              │
+│       │                             │   (UDS same-host, or   │              │
+│       │                             │    dial announcedAt)   │              │
 │       │                             │                        │              │
-│       │                             │◄─ subscribe(UDS) ──────┤              │
-│       │                             │   [broadcast_path]     │              │
-│       │                             │                        │              │
-│       │                             │─ chunk ───────────────►│              │
-│       │                             │─ chunk ───────────────►│[verify HMAC] │
-│       │                             │─ StreamComplete ───────►│              │
+│       │                             │─ block ───────────────►│              │
+│       │                             │─ block ───────────────►│[verify HMAC] │
+│       │                             │─ complete ────────────►│              │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The old ZMQ PUSH/PULL → XPUB/XSUB `StreamService` was removed in epic #131/#138. The
-current streaming plane is moq-lite: InferenceService publishes to the process-global
-`MoqEventOrigin`; clients subscribe via a UDS connection to the moq socket and receive
-chunks through `MoqStreamHandle`.
+The streaming plane is moq-lite: InferenceService publishes to the
+process-global `MoqStreamOrigin` (`crates/hyprstream-rpc/src/moq_stream.rs`);
+clients subscribe — via UDS on the same host, or by dialing a network reach —
+and receive blocks through `MoqStreamHandle`. (The former ZMQ PUSH/PULL →
+XPUB/XSUB `StreamService` was removed in epic #131/#138.)
+
+Two distinct MoQ origins exist per process — do not conflate them:
+
+| Origin | Purpose |
+|--------|---------|
+| `MoqStreamOrigin` (`moq_stream.rs`) | Point-to-point token/data streaming: one producer, one consumer, DH-derived keys |
+| `MoqEventOrigin` (`moq_event.rs`) | Broadcast fan-out event bus — see [EventService Architecture](./eventservice-architecture.md) |
 
 ## Security Model (E2E Authentication)
 
@@ -45,25 +55,35 @@ The moq origin is a **blind router** — it does NOT verify HMACs.
 | **moq-lite Origin** | Routes by broadcast path, buffers for late subscribers |
 | **Client** | Derives same DH keys via ephemeral pubkey, verifies HMAC chain |
 
-### Shared Signing Key
+### Signing Keys
 
-All services use the **same Ed25519 signing key** loaded from:
-```
-~/.local/share/hyprstream/models/.registry/keys/signing.key
-```
+The node signing key resolves via `HyprConfig::resolve_secrets_dir()` to
+`<secrets_dir>/signing-key` (generated on first startup if absent; see
+`load_or_generate_signing_key` in `crates/hyprstream/src/cli/policy_handlers.rs`).
+A `HYPRSTREAM__SIGNING_KEY` / `config.signing_key` test bypass takes precedence.
 
-This key is:
-- **Generated once** on first startup (32 bytes, persisted)
-- **Loaded by all services** (systemd units and CLI)
-- **Used for both requests and responses** (bidirectional authentication)
+Services do **not** share one key. `ServiceContext::service_signing_key(name)`
+(`crates/hyprstream-service/src/service/factory.rs`) resolves a per-service key:
+
+1. Independent per-service keypair from the registry (generated in inproc
+   mode; loaded from the service's own credentials in multi-process/IPC mode)
+2. PolicyService special case — it IS the CA and uses the root key
+3. `"multi"` fallback — multi-service IPC mode shares one key across the
+   co-located services
+
+Each service registers its verifying key with the trust store
+(`hyprstream-service::service::trust_store`) via a CA-signed JWT; verifiers
+resolve a signer pubkey back to a service identity through that store.
 
 ### Security Properties
 
 | Property | Implementation |
 |----------|----------------|
-| **Topic unpredictability** | DH-derived (InferenceService ↔ Client ephemeral key) |
-| **Response auth** | ResponseEnvelope with Ed25519 signature (mandatory) |
-| **Data integrity** | Chained HMAC-SHA256 verified end-to-end by client |
+| **Topic unpredictability** | DH-derived (InferenceService ↔ Client ephemeral Ristretto255 keys) |
+| **Response auth** | ResponseEnvelope with hybrid COSE composite signature (EdDSA + ML-DSA-65, mandatory) — authenticates `dhPublic` and the QoS contract at PQ strength (#275) |
+| **Data integrity** | Chained HMAC verified end-to-end by client |
+| **Data confidentiality** | Transport AEAD: payloads sealed under the DH-derived `enc_key` (AES-256-GCM, #321) |
+| **QoS integrity** | `StreamOpt` carried inside the signed StreamInfo; clients MUST enforce it |
 | **Stream binding** | Claims scope: `publish:stream:{topic}` in StreamInfo |
 | **Replay protection** | Nonce cache on SignedEnvelope (RPC layer) |
 
@@ -81,7 +101,7 @@ Request Flow:
 │    │                                     [verify]   │      │
 │    │                                     [process]  │      │
 │    │◄── ResponseEnvelope ──────────────────────────│      │
-│    │       [signed with server's key]               │      │
+│    │       [COSE composite, service's key]          │      │
 │    │  [verify]                                      │      │
 └────────────────────────────────────────────────────────────┘
 ```
@@ -91,258 +111,252 @@ Request Flow:
 ### 1. Client Initiates Inference Stream
 
 Client calls `infer_stream` via the generated RPC client. The request carries an
-ephemeral X25519 public key for DH key exchange:
+ephemeral Ristretto255 public key for DH key exchange:
 
 ```
 RequestEnvelope {
     payload: InferStreamRequest { model, prompt, ... },
-    ephemeral_pubkey: [32 bytes],  // Client's X25519 public key
+    ephemeral_pubkey: [32 bytes],  // Client's ephemeral DH public key
 }
 ```
 
-### 2. InferenceService Responds with moq Paths
+### 2. InferenceService Responds with StreamInfo
 
-InferenceService derives shared stream keys and returns the moq subscription info:
+InferenceService derives the shared stream keys and returns `StreamInfo`
+(schema: `crates/hyprstream-rpc/schema/streaming.capnp`):
 
-```rust
-// Server-side key derivation
-let (topic, mac_key) = derive_client_stream_keys(
-    &server_ephemeral_sk,
-    &request.ephemeral_pubkey,
-    request_id,
-)?;
-
-// StreamInfo returned in RPC response
-StreamInfo {
-    stream_id: uuid,
-    moq_uds_path: global_moq_uds_path(),       // /tmp/hyprstream-{pid}/moq.sock
-    moq_broadcast_path: format!("streams/{topic}"),
-    // endpoint field is empty (reserved, formerly ZMQ address)
+```capnp
+struct StreamInfo {
+  streamId      @0 :Text;    # Unique stream identifier ("stream-{uuid}")
+  dhPublic      @1 :Data;    # Server's ephemeral Ristretto255 public key (32 bytes)
+  qos           @2 :StreamOpt;           # Service-declared QoS contract
+  broadcastPath @3 :Text;    # e.g. "local/streams/{topic_hex}"
+  announcedAt   @4 :List(Destination);   # Network reaches for the moq plane (#274)
 }
 ```
+
+There is no UDS path or endpoint on the wire. Same-host clients resolve the
+moq socket locally via `global_moq_uds_path()`; remote clients dial one of the
+`announcedAt` reaches. The enclosing ResponseEnvelope's hybrid COSE composite
+signature authenticates `dhPublic` and the QoS contract.
+
+Key derivation (`derive_stream_keys`, `crypto/key_exchange.rs`) produces from
+the DH shared secret: `topic` (64 hex chars), `mac_key` (HMAC chain),
+`enc_key` (transport AEAD, #321), plus a control-channel topic and MAC key.
+
+### QoS: StreamOpt (client-enforced contract)
+
+`StreamOpt` (#213) is the service-declared delivery/integrity contract, carried
+inside the signed StreamInfo. Five axes:
+
+| Axis | Options (fail-closed `@0` default first) |
+|------|------------------------------------------|
+| `ordering` | `ordered` (gap = fatal) / `unordered { antiReplayWindow }` |
+| `delivery` | `atMostOnce` / `atLeastOnce { dedupWindow, resumable }` |
+| `completion` | `endOfStream` (terminal frame required before EOF — EOF without one is a truncation attack) / `none` |
+| `retention` | `live` / `blocks(N)` / `seconds(N)` — relay late-join buffer |
+| `overflowPolicy` | `block` (lossless backpressure) / `dropOldest { highWaterMark }` |
+
+The service asserts the contract it will enforce; **clients MUST enforce the
+same options on ingress and MUST disconnect rather than silently downgrade**
+if they cannot honour a received option (see `StreamVerifier::with_policy`).
+Named Rust presets (`Job`, `Log`, `Pipe`) live in `hyprstream_rpc::stream_info`.
+
+### Network reaches: Destination (#274)
+
+Each `Destination` is one way to reach the moq plane for this stream:
+
+```capnp
+struct Destination {
+  role      @0 :Role;             # direct (the producer itself) | relay
+  transport @1 :TransportConfig;  # union: quic (QuicReach) | iroh (IrohReach)
+}
+```
+
+Only network-routable reaches are encoded; same-host endpoints
+(`inproc`/`ipc`/UDS) are never carried on the wire — a co-located caller
+resolves them from local config. An empty reach list means "co-located fast
+path only". The node's own reach parameters come from one process-global
+source (`NodeStreamReach`, set when the QUIC server binds), so every
+StreamInfo producer publishes the same reach list.
 
 ### 3. Client Connects via MoqStreamHandle
 
-```rust
-let handle = MoqStreamHandle::new(
-    stream_info.moq_uds_path,
-    stream_info.moq_broadcast_path,
-    mac_key,   // Derived from same DH exchange
-    stream_id,
-).await?;
+Generated clients call `MoqStreamHandle::networked` (`moq_stream.rs`):
 
-// Async iteration
+```rust
+let handle = MoqStreamHandle::networked(
+    stream_info.announced_at,   // reaches — source of truth for where the stream lives
+    &stream_info.qos,           // signed StreamOpt: selects direct-vs-relay topology (#358)
+    stream_info.broadcast_path,
+    mac_key,                    // derived from the same DH exchange
+    enc_key,
+    topic,
+);
+
 while let Some(payload) = handle.recv_next().await? {
     match payload {
-        StreamPayload::Token(text) => process_token(text),
-        StreamPayload::Complete(stats) => break,
+        StreamPayload::Data(bytes) => process(bytes),
+        StreamPayload::Complete(meta) => break,
         StreamPayload::Error(e) => return Err(e.into()),
+        _ => {}
     }
 }
 ```
 
-`MoqStreamHandle` implements `futures::Stream` and handles:
-- UDS connection to moq socket
-- moq subscription on `broadcast_path`
-- Per-chunk HMAC-SHA256 chain verification
-- Cancellation via `cancel()` / `cancel_token()`
+The constructor is synchronous; it spawns the background receive task and
+resolves the transport internally:
 
-### 4. InferenceService Publishes Chunks
+- **Networked reach preferred**: the producer's reach is the source of truth.
+  QoS selects topology (`select_reach`, #358): relay-first for
+  retained/resumable streams, direct-first for live pipes — a stable reorder
+  of the service-advertised reaches only (the client never invents a reach).
+- **Local UDS fallback**: only when StreamInfo carries no dialable reach, the
+  handle falls back to this process's moq plane via `global_moq_uds_path()`
+  (UDS-only / test deployments). The local plane is never preferred over a
+  reach — it only carries the producer's broadcast if the producer is
+  co-located in the same process (#275).
+- Neither available → the handle surfaces a clear error.
 
-While the RPC response is sent immediately (with the moq paths), InferenceService
-runs token generation in the background and publishes each token chunk:
+`MoqStreamHandle::new(uds_path, broadcast_path, mac_key, enc_key, topic)` is
+the direct same-host constructor. Both implement `futures::Stream` and handle
+per-block HMAC-chain verification, AEAD decryption, and cancellation via
+`cancel()` / `cancel_token()`.
 
-```rust
-let mut hmac = ChainedStreamHmac::new(mac_key, request_id);
-for token in generate_tokens(...) {
-    let mac = hmac.compute_next(&token);
-    let chunk = StreamChunk { topic: topic.clone(), data: token, hmac: mac };
-    moq_origin.publish(&broadcast_path, serialize(&chunk)).await?;
-}
+### 4. InferenceService Publishes Blocks
 
-// Completion marker
-moq_origin.publish(&broadcast_path, serialize(&StreamComplete { stats })).await?;
-```
+The RPC response (with StreamInfo) is sent immediately; token generation runs
+in the background. The producer side is `StreamChannel::publisher(&ctx)`
+(`streaming.rs`), which appends into the global `MoqStreamOrigin`, batching
+payloads into HMAC-chained `StreamBlock`s and sealing Data/Complete payloads
+under `enc_key`.
 
 ## Message Types
 
 **Schema:** `crates/hyprstream-rpc/schema/streaming.capnp`
 
-### StreamChunk (Single Payload)
+### StreamBlock (the wire unit)
 
-Self-contained message with HMAC embedded in capnp structure.
+Each moq track object is a serialized `StreamBlock` with a 16-byte truncated
+HMAC appended:
 
 ```capnp
-struct StreamChunk {
-    topic    @0 :Text;       # DH-derived hex string
-    data     @1 :Data;       # Serialized StreamPayload
-    hmac     @2 :Data;       # Chained HMAC-SHA256 (32 bytes)
-    prevHmac @3 :Data;       # Previous chunk HMAC (empty for first)
+struct StreamBlock {
+    prevMac        @0 :Data;                 # topic[..16] for block 0, mac_{n-1} after
+    payloads       @1 :List(StreamPayload);  # Batched payloads
+    sequenceNumber @2 :UInt64;   # Producer-assigned monotonic counter (= moq Group id);
+                                 # resume/dedup offset and anti-replay/ordering anchor (#219)
+    epoch          @3 :UInt64;   # Key-epoch; bumps on re-key/producer restart (#223)
+    provenance     @4 :Data;     # Optional per-host hybrid COSE signature (#321):
+                                 # proves WHICH mesh host produced the block
 }
 ```
 
-**MAC Chain:**
+**MAC chain:**
 ```
-mac_0 = HMAC(mac_key, topic_bytes || data_0)       // First chunk
-mac_n = HMAC(mac_key, mac_{n-1} || data_n)         // Subsequent chunks
+mac_0 = HMAC(mac_key, topic_bytes || segments)[..16]     // First block
+mac_n = HMAC(mac_key, mac_{n-1}  || segments)[..16]      // Subsequent blocks
 ```
 
-### StreamBlock (Batched Payloads)
-
-Batched format for high-throughput paths. Wire format:
-
-```
-Frame 0:      topic (DH-derived hex string)
-Frame 1..N-1: capnp segments (StreamBlock struct)
-Frame N:      mac (16 bytes, truncated HMAC-SHA256)
-
-StreamBlock {
-    prevMac:  Data;                    # topic[..16] for block 0, mac_{n-1} for block N
-    payloads: List(StreamPayload);     # Multiple payloads batched
-}
-```
+The MAC covers the whole serialized block, so `sequenceNumber`/`epoch` are
+authenticated implicitly. Consumer ordering/replay enforcement (gap-fatal vs
+per-Group media) is selected by the stream's `StreamOpt`.
 
 ### StreamPayload (Content)
 
-The actual content inside `StreamChunk.data` or `StreamBlock.payloads`:
-
 ```capnp
 struct StreamPayload {
-    streamId @0 :Text;       # Stream identifier for correlation
-
     union {
-        token     @1 :Text;          # Generated token text
-        complete  @2 :StreamStats;   # Completion with stats
-        error     @3 :StreamError;   # Error during generation
-        heartbeat @4 :Void;          # Keep-alive
+        data      @0 :Data;           # Generic binary payload (tokens, I/O, etc.)
+        complete  @1 :Data;           # App-specific completion metadata (serialized)
+        error     @2 :StreamError;    # Error during streaming
+        heartbeat @3 :Void;           # Keep-alive
+        tagged    @4 :TaggedPayload;  # Encrypted tagged payload with key commitment
     }
 }
 ```
 
-#### StreamStats (Completion)
+### StreamError
 
 ```capnp
-struct StreamStats {
-    tokensGenerated  @0 :UInt32;
-    finishReason     @1 :Text;     # "stop", "length", "eos", "error"
-    generationTimeMs @2 :UInt64;
-    tokensPerSecond  @3 :Float32;
-    perplexity       @4 :Float32;
-    avgEntropy       @5 :Float32;
+struct StreamError {
+    message @0 :Text;
+    code    @1 :Text;    # "timeout", "cancelled", "internal", etc.
+    details @2 :Text;
 }
 ```
 
-### StreamInfo (in RPC response)
+### StreamControl (Consumer → Producer)
 
-Returned by streaming RPC calls to tell the client where to subscribe:
+Cancellation and keep-alive travel on a separate DH-derived control channel
+(`ctrl_topic` / `ctrl_mac_key`):
 
 ```capnp
-struct StreamInfo {
-    streamId         @0 :Text;   # UUID for correlation
-    endpoint         @1 :Text;   # Reserved (empty on moq paths)
-    serverPubkey     @2 :Data;   # Server's ephemeral X25519 public key
-    moqUdsPath       @4 :Text;   # /tmp/hyprstream-{pid}/moq.sock
-    moqBroadcastPath @5 :Text;   # streams/{topic}
+struct StreamControl {
+    union {
+        cancel @0 :Void;
+        ping   @1 :Void;
+    }
 }
 ```
-
-## MoqStreamHandle
-
-**Location:** `crates/hyprstream-rpc/src/moq_stream.rs`
-
-```rust
-pub struct MoqStreamHandle {
-    // internal: background task + channel
-}
-
-impl MoqStreamHandle {
-    /// Connect to moq origin and subscribe to broadcast_path.
-    pub async fn new(
-        uds_path: impl AsRef<Path>,
-        broadcast_path: impl Into<String>,
-        mac_key: [u8; 32],
-        stream_id: String,
-    ) -> Result<Self>;
-
-    /// Receive next verified payload.
-    pub async fn recv_next(&mut self) -> Result<Option<StreamPayload>>;
-
-    /// Signal cancellation to the background task.
-    pub fn cancel(&self);
-
-    /// Get a CancellationToken for integration with tokio-util.
-    pub fn cancel_token(&self) -> CancellationToken;
-
-    /// Stream ID for correlation.
-    pub fn stream_id(&self) -> &str;
-}
-
-impl futures::Stream for MoqStreamHandle {
-    type Item = Result<StreamPayload>;
-    // ...
-}
-```
-
-The background task:
-1. Opens a UDS connection to `moq_uds_path`
-2. Issues a moq SUBSCRIBE for `broadcast_path`
-3. For each received object, deserializes and verifies the HMAC chain
-4. Sends verified `StreamPayload` values to the foreground via `mpsc`
-5. Terminates on `cancel()`, connection close, or `StreamComplete`
 
 ## moq-lite Origin
 
 **Location:** `crates/hyprstream-rpc/src/moq_stream.rs`
 
-The process-global origin is initialized at startup:
+Every process that publishes moq streams initializes its own process-global
+`MoqStreamOrigin` at startup — the `streams` service factory, or (in
+multi-process deployments) `init_local_moq_stream_plane` in any
+stream-publisher service's factory (both idempotent):
 
 ```rust
-// Startup: initialize origin + start UDS listener
-let origin = init_global_moq_origin().await?;
-serve_moq_uds_background(origin.clone(), shutdown.clone()).await?;
+// Startup (streams service factory): register origin + start UDS listener.
+// Both functions are synchronous.
+let origin = MoqStreamOrigin::standalone()...build();
+init_global_moq_origin(origin.clone());          // fn(MoqStreamOrigin) -> bool (idempotent)
+serve_moq_uds_background(origin, moq_uds_path);  // fn(MoqStreamOrigin, PathBuf)
 
 // From anywhere in the process
 let uds_path = global_moq_uds_path()
     .ok_or_else(|| anyhow!("moq not initialized"))?;
 ```
 
-The UDS listener accepts external connections (from clients in the same host,
-including subprocess workers) and forwards moq SUBSCRIBE/PUBLISH frames to the
-in-process origin.
+`serve_moq_uds_background` binds the socket synchronously (mode `0o600`,
+peer-credential checked) before publishing the path, so any caller reading
+`global_moq_uds_path()` is guaranteed the socket is ready. Each accepted UDS
+connection gets a dedicated moq server session sharing the same live broadcast
+tree, serving cross-process local subscribers (e.g. `hyprstream tui attach`).
 
 ## Memory Management
 
 | Mechanism | Trigger | Action |
 |-----------|---------|--------|
-| Stream completion | `StreamComplete` published | Background task exits |
-| Cancellation | `handle.cancel()` | Background task exits |
-| Connection close | UDS peer disconnect | Background task exits |
-| moq buffer limit | Configurable | moq-lite drops oldest cached objects |
+| Stream completion | `complete`/`error` payload | Background task exits |
+| Cancellation | `handle.cancel()` or StreamControl `cancel` | Background task exits |
+| Connection close | UDS/QUIC peer disconnect | Background task exits |
+| Relay retention | `StreamOpt::retention` | moq-lite drops per policy |
 
-The moq origin does not implement per-stream TTLs; streams are expected to complete
-or be cancelled by the client. The `MoqEventBarrierService` holds the origin alive
-for the process lifetime.
+The moq origin does not implement per-stream TTLs; streams are expected to
+complete or be cancelled. The origin lives in a process-global `OnceLock` for
+the process lifetime.
 
 ## Integration with Generated Clients
 
-Codegen (`hyprstream-rpc-derive`) generates streaming methods that return `MoqStreamHandle`:
+Codegen (`hyprstream-rpc-derive`) generates streaming methods that return
+`MoqStreamHandle` via the networked constructor:
 
 ```rust
 // Generated client method (simplified)
 impl InferenceClient {
-    pub async fn infer_stream(
-        &self,
-        request: InferStreamRequest,
-    ) -> Result<MoqStreamHandle> {
+    pub async fn infer_stream(&self, request: InferStreamRequest) -> Result<MoqStreamHandle> {
         let (ephemeral_sk, ephemeral_pk) = generate_ephemeral_keypair();
         let info: StreamInfo = self.call_rpc(request, ephemeral_pk).await?;
 
-        if info.moq_uds_path.is_empty() {
-            bail!("Server did not provide moq transport path — moq transport not initialized");
-        }
-
-        let mac_key = derive_client_stream_keys(&ephemeral_sk, &info.server_pubkey, ...)?;
-        MoqStreamHandle::new(info.moq_uds_path, info.moq_broadcast_path, mac_key, info.stream_id).await
+        let keys = derive_stream_keys(&dh(&ephemeral_sk, &info.dh_public), ...)?;
+        Ok(MoqStreamHandle::networked(
+            info.announced_at, &info.qos, info.broadcast_path,
+            keys.mac_key, keys.enc_key, keys.topic,
+        ))
     }
 }
 ```
@@ -351,11 +365,13 @@ impl InferenceClient {
 
 | File | Purpose |
 |------|---------|
-| `crates/hyprstream-rpc/src/moq_stream.rs` | `MoqStreamHandle`, `MoqEventOrigin`, UDS server |
-| `crates/hyprstream-rpc/src/moq_event.rs` | `MoqEventBarrierService`, event bus |
+| `crates/hyprstream-rpc/src/moq_stream.rs` | `MoqStreamOrigin`, `MoqStreamHandle`, UDS server, reach selection |
+| `crates/hyprstream-rpc/src/streaming.rs` | `StreamChannel`, `StreamContext`, `StreamVerifier`, block encoding |
+| `crates/hyprstream-rpc/src/stream_info.rs` | `StreamInfo`, `StreamOpt`, `Destination`, presets |
+| `crates/hyprstream-rpc/src/moq_event.rs` | `MoqEventOrigin` — the separate broadcast event bus |
 | `crates/hyprstream-rpc/schema/streaming.capnp` | Cap'n Proto schema |
 | `crates/hyprstream-rpc/src/crypto/hmac.rs` | Chained HMAC for verification |
-| `crates/hyprstream-rpc/src/crypto/key_exchange.rs` | DH key derivation |
+| `crates/hyprstream-rpc/src/crypto/key_exchange.rs` | DH key derivation (`derive_stream_keys`) |
 | `crates/hyprstream-rpc-derive/src/codegen/client.rs` | Generated streaming client methods |
 
 ## Related Documentation

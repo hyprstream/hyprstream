@@ -34,28 +34,45 @@ It's a closed loop you can audit and reverse at any step:
 
 Models, inference streams, MCP tools, repositories, and even **sandboxed applications** are all just files in a composable namespace. Want to run a model? Open it. Stream tokens? Read a file under `/stream/`. Drive a service? Write its `ctl` file. And you compose all of it from a **sandboxed, Unix-like shell** — `cat`, pipes, and a real scripting language — the same interface humans and agents use to drive models, tools, and apps. Give an agent a tool, or run an untrusted app, and it's a file you mount, scope, and revoke.
 
-This Plan 9-inspired design (see [docs/vfs.md](docs/vfs.md)) gives one uniform interface for everything and per-process namespaces for true isolation. In the browser, HyprStream's WASM clients run as **[Wanix](https://github.com/tractordev/wanix) tasks**, and the VFS mounts Wanix's filesystem over 9P — so the *same* namespace spans your host and the browser. **Application sandboxing** is built in two ways: native workloads run in Kata microVMs ([docs/workers-architecture.md](docs/workers-architecture.md)); browser apps and agent tool-calls run as capability-limited Wanix WASM tasks (WASI, no ambient network) — each reachable as files, but unable to touch anything you didn't mount for it. Composable, network-transparent, capability-scoped.
+This Plan 9-inspired design (see [docs/vfs.md](docs/vfs.md)) gives one uniform interface for everything and per-process namespaces for true isolation. In the browser, HyprStream's WASM clients run as **[Wanix](https://github.com/tractordev/wanix) tasks**, and the VFS mounts Wanix's filesystem over 9P — so the *same* namespace spans your host and the browser. Composable, network-transparent, capability-scoped.
+
+### 📦 Sandboxed tasks: containers, microVMs, and WASM
+
+Untrusted code — agent tool-calls, user apps, CI workflows — runs in **workers**: isolated tasks projected into the namespace as a Plan 9-style process tree (`/exec/instances/<id>/ctl`) that you drive like any other file. One task API, four isolation backends, selected automatically and **fail-closed**:
+
+- **Kata microVMs** (cloud-hypervisor) — hardware-virtualized isolation for the truly untrusted
+- **OCI containers** (rootless Podman) — standard images, no daemon, no root
+- **systemd-nspawn** — lightweight OS containers
+- **WASM** (wasmtime) — capability-limited execution, no ambient network; the same sandbox browser apps get as Wanix tasks
+
+Language engines run *inside* the sandbox family: a locked-down **Tcl shell** for the VFS, **Python** (RustPython over the wasmtime sandbox, mounted at `/lang/python`), and raw **wasmtime** capability profiles. A sandbox is reachable as files, but can't touch anything you didn't mount for it. See [docs/workers-architecture.md](docs/workers-architecture.md).
 
 ### 🌐 Share models, tools, and files across nodes
 
 Federation turns isolated servers into one network. Use a model another node hosts, call an **MCP tool** a peer publishes, or mount a remote **filesystem** or live stream — addressed by its owner's cryptographic identity and used **as if it were local.** An agent on your node can reach tools, weights, and namespaces anywhere on the fabric, every call policy-gated. No brittle URLs or per-host API keys: resources are portable and verifiable (atproto `did:web`/`did:key` + `at://` handles), reached over QUIC/WebTransport or direct peer-to-peer (iroh). It's **off by default** — opt in with the setup wizard.
 
+### 🔒 Security that fails closed
+
+Zero-trust and **post-quantum-ready** by default: every RPC rides a COSE **hybrid-signed envelope** (Ed25519 + ML-DSA-65), streams and events are encrypted end to end so a forwarding relay never sees plaintext, and authorization is deny-by-default — Casbin policy plus **UCAN capability delegation**. Beneath all of it, a **label-based mandatory access control** layer — security labels compiled from capability grants into a hybrid-PQC-signed policy matrix, backed by a tamper-evident audit chain — is rolling out as the floor no policy grant can bypass. See [Security & Authentication](#security--authentication) and [docs/mac-architecture.md](docs/mac-architecture.md).
+
 ### ⚡ Runs on your hardware
 
 One binary, any accelerator. The **Universal AppImage** auto-detects and loads the right backend — **NVIDIA CUDA**, **AMD ROCm** (including gfx1151 / Strix Halo), or CPU — with per-process GPU selection and no CUDA/ROCm toolchain juggling. Also packaged as a multi-variant **Nix flake** (CPU / CUDA / ROCm). Built on the stable PyTorch C++ API (libtorch).
 
+Runs the **Llama 1/2/3, Gemma, Qwen3 (dense), Qwen3.5 (dense and MoE), and Janus (multimodal)** model families, cloned straight from HuggingFace or any Git remote.
+
 ### Also includes
 
-- **Collaborative TUI** — a high-speed compositing multiplexer; share terminals live with teammates and agents.
-- **OpenAI-compatible API** — drop-in `/v1/chat/completions` for existing tools and client libraries.
+- **Paged KV cache** — prefix caching and reuse, paged attention blocks, blockwise quantization, and CPU offload with transparent GPU restore.
+- **Collaborative TUI** — a high-speed compositing multiplexer; share terminals live with teammates and agents. The same ratatui apps run natively and in the browser (WASI) via waxterm.
+- **OpenAI-compatible API** — drop-in `/v1/chat/completions` for existing tools and client libraries, with multi-format tool calling (Qwen, Llama, Mistral) and parallel tool calls.
 - **MCP server** — expose inference, model management, and repo ops as tools for Claude Code, Cursor, etc.
-- **Post-quantum security** — COSE hybrid-signed RPC (Ed25519 + ML-DSA-65), Casbin policy, OIDC/atproto identity.
-- **Git-native weights** — models and source tracked with Git; HuggingFace-compatible.
+- **MoQ streaming fabric** — token streams, events, and container I/O ride Media-over-QUIC with QoS presets; the event bus is group-key encrypted (AES-256-GCM) end to end.
+- **Git-native weights** — models and source tracked with Git; HuggingFace-compatible, with XET large-file storage.
 - **Systemd integration** — optional user-level management for background workers and long-running services.
 
 ### Experimental Features
 
-- **[Workers](docs/workers-architecture.md)** — isolated workload execution using Kata microVMs with cloud-hypervisor.
 - **[Workflows]** — Git workflow files for local CI/CD and functions-as-a-service.
 - **[Metrics]** — structured knowledge engine + time-series database powered by DuckDB, ADBC, and Flight.
 
@@ -118,7 +135,7 @@ Hyprstream can run inside containers. See [README-Docker.md](README-Docker.md) f
 
 ### Clone a model
 
-Hyprstream runs Qwen3 / Qwen3.5 (dense and MoE) models cloned from Git repositories (HuggingFace, GitHub, etc.).
+Hyprstream runs models cloned from Git repositories (HuggingFace, GitHub, etc.) — Llama, Gemma, Qwen3, Qwen3.5, and Janus families.
 
 ```bash
 # Clone a model
@@ -144,7 +161,7 @@ hyprstream quick info qwen3-small:main
 ### Run inference
 
 ```bash
-# Basic inference
+# Basic inference (streams by default; pass --sync for a single response)
 hyprstream quick infer qwen3-small:main \
     --prompt "Explain quantum computing in simple terms"
 
@@ -165,7 +182,8 @@ HyprStream is organized around a **Plan 9-inspired virtual filesystem** ([docs/v
 - **Streams as files** — token streams, events, and container I/O are read/written under `/stream/`-style mounts with backpressure and at-least-once / lossless QoS presets.
 - **Control via `ctl`** — services are steered by writing their `ctl` file (a Plan 9 idiom), not bespoke management RPCs.
 - **Tools as files** — MCP tools, repositories, and registries appear as files an agent can be granted, scoped to, and revoked from.
-- **Per-process namespaces + sandboxing** — each workload gets its own namespace. Untrusted *native* workloads run in **Kata microVMs** ([docs/workers-architecture.md](docs/workers-architecture.md)); *browser* apps and agent tool-calls run as **Wanix WASM tasks** (WASI, no ambient network). Either way a sandbox is reachable as files but can't touch anything not mounted for it — capability-scoped by construction.
+- **Tasks as files** — sandboxed workloads appear under a `/exec` process tree; write a task's `ctl` file to drive it ([docs/workers-architecture.md](docs/workers-architecture.md)).
+- **Per-process namespaces + sandboxing** — each workload gets its own namespace. Untrusted *native* workloads run in **Kata microVMs** or rootless OCI containers; *browser* apps and agent tool-calls run as **Wanix WASM tasks** (WASI, no ambient network). Either way a sandbox is reachable as files but can't touch anything not mounted for it — capability-scoped by construction.
 - **Wanix bridge** — Wanix's own filesystem mounts into the namespace at `/wanix/` over 9P, so browser and host resources compose into one tree.
 
 The payoff is one abstraction that scales the whole way up: a **distributed filesystem** that is also the **operating system**, the **agentic tool interface**, and — federated across nodes — the substrate for a **network of AIs that learn from each other.** One namespace, all the way up.
@@ -174,7 +192,7 @@ The payoff is one abstraction that scales the whole way up: a **distributed file
 
 Federation lets your node use — and offer — resources across the network instead of being a silo. Because everything is a file in a network-transparent namespace (see above), "remote" resources behave like local ones:
 
-- **Federated models** — run a model another node hosts by its identity/name (`model:branch` or a [MIR](docs/interop/tiles-alignment.md) name); it loads and streams as if it were on your box.
+- **Federated models** — run a model another node hosts by its identity/name (`model:branch`); it loads and streams as if it were on your box.
 - **Federated tools** — an agent on your node can call MCP tools a peer publishes (and you can offer yours), every call policy-checked.
 - **Federated filesystems & streams** — mount a peer's namespace, read its event/token streams, or drive a shared service — composable across hosts.
 - **Identity, not URLs** — everything is addressed by cryptographic identity (`did:web`/`did:key` + `at://` handle), so resources are portable, verifiable, and survive a host moving.
@@ -195,7 +213,7 @@ This applies the `federation-open` policy template. You can also scope it later 
 
 ### Under the hood
 
-Each node publishes an atproto-compatible identity document (`did:web`/`did:key`, `at://` handle, P-256 `#atproto` verification method, PDS-style service entry, and typed transport endpoints). Peers are admitted by a two-stage gate — an origin allowed by policy **and** a connecting key bound to a verification method in the peer's published DID (fail-closed otherwise) — and reached over QUIC/WebTransport or direct peer-to-peer via **iroh + pkarr** (dial by Ed25519 node id alone). See [docs/interop/tiles-alignment.md](docs/interop/tiles-alignment.md).
+Each node publishes an atproto-compatible identity document (`did:web`/`did:key`, `at://` handle, P-256 `#atproto` verification method, PDS-style service entry, and typed transport endpoints). Peers are admitted by a two-stage gate — an origin allowed by policy **and** a connecting key bound to a verification method in the peer's published DID (fail-closed otherwise) — and reached over QUIC/WebTransport or direct peer-to-peer via **iroh + pkarr** (dial by Ed25519 node id alone).
 
 > Built for the open social web: HyprStream speaks atproto end-to-end — identity, admission, and transport — so your models, tools, and files federate with the broader Atmosphere, including atproto-native networks like [tiles.run](https://tiles.run).
 
@@ -207,11 +225,11 @@ Each node publishes an atproto-compatible identity document (`did:web`/`did:key`
 
 ### OpenAI-Compatible REST API
 
-HyprStream provides an OpenAI-compatible API endpoint for easy integration with existing tools and libraries:
+HyprStream provides an OpenAI-compatible API endpoint (port 6789 by default) for easy integration with existing tools and libraries:
 
 ```bash
-# Start API server
-hyprstream server --port 6789
+# Start the services (includes the OpenAI-compatible API)
+hyprstream service start
 
 # List available models (worktree-based)
 curl http://localhost:6789/oai/v1/models
@@ -290,16 +308,15 @@ Use `/mcp`, select `hyprstream`, and select `Authenticate` or `Re-authenticate`.
 
 **3. Available tools:**
 
-Once connected, Claude Code can use hyprstream tools directly:
+Once connected, Claude Code can use hyprstream tools directly (tools are schema-generated as `service.method`):
 
 | Tool | Description |
 |------|-------------|
-| `model.load` | Load a model for inference |
-| `model.list` | List loaded models |
-| `model.status` | Get model status and memory usage |
-| `registry.list` | List all cloned repositories |
-| `registry.clone` | Clone a model from HuggingFace/GitHub |
-| `repo.*` | Branch, worktree, merge, and tag operations |
+| `model.load` / `model.unload` / `model.status` | Load, unload, and inspect models |
+| `infer.*` | Run (streaming) inference |
+| `ttt.*` | Drive test-time training: init, train, status, export |
+| `registry.list` / `registry.clone` | List and clone model repositories |
+| `registry.repo.*` | Branch, worktree, merge, and tag operations |
 | `policy.*` | Policy checks and token management |
 
 **Configuration:**
@@ -322,7 +339,6 @@ HyprStream can be configured via environment variables with the `HYPRSTREAM_` pr
 # Server configuration
 export HYPRSTREAM_SERVER_HOST=0.0.0.0
 export HYPRSTREAM_SERVER_PORT=6789
-export HYPRSTREAM_API_KEY=your-api-key
 
 # CORS settings
 export HYPRSTREAM_CORS_ENABLED=true
@@ -331,11 +347,9 @@ export HYPRSTREAM_CORS_ORIGINS="*"
 # Model management
 export HYPRSTREAM_PRELOAD_MODELS=model1,model2,model3
 export HYPRSTREAM_MAX_CACHED_MODELS=5
-export HYPRSTREAM_MODELS_DIR=/custom/models/path
 
 # Performance tuning
 export HYPRSTREAM_USE_MMAP=true
-export HYPRSTREAM_GENERATION_TIMEOUT=120
 ```
 
 ## Security & Authentication
@@ -349,21 +363,22 @@ Hyprstream implements layered, zero-trust, **post-quantum-ready** security.
 | **Transport** | QUIC / WebTransport + iroh (TLS / Noise) | Encrypted, NAT-traversing transport for browsers, hosts, and P2P peers |
 | **Application** | COSE hybrid-signed envelopes (Ed25519 + ML-DSA-65) | Request authentication + integrity with post-quantum signatures |
 | **Identity** | atproto `did:web`/`did:key` + federation admission | Identity-bound peering (origin policy + DID-key binding) |
-| **Authorization** | Casbin policy engine | RBAC/ABAC access control, deny-by-default |
-| **Isolation** | Kata Containers (optional) | microVM-level workload isolation for workers |
+| **Authorization** | Casbin policy engine + UCAN capability delegation | RBAC/ABAC access control, attenuated delegation chains, deny-by-default |
+| **Mandatory floor** | Label-based MAC ([docs/mac-architecture.md](docs/mac-architecture.md)) | Security labels compiled from grants into a hybrid-PQC-signed policy matrix, tamper-evident audit chain; fails closed (enforcement wiring in rollout) |
+| **Isolation** | Kata microVMs / rootless OCI / nspawn / WASM | Sandboxed workload execution for workers and tool calls |
 
 ### RPC & streaming architecture
 
 Inter-service and inter-node communication runs over **moq-net** (moq-lite streaming) and **iroh**, with Cap'n Proto serialization:
 
 - **Request/reply RPC** over QUIC/WebTransport (browsers, reachable hosts) and iroh (direct P2P).
-- **Event bus** over a moq-lite "Live" stream (replaces the legacy pub/sub proxy).
-- **Streaming plane** — moq groups carry token streams, events, and container I/O, with QoS presets (`Job` / `Log` / `Pipe`), per-frame chained-HMAC integrity, and AEAD payloads so a forwarding relay never sees plaintext.
+- **Event bus** over a moq-lite "Live" stream — **group-key encrypted** (AES-256-GCM with membership-driven rekeying), so a forwarding relay never sees event plaintext.
+- **Streaming plane** — moq groups carry token streams, events, and container I/O, with QoS presets (`Job` / `Log` / `Pipe`), per-frame chained-HMAC integrity, and AEAD payloads.
 
 Every request is wrapped in a **COSE hybrid-signed envelope**:
 - Ed25519 + ML-DSA-65 composite signature over the request (classical + post-quantum)
 - Nonce for replay protection and timestamp for clock-skew validation
-- Request identity (Local user, API token, federated Peer, or Anonymous)
+- Verified request identity (local user, API token, federated peer, or anonymous)
 
 ### Service Spawning
 
@@ -379,31 +394,33 @@ See [docs/rpc-architecture.md](docs/rpc-architecture.md) and [docs/streaming-ser
 **Quick Start:**
 ```bash
 # View current policy
-hyprstream policy show
+hyprstream quick policy show
 
 # Check if a user has permission
-hyprstream policy check alice model:qwen3-small infer
+hyprstream quick policy check alice model:qwen3-small infer
 
-# Create an API token
-hyprstream policy token create \
-  --user alice \
+# Create an API token (expiry defaults to 1y)
+hyprstream quick policy token create alice \
   --name "dev-token" \
   --expires 30d \
   --scope "model:*"
 
-# Apply a built-in template -- allow all local users access to all actions on all resources
-hyprstream policy apply-template local
+# Apply a built-in template — e.g. allow anonymous inference
+hyprstream quick policy apply-template public-inference
 ```
 
-**Built-in Templates:**
-- `local` - Full access for local users (default)
+**Built-in Templates** (`hyprstream quick policy list-templates`):
+- `federation-open` - Accept federated peers and third-party apps
 - `public-inference` - Anonymous inference access
 - `public-read` - Anonymous read-only registry access
+- `ttt.user` / `ttt.agent` - Test-time-training roles
 
-**Worker Resources** (experimental):
+First-time setup is handled by `hyprstream wizard`, which configures users, access policy, and API tokens interactively.
+
+**Worker Resources:**
 | Resource | Description |
 |----------|-------------|
-| `sandbox:*`, `sandbox:{id}` | Pod sandbox (Kata VM) operations |
+| `sandbox:*`, `sandbox:{id}` | Pod sandbox (Kata/OCI/nspawn/WASM) operations |
 | `container:*`, `container:{id}` | Container lifecycle within sandboxes |
 | `image:*`, `image:{name}` | Image pull/push/list operations |
 | `workflow:*`, `workflow:{path}` | Workflow execution (.github/workflows/*.yml) |
@@ -412,19 +429,19 @@ hyprstream policy apply-template local
 **Policy History & Rollback:**
 ```bash
 # View policy commit history
-hyprstream policy history
+hyprstream quick policy history
 
 # Compare draft vs running policy
-hyprstream policy diff
+hyprstream quick policy diff
 
 # Rollback to previous version
-hyprstream policy rollback HEAD~1
+hyprstream quick policy rollback HEAD~1
 ```
 
 **REST API Authentication:**
 ```bash
 # Create a token
-hyprstream policy token create --user alice --name "my-token" --expires 1d
+hyprstream quick policy token create alice --name "my-token" --expires 1d
 
 # Use with API requests
 curl -H "Authorization: Bearer eyJ..." http://localhost:6789/oai/v1/models
@@ -441,9 +458,6 @@ HyprStream supports OpenTelemetry for distributed tracing, enabled via the `otel
 ```bash
 # Build with otel support
 cargo build --features otel --release
-
-# Combine with other features
-cargo build --no-default-features --features tch-cuda,otel --release
 ```
 
 ### OpenTelemetry Configuration
@@ -461,7 +475,7 @@ cargo build --no-default-features --features tch-cuda,otel --release
 ```bash
 export HYPRSTREAM_OTEL_ENABLE=true
 export RUST_LOG=hyprstream=debug
-hyprstream server --port 6789
+hyprstream service start
 # Spans printed to console
 ```
 
@@ -470,20 +484,15 @@ hyprstream server --port 6789
 export HYPRSTREAM_OTEL_ENABLE=true
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
 export OTEL_SERVICE_NAME=hyprstream-prod
-hyprstream server --port 6789
+hyprstream service start
 ```
 
 **File logging (separate from OTEL):**
 ```bash
 export HYPRSTREAM_LOG_DIR=/var/log/hyprstream
-hyprstream server --port 6789
+hyprstream service start
 # Creates daily-rotated logs at /var/log/hyprstream/hyprstream.log
 ```
-
-### Exporter Modes
-
-- **OTLP**: Used automatically when running `server` command; sends traces to backends like Jaeger, Tempo, or Datadog
-- **Stdout**: Used for CLI commands; prints spans to console for debugging
 
 ### Debugging GPU detection issues:
 
@@ -497,7 +506,7 @@ If the Universal AppImage is not detecting your GPU, you may override the settin
 ./hyprstream-x86_64.AppImage --detect-gpu
 
 # Override backend selection for Universal AppImage:
-HYPRSTREAM_BACKEND=cuda130 ./hyprstream-x86_64.AppImage server
+HYPRSTREAM_BACKEND=cuda130 ./hyprstream-x86_64.AppImage service start
 ```
 
 ### System Requirements
@@ -507,12 +516,13 @@ HYPRSTREAM_BACKEND=cuda130 ./hyprstream-x86_64.AppImage server
   - **CPU**: Full support (x86_64, ARM64)
   - **CUDA**: NVIDIA host kernel modules (`nvidia-smi` works)
   - **ROCm**: AMDGPU kernel modules and userland (`rocm-smi` works)
-- **Workers Service Requirements (optional, experimental):**
-  - **Nested Virtualization**: The host system running hyprstream-workers must support and have enabled nested virtualization, this may require a physical machine, bare-metal VM, or proper configuration in your QEMU/KVM settings.
+- **Workers Service Requirements (optional):**
+  - **Kata backend**: nested virtualization (a physical machine, bare-metal VM, or QEMU/KVM configured for it) and `cloud-hypervisor`
+  - **OCI backend**: rootless Podman
+  - **WASM / nspawn backends**: no special host requirements
 - 8GB+ RAM for inference, 16GB+ for training
 - **Optional Dependencies:**
   - `systemd` - For service management and worker process isolation
-  - `cloud-hypervisor` - For Kata container workers (experimental)
 
 ## Contributing
 
@@ -522,22 +532,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 This project uses a dual-licensing model:
 
-**AGPL-3.0** - The end-user experience and crates providing public APIs:
-- `hyprstream` (main application)
-- `hyprstream-metrics`
-- `hyprstream-flight`
+**MIT OR AGPL-3.0 (your choice)** — the main `hyprstream` application.
 
-See [LICENSE-AGPLV3](LICENSE-AGPLV3) for details.
+**MIT** — all other crates, including the RPC/security stack (`hyprstream-rpc`, `hyprstream-rpc-derive`, `hyprstream-rpc-std`, `hyprstream-service`, `hyprstream-discovery`), the namespace stack (`hyprstream-vfs`, `hyprstream-9p`, `hyprstream-vfs-server`, `hyprstream-containedfs`), workers (`hyprstream-workers` + engine crates), the TUI stack (`hyprstream-tui`, `hyprstream-compositor`, `waxterm`, `chat-core`), `hyprstream-metrics`, `hyprstream-flight`, `hyprstream-pds`, and the Git/storage libraries (`git2db`, `gittorrent`, `git-xet-filter`, `cas-serve`).
 
-**MIT** - Library crates for broader reuse:
-- `git2db` - Git repository management
-- `gittorrent` - P2P git transport
-- `git-xet-filter` - XET large file storage filter
-- `cas-serve` - CAS server for XET over SSH
-- `hyprstream-rpc` - RPC infrastructure
-- `hyprstream-rpc-derive` - RPC derive macros
-
-See [LICENSE-MIT](LICENSE-MIT) for details.
+See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-AGPLV3](LICENSE-AGPLV3) for details.
 
 ## Acknowledgments
 
@@ -548,9 +547,11 @@ Built with:
 - [Git2](https://github.com/rust-lang/git2-rs) - Git operations in Rust
 - [Tokio](https://tokio.rs/) - Async runtime
 - [iroh](https://www.iroh.computer/) - Peer-to-peer QUIC transport and discovery
+- [moq](https://quic.video/) - Media-over-QUIC live streaming
 - [Casbin](https://casbin.org/) - Authorization library for policy engine
-- [Kata Containers](https://katacontainers.io/) - VM-based container isolation (experimental)
-- [cloud-hypervisor](https://www.cloudhypervisor.org/) - Virtual machine monitor (experimental)
+- [Kata Containers](https://katacontainers.io/) - VM-based container isolation
+- [cloud-hypervisor](https://www.cloudhypervisor.org/) - Virtual machine monitor
+- [wasmtime](https://wasmtime.dev/) - WebAssembly runtime for sandboxed engines
 
 ## Star History
 

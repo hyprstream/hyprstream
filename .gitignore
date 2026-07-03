@@ -17,3 +17,6 @@ appimage/output/
 appimage/appimagetool
 *.AppImage
 *.AppDir/
+
+# Obsidian editor state
+docs/.obsidian/

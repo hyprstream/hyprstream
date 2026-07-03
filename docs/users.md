@@ -155,5 +155,4 @@ until their `exp` — there is no token revocation. Practical guidance: keep
 ## Related
 
 - `auth_config.md` — user store backends (RocksDB / Valkey), SCIM
-- `keychain.md` — service-identity certificate chain (not user keys)
 - `tls.md` — TLS modes and the unrelated JWT *signing* key rotation

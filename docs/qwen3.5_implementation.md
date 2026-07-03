@@ -1,8 +1,8 @@
-# Qwen3.5 Architecture Implementation
+# Qwen3.5 Architecture Reference
 
 ## Overview
 
-This document describes the implementation plan for Qwen3.5 model support in hyprstream. Qwen3.5 is a hybrid SSM/attention architecture from Alibaba that interleaves **Gated DeltaNet** (linear attention / SSM) and standard **full attention** layers.
+This document is an architecture reference for Qwen3.5 model support in hyprstream (`crates/hyprstream/src/runtime/architectures/qwen3_5.rs` and `qwen3_5_vision.rs`). Qwen3.5 is a hybrid SSM/attention architecture from Alibaba that interleaves **Gated DeltaNet** (linear attention / SSM) and standard **full attention** layers.
 
 Two model families are supported under a single implementation:
 
@@ -279,16 +279,11 @@ Weights with prefix `mtp.*` are silently skipped.
 
 ---
 
-## Files Changed
+## Tool Calling
 
-| File | Change |
-|------|--------|
-| `crates/hyprstream/src/runtime/architectures/llama.rs` | Make `LinearProjection`, `LlamaMLP`, `RMSNorm` `pub(crate)` |
-| `crates/hyprstream/src/runtime/architectures/mod.rs` | Add `pub mod qwen3_5`, `pub mod qwen3_5_vision`; add `Qwen3_5` enum variant; tokenizer routing |
-| `crates/hyprstream/src/runtime/model_config.rs` | Add `Qwen3_5` variant; nested `text_config` parsing; new fields |
-| `crates/hyprstream/src/runtime/model_factory.rs` | Add `Qwen3_5` arm → `create_qwen3_5_model()` |
-| `crates/hyprstream/src/runtime/architectures/qwen3_5.rs` | **New**: full hybrid SSM/attention model |
-| `crates/hyprstream/src/runtime/architectures/qwen3_5_vision.rs` | **New**: vision encoder pipeline |
+Qwen3.5 emits tool calls in its own XML parameter format
+(`<tool_call><function=NAME><parameter=KEY>…</parameter></function></tool_call>`),
+handled by `ToolCallFormat::Qwen35XmlParam` in `crates/hyprstream/src/api/tools.rs` — see `docs/TOOL_CALLING.md`.
 
 ---
 
@@ -313,25 +308,3 @@ Weights with prefix `mtp.*` are silently skipped.
 
 8. **MoE routing normalization**: top-k weights are normalized post-softmax (divide by sum of selected weights). Shared expert output is added unconditionally.
 
----
-
-## Verification
-
-```bash
-# 1. Build
-cargo check -p hyprstream
-cargo clippy -p hyprstream
-
-# 2. AppImage
-./appimage/build-appimage.sh build cpu
-
-# 3. Install services
-./appimage/output/hyprstream-dev-cpu-x86_64.AppImage service install --start
-journalctl --user -u hyprstream-inference -f
-
-# 4. Register and infer
-hyprstream quick clone <local-or-remote-path> --name qwen3-5
-hyprstream quick infer qwen3-5 --prompt "Hello, world"
-```
-
-Expected: model loads without panic, at least one token generated, `layer_types` length matches `num_hidden_layers`.
