@@ -231,6 +231,21 @@ pub struct TeRule {
     pub action: Action,
 }
 
+/// Sentinel ids (B2, #674) for auditing a decision that is NOT a per-op TE
+/// evaluation — today, the S6 grant path (`mac::exchange::evaluate_grant`),
+/// which decides against a UCAN grant's capabilities, not a compiled TE
+/// matrix. `AuditRecord` has one shape (it predates the grant path); rather
+/// than fork the schema, a grant record uses these reserved ids so it is
+/// self-describing and can never collide with a real interned TE id (which
+/// starts from 0 and is bounded by the compiled registry). `subject_type`/
+/// `object_type` reuse `u32::MAX`; `action` uses `ScopeAction`'s id space
+/// directly when the requested ability parses, or `ACTION_UNRECOGNIZED`
+/// otherwise (still recorded — an audit record for an unparseable ability is
+/// exactly the diagnosable case, not a reason to drop the record).
+pub const GRANT_PATH_SUBJECT: SubjectType = SubjectType(u32::MAX);
+pub const GRANT_PATH_OBJECT: ObjectType = ObjectType(u32::MAX);
+pub const ACTION_UNRECOGNIZED: Action = Action(u32::MAX);
+
 /// The compiled type-enforcement matrix: a flat allow-set of [`TeRule`]s. Default-deny —
 /// any triple not present is denied. This is the data-plane artifact loaded from signed
 /// compiled policy (see [`crate::mac::compiled`]). Kept as a `HashSet` so the hot-path

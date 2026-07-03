@@ -129,6 +129,12 @@ pub enum GrantError {
     /// The grant carries no capabilities at all, so there is no ceiling to
     /// request a subset of. An empty grant mints nothing.
     EmptyGrant,
+    /// **B2 (#674):** the request would otherwise `Permit`, but the decision
+    /// could not be durably audited (the audit sink's `record` failed, or its
+    /// signer cannot sign under the enforced crypto policy). Mirrors S7's
+    /// `AuditedAvc` fail-closed rule at the grant path: a decision that cannot
+    /// be audited is never allowed through. See [`audited_evaluate_grant`].
+    AuditUnavailable,
 }
 
 impl std::fmt::Display for GrantError {
@@ -155,6 +161,10 @@ impl std::fmt::Display for GrantError {
                 write!(f, "subject carries no MAC clearance (unlabeled ⇒ deny)")
             }
             GrantError::EmptyGrant => write!(f, "grant carries no capabilities (empty ceiling)"),
+            GrantError::AuditUnavailable => write!(
+                f,
+                "grant decision could not be durably audited (fail-closed)"
+            ),
         }
     }
 }
@@ -365,6 +375,127 @@ pub fn evaluate_refresh<V: UcanVerifier + ?Sized>(
     // Identical gates to the initial mint. ZSP: no path diverges here — a
     // refresh that weakens any gate is a refresh that denies.
     evaluate_grant(grant, verifier, now, request, subject, sender_bound)
+}
+
+/// As [`evaluate_grant`], but records a tamper-evident [`AuditRecord`] of the
+/// outcome through `sink` before returning — S7's complete-mediation guarantee
+/// extended to the grant path (B2, #674). This is the mint-path entry point
+/// production code should call; the plain [`evaluate_grant`] is the
+/// unaudited core the gate tests exercise directly.
+///
+/// Every gate outcome is audited, permit and deny alike (`DecisionReason`'s
+/// `Grant*` variants — see [`crate::mac::audit::DecisionReason`]). On a would-be
+/// `Permit`, the audit write happens **before** the token layer is told to
+/// mint: if it fails, the permit is downgraded to
+/// [`GrantError::AuditUnavailable`] rather than handed back — mirroring
+/// [`crate::mac::audit::AuditedAvc`]'s fail-closed rule that a decision which
+/// cannot be audited is never allowed through.
+#[allow(clippy::too_many_arguments)]
+pub fn audited_evaluate_grant<V: UcanVerifier + ?Sized>(
+    grant: &Ucan,
+    verifier: &V,
+    now: u64,
+    request: &GrantRequest,
+    subject: Option<&SecurityContext>,
+    sender_bound: bool,
+    sink: &dyn crate::mac::audit::AuditSink,
+) -> Result<GrantDecision, GrantError> {
+    let result = evaluate_grant(grant, verifier, now, request, subject, sender_bound);
+    audit_grant_outcome(subject, request, &result, sink)
+}
+
+/// As [`evaluate_refresh`], with the same audit-then-decide wrapping as
+/// [`audited_evaluate_grant`]. The refresh path's audit records are
+/// indistinguishable in shape from the mint path's (both are grant-path
+/// decisions); the caller distinguishes them by context if needed.
+#[allow(clippy::too_many_arguments)]
+pub fn audited_evaluate_refresh<V: UcanVerifier + ?Sized>(
+    grant: &Ucan,
+    verifier: &V,
+    now: u64,
+    request: &GrantRequest,
+    subject: Option<&SecurityContext>,
+    sender_bound: bool,
+    sink: &dyn crate::mac::audit::AuditSink,
+) -> Result<GrantDecision, GrantError> {
+    let result = evaluate_refresh(grant, verifier, now, request, subject, sender_bound);
+    audit_grant_outcome(subject, request, &result, sink)
+}
+
+/// Shared audit-then-decide core for [`audited_evaluate_grant`] /
+/// [`audited_evaluate_refresh`]. Builds the [`AuditRecord`] from whatever
+/// context is available (subject may be `None` on an unlabeled-subject
+/// denial; the request's ability may not parse as a canonical
+/// [`crate::mac::te::ScopeAction`] — both are still recorded, using the
+/// sentinel ids documented on [`crate::mac::te::GRANT_PATH_SUBJECT`]).
+fn audit_grant_outcome(
+    subject: Option<&SecurityContext>,
+    request: &GrantRequest,
+    result: &Result<GrantDecision, GrantError>,
+    sink: &dyn crate::mac::audit::AuditSink,
+) -> Result<GrantDecision, GrantError> {
+    use crate::mac::audit::{AuditRecord, DecisionReason};
+    use crate::mac::te::{Action, ScopeAction, ACTION_UNRECOGNIZED, GRANT_PATH_OBJECT, GRANT_PATH_SUBJECT};
+    use hyprstream_rpc::auth::mac::SecurityLabel;
+
+    let (decision, reason) = match result {
+        Ok(GrantDecision::Permit(_)) => (Decision::Permit, DecisionReason::Permit),
+        Ok(GrantDecision::Escalate { .. }) => (Decision::Escalate, DecisionReason::GrantOverCeiling),
+        Err(GrantError::Chain(_)) => (Decision::Deny, DecisionReason::GrantChainInvalid),
+        Err(GrantError::OverCeiling { .. }) => (Decision::Deny, DecisionReason::GrantOverCeiling),
+        Err(GrantError::InsufficientClearance) => (Decision::Deny, DecisionReason::GrantFloorDeny),
+        Err(GrantError::MissingSenderBinding) => {
+            (Decision::Deny, DecisionReason::GrantMissingSenderBinding)
+        }
+        Err(GrantError::UnlabeledSubject) => (Decision::Deny, DecisionReason::GrantUnlabeledSubject),
+        Err(GrantError::EmptyGrant) => (Decision::Deny, DecisionReason::GrantEmptyGrant),
+        // Constructed below, never as the pre-audit decision — but exhaustive
+        // match requires a reachable-if-mis-called arm. Records as a deny.
+        Err(GrantError::AuditUnavailable) => (Decision::Deny, DecisionReason::GrantAuditFailClosed),
+    };
+
+    let action = ScopeAction::parse(request.ability.as_str())
+        .map(Action::from)
+        .unwrap_or(ACTION_UNRECOGNIZED);
+    let record = AuditRecord {
+        seq: 0,          // the sink (WalAuditStore) assigns the real seq.
+        prev_hash: [0u8; 32], // the sink assigns the real chain link.
+        ts_unix_nanos: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+        decision,
+        generation: 0, // grant decisions are not TE-matrix-generation-versioned.
+        policy_hash: None,
+        subject_type: GRANT_PATH_SUBJECT,
+        subject_clearance: subject.map(|s| *s.clearance()).unwrap_or_else(SecurityLabel::bottom),
+        object_type: GRANT_PATH_OBJECT,
+        object_label: request.object_label.unwrap_or_else(SecurityLabel::bottom),
+        action,
+        reason,
+    };
+
+    match sink.record(&record) {
+        Ok(()) => result.clone(),
+        Err(_) => {
+            // Fail-closed: a would-be Permit that cannot be durably audited is
+            // downgraded. A deny that cannot be audited is still enforced as
+            // decided (the deny is not weakened by a broken audit sink) but the
+            // failure is surfaced so it is observable.
+            if matches!(result, Ok(GrantDecision::Permit(_))) {
+                let deny_record = AuditRecord {
+                    reason: DecisionReason::GrantAuditFailClosed,
+                    decision: Decision::Deny,
+                    ..record
+                };
+                let _ = sink.record(&deny_record);
+                Err(GrantError::AuditUnavailable)
+            } else {
+                tracing::error!("MAC grant-path audit write failed on a Deny decision (deny still enforced)");
+                result.clone()
+            }
+        }
+    }
 }
 
 /// Resolve the S1 `SecurityContext` for a UCAN grant's audience from a
@@ -1005,5 +1136,200 @@ mod tests {
             ),
             Err(GrantError::MissingSenderBinding)
         ));
+    }
+
+    // ── B2 (#674): the audited grant path ───────────────────────────────────
+
+    /// An in-memory sink that records every [`crate::mac::audit::AuditRecord`]
+    /// it's given, or can be told to fail the next `record` call (to exercise
+    /// the fail-closed-on-audit-failure path without a real `WalAuditStore`).
+    struct SpySink {
+        records: parking_lot::Mutex<Vec<crate::mac::audit::AuditRecord>>,
+        fail_next: std::sync::atomic::AtomicBool,
+    }
+    impl SpySink {
+        fn new() -> Self {
+            Self {
+                records: parking_lot::Mutex::new(Vec::new()),
+                fail_next: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+        fn fail_next_write(&self) {
+            self.fail_next.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn records(&self) -> Vec<crate::mac::audit::AuditRecord> {
+            self.records.lock().clone()
+        }
+    }
+    impl crate::mac::audit::AuditSink for SpySink {
+        fn record(
+            &self,
+            record: &crate::mac::audit::AuditRecord,
+        ) -> Result<(), crate::mac::audit::AuditError> {
+            if self.fail_next.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::mac::audit::AuditError::Io("injected failure".into()));
+            }
+            self.records.lock().push(record.clone());
+            Ok(())
+        }
+    }
+
+    /// A permit is audited (exactly one `Permit` record, with the grant-path
+    /// sentinel ids) and the token still mints — auditing must not itself
+    /// deny a decision the gates approved.
+    #[test]
+    fn audited_permit_is_recorded_and_still_mints() {
+        let (grant, store) = root_grant(cap("mac://model/*", "model/read"));
+        let object_label =
+            SecurityLabel::new(Level::Confidential, Assurance::PqHybrid, comps(&[0]));
+        let request = req("mac://model/qwen", "model/read", object_label);
+        let sink = SpySink::new();
+
+        let decision = audited_evaluate_grant(
+            &grant,
+            &store,
+            NOW,
+            &request,
+            Some(&cleared_subject()),
+            true,
+            &sink,
+        );
+        assert!(
+            matches!(decision, Ok(GrantDecision::Permit(_))),
+            "an honest permit must still mint under audit: {decision:?}"
+        );
+
+        let recs = sink.records();
+        assert_eq!(recs.len(), 1, "exactly one record per decision");
+        assert_eq!(recs[0].decision, crate::mac::te::Decision::Permit);
+        assert_eq!(recs[0].reason, crate::mac::audit::DecisionReason::Permit);
+        assert_eq!(recs[0].subject_type, crate::mac::te::GRANT_PATH_SUBJECT);
+        assert_eq!(recs[0].object_type, crate::mac::te::GRANT_PATH_OBJECT);
+    }
+
+    /// The core #674 obligation: a would-be Permit that CANNOT be durably
+    /// audited must be downgraded to a deny (`AuditUnavailable`), never handed
+    /// back as a Permit — mirroring `AuditedAvc`'s fail-closed rule at the TE
+    /// path. Also asserts the resulting deny record IS still attempted/audited.
+    #[test]
+    fn permit_downgrades_to_deny_when_audit_write_fails() {
+        let (grant, store) = root_grant(cap("mac://model/*", "model/read"));
+        let object_label =
+            SecurityLabel::new(Level::Confidential, Assurance::PqHybrid, comps(&[0]));
+        let request = req("mac://model/qwen", "model/read", object_label);
+        let sink = SpySink::new();
+        sink.fail_next_write(); // the Permit's own audit write will fail
+
+        let decision = audited_evaluate_grant(
+            &grant,
+            &store,
+            NOW,
+            &request,
+            Some(&cleared_subject()),
+            true,
+            &sink,
+        );
+        assert!(
+            matches!(decision, Err(GrantError::AuditUnavailable)),
+            "an unauditable permit must be downgraded, got {decision:?}"
+        );
+        // The fallback deny record was itself recorded (best-effort, per the
+        // AuditedAvc precedent) — the second `record` call, which SpySink
+        // allows since only the first was told to fail.
+        let recs = sink.records();
+        assert_eq!(recs.len(), 1, "the downgraded deny is recorded");
+        assert_eq!(recs[0].decision, crate::mac::te::Decision::Deny);
+        assert_eq!(
+            recs[0].reason,
+            crate::mac::audit::DecisionReason::GrantAuditFailClosed
+        );
+    }
+
+    /// A denial that cannot be audited is still enforced as a deny (auditing
+    /// failure never WEAKENS a decision — only a would-be Permit is affected).
+    #[test]
+    fn deny_stays_deny_when_audit_write_fails() {
+        let (grant, store) = root_grant(cap("mac://model/*", "model/read"));
+        // Missing object label ⇒ InsufficientClearance (gate 4), independent of
+        // the audit sink.
+        let request = GrantRequest {
+            resource: Resource::new("mac://model/qwen"),
+            ability: Ability::new("model/read"),
+            caveats: Caveats::default(),
+            audience: None,
+            object_label: None,
+        };
+        let sink = SpySink::new();
+        sink.fail_next_write();
+
+        let decision = audited_evaluate_grant(
+            &grant,
+            &store,
+            NOW,
+            &request,
+            Some(&cleared_subject()),
+            true,
+            &sink,
+        );
+        assert!(
+            matches!(decision, Err(GrantError::InsufficientClearance)),
+            "a deny must be enforced as decided even if its audit write fails: {decision:?}"
+        );
+        // The (failed) attempt leaves no record — asserting we don't silently
+        // fabricate one; the failure was logged instead (see tracing::error!).
+        assert!(sink.records().is_empty());
+    }
+
+    /// An unrecognized ability (doesn't parse as a canonical `ScopeAction`)
+    /// still produces a well-formed audit record — using the sentinel
+    /// `ACTION_UNRECOGNIZED` id rather than dropping the record. Diagnosable,
+    /// not silently lost.
+    #[test]
+    fn unparseable_ability_still_produces_a_diagnosable_record() {
+        let (grant, store) = root_grant(cap("mac://model/*", "totally-not-a-verb"));
+        let object_label =
+            SecurityLabel::new(Level::Confidential, Assurance::PqHybrid, comps(&[0]));
+        let request = req("mac://model/qwen", "totally-not-a-verb", object_label);
+        let sink = SpySink::new();
+
+        // The grant will actually Permit (the capability's ability string
+        // matches verbatim), but the ability is not a canonical ScopeAction —
+        // exercising the ACTION_UNRECOGNIZED fallback on a real decision.
+        let _ = audited_evaluate_grant(
+            &grant,
+            &store,
+            NOW,
+            &request,
+            Some(&cleared_subject()),
+            true,
+            &sink,
+        );
+        let recs = sink.records();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].action, crate::mac::te::ACTION_UNRECOGNIZED);
+    }
+
+    /// `audited_evaluate_refresh` audits identically to
+    /// `audited_evaluate_grant` (same gate chain, same record shape) — the
+    /// refresh path is not a quieter/less-audited sibling.
+    #[test]
+    fn audited_refresh_is_recorded_the_same_way() {
+        let (grant, store) = root_grant(cap("mac://model/*", "model/read"));
+        let object_label =
+            SecurityLabel::new(Level::Confidential, Assurance::PqHybrid, comps(&[0]));
+        let request = req("mac://model/qwen", "model/read", object_label);
+        let sink = SpySink::new();
+
+        let decision = audited_evaluate_refresh(
+            &grant,
+            &store,
+            NOW,
+            &request,
+            Some(&cleared_subject()),
+            true,
+            &sink,
+        );
+        assert!(matches!(decision, Ok(GrantDecision::Permit(_))));
+        assert_eq!(sink.records().len(), 1);
     }
 }

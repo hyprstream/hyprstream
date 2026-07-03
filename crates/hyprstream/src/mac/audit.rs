@@ -183,6 +183,32 @@ pub enum DecisionReason {
     /// **Fail-closed:** the audit write failed, so a Permit was downgraded to
     /// Deny. This is itself auditable (the deny is what the PEP enforced).
     AuditFailClosed,
+
+    // ── B2 (#674): the S6 grant-path decision kind (see [`crate::mac::te::
+    // GRANT_PATH_SUBJECT`]). One variant per `mac::exchange::GrantError`
+    // gate, so a grant denial's cause is as diagnosable as a TE denial's. ──
+    /// No DPoP sender-binding proof was supplied (ZSP gate 1).
+    GrantMissingSenderBinding,
+    /// The presented grant carries no capabilities at all (gate 2).
+    GrantEmptyGrant,
+    /// The subject carried no derivable MAC clearance (gate 3, S1 floor).
+    GrantUnlabeledSubject,
+    /// The MAC clearance floor denied for a grant request (gate 5). Distinct
+    /// from [`DecisionReason::FloorDeny`] (a TE-path floor denial) so a grant
+    /// vs. per-op floor denial is distinguishable in the audit trail. Also
+    /// covers gate 4 (unlabeled object), which `evaluate_grant` maps to the
+    /// same `GrantError::InsufficientClearance`.
+    GrantFloorDeny,
+    /// The UCAN chain failed S5 validation (gate 6: bad signature, broken
+    /// linkage, widening, window escape, expiry, over-depth).
+    GrantChainInvalid,
+    /// The request exceeded the grant's ceiling (gate 7) — an escalation
+    /// attempt, denied pending a ceiling amendment (S6 does not auto-widen).
+    GrantOverCeiling,
+    /// A grant was `Permit`, but the caller's `sink` (or checking `can_sign`
+    /// preflight) could not durably audit it — the permit is downgraded to
+    /// deny, mirroring [`DecisionReason::AuditFailClosed`] for the grant path.
+    GrantAuditFailClosed,
 }
 
 impl DecisionReason {
@@ -195,6 +221,13 @@ impl DecisionReason {
             DecisionReason::Escalate => "escalate",
             DecisionReason::TokenGate => "token_gate",
             DecisionReason::AuditFailClosed => "audit_fail_closed",
+            DecisionReason::GrantMissingSenderBinding => "grant_missing_sender_binding",
+            DecisionReason::GrantEmptyGrant => "grant_empty_grant",
+            DecisionReason::GrantUnlabeledSubject => "grant_unlabeled_subject",
+            DecisionReason::GrantFloorDeny => "grant_floor_deny",
+            DecisionReason::GrantChainInvalid => "grant_chain_invalid",
+            DecisionReason::GrantOverCeiling => "grant_over_ceiling",
+            DecisionReason::GrantAuditFailClosed => "grant_audit_fail_closed",
         }
     }
 }
@@ -325,6 +358,7 @@ pub mod cose {
     use ed25519_dalek::{SigningKey, VerifyingKey};
     use hyprstream_rpc::crypto::cose_sign::{sign_composite, verify_composite};
     use hyprstream_rpc::crypto::pq::{MlDsaSigningKey, MlDsaVerifyingKey};
+    use std::sync::Arc;
 
     /// Domain-separation AAD for audit-record signatures (distinct from
     /// policy/envelope AADs so an audit signature can never be replayed as
@@ -394,6 +428,59 @@ pub mod cose {
                 ));
             }
             sign_composite(self.ed_sk, self.pq_sk, signing_input, AUDIT_AAD)
+                .map_err(|e| AuditError::Sign(e.to_string()))
+        }
+    }
+
+    /// Owned-key variant of [`CoseAuditSigner`] (B2, #674): production wiring
+    /// stores this on `OAuthState`/`AuditedAvc`, both of which must be
+    /// `'static` — a borrowed signer cannot live there. Holds `Arc`s to the
+    /// same key material a borrowed [`CoseAuditSigner`] would reference (a
+    /// startup-time snapshot of the node's active EdDSA + ML-DSA-65 keys), and
+    /// signs with the IDENTICAL fail-closed logic: under Hybrid, a missing PQ
+    /// key fails every `sign` call rather than downgrading.
+    pub struct OwnedCoseAuditSigner {
+        ed_sk: Arc<SigningKey>,
+        pq_sk: Option<Arc<MlDsaSigningKey>>,
+        require_pq: bool,
+    }
+
+    impl OwnedCoseAuditSigner {
+        /// Construct from owned key material + the node's enforced
+        /// [`CryptoPolicy`](hyprstream_rpc::crypto::CryptoPolicy). See
+        /// [`CoseAuditSigner::new`] for the exact Hybrid/Classical semantics —
+        /// identical here.
+        pub fn new(
+            ed_sk: Arc<SigningKey>,
+            pq_sk: Option<Arc<MlDsaSigningKey>>,
+            policy: hyprstream_rpc::crypto::CryptoPolicy,
+        ) -> Self {
+            Self {
+                ed_sk,
+                pq_sk: if policy.uses_pq() { pq_sk } else { None },
+                require_pq: policy.uses_pq(),
+            }
+        }
+
+        /// As [`CoseAuditSigner::can_sign`]: whether this signer can produce a
+        /// signature under its policy. Production wiring MUST check this at
+        /// startup and refuse to boot the audited grant path if false under
+        /// Hybrid (no audit signer ⇒ no Permit, per the S7 fail-closed
+        /// contract) — see `OAuthState::with_audit_sink`.
+        #[must_use]
+        pub fn can_sign(&self) -> bool {
+            !self.require_pq || self.pq_sk.is_some()
+        }
+    }
+
+    impl AuditSigner for OwnedCoseAuditSigner {
+        fn sign(&self, signing_input: &[u8]) -> Result<Vec<u8>, AuditError> {
+            if self.require_pq && self.pq_sk.is_none() {
+                return Err(AuditError::Sign(
+                    "Hybrid crypto policy requires an ML-DSA-65 audit signing key, none provisioned (fail-closed)".to_owned(),
+                ));
+            }
+            sign_composite(&self.ed_sk, self.pq_sk.as_deref(), signing_input, AUDIT_AAD)
                 .map_err(|e| AuditError::Sign(e.to_string()))
         }
     }

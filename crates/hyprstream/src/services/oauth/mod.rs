@@ -528,6 +528,49 @@ impl Spawnable for OAuthService {
             );
             info!("ML-DSA-65 signing key rotation store loaded");
 
+            // MAC #547 / B2 (#674): construct the S6 grant-path audit sink. A
+            // startup-time snapshot of the active ML-DSA-65 key (rotation
+            // during the process lifetime is a follow-up — S7's audit key
+            // provisioning is otherwise the same "load once at boot" shape as
+            // the rest of this factory). The node's enforced crypto policy
+            // decides whether the PQ layer is REQUIRED (fail-closed if the key
+            // snapshot comes back empty) or ignored (Classical).
+            let audit_sink: Option<Arc<dyn crate::mac::audit::AuditSink>> = {
+                let crypto_policy = hyprstream_rpc::envelope::envelope_policy_from_env();
+                let audit_pq_key = ml_dsa_store.active_key().await;
+                let signer = crate::mac::audit::cose::OwnedCoseAuditSigner::new(
+                    Arc::new(self.signing_key.clone()),
+                    audit_pq_key,
+                    crypto_policy,
+                );
+                if !signer.can_sign() {
+                    tracing::error!(
+                        "MAC audit signer cannot sign under the enforced Hybrid crypto \
+                         policy (no ML-DSA-65 key provisioned) — the S6 grant path will \
+                         fail closed (deny) on every request until a key is provisioned"
+                    );
+                }
+                match crate::mac::audit::WalAuditStore::open(
+                    credentials_dir.join("mac-audit"),
+                    signer,
+                ) {
+                    Ok(store) => {
+                        info!("MAC grant-path audit store opened (WAL, hash-chained, checkpointed)");
+                        Some(Arc::new(store) as Arc<dyn crate::mac::audit::AuditSink>)
+                    }
+                    Err(e) => {
+                        // Fail-closed by omission: `audit_sink` stays `None`, and
+                        // the grant path denies every request rather than mint
+                        // unaudited tokens (see `exchange_ucan_grant`).
+                        tracing::error!(
+                            "MAC grant-path audit store failed to open — the S6 grant \
+                             path will fail closed (deny) on every request: {e:?}"
+                        );
+                        None
+                    }
+                }
+            };
+
             let (ca_jwt_key, signing_key_store) = match crate::auth::identity_store::load_ca_signing_key(&credentials_dir) {
                 Ok(root_key) => {
                     let key = hyprstream_rpc::node_identity::derive_purpose_key(&root_key, "hyprstream-jwt-v1");
@@ -588,6 +631,9 @@ impl Spawnable for OAuthService {
             oauth_state = oauth_state.with_es256_key_store(Arc::clone(&es256_store));
             {
                 oauth_state = oauth_state.with_ml_dsa_key_store(Arc::clone(&ml_dsa_store));
+            }
+            if let Some(sink) = audit_sink {
+                oauth_state = oauth_state.with_audit_sink(sink);
             }
             if let Some(bl) = self.jti_blocklist {
                 oauth_state = oauth_state.with_jti_blocklist(bl);
