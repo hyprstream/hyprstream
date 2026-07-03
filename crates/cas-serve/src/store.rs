@@ -25,6 +25,19 @@ pub enum StoreError {
     Io(String),
 }
 
+/// Result of ingesting bytes via [`CasStore::put_file_bytes`].
+#[derive(Debug, Clone)]
+pub struct PutResult {
+    /// Server-computed XET merkle root (hex) of the ingested bytes. Authoritative
+    /// — derived from the actual content, never supplied by the caller.
+    pub merkle: String,
+    /// Hex xorb hashes forming the reconstruction set for this content.
+    pub xorb_hashes: Vec<String>,
+    /// Bytes newly written to the store after content-addressed dedup
+    /// (0 if every xorb was already present — fully deduplicated).
+    pub bytes_stored: u64,
+}
+
 /// Storage path resolution order (matches the `cas-serve` binary):
 /// 1. `CAS_STORAGE` environment variable
 /// 2. `XET_CACHE_DIR` environment variable
@@ -106,6 +119,64 @@ impl CasStore {
         }
     }
 
+    /// Ingest raw bytes: chunk (Gearhash CDC), aggregate into xorbs, build the
+    /// reconstruction shard, and store both content-addressed. The XET merkle
+    /// root is computed HERE from the actual bytes and returned in
+    /// [`PutResult::merkle`] — the caller never supplies it. Existing xorbs are
+    /// skipped (global content-addressed dedup), so [`PutResult::bytes_stored`]
+    /// counts only newly-written xorb payload.
+    ///
+    /// This is the in-process, library form of the binary's `UploadFile`
+    /// handler; both go through this single implementation.
+    pub async fn put_file_bytes(&self, data: &[u8]) -> Result<PutResult, StoreError> {
+        use crate::chunker;
+        use crate::shard::Shard;
+
+        // Server-side chunk + merkle: the file_hash is derived from the bytes,
+        // not asserted by the caller (this is what closes the OID-planting vector
+        // for the authenticated write path — see hyprstream registry putBlob).
+        let chunks = chunker::chunk_all(data);
+        let (shard, xorbs) = Shard::from_chunks(&chunks);
+
+        let xorbs_dir = self.storage_path.join("xorbs");
+        let shards_dir = self.storage_path.join("shards");
+        tokio::fs::create_dir_all(&xorbs_dir)
+            .await
+            .map_err(|e| StoreError::Io(format!("create xorbs dir: {e}")))?;
+        tokio::fs::create_dir_all(&shards_dir)
+            .await
+            .map_err(|e| StoreError::Io(format!("create shards dir: {e}")))?;
+
+        // Store each xorb content-addressed. An identical xorb already present is
+        // not an error (dedup): skip the write and don't count it.
+        let mut xorb_hashes = Vec::with_capacity(xorbs.len());
+        let mut bytes_stored: u64 = 0;
+        for (xorb_hash, bytes) in &xorbs {
+            let hex = xorb_hash.hex();
+            let path = self.xorb_path(&hex);
+            if !path.exists() {
+                tokio::fs::write(&path, bytes)
+                    .await
+                    .map_err(|e| StoreError::Io(format!("write xorb {hex}: {e}")))?;
+                bytes_stored += bytes.len() as u64;
+            }
+            xorb_hashes.push(hex);
+        }
+
+        // Reconstruction shard (`.mdb`), keyed by the file merkle. Small metadata,
+        // identical for identical content, so an unconditional (re)write is fine.
+        let shard_path = self.shard_path(&shard.file_hash);
+        tokio::fs::write(&shard_path, shard.to_bytes())
+            .await
+            .map_err(|e| StoreError::Io(format!("write shard {}: {e}", shard.file_hash)))?;
+
+        Ok(PutResult {
+            merkle: shard.file_hash,
+            xorb_hashes,
+            bytes_stored,
+        })
+    }
+
     /// Load the `.mdb` shard, fetch each referenced xorb, and concatenate the
     /// segment bytes to reconstruct the file.
     async fn reassemble_from_shard(
@@ -159,5 +230,58 @@ impl CasStore {
         }
 
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A payload large enough to exercise CDC into multiple chunks/xorbs.
+    fn payload(seed: u8, len: usize) -> Vec<u8> {
+        (0..len).map(|i| seed.wrapping_add((i as u8).wrapping_mul(31))).collect()
+    }
+
+    #[tokio::test]
+    async fn put_then_get_round_trips_and_computes_merkle() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CasStore::new(dir.path());
+        let original = payload(7, 512 * 1024);
+
+        let put = store.put_file_bytes(&original).await.unwrap();
+        // Merkle is server-computed and non-empty; content is content-addressable.
+        assert!(!put.merkle.is_empty(), "server must compute a merkle");
+        assert!(!put.xorb_hashes.is_empty());
+        assert!(put.bytes_stored > 0, "first upload writes new bytes");
+
+        // The store can now reconstruct the exact original bytes by that merkle.
+        let got = store.get_file_bytes(&put.merkle).await.unwrap();
+        assert_eq!(got, original);
+    }
+
+    #[tokio::test]
+    async fn merkle_is_deterministic_and_reupload_dedupes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CasStore::new(dir.path());
+        let original = payload(42, 300 * 1024);
+
+        let first = store.put_file_bytes(&original).await.unwrap();
+        let second = store.put_file_bytes(&original).await.unwrap();
+
+        // Same bytes ⇒ same merkle (content-addressed, caller-independent).
+        assert_eq!(first.merkle, second.merkle);
+        assert_eq!(first.xorb_hashes, second.xorb_hashes);
+        // Re-upload of identical content writes nothing new (global dedup).
+        assert_eq!(second.bytes_stored, 0, "re-upload must fully dedup");
+    }
+
+    #[tokio::test]
+    async fn distinct_content_yields_distinct_merkle() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CasStore::new(dir.path());
+
+        let a = store.put_file_bytes(&payload(1, 200 * 1024)).await.unwrap();
+        let b = store.put_file_bytes(&payload(2, 200 * 1024)).await.unwrap();
+        assert_ne!(a.merkle, b.merkle);
     }
 }

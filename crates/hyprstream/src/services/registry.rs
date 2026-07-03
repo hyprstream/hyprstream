@@ -34,7 +34,7 @@ use crate::services::generated::registry_client::{
     StreamInfo, ErrorInfo, HealthStatus, DetailedStatusInfo, RemoteInfo,
     CloneRequest, RegisterRequest,
     GetBlobRequest, GetBlobRequestContent,
-    PutBlobRequest,
+    PutBlobRequest, PutBlobResult,
     CreateWorktreeRequest, RemoveWorktreeRequest,
     BranchRequest, CheckoutRequest, StageFilesRequest,
     CommitRequest, MergeRequest, ContinueMergeRequest,
@@ -154,6 +154,11 @@ struct FidTable {
 
 /// Idle timeout for fids (5 minutes).
 const FID_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Hard cap on the inline `putBlob` upload path (DoS guard for unbounded `Data`).
+/// Model-weight-scale blobs are NOT intended for the inline path; a streaming
+/// upload channel (additive schema follow-up) will carry those. 64 MiB.
+const MAX_INLINE_UPLOAD: u64 = 64 * 1024 * 1024;
 
 fn now_epoch_secs() -> u64 {
     SystemTime::now()
@@ -1753,39 +1758,94 @@ impl RegistryHandler for RegistryService {
         }
     }
 
-    /// STUB (epic #654) — the authenticated XET write path. NOT IMPLEMENTED:
-    /// this returns a fail-closed error so the wire shape lands (unblocking the
-    /// impl PR) without any behavior change. `main` semantics are unchanged: no
-    /// bytes are ever accepted here.
+    /// Authenticated in-band XET write (epic #654) — the symmetric write half of
+    /// `getBlob` and what populates the provenance store the `#509` read-gate
+    /// consults. The caller supplies bytes only; the server computes the merkle
+    /// from those bytes (never caller-supplied — this is what closes the #436
+    /// OID-planting vector by construction) and binds `(merkle → grantRepo)`
+    /// provenance from the verified identity.
     ///
-    /// Precondition (already satisfied by dispatch): the coarse `$scope(write)`
-    /// gate runs before this handler, exactly as `$scope(query)` does for
-    /// `handle_get_blob` (neither method carries `#[authorize]`; the coarse gate
-    /// is the schema-declared baseline, the fine-grained check lives in-handler).
-    ///
-    /// The real implementation (separate PR) will then:
-    ///   1. fine-grained `authorize(ctx, "model:{repo}", "write")` on
-    ///      `data.grant_repo`, mirroring `authorize_get_blob`'s per-repo check
-    ///      one verb up (a read grant never implies write);
-    ///   2. cap `data.bytes` at MAX_INLINE_UPLOAD (DoS guard — unbounded `Data`);
-    ///   3. chunk (Gearhash CDC) + store xorbs via an in-process CasStore write
-    ///      API (to add, mirroring `cas-serve::handle_upload_file`);
-    ///   4. compute the merkle SERVER-SIDE from the stored bytes (never
-    ///      caller-supplied — this is what closes the #436 planting vector);
-    ///   5. `xet_provenance.record(merkle, repo_id)` (the #509/#511 hook, today
-    ///      called only in tests — production population starts here);
-    ///   6. return `PutBlobResult { merkle, xorb_hashes, bytes_stored }`.
-    async fn handle_put_blob(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        _data: &PutBlobRequest,
+    /// The coarse `$scope(write)` gate runs in dispatch before this handler (as
+    /// `$scope(query)` does for `handle_get_blob`; neither carries `#[authorize]`).
+    /// A failure returns a fail-closed error response — no bytes are persisted and
+    /// no provenance is recorded unless the caller is authorized.
+    async fn handle_put_blob(&self, ctx: &EnvelopeContext, _request_id: u64,
+        data: &PutBlobRequest,
     ) -> Result<RegistryResponseVariant> {
-        // Fail closed: the write path is not yet wired. Deny rather than
-        // silently accept bytes with no provenance binding.
-        Ok(reg_error(
-            "putBlob not yet implemented (epic #654): authenticated XET upload + \
-             server-side merkle + provenance recording pending",
-        ))
+        match self.put_blob_inner(ctx, data).await {
+            Ok(variant) => Ok(variant),
+            // Fail-closed: any deny/error → error response, nothing stored.
+            Err(e) => Ok(reg_error(&format!("putBlob denied: {e}"))),
+        }
     }
 
+}
+
+impl RegistryService {
+    /// Core of [`RegistryHandler::handle_put_blob`], split out for `?` ergonomics.
+    /// Every early return here is a hard deny (no bytes stored, no provenance
+    /// recorded); the caller maps `Err` → a fail-closed error response.
+    async fn put_blob_inner(
+        &self,
+        ctx: &EnvelopeContext,
+        data: &PutBlobRequest,
+    ) -> Result<RegistryResponseVariant> {
+        // ── Input validation ──
+        if data.grant_repo.trim().is_empty() {
+            anyhow::bail!("grantRepo is required (provenance binds the bytes to a repo)");
+        }
+        if data.bytes.is_empty() {
+            anyhow::bail!("empty upload");
+        }
+        // DoS guard: the inline path is hard-capped. Larger blobs will use the
+        // streaming upload channel (additive schema follow-up field).
+        if data.bytes.len() as u64 > MAX_INLINE_UPLOAD {
+            anyhow::bail!(
+                "upload exceeds inline cap ({} > {MAX_INLINE_UPLOAD} bytes); \
+                 streaming upload not yet available",
+                data.bytes.len()
+            );
+        }
+
+        // ── Resolve grantRepo → tracked repo (unknown repo = deny) ──
+        let repo = self
+            .resolve_grant_repo(&data.grant_repo)
+            .await
+            .ok_or_else(|| anyhow!("grantRepo '{}' not found", data.grant_repo))?;
+        let repo_name = repo.name.clone().unwrap_or_default();
+        if repo_name.is_empty() {
+            anyhow::bail!("grantRepo has no name for authz");
+        }
+
+        // ── Authorize WRITE on grantRepo. Mirrors `authorize_get_blob`'s per-repo
+        //    Casbin check, one verb up: a read (`query`) grant never implies
+        //    `write`. There is no condition-(b) "reconstruction target" check on
+        //    the write side — the upload is precisely what CREATES the binding. ──
+        RegistryHandler::authorize(self, ctx, &format!("model:{}", repo_name), "write")
+            .await
+            .map_err(|e| anyhow!("write not authorized on '{}': {}", data.grant_repo, e))?;
+
+        // ── Chunk + store + SERVER-SIDE merkle (caller supplied only bytes) ──
+        let store = cas_serve::CasStore::from_env();
+        let put = store
+            .put_file_bytes(&data.bytes)
+            .await
+            .map_err(|e| anyhow!("CAS ingest failed: {e}"))?;
+
+        // ── Bind provenance: THIS repo uploaded THIS merkle. Key on the SAME
+        //    `repo_id.0.to_string()` form the read-gate's `is_bound` uses, or the
+        //    later read would never match this binding. ──
+        self.xet_provenance
+            .record(&put.merkle, &repo.id.0.to_string())
+            .await
+            .map_err(|e| anyhow!("provenance record failed: {e}"))?;
+
+        Ok(RegistryResponseVariant::PutBlobResult(PutBlobResult {
+            merkle: put.merkle,
+            xorb_hashes: put.xorb_hashes,
+            bytes_stored: put.bytes_stored,
+        }))
+    }
 }
 
 // ============================================================================
