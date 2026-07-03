@@ -136,24 +136,34 @@ hyprstream service install
 
 This installs the `hyprstream` command and systemd units. For source builds, run the binary from `target/release/` or add it to your PATH manually.
 
-### 2. Apply a policy template
+Tip: `hyprstream service install --start` installs and starts the services in one step (after you have run the wizard, below).
 
-Hyprstream uses a deny-by-default policy. Grant yourself access:
+### 2. Run the setup wizard (required)
+
+The wizard is the first-time bootstrap: it creates the trust root and service credentials, applies policy templates, creates your user, and mints an API token. **Services will fail to start without the credentials the wizard creates.**
+
+Interactive (TUI auto-detected):
 
 ```bash
-hyprstream quick policy apply-template local
+hyprstream wizard
 ```
 
-This gives the current local user full access for CLI operations.
+Non-interactive, accepting defaults and starting services when done:
 
-Other templates:
+```bash
+hyprstream wizard -y --start
+```
+
+Running `hyprstream` with no subcommand on a fresh machine also launches the wizard automatically.
+
+Additional policy templates can be applied later with `hyprstream quick policy apply-template <name>`, e.g.:
 
 - `public-inference` — allow anonymous inference (for open API)
 - `public-read` — allow anonymous registry browsing
 
 ### 3. Start services
 
-Start all hyprstream services (registry, policy, model, OAI API, etc.):
+Start all hyprstream services (registry, policy, model, OAI API, OAuth, etc.), unless the wizard already started them:
 
 ```bash
 hyprstream service start
@@ -218,6 +228,8 @@ Run inference with a model reference (`model:branch`):
 hyprstream quick infer qwen3-small:main --prompt "Explain quantum computing in simple terms"
 ```
 
+Output streams token-by-token by default. Use `--sync` to collect the full response before printing.
+
 With options:
 
 ```bash
@@ -225,8 +237,7 @@ hyprstream quick infer qwen3-small:main \
   --prompt "Write a Python function to sort a list" \
   --temperature 0.7 \
   --top-p 0.9 \
-  --max-tokens 1024 \
-  --stream
+  --max-tokens 1024
 ```
 
 Read prompt from stdin:
@@ -266,6 +277,8 @@ export OPENAI_BASE_URL="http://localhost:6789/oai/v1"
 ```
 
 Always use the `model:branch` format (e.g. `qwen3-small:main`), not just the model name.
+
+The OAuth 2.1 service (token issuance, revocation) listens on port 6791 by default.
 
 ---
 
@@ -323,12 +336,12 @@ export GIT2DB_WORKTREE__DRIVER=vfs
 
 ## Troubleshooting
 
-### "Permission denied" or policy errors
+### "Permission denied", missing-credential, or policy errors
 
-Run:
+Make sure the setup wizard has run — it creates the credentials and policies every service depends on:
 
 ```bash
-hyprstream quick policy apply-template local
+hyprstream wizard
 ```
 
 ### "Commit failed" when applying policy template

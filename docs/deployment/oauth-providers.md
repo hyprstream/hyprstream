@@ -1,6 +1,6 @@
 # OAuth / OIDC Provider Configuration
 
-Hyprstream can delegate user authentication to external identity providers. Three
+Hyprstream can delegate user authentication to external identity providers. Two
 provider kinds are supported, each with different discovery and token-validation paths:
 
 | Kind | Discovery | Token validation | Use when |
@@ -12,7 +12,7 @@ Providers are configured under `oauth.oidc_providers` in `hyprstream.toml`:
 
 ```toml
 [oauth.oidc_providers.my-provider]
-kind = "oidc"            # or "oauth2" / "github"
+kind = "oidc"            # or "oauth2"
 client_id = "..."
 client_secret = "..."
 ```
@@ -21,7 +21,7 @@ client_secret = "..."
 
 ## Common fields
 
-These fields apply to all three provider kinds:
+These fields apply to both provider kinds:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -29,29 +29,37 @@ These fields apply to all three provider kinds:
 | `client_secret` | string | optional | Client secret (omit for public clients) |
 | `scopes` | list | *kind-specific* | Requested OAuth scopes |
 | `user_mapping` | string | `"namespaced"` | How external `sub` maps to local username |
-| `provisioning` | string | `"auto"` | Whether to auto-create users on first login |
+| `provisioning` | string | `"deny"` | Whether to auto-create users on first login |
 | `default_scopes` | list | `[]` | Hyprstream scopes granted to new users |
-| `allowed_domains` | list | `[]` | Email domain allow-list (empty = any) |
+| `allowed_domains` | list | `[]` | Domain allow-list used by `provisioning = "allowlist"` |
 | `clock_skew_seconds` | int | `60` | Allowed clock skew for token expiry checks |
 | `allow_http` | bool | `false` | Allow HTTP (non-TLS) discovery endpoints (dev only) |
 
 ### `user_mapping`
 
-| Value | Local username |
+| Value | Local subject |
 |-------|---------------|
-| `"namespaced"` | `provider-slug:external-sub` (e.g. `github:12345678`) |
-| `"sub"` | External `sub` claim directly |
-| `"email"` | Email address from external claims |
+| `"namespaced"` | `provider-slug:external-sub` (e.g. `github:12345678`). Default. |
+| `"email"` | Email address from external claims (requires `email_verified = true`) |
+| `{ claim = { name = "..." } }` | The value of a specific claim (e.g. `preferred_username`) |
+| `"didweb"` | `did:web:{issuer_authority}:users:{external_sub}` (e.g. `did:web:hyprstream.example.com:users:12345`) — the subject-identity format for did:web deployments. Opt-in: existing Casbin policies written against namespaced subjects must be migrated first. |
 
-`"namespaced"` is recommended — it is stable, collision-free, and works for providers
-(like GitHub) whose `sub` is a numeric ID.
+`"namespaced"` is the default and recommended for most deployments — it is stable,
+collision-free, and works for providers (like GitHub) whose `sub` is a numeric ID.
+
+Example of the claim strategy:
+
+```toml
+user_mapping = { claim = { name = "preferred_username" } }
+```
 
 ### `provisioning`
 
 | Value | Behaviour |
 |-------|----------|
+| `"deny"` | Reject logins from users not already registered locally. **Default.** |
 | `"auto"` | Create a local user on first login; grant `default_scopes` |
-| `"deny"` | Reject logins from users not already registered locally |
+| `"allowlist"` | Auto-provision only when the mapped subject matches `allowed_domains` — the email domain for email-shaped subjects, or the provider slug for namespaced subjects; anything else is rejected |
 
 ### `default_scopes`
 
@@ -227,9 +235,14 @@ For server-to-server flows (e.g. validating JWTs issued by Keycloak at the token
 endpoint), use `oauth.trusted_issuers` instead of `oidc_providers`:
 
 ```toml
-[oauth]
-trusted_issuers = ["https://keycloak.example.com/realms/my-realm"]
+[oauth.trusted_issuers."https://keycloak.example.com/realms/my-realm"]
+jwks_uri = "https://keycloak.example.com/realms/my-realm/protocol/openid-connect/certs"
+jwks_cache_ttl_secs = 300
 ```
 
-This allows RFC 8693 token exchange and RFC 7523 JWT bearer grants from the external
-issuer without requiring a browser login flow.
+`trusted_issuers` is a TOML table keyed by the exact issuer URL (matching the token's
+`iss` claim). Per-issuer fields: `jwks_uri` (optional — auto-discovered when omitted),
+`jwks_cache_ttl_secs` (default 300), and `allow_http` (dev only). This allows Bearer
+authentication with externally issued JWTs, plus RFC 8693 token exchange and RFC 7523
+JWT bearer grants, without requiring a browser login flow. See the
+[Keycloak guide](keycloak.md) for a worked example.

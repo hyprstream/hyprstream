@@ -158,10 +158,10 @@ impl Spawnable for OAIService {
 The `#[service_factory]` macro supports `depends_on` to ensure services start in order:
 
 ```rust
-#[service_factory("model", depends_on = ["policy", "registry", "discovery", "notification"])]
+#[service_factory("model", depends_on = ["policy", "registry", "discovery"])]
 fn create_model_service(ctx: &ServiceContext) -> Result<Box<dyn Spawnable>> {
-    // PolicyService, RegistryService, DiscoveryService, and NotificationService
-    // are guaranteed to be running before this factory executes
+    // PolicyService, RegistryService, and DiscoveryService are guaranteed
+    // to be running before this factory executes
 }
 ```
 
@@ -298,21 +298,22 @@ All generated clients share the same structure:
 ┌─────────────────────────────────────────────────────────────┐
 │  PolicyClient / RegistryClient / etc.                       │
 │  └── Arc<dyn RpcClient>  (Clone, Send+Sync)                │
-│       └── RpcClientImpl<LocalSigner, LazyUdsTransport>      │
+│       └── RpcClientImpl<Signer, Transport>                  │
 │            ├── signer: Ed25519 signing key                  │
-│            ├── transport: LazyUdsTransport                  │
-│            │     └── tokio::sync::Mutex<Option<UdsSession>> │
+│            ├── transport: LazyUdsTransport /                │
+│            │     LazyQuinnTransport (QUIC) / iroh substrate │
+│            │     └── tokio::sync::Mutex<Option<Session>>    │
 │            ├── request_id: AtomicU64                        │
 │            └── default_jwt: Option<String>                  │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 - **Pooling primitive**: `Arc::clone()` — share one client across handlers
-- **Thread safety**: `LazyUdsTransport` wraps session in `tokio::Mutex`
+- **Thread safety**: each lazy transport wraps its session in `tokio::Mutex`
 - **Per-call auth**: `RequestBuilder` allows JWT override without mutation
 - **No LocalSet on client side**: The constraint is on the service side only
 
-For QUIC/iroh transports, `LazyQuinnTransport` and iroh substrate follow the same `Send+Sync` pattern via `Mutex`-wrapped session state.
+The transport is chosen by `TransportConfig` (inproc, UDS, QUIC, iroh); all backends follow the same `Send+Sync` pattern via `Mutex`-wrapped session state.
 
 ## Complete Service Topology
 
@@ -325,10 +326,13 @@ For QUIC/iroh transports, `LazyQuinnTransport` and iroh substrate follow the sam
 │  │                     MAIN PROCESS                                   │     │
 │  │                                                                    │     │
 │  │  ┌────────────────┐  ┌──────────────────────────────────────┐     │     │
-│  │  │ EndpointRegistry│  │ moq-lite Origin (MoqEventOrigin)    │     │     │
-│  │  │ (global singl.) │  │ • UDS at /tmp/hyprstream-{pid}/     │     │     │
-│  │  └───────┬────────┘  │   moq.sock                          │     │     │
-│  │          │            │ • Streaming + event bus             │     │     │
+│  │  │ EndpointRegistry│  │ moq-lite planes (process-global)    │     │     │
+│  │  │ (global singl.) │  │ • MoqStreamOrigin — streaming plane │     │     │
+│  │  └───────┬────────┘  │   (cross-process UDS:               │     │     │
+│  │          │            │    /tmp/hyprstream-{pid}/moq.sock)  │     │     │
+│  │          │            │ • MoqEventOrigin — event bus        │     │     │
+│  │          │            │   (cross-process UDS: event.sock    │     │     │
+│  │          │            │    in the runtime dir)              │     │     │
 │  │          │            └──────────────────────────────────────┘     │     │
 │  │  ┌───────┴───────────────────────────────────────────────────┐   │     │
 │  │  │                                                           │   │     │
@@ -339,11 +343,22 @@ For QUIC/iroh transports, `LazyQuinnTransport` and iroh substrate follow the sam
 │  │  │  └─────────────┘  └─────────────┘  └─────────────┘       │   │     │
 │  │  │                                                           │   │     │
 │  │  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐       │   │     │
-│  │  │  │InferenceSvc │  │ WorkerSvc   │  │ EventBarrier│       │   │     │
-│  │  │  │ (Thread)    │  │ (Tokio)     │  │ (Tokio)     │       │   │     │
-│  │  │  │ UDS/inproc  │  │ UDS/inproc  │  │ moq-lite    │       │   │     │
-│  │  │  │ +moq stream │  │ +moq events │  │ event bus   │       │   │     │
+│  │  │  │InferenceSvc │  │ WorkerSvc   │  │ DiscoverySvc│       │   │     │
+│  │  │  │ (Thread)    │  │ (Tokio)     │  │ UDS/inproc  │       │   │     │
+│  │  │  │ UDS/inproc  │  │ UDS/inproc  │  │             │       │   │     │
+│  │  │  │ +moq stream │  │ +moq events │  │             │       │   │     │
 │  │  │  └─────────────┘  └─────────────┘  └─────────────┘       │   │     │
+│  │  │                                                           │   │     │
+│  │  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐       │   │     │
+│  │  │  │ MetricsSvc  │  │ McpSvc      │  │ TuiSvc      │       │   │     │
+│  │  │  │ UDS/inproc  │  │ UDS/inproc  │  │ UDS/inproc  │       │   │     │
+│  │  │  │             │  │ +HTTP/SSE   │  │             │       │   │     │
+│  │  │  └─────────────┘  └─────────────┘  └─────────────┘       │   │     │
+│  │  │                                                           │   │     │
+│  │  │  ┌─────────────────────────────────────────────────┐     │   │     │
+│  │  │  │ event / streams factories — initialize the      │     │   │     │
+│  │  │  │ MoqEventOrigin / MoqStreamOrigin planes above   │     │   │     │
+│  │  │  └─────────────────────────────────────────────────┘     │   │     │
 │  │  │                                                           │   │     │
 │  │  └───────────────────────────────────────────────────────────┘   │     │
 │  │                                                                    │     │

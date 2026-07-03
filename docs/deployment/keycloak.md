@@ -5,7 +5,7 @@ Keycloak is a popular self-hosted OIDC provider. This guide shows how to configu
 ## Prerequisites
 
 - Keycloak 21+ running at `https://keycloak.example.com`
-- hyprstream with `trusted_issuers` support (Task 11 auth/federation)
+- The realm must sign tokens with **EdDSA (Ed25519)** — hyprstream's federation key resolver only accepts `kty: OKP` / `crv: Ed25519` keys from a JWKS (`crates/hyprstream/src/auth/federation.rs`). RS256-signed tokens (the Keycloak default) will fail verification; configure an EdDSA realm key and set the client's access-token signature algorithm accordingly.
 
 ## 1. Keycloak Realm Setup
 
@@ -61,13 +61,23 @@ p, https://keycloak.example.com/realms/myrealm:*, *, model:*, infer.generate, al
 
 ## 5. User Login Flow
 
-Users authenticate via the standard OAuth 2.0 device authorization flow, specifying the Keycloak issuer:
+There is no `hyprstream login` command, and hyprstream does not proxy the Keycloak login. Users obtain a token **directly from Keycloak** using any grant Keycloak supports (authorization code + PKCE, Keycloak's own device flow, etc.) and present it to hyprstream as a Bearer token:
 
 ```bash
-hyprstream login --issuer https://keycloak.example.com/realms/myrealm
+# Example: Keycloak device flow from a terminal
+curl -s -X POST \
+  "https://keycloak.example.com/realms/myrealm/protocol/openid-connect/auth/device" \
+  -d "client_id=hyprstream"
+# ...visit verification_uri, then poll the token endpoint for an access token
+
+# Use the Keycloak-issued token against hyprstream
+curl -H "Authorization: Bearer $KEYCLOAK_ACCESS_TOKEN" \
+  https://hyprstream.example.com/v1/models
 ```
 
-This opens the Keycloak login page in a browser. On success, Keycloak issues a JWT. hyprstream receives the token, checks that `iss` matches a trusted issuer, fetches the Keycloak JWKS to verify the signature, and constructs a federated subject `https://keycloak.example.com/realms/myrealm:alice` for Casbin policy enforcement.
+On each request, hyprstream's auth middleware (`crates/hyprstream/src/server/middleware.rs`) extracts the token's `iss` claim, checks it against `trusted_issuers`, fetches (and caches) the Keycloak JWKS to verify the signature, and constructs a federated Casbin subject of the form `{issuer_url}:{sub}` — e.g. `https://keycloak.example.com/realms/myrealm:alice`. Keycloak-issued tokens can also be exchanged at hyprstream's token endpoint via RFC 8693 token exchange or RFC 7523 JWT bearer grants.
+
+> **Note:** hyprstream *does* implement its own RFC 8628 device flow (`POST /oauth/device`), but that flow authenticates against hyprstream's local user store via Ed25519 challenge-response — it is not how you log in with a federated Keycloak identity.
 
 ## 6. Troubleshooting
 
@@ -85,9 +95,9 @@ If Keycloak includes a trailing slash (`https://keycloak.example.com/realms/myre
 
 ### Token audience (`aud`) mismatch
 
-If Keycloak is configured with audience mappers, the `aud` claim may not match what hyprstream expects. Either:
-- Remove the audience mapper in Keycloak, or
-- Set `oauth.audience` in `hyprstream.toml` to match the Keycloak audience value
+hyprstream validates federated tokens against its own resource URL (`config.oai.resource_url()` — the `oai.external_url` setting, or derived from the OAI host/port). The validation is lenient for federated tokens: a token with **no** `aud` claim is accepted; a token with a **wrong** `aud` is rejected. If Keycloak is configured with audience mappers, either:
+- Remove the audience mapper in Keycloak (absent `aud` passes), or
+- Set the mapped audience to hyprstream's resource URL (set `oai.external_url` in `hyprstream.toml` if the default derivation doesn't match)
 
 ### Clock skew
 

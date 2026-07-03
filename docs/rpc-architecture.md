@@ -27,8 +27,9 @@ This document describes the RPC infrastructure used by hyprstream for inter-serv
 │  ┌───────────────────────────────────────────────────────────────┐         │
 │  │                  STREAMING / EVENT PLANE                       │         │
 │  │  ┌────────────────────────────────────────────────────────┐   │         │
-│  │  │ moq-lite (MoqEventOrigin + MoqStreamHandle)            │   │         │
-│  │  │ UDS socket: /tmp/hyprstream-{pid}/moq.sock             │   │         │
+│  │  │ moq-lite (MoqStreamOrigin + MoqEventOrigin)            │   │         │
+│  │  │ stream UDS: /tmp/hyprstream-{pid}/moq.sock             │   │         │
+│  │  │ event UDS:  event.sock in the runtime dir              │   │         │
 │  │  └────────────────────────────────────────────────────────┘   │         │
 │  └───────────────────────────────────────────────────────────────┘         │
 │                                                                             │
@@ -50,10 +51,11 @@ This document describes the RPC infrastructure used by hyprstream for inter-serv
 │  │    (Cap'n Proto)│                │                 │                    │
 │  │         │       │                │                 │                    │
 │  │ 2. RequestEnvelope              │                 │                    │
-│  │    + identity   │                │                 │                    │
+│  │    + authorization              │                 │                    │
 │  │    + nonce      │                │                 │                    │
 │  │         │       │                │                 │                    │
-│  │ 3. Sign Ed25519 │                │                 │                    │
+│  │ 3. Sign (COSE   │                │                 │                    │
+│  │    composite)   │                │                 │                    │
 │  │    →SignedEnvelope              │                 │                    │
 │  │         │       │   UDS frame   │                 │                    │
 │  │         └───────┼───────────────►│ 4. Receive     │                    │
@@ -80,7 +82,7 @@ This document describes the RPC infrastructure used by hyprstream for inter-serv
 | **QUIC** | Remote, TLS 1.3 | `LazyQuinnTransport` (ALPN: `ALPN_HYPRSTREAM_RPC`) |
 | **iroh** | P2P / NAT-traversal | iroh substrate (Ed25519 node identity) |
 
-All transports carry the same `SignedEnvelope`-wrapped Cap'n Proto frames via ZMTP framing. Only the wire transport layer differs; the application security model is identical.
+All transports carry the same `SignedEnvelope`-wrapped Cap'n Proto frames via ZMTP 3.1 framing (the wire serialization only — a holdover from the retired ZeroMQ stack; no libzmq is involved). Only the wire transport layer differs; the application security model is identical.
 
 ## Security Model
 
@@ -93,36 +95,56 @@ All transports carry the same `SignedEnvelope`-wrapped Cap'n Proto frames via ZM
 │                                                                             │
 │  SignedEnvelope                                                             │
 │  ┌─────────────────────────────────────────────────────────────────┐       │
-│  │  signature: [u8; 64]    ← Ed25519 over RequestEnvelope          │       │
-│  │  signer_pubkey: [u8; 32]                                        │       │
+│  │  cose: Vec<u8>          ← COSE composite signature (detached):  │       │
+│  │                           EdDSA entry (Classical) or            │       │
+│  │                           EdDSA + ML-DSA-65 entries (Hybrid)    │       │
+│  │  sig: [u8; 64]          ← raw Ed25519 (compat + cnf binding)    │       │
+│  │  cnf: [u8; 32]          ← signer's Ed25519 public key           │       │
+│  │  encrypted_envelope     ← Option: AES-256-GCM-SIV ciphertext    │       │
+│  │  client_ephemeral_public← X25519 ephemeral (encrypted mode)     │       │
+│  │  pq_kem_ciphertext      ← Option: ML-KEM-768 (hybrid encryption)│       │
 │  │  ┌───────────────────────────────────────────────────────────┐  │       │
-│  │  │ RequestEnvelope                                           │  │       │
+│  │  │ RequestEnvelope (signed as serialized bytes)              │  │       │
 │  │  │   request_id: u64                                         │  │       │
-│  │  │   identity: RequestIdentity                               │  │       │
-│  │  │   nonce: [u8; 16]     ← Replay protection                 │  │       │
-│  │  │   timestamp: i64      ← Clock skew check                  │  │       │
-│  │  │   ephemeral_pubkey    ← Stream HMAC derivation            │  │       │
 │  │  │   payload: Vec<u8>    ← Actual request (Cap'n Proto)      │  │       │
+│  │  │   iat: i64            ← Expiration check                  │  │       │
+│  │  │   nonce: [u8; 16]     ← Replay protection                 │  │       │
+│  │  │   authorization       ← union: none/local/federated/idJag │  │       │
+│  │  │   delegation_token    ← Optional relayed delegation token │  │       │
+│  │  │   wth                 ← Optional SHA-256 WIT binding      │  │       │
+│  │  │   client_dh_public    ← Stream HMAC key derivation        │  │       │
 │  │  └───────────────────────────────────────────────────────────┘  │       │
 │  └─────────────────────────────────────────────────────────────────┘       │
 │                                                                             │
-│  RequestIdentity → casbin_subject()                                         │
+│  Identity → Subject (bare username, empty = anonymous)                      │
 │  ┌─────────────────────────────────────────────────────────────────┐       │
-│  │  Local { user }        → "local:alice"                          │       │
-│  │  ApiToken { user, .. } → "token:bob"                            │       │
-│  │  Peer { name, .. }     → "peer:gpu-server-1"                    │       │
-│  │  Anonymous             → "anonymous"                            │       │
+│  │  key-derived subject  ← from the verified envelope signer key   │       │
+│  │                         (system/inproc callers)                 │       │
+│  │  JWT-derived subject  ← from verified token claims:             │       │
+│  │    local token        → "alice"                                 │       │
+│  │    federated token    → "https://node-a:alice"                  │       │
 │  └─────────────────────────────────────────────────────────────────┘       │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+The authoritative authentication mechanism is the `cose` field: a CBOR-encoded
+COSE composite signature over the canonical envelope bytes. In Classical mode it
+carries one EdDSA entry; in Hybrid mode it carries a nested composite — an inner
+EdDSA `COSE_Sign1` plus an outer ML-DSA-65 (FIPS 204) signature over
+`signing-data ‖ inner_sig`. The ML-DSA-65 verifying key is never carried in the
+envelope; it is resolved by kid from a trust store keyed by the signer's Ed25519
+`cnf`, and the outer signature is enforced only for signer identities whose PQ
+key is anchored out-of-band (per-identity PQ anchoring — see
+[cryptography-architecture.md](cryptography-architecture.md)). The raw `sig`/`cnf`
+fields remain populated for the JWT `cnf` key-binding path.
 
 ### Security Layers
 
 | Layer | Technology | Purpose |
 |-------|------------|---------|
 | **Transport** | TLS 1.3 (QUIC) / UDS peer credentials (IPC) | Wire confidentiality and peer identity |
-| **Application** | Ed25519 signatures | Request authentication and integrity |
+| **Application** | COSE hybrid signatures (inner EdDSA + outer ML-DSA-65, per-identity PQ anchoring) | Request authentication and integrity |
 | **Authorization** | Casbin policy | RBAC/ABAC access control |
 
 ### JWT Authorization
@@ -148,7 +170,7 @@ Services enforce user-level authorization via JWT tokens embedded in request env
 │    │                             │                            │             │
 │    │ 2. Make RPC call with JWT   │                            │             │
 │    │ RequestEnvelope {           │                            │             │
-│    │   jwt_token: "eyJ..."       │                            │             │
+│    │   authorization: <JWT>      │                            │             │
 │    │   payload: GenerateRequest  │                            │             │
 │    │   ... (signed envelope)     │                            │             │
 │    │ }                           │                            │             │
@@ -190,7 +212,7 @@ Services enforce user-level authorization via JWT tokens embedded in request env
 
 **Defense-in-Depth:**
 ```
-Layer 1: Ed25519 envelope signature (service identity)
+Layer 1: COSE envelope signature (service identity)
          ↓
 Layer 2: Casbin policy check (RBAC/ABAC)
          ↓
@@ -207,15 +229,20 @@ Layer 3: JWT scope validation (least privilege)
 ```capnp
 # Schema: common.capnp
 struct RequestEnvelope {
-  requestId      @0 :UInt64;
-  identity       @1 :RequestIdentity;
-  payload        @2 :Data;
-  ephemeralPubkey @3 :Data;
-  nonce          @4 :Data;
-  timestamp      @5 :Int64;
-  jwtToken       @6 :Text;  # Signed JWT token string
+  requestId @0 :UInt64;            # Unique request ID for correlation
+  payload @1 :Data;                # Serialized inner request (RegistryRequest, etc.)
+  iat @2 :Int64;                   # Unix millis, for expiration check
+  nonce @3 :Data $fixedSize(16);   # 16 random bytes for replay protection
+  authorization @4 :Authorization; # Authorization context (union)
+  delegationToken @5 :Text $optional;  # Delegation token relayed by a trusted service
+  wth @6 :Data $fixedSize(32) $optional;  # SHA-256 of the WIT JWT (WIMSE binding)
+  clientDhPublic @7 :Data $fixedSize(32) $optional;  # Ephemeral DH public key for stream keys
 }
 ```
+
+The `Authorization` union replaces the legacy `identity`/`jwtToken` fields; it is
+`none`, `local` (verified `TokenClaims`), `federated` (raw token from a foreign
+issuer + claims), or `idJag` (identity-assertion JWT).
 
 #### Service Implementation
 
@@ -237,36 +264,49 @@ impl InferenceService {
         // 2. Casbin policy checked
         // 3. JWT scopes validated
 
-        let user_claims = ctx.user_claims.as_ref().unwrap();
-        info!(user = %user_claims.sub, model = %request.model, "Inference authorized");
+        let claims = ctx.claims().unwrap();
+        info!(user = %claims.sub, model = %request.model, "Inference authorized");
         // ...
     }
 }
 ```
 
-#### EnvelopeContext Extensions
+#### EnvelopeContext
+
+`EnvelopeContext` (`crates/hyprstream-rpc/src/service/svc.rs`) is constructed from
+a verified `SignedEnvelope` and passed to every handler:
 
 ```rust
 pub struct EnvelopeContext {
-    pub request_id: u64,
-    pub identity: RequestIdentity,
+    pub request_id: u64,          // Unique request ID for correlation
+    pub cnf: [u8; 32],            // Verified Ed25519 signer key (RFC 7800 cnf)
 
-    jwt_token: Option<String>,              // Signed JWT token string
-    user_claims: Option<Arc<Claims>>,       // Validated claims (lazy-initialized)
+    claims: Option<Claims>,       // Validated JWT claims (set by verify_claims())
+    jwt_token: Option<String>,    // Raw JWT from the envelope's authorization union
+    key_derived_subject: Subject, // Subject from the verified signer key (system/inproc)
+    jwt_subject: Option<Subject>, // Subject from a verified JWT (local or federated)
 }
+```
 
+The server dispatch loop runs `verify_claims()` on the context after envelope
+verification: it decodes and verifies the JWT, populates `claims`, and resolves
+`jwt_subject` (bare `"alice"` for local tokens, `"https://node-a:alice"` for
+federated ones). Handlers then use accessors:
+
+```rust
 impl EnvelopeContext {
-    /// Validate JWT token and extract Claims (stateless)
-    pub fn validate_jwt(&mut self, verifying_key: &VerifyingKey) -> Result<Arc<Claims>>;
+    /// Authorization subject: key-derived subject if present (cryptographically
+    /// proven via the signer key), else the verified JWT subject, else anonymous
+    pub fn subject(&self) -> Subject;
 
-    /// Get validated user claims (None if not yet validated)
-    pub fn user_claims(&self) -> Option<&Arc<Claims>>;
+    /// Validated JWT claims (None until verify_claims() runs)
+    pub fn claims(&self) -> Option<&Claims>;
 
-    /// Get user subject for Casbin checks (if JWT validated)
-    pub fn user_subject(&self) -> Option<String>;
+    /// Raw JWT token from the envelope (if present)
+    pub fn jwt_token(&self) -> Option<&str>;
 
-    /// Get effective subject (user if present, otherwise service identity)
-    pub fn effective_subject(&self) -> String;
+    /// Whether a verified user identity is present
+    pub fn is_authenticated(&self) -> bool;
 }
 ```
 
@@ -397,9 +437,9 @@ InferenceService                moq Origin                        Client
 │  │                     MAIN PROCESS                                   │     │
 │  │                                                                    │     │
 │  │  ┌────────────────┐  ┌──────────────────────────────────────┐     │     │
-│  │  │ EndpointRegistry│  │ moq-lite Origin                     │     │     │
-│  │  │ (global singl.) │  │ • Streaming plane (MoqStreamHandle) │     │     │
-│  │  └───────┬────────┘  │ • Event bus (MoqEventBarrierService) │     │     │
+│  │  │ EndpointRegistry│  │ moq-lite planes (process-global)    │     │     │
+│  │  │ (global singl.) │  │ • Streaming plane (MoqStreamOrigin) │     │     │
+│  │  └───────┬────────┘  │ • Event bus (MoqEventOrigin)         │     │     │
 │  │          │            └──────────────────────────────────────┘     │     │
 │  │          │                                                         │     │
 │  │  ┌───────┴───────────────────────────────────────────────────┐   │     │
@@ -416,6 +456,18 @@ InferenceService                moq Origin                        Client
 │  │  │  │ inproc/UDS  │  │ inproc/UDS  │  │ HTTP        │       │   │     │
 │  │  │  │ +moq stream │  │ +moq events │  │             │       │   │     │
 │  │  │  └─────────────┘  └─────────────┘  └─────────────┘       │   │     │
+│  │  │                                                           │   │     │
+│  │  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐       │   │     │
+│  │  │  │DiscoverySvc │  │ MetricsSvc  │  │ McpSvc      │       │   │     │
+│  │  │  │ inproc/UDS  │  │ inproc/UDS  │  │ inproc/UDS  │       │   │     │
+│  │  │  │             │  │             │  │ +HTTP/SSE   │       │   │     │
+│  │  │  └─────────────┘  └─────────────┘  └─────────────┘       │   │     │
+│  │  │                                                           │   │     │
+│  │  │  ┌─────────────┐  ┌─────────────────────────────────┐    │   │     │
+│  │  │  │ TuiSvc      │  │ event / streams factories       │    │   │     │
+│  │  │  │ inproc/UDS  │  │ (initialize the MoQ event and   │    │   │     │
+│  │  │  │             │  │  stream planes for the process) │    │   │     │
+│  │  │  └─────────────┘  └─────────────────────────────────┘    │   │     │
 │  │  │                                                           │   │     │
 │  │  └───────────────────────────────────────────────────────────┘   │     │
 │  │                                                                    │     │
@@ -448,8 +500,8 @@ InferenceService                moq Origin                        Client
 | `hyprstream-rpc/src/transport/in_memory.rs` | `InprocChannel` — in-process transport |
 | `hyprstream-rpc/src/envelope.rs` | Signed envelope types |
 | `hyprstream-rpc/src/crypto/signing.rs` | Ed25519 signing |
+| `hyprstream-rpc/src/crypto/cose_sign.rs` | COSE composite (EdDSA + ML-DSA-65) sign/verify |
 | `hyprstream-rpc/src/moq_stream.rs` | `MoqStreamHandle`, moq streaming plane |
 | `hyprstream-rpc/src/moq_event.rs` | `MoqEventOrigin`, moq event bus |
 | `hyprstream-rpc/src/registry/mod.rs` | `EndpointRegistry`, `SocketKind`, `EndpointMode` |
-| `hyprstream-workers/src/events/publisher.rs` | Event publishing |
-| `hyprstream-workers/src/events/subscriber.rs` | Event subscription |
+| `hyprstream-workers/src/events/{mod,service,token_manager,types}.rs` | Worker event integration (service, token management, event types) |

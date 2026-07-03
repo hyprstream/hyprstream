@@ -34,10 +34,9 @@ use tch::Device;
 ///
 /// Constructed from [`crate::config::RuntimeConfig`] via [`DevicePool::from_config`].
 /// The pool performs **fail-fast** device resolution: when devices are explicitly
-/// requested it never silently downgrades to CPU (see the plan's
-/// "no-fragile-fallbacks", `docs/plans/2026-06-18-multi-gpu-multi-host-inference-spike.md`
-/// §B / rust-M2). A process told to use GPU 1 that would land on CPU is an error,
-/// not a warning.
+/// requested it never silently downgrades to CPU ("no-fragile-fallbacks", per the
+/// multi-GPU/multi-host inference design). A process told to use GPU 1 that would
+/// land on CPU is an error, not a warning.
 ///
 /// # Send / Sync
 ///

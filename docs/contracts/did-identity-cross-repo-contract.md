@@ -1,6 +1,6 @@
 # Cross-repo identity contract: `Did` / did:web / did:plc / did:key
 
-**Status:** settled (pending #578 merge — shape is final, safe to mirror now).
+**Status:** settled (#578 merged — shape is final).
 **Canonical owner:** `hyprstream` — `crates/hyprstream-rpc/src/identity.rs` (`Did`).
 **Source issues/PRs:** #563 (design + sign-off) · #578 (def + field-level `$domainType`) · #579 (resolver + assurance, PQC pathway).
 **Consumers:** `www-cyberdione-ai` frontend (`src/api/atproto.ts`, MR !18 / #2 / #5) — mirrors this shape, does not re-derive. Security/MAC epic #547 (#548/#549) — consumes the #579 resolver.
@@ -15,8 +15,8 @@ A `Did` is a **branded string** holding **any** DID method: `did:web:…`, `did:
 - Rust (canonical): `pub struct Did(String)` — `$domainType("hyprstream_rpc::identity::Did")`, **bare `Text` on the wire** (W3C DID strings; no wrapper/nesting).
 - TS (mirror): `type Did = string & { readonly __brand: 'Did' }` (brand a string; do not build an object).
 
-## 2. Method predicates (both sides)
-`is_did_key` · `is_did_web` (`startsWith("did:web:")`) · `is_did_plc`.
+## 2. Method predicates
+Rust (`identity.rs`) provides `is_did_key` · `is_did_web` (`startsWith("did:web:")`) — there is **no** `is_did_plc` on the Rust `Did` type (hyprstream does not resolve `did:plc`; see §4/§9). The TS mirror may additionally implement an `is_did_plc` predicate for its own resolution path.
 
 ## 3. Validation posture — lenient construct, strict at the boundary
 - **Construction is lenient:** `Did::new(s)` / the TS constructor accept **any** string; no validation, no rejection. Enables gradual adoption + opaque pass-through.
@@ -73,7 +73,6 @@ hyprstream publishes extra `service` entries (`type: "IrohTransport"` / `"QuicTr
 **Rule:** mirror string + predicates + DID-doc parse + assurance enum. Do **not** re-derive the representation or fork the enum. Changes to this contract go through the canonical owner (hyprstream) and are relayed to consumers.
 
 ---
-*Maintained by the hyprstream identity owner (pane 1:3.0). Frontend sync: pane 1:6.0.*
 
 ## 9. Resolved edge cases (frontend ↔ canonical)
 - **Missing `#atproto_pds`:** **HARD-ERROR (fail-closed).** Do not fall back to another typed `serviceEndpoint` for the PDS.

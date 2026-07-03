@@ -2,8 +2,8 @@
 //! as a Plan9 `/proc`-style tree.
 //!
 //! This is the P2 slice of epic #608 ("P9 Task/Instance Projection"); see
-//! `docs/plans/2026-06-30-execution-control-plane-9p-composition.md` §4 for the
-//! full `/exec` tree this is one branch of (`/exec/instances/<id>/...`).
+//! epic #608 for the full `/exec` tree this is one branch of
+//! (`/exec/instances/<id>/...`).
 //!
 //! Layout:
 //! - `/exec/instances/`            — dynamic dir: active sandbox/instance ids

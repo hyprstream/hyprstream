@@ -230,8 +230,8 @@ mechanisms for clients, chosen at request time:
 
 The client's `client_id` is itself an **HTTPS URL** pointing to a JSON
 metadata document the authorization server fetches at request time.
-Implemented in `services/oauth/authorize.rs:116-133` via
-`fetch_client_metadata` (`services/oauth/registration.rs:96`).
+Implemented in `services/oauth/authorize.rs:160` via
+`fetch_client_metadata` (`services/oauth/registration.rs:391`).
 
 ```
 client_id = "https://app.example.com/.well-known/oauth-client-metadata"
@@ -245,8 +245,10 @@ At `GET /oauth/authorize` time the AS:
    was fetched from.
 4. Checks the request's `redirect_uri` against the document's
    `redirect_uris` array.
-5. Caches the resulting `RegisteredClient` in memory for the process
-   lifetime; cache misses re-fetch.
+5. Caches the resulting `RegisteredClient` in a bounded TTL cache
+   (`services/oauth/cimd_cache.rs`); the entry TTL follows the document's
+   HTTP `Cache-Control: max-age` / `Expires`, clamped to 5 minutes–24 hours.
+   Cache misses (and expiries) re-fetch.
 
 **Trust model:** the AS trusts the document because it was served over a
 publicly-trusted TLS channel from the URL the document claims. There is
@@ -267,8 +269,8 @@ CA-trusted certificates. Unsuitable when the AS cannot reach the URL
 The client `POST`s to `/oauth/register` describing itself; the AS
 returns a generated UUID `client_id` the client uses thereafter. The
 record lives in `OAuthState.clients`
-(`services/oauth/state.rs:228`) — a `RwLock<HashMap>` populated by
-`register_client` (`services/oauth/registration.rs:38`).
+(`services/oauth/state.rs:304`) — a `RwLock<HashMap>` populated by
+`register_client` (`services/oauth/registration.rs:87`).
 
 **State is in-memory only.** Process restart wipes all DCR registrations.
 This is correct behaviour for dev workflows where the client (a webapp
@@ -278,24 +280,24 @@ process lifetime.
 
 ### Which path does a given request take?
 
-The branch is decided at `authorize.rs:115-150` purely by whether the
+The branch is decided at `authorize.rs:160` purely by whether the
 incoming `client_id` starts with `https://`. There is no per-deployment
 toggle; CIMD and DCR coexist and clients pick by how they identify
 themselves.
 
 | If `client_id` is… | Path | Storage |
 |---|---|---|
-| `https://...` | CIMD: fetch, validate, cache | None persisted; in-memory cache only |
+| `https://...` | CIMD: fetch, validate, cache | None persisted; bounded in-memory TTL cache |
 | anything else (UUID, etc.) | DCR: lookup in `state.clients` | In-memory HashMap |
 
 ### Storage backends
 
-Neither path currently persists OAuth client records to RocksDB or
-Valkey — both rely on the in-memory cache in `OAuthState`. CIMD doesn't
-need persistence (re-fetch is correct). DCR doesn't have persistence
-today; the in-memory cache survives only the process lifetime. See the
-project obsidian vault `Retire DCR.md` and `Bounded clients cache.md`
-follow-ups.
+Neither path persists OAuth client records to RocksDB or Valkey. CIMD
+uses a bounded TTL cache (`services/oauth/cimd_cache.rs`) — entries
+expire per the document's HTTP cache headers (clamped 5 min–24 h) and
+are re-fetched on miss, so no persistence is needed (the document at the
+`client_id` URL is the source of truth). DCR registrations are in-memory
+only and survive just the process lifetime.
 
 ### Recommendation for new deployments
 
@@ -306,8 +308,7 @@ follow-ups.
   fallback. The in-memory state is bounded by dev session length.
 - **Air-gapped / private CA deployments:** publish the CIMD document on
   the internal HTTPS endpoint, and ensure hyprstream's HTTP client
-  trusts the internal CA. (Not currently a configurable knob; track in
-  the obsidian vault if you need this.)
+  trusts the internal CA. (Not currently a configurable knob.)
 
 ---
 

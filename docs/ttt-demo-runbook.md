@@ -33,7 +33,7 @@ Expected: `loaded: true`, `online_training_config.enabled: true`
 Write TTT training parameters to the model's `config.json`:
 
 ```
-ttt.configure(
+ttt.writeTttConfig(
   model_ref = "qwen3-4b-2507:hn-demo",
   learning_rate = 0.0003,
   gradient_steps = 3,
@@ -66,7 +66,7 @@ This creates 72 trainable LoRA modules (36 layers x q_proj + v_proj).
 Run inference WITHOUT TTT to show the model's default behavior:
 
 ```
-infer.generate(
+infer.generateStream(
   model_ref = "qwen3-4b-2507:hn-demo",
   prompt = "What is test-time training?",
   max_tokens = 100,
@@ -88,7 +88,7 @@ ttt.trainStream(
   model_ref = "qwen3-4b-2507:hn-demo",
   input = "Test-time training (TTT) is an emerging paradigm in machine learning where model parameters are adapted at inference time using the input itself as a self-supervised signal. Unlike traditional fine-tuning which requires labeled data and offline training, TTT leverages next-token prediction loss on the input context to create temporary parameter adjustments. This approach is particularly effective for domain adaptation scenarios where the test distribution differs significantly from the training distribution. The key insight is that even a few gradient steps on the input context can substantially improve the model's predictions for that specific input, without requiring any labeled examples.",
   gradient_steps = 3,
-  auto_commit = true
+  adaptationStrategy = autoWriteback
 )
 ```
 
@@ -100,7 +100,7 @@ ttt.trainStream(
 | `loss_improvement` | Initial loss minus final loss | > 0.1 |
 | `initial_perplexity` | How surprised the model is by the text | Higher = more novel |
 | `final_perplexity` | After adaptation | Should be significantly lower |
-| `recommendation` | Server's commit recommendation | `true` = beneficial |
+| `recommendation` | Server's writeback recommendation | `true` = beneficial |
 | `gradient_clipped` | Whether max_grad_norm was hit | Normal on first steps |
 
 **Expected:** loss_improvement > 0.5, perplexity reduction of 30-50%, recommendation = true.
@@ -110,7 +110,7 @@ ttt.trainStream(
 Run the same inference query again:
 
 ```
-infer.generate(
+infer.generateStream(
   model_ref = "qwen3-4b-2507:hn-demo",
   prompt = "What is test-time training?",
   max_tokens = 100,
@@ -130,7 +130,7 @@ ttt.trainStream(
   model_ref = "qwen3-4b-2507:hn-demo",
   input = "Hyprstream implements test-time training using per-tenant LoRA deltas. Each tenant gets an isolated set of low-rank adaptation matrices that are trained using next-token prediction loss on the input context. The system supports both inference-time adaptation and explicit training via the trainStream API.",
   gradient_steps = 3,
-  auto_commit = true
+  adaptationStrategy = autoWriteback
 )
 ```
 
@@ -147,14 +147,14 @@ Look for `accumulated_steps` increasing and `delta_norm_ratios` showing non-zero
 The most impressive demo — the model adapts to the prompt DURING inference, then generates:
 
 ```
-infer.generate(
+infer.generateStream(
   model_ref = "qwen3-4b-2507:hn-demo",
   prompt = "Explain how hyprstream implements test-time training with per-tenant LoRA deltas.",
   max_tokens = 200,
   temperature = 0.3,
   ttt_enabled = true,
   ttt_gradient_steps = 2,
-  auto_commit = true
+  adaptationStrategy = autoWriteback
 )
 ```
 
@@ -183,7 +183,7 @@ The adapter is committed to the model's git repository for version control.
 Reset the delta to show the before/after difference:
 
 ```
-ttt.reset(model_ref="qwen3-4b-2507:hn-demo")
+ttt.zero(model_ref="qwen3-4b-2507:hn-demo")
 ```
 
 Verify all norms are back to zero:
@@ -213,12 +213,12 @@ Key log lines to look for:
 - "Models are git repositories — every adapter export is a versioned commit"
 - "Per-tenant isolation means multiple users can train simultaneously without interference"
 - "The LoRA rank-8 delta is only 11MB — 0.15% of the base model's parameters"
-- "Gradient clipping and AdamW optimizer ensure stable training even with aggressive learning rates"
+- "Gradient clipping and the Muon optimizer (orthogonalized momentum via Newton-Schulz) ensure stable training even with aggressive learning rates"
 
 **For ML practitioners:**
 - "TTT uses NTP loss on the INPUT context — no labeled data needed"
 - "Perplexity gating automatically adjusts step count based on how novel the input is"
-- "The commit/rollback mechanism lets you A/B test adaptations before persisting"
+- "The writeback/evict mechanism lets you A/B test adaptations before persisting (adaptationStrategy=speculative keeps them pending)"
 - "Exported adapters are standard PEFT format — load them in HuggingFace transformers"
 
 **For product people:**
@@ -235,5 +235,5 @@ Key log lines to look for:
 | `Token expired` | Default TTL was 5 minutes | Fixed in v0.3.0 — now 48 hours |
 | `Input too short` | Prompt < 32 tokens | Use longer input text or lower `min_input_length` |
 | `Delta at capacity` | Hit `max_accumulated_steps` (300) | Export/save the adapter, then reset |
-| `No pending adaptation` | Auto-rollback after 60 seconds | Use `auto_commit=true` or commit within 60s |
+| `No pending adaptation` | Auto-evict after 60 seconds | Use `adaptationStrategy=autoWriteback`, or call `ttt.writeback` within 60s |
 | `HeaderTooLarge` on adapter.load | Known issue in safetensors deserialization | Export works — reload path has a pre-existing bug |

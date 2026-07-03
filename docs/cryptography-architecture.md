@@ -24,52 +24,42 @@ The cryptography module (`crates/hyprstream-rpc/src/crypto/`) provides:
 
 | Component | Purpose | Performance |
 |-----------|---------|-------------|
-| Ed25519 Signatures | Request envelope authentication | ~10k/sec |
+| Ed25519 Signatures | Classical envelope signature (inner COSE entry) | ~10k/sec |
+| COSE Composite (EdDSA + ML-DSA-65) | Authoritative envelope authentication (see Hybrid PQ/T section) | Per request |
 | Key Exchange | Stream HMAC key derivation | One-time per stream |
 | Chained HMAC | Streaming response authentication | Millions/sec |
+| Envelope Encryption | Optional envelope confidentiality (AES-256-GCM-SIV + hybrid KEM) | Per request |
 
-## Shared Signing Key
+## Signing Keys
 
-All hyprstream services use a **single shared Ed25519 signing key** for bidirectional authentication.
+The node's Ed25519 signing key lives at **`<secrets_dir>/signing-key`**, where the
+secrets directory is resolved via `HyprConfig::resolve_secrets_dir()` (the
+configured `secrets` directory, or the platform XDG default). It is loaded by
+`load_or_generate_signing_key()` (`crates/hyprstream/src/cli/policy_handlers.rs`):
 
-**Location:** `~/.local/share/hyprstream/models/.registry/keys/signing.key`
+1. `HYPRSTREAM__SIGNING_KEY` env var / `config.signing_key` — **test-only bypass**
+2. Load the key file at `<secrets_dir>/signing-key`
+3. Generate a new key and write it to the file (writable directory only)
 
-### Key Lifecycle
+### Per-Service Keys
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         SHARED KEY MANAGEMENT                            │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  First Startup                      Subsequent Startups                  │
-│       │                                    │                             │
-│       ▼                                    ▼                             │
-│  Key file exists?                    Key file exists?                    │
-│       │                                    │                             │
-│    No │                                Yes │                             │
-│       ▼                                    ▼                             │
-│  Generate 32 bytes                   Load from file                      │
-│  Save to signing.key                 (same key for all)                  │
-│  chmod 0600                                                              │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Why Shared Key?
-
-All services (CLI, systemd units, spawned InferenceServices) must use the **same key** because:
-
-1. **Request verification** - Services verify client signatures
-2. **Response verification** - Clients verify service signatures
-3. **Cross-service calls** - ModelService → InferenceService uses same key
-
-If keys differ, response verification fails with "Response signed by unexpected key".
+Services do not share a single blanket key. Each service obtains its signing key
+via `ctx.service_signing_key(name)` in its factory; in multi-process mode each
+service signs with its **own** Ed25519 key, and verifiers resolve the expected
+key for a peer service through the service trust store
+(`hyprstream-service::service::trust_store`). Response verification is still
+mandatory: a client always pins the expected verifying key for the service it
+calls, and a mismatched signer fails with "Response signed by unexpected key".
 
 ## Ed25519 Digital Signatures
 
 **Location:** `crates/hyprstream-rpc/src/crypto/signing.rs`
 
-All ZMQ messages are signed with Ed25519 to provide authentication, integrity, and non-repudiation.
+All RPC envelopes (requests and responses) are signed to provide authentication,
+integrity, and non-repudiation. The **authoritative** mechanism is the COSE
+composite signature (`cose` field — see the Hybrid PQ/T section below); the raw
+Ed25519 `sig`/`cnf` fields are retained for signer-key advertisement and the JWT
+`cnf` key-binding path.
 
 ### Bidirectional Signing Flow
 
@@ -77,14 +67,14 @@ All ZMQ messages are signed with Ed25519 to provide authentication, integrity, a
 Client                                         Service
     │                                              │
     │  1. Create RequestEnvelope                   │
-    │  2. Sign with shared_key                     │
+    │  2. Sign with client key                     │
     │                                              │
     │────────── SignedEnvelope ───────────────────►│
     │                                              │
     │                               3. Verify signature
     │                               4. Process request
     │                               5. Create ResponseEnvelope
-    │                               6. Sign with shared_key
+    │                               6. Sign with service key
     │                                              │
     │◄───────── ResponseEnvelope ─────────────────│
     │                                              │
@@ -92,20 +82,24 @@ Client                                         Service
     │  8. Process response                         │
 ```
 
-**Mandatory verification**: ZmqClient requires `server_verifying_key` at construction. There is no way to receive unverified response data.
+**Mandatory verification**: `RpcClientImpl` (behind all generated clients, via the `RpcClient` trait) requires the server's verifying key at construction. There is no way to receive unverified response data.
 
 ### Request Envelope Structure
 
-The request signed data is computed as:
+The signature covers the **serialized bytes of the entire `RequestEnvelope`**
+(`crates/hyprstream-rpc/schema/common.capnp`), making the signing scope
+structurally explicit:
 
 ```
-SHA-512(request_id || identity_bytes || payload)
+Cleartext mode:  sig = Ed25519.sign(signing_key, serialize(envelope))
+Encrypted mode:  sig = Ed25519.sign(signing_key, encryptedEnvelope || clientEphemeralPublic)
 ```
 
-Where:
-- `request_id`: 8 bytes (u64, little-endian)
-- `identity_bytes`: Canonical serialization of RequestIdentity
-- `payload`: Raw request payload
+The envelope also carries the COSE composite (`cose` field), detached over the
+canonical envelope bytes (or the encrypted signing-data), which is what
+verification enforces. Identity travels in the envelope's `authorization` union
+(`none` / `local` claims / `federated` token / `idJag`) — there is no separate
+identity field in the signed data.
 
 ### Response Envelope Structure
 
@@ -113,19 +107,18 @@ Where:
 
 ```capnp
 struct ResponseEnvelope {
-    requestId @0 :UInt64;           # Correlates with request
-    payload @1 :Data;               # Service-specific response
-    timestamp @2 :Int64;            # Unix timestamp (milliseconds)
-    signature @3 :Data;             # Ed25519 signature (64 bytes)
-    signerPubkey @4 :Data;          # Server's verifying key (32 bytes)
+    requestId @0 :UInt64;        # Correlates with RequestEnvelope.requestId
+    payload @1 :Data;            # Serialized inner response
+    sig @2 :Data $fixedSize(64); # Ed25519 signature — retained for signer
+    cnf @3 :Data $fixedSize(32); # pubkey advertisement; auth comes from `cose`
+    cose @4 :Data;               # CBOR-encoded nested COSE composite signature
 }
 ```
 
-The response signed data is computed as:
-
-```
-SHA-512(request_id || payload || timestamp)
-```
+The response signing-data is `request_id || payload`, and the response COSE
+composite is domain-separated from the request one (bound to a distinct
+`RESPONSE_ENVELOPE_TYPE_ID` in the COSE `external_aad`), so a response signature
+can never verify as a request signature or vice versa.
 
 ### Response Signing API
 
@@ -187,26 +180,29 @@ let restored = verifying_key_from_bytes(&public_bytes)?;
 
 | Property | Guarantee |
 |----------|-----------|
-| **Authentication** | Only holder of shared signing key can create valid signatures |
+| **Authentication** | Only the holder of the signing key can create valid signatures |
 | **Bidirectional** | Both requests AND responses are signed (no MITM possible) |
 | **Integrity** | Any modification invalidates the signature |
 | **Non-repudiation** | Signature survives message forwarding through proxies |
-| **Mandatory verification** | ZmqClient enforces response verification (no bypass) |
+| **Mandatory verification** | `RpcClientImpl` enforces response verification (no bypass) |
 | **Pre-hashing** | Uses SHA-512 streaming hash (effectively Ed25519ph) |
 | **Zeroization** | Secret keys are securely erased from memory when dropped |
 
 ### Key Loading
 
 ```rust
-use hyprstream_core::cli::policy_handlers::load_or_generate_signing_key;
+use hyprstream::cli::policy_handlers::load_or_generate_signing_key;
 
-// Load shared key (generates if missing)
-let keys_dir = models_dir.join(".registry").join("keys");
-let signing_key = load_or_generate_signing_key(&keys_dir).await?;
+// Load the node signing key (generates if missing).
+// The path argument is ignored; the actual location is always
+// <secrets_dir>/signing-key via HyprConfig::resolve_secrets_dir().
+// HYPRSTREAM__SIGNING_KEY is a test-only env bypass.
+let signing_key = load_or_generate_signing_key(Path::new("")).await?;
 let verifying_key = signing_key.verifying_key();
 
-// Both signing_key and verifying_key are derived from the same 32-byte secret
-// All services must load from the same file to interoperate
+// Both signing_key and verifying_key are derived from the same 32-byte secret.
+// Per-service keys are obtained via ctx.service_signing_key(name) in factories;
+// verifiers resolve peer keys through the service trust store.
 ```
 
 ## Hybrid (PQ/T) Signatures — WNS posture
@@ -263,6 +259,36 @@ Ed25519 key but only the node/OAuth `#mesh-pq` VM is published, so remote per-se
 identities verify at the classical floor until each service publishes/anchors its own
 `#mesh-pq` via DID resolution (tracked under #137 / #279).
 
+## Envelope Confidentiality
+
+**Location:** `crates/hyprstream-rpc/src/crypto/envelope_crypto.rs`, `envelope.rs`
+
+Request envelopes support an optional **encrypted mode** (encrypt-then-sign). The
+serialized `RequestEnvelope` bytes are encrypted with **AES-256-GCM-SIV** and
+carried in `SignedEnvelope.encrypted_envelope`; the cleartext `envelope` field is
+unused on the wire in this mode.
+
+Key agreement is X25519 static-ephemeral DH: the client generates an ephemeral
+X25519 keypair (`client_ephemeral_public`) and derives the AEAD key against the
+server's Ed25519 key converted to X25519 via the birational map
+(`to_montgomery()`), with the KDF context `hyprstream-envelope-v1`.
+
+Under the `Hybrid` crypto policy, encryption is a **hybrid KEM**: an ML-KEM-768
+encapsulation against the server's KEM key is combined with the X25519 secret,
+and the 1088-byte ciphertext travels in `SignedEnvelope.pq_kem_ciphertext`.
+`Hybrid` mode requires both the server ML-KEM key and an ML-DSA-65 signing key —
+it fails closed rather than silently downgrading.
+
+The signature (raw Ed25519 and the COSE composite) covers the encrypted
+signing-data:
+
+```
+signing_data = ciphertext ‖ client_ephemeral_public ‖ [pq_kem_ciphertext]
+```
+
+Constructors: `SignedEnvelope::new_signed_encrypted()` (classical) and
+`new_signed_encrypted_hybrid()` / `new_signed_encrypted_with_policy()` (hybrid).
+
 ## Key Exchange
 
 **Location:** `crates/hyprstream-rpc/src/crypto/key_exchange.rs`
@@ -309,7 +335,7 @@ let keys: StreamKeys = derive_stream_keys(
 )?;
 
 // StreamKeys contains:
-// - topic: 64-char hex string for ZMQ PUB/SUB routing
+// - topic: 64-char hex string, used as the moq broadcast-path component
 // - mac_key: 32-byte HMAC key for MAC chain
 ```
 
@@ -459,9 +485,23 @@ let state = verifier.chain_state();  // &[u8; 32]
 // etc.
 ```
 
+## Group-Keyed Event Encryption
+
+**Location:** `crates/hyprstream-rpc/src/events.rs`, `crypto/group_key.rs`, `crypto/event_crypto.rs`
+
+Events published on the moq event plane can be encrypted at the **group** level:
+a symmetric group key encrypts every event for a subscriber group (O(1) per
+publish instead of O(N) per-subscriber encryption). The wire type is
+`EncryptedEvent`; the group key is distributed by wrapping it per subscriber
+(`wrap_group_key` / `unwrap_group_key`), and key rotation is driven by a
+`RekeyEvent` published under a `RekeyPolicy` (rotation interval, max key
+lifetime, grace period). See
+[eventservice-architecture.md](eventservice-architecture.md) for the full
+EventService design.
+
 ## End-to-End Integration
 
-### Complete Request/Response Flow (REQ/REP)
+### Complete Request/Response Flow
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
@@ -473,15 +513,15 @@ let state = verifier.chain_state();  // &[u8; 32]
 │     │ SignedEnvelope                           │                            │
 │     │   envelope: RequestEnvelope {            │                            │
 │     │     request_id: 12345                    │                            │
-│     │     identity: local:alice                │                            │
+│     │     authorization: local(claims)         │                            │
 │     │     payload: {...}                       │                            │
 │     │   }                                      │                            │
-│     │   signature: Ed25519(shared_key)         │ ◄── Signed with shared key│
+│     │   sig / cnf + cose composite             │ ◄── Signed w/ client key  │
 │     └─────────────────────────────────────────┘                            │
 │                                    │                                        │
 │                                    ▼                                        │
 │  2. Server verifies request signature, processes                            │
-│     unwrap_envelope(wire_bytes, &verifying_key, &nonce_cache)?             │
+│     unwrap_envelope(wire_bytes, &unwrap_opts)?                              │
 │                                    │                                        │
 │                                    ▼                                        │
 │  3. Server creates signed response                                          │
@@ -489,9 +529,7 @@ let state = verifier.chain_state();  // &[u8; 32]
 │     │ ResponseEnvelope                         │                            │
 │     │   request_id: 12345                      │ ◄── Correlates request    │
 │     │   payload: {...}                         │                            │
-│     │   timestamp: 1762974327000               │                            │
-│     │   signature: Ed25519(shared_key)         │ ◄── Signed with shared key│
-│     │   signer_pubkey: [32 bytes]              │                            │
+│     │   sig / cnf + cose composite             │ ◄── Signed w/ service key │
 │     └─────────────────────────────────────────┘                            │
 │                                    │                                        │
 │                                    ▼                                        │
@@ -502,7 +540,7 @@ let state = verifier.chain_state();  // &[u8; 32]
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Complete Streaming Flow (PUB/SUB with HMAC)
+### Complete Streaming Flow (moq broadcast with HMAC)
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
@@ -513,10 +551,10 @@ let state = verifier.chain_state();  // &[u8; 32]
 │     ┌─────────────────────────────────────────┐                            │
 │     │ RequestEnvelope                          │                            │
 │     │   request_id: 12345                      │                            │
-│     │   identity: local:alice                  │                            │
+│     │   authorization: local(claims)           │                            │
 │     │   payload: {prompt: "Hello"}             │                            │
-│     │   ephemeral_pubkey: [32 bytes]           │ ◄── Client DH public      │
-│     │   signature: Ed25519(shared_key)         │ ◄── Signed with shared key│
+│     │   client_dh_public: [32 bytes]           │ ◄── Client DH public      │
+│     │   sig / cnf + cose composite             │ ◄── Signed w/ client key  │
 │     └─────────────────────────────────────────┘                            │
 │                                    │                                        │
 │                                    ▼                                        │
@@ -531,14 +569,14 @@ let state = verifier.chain_state();  // &[u8; 32]
 │     │   payload: StreamStarted {               │                            │
 │     │     stream_id, endpoint, server_pubkey   │ ◄── DH server public      │
 │     │   }                                      │                            │
-│     │   signature: Ed25519(shared_key)         │ ◄── Signed with shared key│
+│     │   sig / cnf + cose composite             │ ◄── Signed w/ service key │
 │     └─────────────────────────────────────────┘                            │
 │                                    │                                        │
 │                                    ▼                                        │
 │  4. Server streams data with chained HMACs                                  │
 │     ┌─────────────────────────────────────────┐                            │
-│     │ StreamChunk                              │                            │
-│     │   topic: keys.topic                      │ ◄── DH-derived topic      │
+│     │ StreamChunk (moq broadcast at keys.topic)│                            │
+│     │   topic: keys.topic                      │ ◄── DH-derived path       │
 │     │   data: "Hello"                          │                            │
 │     │   hmac: HMAC(mac_key, prev || data)      │ ◄── Chained MAC           │
 │     └─────────────────────────────────────────┘                            │
@@ -551,41 +589,34 @@ let state = verifier.chain_state();  // &[u8; 32]
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Example: REQ/REP with Mandatory Response Verification
+### Example: Request/Reply with Mandatory Response Verification
 
 ```rust
 use hyprstream_rpc::prelude::*;
 
-// === Shared Key (loaded from file in real code) ===
+// === Keys (loaded from the secrets dir / trust store in real code) ===
 let (signing_key, verifying_key) = generate_signing_keypair();
 
 // === Client: Create and Send Signed Request ===
-let request_id = 12345u64;
-let envelope = RequestEnvelope {
-    request_id,
-    identity: RequestIdentity::local(),
-    payload: b"request data".to_vec(),
-    ephemeral_pubkey: None,
-    nonce: generate_nonce(),
-    timestamp: current_timestamp_ms(),
-    claims: None,
-};
+// RequestEnvelope::anonymous() fills request_id, iat, nonce, and an empty
+// authorization union; other constructors attach JWT/federated authorization.
+let envelope = RequestEnvelope::anonymous(b"request data".to_vec());
 
 let signed = SignedEnvelope::new_signed(envelope, &signing_key);
 let wire_bytes = serialize(&signed);
-// send via ZMQ...
+// send over the transport (inproc / UDS / QUIC / iroh)...
 
 // === Server: Verify Request, Create Signed Response ===
-let (ctx, payload) = unwrap_envelope(&wire_bytes, &verifying_key, &nonce_cache)?;
+let (ctx, payload) = unwrap_envelope(&wire_bytes, &unwrap_opts)?;
 let response_payload = process_request(&ctx, &payload)?;
 
 let response = ResponseEnvelope::new_signed(
     ctx.request_id,
     response_payload,
-    &signing_key,  // Same shared key
+    &signing_key,  // The service's signing key
 );
 let response_bytes = serialize(&response);
-// send via ZMQ...
+// send over the transport...
 
 // === Client: Verify Response (MANDATORY) ===
 let (request_id, payload) = unwrap_response(
@@ -603,7 +634,7 @@ use hyprstream_rpc::crypto::{
     ChainedStreamHmac,
 };
 
-// === Shared Key Setup ===
+// === Key Setup ===
 let (signing_key, verifying_key) = generate_signing_keypair();
 
 // === Client: Create Signed Request with DH Public ===
@@ -668,9 +699,17 @@ for (chunk, mac) in chunks.iter().zip(macs.iter()) {
 |------|---------|
 | `crates/hyprstream-rpc/src/crypto/mod.rs` | Module exports, documentation |
 | `crates/hyprstream-rpc/src/crypto/signing.rs` | Ed25519 signatures |
+| `crates/hyprstream-rpc/src/crypto/cose_sign.rs` | COSE composite (EdDSA + ML-DSA-65) sign/verify |
+| `crates/hyprstream-rpc/src/crypto/cose_sign1.rs` | COSE_Sign1 encoding + `external_aad` schema binding |
+| `crates/hyprstream-rpc/src/crypto/pq.rs` | Post-quantum primitives: ML-DSA-65, ML-KEM-768 |
+| `crates/hyprstream-rpc/src/crypto/envelope_crypto.rs` | Envelope encryption (X25519 DH + AES-256-GCM-SIV, hybrid ML-KEM) |
 | `crates/hyprstream-rpc/src/crypto/key_exchange.rs` | Ristretto255/ECDH P-256 key exchange |
 | `crates/hyprstream-rpc/src/crypto/hmac.rs` | Chained HMAC for streaming |
-| `crates/hyprstream-rpc/src/envelope.rs` | SignedEnvelope, ResponseEnvelope, unwrap functions |
+| `crates/hyprstream-rpc/src/crypto/group_key.rs` | Group-key wrapping for event confidentiality |
+| `crates/hyprstream-rpc/src/crypto/event_crypto.rs` | Event encryption primitives |
+| `crates/hyprstream-rpc/src/crypto/broadcast_primitives.rs` | Reusable broadcast crypto helpers (fingerprints, AAD, one-shot MAC) |
+| `crates/hyprstream-rpc/src/events.rs` | `EncryptedEvent`, `RekeyEvent`, group-keyed event codec |
+| `crates/hyprstream-rpc/src/envelope.rs` | SignedEnvelope, ResponseEnvelope, unwrap functions, `PqTrustStore` |
 | `crates/hyprstream-rpc/schema/common.capnp` | Cap'n Proto schema for envelope types |
 | `crates/hyprstream/src/cli/policy_handlers.rs` | `load_or_generate_signing_key()` |
 

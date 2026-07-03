@@ -1,28 +1,27 @@
-# Tool Calling Implementation
+# Tool Calling
 
 ## Overview
 
-HyprStream now supports OpenAI-compatible tool calling (function calling) for compatibility with Cline and other coding frontends. This implementation bridges the gap between OpenAI's JSON-based tool format and Qwen3's native XML-based tool format.
+HyprStream supports OpenAI-compatible tool calling (function calling) for
+compatibility with Cline and other coding frontends, across multiple model
+families (Qwen3, Qwen3.5, Llama 3.1+, Mistral).
 
-## Architecture
+The design splits into two independent halves:
 
-### Format Translation Layer
-
-The implementation uses a translation layer that:
-
-1. **Input**: Converts OpenAI JSON tool definitions → Qwen3 XML format (injected into system message)
-2. **Output**: Parses Qwen3 XML tool calls → OpenAI JSON ToolCall format
+- **Input (prompt) side** — tool definitions are formatted by the model's own
+  HuggingFace chat template. There is no hand-rolled prompt injection.
+- **Output (parsing) side** — model output is parsed into OpenAI `ToolCall`
+  JSON using a per-model-family `ToolCallFormat`.
 
 ### Files
 
-- **`crates/hyprstream/src/api/tools.rs`**: Core translation logic
-- **`crates/hyprstream/src/server/routes/openai.rs`**: Integration into chat completion endpoints
+- **`crates/hyprstream/src/api/tools.rs`** — output-side format detection and parsing
+- **`crates/hyprstream/src/runtime/template_engine.rs`** — chat template application (input side)
+- **`crates/hyprstream/src/server/routes/openai.rs`** — integration into the chat completion endpoints
 
-## How It Works
+## Input Side: Chat Templates
 
-### 1. Tool Definition Injection (Request Phase)
-
-When a client sends tools in the request:
+When a client sends `tools` in the request:
 
 ```json
 {
@@ -39,38 +38,60 @@ When a client sends tools in the request:
 }
 ```
 
-The server:
-1. Converts tools to Qwen3 XML format using `tools::tools_to_qwen3_xml()`
-2. Injects XML into system message (or creates new system message)
-3. Applies chat template with augmented messages
+the route serializes the tool array to JSON and passes it through the
+`apply_chat_template` RPC (`server/routes/openai.rs:393-418`). The template
+engine (`runtime/template_engine.rs:155-218`) exposes it to the model's
+HuggingFace chat template as the standard `tools` minijinja variable — the same
+variable HF tokenizers use — so each model family's own template formats the
+tool descriptions natively (Qwen's `<tools>` block, Llama 3.1's JSON preamble,
+Mistral's `[AVAILABLE_TOOLS]`, etc.). The server never constructs
+format-specific tool markup itself.
 
-Example XML injection:
-```xml
-<tools>
-  <tool name="execute_command">
-    <description>Execute a shell command</description>
-    <parameters>
-      {JSON schema}
-    </parameters>
-  </tool>
-</tools>
+## Output Side: `ToolCallFormat`
+
+Parsing is per-model-family, selected from the model architecture at request
+time (`api/tools.rs:23-35`):
+
+```rust
+pub enum ToolCallFormat {
+    /// Qwen3 XML: <tool_call>{"name":…,"arguments":…}</tool_call>
+    Qwen3Xml,
+    /// Qwen3.5 XML parameter format:
+    /// <tool_call><function=NAME><parameter=KEY>value</parameter>…</function></tool_call>
+    Qwen35XmlParam,
+    /// Llama 3.1+: <|python_tag|> prefix + JSON {"name":…,"parameters":…}
+    LlamaJson,
+    /// Mistral: [TOOL_CALLS] prefix + JSON array
+    MistralJson,
+    /// Model does not support tool calling.
+    None,
+}
 ```
 
-### 2. Tool Call Parsing (Response Phase)
+Selection: `ToolCallFormat::from_architecture()` (from the detected
+`ModelArchitecture`), with `from_architecture_str()` / `from_model_ref()`
+variants for string inputs.
 
-When Qwen3 generates a tool call:
+The format-aware API (`api/tools.rs:85-115`) is what the routes use:
 
-```xml
-<tool_call>
-{"name": "execute_command", "arguments": {"command": "ls -la"}}
-</tool_call>
-```
+- `has_tool_calls_for_format(format, text)` — fast marker check
+- `parse_tool_calls_for_format(format, text)` — parse into OpenAI `ToolCall`s
+- `extract_text_content_for_format(format, text)` — strip tool-call markup,
+  leaving the plain text content
 
-The server:
-1. Detects tool calls using `tools::has_tool_calls()`
-2. Parses XML using `tools::parse_qwen3_tool_calls()`
-3. Extracts text content using `tools::extract_text_content()`
-4. Returns OpenAI-format response:
+The bare `has_tool_calls()` / `extract_text_content()` functions are
+backwards-compatibility shims that hardcode the Qwen3 format — prefer the
+`*_for_format` variants.
+
+## Request Flow
+
+### Non-streaming (`/v1/chat/completions`)
+
+1. Serialize `tools` → pass to the chat template as the `tools` variable
+2. Determine `ToolCallFormat` from the model architecture
+3. Generate response
+4. Parse tool calls from the accumulated text with the selected format
+5. Return with `finish_reason: "tool_calls"` if any were found:
 
 ```json
 {
@@ -92,49 +113,29 @@ The server:
 }
 ```
 
-## Implementation Details
+### Streaming (`stream: true`)
 
-### Non-Streaming (`/v1/chat/completions`)
+1. Same input handling
+2. Stream tokens as generated (accumulating text internally)
+3. On completion: parse the accumulated text, send tool calls in a delta chunk,
+   then a final chunk with `finish_reason: "tool_calls"`
 
-1. Inject tools into system message
-2. Apply chat template
-3. Generate response
-4. Parse tool calls from accumulated text
-5. Return with `finish_reason: "tool_calls"` if tool calls detected
+## Parallel Tool Calls
 
-### Streaming (`/v1/chat/completions` with `stream: true`)
-
-1. Inject tools into system message
-2. Apply chat template
-3. Stream tokens as they're generated (accumulate text internally)
-4. On completion:
-   - Parse accumulated text for tool calls
-   - Send tool calls in a separate delta chunk
-   - Send final completion with `finish_reason: "tool_calls"`
-
-## Key Functions
-
-### `tools::tools_to_qwen3_xml(tools: &[Tool]) -> String`
-Converts OpenAI tool definitions to Qwen3 XML format for prompt injection.
-
-### `tools::parse_qwen3_tool_calls(text: &str) -> Result<Vec<ToolCall>>`
-Parses `<tool_call>` XML tags from model output and converts to OpenAI ToolCall format.
-
-### `tools::extract_text_content(text: &str) -> String`
-Strips `<tool_call>` tags from response, leaving only text content.
-
-### `tools::has_tool_calls(text: &str) -> bool`
-Fast check for presence of tool call tags.
+Multiple tool calls in one response are supported: every parser returns a
+`Vec<ToolCall>`, extracting each `<tool_call>` block (or each element of
+Mistral's JSON array) in order. The parsers are also tolerant of common model
+misbehavior (duplicated `<tool_call>` tags, non-JSON blocks are skipped).
 
 ## Compatibility
 
-- ✅ Cline (v3.35+)
-- ✅ Any OpenAI-compatible client expecting function/tool calling
-- ✅ Models using Qwen3-style XML tool format
+- Cline (v3.35+) and any OpenAI-compatible client expecting function/tool calling
+- Qwen3-family (XML/JSON), Qwen3.5 (XML parameter format), Llama 3.1+
+  (`<|python_tag|>` JSON), Mistral (`[TOOL_CALLS]` JSON array)
+- Models without a known tool format (`ToolCallFormat::None`) pass text through
+  unchanged
 
 ## Testing
-
-To test tool calling:
 
 ```bash
 curl http://localhost:3000/v1/chat/completions \
@@ -159,11 +160,9 @@ curl http://localhost:3000/v1/chat/completions \
   }'
 ```
 
-Expected: Response with `tool_calls` array and `finish_reason: "tool_calls"`.
+Expected: response with a `tool_calls` array and `finish_reason: "tool_calls"`.
 
-## Future Enhancements
+## Known Limitations
 
-- [ ] Support for `tool_choice` parameter (force/disable tool use)
-- [ ] Parallel tool calling (multiple tools in one response)
-- [ ] Tool call result handling in conversation history
-- [ ] Support for other XML-based tool formats
+- The `tool_choice` parameter is accepted but ignored — tool use cannot yet be
+  forced or disabled per-request.
