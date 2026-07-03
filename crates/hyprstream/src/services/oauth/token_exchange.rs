@@ -392,6 +392,79 @@ impl SubjectContextResolver for ClaimsSubjectContextResolver {
     }
 }
 
+/// The two principals a minted grant token carries (#680/#681). For a delegated
+/// grant this splits the single `sub` into the delegator (source of authority)
+/// and the actor (the presenter that signs the downstream envelope) — the
+/// confused-deputy fix: the token records "actor acting for delegator" instead
+/// of collapsing to one identity.
+struct TokenPrincipals {
+    /// The minted token's `sub`: the delegator (UCAN chain-root issuer) for a
+    /// delegated grant, or the subject (the self-issued root's DID) for a root
+    /// grant. This is always a UCAN principal DID — never the RFC 8707 resource
+    /// indicator (which stays on the `aud` claim).
+    sub: String,
+    /// The minted token's RFC 8693 §4.1 `act` claim: the actor (grant audience /
+    /// presenter). `None` for a self-issued root grant (single principal).
+    act: Option<hyprstream_rpc::auth::ActClaim>,
+}
+
+/// Derive the subject's MAC [`SecurityContext`] for a (possibly delegated) UCAN
+/// grant, plus the [`TokenPrincipals`] the mint stamps on the token (#680/#681).
+///
+/// - **Self-issued root grant** (`root_issuer == audience`): single-principal.
+///   Context is `resolve(audience)`; `sub = audience`, `act = None`.
+/// - **Delegated grant** (`root_issuer != audience`): two-principal (#681). The
+///   effective context is `meet(delegator = root_issuer, actor = audience)` via
+///   [`SecurityContext::delegated`](hyprstream_rpc::auth::mac::SecurityContext::delegated)
+///   — fail-closed if *either* principal is unresolved (no default clearance for
+///   a missing principal). `sub = delegator`, `act = { sub: actor, clearance:
+///   actor's }`, so the token is minted as "actor acting for delegator".
+///
+/// Pure over the resolver (a trait) so the delegation logic is unit-testable
+/// without the async HTTP mint path.
+fn resolve_grant_subject(
+    grant: &hyprstream_rpc::auth::ucan::token::Ucan,
+    resolver: &dyn SubjectContextResolver,
+) -> (
+    Option<hyprstream_rpc::auth::mac::SecurityContext>,
+    TokenPrincipals,
+) {
+    let audience = grant.audience().as_str();
+    let delegator = grant.root_issuer().as_str();
+
+    if delegator == audience {
+        // Self-issued root — no delegation. Single principal = the subject.
+        return (
+            resolver.resolve(audience),
+            TokenPrincipals {
+                sub: audience.to_owned(),
+                act: None,
+            },
+        );
+    }
+
+    // Delegation: resolve BOTH principals and take the fail-closed meet (#681).
+    let delegator_ctx = resolver.resolve(delegator);
+    let actor_ctx = resolver.resolve(audience);
+    let ctx = hyprstream_rpc::auth::mac::SecurityContext::delegated(
+        delegator_ctx.as_ref(),
+        actor_ctx.as_ref(),
+    );
+    let principals = TokenPrincipals {
+        sub: delegator.to_owned(),
+        act: Some(hyprstream_rpc::auth::ActClaim {
+            sub: audience.to_owned(),
+            // The actor's authority-asserted clearance, carried so a downstream
+            // reader can re-take the meet off the one verified token. `None` if
+            // the actor is unresolved — in which case `ctx` above is already
+            // `None` and the grant fails closed before minting.
+            clearance: actor_ctx.map(|c| *c.clearance()),
+            act: None,
+        }),
+    };
+    (ctx, principals)
+}
+
 /// POST /oauth/token — UCAN grant (RFC 8693 token-exchange,
 /// `subject_token_type = urn:hyprstream:token-type:ucan-grant`).
 ///
@@ -458,9 +531,12 @@ pub async fn exchange_ucan_grant(
         }
     };
 
-    // ── 3. Resolve the subject's MAC context (S8 seam; deny until then) ────
-    let audience_did = grant.audience().as_str().to_owned();
-    let subject_ctx = subject_resolver.resolve(&audience_did);
+    // ── 3. Resolve the subject's MAC context (S8 seam; deny until then). ────
+    //    #680/#681: a delegated grant (chain root ≠ audience) resolves TWO
+    //    principals and takes the fail-closed meet(delegator, actor); a
+    //    self-issued root grant stays single-principal. `principals` carries the
+    //    delegator/actor split the mint stamps onto the token.
+    let (subject_ctx, principals) = resolve_grant_subject(&grant, subject_resolver);
 
     // ── 4. Parse the requested access off the form fields ──────────────────
     // TODO(#572-object-label): wire the manifest/TE object-label resolver so
@@ -537,7 +613,7 @@ pub async fn exchange_ucan_grant(
         requested_scope: requested_scope.map(str::to_owned),
         audience: audience.map(str::to_owned),
     };
-    mint_grant_token(state, &granted, &dpop_jkt, Some(grant_refresh)).await
+    mint_grant_token(state, &granted, &dpop_jkt, Some(grant_refresh), principals).await
 }
 
 /// Re-evaluate a UCAN grant on refresh and re-mint (MAC #547 / B1 #673).
@@ -618,11 +694,12 @@ pub(crate) async fn exchange_ucan_grant_refresh(
         Err(msg) => return tx_error(StatusCode::BAD_REQUEST, "invalid_scope", &msg),
     };
 
-    // Resolve the subject's MAC context exactly as the mint path does. Mirrors
-    // the production dispatch's deny-by-default resolver until the S8 concrete
-    // resolver is wired (TODO(#572-verifier)/#574) — refresh must not be more
-    // permissive than mint.
-    let subject_ctx = DenyUnlabeledResolver.resolve(grant.audience().as_str());
+    // Resolve the subject's MAC context exactly as the mint path does — incl.
+    // the #680/#681 two-principal delegated meet. Mirrors the production
+    // dispatch's deny-by-default resolver until the S8 concrete resolver is
+    // wired (TODO(#572-verifier)/#574) — refresh must not be more permissive
+    // than mint.
+    let (subject_ctx, principals) = resolve_grant_subject(&grant, &DenyUnlabeledResolver);
 
     // The verifier: same trust-store-anchored construction as mint. Absent ⇒
     // fail closed (no unverified chain).
@@ -667,7 +744,7 @@ pub(crate) async fn exchange_ucan_grant_refresh(
     };
 
     // Re-mint + rotate, re-persisting the grant context for the next refresh.
-    mint_grant_token(state, &granted, &dpop_jkt, Some(ucan_grant.clone())).await
+    mint_grant_token(state, &granted, &dpop_jkt, Some(ucan_grant.clone()), principals).await
 }
 
 /// Map an S6 [`GrantError`] to a concrete OAuth 2.1 error response. Every variant
@@ -750,6 +827,7 @@ async fn mint_grant_token(
     granted: &GrantedAccess,
     dpop_jkt: &str,
     grant_refresh: Option<super::state::UcanGrantRefresh>,
+    principals: TokenPrincipals,
 ) -> Response {
     let now = chrono::Utc::now().timestamp();
     let ttl = state
@@ -757,13 +835,13 @@ async fn mint_grant_token(
         .min(crate::mac::exchange::MAX_ACCESS_TOKEN_TTL_SECS);
     let expires_at = now + ttl as i64;
 
-    // The token subject is the grant's audience (the delegate). The capability
-    // subset the token encodes is carried as a scope string for downstream
-    // enforcement; the cnf.jkt binds it to the presenter's key.
-    let sub = granted
-        .audience
-        .clone()
-        .unwrap_or_else(|| "ucan-grant".to_owned());
+    // #680/#681: the token subject is the DELEGATOR (source of authority) for a
+    // delegated grant, or the subject for a root grant — always a UCAN principal
+    // DID, never the RFC 8707 resource indicator (which stays on `aud`). For a
+    // delegation, the actor (presenter that signs downstream) is carried in the
+    // `act` claim below, so the token records "actor acting for delegator"
+    // rather than collapsing to one identity (the confused-deputy fix).
+    let sub = principals.sub.clone();
     let scope_str = format!(
         "{}@{}",
         granted.capability.ability, granted.capability.resource
@@ -773,14 +851,19 @@ async fn mint_grant_token(
     // subset in the `cap` claim so the downstream PEP (S2) enforces the minted
     // least-authority on the wire, and a refresh can only re-grant this subset
     // — not just log it. The cnf.jkt binding + short ttl remain load-bearing.
-    let claims = hyprstream_rpc::auth::Claims::new(sub.clone(), now, expires_at)
+    let mut claims = hyprstream_rpc::auth::Claims::new(sub.clone(), now, expires_at)
         .with_issuer(state.issuer_url.clone())
         .with_audience(granted.audience.clone())
         .with_cap(scope_str)
         .with_jti();
+    // #680/#681: stamp the actor (delegate) so the two-principal delegation is
+    // verifiable downstream (`meet(delegator, actor)`, assurance from the actor
+    // who signs the envelope). Absent for a self-issued root grant.
+    if let Some(actor) = principals.act {
+        claims = claims.with_act(actor);
+    }
     // DPoP sender-binding via cnf.jkt (RFC 9449 §6). ZSP: no cnf ⇒ bearer ⇒
     // rejected. We set jkt directly from the verified proof.
-    let mut claims = claims;
     claims.cnf = Some(hyprstream_rpc::auth::Cnf {
         jwk: None,
         jkt: Some(dpop_jkt.to_owned()),
@@ -1039,5 +1122,145 @@ mod tests {
         assert_eq!(ug.grant_cbor_b64, "Zm9vYmFy");
         assert_eq!(ug.grant_cid, blake3::hash(b"the-grant").to_hex().to_string());
         assert_eq!(ug.requested_scope.as_deref(), Some("read:model:llama"));
+    }
+
+    // ── #680/#681: two-principal delegated grant derivation ─────────────────
+
+    use hyprstream_rpc::auth::mac::SecurityContext;
+    use hyprstream_rpc::auth::ucan::token::{Did, Ucan, UcanPayload};
+    use std::collections::HashMap;
+
+    fn did(seed: u8) -> Did {
+        Did::from_ed25519(&[seed; 32])
+    }
+
+    /// A minimal UCAN (payload only; `resolve_grant_subject` reads
+    /// `audience()`/`root_issuer()` off the structure, not the signature).
+    fn ucan(issuer: Did, audience: Did, proofs: Vec<Ucan>) -> Ucan {
+        Ucan {
+            payload: UcanPayload {
+                issuer,
+                audience,
+                capabilities: vec![],
+                not_before: None,
+                expiration: Some(9_999_999_999),
+                nonce: vec![],
+            },
+            proofs,
+            signature: vec![],
+        }
+    }
+
+    fn ctx(level: Level, bits: &[u32], km: VerifiedKeyMaterial) -> SecurityContext {
+        SecurityContext::new(level, comps(bits), km)
+    }
+
+    /// A resolver that maps specific DIDs to contexts; everything else `None`.
+    struct MapResolver(HashMap<String, SecurityContext>);
+    impl SubjectContextResolver for MapResolver {
+        fn resolve(&self, did: &str) -> Option<SecurityContext> {
+            self.0.get(did).cloned()
+        }
+    }
+
+    /// A self-issued root grant (issuer == audience) is single-principal: `sub`
+    /// is the subject, no `act`, and the context is a plain `resolve(audience)`.
+    #[test]
+    fn root_grant_is_single_principal() {
+        let subject = did(1);
+        let subject_did = subject.as_str().to_owned();
+        let grant = ucan(subject.clone(), subject, vec![]);
+        let resolver = MapResolver(HashMap::from([(
+            subject_did.clone(),
+            ctx(Level::Secret, &[0], VerifiedKeyMaterial::PqHybrid),
+        )]));
+
+        let (context, principals) = resolve_grant_subject(&grant, &resolver);
+        assert!(principals.act.is_none(), "root grant has no actor");
+        assert_eq!(principals.sub, subject_did);
+        assert_eq!(context.map(|c| c.level()), Some(Level::Secret));
+    }
+
+    /// A delegated grant (root issuer ≠ audience) splits into delegator (`sub`)
+    /// and actor (`act`), and the derived context is the fail-closed
+    /// `meet(delegator, actor)` — never either principal alone (#681).
+    #[test]
+    fn delegated_grant_splits_principals_and_meets() {
+        let user = did(2); // delegator / source of authority
+        let mcp = did(3); // actor / presenter
+        let user_did = user.as_str().to_owned();
+        let mcp_did = mcp.as_str().to_owned();
+        // user delegates directly to mcp (issuer=user, audience=mcp).
+        let grant = ucan(user, mcp, vec![]);
+        let resolver = MapResolver(HashMap::from([
+            // delegator: Secret / {0,1}
+            (
+                user_did.clone(),
+                ctx(Level::Secret, &[0, 1], VerifiedKeyMaterial::PqHybrid),
+            ),
+            // actor: Confidential / {1,2}
+            (
+                mcp_did.clone(),
+                ctx(Level::Confidential, &[1, 2], VerifiedKeyMaterial::PqHybrid),
+            ),
+        ]));
+
+        let (context, principals) = resolve_grant_subject(&grant, &resolver);
+        assert_eq!(principals.sub, user_did, "sub is the delegator");
+        let act = principals.act.expect("delegation carries an actor");
+        assert_eq!(act.sub, mcp_did, "act is the actor");
+        // meet = min level (Confidential) ∩ compartments ({1}).
+        let context = context.expect("both principals resolved ⇒ Some");
+        assert_eq!(context.level(), Level::Confidential, "min level");
+        assert_eq!(context.compartments(), comps(&[1]), "compartment intersection");
+    }
+
+    /// The delegated derivation fails closed if EITHER principal is unresolved
+    /// — no default clearance for a missing principal (#681 AC).
+    #[test]
+    fn delegated_grant_fails_closed_if_either_principal_unresolved() {
+        let user = did(4);
+        let mcp = did(5);
+        let user_did = user.as_str().to_owned();
+        let grant = ucan(user, mcp, vec![]);
+        // Only the delegator resolves; the actor does not.
+        let resolver = MapResolver(HashMap::from([(
+            user_did,
+            ctx(Level::Secret, &[0], VerifiedKeyMaterial::PqHybrid),
+        )]));
+
+        let (context, principals) = resolve_grant_subject(&grant, &resolver);
+        assert!(
+            context.is_none(),
+            "missing actor clearance ⇒ deny (no default clearance)"
+        );
+        // The principal split is still reported (the actor clearance is None),
+        // but the None context makes evaluate_grant deny before any mint.
+        assert!(principals.act.is_some());
+    }
+
+    /// Multi-hop delegation roots the delegator at the CHAIN ROOT issuer, not
+    /// the nearest hop (RFC 8693 §4.1 — authority flows from the root).
+    #[test]
+    fn multihop_delegation_roots_at_chain_root() {
+        let user = did(6); // ultimate authority (chain root)
+        let intermediate = did(7);
+        let mcp = did(8); // final presenter
+        let root_proof = ucan(user.clone(), intermediate.clone(), vec![]);
+        let leaf = ucan(intermediate, mcp.clone(), vec![root_proof]);
+
+        // No clearances resolved — we only assert the principal identities.
+        let resolver = MapResolver(HashMap::new());
+        let (_ctx, principals) = resolve_grant_subject(&leaf, &resolver);
+        assert_eq!(
+            principals.sub,
+            user.as_str(),
+            "delegator is the chain-root issuer, not the intermediate"
+        );
+        assert_eq!(
+            principals.act.expect("delegation").sub,
+            mcp.as_str(),
+            "actor is the final audience/presenter"
+        );
     }
 }
