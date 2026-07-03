@@ -73,6 +73,10 @@ pub struct HyprConfig {
     #[serde(default)]
     pub oai: OAIConfig,
 
+    /// HuggingFace-XET CAS HTTP face configuration (epic #654)
+    #[serde(default)]
+    pub xet: XetConfig,
+
     /// Arrow Flight SQL server configuration
     #[serde(default)]
     pub flight: FlightConfig,
@@ -603,6 +607,76 @@ impl OAIConfig {
 fn default_oai_host() -> String { "0.0.0.0".to_owned() }
 fn default_oai_port() -> u16 { 6789 }
 fn default_oai_timeout() -> u64 { 300 }
+
+/// XetService configuration — dual-stack HuggingFace-XET CAS HTTP face.
+///
+/// When enabled, exposes the HF-XET CAS wire routes (`/get_xorb/{hash}/`,
+/// `/v1/reconstructions/{hash}`, `/v1/chunks/{key}`, `/v1/xorbs/{key}`,
+/// `/v1/shards`) so a standard xet-enabled git repo can point its CAS endpoint
+/// at hyprstream as an alternative XET backend to HuggingFace. See epic #654.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct XetConfig {
+    /// Whether the XetService is served. Disabled by default: this is a
+    /// foundation surface (most routes 501 pending interop verification).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Host address for the HTTP server.
+    #[serde(default = "default_xet_host")]
+    pub host: String,
+
+    /// Port for the HTTP server. Default 6792 (oai=6789, mcp=6790, oauth=6791).
+    #[serde(default = "default_xet_port")]
+    pub port: u16,
+
+    /// External URL for this server (JWT audience / metadata). Auto-derived from
+    /// host:port when unset, mirroring `OAIConfig::resource_url`.
+    #[serde(default)]
+    pub external_url: Option<String>,
+
+    /// TLS certificate path (optional; falls back to the global `[tls]` config).
+    #[serde(default)]
+    pub tls_cert: Option<PathBuf>,
+
+    /// TLS private key path (optional; falls back to the global `[tls]` config).
+    #[serde(default)]
+    pub tls_key: Option<PathBuf>,
+}
+
+impl Default for XetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: default_xet_host(),
+            port: default_xet_port(),
+            external_url: None,
+            tls_cert: None,
+            tls_key: None,
+        }
+    }
+}
+
+impl XetConfig {
+    /// Resource URL used as the JWT audience for this server. Uses `external_url`
+    /// when set, else derives `scheme://host:port` (https when global TLS is on),
+    /// mirroring `OAIConfig::resource_url`.
+    pub fn resource_url(&self) -> String {
+        if let Some(ref url) = self.external_url {
+            url.clone()
+        } else {
+            let scheme = if HyprConfig::load().map(|c| c.tls.enabled).unwrap_or(false) {
+                "https"
+            } else {
+                "http"
+            };
+            let host = if self.host == "0.0.0.0" { "localhost" } else { &self.host };
+            format!("{scheme}://{host}:{}", self.port)
+        }
+    }
+}
+
+fn default_xet_host() -> String { "0.0.0.0".to_owned() }
+fn default_xet_port() -> u16 { 6792 }
 
 /// Arrow Flight SQL server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2012,6 +2086,7 @@ impl HyprConfigBuilder {
             services: self.services,
             token: self.token,
             oai: self.oai,
+            xet: Default::default(),
             flight: self.flight,
             mcp: self.mcp,
             oauth: self.oauth,
