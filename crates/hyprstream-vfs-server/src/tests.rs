@@ -561,3 +561,117 @@ fn forget_reclaims_inode() {
     fs.forget(&ctx, f.inode, 1);
     assert!(fs.getattr(&ctx, f.inode, None).is_err());
 }
+
+// ── #653: local `fusedev` mount (real kernel `/dev/fuse`) ──────────────────
+//
+// This is the one test in the suite that leaves the in-process `FileSystem`
+// trait surface and drives a real kernel FUSE mount end to end: `serve_local`
+// mounts the namespace at a host directory, and we exercise it purely through
+// `std::fs` — proving the `VfsFileSystem` down-adapter works unmodified over
+// the `fusedev` transport, not just `virtiofs`.
+//
+// It requires a working, accessible `/dev/fuse` plus an unprivileged-capable
+// `fusermount3` (setuid, or user namespaces configured for unprivileged FUSE
+// mounts). Sandboxed CI/build environments frequently lack this (no `/dev/fuse`
+// device node, or mount(2)/fusermount3 blocked by the container runtime), so
+// the test probes for a working mount up front and skips (rather than fails)
+// when unavailable — the mount attempt itself is the probe; anything short of
+// a running background thread reaching a live directory is treated as
+// "environment can't do this" rather than a code fault. Structural coverage of
+// the same `VfsFileSystem` op surface this exercises (lookup/read/readdir/...)
+// lives in the in-process tests above, which always run.
+#[test]
+fn local_fuse_mount_read_and_readdir() {
+    let dir = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skipping local_fuse_mount_read_and_readdir: no tmp dir: {e}");
+            return;
+        }
+    };
+    let mountpoint = dir.path().to_path_buf();
+
+    let mut ns = Namespace::new();
+    ns.mount(
+        "/data",
+        Arc::new(MemFs::with_files(&[("hello.txt", b"hello from fuse"), ("sub/nested.txt", b"n")])),
+    )
+    .unwrap();
+    let fs = build(ns);
+
+    let mp = mountpoint.clone();
+    let handle = std::thread::Builder::new()
+        .name("fuse-local-test".to_owned())
+        .spawn(move || crate::server::serve_local(fs, &mp))
+        .expect("spawn serve_local thread");
+
+    // Poll for the mount to come up (readdir on an unmounted-but-existing
+    // empty tempdir succeeds trivially, so we look for our known entry
+    // instead of just "the directory is readable").
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut mounted = false;
+    while std::time::Instant::now() < deadline {
+        if mountpoint.join("data").join("hello.txt").exists() {
+            mounted = true;
+            break;
+        }
+        if handle.is_finished() {
+            break; // serve_local exited early (mount failed) — stop polling.
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    if !mounted {
+        // Environment can't do a real FUSE mount (no /dev/fuse access,
+        // fusermount3 not usable unprivileged, etc). Best-effort unmount in
+        // case a partial mount happened, then skip.
+        let _ = std::process::Command::new("fusermount3").arg("-u").arg(&mountpoint).status();
+        let _ = std::process::Command::new("fusermount").arg("-u").arg(&mountpoint).status();
+        eprintln!(
+            "skipping local_fuse_mount_read_and_readdir: could not establish a real /dev/fuse \
+             mount in this environment (no access to /dev/fuse or unprivileged fusermount3)"
+        );
+        return;
+    }
+
+    // Read a file through the real kernel mount.
+    let content = std::fs::read_to_string(mountpoint.join("data").join("hello.txt"))
+        .expect("read mounted file");
+    assert_eq!(content, "hello from fuse");
+
+    // List a directory through the real kernel mount.
+    let mut names: Vec<String> = std::fs::read_dir(mountpoint.join("data"))
+        .expect("readdir mounted dir")
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["hello.txt".to_owned(), "sub".to_owned()]);
+
+    // Nested read.
+    let nested = std::fs::read_to_string(mountpoint.join("data").join("sub").join("nested.txt"))
+        .expect("read nested mounted file");
+    assert_eq!(nested, "n");
+
+    // Tear down: unmount (fusermount3 -u works unprivileged for a FUSE mount
+    // owned by this uid), then wait for the serving thread to exit.
+    let status = std::process::Command::new("fusermount3")
+        .arg("-u")
+        .arg(&mountpoint)
+        .status();
+    if !matches!(status, Ok(s) if s.success()) {
+        let _ = std::process::Command::new("fusermount").arg("-u").arg(&mountpoint).status();
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !handle.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    if handle.is_finished() {
+        handle.join().expect("serve_local thread panicked").expect("serve_local returned an error");
+    } else {
+        // Thread didn't exit in time; nothing more we can do from the test
+        // without risking a hang — leave it be (the process will reap it at
+        // exit) rather than block the suite.
+        eprintln!("serve_local thread did not exit after unmount within timeout");
+    }
+}

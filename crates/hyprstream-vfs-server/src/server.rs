@@ -14,6 +14,7 @@
 //! ShareFs attach in `kata_backend.rs`.
 
 use std::io;
+use std::path::Path;
 use std::sync::Arc;
 // `vhost-user-backend` only implements `VhostUserBackend` for the std `Mutex`/
 // `RwLock` (backend.rs:335/415), so we must use the std type here despite the
@@ -23,7 +24,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use fuse_backend_rs::api::server::Server;
-use fuse_backend_rs::transport::{Reader, VirtioFsWriter, Writer};
+use fuse_backend_rs::transport::{FuseChannel, FuseSession, Reader, VirtioFsWriter, Writer};
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 use vhost::vhost_user::Listener;
 use vhost_user_backend::{VhostUserBackendMut, VhostUserDaemon, VringRwLock, VringT};
@@ -206,4 +207,99 @@ pub fn serve(fs: VfsFileSystem, socket_path: &str) -> io::Result<()> {
         .wait()
         .map_err(|e| io::Error::other(format!("daemon wait: {e}")))?;
     Ok(())
+}
+
+/// Mount `fs` at `mountpoint` as a real host directory via the kernel `fusedev`
+/// transport (`/dev/fuse`), blocking until the mount is torn down (unmounted, or
+/// the kernel closes the FUSE device).
+///
+/// This is the non-VM counterpart to [`serve`]: the same transport-agnostic
+/// [`VfsFileSystem`] down-adapter (`SandboxFs::into_filesystem`), served as a
+/// plain POSIX directory instead of a vhost-user-fs virtio-fs share. It exists
+/// so backends that cannot attach a virtio-fs device — `podman run --rootfs
+/// <dir>` (#617) and `systemd-nspawn --directory=<dir>` — can consume the same
+/// composed per-sandbox namespace the kata/CH path uses, instead of
+/// side-channeling their own image provisioning (spine violation, epic #508).
+///
+/// `mountpoint` must already exist as a directory; this function does not
+/// create it. The mount is torn down when [`FuseSession`] is dropped (which
+/// happens when this function returns, on any exit path) or when the kernel
+/// unmounts it out from under us (e.g. `fusermount3 -u`, or the guest killing
+/// the process).
+///
+/// Open question (tracked by #653, resolution deferred to #617): rootless FUSE
+/// (unprivileged `/dev/fuse` access via `fusermount3`) combined with podman's
+/// `--userns=keep-id` has not been validated here — this function mounts via
+/// the same kernel `/dev/fuse` + `fusermount3` path `fuse-backend-rs` uses for
+/// any fusedev consumer, but whether that composition works unprivileged under
+/// `keep-id` user-namespace remapping is unresolved and out of scope for this
+/// change.
+///
+/// Run this on a dedicated thread; like [`serve`], it blocks until the session
+/// ends.
+pub fn serve_local(fs: VfsFileSystem, mountpoint: &Path) -> io::Result<()> {
+    let server = Arc::new(Server::new(fs));
+
+    let mut session = FuseSession::new(mountpoint, "hyprstream-vfs", "", false)
+        .map_err(|e| io::Error::other(format!("fuse session init {mountpoint:?}: {e}")))?;
+    // `fuse-backend-rs` defaults `allow_other` to true, which requires
+    // `user_allow_other` in `/etc/fuse.conf` (a host-wide opt-in most
+    // deployments won't have set). We only need this mount visible to the
+    // process serving it (and whatever shares its uid/gid — e.g. a podman
+    // `--userns=keep-id` child), so disable it and mount unprivileged.
+    session.set_allow_other(false);
+    session
+        .mount()
+        .map_err(|e| io::Error::other(format!("fuse mount {mountpoint:?}: {e}")))?;
+
+    let mut channel = session
+        .new_channel()
+        .map_err(|e| io::Error::other(format!("fuse channel {mountpoint:?}: {e}")))?;
+
+    let result = drive_channel(&server, &mut channel);
+
+    // Always attempt to tear down the mount, even if the request loop errored,
+    // so a failure mid-mount doesn't leave a dangling `/dev/fuse` connection.
+    if let Err(e) = session.umount() {
+        tracing::warn!(mountpoint = %mountpoint.display(), error = %e, "fuse umount failed");
+    }
+
+    result
+}
+
+/// Drain `channel`, dispatching each request through the FUSE server, until the
+/// kernel closes the session (`get_request` returns `Ok(None)`).
+fn drive_channel(server: &Arc<Server<VfsFileSystem>>, channel: &mut FuseChannel) -> io::Result<()> {
+    loop {
+        let request = match channel.get_request() {
+            Ok(r) => r,
+            Err(e) => {
+                // `FuseChannel::get_request` treats a clean `ENODEV` read as
+                // `Ok(None)` (see its `linux_session.rs` docs), but a
+                // concurrent unmount can also surface as an epoll-error event
+                // on the `/dev/fuse` fd, which it reports as `Err` rather than
+                // `Ok(None)`. Either shape means the same thing here: the
+                // kernel end of the session is gone. Treat any channel error
+                // as ordinary session teardown rather than a hard failure —
+                // there is nothing left to serve once `/dev/fuse` is torn
+                // down, and propagating it would turn a normal `fusermount -u`
+                // into a spurious error from `serve_local`.
+                tracing::debug!(error = %e, "fuse channel closed");
+                return Ok(());
+            }
+        };
+        let Some((reader, writer)) = request else {
+            // Session closed (unmounted or kernel dropped /dev/fuse).
+            return Ok(());
+        };
+        if let Err(e) = server.handle_message(reader, writer.into(), None, None) {
+            // Mirrors fuse-backend-rs's own fusedev example: an encode failure
+            // means the kernel end is gone, so stop; any other per-request
+            // error is logged and the loop continues serving later requests.
+            match e {
+                fuse_backend_rs::Error::EncodeMessage(_) => return Ok(()),
+                _ => tracing::error!(error = %e, "fuse request failed"),
+            }
+        }
+    }
 }

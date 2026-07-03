@@ -7220,6 +7220,7 @@ dependencies = [
  "hyprstream-vfs",
  "libc",
  "parking_lot 0.12.4",
+ "tempfile",
  "tokio",
  "tracing",
  "vhost 0.11.0",

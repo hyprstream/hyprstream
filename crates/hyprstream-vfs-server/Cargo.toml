@@ -3,7 +3,7 @@ name = "hyprstream-vfs-server"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "vhost-user-fs server exposing a hyprstream VFS Namespace to a Cloud Hypervisor guest (FS-A, #362)"
+description = "Serves a hyprstream VFS Namespace over vhost-user-fs to a Cloud Hypervisor guest (FS-A, #362), or as a local /dev/fuse mount for non-VM sandbox backends (#653)"
 
 # Native-only (Linux): vhost-user-fs + fuse-backend-rs virtio transport are not
 # available on wasm, and the crate's purpose is serving a VMM.
@@ -11,10 +11,12 @@ description = "vhost-user-fs server exposing a hyprstream VFS Namespace to a Clo
 hyprstream-vfs = { path = "../hyprstream-vfs" }
 hyprstream-rpc = { path = "../hyprstream-rpc" }
 
-# FUSE protocol engine + virtio transport. `virtiofs` gives the Server, Reader,
-# VirtioFsWriter/Writer; we do not need `fusedev` (kernel /dev/fuse) nor the DAX
-# `vhost-user-fs` feature (no shared-memory window).
-fuse-backend-rs = { version = "0.13", default-features = false, features = ["virtiofs"] }
+# FUSE protocol engine + transports. `virtiofs` gives the Server, Reader,
+# VirtioFsWriter/Writer for the vhost-user-fs (VM) path; `fusedev` additionally
+# gives FuseSession/FuseChannel/FuseDevWriter for a real host `/dev/fuse` mount
+# (#653's `serve_local`, used by non-VM backends like podman/nspawn). We do not
+# need the DAX `vhost-user-fs` feature (no shared-memory window).
+fuse-backend-rs = { version = "0.13", default-features = false, features = ["virtiofs", "fusedev"] }
 
 # vhost-user transport: hosts the FUSE Server over a Unix socket to CH. Versions
 # pinned to match fuse-backend-rs 0.13.1 (vhost 0.11 / vm-memory 0.14.1 /
@@ -35,3 +37,4 @@ tracing = { workspace = true }
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
 async-trait = "0.1"
+tempfile = "3"

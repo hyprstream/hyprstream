@@ -19,9 +19,26 @@
 //!         → Namespace mounts    (Mount read/write + FsMount writes, Subject-per-call)
 //! ```
 //!
+//! [`serve_local`] is the non-VM counterpart (#653): the same [`VfsFileSystem`]
+//! down-adapter, mounted at a host directory via `fuse_backend_rs`'s `fusedev`
+//! transport (kernel `/dev/fuse`) instead of vhost-user-fs. This is what lets
+//! non-VM sandbox backends — `podman run --rootfs <dir>` (#617), `systemd-nspawn
+//! --directory=<dir>` — consume the same composed per-sandbox namespace
+//! (`SandboxFs::compose`/`into_filesystem`, #641/#365) the kata/CH path uses,
+//! rather than side-channeling their own image provisioning:
+//!
+//! ```text
+//! podman / systemd-nspawn  (plain POSIX directory)
+//!   → kernel /dev/fuse         (fusedev transport) — server.rs::serve_local
+//!     → fuse_backend_rs::Server (same FUSE protocol engine)
+//!       → VfsFileSystem         (same down-adapter, unmodified)
+//!         → Namespace mounts
+//! ```
+//!
 //! The crate is **native-only** (Linux): vhost-user-fs and `fuse_backend_rs`'s
 //! virtio transport are not available on wasm, and the whole point is serving a
-//! VMM. It is genuinely `Send + Sync` — no wasm `unsafe impl Send`.
+//! VMM (or, for `serve_local`, a real kernel FUSE mount). It is genuinely
+//! `Send + Sync` — no wasm `unsafe impl Send`.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -33,4 +50,4 @@ mod server;
 mod tests;
 
 pub use filesystem::VfsFileSystem;
-pub use server::{serve, VfsBackend};
+pub use server::{serve, serve_local, VfsBackend};
