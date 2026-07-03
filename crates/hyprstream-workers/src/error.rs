@@ -158,6 +158,16 @@ pub enum WorkerError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Namespace delivery errors (#635)
+    // ─────────────────────────────────────────────────────────────────────
+    /// A `SandboxBackend` operation (e.g. `deliver_namespace`) was invoked in
+    /// a shape the backend doesn't (yet) support — e.g. an unsupported
+    /// `NamespaceTransport` variant, or a backend that hasn't been re-grounded
+    /// against the narrowed trait surface yet.
+    #[error("Unsupported operation: {0}")]
+    Unsupported(String),
 }
 
 impl From<anyhow::Error> for WorkerError {

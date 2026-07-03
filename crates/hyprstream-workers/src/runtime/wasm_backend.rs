@@ -349,6 +349,35 @@ impl SandboxBackend for WasmBackend {
         Ok(Vec::new())
     }
 
+    async fn deliver_namespace(
+        &self,
+        _sandbox: &PodSandbox,
+        _namespace: hyprstream_vfs::Namespace,
+        _subject: Subject,
+        transport: super::backend::NamespaceTransport,
+    ) -> Result<super::backend::NamespaceDelivery> {
+        use super::backend::{NamespaceDelivery, NamespaceTransport};
+
+        // Provisional (#635): wasm's guest has no separate OS to mount a
+        // namespace into — the "host-imports" model means mount references
+        // would be passed directly into the guest's linker as capability
+        // imports, not served over a wire transport. That linker wiring
+        // (Profile B / Wanix `/task` #612) doesn't exist yet: today's
+        // `WasmBackend` links a bespoke zero-WASI capability surface
+        // (`env::host_random` only, see module docs) with no filesystem
+        // import at all. This accepts `HostImports` and reports success
+        // without actually exposing `_namespace` to the guest — a stub that
+        // is honest about doing nothing yet, rather than silently no-op'ing
+        // behind a misleadingly "delivered" result for the other transports.
+        match transport {
+            NamespaceTransport::HostImports => Ok(NamespaceDelivery::HostImports),
+            other => Err(WorkerError::Unsupported(format!(
+                "wasm backend only accepts the HostImports namespace transport \
+                 (no guest-OS control-file service wired yet, #612), got {other:?}"
+            ))),
+        }
+    }
+
     fn supports_exec(&self) -> bool {
         true
     }
@@ -664,5 +693,57 @@ mod tests {
             .unwrap();
         pod.set_backend_handle(handle);
         assert!(backend.get_pids(&pod).await.unwrap().is_empty());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // deliver_namespace (#635)
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn deliver_namespace_accepts_host_imports_transport() {
+        use super::super::backend::{NamespaceDelivery, NamespaceTransport};
+
+        let backend = WasmBackend::new(WasmConfig::default());
+        let cfg = pod_config("t", vec![]);
+        let pod = new_pod("wasm-deliver", &cfg);
+
+        let result = backend
+            .deliver_namespace(
+                &pod,
+                hyprstream_vfs::Namespace::new(),
+                Subject::new("test"),
+                NamespaceTransport::HostImports,
+            )
+            .await
+            .expect("wasm backend should accept HostImports");
+
+        assert!(matches!(result, NamespaceDelivery::HostImports));
+    }
+
+    #[tokio::test]
+    async fn deliver_namespace_rejects_non_host_imports_transport() {
+        use super::super::backend::NamespaceTransport;
+
+        let backend = WasmBackend::new(WasmConfig::default());
+        let cfg = pod_config("t", vec![]);
+        let pod = new_pod("wasm-deliver-2", &cfg);
+
+        let result = backend
+            .deliver_namespace(
+                &pod,
+                hyprstream_vfs::Namespace::new(),
+                Subject::new("test"),
+                NamespaceTransport::BindMount {
+                    target: PathBuf::from("/tmp"),
+                },
+            )
+            .await;
+
+        match result {
+            Err(WorkerError::Unsupported(msg)) => {
+                assert!(msg.contains("HostImports"), "unexpected message: {msg}");
+            }
+            other => panic!("expected Unsupported error, got: {other:?}"),
+        }
     }
 }

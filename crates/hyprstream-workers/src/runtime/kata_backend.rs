@@ -563,6 +563,54 @@ impl SandboxBackend for KataBackend {
         Ok(Vec::new())
     }
 
+    async fn deliver_namespace(
+        &self,
+        sandbox: &PodSandbox,
+        namespace: hyprstream_vfs::Namespace,
+        subject: Subject,
+        transport: super::backend::NamespaceTransport,
+    ) -> Result<super::backend::NamespaceDelivery> {
+        use super::backend::{NamespaceDelivery, NamespaceTransport};
+
+        let (socket_path, mount_tag) = match transport {
+            NamespaceTransport::VirtioFs { socket_path, mount_tag } => (socket_path, mount_tag),
+            other => {
+                return Err(WorkerError::Unsupported(format!(
+                    "kata backend only supports the VirtioFs namespace transport, got {other:?}"
+                )))
+            }
+        };
+
+        // Serve the already-composed namespace over a per-sandbox Unix socket,
+        // exactly as `compose_and_serve_vfs` does for the boot-time path — the
+        // difference is that composition already happened in the caller (#635:
+        // the backend's job is delivery, not composition).
+        let rt = tokio::runtime::Handle::current();
+        let sandbox_fs = SandboxFs::from_namespace(namespace, subject);
+        let socket_for_serve = socket_path.clone();
+        let server = tokio::task::spawn_blocking(move || sandbox_fs.serve_on(socket_for_serve, rt))
+            .await
+            .map_err(|e| WorkerError::SandboxCreationFailed(format!("VFS serve task join: {e}")))??;
+
+        // Hot-attach when a hypervisor handle already exists for this sandbox
+        // (VM already prepared/running). If the sandbox hasn't started yet,
+        // the caller is expected to attach the returned socket itself via
+        // `attach_share_fs` before `start_vm` (mirrors `KataBackend::start`'s
+        // own compose-then-attach ordering).
+        if let Some(handle) = sandbox.backend_handle.as_ref() {
+            if let Some(kata) = handle.as_any().downcast_ref::<KataHandle>() {
+                Self::attach_share_fs(&kata.hypervisor, &sandbox.id, server.socket_path(), &mount_tag)
+                    .await?;
+            }
+        }
+
+        Ok(NamespaceDelivery::VirtioFs {
+            socket_path: server.socket_path().to_path_buf(),
+            mount_tag,
+            guard: Some(Arc::new(server)),
+        })
+    }
+
     fn supports_exec(&self) -> bool {
         // Real, via the kata-agent ttrpc/vsock client (#344) — see
         // `exec_sync` below. This is no longer the "host is a black box"
@@ -947,6 +995,71 @@ mod tests {
         // `exec_sync` itself, not from this capability flag.
         let (backend, _, _temp) = create_test_backend();
         assert!(backend.supports_exec());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // deliver_namespace (#635)
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_deliver_namespace_rejects_non_virtiofs_transport() {
+        use super::super::backend::NamespaceTransport;
+        use hyprstream_vfs::{Namespace, Subject};
+
+        let (backend, _, temp) = create_test_backend();
+        let sandbox = create_test_sandbox(temp.path().join("sandbox"));
+
+        let result = backend
+            .deliver_namespace(
+                &sandbox,
+                Namespace::new(),
+                Subject::new("test"),
+                NamespaceTransport::HostImports,
+            )
+            .await;
+
+        match result {
+            Err(WorkerError::Unsupported(msg)) => {
+                assert!(msg.contains("VirtioFs"), "unexpected message: {msg}");
+            }
+            other => panic!("expected Unsupported error, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_deliver_namespace_serves_composed_namespace_over_virtiofs() {
+        use super::super::backend::{NamespaceDelivery, NamespaceTransport};
+        use hyprstream_vfs::{Namespace, Subject};
+
+        let (backend, _, temp) = create_test_backend();
+        let sandbox_path = temp.path().join("sandbox");
+        std::fs::create_dir_all(&sandbox_path).unwrap();
+        // No `backend_handle` set — this exercises the "sandbox hasn't
+        // started yet" path (serve, but skip the hot-attach).
+        let sandbox = create_test_sandbox(sandbox_path.clone());
+
+        let socket_path = sandbox_path.join("deliver-test.sock");
+        let result = backend
+            .deliver_namespace(
+                &sandbox,
+                Namespace::new(),
+                Subject::new("test"),
+                NamespaceTransport::VirtioFs {
+                    socket_path: socket_path.clone(),
+                    mount_tag: "hyprstream-vfs".to_owned(),
+                },
+            )
+            .await
+            .expect("deliver_namespace should serve the namespace");
+
+        match result {
+            NamespaceDelivery::VirtioFs { socket_path: served, mount_tag, guard } => {
+                assert_eq!(served, socket_path);
+                assert_eq!(mount_tag, "hyprstream-vfs");
+                assert!(guard.is_some(), "kata should return a serving-thread guard");
+            }
+            other => panic!("expected VirtioFs delivery, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
