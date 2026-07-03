@@ -1,7 +1,9 @@
 //! RafsStore - Dragonfly-native image storage using nydus-storage
 //!
-//! The on-disk CAS layout (`blobs/`, `bootstrap/`, `cache/`, `refs/`) is driven
-//! via raw `std::fs`/path ops, not yet exposed as a 9P/VFS Mount (#652).
+//! The on-disk CAS layout (`blobs/`, `bootstrap/`, `cache/`, `refs/`) is
+//! driven via raw `std::fs`/path ops for ingest (`pull`/`gc`/`remove`). The
+//! read path is additionally exposed as a 9P/VFS `Mount` — see
+//! [`super::store_mount::RafsStoreMount`] (#652).
 //!
 //! Uses Nydus RAFS format for efficient image storage with:
 //! - Chunk-level deduplication (across all images)
@@ -628,6 +630,16 @@ impl RafsStore {
         &self.cache_dir
     }
 
+    /// Get bootstrap (RAFS metadata) directory
+    pub fn bootstrap_dir(&self) -> &PathBuf {
+        &self.bootstrap_dir
+    }
+
+    /// Get refs (tag symlink) directory
+    pub fn refs_dir(&self) -> &PathBuf {
+        &self.refs_dir
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // CRI ImageClient methods
     // ─────────────────────────────────────────────────────────────────────────
@@ -729,7 +741,11 @@ impl RafsStore {
 }
 
 /// Convert digest to filesystem-safe filename
-fn digest_to_filename(digest: &str) -> String {
+///
+/// `pub(crate)` so [`super::store_mount::RafsStoreMount`] (#652) can resolve a
+/// `sha256:...`-style digest path component to the on-disk blob filename
+/// using the same convention as the rest of the store.
+pub(crate) fn digest_to_filename(digest: &str) -> String {
     digest.replace(':', "_")
 }
 
