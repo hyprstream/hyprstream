@@ -543,30 +543,41 @@ impl Spawnable for OAuthService {
                     audit_pq_key,
                     crypto_policy,
                 );
+                // Fail-closed the SAME way as "store failed to open": a signer
+                // that can't sign under the enforced policy is not a usable
+                // audit sink. Do NOT install it — installing it anyway would
+                // let every real request silently fail two audit-write
+                // attempts deep (mint's Permit downgrade, then the best-effort
+                // fallback deny record, both via this same broken signer) with
+                // only this one startup log line as any indication, instead of
+                // the immediate, obvious "audit trail is not configured" error
+                // the grant path already gives when `audit_sink` is `None`.
                 if !signer.can_sign() {
                     tracing::error!(
                         "MAC audit signer cannot sign under the enforced Hybrid crypto \
                          policy (no ML-DSA-65 key provisioned) — the S6 grant path will \
                          fail closed (deny) on every request until a key is provisioned"
                     );
-                }
-                match crate::mac::audit::WalAuditStore::open(
-                    credentials_dir.join("mac-audit"),
-                    signer,
-                ) {
-                    Ok(store) => {
-                        info!("MAC grant-path audit store opened (WAL, hash-chained, checkpointed)");
-                        Some(Arc::new(store) as Arc<dyn crate::mac::audit::AuditSink>)
-                    }
-                    Err(e) => {
-                        // Fail-closed by omission: `audit_sink` stays `None`, and
-                        // the grant path denies every request rather than mint
-                        // unaudited tokens (see `exchange_ucan_grant`).
-                        tracing::error!(
-                            "MAC grant-path audit store failed to open — the S6 grant \
-                             path will fail closed (deny) on every request: {e:?}"
-                        );
-                        None
+                    None
+                } else {
+                    match crate::mac::audit::WalAuditStore::open(
+                        credentials_dir.join("mac-audit"),
+                        signer,
+                    ) {
+                        Ok(store) => {
+                            info!("MAC grant-path audit store opened (WAL, hash-chained, checkpointed)");
+                            Some(Arc::new(store) as Arc<dyn crate::mac::audit::AuditSink>)
+                        }
+                        Err(e) => {
+                            // Fail-closed by omission: `audit_sink` stays `None`, and
+                            // the grant path denies every request rather than mint
+                            // unaudited tokens (see `exchange_ucan_grant`).
+                            tracing::error!(
+                                "MAC grant-path audit store failed to open — the S6 grant \
+                                 path will fail closed (deny) on every request: {e:?}"
+                            );
+                            None
+                        }
                     }
                 }
             };
