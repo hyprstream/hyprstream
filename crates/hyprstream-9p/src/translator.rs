@@ -483,4 +483,39 @@ mod tests {
         let q = sample_qid(0x80, 42);
         assert!(q.is_dir());
     }
+
+    /// A Treaddir over the translator must produce a wire message typed RREADDIR
+    /// (41), whose payload decodes as standard 9P2000.L dirent records — the
+    /// exact contract a standard client (Wanix `p9kit`) enforces. Regression
+    /// guard for the interop fix (previously framed as RREAD=117).
+    #[tokio::test]
+    async fn readdir_emits_standard_rreaddir_wire() {
+        let backend = MemoryBackend::default();
+        backend.add_file("/one.txt", b"111");
+        backend.add_file("/two.txt", b"22");
+        let t = Arc::new(Translator::new(Arc::new(backend)));
+
+        // Attach fid 0 as the (directory) root, then open + readdir it.
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "u", "/")).await.unwrap();
+        t.handle_message(&msg::tlopen(2, 0, 0)).await.unwrap();
+        let (tag, resp) = t.handle_message(&msg::treaddir(3, 0, 0, 8192)).await.unwrap();
+
+        // Encode to the wire exactly as serve_connection does, and check the
+        // message-type byte is RREADDIR, not RREAD.
+        let wire = msg::encode_response(tag, &resp);
+        assert_eq!(wire[4], msg::RREADDIR, "readdir must be framed as RREADDIR (41)");
+        assert_ne!(wire[4], msg::RREAD, "readdir must NOT be framed as RREAD (117)");
+
+        // The payload must decode as standard dirent records.
+        let data = match resp {
+            Response::Readdir { data } => data,
+            other => panic!("expected Readdir, got {other:?}"),
+        };
+        let entries = msg::parse_readdir_entries(&data).unwrap();
+        let mut names: Vec<_> = entries.iter().map(|e| e.name.clone()).collect();
+        names.sort();
+        assert_eq!(names, vec!["one.txt".to_string(), "two.txt".to_string()]);
+        // Cookies are 1-based and monotonic.
+        assert!(entries.iter().all(|e| e.offset >= 1));
+    }
 }

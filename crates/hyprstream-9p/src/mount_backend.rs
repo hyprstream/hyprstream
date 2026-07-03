@@ -37,7 +37,7 @@ use hyprstream_vfs::{DirEntry, Fid, Mount};
 use tokio::sync::Mutex;
 
 use crate::backend::{Backend, OpenResult, StatResult, WalkResult};
-use crate::msg::Qid;
+use crate::msg::{self, Qid, ReaddirEntry};
 
 /// Max bytes a single read/write returns. Kept below the translator's `MSG_SIZE`
 /// (8 KiB) so an `Rread` carrying a full iounit plus its 9P header still fits the
@@ -199,27 +199,31 @@ impl Backend for MountBackend {
     }
 }
 
-/// Encode directory entries in the length-prefixed wire format the translator
-/// passes through verbatim (matching `MemoryBackend`/the model service):
-/// `name_len: u32` · `name` · `is_dir: u8` · `size: u64`, all little-endian.
+/// Encode directory entries as a page of **standard 9P2000.L Rreaddir dirent
+/// records** (`qid[13] · offset[8] · type[1] · name[s]`) via
+/// [`msg::encode_readdir_page`].
 ///
-/// `offset`/`count` slice the encoded buffer so a client can page through a
-/// large directory across multiple reads.
+/// This is the wire-faithful format a standard 9P client (Wanix `p9kit` over
+/// `progrium/p9`) requires — not the hyprstream-internal
+/// `name_len/name/is_dir/size` dialect. `offset` is a dirent cookie and `count`
+/// a byte budget; records are packed whole (see `encode_readdir_page`).
+///
+/// Per-entry qid: a `DirEntry` may carry a `stat` with a real qid; when it does
+/// we use it, otherwise we synthesize the qtype from `is_dir` with an unknown
+/// (`version=0, path=0`) identity — sound per `Stat`'s qid invariant, and
+/// sufficient because standard clients re-walk each name to stat it.
 fn encode_dir_entries(entries: &[DirEntry], offset: u64, count: u32) -> Vec<u8> {
-    let mut buf = Vec::new();
-    for e in entries {
-        let name = e.name.as_bytes();
-        buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
-        buf.extend_from_slice(name);
-        buf.push(u8::from(e.is_dir));
-        buf.extend_from_slice(&e.size.to_le_bytes());
-    }
-    let off = offset as usize;
-    if off >= buf.len() {
-        return Vec::new();
-    }
-    let end = (off + count as usize).min(buf.len());
-    buf[off..end].to_vec()
+    let records: Vec<ReaddirEntry> = entries
+        .iter()
+        .map(|e| {
+            let qid = match &e.stat {
+                Some(st) => Qid { qtype: st.qtype, version: st.version, path: st.path },
+                None => Qid { qtype: if e.is_dir { QTDIR } else { 0 }, version: 0, path: 0 },
+            };
+            ReaddirEntry { qid, name: e.name.clone() }
+        })
+        .collect();
+    msg::encode_readdir_page(&records, offset, count)
 }
 
 /// Map 9P2000.L `Tlopen` flags (Linux `O_*` bits) to a 9P open-mode byte
@@ -249,18 +253,40 @@ mod tests {
     }
 
     #[test]
-    fn encode_dir_entries_slices_by_offset() {
+    fn encode_dir_entries_emits_standard_rreaddir_records() {
+        use crate::msg::parse_readdir_entries;
+
         let entries = vec![
             DirEntry { name: "a".into(), is_dir: true, size: 0, stat: None },
             DirEntry { name: "bb".into(), is_dir: false, size: 7, stat: None },
         ];
         let full = encode_dir_entries(&entries, 0, u32::MAX);
         assert!(!full.is_empty());
-        // First entry: len(4) + "a"(1) + is_dir(1) + size(8) = 14 bytes.
-        assert_eq!(&full[0..4], &1u32.to_le_bytes());
-        assert_eq!(full[4], b'a');
-        assert_eq!(full[5], 1); // is_dir
-        // Paging: an offset past the end yields nothing.
-        assert!(encode_dir_entries(&entries, full.len() as u64, 16).is_empty());
+
+        // Standard record layout: qid[13] · offset[8] · type[1] · name[2+len].
+        // First entry "a" (a dir): qid.qtype = QTDIR at byte 0, dirent type at
+        // byte 21 also QTDIR, name length u16=1 at bytes 22..24, 'a' at 24.
+        assert_eq!(full[0], QTDIR); // qid.qtype
+        assert_eq!(&full[13..21], &1u64.to_le_bytes()); // offset cookie = 1
+        assert_eq!(full[21], QTDIR); // dirent type = dir
+        assert_eq!(&full[22..24], &1u16.to_le_bytes()); // name len
+        assert_eq!(full[24], b'a');
+
+        // Round-trips through the standard client-side parser.
+        let parsed = parse_readdir_entries(&full).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "a");
+        assert!(parsed[0].qid.is_dir());
+        assert_eq!(parsed[0].offset, 1);
+        assert_eq!(parsed[1].name, "bb");
+        assert!(!parsed[1].qid.is_dir());
+        assert_eq!(parsed[1].offset, 2);
+
+        // Cookie paging: offset past the last cookie yields nothing.
+        assert!(encode_dir_entries(&entries, 2, u32::MAX).is_empty());
+        // Resuming after cookie 1 yields only the second entry.
+        let rest = parse_readdir_entries(&encode_dir_entries(&entries, 1, u32::MAX)).unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].name, "bb");
     }
 }

@@ -338,7 +338,12 @@ pub fn encode_response(tag: u16, response: &Response) -> Vec<u8> {
         Response::Getattr { qid, mode, size, mtime_sec } => {
             rgetattr(tag, qid, *mode, *size, *mtime_sec)
         }
-        Response::Readdir { data } => rread(tag, data), // same wire shape as Rread
+        // Rreaddir shares Rread's `count[4] · data[count]` body shape but MUST
+        // carry the RREADDIR (41) message type — a standard 9P2000.L client
+        // (e.g. Wanix `p9kit.ClientFS` over `progrium/p9`) rejects an Rread (117)
+        // reply to a Treaddir. `data` is already a run of standard dirent records
+        // (`qid[13] offset[8] type[1] name[s]`); see [`encode_readdir_page`].
+        Response::Readdir { data } => rreaddir(tag, data),
     }
 }
 
@@ -385,6 +390,16 @@ pub fn rread(tag: u16, data: &[u8]) -> Vec<u8> {
     body.extend_from_slice(&(data.len() as u32).to_le_bytes());
     body.extend_from_slice(data);
     encode_rmessage(tag, RREAD, &body)
+}
+
+/// Encode an Rreaddir. Body is `count[4] · data[count]` (identical framing to
+/// [`rread`]) but the message type is RREADDIR (41). `data` must already be a
+/// packed run of standard dirent records — build it with [`encode_readdir_page`].
+pub fn rreaddir(tag: u16, data: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    body.extend_from_slice(data);
+    encode_rmessage(tag, RREADDIR, &body)
 }
 
 pub fn rwrite(tag: u16, count: u32) -> Vec<u8> {
@@ -541,6 +556,57 @@ pub struct DirEntryP9 {
     pub offset: u64,
     pub dtype: u8,
     pub name: String,
+}
+
+/// One directory entry to encode into an Rreaddir payload.
+///
+/// The inverse of [`DirEntryP9`]: the server builds these, the client parses
+/// the resulting bytes back into `DirEntryP9`s. `qid` carries the entry's
+/// identity (its `qtype` also supplies the dirent type byte); `name` is the
+/// single path component.
+#[derive(Debug, Clone)]
+pub struct ReaddirEntry {
+    pub qid: Qid,
+    pub name: String,
+}
+
+/// Encode a directory listing as a page of **standard 9P2000.L Rreaddir dirent
+/// records** with cookie-based paging.
+///
+/// Each record is `qid[13] · offset[8] · type[1] · name[s]` — the exact shape
+/// [`parse_readdir_entries`] (and any standard client such as `progrium/p9`)
+/// decodes. `entries` is the *full* listing in a stable order; the record's
+/// `offset` is a resumption cookie equal to the entry's 1-based index.
+///
+/// Paging contract (as required by 9P2000.L, distinct from a byte-offset read):
+/// - `offset` is a dirent cookie — only entries whose cookie is `> offset` are
+///   emitted (so a client resumes by passing back the last cookie it saw).
+/// - `count` is a byte budget — records are packed **whole** (never split) until
+///   the next record would exceed it. A single record larger than `count` is
+///   still emitted alone so the client can always make progress.
+///
+/// The dirent `type` byte is the entry's qid type (`QTDIR`=0x80 / `QTFILE`=0x00);
+/// `progrium/p9` reads it as a `QIDType`, and Wanix's `p9kit` re-walks each name
+/// anyway, so this is the interoperable choice.
+pub fn encode_readdir_page(entries: &[ReaddirEntry], offset: u64, count: u32) -> Vec<u8> {
+    let budget = count as usize;
+    let mut out = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        let cookie = i as u64 + 1;
+        if cookie <= offset {
+            continue;
+        }
+        let mut rec = Vec::new();
+        e.qid.write_to(&mut rec); // qid[13]
+        rec.extend_from_slice(&cookie.to_le_bytes()); // offset[8]
+        rec.push(e.qid.qtype); // type[1] — dirent type = qid type
+        write_string(&mut rec, &e.name); // name[2+len]
+        if !out.is_empty() && out.len() + rec.len() > budget {
+            break;
+        }
+        out.extend_from_slice(&rec);
+    }
+    out
 }
 
 /// Parse Rreaddir data into directory entries.
