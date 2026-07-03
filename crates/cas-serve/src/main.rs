@@ -41,9 +41,8 @@
 
 // The binary reuses the library's modules to avoid drift between the server
 // and any client/embedder of `cas_serve`.
-use cas_serve::{chunker, protocol, shard};
+use cas_serve::protocol;
 use protocol::{ErrorCode, Request, Response};
-use shard::Shard;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use tracing::{debug, error, info};
@@ -326,6 +325,10 @@ fn main() -> anyhow::Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    // `chunker` and `Shard` are used only by these tests (the non-test binary
+    // routes chunk/store through `CasStore::put_file_bytes`), so import them
+    // here rather than at module scope to keep the non-test build warning-clean.
+    use cas_serve::{chunker, shard::Shard};
     use tempfile::tempdir;
 
     #[tokio::test]
