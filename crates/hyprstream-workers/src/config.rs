@@ -235,28 +235,18 @@ impl Default for WorkflowConfig {
     }
 }
 
-/// Configuration for event bus
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Configuration for the worker event bus.
+///
+/// The worker publishes lifecycle events over the moq-lite streaming plane
+/// (#167) via `crate::events::EventPublisher`; there is no ZMQ socket to tune.
+/// The former ZMQ high-water-mark knobs (`publisher_hwm`/`subscriber_hwm`) were
+/// removed with the ZMQ stack (#138/#167) — moq back-pressure/QoS is governed by
+/// `hyprstream_rpc::moq_stream` `StreamOpt`, not per-socket HWMs here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EventConfig {
-    /// ZMQ high water mark for publishers
-    pub publisher_hwm: i32,
-
-    /// ZMQ high water mark for subscribers
-    pub subscriber_hwm: i32,
-
     /// Enable event logging for debugging
     pub log_events: bool,
-}
-
-impl Default for EventConfig {
-    fn default() -> Self {
-        Self {
-            publisher_hwm: 1000,
-            subscriber_hwm: 1000,
-            log_events: false,
-        }
-    }
 }
 
 #[cfg(test)]

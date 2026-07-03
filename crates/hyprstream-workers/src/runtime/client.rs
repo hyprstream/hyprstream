@@ -1,6 +1,8 @@
-//! RuntimeClient trait and ZMQ client
+//! RuntimeClient trait and generated `WorkerClient`.
 //!
-//! Client-side trait for CRI RuntimeService (`runtime.v1`) for future kubelet compatibility.
+//! Client-side trait for CRI RuntimeService (`runtime.v1`) for future kubelet
+//! compatibility. The `WorkerClient` speaks Cap'n Proto over the pluggable RPC
+//! transport (inproc/UDS/QUIC/iroh) — there is no ZMQ client (#138/#167).
 //! Response types use generated types from the Cap'n Proto schema directly.
 
 use std::collections::HashMap; // Only for StatusResponse.info (local-only, not serialized)
