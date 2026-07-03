@@ -14,20 +14,30 @@
 //!
 //! ## Transport
 //!
-//! [`Translator::serve`] runs a TCP accept loop. Each connection is served on
-//! its own tokio task via [`serve_connection`]. virtio-9P will plug in here
-//! later with a different transport that shares the same per-connection
-//! `handle_message` core.
+//! [`Translator::serve`] runs a TCP accept loop; [`Translator::serve_uds`] runs
+//! the same loop over a Unix domain socket ([`tokio::net::UnixListener`]). Both
+//! delegate to one transport-agnostic accept loop (`serve_listener`) and the
+//! same per-connection [`Translator::serve_connection`] core, which operates on
+//! any `AsyncRead + AsyncWrite` stream. The UDS entry point is how a native
+//! Wanix workload consumes a Subject-scoped export via its `p9kit.ClientFS` 9P
+//! client (#506); [`Translator::from_mount`] / [`serve_mount_uds`] build the
+//! translator directly from an `Arc<dyn Mount>` + `Subject`. virtio-9P will plug
+//! in the same way with a third transport.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use dashmap::DashMap;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use hyprstream_rpc::Subject;
+use hyprstream_vfs::Mount;
+use tokio::io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tracing::{debug, error, info, warn};
 
 use crate::backend::Backend;
+use crate::mount_backend::MountBackend;
 use crate::msg::{
     self, encode_response, parse_request, rflush, Request, Response,
 };
@@ -91,15 +101,45 @@ impl Translator {
         Self { backend, fids: Arc::new(FidTable::default()) }
     }
 
+    /// Build a translator that exports a single Subject-scoped VFS [`Mount`] as
+    /// its 9P root.
+    ///
+    /// This is the entry point for #506: `mount` is the tenant's export root
+    /// (already the single MAC policy-enforcement point) and `subject` is the
+    /// verified caller identity threaded onto every backend op. It wraps the
+    /// mount in a [`MountBackend`] — the same [`Backend`] seam the capnp-RPC
+    /// `ModelBackend` uses on the TCP path — so no new attachment mechanism is
+    /// introduced; only the export root differs.
+    pub fn from_mount(mount: Arc<dyn Mount>, subject: Subject) -> Self {
+        Self::new(Arc::new(MountBackend::new(mount, subject)))
+    }
+
     /// Run a TCP accept loop until the listener errors or is closed.
     ///
     /// Each connection runs on its own task. Errors on one connection do not
     /// affect siblings.
     pub async fn serve(self, listener: TcpListener) -> Result<()> {
+        self.serve_listener(listener).await
+    }
+
+    /// Run the accept loop over a Unix domain socket.
+    ///
+    /// Identical per-connection handling to [`Translator::serve`]; only the
+    /// transport differs. This is how a native Wanix workload attaches to a
+    /// Subject-scoped export over a UDS via its `p9kit.ClientFS` 9P client.
+    pub async fn serve_uds(self, listener: UnixListener) -> Result<()> {
+        self.serve_listener(listener).await
+    }
+
+    /// Transport-agnostic accept loop shared by [`serve`](Self::serve) and
+    /// [`serve_uds`](Self::serve_uds). Each accepted connection is served on its
+    /// own task via [`serve_connection`](Self::serve_connection); errors on one
+    /// connection do not affect siblings.
+    async fn serve_listener<L: Listen>(self, listener: L) -> Result<()> {
         let this = Arc::new(self);
-        info!(addr = ?listener.local_addr(), "9P translator: listening");
+        info!(endpoint = %listener.describe(), "9P translator: listening");
         loop {
-            let (stream, peer) = match listener.accept().await {
+            let (stream, peer) = match listener.accept_conn().await {
                 Ok(v) => v,
                 Err(e) => {
                     error!(error = %e, "9P translator: accept failed, shutting down");
@@ -118,8 +158,14 @@ impl Translator {
 
     /// Serve a single connection to completion (until EOF, parse error, or
     /// the peer resets).
-    pub async fn serve_connection(self: &Arc<Self>, stream: TcpStream) -> Result<()> {
-        let (mut rx, mut tx) = stream.into_split();
+    ///
+    /// Generic over the byte stream so the same core serves TCP, UDS, and any
+    /// future `AsyncRead + AsyncWrite` transport.
+    pub async fn serve_connection<S>(self: &Arc<Self>, stream: S) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Send + 'static,
+    {
+        let (mut rx, mut tx) = split(stream);
         // Reusable growable read buffer; capped per-message by msize.
         let mut len_buf = [0u8; 4];
 
@@ -270,6 +316,73 @@ impl Translator {
     async fn handle_readdir(&self, fid: u32, offset: u64, count: u32) -> Result<Response> {
         let data = self.backend.readdir(fid, offset, count).await?;
         Ok(Response::Readdir { data })
+    }
+}
+
+/// Bind a Unix domain socket at `path` and serve `mount` (scoped to `subject`)
+/// as its 9P2000.L root until the socket errors or is closed.
+///
+/// Convenience wrapper over [`Translator::from_mount`] + [`Translator::serve_uds`]
+/// — the #506 one-call entry point a supervisor uses to expose a tenant's
+/// Subject-scoped export to a native Wanix `p9kit.ClientFS` client.
+pub async fn serve_mount_uds(
+    mount: Arc<dyn Mount>,
+    subject: Subject,
+    path: impl AsRef<Path>,
+) -> Result<()> {
+    let listener = UnixListener::bind(path.as_ref())
+        .with_context(|| format!("bind 9P UDS listener at {:?}", path.as_ref()))?;
+    Translator::from_mount(mount, subject).serve_uds(listener).await
+}
+
+/// Transport-agnostic accept surface, implemented for [`TcpListener`] and
+/// [`UnixListener`] so both share one accept loop (`serve_listener`).
+///
+/// Keeping this private and trait-bounded (rather than duplicating the loop)
+/// means TCP and UDS run byte-identical connection handling; a new transport
+/// only implements `accept_conn` + `describe`.
+#[async_trait]
+trait Listen: Send + Sync + 'static {
+    /// The per-connection byte stream this listener produces.
+    type Conn: AsyncRead + AsyncWrite + Send + 'static;
+
+    /// Accept one connection, returning the stream and a display string for the
+    /// peer (used only for tracing).
+    async fn accept_conn(&self) -> std::io::Result<(Self::Conn, String)>;
+
+    /// Human-readable endpoint description for the "listening" log line.
+    fn describe(&self) -> String;
+}
+
+#[async_trait]
+impl Listen for TcpListener {
+    type Conn = TcpStream;
+
+    async fn accept_conn(&self) -> std::io::Result<(TcpStream, String)> {
+        let (stream, peer) = self.accept().await?;
+        Ok((stream, peer.to_string()))
+    }
+
+    fn describe(&self) -> String {
+        self.local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "tcp:?".to_owned())
+    }
+}
+
+#[async_trait]
+impl Listen for UnixListener {
+    type Conn = UnixStream;
+
+    async fn accept_conn(&self) -> std::io::Result<(UnixStream, String)> {
+        let (stream, peer) = self.accept().await?;
+        Ok((stream, format!("unix:{peer:?}")))
+    }
+
+    fn describe(&self) -> String {
+        self.local_addr()
+            .map(|a| format!("unix:{a:?}"))
+            .unwrap_or_else(|_| "unix:?".to_owned())
     }
 }
 
