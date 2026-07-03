@@ -234,6 +234,7 @@ impl CasStore {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // panicking is correct in unit tests
 mod tests {
     use super::*;
 
