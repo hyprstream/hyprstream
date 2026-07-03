@@ -113,7 +113,7 @@ async fn run_send_bandwidth_inner<S: web_transport_trait::Session>(session: &S, 
 			return;
 		}
 
-		let mut interval = tokio::time::interval(POLL_INTERVAL);
+		let mut interval = web_async::time::interval(POLL_INTERVAL);
 		loop {
 			tokio::select! {
 				biased;
