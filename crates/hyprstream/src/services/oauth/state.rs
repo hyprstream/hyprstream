@@ -405,6 +405,15 @@ pub struct OAuthState {
     pub es256_key_store: Option<Arc<crate::auth::Es256SigningKeyStore>>,
     /// ML-DSA-65 signing key rotation store for PQ-hybrid JWT issuance.
     pub ml_dsa_key_store: Option<Arc<crate::auth::MlDsaSigningKeyStore>>,
+    /// MAC #547 / B2 (#674): the tamper-evident audit sink the S6 grant path
+    /// (`mac::exchange::audited_evaluate_grant`/`audited_evaluate_refresh`)
+    /// records every decision through. `None` means the grant-path audit
+    /// trail is not configured — the grant path treats that as fail-closed
+    /// (deny, not "audit best-effort") rather than minting unaudited tokens.
+    /// Production wiring is [`crate::mac::audit::WalAuditStore`] + an
+    /// [`crate::mac::audit::cose::OwnedCoseAuditSigner`] (see the `oauth`
+    /// service factory).
+    pub audit_sink: Option<Arc<dyn crate::mac::audit::AuditSink>>,
     /// QUIC/WebTransport cert hashes (SHA-256 of leaf DER, `sha2-256` multihash encoding).
     /// Published in the DID-doc `#quic` service entry so peers can pin the cert (#185).
     /// A set so cert rotation can publish old + new simultaneously.
@@ -484,6 +493,7 @@ impl OAuthState {
             jti_blocklist: None,
             es256_key_store: None,
             ml_dsa_key_store: None,
+            audit_sink: None,
             quic_cert_hashes: Vec::new(),
             quic_public_uri: None,
             mesh_pq_verifying_key: None,
@@ -528,6 +538,14 @@ impl OAuthState {
     /// Attach the ML-DSA-65 key rotation store.
     pub fn with_ml_dsa_key_store(mut self, store: Arc<crate::auth::MlDsaSigningKeyStore>) -> Self {
         self.ml_dsa_key_store = Some(store);
+        self
+    }
+
+    /// Attach the S6 grant-path audit sink (B2, #674). Without this, the
+    /// grant path fails closed on every request rather than minting tokens
+    /// with no audit trail.
+    pub fn with_audit_sink(mut self, sink: Arc<dyn crate::mac::audit::AuditSink>) -> Self {
+        self.audit_sink = Some(sink);
         self
     }
 

@@ -17,9 +17,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use sha2::{Digest, Sha256};
 
 use super::state::OAuthState;
-use crate::mac::exchange::{
-    evaluate_grant, evaluate_refresh, GrantDecision, GrantError, GrantRequest, GrantedAccess,
-};
+use crate::mac::exchange::{GrantDecision, GrantError, GrantRequest, GrantedAccess};
 use crate::services::generated::policy_client::IssueToken;
 
 const TOKEN_TYPE_ID_TOKEN: &str = "urn:ietf:params:oauth:token-type:id_token";
@@ -493,14 +491,26 @@ pub async fn exchange_ucan_grant(
             "UCAN grant verification is not configured on this node",
         );
     };
+    // MAC #547 / B2 (#674): the grant path is a security decision, and S7's
+    // complete-mediation guarantee is only real if every decision is on the
+    // audit trail. No sink configured ⇒ fail closed (deny) rather than mint
+    // an unaudited token — mirroring `AuditedAvc`'s rule at the TE path.
+    let Some(sink) = state.audit_sink.as_deref() else {
+        return tx_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "MAC grant-path audit trail is not configured on this node",
+        );
+    };
     let now = chrono::Utc::now().timestamp().max(0) as u64;
-    let decision = evaluate_grant(
+    let decision = crate::mac::exchange::audited_evaluate_grant(
         &grant,
         &verifier,
         now,
         &request,
         subject_ctx.as_ref(),
         true, // sender-bound: dpop_jkt is present
+        sink,
     );
 
     let granted = match decision {
@@ -538,7 +548,7 @@ pub async fn exchange_ucan_grant(
 ///
 /// 1. requires a **fresh** DPoP proof (mandatory sender-binding — matching the
 ///    initial mint), and
-/// 2. re-presents the persisted grant to [`evaluate_refresh`], which runs the
+/// 2. re-presents the persisted grant to [`crate::mac::exchange::audited_evaluate_refresh`], which runs the
 ///    same gate chain as mint against the *current* `now` and verifier state —
 ///    so a ceiling that has since been amended/revoked, or a grant that has
 ///    since expired, now denies.
@@ -623,14 +633,25 @@ pub(crate) async fn exchange_ucan_grant_refresh(
             "UCAN grant verification is not configured on this node",
         );
     };
+    // MAC #547 / B2 (#674): refresh is a grant-path decision exactly like mint
+    // — it must be on the audit trail too, with the same fail-closed rule (no
+    // sink configured ⇒ deny rather than re-mint unaudited).
+    let Some(sink) = state.audit_sink.as_deref() else {
+        return tx_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "MAC grant-path audit trail is not configured on this node",
+        );
+    };
     let now = chrono::Utc::now().timestamp().max(0) as u64;
-    let decision = evaluate_refresh(
+    let decision = crate::mac::exchange::audited_evaluate_refresh(
         &grant,
         &verifier,
         now,
         &request,
         subject_ctx.as_ref(),
         true, // sender-bound: a fresh DPoP proof was just verified above
+        sink,
     );
 
     let granted = match decision {
@@ -670,6 +691,12 @@ fn grant_error_response(e: GrantError) -> Response {
         }
         GrantError::UnlabeledSubject | GrantError::EmptyGrant => {
             (StatusCode::FORBIDDEN, "invalid_grant", e.to_string())
+        }
+        // B2 (#674): a would-be Permit that could not be durably audited.
+        // Fail-closed, not the client's fault — surfaced as server_error
+        // (matches the "audit trail not configured" preflight response).
+        GrantError::AuditUnavailable => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string())
         }
     };
     tx_error(status, code, &desc)
