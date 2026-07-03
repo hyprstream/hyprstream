@@ -39,7 +39,13 @@ pub fn generate_parsers(out: &mut String, service_name: &str, schema: &ParsedSch
     if resp_struct.has_union {
         let shared_fields: Vec<String> = non_union_fields
             .iter()
-            .map(|f| format!("{}: {}", to_camel_case(&f.name), capnp_to_ts_type(&f.type_name)))
+            .map(|f| {
+                format!(
+                    "{}: {}",
+                    to_camel_case(&f.name),
+                    capnp_to_ts_type(&f.type_name)
+                )
+            })
             .collect();
         let arms: Vec<(String, String)> = schema
             .response_variants
@@ -54,7 +60,12 @@ pub fn generate_parsers(out: &mut String, service_name: &str, schema: &ParsedSch
                 (v.name.clone(), data_ty)
             })
             .collect();
-        emit_result_union_alias(out, &format!("{pascal}ResponseResult"), &shared_fields, &arms);
+        emit_result_union_alias(
+            out,
+            &format!("{pascal}ResponseResult"),
+            &shared_fields,
+            &arms,
+        );
     } else {
         // Data-only response (no union) — plain interface, unchanged shape.
         out.push_str(&format!("export interface {pascal}ResponseResult {{\n"));
@@ -284,7 +295,7 @@ pub fn generate_struct_parsers(out: &mut String, schema: &ParsedSchema) {
             .collect();
         let arms: Vec<(String, String)> = union_fields
             .iter()
-            .map(|f| (f.name.clone(), super::union_variant_data_type(f)))
+            .map(|f| (f.name.clone(), super::union_arm_data_type(sd, f)))
             .collect();
         emit_result_union_alias(out, &format!("{}Result", sd.name), &shared_fields, &arms);
 
@@ -315,7 +326,10 @@ pub fn generate_struct_parsers(out: &mut String, schema: &ParsedSchema) {
                 variant.discriminant_value, variant.name
             ));
 
-            if variant.type_name == "Void" {
+            if let Some(leaves) = super::group_arm_leaves(sd, variant) {
+                let data = emit_group_arm_read("reader", leaves, schema);
+                emit_return(out, &non_union_fields, &variant.name, &data);
+            } else if variant.type_name == "Void" {
                 emit_return(out, &non_union_fields, &variant.name, "undefined");
             } else if variant.type_name == "Bool" {
                 let byte_off = data_byte_offset(variant);
@@ -782,8 +796,11 @@ fn emit_struct_pointer_expr(
 
         for uf in &union_fields {
             s.push_str(&format!("    case {}: {{\n", uf.discriminant_value));
-            let data_expr =
-                emit_inner_variant_read_from(&var_name, Some(uf), &uf.type_name, schema, depth + 1);
+            let data_expr = if let Some(leaves) = super::group_arm_leaves(sd, uf) {
+                emit_group_arm_read(&var_name, leaves, schema)
+            } else {
+                emit_inner_variant_read_from(&var_name, Some(uf), &uf.type_name, schema, depth + 1)
+            };
             s.push_str(&format!(
                 "      return {{ {nuf_str}{nuf_comma}variant: '{}' as const, data: {data_expr} }};\n",
                 uf.name
@@ -902,6 +919,23 @@ fn emit_struct_element_field_read_inner(
     }
 }
 
+/// Read an inline union `group` arm's leaf fields into an object literal
+/// matching its synthesized interface: `{ leaf1: <read>, leaf2: <read> }`.
+///
+/// The leaves live in the ENCLOSING struct's sections, so they read from the
+/// same `reader_var` at their own slot offsets (a group has no own pointer).
+fn emit_group_arm_read(reader_var: &str, leaves: &[FieldDef], schema: &ParsedSchema) -> String {
+    let parts: Vec<String> = leaves
+        .iter()
+        .map(|leaf| {
+            let camel = to_camel_case(&leaf.name);
+            let read = emit_struct_element_field_read_inner(reader_var, leaf, schema, 0);
+            format!("{camel}: {read}")
+        })
+        .collect();
+    format!("{{ {} }}", parts.join(", "))
+}
+
 /// Generate an inline expression that reads a List(Struct) and maps elements to objects.
 ///
 /// For non-union structs: maps to `{ field1, field2, ... }`.
@@ -975,7 +1009,11 @@ fn emit_union_struct_list_field_expr(
             "      case {}: // {}\n",
             uf.discriminant_value, uf.name
         ));
-        let data_expr = emit_inner_variant_read_from("_el", Some(uf), &uf.type_name, schema, 0);
+        let data_expr = if let Some(leaves) = super::group_arm_leaves(sd, uf) {
+            emit_group_arm_read("_el", leaves, schema)
+        } else {
+            emit_inner_variant_read_from("_el", Some(uf), &uf.type_name, schema, 0)
+        };
         // `as const` narrows the literal so the mapped array types as the typed
         // discriminated union (e.g. StreamPayload[]) rather than widening to
         // `{ variant: string; ... }[]`.
@@ -1254,10 +1292,7 @@ struct PayloadResponse {
     /// Compile `schema_src` to a CGR keyed on `name` and parse it. Uses a
     /// per-(pid, name) temp dir so parallel tests don't collide.
     fn parse_schema(name: &str, schema_src: &str) -> ParsedSchema {
-        let tmp = std::env::temp_dir().join(format!(
-            "hyprstream_ts_{name}_{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("hyprstream_ts_{name}_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).expect("create temp dir");
 
         let capnp_path = tmp.join(format!("{name}.capnp"));
@@ -1363,6 +1398,69 @@ struct PayloadResponse {
         assert!(
             out.contains("variant: 'ok' as const"),
             "variant return missing `as const`:\n{out}"
+        );
+    }
+
+    /// A pure-union struct with an inline `group` arm carrying leaf fields —
+    /// mirrors streaming.capnp's OverflowPolicy.dropOldest.
+    const GROUP_SCHEMA: &str = r#"
+@0x9009900990099009;
+
+struct Overflow {
+  union {
+    block @0 :Void;
+    dropOldest :group {
+      highWaterMark @1 :UInt32;
+    }
+  }
+}
+"#;
+
+    #[test]
+    fn inline_union_group_arm_emits_interface_type_and_build_parse() {
+        let schema = parse_schema("groupfix", GROUP_SCHEMA);
+
+        // 1. Interface: a synthesized `{Struct}{Arm}` interface + a typed arm
+        //    referencing it (NOT the undefined bare `Group`).
+        let mut ifaces = String::new();
+        super::super::interfaces::generate_interfaces(&mut ifaces, &schema);
+        assert!(
+            ifaces.contains("export interface OverflowDropOldest {"),
+            "missing synthesized group interface:\n{ifaces}"
+        );
+        assert!(
+            ifaces.contains("highWaterMark: number;"),
+            "group leaf field missing from interface:\n{ifaces}"
+        );
+        assert!(
+            ifaces.contains("| { variant: 'dropOldest'; data: OverflowDropOldest | null }"),
+            "group arm not typed to its interface:\n{ifaces}"
+        );
+        assert!(
+            !ifaces.contains("data: Group"),
+            "must not emit the undefined bare `Group` type:\n{ifaces}"
+        );
+
+        // 2. Parser: the group arm reads its leaf into an object literal, not
+        //    `undefined`/`null`.
+        let mut parser = String::new();
+        super::generate_struct_parsers(&mut parser, &schema);
+        assert!(
+            parser.contains("variant: 'dropOldest' as const, data: { highWaterMark:"),
+            "group arm parse must read leaves into an object:\n{parser}"
+        );
+
+        // 3. Builder: the per-arm builder takes the group interface and writes
+        //    the leaf.
+        let mut builder = String::new();
+        super::super::builders::generate_struct_builders(&mut builder, &schema);
+        assert!(
+            builder.contains("buildOverflow_dropOldest(p: OverflowDropOldest)"),
+            "group arm builder must take the group interface:\n{builder}"
+        );
+        assert!(
+            builder.contains("p.highWaterMark"),
+            "group arm builder must write the leaf:\n{builder}"
         );
     }
 }
