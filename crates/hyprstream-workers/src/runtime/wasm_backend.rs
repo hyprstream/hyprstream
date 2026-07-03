@@ -455,6 +455,9 @@ inventory::submit! {
         name: "wasm",
         priority: 5,
         auto_selectable: false,
+        // In-process (shared host address space); there is no separate mount
+        // namespace to bind-inject a host 9P socket into (#506).
+        injects_9p_socket: false,
         is_available: WasmBackend::registry_is_available,
         construct: |_ctx| {
             Ok(std::sync::Arc::new(WasmBackend::new(WasmConfig::default()))

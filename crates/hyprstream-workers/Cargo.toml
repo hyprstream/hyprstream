@@ -19,6 +19,9 @@ hyprstream-workers-wasmtime = { path = "../hyprstream-workers-wasmtime", optiona
 hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }
 hyprstream-service = { path = "../hyprstream-service" }
 hyprstream-vfs = { path = "../hyprstream-vfs" }
+# Wire-faithful 9P2000.L server: serves a Subject-scoped `Arc<dyn Mount>` over a
+# Unix socket for the native Wanix guest to dial (#506, `runtime::wanix_workload`).
+hyprstream-9p = { path = "../hyprstream-9p" }
 # FS-A's vhost-user-fs server (native-only): serves a composed per-sandbox
 # Namespace to a Cloud Hypervisor guest. FS-D wires the compose→serve→attach
 # flow. Native-only (vhost-user-fs/fuse-backend-rs transport are Linux-only).

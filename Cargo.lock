@@ -7252,6 +7252,7 @@ dependencies = [
  "glob",
  "hex",
  "hypervisor",
+ "hyprstream-9p",
  "hyprstream-rpc",
  "hyprstream-rpc-build",
  "hyprstream-rpc-derive",

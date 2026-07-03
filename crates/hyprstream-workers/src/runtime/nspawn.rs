@@ -526,6 +526,12 @@ inventory::submit! {
         priority: 10,
         // Kernel-namespace isolation (real container) → eligible for `"auto"`.
         auto_selectable: true,
+        // systemd-nspawn `--bind`s host paths into the container, so hyprstream
+        // can inject a host 9P Unix socket into the workload's mount namespace
+        // (#506). (Running the Wanix guest *as the boot command* under nspawn is
+        // a separate follow-up — nspawn currently boots the inner hyprstream
+        // service — but the socket-injection capability itself is real.)
+        injects_9p_socket: true,
         is_available: NspawnBackend::registry_is_available,
         construct: |_ctx| {
             Ok(std::sync::Arc::new(NspawnBackend::new(NspawnConfig::default()))
