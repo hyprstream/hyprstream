@@ -56,56 +56,7 @@ use web_sys::{Worker, WorkerOptions, WorkerType};
 use hyprstream_9p::client::P9Transport;
 use hyprstream_9p::dma::DmaTransport;
 
-// ─── Frame envelope helpers ──────────────────────────────────────────────────
-
-/// Encode a single DMA frame: `[2: track_len][track][4: payload_len][payload]`.
-///
-/// The track-length prefix is a `u16`; a track name longer than `u16::MAX`
-/// would silently truncate the length header and desync `decode_frame` for the
-/// rest of the stream. Track names are short by construction (moq track paths),
-/// so we clamp defensively and drop the over-long frame rather than corrupt it.
-pub fn encode_frame(track: &str, payload: &[u8]) -> Vec<u8> {
-    let t = track.as_bytes();
-    let track_len = match u16::try_from(t.len()) {
-        Ok(len) => len,
-        Err(_) => {
-            web_sys::console::error_1(
-                &format!("[moq-worker] track name too long ({} bytes), dropping frame", t.len())
-                    .into(),
-            );
-            return Vec::new();
-        }
-    };
-    let mut out = Vec::with_capacity(2 + t.len() + 4 + payload.len());
-    out.extend_from_slice(&track_len.to_le_bytes());
-    out.extend_from_slice(t);
-    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    out.extend_from_slice(payload);
-    out
-}
-
-/// Decode a DMA frame. Returns `(track_name, payload)` or `None` if malformed.
-pub fn decode_frame(buf: &[u8]) -> Option<(&str, &[u8])> {
-    if buf.len() < 6 {
-        return None;
-    }
-    let track_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
-    if buf.len() < 2 + track_len + 4 {
-        return None;
-    }
-    let track = std::str::from_utf8(&buf[2..2 + track_len]).ok()?;
-    let payload_len = u32::from_le_bytes([
-        buf[2 + track_len],
-        buf[3 + track_len],
-        buf[4 + track_len],
-        buf[5 + track_len],
-    ]) as usize;
-    let start = 2 + track_len + 4;
-    if buf.len() < start + payload_len {
-        return None;
-    }
-    Some((track, &buf[start..start + payload_len]))
-}
+use crate::moq_frame::{decode_frame, encode_frame, parse_reach};
 
 // ─── Main-thread handle ───────────────────────────────────────────────────────
 
@@ -126,8 +77,11 @@ impl MoqWorkerHandle {
     ///
     /// # Arguments
     /// - `worker_script_url`: URL of the worker JS shim (e.g. `/moq-worker.js`).
-    /// - `reach_json`: JSON-serialized reach config, e.g.
-    ///   `{"url":"https://relay.example.com:443","cert_hash":"<base64>","track":"local/streams/abcdef"}`.
+    /// - `reach_json`: JSON reach config from the frontend's `selectReach`, e.g.
+    ///   `{"url":"https://relay.example.com:443/moq","certHashes":["<base64 SHA-256>"]}`.
+    ///   The broadcast path to subscribe arrives later in a `subscribe` command
+    ///   (not here), since one worker can serve several subscriptions. See
+    ///   [`crate::moq_frame::ReachConfig`].
     ///
     /// # COOP/COEP
     /// The page must be served with `Cross-Origin-Opener-Policy: same-origin` and
@@ -308,11 +262,11 @@ pub async fn moq_worker_main(sab: JsValue, reach_json: String) {
     let reach_preview: String = reach_json.chars().take(120).collect();
     web_sys::console::log_1(&format!("[moq-worker] started, reach: {}", reach_preview).into());
 
-    // Parse reach config.
-    let reach: serde_json::Value = match serde_json::from_str(&reach_json) {
-        Ok(v) => v,
+    // Parse reach config (url + base64-decoded cert-hash pins).
+    let reach = match parse_reach(&reach_json) {
+        Ok(r) => r,
         Err(e) => {
-            let err = encode_frame("__error__", format!("bad reach_json: {e}").as_bytes());
+            let err = encode_frame("__error__", e.as_bytes());
             let _ = dma.send(&err).await;
             return;
         }
@@ -354,26 +308,10 @@ pub async fn moq_worker_main(sab: JsValue, reach_json: String) {
                     .and_then(|t| t.as_str())
                     .unwrap_or("")
                     .to_string();
-                let url = reach
-                    .get("url")
-                    .and_then(|u| u.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                // Acceptable leaf-cert SHA-256 pins (base64) for the self-signed mesh,
-                // from the QuicReach the frontend selected. Empty ⇒ use system roots.
-                let cert_hashes: Vec<Vec<u8>> = reach
-                    .get("certHashes")
-                    .and_then(|c| c.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str())
-                            .filter_map(|s| {
-                                use base64::Engine;
-                                base64::engine::general_purpose::STANDARD.decode(s).ok()
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                // url + cert-hash pins come from the reach config (parsed once);
+                // empty cert_hashes ⇒ use the browser's system roots.
+                let url = reach.url.clone();
+                let cert_hashes = reach.cert_hashes.clone();
 
                 web_sys::console::log_1(
                     &format!("[moq-worker] subscribe broadcast={broadcast_path} url={url}").into(),
