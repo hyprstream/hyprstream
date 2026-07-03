@@ -772,14 +772,51 @@ impl WorkerService {
 
     /// Get container stats
     pub async fn container_stats(&self, container_id: &str) -> Result<ContainerStats> {
-        let containers = self.containers.read().await;
+        // Snapshot the container and release the lock before any backend RPC:
+        // the guest stats call awaits, and holding the `containers` read lock
+        // across it would needlessly serialise all container mutations.
+        let (mut stats, pod_sandbox_id) = {
+            let containers = self.containers.read().await;
+            let container = containers
+                .get(container_id)
+                .ok_or_else(|| WorkerError::ContainerNotFound(container_id.to_owned()))?;
+            (ContainerStats::from(container), container.pod_sandbox_id.clone())
+        };
 
-        let container = containers
-            .get(container_id)
-            .ok_or_else(|| WorkerError::ContainerNotFound(container_id.to_owned()))?;
+        self.enrich_container_stats(container_id, &pod_sandbox_id, &mut stats)
+            .await;
+        Ok(stats)
+    }
 
-        // TODO: Get actual stats from container
-        Ok(ContainerStats::from(container))
+    /// Overlay real guest-sourced CPU/memory usage onto placeholder
+    /// [`ContainerStats`] when the sandbox backend can observe the guest
+    /// (e.g. Kata via the kata-agent `StatsContainer` RPC). Backends without
+    /// in-guest visibility return `None` and the placeholder values stand.
+    /// A backend error degrades to the placeholder (logged) rather than
+    /// failing the stats call.
+    async fn enrich_container_stats(
+        &self,
+        container_id: &str,
+        pod_sandbox_id: &str,
+        stats: &mut ContainerStats,
+    ) {
+        let Some(sandbox) = self.sandbox_pool.get(pod_sandbox_id).await else {
+            return;
+        };
+        match self.sandbox_pool.backend().container_stats(&sandbox).await {
+            Ok(Some((cpu, memory))) => {
+                stats.cpu = cpu;
+                stats.memory = memory;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    container_id = %container_id,
+                    error = %e,
+                    "Failed to fetch guest container stats; returning placeholder stats"
+                );
+            }
+        }
     }
 
     /// List container stats matching the given filter.
@@ -787,27 +824,45 @@ impl WorkerService {
         &self,
         filter: &ContainerStatsFilter,
     ) -> Result<Vec<ContainerStats>> {
-        let containers = self.containers.read().await;
-        let mut results = Vec::new();
+        // Collect matching (placeholder stats, container id, sandbox id)
+        // snapshots under the lock, then release it before enriching each with
+        // guest-sourced usage (the backend RPCs await and must not run under
+        // the `containers` read lock).
+        let snapshots: Vec<(ContainerStats, String, String)> = {
+            let containers = self.containers.read().await;
+            containers
+                .values()
+                .filter(|container| {
+                    if !filter.id.is_empty() && container.id != filter.id {
+                        return false;
+                    }
+                    if !filter.pod_sandbox_id.is_empty()
+                        && container.pod_sandbox_id != filter.pod_sandbox_id
+                    {
+                        return false;
+                    }
+                    filter.label_selector.iter().all(|kv| {
+                        container
+                            .labels
+                            .iter()
+                            .any(|l| l.key == kv.key && l.value == kv.value)
+                    })
+                })
+                .map(|container| {
+                    (
+                        ContainerStats::from(container),
+                        container.id.clone(),
+                        container.pod_sandbox_id.clone(),
+                    )
+                })
+                .collect()
+        };
 
-        for container in containers.values() {
-            if !filter.id.is_empty() && container.id != filter.id {
-                continue;
-            }
-            if !filter.pod_sandbox_id.is_empty() && container.pod_sandbox_id != filter.pod_sandbox_id {
-                continue;
-            }
-            let mut matches_labels = true;
-            for kv in &filter.label_selector {
-                if !container.labels.iter().any(|l| l.key == kv.key && l.value == kv.value) {
-                    matches_labels = false;
-                    break;
-                }
-            }
-            if !matches_labels {
-                continue;
-            }
-            results.push(ContainerStats::from(container));
+        let mut results = Vec::with_capacity(snapshots.len());
+        for (mut stats, container_id, pod_sandbox_id) in snapshots {
+            self.enrich_container_stats(&container_id, &pod_sandbox_id, &mut stats)
+                .await;
+            results.push(stats);
         }
 
         Ok(results)
