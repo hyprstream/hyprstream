@@ -60,7 +60,11 @@ parking_lot.workspace = true
 default = ["xet-storage"]
 # Enable XET large file storage support
 xet-storage = ["data", "cas_client", "cas_object", "merklehash", "async-trait"]
-# Enable SSH transport for self-hosted CAS servers
+# Enable SSH transport for self-hosted CAS servers.
+# DORMANT (#654): the remote `cas-serve` binary this backend exec'd over SSH has
+# been retired, so `SshStorage` cannot connect to anything today. It still builds
+# against the `cas_serve` LIBRARY protocol types and is retained (not deleted)
+# pending a repoint at the new dual-stack XET service (epic #654, task #5).
 ssh-transport = ["xet-storage", "russh", "russh-keys", "cas-serve", "base64", "dirs"]
 # Enable gittorrent P2P transport
 gittorrent-transport = ["xet-storage", "gittorrent"]

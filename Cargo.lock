@@ -1828,7 +1828,6 @@ dependencies = [
 name = "cas-serve"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "base64 0.22.1",
  "bytes",
  "dirs 5.0.1",
@@ -1840,8 +1839,6 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

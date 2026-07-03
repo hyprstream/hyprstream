@@ -10,9 +10,10 @@ description = "CAS server for stdin/stdout transport - enables XET over SSH"
 name = "cas_serve"
 path = "src/lib.rs"
 
-[[bin]]
-name = "cas-serve"
-path = "src/main.rs"
+# NOTE: the identity-agnostic `cas-serve` NDJSON-over-stdio binary was retired in
+# #654. Its write core now lives in the library (`CasStore::put_file_bytes`) and
+# is reached through the authenticated in-process registry `putBlob` RPC instead
+# of an unauthenticated subprocess ingress. Only the library ships now.
 
 [dependencies]
 # XET core dependencies.
@@ -32,17 +33,12 @@ tokio = { workspace = true, features = ["rt-multi-thread", "io-util", "macros", 
 # `Chunk` uses).
 bytes.workspace = true
 
-# Serialization - using JSON for simplicity and debuggability
+# Serialization - protocol types derive serde; base64 encodes shard blobs for
+# the NDJSON-safe `Response` wire types (still used by the SSH client backend).
 serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
 
 # Error handling
 thiserror.workspace = true
-anyhow.workspace = true
-
-# Logging
-tracing.workspace = true
-tracing-subscriber.workspace = true
 
 # Utilities
 base64 = "0.22"
@@ -51,6 +47,9 @@ shellexpand = "3.1"
 
 [dev-dependencies]
 tempfile.workspace = true
+# serde_json is only exercised by the protocol serialization unit tests now that
+# the NDJSON binary (its only non-test user) has been retired.
+serde_json.workspace = true
 
 [lints]
 workspace = true
