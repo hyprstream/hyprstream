@@ -141,6 +141,51 @@ impl SecurityContext {
     pub fn compartments(&self) -> CompartmentSet {
         self.clearance.compartments
     }
+
+    /// **#681 two-principal composition for a delegated call.** THE single shared
+    /// derivation — both the S6 token-exchange gate (#680) and the downstream PDP
+    /// call this; it is never re-implemented (a parallel impl would drift into
+    /// the exact escalation hole this closes).
+    ///
+    /// - **Level + compartments = meet(delegator, actor)** (`min` level,
+    ///   compartment intersection). The effective clearance dominates an object
+    ///   only if *both* the authority source (`delegator` = UCAN chain root) and
+    ///   the acting receiver (`actor` = the presenter/MCP that signs the
+    ///   downstream envelope and receives the bytes) dominate it. Never either
+    ///   alone.
+    /// - **Assurance = the actor's** (the *signer's* verified key material,
+    ///   already clamped into `actor`'s context per #548). The actor signs the
+    ///   downstream envelope and receives the object bytes, so the crypto floor
+    ///   that governs the read is the actor's — not the delegator's (who
+    ///   authorizes but never receives). A `Classical` actor thus cannot reach a
+    ///   `PqHybrid`-labeled object even if the delegated clearance claims
+    ///   `PqHybrid`.
+    ///
+    /// meet(root, actor) is *sufficient*: intermediate delegation hops carry
+    /// authority, not data (bounded by UCAN capability attenuation), and never
+    /// receive the object bytes — so their clearances do not enter the read floor.
+    #[must_use]
+    pub fn delegated_meet(delegator: &SecurityContext, actor: &SecurityContext) -> SecurityContext {
+        SecurityContext {
+            clearance: SecurityLabel::new(
+                delegator.level().min(actor.level()),
+                actor.assurance(), // signer-derived; NOT met with the delegator
+                delegator.compartments().intersect(actor.compartments()),
+            ),
+        }
+    }
+
+    /// Fail-closed wrapper over [`Self::delegated_meet`]: `None` (→ deny) if
+    /// *either* principal's clearance is unresolved (#681 AC — no default
+    /// clearance for a missing principal). This is the entry point the exchange
+    /// gate and the PDP both call.
+    #[must_use]
+    pub fn delegated(
+        delegator: Option<&SecurityContext>,
+        actor: Option<&SecurityContext>,
+    ) -> Option<SecurityContext> {
+        Some(Self::delegated_meet(delegator?, actor?))
+    }
 }
 
 /// **Seam** for carrying a subject clearance on the verified claims/envelope.
@@ -182,6 +227,52 @@ mod tests {
     /// these tests work directly in bits).
     fn comps(bits: &[u32]) -> CompartmentSet {
         bits.iter().copied().collect()
+    }
+
+    // ── #681 two-principal delegated meet ──────────────────────────────────
+
+    #[test]
+    fn delegated_meet_is_min_level_and_compartment_intersection_neither_alone() {
+        // delegator: Secret / {0,1} ; actor: Confidential / {1,2}. Both PqHybrid.
+        let delegator =
+            SecurityContext::new(Level::Secret, comps(&[0, 1]), VerifiedKeyMaterial::PqHybrid);
+        let actor =
+            SecurityContext::new(Level::Confidential, comps(&[1, 2]), VerifiedKeyMaterial::PqHybrid);
+        let meet = SecurityContext::delegated_meet(&delegator, &actor);
+
+        assert_eq!(meet.level(), Level::Confidential, "min level");
+        assert_eq!(meet.compartments(), comps(&[1]), "compartment intersection");
+        // Neither principal alone equals the meet — the composition is strictly
+        // bounded by both (this is the escalation the single-principal path had).
+        assert_ne!(meet.level(), delegator.level());
+        assert_ne!(meet.compartments(), actor.compartments());
+    }
+
+    #[test]
+    fn delegated_assurance_is_the_signer_actor_classical_actor_cannot_reach_pqhybrid() {
+        // Delegated clearance would like PqHybrid (delegator is PqHybrid), but the
+        // ACTOR signs the downstream envelope with a Classical key. Assurance must
+        // follow the actor → the delegated context cannot reach a PqHybrid object.
+        let delegator =
+            SecurityContext::new(Level::Secret, comps(&[]), VerifiedKeyMaterial::PqHybrid);
+        let actor = SecurityContext::new(Level::Secret, comps(&[]), VerifiedKeyMaterial::Classical);
+        let meet = SecurityContext::delegated_meet(&delegator, &actor);
+
+        assert_eq!(meet.assurance(), Assurance::Classical, "assurance is the actor's (signer)");
+        let pqhybrid_object = SecurityLabel::new(Level::Secret, Assurance::PqHybrid, comps(&[]));
+        assert!(
+            !meet.can_access(&pqhybrid_object),
+            "Classical actor must NOT reach a PqHybrid object even with a PqHybrid delegator"
+        );
+    }
+
+    #[test]
+    fn delegated_fails_closed_if_either_principal_unresolved() {
+        let ctx = SecurityContext::new(Level::Secret, comps(&[0]), VerifiedKeyMaterial::PqHybrid);
+        assert!(SecurityContext::delegated(None, Some(&ctx)).is_none(), "missing delegator ⇒ deny");
+        assert!(SecurityContext::delegated(Some(&ctx), None).is_none(), "missing actor ⇒ deny");
+        assert!(SecurityContext::delegated(None, None).is_none());
+        assert!(SecurityContext::delegated(Some(&ctx), Some(&ctx)).is_some());
     }
 
     #[test]

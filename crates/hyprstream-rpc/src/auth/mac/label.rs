@@ -218,6 +218,16 @@ impl CompartmentSet {
         CompartmentSet(self.0 | other.0)
     }
 
+    /// Set **intersection** (the lattice *meet* on this axis) — the dual of
+    /// [`Self::union`]. Used to compose the need-to-know of two principals
+    /// (#681 delegated meet): the result is cleared into a compartment only if
+    /// *both* inputs are, so a delegated call never widens need-to-know past
+    /// either principal.
+    #[inline]
+    pub const fn intersect(self, other: CompartmentSet) -> CompartmentSet {
+        CompartmentSet(self.0 & other.0)
+    }
+
     /// Does this set contain compartment bit `index`?
     #[inline]
     pub const fn contains(self, index: u32) -> bool {

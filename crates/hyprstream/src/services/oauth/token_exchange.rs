@@ -742,9 +742,14 @@ async fn mint_grant_token(
         granted.capability.ability, granted.capability.resource
     );
 
+    // Fu1/#677 (was TODO(#572-scope-claim)): carry the attenuated capability
+    // subset in the `cap` claim so the downstream PEP (S2) enforces the minted
+    // least-authority on the wire, and a refresh can only re-grant this subset
+    // — not just log it. The cnf.jkt binding + short ttl remain load-bearing.
     let claims = hyprstream_rpc::auth::Claims::new(sub.clone(), now, expires_at)
         .with_issuer(state.issuer_url.clone())
         .with_audience(granted.audience.clone())
+        .with_cap(scope_str)
         .with_jti();
     // DPoP sender-binding via cnf.jkt (RFC 9449 §6). ZSP: no cnf ⇒ bearer ⇒
     // rejected. We set jkt directly from the verified proof.
@@ -753,12 +758,6 @@ async fn mint_grant_token(
         jwk: None,
         jkt: Some(dpop_jkt.to_owned()),
     });
-
-    // TODO(#572-scope-claim): the capability subset (`scope_str`) needs a
-    //   dedicated claim carrying the attenuated capability so the PEP (S2) can
-    //   enforce the minted subset on refresh. For now it is logged; the cnf.jkt
-    //   binding + short ttl are the load-bearing controls.
-    let _ = scope_str;
 
     // S8 (#574): sign via the hybrid composite (EdDSA + ML-DSA-65) when an
     // ML-DSA-65 key is provisioned; fall back to the policy-selected classical
