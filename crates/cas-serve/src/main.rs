@@ -194,62 +194,27 @@ impl CasServer {
             }
         };
 
-        // Chunk via CDC, then aggregate into xorbs + build the shard.
-        let chunks = chunker::chunk_all(&decoded);
-        let (shard, xorbs) = Shard::from_chunks(&chunks);
-
-        // Ensure storage dirs exist.
-        let xorbs_dir = self.storage_path.join("xorbs");
-        let shards_dir = self.storage_path.join("shards");
-        if let Err(e) = tokio::fs::create_dir_all(&xorbs_dir).await {
-            return Response::error(
-                ErrorCode::IoError,
-                format!("Failed to create xorbs dir: {e}"),
-            );
-        }
-        if let Err(e) = tokio::fs::create_dir_all(&shards_dir).await {
-            return Response::error(
-                ErrorCode::IoError,
-                format!("Failed to create shards dir: {e}"),
-            );
-        }
-
-        // Store each xorb content-addressed. Existing xorbs are not an error
-        // (content-addressed dedup): just overwrite.
-        let mut xorb_hashes = Vec::with_capacity(xorbs.len());
-        for (xorb_hash, bytes) in &xorbs {
-            let hex = xorb_hash.hex();
-            let path = xorbs_dir.join(format!("default.{hex}"));
-            if let Err(e) = tokio::fs::write(&path, bytes).await {
-                return Response::error(
-                    ErrorCode::UploadFailed,
-                    format!("Failed to write xorb {hex}: {e}"),
+        // Chunk + store + server-side merkle go through the shared `CasStore`
+        // write core (`cas_serve::store`), so the binary and in-process embedders
+        // (the registry `putBlob` handler) share one implementation.
+        let store = cas_serve::CasStore::new(&self.storage_path);
+        match store.put_file_bytes(&decoded).await {
+            Ok(put) => {
+                info!(
+                    "UploadFile {}: {} bytes, {} xorb(s), {} new byte(s)",
+                    put.merkle,
+                    decoded.len(),
+                    put.xorb_hashes.len(),
+                    put.bytes_stored
                 );
+                Response::UploadFileSuccess {
+                    file_hash: put.merkle,
+                    // file_len is the original input length (== sum of chunk lens).
+                    file_len: decoded.len() as u64,
+                    xorb_hashes: put.xorb_hashes,
+                }
             }
-            xorb_hashes.push(hex);
-        }
-
-        // Store the reconstruction shard (`.mdb` binary) keyed by the file hash.
-        let shard_path = shards_dir.join(&shard.file_hash);
-        if let Err(e) = tokio::fs::write(&shard_path, shard.to_bytes()).await {
-            return Response::error(
-                ErrorCode::UploadFailed,
-                format!("Failed to write shard: {e}"),
-            );
-        }
-
-        info!(
-            "UploadFile {}: {} bytes, {} chunk(s), {} xorb(s)",
-            shard.file_hash,
-            decoded.len(),
-            chunks.len(),
-            xorbs.len()
-        );
-
-        Response::UploadFileSuccess {
-            file_hash: shard.file_hash,
-            file_len: shard.file_len,
-            xorb_hashes,
+            Err(e) => Response::error(ErrorCode::UploadFailed, format!("Upload failed: {e}")),
         }
     }
 
