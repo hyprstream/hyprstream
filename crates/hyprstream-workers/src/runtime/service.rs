@@ -1,6 +1,26 @@
-//! WorkerService - CRI RuntimeClient + ImageClient via ZMQ
+//! WorkerService — CRI RuntimeClient + ImageClient control plane.
 //!
-//! Implements RequestService trait for handling CRI-aligned requests.
+//! Implements the `RequestService` trait for handling CRI-aligned requests.
+//!
+//! # Transport (#350, epic #341)
+//!
+//! This is the worker **control plane**. It is transport-agnostic: the service
+//! only implements `RequestService` (Cap'n Proto wire format via
+//! `generate_rpc_service!("worker")`) and carries a `TransportConfig`. The
+//! legacy ZMQ ROUTER/DEALER stack was removed workspace-wide (#138/#167 —
+//! ZMQ/ZeroMQ is gone); the blanket `Spawnable` impl bridges this service and
+//! serves it over its *registered* transport (`serve_bridged`: Inproc / IPC-UDS
+//! / systemd-fd, plus the QUIC/Iroh dial plane). No ZMQ socket exists in this
+//! path.
+//!
+//! The **asynchronous** surfaces of the worker already ride the moq-lite
+//! streaming plane, mirroring the event-bus migration (#167): lifecycle events
+//! publish via [`EventPublisher`] (moq-backed — see `crate::events`) and
+//! terminal attach/detach FD data streams via `StreamChannel` /
+//! `AnyStreamPublisher` (moq). moq is a pub/sub fan-out plane, not a
+//! request/response RPC transport, so the synchronous CRI req/rep control plane
+//! stays on the Cap'n Proto bridged transport shared by every peer RPC service
+//! (registry/model/policy/mcp).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,7 +31,9 @@ use anyhow::Result as AnyhowResult;
 use async_trait::async_trait;
 use tracing::{debug, info, warn};
 
-// Import ZMQ service infrastructure from hyprstream-rpc
+// RPC service infrastructure from hyprstream-rpc: the pluggable Cap'n Proto
+// bridged transport (inproc/UDS/QUIC/iroh) + the moq streaming plane. ZMQ is
+// gone (#138/#167) — this is not a ZMQ socket API.
 use hyprstream_rpc::prelude::SigningKey;
 use hyprstream_rpc::service::{AuthorizeFn, EnvelopeContext, RequestService};
 use hyprstream_rpc::moq_stream::AnyStreamPublisher;
@@ -63,7 +85,8 @@ const SERVICE_NAME: &str = "worker";
 
 /// WorkerService handles CRI RuntimeClient and ImageClient requests
 ///
-/// Implements the RequestService trait for integration with hyprstream's ZMQ infrastructure.
+/// Implements the RequestService trait for integration with hyprstream's
+/// Cap'n Proto bridged RPC transport (inproc/UDS/systemd-fd + QUIC/Iroh); ZMQ is gone.
 pub struct WorkerService {
     // Business logic
     /// Sandbox pool for VM management
