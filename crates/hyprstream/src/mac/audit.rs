@@ -110,6 +110,35 @@ use thiserror::Error;
 // The record
 // ────────────────────────────────────────────────────────────────────────────
 
+/// The delegator principal recorded on a **delegated** (two-principal, #680/#681)
+/// decision — the source of authority on whose behalf the record's `subject_*`
+/// (the effective, met context) was evaluated.
+///
+/// The audit record identifies principals by their **resolved MAC context**
+/// (TE type + S1 clearance), never caller-asserted strings — the same grain as
+/// `AuditRecord`'s `subject_*`. On the S6 grant path both this and the subject
+/// carry the [`crate::mac::te::GRANT_PATH_SUBJECT`] sentinel type, and the
+/// clearance is the distinguishing field.
+///
+/// Why the delegator and not the actor: the record's `subject_clearance` is
+/// already the effective `meet(delegator, actor)` clearance the PDP evaluated —
+/// and its **assurance is the actor's** (the meet clamps assurance to the
+/// signer's verified key material, #548/#681), so the actor's contribution is
+/// auditable directly on `subject_*`. The delegator is the missing half: the
+/// user-attribution (#445) a confused-deputy call would otherwise lose. Both
+/// source principals are therefore recoverable — the actor's clearance
+/// assurance from `subject_clearance`, the delegator here — and the effective
+/// clearance the decision actually rested on is `subject_clearance` itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationPrincipal {
+    /// TE subject type of the delegator (SELinux domain); the grant path uses
+    /// the [`crate::mac::te::GRANT_PATH_SUBJECT`] sentinel.
+    pub subject_type: SubjectType,
+    /// The delegator's clearance label (S1). MAC provenance for the authority
+    /// source.
+    pub subject_clearance: SecurityLabel,
+}
+
 /// A single authorization decision, as recorded by the audit store. This is
 /// the unit of tamper-evidence: it is content-addressed (BLAKE3 over canonical
 /// CBOR), signed, and append-logged.
@@ -121,6 +150,8 @@ use thiserror::Error;
 ///   that governed this decision, when known (`None` for ad-hoc evaluators).
 /// - `subject_*` / `object_*` — the resolved security contexts (TE type +
 ///   S1 label) the PDP actually saw, not caller-asserted strings.
+/// - `on_behalf_of` — for a delegated decision, the delegator principal
+///   (#680/#681); `None` for an ordinary single-principal decision.
 /// - `reason` — why the PDP decided as it did (floor failure, TE miss, token
 ///   gate, audit-fail-closed, ...).
 ///
@@ -154,8 +185,21 @@ pub struct AuditRecord {
     pub policy_hash: Option<[u8; 32]>,
     /// TE subject type (SELinux domain).
     pub subject_type: SubjectType,
-    /// The subject's clearance label (S1). MAC provenance for the subject.
+    /// The subject's clearance label (S1). MAC provenance for the subject. On a
+    /// delegated decision this is the **effective** `meet(delegator, actor)`
+    /// clearance the PDP evaluated (assurance clamped to the actor's signer key,
+    /// #548/#681); the delegator half is recorded in [`Self::on_behalf_of`].
     pub subject_clearance: SecurityLabel,
+    /// For a **delegated** decision (#680/#681), the delegator principal — the
+    /// source of authority on whose behalf `subject_*` acted. `None` for an
+    /// ordinary single-principal decision.
+    ///
+    /// **Versioned by omission:** serialized only when `Some`, so a
+    /// single-principal record's canonical bytes (and therefore its content
+    /// hash and its successor's `prev_hash` link) are byte-identical to the
+    /// pre-delegation schema — the hash chain is preserved across the upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<DelegationPrincipal>,
     /// TE object type.
     pub object_type: ObjectType,
     /// The object's content-bound label (S1). MAC provenance for the object.
@@ -930,9 +974,15 @@ impl<A: Avc, S: AuditSink> AuditedAvc<A, S> {
 
     /// Record a decision through the sink, applying the fail-closed rule.
     /// Returns the decision the PEP should enforce, plus the reason.
+    ///
+    /// `on_behalf_of` carries the delegator principal on a delegated (#680/#681)
+    /// decision — `subject` is the effective, met context the AVC decided on;
+    /// the delegator is recorded but never re-evaluated here (the meet already
+    /// happened upstream in `SecurityContext::delegated`).
     fn audit(
         &self,
         subject: SubjectCtx,
+        on_behalf_of: Option<SubjectCtx>,
         object: ObjectCtx,
         action: Action,
         decision: Decision,
@@ -960,6 +1010,10 @@ impl<A: Avc, S: AuditSink> AuditedAvc<A, S> {
             policy_hash: self.policy_hash,
             subject_type: subject.subject_type,
             subject_clearance: subject.clearance,
+            on_behalf_of: on_behalf_of.map(|d| DelegationPrincipal {
+                subject_type: d.subject_type,
+                subject_clearance: d.clearance,
+            }),
             object_type: object.object_type,
             object_label: object.label,
             action,
@@ -1002,7 +1056,7 @@ impl<A: Avc, S: AuditSink> Avc for AuditedAvc<A, S> {
     fn decide(&self, subject: SubjectCtx, object: ObjectCtx, action: Action) -> Decision {
         let decision = self.inner.decide(subject, object, action);
         let reason = decision_reason_for(decision);
-        self.audit(subject, object, action, decision, reason)
+        self.audit(subject, None, object, action, decision, reason)
     }
 
     #[inline]
@@ -1026,11 +1080,59 @@ impl<A: Avc, S: AuditSink> Avc for AuditedAvc<A, S> {
         } else {
             pre_reason.unwrap_or_else(|| decision_reason_for(decision))
         };
-        self.audit(subject, object, action, decision, reason)
+        self.audit(subject, None, object, action, decision, reason)
     }
 
     fn flush(&self) {
         self.inner.flush();
+    }
+}
+
+impl<A: Avc, S: AuditSink> AuditedAvc<A, S> {
+    /// Delegated (#680/#681) counterpart of [`Avc::decide`]: `subject` is the
+    /// effective, met context the PDP decides on (already `meet(delegator,
+    /// actor)` from [`hyprstream_rpc::auth::mac::SecurityContext::delegated`]);
+    /// `on_behalf_of` is the delegator principal, recorded on the audit record
+    /// but **never re-evaluated** (the decision rests on the met `subject`
+    /// alone — the delegator cannot re-widen it).
+    ///
+    /// The plain [`Avc::decide`] is the single-principal case (`on_behalf_of =
+    /// None`); this is the two-principal case the (future) reference monitor
+    /// calls when a request arrived over a delegation. Kept off the `Avc` trait
+    /// so the hot-path cache key stays `(subject, object, action)` — delegation
+    /// is an audit-attribution concern, not a decision input.
+    #[inline]
+    pub fn decide_delegated(
+        &self,
+        subject: SubjectCtx,
+        on_behalf_of: Option<SubjectCtx>,
+        object: ObjectCtx,
+        action: Action,
+    ) -> Decision {
+        let decision = self.inner.decide(subject, object, action);
+        let reason = decision_reason_for(decision);
+        self.audit(subject, on_behalf_of, object, action, decision, reason)
+    }
+
+    /// Delegated counterpart of [`Avc::decide_with_token`]; see
+    /// [`Self::decide_delegated`] for the two-principal semantics.
+    #[inline]
+    pub fn decide_delegated_with_token(
+        &self,
+        subject: SubjectCtx,
+        on_behalf_of: Option<SubjectCtx>,
+        object: ObjectCtx,
+        action: Action,
+        token: &TokenScope,
+    ) -> Decision {
+        let pre_reason = token_deny_reason(token, action);
+        let decision = self.inner.decide_with_token(subject, object, action, token);
+        let reason = if decision.is_permit() {
+            DecisionReason::Permit
+        } else {
+            pre_reason.unwrap_or_else(|| decision_reason_for(decision))
+        };
+        self.audit(subject, on_behalf_of, object, action, decision, reason)
     }
 }
 
@@ -1423,6 +1525,7 @@ mod tests {
             policy_hash: None,
             subject_type: SubjectType(1),
             subject_clearance: high(),
+            on_behalf_of: None,
             object_type: ObjectType(1),
             object_label: low(),
             action: Action(1),
@@ -1445,6 +1548,97 @@ mod tests {
         assert_ne!(h1, h4, "timestamp drift must change the content hash");
     }
 
+    /// #680/#681 hash-chain back-compat: a single-principal record
+    /// (`on_behalf_of: None`) must serialize byte-identically to the
+    /// pre-delegation schema — the field is skipped entirely, so existing
+    /// content hashes and `prev_hash` links are preserved across the upgrade.
+    /// Setting a delegator changes the hash (it is covered content).
+    #[test]
+    fn on_behalf_of_none_is_omitted_and_some_changes_the_hash() {
+        let mut rec = AuditRecord {
+            seq: 1,
+            prev_hash: [0u8; 32],
+            ts_unix_nanos: 0,
+            decision: Decision::Permit,
+            generation: 7,
+            policy_hash: None,
+            subject_type: SubjectType(1),
+            subject_clearance: high(),
+            on_behalf_of: None,
+            object_type: ObjectType(1),
+            object_label: low(),
+            action: Action(1),
+            reason: DecisionReason::Permit,
+        };
+
+        // `None` is skipped: the field name never appears in the canonical bytes,
+        // so a single-principal record is byte-identical to the pre-delegation
+        // schema (which had no such field at all).
+        let bytes_none = rec.canonical_bytes().unwrap();
+        let text = String::from_utf8(bytes_none.clone()).unwrap();
+        assert!(
+            !text.contains("on_behalf_of"),
+            "a None delegator must be omitted from canonical bytes (hash-chain back-compat)"
+        );
+        let hash_none = rec.content_hash().unwrap();
+
+        // A delegated record IS distinguished: the delegator is covered content,
+        // so the hash moves and the field is now present.
+        rec.on_behalf_of = Some(DelegationPrincipal {
+            subject_type: SubjectType(2),
+            subject_clearance: low(),
+        });
+        let bytes_some = rec.canonical_bytes().unwrap();
+        assert!(
+            String::from_utf8(bytes_some).unwrap().contains("on_behalf_of"),
+            "a Some delegator must appear in the canonical bytes"
+        );
+        assert_ne!(
+            hash_none,
+            rec.content_hash().unwrap(),
+            "recording a delegator must change the content hash — it is tamper-evident content"
+        );
+    }
+
+    /// #680/#681: `AuditedAvc::decide_delegated` decides on the effective (met)
+    /// `subject` alone — the delegator never re-widens the decision — but stamps
+    /// the delegator on the audit record's `on_behalf_of`. The plain `decide`
+    /// path records `None`.
+    #[test]
+    fn decide_delegated_records_delegator_without_affecting_the_decision() {
+        let inner = avc();
+        let sink = Arc::new(CapturingSink::new());
+        let audited = AuditedAvc::new(inner, sink.clone(), 7, None);
+
+        // Met subject clears the op (rule (1,1,1) + floor holds). The delegator
+        // is a DISTINCT principal (different TE type + clearance).
+        let met = subj(1, high());
+        let delegator = subj(2, low());
+        let d = audited.decide_delegated(met, Some(delegator), obj(1, low()), Action(1));
+        assert_eq!(d, Decision::Permit, "decision rests on the met subject alone");
+
+        // A non-delegated decision on the same triple records no delegator.
+        let d2 = audited.decide(subj(1, high()), obj(1, low()), Action(1));
+        assert_eq!(d2, Decision::Permit);
+
+        let recs = sink.records();
+        assert_eq!(recs.len(), 2);
+        let obo = recs[0]
+            .on_behalf_of
+            .expect("the delegated decision records its delegator");
+        assert_eq!(obo.subject_type, SubjectType(2), "delegator's TE type");
+        assert_eq!(obo.subject_clearance, low(), "delegator's own clearance");
+        assert_eq!(
+            recs[0].subject_clearance,
+            high(),
+            "subject_clearance is the met context, not the delegator's"
+        );
+        assert!(
+            recs[1].on_behalf_of.is_none(),
+            "the non-delegated decision records no delegator"
+        );
+    }
+
     // ── Property: append-only / no mutate/delete API ────────────────────────
 
     #[test]
@@ -1463,6 +1657,7 @@ mod tests {
             policy_hash: None,
             subject_type: SubjectType(1),
             subject_clearance: high(),
+            on_behalf_of: None,
             object_type: ObjectType(1),
             object_label: low(),
             action: Action(1),
@@ -1505,6 +1700,7 @@ mod tests {
             policy_hash: Some([0xaa; 32]),
             subject_type: SubjectType(1),
             subject_clearance: high(),
+            on_behalf_of: None,
             object_type: ObjectType(1),
             object_label: low(),
             action: Action(9),
@@ -1555,6 +1751,7 @@ mod tests {
             policy_hash: None,
             subject_type: SubjectType(1),
             subject_clearance: high(),
+            on_behalf_of: None,
             object_type: ObjectType(1),
             object_label: low(),
             action: Action(1),
@@ -1608,6 +1805,7 @@ mod tests {
             policy_hash: None,
             subject_type: SubjectType(1),
             subject_clearance: high(),
+            on_behalf_of: None,
             object_type: ObjectType(1),
             object_label: low(),
             action: Action(1),
@@ -1657,6 +1855,7 @@ mod tests {
             policy_hash: None,
             subject_type: SubjectType(1),
             subject_clearance: high(),
+            on_behalf_of: None,
             object_type: ObjectType(1),
             object_label: low(),
             action: Action(1),
