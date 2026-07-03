@@ -1408,6 +1408,62 @@ const RELAY_RECONNECT_MAX: std::time::Duration = std::time::Duration::from_secs(
 /// `debug!` to `warn!` so a persistently-unreachable relay is observable.
 const RELAY_RECONNECT_WARN_AFTER: u32 = 5;
 
+/// Fail-closed relay-capability gate (#504 item 3) — assert the dialed relay
+/// endpoint is **cryptographically identity-pinned** before this node announces
+/// its origin UP to it (`with_origin`).
+///
+/// ## The gap this closes
+/// [`run_relay_announce_link`] dials the producer-chosen relay and announces this
+/// node's broadcasts (track names / `broadcastPath`, traffic patterns) UP to it.
+/// Frames are AEAD-sealed so **content** confidentiality holds regardless, but the
+/// announce-handshake exposes broadcast **metadata** to whatever endpoint answers.
+/// moq-net's session handshake exposes **no relay-role / announce-capability**
+/// negotiation (the setup parameters are opaque `Bytes` and `Client` offers no
+/// role hook), so the only signal we can gate on is the relay's **configured
+/// cryptographic identity** — exactly the signal the #356/#357/#358 reach work
+/// already plumbs through [`crate::transport::QuicServerAuth`] / the iroh
+/// `EndpointId`.
+///
+/// ## The check (fail-closed)
+/// - **iroh**: the connection is bound to the peer's `EndpointId` (its Ed25519
+///   public key), so the channel is identity-bound by construction — accepted.
+/// - **QUIC, leaf-pinned** (`accept_cert_hashes` non-empty, with or without
+///   WebPKI): the dialed peer must present a pinned leaf — accepted.
+/// - **QUIC, WebPKI-only** (`require_web_pki` with an EMPTY pin set): **rejected.**
+///   WebPKI proves only "some cert valid for this SNI", so any holder of a
+///   CA-valid cert for that name could be substituted as the relay and silently
+///   receive our broadcast announcements. We will not announce our origin UP to
+///   an endpoint that is not pinned to a specific relay identity.
+/// - **same-host (`Ipc`/`Inproc`/`SystemdFd`)**: not reachable here
+///   ([`reach_to_transport_config`] yields `None` for them), but rejected
+///   defensively — they carry no transport-level peer identity.
+///
+/// Returns `Err` (and the caller skips `with_origin`) when the relay identity
+/// cannot be confirmed, rather than leaking announcements to an unverified
+/// endpoint.
+fn assert_relay_identity_pinned(cfg: &crate::transport::TransportConfig) -> Result<()> {
+    use crate::transport::EndpointType;
+    match &cfg.endpoint {
+        // iroh is identity-bound to the peer's Ed25519 EndpointId by the transport.
+        EndpointType::Iroh { .. } => Ok(()),
+        // QUIC is identity-pinned iff a leaf-cert pin is required.
+        EndpointType::Quic { auth, .. } => {
+            if auth.accept_cert_hashes().is_empty() {
+                Err(anyhow!(
+                    "relay endpoint is WebPKI-only (no leaf-cert pin): cannot confirm it is the \
+                     authorized relay identity — refusing to announce origin UP (fail-closed, #504)"
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        other => Err(anyhow!(
+            "relay endpoint {other:?} carries no transport-level peer identity — \
+             refusing to announce origin UP (fail-closed, #504)"
+        )),
+    }
+}
+
 /// Announce this node's streaming origin UP to the producer-chosen relay (#358).
 ///
 /// Spawns a background task that dials the relay via [`crate::dial::dial_stream`],
@@ -1483,6 +1539,19 @@ pub async fn run_relay_announce_link(
     let dest = crate::stream_info::Destination { role: crate::stream_info::Role::Relay, transport: relay.clone() };
     let cfg = reach_to_transport_config(&dest)
         .ok_or_else(|| anyhow!("relay reach is not a dialable network transport"))?;
+
+    // #504 item 3 — relay-capability gate (fail-closed): do NOT announce this
+    // node's origin (broadcast track names / `broadcastPath`, traffic patterns)
+    // UP to an endpoint we cannot confirm is the authorized relay identity. moq
+    // exposes no relay-role handshake, so we gate on the relay's configured
+    // cryptographic identity (cert-hash pin / iroh EndpointId). A WebPKI-only
+    // (unpinned) or identity-less endpoint is refused here — surfaced loudly and
+    // the announce is skipped — rather than leaking announcements to a
+    // misconfigured / substituted relay. See [`assert_relay_identity_pinned`].
+    if let Err(e) = assert_relay_identity_pinned(&cfg) {
+        tracing::warn!("moq relay announce gate: {e}");
+        return Err(e);
+    }
 
     let stream_session = crate::dial::dial_stream(&cfg).await?;
     // `with_origin` makes the link bidirectional: this node's broadcasts are
@@ -2070,6 +2139,56 @@ mod tests {
                 cert_hashes: vec![vec![0u8; 32]],
             }),
         }
+    }
+
+    // ── #504 item 3: relay-capability (identity-pin) gate ───────────────────
+
+    /// An iroh relay endpoint is identity-bound to its EndpointId by the
+    /// transport, so the announce-UP gate accepts it.
+    #[test]
+    fn relay_gate_accepts_iroh_identity_bound() {
+        let cfg = crate::transport::TransportConfig::iroh([7u8; 32], Vec::new(), None);
+        assert!(assert_relay_identity_pinned(&cfg).is_ok());
+    }
+
+    /// A leaf-cert-pinned QUIC relay is a confirmed identity — accepted.
+    #[test]
+    fn relay_gate_accepts_quic_leaf_pinned() {
+        let addr = "127.0.0.1:7777".parse().expect("addr");
+        let cfg = crate::transport::TransportConfig::quic_pinned(addr, "relay", [3u8; 32]);
+        assert!(assert_relay_identity_pinned(&cfg).is_ok());
+    }
+
+    /// A WebPKI-only QUIC relay (no leaf pin) proves only "some cert valid for
+    /// this SNI" — any CA-valid cert holder could be substituted, so the gate
+    /// REJECTS it fail-closed and the origin is never announced UP.
+    #[test]
+    fn relay_gate_rejects_quic_webpki_only() {
+        let addr = "127.0.0.1:7777".parse().expect("addr");
+        let cfg = crate::transport::TransportConfig::quic(addr, "relay");
+        let err = assert_relay_identity_pinned(&cfg).expect_err("WebPKI-only relay must be rejected");
+        assert!(
+            err.to_string().contains("WebPKI-only"),
+            "expected a WebPKI-only rejection, got: {err}"
+        );
+    }
+
+    /// A WebPKI+leaf-pin QUIC relay (defence in depth) is still leaf-pinned —
+    /// accepted.
+    #[test]
+    fn relay_gate_accepts_quic_webpki_plus_pin() {
+        let addr = "127.0.0.1:7777".parse().expect("addr");
+        let auth = crate::transport::QuicServerAuth::web_pki_pinned(vec![[5u8; 32]]).expect("auth");
+        let cfg = crate::transport::TransportConfig::quic_with_auth(addr, "relay", auth);
+        assert!(assert_relay_identity_pinned(&cfg).is_ok());
+    }
+
+    /// A same-host endpoint carries no transport-level peer identity — rejected
+    /// (defensive; `reach_to_transport_config` already yields None for these).
+    #[test]
+    fn relay_gate_rejects_identityless_same_host() {
+        let cfg = crate::transport::TransportConfig::inproc("hyprstream/x");
+        assert!(assert_relay_identity_pinned(&cfg).is_err());
     }
 
     /// A [`ProducerReachConfig`] with a server-global relay advertises a
