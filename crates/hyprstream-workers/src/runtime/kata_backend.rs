@@ -27,7 +27,7 @@ use super::client::{CpuUsage, LinuxContainerResources, MemoryUsage, PodSandboxCo
 use super::kata_agent::{AgentAddress, KataAgentClient};
 use super::sandbox::PodSandbox;
 use super::sandbox_fs::{SandboxFs, SandboxFsServer, VFS_SOCKET_NAME};
-use hyprstream_vfs::{Subject, SyntheticNode};
+use hyprstream_vfs::{Mount, Subject, SyntheticNode};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Handle
@@ -47,6 +47,14 @@ pub struct KataHandle {
     /// `hyprstream-vfs-server`. Held for the VM's lifetime so the serving thread
     /// + injected registries outlive the guest; dropped on sandbox teardown.
     pub vfs_server: Option<SandboxFsServer>,
+    /// Per-sandbox tenant-VFS **9P-over-vsock** channel (V2, #731). A second
+    /// vsock port (`VFS_9P_VSOCK_PORT`), distinct from the kata-agent's 1024,
+    /// serving the same Subject-scoped tenant Mount as native 9P so an in-guest
+    /// 9P client (V3, #732) can dial the host. Held for the VM's lifetime; its
+    /// [`Drop`] aborts the serve task and removes the host UDS on sandbox
+    /// teardown. `None` when the sandbox has no tenant VFS (no `image_id`) or the
+    /// channel could not be stood up.
+    pub vfs_9p: Option<Vfs9pVsockServer>,
     /// kata-agent ttrpc/vsock client (#344), connected lazily on first
     /// `exec_sync` call and cached for subsequent calls. `None` until then,
     /// or if the guest agent connection could not be established (e.g. the
@@ -64,6 +72,7 @@ impl std::fmt::Debug for KataHandle {
             .field("api_socket", &self.api_socket)
             .field("virtiofs_socket", &self.virtiofs_socket)
             .field("vfs_socket", &self.vfs_server.as_ref().map(SandboxFsServer::socket_path))
+            .field("vfs_9p_socket", &self.vfs_9p.as_ref().map(Vfs9pVsockServer::socket_path))
             .finish_non_exhaustive()
     }
 }
@@ -71,6 +80,81 @@ impl std::fmt::Debug for KataHandle {
 impl SandboxHandle for KataHandle {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tenant-VFS 9P-over-vsock channel (V2, #731)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Guest vsock port the tenant-VFS 9P server listens on — the port an in-guest
+/// 9P client (V3, #732) dials to reach the host VFS over native 9P.
+///
+/// **564** is the IANA-registered port for the Plan 9 file service (9P); reusing
+/// it as the vsock port keeps "9P lives on 564" true across transports and makes
+/// the channel self-documenting. It is deliberately distinct from the kata-agent's
+/// ttrpc port **1024** ([`KATA_AGENT_VSOCK_PORT`](super::kata_agent::KATA_AGENT_VSOCK_PORT)),
+/// so the two vsock channels never collide.
+pub const VFS_9P_VSOCK_PORT: u32 = 564;
+
+/// Derive the host-side Unix socket a Cloud-Hypervisor **hybrid-vsock** guest
+/// reaches by dialing vsock port `port`.
+///
+/// CH (like Firecracker, whose hybrid-vsock design it inherits) routes a
+/// *guest-initiated* connection to vsock port `N` to a host Unix socket named
+/// `<vsock-uds>_<N>`, where `<vsock-uds>` is the base UDS path CH is configured
+/// with (the same path the host writes `connect <port>\n` to for the reverse,
+/// host-initiated direction — e.g. the kata-agent on 1024). The host service
+/// must be listening on `<vsock-uds>_<N>` before the guest dials.
+fn vfs_9p_vsock_uds(vsock_base: &str, port: u32) -> PathBuf {
+    PathBuf::from(format!("{vsock_base}_{port}"))
+}
+
+/// A running per-sandbox tenant-VFS 9P-over-vsock server (V2, #731).
+///
+/// RAII handle mirroring `wanix_workload::Injected9pServer`: owns the host UDS
+/// path and the background 9P accept task. [`Drop`] aborts the task and removes
+/// the socket, so the channel is torn down with the sandbox.
+pub struct Vfs9pVsockServer {
+    /// Host-side UDS the guest's vsock port maps to (`<vsock-uds>_<port>`).
+    socket_path: PathBuf,
+    /// The background 9P serve task ([`hyprstream_9p::serve_mount_vsock`]).
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Vfs9pVsockServer {
+    /// Host-side UDS path the tenant-VFS 9P is served on.
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
+    /// Abort the serve task and remove the host UDS now (idempotent; `Drop` also
+    /// does this).
+    pub fn shutdown(&self) {
+        self.task.abort();
+        if let Err(e) = std::fs::remove_file(&self.socket_path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::debug!(
+                    socket = %self.socket_path.display(),
+                    error = %e,
+                    "remove tenant-VFS 9P vsock socket"
+                );
+            }
+        }
+    }
+}
+
+impl Drop for Vfs9pVsockServer {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+impl std::fmt::Debug for Vfs9pVsockServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Vfs9pVsockServer")
+            .field("socket_path", &self.socket_path)
+            .finish()
     }
 }
 
@@ -271,12 +355,17 @@ impl KataBackend {
     /// pass the current tokio runtime handle for the down-adapter's async→sync
     /// bridge. Compose is CPU/IO-bound (RAFS load), so we run it on a blocking
     /// thread to avoid stalling the async runtime.
+    ///
+    /// Also returns a clone of the tenant **root** [`Mount`] so the *same*
+    /// Subject-scoped Mount can be re-served over the guest's 9P-over-vsock
+    /// channel (#731) — the virtio-fs namespace and the 9P channel share one Arc,
+    /// so there is no second writable-upper CoW layer and no new principal.
     async fn compose_and_serve_vfs(
         &self,
         sandbox: &PodSandbox,
         image_id: &str,
         subject: Subject,
-    ) -> Result<SandboxFsServer> {
+    ) -> Result<(SandboxFsServer, Arc<dyn Mount>)> {
         let socket_path = sandbox.sandbox_path().join(VFS_SOCKET_NAME);
         let rt = tokio::runtime::Handle::current();
         let rafs_store = self.rafs_store.clone();
@@ -296,7 +385,10 @@ impl KataBackend {
                 SyntheticNode::dir(),
                 SyntheticNode::dir(),
             )?;
-            fs.serve_on(socket_path, rt)
+            // Grab the root export root before `serve_on` consumes `fs`.
+            let root = fs.root_mount();
+            let server = fs.serve_on(socket_path, rt)?;
+            Ok((server, root))
         })
         .await
         .map_err(|e| WorkerError::SandboxCreationFailed(format!("VFS compose task join: {e}")))?
@@ -416,10 +508,17 @@ impl SandboxBackend for KataBackend {
         // namespace cannot expose sandbox B's rootfs or injected paths.
         let mut vfs_server: Option<SandboxFsServer> = None;
         let mut share_socket: Option<PathBuf> = None;
+        // The tenant root Mount + Subject, captured so the *same* Subject-scoped
+        // Mount can be re-served over the guest's 9P-over-vsock channel (#731)
+        // once the VM (and thus its vsock UDS) exists.
+        let mut tenant_vfs: Option<(Arc<dyn Mount>, Subject)> = None;
         if let Some(ref image_id) = sandbox.image_id {
             let subject = Self::sandbox_subject(sandbox, annotations);
-            let server = self.compose_and_serve_vfs(sandbox, image_id, subject).await?;
+            let (server, root_mount) = self
+                .compose_and_serve_vfs(sandbox, image_id, subject.clone())
+                .await?;
             share_socket = Some(server.socket_path().to_path_buf());
+            tenant_vfs = Some((root_mount, subject));
             vfs_server = Some(server);
         }
         let virtiofs_sock = share_socket.clone();
@@ -452,11 +551,31 @@ impl SandboxBackend for KataBackend {
             "VM started successfully via Kata Hypervisor trait"
         );
 
+        // V2 (#731): stand up a *second* vsock channel — distinct from the
+        // kata-agent's port 1024 — backed by the tenant VFS 9P server, so an
+        // in-guest 9P client (V3, #732) can dial `VFS_9P_VSOCK_PORT` and operate
+        // the hyprstream VFS over native 9P. Purely additive to the boot path, so
+        // a failure here is logged, not fatal (the virtio-fs rootfs the guest
+        // boots from is unaffected).
+        let mut vfs_9p: Option<Vfs9pVsockServer> = None;
+        if let Some((tenant_mount, subject)) = tenant_vfs {
+            match Self::serve_tenant_vfs_9p(&hypervisor, &sandbox.id, tenant_mount, subject).await {
+                Ok(server) => vfs_9p = Some(server),
+                Err(e) => tracing::warn!(
+                    sandbox_id = %sandbox.id,
+                    error = %e,
+                    "failed to stand up tenant-VFS 9P vsock channel (#731); \
+                     sandbox boots without it"
+                ),
+            }
+        }
+
         let handle = Arc::new(KataHandle {
             hypervisor,
             api_socket,
             virtiofs_socket: virtiofs_sock,
             vfs_server,
+            vfs_9p,
             agent: tokio::sync::Mutex::new(None),
         });
 
@@ -536,6 +655,10 @@ impl SandboxBackend for KataBackend {
                     // The per-sandbox VFS server is not reusable across resets;
                     // a recycled sandbox composes a fresh one on next start.
                     vfs_server: None,
+                    // Ditto the 9P-over-vsock channel (#731): dropping the old
+                    // handle aborts its serve task + removes the UDS; a recycled
+                    // sandbox stands up a fresh one on next start.
+                    vfs_9p: None,
                     // A reused (warm-pool) sandbox keeps the same VM, but the
                     // container(s) inside it are torn down — drop any cached
                     // agent connection so the next `exec_sync` reconnects
@@ -882,6 +1005,82 @@ impl KataBackend {
         *guard = Some(Arc::clone(&client));
         Ok(client)
     }
+
+    /// Stand up the tenant-VFS **9P-over-vsock** channel for a booted VM (V2,
+    /// #731).
+    ///
+    /// Serves `mount` (scoped to `subject` — the same per-sandbox Subject the
+    /// virtio-fs namespace uses; no new principal) as native 9P on the host UDS
+    /// the guest reaches by dialing [`VFS_9P_VSOCK_PORT`]. The base vsock UDS is
+    /// taken from `Hypervisor::get_agent_socket()` (the CH hybrid-vsock path,
+    /// `hvsock://<base>`), so the listener path is not hardcoded; the per-port
+    /// host UDS is `<base>_<VFS_9P_VSOCK_PORT>` ([`vfs_9p_vsock_uds`]).
+    ///
+    /// The serve loop runs on a background task held by the returned
+    /// [`Vfs9pVsockServer`], whose `Drop` tears it down with the sandbox.
+    async fn serve_tenant_vfs_9p(
+        hypervisor: &Arc<dyn Hypervisor>,
+        sandbox_id: &str,
+        mount: Arc<dyn Mount>,
+        subject: Subject,
+    ) -> Result<Vfs9pVsockServer> {
+        // The CH hybrid-vsock base UDS (`hvsock://<base>`), same source the
+        // kata-agent client uses — keeps CH/Dragonball working without a branch.
+        let address = hypervisor.get_agent_socket().await.map_err(|e| {
+            WorkerError::SandboxCreationFailed(format!("get_agent_socket for 9P vsock: {e}"))
+        })?;
+        let address = AgentAddress::parse(&address).map_err(|e| {
+            WorkerError::SandboxCreationFailed(format!("unparseable agent socket address: {e}"))
+        })?;
+        let base = match &address {
+            AgentAddress::HybridVsock { path } => path.clone(),
+            // Real AF_VSOCK (Firecracker/Dragonball) has no host-UDS-per-port
+            // convention; the 9P-over-vsock channel is CH hybrid-vsock only for now.
+            AgentAddress::Vsock { cid } => {
+                return Err(WorkerError::SandboxCreationFailed(format!(
+                    "tenant-VFS 9P vsock channel requires CH hybrid-vsock; \
+                     got real AF_VSOCK (cid={cid})"
+                )))
+            }
+        };
+        let socket_path = vfs_9p_vsock_uds(&base, VFS_9P_VSOCK_PORT);
+
+        // Remove any stale socket from a crashed predecessor (bind would EADDRINUSE).
+        if let Err(e) = std::fs::remove_file(&socket_path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    socket = %socket_path.display(),
+                    error = %e,
+                    "remove stale tenant-VFS 9P vsock socket"
+                );
+            }
+        }
+
+        let sock_for_task = socket_path.clone();
+        let sandbox_id = sandbox_id.to_owned();
+        // `serve_mount_vsock` binds the host UDS and runs the 9P accept loop until
+        // the socket errors/closes (or the task is aborted on teardown). It serves
+        // the same Subject-scoped Mount as native 9P; only the transport differs.
+        let task = tokio::spawn(async move {
+            if let Err(e) =
+                hyprstream_9p::serve_mount_vsock(mount, subject, &sock_for_task).await
+            {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    socket = %sock_for_task.display(),
+                    error = %e,
+                    "tenant-VFS 9P vsock server exited with error"
+                );
+            }
+        });
+
+        tracing::info!(
+            socket = %socket_path.display(),
+            port = VFS_9P_VSOCK_PORT,
+            "tenant-VFS 9P vsock channel listening (#731)"
+        );
+        Ok(Vfs9pVsockServer { socket_path, task })
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -924,6 +1123,34 @@ mod tests {
     use crate::error::WorkerError;
     use crate::image::RafsStore;
     use tempfile::TempDir;
+
+    #[test]
+    fn vfs_9p_vsock_port_distinct_from_agent() {
+        // The tenant-VFS 9P channel must never collide with the kata-agent's
+        // ttrpc port (1024): they share one CH hybrid-vsock base UDS, so equal
+        // ports would map to the same host socket.
+        assert_ne!(
+            VFS_9P_VSOCK_PORT,
+            super::super::kata_agent::KATA_AGENT_VSOCK_PORT
+        );
+        // 564 is the IANA-registered Plan 9 (9P) port.
+        assert_eq!(VFS_9P_VSOCK_PORT, 564);
+    }
+
+    #[test]
+    fn vfs_9p_vsock_uds_appends_underscore_port() {
+        // CH routes a guest connection to vsock port N to the host UDS
+        // `<base>_<N>`; the derivation must produce exactly that.
+        let base = "/run/sandbox/abc/ch-vm.sock";
+        let uds = super::vfs_9p_vsock_uds(base, VFS_9P_VSOCK_PORT);
+        assert_eq!(uds, PathBuf::from("/run/sandbox/abc/ch-vm.sock_564"));
+
+        // And it composes with an arbitrary base + port, underscore-joined.
+        assert_eq!(
+            super::vfs_9p_vsock_uds("/tmp/vm.sock", 1024),
+            PathBuf::from("/tmp/vm.sock_1024")
+        );
+    }
 
     /// Create a KataBackend with temporary directories.
     fn create_test_backend() -> (KataBackend, Arc<RafsStore>, TempDir) {
@@ -979,6 +1206,7 @@ mod tests {
             api_socket: sandbox_path.join("test.sock"),
             virtiofs_socket: Some(sandbox_path.join("virtiofs.sock")),
             vfs_server: None,
+            vfs_9p: None,
             agent: tokio::sync::Mutex::new(None),
         })
     }
