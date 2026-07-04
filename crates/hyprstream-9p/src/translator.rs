@@ -15,14 +15,32 @@
 //! ## Transport
 //!
 //! [`Translator::serve`] runs a TCP accept loop; [`Translator::serve_uds`] runs
-//! the same loop over a Unix domain socket ([`tokio::net::UnixListener`]). Both
-//! delegate to one transport-agnostic accept loop (`serve_listener`) and the
-//! same per-connection [`Translator::serve_connection`] core, which operates on
-//! any `AsyncRead + AsyncWrite` stream. The UDS entry point is how a native
-//! Wanix workload consumes a Subject-scoped export via its `p9kit.ClientFS` 9P
-//! client (#506); [`Translator::from_mount`] / [`serve_mount_uds`] build the
-//! translator directly from an `Arc<dyn Mount>` + `Subject`. virtio-9P will plug
-//! in the same way with a third transport.
+//! the same loop over a Unix domain socket ([`tokio::net::UnixListener`]);
+//! [`Translator::serve_vsock`] runs it over a Cloud-Hypervisor **hybrid-vsock**
+//! host socket. All three delegate to one transport-agnostic accept loop
+//! (`serve_listener`) and the same per-connection
+//! [`Translator::serve_connection`] core, which operates on any
+//! `AsyncRead + AsyncWrite` stream. The UDS entry point is how a native Wanix
+//! workload consumes a Subject-scoped export via its `p9kit.ClientFS` 9P client
+//! (#506); the vsock entry point is how a **kata guest** dials the host VFS over
+//! native 9P (the CH `ch` path has no virtio-9p, so vsock is the 9P transport
+//! into the guest — #730). [`Translator::from_mount`] / [`serve_mount_uds`] /
+//! [`serve_mount_vsock`] build the translator directly from an
+//! `Arc<dyn Mount>` + `Subject`.
+//!
+//! ### Hybrid-vsock
+//!
+//! Cloud Hypervisor exposes guest vsock as a host Unix socket that multiplexes
+//! guest ports with a `connect <port>\n` text handshake — the same handshake
+//! `hyprstream_workers::runtime::kata_agent::hybrid_vsock_connect` performs in
+//! the opposite direction (host→guest agent). [`Translator::serve_vsock`]
+//! plays the host multiplexer role: it strips and acknowledges that preamble
+//! per connection, then hands the bare stream to the shared 9P core, so
+//! hybrid-vsock reuses byte-identical connection handling with TCP and UDS and
+//! adds no new dependency. Firecracker/Dragonball raw `AF_VSOCK`
+//! (`vsock://<cid>`, mirroring `AgentAddress::Vsock`) is a follow-up: CH — the
+//! actual target — uses hybrid-vsock, and the raw-vsock hypervisors are not
+//! booted here.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -129,6 +147,23 @@ impl Translator {
     /// Subject-scoped export over a UDS via its `p9kit.ClientFS` 9P client.
     pub async fn serve_uds(self, listener: UnixListener) -> Result<()> {
         self.serve_listener(listener).await
+    }
+
+    /// Run the accept loop over a Cloud-Hypervisor **hybrid-vsock** host socket.
+    ///
+    /// The vsock sibling of [`serve_uds`](Self::serve_uds), and the entry point
+    /// a kata guest dials to operate the host VFS over native 9P (#730). CH's
+    /// `ch` path has no virtio-9p, so the guest reaches the host by opening a
+    /// vsock connection; CH surfaces that as a host Unix socket whose accepted
+    /// connections each begin with a `connect <port>\n` text preamble (the
+    /// firecracker/CH multiplexer handshake — the reverse of
+    /// `kata_agent::hybrid_vsock_connect`). This entry strips and acknowledges
+    /// that preamble per connection, then runs the identical
+    /// [`serve_connection`](Self::serve_connection) core as
+    /// [`serve`](Self::serve) / [`serve_uds`](Self::serve_uds); the
+    /// `Subject`-per-op enforcement is unchanged — only the transport differs.
+    pub async fn serve_vsock(self, listener: UnixListener) -> Result<()> {
+        self.serve_listener(HybridVsockListener { inner: listener }).await
     }
 
     /// Transport-agnostic accept loop shared by [`serve`](Self::serve) and
@@ -335,6 +370,26 @@ pub async fn serve_mount_uds(
     Translator::from_mount(mount, subject).serve_uds(listener).await
 }
 
+/// Bind a Cloud-Hypervisor **hybrid-vsock** host socket at `path` and serve
+/// `mount` (scoped to `subject`) as its 9P2000.L root until the socket errors
+/// or is closed.
+///
+/// The hybrid-vsock sibling of [`serve_mount_uds`] and the #730 one-call entry
+/// a supervisor uses to expose a tenant's Subject-scoped export to a **kata
+/// guest** dialing over vsock. Guest connections arrive on the host UDS `path`,
+/// each prefixed with a `connect <port>\n` handshake that
+/// [`Translator::serve_vsock`] strips before handing the stream to the shared
+/// 9P core.
+pub async fn serve_mount_vsock(
+    mount: Arc<dyn Mount>,
+    subject: Subject,
+    path: impl AsRef<Path>,
+) -> Result<()> {
+    let listener = UnixListener::bind(path.as_ref())
+        .with_context(|| format!("bind 9P hybrid-vsock listener at {:?}", path.as_ref()))?;
+    Translator::from_mount(mount, subject).serve_vsock(listener).await
+}
+
 /// Transport-agnostic accept surface, implemented for [`TcpListener`] and
 /// [`UnixListener`] so both share one accept loop (`serve_listener`).
 ///
@@ -384,6 +439,99 @@ impl Listen for UnixListener {
             .map(|a| format!("unix:{a:?}"))
             .unwrap_or_else(|_| "unix:?".to_owned())
     }
+}
+
+/// Maximum length (excluding the terminating newline) of the hybrid-vsock
+/// `connect <port>` preamble line. The real handshake is well under 32 bytes;
+/// the cap bounds a peer that never sends a newline.
+const HYBRID_VSOCK_PREAMBLE_MAX: usize = 64;
+
+/// A Cloud-Hypervisor **hybrid-vsock** host listener: a [`UnixListener`] whose
+/// accepted connections each begin with a `connect <port>\n` text preamble (the
+/// firecracker/CH multiplexer handshake). [`accept_conn`](Listen::accept_conn)
+/// strips and acknowledges that preamble, then yields the bare [`UnixStream`]
+/// to the shared 9P serve path — so hybrid-vsock reuses byte-identical
+/// connection handling with TCP and UDS (`serve_listener` /
+/// [`serve_connection`](Translator::serve_connection)) and adds no new
+/// dependency.
+struct HybridVsockListener {
+    inner: UnixListener,
+}
+
+#[async_trait]
+impl Listen for HybridVsockListener {
+    type Conn = UnixStream;
+
+    async fn accept_conn(&self) -> std::io::Result<(UnixStream, String)> {
+        // A malformed/aborted handshake affects only that one peer: retry the
+        // accept rather than propagating (which `serve_listener` treats as a
+        // fatal listener error that tears down every sibling connection).
+        loop {
+            let (mut stream, _peer) = self.inner.accept().await?;
+            match hybrid_vsock_handshake(&mut stream).await {
+                Ok(port) => return Ok((stream, format!("hvsock:port{port}"))),
+                Err(e) => {
+                    warn!(error = %e, "hybrid-vsock handshake failed; dropping connection");
+                    continue;
+                }
+            }
+        }
+    }
+
+    fn describe(&self) -> String {
+        self.inner
+            .local_addr()
+            .map(|a| format!("hvsock:{a:?}"))
+            .unwrap_or_else(|_| "hvsock:?".to_owned())
+    }
+}
+
+/// Read, validate, and acknowledge the hybrid-vsock `connect <port>\n` preamble
+/// on a freshly accepted host-UDS stream, returning the requested vsock port.
+///
+/// The preamble is read one byte at a time up to the terminating newline so no
+/// following 9P payload is swallowed into a throwaway buffer. The acknowledgement
+/// line contains `OK`, matching the firecracker/CH multiplexer and the reader in
+/// `kata_agent::hybrid_vsock_connect` (which only requires the response to
+/// contain `"OK"`).
+async fn hybrid_vsock_handshake(stream: &mut UnixStream) -> Result<u32> {
+    let mut line = Vec::with_capacity(HYBRID_VSOCK_PREAMBLE_MAX);
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stream
+            .read(&mut byte)
+            .await
+            .context("read hybrid-vsock preamble")?;
+        if n == 0 {
+            anyhow::bail!("hybrid-vsock peer closed before sending `connect <port>` preamble");
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        line.push(byte[0]);
+        if line.len() > HYBRID_VSOCK_PREAMBLE_MAX {
+            anyhow::bail!(
+                "hybrid-vsock preamble exceeds {HYBRID_VSOCK_PREAMBLE_MAX} bytes without a newline"
+            );
+        }
+    }
+
+    let text = String::from_utf8_lossy(&line);
+    let mut parts = text.split_whitespace();
+    let verb = parts.next().unwrap_or_default();
+    if !verb.eq_ignore_ascii_case("connect") {
+        anyhow::bail!("hybrid-vsock preamble: expected `connect <port>`, got {text:?}");
+    }
+    let port: u32 = parts
+        .next()
+        .and_then(|p| p.parse().ok())
+        .with_context(|| format!("hybrid-vsock preamble: missing/invalid port in {text:?}"))?;
+
+    stream
+        .write_all(format!("OK {port}\n").as_bytes())
+        .await
+        .context("write hybrid-vsock OK acknowledgement")?;
+    Ok(port)
 }
 
 /// Extract the tag from a raw message for error-path Rlerror encoding.
@@ -517,5 +665,138 @@ mod tests {
         assert_eq!(names, vec!["one.txt".to_string(), "two.txt".to_string()]);
         // Cookies are 1-based and monotonic.
         assert!(entries.iter().all(|e| e.offset >= 1));
+    }
+
+    /// End-to-end hybrid-vsock: a client that speaks the CH multiplexer
+    /// handshake (`connect <port>\n` → line containing `OK`) over a temp host
+    /// UDS must, after the preamble is stripped, drive a byte-identical 9P2000.L
+    /// session (version → attach → walk → open → read) against the shared serve
+    /// core. This exercises [`Translator::serve_vsock`] +
+    /// [`hybrid_vsock_handshake`] without needing a real vsock device.
+    #[tokio::test]
+    async fn hybrid_vsock_handshake_then_9p_session() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tokio::net::UnixStream;
+
+        // Unique temp UDS path (no tempfile dep in this crate).
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let sock = std::env::temp_dir()
+            .join(format!("hs9p-vsock-{}-{nanos}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+
+        let backend = MemoryBackend::default();
+        backend.add_file("/hello.txt", b"hello vsock");
+        let listener = UnixListener::bind(&sock).expect("bind hybrid-vsock host UDS");
+        let translator = Translator::new(Arc::new(backend));
+        let server = tokio::spawn(translator.serve_vsock(listener));
+
+        // ── Client side ─────────────────────────────────────────────────
+        let mut client = UnixStream::connect(&sock).await.expect("dial host UDS");
+
+        // Hybrid-vsock preamble, exactly as `kata_agent::hybrid_vsock_connect`
+        // writes it, then read the acknowledgement line and require "OK".
+        client.write_all(b"connect 1024\n").await.unwrap();
+        let mut ack = Vec::new();
+        let mut b = [0u8; 1];
+        loop {
+            let n = client.read(&mut b).await.unwrap();
+            if n == 0 || b[0] == b'\n' {
+                break;
+            }
+            ack.push(b[0]);
+        }
+        assert!(
+            String::from_utf8_lossy(&ack).contains("OK"),
+            "handshake ack must contain OK, got {ack:?}"
+        );
+
+        // Read one length-prefixed 9P frame off the wire.
+        async fn read_frame(s: &mut UnixStream) -> Vec<u8> {
+            let mut len = [0u8; 4];
+            s.read_exact(&mut len).await.unwrap();
+            let total = u32::from_le_bytes(len) as usize;
+            let mut buf = vec![0u8; total];
+            buf[..4].copy_from_slice(&len);
+            s.read_exact(&mut buf[4..]).await.unwrap();
+            buf
+        }
+
+        // Tversion → Rversion.
+        client.write_all(&msg::tversion(1, MSG_SIZE, "9P2000.L")).await.unwrap();
+        let (_, resp) = msg::parse_response(&read_frame(&mut client).await).unwrap();
+        assert!(matches!(resp, Response::Version { .. }), "expected Rversion, got {resp:?}");
+
+        // Tattach fid 0 as root.
+        client.write_all(&msg::tattach(2, 0, u32::MAX, "u", "/")).await.unwrap();
+        let (_, resp) = msg::parse_response(&read_frame(&mut client).await).unwrap();
+        assert!(matches!(resp, Response::Attach { .. }), "expected Rattach, got {resp:?}");
+
+        // Twalk to the file, Tlopen, Tread.
+        client.write_all(&msg::twalk(3, 0, 1, &["hello.txt"])).await.unwrap();
+        let (_, resp) = msg::parse_response(&read_frame(&mut client).await).unwrap();
+        assert!(matches!(resp, Response::Walk { .. }), "expected Rwalk, got {resp:?}");
+
+        client.write_all(&msg::tlopen(4, 1, 0)).await.unwrap();
+        let (_, resp) = msg::parse_response(&read_frame(&mut client).await).unwrap();
+        assert!(matches!(resp, Response::Lopen { .. }), "expected Rlopen, got {resp:?}");
+
+        client.write_all(&msg::tread(5, 1, 0, 64)).await.unwrap();
+        let (_, resp) = msg::parse_response(&read_frame(&mut client).await).unwrap();
+        match resp {
+            Response::Read { data } => assert_eq!(&data, b"hello vsock"),
+            other => panic!("expected Rread with payload, got {other:?}"),
+        }
+
+        drop(client);
+        server.abort();
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    /// A malformed preamble must drop only that connection: the accept loop
+    /// stays live and a well-behaved client that connects afterward still gets
+    /// served. Guards the "retry, don't propagate" contract in
+    /// [`HybridVsockListener::accept_conn`].
+    #[tokio::test]
+    async fn hybrid_vsock_bad_preamble_does_not_kill_listener() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tokio::net::UnixStream;
+
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let sock = std::env::temp_dir()
+            .join(format!("hs9p-vsock-bad-{}-{nanos}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+
+        let listener = UnixListener::bind(&sock).unwrap();
+        let translator = Translator::new(Arc::new(MemoryBackend::default()));
+        let server = tokio::spawn(translator.serve_vsock(listener));
+
+        // First client sends garbage; server should drop it and keep listening.
+        let mut bad = UnixStream::connect(&sock).await.unwrap();
+        bad.write_all(b"garbage not a preamble\n").await.unwrap();
+        // Server closes this connection without acknowledging; read returns EOF.
+        let mut b = [0u8; 1];
+        let _ = bad.read(&mut b).await; // 0 (EOF) or Err — either is fine.
+        drop(bad);
+
+        // Second client completes a valid handshake — proving the loop survived.
+        let mut good = UnixStream::connect(&sock).await.unwrap();
+        good.write_all(b"connect 1024\n").await.unwrap();
+        let mut ack = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            let n = good.read(&mut byte).await.unwrap();
+            if n == 0 || byte[0] == b'\n' {
+                break;
+            }
+            ack.push(byte[0]);
+        }
+        assert!(
+            String::from_utf8_lossy(&ack).contains("OK"),
+            "listener must survive a bad handshake and serve the next client"
+        );
+
+        drop(good);
+        server.abort();
+        let _ = std::fs::remove_file(&sock);
     }
 }

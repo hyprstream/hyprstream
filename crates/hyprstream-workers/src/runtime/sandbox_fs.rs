@@ -78,6 +78,12 @@ pub struct SandboxFs {
     subject: Subject,
     /// Runtime handles for the injected mounts.
     injected: InjectedMounts,
+    /// A clone of the tenant **root** `Mount` (the `/` image filesystem), kept so
+    /// the same Subject-scoped Mount can be exported over a *second* transport
+    /// (e.g. the kata guest's 9P-over-vsock channel, #731) without re-composing
+    /// or duplicating the writable-upper CoW layer. The virtio-fs path still
+    /// serves the whole `namespace`; this is only the root export root.
+    root: Arc<dyn Mount>,
 }
 
 impl SandboxFs {
@@ -116,6 +122,9 @@ impl SandboxFs {
         // the namespace stores; the down-adapter recovers the `FsMount` vtable via
         // `Mount::as_fsmount` for writes/copy-up.
         let root_mount: Arc<dyn Mount> = Arc::new(image_fs);
+        // Keep a clone so the root export root can be served over a second
+        // transport (9P-over-vsock, #731) — same Arc, so no second CoW upper.
+        let root = Arc::clone(&root_mount);
         namespace
             .mount(ROOTFS_PREFIX, root_mount)
             .map_err(|e| WorkerError::SandboxCreationFailed(format!("mount root: {e}")))?;
@@ -141,6 +150,7 @@ impl SandboxFs {
             namespace,
             subject,
             injected: InjectedMounts { stream_registry },
+            root,
         })
     }
 
@@ -163,7 +173,20 @@ impl SandboxFs {
             injected: InjectedMounts {
                 stream_registry: Arc::new(StreamRegistry::new()),
             },
+            // This path composes elsewhere and does not expose a distinct root
+            // export root for a second transport; an empty synthetic dir stands in
+            // (the 9P-over-vsock channel is only wired on the `compose` path).
+            root: Arc::new(SyntheticMount::new(SyntheticNode::dir())),
         }
+    }
+
+    /// A clone of the tenant **root** `Mount` (the `/` image filesystem).
+    ///
+    /// The same Subject-scoped Mount the virtio-fs namespace roots on — exported
+    /// so a *second* transport (the kata guest's 9P-over-vsock channel, #731) can
+    /// serve it without re-composing or duplicating the writable-upper CoW layer.
+    pub fn root_mount(&self) -> Arc<dyn Mount> {
+        Arc::clone(&self.root)
     }
 
     /// The composed namespace (read-only borrow; e.g. for tests / inspection).
