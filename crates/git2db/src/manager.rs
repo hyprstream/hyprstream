@@ -483,7 +483,18 @@ impl GitManager {
         // Convert inputs to owned types for spawn_blocking
         let url = url.to_owned();
         let target_path = target_path.to_path_buf();
-        let options = options.unwrap_or_else(|| self.default_clone_options());
+        let mut options = options.unwrap_or_else(|| self.default_clone_options());
+
+        // libgit2's local transport rejects shallow fetch over `file://` —
+        // disable it here so callers that default to prefer_shallow (the
+        // global config default) don't get an opaque failure when cloning a
+        // local repository (e.g. RPC registration in local-file test
+        // harnesses, or same-host repo mirroring).
+        if options.shallow && url.starts_with("file://") {
+            debug!("Disabling shallow clone for local file:// transport: {}", url);
+            options.shallow = false;
+            options.depth = None;
+        }
 
         // Acquire operation permit
         let _permit =
