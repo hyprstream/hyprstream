@@ -39,6 +39,15 @@ pub mod generated {
 
 mod service;
 
+/// #524 P1 — placement directory record ingestion + in-process index.
+///
+/// Polls `RecordResolver::resolve_repo` for a bootstrap set of node DIDs,
+/// walks the returned CAR's MST, and decodes `ai.hyprstream.placement.*`
+/// records (node / workload / group / groupItem) into a queryable index:
+/// label-selector evaluation, resource matching, and bidirectional-consent
+/// group membership. Consumed by `handle_query_candidates`.
+pub mod placement_index;
+
 /// #523 P0 / #524 / #628 — Scheduling Substrate.
 ///
 /// The shared `LabelSelector` / `ResourceRequest` / `PlacementCandidate`

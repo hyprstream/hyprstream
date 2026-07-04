@@ -31,10 +31,11 @@ use crate::Subject;
 /// live as DID-document verification methods.
 ///
 /// Wire representation is `Text`; serde (de)serializes transparently as the inner string.
-/// Cloneable, hashable, and usable as a map key.
+/// Cloneable, hashable, orderable (lexicographic on the inner string), and usable as a map
+/// key — including ordered maps / `TtlCache<Did, _>` (#524 placement liveness directory).
 /// `Default` yields an empty DID (`Did("")`) — the generated capnp data structs that carry a
 /// `Did` field derive `Default`, and an absent `Text` field reads back as the empty string.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Did(String);
 
 impl Did {
