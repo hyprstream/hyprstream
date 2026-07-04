@@ -89,6 +89,13 @@ struct DiscoveryRequest {
     # matches labels on the durable node records; resources check
     # (declared - allocatable). (#628 Scheduling Substrate vocabulary.)
     queryCandidates @17 :QueryCandidatesRequest $scope(query) $mcpDescription("Query placement candidates by label-selector + resource requests");
+
+    # #524 P1 — node liveness heartbeat: live allocatable capacity + load for
+    # one node. Backs the hard-exclusion-on-staleness rule in queryCandidates
+    # (a node with no live/fresh heartbeat is omitted outright, never just
+    # flagged stale). Re-inserting (heartbeating) the same node refreshes its
+    # TTL entry.
+    reportNodeLiveness @18 :NodeLiveness $scope(write) $mcpDescription("Report live node capacity/load for placement candidate liveness");
   }
 }
 
@@ -143,6 +150,9 @@ struct DiscoveryResponse {
 
     # #523 P0 / #524 — placement candidate query result.
     queryCandidatesResult @18 :PlacementCandidateSet;
+
+    # #524 P1 — liveness heartbeat acknowledgement.
+    reportNodeLivenessResult @19 :Void;
   }
 }
 
@@ -348,4 +358,15 @@ struct QueryCandidatesRequest {
   selectors    @0 :List(LabelSelector);   # ALL must match (AND)
   resources    @1 :List(ResourceRequest); # ALL must be satisfiable
   maxCandidates @2 :UInt32;               # bounded set
+}
+
+# #524 P1 — one node's liveness heartbeat: live allocatable capacity + load.
+# Stored in a TTL cache (see the Rust `service` module); a heartbeat for the
+# same node refreshes its expiry. Absence (never reported, or expired) hard-
+# excludes the node from queryCandidates results.
+struct NodeLiveness {
+  node         @0 :Text $domainType("hyprstream_rpc::identity::Did");
+  allocatable  @1 :List(Resource);   # capacity free right now
+  loadFraction @2 :Float32;         # [0,1], live
+  ts           @3 :Int64;           # unix millis this snapshot was taken (0 = use receipt time)
 }

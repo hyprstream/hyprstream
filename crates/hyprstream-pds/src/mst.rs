@@ -225,10 +225,25 @@ impl Node {
     pub fn from_records(collection: &str, records: &BTreeMap<Tid, Cid>) -> Self {
         // Sorted keys (BTreeMap over Tid already gives ascending rkey order; we
         // form the full `<collection>/<rkey>` strings and build from there).
-        let keys: Vec<(String, Cid)> = records
+        let keyed: BTreeMap<String, Cid> = records
             .iter()
             .map(|(tid, cid)| (record_key(collection, *tid), *cid))
             .collect();
+        Self::from_keyed_records(&keyed)
+    }
+
+    /// Build an MST from already-formed full record keys (`"<collection>/<rkey>"`)
+    /// to record CID.
+    ///
+    /// Unlike [`Self::from_records`] (single collection, keyed by [`Tid`]), this
+    /// accepts keys spanning *multiple* collections in one tree — the real
+    /// atproto shape (one MST per account repo, not per collection; a repo's
+    /// records live at keys like `ai.hyprstream.model/<rkey>` and
+    /// `ai.hyprstream.placement.node/<rkey>` side by side in the same tree).
+    /// A directory walker enumerates a collection's records by filtering
+    /// entries whose key starts with `"<collection>/"`.
+    pub fn from_keyed_records(records: &BTreeMap<String, Cid>) -> Self {
+        let keys: Vec<(String, Cid)> = records.iter().map(|(k, v)| (k.clone(), *v)).collect();
         if keys.is_empty() {
             return Node::empty();
         }
@@ -625,6 +640,59 @@ mod tests {
             proof.verify(&root, &wrong).is_err(),
             "proof must reject a wrong record"
         );
+    }
+
+    #[test]
+    fn mst_from_keyed_records_mixes_collections() {
+        // A repo's MST spans multiple collections side by side — build one
+        // directly from full keys (no single `collection` argument) and confirm
+        // every entry's key + value round-trips through the node blocks.
+        let mut keyed: BTreeMap<String, Cid> = BTreeMap::new();
+        for i in 0..4u64 {
+            let (tid, rec) = make_record(i);
+            keyed.insert(
+                format!("{}/{}", crate::record::COLLECTION_NSID, tid.encode()),
+                rec.cid(),
+            );
+        }
+        for i in 0..3u64 {
+            let cid = Cid::from_dag_cbor(format!("placement-node-{i}").as_bytes());
+            keyed.insert(format!("ai.hyprstream.placement.node/synthetic-{i}"), cid);
+        }
+        let tree = Node::from_keyed_records(&keyed);
+        let (root_data, blocks) = tree.to_node_data_with_blocks();
+        assert_eq!(root_data.cid(), tree.root_cid());
+
+        // Walk all node blocks and collect every entry's (key, value) — cross
+        // check against the input map by reconstructing keys the same way the
+        // directory walker will (see hyprstream-discovery's placement_index).
+        let block_map: BTreeMap<Cid, NodeData> = blocks.into_iter().collect();
+        let mut found: BTreeMap<String, Cid> = BTreeMap::new();
+        fn walk(cid: Cid, blocks: &BTreeMap<Cid, NodeData>, out: &mut BTreeMap<String, Cid>) {
+            let data = blocks.get(&cid).expect("block present");
+            if let Some(l) = data.l {
+                walk(l, blocks, out);
+            }
+            let mut prev: Option<String> = None;
+            for entry in &data.e {
+                let key = match &prev {
+                    Some(p) => {
+                        let take = entry.p.min(p.len());
+                        let mut full = p.as_bytes()[..take].to_vec();
+                        full.extend_from_slice(&entry.k);
+                        String::from_utf8(full).expect("utf8 key")
+                    }
+                    None => String::from_utf8(entry.k.clone()).expect("utf8 key"),
+                };
+                out.insert(key.clone(), entry.v);
+                prev = Some(key);
+                if let Some(t) = entry.t {
+                    walk(t, blocks, out);
+                }
+            }
+        }
+        walk(tree.root_cid(), &block_map, &mut found);
+        assert_eq!(found, keyed, "walked entries must match the input key set exactly");
     }
 
     #[test]
