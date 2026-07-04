@@ -29,7 +29,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context as _, Result};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use hyprstream_rpc::Subject;
@@ -85,7 +85,7 @@ impl MountBackend {
             .mount
             .stat(handle, &self.subject)
             .await
-            .map_err(|e| anyhow!("mount stat failed: {e}"))?;
+            .context("mount stat failed")?;
         Ok(Qid { qtype: st.qtype, version: st.version, path: st.path })
     }
 }
@@ -110,7 +110,7 @@ impl Backend for MountBackend {
             .mount
             .walk(&refs, &self.subject)
             .await
-            .map_err(|e| anyhow!("mount walk failed: {e}"))?;
+            .context("mount walk failed")?;
 
         // Mirror `ModelBackend::walk`: return the single leaf qid (the translator
         // records its qtype for the new fid; clients here walk one hop at a time).
@@ -130,7 +130,7 @@ impl Backend for MountBackend {
         self.mount
             .open(handle, mode, &self.subject)
             .await
-            .map_err(|e| anyhow!("mount open failed: {e}"))?;
+            .context("mount open failed")?;
         let qid = self.qid_of(handle).await?;
         Ok(OpenResult { qid, iounit: IOUNIT })
     }
@@ -142,7 +142,7 @@ impl Backend for MountBackend {
         self.mount
             .read(handle, offset, count, &self.subject)
             .await
-            .map_err(|e| anyhow!("mount read failed: {e}"))
+            .context("mount read failed")
     }
 
     async fn write(&self, fid: u32, offset: u64, data: &[u8]) -> Result<u32> {
@@ -152,7 +152,7 @@ impl Backend for MountBackend {
         self.mount
             .write(handle, offset, data, &self.subject)
             .await
-            .map_err(|e| anyhow!("mount write failed: {e}"))
+            .context("mount write failed")
     }
 
     async fn stat(&self, fid: u32) -> Result<StatResult> {
@@ -163,7 +163,7 @@ impl Backend for MountBackend {
             .mount
             .stat(handle, &self.subject)
             .await
-            .map_err(|e| anyhow!("mount stat failed: {e}"))?;
+            .context("mount stat failed")?;
         let is_dir = st.qtype & QTDIR != 0;
         let mode = if is_dir { 0o040755 } else { 0o100644 };
         Ok(StatResult {
@@ -182,7 +182,7 @@ impl Backend for MountBackend {
             self.mount
                 .readdir(handle, &self.subject)
                 .await
-                .map_err(|e| anyhow!("mount readdir failed: {e}"))?
+                .context("mount readdir failed")?
         };
         Ok(encode_dir_entries(&entries, offset, count))
     }

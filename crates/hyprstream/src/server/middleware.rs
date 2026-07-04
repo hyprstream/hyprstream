@@ -84,45 +84,19 @@ pub async fn auth_middleware(
     // Build WWW-Authenticate header for 401 responses (RFC 9728)
     let www_authenticate = build_www_authenticate(&state);
 
-    if !token.contains('.') {
-        warn!(client_ip = %client_ip, method = %method, path = %path, "Auth failure: malformed token");
-        return unauthorized_response("Authentication failed", &www_authenticate);
-    }
-
-    // Extract iss for key routing
-    let iss = extract_iss_from_token(&token);
+    // Verify the token to validated claims via the shared auth chain
+    // (malformed check, local-vs-federation issuer routing, signature +
+    // audience validation, JTI revocation). Reused verbatim by the 9P mount
+    // ticket validator (H1a / #764). DPoP sender-binding is enforced below,
+    // after we hold the claims, because it is header/scheme-specific.
     let local_issuers: &[&str] = &[&*state.oauth_issuer_url];
-    let result = if hyprstream_rpc::auth::is_local_iss(&iss, local_issuers) {
-        jwt::decode(&token, &state.verifying_key, Some(&state.resource_url))
-    } else {
-        if !state.federation_resolver.is_trusted(&iss) {
-            warn!(client_ip = %client_ip, method = %method, path = %path, issuer = %iss, "Auth failure: untrusted federation issuer");
-            return unauthorized_response("Authentication failed", &www_authenticate);
-        }
-        match state.federation_resolver.get_key(&iss).await {
-            Ok(key) => jwt::decode_with_key(&token, &key, Some(&state.resource_url)),
-            Err(e) => {
-                warn!(client_ip = %client_ip, method = %method, path = %path, issuer = %iss, error = %e, "Auth failure: federation key resolution failed");
-                return unauthorized_response("Authentication failed", &www_authenticate);
-            }
-        }
-    };
-
-    let claims = match result {
+    let claims = match verify_token_claims(&state, &token).await {
         Ok(c) => c,
-        Err(e) => {
-            warn!(client_ip = %client_ip, method = %method, path = %path, error = %e, "Auth failure: JWT validation failed");
+        Err(reason) => {
+            warn!(client_ip = %client_ip, method = %method, path = %path, reason, "Auth failure");
             return unauthorized_response("Authentication failed", &www_authenticate);
         }
     };
-
-    // JTI revocation check (RFC 7009) — shared blocklist with OAuth revocation endpoint.
-    if let Some(ref jti) = claims.jti {
-        if state.jti_blocklist.is_revoked(jti) {
-            warn!(jti = %jti, sub = %claims.sub, "Revoked token presented");
-            return unauthorized_response("Authentication failed", &www_authenticate);
-        }
-    }
 
     // DPoP binding enforcement (RFC 9449).
     // A token with cnf.jkt MUST be presented with Authorization: DPoP + DPoP proof header.
@@ -290,6 +264,58 @@ pub async fn rate_limit_middleware(
     }
 
     next.run(request).await
+}
+
+/// Verify a bearer/ticket token to its validated [`jwt::Claims`] using the
+/// shared server auth chain.
+///
+/// This is the token-verification core factored out of [`auth_middleware`] so
+/// the 9P mount-ticket validator (H1a / #764) reuses the *exact* same chain
+/// rather than re-implementing one:
+///
+/// 1. malformed-token rejection,
+/// 2. local-vs-federation issuer routing (local `verifying_key` or
+///    `federation_resolver`),
+/// 3. Ed25519 / ML-DSA signature + audience validation via `jwt::decode`,
+/// 4. JTI revocation against the shared blocklist (RFC 7009).
+///
+/// It does **not** enforce DPoP sender-binding: that is header/scheme-specific
+/// and stays in [`auth_middleware`]. Returns `Err(reason)` with a short,
+/// log-safe reason string on any failure (never leaks token contents).
+pub(crate) async fn verify_token_claims(
+    state: &ServerState,
+    token: &str,
+) -> Result<jwt::Claims, &'static str> {
+    if !token.contains('.') {
+        return Err("malformed token");
+    }
+
+    // Extract iss for key routing (local node key vs trusted federation peer).
+    let iss = extract_iss_from_token(token);
+    let local_issuers: &[&str] = &[&*state.oauth_issuer_url];
+    let result = if hyprstream_rpc::auth::is_local_iss(&iss, local_issuers) {
+        jwt::decode(token, &state.verifying_key, Some(&state.resource_url))
+    } else {
+        if !state.federation_resolver.is_trusted(&iss) {
+            return Err("untrusted federation issuer");
+        }
+        match state.federation_resolver.get_key(&iss).await {
+            Ok(key) => jwt::decode_with_key(token, &key, Some(&state.resource_url)),
+            Err(_) => return Err("federation key resolution failed"),
+        }
+    };
+
+    let claims = result.map_err(|_| "JWT validation failed")?;
+
+    // JTI revocation check (RFC 7009) — shared blocklist with the OAuth
+    // revocation endpoint.
+    if let Some(ref jti) = claims.jti {
+        if state.jti_blocklist.is_revoked(jti) {
+            return Err("revoked token");
+        }
+    }
+
+    Ok(claims)
 }
 
 /// Build WWW-Authenticate header value with resource_metadata URL (RFC 9728).
