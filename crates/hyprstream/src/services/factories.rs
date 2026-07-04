@@ -728,6 +728,15 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
         }
     }
 
+    // #523 P3 mesh-authz gate: the enrolled mesh_peers roster maps a routed
+    // NodeId to its per-host subject (`service:inference:host-<label>`).
+    // Empty `mesh_peers` (mesh/federation not configured) yields an empty
+    // roster — every non-co-located candidate then fails closed (denied),
+    // never silently skipped. See `select_inference_server` / `mesh_authz_gate`.
+    model_service = model_service.with_mesh_identity_roster(std::sync::Arc::new(
+        crate::auth::mesh_trust::build_mesh_identity_roster(&config.oauth),
+    ));
+
     Ok(ctx.into_spawnable_quic(model_service, config.model.quic_port))
 }
 
