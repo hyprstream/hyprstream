@@ -9,6 +9,21 @@ description = "Isolated workload execution using Kata Containers with CRI-aligne
 [dependencies]
 # Workspace crates
 hyprstream-rpc = { path = "../hyprstream-rpc" }
+# CRI v1 (runtime.v1) tonic-generated client bindings (#510): the CriBackend
+# drives an external, already-running CRI runtime service (containerd's CRI
+# plugin, or CRI-O) over CRI gRPC — the same protocol kubelet speaks — rather
+# than hyprstream embedding/driving a runtime itself. Pinned to 0.10.0, the
+# last release generated against tonic 0.12 / prost 0.13 (the versions this
+# workspace already pins); 0.11.0 moved to tonic 0.14 / prost 0.14, which
+# would pull a second incompatible tonic/prost/hyper stack into the graph for
+# no functional gain here. Optional — gated behind the `cri` feature so the
+# default build doesn't assume an external CRI runtime is present.
+k8s-cri = { version = "=0.10.0", optional = true }
+tonic = { workspace = true, optional = true }
+# UDS connector plumbing for dialing the CRI runtime's Unix socket
+# (`/run/containerd/containerd.sock` et al) via `tonic::transport::Endpoint`.
+tower = { version = "0.4", optional = true, default-features = false }
+hyper-util = { version = "0.1", optional = true, features = ["tokio"] }
 # In-process WebAssembly sandbox substrate (#505 P1): the embedded wasmtime
 # `Sandbox` (capability-only Linker, fuel/epoch DoS bounds). This is the
 # consolidated crate formerly named `hyprstream-wasm` (renamed to
@@ -242,6 +257,17 @@ wasm = ["dep:hyprstream-workers-wasmtime"]
 # the lean build doesn't assume a container runtime is installed. When off, `oci`
 # selection fails closed (the backend simply isn't registered).
 oci = []
+# CRI-client sandbox backend (#510, Worker GA epic #341 / taxonomy #508).
+# Compiles in `CriBackend`, a tonic gRPC *client* of an external, already-running
+# CRI runtime service (containerd's CRI plugin, or CRI-O) — the kubelet role,
+# not an embedded runtime. This is the generic "any CRI-compliant runtime"
+# compatibility seam (and, incidentally, a way to get Kata via Kubernetes
+# `RuntimeClass` on a containerd host without hyprstream embedding kata-agent
+# itself — see `KataBackend`/`kata-vm` for the embedded path, which this does
+# NOT replace). Opt-in: the lean build doesn't assume a CRI socket exists on
+# the host. When off, `cri` selection fails closed (the backend simply isn't
+# registered).
+cri = ["dep:k8s-cri", "dep:tonic", "dep:tower", "dep:hyper-util"]
 # Enable Dragonball built-in VMM support (alternative to cloud-hypervisor).
 # Implies `kata-vm` since it tunes the kata hypervisor abstraction.
 dragonball = ["kata-vm", "kata-hypervisor/dragonball"]

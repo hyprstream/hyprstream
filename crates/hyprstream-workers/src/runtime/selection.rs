@@ -15,11 +15,15 @@
 //!   container, #346).
 //! * `wasm`   — registered only under the `wasm` feature (in-process WebAssembly,
 //!   explicit-name-only).
+//! * `cri`    — registered only under the `cri` feature (#510: a gRPC *client*
+//!   of an external, already-running CRI runtime service — containerd's CRI
+//!   plugin, or CRI-O — not an embedded runtime). Explicit-name-only, like
+//!   `wasm`: driving an external runtime is an auth-surface decision `"auto"`
+//!   must never reach for on its own.
 //!
-//! YAGNI: still-speculative tiers (e.g. a raw `cri` shim) are intentionally
-//! **not** registered. They gain a `submit!` when their phase actually builds
-//! them; until then they simply do not exist as selectable names (an explicit
-//! request errors).
+//! YAGNI: still-speculative tiers are intentionally **not** registered. They
+//! gain a `submit!` when their phase actually builds them; until then they
+//! simply do not exist as selectable names (an explicit request errors).
 //!
 //! Selection is **config-driven** via `worker.backend` (a string: a registered
 //! backend name, or `"auto"`):
@@ -785,16 +789,34 @@ mod tests {
         );
     }
 
+    // YAGNI note: still-speculative tiers must not be in the registry until
+    // built. `wasm` (#505 P2), `oci` (#346) and `cri` (#510) are now real
+    // backends, each tracked by its own feature-gated test below; nothing
+    // remains speculative at present.
+
     #[test]
-    fn no_speculative_backends_registered() {
-        // YAGNI: still-speculative tiers must not be in the registry until built.
-        // `wasm` (#505 P2) and `oci` (#346) are now real backends, each handled by
-        // its own feature-tracking test below; only `cri` remains speculative.
-        let name = "cri";
-        assert!(
-            !inventory::iter::<BackendRegistration>().any(|r| r.name == name),
-            "speculative backend '{name}' must not be registered (YAGNI)"
+    fn registry_contains_cri_only_under_feature() {
+        // The CRI-client backend (#510) registers iff built with `--features
+        // cri`. With the feature off it must NOT be a selectable name
+        // (fail-closed), mirroring `wasm`/`oci`/`kata`.
+        let has_cri = inventory::iter::<BackendRegistration>().any(|r| r.name == "cri");
+        assert_eq!(
+            has_cri,
+            cfg!(feature = "cri"),
+            "cri registration must track the cri feature"
         );
+    }
+
+    #[cfg(feature = "cri")]
+    #[test]
+    fn cri_is_explicit_name_only() {
+        // Driving an external runtime is an auth-surface decision (#510):
+        // `"auto"` must never reach for `cri` on its own, even if it were the
+        // only registered backend — mirrors `wasm`'s explicit-name-only stance.
+        let cri = inventory::iter::<BackendRegistration>()
+            .find(|r| r.name == "cri")
+            .expect("cri registered under the cri feature");
+        assert!(!cri.auto_selectable, "cri must be explicit-name-only");
     }
 
     #[test]

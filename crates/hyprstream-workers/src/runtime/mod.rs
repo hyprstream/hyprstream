@@ -23,6 +23,13 @@
 pub mod backend;
 mod client;
 mod container;
+// CRI-client sandbox backend (#510) — gated behind `cri`. A tonic gRPC
+// client of an external, already-running CRI runtime service (containerd's
+// CRI plugin, or CRI-O) — the kubelet role, not an embedded runtime. Sibling
+// of `oci_backend` (which drives podman via CLI shell-out) under the same
+// SandboxBackend seam; does NOT replace `kata_backend` (embedded Kata stays).
+#[cfg(feature = "cri")]
+pub mod cri_backend;
 // `/exec/instances/` VFS projection of `SandboxPool` (#608 P2 / #610) — a
 // `hyprstream_vfs::Mount` impl, so it has no `kata-vm`/`wasm` dependency.
 pub mod exec_mount;
@@ -104,6 +111,8 @@ pub use client::{
 };
 // Backend trait and implementations
 pub use backend::{SandboxBackend, SandboxHandle};
+#[cfg(feature = "cri")]
+pub use cri_backend::{CriBackend, CriConfig, CriHandle};
 // `/exec/instances/` Plan9 projection of the pool (#608 P2 / #610)
 pub use exec_mount::ExecMount;
 #[cfg(feature = "kata-vm")]
