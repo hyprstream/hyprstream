@@ -253,15 +253,16 @@ criterion = "0.5.1"
 # - Build with: cargo build --no-default-features --features tch-cuda
 # - Build with: cargo build --no-default-features --features tch-rocm
 
-# moq-net fork (#484): relaxes the wasm-hostile `SessionInner: Send + Sync` bound so a
-# browser web_sys::WebTransport-backed Session can drive the moq subscriber. Vendored
-# at 0.1.8 (unchanged except src/session.rs); native builds are unaffected.
+# moq-net wasm support (#484): relaxes the wasm-hostile `SessionInner: Send + Sync`
+# bound + swaps real-path tokio::time for a wasm-compatible wrapper, so a browser
+# web_sys::WebTransport-backed Session can drive the moq subscriber. Upstreamed as
+# moq-dev/moq#2085 (merged 2026-07-04, commit 07f558fea819c9b4c9a68617383146449f5edc87).
 [patch.crates-io]
-# moq-net wasm support (browser subscriber/publisher) lives on our fork pending
-# upstream review (ewindisch/moq PR #1 → moq-dev/moq). Pinned to a rev so the
-# build is reproducible even if the branch is rebased during review; bump the
-# rev when the fork advances. Once upstream merges, drop this for a crates-io bump.
-moq-net = { git = "https://github.com/ewindisch/moq", rev = "5c51660119777083b9df45e5a9b478b933d944d7" }
+# Pinned to the upstream merge commit rather than a crates-io release: #2085 landed
+# on moq-dev/moq main but hasn't shipped in a moq-net release yet. Pinning to a rev
+# (not a branch) keeps the build reproducible even if main advances further. Drop
+# this patch entirely once a moq-net release containing #2085 is published.
+moq-net = { git = "https://github.com/moq-dev/moq", rev = "07f558fea819c9b4c9a68617383146449f5edc87" }
 
 # Build dependencies
 [workspace.dependencies.cc]
