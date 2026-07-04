@@ -1,0 +1,51 @@
+name: hypr9p guest
+
+# CI-build the native in-guest 9P-over-vsock client (hyprstream epic #729, V3
+# #732). Like workers/wanix-guest, this is a FOREIGN-toolchain (Go) artifact
+# that lives OUTSIDE the Cargo workspace, so it is not covered by the Rust jobs.
+# This standalone job builds it, vets it, and runs its --self-test (attach +
+# readdir + read + write round-trip over 9P2000.L against a throwaway in-process
+# server). Torch-free, no Rust, no cargo.
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'workers/hypr9p-guest/**'
+      - 'scripts/build-hypr9p-guest.sh'
+      - '.github/workflows/hypr9p-guest.yml'
+  pull_request:
+    paths:
+      - 'workers/hypr9p-guest/**'
+      - 'scripts/build-hypr9p-guest.sh'
+      - '.github/workflows/hypr9p-guest.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  hypr9p-guest:
+    name: build + vet + self-test hypr9p-guest
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: workers/hypr9p-guest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: self-test (attach + readdir + read + write round-trip)
+        run: go run . --self-test
+
+      - name: static build via script
+        working-directory: .
+        run: scripts/build-hypr9p-guest.sh
