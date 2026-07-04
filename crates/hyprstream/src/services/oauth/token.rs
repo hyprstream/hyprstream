@@ -140,14 +140,18 @@ pub async fn exchange_token(
             // `subject_token_type` so it cannot be confused with the OIDC/WIT
             // exchange flows. Requires sender-binding (DPoP) — ZSP.
             if subject_token_type == crate::mac::exchange::UCAN_GRANT_TOKEN_TYPE {
-                let resolver = super::token_exchange::DenyUnlabeledResolver;
+                // #698 Decision D: resolves a delegated actor's clearance off the
+                // signed policy's enrollment table, floored at Classical
+                // assurance; falls back to DenyUnlabeledResolver (fail-closed) on
+                // a node that hasn't installed a compiled policy.
+                let resolver = crate::mac::exchange_enrollment_resolver();
                 return super::token_exchange::exchange_ucan_grant(
                     &state,
                     &subject_token,
                     dpop_header.as_deref(),
                     params.scope.as_deref(),
                     params.audience.as_deref(),
-                    &resolver,
+                    resolver.as_ref(),
                 )
                 .await;
             }

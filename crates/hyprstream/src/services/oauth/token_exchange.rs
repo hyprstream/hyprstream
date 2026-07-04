@@ -720,16 +720,16 @@ pub(crate) async fn exchange_ucan_grant_refresh(
         Err(msg) => return tx_error(StatusCode::BAD_REQUEST, "invalid_scope", &msg),
     };
 
-    // Resolve the subject's MAC context exactly as the mint path does — incl.
-    // the #680/#681 two-principal delegated meet. Mirrors the production
-    // dispatch's deny-by-default resolver until the S8 concrete resolver is
-    // wired (TODO(#572-verifier)/#574) — refresh must not be more permissive
-    // than mint.
+    // Resolve the subject's MAC context exactly as the mint path does (#698
+    // Decision D: enrollment-table resolver, actor assurance floored at
+    // Classical), including the #680/#681 two-principal delegated meet —
+    // refresh must not be more permissive than mint.
+    let resolver = crate::mac::exchange_enrollment_resolver();
     let ResolvedGrantSubject {
         subject: subject_ctx,
         on_behalf_of,
         principals,
-    } = resolve_grant_subject(&grant, &DenyUnlabeledResolver);
+    } = resolve_grant_subject(&grant, resolver.as_ref());
 
     // The verifier: same trust-store-anchored construction as mint. Absent ⇒
     // fail closed (no unverified chain).
