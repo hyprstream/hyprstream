@@ -251,11 +251,21 @@ quickcheck_macros = "1.0"
 criterion = "0.5.1"
 
 
-# NOTE: [patch.crates-io] section removed
 # tch backend selection is now handled via features in crates/hyprstream/Cargo.toml:
 # - default: tch-cpu (CPU-only)
 # - Build with: cargo build --no-default-features --features tch-cuda
 # - Build with: cargo build --no-default-features --features tch-rocm
+
+# moq-net wasm support (#484): relaxes the wasm-hostile `SessionInner: Send + Sync`
+# bound + swaps real-path tokio::time for a wasm-compatible wrapper, so a browser
+# web_sys::WebTransport-backed Session can drive the moq subscriber. Upstreamed as
+# moq-dev/moq#2085 (merged 2026-07-04, commit 07f558fea819c9b4c9a68617383146449f5edc87).
+[patch.crates-io]
+# Pinned to the upstream merge commit rather than a crates-io release: #2085 landed
+# on moq-dev/moq main but hasn't shipped in a moq-net release yet. Pinning to a rev
+# (not a branch) keeps the build reproducible even if main advances further. Drop
+# this patch entirely once a moq-net release containing #2085 is published.
+moq-net = { git = "https://github.com/moq-dev/moq", rev = "07f558fea819c9b4c9a68617383146449f5edc87" }
 
 # Build dependencies
 [workspace.dependencies.cc]

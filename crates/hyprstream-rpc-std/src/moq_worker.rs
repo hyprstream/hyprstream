@@ -1,11 +1,20 @@
 //! moq streaming Worker bridge via SharedArrayBuffer DMA ring buffer.
 //!
-//! Resolves the `moq-net Session: Sync` incompatibility with browser `web-sys`
-//! types without waiting for an upstream moq-net fix. The iroh/moq session runs
-//! inside a dedicated Web Worker (a real OS thread from wasm's perspective, where
-//! `Send + Sync` requirements are logically satisfied for single-threaded-per-worker
-//! JS objects). The main browser thread communicates with the worker via the
-//! existing `DmaTransport` SharedArrayBuffer ring buffer (`hyprstream-9p/src/dma.rs`).
+//! The moq session (WebTransport + moq-net consume loop) runs inside a
+//! dedicated Web Worker, kept isolated from the main thread by design — not as
+//! a workaround for a `Sync` bound. With the moq-net wasm fork (ewindisch/moq
+//! PR #1) the session *could* run on the main thread via `spawn_local`; we
+//! still push it to a Worker so frame pumping never competes with UI work on
+//! the main thread, so the `!Sync` `web_sys::WebTransport` session stays
+//! contained to a single realm as defense-in-depth, and so it reuses the
+//! existing `DmaTransport` SharedArrayBuffer ring (`hyprstream-9p/src/dma.rs`)
+//! that other host↔worker bridges already use.
+//!
+//! **Key-boundary invariant:** the worker only relays opaque
+//! `[capnp StreamBlock || mac[16]]` frames. It never verifies the HMAC chain
+//! or decrypts payloads — that happens on the main thread, so the DH-derived
+//! stream keys never need to enter the worker realm. Do not move verification
+//! or decryption into the worker.
 //!
 //! # Architecture
 //!
@@ -13,15 +22,13 @@
 //! Main thread (wasm32)                    Web Worker (wasm32)
 //! ─────────────────────────────────       ──────────────────────────────────────
 //! MoqWorkerHandle                         moq_worker_main()
-//!   .subscribe(track) ──────────────────► recv subscribe cmd over DMA
+//!   .subscribe(broadcast_path) ─────────► recv subscribe cmd over DMA
 //!   .recv_frame() ◄─────────────────────  send frames over DMA
 //!                                         │
 //!                                         ▼
 //!                                    WebTransport → moq relay/server
-//!                                    (opened FROM worker; WT here is the
-//!                                     sole JS thread so !Sync is not an issue
-//!                                     in practice — and moq-net is available
-//!                                     once its Sync bound is relaxed)
+//!                                    (opened FROM worker; the sole JS thread
+//!                                     touching the !Sync Session)
 //! ```
 //!
 //! # DMA frame envelope
@@ -39,14 +46,15 @@
 //! headers are already set by the `crossOriginIsolation()` Vite plugin in the
 //! www-cyberdione-ai frontend.
 //!
-//! # moq-net Sync status
+//! # moq-net on wasm
 //!
-//! `moq-net 0.1.8` requires `Session: Send + Sync`. `web_sys::WebTransport` is
-//! `!Sync`. The worker infrastructure here is complete and ready; the actual
-//! moq subscribe/publish loop (`worker_moq_loop`) is stubbed pending either:
-//! a) upstream moq-net relaxing the Sync bound, or
-//! b) a local `[patch.crates-io]` fork with the one-line fix.
-//! Track: <https://github.com/hyprstream/hyprstream/issues/484>
+//! `moq-net` required `Session: Send + Sync` (rejecting a `!Sync`
+//! `web_sys::WebTransport` Session) and used real-path `tokio::time` (panics on
+//! wasm). Both are fixed on our fork (ewindisch/moq PR #1: Session cfg-split +
+//! `tokio::time`→`web_async::time` + producer-on-wasm), sourced via
+//! `[patch.crates-io]` until upstream merges. The subscribe loop
+//! ([`run_subscribe`]) is implemented against it.
+//! Track: <https://github.com/hyprstream/hyprstream/issues/719>
 
 #![cfg(target_arch = "wasm32")]
 
@@ -56,56 +64,7 @@ use web_sys::{Worker, WorkerOptions, WorkerType};
 use hyprstream_9p::client::P9Transport;
 use hyprstream_9p::dma::DmaTransport;
 
-// ─── Frame envelope helpers ──────────────────────────────────────────────────
-
-/// Encode a single DMA frame: `[2: track_len][track][4: payload_len][payload]`.
-///
-/// The track-length prefix is a `u16`; a track name longer than `u16::MAX`
-/// would silently truncate the length header and desync `decode_frame` for the
-/// rest of the stream. Track names are short by construction (moq track paths),
-/// so we clamp defensively and drop the over-long frame rather than corrupt it.
-pub fn encode_frame(track: &str, payload: &[u8]) -> Vec<u8> {
-    let t = track.as_bytes();
-    let track_len = match u16::try_from(t.len()) {
-        Ok(len) => len,
-        Err(_) => {
-            web_sys::console::error_1(
-                &format!("[moq-worker] track name too long ({} bytes), dropping frame", t.len())
-                    .into(),
-            );
-            return Vec::new();
-        }
-    };
-    let mut out = Vec::with_capacity(2 + t.len() + 4 + payload.len());
-    out.extend_from_slice(&track_len.to_le_bytes());
-    out.extend_from_slice(t);
-    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    out.extend_from_slice(payload);
-    out
-}
-
-/// Decode a DMA frame. Returns `(track_name, payload)` or `None` if malformed.
-pub fn decode_frame(buf: &[u8]) -> Option<(&str, &[u8])> {
-    if buf.len() < 6 {
-        return None;
-    }
-    let track_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
-    if buf.len() < 2 + track_len + 4 {
-        return None;
-    }
-    let track = std::str::from_utf8(&buf[2..2 + track_len]).ok()?;
-    let payload_len = u32::from_le_bytes([
-        buf[2 + track_len],
-        buf[3 + track_len],
-        buf[4 + track_len],
-        buf[5 + track_len],
-    ]) as usize;
-    let start = 2 + track_len + 4;
-    if buf.len() < start + payload_len {
-        return None;
-    }
-    Some((track, &buf[start..start + payload_len]))
-}
+use crate::moq_frame::{decode_frame, encode_frame, parse_reach};
 
 // ─── Main-thread handle ───────────────────────────────────────────────────────
 
@@ -126,8 +85,11 @@ impl MoqWorkerHandle {
     ///
     /// # Arguments
     /// - `worker_script_url`: URL of the worker JS shim (e.g. `/moq-worker.js`).
-    /// - `reach_json`: JSON-serialized reach config, e.g.
-    ///   `{"url":"https://relay.example.com:443","cert_hash":"<base64>","track":"local/streams/abcdef"}`.
+    /// - `reach_json`: JSON reach config from the frontend's `selectReach`, e.g.
+    ///   `{"url":"https://relay.example.com:443/moq","certHashes":["<base64 SHA-256>"]}`.
+    ///   The broadcast path to subscribe arrives later in a `subscribe` command
+    ///   (not here), since one worker can serve several subscriptions. See
+    ///   [`crate::moq_frame::ReachConfig`].
     ///
     /// # COOP/COEP
     /// The page must be served with `Cross-Origin-Opener-Policy: same-origin` and
@@ -135,7 +97,7 @@ impl MoqWorkerHandle {
     /// available. The `crossOriginIsolation()` Vite plugin handles this in dev; ensure
     /// production headers are also set.
     pub fn spawn(worker_script_url: &str, reach_json: &str) -> Result<MoqWorkerHandle, JsError> {
-        // Allocate a 256 KiB SAB: 4 KiB control + 2 × 126 KiB data.
+        // Allocate a 260 KiB SAB: 4 KiB control + 2 × 128 KiB data channels.
         let sab_size = 4096 + 2 * 128 * 1024;
         let sab = js_sys::SharedArrayBuffer::new(sab_size);
 
@@ -161,9 +123,11 @@ impl MoqWorkerHandle {
         Ok(MoqWorkerHandle { sab, dma, worker })
     }
 
-    /// Send a subscribe command for `track_name` to the worker.
-    pub async fn subscribe(&self, track_name: &str) -> Result<(), JsError> {
-        let cmd = serde_json::json!({ "cmd": "subscribe", "track": track_name }).to_string();
+    /// Send a subscribe command for `broadcast_path` (the moq broadcast path,
+    /// e.g. `"local/streams/{topic_hex}"` — not a track name; the token stream
+    /// itself always lives on the single `STREAM_TRACK` within it) to the worker.
+    pub async fn subscribe(&self, broadcast_path: &str) -> Result<(), JsError> {
+        let cmd = serde_json::json!({ "cmd": "subscribe", "broadcast": broadcast_path }).to_string();
         let frame = encode_frame("__cmd__", cmd.as_bytes());
         self.dma
             .send(&frame)
@@ -173,8 +137,9 @@ impl MoqWorkerHandle {
 
     /// Poll for the next incoming frame from the worker.
     ///
-    /// Returns `(track_name, payload_bytes)` as a two-element JS array, or null
-    /// if no frame is available yet.
+    /// Awaits the DMA channel and returns `(track_name, payload_bytes)` as a
+    /// two-element JS array once a frame arrives, or `null` if the raw bytes
+    /// received didn't decode as a well-formed frame.
     pub async fn recv_frame(&self) -> Result<JsValue, JsError> {
         let raw = self
             .dma
@@ -198,6 +163,82 @@ impl MoqWorkerHandle {
     }
 }
 
+// ─── moq subscribe loop ───────────────────────────────────────────────────────
+
+/// Dial the moq plane over WebTransport, subscribe to the stream broadcast, and
+/// pump each received frame to the main thread over DMA.
+///
+/// Mirrors the native subscriber (`hyprstream-rpc::dial`): open a
+/// `web_transport_trait::Session` (here `web_sys::WebTransport` via
+/// `web-transport-wasm`, adapted in `moq_wt_session`), run the moq handshake with
+/// a consume-side origin, await the announced `broadcast_path`, subscribe to the
+/// single `STREAM_TRACK` ("stream"), and forward every group's frames. Each frame
+/// is a `capnp StreamBlock || mac[16]` the main thread parses/verifies/decrypts.
+///
+/// Returns when the track closes (stream complete) or on the first error.
+async fn run_subscribe(
+    dma: &DmaTransport,
+    url: &str,
+    broadcast_path: &str,
+    cert_hashes: Vec<Vec<u8>>,
+) -> Result<(), String> {
+    use crate::moq_wt_session::WtSession;
+
+    let parsed = url::Url::parse(url).map_err(|e| format!("bad reach url {url:?}: {e}"))?;
+
+    // Cert-pin to the self-signed mesh leaf when hashes are advertised; otherwise
+    // fall back to the browser's system roots (a real did:web PDS with a CA cert).
+    let client = if cert_hashes.is_empty() {
+        web_transport_wasm::ClientBuilder::new().with_system_roots()
+    } else {
+        web_transport_wasm::ClientBuilder::new().with_server_certificate_hashes(cert_hashes)
+    };
+    let wt = client
+        .connect(parsed)
+        .await
+        .map_err(|e| format!("WebTransport connect: {e}"))?;
+    let session = WtSession(wt);
+
+    // moq handshake, consume side: received broadcasts are announced into
+    // `client_consumer` (mirrors `dial.rs`'s loopback subscriber).
+    let client_origin = moq_net::Origin::random().produce();
+    let client_consumer = client_origin.consume();
+    let moq_client = moq_net::Client::new().with_consume(client_origin);
+    let _moq_session = moq_client
+        .connect(session)
+        .await
+        .map_err(|e| format!("moq handshake: {e}"))?;
+
+    let broadcast = client_consumer
+        .announced_broadcast(broadcast_path)
+        .await
+        .ok_or_else(|| format!("broadcast {broadcast_path:?} was not announced"))?;
+    let mut track = broadcast
+        .subscribe_track(&moq_net::Track::new("stream"))
+        .map_err(|e| format!("subscribe_track(stream): {e}"))?;
+
+    // Consume groups in order; each group's frames are pushed to main over DMA.
+    loop {
+        let mut group = match track
+            .next_group()
+            .await
+            .map_err(|e| format!("next_group: {e}"))?
+        {
+            Some(g) => g,
+            None => return Ok(()), // producer closed the track — stream complete.
+        };
+        while let Some(frame) = group
+            .read_frame()
+            .await
+            .map_err(|e| format!("read_frame: {e}"))?
+        {
+            dma.send(&encode_frame("stream", &frame))
+                .await
+                .map_err(|e| format!("DMA send frame: {e}"))?;
+        }
+    }
+}
+
 // ─── Worker entrypoint ────────────────────────────────────────────────────────
 
 /// Entry function called inside the Web Worker.
@@ -209,16 +250,8 @@ impl MoqWorkerHandle {
 /// The WebTransport connection is opened FROM the worker thread, which means
 /// `web_sys::WebTransport` is the only JS object on this thread and the
 /// `!Sync` restriction is logically satisfied (no cross-thread sharing occurs).
-///
-/// # moq-net stub
-///
-/// The `worker_moq_loop` function is currently stubbed — it dials the relay
-/// via WebTransport and echoes a "ready" frame to main, but does not yet
-/// implement full moq SUBSCRIBE/OBJECT framing. This is gated on:
-/// - `moq-net` relaxing its `Session: Sync` bound for wasm32, OR
-/// - A local `[patch.crates-io]` fork (one-line fix; tracked in #484).
-///
-/// The DMA channel and Worker spawn infrastructure are fully functional.
+/// moq-net's over-tight `SessionInner: Send + Sync` bound is relaxed for wasm by
+/// the `third_party/moq-net` fork so this Session can drive the moq consumer.
 #[wasm_bindgen]
 pub async fn moq_worker_main(sab: JsValue, reach_json: String) {
     console_error_panic_hook::set_once();
@@ -240,11 +273,11 @@ pub async fn moq_worker_main(sab: JsValue, reach_json: String) {
     let reach_preview: String = reach_json.chars().take(120).collect();
     web_sys::console::log_1(&format!("[moq-worker] started, reach: {}", reach_preview).into());
 
-    // Parse reach config.
-    let reach: serde_json::Value = match serde_json::from_str(&reach_json) {
-        Ok(v) => v,
+    // Parse reach config (url + base64-decoded cert-hash pins).
+    let reach = match parse_reach(&reach_json) {
+        Ok(r) => r,
         Err(e) => {
-            let err = encode_frame("__error__", format!("bad reach_json: {e}").as_bytes());
+            let err = encode_frame("__error__", e.as_bytes());
             let _ = dma.send(&err).await;
             return;
         }
@@ -257,8 +290,8 @@ pub async fn moq_worker_main(sab: JsValue, reach_json: String) {
         return;
     }
 
-    // Main loop: receive subscribe commands from main, relay frames back.
-    // moq framing stub — full implementation pending moq-net Sync fix (#484).
+    // Main loop: receive subscribe commands from main, run the moq subscribe
+    // (`run_subscribe`) for each, relaying OBJECT frames back over DMA.
     loop {
         let raw = match dma.recv().await {
             Ok(r) => r,
@@ -279,34 +312,31 @@ pub async fn moq_worker_main(sab: JsValue, reach_json: String) {
                 Err(_) => continue,
             };
             if cmd.get("cmd").and_then(|c| c.as_str()) == Some("subscribe") {
-                let track_name = cmd
-                    .get("track")
+                // `broadcast` is the moq broadcast path (e.g. "local/streams/{topic_hex}");
+                // the token stream itself lives on the single STREAM_TRACK within it.
+                let broadcast_path = cmd
+                    .get("broadcast")
                     .and_then(|t| t.as_str())
                     .unwrap_or("")
                     .to_string();
-                let url = reach
-                    .get("url")
-                    .and_then(|u| u.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                // url + cert-hash pins come from the reach config (parsed once);
+                // empty cert_hashes ⇒ use the browser's system roots.
+                let url = reach.url.clone();
+                let cert_hashes = reach.cert_hashes.clone();
+
                 web_sys::console::log_1(
-                    &format!("[moq-worker] subscribe track={track_name} url={url}").into(),
+                    &format!("[moq-worker] subscribe broadcast={broadcast_path} url={url}").into(),
                 );
-                // TODO(#484): open WebTransport to `url`, implement moq SUBSCRIBE +
-                // OBJECT consumer, push received OBJECT payloads via:
-                //   dma.send(&encode_frame(&track_name, &object_payload)).await
-                //
-                // Stub: echo an acknowledgment so the main thread knows the subscribe
-                // was received and the DMA channel is working.
-                let ack = encode_frame(
-                    &track_name,
-                    format!("__subscribed_stub__:{url}").as_bytes(),
-                );
-                if let Err(e) = dma.send(&ack).await {
-                    web_sys::console::error_1(
-                        &format!("[moq-worker] DMA send ack error: {e}").into(),
-                    );
-                    break;
+
+                // Runs until the track closes (stream complete) or errors; then the
+                // outer loop resumes waiting for the next command. One inference
+                // stream per worker, so blocking the command loop here is intended.
+                if let Err(e) =
+                    run_subscribe(&dma, &url, &broadcast_path, cert_hashes).await
+                {
+                    web_sys::console::error_1(&format!("[moq-worker] subscribe: {e}").into());
+                    let err = encode_frame("__error__", e.as_bytes());
+                    let _ = dma.send(&err).await;
                 }
             }
         }

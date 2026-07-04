@@ -158,8 +158,12 @@ pub mod stream_mount;
 pub mod wasm_exports;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_rpc_client;
+// Pure framing/reach-parsing for the moq worker — host-testable (not wasm-gated).
+pub mod moq_frame;
 #[cfg(target_arch = "wasm32")]
 pub mod moq_worker;
+#[cfg(target_arch = "wasm32")]
+pub mod moq_wt_session;
 
 // Phase 2: iroh peer identity + pkarr helpers exported to JavaScript.
 #[cfg(target_arch = "wasm32")]
