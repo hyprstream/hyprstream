@@ -487,6 +487,21 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     // access token is rejected by both the HTTP path and the RPC auth check.
     let _ = SHARED_JTI_BLOCKLIST.set(policy_service.jti_blocklist_arc());
 
+    // Wire the user credential store (#449) so `listUsers`/`registerUser`/
+    // `removeUser`/`listUserKeys`/`addUserKey`/`removeUserKey` work without
+    // the CLI opening RocksDB directly. Non-fatal if it can't be opened (see
+    // `crate::auth::open_configured_user_store` for the cross-process caveat).
+    let creds_dir = credentials_dir();
+    let user_store = tokio::task::block_in_place(|| {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(crate::auth::open_configured_user_store(&creds_dir, &config.credentials))
+    });
+    if let Some(store) = user_store {
+        policy_service = policy_service.with_user_store(store);
+    } else {
+        tracing::warn!("PolicyService starting without a user store — user-management RPCs will return NOT_CONFIGURED");
+    }
+
     Ok(ctx.into_spawnable_quic(policy_service, config.policy.quic_port))
 }
 

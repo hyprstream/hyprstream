@@ -18,8 +18,11 @@ use crate::services::generated::policy_client::{
     EventPrefixAccess, PendingSubscribers,
     ResolveServiceKey, RegisterServiceKey, ServiceKeyResponse,
     RefreshServiceTokenRequest, ExchangeWit,
+    RegisterUser, RemoveUser, ListUserKeys, AddUserKey, RemoveUserKey,
+    UserList, UserKeyEntry, UserKeyList,
     dispatch_policy, serialize_response,
 };
+use crate::auth::UserStore;
 use anyhow::{anyhow, Result};
 use git2db::{Git2DB, RepoId};
 use hyprstream_rpc::prelude::*;
@@ -78,6 +81,15 @@ pub struct PolicyService {
     es256_key_store: Option<Arc<crate::auth::Es256SigningKeyStore>>,
     /// ML-DSA-65 key rotation store for PQ-hybrid composite token issuance.
     ml_dsa_key_store: Option<Arc<crate::auth::MlDsaSigningKeyStore>>,
+    /// User credential store (#449) — backs `listUsers`/`registerUser`/`removeUser`/
+    /// `listUserKeys`/`addUserKey`/`removeUserKey`, so CLI user-management commands
+    /// no longer open RocksDB directly.
+    ///
+    /// `None` when the store could not be opened (e.g. another process already
+    /// holds the RocksDB writer lock on the same `credentials_dir` — see
+    /// `crate::services::factories::create_policy_service`); the affected RPCs
+    /// then return a `NOT_CONFIGURED` error instead of panicking.
+    user_store: Option<Arc<dyn UserStore>>,
 }
 
 impl PolicyService {
@@ -106,6 +118,7 @@ impl PolicyService {
             jti_blocklist: Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new()),
             es256_key_store: None,
             ml_dsa_key_store: None,
+            user_store: None,
         }
     }
 
@@ -165,6 +178,12 @@ impl PolicyService {
     /// Attach the ML-DSA-65 key rotation store for composite token issuance.
     pub fn with_ml_dsa_key_store(mut self, store: Arc<crate::auth::MlDsaSigningKeyStore>) -> Self {
         self.ml_dsa_key_store = Some(store);
+        self
+    }
+
+    /// Attach the user credential store (#449).
+    pub fn with_user_store(mut self, store: Arc<dyn UserStore>) -> Self {
+        self.user_store = Some(store);
         self
     }
 
@@ -1470,6 +1489,188 @@ impl PolicyHandler for PolicyService {
             expires_at,
         }))
     }
+
+    // ── User management (#449) ──────────────────────────────────────────
+    //
+    // These handlers replace the CLI's previous direct RocksDB access
+    // (`crate::auth::RocksDbUserStore::open`), which conflicted with any
+    // running process already holding the credential store's exclusive
+    // writer lock. The CLI now calls these RPCs via `PolicyClient` instead.
+
+    async fn handle_list_users(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+    ) -> Result<PolicyResponseVariant> {
+        let Some(store) = self.user_store.as_ref() else {
+            return Ok(user_store_not_configured());
+        };
+        let mut usernames = store.list_users().await;
+        usernames.sort();
+        Ok(PolicyResponseVariant::ListUsersResult(UserList { usernames }))
+    }
+
+    async fn handle_register_user(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &RegisterUser,
+    ) -> Result<PolicyResponseVariant> {
+        let Some(store) = self.user_store.as_ref() else {
+            return Ok(user_store_not_configured());
+        };
+        if data.username.is_empty() {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "username must not be empty".to_owned(),
+                code: "INVALID_INPUT".to_owned(),
+                details: String::new(),
+            }));
+        }
+        match store.register(&data.username).await {
+            Ok(sub) => {
+                info!(username = %data.username, "Registered user via PolicyService");
+                Ok(PolicyResponseVariant::RegisterUserResult(sub))
+            }
+            Err(e) => Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Failed to register user '{}': {e}", data.username),
+                code: "REGISTER_FAILED".to_owned(),
+                details: String::new(),
+            })),
+        }
+    }
+
+    async fn handle_remove_user(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &RemoveUser,
+    ) -> Result<PolicyResponseVariant> {
+        let Some(store) = self.user_store.as_ref() else {
+            return Ok(user_store_not_configured());
+        };
+        match store.remove(&data.username).await {
+            Ok(removed) => {
+                if removed {
+                    info!(username = %data.username, "Removed user via PolicyService");
+                }
+                Ok(PolicyResponseVariant::RemoveUserResult(removed))
+            }
+            Err(e) => Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Failed to remove user '{}': {e}", data.username),
+                code: "REMOVE_FAILED".to_owned(),
+                details: String::new(),
+            })),
+        }
+    }
+
+    async fn handle_list_user_keys(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &ListUserKeys,
+    ) -> Result<PolicyResponseVariant> {
+        let Some(store) = self.user_store.as_ref() else {
+            return Ok(user_store_not_configured());
+        };
+        match store.list_pubkeys(&data.username).await {
+            Ok(pubkeys) => {
+                let keys = pubkeys
+                    .into_iter()
+                    .map(|pk| UserKeyEntry {
+                        fingerprint: pk.fingerprint,
+                        label: pk.label,
+                        created_at: pk.created_at,
+                        last_used_at: pk.last_used_at,
+                    })
+                    .collect();
+                Ok(PolicyResponseVariant::ListUserKeysResult(UserKeyList { keys }))
+            }
+            Err(e) => Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Failed to list keys for user '{}': {e}", data.username),
+                code: "LIST_KEYS_FAILED".to_owned(),
+                details: String::new(),
+            })),
+        }
+    }
+
+    async fn handle_add_user_key(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &AddUserKey,
+    ) -> Result<PolicyResponseVariant> {
+        let Some(store) = self.user_store.as_ref() else {
+            return Ok(user_store_not_configured());
+        };
+        let key_bytes: [u8; 32] = match data.pubkey_raw.as_slice().try_into() {
+            Ok(b) => b,
+            Err(_) => {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: format!(
+                        "pubkeyRaw must be exactly 32 bytes (raw Ed25519), got {}",
+                        data.pubkey_raw.len()
+                    ),
+                    code: "INVALID_INPUT".to_owned(),
+                    details: String::new(),
+                }));
+            }
+        };
+        let verifying_key = match ed25519_dalek::VerifyingKey::from_bytes(&key_bytes) {
+            Ok(vk) => vk,
+            Err(e) => {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: format!("Invalid Ed25519 public key: {e}"),
+                    code: "INVALID_INPUT".to_owned(),
+                    details: String::new(),
+                }));
+            }
+        };
+        let label = data.label.clone().filter(|s| !s.is_empty());
+        match store.add_pubkey(&data.username, verifying_key, label).await {
+            Ok(fingerprint) => {
+                info!(username = %data.username, %fingerprint, "Added user key via PolicyService");
+                Ok(PolicyResponseVariant::AddUserKeyResult(fingerprint))
+            }
+            Err(e) => Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Failed to add key for user '{}': {e}", data.username),
+                code: "ADD_KEY_FAILED".to_owned(),
+                details: String::new(),
+            })),
+        }
+    }
+
+    async fn handle_remove_user_key(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &RemoveUserKey,
+    ) -> Result<PolicyResponseVariant> {
+        let Some(store) = self.user_store.as_ref() else {
+            return Ok(user_store_not_configured());
+        };
+        match store.remove_pubkey(&data.username, &data.fingerprint).await {
+            Ok(removed) => Ok(PolicyResponseVariant::RemoveUserKeyResult(removed)),
+            Err(e) => Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!(
+                    "Failed to remove key '{}' for user '{}': {e}",
+                    data.fingerprint, data.username
+                ),
+                code: "REMOVE_KEY_FAILED".to_owned(),
+                details: String::new(),
+            })),
+        }
+    }
+}
+
+/// Shared "user store not configured" error for the #449 user-management RPCs.
+fn user_store_not_configured() -> PolicyResponseVariant {
+    PolicyResponseVariant::Error(ErrorInfo {
+        message: "User store not configured on this PolicyService instance".to_owned(),
+        code: "NOT_CONFIGURED".to_owned(),
+        details: "Set credentials.backend in config, or check startup logs for why the \
+                  user store failed to open (e.g. another process holds the RocksDB lock)"
+            .to_owned(),
+    })
 }
 
 #[async_trait(?Send)]
@@ -1606,6 +1807,239 @@ pub(crate) async fn watch_policy_file(
             Ok(()) => info!("Policy reloaded from disk"),
             Err(e) => warn!("Failed to reload policy: {}", e),
         }
+    }
+}
+
+// ============================================================================
+// Tests (#449 — user-management RPC handlers)
+// ============================================================================
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod user_management_tests {
+    use super::*;
+    use crate::config::TokenConfig;
+    use ed25519_dalek::SigningKey;
+    use tempfile::TempDir;
+
+    /// Build a real `PolicyService` in a fresh `TempDir`, with a real
+    /// `RocksDbUserStore` wired in via `with_user_store` — the same store
+    /// construction path `create_policy_service` uses in production, minus
+    /// the config-driven backend selection.
+    ///
+    /// This exercises the actual fix for #449: previously the CLI opened
+    /// this exact store type directly; now only `PolicyService` does, and
+    /// the CLI reaches it exclusively through these RPC handlers.
+    async fn make_service_with_user_store() -> (PolicyService, TempDir) {
+        let temp = TempDir::new().expect("tempdir");
+        let models_dir = temp.path().to_path_buf();
+        let policies_dir = models_dir.join(".registry").join("policies");
+
+        let policy_manager = Arc::new(
+            PolicyManager::new(&policies_dir)
+                .await
+                .expect("policy manager"),
+        );
+        let git2db = Arc::new(RwLock::new(
+            Git2DB::open(&models_dir).await.expect("git2db open"),
+        ));
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+
+        let user_store = crate::auth::RocksDbUserStore::open(temp.path())
+            .expect("open user store");
+
+        let service = PolicyService::new(
+            policy_manager,
+            Arc::new(signing_key),
+            TokenConfig::default(),
+            git2db,
+            TransportConfig::inproc("policy-user-mgmt-test-unused"),
+        )
+        .with_user_store(Arc::new(user_store));
+
+        (service, temp)
+    }
+
+    /// `service:policy` is granted `resource: "*", action: "*"` by
+    /// `SERVICE_BASE_POLICIES`, so it's authorized for every #449 method
+    /// without needing extra policy rules just for this test.
+    fn service_policy_ctx() -> EnvelopeContext {
+        EnvelopeContext::from_callback_service(0, "policy")
+    }
+
+    #[tokio::test]
+    async fn list_users_returns_not_configured_without_a_store() {
+        let temp = TempDir::new().expect("tempdir");
+        let models_dir = temp.path().to_path_buf();
+        let policies_dir = models_dir.join(".registry").join("policies");
+        let policy_manager = Arc::new(
+            PolicyManager::new(&policies_dir)
+                .await
+                .expect("policy manager"),
+        );
+        let git2db = Arc::new(RwLock::new(
+            Git2DB::open(&models_dir).await.expect("git2db open"),
+        ));
+        let service = PolicyService::new(
+            policy_manager,
+            Arc::new(SigningKey::from_bytes(&[9u8; 32])),
+            TokenConfig::default(),
+            git2db,
+            TransportConfig::inproc("policy-user-mgmt-test-unused-2"),
+        );
+
+        let resp = service
+            .handle_list_users(&service_policy_ctx(), 0)
+            .await
+            .expect("handler must not error");
+        match resp {
+            PolicyResponseVariant::Error(e) => assert_eq!(e.code, "NOT_CONFIGURED"),
+            other => panic!("expected NOT_CONFIGURED error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn register_list_and_remove_user_round_trip() {
+        let (service, _temp) = make_service_with_user_store().await;
+        let ctx = service_policy_ctx();
+
+        // Fresh install: no users.
+        let resp = service.handle_list_users(&ctx, 0).await.expect("list");
+        let PolicyResponseVariant::ListUsersResult(list) = resp else {
+            panic!("expected ListUsersResult, got {resp:?}");
+        };
+        assert!(list.usernames.is_empty());
+
+        // Register two users via the RPC handler (mirrors `hyprstream user register`).
+        for name in ["alice", "bob"] {
+            let resp = service
+                .handle_register_user(&ctx, 0, &RegisterUser { username: name.to_owned() })
+                .await
+                .expect("register");
+            assert!(
+                matches!(resp, PolicyResponseVariant::RegisterUserResult(ref sub) if !sub.is_empty()),
+                "expected non-empty subject uuid, got {resp:?}"
+            );
+        }
+
+        // Both show up in the list (mirrors `hyprstream user list`), sorted.
+        let resp = service.handle_list_users(&ctx, 0).await.expect("list");
+        let PolicyResponseVariant::ListUsersResult(list) = resp else {
+            panic!("expected ListUsersResult, got {resp:?}");
+        };
+        assert_eq!(list.usernames, vec!["alice".to_owned(), "bob".to_owned()]);
+
+        // Remove one (mirrors `hyprstream user remove`).
+        let resp = service
+            .handle_remove_user(&ctx, 0, &RemoveUser { username: "alice".to_owned() })
+            .await
+            .expect("remove");
+        assert!(matches!(resp, PolicyResponseVariant::RemoveUserResult(true)));
+
+        // Removing again reports false, not an error.
+        let resp = service
+            .handle_remove_user(&ctx, 0, &RemoveUser { username: "alice".to_owned() })
+            .await
+            .expect("remove again");
+        assert!(matches!(resp, PolicyResponseVariant::RemoveUserResult(false)));
+
+        let resp = service.handle_list_users(&ctx, 0).await.expect("list");
+        let PolicyResponseVariant::ListUsersResult(list) = resp else {
+            panic!("expected ListUsersResult, got {resp:?}");
+        };
+        assert_eq!(list.usernames, vec!["bob".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn add_list_and_remove_user_key_round_trip() {
+        let (service, _temp) = make_service_with_user_store().await;
+        let ctx = service_policy_ctx();
+
+        service
+            .handle_register_user(&ctx, 0, &RegisterUser { username: "carol".to_owned() })
+            .await
+            .expect("register");
+
+        // No keys yet.
+        let resp = service
+            .handle_list_user_keys(&ctx, 0, &ListUserKeys { username: "carol".to_owned() })
+            .await
+            .expect("list keys");
+        let PolicyResponseVariant::ListUserKeysResult(ref list) = resp else {
+            panic!("expected ListUserKeysResult, got {resp:?}");
+        };
+        assert!(list.keys.is_empty());
+
+        // Add a key (mirrors `hyprstream user keys import`, which decodes the
+        // key client-side and submits only the raw 32 bytes).
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        let raw_pubkey = signing_key.verifying_key().as_bytes().to_vec();
+        let resp = service
+            .handle_add_user_key(
+                &ctx,
+                0,
+                &AddUserKey {
+                    username: "carol".to_owned(),
+                    pubkey_raw: raw_pubkey,
+                    label: Some("laptop".to_owned()),
+                },
+            )
+            .await
+            .expect("add key");
+        let PolicyResponseVariant::AddUserKeyResult(fingerprint) = resp else {
+            panic!("expected AddUserKeyResult, got {resp:?}");
+        };
+        assert!(fingerprint.starts_with("SHA256:"));
+
+        // Reject wrong-sized key material rather than panicking.
+        let resp = service
+            .handle_add_user_key(
+                &ctx,
+                0,
+                &AddUserKey {
+                    username: "carol".to_owned(),
+                    pubkey_raw: vec![1, 2, 3],
+                    label: None,
+                },
+            )
+            .await
+            .expect("handler must not error on bad input");
+        match resp {
+            PolicyResponseVariant::Error(e) => assert_eq!(e.code, "INVALID_INPUT"),
+            other => panic!("expected INVALID_INPUT error, got {other:?}"),
+        }
+
+        // Now listed (mirrors `hyprstream user keys list`).
+        let resp = service
+            .handle_list_user_keys(&ctx, 0, &ListUserKeys { username: "carol".to_owned() })
+            .await
+            .expect("list keys");
+        let PolicyResponseVariant::ListUserKeysResult(list) = resp else {
+            panic!("expected ListUserKeysResult, got {resp:?}");
+        };
+        assert_eq!(list.keys.len(), 1);
+        assert_eq!(list.keys[0].fingerprint, fingerprint);
+        assert_eq!(list.keys[0].label.as_deref(), Some("laptop"));
+
+        // Remove it (mirrors `hyprstream user keys remove`).
+        let resp = service
+            .handle_remove_user_key(
+                &ctx,
+                0,
+                &RemoveUserKey { username: "carol".to_owned(), fingerprint: fingerprint.clone() },
+            )
+            .await
+            .expect("remove key");
+        assert!(matches!(resp, PolicyResponseVariant::RemoveUserKeyResult(true)));
+
+        let resp = service
+            .handle_list_user_keys(&ctx, 0, &ListUserKeys { username: "carol".to_owned() })
+            .await
+            .expect("list keys");
+        let PolicyResponseVariant::ListUserKeysResult(list) = resp else {
+            panic!("expected ListUserKeysResult, got {resp:?}");
+        };
+        assert!(list.keys.is_empty());
     }
 }
 

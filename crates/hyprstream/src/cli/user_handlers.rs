@@ -1,19 +1,24 @@
 //! Handlers for `hyprstream user` CLI subcommands.
+//!
+//! These commands go through `PolicyService` RPC (`listUsers`/`registerUser`/
+//! `removeUser`/`listUserKeys`/`addUserKey`/`removeUserKey`, #449) instead of
+//! opening the RocksDB credential store directly — direct access from a
+//! second process conflicted with any already-running service holding the
+//! store's exclusive writer lock (`IO error: While lock file: .../LOCK:
+//! Resource temporarily unavailable`).
 // CLI handlers intentionally print to stdout/stderr for user interaction
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::io::{Read, Write};
-use std::path::Path;
 
-use crate::auth::{RocksDbUserStore, UserStore};
 use crate::cli::commands::UserKeysImportFormat;
-
-fn open_store(credentials_dir: &Path) -> Result<RocksDbUserStore> {
-    RocksDbUserStore::open(credentials_dir).context("Failed to open credential store")
-}
+use crate::cli::policy_handlers::create_policy_client;
+use crate::services::generated::policy_client::{
+    AddUserKey, RegisterUser, RemoveUser, RemoveUserKey, ListUserKeys,
+};
 
 /// Resolve key material: from -f <path>, -f -, or inline data.
 fn resolve_key_input(file: Option<&str>, data: Option<&str>) -> Result<String> {
@@ -35,6 +40,9 @@ fn resolve_key_input(file: Option<&str>, data: Option<&str>) -> Result<String> {
 ///
 /// Accepts: `ssh-ed25519 <base64> [comment]`
 /// Wire format: u32be(11) "ssh-ed25519" u32be(32) <32-byte-key> = 51 bytes total.
+///
+/// This is pure client-side parsing — no store access — so it stays local to
+/// the CLI; only the decoded raw key bytes are sent to PolicyService.
 fn parse_ssh_ed25519(line: &str) -> Result<VerifyingKey> {
     let line = line.trim();
     let b64_part = if let Some(rest) = line.strip_prefix("ssh-ed25519 ") {
@@ -71,17 +79,24 @@ fn parse_ssh_ed25519(line: &str) -> Result<VerifyingKey> {
 }
 
 /// Handle `user register <username>`
-pub async fn handle_user_register(credentials_dir: &Path, username: &str) -> Result<()> {
-    let store = open_store(credentials_dir)?;
-    store.register(username).await.context("Failed to register user")?;
+pub async fn handle_user_register(signing_key: &SigningKey, username: &str) -> Result<()> {
+    let client = create_policy_client(signing_key)?;
+    client
+        .register_user(&RegisterUser { username: username.to_owned() })
+        .await
+        .context("Failed to register user via PolicyService. Are services running?")?;
     println!("Registered user '{username}'");
     Ok(())
 }
 
 /// Handle `user list`
-pub async fn handle_user_list(credentials_dir: &Path) -> Result<()> {
-    let store = open_store(credentials_dir)?;
-    let mut users = store.list_users().await;
+pub async fn handle_user_list(signing_key: &SigningKey) -> Result<()> {
+    let client = create_policy_client(signing_key)?;
+    let mut users = client
+        .list_users()
+        .await
+        .context("Failed to list users via PolicyService. Are services running?")?
+        .usernames;
     if users.is_empty() {
         println!("No users registered.");
     } else {
@@ -95,7 +110,7 @@ pub async fn handle_user_list(credentials_dir: &Path) -> Result<()> {
 
 /// Handle `user remove <username> [--force]`
 pub async fn handle_user_remove(
-    credentials_dir: &Path,
+    signing_key: &SigningKey,
     username: &str,
     force: bool,
 ) -> Result<()> {
@@ -109,8 +124,11 @@ pub async fn handle_user_remove(
             return Ok(());
         }
     }
-    let store = open_store(credentials_dir)?;
-    let removed = store.remove(username).await?;
+    let client = create_policy_client(signing_key)?;
+    let removed = client
+        .remove_user(&RemoveUser { username: username.to_owned() })
+        .await
+        .context("Failed to remove user via PolicyService. Are services running?")?;
     if removed {
         println!("Removed user '{username}'");
     } else {
@@ -120,16 +138,18 @@ pub async fn handle_user_remove(
 }
 
 /// Handle `user keys list <username>`
-pub async fn handle_user_keys_list(credentials_dir: &Path, username: &str) -> Result<()> {
-    let store = open_store(credentials_dir)?;
-    let pubkeys = store.list_pubkeys(username).await?;
-    if pubkeys.is_empty() {
+pub async fn handle_user_keys_list(signing_key: &SigningKey, username: &str) -> Result<()> {
+    let client = create_policy_client(signing_key)?;
+    let pubkeys = client
+        .list_user_keys(&ListUserKeys { username: username.to_owned() })
+        .await
+        .context("Failed to list keys via PolicyService. Are services running?")?;
+    if pubkeys.keys.is_empty() {
         println!("No keys registered for '{username}'");
     } else {
-        for pk in &pubkeys {
-            let label = pk.label.as_deref().unwrap_or("(no label)");
-            let ts = pk.created_at;
-            println!("{}  {}  (added {})", pk.fingerprint, label, ts);
+        for pk in &pubkeys.keys {
+            let label = pk.label.as_deref().filter(|l| !l.is_empty()).unwrap_or("(no label)");
+            println!("{}  {}  (added {})", pk.fingerprint, label, pk.created_at);
         }
     }
     Ok(())
@@ -137,7 +157,7 @@ pub async fn handle_user_keys_list(credentials_dir: &Path, username: &str) -> Re
 
 /// Handle `user keys import <username> <format>`
 pub async fn handle_user_keys_import(
-    credentials_dir: &Path,
+    signing_key: &SigningKey,
     username: &str,
     format: &UserKeysImportFormat,
 ) -> Result<()> {
@@ -160,31 +180,36 @@ pub async fn handle_user_keys_import(
         }
     };
 
-    let store = open_store(credentials_dir)?;
-    let fingerprint = store
-        .add_pubkey(username, pubkey, label)
+    let client = create_policy_client(signing_key)?;
+    let fingerprint = client
+        .add_user_key(&AddUserKey {
+            username: username.to_owned(),
+            pubkey_raw: pubkey.as_bytes().to_vec(),
+            label,
+        })
         .await
-        .context("Failed to add key")?;
+        .context("Failed to add key via PolicyService. Are services running?")?;
     println!("Added key {fingerprint}");
     Ok(())
 }
 
 /// Handle `user keys remove <username> <fingerprint>`
 pub async fn handle_user_keys_remove(
-    credentials_dir: &Path,
+    signing_key: &SigningKey,
     username: &str,
     fingerprint: &str,
 ) -> Result<()> {
     // Normalize: ensure SHA256: prefix is present regardless of whether user included it
-    let owned;
     let fp = if fingerprint.starts_with("SHA256:") {
-        fingerprint
+        fingerprint.to_owned()
     } else {
-        owned = format!("SHA256:{fingerprint}");
-        &owned
+        format!("SHA256:{fingerprint}")
     };
-    let store = open_store(credentials_dir)?;
-    let removed = store.remove_pubkey(username, fp).await?;
+    let client = create_policy_client(signing_key)?;
+    let removed = client
+        .remove_user_key(&RemoveUserKey { username: username.to_owned(), fingerprint: fp.clone() })
+        .await
+        .context("Failed to remove key via PolicyService. Are services running?")?;
     if removed {
         println!("Removed key {fp}");
     } else {

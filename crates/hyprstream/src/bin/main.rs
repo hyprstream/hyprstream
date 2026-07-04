@@ -2382,35 +2382,39 @@ fn main() -> Result<()> {
         }
 
         // ── User management ─────────────────────────────────────────────
+        // Routed through PolicyService RPC (#449) rather than opening the
+        // RocksDB credential store directly, which conflicted with any
+        // already-running service holding the store's exclusive writer lock.
         Some(("user", sub_m)) => {
             let cmd = UserCommand::from_arg_matches(sub_m)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let credentials_dir = ctx.config_dir().join("credentials");
+            let keys_dir = ctx.models_dir().join(".registry").join("keys");
             // User handlers are async, run them in a minimal runtime
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .context("Failed to create runtime for user command")?;
             rt.block_on(async {
+                let signing_key = load_or_generate_signing_key(&keys_dir).await?;
                 match cmd {
                     UserCommand::Register { username } => {
-                        handle_user_register(&credentials_dir, &username).await?;
+                        handle_user_register(&signing_key, &username).await?;
                     }
                     UserCommand::List => {
-                        handle_user_list(&credentials_dir).await?;
+                        handle_user_list(&signing_key).await?;
                     }
                     UserCommand::Remove { username, force } => {
-                        handle_user_remove(&credentials_dir, &username, force).await?;
+                        handle_user_remove(&signing_key, &username, force).await?;
                     }
                     UserCommand::Keys { command } => match command {
                         UserKeysCommand::List { username } => {
-                            handle_user_keys_list(&credentials_dir, &username).await?;
+                            handle_user_keys_list(&signing_key, &username).await?;
                         }
                         UserKeysCommand::Import { username, format } => {
-                            handle_user_keys_import(&credentials_dir, &username, &format).await?;
+                            handle_user_keys_import(&signing_key, &username, &format).await?;
                         }
                         UserKeysCommand::Remove { username, fingerprint } => {
-                            handle_user_keys_remove(&credentials_dir, &username, &fingerprint).await?;
+                            handle_user_keys_remove(&signing_key, &username, &fingerprint).await?;
                         }
                     },
                 }

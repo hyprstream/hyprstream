@@ -92,6 +92,26 @@ struct PolicyRequest {
     # Requires 'exchange' permission on 'policy:exchange-wit' in Casbin policy.
     exchangeWit @21 :ExchangeWit
       $scope(manage) $mcpDescription("Exchange the caller's envelope WIT for an OAuth at+jwt; identity from signed envelope");
+
+    # List all registered usernames (#449 — moves `hyprstream user list` off
+    # direct RocksDB access, which conflicted with a running service holding
+    # the credential store's exclusive lock).
+    listUsers @22 :Void $scope(query) $mcpDescription("List all registered usernames");
+
+    # Register a new user account (#449).
+    registerUser @23 :RegisterUser $scope(manage) $mcpDescription("Register a new user account");
+
+    # Remove a registered user and all their keys (#449).
+    removeUser @24 :RemoveUser $scope(manage) $mcpDescription("Remove a registered user and all their keys");
+
+    # List public keys registered for a user (#449).
+    listUserKeys @25 :ListUserKeys $scope(query) $mcpDescription("List public keys registered for a user");
+
+    # Add a public key for a user (#449).
+    addUserKey @26 :AddUserKey $scope(manage) $mcpDescription("Add a public key for a user");
+
+    # Remove a public key from a user by fingerprint (#449).
+    removeUserKey @27 :RemoveUserKey $scope(manage) $mcpDescription("Remove a public key from a user by fingerprint");
   }
 }
 
@@ -168,6 +188,42 @@ struct GetDiff {
   gitRef @0 :Text $optional;
 }
 
+# Register a new user account (#449)
+struct RegisterUser {
+  # Username to register
+  username @0 :Text;
+}
+
+# Remove a registered user and all their keys (#449)
+struct RemoveUser {
+  # Username to remove
+  username @0 :Text;
+}
+
+# List public keys registered for a user (#449)
+struct ListUserKeys {
+  # Username to list keys for
+  username @0 :Text;
+}
+
+# Add a public key for a user (#449).
+# The caller decodes SSH-wire / raw key formats client-side and submits the
+# raw 32-byte Ed25519 public key — PolicyService never parses key wire formats.
+struct AddUserKey {
+  username @0 :Text;
+  # Raw Ed25519 public key (32 bytes)
+  pubkeyRaw @1 :Data;
+  # Optional label (e.g. "laptop", "yubikey")
+  label @2 :Text $optional;
+}
+
+# Remove a public key from a user by fingerprint (#449)
+struct RemoveUserKey {
+  username @0 :Text;
+  # Key fingerprint, e.g. "SHA256:...."
+  fingerprint @1 :Text;
+}
+
 # Unified policy response (covers both check and token issuance)
 struct PolicyResponse {
   # Request ID this response corresponds to
@@ -242,6 +298,24 @@ struct PolicyResponse {
 
     # at+jwt from exchangeWit
     exchangeWitResult @22 :TokenInfo;
+
+    # Registered usernames (for listUsers)
+    listUsersResult @23 :UserList;
+
+    # Subject UUID of the newly-registered user (for registerUser)
+    registerUserResult @24 :Text;
+
+    # Whether the user existed and was removed (for removeUser)
+    removeUserResult @25 :Bool;
+
+    # Public keys registered for a user (for listUserKeys)
+    listUserKeysResult @26 :UserKeyList;
+
+    # Fingerprint of the newly-added key (for addUserKey)
+    addUserKeyResult @27 :Text;
+
+    # Whether the key existed and was removed (for removeUserKey)
+    removeUserKeyResult @28 :Bool;
   }
 }
 
@@ -400,4 +474,24 @@ struct ExchangeWit {
 
   # TTL override in seconds. Server clamps to configured [min, max].
   ttl @2 :Opt.OptionUint32;
+}
+
+# List of registered usernames (#449)
+struct UserList {
+  usernames @0 :List(Text);
+}
+
+# A single registered public key entry (#449)
+struct UserKeyEntry {
+  fingerprint @0 :Text;
+  # Empty means no label was set
+  label @1 :Text $optional;
+  createdAt @2 :Int64;
+  # None if the key has never been used to authenticate
+  lastUsedAt @3 :Opt.OptionInt64;
+}
+
+# List of public keys registered for a user (#449)
+struct UserKeyList {
+  keys @0 :List(UserKeyEntry);
 }

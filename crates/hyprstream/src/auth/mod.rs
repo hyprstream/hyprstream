@@ -34,6 +34,66 @@ pub use rocksdb_store::RocksDbUserStore;
 #[cfg(feature = "valkey")]
 pub use valkey::ValkeyUserStore;
 
+/// Open the user credential store configured by `crate::config::CredentialsConfig`
+/// (#449).
+///
+/// Returns `None` (logging a warning, never panicking) if the store cannot be
+/// opened — callers must degrade gracefully rather than fail startup, since a
+/// missing/misconfigured user store shouldn't take down the whole service.
+///
+/// # RocksDB is single-writer, cross-process (#449 follow-up)
+///
+/// `crate::services::oauth` already opens its own `RocksDbUserStore` at the
+/// same `credentials_dir` for OAuth login/SCIM flows. RocksDB only allows one
+/// open writer for a given directory at a time — including across independent
+/// OS processes, which is exactly how `hyprstream service install` deploys
+/// each service (one systemd unit per service). If both `policy` and `oauth`
+/// are deployed as separate processes with `credentials.backend = "rocksdb"`
+/// (the default) and both are running, only the first to open the directory
+/// (`policy`, since `oauth` depends on `policy` and starts after it) gets the
+/// writer; the other's open call returns `Err`/`None` and that service's
+/// user-store-backed endpoints degrade to "not configured" rather than
+/// crashing. This is a known limitation of sharing one RocksDB directory
+/// across independently-deployed processes, not something callers of this
+/// function need to handle specially — see the tracking discussion on #449.
+pub async fn open_configured_user_store(
+    credentials_dir: &std::path::Path,
+    config: &crate::config::CredentialsConfig,
+) -> Option<std::sync::Arc<dyn UserStore>> {
+    match config.backend {
+        crate::config::CredentialsBackend::Rocksdb => match RocksDbUserStore::open(credentials_dir) {
+            Ok(store) => Some(std::sync::Arc::new(store)),
+            Err(e) => {
+                tracing::warn!(
+                    ?credentials_dir,
+                    "Could not open user store (RocksDB): {e}",
+                );
+                None
+            }
+        },
+        crate::config::CredentialsBackend::Valkey => {
+            #[cfg(feature = "valkey")]
+            {
+                let url = &config.valkey.url;
+                match ValkeyUserStore::connect(url).await {
+                    Ok(store) => Some(std::sync::Arc::new(store)),
+                    Err(e) => {
+                        tracing::warn!("Could not connect user store (Valkey) at {url}: {e}");
+                        None
+                    }
+                }
+            }
+            #[cfg(not(feature = "valkey"))]
+            {
+                tracing::error!(
+                    "credentials.backend = \"valkey\" but binary was not compiled with --features valkey"
+                );
+                None
+            }
+        }
+    }
+}
+
 /// Operation types that can be controlled via policies
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 //

@@ -27,7 +27,7 @@ use std::process::Command;
 /// Create a PolicyClient for RPC calls.
 ///
 /// Bootstrap: PolicyService key needed to create the PolicyClient for peer key resolution.
-fn create_policy_client(signing_key: &SigningKey) -> Result<PolicyClient> {
+pub(crate) fn create_policy_client(signing_key: &SigningKey) -> Result<PolicyClient> {
     PolicyClient::for_service(
         signing_key.clone(),
         // Bootstrap: PolicyService uses the root key
