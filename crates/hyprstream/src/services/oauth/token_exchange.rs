@@ -425,22 +425,20 @@ struct TokenPrincipals {
 fn resolve_grant_subject(
     grant: &hyprstream_rpc::auth::ucan::token::Ucan,
     resolver: &dyn SubjectContextResolver,
-) -> (
-    Option<hyprstream_rpc::auth::mac::SecurityContext>,
-    TokenPrincipals,
-) {
+) -> ResolvedGrantSubject {
     let audience = grant.audience().as_str();
     let delegator = grant.root_issuer().as_str();
 
     if delegator == audience {
         // Self-issued root — no delegation. Single principal = the subject.
-        return (
-            resolver.resolve(audience),
-            TokenPrincipals {
+        return ResolvedGrantSubject {
+            subject: resolver.resolve(audience),
+            on_behalf_of: None,
+            principals: TokenPrincipals {
                 sub: audience.to_owned(),
                 act: None,
             },
-        );
+        };
     }
 
     // Delegation: resolve BOTH principals and take the fail-closed meet (#681).
@@ -462,7 +460,30 @@ fn resolve_grant_subject(
             act: None,
         }),
     };
-    (ctx, principals)
+    ResolvedGrantSubject {
+        subject: ctx,
+        // The delegator (authority source), recorded on the grant audit record
+        // as `on_behalf_of` (#680/#681). Carried separately from the met
+        // `subject` so the audit trail names both principals of a delegated
+        // decision. `None` if the delegator is unresolved (the grant already
+        // fails closed via `subject` above).
+        on_behalf_of: delegator_ctx,
+        principals,
+    }
+}
+
+/// Outcome of [`resolve_grant_subject`]: the effective (met) subject context the
+/// grant gates evaluate, the delegator context for two-principal audit
+/// attribution (#680/#681), and the principals the mint stamps on the token.
+struct ResolvedGrantSubject {
+    /// Effective context: `meet(delegator, actor)` for a delegated grant, or the
+    /// sole principal for a self-issued root grant. `None` ⇒ fail closed.
+    subject: Option<hyprstream_rpc::auth::mac::SecurityContext>,
+    /// The delegator principal, for the audit record's `on_behalf_of`. `None`
+    /// for a self-issued root grant (single principal) or an unresolved delegator.
+    on_behalf_of: Option<hyprstream_rpc::auth::mac::SecurityContext>,
+    /// The delegator/actor split the mint stamps on the token.
+    principals: TokenPrincipals,
 }
 
 /// POST /oauth/token — UCAN grant (RFC 8693 token-exchange,
@@ -536,7 +557,11 @@ pub async fn exchange_ucan_grant(
     //    principals and takes the fail-closed meet(delegator, actor); a
     //    self-issued root grant stays single-principal. `principals` carries the
     //    delegator/actor split the mint stamps onto the token.
-    let (subject_ctx, principals) = resolve_grant_subject(&grant, subject_resolver);
+    let ResolvedGrantSubject {
+        subject: subject_ctx,
+        on_behalf_of,
+        principals,
+    } = resolve_grant_subject(&grant, subject_resolver);
 
     // ── 4. Parse the requested access off the form fields ──────────────────
     // TODO(#572-object-label): wire the manifest/TE object-label resolver so
@@ -585,6 +610,7 @@ pub async fn exchange_ucan_grant(
         now,
         &request,
         subject_ctx.as_ref(),
+        on_behalf_of.as_ref(),
         true, // sender-bound: dpop_jkt is present
         sink,
     );
@@ -699,7 +725,11 @@ pub(crate) async fn exchange_ucan_grant_refresh(
     // dispatch's deny-by-default resolver until the S8 concrete resolver is
     // wired (TODO(#572-verifier)/#574) — refresh must not be more permissive
     // than mint.
-    let (subject_ctx, principals) = resolve_grant_subject(&grant, &DenyUnlabeledResolver);
+    let ResolvedGrantSubject {
+        subject: subject_ctx,
+        on_behalf_of,
+        principals,
+    } = resolve_grant_subject(&grant, &DenyUnlabeledResolver);
 
     // The verifier: same trust-store-anchored construction as mint. Absent ⇒
     // fail closed (no unverified chain).
@@ -727,6 +757,7 @@ pub(crate) async fn exchange_ucan_grant_refresh(
         now,
         &request,
         subject_ctx.as_ref(),
+        on_behalf_of.as_ref(),
         true, // sender-bound: a fresh DPoP proof was just verified above
         sink,
     );
@@ -1175,8 +1206,16 @@ mod tests {
             ctx(Level::Secret, &[0], VerifiedKeyMaterial::PqHybrid),
         )]));
 
-        let (context, principals) = resolve_grant_subject(&grant, &resolver);
+        let ResolvedGrantSubject {
+            subject: context,
+            on_behalf_of,
+            principals,
+        } = resolve_grant_subject(&grant, &resolver);
         assert!(principals.act.is_none(), "root grant has no actor");
+        assert!(
+            on_behalf_of.is_none(),
+            "a single-principal grant records no delegator (audit on_behalf_of = None)"
+        );
         assert_eq!(principals.sub, subject_did);
         assert_eq!(context.map(|c| c.level()), Some(Level::Secret));
     }
@@ -1205,7 +1244,11 @@ mod tests {
             ),
         ]));
 
-        let (context, principals) = resolve_grant_subject(&grant, &resolver);
+        let ResolvedGrantSubject {
+            subject: context,
+            on_behalf_of,
+            principals,
+        } = resolve_grant_subject(&grant, &resolver);
         assert_eq!(principals.sub, user_did, "sub is the delegator");
         let act = principals.act.expect("delegation carries an actor");
         assert_eq!(act.sub, mcp_did, "act is the actor");
@@ -1213,6 +1256,17 @@ mod tests {
         let context = context.expect("both principals resolved ⇒ Some");
         assert_eq!(context.level(), Level::Confidential, "min level");
         assert_eq!(context.compartments(), comps(&[1]), "compartment intersection");
+        // The audit `on_behalf_of` carries the DELEGATOR (the user's own
+        // clearance), distinct from the met `subject` context above — this is
+        // the two-principal attribution (#445/#681): the met context is what the
+        // gates saw, the delegator is who the actor acted for.
+        let obo = on_behalf_of.expect("a delegated grant records its delegator");
+        assert_eq!(obo.level(), Level::Secret, "on_behalf_of is the delegator's own level");
+        assert_eq!(
+            obo.compartments(),
+            comps(&[0, 1]),
+            "on_behalf_of is the delegator's own compartments, not the meet"
+        );
     }
 
     /// The delegated derivation fails closed if EITHER principal is unresolved
@@ -1229,7 +1283,11 @@ mod tests {
             ctx(Level::Secret, &[0], VerifiedKeyMaterial::PqHybrid),
         )]));
 
-        let (context, principals) = resolve_grant_subject(&grant, &resolver);
+        let ResolvedGrantSubject {
+            subject: context,
+            on_behalf_of,
+            principals,
+        } = resolve_grant_subject(&grant, &resolver);
         assert!(
             context.is_none(),
             "missing actor clearance ⇒ deny (no default clearance)"
@@ -1237,6 +1295,9 @@ mod tests {
         // The principal split is still reported (the actor clearance is None),
         // but the None context makes evaluate_grant deny before any mint.
         assert!(principals.act.is_some());
+        // The delegator resolved, so it is still available for audit even though
+        // the decision itself fails closed on the unresolved actor.
+        assert!(on_behalf_of.is_some(), "the resolved delegator is still recorded");
     }
 
     /// Multi-hop delegation roots the delegator at the CHAIN ROOT issuer, not
@@ -1251,7 +1312,13 @@ mod tests {
 
         // No clearances resolved — we only assert the principal identities.
         let resolver = MapResolver(HashMap::new());
-        let (_ctx, principals) = resolve_grant_subject(&leaf, &resolver);
+        let ResolvedGrantSubject {
+            on_behalf_of, principals, ..
+        } = resolve_grant_subject(&leaf, &resolver);
+        assert!(
+            on_behalf_of.is_none(),
+            "no clearance resolved ⇒ no delegator context (fails closed on subject anyway)"
+        );
         assert_eq!(
             principals.sub,
             user.as_str(),
