@@ -14,6 +14,9 @@ crate-type = ["rlib"]  # rlib-only: OnceLock singletons must be shared workspace
 hyprstream-rpc = { path = "../hyprstream-rpc" }
 hyprstream-util = { path = "../hyprstream-util" }
 hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }
+# #524 P1 — placement directory ingestion: CAR parsing + MST walk + record
+# decoding (ai.hyprstream.placement.* lexicons).
+hyprstream-pds = { path = "../hyprstream-pds" }
 
 # Async runtime
 async-trait = { workspace = true }
@@ -36,8 +39,7 @@ tracing = { workspace = true }
 ed25519-dalek = { workspace = true }
 
 [dev-dependencies]
-# #431 — build/verify real CAR proofs in getRecord handler tests.
-hyprstream-pds = { path = "../hyprstream-pds" }
+# #431 / #524 — build/verify real CAR proofs in getRecord + placement tests.
 p256 = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
