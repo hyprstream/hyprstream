@@ -925,6 +925,55 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Xet Service Factory
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Factory for XetService (HuggingFace-XET CAS HTTP face, epic #654).
+///
+/// Dual-stack HTTP service that speaks the HF-XET CAS wire protocol so a standard
+/// xet-enabled git repo can point its CAS endpoint at hyprstream. It dials the
+/// `registry` service (reusing the authenticated `putBlob`/`getBlob` core) and
+/// holds no standing CAS write authority of its own. Reads come from the shared
+/// `cas_serve::CasStore`.
+#[service_factory("xet", depends_on = ["policy", "registry", "discovery"])]
+fn create_xet_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+    info!("Creating XetService");
+
+    use crate::services::{XetService, XetState};
+
+    let config = load_config();
+    let sk = ctx.service_signing_key("xet");
+
+    // Register this service's verifying key with PolicyService.
+    register_service_key(ctx, "xet", &sk)?;
+
+    // Dial the registry — the authenticated write core the HTTP face translates to.
+    let registry_vk = hyprstream_service::global_trust_store()
+        .resolve_one("registry")
+        .ok_or_else(|| anyhow::anyhow!("trust store has no registry key"))?;
+    let registry_client: RegistryClient =
+        RegistryClient::for_service(sk.clone(), registry_vk, service_token("xet"))?;
+
+    let state = XetState {
+        // Reads share the same content-addressed store the registry's getBlob uses.
+        store: cas_serve::CasStore::from_env(),
+        registry: Some(registry_client),
+        jwt_verifying_key: ctx.jwt_verifying_key(),
+        audience: config.xet.resource_url(),
+    };
+
+    let xet_service = XetService::new(
+        config.xet.clone(),
+        config.tls.clone(),
+        state,
+        ctx.transport("xet", SocketKind::Rep),
+        ctx.verifying_key(),
+    );
+
+    Ok(Box::new(xet_service))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Flight Service Factory
 // ═══════════════════════════════════════════════════════════════════════════════
 

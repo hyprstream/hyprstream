@@ -224,6 +224,8 @@ tokio-stream.workspace = true
 # Test-only: iroh substrate types used by `tests/policy_over_iroh.rs`.
 iroh.workspace = true
 rand.workspace = true
+# Test-only: drive the xet axum Router via `ServiceExt::oneshot` (auth-reject test).
+tower = { version = "0.5", features = ["util"] }
 
 [lints]
 workspace = true

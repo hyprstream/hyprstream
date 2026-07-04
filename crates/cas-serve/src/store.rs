@@ -177,6 +177,25 @@ impl CasStore {
         })
     }
 
+    /// Read the raw bytes of a single stored xorb, keyed by its hex xorb hash.
+    ///
+    /// Unlike [`CasStore::get_file_bytes`] this does NOT reconstruct a file: it
+    /// returns the exact on-disk `xorbs/default.{hash}` payload. This backs the
+    /// HuggingFace-XET `GET /get_xorb/{hash}/` wire route, which fetches an
+    /// individual xorb (not a reconstructed file). Callers wanting a byte
+    /// sub-range should slice the returned buffer (the store keeps whole xorbs).
+    pub async fn read_xorb(&self, xorb_hash_hex: &str) -> Result<Vec<u8>, StoreError> {
+        let _ = Request::parse_hash(xorb_hash_hex).map_err(StoreError::InvalidHash)?;
+        let path = self.xorb_path(xorb_hash_hex);
+        match tokio::fs::read(&path).await {
+            Ok(data) => Ok(data),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(StoreError::NotFound(format!("Xorb not found: {xorb_hash_hex}")))
+            }
+            Err(e) => Err(StoreError::Io(format!("Failed to read xorb: {e}"))),
+        }
+    }
+
     /// Load the `.mdb` shard, fetch each referenced xorb, and concatenate the
     /// segment bytes to reconstruct the file.
     async fn reassemble_from_shard(
