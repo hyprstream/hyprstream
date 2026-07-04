@@ -33,11 +33,17 @@
 //! ## Server-owned liveness (H1a hard requirement)
 //!
 //! A dead browser peer is NOT observable to the far side (a closed port yields
-//! no EOF), so a naive server would leak the 9P session forever. The inbound
-//! pump therefore OWNS liveness: it wraps every WS read in an **idle timeout**
-//! ([`IDLE_TIMEOUT`]); on idle, WS close, or WS error it drops the pump's write
-//! half, which surfaces as EOF to `serve_connection` and tears the session
-//! down cleanly. The server never relies on the client noticing.
+//! no EOF), so a naive server would leak the 9P session forever. The pump
+//! therefore OWNS liveness via **server-driven WS ping/pong keepalive**: it
+//! sends a WS `Ping` every [`PING_INTERVAL`] (30s) and closes the session after
+//! [`MAX_MISSED_PONGS`] consecutive unanswered pings (~90s). Closing drops the
+//! pump's write half, which surfaces as EOF to `serve_connection` and tears the
+//! 9P session down cleanly. A dead peer stops ponging and is reaped in ~90s; a
+//! HEALTHY-but-idle mount survives **indefinitely** because pongs keep flowing
+//! with zero 9P traffic (and any inbound frame — pong or data — counts as
+//! liveness). The client's WS `close` event is the browser's unmount trigger,
+//! so teardown stays 100% server-driven with no client keepalive. The server
+//! never relies on the client noticing.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -65,10 +71,13 @@ use crate::server::state::ServerState;
 /// the discovery document and the design doc's `wss://…/9p?ticket=…` example.
 const TICKET_PARAM: &str = "ticket";
 
-/// Idle timeout for a 9P-over-WS session. If no inbound WS message arrives
-/// within this window the server closes the session (see module docs:
-/// server-owned liveness — a dead browser peer is otherwise invisible).
-const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Interval between server-sent WS keepalive `Ping`s. A HEALTHY-but-idle mount
+/// stays alive indefinitely as long as the peer keeps ponging (see module docs).
+const PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Consecutive unanswered pings tolerated before the server reaps the session.
+/// With [`PING_INTERVAL`] = 30s this is ~90s of silence → dead-peer detection.
+const MAX_MISSED_PONGS: u32 = 3;
 
 /// Duplex buffer bridging the WS pump to the 9P serve core. Sized to comfortably
 /// hold a full negotiated 9P msize plus headroom.
@@ -166,7 +175,7 @@ pub async fn ninep_ws(
     let translator = Arc::new(Translator::from_mount(mount, subject));
 
     // No subprotocol negotiation: stock wanix connects with none.
-    ws.on_upgrade(move |socket| serve_9p_websocket(socket, translator, IDLE_TIMEOUT))
+    ws.on_upgrade(move |socket| serve_9p_websocket(socket, translator, PING_INTERVAL))
 }
 
 /// Validate a mount ticket to a session [`Subject`], reusing the server auth
@@ -224,20 +233,26 @@ fn build_export_mount(_state: &ServerState, _subject: &Subject) -> Arc<dyn Mount
 ///
 /// Bridges the WebSocket message stream to the transport-agnostic
 /// [`Translator::serve_connection`] core via an in-process duplex (mirroring
-/// `wanix serve`'s ws↔9p pump), and OWNS session liveness (see module docs).
+/// `wanix serve`'s ws↔9p pump), and OWNS session liveness via server-driven
+/// ping/pong keepalive (see module docs): a `Ping` every `ping_interval`, close
+/// after [`MAX_MISSED_PONGS`] consecutive unanswered pings; any inbound frame
+/// resets the miss counter, so a healthy-idle mount lives indefinitely.
 pub(crate) async fn serve_9p_websocket(
     socket: WebSocket,
     translator: Arc<Translator>,
-    idle: Duration,
+    ping_interval: Duration,
 ) {
     // `core_side` feeds the 9P serve core; `pump_side` is driven by the WS pump.
     let (core_side, pump_side) = tokio::io::duplex(DUPLEX_BUF);
     let (mut pump_rd, mut pump_wr) = split(pump_side);
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    // Outbound: framed 9P responses from the core → one WS binary frame each
-    // (mirrors `serve.go`'s 9p→ws goroutine: read length prefix, then payload).
-    let to_ws = tokio::spawn(async move {
+    // Outbound framing is not cancel-safe (a full 9P message is two `read_exact`
+    // reads: length prefix then payload), so it runs in its own task and feeds
+    // whole frames to the select loop over a channel. Mirrors `serve.go`'s
+    // 9p→ws goroutine.
+    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+    let frame_reader = tokio::spawn(async move {
         loop {
             let mut len = [0u8; 4];
             if pump_rd.read_exact(&mut len).await.is_err() {
@@ -252,54 +267,85 @@ pub(crate) async fn serve_9p_websocket(
             if pump_rd.read_exact(&mut frame[4..]).await.is_err() {
                 break;
             }
-            if ws_tx.send(Message::Binary(frame)).await.is_err() {
-                break; // peer gone
+            if frame_tx.send(frame).await.is_err() {
+                break; // select loop gone
+            }
+        }
+        // `frame_tx` drops → `frame_rx` closes → select loop learns the core ended.
+    });
+    // `frame_reader` (a JoinHandle) owns `pump_rd`; aborted after the session.
+
+    // The pump select loop owns the WS sink+stream, `pump_wr`, the keepalive
+    // ping interval, and the missed-pong counter — the single point that both
+    // forwards bytes and decides liveness.
+    let pump = async move {
+        let mut ping = tokio::time::interval(ping_interval);
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut missed_pongs: u32 = 0;
+        loop {
+            tokio::select! {
+                // Outbound 9P frame → one WS binary frame.
+                maybe = frame_rx.recv() => match maybe {
+                    Some(frame) => {
+                        if ws_tx.send(Message::Binary(frame)).await.is_err() {
+                            break; // peer gone
+                        }
+                    }
+                    None => break, // core closed (serve_connection ended)
+                },
+                // Inbound WS frame → core (binary), or liveness signal.
+                msg = ws_rx.next() => match msg {
+                    None => break, // stream ended
+                    Some(Err(e)) => {
+                        debug!(error = %e, "9P WS read error; closing");
+                        break;
+                    }
+                    Some(Ok(m)) => {
+                        // ANY inbound frame (pong OR data) proves the peer is alive.
+                        missed_pongs = 0;
+                        match m {
+                            Message::Binary(bytes) => {
+                                if pump_wr.write_all(&bytes).await.is_err() {
+                                    break; // core gone
+                                }
+                            }
+                            Message::Close(_) => break,
+                            // Pong/Ping/Text carry no 9P payload; tungstenite
+                            // auto-replies to inbound Pings at the protocol layer.
+                            Message::Ping(_) | Message::Pong(_) | Message::Text(_) => {}
+                        }
+                    }
+                },
+                // Keepalive tick: send a Ping; reap the session after too many
+                // consecutive unanswered pings (dead peer).
+                _ = ping.tick() => {
+                    missed_pongs += 1;
+                    if missed_pongs >= MAX_MISSED_PONGS {
+                        info!(missed_pongs, "9P WS keepalive: peer missed pongs; closing");
+                        break;
+                    }
+                    if ws_tx.send(Message::Ping(Vec::new())).await.is_err() {
+                        break; // peer gone
+                    }
+                }
             }
         }
         let _ = ws_tx.close().await;
-    });
-
-    // Inbound: WS binary frames → core (raw bytes; the core reframes). Owns
-    // liveness — an idle/closed/errored peer drops `pump_wr`, EOF-ing the core.
-    let inbound = async move {
-        loop {
-            match tokio::time::timeout(idle, ws_rx.next()).await {
-                Err(_) => {
-                    info!("9P WS session idle timeout; closing");
-                    break;
-                }
-                Ok(None) => break, // stream ended
-                Ok(Some(Err(e))) => {
-                    debug!(error = %e, "9P WS read error; closing");
-                    break;
-                }
-                Ok(Some(Ok(msg))) => match msg {
-                    Message::Binary(bytes) => {
-                        if pump_wr.write_all(&bytes).await.is_err() {
-                            break; // core gone
-                        }
-                    }
-                    Message::Close(_) => break,
-                    // Text/Ping/Pong are not 9P payload; ignore (axum auto-Pongs Pings).
-                    Message::Ping(_) | Message::Pong(_) | Message::Text(_) => {}
-                },
-            }
-        }
         // `pump_wr` drops here → core read half sees EOF → serve_connection ends.
     };
 
-    // Run the core and the inbound pump concurrently. serve_connection returns
-    // on EOF (inbound drop) or a fatal 9P framing/write error; either way we
-    // then abort the outbound task.
+    // Run the core and the pump concurrently. serve_connection returns on EOF
+    // (pump drop) or a fatal 9P framing/write error; either way we then reap the
+    // outbound frame reader.
     tokio::select! {
         r = translator.serve_connection(core_side) => {
             if let Err(e) = r {
                 debug!(error = %e, "9P WS serve loop ended with error");
             }
         }
-        _ = inbound => {}
+        _ = pump => {}
     }
-    to_ws.abort();
+    frame_reader.abort();
 }
 
 #[cfg(test)]
