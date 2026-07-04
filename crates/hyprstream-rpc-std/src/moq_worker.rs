@@ -39,14 +39,15 @@
 //! headers are already set by the `crossOriginIsolation()` Vite plugin in the
 //! www-cyberdione-ai frontend.
 //!
-//! # moq-net Sync status
+//! # moq-net on wasm
 //!
-//! `moq-net 0.1.8` requires `Session: Send + Sync`. `web_sys::WebTransport` is
-//! `!Sync`. The worker infrastructure here is complete and ready; the actual
-//! moq subscribe/publish loop (`worker_moq_loop`) is stubbed pending either:
-//! a) upstream moq-net relaxing the Sync bound, or
-//! b) a local `[patch.crates-io]` fork with the one-line fix.
-//! Track: <https://github.com/hyprstream/hyprstream/issues/484>
+//! `moq-net` required `Session: Send + Sync` (rejecting a `!Sync`
+//! `web_sys::WebTransport` Session) and used real-path `tokio::time` (panics on
+//! wasm). Both are fixed on our fork (ewindisch/moq PR #1: Session cfg-split +
+//! `tokio::time`→`web_async::time` + producer-on-wasm), sourced via
+//! `[patch.crates-io]` until upstream merges. The subscribe loop
+//! ([`run_subscribe`]) is implemented against it.
+//! Track: <https://github.com/hyprstream/hyprstream/issues/719>
 
 #![cfg(target_arch = "wasm32")]
 
@@ -279,8 +280,8 @@ pub async fn moq_worker_main(sab: JsValue, reach_json: String) {
         return;
     }
 
-    // Main loop: receive subscribe commands from main, relay frames back.
-    // moq framing stub — full implementation pending moq-net Sync fix (#484).
+    // Main loop: receive subscribe commands from main, run the moq subscribe
+    // (`run_subscribe`) for each, relaying OBJECT frames back over DMA.
     loop {
         let raw = match dma.recv().await {
             Ok(r) => r,
