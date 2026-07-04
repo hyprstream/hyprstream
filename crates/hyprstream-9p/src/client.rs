@@ -4,15 +4,21 @@
 //! On wasm32, these would be backed by DMA ring buffers (SharedArrayBuffer).
 //! On native, these could be backed by pipes, TCP, or QUIC streams.
 
-use std::cell::Cell;
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 
 use crate::msg::{self, Qid, Response};
 
 /// Transport trait for sending/receiving 9P messages.
 ///
-/// Implementations provide the actual byte transport (DMA ring, pipe, etc.).
+/// Implementations provide the actual byte transport (DMA ring, socket, etc.).
 /// Messages are already length-prefixed by the 9P serializer.
-#[async_trait::async_trait(?Send)]
+///
+/// The trait is `Send` on native targets — so a socket-backed transport can back
+/// a `Send + Sync` [`Mount`](hyprstream_vfs::Mount) — and `?Send` on wasm32,
+/// where the DMA transport is single-threaded. This mirrors the `Mount` trait's
+/// own `cfg_attr` split.
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 pub trait P9Transport {
     /// Send a complete 9P message (including length prefix).
     async fn send(&self, data: &[u8]) -> anyhow::Result<()>;
@@ -25,10 +31,14 @@ pub trait P9Transport {
 ///
 /// Manages fid allocation, tag sequencing, and protocol handshake.
 /// All operations are async — the transport determines the actual I/O.
+/// The client uses atomic fid/tag counters (rather than `Cell`) so that
+/// `P9Client<T>` is `Send + Sync` whenever the transport is. That lets a native,
+/// socket-backed client back a `Send + Sync` VFS `Mount` served on real OS
+/// threads; on single-threaded wasm the atomics are equally correct.
 pub struct P9Client<T: P9Transport> {
     transport: T,
-    next_fid: Cell<u32>,
-    next_tag: Cell<u16>,
+    next_fid: AtomicU32,
+    next_tag: AtomicU16,
     root_fid: u32,
     #[allow(dead_code)]
     msize: u32,
@@ -39,8 +49,8 @@ impl<T: P9Transport> P9Client<T> {
     pub async fn connect(transport: T, uname: &str, aname: &str) -> anyhow::Result<Self> {
         let client = Self {
             transport,
-            next_fid: Cell::new(1), // 0 reserved for root
-            next_tag: Cell::new(1), // 0 is NOTAG
+            next_fid: AtomicU32::new(1), // 0 reserved for root
+            next_tag: AtomicU16::new(1), // 0 is NOTAG
             root_fid: 0,
             msize: 8192,
         };
@@ -79,16 +89,19 @@ impl<T: P9Transport> P9Client<T> {
     }
 
     fn alloc_fid(&self) -> u32 {
-        let fid = self.next_fid.get();
-        self.next_fid.set(fid.wrapping_add(1));
-        fid
+        // Returns the current value and post-increments; wraps like the prior
+        // `Cell` version (fid 0 is the root and only recurs after 2^32 walks).
+        self.next_fid.fetch_add(1, Ordering::Relaxed)
     }
 
     fn alloc_tag(&self) -> u16 {
-        let tag = self.next_tag.get();
-        self.next_tag.set(tag.wrapping_add(1));
-        if self.next_tag.get() == 0 { self.next_tag.set(1); } // skip NOTAG
-        tag
+        // Post-increment; skip NOTAG (0) if we wrap onto it.
+        let tag = self.next_tag.fetch_add(1, Ordering::Relaxed);
+        if tag == 0 {
+            self.next_tag.fetch_add(1, Ordering::Relaxed)
+        } else {
+            tag
+        }
     }
 
     /// Send a T-message and receive the R-message, checking for errors.
