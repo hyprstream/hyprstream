@@ -263,6 +263,23 @@ impl RafsStore {
     /// Download a blob using nydus-storage's Registry backend.
     ///
     /// This enables Dragonfly P2P when `blob_redirected_host` is configured.
+    ///
+    /// # Runtime-drop safety (#737)
+    ///
+    /// The nydus-storage `Registry` backend and its blob reader own an
+    /// **internal tokio runtime** (for their HTTP transport). tokio forbids
+    /// dropping a runtime from within another runtime's context — and that
+    /// context is thread-local, so it is present both inside an async task AND
+    /// inside a `spawn_blocking` pool thread (the pool thread still carries the
+    /// outer runtime handle). Constructing those nydus objects on a
+    /// `spawn_blocking` thread and letting them drop there therefore panics with
+    /// `Cannot drop a runtime in a context where blocking is not allowed` when
+    /// `download_blob` is called from any async caller.
+    ///
+    /// To stay safe we run the **entire** nydus create + download + drop on a
+    /// plain `std::thread` that has NO ambient tokio runtime, and ferry only the
+    /// final plain `Result` back over a `oneshot`. No nydus object ever crosses
+    /// back into the async context.
     async fn download_blob(
         &self,
         img_ref: &ImageReference,
@@ -277,58 +294,28 @@ impl RafsStore {
 
         // Create nydus-storage Registry backend config
         let registry_config = self.create_registry_config(img_ref, &blob_id, auth);
+        let dest_path = dest_path.to_path_buf();
 
-        // Create the registry backend - this is blocking, so spawn_blocking
-        let blob_id_clone = blob_id.clone();
-        let backend = tokio::task::spawn_blocking(move || {
-            Registry::new(&registry_config, Some(&blob_id_clone))
-                .map_err(|e| WorkerError::RafsError(format!("failed to create registry backend: {e:?}")))
-        })
-        .await
-        .map_err(|e| WorkerError::RafsError(format!("spawn_blocking failed: {e}")))??;
-
-        // Get a blob reader
-        let reader = backend
-            .get_reader(&blob_id)
-            .map_err(|e| WorkerError::RafsError(format!("failed to get blob reader: {e:?}")))?;
-
-        // Get blob size (we need to know the size for BlobBufReader)
-        let blob_size = reader
-            .blob_size()
-            .map_err(|e| WorkerError::RafsError(format!("failed to get blob size: {e:?}")))?;
-
-        // Create a buffered reader and download the blob
-        let dest_path_clone = dest_path.to_path_buf();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            // Use BlobBufReader for efficient buffered reading
-            let mut buf_reader = BlobBufReader::new(
-                1024 * 1024, // 1MB buffer
-                reader,
-                0,
-                blob_size,
-            );
-
-            // Create destination file
-            let mut file = std::fs::File::create(&dest_path_clone).map_err(|e| {
-                WorkerError::IoError(format!("failed to create blob file: {e}"))
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("rafs-blob-download".to_owned())
+            .spawn(move || {
+                // ALL nydus objects (backend, reader, buf_reader) are created,
+                // used, AND dropped inside this closure — on a thread with no
+                // ambient tokio runtime — so their internal runtime drops off
+                // any tokio context. Only the plain Result is sent back.
+                let result = download_blob_blocking(&registry_config, &blob_id, &dest_path);
+                let _ = tx.send(result);
+            })
+            .map_err(|e| {
+                WorkerError::RafsError(format!("failed to spawn blob download thread: {e}"))
             })?;
 
-            // Copy data
-            std::io::copy(&mut buf_reader, &mut file).map_err(|e| {
-                WorkerError::IoError(format!("failed to write blob: {e}"))
-            })?;
-
-            // Sync to disk
-            file.sync_all().map_err(|e| {
-                WorkerError::IoError(format!("failed to sync blob: {e}"))
-            })?;
-
-            Ok(())
-        })
-        .await
-        .map_err(|e| WorkerError::RafsError(format!("spawn_blocking failed: {e}")))??;
-
-        Ok(())
+        rx.await.map_err(|e| {
+            WorkerError::RafsError(format!(
+                "blob download thread exited without a result: {e}"
+            ))
+        })?
     }
 
     /// Create a nydus-storage RegistryConfig for a blob fetch.
@@ -740,6 +727,58 @@ impl RafsStore {
     }
 }
 
+/// Download a single blob to `dest_path` using nydus-storage's `Registry`
+/// backend, entirely synchronously.
+///
+/// This constructs and drops every nydus object (`Registry` backend, blob
+/// reader, `BlobBufReader`) locally. It MUST be called from a thread with no
+/// ambient tokio runtime — see [`RafsStore::download_blob`] and #737 — because
+/// those objects own an internal tokio runtime that panics if dropped inside a
+/// runtime context.
+fn download_blob_blocking(
+    registry_config: &RegistryConfig,
+    blob_id: &str,
+    dest_path: &Path,
+) -> Result<()> {
+    // Create the registry backend.
+    let backend = Registry::new(registry_config, Some(blob_id))
+        .map_err(|e| WorkerError::RafsError(format!("failed to create registry backend: {e:?}")))?;
+
+    // Get a blob reader.
+    let reader = backend
+        .get_reader(blob_id)
+        .map_err(|e| WorkerError::RafsError(format!("failed to get blob reader: {e:?}")))?;
+
+    // Get blob size (we need to know the size for BlobBufReader).
+    let blob_size = reader
+        .blob_size()
+        .map_err(|e| WorkerError::RafsError(format!("failed to get blob size: {e:?}")))?;
+
+    // Use BlobBufReader for efficient buffered reading.
+    let mut buf_reader = BlobBufReader::new(
+        1024 * 1024, // 1MB buffer
+        reader,
+        0,
+        blob_size,
+    );
+
+    // Create destination file.
+    let mut file = std::fs::File::create(dest_path)
+        .map_err(|e| WorkerError::IoError(format!("failed to create blob file: {e}")))?;
+
+    // Copy data.
+    std::io::copy(&mut buf_reader, &mut file)
+        .map_err(|e| WorkerError::IoError(format!("failed to write blob: {e}")))?;
+
+    // Sync to disk.
+    file.sync_all()
+        .map_err(|e| WorkerError::IoError(format!("failed to sync blob: {e}")))?;
+
+    Ok(())
+    // `backend` and `buf_reader` (which owns `reader`) drop here, on the caller's
+    // (non-tokio) thread — off any runtime context.
+}
+
 /// Convert digest to filesystem-safe filename
 ///
 /// `pub(crate)` so [`super::store_mount::RafsStoreMount`] (#652) can resolve a
@@ -834,5 +873,97 @@ inventory::submit! {
             let store = RafsStore::new(config.clone()).map_err(anyhow::Error::from)?;
             Ok(std::sync::Arc::new(store) as std::sync::Arc<dyn crate::image::store_trait::ImageStore>)
         },
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Regression tests (#737)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// These exercise the runtime-drop-safety of the blob download path. Before the
+// #737 fix, the nydus `Registry` backend (which owns an internal tokio runtime)
+// was created on a `spawn_blocking` thread and then dropped inside the async
+// `download_blob` context, panicking with:
+//   "Cannot drop a runtime in a context where blocking is not allowed."
+// Any of the tests below driving `download_blob` from a `#[tokio::test]` would
+// therefore PANIC (and fail) before the fix, and pass after it — the nydus
+// objects are now created and dropped on a plain `std::thread`.
+//
+// No reachable registry is required: we point the pull at an unreachable local
+// address so the download fails fast with a network error *after* the nydus
+// backend (the runtime-owning object) has been constructed and must be dropped.
+
+#[cfg(test)]
+mod runtime_drop_tests {
+    use super::*;
+    use crate::config::ImageConfig;
+
+    /// Build a `RafsStore` rooted in a fresh tempdir.
+    fn test_store(tmp: &std::path::Path) -> RafsStore {
+        let config = ImageConfig {
+            blobs_dir: tmp.join("blobs"),
+            bootstrap_dir: tmp.join("bootstrap"),
+            refs_dir: tmp.join("refs"),
+            cache_dir: tmp.join("cache"),
+            runtime_dir: tmp.join("run"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.blobs_dir).unwrap();
+        RafsStore::new(config).unwrap()
+    }
+
+    /// An `ImageReference` whose host refuses connections immediately, so the
+    /// blob download fails fast *after* the nydus backend is constructed.
+    fn unreachable_ref() -> ImageReference {
+        ImageReference {
+            // 127.0.0.1:1 (a privileged port nothing listens on) → connection
+            // refused, exercising the create+drop of the nydus backend without
+            // needing the network or a real registry.
+            host: "127.0.0.1:1".to_owned(),
+            repository: "library/does-not-exist".to_owned(),
+            reference: "latest".to_owned(),
+            is_digest: false,
+        }
+    }
+
+    /// Drive `download_blob` from a multi-threaded tokio runtime. Must return an
+    /// error (unreachable registry) rather than panicking on the nydus runtime
+    /// drop. Pre-#737 this panicked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn download_blob_does_not_panic_multi_thread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = test_store(tmp.path());
+        let img_ref = unreachable_ref();
+        let dest = store.blobs_dir().join("blob_out");
+
+        let res = store
+            .download_blob(&img_ref, "sha256:deadbeef", &dest, None)
+            .await;
+
+        // The point of the test is that we got HERE (a returned Result) instead
+        // of panicking with "Cannot drop a runtime ...".
+        assert!(
+            res.is_err(),
+            "expected an error pulling from an unreachable registry, got: {res:?}"
+        );
+    }
+
+    /// Same, but from a current-thread runtime — the flavor most likely to trip
+    /// the runtime-in-runtime drop rule.
+    #[tokio::test(flavor = "current_thread")]
+    async fn download_blob_does_not_panic_current_thread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = test_store(tmp.path());
+        let img_ref = unreachable_ref();
+        let dest = store.blobs_dir().join("blob_out");
+
+        let res = store
+            .download_blob(&img_ref, "sha256:deadbeef", &dest, None)
+            .await;
+
+        assert!(
+            res.is_err(),
+            "expected an error pulling from an unreachable registry, got: {res:?}"
+        );
     }
 }
