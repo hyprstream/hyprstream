@@ -6,9 +6,19 @@
 //! - Resolves `uses:` action steps through VFS `/bin/` ctl files
 //! - Evaluates `run:` script steps via TclShell on `spawn_blocking`
 //! - Propagates CancellationToken for cooperative cancellation
+//! - Routes each job through a [`JobScheduler`] (#527) — `runs_on:` +
+//!   `resources:` decide in-proc vs. a real P2-admitted sandbox reservation
+//!   (see `workflow::scheduler`); no scheduler configured (`None`, the
+//!   default) preserves the pre-#527 in-proc-only behavior exactly.
+//! - Honors `WorkflowConfig::max_concurrent_runs` (a run-admission semaphore,
+//!   distinct from `script_semaphore`'s per-job script concurrency) and
+//!   `job_timeout_secs`/`step_timeout_secs` (#521 — wired for real, not
+//!   superseded by P2: admission governs resource capacity/quota, this
+//!   governs wall-clock run/step duration, a different axis)
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -18,7 +28,10 @@ use hyprstream_workers_tcl::TclShell;
 // VFS proxy no longer needed — TclShell awaits namespace operations directly.
 use hyprstream_vfs::{Namespace, Subject};
 
+use crate::config::WorkflowConfig;
+
 use super::parser::{Job, Step, Workflow};
+use super::scheduler::{JobScheduler, Placement};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Result types (local to runner, not wire-format)
@@ -96,22 +109,63 @@ type RunnerResult<T> = std::result::Result<T, RunnerError>;
 /// Resolves action steps through VFS `/bin/` ctl files and evaluates
 /// script steps via TclShell on `spawn_blocking` threads. Concurrent
 /// script-executing jobs are capped by `script_semaphore`.
+///
+/// # Scheduling (#527)
+///
+/// Each job is routed through an optional [`JobScheduler`]: `runs_on:` +
+/// `resources:` decide in-proc execution (unchanged) vs. a real sandbox
+/// reservation acquired through the #525 P2 admission engine. With no
+/// scheduler configured (the default), every job runs in-proc exactly as
+/// before this change — no regression for existing callers.
+///
+/// # Run-level concurrency + timeouts (#521)
+///
+/// `run_semaphore` bounds concurrent workflow *runs* (`WorkflowConfig::
+/// max_concurrent_runs`) — a different axis from `script_semaphore`, which
+/// bounds concurrent script-executing *jobs* within/across runs.
+/// `job_timeout`/`step_timeout` (`job_timeout_secs`/`step_timeout_secs`) wrap
+/// job and step execution in `tokio::time::timeout`; a job's own
+/// `timeout-minutes:` overrides `job_timeout` when present.
 #[derive(Clone)]
 pub struct WorkflowRunner {
     ns: Arc<Namespace>,
     script_semaphore: Arc<Semaphore>,
+    run_semaphore: Arc<Semaphore>,
+    job_timeout: Duration,
+    step_timeout: Duration,
+    scheduler: Option<Arc<JobScheduler>>,
 }
 
 impl WorkflowRunner {
-    /// Create a new WorkflowRunner.
+    /// Create a new WorkflowRunner with `WorkflowConfig::default()` timeouts/
+    /// concurrency and no job scheduler (every job runs in-proc).
     ///
     /// * `ns` — the root namespace (mounts for `/bin/`, `/env/`, `/srv/`, etc.)
     /// * Default concurrency cap: 64 concurrent script-executing jobs.
     pub fn new(ns: Arc<Namespace>) -> Self {
+        Self::with_config(ns, &WorkflowConfig::default())
+    }
+
+    /// Create a WorkflowRunner honoring `config`'s `max_concurrent_runs` +
+    /// `job_timeout_secs`/`step_timeout_secs` (#521).
+    pub fn with_config(ns: Arc<Namespace>, config: &WorkflowConfig) -> Self {
         Self {
             ns,
             script_semaphore: Arc::new(Semaphore::new(64)),
+            // A zero-permit semaphore would deadlock every run forever;
+            // treat a misconfigured 0 as "at least 1" rather than a silent hang.
+            run_semaphore: Arc::new(Semaphore::new(config.max_concurrent_runs.max(1))),
+            job_timeout: Duration::from_secs(config.job_timeout_secs),
+            step_timeout: Duration::from_secs(config.step_timeout_secs),
+            scheduler: None,
         }
+    }
+
+    /// Attach a [`JobScheduler`] (#527): jobs whose `runs_on:` requests
+    /// isolation are placed onto its sandbox pool instead of running in-proc.
+    pub fn with_scheduler(mut self, scheduler: Arc<JobScheduler>) -> Self {
+        self.scheduler = Some(scheduler);
+        self
     }
 
     /// Run a complete workflow.
@@ -119,6 +173,9 @@ impl WorkflowRunner {
     /// Jobs are topologically sorted by `needs:` into execution waves.
     /// Independent jobs in each wave run concurrently. The `cancel` token
     /// is checked between waves and propagated to individual jobs.
+    ///
+    /// Bounded by `run_semaphore` (#521's `max_concurrent_runs`): a run that
+    /// can't get a permit waits here, honoring `cancel` while waiting.
     pub async fn run(
         &self,
         workflow: &Workflow,
@@ -128,6 +185,14 @@ impl WorkflowRunner {
     ) -> RunnerResult<WorkflowRunResult> {
         // Validate inputs: reject _-prefixed keys (provenance injection prevention).
         validate_inputs(&inputs)?;
+
+        // #521: bound concurrent workflow RUNS. Held for the whole run.
+        let _run_permit = tokio::select! {
+            permit = Arc::clone(&self.run_semaphore).acquire_owned() => {
+                permit.map_err(|_| RunnerError::Cancelled)?
+            }
+            _ = cancel.cancelled() => return Err(RunnerError::Cancelled),
+        };
 
         // Topological sort jobs into execution waves.
         let waves = topological_sort(&workflow.jobs)?;
@@ -150,6 +215,12 @@ impl WorkflowRunner {
                 };
                 let ns = Arc::clone(&self.ns);
                 let sem = Arc::clone(&self.script_semaphore);
+                let scheduler = self.scheduler.clone();
+                let job_timeout = job
+                    .timeout_minutes
+                    .map(|m| Duration::from_secs(u64::from(m) * 60))
+                    .unwrap_or(self.job_timeout);
+                let step_timeout = self.step_timeout;
                 let subject = subject.clone();
                 let cancel = cancel.clone();
                 let env = merge_env(&workflow.env, &job.env);
@@ -157,7 +228,10 @@ impl WorkflowRunner {
                 let name = job_name.clone();
 
                 join_set.spawn(async move {
-                    let result = run_job(ns, sem, &job, &name, env, &inputs, &subject, cancel).await;
+                    let result = run_job(
+                        ns, sem, scheduler, &job, &name, env, &inputs, &subject, cancel,
+                        job_timeout, step_timeout,
+                    ).await;
                     (name, result)
                 });
             }
@@ -209,11 +283,63 @@ impl WorkflowRunner {
 // Job execution
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Run a single job. Steps execute sequentially within a job.
-///
-/// For script steps (`run:`), a single TclShell is reused across all
-/// sequential steps in the same job (constructed inside `spawn_blocking`).
+/// Route `job` through the scheduler (#527), then run its steps within
+/// `job_timeout`, releasing the placement afterward regardless of outcome.
+#[allow(clippy::too_many_arguments)]
 async fn run_job(
+    ns: Arc<Namespace>,
+    semaphore: Arc<Semaphore>,
+    scheduler: Option<Arc<JobScheduler>>,
+    job: &Job,
+    job_name: &str,
+    env: HashMap<String, String>,
+    inputs: &HashMap<String, String>,
+    subject: &Subject,
+    cancel: CancellationToken,
+    job_timeout: Duration,
+    step_timeout: Duration,
+) -> RunnerResult<JobRunResult> {
+    // #527: decide + (if isolation is requested) acquire a sandbox
+    // reservation before running any steps. `None` scheduler ⇒ always
+    // in-proc (pre-#527 behavior, unchanged).
+    let placement = match &scheduler {
+        Some(scheduler) => scheduler
+            .place(job_name, &job.runs_on, &job.resources, subject)
+            .await
+            .map_err(|e| RunnerError::VfsError(format!("job placement failed: {e}")))?,
+        None => Placement::InProc,
+    };
+
+    // #521: bound job execution wall-clock time. A job's own
+    // `timeout-minutes:` already folded into `job_timeout` by the caller.
+    let outcome = tokio::time::timeout(
+        job_timeout,
+        run_job_steps(ns, semaphore, job, job_name, env, inputs, subject, cancel, step_timeout),
+    )
+    .await;
+
+    placement.release().await;
+
+    match outcome {
+        Ok(result) => result,
+        Err(_elapsed) => Ok(JobRunResult {
+            name: job_name.to_owned(),
+            success: false,
+            steps: vec![StepRunResult {
+                name: "<timeout>".to_owned(),
+                success: false,
+                output: format!("job timed out after {}s", job_timeout.as_secs()),
+            }],
+        }),
+    }
+}
+
+/// Execute a single job's steps sequentially. For script steps (`run:`), a
+/// single TclShell is reused across all sequential steps in the same job
+/// (constructed inside `spawn_blocking`). Each step is individually bounded
+/// by `step_timeout` (#521).
+#[allow(clippy::too_many_arguments)]
+async fn run_job_steps(
     ns: Arc<Namespace>,
     semaphore: Arc<Semaphore>,
     job: &Job,
@@ -222,6 +348,7 @@ async fn run_job(
     inputs: &HashMap<String, String>,
     subject: &Subject,
     cancel: CancellationToken,
+    step_timeout: Duration,
 ) -> RunnerResult<JobRunResult> {
     let mut step_results = Vec::new();
     let mut job_success = true;
@@ -304,10 +431,19 @@ async fn run_job(
                 .unwrap_or_else(|| format!("step-{}", i));
 
             if let Some(ref action) = step.uses {
-                // Action step — runs on async runtime.
-                let result =
-                    run_action_step(action, &step.with, &ns_for_actions, &subject_for_actions)
-                        .await;
+                // Action step — runs on async runtime, bounded by step_timeout (#521).
+                let result = match tokio::time::timeout(
+                    step_timeout,
+                    run_action_step(action, &step.with, &ns_for_actions, &subject_for_actions),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_elapsed) => Err(RunnerError::StepFailed(format!(
+                        "step timed out after {}s",
+                        step_timeout.as_secs()
+                    ))),
+                };
                 match result {
                     Ok(output) => {
                         step_results.push(StepRunResult {
@@ -347,15 +483,18 @@ async fn run_job(
                     job_success = false;
                     break;
                 }
-                match reply_rx.await {
-                    Ok(Ok(output)) => {
+                // Bounded by step_timeout (#521); on elapsed the reply is simply
+                // dropped — the shell thread will finish the eval on its own time
+                // and move on to the next queued script (or idle if none comes).
+                match tokio::time::timeout(step_timeout, reply_rx).await {
+                    Ok(Ok(Ok(output))) => {
                         step_results.push(StepRunResult {
                             name: step_name,
                             success: true,
                             output,
                         });
                     }
-                    Ok(Err(e)) => {
+                    Ok(Ok(Err(e))) => {
                         let failed = StepRunResult {
                             name: step_name,
                             success: false,
@@ -367,11 +506,20 @@ async fn run_job(
                             break;
                         }
                     }
-                    Err(_) => {
+                    Ok(Err(_)) => {
                         step_results.push(StepRunResult {
                             name: step_name,
                             success: false,
                             output: "TclShell thread panicked".into(),
+                        });
+                        job_success = false;
+                        break;
+                    }
+                    Err(_elapsed) => {
+                        step_results.push(StepRunResult {
+                            name: step_name,
+                            success: false,
+                            output: format!("step timed out after {}s", step_timeout.as_secs()),
                         });
                         job_success = false;
                         break;
@@ -396,7 +544,19 @@ async fn run_job(
                 .unwrap_or_else(|| format!("step-{}", i));
 
             if let Some(ref action) = step.uses {
-                let result = run_action_step(action, &step.with, &ns, subject).await;
+                // Bounded by step_timeout (#521).
+                let result = match tokio::time::timeout(
+                    step_timeout,
+                    run_action_step(action, &step.with, &ns, subject),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_elapsed) => Err(RunnerError::StepFailed(format!(
+                        "step timed out after {}s",
+                        step_timeout.as_secs()
+                    ))),
+                };
                 match result {
                     Ok(output) => {
                         step_results.push(StepRunResult {
@@ -883,6 +1043,113 @@ mod tests {
         async fn clunk(&self, _fid: Fid, _caller: &Subject) {}
     }
 
+    /// Ctl-pattern mount whose `write` actually awaits (`tokio::time::sleep`)
+    /// before answering "ok" — used to make `step_timeout`/`job_timeout`
+    /// (#521) deterministically fire in tests: a step routed through this
+    /// mount really pends, so `tokio::time::timeout` races it for real
+    /// instead of the inner future completing synchronously on first poll.
+    struct SlowMount {
+        delay: std::time::Duration,
+    }
+
+    struct SlowFid;
+
+    #[async_trait]
+    impl Mount for SlowMount {
+        async fn walk(&self, _components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
+            Ok(Fid::new(SlowFid))
+        }
+        async fn open(&self, _fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> {
+            Ok(())
+        }
+        async fn write(
+            &self,
+            _fid: &Fid,
+            _offset: u64,
+            _data: &[u8],
+            _caller: &Subject,
+        ) -> Result<u32, MountError> {
+            tokio::time::sleep(self.delay).await;
+            Ok(0)
+        }
+        async fn read(
+            &self,
+            _fid: &Fid,
+            offset: u64,
+            _count: u32,
+            _caller: &Subject,
+        ) -> Result<Vec<u8>, MountError> {
+            if offset == 0 {
+                Ok(b"ok".to_vec())
+            } else {
+                Ok(vec![])
+            }
+        }
+        async fn readdir(&self, _fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
+            Ok(vec![])
+        }
+        async fn stat(&self, _fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
+            Ok(Stat::unknown_qid(0, 0, String::new(), 0))
+        }
+        async fn clunk(&self, _fid: Fid, _caller: &Subject) {}
+    }
+
+    /// Ctl-pattern mount that tracks concurrently-in-flight `write` calls (for
+    /// the `max_concurrent_runs` / #521 test): bumps a shared counter, records
+    /// the observed peak, sleeps briefly (so overlapping calls actually
+    /// overlap), then decrements.
+    struct TrackingMount {
+        current: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+        delay: std::time::Duration,
+    }
+
+    struct TrackingFid;
+
+    #[async_trait]
+    impl Mount for TrackingMount {
+        async fn walk(&self, _components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
+            Ok(Fid::new(TrackingFid))
+        }
+        async fn open(&self, _fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> {
+            Ok(())
+        }
+        async fn write(
+            &self,
+            _fid: &Fid,
+            _offset: u64,
+            _data: &[u8],
+            _caller: &Subject,
+        ) -> Result<u32, MountError> {
+            use std::sync::atomic::Ordering;
+            let cur = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(cur, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            self.current.fetch_sub(1, Ordering::SeqCst);
+            Ok(0)
+        }
+        async fn read(
+            &self,
+            _fid: &Fid,
+            offset: u64,
+            _count: u32,
+            _caller: &Subject,
+        ) -> Result<Vec<u8>, MountError> {
+            if offset == 0 {
+                Ok(b"ok".to_vec())
+            } else {
+                Ok(vec![])
+            }
+        }
+        async fn readdir(&self, _fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
+            Ok(vec![])
+        }
+        async fn stat(&self, _fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
+            Ok(Stat::unknown_qid(0, 0, String::new(), 0))
+        }
+        async fn clunk(&self, _fid: Fid, _caller: &Subject) {}
+    }
+
     fn test_subject() -> Subject {
         Subject::new("test-runner")
     }
@@ -902,6 +1169,51 @@ mod tests {
         ns.mount("/config", config_mount).unwrap();
 
         Arc::new(ns)
+    }
+
+    fn make_namespace_with_slow_action(delay: std::time::Duration) -> Arc<Namespace> {
+        let mut ns = Namespace::new();
+        let bin_mount = Arc::new(SlowMount { delay });
+        ns.mount("/bin", bin_mount).unwrap();
+        Arc::new(ns)
+    }
+
+    fn make_namespace_with_tracking_action(
+        current: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+        delay: std::time::Duration,
+    ) -> Arc<Namespace> {
+        let mut ns = Namespace::new();
+        let bin_mount = Arc::new(TrackingMount {
+            current,
+            peak,
+            delay,
+        });
+        ns.mount("/bin", bin_mount).unwrap();
+        Arc::new(ns)
+    }
+
+    fn single_action_job(action: &str) -> Job {
+        Job {
+            runs_on: super::super::parser::RunsOn::Label("ubuntu".into()),
+            needs: None,
+            env: HashMap::new(),
+            steps: vec![Step {
+                name: Some("step".into()),
+                id: None,
+                uses: Some(action.to_owned()),
+                run: None,
+                shell: None,
+                working_directory: None,
+                with: HashMap::new(),
+                env: HashMap::new(),
+                condition: None,
+                continue_on_error: false,
+            }],
+            condition: None,
+            timeout_minutes: None,
+            resources: super::super::parser::JobResources::default(),
+        }
     }
 
     fn make_simple_workflow(jobs: HashMap<String, Job>) -> Workflow {
@@ -927,6 +1239,7 @@ mod tests {
                 steps: vec![],
                 condition: None,
                 timeout_minutes: None,
+                resources: super::super::parser::JobResources::default(),
             },
         );
         jobs.insert(
@@ -938,6 +1251,7 @@ mod tests {
                 steps: vec![],
                 condition: None,
                 timeout_minutes: None,
+                resources: super::super::parser::JobResources::default(),
             },
         );
 
@@ -958,6 +1272,7 @@ mod tests {
                 steps: vec![],
                 condition: None,
                 timeout_minutes: None,
+                resources: super::super::parser::JobResources::default(),
             },
         );
         jobs.insert(
@@ -969,6 +1284,7 @@ mod tests {
                 steps: vec![],
                 condition: None,
                 timeout_minutes: None,
+                resources: super::super::parser::JobResources::default(),
             },
         );
         jobs.insert(
@@ -980,6 +1296,7 @@ mod tests {
                 steps: vec![],
                 condition: None,
                 timeout_minutes: None,
+                resources: super::super::parser::JobResources::default(),
             },
         );
 
@@ -1002,6 +1319,7 @@ mod tests {
                 steps: vec![],
                 condition: None,
                 timeout_minutes: None,
+                resources: super::super::parser::JobResources::default(),
             },
         );
         jobs.insert(
@@ -1013,6 +1331,7 @@ mod tests {
                 steps: vec![],
                 condition: None,
                 timeout_minutes: None,
+                resources: super::super::parser::JobResources::default(),
             },
         );
 
@@ -1091,6 +1410,7 @@ mod tests {
                 }],
                 condition: None,
                 timeout_minutes: None,
+                resources: super::super::parser::JobResources::default(),
             },
         );
         jobs.insert(
@@ -1113,6 +1433,7 @@ mod tests {
                 }],
                 condition: None,
                 timeout_minutes: None,
+                resources: super::super::parser::JobResources::default(),
             },
         );
 
@@ -1161,6 +1482,7 @@ mod tests {
                 }],
                 condition: None,
                 timeout_minutes: None,
+                resources: super::super::parser::JobResources::default(),
             },
         );
 
@@ -1204,6 +1526,7 @@ mod tests {
                 }],
                 condition: None,
                 timeout_minutes: None,
+                resources: super::super::parser::JobResources::default(),
             },
         );
 
@@ -1247,6 +1570,7 @@ mod tests {
                 }],
                 condition: None,
                 timeout_minutes: None,
+                resources: super::super::parser::JobResources::default(),
             },
         );
         jobs.insert(
@@ -1269,6 +1593,7 @@ mod tests {
                 }],
                 condition: None,
                 timeout_minutes: None,
+                resources: super::super::parser::JobResources::default(),
             },
         );
 
@@ -1357,6 +1682,7 @@ mod tests {
                 ],
                 condition: None,
                 timeout_minutes: None,
+                resources: super::super::parser::JobResources::default(),
             },
         );
 
@@ -1415,6 +1741,7 @@ mod tests {
                 ],
                 condition: None,
                 timeout_minutes: None,
+                resources: super::super::parser::JobResources::default(),
             },
         );
 
@@ -1473,6 +1800,7 @@ mod tests {
                 ],
                 condition: None,
                 timeout_minutes: None,
+                resources: super::super::parser::JobResources::default(),
             },
         );
 
@@ -1488,5 +1816,119 @@ mod tests {
         assert_eq!(job.steps.len(), 2);
         // Second step should see the variable set by first step
         assert_eq!(job.steps[1].output, "hello");
+    }
+
+    // ── #521: run-level concurrency + job/step timeouts ──────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn step_timeout_fails_the_step_and_job() {
+        // The mount actually sleeps 2s; step_timeout of 1s must trip first.
+        let ns = make_namespace_with_slow_action(Duration::from_secs(2));
+        let config = WorkflowConfig {
+            step_timeout_secs: 1,
+            ..Default::default()
+        };
+        let runner = WorkflowRunner::with_config(ns, &config);
+
+        let mut jobs = HashMap::new();
+        jobs.insert("slow-job".to_owned(), single_action_job("slow/step"));
+        let workflow = make_simple_workflow(jobs);
+
+        let result = runner
+            .run(&workflow, HashMap::new(), &test_subject(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let job = &result.jobs["slow-job"];
+        assert!(!job.success);
+        assert!(
+            job.steps[0].output.contains("timed out"),
+            "expected a timeout message, got: {:?}",
+            job.steps[0].output
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_timeout_fails_the_whole_job() {
+        // step_timeout is generous; job_timeout (wrapping the whole job) is
+        // the one that must trip.
+        let ns = make_namespace_with_slow_action(Duration::from_secs(2));
+        let config = WorkflowConfig {
+            job_timeout_secs: 1,
+            step_timeout_secs: 600,
+            ..Default::default()
+        };
+        let runner = WorkflowRunner::with_config(ns, &config);
+
+        let mut jobs = HashMap::new();
+        jobs.insert("slow-job".to_owned(), single_action_job("slow/step"));
+        let workflow = make_simple_workflow(jobs);
+
+        let result = runner
+            .run(&workflow, HashMap::new(), &test_subject(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let job = &result.jobs["slow-job"];
+        assert!(!job.success);
+        assert_eq!(job.steps[0].name, "<timeout>");
+        assert!(job.steps[0].output.contains("job timed out"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn max_concurrent_runs_serializes_concurrent_runs() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let current = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let ns = make_namespace_with_tracking_action(
+            current.clone(),
+            peak.clone(),
+            Duration::from_millis(150),
+        );
+        let config = WorkflowConfig {
+            max_concurrent_runs: 1,
+            ..Default::default()
+        };
+        let runner = Arc::new(WorkflowRunner::with_config(ns, &config));
+
+        let make_workflow = || {
+            let mut jobs = HashMap::new();
+            jobs.insert("job".to_owned(), single_action_job("track/step"));
+            make_simple_workflow(jobs)
+        };
+
+        let r1 = {
+            let runner = Arc::clone(&runner);
+            let wf = make_workflow();
+            tokio::spawn(async move {
+                runner
+                    .run(&wf, HashMap::new(), &test_subject(), CancellationToken::new())
+                    .await
+            })
+        };
+        // Give r1 a head start so it acquires the sole run permit first.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let r2 = {
+            let runner = Arc::clone(&runner);
+            let wf = make_workflow();
+            tokio::spawn(async move {
+                runner
+                    .run(&wf, HashMap::new(), &test_subject(), CancellationToken::new())
+                    .await
+            })
+        };
+
+        let (res1, res2) = tokio::join!(r1, r2);
+        assert!(res1.unwrap().unwrap().success);
+        assert!(res2.unwrap().unwrap().success);
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "max_concurrent_runs=1 should have serialized the two runs, never letting \
+             both execute their job step at once"
+        );
     }
 }

@@ -27,6 +27,7 @@ use crate::generated::workflow_client::{
 };
 
 use super::runner::WorkflowRunner;
+use super::scheduler::JobScheduler;
 use super::subscription::WorkflowSubscription;
 use super::triggers::{EventHandler, EventTrigger, HandlerResult};
 use super::{RunId, WorkflowId, Workflow};
@@ -79,8 +80,12 @@ const SERVICE_NAME: &str = "workflow";
 
 /// WorkflowService handles workflow orchestration
 ///
-/// Discovers workflows from repositories, subscribes to events,
-/// and spawns containers via WorkerService.
+/// Discovers workflows from repositories, subscribes to events, and routes
+/// job execution through [`WorkflowRunner`] (#527): jobs requesting
+/// isolation via `runs_on:` are scheduled onto a sandbox through the #525 P2
+/// admission engine (`SandboxPool::acquire`, see `workflow::scheduler`);
+/// others run in-process over the VFS/Tcl bridge. There is no `WorkerService`
+/// dependency here — `WorkflowRunner` talks to `SandboxPool` directly.
 pub struct WorkflowService {
     /// Registered workflows
     workflows: RwLock<HashMap<WorkflowId, WorkflowDef>>,
@@ -154,9 +159,39 @@ impl WorkflowService {
     /// Set the VFS namespace for workflow execution.
     ///
     /// This creates a WorkflowRunner that resolves actions through `/bin/`
-    /// and evaluates scripts via TclShell.
+    /// and evaluates scripts via TclShell, using default
+    /// [`crate::config::WorkflowConfig`] timeouts/concurrency and no job
+    /// scheduler (every job runs in-proc — see [`Self::set_job_scheduler`]).
     pub fn set_namespace(&mut self, ns: Arc<Namespace>) {
         self.runner = Some(WorkflowRunner::new(ns));
+    }
+
+    /// Like [`Self::set_namespace`], but honors `config`'s
+    /// `max_concurrent_runs` / `job_timeout_secs` / `step_timeout_secs`
+    /// (#521) instead of defaults.
+    pub fn set_namespace_with_config(
+        &mut self,
+        ns: Arc<Namespace>,
+        config: &crate::config::WorkflowConfig,
+    ) {
+        self.runner = Some(WorkflowRunner::with_config(ns, config));
+    }
+
+    /// Attach a [`JobScheduler`] (#527) so jobs whose `runs_on:` requests
+    /// isolation are placed onto a real sandbox through the #525 P2
+    /// admission engine, instead of always running in-proc. Must be called
+    /// after `set_namespace`/`set_namespace_with_config`; a no-op (with a
+    /// warning) if no runner has been configured yet.
+    pub fn set_job_scheduler(&mut self, scheduler: Arc<JobScheduler>) {
+        match self.runner.take() {
+            Some(runner) => self.runner = Some(runner.with_scheduler(scheduler)),
+            None => {
+                tracing::warn!(
+                    "set_job_scheduler called before set_namespace — ignored; \
+                     call set_namespace/set_namespace_with_config first"
+                );
+            }
+        }
     }
 
     /// Set the authorization callback for policy checks.
