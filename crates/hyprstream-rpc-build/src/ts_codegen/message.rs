@@ -311,7 +311,15 @@ export class CapnpArena {
    * per-element byte width (ignored for bit-packed bool lists).
    * Returns the byte offset of the first element, or -1 for an empty list.
    */
-  private allocPrimitiveList(ptrIndex: number, count: number, elemSize: number, byteWidth: number): number {
+  /**
+   * Same as `allocPrimitiveList`, but takes the absolute byte offset of the
+   * pointer word to write (rather than deriving it from `ptrIndex` against
+   * the root pointer section). Shared by the root-level list setters and by
+   * `List(List(_))` nested-list setters, whose inner-list pointer lives at a
+   * computed offset inside the allocated outer pointer list, not at a
+   * `ptrIndex` slot.
+   */
+  private allocPrimitiveListAt(ptrOffset: number, count: number, elemSize: number, byteWidth: number): number {
     if (count === 0) return -1;
 
     this.alignAlloc();
@@ -320,7 +328,6 @@ export class CapnpArena {
     this.ensureCapacity(wordLen * WORD_SIZE);
 
     const targetOffset = this.allocOffset;
-    const ptrOffset = this.rootPtrOffset + ptrIndex * WORD_SIZE;
     const offsetWords = (targetOffset - ptrOffset - WORD_SIZE) / WORD_SIZE;
     const lo = ((offsetWords << 2) | 1) >>> 0;
     const hi = ((count << 3) | elemSize) >>> 0;
@@ -329,6 +336,37 @@ export class CapnpArena {
 
     this.allocOffset = targetOffset + wordLen * WORD_SIZE;
     return targetOffset;
+  }
+
+  private allocPrimitiveList(ptrIndex: number, count: number, elemSize: number, byteWidth: number): number {
+    return this.allocPrimitiveListAt(this.rootPtrOffset + ptrIndex * WORD_SIZE, count, elemSize, byteWidth);
+  }
+
+  /**
+   * Allocate the outer pointer-list structure for a `List(List(<inner>))`
+   * field at `ptrIndex`: a plain pointer list (element_size=6) with one
+   * pointer-word slot reserved per outer element. Each slot is later filled
+   * in by `allocPrimitiveListAt` when the corresponding inner list is
+   * written. Returns the byte offset of the first outer-element pointer
+   * slot, or -1 for an empty outer list (leaving the field's pointer null).
+   */
+  private allocNestedListOuter(ptrIndex: number, outerCount: number): number {
+    if (outerCount === 0) return -1;
+
+    this.alignAlloc();
+    this.ensureCapacity(outerCount * WORD_SIZE);
+
+    const outerBase = this.allocOffset;
+    this.allocOffset = outerBase + outerCount * WORD_SIZE;
+
+    const ptrOffset = this.rootPtrOffset + ptrIndex * WORD_SIZE;
+    const offsetWords = (outerBase - ptrOffset - WORD_SIZE) / WORD_SIZE;
+    const lo = ((offsetWords << 2) | 1) >>> 0;
+    const hi = ((outerCount << 3) | 6) >>> 0; // element_size=6: pointer list
+    this.buf.setUint32(ptrOffset, lo, true);
+    this.buf.setUint32(ptrOffset + 4, hi, true);
+
+    return outerBase;
   }
 
   setBoolList(ptrIndex: number, values: boolean[]): void {
@@ -397,6 +435,135 @@ export class CapnpArena {
     const base = this.allocPrimitiveList(ptrIndex, values.length, 5, 8);
     if (base < 0) return;
     for (let i = 0; i < values.length; i++) this.buf.setFloat64(base + i * 8, values[i], true);
+  }
+
+  // --- Nested List(List(<primitive>)) setters ---
+  //
+  // Each outer element is a pointer to an inner primitive list, allocated via
+  // `allocNestedListOuter` (outer pointer-list shell) + `allocPrimitiveListAt`
+  // (each inner list, written at the outer element's reserved pointer slot).
+
+  setBoolListList(ptrIndex: number, values: boolean[][]): void {
+    const outerBase = this.allocNestedListOuter(ptrIndex, values.length);
+    if (outerBase < 0) return;
+    for (let i = 0; i < values.length; i++) {
+      const inner = values[i];
+      if (inner.length === 0) continue;
+      const base = this.allocPrimitiveListAt(outerBase + i * WORD_SIZE, inner.length, 1, 0);
+      for (let j = 0; j < inner.length; j++) {
+        if (inner[j]) this.raw[base + (j >> 3)] |= 1 << (j & 7);
+      }
+    }
+  }
+
+  setUint8ListList(ptrIndex: number, values: number[][]): void {
+    const outerBase = this.allocNestedListOuter(ptrIndex, values.length);
+    if (outerBase < 0) return;
+    for (let i = 0; i < values.length; i++) {
+      const inner = values[i];
+      if (inner.length === 0) continue;
+      const base = this.allocPrimitiveListAt(outerBase + i * WORD_SIZE, inner.length, 2, 1);
+      for (let j = 0; j < inner.length; j++) this.buf.setUint8(base + j, inner[j]);
+    }
+  }
+
+  setInt8ListList(ptrIndex: number, values: number[][]): void {
+    const outerBase = this.allocNestedListOuter(ptrIndex, values.length);
+    if (outerBase < 0) return;
+    for (let i = 0; i < values.length; i++) {
+      const inner = values[i];
+      if (inner.length === 0) continue;
+      const base = this.allocPrimitiveListAt(outerBase + i * WORD_SIZE, inner.length, 2, 1);
+      for (let j = 0; j < inner.length; j++) this.buf.setInt8(base + j, inner[j]);
+    }
+  }
+
+  setUint16ListList(ptrIndex: number, values: number[][]): void {
+    const outerBase = this.allocNestedListOuter(ptrIndex, values.length);
+    if (outerBase < 0) return;
+    for (let i = 0; i < values.length; i++) {
+      const inner = values[i];
+      if (inner.length === 0) continue;
+      const base = this.allocPrimitiveListAt(outerBase + i * WORD_SIZE, inner.length, 3, 2);
+      for (let j = 0; j < inner.length; j++) this.buf.setUint16(base + j * 2, inner[j], true);
+    }
+  }
+
+  setInt16ListList(ptrIndex: number, values: number[][]): void {
+    const outerBase = this.allocNestedListOuter(ptrIndex, values.length);
+    if (outerBase < 0) return;
+    for (let i = 0; i < values.length; i++) {
+      const inner = values[i];
+      if (inner.length === 0) continue;
+      const base = this.allocPrimitiveListAt(outerBase + i * WORD_SIZE, inner.length, 3, 2);
+      for (let j = 0; j < inner.length; j++) this.buf.setInt16(base + j * 2, inner[j], true);
+    }
+  }
+
+  setUint32ListList(ptrIndex: number, values: number[][]): void {
+    const outerBase = this.allocNestedListOuter(ptrIndex, values.length);
+    if (outerBase < 0) return;
+    for (let i = 0; i < values.length; i++) {
+      const inner = values[i];
+      if (inner.length === 0) continue;
+      const base = this.allocPrimitiveListAt(outerBase + i * WORD_SIZE, inner.length, 4, 4);
+      for (let j = 0; j < inner.length; j++) this.buf.setUint32(base + j * 4, inner[j], true);
+    }
+  }
+
+  setInt32ListList(ptrIndex: number, values: number[][]): void {
+    const outerBase = this.allocNestedListOuter(ptrIndex, values.length);
+    if (outerBase < 0) return;
+    for (let i = 0; i < values.length; i++) {
+      const inner = values[i];
+      if (inner.length === 0) continue;
+      const base = this.allocPrimitiveListAt(outerBase + i * WORD_SIZE, inner.length, 4, 4);
+      for (let j = 0; j < inner.length; j++) this.buf.setInt32(base + j * 4, inner[j], true);
+    }
+  }
+
+  setFloat32ListList(ptrIndex: number, values: number[][]): void {
+    const outerBase = this.allocNestedListOuter(ptrIndex, values.length);
+    if (outerBase < 0) return;
+    for (let i = 0; i < values.length; i++) {
+      const inner = values[i];
+      if (inner.length === 0) continue;
+      const base = this.allocPrimitiveListAt(outerBase + i * WORD_SIZE, inner.length, 4, 4);
+      for (let j = 0; j < inner.length; j++) this.buf.setFloat32(base + j * 4, inner[j], true);
+    }
+  }
+
+  setUint64ListList(ptrIndex: number, values: bigint[][]): void {
+    const outerBase = this.allocNestedListOuter(ptrIndex, values.length);
+    if (outerBase < 0) return;
+    for (let i = 0; i < values.length; i++) {
+      const inner = values[i];
+      if (inner.length === 0) continue;
+      const base = this.allocPrimitiveListAt(outerBase + i * WORD_SIZE, inner.length, 5, 8);
+      for (let j = 0; j < inner.length; j++) this.buf.setBigUint64(base + j * 8, inner[j], true);
+    }
+  }
+
+  setInt64ListList(ptrIndex: number, values: bigint[][]): void {
+    const outerBase = this.allocNestedListOuter(ptrIndex, values.length);
+    if (outerBase < 0) return;
+    for (let i = 0; i < values.length; i++) {
+      const inner = values[i];
+      if (inner.length === 0) continue;
+      const base = this.allocPrimitiveListAt(outerBase + i * WORD_SIZE, inner.length, 5, 8);
+      for (let j = 0; j < inner.length; j++) this.buf.setBigInt64(base + j * 8, inner[j], true);
+    }
+  }
+
+  setFloat64ListList(ptrIndex: number, values: number[][]): void {
+    const outerBase = this.allocNestedListOuter(ptrIndex, values.length);
+    if (outerBase < 0) return;
+    for (let i = 0; i < values.length; i++) {
+      const inner = values[i];
+      if (inner.length === 0) continue;
+      const base = this.allocPrimitiveListAt(outerBase + i * WORD_SIZE, inner.length, 5, 8);
+      for (let j = 0; j < inner.length; j++) this.buf.setFloat64(base + j * 8, inner[j], true);
+    }
   }
 
   /**
@@ -664,7 +831,7 @@ export class StructBuilder {
    * `byteWidth` is the per-element byte width (ignored for bit-packed bool lists).
    * Returns the byte offset of the first element, or -1 for an empty list.
    */
-  private allocPrimitiveList(ptrIndex: number, count: number, elemSize: number, byteWidth: number): number {
+  private allocPrimitiveListAt(ptrOffset: number, count: number, elemSize: number, byteWidth: number): number {
     if (count === 0) return -1;
 
     this.msg._alignAlloc();
@@ -673,7 +840,6 @@ export class StructBuilder {
     this.msg._ensureCapacity(wordLen * WORD_SIZE);
 
     const targetOffset = this.msg._getAllocOffset();
-    const ptrOffset = this.ptrOffset + ptrIndex * WORD_SIZE;
     const offsetWords = (targetOffset - ptrOffset - WORD_SIZE) / WORD_SIZE;
     const lo = ((offsetWords << 2) | 1) >>> 0;
     const hi = ((count << 3) | elemSize) >>> 0;
@@ -682,6 +848,34 @@ export class StructBuilder {
 
     this.msg._setAllocOffset(targetOffset + wordLen * WORD_SIZE);
     return targetOffset;
+  }
+
+  private allocPrimitiveList(ptrIndex: number, count: number, elemSize: number, byteWidth: number): number {
+    return this.allocPrimitiveListAt(this.ptrOffset + ptrIndex * WORD_SIZE, count, elemSize, byteWidth);
+  }
+
+  /**
+   * Allocate the outer pointer-list structure for a `List(List(<inner>))`
+   * field at `ptrIndex` within this struct. See `CapnpArena.allocNestedListOuter`
+   * for the encoding this mirrors.
+   */
+  private allocNestedListOuter(ptrIndex: number, outerCount: number): number {
+    if (outerCount === 0) return -1;
+
+    this.msg._alignAlloc();
+    this.msg._ensureCapacity(outerCount * WORD_SIZE);
+
+    const outerBase = this.msg._getAllocOffset();
+    this.msg._setAllocOffset(outerBase + outerCount * WORD_SIZE);
+
+    const ptrOffset = this.ptrOffset + ptrIndex * WORD_SIZE;
+    const offsetWords = (outerBase - ptrOffset - WORD_SIZE) / WORD_SIZE;
+    const lo = ((offsetWords << 2) | 1) >>> 0;
+    const hi = ((outerCount << 3) | 6) >>> 0; // element_size=6: pointer list
+    this.msg._getBuf().setUint32(ptrOffset, lo, true);
+    this.msg._getBuf().setUint32(ptrOffset + 4, hi, true);
+
+    return outerBase;
   }
 
   setBoolList(ptrIndex: number, values: boolean[]): void {
@@ -751,6 +945,132 @@ export class StructBuilder {
     const base = this.allocPrimitiveList(ptrIndex, values.length, 5, 8);
     if (base < 0) return;
     for (let i = 0; i < values.length; i++) this.msg._getBuf().setFloat64(base + i * 8, values[i], true);
+  }
+
+  // --- Nested List(List(<primitive>)) setters (see CapnpArena's for docs) ---
+
+  setBoolListList(ptrIndex: number, values: boolean[][]): void {
+    const outerBase = this.allocNestedListOuter(ptrIndex, values.length);
+    if (outerBase < 0) return;
+    const raw = this.msg._getRaw();
+    for (let i = 0; i < values.length; i++) {
+      const inner = values[i];
+      if (inner.length === 0) continue;
+      const base = this.allocPrimitiveListAt(outerBase + i * WORD_SIZE, inner.length, 1, 0);
+      for (let j = 0; j < inner.length; j++) {
+        if (inner[j]) raw[base + (j >> 3)] |= 1 << (j & 7);
+      }
+    }
+  }
+
+  setUint8ListList(ptrIndex: number, values: number[][]): void {
+    const outerBase = this.allocNestedListOuter(ptrIndex, values.length);
+    if (outerBase < 0) return;
+    for (let i = 0; i < values.length; i++) {
+      const inner = values[i];
+      if (inner.length === 0) continue;
+      const base = this.allocPrimitiveListAt(outerBase + i * WORD_SIZE, inner.length, 2, 1);
+      for (let j = 0; j < inner.length; j++) this.msg._getBuf().setUint8(base + j, inner[j]);
+    }
+  }
+
+  setInt8ListList(ptrIndex: number, values: number[][]): void {
+    const outerBase = this.allocNestedListOuter(ptrIndex, values.length);
+    if (outerBase < 0) return;
+    for (let i = 0; i < values.length; i++) {
+      const inner = values[i];
+      if (inner.length === 0) continue;
+      const base = this.allocPrimitiveListAt(outerBase + i * WORD_SIZE, inner.length, 2, 1);
+      for (let j = 0; j < inner.length; j++) this.msg._getBuf().setInt8(base + j, inner[j]);
+    }
+  }
+
+  setUint16ListList(ptrIndex: number, values: number[][]): void {
+    const outerBase = this.allocNestedListOuter(ptrIndex, values.length);
+    if (outerBase < 0) return;
+    for (let i = 0; i < values.length; i++) {
+      const inner = values[i];
+      if (inner.length === 0) continue;
+      const base = this.allocPrimitiveListAt(outerBase + i * WORD_SIZE, inner.length, 3, 2);
+      for (let j = 0; j < inner.length; j++) this.msg._getBuf().setUint16(base + j * 2, inner[j], true);
+    }
+  }
+
+  setInt16ListList(ptrIndex: number, values: number[][]): void {
+    const outerBase = this.allocNestedListOuter(ptrIndex, values.length);
+    if (outerBase < 0) return;
+    for (let i = 0; i < values.length; i++) {
+      const inner = values[i];
+      if (inner.length === 0) continue;
+      const base = this.allocPrimitiveListAt(outerBase + i * WORD_SIZE, inner.length, 3, 2);
+      for (let j = 0; j < inner.length; j++) this.msg._getBuf().setInt16(base + j * 2, inner[j], true);
+    }
+  }
+
+  setUint32ListList(ptrIndex: number, values: number[][]): void {
+    const outerBase = this.allocNestedListOuter(ptrIndex, values.length);
+    if (outerBase < 0) return;
+    for (let i = 0; i < values.length; i++) {
+      const inner = values[i];
+      if (inner.length === 0) continue;
+      const base = this.allocPrimitiveListAt(outerBase + i * WORD_SIZE, inner.length, 4, 4);
+      for (let j = 0; j < inner.length; j++) this.msg._getBuf().setUint32(base + j * 4, inner[j], true);
+    }
+  }
+
+  setInt32ListList(ptrIndex: number, values: number[][]): void {
+    const outerBase = this.allocNestedListOuter(ptrIndex, values.length);
+    if (outerBase < 0) return;
+    for (let i = 0; i < values.length; i++) {
+      const inner = values[i];
+      if (inner.length === 0) continue;
+      const base = this.allocPrimitiveListAt(outerBase + i * WORD_SIZE, inner.length, 4, 4);
+      for (let j = 0; j < inner.length; j++) this.msg._getBuf().setInt32(base + j * 4, inner[j], true);
+    }
+  }
+
+  setFloat32ListList(ptrIndex: number, values: number[][]): void {
+    const outerBase = this.allocNestedListOuter(ptrIndex, values.length);
+    if (outerBase < 0) return;
+    for (let i = 0; i < values.length; i++) {
+      const inner = values[i];
+      if (inner.length === 0) continue;
+      const base = this.allocPrimitiveListAt(outerBase + i * WORD_SIZE, inner.length, 4, 4);
+      for (let j = 0; j < inner.length; j++) this.msg._getBuf().setFloat32(base + j * 4, inner[j], true);
+    }
+  }
+
+  setUint64ListList(ptrIndex: number, values: bigint[][]): void {
+    const outerBase = this.allocNestedListOuter(ptrIndex, values.length);
+    if (outerBase < 0) return;
+    for (let i = 0; i < values.length; i++) {
+      const inner = values[i];
+      if (inner.length === 0) continue;
+      const base = this.allocPrimitiveListAt(outerBase + i * WORD_SIZE, inner.length, 5, 8);
+      for (let j = 0; j < inner.length; j++) this.msg._getBuf().setBigUint64(base + j * 8, inner[j], true);
+    }
+  }
+
+  setInt64ListList(ptrIndex: number, values: bigint[][]): void {
+    const outerBase = this.allocNestedListOuter(ptrIndex, values.length);
+    if (outerBase < 0) return;
+    for (let i = 0; i < values.length; i++) {
+      const inner = values[i];
+      if (inner.length === 0) continue;
+      const base = this.allocPrimitiveListAt(outerBase + i * WORD_SIZE, inner.length, 5, 8);
+      for (let j = 0; j < inner.length; j++) this.msg._getBuf().setBigInt64(base + j * 8, inner[j], true);
+    }
+  }
+
+  setFloat64ListList(ptrIndex: number, values: number[][]): void {
+    const outerBase = this.allocNestedListOuter(ptrIndex, values.length);
+    if (outerBase < 0) return;
+    for (let i = 0; i < values.length; i++) {
+      const inner = values[i];
+      if (inner.length === 0) continue;
+      const base = this.allocPrimitiveListAt(outerBase + i * WORD_SIZE, inner.length, 5, 8);
+      for (let j = 0; j < inner.length; j++) this.msg._getBuf().setFloat64(base + j * 8, inner[j], true);
+    }
   }
 
   /**
@@ -1219,6 +1539,112 @@ export class CapnpReader {
     return this.readPrimitiveList(ptrIndex, 5, 8, (o) => this.buf.getFloat64(o, true));
   }
 
+  /**
+   * Read a `List(List(<inner>))` field: a pointer list whose elements are
+   * themselves primitive lists (List(Bool)/List(UIntN)/List(IntN)/List(FloatN)).
+   * Mirrors `readPrimitiveList`, resolving one extra level of pointer
+   * indirection per outer element. Supports both the canonical pointer-list
+   * outer encoding (element_size=6) and composite (element_size=7, used when
+   * the outer list happens to be optimized as a single-pointer struct list).
+   * An outer element whose inner pointer is null, or whose encoded element
+   * size doesn't match `innerElemSize`, reads as `[]` for that element.
+   */
+  private readNestedPrimitiveList<T>(
+    ptrIndex: number,
+    innerElemSize: number,
+    innerByteWidth: number,
+    readInner: (byteOffset: number, bitIndex: number) => T,
+  ): T[][] {
+    const ptrOffset = this.rootPtrOffset + ptrIndex * WORD_SIZE;
+    const resolved = this.resolvePtr(ptrOffset);
+    if (!resolved) return [];
+    const { lo, hi, offset } = resolved;
+    if ((lo & 3) !== 1) return [];
+
+    const offsetWords = (lo >> 2) | 0;
+    const outerElementSize = hi & 7;
+    const targetOffset = offset + WORD_SIZE + offsetWords * WORD_SIZE;
+
+    let outerCount: number;
+    let outerBase: number;
+    if (outerElementSize === 6) {
+      outerCount = hi >>> 3;
+      outerBase = targetOffset;
+    } else if (outerElementSize === 7) {
+      const tagLo = this.buf.getUint32(targetOffset, true);
+      outerCount = (tagLo >> 2) | 0;
+      outerBase = targetOffset + WORD_SIZE;
+    } else {
+      return [];
+    }
+
+    const results: T[][] = [];
+    for (let i = 0; i < outerCount; i++) {
+      const elemPtrOffset = outerBase + i * WORD_SIZE;
+      const elemResolved = this.resolvePtr(elemPtrOffset);
+      if (!elemResolved) { results.push([]); continue; }
+      const { lo: iLo, hi: iHi, offset: iOffset } = elemResolved;
+      if ((iLo & 3) !== 1 || (iHi & 7) !== innerElemSize) { results.push([]); continue; }
+      const iOffsetWords = (iLo >> 2) | 0;
+      const innerTarget = iOffset + WORD_SIZE + iOffsetWords * WORD_SIZE;
+      const innerCount = iHi >>> 3;
+      const inner: T[] = [];
+      for (let j = 0; j < innerCount; j++) {
+        inner.push(
+          innerByteWidth === 0
+            ? readInner(innerTarget + (j >> 3), j & 7)
+            : readInner(innerTarget + j * innerByteWidth, 0),
+        );
+      }
+      results.push(inner);
+    }
+    return results;
+  }
+
+  getBoolListList(ptrIndex: number): boolean[][] {
+    return this.readNestedPrimitiveList(ptrIndex, 1, 0, (byteOffset, bitIndex) => (this.raw[byteOffset] & (1 << bitIndex)) !== 0);
+  }
+
+  getUint8ListList(ptrIndex: number): number[][] {
+    return this.readNestedPrimitiveList(ptrIndex, 2, 1, (o) => this.buf.getUint8(o));
+  }
+
+  getInt8ListList(ptrIndex: number): number[][] {
+    return this.readNestedPrimitiveList(ptrIndex, 2, 1, (o) => this.buf.getInt8(o));
+  }
+
+  getUint16ListList(ptrIndex: number): number[][] {
+    return this.readNestedPrimitiveList(ptrIndex, 3, 2, (o) => this.buf.getUint16(o, true));
+  }
+
+  getInt16ListList(ptrIndex: number): number[][] {
+    return this.readNestedPrimitiveList(ptrIndex, 3, 2, (o) => this.buf.getInt16(o, true));
+  }
+
+  getUint32ListList(ptrIndex: number): number[][] {
+    return this.readNestedPrimitiveList(ptrIndex, 4, 4, (o) => this.buf.getUint32(o, true));
+  }
+
+  getInt32ListList(ptrIndex: number): number[][] {
+    return this.readNestedPrimitiveList(ptrIndex, 4, 4, (o) => this.buf.getInt32(o, true));
+  }
+
+  getFloat32ListList(ptrIndex: number): number[][] {
+    return this.readNestedPrimitiveList(ptrIndex, 4, 4, (o) => this.buf.getFloat32(o, true));
+  }
+
+  getUint64ListList(ptrIndex: number): bigint[][] {
+    return this.readNestedPrimitiveList(ptrIndex, 5, 8, (o) => this.buf.getBigUint64(o, true));
+  }
+
+  getInt64ListList(ptrIndex: number): bigint[][] {
+    return this.readNestedPrimitiveList(ptrIndex, 5, 8, (o) => this.buf.getBigInt64(o, true));
+  }
+
+  getFloat64ListList(ptrIndex: number): number[][] {
+    return this.readNestedPrimitiveList(ptrIndex, 5, 8, (o) => this.buf.getFloat64(o, true));
+  }
+
   /** Read a List(Struct) composite list pointer. Returns StructReader[] using wire-format shape from tag word. */
   getStructList(ptrIndex: number, _dataWords: number, _ptrWords: number): StructReader[] {
     const ptrOffset = this.rootPtrOffset + ptrIndex * WORD_SIZE;
@@ -1515,6 +1941,106 @@ export class StructReader {
 
   getFloat64List(ptrIndex: number): number[] {
     return this.readPrimitiveList(ptrIndex, 5, 8, (o) => this.buf.getFloat64(o, true));
+  }
+
+  /**
+   * Read a `List(List(<inner>))` field within this struct. See
+   * `CapnpReader.readNestedPrimitiveList` for the encoding this mirrors.
+   */
+  private readNestedPrimitiveList<T>(
+    ptrIndex: number,
+    innerElemSize: number,
+    innerByteWidth: number,
+    readInner: (byteOffset: number, bitIndex: number) => T,
+  ): T[][] {
+    const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
+    const resolved = this.resolvePtr(ptrOffset);
+    if (!resolved) return [];
+    const { lo, hi, offset } = resolved;
+    if ((lo & 3) !== 1) return [];
+
+    const offsetWords = (lo >> 2) | 0;
+    const outerElementSize = hi & 7;
+    const targetOffset = offset + WORD_SIZE + offsetWords * WORD_SIZE;
+
+    let outerCount: number;
+    let outerBase: number;
+    if (outerElementSize === 6) {
+      outerCount = hi >>> 3;
+      outerBase = targetOffset;
+    } else if (outerElementSize === 7) {
+      const tagLo = this.buf.getUint32(targetOffset, true);
+      outerCount = (tagLo >> 2) | 0;
+      outerBase = targetOffset + WORD_SIZE;
+    } else {
+      return [];
+    }
+
+    const results: T[][] = [];
+    for (let i = 0; i < outerCount; i++) {
+      const elemPtrOffset = outerBase + i * WORD_SIZE;
+      const elemResolved = this.resolvePtr(elemPtrOffset);
+      if (!elemResolved) { results.push([]); continue; }
+      const { lo: iLo, hi: iHi, offset: iOffset } = elemResolved;
+      if ((iLo & 3) !== 1 || (iHi & 7) !== innerElemSize) { results.push([]); continue; }
+      const iOffsetWords = (iLo >> 2) | 0;
+      const innerTarget = iOffset + WORD_SIZE + iOffsetWords * WORD_SIZE;
+      const innerCount = iHi >>> 3;
+      const inner: T[] = [];
+      for (let j = 0; j < innerCount; j++) {
+        inner.push(
+          innerByteWidth === 0
+            ? readInner(innerTarget + (j >> 3), j & 7)
+            : readInner(innerTarget + j * innerByteWidth, 0),
+        );
+      }
+      results.push(inner);
+    }
+    return results;
+  }
+
+  getBoolListList(ptrIndex: number): boolean[][] {
+    return this.readNestedPrimitiveList(ptrIndex, 1, 0, (byteOffset, bitIndex) => (this.raw[byteOffset] & (1 << bitIndex)) !== 0);
+  }
+
+  getUint8ListList(ptrIndex: number): number[][] {
+    return this.readNestedPrimitiveList(ptrIndex, 2, 1, (o) => this.buf.getUint8(o));
+  }
+
+  getInt8ListList(ptrIndex: number): number[][] {
+    return this.readNestedPrimitiveList(ptrIndex, 2, 1, (o) => this.buf.getInt8(o));
+  }
+
+  getUint16ListList(ptrIndex: number): number[][] {
+    return this.readNestedPrimitiveList(ptrIndex, 3, 2, (o) => this.buf.getUint16(o, true));
+  }
+
+  getInt16ListList(ptrIndex: number): number[][] {
+    return this.readNestedPrimitiveList(ptrIndex, 3, 2, (o) => this.buf.getInt16(o, true));
+  }
+
+  getUint32ListList(ptrIndex: number): number[][] {
+    return this.readNestedPrimitiveList(ptrIndex, 4, 4, (o) => this.buf.getUint32(o, true));
+  }
+
+  getInt32ListList(ptrIndex: number): number[][] {
+    return this.readNestedPrimitiveList(ptrIndex, 4, 4, (o) => this.buf.getInt32(o, true));
+  }
+
+  getFloat32ListList(ptrIndex: number): number[][] {
+    return this.readNestedPrimitiveList(ptrIndex, 4, 4, (o) => this.buf.getFloat32(o, true));
+  }
+
+  getUint64ListList(ptrIndex: number): bigint[][] {
+    return this.readNestedPrimitiveList(ptrIndex, 5, 8, (o) => this.buf.getBigUint64(o, true));
+  }
+
+  getInt64ListList(ptrIndex: number): bigint[][] {
+    return this.readNestedPrimitiveList(ptrIndex, 5, 8, (o) => this.buf.getBigInt64(o, true));
+  }
+
+  getFloat64ListList(ptrIndex: number): number[][] {
+    return this.readNestedPrimitiveList(ptrIndex, 5, 8, (o) => this.buf.getFloat64(o, true));
   }
 
   getStructList(ptrIndex: number, _dataWords: number, _ptrWords: number): StructReader[] {
