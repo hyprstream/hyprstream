@@ -114,7 +114,10 @@ pub use label::{
     Assurance, Compartment, CompartmentSet, Level, SecurityLabel, MAX_COMPARTMENTS,
 };
 pub use lattice::{LabelError, Lattice, LatticeCodecError, LatticeDecodeError, LatticeVersion};
-pub use manifest::{ContentBoundLabel, LabeledObject, StaticNodeLabel};
+pub use manifest::{
+    bind_time_label, import_label, ContentBoundLabel, LabeledObject, ObjectLabelResolver,
+    ObjectRef, StaticNodeLabel,
+};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

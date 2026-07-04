@@ -101,6 +101,94 @@ impl LabeledObject for StaticNodeLabel {
     }
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Object-label RESOLUTION seam (#699, epic #547 activation prerequisite)
+// ────────────────────────────────────────────────────────────────────────────
+//
+// `LabeledObject` (above) answers "what is THIS object's label" once you
+// already hold an object. The reference monitor doesn't hold objects — it
+// holds a *walked reference* (a path, or a CID) and needs to resolve THAT to
+// a label before it can even construct the `ObjectCtx` the PDP evaluates.
+// `ObjectLabelResolver` is that keyed lookup, ratified as ticket #699's scope
+// item 2 ("An ObjectLabelResolver trait keyed on the walked path / CID that
+// the PEP calls before decide").
+//
+// This module intentionally does NOT wire a concrete resolver against the
+// 9P/VFS `Mount`/`Namespace` types (`hyprstream-vfs`) — that wiring is S2/
+// #568's job (the generated-mount PEP), and this crate is platform-
+// independent by design (no `hyprstream-vfs` dependency, so it keeps
+// compiling for wasm). What lands here is the seam plus the **clamp
+// invariants** ratified alongside #699's carriers, which are pure functions
+// over `SecurityLabel` with no I/O or VFS dependency at all.
+
+/// A reference to the object being labeled, as available to whatever calls
+/// [`ObjectLabelResolver::resolve`] — before any object bytes are read. Mirrors
+/// the two carriers #699 actually has data for at this layer: a walked path
+/// (matches `Mount::walk`'s `&[&str]` component slice in `hyprstream-vfs`,
+/// without this crate depending on that crate) or a content identifier (a
+/// manifest CID / CAS hash).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ObjectRef<'a> {
+    /// Path components of a walked object (schema/synthetic mount nodes).
+    Path(&'a [&'a str]),
+    /// Content identifier of a content-addressed object (CAS manifest).
+    Cid(&'a [u8]),
+}
+
+/// The keyed seam the reference monitor (S2/#568) calls **before** constructing
+/// an `ObjectCtx` for the PDP: "resolve this walked reference to its security
+/// label." Distinct from [`LabeledObject`] (which answers for an object you
+/// already hold) — this answers for a reference you are about to walk.
+///
+/// `None` ⇒ **unresolvable** ⇒ the monitor MUST deny (design §1 invariant 2,
+/// same "no unlabeled-default-allow" rule as [`LabeledObject::security_label`]).
+/// Implementors must NOT manufacture a permissive default.
+pub trait ObjectLabelResolver {
+    /// Resolve `object` to its security label, or `None` if unresolvable.
+    fn resolve(&self, object: ObjectRef<'_>) -> Option<SecurityLabel>;
+}
+
+/// Bind-time label clamp (#699 carrier c, D2 amendment ratified 2026-07-03):
+/// a client-controlled mount (the plan9 model — users compose their own
+/// namespaces) can label what it serves *up* but never *down below what it
+/// can read*, or a subject could read data at a high clearance through its own
+/// access and re-export it labeled low through its own mount — declassifying
+/// by re-serving.
+///
+/// `effective = join(binder_floor, declared)`. `join` (BLP least-upper-bound:
+/// max level, max assurance requirement, union of compartments) can only make
+/// the effective label *more* restrictive than either input, never less — so
+/// this is a floor, not a negotiation: `effective ⊒ binder_floor` and
+/// `effective ⊒ declared` always hold.
+///
+/// `binder_floor` is the binding subject's own [`super::context::SecurityContext`]
+/// clearance (what `Namespace::bind_mount`'s threaded `Subject` resolves to);
+/// `declared` is the label the mount asserts for what it serves.
+#[must_use]
+pub fn bind_time_label(binder_floor: SecurityLabel, declared: SecurityLabel) -> SecurityLabel {
+    binder_floor.join(&declared)
+}
+
+/// Foreign-label import floor (#699, D1/D2 amendment ratified 2026-07-03): a
+/// label asserted by a federated peer — whether a manifest's `security_label`
+/// or (per the D1 ruling) a remote node's own capnp-schema-derived label — is
+/// a **hint, not a guarantee**, when we act as a client of that peer. It is
+/// trusted only as far as the peer's own signer, never face-value across a
+/// domain boundary.
+///
+/// `effective = join(import_floor_for_that_peer, translated)`. Same clamp
+/// shape as [`bind_time_label`] (restrict-only, never escalates); the
+/// distinction is only which floor is being enforced — a local subject's own
+/// clearance there, a per-peer import ceiling here. `import_floor_for_that_peer`
+/// is the enrollment/perimeter-assigned ceiling for imports from that specific
+/// peer (see the atproto perimeter gateway, #549); `translated` is the peer's
+/// asserted label after perimeter translation into this node's lattice
+/// vocabulary.
+#[must_use]
+pub fn import_label(import_floor_for_that_peer: SecurityLabel, translated: SecurityLabel) -> SecurityLabel {
+    import_floor_for_that_peer.join(&translated)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -145,5 +233,89 @@ mod tests {
         };
         assert!(!m.verify_binding(), "unimplemented binding check must fail closed");
         assert_eq!(m.content_id(), &[1, 2, 3]);
+    }
+
+    // ── #699: ObjectLabelResolver seam + clamp invariants ────────────────────
+
+    fn label(level: Level) -> SecurityLabel {
+        SecurityLabel::new(level, Assurance::PqHybrid, CompartmentSet::EMPTY)
+    }
+
+    /// A stub resolver over both `ObjectRef` variants, demonstrating the seam
+    /// compiles and fails closed for an unknown reference.
+    struct StubResolver;
+    impl ObjectLabelResolver for StubResolver {
+        fn resolve(&self, object: ObjectRef<'_>) -> Option<SecurityLabel> {
+            match object {
+                ObjectRef::Path(["srv", "model", "qwen"]) => Some(label(Level::Confidential)),
+                ObjectRef::Cid(_) | ObjectRef::Path(_) => None,
+            }
+        }
+    }
+
+    #[test]
+    fn resolver_resolves_known_path_denies_unknown() {
+        let r = StubResolver;
+        assert_eq!(
+            r.resolve(ObjectRef::Path(&["srv", "model", "qwen"])),
+            Some(label(Level::Confidential))
+        );
+        assert!(
+            r.resolve(ObjectRef::Path(&["srv", "model", "unknown"])).is_none(),
+            "an unresolvable reference must deny, not fall back to a default label"
+        );
+        assert!(r.resolve(ObjectRef::Cid(&[9, 9, 9])).is_none());
+    }
+
+    /// Bind-time clamp: a mount can label what it serves MORE restrictive than
+    /// its binder's own floor, but never less — the declassification/re-export
+    /// laundering case the D2 amendment closes.
+    #[test]
+    fn bind_time_label_cannot_declassify_below_the_binder_floor() {
+        let floor = label(Level::Secret);
+
+        // Attempt to re-export Secret-read data as Public: the clamp raises it
+        // back to (at least) Secret.
+        let declared_low = label(Level::Public);
+        let effective = bind_time_label(floor, declared_low);
+        assert_eq!(
+            effective.level,
+            Level::Secret,
+            "declaring a lower label must not lower the effective label below the binder's floor"
+        );
+
+        // Declaring MORE restrictive than the floor is honored as declared.
+        let declared_high = SecurityLabel::new(Level::Secret, Assurance::PqHybrid, CompartmentSet::EMPTY);
+        let effective_high = bind_time_label(floor, declared_high);
+        assert_eq!(effective_high, declared_high.join(&floor));
+    }
+
+    /// Import clamp: a peer's asserted label is honored only up to the
+    /// per-peer import ceiling — a permissive peer cannot hand us a label more
+    /// permissive than our own floor for that peer.
+    #[test]
+    fn import_label_cannot_exceed_peer_floor_downward() {
+        let peer_floor = label(Level::Internal);
+        let peer_asserts = label(Level::Public); // a peer claiming its data is public
+        let effective = import_label(peer_floor, peer_asserts);
+        assert_eq!(
+            effective.level,
+            Level::Internal,
+            "a peer's permissive self-assertion cannot go below our import floor for that peer"
+        );
+    }
+
+    /// Both clamps are restrict-only: the effective label's level is always
+    /// the MAXIMUM of the two inputs' levels — never a mix that is LESS
+    /// restrictive than either (the property that makes this a floor, not a
+    /// negotiation).
+    #[test]
+    fn clamps_never_produce_a_label_less_restrictive_than_either_input() {
+        let a = label(Level::Confidential);
+        let b = label(Level::Internal);
+        let joined = bind_time_label(a, b);
+        assert_eq!(joined.level, Level::Confidential.max(Level::Internal));
+        assert!(joined.level >= a.level);
+        assert!(joined.level >= b.level);
     }
 }
