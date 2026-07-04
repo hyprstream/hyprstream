@@ -1979,17 +1979,19 @@ fn main() -> Result<()> {
 
                                 if ipc {
                                     // Multi-process mode: each service gets its own independent key.
-                                    let secrets_dir = std::path::PathBuf::from(
-                                        std::env::var("HYPRSTREAM__SECRETS__PATH")
-                                            .unwrap_or_else(|_| {
-                                                dirs::config_dir()
-                                                    .map(|d| d.join("hyprstream").join("credentials"))
-                                                    .unwrap_or_default()
-                                                    .to_str()
-                                                    .unwrap_or("")
-                                                    .to_owned()
-                                            }),
-                                    );
+                                    //
+                                    // #759: resolve via the SAME authoritative path
+                                    // `HyprConfig::resolve_secrets_dir()` uses elsewhere in this
+                                    // function (e.g. the ML-DSA store below) and that
+                                    // `bootstrap_manager::do_bootstrap` uses to write credentials —
+                                    // NOT a hand-rolled `dirs::config_dir()` recomputation. The two
+                                    // used to diverge under `HYPRSTREAM_INSTANCE` or a configured
+                                    // `[secrets] path` (the manual version ignored both), so a
+                                    // bootstrapped credential could land in a different directory
+                                    // than this process reads from — the same "consumer silently
+                                    // re-derives instead of reading the authoritative record"
+                                    // disease #441 targets, just one directory earlier.
+                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir();
 
                                     // Load CA verifying key (trust anchor) for JWT verification only.
                                     // Do NOT insert into the trust store as "policy" scope — the trust
@@ -2017,12 +2019,12 @@ fn main() -> Result<()> {
                                     }
 
                                     // C3 fix: systemd uses flat %d/signing-key, standalone uses subdirectory.
+                                    // #759: "policy" always resolves to the flat root/CA key regardless of
+                                    // deployment mode — see `resolve_service_signing_key` for why.
                                     let systemd_mode = std::env::var("HYPRSTREAM__SECRETS__PATH").is_ok();
-                                    let own_key = if systemd_mode {
-                                        hyprstream_core::auth::identity_store::load_or_generate_node_signing_key(&secrets_dir)?
-                                    } else {
-                                        hyprstream_core::auth::identity_store::load_or_generate_service_signing_key(&secrets_dir, &name)?
-                                    };
+                                    let own_key = hyprstream_core::auth::identity_store::resolve_service_signing_key(
+                                        &secrets_dir, &name, systemd_mode,
+                                    )?;
 
                                     if name == "policy" {
                                         // PolicyService: signing_key IS the CA key (already loaded).
@@ -2058,9 +2060,10 @@ fn main() -> Result<()> {
                                 } else {
                                     // Single-process mode: load keys from disk (same as IPC).
                                     // Wizard must have run to create credentials.
-                                    let secrets_dir = dirs::config_dir()
-                                        .map(|d| d.join("hyprstream").join("credentials"))
-                                        .ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))?;
+                                    //
+                                    // #759: same authoritative resolver as the `--ipc` branch above —
+                                    // see the comment there.
+                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir();
 
                                     // Load CA verifying key (trust anchor)
                                     let ca_vk = hyprstream_core::auth::identity_store::load_ca_verifying_key(&secrets_dir)
@@ -2095,8 +2098,13 @@ fn main() -> Result<()> {
                                     // Load signing keys for each service being started, and
                                     // seed own service-jwt into trust store so register_service_key
                                     // can find it on first call (trust store starts with jwt: None).
+                                    //
+                                    // #759: "policy" must resolve to the flat root/CA key (matching
+                                    // `bootstrap_pubkeys["policy"]`), not an independent per-service
+                                    // key — see `resolve_service_signing_key` for why. This mirrors the
+                                    // same fix applied to the `--ipc` branch above.
                                     for svc_name in &service_names {
-                                        let svc_key = hyprstream_core::auth::identity_store::load_or_generate_service_signing_key(&secrets_dir, svc_name)
+                                        let svc_key = hyprstream_core::auth::identity_store::resolve_service_signing_key(&secrets_dir, svc_name, false)
                                             .with_context(|| format!("Failed to load signing key for service '{}'", svc_name))?;
                                         ctx = ctx.with_service_key(svc_name, svc_key.clone());
 

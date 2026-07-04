@@ -405,6 +405,46 @@ pub fn load_or_generate_node_signing_key(secrets_dir: &std::path::Path) -> Resul
     Ok(key)
 }
 
+/// Resolve the Ed25519 signing key a service process should use to sign its
+/// own RPC responses in `--ipc` (multi-process) deployment.
+///
+/// # PolicyService is special
+///
+/// PolicyService's identity IS the root/CA key, not an independent
+/// per-service key: `bootstrap_manager::do_bootstrap` registers
+/// `bootstrap_pubkeys["policy"] = root_key.verifying_key()` (the same value
+/// persisted flat at `secrets_dir/signing-key`), rather than generating a
+/// `secrets_dir/policy/signing-key` like every other service gets.
+///
+/// Resolving "policy" via the generic per-service path
+/// (`load_or_generate_service_signing_key`) reads/generates a *different*
+/// file (`{secrets_dir}/policy/signing-key`) that bootstrap never populated —
+/// so on first `--ipc` startup it silently mints a fresh, unrelated key. Every
+/// peer that resolves "policy" from the trust store (seeded from
+/// `bootstrap-pubkeys`) still expects `root_key.verifying_key()`, so
+/// PolicyService's actual responses fail verification with "Response signed
+/// by unexpected key" (#759) — a sibling gap to the CA-derivation fallback
+/// #441 already removed from `resolve_service_key`.
+///
+/// - `systemd_mode`: each service's per-unit `LoadCredential` directory
+///   already scopes `secrets_dir` to that one service, so the flat top-level
+///   file is correct for every service, policy included.
+/// - Standalone (non-systemd) `--ipc`: `secrets_dir` is shared across every
+///   spawned service process, so non-policy services use a `{service_name}/`
+///   subdirectory to avoid collisions — but policy must still resolve to the
+///   flat root/CA key, matching what bootstrap registered.
+pub fn resolve_service_signing_key(
+    secrets_dir: &std::path::Path,
+    service_name: &str,
+    systemd_mode: bool,
+) -> Result<SigningKey> {
+    if systemd_mode || service_name == "policy" {
+        load_or_generate_node_signing_key(secrets_dir)
+    } else {
+        load_or_generate_service_signing_key(secrets_dir, service_name)
+    }
+}
+
 /// Decode the `exp` claim from a JWT without signature verification.
 /// Returns `None` on any parse error (invalid base64, not JSON, missing exp).
 pub fn decode_jwt_exp_raw(jwt: &str) -> Option<i64> {
@@ -954,4 +994,70 @@ mod tests {
         assert_ne!(h1, h2, "renewed cert should have different DER due to new timestamps");
     }
 
+    // ── resolve_service_signing_key (#759 regression) ────────────────────────
+
+    #[test]
+    fn test_resolve_service_signing_key_policy_matches_bootstrap_root_key() {
+        // Reproduces the bootstrap flow in `bootstrap_manager::do_bootstrap`:
+        // the root key is written flat as "signing-key" and its verifying key
+        // is what gets registered as `bootstrap_pubkeys["policy"]` — PolicyService
+        // never gets an independent `policy/signing-key` file.
+        let dir = TempDir::new().unwrap();
+        let root_key = load_or_generate_node_signing_key(dir.path()).unwrap();
+
+        // Standalone (non-systemd) `--ipc` startup, resolving policy's own key —
+        // this must equal the root key bootstrap registered, not a freshly
+        // minted independent key.
+        let resolved = resolve_service_signing_key(dir.path(), "policy", false).unwrap();
+        assert_eq!(
+            resolved.to_bytes(), root_key.to_bytes(),
+            "policy must resolve to the flat root/CA key, matching bootstrap_pubkeys[\"policy\"]"
+        );
+
+        // No independent `policy/signing-key` file should have been created.
+        assert!(
+            read_secret(&dir.path().join("policy"), "signing-key").unwrap().is_none(),
+            "resolving policy's key must not mint an independent per-service key file"
+        );
+    }
+
+    #[test]
+    fn test_resolve_service_signing_key_policy_matches_root_key_in_systemd_mode() {
+        let dir = TempDir::new().unwrap();
+        let root_key = load_or_generate_node_signing_key(dir.path()).unwrap();
+        let resolved = resolve_service_signing_key(dir.path(), "policy", true).unwrap();
+        assert_eq!(resolved.to_bytes(), root_key.to_bytes());
+    }
+
+    #[test]
+    fn test_resolve_service_signing_key_non_policy_uses_independent_subdir_key() {
+        let dir = TempDir::new().unwrap();
+        let root_key = load_or_generate_node_signing_key(dir.path()).unwrap();
+
+        let model_key = resolve_service_signing_key(dir.path(), "model", false).unwrap();
+        assert_ne!(
+            model_key.to_bytes(), root_key.to_bytes(),
+            "non-policy services must keep their own independent key, distinct from the root/CA key"
+        );
+
+        // Independent key file lives under the service subdirectory.
+        let from_disk = read_secret(&dir.path().join("model"), "signing-key").unwrap().unwrap();
+        assert_eq!(from_disk, model_key.to_bytes().to_vec());
+    }
+
+    #[test]
+    fn test_resolve_service_signing_key_is_stable_across_calls() {
+        // Simulates repeated resolution (e.g. across a restart) — the same
+        // key must come back every time, for both policy and non-policy.
+        let dir = TempDir::new().unwrap();
+        let _root_key = load_or_generate_node_signing_key(dir.path()).unwrap();
+
+        let policy_1 = resolve_service_signing_key(dir.path(), "policy", false).unwrap();
+        let policy_2 = resolve_service_signing_key(dir.path(), "policy", false).unwrap();
+        assert_eq!(policy_1.to_bytes(), policy_2.to_bytes());
+
+        let model_1 = resolve_service_signing_key(dir.path(), "model", false).unwrap();
+        let model_2 = resolve_service_signing_key(dir.path(), "model", false).unwrap();
+        assert_eq!(model_1.to_bytes(), model_2.to_bytes());
+    }
 }
