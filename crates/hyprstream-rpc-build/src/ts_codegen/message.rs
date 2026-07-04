@@ -254,6 +254,152 @@ export class CapnpArena {
   }
 
   /**
+   * Set a Data list pointer (List(Data)) at the given pointer index.
+   * Encodes as a composite list of byte-blob pointers (no NUL terminator).
+   */
+  setDataList(ptrIndex: number, values: Uint8Array[]): void {
+    if (values.length === 0) return;
+
+    this.alignAlloc();
+
+    const tagOffset = this.allocOffset;
+    const elementCount = values.length;
+    const elementWords = 1; // 0 data + 1 pointer per element
+    const totalWords = 1 + elementCount * elementWords;
+
+    this.ensureCapacity(totalWords * WORD_SIZE + values.reduce((a, v) => a + v.length + 8, 0));
+
+    const tagLo = ((elementCount << 2) | 0) >>> 0;
+    const tagHi = ((0 << 0) | (1 << 16)) >>> 0;
+    this.buf.setUint32(tagOffset, tagLo, true);
+    this.buf.setUint32(tagOffset + 4, tagHi, true);
+
+    this.allocOffset = tagOffset + WORD_SIZE + elementCount * elementWords * WORD_SIZE;
+
+    const ptrOffset = this.rootPtrOffset + ptrIndex * WORD_SIZE;
+    const offsetWords = (tagOffset - ptrOffset - WORD_SIZE) / WORD_SIZE;
+    const lo = ((offsetWords << 2) | 1) >>> 0;
+    const hi = ((elementCount * elementWords << 3) | 7) >>> 0;
+    this.buf.setUint32(ptrOffset, lo, true);
+    this.buf.setUint32(ptrOffset + 4, hi, true);
+
+    for (let i = 0; i < values.length; i++) {
+      const elementPtrOffset = tagOffset + WORD_SIZE + i * elementWords * WORD_SIZE;
+      const byteLen = values[i].length;
+      const wordLen = Math.ceil(byteLen / WORD_SIZE);
+
+      this.alignAlloc();
+      this.ensureCapacity(wordLen * WORD_SIZE);
+
+      const dataOffset = this.allocOffset;
+      this.raw.set(values[i], dataOffset);
+
+      const dataOffsetWords = (dataOffset - elementPtrOffset - WORD_SIZE) / WORD_SIZE;
+      const dataLo = ((dataOffsetWords << 2) | 1) >>> 0;
+      const dataHi = ((byteLen << 3) | 2) >>> 0;
+      this.buf.setUint32(elementPtrOffset, dataLo, true);
+      this.buf.setUint32(elementPtrOffset + 4, dataHi, true);
+
+      this.allocOffset = dataOffset + wordLen * WORD_SIZE;
+    }
+  }
+
+  /**
+   * Allocate a fixed-width primitive list (List(Bool)/List(UIntN)/List(IntN)/List(FloatN))
+   * pointer at `ptrIndex`. `elemSize` is the capnp list element-size tag
+   * (1=bit, 2=1-byte, 3=2-byte, 4=4-byte, 5=8-byte); `byteWidth` is the
+   * per-element byte width (ignored for bit-packed bool lists).
+   * Returns the byte offset of the first element, or -1 for an empty list.
+   */
+  private allocPrimitiveList(ptrIndex: number, count: number, elemSize: number, byteWidth: number): number {
+    if (count === 0) return -1;
+
+    this.alignAlloc();
+    const totalBytes = elemSize === 1 ? Math.ceil(count / 8) : count * byteWidth;
+    const wordLen = Math.ceil(totalBytes / WORD_SIZE);
+    this.ensureCapacity(wordLen * WORD_SIZE);
+
+    const targetOffset = this.allocOffset;
+    const ptrOffset = this.rootPtrOffset + ptrIndex * WORD_SIZE;
+    const offsetWords = (targetOffset - ptrOffset - WORD_SIZE) / WORD_SIZE;
+    const lo = ((offsetWords << 2) | 1) >>> 0;
+    const hi = ((count << 3) | elemSize) >>> 0;
+    this.buf.setUint32(ptrOffset, lo, true);
+    this.buf.setUint32(ptrOffset + 4, hi, true);
+
+    this.allocOffset = targetOffset + wordLen * WORD_SIZE;
+    return targetOffset;
+  }
+
+  setBoolList(ptrIndex: number, values: boolean[]): void {
+    const base = this.allocPrimitiveList(ptrIndex, values.length, 1, 0);
+    if (base < 0) return;
+    for (let i = 0; i < values.length; i++) {
+      if (values[i]) this.raw[base + (i >> 3)] |= 1 << (i & 7);
+    }
+  }
+
+  setUint8List(ptrIndex: number, values: number[]): void {
+    const base = this.allocPrimitiveList(ptrIndex, values.length, 2, 1);
+    if (base < 0) return;
+    for (let i = 0; i < values.length; i++) this.buf.setUint8(base + i, values[i]);
+  }
+
+  setInt8List(ptrIndex: number, values: number[]): void {
+    const base = this.allocPrimitiveList(ptrIndex, values.length, 2, 1);
+    if (base < 0) return;
+    for (let i = 0; i < values.length; i++) this.buf.setInt8(base + i, values[i]);
+  }
+
+  setUint16List(ptrIndex: number, values: number[]): void {
+    const base = this.allocPrimitiveList(ptrIndex, values.length, 3, 2);
+    if (base < 0) return;
+    for (let i = 0; i < values.length; i++) this.buf.setUint16(base + i * 2, values[i], true);
+  }
+
+  setInt16List(ptrIndex: number, values: number[]): void {
+    const base = this.allocPrimitiveList(ptrIndex, values.length, 3, 2);
+    if (base < 0) return;
+    for (let i = 0; i < values.length; i++) this.buf.setInt16(base + i * 2, values[i], true);
+  }
+
+  setUint32List(ptrIndex: number, values: number[]): void {
+    const base = this.allocPrimitiveList(ptrIndex, values.length, 4, 4);
+    if (base < 0) return;
+    for (let i = 0; i < values.length; i++) this.buf.setUint32(base + i * 4, values[i], true);
+  }
+
+  setInt32List(ptrIndex: number, values: number[]): void {
+    const base = this.allocPrimitiveList(ptrIndex, values.length, 4, 4);
+    if (base < 0) return;
+    for (let i = 0; i < values.length; i++) this.buf.setInt32(base + i * 4, values[i], true);
+  }
+
+  setFloat32List(ptrIndex: number, values: number[]): void {
+    const base = this.allocPrimitiveList(ptrIndex, values.length, 4, 4);
+    if (base < 0) return;
+    for (let i = 0; i < values.length; i++) this.buf.setFloat32(base + i * 4, values[i], true);
+  }
+
+  setUint64List(ptrIndex: number, values: bigint[]): void {
+    const base = this.allocPrimitiveList(ptrIndex, values.length, 5, 8);
+    if (base < 0) return;
+    for (let i = 0; i < values.length; i++) this.buf.setBigUint64(base + i * 8, values[i], true);
+  }
+
+  setInt64List(ptrIndex: number, values: bigint[]): void {
+    const base = this.allocPrimitiveList(ptrIndex, values.length, 5, 8);
+    if (base < 0) return;
+    for (let i = 0; i < values.length; i++) this.buf.setBigInt64(base + i * 8, values[i], true);
+  }
+
+  setFloat64List(ptrIndex: number, values: number[]): void {
+    const base = this.allocPrimitiveList(ptrIndex, values.length, 5, 8);
+    if (base < 0) return;
+    for (let i = 0; i < values.length; i++) this.buf.setFloat64(base + i * 8, values[i], true);
+  }
+
+  /**
    * Initialize a sub-struct at the given pointer index.
    * Returns a StructBuilder for writing fields into the sub-struct.
    */
@@ -458,6 +604,153 @@ export class StructBuilder {
     this.msg._getBuf().setUint32(ptrOffset + 4, hi, true);
 
     this.msg._setAllocOffset(targetOffset + wordLen * WORD_SIZE);
+  }
+
+  /**
+   * Set a Data list pointer (List(Data)) at the given pointer index within this struct.
+   * Encodes as a composite list of byte-blob pointers (no NUL terminator).
+   */
+  setDataList(ptrIndex: number, values: Uint8Array[]): void {
+    if (values.length === 0) return;
+
+    this.msg._alignAlloc();
+
+    const tagOffset = this.msg._getAllocOffset();
+    const elementCount = values.length;
+    const elementWords = 1;
+    const totalWords = 1 + elementCount * elementWords;
+
+    this.msg._ensureCapacity(totalWords * WORD_SIZE + values.reduce((a, v) => a + v.length + 8, 0));
+
+    const tagLo = ((elementCount << 2) | 0) >>> 0;
+    const tagHi = ((0 << 0) | (1 << 16)) >>> 0;
+    this.msg._getBuf().setUint32(tagOffset, tagLo, true);
+    this.msg._getBuf().setUint32(tagOffset + 4, tagHi, true);
+
+    this.msg._setAllocOffset(tagOffset + WORD_SIZE + elementCount * elementWords * WORD_SIZE);
+
+    const ptrOffset = this.ptrOffset + ptrIndex * WORD_SIZE;
+    const offsetWords = (tagOffset - ptrOffset - WORD_SIZE) / WORD_SIZE;
+    const lo = ((offsetWords << 2) | 1) >>> 0;
+    const hi = ((elementCount * elementWords << 3) | 7) >>> 0;
+    this.msg._getBuf().setUint32(ptrOffset, lo, true);
+    this.msg._getBuf().setUint32(ptrOffset + 4, hi, true);
+
+    for (let i = 0; i < values.length; i++) {
+      const elementPtrOffset = tagOffset + WORD_SIZE + i * elementWords * WORD_SIZE;
+      const byteLen = values[i].length;
+      const wordLen = Math.ceil(byteLen / WORD_SIZE);
+
+      this.msg._alignAlloc();
+      this.msg._ensureCapacity(wordLen * WORD_SIZE);
+
+      const dataOffset = this.msg._getAllocOffset();
+      this.msg._getRaw().set(values[i], dataOffset);
+
+      const dataOffsetWords = (dataOffset - elementPtrOffset - WORD_SIZE) / WORD_SIZE;
+      const dataLo = ((dataOffsetWords << 2) | 1) >>> 0;
+      const dataHi = ((byteLen << 3) | 2) >>> 0;
+      this.msg._getBuf().setUint32(elementPtrOffset, dataLo, true);
+      this.msg._getBuf().setUint32(elementPtrOffset + 4, dataHi, true);
+
+      this.msg._setAllocOffset(dataOffset + wordLen * WORD_SIZE);
+    }
+  }
+
+  /**
+   * Allocate a fixed-width primitive list (List(Bool)/List(UIntN)/List(IntN)/List(FloatN))
+   * pointer at `ptrIndex` within this struct. `elemSize` is the capnp list
+   * element-size tag (1=bit, 2=1-byte, 3=2-byte, 4=4-byte, 5=8-byte);
+   * `byteWidth` is the per-element byte width (ignored for bit-packed bool lists).
+   * Returns the byte offset of the first element, or -1 for an empty list.
+   */
+  private allocPrimitiveList(ptrIndex: number, count: number, elemSize: number, byteWidth: number): number {
+    if (count === 0) return -1;
+
+    this.msg._alignAlloc();
+    const totalBytes = elemSize === 1 ? Math.ceil(count / 8) : count * byteWidth;
+    const wordLen = Math.ceil(totalBytes / WORD_SIZE);
+    this.msg._ensureCapacity(wordLen * WORD_SIZE);
+
+    const targetOffset = this.msg._getAllocOffset();
+    const ptrOffset = this.ptrOffset + ptrIndex * WORD_SIZE;
+    const offsetWords = (targetOffset - ptrOffset - WORD_SIZE) / WORD_SIZE;
+    const lo = ((offsetWords << 2) | 1) >>> 0;
+    const hi = ((count << 3) | elemSize) >>> 0;
+    this.msg._getBuf().setUint32(ptrOffset, lo, true);
+    this.msg._getBuf().setUint32(ptrOffset + 4, hi, true);
+
+    this.msg._setAllocOffset(targetOffset + wordLen * WORD_SIZE);
+    return targetOffset;
+  }
+
+  setBoolList(ptrIndex: number, values: boolean[]): void {
+    const base = this.allocPrimitiveList(ptrIndex, values.length, 1, 0);
+    if (base < 0) return;
+    const raw = this.msg._getRaw();
+    for (let i = 0; i < values.length; i++) {
+      if (values[i]) raw[base + (i >> 3)] |= 1 << (i & 7);
+    }
+  }
+
+  setUint8List(ptrIndex: number, values: number[]): void {
+    const base = this.allocPrimitiveList(ptrIndex, values.length, 2, 1);
+    if (base < 0) return;
+    for (let i = 0; i < values.length; i++) this.msg._getBuf().setUint8(base + i, values[i]);
+  }
+
+  setInt8List(ptrIndex: number, values: number[]): void {
+    const base = this.allocPrimitiveList(ptrIndex, values.length, 2, 1);
+    if (base < 0) return;
+    for (let i = 0; i < values.length; i++) this.msg._getBuf().setInt8(base + i, values[i]);
+  }
+
+  setUint16List(ptrIndex: number, values: number[]): void {
+    const base = this.allocPrimitiveList(ptrIndex, values.length, 3, 2);
+    if (base < 0) return;
+    for (let i = 0; i < values.length; i++) this.msg._getBuf().setUint16(base + i * 2, values[i], true);
+  }
+
+  setInt16List(ptrIndex: number, values: number[]): void {
+    const base = this.allocPrimitiveList(ptrIndex, values.length, 3, 2);
+    if (base < 0) return;
+    for (let i = 0; i < values.length; i++) this.msg._getBuf().setInt16(base + i * 2, values[i], true);
+  }
+
+  setUint32List(ptrIndex: number, values: number[]): void {
+    const base = this.allocPrimitiveList(ptrIndex, values.length, 4, 4);
+    if (base < 0) return;
+    for (let i = 0; i < values.length; i++) this.msg._getBuf().setUint32(base + i * 4, values[i], true);
+  }
+
+  setInt32List(ptrIndex: number, values: number[]): void {
+    const base = this.allocPrimitiveList(ptrIndex, values.length, 4, 4);
+    if (base < 0) return;
+    for (let i = 0; i < values.length; i++) this.msg._getBuf().setInt32(base + i * 4, values[i], true);
+  }
+
+  setFloat32List(ptrIndex: number, values: number[]): void {
+    const base = this.allocPrimitiveList(ptrIndex, values.length, 4, 4);
+    if (base < 0) return;
+    for (let i = 0; i < values.length; i++) this.msg._getBuf().setFloat32(base + i * 4, values[i], true);
+  }
+
+  setUint64List(ptrIndex: number, values: bigint[]): void {
+    const base = this.allocPrimitiveList(ptrIndex, values.length, 5, 8);
+    if (base < 0) return;
+    for (let i = 0; i < values.length; i++) this.msg._getBuf().setBigUint64(base + i * 8, values[i], true);
+  }
+
+  setInt64List(ptrIndex: number, values: bigint[]): void {
+    const base = this.allocPrimitiveList(ptrIndex, values.length, 5, 8);
+    if (base < 0) return;
+    for (let i = 0; i < values.length; i++) this.msg._getBuf().setBigInt64(base + i * 8, values[i], true);
+  }
+
+  setFloat64List(ptrIndex: number, values: number[]): void {
+    const base = this.allocPrimitiveList(ptrIndex, values.length, 5, 8);
+    if (base < 0) return;
+    for (let i = 0; i < values.length; i++) this.msg._getBuf().setFloat64(base + i * 8, values[i], true);
   }
 
   /**
@@ -797,7 +1090,7 @@ export class CapnpReader {
     return results;
   }
 
-  /** Read a List(Data) pointer. */
+  /** Read a List(Data) pointer (supports both pointer-list and composite encodings). */
   getDataList(ptrIndex: number): Uint8Array[] {
     const ptrOffset = this.rootPtrOffset + ptrIndex * WORD_SIZE;
     const resolved = this.resolvePtr(ptrOffset);
@@ -809,14 +1102,26 @@ export class CapnpReader {
     const elementSize = hi & 7;
     const targetOffset = offset + WORD_SIZE + offsetWords * WORD_SIZE;
 
-    if (elementSize !== 7) return []; // not composite
-
-    const tagLo = this.buf.getUint32(targetOffset, true);
-    const elementCount = (tagLo >> 2) | 0;
+    // Pointer list (element_size=6, the canonical List(Data) encoding — what
+    // the Rust side emits) or composite list (element_size=7): both carry one
+    // pointer per element, differing only in where the count lives and where
+    // the elements start.
+    let elementCount: number;
+    let elemBase: number;
+    if (elementSize === 6) {
+      elementCount = hi >>> 3;
+      elemBase = targetOffset;
+    } else if (elementSize === 7) {
+      const tagLo = this.buf.getUint32(targetOffset, true);
+      elementCount = (tagLo >> 2) | 0;
+      elemBase = targetOffset + WORD_SIZE;
+    } else {
+      return [];
+    }
 
     const results: Uint8Array[] = [];
     for (let i = 0; i < elementCount; i++) {
-      const elemOffset = targetOffset + WORD_SIZE + i * WORD_SIZE;
+      const elemOffset = elemBase + i * WORD_SIZE;
       const elemLo = this.buf.getUint32(elemOffset, true);
       const elemHi = this.buf.getUint32(elemOffset + 4, true);
 
@@ -832,6 +1137,86 @@ export class CapnpReader {
     }
 
     return results;
+  }
+
+  /**
+   * Read a fixed-width primitive list (List(Bool)/List(UIntN)/List(IntN)/List(FloatN)).
+   * `expectedElemSize` is the capnp list element-size tag this getter accepts
+   * (1=bit, 2=1-byte, 3=2-byte, 4=4-byte, 5=8-byte); `byteWidth` is the
+   * per-element byte width (ignored for bit-packed bool lists). Returns `[]`
+   * if the pointer is null or was encoded with a different element size.
+   */
+  private readPrimitiveList<T>(
+    ptrIndex: number,
+    expectedElemSize: number,
+    byteWidth: number,
+    read: (byteOffset: number, bitIndex: number) => T,
+  ): T[] {
+    const ptrOffset = this.rootPtrOffset + ptrIndex * WORD_SIZE;
+    const resolved = this.resolvePtr(ptrOffset);
+    if (!resolved) return [];
+    const { lo, hi, offset } = resolved;
+    if ((lo & 3) !== 1) return [];
+
+    const offsetWords = (lo >> 2) | 0;
+    const elementSize = hi & 7;
+    if (elementSize !== expectedElemSize) return [];
+    const targetOffset = offset + WORD_SIZE + offsetWords * WORD_SIZE;
+    const count = hi >>> 3;
+
+    const results: T[] = [];
+    for (let i = 0; i < count; i++) {
+      results.push(
+        byteWidth === 0
+          ? read(targetOffset + (i >> 3), i & 7)
+          : read(targetOffset + i * byteWidth, 0),
+      );
+    }
+    return results;
+  }
+
+  getBoolList(ptrIndex: number): boolean[] {
+    return this.readPrimitiveList(ptrIndex, 1, 0, (byteOffset, bitIndex) => (this.raw[byteOffset] & (1 << bitIndex)) !== 0);
+  }
+
+  getUint8List(ptrIndex: number): number[] {
+    return this.readPrimitiveList(ptrIndex, 2, 1, (o) => this.buf.getUint8(o));
+  }
+
+  getInt8List(ptrIndex: number): number[] {
+    return this.readPrimitiveList(ptrIndex, 2, 1, (o) => this.buf.getInt8(o));
+  }
+
+  getUint16List(ptrIndex: number): number[] {
+    return this.readPrimitiveList(ptrIndex, 3, 2, (o) => this.buf.getUint16(o, true));
+  }
+
+  getInt16List(ptrIndex: number): number[] {
+    return this.readPrimitiveList(ptrIndex, 3, 2, (o) => this.buf.getInt16(o, true));
+  }
+
+  getUint32List(ptrIndex: number): number[] {
+    return this.readPrimitiveList(ptrIndex, 4, 4, (o) => this.buf.getUint32(o, true));
+  }
+
+  getInt32List(ptrIndex: number): number[] {
+    return this.readPrimitiveList(ptrIndex, 4, 4, (o) => this.buf.getInt32(o, true));
+  }
+
+  getFloat32List(ptrIndex: number): number[] {
+    return this.readPrimitiveList(ptrIndex, 4, 4, (o) => this.buf.getFloat32(o, true));
+  }
+
+  getUint64List(ptrIndex: number): bigint[] {
+    return this.readPrimitiveList(ptrIndex, 5, 8, (o) => this.buf.getBigUint64(o, true));
+  }
+
+  getInt64List(ptrIndex: number): bigint[] {
+    return this.readPrimitiveList(ptrIndex, 5, 8, (o) => this.buf.getBigInt64(o, true));
+  }
+
+  getFloat64List(ptrIndex: number): number[] {
+    return this.readPrimitiveList(ptrIndex, 5, 8, (o) => this.buf.getFloat64(o, true));
   }
 
   /** Read a List(Struct) composite list pointer. Returns StructReader[] using wire-format shape from tag word. */
@@ -1052,6 +1437,84 @@ export class StructReader {
       results.push(this.raw.subarray(dataOffset, dataOffset + byteCount));
     }
     return results;
+  }
+
+  /**
+   * Read a fixed-width primitive list (List(Bool)/List(UIntN)/List(IntN)/List(FloatN))
+   * within this struct. See `CapnpReader.readPrimitiveList` for the element-size
+   * encoding this mirrors.
+   */
+  private readPrimitiveList<T>(
+    ptrIndex: number,
+    expectedElemSize: number,
+    byteWidth: number,
+    read: (byteOffset: number, bitIndex: number) => T,
+  ): T[] {
+    const ptrOffset = this.dataOffset + this.dataWords * WORD_SIZE + ptrIndex * WORD_SIZE;
+    const resolved = this.resolvePtr(ptrOffset);
+    if (!resolved) return [];
+    const { lo, hi, offset } = resolved;
+    if ((lo & 3) !== 1) return [];
+
+    const offsetWords = (lo >> 2) | 0;
+    const elementSize = hi & 7;
+    if (elementSize !== expectedElemSize) return [];
+    const targetOffset = offset + WORD_SIZE + offsetWords * WORD_SIZE;
+    const count = hi >>> 3;
+
+    const results: T[] = [];
+    for (let i = 0; i < count; i++) {
+      results.push(
+        byteWidth === 0
+          ? read(targetOffset + (i >> 3), i & 7)
+          : read(targetOffset + i * byteWidth, 0),
+      );
+    }
+    return results;
+  }
+
+  getBoolList(ptrIndex: number): boolean[] {
+    return this.readPrimitiveList(ptrIndex, 1, 0, (byteOffset, bitIndex) => (this.raw[byteOffset] & (1 << bitIndex)) !== 0);
+  }
+
+  getUint8List(ptrIndex: number): number[] {
+    return this.readPrimitiveList(ptrIndex, 2, 1, (o) => this.buf.getUint8(o));
+  }
+
+  getInt8List(ptrIndex: number): number[] {
+    return this.readPrimitiveList(ptrIndex, 2, 1, (o) => this.buf.getInt8(o));
+  }
+
+  getUint16List(ptrIndex: number): number[] {
+    return this.readPrimitiveList(ptrIndex, 3, 2, (o) => this.buf.getUint16(o, true));
+  }
+
+  getInt16List(ptrIndex: number): number[] {
+    return this.readPrimitiveList(ptrIndex, 3, 2, (o) => this.buf.getInt16(o, true));
+  }
+
+  getUint32List(ptrIndex: number): number[] {
+    return this.readPrimitiveList(ptrIndex, 4, 4, (o) => this.buf.getUint32(o, true));
+  }
+
+  getInt32List(ptrIndex: number): number[] {
+    return this.readPrimitiveList(ptrIndex, 4, 4, (o) => this.buf.getInt32(o, true));
+  }
+
+  getFloat32List(ptrIndex: number): number[] {
+    return this.readPrimitiveList(ptrIndex, 4, 4, (o) => this.buf.getFloat32(o, true));
+  }
+
+  getUint64List(ptrIndex: number): bigint[] {
+    return this.readPrimitiveList(ptrIndex, 5, 8, (o) => this.buf.getBigUint64(o, true));
+  }
+
+  getInt64List(ptrIndex: number): bigint[] {
+    return this.readPrimitiveList(ptrIndex, 5, 8, (o) => this.buf.getBigInt64(o, true));
+  }
+
+  getFloat64List(ptrIndex: number): number[] {
+    return this.readPrimitiveList(ptrIndex, 5, 8, (o) => this.buf.getFloat64(o, true));
   }
 
   getStructList(ptrIndex: number, _dataWords: number, _ptrWords: number): StructReader[] {

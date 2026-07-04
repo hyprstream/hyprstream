@@ -744,9 +744,9 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     info!("Creating WorkerService");
 
     use hyprstream_workers::config::PoolConfig;
-    #[cfg(feature = "kata-vm")]
+    #[cfg(feature = "oci-image")]
     use hyprstream_workers::config::ImageConfig;
-    #[cfg(feature = "kata-vm")]
+    #[cfg(feature = "oci-image")]
     use hyprstream_workers::image::RafsStore;
     use hyprstream_workers::{resolve_backend, BackendCtx, SandboxBackend, WorkerService};
 
@@ -783,8 +783,10 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         ..PoolConfig::default()
     };
 
-    // RAFS/nydus image store is only built for the VM path (kata-vm feature).
-    #[cfg(feature = "kata-vm")]
+    // RAFS/nydus image store is built whenever the image filesystem service is
+    // compiled in (`oci-image`), so both kata (virtio-fs) and nspawn (FUSE
+    // tenant-VFS root, Model B #715) can compose a per-sandbox VFS from it.
+    #[cfg(feature = "oci-image")]
     let image_config = ImageConfig {
         blobs_dir: data_dir.join("images/blobs"),
         bootstrap_dir: data_dir.join("images/bootstrap"),
@@ -794,7 +796,7 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         ..ImageConfig::default()
     };
 
-    #[cfg(feature = "kata-vm")]
+    #[cfg(feature = "oci-image")]
     let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
 
     // Resolve + construct the backend fail-closed against the inventory registry
@@ -804,9 +806,9 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     // `_ => nspawn` fallback (#507 / #518).
     let backend_ctx = BackendCtx {
         pool_config: pool_config.clone(),
-        #[cfg(feature = "kata-vm")]
+        #[cfg(feature = "oci-image")]
         image_config,
-        #[cfg(feature = "kata-vm")]
+        #[cfg(feature = "oci-image")]
         rafs_store: Arc::clone(&rafs_store),
     };
     let backend: Arc<dyn SandboxBackend> = resolve_backend(&backend_name, &backend_ctx)?;
@@ -922,6 +924,55 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     );
 
     Ok(Box::new(oai_service))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Xet Service Factory
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Factory for XetService (HuggingFace-XET CAS HTTP face, epic #654).
+///
+/// Dual-stack HTTP service that speaks the HF-XET CAS wire protocol so a standard
+/// xet-enabled git repo can point its CAS endpoint at hyprstream. It dials the
+/// `registry` service (reusing the authenticated `putBlob`/`getBlob` core) and
+/// holds no standing CAS write authority of its own. Reads come from the shared
+/// `cas_serve::CasStore`.
+#[service_factory("xet", depends_on = ["policy", "registry", "discovery"])]
+fn create_xet_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+    info!("Creating XetService");
+
+    use crate::services::{XetService, XetState};
+
+    let config = load_config();
+    let sk = ctx.service_signing_key("xet");
+
+    // Register this service's verifying key with PolicyService.
+    register_service_key(ctx, "xet", &sk)?;
+
+    // Dial the registry — the authenticated write core the HTTP face translates to.
+    let registry_vk = hyprstream_service::global_trust_store()
+        .resolve_one("registry")
+        .ok_or_else(|| anyhow::anyhow!("trust store has no registry key"))?;
+    let registry_client: RegistryClient =
+        RegistryClient::for_service(sk.clone(), registry_vk, service_token("xet"))?;
+
+    let state = XetState {
+        // Reads share the same content-addressed store the registry's getBlob uses.
+        store: cas_serve::CasStore::from_env(),
+        registry: Some(registry_client),
+        jwt_verifying_key: ctx.jwt_verifying_key(),
+        audience: config.xet.resource_url(),
+    };
+
+    let xet_service = XetService::new(
+        config.xet.clone(),
+        config.tls.clone(),
+        state,
+        ctx.transport("xet", SocketKind::Rep),
+        ctx.verifying_key(),
+    );
+
+    Ok(Box::new(xet_service))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

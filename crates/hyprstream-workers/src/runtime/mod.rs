@@ -58,6 +58,12 @@ pub mod sandbox_fs;
 pub mod selection;
 mod service;
 pub mod spawner;
+// Wanix-guest workload wiring (#506 deliverable 3): allocate a per-workload UDS,
+// serve a tenant's Subject-scoped VFS `Mount` as 9P2000.L over it, and inject the
+// socket + env into a sandbox so the native Wanix guest dials back. Native only
+// (needs tokio `net` for the 9P UDS server).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod wanix_workload;
 
 // Generated wire types — canonical OCI/CRI-aligned names (no Gen*/Wire/Enum aliases)
 pub use client::{
@@ -108,13 +114,23 @@ pub use oci_backend::{OciBackend, OciConfig, OciHandle};
 #[cfg(feature = "wasm")]
 pub use wasm_backend::{WasmBackend, WasmConfig, WasmHandle};
 // Inventory-based backend registry + fail-closed selection spine (#507)
-pub use selection::{resolve_backend, BackendCtx, BackendRegistration};
+pub use selection::{
+    backend_injects_9p_socket, require_9p_socket_capability, require_fuse_mount_capability,
+    resolve_backend, resolve_backend_9p_capable, BackendCtx, BackendRegistration,
+};
 // Domain entities (business logic only)
 pub use container::Container;
 pub use pool::{PoolStats, SandboxPool};
 pub use sandbox::PodSandbox;
 #[cfg(all(not(target_arch = "wasm32"), feature = "oci-image"))]
-pub use sandbox_fs::{InjectedMounts, SandboxFs, SandboxFsServer, VFS_SOCKET_NAME};
+pub use sandbox_fs::{
+    InjectedMounts, SandboxFs, SandboxFsLocalMount, SandboxFsServer, VFS_SOCKET_NAME,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use wanix_workload::{
+    inject_9p_socket, Injected9pServer, WanixGuestConfig, WanixInjection,
+    ANN_WANIX_COMMAND, ENV_9P_SOCK,
+};
 pub use service::WorkerService;
 // Re-export service infrastructure from hyprstream-rpc for convenience
 pub use hyprstream_rpc::service::{EnvelopeContext, ServiceHandle, RequestService};

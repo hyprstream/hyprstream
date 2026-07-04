@@ -947,6 +947,15 @@ inventory::submit! {
         priority: 100,
         // Full VM isolation (strongest tier) → eligible for `"auto"`.
         auto_selectable: true,
+        // A VM does NOT share the host mount namespace, so a host Unix socket
+        // cannot be bind-injected the way oci/nspawn do (#506). The VM path
+        // exposes a tenant namespace over virtio-fs instead (see `sandbox_fs`),
+        // a different mechanism — so kata does not advertise host-UDS injection.
+        injects_9p_socket: false,
+        // kata already shares the composed per-sandbox VFS with its guest as a
+        // virtio-fs (vhost-user-fs) device, NOT a host FUSE mount, so it does not
+        // advertise the Model B (#715) host-FUSE-mount capability.
+        mounts_fuse_vfs: false,
         is_available: KataBackend::registry_is_available,
         construct: |ctx| {
             Ok(Arc::new(KataBackend::new(

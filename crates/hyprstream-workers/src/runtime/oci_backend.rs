@@ -57,6 +57,25 @@ use crate::error::{Result, WorkerError};
 use super::backend::{SandboxBackend, SandboxHandle};
 use super::client::{LinuxContainerResources, PodSandboxConfig};
 use super::sandbox::PodSandbox;
+#[cfg(feature = "oci-image")]
+use crate::image::RafsStore;
+
+/// Sub-directory of the per-sandbox runtime dir where the tenant VFS is
+/// FUSE-mounted for Model B (#715) POSIX-rooting. Mirrors nspawn's `VFS_ROOT_DIR`.
+#[cfg(feature = "oci-image")]
+const VFS_ROOT_DIR: &str = "vfs-root";
+
+/// Container path the tenant VFS FUSE mount is bind-mounted to (Model B, #715).
+///
+/// Unlike nspawn — which POSIX-roots the whole container at the FUSE mount via
+/// `--directory=<mountpoint>` — a rootless podman container keeps its own OCI
+/// image rootfs, so the composed tenant VFS (image rootfs CoW upper + injected
+/// `/models`, `/deltas`, `/stream`) is instead bind-mounted **into** the
+/// container at this well-known path via the same `--volume` seam podman already
+/// uses for `hyprstream.io/mount.*` annotations. The workload reads its tenant
+/// namespace here.
+#[cfg(feature = "oci-image")]
+const VFS_ROOT_CTR_PATH: &str = "/hyprstream";
 
 /// Annotation key: OCI image reference to run (overrides [`OciConfig::default_image`]).
 const ANN_OCI_IMAGE: &str = "hyprstream.io/oci-image";
@@ -66,6 +85,12 @@ const ANN_ENV_PREFIX: &str = "hyprstream.io/env.";
 const ANN_MOUNT_PREFIX: &str = "hyprstream.io/mount.";
 /// Annotation key: request GPU device pass-through (`hyprstream.io/gpu=true`).
 const ANN_GPU: &str = "hyprstream.io/gpu";
+/// Annotation key: the workload command to run in the container, appended after
+/// the image (whitespace-separated argv). When absent the image's own entrypoint
+/// runs (CRI pause semantics). Used by the Wanix-guest workload (#506) to run the
+/// injected guest binary; must equal
+/// [`wanix_workload::ANN_WANIX_COMMAND`](super::wanix_workload::ANN_WANIX_COMMAND).
+const ANN_COMMAND: &str = "hyprstream.io/command";
 
 /// Default OCI runtime binary (rootless podman).
 const DEFAULT_RUNTIME_BIN: &str = "podman";
@@ -156,6 +181,14 @@ pub struct OciHandle {
     pub container_id: Option<String>,
     /// Host-side sandbox directory for bind-mounts.
     pub sandbox_path: PathBuf,
+    /// Per-sandbox tenant-VFS FUSE mount (Model B, #715). When set, the composed
+    /// namespace is FUSE-mounted at this handle's host directory and
+    /// bind-mounted into the container at [`VFS_ROOT_CTR_PATH`]. Held here
+    /// (behind `Arc`) for the sandbox's lifetime so the mount — and its serving
+    /// thread + injected registries — outlive container start; it is unmounted
+    /// when the last handle clone drops (RAII), i.e. on sandbox stop/destroy.
+    #[cfg(feature = "oci-image")]
+    pub vfs_root_mount: Option<Arc<super::sandbox_fs::SandboxFsLocalMount>>,
 }
 
 impl SandboxHandle for OciHandle {
@@ -171,11 +204,34 @@ impl SandboxHandle for OciHandle {
 /// Rootless OCI (podman) sandbox backend.
 pub struct OciBackend {
     config: OciConfig,
+    /// RAFS image store for composing the per-sandbox tenant VFS that Model B
+    /// (#715) FUSE-mounts and bind-mounts into the container. `None` when no
+    /// store was provided; the field exists only when the image service
+    /// (`oci-image`) is compiled in. Without a store, oci behaves exactly as
+    /// before — a plain image-rooted container, no tenant-VFS bind.
+    #[cfg(feature = "oci-image")]
+    rafs_store: Option<Arc<RafsStore>>,
 }
 
 impl OciBackend {
     pub fn new(config: OciConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            #[cfg(feature = "oci-image")]
+            rafs_store: None,
+        }
+    }
+
+    /// Attach the RAFS image store used to compose the per-sandbox tenant VFS
+    /// for Model B (#715) FUSE-rooting. Threaded in from [`BackendCtx`] at
+    /// selection time (see the inventory registration below), exactly as the
+    /// nspawn backend does. Without a store, oci behaves exactly as before.
+    ///
+    /// [`BackendCtx`]: super::selection::BackendCtx
+    #[cfg(feature = "oci-image")]
+    pub fn with_rafs_store(mut self, rafs_store: Option<Arc<RafsStore>>) -> Self {
+        self.rafs_store = rafs_store;
+        self
     }
 
     /// Stable container name for a sandbox id.
@@ -217,10 +273,104 @@ impl OciBackend {
             .unwrap_or_else(|| self.config.default_image.clone())
     }
 
+    /// Annotation key carrying the sandbox's policy principal (the [`Subject`]
+    /// at the VFS Mount boundary, #353/#319/#328) — the same key the kata and
+    /// nspawn backends read. When absent, the sandbox id is used as a stable
+    /// per-sandbox principal so isolation still holds. MAC-conservative: one
+    /// single-`Subject` `VfsFileSystem` per sandbox, no uid→Subject mapping.
+    ///
+    /// [`Subject`]: hyprstream_vfs::Subject
+    #[cfg(feature = "oci-image")]
+    const SUBJECT_ANNOTATION: &'static str = "hyprstream.io/subject";
+
+    /// Resolve the [`Subject`](hyprstream_vfs::Subject) this sandbox's tenant
+    /// VFS is served under (mirrors `NspawnBackend::sandbox_subject` and
+    /// `KataBackend::sandbox_subject` — same key, same fallback).
+    #[cfg(feature = "oci-image")]
+    fn sandbox_subject(
+        sandbox: &PodSandbox,
+        annotations: &HashMap<String, String>,
+    ) -> hyprstream_vfs::Subject {
+        annotations
+            .get(Self::SUBJECT_ANNOTATION)
+            .filter(|s| !s.is_empty())
+            .map(hyprstream_vfs::Subject::new)
+            .unwrap_or_else(|| hyprstream_vfs::Subject::new(sandbox.id.clone()))
+    }
+
+    /// Compose the per-sandbox tenant VFS (image rootfs + injected mounts) and
+    /// FUSE-mount it at a per-sandbox host directory (Model B, #715) — the
+    /// rootless-OCI sibling of nspawn's `compose_and_mount_vfs_root`.
+    ///
+    /// Returns the RAII [`SandboxFsLocalMount`](super::sandbox_fs::SandboxFsLocalMount);
+    /// the container then bind-mounts its `mountpoint()` at [`VFS_ROOT_CTR_PATH`]
+    /// (unlike nspawn, podman keeps its own image rootfs, so the tenant VFS is a
+    /// volume rather than the container root). Compose is CPU/IO-bound (RAFS
+    /// load), so it runs on a blocking thread; the mount's own serving thread is
+    /// spawned inside `serve_local_at`. The
+    /// [`require_fuse_mount_capability`](super::selection::require_fuse_mount_capability)
+    /// gate asserts oci is declared able to FUSE-mount before we mount
+    /// (fail-closed).
+    #[cfg(feature = "oci-image")]
+    async fn compose_and_mount_vfs_root(
+        &self,
+        sandbox: &PodSandbox,
+        image_id: &str,
+        subject: hyprstream_vfs::Subject,
+    ) -> Result<super::sandbox_fs::SandboxFsLocalMount> {
+        use super::sandbox_fs::SandboxFs;
+        use hyprstream_vfs::injected::SyntheticNode;
+
+        let rafs_store = self.rafs_store.clone().ok_or_else(|| {
+            WorkerError::SandboxCreationFailed(
+                "oci tenant-VFS mount requested but no RAFS image store is configured".into(),
+            )
+        })?;
+
+        // Fail-closed capability gate (#715): only POSIX-root the composed VFS
+        // for a backend that declares it can FUSE-mount it. oci does (rootless
+        // `/dev/fuse` feasibility measured positive on the target host).
+        super::selection::require_fuse_mount_capability(self.backend_type())?;
+
+        let mountpoint = sandbox.sandbox_path().join(VFS_ROOT_DIR);
+        let rt = tokio::runtime::Handle::current();
+        let image_id = image_id.to_owned();
+        let sandbox_dir = sandbox.sandbox_path().clone();
+        let mp = mountpoint.clone();
+
+        // RAFS load + overlay setup is blocking; do it off the async executor.
+        tokio::task::spawn_blocking(move || {
+            let fs = SandboxFs::compose(
+                &rafs_store,
+                &image_id,
+                &sandbox_dir,
+                subject,
+                // Models / deltas injected listings: empty mount points for now
+                // (the worker runtime populates them per tenant), mirroring
+                // nspawn and kata.
+                SyntheticNode::dir(),
+                SyntheticNode::dir(),
+            )?;
+            fs.serve_local_at(rt, mp)
+        })
+        .await
+        .map_err(|e| {
+            WorkerError::SandboxCreationFailed(format!("VFS compose/mount task join: {e}"))
+        })?
+    }
+
     /// Build the `podman run` argument list for a sandbox, threading the full CRI
     /// [`PodSandboxConfig`] (metadata, labels, annotations, resources, security
     /// context) into the invocation. `annotations` is the canonical annotation
     /// map supplied by the pool; it also drives image/env/mount/gpu selection.
+    ///
+    /// `vfs_root` is the host directory the tenant VFS was FUSE-mounted at (Model
+    /// B, #715). When `Some`, it is bind-mounted into the container at
+    /// [`VFS_ROOT_CTR_PATH`] via the same `--volume` seam podman already uses for
+    /// `hyprstream.io/mount.*` annotations; podman keeps its own OCI image
+    /// rootfs, so the tenant VFS is a mount *into* the container rather than its
+    /// root (the difference from nspawn's `--directory` rooting).
+    #[cfg_attr(not(feature = "oci-image"), allow(unused_variables))]
     fn build_run_args(
         &self,
         sandbox: &PodSandbox,
@@ -228,6 +378,7 @@ impl OciBackend {
         image: &str,
         config: &PodSandboxConfig,
         annotations: &HashMap<String, String>,
+        vfs_root: Option<&Path>,
     ) -> Vec<String> {
         let mut args: Vec<String> = vec!["run".into(), "--detach".into()];
 
@@ -290,6 +441,15 @@ impl OciBackend {
             }
         }
 
+        // Model B (#715): bind the composed tenant-VFS FUSE mount into the
+        // container at a well-known path (reusing the same `--volume` seam as the
+        // annotation mounts above). Rootless podman keeps its own image rootfs,
+        // so the tenant VFS is a volume rather than the container root.
+        #[cfg(feature = "oci-image")]
+        if let Some(root) = vfs_root {
+            args.push(format!("--volume={}:{}", root.display(), VFS_ROOT_CTR_PATH));
+        }
+
         // GPU pass-through when requested.
         let wants_gpu = annotations.get(ANN_GPU).is_some_and(|v| v == "true");
         if wants_gpu {
@@ -319,8 +479,17 @@ impl OciBackend {
             args.push("--read-only".into());
         }
 
-        // Image to run (positional, last before any command).
+        // Image to run (positional).
         args.push(image.to_owned());
+
+        // Optional workload command, appended after the image as argv. Absent →
+        // the image entrypoint runs (pause semantics). The Wanix-guest workload
+        // (#506) sets this to the injected guest binary path.
+        if let Some(cmd) = annotations.get(ANN_COMMAND) {
+            for tok in cmd.split_whitespace() {
+                args.push(tok.to_owned());
+            }
+        }
 
         args
     }
@@ -447,8 +616,49 @@ impl SandboxBackend for OciBackend {
         tokio::fs::create_dir_all(&sandbox_path).await?;
         sandbox.sandbox_path = sandbox_path.clone();
 
-        let run_args =
-            self.build_run_args(sandbox, &container_name, &image, config, annotations);
+        // Model B (#715): when an image store is configured and the sandbox
+        // names an image, compose the per-sandbox tenant VFS and FUSE-mount it,
+        // then bind that host directory into the container so the workload sees
+        // the tenant VFS — the rootless-OCI sibling of nspawn's `--directory`
+        // rooting and kata's virtio-fs path. Held on the handle so it outlives
+        // start and unmounts on teardown (RAII). Without a store (or image), oci
+        // stays a plain image-rooted container exactly as before.
+        #[cfg(feature = "oci-image")]
+        let vfs_root_mount: Option<Arc<super::sandbox_fs::SandboxFsLocalMount>> =
+            if self.rafs_store.is_some() {
+                if let Some(image_id) = sandbox.image_id.clone() {
+                    let subject = Self::sandbox_subject(sandbox, annotations);
+                    let mount = self
+                        .compose_and_mount_vfs_root(sandbox, &image_id, subject)
+                        .await?;
+                    info!(
+                        sandbox_id = %sandbox.id,
+                        mountpoint = %mount.mountpoint().display(),
+                        ctr_path = %VFS_ROOT_CTR_PATH,
+                        "Mounted tenant VFS into OCI container (Model B, #715)"
+                    );
+                    Some(Arc::new(mount))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        #[cfg(feature = "oci-image")]
+        let vfs_root_mountpoint: Option<PathBuf> =
+            vfs_root_mount.as_ref().map(|m| m.mountpoint().to_path_buf());
+        #[cfg(not(feature = "oci-image"))]
+        let vfs_root_mountpoint: Option<PathBuf> = None;
+
+        let run_args = self.build_run_args(
+            sandbox,
+            &container_name,
+            &image,
+            config,
+            annotations,
+            vfs_root_mountpoint.as_deref(),
+        );
 
         info!(
             sandbox_id = %sandbox.id,
@@ -490,6 +700,8 @@ impl SandboxBackend for OciBackend {
             image,
             container_id: container_id.clone(),
             sandbox_path,
+            #[cfg(feature = "oci-image")]
+            vfs_root_mount,
         });
 
         sandbox.mark_ready();
@@ -639,10 +851,26 @@ inventory::submit! {
         name: "oci",
         priority: 20,
         auto_selectable: true,
+        // A rootless OCI container bind-mounts host paths (`podman --volume`), so
+        // hyprstream can inject a host 9P Unix socket into the workload's mount
+        // namespace (#506) and set `HYPRSTREAM_9P_SOCK` for the guest to dial.
+        injects_9p_socket: true,
+        // Model B (#715): the rootless-userns `/dev/fuse` feasibility spike is
+        // resolved — measured positive on the target host (`/dev/fuse` opens in a
+        // rootless userns; rootless podman already runs on fuse-overlayfs). So oci
+        // composes the per-sandbox tenant VFS, FUSE-mounts it, and bind-mounts it
+        // into the container (the sibling of nspawn's `--directory` rooting and
+        // kata's virtio-fs path). It advertises the capability so the fail-closed
+        // gate ([`require_fuse_mount_capability`]) permits the mount.
+        mounts_fuse_vfs: true,
         is_available: OciBackend::registry_is_available,
         construct: |_ctx| {
-            Ok(std::sync::Arc::new(OciBackend::new(OciConfig::default()))
-                as std::sync::Arc<dyn crate::runtime::SandboxBackend>)
+            #[cfg(feature = "oci-image")]
+            let backend = OciBackend::new(OciConfig::default())
+                .with_rafs_store(Some(std::sync::Arc::clone(&_ctx.rafs_store)));
+            #[cfg(not(feature = "oci-image"))]
+            let backend = OciBackend::new(OciConfig::default());
+            Ok(std::sync::Arc::new(backend) as std::sync::Arc<dyn crate::runtime::SandboxBackend>)
         },
     }
 }
@@ -680,6 +908,8 @@ mod tests {
             image: "img:latest".into(),
             container_id: Some("deadbeef".into()),
             sandbox_path: PathBuf::from("/tmp/x"),
+            #[cfg(feature = "oci-image")]
+            vfs_root_mount: None,
         });
         let down = handle.as_any().downcast_ref::<OciHandle>();
         assert!(down.is_some());
@@ -759,6 +989,7 @@ mod tests {
             "alpine:latest",
             &cfg,
             &ann,
+            None,
         );
 
         // Identity threaded.
@@ -774,7 +1005,90 @@ mod tests {
         assert!(args.contains(&"--env=HYPRSTREAM_INSTANCE=sb-1".to_owned()));
         // Resources threaded.
         assert!(args.contains(&"--memory=134217728".to_owned()));
+        // No tenant-VFS bind when no FUSE mount was composed.
+        assert!(!args.iter().any(|a| a.contains(":/hyprstream")));
         // Image is the last positional argument.
         assert_eq!(args.last().unwrap(), "alpine:latest");
+    }
+
+    #[test]
+    fn command_annotation_appends_argv_after_image() {
+        // The Wanix-guest workload (#506) injects a `hyprstream.io/command`
+        // annotation; it must be threaded as argv *after* the image, and the
+        // injected 9P socket bind + env must survive too.
+        let backend = OciBackend::new(OciConfig::default());
+        let cfg = PodSandboxConfig::default();
+        let pod = new_pod("sb-9p", &cfg);
+
+        let mut ann = HashMap::new();
+        ann.insert(
+            "hyprstream.io/mount.9p-sock".into(),
+            "/run/hs/sb-9p/9p.sock:/run/hyprstream/9p.sock:rw".into(),
+        );
+        ann.insert(
+            "hyprstream.io/env.HYPRSTREAM_9P_SOCK".into(),
+            "/run/hyprstream/9p.sock".into(),
+        );
+        ann.insert("hyprstream.io/command".into(), "/usr/local/bin/wanix-guest".into());
+
+        let args = backend.build_run_args(&pod, "hyprstream-sb-9p", "alpine:latest", &cfg, &ann, None);
+
+        // Injected socket bind + env are threaded.
+        assert!(args
+            .contains(&"--volume=/run/hs/sb-9p/9p.sock:/run/hyprstream/9p.sock:rw".to_owned()));
+        assert!(args.contains(&"--env=HYPRSTREAM_9P_SOCK=/run/hyprstream/9p.sock".to_owned()));
+
+        // The command is the LAST arg, appearing AFTER the image.
+        assert_eq!(args.last().unwrap(), "/usr/local/bin/wanix-guest");
+        let img_idx = args.iter().position(|a| a == "alpine:latest").unwrap();
+        let cmd_idx = args.iter().position(|a| a == "/usr/local/bin/wanix-guest").unwrap();
+        assert!(cmd_idx > img_idx, "command must come after the image");
+    }
+
+    #[test]
+    fn command_annotation_key_matches_wanix_contract() {
+        // Single source of truth: the OCI consumer key must equal the wanix
+        // producer key (both are the same wire annotation).
+        assert_eq!(ANN_COMMAND, super::super::wanix_workload::ANN_WANIX_COMMAND);
+    }
+
+    /// Model B (#715): the OCI backend must advertise the FUSE tenant-VFS mount
+    /// capability in the real inventory now that rootless `/dev/fuse`
+    /// feasibility is confirmed, so the fail-closed gate resolves it Ok. This is
+    /// the sibling assertion to `nspawn_advertises_fuse_mount_capability_*`.
+    #[test]
+    fn oci_advertises_fuse_mount_capability_in_real_inventory() {
+        assert!(
+            crate::runtime::selection::require_fuse_mount_capability("oci").is_ok(),
+            "oci must advertise mounts_fuse_vfs (Model B #715)"
+        );
+    }
+
+    /// Model B (#715): when a tenant VFS was FUSE-mounted, its host directory is
+    /// bind-mounted into the container at the well-known path via the same
+    /// `--volume` seam as annotation mounts. Only meaningful when the image
+    /// service is compiled in (the mount path is `oci-image`-gated).
+    #[cfg(feature = "oci-image")]
+    #[test]
+    fn run_args_bind_tenant_vfs_when_present() {
+        let backend = OciBackend::new(OciConfig::default());
+        let cfg = PodSandboxConfig::default();
+        let pod = new_pod("sb-vfs", &cfg);
+        let ann = HashMap::new();
+
+        let mount = PathBuf::from("/run/hyprstream/sb-vfs/vfs-root");
+        let args = backend.build_run_args(
+            &pod,
+            "hyprstream-sb-vfs",
+            "alpine:latest",
+            &cfg,
+            &ann,
+            Some(mount.as_path()),
+        );
+
+        assert!(
+            args.contains(&format!("--volume={}:{}", mount.display(), VFS_ROOT_CTR_PATH)),
+            "tenant VFS must be bind-mounted at {VFS_ROOT_CTR_PATH}; got: {args:?}"
+        );
     }
 }

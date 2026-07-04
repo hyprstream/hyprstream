@@ -22,9 +22,10 @@
 //! no crypto dependency and so tests can use a trivial signer. The production wiring (using
 //! `MlDsaSigningKeyStore` + Ed25519) is in [`cose`].
 
-use crate::mac::lattice::{Lattice, LatticeCodecError};
+use crate::mac::lattice::{Lattice, LatticeCodecError, SecurityLabel};
 use crate::mac::te::TeMatrix;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 /// A compiled, distributable policy artifact: the TE matrix, **the S1 lattice it was
@@ -54,19 +55,59 @@ pub struct CompiledPolicy {
     /// PDP and every distributed AVC reconstruct an identical name↔bit vocabulary (no
     /// cross-process compartment-bit desync). Reconstruct via [`CompiledPolicy::lattice`].
     pub lattice_bytes: Vec<u8>,
+    /// Subject clearance provenance (#698, epic #547 activation prerequisite): the
+    /// authority-owned DID→clearance assignment, distributed inside this same signed
+    /// artifact rather than resolved live (D1, ratified 2026-07-03 — "no principal
+    /// authors the function that grants its own request", so this map is populated
+    /// only by whoever compiles+signs the policy, never by the subject itself).
+    ///
+    /// Keyed by the DID string ([`hyprstream_rpc::identity::Did::as_str`]) rather than
+    /// the `Did` newtype directly — `Did` does not derive `Ord`, and the plain string
+    /// is exactly what the grant path resolves against
+    /// ([`hyprstream_rpc::auth::ucan::token::Ucan::audience`] /
+    /// [`hyprstream_rpc::auth::ucan::token::Ucan::root_issuer`]). `BTreeMap` keeps
+    /// iteration (and therefore canonical serialization) sorted, so the artifact's
+    /// hash is deterministic regardless of enrollment insertion order (same
+    /// discipline as the matrix's sorted rule projection below).
+    ///
+    /// Empty by default (`CompiledPolicy::new`) — a node that never calls
+    /// [`Self::with_enrollment`] compiles a policy with no enrolled subjects, and
+    /// [`Self::clearance_for`] denies (returns `None`) for every DID, which is the
+    /// fail-closed direction until enrollment is actually populated.
+    pub enrollment: BTreeMap<String, SecurityLabel>,
 }
 
 impl CompiledPolicy {
     /// Compile a policy against an S1 [`Lattice`]. The generation is taken from the lattice
     /// version — they are definitionally equal (#570): the lattice that minted the
     /// compartment bits IS the policy generation. The lattice is embedded verbatim (its
-    /// canonical CBOR bytes) so it travels inside the signature.
+    /// canonical CBOR bytes) so it travels inside the signature. Enrollment starts empty;
+    /// attach it with [`Self::with_enrollment`].
     pub fn new(matrix: TeMatrix, lattice: &Lattice) -> Self {
         Self {
             generation: lattice.version().generation(),
             matrix,
             lattice_bytes: lattice.to_bytes(),
+            enrollment: BTreeMap::new(),
         }
+    }
+
+    /// Attach the authority-owned DID→clearance enrollment table (#698). Replaces any
+    /// previously attached table. The caller is the policy-compiling authority — this is
+    /// where an admin/UCAN-authored assignment becomes part of the signed artifact; the
+    /// grant path never constructs or mutates this map itself.
+    #[must_use]
+    pub fn with_enrollment(mut self, enrollment: BTreeMap<String, SecurityLabel>) -> Self {
+        self.enrollment = enrollment;
+        self
+    }
+
+    /// Look up a subject's authority-assigned clearance by DID string. `None` ⇒ the subject
+    /// is not enrolled ⇒ the caller MUST deny (no default clearance) — mirrors every other
+    /// S1 "unlabeled = denied" rule in this module tree.
+    #[must_use]
+    pub fn clearance_for(&self, did: &str) -> Option<SecurityLabel> {
+        self.enrollment.get(did).copied()
     }
 
     /// Reconstruct the embedded S1 [`Lattice`] from its canonical bytes. Fail-closed: a
@@ -103,6 +144,14 @@ struct CanonicalPolicy {
     allow: Vec<crate::mac::te::TeRule>,
     escalate: Vec<crate::mac::te::TeRule>,
     lattice_bytes: Vec<u8>,
+    /// #698: always present (never `skip_serializing_if`) — unlike `AuditRecord`'s
+    /// append-only hash chain, a `CompiledPolicy` is recompiled and re-signed whole
+    /// each generation, so there is no existing-artifact hash to preserve across the
+    /// schema's introduction. `BTreeMap` already serializes in sorted-key order, so
+    /// this needs no extra sort step (unlike `allow`/`escalate`, which come off a
+    /// `HashSet` and must be explicitly sorted for determinism).
+    #[serde(default)]
+    enrollment: BTreeMap<String, SecurityLabel>,
 }
 
 impl From<&CompiledPolicy> for CanonicalPolicy {
@@ -117,6 +166,7 @@ impl From<&CompiledPolicy> for CanonicalPolicy {
             allow,
             escalate,
             lattice_bytes: p.lattice_bytes.clone(),
+            enrollment: p.enrollment.clone(),
         }
     }
 }
@@ -255,6 +305,7 @@ impl<V: PolicyVerifier> PolicyLoader<V> {
             generation: canonical.generation,
             matrix,
             lattice_bytes: canonical.lattice_bytes,
+            enrollment: canonical.enrollment,
         };
 
         // The out-of-band generation must match the signed-in generation (no mismatch routing).
@@ -552,5 +603,104 @@ mod tests {
             loader.load(&signed),
             Err(PolicyDistError::GenerationMismatch { outer: 4, inner: 3 })
         ));
+    }
+
+    // ── #698: enrollment (subject clearance provenance) ─────────────────────
+
+    use crate::mac::lattice::{Assurance, CompartmentSet, Level};
+
+    fn label(level: Level) -> SecurityLabel {
+        SecurityLabel::new(level, Assurance::PqHybrid, CompartmentSet::EMPTY)
+    }
+
+    /// A policy with no attached enrollment denies (returns `None`) for every DID —
+    /// the fail-closed default until an authority actually populates the table.
+    #[test]
+    fn empty_policy_enrolls_nobody() {
+        let p = policy(1);
+        assert!(p.clearance_for("did:key:zAlice").is_none());
+    }
+
+    /// `with_enrollment` attaches the table; `clearance_for` looks up an enrolled DID
+    /// and denies (`None`) an unenrolled one.
+    #[test]
+    fn enrolled_did_resolves_unenrolled_denies() {
+        let enrollment =
+            BTreeMap::from([("did:key:zAlice".to_owned(), label(Level::Secret))]);
+        let p = policy(1).with_enrollment(enrollment);
+        assert_eq!(p.clearance_for("did:key:zAlice"), Some(label(Level::Secret)));
+        assert!(
+            p.clearance_for("did:key:zMallory").is_none(),
+            "an unenrolled DID must deny, not fall back to a default clearance"
+        );
+    }
+
+    /// The enrollment table round-trips through sign → wire bytes → verify → load,
+    /// exactly like the TE matrix and lattice it travels alongside — a node loading
+    /// the signed artifact gets the SAME enrollment the authority compiled, not a
+    /// live side-channel lookup.
+    #[test]
+    fn enrollment_round_trips_through_sign_and_load() {
+        let key = [11u8; 32];
+        let enrollment = BTreeMap::from([
+            ("did:key:zAlice".to_owned(), label(Level::Secret)),
+            ("did:key:zBob".to_owned(), label(Level::Confidential)),
+        ]);
+        let signed = sign_policy(
+            &policy(2).with_enrollment(enrollment.clone()),
+            &StubSigner { key },
+        )
+        .unwrap();
+        let loaded = PolicyLoader::new(StubVerifier { key }).load(&signed).unwrap();
+        assert_eq!(loaded.enrollment, enrollment);
+        assert_eq!(loaded.clearance_for("did:key:zBob"), Some(label(Level::Confidential)));
+    }
+
+    /// The enrollment table is covered content: tampering with it (without re-signing)
+    /// must fail signature verification at load, exactly like tampering with the TE
+    /// matrix or the lattice bytes — an attacker cannot smuggle a widened clearance in
+    /// by editing the wire bytes after signing.
+    #[test]
+    fn tampered_enrollment_fails_signature_verification() {
+        let key = [13u8; 32];
+        let enrollment =
+            BTreeMap::from([("did:key:zAlice".to_owned(), label(Level::Internal))]);
+        let signed = sign_policy(&policy(4).with_enrollment(enrollment), &StubSigner { key }).unwrap();
+
+        // Tamper: decode, widen Alice's clearance, re-encode — but keep the OLD signature.
+        let mut canonical: CanonicalPolicy = serde_json::from_slice(&signed.policy_bytes).unwrap();
+        canonical
+            .enrollment
+            .insert("did:key:zAlice".to_owned(), label(Level::Secret));
+        let tampered_bytes = serde_json::to_vec(&canonical).unwrap();
+        let tampered = SignedPolicy {
+            policy_bytes: tampered_bytes,
+            ..signed
+        };
+
+        let loader = PolicyLoader::new(StubVerifier { key });
+        assert!(
+            matches!(loader.load(&tampered), Err(PolicyDistError::BadSignature(_))),
+            "an enrollment tampered post-signing must fail verification, not silently widen clearance"
+        );
+    }
+
+    /// The enrollment field must not break hash determinism under reordering: the same
+    /// entries inserted in different orders (into a `BTreeMap`, so insertion order is
+    /// moot, but this guards the canonical-encoding path explicitly) produce the same
+    /// policy hash.
+    #[test]
+    fn enrollment_hash_is_order_independent() {
+        let a = BTreeMap::from([
+            ("did:key:zAlice".to_owned(), label(Level::Secret)),
+            ("did:key:zBob".to_owned(), label(Level::Confidential)),
+        ]);
+        let b = BTreeMap::from([
+            ("did:key:zBob".to_owned(), label(Level::Confidential)),
+            ("did:key:zAlice".to_owned(), label(Level::Secret)),
+        ]);
+        let pa = policy(6).with_enrollment(a);
+        let pb = policy(6).with_enrollment(b);
+        assert_eq!(pa.policy_hash().unwrap(), pb.policy_hash().unwrap());
     }
 }

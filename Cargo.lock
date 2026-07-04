@@ -1828,7 +1828,6 @@ dependencies = [
 name = "cas-serve"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "base64 0.22.1",
  "bytes",
  "dirs 5.0.1",
@@ -1840,8 +1839,6 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -6815,6 +6812,7 @@ dependencies = [
  "tokio-util",
  "toml 0.8.23",
  "tonic 0.12.3",
+ "tower 0.5.2",
  "tower-http",
  "tracing",
  "tracing-appender",
@@ -7252,6 +7250,7 @@ dependencies = [
  "glob",
  "hex",
  "hypervisor",
+ "hyprstream-9p",
  "hyprstream-rpc",
  "hyprstream-rpc-build",
  "hyprstream-rpc-derive",

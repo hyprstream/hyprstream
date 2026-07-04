@@ -1,7 +1,20 @@
 //! SSH-based CAS client for self-hosted XET servers.
 //!
+//! # DORMANT (#654)
+//!
+//! The `cas-serve` **binary** this backend `exec`'d over SSH (`ssh user@host
+//! cas-serve`, speaking NDJSON over stdio) has been **retired** — it was an
+//! identity-agnostic, provenance-free upload ingress, superseded by the
+//! authenticated in-process `putBlob` write path. As a result **this backend
+//! cannot connect to anything today**: there is no remote `cas-serve` process to
+//! spawn. It still *compiles* — it depends only on the `cas_serve` **library**
+//! protocol types (`Request` / `Response` / `ErrorCode`), not the binary — and
+//! is kept intact so it can be **repointed at the new dual-stack XET service**
+//! (epic #654, task #5) rather than rewritten from scratch. Until then, treat
+//! `SshStorage` as inert: do not wire it into a production fetch path.
+//!
 //! This module provides an [`SshStorage`] implementation that communicates with
-//! a remote `cas-serve` binary over SSH, enabling XET operations on self-hosted
+//! a remote CAS server over SSH, enabling XET operations on self-hosted
 //! infrastructure.
 //!
 //! # Architecture

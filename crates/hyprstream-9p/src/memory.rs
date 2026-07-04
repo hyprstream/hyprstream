@@ -106,21 +106,20 @@ impl Backend for MemoryBackend {
             .get(&fid)
             .ok_or_else(|| anyhow::anyhow!("unknown fid {fid}"))?;
         if link.is_dir {
-            // Directory read: synthesize a 9P readdir record per top-level file.
+            // Directory read: emit standard 9P2000.L Rreaddir dirent records
+            // (`qid[13] offset[8] type[1] name[s]`) — the same wire format the
+            // Mount export path and any standard client (incl. this crate's own
+            // `client.rs`, which parses via `parse_readdir_entries`) expect.
             let files = self.files.lock();
-            let mut out = Vec::new();
-            for (name, entry) in files.iter() {
-                out.extend_from_slice(&(name.len() as u32).to_le_bytes());
-                out.extend_from_slice(name.as_bytes());
-                out.push(0); // not dir
-                out.extend_from_slice(&(entry.bytes.len() as u64).to_le_bytes());
-            }
-            let off = offset as usize;
-            if off >= out.len() {
-                return Ok(Vec::new());
-            }
-            let end = (off + count as usize).min(out.len());
-            return Ok(out[off..end].to_vec());
+            let records: Vec<crate::msg::ReaddirEntry> = files
+                .iter()
+                .map(|(name, entry)| crate::msg::ReaddirEntry {
+                    qid: entry.qid.clone(),
+                    name: name.clone(),
+                })
+                .collect();
+            drop(files);
+            return Ok(crate::msg::encode_readdir_page(&records, offset, count));
         }
         let path = link.path.clone().unwrap_or_default();
         let files = self.files.lock();

@@ -165,3 +165,131 @@ impl hyprstream_rpc::auth::ucan::token::UcanVerifier for GlobalPqUcanVerifier {
         .map_err(|e| UcanError::BadSignature(e.to_string()))
     }
 }
+
+/// Process-global installed policy the [`exchange_enrollment_resolver`] seam reads.
+/// Mirrors `hyprstream_rpc::envelope::global_pq_store`'s pattern: a node loads and
+/// verifies a [`SignedPolicy`] via [`PolicyLoader`] at startup and installs the
+/// result once here; a node that hasn't leaves this `None` and the seam below
+/// fails closed.
+static COMPILED_POLICY: std::sync::OnceLock<std::sync::Arc<CompiledPolicy>> =
+    std::sync::OnceLock::new();
+
+/// Install the node's verified [`CompiledPolicy`] for the
+/// [`exchange_enrollment_resolver`] seam. Once-per-process (a second call is a
+/// no-op, matching `install_verify_config`'s contract). The caller MUST have
+/// already verified the policy via [`PolicyLoader`] — this does not re-verify.
+pub fn install_compiled_policy(policy: std::sync::Arc<CompiledPolicy>) {
+    let _ = COMPILED_POLICY.set(policy);
+}
+
+/// The installed [`CompiledPolicy`], if any. `None` on a node that hasn't loaded
+/// one — callers MUST fail closed (see [`exchange_enrollment_resolver`]), never
+/// substitute a permissive default.
+pub fn compiled_policy() -> Option<std::sync::Arc<CompiledPolicy>> {
+    COMPILED_POLICY.get().cloned()
+}
+
+/// The `SubjectContextResolver` for a delegated actor, backed by the signed
+/// policy's enrollment table (`CompiledPolicy::clearance_for`, #698 PR A).
+///
+/// **#698 Decision D** (operator-ratified, 2026-07-03): a delegated actor proves
+/// only DPoP possession of a classical ephemeral key at the grant path — UCAN
+/// chain validation (`GlobalPqUcanVerifier`, `require_pq: true`) proves *issuers*,
+/// never the audience — so this resolver clamps assurance to
+/// `VerifiedKeyMaterial::Classical` unconditionally, regardless of the enrolled
+/// clearance's own level/compartments. That is the truthful label for what the
+/// crypto actually proves; assigning anything higher would let an unverified
+/// actor claim PqHybrid assurance, defeating #548. An object labeled with a
+/// PqHybrid assurance requirement is therefore structurally unreachable through
+/// this resolver — by construction, not by a missing rule (see
+/// `docs/mac-architecture.md`). Raising a specific enrolled actor above Classical
+/// is the enrollment-key-registration follow-up (#718), not this resolver.
+///
+/// An unenrolled DID resolves to `None` — the existing fail-closed contract
+/// (`SubjectContextResolver::resolve`'s `None` ⇒ deny) is unchanged.
+pub struct EnrollmentSubjectContextResolver {
+    policy: std::sync::Arc<CompiledPolicy>,
+}
+
+impl EnrollmentSubjectContextResolver {
+    /// Construct a resolver over a verified, installed [`CompiledPolicy`].
+    pub fn new(policy: std::sync::Arc<CompiledPolicy>) -> Self {
+        Self { policy }
+    }
+}
+
+impl crate::services::oauth::token_exchange::SubjectContextResolver
+    for EnrollmentSubjectContextResolver
+{
+    fn resolve(&self, audience_did: &str) -> Option<SecurityContext> {
+        let clearance = self.policy.clearance_for(audience_did)?;
+        // Decision D: floor at Classical no matter what the enrollment table's
+        // clearance component says — the assurance axis is what's cryptographically
+        // proven here, not what's authorized.
+        Some(SecurityContext::from_clearance(
+            clearance,
+            VerifiedKeyMaterial::Classical,
+        ))
+    }
+}
+
+/// Construct the `SubjectContextResolver` the HTTP grant path resolves delegated
+/// actors' MAC context through (#698 Decision D).
+///
+/// Returns [`EnrollmentSubjectContextResolver`] when a compiled policy has been
+/// installed via [`install_compiled_policy`]; falls back to
+/// [`crate::services::oauth::token_exchange::DenyUnlabeledResolver`] (fail-closed)
+/// on a node that has not loaded one — mirrors [`exchange_ucan_verifier`]'s
+/// Option-to-fail-closed pattern.
+pub fn exchange_enrollment_resolver(
+) -> Box<dyn crate::services::oauth::token_exchange::SubjectContextResolver> {
+    match compiled_policy() {
+        Some(policy) => Box::new(EnrollmentSubjectContextResolver::new(policy)),
+        None => Box::new(crate::services::oauth::token_exchange::DenyUnlabeledResolver),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod enrollment_resolver_tests {
+    use super::*;
+    use crate::services::oauth::token_exchange::SubjectContextResolver as _;
+    use std::collections::BTreeMap;
+
+    fn test_lattice() -> Lattice {
+        Lattice::new(LatticeVersion(1), [])
+    }
+
+    fn policy_with(did: &str, clearance: SecurityLabel) -> std::sync::Arc<CompiledPolicy> {
+        let lattice = test_lattice();
+        let mut policy = CompiledPolicy::new(TeMatrix::default(), &lattice);
+        policy = policy.with_enrollment(BTreeMap::from([(did.to_owned(), clearance)]));
+        std::sync::Arc::new(policy)
+    }
+
+    #[test]
+    fn enrolled_did_resolves_at_classical_regardless_of_table_assurance() {
+        // Enrollment table asserts PqHybrid for this DID; the resolver must
+        // still floor the resulting SecurityContext at Classical (#698 Decision
+        // D) — the table's own assurance component is not authoritative here.
+        let clearance = SecurityLabel::new(Level::Secret, Assurance::PqHybrid, CompartmentSet::EMPTY);
+        let resolver =
+            EnrollmentSubjectContextResolver::new(policy_with("did:key:actor", clearance));
+
+        // enrolled DID must resolve
+        let ctx = resolver.resolve("did:key:actor").unwrap();
+
+        assert_eq!(ctx.clearance().assurance, Assurance::Classical);
+        assert_eq!(ctx.clearance().level, Level::Secret);
+    }
+
+    #[test]
+    fn unenrolled_did_denies() {
+        let resolver = EnrollmentSubjectContextResolver::new(policy_with(
+            "did:key:actor",
+            SecurityLabel::new(Level::Secret, Assurance::Classical, CompartmentSet::EMPTY),
+        ));
+
+        assert!(resolver.resolve("did:key:someone-else").is_none());
+    }
+}

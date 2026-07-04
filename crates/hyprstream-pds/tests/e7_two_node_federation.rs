@@ -716,8 +716,10 @@ fn hex_encode(bytes: &[u8]) -> String {
 //
 //   2. Content/weights fetch by OID over RPC ("getBlob" / CAS-by-OID). There is
 //      no RPC to fetch a git object or XET shard by OID/CID from a remote node.
-//      `cas-serve` exists but is not exposed as a fetch-by-OID RPC, and
-//      `services/model.rs` loads weights from LOCAL worktree paths only.
+//      The `cas_serve` CAS store (`CasStore`) exists in-process (the standalone
+//      cas-serve binary was retired in #654) but is not exposed as a
+//      fetch-by-OID RPC, and `services/model.rs` loads weights from LOCAL
+//      worktree paths only.
 //        NEEDED: a CAS/registry RPC `getBlob(cid) -> bytes` (git-raw OID and
 //        xet-xorb/xet-shard CIDs) so a peer streams the content addressed by the
 //        verified record's `currentOid`, replacing this test's `GET BLOB <oid>`.

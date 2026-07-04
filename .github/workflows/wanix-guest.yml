@@ -1,0 +1,51 @@
+name: wanix guest
+
+# CI-build the native Wanix guest (hyprstream #506, deliverable 2). This is a
+# FOREIGN-toolchain (Go) artifact that lives OUTSIDE the Cargo workspace, so it
+# is not covered by the Rust jobs. This standalone job builds it, vets it, and
+# runs its --self-test (which exercises the real 9P attach/walk/read + Wanix
+# NS().Bind wiring against a throwaway in-process 9P server). Torch-free, no
+# Rust, no cargo.
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'workers/wanix-guest/**'
+      - 'scripts/build-wanix-guest.sh'
+      - '.github/workflows/wanix-guest.yml'
+  pull_request:
+    paths:
+      - 'workers/wanix-guest/**'
+      - 'scripts/build-wanix-guest.sh'
+      - '.github/workflows/wanix-guest.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  wanix-guest:
+    name: build + vet + self-test wanix-guest
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: workers/wanix-guest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: self-test (mount + bind wiring)
+        run: go run . --self-test
+
+      - name: static build via script
+        working-directory: .
+        run: scripts/build-wanix-guest.sh

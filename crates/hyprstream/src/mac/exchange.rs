@@ -397,11 +397,12 @@ pub fn audited_evaluate_grant<V: UcanVerifier + ?Sized>(
     now: u64,
     request: &GrantRequest,
     subject: Option<&SecurityContext>,
+    on_behalf_of: Option<&SecurityContext>,
     sender_bound: bool,
     sink: &dyn crate::mac::audit::AuditSink,
 ) -> Result<GrantDecision, GrantError> {
     let result = evaluate_grant(grant, verifier, now, request, subject, sender_bound);
-    audit_grant_outcome(subject, request, &result, sink)
+    audit_grant_outcome(subject, on_behalf_of, request, &result, sink)
 }
 
 /// As [`evaluate_refresh`], with the same audit-then-decide wrapping as
@@ -415,11 +416,12 @@ pub fn audited_evaluate_refresh<V: UcanVerifier + ?Sized>(
     now: u64,
     request: &GrantRequest,
     subject: Option<&SecurityContext>,
+    on_behalf_of: Option<&SecurityContext>,
     sender_bound: bool,
     sink: &dyn crate::mac::audit::AuditSink,
 ) -> Result<GrantDecision, GrantError> {
     let result = evaluate_refresh(grant, verifier, now, request, subject, sender_bound);
-    audit_grant_outcome(subject, request, &result, sink)
+    audit_grant_outcome(subject, on_behalf_of, request, &result, sink)
 }
 
 /// Shared audit-then-decide core for [`audited_evaluate_grant`] /
@@ -430,11 +432,12 @@ pub fn audited_evaluate_refresh<V: UcanVerifier + ?Sized>(
 /// sentinel ids documented on [`crate::mac::te::GRANT_PATH_SUBJECT`]).
 fn audit_grant_outcome(
     subject: Option<&SecurityContext>,
+    on_behalf_of: Option<&SecurityContext>,
     request: &GrantRequest,
     result: &Result<GrantDecision, GrantError>,
     sink: &dyn crate::mac::audit::AuditSink,
 ) -> Result<GrantDecision, GrantError> {
-    use crate::mac::audit::{AuditRecord, DecisionReason};
+    use crate::mac::audit::{AuditRecord, DecisionReason, DelegationPrincipal};
     use crate::mac::te::{Action, ScopeAction, ACTION_UNRECOGNIZED, GRANT_PATH_OBJECT, GRANT_PATH_SUBJECT};
     use hyprstream_rpc::auth::mac::SecurityLabel;
 
@@ -469,6 +472,14 @@ fn audit_grant_outcome(
         policy_hash: None,
         subject_type: GRANT_PATH_SUBJECT,
         subject_clearance: subject.map(|s| *s.clearance()).unwrap_or_else(SecurityLabel::bottom),
+        // #680/#681: on a delegated grant the delegator (authority source) is
+        // recorded here; `subject_clearance` above is the effective met context
+        // the gates evaluated. Same GRANT_PATH_SUBJECT sentinel type — the
+        // clearance is the distinguishing field on the grant path.
+        on_behalf_of: on_behalf_of.map(|d| DelegationPrincipal {
+            subject_type: GRANT_PATH_SUBJECT,
+            subject_clearance: *d.clearance(),
+        }),
         object_type: GRANT_PATH_OBJECT,
         object_label: request.object_label.unwrap_or_else(SecurityLabel::bottom),
         action,
@@ -1191,6 +1202,7 @@ mod tests {
             NOW,
             &request,
             Some(&cleared_subject()),
+            None, // no delegator — single-principal (self-issued) grant
             true,
             &sink,
         );
@@ -1205,6 +1217,56 @@ mod tests {
         assert_eq!(recs[0].reason, crate::mac::audit::DecisionReason::Permit);
         assert_eq!(recs[0].subject_type, crate::mac::te::GRANT_PATH_SUBJECT);
         assert_eq!(recs[0].object_type, crate::mac::te::GRANT_PATH_OBJECT);
+        // Single-principal grant ⇒ no delegator recorded (#680/#681).
+        assert!(
+            recs[0].on_behalf_of.is_none(),
+            "a self-issued grant records no delegator"
+        );
+    }
+
+    /// #680/#681: a delegated grant records the DELEGATOR on the audit record's
+    /// `on_behalf_of`, distinct from the effective (met) `subject_clearance` the
+    /// gates evaluated — so the audit trail names both principals of a delegated
+    /// decision (the user-attribution #445 asks for), not just the actor.
+    #[test]
+    fn delegated_grant_records_delegator_as_on_behalf_of() {
+        let (grant, store) = root_grant(cap("mac://model/*", "model/read"));
+        let object_label =
+            SecurityLabel::new(Level::Confidential, Assurance::PqHybrid, comps(&[0]));
+        let request = req("mac://model/qwen", "model/read", object_label);
+        let sink = SpySink::new();
+
+        // The delegator (authority source): a DISTINCT clearance from the met
+        // subject (`cleared_subject` is Secret/{0,1}), so the record must not
+        // conflate the two.
+        let delegator = SecurityContext::new(Level::Secret, comps(&[0, 1, 2]), VerifiedKeyMaterial::PqHybrid);
+
+        let decision = audited_evaluate_grant(
+            &grant,
+            &store,
+            NOW,
+            &request,
+            Some(&cleared_subject()), // met context the gates evaluate
+            Some(&delegator),         // delegator, for two-principal audit
+            true,
+            &sink,
+        );
+        assert!(matches!(decision, Ok(GrantDecision::Permit(_))));
+
+        let recs = sink.records();
+        assert_eq!(recs.len(), 1);
+        // A delegated grant records its delegator.
+        let obo = recs[0].on_behalf_of.unwrap();
+        assert_eq!(
+            obo.subject_clearance,
+            *delegator.clearance(),
+            "on_behalf_of carries the delegator's own clearance"
+        );
+        assert_ne!(
+            obo.subject_clearance, recs[0].subject_clearance,
+            "delegator (on_behalf_of) is distinct from the met subject clearance"
+        );
+        assert_eq!(obo.subject_type, crate::mac::te::GRANT_PATH_SUBJECT);
     }
 
     /// The core #674 obligation: a would-be Permit that CANNOT be durably
@@ -1226,6 +1288,7 @@ mod tests {
             NOW,
             &request,
             Some(&cleared_subject()),
+            None, // no delegator — single-principal (self-issued) grant
             true,
             &sink,
         );
@@ -1268,6 +1331,7 @@ mod tests {
             NOW,
             &request,
             Some(&cleared_subject()),
+            None, // no delegator — single-principal (self-issued) grant
             true,
             &sink,
         );
@@ -1301,6 +1365,7 @@ mod tests {
             NOW,
             &request,
             Some(&cleared_subject()),
+            None, // no delegator — single-principal (self-issued) grant
             true,
             &sink,
         );
@@ -1326,6 +1391,7 @@ mod tests {
             NOW,
             &request,
             Some(&cleared_subject()),
+            None, // no delegator — single-principal (self-issued) grant
             true,
             &sink,
         );
