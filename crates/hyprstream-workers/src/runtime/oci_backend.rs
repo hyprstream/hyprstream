@@ -1031,7 +1031,7 @@ mod tests {
         );
         ann.insert("hyprstream.io/command".into(), "/usr/local/bin/wanix-guest".into());
 
-        let args = backend.build_run_args(&pod, "hyprstream-sb-9p", "alpine:latest", &cfg, &ann);
+        let args = backend.build_run_args(&pod, "hyprstream-sb-9p", "alpine:latest", &cfg, &ann, None);
 
         // Injected socket bind + env are threaded.
         assert!(args
