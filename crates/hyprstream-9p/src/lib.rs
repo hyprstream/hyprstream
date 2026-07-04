@@ -41,4 +41,4 @@ pub use backend::{Backend, OpenResult, StatResult, WalkResult};
 #[cfg(not(target_arch = "wasm32"))]
 pub use mount_backend::MountBackend;
 #[cfg(not(target_arch = "wasm32"))]
-pub use translator::{serve_mount_uds, FidTable, Translator};
+pub use translator::{serve_mount_uds, serve_mount_vsock, FidTable, Translator};
