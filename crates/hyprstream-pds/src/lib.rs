@@ -54,8 +54,10 @@ pub mod dag_cbor;
 pub mod event_group;
 pub mod list_record;
 pub mod mst;
+pub mod placement;
 pub mod record;
 pub mod tid;
 
 pub use cid::Cid;
+pub use placement::{GroupItemRecord, GroupRecord, NodeRecord, WorkloadRecord};
 pub use record::ModelRecord;
