@@ -663,10 +663,26 @@ fn emit_field_setter(
                     field.slot_offset
                 ));
             } else if let Some(inner) = super::extract_list_inner_type(&field.type_name) {
+                if let Some(method) = super::list_setter_method(inner) {
+                    // List(<scalar/Text/Data>) — the runtime has a direct setter
+                    // that takes the whole array (see capnp.ts).
+                    out.push_str(&format!(
+                        "{indent}{builder_var}.{method}({}, {value_expr});\n",
+                        field.slot_offset
+                    ));
+                } else if inner.starts_with("List(") {
+                    panic!(
+                        "ts_codegen: field `{}: {}` is a nested list (List(List(_))) — \
+                         the capnp.ts runtime does not yet support double indirection. \
+                         This must be implemented in message.rs before this field can be \
+                         referenced; a silently-dropped comment is not acceptable (#725).",
+                        field.name, field.type_name
+                    );
+                }
                 // List(Struct) — init struct list and set each element's fields.
                 // Claim a unique ID from the per-function counter so nested lists at
                 // the same capnp pointer slot never shadow each other (TDZ collision).
-                if let Some(sd) = structs.iter().find(|s| s.name == inner) {
+                else if let Some(sd) = structs.iter().find(|s| s.name == inner) {
                     let id = *counter;
                     *counter += 1;
                     let sl = format!("_sl{id}");
@@ -717,11 +733,14 @@ fn emit_field_setter(
                     out.push_str(&format!("{indent}  }});\n"));
                     out.push_str(&format!("{indent}}}\n"));
                 } else {
-                    out.push_str(&format!(
-                        "{indent}// {}: {} — struct definition not found\n",
-                        to_camel_case(&field.name),
-                        field.type_name
-                    ));
+                    panic!(
+                        "ts_codegen: field `{}: {}` references struct `{inner}`, which was \
+                         not found among the parsed schema's structs. This means the \
+                         generator has a dangling struct reference — regenerate the CGR \
+                         input and investigate the parser/resolution logic; this must never \
+                         silently degrade to a comment (#725).",
+                        field.name, field.type_name
+                    );
                 }
             } else if let Some(sd) = structs.iter().find(|s| s.name == field.type_name) {
                 if let Some(inner_name) = sd.option_inner_type() {
@@ -770,12 +789,13 @@ fn emit_field_setter(
                     out.push_str(&format!("{indent}}}\n"));
                 }
             } else {
-                // Unsupported pointer type — skip with comment
-                out.push_str(&format!(
-                    "{indent}// {}: {} — not yet supported by runtime\n",
-                    to_camel_case(&field.name),
-                    field.type_name
-                ));
+                panic!(
+                    "ts_codegen: field `{}: {}` is an unrecognized pointer type — neither a \
+                     primitive, a List(_), nor a known struct (e.g. AnyPointer/Interface are \
+                     not supported). This must be a hard generator error, never a silently \
+                     skipped comment (#725).",
+                    field.name, field.type_name
+                );
             }
         }
         FieldSection::Group => {} // groups are inlined, not handled here
@@ -1031,4 +1051,126 @@ fn emit_union_element_setter(
     }
     out.push_str(&format!("{indent}  default: break;\n"));
     out.push_str(&format!("{indent}}}\n"));
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use std::path::Path;
+
+    use hyprstream_rpc_build::schema::parse_from_cgr_path;
+    use hyprstream_rpc_build::schema::types::{FieldDef, FieldSection, ParsedSchema, StructDef};
+
+    /// A struct with a `List(Data)` field (mirrors #725's `certHashes: List(Data)`
+    /// repro in `streaming.capnp`'s `QuicReach`) plus a `List(Int64)` field
+    /// (mirrors `worker.capnp`'s `supplementalGroups`), to catch the whole
+    /// "any other currently-unresolved shapes" class the issue calls out, not
+    /// just the one named example.
+    const LIST_SCHEMA: &str = r#"
+@0xd00dfeeda00dfeed;
+
+struct Reach {
+  addr @0 :Text;
+  certHashes @1 :List(Data);
+  supplementalGroups @2 :List(Int64);
+}
+"#;
+
+    /// Compile `schema_src` to a CGR keyed on `name` and parse it. Uses a
+    /// per-(pid, name) temp dir so parallel tests don't collide.
+    fn parse_schema(name: &str, schema_src: &str) -> ParsedSchema {
+        let tmp =
+            std::env::temp_dir().join(format!("hyprstream_ts_bld_{name}_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+
+        let capnp_path = tmp.join(format!("{name}.capnp"));
+        std::fs::write(&capnp_path, schema_src).expect("write capnp");
+
+        let cgr_path = tmp.join(format!("{name}.cgr"));
+        capnpc::CompilerCommand::new()
+            .src_prefix(&tmp)
+            .file(&capnp_path)
+            .raw_code_generator_request_path(&cgr_path)
+            .run()
+            .expect("compile capnp to CGR");
+
+        let parsed = parse_from_cgr_path(Path::new(&cgr_path), name).expect("parse CGR");
+        let _ = std::fs::remove_dir_all(&tmp);
+        parsed
+    }
+
+    #[test]
+    fn list_data_and_list_scalar_fields_emit_real_setters_not_comments() {
+        let schema = parse_schema("reach", LIST_SCHEMA);
+        let mut out = String::new();
+        super::generate_struct_builders(&mut out, &schema);
+
+        // The #725 regression: these must never degrade to a comment.
+        assert!(
+            !out.contains("struct definition not found"),
+            "must never emit the silent-degrade comment:\n{out}"
+        );
+        assert!(
+            !out.contains("not yet supported by runtime"),
+            "must never emit the silent-degrade comment:\n{out}"
+        );
+
+        // certHashes: List(Data) must use the real runtime setter.
+        assert!(
+            out.contains(".setDataList("),
+            "expected a real setDataList call for List(Data):\n{out}"
+        );
+        // supplementalGroups: List(Int64) must use the real runtime setter too —
+        // this is the "any other currently-unresolved shapes" half of the fix.
+        assert!(
+            out.contains(".setInt64List("),
+            "expected a real setInt64List call for List(Int64):\n{out}"
+        );
+    }
+
+    /// A field whose type references a struct that isn't in the parsed
+    /// schema's `structs` list is a genuine generator bug (a dangling
+    /// reference) — it must be a hard build failure, never a silently
+    /// emitted comment.
+    #[test]
+    #[should_panic(expected = "dangling struct reference")]
+    fn dangling_struct_reference_in_list_field_panics() {
+        let field = FieldDef {
+            name: "ghosts".to_owned(),
+            type_name: "List(GhostStruct)".to_owned(),
+            description: String::new(),
+            fixed_size: None,
+            optional: false,
+            slot_offset: 0,
+            section: FieldSection::Pointer,
+            discriminant_value: 0xFFFF,
+            serde_rename: None,
+            domain_type: None,
+        };
+        let sd = StructDef {
+            name: "Haunted".to_owned(),
+            fields: vec![field],
+            has_union: false,
+            domain_type: None,
+            origin_file: None,
+            data_words: 0,
+            pointer_words: 1,
+            discriminant_count: 0,
+            discriminant_offset: 0,
+            union_arms: vec![],
+        };
+        let schema = ParsedSchema {
+            request_variants: vec![],
+            response_variants: vec![],
+            structs: vec![sd],
+            scoped_clients: vec![],
+            enums: vec![],
+            request_struct: None,
+            response_struct: None,
+        };
+
+        let mut out = String::new();
+        super::generate_struct_builders(&mut out, &schema);
+    }
 }

@@ -43,10 +43,17 @@ pub trait CodegenBackend {
     ///
     /// Returns `None` if this backend does not generate an index file.
     /// TypeScript overrides this to produce `index.ts` with re-exports.
+    ///
+    /// `module_contents` pairs each schema's module name with the full source
+    /// text already written for it, so the barrel generator can detect
+    /// cross-module export name collisions from the single source of truth
+    /// (the actual emitted symbols) instead of re-deriving naming rules
+    /// independently and risking drift.
     fn index_file(
         &self,
         _all_names: &[String],
         _client_names: &[String],
+        _module_contents: &[(String, String)],
     ) -> Option<(String, String)> {
         None
     }

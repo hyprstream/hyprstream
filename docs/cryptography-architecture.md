@@ -259,6 +259,43 @@ Ed25519 key but only the node/OAuth `#mesh-pq` VM is published, so remote per-se
 identities verify at the classical floor until each service publishes/anchors its own
 `#mesh-pq` via DID resolution (tracked under #137 / #279).
 
+### DPoP keys are a separate keyspace from DID identity keys (#698 Decision D)
+
+`PqTrustStore` anchors ML-DSA-65 keys to a subject's **DID identity key** — the same
+long-term key `GlobalPqUcanVerifier` uses to verify UCAN chain signatures
+(`require_pq: true`, hardcoded — every chain-validated **issuer** is cryptographically
+proven `PqHybrid` the moment `evaluate_grant` succeeds). DPoP proofs (RFC 9449), by
+design, use an ephemeral, per-session key that lives in a completely different
+keyspace and rotates freely — nothing in the protocol binds "this DPoP key" to "that
+DID's PQ-anchored identity key".
+
+This matters at the MAC grant path (see `docs/mac-architecture.md` §"Assurance is a
+labeling requirement") because chain validation only proves **issuers**; the UCAN
+**audience** (the delegated actor — e.g. MCP acting on a user's behalf) is only named,
+never a signer over the chain. Its only proof of possession is the DPoP proof itself,
+which proves classical-key possession and nothing about PQ anchoring.
+
+**Ratified decision (2026-07-03, on issue #698):** rather than inventing an ad hoc
+DPoP↔DID binding, a delegated actor's assurance is derived exclusively from what its
+key material cryptographically proves — Classical, unconditionally — until a
+sanctioned binding exists. Options considered and their disposition:
+
+| Option | Shape | Disposition |
+|---|---|---|
+| **A** | DPoP proof signed with the DID's own long-term identity key | Degenerate case of B, worse key hygiene (loses DPoP's per-session rotation) |
+| **B** | Enrollment-time registration: sign the enrolled DID's authorized actor key(s) into the enrollment table (`CompiledPolicy.enrollment`) | **Sanctioned upgrade path** — filed as #718; reuses the existing hybrid-PQC-signed policy artifact, no new trust surface |
+| **C** | Per-session hybrid-COSE attestation binding DPoP jkt → DID | New wire-format surface; deferred unless ephemeral rotation *at* PqHybrid assurance becomes a real requirement |
+| **D** | Floor delegated-actor assurance at Classical permanently | **Adopted now** — truthful, fail-closed, zero new protocol surface |
+
+`EnrollmentSubjectContextResolver` (`crates/hyprstream/src/mac/mod.rs`) implements
+Option D: it resolves clearance off the signed policy's enrollment table but clamps
+the resulting `SecurityContext`'s assurance to `VerifiedKeyMaterial::Classical` via
+`SecurityContext::from_clearance`'s `min(clearance.assurance, derived)` rule,
+regardless of what assurance the enrollment table itself asserts. #718 (Option B)
+extends this by letting an enrollment entry register a specific, PQ-anchored actor
+key; a DPoP proof key matching a registered key earns `PqHybrid` for that actor only
+— never as a blanket default.
+
 ## Envelope Confidentiality
 
 **Location:** `crates/hyprstream-rpc/src/crypto/envelope_crypto.rs`, `envelope.rs`

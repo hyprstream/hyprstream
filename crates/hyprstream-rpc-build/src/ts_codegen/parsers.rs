@@ -169,19 +169,22 @@ pub fn generate_parsers(out: &mut String, service_name: &str, schema: &ParsedSch
                     &format!("reader.getData({})", vf.slot_offset),
                 );
             }
-        } else if variant.type_name.starts_with("List(Text") {
-            if let Some(vf) = variant_field {
-                emit_return(
-                    out,
-                    &non_union_fields,
-                    &variant.name,
-                    &format!("reader.getTextList({})", vf.slot_offset),
-                );
-            }
         } else if let Some(inner) = super::extract_list_inner_type(&variant.type_name) {
-            // List(Struct) variant
             if let Some(vf) = variant_field {
-                if let Some(sd) = schema.structs.iter().find(|s| s.name == inner) {
+                if let Some(method) = super::list_getter_method(inner) {
+                    emit_return(
+                        out,
+                        &non_union_fields,
+                        &variant.name,
+                        &format!("reader.{method}({})", vf.slot_offset),
+                    );
+                } else if inner.starts_with("List(") {
+                    panic!(
+                        "ts_codegen: response variant `{}: {}` is a nested list \
+                         (List(List(_))) — not yet supported by the capnp.ts runtime (#725).",
+                        variant.name, variant.type_name
+                    );
+                } else if let Some(sd) = schema.structs.iter().find(|s| s.name == inner) {
                     emit_struct_list_read(
                         out,
                         "reader",
@@ -192,7 +195,12 @@ pub fn generate_parsers(out: &mut String, service_name: &str, schema: &ParsedSch
                         schema,
                     );
                 } else {
-                    emit_return(out, &non_union_fields, &variant.name, "[]");
+                    panic!(
+                        "ts_codegen: response variant `{}: {}` references struct `{inner}`, \
+                         which was not found in the parsed schema — dangling reference, must \
+                         not silently degrade (#725).",
+                        variant.name, variant.type_name
+                    );
                 }
             }
         } else {
@@ -363,15 +371,21 @@ pub fn generate_struct_parsers(out: &mut String, schema: &ParsedSchema) {
                     &variant.name,
                     &format!("reader.getData({})", variant.slot_offset),
                 );
-            } else if variant.type_name.starts_with("List(Text") {
-                emit_return(
-                    out,
-                    &non_union_fields,
-                    &variant.name,
-                    &format!("reader.getTextList({})", variant.slot_offset),
-                );
             } else if let Some(inner) = super::extract_list_inner_type(&variant.type_name) {
-                if let Some(isd) = schema.structs.iter().find(|s| s.name == inner) {
+                if let Some(method) = super::list_getter_method(inner) {
+                    emit_return(
+                        out,
+                        &non_union_fields,
+                        &variant.name,
+                        &format!("reader.{method}({})", variant.slot_offset),
+                    );
+                } else if inner.starts_with("List(") {
+                    panic!(
+                        "ts_codegen: union arm `{}: {}` is a nested list (List(List(_))) — \
+                         not yet supported by the capnp.ts runtime (#725).",
+                        variant.name, variant.type_name
+                    );
+                } else if let Some(isd) = schema.structs.iter().find(|s| s.name == inner) {
                     emit_struct_list_read(
                         out,
                         "reader",
@@ -382,7 +396,12 @@ pub fn generate_struct_parsers(out: &mut String, schema: &ParsedSchema) {
                         schema,
                     );
                 } else {
-                    emit_return(out, &non_union_fields, &variant.name, "[]");
+                    panic!(
+                        "ts_codegen: union arm `{}: {}` references struct `{inner}`, which \
+                         was not found in the parsed schema — dangling reference, must not \
+                         silently degrade (#725).",
+                        variant.name, variant.type_name
+                    );
                 }
             } else {
                 // Struct type
@@ -714,16 +733,23 @@ fn emit_inner_variant_read_from(
             let method = super::getter_method(type_name);
             format!("{reader_var}.{method}({byte_off})")
         }
-        t if t.starts_with("List(Text") => {
-            format!("{reader_var}.getTextList({})", f.slot_offset)
-        }
         t if t.starts_with("List(") => {
-            // List(Struct) — read as mapped array
             let inner = super::extract_list_inner_type(t).unwrap_or("");
-            if let Some(sd) = schema.structs.iter().find(|s| s.name == inner) {
+            if let Some(method) = super::list_getter_method(inner) {
+                format!("{reader_var}.{method}({})", f.slot_offset)
+            } else if inner.starts_with("List(") {
+                panic!(
+                    "ts_codegen: inner variant `{type_name}` is a nested list \
+                     (List(List(_))) — not yet supported by the capnp.ts runtime (#725)."
+                );
+            } else if let Some(sd) = schema.structs.iter().find(|s| s.name == inner) {
                 emit_struct_list_field_expr(reader_var, f.slot_offset, sd, schema)
             } else {
-                "[]".into()
+                panic!(
+                    "ts_codegen: inner variant `{type_name}` references struct `{inner}`, \
+                     which was not found in the parsed schema — dangling reference, must \
+                     not silently degrade (#725)."
+                );
             }
         }
         _ => {
@@ -849,21 +875,24 @@ fn emit_pointer_read_expr(
     depth: usize,
 ) -> String {
     match super::extract_list_inner_type(&field.type_name) {
-        Some("Text") => {
-            format!("{reader_var}.getTextList({})", field.slot_offset)
-        }
-        Some("Data") => {
-            format!("{reader_var}.getDataList({})", field.slot_offset)
-        }
         Some(inner) => {
-            // List(Struct) — look up struct def, map elements.
-            // For primitive lists (List(Int64), List(UInt32), etc.) we don't yet have
-            // a runtime getter, so emit a typed empty array to satisfy TypeScript.
-            if let Some(isd) = schema.structs.iter().find(|s| s.name == inner) {
+            if let Some(method) = super::list_getter_method(inner) {
+                format!("{reader_var}.{method}({})", field.slot_offset)
+            } else if inner.starts_with("List(") {
+                panic!(
+                    "ts_codegen: field `{}: {}` is a nested list (List(List(_))) — not yet \
+                     supported by the capnp.ts runtime (#725).",
+                    field.name, field.type_name
+                );
+            } else if let Some(isd) = schema.structs.iter().find(|s| s.name == inner) {
                 emit_struct_list_field_expr(reader_var, field.slot_offset, isd, schema)
             } else {
-                let elem_ts = super::capnp_to_ts_type(inner);
-                format!("([] as {elem_ts}[])")
+                panic!(
+                    "ts_codegen: field `{}: {}` references struct `{inner}`, which was not \
+                     found in the parsed schema — dangling reference, must not silently \
+                     degrade to an empty array (#725).",
+                    field.name, field.type_name
+                );
             }
         }
         None => {
@@ -1462,5 +1491,145 @@ struct Overflow {
             builder.contains("p.highWaterMark"),
             "group arm builder must write the leaf:\n{builder}"
         );
+    }
+
+    /// A struct with a `List(Data)` field (mirrors #725's `certHashes: List(Data)`
+    /// repro) plus a `List(Int64)` field (mirrors `worker.capnp`'s
+    /// `supplementalGroups`) — both must read through a real runtime getter,
+    /// never the old silent `[]` fallback.
+    const LIST_SCHEMA: &str = r#"
+@0xd00dfeeda00dfeef;
+
+struct Reach {
+  addr @0 :Text;
+  certHashes @1 :List(Data);
+  supplementalGroups @2 :List(Int64);
+}
+"#;
+
+    #[test]
+    fn list_data_and_list_scalar_fields_parse_with_real_getters() {
+        let schema = parse_schema("reachparse", LIST_SCHEMA);
+        let mut out = String::new();
+        super::generate_struct_parsers(&mut out, &schema);
+
+        assert!(
+            out.contains(".getDataList("),
+            "expected a real getDataList call for List(Data):\n{out}"
+        );
+        assert!(
+            out.contains(".getInt64List("),
+            "expected a real getInt64List call for List(Int64), not the old \
+             `([] as bigint[])` silent fallback:\n{out}"
+        );
+        assert!(
+            !out.contains("([] as "),
+            "must never silently fall back to a typed empty array:\n{out}"
+        );
+    }
+
+    /// Regression for #725 defect 2 (dropped `EndpointInfo.pubkey`/`selfProof`
+    /// fields): every field declared on a struct — including `Data` fields,
+    /// which is the field type that was dropped — must show up in both the
+    /// generated interface and the parser's return object. No field is ever
+    /// silently narrowed out of a regenerated struct.
+    const ENDPOINT_INFO_SCHEMA: &str = r#"
+@0xd00dfeeda00dfeec;
+
+struct EndpointInfo {
+  socketKind @0 :Text;
+  endpoint @1 :Text;
+  pubkey @2 :Data;
+  selfProof @3 :Data;
+  tlsDomain @4 :Text;
+}
+"#;
+
+    #[test]
+    fn all_struct_fields_are_preserved_none_silently_dropped() {
+        let schema = parse_schema("endpointinfo", ENDPOINT_INFO_SCHEMA);
+
+        let mut ifaces = String::new();
+        super::super::interfaces::generate_interfaces(&mut ifaces, &schema);
+        for field in ["socketKind", "endpoint", "pubkey", "selfProof", "tlsDomain"] {
+            assert!(
+                ifaces.contains(&format!("{field}:")),
+                "interface is missing field `{field}` — a regen must never \
+                 silently drop a schema field:\n{ifaces}"
+            );
+        }
+
+        let mut parser = String::new();
+        super::generate_struct_parsers(&mut parser, &schema);
+        for field in ["socketKind", "endpoint", "pubkey", "selfProof", "tlsDomain"] {
+            assert!(
+                parser.contains(field),
+                "parser is missing field `{field}` — a regen must never \
+                 silently drop a schema field:\n{parser}"
+            );
+        }
+        // The two Data fields specifically must read through the real getter,
+        // not be skipped.
+        assert!(parser.contains(".getData("), "{parser}");
+    }
+
+    /// A field whose type references a struct that isn't in the parsed
+    /// schema's `structs` list is a dangling reference — a genuine generator
+    /// bug — and must be a hard build failure, never a silently emitted
+    /// empty-array fallback.
+    #[test]
+    #[should_panic(expected = "dangling reference")]
+    fn dangling_struct_reference_in_list_response_variant_panics() {
+        use hyprstream_rpc_build::schema::types::{
+            FieldDef, FieldSection, StructDef, UnionVariant,
+        };
+
+        let response_struct = StructDef {
+            name: "GhostResponse".to_owned(),
+            fields: vec![FieldDef {
+                name: "ghosts".to_owned(),
+                type_name: "List(GhostStruct)".to_owned(),
+                description: String::new(),
+                fixed_size: None,
+                optional: false,
+                slot_offset: 0,
+                section: FieldSection::Pointer,
+                discriminant_value: 0,
+                serde_rename: None,
+                domain_type: None,
+            }],
+            has_union: true,
+            domain_type: None,
+            origin_file: None,
+            data_words: 0,
+            pointer_words: 1,
+            discriminant_count: 1,
+            discriminant_offset: 0,
+            union_arms: vec![],
+        };
+        let schema = ParsedSchema {
+            request_variants: vec![],
+            response_variants: vec![UnionVariant {
+                name: "ghosts".to_owned(),
+                type_name: "List(GhostStruct)".to_owned(),
+                description: String::new(),
+                scope: String::new(),
+                scope_exempt: false,
+                cli_hidden: false,
+                doc_example: String::new(),
+                vfs_path: String::new(),
+                vfs_kind: String::new(),
+                vfs_bulk: false,
+                vfs_hidden: false,
+            }],
+            structs: vec![],
+            scoped_clients: vec![],
+            enums: vec![],
+            request_struct: None,
+            response_struct: Some(response_struct),
+        };
+
+        let mut out = String::new();
+        super::generate_parsers(&mut out, "ghost", &schema);
     }
 }
