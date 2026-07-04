@@ -3556,6 +3556,16 @@ mod tests {
         )
         .await;
 
+        // Mirror the authenticated write path (putBlob calls xet_provenance.record):
+        // the repo legitimately contributed MERKLE_A's bytes, so the authoritative
+        // provenance gate is satisfied. Reconstruction/pointer match is the
+        // second gate.
+        service
+            .xet_provenance
+            .record(MERKLE_A, &repo_id.0.to_string())
+            .await
+            .expect("test: record provenance");
+
         let permitted = service
             .repo_contains_xet_merkle(&repo_id, MERKLE_A)
             .await
@@ -3592,6 +3602,16 @@ mod tests {
             &[("model.safetensors", &legit_pointer), ("planted.txt", &planted)],
         )
         .await;
+
+        // Bind only the legitimately-contributed content (MERKLE_A), as the
+        // authenticated putBlob write path would. MERKLE_B was never authentically
+        // written by this repo, so it stays unbound: the authoritative provenance
+        // gate denies it regardless of the planted reference in the tree.
+        service
+            .xet_provenance
+            .record(MERKLE_A, &repo_id.0.to_string())
+            .await
+            .expect("test: record provenance");
 
         let denied = service
             .repo_contains_xet_merkle(&repo_id, MERKLE_B)
