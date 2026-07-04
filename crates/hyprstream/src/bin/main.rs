@@ -49,7 +49,7 @@ use hyprstream_core::storage::{GitRef, ModelRef};
 use hyprstream_core::services::{PolicyClient, RegistryClient};
 // Worker service for Kata-based workload execution
 use hyprstream_workers::runtime::WorkerService;
-#[cfg(feature = "kata-vm")]
+#[cfg(feature = "oci-image")]
 use hyprstream_workers::ImageConfig;
 use hyprstream_workers::PoolConfig;
 use std::sync::Arc;
