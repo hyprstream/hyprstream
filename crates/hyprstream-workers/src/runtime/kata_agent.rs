@@ -97,6 +97,73 @@ use tokio::net::UnixStream;
 /// `kata-hypervisor`/`protocols` dependencies.
 pub const KATA_AGENT_VSOCK_PORT: u32 = 1024;
 
+/// Guest-side storage `driver` the kata-agent dispatches on to mount a
+/// virtio-fs share. Matches `kata_types::device::DRIVER_VIRTIOFS_TYPE`
+/// (`"virtio-fs"`, tag `3.31.0`), which `agent/src/storage/fs_handler.rs`'s
+/// `VirtioFsHandler` registers.
+const VIRTIOFS_STORAGE_DRIVER: &str = "virtio-fs";
+
+/// Guest-side filesystem type used to mount a virtio-fs share. The kata-agent
+/// `baremount`s the share with this `fstype` (`FS_TYPE_VIRTIO_FS = "virtiofs"`
+/// in upstream `runtime-rs/.../share_virtio_fs.rs`, tag `3.31.0`).
+const VIRTIOFS_FSTYPE: &str = "virtiofs";
+
+/// Base directory the kata-agent uses for per-container bundles inside the
+/// guest (`CONTAINER_BASE = "/run/kata-containers"` in `agent/src/rpc.rs`,
+/// tag `3.31.0`). The container's rootfs lives at `<base>/<cid>/rootfs`.
+const CONTAINER_BASE: &str = "/run/kata-containers";
+
+/// How the container's rootfs is provided to the guest.
+///
+/// hyprstream serves the **entire tenant VFS namespace** (with the rootfs
+/// mounted at `/` — RAFS lower + per-sandbox writable upper + the injected
+/// `/models` / `/deltas` / `/stream` mounts) over a **single** vhost-user-fs
+/// (virtio-fs) device attached to the hypervisor under a mount tag (see
+/// `sandbox_fs.rs` / `kata_backend::attach_share_fs`). This tells
+/// [`KataAgentClient::create_container`] to make the kata-agent mount that
+/// share, by tag, **as the container's rootfs** — so the container's
+/// filesystem *is* the tenant VFS.
+#[derive(Debug, Clone)]
+pub struct ContainerRootfs {
+    /// The virtio-fs mount tag the hypervisor attached the share under — the
+    /// `ShareFsDevice` `mount_tag` passed to
+    /// `kata_backend::KataBackend::attach_share_fs`.
+    pub virtiofs_mount_tag: String,
+}
+
+/// Guest path where the kata-agent expects (and, via `setup_bundle`, pivots
+/// into) a container's rootfs: `<CONTAINER_BASE>/<cid>/rootfs`.
+fn guest_rootfs_path(container_id: &str) -> String {
+    format!("{CONTAINER_BASE}/{container_id}/rootfs")
+}
+
+/// Build the `Storage` entry that makes the kata-agent mount the virtio-fs
+/// share (identified by `rootfs.virtiofs_mount_tag`) directly at the
+/// container's rootfs path inside the guest.
+///
+/// The agent's `VirtioFsHandler` → `common_storage_handler` → `mount_storage`
+/// `baremount`s `source` (the tag) as `fstype` (`virtiofs`) at `mount_point`,
+/// creating the destination directory first. Because we mount it **directly
+/// at `<CONTAINER_BASE>/<cid>/rootfs`**, the agent's `setup_bundle` finds the
+/// rootfs path already present (the virtio-fs mount) and uses it as-is — no
+/// bind-mount indirection, and no separate nested `passthrough/<cid>` layout
+/// (that layout is kata's multi-container *bundle* sharing; hyprstream serves
+/// exactly one rootfs per share). The tenant VFS root thereby becomes the
+/// container root. `Root.Path` in the OCI spec points at the same path (see
+/// [`build_minimal_spec`]).
+fn rootfs_storage(container_id: &str, rootfs: &ContainerRootfs) -> agent::Storage {
+    agent::Storage {
+        driver: VIRTIOFS_STORAGE_DRIVER.to_owned(),
+        source: rootfs.virtiofs_mount_tag.clone(),
+        fstype: VIRTIOFS_FSTYPE.to_owned(),
+        // `nodev`, matching upstream kata's `SHARED_DIR_VIRTIO_FS_OPTIONS`
+        // for the sandbox virtio-fs share.
+        options: vec!["nodev".to_owned()],
+        mount_point: guest_rootfs_path(container_id),
+        ..Default::default()
+    }
+}
+
 /// Default per-dial-attempt timeout.
 const DIAL_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -267,18 +334,33 @@ impl KataAgentClient {
     }
 
     /// `CreateContainer` — minimal OCI spec wired from `container_id` +
-    /// `argv`. See module docs: this is NOT a full OCI bundle translation
-    /// (no rootfs/mounts/namespaces from `PodSandbox` yet), just enough to
-    /// exercise the real RPC end to end.
+    /// `argv`, plus (when `rootfs` is supplied) a virtio-fs `Storage` entry
+    /// that mounts the tenant VFS share as the container's rootfs (#721).
+    ///
+    /// When `rootfs` is `None` the spec's `Root.Path` still points at
+    /// `<CONTAINER_BASE>/<cid>/rootfs`, but nothing is mounted there — the
+    /// guest must already have a rootfs at that path (the historical bare-VM
+    /// case, which fails `CreateContainer` with `No such file or directory`
+    /// precisely because it does not). Supplying `rootfs` is what makes the
+    /// tenant VFS *be* that rootfs; see [`ContainerRootfs`] / [`rootfs_storage`].
+    ///
+    /// This is still NOT a full OCI bundle translation (no devices/volumes/
+    /// namespaces from `PodSandbox`) — just enough to boot a container whose
+    /// filesystem is the hyprstream tenant VFS.
     pub async fn create_container(
         &self,
         container_id: &str,
         exec_id: &str,
         argv: &[String],
+        rootfs: Option<&ContainerRootfs>,
     ) -> Result<()> {
+        let storages = rootfs
+            .map(|r| vec![rootfs_storage(container_id, r)])
+            .unwrap_or_default();
         let req = agent::CreateContainerRequest {
             container_id: container_id.to_owned(),
             exec_id: exec_id.to_owned(),
+            storages,
             OCI: protobuf::MessageField::some(build_minimal_spec(container_id, argv)),
             ..Default::default()
         };
@@ -310,10 +392,17 @@ impl KataAgentClient {
     ///
     /// `argv` is only used if the container needs to be created (it seeds
     /// the OCI `Process.Args` — see [`build_minimal_spec`]); an already
-    /// existing container's original entrypoint is left untouched.
-    async fn ensure_container(&self, container_id: &str, argv: &[String]) -> Result<()> {
+    /// existing container's original entrypoint is left untouched. `rootfs`
+    /// (the tenant VFS virtio-fs share, #721) is likewise only consumed on
+    /// the create path.
+    async fn ensure_container(
+        &self,
+        container_id: &str,
+        argv: &[String],
+        rootfs: Option<&ContainerRootfs>,
+    ) -> Result<()> {
         let create_exec_id = format!("{container_id}-init");
-        match self.create_container(container_id, &create_exec_id, argv).await {
+        match self.create_container(container_id, &create_exec_id, argv, rootfs).await {
             Ok(()) => {}
             Err(e) if is_already_exists(&e) => {
                 tracing::debug!(container_id, "container already exists, skipping create");
@@ -337,6 +426,7 @@ impl KataAgentClient {
         let process = oci::Process {
             Args: argv.to_vec(),
             Cwd: "/".to_owned(),
+            Capabilities: protobuf::MessageField::some(default_capabilities()),
             ..Default::default()
         };
         let req = agent::ExecProcessRequest {
@@ -476,11 +566,12 @@ impl KataAgentClient {
         container_id: &str,
         argv: &[String],
         timeout: Duration,
+        rootfs: Option<&ContainerRootfs>,
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
         let exec_id = uuid::Uuid::new_v4().to_string();
 
         tokio::time::timeout(timeout, async {
-            self.ensure_container(container_id, argv).await?;
+            self.ensure_container(container_id, argv, rootfs).await?;
             self.exec_process(container_id, &exec_id, argv).await?;
             let status = self.wait_process(container_id, &exec_id).await?;
             let stdout = self.read_stdout_all(container_id, &exec_id).await.unwrap_or_default();
@@ -524,20 +615,61 @@ fn is_already_exists(err: &anyhow::Error) -> bool {
 
 /// Build a minimal `oci::Spec` sufficient to drive `CreateContainer` against
 /// a kata-agent. NOT a complete OCI bundle translation — see module docs.
+///
+/// `Root.Path` is `<CONTAINER_BASE>/<cid>/rootfs`, the guest path the agent's
+/// `setup_bundle` pivots into. When a [`ContainerRootfs`] is supplied to
+/// [`KataAgentClient::create_container`], the accompanying [`rootfs_storage`]
+/// mounts the tenant VFS virtio-fs share at exactly this path, so the tenant
+/// VFS becomes the container's filesystem (#721).
 fn build_minimal_spec(container_id: &str, argv: &[String]) -> oci::Spec {
     oci::Spec {
         Version: "1.0.2".to_owned(),
         Process: protobuf::MessageField::some(oci::Process {
             Args: argv.to_vec(),
             Cwd: "/".to_owned(),
+            Capabilities: protobuf::MessageField::some(default_capabilities()),
             ..Default::default()
         }),
         Root: protobuf::MessageField::some(oci::Root {
-            Path: format!("/run/kata-containers/{container_id}/rootfs"),
+            Path: guest_rootfs_path(container_id),
             Readonly: false,
             ..Default::default()
         }),
         Hostname: container_id.to_owned(),
+        ..Default::default()
+    }
+}
+
+/// Default OCI process capability set (the runc/OCI baseline). The kata-agent
+/// (rustjail) rejects `CreateContainer`/`ExecProcess` with `missing process
+/// capabilities` when `Process.Capabilities` is unset, so every container and
+/// exec process carries this standard bounding/effective/permitted set.
+fn default_capabilities() -> oci::LinuxCapabilities {
+    let caps: Vec<String> = [
+        "CAP_CHOWN",
+        "CAP_DAC_OVERRIDE",
+        "CAP_FSETID",
+        "CAP_FOWNER",
+        "CAP_MKNOD",
+        "CAP_NET_RAW",
+        "CAP_SETGID",
+        "CAP_SETUID",
+        "CAP_SETFCAP",
+        "CAP_SETPCAP",
+        "CAP_NET_BIND_SERVICE",
+        "CAP_SYS_CHROOT",
+        "CAP_KILL",
+        "CAP_AUDIT_WRITE",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    oci::LinuxCapabilities {
+        Bounding: caps.clone(),
+        Effective: caps.clone(),
+        Inheritable: caps.clone(),
+        Permitted: caps.clone(),
+        Ambient: caps,
         ..Default::default()
     }
 }
@@ -828,7 +960,7 @@ mod tests {
         let (client, fake, _server, _dir) = spin_up_fake_agent(0).await;
 
         client
-            .create_container("ctr-1", "exec-1", &["echo".into(), "hi".into()])
+            .create_container("ctr-1", "exec-1", &["echo".into(), "hi".into()], None)
             .await
             .unwrap();
 
@@ -837,6 +969,41 @@ mod tests {
         assert_eq!(seen.exec_id, "exec-1");
         assert!(seen.OCI.is_some());
         assert_eq!(seen.OCI.Process.Args, vec!["echo".to_owned(), "hi".to_owned()]);
+        // No rootfs supplied → no virtio-fs Storage entry.
+        assert!(seen.storages.is_empty(), "no rootfs → no storages");
+        assert_eq!(
+            seen.OCI.Root.Path, "/run/kata-containers/ctr-1/rootfs",
+            "Root.Path is the guest container rootfs path"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_container_mounts_tenant_vfs_as_rootfs() {
+        // #721: when a ContainerRootfs (tenant VFS virtio-fs mount tag) is
+        // supplied, CreateContainer carries a Storage entry that mounts that
+        // share, by tag, directly at the container's rootfs path — and
+        // Root.Path points at that same path.
+        let (client, fake, _server, _dir) = spin_up_fake_agent(0).await;
+
+        let rootfs = ContainerRootfs {
+            virtiofs_mount_tag: "hyprstream-vfs".to_owned(),
+        };
+        client
+            .create_container("ctr-1", "exec-1", &["true".into()], Some(&rootfs))
+            .await
+            .unwrap();
+
+        let seen = fake.last_create.lock().clone().unwrap();
+        assert_eq!(seen.storages.len(), 1, "exactly one rootfs Storage entry");
+        let st = &seen.storages[0];
+        assert_eq!(st.driver, "virtio-fs");
+        assert_eq!(st.source, "hyprstream-vfs", "source is the virtio-fs mount tag");
+        assert_eq!(st.fstype, "virtiofs");
+        assert_eq!(st.mount_point, "/run/kata-containers/ctr-1/rootfs");
+        assert_eq!(
+            seen.OCI.Root.Path, st.mount_point,
+            "Root.Path must equal the virtio-fs rootfs mount point"
+        );
     }
 
     #[tokio::test]
@@ -874,7 +1041,7 @@ mod tests {
         let (client, _fake, _server, _dir) = spin_up_fake_agent(42).await;
 
         let (status, stdout, stderr) = client
-            .exec("ctr-1", &["echo".into(), "hi".into()], Duration::from_secs(5))
+            .exec("ctr-1", &["echo".into(), "hi".into()], Duration::from_secs(5), None)
             .await
             .unwrap();
 
@@ -893,7 +1060,7 @@ mod tests {
         let (client, _fake, _server, _dir) = spin_up_fake_agent_with(fake).await;
 
         let result = client
-            .exec("ctr-1", &["echo".into()], Duration::from_millis(50))
+            .exec("ctr-1", &["echo".into()], Duration::from_millis(50), None)
             .await;
         assert!(result.is_err(), "exec must time out when wait_process stalls");
         assert!(result.unwrap_err().to_string().contains("timed out"));
@@ -909,7 +1076,7 @@ mod tests {
         let (client, _fake, _server, _dir) = spin_up_fake_agent_with(fake).await;
 
         let (status, _stdout, _stderr) = client
-            .exec("ctr-1", &["true".into()], Duration::from_secs(5))
+            .exec("ctr-1", &["true".into()], Duration::from_secs(5), None)
             .await
             .expect("exec must succeed despite ALREADY_EXISTS on create/start");
         assert_eq!(status, 5);

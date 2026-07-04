@@ -24,10 +24,17 @@ use crate::image::RafsStore;
 
 use super::backend::{SandboxBackend, SandboxHandle};
 use super::client::{CpuUsage, LinuxContainerResources, MemoryUsage, PodSandboxConfig};
-use super::kata_agent::{AgentAddress, KataAgentClient};
+use super::kata_agent::{AgentAddress, ContainerRootfs, KataAgentClient};
 use super::sandbox::PodSandbox;
 use super::sandbox_fs::{SandboxFs, SandboxFsServer, VFS_SOCKET_NAME};
 use hyprstream_vfs::{Subject, SyntheticNode};
+
+/// virtio-fs mount tag under which `start()` attaches the composed per-sandbox
+/// tenant VFS to Cloud Hypervisor. The guest's kata-agent mounts the share by
+/// this tag (see [`kata_agent::ContainerRootfs`](super::kata_agent::ContainerRootfs))
+/// as the container's rootfs (#721). A single, stable tag is used because
+/// exactly one VFS share is attached per sandbox.
+const ROOTFS_MOUNT_TAG: &str = "hyprstream-vfs";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Handle
@@ -47,6 +54,12 @@ pub struct KataHandle {
     /// `hyprstream-vfs-server`. Held for the VM's lifetime so the serving thread
     /// + injected registries outlive the guest; dropped on sandbox teardown.
     pub vfs_server: Option<SandboxFsServer>,
+    /// virtio-fs mount tag of the composed tenant VFS share attached to this
+    /// sandbox's VM, when one was attached (#721). `exec_sync` passes this to
+    /// the kata-agent so `CreateContainer` mounts the share, by tag, as the
+    /// container's rootfs. `None` when the VM booted its own rootfs with no
+    /// tenant VFS (e.g. `sandbox.image_id` unset).
+    pub rootfs_mount_tag: Option<String>,
     /// kata-agent ttrpc/vsock client (#344), connected lazily on first
     /// `exec_sync` call and cached for subsequent calls. `None` until then,
     /// or if the guest agent connection could not be established (e.g. the
@@ -64,6 +77,7 @@ impl std::fmt::Debug for KataHandle {
             .field("api_socket", &self.api_socket)
             .field("virtiofs_socket", &self.virtiofs_socket)
             .field("vfs_socket", &self.vfs_server.as_ref().map(SandboxFsServer::socket_path))
+            .field("rootfs_mount_tag", &self.rootfs_mount_tag)
             .finish_non_exhaustive()
     }
 }
@@ -433,10 +447,15 @@ impl SandboxBackend for KataBackend {
             .map_err(|e| WorkerError::VmStartFailed(format!("failed to prepare VM: {e}")))?;
 
         // Attach the composed VFS socket as a CH ShareFs device, after prepare_vm
-        // and before start_vm so it is folded into the boot VmConfig.
-        if let Some(ref socket) = share_socket {
-            Self::attach_share_fs(&hypervisor, &sandbox.id, socket, "hyprstream-vfs").await?;
-        }
+        // and before start_vm so it is folded into the boot VmConfig. Record the
+        // mount tag so `exec_sync` can tell the kata-agent to mount this share as
+        // the container's rootfs (#721).
+        let rootfs_mount_tag = if let Some(ref socket) = share_socket {
+            Self::attach_share_fs(&hypervisor, &sandbox.id, socket, ROOTFS_MOUNT_TAG).await?;
+            Some(ROOTFS_MOUNT_TAG.to_owned())
+        } else {
+            None
+        };
 
         let timeout_secs = i32::try_from(pool_config.create_timeout_secs).unwrap_or(i32::MAX);
         tracing::debug!(sandbox_id = %sandbox.id, timeout_secs, "Starting VM");
@@ -457,6 +476,7 @@ impl SandboxBackend for KataBackend {
             api_socket,
             virtiofs_socket: virtiofs_sock,
             vfs_server,
+            rootfs_mount_tag,
             agent: tokio::sync::Mutex::new(None),
         });
 
@@ -536,6 +556,9 @@ impl SandboxBackend for KataBackend {
                     // The per-sandbox VFS server is not reusable across resets;
                     // a recycled sandbox composes a fresh one on next start.
                     vfs_server: None,
+                    // Fresh compose+attach on next start re-establishes the tag;
+                    // the old container (and its rootfs mount) is torn down.
+                    rootfs_mount_tag: None,
                     // A reused (warm-pool) sandbox keeps the same VM, but the
                     // container(s) inside it are torn down — drop any cached
                     // agent connection so the next `exec_sync` reconnects
@@ -601,6 +624,13 @@ impl SandboxBackend for KataBackend {
             if let Some(kata) = handle.as_any().downcast_ref::<KataHandle>() {
                 Self::attach_share_fs(&kata.hypervisor, &sandbox.id, server.socket_path(), &mount_tag)
                     .await?;
+                // TODO(#721): a namespace delivered here becomes visible over
+                // virtio-fs but is NOT recorded as the container rootfs tag on
+                // the (already-constructed, shared) `KataHandle`, so a later
+                // `exec_sync` won't mount it as rootfs. The boot-time rootfs
+                // path (`start()` → `rootfs_mount_tag`) is what #721 wires;
+                // making a post-start delivered namespace the container rootfs
+                // needs interior mutability on the handle (or a re-create RPC).
             }
         }
 
@@ -645,8 +675,24 @@ impl SandboxBackend for KataBackend {
         // one Kata VM are a separate concern from #344's vsock/ttrpc client).
         let container_id = sandbox.id.clone();
 
+        // When a tenant VFS was attached at boot (#721), tell the kata-agent to
+        // mount that virtio-fs share, by tag, as the container's rootfs — so
+        // `CreateContainer` finds a real rootfs at `<CONTAINER_BASE>/<cid>/rootfs`
+        // (the tenant VFS) instead of failing `No such file or directory`.
+        let rootfs = kata
+            .rootfs_mount_tag
+            .as_ref()
+            .map(|tag| ContainerRootfs {
+                virtiofs_mount_tag: tag.clone(),
+            });
+
         match client
-            .exec(&container_id, command, std::time::Duration::from_secs(timeout_secs))
+            .exec(
+                &container_id,
+                command,
+                std::time::Duration::from_secs(timeout_secs),
+                rootfs.as_ref(),
+            )
             .await
         {
             Ok(out) => Ok(out),
@@ -983,6 +1029,7 @@ mod tests {
             api_socket: sandbox_path.join("test.sock"),
             virtiofs_socket: Some(sandbox_path.join("virtiofs.sock")),
             vfs_server: None,
+            rootfs_mount_tag: None,
             agent: tokio::sync::Mutex::new(None),
         })
     }
