@@ -41,17 +41,24 @@
 //! the harness author. Do not remove the self-skip guard to "just verify it
 //! boots".
 //!
-//! ## Known driving-API gaps (see `TODO(#721)` below)
+//! ## Tenant VFS as container rootfs (#721)
 //!
-//! * `PodSandbox::image_id` is `pub(crate)` with no public setter, so an
-//!   external harness cannot instruct `start()` to compose+attach a *tenant*
-//!   VFS as the guest's virtio-fs share. `start()` therefore boots the bare
-//!   guest rootfs; the tenant-file-over-virtio-fs assertion is blocked on
-//!   exposing that seam.
-//! * `image::rafs_builder::build_rafs_bootstrap` is `pub(crate)`, so an
-//!   external harness cannot synthesize a RAFS tenant image; the
-//!   `SandboxFs::compose` + `serve_on` surface is exercised only when a
-//!   pre-built RAFS image id is supplied via `HYPRSTREAM_KATA_RAFS_IMAGE_ID`.
+//! `PodSandbox::set_image_id` (the doc-hidden seam) lets this external harness
+//! instruct `start()` to compose + serve + attach the per-sandbox **tenant
+//! VFS** as the guest's virtio-fs rootfs share. `start()` records the mount
+//! tag; `exec_sync` then tells the kata-agent (`CreateContainer`) to mount
+//! that share, by tag, as the container's rootfs at
+//! `/run/kata-containers/<cid>/rootfs`. So — with `HYPRSTREAM_KATA_RAFS_IMAGE_ID`
+//! set to a pre-built RAFS image in the store — the container's filesystem is
+//! the hyprstream tenant VFS (RAFS rootfs + injected `/models` `/deltas`
+//! `/stream`), which the assertion below verifies.
+//!
+//! ## Remaining gap (see `TODO(#721)`)
+//!
+//! * `image::rafs_builder::build_rafs_bootstrap` is `pub(crate)`, so this
+//!   external harness cannot synthesize a RAFS tenant image itself; the
+//!   tenant-VFS-rootfs path is exercised only when a pre-built RAFS image id
+//!   is supplied via `HYPRSTREAM_KATA_RAFS_IMAGE_ID`.
 
 #![cfg(feature = "kata-vm")]
 // This is an opt-in operator harness: it intentionally prints skip reasons to
@@ -63,12 +70,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use hyprstream_workers::runtime::{
-    KataBackend, PodSandbox, PodSandboxConfig, SandboxBackend, SandboxFs, VFS_SOCKET_NAME,
-};
+use hyprstream_workers::runtime::{KataBackend, PodSandbox, PodSandboxConfig, SandboxBackend};
 use hyprstream_workers::{HypervisorType, ImageConfig, PoolConfig, RafsStore};
-
-use hyprstream_vfs::{Subject, SyntheticNode};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -192,53 +195,24 @@ async fn kata_spawn_e2e() -> TestResult {
 
     let (image_config, rafs_store) = image_store(scratch.path())?;
 
-    // ─────────────────────────────────────────────────────────────────────
-    // (Optional) tenant VFS: compose + serve_on over vhost-user-fs.
-    //
-    // Exercises the public `SandboxFs::compose` → `serve_on` surface that the
-    // backend's own `start()` uses internally. Gated on a pre-built RAFS image
-    // id because:
+    // Optional tenant VFS: when a pre-built RAFS image id is supplied, we tell
+    // `start()` (via `set_image_id` below) to compose + serve + attach that
+    // image's tenant VFS as the guest's virtio-fs rootfs share (#721). When
+    // absent, the VM boots its own `PoolConfig::vm_image` rootfs and the
+    // container has no rootfs (the historical failure #721 targets), so the
+    // exec assertion is relaxed to the bare-guest smoke below.
     //
     // TODO(#721): `image::rafs_builder::build_rafs_bootstrap` is `pub(crate)`,
     // so this external harness cannot synthesize a tenant RAFS image itself.
     // Supply `HYPRSTREAM_KATA_RAFS_IMAGE_ID` pointing at an image already
-    // present in the store to drive this path; otherwise it is skipped.
-    // ─────────────────────────────────────────────────────────────────────
-    if let Ok(image_id) = std::env::var("HYPRSTREAM_KATA_RAFS_IMAGE_ID") {
-        let subject = Subject::new("tenant-721");
-        // A couple of injected files so the guest would see /models/... content.
-        let models = SyntheticNode::dir().with_child(
-            "hello",
-            SyntheticNode::file(b"hello-from-tenant-vfs\n".to_vec()),
-        );
-        let deltas = SyntheticNode::dir();
-        let sandbox_dir = scratch.path().join("tenant-fs");
-        std::fs::create_dir_all(&sandbox_dir)?;
-
-        let fs = SandboxFs::compose(
-            &rafs_store,
-            &image_id,
-            &sandbox_dir,
-            subject,
-            models,
-            deltas,
-        )?;
-        let socket = sandbox_dir.join(VFS_SOCKET_NAME);
-        let server = fs.serve_on(socket.clone(), tokio::runtime::Handle::current())?;
-        assert_eq!(
-            server.socket_path(),
-            socket.as_path(),
-            "serve_on must expose the socket we attach to Cloud Hypervisor"
-        );
-        println!(
-            "[kata_spawn_e2e] tenant VFS served on {}",
-            server.socket_path().display()
-        );
-    } else {
-        println!(
-            "[kata_spawn_e2e] tenant-VFS compose/serve skipped \
+    // present in the store to drive the tenant-VFS-as-rootfs path.
+    let rafs_image_id = std::env::var("HYPRSTREAM_KATA_RAFS_IMAGE_ID").ok();
+    match &rafs_image_id {
+        Some(id) => println!("[kata_spawn_e2e] tenant VFS rootfs from RAFS image {id}"),
+        None => println!(
+            "[kata_spawn_e2e] tenant-VFS rootfs skipped \
              (set HYPRSTREAM_KATA_RAFS_IMAGE_ID to exercise it)"
-        );
+        ),
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -259,11 +233,13 @@ async fn kata_spawn_e2e() -> TestResult {
     let sandbox_path = runtime_dir.join(&sandbox_id);
     let mut sandbox = PodSandbox::new(sandbox_id.clone(), &sandbox_config, sandbox_path);
 
-    // TODO(#721): no public setter for `PodSandbox::image_id`, so `start()`
-    // cannot be told to compose+attach the tenant VFS as this guest's
-    // virtio-fs share. The VM boots its own rootfs (`PoolConfig::vm_image`);
-    // wiring the tenant share end-to-end (and asserting a tenant file is
-    // visible over virtio-fs) needs that seam exposed.
+    // #721: hand `start()` the tenant image id so it composes + serves + attaches
+    // the tenant VFS as this guest's virtio-fs rootfs share (and records the
+    // mount tag `exec_sync` uses to mount it as the container's rootfs). Without
+    // this, `start()` attaches no share and the container has no rootfs.
+    if let Some(ref id) = rafs_image_id {
+        sandbox.set_image_id(id.clone());
+    }
     let annotations: HashMap<String, String> = HashMap::new();
 
     // NOTE: this call boots a real Cloud Hypervisor guest. It only runs after
@@ -280,20 +256,34 @@ async fn kata_spawn_e2e() -> TestResult {
     //
     // `exec_sync` lazily dials the guest agent over hybrid-vsock
     // (`guest_agent_client`), then drives CreateContainer → StartContainer →
-    // ExecProcess → WaitProcess. `cat`-ing a file that exists in the kata
-    // guest rootfs confirms the agent is reachable and a container-in-VM ran.
+    // ExecProcess → WaitProcess. When a tenant VFS was attached, `exec_sync`
+    // tells CreateContainer to mount that virtio-fs share as the container's
+    // rootfs, so the exec runs with the tenant VFS as its filesystem.
     //
-    // TODO(#721): once the tenant-VFS seam above is wired, switch this to
-    // `cat /models/hello` and assert `b"hello-from-tenant-vfs\n"` to prove the
-    // tenant share is visible over virtio-fs (the issue's real target).
+    // Proof that the tenant VFS *is* the container rootfs: the injected
+    // hyprstream mounts (`/models`, `/deltas`, `/stream`) live at the tenant
+    // VFS root and therefore at the container's `/`. They do NOT exist in a
+    // bare kata guest rootfs, so listing `/` inside the container and seeing
+    // them is unambiguous evidence the virtio-fs share is the container's
+    // filesystem. (The bare-guest fallback, with no tenant VFS, can only smoke
+    // that the agent + a container ran at all.)
+    //
+    // This is what the OPERATOR BOOT will validate: on a real kata 3.31.0
+    // microVM the `ls /` below must exit 0 and its stdout must contain
+    // `models`, `deltas`, and `stream` — i.e. the tenant VFS mounted over
+    // virtio-fs is the container's root.
+    //
+    // TODO(#721): once `build_rafs_bootstrap` is exposed to this harness (or
+    // an injected-content seam exists), also `cat` a known file the tenant VFS
+    // injects (e.g. `/models/<id>/...`) and assert its bytes.
     // ─────────────────────────────────────────────────────────────────────
-    let exec_result = backend
-        .exec_sync(
-            &sandbox,
-            &["cat".to_owned(), "/etc/hostname".to_owned()],
-            30,
-        )
-        .await;
+    let tenant_vfs = rafs_image_id.is_some();
+    let exec_argv: Vec<String> = if tenant_vfs {
+        vec!["ls".to_owned(), "-1".to_owned(), "/".to_owned()]
+    } else {
+        vec!["cat".to_owned(), "/etc/hostname".to_owned()]
+    };
+    let exec_result = backend.exec_sync(&sandbox, &exec_argv, 30).await;
 
     // Always attempt teardown, even if exec failed, so a booted VM is never
     // left running past the test.
@@ -306,16 +296,27 @@ async fn kata_spawn_e2e() -> TestResult {
         }
     };
 
+    let stdout_str = String::from_utf8_lossy(&stdout);
     println!(
-        "[kata_spawn_e2e] guest exec exit={exit_code} stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&stdout),
+        "[kata_spawn_e2e] guest exec ({:?}) exit={exit_code} stdout={stdout_str:?} stderr={:?}",
+        exec_argv,
         String::from_utf8_lossy(&stderr)
     );
-    assert_eq!(exit_code, 0, "cat in guest should exit 0");
-    assert!(
-        !stdout.is_empty(),
-        "guest /etc/hostname should be non-empty (proves the container-in-VM ran)"
-    );
+    assert_eq!(exit_code, 0, "guest exec should exit 0");
+    if tenant_vfs {
+        for injected in ["models", "deltas", "stream"] {
+            assert!(
+                stdout_str.lines().any(|l| l.trim() == injected),
+                "container `/` must list injected tenant-VFS mount `/{injected}` \
+                 (proves the virtio-fs tenant VFS is the container rootfs); got: {stdout_str:?}"
+            );
+        }
+    } else {
+        assert!(
+            !stdout.is_empty(),
+            "guest /etc/hostname should be non-empty (proves the container-in-VM ran)"
+        );
+    }
 
     // ─────────────────────────────────────────────────────────────────────
     // Teardown: stop the VM and remove all runtime state.
