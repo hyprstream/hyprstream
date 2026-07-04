@@ -853,6 +853,10 @@ inventory::submit! {
         priority: 100,
         // Full VM isolation (strongest tier) → eligible for `"auto"`.
         auto_selectable: true,
+        // kata already shares the composed per-sandbox VFS with its guest as a
+        // virtio-fs (vhost-user-fs) device, NOT a host FUSE mount, so it does not
+        // advertise the Model B (#715) host-FUSE-mount capability.
+        mounts_fuse_vfs: false,
         is_available: KataBackend::registry_is_available,
         construct: |ctx| {
             Ok(Arc::new(KataBackend::new(

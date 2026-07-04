@@ -48,7 +48,7 @@ use std::sync::Arc;
 
 use hyprstream_vfs::injected::{StreamMount, StreamRegistry, SyntheticMount, SyntheticNode};
 use hyprstream_vfs::{Mount, Namespace, Subject};
-use hyprstream_vfs_server::{serve, VfsFileSystem};
+use hyprstream_vfs_server::{serve, serve_local, VfsFileSystem};
 
 use crate::error::{Result, WorkerError};
 use crate::image::{image_fs_for, RafsStore};
@@ -212,6 +212,81 @@ impl SandboxFs {
             _thread: thread,
         })
     }
+
+    /// FUSE-mount this composed namespace at `mountpoint` as a real host
+    /// directory — the **non-VM sibling of [`serve_on`]** (Model B, #715).
+    ///
+    /// Where [`serve_on`] serves the [`VfsFileSystem`] to a **VM** guest over
+    /// vhost-user-fs (virtio-fs), this serves the *same* down-adapter to the
+    /// **host kernel** over `/dev/fuse` via
+    /// [`hyprstream_vfs_server::serve_local`], so a non-VM sandbox (e.g.
+    /// `systemd-nspawn --directory=<mountpoint>`) can POSIX-root its workload
+    /// directly in the tenant's composed VFS. Any host process that enters the
+    /// sandbox — the inference workload, a shell — then sees the tenant VFS as
+    /// its filesystem, closing the "run a task" gap (#506) for the POSIX case.
+    ///
+    /// ## Subject preservation (MAC-conservative)
+    ///
+    /// The [`Subject`] is preserved **automatically**: [`into_filesystem`] bakes
+    /// it into the [`VfsFileSystem`], so every VFS op driven over the FUSE
+    /// channel is attributed to this sandbox's single Subject at the Mount
+    /// boundary (Subject-per-call). Because the mount is **per-sandbox** and
+    /// served under **one** Subject, there is no uid→Subject mapping to invent
+    /// (and none is invented): every operation over this mount is correctly
+    /// attributed to the sandbox principal, exactly as the virtio-fs path is.
+    ///
+    /// Rootless-userns uid-mapping / `allow_other` nuances (e.g. an unprivileged
+    /// `/dev/fuse` under a podman `--userns=keep-id` remapping) are **out of
+    /// scope** for the nspawn target, which runs closer to the host; they are
+    /// deferred to the OCI/rootless-FUSE feasibility spike (#715 / #617).
+    ///
+    /// [`serve_local`] **blocks** until the mount is torn down, so it runs on a
+    /// dedicated OS thread; the returned [`SandboxFsLocalMount`] unmounts and
+    /// joins that thread on drop (RAII), mirroring [`SandboxFsServer`].
+    ///
+    /// `mountpoint` is created (`create_dir_all`) if absent. `rt` is captured for
+    /// the down-adapter's async→sync bridge.
+    ///
+    /// [`into_filesystem`]: SandboxFs::into_filesystem
+    pub fn serve_local_at(
+        self,
+        rt: tokio::runtime::Handle,
+        mountpoint: PathBuf,
+    ) -> Result<SandboxFsLocalMount> {
+        std::fs::create_dir_all(&mountpoint).map_err(|e| {
+            WorkerError::SandboxCreationFailed(format!(
+                "create FUSE mountpoint {}: {e}",
+                mountpoint.display()
+            ))
+        })?;
+
+        let (fs, injected) = self.into_filesystem(rt);
+
+        let mp = mountpoint.clone();
+        // `serve_local` blocks until the FUSE session ends; run it on a dedicated
+        // OS thread (the down-adapter's `block_on` uses the captured runtime
+        // handle, not this thread's executor).
+        let thread = std::thread::Builder::new()
+            .name(format!("vfs-fuse-{}", socket_filename(&mountpoint)))
+            .spawn(move || {
+                if let Err(e) = serve_local(fs, &mp) {
+                    tracing::error!(
+                        mountpoint = %mp.display(),
+                        error = %e,
+                        "FUSE VFS mount exited with error"
+                    );
+                }
+            })
+            .map_err(|e| {
+                WorkerError::SandboxCreationFailed(format!("spawn FUSE VFS mount thread: {e}"))
+            })?;
+
+        Ok(SandboxFsLocalMount {
+            mountpoint,
+            injected,
+            thread: Some(thread),
+        })
+    }
 }
 
 /// A running per-sandbox VFS server: owns the socket path and injected handles.
@@ -233,6 +308,68 @@ impl SandboxFsServer {
     /// Runtime handles for the injected mounts (feed `/stream` here).
     pub fn injected(&self) -> &InjectedMounts {
         &self.injected
+    }
+}
+
+/// A running per-sandbox VFS **FUSE mount** at a host directory: the non-VM
+/// sibling of [`SandboxFsServer`] (Model B, #715).
+///
+/// Owns the mountpoint, the injected-mount handles, and the OS thread running
+/// the blocking [`hyprstream_vfs_server::serve_local`] session loop. Dropping it
+/// unmounts the FUSE mount (`fusermount3 -u`, which is unprivileged for a mount
+/// owned by this uid) — which makes the kernel close the `/dev/fuse` session so
+/// the serving thread's loop returns — then joins the thread. This is what makes
+/// the tenant VFS disappear from the host when the sandbox is stopped/destroyed.
+pub struct SandboxFsLocalMount {
+    mountpoint: PathBuf,
+    injected: InjectedMounts,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SandboxFsLocalMount {
+    /// The host directory the tenant VFS is FUSE-mounted at (give this to the
+    /// container as its root, or as a bind-mount source).
+    pub fn mountpoint(&self) -> &Path {
+        &self.mountpoint
+    }
+
+    /// Runtime handles for the injected mounts (feed `/stream` here).
+    pub fn injected(&self) -> &InjectedMounts {
+        &self.injected
+    }
+}
+
+impl std::fmt::Debug for SandboxFsLocalMount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SandboxFsLocalMount")
+            .field("mountpoint", &self.mountpoint)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for SandboxFsLocalMount {
+    fn drop(&mut self) {
+        // `serve_local` blocks until the FUSE session ends; unmount to make it
+        // return. `fusermount3 -u` tears down the kernel mount unprivileged (for
+        // a mount owned by this uid), which the serving thread observes as the
+        // session closing and exits its loop. Best-effort: if the mount never
+        // came up (e.g. no `/dev/fuse`), the unmount is a harmless no-op and the
+        // thread has already exited.
+        let unmounted = std::process::Command::new("fusermount3")
+            .arg("-u")
+            .arg(&self.mountpoint)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !unmounted {
+            let _ = std::process::Command::new("fusermount")
+                .arg("-u")
+                .arg(&self.mountpoint)
+                .status();
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -446,6 +583,54 @@ mod tests {
         // Injected handles survive the move into the adapter.
         injected.stream_registry.register("x", None);
         assert!(injected.stream_registry.exists("x"));
+    }
+
+    /// Model B (#715): `serve_local_at` is the FUSE sibling of `serve_on`. It
+    /// returns an RAII [`SandboxFsLocalMount`] carrying the mountpoint + injected
+    /// handles, and dropping it tears the mount down. A real `/dev/fuse` mount
+    /// can't be exercised in most CI/build sandboxes (no device node or usable
+    /// `fusermount3`), so this asserts the handle *shape* only — the serving
+    /// thread may fail to mount and exit immediately, which drop tolerates. The
+    /// live end-to-end mount is validated on a real host (mirroring the
+    /// `hyprstream-vfs-server` `local_fuse_mount_read_and_readdir` test, which
+    /// self-skips when the environment can't do a real FUSE mount).
+    #[test]
+    fn serve_local_at_returns_raii_mount_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_with_image(tmp.path(), "img:l", &[("etc/hostname", b"h\n")]);
+        let fs = SandboxFs::compose(
+            &store,
+            "img:l",
+            &tmp.path().join("sandbox"),
+            Subject::new("tenant"),
+            SyntheticNode::dir(),
+            SyntheticNode::dir(),
+        )
+        .unwrap();
+
+        // The down-adapter's `block_on` must run on a runtime distinct from the
+        // calling thread, so a multi-thread handle held for the whole test.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mountpoint = tmp.path().join("vfs-root");
+        let mount = fs
+            .serve_local_at(rt.handle().clone(), mountpoint.clone())
+            .expect("serve_local_at returns a mount handle even if the mount can't come up");
+
+        // `serve_local_at` created the mountpoint dir and reports it back.
+        assert!(mountpoint.is_dir(), "mountpoint should be created");
+        assert_eq!(mount.mountpoint(), mountpoint);
+
+        // Injected handles survive into the RAII mount handle.
+        mount.injected().stream_registry.register("x", None);
+        assert!(mount.injected().stream_registry.exists("x"));
+
+        // Drop unmounts + joins; tolerates a mount that never came up.
+        drop(mount);
     }
 
     /// The FS-A down-adapter serves the composed namespace: driving the
