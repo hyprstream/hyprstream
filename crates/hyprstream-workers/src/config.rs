@@ -9,6 +9,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::runtime::AdmissionConfig;
+
 /// Default value for [`WorkerConfig::backend`].
 ///
 /// `"auto"` asks the runtime to pick the highest-priority *available* registered
@@ -128,6 +130,16 @@ pub struct PoolConfig {
 
     /// Timeout for sandbox stop in seconds
     pub stop_timeout_secs: u64,
+
+    /// Admission control: per-Subject/per-group quotas, bounded wait-queue,
+    /// and declared local schedulable capacity for `SandboxPool::acquire`'s
+    /// decision engine (#525 P2).
+    ///
+    /// 🔒 See [`AdmissionConfig`]'s doc for the judgment calls this shape
+    /// bakes in (flagged for reviewer sign-off). Defaults are unconstrained,
+    /// so an operator who does not set this section gets exactly the
+    /// pre-#525 behavior (only `max_sandboxes` capacity is enforced).
+    pub admission: AdmissionConfig,
 }
 
 impl Default for PoolConfig {
@@ -145,6 +157,7 @@ impl Default for PoolConfig {
             vm_cpus: 2,
             create_timeout_secs: 60,
             stop_timeout_secs: 30,
+            admission: AdmissionConfig::default(),
         }
     }
 }

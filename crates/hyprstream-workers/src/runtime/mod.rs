@@ -20,6 +20,10 @@
 //!           └── Active sandboxes
 //! ```
 
+// Admission control (#525 P2): fail-closed identity, per-Subject/per-group
+// quotas, bounded wait-queue, resource-aware fit over the #628 scheduling
+// substrate. Consumed by `pool::SandboxPool::acquire`.
+mod admission;
 pub mod backend;
 mod client;
 mod container;
@@ -133,6 +137,9 @@ pub use selection::{explain_selection, BackendCandidate};
 pub use container::Container;
 pub use pool::{PoolStats, SandboxPool};
 pub use sandbox::PodSandbox;
+// Admission control (#525 P2) — quota/queue configuration + the request
+// annotations it reads (GPU count demand, group key).
+pub use admission::{AdmissionConfig, ANN_GPU_REQUEST, ANN_GROUP};
 #[cfg(all(not(target_arch = "wasm32"), feature = "oci-image"))]
 pub use sandbox_fs::{
     InjectedMounts, SandboxFs, SandboxFsLocalMount, SandboxFsServer, VFS_SOCKET_NAME,

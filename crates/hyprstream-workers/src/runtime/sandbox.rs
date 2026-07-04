@@ -8,8 +8,9 @@ use chrono::{DateTime, Utc};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use super::admission::ReservationRecord;
 use super::backend::SandboxHandle;
-use super::client::{KeyValue, PodSandboxState};
+use super::client::{KeyValue, LinuxContainerResources, PodSandboxState};
 use crate::generated::worker_client::PodSandboxMetadata;
 
 /// Runtime representation of a pod sandbox
@@ -51,6 +52,31 @@ pub struct PodSandbox {
     /// For Cloud Hypervisor: path to the API socket (or a dedicated serial socket).
     /// For nspawn: path to the console socket (if enabled).
     pub(crate) console_socket: Option<PathBuf>,
+
+    /// The `LinuxContainerResources` last actually applied to this sandbox by
+    /// the backend (via `start()` or `update_resources()`) — the physical
+    /// truth, independent of any pool bookkeeping. `Default` (all-zero /
+    /// CRI-"unspecified") for a freshly-booted warm sandbox that has never
+    /// had a caller's resources applied.
+    ///
+    /// #519 fix: `SandboxPool::acquire` compares an incoming request's
+    /// `config.linux.resources` against this field before handing out a
+    /// warm sandbox, and calls `update_resources` (updating this field in
+    /// turn) on a mismatch — instead of silently reusing whatever size the
+    /// sandbox happened to be booted with. Deliberately **not** reset when a
+    /// sandbox is returned to the warm pool (`reset_sandbox`): resetting it
+    /// to `Default` would be a lie (the backend's `reset()` does not resize
+    /// the sandbox back down), and the next `acquire()`'s comparison depends
+    /// on this reflecting the sandbox's actual current size.
+    pub(crate) applied_resources: LinuxContainerResources,
+
+    /// The admission reservation (#525 P2) this sandbox is holding, if it was
+    /// obtained through `SandboxPool::acquire`'s admission-controlled path.
+    /// `None` for sandboxes constructed outside that path (e.g. `from_info`,
+    /// or a warm sandbox that has not yet been claimed). `SandboxPool::release`
+    /// gives this back to the `AdmissionTracker` so per-Subject/per-group
+    /// counters and resource reservations are released precisely.
+    pub(crate) reservation: Option<ReservationRecord>,
 }
 
 impl Clone for PodSandbox {
@@ -67,6 +93,8 @@ impl Clone for PodSandbox {
             sandbox_path: self.sandbox_path.clone(),
             image_id: self.image_id.clone(),
             console_socket: self.console_socket.clone(),
+            applied_resources: self.applied_resources.clone(),
+            reservation: self.reservation.clone(),
         }
     }
 }
@@ -89,6 +117,8 @@ impl PodSandbox {
             sandbox_path,
             image_id: None,
             console_socket: None,
+            applied_resources: LinuxContainerResources::default(),
+            reservation: None,
         }
     }
 
@@ -116,6 +146,8 @@ impl PodSandbox {
             sandbox_path: PathBuf::new(),
             image_id: None,
             console_socket: None,
+            applied_resources: LinuxContainerResources::default(),
+            reservation: None,
         }
     }
 
