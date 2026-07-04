@@ -257,6 +257,7 @@ fn mesh_kem_key_agreement_methods(did: &str, x25519_ek: &[u8], mlkem768_ek: &[u8
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod mesh_kem_did_tests {
     use super::*;
 
