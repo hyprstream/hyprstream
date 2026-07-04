@@ -894,6 +894,7 @@ inventory::submit! {
 // backend (the runtime-owning object) has been constructed and must be dropped.
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod runtime_drop_tests {
     use super::*;
     use crate::config::ImageConfig;
