@@ -337,6 +337,7 @@ impl KataAgentClient {
         let process = oci::Process {
             Args: argv.to_vec(),
             Cwd: "/".to_owned(),
+            Capabilities: protobuf::MessageField::some(default_capabilities()),
             ..Default::default()
         };
         let req = agent::ExecProcessRequest {
@@ -530,6 +531,7 @@ fn build_minimal_spec(container_id: &str, argv: &[String]) -> oci::Spec {
         Process: protobuf::MessageField::some(oci::Process {
             Args: argv.to_vec(),
             Cwd: "/".to_owned(),
+            Capabilities: protobuf::MessageField::some(default_capabilities()),
             ..Default::default()
         }),
         Root: protobuf::MessageField::some(oci::Root {
@@ -538,6 +540,40 @@ fn build_minimal_spec(container_id: &str, argv: &[String]) -> oci::Spec {
             ..Default::default()
         }),
         Hostname: container_id.to_owned(),
+        ..Default::default()
+    }
+}
+
+/// Default OCI process capability set (the runc/OCI baseline). The kata-agent
+/// (rustjail) rejects `CreateContainer`/`ExecProcess` with `missing process
+/// capabilities` when `Process.Capabilities` is unset, so every container and
+/// exec process carries this standard bounding/effective/permitted set.
+fn default_capabilities() -> oci::LinuxCapabilities {
+    let caps: Vec<String> = [
+        "CAP_CHOWN",
+        "CAP_DAC_OVERRIDE",
+        "CAP_FSETID",
+        "CAP_FOWNER",
+        "CAP_MKNOD",
+        "CAP_NET_RAW",
+        "CAP_SETGID",
+        "CAP_SETUID",
+        "CAP_SETFCAP",
+        "CAP_SETPCAP",
+        "CAP_NET_BIND_SERVICE",
+        "CAP_SYS_CHROOT",
+        "CAP_KILL",
+        "CAP_AUDIT_WRITE",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    oci::LinuxCapabilities {
+        Bounding: caps.clone(),
+        Effective: caps.clone(),
+        Inheritable: caps.clone(),
+        Permitted: caps.clone(),
+        Ambient: caps,
         ..Default::default()
     }
 }
