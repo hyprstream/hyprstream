@@ -127,6 +127,8 @@ pub use selection::{
     backend_injects_9p_socket, require_9p_socket_capability, require_fuse_mount_capability,
     resolve_backend, resolve_backend_9p_capable, BackendCtx, BackendRegistration,
 };
+// Scheduling-substrate explain (#628): the shared SelectionReport<C> trace.
+pub use selection::{explain_selection, BackendCandidate};
 // Domain entities (business logic only)
 pub use container::Container;
 pub use pool::{PoolStats, SandboxPool};

@@ -71,6 +71,8 @@ pub use error::WorkerError;
 pub use runtime::{WorkerService, SandboxBackend, SandboxHandle, NspawnBackend, NspawnConfig};
 // Inventory-based backend registry + fail-closed selection spine (#507)
 pub use runtime::{resolve_backend, BackendCtx, BackendRegistration};
+// Scheduling-substrate explain (#628): the shared SelectionReport<C> trace.
+pub use runtime::{explain_selection, BackendCandidate};
 #[cfg(feature = "kata-vm")]
 pub use runtime::KataBackend;
 // The image-store trait seam is always available; only the concrete RAFS impl

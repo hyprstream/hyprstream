@@ -39,6 +39,18 @@ pub mod generated {
 
 mod service;
 
+/// #523 P0 / #524 / #628 — Scheduling Substrate.
+///
+/// The shared `LabelSelector` / `ResourceRequest` / `PlacementCandidate`
+/// vocabulary + a small `filter → rank → select` helper + one `SelectionReport`
+/// explain shape + a `CapabilitySource` contract, so every scheduling surface
+/// (placement `queryCandidates`, the `SandboxPool` engine, `CellRouter` routing,
+/// backend `selection.rs`) composes without duplicating filter/rank/explain
+/// logic or capability truth.
+///
+/// **Not a framework**: free functions + plain types. See the module doc.
+pub mod scheduling;
+
 // Re-export key types
 pub use hyprstream_rpc::resolver::Resolver;
 pub use hyprstream_rpc::registry::SocketKind;

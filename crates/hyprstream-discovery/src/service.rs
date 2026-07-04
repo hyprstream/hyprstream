@@ -17,6 +17,7 @@ use crate::generated::discovery_client::{
     RegisterEntityStatementRequest, RegisterEnvelopeKeysetRequest,
     EntityStatement, EnvelopeKeyset, IssuerList,
     GetRecordRequest, RecordCar,
+    QueryCandidatesRequest,
     dispatch_discovery, serialize_response,
 };
 
@@ -914,6 +915,23 @@ impl DiscoveryHandler for DiscoveryService {
                 details: String::new(),
             })),
         }
+    }
+
+    /// #523 P0 / #524 — placement candidate query. The vocabulary + filter/rank/
+    /// select helpers landed in `crate::scheduling` (#628); the live
+    /// directory + authz-prefiltered handler is P1's job (#524). Stubbed here
+    /// so the RPC surface compiles; returns UNIMPLEMENTED until P1 wires it.
+    async fn handle_query_candidates(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        _data: &QueryCandidatesRequest,
+    ) -> Result<DiscoveryResponseVariant> {
+        Ok(DiscoveryResponseVariant::Error(ErrorInfo {
+            message: "queryCandidates not yet wired (P1 placement directory; see #524)".to_owned(),
+            code: "UNIMPLEMENTED".to_owned(),
+            details: String::new(),
+        }))
     }
 }
 

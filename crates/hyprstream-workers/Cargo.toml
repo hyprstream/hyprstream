@@ -33,6 +33,10 @@ hyper-util = { version = "0.1", optional = true, features = ["tokio"] }
 hyprstream-workers-wasmtime = { path = "../hyprstream-workers-wasmtime", optional = true }
 hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }
 hyprstream-service = { path = "../hyprstream-service" }
+# Shared scheduling substrate (#628): filter→rank→select + SelectionReport<C> +
+# RejectionReason. `selection.rs` composes backend selection on these instead of
+# a bespoke explain shape.
+hyprstream-discovery = { path = "../hyprstream-discovery" }
 hyprstream-vfs = { path = "../hyprstream-vfs" }
 # Wire-faithful 9P2000.L server: serves a Subject-scoped `Arc<dyn Mount>` over a
 # Unix socket for the native Wanix guest to dial (#506, `runtime::wanix_workload`).
