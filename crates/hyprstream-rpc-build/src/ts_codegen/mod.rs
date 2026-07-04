@@ -35,20 +35,24 @@ pub fn generate_all<B: CodegenBackend>(
     // 2. Per-schema service files
     let mut all_names = Vec::new();
     let mut client_names = Vec::new();
+    let mut module_contents = Vec::new();
     for (name, schema) in schemas {
         let content = backend.generate_service_file(name, schema);
         let filename = format!("{name}.{}", backend.file_extension());
         let path = output_dir.join(&filename);
-        std::fs::write(&path, content).expect("Failed to write service file");
+        std::fs::write(&path, &content).expect("Failed to write service file");
         println!("  Generated {filename}");
         all_names.push(name.clone());
         if schema.request_struct.is_some() {
             client_names.push(name.clone());
         }
+        module_contents.push((name.clone(), content));
     }
 
     // 3. Optional index/manifest file
-    if let Some((index_name, index_content)) = backend.index_file(&all_names, &client_names) {
+    if let Some((index_name, index_content)) =
+        backend.index_file(&all_names, &client_names, &module_contents)
+    {
         let index_path = output_dir.join(&index_name);
         std::fs::write(&index_path, index_content).expect("Failed to write index file");
         println!("  Generated {index_name}");
@@ -198,8 +202,55 @@ fn setter_method(type_name: &str) -> Option<&str> {
         "Float64" => "setFloat64",
         "Text" => "setText",
         "Data" => "setData",
-        _ if type_name.starts_with("List(Text") => "setTextList",
-        _ => return None, // struct lists, nested structs, etc. not supported yet
+        _ => return None, // List(_), struct pointers, etc. — handled by list_setter_method / struct codegen
+    })
+}
+
+/// Return the TypeScript setter method name for a `List(<inner>)` field, given
+/// the inner element type name (e.g. `"Int64"`, `"Bool"`, `"Text"`, `"Data"`).
+///
+/// This is the single source of truth for which list element shapes the
+/// `capnp.ts` runtime supports as a flat (non-composite-of-structs) list.
+/// `None` means the caller must fall through to struct-list codegen (if
+/// `inner` names a known struct) — anything else is an unresolved reference
+/// and must be treated as a hard generator error, never a silent comment.
+pub(crate) fn list_setter_method(inner: &str) -> Option<&str> {
+    Some(match inner {
+        "Text" => "setTextList",
+        "Data" => "setDataList",
+        "Bool" => "setBoolList",
+        "UInt8" => "setUint8List",
+        "Int8" => "setInt8List",
+        "UInt16" => "setUint16List",
+        "Int16" => "setInt16List",
+        "UInt32" => "setUint32List",
+        "Int32" => "setInt32List",
+        "UInt64" => "setUint64List",
+        "Int64" => "setInt64List",
+        "Float32" => "setFloat32List",
+        "Float64" => "setFloat64List",
+        _ => return None,
+    })
+}
+
+/// Return the TypeScript getter method name for a `List(<inner>)` field.
+/// Mirrors [`list_setter_method`] — see its docs.
+pub(crate) fn list_getter_method(inner: &str) -> Option<&str> {
+    Some(match inner {
+        "Text" => "getTextList",
+        "Data" => "getDataList",
+        "Bool" => "getBoolList",
+        "UInt8" => "getUint8List",
+        "Int8" => "getInt8List",
+        "UInt16" => "getUint16List",
+        "Int16" => "getInt16List",
+        "UInt32" => "getUint32List",
+        "Int32" => "getInt32List",
+        "UInt64" => "getUint64List",
+        "Int64" => "getInt64List",
+        "Float32" => "getFloat32List",
+        "Float64" => "getFloat64List",
+        _ => return None,
     })
 }
 
@@ -232,9 +283,16 @@ fn getter_method(type_name: &str) -> &str {
         "Float64" => "getFloat64",
         "Text" => "getText",
         "Data" => "getData",
-        _ if type_name.starts_with("List(Text") => "getTextList",
-        _ if type_name.starts_with("List(Data") => "getDataList",
-        _ => "getText",
+        // Callers only ever reach this function for `is_data_scalar`-narrowed
+        // types or a literal Text/Data check — List(_) always resolves through
+        // `list_getter_method` at the call site instead. Anything else getting
+        // here is a generator bug: fail loudly rather than silently guessing
+        // `getText` (the old behavior masked exactly this class of bug — #725).
+        other => panic!(
+            "ts_codegen: getter_method called with unsupported type `{other}` — this \
+             indicates a generator bug in the call site (missing a scalar/Text/Data \
+             guard), never silently degrade to a guessed getter (#725)."
+        ),
     }
 }
 
@@ -451,12 +509,41 @@ impl CodegenBackend for TypeScriptBackend {
         &self,
         all_names: &[String],
         client_names: &[String],
+        module_contents: &[(String, String)],
     ) -> Option<(String, String)> {
         Some((
             "index.ts".to_owned(),
-            generate_index(all_names, client_names),
+            generate_index(all_names, client_names, module_contents),
         ))
     }
+}
+
+/// Scan the literal top-level exported symbol names out of generated TS source.
+///
+/// This is the single source of truth for "what does this module export": it
+/// reads the text that was actually emitted (`export interface X`, `export type
+/// X`, `export function X`) rather than independently re-deriving struct/enum/
+/// function naming rules, so it can never drift from what `interfaces.rs` /
+/// `builders.rs` / `parsers.rs` actually produce.
+fn scan_exported_names(content: &str) -> Vec<String> {
+    const PREFIXES: &[&str] = &["export interface ", "export type ", "export function "];
+    let mut names = Vec::new();
+    for line in content.lines() {
+        let line = line.trim_start();
+        for prefix in PREFIXES {
+            if let Some(rest) = line.strip_prefix(prefix) {
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() {
+                    names.push(name);
+                }
+                break;
+            }
+        }
+    }
+    names
 }
 
 /// Generate index.ts with re-exports.
@@ -465,17 +552,171 @@ impl CodegenBackend for TypeScriptBackend {
 /// For data-only schemas: re-exports all exported symbols (standalone builders/parsers).
 /// Does not use `export type *` for service schemas since different services
 /// may share type names (e.g., ErrorInfo, StreamInfo) which causes TS2308 conflicts.
-fn generate_index(all_names: &[String], client_names: &[String]) -> String {
+///
+/// Data-only modules are barrel-exported with a plain `export * from './name'`
+/// UNLESS one of their exported names also appears in another data-only
+/// module — in that case every data-only module sharing the name switches to
+/// an explicit `export { ... }` list with the colliding names aliased as
+/// `{PascalModuleName}{Name}`, so two modules can never silently shadow one
+/// another's export (#725) and a full regen never leaves an ambiguous name
+/// for tsc to reject.
+fn generate_index(
+    all_names: &[String],
+    client_names: &[String],
+    module_contents: &[(String, String)],
+) -> String {
+    // Exported names per data-only module (services only ever barrel-export
+    // their Client class, so they can't collide with each other here).
+    let data_only_exports: Vec<(&String, Vec<String>)> = all_names
+        .iter()
+        .filter(|name| !client_names.contains(name))
+        .map(|name| {
+            let content = module_contents
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, c)| c.as_str())
+                .unwrap_or_default();
+            (name, scan_exported_names(content))
+        })
+        .collect();
+
+    // name -> number of data-only modules that export it
+    let mut occurrence_count: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for (_, names) in &data_only_exports {
+        for n in names {
+            *occurrence_count.entry(n.as_str()).or_insert(0) += 1;
+        }
+    }
+
     let mut out = String::from("// Generated by hyprstream-ts-codegen — DO NOT EDIT\n\n");
     out.push_str("export { CapnpArena, CapnpReader } from './capnp';\n");
     for name in all_names {
         if client_names.contains(name) {
             let pascal = to_pascal_case(name);
             out.push_str(&format!("export {{ {pascal}Client }} from './{name}';\n"));
-        } else {
-            // Data-only schema: re-export all standalone builders, parsers, and interfaces
-            out.push_str(&format!("export * from './{name}';\n"));
+            continue;
         }
+
+        let exported = data_only_exports
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, names)| names.as_slice())
+            .unwrap_or_default();
+        let has_collision = exported
+            .iter()
+            .any(|n| occurrence_count.get(n.as_str()).copied().unwrap_or(0) > 1);
+
+        if !has_collision {
+            // No cross-module name collision — a plain wildcard re-export is safe.
+            out.push_str(&format!("export * from './{name}';\n"));
+            continue;
+        }
+
+        // At least one export from this module collides with another
+        // data-only module's export — enumerate every export explicitly,
+        // aliasing only the colliding ones, so tsc never sees an ambiguous
+        // wildcard re-export.
+        let module_prefix = to_pascal_case(name);
+        let items: Vec<String> = exported
+            .iter()
+            .map(|n| {
+                if occurrence_count.get(n.as_str()).copied().unwrap_or(0) > 1 {
+                    format!("{n} as {module_prefix}{n}")
+                } else {
+                    n.clone()
+                }
+            })
+            .collect();
+        if items.is_empty() {
+            // Nothing exported from this module (e.g. an empty schema) — no-op.
+            continue;
+        }
+        out.push_str(&format!(
+            "export {{ {} }} from './{name}';\n",
+            items.join(", ")
+        ));
     }
     out
+}
+
+#[cfg(test)]
+mod barrel_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::generate_index;
+
+    /// Two data-only modules that don't share any exported name keep the
+    /// cheap, plain `export *` re-export.
+    #[test]
+    fn no_collision_uses_plain_wildcard_export() {
+        let all_names = vec!["events".to_owned(), "streaming".to_owned()];
+        let client_names: Vec<String> = vec![];
+        let module_contents = vec![
+            (
+                "events".to_owned(),
+                "export interface EventEnvelope {\n  id: string;\n}\n".to_owned(),
+            ),
+            (
+                "streaming".to_owned(),
+                "export interface StreamInfo {\n  id: string;\n}\n".to_owned(),
+            ),
+        ];
+
+        let out = generate_index(&all_names, &client_names, &module_contents);
+
+        assert!(out.contains("export * from './events';"), "{out}");
+        assert!(out.contains("export * from './streaming';"), "{out}");
+    }
+
+    /// Two data-only modules that both export a struct with the same name (the
+    /// #725 "QoS" scenario) must never both emit a blind `export *` — every
+    /// module owning the colliding name switches to an explicit, aliased
+    /// export so tsc can never see an ambiguous re-export.
+    #[test]
+    fn colliding_export_name_is_aliased_per_module_not_silently_dropped() {
+        let all_names = vec!["events".to_owned(), "streaming".to_owned()];
+        let client_names: Vec<String> = vec![];
+        let module_contents = vec![
+            (
+                "events".to_owned(),
+                "export interface QoS {\n  retries: number;\n}\n\
+                 export interface EventEnvelope {\n  id: string;\n}\n"
+                    .to_owned(),
+            ),
+            (
+                "streaming".to_owned(),
+                "export interface QoS {\n  ackTimeoutMs: number;\n}\n\
+                 export interface StreamInfo {\n  id: string;\n}\n"
+                    .to_owned(),
+            ),
+        ];
+
+        let out = generate_index(&all_names, &client_names, &module_contents);
+
+        // Neither module may fall back to a blind wildcard export — that's
+        // exactly the silent-collision failure mode #725 reported.
+        assert!(!out.contains("export * from './events';"), "{out}");
+        assert!(!out.contains("export * from './streaming';"), "{out}");
+
+        // The colliding name is aliased per-module...
+        assert!(out.contains("QoS as EventsQoS"), "{out}");
+        assert!(out.contains("QoS as StreamingQoS"), "{out}");
+        // ...while the non-colliding names from each module are still
+        // re-exported (nothing gets dropped just because its sibling collided).
+        assert!(out.contains("EventEnvelope"), "{out}");
+        assert!(out.contains("StreamInfo"), "{out}");
+    }
+
+    /// `scan_exported_names` is the single source of truth the barrel
+    /// generator relies on — verify it picks up every emission shape used by
+    /// interfaces.rs / builders.rs / parsers.rs.
+    #[test]
+    fn scan_exported_names_finds_interfaces_types_and_functions() {
+        let content = "export interface Foo {\n  a: number;\n}\n\
+                        export type Bar =\n  | { variant: 'x'; data: undefined };\n\
+                        export function buildFoo(p: Foo): Uint8Array {\n  return new Uint8Array(0);\n}\n";
+        let names = super::scan_exported_names(content);
+        assert_eq!(names, vec!["Foo", "Bar", "buildFoo"]);
+    }
 }
