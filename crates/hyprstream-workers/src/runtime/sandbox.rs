@@ -134,6 +134,20 @@ impl PodSandbox {
         self.backend_handle = Some(handle);
     }
 
+    /// Set the image id this sandbox's tenant VFS is composed from.
+    ///
+    /// Normally populated by the worker runtime from the `CreateSandbox` RPC.
+    /// Exposed (doc-hidden) as the seam an out-of-crate boot harness (#721)
+    /// needs so that [`KataBackend::start`](super::kata_backend::KataBackend)
+    /// composes + serves + attaches the per-sandbox tenant VFS as the guest's
+    /// virtio-fs rootfs share — instead of booting the bare VM rootfs with no
+    /// container filesystem. When unset, `start()` attaches no share and the
+    /// container has no rootfs (the failure #721 fixes).
+    #[doc(hidden)]
+    pub fn set_image_id(&mut self, image_id: impl Into<String>) {
+        self.image_id = Some(image_id.into());
+    }
+
     /// Mark sandbox as ready
     pub fn mark_ready(&mut self) {
         self.state = PodSandboxState::SandboxReady;
