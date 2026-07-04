@@ -8,10 +8,10 @@
 
 use serde::Deserialize;
 
-/// DMA frame envelope: `[2: track_len LE][track][4: payload_len LE][payload]`.
-///
-/// A special track name (`__cmd__`) carries JSON control messages main→worker;
-/// `__ready__`/`__error__` are status frames worker→main.
+// DMA frame envelope: `[2: track_len LE][track][4: payload_len LE][payload]`.
+//
+// A special track name (`__cmd__`) carries JSON control messages main→worker;
+// `__ready__`/`__error__` are status frames worker→main.
 
 /// Encode one DMA frame.
 ///
