@@ -36,6 +36,50 @@ use hyprstream_vfs::{Mount, Subject, SyntheticNode};
 /// exactly one VFS share is attached per sandbox.
 const ROOTFS_MOUNT_TAG: &str = "hyprstream-vfs";
 
+/// Derive the user-writable runtime base directory that rootless Kata must use
+/// for its Cloud Hypervisor virtio-fs (`ShareFs`) jailer root (#743).
+///
+/// **Why this exists / what actually drives the jailer base.** In rootless mode
+/// kata-hypervisor 3.31.0 builds the sharefs jailer root as
+/// `get_rootless_symlink_sandbox_jailer_root(id)` →
+/// `get_rootless_symlink_sandbox_path(id)` → `kata_types::build_path(id)` →
+/// `rootless_dir()`, i.e. its base is **`$XDG_RUNTIME_DIR`**, *not* `KATA_PATH`.
+/// `KATA_PATH` is a compile-time `const` (`"/run/kata"`, root-owned) with **no
+/// env override**, so `std::env::set_var("KATA_PATH", …)` would have zero effect
+/// on the vendored jailer path. The real seam is `XDG_RUNTIME_DIR`, which
+/// `kata_types::rootless::rootless_dir()` reads once via a `lazy_static` and
+/// `.unwrap()`s — so if it is unset the rootless jailer code panics, and if it
+/// points at a non-writable dir (or the caller lacks `mkdir` on it) VM start
+/// fails with `failed to create rootless sharefs symlink jailer root dir:
+/// Permission denied`.
+///
+/// This returns a directory we can `mkdir_all` and own, to be assigned to
+/// `XDG_RUNTIME_DIR` before any VM/hypervisor config is built (`rootless_dir()`
+/// is a one-shot `lazy_static`, so it must be set first).
+///
+/// Pure/deterministic so it can be unit-tested:
+/// - `euid == 0` (rootful) → `None`: behaviour is left unchanged.
+/// - otherwise, prefer `<XDG_RUNTIME_DIR>/kata` (user-owned, e.g.
+///   `/run/user/1000/kata`); if `XDG_RUNTIME_DIR` is unset/empty, fall back to
+///   `<TMPDIR or /tmp>/kata-<uid>`.
+fn rootless_kata_runtime_dir(
+    euid: u32,
+    xdg_runtime_dir: Option<&str>,
+    tmpdir: Option<&str>,
+) -> Option<PathBuf> {
+    if euid == 0 {
+        return None;
+    }
+    let base = match xdg_runtime_dir.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(xdg) => PathBuf::from(xdg).join("kata"),
+        None => {
+            let tmp = tmpdir.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("/tmp");
+            PathBuf::from(tmp).join(format!("kata-{euid}"))
+        }
+    };
+    Some(base)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Handle
 // ─────────────────────────────────────────────────────────────────────────────
@@ -520,8 +564,36 @@ impl SandboxBackend for KataBackend {
     }
 
     async fn initialize(&self, _config: &PoolConfig) -> Result<()> {
-        let is_root = nix::unistd::geteuid().is_root();
-        if !is_root {
+        let euid = nix::unistd::geteuid();
+        if !euid.is_root() {
+            // Rootless: kata-hypervisor 3.31.0 derives the Cloud Hypervisor
+            // sharefs jailer root from `$XDG_RUNTIME_DIR` (via
+            // `kata_types::build_path` → `rootless_dir()`), NOT from `KATA_PATH`
+            // (a compile-time const "/run/kata" with no env override). A rootless
+            // user cannot `mkdir /run/kata`, and if `XDG_RUNTIME_DIR` is unset
+            // `rootless_dir()` panics on `.unwrap()`. Pin `XDG_RUNTIME_DIR` at a
+            // directory we create and own, before `set_rootless` and before any
+            // VM/hypervisor config is built (`rootless_dir()` is a one-shot
+            // lazy_static, so this must happen first). See #743.
+            let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+            let tmpdir = std::env::var("TMPDIR").ok();
+            if let Some(kata_runtime_dir) =
+                rootless_kata_runtime_dir(euid.as_raw(), xdg.as_deref(), tmpdir.as_deref())
+            {
+                tokio::fs::create_dir_all(&kata_runtime_dir)
+                    .await
+                    .map_err(|e| {
+                        WorkerError::VmStartFailed(format!(
+                            "failed to create rootless kata runtime dir {}: {e}",
+                            kata_runtime_dir.display()
+                        ))
+                    })?;
+                std::env::set_var("XDG_RUNTIME_DIR", &kata_runtime_dir);
+                tracing::debug!(
+                    dir = %kata_runtime_dir.display(),
+                    "Rootless Kata: pinned XDG_RUNTIME_DIR to a user-writable sharefs jailer base"
+                );
+            }
             rootless::set_rootless(true);
             tracing::debug!("Enabled Kata rootless mode for non-root user");
         }
@@ -1547,6 +1619,51 @@ mod tests {
         if !nix::unistd::geteuid().is_root() {
             assert!(rootless::is_rootless());
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // rootless_kata_runtime_dir — pure path derivation (#743)
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_rootless_kata_runtime_dir_root_is_none() {
+        // Rootful (euid 0): behaviour unchanged, no XDG rewrite.
+        assert_eq!(
+            rootless_kata_runtime_dir(0, Some("/run/user/0"), Some("/tmp")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_rootless_kata_runtime_dir_uses_xdg() {
+        // The seam that actually drives kata's rootless jailer base is
+        // XDG_RUNTIME_DIR (not KATA_PATH); nest kata files under it.
+        assert_eq!(
+            rootless_kata_runtime_dir(1000, Some("/run/user/1000"), None),
+            Some(PathBuf::from("/run/user/1000/kata"))
+        );
+    }
+
+    #[test]
+    fn test_rootless_kata_runtime_dir_falls_back_to_tmpdir() {
+        assert_eq!(
+            rootless_kata_runtime_dir(1000, None, Some("/var/tmp")),
+            Some(PathBuf::from("/var/tmp/kata-1000"))
+        );
+    }
+
+    #[test]
+    fn test_rootless_kata_runtime_dir_defaults_to_slash_tmp() {
+        // XDG and TMPDIR both unset/empty → /tmp/kata-<uid> (avoids the
+        // rootless_dir() unwrap panic on a missing XDG_RUNTIME_DIR).
+        assert_eq!(
+            rootless_kata_runtime_dir(1000, None, None),
+            Some(PathBuf::from("/tmp/kata-1000"))
+        );
+        assert_eq!(
+            rootless_kata_runtime_dir(1000, Some("  "), Some("")),
+            Some(PathBuf::from("/tmp/kata-1000"))
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────
