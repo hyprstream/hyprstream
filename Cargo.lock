@@ -7006,6 +7006,7 @@ dependencies = [
  "bytes",
  "capnp",
  "capnpc",
+ "chacha20poly1305",
  "chrono",
  "ciborium",
  "coset",
@@ -7050,6 +7051,7 @@ dependencies = [
  "subtle",
  "systemd",
  "thiserror 1.0.69",
+ "tiny-keccak",
  "tokio",
  "tokio-test",
  "tokio-util",
@@ -7066,6 +7068,7 @@ dependencies = [
  "web-transport-trait",
  "webpki-roots 0.26.11",
  "whoami",
+ "x25519-dalek",
  "yamux 0.13.7",
  "zeroize",
 ]

@@ -10,6 +10,10 @@
 mod traits;
 pub mod zmtp_quic;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod pq_provider;
+#[cfg(not(target_arch = "wasm32"))]
+pub use pq_provider::{install_pq_crypto_provider, pq_crypto_provider};
+#[cfg(not(target_arch = "wasm32"))]
 pub mod iroh_substrate;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod rpc_session;

@@ -184,6 +184,109 @@ fn mldsa65_verification_method(did: &str, key_id: &str, vk_bytes: &[u8]) -> Valu
     })
 }
 
+// ============================================================================
+// #mesh-kem hybrid keyAgreement identity (S1 / #552, epic #550)
+//
+// NOTE: this crate requires libtorch to compile, which was unavailable in the
+// implementing fork — the helpers below are faithful mirrors of the working
+// `#mesh-pq` / p256 multibase helpers above but are NOT compile-verified here.
+// Integration into `build_did_document` (push these into a `keyAgreement` array)
+// is a deliberate follow-up: it touches the builder signature + every caller, so
+// it is left to a pass that can compile the `hyprstream` crate.
+// ============================================================================
+
+/// multicodec `x25519-pub` unsigned-varint prefix (`0xec` → bytes `0xec 0x01`).
+const MULTICODEC_X25519_PUB: [u8; 2] = [0xec, 0x01];
+
+/// multicodec `ml-kem-768-pub` unsigned-varint prefix.
+///
+/// PROVISIONAL: code point `0x120b` (ML-KEM-768 / FIPS 203 encapsulation key) as
+/// an unsigned varint → bytes `0x8b 0x24` (same shape as `ml-dsa-65-pub`
+/// `0x1211` → `0x91 0x24`). **Confirm against the multiformats multicodec
+/// registry / draft-ietf-cose-mlkem before production** — the exact ML-KEM code
+/// point must match what peers decode.
+const MULTICODEC_ML_KEM_768_PUB: [u8; 2] = [0x8b, 0x24];
+
+/// Multibase z-encode (base58btc, multicodec-prefixed) a raw X25519 encapsulation
+/// key (32 bytes) as a `Multikey` `publicKeyMultibase`.
+#[allow(dead_code)] // wired into build_did_document's keyAgreement set by the #552 follow-up
+fn x25519_to_multibase(ek_bytes: &[u8]) -> String {
+    let mut payload = Vec::with_capacity(MULTICODEC_X25519_PUB.len() + ek_bytes.len());
+    payload.extend_from_slice(&MULTICODEC_X25519_PUB);
+    payload.extend_from_slice(ek_bytes);
+    format!("z{}", bs58::encode(payload).into_string())
+}
+
+/// Multibase z-encode a raw ML-KEM-768 encapsulation key (1184 bytes) as a
+/// `Multikey` `publicKeyMultibase`.
+#[allow(dead_code)]
+fn mlkem768_to_multibase(ek_bytes: &[u8]) -> String {
+    let mut payload = Vec::with_capacity(MULTICODEC_ML_KEM_768_PUB.len() + ek_bytes.len());
+    payload.extend_from_slice(&MULTICODEC_ML_KEM_768_PUB);
+    payload.extend_from_slice(ek_bytes);
+    format!("z{}", bs58::encode(payload).into_string())
+}
+
+/// Build the `#mesh-kem` **keyAgreement** verification methods for the node's
+/// hybrid-KEM identity (S1 / #552): one `Multikey` per suite leg (X25519 +
+/// ML-KEM-768). These belong in the DID document's `keyAgreement` relationship
+/// (NOT `verificationMethod`/`assertionMethod` — they are key-agreement, not
+/// signing, keys). Peers reconstruct the policy-pinned hybrid recipient
+/// (`SuiteId::HyKemX25519MlKem768`) from the two legs and anchor it in their
+/// `crate`-side `KemTrustStore`.
+///
+/// `x25519_ek` / `mlkem768_ek` are the raw encapsulation keys in suite-component
+/// order, from `hyprstream_rpc::node_identity::derive_mesh_kem_recipient(..)
+/// .public().eks`.
+#[allow(dead_code)] // build_did_document integration is the #552 follow-up (needs libtorch to verify)
+fn mesh_kem_key_agreement_methods(did: &str, x25519_ek: &[u8], mlkem768_ek: &[u8]) -> Vec<Value> {
+    vec![
+        json!({
+            "id": format!("{did}#mesh-kem-x25519"),
+            "type": "Multikey",
+            "controller": did,
+            "publicKeyMultibase": x25519_to_multibase(x25519_ek),
+        }),
+        json!({
+            "id": format!("{did}#mesh-kem-mlkem768"),
+            "type": "Multikey",
+            "controller": did,
+            "publicKeyMultibase": mlkem768_to_multibase(mlkem768_ek),
+        }),
+    ]
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod mesh_kem_did_tests {
+    use super::*;
+
+    #[test]
+    fn mesh_kem_methods_shape_and_multicodec() {
+        let did = "did:web:example.com";
+        let x_ek = [0x11u8; 32];
+        let m_ek = [0x22u8; 1184];
+        let vms = mesh_kem_key_agreement_methods(did, &x_ek, &m_ek);
+        assert_eq!(vms.len(), 2);
+        assert_eq!(vms[0]["id"], format!("{did}#mesh-kem-x25519"));
+        assert_eq!(vms[0]["type"], "Multikey");
+        assert_eq!(vms[1]["id"], format!("{did}#mesh-kem-mlkem768"));
+        assert_eq!(vms[1]["type"], "Multikey");
+
+        // publicKeyMultibase = 'z' + base58btc(multicodec ‖ key); decode + check.
+        let mb = vms[0]["publicKeyMultibase"].as_str().unwrap();
+        assert!(mb.starts_with('z'));
+        let decoded = bs58::decode(&mb[1..]).into_vec().unwrap();
+        assert_eq!(&decoded[..2], &MULTICODEC_X25519_PUB);
+        assert_eq!(decoded.len(), 2 + 32);
+
+        let mb2 = vms[1]["publicKeyMultibase"].as_str().unwrap();
+        let decoded2 = bs58::decode(&mb2[1..]).into_vec().unwrap();
+        assert_eq!(&decoded2[..2], &MULTICODEC_ML_KEM_768_PUB);
+        assert_eq!(decoded2.len(), 2 + 1184);
+    }
+}
+
 /// Build a JWK fallback verification method (useful for consumers that
 /// don't speak Multibase but understand JWK).
 fn ed25519_verification_method_jwk(did: &str, key_id: &str, vk: &VerifyingKey) -> Value {

@@ -1057,6 +1057,7 @@ impl InferenceService {
             qos: stream_ctx.qos().clone(),
             broadcast_path,
             announced_at: stream_ctx.reach(), // #384: per-stream reach via ctx
+            kem_ciphertexts: Vec::new(), // #554: classical stream (dh_public path), no hybrid KEM
         };
 
         Ok((stream_info, stream_ctx))
@@ -1903,6 +1904,7 @@ impl InferenceHandler for InferenceService {
             qos: <hyprstream_rpc::stream_info::Job as hyprstream_rpc::stream_info::StreamOptPreset>::stream_opt(),
             broadcast_path,
             announced_at: reach,
+            kem_ciphertexts: Vec::new(), // #554: classical stream (dh_public path), no hybrid KEM
         };
 
         // Build continuation that executes the stream after REP is sent.
@@ -2113,6 +2115,7 @@ impl InferenceHandler for InferenceService {
             qos: stream_ctx.qos().clone(),
             broadcast_path,
             announced_at: stream_ctx.reach(), // #384: per-stream reach via ctx
+            kem_ciphertexts: Vec::new(), // #554: classical stream (dh_public path), no hybrid KEM
         };
 
         let adaptation_strategy = map_adaptation_strategy(data.adaptation_strategy, data.writeback_threshold);

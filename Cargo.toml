@@ -121,7 +121,9 @@ futures = { version = "0.3.31", features = ["alloc"] }
 futures-util = "0.3.31"
 pin-project-lite = "0.2"
 tonic = { version = "0.12.3", features = ["transport", "codegen", "prost", "tls"] }
-rustls = { version = "0.23.1", features = ["ring"] }
+# aws_lc_rs enables the X25519MLKEM768 PQ-hybrid kx group (#557); ring kept for
+# any classical-only path. prefer-post-quantum orders the PQ group first.
+rustls = { version = "0.23.1", features = ["ring", "aws_lc_rs", "prefer-post-quantum"] }
 rustls-pemfile = "2.1.0"
 rustls-acme = { version = "0.11", features = ["tokio"] }
 axum = { version = "0.7", features = ["macros", "tokio"] }
@@ -213,6 +215,7 @@ fastrand = "2.0"
 xdg = "2.5"
 blake3 = "1.5"
 sha2 = "0.10"  # SHA256 validation for LFS files
+chacha20poly1305 = "0.10"  # ChaCha20Poly1305 / XChaCha20Poly1305 AEAD (COSE_Encrypt0, #553)
 shellexpand = "3.1.1"
 caps = "0.5"  # Linux capabilities for privilege detection
 whoami = "1.5"  # OS username detection

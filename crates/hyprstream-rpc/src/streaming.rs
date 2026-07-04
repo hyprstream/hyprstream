@@ -218,6 +218,12 @@ pub struct StreamContext {
     /// one-time per-stream snapshot (the documented compat source), not a
     /// per-`reach()`-call global read.
     reach_config: crate::moq_stream::ProducerReachConfig,
+
+    /// Hybrid KEM ciphertexts to emit in `StreamInfo.kemCiphertexts` (S3 #554).
+    /// `Some` on the hybrid post-quantum path ([`from_hybrid`](Self::from_hybrid));
+    /// `None` on the legacy classical [`from_dh`](Self::from_dh) and the keyless
+    /// [`new`](Self::new) paths.
+    kem_ciphertexts: Option<Vec<u8>>,
 }
 
 impl StreamContext {
@@ -244,6 +250,8 @@ impl StreamContext {
             // which never call `reach()`); default to an empty reach config. A
             // networked producer threads a real one via `with_reach_config`.
             reach_config: crate::moq_stream::ProducerReachConfig::default(),
+            // Keyless path: no hybrid KEM material.
+            kem_ciphertexts: None,
         }
     }
 
@@ -290,7 +298,56 @@ impl StreamContext {
             // `with_reach_config` (prepare_stream), making the base reach fully
             // per-stream rather than global-sourced.
             reach_config: crate::moq_stream::global_reach_config(),
+            // Classical (legacy) path: no hybrid KEM material; the client keys
+            // off the server ephemeral `dhPublic`. Removed at the S5 fail-closed
+            // flip (#556) once all call-sites use `from_hybrid`.
+            kem_ciphertexts: None,
         })
+    }
+
+    /// Create a stream context via the **hybrid post-quantum** handshake (S3 #554).
+    ///
+    /// `client_kem_public` is the client's encoded ephemeral `RecipientPublic`
+    /// (from `RequestEnvelope.clientKemPublic`). The server encapsulates to it and
+    /// derives the stream keys from the hybrid combiner secret; the per-component
+    /// ciphertexts are stored in [`kem_ciphertexts`](Self::kem_ciphertexts) for
+    /// emission in `StreamInfo.kemCiphertexts`. Forward secrecy comes from the
+    /// client's ephemeral keypair (X25519 + ML-KEM legs).
+    ///
+    /// Fail-closed: a malformed / wrong-suite `client_kem_public` is rejected.
+    /// This is the post-quantum replacement for [`from_dh`](Self::from_dh).
+    pub fn from_hybrid(client_kem_public: &[u8]) -> Result<Self> {
+        let (material, keys) =
+            crate::crypto::key_exchange::server_hybrid_stream_keys(client_kem_public)
+                .map_err(|e| anyhow::anyhow!("hybrid stream handshake: {e}"))?;
+
+        let stream_id = format!("stream-{}", uuid::Uuid::new_v4());
+
+        Ok(Self {
+            stream_id,
+            topic: keys.topic,
+            mac_key: *keys.mac_key,
+            // Hybrid path: AEAD ON for the mesh stream plane (#321), keyed by the
+            // post-quantum combiner secret.
+            enc_key: Some(*keys.enc_key),
+            // No classical server ephemeral pubkey on the hybrid path; the client
+            // keys off `kem_ciphertexts`, not `dhPublic`.
+            server_pubkey: [0u8; 32],
+            ctrl_topic: keys.ctrl_topic,
+            ctrl_mac_key: *keys.ctrl_mac_key,
+            cancel_token: CancellationToken::new(),
+            qos: crate::stream_info::StreamOpt::default(),
+            relay_choice: crate::moq_stream::RelayChoice::default(),
+            reach_config: crate::moq_stream::global_reach_config(),
+            kem_ciphertexts: Some(material.encode()),
+        })
+    }
+
+    /// The hybrid KEM ciphertexts to emit in `StreamInfo.kemCiphertexts` (S3 #554):
+    /// `Some` on the hybrid path ([`from_hybrid`](Self::from_hybrid)), `None`
+    /// otherwise.
+    pub fn kem_ciphertexts(&self) -> Option<&[u8]> {
+        self.kem_ciphertexts.as_deref()
     }
 
     /// Get the stream ID (for logging/display).

@@ -227,6 +227,11 @@ struct StreamInfo {
   # first reach it supports (see `dial_stream`) and subscribes to `broadcastPath`.
   # Co-located clients ignore this and use the same-host UDS fast path.
   announcedAt @4 :List(Destination);
+  # S3 #554: server's hybrid-KEM ciphertexts (HybridKemMaterial.encode(),
+  # X25519+ML-KEM-768) — the client decapsulates with its ephemeral keypair to
+  # derive the same stream keys. Supersedes the classical `dhPublic` (kept for the
+  # legacy path until the S5 #556 fail-closed flip). Empty on the legacy path.
+  kemCiphertexts @5 :Data;
 }
 
 # Stream registration - wrapped in SignedEnvelope for authorization

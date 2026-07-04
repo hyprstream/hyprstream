@@ -34,12 +34,12 @@ use crate::crypto::{SigningKey, VerifyingKey};
 use crate::error::{EnvelopeError, EnvelopeResult};
 use anyhow::{anyhow, Result};
 use ed25519_dalek::Signer;
-use subtle::ConstantTimeEq;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::{SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 
 // ============================================================================
 // Authorization (new envelope auth model)
@@ -157,7 +157,11 @@ impl FromCapnp for FederatedToken {
     fn read_from(reader: Self::Reader<'_>) -> Result<Self> {
         let dpop_proof = if reader.has_dpop_proof() {
             let p = reader.get_dpop_proof()?.to_str()?;
-            if p.is_empty() { None } else { Some(p.to_owned()) }
+            if p.is_empty() {
+                None
+            } else {
+                Some(p.to_owned())
+            }
         } else {
             None
         };
@@ -432,7 +436,10 @@ impl Subject {
     /// Federated subjects contain `"://"` (from the issuer URL); local bare
     /// usernames never do.
     pub fn is_federated(&self) -> bool {
-        self.0.as_deref().map(|s| s.contains("://")).unwrap_or(false)
+        self.0
+            .as_deref()
+            .map(|s| s.contains("://"))
+            .unwrap_or(false)
     }
 }
 
@@ -754,7 +761,10 @@ fn response_envelope_external_aad() -> Vec<u8> {
 pub trait PqTrustStore: Send + Sync {
     /// Return the trusted ML-DSA-65 verifying key bound to the given Ed25519
     /// signer public key, or `None` if no binding is known.
-    fn ml_dsa_key_for(&self, ed25519_pubkey: &[u8; 32]) -> Option<crate::crypto::pq::MlDsaVerifyingKey>;
+    fn ml_dsa_key_for(
+        &self,
+        ed25519_pubkey: &[u8; 32],
+    ) -> Option<crate::crypto::pq::MlDsaVerifyingKey>;
 }
 
 /// In-memory kid-anchored ML-DSA-65 trust store mapping an Ed25519 signer
@@ -772,14 +782,22 @@ pub struct KeyedPqTrustStore {
 impl KeyedPqTrustStore {
     /// Create an empty store.
     pub fn new() -> Self {
-        Self { bindings: std::collections::HashMap::new() }
+        Self {
+            bindings: std::collections::HashMap::new(),
+        }
     }
 
     /// Bind an Ed25519 signer identity to its trusted ML-DSA-65 verifying key
     /// (stored as raw vk bytes; re-decoded on lookup).
-    pub fn bind(&mut self, ed25519_pubkey: [u8; 32], ml_dsa_vk: &crate::crypto::pq::MlDsaVerifyingKey) {
-        self.bindings
-            .insert(ed25519_pubkey, crate::crypto::pq::ml_dsa_vk_bytes(ml_dsa_vk));
+    pub fn bind(
+        &mut self,
+        ed25519_pubkey: [u8; 32],
+        ml_dsa_vk: &crate::crypto::pq::MlDsaVerifyingKey,
+    ) {
+        self.bindings.insert(
+            ed25519_pubkey,
+            crate::crypto::pq::ml_dsa_vk_bytes(ml_dsa_vk),
+        );
     }
 
     /// Number of bindings.
@@ -794,7 +812,10 @@ impl KeyedPqTrustStore {
 }
 
 impl PqTrustStore for KeyedPqTrustStore {
-    fn ml_dsa_key_for(&self, ed25519_pubkey: &[u8; 32]) -> Option<crate::crypto::pq::MlDsaVerifyingKey> {
+    fn ml_dsa_key_for(
+        &self,
+        ed25519_pubkey: &[u8; 32],
+    ) -> Option<crate::crypto::pq::MlDsaVerifyingKey> {
         self.bindings
             .get(ed25519_pubkey)
             .and_then(|bytes| crate::crypto::pq::ml_dsa_vk_from_bytes(bytes).ok())
@@ -941,7 +962,8 @@ pub struct ResponseVerifyConfig {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-static RESPONSE_VERIFY_CONFIG: std::sync::OnceLock<ResponseVerifyConfig> = std::sync::OnceLock::new();
+static RESPONSE_VERIFY_CONFIG: std::sync::OnceLock<ResponseVerifyConfig> =
+    std::sync::OnceLock::new();
 
 /// Install the process-global RESPONSE verify configuration. First write wins.
 ///
@@ -1002,7 +1024,9 @@ pub fn global_response_verify_policy() -> crate::crypto::CryptoPolicy {
 /// The installed RESPONSE-side kid-anchored PQ trust store, if any.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn global_response_pq_store() -> Option<std::sync::Arc<dyn PqTrustStore>> {
-    RESPONSE_VERIFY_CONFIG.get().and_then(|c| c.pq_store.clone())
+    RESPONSE_VERIFY_CONFIG
+        .get()
+        .and_then(|c| c.pq_store.clone())
 }
 
 /// Replay protection cache interface.
@@ -1074,22 +1098,30 @@ impl InMemoryNonceCache {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn read_lock(&self) -> parking_lot::RwLockReadGuard<'_, std::collections::HashMap<[u8; 16], i64>> {
+    fn read_lock(
+        &self,
+    ) -> parking_lot::RwLockReadGuard<'_, std::collections::HashMap<[u8; 16], i64>> {
         self.seen.read()
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn read_lock(&self) -> std::sync::RwLockReadGuard<'_, std::collections::HashMap<[u8; 16], i64>> {
+    fn read_lock(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, std::collections::HashMap<[u8; 16], i64>> {
         self.seen.read().expect("nonce cache lock poisoned")
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn write_lock(&self) -> parking_lot::RwLockWriteGuard<'_, std::collections::HashMap<[u8; 16], i64>> {
+    fn write_lock(
+        &self,
+    ) -> parking_lot::RwLockWriteGuard<'_, std::collections::HashMap<[u8; 16], i64>> {
         self.seen.write()
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn write_lock(&self) -> std::sync::RwLockWriteGuard<'_, std::collections::HashMap<[u8; 16], i64>> {
+    fn write_lock(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, std::collections::HashMap<[u8; 16], i64>> {
         self.seen.write().expect("nonce cache lock poisoned")
     }
 
@@ -1162,7 +1194,12 @@ impl SignedEnvelope {
     pub fn new_signed(envelope: RequestEnvelope, signing_key: &SigningKey) -> Self {
         // Default policy is Classical for the bare Ed25519-only constructor so
         // that callers that don't supply a PQ key produce verifiable envelopes.
-        Self::new_signed_with_policy(envelope, signing_key, None, crate::crypto::CryptoPolicy::Classical)
+        Self::new_signed_with_policy(
+            envelope,
+            signing_key,
+            None,
+            crate::crypto::CryptoPolicy::Classical,
+        )
     }
 
     /// Create and dual-sign a new envelope with Ed25519 + ML-DSA-65 (Hybrid).
@@ -1232,63 +1269,37 @@ impl SignedEnvelope {
         policy: crate::crypto::CryptoPolicy,
         signing_data: &[u8],
     ) -> Result<Vec<u8>> {
-        let pq = if policy.uses_pq() { pq_signing_key } else { None };
+        let pq = if policy.uses_pq() {
+            pq_signing_key
+        } else {
+            None
+        };
         let aad = envelope_external_aad();
         crate::crypto::cose_sign::sign_composite(signing_key, pq, signing_data, &aad)
     }
 
-    /// Create, encrypt, and sign a new envelope (encrypt-then-sign), Classical.
+    /// Create, hybrid-encrypt (HyKEM `#mesh-kem` → COSE_Encrypt0), and dual-sign
+    /// (EdDSA + ML-DSA-65) a new envelope — the fail-closed hybrid-PQ path (#555 / S4).
     ///
-    /// The envelope is serialized, encrypted with AES-256-GCM-SIV using a key
-    /// derived from X25519 DH(client_ephemeral, server_static), then signed.
-    /// The COSE signature covers `encrypted_envelope || client_ephemeral_public`.
-    pub fn new_signed_encrypted(
-        envelope: RequestEnvelope,
-        signing_key: &SigningKey,
-        server_pubkey: &VerifyingKey,
-    ) -> EnvelopeResult<Self> {
-        Self::new_signed_encrypted_with_policy(
-            envelope,
-            signing_key,
-            server_pubkey,
-            None,
-            None,
-            crate::crypto::CryptoPolicy::Classical,
-        )
-    }
-
-    /// Create, encrypt (hybrid X25519+ML-KEM-768), and dual-sign with Ed25519 + ML-DSA-65.
-    pub fn new_signed_encrypted_hybrid(
-        envelope: RequestEnvelope,
-        signing_key: &SigningKey,
-        server_pubkey: &VerifyingKey,
-        pq_signing_key: &crate::crypto::pq::MlDsaSigningKey,
-        server_kem_ek: &crate::crypto::pq::MlKemEncapsKey,
-    ) -> EnvelopeResult<Self> {
-        Self::new_signed_encrypted_with_policy(
-            envelope,
-            signing_key,
-            server_pubkey,
-            Some(pq_signing_key),
-            Some(server_kem_ek),
-            crate::crypto::CryptoPolicy::Hybrid,
-        )
-    }
-
-    /// Encrypt-then-sign under an explicit [`CryptoPolicy`].
+    /// The serialized `RequestEnvelope` is sealed with
+    /// [`crate::crypto::cose_encrypt::seal_to_recipient`] to the server's anchored
+    /// `#mesh-kem` [`crate::crypto::hybrid_kem::RecipientPublic`] (resolved
+    /// out-of-band via a [`crate::crypto::hybrid_kem::KemTrustStore`], NEVER
+    /// self-asserted). The KEM material rides inside the COSE_Encrypt0 (`ek`
+    /// header), so the COSE composite signature simply covers the COSE_Encrypt0
+    /// bytes.
     ///
-    /// In `Hybrid` mode both `pq_signing_key` and `server_kem_ek` must be
-    /// supplied (ML-KEM-768 hybrid encryption + ML-DSA-65 composite signature).
-    pub fn new_signed_encrypted_with_policy(
+    /// This replaces the retired `envelope_crypto` X25519-static scheme, which
+    /// reused the Ed25519 *signing* key as a *static* X25519 KEX key (key-reuse +
+    /// no forward secrecy + fixed-zero-nonce AEAD). Forward secrecy now comes from
+    /// the ephemeral X25519 leg of HyKEM and from rotated `#mesh-kem` prekeys
+    /// (S1 `KemPrekey`).
+    pub fn new_signed_encrypted_mesh_kem(
         mut envelope: RequestEnvelope,
         signing_key: &SigningKey,
-        server_pubkey: &VerifyingKey,
-        pq_signing_key: Option<&crate::crypto::pq::MlDsaSigningKey>,
-        server_kem_ek: Option<&crate::crypto::pq::MlKemEncapsKey>,
-        policy: crate::crypto::CryptoPolicy,
+        pq_signing_key: &crate::crypto::pq::MlDsaSigningKey,
+        server_kem_public: &crate::crypto::hybrid_kem::RecipientPublic,
     ) -> EnvelopeResult<Self> {
-        use crate::crypto::envelope_crypto::{encrypt_envelope, encrypt_envelope_hybrid};
-
         if envelope.wth.is_none() {
             if let Some(jwt) = envelope.jwt_token() {
                 use sha2::{Digest, Sha256};
@@ -1296,41 +1307,55 @@ impl SignedEnvelope {
             }
         }
 
-        let envelope_bytes = envelope.to_bytes();
-
-        let (ciphertext, eph_public, kem_ct) = if policy.uses_pq() {
-            let kem_ek = server_kem_ek.ok_or_else(|| {
-                EnvelopeError::Encryption("Hybrid policy requires server ML-KEM key".into())
+        // Serialize the envelope in standard stream framing (NOT the canonical
+        // `to_bytes()` signing form, which omits the segment table) so the decrypt
+        // side can `read_message` it back.
+        let mut envelope_bytes = Vec::new();
+        {
+            let mut message = capnp::message::Builder::new_default();
+            {
+                let mut builder =
+                    message.init_root::<crate::common_capnp::request_envelope::Builder>();
+                envelope.write_to(&mut builder);
+            }
+            capnp::serialize::write_message(&mut envelope_bytes, &message).map_err(|e| {
+                EnvelopeError::Encryption(format!("serialize envelope for encryption: {e}"))
             })?;
-            let (ct, eph, kem) = encrypt_envelope_hybrid(&envelope_bytes, server_pubkey, kem_ek)?;
-            (ct, eph, Some(kem))
-        } else {
-            let (ct, eph) = encrypt_envelope(&envelope_bytes, server_pubkey)?;
-            (ct, eph, None)
-        };
-
-        // Signing data: ciphertext ∥ eph_x25519_public ∥ [kem_ciphertext]
-        let kem_len = kem_ct.as_ref().map_or(0, Vec::len);
-        let mut signing_data = Vec::with_capacity(ciphertext.len() + 32 + kem_len);
-        signing_data.extend_from_slice(&ciphertext);
-        signing_data.extend_from_slice(&eph_public);
-        if let Some(ref kem) = kem_ct {
-            signing_data.extend_from_slice(kem);
         }
+        let aad = envelope_external_aad();
 
-        let signature = signing_key.sign(&signing_data);
-        let cose = Self::build_cose(signing_key, pq_signing_key, policy, &signing_data)
-            .map_err(|e| EnvelopeError::Encryption(format!("COSE composite signing failed: {e}")))?;
+        // One-shot: `seal_to_recipient` performs a FRESH encapsulation per call, so
+        // a fixed (epoch=0, seq=0) nonce is safe — the content key is unique per call.
+        let cose_ct = crate::crypto::cose_encrypt::seal_to_recipient(
+            server_kem_public,
+            &envelope_bytes,
+            &aad,
+            0,
+            0,
+        )
+        .map_err(|e| EnvelopeError::Encryption(format!("#mesh-kem envelope seal failed: {e}")))?;
+
+        // The COSE_Encrypt0 bytes are the signing data — the KEM ciphertexts and
+        // suite id are self-described inside the COSE object.
+        let signature = signing_key.sign(&cose_ct);
+        let cose = Self::build_cose(
+            signing_key,
+            Some(pq_signing_key),
+            crate::crypto::CryptoPolicy::Hybrid,
+            &cose_ct,
+        )
+        .map_err(|e| EnvelopeError::Encryption(format!("COSE composite signing failed: {e}")))?;
 
         Ok(Self {
             envelope,
             sig: signature.to_bytes(),
             cnf: signing_key.verifying_key().to_bytes(),
-            encrypted_envelope: Some(ciphertext),
-            client_ephemeral_public: Some(eph_public),
+            encrypted_envelope: Some(cose_ct),
+            // reserved — KEM material lives in the COSE_Encrypt0 `ek` header now.
+            client_ephemeral_public: None,
             cose,
-            policy,
-            pq_kem_ciphertext: kem_ct,
+            policy: crate::crypto::CryptoPolicy::Hybrid,
+            pq_kem_ciphertext: None,
         })
     }
 
@@ -1358,7 +1383,12 @@ impl SignedEnvelope {
         expected_pubkey: &VerifyingKey,
         nonce_cache: &dyn NonceCache,
     ) -> EnvelopeResult<()> {
-        self.verify_with(expected_pubkey, nonce_cache, None, crate::crypto::CryptoPolicy::Classical)
+        self.verify_with(
+            expected_pubkey,
+            nonce_cache,
+            None,
+            crate::crypto::CryptoPolicy::Classical,
+        )
     }
 
     /// Verify with an explicit kid-anchored PQ trust store and verify policy.
@@ -1402,7 +1432,11 @@ impl SignedEnvelope {
                 actual: hex::encode(self.cnf),
             });
         }
-        self.verify_cose(expected_pubkey, None, crate::crypto::CryptoPolicy::Classical)
+        self.verify_cose(
+            expected_pubkey,
+            None,
+            crate::crypto::CryptoPolicy::Classical,
+        )
     }
 
     /// Verify signature only under an explicit policy + PQ trust store.
@@ -1425,10 +1459,7 @@ impl SignedEnvelope {
     ///
     /// For WebTransport clients that sign with their own keypair rather than
     /// a shared server key. Still checks timestamp and nonce for replay protection.
-    pub fn verify_any_signer(
-        &self,
-        nonce_cache: &dyn NonceCache,
-    ) -> EnvelopeResult<()> {
+    pub fn verify_any_signer(&self, nonce_cache: &dyn NonceCache) -> EnvelopeResult<()> {
         self.verify_any_signer_with(nonce_cache, None, crate::crypto::CryptoPolicy::Classical)
     }
 
@@ -1439,8 +1470,11 @@ impl SignedEnvelope {
         pq_store: Option<&dyn PqTrustStore>,
         verify_policy: crate::crypto::CryptoPolicy,
     ) -> EnvelopeResult<()> {
-        let verifying_key = VerifyingKey::from_bytes(&self.cnf)
-            .map_err(|_| EnvelopeError::InvalidPublicKey { expected: 32, actual: 0 })?;
+        let verifying_key =
+            VerifyingKey::from_bytes(&self.cnf).map_err(|_| EnvelopeError::InvalidPublicKey {
+                expected: 32,
+                actual: 0,
+            })?;
         self.check_replay(nonce_cache)?;
         self.verify_cose(&verifying_key, pq_store, verify_policy)
     }
@@ -1516,80 +1550,50 @@ impl SignedEnvelope {
 
     /// Compute the bytes that were signed.
     ///
-    /// Encrypted mode: `encrypted_envelope || client_ephemeral_public`
-    /// Cleartext mode: `canonical(envelope)`
+    /// Encrypted mode: the COSE_Encrypt0 bytes (`encrypted_envelope`) — the KEM
+    /// ciphertexts and suite id are self-described inside that object.
+    /// Cleartext mode: `canonical(envelope)`.
     fn signed_bytes(&self) -> Vec<u8> {
-        match (&self.encrypted_envelope, &self.client_ephemeral_public) {
-            (Some(ct), Some(eph)) => {
-                let kem_len = self.pq_kem_ciphertext.as_ref().map_or(0, Vec::len);
-                let mut data = Vec::with_capacity(ct.len() + 32 + kem_len);
-                data.extend_from_slice(ct);
-                data.extend_from_slice(eph);
-                if let Some(ref kem_ct) = self.pq_kem_ciphertext {
-                    data.extend_from_slice(kem_ct);
-                }
-                data
-            }
-            _ => self.envelope.to_bytes(),
+        match &self.encrypted_envelope {
+            Some(ct) => ct.clone(),
+            None => self.envelope.to_bytes(),
         }
     }
 
-    /// Decrypt the envelope in-place, replacing the cleartext `envelope` field.
+    /// Decrypt a `#mesh-kem`-encrypted envelope in-place, replacing `envelope`.
     ///
-    /// After calling this, `self.envelope` contains the decrypted data and
-    /// the encrypted fields remain for signature verification.
-    pub fn decrypt_in_place(
+    /// Opens the COSE_Encrypt0 in `encrypted_envelope` with the node's `#mesh-kem`
+    /// [`crate::crypto::hybrid_kem::RecipientKeypair`] (deterministically derived
+    /// from the node Ed25519 key — see
+    /// [`crate::node_identity::derive_mesh_kem_recipient`]). The encrypted bytes
+    /// remain for signature verification.
+    pub fn decrypt_in_place_mesh_kem(
         &mut self,
-        server_signing_key: &crate::crypto::SigningKey,
+        node_kem_keypair: &crate::crypto::hybrid_kem::RecipientKeypair,
     ) -> EnvelopeResult<()> {
-        use crate::crypto::envelope_crypto::decrypt_envelope;
-
-        let ct = self.encrypted_envelope.as_ref()
+        let ct = self
+            .encrypted_envelope
+            .as_ref()
             .ok_or_else(|| EnvelopeError::Decryption("no encrypted envelope present".into()))?;
-        let eph = self.client_ephemeral_public.as_ref()
-            .ok_or_else(|| EnvelopeError::Decryption("no client ephemeral public key".into()))?;
+        let aad = envelope_external_aad();
 
-        let plaintext = decrypt_envelope(ct, eph, server_signing_key)?;
+        let plaintext =
+            crate::crypto::cose_encrypt::open_from_recipient(node_kem_keypair, ct, &aad, 0, 0)
+                .map_err(|e| {
+                    EnvelopeError::Decryption(format!("#mesh-kem envelope open failed: {e}"))
+                })?;
 
         let reader = capnp::serialize::read_message(
             &mut std::io::Cursor::new(&plaintext),
             envelope_reader_options(),
-        ).map_err(|e| EnvelopeError::Decryption(format!("capnp parse after decrypt: {e}")))?;
+        )
+        .map_err(|e| EnvelopeError::Decryption(format!("capnp parse after decrypt: {e}")))?;
         let env_reader = reader
             .get_root::<crate::common_capnp::request_envelope::Reader>()
             .map_err(|e| EnvelopeError::Decryption(format!("envelope read after decrypt: {e}")))?;
-        self.envelope = RequestEnvelope::read_from(env_reader)
-            .map_err(|e| EnvelopeError::Decryption(format!("envelope decode after decrypt: {e}")))?;
-
-        Ok(())
-    }
-
-    /// Decrypt a hybrid-encrypted envelope in-place (X25519 + ML-KEM-768).
-    pub fn decrypt_in_place_hybrid(
-        &mut self,
-        server_signing_key: &crate::crypto::SigningKey,
-        server_kem_dk: &crate::crypto::pq::MlKemDecapsKey,
-    ) -> EnvelopeResult<()> {
-        use crate::crypto::envelope_crypto::decrypt_envelope_hybrid;
-
-        let ct = self.encrypted_envelope.as_ref()
-            .ok_or_else(|| EnvelopeError::Decryption("no encrypted envelope present".into()))?;
-        let eph = self.client_ephemeral_public.as_ref()
-            .ok_or_else(|| EnvelopeError::Decryption("no client ephemeral public key".into()))?;
-        let kem_ct = self.pq_kem_ciphertext.as_ref()
-            .ok_or_else(|| EnvelopeError::Decryption("no KEM ciphertext present".into()))?;
-
-        let plaintext = decrypt_envelope_hybrid(ct, eph, kem_ct, server_signing_key, server_kem_dk)?;
-
-        let reader = capnp::serialize::read_message(
-            &mut std::io::Cursor::new(&plaintext),
-            envelope_reader_options(),
-        ).map_err(|e| EnvelopeError::Decryption(format!("capnp parse after decrypt: {e}")))?;
-        let env_reader = reader
-            .get_root::<crate::common_capnp::request_envelope::Reader>()
-            .map_err(|e| EnvelopeError::Decryption(format!("envelope read after decrypt: {e}")))?;
-        self.envelope = RequestEnvelope::read_from(env_reader)
-            .map_err(|e| EnvelopeError::Decryption(format!("envelope decode after decrypt: {e}")))?;
+        self.envelope = RequestEnvelope::read_from(env_reader).map_err(|e| {
+            EnvelopeError::Decryption(format!("envelope decode after decrypt: {e}"))
+        })?;
 
         Ok(())
     }
@@ -1608,7 +1612,6 @@ impl SignedEnvelope {
     pub fn authorization(&self) -> &Authorization {
         &self.envelope.authorization
     }
-
 }
 
 impl ToCapnp for RequestEnvelope {
@@ -1655,7 +1658,11 @@ impl FromCapnp for RequestEnvelope {
         let delegation_token = {
             if reader.has_delegation_token() {
                 let t = reader.get_delegation_token()?.to_str()?;
-                if t.is_empty() { None } else { Some(t.to_owned()) }
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_owned())
+                }
             } else {
                 None
             }
@@ -1759,7 +1766,11 @@ impl FromCapnp for SignedEnvelope {
 
         let encrypted_envelope = {
             let data = reader.get_encrypted_envelope()?;
-            if data.is_empty() { None } else { Some(data.to_vec()) }
+            if data.is_empty() {
+                None
+            } else {
+                Some(data.to_vec())
+            }
         };
 
         let client_ephemeral_public = {
@@ -1782,7 +1793,11 @@ impl FromCapnp for SignedEnvelope {
 
         let pq_kem_ciphertext = {
             let data = reader.get_pq_kem_ciphertext()?;
-            if data.is_empty() { None } else { Some(data.to_vec()) }
+            if data.is_empty() {
+                None
+            } else {
+                Some(data.to_vec())
+            }
         };
 
         // `policy` is a signing-time concept; the verifier supplies the verify
@@ -1936,7 +1951,11 @@ impl ResponseEnvelope {
         policy: crate::crypto::CryptoPolicy,
         signing_data: &[u8],
     ) -> Result<Vec<u8>> {
-        let pq = if policy.uses_pq() { pq_signing_key } else { None };
+        let pq = if policy.uses_pq() {
+            pq_signing_key
+        } else {
+            None
+        };
         let aad = response_envelope_external_aad();
         crate::crypto::cose_sign::sign_composite(signing_key, pq, signing_data, &aad)
     }
@@ -1947,7 +1966,11 @@ impl ResponseEnvelope {
     /// `Classical` policy and no PQ trust store. For Hybrid enforcement use
     /// [`Self::verify_with`].
     pub fn verify(&self, expected_pubkey: Option<&VerifyingKey>) -> Result<()> {
-        self.verify_with(expected_pubkey, None, crate::crypto::CryptoPolicy::Classical)
+        self.verify_with(
+            expected_pubkey,
+            None,
+            crate::crypto::CryptoPolicy::Classical,
+        )
     }
 
     /// Verify with an explicit kid-anchored PQ trust store and verify policy.
@@ -2033,7 +2056,6 @@ impl ResponseEnvelope {
         VerifyingKey::from_bytes(&self.cnf)
             .map_err(|_| anyhow::anyhow!("Invalid signer public key"))
     }
-
 }
 
 impl ToCapnp for ResponseEnvelope {
@@ -2110,9 +2132,16 @@ pub fn unwrap_and_verify(
 
     if signed.is_encrypted() {
         if let Some(decryption_key) = opts.decryption_key {
-            signed.decrypt_in_place(decryption_key)?;
+            // The node's #mesh-kem keypair is deterministically derived from its
+            // Ed25519 identity key (S1), so the decryption seam keeps taking the
+            // signing key and derives the KEM keypair here.
+            let kem_keypair = crate::node_identity::derive_mesh_kem_recipient(decryption_key)
+                .map_err(|e| anyhow!("derive #mesh-kem keypair for decryption: {e}"))?;
+            signed.decrypt_in_place_mesh_kem(&kem_keypair)?;
         } else {
-            return Err(anyhow!("encrypted envelope but no decryption key configured"));
+            return Err(anyhow!(
+                "encrypted envelope but no decryption key configured"
+            ));
         }
     }
 
@@ -2136,9 +2165,7 @@ pub fn unwrap_envelope(
         EnvelopeVerification::FixedSigner(_) => {
             crate::service::EnvelopeContext::from_verified_as_system(&signed)
         }
-        EnvelopeVerification::AnySigner => {
-            crate::service::EnvelopeContext::from_verified(&signed)
-        }
+        EnvelopeVerification::AnySigner => crate::service::EnvelopeContext::from_verified(&signed),
     };
 
     Ok((ctx, payload))
@@ -2171,7 +2198,12 @@ pub fn unwrap_response(
     response: &[u8],
     expected_pubkey: Option<&VerifyingKey>,
 ) -> Result<(u64, Vec<u8>)> {
-    unwrap_response_with(response, expected_pubkey, None, crate::crypto::CryptoPolicy::Classical)
+    unwrap_response_with(
+        response,
+        expected_pubkey,
+        None,
+        crate::crypto::CryptoPolicy::Classical,
+    )
 }
 
 /// Unwrap and verify a ResponseEnvelope under an explicit kid-anchored PQ trust
@@ -2256,10 +2288,8 @@ mod tests {
                 .iter()
                 .find(|(k, _)| k == ed25519_pubkey)
                 .map(|(_, vk)| {
-                    crate::crypto::pq::ml_dsa_vk_from_bytes(
-                        &crate::crypto::pq::ml_dsa_vk_bytes(vk),
-                    )
-                    .expect("re-decode pq vk")
+                    crate::crypto::pq::ml_dsa_vk_from_bytes(&crate::crypto::pq::ml_dsa_vk_bytes(vk))
+                        .expect("re-decode pq vk")
                 })
         }
     }
@@ -2414,12 +2444,32 @@ mod tests {
 
     #[test]
     fn test_subject_legacy_prefix_parsing() {
-        assert_eq!("local:alice".parse::<Subject>().expect("parse local:alice"), Subject::new("alice"));
-        assert_eq!("token:bob".parse::<Subject>().expect("parse token:bob"), Subject::new("bob"));
-        assert_eq!("peer:gpu-1".parse::<Subject>().expect("parse peer:gpu-1"), Subject::new("gpu-1"));
-        assert_eq!("user:charlie".parse::<Subject>().expect("parse user:charlie"), Subject::new("charlie"));
-        assert_eq!("alice".parse::<Subject>().expect("parse alice"), Subject::new("alice"));
-        assert_eq!("unknown:foo".parse::<Subject>().expect("parse unknown:foo"), Subject::new("unknown:foo"));
+        assert_eq!(
+            "local:alice".parse::<Subject>().expect("parse local:alice"),
+            Subject::new("alice")
+        );
+        assert_eq!(
+            "token:bob".parse::<Subject>().expect("parse token:bob"),
+            Subject::new("bob")
+        );
+        assert_eq!(
+            "peer:gpu-1".parse::<Subject>().expect("parse peer:gpu-1"),
+            Subject::new("gpu-1")
+        );
+        assert_eq!(
+            "user:charlie"
+                .parse::<Subject>()
+                .expect("parse user:charlie"),
+            Subject::new("charlie")
+        );
+        assert_eq!(
+            "alice".parse::<Subject>().expect("parse alice"),
+            Subject::new("alice")
+        );
+        assert_eq!(
+            "unknown:foo".parse::<Subject>().expect("parse unknown:foo"),
+            Subject::new("unknown:foo")
+        );
     }
 
     #[test]
@@ -2469,11 +2519,7 @@ mod tests {
 
     #[test]
     fn test_subject_from_claims() {
-        let claims = crate::auth::Claims::new(
-            "charlie".to_owned(),
-            1000,
-            2000,
-        );
+        let claims = crate::auth::Claims::new("charlie".to_owned(), 1000, 2000);
         assert_eq!(Subject::from(&claims), Subject::new("charlie"));
     }
 
@@ -2642,6 +2688,61 @@ mod tests {
     }
 
     #[test]
+    fn mesh_kem_envelope_seal_open_roundtrip() {
+        use crate::node_identity::{derive_mesh_kem_recipient, derive_mesh_mldsa_key};
+
+        // Node identity: Ed25519 root → #mesh-mldsa sign key + #mesh-kem keypair.
+        let (node_sk, node_vk) = generate_signing_keypair();
+        let pq_sk = derive_mesh_mldsa_key(&node_sk);
+        let kem_kp = derive_mesh_kem_recipient(&node_sk).expect("derive #mesh-kem");
+        let kem_pub = kem_kp.public();
+
+        let req_id = 777u64;
+        let payload = vec![9u8, 8, 7, 6];
+        let envelope = RequestEnvelope {
+            request_id: req_id,
+            payload: payload.clone(),
+            nonce: [3u8; 16],
+            iat: current_timestamp(),
+            authorization: Authorization::None,
+            delegation_token: None,
+            wth: None,
+            client_dh_public: None,
+        };
+
+        // Seal to the node's #mesh-kem public, dual-signed (EdDSA + ML-DSA-65).
+        let signed =
+            SignedEnvelope::new_signed_encrypted_mesh_kem(envelope, &node_sk, &pq_sk, &kem_pub)
+                .expect("seal");
+
+        // Encrypted; plaintext is NOT on the wire; no separate eph/KEM-ct fields.
+        assert!(signed.is_encrypted());
+        assert!(signed.encrypted_envelope.is_some());
+        assert!(signed.client_ephemeral_public.is_none());
+        assert!(signed.pq_kem_ciphertext.is_none());
+
+        // COSE composite signature verifies over the COSE_Encrypt0 bytes.
+        signed
+            .verify_signature_only(&node_vk)
+            .expect("signature over COSE_Encrypt0 verifies");
+
+        // Decrypt with the node's #mesh-kem keypair.
+        let mut opened = signed.clone();
+        opened.decrypt_in_place_mesh_kem(&kem_kp).expect("open");
+        assert_eq!(opened.envelope.request_id, req_id);
+        assert_eq!(opened.envelope.payload, payload);
+
+        // Fail-closed: a WRONG #mesh-kem keypair must not open.
+        let (other_sk, _) = generate_signing_keypair();
+        let other_kem = derive_mesh_kem_recipient(&other_sk).unwrap();
+        let mut wrong = signed.clone();
+        assert!(
+            wrong.decrypt_in_place_mesh_kem(&other_kem).is_err(),
+            "wrong #mesh-kem key must not open"
+        );
+    }
+
+    #[test]
     fn test_tampered_authorization_breaks_signature() {
         let (signing_key, verifying_key) = generate_signing_keypair();
 
@@ -2663,7 +2764,10 @@ mod tests {
 
         // Signature verification must fail
         let result = signed.verify_signature_only(&verifying_key);
-        assert!(result.is_err(), "Tampered authorization must invalidate signature");
+        assert!(
+            result.is_err(),
+            "Tampered authorization must invalidate signature"
+        );
     }
 
     #[test]
@@ -2676,7 +2780,10 @@ mod tests {
         signed.envelope.payload = vec![9, 9, 9];
 
         let result = signed.verify_signature_only(&verifying_key);
-        assert!(result.is_err(), "Tampered payload must invalidate signature");
+        assert!(
+            result.is_err(),
+            "Tampered payload must invalidate signature"
+        );
     }
 
     #[test]
@@ -2707,12 +2814,16 @@ mod tests {
 
     use crate::crypto::CryptoPolicy;
 
-    fn pq_store_for(ed_pubkey: [u8; 32], pq_vk: &crate::crypto::pq::MlDsaVerifyingKey) -> TestPqStore {
-        let vk = crate::crypto::pq::ml_dsa_vk_from_bytes(
-            &crate::crypto::pq::ml_dsa_vk_bytes(pq_vk),
-        )
-        .expect("decode pq vk");
-        TestPqStore { bindings: vec![(ed_pubkey, vk)] }
+    fn pq_store_for(
+        ed_pubkey: [u8; 32],
+        pq_vk: &crate::crypto::pq::MlDsaVerifyingKey,
+    ) -> TestPqStore {
+        let vk =
+            crate::crypto::pq::ml_dsa_vk_from_bytes(&crate::crypto::pq::ml_dsa_vk_bytes(pq_vk))
+                .expect("decode pq vk");
+        TestPqStore {
+            bindings: vec![(ed_pubkey, vk)],
+        }
     }
 
     /// classical_only: sign + verify in Classical mode.
@@ -2822,11 +2933,8 @@ mod tests {
         let (sk, vk) = generate_signing_keypair();
         let (pq_sk, _pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
         let cache = TestNonceCache::new();
-        let signed = SignedEnvelope::new_signed_hybrid(
-            RequestEnvelope::anonymous(vec![1]),
-            &sk,
-            &pq_sk,
-        );
+        let signed =
+            SignedEnvelope::new_signed_hybrid(RequestEnvelope::anonymous(vec![1]), &sk, &pq_sk);
         // Empty store (no anchor) + Hybrid policy → classical inner-EdDSA fallback.
         signed.verify_with(&vk, &cache, None, CryptoPolicy::Hybrid)?;
         Ok(())
@@ -2853,7 +2961,10 @@ mod tests {
 
         let store = pq_store_for(vk.to_bytes(), &pq_vk);
         let res = signed.verify_with(&vk, &cache, Some(&store), CryptoPolicy::Hybrid);
-        assert!(res.is_err(), "stripping the outer ML-DSA layer must fail Hybrid policy");
+        assert!(
+            res.is_err(),
+            "stripping the outer ML-DSA layer must fail Hybrid policy"
+        );
     }
 
     /// Integration at the `unwrap_and_verify` level (prod-wiring path the review
@@ -2905,11 +3016,8 @@ mod tests {
         let (pq_sk, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
         let cache = TestNonceCache::new();
 
-        let signed = SignedEnvelope::new_signed_hybrid(
-            RequestEnvelope::anonymous(vec![4, 2]),
-            &sk,
-            &pq_sk,
-        );
+        let signed =
+            SignedEnvelope::new_signed_hybrid(RequestEnvelope::anonymous(vec![4, 2]), &sk, &pq_sk);
         let mut message = capnp::message::Builder::new_default();
         {
             let mut builder = message.init_root::<common_capnp::signed_envelope::Builder>();
@@ -2995,7 +3103,11 @@ mod tests {
         let _guard = ENV_TEST_LOCK.lock();
         // SAFETY: single-threaded section guarded by ENV_TEST_LOCK.
         unsafe { std::env::remove_var(ENVELOPE_POLICY_ENV) };
-        assert_eq!(envelope_policy_from_env(), CryptoPolicy::Hybrid, "default must be Hybrid");
+        assert_eq!(
+            envelope_policy_from_env(),
+            CryptoPolicy::Hybrid,
+            "default must be Hybrid"
+        );
         unsafe { std::env::set_var(ENVELOPE_POLICY_ENV, "hybrid") };
         assert_eq!(envelope_policy_from_env(), CryptoPolicy::Hybrid);
         unsafe { std::env::set_var(ENVELOPE_POLICY_ENV, "classical") };
@@ -3005,7 +3117,11 @@ mod tests {
             "the escape hatch must downgrade the response side in parity with the request side"
         );
         unsafe { std::env::set_var(ENVELOPE_POLICY_ENV, "bogus") };
-        assert_eq!(envelope_policy_from_env(), CryptoPolicy::Hybrid, "junk must fail-safe to Hybrid");
+        assert_eq!(
+            envelope_policy_from_env(),
+            CryptoPolicy::Hybrid,
+            "junk must fail-safe to Hybrid"
+        );
         unsafe { std::env::remove_var(ENVELOPE_POLICY_ENV) };
     }
 
@@ -3042,8 +3158,12 @@ mod tests {
         // Anchored Hybrid response verifies under the global config.
         let resp = ResponseEnvelope::new_signed_hybrid(11, vec![7, 7], &sk, &pq_sk);
         let wire = response_to_wire(&resp);
-        let (rid, payload) =
-            unwrap_response_with(&wire, Some(&vk), Some(store.as_ref()), global_response_verify_policy())?;
+        let (rid, payload) = unwrap_response_with(
+            &wire,
+            Some(&vk),
+            Some(store.as_ref()),
+            global_response_verify_policy(),
+        )?;
         assert_eq!(rid, 11);
         assert_eq!(payload, vec![7, 7]);
 
@@ -3072,7 +3192,10 @@ mod tests {
             Some(store.as_ref()),
             global_response_verify_policy(),
         );
-        assert!(res3.is_err(), "classical-only response from an anchored signer must be rejected");
+        assert!(
+            res3.is_err(),
+            "classical-only response from an anchored signer must be rejected"
+        );
         Ok(())
     }
 
@@ -3101,7 +3224,10 @@ mod tests {
 
         let store = pq_store_for(vk.to_bytes(), &pq_vk);
         let res = resp.verify_with(Some(&vk), Some(&store), CryptoPolicy::Hybrid);
-        assert!(res.is_err(), "stripping the outer ML-DSA layer must fail Hybrid policy");
+        assert!(
+            res.is_err(),
+            "stripping the outer ML-DSA layer must fail Hybrid policy"
+        );
     }
 
     /// Tampering the inner EdDSA signature invalidates the Hybrid composite.
@@ -3118,12 +3244,15 @@ mod tests {
         let (forged_inner, _none) =
             crate::crypto::cose_sign::decode_composite_for_test(&other_resp.cose).expect("decode");
         let mut tampered = resp.clone();
-        tampered.cose =
-            crate::crypto::cose_sign::encode_composite_for_test(forged_inner, outer).expect("encode");
+        tampered.cose = crate::crypto::cose_sign::encode_composite_for_test(forged_inner, outer)
+            .expect("encode");
 
         let store = pq_store_for(vk.to_bytes(), &pq_vk);
         let res = tampered.verify_with(Some(&vk), Some(&store), CryptoPolicy::Hybrid);
-        assert!(res.is_err(), "tampering the inner EdDSA must invalidate the response composite");
+        assert!(
+            res.is_err(),
+            "tampering the inner EdDSA must invalidate the response composite"
+        );
     }
 
     /// Tampering the payload invalidates the signature.
@@ -3132,7 +3261,10 @@ mod tests {
         let (sk, vk) = generate_signing_keypair();
         let mut resp = ResponseEnvelope::new_signed(4, vec![1, 2, 3], &sk);
         resp.payload = vec![9, 9, 9];
-        assert!(resp.verify(Some(&vk)).is_err(), "tampered payload must invalidate the response");
+        assert!(
+            resp.verify(Some(&vk)).is_err(),
+            "tampered payload must invalidate the response"
+        );
     }
 
     /// self-cert: anchored ML-DSA key not matching the signer's PQ key → reject.
@@ -3144,7 +3276,10 @@ mod tests {
         let resp = ResponseEnvelope::new_signed_hybrid(5, vec![5], &sk, &pq_sk);
         let store = pq_store_for(vk.to_bytes(), &other_vk);
         let res = resp.verify_with(Some(&vk), Some(&store), CryptoPolicy::Hybrid);
-        assert!(res.is_err(), "wrong anchored PQ key must be rejected (self-cert fix)");
+        assert!(
+            res.is_err(),
+            "wrong anchored PQ key must be rejected (self-cert fix)"
+        );
     }
 
     /// Hybrid policy with NO anchored key falls back to the inner EdDSA classical
@@ -3168,7 +3303,10 @@ mod tests {
         let resp = ResponseEnvelope::new_signed(8, vec![8], &sk);
         let store = pq_store_for(vk.to_bytes(), &pq_vk);
         let res = resp.verify_with(Some(&vk), Some(&store), CryptoPolicy::Hybrid);
-        assert!(res.is_err(), "Hybrid policy must reject a classical-only response");
+        assert!(
+            res.is_err(),
+            "Hybrid policy must reject a classical-only response"
+        );
     }
 
     // =========================================================================
@@ -3198,7 +3336,10 @@ mod tests {
         // Signer's PQ key IS anchored → the outer is enforced; stripping it fails.
         let store = pq_store_for(vk.to_bytes(), &pq_vk);
         let res = signed.verify_with(&vk, &cache, Some(&store), CryptoPolicy::Hybrid);
-        assert!(res.is_err(), "anchored identity must not be downgradable by stripping the outer");
+        assert!(
+            res.is_err(),
+            "anchored identity must not be downgradable by stripping the outer"
+        );
     }
 
     /// WNS / SignedEnvelope (2) unanchored classical fallback: empty store, Hybrid
@@ -3231,11 +3372,8 @@ mod tests {
         let store = pq_store_for(vk.to_bytes(), &pq_vk);
 
         let cache = TestNonceCache::new();
-        let intact = SignedEnvelope::new_signed_hybrid(
-            RequestEnvelope::anonymous(vec![7]),
-            &sk,
-            &pq_sk,
-        );
+        let intact =
+            SignedEnvelope::new_signed_hybrid(RequestEnvelope::anonymous(vec![7]), &sk, &pq_sk);
         intact
             .verify_with(&vk, &cache, Some(&store), CryptoPolicy::Hybrid)
             .expect("intact hybrid from an anchored signer must verify");
@@ -3243,7 +3381,10 @@ mod tests {
         let cache2 = TestNonceCache::new();
         let classical = SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![8]), &sk);
         let res = classical.verify_with(&vk, &cache2, Some(&store), CryptoPolicy::Hybrid);
-        assert!(res.is_err(), "anchored signer must use its PQ key — classical-only is rejected");
+        assert!(
+            res.is_err(),
+            "anchored signer must use its PQ key — classical-only is rejected"
+        );
     }
 
     /// WNS / ResponseEnvelope (1) anchored downgrade rejected.
@@ -3259,7 +3400,10 @@ mod tests {
             crate::crypto::cose_sign::encode_composite_for_test(inner, None).expect("encode");
         let store = pq_store_for(vk.to_bytes(), &pq_vk);
         let res = resp.verify_with(Some(&vk), Some(&store), CryptoPolicy::Hybrid);
-        assert!(res.is_err(), "anchored response identity must not be downgradable");
+        assert!(
+            res.is_err(),
+            "anchored response identity must not be downgradable"
+        );
     }
 
     /// WNS / ResponseEnvelope (2) unanchored classical fallback (mirrors the
@@ -3290,7 +3434,10 @@ mod tests {
 
         let classical = ResponseEnvelope::new_signed(23, vec![2, 3], &sk);
         let res = classical.verify_with(Some(&vk), Some(&store), CryptoPolicy::Hybrid);
-        assert!(res.is_err(), "anchored response signer must use its PQ key — classical-only rejected");
+        assert!(
+            res.is_err(),
+            "anchored response signer must use its PQ key — classical-only rejected"
+        );
     }
 
     /// Wrong expected signer key → rejected.
@@ -3299,7 +3446,10 @@ mod tests {
         let (sk, _vk) = generate_signing_keypair();
         let (_other_sk, other_vk) = generate_signing_keypair();
         let resp = ResponseEnvelope::new_signed(10, vec![1], &sk);
-        assert!(resp.verify(Some(&other_vk)).is_err(), "wrong expected signer must be rejected");
+        assert!(
+            resp.verify(Some(&other_vk)).is_err(),
+            "wrong expected signer must be rejected"
+        );
     }
 
     /// Cap'n Proto round-trip preserves the cose field.
@@ -3315,7 +3465,10 @@ mod tests {
         )?;
         let r = reader.get_root::<common_capnp::response_envelope::Reader>()?;
         let decoded = ResponseEnvelope::read_from(r)?;
-        assert_eq!(decoded.cose, resp.cose, "cose must survive the capnp round-trip");
+        assert_eq!(
+            decoded.cose, resp.cose,
+            "cose must survive the capnp round-trip"
+        );
         let store = pq_store_for(vk.to_bytes(), &pq_vk);
         decoded.verify_with(Some(&vk), Some(&store), CryptoPolicy::Hybrid)?;
         Ok(())
@@ -3336,12 +3489,15 @@ mod tests {
         // the same payload bytes, same key.
         let req_aad = envelope_external_aad();
         let resp_aad = response_envelope_external_aad();
-        assert_ne!(req_aad, resp_aad, "request/response AADs must differ (domain separation)");
+        assert_ne!(
+            req_aad, resp_aad,
+            "request/response AADs must differ (domain separation)"
+        );
 
-        let req_cose =
-            crate::crypto::cose_sign::sign_composite(&sk, None, payload, &req_aad).expect("sign req");
-        let resp_cose =
-            crate::crypto::cose_sign::sign_composite(&sk, None, payload, &resp_aad).expect("sign resp");
+        let req_cose = crate::crypto::cose_sign::sign_composite(&sk, None, payload, &req_aad)
+            .expect("sign req");
+        let resp_cose = crate::crypto::cose_sign::sign_composite(&sk, None, payload, &resp_aad)
+            .expect("sign resp");
 
         // The request signature verifies under the request AAD …
         crate::crypto::cose_sign::verify_composite(&req_cose, &vk, None, payload, &req_aad, false)
@@ -3350,15 +3506,23 @@ mod tests {
         let cross1 = crate::crypto::cose_sign::verify_composite(
             &req_cose, &vk, None, payload, &resp_aad, false,
         );
-        assert!(cross1.is_err(), "a request COSE sig must not verify as a response");
+        assert!(
+            cross1.is_err(),
+            "a request COSE sig must not verify as a response"
+        );
 
         // And symmetrically for the response signature.
-        crate::crypto::cose_sign::verify_composite(&resp_cose, &vk, None, payload, &resp_aad, false)
-            .expect("response verifies under response AAD");
+        crate::crypto::cose_sign::verify_composite(
+            &resp_cose, &vk, None, payload, &resp_aad, false,
+        )
+        .expect("response verifies under response AAD");
         let cross2 = crate::crypto::cose_sign::verify_composite(
             &resp_cose, &vk, None, payload, &req_aad, false,
         );
-        assert!(cross2.is_err(), "a response COSE sig must not verify as a request");
+        assert!(
+            cross2.is_err(),
+            "a response COSE sig must not verify as a request"
+        );
     }
 
     /// End-to-end cross-direction: a `SignedEnvelope`'s COSE must not satisfy a
