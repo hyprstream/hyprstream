@@ -206,6 +206,12 @@ UCAN (grant/delegation source) → Casbin (policy STORE + authoring, string-matc
 
 **Naming (don't relitigate):** `ceiling`→`grant`, `dominates`→`can_access`, `witness`→`granted_access`, `rules_for`→`permissions_for` — plain MAC/RBAC vocabulary, not academic/poetic terms.
 
+**Interface policy — MAC on contracts that don't carry it (ratified, epic #547):** MAC context is **never a plaintext field of an API contract**. Contracts carry either verified credentials (checked once at session/attach time) or opaque handles to TCB-resolved context. Select the move by what already crosses the interface:
+1. **Derive, don't extend** — a verified identity already crosses (RPC `EnvelopeContext`): compute `SecurityContext` at the boundary from `Claims × VerifiedKeyMaterial` (S1 invariant), cache, enforce via the AVC. No schema change.
+2. **Extend at attach time, never per-op** — a session exists but no identity crosses (9P `Tattach`, #568): present a verified credential **once** at session establishment; cache the derived `SubjectCtx` fid/connection-scoped inside the TCB (the `mac::avc` amortization model); revoke via the AVC generation counter. Per-op params carry at most an opaque, unforgeable handle.
+3. **Fill with deny/clamp** — nothing crosses or the source is outside the TCB: subjects **deny** (`DenyUnlabeledResolver` pattern), object labels **clamp to the importing boundary's floor** (D2 — join, never "unrestricted"), unverifiable key material **floors at Classical** (Decision D, #698).
+4. **Forbidden** — caller-supplied labels/clearance as authoritative PDP inputs (a plain struct param is unauthenticated data: whoever constructs the call constructs the clearance). "Add a `SecurityContext` parameter to every method" is the *wrong* extension even though it looks most explicit. Labels in wire schemas are **hints** (D1 — trusted only from services we operate).
+
 **Current status (check before assuming otherwise):** the MAC library is real and well-tested, but **enforcement is not active in production as of this writing** — the PDP has no wired-in PEP caller, the S6 grant path's HTTP dispatch still fails closed pending resolver/object-label wiring, and the audit store needs explicit startup construction. Everything fails closed (nothing is exploitable), but do not assume MAC is "live" — check the current wiring state (`services::oauth`, service factories) before relying on it protecting anything at runtime.
 
 ## Adding an RPC Method
