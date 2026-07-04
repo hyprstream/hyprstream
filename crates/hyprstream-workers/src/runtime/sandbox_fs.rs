@@ -144,6 +144,28 @@ impl SandboxFs {
         })
     }
 
+    /// Wrap an **already-composed** namespace for serving, without doing any
+    /// image composition here (#635).
+    ///
+    /// Used by [`SandboxBackend::deliver_namespace`](super::backend::SandboxBackend::deliver_namespace):
+    /// as the #508/#635 narrowing lands, composition becomes the caller's job
+    /// (the universal filesystem-service Mount, or #634's shared
+    /// namespace-composition builder) and the backend's job narrows to
+    /// serving + attaching the transport. There is no fresh
+    /// [`StreamRegistry`] wired into `namespace` here — the caller is
+    /// responsible for mounting whatever injected registries it needs before
+    /// calling this; the placeholder `InjectedMounts` returned by
+    /// [`Self::injected`] is unused in this path.
+    pub fn from_namespace(namespace: Namespace, subject: Subject) -> Self {
+        Self {
+            namespace,
+            subject,
+            injected: InjectedMounts {
+                stream_registry: Arc::new(StreamRegistry::new()),
+            },
+        }
+    }
+
     /// The composed namespace (read-only borrow; e.g. for tests / inspection).
     pub fn namespace(&self) -> &Namespace {
         &self.namespace

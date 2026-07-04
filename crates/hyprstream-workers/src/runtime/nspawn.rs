@@ -436,6 +436,62 @@ impl SandboxBackend for NspawnBackend {
         }
     }
 
+    async fn deliver_namespace(
+        &self,
+        sandbox: &PodSandbox,
+        _namespace: hyprstream_vfs::Namespace,
+        _subject: hyprstream_vfs::Subject,
+        transport: super::backend::NamespaceTransport,
+    ) -> Result<super::backend::NamespaceDelivery> {
+        use super::backend::{NamespaceDelivery, NamespaceTransport};
+
+        // Provisional (#635): nspawn doesn't need FUSE to see a composed
+        // namespace — it can bind a directory straight into a running
+        // container via `machinectl bind`. Until #653's local-FUSE-mount
+        // serve mode lands, there is no generic way to materialize an
+        // in-process `Namespace` at a host directory, so this only supports
+        // the case where the caller has *already* materialized `_namespace`
+        // at `target` (e.g. by hand today; by #653's serve mode once it
+        // exists) and just wants it attached to the guest. The `Namespace`
+        // value itself is intentionally unused here — that is the gap #653
+        // closes, not something this backend can paper over on its own.
+        let NamespaceTransport::BindMount { target } = transport else {
+            return Err(WorkerError::Unsupported(format!(
+                "nspawn backend only supports the BindMount namespace transport (needs #653's \
+                 local-FUSE-mount serve mode for a real VirtioFs/HostImports equivalent), got {transport:?}"
+            )));
+        };
+
+        if !target.exists() {
+            return Err(WorkerError::SandboxCreationFailed(format!(
+                "deliver_namespace: bind-mount source {} does not exist",
+                target.display()
+            )));
+        }
+
+        let machine_name = format!("hyprstream-{}", sandbox.id);
+        let target_str = target.to_string_lossy().into_owned();
+
+        // `machinectl bind` runtime-attaches a host path into an already
+        // running container/VM — the nspawn analogue of Kata's hot-attach
+        // ShareFs device.
+        let status = tokio::process::Command::new("machinectl")
+            .args(["bind", "--mkdir", &machine_name, &target_str])
+            .status()
+            .await
+            .map_err(|e| {
+                WorkerError::SandboxCreationFailed(format!("failed to run machinectl bind: {e}"))
+            })?;
+
+        if !status.success() {
+            return Err(WorkerError::SandboxCreationFailed(format!(
+                "machinectl bind {machine_name} {target_str} failed"
+            )));
+        }
+
+        Ok(NamespaceDelivery::BindMount { target })
+    }
+
     fn supports_exec(&self) -> bool {
         true
     }
@@ -579,6 +635,68 @@ mod tests {
     fn test_backend_type() {
         let backend = NspawnBackend::new(NspawnConfig::default());
         assert_eq!(backend.backend_type(), "nspawn");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // deliver_namespace (#635)
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn test_sandbox(sandbox_path: PathBuf) -> PodSandbox {
+        let config = PodSandboxConfig::default();
+        PodSandbox::new("test-sandbox-001".to_owned(), &config, sandbox_path)
+    }
+
+    #[tokio::test]
+    async fn test_deliver_namespace_rejects_non_bindmount_transport() {
+        use super::super::backend::NamespaceTransport;
+
+        let backend = NspawnBackend::new(NspawnConfig::default());
+        let sandbox = test_sandbox(PathBuf::from("/tmp/nonexistent-sandbox"));
+
+        let result = backend
+            .deliver_namespace(
+                &sandbox,
+                hyprstream_vfs::Namespace::new(),
+                hyprstream_vfs::Subject::new("test"),
+                NamespaceTransport::HostImports,
+            )
+            .await;
+
+        match result {
+            Err(WorkerError::Unsupported(msg)) => {
+                assert!(msg.contains("BindMount"), "unexpected message: {msg}");
+            }
+            other => panic!("expected Unsupported error, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_deliver_namespace_rejects_missing_bindmount_source() {
+        use super::super::backend::NamespaceTransport;
+
+        let backend = NspawnBackend::new(NspawnConfig::default());
+        let sandbox = test_sandbox(PathBuf::from("/tmp/nonexistent-sandbox"));
+
+        // No `machinectl` call should even be attempted: the source path
+        // doesn't exist, so this must fail before shelling out.
+        let result = backend
+            .deliver_namespace(
+                &sandbox,
+                hyprstream_vfs::Namespace::new(),
+                hyprstream_vfs::Subject::new("test"),
+                NamespaceTransport::BindMount {
+                    target: PathBuf::from("/nonexistent/path/for/635/test"),
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WorkerError::SandboxCreationFailed(msg) => {
+                assert!(msg.contains("does not exist"), "unexpected message: {msg}");
+            }
+            other => panic!("expected SandboxCreationFailed, got: {other:?}"),
+        }
     }
 
     #[test]
