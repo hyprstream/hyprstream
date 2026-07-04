@@ -6842,6 +6842,7 @@ dependencies = [
  "hyprstream-vfs",
  "js-sys",
  "parking_lot 0.12.4",
+ "tempfile",
  "tokio",
  "tracing",
  "wasm-bindgen",
