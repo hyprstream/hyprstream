@@ -166,6 +166,29 @@ impl Translator {
         self.serve_listener(HybridVsockListener { inner: listener }).await
     }
 
+    /// Run the accept loop over a **raw** (no-handshake) hybrid-vsock host
+    /// socket: a per-port host UDS the **guest dials**.
+    ///
+    /// The raw sibling of [`serve_vsock`](Self::serve_vsock). Where
+    /// [`serve_vsock`] plays the CH host-multiplexer role for connections
+    /// *hyprstream* initiates — and therefore strips a `connect <port>\n` text
+    /// preamble off each accepted stream — this entry point serves a **per-port
+    /// host listener** (`<vsock-base>_<port>`, e.g. `VFS_9P_VSOCK_PORT=564`) that
+    /// the guest connects to. Per the Firecracker/CH hybrid-vsock spec,
+    /// guest-initiated connections to a per-port host UDS arrive **raw**: there is
+    /// no `connect <port>\n` preamble (the port is already encoded in the socket
+    /// path, not in an in-band handshake). Stripping a preamble here would eat the
+    /// guest's first 9P `Tversion` bytes and break the handshake (#741).
+    ///
+    /// So this hands each accepted [`UnixStream`] straight to the shared
+    /// [`serve_connection`](Self::serve_connection) core with **no** preamble
+    /// strip. The `Subject`-per-op enforcement and wire-faithful 9P2000.L framing
+    /// are byte-identical to every other transport; only the accept surface
+    /// differs (raw, via [`RawVsockListener`]).
+    pub async fn serve_vsock_raw(self, listener: UnixListener) -> Result<()> {
+        self.serve_listener(RawVsockListener { inner: listener }).await
+    }
+
     /// Transport-agnostic accept loop shared by [`serve`](Self::serve) and
     /// [`serve_uds`](Self::serve_uds). Each accepted connection is served on its
     /// own task via [`serve_connection`](Self::serve_connection); errors on one
@@ -390,6 +413,30 @@ pub async fn serve_mount_vsock(
     Translator::from_mount(mount, subject).serve_vsock(listener).await
 }
 
+/// Bind a **raw** (no-handshake) hybrid-vsock **per-port** host socket at `path`
+/// and serve `mount` (scoped to `subject`) as its 9P2000.L root until the socket
+/// errors or is closed.
+///
+/// The raw sibling of [`serve_mount_vsock`], for the **guest-initiated**
+/// direction (#741). `path` is a per-port host UDS (`<vsock-base>_<port>`) the
+/// **guest dials**; per the Firecracker/CH hybrid-vsock spec such connections
+/// arrive **raw** (no `connect <port>\n` preamble — the port is encoded in the
+/// socket path). Accepted streams go straight to the shared 9P core via
+/// [`Translator::serve_vsock_raw`] with no preamble strip, so the guest's first
+/// `Tversion` bytes are treated as 9P and not consumed. This is the entry a kata
+/// supervisor uses to expose a tenant's Subject-scoped export on
+/// `VFS_9P_VSOCK_PORT`.
+pub async fn serve_mount_vsock_raw(
+    mount: Arc<dyn Mount>,
+    subject: Subject,
+    path: impl AsRef<Path>,
+) -> Result<()> {
+    let listener = UnixListener::bind(path.as_ref()).with_context(|| {
+        format!("bind 9P raw hybrid-vsock per-port listener at {:?}", path.as_ref())
+    })?;
+    Translator::from_mount(mount, subject).serve_vsock_raw(listener).await
+}
+
 /// Transport-agnostic accept surface, implemented for [`TcpListener`] and
 /// [`UnixListener`] so both share one accept loop (`serve_listener`).
 ///
@@ -483,6 +530,42 @@ impl Listen for HybridVsockListener {
             .local_addr()
             .map(|a| format!("hvsock:{a:?}"))
             .unwrap_or_else(|_| "hvsock:?".to_owned())
+    }
+}
+
+/// A **raw** (no-handshake) hybrid-vsock **per-port** host listener: a
+/// [`UnixListener`] bound at a per-port host UDS (`<vsock-base>_<port>`) that the
+/// **guest dials**. Unlike [`HybridVsockListener`], accepted connections carry
+/// **no** `connect <port>\n` preamble — per the Firecracker/CH hybrid-vsock spec
+/// the port is encoded in the socket path, and guest-initiated connections to a
+/// per-port host UDS arrive raw (#741). So [`accept_conn`](Listen::accept_conn)
+/// yields the accepted [`UnixStream`] verbatim to the shared 9P serve path; the
+/// guest's first bytes are the 9P `Tversion`, never a preamble.
+///
+/// This is a thin, self-documenting wrapper (rather than serving the bare
+/// [`UnixListener`]) so the "listening" log line and peer strings identify the
+/// channel as raw hybrid-vsock; the byte handling is identical to the plain UDS
+/// impl.
+struct RawVsockListener {
+    inner: UnixListener,
+}
+
+#[async_trait]
+impl Listen for RawVsockListener {
+    type Conn = UnixStream;
+
+    async fn accept_conn(&self) -> std::io::Result<(UnixStream, String)> {
+        // No preamble: hand the stream straight through. The first bytes the
+        // guest sends are the 9P Tversion.
+        let (stream, peer) = self.inner.accept().await?;
+        Ok((stream, format!("rawvsock:{peer:?}")))
+    }
+
+    fn describe(&self) -> String {
+        self.inner
+            .local_addr()
+            .map(|a| format!("rawvsock:{a:?}"))
+            .unwrap_or_else(|_| "rawvsock:?".to_owned())
     }
 }
 
@@ -744,6 +827,76 @@ mod tests {
         let (_, resp) = msg::parse_response(&read_frame(&mut client).await).unwrap();
         match resp {
             Response::Read { data } => assert_eq!(&data, b"hello vsock"),
+            other => panic!("expected Rread with payload, got {other:?}"),
+        }
+
+        drop(client);
+        server.abort();
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    /// RAW (no-handshake) vsock: a guest-initiated client that connects to a
+    /// per-port host UDS and sends its 9P `Tversion` **immediately** — with NO
+    /// `connect <port>\n` preamble — must drive a byte-identical 9P2000.L session.
+    /// This is the #741 guest→host direction: the raw serve path must treat the
+    /// very first bytes as 9P and never consume a preamble. Exercises
+    /// [`Translator::serve_vsock_raw`] / [`RawVsockListener`].
+    #[tokio::test]
+    async fn raw_vsock_no_preamble_9p_session() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tokio::net::UnixStream;
+
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let sock = std::env::temp_dir()
+            .join(format!("hs9p-rawvsock-{}-{nanos}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+
+        let backend = MemoryBackend::default();
+        backend.add_file("/hello.txt", b"hello raw");
+        let listener = UnixListener::bind(&sock).expect("bind raw vsock per-port host UDS");
+        let translator = Translator::new(Arc::new(backend));
+        let server = tokio::spawn(translator.serve_vsock_raw(listener));
+
+        // ── Client (guest) side ─────────────────────────────────────────
+        let mut client = UnixStream::connect(&sock).await.expect("dial per-port host UDS");
+
+        async fn read_frame(s: &mut UnixStream) -> Vec<u8> {
+            let mut len = [0u8; 4];
+            s.read_exact(&mut len).await.unwrap();
+            let total = u32::from_le_bytes(len) as usize;
+            let mut buf = vec![0u8; total];
+            buf[..4].copy_from_slice(&len);
+            s.read_exact(&mut buf[4..]).await.unwrap();
+            buf
+        }
+
+        // FIRST bytes on the wire are 9P Tversion — NO `connect <port>\n`
+        // preamble. If the raw path erroneously stripped a preamble it would
+        // swallow these bytes and the session would hang / fail here.
+        client.write_all(&msg::tversion(1, MSG_SIZE, "9P2000.L")).await.unwrap();
+        let (_, resp) = msg::parse_response(&read_frame(&mut client).await).unwrap();
+        assert!(
+            matches!(resp, Response::Version { .. }),
+            "raw path must treat the first bytes as 9P Tversion, got {resp:?}"
+        );
+
+        // Rest of the session proves the stream was never desynchronized.
+        client.write_all(&msg::tattach(2, 0, u32::MAX, "u", "/")).await.unwrap();
+        let (_, resp) = msg::parse_response(&read_frame(&mut client).await).unwrap();
+        assert!(matches!(resp, Response::Attach { .. }), "expected Rattach, got {resp:?}");
+
+        client.write_all(&msg::twalk(3, 0, 1, &["hello.txt"])).await.unwrap();
+        let (_, resp) = msg::parse_response(&read_frame(&mut client).await).unwrap();
+        assert!(matches!(resp, Response::Walk { .. }), "expected Rwalk, got {resp:?}");
+
+        client.write_all(&msg::tlopen(4, 1, 0)).await.unwrap();
+        let (_, resp) = msg::parse_response(&read_frame(&mut client).await).unwrap();
+        assert!(matches!(resp, Response::Lopen { .. }), "expected Rlopen, got {resp:?}");
+
+        client.write_all(&msg::tread(5, 1, 0, 64)).await.unwrap();
+        let (_, resp) = msg::parse_response(&read_frame(&mut client).await).unwrap();
+        match resp {
+            Response::Read { data } => assert_eq!(&data, b"hello raw"),
             other => panic!("expected Rread with payload, got {other:?}"),
         }
 

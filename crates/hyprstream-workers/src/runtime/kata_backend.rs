@@ -132,7 +132,7 @@ fn vfs_9p_vsock_uds(vsock_base: &str, port: u32) -> PathBuf {
 pub struct Vfs9pVsockServer {
     /// Host-side UDS the guest's vsock port maps to (`<vsock-uds>_<port>`).
     socket_path: PathBuf,
-    /// The background 9P serve task ([`hyprstream_9p::serve_mount_vsock`]).
+    /// The background 9P serve task ([`hyprstream_9p::serve_mount_vsock_raw`]).
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -1104,12 +1104,22 @@ impl KataBackend {
 
         let sock_for_task = socket_path.clone();
         let sandbox_id = sandbox_id.to_owned();
-        // `serve_mount_vsock` binds the host UDS and runs the 9P accept loop until
-        // the socket errors/closes (or the task is aborted on teardown). It serves
-        // the same Subject-scoped Mount as native 9P; only the transport differs.
+        // `serve_mount_vsock_raw` binds the per-port host UDS and runs the 9P
+        // accept loop until the socket errors/closes (or the task is aborted on
+        // teardown). It serves the same Subject-scoped Mount as native 9P; only
+        // the transport differs.
+        //
+        // RAW (no-handshake) mode is required here (#741): this is a **per-port**
+        // host listener (`<vsock-base>_<VFS_9P_VSOCK_PORT>`) that the **guest
+        // dials**. Per the Firecracker/CH hybrid-vsock spec, guest-initiated
+        // connections to a per-port host UDS arrive **raw** — the port is encoded
+        // in the socket path, not in an in-band `connect <port>\n` preamble. The
+        // preamble-stripping `serve_mount_vsock` is for the opposite (host-
+        // initiated, CH-multiplexer) direction; using it here would consume the
+        // guest's first 9P `Tversion` bytes and break the handshake.
         let task = tokio::spawn(async move {
             if let Err(e) =
-                hyprstream_9p::serve_mount_vsock(mount, subject, &sock_for_task).await
+                hyprstream_9p::serve_mount_vsock_raw(mount, subject, &sock_for_task).await
             {
                 tracing::warn!(
                     sandbox_id = %sandbox_id,
