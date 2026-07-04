@@ -372,27 +372,46 @@ impl std::fmt::Debug for SandboxFsLocalMount {
 impl Drop for SandboxFsLocalMount {
     fn drop(&mut self) {
         // `serve_local` blocks until the FUSE session ends; unmount to make it
-        // return. `fusermount3 -u` tears down the kernel mount unprivileged (for
-        // a mount owned by this uid), which the serving thread observes as the
-        // session closing and exits its loop. Best-effort: if the mount never
-        // came up (e.g. no `/dev/fuse`), the unmount is a harmless no-op and the
-        // thread has already exited.
-        let unmounted = std::process::Command::new("fusermount3")
-            .arg("-u")
-            .arg(&self.mountpoint)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !unmounted {
-            let _ = std::process::Command::new("fusermount")
-                .arg("-u")
-                .arg(&self.mountpoint)
-                .status();
+        // return. A non-lazy `fusermount3 -u` tears down the kernel mount
+        // unprivileged (for a mount owned by this uid), which the serving thread
+        // observes as the session closing and exits its loop. Best-effort: if
+        // the mount never came up (e.g. no `/dev/fuse`), the unmount is a
+        // harmless no-op and the thread has already exited.
+        //
+        // If the clean unmount fails because the mount is still busy (a workload
+        // process still has it open), fall back to a LAZY unmount (`-uz`): the
+        // kernel detaches the mount as soon as it stops being referenced, which
+        // still closes the FUSE session so the serving thread exits. Without this
+        // fallback a busy mount would leave the session open and the
+        // `thread.join()` below would block forever, hanging the runtime thread
+        // that dropped this handle.
+        if !fusermount_unmount(&self.mountpoint, false) {
+            let _ = fusermount_unmount(&self.mountpoint, true);
         }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
+}
+
+/// Unmount the FUSE mount at `mountpoint`, trying `fusermount3` then the older
+/// `fusermount`. With `lazy = true` uses `-uz` (detach-when-idle), which
+/// succeeds even when the mount is busy; with `lazy = false` uses a clean `-u`.
+/// Returns whether either tool reported success.
+fn fusermount_unmount(mountpoint: &Path, lazy: bool) -> bool {
+    let flag = if lazy { "-uz" } else { "-u" };
+    for tool in ["fusermount3", "fusermount"] {
+        let ok = std::process::Command::new(tool)
+            .arg(flag)
+            .arg(mountpoint)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            return true;
+        }
+    }
+    false
 }
 
 fn socket_filename(path: &Path) -> String {
