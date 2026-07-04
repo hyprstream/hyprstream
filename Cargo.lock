@@ -7249,6 +7249,7 @@ dependencies = [
  "futures",
  "glob",
  "hex",
+ "hyper-util",
  "hypervisor",
  "hyprstream-9p",
  "hyprstream-rpc",
@@ -7260,6 +7261,7 @@ dependencies = [
  "hyprstream-workers-tcl",
  "hyprstream-workers-wasmtime",
  "inventory",
+ "k8s-cri",
  "kata-sys-util",
  "kata-types",
  "libc",
@@ -7285,6 +7287,8 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tokio-util",
+ "tonic 0.12.3",
+ "tower 0.4.13",
  "tracing",
  "ttrpc",
  "uuid 1.18.1",
@@ -8160,6 +8164,18 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "signature 2.2.0",
+]
+
+[[package]]
+name = "k8s-cri"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ed54370442b5bf5f7381378dbcb83ed7e0d9b7259c519ecc2152156a2bebac8"
+dependencies = [
+ "prost 0.13.5",
+ "serde",
+ "tonic 0.12.3",
+ "tonic-build",
 ]
 
 [[package]]
@@ -12440,6 +12456,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "prost-build"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
+dependencies = [
+ "heck 0.5.0",
+ "itertools 0.14.0",
+ "log",
+ "multimap",
+ "once_cell",
+ "petgraph 0.6.5",
+ "prettyplease",
+ "prost 0.13.5",
+ "prost-types 0.13.5",
+ "regex",
+ "syn 2.0.111",
+ "tempfile",
+]
+
+[[package]]
 name = "prost-derive"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -16124,6 +16160,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tonic-build"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9557ce109ea773b399c9b9e5dca39294110b74f1f342cb347a80d1fce8c26a11"
+dependencies = [
+ "prettyplease",
+ "proc-macro2",
+ "prost-build 0.13.5",
+ "prost-types 0.13.5",
+ "quote",
+ "syn 2.0.111",
+]
+
+[[package]]
 name = "torch-sys"
 version = "0.23.0"
 source = "git+https://github.com/hyprstream/tch-rs?branch=hyprstream#5e16a26f333a3ec73669580a35dea51b349058ac"
@@ -16362,7 +16412,7 @@ checksum = "3aa71f4a44711b3b9cc10ed0c7e239ff0fe4b8e6c900a142fb3bb26401385718"
 dependencies = [
  "derive-new",
  "prost 0.8.0",
- "prost-build",
+ "prost-build 0.8.0",
  "prost-types 0.8.0",
  "protobuf",
  "protobuf-codegen",
