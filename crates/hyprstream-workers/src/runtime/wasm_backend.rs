@@ -455,6 +455,9 @@ inventory::submit! {
         name: "wasm",
         priority: 5,
         auto_selectable: false,
+        // In-process wasm has no host filesystem to POSIX-root into, so it does
+        // not advertise the Model B (#715) host-FUSE-mount capability.
+        mounts_fuse_vfs: false,
         is_available: WasmBackend::registry_is_available,
         construct: |_ctx| {
             Ok(std::sync::Arc::new(WasmBackend::new(WasmConfig::default()))

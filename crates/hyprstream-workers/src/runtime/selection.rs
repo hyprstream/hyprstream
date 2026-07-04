@@ -45,9 +45,9 @@ use std::sync::Arc;
 use crate::config::PoolConfig;
 use crate::error::{Result, WorkerError};
 
-#[cfg(feature = "kata-vm")]
+#[cfg(feature = "oci-image")]
 use crate::config::ImageConfig;
-#[cfg(feature = "kata-vm")]
+#[cfg(feature = "oci-image")]
 use crate::image::RafsStore;
 
 use super::SandboxBackend;
@@ -61,13 +61,18 @@ pub struct BackendCtx {
     /// Sandbox pool configuration (paths, hypervisor, limits).
     pub pool_config: PoolConfig,
 
-    /// Image storage configuration. Only the VM (`kata-vm`) path consumes the
-    /// RAFS/nydus image store, so this field only exists on that build.
-    #[cfg(feature = "kata-vm")]
+    /// Image storage configuration. Any backend that composes the RAFS image
+    /// filesystem (kata over virtio-fs, or nspawn over FUSE — Model B #715)
+    /// consumes it, so it exists on the `oci-image` build, not just `kata-vm`.
+    /// The Cargo manifest is explicit that the RAFS image service "lives on
+    /// oci-image, not kata-vm".
+    #[cfg(feature = "oci-image")]
     pub image_config: ImageConfig,
 
-    /// RAFS/nydus image store — VM-only (`kata-vm`).
-    #[cfg(feature = "kata-vm")]
+    /// RAFS/nydus image store — available whenever the image filesystem service
+    /// is compiled in (`oci-image`), so both the kata (virtio-fs) and nspawn
+    /// (FUSE, #715) backends can compose a per-sandbox VFS from it.
+    #[cfg(feature = "oci-image")]
     pub rafs_store: Arc<RafsStore>,
 }
 
@@ -98,6 +103,22 @@ pub struct BackendRegistration {
     /// silent isolation downgrade, which the #547 MAC/ZSP model forbids. The
     /// in-process `wasm` sandbox (shared host address space) sets this `false`.
     pub auto_selectable: bool,
+
+    /// Whether this backend **FUSE-mounts the composed per-sandbox tenant VFS**
+    /// as a real host directory and POSIX-roots its workload there (Model B,
+    /// #715 — the non-VM sibling of the kata virtio-fs path).
+    ///
+    /// `true` → the backend consumes `SandboxFs::serve_local_at` to serve the
+    /// composed namespace over `/dev/fuse` and give that host directory to the
+    /// container. `nspawn` sets this. `kata` does **not** — it already shares the
+    /// composed VFS as a virtio-fs device, not a host FUSE mount. In-process
+    /// `wasm` has no host filesystem to mount into. `oci` is deferred pending a
+    /// rootless `/dev/fuse` feasibility spike and advertises `false` for now.
+    ///
+    /// [`require_fuse_mount_capability`] gates the mount fail-closed: a backend
+    /// that does not advertise this capability is never handed a FUSE-rooted
+    /// namespace (no silent POSIX-rooting in a namespace a backend can't mount).
+    pub mounts_fuse_vfs: bool,
 
     /// Runtime prerequisite probe (PATH lookups, socket existence, …). Returns
     /// `true` when this backend can actually run on this host *right now*. Used
@@ -212,6 +233,40 @@ pub fn resolve_backend(name: &str, ctx: &BackendCtx) -> Result<Arc<dyn SandboxBa
     })
 }
 
+/// Pure capability check over a registration set, with the same fail-closed
+/// contract as [`select_registration`]. Factored out so the Model B (#715)
+/// FUSE-mount gate is unit-testable without depending on which backends the
+/// build's inventory happens to contain.
+fn check_fuse_mount_capability(name: &str, regs: &[&BackendRegistration]) -> Result<()> {
+    match regs.iter().find(|r| r.name.eq_ignore_ascii_case(name)) {
+        Some(reg) if reg.mounts_fuse_vfs => Ok(()),
+        Some(reg) => Err(WorkerError::ConfigError(format!(
+            "sandbox backend '{}' does not advertise the FUSE tenant-VFS mount \
+             capability (mounts_fuse_vfs); refusing to POSIX-root a workload in a \
+             namespace this backend was not declared able to mount (fail-closed).",
+            reg.name
+        ))),
+        None => Err(WorkerError::ConfigError(format!(
+            "unknown sandbox backend '{name}'; cannot check FUSE tenant-VFS mount \
+             capability"
+        ))),
+    }
+}
+
+/// Fail-closed gate for Model B (#715): assert `backend_type` advertises the
+/// [`mounts_fuse_vfs`](BackendRegistration::mounts_fuse_vfs) capability before a
+/// caller FUSE-mounts the composed tenant VFS as that backend's root.
+///
+/// Parallels [`resolve_backend`]'s fail-closed contract: an unknown backend, or
+/// a registered one that does not advertise the capability, errors rather than
+/// proceeding — we never POSIX-root a workload in a namespace a backend was not
+/// declared able to mount, and never silently substitute a different transport.
+pub fn require_fuse_mount_capability(backend_type: &str) -> Result<()> {
+    let regs: Vec<&'static BackendRegistration> =
+        inventory::iter::<BackendRegistration>().collect();
+    check_fuse_mount_capability(backend_type, &regs)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -231,6 +286,7 @@ mod tests {
         name: "high-tier",
         priority: 100,
         auto_selectable: true,
+        mounts_fuse_vfs: false,
         is_available: || true,
         construct: never_available,
     };
@@ -238,6 +294,18 @@ mod tests {
         name: "low-tier",
         priority: 10,
         auto_selectable: true,
+        mounts_fuse_vfs: false,
+        is_available: || true,
+        construct: never_available,
+    };
+
+    /// A FUSE-mount-capable backend, modeling the Model B (#715) nspawn target:
+    /// it advertises `mounts_fuse_vfs: true`.
+    const FUSE_CAP: BackendRegistration = BackendRegistration {
+        name: "fuse-tier",
+        priority: 50,
+        auto_selectable: true,
+        mounts_fuse_vfs: true,
         is_available: || true,
         construct: never_available,
     };
@@ -249,6 +317,7 @@ mod tests {
         name: "explicit-only",
         priority: 1000,
         auto_selectable: false,
+        mounts_fuse_vfs: false,
         is_available: || true,
         construct: never_available,
     };
@@ -350,6 +419,56 @@ mod tests {
     }
 
     // ── The real inventory must reflect the build's feature set ──
+
+    // ── Model B (#715): FUSE tenant-VFS mount capability gate ──
+
+    #[test]
+    fn fuse_capability_gate_allows_advertised_backend() {
+        let regs = vec![&FUSE_CAP, &LOW];
+        assert!(check_fuse_mount_capability("fuse-tier", &regs).is_ok());
+        // Case-insensitive, mirroring backend selection.
+        assert!(check_fuse_mount_capability("FUSE-TIER", &regs).is_ok());
+    }
+
+    #[test]
+    fn fuse_capability_gate_fails_closed_for_non_advertising_backend() {
+        // A registered backend that does NOT advertise the capability must be
+        // refused — no silent POSIX-rooting in a namespace it can't mount.
+        let regs = vec![&FUSE_CAP, &LOW];
+        let err = check_fuse_mount_capability("low-tier", &regs).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("does not advertise"), "got: {msg}");
+        assert!(msg.contains("fail-closed"), "got: {msg}");
+    }
+
+    #[test]
+    fn fuse_capability_gate_unknown_backend_errors() {
+        let regs = vec![&FUSE_CAP];
+        let err = check_fuse_mount_capability("bogus", &regs).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown sandbox backend"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn nspawn_advertises_fuse_mount_capability_in_real_inventory() {
+        // The real inventory: nspawn is the Model B FUSE-root target (#715), so
+        // the public gate resolves it Ok. nspawn is always registered.
+        assert!(
+            require_fuse_mount_capability("nspawn").is_ok(),
+            "nspawn must advertise mounts_fuse_vfs"
+        );
+    }
+
+    #[cfg(feature = "kata-vm")]
+    #[test]
+    fn kata_does_not_advertise_fuse_mount_capability() {
+        // kata already shares the composed VFS via virtio-fs, not a host FUSE
+        // mount, so it must NOT advertise the capability (fail-closed).
+        let err = require_fuse_mount_capability("kata").unwrap_err();
+        assert!(err.to_string().contains("does not advertise"), "got: {err}");
+    }
 
     #[test]
     fn registry_contains_nspawn_always() {

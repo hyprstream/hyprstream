@@ -108,13 +108,17 @@ pub use oci_backend::{OciBackend, OciConfig, OciHandle};
 #[cfg(feature = "wasm")]
 pub use wasm_backend::{WasmBackend, WasmConfig, WasmHandle};
 // Inventory-based backend registry + fail-closed selection spine (#507)
-pub use selection::{resolve_backend, BackendCtx, BackendRegistration};
+pub use selection::{
+    require_fuse_mount_capability, resolve_backend, BackendCtx, BackendRegistration,
+};
 // Domain entities (business logic only)
 pub use container::Container;
 pub use pool::{PoolStats, SandboxPool};
 pub use sandbox::PodSandbox;
 #[cfg(all(not(target_arch = "wasm32"), feature = "oci-image"))]
-pub use sandbox_fs::{InjectedMounts, SandboxFs, SandboxFsServer, VFS_SOCKET_NAME};
+pub use sandbox_fs::{
+    InjectedMounts, SandboxFs, SandboxFsLocalMount, SandboxFsServer, VFS_SOCKET_NAME,
+};
 pub use service::WorkerService;
 // Re-export service infrastructure from hyprstream-rpc for convenience
 pub use hyprstream_rpc::service::{EnvelopeContext, ServiceHandle, RequestService};
