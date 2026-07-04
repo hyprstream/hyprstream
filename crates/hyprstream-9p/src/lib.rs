@@ -22,11 +22,15 @@ pub mod msg;
 pub mod client;
 pub mod backend;
 pub mod memory;
-// The translator is the server-side TCP accept loop (tokio::net). `net` pulls
-// `mio`, which has no wasm32 backend, so the whole module is native-only. The
-// browser/wasm build reaches the backend through the DMA/Wanix client path.
+// The translator is the server-side TCP/UDS accept loop (tokio::net). `net`
+// pulls `mio`, which has no wasm32 backend, so these modules are native-only.
+// The browser/wasm build reaches the backend through the DMA/Wanix client path.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod translator;
+// `MountBackend` bridges a VFS `Mount` (+ `Subject`) to the `Backend` seam so
+// the translator can export it over TCP/UDS. Native-only (drives async Mount ops).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod mount_backend;
 
 #[cfg(target_arch = "wasm32")]
 pub mod dma;
@@ -35,4 +39,6 @@ pub mod wanix_mount;
 
 pub use backend::{Backend, OpenResult, StatResult, WalkResult};
 #[cfg(not(target_arch = "wasm32"))]
-pub use translator::{FidTable, Translator};
+pub use mount_backend::MountBackend;
+#[cfg(not(target_arch = "wasm32"))]
+pub use translator::{serve_mount_uds, FidTable, Translator};

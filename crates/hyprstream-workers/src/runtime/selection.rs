@@ -99,6 +99,33 @@ pub struct BackendRegistration {
     /// in-process `wasm` sandbox (shared host address space) sets this `false`.
     pub auto_selectable: bool,
 
+    /// Whether this backend can **inject a 9P socket endpoint** — a host Unix
+    /// domain socket — into a workload's mount namespace (#506).
+    ///
+    /// The Wanix-guest workload (`runtime::wanix_workload`) works by having
+    /// hyprstream serve a tenant's Subject-scoped VFS `Mount` as a 9P2000.L
+    /// server on a host UDS, then making that socket reachable *inside* the
+    /// sandbox (bind-mounting the host socket into the container's mount
+    /// namespace and setting `HYPRSTREAM_9P_SOCK`) so the guest dials back. That
+    /// requires the backend to be able to bind-mount an arbitrary host path (the
+    /// socket) into the workload, which the tiers do differently:
+    ///
+    /// * `oci` / `nspawn` → `true`: both bind-mount host paths into the
+    ///   container (`podman --volume` / `nspawn --bind`), so a host UDS injects
+    ///   cleanly.
+    /// * `kata` → `false`: a full VM does not share the host mount namespace, so
+    ///   a host UDS cannot be bind-injected the same way (the VM path uses
+    ///   virtio-fs, a different mechanism — see `sandbox_fs`); it therefore does
+    ///   **not** advertise this capability.
+    /// * `wasm` → `false`: in-process, no separate mount namespace to inject a
+    ///   host socket into.
+    ///
+    /// Selection is **fail-closed** on this flag: a workload that requires 9P
+    /// socket injection ([`resolve_backend_9p_capable`] /
+    /// [`require_9p_socket_capability`]) never resolves to a backend that does
+    /// not advertise it — it errors rather than silently dropping the injection.
+    pub injects_9p_socket: bool,
+
     /// Runtime prerequisite probe (PATH lookups, socket existence, …). Returns
     /// `true` when this backend can actually run on this host *right now*. Used
     /// to inform `"auto"` and to fail-close explicit requests whose prereqs are
@@ -122,10 +149,38 @@ fn registered_names(regs: &[&BackendRegistration]) -> String {
 /// oracle. Factored out of [`resolve_backend`] so the fail-closed / auto-priority
 /// / unknown-name logic is unit-testable without depending on which runtimes
 /// happen to be installed on the test host.
+///
+/// Capability-agnostic; delegates to [`select_registration_with_cap`] with no
+/// required capability.
 fn select_registration<'a>(
     name: &str,
     regs: &[&'a BackendRegistration],
     is_available: impl Fn(&BackendRegistration) -> bool,
+) -> Result<&'a BackendRegistration> {
+    select_registration_with_cap(name, regs, is_available, false)
+}
+
+/// Pure selection with an additional **required-capability** gate for 9P socket
+/// injection (#506), fail-closed.
+///
+/// When `require_9p_socket` is `true`, the chosen registration must advertise
+/// [`BackendRegistration::injects_9p_socket`]:
+///
+/// * `"auto"` → only backends that are *both* `auto_selectable` **and**
+///   `injects_9p_socket` are candidates; the highest-priority available one
+///   wins. If none qualifies, error — never fall back to a backend that cannot
+///   inject the socket (that would silently drop the tenant's namespace export).
+/// * a concrete name → resolves the named backend, then rejects it if it does
+///   not advertise the capability. We never substitute a different (capable)
+///   backend for an explicitly-named incapable one — the explicit request is
+///   authoritative, and the correct answer is a clean error, not a swap.
+///
+/// With `require_9p_socket == false` this is exactly the prior behaviour.
+fn select_registration_with_cap<'a>(
+    name: &str,
+    regs: &[&'a BackendRegistration],
+    is_available: impl Fn(&BackendRegistration) -> bool,
+    require_9p_socket: bool,
 ) -> Result<&'a BackendRegistration> {
     // ── Auto: highest-priority *available* registration wins ──
     //
@@ -134,8 +189,15 @@ fn select_registration<'a>(
     // resort when nothing stronger is available — that would be a silent isolation
     // downgrade (#547 ZSP). Such backends remain reachable by explicit name below.
     if name.eq_ignore_ascii_case("auto") {
-        let mut candidates: Vec<&'a BackendRegistration> =
-            regs.iter().copied().filter(|r| r.auto_selectable).collect();
+        let mut candidates: Vec<&'a BackendRegistration> = regs
+            .iter()
+            .copied()
+            .filter(|r| r.auto_selectable)
+            // Capability gate: when a 9P-socket-injecting workload is being
+            // placed, an incapable backend is not even a candidate — auto must
+            // never downgrade to one that would silently drop the injection.
+            .filter(|r| !require_9p_socket || r.injects_9p_socket)
+            .collect();
         // Highest priority first; ties broken by name for determinism.
         candidates.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.name.cmp(b.name)));
         for reg in candidates {
@@ -143,8 +205,13 @@ fn select_registration<'a>(
                 return Ok(reg);
             }
         }
+        let cap_note = if require_9p_socket {
+            " that can inject a 9P socket endpoint (host UDS bind-mount)"
+        } else {
+            ""
+        };
         return Err(WorkerError::ConfigError(format!(
-            "auto backend selection found no available sandbox backend among [{}]. \
+            "auto backend selection found no available sandbox backend{cap_note} among [{}]. \
              Install a supported runtime or set `worker.backend` to an explicit \
              backend; refusing to run a workload without isolation (fail-closed).",
             registered_names(regs)
@@ -153,6 +220,18 @@ fn select_registration<'a>(
 
     // ── Explicit request: authoritative, fail-closed ──
     match regs.iter().find(|r| r.name.eq_ignore_ascii_case(name)) {
+        // Named + available, but cannot inject the required 9P socket → reject.
+        // We do NOT substitute a capable backend for an explicitly-named one.
+        Some(reg) if require_9p_socket && !reg.injects_9p_socket => {
+            Err(WorkerError::ConfigError(format!(
+                "sandbox backend '{}' was requested for a workload that requires 9P \
+                 socket injection (a host Unix socket bind-mounted into the sandbox), \
+                 but '{}' cannot inject a host UDS into a workload's mount namespace. \
+                 Choose a backend that can (e.g. oci, nspawn); refusing to silently \
+                 drop the namespace export (fail-closed).",
+                reg.name, reg.name
+            )))
+        }
         Some(reg) if is_available(reg) => Ok(reg),
         Some(reg) => Err(WorkerError::ConfigError(format!(
             "sandbox backend '{}' was requested but its runtime prerequisites are \
@@ -212,6 +291,69 @@ pub fn resolve_backend(name: &str, ctx: &BackendCtx) -> Result<Arc<dyn SandboxBa
     })
 }
 
+/// Resolve `worker.backend` to a [`SandboxBackend`] that is **guaranteed capable
+/// of 9P socket injection** (#506), fail-closed.
+///
+/// Identical to [`resolve_backend`] but with the capability gate engaged: the
+/// resolved backend always advertises
+/// [`injects_9p_socket`](BackendRegistration::injects_9p_socket). Use this when
+/// placing a workload (e.g. the Wanix guest) that needs a host UDS injected into
+/// its mount namespace. `"auto"` picks the highest-priority *capable* backend;
+/// an explicit name that is incapable errors rather than being swapped for a
+/// capable one.
+pub fn resolve_backend_9p_capable(name: &str, ctx: &BackendCtx) -> Result<Arc<dyn SandboxBackend>> {
+    let regs: Vec<&'static BackendRegistration> =
+        inventory::iter::<BackendRegistration>().collect();
+
+    let reg = select_registration_with_cap(name, &regs, |r| (r.is_available)(), true)?;
+
+    tracing::info!(
+        backend = reg.name,
+        requested = name,
+        priority = reg.priority,
+        "sandbox backend selected for 9P-socket-injecting workload (fail-closed)"
+    );
+
+    (reg.construct)(ctx).map_err(|e| {
+        WorkerError::ConfigError(format!(
+            "failed to construct sandbox backend '{}': {e:#}",
+            reg.name
+        ))
+    })
+}
+
+/// Does the registered backend named `backend_type` advertise 9P socket
+/// injection? Returns `false` for an unknown/unregistered name.
+///
+/// This queries the *registry* (not a live backend instance), so a caller
+/// holding an already-constructed `Arc<dyn SandboxBackend>` can check its
+/// capability via [`SandboxBackend::backend_type`](super::SandboxBackend::backend_type).
+pub fn backend_injects_9p_socket(backend_type: &str) -> bool {
+    inventory::iter::<BackendRegistration>()
+        .find(|r| r.name.eq_ignore_ascii_case(backend_type))
+        .is_some_and(|r| r.injects_9p_socket)
+}
+
+/// Fail-closed guard used at the workload seam: error unless `backend_type`
+/// advertises 9P socket injection (#506).
+///
+/// A caller that already holds a constructed backend (e.g. from the pool) uses
+/// this to refuse — cleanly, before spawning any 9P server or building any
+/// injection annotations — to place a socket-injecting workload on a backend
+/// that cannot receive the socket. It never downgrades; it only reports.
+pub fn require_9p_socket_capability(backend_type: &str) -> Result<()> {
+    if backend_injects_9p_socket(backend_type) {
+        Ok(())
+    } else {
+        Err(WorkerError::ConfigError(format!(
+            "sandbox backend '{backend_type}' cannot inject a 9P socket endpoint \
+             (a host Unix socket bind-mounted into the sandbox), which this workload \
+             requires. Select a capable backend (e.g. oci, nspawn); refusing to run \
+             the workload without its namespace export (fail-closed)."
+        )))
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -231,6 +373,7 @@ mod tests {
         name: "high-tier",
         priority: 100,
         auto_selectable: true,
+        injects_9p_socket: false,
         is_available: || true,
         construct: never_available,
     };
@@ -238,6 +381,7 @@ mod tests {
         name: "low-tier",
         priority: 10,
         auto_selectable: true,
+        injects_9p_socket: false,
         is_available: || true,
         construct: never_available,
     };
@@ -249,6 +393,26 @@ mod tests {
         name: "explicit-only",
         priority: 1000,
         auto_selectable: false,
+        injects_9p_socket: false,
+        is_available: || true,
+        construct: never_available,
+    };
+
+    /// A high-priority backend that CAN inject a 9P socket (models `oci`).
+    const NINEP_HIGH: BackendRegistration = BackendRegistration {
+        name: "ninep-high",
+        priority: 100,
+        auto_selectable: true,
+        injects_9p_socket: true,
+        is_available: || true,
+        construct: never_available,
+    };
+    /// A lower-priority backend that CAN inject a 9P socket (models `nspawn`).
+    const NINEP_LOW: BackendRegistration = BackendRegistration {
+        name: "ninep-low",
+        priority: 10,
+        auto_selectable: true,
+        injects_9p_socket: true,
         is_available: || true,
         construct: never_available,
     };
@@ -339,6 +503,137 @@ mod tests {
         assert!(msg.contains("unknown sandbox backend 'bogus'"), "got: {msg}");
         assert!(msg.contains("high-tier"), "should list registered names: {msg}");
         assert!(msg.contains("low-tier"), "should list registered names: {msg}");
+    }
+
+    // ── 9P-socket-injection capability gate (#506), fail-closed ──
+
+    #[test]
+    fn cap_auto_picks_highest_priority_capable_backend() {
+        // Both capable → strongest (highest priority) wins.
+        let regs = vec![&NINEP_HIGH, &NINEP_LOW];
+        let r = select_registration_with_cap("auto", &regs, |_| true, true).unwrap();
+        assert_eq!(r.name, "ninep-high");
+    }
+
+    #[test]
+    fn cap_auto_skips_incapable_backend_even_if_higher_priority() {
+        // HIGH (priority 100) cannot inject; NINEP_LOW (priority 10) can. With
+        // the capability required, auto MUST pick the lower-priority *capable*
+        // backend, never the higher-priority incapable one.
+        let regs = vec![&HIGH, &NINEP_LOW];
+        let r = select_registration_with_cap("auto", &regs, |_| true, true).unwrap();
+        assert_eq!(r.name, "ninep-low", "auto must pick the capable backend");
+    }
+
+    #[test]
+    fn cap_auto_errors_when_no_capable_backend_available() {
+        // Only incapable backends present → auto errors rather than downgrading
+        // to one that would silently drop the 9P injection.
+        let regs = vec![&HIGH, &LOW];
+        let err = select_registration_with_cap("auto", &regs, |_| true, true).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("9P socket endpoint"), "got: {msg}");
+        assert!(msg.contains("fail-closed"), "got: {msg}");
+    }
+
+    #[test]
+    fn cap_auto_errors_when_capable_backend_unavailable() {
+        // The only capable backend is unavailable → auto fails closed (no
+        // fallback to an available-but-incapable backend).
+        let regs = vec![&NINEP_HIGH, &LOW];
+        let err = select_registration_with_cap("auto", &regs, |r| r.name == "low-tier", true)
+            .unwrap_err();
+        assert!(err.to_string().contains("9P socket endpoint"), "got: {err}");
+    }
+
+    #[test]
+    fn cap_explicit_capable_resolves() {
+        let regs = vec![&NINEP_HIGH, &LOW];
+        let r = select_registration_with_cap("ninep-high", &regs, |_| true, true).unwrap();
+        assert_eq!(r.name, "ninep-high");
+    }
+
+    #[test]
+    fn cap_explicit_incapable_errors_no_substitution() {
+        // Explicitly asking for an incapable backend when the capability is
+        // required errors — and must NOT silently swap in a capable one.
+        let regs = vec![&HIGH, &NINEP_LOW];
+        let err =
+            select_registration_with_cap("high-tier", &regs, |_| true, true).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("9P socket injection"), "got: {msg}");
+        assert!(msg.contains("fail-closed"), "got: {msg}");
+        // Must not name the capable backend it could have swapped to.
+        assert!(!msg.contains("ninep-low"), "must not suggest a silent swap: {msg}");
+    }
+
+    #[test]
+    fn cap_off_ignores_incapable_flag() {
+        // With the capability NOT required, an incapable backend resolves fine
+        // (the gate is opt-in; default behaviour is unchanged).
+        let regs = vec![&HIGH, &LOW];
+        let r = select_registration_with_cap("high-tier", &regs, |_| true, false).unwrap();
+        assert_eq!(r.name, "high-tier");
+        let r = select_registration_with_cap("auto", &regs, |_| true, false).unwrap();
+        assert_eq!(r.name, "high-tier");
+    }
+
+    #[test]
+    fn require_capability_helper_is_fail_closed() {
+        // The registry-backed helper the workload seam uses: real registered
+        // backends reflect reality (oci/nspawn capable; kata/wasm not), and an
+        // unknown name is treated as incapable (fail-closed).
+        assert!(!backend_injects_9p_socket("does-not-exist"));
+        assert!(require_9p_socket_capability("does-not-exist").is_err());
+
+        // nspawn is always registered and IS capable (host --bind).
+        assert!(backend_injects_9p_socket("nspawn"), "nspawn can bind a host UDS");
+        assert!(require_9p_socket_capability("nspawn").is_ok());
+        // Case-insensitive, mirroring name matching.
+        assert!(backend_injects_9p_socket("NSPAWN"));
+    }
+
+    #[cfg(feature = "oci")]
+    #[test]
+    fn oci_advertises_9p_socket_injection() {
+        let oci = inventory::iter::<BackendRegistration>()
+            .find(|r| r.name == "oci")
+            .expect("oci registered under the oci feature");
+        assert!(oci.injects_9p_socket, "oci bind-mounts a host UDS → capable");
+    }
+
+    #[cfg(feature = "kata-vm")]
+    #[test]
+    fn kata_does_not_advertise_9p_socket_injection() {
+        // A VM does not share the host mount namespace, so it cannot bind-inject
+        // a host UDS the way oci/nspawn do — it must NOT advertise the capability.
+        let kata = inventory::iter::<BackendRegistration>()
+            .find(|r| r.name == "kata")
+            .expect("kata registered under the kata-vm feature");
+        assert!(
+            !kata.injects_9p_socket,
+            "kata (VM, no shared host mount ns) must not advertise host-UDS injection"
+        );
+    }
+
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn wasm_does_not_advertise_9p_socket_injection() {
+        let wasm = inventory::iter::<BackendRegistration>()
+            .find(|r| r.name == "wasm")
+            .expect("wasm registered under the wasm feature");
+        assert!(
+            !wasm.injects_9p_socket,
+            "in-process wasm has no separate mount ns to inject a host socket into"
+        );
+    }
+
+    #[test]
+    fn nspawn_advertises_9p_socket_injection() {
+        let nspawn = inventory::iter::<BackendRegistration>()
+            .find(|r| r.name == "nspawn")
+            .expect("nspawn always registered");
+        assert!(nspawn.injects_9p_socket, "nspawn --bind can inject a host UDS");
     }
 
     #[test]

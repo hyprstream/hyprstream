@@ -66,6 +66,12 @@ const ANN_ENV_PREFIX: &str = "hyprstream.io/env.";
 const ANN_MOUNT_PREFIX: &str = "hyprstream.io/mount.";
 /// Annotation key: request GPU device pass-through (`hyprstream.io/gpu=true`).
 const ANN_GPU: &str = "hyprstream.io/gpu";
+/// Annotation key: the workload command to run in the container, appended after
+/// the image (whitespace-separated argv). When absent the image's own entrypoint
+/// runs (CRI pause semantics). Used by the Wanix-guest workload (#506) to run the
+/// injected guest binary; must equal
+/// [`wanix_workload::ANN_WANIX_COMMAND`](super::wanix_workload::ANN_WANIX_COMMAND).
+const ANN_COMMAND: &str = "hyprstream.io/command";
 
 /// Default OCI runtime binary (rootless podman).
 const DEFAULT_RUNTIME_BIN: &str = "podman";
@@ -319,8 +325,17 @@ impl OciBackend {
             args.push("--read-only".into());
         }
 
-        // Image to run (positional, last before any command).
+        // Image to run (positional).
         args.push(image.to_owned());
+
+        // Optional workload command, appended after the image as argv. Absent →
+        // the image entrypoint runs (pause semantics). The Wanix-guest workload
+        // (#506) sets this to the injected guest binary path.
+        if let Some(cmd) = annotations.get(ANN_COMMAND) {
+            for tok in cmd.split_whitespace() {
+                args.push(tok.to_owned());
+            }
+        }
 
         args
     }
@@ -639,6 +654,10 @@ inventory::submit! {
         name: "oci",
         priority: 20,
         auto_selectable: true,
+        // A rootless OCI container bind-mounts host paths (`podman --volume`), so
+        // hyprstream can inject a host 9P Unix socket into the workload's mount
+        // namespace (#506) and set `HYPRSTREAM_9P_SOCK` for the guest to dial.
+        injects_9p_socket: true,
         is_available: OciBackend::registry_is_available,
         construct: |_ctx| {
             Ok(std::sync::Arc::new(OciBackend::new(OciConfig::default()))
@@ -776,5 +795,46 @@ mod tests {
         assert!(args.contains(&"--memory=134217728".to_owned()));
         // Image is the last positional argument.
         assert_eq!(args.last().unwrap(), "alpine:latest");
+    }
+
+    #[test]
+    fn command_annotation_appends_argv_after_image() {
+        // The Wanix-guest workload (#506) injects a `hyprstream.io/command`
+        // annotation; it must be threaded as argv *after* the image, and the
+        // injected 9P socket bind + env must survive too.
+        let backend = OciBackend::new(OciConfig::default());
+        let cfg = PodSandboxConfig::default();
+        let pod = new_pod("sb-9p", &cfg);
+
+        let mut ann = HashMap::new();
+        ann.insert(
+            "hyprstream.io/mount.9p-sock".into(),
+            "/run/hs/sb-9p/9p.sock:/run/hyprstream/9p.sock:rw".into(),
+        );
+        ann.insert(
+            "hyprstream.io/env.HYPRSTREAM_9P_SOCK".into(),
+            "/run/hyprstream/9p.sock".into(),
+        );
+        ann.insert("hyprstream.io/command".into(), "/usr/local/bin/wanix-guest".into());
+
+        let args = backend.build_run_args(&pod, "hyprstream-sb-9p", "alpine:latest", &cfg, &ann);
+
+        // Injected socket bind + env are threaded.
+        assert!(args
+            .contains(&"--volume=/run/hs/sb-9p/9p.sock:/run/hyprstream/9p.sock:rw".to_owned()));
+        assert!(args.contains(&"--env=HYPRSTREAM_9P_SOCK=/run/hyprstream/9p.sock".to_owned()));
+
+        // The command is the LAST arg, appearing AFTER the image.
+        assert_eq!(args.last().unwrap(), "/usr/local/bin/wanix-guest");
+        let img_idx = args.iter().position(|a| a == "alpine:latest").unwrap();
+        let cmd_idx = args.iter().position(|a| a == "/usr/local/bin/wanix-guest").unwrap();
+        assert!(cmd_idx > img_idx, "command must come after the image");
+    }
+
+    #[test]
+    fn command_annotation_key_matches_wanix_contract() {
+        // Single source of truth: the OCI consumer key must equal the wanix
+        // producer key (both are the same wire annotation).
+        assert_eq!(ANN_COMMAND, super::super::wanix_workload::ANN_WANIX_COMMAND);
     }
 }
