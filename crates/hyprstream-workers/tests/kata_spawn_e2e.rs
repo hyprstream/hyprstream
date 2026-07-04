@@ -206,14 +206,36 @@ async fn kata_spawn_e2e() -> TestResult {
     // so this external harness cannot synthesize a tenant RAFS image itself.
     // Supply `HYPRSTREAM_KATA_RAFS_IMAGE_ID` pointing at an image already
     // present in the store to drive the tenant-VFS-as-rootfs path.
-    let rafs_image_id = std::env::var("HYPRSTREAM_KATA_RAFS_IMAGE_ID").ok();
-    match &rafs_image_id {
-        Some(id) => println!("[kata_spawn_e2e] tenant VFS rootfs from RAFS image {id}"),
-        None => println!(
-            "[kata_spawn_e2e] tenant-VFS rootfs skipped \
-             (set HYPRSTREAM_KATA_RAFS_IMAGE_ID to exercise it)"
-        ),
-    }
+    // Resolve the tenant RAFS image id. Preference order:
+    //   1. HYPRSTREAM_KATA_RAFS_IMAGE_ID — an id already present in a store.
+    //   2. HYPRSTREAM_KATA_PULL_IMAGE — an OCI ref to pull+convert into THIS
+    //      run's store (self-contained: the fresh temp store is otherwise empty).
+    let rafs_image_id = match std::env::var("HYPRSTREAM_KATA_RAFS_IMAGE_ID").ok() {
+        Some(id) => {
+            println!("[kata_spawn_e2e] tenant VFS rootfs from RAFS image {id}");
+            Some(id)
+        }
+        None => match std::env::var("HYPRSTREAM_KATA_PULL_IMAGE").ok() {
+            Some(image_ref) => {
+                println!("[kata_spawn_e2e] pulling+converting {image_ref} into the RAFS store …");
+                // TODO(#737): `RafsStore::ensure`/`pull` drops a nested tokio
+                // runtime inside its own execution → panics from ANY tokio
+                // context (verified: a dedicated-thread `block_on` wrapper does
+                // not help). Until #737 is fixed, prefer HYPRSTREAM_KATA_RAFS_IMAGE_ID
+                // pointing at a store pre-populated by a non-async pull.
+                let id = rafs_store.ensure(&image_ref).await?;
+                println!("[kata_spawn_e2e] tenant VFS rootfs from pulled RAFS image {id}");
+                Some(id)
+            }
+            None => {
+                println!(
+                    "[kata_spawn_e2e] tenant-VFS rootfs skipped (set \
+                     HYPRSTREAM_KATA_RAFS_IMAGE_ID or HYPRSTREAM_KATA_PULL_IMAGE)"
+                );
+                None
+            }
+        },
+    };
 
     // ─────────────────────────────────────────────────────────────────────
     // Boot the microVM via the real backend path.
