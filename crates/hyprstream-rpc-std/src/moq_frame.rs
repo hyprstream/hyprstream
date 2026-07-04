@@ -88,16 +88,25 @@ struct ReachJson {
 }
 
 /// Parse the reach JSON the frontend emits into a [`ReachConfig`], base64-decoding
-/// the cert hashes. Unparseable base64 entries are skipped (not an error).
+/// the cert hashes.
+///
+/// A cert pin is a security control: silently dropping an undecodable entry
+/// and falling back to system roots would connect unpinned without ever
+/// telling the caller. So an individual undecodable entry is an error (not
+/// skipped) whenever the list is non-empty — the only silent case is a
+/// genuinely empty `certHashes` list, which is the documented "use the
+/// browser's system roots" contract.
 pub fn parse_reach(reach_json: &str) -> Result<ReachConfig, String> {
     let parsed: ReachJson =
         serde_json::from_str(reach_json).map_err(|e| format!("bad reach_json: {e}"))?;
     use base64::Engine;
-    let cert_hashes = parsed
-        .cert_hashes
-        .iter()
-        .filter_map(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
-        .collect();
+    let mut cert_hashes = Vec::with_capacity(parsed.cert_hashes.len());
+    for s in &parsed.cert_hashes {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(s)
+            .map_err(|e| format!("certHashes entry {s:?} is not valid base64: {e}"))?;
+        cert_hashes.push(decoded);
+    }
     Ok(ReachConfig {
         url: parsed.url,
         cert_hashes,
@@ -165,21 +174,27 @@ mod tests {
     }
 
     #[test]
-    fn parse_reach_defaults_and_bad_base64() {
-        // Missing certHashes ⇒ empty (fall back to system roots).
+    fn parse_reach_defaults() {
+        // Missing certHashes ⇒ empty (fall back to system roots) — the only
+        // silent case; a *present but undecodable* entry is fatal (below).
         let r = parse_reach(r#"{"url":"https://h/moq"}"#).unwrap();
         assert_eq!(r.url, "https://h/moq");
         assert!(r.cert_hashes.is_empty());
         // Missing url ⇒ empty string (caller treats as unusable).
         let r = parse_reach(r#"{}"#).unwrap();
         assert!(r.url.is_empty());
-        // Non-base64 entries are skipped, not fatal.
-        let r = parse_reach(r#"{"url":"u","certHashes":["!!!not base64!!!"]}"#).unwrap();
-        assert!(r.cert_hashes.is_empty());
     }
 
     #[test]
     fn parse_reach_rejects_invalid_json() {
         assert!(parse_reach("not json").is_err());
+    }
+
+    #[test]
+    fn parse_reach_rejects_undecodable_cert_hash() {
+        // A non-empty certHashes list with an undecodable entry must fail
+        // closed, not silently drop the pin and fall back to system roots.
+        let r = parse_reach(r#"{"url":"u","certHashes":["!!!not base64!!!"]}"#);
+        assert!(r.is_err(), "undecodable cert pin must be rejected, not skipped");
     }
 }

@@ -1,11 +1,20 @@
 //! moq streaming Worker bridge via SharedArrayBuffer DMA ring buffer.
 //!
-//! Resolves the `moq-net Session: Sync` incompatibility with browser `web-sys`
-//! types without waiting for an upstream moq-net fix. The iroh/moq session runs
-//! inside a dedicated Web Worker (a real OS thread from wasm's perspective, where
-//! `Send + Sync` requirements are logically satisfied for single-threaded-per-worker
-//! JS objects). The main browser thread communicates with the worker via the
-//! existing `DmaTransport` SharedArrayBuffer ring buffer (`hyprstream-9p/src/dma.rs`).
+//! The moq session (WebTransport + moq-net consume loop) runs inside a
+//! dedicated Web Worker, kept isolated from the main thread by design — not as
+//! a workaround for a `Sync` bound. With the moq-net wasm fork (ewindisch/moq
+//! PR #1) the session *could* run on the main thread via `spawn_local`; we
+//! still push it to a Worker so frame pumping never competes with UI work on
+//! the main thread, so the `!Sync` `web_sys::WebTransport` session stays
+//! contained to a single realm as defense-in-depth, and so it reuses the
+//! existing `DmaTransport` SharedArrayBuffer ring (`hyprstream-9p/src/dma.rs`)
+//! that other host↔worker bridges already use.
+//!
+//! **Key-boundary invariant:** the worker only relays opaque
+//! `[capnp StreamBlock || mac[16]]` frames. It never verifies the HMAC chain
+//! or decrypts payloads — that happens on the main thread, so the DH-derived
+//! stream keys never need to enter the worker realm. Do not move verification
+//! or decryption into the worker.
 //!
 //! # Architecture
 //!
@@ -13,15 +22,13 @@
 //! Main thread (wasm32)                    Web Worker (wasm32)
 //! ─────────────────────────────────       ──────────────────────────────────────
 //! MoqWorkerHandle                         moq_worker_main()
-//!   .subscribe(track) ──────────────────► recv subscribe cmd over DMA
+//!   .subscribe(broadcast_path) ─────────► recv subscribe cmd over DMA
 //!   .recv_frame() ◄─────────────────────  send frames over DMA
 //!                                         │
 //!                                         ▼
 //!                                    WebTransport → moq relay/server
-//!                                    (opened FROM worker; WT here is the
-//!                                     sole JS thread so !Sync is not an issue
-//!                                     in practice — and moq-net is available
-//!                                     once its Sync bound is relaxed)
+//!                                    (opened FROM worker; the sole JS thread
+//!                                     touching the !Sync Session)
 //! ```
 //!
 //! # DMA frame envelope
@@ -90,7 +97,7 @@ impl MoqWorkerHandle {
     /// available. The `crossOriginIsolation()` Vite plugin handles this in dev; ensure
     /// production headers are also set.
     pub fn spawn(worker_script_url: &str, reach_json: &str) -> Result<MoqWorkerHandle, JsError> {
-        // Allocate a 256 KiB SAB: 4 KiB control + 2 × 126 KiB data.
+        // Allocate a 260 KiB SAB: 4 KiB control + 2 × 128 KiB data channels.
         let sab_size = 4096 + 2 * 128 * 1024;
         let sab = js_sys::SharedArrayBuffer::new(sab_size);
 
@@ -116,9 +123,11 @@ impl MoqWorkerHandle {
         Ok(MoqWorkerHandle { sab, dma, worker })
     }
 
-    /// Send a subscribe command for `track_name` to the worker.
-    pub async fn subscribe(&self, track_name: &str) -> Result<(), JsError> {
-        let cmd = serde_json::json!({ "cmd": "subscribe", "track": track_name }).to_string();
+    /// Send a subscribe command for `broadcast_path` (the moq broadcast path,
+    /// e.g. `"local/streams/{topic_hex}"` — not a track name; the token stream
+    /// itself always lives on the single `STREAM_TRACK` within it) to the worker.
+    pub async fn subscribe(&self, broadcast_path: &str) -> Result<(), JsError> {
+        let cmd = serde_json::json!({ "cmd": "subscribe", "broadcast": broadcast_path }).to_string();
         let frame = encode_frame("__cmd__", cmd.as_bytes());
         self.dma
             .send(&frame)
@@ -128,8 +137,9 @@ impl MoqWorkerHandle {
 
     /// Poll for the next incoming frame from the worker.
     ///
-    /// Returns `(track_name, payload_bytes)` as a two-element JS array, or null
-    /// if no frame is available yet.
+    /// Awaits the DMA channel and returns `(track_name, payload_bytes)` as a
+    /// two-element JS array once a frame arrives, or `null` if the raw bytes
+    /// received didn't decode as a well-formed frame.
     pub async fn recv_frame(&self) -> Result<JsValue, JsError> {
         let raw = self
             .dma
@@ -302,10 +312,10 @@ pub async fn moq_worker_main(sab: JsValue, reach_json: String) {
                 Err(_) => continue,
             };
             if cmd.get("cmd").and_then(|c| c.as_str()) == Some("subscribe") {
-                // `track` is the moq broadcast path (e.g. "local/streams/{topic_hex}");
+                // `broadcast` is the moq broadcast path (e.g. "local/streams/{topic_hex}");
                 // the token stream itself lives on the single STREAM_TRACK within it.
                 let broadcast_path = cmd
-                    .get("track")
+                    .get("broadcast")
                     .and_then(|t| t.as_str())
                     .unwrap_or("")
                     .to_string();
