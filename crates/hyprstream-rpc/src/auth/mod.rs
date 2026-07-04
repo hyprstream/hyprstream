@@ -33,7 +33,7 @@ pub mod ucan;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use atproto_perimeter::{AtprotoPerimeterGateway, Ed25519Vk, EnrolledPeer, EnrollmentStore, IdentityKeys, IdentityResolver, MlDsaVk};
-pub use claims::{Claims, Cnf, CnfJwk, IdTokenClaims, OneOrMany, compute_jkt, is_local_iss};
+pub use claims::{ActClaim, Claims, Cnf, CnfJwk, IdTokenClaims, OneOrMany, compute_jkt, is_local_iss};
 pub use jti_blocklist::{InMemoryJtiBlocklist, JtiBlocklist};
 pub use mac::{
     Assurance, Compartment, CompartmentSet, ContentBoundLabel, GenesisMap, GenesisReport,
