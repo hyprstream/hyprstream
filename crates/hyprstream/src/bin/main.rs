@@ -1087,7 +1087,7 @@ fn handle_quick_command(
                         cloud_init_dir: data_dir.join("cloud-init"),
                         ..PoolConfig::default()
                     };
-                    #[cfg(feature = "kata-vm")]
+                    #[cfg(feature = "oci-image")]
                     let image_config = ImageConfig {
                         blobs_dir: data_dir.join("images/blobs"),
                         bootstrap_dir: data_dir.join("images/bootstrap"),
@@ -1102,8 +1102,11 @@ fn handle_quick_command(
                             resolve_backend, BackendCtx, SandboxBackend,
                         };
 
-                        // RAFS image store is only built on the VM path (kata-vm).
-                        #[cfg(feature = "kata-vm")]
+                        // RAFS image store is built whenever the image filesystem
+                        // service is compiled in (`oci-image`), so both kata
+                        // (virtio-fs) and nspawn (FUSE tenant-VFS root, Model B
+                        // #715) can compose a per-sandbox VFS from it.
+                        #[cfg(feature = "oci-image")]
                         let rafs_store = {
                             use hyprstream_workers::image::RafsStore;
                             Arc::new(RafsStore::new(image_config.clone())?)
@@ -1121,9 +1124,9 @@ fn handle_quick_command(
                             .unwrap_or_else(|| "auto".to_owned());
                         let backend_ctx = BackendCtx {
                             pool_config: pool_config.clone(),
-                            #[cfg(feature = "kata-vm")]
+                            #[cfg(feature = "oci-image")]
                             image_config,
-                            #[cfg(feature = "kata-vm")]
+                            #[cfg(feature = "oci-image")]
                             rafs_store: Arc::clone(&rafs_store),
                         };
                         let backend: Arc<dyn SandboxBackend> =

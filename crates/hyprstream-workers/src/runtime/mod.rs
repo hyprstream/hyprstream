@@ -115,15 +115,17 @@ pub use oci_backend::{OciBackend, OciConfig, OciHandle};
 pub use wasm_backend::{WasmBackend, WasmConfig, WasmHandle};
 // Inventory-based backend registry + fail-closed selection spine (#507)
 pub use selection::{
-    backend_injects_9p_socket, require_9p_socket_capability, resolve_backend,
-    resolve_backend_9p_capable, BackendCtx, BackendRegistration,
+    backend_injects_9p_socket, require_9p_socket_capability, require_fuse_mount_capability,
+    resolve_backend, resolve_backend_9p_capable, BackendCtx, BackendRegistration,
 };
 // Domain entities (business logic only)
 pub use container::Container;
 pub use pool::{PoolStats, SandboxPool};
 pub use sandbox::PodSandbox;
 #[cfg(all(not(target_arch = "wasm32"), feature = "oci-image"))]
-pub use sandbox_fs::{InjectedMounts, SandboxFs, SandboxFsServer, VFS_SOCKET_NAME};
+pub use sandbox_fs::{
+    InjectedMounts, SandboxFs, SandboxFsLocalMount, SandboxFsServer, VFS_SOCKET_NAME,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use wanix_workload::{
     inject_9p_socket, Injected9pServer, WanixGuestConfig, WanixInjection,

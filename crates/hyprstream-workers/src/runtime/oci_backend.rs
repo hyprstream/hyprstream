@@ -658,6 +658,13 @@ inventory::submit! {
         // hyprstream can inject a host 9P Unix socket into the workload's mount
         // namespace (#506) and set `HYPRSTREAM_9P_SOCK` for the guest to dial.
         injects_9p_socket: true,
+        // TODO(#715): rootless-userns /dev/fuse feasibility spike before enabling
+        // OCI. Model B FUSE-rooting of the tenant VFS is deferred for the rootless
+        // OCI (podman) backend: whether an unprivileged `/dev/fuse` mount composes
+        // with podman `--userns=keep-id` uid remapping is unresolved (#653/#617),
+        // so oci does not advertise the capability yet (fail-closed — an explicit
+        // FUSE-root request against oci is refused until this is validated).
+        mounts_fuse_vfs: false,
         is_available: OciBackend::registry_is_available,
         construct: |_ctx| {
             Ok(std::sync::Arc::new(OciBackend::new(OciConfig::default()))
