@@ -57,10 +57,12 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
-use hyprstream_9p::Translator;
+use hyprstream_9p::{AttachAuthorizer, Translator};
+use hyprstream_rpc::transport::quinn_transport::{NinePWtHandler, NinePWtStream};
 use hyprstream_rpc::Subject;
-use hyprstream_vfs::{Mount, SyntheticMount, SyntheticNode};
+use hyprstream_vfs::{Mount, MountError, SyntheticMount, SyntheticNode};
 use serde::{Deserialize, Serialize};
 use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info, warn};
@@ -192,6 +194,19 @@ async fn validate_ticket(
     state: &ServerState,
     ticket: &str,
     _headers: &HeaderMap,
+) -> Result<Subject, &'static str> {
+    verify_mount_ticket(state, ticket).await
+}
+
+/// Transport-agnostic core of mount-ticket validation, shared by H1a's
+/// URL-query path ([`validate_ticket`]) and H1b's `Tattach.uname` path
+/// ([`TicketAttachAuthorizer`]). Both present the same `at+jwt` mount ticket;
+/// only *where* it rides differs (WS query vs 9P attach), so the verification —
+/// signature, audience, expiry, revocation (in `verify_token_claims`), then
+/// subject-name validation — is identical.
+async fn verify_mount_ticket(
+    state: &ServerState,
+    ticket: &str,
 ) -> Result<Subject, &'static str> {
     let claims = crate::server::middleware::verify_token_claims(state, ticket).await?;
     let local_issuers: &[&str] = &[&*state.oauth_issuer_url];
@@ -346,6 +361,91 @@ pub(crate) async fn serve_9p_websocket(
         _ = pump => {}
     }
     frame_reader.abort();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// H1b: /9p over WebTransport (QUIC path-mux plane)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Resolves the mount ticket a client presents in `Tattach.uname` to a narrowed
+/// session [`Subject`], reusing H1a's [`verify_mount_ticket`].
+///
+/// This is the attach-time credential seam for the H1b `/9p` WebTransport plane:
+/// the cert-pinned mesh session carries no URL query (and a browser `WebSocket`
+/// can't set headers), so the ticket rides `Tattach.uname` and is validated once
+/// at attach — the per-session analogue of H1a's pre-upgrade check. On denial we
+/// return [`MountError::PermissionDenied`], which the 9P translator maps to an
+/// `Rlerror` (`EACCES`).
+struct TicketAttachAuthorizer {
+    state: ServerState,
+}
+
+#[async_trait]
+impl AttachAuthorizer for TicketAttachAuthorizer {
+    async fn authorize(&self, uname: &str) -> Result<Subject, MountError> {
+        if uname.is_empty() {
+            return Err(MountError::PermissionDenied("missing mount ticket".to_owned()));
+        }
+        match verify_mount_ticket(&self.state, uname).await {
+            Ok(subject) => Ok(subject),
+            Err(reason) => {
+                warn!(reason, "9P WT attach rejected: invalid mount ticket");
+                Err(MountError::PermissionDenied(reason.to_owned()))
+            }
+        }
+    }
+}
+
+/// The injected 9P-over-WebTransport handler (H1b / #765).
+///
+/// Registered process-globally via [`register_ninep_wt_handler`] so the QUIC
+/// path-mux `/9p` arm (`hyprstream-rpc`) can drive hyprstream's 9P core without
+/// that transport crate depending on `hyprstream`. Each WT bidi stream on the
+/// `/9p` path lands in [`NinePWtHandler::serve`], where it is served by the SAME
+/// [`Translator::serve_connection`] core + [`build_export_mount`] as H1a —
+/// only the ticket now rides `Tattach.uname` (validated by
+/// [`TicketAttachAuthorizer`]) and the transport is a QUIC bidi stream.
+pub struct NinePWtExport {
+    state: ServerState,
+}
+
+impl NinePWtExport {
+    /// Build the handler over the server's [`ServerState`] (the ticket-validation
+    /// chain + export mount source).
+    pub fn new(state: ServerState) -> Self {
+        Self { state }
+    }
+}
+
+#[async_trait]
+impl NinePWtHandler for NinePWtExport {
+    async fn serve(&self, stream: Box<dyn NinePWtStream>) {
+        // The export root is Subject-scoped per op by `MountBackend`; the Subject
+        // is bound at `Tattach` from the validated ticket, so the mount is built
+        // Subject-agnostic here (`build_export_mount` ignores the Subject in the
+        // current placeholder root — see its docs; the real #730 namespace is
+        // scoped by the bound Subject once it lands).
+        let mount = build_export_mount(&self.state, &Subject::anonymous());
+        let authorizer: Arc<dyn AttachAuthorizer> =
+            Arc::new(TicketAttachAuthorizer { state: self.state.clone() });
+        let translator = Arc::new(Translator::from_mount_authorized(mount, authorizer));
+        if let Err(e) = translator.serve_connection(stream).await {
+            debug!(error = %e, "9P WT serve loop ended with error");
+        }
+    }
+}
+
+/// Register the process-global 9P-over-WebTransport handler so the QUIC
+/// path-mux `/9p` arm serves this node's export. Idempotent (first-wins);
+/// call once at server startup where [`ServerState`] exists (see
+/// [`crate::server::create_app`]).
+pub fn register_ninep_wt_handler(state: ServerState) {
+    let installed = hyprstream_rpc::transport::quinn_transport::set_global_ninep_handler(
+        Arc::new(NinePWtExport::new(state)),
+    );
+    if installed {
+        info!("registered 9P-over-WebTransport handler (/9p QUIC path-mux, H1b)");
+    }
 }
 
 #[cfg(test)]
