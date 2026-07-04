@@ -10,6 +10,33 @@
 //! *bind-mount-capable* sandbox (OCI/nspawn) so the native Wanix guest (PR-B's
 //! `workers/wanix-guest`) dials back and binds the export as its namespace root.
 //!
+//! ## Bidirectional 9P (#708 phase 2)
+//!
+//! The above is **Direction A** — the host exports its namespace, the guest
+//! imports it. This module also wires **Direction B**, the reverse: the native
+//! Wanix guest exports its OWN live namespace over a *second, independent* UDS,
+//! and the host imports it via the phase-1 socket 9P client
+//! [`Remote9pMount`](hyprstream_9p::Remote9pMount) and binds it into the host
+//! VFS [`Namespace`] at `/workers/<tenant>/wanix` — giving the host visibility
+//! into the guest's task tree.
+//!
+//! [`inject_9p_socket`] allocates the export path and injects it (a shared
+//! export *directory* bind-mount + [`ENV_GUEST_EXPORT_SOCK`], mirroring the
+//! Direction-A socket injection). After the sandbox starts,
+//! [`import_guest_namespace`] dials the guest's export socket and binds the
+//! imported tree. The two directions are **independent** — separate sockets,
+//! separate 9P sessions, no shared coupling (#708).
+//!
+//! **Scope + payoff caveat.** This is wired for the shared-FS UDS backends
+//! (OCI/nspawn); a kata guest would export over vsock (follow-up, not here).
+//! And native Wanix currently has only [`native::ExecDriver`] — the exported
+//! `#task` tree is host-exec processes + binds, not a wasi/VM task tree, until a
+//! native wasi driver exists. The *mechanism* (host imports the guest's
+//! namespace bidirectionally, over the phase-1 `Remote9pMount`) is the
+//! deliverable; what is visible through it will grow as the guest gains drivers.
+//!
+//! [`native::ExecDriver`]: https://pkg.go.dev/tractor.dev/wanix/native
+//!
 //! ## The three injection steps (#506 deliverable 3)
 //!
 //! [`inject_9p_socket`] performs, for one workload:
@@ -64,7 +91,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use hyprstream_vfs::{Mount, Subject};
+use hyprstream_9p::Remote9pMount;
+use hyprstream_vfs::{BindFlag, Mount, Namespace, Subject};
 use tokio::net::UnixListener;
 use tracing::{debug, info, warn};
 
@@ -90,12 +118,37 @@ pub const ANN_WANIX_COMMAND: &str = "hyprstream.io/command";
 /// `workers/wanix-guest`). Kept in sync with the guest's `--sock` env fallback.
 pub const ENV_9P_SOCK: &str = "HYPRSTREAM_9P_SOCK";
 
+/// Environment variable the Wanix guest reads for the Direction-B **export**
+/// socket path — the in-container UDS on which the guest serves its OWN live
+/// namespace for the host to import (#708 phase 2). Kept in sync with the
+/// guest's `--export-sock` env fallback (`workers/wanix-guest`).
+pub const ENV_GUEST_EXPORT_SOCK: &str = "HYPRSTREAM_GUEST_EXPORT_SOCK";
+
 /// File name of the per-workload 9P socket under the workload runtime dir.
 const NINEP_SOCKET_NAME: &str = "9p.sock";
 /// In-container path the host 9P socket is bind-mounted to.
 const CTR_SOCK_PATH: &str = "/run/hyprstream/9p.sock";
 /// In-container path the host `wanix-guest` binary is bind-mounted to.
 const CTR_GUEST_BIN_PATH: &str = "/usr/local/bin/wanix-guest";
+
+/// Sub-directory under the workload runtime dir shared with the container for
+/// the Direction-B guest export. The guest CREATES its export listener inside
+/// this dir (a bind-mount source must already exist, and the guest's socket
+/// does not yet — so we share the *directory*, not a pre-made socket file, and
+/// the socket the guest binds appears here on the host).
+const GUEST_EXPORT_DIR_NAME: &str = "export";
+/// File name the guest binds its export listener as, inside the shared dir.
+const GUEST_EXPORT_SOCKET_NAME: &str = "wanix.sock";
+/// In-container path the shared export dir is bind-mounted to.
+const CTR_EXPORT_DIR: &str = "/run/hyprstream/export";
+/// In-container path of the guest's export socket (inside [`CTR_EXPORT_DIR`]).
+const CTR_EXPORT_SOCK_PATH: &str = "/run/hyprstream/export/wanix.sock";
+
+/// Bounded attempts to dial the guest export socket after sandbox start (it
+/// appears only once the guest boots and calls `listen(2)`).
+const IMPORT_CONNECT_ATTEMPTS: u32 = 20;
+/// Base backoff between import-connect attempts.
+const IMPORT_CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Env var overriding the host path to the `wanix-guest` build artifact.
 const ENV_GUEST_BIN: &str = "HYPRSTREAM_WANIX_GUEST_BIN";
@@ -187,9 +240,14 @@ pub struct WanixInjection {
     /// [`PodSandboxConfig`](super::client::PodSandboxConfig)'s
     /// `annotations: Vec<KeyValue>` for the pool path.
     pub annotations: HashMap<String, String>,
-    /// The live 9P server. Keep it alive for the workload's lifetime; drop it to
-    /// tear the export down.
+    /// The live Direction-A 9P server (host exports its namespace to the guest).
+    /// Keep it alive for the workload's lifetime; drop it to tear the export down.
     pub server: Injected9pServer,
+    /// Host-side path where the guest's Direction-B export socket will appear
+    /// once the guest boots and listens (inside the shared export dir bound into
+    /// the container). Pass this to [`import_guest_namespace`] **after** the
+    /// sandbox is started to import the guest's live namespace.
+    pub export_socket_path: PathBuf,
 }
 
 impl WanixInjection {
@@ -203,6 +261,12 @@ impl WanixInjection {
                 value: v.clone(),
             })
             .collect()
+    }
+
+    /// Host-side path of the guest's Direction-B export socket (see
+    /// [`WanixInjection::export_socket_path`]).
+    pub fn export_socket_path(&self) -> &Path {
+        &self.export_socket_path
     }
 }
 
@@ -284,20 +348,180 @@ pub async fn inject_9p_socket(
         format!("{ANN_ENV_PREFIX}{ENV_9P_SOCK}"),
         CTR_SOCK_PATH.to_owned(),
     );
+
+    // ── Direction B (#708 phase 2): guest exports, host imports ──────────────
+    //
+    // Allocate a shared export DIRECTORY (not a pre-made socket file: the guest
+    // is the server here, so it creates the listener — a bind-mount source must
+    // already exist, but the guest's socket does not yet). The guest binds its
+    // export listener inside this dir; because the dir is bind-mounted into the
+    // container, that socket appears on the host at `export_socket_path`, which
+    // the host later dials via [`import_guest_namespace`].
+    let host_export_dir = workload_dir.join(GUEST_EXPORT_DIR_NAME);
+    tokio::fs::create_dir_all(&host_export_dir).await.map_err(|e| {
+        WorkerError::SandboxCreationFailed(format!(
+            "create guest export dir {}: {e}",
+            host_export_dir.display()
+        ))
+    })?;
+    let export_socket_path = host_export_dir.join(GUEST_EXPORT_SOCKET_NAME);
+    // Remove any stale export socket left by a crashed predecessor guest.
+    if let Err(e) = tokio::fs::remove_file(&export_socket_path).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(socket = %export_socket_path.display(), error = %e, "remove stale guest export socket");
+        }
+    }
+    let host_export_dir_str = host_export_dir.to_string_lossy().into_owned();
+    // Bind the shared export dir into the container's mount namespace (rw: the
+    // guest binds its listener inside it, the host reads the resulting socket).
+    annotations.insert(
+        format!("{ANN_MOUNT_PREFIX}wanix-export-dir"),
+        format!("{host_export_dir_str}:{CTR_EXPORT_DIR}:rw"),
+    );
+    // Tell the guest where to export its namespace (in-container socket path).
+    annotations.insert(
+        format!("{ANN_ENV_PREFIX}{ENV_GUEST_EXPORT_SOCK}"),
+        CTR_EXPORT_SOCK_PATH.to_owned(),
+    );
+
     // Run the guest as the workload command (serve-namespace mode: no `--cmd`,
     // which is the reliable path today — see wanix-guest README's known gap).
     annotations.insert(ANN_WANIX_COMMAND.to_owned(), CTR_GUEST_BIN_PATH.to_owned());
 
     info!(
         socket = %socket_path.display(),
+        export_socket = %export_socket_path.display(),
         guest_bin = %guest_cfg.guest_bin.display(),
-        "prepared Wanix-guest 9P workload injection"
+        "prepared bidirectional Wanix-guest 9P workload injection"
     );
 
     Ok(WanixInjection {
         annotations,
         server: Injected9pServer { socket_path, task },
+        export_socket_path,
     })
+}
+
+/// A guest namespace imported into the host VFS namespace (#708 phase 2,
+/// Direction B). Holds the [`Remote9pMount`] backing the imported tree so the
+/// remote 9P client connection lives as long as this handle; drop it (and
+/// [`unmount`](ImportedGuestNamespace::unmount) the prefix) at workload teardown.
+pub struct ImportedGuestNamespace {
+    mount: Arc<dyn Mount>,
+    prefix: String,
+}
+
+impl ImportedGuestNamespace {
+    /// The host namespace prefix the guest tree is bound at
+    /// (`/workers/<tenant>/wanix`).
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    /// The imported guest tree as an `Arc<dyn Mount>` (already bound into the
+    /// host namespace by [`import_guest_namespace`]; exposed for rebind/teardown).
+    pub fn mount(&self) -> Arc<dyn Mount> {
+        Arc::clone(&self.mount)
+    }
+
+    /// Remove the imported tree from `host_ns` (the teardown counterpart of the
+    /// bind [`import_guest_namespace`] performed).
+    pub fn unmount(&self, host_ns: &mut Namespace) {
+        host_ns.unmount(&self.prefix);
+    }
+}
+
+impl std::fmt::Debug for ImportedGuestNamespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImportedGuestNamespace")
+            .field("prefix", &self.prefix)
+            .finish()
+    }
+}
+
+/// Import the guest's live namespace (Direction B, #708 phase 2): dial the
+/// guest's export socket with the phase-1 socket 9P client [`Remote9pMount`],
+/// and bind the resulting [`Mount`] into `host_ns` at `/workers/<tenant>/wanix`,
+/// giving the host visibility into the guest's task tree.
+///
+/// Call this **after** the sandbox has been started: the export socket appears
+/// only once the guest boots and `listen(2)`s, so the dial is retried with
+/// bounded backoff ([`IMPORT_CONNECT_ATTEMPTS`]). `export_sock` is the host-side
+/// [`WanixInjection::export_socket_path`].
+///
+/// This is the reverse, independent 9P session of the Direction-A export the
+/// host serves in [`inject_9p_socket`] — a separate socket, a separate client,
+/// no shared coupling (#708).
+pub async fn import_guest_namespace(
+    host_ns: &mut Namespace,
+    export_sock: &Path,
+    tenant: &str,
+) -> Result<ImportedGuestNamespace> {
+    import_guest_namespace_with(
+        host_ns,
+        export_sock,
+        tenant,
+        IMPORT_CONNECT_ATTEMPTS,
+        IMPORT_CONNECT_BACKOFF,
+    )
+    .await
+}
+
+/// [`import_guest_namespace`] with explicit retry bounds (the public wrapper
+/// uses [`IMPORT_CONNECT_ATTEMPTS`]/[`IMPORT_CONNECT_BACKOFF`]). Kept separate so
+/// tests can drive the retry loop without waiting out the production backoff.
+async fn import_guest_namespace_with(
+    host_ns: &mut Namespace,
+    export_sock: &Path,
+    tenant: &str,
+    attempts: u32,
+    backoff: std::time::Duration,
+) -> Result<ImportedGuestNamespace> {
+    let prefix = format!("/workers/{tenant}/wanix");
+
+    // The guest's listener appears only after it boots — retry with backoff.
+    let mut last_err: Option<anyhow::Error> = None;
+    let mut mount = None;
+    for attempt in 1..=attempts {
+        match Remote9pMount::connect_uds(export_sock, "hyprstream", "").await {
+            Ok(m) => {
+                mount = Some(m);
+                break;
+            }
+            Err(e) => {
+                debug!(
+                    socket = %export_sock.display(),
+                    attempt,
+                    error = %e,
+                    "guest export socket not ready yet; retrying"
+                );
+                last_err = Some(e);
+                tokio::time::sleep(backoff * attempt).await;
+            }
+        }
+    }
+    let mount = mount.ok_or_else(|| {
+        WorkerError::SandboxCreationFailed(format!(
+            "could not import guest namespace from {} after {attempts} attempts: {}",
+            export_sock.display(),
+            last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown error".into())
+        ))
+    })?;
+
+    let mount: Arc<dyn Mount> = Arc::new(mount);
+    host_ns
+        .bind_mount(&prefix, Arc::clone(&mount), BindFlag::Replace)
+        .map_err(|e| {
+            WorkerError::SandboxCreationFailed(format!(
+                "bind imported guest namespace at {prefix}: {e}"
+            ))
+        })?;
+
+    info!(prefix = %prefix, socket = %export_sock.display(), "imported guest Wanix namespace into host VFS");
+
+    Ok(ImportedGuestNamespace { mount, prefix })
 }
 
 /// Fail-closed convenience: verify `backend_type` can inject a 9P socket, then
@@ -395,6 +619,81 @@ mod tests {
             inj.annotations.get(ANN_WANIX_COMMAND).map(String::as_str),
             Some(CTR_GUEST_BIN_PATH)
         );
+
+        // Direction B (#708 phase 2): shared export dir bound rw, export env set,
+        // and the host-side export socket path exposed under the shared dir.
+        let export_dir = dir.path().join(GUEST_EXPORT_DIR_NAME);
+        assert!(export_dir.is_dir(), "shared export dir must be created on inject");
+        assert_eq!(
+            inj.annotations.get(&format!("{ANN_MOUNT_PREFIX}wanix-export-dir")),
+            Some(&format!("{}:{CTR_EXPORT_DIR}:rw", export_dir.display()))
+        );
+        assert_eq!(
+            inj.annotations
+                .get(&format!("{ANN_ENV_PREFIX}{ENV_GUEST_EXPORT_SOCK}"))
+                .map(String::as_str),
+            Some(CTR_EXPORT_SOCK_PATH)
+        );
+        assert_eq!(
+            inj.export_socket_path(),
+            export_dir.join(GUEST_EXPORT_SOCKET_NAME).as_path()
+        );
+    }
+
+    #[tokio::test]
+    async fn import_guest_namespace_binds_and_reads() {
+        // Stand up a local wire-faithful 9P server over a Mount — this stands in
+        // for the guest's Direction-B export — then import it into a host
+        // namespace and read a file back through the bound prefix. Exercises the
+        // full host-import mechanism (phase-1 Remote9pMount → bind_mount) in
+        // process, no sandbox boot.
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("guest-export.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            let _ = hyprstream_9p::Translator::from_mount(tenant_mount(), Subject::anonymous())
+                .serve_uds(listener)
+                .await;
+        });
+
+        let mut host_ns = Namespace::new();
+        let imported = import_guest_namespace(&mut host_ns, &sock, "t1")
+            .await
+            .unwrap();
+        assert_eq!(imported.prefix(), "/workers/t1/wanix");
+
+        let data = host_ns
+            .cat("/workers/t1/wanix/hello", &Subject::anonymous())
+            .await
+            .unwrap();
+        assert_eq!(data, b"hi\n", "host must read the guest's file over the imported 9P mount");
+
+        imported.unmount(&mut host_ns);
+        assert!(
+            !host_ns.mount_prefixes().contains(&"/workers/t1/wanix"),
+            "unmount must remove the imported prefix"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn import_fails_when_no_guest_export() {
+        // No server ever listens on the socket → bounded retries exhaust and the
+        // import fails closed (never binds a dead mount).
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("never-appears.sock");
+        let mut host_ns = Namespace::new();
+        let err = import_guest_namespace_with(
+            &mut host_ns,
+            &sock,
+            "t1",
+            3,
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("could not import guest namespace"), "got: {err}");
+        assert!(host_ns.mount_prefixes().is_empty(), "nothing must be bound on failure");
     }
 
     #[tokio::test]
