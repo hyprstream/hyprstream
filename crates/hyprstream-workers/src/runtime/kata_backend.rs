@@ -906,6 +906,10 @@ inventory::submit! {
         // exposes a tenant namespace over virtio-fs instead (see `sandbox_fs`),
         // a different mechanism — so kata does not advertise host-UDS injection.
         injects_9p_socket: false,
+        // kata already shares the composed per-sandbox VFS with its guest as a
+        // virtio-fs (vhost-user-fs) device, NOT a host FUSE mount, so it does not
+        // advertise the Model B (#715) host-FUSE-mount capability.
+        mounts_fuse_vfs: false,
         is_available: KataBackend::registry_is_available,
         construct: |ctx| {
             Ok(Arc::new(KataBackend::new(

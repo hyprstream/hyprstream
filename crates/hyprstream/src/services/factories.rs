@@ -744,9 +744,9 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     info!("Creating WorkerService");
 
     use hyprstream_workers::config::PoolConfig;
-    #[cfg(feature = "kata-vm")]
+    #[cfg(feature = "oci-image")]
     use hyprstream_workers::config::ImageConfig;
-    #[cfg(feature = "kata-vm")]
+    #[cfg(feature = "oci-image")]
     use hyprstream_workers::image::RafsStore;
     use hyprstream_workers::{resolve_backend, BackendCtx, SandboxBackend, WorkerService};
 
@@ -783,8 +783,10 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         ..PoolConfig::default()
     };
 
-    // RAFS/nydus image store is only built for the VM path (kata-vm feature).
-    #[cfg(feature = "kata-vm")]
+    // RAFS/nydus image store is built whenever the image filesystem service is
+    // compiled in (`oci-image`), so both kata (virtio-fs) and nspawn (FUSE
+    // tenant-VFS root, Model B #715) can compose a per-sandbox VFS from it.
+    #[cfg(feature = "oci-image")]
     let image_config = ImageConfig {
         blobs_dir: data_dir.join("images/blobs"),
         bootstrap_dir: data_dir.join("images/bootstrap"),
@@ -794,7 +796,7 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         ..ImageConfig::default()
     };
 
-    #[cfg(feature = "kata-vm")]
+    #[cfg(feature = "oci-image")]
     let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
 
     // Resolve + construct the backend fail-closed against the inventory registry
@@ -804,9 +806,9 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     // `_ => nspawn` fallback (#507 / #518).
     let backend_ctx = BackendCtx {
         pool_config: pool_config.clone(),
-        #[cfg(feature = "kata-vm")]
+        #[cfg(feature = "oci-image")]
         image_config,
-        #[cfg(feature = "kata-vm")]
+        #[cfg(feature = "oci-image")]
         rafs_store: Arc::clone(&rafs_store),
     };
     let backend: Arc<dyn SandboxBackend> = resolve_backend(&backend_name, &backend_ctx)?;

@@ -24,6 +24,13 @@ use crate::error::{Result, WorkerError};
 use super::backend::{SandboxBackend, SandboxHandle};
 use super::client::{LinuxContainerResources, PodSandboxConfig};
 use super::sandbox::PodSandbox;
+#[cfg(feature = "oci-image")]
+use crate::image::RafsStore;
+
+/// Sub-directory of the per-sandbox runtime dir where the tenant VFS is
+/// FUSE-mounted for Model B (#715) POSIX-rooting.
+#[cfg(feature = "oci-image")]
+const VFS_ROOT_DIR: &str = "vfs-root";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
@@ -103,6 +110,14 @@ pub struct NspawnHandle {
     pub leader_pid: Option<u32>,
     /// Host-side sandbox directory for bind-mounts.
     pub sandbox_path: PathBuf,
+    /// Per-sandbox tenant-VFS FUSE mount (Model B, #715). When set, the
+    /// container is `--directory`-rooted at this mount's host directory. Held
+    /// here (behind `Arc`) for the sandbox's lifetime so the mount — and its
+    /// serving thread + injected registries — outlive container start; it is
+    /// unmounted when the last handle clone drops (RAII), i.e. on sandbox
+    /// stop/destroy.
+    #[cfg(feature = "oci-image")]
+    pub vfs_root_mount: Option<Arc<super::sandbox_fs::SandboxFsLocalMount>>,
 }
 
 impl SandboxHandle for NspawnHandle {
@@ -118,11 +133,34 @@ impl SandboxHandle for NspawnHandle {
 /// systemd-nspawn sandbox backend.
 pub struct NspawnBackend {
     config: NspawnConfig,
+    /// RAFS image store for composing the per-sandbox tenant VFS that Model B
+    /// (#715) FUSE-mounts as the container root. `None` when no store was
+    /// provided; the field exists only when the image service (`oci-image`) is
+    /// compiled in.
+    #[cfg(feature = "oci-image")]
+    rafs_store: Option<Arc<RafsStore>>,
 }
 
 impl NspawnBackend {
     pub fn new(config: NspawnConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            #[cfg(feature = "oci-image")]
+            rafs_store: None,
+        }
+    }
+
+    /// Attach the RAFS image store used to compose the per-sandbox tenant VFS
+    /// for Model B (#715) FUSE-rooting. Threaded in from [`BackendCtx`] at
+    /// selection time (see the inventory registration below). Without a store,
+    /// nspawn behaves exactly as before — a host-root (`--directory=/`)
+    /// container, no tenant-VFS root.
+    ///
+    /// [`BackendCtx`]: super::selection::BackendCtx
+    #[cfg(feature = "oci-image")]
+    pub fn with_rafs_store(mut self, rafs_store: Option<Arc<RafsStore>>) -> Self {
+        self.rafs_store = rafs_store;
+        self
     }
 
     /// Runtime prerequisite probe for the backend registry: both
@@ -133,18 +171,28 @@ impl NspawnBackend {
     }
 
     /// Build the `systemd-nspawn` argument list for a sandbox.
+    ///
+    /// `vfs_root` is the host directory the tenant VFS was FUSE-mounted at
+    /// (Model B, #715). When `Some`, the container is rooted there — its
+    /// workload sees the tenant VFS as its filesystem — instead of sharing the
+    /// host root (`--directory=/`).
     fn build_nspawn_args(
         &self,
         sandbox: &PodSandbox,
         machine_name: &str,
         annotations: &HashMap<String, String>,
         resources: Option<&LinuxContainerResources>,
+        vfs_root: Option<&Path>,
     ) -> Vec<String> {
         let mut args = Vec::new();
 
-        // Core flags
+        // Core flags. Root at the tenant-VFS FUSE mount when Model B (#715) has
+        // composed one for this sandbox; otherwise share the host root as before.
         args.push(format!("--machine={machine_name}"));
-        args.push("--directory=/".into());
+        match vfs_root {
+            Some(root) => args.push(format!("--directory={}", root.display())),
+            None => args.push("--directory=/".into()),
+        }
         args.push("--tmpfs=/tmp".into());
         args.push("--tmpfs=/run".into());
 
@@ -217,6 +265,86 @@ impl NspawnBackend {
         args.push("--foreground".into());
 
         args
+    }
+
+    /// Annotation key carrying the sandbox's policy principal (the [`Subject`]
+    /// at the VFS Mount boundary, #353/#319/#328) — same key the kata backend
+    /// reads. When absent, the sandbox id is used as a stable per-sandbox
+    /// principal so isolation still holds.
+    ///
+    /// [`Subject`]: hyprstream_vfs::Subject
+    #[cfg(feature = "oci-image")]
+    const SUBJECT_ANNOTATION: &'static str = "hyprstream.io/subject";
+
+    /// Resolve the [`Subject`](hyprstream_vfs::Subject) this sandbox's tenant
+    /// VFS is served under (mirrors `KataBackend::sandbox_subject`).
+    #[cfg(feature = "oci-image")]
+    fn sandbox_subject(
+        sandbox: &PodSandbox,
+        annotations: &HashMap<String, String>,
+    ) -> hyprstream_vfs::Subject {
+        annotations
+            .get(Self::SUBJECT_ANNOTATION)
+            .filter(|s| !s.is_empty())
+            .map(hyprstream_vfs::Subject::new)
+            .unwrap_or_else(|| hyprstream_vfs::Subject::new(sandbox.id.clone()))
+    }
+
+    /// Compose the per-sandbox tenant VFS (image rootfs + injected mounts) and
+    /// FUSE-mount it at a per-sandbox host directory (Model B, #715) — the
+    /// non-VM sibling of `KataBackend::compose_and_serve_vfs`.
+    ///
+    /// Returns the RAII [`SandboxFsLocalMount`](super::sandbox_fs::SandboxFsLocalMount);
+    /// the container is then `--directory`-rooted at its `mountpoint()`. Compose
+    /// is CPU/IO-bound (RAFS load), so it runs on a blocking thread; the mount's
+    /// own serving thread is spawned inside `serve_local_at`. The
+    /// [`require_fuse_mount_capability`](super::selection::require_fuse_mount_capability)
+    /// gate asserts nspawn is declared able to FUSE-root before we mount
+    /// (fail-closed).
+    #[cfg(feature = "oci-image")]
+    async fn compose_and_mount_vfs_root(
+        &self,
+        sandbox: &PodSandbox,
+        image_id: &str,
+        subject: hyprstream_vfs::Subject,
+    ) -> Result<super::sandbox_fs::SandboxFsLocalMount> {
+        use super::sandbox_fs::SandboxFs;
+        use hyprstream_vfs::injected::SyntheticNode;
+
+        let rafs_store = self.rafs_store.clone().ok_or_else(|| {
+            WorkerError::SandboxCreationFailed(
+                "nspawn tenant-VFS root requested but no RAFS image store is configured".into(),
+            )
+        })?;
+
+        // Fail-closed capability gate (#715): only POSIX-root the composed VFS
+        // for a backend that declares it can FUSE-mount it. nspawn does.
+        super::selection::require_fuse_mount_capability(self.backend_type())?;
+
+        let mountpoint = sandbox.sandbox_path().join(VFS_ROOT_DIR);
+        let rt = tokio::runtime::Handle::current();
+        let image_id = image_id.to_owned();
+        let sandbox_dir = sandbox.sandbox_path().clone();
+        let mp = mountpoint.clone();
+
+        // RAFS load + overlay setup is blocking; do it off the async executor.
+        tokio::task::spawn_blocking(move || {
+            let fs = SandboxFs::compose(
+                &rafs_store,
+                &image_id,
+                &sandbox_dir,
+                subject,
+                // Models / deltas injected listings: empty mount points for now
+                // (the worker runtime populates them per tenant), mirroring kata.
+                SyntheticNode::dir(),
+                SyntheticNode::dir(),
+            )?;
+            fs.serve_local_at(rt, mp)
+        })
+        .await
+        .map_err(|e| {
+            WorkerError::SandboxCreationFailed(format!("VFS compose/mount task join: {e}"))
+        })?
     }
 
     /// Discover leader PID via `machinectl show`.
@@ -315,12 +443,46 @@ impl SandboxBackend for NspawnBackend {
         tokio::fs::create_dir_all(&sandbox_path).await?;
         sandbox.sandbox_path = sandbox_path.clone();
 
+        // Model B (#715): when an image store is configured and the sandbox
+        // names an image, compose the per-sandbox tenant VFS and FUSE-mount it as
+        // the container root, so the workload POSIX-roots in the tenant's VFS —
+        // the non-VM sibling of kata's virtio-fs path. Held on the handle so it
+        // outlives start and unmounts on teardown (RAII). Without a store (or
+        // image), nspawn stays a host-root container exactly as before.
+        #[cfg(feature = "oci-image")]
+        let vfs_root_mount: Option<Arc<super::sandbox_fs::SandboxFsLocalMount>> =
+            if self.rafs_store.is_some() {
+                if let Some(image_id) = sandbox.image_id.clone() {
+                    let subject = Self::sandbox_subject(sandbox, annotations);
+                    let mount = self
+                        .compose_and_mount_vfs_root(sandbox, &image_id, subject)
+                        .await?;
+                    info!(
+                        sandbox_id = %sandbox.id,
+                        mountpoint = %mount.mountpoint().display(),
+                        "Mounted tenant VFS as nspawn container root (Model B, #715)"
+                    );
+                    Some(Arc::new(mount))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        #[cfg(feature = "oci-image")]
+        let vfs_root_mountpoint: Option<PathBuf> =
+            vfs_root_mount.as_ref().map(|m| m.mountpoint().to_path_buf());
+        #[cfg(not(feature = "oci-image"))]
+        let vfs_root_mountpoint: Option<PathBuf> = None;
+
         // Build argument list
         let nspawn_args = self.build_nspawn_args(
             sandbox,
             &machine_name,
             annotations,
             Some(&config.linux.resources),
+            vfs_root_mountpoint.as_deref(),
         );
 
         info!(
@@ -354,6 +516,8 @@ impl SandboxBackend for NspawnBackend {
             machine_name: machine_name.clone(),
             leader_pid,
             sandbox_path,
+            #[cfg(feature = "oci-image")]
+            vfs_root_mount,
         });
 
         info!(
@@ -588,10 +752,20 @@ inventory::submit! {
         // a separate follow-up — nspawn currently boots the inner hyprstream
         // service — but the socket-injection capability itself is real.)
         injects_9p_socket: true,
+        // Model B (#715): nspawn POSIX-roots the workload in the tenant VFS by
+        // FUSE-mounting the composed per-sandbox namespace at a host directory
+        // and handing it to the container — the non-VM sibling of kata's
+        // virtio-fs path. It advertises the capability so the fail-closed gate
+        // ([`require_fuse_mount_capability`]) permits the mount.
+        mounts_fuse_vfs: true,
         is_available: NspawnBackend::registry_is_available,
         construct: |_ctx| {
-            Ok(std::sync::Arc::new(NspawnBackend::new(NspawnConfig::default()))
-                as std::sync::Arc<dyn crate::runtime::SandboxBackend>)
+            #[cfg(feature = "oci-image")]
+            let backend = NspawnBackend::new(NspawnConfig::default())
+                .with_rafs_store(Some(std::sync::Arc::clone(&_ctx.rafs_store)));
+            #[cfg(not(feature = "oci-image"))]
+            let backend = NspawnBackend::new(NspawnConfig::default());
+            Ok(std::sync::Arc::new(backend) as std::sync::Arc<dyn crate::runtime::SandboxBackend>)
         },
     }
 }
@@ -616,6 +790,8 @@ mod tests {
             machine_name: "hyprstream-test-123".into(),
             leader_pid: Some(42),
             sandbox_path: PathBuf::from("/tmp/test"),
+            #[cfg(feature = "oci-image")]
+            vfs_root_mount: None,
         };
 
         let handle: Arc<dyn SandboxHandle> = Arc::new(handle);

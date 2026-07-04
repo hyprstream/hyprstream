@@ -675,3 +675,87 @@ fn local_fuse_mount_read_and_readdir() {
         eprintln!("serve_local thread did not exit after unmount within timeout");
     }
 }
+
+/// #720 end-to-end: a rootless `podman run` reads a file through the tenant VFS
+/// FUSE-mounted via `serve_local` — the Model B OCI path exercised against a
+/// real container runtime + kernel `/dev/fuse`. Self-skips when the host lacks
+/// podman or `/dev/fuse` (CI runners), so it is safe in the normal suite.
+#[test]
+fn podman_run_reads_serve_local_vfs() {
+    if !std::path::Path::new("/dev/fuse").exists() {
+        eprintln!("skipping podman_run_reads_serve_local_vfs: no /dev/fuse");
+        return;
+    }
+    if std::process::Command::new("podman").arg("--version").output().is_err() {
+        eprintln!("skipping podman_run_reads_serve_local_vfs: no podman");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mountpoint = dir.path().to_path_buf();
+
+    let mut ns = Namespace::new();
+    ns.mount(
+        "/data",
+        Arc::new(MemFs::with_files(&[("hello.txt", b"hello from hyprstream vfs")])),
+    )
+    .expect("mount MemFs");
+    let fs = build(ns);
+
+    let mp = mountpoint.clone();
+    let handle = std::thread::Builder::new()
+        .name("fuse-podman-e2e".to_owned())
+        .spawn(move || crate::server::serve_local(fs, &mp))
+        .expect("spawn serve_local");
+
+    // Wait for the mount to come up.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut mounted = false;
+    while std::time::Instant::now() < deadline {
+        if mountpoint.join("data").join("hello.txt").exists() {
+            mounted = true;
+            break;
+        }
+        if handle.is_finished() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let unmount = |mp: &std::path::Path| {
+        if !matches!(std::process::Command::new("fusermount3").arg("-u").arg(mp).status(), Ok(s) if s.success()) {
+            let _ = std::process::Command::new("fusermount").arg("-u").arg(mp).status();
+        }
+    };
+    if !mounted {
+        unmount(&mountpoint);
+        eprintln!("skipping podman_run_reads_serve_local_vfs: serve_local mount did not come up (FUSE unavailable in this env)");
+        return;
+    }
+
+    // Rootless `podman run` reads the file through the FUSE-mounted VFS using
+    // the DEFAULT user namespace. NOTE: do NOT use `--userns=keep-id` here — it
+    // hits a crun+FUSE fd-stat failure ("crun: cannot stat /proc/self/fd/N:
+    // Permission denied") when the bind source is a FUSE mount. Default userns
+    // (and `--userns=host`) work because the container root maps to the mounting
+    // uid and the VFS nodes are world-readable. This is the empirical basis for
+    // the OCI Model B wiring choosing default userns (#720).
+    let vol = format!("{}:/vfs:ro", mountpoint.display());
+    let out = std::process::Command::new("podman")
+        .args([
+            "run", "--rm", "--volume", &vol,
+            "docker.io/library/busybox", "cat", "/vfs/data/hello.txt",
+        ])
+        .output()
+        .expect("podman run");
+
+    unmount(&mountpoint);
+    let _ = handle.join();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("hello from hyprstream vfs"),
+        "rootless podman did not read the fuse-mounted VFS file.\nstatus={:?}\nstdout={stdout:?}\nstderr={stderr:?}",
+        out.status
+    );
+}
