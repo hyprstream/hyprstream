@@ -17,16 +17,76 @@ use crate::generated::discovery_client::{
     RegisterEntityStatementRequest, RegisterEnvelopeKeysetRequest,
     EntityStatement, EnvelopeKeyset, IssuerList,
     GetRecordRequest, RecordCar,
-    QueryCandidatesRequest,
+    QueryCandidatesRequest, NodeLiveness, PlacementCandidate, PlacementCandidateSet, Resource,
     dispatch_discovery, serialize_response,
 };
+use crate::placement_index::PlacementIndex;
+use crate::scheduling;
 
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use parking_lot::RwLock;
 use tracing::{trace, info};
+use hyprstream_rpc::identity::Did;
+use hyprstream_util::ttl_cache::TtlCache;
+
+/// #524 P1 — liveness heartbeat TTL: a node with no live/fresh
+/// `reportNodeLiveness` entry is hard-excluded from `queryCandidates`
+/// (ratified decision — see the epic's issue comments), never just flagged
+/// stale. 45s sits mid-range of the 30-60s window floated in earlier design
+/// notes; named here so it's easy to retune.
+const LIVENESS_TTL: Duration = Duration::from_secs(45);
+
+/// Liveness cache capacity / inline-reap budget. Generous fleet-scale
+/// headroom; eviction is O(log n) and happens inline on every insert/get, so a
+/// large bound doesn't cost anything until it's actually full.
+const LIVENESS_CACHE_MAX_ENTRIES: usize = 16_384;
+const LIVENESS_CACHE_REAP_BUDGET: usize = 32;
+
+/// Default bound applied to `queryCandidates` when the caller passes
+/// `maxCandidates == 0` (unspecified) — keeps an unscoped query from returning
+/// the entire fleet in one response.
+const DEFAULT_MAX_CANDIDATES: usize = 100;
+
+/// One node's live allocatable capacity + load, as reported via
+/// `reportNodeLiveness`. Stored in a `TtlCache<Did, _>` — absence (never
+/// reported, or expired) hard-excludes the node from `queryCandidates`.
+#[derive(Clone, Debug)]
+struct LiveAllocatable {
+    /// resource name -> k8s-quantity, free right now.
+    allocatable: Vec<(String, String)>,
+    load_fraction: f32,
+    /// unix millis of this snapshot.
+    last_seen: i64,
+}
+
+fn unix_millis_now() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Convert the wire `SelectorOp` (generated from `discovery.capnp`) to the
+/// shared scheduling-substrate `SelectorOp` (`crate::scheduling`, #628).
+/// Deliberately exhaustive (no catch-all) so a future wire variant fails to
+/// compile here instead of silently matching nothing.
+fn to_scheduling_op(
+    op: crate::generated::discovery_client::SelectorOp,
+) -> scheduling::SelectorOp {
+    use crate::generated::discovery_client::SelectorOp as Wire;
+    match op {
+        Wire::In => scheduling::SelectorOp::In,
+        Wire::NotIn => scheduling::SelectorOp::NotIn,
+        Wire::Exists => scheduling::SelectorOp::Exists,
+        Wire::DoesNotExist => scheduling::SelectorOp::DoesNotExist,
+        Wire::Gt => scheduling::SelectorOp::Gt,
+        Wire::Lt => scheduling::SelectorOp::Lt,
+    }
+}
 
 // ============================================================================
 // AuthorizationProvider trait (D5)
@@ -187,6 +247,15 @@ pub struct DiscoveryService {
     tls_endorsement: Vec<u8>,
     /// Domain the TLS endorsement covers (empty when no endorsement).
     tls_domain: String,
+    /// #524 P1 — durable placement directory (labels/declared-resources/group
+    /// consents), refreshed by polling `record_resolver` lazily: the first
+    /// `reportNodeLiveness` heartbeat seen for a DID with no ingested
+    /// `NodeRecord` yet triggers a poll of its repo.
+    placement_index: PlacementIndex,
+    /// #524 P1 — live allocatable capacity + load per node, TTL'd
+    /// (`LIVENESS_TTL`). Backs the hard-exclusion-on-staleness rule in
+    /// `queryCandidates`.
+    liveness: TtlCache<Did, LiveAllocatable>,
     // Infrastructure (for Spawnable)
     transport: TransportConfig,
 }
@@ -216,6 +285,8 @@ impl DiscoveryService {
             envelope_keysets: RwLock::new(HashMap::new()),
             tls_endorsement: Vec::new(),
             tls_domain: String::new(),
+            placement_index: PlacementIndex::new(),
+            liveness: TtlCache::new(LIVENESS_CACHE_MAX_ENTRIES, LIVENESS_CACHE_REAP_BUDGET),
             transport,
         }
     }
@@ -917,21 +988,208 @@ impl DiscoveryHandler for DiscoveryService {
         }
     }
 
-    /// #523 P0 / #524 — placement candidate query. The vocabulary + filter/rank/
-    /// select helpers landed in `crate::scheduling` (#628); the live
-    /// directory + authz-prefiltered handler is P1's job (#524). Stubbed here
-    /// so the RPC surface compiles; returns UNIMPLEMENTED until P1 wires it.
+    /// #523 P0 / #524 — placement candidate query. The auto-generated dispatch
+    /// gate already ran a `discovery:QueryCandidates`/`query` authz check
+    /// before this handler was invoked; that only authorizes "may call
+    /// queryCandidates at all". Each surviving candidate additionally gets its
+    /// own fail-closed `placement:candidate:<did>` check below (a denied node
+    /// is silently omitted, not surfaced as an error) — mirroring why
+    /// `getRecord`/`getRepo` layer a per-target check on top of the generic gate.
+    ///
+    /// Pipeline: known node DIDs (placement directory) → hard-exclude any
+    /// without a live `reportNodeLiveness` entry (decision: absence/expiry is
+    /// exclusion, never a "stale" flag) → sync filter (label selectors AND,
+    /// resource requests AND) via `scheduling::filter` → per-candidate async
+    /// authz → rank (ascending load, DID tiebreak) via `scheduling::rank` →
+    /// bound to `maxCandidates` (or [`DEFAULT_MAX_CANDIDATES`] when 0).
+    /// `totalMatching` is the authorized-survivor count *before* the bound.
     async fn handle_query_candidates(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &QueryCandidatesRequest,
+    ) -> Result<DiscoveryResponseVariant> {
+        struct Candidate {
+            did: String,
+            record_uri: String,
+            load_fraction: f32,
+            allocatable: Vec<(String, String)>,
+            last_seen: i64,
+            labels: Vec<(String, String)>,
+        }
+
+        let selectors: Vec<scheduling::LabelSelector> = data
+            .selectors
+            .iter()
+            .map(|s| scheduling::LabelSelector::new(s.key.clone(), to_scheduling_op(s.op), s.values.clone()))
+            .collect();
+        let resources: Vec<scheduling::ResourceRequest> = data
+            .resources
+            .iter()
+            .map(|r| scheduling::ResourceRequest::new(r.name.clone(), r.min_quantity.clone()))
+            .collect();
+
+        // Hard liveness exclusion (decision #1): only nodes with a live,
+        // unexpired `reportNodeLiveness` entry become candidates at all.
+        let candidates: Vec<Candidate> = self
+            .placement_index
+            .known_node_dids()
+            .into_iter()
+            .filter_map(|did| {
+                let live = self.liveness.get(&Did::new(did.clone()))?;
+                let labels = self.placement_index.effective_labels(&did);
+                let record_uri = self.placement_index.record_uri(&did).unwrap_or_default();
+                Some(Candidate {
+                    did,
+                    record_uri,
+                    load_fraction: live.load_fraction,
+                    allocatable: live.allocatable,
+                    last_seen: live.last_seen,
+                    labels,
+                })
+            })
+            .collect();
+
+        let predicates: Vec<scheduling::Predicate<Candidate>> = vec![
+            Box::new({
+                let selectors = selectors.clone();
+                move |c: &Candidate| {
+                    for sel in &selectors {
+                        if !sel.matches(&c.labels) {
+                            return Some(scheduling::RejectionReason(format!(
+                                "label selector on {:?} did not match",
+                                sel.key
+                            )));
+                        }
+                    }
+                    None
+                }
+            }),
+            Box::new({
+                let resources = resources.clone();
+                move |c: &Candidate| {
+                    for req in &resources {
+                        let satisfied = c
+                            .allocatable
+                            .iter()
+                            .find(|(name, _)| name == &req.name)
+                            .is_some_and(|(_, quantity)| req.satisfied_by(quantity));
+                        if !satisfied {
+                            return Some(scheduling::RejectionReason(format!(
+                                "resource {:?} not satisfied",
+                                req.name
+                            )));
+                        }
+                    }
+                    None
+                }
+            }),
+        ];
+
+        let outcomes = scheduling::filter(&candidates, &predicates);
+        let survivors: Vec<&Candidate> = outcomes.iter().filter(|o| o.passed()).map(|o| o.candidate).collect();
+
+        // Per-candidate fail-closed authz — async, so it runs as its own pass
+        // rather than inside a (sync) `scheduling::Predicate` closure. A denied
+        // node is silently dropped, never surfaced as an error.
+        let mut authorized: Vec<&Candidate> = Vec::with_capacity(survivors.len());
+        for c in survivors {
+            let resource = format!("placement:candidate:{}", c.did);
+            if self.authorize(ctx, &resource, "query").await.is_ok() {
+                authorized.push(c);
+            }
+        }
+
+        // Post-filter, post-authz, pre-bound — so callers can tell truncation
+        // apart from "that's really all of them".
+        let total_matching = authorized.len() as u32;
+
+        let ranked = scheduling::rank(authorized, |a, b| {
+            a.load_fraction
+                .partial_cmp(&b.load_fraction)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.did.cmp(&b.did))
+        });
+
+        let max = if data.max_candidates == 0 {
+            DEFAULT_MAX_CANDIDATES
+        } else {
+            data.max_candidates as usize
+        };
+        let candidates_out: Vec<PlacementCandidate> = ranked
+            .into_iter()
+            .take(max)
+            .map(|c| PlacementCandidate {
+                node: c.did.clone(),
+                record_uri: c.record_uri.clone(),
+                load_fraction: c.load_fraction,
+                allocatable: c
+                    .allocatable
+                    .iter()
+                    .map(|(name, quantity)| Resource {
+                        name: name.clone(),
+                        quantity: quantity.clone(),
+                    })
+                    .collect(),
+                last_seen: c.last_seen,
+            })
+            .collect();
+
+        Ok(DiscoveryResponseVariant::QueryCandidatesResult(PlacementCandidateSet {
+            candidates: candidates_out,
+            total_matching,
+        }))
+    }
+
+    /// #524 P1 — node liveness heartbeat. The auto-generated dispatch gate
+    /// already ran a `discovery:ReportNodeLiveness`/`write` authz check before
+    /// this handler was invoked (mirrors `handle_announce`, which needs no
+    /// additional internal check for the same reason).
+    ///
+    /// Re-inserting (heartbeating) the same node refreshes its TTL entry. The
+    /// first heartbeat seen for a DID this directory hasn't ingested a
+    /// `NodeRecord` for yet lazily triggers a one-shot poll of that DID's repo
+    /// (day-1 ingestion cadence — see the `placement_index` module docs); a
+    /// failure there does not fail the heartbeat itself.
+    async fn handle_report_node_liveness(
         &self,
         _ctx: &EnvelopeContext,
         _request_id: u64,
-        _data: &QueryCandidatesRequest,
+        data: &NodeLiveness,
     ) -> Result<DiscoveryResponseVariant> {
-        Ok(DiscoveryResponseVariant::Error(ErrorInfo {
-            message: "queryCandidates not yet wired (P1 placement directory; see #524)".to_owned(),
-            code: "UNIMPLEMENTED".to_owned(),
-            details: String::new(),
-        }))
+        let node_did = data.node.as_str().to_owned();
+        if node_did.is_empty() {
+            return Ok(DiscoveryResponseVariant::Error(ErrorInfo {
+                message: "node is required".to_owned(),
+                code: "INVALID_ARGUMENT".to_owned(),
+                details: String::new(),
+            }));
+        }
+
+        let live = LiveAllocatable {
+            allocatable: data
+                .allocatable
+                .iter()
+                .map(|r| (r.name.clone(), r.quantity.clone()))
+                .collect(),
+            load_fraction: data.load_fraction,
+            last_seen: if data.ts != 0 { data.ts } else { unix_millis_now() },
+        };
+        self.liveness.insert(data.node.clone(), live, LIVENESS_TTL);
+
+        if self.placement_index.record_uri(&node_did).is_none() {
+            if let Some(resolver) = &self.record_resolver {
+                if let Err(e) = self.placement_index.ingest_did(resolver.as_ref(), &node_did).await {
+                    tracing::warn!(
+                        node = %node_did,
+                        error = %e,
+                        "placement directory ingestion failed for heartbeating node (liveness still recorded)"
+                    );
+                }
+            }
+        }
+
+        Ok(DiscoveryResponseVariant::ReportNodeLivenessResult)
     }
 }
 
@@ -1276,5 +1534,273 @@ mod get_record_tests {
         let block_cids: std::collections::BTreeSet<PdsCid> =
             blocks.iter().map(|(c, _)| *c).collect();
         assert!(block_cids.contains(&target_cid));
+    }
+}
+
+// ============================================================================
+// #524 P1 — queryCandidates / reportNodeLiveness handler tests
+// ============================================================================
+
+#[cfg(test)]
+mod query_candidates_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    use super::*;
+
+    use std::collections::BTreeMap;
+
+    use hyprstream_pds::car::build_car_v1;
+    use hyprstream_pds::cid::Cid;
+    use hyprstream_pds::commit::{Commit, UnsignedCommit};
+    use hyprstream_pds::mst::Node;
+    use hyprstream_pds::placement::node::{self, NodeRecord};
+    use hyprstream_pds::tid::Tid;
+    use crate::generated::discovery_client::{LabelSelector, SelectorOp, ResourceRequest};
+    use p256::ecdsa::SigningKey as P256SigningKey;
+
+    /// Allows every (resource, operation) pair.
+    struct AllowAll;
+    #[async_trait(?Send)]
+    impl AuthorizationProvider for AllowAll {
+        async fn check(&self, _subject: &str, _domain: &str, _resource: &str, _operation: &str) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    /// Denies exactly the `placement:candidate:<did>` resource for one DID;
+    /// allows everything else (including the dispatch-level auto-gate checks).
+    struct DenyNode(String);
+    #[async_trait(?Send)]
+    impl AuthorizationProvider for DenyNode {
+        async fn check(&self, _subject: &str, _domain: &str, resource: &str, _operation: &str) -> Result<bool> {
+            Ok(resource != format!("placement:candidate:{}", self.0))
+        }
+    }
+
+    /// A resolver serving one fixed repo CAR per DID (built with a real
+    /// `NodeRecord` encoding — not hand-hacked bytes).
+    struct FixedRepoResolver {
+        repos: HashMap<String, Vec<u8>>,
+    }
+    #[async_trait(?Send)]
+    impl RecordResolver for FixedRepoResolver {
+        async fn resolve_record(&self, _did: &str, _collection: &str, _rkey: &str) -> Result<Option<RecordCarData>> {
+            Ok(None)
+        }
+        async fn resolve_repo(&self, did: &str) -> Result<Option<RecordCarData>> {
+            Ok(self
+                .repos
+                .get(did)
+                .map(|car| RecordCarData { uri: format!("at://{did}"), car: car.clone() }))
+        }
+    }
+
+    /// Build a one-record repo CAR for `did` carrying `rec` as its
+    /// `ai.hyprstream.placement.node` record.
+    fn node_repo_car(did: &str, rec: &NodeRecord) -> Vec<u8> {
+        let signing_key = P256SigningKey::random(&mut rand::rngs::OsRng);
+        let key = format!("{}/3a", node::COLLECTION_NSID);
+        let record_cid = Cid::from_dag_cbor(&rec.to_dag_cbor());
+        let mut keyed: BTreeMap<String, Cid> = BTreeMap::new();
+        keyed.insert(key, record_cid);
+        let tree = Node::from_keyed_records(&keyed);
+        let root = tree.root_cid();
+        let (_root_data, node_blocks) = tree.to_node_data_with_blocks();
+        let unsigned = UnsignedCommit::new(did.to_owned(), root, Tid::now(), None);
+        let commit = Commit::sign(&unsigned, &signing_key);
+        let mut blocks: Vec<(Cid, Vec<u8>)> = vec![(commit.cid(), commit.to_dag_cbor())];
+        for (cid, data) in node_blocks {
+            blocks.push((cid, data.encode()));
+        }
+        blocks.push((record_cid, rec.to_dag_cbor()));
+        build_car_v1(&[commit.cid()], &blocks)
+    }
+
+    fn sample_node_record(did: &str, labels: Vec<(&str, &str)>) -> NodeRecord {
+        NodeRecord::new(
+            format!("at://{did}"),
+            labels
+                .into_iter()
+                .map(|(k, v)| node::Label { key: k.to_owned(), value: v.to_owned() })
+                .collect(),
+            vec![],
+            vec![],
+            "2026-06-23T12:34:56.789Z",
+        )
+        .unwrap()
+    }
+
+    fn service_with(auth: Box<dyn AuthorizationProvider>, repos: HashMap<String, Vec<u8>>) -> DiscoveryService {
+        let (sk, vk) = hyprstream_rpc::crypto::generate_signing_keypair();
+        DiscoveryService::new(
+            Arc::new(sk),
+            vk,
+            hyprstream_rpc::transport::TransportConfig::inproc("query-candidates-test"),
+        )
+        .with_auth_provider(auth)
+        .with_record_resolver(Box::new(FixedRepoResolver { repos }))
+    }
+
+    fn test_ctx() -> EnvelopeContext {
+        EnvelopeContext::from_callback_service(1, "test-caller")
+    }
+
+    async fn heartbeat(svc: &DiscoveryService, did: &str, allocatable: Vec<(&str, &str)>, load_fraction: f32) {
+        let req = NodeLiveness {
+            node: Did::new(did.to_owned()),
+            allocatable: allocatable
+                .into_iter()
+                .map(|(n, q)| Resource { name: n.to_owned(), quantity: q.to_owned() })
+                .collect(),
+            load_fraction,
+            ts: 0,
+        };
+        let resp = svc.handle_report_node_liveness(&test_ctx(), 1, &req).await.unwrap();
+        assert!(matches!(resp, DiscoveryResponseVariant::ReportNodeLivenessResult));
+    }
+
+    fn empty_query(max_candidates: u32) -> QueryCandidatesRequest {
+        QueryCandidatesRequest { selectors: vec![], resources: vec![], max_candidates }
+    }
+
+    fn as_set(resp: DiscoveryResponseVariant) -> PlacementCandidateSet {
+        match resp {
+            DiscoveryResponseVariant::QueryCandidatesResult(s) => s,
+            other => panic!("expected QueryCandidatesResult, got {other:?}"),
+        }
+    }
+
+    /// A node with an ingested NodeRecord but NO liveness heartbeat must never
+    /// appear — absence is hard exclusion, not a "stale" flag (decision #1).
+    #[tokio::test]
+    async fn liveness_hard_excludes_nodes_never_heartbeated() {
+        let did = "did:web:node1.example.com";
+        let rec = sample_node_record(did, vec![("zone", "us-east")]);
+        let svc = service_with(Box::new(AllowAll), HashMap::from([(did.to_owned(), node_repo_car(did, &rec))]));
+
+        let set = as_set(svc.handle_query_candidates(&test_ctx(), 1, &empty_query(0)).await.unwrap());
+        assert!(set.candidates.is_empty());
+        assert_eq!(set.total_matching, 0);
+    }
+
+    #[tokio::test]
+    async fn label_selector_matches_and_excludes_non_matching_nodes() {
+        let did_a = "did:web:node-a.example.com";
+        let did_b = "did:web:node-b.example.com";
+        let repos = HashMap::from([
+            (did_a.to_owned(), node_repo_car(did_a, &sample_node_record(did_a, vec![("zone", "us-east")]))),
+            (did_b.to_owned(), node_repo_car(did_b, &sample_node_record(did_b, vec![("zone", "us-west")]))),
+        ]);
+        let svc = service_with(Box::new(AllowAll), repos);
+        heartbeat(&svc, did_a, vec![], 0.1).await;
+        heartbeat(&svc, did_b, vec![], 0.1).await;
+
+        let req = QueryCandidatesRequest {
+            selectors: vec![LabelSelector {
+                key: "zone".to_owned(),
+                op: SelectorOp::In,
+                values: vec!["us-east".to_owned()],
+            }],
+            resources: vec![],
+            max_candidates: 0,
+        };
+        let set = as_set(svc.handle_query_candidates(&test_ctx(), 1, &req).await.unwrap());
+        assert_eq!(set.candidates.len(), 1);
+        assert_eq!(set.candidates[0].node, did_a);
+        assert_eq!(set.total_matching, 1);
+    }
+
+    #[tokio::test]
+    async fn resource_request_filters_insufficient_live_capacity() {
+        let did = "did:web:node1.example.com";
+        let rec = sample_node_record(did, vec![]);
+        let svc = service_with(Box::new(AllowAll), HashMap::from([(did.to_owned(), node_repo_car(did, &rec))]));
+        heartbeat(&svc, did, vec![("nvidia.com/gpu", "2")], 0.1).await;
+
+        let req = QueryCandidatesRequest {
+            selectors: vec![],
+            resources: vec![ResourceRequest { name: "nvidia.com/gpu".to_owned(), min_quantity: "4".to_owned() }],
+            max_candidates: 0,
+        };
+        let set = as_set(svc.handle_query_candidates(&test_ctx(), 1, &req).await.unwrap());
+        assert!(set.candidates.is_empty(), "2 GPUs must not satisfy a request for >=4");
+
+        // A satisfiable request against the same live report succeeds.
+        let req_ok = QueryCandidatesRequest {
+            selectors: vec![],
+            resources: vec![ResourceRequest { name: "nvidia.com/gpu".to_owned(), min_quantity: "1".to_owned() }],
+            max_candidates: 0,
+        };
+        let set_ok = as_set(svc.handle_query_candidates(&test_ctx(), 1, &req_ok).await.unwrap());
+        assert_eq!(set_ok.candidates.len(), 1);
+    }
+
+    /// THE LOAD-BEARING TEST: a per-candidate authz denial silently drops that
+    /// node from the result — it is not surfaced as an RPC error.
+    #[tokio::test]
+    async fn per_candidate_authz_denial_is_silent_not_an_error() {
+        let did_a = "did:web:node-a.example.com";
+        let did_b = "did:web:node-b.example.com";
+        let repos = HashMap::from([
+            (did_a.to_owned(), node_repo_car(did_a, &sample_node_record(did_a, vec![]))),
+            (did_b.to_owned(), node_repo_car(did_b, &sample_node_record(did_b, vec![]))),
+        ]);
+        let svc = service_with(Box::new(DenyNode(did_a.to_owned())), repos);
+        heartbeat(&svc, did_a, vec![], 0.1).await;
+        heartbeat(&svc, did_b, vec![], 0.1).await;
+
+        let resp = svc.handle_query_candidates(&test_ctx(), 1, &empty_query(0)).await.unwrap();
+        let set = as_set(resp);
+        assert_eq!(set.candidates.len(), 1);
+        assert_eq!(set.candidates[0].node, did_b);
+        assert_eq!(set.total_matching, 1, "denied candidate must not inflate totalMatching");
+    }
+
+    #[tokio::test]
+    async fn bounding_respects_max_candidates_and_total_matching_is_pre_bound() {
+        let dids: Vec<String> = (0..5).map(|i| format!("did:web:node{i}.example.com")).collect();
+        let mut repos = HashMap::new();
+        for d in &dids {
+            repos.insert(d.clone(), node_repo_car(d, &sample_node_record(d, vec![])));
+        }
+        let svc = service_with(Box::new(AllowAll), repos);
+        for (i, d) in dids.iter().enumerate() {
+            heartbeat(&svc, d, vec![], i as f32 * 0.1).await;
+        }
+
+        let set = as_set(svc.handle_query_candidates(&test_ctx(), 1, &empty_query(2)).await.unwrap());
+        assert_eq!(set.candidates.len(), 2, "bounded to maxCandidates");
+        assert_eq!(set.total_matching, 5, "totalMatching counts all authorized survivors, not just the bound");
+        // Ranked ascending by load_fraction: node0 (0.0) then node1 (0.1).
+        assert_eq!(set.candidates[0].node, dids[0]);
+        assert_eq!(set.candidates[1].node, dids[1]);
+    }
+
+    #[tokio::test]
+    async fn zero_max_candidates_uses_default_bound() {
+        let dids: Vec<String> = (0..3).map(|i| format!("did:web:node{i}.example.com")).collect();
+        let mut repos = HashMap::new();
+        for d in &dids {
+            repos.insert(d.clone(), node_repo_car(d, &sample_node_record(d, vec![])));
+        }
+        let svc = service_with(Box::new(AllowAll), repos);
+        for d in &dids {
+            heartbeat(&svc, d, vec![], 0.0).await;
+        }
+        let set = as_set(svc.handle_query_candidates(&test_ctx(), 1, &empty_query(0)).await.unwrap());
+        assert_eq!(set.candidates.len(), 3, "under the default bound, all 3 come back");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_refreshes_ttl_and_liveness_fields() {
+        let did = "did:web:node1.example.com";
+        let rec = sample_node_record(did, vec![]);
+        let svc = service_with(Box::new(AllowAll), HashMap::from([(did.to_owned(), node_repo_car(did, &rec))]));
+        heartbeat(&svc, did, vec![("cpu", "1")], 0.9).await;
+        heartbeat(&svc, did, vec![("cpu", "8")], 0.1).await;
+
+        let set = as_set(svc.handle_query_candidates(&test_ctx(), 1, &empty_query(0)).await.unwrap());
+        assert_eq!(set.candidates.len(), 1);
+        assert!((set.candidates[0].load_fraction - 0.1).abs() < f32::EPSILON, "second heartbeat must win");
+        assert_eq!(set.candidates[0].allocatable[0].quantity, "8");
     }
 }
