@@ -67,7 +67,18 @@ pub struct KataHandle {
     /// the kata-agent so `CreateContainer` mounts the share, by tag, as the
     /// container's rootfs. `None` when the VM booted its own rootfs with no
     /// tenant VFS (e.g. `sandbox.image_id` unset).
-    pub rootfs_mount_tag: Option<String>,
+    ///
+    /// Interior-mutable (`parking_lot::Mutex`) because the handle is shared
+    /// (`Arc`) once the sandbox has started: the post-start `deliver_namespace`
+    /// path (#742) composes+attaches a tenant VFS over virtio-fs *after*
+    /// construction and must record the resulting rootfs tag through a shared
+    /// `&self` — it has no `&mut KataHandle`. Both the boot path
+    /// (`start()`) and the delivery path write through
+    /// [`record_rootfs_mount_tag`](KataHandle::record_rootfs_mount_tag); readers
+    /// use [`rootfs_mount_tag`](KataHandle::rootfs_mount_tag). `parking_lot`
+    /// (not `std::sync`) so the lock is infallible — no poisoning, so no
+    /// `unwrap`/`expect` at the (`-D clippy::unwrap_used`) call sites.
+    pub rootfs_mount_tag: parking_lot::Mutex<Option<String>>,
     /// kata-agent ttrpc/vsock client (#344), connected lazily on first
     /// `exec_sync` call and cached for subsequent calls. `None` until then,
     /// or if the guest agent connection could not be established (e.g. the
@@ -79,6 +90,31 @@ pub struct KataHandle {
     pub agent: tokio::sync::Mutex<Option<Arc<KataAgentClient>>>,
 }
 
+impl KataHandle {
+    /// Read the recorded container rootfs virtio-fs mount tag, if any.
+    ///
+    /// Set either at boot (`start()` → the `ROOTFS_MOUNT_TAG` share) or by a
+    /// post-start `deliver_namespace` (#742). `exec_sync` reads this to tell the
+    /// kata-agent which virtio-fs share to mount, by tag, as the container
+    /// rootfs. Returns an owned clone so the lock is not held across the caller's
+    /// `.await`s.
+    pub fn rootfs_mount_tag(&self) -> Option<String> {
+        self.rootfs_mount_tag.lock().clone()
+    }
+
+    /// Record the container rootfs virtio-fs mount tag through the shared
+    /// (`Arc`) handle.
+    ///
+    /// Called from both the boot path and — the point of #742 — the post-start
+    /// `deliver_namespace` path, which composes+attaches the tenant VFS after
+    /// the handle is already `Arc`-shared and so cannot take `&mut`. A later
+    /// `exec_sync` then mounts the delivered share as the container rootfs.
+    /// Last write wins (a re-delivery replaces the prior tag).
+    pub fn record_rootfs_mount_tag(&self, tag: String) {
+        *self.rootfs_mount_tag.lock() = Some(tag);
+    }
+}
+
 impl std::fmt::Debug for KataHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KataHandle")
@@ -86,7 +122,7 @@ impl std::fmt::Debug for KataHandle {
             .field("virtiofs_socket", &self.virtiofs_socket)
             .field("vfs_socket", &self.vfs_server.as_ref().map(SandboxFsServer::socket_path))
             .field("vfs_9p_socket", &self.vfs_9p.as_ref().map(Vfs9pVsockServer::socket_path))
-            .field("rootfs_mount_tag", &self.rootfs_mount_tag)
+            .field("rootfs_mount_tag", &self.rootfs_mount_tag())
             .finish_non_exhaustive()
     }
 }
@@ -595,7 +631,7 @@ impl SandboxBackend for KataBackend {
             virtiofs_socket: virtiofs_sock,
             vfs_server,
             vfs_9p,
-            rootfs_mount_tag,
+            rootfs_mount_tag: parking_lot::Mutex::new(rootfs_mount_tag),
             agent: tokio::sync::Mutex::new(None),
         });
 
@@ -681,7 +717,7 @@ impl SandboxBackend for KataBackend {
                     vfs_9p: None,
                     // Fresh compose+attach on next start re-establishes the tag;
                     // the old container (and its rootfs mount) is torn down.
-                    rootfs_mount_tag: None,
+                    rootfs_mount_tag: parking_lot::Mutex::new(None),
                     // A reused (warm-pool) sandbox keeps the same VM, but the
                     // container(s) inside it are torn down — drop any cached
                     // agent connection so the next `exec_sync` reconnects
@@ -747,13 +783,16 @@ impl SandboxBackend for KataBackend {
             if let Some(kata) = handle.as_any().downcast_ref::<KataHandle>() {
                 Self::attach_share_fs(&kata.hypervisor, &sandbox.id, server.socket_path(), &mount_tag)
                     .await?;
-                // TODO(#721): a namespace delivered here becomes visible over
-                // virtio-fs but is NOT recorded as the container rootfs tag on
-                // the (already-constructed, shared) `KataHandle`, so a later
-                // `exec_sync` won't mount it as rootfs. The boot-time rootfs
-                // path (`start()` → `rootfs_mount_tag`) is what #721 wires;
-                // making a post-start delivered namespace the container rootfs
-                // needs interior mutability on the handle (or a re-create RPC).
+                // #742: record the delivered share's tag as the container
+                // rootfs tag on the (already-`Arc`-shared) `KataHandle` via
+                // interior mutability. The delivered namespace is the fully
+                // composed tenant VFS (rootfs + injected mounts — see the
+                // `deliver_namespace` trait contract), so a later `exec_sync`
+                // passes this tag to the kata-agent's `CreateContainer` and the
+                // guest mounts it, by tag, as the container's rootfs — exactly
+                // as the boot-time `start()` path does. Last write wins, so a
+                // re-delivery re-roots the container on the new share.
+                kata.record_rootfs_mount_tag(mount_tag.clone());
             }
         }
 
@@ -802,12 +841,9 @@ impl SandboxBackend for KataBackend {
         // mount that virtio-fs share, by tag, as the container's rootfs — so
         // `CreateContainer` finds a real rootfs at `<CONTAINER_BASE>/<cid>/rootfs`
         // (the tenant VFS) instead of failing `No such file or directory`.
-        let rootfs = kata
-            .rootfs_mount_tag
-            .as_ref()
-            .map(|tag| ContainerRootfs {
-                virtiofs_mount_tag: tag.clone(),
-            });
+        let rootfs = kata.rootfs_mount_tag().map(|tag| ContainerRootfs {
+            virtiofs_mount_tag: tag,
+        });
 
         match client
             .exec(
@@ -1257,7 +1293,7 @@ mod tests {
             virtiofs_socket: Some(sandbox_path.join("virtiofs.sock")),
             vfs_server: None,
             vfs_9p: None,
-            rootfs_mount_tag: None,
+            rootfs_mount_tag: parking_lot::Mutex::new(None),
             agent: tokio::sync::Mutex::new(None),
         })
     }
@@ -1344,6 +1380,35 @@ mod tests {
             }
             other => panic!("expected VirtioFs delivery, got: {other:?}"),
         }
+    }
+
+    /// #742: the container rootfs mount tag is recorded and read back through
+    /// the interior-mutable `rootfs_mount_tag` field — including through a
+    /// *shared* (`Arc`, no `&mut`) handle, which is exactly the constraint the
+    /// post-start `deliver_namespace` path faces. A fresh handle reads `None`;
+    /// after `record_rootfs_mount_tag` (the write `deliver_namespace` performs),
+    /// `rootfs_mount_tag()` (the read `exec_sync` performs) observes the tag,
+    /// and a later re-record replaces it (last write wins).
+    #[test]
+    fn test_rootfs_mount_tag_recorded_through_shared_handle() {
+        let temp = TempDir::new().unwrap();
+        let handle = create_test_handle(temp.path());
+
+        // Boot with no tenant VFS → no rootfs tag; `exec_sync` would send no
+        // rootfs storage.
+        assert_eq!(handle.rootfs_mount_tag(), None);
+
+        // Record through a *shared* clone — no `&mut` available, mirroring
+        // `deliver_namespace` recording on the already-`Arc`-shared handle.
+        let shared = Arc::clone(&handle);
+        shared.record_rootfs_mount_tag(ROOTFS_MOUNT_TAG.to_owned());
+
+        // The original `Arc` (what `exec_sync` reads) sees the delivered tag.
+        assert_eq!(handle.rootfs_mount_tag().as_deref(), Some(ROOTFS_MOUNT_TAG));
+
+        // Re-delivery re-roots the container: last write wins.
+        handle.record_rootfs_mount_tag("re-delivered-tag".to_owned());
+        assert_eq!(handle.rootfs_mount_tag().as_deref(), Some("re-delivered-tag"));
     }
 
     #[tokio::test]
