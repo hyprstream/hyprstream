@@ -3,6 +3,7 @@ module github.com/hyprstream/hyprstream/workers/hypr9p-guest
 go 1.26
 
 require (
+	github.com/hanwen/go-fuse/v2 v2.8.0
 	github.com/hugelgupf/p9 v0.3.1-0.20240118043522-6f4f11e5296e
 	golang.org/x/sys v0.43.0
 )
