@@ -139,8 +139,8 @@ pub use sandbox_fs::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use wanix_workload::{
-    inject_9p_socket, Injected9pServer, WanixGuestConfig, WanixInjection,
-    ANN_WANIX_COMMAND, ENV_9P_SOCK,
+    import_guest_namespace, inject_9p_socket, ImportedGuestNamespace, Injected9pServer,
+    WanixGuestConfig, WanixInjection, ANN_WANIX_COMMAND, ENV_9P_SOCK, ENV_GUEST_EXPORT_SOCK,
 };
 pub use service::WorkerService;
 // Re-export service infrastructure from hyprstream-rpc for convenience

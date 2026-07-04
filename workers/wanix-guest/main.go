@@ -10,18 +10,37 @@
 //   - root.Register("exec", &native.ExecDriver{}) enables host-process tasks
 //   - root.NS().Bind(hyprfs, ".", ".", BindReplace) makes the remote tree root
 //
+// Bidirectional 9P (#708 phase 2). The above is Direction A: the guest IMPORTS
+// hyprstream's namespace. This binary also serves Direction B, the reverse --
+// the guest EXPORTS its OWN live namespace so the host can import it and bind it
+// into the host VFS namespace (giving the host visibility into the guest's task
+// tree). When HYPRSTREAM_GUEST_EXPORT_SOCK (or --export-sock) is set, after the
+// root is built the guest stands up a second, INDEPENDENT 9P2000.L server --
+//
+//	p9.NewServer(p9kit.Attacher(root.NS()))   served on that Unix socket
+//
+// in its own goroutine, using Wanix's OWN embed (root.NS() is the live vfs.NS,
+// which is an fs.FS) -- no upstream `wanix serve` patch, no bespoke verb. Import
+// and export are two independent 9P sessions over two sockets that share no
+// state beyond the namespace itself (#708).
+//
 // Run modes:
 //
-//	wanix-guest --sock /run/hyprstream/9p.sock [--aname ""] [--cmd "sh"]
+//	wanix-guest --sock /run/hyprstream/9p.sock [--aname ""] [--cmd "sh"] \
+//	            [--export-sock /run/hyprstream/wanix-export.sock]
 //	    Connect to a real hyprstream 9P server, bind it as the namespace root,
 //	    then either run --cmd as a Wanix task (waiting for it to exit) or, when
 //	    no --cmd is given, block serving the namespace until signalled. The
 //	    connection is health-probed; a dropped server triggers reconnect+rebind.
+//	    When --export-sock is given the guest namespace is also served over that
+//	    socket for the host to import (Direction B).
 //
 //	wanix-guest --self-test
 //	    Spin up a throwaway in-process p9kit server over a temp Unix socket,
-//	    bind it as the namespace root, and list "/" -- exercises the full 9P
-//	    attach/walk/read + bind wiring with no external server. Build smoke test.
+//	    bind it as the namespace root, list "/", THEN stand up the Direction-B
+//	    export server on a throwaway socket and read the same namespace back
+//	    through a p9 client -- exercises the full import AND export 9P wiring
+//	    with no external server. Build smoke test.
 //
 // Known semantic gap (see README): native.ExecDriver runs a task's command as a
 // HOST OS process; that process is NOT chrooted/rooted into the mounted 9P tree.
@@ -69,10 +88,11 @@ const (
 )
 
 type config struct {
-	sock     string
-	aname    string
-	cmd      string
-	selfTest bool
+	sock       string
+	aname      string
+	cmd        string
+	exportSock string
+	selfTest   bool
 }
 
 func main() {
@@ -86,6 +106,9 @@ func main() {
 		"9P attach name (empty = default tree)")
 	flag.StringVar(&cfg.cmd, "cmd", "",
 		"command to run as a Wanix task after mounting; empty = serve the namespace")
+	flag.StringVar(&cfg.exportSock, "export-sock", os.Getenv("HYPRSTREAM_GUEST_EXPORT_SOCK"),
+		"path to a Unix socket on which to EXPORT this guest's namespace over 9P for the host to import "+
+			"(Direction B; env: HYPRSTREAM_GUEST_EXPORT_SOCK); empty = no export")
 	flag.BoolVar(&cfg.selfTest, "self-test", false,
 		"run against a throwaway in-process 9P server and exit")
 	flag.Parse()
@@ -137,7 +160,56 @@ func runSelfTest(ctx context.Context) error {
 	for _, e := range entries {
 		fmt.Printf("  %s\tdir=%v\n", e.Name(), e.IsDir())
 	}
+
+	// Direction B (#708 phase 2): stand up the export server on a throwaway
+	// socket and read the SAME namespace back through a p9 client -- exercising
+	// the full serve -> attach -> walk -> readdir path the host uses to import.
+	if err := exportSelfTest(g.root.NS(), entries); err != nil {
+		return err
+	}
+
 	_ = ctx
+	return nil
+}
+
+// exportSelfTest serves ns over a throwaway export socket, dials it with a p9
+// client, and verifies the client sees the same root entries -- the Direction-B
+// (guest exports, host imports) build smoke test.
+func exportSelfTest(ns wfs.FS, want []wfs.DirEntry) error {
+	dir, err := os.MkdirTemp("", "wanix-guest-export-*")
+	if err != nil {
+		return fmt.Errorf("mktemp export dir: %w", err)
+	}
+	defer os.RemoveAll(dir)
+	sockPath := filepath.Join(dir, "export.sock")
+
+	stop, err := serveExport(ns, sockPath)
+	if err != nil {
+		return fmt.Errorf("serve export: %w", err)
+	}
+	defer stop()
+
+	conn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		return fmt.Errorf("dial export socket %q: %w", sockPath, err)
+	}
+	defer conn.Close()
+
+	exported, err := p9kit.ClientFS(conn, "")
+	if err != nil {
+		return fmt.Errorf("p9kit.ClientFS(export): %w", err)
+	}
+	got, err := wfs.ReadDir(exported, ".")
+	if err != nil {
+		return fmt.Errorf("readdir exported namespace over 9P client: %w", err)
+	}
+	if len(got) != len(want) {
+		return fmt.Errorf("exported namespace entry count mismatch: got %d, want %d", len(got), len(want))
+	}
+	fmt.Printf("self-test OK: exported guest namespace over 9P; p9 client read %d entries:\n", len(got))
+	for _, e := range got {
+		fmt.Printf("  %s\tdir=%v\n", e.Name(), e.IsDir())
+	}
 	return nil
 }
 
@@ -155,10 +227,62 @@ func runGuest(ctx context.Context, cfg config) error {
 	}
 	log.Printf("mounted hyprstream 9P (%q, aname=%q) as wanix namespace root", cfg.sock, cfg.aname)
 
+	// Direction B (#708 phase 2): if an export socket is configured, serve THIS
+	// guest's own live namespace over it so the host can import + bind it into
+	// the host VFS namespace. This is a SECOND, independent 9P session -- its own
+	// listener and server, sharing no state with the Direction-A import above
+	// beyond the namespace it reads.
+	if s := strings.TrimSpace(cfg.exportSock); s != "" {
+		stop, err := serveExport(g.root.NS(), s)
+		if err != nil {
+			return fmt.Errorf("start guest namespace export: %w", err)
+		}
+		defer stop()
+		log.Printf("exporting guest namespace over 9P at %q (host imports this)", s)
+	}
+
 	if strings.TrimSpace(cfg.cmd) != "" {
 		return g.runTask(ctx, cfg.cmd)
 	}
 	return g.serve(ctx)
+}
+
+// serveExport stands up a 9P2000.L server (progrium/p9) exporting ns on a Unix
+// socket at sockPath -- Direction B of the bidirectional 9P (#708 phase 2): the
+// guest serves its OWN live namespace so hyprstream (the host) can import it via
+// its socket 9P client Mount (phase 1) and bind it into the host VFS namespace.
+//
+// This is INDEPENDENT of the Direction-A import session: a separate listener, a
+// separate 9P session, no shared state beyond the namespace it reads. The
+// listener is bound synchronously (so the socket file exists on return -- the
+// host's import dial never races the server coming up); the accept loop runs in
+// a goroutine until the returned stop func closes the listener.
+func serveExport(ns wfs.FS, sockPath string) (func(), error) {
+	// Remove any stale socket from a crashed predecessor (Listen would EADDRINUSE).
+	if err := os.Remove(sockPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("remove stale export socket %q: %w", sockPath, err)
+	}
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		return nil, fmt.Errorf("listen export socket %q: %w", sockPath, err)
+	}
+
+	srv := p9.NewServer(p9kit.Attacher(ns))
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Serve blocks until the listener is closed (stop), at which point Accept
+		// fails with a closing error and Serve returns nil.
+		if err := srv.Serve(ln); err != nil {
+			log.Printf("export 9P server exited with error: %v", err)
+		}
+	}()
+
+	stop := func() {
+		ln.Close()
+		<-done
+	}
+	return stop, nil
 }
 
 // guest owns the Wanix root Task and the live connection to the remote 9P
