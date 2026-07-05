@@ -23,7 +23,8 @@ const (
 	attrMounter       = "mounter"
 	attrCarrier       = "carrier"
 	attrEndpoint      = "endpoint"
-	attrServiceToken  = "csi.storage.k8s.io/serviceAccount.token"
+	attrTicket        = "ticket"
+	attrServiceTokens = "csi.storage.k8s.io/serviceAccount.tokens"
 )
 
 type mountTicketRequest struct {
@@ -38,6 +39,11 @@ type mountTicketResponse struct {
 	ExpiresIn  int64  `json:"expires_in"`
 	Audience   string `json:"audience"`
 	Capability string `json:"capability"`
+}
+
+type serviceAccountToken struct {
+	Token               string `json:"token"`
+	ExpirationTimestamp string `json:"expirationTimestamp"`
 }
 
 type mountPlan struct {
@@ -62,6 +68,9 @@ func buildMountPlan(cfg config, req *csi.NodePublishVolumeRequest) (mountPlan, e
 		return mountPlan{}, errors.New("target_path is required")
 	}
 	attrs := req.GetVolumeContext()
+	if attrs[attrTicket] != "" {
+		return mountPlan{}, errors.New("ticket volume attribute is forbidden; CSI must mint mount tickets at NodePublishVolume")
+	}
 	namespacePath := firstNonEmpty(attrs[attrNamespacePath], cfgValue(cfgDefaultNamespacePath(), "/"))
 	plane := firstNonEmpty(attrs[attrPlane], cfg.defaultPlane)
 	mounter := strings.ToLower(firstNonEmpty(attrs[attrMounter], cfg.defaultMounter))
@@ -73,7 +82,11 @@ func buildMountPlan(cfg config, req *csi.NodePublishVolumeRequest) (mountPlan, e
 	if namespacePath == "" || !strings.HasPrefix(namespacePath, "/") {
 		return mountPlan{}, fmt.Errorf("namespacePath must be absolute, got %q", namespacePath)
 	}
-	ticket, err := requestMountTicket(context.Background(), cfg.mountTicketURL, attrs[attrServiceToken], plane, namespacePath)
+	bearer, err := serviceAccountBearer(req, cfg.oauthAudience)
+	if err != nil {
+		return mountPlan{}, err
+	}
+	ticket, err := requestMountTicket(context.Background(), cfg.mountTicketURL, bearer, plane, namespacePath)
 	if err != nil {
 		return mountPlan{}, err
 	}
@@ -93,6 +106,28 @@ func buildMountPlan(cfg config, req *csi.NodePublishVolumeRequest) (mountPlan, e
 		plan.KernelBridge = cfg.bridgeListen
 	}
 	return plan, nil
+}
+
+func serviceAccountBearer(req *csi.NodePublishVolumeRequest, audience string) (string, error) {
+	raw := firstNonEmpty(req.GetSecrets()[attrServiceTokens], req.GetVolumeContext()[attrServiceTokens])
+	if raw == "" {
+		return "", fmt.Errorf("%s is required for NodePublishVolume ticket minting", attrServiceTokens)
+	}
+	var tokens map[string]serviceAccountToken
+	if err := json.Unmarshal([]byte(raw), &tokens); err != nil {
+		return "", fmt.Errorf("parse %s: %w", attrServiceTokens, err)
+	}
+	entry, ok := tokens[audience]
+	if !ok && audience == "" {
+		entry, ok = tokens[""]
+	}
+	if !ok {
+		return "", fmt.Errorf("service account token for audience %q not found", audience)
+	}
+	if entry.Token == "" {
+		return "", fmt.Errorf("service account token for audience %q is empty", audience)
+	}
+	return entry.Token, nil
 }
 
 func cfgDefaultNamespacePath() string { return "/" }

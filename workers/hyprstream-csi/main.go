@@ -24,6 +24,7 @@ type config struct {
 	nodeID            string
 	defaultMounter    string
 	defaultPlane      string
+	oauthAudience     string
 	mountTicketURL    string
 	transportCarrier  string
 	transportEndpoint string
@@ -45,6 +46,7 @@ func main() {
 	flag.StringVar(&cfg.nodeID, "node-id", os.Getenv("NODE_NAME"), "Kubernetes node name")
 	flag.StringVar(&cfg.defaultMounter, "default-mounter", "fuse", "default mounter: fuse or kernel")
 	flag.StringVar(&cfg.defaultPlane, "default-plane", "webtransport", "default mount-ticket plane")
+	flag.StringVar(&cfg.oauthAudience, "oauth-audience", "hyprstream-9p", "audience key for CSI service account tokenRequests")
 	flag.StringVar(&cfg.mountTicketURL, "mount-ticket-url", "http://hyprstream-oauth:6791/oauth/mount-ticket", "hyprstream /oauth/mount-ticket endpoint")
 	flag.StringVar(&cfg.transportCarrier, "transport-carrier", "webtransport", "dial-time carrier")
 	flag.StringVar(&cfg.transportEndpoint, "transport-endpoint", "", "carrier endpoint")

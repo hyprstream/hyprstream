@@ -28,6 +28,7 @@ func TestBuildMountPlanFuseRequestsScopedTicket(t *testing.T) {
 	plan, err := buildMountPlan(config{
 		defaultMounter:    "fuse",
 		defaultPlane:      "webtransport",
+		oauthAudience:     "hyprstream-9p",
 		mountTicketURL:    srv.URL,
 		transportCarrier:  "webtransport",
 		transportEndpoint: "https://hyprstream-streams:7011/9p",
@@ -36,7 +37,7 @@ func TestBuildMountPlanFuseRequestsScopedTicket(t *testing.T) {
 		TargetPath: "/var/lib/kubelet/pods/p/volumes/kubernetes.io~csi/v/mount",
 		VolumeContext: map[string]string{
 			attrNamespacePath: "/tenant/a",
-			attrServiceToken:  "pod-token",
+			attrServiceTokens: `{"hyprstream-9p":{"token":"pod-token","expirationTimestamp":"2026-07-05T19:00:00Z"}}`,
 		},
 	})
 	if err != nil {
@@ -59,6 +60,7 @@ func TestBuildMountPlanKernelUsesBridge(t *testing.T) {
 	plan, err := buildMountPlan(config{
 		defaultMounter:    "fuse",
 		defaultPlane:      "webtransport",
+		oauthAudience:     "hyprstream-9p",
 		mountTicketURL:    srv.URL,
 		transportCarrier:  "webtransport",
 		transportEndpoint: "https://node.local/9p",
@@ -70,12 +72,45 @@ func TestBuildMountPlanKernelUsesBridge(t *testing.T) {
 			attrNamespacePath: "/tenant/k",
 			attrMounter:       "kernel",
 		},
+		Secrets: map[string]string{
+			attrServiceTokens: `{"hyprstream-9p":{"token":"pod-token","expirationTimestamp":"2026-07-05T19:00:00Z"}}`,
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if plan.Mounter != "kernel" || plan.KernelBridge != "127.0.0.1:0" || plan.Ticket != "ticket-k" {
 		t.Fatalf("plan = %+v", plan)
+	}
+}
+
+func TestBuildMountPlanRejectsPlaintextTicketAttribute(t *testing.T) {
+	_, err := buildMountPlan(config{mountTicketURL: "http://127.0.0.1"}, &csi.NodePublishVolumeRequest{
+		VolumeId:   "vol",
+		TargetPath: "/mnt/x",
+		VolumeContext: map[string]string{
+			attrNamespacePath: "/tenant/a",
+			attrTicket:        "ticket-in-etcd",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected plaintext ticket rejection")
+	}
+}
+
+func TestBuildMountPlanRequiresProjectedServiceAccountToken(t *testing.T) {
+	_, err := buildMountPlan(config{
+		oauthAudience:  "hyprstream-9p",
+		mountTicketURL: "http://127.0.0.1",
+	}, &csi.NodePublishVolumeRequest{
+		VolumeId:   "vol",
+		TargetPath: "/mnt/x",
+		VolumeContext: map[string]string{
+			attrNamespacePath: "/tenant/a",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected service account token requirement")
 	}
 }
 

@@ -107,6 +107,7 @@ spec:
             - --driver-name={{ .Values.csi.driverName }}
             - --default-mounter={{ .Values.csi.defaultMounter }}
             - --default-plane={{ .Values.csi.defaultPlane }}
+            - --oauth-audience={{ .Values.csi.oauth.audience }}
             - --mount-ticket-url={{ .Values.csi.oauth.mountTicketUrl }}
             - --transport-carrier={{ .Values.csi.transport.carrier }}
             - --transport-endpoint={{ .Values.csi.transport.endpoint }}
