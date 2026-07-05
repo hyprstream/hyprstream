@@ -1,0 +1,31 @@
+[package]
+name = "hyprstream-k8s"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/hyprstream/hyprstream"
+description = "Kubernetes CRD schemas for hyprstream resources under *.hyprstream.io (Model, Adapter, TrainingRun, InferenceService, TenantBinding)"
+
+[lib]
+name = "hyprstream_k8s"
+path = "src/lib.rs"
+
+[features]
+# CRD *type* definitions + YAML emission compile with no features and no cluster.
+default = []
+# `k8s` gates anything that needs a live client / controller-runtime.
+k8s = ["kube/client", "kube/runtime", "kube/rustls-tls"]
+
+[dependencies]
+# `derive` gives the CustomResource derive + CustomResourceExt (kube-core, no client).
+# `cel` gives client-side CEL validation (kube-core, no client) so `validate_cel()`
+# and `x-kubernetes-validations` emission work offline in tests.
+kube = { version = "4.0", default-features = false, features = ["derive", "cel"] }
+k8s-openapi = { version = "0.28", features = ["v1_32"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+schemars = "1"
+
+[lints]
+workspace = true
