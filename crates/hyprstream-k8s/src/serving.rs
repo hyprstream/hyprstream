@@ -16,10 +16,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 pub enum Statefulness {
     /// Stateless inference; replicas are freely interchangeable.
-    #[default]
     Stateless,
     /// Test-Time-Training-stateful: replicas hold per-tenant LoRA deltas, so
     /// scaling/routing must be TTT-aware (session affinity, drain-before-scale).
+    #[default]
     TttStateful,
 }
 
@@ -88,6 +88,10 @@ pub struct InferenceServiceStatus {
     /// Externally reachable URL, once serving.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+
+    /// Human-readable reconcile outcome or reason for the current phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 
     /// `metadata.generation` last reconciled.
     #[serde(default, skip_serializing_if = "Option::is_none")]

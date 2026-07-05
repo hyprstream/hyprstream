@@ -58,7 +58,7 @@ spec:
                   promoted ref).
                 type: string
               statefulness:
-                default: Stateless
+                default: TttStateful
                 description: Statefulness class driving autoscaling behaviour.
                 enum:
                 - Stateless
@@ -73,6 +73,10 @@ spec:
               operator.
             nullable: true
             properties:
+              message:
+                description: Human-readable reconcile outcome or reason for the current phase.
+                nullable: true
+                type: string
               observedGeneration:
                 description: '`metadata.generation` last reconciled.'
                 format: int64

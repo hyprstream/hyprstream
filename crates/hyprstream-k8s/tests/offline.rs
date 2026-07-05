@@ -208,6 +208,22 @@ fn inference_service_cel_enforces_replica_bounds() {
 }
 
 #[test]
+fn inference_service_defaults_to_ttt_stateful_and_exposes_status_message() {
+    let spec = InferenceServiceSpec {
+        model: "m:main".into(),
+        min_replicas: 1,
+        max_replicas: 1,
+        statefulness: Statefulness::default(),
+    };
+    assert_eq!(spec.statefulness, Statefulness::TttStateful);
+
+    let crd = serde_json::to_value(InferenceService::crd()).unwrap();
+    let status_properties = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+        ["status"]["properties"];
+    assert!(status_properties["message"].is_object());
+}
+
+#[test]
 fn tenant_binding_cel_validates_namespace_and_tenant() {
     let bad_ns = TenantBinding::new(
         "tb",
