@@ -224,18 +224,43 @@ pub fn bond_entropy(matrix: &Tensor) -> (f64, usize) {
     (entropy_of_nonneg(&s_sq), num_sv)
 }
 
+/// Calibration cutoffs for [`entropy_to_rank`], hand-fitted to the Qwen3.5-0.8B
+/// ablation results. They are NOT validated for any other model, and the
+/// mapping's premise — lower normalized spectral entropy means the layer needs
+/// more adaptation rank — is itself unproven (there are credible arguments for
+/// the opposite sign). The hard step at each cutoff is an artifact of the hand
+/// fit, not a property of the data. A continuous, data-calibrated mapping is
+/// planned once the rank-proxy validation spike has ground truth to fit
+/// against; until then, do not tune these per-model — unrecognized models are
+/// protected by [`UNVALIDATED_RANK_CAP`] instead.
+const ENTROPY_CUTOFF_RANK_32: f64 = 0.80;
+const ENTROPY_CUTOFF_RANK_16: f64 = 0.85;
+const ENTROPY_CUTOFF_RANK_8: f64 = 0.92;
+
+/// Rank ceiling for any profile derived without ablation ground truth
+/// (computed Tier-3 profiles and cached copies of them). Matches the uniform
+/// fallback rank on purpose: without validation, a spectral-entropy rank is
+/// not trusted to claim more capacity than the uninformed default. The
+/// runtime-correction loop may still shrink the utilized rank below this.
+const UNVALIDATED_RANK_CAP: usize = 8;
+
+/// Normalized entropy assumed for a layer whose projections could not be
+/// analyzed (no matching weight keys): treated as near-uniform, which maps to
+/// the minimum band.
+const UNANALYZED_LAYER_ENTROPY: f64 = 0.95;
+
 /// Map normalized entropy [0,1] to LoRA rank.
-/// Lower normalized entropy → more structured → higher rank.
+/// Lower normalized entropy → more structured → higher rank (assumed sign —
+/// see the cutoff constants above).
 ///
-/// Calibrated approximately against Qwen3.5-0.8B ablation data.
 /// Note: Tier 3 ranks are approximate — embedded profiles (Tier 1) use
 /// ablation-derived perplexity delta as the gold standard.
 fn entropy_to_rank(normalized: f64) -> usize {
     match normalized {
-        x if x < 0.80 => 32, // Very structured (critical layers)
-        x if x < 0.85 => 16, // Moderate structure
-        x if x < 0.92 => 8,  // Low structure
-        _ => 4,               // Near-uniform
+        x if x < ENTROPY_CUTOFF_RANK_32 => 32, // Very structured (critical layers)
+        x if x < ENTROPY_CUTOFF_RANK_16 => 16, // Moderate structure
+        x if x < ENTROPY_CUTOFF_RANK_8 => 8,   // Low structure
+        _ => 4,                                 // Near-uniform
     }
 }
 
@@ -336,13 +361,12 @@ pub fn compute_weight_entropy_profile(
         let avg_normalized = if entropy_count > 0 {
             entropy_normalized_sum / entropy_count as f64
         } else {
-            0.95 // Default: near-uniform → low rank
+            UNANALYZED_LAYER_ENTROPY
         };
 
-        // Conservative cap: Tier 3 entropy-based ranks are unvalidated for models outside
-        // the embedded profile registry. Cap at 8 (uniform fallback) until ablation
-        // results land (#202). The runtime-correction loop raises utilised rank over time.
-        let recommended_rank = entropy_to_rank(avg_normalized).min(8);
+        // Tier 3 entropy-based ranks are unvalidated for models outside the
+        // embedded profile registry — cap them (see UNVALIDATED_RANK_CAP).
+        let recommended_rank = entropy_to_rank(avg_normalized).min(UNVALIDATED_RANK_CAP);
 
         // Target modules: default ["q_proj", "v_proj"] for standard (R2-I4 fix)
         let target_modules = match layer_type {
@@ -398,7 +422,7 @@ fn uniform_fallback_profile(config: &ModelConfig) -> LayerProfile {
             layer_type: LayerType::StandardAttention,
             bond_entropy: HashMap::new(),
             perplexity_delta: None,
-            recommended_rank: 8, // uniform default
+            recommended_rank: UNVALIDATED_RANK_CAP, // uninformed uniform default
             target_modules: vec!["o_proj".to_owned()],
         })
         .collect();
