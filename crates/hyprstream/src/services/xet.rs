@@ -19,8 +19,8 @@
 //! RPC control channel (health/shutdown) registered via `Spawnable`. It is a
 //! **thin translator** over the authenticated core — it dials the `registry`
 //! service (reusing the authenticated `putBlob`/`getBlob` RPCs) and holds no
-//! standing CAS *write* authority of its own. Reads for `/get_xorb` come from the
-//! shared `cas_serve::CasStore` (the same store the registry's `getBlob` uses).
+//! standing CAS *write* authority of its own. Reads for `/get_xorb` go through
+//! the Subject-threaded CAS mount, not a bare store read.
 //!
 //! # Auth
 //!
@@ -30,37 +30,36 @@
 //! service uses. The mapped identity (`sub`) is attached as
 //! [`AuthenticatedUser`] for downstream authorization.
 //!
-//! ## Known authorization gap (foundation-level) — TODO(#654)
+//! ## Known provenance gap (foundation-level)
 //!
 //! The HF `/get_xorb/{hash}/` route carries a *xorb hash* and **no `grantRepo`**,
 //! so it cannot be mapped onto the registry's `getBlob` (which is file-merkle +
 //! `grantRepo` and enforces per-repo entitlement — "the hash is not a
-//! capability"). This foundation therefore serves xorb bytes to any
-//! *authenticated* caller but does **not** yet enforce the per-repo grant that
-//! `getBlob` does. A follow-up must add a xorb→repo provenance reverse-index (or
-//! an equivalent grant context) so xorb fetches are authorized, not merely
-//! authenticated. Until then keep this surface disabled in untrusted multi-tenant
-//! deployments (`[xet] enabled = false` by default).
+//! capability"). #813 moves this route behind the Subject-threaded CAS mount so
+//! the policy boundary is the same `Mount` surface used by namespaces. The
+//! remaining work is attaching repo/compartment provenance labels to xorb objects
+//! so the mount can make a full AVC decision instead of the current authenticated
+//! floor.
 
 use crate::config::{TlsConfig, XetConfig};
-use crate::server::tls::{resolve_rustls_config, serve_app};
 use crate::server::AuthenticatedUser;
+use crate::server::tls::{resolve_rustls_config, serve_app};
 use crate::services::RegistryClient;
+use crate::storage::cas::{AllowAllCasAuthorizer, CasMount, CasSubstrate, DedupDomain};
 use anyhow::Result;
 use axum::{
+    Router,
     extract::{Path, Request, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Router,
 };
-use crate::storage::cas::{CasError, CasSubstrate, DedupDomain};
-use cas_serve::StoreError;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::SocketKind;
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_service::Spawnable;
+use hyprstream_vfs::{Mount, MountError, OREAD};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -73,8 +72,8 @@ pub const SERVICE_NAME: &str = "xet";
 #[derive(Clone)]
 pub struct XetState {
     /// L1 CAS substrate backing `/get_xorb` reads (shared with the registry's
-    /// `getBlob` reconstruction path, #812). Reads use the default (untenanted,
-    /// BLAKE3, local) dedup domain.
+    /// `getBlob` reconstruction path, #812). HTTP reads go through `CasMount`
+    /// so the authenticated Subject reaches the VFS policy boundary (#813).
     pub store: CasSubstrate,
     /// Authenticated registry client — the write path (`/v1/xorbs`, `/v1/shards`)
     /// must translate through its `putBlob` RPC rather than writing directly.
@@ -207,23 +206,24 @@ async fn get_xorb_handler(
     State(state): State<XetState>,
     Path(hash): Path<String>,
     headers: HeaderMap,
+    axum::extract::Extension(user): axum::extract::Extension<AuthenticatedUser>,
 ) -> Response {
-    let bytes = match state
-        .store
-        .read_xorb(&DedupDomain::local_default(), &hash)
-        .await
-    {
+    let subject = Subject::new(user.user);
+    let mount = CasMount::with_authorizer(
+        state.store.clone(),
+        DedupDomain::local_default(),
+        AllowAllCasAuthorizer,
+    );
+    let mut fid = match mount.walk(&["xorb", hash.as_str()], &subject).await {
+        Ok(fid) => fid,
+        Err(e) => return mount_error_response(e, "get_xorb: mount walk failed"),
+    };
+    if let Err(e) = mount.open(&mut fid, OREAD, &subject).await {
+        return mount_error_response(e, "get_xorb: mount open failed");
+    }
+    let bytes = match mount.read(&fid, 0, u32::MAX, &subject).await {
         Ok(b) => b,
-        Err(CasError::Store(StoreError::NotFound(_))) => {
-            return (StatusCode::NOT_FOUND, "xorb not found").into_response()
-        }
-        Err(CasError::Store(StoreError::InvalidHash(_))) => {
-            return (StatusCode::BAD_REQUEST, "invalid xorb hash").into_response()
-        }
-        Err(e) => {
-            warn!(error = %e, "get_xorb: store read failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response();
-        }
+        Err(e) => return mount_error_response(e, "get_xorb: mount read failed"),
     };
 
     match parse_range(headers.get(header::RANGE), bytes.len() as u64) {
@@ -257,6 +257,20 @@ async fn get_xorb_handler(
             "range not satisfiable",
         )
             .into_response(),
+    }
+}
+
+fn mount_error_response(err: MountError, log_message: &str) -> Response {
+    match err {
+        MountError::NotFound(_) => (StatusCode::NOT_FOUND, "xorb not found").into_response(),
+        MountError::InvalidArgument(_) => {
+            (StatusCode::BAD_REQUEST, "invalid xorb hash").into_response()
+        }
+        MountError::PermissionDenied(_) => (StatusCode::FORBIDDEN, "forbidden").into_response(),
+        other => {
+            warn!(error = %other, "{log_message}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "store error").into_response()
+        }
     }
 }
 
@@ -467,6 +481,11 @@ mod tests {
             State(state),
             Path(HASH.to_owned()),
             HeaderMap::new(),
+            axum::extract::Extension(AuthenticatedUser {
+                user: "alice".to_owned(),
+                token: None,
+                exp: None,
+            }),
         )
         .await;
 
@@ -485,7 +504,17 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert(header::RANGE, "bytes=2-5".parse().unwrap());
-        let resp = get_xorb_handler(State(state), Path(HASH.to_owned()), headers).await;
+        let resp = get_xorb_handler(
+            State(state),
+            Path(HASH.to_owned()),
+            headers,
+            axum::extract::Extension(AuthenticatedUser {
+                user: "alice".to_owned(),
+                token: None,
+                exp: None,
+            }),
+        )
+        .await;
 
         assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)

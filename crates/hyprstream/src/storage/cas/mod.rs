@@ -45,10 +45,15 @@
 
 mod domain;
 mod manifest;
+mod mount;
 mod substrate;
 
 pub use domain::{DedupDomain, TrustBoundary};
-pub use manifest::{cid_from_merkle, merkle_from_address, BlobManifest, FILE_RECONSTRUCTION_CODEC};
+pub use manifest::{BlobManifest, FILE_RECONSTRUCTION_CODEC, cid_from_merkle, merkle_from_address};
+pub use mount::{
+    AllowAllCasAuthorizer, CasMount, CasMountAuthorizer, CasMountAuthzRequest, CasMountObjectKind,
+    DenyAllCasAuthorizer,
+};
 pub use substrate::CasSubstrate;
 
 /// Errors from the L1 CAS substrate.
