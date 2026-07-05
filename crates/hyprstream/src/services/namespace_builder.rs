@@ -16,6 +16,15 @@
 //! This is a pure assembly layer: it does not change any Subject/MAC
 //! scoping semantics of the individual mounts (`RemoteModelMount`,
 //! `RemoteRegistryMount`, `TclMount`) it wires together.
+//!
+//! Per epic #809's mount-point convention ("a mount point is a per-namespace
+//! binding decision... the server never dictates the path"), this builder
+//! does not itself choose where anything lands in the tree — every mount
+//! path below is a required field on [`StandardNamespaceConfig`] that the
+//! caller must supply. The CLI shell and TUI ChatApp callers both currently
+//! pass the same literal paths (`/srv/model`, `/srv/registry`, `/worktree`,
+//! `/bin`, `/env`, `/lang/tcl`), but that's a coincidence of current
+//! behavior, not something this module bakes in.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,21 +41,43 @@ use super::RegistryClient;
 /// Inputs that legitimately differ between the CLI shell and TUI ChatApp
 /// call sites. Everything else about the recipe is fixed by
 /// [`build_standard_namespace`].
+///
+/// The mount-point paths are required fields, not defaults this builder
+/// invents (epic #809) — every caller states its own paths explicitly, even
+/// when they happen to match another caller's.
 pub struct StandardNamespaceConfig {
     /// Subject the `/lang/tcl` driver operates as (the caller separately
     /// keeps its own copy of the `Subject` for VFS proxy / RPC use — this
     /// builder only consumes it for `TclMount::spawn`).
     pub subject: Subject,
-    /// Already-constructed model service RPC client, mounted at
-    /// `/srv/model`.
+    /// Already-constructed model service RPC client.
     pub model_client: ModelClient,
-    /// Registry service RPC client. When `Some`, mounts `/srv/registry`
-    /// (+ a `/worktree` alias, `BindFlag::After`, same backing mount).
+    /// Registry service RPC client. When `Some`, mounts `registry_path`
+    /// (+ a `worktree_path` alias, `BindFlag::After`, same backing mount).
     /// The CLI shell always has a registry client available; the TUI
     /// ChatApp namespace builder currently does not obtain one and passes
     /// `None` — this was already the pre-#634 behavior of each builder, now
     /// made an explicit parameter rather than silently unified.
     pub registry: Option<RegistryClient>,
+    /// Path at which `model_client`'s 9P filesystem is mounted (caller
+    /// convention today: `/srv/model`).
+    pub model_path: String,
+    /// Path at which `registry`'s worktree filesystem is mounted, when
+    /// `registry` is `Some` (caller convention today: `/srv/registry`).
+    pub registry_path: String,
+    /// Alias path bound (`BindFlag::After`) to the same backing mount as
+    /// `registry_path`, when `registry` is `Some` (caller convention today:
+    /// `/worktree`).
+    pub worktree_path: String,
+    /// Path for the static `/bin`-style command listing + discovered `.tcl`
+    /// tool scripts (caller convention today: `/bin`).
+    pub bin_path: String,
+    /// Path for the session-variable file tree (caller convention today:
+    /// `/env`).
+    pub env_path: String,
+    /// Path at which the Tcl shell driver is mounted (caller convention
+    /// today: `/lang/tcl`).
+    pub tcl_path: String,
 }
 
 /// Compose the standard VFS namespace shared by the CLI shell and TUI
@@ -60,22 +91,28 @@ pub fn build_standard_namespace(cfg: StandardNamespaceConfig) -> Namespace {
         subject,
         model_client,
         registry,
+        model_path,
+        registry_path,
+        worktree_path,
+        bin_path,
+        env_path,
+        tcl_path,
     } = cfg;
 
     let mut ns = Namespace::new();
 
     // Mount the model service's 9P filesystem via RPC proxy.
     // RemoteModelMount translates sync Mount trait calls to async ModelClient
-    // RPC requests, so `/srv/model/{model_ref}/status` etc. are served by the
-    // model service's SyntheticTree on the other end of the RPC channel.
+    // RPC requests, so `{model_path}/{model_ref}/status` etc. are served by
+    // the model service's SyntheticTree on the other end of the RPC channel.
     let remote_model_mount = RemoteModelMount::new(model_client);
-    let _ = ns.mount("/srv/model", Arc::new(remote_model_mount));
+    let _ = ns.mount(&model_path, Arc::new(remote_model_mount));
 
     // Mount the registry service's worktree filesystem via RPC proxy, when a
     // registry client is available. RemoteRegistryMount is the registry
     // analogue of RemoteModelMount: it proxies 9P operations to the registry
     // service's `WorktreeClient` (real qids, real filesystem). 2-level scope:
-    //   /srv/registry/{repo_name}/{worktree_name}/<...rest...>
+    //   {registry_path}/{repo_name}/{worktree_name}/<...rest...>
     // Per #389 + #391 (Option 1, shared content model): the namespace mirrors
     // the browser namespace's `/srv/registry` mount, both backed at the
     // hyprstream spine. See `STANDARD_NAMESPACE_PATHS` in hyprstream-vfs for
@@ -83,12 +120,11 @@ pub fn build_standard_namespace(cfg: StandardNamespaceConfig) -> Namespace {
     if let Some(registry) = registry {
         let remote_registry_mount = RemoteRegistryMount::new(registry);
         let registry_mount: Arc<RemoteRegistryMount> = Arc::new(remote_registry_mount);
-        let _ = ns.mount("/srv/registry", registry_mount.clone());
-        // `/worktree` is an alias for `/srv/registry` — same backing mount,
-        // exposed under the short path for ergonomic worktree access. Both
-        // `/worktree/{repo}/{wt}` and `/srv/registry/{repo}/{wt}` resolve to
-        // the same worktree content.
-        let _ = ns.bind_mount("/worktree", registry_mount, hyprstream_vfs::BindFlag::After);
+        let _ = ns.mount(&registry_path, registry_mount.clone());
+        // `worktree_path` is an alias for `registry_path` — same backing
+        // mount, exposed under a separate path for ergonomic worktree
+        // access. Both resolve to the same worktree content.
+        let _ = ns.bind_mount(&worktree_path, registry_mount, hyprstream_vfs::BindFlag::After);
     }
 
     // /bin/ — static directory entries for listing purposes.
@@ -130,9 +166,9 @@ pub fn build_standard_namespace(cfg: StandardNamespaceConfig) -> Namespace {
 
         SyntheticTree::new(SyntheticNode::Dir { children })
     };
-    let _ = ns.mount("/bin", Arc::new(bin_tree));
+    let _ = ns.mount(&bin_path, Arc::new(bin_tree));
 
-    // Discover .tcl tool scripts and bind them into /bin/ (After = fallback).
+    // Discover .tcl tool scripts and bind them into bin_path (After = fallback).
     let tools_dir = std::env::var("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".config"))
@@ -140,7 +176,7 @@ pub fn build_standard_namespace(cfg: StandardNamespaceConfig) -> Namespace {
     let tools = discover_tools(&tools_dir);
     if !tools.is_empty() {
         let tools_tree = SyntheticTree::new(SyntheticNode::Dir { children: tools });
-        let _ = ns.bind_mount("/bin", Arc::new(tools_tree), hyprstream_vfs::BindFlag::After);
+        let _ = ns.bind_mount(&bin_path, Arc::new(tools_tree), hyprstream_vfs::BindFlag::After);
     }
 
     // /env/ — session variables as files (Plan9 per-process /env/).
@@ -178,14 +214,14 @@ pub fn build_standard_namespace(cfg: StandardNamespaceConfig) -> Namespace {
             }),
         })
     };
-    let _ = ns.mount("/env", Arc::new(env_tree));
+    let _ = ns.mount(&env_path, Arc::new(env_tree));
 
-    // /lang/tcl — the driver gets a fork() snapshot of the namespace (taken
-    // before /lang/tcl is mounted, so it never observes itself) for
-    // `/bin/{cmd}` fallback resolution inside `/lang/tcl/eval`.
+    // tcl_path — the driver gets a fork() snapshot of the namespace (taken
+    // before tcl_path is mounted, so it never observes itself) for
+    // `{bin_path}/{cmd}` fallback resolution inside `{tcl_path}/eval`.
     let driver_ns = Arc::new(ns.fork());
     let tcl_mount = Arc::new(hyprstream_workers_tcl::TclMount::spawn(subject, driver_ns));
-    let _ = ns.mount("/lang/tcl", tcl_mount);
+    let _ = ns.mount(&tcl_path, tcl_mount);
 
     // /lang/python needs a wasm Sandbox this builder does not hold; wiring it
     // is tracked in #632.
