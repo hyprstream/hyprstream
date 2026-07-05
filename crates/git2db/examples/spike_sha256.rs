@@ -40,6 +40,25 @@
 //! coordinated fork of BOTH `libgit2-sys` (define + rewrite `git_oid` struct + all
 //! sha256-gated extern signatures) AND `git2-rs` (its safe `Oid` hardcodes 20-byte/40-hex
 //! SHA-1), tracking an explicitly-unstable upstream ABI. See PR body for cost/recommendation.
+//!
+//! ## Phase 3 (libgit2 + gix HYBRID) — result: does NOT unlock SHA-256
+//!
+//! Reverse probe (`gix::open` where libgit2 failed). A throwaway `spike_gix.rs` example
+//! with a `gix = "0.70"` dev-dep opened SHA-1 and SHA-256 repos built by system git:
+//!
+//! ```text
+//! gix on SHA-1 repo:   OPEN OK; object_hash=Sha1; commit/tree/revwalk read OK; sees
+//!                      new refs+objects written by git/libgit2 on the same .git (read interop OK)
+//! gix on SHA-256 repo: gix::open ERR "Failed to load the git configuration"
+//!                      caused by: The key "extensions.objectFormat=sha256" was invalid
+//! ```
+//!
+//! Root cause: `gix_hash::Kind` is **SHA-1-only** — `enum Kind { Sha1 = 1 }` with no
+//! `Sha256` variant, in every currently-published gix (checked gix-hash 0.16 / 0.17 / 0.18,
+//! i.e. up through gix ~0.85). `try_into_object_format` hard-rejects `sha256`. So gix cannot
+//! read a SHA-256 repo either; a libgit2+gix hybrid does NOT unlock SHA-256 today — the map
+//! and interop findings are in the PR body. (Reproduce: add `gix = "0.70"` dev-dep + a
+//! `gix::open(path)` probe.)
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
 
 fn main() {
