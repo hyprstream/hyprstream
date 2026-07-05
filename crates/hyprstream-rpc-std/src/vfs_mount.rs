@@ -255,12 +255,13 @@ impl Mount for GenericServiceMount {
 
                 let topic = handle.stream_id().to_owned();
 
-                self.stream_registry.register(topic.clone(), crate::stream_mount::StreamEntry {
-                    handle: Some(handle),
-                    owner: _caller.name().unwrap_or("anonymous").to_owned(),
-                    bytes_received: 0,
-                    blocks_received: 0,
-                });
+                self.stream_registry.register(
+                    topic.clone(),
+                    crate::stream_mount::StreamEntry::stream(
+                        Some(handle),
+                        _caller.name().unwrap_or("anonymous").to_owned(),
+                    ),
+                );
 
                 let result = serde_json::json!({
                     "streamId": info.stream_id,
