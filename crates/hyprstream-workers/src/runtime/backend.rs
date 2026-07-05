@@ -78,12 +78,11 @@ pub enum NamespaceTransport {
     ///
     /// `endpoint` is the dial-time carrier endpoint selected by the operator
     /// (normally iroh/QUIC-WebTransport cross-node, vsock for Kata, UDS only
-    /// co-located). `ticket` is a #862 mount ticket scoped to `namespace_path`.
-    /// The CSI node plugin chooses `mounter` (`kernel` or `fuse`) per
-    /// StorageClass/node policy.
+    /// co-located). The CSI node plugin mints the scoped #862 mount ticket at
+    /// `NodePublishVolume` via Kubernetes CSI `tokenRequests`, so no bearer
+    /// ticket is persisted in the PodSpec.
     NineP {
         endpoint: String,
-        ticket: String,
         namespace_path: String,
         plane: String,
         mounter: String,
@@ -113,7 +112,6 @@ pub enum NamespaceDelivery {
     /// The namespace is represented as a `csi.hyprstream.io` pod volume.
     NineP {
         endpoint: String,
-        ticket: String,
         namespace_path: String,
         plane: String,
         mounter: String,
