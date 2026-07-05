@@ -52,6 +52,8 @@ Values are documented inline in `values.yaml`. Highlights:
 - `persistence.*` — the shared `/var/lib/hyprstream` data volume (RWO by default;
   set `accessModes: [ReadWriteMany]` for multi-node).
 - `config.*` — shared `HYPRSTREAM__*` env (rendered into a ConfigMap).
+- `config.tls.enabled` — false by default so in-cluster HTTP probes and the
+  port-forward quick start use plain HTTP on the oai Service port.
 
 ## Key/trust bootstrap
 

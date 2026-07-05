@@ -114,7 +114,7 @@ spec:
         {{- if $root.Values.keyBootstrap.enabled }}
         - name: credentials
           projected:
-            defaultMode: 0400
+            defaultMode: 0440
             sources:
               - secret:
                   name: {{ include "hyprstream.trustSecretName" $root }}

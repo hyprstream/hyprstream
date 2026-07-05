@@ -30,7 +30,7 @@ data:
   HYPRSTREAM__STORAGE__LORAS_DIR: "/var/lib/hyprstream/loras"
   HYPRSTREAM__STORAGE__CACHE_DIR: "/var/lib/hyprstream/cache"
   HYPRSTREAM__STORAGE__CONFIG_DIR: "/var/lib/hyprstream/config"
-  HYPRSTREAM__SECRETS__PATH: "/var/lib/hyprstream/credentials"
+  HYPRSTREAM__TLS__ENABLED: "false"
   HYPRSTREAM__QUIC__ENABLED: "true"
   HYPRSTREAM__QUIC__IROH: "true"
   HYPRSTREAM__QUIC__BIND_ADDR: "0.0.0.0:0"
@@ -248,6 +248,9 @@ spec:
         app.kubernetes.io/component: discovery
     spec:
       serviceAccountName: hyprstream
+      securityContext:
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: discovery
           image: ghcr.io/hyprstream/hyprstream:0.1.0
@@ -312,6 +315,9 @@ spec:
         app.kubernetes.io/component: event
     spec:
       serviceAccountName: hyprstream
+      securityContext:
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: event
           image: ghcr.io/hyprstream/hyprstream:0.1.0
@@ -376,6 +382,9 @@ spec:
         app.kubernetes.io/component: model
     spec:
       serviceAccountName: hyprstream
+      securityContext:
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: model
           image: ghcr.io/hyprstream/hyprstream:0.1.0-cpu
@@ -440,6 +449,9 @@ spec:
         app.kubernetes.io/component: oai
     spec:
       serviceAccountName: hyprstream
+      securityContext:
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: oai
           image: ghcr.io/hyprstream/hyprstream:0.1.0
@@ -519,6 +531,9 @@ spec:
         app.kubernetes.io/component: policy
     spec:
       serviceAccountName: hyprstream
+      securityContext:
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: policy
           image: ghcr.io/hyprstream/hyprstream:0.1.0
@@ -583,6 +598,9 @@ spec:
         app.kubernetes.io/component: registry
     spec:
       serviceAccountName: hyprstream
+      securityContext:
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: registry
           image: ghcr.io/hyprstream/hyprstream:0.1.0
@@ -647,6 +665,9 @@ spec:
         app.kubernetes.io/component: streams
     spec:
       serviceAccountName: hyprstream
+      securityContext:
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: streams
           image: ghcr.io/hyprstream/hyprstream:0.1.0

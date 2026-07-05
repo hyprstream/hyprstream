@@ -11,7 +11,10 @@ data:
   HYPRSTREAM__STORAGE__LORAS_DIR: {{ printf "%s/loras" .Values.config.dataDir | quote }}
   HYPRSTREAM__STORAGE__CACHE_DIR: {{ printf "%s/cache" .Values.config.dataDir | quote }}
   HYPRSTREAM__STORAGE__CONFIG_DIR: {{ printf "%s/config" .Values.config.dataDir | quote }}
+  HYPRSTREAM__TLS__ENABLED: {{ .Values.config.tls.enabled | quote }}
+  {{- if .Values.keyBootstrap.enabled }}
   HYPRSTREAM__SECRETS__PATH: {{ .Values.keyBootstrap.secretsPath | quote }}
+  {{- end }}
   HYPRSTREAM__QUIC__ENABLED: {{ .Values.config.quic.enabled | quote }}
   HYPRSTREAM__QUIC__IROH: {{ .Values.config.quic.iroh | quote }}
   HYPRSTREAM__QUIC__BIND_ADDR: {{ .Values.config.quic.bindAddr | quote }}

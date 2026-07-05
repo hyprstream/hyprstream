@@ -55,6 +55,12 @@ config:
     # Base bind address; the per-service QUIC listen port comes from each
     # service's HYPRSTREAM__<SVC>__QUIC_PORT (see services.<name>.env).
     bindAddr: "0.0.0.0:0"
+  # In-cluster HTTP surfaces are fronted by Kubernetes Services and probes.
+  # Leave app TLS off by default so the oai readiness/liveness HTTP probes and
+  # README port-forward curl hit the protocol actually served on 6789. Operators
+  # that terminate TLS in-process can set this true and update probes to HTTPS.
+  tls:
+    enabled: false
   # Extra raw HYPRSTREAM__* env applied to every service (escape hatch).
   extraEnv: {}
 
@@ -134,7 +140,9 @@ defaults:
   tolerations: []
   affinity: {}
   podAnnotations: {}
-  podSecurityContext: {}
+  podSecurityContext:
+    fsGroup: 65532
+    fsGroupChangePolicy: OnRootMismatch
   securityContext:
     allowPrivilegeEscalation: false
     readOnlyRootFilesystem: false
