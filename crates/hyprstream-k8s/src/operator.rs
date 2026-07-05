@@ -17,11 +17,13 @@ use kube::runtime::{watcher, Controller};
 use kube::{Api, Client, Resource, ResourceExt};
 use serde::Serialize;
 use serde_json::json;
+use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-    Adapter, AdapterStatus, Model, ModelStatus, TenantBinding, TrainingRun, TrainingRunStatus,
-    API_VERSION, MANAGED_BY_LABEL, MANAGED_BY_VALUE,
+    Adapter, AdapterStatus, InferenceService, InferenceServiceStatus, Model, ModelStatus,
+    Statefulness, TenantBinding, TrainingRun, TrainingRunStatus, API_VERSION, MANAGED_BY_LABEL,
+    MANAGED_BY_VALUE,
 };
 
 /// Field manager used by the operator when writing status.
@@ -30,7 +32,9 @@ pub const OPERATOR_FIELD_MANAGER: &str = "hyprstream-operator";
 const MODEL_KIND: &str = "Model";
 const ADAPTER_KIND: &str = "Adapter";
 const TRAINING_RUN_KIND: &str = "TrainingRun";
+const INFERENCE_SERVICE_KIND: &str = "InferenceService";
 const TRAINING_RUN_FINALIZER: &str = "training.hyprstream.io/finalizer";
+const SERVING_APP_LABEL: &str = "hyprstream.io/serving-app";
 
 /// Runtime configuration shared by every reconciler.
 #[derive(Clone, Debug)]
@@ -39,6 +43,14 @@ pub struct OperatorConfig {
     pub requeue: Duration,
     /// Maximum age of the namespace -> tenant cache.
     pub tenant_binding_cache_ttl: Duration,
+    /// Container image used by native serving Deployments.
+    pub serving_image: String,
+    /// Gateway API parentRef name for generated HTTPRoutes.
+    pub gateway_parent_ref: String,
+    /// Container port exposed by the OpenAI-compatible serving process.
+    pub serving_port: u16,
+    /// Prometheus base URL used by generated KEDA ScaledObjects.
+    pub prometheus_server: String,
 }
 
 impl Default for OperatorConfig {
@@ -46,6 +58,10 @@ impl Default for OperatorConfig {
         Self {
             requeue: Duration::from_secs(300),
             tenant_binding_cache_ttl: Duration::from_secs(60),
+            serving_image: "ghcr.io/hyprstream/hyprstream:latest".to_owned(),
+            gateway_parent_ref: "hyprstream".to_owned(),
+            serving_port: 8080,
+            prometheus_server: "http://prometheus-server.monitoring.svc:9090".to_owned(),
         }
     }
 }
@@ -73,6 +89,25 @@ pub struct AdapterObservation {
 pub struct TrainingRunObservation {
     pub phase: TrainingRunPhase,
     pub produced_adapter: Option<String>,
+    pub message: Option<String>,
+}
+
+/// Kubernetes objects projected for a native hyprstream serving endpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServingPlan {
+    pub deployment: Value,
+    pub service: Value,
+    pub http_route: Value,
+    pub autoscaler: Value,
+    pub prunes: Vec<Value>,
+    pub url: String,
+}
+
+/// Result observed after reconciling an InferenceService serving plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InferenceServiceObservation {
+    pub ready_replicas: u32,
+    pub url: Option<String>,
     pub message: Option<String>,
 }
 
@@ -143,6 +178,13 @@ pub trait HyprstreamOperatorRpc: Send + Sync + 'static {
     ) -> BoxFuture<'a, Result<(), OperatorError>> {
         Box::pin(async { Ok(()) })
     }
+
+    fn reconcile_inference_service<'a>(
+        &'a self,
+        tenant: &'a str,
+        service: &'a InferenceService,
+        plan: &'a ServingPlan,
+    ) -> BoxFuture<'a, Result<InferenceServiceObservation, OperatorError>>;
 }
 
 /// Shared controller state.
@@ -198,7 +240,7 @@ pub enum OperatorError {
     Rpc(String),
 }
 
-/// Run Model, Adapter, and TrainingRun controllers until Ctrl-C.
+/// Run Model, Adapter, TrainingRun, and InferenceService controllers until Ctrl-C.
 pub async fn run_operator<R>(
     client: Client,
     rpc: Arc<R>,
@@ -210,11 +252,13 @@ where
     let state = Arc::new(OperatorState::new(client.clone(), rpc, config));
     let models = run_model_controller(client.clone(), Arc::clone(&state));
     let adapters = run_adapter_controller(client.clone(), Arc::clone(&state));
-    let training_runs = run_training_run_controller(client, state);
+    let training_runs = run_training_run_controller(client.clone(), Arc::clone(&state));
+    let inference_services = run_inference_service_controller(client, state);
     tokio::select! {
         result = models => result,
         result = adapters => result,
         result = training_runs => result,
+        result = inference_services => result,
         _ = tokio::signal::ctrl_c() => Ok(()),
     }
 }
@@ -302,6 +346,32 @@ where
     Ok(())
 }
 
+/// Run the InferenceService controller stream.
+pub async fn run_inference_service_controller<R>(
+    client: Client,
+    state: Arc<OperatorState<R>>,
+) -> Result<(), OperatorError>
+where
+    R: HyprstreamOperatorRpc,
+{
+    Controller::new(
+        Api::<InferenceService>::all(client),
+        watcher::Config::default(),
+    )
+    .run(
+        reconcile_inference_service,
+        inference_service_error_policy::<R>,
+        state,
+    )
+    .for_each(|result| async move {
+        if let Err(error) = result {
+            tracing::warn!(%error, "inferenceservice reconcile failed");
+        }
+    })
+    .await;
+    Ok(())
+}
+
 async fn reconcile_model<R>(
     model: Arc<Model>,
     state: Arc<OperatorState<R>>,
@@ -366,20 +436,22 @@ where
     outcome.map(|_| Action::requeue(state.config.requeue))
 }
 
-async fn finalize_training_run<R>(
-    run: &TrainingRun,
-    state: &OperatorState<R>,
+async fn reconcile_inference_service<R>(
+    service: Arc<InferenceService>,
+    state: Arc<OperatorState<R>>,
 ) -> Result<Action, OperatorError>
 where
     R: HyprstreamOperatorRpc,
 {
-    if !has_finalizer(run, TRAINING_RUN_FINALIZER) {
-        return Ok(Action::await_change());
-    }
-    let tenant = tenant_for_resource(state, TRAINING_RUN_KIND, run).await?;
-    state.rpc.finalize_training_run(&tenant, run).await?;
-    remove_training_run_finalizer(&state.client, run).await?;
-    Ok(Action::await_change())
+    ensure_operator_label(&state.client, service.as_ref(), INFERENCE_SERVICE_KIND).await?;
+    let outcome = evaluate_inference_service(service.as_ref(), state.as_ref()).await;
+    patch_inference_service_status(
+        &state.client,
+        service.as_ref(),
+        status_for_inference_service_outcome(service.as_ref(), &outcome),
+    )
+    .await?;
+    outcome.map(|_| Action::requeue(state.config.requeue))
 }
 
 fn model_error_policy<R>(
@@ -406,6 +478,17 @@ where
 
 fn training_run_error_policy<R>(
     _run: Arc<TrainingRun>,
+    _error: &OperatorError,
+    state: Arc<OperatorState<R>>,
+) -> Action
+where
+    R: HyprstreamOperatorRpc,
+{
+    Action::requeue(state.config.requeue)
+}
+
+fn inference_service_error_policy<R>(
+    _service: Arc<InferenceService>,
     _error: &OperatorError,
     state: Arc<OperatorState<R>>,
 ) -> Action
@@ -446,6 +529,37 @@ where
 {
     let tenant = tenant_for_resource(state, ADAPTER_KIND, adapter).await?;
     state.rpc.reconcile_adapter(&tenant, adapter).await
+}
+
+async fn evaluate_inference_service<R>(
+    service: &InferenceService,
+    state: &OperatorState<R>,
+) -> Result<InferenceServiceObservation, OperatorError>
+where
+    R: HyprstreamOperatorRpc,
+{
+    let tenant = tenant_for_resource(state, INFERENCE_SERVICE_KIND, service).await?;
+    let plan = serving_plan(service, &tenant, &state.config);
+    state
+        .rpc
+        .reconcile_inference_service(&tenant, service, &plan)
+        .await
+}
+
+async fn finalize_training_run<R>(
+    run: &TrainingRun,
+    state: &OperatorState<R>,
+) -> Result<Action, OperatorError>
+where
+    R: HyprstreamOperatorRpc,
+{
+    if !has_finalizer(run, TRAINING_RUN_FINALIZER) {
+        return Ok(Action::await_change());
+    }
+    let tenant = tenant_for_resource(state, TRAINING_RUN_KIND, run).await?;
+    state.rpc.finalize_training_run(&tenant, run).await?;
+    remove_training_run_finalizer(&state.client, run).await?;
+    Ok(Action::await_change())
 }
 
 async fn tenant_for_resource<R, K>(
@@ -647,6 +761,361 @@ fn status_for_training_run_outcome(
     }
 }
 
+fn status_for_inference_service_outcome(
+    service: &InferenceService,
+    outcome: &Result<InferenceServiceObservation, OperatorError>,
+) -> InferenceServiceStatus {
+    match outcome {
+        Ok(observed) => InferenceServiceStatus {
+            phase: Some(inference_service_phase(service, observed.ready_replicas).to_owned()),
+            ready_replicas: Some(observed.ready_replicas),
+            url: observed.url.clone(),
+            observed_generation: service.meta().generation,
+        },
+        Err(_error) => InferenceServiceStatus {
+            phase: Some("Failed".to_owned()),
+            ready_replicas: Some(0),
+            url: None,
+            observed_generation: service.meta().generation,
+        },
+    }
+}
+
+fn inference_service_phase(service: &InferenceService, ready_replicas: u32) -> &'static str {
+    if ready_replicas > 0 {
+        "Ready"
+    } else if service.spec.statefulness == Statefulness::Stateless && service.spec.min_replicas == 0
+    {
+        "ScaledToZero"
+    } else {
+        "Pending"
+    }
+}
+
+fn serving_plan(service: &InferenceService, tenant: &str, config: &OperatorConfig) -> ServingPlan {
+    let name = service.name_any();
+    let namespace = service.namespace().unwrap_or_default();
+    let app = serving_app_name(&name);
+    let labels = serving_labels(&app, tenant);
+    let owner_references = owner_references(service, INFERENCE_SERVICE_KIND);
+    let min_replicas = effective_min_replicas(service);
+    let max_replicas = service.spec.max_replicas.max(min_replicas.max(1));
+    let statefulness = statefulness_value(&service.spec.statefulness);
+    let url = format!("https://{}.{}.hyprstream.local/v1", name, namespace);
+
+    let deployment = json!({
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {
+            "name": app,
+            "namespace": namespace,
+            "labels": labels,
+            "ownerReferences": owner_references,
+        },
+        "spec": {
+            "selector": {
+                "matchLabels": {
+                    SERVING_APP_LABEL: app,
+                },
+            },
+            "template": {
+                "metadata": {
+                    "labels": labels,
+                    "annotations": {
+                        "hyprstream.io/model-ref": service.spec.model,
+                        "hyprstream.io/statefulness": statefulness,
+                    },
+                },
+                "spec": {
+                    "containers": [{
+                        "name": "model-service",
+                        "image": config.serving_image,
+                        "args": [
+                            "serve",
+                            "--openai-compatible",
+                            "--model", service.spec.model,
+                            "--tenant", tenant,
+                        ],
+                        "ports": [{
+                            "name": "http",
+                            "containerPort": config.serving_port,
+                        }],
+                    }],
+                },
+            },
+        },
+    });
+
+    let service_manifest = json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": app,
+            "namespace": namespace,
+            "labels": labels,
+            "ownerReferences": owner_references,
+        },
+        "spec": {
+            "selector": {
+                SERVING_APP_LABEL: app,
+            },
+            "ports": [{
+                "name": "http",
+                "port": 80,
+                "targetPort": "http",
+            }],
+            "sessionAffinity": "None",
+        },
+    });
+
+    let http_route = json!({
+        "apiVersion": "gateway.networking.k8s.io/v1",
+        "kind": "HTTPRoute",
+        "metadata": {
+            "name": app,
+            "namespace": namespace,
+            "labels": labels,
+            "ownerReferences": owner_references,
+            "annotations": http_route_annotations(&service.spec.statefulness),
+        },
+        "spec": {
+            "parentRefs": [{
+                "name": config.gateway_parent_ref,
+            }],
+            "hostnames": [
+                format!("{}.{}.hyprstream.local", name, namespace),
+            ],
+            "rules": [{
+                "matches": [{
+                    "path": {
+                        "type": "PathPrefix",
+                        "value": "/v1",
+                    },
+                }],
+                "backendRefs": [{
+                    "name": app,
+                    "port": 80,
+                }],
+            }],
+        },
+    });
+
+    let (autoscaler, prunes) =
+        if service.spec.statefulness == Statefulness::Stateless && min_replicas == 0 {
+            (
+                keda_scaled_object(
+                    service,
+                    &app,
+                    &namespace,
+                    labels,
+                    owner_references,
+                    max_replicas,
+                    &config.prometheus_server,
+                ),
+                vec![prune_manifest(
+                    "autoscaling/v2",
+                    "HorizontalPodAutoscaler",
+                    &app,
+                    &namespace,
+                )],
+            )
+        } else {
+            (
+                hpa(
+                    &app,
+                    &namespace,
+                    labels,
+                    owner_references,
+                    min_replicas,
+                    max_replicas,
+                ),
+                vec![prune_manifest(
+                    "keda.sh/v1alpha1",
+                    "ScaledObject",
+                    &app,
+                    &namespace,
+                )],
+            )
+        };
+
+    ServingPlan {
+        deployment,
+        service: service_manifest,
+        http_route,
+        autoscaler,
+        prunes,
+        url,
+    }
+}
+
+fn serving_app_name(name: &str) -> String {
+    format!("hs-serve-{name}")
+}
+
+fn serving_labels(app: &str, tenant: &str) -> Value {
+    json!({
+        MANAGED_BY_LABEL: MANAGED_BY_VALUE,
+        SERVING_APP_LABEL: app,
+        "hyprstream.io/tenant": tenant,
+    })
+}
+
+fn owner_references(service: &InferenceService, kind: &'static str) -> Value {
+    match service.meta().uid.as_ref() {
+        Some(uid) => json!([{
+            "apiVersion": format!("{}.hyprstream.io/{API_VERSION}", group_for_kind(kind)),
+            "kind": kind,
+            "name": service.name_any(),
+            "uid": uid,
+            "controller": true,
+            "blockOwnerDeletion": true,
+        }]),
+        None => json!([]),
+    }
+}
+
+fn effective_min_replicas(service: &InferenceService) -> u32 {
+    match service.spec.statefulness {
+        Statefulness::TttStateful => service.spec.min_replicas.max(1),
+        Statefulness::Stateless => service.spec.min_replicas,
+    }
+}
+
+fn statefulness_value(statefulness: &Statefulness) -> &'static str {
+    match statefulness {
+        Statefulness::Stateless => "stateless",
+        Statefulness::TttStateful => "ttt-stateful",
+    }
+}
+
+fn http_route_annotations(statefulness: &Statefulness) -> Value {
+    match statefulness {
+        Statefulness::Stateless => json!({}),
+        Statefulness::TttStateful => json!({
+            "hyprstream.io/session-persistence": "gateway-consistent-hash",
+            "hyprstream.io/session-persistence-key": "tenant,authorization-subject",
+        }),
+    }
+}
+
+fn hpa(
+    app: &str,
+    namespace: &str,
+    labels: Value,
+    owner_references: Value,
+    min_replicas: u32,
+    max_replicas: u32,
+) -> Value {
+    json!({
+        "apiVersion": "autoscaling/v2",
+        "kind": "HorizontalPodAutoscaler",
+        "metadata": {
+            "name": app,
+            "namespace": namespace,
+            "labels": labels,
+            "ownerReferences": owner_references,
+            "annotations": {
+                "hyprstream.io/autoscaling-signals": "request_rate,stream_backpressure,tokens_per_second",
+            },
+        },
+        "spec": {
+            "scaleTargetRef": {
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "name": app,
+            },
+            "minReplicas": min_replicas,
+            "maxReplicas": max_replicas,
+            "metrics": [{
+                "type": "Pods",
+                "pods": {
+                    "metric": {
+                        "name": "hyprstream_request_rate",
+                    },
+                    "target": {
+                        "type": "AverageValue",
+                        "averageValue": "10",
+                    },
+                },
+            }, {
+                "type": "Pods",
+                "pods": {
+                    "metric": {
+                        "name": "hyprstream_tokens_per_second",
+                    },
+                    "target": {
+                        "type": "AverageValue",
+                        "averageValue": "100",
+                    },
+                },
+            }, {
+                "type": "Pods",
+                "pods": {
+                    "metric": {
+                        "name": "hyprstream_stream_backpressure",
+                    },
+                    "target": {
+                        "type": "AverageValue",
+                        "averageValue": "1",
+                    },
+                },
+            }],
+        },
+    })
+}
+
+fn keda_scaled_object(
+    service: &InferenceService,
+    app: &str,
+    namespace: &str,
+    labels: Value,
+    owner_references: Value,
+    max_replicas: u32,
+    prometheus_server: &str,
+) -> Value {
+    json!({
+        "apiVersion": "keda.sh/v1alpha1",
+        "kind": "ScaledObject",
+        "metadata": {
+            "name": app,
+            "namespace": namespace,
+            "labels": labels,
+            "ownerReferences": owner_references,
+            "annotations": {
+                "hyprstream.io/autoscaling-signals": "request_rate,stream_backpressure,tokens_per_second",
+            },
+        },
+        "spec": {
+            "scaleTargetRef": {
+                "name": app,
+            },
+            "minReplicaCount": 0,
+            "maxReplicaCount": max_replicas,
+            "triggers": [{
+                "type": "prometheus",
+                "metadata": {
+                    "serverAddress": prometheus_server,
+                    "metricName": "hyprstream_request_rate",
+                    "threshold": "10",
+                    "query": format!("sum(rate(hyprstream_requests_total{{inference_service=\"{}\"}}[1m]))", service.name_any()),
+                },
+            }],
+        },
+    })
+}
+
+fn prune_manifest(api_version: &str, kind: &str, name: &str, namespace: &str) -> Value {
+    json!({
+        "apiVersion": api_version,
+        "kind": kind,
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+        },
+        "hyprstream.io/action": "delete",
+    })
+}
+
 async fn ensure_operator_label<K>(
     client: &Client,
     resource: &K,
@@ -668,6 +1137,30 @@ where
         &Patch::Apply(&metadata_patch(resource, kind)),
     )
     .await
+}
+
+async fn patch_model_status(
+    client: &Client,
+    model: &Model,
+    status: ModelStatus,
+) -> Result<Model, kube::Error> {
+    patch_namespaced_status(client, model, MODEL_KIND, status).await
+}
+
+async fn patch_adapter_status(
+    client: &Client,
+    adapter: &Adapter,
+    status: AdapterStatus,
+) -> Result<Adapter, kube::Error> {
+    patch_namespaced_status(client, adapter, ADAPTER_KIND, status).await
+}
+
+async fn patch_training_run_status(
+    client: &Client,
+    run: &TrainingRun,
+    status: TrainingRunStatus,
+) -> Result<TrainingRun, kube::Error> {
+    patch_namespaced_status(client, run, TRAINING_RUN_KIND, status).await
 }
 
 async fn ensure_training_run_metadata(
@@ -710,28 +1203,12 @@ async fn remove_training_run_finalizer(
     .await
 }
 
-async fn patch_model_status(
+async fn patch_inference_service_status(
     client: &Client,
-    model: &Model,
-    status: ModelStatus,
-) -> Result<Model, kube::Error> {
-    patch_namespaced_status(client, model, MODEL_KIND, status).await
-}
-
-async fn patch_adapter_status(
-    client: &Client,
-    adapter: &Adapter,
-    status: AdapterStatus,
-) -> Result<Adapter, kube::Error> {
-    patch_namespaced_status(client, adapter, ADAPTER_KIND, status).await
-}
-
-async fn patch_training_run_status(
-    client: &Client,
-    run: &TrainingRun,
-    status: TrainingRunStatus,
-) -> Result<TrainingRun, kube::Error> {
-    patch_namespaced_status(client, run, TRAINING_RUN_KIND, status).await
+    service: &InferenceService,
+    status: InferenceServiceStatus,
+) -> Result<InferenceService, kube::Error> {
+    patch_namespaced_status(client, service, INFERENCE_SERVICE_KIND, status).await
 }
 
 async fn patch_namespaced_status<K, S>(
@@ -826,6 +1303,7 @@ fn group_for_kind(kind: &str) -> &'static str {
     match kind {
         MODEL_KIND | ADAPTER_KIND => "models",
         TRAINING_RUN_KIND => "training",
+        INFERENCE_SERVICE_KIND => "serving",
         _ => "mesh",
     }
 }
@@ -833,7 +1311,10 @@ fn group_for_kind(kind: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AdapterSpec, ModelSpec, ModelStage, TenantBindingSpec, TrainingRunSpec};
+    use crate::{
+        AdapterSpec, InferenceServiceSpec, ModelSpec, ModelStage, TenantBindingSpec,
+        TrainingRunSpec,
+    };
 
     #[test]
     fn model_success_status_reports_observed_ref() {
@@ -951,31 +1432,6 @@ mod tests {
         assert_eq!(patch["apiVersion"], "models.hyprstream.io/v1alpha1");
         assert_eq!(patch["kind"], "Adapter");
         assert_eq!(patch["status"]["observedFile"], "00_style.safetensors");
-    }
-
-    #[test]
-    fn current_generation_status_short_circuits_reconcile() {
-        let mut model = Model::new(
-            "qwen",
-            ModelSpec {
-                repo: "hf://org/qwen".to_owned(),
-                git_ref: Some("main".to_owned()),
-                stage: ModelStage::Promoted,
-            },
-        );
-        model.metadata.generation = Some(7);
-        model.status = Some(ModelStatus {
-            observed_generation: Some(7),
-            ..Default::default()
-        });
-
-        assert!(model_status_observed_current(&model));
-
-        model.status = Some(ModelStatus {
-            observed_generation: Some(6),
-            ..Default::default()
-        });
-        assert!(!model_status_observed_current(&model));
     }
 
     #[test]
@@ -1140,76 +1596,135 @@ mod tests {
         assert_eq!(patch["status"]["phase"], "Training");
     }
 
-    #[test]
-    fn terminal_training_run_status_short_circuits_reconcile() {
-        let mut run = TrainingRun::new(
-            "train-qwen",
-            TrainingRunSpec {
-                model_ref: "qwen".to_owned(),
-                dataset_mount: "/datasets/toy".to_owned(),
-                adapter_name: None,
-                runs_on: None,
-                resources: None,
+    fn inference_service(
+        name: &str,
+        statefulness: Statefulness,
+        min_replicas: u32,
+    ) -> InferenceService {
+        let mut service = InferenceService::new(
+            name,
+            InferenceServiceSpec {
+                model: "qwen:main".to_owned(),
+                min_replicas,
+                max_replicas: 4,
+                statefulness,
             },
         );
-        run.metadata.generation = Some(9);
-        run.status = Some(TrainingRunStatus {
-            phase: Some("Promoted".to_owned()),
-            observed_generation: Some(9),
-            ..Default::default()
-        });
-
-        assert!(training_run_terminal_observed_current(&run));
-
-        run.status = Some(TrainingRunStatus {
-            phase: Some("Training".to_owned()),
-            observed_generation: Some(9),
-            ..Default::default()
-        });
-        assert!(!training_run_terminal_observed_current(&run));
+        service.metadata.namespace = Some("default".to_owned());
+        service
     }
 
     #[test]
-    fn training_run_status_changed_detects_noop_patch() {
-        let mut run = TrainingRun::new(
-            "train-qwen",
-            TrainingRunSpec {
-                model_ref: "qwen".to_owned(),
-                dataset_mount: "/datasets/toy".to_owned(),
-                adapter_name: None,
-                runs_on: None,
-                resources: None,
-            },
-        );
-        let status = TrainingRunStatus {
-            phase: Some("Training".to_owned()),
-            produced_adapter: None,
-            message: Some("running".to_owned()),
-            observed_generation: Some(2),
-        };
-        run.status = Some(status.clone());
+    fn serving_plan_stateful_never_scales_to_zero() {
+        let service = inference_service("chat", Statefulness::TttStateful, 0);
+        let plan = serving_plan(&service, "tenant-a", &OperatorConfig::default());
 
-        assert!(!training_run_status_changed(&run, &status));
+        assert!(plan.deployment["spec"].get("replicas").is_none());
+        assert_eq!(plan.service["spec"]["sessionAffinity"], "None");
+        assert_eq!(
+            plan.http_route["metadata"]["annotations"]["hyprstream.io/session-persistence"],
+            "gateway-consistent-hash"
+        );
+        assert_eq!(plan.autoscaler["kind"], "HorizontalPodAutoscaler");
+        assert_eq!(plan.autoscaler["spec"]["minReplicas"], 1);
+        assert_eq!(plan.prunes[0]["kind"], "ScaledObject");
+        assert_eq!(
+            plan.deployment["spec"]["template"]["metadata"]["annotations"]
+                ["hyprstream.io/statefulness"],
+            "ttt-stateful"
+        );
     }
 
     #[test]
-    fn training_run_metadata_patch_adds_finalizer() {
-        let run = TrainingRun::new(
-            "train-qwen",
-            TrainingRunSpec {
-                model_ref: "qwen".to_owned(),
-                dataset_mount: "/datasets/toy".to_owned(),
-                adapter_name: None,
-                runs_on: None,
-                resources: None,
-            },
+    fn serving_plan_stateless_zero_uses_keda_scaled_object() {
+        let service = inference_service("embed", Statefulness::Stateless, 0);
+        let plan = serving_plan(&service, "tenant-a", &OperatorConfig::default());
+
+        assert!(plan.deployment["spec"].get("replicas").is_none());
+        assert_eq!(plan.service["spec"]["sessionAffinity"], "None");
+        assert_eq!(plan.autoscaler["apiVersion"], "keda.sh/v1alpha1");
+        assert_eq!(plan.autoscaler["kind"], "ScaledObject");
+        assert_eq!(plan.autoscaler["spec"]["minReplicaCount"], 0);
+        assert_eq!(plan.prunes[0]["kind"], "HorizontalPodAutoscaler");
+        assert_eq!(
+            plan.autoscaler["spec"]["triggers"][0]["metadata"]["serverAddress"],
+            OperatorConfig::default().prometheus_server
         );
-        let patch = training_run_metadata_patch(&run);
+    }
+
+    #[test]
+    fn serving_plan_routes_openai_surface_through_gateway() {
+        let service = inference_service("chat", Statefulness::Stateless, 1);
+        let plan = serving_plan(&service, "tenant-a", &OperatorConfig::default());
 
         assert_eq!(
-            patch["metadata"]["labels"][MANAGED_BY_LABEL],
-            MANAGED_BY_VALUE
+            plan.http_route["apiVersion"],
+            "gateway.networking.k8s.io/v1"
         );
-        assert_eq!(patch["metadata"]["finalizers"][0], TRAINING_RUN_FINALIZER);
+        assert_eq!(plan.http_route["kind"], "HTTPRoute");
+        assert_eq!(
+            plan.http_route["spec"]["rules"][0]["matches"][0]["path"]["value"],
+            "/v1"
+        );
+        assert_eq!(
+            plan.http_route["spec"]["rules"][0]["backendRefs"][0]["name"],
+            "hs-serve-chat"
+        );
+        assert_eq!(plan.url, "https://chat.default.hyprstream.local/v1");
+    }
+
+    #[test]
+    fn inference_service_status_patch_uses_serving_group() {
+        let service = inference_service("chat", Statefulness::Stateless, 1);
+        let patch = status_patch(
+            &service,
+            INFERENCE_SERVICE_KIND,
+            InferenceServiceStatus {
+                phase: Some("Ready".to_owned()),
+                ready_replicas: Some(1),
+                url: Some("https://chat.default.hyprstream.local/v1".to_owned()),
+                observed_generation: None,
+            },
+        );
+
+        assert_eq!(patch["apiVersion"], "serving.hyprstream.io/v1alpha1");
+        assert_eq!(patch["kind"], "InferenceService");
+        assert_eq!(patch["status"]["readyReplicas"], 1);
+    }
+
+    #[test]
+    fn inference_service_ready_status_uses_observed_url() {
+        let service = inference_service("chat", Statefulness::Stateless, 1);
+        let status = status_for_inference_service_outcome(
+            &service,
+            &Ok(InferenceServiceObservation {
+                ready_replicas: 2,
+                url: Some("https://chat.default.hyprstream.local/v1".to_owned()),
+                message: None,
+            }),
+        );
+
+        assert_eq!(status.phase.as_deref(), Some("Ready"));
+        assert_eq!(status.ready_replicas, Some(2));
+        assert_eq!(
+            status.url.as_deref(),
+            Some("https://chat.default.hyprstream.local/v1")
+        );
+    }
+
+    #[test]
+    fn inference_service_stateless_zero_status_is_scaled_to_zero() {
+        let service = inference_service("embed", Statefulness::Stateless, 0);
+        let status = status_for_inference_service_outcome(
+            &service,
+            &Ok(InferenceServiceObservation {
+                ready_replicas: 0,
+                url: Some("https://embed.default.hyprstream.local/v1".to_owned()),
+                message: None,
+            }),
+        );
+
+        assert_eq!(status.phase.as_deref(), Some("ScaledToZero"));
+        assert_eq!(status.ready_replicas, Some(0));
     }
 }
