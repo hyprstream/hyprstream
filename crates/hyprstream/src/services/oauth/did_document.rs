@@ -186,30 +186,23 @@ fn mldsa65_verification_method(did: &str, key_id: &str, vk_bytes: &[u8]) -> Valu
 
 // ============================================================================
 // #mesh-kem hybrid keyAgreement identity (S1 / #552, epic #550)
-//
-// NOTE: this crate requires libtorch to compile, which was unavailable in the
-// implementing fork — the helpers below are faithful mirrors of the working
-// `#mesh-pq` / p256 multibase helpers above but are NOT compile-verified here.
-// Integration into `build_did_document` (push these into a `keyAgreement` array)
-// is a deliberate follow-up: it touches the builder signature + every caller, so
-// it is left to a pass that can compile the `hyprstream` crate.
 // ============================================================================
 
 /// multicodec `x25519-pub` unsigned-varint prefix (`0xec` → bytes `0xec 0x01`).
 const MULTICODEC_X25519_PUB: [u8; 2] = [0xec, 0x01];
 
-/// multicodec `ml-kem-768-pub` unsigned-varint prefix.
+/// multicodec `mlkem-768-pub` unsigned-varint prefix.
 ///
-/// PROVISIONAL: code point `0x120b` (ML-KEM-768 / FIPS 203 encapsulation key) as
-/// an unsigned varint → bytes `0x8b 0x24` (same shape as `ml-dsa-65-pub`
-/// `0x1211` → `0x91 0x24`). **Confirm against the multiformats multicodec
-/// registry / draft-ietf-cose-mlkem before production** — the exact ML-KEM code
-/// point must match what peers decode.
-const MULTICODEC_ML_KEM_768_PUB: [u8; 2] = [0x8b, 0x24];
+/// Code point `0x120c` (ML-KEM-768 / FIPS 203 encapsulation key) from the
+/// multiformats multicodec registry (`table.csv`, status: draft) — confirmed
+/// against the upstream registry (NOT `0x120b`, which is `mlkem-512-pub`; a
+/// one-code-point mixup there would silently anchor peers to the wrong key
+/// size). As an unsigned varint, `0x120c` encodes to the two bytes `0x8c 0x24`
+/// (same shape as `ml-dsa-65-pub` `0x1211` → `0x91 0x24`).
+const MULTICODEC_ML_KEM_768_PUB: [u8; 2] = [0x8c, 0x24];
 
 /// Multibase z-encode (base58btc, multicodec-prefixed) a raw X25519 encapsulation
 /// key (32 bytes) as a `Multikey` `publicKeyMultibase`.
-#[allow(dead_code)] // wired into build_did_document's keyAgreement set by the #552 follow-up
 fn x25519_to_multibase(ek_bytes: &[u8]) -> String {
     let mut payload = Vec::with_capacity(MULTICODEC_X25519_PUB.len() + ek_bytes.len());
     payload.extend_from_slice(&MULTICODEC_X25519_PUB);
@@ -219,7 +212,6 @@ fn x25519_to_multibase(ek_bytes: &[u8]) -> String {
 
 /// Multibase z-encode a raw ML-KEM-768 encapsulation key (1184 bytes) as a
 /// `Multikey` `publicKeyMultibase`.
-#[allow(dead_code)]
 fn mlkem768_to_multibase(ek_bytes: &[u8]) -> String {
     let mut payload = Vec::with_capacity(MULTICODEC_ML_KEM_768_PUB.len() + ek_bytes.len());
     payload.extend_from_slice(&MULTICODEC_ML_KEM_768_PUB);
@@ -238,7 +230,6 @@ fn mlkem768_to_multibase(ek_bytes: &[u8]) -> String {
 /// `x25519_ek` / `mlkem768_ek` are the raw encapsulation keys in suite-component
 /// order, from `hyprstream_rpc::node_identity::derive_mesh_kem_recipient(..)
 /// .public().eks`.
-#[allow(dead_code)] // build_did_document integration is the #552 follow-up (needs libtorch to verify)
 fn mesh_kem_key_agreement_methods(did: &str, x25519_ek: &[u8], mlkem768_ek: &[u8]) -> Vec<Value> {
     vec![
         json!({
@@ -254,6 +245,37 @@ fn mesh_kem_key_agreement_methods(did: &str, x25519_ek: &[u8], mlkem768_ek: &[u8
             "publicKeyMultibase": mlkem768_to_multibase(mlkem768_ek),
         }),
     ]
+}
+
+/// Build the `keyAgreement` entries for a node's `#mesh-kem` recipient public
+/// material, embedding the VMs directly in the `keyAgreement` relationship
+/// array (did:key convention — not cross-referenced via `verificationMethod`,
+/// since these are key-agreement-only keys, never used for signing).
+///
+/// Validates the suite shape defensively (exactly the 2 components of
+/// `SuiteId::HyKemX25519MlKem768`, X25519 then ML-KEM-768) before emitting —
+/// `recipient_public` only ever comes from this node's own
+/// `derive_mesh_kem_recipient`, but a shape mismatch must fail closed (omit
+/// `keyAgreement`) rather than publish a malformed or misordered key that a
+/// peer would silently mis-anchor.
+fn mesh_kem_key_agreement(
+    did: &str,
+    recipient_public: Option<&hyprstream_rpc::crypto::hybrid_kem::RecipientPublic>,
+) -> Vec<Value> {
+    use hyprstream_rpc::crypto::hybrid_kem::SuiteId;
+    let Some(pub_material) = recipient_public else {
+        return Vec::new();
+    };
+    // `SuiteId::HyKemX25519MlKem768.components()` is `[X25519, MlKem768]` by
+    // construction, so pinning the suite id here also pins the component
+    // order below.
+    if pub_material.suite_id != SuiteId::HyKemX25519MlKem768 {
+        return Vec::new();
+    }
+    let [x25519_ek, mlkem768_ek] = &pub_material.eks[..] else {
+        return Vec::new();
+    };
+    mesh_kem_key_agreement_methods(did, x25519_ek, mlkem768_ek)
 }
 
 #[cfg(test)]
@@ -312,6 +334,11 @@ fn ed25519_verification_method_jwk(did: &str, key_id: &str, vk: &VerifyingKey) -
 /// `at://{handle}`. The Ed25519 `keys` remain as additional (mesh) verification
 /// methods, and `transports` are additional typed `service` entries — both are
 /// ignored by atproto resolvers (which match by id/type) but used by our mesh.
+///
+/// `mesh_kem_public` (S1 / #552), when present, publishes the node's
+/// `#mesh-kem` hybrid keyAgreement recipient (X25519 + ML-KEM-768) as
+/// `keyAgreement` entries — additive and, like `mesh_pq_vk`, ignored by
+/// atproto resolvers.
 fn build_did_document(
     did: &str,
     issuer_url: &str,
@@ -319,6 +346,7 @@ fn build_did_document(
     atproto: Option<&AtprotoIdentity<'_>>,
     transports: &[TransportEndpoint],
     mesh_pq_vk: Option<&[u8]>,
+    mesh_kem_public: Option<&hyprstream_rpc::crypto::hybrid_kem::RecipientPublic>,
 ) -> Value {
     let mut verification_methods = Vec::with_capacity(keys.len() * 2 + 2);
     let mut authentication_refs = Vec::with_capacity(keys.len() * 2 + 2);
@@ -379,6 +407,12 @@ fn build_did_document(
         }));
     }
 
+    // `#mesh-kem` hybrid keyAgreement (S1 / #552): embedded directly in the
+    // `keyAgreement` relationship (did:key convention) — these are
+    // key-agreement-only keys, never cross-referenced from
+    // `verificationMethod`/`authentication`/`assertionMethod`.
+    let key_agreement = mesh_kem_key_agreement(did, mesh_kem_public);
+
     let mut doc = json!({
         "@context": [
             "https://www.w3.org/ns/did/v1",
@@ -389,6 +423,7 @@ fn build_did_document(
         "verificationMethod": verification_methods,
         "authentication": authentication_refs,
         "assertionMethod": assertion_refs,
+        "keyAgreement": key_agreement,
         "service": services,
     });
 
@@ -501,6 +536,7 @@ pub async fn root_did_document(
         atproto.as_ref(),
         &transports,
         state.mesh_pq_verifying_key.as_deref(),
+        state.mesh_kem_public.as_ref(),
     );
     (
         StatusCode::OK,
@@ -582,7 +618,7 @@ pub async fn user_did_document(
         None => Vec::new(),
     };
 
-    let doc = build_did_document(&did, &state.issuer_url, &keys, None, &[], None);
+    let doc = build_did_document(&did, &state.issuer_url, &keys, None, &[], None, None);
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/did+json")],
@@ -621,7 +657,7 @@ pub async fn client_did_document(
     // lookup + extract_ed25519_keys_from_jwks call.
     let keys: Vec<(String, VerifyingKey)> = Vec::new();
 
-    let doc = build_did_document(&did, &state.issuer_url, &keys, None, &[], None);
+    let doc = build_did_document(&did, &state.issuer_url, &keys, None, &[], None, None);
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/did+json")],
@@ -724,6 +760,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         );
         assert_eq!(doc["id"].as_str().unwrap(), did);
         assert!(doc["@context"].is_array());
@@ -744,7 +781,7 @@ mod tests {
     #[test]
     fn build_did_doc_empty_keys_is_valid() {
         let did = "did:web:example.com:users:alice";
-        let doc = build_did_document(did, "https://example.com", &[], None, &[], None);
+        let doc = build_did_document(did, "https://example.com", &[], None, &[], None, None);
         assert_eq!(doc["id"].as_str().unwrap(), did);
         assert_eq!(doc["verificationMethod"].as_array().unwrap().len(), 0);
         assert_eq!(doc["authentication"].as_array().unwrap().len(), 0);
@@ -783,6 +820,7 @@ mod tests {
             &[("key-1".to_owned(), ed.verifying_key())],
             Some(&atproto),
             &transports,
+            None,
             None,
         );
 
@@ -878,6 +916,7 @@ mod tests {
             None,
             &[],
             Some(&vk_bytes),
+            None,
         );
         let vms = doc["verificationMethod"].as_array().unwrap();
         // key-1 multibase + key-1 jwk + mesh-pq = 3.
@@ -911,6 +950,7 @@ mod tests {
             None,
             &[],
             Some(&pq_vk_bytes),
+            None,
         );
         let vms = doc["verificationMethod"].as_array().unwrap();
         let pq = vms.iter().find(|v| v["id"] == format!("{did}#mesh-pq")).unwrap();
@@ -952,6 +992,7 @@ mod tests {
             None,
             &transports,
             None,
+            None,
         );
 
         // The `#iroh` VM is present and carries the node_id as a Multikey.
@@ -991,6 +1032,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         );
         let vms = doc["verificationMethod"].as_array().unwrap();
         assert!(
@@ -1002,6 +1044,80 @@ mod tests {
             !svcs.iter().any(|s| s["type"] == "IrohTransport"),
             "no IrohTransport entry when iroh is not bound"
         );
+    }
+
+    #[test]
+    fn build_did_doc_omits_key_agreement_when_mesh_kem_absent() {
+        // No `#mesh-kem` public material provided → `keyAgreement` is present
+        // but empty (a valid, empty DID-document relationship), never omitted
+        // outright (omitting the key entirely would be a different, also-valid
+        // shape, but an empty array is simpler for consumers to handle uniformly).
+        let sk = SigningKey::generate(&mut OsRng);
+        let did = "did:web:hyprstream.example.com";
+        let doc = build_did_document(
+            did,
+            "https://hyprstream.example.com",
+            &[("key-1".to_owned(), sk.verifying_key())],
+            None,
+            &[],
+            None,
+            None,
+        );
+        assert_eq!(doc["keyAgreement"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn build_did_doc_publishes_mesh_kem_key_agreement() {
+        // S1 / #552: when a `#mesh-kem` recipient public is provided,
+        // build_did_document emits both suite-component `keyAgreement` VMs
+        // (X25519 + ML-KEM-768), embedded directly (not cross-referenced from
+        // verificationMethod/authentication/assertionMethod — these are
+        // key-agreement-only keys).
+        let node_sk = SigningKey::generate(&mut OsRng);
+        let kem_kp = hyprstream_rpc::node_identity::derive_mesh_kem_recipient(&node_sk)
+            .expect("derive #mesh-kem recipient");
+        let kem_pub = kem_kp.public();
+
+        let did = "did:web:hyprstream.example.com";
+        let doc = build_did_document(
+            did,
+            "https://hyprstream.example.com",
+            &[("key-1".to_owned(), node_sk.verifying_key())],
+            None,
+            &[],
+            None,
+            Some(&kem_pub),
+        );
+
+        // keyAgreement carries exactly the two suite-component VMs, and they
+        // are NOT duplicated into verificationMethod/authentication/assertionMethod.
+        let kas = doc["keyAgreement"].as_array().unwrap();
+        assert_eq!(kas.len(), 2);
+        assert_eq!(kas[0]["id"].as_str().unwrap(), format!("{did}#mesh-kem-x25519"));
+        assert_eq!(kas[0]["type"].as_str().unwrap(), "Multikey");
+        assert_eq!(kas[1]["id"].as_str().unwrap(), format!("{did}#mesh-kem-mlkem768"));
+        assert_eq!(kas[1]["type"].as_str().unwrap(), "Multikey");
+
+        let vms = doc["verificationMethod"].as_array().unwrap();
+        assert!(!vms.iter().any(|v| v["id"] == format!("{did}#mesh-kem-x25519")));
+        assert!(!vms.iter().any(|v| v["id"] == format!("{did}#mesh-kem-mlkem768")));
+        assert!(!doc["authentication"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().map(|s| s.contains("mesh-kem")).unwrap_or(false)));
+
+        // The published X25519 leg round-trips to the exact bytes derived —
+        // consistency between the DID doc and the key the node actually holds.
+        let mb = kas[0]["publicKeyMultibase"].as_str().unwrap();
+        let decoded = bs58::decode(&mb[1..]).into_vec().unwrap();
+        assert_eq!(&decoded[..2], &MULTICODEC_X25519_PUB);
+        assert_eq!(&decoded[2..], kem_pub.eks[0].as_slice());
+
+        let mb2 = kas[1]["publicKeyMultibase"].as_str().unwrap();
+        let decoded2 = bs58::decode(&mb2[1..]).into_vec().unwrap();
+        assert_eq!(&decoded2[..2], &MULTICODEC_ML_KEM_768_PUB);
+        assert_eq!(&decoded2[2..], kem_pub.eks[1].as_slice());
     }
 
     #[test]

@@ -428,6 +428,15 @@ pub struct OAuthState {
     /// the published VM equals the key the node signs mesh responses with.
     /// `None` when the entity signing key is not configured.
     pub mesh_pq_verifying_key: Option<Vec<u8>>,
+    /// The node's `#mesh-kem` hybrid keyAgreement public material (S1 / #552):
+    /// one ML-KEM-768-hybrid recipient public (X25519 + ML-KEM-768 encapsulation
+    /// keys, suite `HyKemX25519MlKem768`). Published as the `keyAgreement`
+    /// verification methods in the root DID document. Derived from the same
+    /// Ed25519 key as [`Self::signing_key`] (via `derive_mesh_kem_recipient`),
+    /// so the published keys equal what the node decapsulates `#mesh-kem`
+    /// envelopes with. `None` when the entity signing key is not configured
+    /// (or derivation failed — see `with_signing_key`).
+    pub mesh_kem_public: Option<hyprstream_rpc::crypto::hybrid_kem::RecipientPublic>,
     /// #282: the node's iroh endpoint id (its Ed25519 `node_id`, 32 bytes),
     /// published as the `#iroh` verification method + an `IrohTransport` service
     /// entry in the root DID document — **only** when the iroh substrate is
@@ -497,6 +506,7 @@ impl OAuthState {
             quic_cert_hashes: Vec::new(),
             quic_public_uri: None,
             mesh_pq_verifying_key: None,
+            mesh_kem_public: None,
             iroh_node_id: None,
             iroh_relays: Vec::new(),
         }
@@ -638,10 +648,26 @@ impl OAuthState {
     /// Also derives and stores the node's mesh ML-DSA-65 verifying key (#157)
     /// from this same Ed25519 key, so the root DID document's `#mesh-pq`
     /// Multikey verification method matches the post-quantum key the mesh signs
-    /// with (`derive_mesh_mldsa_key`).
+    /// with (`derive_mesh_mldsa_key`), and the node's `#mesh-kem` hybrid
+    /// keyAgreement public material (S1 / #552, `derive_mesh_kem_recipient`) so
+    /// peers can anchor a recipient key that matches what this node decapsulates
+    /// with. A `#mesh-kem` derivation failure is logged and leaves
+    /// `mesh_kem_public` unset — the DID document then omits `keyAgreement`
+    /// rather than publishing a key the node cannot actually use (fail-closed:
+    /// no unanchorable/unusable key is ever advertised).
     pub fn with_signing_key(mut self, key: ed25519_dalek::SigningKey) -> Self {
         let pq_sk = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&key);
         self.mesh_pq_verifying_key = Some(hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq_sk));
+        match hyprstream_rpc::node_identity::derive_mesh_kem_recipient(&key) {
+            Ok(kem_kp) => self.mesh_kem_public = Some(kem_kp.public()),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "failed to derive #mesh-kem hybrid keyAgreement identity; \
+                     root DID document will omit keyAgreement",
+                );
+            }
+        }
         self.signing_key = Some(key);
         self
     }
