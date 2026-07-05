@@ -1,0 +1,54 @@
+# Least-privilege RBAC for the hyprstream `k8s` SandboxBackend (#781, epic #778).
+#
+# hyprstream is the *client/orchestrator* here: it creates real Pod/Job objects
+# against the API server (scheduler-placed, quota'd, kubectl-visible) and drives
+# their lifecycle. It never implements the kubelet-facing CRI contract.
+#
+# This Role grants EXACTLY the verbs the backend uses, namespace-scoped:
+#   - pods            : create/watch(→Running)/get/delete   (start/stop/destroy)
+#   - pods/exec       : create                              (exec_sync)
+#   - pods/log        : get                                 (log_stream)
+#   - jobs            : create/get/delete                   (Job workload kind)
+#
+# Bind it in the single namespace the backend targets (HYPRSTREAM_K8S_NAMESPACE
+# / hyprstream.io/k8s-namespace). Do NOT grant cluster-wide; the two-writer
+# origin-marker guard (hyprstream.io/managed-by + hyprstream.io/instance) is a
+# defence-in-depth check, not a substitute for a scoped Role.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hyprstream-workers
+  namespace: hyprstream
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hyprstream-k8s-backend
+  namespace: hyprstream
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hyprstream-k8s-backend
+  namespace: hyprstream
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: hyprstream-k8s-backend
+subjects:
+  - kind: ServiceAccount
+    name: hyprstream-workers
+    namespace: hyprstream

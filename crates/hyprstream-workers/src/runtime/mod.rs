@@ -30,6 +30,14 @@ mod container;
 // SandboxBackend seam; does NOT replace `kata_backend` (embedded Kata stays).
 #[cfg(feature = "cri")]
 pub mod cri_backend;
+// Kubernetes API-server sandbox backend (#781, epic #778) — gated behind `k8s`.
+// A kube-rs client that emits real Pod/Job objects against the cluster API
+// server (scheduler-placed, quota'd, kubectl-visible), i.e. hyprstream as
+// orchestrator/client. Distinct from `cri_backend`, which drives a node's CRI
+// socket directly (shadow pods, same-node, invisible to Kubernetes). Off by
+// default so the lean build assumes no cluster.
+#[cfg(feature = "k8s")]
+pub mod k8s_backend;
 // `/exec/instances/` VFS projection of `SandboxPool` (#608 P2 / #610) — a
 // `hyprstream_vfs::Mount` impl, so it has no `kata-vm`/`wasm` dependency.
 pub mod exec_mount;

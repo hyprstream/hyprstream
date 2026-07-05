@@ -14,7 +14,9 @@ path = "src/lib.rs"
 # CRD *type* definitions + YAML emission compile with no features and no cluster.
 default = []
 # `k8s` gates anything that needs a live client / controller-runtime.
-k8s = ["kube/client", "kube/runtime", "kube/rustls-tls"]
+# `ws` adds the websocket upgrade path kube uses for pod `exec`/`attach`
+# (`AttachedProcess`), consumed by the workers `k8s` sandbox backend.
+k8s = ["kube/client", "kube/runtime", "kube/rustls-tls", "kube/ws"]
 
 [dependencies]
 # `derive` gives the CustomResource derive + CustomResourceExt (kube-core, no client).
