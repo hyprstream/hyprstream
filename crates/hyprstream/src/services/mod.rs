@@ -69,6 +69,8 @@ pub mod editing;
 pub mod factories;
 pub mod flight;
 pub mod generated;
+#[cfg(feature = "oci-image")]
+pub mod image_substrate;
 pub mod inference;
 pub mod mcp_service;
 pub mod metrics;
@@ -130,6 +132,10 @@ pub use hyprstream_workers::runtime::WorkerClient;
 pub use oauth::OAuthService;
 pub use oai::OAIService;
 pub use xet::{XetService, XetState};
+#[cfg(feature = "oci-image")]
+pub use image_substrate::{
+    create_image_substrate_router, ImageSubstratePolicy, ImageSubstrateState,
+};
 pub use flight::FlightService;
 pub use discovery::DiscoveryService;
 pub use generated::discovery_client::DiscoveryClient;
