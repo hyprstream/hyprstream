@@ -356,16 +356,19 @@ impl PolicyHandler for PolicyService {
         let audience = data.audience.as_ref().filter(|s| !s.is_empty()).cloned()
             .or_else(|| self.default_audience.clone());
 
-        // Service tokens: derive the Ed25519 key bytes from the root CA key.
-        // The CA (PolicyService) is authoritative — the pubkey is not caller-provided.
+        // Service tokens: cnf.jwk must be the service's REGISTERED key, never a
+        // CA-derived guess (#441/#806) — bootstrap generates independent random
+        // per-service keys (`load_or_generate_service_signing_key`), so a derived
+        // pubkey here would not match the key the service actually holds. If no
+        // registered key exists yet, error rather than sign a wrong key binding.
         // User tokens: decode the caller-provided pubkey (from OAuth consent page).
         let service_key_bytes: Option<[u8; 32]> = if is_service_token {
             let svc_name = &subject["service:".len()..];
-            let svc_signing_key = hyprstream_rpc::node_identity::derive_purpose_key(
-                &self.signing_key,
-                &format!("service:{svc_name}"),
-            );
-            Some(*svc_signing_key.verifying_key().as_bytes())
+            let trust = hyprstream_service::global_trust_store();
+            let vk = trust.resolve_one(svc_name).ok_or_else(|| {
+                anyhow!("service key '{svc_name}' not registered; refusing to issue a service token with a fabricated cnf.jwk")
+            })?;
+            Some(*vk.as_bytes())
         } else {
             use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
             data.user_pub_key.as_deref().and_then(|s| {
@@ -1368,16 +1371,18 @@ impl PolicyHandler for PolicyService {
         let now = chrono::Utc::now().timestamp();
         let expires_at = now + ttl;
 
-        // Derive the service's pubkey from the root CA key (same as issue_token)
-        let svc_signing_key = hyprstream_rpc::node_identity::derive_purpose_key(
-            &self.signing_key,
-            &format!("service:{svc_name}"),
-        );
+        // cnf.jwk must be the service's REGISTERED key, never a CA-derived guess
+        // (#441/#806) — see handle_issue_token for the rationale. Registered-or-
+        // error: refuse to refresh a service token we can't bind to a real key.
+        let trust = hyprstream_service::global_trust_store();
+        let vk = trust.resolve_one(svc_name).ok_or_else(|| {
+            anyhow!("service key '{svc_name}' not registered; refusing to refresh a service token with a fabricated cnf.jwk")
+        })?;
 
         let issuer = self.default_audience.clone().unwrap_or_default();
         let claims = hyprstream_rpc::auth::Claims::new(subject.clone(), now, expires_at)
             .with_issuer(issuer)
-            .with_cnf_jwk(svc_signing_key.verifying_key().as_bytes());
+            .with_cnf_jwk(vk.as_bytes());
 
         let token = self.sign_token(&claims, true).await;
 
