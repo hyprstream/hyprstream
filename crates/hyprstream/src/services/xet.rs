@@ -55,7 +55,8 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use cas_serve::{CasStore, StoreError};
+use crate::storage::cas::{CasError, CasSubstrate, DedupDomain};
+use cas_serve::StoreError;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::SocketKind;
 use hyprstream_rpc::transport::TransportConfig;
@@ -71,9 +72,10 @@ pub const SERVICE_NAME: &str = "xet";
 /// Shared state for the axum HTTP handlers.
 #[derive(Clone)]
 pub struct XetState {
-    /// Content-addressed store backing `/get_xorb` reads (shared with the
-    /// registry's `getBlob` reconstruction path).
-    pub store: CasStore,
+    /// L1 CAS substrate backing `/get_xorb` reads (shared with the registry's
+    /// `getBlob` reconstruction path, #812). Reads use the default (untenanted,
+    /// BLAKE3, local) dedup domain.
+    pub store: CasSubstrate,
     /// Authenticated registry client — the write path (`/v1/xorbs`, `/v1/shards`)
     /// must translate through its `putBlob` RPC rather than writing directly.
     /// Dialed by the factory and held here so the 501 write stubs can be wired
@@ -206,12 +208,16 @@ async fn get_xorb_handler(
     Path(hash): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let bytes = match state.store.read_xorb(&hash).await {
+    let bytes = match state
+        .store
+        .read_xorb(&DedupDomain::local_default(), &hash)
+        .await
+    {
         Ok(b) => b,
-        Err(StoreError::NotFound(_)) => {
+        Err(CasError::Store(StoreError::NotFound(_))) => {
             return (StatusCode::NOT_FOUND, "xorb not found").into_response()
         }
-        Err(StoreError::InvalidHash(_)) => {
+        Err(CasError::Store(StoreError::InvalidHash(_))) => {
             return (StatusCode::BAD_REQUEST, "invalid xorb hash").into_response()
         }
         Err(e) => {
@@ -440,7 +446,7 @@ mod tests {
         let (_sk, vk) = hyprstream_rpc::crypto::generate_signing_keypair();
 
         XetState {
-            store: CasStore::new(dir),
+            store: CasSubstrate::new(dir),
             // Write path is 501; no live registry needed to exercise reads/auth.
             registry: None,
             jwt_verifying_key: vk,
