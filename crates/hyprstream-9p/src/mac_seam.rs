@@ -47,15 +47,17 @@ use hyprstream_rpc::auth::mac::{
 /// The 9P op an [`AccessDecider`] is being asked to authorize.
 ///
 /// Mirrors the translator's dispatch surface (`walk`/`open`/`read`/`write`/
-/// `create`/`readdir`) so a real decider can apply per-action policy (e.g.
-/// deny `Write` more aggressively than `Read`).
+/// `getattr`/`readdir`) so a real decider can apply per-action policy (e.g.
+/// deny `Write` more aggressively than `Read`). Only ops the translator
+/// actually dispatches appear here — there is no `Tlcreate` handler, so no
+/// `Create` variant (a dead variant would be an unreachable policy surface).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     Walk,
     Open,
     Read,
     Write,
-    Create,
+    Getattr,
     Readdir,
 }
 

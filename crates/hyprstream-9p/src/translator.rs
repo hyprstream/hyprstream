@@ -435,7 +435,15 @@ impl Translator {
         // Mirror of RemoteModelMount::walk: call backend.walk with the source
         // fid, the new fid, and the path components.
         let result = self.backend.walk(fid, newfid, &wnames).await?;
-        if let Some(q) = result.qids.last() {
+        if wnames.is_empty() {
+            // nwname=0 is a fid *clone*: newfid aliases fid (same file), and
+            // the backend returns no qids. newfid must still inherit the source
+            // fid's qtype and context — otherwise the clone has no cached
+            // context, floors to anonymous, and a real decider wrongly denies
+            // it for an already-authenticated client (#568).
+            let qtype = self.fids.qtype(fid).unwrap_or(0);
+            self.fids.insert(newfid, qtype, ctx);
+        } else if let Some(q) = result.qids.last() {
             self.fids.insert(newfid, q.qtype, ctx);
         }
         Ok(Response::Walk { qids: result.qids })
@@ -476,6 +484,11 @@ impl Translator {
     }
 
     async fn handle_getattr(&self, fid: u32) -> Result<Response> {
+        // getattr leaks object metadata (qid/mode/size/mtime), so it is gated
+        // like every other fid op — it is not a metadata-only exemption.
+        if let Some(err) = self.deny(fid, Action::Getattr) {
+            return Ok(err);
+        }
         let st = self.backend.stat(fid).await?;
         Ok(Response::Getattr { qid: st.qid, mode: st.mode, size: st.size, mtime_sec: st.mtime_sec })
     }
@@ -999,6 +1012,81 @@ mod tests {
             Response::Error { ecode } => assert_eq!(ecode, libc_eperm()),
             other => panic!("expected Rlerror EPERM, got {other:?}"),
         }
+    }
+
+    /// #767 review: `getattr` leaks object metadata (qid/mode/size/mtime) and
+    /// must be gated by the decider like every other fid op — it was the one
+    /// ungated op. A decider that denies `Action::Getattr` must produce EPERM.
+    #[tokio::test]
+    async fn injected_decider_blocks_getattr() {
+        struct DenyGetattr;
+        impl AccessDecider for DenyGetattr {
+            fn check(
+                &self,
+                _ctx: &SecurityContext,
+                _object_label: Option<&hyprstream_rpc::auth::mac::SecurityLabel>,
+                action: Action,
+            ) -> bool {
+                !matches!(action, Action::Getattr)
+            }
+        }
+
+        let backend = MemoryBackend::default();
+        backend.add_file("/hello.txt", b"hi");
+        let t = Translator::new(Arc::new(backend)).with_decider(Arc::new(DenyGetattr));
+
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
+        let (_, resp) = t.handle_message(&msg::twalk(2, 0, 1, &["hello.txt"])).await.unwrap();
+        assert!(matches!(resp, Response::Walk { .. }), "walk must still succeed");
+
+        let (_, resp) = t.handle_message(&msg::tgetattr(3, 1, u64::MAX)).await.unwrap();
+        match resp {
+            Response::Error { ecode } => assert_eq!(ecode, libc_eperm()),
+            other => panic!("expected Rlerror EPERM for gated getattr, got {other:?}"),
+        }
+    }
+
+    /// #767 review: a zero-element walk (nwname=0) is a fid *clone*; the new
+    /// fid must inherit the source fid's cached context rather than being left
+    /// untracked (which floored to anonymous under a real decider and wrongly
+    /// denied an already-authenticated client).
+    #[tokio::test]
+    async fn walk_clone_inherits_source_context() {
+        use async_trait::async_trait;
+        use hyprstream_rpc::auth::mac::{
+            Assurance, CompartmentSet, Level, SecurityLabel, VerifiedKeyMaterial,
+        };
+
+        struct ElevatedAuth;
+        #[async_trait]
+        impl AttachAuthenticator for ElevatedAuth {
+            async fn authenticate(&self, _u: &str, _a: &str) -> SecurityContext {
+                SecurityContext::from_clearance(
+                    SecurityLabel::new(Level::Secret, Assurance::Unverified, CompartmentSet::EMPTY),
+                    VerifiedKeyMaterial::Unverified,
+                )
+            }
+        }
+
+        let t = Translator::new(Arc::new(MemoryBackend::default()))
+            .with_authenticator(Arc::new(ElevatedAuth));
+
+        // Attach root fid 0 with the elevated (non-anonymous) context.
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
+        // Clone fid 0 -> fid 1 via a zero-element walk.
+        let (_, resp) = t.handle_message(&msg::twalk(2, 0, 1, &[])).await.unwrap();
+        assert!(matches!(resp, Response::Walk { .. }), "clone walk must succeed");
+
+        // The clone must carry the source's elevated context, not the anon floor.
+        let ctx = t
+            .fids
+            .security_context(1)
+            .expect("cloned fid must be tracked in the fid table");
+        assert_ne!(
+            ctx.level(),
+            Level::Public,
+            "cloned fid must inherit the source's elevated context, not floor to anonymous",
+        );
     }
 
     #[tokio::test]
