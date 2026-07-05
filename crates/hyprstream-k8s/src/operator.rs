@@ -20,8 +20,8 @@ use serde_json::json;
 use thiserror::Error;
 
 use crate::{
-    Adapter, AdapterStatus, Model, ModelStatus, TenantBinding, API_VERSION, MANAGED_BY_LABEL,
-    MANAGED_BY_VALUE,
+    Adapter, AdapterStatus, Model, ModelStatus, TenantBinding, TrainingRun, TrainingRunStatus,
+    API_VERSION, MANAGED_BY_LABEL, MANAGED_BY_VALUE,
 };
 
 /// Field manager used by the operator when writing status.
@@ -29,6 +29,8 @@ pub const OPERATOR_FIELD_MANAGER: &str = "hyprstream-operator";
 
 const MODEL_KIND: &str = "Model";
 const ADAPTER_KIND: &str = "Adapter";
+const TRAINING_RUN_KIND: &str = "TrainingRun";
+const TRAINING_RUN_FINALIZER: &str = "training.hyprstream.io/finalizer";
 
 /// Runtime configuration shared by every reconciler.
 #[derive(Clone, Debug)]
@@ -62,11 +64,59 @@ pub struct AdapterObservation {
     pub message: Option<String>,
 }
 
+/// Result observed after a TrainingRun STEP reconcile.
+///
+/// The RPC side owns the actual Stage -> Train -> Evaluate -> Promote actions:
+/// worker dispatch, stream/event progress, quality gate, and RegistryService git
+/// merge/checkout. The operator records the observed phase only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrainingRunObservation {
+    pub phase: TrainingRunPhase,
+    pub produced_adapter: Option<String>,
+    pub message: Option<String>,
+}
+
+/// Coarse TrainingRun phases persisted into `status.phase`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrainingRunPhase {
+    Pending,
+    Staged,
+    Training,
+    Evaluated,
+    AwaitingPromotion,
+    Promoted,
+    RolledBack,
+    Failed,
+}
+
+impl TrainingRunPhase {
+    fn as_status(self) -> &'static str {
+        match self {
+            Self::Pending => "Pending",
+            Self::Staged => "Staged",
+            Self::Training => "Training",
+            Self::Evaluated => "Evaluated",
+            Self::AwaitingPromotion => "AwaitingPromotion",
+            Self::Promoted => "Promoted",
+            Self::RolledBack => "RolledBack",
+            Self::Failed => "Failed",
+        }
+    }
+
+    fn is_terminal_status(status: &str) -> bool {
+        matches!(
+            status,
+            "AwaitingPromotion" | "Promoted" | "RolledBack" | "Failed"
+        )
+    }
+}
+
 /// Thin abstraction over the hyprstream RPC clients used by K5b.
 ///
 /// The production implementation is expected to wrap generated
-/// RegistryService/ModelService clients. #848 is the remaining cluster-topology
-/// dependency for constructing those clients over cross-pod QUIC/iroh.
+/// RegistryService/ModelService/WorkerService clients. #848 is the remaining
+/// cluster-topology dependency for constructing those clients over cross-pod
+/// QUIC/iroh.
 pub trait HyprstreamOperatorRpc: Send + Sync + 'static {
     fn reconcile_model<'a>(
         &'a self,
@@ -79,6 +129,20 @@ pub trait HyprstreamOperatorRpc: Send + Sync + 'static {
         tenant: &'a str,
         adapter: &'a Adapter,
     ) -> BoxFuture<'a, Result<AdapterObservation, OperatorError>>;
+
+    fn reconcile_training_run<'a>(
+        &'a self,
+        tenant: &'a str,
+        run: &'a TrainingRun,
+    ) -> BoxFuture<'a, Result<TrainingRunObservation, OperatorError>>;
+
+    fn finalize_training_run<'a>(
+        &'a self,
+        _tenant: &'a str,
+        _run: &'a TrainingRun,
+    ) -> BoxFuture<'a, Result<(), OperatorError>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Shared controller state.
@@ -134,7 +198,31 @@ pub enum OperatorError {
     Rpc(String),
 }
 
-/// Run Model and Adapter controllers until the process receives Ctrl-C.
+/// Run Model, Adapter, and TrainingRun controllers until Ctrl-C.
+pub async fn run_operator<R>(
+    client: Client,
+    rpc: Arc<R>,
+    config: OperatorConfig,
+) -> Result<(), OperatorError>
+where
+    R: HyprstreamOperatorRpc,
+{
+    let state = Arc::new(OperatorState::new(client.clone(), rpc, config));
+    let models = run_model_controller(client.clone(), Arc::clone(&state));
+    let adapters = run_adapter_controller(client.clone(), Arc::clone(&state));
+    let training_runs = run_training_run_controller(client, state);
+    tokio::select! {
+        result = models => result,
+        result = adapters => result,
+        result = training_runs => result,
+        _ = tokio::signal::ctrl_c() => Ok(()),
+    }
+}
+
+/// Run Model and Adapter controllers until Ctrl-C.
+///
+/// Kept for callers that want K5b core behavior without enabling K5c
+/// TrainingRun reconciliation yet.
 pub async fn run_model_adapter_operator<R>(
     client: Client,
     rpc: Arc<R>,
@@ -191,6 +279,29 @@ where
     Ok(())
 }
 
+/// Run the TrainingRun controller stream.
+pub async fn run_training_run_controller<R>(
+    client: Client,
+    state: Arc<OperatorState<R>>,
+) -> Result<(), OperatorError>
+where
+    R: HyprstreamOperatorRpc,
+{
+    Controller::new(Api::<TrainingRun>::all(client), watcher::Config::default())
+        .run(
+            reconcile_training_run,
+            training_run_error_policy::<R>,
+            state,
+        )
+        .for_each(|result| async move {
+            if let Err(error) = result {
+                tracing::warn!(%error, "trainingrun reconcile failed");
+            }
+        })
+        .await;
+    Ok(())
+}
+
 async fn reconcile_model<R>(
     model: Arc<Model>,
     state: Arc<OperatorState<R>>,
@@ -233,6 +344,44 @@ where
     outcome.map(|_| Action::requeue(state.config.requeue))
 }
 
+async fn reconcile_training_run<R>(
+    run: Arc<TrainingRun>,
+    state: Arc<OperatorState<R>>,
+) -> Result<Action, OperatorError>
+where
+    R: HyprstreamOperatorRpc,
+{
+    if run.meta().deletion_timestamp.is_some() {
+        return finalize_training_run(run.as_ref(), state.as_ref()).await;
+    }
+    if training_run_terminal_observed_current(run.as_ref()) {
+        return Ok(Action::requeue(state.config.requeue));
+    }
+    ensure_training_run_metadata(&state.client, run.as_ref()).await?;
+    let outcome = evaluate_training_run(run.as_ref(), state.as_ref()).await;
+    let status = status_for_training_run_outcome(run.as_ref(), &outcome);
+    if training_run_status_changed(run.as_ref(), &status) {
+        patch_training_run_status(&state.client, run.as_ref(), status).await?;
+    }
+    outcome.map(|_| Action::requeue(state.config.requeue))
+}
+
+async fn finalize_training_run<R>(
+    run: &TrainingRun,
+    state: &OperatorState<R>,
+) -> Result<Action, OperatorError>
+where
+    R: HyprstreamOperatorRpc,
+{
+    if !has_finalizer(run, TRAINING_RUN_FINALIZER) {
+        return Ok(Action::await_change());
+    }
+    let tenant = tenant_for_resource(state, TRAINING_RUN_KIND, run).await?;
+    state.rpc.finalize_training_run(&tenant, run).await?;
+    remove_training_run_finalizer(&state.client, run).await?;
+    Ok(Action::await_change())
+}
+
 fn model_error_policy<R>(
     _model: Arc<Model>,
     _error: &OperatorError,
@@ -255,6 +404,17 @@ where
     Action::requeue(state.config.requeue)
 }
 
+fn training_run_error_policy<R>(
+    _run: Arc<TrainingRun>,
+    _error: &OperatorError,
+    state: Arc<OperatorState<R>>,
+) -> Action
+where
+    R: HyprstreamOperatorRpc,
+{
+    Action::requeue(state.config.requeue)
+}
+
 async fn evaluate_model<R>(
     model: &Model,
     state: &OperatorState<R>,
@@ -264,6 +424,17 @@ where
 {
     let tenant = tenant_for_resource(state, MODEL_KIND, model).await?;
     state.rpc.reconcile_model(&tenant, model).await
+}
+
+async fn evaluate_training_run<R>(
+    run: &TrainingRun,
+    state: &OperatorState<R>,
+) -> Result<TrainingRunObservation, OperatorError>
+where
+    R: HyprstreamOperatorRpc,
+{
+    let tenant = tenant_for_resource(state, TRAINING_RUN_KIND, run).await?;
+    state.rpc.reconcile_training_run(&tenant, run).await
 }
 
 async fn evaluate_adapter<R>(
@@ -398,6 +569,26 @@ fn adapter_status_observed_current(adapter: &Adapter) -> bool {
         == adapter.meta().generation
 }
 
+fn training_run_terminal_observed_current(run: &TrainingRun) -> bool {
+    run.status.as_ref().is_some_and(|status| {
+        status.observed_generation == run.meta().generation
+            && status
+                .phase
+                .as_deref()
+                .is_some_and(TrainingRunPhase::is_terminal_status)
+    })
+}
+
+fn training_run_status_changed(run: &TrainingRun, next: &TrainingRunStatus) -> bool {
+    run.status
+        .as_ref()
+        .is_none_or(|current| status_value(current) != status_value(next))
+}
+
+fn status_value<S: Serialize>(status: &S) -> serde_json::Value {
+    serde_json::to_value(status).unwrap_or(serde_json::Value::Null)
+}
+
 fn status_for_model_outcome(
     model: &Model,
     outcome: &Result<ModelObservation, OperatorError>,
@@ -436,6 +627,26 @@ fn status_for_adapter_outcome(
     }
 }
 
+fn status_for_training_run_outcome(
+    run: &TrainingRun,
+    outcome: &Result<TrainingRunObservation, OperatorError>,
+) -> TrainingRunStatus {
+    match outcome {
+        Ok(observed) => TrainingRunStatus {
+            phase: Some(observed.phase.as_status().to_owned()),
+            produced_adapter: observed.produced_adapter.clone(),
+            message: observed.message.clone(),
+            observed_generation: run.meta().generation,
+        },
+        Err(error) => TrainingRunStatus {
+            phase: Some(TrainingRunPhase::Failed.as_status().to_owned()),
+            produced_adapter: None,
+            message: Some(error.to_string()),
+            observed_generation: run.meta().generation,
+        },
+    }
+}
+
 async fn ensure_operator_label<K>(
     client: &Client,
     resource: &K,
@@ -459,6 +670,46 @@ where
     .await
 }
 
+async fn ensure_training_run_metadata(
+    client: &Client,
+    run: &TrainingRun,
+) -> Result<TrainingRun, kube::Error> {
+    let namespace = run.namespace().unwrap_or_default();
+    let api: Api<TrainingRun> = Api::namespaced(client.clone(), &namespace);
+    api.patch(
+        &run.name_any(),
+        &PatchParams::apply(OPERATOR_FIELD_MANAGER).force(),
+        &Patch::Apply(&training_run_metadata_patch(run)),
+    )
+    .await
+}
+
+async fn remove_training_run_finalizer(
+    client: &Client,
+    run: &TrainingRun,
+) -> Result<TrainingRun, kube::Error> {
+    let namespace = run.namespace().unwrap_or_default();
+    let api: Api<TrainingRun> = Api::namespaced(client.clone(), &namespace);
+    let finalizers: Vec<String> = run
+        .meta()
+        .finalizers
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|finalizer| finalizer != TRAINING_RUN_FINALIZER)
+        .collect();
+    api.patch(
+        &run.name_any(),
+        &PatchParams::default(),
+        &Patch::Merge(json!({
+            "metadata": {
+                "finalizers": finalizers,
+            },
+        })),
+    )
+    .await
+}
+
 async fn patch_model_status(
     client: &Client,
     model: &Model,
@@ -473,6 +724,14 @@ async fn patch_adapter_status(
     status: AdapterStatus,
 ) -> Result<Adapter, kube::Error> {
     patch_namespaced_status(client, adapter, ADAPTER_KIND, status).await
+}
+
+async fn patch_training_run_status(
+    client: &Client,
+    run: &TrainingRun,
+    status: TrainingRunStatus,
+) -> Result<TrainingRun, kube::Error> {
+    patch_namespaced_status(client, run, TRAINING_RUN_KIND, status).await
 }
 
 async fn patch_namespaced_status<K, S>(
@@ -530,9 +789,43 @@ where
     })
 }
 
+fn training_run_metadata_patch(run: &TrainingRun) -> serde_json::Value {
+    let mut finalizers = run.meta().finalizers.clone().unwrap_or_default();
+    if !finalizers
+        .iter()
+        .any(|finalizer| finalizer == TRAINING_RUN_FINALIZER)
+    {
+        finalizers.push(TRAINING_RUN_FINALIZER.to_owned());
+    }
+    json!({
+        "apiVersion": format!("training.hyprstream.io/{API_VERSION}"),
+        "kind": TRAINING_RUN_KIND,
+        "metadata": {
+            "name": run.name_any(),
+            "namespace": run.namespace(),
+            "labels": {
+                MANAGED_BY_LABEL: MANAGED_BY_VALUE,
+            },
+            "finalizers": finalizers,
+        },
+    })
+}
+
+fn has_finalizer<K>(resource: &K, finalizer: &str) -> bool
+where
+    K: ResourceExt,
+{
+    resource
+        .meta()
+        .finalizers
+        .as_ref()
+        .is_some_and(|finalizers| finalizers.iter().any(|item| item == finalizer))
+}
+
 fn group_for_kind(kind: &str) -> &'static str {
     match kind {
         MODEL_KIND | ADAPTER_KIND => "models",
+        TRAINING_RUN_KIND => "training",
         _ => "mesh",
     }
 }
@@ -540,7 +833,7 @@ fn group_for_kind(kind: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AdapterSpec, ModelSpec, ModelStage, TenantBindingSpec};
+    use crate::{AdapterSpec, ModelSpec, ModelStage, TenantBindingSpec, TrainingRunSpec};
 
     #[test]
     fn model_success_status_reports_observed_ref() {
@@ -729,5 +1022,194 @@ mod tests {
             ),
             Err(error) => panic!("valid binding failed: {error}"),
         }
+    }
+
+    #[test]
+    fn training_run_promoted_status_reports_adapter() {
+        let run = TrainingRun::new(
+            "train-qwen",
+            TrainingRunSpec {
+                model_ref: "qwen".to_owned(),
+                dataset_mount: "/datasets/toy".to_owned(),
+                adapter_name: Some("00_toy.safetensors".to_owned()),
+                runs_on: None,
+                resources: None,
+            },
+        );
+        let status = status_for_training_run_outcome(
+            &run,
+            &Ok(TrainingRunObservation {
+                phase: TrainingRunPhase::Promoted,
+                produced_adapter: Some("00_toy.safetensors".to_owned()),
+                message: Some("merged refs/heads/train-qwen".to_owned()),
+            }),
+        );
+
+        assert_eq!(status.phase.as_deref(), Some("Promoted"));
+        assert_eq!(
+            status.produced_adapter.as_deref(),
+            Some("00_toy.safetensors")
+        );
+        assert_eq!(
+            status.message.as_deref(),
+            Some("merged refs/heads/train-qwen")
+        );
+    }
+
+    #[test]
+    fn training_run_manual_gate_status_is_distinct() {
+        let run = TrainingRun::new(
+            "train-qwen",
+            TrainingRunSpec {
+                model_ref: "qwen".to_owned(),
+                dataset_mount: "/datasets/toy".to_owned(),
+                adapter_name: None,
+                runs_on: None,
+                resources: None,
+            },
+        );
+        let status = status_for_training_run_outcome(
+            &run,
+            &Ok(TrainingRunObservation {
+                phase: TrainingRunPhase::AwaitingPromotion,
+                produced_adapter: Some("train-qwen.safetensors".to_owned()),
+                message: Some("manual promotion required".to_owned()),
+            }),
+        );
+
+        assert_eq!(status.phase.as_deref(), Some("AwaitingPromotion"));
+        assert_eq!(
+            status.produced_adapter.as_deref(),
+            Some("train-qwen.safetensors")
+        );
+    }
+
+    #[test]
+    fn training_run_failure_status_retains_message() {
+        let run = TrainingRun::new(
+            "train-qwen",
+            TrainingRunSpec {
+                model_ref: "qwen".to_owned(),
+                dataset_mount: "/datasets/toy".to_owned(),
+                adapter_name: None,
+                runs_on: None,
+                resources: None,
+            },
+        );
+        let status = status_for_training_run_outcome(
+            &run,
+            &Err(OperatorError::Rpc(
+                "worker exited 1; branch retained".to_owned(),
+            )),
+        );
+
+        assert_eq!(status.phase.as_deref(), Some("Failed"));
+        assert_eq!(status.produced_adapter, None);
+        assert!(status
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("branch retained"));
+    }
+
+    #[test]
+    fn training_run_status_patch_uses_training_group() {
+        let run = TrainingRun::new(
+            "train-qwen",
+            TrainingRunSpec {
+                model_ref: "qwen".to_owned(),
+                dataset_mount: "/datasets/toy".to_owned(),
+                adapter_name: None,
+                runs_on: None,
+                resources: None,
+            },
+        );
+        let patch = status_patch(
+            &run,
+            TRAINING_RUN_KIND,
+            TrainingRunStatus {
+                phase: Some("Training".to_owned()),
+                produced_adapter: None,
+                message: None,
+                observed_generation: None,
+            },
+        );
+
+        assert_eq!(patch["apiVersion"], "training.hyprstream.io/v1alpha1");
+        assert_eq!(patch["kind"], "TrainingRun");
+        assert_eq!(patch["status"]["phase"], "Training");
+    }
+
+    #[test]
+    fn terminal_training_run_status_short_circuits_reconcile() {
+        let mut run = TrainingRun::new(
+            "train-qwen",
+            TrainingRunSpec {
+                model_ref: "qwen".to_owned(),
+                dataset_mount: "/datasets/toy".to_owned(),
+                adapter_name: None,
+                runs_on: None,
+                resources: None,
+            },
+        );
+        run.metadata.generation = Some(9);
+        run.status = Some(TrainingRunStatus {
+            phase: Some("Promoted".to_owned()),
+            observed_generation: Some(9),
+            ..Default::default()
+        });
+
+        assert!(training_run_terminal_observed_current(&run));
+
+        run.status = Some(TrainingRunStatus {
+            phase: Some("Training".to_owned()),
+            observed_generation: Some(9),
+            ..Default::default()
+        });
+        assert!(!training_run_terminal_observed_current(&run));
+    }
+
+    #[test]
+    fn training_run_status_changed_detects_noop_patch() {
+        let mut run = TrainingRun::new(
+            "train-qwen",
+            TrainingRunSpec {
+                model_ref: "qwen".to_owned(),
+                dataset_mount: "/datasets/toy".to_owned(),
+                adapter_name: None,
+                runs_on: None,
+                resources: None,
+            },
+        );
+        let status = TrainingRunStatus {
+            phase: Some("Training".to_owned()),
+            produced_adapter: None,
+            message: Some("running".to_owned()),
+            observed_generation: Some(2),
+        };
+        run.status = Some(status.clone());
+
+        assert!(!training_run_status_changed(&run, &status));
+    }
+
+    #[test]
+    fn training_run_metadata_patch_adds_finalizer() {
+        let run = TrainingRun::new(
+            "train-qwen",
+            TrainingRunSpec {
+                model_ref: "qwen".to_owned(),
+                dataset_mount: "/datasets/toy".to_owned(),
+                adapter_name: None,
+                runs_on: None,
+                resources: None,
+            },
+        );
+        let patch = training_run_metadata_patch(&run);
+
+        assert_eq!(
+            patch["metadata"]["labels"][MANAGED_BY_LABEL],
+            MANAGED_BY_VALUE
+        );
+        assert_eq!(patch["metadata"]["finalizers"][0], TRAINING_RUN_FINALIZER);
     }
 }
