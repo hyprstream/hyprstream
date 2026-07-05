@@ -51,6 +51,18 @@ pub struct OperatorConfig {
     pub serving_port: u16,
     /// Prometheus base URL used by generated KEDA ScaledObjects.
     pub prometheus_server: String,
+    /// Request-rate threshold used by generated autoscalers.
+    pub request_rate_threshold: String,
+    /// Token-throughput threshold used by generated autoscalers.
+    pub tokens_per_second_threshold: String,
+    /// Stream-backpressure threshold used by generated autoscalers.
+    pub stream_backpressure_threshold: String,
+    /// Extended resource key used for GPU scheduling.
+    pub gpu_resource_name: String,
+    /// GPU count requested by serving pods.
+    pub gpu_count: u32,
+    /// Memory request for serving pods.
+    pub serving_memory_request: String,
 }
 
 impl Default for OperatorConfig {
@@ -62,6 +74,12 @@ impl Default for OperatorConfig {
             gateway_parent_ref: "hyprstream".to_owned(),
             serving_port: 8080,
             prometheus_server: "http://prometheus-server.monitoring.svc:9090".to_owned(),
+            request_rate_threshold: "10".to_owned(),
+            tokens_per_second_threshold: "100".to_owned(),
+            stream_backpressure_threshold: "1".to_owned(),
+            gpu_resource_name: "nvidia.com/gpu".to_owned(),
+            gpu_count: 1,
+            serving_memory_request: "16Gi".to_owned(),
         }
     }
 }
@@ -95,12 +113,8 @@ pub struct TrainingRunObservation {
 /// Kubernetes objects projected for a native hyprstream serving endpoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServingPlan {
-    pub deployment: Value,
-    pub service: Value,
-    pub http_route: Value,
-    pub autoscaler: Value,
-    pub prunes: Vec<Value>,
-    pub url: String,
+    pub apply: Vec<Value>,
+    pub prune: Vec<Value>,
 }
 
 /// Result observed after reconciling an InferenceService serving plan.
@@ -770,12 +784,14 @@ fn status_for_inference_service_outcome(
             phase: Some(inference_service_phase(service, observed.ready_replicas).to_owned()),
             ready_replicas: Some(observed.ready_replicas),
             url: observed.url.clone(),
+            message: observed.message.clone(),
             observed_generation: service.meta().generation,
         },
-        Err(_error) => InferenceServiceStatus {
+        Err(error) => InferenceServiceStatus {
             phase: Some("Failed".to_owned()),
             ready_replicas: Some(0),
             url: None,
+            message: Some(error.to_string()),
             observed_generation: service.meta().generation,
         },
     }
@@ -801,7 +817,6 @@ fn serving_plan(service: &InferenceService, tenant: &str, config: &OperatorConfi
     let min_replicas = effective_min_replicas(service);
     let max_replicas = service.spec.max_replicas.max(min_replicas.max(1));
     let statefulness = statefulness_value(&service.spec.statefulness);
-    let url = format!("https://{}.{}.hyprstream.local/v1", name, namespace);
 
     let deployment = json!({
         "apiVersion": "apps/v1",
@@ -824,15 +839,19 @@ fn serving_plan(service: &InferenceService, tenant: &str, config: &OperatorConfi
                     "annotations": {
                         "hyprstream.io/model-ref": service.spec.model,
                         "hyprstream.io/statefulness": statefulness,
+                        "hyprstream.io/drain-before-scale": drain_before_scale(&service.spec.statefulness),
+                        "hyprstream.io/drain-prerequisite": "https://github.com/hyprstream/hyprstream/issues/869",
                     },
                 },
                 "spec": {
+                    "terminationGracePeriodSeconds": 120,
                     "containers": [{
                         "name": "model-service",
                         "image": config.serving_image,
                         "args": [
-                            "serve",
-                            "--openai-compatible",
+                            "service",
+                            "start",
+                            "oai",
                             "--model", service.spec.model,
                             "--tenant", tenant,
                         ],
@@ -840,6 +859,24 @@ fn serving_plan(service: &InferenceService, tenant: &str, config: &OperatorConfi
                             "name": "http",
                             "containerPort": config.serving_port,
                         }],
+                        "resources": serving_resources(config),
+                        "readinessProbe": {
+                            "httpGet": {
+                                "path": "/healthz/ready",
+                                "port": "http",
+                            },
+                            "periodSeconds": 10,
+                            "failureThreshold": 18,
+                        },
+                        "livenessProbe": {
+                            "httpGet": {
+                                "path": "/healthz/live",
+                                "port": "http",
+                            },
+                            "periodSeconds": 30,
+                            "failureThreshold": 3,
+                        },
+                        "lifecycle": lifecycle_for_statefulness(&service.spec.statefulness),
                     }],
                 },
             },
@@ -882,9 +919,6 @@ fn serving_plan(service: &InferenceService, tenant: &str, config: &OperatorConfi
             "parentRefs": [{
                 "name": config.gateway_parent_ref,
             }],
-            "hostnames": [
-                format!("{}.{}.hyprstream.local", name, namespace),
-            ],
             "rules": [{
                 "matches": [{
                     "path": {
@@ -911,6 +945,7 @@ fn serving_plan(service: &InferenceService, tenant: &str, config: &OperatorConfi
                     owner_references,
                     max_replicas,
                     &config.prometheus_server,
+                    &config.request_rate_threshold,
                 ),
                 vec![prune_manifest(
                     "autoscaling/v2",
@@ -928,6 +963,7 @@ fn serving_plan(service: &InferenceService, tenant: &str, config: &OperatorConfi
                     owner_references,
                     min_replicas,
                     max_replicas,
+                    config,
                 ),
                 vec![prune_manifest(
                     "keda.sh/v1alpha1",
@@ -939,17 +975,28 @@ fn serving_plan(service: &InferenceService, tenant: &str, config: &OperatorConfi
         };
 
     ServingPlan {
-        deployment,
-        service: service_manifest,
-        http_route,
-        autoscaler,
-        prunes,
-        url,
+        apply: vec![deployment, service_manifest, http_route, autoscaler],
+        prune: prunes,
     }
 }
 
 fn serving_app_name(name: &str) -> String {
-    format!("hs-serve-{name}")
+    let candidate = format!("hs-serve-{name}");
+    if candidate.len() <= 63 {
+        return candidate;
+    }
+
+    let hash = fnv1a32(name.as_bytes());
+    format!("hs-serve-{}-{hash:08x}", &name[..45])
+}
+
+fn fnv1a32(bytes: &[u8]) -> u32 {
+    let mut hash = 0x811c9dc5u32;
+    for byte in bytes {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    hash
 }
 
 fn serving_labels(app: &str, tenant: &str) -> Value {
@@ -990,12 +1037,51 @@ fn statefulness_value(statefulness: &Statefulness) -> &'static str {
 
 fn http_route_annotations(statefulness: &Statefulness) -> Value {
     match statefulness {
-        Statefulness::Stateless => json!({}),
+        Statefulness::Stateless => json!({
+            "hyprstream.io/hostname-source": "did-operated-domain",
+        }),
         Statefulness::TttStateful => json!({
-            "hyprstream.io/session-persistence": "gateway-consistent-hash",
-            "hyprstream.io/session-persistence-key": "tenant,authorization-subject",
+            "hyprstream.io/hostname-source": "did-operated-domain",
+            "hyprstream.io/session-persistence": "subject-header-consistent-hash",
+            "hyprstream.io/session-persistence-key": "Subject",
         }),
     }
+}
+
+fn drain_before_scale(statefulness: &Statefulness) -> &'static str {
+    match statefulness {
+        Statefulness::Stateless => "not-required",
+        Statefulness::TttStateful => "required",
+    }
+}
+
+fn lifecycle_for_statefulness(statefulness: &Statefulness) -> Value {
+    match statefulness {
+        Statefulness::Stateless => json!({}),
+        Statefulness::TttStateful => json!({
+            "preStop": {
+                "exec": {
+                    "command": [
+                        "sh",
+                        "-c",
+                        "hyprstream service drain --export-once || true",
+                    ],
+                },
+            },
+        }),
+    }
+}
+
+fn serving_resources(config: &OperatorConfig) -> Value {
+    json!({
+        "requests": {
+            "memory": config.serving_memory_request,
+            config.gpu_resource_name.as_str(): config.gpu_count.to_string(),
+        },
+        "limits": {
+            config.gpu_resource_name.as_str(): config.gpu_count.to_string(),
+        },
+    })
 }
 
 fn hpa(
@@ -1005,6 +1091,7 @@ fn hpa(
     owner_references: Value,
     min_replicas: u32,
     max_replicas: u32,
+    config: &OperatorConfig,
 ) -> Value {
     json!({
         "apiVersion": "autoscaling/v2",
@@ -1034,7 +1121,7 @@ fn hpa(
                     },
                     "target": {
                         "type": "AverageValue",
-                        "averageValue": "10",
+                        "averageValue": config.request_rate_threshold,
                     },
                 },
             }, {
@@ -1045,7 +1132,7 @@ fn hpa(
                     },
                     "target": {
                         "type": "AverageValue",
-                        "averageValue": "100",
+                        "averageValue": config.tokens_per_second_threshold,
                     },
                 },
             }, {
@@ -1056,7 +1143,7 @@ fn hpa(
                     },
                     "target": {
                         "type": "AverageValue",
-                        "averageValue": "1",
+                        "averageValue": config.stream_backpressure_threshold,
                     },
                 },
             }],
@@ -1072,6 +1159,7 @@ fn keda_scaled_object(
     owner_references: Value,
     max_replicas: u32,
     prometheus_server: &str,
+    request_rate_threshold: &str,
 ) -> Value {
     json!({
         "apiVersion": "keda.sh/v1alpha1",
@@ -1096,7 +1184,7 @@ fn keda_scaled_object(
                 "metadata": {
                     "serverAddress": prometheus_server,
                     "metricName": "hyprstream_request_rate",
-                    "threshold": "10",
+                    "threshold": request_rate_threshold,
                     "query": format!("sum(rate(hyprstream_requests_total{{inference_service=\"{}\"}}[1m]))", service.name_any()),
                 },
             }],
@@ -1614,24 +1702,48 @@ mod tests {
         service
     }
 
+    fn applied<'a>(plan: &'a ServingPlan, kind: &str) -> &'a Value {
+        plan.apply
+            .iter()
+            .find(|manifest| manifest["kind"] == kind)
+            .unwrap_or_else(|| panic!("missing apply manifest kind {kind}"))
+    }
+
     #[test]
     fn serving_plan_stateful_never_scales_to_zero() {
         let service = inference_service("chat", Statefulness::TttStateful, 0);
         let plan = serving_plan(&service, "tenant-a", &OperatorConfig::default());
+        let deployment = applied(&plan, "Deployment");
+        let service_manifest = applied(&plan, "Service");
+        let route = applied(&plan, "HTTPRoute");
+        let autoscaler = applied(&plan, "HorizontalPodAutoscaler");
 
-        assert!(plan.deployment["spec"].get("replicas").is_none());
-        assert_eq!(plan.service["spec"]["sessionAffinity"], "None");
+        assert!(deployment["spec"].get("replicas").is_none());
+        assert_eq!(service_manifest["spec"]["sessionAffinity"], "None");
         assert_eq!(
-            plan.http_route["metadata"]["annotations"]["hyprstream.io/session-persistence"],
-            "gateway-consistent-hash"
+            route["metadata"]["annotations"]["hyprstream.io/session-persistence"],
+            "subject-header-consistent-hash"
         );
-        assert_eq!(plan.autoscaler["kind"], "HorizontalPodAutoscaler");
-        assert_eq!(plan.autoscaler["spec"]["minReplicas"], 1);
-        assert_eq!(plan.prunes[0]["kind"], "ScaledObject");
         assert_eq!(
-            plan.deployment["spec"]["template"]["metadata"]["annotations"]
-                ["hyprstream.io/statefulness"],
+            route["metadata"]["annotations"]["hyprstream.io/session-persistence-key"],
+            "Subject"
+        );
+        assert!(route["spec"].get("hostnames").is_none());
+        assert_eq!(autoscaler["spec"]["minReplicas"], 1);
+        assert_eq!(plan.prune[0]["kind"], "ScaledObject");
+        assert_eq!(
+            deployment["spec"]["template"]["metadata"]["annotations"]["hyprstream.io/statefulness"],
             "ttt-stateful"
+        );
+        assert_eq!(
+            deployment["spec"]["template"]["metadata"]["annotations"]
+                ["hyprstream.io/drain-before-scale"],
+            "required"
+        );
+        assert_eq!(
+            deployment["spec"]["template"]["spec"]["containers"][0]["lifecycle"]["preStop"]["exec"]
+                ["command"],
+            json!(["sh", "-c", "hyprstream service drain --export-once || true"])
         );
     }
 
@@ -1639,15 +1751,17 @@ mod tests {
     fn serving_plan_stateless_zero_uses_keda_scaled_object() {
         let service = inference_service("embed", Statefulness::Stateless, 0);
         let plan = serving_plan(&service, "tenant-a", &OperatorConfig::default());
+        let deployment = applied(&plan, "Deployment");
+        let service_manifest = applied(&plan, "Service");
+        let autoscaler = applied(&plan, "ScaledObject");
 
-        assert!(plan.deployment["spec"].get("replicas").is_none());
-        assert_eq!(plan.service["spec"]["sessionAffinity"], "None");
-        assert_eq!(plan.autoscaler["apiVersion"], "keda.sh/v1alpha1");
-        assert_eq!(plan.autoscaler["kind"], "ScaledObject");
-        assert_eq!(plan.autoscaler["spec"]["minReplicaCount"], 0);
-        assert_eq!(plan.prunes[0]["kind"], "HorizontalPodAutoscaler");
+        assert!(deployment["spec"].get("replicas").is_none());
+        assert_eq!(service_manifest["spec"]["sessionAffinity"], "None");
+        assert_eq!(autoscaler["apiVersion"], "keda.sh/v1alpha1");
+        assert_eq!(autoscaler["spec"]["minReplicaCount"], 0);
+        assert_eq!(plan.prune[0]["kind"], "HorizontalPodAutoscaler");
         assert_eq!(
-            plan.autoscaler["spec"]["triggers"][0]["metadata"]["serverAddress"],
+            autoscaler["spec"]["triggers"][0]["metadata"]["serverAddress"],
             OperatorConfig::default().prometheus_server
         );
     }
@@ -1656,21 +1770,55 @@ mod tests {
     fn serving_plan_routes_openai_surface_through_gateway() {
         let service = inference_service("chat", Statefulness::Stateless, 1);
         let plan = serving_plan(&service, "tenant-a", &OperatorConfig::default());
+        let deployment = applied(&plan, "Deployment");
+        let route = applied(&plan, "HTTPRoute");
 
+        assert_eq!(route["apiVersion"], "gateway.networking.k8s.io/v1");
+        assert_eq!(route["kind"], "HTTPRoute");
+        assert!(route["spec"].get("hostnames").is_none());
         assert_eq!(
-            plan.http_route["apiVersion"],
-            "gateway.networking.k8s.io/v1"
+            route["metadata"]["annotations"]["hyprstream.io/hostname-source"],
+            "did-operated-domain"
         );
-        assert_eq!(plan.http_route["kind"], "HTTPRoute");
         assert_eq!(
-            plan.http_route["spec"]["rules"][0]["matches"][0]["path"]["value"],
+            route["spec"]["rules"][0]["matches"][0]["path"]["value"],
             "/v1"
         );
         assert_eq!(
-            plan.http_route["spec"]["rules"][0]["backendRefs"][0]["name"],
+            route["spec"]["rules"][0]["backendRefs"][0]["name"],
             "hs-serve-chat"
         );
-        assert_eq!(plan.url, "https://chat.default.hyprstream.local/v1");
+        assert_eq!(
+            deployment["spec"]["template"]["spec"]["containers"][0]["args"],
+            json!([
+                "service",
+                "start",
+                "oai",
+                "--model",
+                "qwen:main",
+                "--tenant",
+                "tenant-a"
+            ])
+        );
+        assert_eq!(
+            deployment["spec"]["template"]["spec"]["containers"][0]["resources"]["requests"]
+                ["nvidia.com/gpu"],
+            "1"
+        );
+        assert_eq!(
+            deployment["spec"]["template"]["spec"]["containers"][0]["readinessProbe"]["httpGet"]
+                ["path"],
+            "/healthz/ready"
+        );
+    }
+
+    #[test]
+    fn serving_plan_app_name_fits_dns_label() {
+        let name = "a".repeat(63);
+        let app = serving_app_name(&name);
+
+        assert!(app.len() <= 63);
+        assert!(app.starts_with("hs-serve-"));
     }
 
     #[test]
@@ -1682,7 +1830,8 @@ mod tests {
             InferenceServiceStatus {
                 phase: Some("Ready".to_owned()),
                 ready_replicas: Some(1),
-                url: Some("https://chat.default.hyprstream.local/v1".to_owned()),
+                url: Some("https://chat.example.com/v1".to_owned()),
+                message: Some("published via discovery".to_owned()),
                 observed_generation: None,
             },
         );
@@ -1690,6 +1839,7 @@ mod tests {
         assert_eq!(patch["apiVersion"], "serving.hyprstream.io/v1alpha1");
         assert_eq!(patch["kind"], "InferenceService");
         assert_eq!(patch["status"]["readyReplicas"], 1);
+        assert_eq!(patch["status"]["message"], "published via discovery");
     }
 
     #[test]
@@ -1699,16 +1849,17 @@ mod tests {
             &service,
             &Ok(InferenceServiceObservation {
                 ready_replicas: 2,
-                url: Some("https://chat.default.hyprstream.local/v1".to_owned()),
-                message: None,
+                url: Some("https://chat.example.com/v1".to_owned()),
+                message: Some("observed from DiscoveryService".to_owned()),
             }),
         );
 
         assert_eq!(status.phase.as_deref(), Some("Ready"));
         assert_eq!(status.ready_replicas, Some(2));
+        assert_eq!(status.url.as_deref(), Some("https://chat.example.com/v1"));
         assert_eq!(
-            status.url.as_deref(),
-            Some("https://chat.default.hyprstream.local/v1")
+            status.message.as_deref(),
+            Some("observed from DiscoveryService")
         );
     }
 
@@ -1719,7 +1870,7 @@ mod tests {
             &service,
             &Ok(InferenceServiceObservation {
                 ready_replicas: 0,
-                url: Some("https://embed.default.hyprstream.local/v1".to_owned()),
+                url: Some("https://embed.example.com/v1".to_owned()),
                 message: None,
             }),
         );
