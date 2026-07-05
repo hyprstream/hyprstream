@@ -105,6 +105,46 @@ impl GitHash {
     pub fn is_sha1(&self) -> bool {
         matches!(self, GitHash::Sha1(_))
     }
+
+    /// Object format (hash algorithm) this hash belongs to.
+    pub fn object_format(&self) -> ObjectFormat {
+        ObjectFormat::from(self)
+    }
+}
+
+/// Git repository object format (hash algorithm).
+///
+/// Git objects that embed references in **binary** form (notably tree
+/// entries) do not self-describe their hash width, so the width must be
+/// carried from the surrounding context (the object's own hash, or the
+/// repository's `extensions.objectFormat`). This enum makes that context
+/// explicit so a SHA-256 repository is not parsed with a hardcoded 20-byte
+/// (SHA-1) OID width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ObjectFormat {
+    /// SHA1 object format (20-byte raw OIDs) - legacy git format.
+    Sha1,
+    /// SHA256 object format (32-byte raw OIDs) - modern git format.
+    Sha256,
+}
+
+impl ObjectFormat {
+    /// Raw hash width in bytes for this object format (SHA1 = 20, SHA256 = 32).
+    pub const fn hash_len(self) -> usize {
+        match self {
+            ObjectFormat::Sha1 => 20,
+            ObjectFormat::Sha256 => 32,
+        }
+    }
+}
+
+impl From<&GitHash> for ObjectFormat {
+    fn from(hash: &GitHash) -> Self {
+        match hash {
+            GitHash::Sha1(_) => ObjectFormat::Sha1,
+            GitHash::Sha256(_) => ObjectFormat::Sha256,
+        }
+    }
 }
 
 impl std::fmt::Display for GitHash {
