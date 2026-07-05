@@ -50,6 +50,15 @@ pub mod training;
 #[cfg(feature = "k8s")]
 pub mod install;
 
+// Re-export the underlying `kube`/`k8s-openapi` crates so downstream crates
+// (e.g. `hyprstream-workers`' `k8s` sandbox backend) consume the *same*
+// versions and the single `v1_*` k8s-openapi feature this crate pins, rather
+// than declaring their own — the workspace allows exactly one k8s-openapi
+// `v1_*` feature, and threading these through one crate keeps that invariant
+// impossible to violate by accident.
+pub use k8s_openapi;
+pub use kube;
+
 pub use mesh::{TenantBinding, TenantBindingSpec, TenantBindingStatus};
 pub use models::{Adapter, AdapterSpec, AdapterStatus, Model, ModelSpec, ModelStage, ModelStatus};
 pub use serving::{InferenceService, InferenceServiceSpec, InferenceServiceStatus, Statefulness};

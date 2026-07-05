@@ -975,6 +975,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn registry_contains_k8s_only_under_feature() {
+        // The Kubernetes API-server backend (#781) registers iff built with
+        // `--features k8s`. With the feature off it must NOT be a selectable
+        // name (fail-closed), mirroring `cri`/`wasm`/`oci`/`kata`.
+        let has_k8s = inventory::iter::<BackendRegistration>().any(|r| r.name == "k8s");
+        assert_eq!(
+            has_k8s,
+            cfg!(feature = "k8s"),
+            "k8s registration must track the k8s feature"
+        );
+    }
+
+    #[cfg(feature = "k8s")]
+    #[test]
+    fn k8s_is_explicit_name_only() {
+        // Handing a workload to a cluster (scheduler-placed, cross-node,
+        // quota-charged) is an auth-surface decision (#781/#778): `"auto"` must
+        // never reach for `k8s`, mirroring `cri`.
+        let k8s = inventory::iter::<BackendRegistration>()
+            .find(|r| r.name == "k8s")
+            .expect("k8s registered under the k8s feature");
+        assert!(!k8s.auto_selectable, "k8s must be explicit-name-only");
+    }
+
     #[cfg(feature = "cri")]
     #[test]
     fn cri_is_explicit_name_only() {
