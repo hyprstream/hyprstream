@@ -48,11 +48,15 @@ spec:
           envFrom:
             - configMapRef:
                 name: {{ include "hyprstream.fullname" $root }}-config
-          {{- with $svc.env }}
+          {{- if or $svc.env (and $root.Values.keyBootstrap.enabled $root.Values.keyBootstrap.issuerUrl) }}
           env:
-            {{- range $k, $v := . }}
+            {{- range $k, $v := $svc.env }}
             - name: {{ $k }}
               value: {{ $v | quote }}
+            {{- end }}
+            {{- if and $root.Values.keyBootstrap.enabled $root.Values.keyBootstrap.issuerUrl }}
+            - name: HYPRSTREAM__OAUTH__ISSUER_URL
+              value: {{ $root.Values.keyBootstrap.issuerUrl | quote }}
             {{- end }}
           {{- end }}
           {{- with $svc.ports }}
@@ -83,7 +87,9 @@ spec:
             - name: data
               mountPath: {{ $root.Values.config.dataDir }}
             {{- if $root.Values.keyBootstrap.enabled }}
-            # TODO(#783): mount per-service signing-key Secret at secretsPath.
+            - name: credentials
+              mountPath: {{ $root.Values.keyBootstrap.secretsPath }}
+              readOnly: true
             {{- end }}
       {{- with (default $defaults.nodeSelector $svc.nodeSelector) }}
       nodeSelector:
@@ -105,5 +111,34 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        {{- if $root.Values.keyBootstrap.enabled }}
+        - name: credentials
+          projected:
+            defaultMode: 0400
+            sources:
+              - secret:
+                  name: {{ include "hyprstream.trustSecretName" $root }}
+                  items:
+                    - key: ca-pubkey
+                      path: ca-pubkey
+                    - key: bootstrap-pubkeys
+                      path: bootstrap-pubkeys
+              - secret:
+                  name: {{ include "hyprstream.serviceCredentialSecretName" $ctx }}
+                  items:
+                    - key: signing-key
+                      path: signing-key
+                    {{- if ne $name "policy" }}
+                    - key: service-jwt
+                      path: service-jwt
+                    {{- end }}
+              {{- if eq $name "policy" }}
+              - secret:
+                  name: {{ include "hyprstream.policyCaSecretName" $root }}
+                  items:
+                    - key: ca-key
+                      path: ca-key
+              {{- end }}
+        {{- end }}
 {{- end }}
 {{- end }}

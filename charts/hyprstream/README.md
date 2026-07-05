@@ -53,10 +53,32 @@ Values are documented inline in `values.yaml`. Highlights:
   set `accessModes: [ReadWriteMany]` for multi-node).
 - `config.*` — shared `HYPRSTREAM__*` env (rendered into a ConfigMap).
 
+## Key/trust bootstrap
+
+Set `keyBootstrap.enabled=true` to mount the flat credential directory expected
+by `HYPRSTREAM__SECRETS__PATH`. The chart projects externally generated Secrets
+instead of minting identity material in Helm templates.
+
+Required Secret layout:
+
+- Shared trust Secret: `ca-pubkey`, `bootstrap-pubkeys`.
+- Non-policy service credential Secrets: `signing-key`, `service-jwt`.
+- Policy service credential Secret: `signing-key`.
+- Policy CA Secret: `ca-key`.
+
+Omitted per-service Secret names default to
+`<release>-hyprstream-<service>-credentials`. The shared trust Secret defaults to
+`<release>-hyprstream-trust`, and the policy CA Secret defaults to
+`<release>-hyprstream-policy-ca`. Use `keyBootstrap.trust.existingSecret`,
+`keyBootstrap.serviceSecrets`, and `keyBootstrap.policyCaSecret` to bind
+Secrets created by the bootstrap/wizard flow or an external-secrets controller.
+
+`keyBootstrap.issuerUrl`, when set, is exposed to every service as
+`HYPRSTREAM__OAUTH__ISSUER_URL` and must match the issuer stamped into the
+pre-generated service JWTs.
+
 ## Extension hooks (separate issues — not implemented here)
 
-- `keyBootstrap.*` → **#783 (K1a)**: per-service signing-key Secrets, trust store,
-  node DID. This chart only reserves the shape + a stable `HYPRSTREAM__SECRETS__PATH`.
 - `observability.*` → **#784 (K1b)**: OTel Collector → Prometheus exposition.
 
 ## Image assumption
@@ -75,6 +97,5 @@ the RPC resolver / discovery lookup so `for_service("policy")` dials
 multi-process model resolves peers to UDS paths in a shared runtime dir (same-host
 only), and QUIC is a WebTransport/announce plane with no static peer-address
 config. This chart delivers the deployment substrate (Phase 0); a working
-end-to-end install additionally needs that app-side wiring and the #783 key/trust
-bootstrap. The chart itself contains **no shared-volume IPC**, per the #778
-non-goal.
+end-to-end install additionally needs that app-side wiring. The chart itself
+contains **no shared-volume IPC**, per the #778 non-goal.

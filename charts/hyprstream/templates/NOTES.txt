@@ -17,7 +17,8 @@ IMPORTANT (Phase 0 substrate):
   * Cross-pod QUIC service-to-service *peer resolution* (feeding K8s DNS names into
     the RPC resolver / discovery lookup) is not yet wired in hyprstream itself.
     This chart provisions the deployment substrate; a working end-to-end install
-    also needs that app-side wiring plus the key/trust bootstrap from #783 (K1a).
-  * Per-service signing-key Secrets / trust store / node DID: TODO(#783), gated by
-    keyBootstrap.enabled.
+    also needs that app-side wiring.
+  * Per-service signing-key Secrets / trust store projection is available with
+    keyBootstrap.enabled. Provide pre-generated Secrets; the chart does not mint
+    signing keys or service JWTs.
   * OTel Collector / Prometheus exposition: TODO(#784), gated by observability.enabled.
