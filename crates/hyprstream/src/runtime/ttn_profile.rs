@@ -216,7 +216,7 @@ fn entropy_of_nonneg(s: &Tensor) -> f64 {
 /// Compute bond entropy of a weight matrix.
 ///
 /// Returns `(entropy_nats, num_singular_values)`.
-/// The caller normalizes by `ln(num_sv)` for per-matrix normalization (I-1 fix).
+/// The caller normalizes by `ln(num_sv)` for per-matrix normalization.
 ///
 /// Ported from `tnn-transformer-1/src/entropy.py:bond_entropy_from_singular_values`.
 pub fn bond_entropy(matrix: &Tensor) -> (f64, usize) {
@@ -394,7 +394,7 @@ pub fn compute_weight_entropy_profile(
             entropy_to_rank(avg_normalized).min(UNVALIDATED_RANK_CAP)
         };
 
-        // Target modules: default ["q_proj", "v_proj"] for standard (R2-I4 fix)
+        // Target modules: default ["q_proj", "v_proj"] for standard attention
         let target_modules = match layer_type {
             LayerType::FullAttention => {
                 vec!["q_proj".to_owned(), "v_proj".to_owned(), "o_proj".to_owned()]
@@ -424,7 +424,7 @@ pub fn compute_weight_entropy_profile(
         computed_at: Some(chrono::Utc::now().to_rfc3339()),
     };
 
-    // Atomic cache write (R2-I2 fix)
+    // Atomic cache write (tmpfile + rename)
     if let Err(e) = save_cached_profile(model_path, &profile) {
         warn!("Failed to cache layer profile: {e}");
     }
@@ -517,9 +517,11 @@ pub fn get_layer_profile(
     if let Some(weights) = weights {
         warn!(
             model_type = %config.model_type,
+            rank_cap = UNVALIDATED_RANK_CAP,
             "Unknown model — Tier 3 entropy-based rank allocation is unvalidated \
-             (no embedded ablation data). Conservative cap (rank ≤ 8) applied until \
-             ablation spike lands (#202). Consider contributing an embedded profile."
+             (no embedded ablation data). A conservative rank cap is applied until \
+             the mapping is validated against ablation ground truth. Consider \
+             contributing an embedded profile."
         );
         info!("Computing TTN profile for new model (one-time analysis)...");
         return compute_weight_entropy_profile(weights, config, model_path);
@@ -538,7 +540,7 @@ pub fn get_layer_profile(
 ///
 /// Returns value in [0, 1]: 0 = rank-1 (collapsed), 1 = fully utilized.
 ///
-/// Uses SVD of `B^T @ B` which is `[rank, rank]` (I2 fix) — much cheaper than `B @ A`
+/// Uses SVD of `B^T @ B` which is `[rank, rank]` — much cheaper than `B @ A`
 /// which is `[out, in]`. B accumulates the learned update (initialized to zeros), so its
 /// singular value distribution captures how much of the allocated rank is actually being
 /// used. When B is zero (fresh delta), returns 0.0.
