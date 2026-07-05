@@ -696,8 +696,12 @@ mod tests {
         assert_eq!(attn_23.layer_type, LayerType::FullAttention);
 
         let gdn_0 = profile.layers.iter().find(|l| l.layer_idx == 0).expect("layer 0 should exist");
-        assert_eq!(gdn_0.recommended_rank, 4);
+        assert_eq!(gdn_0.recommended_rank, GDN_LORA_RANK);
         assert_eq!(gdn_0.layer_type, LayerType::GatedDeltaNet);
+        assert!(
+            gdn_0.bond_entropy.is_empty(),
+            "no fabricated spectral entries for GDN layers"
+        );
     }
 
     #[test]
@@ -709,11 +713,100 @@ mod tests {
     }
 
     #[test]
-    fn test_entropy_to_rank() {
-        assert_eq!(entropy_to_rank(0.70), 32);
-        assert_eq!(entropy_to_rank(0.82), 16);
-        assert_eq!(entropy_to_rank(0.90), 8);
-        assert_eq!(entropy_to_rank(0.95), 4);
+    fn test_entropy_to_rank_bands_follow_cutoffs() {
+        // Derive the probes from the constants so recalibration moves the
+        // test with it; what is pinned is the band structure and its sign.
+        assert_eq!(entropy_to_rank(ENTROPY_CUTOFF_RANK_32 - 0.05), 32);
+        assert_eq!(entropy_to_rank(ENTROPY_CUTOFF_RANK_32), 16);
+        assert_eq!(entropy_to_rank(ENTROPY_CUTOFF_RANK_16), 8);
+        assert_eq!(entropy_to_rank(ENTROPY_CUTOFF_RANK_8), 4);
+        assert_eq!(entropy_to_rank(1.0), 4);
+    }
+
+    #[test]
+    fn test_bond_entropy_uniform_spectrum() {
+        let _guard = tch::no_grad_guard();
+        // Identity matrix: all singular values equal → maximally uniform
+        // spectrum → normalized entropy ≈ 1.
+        let m = Tensor::eye(64, (Kind::Float, tch::Device::Cpu));
+        let (entropy, num_sv) = bond_entropy(&m);
+        assert_eq!(num_sv, 64);
+        let normalized = entropy / (64f64).ln();
+        assert!(
+            normalized > 0.99,
+            "Uniform spectrum should give normalized entropy ≈ 1, got {normalized}"
+        );
+    }
+
+    #[test]
+    fn test_tier3_synthetic_profile_golden() {
+        let _guard = tch::no_grad_guard();
+        tch::manual_seed(42);
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let config = ModelConfig {
+            model_type: "synthetic_test".to_owned(),
+            num_hidden_layers: 2,
+            hidden_size: 64,
+            ..Default::default()
+        };
+
+        // Layer 0: GDN (detected by weight-key presence). Layer 1: attention.
+        let mut weights: HashMap<String, Tensor> = HashMap::new();
+        weights.insert(
+            "model.layers.0.linear_attn.out_proj.weight".to_owned(),
+            Tensor::randn([64, 64], (Kind::Float, tch::Device::Cpu)),
+        );
+        for proj in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+            weights.insert(
+                format!("model.layers.1.self_attn.{proj}.weight"),
+                Tensor::randn([64, 64], (Kind::Float, tch::Device::Cpu)),
+            );
+        }
+
+        let profile =
+            compute_weight_entropy_profile(&weights, &config, dir.path()).expect("profile");
+        assert_eq!(profile.layers.len(), 2);
+
+        let gdn = &profile.layers[0];
+        assert_eq!(gdn.layer_type, LayerType::GatedDeltaNet);
+        assert_eq!(gdn.recommended_rank, GDN_LORA_RANK);
+        assert!(
+            gdn.bond_entropy.is_empty(),
+            "GDN layers carry no spectral analysis"
+        );
+
+        let attn = &profile.layers[1];
+        assert_eq!(attn.layer_type, LayerType::FullAttention);
+        assert_eq!(attn.bond_entropy.len(), 4, "all four projections analyzed");
+        assert!(
+            attn.recommended_rank <= UNVALIDATED_RANK_CAP,
+            "computed ranks are capped, got {}",
+            attn.recommended_rank
+        );
+
+        // The computation persisted itself to the Tier-2 cache.
+        assert!(load_cached_profile(dir.path()).is_some());
+    }
+
+    #[test]
+    fn test_cached_profile_rank_is_capped_on_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = ModelConfig {
+            model_type: "synthetic_test".to_owned(),
+            num_hidden_layers: 1,
+            hidden_size: 64,
+            ..Default::default()
+        };
+
+        // A pre-cap (or hand-edited) cache claiming rank 32.
+        let mut profile = uniform_fallback_profile(&config);
+        profile.layers[0].recommended_rank = 32;
+        save_cached_profile(dir.path(), &profile).expect("save");
+
+        // No embedded profile for this model → Tier 2 load must clamp.
+        let loaded = get_layer_profile(dir.path(), &config, None).expect("load");
+        assert_eq!(loaded.layers[0].recommended_rank, UNVALIDATED_RANK_CAP);
     }
 
     #[test]
