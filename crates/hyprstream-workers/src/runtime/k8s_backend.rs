@@ -41,10 +41,13 @@
 //! ## Namespace delivery (#793)
 //!
 //! Scheduler-placed pods receive composed hyprstream namespaces through
-//! `csi.hyprstream.io` volumes. The ticket/endpoint/namespace path are injected
-//! into the PodSpec at create time; late mutation of a running Pod's volumes is
-//! impossible by Kubernetes design, so `deliver_namespace(NineP)` returns the
-//! same delivery descriptor the start path must have injected.
+//! `csi.hyprstream.io` volumes. The endpoint/namespace path/mounter reference
+//! is injected into the PodSpec at create time; the CSI node plugin mints the
+//! scoped mount ticket at `NodePublishVolume` via Kubernetes CSI tokenRequests
+//! so bearer tickets are never persisted in etcd. Late mutation of a running
+//! Pod's volumes is impossible by Kubernetes design, so
+//! `deliver_namespace(NineP)` returns the same delivery descriptor the start
+//! path must have injected.
 
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
@@ -99,8 +102,6 @@ const ANN_WORKLOAD_KIND: &str = "hyprstream.io/k8s-workload-kind";
 const ANN_NINEP_MOUNT_PATH: &str = "hyprstream.io/9p-mount-path";
 /// Annotation key: mount-ticket scoped namespace path.
 const ANN_NINEP_NAMESPACE_PATH: &str = "hyprstream.io/9p-namespace-path";
-/// Annotation key: #862 mount ticket presented as Tattach.uname by CSI.
-const ANN_NINEP_TICKET: &str = "hyprstream.io/9p-ticket";
 /// Annotation key: dial-time carrier endpoint for the CSI node plugin.
 const ANN_NINEP_ENDPOINT: &str = "hyprstream.io/9p-endpoint";
 /// Annotation key: mount ticket plane (`webtransport`, `ws`, `vsock`, ...).
@@ -462,7 +463,6 @@ fn to_k8s_env(sandbox_id: &str, annotations: &HashMap<String, String>) -> Vec<En
 struct NinePVolumeSpec {
     mount_path: String,
     namespace_path: String,
-    ticket: String,
     endpoint: String,
     plane: String,
     mounter: String,
@@ -478,7 +478,6 @@ fn ninep_volume_from_annotations(
         return Ok(None);
     };
     let namespace_path = required_annotation(annotations, ANN_NINEP_NAMESPACE_PATH)?;
-    let ticket = required_annotation(annotations, ANN_NINEP_TICKET)?;
     let endpoint = required_annotation(annotations, ANN_NINEP_ENDPOINT)?;
     let plane = annotations
         .get(ANN_NINEP_PLANE)
@@ -508,7 +507,6 @@ fn ninep_volume_from_annotations(
     Ok(Some(NinePVolumeSpec {
         mount_path: mount_path.clone(),
         namespace_path,
-        ticket,
         endpoint,
         plane,
         mounter,
@@ -529,10 +527,6 @@ fn ninep_volume(spec: &NinePVolumeSpec) -> Volume {
     attrs.insert("plane".to_owned(), spec.plane.clone());
     attrs.insert("mounter".to_owned(), spec.mounter.clone());
     attrs.insert("endpoint".to_owned(), spec.endpoint.clone());
-    // The node plugin uses this pre-minted per-sandbox ticket as Tattach.uname.
-    // A follow-up can switch to CSI tokenRequests -> /oauth/mount-ticket in the
-    // node plugin when the worker has a live issuer client in-process.
-    attrs.insert("ticket".to_owned(), spec.ticket.clone());
     Volume {
         name: NINEP_VOLUME_NAME.to_owned(),
         csi: Some(CSIVolumeSource {
@@ -597,6 +591,7 @@ pub fn to_k8s_podspec(
         ..Default::default()
     };
     if let Some(spec) = ninep.as_ref() {
+        validate_ninep_scope(sandbox_id, &spec.namespace_path)?;
         container.volume_mounts = Some(vec![ninep_volume_mount(spec)]);
     }
 
@@ -624,6 +619,16 @@ fn object_labels(
     labels.insert(INSTANCE_LABEL.to_owned(), instance_id.to_owned());
     labels.insert(SANDBOX_LABEL.to_owned(), sandbox_id.to_owned());
     labels
+}
+
+fn validate_ninep_scope(sandbox_id: &str, namespace_path: &str) -> Result<()> {
+    let expected = format!("/sandboxes/{sandbox_id}");
+    if namespace_path != expected && !namespace_path.starts_with(&format!("{expected}/")) {
+        return Err(WorkerError::ConfigError(format!(
+            "{ANN_NINEP_NAMESPACE_PATH} must be scoped under {expected:?}, got {namespace_path:?}"
+        )));
+    }
+    Ok(())
 }
 
 fn object_meta(
@@ -852,7 +857,6 @@ impl SandboxBackend for K8sBackend {
     ) -> Result<NamespaceDelivery> {
         let NamespaceTransport::NineP {
             endpoint,
-            ticket,
             namespace_path,
             plane,
             mounter,
@@ -870,20 +874,20 @@ impl SandboxBackend for K8sBackend {
                 "NineP namespace_path must be absolute, got {namespace_path:?}"
             )));
         }
+        validate_ninep_scope(&_sandbox.id, &namespace_path)?;
         if !mount_path.is_absolute() {
             return Err(WorkerError::ConfigError(format!(
                 "NineP mount_path must be absolute, got {}",
                 mount_path.display()
             )));
         }
-        if ticket.is_empty() {
-            return Err(WorkerError::ConfigError(
-                "NineP delivery requires a scoped mount ticket".to_owned(),
-            ));
+        if mounter != "kernel" && mounter != "fuse" {
+            return Err(WorkerError::ConfigError(format!(
+                "NineP mounter must be kernel or fuse, got {mounter:?}"
+            )));
         }
         Ok(NamespaceDelivery::NineP {
             endpoint,
-            ticket,
             namespace_path,
             plane,
             mounter,
@@ -1212,7 +1216,6 @@ mod tests {
         let mut ann = HashMap::new();
         ann.insert(ANN_NINEP_MOUNT_PATH.into(), "/mnt/hyprstream".into());
         ann.insert(ANN_NINEP_NAMESPACE_PATH.into(), "/sandboxes/sb-10".into());
-        ann.insert(ANN_NINEP_TICKET.into(), "ticket-sb-10".into());
         ann.insert(ANN_NINEP_ENDPOINT.into(), "https://node.example/9p".into());
         ann.insert(ANN_NINEP_PLANE.into(), "webtransport".into());
         ann.insert(ANN_NINEP_MOUNTER.into(), "kernel".into());
@@ -1231,10 +1234,7 @@ mod tests {
             attrs.get("namespacePath").map(String::as_str),
             Some("/sandboxes/sb-10")
         );
-        assert_eq!(
-            attrs.get("ticket").map(String::as_str),
-            Some("ticket-sb-10")
-        );
+        assert!(!attrs.contains_key("ticket"));
         assert_eq!(
             attrs.get("endpoint").map(String::as_str),
             Some("https://node.example/9p")
@@ -1247,11 +1247,21 @@ mod tests {
         let mut ann = HashMap::new();
         ann.insert(ANN_NINEP_MOUNT_PATH.into(), "/mnt/hyprstream".into());
         ann.insert(ANN_NINEP_NAMESPACE_PATH.into(), "sandboxes/sb-11".into());
-        ann.insert(ANN_NINEP_TICKET.into(), "ticket".into());
         ann.insert(ANN_NINEP_ENDPOINT.into(), "https://node.example/9p".into());
 
         let err = to_k8s_podspec(&cfg(), "sb-11", &ann, DEFAULT_IMAGE).unwrap_err();
         assert!(err.to_string().contains(ANN_NINEP_NAMESPACE_PATH));
+    }
+
+    #[test]
+    fn podspec_rejects_cross_sandbox_ninep_scope() {
+        let mut ann = HashMap::new();
+        ann.insert(ANN_NINEP_MOUNT_PATH.into(), "/mnt/hyprstream".into());
+        ann.insert(ANN_NINEP_NAMESPACE_PATH.into(), "/sandboxes/other".into());
+        ann.insert(ANN_NINEP_ENDPOINT.into(), "https://node.example/9p".into());
+
+        let err = to_k8s_podspec(&cfg(), "sb-11", &ann, DEFAULT_IMAGE).unwrap_err();
+        assert!(err.to_string().contains("/sandboxes/sb-11"));
     }
 
     #[tokio::test]
@@ -1269,7 +1279,6 @@ mod tests {
                 hyprstream_vfs::Subject::anonymous(),
                 NamespaceTransport::NineP {
                     endpoint: "https://node.example/9p".to_owned(),
-                    ticket: "ticket".to_owned(),
                     namespace_path: "/sandboxes/sb-12".to_owned(),
                     plane: "webtransport".to_owned(),
                     mounter: "fuse".to_owned(),
@@ -1286,6 +1295,32 @@ mod tests {
                 ..
             } if namespace_path == "/sandboxes/sb-12" && mounter == "fuse"
         ));
+    }
+
+    #[tokio::test]
+    async fn deliver_namespace_rejects_unknown_mounter() {
+        let backend = K8sBackend::new(K8sConfig::default());
+        let sandbox = PodSandbox::new(
+            "sb-13".to_owned(),
+            &cfg(),
+            PathBuf::from("/tmp/hyprstream-k8s-test"),
+        );
+        let err = backend
+            .deliver_namespace(
+                &sandbox,
+                hyprstream_vfs::Namespace::new(),
+                hyprstream_vfs::Subject::anonymous(),
+                NamespaceTransport::NineP {
+                    endpoint: "https://node.example/9p".to_owned(),
+                    namespace_path: "/sandboxes/sb-13".to_owned(),
+                    plane: "webtransport".to_owned(),
+                    mounter: "raw".to_owned(),
+                    mount_path: PathBuf::from("/mnt/hyprstream"),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("mounter"));
     }
 
     #[test]
