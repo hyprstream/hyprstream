@@ -59,6 +59,13 @@ pub mod install;
 pub use ::k8s_openapi;
 pub use ::kube;
 
+/// `/k8s` VFS projection (K7, #782) — Kubernetes objects as Plan 9 files.
+///
+/// Gated behind `k8s` because it needs the kube watch runtime plus the
+/// in-process VFS `Mount` surface. See [`vfs::K8sMount`].
+#[cfg(feature = "k8s")]
+pub mod vfs;
+
 pub use mesh::{TenantBinding, TenantBindingSpec, TenantBindingStatus};
 pub use models::{Adapter, AdapterSpec, AdapterStatus, Model, ModelSpec, ModelStage, ModelStatus};
 pub use serving::{InferenceService, InferenceServiceSpec, InferenceServiceStatus, Statefulness};
