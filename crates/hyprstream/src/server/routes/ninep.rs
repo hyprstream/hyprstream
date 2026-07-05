@@ -45,6 +45,7 @@
 //! so teardown stays 100% server-driven with no client keepalive. The server
 //! never relies on the client noticing.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -72,6 +73,14 @@ use crate::server::state::ServerState;
 /// Query-param name carrying the short-lived mount ticket. Kept in sync with
 /// the discovery document and the design doc's `wss://…/9p?ticket=…` example.
 const TICKET_PARAM: &str = "ticket";
+
+/// URL path the 9P plane is served on. The single authoritative source for the
+/// `/9p` selector on the SERVE side: both [`Export9pDiscovery`] and the
+/// [`WirePlaneTable`] read it, and the route in [`crate::server`] registers it,
+/// so the plane advertises its own path rather than the value being duplicated
+/// as a constant on both the dial and serve sides (the retire of the dial-side
+/// `crate::dial::*_PATH` constants against this table is #820's job).
+pub const NINEP_PATH: &str = "/9p";
 
 /// Interval between server-sent WS keepalive `Ping`s. A HEALTHY-but-idle mount
 /// stays alive indefinitely as long as the peer keeps ponging (see module docs).
@@ -116,7 +125,7 @@ impl Default for Export9pDiscovery {
         Self {
             protocol: "9P2000.L".to_owned(),
             transport: "websocket".to_owned(),
-            endpoint: "/9p".to_owned(),
+            endpoint: NINEP_PATH.to_owned(),
             ticket_param: TICKET_PARAM.to_owned(),
             subprotocol: None,
             wire: "raw-9p-binary-frames".to_owned(),
@@ -128,6 +137,103 @@ impl Default for Export9pDiscovery {
 /// `GET /.well-known/export9p` — advertise the 9P-over-WS export.
 pub async fn export9p_metadata() -> impl IntoResponse {
     Json(Export9pDiscovery::default())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Discovery: GET /.well-known/planes (wire-plane table, #821 / epic #809)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One wire plane's advertisement in the [`WirePlaneTable`].
+///
+/// A "plane" is a non-file wire endpoint the daemon serves (9P, moq, …). This
+/// is the cs/ndb analog: a client resolves a plane NAME → its current path +
+/// carriers here, then dials/mounts wherever it wants. The server advertises;
+/// it never dictates that the client hardcode the path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WirePlane {
+    /// URL path the plane is currently served on (e.g. `/9p`, `/moq`). This is
+    /// the value a client resolves against instead of a hardcoded constant.
+    pub path: String,
+    /// Carriers the plane is reachable over, most-preferred first. `ws` =
+    /// WebSocket (browser-native), `webtransport` = WebTransport over QUIC/H3.
+    pub transports: Vec<String>,
+    /// Query-param carrying the plane's auth/mount ticket, if it needs one.
+    /// Omitted from JSON when the plane is unauthenticated at the transport.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ticket_param: Option<String>,
+    /// Protocol/dialect tag for the plane (e.g. `9P2000.L`), if meaningful.
+    /// Omitted when the plane has no single dialect to name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+}
+
+/// Wire-plane discovery table served at `GET /.well-known/planes` (#821).
+///
+/// Enumerates every non-file wire plane the daemon serves, keyed by a stable
+/// plane NAME (`9p`, `moq`, …) → its current [`WirePlane`] advertisement. This
+/// is the source of truth a client resolves the `/9p` (and any future) selector
+/// against; the serve side ADVERTISES the path here rather than the value being
+/// duplicated as a hardcoded constant on both the dial and serve sides.
+///
+/// Companions — does not replace — [`Export9pDiscovery`] at
+/// `/.well-known/export9p`: the `9p` entry here is derived from the SAME
+/// [`Export9pDiscovery::default`] values (`endpoint`/`ticket_param`/`protocol`),
+/// so the two documents can never drift and the existing export9p contract
+/// (which 1:3.0's `WsMountTransport` reads today) is untouched.
+///
+/// `BTreeMap` gives a deterministic, stably-ordered JSON object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WirePlaneTable {
+    /// Plane name → advertisement. Stably ordered.
+    pub planes: BTreeMap<String, WirePlane>,
+}
+
+impl WirePlaneTable {
+    /// Build the table from the daemon's actually-registered planes.
+    ///
+    /// The `9p` entry is derived from [`Export9pDiscovery::default`] so it stays
+    /// byte-for-byte consistent with the companion export9p document. The `moq`
+    /// streaming plane advertises [`hyprstream_rpc::dial::MOQ_PATH`] (its
+    /// existing WebTransport selector) so this table is authoritative for it
+    /// too. Both planes list the carriers they are actually reachable over: the
+    /// 9P plane over WebSocket (H1a, `/9p`) and WebTransport (H1b, #765), the
+    /// moq plane over WebTransport.
+    pub fn current() -> Self {
+        let export9p = Export9pDiscovery::default();
+
+        let mut planes = BTreeMap::new();
+        planes.insert(
+            "9p".to_owned(),
+            WirePlane {
+                path: export9p.endpoint.clone(),
+                transports: vec!["ws".to_owned(), "webtransport".to_owned()],
+                ticket_param: Some(export9p.ticket_param.clone()),
+                protocol: Some(export9p.protocol.clone()),
+            },
+        );
+        planes.insert(
+            "moq".to_owned(),
+            WirePlane {
+                path: hyprstream_rpc::dial::MOQ_PATH.to_owned(),
+                transports: vec!["webtransport".to_owned()],
+                ticket_param: None,
+                protocol: None,
+            },
+        );
+
+        Self { planes }
+    }
+}
+
+impl Default for WirePlaneTable {
+    fn default() -> Self {
+        Self::current()
+    }
+}
+
+/// `GET /.well-known/planes` — advertise the wire-plane discovery table (#821).
+pub async fn wire_planes_metadata() -> impl IntoResponse {
+    Json(WirePlaneTable::current())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -464,6 +570,56 @@ mod tests {
         assert_eq!(d.endpoint, "/9p");
         assert_eq!(d.ticket_param, "ticket");
         assert_eq!(d.subprotocol, None); // stock wanix uses no subprotocol
+    }
+
+    /// The wire-plane discovery table (#821) lists the 9p plane, serializes to
+    /// valid JSON, and stays byte-for-byte back-compatible with the existing
+    /// `/.well-known/export9p` document — the 9p entry is DERIVED from
+    /// `Export9pDiscovery::default()`, so the two can never drift.
+    #[test]
+    fn wire_plane_table_lists_9p_and_is_back_compat() {
+        let table = WirePlaneTable::current();
+
+        // The 9p plane is advertised, over both carriers, resolving to /9p.
+        let ninep = table.planes.get("9p").expect("9p plane must be advertised");
+        assert_eq!(ninep.path, "/9p");
+        assert_eq!(ninep.path, NINEP_PATH);
+        assert_eq!(ninep.transports, vec!["ws", "webtransport"]);
+        assert_eq!(ninep.ticket_param.as_deref(), Some("ticket"));
+        assert_eq!(ninep.protocol.as_deref(), Some("9P2000.L"));
+
+        // The moq plane is advertised at its existing selector.
+        let moq = table.planes.get("moq").expect("moq plane must be advertised");
+        assert_eq!(moq.path, hyprstream_rpc::dial::MOQ_PATH);
+        assert_eq!(moq.transports, vec!["webtransport"]);
+
+        // The document is valid JSON with the expected `planes` shape and
+        // round-trips losslessly.
+        let json = serde_json::to_value(&table).expect("table serializes to JSON");
+        assert!(json.get("planes").is_some(), "top-level `planes` key present");
+        assert_eq!(json["planes"]["9p"]["path"], "/9p");
+        assert_eq!(json["planes"]["9p"]["transports"][0], "ws");
+        let round: WirePlaneTable =
+            serde_json::from_value(json).expect("table round-trips from JSON");
+        assert_eq!(round, table);
+
+        // Back-compat: the fields the 9p entry is built from are exactly the
+        // export9p document's fields — deriving the entry guarantees no drift.
+        let export9p = Export9pDiscovery::default();
+        assert_eq!(ninep.path, export9p.endpoint);
+        assert_eq!(ninep.ticket_param.as_deref(), Some(export9p.ticket_param.as_str()));
+        assert_eq!(ninep.protocol.as_deref(), Some(export9p.protocol.as_str()));
+
+        // The export9p contract itself is unchanged (still serializes with its
+        // original field set + values — the 1:3.0 WsMountTransport reads this).
+        let ex_json = serde_json::to_value(&export9p).expect("export9p serializes");
+        assert_eq!(ex_json["protocol"], "9P2000.L");
+        assert_eq!(ex_json["transport"], "websocket");
+        assert_eq!(ex_json["endpoint"], "/9p");
+        assert_eq!(ex_json["ticket_param"], "ticket");
+        assert_eq!(ex_json["subprotocol"], serde_json::Value::Null);
+        assert_eq!(ex_json["wire"], "raw-9p-binary-frames");
+        assert_eq!(ex_json["compatible_with"], "wanix serve");
     }
 
     /// End-to-end 9P-over-WebSocket attach: spin the `/9p` transport over a
