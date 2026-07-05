@@ -29,12 +29,15 @@ built with the **virtio** transport only — and cloud-hypervisor exposes no
 virtio-9p device (only virtio-fs). So there is **no kernel-mountable 9P
 transport in this guest at all**, and `trans=fd` is out. This binary is (B).
 
-A POSIX-visible mountpoint (so a bare `cat <mnt>/file` works) would need a
-FUSE→9P bridge. The guest kernel **does** ship FUSE (`fuse`/`virtio_fs` strings
-present), so that is a viable **follow-up (V5)** — deliberately not done here
-because it drags in a FUSE dependency, `/dev/fuse`, and mount privileges that
-make a CI self-test impossible. This client validates exactly the epic's
-acceptance surface: attach + walk + **readdir + read + write** over vsock 9P.
+A POSIX-visible mountpoint (so a bare `cat <mnt>/file` works, for **arbitrary**
+in-guest processes — not just this client) needs a FUSE→9P bridge. The guest
+kernel **does** ship FUSE (`fuse`=376 in the vmlinux strings), so this is the
+**`--fuse-mount` mode (V5, #751)** — see [FUSE mode](#fuse-mode-v5-751) below. It
+reuses this binary's 9P client as the backend and needs `/dev/fuse` + mount
+privilege, so it is **operator-boot-only**, not part of the CI self-test. The
+client modes here still validate the epic's acceptance surface: attach + walk +
+**readdir + read + write** over vsock 9P. (A native-kernel 9P mount — a rebuilt
+guest kernel with the fd transport — is tracked separately in #762.)
 
 ## What it does
 
@@ -61,6 +64,46 @@ the raw `AF_VSOCK` fd is wrapped in an `*os.File`.
 
 `write` uses `Tlopen` — **not** `Tlcreate`, which the host translator does not
 implement — so the target file must already exist in the tenant VFS.
+
+## FUSE mode (V5, #751)
+
+```
+hypr9p-guest [--vsock-cid 2] [--vsock-port 564] --fuse-mount /mnt/vfs
+                                     # env: HYPRSTREAM_GUEST_FUSE_MOUNT
+```
+
+Gives the guest a **real POSIX mountpoint** for the tenant VFS: it dials the
+same host 9P-over-vsock channel, attaches the tree, and serves it as a FUSE
+filesystem at `<mnt>`. Once mounted, **any** in-guest process sees it as a normal
+filesystem — a bare `cat /mnt/vfs/models/hello` works, no 9P client involved.
+
+Each FUSE op is proxied to a 9P op against the reused client:
+
+| FUSE op | 9P |
+|---------|-----|
+| `getattr` / `lookup` | Twalk → Tgetattr |
+| `readdir` | Twalk → Tlopen → Treaddir |
+| `open` | Twalk → Tlopen |
+| `read` / `write` | Tread / Twrite |
+
+**Library:** [`github.com/hanwen/go-fuse/v2`](https://github.com/hanwen/go-fuse)
+(`fs` inode API) — actively maintained, pure-Go (keeps the CGO-disabled static
+build), and its `InodeEmbedder` interfaces map one-to-one onto 9P. It has no
+dependency overlap with the p9 stack, so it does not disturb the progrium/p9
+`replace`.
+
+**Errno mapping:** the progrium/p9 client surfaces a server-side `Rlerror` as a
+`linux.Errno` (Linux errno numbers, identical to this linux/amd64 guest's
+`syscall.Errno`), so `errnoOf` maps it straight through — `ls`/`stat` of a
+missing path yields `ENOENT`, not a generic `EIO`.
+
+**Privilege / gating:** mounting FUSE needs `/dev/fuse` + `CAP_SYS_ADMIN` (or an
+unprivileged-userns grant) inside the guest, which a CI self-test cannot provide.
+So the FUSE path is **operator-boot-only**; its build gate is `go build` + the
+**non-mounting** unit tests in `fuse_test.go` (errno mapping + the FUSE→9P proxy
+layer exercised against an in-process 9P server, no kernel mount). The operator
+e2e lives in `crates/hyprstream-workers/tests/kata_9p_vsock_e2e.rs`
+(`kata_9p_fuse_mount_e2e`, env-gated behind `HYPRSTREAM_GUEST_FUSE_E2E=1`).
 
 ## Self-test (CI smoke)
 

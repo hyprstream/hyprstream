@@ -43,6 +43,12 @@ jobs:
       - name: go build
         run: go build ./...
 
+      - name: go test (errno mapping + FUSE->9P proxy layer, non-mounting)
+        # The FUSE mode itself needs /dev/fuse + CAP_SYS_ADMIN and is
+        # operator-boot-only; these unit tests exercise the bridge logic against
+        # an in-process 9P server WITHOUT a real mount, so they run in CI.
+        run: go test ./...
+
       - name: self-test (attach + readdir + read + write round-trip)
         run: go run . --self-test
 

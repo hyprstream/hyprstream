@@ -26,18 +26,22 @@
 // over AF_VSOCK and operates the 9P tree from userspace, needing nothing from
 // the guest kernel beyond AF_VSOCK (already present — the kata-agent uses it).
 //
-// A POSIX-visible mountpoint (so a bare `cat <mnt>/file` works) would require a
-// FUSE→9P bridge; the guest kernel *does* ship FUSE (`CONFIG_FUSE_FS`), so that
-// is a viable follow-up (V5). It is intentionally out of scope here: it drags in
-// a FUSE dependency, `/dev/fuse`, and mount privileges that make a CI self-test
-// impossible. This client validates exactly the epic's acceptance surface —
-// attach + walk + **readdir + read + write** round-trips over the vsock 9P
-// channel — with a CI-safe `--self-test`.
+// A POSIX-visible mountpoint (so a bare `cat <mnt>/file` works — for arbitrary
+// in-guest processes, not just this client) needs a FUSE→9P bridge; the guest
+// kernel *does* ship FUSE (`fuse`=376 in the vmlinux strings). That bridge is
+// the **`--fuse-mount` mode** added in V5 (#751, see fuse.go): it reuses this
+// binary's 9P client as the backend and exposes the tree via
+// github.com/hanwen/go-fuse/v2. Because mounting FUSE needs `/dev/fuse` +
+// CAP_SYS_ADMIN, that mode is **operator-boot-only** — a CI self-test cannot
+// mount — so the client modes below keep the CI-safe `--self-test`, and the
+// FUSE bridge's own gate is `go build` + the non-mounting unit tests in
+// fuse_test.go. (A native-kernel 9P mount path is tracked separately in #762.)
 //
 // # Run modes
 //
 //	hypr9p-guest [--vsock-cid 2] [--vsock-port 564] [--aname ""] <op> <args...>
 //	hypr9p-guest --sock /path/to/9p.sock <op> <args...>     # UDS instead of vsock
+//	hypr9p-guest --fuse-mount /mnt/vfs                       # POSIX FUSE mount (operator-only)
 //	hypr9p-guest --self-test
 //
 // Operations:
@@ -84,6 +88,7 @@ type config struct {
 	sock      string
 	aname     string
 	selfTest  bool
+	fuseMount string
 }
 
 func main() {
@@ -97,6 +102,9 @@ func main() {
 	flag.StringVar(&cfg.aname, "aname", "", "9P attach name (empty = default tree)")
 	flag.BoolVar(&cfg.selfTest, "self-test", false,
 		"run ls/cat/write against a throwaway in-process 9P server and exit")
+	flag.StringVar(&cfg.fuseMount, "fuse-mount", os.Getenv("HYPRSTREAM_GUEST_FUSE_MOUNT"),
+		"mount the tenant VFS as a POSIX FUSE filesystem at this path (env: HYPRSTREAM_GUEST_FUSE_MOUNT); "+
+			"needs /dev/fuse + mount privilege, so it is operator-boot-only, not for the CI self-test")
 	flag.Parse()
 
 	if err := run(cfg, flag.Args()); err != nil {
@@ -108,6 +116,11 @@ func main() {
 func run(cfg config, args []string) error {
 	if cfg.selfTest {
 		return runSelfTest()
+	}
+	if cfg.fuseMount != "" {
+		// FUSE mode owns its own dial/attach lifecycle (a long-lived mount, not
+		// a one-shot op), so it does not fall through to the client dispatch.
+		return runFuseMount(cfg, cfg.fuseMount)
 	}
 	if len(args) < 1 {
 		return errors.New("usage: hypr9p-guest [flags] <ls|cat|write> <path> [data]  (or --self-test)")
