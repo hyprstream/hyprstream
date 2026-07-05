@@ -45,6 +45,7 @@
 //! so teardown stays 100% server-driven with no client keepalive. The server
 //! never relies on the client noticing.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,10 +58,12 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
-use hyprstream_9p::Translator;
+use hyprstream_9p::{AttachAuthorizer, Translator};
+use hyprstream_rpc::transport::quinn_transport::{NinePWtHandler, NinePWtStream};
 use hyprstream_rpc::Subject;
-use hyprstream_vfs::{Mount, SyntheticMount, SyntheticNode};
+use hyprstream_vfs::{Mount, MountError, SyntheticMount, SyntheticNode};
 use serde::{Deserialize, Serialize};
 use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info, warn};
@@ -70,6 +73,14 @@ use crate::server::state::ServerState;
 /// Query-param name carrying the short-lived mount ticket. Kept in sync with
 /// the discovery document and the design doc's `wss://…/9p?ticket=…` example.
 const TICKET_PARAM: &str = "ticket";
+
+/// URL path the 9P plane is served on. The single authoritative source for the
+/// `/9p` selector on the SERVE side: both [`Export9pDiscovery`] and the
+/// [`WirePlaneTable`] read it, and the route in [`crate::server`] registers it,
+/// so the plane advertises its own path rather than the value being duplicated
+/// as a constant on both the dial and serve sides (the retire of the dial-side
+/// `crate::dial::*_PATH` constants against this table is #820's job).
+pub const NINEP_PATH: &str = "/9p";
 
 /// Interval between server-sent WS keepalive `Ping`s. A HEALTHY-but-idle mount
 /// stays alive indefinitely as long as the peer keeps ponging (see module docs).
@@ -114,7 +125,7 @@ impl Default for Export9pDiscovery {
         Self {
             protocol: "9P2000.L".to_owned(),
             transport: "websocket".to_owned(),
-            endpoint: "/9p".to_owned(),
+            endpoint: NINEP_PATH.to_owned(),
             ticket_param: TICKET_PARAM.to_owned(),
             subprotocol: None,
             wire: "raw-9p-binary-frames".to_owned(),
@@ -126,6 +137,103 @@ impl Default for Export9pDiscovery {
 /// `GET /.well-known/export9p` — advertise the 9P-over-WS export.
 pub async fn export9p_metadata() -> impl IntoResponse {
     Json(Export9pDiscovery::default())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Discovery: GET /.well-known/planes (wire-plane table, #821 / epic #809)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One wire plane's advertisement in the [`WirePlaneTable`].
+///
+/// A "plane" is a non-file wire endpoint the daemon serves (9P, moq, …). This
+/// is the cs/ndb analog: a client resolves a plane NAME → its current path +
+/// carriers here, then dials/mounts wherever it wants. The server advertises;
+/// it never dictates that the client hardcode the path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WirePlane {
+    /// URL path the plane is currently served on (e.g. `/9p`, `/moq`). This is
+    /// the value a client resolves against instead of a hardcoded constant.
+    pub path: String,
+    /// Carriers the plane is reachable over, most-preferred first. `ws` =
+    /// WebSocket (browser-native), `webtransport` = WebTransport over QUIC/H3.
+    pub transports: Vec<String>,
+    /// Query-param carrying the plane's auth/mount ticket, if it needs one.
+    /// Omitted from JSON when the plane is unauthenticated at the transport.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ticket_param: Option<String>,
+    /// Protocol/dialect tag for the plane (e.g. `9P2000.L`), if meaningful.
+    /// Omitted when the plane has no single dialect to name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+}
+
+/// Wire-plane discovery table served at `GET /.well-known/planes` (#821).
+///
+/// Enumerates every non-file wire plane the daemon serves, keyed by a stable
+/// plane NAME (`9p`, `moq`, …) → its current [`WirePlane`] advertisement. This
+/// is the source of truth a client resolves the `/9p` (and any future) selector
+/// against; the serve side ADVERTISES the path here rather than the value being
+/// duplicated as a hardcoded constant on both the dial and serve sides.
+///
+/// Companions — does not replace — [`Export9pDiscovery`] at
+/// `/.well-known/export9p`: the `9p` entry here is derived from the SAME
+/// [`Export9pDiscovery::default`] values (`endpoint`/`ticket_param`/`protocol`),
+/// so the two documents can never drift and the existing export9p contract
+/// (which 1:3.0's `WsMountTransport` reads today) is untouched.
+///
+/// `BTreeMap` gives a deterministic, stably-ordered JSON object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WirePlaneTable {
+    /// Plane name → advertisement. Stably ordered.
+    pub planes: BTreeMap<String, WirePlane>,
+}
+
+impl WirePlaneTable {
+    /// Build the table from the daemon's actually-registered planes.
+    ///
+    /// The `9p` entry is derived from [`Export9pDiscovery::default`] so it stays
+    /// byte-for-byte consistent with the companion export9p document. The `moq`
+    /// streaming plane advertises [`hyprstream_rpc::dial::MOQ_PATH`] (its
+    /// existing WebTransport selector) so this table is authoritative for it
+    /// too. Both planes list the carriers they are actually reachable over: the
+    /// 9P plane over WebSocket (H1a, `/9p`) and WebTransport (H1b, #765), the
+    /// moq plane over WebTransport.
+    pub fn current() -> Self {
+        let export9p = Export9pDiscovery::default();
+
+        let mut planes = BTreeMap::new();
+        planes.insert(
+            "9p".to_owned(),
+            WirePlane {
+                path: export9p.endpoint.clone(),
+                transports: vec!["ws".to_owned(), "webtransport".to_owned()],
+                ticket_param: Some(export9p.ticket_param.clone()),
+                protocol: Some(export9p.protocol.clone()),
+            },
+        );
+        planes.insert(
+            "moq".to_owned(),
+            WirePlane {
+                path: hyprstream_rpc::dial::MOQ_PATH.to_owned(),
+                transports: vec!["webtransport".to_owned()],
+                ticket_param: None,
+                protocol: None,
+            },
+        );
+
+        Self { planes }
+    }
+}
+
+impl Default for WirePlaneTable {
+    fn default() -> Self {
+        Self::current()
+    }
+}
+
+/// `GET /.well-known/planes` — advertise the wire-plane discovery table (#821).
+pub async fn wire_planes_metadata() -> impl IntoResponse {
+    Json(WirePlaneTable::current())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -192,6 +300,19 @@ async fn validate_ticket(
     state: &ServerState,
     ticket: &str,
     _headers: &HeaderMap,
+) -> Result<Subject, &'static str> {
+    verify_mount_ticket(state, ticket).await
+}
+
+/// Transport-agnostic core of mount-ticket validation, shared by H1a's
+/// URL-query path ([`validate_ticket`]) and H1b's `Tattach.uname` path
+/// ([`TicketAttachAuthorizer`]). Both present the same `at+jwt` mount ticket;
+/// only *where* it rides differs (WS query vs 9P attach), so the verification —
+/// signature, audience, expiry, revocation (in `verify_token_claims`), then
+/// subject-name validation — is identical.
+async fn verify_mount_ticket(
+    state: &ServerState,
+    ticket: &str,
 ) -> Result<Subject, &'static str> {
     let claims = crate::server::middleware::verify_token_claims(state, ticket).await?;
     let local_issuers: &[&str] = &[&*state.oauth_issuer_url];
@@ -348,6 +469,91 @@ pub(crate) async fn serve_9p_websocket(
     frame_reader.abort();
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// H1b: /9p over WebTransport (QUIC path-mux plane)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Resolves the mount ticket a client presents in `Tattach.uname` to a narrowed
+/// session [`Subject`], reusing H1a's [`verify_mount_ticket`].
+///
+/// This is the attach-time credential seam for the H1b `/9p` WebTransport plane:
+/// the cert-pinned mesh session carries no URL query (and a browser `WebSocket`
+/// can't set headers), so the ticket rides `Tattach.uname` and is validated once
+/// at attach — the per-session analogue of H1a's pre-upgrade check. On denial we
+/// return [`MountError::PermissionDenied`], which the 9P translator maps to an
+/// `Rlerror` (`EACCES`).
+struct TicketAttachAuthorizer {
+    state: ServerState,
+}
+
+#[async_trait]
+impl AttachAuthorizer for TicketAttachAuthorizer {
+    async fn authorize(&self, uname: &str) -> Result<Subject, MountError> {
+        if uname.is_empty() {
+            return Err(MountError::PermissionDenied("missing mount ticket".to_owned()));
+        }
+        match verify_mount_ticket(&self.state, uname).await {
+            Ok(subject) => Ok(subject),
+            Err(reason) => {
+                warn!(reason, "9P WT attach rejected: invalid mount ticket");
+                Err(MountError::PermissionDenied(reason.to_owned()))
+            }
+        }
+    }
+}
+
+/// The injected 9P-over-WebTransport handler (H1b / #765).
+///
+/// Registered process-globally via [`register_ninep_wt_handler`] so the QUIC
+/// path-mux `/9p` arm (`hyprstream-rpc`) can drive hyprstream's 9P core without
+/// that transport crate depending on `hyprstream`. Each WT bidi stream on the
+/// `/9p` path lands in [`NinePWtHandler::serve`], where it is served by the SAME
+/// [`Translator::serve_connection`] core + [`build_export_mount`] as H1a —
+/// only the ticket now rides `Tattach.uname` (validated by
+/// [`TicketAttachAuthorizer`]) and the transport is a QUIC bidi stream.
+pub struct NinePWtExport {
+    state: ServerState,
+}
+
+impl NinePWtExport {
+    /// Build the handler over the server's [`ServerState`] (the ticket-validation
+    /// chain + export mount source).
+    pub fn new(state: ServerState) -> Self {
+        Self { state }
+    }
+}
+
+#[async_trait]
+impl NinePWtHandler for NinePWtExport {
+    async fn serve(&self, stream: Box<dyn NinePWtStream>) {
+        // The export root is Subject-scoped per op by `MountBackend`; the Subject
+        // is bound at `Tattach` from the validated ticket, so the mount is built
+        // Subject-agnostic here (`build_export_mount` ignores the Subject in the
+        // current placeholder root — see its docs; the real #730 namespace is
+        // scoped by the bound Subject once it lands).
+        let mount = build_export_mount(&self.state, &Subject::anonymous());
+        let authorizer: Arc<dyn AttachAuthorizer> =
+            Arc::new(TicketAttachAuthorizer { state: self.state.clone() });
+        let translator = Arc::new(Translator::from_mount_authorized(mount, authorizer));
+        if let Err(e) = translator.serve_connection(stream).await {
+            debug!(error = %e, "9P WT serve loop ended with error");
+        }
+    }
+}
+
+/// Register the process-global 9P-over-WebTransport handler so the QUIC
+/// path-mux `/9p` arm serves this node's export. Idempotent (first-wins);
+/// call once at server startup where [`ServerState`] exists (see
+/// [`crate::server::create_app`]).
+pub fn register_ninep_wt_handler(state: ServerState) {
+    let installed = hyprstream_rpc::transport::quinn_transport::set_global_ninep_handler(
+        Arc::new(NinePWtExport::new(state)),
+    );
+    if installed {
+        info!("registered 9P-over-WebTransport handler (/9p QUIC path-mux, H1b)");
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -364,6 +570,56 @@ mod tests {
         assert_eq!(d.endpoint, "/9p");
         assert_eq!(d.ticket_param, "ticket");
         assert_eq!(d.subprotocol, None); // stock wanix uses no subprotocol
+    }
+
+    /// The wire-plane discovery table (#821) lists the 9p plane, serializes to
+    /// valid JSON, and stays byte-for-byte back-compatible with the existing
+    /// `/.well-known/export9p` document — the 9p entry is DERIVED from
+    /// `Export9pDiscovery::default()`, so the two can never drift.
+    #[test]
+    fn wire_plane_table_lists_9p_and_is_back_compat() {
+        let table = WirePlaneTable::current();
+
+        // The 9p plane is advertised, over both carriers, resolving to /9p.
+        let ninep = table.planes.get("9p").expect("9p plane must be advertised");
+        assert_eq!(ninep.path, "/9p");
+        assert_eq!(ninep.path, NINEP_PATH);
+        assert_eq!(ninep.transports, vec!["ws", "webtransport"]);
+        assert_eq!(ninep.ticket_param.as_deref(), Some("ticket"));
+        assert_eq!(ninep.protocol.as_deref(), Some("9P2000.L"));
+
+        // The moq plane is advertised at its existing selector.
+        let moq = table.planes.get("moq").expect("moq plane must be advertised");
+        assert_eq!(moq.path, hyprstream_rpc::dial::MOQ_PATH);
+        assert_eq!(moq.transports, vec!["webtransport"]);
+
+        // The document is valid JSON with the expected `planes` shape and
+        // round-trips losslessly.
+        let json = serde_json::to_value(&table).expect("table serializes to JSON");
+        assert!(json.get("planes").is_some(), "top-level `planes` key present");
+        assert_eq!(json["planes"]["9p"]["path"], "/9p");
+        assert_eq!(json["planes"]["9p"]["transports"][0], "ws");
+        let round: WirePlaneTable =
+            serde_json::from_value(json).expect("table round-trips from JSON");
+        assert_eq!(round, table);
+
+        // Back-compat: the fields the 9p entry is built from are exactly the
+        // export9p document's fields — deriving the entry guarantees no drift.
+        let export9p = Export9pDiscovery::default();
+        assert_eq!(ninep.path, export9p.endpoint);
+        assert_eq!(ninep.ticket_param.as_deref(), Some(export9p.ticket_param.as_str()));
+        assert_eq!(ninep.protocol.as_deref(), Some(export9p.protocol.as_str()));
+
+        // The export9p contract itself is unchanged (still serializes with its
+        // original field set + values — the 1:3.0 WsMountTransport reads this).
+        let ex_json = serde_json::to_value(&export9p).expect("export9p serializes");
+        assert_eq!(ex_json["protocol"], "9P2000.L");
+        assert_eq!(ex_json["transport"], "websocket");
+        assert_eq!(ex_json["endpoint"], "/9p");
+        assert_eq!(ex_json["ticket_param"], "ticket");
+        assert_eq!(ex_json["subprotocol"], serde_json::Value::Null);
+        assert_eq!(ex_json["wire"], "raw-9p-binary-frames");
+        assert_eq!(ex_json["compatible_with"], "wanix serve");
     }
 
     /// End-to-end 9P-over-WebSocket attach: spin the `/9p` transport over a

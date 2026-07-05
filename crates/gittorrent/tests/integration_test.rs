@@ -125,7 +125,9 @@ mod tests {
         let tree_obj = objects.iter()
             .find(|obj| obj.object_type == GitObjectType::Tree)
             .ok_or("No tree object found")?;
-        let parsed_tree = parse_tree_object(&tree_obj.data)?;
+        // The tree uses the same object format as the commit that references it.
+        let parsed_tree =
+            parse_tree_object(&tree_obj.data, parsed_commit.tree_hash.object_format())?;
 
         assert_eq!(parsed_tree.entries.len(), 1);
         assert_eq!(parsed_tree.entries[0].name, "sample.txt");

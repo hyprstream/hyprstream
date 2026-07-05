@@ -282,6 +282,53 @@ pub async fn rate_limit_middleware(
 /// It does **not** enforce DPoP sender-binding: that is header/scheme-specific
 /// and stays in [`auth_middleware`]. Returns `Err(reason)` with a short,
 /// log-safe reason string on any failure (never leaks token contents).
+/// RFC 7638 JWK thumbprint (the JWKS `kid`) for an Ed25519 verifying key.
+fn ed25519_kid(key: &ed25519_dalek::VerifyingKey) -> String {
+    hyprstream_rpc::auth::jwk_thumbprint(&hyprstream_rpc::auth::JwkThumbprintInput::Ed25519 {
+        x: key.as_bytes(),
+    })
+}
+
+/// Verify a locally-issued JWT against the node's full published key set: the
+/// cluster CA key plus every currently-published Ed25519 rotation slot (the same
+/// key set `/oauth/jwks` publishes). Accepts the token if ANY of these trusted,
+/// node-published keys verifies it — standard JWKS/`kid`-rotation semantics.
+///
+/// Security invariant: only keys the node itself publishes are ever tried. A
+/// token-supplied (`jwk`/embedded) key is NEVER admitted; the `kid` header is
+/// used only as an ordering *hint* to try the matching published key first, and
+/// falls through to the other trusted keys. Audience validation is unchanged —
+/// `jwt::decode` still enforces strict local-issuer audience matching.
+fn decode_local_multi_key(
+    token: &str,
+    ca_key: &ed25519_dalek::VerifyingKey,
+    published_keys: &[ed25519_dalek::VerifyingKey],
+    expected_aud: Option<&str>,
+) -> Result<jwt::Claims, &'static str> {
+    // Candidate set: CA key first, then all published rotation slots. This is the
+    // exact set the JWKS endpoint publishes; nothing else is trusted.
+    let mut candidates: Vec<&ed25519_dalek::VerifyingKey> =
+        Vec::with_capacity(1 + published_keys.len());
+    candidates.push(ca_key);
+    candidates.extend(published_keys.iter());
+
+    // If the JOSE header carries a kid, try the matching published key first
+    // (fast path for the common rotation case). This is a stable reordering
+    // only — every trusted candidate is still attempted, so a token whose kid
+    // is absent/mismatched but which is validly signed by a published key still
+    // verifies. The kid is the RFC 7638 JWK thumbprint the JWKS `kid` uses.
+    if let Some(token_kid) = extract_kid_from_token(token) {
+        candidates.sort_by_key(|k| u8::from(ed25519_kid(k) != token_kid));
+    }
+
+    for key in candidates {
+        if let Ok(claims) = jwt::decode(token, key, expected_aud) {
+            return Ok(claims);
+        }
+    }
+    Err("JWT validation failed")
+}
+
 pub(crate) async fn verify_token_claims(
     state: &ServerState,
     token: &str,
@@ -293,19 +340,35 @@ pub(crate) async fn verify_token_claims(
     // Extract iss for key routing (local node key vs trusted federation peer).
     let iss = extract_iss_from_token(token);
     let local_issuers: &[&str] = &[&*state.oauth_issuer_url];
-    let result = if hyprstream_rpc::auth::is_local_iss(&iss, local_issuers) {
-        jwt::decode(token, &state.verifying_key, Some(&state.resource_url))
+    let claims = if hyprstream_rpc::auth::is_local_iss(&iss, local_issuers) {
+        // Local-issuer tokens may be signed by EITHER the cluster CA key OR any
+        // currently-published rotation slot (the OAuth token endpoint signs with
+        // `active_jwt_signing_key()` → the rotation active slot). Validate against
+        // the same key set the /oauth/jwks endpoint publishes (CA + rotation
+        // slots), accepting if ANY trusted, published key verifies (#777).
+        let published = {
+            let guard = state
+                .published_jwt_verifying_keys
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.clone()
+        };
+        decode_local_multi_key(
+            token,
+            &state.verifying_key,
+            &published,
+            Some(&state.resource_url),
+        )?
     } else {
         if !state.federation_resolver.is_trusted(&iss) {
             return Err("untrusted federation issuer");
         }
         match state.federation_resolver.get_key(&iss).await {
-            Ok(key) => jwt::decode_with_key(token, &key, Some(&state.resource_url)),
+            Ok(key) => jwt::decode_with_key(token, &key, Some(&state.resource_url))
+                .map_err(|_| "JWT validation failed")?,
             Err(_) => return Err("federation key resolution failed"),
         }
     };
-
-    let claims = result.map_err(|_| "JWT validation failed")?;
 
     // JTI revocation check (RFC 7009) — shared blocklist with the OAuth
     // revocation endpoint.
@@ -520,5 +583,134 @@ mod tests {
 
         // Garbage input
         assert_eq!(extract_iss_from_token("notavalidtoken"), "");
+    }
+}
+
+/// Rotation/JWKS-aware local-token validation (#777).
+///
+/// Proves `decode_local_multi_key` accepts a token signed by ANY currently
+/// published key (CA or rotation slot) and rejects unpublished keys / wrong
+/// audience, and that the shared jti-revocation check still rejects a
+/// validly-decoded token.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod rotation_aware_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    const AUD: &str = "https://node-a/resource";
+
+    fn now() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+
+    fn new_key() -> SigningKey {
+        SigningKey::generate(&mut rand::rngs::OsRng)
+    }
+
+    /// Build a locally-issued at+JWT signed by `key`, with the given audience and
+    /// optional explicit jti (`jwt::encode` auto-assigns a random jti otherwise).
+    fn signed_token(key: &SigningKey, aud: &str, jti: Option<&str>) -> String {
+        let n = now();
+        let mut claims = jwt::Claims::new("alice".to_owned(), n, n + 3600)
+            .with_audience(Some(aud.to_owned()));
+        if let Some(j) = jti {
+            claims.jti = Some(j.to_owned());
+        }
+        jwt::encode(&claims, key)
+    }
+
+    #[test]
+    fn rotation_active_slot_verifies() {
+        // Token signed by a rotation slot that is NOT the CA key — this is the
+        // exact case that 401'd before #777.
+        let ca = new_key();
+        let rotation = new_key();
+        let token = signed_token(&rotation, AUD, None);
+        let published = vec![rotation.verifying_key()];
+
+        let claims =
+            decode_local_multi_key(&token, &ca.verifying_key(), &published, Some(AUD)).unwrap();
+        assert_eq!(claims.sub, "alice");
+    }
+
+    #[test]
+    fn ca_key_signed_token_still_verifies() {
+        // CA-signed token must still verify — even with no rotation slots published.
+        let ca = new_key();
+        let token = signed_token(&ca, AUD, None);
+
+        let claims = decode_local_multi_key(&token, &ca.verifying_key(), &[], Some(AUD)).unwrap();
+        assert_eq!(claims.sub, "alice");
+    }
+
+    #[test]
+    fn unpublished_random_key_rejected() {
+        // A token signed by a key the node never published must be rejected — the
+        // core security invariant (only trusted, published keys are ever tried).
+        let ca = new_key();
+        let rotation = new_key();
+        let attacker = new_key();
+        let token = signed_token(&attacker, AUD, None);
+        let published = vec![rotation.verifying_key()];
+
+        let err = decode_local_multi_key(&token, &ca.verifying_key(), &published, Some(AUD))
+            .unwrap_err();
+        assert_eq!(err, "JWT validation failed");
+    }
+
+    #[test]
+    fn wrong_audience_rejected() {
+        // Correct (published) key but wrong audience → still rejected. Strict
+        // local-issuer audience validation is unchanged.
+        let ca = new_key();
+        let rotation = new_key();
+        let token = signed_token(&rotation, "https://evil/other", None);
+        let published = vec![rotation.verifying_key()];
+
+        let err = decode_local_multi_key(&token, &ca.verifying_key(), &published, Some(AUD))
+            .unwrap_err();
+        assert_eq!(err, "JWT validation failed");
+    }
+
+    #[test]
+    fn revoked_jti_still_rejected() {
+        // A rotation-signed token decodes cleanly, but the shared jti-blocklist
+        // check `verify_token_claims` performs after decode still rejects it.
+        use hyprstream_rpc::auth::{InMemoryJtiBlocklist, JtiBlocklist as _};
+
+        let ca = new_key();
+        let rotation = new_key();
+        let token = signed_token(&rotation, AUD, Some("jti-777"));
+        let published = vec![rotation.verifying_key()];
+
+        let claims =
+            decode_local_multi_key(&token, &ca.verifying_key(), &published, Some(AUD)).unwrap();
+        assert_eq!(claims.jti.as_deref(), Some("jti-777"));
+
+        let blocklist = InMemoryJtiBlocklist::new();
+        blocklist.revoke("jti-777".to_owned(), now() + 3600);
+        // This mirrors the exact post-decode check in `verify_token_claims`.
+        assert!(blocklist.is_revoked(claims.jti.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn kid_hint_finds_rotation_slot_behind_ca() {
+        // The rotation slot is listed after the CA candidate; the kid-preference
+        // reorder must still locate and verify against it (it also verifies
+        // without any kid, since every candidate is tried).
+        let ca = new_key();
+        let rotation = new_key();
+        let token = signed_token(&rotation, AUD, None);
+        // Token header carries the rotation key's RFC 7638 thumbprint as kid.
+        assert_eq!(
+            extract_kid_from_token(&token).as_deref(),
+            Some(ed25519_kid(&rotation.verifying_key()).as_str()),
+        );
+        let published = vec![rotation.verifying_key()];
+
+        let claims =
+            decode_local_multi_key(&token, &ca.verifying_key(), &published, Some(AUD)).unwrap();
+        assert_eq!(claims.sub, "alice");
     }
 }
