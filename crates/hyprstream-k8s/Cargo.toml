@@ -16,7 +16,15 @@ default = []
 # `k8s` gates anything that needs a live client / controller-runtime.
 # `ws` adds the websocket upgrade path kube uses for pod `exec`/`attach`
 # (`AttachedProcess`), consumed by the workers `k8s` sandbox backend.
-k8s = ["kube/client", "kube/runtime", "kube/rustls-tls", "kube/ws"]
+k8s = [
+    "dep:futures",
+    "dep:tokio",
+    "dep:tracing",
+    "kube/client",
+    "kube/runtime",
+    "kube/rustls-tls",
+    "kube/ws",
+]
 
 [dependencies]
 # `derive` gives the CustomResource derive + CustomResourceExt (kube-core, no client).
@@ -28,6 +36,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 schemars = "1"
+futures = { workspace = true, optional = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 
 [lints]
 workspace = true

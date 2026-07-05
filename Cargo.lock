@@ -7098,12 +7098,16 @@ dependencies = [
 name = "hyprstream-k8s"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "k8s-openapi",
  "kube",
  "schemars",
  "serde",
  "serde_json",
  "serde_yaml",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

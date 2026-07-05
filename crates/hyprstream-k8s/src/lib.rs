@@ -49,6 +49,8 @@ pub mod training;
 
 #[cfg(feature = "k8s")]
 pub mod install;
+#[cfg(feature = "k8s")]
+pub mod operator;
 
 // Re-export the underlying `kube`/`k8s-openapi` crates so downstream crates
 // (e.g. `hyprstream-workers`' `k8s` sandbox backend) consume the *same*
