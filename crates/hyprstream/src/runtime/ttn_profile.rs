@@ -138,6 +138,10 @@ pub fn qwen3_5_0_8b_profile() -> LayerProfile {
 }
 
 /// Registry lookup for embedded profiles. Returns `None` for unknown models.
+///
+/// A known model family with unexpected geometry (e.g. a larger variant of a
+/// profiled family) also returns `None`, but loudly: it falls through to
+/// unvalidated allocation, and silence here previously masked that.
 pub fn find_embedded_profile(
     model_type: &str,
     num_layers: usize,
@@ -145,9 +149,22 @@ pub fn find_embedded_profile(
 ) -> Option<LayerProfile> {
     let normalized = model_type.to_lowercase();
     let normalized = normalized.as_str();
+    let known_family = matches!(normalized, "qwen3_5" | "qwen3.5" | "qwen3_5_text");
     match (normalized, num_layers, hidden_size) {
         ("qwen3_5" | "qwen3.5" | "qwen3_5_text", 24, 1024) => Some(qwen3_5_0_8b_profile()),
-        _ => None,
+        _ => {
+            if known_family {
+                warn!(
+                    model_type,
+                    num_layers,
+                    hidden_size,
+                    "Known model family but unexpected geometry — no embedded \
+                     rank profile matches; falling through to unvalidated \
+                     allocation"
+                );
+            }
+            None
+        }
     }
 }
 
@@ -475,11 +492,24 @@ pub fn get_layer_profile(
     }
 
     // Tier 2: Cached profile from disk (~1ms)
-    if let Some(profile) = load_cached_profile(model_path) {
+    if let Some(mut profile) = load_cached_profile(model_path) {
         info!(
             "Loaded cached TTN profile from {}",
             model_path.display()
         );
+        // A cached profile for a model with no embedded ablation data is a
+        // persisted Tier-3 computation and gets the same cap. Older caches
+        // predate the cap; hand-edited ones must not bypass it either.
+        for layer in &mut profile.layers {
+            if layer.recommended_rank > UNVALIDATED_RANK_CAP {
+                warn!(
+                    layer_idx = layer.layer_idx,
+                    cached_rank = layer.recommended_rank,
+                    "Cached profile exceeds the unvalidated-rank cap; clamping"
+                );
+                layer.recommended_rank = UNVALIDATED_RANK_CAP;
+            }
+        }
         return Ok(profile);
     }
 
