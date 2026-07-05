@@ -47,13 +47,6 @@ pub mod models;
 pub mod serving;
 pub mod training;
 
-/// Re-export of the exact `k8s-openapi` version this crate is built against, so
-/// downstream crates (e.g. `hyprstream-discovery`'s placement→PodSpec map, K4c
-/// #787) can name `PodSpec` / `Quantity` / `Affinity` at the single
-/// workspace-pinned `v1_32` version without independently depending on
-/// `k8s-openapi` (exactly one `v1_*` is permitted workspace-wide).
-pub use k8s_openapi;
-
 #[cfg(feature = "k8s")]
 pub mod install;
 
@@ -63,16 +56,16 @@ pub mod install;
 // than declaring their own — the workspace allows exactly one k8s-openapi
 // `v1_*` feature, and threading these through one crate keeps that invariant
 // impossible to violate by accident.
-pub use k8s_openapi;
-pub use kube;
+pub use ::k8s_openapi;
+pub use ::kube;
 
 pub use mesh::{TenantBinding, TenantBindingSpec, TenantBindingStatus};
 pub use models::{Adapter, AdapterSpec, AdapterStatus, Model, ModelSpec, ModelStage, ModelStatus};
 pub use serving::{InferenceService, InferenceServiceSpec, InferenceServiceStatus, Statefulness};
 pub use training::{ResourceSpec, TrainingRun, TrainingRunSpec, TrainingRunStatus};
 
-use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
-use kube::CustomResourceExt;
+use ::k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+use ::kube::CustomResourceExt;
 
 /// Label applied to every object the hyprstream operator manages.
 ///
