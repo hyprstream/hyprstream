@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "hyprstream.fullname" . }}-config
+  labels:
+    {{- include "hyprstream.labels" . | nindent 4 }}
+data:
+  # Shared HYPRSTREAM__* env for every service. Config crate maps
+  # HYPRSTREAM__<SECTION>__<FIELD> onto HyprConfig.
+  HYPRSTREAM__STORAGE__MODELS_DIR: {{ printf "%s/models" .Values.config.dataDir | quote }}
+  HYPRSTREAM__STORAGE__LORAS_DIR: {{ printf "%s/loras" .Values.config.dataDir | quote }}
+  HYPRSTREAM__STORAGE__CACHE_DIR: {{ printf "%s/cache" .Values.config.dataDir | quote }}
+  HYPRSTREAM__STORAGE__CONFIG_DIR: {{ printf "%s/config" .Values.config.dataDir | quote }}
+  HYPRSTREAM__SECRETS__PATH: {{ .Values.keyBootstrap.secretsPath | quote }}
+  HYPRSTREAM__QUIC__ENABLED: {{ .Values.config.quic.enabled | quote }}
+  HYPRSTREAM__QUIC__IROH: {{ .Values.config.quic.iroh | quote }}
+  HYPRSTREAM__QUIC__BIND_ADDR: {{ .Values.config.quic.bindAddr | quote }}
+  {{- with .Values.config.extraEnv }}
+  {{- range $k, $v := . }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}
+  {{- end }}
+  {{- if .Values.observability.enabled }}
+  # TODO(#784): observability wiring populates OTEL_EXPORTER_OTLP_ENDPOINT here.
+  {{- with .Values.observability.otelExporterOtlpEndpoint }}
+  OTEL_EXPORTER_OTLP_ENDPOINT: {{ . | quote }}
+  {{- end }}
+  {{- end }}

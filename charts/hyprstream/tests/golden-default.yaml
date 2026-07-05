@@ -1,0 +1,683 @@
+---
+# Source: hyprstream/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hyprstream
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+automountServiceAccountToken: true
+---
+# Source: hyprstream/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hyprstream-config
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+data:
+  # Shared HYPRSTREAM__* env for every service. Config crate maps
+  # HYPRSTREAM__<SECTION>__<FIELD> onto HyprConfig.
+  HYPRSTREAM__STORAGE__MODELS_DIR: "/var/lib/hyprstream/models"
+  HYPRSTREAM__STORAGE__LORAS_DIR: "/var/lib/hyprstream/loras"
+  HYPRSTREAM__STORAGE__CACHE_DIR: "/var/lib/hyprstream/cache"
+  HYPRSTREAM__STORAGE__CONFIG_DIR: "/var/lib/hyprstream/config"
+  HYPRSTREAM__SECRETS__PATH: "/var/lib/hyprstream/credentials"
+  HYPRSTREAM__QUIC__ENABLED: "true"
+  HYPRSTREAM__QUIC__IROH: "true"
+  HYPRSTREAM__QUIC__BIND_ADDR: "0.0.0.0:0"
+---
+# Source: hyprstream/templates/pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hyprstream-data
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+---
+# Source: hyprstream/templates/services.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: hyprstream-discovery
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: discovery
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/component: discovery
+  ports:
+    - name: quic
+      port: 7002
+      targetPort: quic
+      protocol: UDP
+---
+# Source: hyprstream/templates/services.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: hyprstream-event
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: event
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/component: event
+  ports:
+    - name: quic
+      port: 7010
+      targetPort: quic
+      protocol: UDP
+---
+# Source: hyprstream/templates/services.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: hyprstream-model
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: model
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/component: model
+  ports:
+    - name: quic
+      port: 7004
+      targetPort: quic
+      protocol: UDP
+---
+# Source: hyprstream/templates/services.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: hyprstream-oai
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: oai
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/component: oai
+  ports:
+    - name: http
+      port: 6789
+      targetPort: http
+      protocol: TCP
+---
+# Source: hyprstream/templates/services.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: hyprstream-policy
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: policy
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/component: policy
+  ports:
+    - name: quic
+      port: 7001
+      targetPort: quic
+      protocol: UDP
+---
+# Source: hyprstream/templates/services.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: hyprstream-registry
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: registry
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/component: registry
+  ports:
+    - name: quic
+      port: 7003
+      targetPort: quic
+      protocol: UDP
+---
+# Source: hyprstream/templates/services.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: hyprstream-streams
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: streams
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/component: streams
+  ports:
+    - name: quic
+      port: 7011
+      targetPort: quic
+      protocol: UDP
+---
+# Source: hyprstream/templates/deployments.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hyprstream-discovery
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: discovery
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hyprstream
+      app.kubernetes.io/instance: hyprstream
+      app.kubernetes.io/component: discovery
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hyprstream
+        app.kubernetes.io/instance: hyprstream
+        app.kubernetes.io/component: discovery
+    spec:
+      serviceAccountName: hyprstream
+      containers:
+        - name: discovery
+          image: ghcr.io/hyprstream/hyprstream:0.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - service
+            - start
+            - discovery
+            - --foreground
+          envFrom:
+            - configMapRef:
+                name: hyprstream-config
+          env:
+            - name: HYPRSTREAM__DISCOVERY__QUIC_PORT
+              value: "7002"
+            - name: HYPRSTREAM__QUIC__SERVER_NAME
+              value: "hyprstream-discovery"
+          ports:
+            - name: quic
+              containerPort: 7002
+              protocol: UDP
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 65532
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/hyprstream
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: hyprstream-data
+---
+# Source: hyprstream/templates/deployments.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hyprstream-event
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: event
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hyprstream
+      app.kubernetes.io/instance: hyprstream
+      app.kubernetes.io/component: event
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hyprstream
+        app.kubernetes.io/instance: hyprstream
+        app.kubernetes.io/component: event
+    spec:
+      serviceAccountName: hyprstream
+      containers:
+        - name: event
+          image: ghcr.io/hyprstream/hyprstream:0.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - service
+            - start
+            - event
+            - --foreground
+          envFrom:
+            - configMapRef:
+                name: hyprstream-config
+          env:
+            - name: HYPRSTREAM__EVENT__QUIC_PORT
+              value: "7010"
+            - name: HYPRSTREAM__QUIC__SERVER_NAME
+              value: "hyprstream-event"
+          ports:
+            - name: quic
+              containerPort: 7010
+              protocol: UDP
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 65532
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/hyprstream
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: hyprstream-data
+---
+# Source: hyprstream/templates/deployments.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hyprstream-model
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: model
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hyprstream
+      app.kubernetes.io/instance: hyprstream
+      app.kubernetes.io/component: model
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hyprstream
+        app.kubernetes.io/instance: hyprstream
+        app.kubernetes.io/component: model
+    spec:
+      serviceAccountName: hyprstream
+      containers:
+        - name: model
+          image: ghcr.io/hyprstream/hyprstream:0.1.0-cpu
+          imagePullPolicy: IfNotPresent
+          args:
+            - service
+            - start
+            - model
+            - --foreground
+          envFrom:
+            - configMapRef:
+                name: hyprstream-config
+          env:
+            - name: HYPRSTREAM__MODEL__QUIC_PORT
+              value: "7004"
+            - name: HYPRSTREAM__QUIC__SERVER_NAME
+              value: "hyprstream-model"
+          ports:
+            - name: quic
+              containerPort: 7004
+              protocol: UDP
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 65532
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/hyprstream
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: hyprstream-data
+---
+# Source: hyprstream/templates/deployments.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hyprstream-oai
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: oai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hyprstream
+      app.kubernetes.io/instance: hyprstream
+      app.kubernetes.io/component: oai
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hyprstream
+        app.kubernetes.io/instance: hyprstream
+        app.kubernetes.io/component: oai
+    spec:
+      serviceAccountName: hyprstream
+      containers:
+        - name: oai
+          image: ghcr.io/hyprstream/hyprstream:0.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - service
+            - start
+            - oai
+            - --foreground
+          envFrom:
+            - configMapRef:
+                name: hyprstream-config
+          env:
+            - name: HYPRSTREAM__OAI__HOST
+              value: "0.0.0.0"
+            - name: HYPRSTREAM__OAI__PORT
+              value: "6789"
+            - name: HYPRSTREAM__QUIC__SERVER_NAME
+              value: "hyprstream-oai"
+          ports:
+            - name: http
+              containerPort: 6789
+              protocol: TCP
+          readinessProbe:
+            failureThreshold: 6
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 65532
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/hyprstream
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: hyprstream-data
+---
+# Source: hyprstream/templates/deployments.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hyprstream-policy
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: policy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hyprstream
+      app.kubernetes.io/instance: hyprstream
+      app.kubernetes.io/component: policy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hyprstream
+        app.kubernetes.io/instance: hyprstream
+        app.kubernetes.io/component: policy
+    spec:
+      serviceAccountName: hyprstream
+      containers:
+        - name: policy
+          image: ghcr.io/hyprstream/hyprstream:0.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - service
+            - start
+            - policy
+            - --foreground
+          envFrom:
+            - configMapRef:
+                name: hyprstream-config
+          env:
+            - name: HYPRSTREAM__POLICY__QUIC_PORT
+              value: "7001"
+            - name: HYPRSTREAM__QUIC__SERVER_NAME
+              value: "hyprstream-policy"
+          ports:
+            - name: quic
+              containerPort: 7001
+              protocol: UDP
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 65532
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/hyprstream
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: hyprstream-data
+---
+# Source: hyprstream/templates/deployments.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hyprstream-registry
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: registry
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hyprstream
+      app.kubernetes.io/instance: hyprstream
+      app.kubernetes.io/component: registry
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hyprstream
+        app.kubernetes.io/instance: hyprstream
+        app.kubernetes.io/component: registry
+    spec:
+      serviceAccountName: hyprstream
+      containers:
+        - name: registry
+          image: ghcr.io/hyprstream/hyprstream:0.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - service
+            - start
+            - registry
+            - --foreground
+          envFrom:
+            - configMapRef:
+                name: hyprstream-config
+          env:
+            - name: HYPRSTREAM__QUIC__SERVER_NAME
+              value: "hyprstream-registry"
+            - name: HYPRSTREAM__REGISTRY__QUIC_PORT
+              value: "7003"
+          ports:
+            - name: quic
+              containerPort: 7003
+              protocol: UDP
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 65532
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/hyprstream
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: hyprstream-data
+---
+# Source: hyprstream/templates/deployments.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hyprstream-streams
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: streams
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hyprstream
+      app.kubernetes.io/instance: hyprstream
+      app.kubernetes.io/component: streams
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hyprstream
+        app.kubernetes.io/instance: hyprstream
+        app.kubernetes.io/component: streams
+    spec:
+      serviceAccountName: hyprstream
+      containers:
+        - name: streams
+          image: ghcr.io/hyprstream/hyprstream:0.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - service
+            - start
+            - streams
+            - --foreground
+          envFrom:
+            - configMapRef:
+                name: hyprstream-config
+          env:
+            - name: HYPRSTREAM__QUIC__SERVER_NAME
+              value: "hyprstream-streams"
+          ports:
+            - name: quic
+              containerPort: 7011
+              protocol: UDP
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 65532
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/hyprstream
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: hyprstream-data

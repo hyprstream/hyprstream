@@ -1,0 +1,23 @@
+HyprStream deployed as {{ include "hyprstream.fullname" . }} in namespace {{ .Release.Namespace }}.
+
+Enabled services (one Deployment + ClusterIP Service each):
+{{- range $name, $svc := .Values.services }}
+{{- if $svc.enabled }}
+  - {{ printf "%s-%s" (include "hyprstream.fullname" $) $name }}  ({{ $svc.kind }})
+{{- end }}
+{{- end }}
+
+Services address each other by DNS Service name over QUIC/iroh (no shared-volume UDS).
+
+Reach the OpenAI-compatible API (if oai is enabled):
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "hyprstream.fullname" . }}-oai 6789:6789
+  curl http://localhost:6789/v1/models
+
+IMPORTANT (Phase 0 substrate):
+  * Cross-pod QUIC service-to-service *peer resolution* (feeding K8s DNS names into
+    the RPC resolver / discovery lookup) is not yet wired in hyprstream itself.
+    This chart provisions the deployment substrate; a working end-to-end install
+    also needs that app-side wiring plus the key/trust bootstrap from #783 (K1a).
+  * Per-service signing-key Secrets / trust store / node DID: TODO(#783), gated by
+    keyBootstrap.enabled.
+  * OTel Collector / Prometheus exposition: TODO(#784), gated by observability.enabled.
