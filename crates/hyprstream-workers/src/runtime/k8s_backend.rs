@@ -38,14 +38,13 @@
 //! so a restarted backend can reap its own sandbox workload without adopting a
 //! different sandbox's objects.
 //!
-//! ## Out of scope here
+//! ## Namespace delivery (#793)
 //!
-//! - **Namespace delivery** (`deliver_namespace`) is K4b (#793, needs K3): the
-//!   trait default (fail-closed "not implemented") is deliberately left in
-//!   place.
-//! - **Placement mapping** (node affinity / GPU / topology) is K4c.
-//! - The "runs on a kind cluster" e2e acceptance is a follow-up; this change is
-//!   the backend core + the offline-testable `to_k8s_podspec` mapping.
+//! Scheduler-placed pods receive composed hyprstream namespaces through
+//! `csi.hyprstream.io` volumes. The ticket/endpoint/namespace path are injected
+//! into the PodSpec at create time; late mutation of a running Pod's volumes is
+//! impossible by Kubernetes design, so `deliver_namespace(NineP)` returns the
+//! same delivery descriptor the start path must have injected.
 
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
@@ -58,7 +57,8 @@ use tracing::{debug, info, warn};
 
 use hyprstream_k8s::k8s_openapi::api::batch::v1::{Job, JobSpec};
 use hyprstream_k8s::k8s_openapi::api::core::v1::{
-    Container, EnvVar, Pod, PodSpec, PodTemplateSpec, ResourceRequirements, SecurityContext,
+    CSIVolumeSource, Container, EnvVar, Pod, PodSpec, PodTemplateSpec, ResourceRequirements,
+    SecurityContext, Volume, VolumeMount,
 };
 use hyprstream_k8s::k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use hyprstream_k8s::k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -70,7 +70,7 @@ use hyprstream_k8s::MANAGED_BY_LABEL;
 use crate::config::PoolConfig;
 use crate::error::{Result, WorkerError};
 
-use super::backend::{SandboxBackend, SandboxHandle};
+use super::backend::{NamespaceDelivery, NamespaceTransport, SandboxBackend, SandboxHandle};
 use super::client::{KeyValue, PodSandboxConfig};
 use super::sandbox::PodSandbox;
 
@@ -94,6 +94,21 @@ const ANN_NAMESPACE: &str = "hyprstream.io/k8s-namespace";
 /// the default). A `Job` gets retry/backoff + completion tracking from the Job
 /// controller; a bare `Pod` is the minimal, watch-until-`Running` shape.
 const ANN_WORKLOAD_KIND: &str = "hyprstream.io/k8s-workload-kind";
+/// Annotation key: absolute path inside the workload container where the
+/// composed hyprstream namespace is mounted through `csi.hyprstream.io`.
+const ANN_NINEP_MOUNT_PATH: &str = "hyprstream.io/9p-mount-path";
+/// Annotation key: mount-ticket scoped namespace path.
+const ANN_NINEP_NAMESPACE_PATH: &str = "hyprstream.io/9p-namespace-path";
+/// Annotation key: #862 mount ticket presented as Tattach.uname by CSI.
+const ANN_NINEP_TICKET: &str = "hyprstream.io/9p-ticket";
+/// Annotation key: dial-time carrier endpoint for the CSI node plugin.
+const ANN_NINEP_ENDPOINT: &str = "hyprstream.io/9p-endpoint";
+/// Annotation key: mount ticket plane (`webtransport`, `ws`, `vsock`, ...).
+const ANN_NINEP_PLANE: &str = "hyprstream.io/9p-plane";
+/// Annotation key: CSI mounter (`kernel` or `fuse`).
+const ANN_NINEP_MOUNTER: &str = "hyprstream.io/9p-mounter";
+const CSI_DRIVER: &str = "csi.hyprstream.io";
+const NINEP_VOLUME_NAME: &str = "hyprstream-9p";
 
 /// Label value for [`MANAGED_BY_LABEL`] on objects this backend emits.
 ///
@@ -443,6 +458,102 @@ fn to_k8s_env(sandbox_id: &str, annotations: &HashMap<String, String>) -> Vec<En
     env
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NinePVolumeSpec {
+    mount_path: String,
+    namespace_path: String,
+    ticket: String,
+    endpoint: String,
+    plane: String,
+    mounter: String,
+}
+
+fn ninep_volume_from_annotations(
+    annotations: &HashMap<String, String>,
+) -> Result<Option<NinePVolumeSpec>> {
+    let Some(mount_path) = annotations
+        .get(ANN_NINEP_MOUNT_PATH)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    let namespace_path = required_annotation(annotations, ANN_NINEP_NAMESPACE_PATH)?;
+    let ticket = required_annotation(annotations, ANN_NINEP_TICKET)?;
+    let endpoint = required_annotation(annotations, ANN_NINEP_ENDPOINT)?;
+    let plane = annotations
+        .get(ANN_NINEP_PLANE)
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .unwrap_or_else(|| "webtransport".to_owned());
+    let mounter = annotations
+        .get(ANN_NINEP_MOUNTER)
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .unwrap_or_else(|| "fuse".to_owned());
+    if !mount_path.starts_with('/') {
+        return Err(WorkerError::ConfigError(format!(
+            "{ANN_NINEP_MOUNT_PATH} must be absolute, got {mount_path:?}"
+        )));
+    }
+    if !namespace_path.starts_with('/') {
+        return Err(WorkerError::ConfigError(format!(
+            "{ANN_NINEP_NAMESPACE_PATH} must be absolute, got {namespace_path:?}"
+        )));
+    }
+    if mounter != "kernel" && mounter != "fuse" {
+        return Err(WorkerError::ConfigError(format!(
+            "{ANN_NINEP_MOUNTER} must be kernel or fuse, got {mounter:?}"
+        )));
+    }
+    Ok(Some(NinePVolumeSpec {
+        mount_path: mount_path.clone(),
+        namespace_path,
+        ticket,
+        endpoint,
+        plane,
+        mounter,
+    }))
+}
+
+fn required_annotation(annotations: &HashMap<String, String>, key: &str) -> Result<String> {
+    annotations
+        .get(key)
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .ok_or_else(|| WorkerError::ConfigError(format!("{key} is required for 9P CSI delivery")))
+}
+
+fn ninep_volume(spec: &NinePVolumeSpec) -> Volume {
+    let mut attrs = BTreeMap::new();
+    attrs.insert("namespacePath".to_owned(), spec.namespace_path.clone());
+    attrs.insert("plane".to_owned(), spec.plane.clone());
+    attrs.insert("mounter".to_owned(), spec.mounter.clone());
+    attrs.insert("endpoint".to_owned(), spec.endpoint.clone());
+    // The node plugin uses this pre-minted per-sandbox ticket as Tattach.uname.
+    // A follow-up can switch to CSI tokenRequests -> /oauth/mount-ticket in the
+    // node plugin when the worker has a live issuer client in-process.
+    attrs.insert("ticket".to_owned(), spec.ticket.clone());
+    Volume {
+        name: NINEP_VOLUME_NAME.to_owned(),
+        csi: Some(CSIVolumeSource {
+            driver: CSI_DRIVER.to_owned(),
+            read_only: Some(false),
+            volume_attributes: Some(attrs),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn ninep_volume_mount(spec: &NinePVolumeSpec) -> VolumeMount {
+    VolumeMount {
+        name: NINEP_VOLUME_NAME.to_owned(),
+        mount_path: spec.mount_path.clone(),
+        read_only: Some(false),
+        ..Default::default()
+    }
+}
+
 /// Translate the capnp [`PodSandboxConfig`] + resolved annotations into a
 /// Kubernetes [`PodSpec`] with a single `workload` container.
 ///
@@ -456,7 +567,7 @@ pub fn to_k8s_podspec(
     sandbox_id: &str,
     annotations: &HashMap<String, String>,
     default_image: &str,
-) -> PodSpec {
+) -> Result<PodSpec> {
     let image = annotations
         .get(ANN_IMAGE)
         .filter(|s| !s.is_empty())
@@ -474,7 +585,9 @@ pub fn to_k8s_podspec(
         .cloned()
         .and_then(NonEmptyOption::into_option_nonempty);
 
-    let container = Container {
+    let ninep = ninep_volume_from_annotations(annotations)?;
+
+    let mut container = Container {
         name: "workload".to_owned(),
         image: Some(image),
         command,
@@ -483,13 +596,20 @@ pub fn to_k8s_podspec(
         security_context: to_k8s_security_context(config),
         ..Default::default()
     };
+    if let Some(spec) = ninep.as_ref() {
+        container.volume_mounts = Some(vec![ninep_volume_mount(spec)]);
+    }
 
-    PodSpec {
+    let mut pod_spec = PodSpec {
         containers: vec![container],
         restart_policy: Some("Never".to_owned()),
         runtime_class_name,
         ..Default::default()
+    };
+    if let Some(spec) = ninep.as_ref() {
+        pod_spec.volumes = Some(vec![ninep_volume(spec)]);
     }
+    Ok(pod_spec)
 }
 
 /// Origin-marker labels stamped on every emitted object: the config labels plus
@@ -527,17 +647,17 @@ fn build_pod(
     instance_id: &str,
     default_image: &str,
     annotations: &HashMap<String, String>,
-) -> Pod {
-    Pod {
+) -> Result<Pod> {
+    Ok(Pod {
         metadata: object_meta(config, sandbox_id, namespace, instance_id),
         spec: Some(to_k8s_podspec(
             config,
             sandbox_id,
             annotations,
             default_image,
-        )),
+        )?),
         ..Default::default()
-    }
+    })
 }
 
 fn build_job(
@@ -547,9 +667,9 @@ fn build_job(
     instance_id: &str,
     default_image: &str,
     annotations: &HashMap<String, String>,
-) -> Job {
+) -> Result<Job> {
     let labels = object_labels(config, sandbox_id, instance_id);
-    Job {
+    Ok(Job {
         metadata: object_meta(config, sandbox_id, namespace, instance_id),
         spec: Some(JobSpec {
             // Do not let the Job controller retry indefinitely; the sandbox
@@ -565,12 +685,12 @@ fn build_job(
                     sandbox_id,
                     annotations,
                     default_image,
-                )),
+                )?),
             },
             ..Default::default()
         }),
         ..Default::default()
-    }
+    })
 }
 
 #[async_trait]
@@ -648,7 +768,7 @@ impl SandboxBackend for K8sBackend {
                     &self.instance_id,
                     &image,
                     annotations,
-                );
+                )?;
                 let pods: Api<Pod> = Api::namespaced(client, &namespace);
                 pods.create(&PostParams::default(), &pod)
                     .await
@@ -679,7 +799,7 @@ impl SandboxBackend for K8sBackend {
                     &self.instance_id,
                     &image,
                     annotations,
-                );
+                )?;
                 let jobs: Api<Job> = Api::namespaced(client, &namespace);
                 jobs.create(&PostParams::default(), &job)
                     .await
@@ -721,6 +841,54 @@ impl SandboxBackend for K8sBackend {
         // Host PIDs are a node-local concept the API server does not expose;
         // fail-safe empty result rather than fabricating one (same as `cri`).
         Ok(Vec::new())
+    }
+
+    async fn deliver_namespace(
+        &self,
+        _sandbox: &PodSandbox,
+        _namespace: hyprstream_vfs::Namespace,
+        _subject: hyprstream_vfs::Subject,
+        transport: NamespaceTransport,
+    ) -> Result<NamespaceDelivery> {
+        let NamespaceTransport::NineP {
+            endpoint,
+            ticket,
+            namespace_path,
+            plane,
+            mounter,
+            mount_path,
+        } = transport
+        else {
+            return Err(WorkerError::Unsupported(
+                "k8s backend only supports NamespaceTransport::NineP; host bind mounts \
+                 and Kata/virtiofs transports are not meaningful for API-server pods"
+                    .to_owned(),
+            ));
+        };
+        if !namespace_path.starts_with('/') {
+            return Err(WorkerError::ConfigError(format!(
+                "NineP namespace_path must be absolute, got {namespace_path:?}"
+            )));
+        }
+        if !mount_path.is_absolute() {
+            return Err(WorkerError::ConfigError(format!(
+                "NineP mount_path must be absolute, got {}",
+                mount_path.display()
+            )));
+        }
+        if ticket.is_empty() {
+            return Err(WorkerError::ConfigError(
+                "NineP delivery requires a scoped mount ticket".to_owned(),
+            ));
+        }
+        Ok(NamespaceDelivery::NineP {
+            endpoint,
+            ticket,
+            namespace_path,
+            plane,
+            mounter,
+            mount_path,
+        })
     }
 
     fn supports_exec(&self) -> bool {
@@ -955,7 +1123,7 @@ mod tests {
         ann.insert(ANN_COMMAND.into(), "/bin/sh -c echo".into());
         ann.insert("hyprstream.io/env.FOO".into(), "bar".into());
 
-        let spec = to_k8s_podspec(&cfg(), "sb-1", &ann, DEFAULT_IMAGE);
+        let spec = to_k8s_podspec(&cfg(), "sb-1", &ann, DEFAULT_IMAGE).expect("podspec");
         assert_eq!(spec.restart_policy.as_deref(), Some("Never"));
         let c = &spec.containers[0];
         assert_eq!(c.name, "workload");
@@ -975,7 +1143,7 @@ mod tests {
 
     #[test]
     fn podspec_defaults_image_when_no_annotation() {
-        let spec = to_k8s_podspec(&cfg(), "sb-2", &HashMap::new(), DEFAULT_IMAGE);
+        let spec = to_k8s_podspec(&cfg(), "sb-2", &HashMap::new(), DEFAULT_IMAGE).expect("podspec");
         assert_eq!(spec.containers[0].image.as_deref(), Some(DEFAULT_IMAGE));
         // No command annotation ⇒ image entrypoint (None), not an empty argv.
         assert!(spec.containers[0].command.is_none());
@@ -985,13 +1153,13 @@ mod tests {
     fn podspec_passes_runtime_class_through() {
         let mut ann = HashMap::new();
         ann.insert(ANN_RUNTIME_CLASS.into(), "kata".into());
-        let spec = to_k8s_podspec(&cfg(), "sb-3", &ann, DEFAULT_IMAGE);
+        let spec = to_k8s_podspec(&cfg(), "sb-3", &ann, DEFAULT_IMAGE).expect("podspec");
         assert_eq!(spec.runtime_class_name.as_deref(), Some("kata"));
 
         // Empty runtime-class ⇒ cluster default (no runtimeClassName).
         let mut ann2 = HashMap::new();
         ann2.insert(ANN_RUNTIME_CLASS.into(), "".into());
-        let spec2 = to_k8s_podspec(&cfg(), "sb-3b", &ann2, DEFAULT_IMAGE);
+        let spec2 = to_k8s_podspec(&cfg(), "sb-3b", &ann2, DEFAULT_IMAGE).expect("podspec");
         assert!(spec2.runtime_class_name.is_none());
     }
 
@@ -1002,7 +1170,7 @@ mod tests {
         c.linux.resources.cpu_quota = 50_000; // 0.5 core → 500m
         c.linux.resources.memory_limit_in_bytes = 268_435_456; // 256Mi bytes
 
-        let spec = to_k8s_podspec(&c, "sb-4", &HashMap::new(), DEFAULT_IMAGE);
+        let spec = to_k8s_podspec(&c, "sb-4", &HashMap::new(), DEFAULT_IMAGE).expect("podspec");
         let res = spec.containers[0].resources.as_ref().unwrap();
         let limits = res.limits.as_ref().unwrap();
         assert_eq!(limits.get("cpu").unwrap().0, "500m");
@@ -1013,7 +1181,7 @@ mod tests {
 
     #[test]
     fn no_resources_when_unspecified() {
-        let spec = to_k8s_podspec(&cfg(), "sb-5", &HashMap::new(), DEFAULT_IMAGE);
+        let spec = to_k8s_podspec(&cfg(), "sb-5", &HashMap::new(), DEFAULT_IMAGE).expect("podspec");
         assert!(spec.containers[0].resources.is_none());
     }
 
@@ -1023,7 +1191,7 @@ mod tests {
         c.linux.security_context.run_as_user = 1000;
         c.linux.security_context.readonly_rootfs = true;
 
-        let spec = to_k8s_podspec(&c, "sb-6", &HashMap::new(), DEFAULT_IMAGE);
+        let spec = to_k8s_podspec(&c, "sb-6", &HashMap::new(), DEFAULT_IMAGE).expect("podspec");
         let sc = spec.containers[0].security_context.as_ref().unwrap();
         assert_eq!(sc.run_as_user, Some(1000));
         assert_eq!(sc.read_only_root_filesystem, Some(true));
@@ -1035,8 +1203,89 @@ mod tests {
     #[test]
     fn security_context_none_when_nothing_asserted() {
         // run_as_user == 0 is treated as unset (never force root).
-        let spec = to_k8s_podspec(&cfg(), "sb-7", &HashMap::new(), DEFAULT_IMAGE);
+        let spec = to_k8s_podspec(&cfg(), "sb-7", &HashMap::new(), DEFAULT_IMAGE).expect("podspec");
         assert!(spec.containers[0].security_context.is_none());
+    }
+
+    #[test]
+    fn podspec_injects_ninep_csi_volume() {
+        let mut ann = HashMap::new();
+        ann.insert(ANN_NINEP_MOUNT_PATH.into(), "/mnt/hyprstream".into());
+        ann.insert(ANN_NINEP_NAMESPACE_PATH.into(), "/sandboxes/sb-10".into());
+        ann.insert(ANN_NINEP_TICKET.into(), "ticket-sb-10".into());
+        ann.insert(ANN_NINEP_ENDPOINT.into(), "https://node.example/9p".into());
+        ann.insert(ANN_NINEP_PLANE.into(), "webtransport".into());
+        ann.insert(ANN_NINEP_MOUNTER.into(), "kernel".into());
+
+        let spec = to_k8s_podspec(&cfg(), "sb-10", &ann, DEFAULT_IMAGE).expect("podspec");
+        let mounts = spec.containers[0].volume_mounts.as_ref().unwrap();
+        assert_eq!(mounts[0].name, NINEP_VOLUME_NAME);
+        assert_eq!(mounts[0].mount_path, "/mnt/hyprstream");
+
+        let volume = &spec.volumes.as_ref().unwrap()[0];
+        assert_eq!(volume.name, NINEP_VOLUME_NAME);
+        let csi = volume.csi.as_ref().unwrap();
+        assert_eq!(csi.driver, CSI_DRIVER);
+        let attrs = csi.volume_attributes.as_ref().unwrap();
+        assert_eq!(
+            attrs.get("namespacePath").map(String::as_str),
+            Some("/sandboxes/sb-10")
+        );
+        assert_eq!(
+            attrs.get("ticket").map(String::as_str),
+            Some("ticket-sb-10")
+        );
+        assert_eq!(
+            attrs.get("endpoint").map(String::as_str),
+            Some("https://node.example/9p")
+        );
+        assert_eq!(attrs.get("mounter").map(String::as_str), Some("kernel"));
+    }
+
+    #[test]
+    fn podspec_rejects_relative_ninep_scope() {
+        let mut ann = HashMap::new();
+        ann.insert(ANN_NINEP_MOUNT_PATH.into(), "/mnt/hyprstream".into());
+        ann.insert(ANN_NINEP_NAMESPACE_PATH.into(), "sandboxes/sb-11".into());
+        ann.insert(ANN_NINEP_TICKET.into(), "ticket".into());
+        ann.insert(ANN_NINEP_ENDPOINT.into(), "https://node.example/9p".into());
+
+        let err = to_k8s_podspec(&cfg(), "sb-11", &ann, DEFAULT_IMAGE).unwrap_err();
+        assert!(err.to_string().contains(ANN_NINEP_NAMESPACE_PATH));
+    }
+
+    #[tokio::test]
+    async fn deliver_namespace_accepts_ninep_transport() {
+        let backend = K8sBackend::new(K8sConfig::default());
+        let sandbox = PodSandbox::new(
+            "sb-12".to_owned(),
+            &cfg(),
+            PathBuf::from("/tmp/hyprstream-k8s-test"),
+        );
+        let delivery = backend
+            .deliver_namespace(
+                &sandbox,
+                hyprstream_vfs::Namespace::new(),
+                hyprstream_vfs::Subject::anonymous(),
+                NamespaceTransport::NineP {
+                    endpoint: "https://node.example/9p".to_owned(),
+                    ticket: "ticket".to_owned(),
+                    namespace_path: "/sandboxes/sb-12".to_owned(),
+                    plane: "webtransport".to_owned(),
+                    mounter: "fuse".to_owned(),
+                    mount_path: PathBuf::from("/mnt/hyprstream"),
+                },
+            )
+            .await
+            .expect("ninep delivery");
+        assert!(matches!(
+            delivery,
+            NamespaceDelivery::NineP {
+                ref namespace_path,
+                ref mounter,
+                ..
+            } if namespace_path == "/sandboxes/sb-12" && mounter == "fuse"
+        ));
     }
 
     #[test]
@@ -1053,7 +1302,8 @@ mod tests {
             "inst-xyz",
             DEFAULT_IMAGE,
             &HashMap::new(),
-        );
+        )
+        .expect("pod");
         assert_eq!(pod.metadata.name.as_deref(), Some("sb-8"));
         assert_eq!(pod.metadata.namespace.as_deref(), Some("team-a"));
         let labels = pod.metadata.labels.as_ref().unwrap();
@@ -1078,7 +1328,8 @@ mod tests {
             "inst-1",
             DEFAULT_IMAGE,
             &HashMap::new(),
-        );
+        )
+        .expect("job");
         let spec = job.spec.as_ref().unwrap();
         assert_eq!(spec.backoff_limit, Some(0));
         let tmpl = &spec.template;
