@@ -54,6 +54,14 @@ pub fn create_app(state: ServerState) -> Router {
             "/.well-known/export9p",
             get(routes::ninep::export9p_metadata),
         )
+        // Wire-plane discovery table (#821 / epic #809): enumerates every
+        // non-file wire plane (9p, moq, …) → its current path + carriers, the
+        // source of truth a client resolves the `/9p` selector against instead
+        // of a hardcoded constant. Companions (does not replace) export9p.
+        .route(
+            "/.well-known/planes",
+            get(routes::ninep::wire_planes_metadata),
+        )
         .route("/9p", get(routes::ninep::ninep_ws));
 
     // Protected routes (auth required)
