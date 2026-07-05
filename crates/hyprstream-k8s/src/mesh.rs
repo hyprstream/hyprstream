@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
     // `namespace` is a CEL reserved word, so the apiserver requires the field
     // to be referenced with the `__namespace__` escape (same rule as the Go
     // apiserver's `apiserver/schema/cel/model` escaping).
-    validation = "self.spec.__namespace__.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')",
+    validation = "self.spec.__namespace__.size() <= 63 && self.spec.__namespace__.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')",
     validation = "self.spec.tenant != ''",
     cel
 )]

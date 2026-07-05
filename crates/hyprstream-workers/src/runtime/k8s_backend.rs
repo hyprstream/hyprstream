@@ -31,11 +31,12 @@
 //!
 //! ## Origin markers / two-writer guard (#778 threat table)
 //!
-//! Every emitted object carries [`MANAGED_BY_LABEL`] plus this backend
-//! instance's identity ([`INSTANCE_LABEL`]) and the sandbox id
-//! ([`SANDBOX_LABEL`]). `stop`/`destroy` refuse to delete an object that does
-//! not carry *this* instance's markers — the backend never adopts (or reaps)
-//! objects it did not create.
+//! Every emitted object carries [`MANAGED_BY_LABEL`], the sandbox id
+//! ([`SANDBOX_LABEL`]), and this backend instance's identity
+//! ([`INSTANCE_LABEL`]) for audit/provenance. `stop`/`destroy` refuse to delete
+//! an object that does not carry the expected managed-by + sandbox-id markers,
+//! so a restarted backend can reap its own sandbox workload without adopting a
+//! different sandbox's objects.
 //!
 //! ## Out of scope here
 //!
@@ -200,7 +201,7 @@ impl SandboxHandle for K8sHandle {
 pub struct K8sBackend {
     config: K8sConfig,
     /// This backend instance's identity, stamped on every emitted object and
-    /// checked by the two-writer guard before any delete.
+    /// retained as audit/provenance metadata.
     instance_id: String,
     /// Lazily-initialised kube client. Building a `Client` needs an async
     /// context (it reads in-cluster/kubeconfig and constructs an HTTPS stack),
@@ -282,13 +283,14 @@ impl K8sBackend {
             .into_option_nonempty()
     }
 
-    /// Two-writer guard: confirm the live object at `name` carries *this*
-    /// instance's origin markers before we delete it. Refuses (errors) on a
-    /// missing/foreign object rather than reaping something we did not create.
-    fn labels_are_ours(&self, labels: Option<&BTreeMap<String, String>>) -> bool {
+    /// Two-writer guard: confirm the live object carries hyprstream's
+    /// managed-by marker and the expected sandbox id before we delete it.
+    /// [`INSTANCE_LABEL`] is audit metadata only, so a restarted backend can
+    /// still reap objects for the same sandbox.
+    fn labels_are_ours(&self, labels: Option<&BTreeMap<String, String>>, sandbox_id: &str) -> bool {
         let Some(labels) = labels else { return false };
         labels.get(MANAGED_BY_LABEL).map(String::as_str) == Some(MANAGED_BY_VALUE)
-            && labels.get(INSTANCE_LABEL).map(String::as_str) == Some(self.instance_id.as_str())
+            && labels.get(SANDBOX_LABEL).map(String::as_str) == Some(sandbox_id)
     }
 
     /// Fetch `count` bytes of a running Pod's logs (inherent helper — the
@@ -798,10 +800,10 @@ impl K8sBackend {
                 let pods: Api<Pod> = Api::namespaced(client, &handle.namespace);
                 match pods.get_opt(&handle.name).await {
                     Ok(Some(pod)) => {
-                        if !self.labels_are_ours(pod.metadata.labels.as_ref()) {
+                        if !self.labels_are_ours(pod.metadata.labels.as_ref(), &handle.sandbox_id) {
                             return Err(WorkerError::ConfigError(format!(
                                 "refusing to delete pod {}/{}: it does not carry this \
-                                 backend instance's origin markers (two-writer guard)",
+                                 sandbox's origin markers (two-writer guard)",
                                 handle.namespace, handle.name
                             )));
                         }
@@ -811,7 +813,7 @@ impl K8sBackend {
                     }
                     Ok(None) => debug!(sandbox_id = %sandbox.id, "pod already gone"),
                     Err(e) => {
-                        warn!(sandbox_id = %sandbox.id, error = %e, "pod get before delete failed")
+                        warn!(sandbox_id = %sandbox.id, error = %e, "pod get before delete failed");
                     }
                 }
             }
@@ -819,10 +821,10 @@ impl K8sBackend {
                 let jobs: Api<Job> = Api::namespaced(client, &handle.namespace);
                 match jobs.get_opt(&handle.name).await {
                     Ok(Some(job)) => {
-                        if !self.labels_are_ours(job.metadata.labels.as_ref()) {
+                        if !self.labels_are_ours(job.metadata.labels.as_ref(), &handle.sandbox_id) {
                             return Err(WorkerError::ConfigError(format!(
                                 "refusing to delete job {}/{}: it does not carry this \
-                                 backend instance's origin markers (two-writer guard)",
+                                 sandbox's origin markers (two-writer guard)",
                                 handle.namespace, handle.name
                             )));
                         }
@@ -839,7 +841,7 @@ impl K8sBackend {
                     }
                     Ok(None) => debug!(sandbox_id = %sandbox.id, "job already gone"),
                     Err(e) => {
-                        warn!(sandbox_id = %sandbox.id, error = %e, "job get before delete failed")
+                        warn!(sandbox_id = %sandbox.id, error = %e, "job get before delete failed");
                     }
                 }
             }
@@ -1105,24 +1107,33 @@ mod tests {
     }
 
     #[test]
-    fn two_writer_guard_rejects_foreign_labels() {
+    fn two_writer_guard_rejects_foreign_sandbox_labels() {
         let b = K8sBackend::new(K8sConfig::default());
+        let sandbox_id = "sb-restart";
         // Our own labels pass.
         let mut ours = BTreeMap::new();
         ours.insert(MANAGED_BY_LABEL.to_owned(), MANAGED_BY_VALUE.to_owned());
+        ours.insert(SANDBOX_LABEL.to_owned(), sandbox_id.to_owned());
         ours.insert(INSTANCE_LABEL.to_owned(), b.instance_id.clone());
-        assert!(b.labels_are_ours(Some(&ours)));
+        assert!(b.labels_are_ours(Some(&ours), sandbox_id));
 
-        // A different instance id fails.
+        // A restarted backend has a different instance id, but the same
+        // managed-by/sandbox-id ownership markers still pass.
+        let mut restarted = ours.clone();
+        restarted.insert(INSTANCE_LABEL.to_owned(), "someone-else".to_owned());
+        assert!(b.labels_are_ours(Some(&restarted), sandbox_id));
+
+        // A different sandbox id fails.
         let mut theirs = ours.clone();
-        theirs.insert(INSTANCE_LABEL.to_owned(), "someone-else".to_owned());
-        assert!(!b.labels_are_ours(Some(&theirs)));
+        theirs.insert(SANDBOX_LABEL.to_owned(), "sb-other".to_owned());
+        assert!(!b.labels_are_ours(Some(&theirs), sandbox_id));
 
         // Missing managed-by fails; no labels at all fails.
         let mut no_mgr = BTreeMap::new();
+        no_mgr.insert(SANDBOX_LABEL.to_owned(), sandbox_id.to_owned());
         no_mgr.insert(INSTANCE_LABEL.to_owned(), b.instance_id.clone());
-        assert!(!b.labels_are_ours(Some(&no_mgr)));
-        assert!(!b.labels_are_ours(None));
+        assert!(!b.labels_are_ours(Some(&no_mgr), sandbox_id));
+        assert!(!b.labels_are_ours(None, sandbox_id));
     }
 
     #[test]

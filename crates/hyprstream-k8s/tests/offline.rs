@@ -221,6 +221,18 @@ fn tenant_binding_cel_validates_namespace_and_tenant() {
         "invalid namespace must be rejected"
     );
 
+    let too_long_ns = TenantBinding::new(
+        "tb",
+        TenantBindingSpec {
+            namespace: "a".repeat(64),
+            tenant: "did:web:acme".into(),
+        },
+    );
+    assert!(
+        too_long_ns.validate_cel().is_err(),
+        "namespace longer than 63 chars must be rejected"
+    );
+
     let bad_tenant = TenantBinding::new(
         "tb",
         TenantBindingSpec {

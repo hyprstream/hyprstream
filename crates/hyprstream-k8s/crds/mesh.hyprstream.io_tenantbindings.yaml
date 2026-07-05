@@ -83,7 +83,7 @@ spec:
         title: TenantBinding
         type: object
         x-kubernetes-validations:
-        - rule: self.spec.__namespace__.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
+        - rule: self.spec.__namespace__.size() <= 63 && self.spec.__namespace__.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
         - rule: self.spec.tenant != ''
     served: true
     storage: true
