@@ -952,11 +952,13 @@ export class StructBuilder {
   setBoolListList(ptrIndex: number, values: boolean[][]): void {
     const outerBase = this.allocNestedListOuter(ptrIndex, values.length);
     if (outerBase < 0) return;
-    const raw = this.msg._getRaw();
     for (let i = 0; i < values.length; i++) {
       const inner = values[i];
       if (inner.length === 0) continue;
       const base = this.allocPrimitiveListAt(outerBase + i * WORD_SIZE, inner.length, 1, 0);
+      // Re-fetch after alloc: allocPrimitiveListAt can grow the arena,
+      // detaching any previously captured raw buffer.
+      const raw = this.msg._getRaw();
       for (let j = 0; j < inner.length; j++) {
         if (inner[j]) raw[base + (j >> 3)] |= 1 << (j & 7);
       }
