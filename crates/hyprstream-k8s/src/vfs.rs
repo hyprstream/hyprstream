@@ -400,6 +400,15 @@ impl K8sMount {
     }
 
     /// Attach a live `ctl` actuator (enables delete/evict).
+    ///
+    /// # Precondition
+    ///
+    /// Do not wire a production Kubernetes client here until the #568
+    /// reference-monitor PEP authorizes mutating `ctl` verbs per caller. This
+    /// mount currently enforces only the object-label import floor before
+    /// dispatching to the actuator; without #568, any fid-holder that can reach
+    /// a labeled object's `ctl` file could invoke verbs such as `delete` or
+    /// `evict`.
     #[must_use]
     pub fn with_actuator(mut self, actuator: Arc<dyn CtlActuator>) -> Self {
         self.actuator = Some(actuator);
