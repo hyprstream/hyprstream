@@ -115,13 +115,11 @@ pub fn qwen3_5_0_8b_profile() -> LayerProfile {
             layers.push(LayerAnalysis {
                 layer_idx: idx,
                 layer_type: LayerType::GatedDeltaNet,
-                bond_entropy: {
-                    let mut m = HashMap::new();
-                    m.insert("o_proj".to_owned(), 6.2f64); // representative value
-                    m
-                },
+                // Empty on purpose: no spectral analysis backs the GDN rank
+                // (a fabricated "representative" entry used to live here).
+                bond_entropy: HashMap::new(),
                 perplexity_delta: None,
-                recommended_rank: 4,
+                recommended_rank: GDN_LORA_RANK,
                 target_modules: vec!["o_proj".to_owned()],
             });
         }
@@ -249,6 +247,16 @@ const UNVALIDATED_RANK_CAP: usize = 8;
 /// the minimum band.
 const UNANALYZED_LAYER_ENTROPY: f64 = 0.95;
 
+/// LoRA rank for GatedDeltaNet layers, as an explicit calibrated constant.
+///
+/// GDN capacity lives in the recurrent/conv/gating parameters, which no
+/// current statistic here analyzes — the previous approach derived a rank
+/// from the spectrum of `out_proj` alone, which presented a guess as
+/// analysis. The value matches the embedded Qwen3.5-0.8B GDN rank and sits
+/// under [`UNVALIDATED_RANK_CAP`]. Revisit when GDN ablation ground truth
+/// exists.
+const GDN_LORA_RANK: usize = 4;
+
 /// Map normalized entropy [0,1] to LoRA rank.
 /// Lower normalized entropy → more structured → higher rank (assumed sign —
 /// see the cutoff constants above).
@@ -331,42 +339,43 @@ pub fn compute_weight_entropy_profile(
 
         let layer_type = detect_layer_type(config, layer_idx, weights, &prefix);
 
-        // Architecture-aware key resolution (R2-C1 fix)
-        let (subpath, projs): (&str, &[&str]) = match layer_type {
-            LayerType::FullAttention | LayerType::StandardAttention => {
-                ("self_attn", &["q_proj", "k_proj", "v_proj", "o_proj"])
-            }
-            LayerType::GatedDeltaNet => ("linear_attn", &["out_proj"]),
-        };
-
         let mut entropies = HashMap::new();
-        let mut entropy_normalized_sum = 0.0f64;
-        let mut entropy_count = 0usize;
+        let recommended_rank = if layer_type == LayerType::GatedDeltaNet {
+            // No spectral analysis for GDN layers: their capacity lives in
+            // recurrent/conv/gating parameters this pipeline does not model,
+            // so an out_proj-only spectrum would be a guess dressed as
+            // analysis. Use the explicit constant (and skip the SVD — GDN
+            // layers are the majority of hybrid stacks).
+            GDN_LORA_RANK
+        } else {
+            let mut entropy_normalized_sum = 0.0f64;
+            let mut entropy_count = 0usize;
 
-        for proj in projs {
-            let key = format!("{prefix}.{subpath}.{proj}.weight");
-            if let Some(w) = weights.get(&key) {
-                let (entropy_nats, num_sv) = bond_entropy(w);
-                entropies.insert((*proj).to_owned(), entropy_nats);
+            for proj in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+                let key = format!("{prefix}.self_attn.{proj}.weight");
+                if let Some(w) = weights.get(&key) {
+                    let (entropy_nats, num_sv) = bond_entropy(w);
+                    entropies.insert(proj.to_owned(), entropy_nats);
 
-                // Per-matrix normalization (R2-I1 fix): divide by ln(num_sv)
-                let max_entropy = (num_sv as f64).ln();
-                if max_entropy > 1e-10 {
-                    entropy_normalized_sum += entropy_nats / max_entropy;
-                    entropy_count += 1;
+                    // Per-matrix normalization: divide by ln(num_sv)
+                    let max_entropy = (num_sv as f64).ln();
+                    if max_entropy > 1e-10 {
+                        entropy_normalized_sum += entropy_nats / max_entropy;
+                        entropy_count += 1;
+                    }
                 }
             }
-        }
 
-        let avg_normalized = if entropy_count > 0 {
-            entropy_normalized_sum / entropy_count as f64
-        } else {
-            UNANALYZED_LAYER_ENTROPY
+            let avg_normalized = if entropy_count > 0 {
+                entropy_normalized_sum / entropy_count as f64
+            } else {
+                UNANALYZED_LAYER_ENTROPY
+            };
+
+            // Tier 3 entropy-based ranks are unvalidated for models outside the
+            // embedded profile registry — cap them (see UNVALIDATED_RANK_CAP).
+            entropy_to_rank(avg_normalized).min(UNVALIDATED_RANK_CAP)
         };
-
-        // Tier 3 entropy-based ranks are unvalidated for models outside the
-        // embedded profile registry — cap them (see UNVALIDATED_RANK_CAP).
-        let recommended_rank = entropy_to_rank(avg_normalized).min(UNVALIDATED_RANK_CAP);
 
         // Target modules: default ["q_proj", "v_proj"] for standard (R2-I4 fix)
         let target_modules = match layer_type {
