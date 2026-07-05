@@ -48,6 +48,58 @@ func TestErrnoOf(t *testing.T) {
 	}
 }
 
+func TestParseDialTarget(t *testing.T) {
+	cases := []struct {
+		name    string
+		target  string
+		network string
+		address string
+		cid     uint64
+		port    uint64
+	}{
+		{
+			name:    "unix absolute path",
+			target:  "unix:///run/hyprstream/9p.sock",
+			network: "unix",
+			address: "/run/hyprstream/9p.sock",
+		},
+		{
+			name:    "tcp bridge",
+			target:  "tcp://127.0.0.1:4564",
+			network: "tcp",
+			address: "127.0.0.1:4564",
+		},
+		{
+			name:    "vsock kata",
+			target:  "vsock://2:564",
+			network: "vsock",
+			cid:     2,
+			port:    564,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseDialTarget(tc.target)
+			if err != nil {
+				t.Fatalf("parseDialTarget(%q): %v", tc.target, err)
+			}
+			if got.network != tc.network || got.address != tc.address ||
+				got.vsockCID != tc.cid || got.vsockPort != tc.port {
+				t.Fatalf("parseDialTarget(%q) = %+v", tc.target, got)
+			}
+		})
+	}
+}
+
+func TestParseDialTargetRejectsIncompleteTargets(t *testing.T) {
+	for _, target := range []string{"", "udp://127.0.0.1:564", "tcp://", "unix://", "vsock://2"} {
+		if _, err := parseDialTarget(target); err == nil {
+			t.Fatalf("parseDialTarget(%q) unexpectedly succeeded", target)
+		}
+	}
+}
+
 type errString string
 
 func (e errString) Error() string { return string(e) }

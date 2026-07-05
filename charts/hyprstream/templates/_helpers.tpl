@@ -120,3 +120,19 @@ Policy CA Secret name.
 {{- define "hyprstream.policyCaSecretName" -}}
 {{- default (printf "%s-policy-ca" (include "hyprstream.fullname" .)) .Values.keyBootstrap.policyCaSecret -}}
 {{- end }}
+
+{{/*
+CSI node plugin object name.
+*/}}
+{{- define "hyprstream.csiName" -}}
+{{- printf "%s-csi-node" (include "hyprstream.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Resolve the CSI node plugin image. Empty tag follows Chart.appVersion.
+*/}}
+{{- define "hyprstream.csiImage" -}}
+{{- $img := .Values.csi.image -}}
+{{- $tag := default .Chart.AppVersion $img.tag -}}
+{{- printf "%s:%s" $img.repository $tag -}}
+{{- end }}

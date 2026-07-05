@@ -1,0 +1,212 @@
+{{- if .Values.csi.enabled }}
+{{- $root := . -}}
+{{- $name := include "hyprstream.csiName" . -}}
+---
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: {{ .Values.csi.driverName }}
+  labels:
+    {{- include "hyprstream.labels" . | nindent 4 }}
+spec:
+  attachRequired: false
+  podInfoOnMount: true
+  volumeLifecycleModes:
+    - Ephemeral
+    - Persistent
+  tokenRequests:
+    - audience: {{ .Values.csi.oauth.audience | quote }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "hyprstream.labels" . | nindent 4 }}
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "hyprstream.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csinodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "hyprstream.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "hyprstream.labels" . | nindent 4 }}
+    app.kubernetes.io/component: csi-node
+spec:
+  selector:
+    matchLabels:
+      {{- include "hyprstream.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: csi-node
+  template:
+    metadata:
+      labels:
+        {{- include "hyprstream.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: csi-node
+    spec:
+      serviceAccountName: {{ $name }}
+      priorityClassName: system-node-critical
+      hostNetwork: true
+      {{- with .Values.csi.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: node-driver-registrar
+          image: {{ .Values.csi.registrar.image }}
+          args:
+            - --v=2
+            - --csi-address=$(ADDRESS)
+            - --kubelet-registration-path={{ .Values.csi.socketDir }}/csi.sock
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+        - name: hyprstream-csi
+          image: {{ include "hyprstream.csiImage" . }}
+          imagePullPolicy: {{ .Values.csi.image.pullPolicy }}
+          args:
+            - csi
+            - node
+            - --endpoint=unix:///csi/csi.sock
+            - --driver-name={{ .Values.csi.driverName }}
+            - --default-mounter={{ .Values.csi.defaultMounter }}
+            - --default-plane={{ .Values.csi.defaultPlane }}
+            - --mount-ticket-url={{ .Values.csi.oauth.mountTicketUrl }}
+            - --transport-carrier={{ .Values.csi.transport.carrier }}
+            - --transport-endpoint={{ .Values.csi.transport.endpoint }}
+            - --bridge-listen={{ .Values.csi.transport.bridgeListen }}
+            - --log-level={{ .Values.csi.logLevel }}
+          securityContext:
+            {{- toYaml .Values.csi.securityContext | nindent 12 }}
+          env:
+            - name: HYPRSTREAM_CSI_DRIVER_NAME
+              value: {{ .Values.csi.driverName | quote }}
+            - name: HYPRSTREAM_CSI_DEFAULT_MOUNTER
+              value: {{ .Values.csi.defaultMounter | quote }}
+            - name: HYPRSTREAM_CSI_DEFAULT_PLANE
+              value: {{ .Values.csi.defaultPlane | quote }}
+            - name: HYPRSTREAM_CSI_DEFAULT_NAMESPACE_PATH
+              value: {{ .Values.csi.defaultNamespacePath | quote }}
+            - name: HYPRSTREAM_CSI_MOUNT_TICKET_URL
+              value: {{ .Values.csi.oauth.mountTicketUrl | quote }}
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: kubelet-pods
+              mountPath: {{ .Values.csi.kubeletRootDir }}/pods
+              mountPropagation: Bidirectional
+            - name: plugins
+              mountPath: {{ .Values.csi.kubeletRootDir }}/plugins
+              mountPropagation: Bidirectional
+            - name: dev
+              mountPath: /dev
+          {{- with .Values.csi.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: socket-dir
+          hostPath:
+            path: {{ .Values.csi.socketDir }}
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: {{ .Values.csi.kubeletRootDir }}/plugins_registry
+            type: DirectoryOrCreate
+        - name: kubelet-pods
+          hostPath:
+            path: {{ .Values.csi.kubeletRootDir }}/pods
+            type: Directory
+        - name: plugins
+          hostPath:
+            path: {{ .Values.csi.kubeletRootDir }}/plugins
+            type: DirectoryOrCreate
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory
+      {{- with .Values.csi.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.csi.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.csi.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- if .Values.csi.storageClasses.create }}
+{{- if .Values.csi.storageClasses.kernel.enabled }}
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.csi.storageClasses.kernel.name }}
+  labels:
+    {{- include "hyprstream.labels" . | nindent 4 }}
+provisioner: {{ .Values.csi.driverName }}
+reclaimPolicy: {{ .Values.csi.storageClasses.kernel.reclaimPolicy }}
+volumeBindingMode: {{ .Values.csi.storageClasses.kernel.volumeBindingMode }}
+parameters:
+  mounter: kernel
+  plane: {{ .Values.csi.defaultPlane | quote }}
+  carrier: {{ .Values.csi.transport.carrier | quote }}
+  namespacePath: {{ .Values.csi.defaultNamespacePath | quote }}
+{{- end }}
+{{- if .Values.csi.storageClasses.fuse.enabled }}
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.csi.storageClasses.fuse.name }}
+  labels:
+    {{- include "hyprstream.labels" . | nindent 4 }}
+provisioner: {{ .Values.csi.driverName }}
+reclaimPolicy: {{ .Values.csi.storageClasses.fuse.reclaimPolicy }}
+volumeBindingMode: {{ .Values.csi.storageClasses.fuse.volumeBindingMode }}
+parameters:
+  mounter: fuse
+  plane: {{ .Values.csi.defaultPlane | quote }}
+  carrier: {{ .Values.csi.transport.carrier | quote }}
+  namespacePath: {{ .Values.csi.defaultNamespacePath | quote }}
+{{- end }}
+{{- end }}
+{{- end }}

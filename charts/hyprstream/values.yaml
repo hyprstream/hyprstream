@@ -192,6 +192,61 @@ observability:
       labels: {}
 
 # -----------------------------------------------------------------------------
+# K3b CSI node plugin (#790).
+#
+# The CSI contract deliberately supports both mounters. Operators choose per
+# StorageClass / node:
+#   - kernel: kubelet invokes kernel v9fs; ticket is presented via uname= and a
+#     node-local stream bridge hands the kernel a connected fd (trans=fd).
+#   - fuse: the hypr9p FUSE->9P client dials the configured carrier directly.
+# Transports are dial-time carriers. iroh / QUIC-WebTransport is the normal
+# cross-node path, vsock is for Kata, and UDS is only a co-located corner case.
+# -----------------------------------------------------------------------------
+csi:
+  enabled: false
+  driverName: csi.hyprstream.io
+  image:
+    repository: ghcr.io/hyprstream/hyprstream-csi
+    tag: ""
+    pullPolicy: IfNotPresent
+  registrar:
+    image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.13.0
+  kubeletRootDir: /var/lib/kubelet
+  socketDir: /var/lib/kubelet/plugins/csi.hyprstream.io
+  logLevel: info
+  defaultMounter: fuse
+  defaultPlane: webtransport
+  defaultNamespacePath: /
+  oauth:
+    mountTicketUrl: http://hyprstream-oauth:6791/oauth/mount-ticket
+    audience: hyprstream-9p
+  transport:
+    carrier: webtransport
+    endpoint: https://hyprstream-streams:7011/9p
+    bridgeListen: 127.0.0.1:0
+  storageClasses:
+    create: true
+    kernel:
+      enabled: true
+      name: hyprstream-9p-kernel
+      reclaimPolicy: Delete
+      volumeBindingMode: WaitForFirstConsumer
+    fuse:
+      enabled: true
+      name: hyprstream-9p-fuse
+      reclaimPolicy: Delete
+      volumeBindingMode: WaitForFirstConsumer
+  podSecurityContext: {}
+  securityContext:
+    privileged: true
+    allowPrivilegeEscalation: true
+  nodeSelector: {}
+  tolerations:
+    - operator: Exists
+  affinity: {}
+  resources: {}
+
+# -----------------------------------------------------------------------------
 # Defaults applied to every service; each services.<name> entry may override.
 # -----------------------------------------------------------------------------
 defaults:

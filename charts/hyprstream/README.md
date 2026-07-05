@@ -122,6 +122,22 @@ today (and which scaling signals — stream backpressure/queue depth, tokens/s �
 still need instrumentation) are tracked as follow-ups under #792; this chart only
 delivers the exposition surface.
 
+## CSI node plugin
+
+Set `csi.enabled=true` to install the `csi.hyprstream.io` node plugin for K3b
+(#790). The driver supports the operator-selected dual mounter contract:
+
+- `mounter=kernel` uses kernel v9fs. Mount tickets are presented through the
+  normal `uname=` attach field and a node-local stream bridge terminates the
+  selected carrier before handing the kernel a connected `trans=fd` socket.
+- `mounter=fuse` uses the hypr9p FUSE->9P client and dials the selected carrier
+  directly.
+
+The transport is a dial-time carrier, not a storage contract. `webtransport` /
+iroh-QUIC is the normal cross-node path, `vsock` is for Kata, and UDS is only a
+co-located DaemonSet corner case. The chart renders two StorageClasses by
+default when CSI is enabled: `hyprstream-9p-kernel` and `hyprstream-9p-fuse`.
+
 ## Image assumption
 
 No published image reference exists in-repo yet — only a local multi-variant
