@@ -1041,8 +1041,11 @@ impl RegistryService {
 
         let result = stream_channel
             .run_stream(&stream_ctx, |mut publisher| async move {
-                let store = cas_serve::CasStore::from_env();
-                let bytes = match store.get_file_bytes(&address).await {
+                // L1 CAS substrate, default (untenanted, BLAKE3, local) domain —
+                // layout-compatible with the legacy CasStore root (#812).
+                let substrate = crate::storage::CasSubstrate::from_env();
+                let domain = crate::storage::DedupDomain::local_default();
+                let bytes = match substrate.get(&domain, &address).await {
                     Ok(b) => b,
                     Err(e) => return (publisher, Err(anyhow!("getBlob reconstruction failed: {}", e))),
                 };
@@ -1826,9 +1829,13 @@ impl RegistryService {
             .map_err(|e| anyhow!("write not authorized on '{}': {}", data.grant_repo, e))?;
 
         // ── Chunk + store + SERVER-SIDE merkle (caller supplied only bytes) ──
-        let store = cas_serve::CasStore::from_env();
-        let put = store
-            .put_file_bytes(&data.bytes)
+        // Ingest through the L1 CAS substrate's default (untenanted, BLAKE3, local)
+        // domain (#812). The `security_label` carrier is left `None` here — object
+        // labeling/enforcement is #699/#767's job, not the ingest path's.
+        let substrate = crate::storage::CasSubstrate::from_env();
+        let domain = crate::storage::DedupDomain::local_default();
+        let put = substrate
+            .put(&domain, &data.bytes, None)
             .await
             .map_err(|e| anyhow!("CAS ingest failed: {e}"))?;
 

@@ -31,6 +31,56 @@ use crate::transport::rpc_session::{
 };
 use crate::transport_traits::Transport;
 
+/// A WebTransport bidi stream carrying a 9P2000.L session, erased to a byte
+/// stream. The H1b `/9p` arm hands one of these to the injected
+/// [`NinePWtHandler`]; the handler runs the transport-agnostic
+/// `Translator::serve_connection` core over it (the same core H1a's WebSocket
+/// pump feeds). Blanket-implemented for any `AsyncRead + AsyncWrite` byte stream
+/// (a joined WT send/recv pair).
+pub trait NinePWtStream:
+    tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static
+{
+}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static> NinePWtStream for T {}
+
+/// Serves one 9P session over a WebTransport bidi stream (H1b / #765).
+///
+/// This is the injection seam that keeps the transport crate free of the 9P
+/// core: the concrete impl lives in the `hyprstream` crate (it owns the 9P
+/// `Translator`, the Subject-scoped export mount, and the mount-ticket
+/// validator), and is registered here via [`QuinnRpcServer::with_ninep_handler`]
+/// or the process-global [`set_global_ninep_handler`] — mirroring how the moq
+/// consumer is threaded onto the same endpoint. The mount ticket is validated
+/// at `Tattach.uname` inside the handler (the cert-pinned session carries no URL
+/// query), so this trait exposes only the raw byte stream.
+#[async_trait]
+pub trait NinePWtHandler: Send + Sync {
+    /// Drive the 9P session on `stream` to completion (returns on EOF, the peer
+    /// resetting the stream, or a fatal 9P framing error). The handler owns
+    /// session teardown.
+    async fn serve(&self, stream: Box<dyn NinePWtStream>);
+}
+
+/// Process-global 9P WebTransport handler, populated by the `hyprstream` crate
+/// at server startup (where `ServerState` — hence the export mount + ticket
+/// validator — is available). The per-service `QuinnRpcServer` build site lives
+/// in `hyprstream-service`, which cannot depend on `hyprstream`; a global here
+/// is the same seam the moq origin uses to cross that boundary. First write
+/// wins; later writes are ignored.
+static GLOBAL_NINEP_HANDLER: std::sync::OnceLock<Arc<dyn NinePWtHandler>> =
+    std::sync::OnceLock::new();
+
+/// Register the process-global 9P WebTransport handler (idempotent, first-wins).
+/// Returns `true` if this call installed it, `false` if one was already set.
+pub fn set_global_ninep_handler(handler: Arc<dyn NinePWtHandler>) -> bool {
+    GLOBAL_NINEP_HANDLER.set(handler).is_ok()
+}
+
+/// The process-global 9P WebTransport handler, if one has been registered.
+pub fn global_ninep_handler() -> Option<Arc<dyn NinePWtHandler>> {
+    GLOBAL_NINEP_HANDLER.get().cloned()
+}
+
 /// A quinn-backed WebTransport server for the RPC plane.
 ///
 /// Accepts WebTransport sessions and spawns [`serve_rpc_connection`] for each.
@@ -69,6 +119,12 @@ pub struct QuinnRpcServer {
     /// #276 subscribe-authz + per-tenant announce-scoping config for the `/moq`
     /// plane. Defaults to "off" (open subscribe preserved).
     moq_authz: crate::transport::iroh_moq::MoqAuthzConfig,
+    /// Optional 9P export handler (H1b / #765). When set, sessions whose
+    /// WebTransport CONNECT URL path is [`crate::dial::NINEP_PATH`] are handed to
+    /// it instead of the RPC core. Defaults to [`global_ninep_handler`] at
+    /// construction; `None` = 9P plane off (unknown-path sessions fall through to
+    /// the RPC core, matching pre-H1b behaviour).
+    ninep_handler: Option<Arc<dyn NinePWtHandler>>,
     shutdown: CancellationToken,
 }
 
@@ -103,6 +159,9 @@ impl QuinnRpcServer {
             moq_consumer: None,
             moq_relay_origin: None,
             moq_authz: crate::transport::iroh_moq::MoqAuthzConfig::default(),
+            // Pick up the process-global 9P handler if the `hyprstream` crate
+            // registered one; a builder call can still override it.
+            ninep_handler: global_ninep_handler(),
             shutdown: CancellationToken::new(),
         }
     }
@@ -154,6 +213,18 @@ impl QuinnRpcServer {
         authz: crate::transport::iroh_moq::MoqAuthzConfig,
     ) -> Self {
         self.moq_authz = authz;
+        self
+    }
+
+    /// Serve the 9P export plane on the same endpoint (H1b / #765).
+    ///
+    /// Sessions whose WebTransport CONNECT URL path is [`crate::dial::NINEP_PATH`]
+    /// are handed to `handler` (which runs the 9P `Translator::serve_connection`
+    /// core over the WT bidi stream); all other paths route to the RPC core (or
+    /// the moq plane for `/moq`). Overrides any process-global handler picked up
+    /// at construction.
+    pub fn with_ninep_handler(mut self, handler: Arc<dyn NinePWtHandler>) -> Self {
+        self.ninep_handler = Some(handler);
         self
     }
 
@@ -284,13 +355,16 @@ impl QuinnRpcServer {
                     let moq_consumer = self.moq_consumer.clone();
                     let moq_relay_origin = self.moq_relay_origin.clone();
                     let moq_authz = self.moq_authz.clone();
+                    let ninep_handler = self.ninep_handler.clone();
                     tokio::spawn(async move {
                         let _conn_permit = conn_permit; // released when this connection ends
-                        // Multiplex by WebTransport CONNECT URL path (#274): read
+                        // Multiplex by WebTransport CONNECT URL path (#274, H1b): read
                         // it BEFORE `request.ok()` consumes the request. `/moq`
-                        // → moq streaming plane; any other path → RPC core.
+                        // → moq streaming plane; `/9p` → 9P export plane (#765);
+                        // any other path → RPC core.
                         // (`Request` Derefs to `ConnectRequest`, exposing `url`.)
                         let is_moq = request.url.path() == crate::dial::MOQ_PATH;
+                        let is_ninep = request.url.path() == crate::dial::NINEP_PATH;
                         // Resolve the handshake INSIDE the task, bounded (#162),
                         // so a slow/stalled CONNECT never blocks the accept loop.
                         let session = match tokio::time::timeout(
@@ -397,6 +471,68 @@ impl QuinnRpcServer {
                                     tracing::warn!(
                                         "quinn-rpc: /moq requested but no moq consumer configured"
                                     );
+                                }
+                            }
+                            return;
+                        }
+
+                        if is_ninep {
+                            // 9P export plane (H1b / #765): the QUIC path-mux
+                            // sibling of H1a's axum `/9p` WebSocket. Serve the
+                            // SAME `Translator::serve_connection` core (via the
+                            // injected handler) over a WT bidi stream.
+                            let Some(handler) = ninep_handler else {
+                                tracing::warn!(
+                                    "quinn-rpc: /9p requested but no 9P handler configured"
+                                );
+                                return;
+                            };
+                            // A stream permit bounds concurrency server-wide and
+                            // lets `shutdown` drain the in-flight session (same
+                            // DoS/drain contract as the RPC streams). If the
+                            // semaphore is closed (shutdown drained it), exit.
+                            let _permit = match Arc::clone(&stream_limit).acquire_owned().await {
+                                Ok(p) => p,
+                                Err(_) => return,
+                            };
+                            // Accept the single client-opened bidi stream (bounded
+                            // so a session that never opens one can't pin the
+                            // permit). `RecvStream`/`SendStream` impl tokio
+                            // `AsyncRead`/`AsyncWrite`, so joining them yields the
+                            // byte stream the 9P core serves directly — the WT
+                            // analogue of H1a's ws↔9p pump, tolerant of arbitrary
+                            // chunking.
+                            let accept = tokio::time::timeout(
+                                super::rpc_session::HANDSHAKE_TIMEOUT,
+                                session.accept_bi(),
+                            )
+                            .await;
+                            let (send, recv) = match accept {
+                                Ok(Ok(pair)) => pair,
+                                Ok(Err(e)) => {
+                                    tracing::debug!(error = ?e, "quinn-9p: accept_bi failed");
+                                    return;
+                                }
+                                Err(_) => {
+                                    tracing::warn!("quinn-9p: client opened no bidi stream in time");
+                                    return;
+                                }
+                            };
+                            let stream: Box<dyn NinePWtStream> =
+                                Box::new(tokio::io::join(recv, send));
+                            // Liveness (H1b, mirrors H1a's server-owned teardown):
+                            // the handler's serve loop returns on stream EOF / a
+                            // fatal 9P error; a dead peer is torn down by the
+                            // cert-pinned QUIC session's idle timeout (transport-
+                            // owned, the WT/reach layer) which resets the stream →
+                            // EOF. We also stop on server shutdown and on the WT
+                            // session closing, whichever comes first.
+                            tokio::select! {
+                                biased;
+                                _ = shutdown.cancelled() => {}
+                                _ = handler.serve(stream) => {}
+                                err = session.closed() => {
+                                    tracing::debug!(?err, "quinn-9p: WT session closed");
                                 }
                             }
                             return;

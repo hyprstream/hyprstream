@@ -506,7 +506,11 @@ impl<T: Transport> StreamHandleImpl<T> {
 
     /// Cancel the stream via ctrl channel.
     /// Sets local cancelled flag AND sends cancel message to producer.
-    pub async fn cancel(&self) -> Result<()> {
+    ///
+    /// Takes `&mut self` so the future is `Send` (holds `&mut Self`, which is
+    /// `Send` because `Self: Send`) rather than requiring `Self: Sync`. See
+    /// #670 / the `StreamHandle::cancel` trait method.
+    pub async fn cancel(&mut self) -> Result<()> {
         self.cancelled.store(true, Ordering::Release);
         if let Some(ref pub_handle) = self.publisher {
             let msg = build_stream_control_cancel();
@@ -555,13 +559,36 @@ fn build_stream_control_cancel() -> Vec<u8> {
 ///
 /// Generated portable clients use `Box<dyn StreamHandle>` so they work
 /// with any `StreamHandleImpl<T>` regardless of concrete transport.
-#[async_trait::async_trait(?Send)]
+///
+/// # `Send` futures on native (#670)
+///
+/// On native the trait methods return `Send` futures (plain `#[async_trait]`),
+/// so a native `Send + Sync` `Mount` (e.g. the `/stream` pipe reader in
+/// `hyprstream-rpc-std`) can hold a `StreamHandle` future across `.await`. This
+/// is sound because the only implementors are `StreamHandleImpl<T>` and
+/// `Box<dyn StreamHandle>`, and `StreamHandleImpl<T>` is built entirely from the
+/// `Transport` associated types — which are already `Send`
+/// (`Transport::Sub: Send`, `Transport::Pub: Send`), and whose native
+/// `PublishSink` impls return `Send` futures.
+///
+/// On wasm the trait stays `#[async_trait(?Send)]`: the WebTransport
+/// `WtPublisher::send_frames` future holds JS values and is genuinely `!Send`,
+/// and the browser namespace never needs `Send` (wasm32 is single-threaded).
+/// The dual `cfg_attr` mirrors the `hyprstream_vfs::Mount` trait itself.
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 pub trait StreamHandle: Send {
     /// Get next verified payload. Returns None on stream end.
     async fn next_payload(&mut self) -> Result<Option<StreamPayload>>;
 
     /// Cancel the stream via ctrl channel.
-    async fn cancel(&self) -> Result<()>;
+    ///
+    /// Takes `&mut self` (not `&self`) so the returned future is `Send` without
+    /// requiring `Self: Sync` — a `dyn StreamHandle` is `Send` but not `Sync`
+    /// (its transport `Sub`/`Pub` are only `Send`-bound), so a `&self` future
+    /// could not be sent across threads. `&mut self` also matches the state it
+    /// mutates (the cancelled flag). See #670.
+    async fn cancel(&mut self) -> Result<()>;
 
     /// Get the stream ID.
     fn stream_id(&self) -> &str;
@@ -571,13 +598,14 @@ pub trait StreamHandle: Send {
 }
 
 /// Blanket impl: any `StreamHandleImpl<T>` satisfies `StreamHandle`.
-#[async_trait::async_trait(?Send)]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 impl<T: Transport> StreamHandle for StreamHandleImpl<T> {
     async fn next_payload(&mut self) -> Result<Option<StreamPayload>> {
         StreamHandleImpl::next_payload(self).await
     }
 
-    async fn cancel(&self) -> Result<()> {
+    async fn cancel(&mut self) -> Result<()> {
         StreamHandleImpl::cancel(self).await
     }
 
@@ -591,13 +619,14 @@ impl<T: Transport> StreamHandle for StreamHandleImpl<T> {
 }
 
 /// Blanket impl for Box<dyn StreamHandle> so callers can use it directly.
-#[async_trait::async_trait(?Send)]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 impl StreamHandle for Box<dyn StreamHandle> {
     async fn next_payload(&mut self) -> Result<Option<StreamPayload>> {
         (**self).next_payload().await
     }
 
-    async fn cancel(&self) -> Result<()> {
+    async fn cancel(&mut self) -> Result<()> {
         (**self).cancel().await
     }
 

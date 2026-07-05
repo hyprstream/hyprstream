@@ -35,8 +35,20 @@ pub struct ServerState {
     /// Ed25519 signing key for creating JWT tokens
     pub signing_key: Arc<SigningKey>,
 
-    /// Ed25519 verifying key for validating JWT tokens (derived from signing_key)
+    /// Ed25519 verifying key for validating JWT tokens (derived from signing_key).
+    ///
+    /// This is the cluster CA key. Locally-issued at+JWTs may instead be signed by
+    /// a rotation slot (see `published_jwt_verifying_keys`), so token validation
+    /// tries this key AND the published rotation keys.
     pub verifying_key: Arc<VerifyingKey>,
+
+    /// Live, shared handle to the node's published Ed25519 rotation-slot verifying
+    /// keys — the SAME set the `/oauth/jwks` endpoint publishes. Locally-issued
+    /// tokens signed by the OAuth rotation active/lead/drain slots (WIT, S6 grant /
+    /// token-exchange, WITs) verify against these in addition to `verifying_key`.
+    /// Only node-published public keys are ever admitted here (never token-supplied
+    /// keys). Populated + kept current by the key-rotation task.
+    pub published_jwt_verifying_keys: crate::auth::key_rotation::PublishedEd25519Keys,
 
     /// Context store for RAG/CAG (optional)
     pub context_store: Option<Arc<ContextStore<hyprstream_metrics::storage::duckdb::DuckDbBackend>>>,
@@ -113,6 +125,12 @@ impl ServerState {
         // issued by PolicyService can be verified correctly.
         let verifying_key = Arc::new(jwt_verifying_key);
 
+        // Live handle to the node's published Ed25519 rotation-slot verifying keys.
+        // Shared with the OAuth key-rotation task so tokens signed by the active
+        // rotation slot (not the CA key) still validate here.
+        let published_jwt_verifying_keys =
+            crate::auth::key_rotation::global_ed25519_verifying_keys();
+
         // Preload models for faster first request
         if !config.preload_models.is_empty() {
             tracing::info!("Preloading {} models", config.preload_models.len());
@@ -148,6 +166,7 @@ impl ServerState {
             metrics,
             signing_key,
             verifying_key,
+            published_jwt_verifying_keys,
             context_store: None, // Initialize via enable_context_store() if needed
             resource_url,
             oauth_issuer_url,

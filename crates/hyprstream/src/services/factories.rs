@@ -945,7 +945,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 /// xet-enabled git repo can point its CAS endpoint at hyprstream. It dials the
 /// `registry` service (reusing the authenticated `putBlob`/`getBlob` core) and
 /// holds no standing CAS write authority of its own. Reads come from the shared
-/// `cas_serve::CasStore`.
+/// L1 CAS substrate (`crate::storage::CasSubstrate`, #812).
 #[service_factory("xet", depends_on = ["policy", "registry", "discovery"])]
 fn create_xet_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating XetService");
@@ -966,8 +966,8 @@ fn create_xet_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         RegistryClient::for_service(sk.clone(), registry_vk, service_token("xet"))?;
 
     let state = XetState {
-        // Reads share the same content-addressed store the registry's getBlob uses.
-        store: cas_serve::CasStore::from_env(),
+        // Reads share the same L1 CAS substrate the registry's getBlob uses (#812).
+        store: crate::storage::CasSubstrate::from_env(),
         registry: Some(registry_client),
         jwt_verifying_key: ctx.jwt_verifying_key(),
         audience: config.xet.resource_url(),

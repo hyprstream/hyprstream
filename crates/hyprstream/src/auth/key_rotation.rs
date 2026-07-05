@@ -38,6 +38,53 @@ pub fn global_ml_dsa_verifying_keys() -> std::sync::Arc<std::sync::RwLock<Vec<hy
     }).clone()
 }
 
+/// Live, shared handle to the node's published Ed25519 rotation-slot verifying
+/// keys (drain/active/lead). This is the SAME Ed25519 key set the `/oauth/jwks`
+/// endpoint publishes — the keys that sign rotation-issued at+JWTs (WIT, S6
+/// grant / token-exchange, and any issuance path using the active slot). It is
+/// public-key material only; no signing keys are ever exposed through it.
+///
+/// Consumers (e.g. the shared HTTP validator `verify_token_claims`) hold a clone
+/// and verify locally-issued tokens against these keys in addition to the CA key.
+// Cross-service `Arc<std::sync::RwLock<..>>` contract mirroring the ML-DSA
+// verifying-key list above; intentionally `std::sync::RwLock`, not `parking_lot`.
+#[allow(clippy::disallowed_types)]
+pub type PublishedEd25519Keys = std::sync::Arc<std::sync::RwLock<Vec<ed25519_dalek::VerifyingKey>>>;
+
+/// Global shared Ed25519 published verifying keys (rotation slots).
+///
+/// Populated at OAuth service init from the signing-key store's current slots
+/// and refreshed by the rotation task after each promotion/eviction. The CA key
+/// is NOT included here — callers already hold it separately (`verifying_key`).
+static ED25519_VERIFYING_KEYS: std::sync::OnceLock<PublishedEd25519Keys> = std::sync::OnceLock::new();
+
+/// Get or initialize the global published-Ed25519 verifying-key handle.
+///
+/// Returns a live, shared `Arc` — mutations by the rotation task are visible to
+/// every holder. Starts empty until the OAuth service populates it.
+#[allow(clippy::disallowed_types)]
+pub fn global_ed25519_verifying_keys() -> PublishedEd25519Keys {
+    ED25519_VERIFYING_KEYS
+        .get_or_init(|| std::sync::Arc::new(std::sync::RwLock::new(Vec::new())))
+        .clone()
+}
+
+/// Refresh the global published-Ed25519 verifying keys from a signing-key store
+/// snapshot (all current drain/active/lead slots).
+///
+/// Called at OAuth init and after every rotation so the shared HTTP validator
+/// keeps accepting tokens signed by any currently-published slot.
+pub async fn refresh_ed25519_verifying_keys(store: &SigningKeyStore) {
+    let vks: Vec<ed25519_dalek::VerifyingKey> = store
+        .all_slots_snapshot()
+        .await
+        .iter()
+        .map(|slot| slot.key.verifying_key())
+        .collect();
+    let shared = global_ed25519_verifying_keys();
+    let _ = shared.write().map(|mut guard| *guard = vks);
+}
+
 /// Global ML-DSA signing key store singleton.
 ///
 /// Ensures all services (PolicyService, OAuthService, rotation task) share
@@ -326,6 +373,9 @@ pub fn spawn_rotation_task(
             interval.tick().await;
             let now = chrono::Utc::now().timestamp();
             rotate_jwt_keys(&config, &secrets_dir, &store, now).await;
+            // Keep the shared HTTP validator's published Ed25519 key set current
+            // after every rotation (drain evicted / lead promoted → active).
+            refresh_ed25519_verifying_keys(&store).await;
             if let Some(ref es256) = extra.es256 {
                 rotate_es256_keys(&config, &secrets_dir, es256, now).await;
             }

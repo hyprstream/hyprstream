@@ -33,11 +33,31 @@ use anyhow::{anyhow, Context as _, Result};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use hyprstream_rpc::Subject;
-use hyprstream_vfs::{DirEntry, Fid, Mount};
-use tokio::sync::Mutex;
+use hyprstream_vfs::{DirEntry, Fid, Mount, MountError};
+use tokio::sync::{Mutex, OnceCell};
 
 use crate::backend::{Backend, OpenResult, StatResult, WalkResult};
 use crate::msg::{self, Qid, ReaddirEntry};
+
+/// Resolves the mount ticket a client presents in `Tattach.uname` to the
+/// verified session [`Subject`] the export is scoped to.
+///
+/// This is the attach-time credential seam for transports where the caller
+/// identity is not fixed at listener construction: the H1b `/9p` WebTransport
+/// plane serves a cert-pinned mesh session over which many tenants could
+/// attach, so the ticket rides `Tattach.uname` and is validated here — the
+/// per-session analogue of the RPC `EnvelopeContext` (MAC interface policy:
+/// "extend at attach time, never per-op"). The concrete impl lives in the
+/// `hyprstream` crate (it owns the JWT/OAuth verification chain); this trait
+/// keeps `hyprstream-9p` free of that dependency.
+///
+/// On denial, return a [`MountError`] — the translator maps it to an `Rlerror`
+/// errno (e.g. [`MountError::PermissionDenied`] → `EACCES`).
+#[async_trait]
+pub trait AttachAuthorizer: Send + Sync {
+    /// Validate the `uname` ticket and return the narrowed session [`Subject`].
+    async fn authorize(&self, uname: &str) -> Result<Subject, MountError>;
+}
 
 /// Max bytes a single read/write returns. Kept below the translator's `MSG_SIZE`
 /// (8 KiB) so an `Rread` carrying a full iounit plus its 9P header still fits the
@@ -58,16 +78,49 @@ struct MountFidEntry {
 }
 
 /// A [`Backend`] backed by a single Subject-scoped VFS [`Mount`].
+///
+/// The session [`Subject`] is either fixed at construction ([`MountBackend::new`],
+/// the UDS/vsock listeners) or resolved from the client's `Tattach.uname` ticket
+/// at attach time ([`MountBackend::with_authorizer`], the H1b `/9p` WebTransport
+/// plane). It lives behind a [`OnceCell`] so per-op code reads one bound value
+/// either way; ops before a successful attach fail closed.
 pub struct MountBackend {
     mount: Arc<dyn Mount>,
-    subject: Subject,
+    subject: OnceCell<Subject>,
+    /// Present only for the attach-time path; resolves `uname` → `Subject`.
+    authorizer: Option<Arc<dyn AttachAuthorizer>>,
     fids: DashMap<u32, Arc<MountFidEntry>>,
 }
 
 impl MountBackend {
-    /// Wrap `mount` as the 9P export root for `subject`.
+    /// Wrap `mount` as the 9P export root for a `subject` fixed at construction.
     pub fn new(mount: Arc<dyn Mount>, subject: Subject) -> Self {
-        Self { mount, subject, fids: DashMap::new() }
+        let cell = OnceCell::new();
+        // Infallible on a fresh cell.
+        let _ = cell.set(subject);
+        Self { mount, subject: cell, authorizer: None, fids: DashMap::new() }
+    }
+
+    /// Wrap `mount` as the 9P export root whose session [`Subject`] is resolved
+    /// from the `Tattach.uname` ticket by `authorizer` (H1b `/9p` WebTransport).
+    ///
+    /// The `Subject` is unbound until a successful [`Backend::attach`]; any op
+    /// arriving before attach fails closed.
+    pub fn with_authorizer(mount: Arc<dyn Mount>, authorizer: Arc<dyn AttachAuthorizer>) -> Self {
+        Self {
+            mount,
+            subject: OnceCell::new(),
+            authorizer: Some(authorizer),
+            fids: DashMap::new(),
+        }
+    }
+
+    /// The bound session [`Subject`], or an error if no attach has bound it yet
+    /// (fail-closed: a 9P op must never reach the mount without a caller).
+    fn caller(&self) -> Result<&Subject> {
+        self.subject
+            .get()
+            .ok_or_else(|| anyhow!("9P op before Tattach: session Subject not bound"))
     }
 
     /// Clone out the `Arc` for a fid, dropping the `DashMap` guard so the mount
@@ -83,7 +136,7 @@ impl MountBackend {
     async fn qid_of(&self, handle: &Fid) -> Result<Qid> {
         let st = self
             .mount
-            .stat(handle, &self.subject)
+            .stat(handle, self.caller()?)
             .await
             .context("mount stat failed")?;
         Ok(Qid { qtype: st.qtype, version: st.version, path: st.path })
@@ -92,6 +145,25 @@ impl MountBackend {
 
 #[async_trait]
 impl Backend for MountBackend {
+    async fn attach(&self, uname: &str) -> Result<()> {
+        // Fixed-subject listeners have no authorizer; the Subject is already
+        // bound and `uname` is advisory (ignored, as on the UDS/vsock paths).
+        let Some(authorizer) = self.authorizer.as_ref() else {
+            return Ok(());
+        };
+        // Attach-time ticket path (H1b): resolve+narrow. A MountError here maps
+        // to an Rlerror errno (PermissionDenied → EACCES) via the translator.
+        let subject = authorizer.authorize(uname).await.map_err(anyhow::Error::new)?;
+        // First attach wins; a second attach on the same connection must not
+        // silently re-scope the session. Ignore a redundant identical set,
+        // reject a conflicting one.
+        match self.subject.set(subject) {
+            Ok(()) => Ok(()),
+            Err(_) if self.subject.get().is_some() => Ok(()),
+            Err(e) => Err(anyhow!("bind session Subject: {e}")),
+        }
+    }
+
     async fn walk(
         &self,
         fid: u32,
@@ -108,7 +180,7 @@ impl Backend for MountBackend {
         let refs: Vec<&str> = new_path.iter().map(String::as_str).collect();
         let handle = self
             .mount
-            .walk(&refs, &self.subject)
+            .walk(&refs, self.caller()?)
             .await
             .context("mount walk failed")?;
 
@@ -128,7 +200,7 @@ impl Backend for MountBackend {
         let handle = guard.as_mut().ok_or_else(|| anyhow!("open: fid {fid} is clunked"))?;
         let mode = lopen_flags_to_mode(flags);
         self.mount
-            .open(handle, mode, &self.subject)
+            .open(handle, mode, self.caller()?)
             .await
             .context("mount open failed")?;
         let qid = self.qid_of(handle).await?;
@@ -140,7 +212,7 @@ impl Backend for MountBackend {
         let guard = entry.handle.lock().await;
         let handle = guard.as_ref().ok_or_else(|| anyhow!("read: fid {fid} is clunked"))?;
         self.mount
-            .read(handle, offset, count, &self.subject)
+            .read(handle, offset, count, self.caller()?)
             .await
             .context("mount read failed")
     }
@@ -150,7 +222,7 @@ impl Backend for MountBackend {
         let guard = entry.handle.lock().await;
         let handle = guard.as_ref().ok_or_else(|| anyhow!("write: fid {fid} is clunked"))?;
         self.mount
-            .write(handle, offset, data, &self.subject)
+            .write(handle, offset, data, self.caller()?)
             .await
             .context("mount write failed")
     }
@@ -161,7 +233,7 @@ impl Backend for MountBackend {
         let handle = guard.as_ref().ok_or_else(|| anyhow!("stat: fid {fid} is clunked"))?;
         let st = self
             .mount
-            .stat(handle, &self.subject)
+            .stat(handle, self.caller()?)
             .await
             .context("mount stat failed")?;
         let is_dir = st.qtype & QTDIR != 0;
@@ -180,7 +252,7 @@ impl Backend for MountBackend {
             let guard = entry.handle.lock().await;
             let handle = guard.as_ref().ok_or_else(|| anyhow!("readdir: fid {fid} is clunked"))?;
             self.mount
-                .readdir(handle, &self.subject)
+                .readdir(handle, self.caller()?)
                 .await
                 .context("mount readdir failed")?
         };
@@ -192,7 +264,7 @@ impl Backend for MountBackend {
         if let Some((_, entry)) = self.fids.remove(&fid) {
             let handle = entry.handle.lock().await.take();
             if let Some(handle) = handle {
-                self.mount.clunk(handle, &self.subject).await;
+                self.mount.clunk(handle, self.caller()?).await;
             }
         }
         Ok(())

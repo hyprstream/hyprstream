@@ -132,6 +132,25 @@ impl Translator {
         Self::new(Arc::new(MountBackend::new(mount, subject)))
     }
 
+    /// Build a translator that exports `mount`, resolving the session
+    /// [`Subject`] from the mount ticket the client presents in `Tattach.uname`
+    /// via `authorizer` (H1b `/9p` WebTransport plane, #765).
+    ///
+    /// Unlike [`from_mount`](Self::from_mount) — where the caller identity is
+    /// fixed at construction (a UDS/vsock listener serves exactly one tenant) —
+    /// the WebTransport plane serves a cert-pinned mesh session over which a
+    /// tenant proves identity at attach. The `Subject` is bound once, at the
+    /// first successful `Tattach`, and threaded onto every op by
+    /// [`MountBackend`] thereafter; a denied ticket fails the attach with an
+    /// `Rlerror` (see [`MountBackend::with_authorizer`]). Every other layer —
+    /// the serve loop, fid table, errno mapping — is identical to `from_mount`.
+    pub fn from_mount_authorized(
+        mount: Arc<dyn Mount>,
+        authorizer: Arc<dyn crate::mount_backend::AttachAuthorizer>,
+    ) -> Self {
+        Self::new(Arc::new(MountBackend::with_authorizer(mount, authorizer)))
+    }
+
     /// Run a TCP accept loop until the listener errors or is closed.
     ///
     /// Each connection runs on its own task. Errors on one connection do not
@@ -285,7 +304,7 @@ impl Translator {
         let (tag, req) = parse_request(buf).context("decode 9P T-message")?;
         let resp = match req {
             Request::Version { msize, version } => self.handle_version(msize, version),
-            Request::Attach { fid, .. } => self.handle_attach(fid).await?,
+            Request::Attach { fid, uname, .. } => self.handle_attach(fid, &uname).await?,
             // Flush is intercepted in serve_connection before reaching here;
             // this arm is unreachable but kept exhaustive.
             Request::Flush { .. } => Response::Clunk,
@@ -320,7 +339,12 @@ impl Translator {
         Response::Version { msize, version: "9P2000.L".into() }
     }
 
-    async fn handle_attach(&self, fid: u32) -> Result<Response> {
+    async fn handle_attach(&self, fid: u32, uname: &str) -> Result<Response> {
+        // Establish the session first: on the attach-time ticket path (H1b) this
+        // validates `uname` and binds the session Subject; on the fixed-subject
+        // path it is a no-op. A denied ticket returns here and is mapped to an
+        // Rlerror by the serve loop — before any fid or mount handle exists.
+        self.backend.attach(uname).await?;
         // Attach establishes the root fid. Walk the empty path to materialize
         // a root qid from the backend, then record it.
         let walk = self.backend.walk(fid, fid, &[]).await?;
@@ -1085,5 +1109,93 @@ mod tests {
         drop(good);
         server.abort();
         let _ = std::fs::remove_file(&sock);
+    }
+
+    // ── Attach-time mount ticket (H1b / #765) ───────────────────────────
+
+    /// A fake [`AttachAuthorizer`] mirroring the H1b `Tattach.uname` ticket
+    /// check: one fixed ticket string maps to a narrowed Subject; anything else
+    /// is denied with `PermissionDenied` (→ `EACCES`).
+    struct FakeTicketAuth;
+    #[async_trait::async_trait]
+    impl crate::mount_backend::AttachAuthorizer for FakeTicketAuth {
+        async fn authorize(
+            &self,
+            uname: &str,
+        ) -> std::result::Result<hyprstream_rpc::Subject, hyprstream_vfs::MountError> {
+            if uname == "good-ticket" {
+                Ok(hyprstream_rpc::Subject::new("alice"))
+            } else {
+                Err(hyprstream_vfs::MountError::PermissionDenied("bad ticket".into()))
+            }
+        }
+    }
+
+    fn authorized_translator() -> Arc<Translator> {
+        use hyprstream_vfs::{SyntheticMount, SyntheticNode};
+        let root = SyntheticNode::dir()
+            .with_child("hello.txt", SyntheticNode::file(b"hi alice".to_vec()));
+        let mount: Arc<dyn hyprstream_vfs::Mount> = Arc::new(SyntheticMount::new(root));
+        Arc::new(Translator::from_mount_authorized(mount, Arc::new(FakeTicketAuth)))
+    }
+
+    /// A valid ticket in `Tattach.uname` binds the session Subject and the
+    /// attach + subsequent ops succeed (the H1b happy path over the shared
+    /// `handle_message` core).
+    #[tokio::test]
+    async fn attach_ticket_valid_binds_subject_and_serves() {
+        let t = authorized_translator();
+        let (_, resp) = t
+            .handle_message(&msg::tattach(1, 0, u32::MAX, "good-ticket", ""))
+            .await
+            .unwrap();
+        assert!(matches!(resp, Response::Attach { .. }), "valid ticket must attach: {resp:?}");
+
+        // The bound Subject now threads through walk/open/read.
+        let (_, resp) = t.handle_message(&msg::twalk(2, 0, 1, &["hello.txt"])).await.unwrap();
+        assert!(matches!(resp, Response::Walk { .. }), "got {resp:?}");
+        let (_, resp) = t.handle_message(&msg::tlopen(3, 1, 0)).await.unwrap();
+        assert!(matches!(resp, Response::Lopen { .. }), "got {resp:?}");
+        let (_, resp) = t.handle_message(&msg::tread(4, 1, 0, 64)).await.unwrap();
+        match resp {
+            Response::Read { data } => assert_eq!(&data, b"hi alice"),
+            other => panic!("expected Rread, got {other:?}"),
+        }
+    }
+
+    /// An invalid ticket in `Tattach.uname` fails the attach; the translator
+    /// maps the authorizer's `PermissionDenied` to an `Rlerror` `EACCES` — no
+    /// fid or mount handle is ever created.
+    #[tokio::test]
+    async fn attach_ticket_denied_returns_eacces() {
+        let t = authorized_translator();
+        let err = t
+            .handle_message(&msg::tattach(1, 0, u32::MAX, "forged", ""))
+            .await
+            .unwrap_err();
+        assert_eq!(errno_from_error(&err), EACCES, "denied ticket must be EACCES");
+    }
+
+    /// An empty `uname` (no ticket presented) is likewise denied — the ticket is
+    /// mandatory on the WebTransport plane.
+    #[tokio::test]
+    async fn attach_empty_ticket_denied() {
+        let t = authorized_translator();
+        let err = t
+            .handle_message(&msg::tattach(1, 0, u32::MAX, "", ""))
+            .await
+            .unwrap_err();
+        assert_eq!(errno_from_error(&err), EACCES, "missing ticket must be EACCES");
+    }
+
+    /// Fail-closed: an op arriving before a successful attach binds the Subject
+    /// must not reach the mount (the `OnceCell` is unset).
+    #[tokio::test]
+    async fn op_before_attach_fails_closed() {
+        let t = authorized_translator();
+        // No Tattach: a walk cannot resolve a caller and must error, not serve.
+        let err = t.handle_message(&msg::twalk(1, 0, 1, &["hello.txt"])).await.unwrap_err();
+        // Untyped bookkeeping error (no MountError) → EIO, never a success.
+        assert_eq!(errno_from_error(&err), EIO);
     }
 }

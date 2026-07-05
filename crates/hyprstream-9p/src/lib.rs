@@ -65,7 +65,7 @@ pub mod wanix_mount;
 pub use backend::{Backend, OpenResult, StatResult, WalkResult};
 pub use client::{P9Client, P9Transport};
 #[cfg(not(target_arch = "wasm32"))]
-pub use mount_backend::MountBackend;
+pub use mount_backend::{AttachAuthorizer, MountBackend};
 #[cfg(not(target_arch = "wasm32"))]
 pub use remote_mount::Remote9pMount;
 #[cfg(not(target_arch = "wasm32"))]
