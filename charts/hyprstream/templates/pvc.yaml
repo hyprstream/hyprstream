@@ -1,0 +1,29 @@
+{{- if and .Values.persistence.enabled (not .Values.persistence.existingClaim) -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "hyprstream.fullname" . }}-data
+  labels:
+    {{- include "hyprstream.labels" . | nindent 4 }}
+  {{- with .Values.persistence.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  accessModes:
+    {{- toYaml .Values.persistence.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size }}
+  {{- if .Values.persistence.storageClass }}
+  storageClassName: {{ .Values.persistence.storageClass | quote }}
+  {{- end }}
+{{- end }}
+{{/*
+  NOTE: this is a single shared claim across all service Deployments. accessModes
+  defaults to ReadWriteOnce, which binds to pods on ONE node — fine for a
+  single-node cluster (kind) and for validation. On a multi-node cluster set
+  persistence.accessModes to [ReadWriteMany] with an RWX-capable StorageClass, or
+  supply model data out-of-band via XET/CAS. Cross-service state sharing (models,
+  CAS) is the reason for a shared volume.
+*/}}
