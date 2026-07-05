@@ -72,19 +72,47 @@ persistence:
   annotations: {}
 
 # -----------------------------------------------------------------------------
-# TODO(#783) — K1a key/trust bootstrap extension hook.
-# Per-service signing-key Secrets, CA/trust store, node DID. Intentionally NOT
-# implemented here (separate issue). When keyBootstrap.enabled is true, #783
-# will project per-service Secret volumes into HYPRSTREAM__SECRETS__PATH and set
-# the node DID. This chart only reserves the shape + a stable secrets mount path.
+# K1a key/trust bootstrap (#783).
+#
+# hyprstream reads a flat credential directory when HYPRSTREAM__SECRETS__PATH is
+# set. In Kubernetes each pod gets that flat directory by projecting:
+#   - shared trust: ca-pubkey + bootstrap-pubkeys
+#   - service credential Secret: signing-key + service-jwt
+#   - policy-only CA Secret: ca-key (policy signs/renews service JWTs)
+#
+# Generate these files with the normal hyprstream bootstrap/wizard flow, or an
+# external-secrets controller. The chart deliberately does not mint keys in
+# templates: Helm has no secure RNG/signing primitive, and missing credentials
+# should fail closed rather than silently deriving identity in-cluster.
 # -----------------------------------------------------------------------------
 keyBootstrap:
   enabled: false
-  # Directory each service reads signing keys / bootstrap pubkeys / JWTs from
-  # (HYPRSTREAM__SECRETS__PATH). #783 owns populating it from Secrets.
+  # Directory each service reads signing keys / bootstrap pubkeys / JWTs from.
   secretsPath: /var/lib/hyprstream/credentials
-  # nodeDid: ""              # filled by #783
-  # secretNameTemplate: ""   # filled by #783
+  # OAuth issuer / local trust-domain URL stamped into service JWTs by the
+  # bootstrap tool and used as the node's did:web authority when OAuth is on.
+  # If set, it is exposed as HYPRSTREAM__OAUTH__ISSUER_URL.
+  issuerUrl: ""
+  # Shared public trust material. Existing Secret must contain:
+  #   ca-pubkey
+  #   bootstrap-pubkeys
+  trust:
+    existingSecret: ""
+    # Inline public trust data for dev/test installs. Values are rendered into a
+    # Secret only when existingSecret is empty. Do not put private keys here.
+    caPubkey: ""
+    bootstrapPubkeys: ""
+  # Per-service credential Secrets. Each non-policy service Secret must contain:
+  #   signing-key
+  #   service-jwt
+  # The policy service Secret must contain:
+  #   signing-key
+  # and may contain service-jwt for symmetry.
+  # Omitted entries default to "<fullname>-<service>-credentials".
+  serviceSecrets: {}
+  # Policy-only CA Secret. Must contain ca-key. Omitted default:
+  # "<fullname>-policy-ca".
+  policyCaSecret: ""
 
 # -----------------------------------------------------------------------------
 # TODO(#784) — K1b observability extension hook.

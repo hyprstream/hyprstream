@@ -1,0 +1,15 @@
+{{- if .Values.keyBootstrap.enabled }}
+{{- if not .Values.keyBootstrap.trust.existingSecret }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "hyprstream.trustSecretName" . }}
+  labels:
+    {{- include "hyprstream.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  ca-pubkey: {{ required "keyBootstrap.trust.caPubkey is required when keyBootstrap.enabled=true and keyBootstrap.trust.existingSecret is empty" .Values.keyBootstrap.trust.caPubkey | quote }}
+  bootstrap-pubkeys: {{ required "keyBootstrap.trust.bootstrapPubkeys is required when keyBootstrap.enabled=true and keyBootstrap.trust.existingSecret is empty" .Values.keyBootstrap.trust.bootstrapPubkeys | quote }}
+{{- end }}
+{{- end }}

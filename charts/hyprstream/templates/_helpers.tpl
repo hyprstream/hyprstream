@@ -78,3 +78,26 @@ suffix. Usage: include "hyprstream.image" (dict "root" $ "svc" $svc)
 {{- end -}}
 {{- printf "%s:%s%s" $img.repository $tag $suffix -}}
 {{- end }}
+
+{{/*
+Shared trust Secret name.
+*/}}
+{{- define "hyprstream.trustSecretName" -}}
+{{- default (printf "%s-trust" (include "hyprstream.fullname" .)) .Values.keyBootstrap.trust.existingSecret -}}
+{{- end }}
+
+{{/*
+Per-service credential Secret name.
+Usage: include "hyprstream.serviceCredentialSecretName" (dict "root" $ "name" $name)
+*/}}
+{{- define "hyprstream.serviceCredentialSecretName" -}}
+{{- $default := printf "%s-%s-credentials" (include "hyprstream.fullname" .root) .name -}}
+{{- default $default (index .root.Values.keyBootstrap.serviceSecrets .name) -}}
+{{- end }}
+
+{{/*
+Policy CA Secret name.
+*/}}
+{{- define "hyprstream.policyCaSecretName" -}}
+{{- default (printf "%s-policy-ca" (include "hyprstream.fullname" .)) .Values.keyBootstrap.policyCaSecret -}}
+{{- end }}
