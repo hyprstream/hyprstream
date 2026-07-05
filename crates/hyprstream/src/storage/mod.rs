@@ -9,6 +9,7 @@
 //! - Git LFS to XET translation for Hugging Face models (via git2db::lfs, requires `xet` feature)
 //! - Git-native model registry
 pub mod adapter_manager;
+pub mod cas;
 pub mod errors;
 pub mod model_ref;
 pub mod paths;
@@ -16,6 +17,7 @@ pub mod release_store;
 
 // Re-export types for backward compatibility
 pub use adapter_manager::{AdapterConfig, AdapterInfo, AdapterManager};
+pub use cas::{BlobManifest, CasError, CasSubstrate, DedupDomain, TrustBoundary};
 pub use errors::{ModelRefError, ModelRefResult};
 pub use model_ref::{validate_model_name, GitRef, ModelRef};
 pub use paths::StoragePaths;

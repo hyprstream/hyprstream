@@ -12,7 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # Data processing - use DuckDB's arrow version for consistency
-duckdb = { version = "1.4.3", features = ["bundled"] }
+duckdb = { version = "=1.4.3", features = ["bundled"] }
 
 # Re-export arrow from duckdb to avoid version conflicts
 # arrow = { version = "54", package = "arrow" }  # via duckdb

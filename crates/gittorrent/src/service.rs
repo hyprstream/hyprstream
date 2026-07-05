@@ -497,8 +497,10 @@ impl GitTorrentService {
             if let Some(data) = self.get_object(&sha256_hash).await? {
                 objects.push(data.clone());
 
-                // Parse object to find referenced objects (returns GitHash)
-                let referenced = self.parse_object_references(&data)?;
+                // Parse object to find referenced objects (returns GitHash).
+                // The object we just fetched was keyed by `hash`, whose variant
+                // tells us the repository object format for binary tree entries.
+                let referenced = self.parse_object_references(&data, hash.object_format())?;
                 to_fetch.extend(referenced);
             }
         }
@@ -506,10 +508,17 @@ impl GitTorrentService {
         Ok(objects)
     }
 
-    /// Parse an object to find hash references to other objects
-    fn parse_object_references(&self, object_data: &[u8]) -> Result<Vec<crate::types::GitHash>> {
+    /// Parse an object to find hash references to other objects.
+    ///
+    /// `format` is the repository's object format (from the fetched object's
+    /// own hash), used to slice binary tree entries at the correct OID width.
+    fn parse_object_references(
+        &self,
+        object_data: &[u8],
+        format: crate::types::ObjectFormat,
+    ) -> Result<Vec<crate::types::GitHash>> {
         use crate::git::objects::parse_object_references;
-        parse_object_references(object_data)
+        parse_object_references(object_data, format)
     }
 
     /// Clone a repository from a GitTorrent URL
