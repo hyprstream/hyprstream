@@ -22,9 +22,22 @@ pub use hyprstream_rpc::common_capnp;
 // Cap'n Proto generated module
 pub mod discovery_capnp {
     #![allow(dead_code, unused_imports)]
-    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
-    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    #![allow(
+        clippy::all,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::match_same_arms
+    )]
+    #![allow(
+        clippy::semicolon_if_nothing_returned,
+        clippy::doc_markdown,
+        clippy::indexing_slicing
+    )]
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     include!(concat!(env!("OUT_DIR"), "/discovery_capnp.rs"));
 }
 
@@ -60,18 +73,26 @@ pub mod placement_index;
 /// **Not a framework**: free functions + plain types. See the module doc.
 pub mod scheduling;
 
+/// K4c (#787) — the placement→PodSpec vocabulary map (`k8s` feature).
+///
+/// Pure translation of a placement decision (in the [`scheduling`] substrate
+/// vocabulary) into the Kubernetes `PodSpec` scheduling fields — `nodeSelector`
+/// / `affinity` / `tolerations` / `resources` / `priorityClassName`. The
+/// two-level-scheduling seam: hyprstream decides *what runs with what
+/// constraints*, Kubernetes decides *which node*. No cluster, no kube client.
+#[cfg(feature = "k8s")]
+pub mod podspec;
+
 // Re-export key types
-pub use hyprstream_rpc::resolver::Resolver;
 pub use hyprstream_rpc::registry::SocketKind;
+pub use hyprstream_rpc::resolver::Resolver;
 pub use service::{AuthorizationProvider, DiscoveryService, RecordCarData, RecordResolver};
 
 // Re-export generated types that consumers need
 pub use generated::discovery_client::{
-    DiscoveryClient, DiscoveryHandler, DiscoveryResponseVariant,
-    ErrorInfo, ServiceList, ServiceSummary, ServiceEndpoints, EndpointInfo,
-    PingInfo, AuthMetadata, AuthMetadataList, ServiceAnnouncement,
-    GetRecordRequest, RecordCar,
-    dispatch_discovery, serialize_response,
+    dispatch_discovery, serialize_response, AuthMetadata, AuthMetadataList, DiscoveryClient,
+    DiscoveryHandler, DiscoveryResponseVariant, EndpointInfo, ErrorInfo, GetRecordRequest,
+    PingInfo, RecordCar, ServiceAnnouncement, ServiceEndpoints, ServiceList, ServiceSummary,
 };
 
 #[cfg(test)]

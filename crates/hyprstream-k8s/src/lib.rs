@@ -47,6 +47,13 @@ pub mod models;
 pub mod serving;
 pub mod training;
 
+/// Re-export of the exact `k8s-openapi` version this crate is built against, so
+/// downstream crates (e.g. `hyprstream-discovery`'s placement→PodSpec map, K4c
+/// #787) can name `PodSpec` / `Quantity` / `Affinity` at the single
+/// workspace-pinned `v1_32` version without independently depending on
+/// `k8s-openapi` (exactly one `v1_*` is permitted workspace-wide).
+pub use k8s_openapi;
+
 #[cfg(feature = "k8s")]
 pub mod install;
 

@@ -1,0 +1,33 @@
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: gpu.arch
+          operator: In
+          values:
+          - hopper
+          - ampere
+        - key: spot
+          operator: DoesNotExist
+        - key: gpu.memory.gib
+          operator: Gt
+          values:
+          - '40'
+containers:
+- image: hyprstream/trainer:latest
+  name: trainer
+  resources:
+    limits:
+      nvidia.com/gpu: '2'
+    requests:
+      cpu: '4'
+      memory: 32Gi
+      nvidia.com/gpu: '2'
+nodeSelector:
+  topology.zone: us-east-1a
+priorityClassName: training-high
+tolerations:
+- effect: NoSchedule
+  key: nvidia.com/gpu
+  operator: Exists
