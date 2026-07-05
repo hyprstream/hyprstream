@@ -220,6 +220,14 @@ where
 /// streaming plane (default path → RPC). Both server and client use this.
 pub const MOQ_PATH: &str = "/moq";
 
+/// The URL path the daemon's `web_transport_quinn` server dispatches to the 9P
+/// export plane (H1b / #765): the QUIC path-mux sibling of H1a's `/9p` axum
+/// WebSocket endpoint, for the cert-pinned self-signed mesh. A WebTransport
+/// session whose CONNECT URL path is this is handed to the injected 9P handler
+/// (see [`crate::transport::quinn_transport`]); the mount ticket rides
+/// `Tattach.uname`, not the URL, since the session is already cert-pinned.
+pub const NINEP_PATH: &str = "/9p";
+
 /// A dialed moq streaming session, erased over the concrete transport.
 ///
 /// [`dial_stream`] returns this so a caller can dial the streaming plane over
