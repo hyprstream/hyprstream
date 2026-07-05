@@ -13,4 +13,4 @@ require github.com/u-root/uio v0.0.0-20240224005618-d2acac8f3701 // indirect
 // hyprstream's 9P server + wanix-guest both use the progrium p9 fork; pin the
 // same one here (Go does not apply a dependency's replace directives, so this is
 // declared, not inherited). Kept in lockstep with workers/wanix-guest/go.mod.
-replace github.com/hugelgupf/p9 => github.com/progrium/p9 v0.0.0-20260529042029-b49ec572080f
+replace github.com/hugelgupf/p9 => ../../third_party/progrium-p9

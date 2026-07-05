@@ -199,8 +199,10 @@ observability:
 #   - kernel: kubelet invokes kernel v9fs; ticket is presented via uname= and a
 #     node-local stream bridge hands the kernel a connected fd (trans=fd).
 #   - fuse: the hypr9p FUSE->9P client dials the configured carrier directly.
-# Transports are dial-time carriers. iroh / QUIC-WebTransport is the normal
-# cross-node path, vsock is for Kata, and UDS is only a co-located corner case.
+# Transports are dial-time carriers. The Phase-1 FUSE client supports raw
+# vsock/unix/tcp dial targets; iroh / QUIC-WebTransport remains the normal
+# cross-node target once the node bridge/dialer lands. UDS is only a co-located
+# corner case.
 # -----------------------------------------------------------------------------
 csi:
   enabled: false
@@ -221,8 +223,8 @@ csi:
     mountTicketUrl: http://hyprstream-oauth:6791/oauth/mount-ticket
     audience: hyprstream-9p
   transport:
-    carrier: webtransport
-    endpoint: https://hyprstream-streams:7011/9p
+    carrier: tcp
+    endpoint: tcp://127.0.0.1:564
     bridgeListen: 127.0.0.1:0
   storageClasses:
     create: true

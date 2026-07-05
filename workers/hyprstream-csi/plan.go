@@ -10,7 +10,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
@@ -25,6 +27,8 @@ const (
 	attrEndpoint      = "endpoint"
 	attrTicket        = "ticket"
 	attrServiceTokens = "csi.storage.k8s.io/serviceAccount.tokens"
+	fusePIDFile       = ".hyprstream-fuse.pid"
+	ticketEnv         = "HYPRSTREAM_9P_UNAME"
 )
 
 type mountTicketRequest struct {
@@ -189,23 +193,35 @@ func executeMountPlan(ctx context.Context, plan mountPlan) error {
 	}
 	switch plan.Mounter {
 	case "fuse":
-		cmd := exec.CommandContext(ctx, "hypr9p-guest", "--dial", plan.DialTarget, "--aname", plan.Ticket, "--fuse-mount", plan.TargetPath)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+		mounted, err := fuseMountProcessAlive(plan.TargetPath)
+		if err != nil {
+			return err
+		}
+		if mounted {
+			return nil
+		}
+		cmd := fuseCommand(ctx, plan)
 		if err := cmd.Start(); err != nil {
 			return fmt.Errorf("start FUSE 9P mounter: %w", err)
 		}
-		pidPath := filepath.Join(plan.TargetPath, ".hyprstream-fuse.pid")
-		_ = os.WriteFile(pidPath, []byte(fmt.Sprintln(cmd.Process.Pid)), 0o600)
+		pidPath := filepath.Join(plan.TargetPath, fusePIDFile)
+		if err := os.WriteFile(pidPath, []byte(fmt.Sprintln(cmd.Process.Pid)), 0o600); err != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			return fmt.Errorf("write FUSE mounter pid: %w", err)
+		}
+		if err := cmd.Process.Release(); err != nil {
+			return fmt.Errorf("release FUSE mounter process: %w", err)
+		}
 		return nil
 	case "kernel":
 		cmd := exec.CommandContext(ctx, "hyprstream-csi-bridge",
 			"mount-kernel",
 			"--dial", plan.DialTarget,
-			"--ticket", plan.Ticket,
 			"--target", plan.TargetPath,
 			"--listen", plan.KernelBridge,
 		)
+		cmd.Env = append(os.Environ(), ticketEnv+"="+plan.Ticket)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
@@ -215,4 +231,86 @@ func executeMountPlan(ctx context.Context, plan mountPlan) error {
 	default:
 		return fmt.Errorf("unsupported mounter %q", plan.Mounter)
 	}
+}
+
+func fuseCommand(ctx context.Context, plan mountPlan) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "hypr9p-guest",
+		"--dial", plan.DialTarget,
+		"--fuse-mount", plan.TargetPath,
+	)
+	cmd.Env = append(os.Environ(), ticketEnv+"="+plan.Ticket)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd
+}
+
+func fuseMountProcessAlive(targetPath string) (bool, error) {
+	pid, ok, err := readFusePID(targetPath)
+	if err != nil || !ok {
+		return false, err
+	}
+	if err := syscall.Kill(pid, 0); err == nil {
+		return true, nil
+	} else if errors.Is(err, syscall.ESRCH) {
+		_ = os.Remove(filepath.Join(targetPath, fusePIDFile))
+		return false, nil
+	} else {
+		return false, fmt.Errorf("check FUSE mounter pid %d: %w", pid, err)
+	}
+}
+
+func readFusePID(targetPath string) (int, bool, error) {
+	raw, err := os.ReadFile(filepath.Join(targetPath, fusePIDFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("read FUSE mounter pid: %w", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 0 {
+		return 0, false, fmt.Errorf("invalid FUSE mounter pid %q", strings.TrimSpace(string(raw)))
+	}
+	return pid, true, nil
+}
+
+func unpublishMount(ctx context.Context, targetPath string) error {
+	if targetPath == "" {
+		return errors.New("target_path is required")
+	}
+	pid, ok, err := readFusePID(targetPath)
+	if err != nil {
+		return err
+	}
+	if ok {
+		_ = syscall.Kill(pid, syscall.SIGTERM)
+	}
+	_ = bestEffortUnmount(ctx, targetPath)
+	if ok {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if err := syscall.Kill(pid, 0); err == nil {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	}
+	_ = os.Remove(filepath.Join(targetPath, fusePIDFile))
+	return nil
+}
+
+func bestEffortUnmount(ctx context.Context, targetPath string) error {
+	for _, argv := range [][]string{
+		{"fusermount3", "-u", targetPath},
+		{"fusermount", "-u", targetPath},
+		{"umount", targetPath},
+	} {
+		if err := exec.CommandContext(ctx, argv[0], argv[1:]...).Run(); err == nil {
+			return nil
+		}
+	}
+	return nil
 }

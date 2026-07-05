@@ -1,9 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
@@ -125,4 +130,76 @@ func TestBuildMountPlanRejectsBadInput(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected relative namespacePath rejection")
 	}
+}
+
+func TestFuseCommandKeepsTicketOutOfArgvAndUsesUnameEnv(t *testing.T) {
+	plan := mountPlan{
+		TargetPath: "/mnt/hypr",
+		DialTarget: "tcp://127.0.0.1:564",
+		Ticket:     "ticket-secret",
+	}
+	cmd := fuseCommand(context.Background(), plan)
+	argv := strings.Join(cmd.Args, "\x00")
+	if strings.Contains(argv, "ticket-secret") {
+		t.Fatalf("ticket leaked into argv: %q", cmd.Args)
+	}
+	if strings.Contains(argv, "--aname") {
+		t.Fatalf("ticket must be presented as uname, not aname: %q", cmd.Args)
+	}
+	if !hasEnv(cmd.Env, ticketEnv+"=ticket-secret") {
+		t.Fatalf("missing ticket env %s in %v", ticketEnv, cmd.Env)
+	}
+}
+
+func TestFuseMountProcessAliveHandlesStalePid(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, fusePIDFile), []byte("999999999\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	alive, err := fuseMountProcessAlive(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if alive {
+		t.Fatal("expected stale pid to be treated as not mounted")
+	}
+	if _, err := os.Stat(filepath.Join(dir, fusePIDFile)); !os.IsNotExist(err) {
+		t.Fatalf("stale pid file should be removed, stat err=%v", err)
+	}
+}
+
+func TestFuseMountProcessAliveRecognizesLivePid(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, fusePIDFile), []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	alive, err := fuseMountProcessAlive(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !alive {
+		t.Fatal("expected current process pid to be treated as mounted")
+	}
+}
+
+func TestUnpublishMountRemovesStalePidFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, fusePIDFile), []byte("999999999\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := unpublishMount(context.Background(), dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, fusePIDFile)); !os.IsNotExist(err) {
+		t.Fatalf("pid file should be removed, stat err=%v", err)
+	}
+}
+
+func hasEnv(env []string, want string) bool {
+	for _, item := range env {
+		if item == want {
+			return true
+		}
+	}
+	return false
 }
