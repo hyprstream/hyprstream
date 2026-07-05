@@ -45,7 +45,16 @@ pub fn create_app(state: ServerState) -> Router {
         .route(
             "/.well-known/oauth-protected-resource",
             get(oauth_protected_resource_metadata),
-        );
+        )
+        // 9P-over-WebSocket export (H1a / #764). Public routes: the mount
+        // ticket rides the URL query (browser WS can't set headers) and is
+        // validated inside the /9p handler, so these bypass `auth_middleware`
+        // (which requires an Authorization header).
+        .route(
+            "/.well-known/export9p",
+            get(routes::ninep::export9p_metadata),
+        )
+        .route("/9p", get(routes::ninep::ninep_ws));
 
     // Protected routes (auth required)
     let protected_routes = Router::new()

@@ -175,7 +175,8 @@ subtle.workspace = true                  # Constant-time operations
 ring = "0.17"                            # TLS endorsement signing (key-type-agnostic)
 
 # HTTP API dependencies
-axum.workspace = true
+# `ws` feature: 9P-over-WebSocket export (H1a / #764) on the existing server.
+axum = { workspace = true, features = ["ws"] }
 axum-server.workspace = true
 tower-http.workspace = true
 url.workspace = true
@@ -226,6 +227,8 @@ iroh.workspace = true
 rand.workspace = true
 # Test-only: drive the xet axum Router via `ServiceExt::oneshot` (auth-reject test).
 tower = { version = "0.5", features = ["util"] }
+# Test-only: WebSocket client for the 9P-over-WS attach round-trip (H1a / #764).
+tokio-tungstenite = "0.24"
 
 [lints]
 workspace = true

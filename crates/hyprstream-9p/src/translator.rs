@@ -261,12 +261,16 @@ impl Translator {
             let (tag, response) = match self.handle_message(&buf).await {
                 Ok(r) => r,
                 Err(e) => {
-                    // Map a handler error to Rlerror (errno-style code).
-                    // We use a synthetic code; real errno mapping is backend-
-                    // specific and deferred to a later hardening pass.
+                    // Map a typed backend error to a real 9P2000.L `Rlerror`
+                    // errno (H1a / #764). `wanix serve` clients and shell UX
+                    // depend on distinguishing ENOENT/EACCES/ENOTDIR from a
+                    // blanket EIO; [`errno_from_error`] walks the anyhow cause
+                    // chain for a [`hyprstream_vfs::MountError`] and maps it,
+                    // falling back to EIO for untyped errors.
                     let err_tag = tag_or_notag(&buf);
-                    warn!(error = %e, tag = err_tag, "9P handler error");
-                    (err_tag, Response::Error { ecode: libc_eio() })
+                    let ecode = errno_from_error(&e);
+                    warn!(error = %e, tag = err_tag, ecode, "9P handler error");
+                    (err_tag, Response::Error { ecode })
                 }
             };
 
@@ -626,20 +630,150 @@ fn tag_or_notag(buf: &[u8]) -> u16 {
     }
 }
 
-// errno-style codes the translator emits on its own errors. We hardcode the
-// integer values rather than depend on libc so the crate stays wasm-friendly.
-const fn libc_eio() -> u32 {
-    5 // EIO
-}
+// errno-style codes the translator emits. We hardcode the integer values
+// (Linux asm-generic errno numbers) rather than depend on libc so the crate
+// stays wasm-friendly and the Rlerror wire codes are stable across platforms.
+const ENOENT: u32 = 2; // No such file or directory
+const EIO: u32 = 5; // I/O error
+const EACCES: u32 = 13; // Permission denied
+const EEXIST: u32 = 17; // File exists
+const ENOTDIR: u32 = 20; // Not a directory
+const EISDIR: u32 = 21; // Is a directory
+const EINVAL: u32 = 22; // Invalid argument
+const ENOSYS: u32 = 38; // Function not implemented
+
 const fn libc_einval() -> u32 {
-    22 // EINVAL
+    EINVAL
+}
+
+/// Map a backend handler error to a 9P2000.L `Rlerror` errno (H1a / #764).
+///
+/// The backend seam is stringly-typed at the `anyhow::Error` boundary, but the
+/// VFS [`MountBackend`] preserves the underlying [`hyprstream_vfs::MountError`]
+/// as an anyhow *source* (via `.context(...)`, not string interpolation), so
+/// the concrete error survives in the cause chain. This walks that chain and
+/// maps the first [`MountError`] it finds to its POSIX errno; an untyped error
+/// (e.g. a fid-table bookkeeping failure) falls back to [`EIO`].
+///
+/// Mapping (min ENOENT/EACCES/ENOTDIR per the spike, plus the rest of the
+/// [`MountError`] surface):
+/// `NotFound→ENOENT`, `PermissionDenied→EACCES`, `NotDirectory→ENOTDIR`,
+/// `IsDirectory→EISDIR`, `InvalidArgument→EINVAL`, `AlreadyExists→EEXIST`,
+/// `NotSupported→ENOSYS`, `Io→EIO`.
+pub(crate) fn errno_from_error(err: &anyhow::Error) -> u32 {
+    for cause in err.chain() {
+        if let Some(me) = cause.downcast_ref::<hyprstream_vfs::MountError>() {
+            return errno_from_mount_error(me);
+        }
+    }
+    EIO
+}
+
+/// Map a [`hyprstream_vfs::MountError`] variant to its POSIX errno.
+fn errno_from_mount_error(e: &hyprstream_vfs::MountError) -> u32 {
+    use hyprstream_vfs::MountError as M;
+    match e {
+        M::NotFound(_) => ENOENT,
+        M::PermissionDenied(_) => EACCES,
+        M::NotDirectory(_) => ENOTDIR,
+        M::IsDirectory(_) => EISDIR,
+        M::InvalidArgument(_) => EINVAL,
+        M::AlreadyExists(_) => EEXIST,
+        M::NotSupported(_) => ENOSYS,
+        M::Io(_) => EIO,
+    }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::memory::MemoryBackend;
     use crate::msg::Qid;
+
+    // ── Typed errno mapping (H1a / #764) ────────────────────────────────
+
+    /// Every [`hyprstream_vfs::MountError`] variant must map to its POSIX
+    /// errno when wrapped exactly as [`MountBackend`] wraps it (via
+    /// `.context(...)`, which preserves the concrete error as an anyhow
+    /// source). An untyped error falls back to EIO. Regression guard for the
+    /// blanket-EIO behaviour the spike flagged at `translator.rs:211`.
+    #[test]
+    fn mount_errors_map_to_errnos() {
+        use hyprstream_vfs::MountError as M;
+        let cases = [
+            (M::NotFound("x".into()), ENOENT),
+            (M::PermissionDenied("x".into()), EACCES),
+            (M::NotDirectory("x".into()), ENOTDIR),
+            (M::IsDirectory("x".into()), EISDIR),
+            (M::InvalidArgument("x".into()), EINVAL),
+            (M::AlreadyExists("x".into()), EEXIST),
+            (M::NotSupported("x".into()), ENOSYS),
+            (M::Io("x".into()), EIO),
+        ];
+        for (err, expected) in cases {
+            // Mimic the MountBackend error path: attach context so the
+            // MountError is an anyhow *source*, not string-flattened.
+            let wrapped = anyhow::Error::new(err).context("mount op failed");
+            assert_eq!(errno_from_error(&wrapped), expected);
+        }
+        // Untyped bookkeeping errors fall back to EIO.
+        assert_eq!(errno_from_error(&anyhow::anyhow!("fid 3 not walked")), EIO);
+    }
+
+    /// End-to-end through [`MountBackend`]: a `Mount` that returns
+    /// `NotFound` on a bad walk must surface as an anyhow chain the
+    /// translator maps to `ENOENT` (not EIO). Proves the `.context(...)`
+    /// wrapping in `MountBackend` keeps the `MountError` downcastable.
+    #[tokio::test]
+    async fn mount_backend_preserves_typed_errno_end_to_end() {
+        use crate::mount_backend::MountBackend;
+        use async_trait::async_trait;
+        use hyprstream_rpc::Subject;
+        use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
+
+        struct StubMount;
+        #[async_trait]
+        impl Mount for StubMount {
+            async fn walk(&self, components: &[&str], _c: &Subject) -> Result<Fid, MountError> {
+                if components.is_empty() {
+                    // Attach walks the empty root path — resolve it.
+                    Ok(Fid::new(()))
+                } else {
+                    Err(MountError::NotFound(components.join("/")))
+                }
+            }
+            async fn open(&self, _f: &mut Fid, _m: u8, _c: &Subject) -> Result<(), MountError> {
+                Err(MountError::PermissionDenied("open".into()))
+            }
+            async fn read(&self, _f: &Fid, _o: u64, _n: u32, _c: &Subject) -> Result<Vec<u8>, MountError> {
+                Err(MountError::Io("read".into()))
+            }
+            async fn write(&self, _f: &Fid, _o: u64, _d: &[u8], _c: &Subject) -> Result<u32, MountError> {
+                Err(MountError::NotSupported("write".into()))
+            }
+            async fn readdir(&self, _f: &Fid, _c: &Subject) -> Result<Vec<DirEntry>, MountError> {
+                Err(MountError::NotDirectory("readdir".into()))
+            }
+            async fn stat(&self, _f: &Fid, _c: &Subject) -> Result<Stat, MountError> {
+                Ok(Stat::unknown_qid(0x80, 0, "/".into(), 0))
+            }
+            async fn clunk(&self, _f: Fid, _c: &Subject) {}
+        }
+
+        let backend = MountBackend::new(Arc::new(StubMount), Subject::new("tenant"));
+        let t = Arc::new(Translator::new(Arc::new(backend)));
+
+        // Attach fid 0 as root (empty walk succeeds).
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "u", "")).await.unwrap();
+
+        // Walk to a missing child → Err whose errno must be ENOENT.
+        let err = t
+            .handle_message(&msg::twalk(2, 0, 1, &["nope"]))
+            .await
+            .unwrap_err();
+        assert_eq!(errno_from_error(&err), ENOENT, "missing path must be ENOENT, not EIO");
+    }
 
     fn sample_qid(qtype: u8, path: u64) -> Qid {
         Qid { qtype, version: 1, path }
