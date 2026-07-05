@@ -255,9 +255,9 @@ fn mesh_kem_key_agreement_methods(did: &str, x25519_ek: &[u8], mlkem768_ek: &[u8
 /// Validates the suite shape defensively (exactly the 2 components of
 /// `SuiteId::HyKemX25519MlKem768`, X25519 then ML-KEM-768) before emitting —
 /// `recipient_public` only ever comes from this node's own
-/// `derive_mesh_kem_recipient`, but a shape mismatch must fail closed (omit
-/// `keyAgreement`) rather than publish a malformed or misordered key that a
-/// peer would silently mis-anchor.
+/// `derive_mesh_kem_recipient`, but a shape mismatch must fail closed (publish
+/// an empty `keyAgreement` relationship) rather than publish a malformed or
+/// misordered key that a peer would silently mis-anchor.
 fn mesh_kem_key_agreement(
     did: &str,
     recipient_public: Option<&hyprstream_rpc::crypto::hybrid_kem::RecipientPublic>,

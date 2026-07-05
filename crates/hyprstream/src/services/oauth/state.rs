@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use anyhow::Context as _;
 use base64::Engine as _;
 use tokio::sync::RwLock;
 use serde::{Deserialize, Serialize};
@@ -143,6 +144,39 @@ pub struct PushedAuthRequest {
 impl PushedAuthRequest {
     pub fn is_expired(&self) -> bool {
         Instant::now() > self.expires_at
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use hyprstream_rpc::crypto::CryptoPolicy;
+    use rand::rngs::OsRng;
+
+    #[test]
+    fn mesh_kem_derivation_failure_fails_closed_under_hybrid() {
+        let key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        let err = mesh_kem_public_for_policy(&key, CryptoPolicy::Hybrid, |_| {
+            Err(anyhow::anyhow!("synthetic derivation failure"))
+        })
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("Hybrid policy"),
+            "unexpected error: {err:?}",
+        );
+    }
+
+    #[test]
+    fn mesh_kem_derivation_failure_is_empty_under_classical() {
+        let key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        let public = mesh_kem_public_for_policy(&key, CryptoPolicy::Classical, |_| {
+            Err(anyhow::anyhow!("synthetic derivation failure"))
+        })
+        .unwrap();
+
+        assert!(public.is_none());
     }
 }
 
@@ -434,8 +468,9 @@ pub struct OAuthState {
     /// verification methods in the root DID document. Derived from the same
     /// Ed25519 key as [`Self::signing_key`] (via `derive_mesh_kem_recipient`),
     /// so the published keys equal what the node decapsulates `#mesh-kem`
-    /// envelopes with. `None` when the entity signing key is not configured
-    /// (or derivation failed — see `with_signing_key`).
+    /// envelopes with. `None` when the entity signing key is not configured,
+    /// or when derivation failed under Classical policy (Hybrid fails closed
+    /// during `with_signing_key`).
     pub mesh_kem_public: Option<hyprstream_rpc::crypto::hybrid_kem::RecipientPublic>,
     /// #282: the node's iroh endpoint id (its Ed25519 `node_id`, 32 bytes),
     /// published as the `#iroh` verification method + an `IrohTransport` service
@@ -446,6 +481,29 @@ pub struct OAuthState {
     /// `relays`. Empty = rely on pkarr/DNS discovery for reachability (the
     /// peer resolves direct paths by node_id alone).
     pub iroh_relays: Vec<String>,
+}
+
+fn mesh_kem_public_for_policy(
+    key: &ed25519_dalek::SigningKey,
+    policy: hyprstream_rpc::crypto::CryptoPolicy,
+    derive: impl FnOnce(
+        &ed25519_dalek::SigningKey,
+    ) -> anyhow::Result<hyprstream_rpc::crypto::hybrid_kem::RecipientKeypair>,
+) -> anyhow::Result<Option<hyprstream_rpc::crypto::hybrid_kem::RecipientPublic>> {
+    match derive(key) {
+        Ok(kem_kp) => Ok(Some(kem_kp.public())),
+        Err(e) if policy.uses_pq() => Err(e).context(
+            "failed to derive #mesh-kem hybrid keyAgreement identity under Hybrid policy",
+        ),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to derive #mesh-kem hybrid keyAgreement identity under Classical policy; \
+                 root DID document will publish an empty keyAgreement relationship",
+            );
+            Ok(None)
+        }
+    }
 }
 
 impl OAuthState {
@@ -651,25 +709,22 @@ impl OAuthState {
     /// with (`derive_mesh_mldsa_key`), and the node's `#mesh-kem` hybrid
     /// keyAgreement public material (S1 / #552, `derive_mesh_kem_recipient`) so
     /// peers can anchor a recipient key that matches what this node decapsulates
-    /// with. A `#mesh-kem` derivation failure is logged and leaves
-    /// `mesh_kem_public` unset — the DID document then omits `keyAgreement`
-    /// rather than publishing a key the node cannot actually use (fail-closed:
-    /// no unanchorable/unusable key is ever advertised).
-    pub fn with_signing_key(mut self, key: ed25519_dalek::SigningKey) -> Self {
+    /// with. A `#mesh-kem` derivation failure is fail-closed under Hybrid
+    /// policy: startup returns an error rather than publishing a root DID
+    /// document with an empty `keyAgreement` relationship. Under Classical
+    /// policy, the failure is logged and `mesh_kem_public` stays unset.
+    pub fn with_signing_key(
+        mut self,
+        key: ed25519_dalek::SigningKey,
+        policy: hyprstream_rpc::crypto::CryptoPolicy,
+    ) -> anyhow::Result<Self> {
         let pq_sk = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&key);
         self.mesh_pq_verifying_key = Some(hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq_sk));
-        match hyprstream_rpc::node_identity::derive_mesh_kem_recipient(&key) {
-            Ok(kem_kp) => self.mesh_kem_public = Some(kem_kp.public()),
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    "failed to derive #mesh-kem hybrid keyAgreement identity; \
-                     root DID document will omit keyAgreement",
-                );
-            }
-        }
+        self.mesh_kem_public = mesh_kem_public_for_policy(&key, policy, |key| {
+            hyprstream_rpc::node_identity::derive_mesh_kem_recipient(key)
+        })?;
         self.signing_key = Some(key);
-        self
+        Ok(self)
     }
 
     /// Inject a pre-built token store implementation.

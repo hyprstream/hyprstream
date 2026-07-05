@@ -527,6 +527,7 @@ impl Spawnable for OAuthService {
                 &self.config,
             );
             info!("ML-DSA-65 signing key rotation store loaded");
+            let crypto_policy = hyprstream_rpc::envelope::envelope_policy_from_env();
 
             // MAC #547 / B2 (#674): construct the S6 grant-path audit sink. A
             // startup-time snapshot of the active ML-DSA-65 key (rotation
@@ -536,7 +537,6 @@ impl Spawnable for OAuthService {
             // decides whether the PQ layer is REQUIRED (fail-closed if the key
             // snapshot comes back empty) or ignored (Classical).
             let audit_sink: Option<Arc<dyn crate::mac::audit::AuditSink>> = {
-                let crypto_policy = hyprstream_rpc::envelope::envelope_policy_from_env();
                 let audit_pq_key = ml_dsa_store.active_key().await;
                 let signer = crate::mac::audit::cose::OwnedCoseAuditSigner::new(
                     Arc::new(self.signing_key.clone()),
@@ -632,7 +632,9 @@ impl Spawnable for OAuthService {
             if let Some(ds) = device_store_opt {
                 oauth_state = oauth_state.with_device_store(ds);
             }
-            oauth_state = oauth_state.with_signing_key(self.signing_key.clone());
+            oauth_state = oauth_state
+                .with_signing_key(self.signing_key.clone(), crypto_policy)
+                .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("{e:#}")))?;
             if let Some(key) = ca_jwt_key {
                 oauth_state = oauth_state.with_ca_jwt_key(key);
             }
