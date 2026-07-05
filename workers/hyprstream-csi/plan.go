@@ -83,6 +83,9 @@ func buildMountPlan(cfg config, req *csi.NodePublishVolumeRequest) (mountPlan, e
 	if mounter != "kernel" && mounter != "fuse" {
 		return mountPlan{}, fmt.Errorf("mounter must be kernel or fuse, got %q", mounter)
 	}
+	if endpoint == "" {
+		return mountPlan{}, errors.New("transport endpoint is required; configure csi.transport.endpoint or the volume endpoint attribute")
+	}
 	if namespacePath == "" || !strings.HasPrefix(namespacePath, "/") {
 		return mountPlan{}, fmt.Errorf("namespacePath must be absolute, got %q", namespacePath)
 	}

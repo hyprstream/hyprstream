@@ -16,6 +16,8 @@ Mounters:
   with the ticket as `uname=`.
 
 The transport is a dial-time carrier. The Phase-1 FUSE client supports raw
-`vsock`, `unix`, and `tcp` dial targets. `webtransport` / iroh-QUIC is the
+`vsock`, `unix`, and `tcp` dial targets, and requires an operator-provided
+node-local listener/bridge endpoint. `webtransport` / iroh-QUIC is the
 cross-node target once the node bridge/dialer lands; UDS is only for co-located
-nodes.
+nodes. The kernel mounter is opt-in until the `hyprstream-csi-bridge` binary
+ships.

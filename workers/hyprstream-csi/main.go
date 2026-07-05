@@ -49,7 +49,7 @@ func main() {
 	flag.StringVar(&cfg.oauthAudience, "oauth-audience", "hyprstream-9p", "audience key for CSI service account tokenRequests")
 	flag.StringVar(&cfg.mountTicketURL, "mount-ticket-url", "http://hyprstream-oauth:6791/oauth/mount-ticket", "hyprstream /oauth/mount-ticket endpoint")
 	flag.StringVar(&cfg.transportCarrier, "transport-carrier", "tcp", "dial-time carrier")
-	flag.StringVar(&cfg.transportEndpoint, "transport-endpoint", "tcp://127.0.0.1:564", "carrier endpoint")
+	flag.StringVar(&cfg.transportEndpoint, "transport-endpoint", "", "carrier endpoint")
 	flag.StringVar(&cfg.bridgeListen, "bridge-listen", "127.0.0.1:0", "node-local stream bridge listen address")
 	flag.BoolVar(&cfg.dryRun, "dry-run", false, "plan NodePublishVolume without executing mounts")
 	flag.Parse()

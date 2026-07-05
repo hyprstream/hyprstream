@@ -103,6 +103,30 @@ func TestBuildMountPlanRejectsPlaintextTicketAttribute(t *testing.T) {
 	}
 }
 
+func TestBuildMountPlanRequiresTransportEndpoint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(mountTicketResponse{Ticket: "ticket"})
+	}))
+	defer srv.Close()
+
+	_, err := buildMountPlan(config{
+		defaultMounter: "fuse",
+		defaultPlane:   "webtransport",
+		oauthAudience:  "hyprstream-9p",
+		mountTicketURL: srv.URL,
+	}, &csi.NodePublishVolumeRequest{
+		VolumeId:   "vol",
+		TargetPath: "/mnt/x",
+		VolumeContext: map[string]string{
+			attrNamespacePath: "/tenant/a",
+			attrServiceTokens: `{"hyprstream-9p":{"token":"pod-token","expirationTimestamp":"2026-07-05T19:00:00Z"}}`,
+		},
+	})
+	if err == nil {
+		t.Fatal("expected transport endpoint requirement")
+	}
+}
+
 func TestBuildMountPlanRequiresProjectedServiceAccountToken(t *testing.T) {
 	_, err := buildMountPlan(config{
 		oauthAudience:  "hyprstream-9p",

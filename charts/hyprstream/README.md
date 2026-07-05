@@ -133,10 +133,17 @@ Set `csi.enabled=true` to install the `csi.hyprstream.io` node plugin for K3b
 - `mounter=fuse` uses the hypr9p FUSE->9P client and dials the selected carrier
   directly.
 
-The transport is a dial-time carrier, not a storage contract. `webtransport` /
-iroh-QUIC is the normal cross-node path, `vsock` is for Kata, and UDS is only a
-co-located DaemonSet corner case. The chart renders two StorageClasses by
-default when CSI is enabled: `hyprstream-9p-kernel` and `hyprstream-9p-fuse`.
+The transport is a dial-time carrier, not a storage contract. Phase 1 requires
+operators to set `csi.transport.endpoint` to a node-local 9P listener/bridge
+that the FUSE client can dial, such as `vsock://<cid>:564`, `unix:///path`, or
+`tcp://host:port`. `webtransport` / iroh-QUIC is the normal cross-node target
+once the node bridge/dialer lands; UDS is only a co-located DaemonSet corner
+case.
+
+By default the chart renders only the FUSE StorageClass
+`hyprstream-9p-fuse`. The kernel v9fs StorageClass is opt-in
+(`csi.storageClasses.kernel.enabled=true`) until the node-local `trans=fd`
+bridge binary ships.
 
 ## Image assumption
 

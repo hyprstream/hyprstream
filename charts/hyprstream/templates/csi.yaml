@@ -110,7 +110,7 @@ spec:
             - --oauth-audience={{ .Values.csi.oauth.audience }}
             - --mount-ticket-url={{ .Values.csi.oauth.mountTicketUrl }}
             - --transport-carrier={{ .Values.csi.transport.carrier }}
-            - --transport-endpoint={{ .Values.csi.transport.endpoint }}
+            - --transport-endpoint={{ required "csi.transport.endpoint is required when csi.enabled=true; point it at a node-local 9P listener/bridge such as vsock://<cid>:564, unix:///path, or tcp://host:port" .Values.csi.transport.endpoint }}
             - --bridge-listen={{ .Values.csi.transport.bridgeListen }}
             - --log-level={{ .Values.csi.logLevel }}
           securityContext:
