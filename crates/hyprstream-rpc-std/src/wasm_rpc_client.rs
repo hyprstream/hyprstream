@@ -275,7 +275,7 @@ impl WasmStreamHandle {
     }
 
     /// Cancel the stream via authenticated ctrl channel.
-    pub async fn cancel(&self) -> Result<(), JsError> {
+    pub async fn cancel(&mut self) -> Result<(), JsError> {
         self.inner.cancel().await
             .map_err(|e| JsError::new(&e.to_string()))
     }
