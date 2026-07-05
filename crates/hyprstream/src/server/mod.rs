@@ -34,6 +34,13 @@ pub fn extract_user(auth_user: Option<&Extension<AuthenticatedUser>>) -> String 
 
 /// Create the main application router
 pub fn create_app(state: ServerState) -> Router {
+    // H1b (#765): register the 9P-over-WebTransport handler for the QUIC
+    // path-mux `/9p` arm, co-located with H1a's axum `/9p` WS route below so
+    // both planes share one `ServerState` (export mount + ticket validator).
+    // Idempotent; the per-service QUIC endpoint (built in `hyprstream-service`,
+    // which can't depend on this crate) picks it up via the process-global.
+    routes::ninep::register_ninep_wt_handler(state.clone());
+
     // Clone config for middleware
     let cors_config = state.config.cors.clone();
     let timeout_duration = Duration::from_secs(state.config.request_timeout_secs);
@@ -53,6 +60,14 @@ pub fn create_app(state: ServerState) -> Router {
         .route(
             "/.well-known/export9p",
             get(routes::ninep::export9p_metadata),
+        )
+        // Wire-plane discovery table (#821 / epic #809): enumerates every
+        // non-file wire plane (9p, moq, …) → its current path + carriers, the
+        // source of truth a client resolves the `/9p` selector against instead
+        // of a hardcoded constant. Companions (does not replace) export9p.
+        .route(
+            "/.well-known/planes",
+            get(routes::ninep::wire_planes_metadata),
         )
         .route("/9p", get(routes::ninep::ninep_ws));
 

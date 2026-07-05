@@ -1,6 +1,6 @@
 //! Git object utilities for GitTorrent SHA256 operations
 
-use crate::{types::{GitHash, Sha256Hash, GitRefs}, Result, Error};
+use crate::{types::{GitHash, ObjectFormat, Sha256Hash, GitRefs}, Result, Error};
 use crate::crypto::hash::sha256_git;
 use std::path::Path;
 use std::collections::HashMap;
@@ -263,8 +263,15 @@ pub fn parse_commit_object(data: &[u8]) -> Result<CommitObject> {
     })
 }
 
-/// Parse a tree object from git format
-pub fn parse_tree_object(data: &[u8]) -> Result<TreeObject> {
+/// Parse a tree object from git format.
+///
+/// Tree entries store the referenced OID in **binary** form, which is not
+/// self-describing: a SHA-1 repository uses 20-byte OIDs and a SHA-256
+/// repository uses 32-byte OIDs. The caller must supply the repository's
+/// [`ObjectFormat`] — typically derived from the tree object's own hash
+/// (`GitHash::object_format`) — so the entries are sliced at the correct
+/// width instead of a hardcoded 20.
+pub fn parse_tree_object(data: &[u8], format: ObjectFormat) -> Result<TreeObject> {
     // Parse git object header: "tree <size>\0<content>"
     let null_pos = data.iter().position(|&b| b == 0)
         .ok_or_else(|| Error::other("Invalid git object format"))?;
@@ -301,9 +308,10 @@ pub fn parse_tree_object(data: &[u8]) -> Result<TreeObject> {
             _ => return Err(Error::other(format!("Unknown tree entry mode: {mode_str}"))),
         };
 
-        // Hash is either 20 bytes (SHA1) or 32 bytes (SHA256) after the null terminator
-        // Git currently uses SHA1 (20 bytes), but may switch to SHA256 (32 bytes) in the future
-        let hash_size = 20; // SHA1 for now
+        // Hash is 20 bytes (SHA1) or 32 bytes (SHA256) after the null terminator.
+        // The width is not encoded in the tree object itself, so it comes from the
+        // repository's object format (carried in by the caller).
+        let hash_size = format.hash_len();
         if content.len() < null_pos + 1 + hash_size {
             return Err(Error::other("Tree entry missing hash"));
         }
@@ -342,8 +350,12 @@ pub fn parse_blob_object(data: &[u8]) -> Result<Vec<u8>> {
     Ok(data[null_pos + 1..].to_vec())
 }
 
-/// Parse object references from git object data
-pub fn parse_object_references(object_data: &[u8]) -> Result<Vec<GitHash>> {
+/// Parse object references from git object data.
+///
+/// `format` is the repository's object format, needed to slice binary tree
+/// entries at the correct OID width. Callers derive it from the hash of the
+/// object being parsed (`GitHash::object_format`).
+pub fn parse_object_references(object_data: &[u8], format: ObjectFormat) -> Result<Vec<GitHash>> {
     // Determine object type and parse accordingly
     let null_pos = object_data.iter().position(|&b| b == 0)
         .ok_or_else(|| Error::other("Invalid git object format"))?;
@@ -356,7 +368,7 @@ pub fn parse_object_references(object_data: &[u8]) -> Result<Vec<GitHash>> {
         refs.extend(commit.parent_hashes);
         Ok(refs)
     } else if header.starts_with("tree ") {
-        let tree = parse_tree_object(object_data)?;
+        let tree = parse_tree_object(object_data, format)?;
         Ok(tree.entries.into_iter().map(|e| e.hash).collect())
     } else {
         // Blobs and tags don't reference other objects
@@ -531,7 +543,8 @@ pub fn checkout_tree<'a>(
     let tree_record = dht.get_object(tree_key).await?
         .ok_or_else(|| crate::Error::not_found("Tree not found"))?;
 
-    let tree = parse_tree_object(&tree_record.data)?;
+    // Tree entries use the same object format as the tree's own hash.
+    let tree = parse_tree_object(&tree_record.data, tree_hash.object_format())?;
 
     for entry in tree.entries {
         let entry_path = path.join(&entry.name);
@@ -815,11 +828,79 @@ pub async fn restore_git_refs(repo_path: &Path, refs: &GitRefs) -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use git2::Repository;
     use tempfile::TempDir;
     use std::fs;
+
+    /// Build the raw bytes of a git tree object with a single entry whose OID
+    /// is `oid` bytes wide, e.g. `"tree <size>\0100644 file\0<oid...>"`.
+    fn make_tree_object(name: &str, oid: &[u8]) -> Vec<u8> {
+        let mut content = Vec::new();
+        content.extend_from_slice(b"100644 ");
+        content.extend_from_slice(name.as_bytes());
+        content.push(0);
+        content.extend_from_slice(oid);
+
+        let mut object = format!("tree {}\0", content.len()).into_bytes();
+        object.extend_from_slice(&content);
+        object
+    }
+
+    #[test]
+    fn test_parse_tree_object_sha256_oid() {
+        // A SHA-256 repository stores 32-byte OIDs in tree entries.
+        let oid = [0xABu8; 32];
+        let object = make_tree_object("modern.txt", &oid);
+
+        let tree = parse_tree_object(&object, ObjectFormat::Sha256).unwrap();
+        assert_eq!(tree.entries.len(), 1);
+        let entry = &tree.entries[0];
+        assert_eq!(entry.name, "modern.txt");
+        assert_eq!(entry.hash, GitHash::Sha256(oid));
+        assert_eq!(entry.hash.to_hex(), hex::encode(oid));
+    }
+
+    #[test]
+    fn test_parse_tree_object_sha1_oid() {
+        // A SHA-1 repository stores 20-byte OIDs; the legacy path must still work.
+        let oid = [0x11u8; 20];
+        let object = make_tree_object("legacy.txt", &oid);
+
+        let tree = parse_tree_object(&object, ObjectFormat::Sha1).unwrap();
+        assert_eq!(tree.entries.len(), 1);
+        let entry = &tree.entries[0];
+        assert_eq!(entry.name, "legacy.txt");
+        assert_eq!(entry.hash, GitHash::Sha1(oid));
+    }
+
+    #[test]
+    fn test_parse_tree_object_sha256_with_sha1_width_is_wrong() {
+        // Regression guard for the hardcoded-20 bug: parsing a 32-byte-OID tree
+        // as SHA-1 must NOT silently yield the correct 32-byte hash.
+        let oid = [0xABu8; 32];
+        let object = make_tree_object("modern.txt", &oid);
+
+        // Parsing at the wrong (20-byte) width must not silently recover the
+        // correct 32-byte hash: it either errors or yields a corrupt entry.
+        // Threading the real object format is what avoids this.
+        if let Ok(tree) = parse_tree_object(&object, ObjectFormat::Sha1) {
+            assert_ne!(tree.entries[0].hash, GitHash::Sha256(oid));
+        }
+    }
+
+    #[test]
+    fn test_object_format_hash_len() {
+        assert_eq!(ObjectFormat::Sha1.hash_len(), 20);
+        assert_eq!(ObjectFormat::Sha256.hash_len(), 32);
+        assert_eq!(GitHash::Sha1([0u8; 20]).object_format(), ObjectFormat::Sha1);
+        assert_eq!(
+            GitHash::Sha256([0u8; 32]).object_format(),
+            ObjectFormat::Sha256
+        );
+    }
 
     #[tokio::test]
     async fn test_extract_objects() -> std::result::Result<(), Box<dyn std::error::Error>> {
