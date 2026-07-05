@@ -79,9 +79,48 @@ Secrets created by the bootstrap/wizard flow or an external-secrets controller.
 `HYPRSTREAM__OAUTH__ISSUER_URL` and must match the issuer stamped into the
 pre-generated service JWTs.
 
-## Extension hooks (separate issues — not implemented here)
+## Observability (K1b, #784)
 
-- `observability.*` → **#784 (K1b)**: OTel Collector → Prometheus exposition.
+`observability.enabled=true` (default off) deploys a standalone **OpenTelemetry
+Collector** (Deployment + ConfigMap + Service) and wires every service to push
+OTLP traces to it (`HYPRSTREAM_OTEL_ENABLE=true`, `OTEL_EXPORTER_OTLP_ENDPOINT`,
+and per-Deployment `OTEL_SERVICE_NAME`).
+
+hyprstream's `otel` feature is OTLP-**push**, **traces only** — it has no native
+`/metrics` surface (an explicit non-goal of #784). The collector closes that gap:
+its `spanmetrics` connector derives RED metrics (request rate / errors / latency)
+from the incoming spans and its `prometheus` exporter exposes them for scraping.
+
+```bash
+helm install hyprstream charts/hyprstream --set observability.enabled=true \
+  --namespace hyprstream --create-namespace
+kubectl -n hyprstream port-forward svc/hyprstream-otel-collector 8889:8889
+curl http://localhost:8889/metrics    # hyprstream_traces_span_metrics_calls_total, ..._duration_milliseconds_*
+```
+
+The `spanmetrics` connector emits `traces.span.metrics.calls` (counter) and
+`..duration` (histogram); the prometheus exporter's `namespace` prefixes them,
+so the scrapeable series are `hyprstream_traces_span_metrics_calls_total` and
+`hyprstream_traces_span_metrics_duration_milliseconds_{bucket,count,sum}`,
+labelled by `service_name` plus the configured `dimensions` (route/method/status).
+
+| Value | Default | Purpose |
+|-------|---------|---------|
+| `observability.enabled` | `false` | Master toggle (env wiring + collector). |
+| `observability.otelExporterOtlpEndpoint` | `""` | Override; empty ⇒ the in-cluster collector Service. |
+| `observability.collector.enabled` | `true` | Deploy the bundled collector (false ⇒ env-only, point at an external one). |
+| `observability.collector.image.*` | contrib `0.128.0` | Contrib distro (needed for `spanmetrics`). |
+| `observability.collector.ports.prometheus` | `8889` | Prometheus exposition port (`/metrics`). |
+| `observability.collector.prometheusNamespace` | `hyprstream` | Metric name prefix. |
+| `observability.collector.dimensions` | route/method/status | Span attrs promoted to metric labels. |
+| `observability.collector.serviceMonitor.enabled` | `false` | Emit a kube-prometheus-stack `ServiceMonitor` (needs the Prometheus Operator CRD). |
+
+**Autoscaling signal (K6a, #792).** The `/metrics` endpoint is the scaling signal
+source: point `prometheus-adapter` or the KEDA prometheus scaler at it to drive an
+HPA on e.g. `hyprstream_traces_span_metrics_calls_total` request rate. Which spans hyprstream emits
+today (and which scaling signals — stream backpressure/queue depth, tokens/s —
+still need instrumentation) are tracked as follow-ups under #792; this chart only
+delivers the exposition surface.
 
 ## Image assumption
 

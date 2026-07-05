@@ -48,11 +48,15 @@ spec:
           envFrom:
             - configMapRef:
                 name: {{ include "hyprstream.fullname" $root }}-config
-          {{- if or $svc.env (and $root.Values.keyBootstrap.enabled $root.Values.keyBootstrap.issuerUrl) }}
+          {{- if or $svc.env $root.Values.observability.enabled (and $root.Values.keyBootstrap.enabled $root.Values.keyBootstrap.issuerUrl) }}
           env:
             {{- range $k, $v := $svc.env }}
             - name: {{ $k }}
               value: {{ $v | quote }}
+            {{- end }}
+            {{- if $root.Values.observability.enabled }}
+            - name: OTEL_SERVICE_NAME
+              value: {{ include "hyprstream.svcName" $ctx | quote }}
             {{- end }}
             {{- if and $root.Values.keyBootstrap.enabled $root.Values.keyBootstrap.issuerUrl }}
             - name: HYPRSTREAM__OAUTH__ISSUER_URL

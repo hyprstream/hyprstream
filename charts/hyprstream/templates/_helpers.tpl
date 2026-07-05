@@ -65,6 +65,25 @@ Usage: include "hyprstream.svcName" (dict "root" $ "name" $name)
 {{- end }}
 
 {{/*
+OTel Collector object name: <fullname>-otel-collector.
+*/}}
+{{- define "hyprstream.collectorName" -}}
+{{- printf "%s-otel-collector" (include "hyprstream.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+The OTLP endpoint services push traces to. Explicit override wins; otherwise the
+in-cluster collector Service (gRPC/tonic on the OTLP gRPC port).
+*/}}
+{{- define "hyprstream.otlpEndpoint" -}}
+{{- if .Values.observability.otelExporterOtlpEndpoint -}}
+{{- .Values.observability.otelExporterOtlpEndpoint -}}
+{{- else -}}
+{{- printf "http://%s:%v" (include "hyprstream.collectorName" .) .Values.observability.collector.ports.otlpGrpc -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Resolve the container image for a service, applying the per-service variant
 suffix. Usage: include "hyprstream.image" (dict "root" $ "svc" $svc)
 */}}

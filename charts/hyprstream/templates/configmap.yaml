@@ -24,8 +24,9 @@ data:
   {{- end }}
   {{- end }}
   {{- if .Values.observability.enabled }}
-  # TODO(#784): observability wiring populates OTEL_EXPORTER_OTLP_ENDPOINT here.
-  {{- with .Values.observability.otelExporterOtlpEndpoint }}
-  OTEL_EXPORTER_OTLP_ENDPOINT: {{ . | quote }}
-  {{- end }}
+  # K1b (#784): turn on the OTLP trace exporter and point it at the collector.
+  # hyprstream only exports OTLP when HYPRSTREAM_OTEL_ENABLE=true (main.rs); the
+  # collector derives Prometheus-scrapeable RED metrics from those spans.
+  HYPRSTREAM_OTEL_ENABLE: "true"
+  OTEL_EXPORTER_OTLP_ENDPOINT: {{ include "hyprstream.otlpEndpoint" . | quote }}
   {{- end }}
