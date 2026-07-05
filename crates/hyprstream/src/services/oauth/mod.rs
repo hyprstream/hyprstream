@@ -40,6 +40,7 @@ pub mod jwks;
 pub mod jwt_bearer;
 pub mod login_page;
 pub mod metadata;
+pub mod mount_ticket;
 pub mod oauth2_userinfo;
 pub mod oidc_callback;
 pub mod oidc_discovery;
@@ -49,6 +50,7 @@ pub mod revocation;
 pub mod scim;
 pub mod scim_types;
 pub mod session;
+pub mod spiffe;
 pub mod state;
 pub mod token;
 pub mod token_exchange;
@@ -104,6 +106,7 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             "/.well-known/openid-configuration",
             get(metadata::openid_configuration),
         )
+        .route("/.well-known/spiffe/bundle", get(spiffe::spiffe_bundle))
         .route(
             "/.well-known/openid-federation",
             get(federation_entity::entity_configuration),
@@ -115,6 +118,7 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
         )
         .route("/oauth/par", post(par::push_authorization_request))
         .route("/oauth/token", post(token::exchange_token))
+        .route("/oauth/spiffe/wit", post(spiffe::exchange_workload_wit))
         .route("/oauth/jwks", get(jwks::jwks))
         .route("/oauth/device", post(device::device_authorize))
         .route(
@@ -148,6 +152,14 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
     let protected_router = Router::new()
         .route("/oauth/introspect", post(introspection::introspect_token))
         .route("/oauth/wit", post(wit_bootstrap::issue_browser_wit))
+        .route(
+            "/oauth/mount-ticket",
+            post(mount_ticket::issue_mount_ticket),
+        )
+        .route(
+            "/oauth/spiffe/service-svid",
+            post(spiffe::issue_service_svid),
+        )
         .route(
             "/oauth/userinfo",
             get(userinfo::userinfo).post(userinfo::userinfo),
