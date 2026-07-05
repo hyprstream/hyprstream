@@ -1355,10 +1355,10 @@ mod tests {
             &self,
             uname: &str,
         ) -> std::result::Result<hyprstream_rpc::Subject, hyprstream_vfs::MountError> {
-            if uname == "good-ticket" {
-                Ok(hyprstream_rpc::Subject::new("alice"))
-            } else {
-                Err(hyprstream_vfs::MountError::PermissionDenied("bad ticket".into()))
+            match uname {
+                "good-ticket" => Ok(hyprstream_rpc::Subject::new("alice")),
+                "other-ticket" => Ok(hyprstream_rpc::Subject::new("bob")),
+                _ => Err(hyprstream_vfs::MountError::PermissionDenied("bad ticket".into())),
             }
         }
     }
@@ -1418,6 +1418,24 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(errno_from_error(&err), EACCES, "missing ticket must be EACCES");
+    }
+
+    /// A second attach may repeat the same ticket, but it must not re-scope the
+    /// session to a different valid Subject.
+    #[tokio::test]
+    async fn second_attach_conflicting_ticket_denied() {
+        let t = authorized_translator();
+        let (_, resp) = t
+            .handle_message(&msg::tattach(1, 0, u32::MAX, "good-ticket", ""))
+            .await
+            .unwrap();
+        assert!(matches!(resp, Response::Attach { .. }), "got {resp:?}");
+
+        let err = t
+            .handle_message(&msg::tattach(2, 0, u32::MAX, "other-ticket", ""))
+            .await
+            .unwrap_err();
+        assert_eq!(errno_from_error(&err), EACCES, "conflicting attach must be EACCES");
     }
 
     /// Fail-closed: an op arriving before a successful attach binds the Subject
