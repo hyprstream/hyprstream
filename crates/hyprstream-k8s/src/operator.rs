@@ -852,6 +852,7 @@ fn serving_plan(service: &InferenceService, tenant: &str, config: &OperatorConfi
                             "service",
                             "start",
                             "oai",
+                            "--foreground",
                             "--model", service.spec.model,
                             "--tenant", tenant,
                         ],
@@ -862,7 +863,7 @@ fn serving_plan(service: &InferenceService, tenant: &str, config: &OperatorConfi
                         "resources": serving_resources(config),
                         "readinessProbe": {
                             "httpGet": {
-                                "path": "/healthz/ready",
+                                "path": "/health",
                                 "port": "http",
                             },
                             "periodSeconds": 10,
@@ -870,7 +871,7 @@ fn serving_plan(service: &InferenceService, tenant: &str, config: &OperatorConfi
                         },
                         "livenessProbe": {
                             "httpGet": {
-                                "path": "/healthz/live",
+                                "path": "/health",
                                 "port": "http",
                             },
                             "periodSeconds": 30,
@@ -1794,6 +1795,7 @@ mod tests {
                 "service",
                 "start",
                 "oai",
+                "--foreground",
                 "--model",
                 "qwen:main",
                 "--tenant",
@@ -1808,7 +1810,12 @@ mod tests {
         assert_eq!(
             deployment["spec"]["template"]["spec"]["containers"][0]["readinessProbe"]["httpGet"]
                 ["path"],
-            "/healthz/ready"
+            "/health"
+        );
+        assert_eq!(
+            deployment["spec"]["template"]["spec"]["containers"][0]["livenessProbe"]["httpGet"]
+                ["path"],
+            "/health"
         );
     }
 
