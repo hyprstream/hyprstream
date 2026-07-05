@@ -109,26 +109,26 @@ enum StreamFidState {
 /// and `ctl` pseudo-files. Reading from `data` blocks until the next verified
 /// payload arrives via the StreamHandle.
 ///
-/// Wasm-only: the `Mount` `read`/`write` path awaits [`StreamHandle`] methods,
-/// which return `!Send` futures (`#[async_trait(?Send)]` on the trait). Making
-/// this mount a native (`Send`) `Mount` requires `StreamHandle`'s futures to be
-/// `Send` — a separate change in `hyprstream-rpc`'s stream transport, tracked
-/// outside T3. `StreamRegistry`/`StreamEntry` above are target-agnostic so the
-/// generic service mount can register streams on any target.
-#[cfg(target_arch = "wasm32")]
+/// Native + wasm (#670): the `Mount` `read`/`write` path awaits
+/// [`StreamHandle`] methods, which now return `Send` futures (the
+/// `StreamHandle` trait dropped its `?Send`). That lets this mount be a
+/// genuinely `Send + Sync` `Mount` on native — served to a Cloud Hypervisor
+/// guest or any native namespace — while `#[async_trait(?Send)]` on wasm keeps
+/// the browser path working. `StreamRegistry`/`StreamEntry` above are
+/// target-agnostic so the generic service mount can register streams on any
+/// target.
 pub struct StreamMount {
     registry: std::sync::Arc<StreamRegistry>,
 }
 
-#[cfg(target_arch = "wasm32")]
 impl StreamMount {
     pub fn new(registry: std::sync::Arc<StreamRegistry>) -> Self {
         Self { registry }
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-#[async_trait(?Send)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl Mount for StreamMount {
     async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
         let state = match components {
@@ -206,8 +206,7 @@ impl Mount for StreamMount {
                 // Read next verified payload (await without holding borrow)
                 let result = handle.next_payload().await;
 
-                // Put handle back
-                let is_completed = handle.is_completed();
+                // Put handle back (its completion state is tracked internally).
                 {
                     let mut streams = self.registry.lock();
                     if let Some(entry) = streams.get_mut(topic.as_str()) {
@@ -290,7 +289,7 @@ impl Mount for StreamMount {
                 match cmd {
                     "cancel" => {
                         if let Some(entry) = self.registry.remove(topic) {
-                            if let Some(handle) = entry.handle {
+                            if let Some(mut handle) = entry.handle {
                                 let _ = handle.cancel().await;
                             }
                         }
@@ -363,4 +362,52 @@ impl Mount for StreamMount {
     }
 
     async fn clunk(&self, _fid: Fid, _caller: &Subject) {}
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+// #670: these assertions are meaningful only on native, where `StreamMount` is
+// `Send + Sync` and the `Mount::read` future must be `Send`. On wasm the mount
+// is `#[async_trait(?Send)]` by design (JS-backed transport), so gate them out.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn assert_send_sync<T: Send + Sync>() {}
+    fn assert_send<F: std::future::Future + Send>(_f: F) {}
+
+    /// #670: `StreamMount` and its registry must be a native `Send + Sync`
+    /// `Mount`, so it can live behind `Arc<dyn Mount>` and be served from a
+    /// multi-threaded runtime / to a CH guest.
+    #[test]
+    fn stream_mount_is_native_send_sync() {
+        assert_send_sync::<StreamMount>();
+        assert_send_sync::<StreamRegistry>();
+
+        // Usable as a shared `Arc<dyn Mount>` — the whole point of un-gating it.
+        fn takes_mount(_m: std::sync::Arc<dyn Mount>) {}
+        let reg = std::sync::Arc::new(StreamRegistry::new());
+        takes_mount(std::sync::Arc::new(StreamMount::new(reg)));
+    }
+
+    /// The `read` future itself must be `Send` — this is exactly what #670
+    /// unblocks. `read`'s `Data` branch holds a `Box<dyn StreamHandle>` across
+    /// `handle.next_payload().await`; if `StreamHandle`'s futures regressed to
+    /// `!Send` the whole `read` future would be `!Send` and this stops
+    /// compiling, regardless of which match arm runs at runtime.
+    #[test]
+    fn stream_mount_read_future_is_send() {
+        let reg = std::sync::Arc::new(StreamRegistry::new());
+        let mount = StreamMount::new(reg);
+        assert_send(async move {
+            let fid = Fid::new(StreamFidState::Data {
+                topic: "topic".to_string(),
+            });
+            let caller = Subject::anonymous();
+            let _ = mount.read(&fid, 0, 0, &caller).await;
+        });
+    }
 }
