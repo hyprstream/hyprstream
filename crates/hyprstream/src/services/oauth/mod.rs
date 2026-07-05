@@ -594,6 +594,12 @@ impl Spawnable for OAuthService {
                     );
                     let store_arc = Arc::new(store);
 
+                    // Publish the current Ed25519 rotation-slot verifying keys to the
+                    // process-shared handle so the OAI/HTTP validator (`verify_token_claims`)
+                    // accepts tokens signed by any active/lead/drain slot from startup —
+                    // before the first rotation tick. Mirrors the /oauth/jwks key set.
+                    crate::auth::key_rotation::refresh_ed25519_verifying_keys(&store_arc).await;
+
                     // Spawn the background rotation task (rotates all algorithm stores).
                     crate::auth::key_rotation::spawn_rotation_task(
                         Arc::clone(&oauth_config_arc),
