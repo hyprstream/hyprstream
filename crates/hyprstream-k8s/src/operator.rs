@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
 use futures::StreamExt;
+use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use kube::api::{ListParams, Patch, PatchParams};
 use kube::core::NamespaceResourceScope;
 use kube::runtime::controller::Action;
@@ -63,6 +64,22 @@ pub struct OperatorConfig {
     pub gpu_count: u32,
     /// Memory request for serving pods.
     pub serving_memory_request: String,
+    /// Optional KServe adapter settings. Disabled unless values/config enable it
+    /// and discovery confirms the `serving.kserve.io` CRDs exist.
+    pub kserve_adapter: KserveAdapterConfig,
+}
+
+/// Values-gated KServe adapter configuration.
+#[derive(Clone, Debug)]
+pub struct KserveAdapterConfig {
+    /// Whether values/config requested KServe adapter mode.
+    pub enabled: bool,
+    /// Whether startup discovery observed KServe CRDs in the cluster.
+    pub discovered: bool,
+    /// Name of the KServe ClusterServingRuntime registered for hyprstream.
+    pub runtime_name: String,
+    /// Image used by the KServe runtime container.
+    pub runtime_image: String,
 }
 
 impl Default for OperatorConfig {
@@ -80,6 +97,18 @@ impl Default for OperatorConfig {
             gpu_resource_name: "nvidia.com/gpu".to_owned(),
             gpu_count: 1,
             serving_memory_request: "16Gi".to_owned(),
+            kserve_adapter: KserveAdapterConfig::default(),
+        }
+    }
+}
+
+impl Default for KserveAdapterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            discovered: false,
+            runtime_name: "hyprstream-openai".to_owned(),
+            runtime_image: "ghcr.io/hyprstream/hyprstream:latest".to_owned(),
         }
     }
 }
@@ -115,6 +144,14 @@ pub struct TrainingRunObservation {
 pub struct ServingPlan {
     pub apply: Vec<Value>,
     pub prune: Vec<Value>,
+    pub kserve: Option<KserveAdapterPlan>,
+}
+
+/// Optional KServe projection for clusters that standardize on KServe.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KserveAdapterPlan {
+    pub cluster_serving_runtime: Value,
+    pub inference_service: Value,
 }
 
 /// Result observed after reconciling an InferenceService serving plan.
@@ -942,8 +979,8 @@ fn serving_plan(service: &InferenceService, tenant: &str, config: &OperatorConfi
                     service,
                     &app,
                     &namespace,
-                    labels,
-                    owner_references,
+                    labels.clone(),
+                    owner_references.clone(),
                     max_replicas,
                     &config.prometheus_server,
                     &config.request_rate_threshold,
@@ -960,8 +997,8 @@ fn serving_plan(service: &InferenceService, tenant: &str, config: &OperatorConfi
                 hpa(
                     &app,
                     &namespace,
-                    labels,
-                    owner_references,
+                    labels.clone(),
+                    owner_references.clone(),
                     min_replicas,
                     max_replicas,
                     config,
@@ -975,9 +1012,32 @@ fn serving_plan(service: &InferenceService, tenant: &str, config: &OperatorConfi
             )
         };
 
+    let kserve = kserve_adapter_plan_if_discovered(
+        service,
+        tenant,
+        &app,
+        &namespace,
+        config,
+        labels.clone(),
+        owner_references.clone(),
+    );
+
+    if let Some(kserve) = kserve {
+        let apply = vec![
+            kserve.cluster_serving_runtime.clone(),
+            kserve.inference_service.clone(),
+        ];
+        return ServingPlan {
+            apply,
+            prune: native_serving_prunes(&app, &namespace),
+            kserve: Some(kserve),
+        };
+    }
+
     ServingPlan {
         apply: vec![deployment, service_manifest, http_route, autoscaler],
         prune: prunes,
+        kserve: None,
     }
 }
 
@@ -1203,6 +1263,136 @@ fn prune_manifest(api_version: &str, kind: &str, name: &str, namespace: &str) ->
         },
         "hyprstream.io/action": "delete",
     })
+}
+
+fn native_serving_prunes(app: &str, namespace: &str) -> Vec<Value> {
+    vec![
+        prune_manifest("apps/v1", "Deployment", app, namespace),
+        prune_manifest("v1", "Service", app, namespace),
+        prune_manifest("gateway.networking.k8s.io/v1", "HTTPRoute", app, namespace),
+        prune_manifest("autoscaling/v2", "HorizontalPodAutoscaler", app, namespace),
+        prune_manifest("keda.sh/v1alpha1", "ScaledObject", app, namespace),
+    ]
+}
+
+fn kserve_adapter_plan_if_discovered(
+    service: &InferenceService,
+    tenant: &str,
+    app: &str,
+    namespace: &str,
+    config: &OperatorConfig,
+    labels: Value,
+    owner_references: Value,
+) -> Option<KserveAdapterPlan> {
+    if !(config.kserve_adapter.enabled && config.kserve_adapter.discovered) {
+        return None;
+    }
+
+    let statefulness = statefulness_value(&service.spec.statefulness);
+    let mut min_replicas = effective_min_replicas(service);
+    let raw_deployment_scale_to_zero = min_replicas == 0;
+    min_replicas = min_replicas.max(1);
+    let max_replicas = service.spec.max_replicas.max(min_replicas.max(1));
+    let runtime_name = &config.kserve_adapter.runtime_name;
+    let runtime_image = &config.kserve_adapter.runtime_image;
+
+    let cluster_serving_runtime = json!({
+        "apiVersion": "serving.kserve.io/v1alpha1",
+        "kind": "ClusterServingRuntime",
+        "metadata": {
+            "name": runtime_name,
+            "labels": {
+                MANAGED_BY_LABEL: MANAGED_BY_VALUE,
+                "hyprstream.io/origin": "serving.hyprstream.io",
+            },
+            "annotations": {
+                "hyprstream.io/lifecycle": "shared-cluster-runtime",
+                "hyprstream.io/owner-scope": "cluster",
+            },
+        },
+        "spec": {
+            "supportedModelFormats": [{
+                "name": "hyprstream",
+                "version": "v1alpha1",
+                "autoSelect": false,
+            }],
+            "protocolVersions": ["v2"],
+            "containers": [{
+                "name": "kserve-container",
+                "image": runtime_image,
+                "args": [
+                    "service",
+                    "start",
+                    "oai",
+                ],
+                "ports": [{
+                    "containerPort": 8080,
+                    "protocol": "TCP",
+                }],
+            }],
+        },
+    });
+
+    let inference_service = json!({
+        "apiVersion": "serving.kserve.io/v1beta1",
+        "kind": "InferenceService",
+        "metadata": {
+            "name": app,
+            "namespace": namespace,
+            "labels": labels,
+            "annotations": {
+                "hyprstream.io/origin": "serving.hyprstream.io",
+                "hyprstream.io/source-inferenceservice": service.name_any(),
+                "hyprstream.io/model-ref": service.spec.model,
+                "hyprstream.io/statefulness": statefulness,
+                "hyprstream.io/rawdeployment-min-replicas": min_replicas.to_string(),
+                "hyprstream.io/rawdeployment-scale-to-zero": if raw_deployment_scale_to_zero { "unsupported" } else { "not-requested" },
+                "serving.kserve.io/deploymentMode": "RawDeployment",
+            },
+            "ownerReferences": owner_references,
+        },
+        "spec": {
+            "predictor": {
+                "model": {
+                    "modelFormat": {
+                        "name": "hyprstream",
+                    },
+                    "runtime": runtime_name,
+                    "storageUri": format!("hyprstream://{}", service.spec.model),
+                    "args": [
+                        "--model", service.spec.model,
+                        "--tenant", tenant,
+                    ],
+                    "env": [{
+                        "name": "MODEL_REF",
+                        "value": service.spec.model,
+                    }],
+                },
+                "minReplicas": min_replicas,
+                "maxReplicas": max_replicas,
+            },
+        },
+    });
+
+    Some(KserveAdapterPlan {
+        cluster_serving_runtime,
+        inference_service,
+    })
+}
+
+/// Probe the cluster for the KServe CRDs that this adapter needs before enabling
+/// KServe projection in `OperatorConfig`.
+pub async fn kserve_adapter_discovered(client: Client) -> Result<bool, OperatorError> {
+    let crds: Api<CustomResourceDefinition> = Api::all(client);
+    let inferenceservices = crds
+        .get("inferenceservices.serving.kserve.io")
+        .await
+        .is_ok();
+    let cluster_runtimes = crds
+        .get("clusterservingruntimes.serving.kserve.io")
+        .await
+        .is_ok();
+    Ok(inferenceservices && cluster_runtimes)
 }
 
 async fn ensure_operator_label<K>(
@@ -1884,5 +2074,162 @@ mod tests {
 
         assert_eq!(status.phase.as_deref(), Some("ScaledToZero"));
         assert_eq!(status.ready_replicas, Some(0));
+    }
+
+    fn kserve_config(enabled: bool, discovered: bool) -> OperatorConfig {
+        OperatorConfig {
+            kserve_adapter: KserveAdapterConfig {
+                enabled,
+                discovered,
+                runtime_name: "hyprstream-runtime".to_owned(),
+                runtime_image: "example.com/hyprstream:serve".to_owned(),
+            },
+            ..OperatorConfig::default()
+        }
+    }
+
+    fn required_kserve_plan(plan: ServingPlan) -> KserveAdapterPlan {
+        match plan.kserve {
+            Some(kserve) => kserve,
+            None => panic!("missing kserve plan"),
+        }
+    }
+
+    #[test]
+    fn kserve_adapter_stays_dormant_without_discovery() {
+        let service = inference_service("chat", Statefulness::Stateless, 1);
+        let requested_but_missing = serving_plan(&service, "tenant-a", &kserve_config(true, false));
+        let discovered_but_disabled =
+            serving_plan(&service, "tenant-a", &kserve_config(false, true));
+
+        assert!(requested_but_missing.kserve.is_none());
+        assert!(discovered_but_disabled.kserve.is_none());
+    }
+
+    #[test]
+    fn kserve_adapter_registers_tenant_neutral_hyprstream_runtime() {
+        let service = inference_service("chat", Statefulness::Stateless, 1);
+        let plan = serving_plan(&service, "tenant-a", &kserve_config(true, true));
+        let kserve = required_kserve_plan(plan);
+
+        assert_eq!(
+            kserve.cluster_serving_runtime["apiVersion"],
+            "serving.kserve.io/v1alpha1"
+        );
+        assert_eq!(
+            kserve.cluster_serving_runtime["kind"],
+            "ClusterServingRuntime"
+        );
+        assert_eq!(
+            kserve.cluster_serving_runtime["metadata"]["name"],
+            "hyprstream-runtime"
+        );
+        assert_eq!(
+            kserve.cluster_serving_runtime["spec"]["containers"][0]["image"],
+            "example.com/hyprstream:serve"
+        );
+        assert_eq!(
+            kserve.cluster_serving_runtime["spec"]["supportedModelFormats"][0]["name"],
+            "hyprstream"
+        );
+        assert_eq!(
+            kserve.cluster_serving_runtime["metadata"]["annotations"]["hyprstream.io/lifecycle"],
+            "shared-cluster-runtime"
+        );
+        assert_eq!(
+            kserve.cluster_serving_runtime["spec"]["containers"][0]["args"],
+            json!(["service", "start", "oai"])
+        );
+        assert!(kserve.cluster_serving_runtime["spec"]["containers"][0]
+            .get("env")
+            .is_none());
+    }
+
+    #[test]
+    fn kserve_adapter_translates_to_kserve_inferenceservice() {
+        let service = inference_service("chat", Statefulness::Stateless, 1);
+        let plan = serving_plan(&service, "tenant-a", &kserve_config(true, true));
+        let translated = required_kserve_plan(plan).inference_service;
+
+        assert_eq!(translated["apiVersion"], "serving.kserve.io/v1beta1");
+        assert_eq!(translated["kind"], "InferenceService");
+        assert_eq!(translated["metadata"]["name"], "hs-serve-chat");
+        assert_eq!(
+            translated["metadata"]["annotations"]["hyprstream.io/origin"],
+            "serving.hyprstream.io"
+        );
+        assert!(translated["metadata"]["annotations"]
+            .get("hyprstream.io/openai-endpoint")
+            .is_none());
+        assert_eq!(
+            translated["spec"]["predictor"]["model"]["runtime"],
+            "hyprstream-runtime"
+        );
+        assert_eq!(
+            translated["spec"]["predictor"]["model"]["storageUri"],
+            "hyprstream://qwen:main"
+        );
+        assert_eq!(
+            translated["spec"]["predictor"]["model"]["args"],
+            json!(["--model", "qwen:main", "--tenant", "tenant-a"])
+        );
+    }
+
+    #[test]
+    fn kserve_adapter_stateful_min_replicas_is_one() {
+        let service = inference_service("chat", Statefulness::TttStateful, 0);
+        let plan = serving_plan(&service, "tenant-a", &kserve_config(true, true));
+        let translated = required_kserve_plan(plan).inference_service;
+
+        assert_eq!(translated["spec"]["predictor"]["minReplicas"], 1);
+        assert_eq!(
+            translated["metadata"]["annotations"]["hyprstream.io/statefulness"],
+            "ttt-stateful"
+        );
+    }
+
+    #[test]
+    fn kserve_adapter_stateless_rawdeployment_clamps_min_replicas() {
+        let service = inference_service("embed", Statefulness::Stateless, 0);
+        let plan = serving_plan(&service, "tenant-a", &kserve_config(true, true));
+        let translated = required_kserve_plan(plan).inference_service;
+
+        assert_eq!(translated["spec"]["predictor"]["minReplicas"], 1);
+        assert_eq!(
+            translated["metadata"]["annotations"]["hyprstream.io/statefulness"],
+            "stateless"
+        );
+        assert_eq!(
+            translated["metadata"]["annotations"]["hyprstream.io/rawdeployment-scale-to-zero"],
+            "unsupported"
+        );
+    }
+
+    #[test]
+    fn kserve_adapter_suppresses_native_serving_plan() {
+        let service = inference_service("chat", Statefulness::Stateless, 1);
+        let plan = serving_plan(&service, "tenant-a", &kserve_config(true, true));
+
+        assert!(plan.kserve.is_some());
+        assert_eq!(
+            plan.apply
+                .iter()
+                .map(|apply| &apply["kind"])
+                .collect::<Vec<_>>(),
+            vec![&json!("ClusterServingRuntime"), &json!("InferenceService")]
+        );
+        assert_eq!(
+            plan.prune
+                .iter()
+                .map(|prune| &prune["kind"])
+                .collect::<Vec<_>>(),
+            vec![
+                &json!("Deployment"),
+                &json!("Service"),
+                &json!("HTTPRoute"),
+                &json!("HorizontalPodAutoscaler"),
+                &json!("ScaledObject"),
+            ]
+        );
     }
 }
