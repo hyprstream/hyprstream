@@ -25,6 +25,8 @@ use crate::scheduling;
 
 use anyhow::Result;
 use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use parking_lot::RwLock;
@@ -44,6 +46,7 @@ const LIVENESS_TTL: Duration = Duration::from_secs(45);
 /// large bound doesn't cost anything until it's actually full.
 const LIVENESS_CACHE_MAX_ENTRIES: usize = 16_384;
 const LIVENESS_CACHE_REAP_BUDGET: usize = 32;
+const ANNOUNCED_ENDPOINT_TTL: Duration = Duration::from_secs(90);
 
 /// Default bound applied to `queryCandidates` when the caller passes
 /// `maxCandidates == 0` (unspecified) — keeps an unscoped query from returning
@@ -349,10 +352,172 @@ impl DiscoveryService {
 #[async_trait]
 impl Resolver for DiscoveryService {
     async fn resolve(&self, name: &str, kind: SocketKind) -> anyhow::Result<TransportConfig> {
-        // Delegate to the global EndpointRegistry (D9: non-panicking).
-        // In the future this will query internal state directly
-        // (once EndpointRegistry is owned by DiscoveryService).
+        if let Some(transport) = self.resolve_announced_endpoint(name, kind)? {
+            return Ok(transport);
+        }
+
+        // Cross-pod QUIC peers must come from fresh service announcements. The
+        // registry fallback for QUIC is a non-dialable bootstrap placeholder.
+        if kind == SocketKind::Quic {
+            anyhow::bail!("no fresh announced QUIC endpoint for service '{name}'");
+        }
+
         Ok(self.reg()?.endpoint(name, kind))
+    }
+}
+
+impl DiscoveryService {
+    fn resolve_announced_endpoint(
+        &self,
+        name: &str,
+        kind: SocketKind,
+    ) -> anyhow::Result<Option<TransportConfig>> {
+        let wanted = socket_kind_to_string(kind);
+        let announced = self.announced_endpoints.read();
+        let Some(endpoints) = announced.get(name) else {
+            return Ok(None);
+        };
+
+        let Some(endpoint) = endpoints
+            .iter()
+            .filter(|ep| ep.socket_kind == wanted)
+            .find(|ep| ep.last_heartbeat.elapsed() <= ANNOUNCED_ENDPOINT_TTL)
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(announced_endpoint_to_transport(endpoint)?))
+    }
+}
+
+fn announced_endpoint_to_transport(endpoint: &AnnouncedEndpoint) -> anyhow::Result<TransportConfig> {
+    match endpoint.socket_kind.as_str() {
+        "quic" => parse_announced_quic(&endpoint.endpoint),
+        "iroh" => parse_announced_iroh(&endpoint.endpoint),
+        _ => Ok(TransportConfig::from_endpoint(&endpoint.endpoint)),
+    }
+}
+
+fn parse_announced_quic(endpoint: &str) -> anyhow::Result<TransportConfig> {
+    let rest = endpoint
+        .strip_prefix("quic://")
+        .ok_or_else(|| anyhow::anyhow!("announced QUIC endpoint must start with quic://"))?;
+    let (server_name, addr) = rest
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("announced QUIC endpoint must be quic://<server-name>:<socket-addr>"))?;
+    anyhow::ensure!(!server_name.is_empty(), "announced QUIC endpoint is missing server name");
+    let addr = SocketAddr::from_str(addr)
+        .map_err(|e| anyhow::anyhow!("invalid announced QUIC socket address '{addr}': {e}"))?;
+    anyhow::ensure!(addr.port() != 0, "announced QUIC endpoint must not use port 0");
+    Ok(TransportConfig::quic(addr, server_name).with_connect_mode())
+}
+
+fn parse_announced_iroh(endpoint: &str) -> anyhow::Result<TransportConfig> {
+    let hex = endpoint
+        .strip_prefix("iroh://")
+        .ok_or_else(|| anyhow::anyhow!("announced iroh endpoint must start with iroh://"))?;
+    anyhow::ensure!(hex.len() == 64, "announced iroh node id must be 32 bytes of hex");
+    let mut node_id = [0u8; 32];
+    for (idx, byte) in node_id.iter_mut().enumerate() {
+        let start = idx * 2;
+        *byte = u8::from_str_radix(&hex[start..start + 2], 16)
+            .map_err(|e| anyhow::anyhow!("invalid announced iroh node id hex: {e}"))?;
+    }
+    Ok(TransportConfig::iroh(node_id, Vec::new(), None))
+}
+
+#[cfg(test)]
+mod resolver_tests {
+    use super::*;
+    use hyprstream_rpc::transport::{BindMode, EndpointType};
+
+    fn service() -> DiscoveryService {
+        let (sk, vk) = hyprstream_rpc::crypto::generate_signing_keypair();
+        DiscoveryService::new(
+            Arc::new(sk),
+            vk,
+            TransportConfig::inproc("resolver-test"),
+        )
+    }
+
+    #[tokio::test]
+    async fn resolver_uses_fresh_announced_quic_endpoint() {
+        let svc = service();
+        svc.announced_endpoints.write().insert(
+            "model".to_owned(),
+            vec![AnnouncedEndpoint {
+                socket_kind: "quic".to_owned(),
+                endpoint: "quic://model.hyprstream.svc.cluster.local:10.96.0.42:4433".to_owned(),
+                service_jwt: "jwt".to_owned(),
+                last_heartbeat: Instant::now(),
+            }],
+        );
+
+        let transport = match svc.resolve("model", SocketKind::Quic).await {
+            Ok(transport) => transport,
+            Err(err) => panic!("fresh announced QUIC endpoint must resolve: {err}"),
+        };
+        assert_eq!(transport.bind_mode(), BindMode::Connect);
+        match transport.endpoint {
+            EndpointType::Quic { addr, server_name, .. } => {
+                assert_eq!(server_name, "model.hyprstream.svc.cluster.local");
+                assert_eq!(addr, SocketAddr::from(([10, 96, 0, 42], 4433)));
+            }
+            other => panic!("expected announced QUIC endpoint, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolver_rejects_missing_announced_quic_endpoint() {
+        let err = match service().resolve("model", SocketKind::Quic).await {
+            Ok(transport) => panic!("missing announced QUIC endpoint resolved to {transport:?}"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("no fresh announced QUIC endpoint"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_rejects_stale_announced_quic_endpoint() {
+        let svc = service();
+        svc.announced_endpoints.write().insert(
+            "model".to_owned(),
+            vec![AnnouncedEndpoint {
+                socket_kind: "quic".to_owned(),
+                endpoint: "quic://model.hyprstream.svc.cluster.local:10.96.0.42:4433".to_owned(),
+                service_jwt: "jwt".to_owned(),
+                last_heartbeat: Instant::now() - (ANNOUNCED_ENDPOINT_TTL + Duration::from_secs(1)),
+            }],
+        );
+
+        let err = match svc.resolve("model", SocketKind::Quic).await {
+            Ok(transport) => panic!("stale announced QUIC endpoint resolved to {transport:?}"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("no fresh announced QUIC endpoint"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn announced_iroh_endpoint_parses_to_transport() {
+        let node_hex = "0707070707070707070707070707070707070707070707070707070707070707";
+        let transport = match parse_announced_iroh(&format!("iroh://{node_hex}")) {
+            Ok(transport) => transport,
+            Err(err) => panic!("valid iroh endpoint must parse: {err}"),
+        };
+        assert_eq!(transport.bind_mode(), BindMode::Connect);
+        match transport.endpoint {
+            EndpointType::Iroh { node_id, direct_addrs, relay_url } => {
+                assert_eq!(node_id, [7u8; 32]);
+                assert!(direct_addrs.is_empty());
+                assert!(relay_url.is_none());
+            }
+            other => panic!("expected iroh endpoint, got {other:?}"),
+        }
     }
 }
 
