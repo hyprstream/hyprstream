@@ -4,12 +4,13 @@
 //! hyprstream RPC calls, then reflect observed git/runtime truth back into
 //! status. They are deliberately not a second writer of model weights.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
 use futures::StreamExt;
-use kube::api::{Patch, PatchParams};
+use kube::api::{ListParams, Patch, PatchParams};
 use kube::core::NamespaceResourceScope;
 use kube::runtime::controller::Action;
 use kube::runtime::{watcher, Controller};
@@ -34,12 +35,15 @@ const ADAPTER_KIND: &str = "Adapter";
 pub struct OperatorConfig {
     /// Requeue interval after a successful reconcile.
     pub requeue: Duration,
+    /// Maximum age of the namespace -> tenant cache.
+    pub tenant_binding_cache_ttl: Duration,
 }
 
 impl Default for OperatorConfig {
     fn default() -> Self {
         Self {
             requeue: Duration::from_secs(300),
+            tenant_binding_cache_ttl: Duration::from_secs(60),
         }
     }
 }
@@ -83,6 +87,7 @@ pub struct OperatorState<R> {
     client: Client,
     rpc: Arc<R>,
     config: OperatorConfig,
+    tenant_bindings: TenantBindingCache,
 }
 
 impl<R> OperatorState<R>
@@ -94,8 +99,20 @@ where
             client,
             rpc,
             config,
+            tenant_bindings: TenantBindingCache::default(),
         }
     }
+}
+
+#[derive(Clone, Default)]
+struct TenantBindingCache {
+    inner: Arc<tokio::sync::RwLock<CachedTenantBindings>>,
+}
+
+#[derive(Default)]
+struct CachedTenantBindings {
+    refreshed_at: Option<Instant>,
+    tenants_by_namespace: HashMap<String, String>,
 }
 
 /// Operator runtime errors surfaced into status conditions and logs.
@@ -106,6 +123,9 @@ pub enum OperatorError {
 
     #[error("namespace {namespace} is not bound to a hyprstream tenant")]
     TenantBindingMissing { namespace: String },
+
+    #[error("namespace {namespace} has multiple TenantBindings: {bindings}")]
+    TenantBindingDuplicate { namespace: String, bindings: String },
 
     #[error("kubernetes API error: {0}")]
     Kube(#[from] kube::Error),
@@ -178,6 +198,9 @@ async fn reconcile_model<R>(
 where
     R: HyprstreamOperatorRpc,
 {
+    if model_status_observed_current(model.as_ref()) {
+        return Ok(Action::requeue(state.config.requeue));
+    }
     ensure_operator_label(&state.client, model.as_ref(), MODEL_KIND).await?;
     let outcome = evaluate_model(model.as_ref(), state.as_ref()).await;
     patch_model_status(
@@ -196,6 +219,9 @@ async fn reconcile_adapter<R>(
 where
     R: HyprstreamOperatorRpc,
 {
+    if adapter_status_observed_current(adapter.as_ref()) {
+        return Ok(Action::requeue(state.config.requeue));
+    }
     ensure_operator_label(&state.client, adapter.as_ref(), ADAPTER_KIND).await?;
     let outcome = evaluate_adapter(adapter.as_ref(), state.as_ref()).await;
     patch_adapter_status(
@@ -236,7 +262,7 @@ async fn evaluate_model<R>(
 where
     R: HyprstreamOperatorRpc,
 {
-    let tenant = tenant_for_resource(&state.client, MODEL_KIND, model).await?;
+    let tenant = tenant_for_resource(state, MODEL_KIND, model).await?;
     state.rpc.reconcile_model(&tenant, model).await
 }
 
@@ -247,34 +273,129 @@ async fn evaluate_adapter<R>(
 where
     R: HyprstreamOperatorRpc,
 {
-    let tenant = tenant_for_resource(&state.client, ADAPTER_KIND, adapter).await?;
+    let tenant = tenant_for_resource(state, ADAPTER_KIND, adapter).await?;
     state.rpc.reconcile_adapter(&tenant, adapter).await
 }
 
-async fn tenant_for_resource<K>(
-    client: &Client,
+async fn tenant_for_resource<R, K>(
+    state: &OperatorState<R>,
     kind: &'static str,
     resource: &K,
 ) -> Result<String, OperatorError>
 where
+    R: HyprstreamOperatorRpc,
     K: Resource + ResourceExt,
 {
     let name = resource.name_any();
     let namespace = resource
         .namespace()
         .ok_or_else(|| OperatorError::MissingNamespace { kind, name })?;
-    tenant_for_namespace(client, &namespace).await
+    state.tenant_for_namespace(&namespace).await
 }
 
-async fn tenant_for_namespace(client: &Client, namespace: &str) -> Result<String, OperatorError> {
-    let bindings: Api<TenantBinding> = Api::all(client.clone());
-    let list = bindings.list(&Default::default()).await?;
-    list.into_iter()
-        .find(|binding| binding.spec.namespace == namespace)
-        .map(|binding| binding.spec.tenant)
-        .ok_or_else(|| OperatorError::TenantBindingMissing {
-            namespace: namespace.to_owned(),
-        })
+impl<R> OperatorState<R>
+where
+    R: HyprstreamOperatorRpc,
+{
+    async fn tenant_for_namespace(&self, namespace: &str) -> Result<String, OperatorError> {
+        if let Some(tenant) = self
+            .tenant_bindings
+            .get_fresh(namespace, self.config.tenant_binding_cache_ttl)
+            .await
+        {
+            return Ok(tenant);
+        }
+
+        let bindings: Api<TenantBinding> = Api::all(self.client.clone());
+        let list = bindings.list(&ListParams::default()).await?;
+        let tenants_by_namespace = tenant_map(list)?;
+        self.tenant_bindings
+            .replace(tenants_by_namespace, Instant::now())
+            .await;
+        self.tenant_bindings
+            .get_any(namespace)
+            .await
+            .ok_or_else(|| OperatorError::TenantBindingMissing {
+                namespace: namespace.to_owned(),
+            })
+    }
+}
+
+impl TenantBindingCache {
+    async fn get_fresh(&self, namespace: &str, ttl: Duration) -> Option<String> {
+        let cache = self.inner.read().await;
+        let fresh = cache
+            .refreshed_at
+            .is_some_and(|refreshed_at| refreshed_at.elapsed() <= ttl);
+        if fresh {
+            cache.tenants_by_namespace.get(namespace).cloned()
+        } else {
+            None
+        }
+    }
+
+    async fn get_any(&self, namespace: &str) -> Option<String> {
+        self.inner
+            .read()
+            .await
+            .tenants_by_namespace
+            .get(namespace)
+            .cloned()
+    }
+
+    async fn replace(&self, tenants_by_namespace: HashMap<String, String>, refreshed_at: Instant) {
+        let mut cache = self.inner.write().await;
+        cache.refreshed_at = Some(refreshed_at);
+        cache.tenants_by_namespace = tenants_by_namespace;
+    }
+}
+
+fn tenant_map(
+    bindings: impl IntoIterator<Item = TenantBinding>,
+) -> Result<HashMap<String, String>, OperatorError> {
+    let mut tenants = HashMap::new();
+    let mut owners: HashMap<String, Vec<String>> = HashMap::new();
+
+    for binding in bindings {
+        let namespace = binding.spec.namespace.clone();
+        owners
+            .entry(namespace.clone())
+            .or_default()
+            .push(binding.name_any());
+        tenants
+            .entry(namespace)
+            .or_insert_with(|| binding.spec.tenant.clone());
+    }
+
+    if let Some((namespace, bindings)) = owners
+        .into_iter()
+        .find(|(_namespace, bindings)| bindings.len() > 1)
+    {
+        let mut bindings = bindings;
+        bindings.sort();
+        return Err(OperatorError::TenantBindingDuplicate {
+            namespace,
+            bindings: bindings.join(","),
+        });
+    }
+
+    Ok(tenants)
+}
+
+fn model_status_observed_current(model: &Model) -> bool {
+    model
+        .status
+        .as_ref()
+        .and_then(|status| status.observed_generation)
+        == model.meta().generation
+}
+
+fn adapter_status_observed_current(adapter: &Adapter) -> bool {
+    adapter
+        .status
+        .as_ref()
+        .and_then(|status| status.observed_generation)
+        == adapter.meta().generation
 }
 
 fn status_for_model_outcome(
@@ -419,7 +540,7 @@ fn group_for_kind(kind: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AdapterSpec, ModelSpec, ModelStage};
+    use crate::{AdapterSpec, ModelSpec, ModelStage, TenantBindingSpec};
 
     #[test]
     fn model_success_status_reports_observed_ref() {
@@ -537,5 +658,76 @@ mod tests {
         assert_eq!(patch["apiVersion"], "models.hyprstream.io/v1alpha1");
         assert_eq!(patch["kind"], "Adapter");
         assert_eq!(patch["status"]["observedFile"], "00_style.safetensors");
+    }
+
+    #[test]
+    fn current_generation_status_short_circuits_reconcile() {
+        let mut model = Model::new(
+            "qwen",
+            ModelSpec {
+                repo: "hf://org/qwen".to_owned(),
+                git_ref: Some("main".to_owned()),
+                stage: ModelStage::Promoted,
+            },
+        );
+        model.metadata.generation = Some(7);
+        model.status = Some(ModelStatus {
+            observed_generation: Some(7),
+            ..Default::default()
+        });
+
+        assert!(model_status_observed_current(&model));
+
+        model.status = Some(ModelStatus {
+            observed_generation: Some(6),
+            ..Default::default()
+        });
+        assert!(!model_status_observed_current(&model));
+    }
+
+    #[test]
+    fn tenant_map_rejects_duplicate_namespace_bindings() {
+        let first = TenantBinding::new(
+            "tenant-a",
+            TenantBindingSpec {
+                namespace: "team-a".to_owned(),
+                tenant: "did:web:tenant-a".to_owned(),
+            },
+        );
+        let second = TenantBinding::new(
+            "tenant-b",
+            TenantBindingSpec {
+                namespace: "team-a".to_owned(),
+                tenant: "did:web:tenant-b".to_owned(),
+            },
+        );
+
+        let error = match tenant_map([first, second]) {
+            Ok(_) => panic!("duplicate must fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            OperatorError::TenantBindingDuplicate { namespace, .. } if namespace == "team-a"
+        ));
+    }
+
+    #[test]
+    fn tenant_map_is_namespace_keyed() {
+        let binding = TenantBinding::new(
+            "tenant-a",
+            TenantBindingSpec {
+                namespace: "team-a".to_owned(),
+                tenant: "did:web:tenant-a".to_owned(),
+            },
+        );
+
+        match tenant_map([binding]) {
+            Ok(tenants) => assert_eq!(
+                tenants.get("team-a").map(String::as_str),
+                Some("did:web:tenant-a")
+            ),
+            Err(error) => panic!("valid binding failed: {error}"),
+        }
     }
 }
