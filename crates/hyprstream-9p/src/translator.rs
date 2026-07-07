@@ -304,7 +304,9 @@ impl Translator {
         let (tag, req) = parse_request(buf).context("decode 9P T-message")?;
         let resp = match req {
             Request::Version { msize, version } => self.handle_version(msize, version),
-            Request::Attach { fid, uname, .. } => self.handle_attach(fid, &uname).await?,
+            Request::Attach { fid, uname, aname, .. } => {
+                self.handle_attach(fid, &uname, &aname).await?
+            }
             // Flush is intercepted in serve_connection before reaching here;
             // this arm is unreachable but kept exhaustive.
             Request::Flush { .. } => Response::Clunk,
@@ -339,12 +341,14 @@ impl Translator {
         Response::Version { msize, version: "9P2000.L".into() }
     }
 
-    async fn handle_attach(&self, fid: u32, uname: &str) -> Result<Response> {
+    async fn handle_attach(&self, fid: u32, uname: &str, aname: &str) -> Result<Response> {
         // Establish the session first: on the attach-time ticket path (H1b) this
         // validates `uname` and binds the session Subject; on the fixed-subject
-        // path it is a no-op. A denied ticket returns here and is mapped to an
-        // Rlerror by the serve loop — before any fid or mount handle exists.
-        self.backend.attach(uname).await?;
+        // path it is a no-op. `aname` is preserved as the protocol export
+        // selector so backends can authorize/select a root at attach time. A
+        // denied ticket or export returns here and is mapped to an Rlerror by
+        // the serve loop — before any fid or mount handle exists.
+        self.backend.attach(uname, aname).await?;
         // Attach establishes the root fid. Walk the empty path to materialize
         // a root qid from the backend, then record it.
         let walk = self.backend.walk(fid, fid, &[]).await?;
@@ -820,6 +824,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attach_preserves_aname_for_backend() {
+        use parking_lot::Mutex;
+
+        struct RecordingBackend {
+            seen: Mutex<Option<(String, String)>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Backend for RecordingBackend {
+            async fn attach(&self, uname: &str, aname: &str) -> Result<()> {
+                *self.seen.lock() = Some((uname.to_owned(), aname.to_owned()));
+                Ok(())
+            }
+
+            async fn walk(
+                &self,
+                _fid: u32,
+                _newfid: u32,
+                _components: &[String],
+            ) -> Result<crate::backend::WalkResult> {
+                Ok(crate::backend::WalkResult {
+                    qids: vec![sample_qid(0x80, 1)],
+                })
+            }
+
+            async fn open(&self, _fid: u32, _flags: u32) -> Result<crate::backend::OpenResult> {
+                unimplemented!("not used by aname regression test")
+            }
+
+            async fn read(&self, _fid: u32, _offset: u64, _count: u32) -> Result<Vec<u8>> {
+                unimplemented!("not used by aname regression test")
+            }
+
+            async fn write(&self, _fid: u32, _offset: u64, _data: &[u8]) -> Result<u32> {
+                unimplemented!("not used by aname regression test")
+            }
+
+            async fn stat(&self, _fid: u32) -> Result<crate::backend::StatResult> {
+                unimplemented!("not used by aname regression test")
+            }
+
+            async fn readdir(&self, _fid: u32, _offset: u64, _count: u32) -> Result<Vec<u8>> {
+                unimplemented!("not used by aname regression test")
+            }
+
+            async fn clunk(&self, _fid: u32) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let backend = Arc::new(RecordingBackend { seen: Mutex::new(None) });
+        let t = Translator::new(backend.clone());
+        let (_, resp) = t
+            .handle_message(&msg::tattach(
+                1,
+                0,
+                u32::MAX,
+                "mount-ticket",
+                "export:models/qwen",
+            ))
+            .await
+            .unwrap();
+
+        assert!(matches!(resp, Response::Attach { .. }));
+        assert_eq!(
+            *backend.seen.lock(),
+            Some(("mount-ticket".to_owned(), "export:models/qwen".to_owned()))
+        );
+    }
+
+    #[tokio::test]
     async fn attach_then_walk_open_read_clunk() {
         let backend = MemoryBackend::default();
         backend.add_file("/hello.txt", b"hello world");
@@ -1122,11 +1197,14 @@ mod tests {
         async fn authorize(
             &self,
             uname: &str,
+            aname: &str,
         ) -> std::result::Result<hyprstream_rpc::Subject, hyprstream_vfs::MountError> {
-            if uname == "good-ticket" {
+            if uname == "good-ticket" && (aname.is_empty() || aname == "default") {
                 Ok(hyprstream_rpc::Subject::new("alice"))
             } else {
-                Err(hyprstream_vfs::MountError::PermissionDenied("bad ticket".into()))
+                Err(hyprstream_vfs::MountError::PermissionDenied(
+                    "bad ticket or export".into(),
+                ))
             }
         }
     }
@@ -1186,6 +1264,24 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(errno_from_error(&err), EACCES, "missing ticket must be EACCES");
+    }
+
+    /// The attach-time authorizer receives `aname`, so export selection can
+    /// fail closed before any fid is served.
+    #[tokio::test]
+    async fn attach_aname_denied_returns_eacces() {
+        let t = authorized_translator();
+        let err = t
+            .handle_message(&msg::tattach(
+                1,
+                0,
+                u32::MAX,
+                "good-ticket",
+                "forbidden-export",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(errno_from_error(&err), EACCES, "denied aname must be EACCES");
     }
 
     /// Fail-closed: an op arriving before a successful attach binds the Subject

@@ -52,18 +52,22 @@ pub struct StatResult {
 /// per walked path.
 #[async_trait]
 pub trait Backend: Send + Sync {
-    /// Establish the session at `Tattach`, given the `uname` the client
-    /// presented. The default is a no-op: backends whose caller identity is
-    /// fixed at construction (the UDS/vsock listeners) ignore `uname`.
+    /// Establish the session at `Tattach`, given the `uname` and `aname` the
+    /// client presented. The default is a no-op: backends whose caller identity
+    /// and export root are fixed at construction (the UDS/vsock listeners)
+    /// ignore both fields.
     ///
     /// A backend that resolves its caller identity from the attach itself
     /// (the H1b `/9p` WebTransport plane carries a mount ticket in
     /// `Tattach.uname` — the browser `WebSocket` can't set headers and the
     /// cert-pinned WT session has no URL query) validates it here and binds
-    /// the session `Subject`. Returning `Err` fails the attach; the translator
-    /// maps it to an `Rlerror` errno (a `hyprstream_vfs::MountError` in the
-    /// cause chain picks the errno — e.g. `PermissionDenied → EACCES`).
-    async fn attach(&self, _uname: &str) -> anyhow::Result<()> {
+    /// the session `Subject`. `aname` is the 9P attach name/export selector;
+    /// implementations may ignore it for a single-root export, or use it to
+    /// select and authorize a narrower root. Returning `Err` fails the attach;
+    /// the translator maps it to an `Rlerror` errno (a
+    /// `hyprstream_vfs::MountError` in the cause chain picks the errno — e.g.
+    /// `PermissionDenied → EACCES`).
+    async fn attach(&self, _uname: &str, _aname: &str) -> anyhow::Result<()> {
         Ok(())
     }
 
