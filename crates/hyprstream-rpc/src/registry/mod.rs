@@ -207,39 +207,74 @@ impl EndpointRegistry {
     /// the historical local fallback (`inproc` or same-host UDS), while missing
     /// QUIC/network endpoints fail closed instead of synthesizing a placeholder.
     pub fn try_endpoint(&self, name: &str, socket_kind: SocketKind) -> anyhow::Result<TransportConfig> {
+        if let Some(endpoint) = self.registered_endpoint(name, socket_kind) {
+            return Ok(endpoint);
+        }
+
+        self.local_default_endpoint(name, socket_kind)
+    }
+
+    /// Get an explicitly registered endpoint without applying any profile
+    /// fallback.
+    pub fn registered_endpoint(
+        &self,
+        name: &str,
+        socket_kind: SocketKind,
+    ) -> Option<TransportConfig> {
         if let Some(entry) = self.services.read().get(name) {
             if let Some(ep) = entry.endpoints.get(&socket_kind) {
-                return Ok(ep.clone());
+                return Some(ep.clone());
             }
         }
-
-        self.default_endpoint(name, socket_kind)
+        None
     }
 
-    /// Generate a default endpoint for a service and socket type.
-    fn default_endpoint(&self, name: &str, socket_kind: SocketKind) -> anyhow::Result<TransportConfig> {
-        if socket_kind == SocketKind::Quic {
-            anyhow::bail!(
-                "no registered QUIC endpoint for service '{name}' — network reach must be announced or explicitly registered"
-            );
+    /// Generate the legacy local default endpoint for a service and socket type.
+    ///
+    /// This remains for direct registry callers. The process-global resolver
+    /// installed by [`init`] uses explicit resolver profile types instead.
+    fn local_default_endpoint(
+        &self,
+        name: &str,
+        socket_kind: SocketKind,
+    ) -> anyhow::Result<TransportConfig> {
+        match self.mode {
+            EndpointMode::Inproc => local_inproc_endpoint(name, socket_kind),
+            EndpointMode::Ipc => same_host_uds_endpoint(name, socket_kind, self.runtime_dir.as_ref()),
         }
-        let suffix = socket_kind.suffix();
-        Ok(match self.mode {
-            EndpointMode::Inproc => {
-                TransportConfig::inproc(format!("hyprstream/{name}{suffix}"))
-            }
-            EndpointMode::Ipc => {
-                // Use normal IPC binding instead of systemd socket activation
-                let path = self
-                    .runtime_dir
-                    .as_ref()
-                    .map(|d| d.join(format!("{name}{suffix}.sock")))
-                    .unwrap_or_else(|| PathBuf::from(format!("/tmp/hyprstream/{name}{suffix}.sock")));
-                TransportConfig::ipc(path)
-            }
-        })
     }
+}
 
+fn local_inproc_endpoint(name: &str, socket_kind: SocketKind) -> anyhow::Result<TransportConfig> {
+    if socket_kind == SocketKind::Quic {
+        anyhow::bail!(
+            "no registered QUIC endpoint for service '{name}' — network reach must be announced or explicitly registered"
+        );
+    }
+    Ok(TransportConfig::inproc(format!(
+        "hyprstream/{name}{}",
+        socket_kind.suffix()
+    )))
+}
+
+fn same_host_uds_endpoint(
+    name: &str,
+    socket_kind: SocketKind,
+    runtime_dir: Option<&PathBuf>,
+) -> anyhow::Result<TransportConfig> {
+    if socket_kind == SocketKind::Quic {
+        anyhow::bail!(
+            "no registered QUIC endpoint for service '{name}' — network reach must be announced or explicitly registered"
+        );
+    }
+    let suffix = socket_kind.suffix();
+    let path = runtime_dir
+        .map(|d| d.join(format!("{name}{suffix}.sock")))
+        .unwrap_or_else(|| PathBuf::from(format!("/tmp/hyprstream/{name}{suffix}.sock")));
+    Ok(TransportConfig::ipc(path))
+}
+
+impl EndpointRegistry {
     // ========================================================================
     // Backward-compatible convenience methods (default to REP socket)
     // ========================================================================
@@ -338,6 +373,49 @@ impl crate::resolver::Resolver for EndpointRegistry {
 // Global registry
 static REGISTRY: RwLock<Option<EndpointRegistry>> = RwLock::new(None);
 
+fn registered_global_endpoint(
+    name: &str,
+    kind: SocketKind,
+) -> anyhow::Result<Option<TransportConfig>> {
+    let registry = try_global()
+        .ok_or_else(|| anyhow::anyhow!("EndpointRegistry not initialized — call init() first"))?;
+    Ok(registry.registered_endpoint(name, kind))
+}
+
+/// Explicit single-process resolver profile.
+pub struct LocalInprocResolver;
+
+#[async_trait::async_trait]
+impl crate::resolver::Resolver for LocalInprocResolver {
+    async fn resolve(&self, name: &str, kind: SocketKind) -> anyhow::Result<TransportConfig> {
+        if let Some(endpoint) = registered_global_endpoint(name, kind)? {
+            return Ok(endpoint);
+        }
+        local_inproc_endpoint(name, kind)
+    }
+}
+
+/// Explicit IPC resolver profile.
+pub struct IpcResolver {
+    runtime_dir: Option<PathBuf>,
+}
+
+impl IpcResolver {
+    pub fn new(runtime_dir: Option<PathBuf>) -> Self {
+        Self { runtime_dir }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::resolver::Resolver for IpcResolver {
+    async fn resolve(&self, name: &str, kind: SocketKind) -> anyhow::Result<TransportConfig> {
+        if let Some(endpoint) = registered_global_endpoint(name, kind)? {
+            return Ok(endpoint);
+        }
+        same_host_uds_endpoint(name, kind, self.runtime_dir.as_ref())
+    }
+}
+
 /// Initialize the global endpoint registry.
 ///
 /// Idempotent: subsequent calls are no-ops if already initialized.
@@ -349,24 +427,14 @@ static REGISTRY: RwLock<Option<EndpointRegistry>> = RwLock::new(None);
 pub fn init(mode: EndpointMode, runtime_dir: Option<PathBuf>) {
     let mut guard = REGISTRY.write();
     if guard.is_none() {
-        *guard = Some(EndpointRegistry::new(mode, runtime_dir));
-        // Also set the global Resolver so async consumers can use the trait
-        crate::resolver::set_global(Arc::new(GlobalRegistryResolver));
-    }
-}
-
-/// Adapter that delegates `Resolver` calls to the global `EndpointRegistry`.
-///
-/// Installed automatically by `init()`. Allows async callers to resolve
-/// endpoints via the `Resolver` trait without holding a lock guard.
-struct GlobalRegistryResolver;
-
-#[async_trait::async_trait]
-impl crate::resolver::Resolver for GlobalRegistryResolver {
-    async fn resolve(&self, name: &str, kind: SocketKind) -> anyhow::Result<TransportConfig> {
-        let registry = try_global()
-            .ok_or_else(|| anyhow::anyhow!("EndpointRegistry not initialized — call init() first"))?;
-        registry.try_endpoint(name, kind)
+        *guard = Some(EndpointRegistry::new(mode, runtime_dir.clone()));
+        // Also set the global Resolver so async consumers use an explicit
+        // locality profile instead of the registry's legacy direct fallback.
+        let resolver: Arc<dyn crate::resolver::Resolver> = match mode {
+            EndpointMode::Inproc => Arc::new(LocalInprocResolver),
+            EndpointMode::Ipc => Arc::new(IpcResolver::new(runtime_dir)),
+        };
+        crate::resolver::set_global(resolver);
     }
 }
 
@@ -567,6 +635,21 @@ mod tests {
     }
 
     #[test]
+    fn test_global_resolver_installs_local_inproc_profile() {
+        let _lock = TEST_MUTEX.lock();
+        reset_registry();
+        init(EndpointMode::Inproc, None);
+
+        let resolver = match crate::resolver::try_global() {
+            Some(resolver) => resolver,
+            None => panic!("global resolver must be installed"),
+        };
+        let endpoint = futures::executor::block_on(resolver.resolve("policy", SocketKind::Rep))
+            .unwrap_or_else(|err| panic!("local-inproc resolver failed: {err}"));
+        assert_eq!(endpoint.endpoint_string(), "inproc://hyprstream/policy");
+    }
+
+    #[test]
     fn test_ipc_defaults() {
         let _lock = TEST_MUTEX.lock();
         reset_registry();
@@ -579,6 +662,21 @@ mod tests {
         // REQ socket (with suffix)
         let endpoint = global().endpoint("model", SocketKind::Req);
         assert_eq!(endpoint.endpoint_string(), "ipc:///run/hyprstream/model-req.sock");
+    }
+
+    #[test]
+    fn test_global_resolver_installs_ipc_profile() {
+        let _lock = TEST_MUTEX.lock();
+        reset_registry();
+        init(EndpointMode::Ipc, Some(PathBuf::from("/run/hyprstream")));
+
+        let resolver = match crate::resolver::try_global() {
+            Some(resolver) => resolver,
+            None => panic!("global resolver must be installed"),
+        };
+        let endpoint = futures::executor::block_on(resolver.resolve("policy", SocketKind::Rep))
+            .unwrap_or_else(|err| panic!("same-host-uds resolver failed: {err}"));
+        assert_eq!(endpoint.endpoint_string(), "ipc:///run/hyprstream/policy.sock");
     }
 
     #[test]
