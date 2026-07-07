@@ -56,33 +56,28 @@ pub struct LayerProfile {
 // Tier 1: Embedded profiles (known models — zero cost)
 // ============================================================================
 
-/// Pre-computed layer analysis for Qwen3.5-0.8B (Tier 1).
+/// Embedded Tier-1 layer profile for the single ablated hybrid (full-attention
+/// + GatedDeltaNet) reference model.
 ///
 /// Data from `tnn-transformer-1/results/linearization_ablation.json`.
-/// Rank assignments based on perplexity delta (ablation gold standard).
+/// Rank assignments based on perplexity delta (the ablation gold standard);
+/// the per-layer `bond_entropy` map is intentionally empty (see `attn_layers`).
 pub fn qwen3_5_0_8b_profile() -> LayerProfile {
     // Full-attention layers: 3, 7, 11, 15, 19, 23
     // GDN layers: 0-2, 4-6, 8-10, 12-14, 16-18, 20-22
+    // (layer_idx, perplexity_delta, rank). Per-projection bond entropies used
+    // to be carried here and were dropped: the values were mistranscribed from
+    // the research source (every q_proj value held the measured k_proj, and
+    // k_proj/v_proj both held v_proj), and the weight-bond-entropy quantity is
+    // not validated against adaptation rank anyway (see `entropy_to_rank`).
+    // Embedded rank is assigned from perplexity delta, so the map was unconsumed.
     let attn_layers = [
-        // (layer_idx, perplexity_delta, rank, bond_entropies: [(name, k_entropy, v_entropy)])
-        (23usize, Some(8.40f64), 32usize, vec![
-            ("q_proj", 5.33f64), ("k_proj", 5.28f64), ("v_proj", 5.28f64),
-        ]),
-        (3usize,  Some(5.62f64), 24usize, vec![
-            ("q_proj", 5.75f64), ("k_proj", 5.85f64), ("v_proj", 5.85f64),
-        ]),
-        (19usize, Some(4.39f64), 16usize, vec![
-            ("q_proj", 5.15f64), ("k_proj", 5.56f64), ("v_proj", 5.56f64),
-        ]),
-        (15usize, Some(3.22f64), 16usize, vec![
-            ("q_proj", 5.49f64), ("k_proj", 5.83f64), ("v_proj", 5.83f64),
-        ]),
-        (7usize,  Some(2.16f64), 8usize, vec![
-            ("q_proj", 5.65f64), ("k_proj", 5.82f64), ("v_proj", 5.82f64),
-        ]),
-        (11usize, Some(1.13f64), 8usize, vec![
-            ("q_proj", 5.42f64), ("k_proj", 5.77f64), ("v_proj", 5.77f64),
-        ]),
+        (23usize, Some(8.40f64), 32usize),
+        (3usize,  Some(5.62f64), 24usize),
+        (19usize, Some(4.39f64), 16usize),
+        (15usize, Some(3.22f64), 16usize),
+        (7usize,  Some(2.16f64), 8usize),
+        (11usize, Some(1.13f64), 8usize),
     ];
     let attn_set: std::collections::HashSet<usize> =
         attn_layers.iter().map(|(i, ..)| *i).collect();
@@ -90,15 +85,13 @@ pub fn qwen3_5_0_8b_profile() -> LayerProfile {
     let mut layers: Vec<LayerAnalysis> = Vec::with_capacity(24);
 
     // Build full-attention entries
-    for (idx, ppl_delta, rank, entropies) in &attn_layers {
-        let mut entropy_map = HashMap::new();
-        for (name, e) in entropies {
-            entropy_map.insert((*name).to_owned(), *e);
-        }
+    for (idx, ppl_delta, rank) in &attn_layers {
         layers.push(LayerAnalysis {
             layer_idx: *idx,
             layer_type: LayerType::FullAttention,
-            bond_entropy: entropy_map,
+            // Empty on purpose: no validated, consumed spectral data backs the
+            // embedded entries — rank comes from perplexity delta above.
+            bond_entropy: HashMap::new(),
             perplexity_delta: *ppl_delta,
             recommended_rank: *rank,
             target_modules: vec![
@@ -239,8 +232,8 @@ pub fn bond_entropy(matrix: &Tensor) -> (f64, usize) {
     (entropy_of_nonneg(&s_sq), num_sv)
 }
 
-/// Calibration cutoffs for [`entropy_to_rank`], hand-fitted to the Qwen3.5-0.8B
-/// ablation results. They are NOT validated for any other model, and the
+/// Calibration cutoffs for [`entropy_to_rank`], hand-fitted to the single
+/// ablated reference model's results. They are NOT validated for any other model, and the
 /// mapping's premise — lower normalized spectral entropy means the layer needs
 /// more adaptation rank — is itself unproven (there are credible arguments for
 /// the opposite sign). The hard step at each cutoff is an artifact of the hand
@@ -269,7 +262,7 @@ const UNANALYZED_LAYER_ENTROPY: f64 = 0.95;
 /// GDN capacity lives in the recurrent/conv/gating parameters, which no
 /// current statistic here analyzes — the previous approach derived a rank
 /// from the spectrum of `out_proj` alone, which presented a guess as
-/// analysis. The value matches the embedded Qwen3.5-0.8B GDN rank and sits
+/// analysis. The value matches the embedded GDN rank and sits
 /// under [`UNVALIDATED_RANK_CAP`]. Revisit when GDN ablation ground truth
 /// exists.
 const GDN_LORA_RANK: usize = 4;
@@ -694,6 +687,11 @@ mod tests {
         let attn_23 = profile.layers.iter().find(|l| l.layer_idx == 23).expect("layer 23 should exist");
         assert_eq!(attn_23.recommended_rank, 32);
         assert_eq!(attn_23.layer_type, LayerType::FullAttention);
+        assert_eq!(attn_23.perplexity_delta, Some(8.40));
+        assert!(
+            attn_23.bond_entropy.is_empty(),
+            "embedded attention layers carry no spectral map — rank comes from ppl delta"
+        );
 
         let gdn_0 = profile.layers.iter().find(|l| l.layer_idx == 0).expect("layer 0 should exist");
         assert_eq!(gdn_0.recommended_rank, GDN_LORA_RANK);

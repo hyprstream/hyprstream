@@ -2,14 +2,17 @@
 
 ## Overview
 
-This document describes the runtime rank adaptation system added to hyprstream's Test-Time Training (TTT) subsystem. The system uses Selective Linearization Characterization (SLC) principles to dynamically adjust LoRA rank allocation per layer during inference, replacing the static rank assignments from TTN profiles.
+This document describes the runtime rank adaptation system added to hyprstream's Test-Time Training (TTT) subsystem. The system uses Selective Linearization Characterization (SLC) principles to dynamically adjust LoRA rank allocation per layer during inference, starting from the static per-layer ranks produced by a TTN layer profile.
 
-Four components work together:
+Three components work together:
 
 1. **Muon optimizer** — replaces AdamW for LoRA parameter updates
 2. **Narrow-based effective rank** — runtime rank control without tensor reallocation
 3. **Per-layer gradient gating** — freezes low-signal layers during multi-step TTT
-4. **W-SLC online rank allocator** — budget-constrained rank redistribution algorithms
+
+The static ranks these operate on come from a **TTN layer profile** (see [TTN Layer Profiles](#ttn-layer-profiles)) — a per-layer `recommended_rank` derived either from ablation ground truth (embedded models) or from a conservative, capped spectral-entropy estimate (everything else). A runtime `RankUtilizationTracker` then narrows the *effective* rank below that ceiling in response to observed utilization.
+
+> The W-SLC streaming rank allocator (a Python research port with a dimensionally-inconsistent `|rank − entropy|` cost term and no production call-sites) was removed in the #202 cleanup; the active W-SLC research lives in the separate Python research repo and is unaffected. Runtime rank redistribution is now solely the utilization-driven oracle below.
 
 ## Muon Optimizer
 
@@ -59,7 +62,7 @@ B: [out_features, max_rank]  →  B.narrow(1, 0, eff_rank): [out_features, eff_r
 - Saves compute — narrower matmuls when effective rank < max rank
 - Scaling auto-adjusts — `set_effective_rank()` recalculates `alpha / eff_rank`
 
-**Memory overhead:** ~16MB for Qwen3.5-0.8B (72 modules × 28 extra rank × 2048 dims × 4 bytes). Negligible.
+**Memory overhead:** ~16MB for a ~0.8B hybrid model (72 modules × 28 extra rank × 2048 dims × 4 bytes). Negligible.
 
 ## Per-Layer Gradient Gating
 
@@ -80,23 +83,43 @@ All parameters are restored to `requires_grad_(true)` after the TTT call complet
 | `min_grad_norm` | 1e-5 | L2 norm threshold for freezing |
 | `warmup_steps` | 1 | Steps before gating activates |
 
-## W-SLC Online Rank Allocator
+## TTN Layer Profiles
 
 **File:** `crates/hyprstream/src/runtime/ttn_profile.rs`
 
-Ported from `qonk/experiments/ttn-transformer/src/wasserstein_slc.py`. Three algorithms operate under a per-step budget constraint: `sum of ranks ≤ median(rank_levels) × num_layers`.
+A TTN layer profile gives every layer a `recommended_rank` — the `max_rank` the narrow-based effective-rank mechanism allocates and the oracle narrows from. Profiles resolve through a three-tier lookup in `get_layer_profile()`, in order:
 
-### Algorithms
+| Tier | Source | Cost | Trust |
+|------|--------|------|-------|
+| **1** | Embedded profile for a known model family/geometry (`find_embedded_profile`) | const lookup | **Gold standard** — ranks from ablation perplexity delta |
+| **2** | Cached profile on disk (`load_cached_profile`) | ~1ms | Treated as a persisted Tier-3 result |
+| **3** | Computed from weight spectra (`compute_weight_entropy_profile`) | ~2–5s SVD, then cached | Unvalidated — capped (see below) |
 
-**Greedy:** Assigns closest available rank to each layer's entropy, then iteratively reduces the highest-rank layer until budget is met. Fast, online-capable, good for streaming.
+### The unvalidated-rank cap
 
-**Balanced:** Averages entropy across time, assigns uniform allocation. Best when entropy is stable across requests.
+`UNVALIDATED_RANK_CAP = 8` is the ceiling on any rank not backed by ablation ground truth — Tier-3 computed ranks, the uniform fallback, and Tier-2 cache loads alike. Pre-cap or hand-edited caches that previously bypassed it are clamped on load. The cap is the same value as the uniform fallback on purpose: without validation, a spectral-entropy rank is not trusted to claim more capacity than the uninformed default. (A model with an embedded Tier-1 profile returns before the cache path, so embedded ranks are never clamped.)
 
-**Offline Optimal (DP):** Dynamic programming over the full budget space. Minimizes total |entropy - rank| cost. Requires integer budget. O(T × L × B × R) where B = budget, R = number of rank levels.
+### Why spectral entropy is a weak proxy (and treated as such)
+
+`entropy_to_rank` maps normalized weight-bond entropy to rank on the *assumed* premise that lower entropy (more structured spectrum) means a layer needs more adaptation capacity. That premise is **unvalidated**:
+
+- The linearization-resistance theory in the underlying research is about **attention-pattern** entropy, not weight-bond entropy from SVD — a different quantity the research never connected to adaptation rank.
+- On the research's own n=6 attention layers, the sign of the entropy↔importance correlation is projection-dependent: it holds for `v_proj` (r ≈ −0.73), is absent for `k_proj` (r ≈ −0.13), and **inverts** for `q_proj` (r ≈ +0.31).
+- The cutoff constants (`ENTROPY_CUTOFF_RANK_{32,16,8}`) were hand-fitted to a single ablated reference model and are not expected to generalize.
+
+This is why the cap exists and why `entropy_to_rank`'s doc comment flags the sign as assumed. A continuous, data-calibrated mapping is deferred to the rank-proxy validation spike (#842 → #844), which must test the sign per-projection on more than one model.
+
+### GatedDeltaNet layers
+
+GDN layers receive a fixed `GDN_LORA_RANK = 4` rather than an entropy-derived rank. GDN adaptation capacity lives in the recurrent/conv/gating parameters, which the weight-spectrum pipeline does not model; deriving a rank from `out_proj`'s spectrum alone presented a guess as analysis. (This matches the embedded GDN rank and sits under the cap.) No SVD is computed for GDN layers — they are the majority of a hybrid stack, so skipping them is also the dominant profiling-speed win.
+
+### Embedded profile honesty
+
+The embedded profile carries `perplexity_delta` per attention layer (the consumed, ablation-derived input to `recommended_rank`) but its `bond_entropy` maps are intentionally empty. Weight-bond entropies were never validated against rank and the originally-transcribed values did not match the research source; an empty map is more honest than unconsumed, unvalidated numbers in a "gold standard" profile.
 
 ### Rank Utilization Tracker
 
-A rolling-window tracker (`RankUtilizationTracker`) records per-key utilization values and produces adaptation signals:
+A rolling-window tracker (`RankUtilizationTracker`) records per-key utilization values and produces adaptation signals. It narrows the *effective* rank below the profile ceiling at runtime:
 
 | Signal | Condition | Action |
 |--------|-----------|--------|
@@ -164,6 +187,6 @@ TestTimeTrainer::adapt_tenant(&self, delta)
 | `training/ttt.rs` | Gradient gating, rank oracle, optimizer wiring |
 | `training/mod.rs` | Re-exports |
 | `training/delta_pool.rs` | Oracle config propagation |
-| `runtime/ttn_profile.rs` | Allocator port, utilization tracker |
+| `runtime/ttn_profile.rs` | Layer profiles, utilization tracker (W-SLC allocator port removed in #202 cleanup) |
 | `config/mod.rs` | TTTTrainingConfig fields |
 | `services/inference.rs` | Service wiring |
