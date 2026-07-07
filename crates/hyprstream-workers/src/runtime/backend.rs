@@ -80,10 +80,12 @@ pub enum NamespaceTransport {
     /// (normally iroh/QUIC-WebTransport cross-node, vsock for Kata, UDS only
     /// co-located). The CSI node plugin mints the scoped #862 mount ticket at
     /// `NodePublishVolume` via Kubernetes CSI `tokenRequests`, so no bearer
-    /// ticket is persisted in the PodSpec.
+    /// ticket is persisted in the PodSpec. `aname` is the Plan 9 attach name
+    /// selecting the authorized export root; filesystem paths are walked after
+    /// attach inside that root.
     NineP {
         endpoint: String,
-        namespace_path: String,
+        aname: String,
         plane: String,
         mounter: String,
         mount_path: PathBuf,
@@ -112,7 +114,7 @@ pub enum NamespaceDelivery {
     /// The namespace is represented as a `csi.hyprstream.io` pod volume.
     NineP {
         endpoint: String,
-        namespace_path: String,
+        aname: String,
         plane: String,
         mounter: String,
         mount_path: PathBuf,
@@ -137,7 +139,7 @@ impl std::fmt::Debug for NamespaceDelivery {
             Self::HostImports => write!(f, "HostImports"),
             Self::NineP {
                 endpoint,
-                namespace_path,
+                aname,
                 plane,
                 mounter,
                 mount_path,
@@ -145,7 +147,7 @@ impl std::fmt::Debug for NamespaceDelivery {
             } => f
                 .debug_struct("NineP")
                 .field("endpoint", endpoint)
-                .field("namespace_path", namespace_path)
+                .field("aname", aname)
                 .field("plane", plane)
                 .field("mounter", mounter)
                 .field("mount_path", mount_path)
