@@ -219,7 +219,7 @@ csi:
   logLevel: info
   defaultMounter: fuse
   defaultPlane: webtransport
-  defaultNamespacePath: /
+  defaultAname: default
   oauth:
     mountTicketUrl: http://hyprstream-oauth:6791/oauth/mount-ticket
     audience: hyprstream-9p

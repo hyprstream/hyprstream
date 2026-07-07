@@ -26,7 +26,7 @@ func TestBuildMountPlanFuseRequestsScopedTicket(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
 			t.Fatal(err)
 		}
-		_ = json.NewEncoder(w).Encode(mountTicketResponse{Ticket: "ticket-123", Audience: "hyprstream-9p", Capability: "mount@9p://webtransport/tenant/a"})
+		_ = json.NewEncoder(w).Encode(mountTicketResponse{Ticket: "ticket-123", Audience: "hyprstream-9p", Capability: "mount@9p://webtransport/export/tenant-a"})
 	}))
 	defer srv.Close()
 
@@ -41,17 +41,17 @@ func TestBuildMountPlanFuseRequestsScopedTicket(t *testing.T) {
 		VolumeId:   "vol-a",
 		TargetPath: "/var/lib/kubelet/pods/p/volumes/kubernetes.io~csi/v/mount",
 		VolumeContext: map[string]string{
-			attrNamespacePath: "/tenant/a",
+			attrAname:         "export:tenant-a",
 			attrServiceTokens: `{"hyprstream-9p":{"token":"pod-token","expirationTimestamp":"2026-07-05T19:00:00Z"}}`,
 		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Plane != "webtransport" || got.NamespacePath != "/tenant/a" {
+	if got.Plane != "webtransport" || got.Aname != "export:tenant-a" {
 		t.Fatalf("ticket request = %+v", got)
 	}
-	if plan.Mounter != "fuse" || plan.Ticket != "ticket-123" || plan.DialTarget != "https://hyprstream-streams:7011/9p" {
+	if plan.Mounter != "fuse" || plan.Ticket != "ticket-123" || plan.DialTarget != "https://hyprstream-streams:7011/9p" || plan.Aname != "export:tenant-a" {
 		t.Fatalf("plan = %+v", plan)
 	}
 }
@@ -74,8 +74,8 @@ func TestBuildMountPlanKernelUsesBridge(t *testing.T) {
 		VolumeId:   "vol-k",
 		TargetPath: "/mnt/k",
 		VolumeContext: map[string]string{
-			attrNamespacePath: "/tenant/k",
-			attrMounter:       "kernel",
+			attrExportRef: "export:tenant-k",
+			attrMounter:   "kernel",
 		},
 		Secrets: map[string]string{
 			attrServiceTokens: `{"hyprstream-9p":{"token":"pod-token","expirationTimestamp":"2026-07-05T19:00:00Z"}}`,
@@ -84,7 +84,7 @@ func TestBuildMountPlanKernelUsesBridge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.Mounter != "kernel" || plan.KernelBridge != "127.0.0.1:0" || plan.Ticket != "ticket-k" {
+	if plan.Mounter != "kernel" || plan.KernelBridge != "127.0.0.1:0" || plan.Ticket != "ticket-k" || plan.Aname != "export:tenant-k" {
 		t.Fatalf("plan = %+v", plan)
 	}
 }
@@ -94,8 +94,8 @@ func TestBuildMountPlanRejectsPlaintextTicketAttribute(t *testing.T) {
 		VolumeId:   "vol",
 		TargetPath: "/mnt/x",
 		VolumeContext: map[string]string{
-			attrNamespacePath: "/tenant/a",
-			attrTicket:        "ticket-in-etcd",
+			attrAname:  "export:tenant-a",
+			attrTicket: "ticket-in-etcd",
 		},
 	})
 	if err == nil {
@@ -118,7 +118,7 @@ func TestBuildMountPlanRequiresTransportEndpoint(t *testing.T) {
 		VolumeId:   "vol",
 		TargetPath: "/mnt/x",
 		VolumeContext: map[string]string{
-			attrNamespacePath: "/tenant/a",
+			attrAname:         "export:tenant-a",
 			attrServiceTokens: `{"hyprstream-9p":{"token":"pod-token","expirationTimestamp":"2026-07-05T19:00:00Z"}}`,
 		},
 	})
@@ -135,7 +135,7 @@ func TestBuildMountPlanRequiresProjectedServiceAccountToken(t *testing.T) {
 		VolumeId:   "vol",
 		TargetPath: "/mnt/x",
 		VolumeContext: map[string]string{
-			attrNamespacePath: "/tenant/a",
+			attrAname: "export:tenant-a",
 		},
 	})
 	if err == nil {
@@ -143,16 +143,16 @@ func TestBuildMountPlanRequiresProjectedServiceAccountToken(t *testing.T) {
 	}
 }
 
-func TestBuildMountPlanRejectsBadInput(t *testing.T) {
+func TestBuildMountPlanRejectsLegacyNamespacePath(t *testing.T) {
 	_, err := buildMountPlan(config{mountTicketURL: "http://127.0.0.1"}, &csi.NodePublishVolumeRequest{
 		VolumeId:   "vol",
 		TargetPath: "/mnt/x",
 		VolumeContext: map[string]string{
-			attrNamespacePath: "relative",
+			attrLegacyNamespacePath: "/sandboxes/sb-1",
 		},
 	})
 	if err == nil {
-		t.Fatal("expected relative namespacePath rejection")
+		t.Fatal("expected legacy namespacePath rejection")
 	}
 }
 
@@ -167,8 +167,8 @@ func TestFuseCommandKeepsTicketOutOfArgvAndUsesUnameEnv(t *testing.T) {
 	if strings.Contains(argv, "ticket-secret") {
 		t.Fatalf("ticket leaked into argv: %q", cmd.Args)
 	}
-	if strings.Contains(argv, "--aname") {
-		t.Fatalf("ticket must be presented as uname, not aname: %q", cmd.Args)
+	if !strings.Contains(argv, "--aname") {
+		t.Fatalf("export selector must be presented as aname: %q", cmd.Args)
 	}
 	if !hasEnv(cmd.Env, ticketEnv+"=ticket-secret") {
 		t.Fatalf("missing ticket env %s in %v", ticketEnv, cmd.Env)

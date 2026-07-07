@@ -19,22 +19,24 @@ import (
 )
 
 const (
-	attrNamespacePath = "namespacePath"
-	attrTenant        = "tenant"
-	attrPlane         = "plane"
-	attrMounter       = "mounter"
-	attrCarrier       = "carrier"
-	attrEndpoint      = "endpoint"
-	attrTicket        = "ticket"
-	attrServiceTokens = "csi.storage.k8s.io/serviceAccount.tokens"
-	fusePIDFile       = ".hyprstream-fuse.pid"
-	ticketEnv         = "HYPRSTREAM_9P_UNAME"
+	attrAname               = "aname"
+	attrExportRef           = "exportRef"
+	attrLegacyNamespacePath = "namespacePath"
+	attrTenant              = "tenant"
+	attrPlane               = "plane"
+	attrMounter             = "mounter"
+	attrCarrier             = "carrier"
+	attrEndpoint            = "endpoint"
+	attrTicket              = "ticket"
+	attrServiceTokens       = "csi.storage.k8s.io/serviceAccount.tokens"
+	fusePIDFile             = ".hyprstream-fuse.pid"
+	ticketEnv               = "HYPRSTREAM_9P_UNAME"
 )
 
 type mountTicketRequest struct {
-	Plane         string `json:"plane"`
-	NamespacePath string `json:"namespace_path"`
-	Pubkey        string `json:"pubkey,omitempty"`
+	Plane  string `json:"plane"`
+	Aname  string `json:"aname"`
+	Pubkey string `json:"pubkey,omitempty"`
 }
 
 type mountTicketResponse struct {
@@ -51,17 +53,17 @@ type serviceAccountToken struct {
 }
 
 type mountPlan struct {
-	VolumeID      string
-	TargetPath    string
-	NamespacePath string
-	Tenant        string
-	Plane         string
-	Mounter       string
-	Carrier       string
-	Endpoint      string
-	Ticket        string
-	DialTarget    string
-	KernelBridge  string
+	VolumeID     string
+	TargetPath   string
+	Aname        string
+	Tenant       string
+	Plane        string
+	Mounter      string
+	Carrier      string
+	Endpoint     string
+	Ticket       string
+	DialTarget   string
+	KernelBridge string
 }
 
 func buildMountPlan(cfg config, req *csi.NodePublishVolumeRequest) (mountPlan, error) {
@@ -75,7 +77,10 @@ func buildMountPlan(cfg config, req *csi.NodePublishVolumeRequest) (mountPlan, e
 	if attrs[attrTicket] != "" {
 		return mountPlan{}, errors.New("ticket volume attribute is forbidden; CSI must mint mount tickets at NodePublishVolume")
 	}
-	namespacePath := firstNonEmpty(attrs[attrNamespacePath], cfgValue(cfgDefaultNamespacePath(), "/"))
+	if attrs[attrLegacyNamespacePath] != "" {
+		return mountPlan{}, errors.New("namespacePath volume attribute is obsolete; use aname/exportRef as the 9P attach selector")
+	}
+	aname := firstNonEmpty(attrs[attrAname], attrs[attrExportRef], cfgDefaultAname())
 	plane := firstNonEmpty(attrs[attrPlane], cfg.defaultPlane)
 	mounter := strings.ToLower(firstNonEmpty(attrs[attrMounter], cfg.defaultMounter))
 	carrier := firstNonEmpty(attrs[attrCarrier], cfg.transportCarrier)
@@ -86,28 +91,25 @@ func buildMountPlan(cfg config, req *csi.NodePublishVolumeRequest) (mountPlan, e
 	if endpoint == "" {
 		return mountPlan{}, errors.New("transport endpoint is required; configure csi.transport.endpoint or the volume endpoint attribute")
 	}
-	if namespacePath == "" || !strings.HasPrefix(namespacePath, "/") {
-		return mountPlan{}, fmt.Errorf("namespacePath must be absolute, got %q", namespacePath)
-	}
 	bearer, err := serviceAccountBearer(req, cfg.oauthAudience)
 	if err != nil {
 		return mountPlan{}, err
 	}
-	ticket, err := requestMountTicket(context.Background(), cfg.mountTicketURL, bearer, plane, namespacePath)
+	ticket, err := requestMountTicket(context.Background(), cfg.mountTicketURL, bearer, plane, aname)
 	if err != nil {
 		return mountPlan{}, err
 	}
 	plan := mountPlan{
-		VolumeID:      req.GetVolumeId(),
-		TargetPath:    req.GetTargetPath(),
-		NamespacePath: namespacePath,
-		Tenant:        attrs[attrTenant],
-		Plane:         plane,
-		Mounter:       mounter,
-		Carrier:       carrier,
-		Endpoint:      endpoint,
-		Ticket:        ticket.Ticket,
-		DialTarget:    endpoint,
+		VolumeID:   req.GetVolumeId(),
+		TargetPath: req.GetTargetPath(),
+		Aname:      aname,
+		Tenant:     attrs[attrTenant],
+		Plane:      plane,
+		Mounter:    mounter,
+		Carrier:    carrier,
+		Endpoint:   endpoint,
+		Ticket:     ticket.Ticket,
+		DialTarget: endpoint,
 	}
 	if mounter == "kernel" {
 		plan.KernelBridge = cfg.bridgeListen
@@ -137,14 +139,7 @@ func serviceAccountBearer(req *csi.NodePublishVolumeRequest, audience string) (s
 	return entry.Token, nil
 }
 
-func cfgDefaultNamespacePath() string { return "/" }
-
-func cfgValue(v string, fallback string) string {
-	if v == "" {
-		return fallback
-	}
-	return v
-}
+func cfgDefaultAname() string { return "default" }
 
 func firstNonEmpty(values ...string) string {
 	for _, v := range values {
@@ -155,11 +150,11 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func requestMountTicket(ctx context.Context, endpoint, bearer, plane, namespacePath string) (mountTicketResponse, error) {
+func requestMountTicket(ctx context.Context, endpoint, bearer, plane, aname string) (mountTicketResponse, error) {
 	if endpoint == "" {
 		return mountTicketResponse{}, errors.New("mount-ticket endpoint is required")
 	}
-	body, err := json.Marshal(mountTicketRequest{Plane: plane, NamespacePath: namespacePath})
+	body, err := json.Marshal(mountTicketRequest{Plane: plane, Aname: aname})
 	if err != nil {
 		return mountTicketResponse{}, err
 	}
@@ -223,6 +218,7 @@ func executeMountPlan(ctx context.Context, plan mountPlan) error {
 			"--dial", plan.DialTarget,
 			"--target", plan.TargetPath,
 			"--listen", plan.KernelBridge,
+			"--aname", plan.Aname,
 		)
 		cmd.Env = append(os.Environ(), ticketEnv+"="+plan.Ticket)
 		cmd.Stdout = os.Stdout
@@ -239,6 +235,7 @@ func executeMountPlan(ctx context.Context, plan mountPlan) error {
 func fuseCommand(ctx context.Context, plan mountPlan) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, "hypr9p-guest",
 		"--dial", plan.DialTarget,
+		"--aname", plan.Aname,
 		"--fuse-mount", plan.TargetPath,
 	)
 	cmd.Env = append(os.Environ(), ticketEnv+"="+plan.Ticket)

@@ -122,8 +122,8 @@ spec:
               value: {{ .Values.csi.defaultMounter | quote }}
             - name: HYPRSTREAM_CSI_DEFAULT_PLANE
               value: {{ .Values.csi.defaultPlane | quote }}
-            - name: HYPRSTREAM_CSI_DEFAULT_NAMESPACE_PATH
-              value: {{ .Values.csi.defaultNamespacePath | quote }}
+            - name: HYPRSTREAM_CSI_DEFAULT_ANAME
+              value: {{ .Values.csi.defaultAname | quote }}
             - name: HYPRSTREAM_CSI_MOUNT_TICKET_URL
               value: {{ .Values.csi.oauth.mountTicketUrl | quote }}
           volumeMounts:
@@ -190,7 +190,7 @@ parameters:
   mounter: kernel
   plane: {{ .Values.csi.defaultPlane | quote }}
   carrier: {{ .Values.csi.transport.carrier | quote }}
-  namespacePath: {{ .Values.csi.defaultNamespacePath | quote }}
+  aname: {{ .Values.csi.defaultAname | quote }}
 {{- end }}
 {{- if .Values.csi.storageClasses.fuse.enabled }}
 ---
@@ -207,7 +207,7 @@ parameters:
   mounter: fuse
   plane: {{ .Values.csi.defaultPlane | quote }}
   carrier: {{ .Values.csi.transport.carrier | quote }}
-  namespacePath: {{ .Values.csi.defaultNamespacePath | quote }}
+  aname: {{ .Values.csi.defaultAname | quote }}
 {{- end }}
 {{- end }}
 {{- end }}
