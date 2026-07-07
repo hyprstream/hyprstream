@@ -362,7 +362,7 @@ impl Resolver for DiscoveryService {
             anyhow::bail!("no fresh announced QUIC endpoint for service '{name}'");
         }
 
-        Ok(self.reg()?.endpoint(name, kind))
+        self.reg()?.try_endpoint(name, kind)
     }
 }
 

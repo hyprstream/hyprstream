@@ -503,11 +503,14 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
                 destination: hyprstream_rpc::crypto::VerifyingKey,
                 token: Option<String>,
             ) -> anyhow::Result<Self> {
-                let transport = hyprstream_rpc::registry::try_global()
-                    .map(|r| r.endpoint(#service_name_lit, hyprstream_rpc::registry::SocketKind::Rep))
-                    .unwrap_or_else(|| hyprstream_rpc::transport::TransportConfig::inproc(
-                        concat!("hyprstream/", #service_name_lit)
-                    ));
+                let registry = hyprstream_rpc::registry::try_global()
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "EndpointRegistry not initialized — call registry::init() or use from_resolver()"
+                    ))?;
+                let transport = registry.try_endpoint(
+                    #service_name_lit,
+                    hyprstream_rpc::registry::SocketKind::Rep,
+                )?;
                 Self::dial_transport(&transport, signing_key, destination, token)
             }
 
@@ -571,11 +574,14 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
             pub async fn from_provider(
                 provider: &dyn hyprstream_rpc::identity::IdentityProvider,
             ) -> anyhow::Result<Self> {
-                let transport = hyprstream_rpc::registry::try_global()
-                    .map(|r| r.endpoint(#service_name_lit, hyprstream_rpc::registry::SocketKind::Rep))
-                    .unwrap_or_else(|| hyprstream_rpc::transport::TransportConfig::inproc(
-                        concat!("hyprstream/", #service_name_lit)
-                    ));
+                let registry = hyprstream_rpc::registry::try_global()
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "EndpointRegistry not initialized — call registry::init() or use from_resolver()"
+                    ))?;
+                let transport = registry.try_endpoint(
+                    #service_name_lit,
+                    hyprstream_rpc::registry::SocketKind::Rep,
+                )?;
                 Self::from_provider_at_transport(&transport, provider).await
             }
 
