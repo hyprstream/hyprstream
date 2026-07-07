@@ -23,9 +23,9 @@
 //!     (SocketKind::Quic, quic_endpoint),
 //! ], None)?;
 //!
-//! // Clients discover endpoints by socket type
+//! // Clients discover local endpoints by socket type
 //! let rep_endpoint = global().endpoint("model", SocketKind::Rep);
-//! let quic_endpoint = global().endpoint("model", SocketKind::Quic);
+//! let quic_endpoint = global().try_endpoint("model", SocketKind::Quic)?;
 //! ```
 
 use crate::transport::TransportConfig;
@@ -45,8 +45,8 @@ use std::sync::Arc;
 ///   are kind-symmetric), but it is retained to keep the client/server pair
 ///   self-documenting and to avoid forcing future clients to misuse `Rep`.
 /// - [`SocketKind::Quic`] — the QUIC/WebTransport transport used by the moq
-///   stream plane; branched on by the registry's `default_endpoint`, the
-///   `DidWebResolver`, and the discovery auth-metadata lookup.
+///   stream plane. Unlike local REP/REQ endpoints, QUIC has no synthesized
+///   default: network reach must be explicitly registered or announced.
 ///
 /// The dropped variants (`Dealer`, `Router`, `Pub`, `Sub`, `XPub`, `XSub`,
 /// `Push`, `Pull`, `Pair`, `Stream`) were ZMQ socket kinds carried by the
@@ -188,34 +188,43 @@ impl EndpointRegistry {
 
     /// Get endpoint for a service and socket type.
     ///
-    /// Returns the registered endpoint if available, otherwise generates
-    /// a default based on the current mode and socket type.
+    /// Returns the registered endpoint if available, otherwise generates a
+    /// local default for REP/REQ based on the current mode and socket type.
+    ///
+    /// # Panics
+    ///
+    /// Panics for socket kinds that have no local default, such as
+    /// [`SocketKind::Quic`]. New resolver code should prefer
+    /// [`Self::try_endpoint`] so missing network reach is a normal error.
     pub fn endpoint(&self, name: &str, socket_kind: SocketKind) -> TransportConfig {
+        self.try_endpoint(name, socket_kind)
+            .unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    /// Try to get endpoint for a service and socket type.
+    ///
+    /// Registered endpoints are returned as-is. Missing REP/REQ endpoints keep
+    /// the historical local fallback (`inproc` or same-host UDS), while missing
+    /// QUIC/network endpoints fail closed instead of synthesizing a placeholder.
+    pub fn try_endpoint(&self, name: &str, socket_kind: SocketKind) -> anyhow::Result<TransportConfig> {
         if let Some(entry) = self.services.read().get(name) {
             if let Some(ep) = entry.endpoints.get(&socket_kind) {
-                return ep.clone();
+                return Ok(ep.clone());
             }
         }
-        // Generate default based on mode + socket type
+
         self.default_endpoint(name, socket_kind)
     }
 
     /// Generate a default endpoint for a service and socket type.
-    fn default_endpoint(&self, name: &str, socket_kind: SocketKind) -> TransportConfig {
-        // QUIC endpoints are always TCP-based, independent of endpoint mode.
-        // This is a non-dialable PLACEHOLDER (port 0), returned only when a
-        // service has no real registration; a genuine QUIC endpoint is
-        // registered by the serving loop *pinned* with its cert hash (see
-        // QuicServiceLoop::registrations and the unified loop's QUIC
-        // registration). The WebPki policy here is moot — :0 can't be connected.
+    fn default_endpoint(&self, name: &str, socket_kind: SocketKind) -> anyhow::Result<TransportConfig> {
         if socket_kind == SocketKind::Quic {
-            return TransportConfig::quic(
-                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
-                "localhost",
+            anyhow::bail!(
+                "no registered QUIC endpoint for service '{name}' — network reach must be announced or explicitly registered"
             );
         }
         let suffix = socket_kind.suffix();
-        match self.mode {
+        Ok(match self.mode {
             EndpointMode::Inproc => {
                 TransportConfig::inproc(format!("hyprstream/{name}{suffix}"))
             }
@@ -228,7 +237,7 @@ impl EndpointRegistry {
                     .unwrap_or_else(|| PathBuf::from(format!("/tmp/hyprstream/{name}{suffix}.sock")));
                 TransportConfig::ipc(path)
             }
-        }
+        })
     }
 
     // ========================================================================
@@ -317,12 +326,12 @@ impl EndpointRegistry {
 
 // Implement Resolver for EndpointRegistry (local, sync-internally).
 //
-// EndpointRegistry::endpoint() is infallible — it always returns a default.
-// The async Resolver trait wraps this in Ok(...) for compatibility.
+// EndpointRegistry remains the local resolver. REP/REQ retain local defaults;
+// missing network endpoints fail closed through try_endpoint().
 #[async_trait::async_trait]
 impl crate::resolver::Resolver for EndpointRegistry {
     async fn resolve(&self, name: &str, kind: SocketKind) -> anyhow::Result<TransportConfig> {
-        Ok(self.endpoint(name, kind))
+        self.try_endpoint(name, kind)
     }
 }
 
@@ -357,7 +366,7 @@ impl crate::resolver::Resolver for GlobalRegistryResolver {
     async fn resolve(&self, name: &str, kind: SocketKind) -> anyhow::Result<TransportConfig> {
         let registry = try_global()
             .ok_or_else(|| anyhow::anyhow!("EndpointRegistry not initialized — call init() first"))?;
-        Ok(registry.endpoint(name, kind))
+        registry.try_endpoint(name, kind)
     }
 }
 
@@ -532,6 +541,7 @@ impl Drop for ServiceRegistration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resolver::Resolver;
     use parking_lot::Mutex;
 
     // Serialize tests that use the global registry
@@ -618,14 +628,36 @@ mod tests {
             assert_eq!(quic_ep.endpoint_string(), "inproc://model/quic");
         }
 
-        // After drop, Rep falls back to its inproc default; Quic falls back to
-        // its QUIC default (the :0 placeholder — distinct path from Rep).
+        // After drop, Rep falls back to its inproc default; Quic has no
+        // synthesized network default and fails closed.
         let rep_ep = global().endpoint("model", SocketKind::Rep);
         assert_eq!(rep_ep.endpoint_string(), "inproc://hyprstream/model");
 
-        let quic_ep = global().endpoint("model", SocketKind::Quic);
-        assert!(quic_ep.endpoint_string().starts_with("quic://"));
+        let err = match global().try_endpoint("model", SocketKind::Quic) {
+            Ok(endpoint) => panic!("missing QUIC endpoint resolved to {endpoint:?}"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("no registered QUIC endpoint"),
+            "unexpected error: {err}"
+        );
         Ok(())
+    }
+
+    #[test]
+    fn test_missing_quic_endpoint_fails_closed_through_resolver() {
+        let _lock = TEST_MUTEX.lock();
+        reset_registry();
+        init(EndpointMode::Inproc, None);
+
+        let err = match futures::executor::block_on(global().resolve("model", SocketKind::Quic)) {
+            Ok(endpoint) => panic!("missing QUIC endpoint resolved to {endpoint:?}"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("no registered QUIC endpoint"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
