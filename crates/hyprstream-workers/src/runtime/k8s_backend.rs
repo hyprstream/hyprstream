@@ -41,7 +41,7 @@
 //! ## Namespace delivery (#793)
 //!
 //! Scheduler-placed pods receive composed hyprstream namespaces through
-//! `csi.hyprstream.io` volumes. The endpoint/namespace path/mounter reference
+//! `csi.hyprstream.io` volumes. The endpoint/aname/mounter reference
 //! is injected into the PodSpec at create time; the CSI node plugin mints the
 //! scoped mount ticket at `NodePublishVolume` via Kubernetes CSI tokenRequests
 //! so bearer tickets are never persisted in etcd. Late mutation of a running
@@ -100,8 +100,8 @@ const ANN_WORKLOAD_KIND: &str = "hyprstream.io/k8s-workload-kind";
 /// Annotation key: absolute path inside the workload container where the
 /// composed hyprstream namespace is mounted through `csi.hyprstream.io`.
 const ANN_NINEP_MOUNT_PATH: &str = "hyprstream.io/9p-mount-path";
-/// Annotation key: mount-ticket scoped namespace path.
-const ANN_NINEP_NAMESPACE_PATH: &str = "hyprstream.io/9p-namespace-path";
+/// Annotation key: Plan 9 attach name selecting the exported namespace root.
+const ANN_NINEP_ANAME: &str = "hyprstream.io/9p-aname";
 /// Annotation key: dial-time carrier endpoint for the CSI node plugin.
 const ANN_NINEP_ENDPOINT: &str = "hyprstream.io/9p-endpoint";
 /// Annotation key: mount ticket plane (`webtransport`, `ws`, `vsock`, ...).
@@ -462,7 +462,7 @@ fn to_k8s_env(sandbox_id: &str, annotations: &HashMap<String, String>) -> Vec<En
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NinePVolumeSpec {
     mount_path: String,
-    namespace_path: String,
+    aname: String,
     endpoint: String,
     plane: String,
     mounter: String,
@@ -477,7 +477,7 @@ fn ninep_volume_from_annotations(
     else {
         return Ok(None);
     };
-    let namespace_path = required_annotation(annotations, ANN_NINEP_NAMESPACE_PATH)?;
+    let aname = required_annotation(annotations, ANN_NINEP_ANAME)?;
     let endpoint = required_annotation(annotations, ANN_NINEP_ENDPOINT)?;
     let plane = annotations
         .get(ANN_NINEP_PLANE)
@@ -494,11 +494,6 @@ fn ninep_volume_from_annotations(
             "{ANN_NINEP_MOUNT_PATH} must be absolute, got {mount_path:?}"
         )));
     }
-    if !namespace_path.starts_with('/') {
-        return Err(WorkerError::ConfigError(format!(
-            "{ANN_NINEP_NAMESPACE_PATH} must be absolute, got {namespace_path:?}"
-        )));
-    }
     if mounter != "kernel" && mounter != "fuse" {
         return Err(WorkerError::ConfigError(format!(
             "{ANN_NINEP_MOUNTER} must be kernel or fuse, got {mounter:?}"
@@ -506,7 +501,7 @@ fn ninep_volume_from_annotations(
     }
     Ok(Some(NinePVolumeSpec {
         mount_path: mount_path.clone(),
-        namespace_path,
+        aname,
         endpoint,
         plane,
         mounter,
@@ -523,7 +518,7 @@ fn required_annotation(annotations: &HashMap<String, String>, key: &str) -> Resu
 
 fn ninep_volume(spec: &NinePVolumeSpec) -> Volume {
     let mut attrs = BTreeMap::new();
-    attrs.insert("namespacePath".to_owned(), spec.namespace_path.clone());
+    attrs.insert("aname".to_owned(), spec.aname.clone());
     attrs.insert("plane".to_owned(), spec.plane.clone());
     attrs.insert("mounter".to_owned(), spec.mounter.clone());
     attrs.insert("endpoint".to_owned(), spec.endpoint.clone());
@@ -591,7 +586,6 @@ pub fn to_k8s_podspec(
         ..Default::default()
     };
     if let Some(spec) = ninep.as_ref() {
-        validate_ninep_scope(sandbox_id, &spec.namespace_path)?;
         container.volume_mounts = Some(vec![ninep_volume_mount(spec)]);
     }
 
@@ -619,16 +613,6 @@ fn object_labels(
     labels.insert(INSTANCE_LABEL.to_owned(), instance_id.to_owned());
     labels.insert(SANDBOX_LABEL.to_owned(), sandbox_id.to_owned());
     labels
-}
-
-fn validate_ninep_scope(sandbox_id: &str, namespace_path: &str) -> Result<()> {
-    let expected = format!("/sandboxes/{sandbox_id}");
-    if namespace_path != expected && !namespace_path.starts_with(&format!("{expected}/")) {
-        return Err(WorkerError::ConfigError(format!(
-            "{ANN_NINEP_NAMESPACE_PATH} must be scoped under {expected:?}, got {namespace_path:?}"
-        )));
-    }
-    Ok(())
 }
 
 fn object_meta(
@@ -857,7 +841,7 @@ impl SandboxBackend for K8sBackend {
     ) -> Result<NamespaceDelivery> {
         let NamespaceTransport::NineP {
             endpoint,
-            namespace_path,
+            aname,
             plane,
             mounter,
             mount_path,
@@ -869,12 +853,6 @@ impl SandboxBackend for K8sBackend {
                     .to_owned(),
             ));
         };
-        if !namespace_path.starts_with('/') {
-            return Err(WorkerError::ConfigError(format!(
-                "NineP namespace_path must be absolute, got {namespace_path:?}"
-            )));
-        }
-        validate_ninep_scope(&_sandbox.id, &namespace_path)?;
         if !mount_path.is_absolute() {
             return Err(WorkerError::ConfigError(format!(
                 "NineP mount_path must be absolute, got {}",
@@ -888,7 +866,7 @@ impl SandboxBackend for K8sBackend {
         }
         Ok(NamespaceDelivery::NineP {
             endpoint,
-            namespace_path,
+            aname,
             plane,
             mounter,
             mount_path,
@@ -1215,7 +1193,7 @@ mod tests {
     fn podspec_injects_ninep_csi_volume() {
         let mut ann = HashMap::new();
         ann.insert(ANN_NINEP_MOUNT_PATH.into(), "/mnt/hyprstream".into());
-        ann.insert(ANN_NINEP_NAMESPACE_PATH.into(), "/sandboxes/sb-10".into());
+        ann.insert(ANN_NINEP_ANAME.into(), "export:sandbox:sb-10".into());
         ann.insert(ANN_NINEP_ENDPOINT.into(), "https://node.example/9p".into());
         ann.insert(ANN_NINEP_PLANE.into(), "webtransport".into());
         ann.insert(ANN_NINEP_MOUNTER.into(), "kernel".into());
@@ -1231,8 +1209,8 @@ mod tests {
         assert_eq!(csi.driver, CSI_DRIVER);
         let attrs = csi.volume_attributes.as_ref().unwrap();
         assert_eq!(
-            attrs.get("namespacePath").map(String::as_str),
-            Some("/sandboxes/sb-10")
+            attrs.get("aname").map(String::as_str),
+            Some("export:sandbox:sb-10")
         );
         assert!(!attrs.contains_key("ticket"));
         assert_eq!(
@@ -1245,23 +1223,22 @@ mod tests {
     #[test]
     fn podspec_rejects_relative_ninep_scope() {
         let mut ann = HashMap::new();
-        ann.insert(ANN_NINEP_MOUNT_PATH.into(), "/mnt/hyprstream".into());
-        ann.insert(ANN_NINEP_NAMESPACE_PATH.into(), "sandboxes/sb-11".into());
+        ann.insert(ANN_NINEP_MOUNT_PATH.into(), "mnt/hyprstream".into());
+        ann.insert(ANN_NINEP_ANAME.into(), "export:sandbox:sb-11".into());
         ann.insert(ANN_NINEP_ENDPOINT.into(), "https://node.example/9p".into());
 
         let err = to_k8s_podspec(&cfg(), "sb-11", &ann, DEFAULT_IMAGE).unwrap_err();
-        assert!(err.to_string().contains(ANN_NINEP_NAMESPACE_PATH));
+        assert!(err.to_string().contains(ANN_NINEP_MOUNT_PATH));
     }
 
     #[test]
-    fn podspec_rejects_cross_sandbox_ninep_scope() {
+    fn podspec_requires_ninep_aname() {
         let mut ann = HashMap::new();
         ann.insert(ANN_NINEP_MOUNT_PATH.into(), "/mnt/hyprstream".into());
-        ann.insert(ANN_NINEP_NAMESPACE_PATH.into(), "/sandboxes/other".into());
         ann.insert(ANN_NINEP_ENDPOINT.into(), "https://node.example/9p".into());
 
         let err = to_k8s_podspec(&cfg(), "sb-11", &ann, DEFAULT_IMAGE).unwrap_err();
-        assert!(err.to_string().contains("/sandboxes/sb-11"));
+        assert!(err.to_string().contains(ANN_NINEP_ANAME));
     }
 
     #[tokio::test]
@@ -1279,7 +1256,7 @@ mod tests {
                 hyprstream_vfs::Subject::anonymous(),
                 NamespaceTransport::NineP {
                     endpoint: "https://node.example/9p".to_owned(),
-                    namespace_path: "/sandboxes/sb-12".to_owned(),
+                    aname: "export:sandbox:sb-12".to_owned(),
                     plane: "webtransport".to_owned(),
                     mounter: "fuse".to_owned(),
                     mount_path: PathBuf::from("/mnt/hyprstream"),
@@ -1290,10 +1267,10 @@ mod tests {
         assert!(matches!(
             delivery,
             NamespaceDelivery::NineP {
-                ref namespace_path,
+                ref aname,
                 ref mounter,
                 ..
-            } if namespace_path == "/sandboxes/sb-12" && mounter == "fuse"
+            } if aname == "export:sandbox:sb-12" && mounter == "fuse"
         ));
     }
 
@@ -1312,7 +1289,7 @@ mod tests {
                 hyprstream_vfs::Subject::anonymous(),
                 NamespaceTransport::NineP {
                     endpoint: "https://node.example/9p".to_owned(),
-                    namespace_path: "/sandboxes/sb-13".to_owned(),
+                    aname: "export:sandbox:sb-13".to_owned(),
                     plane: "webtransport".to_owned(),
                     mounter: "raw".to_owned(),
                     mount_path: PathBuf::from("/mnt/hyprstream"),
