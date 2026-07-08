@@ -32,7 +32,10 @@ pub mod scope_registry;
 pub mod ucan;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use atproto_perimeter::{AtprotoPerimeterGateway, Ed25519Vk, EnrolledPeer, EnrollmentStore, IdentityKeys, IdentityResolver, MlDsaVk};
+pub use atproto_perimeter::{AtprotoPerimeterGateway, EnrolledPeer, EnrollmentStore};
+// The identity-resolution contract (#579) lives canonically in `crate::identity`;
+// re-exported here so existing `crate::auth::{IdentityResolver, ...}` paths keep working.
+pub use crate::identity::{Ed25519Vk, IdentityKeys, IdentityResolver, MlDsaVk};
 pub use claims::{ActClaim, Claims, Cnf, CnfJwk, IdTokenClaims, OneOrMany, compute_jkt, is_local_iss};
 pub use jti_blocklist::{InMemoryJtiBlocklist, JtiBlocklist};
 pub use mac::{

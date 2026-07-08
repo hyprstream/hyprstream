@@ -41,51 +41,7 @@ use crate::admission::AdmittedIdentity;
 use crate::auth::mac::{
     Assurance, CompartmentSet, Level, SecurityContext, SecurityLabel, VerifiedKeyMaterial,
 };
-use crate::crypto::pq::MlDsaVerifyingKey;
-use crate::identity::Did;
-
-/// Raw 32-byte Ed25519 verifying key.
-///
-/// Mirror alias for the #579 resolver contract. When #579 lands and exports its
-/// own key type, this alias swaps to it without touching the gateway logic.
-pub type Ed25519Vk = [u8; 32];
-
-/// ML-DSA-65 verifying key (FIPS 204).
-///
-/// Mirror alias for the #579 resolver contract, pinned to the always-compiled PQ
-/// primitive ([`crate::crypto::pq::MlDsaVerifyingKey`]).
-pub type MlDsaVk = MlDsaVerifyingKey;
-
-/// The key material a resolver returns for an external identity.
-///
-/// **Mirror** of the #579 contract; field-for-field what `resolve_identity_keys`
-/// must yield. `ml_dsa_65 == None` ⇒ classical-only edge; `Some` ⇒ a hybrid-PQC
-/// anchor is present. The `assurance` is **crypto-derived by the resolver**, never
-/// self-asserted — the gateway maps it 1:1 into [`VerifiedKeyMaterial`].
-#[derive(Clone)]
-pub struct IdentityKeys {
-    /// The classical Ed25519 verifying key, if the identity published one.
-    pub ed25519: Option<Ed25519Vk>,
-    /// The bound ML-DSA-65 verifying key, if the identity published a PQ anchor.
-    pub ml_dsa_65: Option<MlDsaVk>,
-    /// The assurance the resolver established for this identity (crypto-derived).
-    pub assurance: Assurance,
-}
-
-/// Resolves an external `Did` to its verified key material.
-///
-/// **Mirror** of the #579 resolver trait — its signature matches #579 exactly so a
-/// real `did:plc`/`did:web` resolver (the #579 deliverable) drops in unchanged.
-/// Until #579 lands, the gateway is exercised against fixture implementations (as
-/// `admission.rs` does with its `DidDocResolve` test doubles).
-///
-/// **Fail-closed contract:** an implementation MUST return `Err` on any inability
-/// to establish key material (network failure, unknown DID, malformed document) —
-/// never a default-`Unverified` `Ok`. The gateway treats `Err` as "not enrolled".
-pub trait IdentityResolver: Send + Sync {
-    /// Resolve `did` to its verified key material, or `Err` (fail-closed).
-    fn resolve_identity_keys(&self, did: &Did) -> Result<IdentityKeys>;
-}
+use crate::identity::{Did, IdentityResolver};
 
 /// A pinned, enrolled external peer.
 ///
@@ -267,6 +223,7 @@ impl EnrollmentStore {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::identity::{IdentityKeys, MlDsaVk};
     use crate::crypto::pq::ml_dsa_generate_keypair;
 
     const DID_WEB: &str = "did:web:peer.example";

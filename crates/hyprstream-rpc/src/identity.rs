@@ -13,6 +13,9 @@ use std::str::FromStr;
 
 use anyhow::Result;
 use async_trait::async_trait;
+
+use crate::auth::mac::Assurance;
+use crate::crypto::pq::MlDsaVerifyingKey;
 use serde::{Deserialize, Serialize};
 
 use crate::Subject;
@@ -211,4 +214,47 @@ mod did_tests {
         let back: Did = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, did);
     }
+}
+
+// ============================================================================
+// Identity-resolution contract (#579)
+//
+// The canonical `Did -> verified key material` contract. A method-dispatched
+// resolver (did:web VM extractor / did:key single-Ed25519 / did:at9p capsule
+// arm, #894) implements `IdentityResolver`; consumers — the ATProto perimeter
+// gateway (`auth::atproto_perimeter`) and mesh admission (`admission`) — are
+// generic over it and never see key bytes directly. One definition lives here;
+// do not re-declare it elsewhere.
+// ============================================================================
+
+/// Raw 32-byte Ed25519 verifying key.
+pub type Ed25519Vk = [u8; 32];
+
+/// ML-DSA-65 verifying key (FIPS 204), pinned to the always-compiled PQ
+/// primitive ([`crate::crypto::pq::MlDsaVerifyingKey`]).
+pub type MlDsaVk = MlDsaVerifyingKey;
+
+/// The key material a resolver returns for an identity.
+///
+/// `ml_dsa_65 == None` ⇒ classical-only edge; `Some` ⇒ a hybrid-PQC anchor is
+/// present. `assurance` is **crypto-derived by the resolver**, never
+/// self-asserted — consumers map it 1:1 into their MAC key material.
+#[derive(Clone)]
+pub struct IdentityKeys {
+    /// The classical Ed25519 verifying key, if the identity published one.
+    pub ed25519: Option<Ed25519Vk>,
+    /// The bound ML-DSA-65 verifying key, if the identity published a PQ anchor.
+    pub ml_dsa_65: Option<MlDsaVk>,
+    /// The assurance the resolver established for this identity (crypto-derived).
+    pub assurance: Assurance,
+}
+
+/// Resolves a `Did` to its verified key material.
+///
+/// **Fail-closed contract:** an implementation MUST return `Err` on any inability
+/// to establish key material (network failure, unknown DID, malformed document) —
+/// never a default-`Unverified` `Ok`. Consumers treat `Err` as "not enrolled".
+pub trait IdentityResolver: Send + Sync {
+    /// Resolve `did` to its verified key material, or `Err` (fail-closed).
+    fn resolve_identity_keys(&self, did: &Did) -> Result<IdentityKeys>;
 }
