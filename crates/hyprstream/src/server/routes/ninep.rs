@@ -488,7 +488,7 @@ struct TicketAttachAuthorizer {
 
 #[async_trait]
 impl AttachAuthorizer for TicketAttachAuthorizer {
-    async fn authorize(&self, uname: &str) -> Result<Subject, MountError> {
+    async fn authorize(&self, uname: &str, _aname: &str) -> Result<Subject, MountError> {
         if uname.is_empty() {
             return Err(MountError::PermissionDenied("missing mount ticket".to_owned()));
         }

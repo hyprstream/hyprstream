@@ -55,8 +55,9 @@ use crate::msg::{self, Qid, ReaddirEntry};
 /// errno (e.g. [`MountError::PermissionDenied`] → `EACCES`).
 #[async_trait]
 pub trait AttachAuthorizer: Send + Sync {
-    /// Validate the `uname` ticket and return the narrowed session [`Subject`].
-    async fn authorize(&self, uname: &str) -> Result<Subject, MountError>;
+    /// Validate the `uname` ticket and `aname` export selector, then return the
+    /// narrowed session [`Subject`].
+    async fn authorize(&self, uname: &str, aname: &str) -> Result<Subject, MountError>;
 }
 
 /// Max bytes a single read/write returns. Kept below the translator's `MSG_SIZE`
@@ -145,15 +146,19 @@ impl MountBackend {
 
 #[async_trait]
 impl Backend for MountBackend {
-    async fn attach(&self, uname: &str) -> Result<()> {
+    async fn attach(&self, uname: &str, aname: &str) -> Result<()> {
         // Fixed-subject listeners have no authorizer; the Subject is already
-        // bound and `uname` is advisory (ignored, as on the UDS/vsock paths).
+        // bound and `uname`/`aname` are advisory (ignored, as on the UDS/vsock
+        // paths unless a future fixed-subject export resolver is installed).
         let Some(authorizer) = self.authorizer.as_ref() else {
             return Ok(());
         };
         // Attach-time ticket path (H1b): resolve+narrow. A MountError here maps
         // to an Rlerror errno (PermissionDenied → EACCES) via the translator.
-        let subject = authorizer.authorize(uname).await.map_err(anyhow::Error::new)?;
+        let subject = authorizer
+            .authorize(uname, aname)
+            .await
+            .map_err(anyhow::Error::new)?;
         // First attach wins; a second attach on the same connection must not
         // silently re-scope the session. Ignore a redundant identical set,
         // reject a conflicting one.

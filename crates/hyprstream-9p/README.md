@@ -9,7 +9,7 @@ Implements the subset of the 9P2000.L wire protocol needed for read/write filesy
 | Message pair | Purpose |
 |---|---|
 | `Tversion` / `Rversion` | Protocol negotiation |
-| `Tattach` / `Rattach` | Attach to root fid |
+| `Tattach` / `Rattach` | Attach to root fid; `uname` carries caller credential/ticket when needed, `aname` selects the export root |
 | `Twalk` / `Rwalk` | Path traversal (resolve fid) |
 | `Tlopen` / `Rlopen` | Open file (9P2000.L variant) |
 | `Tread` / `Rread` | Read data |
@@ -22,6 +22,21 @@ Implements the subset of the 9P2000.L wire protocol needed for read/write filesy
 **Wire format**: all messages are 4-byte LE length-prefixed, matching the DMA ring buffer framing used by the Wanix WASM runtime.
 
 **WASM extras** (`target_arch = "wasm32"`): `dma` module (SAB ring-buffer transport) and `wanix_mount` (mount the VFS into the Wanix namespace via DMA).
+
+## Attach contract
+
+`Tattach` preserves both Plan 9 selector fields:
+
+- `uname` is the caller identity material. For authenticated network mounts it
+  may carry a short-lived mount ticket; for fixed-subject local transports it
+  can be ignored.
+- `aname` is the attach name, used by hyprstream as the export selector. Paths
+  walked after attach are paths inside that selected export, not global
+  scheduler or Kubernetes implementation paths.
+
+This keeps Wanix, `hypr9p-guest`, Kubernetes CSI, and future resolver-driven
+mounts on one model: resolve an export profile, attach with its `aname`, then
+walk normal filesystem paths below the attached root.
 
 ## Server-side translator (Kata 9P)
 
