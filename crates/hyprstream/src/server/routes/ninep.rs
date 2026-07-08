@@ -70,6 +70,10 @@ use tracing::{debug, info, warn};
 
 use crate::server::state::ServerState;
 
+const PLANE_WS: &str = "ws";
+const PLANE_WEBTRANSPORT: &str = "webtransport";
+const ROOT_NAMESPACE_PATH: &str = "/";
+
 /// Query-param name carrying the short-lived mount ticket. Kept in sync with
 /// the discovery document and the design doc's `wss://…/9p?ticket=…` example.
 const TICKET_PARAM: &str = "ticket";
@@ -243,8 +247,8 @@ pub async fn wire_planes_metadata() -> impl IntoResponse {
 /// Query params on the `/9p` WebSocket upgrade.
 #[derive(Debug, Deserialize)]
 pub struct NinePQuery {
-    /// Short-lived mount ticket (an `at+jwt`), minted via the existing token
-    /// chain. Required — a missing/invalid ticket is rejected pre-upgrade.
+    /// Short-lived mount ticket, minted by `POST /oauth/mount-ticket`.
+    /// Required — a missing/invalid ticket is rejected pre-upgrade.
     #[serde(default)]
     pub ticket: Option<String>,
 }
@@ -269,13 +273,14 @@ pub async fn ninep_ws(
         }
     };
 
-    let subject = match validate_ticket(&state, ticket, &headers).await {
-        Ok(s) => s,
-        Err(reason) => {
-            warn!(reason, "9P WS upgrade rejected: invalid mount ticket");
-            return (StatusCode::UNAUTHORIZED, "invalid mount ticket").into_response();
-        }
-    };
+    let subject =
+        match validate_ticket(&state, ticket, &headers, PLANE_WS, ROOT_NAMESPACE_PATH).await {
+            Ok(s) => s,
+            Err(reason) => {
+                warn!(reason, "9P WS upgrade rejected: invalid mount ticket");
+                return (StatusCode::UNAUTHORIZED, "invalid mount ticket").into_response();
+            }
+        };
 
     let mount = build_export_mount(&state, &subject);
     // `from_mount` wraps the Subject-scoped mount in a `MountBackend` and threads
@@ -300,27 +305,46 @@ async fn validate_ticket(
     state: &ServerState,
     ticket: &str,
     _headers: &HeaderMap,
+    plane: &str,
+    namespace_path: &str,
 ) -> Result<Subject, &'static str> {
-    verify_mount_ticket(state, ticket).await
+    verify_mount_ticket(state, ticket, plane, namespace_path).await
 }
 
 /// Transport-agnostic core of mount-ticket validation, shared by H1a's
 /// URL-query path ([`validate_ticket`]) and H1b's `Tattach.uname` path
-/// ([`TicketAttachAuthorizer`]). Both present the same `at+jwt` mount ticket;
+/// ([`TicketAttachAuthorizer`]). Both present the same mount-ticket JWT;
 /// only *where* it rides differs (WS query vs 9P attach), so the verification —
-/// signature, audience, expiry, revocation (in `verify_token_claims`), then
-/// subject-name validation — is identical.
+/// signature, expiry, revocation (in `verify_token_claims`), explicit
+/// mount-capability marker, then subject-name validation — is identical.
 async fn verify_mount_ticket(
     state: &ServerState,
     ticket: &str,
+    plane: &str,
+    namespace_path: &str,
 ) -> Result<Subject, &'static str> {
     let claims = crate::server::middleware::verify_token_claims(state, ticket).await?;
+    if !crate::services::oauth::mount_ticket::is_mount_ticket_for(&claims, plane, namespace_path) {
+        return Err("token is not valid for this 9P plane/path");
+    }
     let local_issuers: &[&str] = &[&*state.oauth_issuer_url];
     let subject = claims.subject(local_issuers);
     subject.validate().map_err(|_| "subject validation failed")?;
     match subject.name() {
         Some(n) if !n.is_empty() => {}
         _ => return Err("empty subject"),
+    }
+    let Some(jti) = claims.jti.as_ref() else {
+        return Err("mount ticket missing jti");
+    };
+    let now = chrono::Utc::now().timestamp();
+    let ttl = (claims.exp - now).max(0) as u64;
+    if !state.dpop_jti_seen.insert_if_absent(
+        format!("mount-ticket:{jti}"),
+        (),
+        Duration::from_secs(ttl),
+    ) {
+        return Err("mount ticket already used");
     }
     Ok(subject)
 }
@@ -492,7 +516,8 @@ impl AttachAuthorizer for TicketAttachAuthorizer {
         if uname.is_empty() {
             return Err(MountError::PermissionDenied("missing mount ticket".to_owned()));
         }
-        match verify_mount_ticket(&self.state, uname).await {
+        match verify_mount_ticket(&self.state, uname, PLANE_WEBTRANSPORT, ROOT_NAMESPACE_PATH).await
+        {
             Ok(subject) => Ok(subject),
             Err(reason) => {
                 warn!(reason, "9P WT attach rejected: invalid mount ticket");

@@ -28,6 +28,12 @@ pub fn compute_rsa_kid(n: &str, e: &str) -> String {
 
 /// GET /oauth/jwks
 pub async fn jwks(State(state): State<Arc<OAuthState>>) -> impl IntoResponse {
+    Json(serde_json::json!({ "keys": jwks_json(&state).await }))
+}
+
+/// Build the public JWKS key array shared by `/oauth/jwks` and the SPIFFE
+/// bundle endpoint.
+pub async fn jwks_json(state: &OAuthState) -> Vec<serde_json::Value> {
     let mut keys: Vec<serde_json::Value> = Vec::new();
 
     // Serve all rotation slots (drain + active + lead) when the store is present.
@@ -118,7 +124,7 @@ pub async fn jwks(State(state): State<Arc<OAuthState>>) -> impl IntoResponse {
         keys.push(rsa_jwk.clone());
     }
 
-    Json(serde_json::json!({ "keys": keys }))
+    keys
 }
 
 #[cfg(test)]
