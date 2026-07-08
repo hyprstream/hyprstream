@@ -243,7 +243,7 @@ pub use error::{EnvelopeError, EnvelopeResult, Result, RpcError};
 pub use hyprstream_rpc_derive::{authorize, service_factory, FromCapnp, ToCapnp};
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use resolver::Resolver;
+pub use resolver::{NetworkDiscoveryResolver, Resolver, ResolverProfile};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use registry::SocketKind;
@@ -289,7 +289,8 @@ pub mod prelude {
     // Registry (with renamed imports for convenience)
     pub use crate::registry::{
         global as registry_global, init as registry_init, try_global as registry_try_global,
-        EndpointMode, EndpointRegistry, ServiceEntry, ServiceRegistration,
+        EndpointMode, EndpointRegistry, IpcResolver, LocalInprocResolver, ServiceEntry,
+        ServiceRegistration,
     };
 
     // Transport
