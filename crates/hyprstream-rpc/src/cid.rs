@@ -21,7 +21,8 @@
 //! - **CID version** is always `0x01` (CIDv1). CIDv0 (sha1+git implicit) is not
 //!   emitted; git OIDs get an explicit CIDv1 instead.
 //! - **Multicodec** identifies the *content type*: `git-raw` (0x78) for a raw git
-//!   object addressed by OID, and the local XET codes below for XET hashes.
+//!   object addressed by OID, the local XET codes below for XET hashes, and the
+//!   local `at9p-capsule` code for capsule commitments.
 //! - **Multihash** carries the hash algorithm + digest, so a CID is self-describing
 //!   and can address sha1 git blobs, sha2-256 git-tree hashes, and blake3 XET
 //!   chunks uniformly.
@@ -32,7 +33,7 @@
 //! |-----------|--------|-----------------------------------|
 //! | sha1      | 0x11   | legacy git blob/tree/commit OIDs  |
 //! | sha2-256  | 0x12   | git OIDs (sha256 repos), XET tags |
-//! | blake3    | 0x1e   | XET chunk + shard hashes          |
+//! | blake3    | 0x1e   | XET hashes; at9p BLAKE3-512 CIDs  |
 //!
 //! ## Multicodec codes
 //!
@@ -41,11 +42,12 @@
 //! | git-raw       | 0x78  | registered (multicodec table)           |
 //! | xet-xorb      | 0x71  | LOCAL convention, unregistered (#395)   |
 //! | xet-shard     | 0x72  | LOCAL convention, unregistered (#395)   |
+//! | at9p-capsule  | 0x73  | LOCAL convention, unregistered (#881)   |
 //!
-//! The XET codes live in the multicodec reserved (`0x70`–`0x7f`) private-use
-//! range and MUST be replaced with official codes once XET is registered with
-//! multiformats. They are tagged `LOCAL_CONVENTION` so a `grep` finds them when
-//! the migration lands.
+//! The XET and at9p-capsule codes live in the multicodec reserved (`0x70`–`0x7f`)
+//! private-use range and MUST be replaced with official codes once registered
+//! with multiformats. They are tagged `LOCAL_CONVENTION` so a `grep` finds them
+//! when the migration lands.
 //!
 //! ## Determinism
 //!
@@ -79,20 +81,35 @@ pub enum HashAlgo {
     Sha1 = 0x11,
     /// sha2-256 (code 0x12). git OIDs in sha256 repos; XET tag hashes.
     Sha2_256 = 0x12,
-    /// blake3 (code 0x1e). XET chunk + shard hashes.
+    /// blake3 (code 0x1e). XET chunk/shard hashes and at9p capsule commitments.
     Blake3 = 0x1e,
 }
 
 impl HashAlgo {
-    /// Expected digest length in bytes for a given algorithm, or `None` for
-    /// variable-length digests (none of the currently-modeled algos are).
-    pub const fn digest_len(self) -> usize {
+    /// Validate the digest length carried by a multihash for this algorithm.
+    ///
+    /// BLAKE3 is an XOF: `0x1e` may carry either the existing 32-byte XET/CAS
+    /// digest or the 64-byte at9p capsule commitment. The length remains part of
+    /// the encoded multihash and therefore part of the CID identity.
+    pub fn validate_digest_len(self, len: usize) -> Result<()> {
+        let valid = match self {
+            HashAlgo::Sha1 => len == 20,
+            HashAlgo::Sha2_256 => len == 32,
+            HashAlgo::Blake3 => matches!(len, 32 | 64),
+        };
+        ensure!(
+            valid,
+            "digest length mismatch for {self:?}: expected {}, got {len}",
+            self.expected_digest_lengths()
+        );
+        Ok(())
+    }
+
+    fn expected_digest_lengths(self) -> &'static str {
         match self {
-            HashAlgo::Sha1 => 20,
-            // Both sha2-256 and blake3 produce 32-byte digests; merged per
-            // clippy::match_same_arms. The algorithms are still distinguished by
-            // their multihash codes (0x12 vs 0x1e) elsewhere.
-            HashAlgo::Sha2_256 | HashAlgo::Blake3 => 32,
+            HashAlgo::Sha1 => "20 bytes",
+            HashAlgo::Sha2_256 => "32 bytes",
+            HashAlgo::Blake3 => "32 or 64 bytes",
         }
     }
 
@@ -121,6 +138,8 @@ pub enum Codec {
     XetXorb = 0x71,
     /// xet-shard (LOCAL_CONVENTION, 0x72): a XET shard (merkle) hash.
     XetShard = 0x72,
+    /// at9p-capsule (LOCAL_CONVENTION, 0x73): an at9p capsule commitment.
+    At9pCapsule = 0x73,
 }
 
 impl Codec {
@@ -130,6 +149,7 @@ impl Codec {
             0x78 => Ok(Codec::GitRaw),
             0x71 => Ok(Codec::XetXorb),
             0x72 => Ok(Codec::XetShard),
+            0x73 => Ok(Codec::At9pCapsule),
             other => bail!("unsupported CID multicodec: 0x{other:x}"),
         }
     }
@@ -176,16 +196,10 @@ fn read_uvarint(bytes: &[u8], pos: usize) -> Result<(u64, usize)> {
 
 /// Encode a digest as a multihash: `uvarint(algo) || uvarint(len) || digest`.
 ///
-/// The digest length is checked against the algorithm's canonical length when
-/// known (sha1=20, sha2-256=32, blake3=32); variable-length digests are not
-/// currently modeled.
+/// The digest length is checked against the lengths supported by the algorithm:
+/// sha1=20, sha2-256=32, and blake3=32 or 64.
 pub fn encode_multihash(algo: HashAlgo, digest: &[u8]) -> Result<Vec<u8>> {
-    let expected = algo.digest_len();
-    ensure!(
-        digest.len() == expected,
-        "digest length mismatch for {algo:?}: expected {expected} bytes, got {}",
-        digest.len()
-    );
+    algo.validate_digest_len(digest.len())?;
     let mut out = Vec::with_capacity(2 + digest.len());
     write_uvarint(&mut out, algo as u64);
     write_uvarint(&mut out, digest.len() as u64);
@@ -202,26 +216,22 @@ pub struct Multihash {
 
 /// Decode a multihash produced by [`encode_multihash`].
 pub fn decode_multihash(bytes: &[u8]) -> Result<Multihash> {
-    let (algo_code, n1) = read_uvarint(bytes, 0)
-        .context("multihash: failed to read algorithm code")?;
-    let (len, n2) = read_uvarint(bytes, n1)
-        .context("multihash: failed to read length")?;
+    let (algo_code, n1) =
+        read_uvarint(bytes, 0).context("multihash: failed to read algorithm code")?;
+    let (len, n2) = read_uvarint(bytes, n1).context("multihash: failed to read length")?;
     let len = usize::try_from(len).context("multihash: length overflow")?;
     ensure!(
         n1 + n2 + len == bytes.len(),
         "multihash: trailing bytes after digest (declared len {len})"
     );
-    let digest = bytes.get(n1 + n2..).context("multihash: digest truncated")?;
+    let digest = bytes
+        .get(n1 + n2..)
+        .context("multihash: digest truncated")?;
     ensure!(digest.len() == len, "multihash: digest length mismatch");
     let algo = HashAlgo::from_code(algo_code)?;
-    // Validate the digest length matches the algorithm's canonical size, so a
-    // truncated/corrupted multihash is rejected rather than silently accepted.
-    ensure!(
-        digest.len() == algo.digest_len(),
-        "multihash: digest length {} disagrees with {algo:?} canonical {}",
-        digest.len(),
-        algo.digest_len()
-    );
+    // Validate the digest length belongs to the algorithm's accepted domain, so
+    // a truncated/corrupted multihash is rejected rather than silently accepted.
+    algo.validate_digest_len(digest.len())?;
     Ok(Multihash {
         algo,
         digest: digest.to_vec(),
@@ -301,8 +311,8 @@ pub fn decode_cid(s: &str) -> Result<Cid> {
 /// Encode a git OID (hex string) as a `git-raw` CIDv1. The algorithm is inferred
 /// from the hex length: 40 chars → sha1, 64 chars → sha2-256.
 pub fn encode_git_oid(hex_oid: &str) -> Result<String> {
-    let raw = hex::decode(hex_oid)
-        .with_context(|| format!("git OID is not valid hex: {hex_oid}"))?;
+    let raw =
+        hex::decode(hex_oid).with_context(|| format!("git OID is not valid hex: {hex_oid}"))?;
     let algo = match raw.len() {
         20 => HashAlgo::Sha1,
         32 => HashAlgo::Sha2_256,
@@ -320,7 +330,16 @@ mod tests {
 
     #[test]
     fn uvarint_round_trip_single_and_multi_byte() {
-        for &v in &[0u64, 1, 0x7f, 0x80, 0xff, 0x100, 0x4000, 0x7fff_ffff_ffff_ffff] {
+        for &v in &[
+            0u64,
+            1,
+            0x7f,
+            0x80,
+            0xff,
+            0x100,
+            0x4000,
+            0x7fff_ffff_ffff_ffff,
+        ] {
             let mut buf = Vec::new();
             write_uvarint(&mut buf, v);
             assert!(buf.len() <= 9, "uvarint for {v} too long");
@@ -396,13 +415,25 @@ mod tests {
     }
 
     #[test]
+    fn multihash_blake3_512_round_trip() {
+        let digest = [0x51u8; 64];
+        let mh = encode_multihash(HashAlgo::Blake3, &digest).unwrap();
+        assert_eq!(mh[0], 0x1e);
+        assert_eq!(mh[1], 64);
+        let decoded = decode_multihash(&mh).unwrap();
+        assert_eq!(decoded.algo, HashAlgo::Blake3);
+        assert_eq!(decoded.digest, digest.to_vec());
+    }
+
+    #[test]
     fn multihash_rejects_wrong_length() {
         // sha1 expects 20 bytes; 19 must be rejected.
         assert!(encode_multihash(HashAlgo::Sha1, &[0u8; 19]).is_err());
         // sha2-256 expects 32; 33 must be rejected.
         assert!(encode_multihash(HashAlgo::Sha2_256, &[0u8; 33]).is_err());
-        // blake3 expects 32; 16 must be rejected.
+        // blake3 accepts 32 or 64; other lengths must be rejected.
         assert!(encode_multihash(HashAlgo::Blake3, &[0u8; 16]).is_err());
+        assert!(encode_multihash(HashAlgo::Blake3, &[0u8; 63]).is_err());
     }
 
     #[test]
@@ -464,6 +495,16 @@ mod tests {
     }
 
     #[test]
+    fn cid_at9p_capsule_blake3_512_round_trip() {
+        let digest = [0x44u8; 64];
+        let cid = encode_cid(Codec::At9pCapsule, HashAlgo::Blake3, &digest).unwrap();
+        let decoded = decode_cid(&cid).unwrap();
+        assert_eq!(decoded.codec, Codec::At9pCapsule);
+        assert_eq!(decoded.multihash.algo, HashAlgo::Blake3);
+        assert_eq!(decoded.multihash.digest, digest.to_vec());
+    }
+
+    #[test]
     fn cid_is_deterministic() {
         // Same input → identical string. Run a handful of times; if any byte
         // drifts, encoding is not a pure function and federation breaks.
@@ -480,6 +521,29 @@ mod tests {
         let a = encode_cid(Codec::GitRaw, HashAlgo::Sha1, &[0u8; 20]).unwrap();
         let b = encode_cid(Codec::GitRaw, HashAlgo::Sha1, &[1u8; 20]).unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn cid_blake3_32_and_64_byte_digests_do_not_alias() {
+        let input = b"canonical genesis capsule";
+        let digest32 = *blake3::hash(input).as_bytes();
+        let mut digest64 = [0u8; 64];
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(input);
+        hasher.finalize_xof().fill(&mut digest64);
+
+        assert_eq!(&digest64[..32], &digest32);
+
+        let cid32 = encode_cid(Codec::At9pCapsule, HashAlgo::Blake3, &digest32).unwrap();
+        let cid64 = encode_cid(Codec::At9pCapsule, HashAlgo::Blake3, &digest64).unwrap();
+        assert_ne!(cid32, cid64);
+
+        let decoded32 = decode_cid(&cid32).unwrap();
+        let decoded64 = decode_cid(&cid64).unwrap();
+        assert_eq!(decoded32.multihash.algo, decoded64.multihash.algo);
+        assert_eq!(decoded32.multihash.digest.len(), 32);
+        assert_eq!(decoded64.multihash.digest.len(), 64);
+        assert_ne!(decoded32.multihash, decoded64.multihash);
     }
 
     #[test]
