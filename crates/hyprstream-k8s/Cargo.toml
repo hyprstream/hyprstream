@@ -13,10 +13,23 @@ path = "src/lib.rs"
 [features]
 # CRD *type* definitions + YAML emission compile with no features and no cluster.
 default = []
-# `k8s` gates anything that needs a live client / controller-runtime.
+# `k8s` gates anything that needs a live client / controller-runtime, including
+# the `/k8s` VFS projection (K7, #782) — it needs the kube watch runtime plus the
+# in-process VFS `Mount` trait + verified `Subject` from hyprstream-vfs/-rpc.
 # `ws` adds the websocket upgrade path kube uses for pod `exec`/`attach`
 # (`AttachedProcess`), consumed by the workers `k8s` sandbox backend.
-k8s = ["kube/client", "kube/runtime", "kube/rustls-tls", "kube/ws"]
+k8s = [
+    "kube/client",
+    "kube/runtime",
+    "kube/rustls-tls",
+    "kube/ws",
+    "dep:hyprstream-vfs",
+    "dep:hyprstream-rpc",
+    "dep:async-trait",
+    "dep:tokio",
+    "dep:parking_lot",
+    "dep:futures",
+]
 
 [dependencies]
 # `derive` gives the CustomResource derive + CustomResourceExt (kube-core, no client).
@@ -28,6 +41,17 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 schemars = "1"
+
+# `/k8s` VFS projection (K7, #782) — all optional, pulled in by the `k8s` feature.
+hyprstream-vfs = { path = "../hyprstream-vfs", optional = true }
+hyprstream-rpc = { path = "../hyprstream-rpc", optional = true }
+async-trait = { version = "0.1", optional = true }
+tokio = { version = "1", features = ["sync", "rt"], optional = true }
+parking_lot = { workspace = true, optional = true }
+futures = { version = "0.3", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync"] }
 
 [lints]
 workspace = true
