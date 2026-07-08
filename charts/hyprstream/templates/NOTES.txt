@@ -21,4 +21,18 @@ IMPORTANT (Phase 0 substrate):
   * Per-service signing-key Secrets / trust store projection is available with
     keyBootstrap.enabled. Provide pre-generated Secrets; the chart does not mint
     signing keys or service JWTs.
-  * OTel Collector / Prometheus exposition: TODO(#784), gated by observability.enabled.
+{{- if .Values.observability.enabled }}
+
+Observability (K1b, #784) is ENABLED:
+  * Every service pushes OTLP traces to {{ include "hyprstream.otlpEndpoint" . }}.
+{{- if .Values.observability.collector.enabled }}
+  * OTel Collector {{ include "hyprstream.collectorName" . }} derives RED metrics
+    (request rate / errors / latency) from spans and exposes them for scraping:
+      kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "hyprstream.collectorName" . }} {{ .Values.observability.collector.ports.prometheus }}:{{ .Values.observability.collector.ports.prometheus }}
+      curl http://localhost:{{ .Values.observability.collector.ports.prometheus }}/metrics
+    Metrics are prefixed `{{ .Values.observability.collector.prometheusNamespace }}_` (e.g. {{ .Values.observability.collector.prometheusNamespace }}_traces_span_metrics_calls_total).
+    Feed this endpoint to prometheus-adapter/KEDA to drive an HPA (K6a, #792).
+{{- end }}
+{{- else }}
+  * OTel Collector / Prometheus exposition: available via observability.enabled=true (K1b, #784).
+{{- end }}

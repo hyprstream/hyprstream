@@ -121,14 +121,75 @@ keyBootstrap:
   policyCaSecret: ""
 
 # -----------------------------------------------------------------------------
-# TODO(#784) — K1b observability extension hook.
-# OTel Collector -> Prometheus exposition. NOT implemented here (separate issue).
-# When enabled, #784 will set OTEL_EXPORTER_OTLP_ENDPOINT on every service and
-# deploy/point at a collector. This chart only reserves the shape.
+# K1b observability (#784) — OpenTelemetry Collector -> Prometheus exposition.
+#
+# hyprstream's `otel` feature is OTLP-*push* only and exports **traces** (spans),
+# not metrics (crates/hyprstream/src/bin/main.rs). HPA/KEDA need a scrapeable
+# signal, so the chart deploys a standalone OTel Collector Deployment that:
+#   1. receives OTLP traces from every service (gRPC :4317 / HTTP :4318),
+#   2. derives RED metrics (request rate / errors / latency) from those spans
+#      via the `spanmetrics` connector, and
+#   3. exposes them on a Prometheus exposition endpoint (:8889 /metrics) that
+#      an HPA (prometheus-adapter) or KEDA prometheus scaler can consume (#792).
+#
+# When enabled, every service also gets HYPRSTREAM_OTEL_ENABLE=true and
+# OTEL_EXPORTER_OTLP_ENDPOINT pointed at the collector Service (see configmap).
+# Standalone Deployment (not sidecar/DaemonSet): OTLP is push, so services dial
+# one collector Service by DNS; Prometheus scrapes that one endpoint.
 # -----------------------------------------------------------------------------
 observability:
   enabled: false
-  # otelExporterOtlpEndpoint: ""   # filled by #784
+  # OTLP endpoint every service pushes traces to. Leave empty to default to the
+  # in-cluster collector Service below ("http://<fullname>-otel-collector:4317").
+  # Override to point at an external/existing collector instead.
+  otelExporterOtlpEndpoint: ""
+  collector:
+    # Deploy the bundled collector. Set false to only wire the env above at an
+    # external collector (otelExporterOtlpEndpoint must then be set).
+    enabled: true
+    image:
+      # contrib distro — the `spanmetrics` connector is not in the core distro.
+      repository: otel/opentelemetry-collector-contrib
+      tag: "0.128.0"
+      pullPolicy: IfNotPresent
+    replicas: 1
+    resources: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    podAnnotations: {}
+    ports:
+      otlpGrpc: 4317
+      otlpHttp: 4318
+      # Prometheus exposition endpoint (scraped by HPA/KEDA/kube-prometheus).
+      prometheus: 8889
+      # Collector health_check extension (used for readiness/liveness).
+      health: 13133
+    # Metric name prefix on the Prometheus exposition
+    # (e.g. hyprstream_traces_span_metrics_calls_total).
+    prometheusNamespace: hyprstream
+    # Span attributes promoted to metric labels (dimensions) so scaling signals
+    # can be sliced per route/method. Attribute must exist on the span or the
+    # dimension is dropped.
+    dimensions:
+      - name: http.method
+      - name: http.route
+      - name: http.status_code
+      - name: rpc.method
+      - name: rpc.service
+    service:
+      type: ClusterIP
+      # Prometheus annotation-based scrape discovery (kube-prometheus ignores
+      # these — use serviceMonitor for that). Handy for prometheus.io/scrape.
+      annotations: {}
+    # Emit a kube-prometheus-stack ServiceMonitor. Requires the Prometheus
+    # Operator CRD (monitoring.coreos.com/v1) to be installed in the cluster.
+    serviceMonitor:
+      enabled: false
+      interval: 30s
+      scrapeTimeout: 10s
+      # Extra labels (e.g. release: kube-prometheus-stack) so the operator selects it.
+      labels: {}
 
 # -----------------------------------------------------------------------------
 # Defaults applied to every service; each services.<name> entry may override.
