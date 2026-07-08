@@ -96,6 +96,26 @@ fn credentials_dir() -> std::path::PathBuf {
         })
 }
 
+/// Resolve the on-disk directory for the durable PDS record store (#910a).
+///
+/// A single RocksDB database lives here, matching `RocksDbUserStore`'s
+/// `<config_dir>/users.db` convention. The registry service (the sole
+/// publisher) opens it read-write; the discovery service (the resolver)
+/// opens it read-only — see `services::discovery::PdsRecordStore`.
+fn pds_store_dir() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("HYPRSTREAM__PDS__STORE_PATH") {
+        return std::path::PathBuf::from(p);
+    }
+    HyprConfig::load()
+        .map(|c| c.config_dir().join("pds-store"))
+        .unwrap_or_else(|_| {
+            dirs::config_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                .join("hyprstream")
+                .join("pds-store")
+        })
+}
+
 /// Resolve the CA-signed JWT used to register a service's signing key.
 ///
 /// Fail-closed (issue #441): returns the JWT (preferring one already in the
@@ -516,6 +536,34 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
     let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("registry"))?;
 
+    // #910a — the registry service is the sole PDS-record writer: it opens
+    // the durable store read-write and publishes on register/commit. This
+    // node's `did:key` identity (the record `repo` at-uri authority) is
+    // derived from the node's own root Ed25519 key — the same identity
+    // TLS endorsement uses ("a node-level trust assertion, not specific to
+    // any per-service key"). The `#atproto` commit-signing key is a
+    // dedicated, persisted P-256 key (classical — atproto has no PQ variant).
+    let pds_publisher = match crate::services::discovery::PdsRecordStore::open(&pds_store_dir()) {
+        Ok(store) => {
+            let node_did = hyprstream_rpc::did_key::ed25519_to_did_key(&ctx.verifying_key().to_bytes());
+            match crate::auth::identity_store::load_or_generate_atproto_signing_key(&credentials_dir()) {
+                Ok(atproto_key) => Some(crate::services::discovery::PdsPublisher::new(
+                    Arc::new(store),
+                    node_did,
+                    atproto_key,
+                )),
+                Err(e) => {
+                    tracing::warn!("Failed to load/generate #atproto signing key; PDS publish disabled: {e}");
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to open PDS record store (rw); PDS publish disabled: {e}");
+            None
+        }
+    };
+
     // Create registry service with infrastructure (blocking since we're in sync context)
     let mut registry_service = tokio::task::block_in_place(|| {
         let rt = tokio::runtime::Handle::current();
@@ -530,6 +578,9 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
         registry_service = registry_service.with_expected_audience(issuer.to_owned());
     }
     registry_service = registry_service.with_jwt_key_source(ctx.cluster_key_source());
+    if let Some(publisher) = pds_publisher {
+        registry_service = registry_service.with_pds_publisher(publisher);
+    }
 
     Ok(ctx.into_spawnable_quic(registry_service, config.registry.quic_port))
 }
@@ -1507,6 +1558,32 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     Ok(ctx.into_spawnable_quic(tui_service, tui_config.quic_port))
 }
 
+/// Open the PDS record store (#910a) read-only, bootstrapping an empty
+/// RocksDB database at `dir` first if nothing has been published yet.
+///
+/// `PdsRecordStore::open_readonly` requires the RocksDB files to already
+/// exist (`create_if_missing(false)`, matching `RocksDbUserStore::open_readonly`),
+/// which is normally true because the registry service (the writer) creates
+/// it. On a fresh install the discovery service may start before any model
+/// has ever been registered — bootstrap by briefly opening read-write (which
+/// creates the DB files) and releasing the handle, then retry read-only.
+///
+/// Known limitation: if the registry and discovery services start
+/// concurrently on a brand-new install, both may race to bootstrap the same
+/// directory; one loses the RocksDB lock and its factory call fails, which
+/// the service manager will retry.
+fn open_pds_store_readonly(
+    dir: &std::path::Path,
+) -> anyhow::Result<crate::services::discovery::PdsRecordStore> {
+    match crate::services::discovery::PdsRecordStore::open_readonly(dir) {
+        Ok(store) => Ok(store),
+        Err(_) => {
+            drop(crate::services::discovery::PdsRecordStore::open(dir)?);
+            crate::services::discovery::PdsRecordStore::open_readonly(dir)
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Discovery Service Factory
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1532,12 +1609,15 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("discovery"))?;
     let auth_provider = crate::services::discovery::PolicyAuthProvider::new(policy_client);
 
-    // #431 — record resolver backing getRecord/getRepo. Built over an in-memory
-    // PDS record store; the publishing side (populating the store on model
-    // register + atproto-pointer advance, #394) is wired separately, so the
-    // store starts empty (getRecord reports NOT_FOUND until records are
-    // published). The access-control gate + CAR-proof wire are fully active.
-    let pds_store = std::sync::Arc::new(crate::services::discovery::PdsRecordStore::new());
+    // #431 — record resolver backing getRecord/getRepo, over the durable
+    // RocksDB-backed PDS record store (#910a). The registry service is the
+    // sole writer (it opens the same directory read-write and publishes on
+    // register/commit — see `create_registry_service`); this factory opens
+    // the directory read-only, matching `RocksDbUserStore::open_readonly`.
+    let pds_store = std::sync::Arc::new(
+        open_pds_store_readonly(&pds_store_dir())
+            .context("failed to open PDS record store (read-only)")?,
+    );
     let record_resolver = crate::services::discovery::PdsRecordResolver::new(pds_store);
 
     let mut discovery_service = DiscoveryService::new(

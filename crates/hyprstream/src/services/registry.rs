@@ -337,6 +337,10 @@ pub struct RegistryService {
     /// fail-closed XET `getBlob` gate (#436 / #509). Pointer presence is
     /// necessary-but-not-sufficient: entitlement requires a provenance record.
     xet_provenance: Arc<XetProvenanceStore>,
+    /// Publishes/advances a repo's `ai.hyprstream.model` PDS record on
+    /// register + commit (#910a). `None` means this node has no PDS
+    /// configured — register/commit proceed exactly as before.
+    pds_publisher: Option<crate::services::discovery::PdsPublisher>,
 }
 
 /// Progress reporter that sends updates via a tokio mpsc channel.
@@ -415,6 +419,7 @@ impl RegistryService {
             expected_audience: None,
             jwt_key_source: None,
             xet_provenance,
+            pds_publisher: None,
         };
 
         Ok(service)
@@ -424,6 +429,32 @@ impl RegistryService {
     pub fn with_expected_audience(mut self, audience: String) -> Self {
         self.expected_audience = Some(audience);
         self
+    }
+
+    /// Wire in the PDS publisher (#910a). Registration and
+    /// `commitWithAuthor` (the RPC promote also drives) will publish/advance
+    /// the repo's `ai.hyprstream.model` record through it.
+    pub fn with_pds_publisher(mut self, publisher: crate::services::discovery::PdsPublisher) -> Self {
+        self.pds_publisher = Some(publisher);
+        self
+    }
+
+    /// Best-effort publish/advance of `repo_id`'s PDS record (#910a).
+    ///
+    /// Failures are logged and swallowed, never surfaced to the RPC caller:
+    /// the git commit/registration that triggered this already succeeded and
+    /// is the durable source of truth, matching the eventual-consistency
+    /// contract `git::promote` documents for the (still-stubbed, cross-node)
+    /// pointer-advance path. A missed local publish is caught up by the next
+    /// successful register/commit on the same repo.
+    fn publish_pds_record(&self, repo_id: &RepoId, current_oid: &str) {
+        let Some(publisher) = &self.pds_publisher else { return };
+        if let Err(e) = publisher.publish(&repo_id.to_string(), current_oid) {
+            warn!(
+                repo_id = %repo_id, current_oid, error = %e,
+                "PDS record publish failed; local state is durable, record is stale until next publish"
+            );
+        }
     }
 
     /// Set the JWT key source for token verification.
@@ -1189,6 +1220,15 @@ impl RegistryService {
             .find(|r| r.id == repo_id)
             .cloned()
             .ok_or_else(|| anyhow!("Failed to find registered repository"))?;
+        drop(registry);
+
+        // #910a — publish an initial PDS record if the newly-registered repo
+        // already has a HEAD (e.g. registering an existing on-disk repo).
+        // A freshly-initialized repo with no commits yet has no `current_oid`
+        // to publish; its first `commitWithAuthor` will do so instead.
+        if let Some(current_oid) = repo.current_oid.as_deref() {
+            self.publish_pds_record(&repo_id, current_oid);
+        }
 
         Ok(repo)
     }
@@ -2989,6 +3029,12 @@ impl WorktreeHandler for RegistryService {
     }
 
     /// Commit staged changes with specified author.
+    ///
+    /// #910a: this is the RPC verb `git::promote::promote` drives (via
+    /// `WorktreeClient::commit_with_author`) to snapshot the promoted upper
+    /// layer, so publishing the PDS record here — rather than in the
+    /// client-side `advance_pointer` stub — is what makes "promote" actually
+    /// advance the atproto pointer for a local/single-node deployment.
     async fn handle_commit_with_author(&self, _ctx: &EnvelopeContext, _request_id: u64,
         repo_id: &str, name: &str, data: &CommitWithAuthorRequest,
     ) -> Result<String> {
@@ -2996,9 +3042,11 @@ impl WorktreeHandler for RegistryService {
         let message = data.message.clone();
         let author_name = data.author_name.clone();
         let author_email = data.author_email.clone();
-        self.with_worktree_blocking(&id, name, move |repo| {
+        let oid = self.with_worktree_blocking(&id, name, move |repo| {
             Ok(crate::git::ops::commit_with_author(&repo, &message, &author_name, &author_email)?.to_string())
-        }).await
+        }).await?;
+        self.publish_pds_record(&id, &oid);
+        Ok(oid)
     }
 
     /// Amend the last commit in this worktree.
