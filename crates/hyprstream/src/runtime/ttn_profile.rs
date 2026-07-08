@@ -1,11 +1,15 @@
 //! TTN (Test-Time Naturalization) analysis pipeline for model layer profiling.
 //!
-//! Provides adaptive analysis for determining optimal LoRA rank allocation
-//! per layer. Uses a tiered approach:
+//! Provides per-layer LoRA rank allocation. Uses a tiered approach:
 //!
-//! - **Tier 1**: Embedded profiles for known models (zero-cost const lookup)
-//! - **Tier 2**: Cached profiles from disk (~1ms file read)
-//! - **Tier 3**: Computed profiles via bond entropy analysis (~2-5s, cached)
+//! - **Tier 1**: Embedded profiles for known models (zero-cost const lookup) —
+//!   ranks from ablation perplexity delta (the gold standard).
+//! - **Tier 2**: Cached profiles from disk (~1ms file read).
+//! - **Tier 3**: Computed profiles — layer type detected from weight-key
+//!   geometry, every layer assigned a flat unvalidated rank (see
+//!   [`UNVALIDATED_RANK_CAP`] / [`GDN_LORA_RANK`]) that the runtime
+//!   utilization oracle narrows from. There is no per-layer spectral analysis;
+//!   a data-calibrated allocator is gated on the rank-proxy spike (#842).
 //!
 //! Ported from `tnn-transformer-1/src/entropy.py` and `attention_analysis.py`.
 
@@ -33,8 +37,6 @@ pub enum LayerType {
 pub struct LayerAnalysis {
     pub layer_idx: usize,
     pub layer_type: LayerType,
-    /// Weight name → bond entropy in nats
-    pub bond_entropy: HashMap<String, f64>,
     /// Perplexity delta if ablation data available, else None
     pub perplexity_delta: Option<f64>,
     pub recommended_rank: usize,
@@ -60,17 +62,12 @@ pub struct LayerProfile {
 /// + GatedDeltaNet) reference model.
 ///
 /// Data from `tnn-transformer-1/results/linearization_ablation.json`.
-/// Rank assignments based on perplexity delta (the ablation gold standard);
-/// the per-layer `bond_entropy` map is intentionally empty (see `attn_layers`).
+/// Rank assignments based on perplexity delta (the ablation gold standard).
 pub fn qwen3_5_0_8b_profile() -> LayerProfile {
     // Full-attention layers: 3, 7, 11, 15, 19, 23
     // GDN layers: 0-2, 4-6, 8-10, 12-14, 16-18, 20-22
-    // (layer_idx, perplexity_delta, rank). Per-projection bond entropies used
-    // to be carried here and were dropped: the values were mistranscribed from
-    // the research source (every q_proj value held the measured k_proj, and
-    // k_proj/v_proj both held v_proj), and the weight-bond-entropy quantity is
-    // not validated against adaptation rank anyway (see `entropy_to_rank`).
-    // Embedded rank is assigned from perplexity delta, so the map was unconsumed.
+    // (layer_idx, perplexity_delta, rank). Rank comes from perplexity delta;
+    // no per-projection spectral data is carried.
     let attn_layers = [
         (23usize, Some(8.40f64), 32usize),
         (3usize,  Some(5.62f64), 24usize),
@@ -89,9 +86,6 @@ pub fn qwen3_5_0_8b_profile() -> LayerProfile {
         layers.push(LayerAnalysis {
             layer_idx: *idx,
             layer_type: LayerType::FullAttention,
-            // Empty on purpose: no validated, consumed spectral data backs the
-            // embedded entries — rank comes from perplexity delta above.
-            bond_entropy: HashMap::new(),
             perplexity_delta: *ppl_delta,
             recommended_rank: *rank,
             target_modules: vec![
@@ -108,9 +102,6 @@ pub fn qwen3_5_0_8b_profile() -> LayerProfile {
             layers.push(LayerAnalysis {
                 layer_idx: idx,
                 layer_type: LayerType::GatedDeltaNet,
-                // Empty on purpose: no spectral analysis backs the GDN rank
-                // (a fabricated "representative" entry used to live here).
-                bond_entropy: HashMap::new(),
                 perplexity_delta: None,
                 recommended_rank: GDN_LORA_RANK,
                 target_modules: vec!["o_proj".to_owned()],
@@ -187,14 +178,13 @@ pub fn save_cached_profile(model_path: &Path, profile: &LayerProfile) -> Result<
 }
 
 // ============================================================================
-// Tier 3: Computed profiles (bond entropy analysis)
+// Tier 3: Computed profiles (weight-key geometry → flat rank)
 // ============================================================================
 
 /// Shannon entropy of a non-negative tensor treated as unnormalized probabilities.
 ///
-/// Shared by `bond_entropy` (applied to squared singular values) and
-/// `delta_rank_utilization` (applied to gram eigenvalues, which are already σᵢ²).
-/// Keeping this separate preserves the distinct SVD strategies in each caller.
+/// Used by `delta_rank_utilization` (applied to gram eigenvalues, which are
+/// already σᵢ²) to measure how spread the learned LoRA update is across rank.
 fn entropy_of_nonneg(s: &Tensor) -> f64 {
     let total: f64 = s.sum(Kind::Double).double_value(&[]);
     if total < 1e-30 {
@@ -206,81 +196,18 @@ fn entropy_of_nonneg(s: &Tensor) -> f64 {
     -(&p_valid * p_valid.log()).sum(Kind::Double).double_value(&[])
 }
 
-/// Compute bond entropy of a weight matrix.
-///
-/// Returns `(entropy_nats, num_singular_values)`.
-/// The caller normalizes by `ln(num_sv)` for per-matrix normalization.
-///
-/// Ported from `tnn-transformer-1/src/entropy.py:bond_entropy_from_singular_values`.
-pub fn bond_entropy(matrix: &Tensor) -> (f64, usize) {
-    let _guard = tch::no_grad_guard();
-    // Reshape to 2D if needed (FP8 may have been dequantized already)
-    let m = if matrix.dim() == 2 {
-        matrix.to_kind(Kind::Float)
-    } else {
-        let shape = matrix.size();
-        let rows = shape[0];
-        let cols: i64 = shape[1..].iter().product();
-        matrix.reshape([rows, cols]).to_kind(Kind::Float)
-    };
-
-    // Use Tensor::svd (economy, compute_uv=false) — compatible with both CPU and CUDA.
-    // linalg_svdvals requires the driver argument which fails on CPU without cuSOLVER.
-    let (_, s, _) = m.svd(true, false);
-    let num_sv = s.size()[0] as usize;
-    let s_sq = &s * &s;
-    (entropy_of_nonneg(&s_sq), num_sv)
-}
-
-/// Calibration cutoffs for [`entropy_to_rank`], hand-fitted to the single
-/// ablated reference model's results. They are NOT validated for any other model, and the
-/// mapping's premise — lower normalized spectral entropy means the layer needs
-/// more adaptation rank — is itself unproven (there are credible arguments for
-/// the opposite sign). The hard step at each cutoff is an artifact of the hand
-/// fit, not a property of the data. A continuous, data-calibrated mapping is
-/// planned once the rank-proxy validation spike has ground truth to fit
-/// against; until then, do not tune these per-model — unrecognized models are
-/// protected by [`UNVALIDATED_RANK_CAP`] instead.
-const ENTROPY_CUTOFF_RANK_32: f64 = 0.80;
-const ENTROPY_CUTOFF_RANK_16: f64 = 0.85;
-const ENTROPY_CUTOFF_RANK_8: f64 = 0.92;
-
 /// Rank ceiling for any profile derived without ablation ground truth
-/// (computed Tier-3 profiles and cached copies of them). Matches the uniform
-/// fallback rank on purpose: without validation, a spectral-entropy rank is
-/// not trusted to claim more capacity than the uninformed default. The
-/// runtime-correction loop may still shrink the utilized rank below this.
+/// (computed Tier-3 profiles, the uniform fallback, and cached copies of
+/// them). Without a validated per-layer allocator, every unprofiled layer gets
+/// this flat value, which the runtime utilization oracle then narrows from.
 const UNVALIDATED_RANK_CAP: usize = 8;
 
-/// Normalized entropy assumed for a layer whose projections could not be
-/// analyzed (no matching weight keys): treated as near-uniform, which maps to
-/// the minimum band.
-const UNANALYZED_LAYER_ENTROPY: f64 = 0.95;
-
-/// LoRA rank for GatedDeltaNet layers, as an explicit calibrated constant.
+/// LoRA rank for GatedDeltaNet layers, as an explicit constant.
 ///
-/// GDN capacity lives in the recurrent/conv/gating parameters, which no
-/// current statistic here analyzes — the previous approach derived a rank
-/// from the spectrum of `out_proj` alone, which presented a guess as
-/// analysis. The value matches the embedded GDN rank and sits
-/// under [`UNVALIDATED_RANK_CAP`]. Revisit when GDN ablation ground truth
-/// exists.
+/// GDN capacity lives in the recurrent/conv/gating parameters; this value
+/// matches the embedded GDN rank and sits under [`UNVALIDATED_RANK_CAP`].
+/// Revisit when GDN ablation ground truth exists.
 const GDN_LORA_RANK: usize = 4;
-
-/// Map normalized entropy [0,1] to LoRA rank.
-/// Lower normalized entropy → more structured → higher rank (assumed sign —
-/// see the cutoff constants above).
-///
-/// Note: Tier 3 ranks are approximate — embedded profiles (Tier 1) use
-/// ablation-derived perplexity delta as the gold standard.
-fn entropy_to_rank(normalized: f64) -> usize {
-    match normalized {
-        x if x < ENTROPY_CUTOFF_RANK_32 => 32, // Very structured (critical layers)
-        x if x < ENTROPY_CUTOFF_RANK_16 => 16, // Moderate structure
-        x if x < ENTROPY_CUTOFF_RANK_8 => 8,   // Low structure
-        _ => 4,                                 // Near-uniform
-    }
-}
 
 /// Detect the layer type for a given layer index.
 ///
@@ -316,14 +243,13 @@ fn detect_layer_type(
     LayerType::StandardAttention
 }
 
-/// Compute layer profile by analyzing weight matrices (Tier 3).
+/// Compute a layer profile from weight-key geometry (Tier 3).
 ///
-/// Runs SVD on Q/K/V/O projection weights per layer to determine bond entropy.
-/// Results are cached to `{model_path}/.analysis/layer_profile.json`.
-///
-/// # Complexity
-/// O(layers × projs × min(rows,cols)²) SVD. Typically 2–5s for 0.8B models.
-pub fn compute_weight_entropy_profile(
+/// Detects each layer's type from weight-key presence and assigns a flat
+/// unvalidated rank (see [`UNVALIDATED_RANK_CAP`] / [`GDN_LORA_RANK`]); there
+/// is no per-layer spectral analysis. Results are cached to
+/// `{model_path}/.analysis/layer_profile.json`.
+pub fn compute_layer_profile(
     weights: &HashMap<String, Tensor>,
     config: &ModelConfig,
     model_path: &Path,
@@ -349,42 +275,19 @@ pub fn compute_weight_entropy_profile(
 
         let layer_type = detect_layer_type(config, layer_idx, weights, &prefix);
 
-        let mut entropies = HashMap::new();
+        // No validated per-layer rank signal exists for unprofiled models: the
+        // spectral-entropy → rank mapping that lived here was unvalidated (its
+        // sign inverted across attention projections on the only ablation
+        // data) and has been removed. Every layer gets a flat prior — the cap
+        // for attention/standard layers, the explicit GDN constant for GDN —
+        // and the runtime utilization oracle narrows from there. A
+        // data-calibrated allocator is gated on the rank-proxy validation
+        // spike (#842); until then a flat prior is more honest than an
+        // unvalidated guess.
         let recommended_rank = if layer_type == LayerType::GatedDeltaNet {
-            // No spectral analysis for GDN layers: their capacity lives in
-            // recurrent/conv/gating parameters this pipeline does not model,
-            // so an out_proj-only spectrum would be a guess dressed as
-            // analysis. Use the explicit constant (and skip the SVD — GDN
-            // layers are the majority of hybrid stacks).
             GDN_LORA_RANK
         } else {
-            let mut entropy_normalized_sum = 0.0f64;
-            let mut entropy_count = 0usize;
-
-            for proj in ["q_proj", "k_proj", "v_proj", "o_proj"] {
-                let key = format!("{prefix}.self_attn.{proj}.weight");
-                if let Some(w) = weights.get(&key) {
-                    let (entropy_nats, num_sv) = bond_entropy(w);
-                    entropies.insert(proj.to_owned(), entropy_nats);
-
-                    // Per-matrix normalization: divide by ln(num_sv)
-                    let max_entropy = (num_sv as f64).ln();
-                    if max_entropy > 1e-10 {
-                        entropy_normalized_sum += entropy_nats / max_entropy;
-                        entropy_count += 1;
-                    }
-                }
-            }
-
-            let avg_normalized = if entropy_count > 0 {
-                entropy_normalized_sum / entropy_count as f64
-            } else {
-                UNANALYZED_LAYER_ENTROPY
-            };
-
-            // Tier 3 entropy-based ranks are unvalidated for models outside the
-            // embedded profile registry — cap them (see UNVALIDATED_RANK_CAP).
-            entropy_to_rank(avg_normalized).min(UNVALIDATED_RANK_CAP)
+            UNVALIDATED_RANK_CAP
         };
 
         // Target modules: default ["q_proj", "v_proj"] for standard attention
@@ -401,7 +304,6 @@ pub fn compute_weight_entropy_profile(
         layers.push(LayerAnalysis {
             layer_idx,
             layer_type,
-            bond_entropy: entropies,
             perplexity_delta: None,
             recommended_rank,
             target_modules,
@@ -439,7 +341,6 @@ fn uniform_fallback_profile(config: &ModelConfig) -> LayerProfile {
         .map(|layer_idx| LayerAnalysis {
             layer_idx,
             layer_type: LayerType::StandardAttention,
-            bond_entropy: HashMap::new(),
             perplexity_delta: None,
             recommended_rank: UNVALIDATED_RANK_CAP, // uninformed uniform default
             target_modules: vec!["o_proj".to_owned()],
@@ -517,7 +418,7 @@ pub fn get_layer_profile(
              contributing an embedded profile."
         );
         info!("Computing TTN profile for new model (one-time analysis)...");
-        return compute_weight_entropy_profile(weights, config, model_path);
+        return compute_layer_profile(weights, config, model_path);
     }
 
     // Fallback: uniform profile
@@ -688,18 +589,10 @@ mod tests {
         assert_eq!(attn_23.recommended_rank, 32);
         assert_eq!(attn_23.layer_type, LayerType::FullAttention);
         assert_eq!(attn_23.perplexity_delta, Some(8.40));
-        assert!(
-            attn_23.bond_entropy.is_empty(),
-            "embedded attention layers carry no spectral map — rank comes from ppl delta"
-        );
 
         let gdn_0 = profile.layers.iter().find(|l| l.layer_idx == 0).expect("layer 0 should exist");
         assert_eq!(gdn_0.recommended_rank, GDN_LORA_RANK);
         assert_eq!(gdn_0.layer_type, LayerType::GatedDeltaNet);
-        assert!(
-            gdn_0.bond_entropy.is_empty(),
-            "no fabricated spectral entries for GDN layers"
-        );
     }
 
     #[test]
@@ -708,32 +601,6 @@ mod tests {
         assert!(find_embedded_profile("qwen3.5", 24, 1024).is_some());
         assert!(find_embedded_profile("llama", 32, 4096).is_none());
         assert!(find_embedded_profile("qwen3_5", 32, 4096).is_none()); // different dims
-    }
-
-    #[test]
-    fn test_entropy_to_rank_bands_follow_cutoffs() {
-        // Derive the probes from the constants so recalibration moves the
-        // test with it; what is pinned is the band structure and its sign.
-        assert_eq!(entropy_to_rank(ENTROPY_CUTOFF_RANK_32 - 0.05), 32);
-        assert_eq!(entropy_to_rank(ENTROPY_CUTOFF_RANK_32), 16);
-        assert_eq!(entropy_to_rank(ENTROPY_CUTOFF_RANK_16), 8);
-        assert_eq!(entropy_to_rank(ENTROPY_CUTOFF_RANK_8), 4);
-        assert_eq!(entropy_to_rank(1.0), 4);
-    }
-
-    #[test]
-    fn test_bond_entropy_uniform_spectrum() {
-        let _guard = tch::no_grad_guard();
-        // Identity matrix: all singular values equal → maximally uniform
-        // spectrum → normalized entropy ≈ 1.
-        let m = Tensor::eye(64, (Kind::Float, tch::Device::Cpu));
-        let (entropy, num_sv) = bond_entropy(&m);
-        assert_eq!(num_sv, 64);
-        let normalized = entropy / (64f64).ln();
-        assert!(
-            normalized > 0.99,
-            "Uniform spectrum should give normalized entropy ≈ 1, got {normalized}"
-        );
     }
 
     #[test]
@@ -763,24 +630,18 @@ mod tests {
         }
 
         let profile =
-            compute_weight_entropy_profile(&weights, &config, dir.path()).expect("profile");
+            compute_layer_profile(&weights, &config, dir.path()).expect("profile");
         assert_eq!(profile.layers.len(), 2);
 
         let gdn = &profile.layers[0];
         assert_eq!(gdn.layer_type, LayerType::GatedDeltaNet);
         assert_eq!(gdn.recommended_rank, GDN_LORA_RANK);
-        assert!(
-            gdn.bond_entropy.is_empty(),
-            "GDN layers carry no spectral analysis"
-        );
 
         let attn = &profile.layers[1];
         assert_eq!(attn.layer_type, LayerType::FullAttention);
-        assert_eq!(attn.bond_entropy.len(), 4, "all four projections analyzed");
-        assert!(
-            attn.recommended_rank <= UNVALIDATED_RANK_CAP,
-            "computed ranks are capped, got {}",
-            attn.recommended_rank
+        assert_eq!(
+            attn.recommended_rank, UNVALIDATED_RANK_CAP,
+            "unprofiled attention layers get the flat unvalidated cap"
         );
 
         // The computation persisted itself to the Tier-2 cache.
@@ -805,30 +666,6 @@ mod tests {
         // No embedded profile for this model → Tier 2 load must clamp.
         let loaded = get_layer_profile(dir.path(), &config, None).expect("load");
         assert_eq!(loaded.layers[0].recommended_rank, UNVALIDATED_RANK_CAP);
-    }
-
-    #[test]
-    fn test_bond_entropy_random() {
-        let _guard = tch::no_grad_guard();
-        let m = Tensor::randn([64, 64], (Kind::Float, tch::Device::Cpu));
-        let (entropy, num_sv) = bond_entropy(&m);
-        assert_eq!(num_sv, 64);
-        assert!(entropy > 0.0);
-        // Random matrix should have near-uniform distribution, so high entropy
-        let max_entropy = (64f64).ln();
-        assert!(entropy < max_entropy + 1e-6);
-    }
-
-    #[test]
-    fn test_bond_entropy_rank1() {
-        let _guard = tch::no_grad_guard();
-        // Rank-1 matrix: outer product of two vectors
-        let u = Tensor::randn([64, 1], (Kind::Float, tch::Device::Cpu));
-        let v = Tensor::randn([1, 32], (Kind::Float, tch::Device::Cpu));
-        let m = u.matmul(&v);
-        let (entropy, _) = bond_entropy(&m);
-        // Rank-1 → single nonzero singular value → entropy = 0
-        assert!(entropy < 0.1, "Rank-1 matrix entropy should be near 0, got {entropy}");
     }
 
     #[test]

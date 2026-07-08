@@ -10,7 +10,7 @@ Three components work together:
 2. **Narrow-based effective rank** — runtime rank control without tensor reallocation
 3. **Per-layer gradient gating** — freezes low-signal layers during multi-step TTT
 
-The static ranks these operate on come from a **TTN layer profile** (see [TTN Layer Profiles](#ttn-layer-profiles)) — a per-layer `recommended_rank` derived either from ablation ground truth (embedded models) or from a conservative, capped spectral-entropy estimate (everything else). A runtime `RankUtilizationTracker` then narrows the *effective* rank below that ceiling in response to observed utilization.
+The static ranks these operate on come from a **TTN layer profile** (see [TTN Layer Profiles](#ttn-layer-profiles)) — a per-layer `recommended_rank` derived either from ablation ground truth (embedded models) or a flat unvalidated cap (everything else). A runtime `RankUtilizationTracker` then narrows the *effective* rank below that ceiling in response to observed utilization.
 
 > The W-SLC streaming rank allocator (a Python research port with a dimensionally-inconsistent `|rank − entropy|` cost term and no production call-sites) was removed in the #202 cleanup; the active W-SLC research lives in the separate Python research repo and is unaffected. Runtime rank redistribution is now solely the utilization-driven oracle below.
 
@@ -93,29 +93,19 @@ A TTN layer profile gives every layer a `recommended_rank` — the `max_rank` th
 |------|--------|------|-------|
 | **1** | Embedded profile for a known model family/geometry (`find_embedded_profile`) | const lookup | **Gold standard** — ranks from ablation perplexity delta |
 | **2** | Cached profile on disk (`load_cached_profile`) | ~1ms | Treated as a persisted Tier-3 result |
-| **3** | Computed from weight spectra (`compute_weight_entropy_profile`) | ~2–5s SVD, then cached | Unvalidated — capped (see below) |
+| **3** | Computed from weight-key geometry (`compute_layer_profile`) | negligible, then cached | Unvalidated — flat prior (see below) |
 
-### The unvalidated-rank cap
+### Flat prior — no per-layer spectral allocation
 
-`UNVALIDATED_RANK_CAP = 8` is the ceiling on any rank not backed by ablation ground truth — Tier-3 computed ranks, the uniform fallback, and Tier-2 cache loads alike. Pre-cap or hand-edited caches that previously bypassed it are clamped on load. The cap is the same value as the uniform fallback on purpose: without validation, a spectral-entropy rank is not trusted to claim more capacity than the uninformed default. (A model with an embedded Tier-1 profile returns before the cache path, so embedded ranks are never clamped.)
+`UNVALIDATED_RANK_CAP = 8` is the rank assigned to every attention/standard layer in a Tier-3 (computed) or Tier-2 (cached) profile without ablation ground truth; GatedDeltaNet layers get `GDN_LORA_RANK = 4`. The runtime utilization oracle then narrows the effective rank below these ceilings from observed utilization. Pre-cap or hand-edited caches that previously held larger ranks are clamped to the cap on load. (A model with an embedded Tier-1 profile returns before the Tier-2/Tier-3 path, so embedded ranks are untouched.)
 
-### Why spectral entropy is a weak proxy (and treated as such)
+There is intentionally **no per-layer spectral allocation**. A weight-bond spectral-entropy → rank mapping (`entropy_to_rank` + hand-fitted cutoff constants) previously lived here and was removed as unvalidated:
 
-`entropy_to_rank` maps normalized weight-bond entropy to rank on the *assumed* premise that lower entropy (more structured spectrum) means a layer needs more adaptation capacity. That premise is **unvalidated**:
+- The linearization-resistance theory in the underlying research is about *attention-pattern* entropy, not weight-bond entropy from SVD — a different quantity the research never connected to adaptation rank.
+- On the research's own n=6 attention layers, the sign of the entropy↔importance correlation is projection-dependent: it holds for `v_proj` (r ≈ −0.73), is absent for `k_proj` (r ≈ −0.13), and *inverts* for `q_proj` (r ≈ +0.31).
+- The cutoff constants were hand-fitted to a single ablated reference model.
 
-- The linearization-resistance theory in the underlying research is about **attention-pattern** entropy, not weight-bond entropy from SVD — a different quantity the research never connected to adaptation rank.
-- On the research's own n=6 attention layers, the sign of the entropy↔importance correlation is projection-dependent: it holds for `v_proj` (r ≈ −0.73), is absent for `k_proj` (r ≈ −0.13), and **inverts** for `q_proj` (r ≈ +0.31).
-- The cutoff constants (`ENTROPY_CUTOFF_RANK_{32,16,8}`) were hand-fitted to a single ablated reference model and are not expected to generalize.
-
-This is why the cap exists and why `entropy_to_rank`'s doc comment flags the sign as assumed. A continuous, data-calibrated mapping is deferred to the rank-proxy validation spike (#842 → #844), which must test the sign per-projection on more than one model.
-
-### GatedDeltaNet layers
-
-GDN layers receive a fixed `GDN_LORA_RANK = 4` rather than an entropy-derived rank. GDN adaptation capacity lives in the recurrent/conv/gating parameters, which the weight-spectrum pipeline does not model; deriving a rank from `out_proj`'s spectrum alone presented a guess as analysis. (This matches the embedded GDN rank and sits under the cap.) No SVD is computed for GDN layers — they are the majority of a hybrid stack, so skipping them is also the dominant profiling-speed win.
-
-### Embedded profile honesty
-
-The embedded profile carries `perplexity_delta` per attention layer (the consumed, ablation-derived input to `recommended_rank`) but its `bond_entropy` maps are intentionally empty. Weight-bond entropies were never validated against rank and the originally-transcribed values did not match the research source; an empty map is more honest than unconsumed, unvalidated numbers in a "gold standard" profile.
+After the cap, the mapping only ever distinguished rank 8 from 4 with an unreliable sign — a flat prior is more honest, the oracle adjusts at runtime, and first-inference SVD cost (~2–5s) is eliminated. A data-calibrated allocator is gated on the rank-proxy validation spike (#842 → #844), which must test any candidate per-projection on more than one model.
 
 ### Rank Utilization Tracker
 
