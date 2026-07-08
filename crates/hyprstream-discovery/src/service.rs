@@ -362,7 +362,7 @@ impl Resolver for DiscoveryService {
             anyhow::bail!("no fresh announced QUIC endpoint for service '{name}'");
         }
 
-        Ok(self.reg()?.endpoint(name, kind))
+        self.reg()?.try_endpoint(name, kind)
     }
 }
 
@@ -746,7 +746,17 @@ impl DiscoveryHandler for DiscoveryService {
             .iter()
             .filter(|name| filter.is_empty() || *name == filter)
             .filter_map(|name| {
-                let quic_transport = reg.endpoint(name, SocketKind::Quic);
+                let quic_transport = match reg.try_endpoint(name, SocketKind::Quic) {
+                    Ok(transport) => transport,
+                    Err(err) => {
+                        tracing::debug!(
+                            service = %name,
+                            error = %err,
+                            "skipping auth metadata for service without registered QUIC reach"
+                        );
+                        return None;
+                    }
+                };
                 let resource = quic_transport.quic_resource_url(name)?;
                 Some(AuthMetadata {
                     service_name: name.clone(),
