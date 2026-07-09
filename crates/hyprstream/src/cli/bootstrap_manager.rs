@@ -138,17 +138,12 @@ pub fn is_first_run(_models_dir: &std::path::Path) -> bool {
         return false;
     }
 
-    // Resolve credentials directory
-    let credentials_dir = crate::config::HyprConfig::load()
-        .map(|c| c.config_dir().join("credentials"))
-        .unwrap_or_else(|_| {
-            dirs::config_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join("hyprstream")
-                .join("credentials")
-        });
+    // bootstrap-pubkeys is written last during bootstrap — best indicator.
+    // If credentials cannot be resolved, fail closed by treating this as first run.
+    let Ok(credentials_dir) = identity_store::credentials_dir() else {
+        return true;
+    };
 
-    // bootstrap-pubkeys is written last during bootstrap — best indicator
     !credentials_dir.join("bootstrap-pubkeys").exists()
 }
 
@@ -187,17 +182,6 @@ impl BootstrapManager {
         self.models_dir.join(".registry").join("keys")
     }
 
-    fn credentials_dir(&self) -> PathBuf {
-        crate::config::HyprConfig::load()
-            .map(|c| c.config_dir().join("credentials"))
-            .unwrap_or_else(|_|
-                dirs::config_dir()
-                    .unwrap_or_else(|| self.models_dir.clone())
-                    .join("hyprstream")
-                    .join("credentials")
-            )
-    }
-
     /// Register a user identity in UserStore and bind the CLI's user-signing-key
     /// public key to it.
     ///
@@ -209,7 +193,16 @@ impl BootstrapManager {
     ///
     /// Idempotent and collision-safe (see `bind_user_signing_key`).
     fn register_local_identity(&mut self, username: &str) {
-        let credentials_dir = self.credentials_dir();
+        let credentials_dir = match identity_store::credentials_dir() {
+            Ok(path) => path,
+            Err(e) => {
+                tracing::warn!(
+                    username,
+                    "Failed to resolve credentials directory during bootstrap — user identity will not be registered: {e}"
+                );
+                return;
+            }
+        };
         let store = match RocksDbUserStore::open(&credentials_dir) {
             Ok(s) => s,
             Err(e) => {
@@ -728,14 +721,7 @@ async fn do_bootstrap(
     // ── 4b. Per-service independent keys + CA credentials ────────────────
     let _ = tx.send(BootstrapPoll::InProgress("Generating service keys...".to_owned()));
     {
-        let credentials_dir = crate::config::HyprConfig::load()
-            .map(|c| c.config_dir().join("credentials"))
-            .unwrap_or_else(|_| {
-                dirs::config_dir()
-                    .unwrap_or_else(|| models_dir.to_path_buf())
-                    .join("hyprstream")
-                    .join("credentials")
-            });
+        let credentials_dir = identity_store::credentials_dir()?;
 
         // Local issuer URL stamped into service JWTs so they verify on the
         // local IPC/AnySigner plane without tripping the #328 empty-`iss` gate.

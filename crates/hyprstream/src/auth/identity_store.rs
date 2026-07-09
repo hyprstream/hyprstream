@@ -6,8 +6,8 @@
 //!
 //! # Design
 //!
-//! - **No env var checks** — callers must resolve config bypasses before calling
-//!   these functions.  This module is pure file I/O.
+//! - **Centralized directory resolution** — callers use `credentials_dir()` so
+//!   all secret-bearing paths fail closed consistently.
 //! - **Atomic writes** — secrets are written via tempfile + rename so partial
 //!   writes are never visible.
 //! - **Mode 0600 / 0700** — secret files and their parent directory are created
@@ -24,6 +24,23 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::server::tls::TlsMaterials;
 
 // ─── Low-level primitives ───────────────────────────────────────────────────
+
+/// Resolve the credentials/secrets directory: `HYPRSTREAM__SECRETS__PATH` if set,
+/// else `<config_dir>/credentials`. Fails closed — NEVER falls back to a
+/// world-writable /tmp path for a secret-bearing dir.
+pub fn credentials_dir() -> anyhow::Result<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("HYPRSTREAM__SECRETS__PATH") {
+        return Ok(std::path::PathBuf::from(p));
+    }
+    if let Ok(c) = crate::config::HyprConfig::load() {
+        return Ok(c.config_dir().join("credentials"));
+    }
+    let base = dirs::config_dir().ok_or_else(|| anyhow!(
+        "cannot resolve a credentials directory: set HYPRSTREAM__SECRETS__PATH \
+         (systemd credentials / k8s secret mount) — refusing to fall back to /tmp"
+    ))?;
+    Ok(base.join("hyprstream").join("credentials"))
+}
 
 /// Read a named secret from `dir`.  Returns `None` if the file does not exist.
 pub fn read_secret(dir: &std::path::Path, name: &str) -> Result<Option<Vec<u8>>> {

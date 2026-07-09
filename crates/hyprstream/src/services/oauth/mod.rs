@@ -466,14 +466,11 @@ impl Spawnable for OAuthService {
                 format!("failed to create DiscoveryClient: {e}"),
             ))?;
 
-            let credentials_dir = crate::config::HyprConfig::load()
-                .map(|c| c.config_dir().join("credentials"))
-                .unwrap_or_else(|_| {
-                    dirs::config_dir()
-                        .unwrap_or_else(|| std::path::PathBuf::from("/etc/hyprstream"))
-                        .join("hyprstream")
-                        .join("credentials")
-                });
+            let credentials_dir = crate::auth::identity_store::credentials_dir().map_err(|e| {
+                hyprstream_rpc::error::RpcError::SpawnFailed(
+                    format!("failed to resolve credentials directory: {e}"),
+                )
+            })?;
 
             // Load the user store and token store based on configured backend.
             // Failure is non-fatal; endpoints will report "not configured" instead.

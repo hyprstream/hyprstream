@@ -636,14 +636,7 @@ pub(crate) async fn run_repair_checks(
 
     // 6. Service JWT presence
     {
-        let credentials_dir = crate::config::HyprConfig::load()
-            .map(|c| c.config_dir().join("credentials"))
-            .unwrap_or_else(|_| {
-                dirs::config_dir()
-                    .unwrap_or_else(|| models_dir.to_path_buf())
-                    .join("hyprstream")
-                    .join("credentials")
-            });
+        let credentials_dir = crate::auth::identity_store::credentials_dir()?;
 
         let mut missing_jwts = Vec::new();
         for factory in hyprstream_service::list_factories() {

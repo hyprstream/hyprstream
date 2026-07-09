@@ -2393,7 +2393,7 @@ fn main() -> Result<()> {
         Some(("user", sub_m)) => {
             let cmd = UserCommand::from_arg_matches(sub_m)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let credentials_dir = ctx.config_dir().join("credentials");
+            let credentials_dir = hyprstream_core::auth::identity_store::credentials_dir()?;
             // User handlers are async, run them in a minimal runtime
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

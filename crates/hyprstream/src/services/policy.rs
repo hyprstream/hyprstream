@@ -1387,14 +1387,7 @@ impl PolicyHandler for PolicyService {
         let token = self.sign_token(&claims, true).await;
 
         // Persist renewed JWT to disk so it survives a server restart
-        let credentials_dir = crate::config::HyprConfig::load()
-            .map(|c| c.config_dir().join("credentials"))
-            .unwrap_or_else(|_| {
-                dirs::config_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-                    .join("hyprstream")
-                    .join("credentials")
-            });
+        let credentials_dir = crate::auth::identity_store::credentials_dir()?;
         if let Err(e) = crate::auth::identity_store::write_service_jwt(&credentials_dir, svc_name, &token) {
             warn!(service = svc_name, "Failed to persist renewed JWT to disk: {e}");
         }
@@ -1613,4 +1606,3 @@ pub(crate) async fn watch_policy_file(
         }
     }
 }
-
