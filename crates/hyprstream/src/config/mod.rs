@@ -181,9 +181,11 @@ pub struct SecretsConfig {
 }
 
 impl SecretsConfig {
-    /// Resolve the secrets directory.
+    /// Resolve the secrets directory from this config section only.
     ///
-    /// Returns `path` if set, otherwise `<config_dir>/credentials`.
+    /// Most callers should use `HyprConfig::resolve_secrets_dir()` or
+    /// `HyprConfig::resolve_secrets_dir_for()` so env/config/XDG precedence is
+    /// applied uniformly for all secret material.
     pub fn resolve_dir(&self, config_dir: &Path) -> PathBuf {
         self.path.clone().unwrap_or_else(|| config_dir.join("credentials"))
     }
@@ -191,13 +193,15 @@ impl SecretsConfig {
     /// Return the default secrets directory when no config is available.
     ///
     /// Routes through `StoragePaths` so `XDG_CONFIG_HOME` is respected
-    /// consistently with every other directory in the application.
-    /// Falls back to `/etc/hyprstream/credentials` if XDG resolution fails.
-    pub fn default_dir() -> PathBuf {
-        StoragePaths::new()
-            .and_then(|p| p.config_dir())
-            .map(|d| d.join("credentials"))
-            .unwrap_or_else(|_| PathBuf::from("/etc/hyprstream/credentials"))
+    /// consistently with every other directory in the application. This is
+    /// fail-closed: there is no implicit `/etc` fallback.
+    pub fn default_dir() -> anyhow::Result<PathBuf> {
+        let storage = StoragePaths::new()
+            .map_err(|e| anyhow::anyhow!("failed to initialize XDG storage paths: {e}"))?;
+        let config_dir = storage
+            .config_dir()
+            .map_err(|e| anyhow::anyhow!("failed to resolve XDG config directory: {e}"))?;
+        Ok(config_dir.join("credentials"))
     }
 }
 
@@ -425,7 +429,7 @@ impl QuicConfig {
     /// the leaf + CA cert in a single PEM file.
     pub fn load_tls_materials(&self) -> anyhow::Result<(Vec<Vec<u8>>, Zeroizing<Vec<u8>>)> {
         if self.use_self_signed() {
-            let secrets_dir = HyprConfig::resolve_secrets_dir();
+            let secrets_dir = HyprConfig::resolve_secrets_dir()?;
             // Use quic-specific secret names so QUIC and HTTP certs have different
             // validity windows without stomping each other's files.
             let materials = crate::auth::identity_store::load_or_generate_tls_materials_named(
@@ -2261,14 +2265,36 @@ impl HyprConfig {
 
     // ── Secrets / key bypass helpers ────────────────────────────────────────
 
-    /// Resolve the secrets directory from config, or the platform XDG default.
+    /// Resolve the secrets directory using the unified secret-material resolver.
     ///
-    /// Prefer calling this over inlining the fallback logic everywhere.
-    pub fn resolve_secrets_dir() -> PathBuf {
-        match Self::load() {
-            Ok(cfg) => cfg.secrets.resolve_dir(cfg.config_dir()),
-            Err(_) => SecretsConfig::default_dir(),
+    /// Precedence is:
+    /// 1. `HYPRSTREAM__SECRETS__PATH`
+    /// 2. explicit config, when provided via `resolve_secrets_dir_for`
+    /// 3. loaded config file / env-derived config
+    /// 4. XDG default (`<config_dir>/credentials`)
+    ///
+    /// Resolution is fail-closed: no `/etc` or `/tmp` fallback is chosen
+    /// silently when XDG resolution fails.
+    pub fn resolve_secrets_dir() -> anyhow::Result<PathBuf> {
+        Self::resolve_secrets_dir_for(None)
+    }
+
+    /// Resolve the secrets directory, optionally from an already-loaded config.
+    ///
+    /// The optional config handle lets CLI paths that already honored
+    /// `--config <path>` stay on the same resolver family as daemon/service
+    /// code instead of reloading default config locations.
+    pub fn resolve_secrets_dir_for(config: Option<&HyprConfig>) -> anyhow::Result<PathBuf> {
+        if let Ok(path) = std::env::var("HYPRSTREAM__SECRETS__PATH") {
+            return Ok(PathBuf::from(path));
         }
+        if let Some(config) = config {
+            return Ok(config.secrets.resolve_dir(config.config_dir()));
+        }
+        if let Ok(config) = Self::load() {
+            return Ok(config.secrets.resolve_dir(config.config_dir()));
+        }
+        SecretsConfig::default_dir()
     }
 
     /// Check for the `HYPRSTREAM__SIGNING_KEY` test bypass.
@@ -2571,6 +2597,63 @@ impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serialize process-env mutations for secrets-dir resolver tests.
+    static SECRETS_DIR_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn resolve_secrets_dir_env_overrides_config() {
+        let _serial = SECRETS_DIR_ENV_LOCK.lock();
+        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", "/tmp/hyprstream-test-config");
+        let _instance = EnvVarGuard::unset("HYPRSTREAM_INSTANCE");
+        let _env = EnvVarGuard::set("HYPRSTREAM__SECRETS__PATH", "/run/hyprstream/secrets");
+
+        let mut cfg = HyprConfig::default();
+        cfg.secrets.path = Some(PathBuf::from("/config/secrets"));
+
+        let dir = HyprConfig::resolve_secrets_dir_for(Some(&cfg)).unwrap();
+        assert_eq!(dir, PathBuf::from("/run/hyprstream/secrets"));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn resolve_secrets_dir_config_overrides_xdg_default() {
+        let _serial = SECRETS_DIR_ENV_LOCK.lock();
+        let xdg = tempfile::TempDir::new().unwrap();
+        let config_secret = xdg.path().join("from-config");
+        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", xdg.path().to_str().unwrap());
+        let _instance = EnvVarGuard::unset("HYPRSTREAM_INSTANCE");
+        let _env = EnvVarGuard::unset("HYPRSTREAM__SECRETS__PATH");
+
+        let mut cfg = HyprConfig::default();
+        cfg.secrets.path = Some(config_secret.clone());
+
+        let dir = HyprConfig::resolve_secrets_dir_for(Some(&cfg)).unwrap();
+        assert_eq!(dir, config_secret);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn resolve_secrets_dir_uses_xdg_default_without_env_or_config_path() {
+        let _serial = SECRETS_DIR_ENV_LOCK.lock();
+        let xdg = tempfile::TempDir::new().unwrap();
+        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", xdg.path().to_str().unwrap());
+        let _instance = EnvVarGuard::unset("HYPRSTREAM_INSTANCE");
+        let _env = EnvVarGuard::unset("HYPRSTREAM__SECRETS__PATH");
+
+        let dir = HyprConfig::resolve_secrets_dir().unwrap();
+        assert_eq!(dir, xdg.path().join("hyprstream").join("credentials"));
+    }
+
+    #[test]
+    fn resolve_secrets_dir_errors_when_xdg_unresolvable() {
+        let _serial = SECRETS_DIR_ENV_LOCK.lock();
+        let _instance = EnvVarGuard::set("HYPRSTREAM_INSTANCE", "../bad");
+        let _env = EnvVarGuard::unset("HYPRSTREAM__SECRETS__PATH");
+
+        assert!(HyprConfig::resolve_secrets_dir().is_err());
+    }
 
     #[test]
     #[allow(clippy::expect_used)]

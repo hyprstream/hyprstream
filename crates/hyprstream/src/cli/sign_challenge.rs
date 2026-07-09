@@ -184,7 +184,7 @@ fn load_user_signing_key() -> Result<(ed25519_dalek::SigningKey, String)> {
         return Ok((sk, username));
     }
 
-    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
+    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
     let (sk, _vk) = crate::auth::identity_store::load_or_generate_user_signing_key(&secrets_dir)
         .map_err(|e| anyhow::anyhow!(
             "Could not load user signing key: {e}\n\
@@ -203,4 +203,3 @@ fn resolve_server_url(server: Option<String>) -> String {
         .map(|c| c.oauth.issuer_url())
         .unwrap_or_else(|_| "http://localhost:6791".to_owned())
 }
-

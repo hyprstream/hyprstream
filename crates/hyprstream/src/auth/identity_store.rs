@@ -25,21 +25,23 @@ use crate::server::tls::TlsMaterials;
 
 // ─── Low-level primitives ───────────────────────────────────────────────────
 
-/// Resolve the credentials/secrets directory: `HYPRSTREAM__SECRETS__PATH` if set,
-/// else `<config_dir>/credentials`. Fails closed — NEVER falls back to a
-/// world-writable /tmp path for a secret-bearing dir.
+/// Resolve the credentials/secrets directory via the unified config resolver.
+///
+/// Precedence is `HYPRSTREAM__SECRETS__PATH`, config `[secrets].path`, XDG
+/// `<config_dir>/credentials`, then error. Fails closed — NEVER falls back to a
+/// world-writable `/tmp` path or implicit `/etc` path for a secret-bearing dir.
 pub fn credentials_dir() -> anyhow::Result<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("HYPRSTREAM__SECRETS__PATH") {
-        return Ok(std::path::PathBuf::from(p));
-    }
-    if let Ok(c) = crate::config::HyprConfig::load() {
-        return Ok(c.config_dir().join("credentials"));
-    }
-    let base = dirs::config_dir().ok_or_else(|| anyhow!(
-        "cannot resolve a credentials directory: set HYPRSTREAM__SECRETS__PATH \
-         (systemd credentials / k8s secret mount) — refusing to fall back to /tmp"
-    ))?;
-    Ok(base.join("hyprstream").join("credentials"))
+    crate::config::HyprConfig::resolve_secrets_dir()
+}
+
+/// Resolve credentials from an already-loaded config handle.
+///
+/// This is the same resolver family as `credentials_dir()`, but lets CLI paths
+/// that loaded config from `--config` avoid reloading default locations.
+pub fn credentials_dir_for_config(
+    config: Option<&crate::config::HyprConfig>,
+) -> anyhow::Result<std::path::PathBuf> {
+    crate::config::HyprConfig::resolve_secrets_dir_for(config)
 }
 
 /// Read a named secret from `dir`.  Returns `None` if the file does not exist.
