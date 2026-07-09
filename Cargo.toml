@@ -3,7 +3,7 @@ members = [
     "crates/hyprstream",
     "crates/git2db",
     "crates/git-xet-filter",
-    "crates/gittorrent",
+    "crates/hyprstream-p2p",
     "crates/hyprstream-metrics",
     "crates/hyprstream-flight",
     "crates/cas-serve",
@@ -111,8 +111,8 @@ chunk_cache = { git = "https://github.com/huggingface/xet-core", tag = "git-xet-
 merklehash = { git = "https://github.com/huggingface/xet-core", tag = "git-xet-v0.2.0" }
 async-trait = "0.1"
 
-# Optional gittorrent transport support
-gittorrent = { path = "crates/gittorrent" }
+# Optional hyprstream-p2p (formerly gittorrent) transport support
+hyprstream-p2p = { path = "crates/hyprstream-p2p" }
 
 # OCI registry client
 oci-distribution = "0.11"

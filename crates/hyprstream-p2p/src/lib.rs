@@ -32,7 +32,7 @@ pub fn init_tracing() -> Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "gittorrent=info".into()),
+                .unwrap_or_else(|_| "hyprstream-p2p=info".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .try_init()

@@ -44,8 +44,8 @@ tempfile.workspace = true
 async-trait.workspace = true
 arc-swap = "1.7"
 
-# Optional gittorrent support
-gittorrent = { workspace = true, optional = true }
+# Optional hyprstream-p2p (formerly gittorrent) support
+hyprstream-p2p = { workspace = true, optional = true }
 
 # XET large file storage support (always available, but implementation is feature-gated)
 git-xet-filter = { path = "../git-xet-filter" }
@@ -84,7 +84,7 @@ experimental = []
 # Enable detailed tracing
 tracing-detail = []
 # Enable gittorrent transport support (also enables it in git-xet-filter)
-gittorrent-transport = ["gittorrent", "git-xet-filter/gittorrent-transport"]
+gittorrent-transport = ["hyprstream-p2p", "git-xet-filter/gittorrent-transport"]
 # Enable XET large file storage support
 xet-storage = ["git-xet-filter/xet-storage", "data", "cas_client", "cas_object", "merklehash", "sha2"]
 # Enable overlayfs worktree support (Linux-only, space-efficient CoW)

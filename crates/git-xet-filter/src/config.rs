@@ -207,13 +207,13 @@ impl XetConfig {
         #[cfg(feature = "gittorrent-transport")]
         if self.endpoint.starts_with("gittorrent://") {
             // Initialize gittorrent service and create storage with HTTPS fallback
-            let gt_config = gittorrent::service::GitTorrentConfig::load()
+            let gt_config = hyprstream_p2p::service::GitTorrentConfig::load()
                 .map_err(|e| crate::error::XetError::new(
                     crate::error::XetErrorKind::RuntimeError,
                     format!("Failed to load gittorrent config: {e}"),
                 ))?;
             let gt_service = std::sync::Arc::new(
-                gittorrent::service::GitTorrentService::new(gt_config)
+                hyprstream_p2p::service::GitTorrentService::new(gt_config)
                     .await
                     .map_err(|e| crate::error::XetError::new(
                         crate::error::XetErrorKind::RuntimeError,

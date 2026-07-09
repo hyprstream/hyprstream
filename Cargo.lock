@@ -5810,7 +5810,7 @@ dependencies = [
  "data",
  "dirs",
  "git2",
- "gittorrent",
+ "hyprstream-p2p",
  "libc",
  "libgit2-sys",
  "merklehash",
@@ -5859,8 +5859,8 @@ dependencies = [
  "data",
  "git-xet-filter",
  "git2",
- "gittorrent",
  "hyprstream-containedfs",
+ "hyprstream-p2p",
  "inventory",
  "libc",
  "lru 0.16.4",
@@ -5883,43 +5883,6 @@ dependencies = [
  "tracing-subscriber",
  "uuid 1.18.1",
  "walkdir",
-]
-
-[[package]]
-name = "gittorrent"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.21.7",
- "bincode",
- "blake3",
- "bytes",
- "clap",
- "colored",
- "config 0.13.4",
- "dirs",
- "ed25519-dalek 2.2.0",
- "futures",
- "git2",
- "glob",
- "hex",
- "iroh-blobs",
- "mainline",
- "multihash",
- "parking_lot 0.12.4",
- "rand 0.8.5",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-test",
- "tokio-util",
- "toml 0.8.23",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -6816,7 +6779,6 @@ dependencies = [
  "futures",
  "git2",
  "git2db",
- "gittorrent",
  "glob",
  "hex",
  "hkdf",
@@ -6828,6 +6790,7 @@ dependencies = [
  "hyprstream-discovery",
  "hyprstream-flight",
  "hyprstream-metrics",
+ "hyprstream-p2p",
  "hyprstream-pds",
  "hyprstream-rpc",
  "hyprstream-rpc-build",
@@ -7106,6 +7069,43 @@ dependencies = [
  "tonic 0.13.1",
  "tracing",
  "uuid 1.18.1",
+]
+
+[[package]]
+name = "hyprstream-p2p"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.21.7",
+ "bincode",
+ "blake3",
+ "bytes",
+ "clap",
+ "colored",
+ "config 0.13.4",
+ "dirs",
+ "ed25519-dalek 2.2.0",
+ "futures",
+ "git2",
+ "glob",
+ "hex",
+ "iroh-blobs",
+ "mainline",
+ "multihash",
+ "parking_lot 0.12.4",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-test",
+ "tokio-util",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -62,7 +62,7 @@ pub struct Git2DBConfig {
     /// GitTorrent P2P transport configuration (optional, requires gittorrent-transport feature)
     #[cfg(feature = "gittorrent-transport")]
     #[serde(default)]
-    pub gittorrent: gittorrent::service::GitTorrentConfig,
+    pub gittorrent: hyprstream_p2p::service::GitTorrentConfig,
     /// XET large file storage configuration (optional, requires xet-storage feature)
     #[cfg(feature = "xet-storage")]
     #[serde(default)]
@@ -566,7 +566,7 @@ mod tests {
             signature: GitSignature::new("Test", "test@example.com"),
             worktree: WorktreeConfig::default(),
             #[cfg(feature = "gittorrent-transport")]
-            gittorrent: gittorrent::service::GitTorrentConfig::default(),
+            gittorrent: hyprstream_p2p::service::GitTorrentConfig::default(),
             #[cfg(feature = "xet-storage")]
             xet: git_xet_filter::XetConfig::default(),
         };

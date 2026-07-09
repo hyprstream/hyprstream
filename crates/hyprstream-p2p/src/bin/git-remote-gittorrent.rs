@@ -7,7 +7,7 @@
 //! Configuration is read from environment variables and config files.
 
 use std::io::Write;
-use gittorrent::{Result, git::remote_helper::run_git_remote_helper, service::GitTorrentConfig};
+use hyprstream_p2p::{Result, git::remote_helper::run_git_remote_helper, service::GitTorrentConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {

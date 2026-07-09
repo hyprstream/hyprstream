@@ -14,14 +14,14 @@ use std::sync::Arc;
 
 /// Bridge between gittorrent's TransportFactory and git2db's TransportFactory
 pub struct GittorrentTransportBridge {
-    factory: gittorrent::GittorrentTransportFactory,
+    factory: hyprstream_p2p::GittorrentTransportFactory,
 }
 
 impl GittorrentTransportBridge {
     /// Create a new bridge with the given gittorrent service
-    pub fn new(service: Arc<gittorrent::service::GitTorrentService>) -> Self {
+    pub fn new(service: Arc<hyprstream_p2p::service::GitTorrentService>) -> Self {
         Self {
-            factory: gittorrent::GittorrentTransportFactory::new(service),
+            factory: hyprstream_p2p::GittorrentTransportFactory::new(service),
         }
     }
 }
@@ -29,11 +29,11 @@ impl GittorrentTransportBridge {
 impl TransportFactory for GittorrentTransportBridge {
     fn create_transport(&self, url: &str) -> anyhow::Result<Box<dyn SmartSubtransport>> {
         // Delegate to gittorrent's factory
-        gittorrent::git::transport::TransportFactory::create_transport(&self.factory, url)
+        hyprstream_p2p::git::transport::TransportFactory::create_transport(&self.factory, url)
     }
 
     fn supports_url(&self, url: &str) -> bool {
-        gittorrent::git::transport::TransportFactory::supports_url(&self.factory, url)
+        hyprstream_p2p::git::transport::TransportFactory::supports_url(&self.factory, url)
     }
 }
 
@@ -63,7 +63,7 @@ impl TransportFactory for GittorrentTransportBridge {
 /// ).await?;
 ///
 /// // Option 2: Load gittorrent config independently
-/// let gittorrent_config = gittorrent::service::GitTorrentConfig::load()?;
+/// let gittorrent_config = hyprstream_p2p::service::GitTorrentConfig::load()?;
 /// let service = gittorrent_integration::register_gittorrent(
 ///     manager,
 ///     gittorrent_config
@@ -71,9 +71,9 @@ impl TransportFactory for GittorrentTransportBridge {
 /// ```
 pub async fn register_gittorrent(
     manager: &crate::manager::GitManager,
-    config: gittorrent::service::GitTorrentConfig,
-) -> anyhow::Result<Arc<gittorrent::service::GitTorrentService>> {
-    let service = Arc::new(gittorrent::service::GitTorrentService::new(config).await?);
+    config: hyprstream_p2p::service::GitTorrentConfig,
+) -> anyhow::Result<Arc<hyprstream_p2p::service::GitTorrentService>> {
+    let service = Arc::new(hyprstream_p2p::service::GitTorrentService::new(config).await?);
     let bridge = Arc::new(GittorrentTransportBridge::new(service.clone()));
     manager.register_transport("gittorrent", bridge)?;
 

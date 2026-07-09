@@ -203,8 +203,8 @@ impl Write for GittorrentStream {
 ///
 /// ```no_run
 /// use std::sync::Arc;
-/// use gittorrent::service::GitTorrentService;
-/// use gittorrent::git::transport::register_gittorrent_transport;
+/// use hyprstream_p2p::service::GitTorrentService;
+/// use hyprstream_p2p::git::transport::register_gittorrent_transport;
 ///
 /// # async fn example() -> anyhow::Result<()> {
 /// let service = Arc::new(GitTorrentService::new(Default::default()).await?);
