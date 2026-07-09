@@ -7170,6 +7170,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "git2",
  "git2db",
+ "hyprstream-crypto",
  "hyprstream-rpc",
  "iroh",
  "p256",

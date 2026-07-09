@@ -16,6 +16,12 @@ anyhow = { workspace = true }
 # at9p capsule CIDs use the shared CIDv1/multihash API from the resolver/RPC
 # layer instead of duplicating multicodec or BLAKE3-512 encoding locally.
 hyprstream-rpc = { path = "../hyprstream-rpc" }
+# at9p capsule/update signing (#883): policy-gated composite COSE (EdDSA +
+# ML-DSA-65) via the light transport-free crypto crate. Unconditional (no
+# feature gate) — Hybrid is pinned for at9p records regardless of build.
+hyprstream-crypto = { path = "../hyprstream-crypto" }
+# Ed25519 signing/verifying keys for the at9p composite signature path.
+ed25519-dalek = { workspace = true }
 blake3 = { workspace = true }
 # Note: DAG-CBOR + CIDv1 + varints are hand-rolled in src/dag_cbor.rs and
 # src/cid.rs to enforce the determinism invariants (sorted keys, minimal ints,
@@ -50,8 +56,8 @@ tracing-subscriber = { workspace = true }
 iroh = { workspace = true }
 # did:key derivation from the Ed25519 node key (ed25519_to_did_key) + the
 # IrohSubstrate two-plane transport are re-exported by hyprstream-rpc (already a
-# dev-dep above); ed25519-dalek provides the SigningKey type the node key uses.
-ed25519-dalek = { workspace = true }
+# dev-dep above); ed25519-dalek (SigningKey type) is now a normal dependency
+# for the at9p composite signing path (#883).
 
 [lints]
 workspace = true

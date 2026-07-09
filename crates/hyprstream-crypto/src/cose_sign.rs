@@ -414,6 +414,36 @@ pub fn decode_composite_for_test(bytes: &[u8]) -> Result<(Vec<u8>, Option<Vec<u8
     decode_composite(bytes)
 }
 
+/// Split a nested composite blob into its raw component signatures
+/// `(ed25519_signature, Option<mldsa65_signature>)`.
+///
+/// This is the inverse projection of [`assemble_composite_nested`]: record
+/// layers that persist the composite in a *decomposed* schema (e.g. the at9p
+/// capsule/update `CoseCompositeSignature`, storing the EdDSA and ML-DSA-65
+/// signatures in separate fields) sign via [`sign_composite`], store the two
+/// raw signatures returned here, then reconstruct the nested blob with
+/// [`assemble_composite_nested`] for [`verify_composite`]. The signatures are
+/// the raw component signatures (64-byte Ed25519, 3309-byte ML-DSA-65); the
+/// kids and protected headers are deterministic and rebuilt on reassembly.
+///
+/// The inner→outer binding (the outer ML-DSA layer signs `payload ‖ inner_sig`)
+/// is preserved by that reassembly + verify round-trip — it is *not* something
+/// the decomposed store has to carry.
+pub fn split_composite(bytes: &[u8]) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
+    let (inner_bytes, outer_bytes) = decode_composite(bytes)?;
+    let inner = CoseSign1::from_slice(&inner_bytes)
+        .map_err(|e| anyhow!("malformed inner EdDSA COSE_Sign1: {e}"))?;
+    let outer_sig = match outer_bytes {
+        Some(ob) => {
+            let outer = CoseSign1::from_slice(&ob)
+                .map_err(|e| anyhow!("malformed outer ML-DSA COSE_Sign1: {e}"))?;
+            Some(outer.signature)
+        }
+        None => None,
+    };
+    Ok((inner.signature, outer_sig))
+}
+
 /// Test-only: re-encode a composite from `(inner_bytes, Option<outer_bytes>)`.
 #[doc(hidden)]
 pub fn encode_composite_for_test(inner: Vec<u8>, outer: Option<Vec<u8>>) -> Result<Vec<u8>> {
