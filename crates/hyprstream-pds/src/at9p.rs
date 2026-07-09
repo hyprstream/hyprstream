@@ -66,6 +66,19 @@ impl HybridKeyPair {
         ])
     }
 
+    /// KERI pre-rotation commitment digest for this keypair: `BLAKE3-512` over
+    /// the canonical DAG-CBOR of the hybrid keypair (both the Ed25519 and
+    /// ML-DSA-65 public keys). This is the value a capsule author places in
+    /// `next_key_commitments` to pre-commit the *next* key set, and the value
+    /// the B1 successor-check ([`crate::at9p_chain`]) recomputes from an
+    /// update-record's revealed signing key to prove it was pre-committed.
+    ///
+    /// Hashing both components together binds them: an attacker cannot swap one
+    /// half of the hybrid pair without changing the commitment.
+    pub fn commitment_digest(&self) -> [u8; H512_LEN] {
+        h512(&self.to_value().encode())
+    }
+
     fn from_value(value: &DagCbor) -> Result<Self> {
         reject_unknown(value, &["ed25519Pub", "mldsa65Pub"], "at9p hybrid keypair")?;
         Self::new(
@@ -857,11 +870,19 @@ impl Shard {
     }
 }
 
-pub fn at9p_capsule_cid512(canonical_capsule_bytes: &[u8]) -> Result<String> {
+/// BLAKE3 extended to a 512-bit (`H512_LEN`-byte) output — the at9p digest
+/// primitive (`H512` in design #879 §5). Used for capsule CIDs, update-record
+/// linkage digests (`prev-record-digest`), and key commitments.
+pub fn h512(bytes: &[u8]) -> [u8; H512_LEN] {
     let mut digest = [0u8; H512_LEN];
     let mut hasher = blake3::Hasher::new();
-    hasher.update(canonical_capsule_bytes);
+    hasher.update(bytes);
     hasher.finalize_xof().fill(&mut digest);
+    digest
+}
+
+pub fn at9p_capsule_cid512(canonical_capsule_bytes: &[u8]) -> Result<String> {
+    let digest = h512(canonical_capsule_bytes);
     encode_cid(Codec::At9pCapsule, HashAlgo::Blake3, &digest)
 }
 
