@@ -20,9 +20,11 @@
 //! # Encoding
 //!
 //! Records are **DAG-CBOR**. The field order in the encoded map is the canonical
-//! (length-first, then lexicographic) order, which for these three keys is
-//! `createdAt`, `currentOid`, `repo` — the encoder handles this; callers do not
-//! need to care.
+//! order — **pure lexicographic byte order** (RFC 7049 §4.2.1 "core
+//! determinism", matching atproto's `@atproto/lex-cbor`). For these three keys
+//! that is `createdAt`, `currentOid`, `repo`. (NOT length-first-then-lex; that's
+//! the older RFC 7049 §3.9 form, which atproto rejects.) The encoder handles
+//! this; callers do not need to care.
 //!
 //! `currentOid` is a `format: "cid"` **string** — *not* a CID link. It references
 //! external git content by OID, so it is carried as text and validated as a CID
@@ -226,14 +228,14 @@ mod tests {
     fn record_fields_canonical_order() {
         let r = sample();
         let bytes = r.to_dag_cbor();
-        // Decode raw to confirm key order is length-first: createdAt, currentOid, repo.
+        // Decode raw to confirm key order is pure-lexicographic: createdAt, currentOid, repo.
         let v = DagCbor::decode(&bytes).expect("decode");
         let map = v.as_map().expect("map");
         let keys: Vec<&str> = map.iter().map(|(k, _)| k.as_str().expect("str")).collect();
         assert_eq!(
             keys,
             vec!["createdAt", "currentOid", "repo"],
-            "DAG-CBOR map keys must be canonical (length-first, then lex)"
+            "DAG-CBOR map keys must be pure-lexicographic byte order"
         );
     }
 

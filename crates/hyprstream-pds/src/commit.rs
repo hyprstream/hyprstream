@@ -39,8 +39,9 @@ pub const COMMIT_VERSION: u64 = 3;
 /// An unsigned commit — the form that gets DAG-CBOR-encoded and signed.
 ///
 /// Field order matches atproto (`did`, `version`, `data`, `rev`, `prev`); the
-/// encoder re-sorts canonically (length-first then lex) so the order here is
-/// only for readability. `version` is always [`COMMIT_VERSION`] = 3.
+/// encoder re-sorts canonically (**pure lexicographic byte order**, RFC 7049
+/// §4.2.1 "core determinism" — not length-first) so the order here is only for
+/// readability. `version` is always [`COMMIT_VERSION`] = 3.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UnsignedCommit {
     pub did: String,
