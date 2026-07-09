@@ -670,14 +670,25 @@ fn emit_field_setter(
                         "{indent}{builder_var}.{method}({}, {value_expr});\n",
                         field.slot_offset
                     ));
-                } else if inner.starts_with("List(") {
-                    panic!(
-                        "ts_codegen: field `{}: {}` is a nested list (List(List(_))) — \
-                         the capnp.ts runtime does not yet support double indirection. \
-                         This must be implemented in message.rs before this field can be \
-                         referenced; a silently-dropped comment is not acceptable (#725).",
-                        field.name, field.type_name
-                    );
+                } else if let Some(nested_inner) = super::extract_list_inner_type(inner) {
+                    // List(List(<nested_inner>)) — a doubly-nested primitive list
+                    // (e.g. `embeddings: List(List(Float32))`). The runtime has a
+                    // direct setter that takes the whole nested array.
+                    if let Some(method) = super::nested_list_setter_method(nested_inner) {
+                        out.push_str(&format!(
+                            "{indent}{builder_var}.{method}({}, {value_expr});\n",
+                            field.slot_offset
+                        ));
+                    } else {
+                        panic!(
+                            "ts_codegen: field `{}: {}` is a nested list of `{nested_inner}` \
+                             — the capnp.ts runtime does not yet support this inner element \
+                             type for List(List(_)). This must be implemented in message.rs \
+                             before this field can be referenced; a silently-dropped comment \
+                             is not acceptable (#758).",
+                            field.name, field.type_name
+                        );
+                    }
                 }
                 // List(Struct) — init struct list and set each element's fields.
                 // Claim a unique ID from the per-function counter so nested lists at
@@ -1127,6 +1138,39 @@ struct Reach {
             out.contains(".setInt64List("),
             "expected a real setInt64List call for List(Int64):\n{out}"
         );
+    }
+
+    /// A nested-list (`List(List(Float32))`) field, mirroring the
+    /// `embeddings` field of `EmbedImagesResponse` in `inference.capnp` (the
+    /// #758 repro — see the matching parser-side test in `parsers.rs`).
+    const NESTED_LIST_SCHEMA: &str = r#"
+@0xd00dfeeda00dfeec;
+
+struct EmbedImagesResponse {
+  embeddings @0 :List(List(Float32));
+  dimensions @1 :UInt32;
+}
+"#;
+
+    #[test]
+    fn nested_list_field_builds_with_real_setter() {
+        let schema = parse_schema("embedbuild", NESTED_LIST_SCHEMA);
+        let mut out = String::new();
+        super::generate_struct_builders(&mut out, &schema);
+
+        // Must write through the real nested-list runtime setter, never the
+        // old #725 hard-panic ("nested list ... does not yet support double
+        // indirection") and never a silently dropped comment.
+        assert!(
+            out.contains(".setFloat32ListList(0,"),
+            "expected a real setFloat32ListList call for List(List(Float32)):\n{out}"
+        );
+        assert!(
+            !out.contains("does not yet support double indirection"),
+            "must never emit the old #725 nested-list panic path:\n{out}"
+        );
+        // The sibling scalar field must still build correctly alongside it.
+        assert!(out.contains(".setUint32(0,"), "{out}");
     }
 
     /// A field whose type references a struct that isn't in the parsed

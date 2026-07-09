@@ -178,12 +178,23 @@ pub fn generate_parsers(out: &mut String, service_name: &str, schema: &ParsedSch
                         &variant.name,
                         &format!("reader.{method}({})", vf.slot_offset),
                     );
-                } else if inner.starts_with("List(") {
-                    panic!(
-                        "ts_codegen: response variant `{}: {}` is a nested list \
-                         (List(List(_))) — not yet supported by the capnp.ts runtime (#725).",
-                        variant.name, variant.type_name
-                    );
+                } else if let Some(nested_inner) = super::extract_list_inner_type(inner) {
+                    if let Some(method) = super::nested_list_getter_method(nested_inner) {
+                        emit_return(
+                            out,
+                            &non_union_fields,
+                            &variant.name,
+                            &format!("reader.{method}({})", vf.slot_offset),
+                        );
+                    } else {
+                        panic!(
+                            "ts_codegen: response variant `{}: {}` is a nested list of \
+                             `{nested_inner}` — not yet supported by the capnp.ts runtime \
+                             (only primitive-scalar List(List(_)) shapes are implemented) \
+                             (#758).",
+                            variant.name, variant.type_name
+                        );
+                    }
                 } else if let Some(sd) = schema.structs.iter().find(|s| s.name == inner) {
                     emit_struct_list_read(
                         out,
@@ -379,12 +390,22 @@ pub fn generate_struct_parsers(out: &mut String, schema: &ParsedSchema) {
                         &variant.name,
                         &format!("reader.{method}({})", variant.slot_offset),
                     );
-                } else if inner.starts_with("List(") {
-                    panic!(
-                        "ts_codegen: union arm `{}: {}` is a nested list (List(List(_))) — \
-                         not yet supported by the capnp.ts runtime (#725).",
-                        variant.name, variant.type_name
-                    );
+                } else if let Some(nested_inner) = super::extract_list_inner_type(inner) {
+                    if let Some(method) = super::nested_list_getter_method(nested_inner) {
+                        emit_return(
+                            out,
+                            &non_union_fields,
+                            &variant.name,
+                            &format!("reader.{method}({})", variant.slot_offset),
+                        );
+                    } else {
+                        panic!(
+                            "ts_codegen: union arm `{}: {}` is a nested list of `{nested_inner}` \
+                             — not yet supported by the capnp.ts runtime (only \
+                             primitive-scalar List(List(_)) shapes are implemented) (#758).",
+                            variant.name, variant.type_name
+                        );
+                    }
                 } else if let Some(isd) = schema.structs.iter().find(|s| s.name == inner) {
                     emit_struct_list_read(
                         out,
@@ -737,11 +758,16 @@ fn emit_inner_variant_read_from(
             let inner = super::extract_list_inner_type(t).unwrap_or("");
             if let Some(method) = super::list_getter_method(inner) {
                 format!("{reader_var}.{method}({})", f.slot_offset)
-            } else if inner.starts_with("List(") {
-                panic!(
-                    "ts_codegen: inner variant `{type_name}` is a nested list \
-                     (List(List(_))) — not yet supported by the capnp.ts runtime (#725)."
-                );
+            } else if let Some(nested_inner) = super::extract_list_inner_type(inner) {
+                if let Some(method) = super::nested_list_getter_method(nested_inner) {
+                    format!("{reader_var}.{method}({})", f.slot_offset)
+                } else {
+                    panic!(
+                        "ts_codegen: inner variant `{type_name}` is a nested list of \
+                         `{nested_inner}` — not yet supported by the capnp.ts runtime \
+                         (only primitive-scalar List(List(_)) shapes are implemented) (#758)."
+                    );
+                }
             } else if let Some(sd) = schema.structs.iter().find(|s| s.name == inner) {
                 emit_struct_list_field_expr(reader_var, f.slot_offset, sd, schema)
             } else {
@@ -878,12 +904,17 @@ fn emit_pointer_read_expr(
         Some(inner) => {
             if let Some(method) = super::list_getter_method(inner) {
                 format!("{reader_var}.{method}({})", field.slot_offset)
-            } else if inner.starts_with("List(") {
-                panic!(
-                    "ts_codegen: field `{}: {}` is a nested list (List(List(_))) — not yet \
-                     supported by the capnp.ts runtime (#725).",
-                    field.name, field.type_name
-                );
+            } else if let Some(nested_inner) = super::extract_list_inner_type(inner) {
+                if let Some(method) = super::nested_list_getter_method(nested_inner) {
+                    format!("{reader_var}.{method}({})", field.slot_offset)
+                } else {
+                    panic!(
+                        "ts_codegen: field `{}: {}` is a nested list of `{nested_inner}` — \
+                         not yet supported by the capnp.ts runtime (only primitive-scalar \
+                         List(List(_)) shapes are implemented) (#758).",
+                        field.name, field.type_name
+                    );
+                }
             } else if let Some(isd) = schema.structs.iter().find(|s| s.name == inner) {
                 emit_struct_list_field_expr(reader_var, field.slot_offset, isd, schema)
             } else {
@@ -1571,6 +1602,40 @@ struct EndpointInfo {
         // The two Data fields specifically must read through the real getter,
         // not be skipped.
         assert!(parser.contains(".getData("), "{parser}");
+    }
+
+    /// A nested-list (`List(List(Float32))`) field, mirroring the
+    /// `embeddings` field of `EmbedImagesResponse` in `inference.capnp` (the
+    /// #758 repro: a full regen of `inference.ts`/`model.ts` aborted on
+    /// exactly this shape because nested lists had no codegen support).
+    const NESTED_LIST_SCHEMA: &str = r#"
+@0xd00dfeeda00dfeee;
+
+struct EmbedImagesResponse {
+  embeddings @0 :List(List(Float32));
+  dimensions @1 :UInt32;
+}
+"#;
+
+    #[test]
+    fn nested_list_field_parses_with_real_getter() {
+        let schema = parse_schema("embedparse", NESTED_LIST_SCHEMA);
+        let mut out = String::new();
+        super::generate_struct_parsers(&mut out, &schema);
+
+        // Must read through the real nested-list runtime getter, never the
+        // old #725 hard-panic ("nested list ... not yet supported") and
+        // never a silent `[]` fallback.
+        assert!(
+            out.contains("reader.getFloat32ListList(0)"),
+            "expected a real getFloat32ListList call for List(List(Float32)):\n{out}"
+        );
+        assert!(
+            !out.contains("not yet supported"),
+            "must never emit the old #725 nested-list panic path:\n{out}"
+        );
+        // The sibling scalar field must still parse correctly alongside it.
+        assert!(out.contains("reader.getUint32(0)"), "{out}");
     }
 
     /// A field whose type references a struct that isn't in the parsed

@@ -254,6 +254,54 @@ pub(crate) fn list_getter_method(inner: &str) -> Option<&str> {
     })
 }
 
+/// Return the TypeScript setter method name for a `List(List(<inner>))` field,
+/// given the doubly-nested (innermost) element type name — e.g. `"Float32"`
+/// for the `embeddings: List(List(Float32))` shape used by
+/// `inference.capnp`/`model.capnp`.
+///
+/// Mirrors [`list_setter_method`] one level deeper: the runtime encodes the
+/// outer list as a plain pointer list (each element itself a `List(<inner>)`
+/// pointer), so only inner element types the flat list runtime already
+/// supports as a *primitive* list are covered here — `None` for `Text`/`Data`
+/// (nested `List(List(Text))`/`List(List(Data))`) and struct/list inner types,
+/// which are not yet implemented and must remain a hard generator error
+/// rather than silently degrading (#758).
+pub(crate) fn nested_list_setter_method(inner: &str) -> Option<&str> {
+    Some(match inner {
+        "Bool" => "setBoolListList",
+        "UInt8" => "setUint8ListList",
+        "Int8" => "setInt8ListList",
+        "UInt16" => "setUint16ListList",
+        "Int16" => "setInt16ListList",
+        "UInt32" => "setUint32ListList",
+        "Int32" => "setInt32ListList",
+        "UInt64" => "setUint64ListList",
+        "Int64" => "setInt64ListList",
+        "Float32" => "setFloat32ListList",
+        "Float64" => "setFloat64ListList",
+        _ => return None,
+    })
+}
+
+/// Return the TypeScript getter method name for a `List(List(<inner>))`
+/// field. Mirrors [`nested_list_setter_method`] — see its docs.
+pub(crate) fn nested_list_getter_method(inner: &str) -> Option<&str> {
+    Some(match inner {
+        "Bool" => "getBoolListList",
+        "UInt8" => "getUint8ListList",
+        "Int8" => "getInt8ListList",
+        "UInt16" => "getUint16ListList",
+        "Int16" => "getInt16ListList",
+        "UInt32" => "getUint32ListList",
+        "Int32" => "getInt32ListList",
+        "UInt64" => "getUint64ListList",
+        "Int64" => "getInt64ListList",
+        "Float32" => "getFloat32ListList",
+        "Float64" => "getFloat64ListList",
+        _ => return None,
+    })
+}
+
 /// Return the default TS expression for a Cap'n Proto type (used for optional field coalescing).
 fn default_value_expr(type_name: &str) -> &str {
     match type_name {
