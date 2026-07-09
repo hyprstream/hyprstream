@@ -7125,6 +7125,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyprstream-ledger"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.11.0",
+ "blake3",
+ "ciborium",
+ "ed25519-dalek 2.2.0",
+ "hyprstream-crypto",
+ "proptest",
+ "serde",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "hyprstream-metrics"
 version = "0.1.0"
 dependencies = [
