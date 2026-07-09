@@ -754,6 +754,62 @@ mod tests {
         nix::sys::stat::utimes(path, &tv, &tv).unwrap();
     }
 
+    /// RAII guard to set/unset a process env var for the duration of a test and
+    /// restore the previous value, keeping env-mutating tests from leaking state.
+    struct EnvVarGuard {
+        key: String,
+        prev: Option<String>,
+    }
+    impl EnvVarGuard {
+        fn set(key: &str, val: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, val);
+            Self { key: key.to_owned(), prev }
+        }
+        fn unset(key: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key: key.to_owned(), prev }
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(&self.key, v),
+                None => std::env::remove_var(&self.key),
+            }
+        }
+    }
+
+    /// `credentials_dir()` precedence: `HYPRSTREAM__SECRETS__PATH` wins when set;
+    /// otherwise resolution falls back to a `<config_dir>/credentials` path.
+    /// Both cases in one test — the env var is process-global and tests run in
+    /// parallel, so splitting them would race.
+    #[test]
+    fn test_credentials_dir_precedence() {
+        const VAR: &str = "HYPRSTREAM__SECRETS__PATH";
+
+        // (a) env var set → returns exactly that path.
+        {
+            let _g = EnvVarGuard::set(VAR, "/run/credentials/hyprstream");
+            let dir = credentials_dir().unwrap();
+            assert_eq!(dir, std::path::PathBuf::from("/run/credentials/hyprstream"));
+        }
+
+        // (b) env var unset → default resolution yields a path ending in
+        // `credentials` (via config load or the XDG fallback).
+        {
+            let _g = EnvVarGuard::unset(VAR);
+            let dir = credentials_dir().unwrap();
+            assert_eq!(
+                dir.file_name().and_then(|n| n.to_str()),
+                Some("credentials"),
+                "default resolution should end in 'credentials': {}",
+                dir.display()
+            );
+        }
+    }
+
     #[test]
     fn test_is_writable_leaves_no_probe_file() {
         let dir = TempDir::new().unwrap();
