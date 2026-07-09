@@ -7280,6 +7280,7 @@ dependencies = [
  "hyprstream-rpc",
  "iroh",
  "p256",
+ "parking_lot 0.12.4",
  "proptest",
  "rand 0.8.5",
  "sha2 0.10.9",

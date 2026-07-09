@@ -23,6 +23,8 @@ hyprstream-crypto = { path = "../hyprstream-crypto" }
 # Ed25519 signing/verifying keys for the at9p composite signature path.
 ed25519-dalek = { workspace = true }
 blake3 = { workspace = true }
+# Non-poisoning Mutex for the in-memory duplicity watermark store (#886).
+parking_lot = { workspace = true }
 # Note: DAG-CBOR + CIDv1 + varints are hand-rolled in src/dag_cbor.rs and
 # src/cid.rs to enforce the determinism invariants (sorted keys, minimal ints,
 # tag-42 links) that serde-driven CBOR cannot guarantee. No CBOR/CID crate dep.
