@@ -13,6 +13,10 @@ p256 = { workspace = true }
 sha2 = { workspace = true }
 # Error handling.
 anyhow = { workspace = true }
+# at9p capsule CIDs use the shared CIDv1/multihash API from the resolver/RPC
+# layer instead of duplicating multicodec or BLAKE3-512 encoding locally.
+hyprstream-rpc = { path = "../hyprstream-rpc" }
+blake3 = { workspace = true }
 # Note: DAG-CBOR + CIDv1 + varints are hand-rolled in src/dag_cbor.rs and
 # src/cid.rs to enforce the determinism invariants (sorted keys, minimal ints,
 # tag-42 links) that serde-driven CBOR cannot guarantee. No CBOR/CID crate dep.
@@ -20,14 +24,13 @@ anyhow = { workspace = true }
 [dev-dependencies]
 # Random signing keys for round-trip / tamper tests.
 rand = { workspace = true }
+proptest = { workspace = true }
 
 # E1 (#421) end-to-end content-addressing + identity test. The dev-deps are the
 # three crates whose composition the test validates: git2db (repo → commit OID),
 # hyprstream-rpc (OID → git-raw CID string), and the PDS layers exercised via the
-# integration test binary itself. They only compile for `cargo test -p
-# hyprstream-pds`; the library's normal build stays the minimal crypto layer.
+# integration test binary itself.
 git2db = { path = "../git2db" }
-hyprstream-rpc = { path = "../hyprstream-rpc" }
 # git2 re-exported by git2db; used to seed a local repo and read the commit OID.
 git2 = { workspace = true }
 # Temp dirs for the git2db registry + source repos.

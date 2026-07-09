@@ -7166,12 +7166,14 @@ name = "hyprstream-pds"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "ed25519-dalek 2.2.0",
  "git2",
  "git2db",
  "hyprstream-rpc",
  "iroh",
  "p256",
+ "proptest",
  "rand 0.8.5",
  "sha2 0.10.9",
  "tempfile",

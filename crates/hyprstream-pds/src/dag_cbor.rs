@@ -42,6 +42,7 @@ const MT_TEXT: u8 = 3;
 const MT_ARRAY: u8 = 4;
 const MT_MAP: u8 = 5;
 const MT_TAG: u8 = 6;
+const MT_SIMPLE: u8 = 7;
 
 /// The CBOR tag identifying a DAG-CBOR link (CID).
 const TAG_CID: u64 = 42;
@@ -115,9 +116,9 @@ impl DagCbor {
 
     fn write(&self, out: &mut Vec<u8>) {
         match self {
-            DagCbor::Null => write_head(out, MT_UNSIGNED, 22), // 0xf6
-            DagCbor::Bool(false) => write_head(out, MT_UNSIGNED, 20), // 0xf4
-            DagCbor::Bool(true) => write_head(out, MT_UNSIGNED, 21), // 0xf5
+            DagCbor::Null => write_head(out, MT_SIMPLE, 22), // 0xf6
+            DagCbor::Bool(false) => write_head(out, MT_SIMPLE, 20), // 0xf4
+            DagCbor::Bool(true) => write_head(out, MT_SIMPLE, 21), // 0xf5
             DagCbor::Unsigned(n) => write_uint(out, MT_UNSIGNED, *n),
             DagCbor::Negative(n) => {
                 // CBOR encodes negatives as -1 - n in major type 1 (uint).
@@ -188,19 +189,7 @@ impl DagCbor {
         }
 
         match major {
-            MT_UNSIGNED => {
-                let n = read_arg(info, input, cursor)?;
-                // CBOR simple values (major 0, info 0..=23) carry the simple
-                // value in the low byte. We model Null (22 = 0xf6), True (21),
-                // and False (20) as the major-0 simple-value encodings per
-                // RFC 7049 §3.6, so they round-trip with our encoder.
-                Ok(match n {
-                    20 => DagCbor::Bool(false),
-                    21 => DagCbor::Bool(true),
-                    22 => DagCbor::Null,
-                    other => DagCbor::Unsigned(other),
-                })
-            }
+            MT_UNSIGNED => Ok(DagCbor::Unsigned(read_arg(info, input, cursor)?)),
             MT_NEGATIVE => {
                 let n = read_arg(info, input, cursor)?;
                 // Decode major-1 uint into -1 - n as i128.
@@ -220,7 +209,10 @@ impl DagCbor {
             }
             MT_ARRAY => {
                 let len = read_arg(info, input, cursor)? as usize;
-                let mut items = Vec::with_capacity(len);
+                // Cap preallocation by what the remaining input could possibly
+                // hold (each element needs at least 1 byte) — the length arg is
+                // untrusted and a huge value must not trigger a capacity panic.
+                let mut items = Vec::with_capacity(len.min(input.len().saturating_sub(*cursor)));
                 for _ in 0..len {
                     items.push(Self::read(input, cursor)?);
                 }
@@ -228,7 +220,10 @@ impl DagCbor {
             }
             MT_MAP => {
                 let len = read_arg(info, input, cursor)? as usize;
-                let mut pairs: Vec<(DagCbor, DagCbor)> = Vec::with_capacity(len);
+                // Same untrusted-length cap as the array arm (each entry needs
+                // at least 2 bytes, so remaining-input is a safe upper bound).
+                let mut pairs: Vec<(DagCbor, DagCbor)> =
+                    Vec::with_capacity(len.min(input.len().saturating_sub(*cursor)));
                 let mut prev_key: Option<Vec<u8>> = None;
                 for _ in 0..len {
                     let k = Self::read(input, cursor)?;
@@ -247,6 +242,12 @@ impl DagCbor {
                 Ok(DagCbor::Map(pairs))
             }
             MT_TAG => bail!("unexpected CBOR tag (only tag 42/CID is supported)"),
+            MT_SIMPLE => match info {
+                20 => Ok(DagCbor::Bool(false)),
+                21 => Ok(DagCbor::Bool(true)),
+                22 => Ok(DagCbor::Null),
+                _ => bail!("unsupported CBOR simple value {info}"),
+            },
             _ => bail!("unknown CBOR major type {major}"),
         }
     }
@@ -443,6 +444,9 @@ mod tests {
             DagCbor::Bool(true),
             DagCbor::Bool(false),
             DagCbor::Unsigned(0),
+            DagCbor::Unsigned(20),
+            DagCbor::Unsigned(21),
+            DagCbor::Unsigned(22),
             DagCbor::Unsigned(23),
             DagCbor::Unsigned(24),
             DagCbor::Unsigned(0x1_0000),
@@ -472,6 +476,22 @@ mod tests {
     }
 
     #[test]
+    fn decode_huge_array_header_errors_not_panics() {
+        // 0x9b = array with 8-byte length arg; length claims 2^64-1 elements
+        // but the input is only 9 bytes. Must return Err — not panic with a
+        // capacity overflow or attempt a huge allocation.
+        let input = [0x9b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        assert!(DagCbor::decode(&input).is_err());
+    }
+
+    #[test]
+    fn decode_huge_map_header_errors_not_panics() {
+        // 0xbb = map with 8-byte length arg claiming 2^64-1 entries.
+        let input = [0xbb, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        assert!(DagCbor::decode(&input).is_err());
+    }
+
+    #[test]
     fn decode_rejects_unsorted_keys() {
         // Hand-build a map with keys in WRONG order; decode must reject it.
         let bad = {
@@ -496,6 +516,10 @@ mod tests {
     fn encode_minimal_widths() {
         // Determinism: minimal-width integer heads.
         assert_eq!(DagCbor::Unsigned(0).encode(), vec![0x00]);
+        assert_eq!(DagCbor::Bool(false).encode(), vec![0xf4]);
+        assert_eq!(DagCbor::Bool(true).encode(), vec![0xf5]);
+        assert_eq!(DagCbor::Null.encode(), vec![0xf6]);
+        assert_eq!(DagCbor::Unsigned(20).encode(), vec![20]);
         assert_eq!(DagCbor::Unsigned(23).encode(), vec![23]);
         assert_eq!(DagCbor::Unsigned(24).encode(), vec![24, 24]);
         assert_eq!(
