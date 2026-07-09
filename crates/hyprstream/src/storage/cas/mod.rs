@@ -3,8 +3,8 @@
 //! One content-addressed store under everything. Every artifact is addressed by a
 //! self-describing **multihash** ([`hyprstream_rpc::cid`]), and every ingest is
 //! partitioned into a **dedup domain** keyed `(compartment, algorithm,
-//! trust_boundary)` so content is only ever deduplicated against other content in
-//! the *same* domain.
+//! digest_length, trust_boundary)` so content is only ever deduplicated against
+//! other content in the *same* domain.
 //!
 //! ## What this layer is
 //!
@@ -32,6 +32,10 @@
 //!   (READ-only here — the substrate never authors or enforces MAC policy).
 //! - **algorithm** — SHA-1 content is never deduplicated against SHA-256; the pair
 //!   would lean on the weaker collision resistance.
+//! - **digest_length** — length is part of multihash/CID identity, so it is part of
+//!   the dedup key: BLAKE3 is an XOF and `BLAKE3-512(x)[0:32] == BLAKE3-256(x)`,
+//!   so the two widths must not share a storage root (#812/#881 joint decision).
+//!   Ingest is BLAKE3-256 today; a 512-bit width lands as its own root in #881.
 //! - **trust_boundary** — node-local content is never deduplicated against
 //!   shared-remote content (an existence/content oracle across the boundary, U5).
 //!
@@ -48,7 +52,7 @@ mod manifest;
 mod mount;
 mod substrate;
 
-pub use domain::{DedupDomain, TrustBoundary};
+pub use domain::{DedupDomain, InvalidDedupDomain, TrustBoundary};
 pub use manifest::{BlobManifest, FILE_RECONSTRUCTION_CODEC, cid_from_merkle, merkle_from_address};
 pub use mount::{
     AllowAllCasAuthorizer, CasMount, CasMountAuthorizer, CasMountAuthzRequest, CasMountObjectKind,
