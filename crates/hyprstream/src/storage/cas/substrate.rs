@@ -16,6 +16,11 @@ use super::domain::DedupDomain;
 use super::manifest::{cid_from_merkle, merkle_from_address, BlobManifest};
 use super::CasError;
 
+/// Hex-character length of a `digest_length`-byte digest (2 hex chars per byte).
+const fn hex_digest_len(digest_length: u16) -> usize {
+    digest_length as usize * 2
+}
+
 /// The L1 unified content-addressed store.
 ///
 /// A thin, domain-partitioning facade over `cas_serve::CasStore`. Construct once
@@ -52,21 +57,33 @@ impl CasSubstrate {
     /// boundaries stay identical to xet-core. The substrate adds the canonical
     /// multihash CID and attaches the `security_label` carrier (plumb-through only).
     ///
-    /// Only BLAKE3-256 ingest is implemented today (the merkle the store computes
-    /// is BLAKE3-based); a non-BLAKE3 domain is rejected rather than mislabeled
-    /// with a CID that claims the wrong algorithm. The domain still *keys* every
-    /// algorithm so future non-BLAKE3 content never dedups against BLAKE3 content.
+    /// Only **BLAKE3-256** ingest is implemented today: the merkle the store
+    /// computes is the 32-byte BLAKE3 reconstruction hash, so the domain must
+    /// declare `(Blake3, digest_length = 32)`. Any other `(algorithm, length)`
+    /// pair is rejected rather than mislabeled with a CID that claims the wrong
+    /// algorithm/width. The domain vocabulary still *keys* every algorithm and
+    /// width (see [`DedupDomain`]) so future non-BLAKE3 / wider ingest (e.g. the
+    /// BLAKE3-512 at9p capsule path, #881) never dedups against BLAKE3-256 content
+    /// — it lands as a distinct, length-partitioned storage root.
     pub async fn put(
         &self,
         domain: &DedupDomain,
         data: &[u8],
         security_label: Option<SecurityLabel>,
     ) -> Result<BlobManifest, CasError> {
-        if domain.algorithm != HashAlgo::Blake3 {
+        if domain.algorithm != HashAlgo::Blake3 || domain.digest_length != 32 {
             return Err(CasError::UnsupportedIngestAlgorithm(domain.algorithm));
         }
         let store = self.store_for(domain);
         let put = store.put_file_bytes(data).await?;
+        // The store's merkle is the 32-byte BLAKE3 digest the domain declared;
+        // assert the contract rather than silently emitting a CID of the wrong width.
+        debug_assert_eq!(
+            put.merkle.len(),
+            hex_digest_len(domain.digest_length),
+            "store merkle must be the declared {}-byte digest",
+            domain.digest_length
+        );
         let cid = cid_from_merkle(domain.algorithm, &put.merkle)?;
         Ok(BlobManifest {
             cid,
@@ -202,10 +219,30 @@ mod tests {
         let sub = CasSubstrate::new(dir.path());
         let domain = DedupDomain {
             algorithm: HashAlgo::Sha2_256,
+            digest_length: 32,
             ..DedupDomain::local_default()
         };
         let err = sub.put(&domain, b"hello", None).await.unwrap_err();
         assert!(matches!(err, CasError::UnsupportedIngestAlgorithm(_)));
+    }
+
+    #[tokio::test]
+    async fn blake3_512_ingest_not_yet_supported() {
+        // The domain vocabulary admits a BLAKE3-512 width (length-partitioned
+        // storage root), but ingest of it is #881's job; the substrate must
+        // reject a 512-bit ingest domain rather than silently addressing the
+        // 32-byte merkle as if it were 64 bytes.
+        let dir = tempfile::tempdir().unwrap();
+        let sub = CasSubstrate::new(dir.path());
+        let domain = DedupDomain {
+            digest_length: 64,
+            ..DedupDomain::local_default()
+        };
+        let err = sub.put(&domain, b"hello", None).await.unwrap_err();
+        assert!(
+            matches!(err, CasError::UnsupportedIngestAlgorithm(_)),
+            "BLAKE3-512 ingest must be rejected until #881 lands"
+        );
     }
 
     #[tokio::test]
