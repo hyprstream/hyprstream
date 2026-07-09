@@ -16,10 +16,13 @@
 //! 2. **Integers use minimal encoding**: `u8` < 24 → one byte (major 0/1);
 //!    otherwise the smallest power-of-two width (1/2/4/8 bytes).
 //! 3. **No duplicate keys**: decoding rejects them.
-//! 4. **CIDs are CBOR tag 42** byte strings carrying the DAG-CBOR link payload
+//! 4. **Map keys are text strings**: DAG-CBOR does not allow non-string keys.
+//! 5. **Recursion is bounded**: decoding rejects containers nested deeper than
+//!    [`MAX_RECURSION_DEPTH`] instead of risking stack overflow.
+//! 6. **CIDs are CBOR tag 42** byte strings carrying the DAG-CBOR link payload
 //!    (leading 0x00 identity marker + raw CID bytes), per the
 //!    [DAG-CBOR spec](https://github.com/ipld/specs/blob/master/block-layer/codecs/dag-cbor.md).
-//! 5. **Tag 42 byte strings are reserved**: any non-CID byte string is decoded
+//! 7. **Tag 42 byte strings are reserved**: any non-CID byte string is decoded
 //!    as [`DagCbor::Bytes`], never confused with a link.
 //!
 //! # Why a custom enum rather than `serde` + `ciborium` directly
@@ -46,6 +49,9 @@ const MT_SIMPLE: u8 = 7;
 
 /// The CBOR tag identifying a DAG-CBOR link (CID).
 const TAG_CID: u64 = 42;
+
+/// Maximum nested container/link depth accepted by [`DagCbor::decode`].
+const MAX_RECURSION_DEPTH: usize = 128;
 
 /// A typed DAG-CBOR value.
 ///
@@ -159,17 +165,21 @@ impl DagCbor {
 
     // ── Decoding ────────────────────────────────────────────────────────────
 
-    /// Decode canonical DAG-CBOR bytes, enforcing the determinism constraints
-    /// (sorted keys, no duplicates, minimal-int width on the wire is accepted
-    /// but a re-encode will produce minimal form).
+    /// Decode canonical DAG-CBOR bytes, enforcing the determinism constraints:
+    /// sorted text keys, no duplicates, bounded recursion, and minimal integer
+    /// and length widths on the wire.
     pub fn decode(input: &[u8]) -> Result<Self> {
         let mut cursor = 0usize;
-        let val = Self::read(input, &mut cursor)?;
+        let val = Self::read(input, &mut cursor, 0)?;
         ensure!(cursor == input.len(), "trailing bytes after DAG-CBOR value");
         Ok(val)
     }
 
-    fn read(input: &[u8], cursor: &mut usize) -> Result<Self> {
+    fn read(input: &[u8], cursor: &mut usize, depth: usize) -> Result<Self> {
+        ensure!(
+            depth <= MAX_RECURSION_DEPTH,
+            "DepthLimitExceeded: DAG-CBOR nesting exceeds {MAX_RECURSION_DEPTH}"
+        );
         let head = *input
             .get(*cursor)
             .ok_or_else(|| anyhow!("truncated DAG-CBOR (need at least one byte)"))?;
@@ -214,7 +224,7 @@ impl DagCbor {
                 // untrusted and a huge value must not trigger a capacity panic.
                 let mut items = Vec::with_capacity(len.min(input.len().saturating_sub(*cursor)));
                 for _ in 0..len {
-                    items.push(Self::read(input, cursor)?);
+                    items.push(Self::read(input, cursor, depth + 1)?);
                 }
                 Ok(DagCbor::List(items))
             }
@@ -226,8 +236,12 @@ impl DagCbor {
                     Vec::with_capacity(len.min(input.len().saturating_sub(*cursor)));
                 let mut prev_key: Option<Vec<u8>> = None;
                 for _ in 0..len {
-                    let k = Self::read(input, cursor)?;
-                    let v = Self::read(input, cursor)?;
+                    let k = Self::read(input, cursor, depth + 1)?;
+                    ensure!(
+                        matches!(k, DagCbor::Text(_)),
+                        "DAG-CBOR map key must be a text string"
+                    );
+                    let v = Self::read(input, cursor, depth + 1)?;
                     // Enforce sorted + unique keys: compare against previous.
                     let key_bytes = canonical_key_of(&k);
                     if let Some(ref prev) = prev_key {
@@ -353,26 +367,33 @@ fn write_uint(out: &mut Vec<u8>, major: u8, val: u64) {
 
 /// Read the argument following a CBOR head byte, consuming the appropriate
 /// number of bytes from `input` (the full buffer) and advancing `cursor`.
+/// Non-minimal argument widths are rejected, matching canonical DAG-CBOR.
 fn read_arg(info: u8, input: &[u8], cursor: &mut usize) -> Result<u64> {
     match info {
         0..=23 => Ok(info as u64),
         24 => {
             let b = take(input, cursor, 1)?;
-            Ok(b[0] as u64)
+            let val = b[0] as u64;
+            ensure!(val >= 24, "non-minimal CBOR integer encoding");
+            Ok(val)
         }
         25 => {
             let b = take(input, cursor, 2)?;
-            Ok(u16::from_be_bytes([b[0], b[1]]) as u64)
+            let val = u16::from_be_bytes([b[0], b[1]]) as u64;
+            ensure!(val >= 0x1_00, "non-minimal CBOR integer encoding");
+            Ok(val)
         }
         26 => {
             let b = take(input, cursor, 4)?;
-            Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as u64)
+            let val = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as u64;
+            ensure!(val >= 0x1_0000, "non-minimal CBOR integer encoding");
+            Ok(val)
         }
         27 => {
             let b = take(input, cursor, 8)?;
-            Ok(u64::from_be_bytes([
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-            ]))
+            let val = u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+            ensure!(val >= 0x1_0000_0000, "non-minimal CBOR integer encoding");
+            Ok(val)
         }
         _ => bail!("invalid CBOR argument info {info}"),
     }
@@ -401,13 +422,11 @@ fn take<'a>(input: &'a [u8], cursor: &mut usize, n: usize) -> Result<&'a [u8]> {
 
 /// Canonical comparison for a map key: returns the "canonical key" byte
 /// representation used both for sorting at construction and for verifying order
-/// at decode. For text keys this is the UTF-8 bytes; for byte-string keys, the
-/// raw bytes. (Mixed-type keys are not supported in DAG-CBOR.)
+/// at decode. DAG-CBOR map keys are text strings, so this is always UTF-8 bytes.
 fn canonical_key_of(key: &DagCbor) -> Vec<u8> {
     match key {
         DagCbor::Text(s) => s.as_bytes().to_vec(),
-        DagCbor::Bytes(b) => b.clone(),
-        _ => Vec::new(), // non-string keys are rejected at a higher layer if needed
+        _ => Vec::new(), // non-string keys are rejected before ordering is checked
     }
 }
 
@@ -489,6 +508,39 @@ mod tests {
         // 0xbb = map with 8-byte length arg claiming 2^64-1 entries.
         let input = [0xbb, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
         assert!(DagCbor::decode(&input).is_err());
+    }
+
+    #[test]
+    fn decode_deep_nesting_hits_depth_limit() {
+        let input = vec![0x81; 200 * 1024];
+        let err = DagCbor::decode(&input).expect_err("deep nesting must fail");
+        assert!(
+            err.to_string().contains("DepthLimitExceeded"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_non_string_map_key() {
+        // { 1: 2 } is valid generic CBOR, but DAG-CBOR map keys must be text.
+        let input = [0xa1, 0x01, 0x02];
+        let err = DagCbor::decode(&input).expect_err("integer key must fail");
+        assert!(
+            err.to_string().contains("map key must be a text string"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_non_minimal_unsigned_integer() {
+        // 23 encoded with additional-info 24 instead of the single-byte form.
+        let input = [0x18, 0x17];
+        let err = DagCbor::decode(&input).expect_err("non-minimal int must fail");
+        assert!(
+            err.to_string()
+                .contains("non-minimal CBOR integer encoding"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]
