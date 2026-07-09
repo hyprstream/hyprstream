@@ -30,8 +30,8 @@ use async_trait::async_trait;
 use crate::config::PoolConfig;
 use crate::error::Result;
 
-use super::sandbox::PodSandbox;
 use super::client::{CpuUsage, LinuxContainerResources, MemoryUsage, PodSandboxConfig};
+use super::sandbox::PodSandbox;
 use hyprstream_vfs::{Namespace, Subject};
 
 /// Opaque handle stored on each `PodSandbox`.
@@ -73,6 +73,23 @@ pub enum NamespaceTransport {
     /// environment rather than over any wire transport — the wasm
     /// host-imports path (no separate guest OS to mount into).
     HostImports,
+    /// Deliver the composed namespace over authenticated network 9P and mount it
+    /// in a scheduler-placed Kubernetes pod through `csi.hyprstream.io` (#793).
+    ///
+    /// `endpoint` is the dial-time carrier endpoint selected by the operator
+    /// (normally iroh/QUIC-WebTransport cross-node, vsock for Kata, UDS only
+    /// co-located). The CSI node plugin mints the scoped #862 mount ticket at
+    /// `NodePublishVolume` via Kubernetes CSI `tokenRequests`, so no bearer
+    /// ticket is persisted in the PodSpec. `aname` is the Plan 9 attach name
+    /// selecting the authorized export root; filesystem paths are walked after
+    /// attach inside that root.
+    NineP {
+        endpoint: String,
+        aname: String,
+        plane: String,
+        mounter: String,
+        mount_path: PathBuf,
+    },
 }
 
 /// Result of [`SandboxBackend::deliver_namespace`]: what's now available for
@@ -94,12 +111,24 @@ pub enum NamespaceDelivery {
     BindMount { target: PathBuf },
     /// The namespace was imported directly into the guest's environment.
     HostImports,
+    /// The namespace is represented as a `csi.hyprstream.io` pod volume.
+    NineP {
+        endpoint: String,
+        aname: String,
+        plane: String,
+        mounter: String,
+        mount_path: PathBuf,
+    },
 }
 
 impl std::fmt::Debug for NamespaceDelivery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::VirtioFs { socket_path, mount_tag, .. } => f
+            Self::VirtioFs {
+                socket_path,
+                mount_tag,
+                ..
+            } => f
                 .debug_struct("VirtioFs")
                 .field("socket_path", socket_path)
                 .field("mount_tag", mount_tag)
@@ -108,6 +137,21 @@ impl std::fmt::Debug for NamespaceDelivery {
                 f.debug_struct("BindMount").field("target", target).finish()
             }
             Self::HostImports => write!(f, "HostImports"),
+            Self::NineP {
+                endpoint,
+                aname,
+                plane,
+                mounter,
+                mount_path,
+                ..
+            } => f
+                .debug_struct("NineP")
+                .field("endpoint", endpoint)
+                .field("aname", aname)
+                .field("plane", plane)
+                .field("mounter", mounter)
+                .field("mount_path", mount_path)
+                .finish_non_exhaustive(),
         }
     }
 }
