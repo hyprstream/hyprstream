@@ -565,6 +565,36 @@ mod tests {
     }
 
     #[test]
+    fn canonical_key_order_is_pure_lex_not_length_first() {
+        // The placement `node` record's 5 keys. Their pure-lexicographic byte
+        // order (`createdAt, groups, labels, repo, resources`) differs from the
+        // length-first-then-lex order atproto rejects (`repo, groups, labels,
+        // createdAt, resources`), so this fixture is a real discriminator.
+        // Lock the pure-lex bytes: a "fix" toward length-first (the older RFC
+        // 7049 §3.9 "canonical CBOR" form) would silently break CID/CAR interop
+        // against every other atproto implementation.
+        let keys = ["repo", "labels", "resources", "groups", "createdAt"];
+        let map = DagCbor::str_map(keys.into_iter().map(|k| (k, DagCbor::Unsigned(1))));
+        let decoded = DagCbor::decode(&map.encode()).expect("round-trip");
+        let emitted: Vec<&str> = decoded
+            .as_map()
+            .expect("map")
+            .iter()
+            .map(|(k, _)| k.as_str().expect("text key"))
+            .collect();
+        assert_eq!(
+            emitted,
+            vec!["createdAt", "groups", "labels", "repo", "resources"],
+            "DAG-CBOR map keys must be pure-lexicographic byte order"
+        );
+        assert_ne!(
+            emitted,
+            vec!["repo", "groups", "labels", "createdAt", "resources"],
+            "length-first-then-lex order is the rejected RFC 7049 §3.9 form"
+        );
+    }
+
+    #[test]
     fn encode_minimal_widths() {
         // Determinism: minimal-width integer heads.
         assert_eq!(DagCbor::Unsigned(0).encode(), vec![0x00]);

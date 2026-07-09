@@ -15,8 +15,9 @@
 //! # Encoding
 //!
 //! Like `ai.hyprstream.model`, every record is **DAG-CBOR** with canonical
-//! (length-first, then lexicographic) map-key order. The encoder applies that
-//! ordering, so callers construct fields in any order. Each record has a frozen
+//! map-key order — **pure lexicographic byte order** (RFC 7049 §4.2.1 "core
+//! determinism", not length-first). The encoder applies that ordering, so
+//! callers construct fields in any order. Each record has a frozen
 //! field set: decoding rejects unknown fields. Optional fields are *omitted*
 //! from the encoded map when absent (never encoded as `null`).
 //!
