@@ -411,6 +411,15 @@ impl CapsuleBody {
         Ok(body)
     }
 
+    /// Canonical DAG-CBOR bytes of the capsule body.
+    ///
+    /// This is the signed payload for an at9p capsule: the composite signature
+    /// (see [`crate::at9p_sign`]) covers exactly these bytes, never the
+    /// enclosing `signatures` field.
+    pub fn to_dag_cbor(&self) -> Vec<u8> {
+        self.to_value().encode()
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.version == CAPSULE_VERSION,
@@ -612,6 +621,26 @@ impl UpdateRecord {
 
     pub fn from_dag_cbor(bytes: &[u8]) -> Result<Self> {
         Self::from_value(&decode_canonical(bytes, "at9p update record")?)
+    }
+
+    /// Canonical DAG-CBOR bytes of the update record *without* its `signatures`
+    /// field — the payload the composite signature covers (see
+    /// [`crate::at9p_sign`]).
+    pub fn signable_bytes(&self) -> Vec<u8> {
+        self.signable_value().encode()
+    }
+
+    fn signable_value(&self) -> DagCbor {
+        DagCbor::str_map([
+            ("epoch", DagCbor::Unsigned(self.epoch)),
+            ("expiresAt", DagCbor::Text(self.expires_at.clone())),
+            ("newCapsuleBody", self.new_capsule_body.to_value()),
+            (
+                "prevRecordDigest",
+                DagCbor::Bytes(self.prev_record_digest.to_vec()),
+            ),
+            ("subjectCid512", DagCbor::Text(self.subject_cid512.clone())),
+        ])
     }
 
     fn validate(&self) -> Result<()> {
