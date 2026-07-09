@@ -108,6 +108,14 @@ pub struct Job {
     /// Timeout in minutes
     #[serde(rename = "timeout-minutes", default)]
     pub timeout_minutes: Option<u32>,
+
+    /// Resource hints for scheduling (hyprstream extension, not part of the
+    /// GHA syntax). Consumed by the P2 admission engine (#525) via
+    /// `workflow::scheduler` to derive a `Demand` for the job's sandbox
+    /// reservation. All-zero (the default) means "no resource requirement" —
+    /// existing workflow YAML with no `resources:` key is unaffected.
+    #[serde(default)]
+    pub resources: JobResources,
 }
 
 /// Runner specification
@@ -119,6 +127,24 @@ pub enum RunsOn {
 
     /// Multiple runner labels (AND logic)
     Labels(Vec<String>),
+}
+
+/// Resource hints a job declares for scheduling (hyprstream extension).
+///
+/// GHA has no native `resources:` job key — this is a hyprstream-specific
+/// addition, parsed only when present (`#[serde(default)]` on the `Job`
+/// field), so it never affects existing workflow YAML. See
+/// `workflow::scheduler::job_pod_sandbox_config` for how these map onto the
+/// #525 admission engine's `Demand`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct JobResources {
+    /// Requested CPU, in millicores (e.g. `500` = half a core).
+    pub cpu_millis: u64,
+    /// Requested memory, in bytes.
+    pub memory_bytes: u64,
+    /// Requested GPU count.
+    pub gpu: usize,
 }
 
 /// Step definition

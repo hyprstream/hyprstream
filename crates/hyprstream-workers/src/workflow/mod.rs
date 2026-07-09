@@ -1,7 +1,12 @@
 //! WorkflowService - GitHub Actions compatible workflow orchestration
 //!
-//! Discovers workflows from git repositories, subscribes to events,
-//! and spawns containers via WorkerService.
+//! Discovers workflows from git repositories, subscribes to events, and runs
+//! jobs as scheduled workloads (#527): each job's `runs_on:` + `resources:`
+//! route through the #525 P2 admission engine (`SandboxPool::acquire`) when
+//! the job requests isolation, or stay on the existing in-process VFS/Tcl
+//! execution path otherwise (see `workflow::scheduler` for the mapping).
+//! `WorkflowRunner` talks to `SandboxPool` directly — there is no
+//! `WorkerService` dependency in this crate's workflow engine.
 //!
 //! # Architecture
 //!
@@ -14,8 +19,9 @@
 //!     └── get_run()         → Query run status
 //!     │
 //!     └── WorkflowRunner
-//!           ├── Creates PodSandbox via WorkerService
-//!           └── Executes steps as containers
+//!           ├── JobScheduler → SandboxPool::acquire (isolated jobs) or
+//!           │                  in-proc (`IN_PROC_LABELS`) — #527
+//!           └── Executes steps via VFS `/bin/` ctl calls + TclShell
 //! ```
 
 mod service;
@@ -24,14 +30,16 @@ mod parser;
 mod triggers;
 mod subscription;
 mod runner;
+pub mod scheduler;
 pub mod adapter;
 pub mod gh_adapter;
 
 pub use service::WorkflowService;
-pub use parser::{Workflow, Job, Step};
+pub use parser::{Workflow, Job, JobResources, Step};
 pub use triggers::{EventTrigger, EventHandler, HandlerResult};
 pub use subscription::WorkflowSubscription;
 pub use runner::WorkflowRunner;
+pub use scheduler::{JobScheduler, Placement};
 pub use adapter::SubscriberAdapter;
 pub use gh_adapter::GitHubActionsAdapter;
 

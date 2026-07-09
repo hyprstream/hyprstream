@@ -71,9 +71,39 @@ pub struct SandboxPool {
 }
 
 impl SandboxPool {
-    /// Create a new sandbox pool with a backend
+    /// Create a new sandbox pool with a backend.
+    ///
+    /// Uses the fail-closed [`admission::DenyUnknownGroupValidator`] — the
+    /// production default until a membership-backed validator is wired: any
+    /// non-empty `hyprstream.io/group` selector is rejected at admission
+    /// (B′); the no-selector case is unaffected.
     pub fn new(config: PoolConfig, backend: Arc<dyn SandboxBackend>) -> Self {
         let admission = AdmissionTracker::new(config.admission.clone(), config.max_sandboxes);
+        Self::with_admission(config, backend, admission)
+    }
+
+    /// Create a pool with an explicit [`admission::GroupSelectorValidator`]
+    /// (e.g. one backed by a real membership source such as
+    /// `PlacementIndex::is_member`, or a test double). Mirrors
+    /// [`AdmissionTracker::with_group_validator`].
+    pub fn with_group_validator(
+        config: PoolConfig,
+        backend: Arc<dyn SandboxBackend>,
+        group_validator: Arc<dyn admission::GroupSelectorValidator>,
+    ) -> Self {
+        let admission = AdmissionTracker::with_group_validator(
+            config.admission.clone(),
+            config.max_sandboxes,
+            group_validator,
+        );
+        Self::with_admission(config, backend, admission)
+    }
+
+    fn with_admission(
+        config: PoolConfig,
+        backend: Arc<dyn SandboxBackend>,
+        admission: AdmissionTracker,
+    ) -> Self {
         Self {
             warm_pool: Mutex::new(VecDeque::new()),
             active: Mutex::new(HashMap::new()),

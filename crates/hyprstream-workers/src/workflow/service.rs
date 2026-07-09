@@ -27,6 +27,7 @@ use crate::generated::workflow_client::{
 };
 
 use super::runner::WorkflowRunner;
+use super::scheduler::JobScheduler;
 use super::subscription::WorkflowSubscription;
 use super::triggers::{EventHandler, EventTrigger, HandlerResult};
 use super::{RunId, WorkflowId, Workflow};
@@ -79,8 +80,12 @@ const SERVICE_NAME: &str = "workflow";
 
 /// WorkflowService handles workflow orchestration
 ///
-/// Discovers workflows from repositories, subscribes to events,
-/// and spawns containers via WorkerService.
+/// Discovers workflows from repositories, subscribes to events, and routes
+/// job execution through [`WorkflowRunner`] (#527): jobs requesting
+/// isolation via `runs_on:` are scheduled onto a sandbox through the #525 P2
+/// admission engine (`SandboxPool::acquire`, see `workflow::scheduler`);
+/// others run in-process over the VFS/Tcl bridge. There is no `WorkerService`
+/// dependency here — `WorkflowRunner` talks to `SandboxPool` directly.
 pub struct WorkflowService {
     /// Registered workflows
     workflows: RwLock<HashMap<WorkflowId, WorkflowDef>>,
@@ -154,9 +159,39 @@ impl WorkflowService {
     /// Set the VFS namespace for workflow execution.
     ///
     /// This creates a WorkflowRunner that resolves actions through `/bin/`
-    /// and evaluates scripts via TclShell.
+    /// and evaluates scripts via TclShell, using default
+    /// [`crate::config::WorkflowConfig`] timeouts/concurrency and no job
+    /// scheduler (every job runs in-proc — see [`Self::set_job_scheduler`]).
     pub fn set_namespace(&mut self, ns: Arc<Namespace>) {
         self.runner = Some(WorkflowRunner::new(ns));
+    }
+
+    /// Like [`Self::set_namespace`], but honors `config`'s
+    /// `max_concurrent_runs` / `job_timeout_secs` / `step_timeout_secs`
+    /// (#521) instead of defaults.
+    pub fn set_namespace_with_config(
+        &mut self,
+        ns: Arc<Namespace>,
+        config: &crate::config::WorkflowConfig,
+    ) {
+        self.runner = Some(WorkflowRunner::with_config(ns, config));
+    }
+
+    /// Attach a [`JobScheduler`] (#527) so jobs whose `runs_on:` requests
+    /// isolation are placed onto a real sandbox through the #525 P2
+    /// admission engine, instead of always running in-proc. Must be called
+    /// after `set_namespace`/`set_namespace_with_config`; a no-op (with a
+    /// warning) if no runner has been configured yet.
+    pub fn set_job_scheduler(&mut self, scheduler: Arc<JobScheduler>) {
+        match self.runner.take() {
+            Some(runner) => self.runner = Some(runner.with_scheduler(scheduler)),
+            None => {
+                tracing::warn!(
+                    "set_job_scheduler called before set_namespace — ignored; \
+                     call set_namespace/set_namespace_with_config first"
+                );
+            }
+        }
     }
 
     /// Set the authorization callback for policy checks.
@@ -683,7 +718,13 @@ impl WorkflowHandler for WorkflowService {
         let inputs_map: HashMap<String, String> = request.inputs.iter()
             .map(|kv| (kv.key.clone(), kv.value.clone()))
             .collect();
-        let subject = hyprstream_vfs::Subject::new(ctx.subject().to_string());
+        // Pass the verified `Subject` through directly — never round-trip it
+        // through `.to_string()` → `Subject::new(...)`. `Subject::anonymous()`
+        // Displays as "anonymous", so that round-trip turns an anonymous caller
+        // into a *named* subject "anonymous" (is_anonymous() == false), which
+        // would then pass the fail-closed admission check this dispatch path
+        // feeds (#527) — defeating per-subject quota + the anonymous deny.
+        let subject = ctx.subject();
         let run_id = self.dispatch(&request.workflow_id.clone(), inputs_map, &subject).await?;
         Ok(WorkflowResponseVariant::DispatchResult(run_id))
     }
@@ -845,4 +886,46 @@ fn extract_triggers(workflow: &Workflow) -> Vec<EventTrigger> {
         "schedule" | "training" => vec![EventTrigger::Custom { topic: format!("training.{event}"), pattern: String::new() }],
         _ => vec![EventTrigger::Custom { topic: format!("repo.{event}"), pattern: String::new() }],
     }).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    // Regression guard for the anonymous-subject fail-closed defeat (#770
+    // review FIX 1). `handle_dispatch` derives the caller subject from
+    // `EnvelopeContext::subject()`, which returns `Subject::anonymous()` for
+    // an unauthenticated caller. That subject must reach `dispatch` (→ runner
+    // → `JobScheduler::place` → `AdmissionTracker::reserve`) *untouched*:
+    // `reserve` is fail-closed on `subject.is_anonymous()`, so a converted
+    // subject would silently pass admission and defeat per-subject quota.
+    //
+    // `EnvelopeContext`'s fields are private to `hyprstream-rpc`, so an
+    // anonymous context can't be built from this crate; this test pins the
+    // invariant the dispatch boundary depends on instead.
+
+    use hyprstream_vfs::Subject;
+
+    #[test]
+    fn anonymous_subject_must_not_round_trip_through_string() {
+        // What `ctx.subject()` yields for an unauthenticated caller.
+        let anon = Subject::anonymous();
+        assert!(anon.is_anonymous());
+
+        // The broken transform `handle_dispatch` used to do:
+        // `Subject::new(ctx.subject().to_string())`. `Subject::anonymous()`
+        // Displays as the literal "anonymous", so re-wrapping it produces a
+        // NAMED subject — fail-closed defeated.
+        let broken = Subject::new(anon.to_string());
+        assert_ne!(anon, broken);
+        assert!(
+            !broken.is_anonymous(),
+            "round-tripping an anonymous subject through Display must stay \
+             forbidden: it turns anonymous into the named subject \"anonymous\" \
+             and bypasses fail-closed admission"
+        );
+
+        // The fixed transform: pass the verified `Subject` through untouched.
+        let fixed: Subject = anon.clone();
+        assert!(fixed.is_anonymous());
+        assert_eq!(anon, fixed);
+    }
 }
