@@ -111,6 +111,24 @@ impl IrohBlobStore {
     /// mapping is recorded.
     pub async fn put_object(&self, data: Vec<u8>) -> Result<Sha256Hash> {
         let sha256 = sha256_git(&data)?;
+        self.put_verified_object(sha256, data).await
+    }
+
+    /// Store bytes under an expected SHA256 key after re-verifying them.
+    ///
+    /// F2 uses this after a remote iroh-blobs transfer: provider hints are
+    /// untrusted, so fetched bytes are accepted only when they match the
+    /// consumer-facing SHA256 requested by the facade.
+    pub async fn put_verified_object(
+        &self,
+        expected_sha256: Sha256Hash,
+        data: Vec<u8>,
+    ) -> Result<Sha256Hash> {
+        if !verify_sha256(&data, &expected_sha256)? {
+            return Err(Error::other(format!(
+                "sha256 verification failed for fetched object {expected_sha256}"
+            )));
+        }
 
         let tag = self
             .backend
@@ -121,15 +139,19 @@ impl IrohBlobStore {
             .map_err(|e| Error::other(format!("iroh-blobs add failed: {e}")))?;
 
         let mut index = self.index.lock().await;
-        if index.insert(sha256.clone(), tag.hash).is_none() {
+        if index.insert(expected_sha256.clone(), tag.hash).is_none() {
             if let Some(path) = &self.index_path {
-                append_index_entry(path, &sha256, &tag.hash).await?;
+                append_index_entry(path, &expected_sha256, &tag.hash).await?;
             }
         }
         drop(index);
 
-        tracing::debug!("stored object sha256={} blake3={}", sha256, tag.hash);
-        Ok(sha256)
+        tracing::debug!(
+            "stored object sha256={} blake3={}",
+            expected_sha256,
+            tag.hash
+        );
+        Ok(expected_sha256)
     }
 
     /// Fetch an object by its SHA256 hash.
@@ -301,6 +323,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_put_verified_object_rejects_wrong_sha256() -> Result<()> {
+        let store = IrohBlobStore::new_memory();
+        let expected = sha256_git(b"expected")?;
+
+        assert!(store
+            .put_verified_object(expected.clone(), b"different".to_vec())
+            .await
+            .is_err());
+        assert!(store.get_object(&expected).await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_fs_persistence_across_reopen() -> Result<()> {
         let dir = TempDir::new()?;
         let data = b"persisted across reopen".to_vec();
@@ -327,7 +362,10 @@ mod tests {
 
         let (sha_a, sha_b) = {
             let store = IrohBlobStore::open_fs(dir.path()).await?;
-            let pair = (store.put_object(a.clone()).await?, store.put_object(b.clone()).await?);
+            let pair = (
+                store.put_object(a.clone()).await?,
+                store.put_object(b.clone()).await?,
+            );
             store.shutdown().await?;
             pair
         };
