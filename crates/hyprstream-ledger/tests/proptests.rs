@@ -8,8 +8,8 @@
 
 use hyprstream_ledger::engine::{MAX_TIMEOUT_S, MIN_TIMEOUT_S};
 use hyprstream_ledger::{
-    Account, AccountSpec, Did, IssueTransfer, LedgerBackend, MemLedger, Purpose, TransferId,
-    TransferResult, UnitId,
+    Account, AccountFlags, AccountSpec, Did, IssueTransfer, LedgerBackend, LedgerError, MemLedger,
+    Purpose, TransferId, TransferResult, UnitId,
 };
 use proptest::prelude::*;
 
@@ -90,13 +90,32 @@ fn assert_no_overdraft(l: &MemLedger) {
 /// One generated action over the fixed account set.
 #[derive(Debug, Clone)]
 enum Action {
-    Credit { dest: usize, amount: u64 },
-    Debit { from: usize, to: usize, amount: u64 },
-    Reserve { from: usize, to: usize, amount: u64, timeout: u32 },
-    Post { which: usize, partial: Option<u64> },
-    Void { which: usize },
+    Credit {
+        dest: usize,
+        amount: u64,
+    },
+    Debit {
+        from: usize,
+        to: usize,
+        amount: u64,
+    },
+    Reserve {
+        from: usize,
+        to: usize,
+        amount: u64,
+        timeout: u32,
+    },
+    Post {
+        which: usize,
+        partial: Option<u64>,
+    },
+    Void {
+        which: usize,
+    },
     Tick,
-    Advance { secs: u64 },
+    Advance {
+        secs: u64,
+    },
 }
 
 fn action_strategy() -> impl Strategy<Value = Action> {
@@ -104,10 +123,19 @@ fn action_strategy() -> impl Strategy<Value = Action> {
     let idx = 1usize..=K_SPENDABLE;
     prop_oneof![
         (idx.clone(), 1u64..1000).prop_map(|(dest, amount)| Action::Credit { dest, amount }),
-        (idx.clone(), idx.clone(), 1u64..1000)
-            .prop_map(|(from, to, amount)| Action::Debit { from, to, amount }),
-        (idx.clone(), idx.clone(), 1u64..1000, MIN_TIMEOUT_S..50u32)
-            .prop_map(|(from, to, amount, timeout)| Action::Reserve { from, to, amount, timeout }),
+        (idx.clone(), idx.clone(), 1u64..1000).prop_map(|(from, to, amount)| Action::Debit {
+            from,
+            to,
+            amount
+        }),
+        (idx.clone(), idx.clone(), 1u64..1000, MIN_TIMEOUT_S..50u32).prop_map(
+            |(from, to, amount, timeout)| Action::Reserve {
+                from,
+                to,
+                amount,
+                timeout
+            }
+        ),
         (0usize..8, proptest::option::of(1u64..1000))
             .prop_map(|(which, partial)| Action::Post { which, partial }),
         (0usize..8).prop_map(|which| Action::Void { which }),
@@ -299,10 +327,17 @@ fn mk_transfer(
     }
 }
 
-/// A stable snapshot of every account's balance view, for idempotency
-/// no-state-change assertions.
-fn snapshot(l: &MemLedger) -> Vec<(u128, u128, u128, u128)> {
-    let mut v: Vec<_> = l
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LedgerSnapshot {
+    head_seq: u64,
+    journal_len: usize,
+    accounts: Vec<(u128, u128, u128, u128)>,
+}
+
+/// A stable snapshot of every account's balance view and journal position, for
+/// idempotency no-state-change/no-journal-growth assertions.
+fn snapshot(l: &MemLedger) -> LedgerSnapshot {
+    let mut accounts: Vec<_> = l
         .accounts()
         .map(|a: &Account| {
             (
@@ -313,8 +348,12 @@ fn snapshot(l: &MemLedger) -> Vec<(u128, u128, u128, u128)> {
             )
         })
         .collect();
-    v.sort_by_key(|t| t.0);
-    v
+    accounts.sort_by_key(|t| t.0);
+    LedgerSnapshot {
+        head_seq: l.head().seq,
+        journal_len: l.journal().len(),
+        accounts,
+    }
 }
 
 /// A no-op checkpoint signer for tick (which never actually checkpoints in the
@@ -335,4 +374,38 @@ impl hyprstream_ledger::CheckpointSigner for NoopSigner {
 fn timeout_bounds_are_plan_values() {
     assert_eq!(MIN_TIMEOUT_S, 1);
     assert_eq!(MAX_TIMEOUT_S, 24 * 60 * 60);
+}
+
+#[test]
+fn issuance_rejects_available_account_even_with_empty_flags() {
+    let mut l = MemLedger::new(ledger_id());
+    let source = l
+        .open_account(AccountSpec {
+            ledger_id: ledger_id(),
+            owner: Did("did:key:not-issuer-liability".to_owned()),
+            unit: unit(),
+            purpose: Purpose::Available,
+            flags: AccountFlags::empty(),
+        })
+        .unwrap();
+    let dest = l
+        .open_account(AccountSpec::new(
+            ledger_id(),
+            Did("did:key:dest".to_owned()),
+            unit(),
+            Purpose::Available,
+        ))
+        .unwrap();
+
+    let out = l.credit(IssueTransfer {
+        id: TransferId(1),
+        issuer_liability: source.id,
+        destination: dest.id,
+        unit: unit(),
+        amount: 10,
+        grant_cid: None,
+        user_data: ud(),
+    });
+
+    assert_eq!(out.result, Err(LedgerError::NotIssuerLiability(source.id)));
 }

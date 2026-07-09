@@ -13,8 +13,8 @@
 
 use crate::errors::LedgerError;
 use crate::types::{
-    Account, AccountId, AccountSpec, IssueTransfer, PendingReservation, PendingState, Transfer,
-    TransferId, TransferResult,
+    Account, AccountId, AccountSpec, IssueTransfer, PendingReservation, PendingState, Purpose,
+    Transfer, TransferId, TransferResult,
 };
 
 /// Minimum reservation timeout (plan §2b.6).
@@ -132,8 +132,13 @@ pub fn stage(view: &dyn StateView, op: &Op) -> Staged {
         Op::OpenAccount(spec) => stage_open(view, spec),
         Op::Credit(t) => stage_credit(view, t),
         Op::Debit(t) => stage_debit(view, t),
-        Op::Reserve { transfer, timeout_s } => stage_reserve(view, transfer, *timeout_s),
-        Op::Post { pending, amount, .. } => stage_second_phase(view, *pending, Phase::Post(*amount)),
+        Op::Reserve {
+            transfer,
+            timeout_s,
+        } => stage_reserve(view, transfer, *timeout_s),
+        Op::Post {
+            pending, amount, ..
+        } => stage_second_phase(view, *pending, Phase::Post(*amount)),
         Op::Void { pending, .. } => stage_second_phase(view, *pending, Phase::Void),
         Op::Expire { pending } => stage_second_phase(view, *pending, Phase::Expire),
     }
@@ -152,7 +157,7 @@ fn stage_open(view: &dyn StateView, spec: &AccountSpec) -> Staged {
             deltas: Vec::new(),
         };
     }
-    let account = Account::new(id, spec.unit.clone(), spec.flags);
+    let account = Account::new(id, spec.unit.clone(), spec.purpose.clone(), spec.flags);
     Staged {
         result: Ok(TransferResult::Opened),
         deltas: vec![Delta::Account(account)],
@@ -163,17 +168,19 @@ fn stage_credit(view: &dyn StateView, t: &IssueTransfer) -> Staged {
     if t.amount == 0 {
         return Staged::err(LedgerError::ZeroAmount);
     }
-    let (liability, dest) =
-        match (view.account(t.issuer_liability), view.account(t.destination)) {
-            (Some(l), Some(d)) => (l, d),
-            (None, _) => return Staged::err(LedgerError::UnknownAccount(t.issuer_liability)),
-            (_, None) => return Staged::err(LedgerError::UnknownAccount(t.destination)),
-        };
+    let (liability, dest) = match (
+        view.account(t.issuer_liability),
+        view.account(t.destination),
+    ) {
+        (Some(l), Some(d)) => (l, d),
+        (None, _) => return Staged::err(LedgerError::UnknownAccount(t.issuer_liability)),
+        (_, None) => return Staged::err(LedgerError::UnknownAccount(t.destination)),
+    };
     // The debit side must be an issuer-liability account (INV-1).
     if t.issuer_liability == t.destination {
         return Staged::err(LedgerError::AccountsMustDiffer(t.issuer_liability));
     }
-    if liability.is_debit_constrained() {
+    if liability.purpose != Purpose::IssuerLiability {
         return Staged::err(LedgerError::NotIssuerLiability(t.issuer_liability));
     }
     if let Err(e) = check_unit(liability, &t.unit) {

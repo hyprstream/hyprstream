@@ -48,7 +48,8 @@ pub use backend::LedgerBackend;
 pub use errors::LedgerError;
 pub use journal::{
     balances_root, checkpoint_signing_input, pending_root, verify_checkpoint_signature, ChainHead,
-    CheckpointSigner, JournalEntry, OutboxItem, OutboxKind, OutboxSeq, SignedCheckpoint, TickReport,
+    CheckpointSigner, JournalEntry, OutboxItem, OutboxKind, OutboxSeq, SignedCheckpoint,
+    TickReport,
 };
 pub use mem::MemLedger;
 pub use types::{

@@ -162,7 +162,12 @@ impl MemLedger {
         outcome
     }
 
-    fn enqueue_outbox(&mut self, kind: OutboxKind, transfer_id: Option<TransferId>, journal_seq: u64) {
+    fn enqueue_outbox(
+        &mut self,
+        kind: OutboxKind,
+        transfer_id: Option<TransferId>,
+        journal_seq: u64,
+    ) {
         let seq = OutboxSeq(self.outbox_next);
         self.outbox_next += 1;
         self.outbox.insert(

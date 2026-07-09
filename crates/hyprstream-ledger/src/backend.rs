@@ -58,8 +58,10 @@ pub trait LedgerBackend: Send {
 
     /// Force a signed checkpoint now and return it. Periodic checkpoints are the
     /// backend's own duty (driven from `tick`).
-    fn checkpoint(&mut self, signer: &dyn CheckpointSigner)
-        -> Result<SignedCheckpoint, LedgerError>;
+    fn checkpoint(
+        &mut self,
+        signer: &dyn CheckpointSigner,
+    ) -> Result<SignedCheckpoint, LedgerError>;
 
     /// Housekeeping: expiry sweep (plan §2b.4), outcome pruning (plan §2c — later
     /// item), and scheduled checkpoints. Called by the actor on an interval.

@@ -162,6 +162,9 @@ pub struct Account {
     pub id: AccountId,
     /// Denormalized unit; checked to match on every transfer touching this account.
     pub unit: UnitId,
+    /// Denormalized purpose; issuance checks this directly instead of inferring
+    /// authority from flags.
+    pub purpose: Purpose,
     /// Held-but-not-settled debits (outstanding reservations on the debit side).
     pub debits_pending: u128,
     /// Settled debits — monotonically increasing.
@@ -176,10 +179,11 @@ pub struct Account {
 
 impl Account {
     /// A freshly opened account with zeroed counters.
-    pub fn new(id: AccountId, unit: UnitId, flags: AccountFlags) -> Self {
+    pub fn new(id: AccountId, unit: UnitId, purpose: Purpose, flags: AccountFlags) -> Self {
         Account {
             id,
             unit,
+            purpose,
             debits_pending: 0,
             debits_posted: 0,
             credits_pending: 0,
