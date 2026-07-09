@@ -75,6 +75,11 @@ libp2p = { version = "0.56", features = ["kad", "mdns", "noise", "tcp", "tokio",
 # Optional: nothing ships enabled until Track C wiring lands.
 mainline = { version = "7.0", optional = true }
 blake3 = { workspace = true, optional = true }
+
+# iroh-blobs content-addressed byte transport (F1, #899).
+# 0.101.0 pins iroh =1.0.0-rc.0 - the exact version the workspace pins via
+# web-transport-iroh 0.5.x; co-bump all three together (see workspace Cargo.toml).
+iroh-blobs = { version = "=0.101.0", default-features = false, features = ["fs-store"], optional = true }
 multihash = "0.19"
 sha2 = "0.10"
 
@@ -93,6 +98,9 @@ debug = []
 # at9p mainline (BEP5) locator: arbitrary-infohash announce/get_peers, which
 # iroh's internal pkarr cannot do. Off by default (#889 / epic #880 Track C).
 mainline-locator = ["dep:blake3", "dep:mainline"]
+# Experimental iroh-blobs-backed object store (F1, #899). Local store only;
+# networked fetch via the at9p locator is F2 (#900).
+iroh-blobs = ["dep:iroh-blobs"]
 
 [lints]
 workspace = true
