@@ -526,7 +526,7 @@ impl ServiceSpawner {
 
         // Spawn thread
         let thread_handle = thread::Builder::new()
-            .name(format!("{}-service", &name))
+            .name(format!("{}-service", name))
             .spawn(move || {
                 // Run the service - it will signal ready after socket binds
                 if let Err(e) = Box::new(service).run(shutdown_clone, Some(ready_tx)) {
@@ -841,7 +841,7 @@ impl ServiceManager for InprocManager {
         let name_clone = name.clone(); // Clone for closure use
 
         let thread_handle = thread::Builder::new()
-            .name(format!("{}-service", &name))
+            .name(format!("{}-service", name))
             .spawn(move || {
                 if let Err(e) = service.run(shutdown_clone, Some(ready_tx)) {
                     tracing::error!("Service {} failed: {}", name_clone, e);

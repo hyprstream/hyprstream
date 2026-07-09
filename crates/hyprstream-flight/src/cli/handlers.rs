@@ -80,7 +80,7 @@ pub async fn handle_server(
 
         if let Some(ca) = config.get::<Vec<u8>>("tls.ca_data").ok()
             .or_else(|| config.get_string("tls.ca_path").ok()
-                .and_then(|p| if p.is_empty() { None } else { Some(p) })
+                .filter(|p| !p.is_empty())
                 .and_then(|p| std::fs::read(p).ok())) {
             tls_config = tls_config.client_ca_root(Certificate::from_pem(&ca));
         }

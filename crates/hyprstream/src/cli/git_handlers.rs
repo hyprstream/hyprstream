@@ -1038,7 +1038,7 @@ pub async fn handle_info(
 
     // Size calculation - derive bare repo path locally from models_dir
     let bare_repo_path = storage_paths.models_dir().ok()
-        .map(|d| d.join(&model_ref.model).join(format!("{}.git", &model_ref.model)));
+        .map(|d| d.join(&model_ref.model).join(format!("{}.git", model_ref.model)));
 
     if let Some(ref bare_repo_path) = bare_repo_path {
         if bare_repo_path.exists() {

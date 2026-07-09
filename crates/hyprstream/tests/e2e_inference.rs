@@ -781,7 +781,7 @@ async fn e6_gpu_load_and_stream_tokens() {
 
     eprintln!(
         "[e2e_inference] produced {chunks} chunks, {} tokens, {:.1} tok/s: {:?}",
-        stats.tokens_generated, stats.tokens_per_second, &full
+        stats.tokens_generated, stats.tokens_per_second, full
     );
 
     // The load-bearing assertions: generation actually produced tokens over the
@@ -789,7 +789,7 @@ async fn e6_gpu_load_and_stream_tokens() {
     assert!(
         chunks > 0,
         "stream must deliver >0 text chunks (got 0; full={:?})",
-        &full
+        full
     );
     assert!(
         stats.tokens_generated > 0,
@@ -799,7 +799,7 @@ async fn e6_gpu_load_and_stream_tokens() {
     assert!(
         !full.trim().is_empty(),
         "streamed text must be non-empty (got {:?})",
-        &full
+        full
     );
 
     // A gentle sanity check on content: greedy continuation of
@@ -811,7 +811,7 @@ async fn e6_gpu_load_and_stream_tokens() {
     assert!(
         lower.contains("paris"),
         "greedy continuation should mention Paris; got {:?}",
-        &full
+        full
     );
 
     // Clean shutdown so the GPU memory is released before the next test.
