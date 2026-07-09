@@ -1148,18 +1148,16 @@ impl RegistryService {
     }
 
     /// Handle register operation
-    #[allow(deprecated)]
     async fn handle_register(
         &self,
         path: &str,
         name: Option<&str>,
-        _tracking_ref: Option<&str>,
+        tracking_ref: Option<&str>,
     ) -> Result<TrackedRepository> {
         let path = PathBuf::from(path);
         // I5: Validate path is within base_dir
         self.validate_path_within_base(&path)?;
         let name = name.map(std::borrow::ToOwned::to_owned);
-        // Note: tracking_ref is not yet used by register_repository
 
         // Register requires write lock
         let mut registry = self.registry.write().await;
@@ -1170,8 +1168,20 @@ impl RegistryService {
         // Derive URL from path (local file URL)
         let url = format!("file://{}", path.display());
 
-        // TODO: Migrate to registry.register(repo_id) builder API
-        registry.register_repository(&repo_id, name, url).await?;
+        // Use the non-deprecated registry.register(repo_id) builder so the
+        // caller-supplied path is honored, rather than register_repository's
+        // hard-coded base_dir/<uuid> location.
+        let mut builder = registry
+            .register(repo_id.clone())
+            .url(url)
+            .worktree_path(path);
+        if let Some(name) = name {
+            builder = builder.name(name);
+        }
+        if let Some(tracking_ref) = tracking_ref {
+            builder = builder.tracking_ref(GitRef::Branch(tracking_ref.to_owned()));
+        }
+        builder.exec().await?;
 
         // Get the tracked repository to return
         let repo = registry
@@ -1539,6 +1549,18 @@ impl RegistryService {
             qtype: qid.qtype,
             version: qid.version,
             path: qid.path,
+        }
+    }
+
+    /// Extract a file's own name (the final path component) from a fid's
+    /// tracked `rel_path` (relative to the contained root). Returns `""` for
+    /// the contained root itself (`"."` / empty) — a synthetic entry with no
+    /// name of its own — which callers may leave empty in `Tstat`.
+    fn rel_path_file_name(rel_path: &str) -> &str {
+        if rel_path.is_empty() || rel_path == "." {
+            ""
+        } else {
+            rel_path.rsplit('/').next().unwrap_or(rel_path)
         }
     }
 
@@ -2864,16 +2886,17 @@ impl WorktreeHandler for RegistryService {
         let entry = self.fid_table.get_verified(data.fid, &subject)
             .map_err(|e| anyhow!("{}", e))?;
 
-        let meta = match &entry.state {
-            FidState::Walked { walk_handle, .. } => {
-                walk_handle.metadata().map_err(|e| anyhow!("{}", e))?
-            }
-            FidState::Opened { file, .. } => {
-                file.lock().metadata()?
+        let (meta, rel_path) = match &entry.state {
+            FidState::Walked { walk_handle, .. } => (
+                walk_handle.metadata().map_err(|e| anyhow!("{}", e))?,
+                walk_handle.rel_path().to_owned(),
+            ),
+            FidState::Opened { file, rel_path, .. } => {
+                (file.lock().metadata()?, rel_path.clone())
             }
         };
 
-        let stat = Self::metadata_to_np_stat("", &meta);
+        let stat = Self::metadata_to_np_stat(Self::rel_path_file_name(&rel_path), &meta);
         Ok(RStat { stat })
     }
 
@@ -3654,5 +3677,138 @@ mod tests {
             "getBlob with unknown grantRepo must be denied, got: {res:?}"
         );
         let _ = handle.stop().await;
+    }
+
+    // ── #427 finding 1: Tstat must return the real name, not "" ─────────────
+    #[tokio::test]
+    async fn test_tstat_returns_real_registry_repo_name() {
+        // `metadata_to_np_stat("", ..)` meant the registry's Tstat handler
+        // never returned a file name — identity was carried by qid/size only.
+        // Walk to a real committed file in a registered repo and assert the
+        // RStat now carries its actual name.
+        let temp_dir = TempDir::new().expect("test: temp dir");
+        let (service, repo_id) = registry_with_committed_repo(
+            temp_dir.path(),
+            "model-tstat-name",
+            &[("config.json", "{}")],
+        )
+        .await;
+
+        let ctx = EnvelopeContext::from_callback_service(1, "test-caller");
+        let repo_id_str = repo_id.to_string();
+
+        // Walk from the repo root to config.json with a deterministic fid.
+        let walk = service
+            .handle_walk(
+                &ctx,
+                1,
+                &repo_id_str,
+                ".",
+                &NpWalk {
+                    fid: 0,
+                    newfid: 42,
+                    wnames: vec!["config.json".to_string()],
+                },
+            )
+            .await
+            .expect("test: walk to config.json");
+        assert_eq!(walk.qid.qtype & 0x80, 0, "config.json must not be a directory");
+
+        let stat = service
+            .handle_np_stat(&ctx, 2, &repo_id_str, ".", &NpStatReq { fid: 42 })
+            .await
+            .expect("test: stat fid 42");
+
+        assert_eq!(
+            stat.stat.name, "config.json",
+            "Tstat on a real registry-repo record must return the actual file name, not empty"
+        );
+    }
+
+    // ── #427 finding 2: register RPC must honor the caller-supplied path ───
+    #[tokio::test]
+    async fn test_register_honors_caller_supplied_path() {
+        // The deprecated `register_repository` ignored the supplied path and
+        // hard-required the repo at `base_dir/<uuid>`. `handle_register` must
+        // now route through the `Git2DB::register(repo_id)` builder and honor
+        // the real, caller-chosen path.
+        use git2::{Repository, Signature};
+        use hyprstream_service::InprocManager;
+        use hyprstream_rpc::transport::TransportConfig;
+
+        let _ = hyprstream_rpc::envelope::install_verify_config(
+            hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+                policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
+                pq_store: None,
+            },
+        );
+
+        let temp_dir = TempDir::new().expect("test: temp dir");
+        let base_dir = temp_dir.path();
+
+        // Repo lives at a caller-chosen, non-UUID subdirectory of base_dir —
+        // exactly the layout register_repository's base_dir/<uuid> assumption
+        // could not honor.
+        let repo_name = "my-custom-repo";
+        let repo_path = base_dir.join(repo_name);
+        std::fs::create_dir_all(&repo_path).expect("test: mkdir repo");
+        let repo = Repository::init(&repo_path).expect("test: git init");
+        {
+            let mut index = repo.index().expect("test: index");
+            std::fs::write(repo_path.join("README.md"), "hello").expect("test: write file");
+            index.add_path(Path::new("README.md")).expect("test: index add");
+            index.write().expect("test: index write");
+            let tree_oid = index.write_tree().expect("test: write tree");
+            let tree = repo.find_tree(tree_oid).expect("test: find tree");
+            let sig = Signature::now("Test", "test@example.com").expect("test: sig");
+            repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                .expect("test: commit");
+        }
+
+        let (signing_key, _vk) = generate_signing_keypair();
+        let policy_manager = Arc::new(PolicyManager::permissive().await.expect("test: policy manager"));
+        let policy_git2db = Arc::new(tokio::sync::RwLock::new(
+            Git2DB::open(base_dir).await.expect("test: open git2db"),
+        ));
+        let policy_service = PolicyService::new(
+            policy_manager,
+            Arc::new(signing_key.clone()),
+            crate::config::TokenConfig::default(),
+            policy_git2db,
+            TransportConfig::inproc("test-policy-register-path"),
+        );
+        let manager = InprocManager::new();
+        let policy_handle = manager
+            .spawn(Box::new(policy_service))
+            .await
+            .expect("test: start policy");
+        std::mem::forget(policy_handle);
+        let policy_client: PolicyClient = PolicyClient::for_endpoint(
+            "inproc://test-policy-register-path",
+            signing_key.clone(),
+            signing_key.verifying_key(),
+            None,
+        )
+        .expect("test: policy client");
+
+        let service = RegistryService::new(
+            base_dir,
+            policy_client,
+            TransportConfig::inproc("test-registry-register-path"),
+            signing_key,
+        )
+        .await
+        .expect("test: create registry service");
+
+        let tracked = service
+            .handle_register(&repo_path.to_string_lossy(), Some(repo_name), None)
+            .await
+            .expect("test: register");
+
+        assert_eq!(
+            tracked.worktree_path, repo_path,
+            "register RPC must honor the caller-supplied path, not force base_dir/<uuid>"
+        );
+        assert_eq!(tracked.name.as_deref(), Some(repo_name));
     }
 }

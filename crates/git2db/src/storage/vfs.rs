@@ -289,7 +289,7 @@ impl VfsDriver {
         let ref_spec = opts.ref_spec.clone();
         let progress = opts.progress.clone();
 
-        let _ = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             // Set up smudge progress hook if progress reporter is available
             if let Some(ref reporter) = progress {
                 let r = std::sync::Arc::clone(reporter);
@@ -368,7 +368,7 @@ impl VfsDriver {
             result
         })
         .await
-        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))?;
+        .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))??;
 
         // Apply pathspec filter if requested
         if let Some(ref paths) = opts.checkout_paths {
@@ -393,5 +393,46 @@ mod tests {
     fn test_always_available() {
         let driver = VfsDriver;
         assert!(driver.is_available());
+    }
+
+    /// #427: `create_git_worktree` must propagate the real libgit2 failure
+    /// instead of discarding it. Previously the inner `Git2DBResult<()>` was
+    /// thrown away via `let _ = spawn_blocking(...).await...?` — only the
+    /// *join* error was checked, so any failure inside the closure (e.g. a
+    /// ref that doesn't resolve, or a worktree-add failure) was silently
+    /// swallowed and `create_git_worktree` returned `Ok(())` regardless.
+    #[tokio::test]
+    async fn create_git_worktree_propagates_inner_error() -> Result<(), Box<dyn std::error::Error>> {
+        // A repo with no commits at all: `ref_spec` cannot resolve to
+        // anything, so libgit2's `revparse_single` fails inside the
+        // spawn_blocking closure — exactly the kind of failure that used to
+        // be discarded.
+        let base_dir = tempfile::tempdir()?;
+        let repo_path = base_dir.path().join("repo");
+        std::fs::create_dir_all(&repo_path)?;
+        git2::Repository::init(&repo_path)?;
+
+        let opts = DriverOpts {
+            base_repo: repo_path.clone(),
+            worktree_path: base_dir.path().join("worktree"),
+            ref_spec: "does-not-exist".to_owned(),
+            progress: None,
+            checkout_paths: None,
+        };
+
+        let driver = VfsDriver;
+        match driver.create_git_worktree(&opts).await {
+            Ok(()) => panic!(
+                "create_git_worktree must fail when ref_spec cannot be resolved, not silently succeed"
+            ),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("Failed to resolve ref") || msg.contains("does-not-exist"),
+                    "error must surface the real libgit2 failure, got: {msg}"
+                );
+            }
+        }
+        Ok(())
     }
 }
