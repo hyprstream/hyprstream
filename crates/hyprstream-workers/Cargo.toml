@@ -19,6 +19,14 @@ hyprstream-rpc = { path = "../hyprstream-rpc" }
 # no functional gain here. Optional — gated behind the `cri` feature so the
 # default build doesn't assume an external CRI runtime is present.
 k8s-cri = { version = "=0.10.0", optional = true }
+# Kubernetes API-server backend (#781, epic #778): the `K8sBackend` drives the
+# cluster API server via kube-rs, emitting real Pods/Jobs (scheduler-placed,
+# quota'd, kubectl-visible) — the client/orchestrator role, distinct from the
+# CRI-socket `CriBackend`. Consumed through `hyprstream-k8s` (the CRD-schema
+# crate) so the `kube`/`k8s-openapi` versions + the single `v1_*` feature are
+# pinned in exactly one place. Optional — gated behind the `k8s` feature so the
+# default build assumes no cluster.
+hyprstream-k8s = { path = "../hyprstream-k8s", optional = true }
 tonic = { workspace = true, optional = true }
 # UDS connector plumbing for dialing the CRI runtime's Unix socket
 # (`/run/containerd/containerd.sock` et al) via `tonic::transport::Endpoint`.
@@ -272,6 +280,16 @@ oci = []
 # the host. When off, `cri` selection fails closed (the backend simply isn't
 # registered).
 cri = ["dep:k8s-cri", "dep:tonic", "dep:tower", "dep:hyper-util"]
+# Kubernetes API-server sandbox backend (#781, epic #778). Compiles in
+# `K8sBackend`, a kube-rs client that creates real Pod/Job objects against the
+# cluster API server (scheduler-placed, quota'd, kubectl-visible) — hyprstream
+# as orchestrator/client, NOT the kubelet-facing CRI contract (`CriBackend`
+# drives a node's CRI socket instead). Pulls the `k8s`-gated live-client path of
+# `hyprstream-k8s` (kube client + runtime + ws for exec). Opt-in: the lean build
+# assumes no cluster. Explicit-name-only when on (handing a workload to a
+# cluster is an auth-surface decision `"auto"` must never make); when off, `k8s`
+# selection fails closed (the backend simply isn't registered).
+k8s = ["dep:hyprstream-k8s", "hyprstream-k8s/k8s"]
 # Enable Dragonball built-in VMM support (alternative to cloud-hypervisor).
 # Implies `kata-vm` since it tunes the kata hypervisor abstraction.
 dragonball = ["kata-vm", "kata-hypervisor/dragonball"]

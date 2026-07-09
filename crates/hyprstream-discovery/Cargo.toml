@@ -9,9 +9,18 @@ description = "Service discovery and endpoint resolution for hyprstream"
 [lib]
 crate-type = ["rlib"]  # rlib-only: OnceLock singletons must be shared workspace-wide
 
+[features]
+# K4c (#787) — the placement→PodSpec vocabulary map. Off by default: the
+# scheduling substrate stays cluster-agnostic; only a Kubernetes backend opts in.
+# Pulls in `hyprstream-k8s`, whose re-exported `k8s-openapi` gives the PodSpec /
+# Quantity / Affinity types at the single workspace-pinned `v1_32` version.
+k8s = ["dep:hyprstream-k8s"]
+
 [dependencies]
 # Workspace crates
 hyprstream-rpc = { path = "../hyprstream-rpc" }
+# K4c (#787) — optional, only for the `k8s` feature's placement→PodSpec map.
+hyprstream-k8s = { path = "../hyprstream-k8s", optional = true }
 hyprstream-util = { path = "../hyprstream-util" }
 hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }
 # #524 P1 — placement directory ingestion: CAR parsing + MST walk + record
@@ -43,6 +52,9 @@ ed25519-dalek = { workspace = true }
 p256 = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
+# K4c (#787) — property tests for the placement→PodSpec map's no-widening invariant.
+proptest = { workspace = true }
+serde_yaml = { workspace = true }
 
 [build-dependencies]
 capnpc = { workspace = true }
