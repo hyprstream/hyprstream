@@ -78,6 +78,8 @@ impl AuthorizationProvider for PolicyAuthProvider {
 /// verbatim thereafter.
 struct RepoState {
     /// `<collection>/<rkey>` is the MST key; here we key by `(collection, tid)`.
+    /// One repo spans *many* collections (#910b) — all of them live in this one
+    /// map, and the MST is built over the full multi-collection key space.
     records: BTreeMap<(String, Tid), ModelRecord>,
     /// The signed commit persisted by the writer — served verbatim on reads,
     /// never re-signed.
@@ -289,20 +291,19 @@ impl PdsRecordStore {
     /// Build the MST over a repo's record set. The MST is a deterministic,
     /// keyless function of the record keys/CIDs, so this reproduces exactly the
     /// tree whose root the persisted commit signs.
+    ///
+    /// All of a repo's records — across **all** collections — share ONE MST,
+    /// keyed by `<collection>/<rkey>` exactly as atproto specifies (#910b).
+    /// One repo, one tree, one signed root: adding a record in any collection
+    /// changes the single root the commit signs.
     fn build_tree(records: &BTreeMap<(String, Tid), ModelRecord>) -> Node {
-        // All records across all collections share one MST keyed by
-        // `<collection>/<rkey>`. `Node::from_records` keys by Tid within one
-        // collection NSID; our records today are a single collection
-        // (`ai.hyprstream.model`), so build over that collection's Tid→CID map.
-        // Mixed-collection repos are a follow-up (#910b).
-        let mut by_tid: BTreeMap<Tid, hyprstream_pds::cid::Cid> = BTreeMap::new();
-        for ((collection, tid), rec) in records {
-            // Single-collection assumption (see note above): use the record's
-            // own collection NSID as the MST collection.
-            let _ = collection;
-            by_tid.insert(*tid, rec.cid());
-        }
-        Node::from_records(COLLECTION_NSID, &by_tid)
+        let keyed: BTreeMap<String, hyprstream_pds::cid::Cid> = records
+            .iter()
+            .map(|((collection, tid), rec)| {
+                (format!("{collection}/{}", tid.encode()), rec.cid())
+            })
+            .collect();
+        Node::from_keyed_records(&keyed)
     }
 }
 
@@ -358,6 +359,16 @@ pub struct PdsPublisher {
     /// publishes as the `#atproto` verification method. Held only here (the
     /// writer); resolvers hold no key. Used to sign each commit exactly once.
     signing_key: p256::ecdsa::SigningKey,
+    /// Serializes the load→rebuild→sign→persist critical section (#910b).
+    ///
+    /// A publish is a read-modify-write over the WHOLE repo (one MST, one
+    /// signed root across all collections): two concurrent publishes that both
+    /// load the same prior state would each sign a commit covering only their
+    /// own record, and whichever lands last silently drops the other's from
+    /// the signed root — the store would then fail the read-side
+    /// root-consistency check. Holding this lock across the full critical
+    /// section makes each commit cover every prior write.
+    publish_lock: parking_lot::Mutex<()>,
 }
 
 impl PdsPublisher {
@@ -366,19 +377,20 @@ impl PdsPublisher {
         did: String,
         signing_key: p256::ecdsa::SigningKey,
     ) -> Self {
-        Self { store, did, signing_key }
+        Self {
+            store,
+            did,
+            signing_key,
+            publish_lock: parking_lot::Mutex::new(()),
+        }
     }
 
     /// Publish (or advance) the `ai.hyprstream.model` record for `repo_id`,
     /// pointing it at `current_oid_hex` (a git OID, hex-encoded).
     ///
-    /// The record's rkey is derived deterministically from `repo_id`
-    /// (`PdsRecordStore::tid_for_repo`) and reused on every call, so this
-    /// always *replaces* the existing record's value rather than creating a
-    /// new one. The repo's MST is rebuilt over its full record set, a new
-    /// commit is signed **once** here (rev strictly advances; `prev` points at
-    /// the previous commit's CID — the atproto pointer advance), and the record
-    /// and signed commit are persisted together.
+    /// Collection-parameterized publication lives in
+    /// [`Self::publish_record`]; this is the `ai.hyprstream.model` wrapper the
+    /// registry service calls — behavior unchanged from #910a.
     ///
     /// Best-effort by design: the caller (registry service) should log and
     /// continue on error rather than fail the git operation that triggered
@@ -386,13 +398,50 @@ impl PdsPublisher {
     /// PDS publish is caught up by the next successful one (same
     /// eventual-consistency contract `git::promote` documents).
     pub fn publish(&self, repo_id: &str, current_oid_hex: &str) -> AnyResult<()> {
-        let tid = PdsRecordStore::tid_for_repo(repo_id);
+        self.publish_record(COLLECTION_NSID, repo_id, current_oid_hex)
+    }
+
+    /// Publish (or advance) a record in `collection` for `record_id`, pointing
+    /// it at `current_oid_hex` (a git OID, hex-encoded). This is the
+    /// collection-parameterized publication path (#910b): the repo's ONE MST
+    /// spans every collection, and the ONE commit signed here covers them all.
+    ///
+    /// The record's rkey is derived deterministically from `record_id`
+    /// (`PdsRecordStore::tid_for_repo`) and reused on every call, so this
+    /// always *replaces* the existing record's value rather than creating a
+    /// new one. (rkeys are scoped per collection in atproto, so the same
+    /// `record_id` in two collections is two distinct records at
+    /// `<collection-a>/<rkey>` and `<collection-b>/<rkey>`.) The repo's MST is
+    /// rebuilt over its full multi-collection record set, a new commit is
+    /// signed **once** here (rev strictly advances; `prev` points at the
+    /// previous commit's CID — the atproto pointer advance), and the record
+    /// and signed commit are persisted together.
+    pub fn publish_record(
+        &self,
+        collection: &str,
+        record_id: &str,
+        current_oid_hex: &str,
+    ) -> AnyResult<()> {
+        // The collection NSID becomes both a `\0`-delimited RocksDB key field
+        // and the `<collection>/<rkey>` MST key prefix — reject anything that
+        // would be ambiguous in either encoding.
+        if collection.is_empty() || collection.contains(['\0', '/']) {
+            bail!("invalid collection NSID {collection:?}");
+        }
+        let tid = PdsRecordStore::tid_for_repo(record_id);
         let current_oid_cid = git_oid_to_cid_string(current_oid_hex)?;
         let record = ModelRecord::new(
             format!("at://{}", self.did),
             current_oid_cid,
             atproto_datetime_now(),
         )?;
+
+        // ── critical section: load → rebuild → sign → persist ──────────────
+        // Serialized so every signed commit covers ALL prior writes (see
+        // `publish_lock`). A panicked publish is benign — the store write is
+        // a single atomic WriteBatch, so the store stays consistent and the
+        // next publisher proceeds (parking_lot has no poisoning).
+        let _guard = self.publish_lock.lock();
 
         // Load the existing repo state (records + previous signed commit) so we
         // can rebuild the full MST and advance the commit pointer.
@@ -401,10 +450,10 @@ impl PdsPublisher {
             .as_ref()
             .map(|r| r.records.clone())
             .unwrap_or_default();
-        records.insert((COLLECTION_NSID.to_owned(), tid), record.clone());
+        records.insert((collection.to_owned(), tid), record.clone());
 
-        // Rebuild the MST (deterministic, keyless) over the full record set and
-        // sign the commit ONCE over its root.
+        // Rebuild the MST (deterministic, keyless) over the full
+        // multi-collection record set and sign the commit ONCE over its root.
         let tree = PdsRecordStore::build_tree(&records);
         let root = tree.root_cid();
         let (rev, prev) = match existing.as_ref().map(|r| &r.commit) {
@@ -415,7 +464,7 @@ impl PdsPublisher {
         let commit = Commit::sign(&unsigned, &self.signing_key);
 
         self.store
-            .put_record_and_commit(&self.did, COLLECTION_NSID, tid, &record, &commit)
+            .put_record_and_commit(&self.did, collection, tid, &record, &commit)
     }
 }
 
@@ -468,6 +517,39 @@ impl PdsRecordResolver {
     }
 }
 
+/// Rebuild the repo's MST (keyless) and assemble a proof CAR for one record,
+/// served against the STORED signed commit — no re-signing.
+///
+/// **Fail-closed root-consistency check (#910b):** the rebuilt tree's root must
+/// equal the root the persisted commit signs (`commit.data`). Records and their
+/// covering commit are written atomically, so a mismatch means the store is
+/// corrupt or was tampered with — serving would hand out a record the signed
+/// commit does not actually cover (the proof could not verify anyway, but we
+/// refuse loudly rather than emit a broken CAR). This is an error, not
+/// NOT_FOUND: an inconsistent store must never look like a merely-absent record.
+fn proof_car(
+    repo: &RepoState,
+    did: &str,
+    collection: &str,
+    tid: Tid,
+    record: &ModelRecord,
+) -> AnyResult<Vec<u8>> {
+    let tree = PdsRecordStore::build_tree(&repo.records);
+    let rebuilt_root = tree.root_cid();
+    if rebuilt_root != repo.commit.data {
+        bail!(
+            "PDS store inconsistent for {did}: rebuilt MST root {rebuilt_root} \
+             != signed commit root {} — refusing to serve",
+            repo.commit.data
+        );
+    }
+    let proof = tree
+        .proof(collection, &tid)
+        .ok_or_else(|| anyhow!("record present but no MST proof — store inconsistent"))?;
+    let (_root_data, node_blocks) = tree.to_node_data_with_blocks();
+    Ok(build_record_proof_car(&repo.commit, &proof, &node_blocks, record))
+}
+
 #[async_trait(?Send)]
 impl RecordResolver for PdsRecordResolver {
     async fn resolve_record(
@@ -492,14 +574,9 @@ impl RecordResolver for PdsRecordResolver {
         };
 
         // Rebuild the MST (keyless) and serve the STORED signed commit — no
-        // re-signing. The proof's root is `commit.data`, which the rebuilt tree
-        // reproduces exactly (records + commit were persisted together).
-        let tree = PdsRecordStore::build_tree(&repo.records);
-        let proof = tree
-            .proof(COLLECTION_NSID, &tid)
-            .ok_or_else(|| anyhow::anyhow!("record present but no MST proof — store inconsistent"))?;
-        let (_root_data, node_blocks) = tree.to_node_data_with_blocks();
-        let car = build_record_proof_car(&repo.commit, &proof, &node_blocks, &record);
+        // re-signing. `proof_car` fail-closes if the rebuilt root does not
+        // match the root the persisted commit signs.
+        let car = proof_car(&repo, did, collection, tid, &record)?;
 
         let uri = format!("at://{did}/{collection}/{rkey}");
         Ok(Some(RecordCarData { uri, car }))
@@ -525,12 +602,7 @@ impl RecordResolver for PdsRecordResolver {
         let tid = *tid;
         let record = record.clone();
 
-        let tree = PdsRecordStore::build_tree(&repo.records);
-        let proof = tree
-            .proof(COLLECTION_NSID, &tid)
-            .ok_or_else(|| anyhow::anyhow!("repo record has no MST proof — store inconsistent"))?;
-        let (_root_data, node_blocks) = tree.to_node_data_with_blocks();
-        let car = build_record_proof_car(&repo.commit, &proof, &node_blocks, &record);
+        let car = proof_car(&repo, did, &collection, tid, &record)?;
 
         let uri = format!("at://{did}/{collection}/{}", tid.encode());
         Ok(Some(RecordCarData { uri, car }))
@@ -690,6 +762,221 @@ mod pds_store_tests {
             .put_record_and_commit("did:key:zX", COLLECTION_NSID, Tid::now(), &record, &commit)
             .unwrap_err();
         assert!(err.to_string().contains("read-only"));
+    }
+
+    /// A second collection for multi-collection tests (#910b) — the G3 (#908)
+    /// name collection this slice exists to unblock.
+    const NAME_COLLECTION: &str = "ai.hyprstream.name";
+
+    /// Resolve `(collection, record_id)` via a keyless resolver and verify the
+    /// full record proof offline against `vk`: commit signature + MST path from
+    /// the signed root + record CID.
+    fn resolve_and_verify(
+        store: &Arc<PdsRecordStore>,
+        vk: &VerifyingKey,
+        collection: &str,
+        record_id: &str,
+    ) {
+        let tid = PdsRecordStore::tid_for_repo(record_id);
+        let resolver = PdsRecordResolver::new(Arc::clone(store));
+        let got = block_on(resolver.resolve_record(DID, collection, &tid.encode()))
+            .expect("resolve ok")
+            .expect("record present");
+        assert_eq!(got.uri, format!("at://{DID}/{collection}/{}", tid.encode()));
+        commit_from_car(&got.car).verify(vk).expect("commit verifies");
+
+        // Full offline proof, reconstructed the way the resolver does it.
+        let repo = store.load_repo(DID).expect("load ok").expect("repo present");
+        let record = repo
+            .records
+            .get(&(collection.to_owned(), tid))
+            .cloned()
+            .expect("record present in store");
+        let tree = PdsRecordStore::build_tree(&repo.records);
+        assert_eq!(
+            tree.root_cid(),
+            repo.commit.data,
+            "rebuilt multi-collection root must match the signed commit root"
+        );
+        let proof = tree.proof(collection, &tid).expect("proof");
+        verify_record_proof(&repo.commit, vk, &proof, &record)
+            .expect("full keyless proof must verify");
+    }
+
+    #[test]
+    fn multi_collection_round_trip() {
+        // Records in two collections under ONE DID, covered by ONE signed
+        // commit — each independently resolvable with a valid proof (#910b).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let vk: VerifyingKey = *sk.verifying_key();
+
+        let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+        publisher.publish("repo-a", SAMPLE_OID).expect("publish model");
+        publisher
+            .publish_record(NAME_COLLECTION, "name-a", SAMPLE_OID_2)
+            .expect("publish name");
+
+        // One repo, one commit: both records live under the same signed root.
+        let repo = store.load_repo(DID).expect("load").expect("repo");
+        assert_eq!(repo.records.len(), 2, "both collections in one repo");
+
+        resolve_and_verify(&store, &vk, COLLECTION_NSID, "repo-a");
+        resolve_and_verify(&store, &vk, NAME_COLLECTION, "name-a");
+    }
+
+    #[test]
+    fn cross_collection_isolation() {
+        // Writing collection B must not corrupt proofs for collection A: after
+        // the B write, A still resolves with a valid proof under the (new)
+        // signed root, and A's record bytes are untouched.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let vk: VerifyingKey = *sk.verifying_key();
+
+        let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+        publisher.publish("repo-a", SAMPLE_OID).expect("publish model");
+        let tid_a = PdsRecordStore::tid_for_repo("repo-a");
+        let record_a_before = store
+            .load_repo(DID)
+            .expect("load")
+            .expect("repo")
+            .records
+            .get(&(COLLECTION_NSID.to_owned(), tid_a))
+            .cloned()
+            .expect("record a");
+
+        publisher
+            .publish_record(NAME_COLLECTION, "name-a", SAMPLE_OID_2)
+            .expect("publish name");
+
+        // A's record bytes are unchanged and its proof verifies under the
+        // advanced commit.
+        let repo = store.load_repo(DID).expect("load").expect("repo");
+        let record_a_after = repo
+            .records
+            .get(&(COLLECTION_NSID.to_owned(), tid_a))
+            .cloned()
+            .expect("record a still present");
+        assert_eq!(record_a_before, record_a_after, "B write must not touch A's record");
+        resolve_and_verify(&store, &vk, COLLECTION_NSID, "repo-a");
+        resolve_and_verify(&store, &vk, NAME_COLLECTION, "name-a");
+
+        // The name record is NOT addressable under the model collection: same
+        // rkey, different collection → a different MST key.
+        let tid_name = PdsRecordStore::tid_for_repo("name-a");
+        let resolver = PdsRecordResolver::new(Arc::clone(&store));
+        let cross = block_on(resolver.resolve_record(DID, COLLECTION_NSID, &tid_name.encode()))
+            .expect("resolve ok");
+        assert!(cross.is_none(), "collections must not alias onto each other");
+    }
+
+    #[test]
+    fn concurrent_publishes_serialize_and_stay_consistent() {
+        // Concurrent writers — including writers to DIFFERENT collections of
+        // the same DID — must serialize on the publish lock so the final
+        // commit covers every record, and every record's proof verifies
+        // against that single signed root (#910b).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let vk: VerifyingKey = *sk.verifying_key();
+
+        let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
+        let publisher = Arc::new(PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk));
+
+        const WRITERS_PER_COLLECTION: usize = 4;
+        let mut handles = Vec::new();
+        for i in 0..WRITERS_PER_COLLECTION {
+            for collection in [COLLECTION_NSID, NAME_COLLECTION] {
+                let publisher = Arc::clone(&publisher);
+                handles.push(std::thread::spawn(move || {
+                    publisher
+                        .publish_record(collection, &format!("rec-{i}"), SAMPLE_OID)
+                        .expect("concurrent publish");
+                }));
+            }
+        }
+        for h in handles {
+            h.join().expect("writer thread");
+        }
+
+        let repo = store.load_repo(DID).expect("load").expect("repo");
+        assert_eq!(
+            repo.records.len(),
+            WRITERS_PER_COLLECTION * 2,
+            "every concurrent write across both collections must survive"
+        );
+        // The stored commit signs the FULL record set (no lost update).
+        let tree = PdsRecordStore::build_tree(&repo.records);
+        assert_eq!(
+            tree.root_cid(),
+            repo.commit.data,
+            "final signed commit must cover all concurrent writes"
+        );
+        // And every record still proves against that one commit.
+        for i in 0..WRITERS_PER_COLLECTION {
+            resolve_and_verify(&store, &vk, COLLECTION_NSID, &format!("rec-{i}"));
+            resolve_and_verify(&store, &vk, NAME_COLLECTION, &format!("rec-{i}"));
+        }
+    }
+
+    #[test]
+    fn root_consistency_check_fails_closed() {
+        // A record the stored commit does NOT cover must make reads fail
+        // loudly (Err), never serve a broken proof and never report a clean
+        // NOT_FOUND.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sk = SigningKey::random(&mut rand::rngs::OsRng);
+
+        let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+        publisher.publish("repo-a", SAMPLE_OID).expect("publish");
+
+        // Corrupt the store: write a second record while re-persisting the
+        // STALE commit (whose root covers only the first record).
+        let stale_commit = store.load_repo(DID).expect("load").expect("repo").commit;
+        let rogue = ModelRecord::new(
+            format!("at://{DID}"),
+            "bafyreiexampleoid00000000000000000000",
+            "2026-06-23T12:34:56.789Z",
+        )
+        .expect("record");
+        store
+            .put_record_and_commit(
+                DID,
+                NAME_COLLECTION,
+                PdsRecordStore::tid_for_repo("rogue"),
+                &rogue,
+                &stale_commit,
+            )
+            .expect("raw write");
+
+        let resolver = PdsRecordResolver::new(Arc::clone(&store));
+        let tid_a = PdsRecordStore::tid_for_repo("repo-a");
+        let err = block_on(resolver.resolve_record(DID, COLLECTION_NSID, &tid_a.encode()))
+            .expect_err("inconsistent store must fail closed");
+        assert!(
+            err.to_string().contains("inconsistent"),
+            "error must name the inconsistency: {err}"
+        );
+        // resolve_repo fails closed the same way.
+        assert!(block_on(resolver.resolve_repo(DID)).is_err());
+    }
+
+    #[test]
+    fn publish_record_rejects_malformed_collection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+        for bad in ["", "with/slash", "with\0nul"] {
+            assert!(
+                publisher.publish_record(bad, "repo-a", SAMPLE_OID).is_err(),
+                "collection {bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]
