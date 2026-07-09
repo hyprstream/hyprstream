@@ -1,0 +1,32 @@
+{{- $root := . -}}
+{{- $defaults := .Values.defaults -}}
+{{- range $name, $svc := .Values.services }}
+{{- if $svc.enabled }}
+{{- $ctx := dict "root" $root "name" $name }}
+{{- $svcCfg := $svc.service | default $defaults.service }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hyprstream.svcName" $ctx }}
+  labels:
+    {{- include "hyprstream.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+  {{- with (default $defaults.service.annotations $svcCfg.annotations) }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $svcCfg.type | default "ClusterIP" }}
+  selector:
+    {{- include "hyprstream.selectorLabels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+  ports:
+    {{- range $svc.ports }}
+    - name: {{ .name }}
+      port: {{ .port }}
+      targetPort: {{ .name }}
+      protocol: {{ .protocol | default "TCP" }}
+    {{- end }}
+{{- end }}
+{{- end }}

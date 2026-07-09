@@ -1,0 +1,229 @@
+{{- if and .Values.observability.enabled .Values.observability.collector.enabled }}
+{{- $root := . -}}
+{{- $col := .Values.observability.collector -}}
+{{- $name := include "hyprstream.collectorName" . -}}
+# -----------------------------------------------------------------------------
+# K1b (#784) — OpenTelemetry Collector: OTLP trace receiver -> spanmetrics
+# connector (RED metrics) -> Prometheus exposition (autoscaling signal source
+# for HPA/KEDA, #792). Standalone Deployment + ConfigMap + Service (all
+# built-in kinds; the optional ServiceMonitor below needs the Prometheus
+# Operator CRD).
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-config
+  labels:
+    {{- include "hyprstream.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: otel-collector
+data:
+  collector.yaml: |
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:{{ $col.ports.health }}
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:{{ $col.ports.otlpGrpc }}
+          http:
+            endpoint: 0.0.0.0:{{ $col.ports.otlpHttp }}
+    processors:
+      memory_limiter:
+        check_interval: 5s
+        limit_percentage: 80
+        spike_limit_percentage: 25
+      batch: {}
+    connectors:
+      # Derives request-rate / error / latency (RED) metrics from incoming spans
+      # per service, labelled by the dimensions below. This is the scaling signal.
+      # Emits `traces.span.metrics.calls` (counter) + `..duration` (histogram);
+      # the prometheus exporter `namespace` below prefixes them, giving
+      # {{ $col.prometheusNamespace }}_traces_span_metrics_calls_total etc.
+      spanmetrics:
+        histogram:
+          explicit:
+            buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2s, 5s, 10s]
+        {{- with $col.dimensions }}
+        dimensions:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        exemplars:
+          enabled: true
+        metrics_flush_interval: 15s
+    exporters:
+      # Prometheus exposition endpoint scraped by HPA/KEDA/kube-prometheus.
+      prometheus:
+        endpoint: 0.0.0.0:{{ $col.ports.prometheus }}
+        namespace: {{ $col.prometheusNamespace | quote }}
+        resource_to_telemetry_conversion:
+          enabled: true
+        enable_open_metrics: true
+      debug:
+        verbosity: basic
+    service:
+      extensions: [health_check]
+      # Disable the collector's own self-telemetry metrics server to avoid
+      # binding an extra port; the pipeline below is the exposition surface.
+      telemetry:
+        metrics:
+          level: none
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [spanmetrics, debug]
+        metrics:
+          receivers: [spanmetrics]
+          processors: [memory_limiter, batch]
+          exporters: [prometheus]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "hyprstream.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: otel-collector
+spec:
+  replicas: {{ $col.replicas }}
+  selector:
+    matchLabels:
+      {{- include "hyprstream.selectorLabels" $root | nindent 6 }}
+      app.kubernetes.io/component: otel-collector
+  template:
+    metadata:
+      labels:
+        {{- include "hyprstream.selectorLabels" $root | nindent 8 }}
+        app.kubernetes.io/component: otel-collector
+      annotations:
+        # Roll the collector when its rendered config changes.
+        checksum/config: {{ $col | toYaml | sha256sum }}
+        {{- with $col.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "hyprstream.serviceAccountName" $root }}
+      {{- with $root.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: otel-collector
+          image: "{{ $col.image.repository }}:{{ $col.image.tag }}"
+          imagePullPolicy: {{ $col.image.pullPolicy }}
+          args:
+            - --config=/conf/collector.yaml
+          ports:
+            - name: otlp-grpc
+              containerPort: {{ $col.ports.otlpGrpc }}
+              protocol: TCP
+            - name: otlp-http
+              containerPort: {{ $col.ports.otlpHttp }}
+              protocol: TCP
+            - name: prometheus
+              containerPort: {{ $col.ports.prometheus }}
+              protocol: TCP
+            - name: health
+              containerPort: {{ $col.ports.health }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          {{- with $col.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /conf
+              readOnly: true
+      {{- with $col.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $col.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $col.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $name }}-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "hyprstream.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: otel-collector
+  {{- with $col.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $col.service.type | default "ClusterIP" }}
+  selector:
+    {{- include "hyprstream.selectorLabels" $root | nindent 4 }}
+    app.kubernetes.io/component: otel-collector
+  ports:
+    - name: otlp-grpc
+      port: {{ $col.ports.otlpGrpc }}
+      targetPort: otlp-grpc
+      protocol: TCP
+    - name: otlp-http
+      port: {{ $col.ports.otlpHttp }}
+      targetPort: otlp-http
+      protocol: TCP
+    - name: prometheus
+      port: {{ $col.ports.prometheus }}
+      targetPort: prometheus
+      protocol: TCP
+{{- if $col.serviceMonitor.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "hyprstream.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: otel-collector
+    {{- with $col.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "hyprstream.selectorLabels" $root | nindent 6 }}
+      app.kubernetes.io/component: otel-collector
+  endpoints:
+    - port: prometheus
+      path: /metrics
+      interval: {{ $col.serviceMonitor.interval }}
+      scrapeTimeout: {{ $col.serviceMonitor.scrapeTimeout }}
+{{- end }}
+{{- end }}

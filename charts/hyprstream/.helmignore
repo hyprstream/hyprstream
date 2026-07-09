@@ -1,0 +1,8 @@
+.DS_Store
+.git/
+.gitignore
+*.tmp
+*.bak
+*.swp
+# tests/ holds golden renders used by CI, not chart runtime assets.
+tests/

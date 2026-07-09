@@ -1,0 +1,918 @@
+---
+# Source: hyprstream/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hyprstream
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+automountServiceAccountToken: true
+---
+# Source: hyprstream/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hyprstream-config
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+data:
+  # Shared HYPRSTREAM__* env for every service. Config crate maps
+  # HYPRSTREAM__<SECTION>__<FIELD> onto HyprConfig.
+  HYPRSTREAM__STORAGE__MODELS_DIR: "/var/lib/hyprstream/models"
+  HYPRSTREAM__STORAGE__LORAS_DIR: "/var/lib/hyprstream/loras"
+  HYPRSTREAM__STORAGE__CACHE_DIR: "/var/lib/hyprstream/cache"
+  HYPRSTREAM__STORAGE__CONFIG_DIR: "/var/lib/hyprstream/config"
+  HYPRSTREAM__TLS__ENABLED: "false"
+  HYPRSTREAM__QUIC__ENABLED: "true"
+  HYPRSTREAM__QUIC__IROH: "true"
+  HYPRSTREAM__QUIC__BIND_ADDR: "0.0.0.0:0"
+  # K1b (#784): turn on the OTLP trace exporter and point it at the collector.
+  # hyprstream only exports OTLP when HYPRSTREAM_OTEL_ENABLE=true (main.rs); the
+  # collector derives Prometheus-scrapeable RED metrics from those spans.
+  HYPRSTREAM_OTEL_ENABLE: "true"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://hyprstream-otel-collector:4317"
+---
+# Source: hyprstream/templates/observability.yaml
+# -----------------------------------------------------------------------------
+# K1b (#784) — OpenTelemetry Collector: OTLP trace receiver -> spanmetrics
+# connector (RED metrics) -> Prometheus exposition (autoscaling signal source
+# for HPA/KEDA, #792). Standalone Deployment + ConfigMap + Service (all
+# built-in kinds; the optional ServiceMonitor below needs the Prometheus
+# Operator CRD).
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hyprstream-otel-collector-config
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: otel-collector
+data:
+  collector.yaml: |
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+    processors:
+      memory_limiter:
+        check_interval: 5s
+        limit_percentage: 80
+        spike_limit_percentage: 25
+      batch: {}
+    connectors:
+      # Derives request-rate / error / latency (RED) metrics from incoming spans
+      # per service, labelled by the dimensions below. This is the scaling signal.
+      # Emits `traces.span.metrics.calls` (counter) + `..duration` (histogram);
+      # the prometheus exporter `namespace` below prefixes them, giving
+      # hyprstream_traces_span_metrics_calls_total etc.
+      spanmetrics:
+        histogram:
+          explicit:
+            buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2s, 5s, 10s]
+        dimensions:
+          - name: http.method
+          - name: http.route
+          - name: http.status_code
+          - name: rpc.method
+          - name: rpc.service
+        exemplars:
+          enabled: true
+        metrics_flush_interval: 15s
+    exporters:
+      # Prometheus exposition endpoint scraped by HPA/KEDA/kube-prometheus.
+      prometheus:
+        endpoint: 0.0.0.0:8889
+        namespace: "hyprstream"
+        resource_to_telemetry_conversion:
+          enabled: true
+        enable_open_metrics: true
+      debug:
+        verbosity: basic
+    service:
+      extensions: [health_check]
+      # Disable the collector's own self-telemetry metrics server to avoid
+      # binding an extra port; the pipeline below is the exposition surface.
+      telemetry:
+        metrics:
+          level: none
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [spanmetrics, debug]
+        metrics:
+          receivers: [spanmetrics]
+          processors: [memory_limiter, batch]
+          exporters: [prometheus]
+---
+# Source: hyprstream/templates/pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hyprstream-data
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+---
+# Source: hyprstream/templates/observability.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: hyprstream-otel-collector
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: otel-collector
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/component: otel-collector
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+      protocol: TCP
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+      protocol: TCP
+    - name: prometheus
+      port: 8889
+      targetPort: prometheus
+      protocol: TCP
+---
+# Source: hyprstream/templates/services.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: hyprstream-discovery
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: discovery
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/component: discovery
+  ports:
+    - name: quic
+      port: 7002
+      targetPort: quic
+      protocol: UDP
+---
+# Source: hyprstream/templates/services.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: hyprstream-event
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: event
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/component: event
+  ports:
+    - name: quic
+      port: 7010
+      targetPort: quic
+      protocol: UDP
+---
+# Source: hyprstream/templates/services.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: hyprstream-model
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: model
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/component: model
+  ports:
+    - name: quic
+      port: 7004
+      targetPort: quic
+      protocol: UDP
+---
+# Source: hyprstream/templates/services.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: hyprstream-oai
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: oai
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/component: oai
+  ports:
+    - name: http
+      port: 6789
+      targetPort: http
+      protocol: TCP
+---
+# Source: hyprstream/templates/services.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: hyprstream-policy
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: policy
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/component: policy
+  ports:
+    - name: quic
+      port: 7001
+      targetPort: quic
+      protocol: UDP
+---
+# Source: hyprstream/templates/services.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: hyprstream-registry
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: registry
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/component: registry
+  ports:
+    - name: quic
+      port: 7003
+      targetPort: quic
+      protocol: UDP
+---
+# Source: hyprstream/templates/services.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: hyprstream-streams
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: streams
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/component: streams
+  ports:
+    - name: quic
+      port: 7011
+      targetPort: quic
+      protocol: UDP
+---
+# Source: hyprstream/templates/deployments.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hyprstream-discovery
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: discovery
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hyprstream
+      app.kubernetes.io/instance: hyprstream
+      app.kubernetes.io/component: discovery
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hyprstream
+        app.kubernetes.io/instance: hyprstream
+        app.kubernetes.io/component: discovery
+    spec:
+      serviceAccountName: hyprstream
+      securityContext:
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: discovery
+          image: ghcr.io/hyprstream/hyprstream:0.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - service
+            - start
+            - discovery
+            - --foreground
+          envFrom:
+            - configMapRef:
+                name: hyprstream-config
+          env:
+            - name: HYPRSTREAM__DISCOVERY__QUIC_PORT
+              value: "7002"
+            - name: HYPRSTREAM__QUIC__SERVER_NAME
+              value: "hyprstream-discovery"
+            - name: OTEL_SERVICE_NAME
+              value: "hyprstream-discovery"
+          ports:
+            - name: quic
+              containerPort: 7002
+              protocol: UDP
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 65532
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/hyprstream
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: hyprstream-data
+---
+# Source: hyprstream/templates/deployments.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hyprstream-event
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: event
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hyprstream
+      app.kubernetes.io/instance: hyprstream
+      app.kubernetes.io/component: event
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hyprstream
+        app.kubernetes.io/instance: hyprstream
+        app.kubernetes.io/component: event
+    spec:
+      serviceAccountName: hyprstream
+      securityContext:
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: event
+          image: ghcr.io/hyprstream/hyprstream:0.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - service
+            - start
+            - event
+            - --foreground
+          envFrom:
+            - configMapRef:
+                name: hyprstream-config
+          env:
+            - name: HYPRSTREAM__EVENT__QUIC_PORT
+              value: "7010"
+            - name: HYPRSTREAM__QUIC__SERVER_NAME
+              value: "hyprstream-event"
+            - name: OTEL_SERVICE_NAME
+              value: "hyprstream-event"
+          ports:
+            - name: quic
+              containerPort: 7010
+              protocol: UDP
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 65532
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/hyprstream
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: hyprstream-data
+---
+# Source: hyprstream/templates/deployments.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hyprstream-model
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: model
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hyprstream
+      app.kubernetes.io/instance: hyprstream
+      app.kubernetes.io/component: model
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hyprstream
+        app.kubernetes.io/instance: hyprstream
+        app.kubernetes.io/component: model
+    spec:
+      serviceAccountName: hyprstream
+      securityContext:
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: model
+          image: ghcr.io/hyprstream/hyprstream:0.1.0-cpu
+          imagePullPolicy: IfNotPresent
+          args:
+            - service
+            - start
+            - model
+            - --foreground
+          envFrom:
+            - configMapRef:
+                name: hyprstream-config
+          env:
+            - name: HYPRSTREAM__MODEL__QUIC_PORT
+              value: "7004"
+            - name: HYPRSTREAM__QUIC__SERVER_NAME
+              value: "hyprstream-model"
+            - name: OTEL_SERVICE_NAME
+              value: "hyprstream-model"
+          ports:
+            - name: quic
+              containerPort: 7004
+              protocol: UDP
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 65532
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/hyprstream
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: hyprstream-data
+---
+# Source: hyprstream/templates/deployments.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hyprstream-oai
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: oai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hyprstream
+      app.kubernetes.io/instance: hyprstream
+      app.kubernetes.io/component: oai
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hyprstream
+        app.kubernetes.io/instance: hyprstream
+        app.kubernetes.io/component: oai
+    spec:
+      serviceAccountName: hyprstream
+      securityContext:
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: oai
+          image: ghcr.io/hyprstream/hyprstream:0.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - service
+            - start
+            - oai
+            - --foreground
+          envFrom:
+            - configMapRef:
+                name: hyprstream-config
+          env:
+            - name: HYPRSTREAM__OAI__HOST
+              value: "0.0.0.0"
+            - name: HYPRSTREAM__OAI__PORT
+              value: "6789"
+            - name: HYPRSTREAM__QUIC__SERVER_NAME
+              value: "hyprstream-oai"
+            - name: OTEL_SERVICE_NAME
+              value: "hyprstream-oai"
+          ports:
+            - name: http
+              containerPort: 6789
+              protocol: TCP
+          readinessProbe:
+            failureThreshold: 6
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 65532
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/hyprstream
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: hyprstream-data
+---
+# Source: hyprstream/templates/deployments.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hyprstream-policy
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: policy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hyprstream
+      app.kubernetes.io/instance: hyprstream
+      app.kubernetes.io/component: policy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hyprstream
+        app.kubernetes.io/instance: hyprstream
+        app.kubernetes.io/component: policy
+    spec:
+      serviceAccountName: hyprstream
+      securityContext:
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: policy
+          image: ghcr.io/hyprstream/hyprstream:0.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - service
+            - start
+            - policy
+            - --foreground
+          envFrom:
+            - configMapRef:
+                name: hyprstream-config
+          env:
+            - name: HYPRSTREAM__POLICY__QUIC_PORT
+              value: "7001"
+            - name: HYPRSTREAM__QUIC__SERVER_NAME
+              value: "hyprstream-policy"
+            - name: OTEL_SERVICE_NAME
+              value: "hyprstream-policy"
+          ports:
+            - name: quic
+              containerPort: 7001
+              protocol: UDP
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 65532
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/hyprstream
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: hyprstream-data
+---
+# Source: hyprstream/templates/deployments.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hyprstream-registry
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: registry
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hyprstream
+      app.kubernetes.io/instance: hyprstream
+      app.kubernetes.io/component: registry
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hyprstream
+        app.kubernetes.io/instance: hyprstream
+        app.kubernetes.io/component: registry
+    spec:
+      serviceAccountName: hyprstream
+      securityContext:
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: registry
+          image: ghcr.io/hyprstream/hyprstream:0.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - service
+            - start
+            - registry
+            - --foreground
+          envFrom:
+            - configMapRef:
+                name: hyprstream-config
+          env:
+            - name: HYPRSTREAM__QUIC__SERVER_NAME
+              value: "hyprstream-registry"
+            - name: HYPRSTREAM__REGISTRY__QUIC_PORT
+              value: "7003"
+            - name: OTEL_SERVICE_NAME
+              value: "hyprstream-registry"
+          ports:
+            - name: quic
+              containerPort: 7003
+              protocol: UDP
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 65532
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/hyprstream
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: hyprstream-data
+---
+# Source: hyprstream/templates/deployments.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hyprstream-streams
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: streams
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hyprstream
+      app.kubernetes.io/instance: hyprstream
+      app.kubernetes.io/component: streams
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hyprstream
+        app.kubernetes.io/instance: hyprstream
+        app.kubernetes.io/component: streams
+    spec:
+      serviceAccountName: hyprstream
+      securityContext:
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: streams
+          image: ghcr.io/hyprstream/hyprstream:0.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - service
+            - start
+            - streams
+            - --foreground
+          envFrom:
+            - configMapRef:
+                name: hyprstream-config
+          env:
+            - name: HYPRSTREAM__QUIC__SERVER_NAME
+              value: "hyprstream-streams"
+            - name: OTEL_SERVICE_NAME
+              value: "hyprstream-streams"
+          ports:
+            - name: quic
+              containerPort: 7011
+              protocol: UDP
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 65532
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/hyprstream
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: hyprstream-data
+---
+# Source: hyprstream/templates/observability.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hyprstream-otel-collector
+  labels:
+    helm.sh/chart: hyprstream-0.1.0
+    app.kubernetes.io/name: hyprstream
+    app.kubernetes.io/instance: hyprstream
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: otel-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hyprstream
+      app.kubernetes.io/instance: hyprstream
+      app.kubernetes.io/component: otel-collector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hyprstream
+        app.kubernetes.io/instance: hyprstream
+        app.kubernetes.io/component: otel-collector
+      annotations:
+        # Roll the collector when its rendered config changes.
+        checksum/config: 909245b4b6619b5dbacb3cebbf79052cd757b686e5372e2fef494d3e61d8ce3d
+    spec:
+      serviceAccountName: hyprstream
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: otel-collector
+          image: "otel/opentelemetry-collector-contrib:0.128.0"
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config=/conf/collector.yaml
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+              protocol: TCP
+            - name: otlp-http
+              containerPort: 4318
+              protocol: TCP
+            - name: prometheus
+              containerPort: 8889
+              protocol: TCP
+            - name: health
+              containerPort: 13133
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: config
+              mountPath: /conf
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: hyprstream-otel-collector-config

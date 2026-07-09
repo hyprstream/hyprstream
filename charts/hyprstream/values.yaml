@@ -1,0 +1,435 @@
+# Default values for the hyprstream chart.
+#
+# Topology: one Deployment + one ClusterIP Service per hyprstream service
+# ("service-per-Deployment"). Services communicate over the networked transport
+# (QUIC over UDP / iroh), addressed by Kubernetes DNS Service names — never over
+# shared-volume Unix-domain sockets (UDS is explicitly not a deployment topology
+# requirement; ratified in epic #778 non-goals).
+#
+# The service set here mirrors the real inventory-registered factories in
+# crates/hyprstream/src/services/factories.rs. QUIC/RPC services expose a UDP
+# port; HTTP surfaces (oai/xet/flight) expose a TCP port.
+
+# -----------------------------------------------------------------------------
+# Image
+# -----------------------------------------------------------------------------
+# ASSUMPTION: no published image reference exists in-repo yet (only a local
+# multi-variant Dockerfile that builds distroless CPU/CUDA/ROCm images and tags
+# nothing). This is a placeholder registry/repo; override for your registry, or
+# have CI publish to it. Variant suffixes match the Dockerfile VARIANT stages.
+image:
+  repository: ghcr.io/hyprstream/hyprstream
+  # Empty tag => Chart.appVersion. A per-service `variant` appends a suffix below.
+  tag: ""
+  pullPolicy: IfNotPresent
+  # Suffix appended to the tag per service `variant` (see services.<name>.variant).
+  # e.g. tag "0.1.0" + variant "cuda" => "0.1.0-cuda128".
+  variants:
+    cpu: "-cpu"
+    cuda: "-cuda128"
+    rocm: "-rocm71"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  automountServiceAccountToken: true
+
+# -----------------------------------------------------------------------------
+# Shared config -> rendered into a ConfigMap and mounted as HYPRSTREAM__* env on
+# every service. Config crate maps HYPRSTREAM__<SECTION>__<FIELD> (double
+# underscore) onto HyprConfig (crates/hyprstream/src/config/mod.rs).
+# -----------------------------------------------------------------------------
+config:
+  # Root data/state directory (models, loras, cache, config). Backed by the PVC
+  # below when persistence.enabled=true.
+  dataDir: /var/lib/hyprstream
+  # QUIC + iroh are on by default in QuicConfig; kept explicit here.
+  quic:
+    enabled: true
+    iroh: true
+    # Base bind address; the per-service QUIC listen port comes from each
+    # service's HYPRSTREAM__<SVC>__QUIC_PORT (see services.<name>.env).
+    bindAddr: "0.0.0.0:0"
+  # In-cluster HTTP surfaces are fronted by Kubernetes Services and probes.
+  # Leave app TLS off by default so the oai readiness/liveness HTTP probes and
+  # README port-forward curl hit the protocol actually served on 6789. Operators
+  # that terminate TLS in-process can set this true and update probes to HTTPS.
+  tls:
+    enabled: false
+  # Extra raw HYPRSTREAM__* env applied to every service (escape hatch).
+  extraEnv: {}
+
+# -----------------------------------------------------------------------------
+# Persistence for the data dir (models via XET/CAS or PVC). Set enabled=false to
+# use an emptyDir (ephemeral) instead — useful for smoke tests.
+# -----------------------------------------------------------------------------
+persistence:
+  enabled: true
+  # existingClaim: ""
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 20Gi
+  annotations: {}
+
+# -----------------------------------------------------------------------------
+# K1a key/trust bootstrap (#783).
+#
+# hyprstream reads a flat credential directory when HYPRSTREAM__SECRETS__PATH is
+# set. In Kubernetes each pod gets that flat directory by projecting:
+#   - shared trust: ca-pubkey + bootstrap-pubkeys
+#   - service credential Secret: signing-key + service-jwt
+#   - policy-only CA Secret: ca-key (policy signs/renews service JWTs)
+#
+# Generate these files with the normal hyprstream bootstrap/wizard flow, or an
+# external-secrets controller. The chart deliberately does not mint keys in
+# templates: Helm has no secure RNG/signing primitive, and missing credentials
+# should fail closed rather than silently deriving identity in-cluster.
+# -----------------------------------------------------------------------------
+keyBootstrap:
+  enabled: false
+  # Directory each service reads signing keys / bootstrap pubkeys / JWTs from.
+  secretsPath: /var/lib/hyprstream/credentials
+  # OAuth issuer / local trust-domain URL stamped into service JWTs by the
+  # bootstrap tool and used as the node's did:web authority when OAuth is on.
+  # If set, it is exposed as HYPRSTREAM__OAUTH__ISSUER_URL.
+  issuerUrl: ""
+  # Shared public trust material. Existing Secret must contain:
+  #   ca-pubkey
+  #   bootstrap-pubkeys
+  trust:
+    existingSecret: ""
+    # Inline public trust data for dev/test installs. Values are rendered into a
+    # Secret only when existingSecret is empty. Do not put private keys here.
+    caPubkey: ""
+    bootstrapPubkeys: ""
+  # Per-service credential Secrets. Each non-policy service Secret must contain:
+  #   signing-key
+  #   service-jwt
+  # The policy service Secret must contain:
+  #   signing-key
+  # and may contain service-jwt for symmetry.
+  # Omitted entries default to "<fullname>-<service>-credentials".
+  serviceSecrets: {}
+  # Policy-only CA Secret. Must contain ca-key. Omitted default:
+  # "<fullname>-policy-ca".
+  policyCaSecret: ""
+
+# -----------------------------------------------------------------------------
+# K1b observability (#784) — OpenTelemetry Collector -> Prometheus exposition.
+#
+# hyprstream's `otel` feature is OTLP-*push* only and exports **traces** (spans),
+# not metrics (crates/hyprstream/src/bin/main.rs). HPA/KEDA need a scrapeable
+# signal, so the chart deploys a standalone OTel Collector Deployment that:
+#   1. receives OTLP traces from every service (gRPC :4317 / HTTP :4318),
+#   2. derives RED metrics (request rate / errors / latency) from those spans
+#      via the `spanmetrics` connector, and
+#   3. exposes them on a Prometheus exposition endpoint (:8889 /metrics) that
+#      an HPA (prometheus-adapter) or KEDA prometheus scaler can consume (#792).
+#
+# When enabled, every service also gets HYPRSTREAM_OTEL_ENABLE=true and
+# OTEL_EXPORTER_OTLP_ENDPOINT pointed at the collector Service (see configmap).
+# Standalone Deployment (not sidecar/DaemonSet): OTLP is push, so services dial
+# one collector Service by DNS; Prometheus scrapes that one endpoint.
+# -----------------------------------------------------------------------------
+observability:
+  enabled: false
+  # OTLP endpoint every service pushes traces to. Leave empty to default to the
+  # in-cluster collector Service below ("http://<fullname>-otel-collector:4317").
+  # Override to point at an external/existing collector instead.
+  otelExporterOtlpEndpoint: ""
+  collector:
+    # Deploy the bundled collector. Set false to only wire the env above at an
+    # external collector (otelExporterOtlpEndpoint must then be set).
+    enabled: true
+    image:
+      # contrib distro — the `spanmetrics` connector is not in the core distro.
+      repository: otel/opentelemetry-collector-contrib
+      tag: "0.128.0"
+      pullPolicy: IfNotPresent
+    replicas: 1
+    resources: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    podAnnotations: {}
+    ports:
+      otlpGrpc: 4317
+      otlpHttp: 4318
+      # Prometheus exposition endpoint (scraped by HPA/KEDA/kube-prometheus).
+      prometheus: 8889
+      # Collector health_check extension (used for readiness/liveness).
+      health: 13133
+    # Metric name prefix on the Prometheus exposition
+    # (e.g. hyprstream_traces_span_metrics_calls_total).
+    prometheusNamespace: hyprstream
+    # Span attributes promoted to metric labels (dimensions) so scaling signals
+    # can be sliced per route/method. Attribute must exist on the span or the
+    # dimension is dropped.
+    dimensions:
+      - name: http.method
+      - name: http.route
+      - name: http.status_code
+      - name: rpc.method
+      - name: rpc.service
+    service:
+      type: ClusterIP
+      # Prometheus annotation-based scrape discovery (kube-prometheus ignores
+      # these — use serviceMonitor for that). Handy for prometheus.io/scrape.
+      annotations: {}
+    # Emit a kube-prometheus-stack ServiceMonitor. Requires the Prometheus
+    # Operator CRD (monitoring.coreos.com/v1) to be installed in the cluster.
+    serviceMonitor:
+      enabled: false
+      interval: 30s
+      scrapeTimeout: 10s
+      # Extra labels (e.g. release: kube-prometheus-stack) so the operator selects it.
+      labels: {}
+
+# -----------------------------------------------------------------------------
+# Defaults applied to every service; each services.<name> entry may override.
+# -----------------------------------------------------------------------------
+defaults:
+  replicas: 1
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  podSecurityContext:
+    fsGroup: 65532
+    fsGroupChangePolicy: OnRootMismatch
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: false
+    runAsNonRoot: true
+    runAsUser: 65532        # distroless "nonroot"
+    capabilities:
+      drop:
+        - ALL
+  # Probes are per-service; QUIC (UDP) services have no TCP/HTTP health surface,
+  # so ordering across Deployments relies on hyprstream's fail-closed connect
+  # retry rather than initContainer wait-hacks. Services with an HTTP surface
+  # (oai) set a real readiness probe below.
+  readinessProbe: {}
+  livenessProbe: {}
+  service:
+    type: ClusterIP
+    annotations: {}
+
+# -----------------------------------------------------------------------------
+# Services (mirrors #[service_factory] registrations). The map key IS the
+# hyprstream service name passed to `service start <name> --foreground`.
+#
+# Default-enabled set satisfies the #779 acceptance path
+# (event/registry/policy/streams/model(cpu)/oai) plus its transitive
+# dependencies (discovery; registry/model/oai depend_on it). Everything else is
+# a toggle (enabled:false) so operators opt in.
+# -----------------------------------------------------------------------------
+services:
+
+  # --- Control plane -------------------------------------------------------
+  policy:
+    enabled: true
+    kind: rpc              # QUIC/RPC (informational)
+    ports:
+      - name: quic
+        port: 7001
+        protocol: UDP
+    env:
+      HYPRSTREAM__POLICY__QUIC_PORT: "7001"
+      HYPRSTREAM__QUIC__SERVER_NAME: "hyprstream-policy"
+
+  discovery:
+    enabled: true
+    kind: rpc
+    ports:
+      - name: quic
+        port: 7002
+        protocol: UDP
+    env:
+      HYPRSTREAM__DISCOVERY__QUIC_PORT: "7002"
+      HYPRSTREAM__QUIC__SERVER_NAME: "hyprstream-discovery"
+
+  registry:
+    enabled: true
+    kind: rpc
+    ports:
+      - name: quic
+        port: 7003
+        protocol: UDP
+    env:
+      HYPRSTREAM__REGISTRY__QUIC_PORT: "7003"
+      HYPRSTREAM__QUIC__SERVER_NAME: "hyprstream-registry"
+
+  model:
+    enabled: true
+    kind: rpc
+    # Inference image variant: cpu | cuda | rocm. GPU variants also need the
+    # matching resources/nodeSelector below (device plugins).
+    variant: cpu
+    ports:
+      - name: quic
+        port: 7004
+        protocol: UDP
+    env:
+      HYPRSTREAM__MODEL__QUIC_PORT: "7004"
+      HYPRSTREAM__QUIC__SERVER_NAME: "hyprstream-model"
+    # GPU example (uncomment + set variant: cuda):
+    # resources:
+    #   limits:
+    #     nvidia.com/gpu: 1
+    # nodeSelector:
+    #   nvidia.com/gpu.present: "true"
+
+  # --- MoQ planes (process-global origins; barrier services) ---------------
+  event:
+    enabled: true
+    kind: moq
+    ports:
+      - name: quic
+        port: 7010
+        protocol: UDP
+    env:
+      HYPRSTREAM__EVENT__QUIC_PORT: "7010"
+      HYPRSTREAM__QUIC__SERVER_NAME: "hyprstream-event"
+
+  streams:
+    enabled: true
+    kind: moq
+    # The streams barrier service serves a process-global MoQ origin. It has no
+    # RPC QUIC listener of its own; a nominal port keeps the Service valid and
+    # reserves the MoQ/WebTransport reach for cross-pod wiring.
+    ports:
+      - name: quic
+        port: 7011
+        protocol: UDP
+    env:
+      HYPRSTREAM__QUIC__SERVER_NAME: "hyprstream-streams"
+
+  # --- HTTP surface --------------------------------------------------------
+  oai:
+    enabled: true
+    kind: http
+    ports:
+      - name: http
+        port: 6789
+        protocol: TCP
+    env:
+      HYPRSTREAM__OAI__PORT: "6789"
+      HYPRSTREAM__OAI__HOST: "0.0.0.0"
+      HYPRSTREAM__QUIC__SERVER_NAME: "hyprstream-oai"
+    # oai serves an Axum /health route (crates/hyprstream/src/server/mod.rs).
+    readinessProbe:
+      httpGet:
+        path: /health
+        port: http
+      initialDelaySeconds: 10
+      periodSeconds: 10
+      failureThreshold: 6
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: http
+      initialDelaySeconds: 30
+      periodSeconds: 20
+
+  # --- Optional services (opt in) -----------------------------------------
+  oauth:
+    enabled: false
+    kind: http
+    ports:
+      - name: http
+        port: 6791
+        protocol: TCP
+      - name: quic
+        port: 7007
+        protocol: UDP
+    env:
+      HYPRSTREAM__OAUTH__PORT: "6791"
+      HYPRSTREAM__OAUTH__QUIC_PORT: "7007"
+      HYPRSTREAM__QUIC__SERVER_NAME: "hyprstream-oauth"
+
+  mcp:
+    enabled: false
+    kind: http
+    ports:
+      - name: http
+        port: 6790
+        protocol: TCP
+      - name: quic
+        port: 7006
+        protocol: UDP
+    env:
+      HYPRSTREAM__MCP__HTTP_PORT: "6790"
+      HYPRSTREAM__MCP__QUIC_PORT: "7006"
+      HYPRSTREAM__QUIC__SERVER_NAME: "hyprstream-mcp"
+
+  xet:
+    enabled: false
+    kind: http
+    ports:
+      - name: http
+        port: 6792
+        protocol: TCP
+    env:
+      HYPRSTREAM__XET__PORT: "6792"
+      HYPRSTREAM__QUIC__SERVER_NAME: "hyprstream-xet"
+
+  flight:
+    enabled: false
+    kind: http
+    ports:
+      - name: grpc
+        port: 50051
+        protocol: TCP
+    env:
+      HYPRSTREAM__FLIGHT__PORT: "50051"
+      HYPRSTREAM__QUIC__SERVER_NAME: "hyprstream-flight"
+
+  metrics:
+    enabled: false
+    kind: rpc
+    ports:
+      - name: quic
+        port: 7009
+        protocol: UDP
+    env:
+      HYPRSTREAM__METRICS__QUIC_PORT: "7009"
+      HYPRSTREAM__QUIC__SERVER_NAME: "hyprstream-metrics"
+
+  tui:
+    enabled: false
+    kind: rpc
+    ports:
+      - name: quic
+        port: 7008
+        protocol: UDP
+    env:
+      HYPRSTREAM__TUI__QUIC_PORT: "7008"
+      HYPRSTREAM__QUIC__SERVER_NAME: "hyprstream-tui"
+
+  worker:
+    # The worker service manages sandbox backends (Kata microVM / rootless OCI /
+    # nspawn). PRIVILEGE NOTE: real sandbox backends need elevated privileges
+    # (device access, user namespaces, /dev/kvm for microVMs) that are NOT
+    # granted by this chart's default hardened securityContext. Enable only with
+    # a securityContext override appropriate to your backend + node policy.
+    enabled: false
+    kind: rpc
+    ports:
+      - name: quic
+        port: 7005
+        protocol: UDP
+    env:
+      HYPRSTREAM__WORKER__QUIC_PORT: "7005"
+      HYPRSTREAM__QUIC__SERVER_NAME: "hyprstream-worker"
+    # Example privileged override (backend-dependent — review before use):
+    # securityContext:
+    #   runAsNonRoot: false
+    #   privileged: true

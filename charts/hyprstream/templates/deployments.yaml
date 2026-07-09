@@ -1,0 +1,148 @@
+{{- $root := . -}}
+{{- $defaults := .Values.defaults -}}
+{{- range $name, $svc := .Values.services }}
+{{- if $svc.enabled }}
+{{- $ctx := dict "root" $root "name" $name }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hyprstream.svcName" $ctx }}
+  labels:
+    {{- include "hyprstream.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+spec:
+  replicas: {{ $svc.replicas | default $defaults.replicas }}
+  selector:
+    matchLabels:
+      {{- include "hyprstream.selectorLabels" $root | nindent 6 }}
+      app.kubernetes.io/component: {{ $name }}
+  template:
+    metadata:
+      labels:
+        {{- include "hyprstream.selectorLabels" $root | nindent 8 }}
+        app.kubernetes.io/component: {{ $name }}
+      {{- with (mergeOverwrite (deepCopy $defaults.podAnnotations) ($svc.podAnnotations | default dict)) }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "hyprstream.serviceAccountName" $root }}
+      {{- with $root.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (default $defaults.podSecurityContext $svc.podSecurityContext) }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ $name }}
+          image: {{ include "hyprstream.image" (dict "root" $root "svc" $svc) }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          args:
+            - service
+            - start
+            - {{ $name }}
+            - --foreground
+          envFrom:
+            - configMapRef:
+                name: {{ include "hyprstream.fullname" $root }}-config
+          {{- if or $svc.env $root.Values.observability.enabled (and $root.Values.keyBootstrap.enabled $root.Values.keyBootstrap.issuerUrl) }}
+          env:
+            {{- range $k, $v := $svc.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+            {{- if $root.Values.observability.enabled }}
+            - name: OTEL_SERVICE_NAME
+              value: {{ include "hyprstream.svcName" $ctx | quote }}
+            {{- end }}
+            {{- if and $root.Values.keyBootstrap.enabled $root.Values.keyBootstrap.issuerUrl }}
+            - name: HYPRSTREAM__OAUTH__ISSUER_URL
+              value: {{ $root.Values.keyBootstrap.issuerUrl | quote }}
+            {{- end }}
+          {{- end }}
+          {{- with $svc.ports }}
+          ports:
+            {{- range . }}
+            - name: {{ .name }}
+              containerPort: {{ .port }}
+              protocol: {{ .protocol | default "TCP" }}
+            {{- end }}
+          {{- end }}
+          {{- with (default $defaults.readinessProbe $svc.readinessProbe) }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with (default $defaults.livenessProbe $svc.livenessProbe) }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with (default $defaults.securityContext $svc.securityContext) }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with (default $defaults.resources $svc.resources) }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ $root.Values.config.dataDir }}
+            {{- if $root.Values.keyBootstrap.enabled }}
+            - name: credentials
+              mountPath: {{ $root.Values.keyBootstrap.secretsPath }}
+              readOnly: true
+            {{- end }}
+      {{- with (default $defaults.nodeSelector $svc.nodeSelector) }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (default $defaults.tolerations $svc.tolerations) }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (default $defaults.affinity $svc.affinity) }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: data
+          {{- if $root.Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ $root.Values.persistence.existingClaim | default (printf "%s-data" (include "hyprstream.fullname" $root)) }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- if $root.Values.keyBootstrap.enabled }}
+        - name: credentials
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: {{ include "hyprstream.trustSecretName" $root }}
+                  items:
+                    - key: ca-pubkey
+                      path: ca-pubkey
+                    - key: bootstrap-pubkeys
+                      path: bootstrap-pubkeys
+              - secret:
+                  name: {{ include "hyprstream.serviceCredentialSecretName" $ctx }}
+                  items:
+                    - key: signing-key
+                      path: signing-key
+                    {{- if ne $name "policy" }}
+                    - key: service-jwt
+                      path: service-jwt
+                    {{- end }}
+              {{- if eq $name "policy" }}
+              - secret:
+                  name: {{ include "hyprstream.policyCaSecretName" $root }}
+                  items:
+                    - key: ca-key
+                      path: ca-key
+              {{- end }}
+        {{- end }}
+{{- end }}
+{{- end }}
