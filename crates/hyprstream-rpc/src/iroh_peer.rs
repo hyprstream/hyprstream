@@ -133,6 +133,38 @@ pub fn node_id_from_did_key(did: &str) -> Result<[u8; 32]> {
 // Pkarr relay lookup (N0 relay — same HTTP endpoint as atproto.ts fallback)
 // ============================================================================
 
+/// A relay URL sourced from a pkarr record — an **unverified reach hint**.
+///
+/// This is the typed output of [`resolve_pkarr_relay_url`]. It exists to make
+/// the D3 liveness-only contract (#895) structural: a pkarr record is signed by
+/// the peer's Ed25519 NodeId, so it is an integrity-protected *reach claim*
+/// ("I am reachable at this relay"), but it carries **zero identity/trust
+/// authority** — it says nothing about which capsule / `did:web` / `did:key`
+/// owns that NodeId or what its PQ key material is.
+///
+/// **Forbidden use:** this value MUST NOT be treated as an identity authority
+/// input. Authority for a `did:at9p` peer comes only from a GATE-verified
+/// capsule (D1 / #893); for a raw `did:key` peer, from the channel-bound
+/// `remote_id()`. The hint is a dial candidate only — feed it to the iroh dial
+/// path as a relay address, never to admission / trust decisions.
+///
+/// The newtype has no conversion to any identity type by design; reach its URL
+/// via [`PkarrReachHint::url`] when constructing a dial target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PkarrReachHint(String);
+
+impl PkarrReachHint {
+    /// Wrap a relay URL parsed from a pkarr record as an unverified reach hint.
+    pub fn new(relay_url: String) -> Self {
+        Self(relay_url)
+    }
+
+    /// The relay URL, for use as a dial-candidate address only.
+    pub fn url(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Resolve a peer's relay URL from the N0 pkarr relay via iroh's PkarrRelayClient.
 ///
 /// Fetches `https://dns.iroh.link/pkarr/<z32-node-id>` using the iroh
@@ -142,12 +174,17 @@ pub fn node_id_from_did_key(did: &str) -> Result<[u8; 32]> {
 /// This is equivalent to the `atproto.ts` HTTP-fetch workaround but uses
 /// iroh's verified parser instead of manual DNS-wire parsing.
 ///
+/// **D3 (#895): the returned [`PkarrReachHint`] is an unverified reach hint,
+/// not an identity authority source** — see its doc. pkarr rides the same
+/// mainline DHT as the at9p locator, but only at9p (GATE-verified capsule) is
+/// zero-trust.
+///
 /// # Returns
 ///
-/// `Ok(Some(relay_url))` if the peer has published a relay URL.
+/// `Ok(Some(hint))` if the peer has published a relay URL.
 /// `Ok(None)` if the peer has no record or no relay URL in the record.
 /// `Err(_)` if the pkarr relay is unreachable or the response is invalid.
-pub async fn resolve_pkarr_relay_url(node_id_bytes: &[u8; 32]) -> Result<Option<String>> {
+pub async fn resolve_pkarr_relay_url(node_id_bytes: &[u8; 32]) -> Result<Option<PkarrReachHint>> {
     let node_id = EndpointId::from_bytes(node_id_bytes)
         .map_err(|e| anyhow!("invalid node_id bytes: {e:?}"))?;
     let pkarr_relay_url: url::Url = "https://dns.iroh.link/pkarr"
@@ -177,7 +214,10 @@ pub async fn resolve_pkarr_relay_url(node_id_bytes: &[u8; 32]) -> Result<Option<
         .next()
         .map(|url| url.to_string());
 
-    Ok(relay_url)
+    // Wrap as an unverified reach hint so the D3 contract (pkarr derives zero
+    // authority) is enforced at the type — callers get a PkarrReachHint, never a
+    // bare String that could be mistaken for authoritative reach.
+    Ok(relay_url.map(PkarrReachHint::new))
 }
 
 /// Whether a pkarr resolve error is the "no record for this peer" case (HTTP
