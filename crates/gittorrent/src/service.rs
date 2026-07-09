@@ -5,16 +5,28 @@
 //! - P2P networking for repository discovery and sharing via libp2p
 //! - SHA256-based content addressing and distribution
 
-use crate::{Result, Error, GitTorrentUrl, Sha256Hash};
-use crate::dht::{GitTorrentDht, GitObjectKey, GitObjectRecord};
-use crate::crypto::hash::{sha256_git, verify_sha256};
+#[cfg(any(not(all(feature = "iroh-blobs", feature = "mainline-locator")), test))]
+use crate::crypto::hash::sha256_git;
+#[cfg(not(all(feature = "iroh-blobs", feature = "mainline-locator")))]
+use crate::crypto::hash::verify_sha256;
+use crate::dht::{GitObjectKey, GitObjectRecord, GitTorrentDht};
+use crate::{Error, GitTorrentUrl, Result, Sha256Hash};
 
+#[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+use crate::blobs::IrohBlobStore;
+#[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+use crate::locator::{Cid512, MainlineLocator, PeerContact, CID512_LEN};
+#[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+use async_trait::async_trait;
+#[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+use iroh_blobs::Hash as Blake3Hash;
+
+use libp2p::Multiaddr;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use serde::{Serialize, Deserialize};
-use libp2p::Multiaddr;
 
 /// Configuration for GitTorrent service
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,7 +61,7 @@ impl Default for GitTorrentConfig {
             auto_discovery: true,
             bind_address: "127.0.0.1".to_owned(),
             bind_port: 8080,
-            p2p_port: 0, // 0 = random port
+            p2p_port: 0,                           // 0 = random port
             dht_mode: crate::dht::DhtMode::Server, // Server mode by default
         }
     }
@@ -126,7 +138,7 @@ impl GitTorrentConfig {
             .add_source(
                 config::Environment::with_prefix("GITTORRENT")
                     .separator("_")
-                    .list_separator(",")
+                    .list_separator(","),
             ))
     }
 
@@ -145,7 +157,8 @@ impl GitTorrentConfig {
             .build()
             .map_err(|e| Error::other(format!("Failed to build config: {e}")))?;
 
-        config.try_deserialize()
+        config
+            .try_deserialize()
             .map_err(|e| Error::other(format!("Failed to deserialize config: {e}")))
     }
 }
@@ -210,10 +223,113 @@ pub struct ObjectStats {
 pub struct GitTorrentService {
     /// DHT service for P2P networking
     dht: Arc<GitTorrentDht>,
+    /// iroh-blobs/mainline object plane used by the facade during F2.
+    #[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+    object_plane: ObjectPlane,
     /// Local repository metadata
     repositories: Arc<RwLock<HashMap<String, RepositoryMetadata>>>,
     /// Git object cache
     object_cache: Arc<RwLock<HashMap<Sha256Hash, Vec<u8>>>>,
+}
+
+#[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+struct ObjectPlane {
+    blobs: Arc<IrohBlobStore>,
+    locator: Arc<dyn ObjectLocator>,
+    fetcher: Arc<dyn RemoteBlobFetcher>,
+    announce_port: Option<u16>,
+}
+
+#[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+#[async_trait]
+trait ObjectLocator: Send + Sync {
+    async fn announce(&self, cid: &Cid512, port: Option<u16>) -> Result<()>;
+    async fn providers(&self, cid: &Cid512) -> Result<Vec<PeerContact>>;
+}
+
+#[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+#[async_trait]
+impl ObjectLocator for MainlineLocator {
+    async fn announce(&self, cid: &Cid512, port: Option<u16>) -> Result<()> {
+        MainlineLocator::announce(self, cid, port).await
+    }
+
+    async fn providers(&self, cid: &Cid512) -> Result<Vec<PeerContact>> {
+        MainlineLocator::providers(self, cid).await
+    }
+}
+
+#[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+#[async_trait]
+trait RemoteBlobFetcher: Send + Sync {
+    async fn fetch(
+        &self,
+        hash: &Sha256Hash,
+        providers: Vec<PeerContact>,
+    ) -> Result<Option<Vec<u8>>>;
+}
+
+#[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+#[derive(Debug, Default)]
+struct IrohMainlineBlobFetcher;
+
+#[cfg(all(test, feature = "iroh-blobs", feature = "mainline-locator"))]
+#[derive(Debug, Default)]
+struct NoopObjectLocator;
+
+#[cfg(all(test, feature = "iroh-blobs", feature = "mainline-locator"))]
+#[async_trait]
+impl ObjectLocator for NoopObjectLocator {
+    async fn announce(&self, _cid: &Cid512, _port: Option<u16>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn providers(&self, _cid: &Cid512) -> Result<Vec<PeerContact>> {
+        Ok(Vec::new())
+    }
+}
+
+#[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+#[async_trait]
+impl RemoteBlobFetcher for IrohMainlineBlobFetcher {
+    async fn fetch(
+        &self,
+        hash: &Sha256Hash,
+        providers: Vec<PeerContact>,
+    ) -> Result<Option<Vec<u8>>> {
+        // C2 currently exposes BEP5 socket contacts. The iroh-blobs downloader
+        // needs authenticated iroh EndpointIds, so F2 keeps this as the single
+        // adapter point until the locator carries endpoint identity metadata.
+        if !providers.is_empty() {
+            tracing::debug!(
+                "found {} mainline providers for sha256 {hash}, but endpoint-id fetch is not wired yet",
+                providers.len(),
+            );
+        }
+        Ok(None)
+    }
+}
+
+#[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+fn locator_cid_from_blake3(hash: Blake3Hash) -> Cid512 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"hyprstream.gittorrent.iroh-blobs.locator.v1");
+    hasher.update(hash.as_bytes());
+
+    let mut cid = [0u8; CID512_LEN];
+    hasher.finalize_xof().fill(&mut cid);
+    Cid512::from_bytes(cid)
+}
+
+#[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+fn locator_cid_from_sha256(hash: &Sha256Hash) -> Cid512 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"hyprstream.gittorrent.sha256-facade.locator.v1");
+    hasher.update(&hash.to_bytes());
+
+    let mut cid = [0u8; CID512_LEN];
+    hasher.finalize_xof().fill(&mut cid);
+    Cid512::from_bytes(cid)
 }
 
 impl GitTorrentService {
@@ -224,6 +340,20 @@ impl GitTorrentService {
 
         // Initialize DHT with configured port
         let dht = Arc::new(GitTorrentDht::new(config.p2p_port, config.dht_mode).await?);
+
+        #[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+        let object_plane = ObjectPlane {
+            #[cfg(not(test))]
+            blobs: Arc::new(IrohBlobStore::open_fs(config.storage_dir.join("iroh-blobs")).await?),
+            #[cfg(test)]
+            blobs: Arc::new(IrohBlobStore::new_memory()),
+            #[cfg(not(test))]
+            locator: Arc::new(MainlineLocator::new()?),
+            #[cfg(test)]
+            locator: Arc::new(NoopObjectLocator),
+            fetcher: Arc::new(IrohMainlineBlobFetcher),
+            announce_port: config.auto_discovery.then_some(config.p2p_port),
+        };
 
         // Bootstrap DHT with known peers
         let bootstrap_addrs: Vec<Multiaddr> = config
@@ -247,6 +377,31 @@ impl GitTorrentService {
 
         Ok(Self {
             dht,
+            #[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+            object_plane,
+            repositories: Arc::new(RwLock::new(HashMap::new())),
+            object_cache: Arc::new(RwLock::new(HashMap::new())),
+        })
+    }
+
+    #[cfg(all(test, feature = "iroh-blobs", feature = "mainline-locator"))]
+    async fn new_with_object_plane(
+        config: GitTorrentConfig,
+        locator: Arc<dyn ObjectLocator>,
+        fetcher: Arc<dyn RemoteBlobFetcher>,
+    ) -> Result<Self> {
+        tokio::fs::create_dir_all(&config.storage_dir).await?;
+        let dht = Arc::new(GitTorrentDht::new(config.p2p_port, config.dht_mode).await?);
+        let object_plane = ObjectPlane {
+            blobs: Arc::new(IrohBlobStore::open_fs(config.storage_dir.join("iroh-blobs")).await?),
+            locator,
+            fetcher,
+            announce_port: config.auto_discovery.then_some(config.p2p_port),
+        };
+
+        Ok(Self {
+            dht,
+            object_plane,
             repositories: Arc::new(RwLock::new(HashMap::new())),
             object_cache: Arc::new(RwLock::new(HashMap::new())),
         })
@@ -266,6 +421,7 @@ impl GitTorrentService {
     }
 
     /// Get a Git object by SHA256 hash
+    #[allow(unreachable_code)]
     pub async fn get_object(&self, hash: &Sha256Hash) -> Result<Option<Vec<u8>>> {
         // Check local cache first
         {
@@ -275,17 +431,47 @@ impl GitTorrentService {
             }
         }
 
-        // Try to fetch from DHT
-        let key = GitObjectKey::from_sha256(hash);
-        if let Some(record) = self.dht.get_object(key).await? {
-            // Verify the object hash
-            if verify_sha256(&record.data, hash)? {
-                // Cache the object
+        #[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+        {
+            if let Some(data) = self.object_plane.blobs.get_object(hash).await? {
                 let mut cache = self.object_cache.write().await;
-                cache.insert(hash.clone(), record.data.clone());
-                return Ok(Some(record.data));
-            } else {
-                tracing::warn!("Object hash mismatch for {}", hash);
+                cache.insert(hash.clone(), data.clone());
+                return Ok(Some(data));
+            }
+
+            let cid = locator_cid_from_sha256(hash);
+            let providers = self.object_plane.locator.providers(&cid).await?;
+            if providers.is_empty() {
+                return Ok(None);
+            }
+
+            if let Some(data) = self.object_plane.fetcher.fetch(hash, providers).await? {
+                self.object_plane
+                    .blobs
+                    .put_verified_object(hash.clone(), data.clone())
+                    .await?;
+                let mut cache = self.object_cache.write().await;
+                cache.insert(hash.clone(), data.clone());
+                return Ok(Some(data));
+            }
+
+            return Ok(None);
+        }
+
+        #[cfg(not(all(feature = "iroh-blobs", feature = "mainline-locator")))]
+        {
+            // Try to fetch from DHT
+            let key = GitObjectKey::from_sha256(hash);
+            if let Some(record) = self.dht.get_object(key).await? {
+                // Verify the object hash
+                if verify_sha256(&record.data, hash)? {
+                    // Cache the object
+                    let mut cache = self.object_cache.write().await;
+                    cache.insert(hash.clone(), record.data.clone());
+                    return Ok(Some(record.data));
+                } else {
+                    tracing::warn!("Object hash mismatch for {}", hash);
+                }
             }
         }
 
@@ -293,24 +479,58 @@ impl GitTorrentService {
     }
 
     /// Store a Git object in the DHT
+    #[allow(unreachable_code)]
     pub async fn put_object(&self, data: Vec<u8>) -> Result<Sha256Hash> {
-        // Calculate SHA256 hash
-        let hash = sha256_git(&data)?;
+        #[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+        {
+            let hash = self.object_plane.blobs.put_object(data.clone()).await?;
+            let blake3 = self
+                .object_plane
+                .blobs
+                .blake3_of(&hash)
+                .await
+                .ok_or_else(|| Error::not_found(format!("missing blake3 index for {hash}")))?;
+            let cid = locator_cid_from_blake3(blake3);
 
-        // Store in DHT
-        let key = GitObjectKey::from_sha256(&hash);
-        let record = GitObjectRecord::new(key.clone(), data.clone());
-        self.dht.put_object(record).await?;
+            if let Some(port) = self.object_plane.announce_port {
+                let facade_cid = locator_cid_from_sha256(&hash);
+                self.object_plane.locator.announce(&cid, Some(port)).await?;
+                self.object_plane
+                    .locator
+                    .announce(&facade_cid, Some(port))
+                    .await?;
+            }
 
-        // Announce as provider
-        self.dht.provide(key).await?;
+            let mut cache = self.object_cache.write().await;
+            cache.insert(hash.clone(), data);
 
-        // Cache locally
-        let mut cache = self.object_cache.write().await;
-        cache.insert(hash.clone(), data);
+            tracing::debug!("Stored object with hash: {}", hash);
+            return Ok(hash);
+        }
 
-        tracing::debug!("Stored object with hash: {}", hash);
-        Ok(hash)
+        #[cfg(not(all(feature = "iroh-blobs", feature = "mainline-locator")))]
+        {
+            // Calculate SHA256 hash
+            let hash = sha256_git(&data)?;
+
+            // Store in DHT
+            let key = GitObjectKey::from_sha256(&hash);
+            let record = GitObjectRecord::new(key.clone(), data.clone());
+            self.dht.put_object(record).await?;
+
+            // Announce as provider
+            self.dht.provide(key).await?;
+
+            // Cache locally
+            let mut cache = self.object_cache.write().await;
+            cache.insert(hash.clone(), data);
+
+            tracing::debug!("Stored object with hash: {}", hash);
+            return Ok(hash);
+        }
+
+        #[allow(unreachable_code)]
+        Err(Error::other("unreachable object storage configuration"))
     }
 
     /// Find providers for a Git object
@@ -351,13 +571,21 @@ impl GitTorrentService {
     }
 
     /// Store objects for a specific commit and its history
-    pub async fn store_commit_objects(&self, repo_path: &Path, commit_hash: &str) -> Result<Vec<Sha256Hash>> {
+    pub async fn store_commit_objects(
+        &self,
+        repo_path: &Path,
+        commit_hash: &str,
+    ) -> Result<Vec<Sha256Hash>> {
         use crate::git::objects::extract_commit_objects;
 
         let objects = extract_commit_objects(repo_path, commit_hash).await?;
         let mut stored_hashes = Vec::new();
 
-        tracing::info!("Storing {} objects for commit {}", objects.len(), commit_hash);
+        tracing::info!(
+            "Storing {} objects for commit {}",
+            objects.len(),
+            commit_hash
+        );
 
         for obj in objects {
             // Store object in DHT
@@ -381,9 +609,10 @@ impl GitTorrentService {
     }
 
     /// Reconstruct repository from individual objects
-    pub async fn reconstruct_repository(&self,
+    pub async fn reconstruct_repository(
+        &self,
         object_hashes: &[Sha256Hash],
-        target_path: &Path
+        target_path: &Path,
     ) -> Result<()> {
         use crate::git::objects::{write_objects, GitObject, GitObjectType};
 
@@ -430,7 +659,10 @@ impl GitTorrentService {
         }
 
         if !missing_objects.is_empty() {
-            tracing::warn!("Missing {} objects during reconstruction", missing_objects.len());
+            tracing::warn!(
+                "Missing {} objects during reconstruction",
+                missing_objects.len()
+            );
             // Try to fetch missing objects from DHT
             for hash in missing_objects {
                 self.fetch_object_from_peers(hash).await?;
@@ -440,7 +672,11 @@ impl GitTorrentService {
         // Write objects to repository
         write_objects(target_path, &git_objects).await?;
 
-        tracing::info!("Reconstructed repository with {} objects at {:?}", git_objects.len(), target_path);
+        tracing::info!(
+            "Reconstructed repository with {} objects at {:?}",
+            git_objects.len(),
+            target_path
+        );
         Ok(())
     }
 
@@ -450,7 +686,9 @@ impl GitTorrentService {
         let providers = self.find_providers(hash).await?;
 
         if providers.is_empty() {
-            return Err(Error::not_found(format!("No providers found for object {hash}")));
+            return Err(Error::not_found(format!(
+                "No providers found for object {hash}"
+            )));
         }
 
         tracing::debug!("Found {} providers for object {}", providers.len(), hash);
@@ -462,7 +700,9 @@ impl GitTorrentService {
             return Ok(());
         }
 
-        Err(Error::not_found(format!("Failed to fetch object {hash} from peers")))
+        Err(Error::not_found(format!(
+            "Failed to fetch object {hash} from peers"
+        )))
     }
 
     /// Get objects for a specific commit (recursive)
@@ -537,7 +777,9 @@ impl GitTorrentService {
 
                     tracing::info!("Successfully cloned repository to {:?}", local_path);
                 } else {
-                    return Err(Error::not_found(format!("Repository metadata not found for hash {hash}")));
+                    return Err(Error::not_found(format!(
+                        "Repository metadata not found for hash {hash}"
+                    )));
                 }
             }
             GitTorrentUrl::GitServer { server: _, repo: _ } => {
@@ -567,7 +809,10 @@ impl GitTorrentService {
     /// List all repositories
     pub async fn list_repositories(&self) -> Vec<(String, RepositoryMetadata)> {
         let repos = self.repositories.read().await;
-        repos.iter().map(|(name, meta)| (name.clone(), meta.clone())).collect()
+        repos
+            .iter()
+            .map(|(name, meta)| (name.clone(), meta.clone()))
+            .collect()
     }
 
     /// Announce repository to P2P network (wrapper for store_repository_objects)
@@ -626,7 +871,8 @@ impl GitTorrentService {
             }
 
             Ok((branches, root_commits))
-        }).await?;
+        })
+        .await?;
 
         // Extract all objects to get complete metadata (async)
         let objects = extract_objects(repo_path).await?;
@@ -647,9 +893,11 @@ impl GitTorrentService {
             }
         }
 
-        let repo_name = repo_path.file_name()
+        let repo_name = repo_path
+            .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("unknown").to_owned();
+            .unwrap_or("unknown")
+            .to_owned();
 
         // Collect ref names
         let ref_names: Vec<String> = branches.keys().cloned().collect();
@@ -676,9 +924,14 @@ impl GitTorrentService {
     }
 
     /// Create a local repository from metadata using object reconstruction
-    async fn create_local_repository(&self, local_path: &Path, metadata: &RepositoryMetadata) -> Result<()> {
+    async fn create_local_repository(
+        &self,
+        local_path: &Path,
+        metadata: &RepositoryMetadata,
+    ) -> Result<()> {
         // Reconstruct repository from individual objects
-        self.reconstruct_repository(&metadata.object_hashes, local_path).await?;
+        self.reconstruct_repository(&metadata.object_hashes, local_path)
+            .await?;
 
         // Set up refs in spawn_blocking (git2::Repository is !Send)
         let path = local_path.to_path_buf();
@@ -703,10 +956,14 @@ impl GitTorrentService {
             }
 
             Ok(())
-        }).await?;
+        })
+        .await?;
 
-        tracing::info!("Created local repository at {:?} with {} objects",
-                      local_path, object_count);
+        tracing::info!(
+            "Created local repository at {:?} with {} objects",
+            local_path,
+            object_count
+        );
         Ok(())
     }
 }
@@ -714,16 +971,100 @@ impl GitTorrentService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+    use std::collections::HashMap as StdHashMap;
+    #[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+    use std::net::{Ipv4Addr, SocketAddrV4};
     use tempfile::TempDir;
+    #[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+    use tokio::sync::Mutex;
+
+    #[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+    #[derive(Default)]
+    struct MockObjectLocator {
+        announcements: Mutex<Vec<(Cid512, Option<u16>)>>,
+        providers: Mutex<StdHashMap<Cid512, Vec<PeerContact>>>,
+    }
+
+    #[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+    impl MockObjectLocator {
+        async fn add_provider(&self, cid: Cid512, provider: PeerContact) {
+            self.providers
+                .lock()
+                .await
+                .entry(cid)
+                .or_default()
+                .push(provider);
+        }
+
+        async fn announcements(&self) -> Vec<(Cid512, Option<u16>)> {
+            self.announcements.lock().await.clone()
+        }
+    }
+
+    #[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+    #[async_trait]
+    impl ObjectLocator for MockObjectLocator {
+        async fn announce(&self, cid: &Cid512, port: Option<u16>) -> Result<()> {
+            self.announcements.lock().await.push((*cid, port));
+            Ok(())
+        }
+
+        async fn providers(&self, cid: &Cid512) -> Result<Vec<PeerContact>> {
+            Ok(self
+                .providers
+                .lock()
+                .await
+                .get(cid)
+                .cloned()
+                .unwrap_or_default())
+        }
+    }
+
+    #[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+    #[derive(Default)]
+    struct MockBlobFetcher {
+        objects: Mutex<StdHashMap<Sha256Hash, Vec<u8>>>,
+        calls: Mutex<usize>,
+    }
+
+    #[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+    impl MockBlobFetcher {
+        async fn insert(&self, hash: Sha256Hash, data: Vec<u8>) {
+            self.objects.lock().await.insert(hash, data);
+        }
+
+        async fn calls(&self) -> usize {
+            *self.calls.lock().await
+        }
+    }
+
+    #[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+    #[async_trait]
+    impl RemoteBlobFetcher for MockBlobFetcher {
+        async fn fetch(
+            &self,
+            hash: &Sha256Hash,
+            _providers: Vec<PeerContact>,
+        ) -> Result<Option<Vec<u8>>> {
+            *self.calls.lock().await += 1;
+            Ok(self.objects.lock().await.get(hash).cloned())
+        }
+    }
+
+    fn test_config(path: &Path) -> GitTorrentConfig {
+        GitTorrentConfig {
+            storage_dir: path.to_path_buf(),
+            bootstrap_nodes: vec![],
+            auto_discovery: false,
+            ..Default::default()
+        }
+    }
 
     #[tokio::test]
     async fn test_service_creation() -> crate::error::Result<()> {
         let temp_dir = TempDir::new()?;
-        let config = GitTorrentConfig {
-            storage_dir: temp_dir.path().to_path_buf(),
-            bootstrap_nodes: vec![],
-            ..Default::default()
-        };
+        let config = test_config(temp_dir.path());
 
         let service = GitTorrentService::new(config).await?;
         let stats = service.stats().await;
@@ -736,11 +1077,7 @@ mod tests {
     #[tokio::test]
     async fn test_object_storage() -> crate::error::Result<()> {
         let temp_dir = TempDir::new()?;
-        let config = GitTorrentConfig {
-            storage_dir: temp_dir.path().to_path_buf(),
-            bootstrap_nodes: vec![],
-            ..Default::default()
-        };
+        let config = test_config(temp_dir.path());
 
         let service = GitTorrentService::new(config).await?;
 
@@ -750,6 +1087,113 @@ mod tests {
         let retrieved = service.get_object(&hash).await?;
         let retrieved = retrieved.ok_or_else(|| crate::Error::not_found("Object not found"))?;
         assert_eq!(retrieved, test_data);
+        Ok(())
+    }
+
+    #[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+    #[tokio::test]
+    async fn test_object_storage_announces_blake3_and_facade_cids() -> crate::error::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let locator = Arc::new(MockObjectLocator::default());
+        let fetcher = Arc::new(MockBlobFetcher::default());
+        let config = GitTorrentConfig {
+            auto_discovery: true,
+            p2p_port: 4242,
+            ..test_config(temp_dir.path())
+        };
+
+        let service =
+            GitTorrentService::new_with_object_plane(config, locator.clone(), fetcher).await?;
+
+        let data = b"announced object".to_vec();
+        let hash = service.put_object(data.clone()).await?;
+        let blake3 = service
+            .object_plane
+            .blobs
+            .blake3_of(&hash)
+            .await
+            .ok_or_else(|| Error::not_found("missing blake3 index"))?;
+        let announcements = locator.announcements().await;
+
+        assert!(announcements.contains(&(locator_cid_from_blake3(blake3), Some(4242))));
+        assert!(announcements.contains(&(locator_cid_from_sha256(&hash), Some(4242))));
+        assert_eq!(
+            service.get_object(&hash).await?.as_deref(),
+            Some(data.as_slice())
+        );
+        Ok(())
+    }
+
+    #[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+    #[tokio::test]
+    async fn test_get_object_fetches_from_provider_and_stores_locally() -> crate::error::Result<()>
+    {
+        let temp_dir = TempDir::new()?;
+        let locator = Arc::new(MockObjectLocator::default());
+        let fetcher = Arc::new(MockBlobFetcher::default());
+        let service = GitTorrentService::new_with_object_plane(
+            test_config(temp_dir.path()),
+            locator.clone(),
+            fetcher.clone(),
+        )
+        .await?;
+
+        let data = b"remote object".to_vec();
+        let hash = sha256_git(&data)?;
+        locator
+            .add_provider(
+                locator_cid_from_sha256(&hash),
+                PeerContact::untrusted(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 6881)),
+            )
+            .await;
+        fetcher.insert(hash.clone(), data.clone()).await;
+
+        assert_eq!(
+            service.get_object(&hash).await?.as_deref(),
+            Some(data.as_slice())
+        );
+        assert_eq!(fetcher.calls().await, 1);
+
+        assert_eq!(
+            service.get_object(&hash).await?.as_deref(),
+            Some(data.as_slice())
+        );
+        assert_eq!(fetcher.calls().await, 1);
+        Ok(())
+    }
+
+    #[cfg(all(feature = "iroh-blobs", feature = "mainline-locator"))]
+    #[tokio::test]
+    async fn test_get_object_rejects_provider_bytes_with_wrong_sha256() -> crate::error::Result<()>
+    {
+        let temp_dir = TempDir::new()?;
+        let locator = Arc::new(MockObjectLocator::default());
+        let fetcher = Arc::new(MockBlobFetcher::default());
+        let service = GitTorrentService::new_with_object_plane(
+            test_config(temp_dir.path()),
+            locator.clone(),
+            fetcher.clone(),
+        )
+        .await?;
+
+        let requested_hash = sha256_git(b"wanted")?;
+        locator
+            .add_provider(
+                locator_cid_from_sha256(&requested_hash),
+                PeerContact::untrusted(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 6881)),
+            )
+            .await;
+        fetcher
+            .insert(requested_hash.clone(), b"poisoned".to_vec())
+            .await;
+
+        assert!(service.get_object(&requested_hash).await.is_err());
+        assert!(service
+            .object_plane
+            .blobs
+            .get_object(&requested_hash)
+            .await?
+            .is_none());
         Ok(())
     }
 }
