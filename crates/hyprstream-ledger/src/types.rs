@@ -6,7 +6,10 @@
 //! benches).
 
 use bitflags::bitflags;
+use ciborium::value::Value;
 use serde::{Deserialize, Serialize};
+
+use crate::errors::LedgerError;
 
 /// A decentralized identifier, carried opaquely (`did:web` / `did:key` /
 /// `did:at9p`). The ledger crate treats DIDs as pseudonymous strings and never
@@ -74,60 +77,100 @@ pub enum Purpose {
 /// no allocation-time coordination, and it is TigerBeetle-compatible (TB account
 /// ids are `u128`).
 ///
-/// PLAN DECISION 1: `AccountId = blake3_128(encode(ledger_id, owner, unit,
-/// purpose))`. The unit already names its issuer (INV-1), so the issuer is baked
-/// into the id transitively.
+/// PLAN DECISION 1: `AccountId = blake3_128(canonical_dag_cbor(ledger_id,
+/// owner, unit, purpose))`. The unit already names its issuer (INV-1), so the
+/// issuer is baked into the id transitively.
+///
+/// # Interop contract — normative account-id encoding
+///
+/// The hashed body is **canonical DAG-CBOR** (the same wire format
+/// `hyprstream-pds::dag_cbor` emits: sorted map keys, minimal-width integers,
+/// definite lengths). Account ids are a contract other implementations
+/// re-derive, so the byte layout below is normative — it supersedes the earlier
+/// bespoke length-prefixed encoding.
+///
+/// The body is a single definite-length DAG-CBOR **array** in this fixed order
+/// (no maps, so canonicality needs no key-sorting):
+///
+/// ```text
+/// [
+///   "hs-ledger-account-id-v1",   // domain-separation tag
+///   <ledger_id  : tstr>,
+///   <owner      : tstr>,
+///   <unit_issuer: tstr>,          // unit.issuer
+///   <unit_code  : tstr>,          // unit.resource_class
+///   <purpose    : purpose-encoding>
+/// ]
+/// ```
+///
+/// where `purpose-encoding` is itself canonical DAG-CBOR:
+///
+/// | `Purpose` | encoding |
+/// |---|---|
+/// | `Available` | unsigned `0` |
+/// | `Escrow { peer_cell }` | `[1, <peer_cell:tstr>]` |
+/// | `IssuerLiability` | unsigned `2` |
+/// | `Remote { home_cell }` | `[3, <home_cell:tstr>]` |
+/// | `Bond` | unsigned `4` |
+///
+/// The id is the 128-bit blake3 XOF (`blake3::Hasher::finalize_xof`, 16 bytes,
+/// read big-endian into a `u128`) of those bytes. Two implementations that agree
+/// on this layout derive byte-identical ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct AccountId(pub u128);
 
 impl AccountId {
-    /// Derive the canonical account id.
+    /// Derive the canonical account id over the normative DAG-CBOR encoding
+    /// (see the [`AccountId`] rustdoc for the interop wire format).
     ///
-    /// The hash input is a domain-separated, length-prefixed encoding of the
-    /// tuple rather than raw DAG-CBOR. This keeps `derive` **infallible** (no
-    /// serializer `Result` to unwrap) while remaining canonical: it is the single
-    /// source function every backend calls, so RocksLedger / TigerBeetleLedger
-    /// derive byte-identical ids. (Trait-surface decision — see PR notes.)
-    pub fn derive(ledger_id: &Did, owner: &Did, unit: &UnitId, purpose: &Purpose) -> Self {
+    /// Returns `Result` because the CBOR serializer is fallible at the API
+    /// level (`ciborium::into_writer`). Over this fixed set of small types
+    /// (text strings, small unsigned ints, definite-length arrays) an encode
+    /// error is unreachable in practice; rather than `unwrap` (lint-denied) we
+    /// map the impossible failure to [`LedgerError::Internal`], which is
+    /// fail-closed and retryable. Call sites propagate it.
+    pub fn derive(
+        ledger_id: &Did,
+        owner: &Did,
+        unit: &UnitId,
+        purpose: &Purpose,
+    ) -> Result<Self, LedgerError> {
+        let value = Value::Array(vec![
+            // Domain-separation tag, carried inside the canonical body so the
+            // entire hashed input is canonical DAG-CBOR.
+            Value::Text("hs-ledger-account-id-v1".to_owned()),
+            Value::Text(ledger_id.0.clone()),
+            Value::Text(owner.0.clone()),
+            Value::Text(unit.issuer.0.clone()),
+            Value::Text(unit.resource_class.clone()),
+            canonical_purpose(purpose),
+        ]);
         let mut h = blake3::Hasher::new();
-        h.update(b"hs-ledger-account-id-v1");
-        write_field(&mut h, ledger_id.0.as_bytes());
-        write_field(&mut h, owner.0.as_bytes());
-        write_field(&mut h, unit.issuer.0.as_bytes());
-        write_field(&mut h, unit.resource_class.as_bytes());
-        write_purpose(&mut h, purpose);
+        ciborium::into_writer(&value, &mut h)
+            .map_err(|e| LedgerError::Internal(format!("account-id DAG-CBOR encode failed: {e}")))?;
         let mut out = [0u8; 16];
         h.finalize_xof().fill(&mut out);
-        AccountId(u128::from_be_bytes(out))
+        Ok(AccountId(u128::from_be_bytes(out)))
     }
 }
 
-/// Length-prefixed field write (8-byte BE length + bytes) — unambiguous framing
-/// so no two distinct tuples can collide by concatenation boundary shifting.
-fn write_field(h: &mut blake3::Hasher, bytes: &[u8]) {
-    h.update(&(bytes.len() as u64).to_be_bytes());
-    h.update(bytes);
-}
-
-fn write_purpose(h: &mut blake3::Hasher, purpose: &Purpose) {
+/// Canonical DAG-CBOR encoding of [`Purpose`] (see the [`AccountId`] interop
+/// table). Fixed-shape: a bare unsigned int for the leaf purposes, a
+/// `[tag, did]` array for the carried-DID purposes — definite-length and
+/// minimal-width, so ciborium emits canonical bytes with no map sorting needed.
+fn canonical_purpose(purpose: &Purpose) -> Value {
     match purpose {
-        Purpose::Available => {
-            h.update(&[0u8]);
-        }
-        Purpose::Escrow { peer_cell } => {
-            h.update(&[1u8]);
-            write_field(h, peer_cell.0.as_bytes());
-        }
-        Purpose::IssuerLiability => {
-            h.update(&[2u8]);
-        }
-        Purpose::Remote { home_cell } => {
-            h.update(&[3u8]);
-            write_field(h, home_cell.0.as_bytes());
-        }
-        Purpose::Bond => {
-            h.update(&[4u8]);
-        }
+        Purpose::Available => Value::Integer(0u64.into()),
+        Purpose::Escrow { peer_cell } => Value::Array(vec![
+            Value::Integer(1u64.into()),
+            Value::Text(peer_cell.0.clone()),
+        ]),
+        Purpose::IssuerLiability => Value::Integer(2u64.into()),
+        Purpose::Remote { home_cell } => Value::Array(vec![
+            Value::Integer(3u64.into()),
+            Value::Text(home_cell.0.clone()),
+        ]),
+        Purpose::Bond => Value::Integer(4u64.into()),
     }
 }
 
@@ -249,8 +292,8 @@ impl AccountSpec {
         }
     }
 
-    /// The derived id for this spec.
-    pub fn account_id(&self) -> AccountId {
+    /// The derived id for this spec (see [`AccountId::derive`]).
+    pub fn account_id(&self) -> Result<AccountId, LedgerError> {
         AccountId::derive(&self.ledger_id, &self.owner, &self.unit, &self.purpose)
     }
 }

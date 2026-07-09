@@ -145,7 +145,10 @@ pub fn stage(view: &dyn StateView, op: &Op) -> Staged {
 }
 
 fn stage_open(view: &dyn StateView, spec: &AccountSpec) -> Staged {
-    let id = spec.account_id();
+    let id = match spec.account_id() {
+        Ok(id) => id,
+        Err(e) => return Staged::err(e),
+    };
     if let Some(existing) = view.account(id) {
         if existing.unit != spec.unit {
             return Staged::err(LedgerError::AccountUnitConflict { id });

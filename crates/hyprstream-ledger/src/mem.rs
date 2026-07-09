@@ -198,7 +198,7 @@ impl engine::StateView for MemLedger {
 
 impl LedgerBackend for MemLedger {
     fn open_account(&mut self, spec: AccountSpec) -> Result<Account, LedgerError> {
-        let id = spec.account_id();
+        let id = spec.account_id()?;
         // Fast path: idempotent return of an existing account, with NO journal
         // growth (the property the idempotency proptest checks for opens).
         if let Some(existing) = self.accounts.get(&id) {
