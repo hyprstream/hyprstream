@@ -1,7 +1,8 @@
 //! Merkle Search Tree (MST) — the atproto repo's per-account record store.
 //!
 //! The MST (Auvolat & Taïani, SRDS 2019) is a binary-tree-of-blocks keyed by
-//! string record keys (here, `ai.hyprstream.model` TID rkeys). Its defining
+//! string record keys (`<collection>/<rkey>` paths — ONE tree per account repo
+//! spans all of its collections). Its defining
 //! property is that the **shape of the tree is a deterministic function of the
 //! key set** — independent of insertion order — so two hosts with the same
 //! records compute the same root CID. This is what makes the repo
@@ -187,7 +188,8 @@ impl NodeData {
 
 // ── The in-memory MST ───────────────────────────────────────────────────────
 
-/// An in-memory MST over `ai.hyprstream.model` records.
+/// An in-memory MST over an account repo's records (all collections, keyed by
+/// `<collection>/<rkey>`).
 ///
 /// Internally this is a recursive structure of [`Node`]s, each at a `level`.
 /// The tree shape depends only on the (key → record-CID) map, not insertion
