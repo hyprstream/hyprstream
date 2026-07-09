@@ -52,6 +52,8 @@ ed25519-dalek = { workspace = true }
 p256 = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
+# #893 (at9p D1) — mint real hybrid-signed capsules for the resolver tests.
+hyprstream-crypto = { path = "../hyprstream-crypto" }
 # K4c (#787) — property tests for the placement→PodSpec map's no-widening invariant.
 proptest = { workspace = true }
 serde_yaml = { workspace = true }
