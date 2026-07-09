@@ -48,6 +48,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 pub mod at9p;
+pub mod at9p_chain;
 pub mod at9p_sign;
 pub mod car;
 pub mod cid;
