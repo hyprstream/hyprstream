@@ -85,7 +85,6 @@ struct RepoState {
 // unambiguous field separator for compound keys (same idea as the delimited
 // keys `RocksDbUserStore` uses, just with a compound suffix here).
 //
-//   sk\0{did}                              -> 32-byte P-256 signing-key seed
 //   rk\0{did}\0{collection}\0{tid}         -> canonical DAG-CBOR record bytes
 //
 // The record's rkey (a TID) is derived deterministically from the repo id
@@ -157,7 +156,7 @@ impl PdsRecordStore {
     pub fn open(path: &Path, atproto_signing_key: p256::ecdsa::SigningKey) -> AnyResult<Self> {
         std::fs::create_dir_all(path)
             .with_context(|| format!("failed to create PDS store dir {path:?}"))?;
-        harden_store_dir(path)?;
+        harden_store_dir(path);
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
         let db = rocksdb::DB::open(&opts, path)
@@ -289,16 +288,20 @@ fn readonly_opts() -> rocksdb::Options {
 /// over at read time — a store another local user could write would let them
 /// inject records the node then serves as authentic. On non-unix this is a
 /// no-op (the store path is expected to be an OS-managed private dir there).
-fn harden_store_dir(path: &Path) -> AnyResult<()> {
+fn harden_store_dir(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("failed to set 0700 on PDS store dir {path:?}"))?;
+        // Best-effort: this is defence-in-depth (the private key never lands in
+        // this DB — H1 — and the path never resolves to /tmp — H2). If the chmod
+        // fails (e.g. the dir is owned by a different uid in a split-uid setup),
+        // warn rather than hard-fail startup.
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)) {
+            tracing::warn!("could not set 0700 on PDS store dir {path:?}: {e}");
+        }
     }
     #[cfg(not(unix))]
     let _ = path;
-    Ok(())
 }
 
 // ============================================================================
