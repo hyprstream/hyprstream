@@ -445,43 +445,12 @@ pub fn resolve_service_signing_key(
     }
 }
 
-/// Load or generate this node's `#atproto` commit-signing key (P-256/ES256).
-///
-/// PDS commits are signed classically (ES256) per atproto — there is no PQ
-/// variant of this key (#910a). Mirrors [`load_or_generate_node_signing_key`]:
-///
-/// 1. Read `secrets_dir/atproto-signing-key` → return if present.
-/// 2. If writable: generate a new key, write, return.
-/// 3. If read-only and missing: hard error.
-pub fn load_or_generate_atproto_signing_key(
-    secrets_dir: &std::path::Path,
-) -> Result<p256::ecdsa::SigningKey> {
-    const NAME: &str = "atproto-signing-key";
-
-    if let Some(bytes) = read_secret(secrets_dir, NAME)? {
-        let seed: [u8; 32] = bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow!("secret '{}' must be 32 bytes (P-256 seed)", NAME))?;
-        let sk = p256::ecdsa::SigningKey::from_bytes(seed.as_slice().into())
-            .map_err(|e| anyhow!("secret '{}' is not a valid P-256 key: {}", NAME, e))?;
-        tracing::info!("Loaded #atproto (P-256) signing key from '{}'", secrets_dir.display());
-        return Ok(sk);
-    }
-
-    if !is_writable(secrets_dir) {
-        return Err(missing_in_readonly(secrets_dir, NAME));
-    }
-
-    let key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
-    write_secret(secrets_dir, NAME, key.to_bytes().as_slice())?;
-    tracing::info!(
-        "Generated new #atproto (P-256) signing key → '{}/{}'",
-        secrets_dir.display(),
-        NAME
-    );
-    Ok(key)
-}
+// The `#atproto` commit-signing key is NOT loaded here. It is the *active* key
+// of the shared `Es256SigningKeyStore` (`auth::key_rotation`), the same P-256
+// key `oauth::did_document` publishes as the `#atproto` verification method —
+// one source of truth for signer and published key. The PDS writer
+// (`services::discovery::PdsPublisher`) sources it from that store; there is no
+// separate `atproto-signing-key` secret and no duplicate loader (#910a).
 
 /// Decode the `exp` claim from a JWT without signature verification.
 /// Returns `None` on any parse error (invalid base64, not JSON, missing exp).

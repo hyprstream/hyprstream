@@ -548,24 +548,40 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
     let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("registry"))?;
 
-    // #910a — the registry service is the sole PDS-record writer: it opens
-    // the durable store read-write and publishes on register/commit. This
-    // node's `did:key` identity (the record `repo` at-uri authority) is
-    // derived from the node's own root Ed25519 key — the same identity
-    // TLS endorsement uses ("a node-level trust assertion, not specific to
-    // any per-service key"). The `#atproto` commit-signing key is a
-    // dedicated, persisted P-256 key (classical — atproto has no PQ variant).
-    // Best-effort: any failure here disables PDS publish with a warning rather
-    // than failing the registry. The `#atproto` key is loaded from the secrets
-    // dir and handed to the store in memory — it is never persisted into the
-    // record DB (#910a H1). Paths fail closed rather than fall back to /tmp (H2).
+    // #910a — the registry service is the sole PDS-record writer AND the sole
+    // holder of the `#atproto` private key: it opens the durable store
+    // read-write and, on register/commit, signs the repo's commit ONCE and
+    // persists the signed bytes. Reads (the discovery service) are keyless.
+    // This node's `did:key` identity (the record `repo` at-uri authority) is
+    // derived from the node's own root Ed25519 key — the same identity TLS
+    // endorsement uses ("a node-level trust assertion, not specific to any
+    // per-service key"). The `#atproto` commit-signing key is the *active* key
+    // from the shared `Es256SigningKeyStore` — the same P-256 key
+    // `oauth::did_document` publishes as the `#atproto` verification method, so
+    // the writer and the published key are one source of truth (classical —
+    // atproto has no PQ variant). Best-effort: any failure here disables PDS
+    // publish with a warning rather than failing the registry. The key lives
+    // only in the writer's memory — never in the record DB (#910a H1). Paths
+    // fail closed rather than fall back to /tmp (H2).
     let pds_publisher = (|| -> anyhow::Result<crate::services::discovery::PdsPublisher> {
         let store_dir = pds_store_dir()?;
-        let atproto_key =
-            crate::auth::identity_store::load_or_generate_atproto_signing_key(&credentials_dir()?)?;
-        let store = crate::services::discovery::PdsRecordStore::open(&store_dir, atproto_key)?;
+        let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
+        let es256_store =
+            crate::auth::key_rotation::global_es256_key_store(&secrets_dir, &config.oauth);
+        // `active_key` is async (tokio RwLock); resolve it once here on the
+        // current runtime. `block_in_place` avoids stalling a worker reactor.
+        let active = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(es256_store.active_key())
+        })
+        .ok_or_else(|| anyhow::anyhow!("no active ES256 #atproto key for PDS publish"))?;
+        let atproto_key: p256::ecdsa::SigningKey = (*active).clone();
+        let store = crate::services::discovery::PdsRecordStore::open(&store_dir)?;
         let node_did = hyprstream_rpc::did_key::ed25519_to_did_key(&ctx.verifying_key().to_bytes());
-        Ok(crate::services::discovery::PdsPublisher::new(Arc::new(store), node_did))
+        Ok(crate::services::discovery::PdsPublisher::new(
+            Arc::new(store),
+            node_did,
+            atproto_key,
+        ))
     })()
     .map_err(|e| tracing::warn!("PDS publish disabled: {e}"))
     .ok();
@@ -1580,9 +1596,8 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 /// the service manager will retry.
 fn open_pds_store_readonly(
     dir: &std::path::Path,
-    atproto_key: p256::ecdsa::SigningKey,
 ) -> anyhow::Result<crate::services::discovery::PdsRecordStore> {
-    match crate::services::discovery::PdsRecordStore::open_readonly(dir, atproto_key.clone()) {
+    match crate::services::discovery::PdsRecordStore::open_readonly(dir) {
         Ok(store) => Ok(store),
         Err(orig) => {
             // Bootstrap the DB files by briefly opening read-write, then retry
@@ -1590,10 +1605,10 @@ fn open_pds_store_readonly(
             // lock, or the path is corrupt), surface BOTH errors so the real
             // cause is visible rather than masked by the retry (#910a, fable M3).
             drop(
-                crate::services::discovery::PdsRecordStore::open(dir, atproto_key.clone())
+                crate::services::discovery::PdsRecordStore::open(dir)
                     .with_context(|| format!("read-only open failed ({orig}); bootstrap open also failed"))?,
             );
-            crate::services::discovery::PdsRecordStore::open_readonly(dir, atproto_key)
+            crate::services::discovery::PdsRecordStore::open_readonly(dir)
         }
     }
 }
@@ -1625,18 +1640,16 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
 
     // #431 — record resolver backing getRecord/getRepo, over the durable
     // RocksDB-backed PDS record store (#910a). The registry service is the
-    // sole writer (it opens the same directory read-write and publishes on
-    // register/commit — see `create_registry_service`); this factory opens
-    // the directory read-only, matching `RocksDbUserStore::open_readonly`.
-    // The `#atproto` commit key is loaded from the secrets dir (the same one
-    // the registry/writer uses) and held in memory to sign CAR proofs — it is
-    // never read from the record DB (#910a H1). In systemd/k8s this is a
-    // read-only, pre-provisioned credential; all replicas must share the same
-    // key so proofs verify consistently.
-    let atproto_key =
-        crate::auth::identity_store::load_or_generate_atproto_signing_key(&credentials_dir()?)?;
+    // sole writer (it opens the same directory read-write, signs each commit
+    // ONCE and persists it — see `create_registry_service`); this factory
+    // opens the directory read-only, matching `RocksDbUserStore::open_readonly`.
+    // The resolver holds **no signing key** at all: reads are keyless (rebuild
+    // the deterministic MST, load the writer's already-signed commit, serve a
+    // proof). This is the #910a security fix — a read path that re-signed a
+    // commit on every `getRecord` (and so needed the private key) was the root
+    // of the key-exposure problem; atproto never re-signs on read.
     let pds_store = std::sync::Arc::new(
-        open_pds_store_readonly(&pds_store_dir()?, atproto_key)
+        open_pds_store_readonly(&pds_store_dir()?)
             .context("failed to open PDS record store (read-only)")?,
     );
     let record_resolver = crate::services::discovery::PdsRecordResolver::new(pds_store);

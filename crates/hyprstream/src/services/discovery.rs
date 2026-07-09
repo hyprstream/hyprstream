@@ -16,9 +16,9 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Context as _, Result as AnyResult};
 use hyprstream_discovery::{RecordCarData, RecordResolver};
 use hyprstream_pds::car::build_record_proof_car;
-use hyprstream_pds::commit::Commit;
+use hyprstream_pds::commit::{Commit, UnsignedCommit};
 use hyprstream_pds::mst::Node;
-use hyprstream_pds::record::ModelRecord;
+use hyprstream_pds::record::{ModelRecord, COLLECTION_NSID};
 use hyprstream_pds::tid::Tid;
 use sha2::Digest as _;
 
@@ -62,21 +62,26 @@ impl AuthorizationProvider for PolicyAuthProvider {
 }
 
 // ============================================================================
-// PdsRecordResolver — backs DiscoveryService getRecord/getRepo (#431)
+// PdsRecordStore — durable, keyless-read atproto record store (#910a)
 // ============================================================================
 
-/// One account's repo in the node's local PDS: its records (keyed by TID) and
-/// the P-256 `#atproto` signing key that signs its commits.
+/// One account's repo, loaded from the durable store: its records (keyed by
+/// `(collection, tid)`) plus the **signed commit** that was persisted at write
+/// time.
 ///
-/// The MST and signed commit are rebuilt deterministically from the record set
-/// on demand (the MST shape is a pure function of the key set), so a stored repo
-/// is just "the records + the signing key". This mirrors the e7 federation
-/// publish path (`node_a_publish`) but as a queryable per-account store.
+/// The MST is a deterministic, keyless function of the record set
+/// (`Node::from_records`), so it is *not* stored — it is rebuilt on demand. The
+/// only thing that must be persisted (a private key signed it) is the commit
+/// itself. Reads therefore never touch a signing key: they rebuild the MST,
+/// load this already-signed commit, and assemble a proof CAR. This mirrors how
+/// atproto works — the commit is signed **once** at write time and served
+/// verbatim thereafter.
 struct RepoState {
-    /// P-256 `#atproto` signing key for this account's commits.
-    signing_key: p256::ecdsa::SigningKey,
     /// `<collection>/<rkey>` is the MST key; here we key by `(collection, tid)`.
     records: BTreeMap<(String, Tid), ModelRecord>,
+    /// The signed commit persisted by the writer — served verbatim on reads,
+    /// never re-signed.
+    commit: Commit,
 }
 
 // ── RocksDB key scheme ───────────────────────────────────────────────────────
@@ -85,12 +90,15 @@ struct RepoState {
 // unambiguous field separator for compound keys (same idea as the delimited
 // keys `RocksDbUserStore` uses, just with a compound suffix here).
 //
-//   rk\0{did}\0{collection}\0{tid}         -> canonical DAG-CBOR record bytes
+//   rk\0{did}\0{collection}\0{tid}   -> canonical DAG-CBOR record bytes
+//   commit\0{did}                    -> signed-commit DAG-CBOR bytes
 //
 // The record's rkey (a TID) is derived deterministically from the repo id
 // (`PdsRecordStore::tid_for_repo`), so it is never minted or persisted. The
-// `#atproto` signing key is held in memory (loaded from the 0600 secrets dir),
-// never stored in this DB (#910a H1).
+// `#atproto` signing key is held ONLY by the writer (`PdsPublisher`); it is
+// never stored in this DB and never held by the resolver (#910a). The commit is
+// signed once at write time and persisted under `commit\0{did}`, so reads are a
+// keyless walk (rebuild the MST, load the signed commit, serve a proof).
 
 fn record_prefix(did: &str) -> Vec<u8> {
     format!("rk\0{did}\0").into_bytes()
@@ -98,6 +106,10 @@ fn record_prefix(did: &str) -> Vec<u8> {
 
 fn record_key(did: &str, collection: &str, tid: Tid) -> Vec<u8> {
     format!("rk\0{did}\0{collection}\0{}", tid.encode()).into_bytes()
+}
+
+fn commit_key(did: &str) -> Vec<u8> {
+    format!("commit\0{did}").into_bytes()
 }
 
 /// Split a full record key back into `(collection, tid)`, given the `did` it
@@ -124,6 +136,12 @@ fn parse_record_key(key: &[u8], did: &str) -> AnyResult<(String, Tid)> {
 /// opened read-write by the *one* process that publishes, and read-only by
 /// resolvers.
 ///
+/// **The store holds no signing key.** The writer (`PdsPublisher`) signs the
+/// commit once and hands this store the signed bytes; the resolver only ever
+/// reads them back. This is the security fix at the heart of #910a: a read path
+/// that needed a private key to re-sign a commit on every `getRecord` was the
+/// root of the key-exposure problem — atproto never re-signs on read.
+///
 /// RocksDB allows exactly one read-write handle per directory; on a single
 /// node the registry service (the publisher) is the sole writer, and the
 /// discovery service (the resolver) opens the same directory read-only —
@@ -132,12 +150,6 @@ fn parse_record_key(key: &[u8], did: &str) -> AnyResult<(String, Tid)> {
 /// callers that need a live view reopen per read (see [`RecordBacking::ReadOnly`]).
 pub struct PdsRecordStore {
     backing: RecordBacking,
-    /// This node's `#atproto` commit-signing key (P-256/ES256), held in memory
-    /// and loaded from the 0600 secrets dir by both the publisher and the
-    /// resolver. It is **never** persisted into the record DB (#910a H1) —
-    /// putting a private key into 0644 RocksDB files would let any local reader
-    /// forge signed PDS commits. Used to sign CAR proofs at read time.
-    atproto_signing_key: p256::ecdsa::SigningKey,
 }
 
 enum RecordBacking {
@@ -153,7 +165,7 @@ impl PdsRecordStore {
     /// Open (or create) the durable store at `path` for read-write access.
     /// Exactly one process should hold this — the publisher (registry
     /// service). See the type-level docs for the single-writer rationale.
-    pub fn open(path: &Path, atproto_signing_key: p256::ecdsa::SigningKey) -> AnyResult<Self> {
+    pub fn open(path: &Path) -> AnyResult<Self> {
         std::fs::create_dir_all(path)
             .with_context(|| format!("failed to create PDS store dir {path:?}"))?;
         harden_store_dir(path);
@@ -161,36 +173,40 @@ impl PdsRecordStore {
         opts.create_if_missing(true);
         let db = rocksdb::DB::open(&opts, path)
             .with_context(|| format!("failed to open PDS record store (rw) at {path:?}"))?;
-        Ok(Self { backing: RecordBacking::ReadWrite(db), atproto_signing_key })
+        Ok(Self { backing: RecordBacking::ReadWrite(db) })
     }
 
     /// Open the store read-only at `path`, for resolvers that never write
     /// (the discovery service). Verifies the directory opens successfully now
     /// (surfacing a missing/corrupt store at startup) but does not hold the
-    /// handle — see the type-level docs.
-    pub fn open_readonly(path: &Path, atproto_signing_key: p256::ecdsa::SigningKey) -> AnyResult<Self> {
+    /// handle — see the type-level docs. The resolver holds **no signing key**.
+    pub fn open_readonly(path: &Path) -> AnyResult<Self> {
         let opts = readonly_opts();
         let _probe = rocksdb::DB::open_for_read_only(&opts, path, false)
             .with_context(|| format!("failed to open PDS record store (ro) at {path:?}"))?;
-        Ok(Self { backing: RecordBacking::ReadOnly(path.to_path_buf()), atproto_signing_key })
+        Ok(Self { backing: RecordBacking::ReadOnly(path.to_path_buf()) })
     }
 
-    /// Insert/replace a record for `did` under `collection` at `tid`. The
-    /// account's `#atproto` commit key lives in memory (never in this DB —
-    /// #910a H1). Used by the publishing path and by tests. Fails if this
-    /// store was opened read-only.
-    pub fn put_record(
+    /// Atomically persist a record and the repo's freshly-signed commit.
+    ///
+    /// The record and the commit that covers it advance together in one
+    /// `WriteBatch`, so a reader never observes a record whose MST root the
+    /// stored commit does not sign. Fails if this store was opened read-only.
+    fn put_record_and_commit(
         &self,
         did: &str,
         collection: &str,
         tid: Tid,
-        record: ModelRecord,
+        record: &ModelRecord,
+        commit: &Commit,
     ) -> AnyResult<()> {
         let RecordBacking::ReadWrite(db) = &self.backing else {
-            bail!("PdsRecordStore::put_record called on a read-only store");
+            bail!("PdsRecordStore::put_record_and_commit called on a read-only store");
         };
-        db.put(record_key(did, collection, tid), record.to_dag_cbor())
-            .context("PDS record store write failed")?;
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put(record_key(did, collection, tid), record.to_dag_cbor());
+        batch.put(commit_key(did), commit.to_dag_cbor());
+        db.write(batch).context("PDS record+commit write failed")?;
         Ok(())
     }
 
@@ -216,21 +232,21 @@ impl PdsRecordStore {
         Tid::from_micros(micros, clock_id)
     }
 
-    /// Load the full record set + signing key for `did`, or `None` if the
-    /// account has never published.
+    /// Load the full record set + signed commit for `did`, or `None` if the
+    /// account has never published (no records, or no persisted commit).
     fn load_repo(&self, did: &str) -> AnyResult<Option<RepoState>> {
         match &self.backing {
-            RecordBacking::ReadWrite(db) => self.load_repo_from(db, did),
+            RecordBacking::ReadWrite(db) => Self::load_repo_from(db, did),
             RecordBacking::ReadOnly(path) => {
                 let opts = readonly_opts();
                 let db = rocksdb::DB::open_for_read_only(&opts, path, false)
                     .with_context(|| format!("failed to reopen PDS record store at {path:?}"))?;
-                self.load_repo_from(&db, did)
+                Self::load_repo_from(&db, did)
             }
         }
     }
 
-    fn load_repo_from(&self, db: &rocksdb::DB, did: &str) -> AnyResult<Option<RepoState>> {
+    fn load_repo_from(db: &rocksdb::DB, did: &str) -> AnyResult<Option<RepoState>> {
         let prefix = record_prefix(did);
         let mut records = BTreeMap::new();
         // `prefix_iterator` without a configured `prefix_extractor` degrades to
@@ -245,33 +261,48 @@ impl PdsRecordStore {
                 .with_context(|| format!("corrupt PDS record for {did}/{collection}/{tid}"))?;
             records.insert((collection, tid), record);
         }
-        // "Never published" == no records for this DID. The `#atproto` key is
-        // held in memory (never in the DB — #910a H1), so a repo's existence is
-        // determined by its records, not by a stored key.
+        // "Never published" == no records for this DID.
         if records.is_empty() {
             return Ok(None);
         }
-        Ok(Some(RepoState { signing_key: self.atproto_signing_key.clone(), records }))
+        // A published repo always has a persisted signed commit (records and
+        // the commit that signs their MST root advance together atomically —
+        // see `put_record_and_commit`). If the commit is absent the store is
+        // inconsistent (e.g. a legacy pre-#910a-rework write); we cannot serve
+        // a keyless proof without it, so report "not published" rather than
+        // re-sign (the resolver holds no key by design).
+        let Some(commit_bytes) = db
+            .get(commit_key(did))
+            .context("PDS store commit read failed")?
+        else {
+            tracing::warn!(
+                did,
+                "PDS repo has records but no signed commit — refusing to serve (resolver holds no key)"
+            );
+            return Ok(None);
+        };
+        let commit = Commit::from_dag_cbor(&commit_bytes)
+            .with_context(|| format!("corrupt signed commit for {did}"))?;
+        Ok(Some(RepoState { records, commit }))
     }
 
-    /// Build the MST over all of a repo's records and return it with the
-    /// per-collection record-CID map (so callers can locate a target record).
-    fn build_tree(repo: &RepoState) -> Node {
+    /// Build the MST over a repo's record set. The MST is a deterministic,
+    /// keyless function of the record keys/CIDs, so this reproduces exactly the
+    /// tree whose root the persisted commit signs.
+    fn build_tree(records: &BTreeMap<(String, Tid), ModelRecord>) -> Node {
         // All records across all collections share one MST keyed by
         // `<collection>/<rkey>`. `Node::from_records` keys by Tid within one
-        // collection NSID, so when a repo holds multiple collections we build a
-        // per-collection subtree set is NOT how atproto works — atproto uses one
-        // tree over `<collection>/<rkey>` keys. Our records today are a single
-        // collection (`ai.hyprstream.model`), so build over that collection's
-        // Tid→CID map. Mixed-collection repos are a follow-up (#910b).
+        // collection NSID; our records today are a single collection
+        // (`ai.hyprstream.model`), so build over that collection's Tid→CID map.
+        // Mixed-collection repos are a follow-up (#910b).
         let mut by_tid: BTreeMap<Tid, hyprstream_pds::cid::Cid> = BTreeMap::new();
-        for ((collection, tid), rec) in &repo.records {
+        for ((collection, tid), rec) in records {
             // Single-collection assumption (see note above): use the record's
             // own collection NSID as the MST collection.
             let _ = collection;
             by_tid.insert(*tid, rec.cid());
         }
-        Node::from_records(hyprstream_pds::record::COLLECTION_NSID, &by_tid)
+        Node::from_records(COLLECTION_NSID, &by_tid)
     }
 }
 
@@ -283,17 +314,17 @@ fn readonly_opts() -> rocksdb::Options {
 
 /// Restrict the record-store directory to owner-only (0700) on unix.
 ///
-/// Defence in depth: even though the `#atproto` private key never lands in
-/// this DB (#910a H1), the record *values* are what the node signs CAR proofs
-/// over at read time — a store another local user could write would let them
-/// inject records the node then serves as authentic. On non-unix this is a
-/// no-op (the store path is expected to be an OS-managed private dir there).
+/// Defence in depth: the record *values* (and the signed commit) are what a
+/// resolver serves as authentic PDS state — a store another local user could
+/// write would let them inject records/commits the node then serves. On
+/// non-unix this is a no-op (the store path is expected to be an OS-managed
+/// private dir there).
 fn harden_store_dir(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         // Best-effort: this is defence-in-depth (the private key never lands in
-        // this DB — H1 — and the path never resolves to /tmp — H2). If the chmod
+        // this DB, and the path never resolves to /tmp — H2). If the chmod
         // fails (e.g. the dir is owned by a different uid in a split-uid setup),
         // warn rather than hard-fail startup.
         if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)) {
@@ -308,21 +339,34 @@ fn harden_store_dir(path: &Path) {
 // PdsPublisher — the register/commit write side of #910a
 // ============================================================================
 
-/// Publishes/advances a repo's `ai.hyprstream.model` PDS record on this
-/// node, over a read-write [`PdsRecordStore`]. Constructed once by the
-/// registry service (the sole writer) and called from `handle_register` /
+/// Publishes/advances a repo's `ai.hyprstream.model` PDS record on this node,
+/// over a read-write [`PdsRecordStore`]. Constructed once by the registry
+/// service (the sole writer) and called from `handle_register` /
 /// `handle_commit_with_author`.
+///
+/// This is the **only** holder of the `#atproto` P-256 private key: it signs
+/// the repo's commit once, here, at write time, and persists the signed bytes.
+/// The resolver never sees the key.
 pub struct PdsPublisher {
     store: Arc<PdsRecordStore>,
     /// This node's own `did:key` identity — the `repo` at-uri authority for
     /// every record this node publishes (single-node, self-hosted PDS; a
     /// per-account DID scheme is out of scope for #910a).
     did: String,
+    /// This node's `#atproto` commit-signing key (P-256/ES256), sourced from
+    /// the shared `Es256SigningKeyStore` — the *same* key `did_document.rs`
+    /// publishes as the `#atproto` verification method. Held only here (the
+    /// writer); resolvers hold no key. Used to sign each commit exactly once.
+    signing_key: p256::ecdsa::SigningKey,
 }
 
 impl PdsPublisher {
-    pub fn new(store: Arc<PdsRecordStore>, did: String) -> Self {
-        Self { store, did }
+    pub fn new(
+        store: Arc<PdsRecordStore>,
+        did: String,
+        signing_key: p256::ecdsa::SigningKey,
+    ) -> Self {
+        Self { store, did, signing_key }
     }
 
     /// Publish (or advance) the `ai.hyprstream.model` record for `repo_id`,
@@ -331,7 +375,10 @@ impl PdsPublisher {
     /// The record's rkey is derived deterministically from `repo_id`
     /// (`PdsRecordStore::tid_for_repo`) and reused on every call, so this
     /// always *replaces* the existing record's value rather than creating a
-    /// new one — the atproto "pointer advance".
+    /// new one. The repo's MST is rebuilt over its full record set, a new
+    /// commit is signed **once** here (rev strictly advances; `prev` points at
+    /// the previous commit's CID — the atproto pointer advance), and the record
+    /// and signed commit are persisted together.
     ///
     /// Best-effort by design: the caller (registry service) should log and
     /// continue on error rather than fail the git operation that triggered
@@ -346,8 +393,44 @@ impl PdsPublisher {
             current_oid_cid,
             atproto_datetime_now(),
         )?;
+
+        // Load the existing repo state (records + previous signed commit) so we
+        // can rebuild the full MST and advance the commit pointer.
+        let existing = self.store.load_repo(&self.did)?;
+        let mut records = existing
+            .as_ref()
+            .map(|r| r.records.clone())
+            .unwrap_or_default();
+        records.insert((COLLECTION_NSID.to_owned(), tid), record.clone());
+
+        // Rebuild the MST (deterministic, keyless) over the full record set and
+        // sign the commit ONCE over its root.
+        let tree = PdsRecordStore::build_tree(&records);
+        let root = tree.root_cid();
+        let (rev, prev) = match existing.as_ref().map(|r| &r.commit) {
+            Some(prev_commit) => (next_rev(prev_commit.rev), Some(prev_commit.cid())),
+            None => (Tid::now(), None),
+        };
+        let unsigned = UnsignedCommit::new(self.did.clone(), root, rev, prev);
+        let commit = Commit::sign(&unsigned, &self.signing_key);
+
         self.store
-            .put_record(&self.did, hyprstream_pds::record::COLLECTION_NSID, tid, record)
+            .put_record_and_commit(&self.did, COLLECTION_NSID, tid, &record, &commit)
+    }
+}
+
+/// The next commit `rev`: the current wall-clock TID, or one past the previous
+/// rev if the clock has not advanced past it.
+///
+/// atproto requires `rev` to strictly increase across a repo's commits; two
+/// publishes within the same microsecond (or a clock that went backwards) must
+/// still advance.
+fn next_rev(prev: Tid) -> Tid {
+    let now = Tid::now();
+    if now > prev {
+        now
+    } else {
+        Tid::from_raw(prev.to_raw().saturating_add(1))
     }
 }
 
@@ -373,7 +456,8 @@ fn atproto_datetime_now() -> String {
 
 /// `RecordResolver` over a [`PdsRecordStore`]. Builds CAR proofs via the
 /// reused `hyprstream_pds::car::build_record_proof_car` — no CAR/MST/commit
-/// code is reinvented here.
+/// code is reinvented here, and **no signing happens on the read path**: the
+/// commit served in the proof is the one the writer signed at publish time.
 pub struct PdsRecordResolver {
     store: Arc<PdsRecordStore>,
 }
@@ -407,22 +491,15 @@ impl RecordResolver for PdsRecordResolver {
             return Ok(None);
         };
 
-        // Rebuild the MST + signed commit, then build the CAR proof for the
-        // target record (reusing the PDS CAR builder — #392).
-        let tree = PdsRecordStore::build_tree(&repo);
-        let root = tree.root_cid();
-        let unsigned = hyprstream_pds::commit::UnsignedCommit::new(
-            did.to_owned(),
-            root,
-            Tid::now(),
-            None,
-        );
-        let commit = Commit::sign(&unsigned, &repo.signing_key);
+        // Rebuild the MST (keyless) and serve the STORED signed commit — no
+        // re-signing. The proof's root is `commit.data`, which the rebuilt tree
+        // reproduces exactly (records + commit were persisted together).
+        let tree = PdsRecordStore::build_tree(&repo.records);
         let proof = tree
-            .proof(hyprstream_pds::record::COLLECTION_NSID, &tid)
+            .proof(COLLECTION_NSID, &tid)
             .ok_or_else(|| anyhow::anyhow!("record present but no MST proof — store inconsistent"))?;
         let (_root_data, node_blocks) = tree.to_node_data_with_blocks();
-        let car = build_record_proof_car(&commit, &proof, &node_blocks, &record);
+        let car = build_record_proof_car(&repo.commit, &proof, &node_blocks, &record);
 
         let uri = format!("at://{did}/{collection}/{rkey}");
         Ok(Some(RecordCarData { uri, car }))
@@ -432,9 +509,6 @@ impl RecordResolver for PdsRecordResolver {
         let Some(repo) = self.store.load_repo(did)? else {
             return Ok(None);
         };
-        if repo.records.is_empty() {
-            return Ok(None);
-        }
 
         // Full-repo CAR: a self-contained helper for the WHOLE repo (commit +
         // all MST nodes + all record blocks) does not exist in the PDS `car`
@@ -451,20 +525,12 @@ impl RecordResolver for PdsRecordResolver {
         let tid = *tid;
         let record = record.clone();
 
-        let tree = PdsRecordStore::build_tree(&repo);
-        let root = tree.root_cid();
-        let unsigned = hyprstream_pds::commit::UnsignedCommit::new(
-            did.to_owned(),
-            root,
-            Tid::now(),
-            None,
-        );
-        let commit = Commit::sign(&unsigned, &repo.signing_key);
+        let tree = PdsRecordStore::build_tree(&repo.records);
         let proof = tree
-            .proof(hyprstream_pds::record::COLLECTION_NSID, &tid)
+            .proof(COLLECTION_NSID, &tid)
             .ok_or_else(|| anyhow::anyhow!("repo record has no MST proof — store inconsistent"))?;
         let (_root_data, node_blocks) = tree.to_node_data_with_blocks();
-        let car = build_record_proof_car(&commit, &proof, &node_blocks, &record);
+        let car = build_record_proof_car(&repo.commit, &proof, &node_blocks, &record);
 
         let uri = format!("at://{did}/{collection}/{}", tid.encode());
         Ok(Some(RecordCarData { uri, car }))
@@ -475,68 +541,153 @@ impl RecordResolver for PdsRecordResolver {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod pds_store_tests {
     use super::*;
+    use hyprstream_pds::car::{parse_car_v1, verify_record_proof};
+    use p256::ecdsa::{SigningKey, VerifyingKey};
 
-    fn sample_record(oid_suffix: &str) -> ModelRecord {
-        ModelRecord::new(
-            "at://did:key:zTestNode",
-            format!("bafyreiexample{oid_suffix}0000000000000000000000000"),
-            "2026-06-23T12:34:56.789Z",
-        )
-        .expect("valid sample record")
+    /// A 40-hex-char (SHA-1-shaped) git OID for the publish path.
+    const SAMPLE_OID: &str = "1111111111111111111111111111111111111111";
+    const SAMPLE_OID_2: &str = "2222222222222222222222222222222222222222";
+    const DID: &str = "did:key:zTestNode";
+
+    /// Extract and decode the signed commit from a proof CAR (its single root).
+    fn commit_from_car(car: &[u8]) -> Commit {
+        let (roots, blocks) = parse_car_v1(car).expect("parse CAR");
+        let root = roots.first().copied().expect("CAR has a root commit");
+        let (_cid, bytes) = blocks
+            .iter()
+            .find(|(cid, _)| *cid == root)
+            .expect("commit block present");
+        Commit::from_dag_cbor(bytes).expect("decode commit")
+    }
+
+    /// Minimal single-threaded block_on so these tests don't need a full
+    /// `#[tokio::test]` runtime just to drive one `async_trait(?Send)` call.
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build current-thread runtime")
+            .block_on(fut)
     }
 
     #[test]
-    fn put_then_load_round_trips_through_rocksdb() {
+    fn keyless_read_serves_writer_signed_commit() {
+        // The writer signs once; a resolver constructed with NO key returns a
+        // proof whose commit verifies against the published P-256 key.
         let dir = tempfile::tempdir().expect("tempdir");
-        let sk = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
-        let store = PdsRecordStore::open(dir.path(), sk.clone()).expect("open");
-        let tid = Tid::now();
-        let did = "did:key:zTestNode";
+        let sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let vk: VerifyingKey = *sk.verifying_key();
 
-        store
-            .put_record(did, "ai.hyprstream.model", tid, sample_record("a"))
-            .expect("put_record");
+        let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+        publisher.publish("repo-a", SAMPLE_OID).expect("publish");
 
-        let resolver = PdsRecordResolver::new(Arc::new(store));
-        let got = tokio_test_block_on(resolver.resolve_record(did, "ai.hyprstream.model", &tid.encode()))
-            .expect("resolve_record ok")
+        // Resolver holds no key at all.
+        let resolver = PdsRecordResolver::new(Arc::clone(&store));
+        let tid = PdsRecordStore::tid_for_repo("repo-a");
+        let got = block_on(resolver.resolve_record(DID, COLLECTION_NSID, &tid.encode()))
+            .expect("resolve ok")
             .expect("record present");
-        assert_eq!(got.uri, format!("at://{did}/ai.hyprstream.model/{}", tid.encode()));
+
+        let commit = commit_from_car(&got.car);
+        commit
+            .verify(&vk)
+            .expect("writer-signed commit must verify against the published #atproto key");
+    }
+
+    #[test]
+    fn publish_read_full_proof_verifies() {
+        // End-to-end: publish → getRecord → the FULL record proof (commit sig +
+        // MST path + record CID) verifies keyless against the published key.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let vk: VerifyingKey = *sk.verifying_key();
+
+        let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+        publisher.publish("repo-a", SAMPLE_OID).expect("publish");
+
+        // Reconstruct the proof the same way the resolver does (store holds no
+        // key), and run the offline verifier against the published key.
+        let repo = store.load_repo(DID).expect("load ok").expect("repo present");
+        let tid = PdsRecordStore::tid_for_repo("repo-a");
+        let record = repo
+            .records
+            .get(&(COLLECTION_NSID.to_owned(), tid))
+            .cloned()
+            .expect("record present");
+        let tree = PdsRecordStore::build_tree(&repo.records);
+        let proof = tree.proof(COLLECTION_NSID, &tid).expect("proof");
+        verify_record_proof(&repo.commit, &vk, &proof, &record)
+            .expect("full keyless proof must verify");
+    }
+
+    #[test]
+    fn pointer_advance_bumps_rev_and_links_prev() {
+        // A re-publish must advance the commit: a new rev and prev = the old
+        // commit's CID.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+
+        publisher.publish("repo-a", SAMPLE_OID).expect("publish 1");
+        let first = store.load_repo(DID).expect("load").expect("repo").commit;
+        assert!(first.prev.is_none(), "genesis commit has no prev");
+
+        publisher.publish("repo-a", SAMPLE_OID_2).expect("publish 2");
+        let second = store.load_repo(DID).expect("load").expect("repo").commit;
+        assert_eq!(
+            second.prev,
+            Some(first.cid()),
+            "the advanced commit must link the previous commit"
+        );
+        assert!(second.rev > first.rev, "rev must strictly advance");
     }
 
     #[test]
     fn readonly_store_survives_restart_and_sees_writer_updates() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let did = "did:key:zTestNode2";
-        let sk = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
-        let tid = Tid::now();
+        let sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let vk: VerifyingKey = *sk.verifying_key();
 
         {
-            let store = PdsRecordStore::open(dir.path(), sk.clone()).expect("open rw");
-            store
-                .put_record(did, "ai.hyprstream.model", tid, sample_record("b"))
-                .expect("put_record");
+            let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
+            let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+            publisher.publish("repo-b", SAMPLE_OID).expect("publish");
             // Writer handle dropped here — simulates a process restart.
         }
 
-        let ro = PdsRecordStore::open_readonly(dir.path(), sk).expect("open ro");
-        let resolver = PdsRecordResolver::new(Arc::new(ro));
-        let got = tokio_test_block_on(resolver.resolve_repo(did))
+        let ro = Arc::new(PdsRecordStore::open_readonly(dir.path()).expect("open ro"));
+        let resolver = PdsRecordResolver::new(Arc::clone(&ro));
+        let got = block_on(resolver.resolve_repo(DID))
             .expect("resolve_repo ok")
             .expect("repo present after reopen");
-        assert!(got.uri.starts_with(&format!("at://{did}/")));
+        assert!(got.uri.starts_with(&format!("at://{DID}/")));
+        // The signed commit survived the reopen and still verifies.
+        commit_from_car(&got.car)
+            .verify(&vk)
+            .expect("commit persisted across restart must verify");
     }
 
     #[test]
     fn readonly_store_rejects_writes() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let sk = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
         // Create the directory with a real DB first so open_readonly succeeds.
-        drop(PdsRecordStore::open(dir.path(), sk.clone()).expect("open rw"));
+        drop(PdsRecordStore::open(dir.path()).expect("open rw"));
 
-        let ro = PdsRecordStore::open_readonly(dir.path(), sk).expect("open ro");
+        let ro = PdsRecordStore::open_readonly(dir.path()).expect("open ro");
+        let record = ModelRecord::new(
+            "at://did:key:zX",
+            format!("bafyreiexample{SAMPLE_OID}"),
+            "2026-06-23T12:34:56.789Z",
+        )
+        .expect("record");
+        let sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let tree = PdsRecordStore::build_tree(&BTreeMap::new());
+        let unsigned = UnsignedCommit::new("did:key:zX", tree.root_cid(), Tid::now(), None);
+        let commit = Commit::sign(&unsigned, &sk);
         let err = ro
-            .put_record("did:key:zX", "ai.hyprstream.model", Tid::now(), sample_record("c"))
+            .put_record_and_commit("did:key:zX", COLLECTION_NSID, Tid::now(), &record, &commit)
             .unwrap_err();
         assert!(err.to_string().contains("read-only"));
     }
@@ -548,14 +699,5 @@ mod pds_store_tests {
         assert_eq!(first, second, "the same repo must always get the same rkey");
         let other = PdsRecordStore::tid_for_repo("repo-b");
         assert_ne!(first, other, "distinct repos must not alias onto one rkey");
-    }
-
-    /// Minimal single-threaded block_on so these tests don't need a full
-    /// `#[tokio::test]` runtime just to drive one `async_trait(?Send)` call.
-    fn tokio_test_block_on<F: std::future::Future>(fut: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("build current-thread runtime")
-            .block_on(fut)
     }
 }
