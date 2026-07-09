@@ -58,6 +58,11 @@ mod service;
 /// `Resolver::set_global` / network-profile resolver seam (#873).
 pub mod at9p_resolver;
 
+/// #896 (at9p D4) — `did:web` / `did:key` → `did:at9p` aliasing resolver:
+/// resolves a classical DID to its authoritative `did:at9p` identity via mutual
+/// `alsoKnownAs` attestation + the GATE pipeline. Sibling to `at9p_resolver`.
+pub mod at9p_alias;
+
 /// #524 P1 — placement directory record ingestion + in-process index.
 ///
 /// Polls `RecordResolver::resolve_repo` for a bootstrap set of node DIDs,

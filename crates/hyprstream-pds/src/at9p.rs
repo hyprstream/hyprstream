@@ -405,6 +405,17 @@ pub struct CapsuleBody {
     pub next_key_commitments: Vec<[u8; H512_LEN]>,
     pub services: Vec<ServiceEntry>,
     pub label_hints: Option<Vec<String>>,
+    /// Classical DID aliases this `did:at9p` identity attests to — the
+    /// **hybrid-signed** leg of the `alsoKnownAs` aliasing bridge (#896 / D4,
+    /// design #879 Q4 / #905 §2/§6). Each entry is a `did:web` / `did:key` /
+    /// `did:plc` identifier the capsule claims to *also* be. Because the list
+    /// lives inside the GATE-verified capsule body, it is content-bound to the
+    /// at9p identity and signed under pinned Hybrid — the strongest of the two
+    /// aliasing legs. The reciprocal (classical→at9p) vouch is classical-only
+    /// (a DID document's best), so the authoritative-direction rule
+    /// (`at9p_alias::resolve_authoritative_alias`) requires **both** legs to
+    /// name each other before the at9p identity is trusted.
+    pub also_known_as: Option<Vec<String>>,
     pub delegations: Option<Vec<Delegation>>,
     pub witnesses: Option<Vec<String>>,
 }
@@ -417,6 +428,7 @@ impl CapsuleBody {
             next_key_commitments: Vec::new(),
             services,
             label_hints: None,
+            also_known_as: None,
             delegations: None,
             witnesses: None,
         };
@@ -460,6 +472,13 @@ impl CapsuleBody {
                 "labelHints must not be empty when present"
             );
             validate_unique_texts(label_hints, "labelHints")?;
+        }
+        if let Some(aliases) = &self.also_known_as {
+            ensure!(
+                !aliases.is_empty(),
+                "alsoKnownAs must not be empty when present"
+            );
+            validate_did_list(aliases, "alsoKnownAs")?;
         }
         if let Some(delegations) = &self.delegations {
             ensure!(
@@ -511,6 +530,12 @@ impl CapsuleBody {
                 DagCbor::list(label_hints.iter().cloned().map(DagCbor::Text)),
             ));
         }
+        if let Some(aliases) = &self.also_known_as {
+            fields.push((
+                "alsoKnownAs",
+                DagCbor::list(aliases.iter().cloned().map(DagCbor::Text)),
+            ));
+        }
         if let Some(delegations) = &self.delegations {
             fields.push((
                 "delegations",
@@ -535,6 +560,7 @@ impl CapsuleBody {
                 "nextKeyCommitments",
                 "services",
                 "labelHints",
+                "alsoKnownAs",
                 "delegations",
                 "witnesses",
             ],
@@ -552,6 +578,7 @@ impl CapsuleBody {
             .collect::<Result<Vec<_>>>()?;
         let services = parse_services(required(value, "services", "at9p capsule body")?)?;
         let label_hints = optional_text_list(value, "labelHints")?;
+        let also_known_as = optional_text_list(value, "alsoKnownAs")?;
         let delegations = match value.get("delegations") {
             Some(v) => Some(
                 v.as_list()?
@@ -568,6 +595,7 @@ impl CapsuleBody {
             next_key_commitments,
             services,
             label_hints,
+            also_known_as,
             delegations,
             witnesses,
         };
@@ -1051,6 +1079,26 @@ fn validate_unique_texts(values: &[String], field: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate a list of DID identifiers: each entry must be non-empty, whitespace-
+/// free, `did:`-prefixed, and the list duplicate-free. Used for the capsule's
+/// `alsoKnownAs` aliases (#896 / D4) — a non-DID or duplicate alias is rejected
+/// at the schema gate, never silently normalized.
+fn validate_did_list(values: &[String], field: &str) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for value in values {
+        validate_nonempty_no_ws(value, field)?;
+        ensure!(
+            value.starts_with("did:"),
+            "{field} entry {value:?} must be a DID identifier"
+        );
+        ensure!(
+            seen.insert(value.as_str()),
+            "duplicate {field} entry {value:?}"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -1118,6 +1166,10 @@ mod tests {
         .unwrap();
         body.next_key_commitments = vec![digest(seed.wrapping_add(3))];
         body.label_hints = Some(vec![format!("tenant{seed}")]);
+        body.also_known_as = Some(vec![
+            format!("did:web:node{seed}.example"),
+            format!("did:key:z6Mkaka{seed}"),
+        ]);
         body.witnesses = Some(vec![format!("did:at9p:witness{seed}")]);
         Capsule::new(body, signature(CAPSULE_SIGNATURE_CONTEXT, seed)).unwrap()
     }
@@ -1235,5 +1287,47 @@ mod tests {
         assert_eq!(decoded.codec, Codec::At9pCapsule);
         assert_eq!(decoded.multihash.algo, HashAlgo::Blake3);
         assert_eq!(decoded.multihash.digest.len(), H512_LEN);
+    }
+
+    #[test]
+    fn also_known_as_round_trips_and_round_trips_byte_stable() {
+        let capsule = sample_capsule(7);
+        // The fixture sets two classical aliases.
+        assert_eq!(
+            capsule.body.also_known_as.as_deref().unwrap(),
+            &[
+                "did:web:node7.example".to_owned(),
+                "did:key:z6Mkaka7".to_owned()
+            ]
+        );
+        // Byte-stable canonical round-trip carries alsoKnownAs.
+        let bytes = capsule.to_dag_cbor();
+        let decoded = Capsule::from_dag_cbor(&bytes).unwrap();
+        assert_eq!(&decoded, &capsule);
+        assert_eq!(decoded.to_dag_cbor(), bytes);
+    }
+
+    #[test]
+    fn also_known_as_rejects_non_did_and_duplicates() {
+        let mut body = CapsuleBody::new(
+            vec![key(1)],
+            vec![service("#ns".to_owned(), ServiceType::NinePExport, 1)],
+        )
+        .unwrap();
+        // Non-DID entry rejected at the schema gate.
+        body.also_known_as = Some(vec!["https://not.a.did.example".to_owned()]);
+        assert!(body.validate().is_err());
+        // Duplicate entry rejected.
+        body.also_known_as = Some(vec![
+            "did:web:dup.example".to_owned(),
+            "did:web:dup.example".to_owned(),
+        ]);
+        assert!(body.validate().is_err());
+        // Empty list rejected (must not be empty when present).
+        body.also_known_as = Some(Vec::new());
+        assert!(body.validate().is_err());
+        // A clean DID list validates.
+        body.also_known_as = Some(vec!["did:web:clean.example".to_owned()]);
+        assert!(body.validate().is_ok());
     }
 }

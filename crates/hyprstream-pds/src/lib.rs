@@ -49,6 +49,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 pub mod at9p;
+pub mod at9p_alias;
 pub mod at9p_chain;
 pub mod at9p_duplicity;
 pub mod at9p_gate;
