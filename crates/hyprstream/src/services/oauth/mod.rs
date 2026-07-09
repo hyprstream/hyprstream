@@ -520,7 +520,7 @@ impl Spawnable for OAuthService {
 
             // Load the CA JWT signing key for browser WIT issuance (POST /oauth/wit).
             // Also seed the signing key store from the same root key.
-            let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
+            let secrets_dir = credentials_dir.clone();
             let oauth_config_arc = Arc::new(self.config.clone());
 
             // Load or initialize ES256 + ML-DSA rotation stores (independent of CA key).

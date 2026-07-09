@@ -228,7 +228,16 @@ impl BootstrapManager {
 
         // Load the user-signing-key from the SAME secrets dir the CLI uses, so
         // the bound fingerprint matches the key the CLI signs with.
-        let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
+        let secrets_dir = match crate::config::HyprConfig::resolve_secrets_dir() {
+            Ok(path) => path,
+            Err(e) => {
+                tracing::warn!(
+                    username,
+                    "Failed to resolve secrets directory — CLI signing key will not be bound to '{username}': {e}"
+                );
+                return;
+            }
+        };
         let vk = match identity_store::load_or_generate_user_signing_key(&secrets_dir) {
             Ok((_sk, vk)) => vk,
             Err(e) => {

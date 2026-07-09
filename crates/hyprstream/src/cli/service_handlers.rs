@@ -71,8 +71,8 @@ pub async fn handle_service_install(
         #[cfg(feature = "systemd")]
         {
             let secrets_dir = crate::config::HyprConfig::load()
-                .map(|c| c.secrets.resolve_dir(c.config_dir()))
-                .ok();
+                .ok()
+                .and_then(|c| crate::config::HyprConfig::resolve_secrets_dir_for(Some(&c)).ok());
             hyprstream_service::encrypt_credentials_if_available(secrets_dir.as_deref());
         }
 
@@ -572,22 +572,29 @@ pub(crate) async fn run_repair_checks(
     // 4b. TLS materials (HTTP + QUIC) — generate into secrets dir so they are
     //     available for systemd-creds encryption in phase 6.
     {
-        let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
-        // HTTP TLS (365-day self-signed)
-        match crate::auth::identity_store::load_or_generate_tls_materials(&secrets_dir, "localhost", 365) {
-            Ok(_) => print_check("TLS key+cert", CheckStatus::Ok, "HTTP (365d)"),
-            Err(e) => {
-                print_check("TLS key+cert", CheckStatus::Fail, &format!("{e}"));
-                all_passed = false;
+        match crate::config::HyprConfig::resolve_secrets_dir() {
+            Ok(secrets_dir) => {
+                // HTTP TLS (365-day self-signed)
+                match crate::auth::identity_store::load_or_generate_tls_materials(&secrets_dir, "localhost", 365) {
+                    Ok(_) => print_check("TLS key+cert", CheckStatus::Ok, "HTTP (365d)"),
+                    Err(e) => {
+                        print_check("TLS key+cert", CheckStatus::Fail, &format!("{e}"));
+                        all_passed = false;
+                    }
+                }
+                // QUIC TLS (14-day per WebTransport spec)
+                match crate::auth::identity_store::load_or_generate_tls_materials_named(
+                    &secrets_dir, "localhost", 14, "quic-key", "quic-cert",
+                ) {
+                    Ok(_) => print_check("QUIC key+cert", CheckStatus::Ok, "WebTransport (14d)"),
+                    Err(e) => {
+                        print_check("QUIC key+cert", CheckStatus::Fail, &format!("{e}"));
+                        all_passed = false;
+                    }
+                }
             }
-        }
-        // QUIC TLS (14-day per WebTransport spec)
-        match crate::auth::identity_store::load_or_generate_tls_materials_named(
-            &secrets_dir, "localhost", 14, "quic-key", "quic-cert",
-        ) {
-            Ok(_) => print_check("QUIC key+cert", CheckStatus::Ok, "WebTransport (14d)"),
             Err(e) => {
-                print_check("QUIC key+cert", CheckStatus::Fail, &format!("{e}"));
+                print_check("Secrets directory", CheckStatus::Fail, &format!("{e}"));
                 all_passed = false;
             }
         }
@@ -595,12 +602,18 @@ pub(crate) async fn run_repair_checks(
 
     // 4c. RSA key for RS256 JWT signing (OIDC interop)
     {
-        let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
-        match crate::auth::identity_store::load_or_generate_rsa_key(&secrets_dir) {
-            Ok(_) => print_check("RSA key", CheckStatus::Ok, "RS256 (2048-bit)"),
+        match crate::config::HyprConfig::resolve_secrets_dir() {
+            Ok(secrets_dir) => {
+                match crate::auth::identity_store::load_or_generate_rsa_key(&secrets_dir) {
+                    Ok(_) => print_check("RSA key", CheckStatus::Ok, "RS256 (2048-bit)"),
+                    Err(e) => {
+                        // Non-fatal: EdDSA still works, RS256 is for interop
+                        print_check("RSA key", CheckStatus::Warn, &format!("{e}"));
+                    }
+                }
+            }
             Err(e) => {
-                // Non-fatal: EdDSA still works, RS256 is for interop
-                print_check("RSA key", CheckStatus::Warn, &format!("{e}"));
+                print_check("Secrets directory", CheckStatus::Warn, &format!("{e}"));
             }
         }
     }

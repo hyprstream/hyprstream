@@ -49,7 +49,7 @@ pub fn get_or_init_tls_materials(config: &TlsConfig) -> anyhow::Result<Arc<TlsMa
     }
 
     let materials = if config.use_self_signed() {
-        let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
+        let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
         let server_name = &config.server_name;
         info!(
             "Loading/generating TLS materials (365-day validity) from '{}'",

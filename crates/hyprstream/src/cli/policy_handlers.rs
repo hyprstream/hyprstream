@@ -411,7 +411,7 @@ pub async fn load_or_generate_signing_key(_keys_dir: &Path) -> Result<SigningKey
     if let Some(sk) = crate::config::HyprConfig::node_signing_key_bypass()? {
         return Ok(sk);
     }
-    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
+    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
     crate::auth::identity_store::load_or_generate_node_signing_key(&secrets_dir)
 }
 
@@ -456,7 +456,7 @@ pub(crate) fn ensure_user_signing_key() -> Result<(SigningKey, ed25519_dalek::Ve
     if let Some(pair) = crate::config::HyprConfig::user_signing_key_bypass()? {
         return Ok(pair);
     }
-    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
+    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
     crate::auth::identity_store::load_or_generate_user_signing_key(&secrets_dir)
 }
 

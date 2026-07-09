@@ -1385,7 +1385,9 @@ fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
         return Some(vk);
     }
     // CLI mode: seed from bootstrap-pubkeys on first use
-    let secrets_dir = HyprConfig::resolve_secrets_dir();
+    let Ok(secrets_dir) = HyprConfig::resolve_secrets_dir() else {
+        return None;
+    };
     if let Ok(pubkeys) = hyprstream_core::auth::identity_store::load_bootstrap_pubkeys(&secrets_dir) {
         for (name, vk) in &pubkeys {
             trust.insert(
@@ -1991,7 +1993,7 @@ fn main() -> Result<()> {
                                     // than this process reads from — the same "consumer silently
                                     // re-derives instead of reading the authoritative record"
                                     // disease #441 targets, just one directory earlier.
-                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir();
+                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir()?;
 
                                     // Load CA verifying key (trust anchor) for JWT verification only.
                                     // Do NOT insert into the trust store as "policy" scope — the trust
@@ -2063,7 +2065,7 @@ fn main() -> Result<()> {
                                     //
                                     // #759: same authoritative resolver as the `--ipc` branch above —
                                     // see the comment there.
-                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir();
+                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir()?;
 
                                     // Load CA verifying key (trust anchor)
                                     let ca_vk = hyprstream_core::auth::identity_store::load_ca_verifying_key(&secrets_dir)
@@ -2196,7 +2198,7 @@ fn main() -> Result<()> {
 
                                 // Populate ML-DSA-65 verifying keys for PQ-hybrid JWT verification.
                                 {
-                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir();
+                                    let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir()?;
                                     let ml_dsa_store = hyprstream_core::auth::key_rotation::global_ml_dsa_key_store(
                                         &secrets_dir,
                                         &config.oauth,
@@ -2393,12 +2395,12 @@ fn main() -> Result<()> {
         Some(("user", sub_m)) => {
             let cmd = UserCommand::from_arg_matches(sub_m)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
-            // Deliberately NOT the shared `identity_store::credentials_dir()` helper:
-            // that helper re-runs `HyprConfig::load()` against default locations,
-            // while `ctx` honors the `--config <path>` CLI override. The operator's
-            // config must win here, or `--config` invocations would resolve the
-            // user store from XDG defaults and split it.
-            let credentials_dir = ctx.config_dir().join("credentials");
+            // Deliberately resolve from `ctx`: it honors the `--config <path>`
+            // CLI override. The operator's config must win here, or `--config`
+            // invocations would resolve the user store from XDG defaults and
+            // split it.
+            let credentials_dir =
+                hyprstream_core::auth::identity_store::credentials_dir_for_config(Some(ctx.config()))?;
             // User handlers are async, run them in a minimal runtime
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

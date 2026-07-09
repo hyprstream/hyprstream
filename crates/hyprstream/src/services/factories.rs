@@ -481,7 +481,7 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 
     // Wire ES256 + ML-DSA rotation stores into PolicyService for composite token issuance.
     // Uses global singletons so PolicyService shares the same store the rotation task updates.
-    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
+    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
     let es256_store = crate::auth::key_rotation::global_es256_key_store(&secrets_dir, &config.oauth);
     policy_service = policy_service.with_es256_key_store(es256_store);
     {
@@ -540,7 +540,7 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     // fail closed rather than fall back to /tmp (H2).
     let pds_publisher = (|| -> anyhow::Result<crate::services::discovery::PdsPublisher> {
         let store_dir = pds_store_dir()?;
-        let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
+        let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
         let es256_store =
             crate::auth::key_rotation::global_es256_key_store(&secrets_dir, &config.oauth);
         // `active_key` is async (tokio RwLock); resolve it once here on the
