@@ -6,8 +6,8 @@
 //!
 //! # Design
 //!
-//! - **No env var checks** — callers must resolve config bypasses before calling
-//!   these functions.  This module is pure file I/O.
+//! - **Centralized directory resolution** — callers use `credentials_dir()` so
+//!   all secret-bearing paths fail closed consistently.
 //! - **Atomic writes** — secrets are written via tempfile + rename so partial
 //!   writes are never visible.
 //! - **Mode 0600 / 0700** — secret files and their parent directory are created
@@ -24,6 +24,23 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::server::tls::TlsMaterials;
 
 // ─── Low-level primitives ───────────────────────────────────────────────────
+
+/// Resolve the credentials/secrets directory: `HYPRSTREAM__SECRETS__PATH` if set,
+/// else `<config_dir>/credentials`. Fails closed — NEVER falls back to a
+/// world-writable /tmp path for a secret-bearing dir.
+pub fn credentials_dir() -> anyhow::Result<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("HYPRSTREAM__SECRETS__PATH") {
+        return Ok(std::path::PathBuf::from(p));
+    }
+    if let Ok(c) = crate::config::HyprConfig::load() {
+        return Ok(c.config_dir().join("credentials"));
+    }
+    let base = dirs::config_dir().ok_or_else(|| anyhow!(
+        "cannot resolve a credentials directory: set HYPRSTREAM__SECRETS__PATH \
+         (systemd credentials / k8s secret mount) — refusing to fall back to /tmp"
+    ))?;
+    Ok(base.join("hyprstream").join("credentials"))
+}
 
 /// Read a named secret from `dir`.  Returns `None` if the file does not exist.
 pub fn read_secret(dir: &std::path::Path, name: &str) -> Result<Option<Vec<u8>>> {
@@ -735,6 +752,62 @@ mod tests {
             - days * 86_400;
         let tv = TimeVal::new(past_secs, 0);
         nix::sys::stat::utimes(path, &tv, &tv).unwrap();
+    }
+
+    /// RAII guard to set/unset a process env var for the duration of a test and
+    /// restore the previous value, keeping env-mutating tests from leaking state.
+    struct EnvVarGuard {
+        key: String,
+        prev: Option<String>,
+    }
+    impl EnvVarGuard {
+        fn set(key: &str, val: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, val);
+            Self { key: key.to_owned(), prev }
+        }
+        fn unset(key: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key: key.to_owned(), prev }
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(&self.key, v),
+                None => std::env::remove_var(&self.key),
+            }
+        }
+    }
+
+    /// `credentials_dir()` precedence: `HYPRSTREAM__SECRETS__PATH` wins when set;
+    /// otherwise resolution falls back to a `<config_dir>/credentials` path.
+    /// Both cases in one test — the env var is process-global and tests run in
+    /// parallel, so splitting them would race.
+    #[test]
+    fn test_credentials_dir_precedence() {
+        const VAR: &str = "HYPRSTREAM__SECRETS__PATH";
+
+        // (a) env var set → returns exactly that path.
+        {
+            let _g = EnvVarGuard::set(VAR, "/run/credentials/hyprstream");
+            let dir = credentials_dir().unwrap();
+            assert_eq!(dir, std::path::PathBuf::from("/run/credentials/hyprstream"));
+        }
+
+        // (b) env var unset → default resolution yields a path ending in
+        // `credentials` (via config load or the XDG fallback).
+        {
+            let _g = EnvVarGuard::unset(VAR);
+            let dir = credentials_dir().unwrap();
+            assert_eq!(
+                dir.file_name().and_then(|n| n.to_str()),
+                Some("credentials"),
+                "default resolution should end in 'credentials': {}",
+                dir.display()
+            );
+        }
     }
 
     #[test]

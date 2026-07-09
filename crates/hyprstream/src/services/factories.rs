@@ -33,6 +33,7 @@ use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::auth::PolicyManager;
+use crate::auth::identity_store::credentials_dir;
 use crate::config::{HyprConfig, TokenConfig};
 use crate::services::{DiscoveryService, McpService, McpConfig, PolicyService, PolicyClient, RegistryService, RegistryClient};
 use crate::services::generated::policy_client::{RefreshServiceTokenRequest, RegisterServiceKey};
@@ -74,32 +75,6 @@ fn get_or_init_git2db(models_dir: &std::path::Path) -> anyhow::Result<Arc<RwLock
     let shared = Arc::new(RwLock::new(registry));
     // If another thread beat us, that's fine — use theirs
     Ok(Arc::clone(SHARED_GIT2DB.get_or_init(|| shared)))
-}
-
-/// Resolve the credentials directory used to load service JWTs at startup.
-///
-/// Mirrors the resolution in `main.rs`: systemd/IPC mode honors
-/// `HYPRSTREAM__SECRETS__PATH`; otherwise it is `<config_dir>/credentials`.
-/// This is the same on-disk location the wizard/bootstrap manager writes
-/// service JWTs to (`credentials/{service}/service-jwt`).
-fn credentials_dir() -> anyhow::Result<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("HYPRSTREAM__SECRETS__PATH") {
-        return Ok(std::path::PathBuf::from(p));
-    }
-    if let Ok(c) = HyprConfig::load() {
-        return Ok(c.config_dir().join("credentials"));
-    }
-    // Never fall back to a world-writable /tmp path for a secret-bearing dir
-    // (#910a H2): a predictable /tmp location lets another local user pre-own
-    // the secrets store or read keys placed there. Fail closed instead.
-    let base = dirs::config_dir().ok_or_else(|| {
-        anyhow::anyhow!(
-            "cannot resolve a secrets directory: set HYPRSTREAM__SECRETS__PATH \
-             (systemd credentials / k8s secret mount) — refusing to fall back to /tmp \
-             for a secret-bearing store"
-        )
-    })?;
-    Ok(base.join("hyprstream").join("credentials"))
 }
 
 /// Resolve the on-disk directory for the durable PDS record store (#910a).

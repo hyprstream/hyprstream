@@ -2393,6 +2393,11 @@ fn main() -> Result<()> {
         Some(("user", sub_m)) => {
             let cmd = UserCommand::from_arg_matches(sub_m)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
+            // Deliberately NOT the shared `identity_store::credentials_dir()` helper:
+            // that helper re-runs `HyprConfig::load()` against default locations,
+            // while `ctx` honors the `--config <path>` CLI override. The operator's
+            // config must win here, or `--config` invocations would resolve the
+            // user store from XDG defaults and split it.
             let credentials_dir = ctx.config_dir().join("credentials");
             // User handlers are async, run them in a minimal runtime
             let rt = tokio::runtime::Builder::new_current_thread()
