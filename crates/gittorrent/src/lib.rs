@@ -3,6 +3,8 @@
 //! This library implements a peer-to-peer network for sharing Git repositories
 //! using libp2p and a Kademlia distributed hash table (DHT).
 
+#[cfg(feature = "iroh-blobs")]
+pub mod blobs;
 pub mod crypto;
 pub mod dht;
 pub mod error;
