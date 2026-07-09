@@ -7490,6 +7490,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tokio-util",
+ "toml 0.8.23",
  "tonic 0.12.3",
  "tower 0.4.13",
  "tracing",

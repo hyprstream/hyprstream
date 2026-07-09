@@ -31,6 +31,34 @@ pub enum WorkerError {
     SandboxTimeout { operation: String, timeout_secs: u64 },
 
     // ─────────────────────────────────────────────────────────────────────
+    // Admission control errors (#525 P2 — SandboxPool::acquire decision engine)
+    // ─────────────────────────────────────────────────────────────────────
+    /// Per-Subject or per-group quota exceeded. Fail-fast: unlike capacity
+    /// exhaustion, a quota rejection never queues (retrying immediately
+    /// cannot help until the Subject/group's own active count drops).
+    #[error("Admission denied: {reason}")]
+    AdmissionDenied { reason: String },
+
+    /// The bounded admission wait-queue was already at capacity when this
+    /// request arrived — rejected immediately rather than silently blocking
+    /// past the configured bound.
+    #[error("Admission queue full: {waiting} waiting (bound {bound})")]
+    QueueFull { waiting: usize, bound: usize },
+
+    /// A request queued for capacity did not get admitted within the
+    /// configured wait timeout.
+    #[error("Admission queue wait timed out after {timeout_secs}s")]
+    QueueTimeout { timeout_secs: u64 },
+
+    /// Demand exceeds this node's *configured totals* (e.g. a GPU request on a
+    /// node that declares no GPU capacity, or memory above the declared total)
+    /// — no release can ever satisfy it. Rejected immediately rather than
+    /// queued, so callers can distinguish "never fits here" from "busy right
+    /// now" (`QueueTimeout`).
+    #[error("Admission infeasible: {reason}")]
+    AdmissionInfeasible { reason: String },
+
+    // ─────────────────────────────────────────────────────────────────────
     // VM Errors
     // ─────────────────────────────────────────────────────────────────────
     #[error("VM start failed: {0}")]

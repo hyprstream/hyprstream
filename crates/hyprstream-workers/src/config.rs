@@ -9,6 +9,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::runtime::AdmissionConfig;
+
 /// Default value for [`WorkerConfig::backend`].
 ///
 /// `"auto"` asks the runtime to pick the highest-priority *available* registered
@@ -128,6 +130,16 @@ pub struct PoolConfig {
 
     /// Timeout for sandbox stop in seconds
     pub stop_timeout_secs: u64,
+
+    /// Admission control: per-Subject/per-group quotas, bounded wait-queue,
+    /// and declared local schedulable capacity for `SandboxPool::acquire`'s
+    /// decision engine (#525 P2).
+    ///
+    /// 🔒 See [`AdmissionConfig`]'s doc for the judgment calls this shape
+    /// bakes in (flagged for reviewer sign-off). Defaults are unconstrained,
+    /// so an operator who does not set this section gets exactly the
+    /// pre-#525 behavior (only `max_sandboxes` capacity is enforced).
+    pub admission: AdmissionConfig,
 }
 
 impl Default for PoolConfig {
@@ -145,6 +157,7 @@ impl Default for PoolConfig {
             vm_cpus: 2,
             create_timeout_secs: 60,
             stop_timeout_secs: 30,
+            admission: AdmissionConfig::default(),
         }
     }
 }
@@ -268,6 +281,43 @@ mod tests {
         let yaml = serde_yaml::to_string(&config)?;
         let parsed: WorkerConfig = serde_yaml::from_str(&yaml)?;
         assert_eq!(parsed.pool.max_sandboxes, config.pool.max_sandboxes);
+        Ok(())
+    }
+
+    #[test]
+    fn test_worker_config_toml_roundtrips_at_defaults() -> Result<(), Box<dyn std::error::Error>> {
+        // F3 regression: the default `AdmissionConfig` used to set
+        // `max_per_subject`/`max_per_group` to `usize::MAX`, which is not a
+        // valid TOML i64 — `toml::to_string_pretty` errored, breaking any
+        // `Config::save()` that included a `[worker]` section. The unlimited
+        // quotas are now `Option<usize>` serialized as *absent*, so a default
+        // config must round-trip through TOML cleanly.
+        let config = WorkerConfig::default();
+        let toml_str = toml::to_string_pretty(&config)?;
+        // Unlimited quotas serialize as absent, never as a giant sentinel int.
+        assert!(
+            !toml_str.contains("max_per_subject"),
+            "unlimited per-subject quota must serialize as absent, got:\n{toml_str}"
+        );
+        assert!(!toml_str.contains("max_per_group"));
+        let parsed: WorkerConfig = toml::from_str(&toml_str)?;
+        assert_eq!(parsed.pool.admission.max_per_subject, None);
+        assert_eq!(parsed.pool.admission.max_per_group, None);
+        assert_eq!(parsed.pool.max_sandboxes, config.pool.max_sandboxes);
+        Ok(())
+    }
+
+    #[test]
+    fn test_worker_config_toml_roundtrips_with_explicit_quotas(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // A set quota must round-trip as a normal integer.
+        let mut config = WorkerConfig::default();
+        config.pool.admission.max_per_subject = Some(4);
+        config.pool.admission.max_per_group = Some(16);
+        let toml_str = toml::to_string_pretty(&config)?;
+        let parsed: WorkerConfig = toml::from_str(&toml_str)?;
+        assert_eq!(parsed.pool.admission.max_per_subject, Some(4));
+        assert_eq!(parsed.pool.admission.max_per_group, Some(16));
         Ok(())
     }
 

@@ -2573,6 +2573,30 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::expect_used)]
+    fn test_config_with_worker_section_at_defaults_serializes_to_toml() {
+        // F3 (#761) regression: `AdmissionConfig`'s default per-Subject/per-group
+        // quotas used to be `usize::MAX`, which is not a valid TOML i64, so
+        // `Config::save()` (which does `toml::to_string_pretty(self)`) failed
+        // for any config carrying a `[worker]` section. This reproduces that
+        // exact save path and round-trips it.
+        let mut config = HyprConfig::default();
+        config.worker = Some(hyprstream_workers::config::WorkerConfig::default());
+
+        let toml_str = toml::to_string_pretty(&config)
+            .expect("a default worker section must serialize to TOML (F3)");
+        let parsed: HyprConfig =
+            toml::from_str(&toml_str).expect("round-trip parse must succeed");
+        let admission = parsed
+            .worker
+            .expect("worker section round-trips")
+            .pool
+            .admission;
+        assert_eq!(admission.max_per_subject, None);
+        assert_eq!(admission.max_per_group, None);
+    }
+
+    #[test]
     fn test_generation_config_defaults() {
         let config = GenerationConfig::default();
 

@@ -641,6 +641,16 @@ mod tests {
         Subject::anonymous()
     }
 
+    /// Distinct from `subject()` above: that one is the *VFS caller* passed
+    /// to `ExecMount`'s `Mount` trait methods (anonymous is fine there — this
+    /// projection doesn't itself enforce per-caller authorization). This one
+    /// is the *admission* identity `SandboxPool::acquire` requires (#525 P2)
+    /// — must be non-anonymous, or every `pool.acquire()` call below would
+    /// fail closed.
+    fn admission_subject() -> Subject {
+        Subject::new("test-user")
+    }
+
     #[tokio::test]
     async fn list_instances_empty() {
         let pool = make_pool().await;
@@ -653,7 +663,7 @@ mod tests {
     #[tokio::test]
     async fn list_instances_after_acquire() {
         let pool = make_pool().await;
-        let id = pool.acquire(&PodSandboxConfig::default()).await.unwrap();
+        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
         let mount = ExecMount::new(pool);
 
         let fid = mount.walk(&[], &subject()).await.unwrap();
@@ -674,7 +684,7 @@ mod tests {
     #[tokio::test]
     async fn read_status_reflects_pool_state() {
         let pool = make_pool().await;
-        let id = pool.acquire(&PodSandboxConfig::default()).await.unwrap();
+        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
         let mount = ExecMount::new(pool);
 
         let mut fid = mount.walk(&[&id, "status"], &subject()).await.unwrap();
@@ -687,7 +697,7 @@ mod tests {
     #[tokio::test]
     async fn ctl_stop_invokes_backend() {
         let pool = make_pool().await;
-        let id = pool.acquire(&PodSandboxConfig::default()).await.unwrap();
+        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
         let mount = ExecMount::new(pool);
 
         let mut fid = mount.walk(&[&id, "ctl"], &subject()).await.unwrap();
@@ -703,7 +713,7 @@ mod tests {
     #[tokio::test]
     async fn ctl_unknown_verb_rejected() {
         let pool = make_pool().await;
-        let id = pool.acquire(&PodSandboxConfig::default()).await.unwrap();
+        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
         let mount = ExecMount::new(pool);
 
         let mut fid = mount.walk(&[&id, "ctl"], &subject()).await.unwrap();
@@ -719,7 +729,7 @@ mod tests {
     #[tokio::test]
     async fn exit_blocks_then_unblocks_on_destroy() {
         let pool = make_pool().await;
-        let id = pool.acquire(&PodSandboxConfig::default()).await.unwrap();
+        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
         let mount = Arc::new(ExecMount::new(pool));
 
         let reader = {
@@ -762,7 +772,7 @@ mod tests {
     #[tokio::test]
     async fn exit_after_destroy_reports_terminal() {
         let pool = make_pool().await;
-        let id = pool.acquire(&PodSandboxConfig::default()).await.unwrap();
+        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
         let mount = ExecMount::new(pool);
 
         // Drive destroy through ctl.
@@ -799,7 +809,7 @@ mod tests {
     #[tokio::test]
     async fn ctl_on_terminal_instance_rejected() {
         let pool = make_pool().await;
-        let id = pool.acquire(&PodSandboxConfig::default()).await.unwrap();
+        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
         let mount = ExecMount::new(pool);
 
         let mut ctl_fid = mount.walk(&[&id, "ctl"], &subject()).await.unwrap();
@@ -822,7 +832,7 @@ mod tests {
     #[tokio::test]
     async fn read_ns_returns_placeholder_info() {
         let pool = make_pool().await;
-        let id = pool.acquire(&PodSandboxConfig::default()).await.unwrap();
+        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
         let mount = ExecMount::new(pool);
 
         let mut fid = mount.walk(&[&id, "ns"], &subject()).await.unwrap();
@@ -836,7 +846,7 @@ mod tests {
     #[tokio::test]
     async fn readdir_instance_dir_lists_files() {
         let pool = make_pool().await;
-        let id = pool.acquire(&PodSandboxConfig::default()).await.unwrap();
+        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
         let mount = ExecMount::new(pool);
 
         let fid = mount.walk(&[&id], &subject()).await.unwrap();
@@ -872,7 +882,7 @@ mod tests {
     #[tokio::test]
     async fn ctl_concurrent_writes_to_one_fid_are_safe() {
         let pool = make_pool().await;
-        let id = pool.acquire(&PodSandboxConfig::default()).await.unwrap();
+        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
         let mount = ExecMount::new(pool);
 
         // One shared ctl fid; opened RDWR.

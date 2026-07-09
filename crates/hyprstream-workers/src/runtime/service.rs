@@ -246,8 +246,14 @@ impl WorkerService {
     // ─────────────────────────────────────────────────────────────────────────
 
     /// Create and start a pod sandbox (Kata VM)
-    pub async fn run_pod_sandbox(&self, config: &PodSandboxConfig) -> Result<String> {
-        let sandbox_id = self.sandbox_pool.acquire(config).await?;
+    ///
+    /// `subject` is the cryptographically-verified caller identity (#525 P2
+    /// admission control) — derive it from `ctx.subject()` at the RPC
+    /// dispatch boundary (see `handle_run`), never accept a caller-asserted
+    /// subject as a plain parameter (see the MAC interface policy: "derive,
+    /// don't extend").
+    pub async fn run_pod_sandbox(&self, subject: &hyprstream_vfs::Subject, config: &PodSandboxConfig) -> Result<String> {
+        let sandbox_id = self.sandbox_pool.acquire(subject, config).await?;
         tracing::info!(sandbox_id = %sandbox_id, "Created pod sandbox");
 
         // Publish sandbox started event with structured payload
@@ -1229,8 +1235,11 @@ impl RuntimeHandler for WorkerService {
 
 #[async_trait::async_trait(?Send)]
 impl SandboxHandler for WorkerService {
-    async fn handle_run(&self, _ctx: &EnvelopeContext, _request_id: u64, data: &PodSandboxConfig) -> AnyhowResult<String> {
-        let sandbox_id = self.run_pod_sandbox(data).await?;
+    async fn handle_run(&self, ctx: &EnvelopeContext, _request_id: u64, data: &PodSandboxConfig) -> AnyhowResult<String> {
+        // #525 P2: thread the verified caller identity through to admission
+        // control. `ctx.subject()` is derived from the verified envelope
+        // (signer key / JWT), never caller-asserted data.
+        let sandbox_id = self.run_pod_sandbox(&ctx.subject(), data).await?;
         Ok(sandbox_id)
     }
 
@@ -1504,7 +1513,8 @@ mod tests {
 
         // Create sandbox - this requires cloud-hypervisor and kata runtime directories
         let config = PodSandboxConfig::default();
-        let result = service.run_pod_sandbox(&config).await;
+        let subject = hyprstream_vfs::Subject::new("test-user");
+        let result = service.run_pod_sandbox(&subject, &config).await;
 
         // Skip test if cloud-hypervisor not installed or kata runtime not available
         match &result {
@@ -1546,7 +1556,8 @@ mod tests {
 
         // Create sandbox first - this requires cloud-hypervisor and kata runtime directories
         let sandbox_config = PodSandboxConfig::default();
-        let result = service.run_pod_sandbox(&sandbox_config).await;
+        let subject = hyprstream_vfs::Subject::new("test-user");
+        let result = service.run_pod_sandbox(&subject, &sandbox_config).await;
 
         // Skip test if cloud-hypervisor not installed or kata runtime not available
         match &result {

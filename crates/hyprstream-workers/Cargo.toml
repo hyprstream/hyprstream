@@ -307,6 +307,8 @@ hyprstream-rpc-build = { workspace = true }
 [dev-dependencies]
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
+# F3 (#761) admission-config TOML round-trip regression test.
+toml = "0.8"
 # FS-B0 RAFS bootstrap builder tests: synthesize small OCI layer tarballs.
 tar = "0.4"
 flate2 = "1"

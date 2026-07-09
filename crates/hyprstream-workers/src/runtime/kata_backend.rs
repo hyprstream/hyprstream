@@ -1363,6 +1363,8 @@ mod tests {
             sandbox_path,
             image_id: None,
             console_socket: None,
+            applied_resources: crate::runtime::client::LinuxContainerResources::default(),
+            reservation: None,
         }
     }
 
