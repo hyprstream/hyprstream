@@ -41,6 +41,16 @@ use crate::Subject;
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Did(String);
 
+/// The `did:at9p:` method prefix — the single source of truth for the
+/// self-certifying hybrid-PQC capsule identity (#879/#880). A `did:at9p`
+/// identifier is this prefix followed by the base32 CIDv1 (`cid512`) of the
+/// genesis capsule (#884).
+///
+/// Shared by the admission gate (`crate::admission`), this method check
+/// ([`Did::is_did_at9p`]), and the GATE/capsule code in `hyprstream-pds`
+/// (`at9p_gate`) so the literal cannot drift across the three arms (D2/#964).
+pub const DID_AT9P_PREFIX: &str = "did:at9p:";
+
 impl Did {
     /// Wrap a DID string verbatim. **No validation** — strict checks belong at the
     /// admission gate (see the type docs).
@@ -84,7 +94,7 @@ impl Did {
     /// `PqHybrid` key material is epic #880 (D2); the method-dispatched resolver
     /// reserves the arm but does not yet resolve it (fails closed until #894).
     pub fn is_did_at9p(&self) -> bool {
-        self.0.starts_with("did:at9p:")
+        self.0.starts_with(DID_AT9P_PREFIX)
     }
 
     /// Decode the raw 32-byte Ed25519 public key from a `did:key` identifier.

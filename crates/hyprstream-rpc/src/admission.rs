@@ -62,13 +62,14 @@ use crate::did_web::{
     DidWebResolver,
 };
 use crate::envelope::KeyedPqTrustStore;
+use crate::identity::DID_AT9P_PREFIX;
 use crate::identity_resolver::At9pCapsuleResolver;
 
-/// The `did:at9p:` method prefix; a `did:at9p` identifier is this prefix followed
-/// by the base32 CIDv1 (`cid512`) of the genesis capsule (#884).
-const DID_AT9P_PREFIX: &str = "did:at9p:";
-
 /// Whether `did` is a `did:at9p` identifier (the self-certifying hybrid-PQC arm).
+///
+/// Delegates to the shared [`DID_AT9P_PREFIX`] literal (the single source of
+/// truth shared with [`crate::identity::Did::is_did_at9p`] and `hyprstream-pds`'s
+/// GATE code) so the prefix cannot drift across arms (#964).
 fn is_did_at9p(did: &str) -> bool {
     did.starts_with(DID_AT9P_PREFIX)
 }
@@ -307,7 +308,7 @@ pub async fn admit_key_against_did<R: DidDocResolve>(
         // The capsule's Ed25519 subject key IS the identity; the peer's
         // authenticated channel key must equal it (one trust root, #185 closed
         // by construction for did:at9p).
-        if !key_eq(&verified.ed25519, peer_key.as_bytes()) {
+        if !key_eq(verified.ed25519(), peer_key.as_bytes()) {
             return Err(admission_reject(
                 origin,
                 peer_key,
@@ -318,7 +319,7 @@ pub async fn admit_key_against_did<R: DidDocResolve>(
         }
         // Atomic hybrid binding from the verified capsule — replaces the
         // out-of-band `mesh_peers` config path for did:at9p peers (#894).
-        ctx.pq_store.bind(verified.ed25519, &verified.ml_dsa_65);
+        ctx.pq_store.bind(*verified.ed25519(), verified.ml_dsa_65());
         return Ok(AdmittedIdentity {
             origin: origin.to_owned(),
             did: Some(did.to_owned()),
@@ -738,7 +739,7 @@ mod tests {
 
     fn verified_subject(ed: [u8; 32]) -> VerifiedAt9pKeys {
         let (_sk, vk) = ml_dsa_generate_keypair();
-        VerifiedAt9pKeys { ed25519: ed, ml_dsa_65: vk }
+        VerifiedAt9pKeys::new_gate_verified(ed, vk)
     }
 
     #[tokio::test]
@@ -771,7 +772,7 @@ mod tests {
         let bound = store
             .ml_dsa_key_for(&ed)
             .expect("ed25519→ml_dsa_65 bound");
-        assert_eq!(ml_dsa_vk_bytes(&bound), ml_dsa_vk_bytes(&keys.ml_dsa_65));
+        assert_eq!(ml_dsa_vk_bytes(&bound), ml_dsa_vk_bytes(keys.ml_dsa_65()));
     }
 
     #[tokio::test]

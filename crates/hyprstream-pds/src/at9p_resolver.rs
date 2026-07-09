@@ -70,7 +70,7 @@ impl At9pCapsuleResolver for At9pGateResolver {
 
         let ml_dsa_65 = ml_dsa_vk_from_bytes(&subject.mldsa65_pub)?;
 
-        Ok(VerifiedAt9pKeys { ed25519, ml_dsa_65 })
+        Ok(VerifiedAt9pKeys::new_gate_verified(ed25519, ml_dsa_65))
     }
 
     fn resolve(&self, did: &str) -> Result<VerifiedAt9pKeys> {
@@ -151,8 +151,8 @@ mod tests {
         let (capsule, bytes, did) = signed(1);
         let primary = capsule.body.subject_keys[0].clone();
         let verified = At9pGateResolver::new().verify_bytes(&did, &bytes).expect("GATE passes");
-        assert_eq!(verified.ed25519.as_slice(), primary.ed25519_pub);
-        assert_eq!(ml_dsa_vk_bytes(&verified.ml_dsa_65), primary.mldsa65_pub);
+        assert_eq!(verified.ed25519().as_slice(), primary.ed25519_pub);
+        assert_eq!(ml_dsa_vk_bytes(verified.ml_dsa_65()), primary.mldsa65_pub);
     }
 
     #[test]
