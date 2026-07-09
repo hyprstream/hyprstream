@@ -285,6 +285,43 @@ mod tests {
     }
 
     #[test]
+    fn test_worker_config_toml_roundtrips_at_defaults() -> Result<(), Box<dyn std::error::Error>> {
+        // F3 regression: the default `AdmissionConfig` used to set
+        // `max_per_subject`/`max_per_group` to `usize::MAX`, which is not a
+        // valid TOML i64 — `toml::to_string_pretty` errored, breaking any
+        // `Config::save()` that included a `[worker]` section. The unlimited
+        // quotas are now `Option<usize>` serialized as *absent*, so a default
+        // config must round-trip through TOML cleanly.
+        let config = WorkerConfig::default();
+        let toml_str = toml::to_string_pretty(&config)?;
+        // Unlimited quotas serialize as absent, never as a giant sentinel int.
+        assert!(
+            !toml_str.contains("max_per_subject"),
+            "unlimited per-subject quota must serialize as absent, got:\n{toml_str}"
+        );
+        assert!(!toml_str.contains("max_per_group"));
+        let parsed: WorkerConfig = toml::from_str(&toml_str)?;
+        assert_eq!(parsed.pool.admission.max_per_subject, None);
+        assert_eq!(parsed.pool.admission.max_per_group, None);
+        assert_eq!(parsed.pool.max_sandboxes, config.pool.max_sandboxes);
+        Ok(())
+    }
+
+    #[test]
+    fn test_worker_config_toml_roundtrips_with_explicit_quotas(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // A set quota must round-trip as a normal integer.
+        let mut config = WorkerConfig::default();
+        config.pool.admission.max_per_subject = Some(4);
+        config.pool.admission.max_per_group = Some(16);
+        let toml_str = toml::to_string_pretty(&config)?;
+        let parsed: WorkerConfig = toml::from_str(&toml_str)?;
+        assert_eq!(parsed.pool.admission.max_per_subject, Some(4));
+        assert_eq!(parsed.pool.admission.max_per_group, Some(16));
+        Ok(())
+    }
+
+    #[test]
     fn test_hypervisor_type_serialization() -> Result<(), Box<dyn std::error::Error>> {
         // Test default (cloud-hypervisor)
         let config = PoolConfig::default();

@@ -129,8 +129,11 @@ impl SandboxPool {
     /// the distinct failure modes.
     pub async fn acquire(self: &Arc<Self>, subject: &Subject, config: &PodSandboxConfig) -> Result<String> {
         let demand = admission::derive_demand(config);
-        let group = admission::derive_group(config);
-        let reservation = self.admission.reserve(subject, group.as_deref(), demand).await?;
+        let group_selector = admission::derive_group_selector(config);
+        let reservation = self
+            .admission
+            .reserve(subject, group_selector.as_deref(), demand)
+            .await?;
 
         let obtained = self.obtain_sandbox(config).await;
         let mut sandbox = match obtained {
@@ -180,7 +183,23 @@ impl SandboxPool {
                     sandbox_id = %sandbox.id,
                     "warm sandbox resource mismatch on reuse — resizing (#519)"
                 );
-                self.backend.update_resources(&sandbox, &requested).await?;
+                // F2: this sandbox has already been popped off `warm_pool`, so
+                // if the resize fails the value is about to be dropped and its
+                // VM/container would be orphaned (still running, owned by
+                // nobody, warm pool permanently shrunk). Best-effort destroy it
+                // — its actual size is now unknown/untrusted — before
+                // propagating. `acquire` rolls back the admission reservation
+                // on the returned error, so capacity/quota are not leaked.
+                if let Err(resize_err) = self.backend.update_resources(&sandbox, &requested).await {
+                    if let Err(destroy_err) = self.backend.destroy(&sandbox).await {
+                        tracing::warn!(
+                            sandbox_id = %sandbox.id,
+                            error = %destroy_err,
+                            "failed to destroy warm sandbox after resize failure — possible orphan"
+                        );
+                    }
+                    return Err(resize_err);
+                }
                 sandbox.applied_resources = requested;
             }
             Ok(sandbox)
@@ -199,16 +218,40 @@ impl SandboxPool {
             .ok_or_else(|| WorkerError::SandboxNotFound(sandbox_id.to_owned()))?;
         drop(active);
 
-        // Give back the admission reservation (capacity + per-Subject/group
-        // quota + resource dimensions) this sandbox was holding, waking any
-        // queued waiters. Sandboxes with no reservation (e.g. constructed
-        // outside `acquire`) have nothing to give back.
-        if let Some(reservation) = sandbox.reservation.clone() {
-            self.admission.release(&reservation).await;
+        // F5: give back the admission reservation only *after* the sandbox's
+        // resources are actually released, i.e. after `stop` succeeds. Waking a
+        // queued waiter before `stop` completes would let it cold-create while
+        // this sandbox's VM is still physically holding cpu/memory/GPU —
+        // transiently over-committing the envelope (`max_sandboxes + 1`). On
+        // stop failure, best-effort destroy so we don't orphan the sandbox
+        // (mirroring the shutdown path's tolerance), then still release the
+        // reservation so capacity/quota aren't permanently leaked, and
+        // propagate the error.
+        let release_reservation = || async {
+            if let Some(reservation) = sandbox.reservation.clone() {
+                self.admission.release(&reservation).await;
+            }
+        };
+
+        if let Err(stop_err) = self.backend.stop(&sandbox).await {
+            tracing::warn!(
+                sandbox_id = %sandbox.id,
+                error = %stop_err,
+                "stop failed on release — destroying sandbox to avoid an orphan"
+            );
+            if let Err(destroy_err) = self.backend.destroy(&sandbox).await {
+                tracing::warn!(
+                    sandbox_id = %sandbox.id,
+                    error = %destroy_err,
+                    "destroy also failed after stop failure — possible orphan"
+                );
+            }
+            release_reservation().await;
+            return Err(stop_err);
         }
 
-        // Stop the sandbox
-        self.backend.stop(&sandbox).await?;
+        // Stop succeeded — the resource envelope is genuinely free now.
+        release_reservation().await;
 
         // Decide whether to return to warm pool or destroy
         let warm = self.warm_pool.lock().await;
@@ -538,6 +581,7 @@ mod admission_tests {
     use parking_lot::Mutex as StdMutex;
     use std::any::Any;
     use std::collections::HashMap as StdHashMap;
+    use std::sync::atomic::AtomicBool as StdAtomicBool;
     use std::sync::atomic::AtomicUsize as StdAtomicUsize;
 
     #[derive(Debug)]
@@ -559,12 +603,21 @@ mod admission_tests {
         current: StdAtomicUsize,
         peak: StdAtomicUsize,
         applied: StdMutex<StdHashMap<String, LinuxContainerResources>>,
+        /// When set, `update_resources` fails (F2 resize-leak test).
+        fail_resize: StdAtomicBool,
+        /// When set, `stop` fails (F5 release-ordering test).
+        fail_stop: StdAtomicBool,
+        /// Ids passed to `destroy`, in call order (F2/F5 orphan-avoidance).
+        destroyed: StdMutex<Vec<String>>,
     }
 
     impl FakeBackend {
         fn bump(&self) {
             let cur = self.current.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(cur, Ordering::SeqCst);
+        }
+        fn was_destroyed(&self, id: &str) -> bool {
+            self.destroyed.lock().iter().any(|d| d == id)
         }
     }
 
@@ -590,10 +643,18 @@ mod admission_tests {
             Ok(Arc::new(FakeHandle))
         }
         async fn stop(&self, _sandbox: &PodSandbox) -> Result<()> {
+            if self.fail_stop.load(Ordering::SeqCst) {
+                // Did not stop → do not decrement the live count.
+                return Err(WorkerError::SandboxTimeout {
+                    operation: "stop".to_owned(),
+                    timeout_secs: 0,
+                });
+            }
             self.current.fetch_sub(1, Ordering::SeqCst);
             Ok(())
         }
-        async fn destroy(&self, _sandbox: &PodSandbox) -> Result<()> {
+        async fn destroy(&self, sandbox: &PodSandbox) -> Result<()> {
+            self.destroyed.lock().push(sandbox.id.clone());
             Ok(())
         }
         async fn reset(&self, _sandbox: &mut PodSandbox) -> Result<bool> {
@@ -620,6 +681,12 @@ mod admission_tests {
             sandbox: &PodSandbox,
             resources: &LinuxContainerResources,
         ) -> Result<()> {
+            if self.fail_resize.load(Ordering::SeqCst) {
+                return Err(WorkerError::SandboxTimeout {
+                    operation: "update_resources".to_owned(),
+                    timeout_secs: 0,
+                });
+            }
             self.applied.lock().insert(sandbox.id.clone(), resources.clone());
             Ok(())
         }
@@ -688,7 +755,7 @@ mod admission_tests {
 
     #[tokio::test]
     async fn per_subject_quota_rejects_over_quota_caller() {
-        let cfg = crate::runtime::AdmissionConfig { max_per_subject: 1, ..Default::default() };
+        let cfg = crate::runtime::AdmissionConfig { max_per_subject: Some(1), ..Default::default() };
         let (pool, _fake) = make_pool_with_admission(10, 0, cfg);
         let alice = Subject::new("alice");
         let sandbox_config = PodSandboxConfig::default();
@@ -711,9 +778,15 @@ mod admission_tests {
             .push(KeyValue { key: crate::runtime::ANN_GPU_REQUEST.to_owned(), value: "1".to_owned() });
 
         // No GPU capacity declared → fail-closed reject, never a silent
-        // CPU-only placement.
+        // CPU-only placement. F1: this is *infeasible* (exceeds the node total),
+        // so it must reject immediately rather than queue out the timeout.
+        let start = std::time::Instant::now();
         let err = pool.acquire(&subject, &sandbox_config).await.unwrap_err();
-        assert!(matches!(err, WorkerError::QueueFull { .. } | WorkerError::QueueTimeout { .. }), "got: {err:?}");
+        assert!(matches!(err, WorkerError::AdmissionInfeasible { .. }), "got: {err:?}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "infeasible GPU request must reject immediately, not wait the queue timeout"
+        );
     }
 
     #[tokio::test]
@@ -760,8 +833,11 @@ mod admission_tests {
         let mut sandbox_config = PodSandboxConfig::default();
         sandbox_config.linux.resources.memory_limit_in_bytes = 512 * 1024 * 1024; // exceeds declared 256Mi
 
+        // F1: demand above the declared *total* is infeasible (no release can
+        // ever satisfy it), so it rejects immediately rather than queueing —
+        // still never a silent placement.
         let err = pool.acquire(&subject, &sandbox_config).await.unwrap_err();
-        assert!(matches!(err, WorkerError::QueueFull { .. }), "got: {err:?}");
+        assert!(matches!(err, WorkerError::AdmissionInfeasible { .. }), "got: {err:?}");
     }
 
     // ── #519 regression: warm-sandbox reuse must resize, never silently
@@ -879,5 +955,73 @@ mod admission_tests {
             .expect("queued waiter should be woken well within 2s")
             .expect("task must not panic");
         assert!(result.is_ok(), "queued request should be admitted once capacity frees: {result:?}");
+    }
+
+    // ── F2: resize failure must not orphan the popped warm sandbox ─────────
+
+    #[tokio::test]
+    async fn resize_failure_destroys_warm_sandbox_and_rolls_back_reservation() {
+        // queue_capacity 0 so any leaked reservation shows up as an immediate
+        // QueueFull on the follow-up acquire.
+        let cfg = crate::runtime::AdmissionConfig { queue_capacity: 0, ..Default::default() };
+        let (pool, fake) = make_pool_with_admission(1, 1, cfg);
+        pool.initialize().await.expect("prewarm one sandbox");
+        assert_eq!(pool.stats().await.warm_count, 1);
+
+        fake.fail_resize.store(true, Ordering::SeqCst);
+
+        let subject = Subject::new("alice");
+        let mut sandbox_config = PodSandboxConfig::default();
+        // Force a mismatch vs the warm sandbox's default (all-zero) resources so
+        // the #519 resize path runs — and fails.
+        sandbox_config.linux.resources.memory_limit_in_bytes = 256 * 1024 * 1024;
+
+        let err = pool.acquire(&subject, &sandbox_config).await.unwrap_err();
+        assert!(matches!(err, WorkerError::SandboxTimeout { .. }), "resize error propagates: {err:?}");
+        // The popped warm sandbox must be destroyed, not orphaned.
+        assert!(
+            !fake.destroyed.lock().is_empty(),
+            "warm sandbox must be destroyed on resize failure (no orphan)"
+        );
+        assert_eq!(pool.stats().await.active_count, 0, "no active-sandbox leak");
+
+        // Reservation rolled back: a fresh cold acquire fits the single slot.
+        fake.fail_resize.store(false, Ordering::SeqCst);
+        let id = pool
+            .acquire(&subject, &PodSandboxConfig::default())
+            .await
+            .expect("capacity/quota must have been rolled back after resize failure");
+        assert!(pool.get(&id).await.is_some());
+    }
+
+    // ── F5: stop failure on release must not orphan / over-commit ──────────
+
+    #[tokio::test]
+    async fn stop_failure_on_release_destroys_sandbox_and_still_frees_reservation() {
+        let cfg = crate::runtime::AdmissionConfig { queue_capacity: 0, ..Default::default() };
+        let (pool, fake) = make_pool_with_admission(1, 0, cfg);
+        let subject = Subject::new("alice");
+        let id = pool
+            .acquire(&subject, &PodSandboxConfig::default())
+            .await
+            .expect("acquire");
+
+        fake.fail_stop.store(true, Ordering::SeqCst);
+        let err = pool.release(&id).await.unwrap_err();
+        assert!(matches!(err, WorkerError::SandboxTimeout { .. }), "stop error propagates: {err:?}");
+        // Orphan avoided: a destroy was attempted after the stop failure.
+        assert!(
+            fake.was_destroyed(&id),
+            "sandbox must be destroyed after stop failure to avoid an orphan"
+        );
+
+        // The reservation is still freed (only after the stop attempt), so
+        // capacity recovers — a leak would make the next acquire QueueFull.
+        fake.fail_stop.store(false, Ordering::SeqCst);
+        let id2 = pool
+            .acquire(&subject, &PodSandboxConfig::default())
+            .await
+            .expect("reservation must be freed even when stop fails");
+        assert!(pool.get(&id2).await.is_some());
     }
 }

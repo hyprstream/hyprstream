@@ -50,6 +50,14 @@ pub enum WorkerError {
     #[error("Admission queue wait timed out after {timeout_secs}s")]
     QueueTimeout { timeout_secs: u64 },
 
+    /// Demand exceeds this node's *configured totals* (e.g. a GPU request on a
+    /// node that declares no GPU capacity, or memory above the declared total)
+    /// — no release can ever satisfy it. Rejected immediately rather than
+    /// queued, so callers can distinguish "never fits here" from "busy right
+    /// now" (`QueueTimeout`).
+    #[error("Admission infeasible: {reason}")]
+    AdmissionInfeasible { reason: String },
+
     // ─────────────────────────────────────────────────────────────────────
     // VM Errors
     // ─────────────────────────────────────────────────────────────────────

@@ -31,20 +31,30 @@
 //!    Full Casbin-backed quota configuration (e.g. deriving `max_per_subject`
 //!    from a Casbin role/policy rather than a flat config value) is a
 //!    follow-up.
-//! 2. **"Group" identity**: there is no first-class "group" claim on
-//!    [`hyprstream_rpc::auth::Claims`] today. `derive_group` reads it from a
-//!    plain annotation (`hyprstream.io/group`) on the request rather than
-//!    inventing a new capnp field or claim — deliberately, to avoid a
-//!    wire-format change here. This is a placeholder pending a real
-//!    tenant/group model.
-//! 3. **Wait-queue fairness**: the queue is a single bounded FIFO-ish
-//!    structure (all waiters are woken on every release and re-race for the
-//!    lock), *not* the per-Subject/per-group fair sub-queue + weighted-
-//!    round-robin the issue's design note describes. Quota-rejected requests
-//!    never queue (they fail fast), which limits one noisy Subject's ability
-//!    to starve others out of the *quota* axis, but the *capacity* wait queue
-//!    itself has no per-key fairness weighting. Flagged as a scope-down, not
-//!    a silent omission.
+//! 2. **"Group" derivation (B′, ratified in #921 decision 5)**: the group is
+//!    derived from the **verified [`Subject`], never trusted from the
+//!    annotation**. The `hyprstream.io/group` annotation is only a *selector*
+//!    among groups the Subject provably belongs to; a
+//!    [`GroupSelectorValidator`] resolves it against the authoritative
+//!    membership source (the bidirectional-consent placement group,
+//!    `ai.hyprstream.placement.{group,groupItem}` / `PlacementIndex::is_member`).
+//!    A selector naming a group the Subject is not a member of is **rejected**;
+//!    an absent selector means **no group partition** (never a quota bypass).
+//!    The default [`DenyUnknownGroupValidator`] is fail-closed: it denies every
+//!    non-empty selector until a membership-backed validator is wired, so an
+//!    unverified group can never partition capacity. See point 3 for what the
+//!    counter itself means.
+//! 3. **Wait-queue fairness**: the queue is a single bounded **FIFO** — new
+//!    arrivals never barge past a non-empty queue, and each release hands
+//!    capacity to the queue *head* (rather than waking all waiters to
+//!    thundering-herd re-race). This eliminates the starvation the blocking
+//!    review flagged (a queued waiter losing every re-race under sustained
+//!    arrival). The tradeoff is **head-of-line blocking**: a large demand at
+//!    the head can block a smaller demand behind it even when capacity for the
+//!    smaller one exists. That is the conservative choice; a per-Subject/
+//!    per-group fair sub-queue + weighted round-robin is the documented (not
+//!    implemented) follow-up. Quota- and infeasibility-rejected requests never
+//!    queue (they fail fast).
 //! 4. **GPU/resource vocabulary**: cpu/memory/GPU demand is read from
 //!    `config.linux.resources` (existing CRI-shaped fields) plus a new,
 //!    separate annotation `hyprstream.io/gpu-request` (a plain integer count,
@@ -52,10 +62,11 @@
 //!    `hyprstream.io/gpu` passthrough annotation consumed by `oci_backend`/
 //!    `nspawn`. The two are intentionally not unified in this change; see the
 //!    module docs on `pool.rs` for the full rationale.
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::Instant;
@@ -72,8 +83,12 @@ use super::client::{KeyValue, PodSandboxConfig};
 /// boolean `hyprstream.io/gpu` passthrough flag — see module docs, point 4.
 pub const ANN_GPU_REQUEST: &str = "hyprstream.io/gpu-request";
 
-/// Annotation key: the admission "group" this request belongs to (#525
-/// placeholder for a real tenant/group claim — see module docs, point 2).
+/// Annotation key: the group *selector* for this request (B′, #921 decision
+/// 5). This is **not** a trusted group claim — it only names which of the
+/// groups the verified [`Subject`] *provably belongs to* this request should
+/// be partitioned under. A [`GroupSelectorValidator`] resolves it against the
+/// authoritative membership source; a selector the Subject is not a member of
+/// is rejected. See module docs, point 2.
 pub const ANN_GROUP: &str = "hyprstream.io/group";
 
 fn annotation<'a>(annotations: &'a [KeyValue], key: &str) -> Option<&'a str> {
@@ -117,9 +132,12 @@ pub fn derive_demand(config: &PodSandboxConfig) -> Demand {
     }
 }
 
-/// Derive the admission "group" key for a request, if any (see module docs,
-/// point 2).
-pub fn derive_group(config: &PodSandboxConfig) -> Option<String> {
+/// Derive the group *selector* for a request, if any (the raw
+/// `hyprstream.io/group` annotation). This is an **untrusted** selector, not
+/// an authoritative group: it must be validated against the verified Subject's
+/// membership by a [`GroupSelectorValidator`] before it can partition capacity
+/// (B′ — see module docs, point 2).
+pub fn derive_group_selector(config: &PodSandboxConfig) -> Option<String> {
     annotation(&config.annotations, ANN_GROUP).map(str::to_owned)
 }
 
@@ -138,11 +156,25 @@ pub fn derive_group(config: &PodSandboxConfig) -> Option<String> {
 #[serde(default)]
 pub struct AdmissionConfig {
     /// Maximum concurrently-active sandboxes for a single Subject.
-    /// Default: unconstrained (`usize::MAX`).
-    pub max_per_subject: usize,
+    /// `None` (default) = unconstrained.
+    ///
+    /// Serialized as *absent* when unlimited (rather than a sentinel like
+    /// `usize::MAX`, which is not representable as a TOML i64 and would break
+    /// `Config::save()`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_per_subject: Option<usize>,
     /// Maximum concurrently-active sandboxes for a single group (see
-    /// [`derive_group`]). Default: unconstrained (`usize::MAX`).
-    pub max_per_group: usize,
+    /// [`derive_group_selector`]). `None` (default) = unconstrained.
+    ///
+    /// This counter is **node-local capacity partitioning** — a fairness /
+    /// organization mechanism, *not* a trust or billing boundary. The
+    /// authoritative quota is the ledger/capability path (#922/#925: verify
+    /// presented grant → debit cell ledger → emit receipt), which this module
+    /// deliberately does **not** implement. See module docs, point 2.
+    ///
+    /// Serialized as *absent* when unlimited (see [`Self::max_per_subject`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_per_group: Option<usize>,
     /// Bound on the number of callers allowed to wait in the admission queue
     /// at once. A request that would exceed this is rejected immediately
     /// (`QueueFull`) rather than queued.
@@ -167,8 +199,8 @@ pub struct AdmissionConfig {
 impl Default for AdmissionConfig {
     fn default() -> Self {
         Self {
-            max_per_subject: usize::MAX,
-            max_per_group: usize::MAX,
+            max_per_subject: None,
+            max_per_group: None,
             queue_capacity: 64,
             queue_timeout_secs: 30,
             cpu_millis_total: None,
@@ -191,7 +223,7 @@ pub struct ReservationRecord {
 /// `filter → rank → select` pipeline (see module docs on GPU/resource
 /// vocabulary). In the single-node/solo case this is the *only* candidate;
 /// the extension point for cross-node placement is `rank_by` in
-/// [`fit_report`] — feeding `queryCandidates` results in as additional
+/// [`fit_over_local_candidate`] — feeding `queryCandidates` results in as additional
 /// candidates here (with a real least-loaded/best-fit `rank_by`) is P2's
 /// documented (not implemented) cross-node extension.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,16 +322,22 @@ struct AdmissionState {
     cpu_millis_reserved: u64,
     memory_bytes_reserved: u64,
     gpu_reserved: usize,
-    /// Bounded wait-queue. On any release, every waiter here is woken and
-    /// re-races to retry admission under the lock (see module docs, sign-off
-    /// point 3, on why this is not a per-key fair sub-queue).
+    /// Bounded **FIFO** wait-queue. A release hands capacity to the *head*
+    /// (front) only; a new arrival never barges past a non-empty queue. See
+    /// module docs, point 3, for the head-of-line-blocking tradeoff and why
+    /// this is not yet a per-key fair sub-queue.
     queue: VecDeque<Arc<Notify>>,
 }
 
-/// Why [`try_admit_locked`] refused to admit — distinguishes *quota*
-/// (never queues; retrying won't help until the Subject/group frees up on
-/// its own) from *capacity* (may queue; a release elsewhere can free room).
+/// Why [`try_admit_locked`] refused to admit. Three failure classes with
+/// different queueing semantics:
+/// - `Infeasible`: demand exceeds the node's *configured totals* — no release
+///   can ever satisfy it. Never queues; immediate hard reject.
+/// - `Quota`: the Subject/group is at its per-key ceiling. Never queues;
+///   retrying won't help until that Subject/group frees up on its own.
+/// - `Capacity`: transient — a release elsewhere can free room. May queue.
 enum AdmitReject {
+    Infeasible(String),
     Quota(String),
     Capacity(String),
 }
@@ -317,21 +355,55 @@ fn try_admit_locked(
     cfg: &AdmissionConfig,
     max_sandboxes: usize,
 ) -> std::result::Result<(), AdmitReject> {
-    // ── Quota checks first: fail-closed, never queue ──
-    let subj_count = *state.active_by_subject.get(subject_key).unwrap_or(&0);
-    if subj_count >= cfg.max_per_subject {
-        return Err(AdmitReject::Quota(format!(
-            "subject '{subject_key}' at quota ({subj_count}/{})",
-            cfg.max_per_subject
+    // ── Feasibility first: demand exceeding the configured TOTALS (not just
+    //    the currently-free amount) can never be satisfied by any release, so
+    //    it must reject immediately rather than burn the whole queue_timeout.
+    //    Checked independently of `*_reserved`. ──
+    if max_sandboxes == 0 {
+        return Err(AdmitReject::Infeasible(
+            "pool declares zero schedulable capacity (max_sandboxes = 0)".to_owned(),
+        ));
+    }
+    if let Some(total) = cfg.cpu_millis_total {
+        if demand.cpu_millis > total {
+            return Err(AdmitReject::Infeasible(format!(
+                "cpu demand {}m exceeds node total {total}m",
+                demand.cpu_millis
+            )));
+        }
+    }
+    if let Some(total) = cfg.memory_bytes_total {
+        if demand.memory_bytes > total {
+            return Err(AdmitReject::Infeasible(format!(
+                "memory demand {} bytes exceeds node total {total} bytes",
+                demand.memory_bytes
+            )));
+        }
+    }
+    if demand.gpu > cfg.gpu_total {
+        return Err(AdmitReject::Infeasible(format!(
+            "gpu demand {} exceeds node total {}",
+            demand.gpu, cfg.gpu_total
         )));
     }
-    if let Some(g) = group_key {
-        let gcount = *state.active_by_group.get(g).unwrap_or(&0);
-        if gcount >= cfg.max_per_group {
+
+    // ── Quota checks: fail-closed, never queue ──
+    if let Some(max) = cfg.max_per_subject {
+        let subj_count = *state.active_by_subject.get(subject_key).unwrap_or(&0);
+        if subj_count >= max {
             return Err(AdmitReject::Quota(format!(
-                "group '{g}' at quota ({gcount}/{})",
-                cfg.max_per_group
+                "subject '{subject_key}' at quota ({subj_count}/{max})"
             )));
+        }
+    }
+    if let Some(g) = group_key {
+        if let Some(max) = cfg.max_per_group {
+            let gcount = *state.active_by_group.get(g).unwrap_or(&0);
+            if gcount >= max {
+                return Err(AdmitReject::Quota(format!(
+                    "group '{g}' at quota ({gcount}/{max})"
+                )));
+            }
         }
     }
 
@@ -370,6 +442,16 @@ fn try_admit_locked(
     Ok(())
 }
 
+/// Wake the current FIFO head (if any) so it retries admission. `Notify`
+/// stores one permit if the head isn't yet awaiting, so this never loses a
+/// wakeup. Idempotent-ish: a spurious extra wake just makes the head re-check
+/// under the lock.
+fn wake_head(state: &AdmissionState) {
+    if let Some(head) = state.queue.front() {
+        head.notify_one();
+    }
+}
+
 fn release_locked(state: &mut AdmissionState, record: &ReservationRecord) {
     state.active_total = state.active_total.saturating_sub(1);
     if let Some(c) = state.active_by_subject.get_mut(&record.subject) {
@@ -395,30 +477,165 @@ fn release_locked(state: &mut AdmissionState, record: &ReservationRecord) {
     state.gpu_reserved = state.gpu_reserved.saturating_sub(record.demand.gpu);
 }
 
+/// Resolves an untrusted group *selector* against the verified [`Subject`]'s
+/// membership (B′, ratified in #921 decision 5).
+///
+/// The group is **never** trusted from the annotation. The annotation is only
+/// a selector naming which of the groups the Subject *provably belongs to* a
+/// request should be partitioned under. This trait is the seam that resolves
+/// that selector against the authoritative membership source — the
+/// bidirectional-consent placement group
+/// (`ai.hyprstream.placement.{group,groupItem}` / `PlacementIndex::is_member`,
+/// in `hyprstream-pds`/`hyprstream-discovery`).
+///
+/// # Fail-closed
+///
+/// The default impl ([`DenyUnknownGroupValidator`]) denies **every** non-empty
+/// selector, so a pool constructed without an explicit membership-backed
+/// validator can never partition capacity by an unverified group. Wire a
+/// real membership-source-backed impl at construction (where the discovery /
+/// PDS client is available) to enable group partitioning.
+///
+/// Returning `Ok(None)` for an absent selector means **no group partition** —
+/// never a quota bypass.
+#[async_trait]
+pub trait GroupSelectorValidator: Send + Sync + std::fmt::Debug {
+    /// Resolve `selector` for `subject`:
+    /// - `Ok(None)` — no selector present → no group partition.
+    /// - `Ok(Some(group))` — selector validated: `subject` is a consented
+    ///   member of `group`, which becomes the authoritative partition key.
+    /// - `Err(_)` — selector present but `subject` is not a member → reject.
+    async fn validate(&self, subject: &Subject, selector: Option<&str>)
+        -> Result<Option<String>>;
+}
+
+/// Fail-closed default [`GroupSelectorValidator`]: denies every non-empty
+/// group selector (no membership source is wired), permits the absent-selector
+/// (no-partition) case. This is the production default until a real
+/// membership-backed validator is wired — an unverified group can never
+/// partition capacity.
+#[derive(Debug, Default)]
+pub struct DenyUnknownGroupValidator;
+
+#[async_trait]
+impl GroupSelectorValidator for DenyUnknownGroupValidator {
+    async fn validate(
+        &self,
+        _subject: &Subject,
+        selector: Option<&str>,
+    ) -> Result<Option<String>> {
+        match selector {
+            None => Ok(None),
+            Some(sel) => Err(WorkerError::AdmissionDenied {
+                reason: format!(
+                    "group selector '{sel}' cannot be verified: no membership source wired (fail-closed, B′)"
+                ),
+            }),
+        }
+    }
+}
+
+/// Reference [`GroupSelectorValidator`] backed by a static in-memory
+/// membership set (group → member Subject keys). Models the authoritative
+/// bidirectional-consent membership fact without the PDS/discovery plumbing;
+/// a production deployment wires an `is_member`-backed impl instead.
+#[derive(Debug, Default)]
+pub struct StaticGroupMembership {
+    members: HashMap<String, HashSet<String>>,
+}
+
+impl StaticGroupMembership {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that `subject` is a consented member of `group`.
+    pub fn with_member(mut self, group: &str, subject: &str) -> Self {
+        self.members
+            .entry(group.to_owned())
+            .or_default()
+            .insert(subject.to_owned());
+        self
+    }
+}
+
+#[async_trait]
+impl GroupSelectorValidator for StaticGroupMembership {
+    async fn validate(
+        &self,
+        subject: &Subject,
+        selector: Option<&str>,
+    ) -> Result<Option<String>> {
+        match selector {
+            None => Ok(None),
+            Some(sel) => {
+                let subj = subject.name().unwrap_or("");
+                if self.members.get(sel).is_some_and(|m| m.contains(subj)) {
+                    Ok(Some(sel.to_owned()))
+                } else {
+                    Err(WorkerError::AdmissionDenied {
+                        reason: format!(
+                            "subject '{subj}' is not a consented member of group '{sel}'"
+                        ),
+                    })
+                }
+            }
+        }
+    }
+}
+
 /// Admission decision engine backing `SandboxPool::acquire` (#525 P2).
 #[derive(Debug)]
 pub struct AdmissionTracker {
     state: Mutex<AdmissionState>,
     config: AdmissionConfig,
     max_sandboxes: usize,
+    group_validator: Arc<dyn GroupSelectorValidator>,
 }
 
 impl AdmissionTracker {
+    /// Construct with the fail-closed [`DenyUnknownGroupValidator`] — the
+    /// production default until a membership-backed validator is wired
+    /// (any group selector is rejected; the no-selector case is unaffected).
     pub fn new(config: AdmissionConfig, max_sandboxes: usize) -> Self {
+        Self::with_group_validator(
+            config,
+            max_sandboxes,
+            Arc::new(DenyUnknownGroupValidator),
+        )
+    }
+
+    /// Construct with an explicit [`GroupSelectorValidator`] (e.g. one backed
+    /// by a real membership source, or a test double).
+    pub fn with_group_validator(
+        config: AdmissionConfig,
+        max_sandboxes: usize,
+        group_validator: Arc<dyn GroupSelectorValidator>,
+    ) -> Self {
         Self {
             state: Mutex::new(AdmissionState::default()),
             config,
             max_sandboxes,
+            group_validator,
         }
     }
 
-    /// Reserve capacity for `(subject, group, demand)`, fail-closed on
-    /// unauthenticated callers, queueing (bounded) when only *capacity* (not
-    /// quota) blocks admission.
+    /// Reserve capacity for `(subject, group_selector, demand)`, fail-closed on
+    /// unauthenticated callers, queueing (bounded, **FIFO**) when only
+    /// *capacity* (not quota/infeasibility) blocks admission.
+    ///
+    /// `group_selector` is the untrusted `hyprstream.io/group` annotation; it
+    /// is resolved against the verified Subject's membership by the configured
+    /// [`GroupSelectorValidator`] (B′). A selector the Subject is not a member
+    /// of is rejected; an absent selector means no group partition.
+    ///
+    /// FIFO (F4): a new arrival never barges past a non-empty queue, and each
+    /// release hands capacity to the queue head. See module docs, point 3, for
+    /// the head-of-line-blocking tradeoff.
     pub async fn reserve(
         &self,
         subject: &Subject,
-        group: Option<&str>,
+        group_selector: Option<&str>,
         demand: Demand,
     ) -> Result<ReservationRecord> {
         // Fail-closed identity: no verified Subject → reject before any
@@ -431,58 +648,118 @@ impl AdmissionTracker {
             });
         }
         let subject_key = subject.name().unwrap_or("").to_owned();
+
+        // B′: derive the authoritative group from the verified Subject, never
+        // trust the annotation. Rejects a selector the Subject is not a member
+        // of; `None` means no group partition.
+        let group: Option<String> = self
+            .group_validator
+            .validate(subject, group_selector)
+            .await?;
+        let group_key = group.as_deref();
+
         let deadline = Instant::now() + Duration::from_secs(self.config.queue_timeout_secs);
+        // Our place in the FIFO queue, once we join it. `None` until we first
+        // fail an admission attempt on *capacity* (or find the queue non-empty
+        // ahead of us).
+        let mut ticket: Option<Arc<Notify>> = None;
 
         loop {
-            let ticket = {
-                let mut state = self.state.lock().await;
-                match try_admit_locked(
-                    &mut state,
-                    &subject_key,
-                    group,
-                    demand,
-                    &self.config,
-                    self.max_sandboxes,
-                ) {
-                    Ok(()) => {
-                        return Ok(ReservationRecord {
-                            subject: subject_key,
-                            group: group.map(str::to_owned),
-                            demand,
-                        });
-                    }
-                    Err(AdmitReject::Quota(reason)) => {
-                        return Err(WorkerError::AdmissionDenied { reason });
-                    }
-                    Err(AdmitReject::Capacity(reason)) => {
-                        if state.queue.len() >= self.config.queue_capacity {
-                            return Err(WorkerError::QueueFull {
-                                waiting: state.queue.len(),
-                                bound: self.config.queue_capacity,
-                            });
-                        }
-                        tracing::debug!(subject = %subject_key, reason = %reason, "acquire: queueing for capacity");
-                        let ticket = Arc::new(Notify::new());
-                        state.queue.push_back(ticket.clone());
-                        ticket
-                    }
-                }
-            };
-
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                let mut state = self.state.lock().await;
-                state.queue.retain(|t| !Arc::ptr_eq(t, &ticket));
-                return Err(WorkerError::QueueTimeout {
-                    timeout_secs: self.config.queue_timeout_secs,
-                });
-            }
-            if tokio::time::timeout(remaining, ticket.notified())
-                .await
-                .is_err()
             {
                 let mut state = self.state.lock().await;
-                state.queue.retain(|t| !Arc::ptr_eq(t, &ticket));
+
+                // A caller may attempt admission only if nobody is ahead of it
+                // in the FIFO: it holds the head ticket, or it holds no ticket
+                // and the queue is empty (no barging past waiters — F4).
+                let may_attempt = match &ticket {
+                    Some(t) => state.queue.front().is_some_and(|h| Arc::ptr_eq(h, t)),
+                    None => state.queue.is_empty(),
+                };
+
+                if may_attempt {
+                    match try_admit_locked(
+                        &mut state,
+                        &subject_key,
+                        group_key,
+                        demand,
+                        &self.config,
+                        self.max_sandboxes,
+                    ) {
+                        Ok(()) => {
+                            if ticket.is_some() {
+                                state.queue.pop_front();
+                            }
+                            wake_head(&state);
+                            return Ok(ReservationRecord {
+                                subject: subject_key,
+                                group,
+                                demand,
+                            });
+                        }
+                        Err(AdmitReject::Infeasible(reason)) => {
+                            if ticket.is_some() {
+                                state.queue.pop_front();
+                                wake_head(&state);
+                            }
+                            return Err(WorkerError::AdmissionInfeasible { reason });
+                        }
+                        Err(AdmitReject::Quota(reason)) => {
+                            if ticket.is_some() {
+                                state.queue.pop_front();
+                                wake_head(&state);
+                            }
+                            return Err(WorkerError::AdmissionDenied { reason });
+                        }
+                        Err(AdmitReject::Capacity(reason)) => {
+                            if ticket.is_none() {
+                                if state.queue.len() >= self.config.queue_capacity {
+                                    return Err(WorkerError::QueueFull {
+                                        waiting: state.queue.len(),
+                                        bound: self.config.queue_capacity,
+                                    });
+                                }
+                                tracing::debug!(subject = %subject_key, reason = %reason, "acquire: queueing for capacity (FIFO)");
+                                let t = Arc::new(Notify::new());
+                                state.queue.push_back(t.clone());
+                                ticket = Some(t);
+                            }
+                            // else: we are the head and capacity still isn't
+                            // free — stay queued and wait again.
+                        }
+                    }
+                } else if ticket.is_none() {
+                    // Someone is ahead of us: join the back of the queue
+                    // (bounded) and wait our turn rather than barging.
+                    if state.queue.len() >= self.config.queue_capacity {
+                        return Err(WorkerError::QueueFull {
+                            waiting: state.queue.len(),
+                            bound: self.config.queue_capacity,
+                        });
+                    }
+                    let t = Arc::new(Notify::new());
+                    state.queue.push_back(t.clone());
+                    ticket = Some(t);
+                }
+            }
+
+            // Wait to be handed capacity (or to reach the head), bounded by the
+            // deadline. Every path that falls through to here has set `ticket`;
+            // the `None` arm is unreachable, so re-loop rather than panic.
+            let t = match &ticket {
+                Some(t) => t.clone(),
+                None => continue,
+            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let timed_out = remaining.is_zero()
+                || tokio::time::timeout(remaining, t.notified()).await.is_err();
+            if timed_out {
+                let mut state = self.state.lock().await;
+                let was_head = state.queue.front().is_some_and(|h| Arc::ptr_eq(h, &t));
+                state.queue.retain(|x| !Arc::ptr_eq(x, &t));
+                // If the head gave up, hand its turn to the next waiter.
+                if was_head {
+                    wake_head(&state);
+                }
                 return Err(WorkerError::QueueTimeout {
                     timeout_secs: self.config.queue_timeout_secs,
                 });
@@ -492,16 +769,12 @@ impl AdmissionTracker {
     }
 
     /// Give back a committed reservation (a sandbox using it was released or
-    /// destroyed) and wake queued waiters to retry.
+    /// destroyed) and hand the freed capacity to the FIFO queue head (F4 — no
+    /// thundering-herd re-race).
     pub async fn release(&self, record: &ReservationRecord) {
-        let queue = {
-            let mut state = self.state.lock().await;
-            release_locked(&mut state, record);
-            std::mem::take(&mut state.queue)
-        };
-        for ticket in queue {
-            ticket.notify_one();
-        }
+        let mut state = self.state.lock().await;
+        release_locked(&mut state, record);
+        wake_head(&state);
     }
 
     /// Give back a reservation that was committed but never resulted in a
@@ -551,10 +824,21 @@ mod tests {
         assert!(r.is_ok());
     }
 
+    /// Membership validator with alice + bob both consented members of
+    /// team-a — models the authoritative bidirectional-consent membership
+    /// fact so the group tests exercise quota, not the fail-closed default.
+    fn team_a_membership() -> Arc<dyn GroupSelectorValidator> {
+        Arc::new(
+            StaticGroupMembership::new()
+                .with_member("team-a", "alice")
+                .with_member("team-a", "bob"),
+        )
+    }
+
     #[tokio::test]
     async fn per_subject_quota_rejects_not_queues() {
         let cfg = AdmissionConfig {
-            max_per_subject: 1,
+            max_per_subject: Some(1),
             ..Default::default()
         };
         let tracker = AdmissionTracker::new(cfg, 10);
@@ -571,10 +855,10 @@ mod tests {
     #[tokio::test]
     async fn per_group_quota_rejects_across_subjects() {
         let cfg = AdmissionConfig {
-            max_per_group: 1,
+            max_per_group: Some(1),
             ..Default::default()
         };
-        let tracker = AdmissionTracker::new(cfg, 10);
+        let tracker = AdmissionTracker::with_group_validator(cfg, 10, team_a_membership());
         let r1 = tracker
             .reserve(&Subject::new("alice"), Some("team-a"), demand(0, 0, 0))
             .await;
@@ -585,6 +869,50 @@ mod tests {
         assert!(
             matches!(r2, Err(WorkerError::AdmissionDenied { .. })),
             "got: {r2:?}"
+        );
+    }
+
+    // ── B′: group is derived from the verified Subject, never trusted from
+    //    the annotation (F6) ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn group_selector_from_non_member_is_rejected() {
+        // Only alice is a member of team-a.
+        let validator = Arc::new(StaticGroupMembership::new().with_member("team-a", "alice"));
+        let tracker =
+            AdmissionTracker::with_group_validator(AdmissionConfig::default(), 10, validator);
+        // A member's selector validates and partitions.
+        let r_alice = tracker
+            .reserve(&Subject::new("alice"), Some("team-a"), demand(0, 0, 0))
+            .await;
+        assert!(r_alice.is_ok(), "member's selector must validate: {r_alice:?}");
+        // A non-member asserting team-a is rejected — no cross-tenant quota
+        // consumption.
+        let r_bob = tracker
+            .reserve(&Subject::new("bob"), Some("team-a"), demand(0, 0, 0))
+            .await;
+        assert!(
+            matches!(r_bob, Err(WorkerError::AdmissionDenied { .. })),
+            "non-member selector must be rejected: {r_bob:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_unknown_group_validator_rejects_any_selector_but_allows_none() {
+        // Default tracker uses the fail-closed DenyUnknownGroupValidator.
+        let tracker = AdmissionTracker::new(AdmissionConfig::default(), 10);
+        // No selector → no group partition, admitted.
+        let r_none = tracker
+            .reserve(&Subject::new("alice"), None, demand(0, 0, 0))
+            .await;
+        assert!(r_none.is_ok(), "absent selector must not partition: {r_none:?}");
+        // Any selector is rejected fail-closed (no membership source wired).
+        let r_sel = tracker
+            .reserve(&Subject::new("alice"), Some("team-a"), demand(0, 0, 0))
+            .await;
+        assert!(
+            matches!(r_sel, Err(WorkerError::AdmissionDenied { .. })),
+            "fail-closed: unverifiable selector must be rejected: {r_sel:?}"
         );
     }
 
@@ -628,6 +956,153 @@ mod tests {
             matches!(r2, Err(WorkerError::QueueTimeout { .. })),
             "got: {r2:?}"
         );
+    }
+
+    // ── F1: demand exceeding configured TOTALS rejects immediately
+    //    (infeasible), never burns the queue timeout ─────────────────────────
+
+    #[tokio::test]
+    async fn gpu_demand_exceeding_total_rejects_immediately_infeasible() {
+        // gpu_total defaults to 0. A GPU request can never be satisfied, so it
+        // must reject *immediately* (Infeasible), not queue for 30s.
+        let cfg = AdmissionConfig {
+            // Long timeout so a wrong "queue" answer would be obvious/slow.
+            queue_timeout_secs: 30,
+            ..Default::default()
+        };
+        let tracker = AdmissionTracker::new(cfg, 10);
+        let start = Instant::now();
+        let r = tracker
+            .reserve(&Subject::new("alice"), None, demand(0, 0, 1))
+            .await;
+        assert!(
+            matches!(r, Err(WorkerError::AdmissionInfeasible { .. })),
+            "got: {r:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "infeasible demand must reject immediately, not wait out the timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_demand_exceeding_total_is_infeasible() {
+        let cfg = AdmissionConfig {
+            memory_bytes_total: Some(256),
+            queue_timeout_secs: 30,
+            ..Default::default()
+        };
+        let tracker = AdmissionTracker::new(cfg, 10);
+        let start = Instant::now();
+        let r = tracker
+            .reserve(&Subject::new("alice"), None, demand(0, 512, 0))
+            .await;
+        assert!(
+            matches!(r, Err(WorkerError::AdmissionInfeasible { .. })),
+            "got: {r:?}"
+        );
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn cpu_demand_exceeding_total_is_infeasible() {
+        let cfg = AdmissionConfig {
+            cpu_millis_total: Some(1000),
+            queue_timeout_secs: 30,
+            ..Default::default()
+        };
+        let tracker = AdmissionTracker::new(cfg, 10);
+        let r = tracker
+            .reserve(&Subject::new("alice"), None, demand(2000, 0, 0))
+            .await;
+        assert!(
+            matches!(r, Err(WorkerError::AdmissionInfeasible { .. })),
+            "got: {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn demand_equal_to_total_is_feasible_not_infeasible() {
+        // Boundary: demand == total fits (busy, not infeasible). First takes
+        // the GPU; a second equal request queues on *capacity* (would time
+        // out), proving it wasn't classified infeasible.
+        let cfg = AdmissionConfig {
+            gpu_total: 1,
+            queue_timeout_secs: 0,
+            ..Default::default()
+        };
+        let tracker = AdmissionTracker::new(cfg, 10);
+        let r1 = tracker
+            .reserve(&Subject::new("alice"), None, demand(0, 0, 1))
+            .await;
+        assert!(r1.is_ok(), "demand == total must fit: {r1:?}");
+        let r2 = tracker
+            .reserve(&Subject::new("bob"), None, demand(0, 0, 1))
+            .await;
+        assert!(
+            matches!(r2, Err(WorkerError::QueueTimeout { .. })),
+            "second equal request is busy (capacity), not infeasible: {r2:?}"
+        );
+    }
+
+    // ── F4: FIFO — arrivals never barge past queued waiters ────────────────
+
+    #[tokio::test]
+    async fn fifo_earlier_waiter_is_not_starved_by_later_arrivals() {
+        // Capacity 1. alice holds it; bob queues first, carol queues after.
+        // Freeing one slot must admit bob (the earlier waiter), never carol.
+        let cfg = AdmissionConfig {
+            queue_timeout_secs: 5,
+            ..Default::default()
+        };
+        let tracker = Arc::new(AdmissionTracker::new(cfg, 1));
+        let held = tracker
+            .reserve(&Subject::new("alice"), None, demand(0, 0, 0))
+            .await
+            .unwrap();
+
+        let t_bob = tracker.clone();
+        let bob = tokio::spawn(async move {
+            t_bob
+                .reserve(&Subject::new("bob"), None, demand(0, 0, 0))
+                .await
+        });
+        // Ensure bob is queued at the head before carol arrives.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let t_carol = tracker.clone();
+        let carol = tokio::spawn(async move {
+            t_carol
+                .reserve(&Subject::new("carol"), None, demand(0, 0, 0))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Free exactly one slot.
+        tracker.release(&held).await;
+
+        // bob (earlier) must be the one admitted.
+        let bob_res = tokio::time::timeout(Duration::from_secs(2), bob)
+            .await
+            .expect("bob should be woken")
+            .expect("task ok");
+        assert!(bob_res.is_ok(), "earlier waiter bob must be admitted: {bob_res:?}");
+
+        // carol must still be waiting (only one slot freed, bob took it — no
+        // barging).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !carol.is_finished(),
+            "later arrival carol must not barge ahead of / with bob"
+        );
+
+        // Clean up: release bob's slot so carol can finish.
+        tracker.release(&bob_res.unwrap()).await;
+        let carol_res = tokio::time::timeout(Duration::from_secs(2), carol)
+            .await
+            .expect("carol should now be woken")
+            .expect("task ok");
+        assert!(carol_res.is_ok(), "carol admitted once capacity frees: {carol_res:?}");
     }
 
     #[tokio::test]
@@ -694,7 +1169,7 @@ mod tests {
     async fn derive_demand_is_zero_for_default_config() {
         let config = PodSandboxConfig::default();
         assert_eq!(derive_demand(&config), Demand::default());
-        assert_eq!(derive_group(&config), None);
+        assert_eq!(derive_group_selector(&config), None);
     }
 
     #[tokio::test]
@@ -716,6 +1191,6 @@ mod tests {
         assert_eq!(d.cpu_millis, 500);
         assert_eq!(d.memory_bytes, 1024);
         assert_eq!(d.gpu, 2);
-        assert_eq!(derive_group(&config).as_deref(), Some("team-a"));
+        assert_eq!(derive_group_selector(&config).as_deref(), Some("team-a"));
     }
 }

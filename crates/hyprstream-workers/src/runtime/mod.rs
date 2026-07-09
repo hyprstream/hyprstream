@@ -139,7 +139,10 @@ pub use pool::{PoolStats, SandboxPool};
 pub use sandbox::PodSandbox;
 // Admission control (#525 P2) — quota/queue configuration + the request
 // annotations it reads (GPU count demand, group key).
-pub use admission::{AdmissionConfig, ANN_GPU_REQUEST, ANN_GROUP};
+pub use admission::{
+    AdmissionConfig, DenyUnknownGroupValidator, GroupSelectorValidator, StaticGroupMembership,
+    ANN_GPU_REQUEST, ANN_GROUP,
+};
 #[cfg(all(not(target_arch = "wasm32"), feature = "oci-image"))]
 pub use sandbox_fs::{
     InjectedMounts, SandboxFs, SandboxFsLocalMount, SandboxFsServer, VFS_SOCKET_NAME,
