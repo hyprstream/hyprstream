@@ -1,0 +1,28 @@
+# N relay stand-ins behind one ClusterIP for the #458 flap spike. Replace
+# __REPLICAS__ / __IMAGE__ at apply time (run.sh sed-substitutes them).
+#
+# Stand-in contract: each relay accepts QUIC/moq/WebTransport connections, echoes
+# a stable per-instance id on connect (so the client can tell which backing it is
+# pinned to), and stays up holding the flow.
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: relay}
+spec:
+  replicas: __REPLICAS__
+  selector: {matchLabels: {app: relay}}
+  template:
+    metadata:
+      labels: {app: relay}
+    spec:
+      containers:
+      - name: relay
+        image: __IMAGE__
+        imagePullPolicy: IfNotPresent
+        ports: [{name: quic, containerPort: 443, protocol: UDP}]
+        env:
+        - {name: INSTANCE_ID, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+        readinessProbe:
+          # stand-in exposes a TCP liveness/readiness on :80
+          tcpSocket: {port: 80}
+          initialDelaySeconds: 2
+          periodSeconds: 3

@@ -1,0 +1,11 @@
+# UDP NodePort exposure for the #799 direct-QUIC path.
+# kind-config.yaml maps hostPort 30443 <-> node 30443 (TCP+UDP), so an external
+# subscriber on the host reaches the producer at <node-ip>:30443/udp.
+apiVersion: v1
+kind: Service
+metadata: {name: producer}
+spec:
+  type: NodePort
+  selector: {app: producer}
+  ports:
+  - {name: quic, port: 443, targetPort: 443, nodePort: 30443, protocol: UDP}

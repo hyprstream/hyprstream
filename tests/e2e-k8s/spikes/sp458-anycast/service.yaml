@@ -1,0 +1,11 @@
+# The single ClusterIP Service fronting all relay pods — this VIP is the
+# "anycast" address for #458. kube-proxy load-balances (flow-hash) across N
+# backings; the spike forces a flap (pod delete / Endpoints rewrite) and observes
+# whether a live QUIC/moq/WebTransport flow survives the reroute.
+apiVersion: v1
+kind: Service
+metadata: {name: relay}
+spec:
+  selector: {app: relay}
+  ports:
+  - {name: quic, port: 443, targetPort: 443, protocol: UDP}
