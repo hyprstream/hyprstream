@@ -718,7 +718,13 @@ impl WorkflowHandler for WorkflowService {
         let inputs_map: HashMap<String, String> = request.inputs.iter()
             .map(|kv| (kv.key.clone(), kv.value.clone()))
             .collect();
-        let subject = hyprstream_vfs::Subject::new(ctx.subject().to_string());
+        // Pass the verified `Subject` through directly — never round-trip it
+        // through `.to_string()` → `Subject::new(...)`. `Subject::anonymous()`
+        // Displays as "anonymous", so that round-trip turns an anonymous caller
+        // into a *named* subject "anonymous" (is_anonymous() == false), which
+        // would then pass the fail-closed admission check this dispatch path
+        // feeds (#527) — defeating per-subject quota + the anonymous deny.
+        let subject = ctx.subject();
         let run_id = self.dispatch(&request.workflow_id.clone(), inputs_map, &subject).await?;
         Ok(WorkflowResponseVariant::DispatchResult(run_id))
     }
@@ -880,4 +886,46 @@ fn extract_triggers(workflow: &Workflow) -> Vec<EventTrigger> {
         "schedule" | "training" => vec![EventTrigger::Custom { topic: format!("training.{event}"), pattern: String::new() }],
         _ => vec![EventTrigger::Custom { topic: format!("repo.{event}"), pattern: String::new() }],
     }).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    // Regression guard for the anonymous-subject fail-closed defeat (#770
+    // review FIX 1). `handle_dispatch` derives the caller subject from
+    // `EnvelopeContext::subject()`, which returns `Subject::anonymous()` for
+    // an unauthenticated caller. That subject must reach `dispatch` (→ runner
+    // → `JobScheduler::place` → `AdmissionTracker::reserve`) *untouched*:
+    // `reserve` is fail-closed on `subject.is_anonymous()`, so a converted
+    // subject would silently pass admission and defeat per-subject quota.
+    //
+    // `EnvelopeContext`'s fields are private to `hyprstream-rpc`, so an
+    // anonymous context can't be built from this crate; this test pins the
+    // invariant the dispatch boundary depends on instead.
+
+    use hyprstream_vfs::Subject;
+
+    #[test]
+    fn anonymous_subject_must_not_round_trip_through_string() {
+        // What `ctx.subject()` yields for an unauthenticated caller.
+        let anon = Subject::anonymous();
+        assert!(anon.is_anonymous());
+
+        // The broken transform `handle_dispatch` used to do:
+        // `Subject::new(ctx.subject().to_string())`. `Subject::anonymous()`
+        // Displays as the literal "anonymous", so re-wrapping it produces a
+        // NAMED subject — fail-closed defeated.
+        let broken = Subject::new(anon.to_string());
+        assert_ne!(anon, broken);
+        assert!(
+            !broken.is_anonymous(),
+            "round-tripping an anonymous subject through Display must stay \
+             forbidden: it turns anonymous into the named subject \"anonymous\" \
+             and bypasses fail-closed admission"
+        );
+
+        // The fixed transform: pass the verified `Subject` through untouched.
+        let fixed: Subject = anon.clone();
+        assert!(fixed.is_anonymous());
+        assert_eq!(anon, fixed);
+    }
 }

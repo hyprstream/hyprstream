@@ -88,6 +88,14 @@ pub enum RunnerError {
     #[error("cancelled")]
     Cancelled,
 
+    /// Job placement (scheduler decide + admission) failed. Carries the typed
+    /// [`WorkerError`] so callers/retry-policy can distinguish "retry later,
+    /// queue pressure" (`QueueFull`/`QueueTimeout`) from "terminal, over-quota
+    /// or unauthorized" (`AdmissionDenied`/`Unauthorized`/`AdmissionInfeasible`)
+    /// instead of a flattened string.
+    #[error("job placement failed: {0}")]
+    PlacementFailed(#[from] crate::error::WorkerError),
+
     #[error("vfs error: {0}")]
     VfsError(String),
 
@@ -302,11 +310,22 @@ async fn run_job(
     // #527: decide + (if isolation is requested) acquire a sandbox
     // reservation before running any steps. `None` scheduler ⇒ always
     // in-proc (pre-#527 behavior, unchanged).
+    //
+    // The placement sits outside `job_timeout` and any step-level cancel race,
+    // so it would otherwise wait up to `queue_timeout_secs` in the admission
+    // queue even for an already-cancelled workflow. Race it against the
+    // cancellation token so a cancel aborts the queue wait promptly, and
+    // propagate the typed `WorkerError` (via `PlacementFailed`) instead of
+    // flattening it into a string.
     let placement = match &scheduler {
-        Some(scheduler) => scheduler
-            .place(job_name, &job.runs_on, &job.resources, subject)
-            .await
-            .map_err(|e| RunnerError::VfsError(format!("job placement failed: {e}")))?,
+        Some(scheduler) => {
+            let place_fut = scheduler.place(job_name, &job.runs_on, &job.resources, subject);
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(RunnerError::Cancelled),
+                result = place_fut => result?,
+            }
+        }
         None => Placement::InProc,
     };
 
