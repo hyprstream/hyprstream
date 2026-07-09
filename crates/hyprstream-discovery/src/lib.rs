@@ -52,6 +52,12 @@ pub mod generated {
 
 mod service;
 
+/// #893 (at9p D1) — `did:at9p` capsule resolver: turns a GATE-verified capsule
+/// into a dialable `TransportConfig::iroh` (sibling to
+/// `hyprstream_rpc::service_entry::decode_iroh`). Injectable at the
+/// `Resolver::set_global` / network-profile resolver seam (#873).
+pub mod at9p_resolver;
+
 /// #524 P1 — placement directory record ingestion + in-process index.
 ///
 /// Polls `RecordResolver::resolve_repo` for a bootstrap set of node DIDs,

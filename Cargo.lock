@@ -7153,6 +7153,7 @@ dependencies = [
  "capnp",
  "capnpc",
  "ed25519-dalek 2.2.0",
+ "hyprstream-crypto",
  "hyprstream-k8s",
  "hyprstream-pds",
  "hyprstream-rpc",
