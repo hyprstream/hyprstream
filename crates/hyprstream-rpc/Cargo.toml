@@ -13,6 +13,10 @@ crate-type = ["cdylib", "rlib"]
 # Re-export derive macros
 hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }
 
+# Light, transport-free crypto primitives (COSE, ML-DSA/ML-KEM, KDF/MAC, did:key).
+# Re-exported under `crypto::` / `did_key` so existing paths keep working (#916).
+hyprstream-crypto = { path = "../hyprstream-crypto" }
+
 # Cap'n Proto serialization
 capnp = { workspace = true }
 
@@ -149,7 +153,7 @@ systemd = { version = "0.10", optional = true }
 
 [features]
 default = []
-fips = ["p256", "hmac"]  # FIPS mode uses P-256 + HMAC-SHA256 (hkdf is always enabled)
+fips = ["p256", "hmac", "hyprstream-crypto/fips"]  # FIPS mode uses P-256 + HMAC-SHA256 (hkdf is always enabled)
 # `pq-hybrid` is retained as a NO-OP alias for source/build compatibility.
 # Post-quantum primitives (ML-DSA-65 + ML-KEM-768) are now ALWAYS compiled;
 # Classical vs Hybrid is selected at runtime via `crypto::CryptoPolicy`. See M3.

@@ -38,10 +38,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 
+use crate::did_key::MULTICODEC_ED25519_PUB;
 use crate::transport::{QuicServerAuth, TransportConfig};
 
-/// multicodec `ed25519-pub` varint prefix (did:key spec).
-const MULTICODEC_ED25519_PUB: [u8; 2] = [0xed, 0x01];
 /// multihash prefix for `sha2-256` with a 32-byte digest (`0x12` code, `0x20` len).
 const MULTIHASH_SHA2_256: [u8; 2] = [0x12, 0x20];
 

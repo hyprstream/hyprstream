@@ -1,0 +1,50 @@
+[package]
+name = "hyprstream-crypto"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT"
+repository.workspace = true
+description = "Light, transport-free cryptographic primitives for hyprstream (COSE sign/encrypt, ML-DSA/ML-KEM, KDF/MAC, did:key multikey codec)"
+
+[dependencies]
+anyhow = { workspace = true }
+
+# COSE signing/encryption (RFC 9052/9053)
+coset = { workspace = true }
+ciborium = { workspace = true }
+
+# Ed25519 (classical) + post-quantum ML-DSA-65 / ML-KEM-768
+ed25519-dalek = { workspace = true }
+ml-dsa = { workspace = true }
+ml-kem = { workspace = true }
+
+# KDF / MAC backends
+blake3 = { workspace = true }            # Default: fast KDF and MAC
+hkdf = { workspace = true }              # HKDF-SHA256 (FIPS + tests)
+sha2 = { workspace = true }              # SHA-256 for HKDF/HMAC
+hmac = { workspace = true, optional = true }  # FIPS mode HMAC-SHA256
+
+zeroize = { workspace = true }
+subtle = { workspace = true }
+base64 = { workspace = true }            # kid encoding in COSE_Sign1 headers
+
+# did:key / Multikey multibase base58btc codec
+bs58 = "0.5"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The always-on PQ crypto (ml-dsa/ml-kem → sha3/crypto-common) pulls getrandom 0.4,
+# which refuses to build on wasm32-unknown-unknown unless its `wasm_js` backend is
+# enabled. Declare it (renamed) so the feature unifies onto the transitive 0.4 dep
+# and the browser/WebTransport consumer compiles for wasm (#225).
+getrandom_v04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+
+[dev-dependencies]
+rand = { workspace = true }
+hmac = { workspace = true }
+
+[features]
+# FIPS mode: HKDF-SHA256 + HMAC-SHA256 in the KDF/MAC backend (else Blake3).
+fips = ["hmac"]
+
+[lints]
+workspace = true

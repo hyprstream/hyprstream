@@ -73,7 +73,7 @@ impl StreamHmacState {
         }
         input.extend_from_slice(capnp_data);
 
-        let truncated = crate::crypto::keyed_mac_truncated(&self.key, &input);
+        let truncated = crate::backend::keyed_mac_truncated(&self.key, &input);
         self.prev_mac = Some(truncated);
         truncated
     }
@@ -86,7 +86,7 @@ impl StreamHmacState {
             Some(prev) => input.extend_from_slice(prev),
         }
         input.extend_from_slice(capnp_data);
-        crate::crypto::keyed_mac_truncated(&self.key, &input)
+        crate::backend::keyed_mac_truncated(&self.key, &input)
     }
 
     /// Verify the next block's MAC in constant time.

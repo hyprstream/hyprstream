@@ -1,7 +1,7 @@
 //! Post-quantum hybrid cryptographic primitives (ML-DSA-65 + ML-KEM-768).
 //!
 //! Always compiled (M3 #152). Whether these are USED is a runtime decision via
-//! [`crate::crypto::CryptoPolicy`], not a compile-time cargo feature. Provides:
+//! `hyprstream_rpc::crypto::CryptoPolicy`, not a compile-time cargo feature. Provides:
 //! - ML-DSA-65 (FIPS 204) digital signatures
 //! - ML-KEM-768 (FIPS 203) key encapsulation
 
