@@ -342,6 +342,42 @@ enum AdmitReject {
     Capacity(String),
 }
 
+fn check_feasible(
+    demand: Demand,
+    cfg: &AdmissionConfig,
+    max_sandboxes: usize,
+) -> std::result::Result<(), String> {
+    if max_sandboxes == 0 {
+        return Err(
+            "pool declares zero schedulable capacity (max_sandboxes = 0)".to_owned(),
+        );
+    }
+    if let Some(total) = cfg.cpu_millis_total {
+        if demand.cpu_millis > total {
+            return Err(format!(
+                "cpu demand {}m exceeds node total {total}m",
+                demand.cpu_millis
+            ));
+        }
+    }
+    if let Some(total) = cfg.memory_bytes_total {
+        if demand.memory_bytes > total {
+            return Err(format!(
+                "memory demand {} bytes exceeds node total {total} bytes",
+                demand.memory_bytes
+            ));
+        }
+    }
+    if demand.gpu > cfg.gpu_total {
+        return Err(format!(
+            "gpu demand {} exceeds node total {}",
+            demand.gpu, cfg.gpu_total
+        ));
+    }
+
+    Ok(())
+}
+
 /// Check admission for `(subject_key, group_key, demand)` and, if it fits,
 /// commit the reservation — atomically, under the caller's lock. This is the
 /// entire "reserve-then-place" critical section; there is no gap between
@@ -359,33 +395,7 @@ fn try_admit_locked(
     //    the currently-free amount) can never be satisfied by any release, so
     //    it must reject immediately rather than burn the whole queue_timeout.
     //    Checked independently of `*_reserved`. ──
-    if max_sandboxes == 0 {
-        return Err(AdmitReject::Infeasible(
-            "pool declares zero schedulable capacity (max_sandboxes = 0)".to_owned(),
-        ));
-    }
-    if let Some(total) = cfg.cpu_millis_total {
-        if demand.cpu_millis > total {
-            return Err(AdmitReject::Infeasible(format!(
-                "cpu demand {}m exceeds node total {total}m",
-                demand.cpu_millis
-            )));
-        }
-    }
-    if let Some(total) = cfg.memory_bytes_total {
-        if demand.memory_bytes > total {
-            return Err(AdmitReject::Infeasible(format!(
-                "memory demand {} bytes exceeds node total {total} bytes",
-                demand.memory_bytes
-            )));
-        }
-    }
-    if demand.gpu > cfg.gpu_total {
-        return Err(AdmitReject::Infeasible(format!(
-            "gpu demand {} exceeds node total {}",
-            demand.gpu, cfg.gpu_total
-        )));
-    }
+    check_feasible(demand, cfg, max_sandboxes).map_err(AdmitReject::Infeasible)?;
 
     // ── Quota checks: fail-closed, never queue ──
     if let Some(max) = cfg.max_per_subject {
@@ -729,7 +739,12 @@ impl AdmissionTracker {
                     }
                 } else if ticket.is_none() {
                     // Someone is ahead of us: join the back of the queue
-                    // (bounded) and wait our turn rather than barging.
+                    // (bounded) and wait our turn rather than barging. Demand
+                    // infeasible against configured totals never queues, even
+                    // behind existing waiters.
+                    if let Err(reason) = check_feasible(demand, &self.config, self.max_sandboxes) {
+                        return Err(WorkerError::AdmissionInfeasible { reason });
+                    }
                     if state.queue.len() >= self.config.queue_capacity {
                         return Err(WorkerError::QueueFull {
                             waiting: state.queue.len(),
@@ -1043,6 +1058,67 @@ mod tests {
             matches!(r2, Err(WorkerError::QueueTimeout { .. })),
             "second equal request is busy (capacity), not infeasible: {r2:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn infeasible_request_behind_waiter_rejects_without_taking_queue_slot() {
+        let cfg = AdmissionConfig {
+            gpu_total: 0,
+            queue_capacity: 2,
+            queue_timeout_secs: 5,
+            ..Default::default()
+        };
+        let tracker = Arc::new(AdmissionTracker::new(cfg, 1));
+        let held = tracker
+            .reserve(&Subject::new("alice"), None, demand(0, 0, 0))
+            .await
+            .expect("first request should occupy the only sandbox slot");
+
+        let t_bob = tracker.clone();
+        let bob = tokio::spawn(async move {
+            t_bob
+                .reserve(&Subject::new("bob"), None, demand(0, 0, 0))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let start = Instant::now();
+        let carol = tracker
+            .reserve(&Subject::new("carol"), None, demand(0, 0, 1))
+            .await;
+        assert!(
+            matches!(carol, Err(WorkerError::AdmissionInfeasible { .. })),
+            "infeasible demand behind a waiter must fail immediately: {carol:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "infeasible demand must not wait behind the existing queue"
+        );
+
+        let t_dave = tracker.clone();
+        let dave = tokio::spawn(async move {
+            t_dave
+                .reserve(&Subject::new("dave"), None, demand(0, 0, 0))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !dave.is_finished(),
+            "feasible follow-up should fit in the queue slot not consumed by the infeasible request"
+        );
+
+        tracker.release(&held).await;
+        let bob_res = tokio::time::timeout(Duration::from_secs(2), bob)
+            .await
+            .expect("bob should be admitted")
+            .expect("task ok")
+            .expect("bob reservation ok");
+        tracker.release(&bob_res).await;
+        let dave_res = tokio::time::timeout(Duration::from_secs(2), dave)
+            .await
+            .expect("dave should be admitted")
+            .expect("task ok");
+        assert!(dave_res.is_ok(), "dave should have remained queued: {dave_res:?}");
     }
 
     // ── F4: FIFO — arrivals never barge past queued waiters ────────────────

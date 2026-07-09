@@ -402,7 +402,24 @@ impl SandboxPool {
         sandbox.reservation = None;
 
         // Let the backend reset its handle
-        let reusable = self.backend.reset(&mut sandbox).await?;
+        let reusable = match self.backend.reset(&mut sandbox).await {
+            Ok(reusable) => reusable,
+            Err(reset_err) => {
+                tracing::warn!(
+                    sandbox_id = %sandbox.id,
+                    error = %reset_err,
+                    "reset failed on release — destroying sandbox to avoid an orphan"
+                );
+                if let Err(destroy_err) = self.backend.destroy(&sandbox).await {
+                    tracing::warn!(
+                        sandbox_id = %sandbox.id,
+                        error = %destroy_err,
+                        "destroy also failed after reset failure — possible orphan"
+                    );
+                }
+                return Err(reset_err);
+            }
+        };
         if reusable {
             Ok(Some(sandbox))
         } else {
@@ -607,6 +624,8 @@ mod admission_tests {
         fail_resize: StdAtomicBool,
         /// When set, `stop` fails (F5 release-ordering test).
         fail_stop: StdAtomicBool,
+        /// When set, `reset` fails (reset-failure orphan-avoidance test).
+        fail_reset: StdAtomicBool,
         /// Ids passed to `destroy`, in call order (F2/F5 orphan-avoidance).
         destroyed: StdMutex<Vec<String>>,
     }
@@ -658,6 +677,12 @@ mod admission_tests {
             Ok(())
         }
         async fn reset(&self, _sandbox: &mut PodSandbox) -> Result<bool> {
+            if self.fail_reset.load(Ordering::SeqCst) {
+                return Err(WorkerError::SandboxTimeout {
+                    operation: "reset".to_owned(),
+                    timeout_secs: 0,
+                });
+            }
             // Reusable (Kata-like) — required to exercise the warm-pool /
             // #519 resize path below.
             Ok(true)
@@ -992,6 +1017,27 @@ mod admission_tests {
             .await
             .expect("capacity/quota must have been rolled back after resize failure");
         assert!(pool.get(&id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn reset_failure_destroys_released_sandbox() {
+        let (pool, fake) = make_pool_with(1, 1);
+        pool.initialize().await.expect("prewarm one sandbox");
+
+        let subject = Subject::new("alice");
+        let id = pool
+            .acquire(&subject, &PodSandboxConfig::default())
+            .await
+            .expect("warm acquire should succeed");
+
+        fake.fail_reset.store(true, Ordering::SeqCst);
+        let err = pool.release(&id).await.unwrap_err();
+        assert!(matches!(err, WorkerError::SandboxTimeout { .. }), "reset error propagates: {err:?}");
+        assert!(
+            fake.was_destroyed(&id),
+            "sandbox must be destroyed after reset failure to avoid an orphan"
+        );
+        assert_eq!(pool.stats().await.active_count, 0, "release removed active sandbox");
     }
 
     // ── F5: stop failure on release must not orphan / over-commit ──────────
