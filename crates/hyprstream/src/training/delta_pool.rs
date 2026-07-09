@@ -2,16 +2,49 @@
 //!
 //! Manages a pool of `TenantDelta` instances, one per tenant/session.
 //! Pattern mirrors `KVCacheRegistry` using `DashMap` for concurrent access.
+//!
+//! # Snapshot durability & lifecycle (#869)
+//!
+//! Uncommitted per-tenant TTT adaptation is persisted to
+//! `adapters/.snapshots/{subject}.safetensors` on two occasions:
+//! - **LRU eviction** ([`DeltaPool::evict_lru`] / [`DeltaPool::evict_lru_async`]) — a
+//!   warm-cache spill.
+//! - **Drain-time export** ([`DeltaPool::export_all`]) — a graceful-shutdown "snapshot
+//!   all, now" for pod preStop / scale-in.
+//!
+//! The read half is [`DeltaPool::get_or_hydrate`], which reloads a snapshot before
+//! zero-initializing a fresh delta, restoring weights, effective ranks, Muon momentum,
+//! and `accumulated_steps` / `request_count`.
+//!
+//! **Lifecycle decision — keep, don't delete on load.** A rehydrated snapshot is left
+//! on disk after a successful load. Deleting it on load would open a window where a crash
+//! between hydrate and the next eviction/export loses every step accumulated since — the
+//! exact failure #869 exists to close. The file is instead overwritten by the next
+//! eviction/export snapshot of the same subject, so at worst a reader sees slightly stale
+//! (never absent) state. These staging snapshots stay in `.snapshots/` and are **never**
+//! auto-promoted into a committed `adapters/NN_*.safetensors` adapter — that crossing is
+//! the STEP `Promote` boundary and remains an explicit operation.
+//!
+//! **What a snapshot does NOT preserve** (rehydrated deltas start blank for these; see
+//! [`TenantDelta::extract_state_dict`]): the in-memory STEP `Pending` rollback state
+//! (`DeltaAdaptationState::Pending`) — a speculative, not-yet-resolved adaptation is
+//! folded into the committed weights it was applied on top of, so it survives as
+//! committed rather than as a reversible pending. No SSM/optimizer state beyond Muon
+//! momentum is carried (there is none in `TenantDelta` today). `avg_loss_improvement`
+//! and `last_snapshot_hash` reset.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tch::Device;
+use tch::{Device, Tensor};
 
-use super::tenant_delta::{TenantDelta, TenantDeltaConfig, serialize_state_dict_to_bytes};
+use super::muon::MuonState;
+use super::tenant_delta::{
+    load_state_dict_from_bytes, serialize_state_dict_to_bytes, TenantDelta, TenantDeltaConfig,
+};
 use crate::runtime::kv_cache::KVCacheRegistry;
 use crate::services::WorktreeClient;
 use hyprstream_rpc::Subject;
@@ -21,6 +54,18 @@ const MAX_SNAPSHOT_BYTES: usize = 512 * 1024 * 1024;
 
 /// Default maximum number of tenants before LRU eviction kicks in.
 const MAX_TENANTS_DEFAULT: usize = 100;
+
+/// Snapshot-file metadata key: accumulated gradient steps (i64 scalar).
+///
+/// These `__meta.*` keys ride inside the safetensors snapshot alongside the LoRA
+/// A/B / `__effective_rank` / `__muon_momentum` tensors written by
+/// [`TenantDelta::extract_state_dict`]. They are injected only at the DeltaPool
+/// snapshot boundary (see [`DeltaPool::snapshot_state_dict`]) so the generic
+/// in-memory rollback state dict (used by the STEP stage/apply machinery) stays
+/// free of pool-lifecycle counters.
+const META_ACCUMULATED_STEPS: &str = "__meta.accumulated_steps";
+/// Snapshot-file metadata key: served request count (i64 scalar).
+const META_REQUEST_COUNT: &str = "__meta.request_count";
 
 /// Registry managing per-tenant LoRA deltas for isolated TTT adaptation
 ///
@@ -140,17 +185,12 @@ impl DeltaPool {
         self.kv_registry = Some(registry);
     }
 
-    /// Get or create a delta for the given tenant
+    /// Construct a fresh, zero-initialized delta with the default config.
     ///
-    /// If the delta doesn't exist, creates a new one with the default config.
-    pub fn get_or_create(&self, tenant_id: &Subject) -> Result<Arc<Mutex<TenantDelta>>> {
-        // Fast path: existing delta
-        if let Some(delta) = self.deltas.get(tenant_id) {
-            delta.lock().touch();
-            return Ok(delta.clone());
-        }
-
-        // Slow path: create new delta (lock config briefly to clone it)
+    /// This is the pre-#869 status quo: B = zeros, no accumulated steps. Shared by
+    /// [`Self::get_or_create`] and [`Self::get_or_hydrate`] (which then overlays a
+    /// persisted snapshot on top, when one exists).
+    fn create_blank_delta(&self) -> Result<TenantDelta> {
         let config = self.default_config.lock().clone();
         let mut delta = TenantDelta::new_with_per_layer_dims(
             &config,
@@ -163,7 +203,24 @@ impl DeltaPool {
         if let Some(ref oracle_config) = self.rank_oracle_config {
             delta.rank_oracle = Some(super::ttt::RankOracle::new(oracle_config.clone()));
         }
-        let delta = Arc::new(Mutex::new(delta));
+        Ok(delta)
+    }
+
+    /// Get or create a delta for the given tenant (synchronous, **no** snapshot rehydration).
+    ///
+    /// If the delta doesn't exist, creates a new zero-initialized one with the default
+    /// config. This path does **not** reload `adapters/.snapshots/{subject}.safetensors` —
+    /// it cannot, because snapshot reads require async FsOps. Async callers that want
+    /// replica-loss durability (#869) must use [`Self::get_or_hydrate`] instead; this
+    /// sync entry point remains for non-async callers (tests, batched-LoRA construction).
+    pub fn get_or_create(&self, tenant_id: &Subject) -> Result<Arc<Mutex<TenantDelta>>> {
+        // Fast path: existing delta
+        if let Some(delta) = self.deltas.get(tenant_id) {
+            delta.lock().touch();
+            return Ok(delta.clone());
+        }
+
+        let delta = Arc::new(Mutex::new(self.create_blank_delta()?));
 
         // Insert (handles race condition)
         Ok(self
@@ -171,6 +228,222 @@ impl DeltaPool {
             .entry(tenant_id.clone())
             .or_insert(delta.clone())
             .clone())
+    }
+
+    /// Get an existing delta, or create one **rehydrating from a persisted snapshot**
+    /// if `adapters/.snapshots/{subject}.safetensors` exists (async sibling of
+    /// [`Self::get_or_create`], #869).
+    ///
+    /// This is the read half that makes eviction/drain snapshots durable across replica
+    /// loss and scale-in. On a cold miss it:
+    /// 1. builds a blank delta (as `get_or_create` would),
+    /// 2. looks for a snapshot (via FsOps when a [`WorktreeClient`] is present, else the
+    ///    local `snapshots_dir`),
+    /// 3. on hit, restores the LoRA A/B weights, per-key effective ranks, Muon momentum,
+    ///    and `accumulated_steps` / `request_count` onto the delta (device-mapped to the
+    ///    pool's device),
+    /// 4. on a corrupt/unloadable/shape-incompatible snapshot, **falls open** to a blank
+    ///    delta (the pre-#869 status quo) and quarantines the bad file as `*.corrupt`.
+    ///
+    /// The snapshot file is **kept** after a successful load (not deleted) — see the
+    /// module note on snapshot lifecycle. It is overwritten by the next eviction/export.
+    pub async fn get_or_hydrate(&self, tenant_id: &Subject) -> Result<Arc<Mutex<TenantDelta>>> {
+        // Fast path: already resident.
+        if let Some(delta) = self.deltas.get(tenant_id) {
+            delta.lock().touch();
+            return Ok(delta.clone());
+        }
+
+        let mut delta = self.create_blank_delta()?;
+        let id_filename = Self::sanitize_filename(&tenant_id.to_string());
+
+        match self.read_snapshot_bytes(&id_filename).await {
+            Ok(Some(bytes)) => {
+                let loaded = load_state_dict_from_bytes(&bytes)
+                    .and_then(|state| Self::apply_snapshot(&mut delta, &state));
+                match loaded {
+                    Ok(()) => {
+                        tracing::info!(
+                            "Rehydrated delta '{}' from snapshot ({} accumulated steps)",
+                            tenant_id,
+                            delta.accumulated_steps
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Corrupt/incompatible snapshot for delta '{}': {} — quarantining and starting blank",
+                            tenant_id,
+                            e
+                        );
+                        self.quarantine_snapshot(&id_filename).await;
+                        // Rebuild pristine: apply_snapshot validates before mutating, but a
+                        // rebuild guarantees no partial state leaks through on any error path.
+                        delta = self.create_blank_delta()?;
+                    }
+                }
+            }
+            Ok(None) => {
+                // No snapshot — normal cold start.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to read snapshot for delta '{}': {} — starting blank",
+                    tenant_id,
+                    e
+                );
+            }
+        }
+
+        let delta = Arc::new(Mutex::new(delta));
+        Ok(self
+            .deltas
+            .entry(tenant_id.clone())
+            .or_insert(delta.clone())
+            .clone())
+    }
+
+    /// Build the state dict written to a snapshot file: the delta's tensor state
+    /// (A/B, effective ranks, Muon momentum) plus pool-lifecycle counters
+    /// (`accumulated_steps`, `request_count`) as `__meta.*` scalar tensors.
+    fn snapshot_state_dict(delta: &TenantDelta) -> HashMap<String, Tensor> {
+        let mut state = delta.extract_state_dict();
+        state.insert(
+            META_ACCUMULATED_STEPS.to_owned(),
+            Tensor::from_slice(&[delta.accumulated_steps as i64]),
+        );
+        state.insert(
+            META_REQUEST_COUNT.to_owned(),
+            Tensor::from_slice(&[delta.request_count as i64]),
+        );
+        state
+    }
+
+    /// Restore a loaded snapshot state dict onto a (blank) delta.
+    ///
+    /// Validates A/B shapes up front — `load_state_dict`'s `copy_` panics on a shape
+    /// mismatch, so an incompatible snapshot (e.g. the pool's rank/module config changed
+    /// since the snapshot was written) must be rejected as an error here rather than
+    /// aborting the process. Also pre-seeds `muon_states` for any momentum buffers in the
+    /// snapshot (a blank delta starts with none, so `load_state_dict` would otherwise drop
+    /// them), device-mapped to the delta's device.
+    fn apply_snapshot(delta: &mut TenantDelta, state: &HashMap<String, Tensor>) -> Result<()> {
+        // Shape-compatibility gate (fail before any mutation).
+        for key in delta.lora_a.keys() {
+            if let Some(src) = state.get(&format!("{}.lora_a", key)) {
+                let want = delta.lora_a[key].size();
+                if src.size() != want {
+                    return Err(anyhow!(
+                        "snapshot lora_a '{}' shape {:?} != expected {:?}",
+                        key,
+                        src.size(),
+                        want
+                    ));
+                }
+            }
+        }
+        for key in delta.lora_b.keys() {
+            if let Some(src) = state.get(&format!("{}.lora_b", key)) {
+                let want = delta.lora_b[key].size();
+                if src.size() != want {
+                    return Err(anyhow!(
+                        "snapshot lora_b '{}' shape {:?} != expected {:?}",
+                        key,
+                        src.size(),
+                        want
+                    ));
+                }
+            }
+        }
+
+        // Pre-seed Muon momentum slots (device-mapped) so load_state_dict restores them.
+        let device = delta.device;
+        for (name, t) in state.iter() {
+            if let Some(key) = name.strip_suffix(".__muon_momentum") {
+                delta
+                    .muon_states
+                    .entry(key.to_owned())
+                    .or_insert_with(|| MuonState {
+                        momentum_buffer: Some(t.to_device(device)),
+                    });
+            }
+        }
+
+        delta.load_state_dict(state)?;
+
+        if let Some(t) = state.get(META_ACCUMULATED_STEPS) {
+            delta.accumulated_steps = t.int64_value(&[]).max(0) as u64;
+        }
+        if let Some(t) = state.get(META_REQUEST_COUNT) {
+            delta.request_count = t.int64_value(&[]).max(0) as u64;
+        }
+        Ok(())
+    }
+
+    /// Read a snapshot's raw bytes, or `Ok(None)` if it does not exist.
+    ///
+    /// Reads through the [`WorktreeClient`] (9P/FsOps) when present — the same channel
+    /// the async eviction/export path writes through — otherwise falls back to the local
+    /// `snapshots_dir` (used by the sync eviction path and by tests).
+    async fn read_snapshot_bytes(&self, id_filename: &str) -> Result<Option<Vec<u8>>> {
+        let rel_path = format!("adapters/.snapshots/{}.safetensors", id_filename);
+        if let Some(ref fs) = self.fs {
+            let st = fs
+                .stat_path(&rel_path)
+                .await
+                .map_err(|e| anyhow!("FsOps stat failed: {}", e))?;
+            if !st.exists {
+                return Ok(None);
+            }
+            let bytes = fs
+                .read_file_chunked(&rel_path)
+                .await
+                .map_err(|e| anyhow!("FsOps read failed: {}", e))?;
+            Ok(Some(bytes))
+        } else {
+            let path = self
+                .snapshots_dir
+                .join(format!("{}.safetensors", id_filename));
+            match std::fs::read(&path) {
+                Ok(b) => Ok(Some(b)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(anyhow!("read snapshot {}: {}", path.display(), e)),
+            }
+        }
+    }
+
+    /// Best-effort quarantine of a bad snapshot: move `{id}.safetensors` aside to
+    /// `{id}.safetensors.corrupt` so a later hydrate does not retry the same bad file
+    /// and an operator can inspect it. Never fails the caller.
+    async fn quarantine_snapshot(&self, id_filename: &str) {
+        let rel_path = format!("adapters/.snapshots/{}.safetensors", id_filename);
+        let corrupt_rel = format!("{}.corrupt", rel_path);
+        if let Some(ref fs) = self.fs {
+            // No 9P rename op — copy bytes aside, then remove the original.
+            match fs.read_file_chunked(&rel_path).await {
+                Ok(bytes) => {
+                    if let Err(e) = fs.write_file_chunked(&corrupt_rel, &bytes).await {
+                        tracing::warn!("Failed to write quarantined snapshot {}: {}", corrupt_rel, e);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to read snapshot for quarantine {}: {}", rel_path, e);
+                }
+            }
+            if let Err(e) = fs.remove_path(&rel_path).await {
+                tracing::warn!("Failed to remove corrupt snapshot {}: {}", rel_path, e);
+            }
+        } else {
+            let path = self
+                .snapshots_dir
+                .join(format!("{}.safetensors", id_filename));
+            let corrupt = self
+                .snapshots_dir
+                .join(format!("{}.safetensors.corrupt", id_filename));
+            if let Err(e) = std::fs::rename(&path, &corrupt) {
+                tracing::warn!("Failed to quarantine corrupt snapshot {}: {}", path.display(), e);
+            }
+        }
+        tracing::warn!("Quarantined corrupt snapshot for '{}' -> {}", id_filename, corrupt_rel);
     }
 
     /// Get an existing delta (returns None if not found)
@@ -322,7 +595,7 @@ impl DeltaPool {
             let d = delta.lock();
             if d.accumulated_steps > 0 {
                 if self.fs.is_some() {
-                    let state_dict = d.extract_state_dict();
+                    let state_dict = Self::snapshot_state_dict(&d);
                     let memory_bytes = d.memory_bytes();
                     Some((state_dict, memory_bytes))
                 } else {
@@ -427,7 +700,7 @@ impl DeltaPool {
                     .join(format!("{}.safetensors", id_filename));
                 // In sync context, we can only write directly to the snapshots_dir
                 // (not through WorktreeClient which requires async)
-                let state_dict = d.extract_state_dict();
+                let state_dict = Self::snapshot_state_dict(&d);
                 let memory_bytes = d.memory_bytes();
                 drop(d);
 
@@ -523,6 +796,105 @@ impl DeltaPool {
             }
         }
         evicted
+    }
+
+    /// Drain-time export: snapshot **every** resident delta with accumulated steps,
+    /// without evicting any of them (#869, deliverable 2).
+    ///
+    /// This is the explicit "snapshot all, now" entry point for a graceful-shutdown /
+    /// pod-preStop drain hook. It reuses the eviction snapshot format and path
+    /// (`adapters/.snapshots/{subject}.safetensors`) and the same 512 MB cap and
+    /// FsOps-required semantics, so a rehydrating replica reads these back through
+    /// [`Self::get_or_hydrate`] identically to eviction snapshots.
+    ///
+    /// Deltas remain live in the pool after export (the process is about to exit, but
+    /// the delta state must survive to disk, not be cleared). Returns `(subject,
+    /// snapshot_path)` for each resident delta considered — `None` in the path slot
+    /// marks a **loss event**: a delta that was skipped (no accumulated steps, over the
+    /// size cap, or a write failure). Callers/operators should treat `None` with
+    /// `accumulated_steps > 0` as data loss.
+    ///
+    /// Requires a [`WorktreeClient`]; without one this is a logged no-op (FsOps-absent
+    /// skip, matching the eviction path — there is no worktree to write through).
+    pub async fn export_all(&self) -> Result<Vec<(Subject, Option<PathBuf>)>> {
+        let Some(ref fs) = self.fs else {
+            tracing::warn!(
+                "export_all: FsOps not available — {} resident delta(s) NOT persisted (loss on shutdown)",
+                self.deltas.len()
+            );
+            return Ok(Vec::new());
+        };
+
+        if self.deltas.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        fs.mkdir_p("adapters/.snapshots")
+            .await
+            .map_err(|e| anyhow!("FsOps mkdir failed: {}", e))?;
+
+        // Collect ids first so we don't hold DashMap refs across await points.
+        let ids: Vec<Subject> = self.deltas.iter().map(|e| e.key().clone()).collect();
+        let mut results = Vec::with_capacity(ids.len());
+
+        for id in ids {
+            let Some(entry) = self.deltas.get(&id) else {
+                continue; // Evicted concurrently.
+            };
+            let delta = entry.value().clone();
+            drop(entry);
+
+            // Extract snapshot data under lock, release before async I/O.
+            let snapshot_data = {
+                let d = delta.lock();
+                if d.accumulated_steps == 0 {
+                    None // Nothing to persist.
+                } else {
+                    let memory_bytes = d.memory_bytes();
+                    if memory_bytes > MAX_SNAPSHOT_BYTES {
+                        tracing::warn!(
+                            "export_all: delta '{}' exceeds max snapshot size ({} > {}), skipping (loss)",
+                            id, memory_bytes, MAX_SNAPSHOT_BYTES
+                        );
+                        None
+                    } else {
+                        Some(Self::snapshot_state_dict(&d))
+                    }
+                }
+            };
+
+            let path = if let Some(state_dict) = snapshot_data {
+                let id_filename = Self::sanitize_filename(&id.to_string());
+                let rel_path = format!("adapters/.snapshots/{}.safetensors", id_filename);
+                match async {
+                    let bytes = serialize_state_dict_to_bytes(&state_dict)?;
+                    fs.write_file_chunked(&rel_path, &bytes)
+                        .await
+                        .map_err(|e| anyhow!("FsOps write_file failed: {}", e))?;
+                    Ok::<(), anyhow::Error>(())
+                }
+                .await
+                {
+                    Ok(()) => {
+                        tracing::info!("export_all: snapshotted delta '{}' -> {}", id, rel_path);
+                        Some(
+                            self.snapshots_dir
+                                .join(format!("{}.safetensors", id_filename)),
+                        )
+                    }
+                    Err(e) => {
+                        tracing::warn!("export_all: failed to snapshot delta '{}': {} (loss)", id, e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            results.push((id, path));
+        }
+
+        Ok(results)
     }
 
     /// Clear all deltas and invalidate all dependent KV caches
@@ -680,5 +1052,163 @@ mod tests {
 
         let usage = pool.total_memory_usage();
         assert!(usage > 0, "Memory usage should be non-zero with a delta");
+    }
+
+    // ===== #869 rehydration + drain-time export =====
+
+    /// Per-test unique snapshots dir under a fresh temp path (isolate file I/O).
+    fn unique_snapshots_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("delta_pool_869_{}_{}", tag, nanos))
+    }
+
+    fn pool_with_dir(dir: PathBuf) -> DeltaPool {
+        DeltaPool::new(
+            TenantDeltaConfig::default(),
+            test_module_dims(),
+            Device::Cpu,
+            None,
+            dir,
+            None, // fs = None -> sync std::fs snapshot path (used by evict_lru + get_or_hydrate)
+            2,
+        )
+    }
+
+    /// snapshot -> evict -> get_or_hydrate rehydrates weights + accumulated_steps.
+    #[tokio::test]
+    async fn test_hydrate_roundtrip_restores_state() {
+        let dir = unique_snapshots_dir("roundtrip");
+        let pool = pool_with_dir(dir.clone());
+        let tid = Subject::new("tenant-hydrate");
+
+        // Train: mutate B and set accumulated_steps so eviction snapshots it.
+        let expected_b: Tensor;
+        {
+            let delta_arc = pool.get_or_create(&tid).unwrap();
+            let mut d = delta_arc.lock();
+            let _guard = tch::no_grad_guard(); // B is a grad-requiring leaf var
+            let b = d.lora_b.get_mut("0.q_proj").unwrap();
+            let _ = b.uniform_(-0.5, 0.5);
+            expected_b = b.copy();
+            d.accumulated_steps = 17;
+            d.request_count = 5;
+        }
+
+        // Evict (sync path writes snapshot to `dir`), then hydrate a fresh miss.
+        let evicted = pool.evict_lru();
+        assert!(evicted.is_some());
+        assert!(evicted.unwrap().2.is_some(), "eviction should write a snapshot");
+        assert_eq!(pool.tenant_count(), 0);
+
+        let delta_arc = pool.get_or_hydrate(&tid).await.unwrap();
+        let d = delta_arc.lock();
+        assert_eq!(d.accumulated_steps, 17, "accumulated_steps rehydrated");
+        assert_eq!(d.request_count, 5, "request_count rehydrated");
+        let max_diff: f64 = (&d.lora_b["0.q_proj"] - &expected_b)
+            .abs()
+            .max()
+            .double_value(&[]);
+        assert!(max_diff < 1e-6, "B weights rehydrated (max diff {})", max_diff);
+
+        drop(d);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A corrupt snapshot file is quarantined (.corrupt) and hydrate falls open to blank.
+    #[tokio::test]
+    async fn test_corrupt_snapshot_quarantined_and_blank() {
+        let dir = unique_snapshots_dir("corrupt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = pool_with_dir(dir.clone());
+        let tid = Subject::new("tenant-corrupt");
+
+        // Write garbage where the snapshot would live.
+        let fname = DeltaPool::sanitize_filename(&tid.to_string());
+        let snap_path = dir.join(format!("{}.safetensors", fname));
+        std::fs::write(&snap_path, b"not a safetensors file").unwrap();
+
+        let delta_arc = pool.get_or_hydrate(&tid).await.unwrap();
+        {
+            let d = delta_arc.lock();
+            // Blank: B is zeros, no accumulated steps.
+            assert_eq!(d.accumulated_steps, 0);
+            let b_norm: f64 = d.lora_b["0.q_proj"].norm().double_value(&[]);
+            assert!(b_norm < 1e-8, "fell open to a blank delta");
+        }
+        assert!(!snap_path.exists(), "corrupt file moved aside");
+        assert!(
+            dir.join(format!("{}.safetensors.corrupt", fname)).exists(),
+            "corrupt file quarantined"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An incompatible (wrong-shape) snapshot is rejected without panicking.
+    #[tokio::test]
+    async fn test_incompatible_shape_snapshot_falls_open() {
+        let dir = unique_snapshots_dir("incompat");
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = pool_with_dir(dir.clone());
+        let tid = Subject::new("tenant-incompat");
+
+        // Build a valid safetensors snapshot whose lora_a has the wrong shape.
+        let mut state: HashMap<String, Tensor> = HashMap::new();
+        state.insert(
+            "0.q_proj.lora_a".to_owned(),
+            Tensor::zeros([4, 8], (tch::Kind::Float, Device::Cpu)), // expected [8, 512]
+        );
+        let bytes = serialize_state_dict_to_bytes(&state).unwrap();
+        let fname = DeltaPool::sanitize_filename(&tid.to_string());
+        std::fs::write(dir.join(format!("{}.safetensors", fname)), &bytes).unwrap();
+
+        // Must not panic; falls open to blank and quarantines.
+        let delta_arc = pool.get_or_hydrate(&tid).await.unwrap();
+        {
+            let d = delta_arc.lock();
+            assert_eq!(d.lora_a["0.q_proj"].size(), vec![8, 512]);
+        }
+        assert!(
+            dir.join(format!("{}.safetensors.corrupt", fname)).exists(),
+            "incompatible snapshot quarantined"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Hydrating a subject with no snapshot yields a normal blank delta.
+    #[tokio::test]
+    async fn test_hydrate_no_snapshot_is_blank() {
+        let dir = unique_snapshots_dir("nosnap");
+        let pool = pool_with_dir(dir.clone());
+        let tid = Subject::new("tenant-fresh");
+
+        let delta_arc = pool.get_or_hydrate(&tid).await.unwrap();
+        let d = delta_arc.lock();
+        assert_eq!(d.accumulated_steps, 0);
+        assert_eq!(pool.tenant_count(), 1);
+        drop(d);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// export_all with no FsOps is a logged no-op (no worktree to write through).
+    #[tokio::test]
+    async fn test_export_all_no_fs_is_noop() {
+        let dir = unique_snapshots_dir("exportnofs");
+        let pool = pool_with_dir(dir.clone());
+        let tid = Subject::new("tenant-x");
+        {
+            let d = pool.get_or_create(&tid).unwrap();
+            d.lock().accumulated_steps = 3;
+        }
+        // fs = None -> export_all returns empty (documented FsOps-absent skip).
+        let exported = pool.export_all().await.unwrap();
+        assert!(exported.is_empty());
+        // Delta stays resident (export never evicts).
+        assert_eq!(pool.tenant_count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
