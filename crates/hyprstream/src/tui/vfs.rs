@@ -141,6 +141,12 @@ pub fn build_chat_vfs_namespace(
         subject: subject.clone(),
         model_client,
         registry: None,
+        model_path: "/srv/model".to_owned(),
+        registry_path: "/srv/registry".to_owned(),
+        worktree_path: "/worktree".to_owned(),
+        bin_path: "/bin".to_owned(),
+        env_path: "/env".to_owned(),
+        tcl_path: "/lang/tcl".to_owned(),
     });
 
     Ok((Arc::new(ns), subject))
