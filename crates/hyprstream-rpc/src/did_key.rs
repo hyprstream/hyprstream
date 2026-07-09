@@ -23,30 +23,57 @@ use anyhow::{anyhow, bail, Result};
 /// codepath shares.
 pub(crate) const MULTICODEC_ED25519_PUB: [u8; 2] = [0xed, 0x01];
 
-/// Decode a `Multikey` `publicKeyMultibase` string into raw Ed25519 key bytes.
+/// Multicodec `ml-dsa-65-pub` unsigned-varint prefix (`0x1211` → bytes `0x91 0x24`).
 ///
-/// Verifies the base58btc multibase prefix (`z`) and the `ed25519-pub` multicodec
-/// header, returning the 32-byte payload.
+/// The PQ counterpart to [`MULTICODEC_ED25519_PUB`]: the header the mesh's
+/// `#mesh-pq` ML-DSA-65 verification method carries in its `publicKeyMultibase`.
+/// Mirrors `hyprstream::auth::mesh_trust::MULTICODEC_ML_DSA_65_PUB` (a 2-byte
+/// constant duplicated across the `hyprstream`/`hyprstream-rpc` crate boundary
+/// because `hyprstream-rpc` is the lower crate). Within `hyprstream-rpc` this is
+/// the one definition every codec-agile `Multikey` decode shares.
+pub const MULTICODEC_ML_DSA_65_PUB: [u8; 2] = [0x91, 0x24];
+
+/// Decode a `Multikey` `publicKeyMultibase` string into its raw key bytes,
+/// verifying the base58btc multibase prefix (`z`) and the `expected_codec`
+/// multicodec header, returning the payload with the multicodec prefix stripped.
 ///
-/// Returns `Err` for a wrong multibase, an undecodable base58, a non-Ed25519
-/// codec, or a payload that is not exactly 32 bytes.
-pub fn decode_ed25519_multikey(multibase: &str) -> Result<[u8; 32]> {
+/// This is the **codec-agile** core: it is algorithm-parametric over the
+/// multicodec header, so one implementation covers the `ed25519-pub` (`0xed01`)
+/// and `ml-dsa-65-pub` (`0x1211`) Multikeys the mesh publishes (and any future
+/// codec). [`decode_ed25519_multikey`] is the Ed25519-fixed thin wrapper.
+///
+/// Returns `Err` for a wrong multibase, an undecodable base58, or a multicodec
+/// header that does not match `expected_codec`. Payload *length* validation is
+/// the caller's concern (it is algorithm-specific).
+pub fn decode_multikey(multibase: &str, expected_codec: &[u8; 2]) -> Result<Vec<u8>> {
     let body = multibase
         .strip_prefix('z')
         .ok_or_else(|| anyhow!("Multikey must use base58btc multibase ('z') prefix"))?;
     let decoded = bs58::decode(body)
         .into_vec()
         .map_err(|e| anyhow!("invalid base58btc Multikey: {e}"))?;
-    if decoded.len() < 2 || decoded[..2] != MULTICODEC_ED25519_PUB {
+    if decoded.len() < 2 || &decoded[..2] != expected_codec {
         bail!(
-            "unexpected multicodec prefix (expected ed25519-pub {MULTICODEC_ED25519_PUB:02x?}, got {:02x?})",
+            "unexpected multicodec prefix (expected {expected_codec:02x?}, got {:02x?})",
             decoded.get(..2).unwrap_or(&decoded)
         );
     }
-    let raw: [u8; 32] = decoded[2..]
-        .try_into()
-        .map_err(|_| anyhow!("ed25519 Multikey payload is {} bytes (expected 32)", decoded.len() - 2))?;
-    Ok(raw)
+    Ok(decoded[2..].to_vec())
+}
+
+/// Decode a `Multikey` `publicKeyMultibase` string into raw Ed25519 key bytes.
+///
+/// A thin, length-checked wrapper over the codec-agile [`decode_multikey`]:
+/// verifies the base58btc multibase prefix (`z`) and the `ed25519-pub` multicodec
+/// header, returning the 32-byte payload.
+///
+/// Returns `Err` for a wrong multibase, an undecodable base58, a non-Ed25519
+/// codec, or a payload that is not exactly 32 bytes.
+pub fn decode_ed25519_multikey(multibase: &str) -> Result<[u8; 32]> {
+    let raw = decode_multikey(multibase, &MULTICODEC_ED25519_PUB)?;
+    let len = raw.len();
+    raw.try_into()
+        .map_err(|_| anyhow!("ed25519 Multikey payload is {len} bytes (expected 32)"))
 }
 
 /// Decode a `did:key` (Ed25519) identifier into its raw 32-byte Ed25519 key.

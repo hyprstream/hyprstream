@@ -240,7 +240,10 @@ pub fn preferred_transport(doc: &Value, kind: Option<SocketKind>) -> Option<Tran
 // share one implementation and cannot drift. They are re-exported here so
 // existing `crate::did_web::*` callers (admission gate, federation tests) are
 // unaffected.
-pub use crate::did_key::{decode_ed25519_multikey, did_key_to_ed25519, ed25519_to_did_key};
+pub use crate::did_key::{
+    decode_ed25519_multikey, decode_multikey, did_key_to_ed25519, ed25519_to_did_key,
+    MULTICODEC_ML_DSA_65_PUB,
+};
 // Only the test multikey helper references the raw multicodec constant now.
 #[cfg(test)]
 use crate::did_key::MULTICODEC_ED25519_PUB;
@@ -277,6 +280,47 @@ pub fn verification_method_ed25519_keys(doc: &Value) -> Vec<[u8; 32]> {
             Ok(k) => keys.push(k),
             Err(e) => {
                 tracing::debug!(error = %e, "skipping undecodable verificationMethod Multikey");
+            }
+        }
+    }
+    keys
+}
+
+/// Extract every ML-DSA-65 verifying key published in a DID document's
+/// `verificationMethod` array (#579 multi-alg VM extraction).
+///
+/// The PQ counterpart to [`verification_method_ed25519_keys`]: it scans the same
+/// `verificationMethod` array but keeps the `Multikey` entries whose
+/// `publicKeyMultibase` carries the `ml-dsa-65-pub` multicodec (`0x1211`) — the
+/// mesh's `#mesh-pq` verification method. Each candidate is decoded via the
+/// codec-agile [`decode_multikey`] and validated as a real ML-DSA-65 key by
+/// [`crate::crypto::pq::ml_dsa_vk_from_bytes`] (a malformed / wrong-length key is
+/// skipped, never trusted). Ed25519 (`0xed01`) VMs decode to a different codec
+/// and are skipped here, so the two extractors partition the same document by
+/// algorithm without interfering.
+///
+/// A document with no ML-DSA-65 VM yields an **empty** vec (the classical-only
+/// case): the caller treats "no PQ anchor" as `Assurance::Classical`, not an
+/// error.
+pub fn verification_method_ml_dsa_65_keys(doc: &Value) -> Vec<crate::crypto::pq::MlDsaVerifyingKey> {
+    let Some(vms) = doc.get("verificationMethod").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut keys = Vec::new();
+    for vm in vms {
+        let Some(mb) = vm.get("publicKeyMultibase").and_then(Value::as_str) else {
+            continue;
+        };
+        // Only ml-dsa-65-pub Multikeys; an ed25519 (or other) codec is not an
+        // error here — it belongs to the Ed25519 extractor — so skip quietly.
+        let raw = match decode_multikey(mb, &MULTICODEC_ML_DSA_65_PUB) {
+            Ok(raw) => raw,
+            Err(_) => continue,
+        };
+        match crate::crypto::pq::ml_dsa_vk_from_bytes(&raw) {
+            Ok(vk) => keys.push(vk),
+            Err(e) => {
+                tracing::debug!(error = %e, "skipping ml-dsa-65 verificationMethod: not a valid ML-DSA-65 key");
             }
         }
     }

@@ -178,6 +178,10 @@ pub mod did_key;
 pub mod did_web;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod admission;
+// The real, method-dispatched `IdentityResolver` (#579). Native-only: the
+// did:web arm depends on `did_web`'s DID-document helpers.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod identity_resolver;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod notify;
 #[cfg(not(target_arch = "wasm32"))]
