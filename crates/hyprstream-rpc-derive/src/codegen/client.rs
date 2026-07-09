@@ -173,16 +173,13 @@ fn generate_trait_method(
             vec![quote! { value: #ty }]
         }
         struct_name => {
-            if let Some(s) = resolved.find_struct(struct_name) {
-                let nuf: Vec<_> = s.non_union_fields().collect();
-                if nuf.is_empty() || (nuf.len() == 1 && nuf[0].type_name == "Void") {
-                    Vec::new()
-                } else {
-                    let data_name = format_ident!("{}", struct_name);
-                    vec![quote! { request: &#data_name }]
-                }
+            let s = resolved.find_struct(struct_name)?;
+            let nuf: Vec<_> = s.non_union_fields().collect();
+            if nuf.is_empty() || (nuf.len() == 1 && nuf[0].type_name == "Void") {
+                Vec::new()
             } else {
-                return None;
+                let data_name = format_ident!("{}", struct_name);
+                vec![quote! { request: &#data_name }]
             }
         }
     };
@@ -231,15 +228,12 @@ fn determine_return_type(
             quote! { Vec<#data_name> }
         }
         CapnpType::Struct(ref name) => {
-            if let Some(s) = resolved.find_struct(name) {
-                if let Some(ref dt) = s.domain_type {
-                    resolve_domain_type(dt, types_crate)
-                } else {
-                    let data_name = format_ident!("{}", name);
-                    quote! { #data_name }
-                }
+            let s = resolved.find_struct(name)?;
+            if let Some(ref dt) = s.domain_type {
+                resolve_domain_type(dt, types_crate)
             } else {
-                return None;
+                let data_name = format_ident!("{}", name);
+                quote! { #data_name }
             }
         }
         _ => return None,
@@ -421,16 +415,13 @@ fn generate_trait_method_impl(
             (vec![quote! { value: #ty }], vec![quote! { value }])
         }
         struct_name => {
-            if let Some(s) = resolved.find_struct(struct_name) {
-                let nuf: Vec<_> = s.non_union_fields().collect();
-                if nuf.is_empty() || (nuf.len() == 1 && nuf[0].type_name == "Void") {
-                    (Vec::new(), Vec::new())
-                } else {
-                    let data_name = format_ident!("{}", struct_name);
-                    (vec![quote! { request: &#data_name }], vec![quote! { request }])
-                }
+            let s = resolved.find_struct(struct_name)?;
+            let nuf: Vec<_> = s.non_union_fields().collect();
+            if nuf.is_empty() || (nuf.len() == 1 && nuf[0].type_name == "Void") {
+                (Vec::new(), Vec::new())
             } else {
-                return None;
+                let data_name = format_ident!("{}", struct_name);
+                (vec![quote! { request: &#data_name }], vec![quote! { request }])
             }
         }
     };
