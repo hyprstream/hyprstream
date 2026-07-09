@@ -5,5 +5,5 @@
 # — a non-deterministic, cache-dependent merge blocker. Bump this deliberately
 # (and fix any new lints in the same PR) rather than letting it float.
 [toolchain]
-channel = "1.96.0"
+channel = "1.97.0"
 components = ["clippy", "rustfmt"]
