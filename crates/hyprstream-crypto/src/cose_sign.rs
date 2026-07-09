@@ -54,7 +54,7 @@
 //! ```
 //!
 //! Both layers bind the base `external_aad` (the CBOR `[envelope_schema_id,
-//! inner_type_id]` schema binding, see [`crate::crypto::cose_sign1::build_external_aad`]),
+//! inner_type_id]` schema binding, see [`crate::cose_sign1::build_external_aad`]),
 //! and — in **Hybrid** mode only — *additionally* bind a hybrid-composite
 //! algorithm identifier (see [`HYBRID_COMPOSITE_ALG_ID`]) into both layers'
 //! `external_aad` via [`build_hybrid_external_aad`].
@@ -107,7 +107,7 @@ use coset::{
     CborSerializable, CoseSign1, CoseSign1Builder, HeaderBuilder,
 };
 
-use crate::crypto::pq::{ml_dsa_sign, ml_dsa_verify, MlDsaSigningKey, MlDsaVerifyingKey};
+use crate::pq::{ml_dsa_sign, ml_dsa_verify, MlDsaSigningKey, MlDsaVerifyingKey};
 
 /// IANA COSE algorithm id for ML-DSA-65 (FIPS 204, draft-ietf-cose-dilithium).
 pub const ALG_ML_DSA_65: i64 = iana::Algorithm::ML_DSA_65 as i64;
@@ -174,7 +174,7 @@ fn eddsa_kid(vk: &ed25519_dalek::VerifyingKey) -> Vec<u8> {
 
 /// ML-DSA-65 kid convention: raw verifying key bytes (1952 bytes).
 fn ml_dsa_kid(vk: &MlDsaVerifyingKey) -> Vec<u8> {
-    crate::crypto::pq::ml_dsa_vk_bytes(vk)
+    crate::pq::ml_dsa_vk_bytes(vk)
 }
 
 /// Build the inner EdDSA `COSE_Sign1` over the detached `payload`.
@@ -581,8 +581,8 @@ fn ed_verify(vk: &ed25519_dalek::VerifyingKey, msg: &[u8], sig: &[u8]) -> Result
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::crypto::cose_sign1::build_external_aad;
-    use crate::crypto::pq::ml_dsa_generate_keypair;
+    use crate::cose_sign1::build_external_aad;
+    use crate::pq::ml_dsa_generate_keypair;
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
 

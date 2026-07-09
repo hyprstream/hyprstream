@@ -18,31 +18,12 @@
 use hyprstream_rpc::envelope::KeyedPqTrustStore;
 use hyprstream_rpc::Subject;
 
+// The multikey codec + multicodec constants are the single canonical home in
+// `hyprstream-crypto` (re-exported via `hyprstream_rpc::did_key`); the previous
+// local copies here were deduplicated in #916.
+use hyprstream_rpc::did_key::{decode_multikey, MULTICODEC_ED25519_PUB, MULTICODEC_ML_DSA_65_PUB};
+
 use crate::config::OAuthConfig;
-
-/// Multicodec `ed25519-pub` unsigned-varint prefix (`0xed01` → bytes `0xed 0x01`).
-const MULTICODEC_ED25519_PUB: [u8; 2] = [0xed, 0x01];
-/// Multicodec `ml-dsa-65-pub` unsigned-varint prefix (`0x1211` → bytes `0x91 0x24`).
-const MULTICODEC_ML_DSA_65_PUB: [u8; 2] = [0x91, 0x24];
-
-/// Decode a `Multikey` `publicKeyMultibase` string into the raw key bytes,
-/// verifying the multibase prefix (`z`, base58btc) and the expected multicodec
-/// header. Returns the payload with the multicodec prefix stripped.
-pub fn decode_multikey(multibase: &str, expected_codec: &[u8; 2]) -> anyhow::Result<Vec<u8>> {
-    let body = multibase
-        .strip_prefix('z')
-        .ok_or_else(|| anyhow::anyhow!("Multikey must use base58btc multibase ('z') prefix"))?;
-    let decoded = bs58::decode(body)
-        .into_vec()
-        .map_err(|e| anyhow::anyhow!("invalid base58btc Multikey: {e}"))?;
-    if decoded.len() < 2 || &decoded[..2] != expected_codec {
-        anyhow::bail!(
-            "unexpected multicodec prefix (expected {expected_codec:02x?}, got {:02x?})",
-            decoded.get(..2).unwrap_or(&decoded)
-        );
-    }
-    Ok(decoded[2..].to_vec())
-}
 
 /// Build the kid-anchored ML-DSA-65 trust store from the admin-configured
 /// `mesh_peers` (#157, Option A — eager, admin-anchored, immutable).

@@ -5,23 +5,54 @@
 //! stripping used to convert between a raw 32-byte Ed25519 public key and its
 //! `did:key:z6Mk…` / Multikey `publicKeyMultibase` forms.
 //!
-//! It is compiled on **all targets** (unlike `did_web`, which is native-only,
-//! and `iroh_peer`, which is wasm32-only) precisely so the native `did:web`
-//! admission resolver and the wasm32 `iroh_peer` browser identity helpers share
-//! one implementation and can never drift (#281/#475). `did_web` re-exports
-//! these as `crate::did_web::{decode_ed25519_multikey, did_key_to_ed25519,
-//! ed25519_to_did_key}` for source compatibility with existing callers.
+//! It is compiled on **all targets** (unlike `did:web` resolution, which is
+//! native-only, and `iroh_peer`, which is wasm32-only) precisely so the native
+//! `did:web` admission resolver and the wasm32 `iroh_peer` browser identity
+//! helpers share one implementation and can never drift (#281/#475).
+//! `hyprstream_rpc::did_web` re-exports `decode_ed25519_multikey`,
+//! `did_key_to_ed25519`, and `ed25519_to_did_key` for source compatibility with
+//! existing callers.
+//!
+//! This module is the **single canonical home** for the multicodec constants
+//! ([`MULTICODEC_ED25519_PUB`], [`MULTICODEC_ML_DSA_65_PUB`]) and the generic
+//! [`decode_multikey`] helper (#916); previously these were duplicated in
+//! `hyprstream::auth::mesh_trust` and `hyprstream-rpc`'s `service_entry`.
 
 use anyhow::{anyhow, bail, Result};
 
 /// Multicodec `ed25519-pub` unsigned-varint prefix (`0xed01` → bytes `0xed 0x01`).
 ///
-/// Mirrors `hyprstream::auth::mesh_trust::MULTICODEC_ED25519_PUB`; duplicated
-/// across the `hyprstream`/`hyprstream-rpc` crate boundary (a 2-byte constant)
-/// because `hyprstream-rpc` is the lower crate and cannot depend on `hyprstream`.
-/// Within `hyprstream-rpc`, however, this is the one definition every `did:key`
-/// codepath shares.
-pub(crate) const MULTICODEC_ED25519_PUB: [u8; 2] = [0xed, 0x01];
+/// This is the one canonical definition every `did:key` / Multikey codepath
+/// shares across the workspace.
+pub const MULTICODEC_ED25519_PUB: [u8; 2] = [0xed, 0x01];
+
+/// Multicodec `ml-dsa-65-pub` unsigned-varint prefix (`0x1211` → bytes `0x91 0x24`).
+pub const MULTICODEC_ML_DSA_65_PUB: [u8; 2] = [0x91, 0x24];
+
+/// Decode a `Multikey` `publicKeyMultibase` string into raw key bytes, verifying
+/// the base58btc multibase prefix (`z`) and the expected multicodec header.
+///
+/// Returns the payload with the multicodec prefix stripped (variable length; the
+/// caller validates the key length for its algorithm). For the fixed 32-byte
+/// Ed25519 case, prefer [`decode_ed25519_multikey`].
+///
+/// Returns `Err` for a wrong multibase, an undecodable base58, or a multicodec
+/// prefix that does not match `expected_codec`.
+pub fn decode_multikey(multibase: &str, expected_codec: &[u8; 2]) -> Result<Vec<u8>> {
+    let body = multibase
+        .strip_prefix('z')
+        .ok_or_else(|| anyhow!("Multikey must use base58btc multibase ('z') prefix"))?;
+    let decoded = bs58::decode(body)
+        .into_vec()
+        .map_err(|e| anyhow!("invalid base58btc Multikey: {e}"))?;
+    if decoded.len() < 2 || &decoded[..2] != expected_codec {
+        bail!(
+            "unexpected multicodec prefix (expected {expected_codec:02x?}, got {:02x?})",
+            decoded.get(..2).unwrap_or(&decoded)
+        );
+    }
+    Ok(decoded[2..].to_vec())
+}
 
 /// Decode a `Multikey` `publicKeyMultibase` string into raw Ed25519 key bytes.
 ///
@@ -31,22 +62,11 @@ pub(crate) const MULTICODEC_ED25519_PUB: [u8; 2] = [0xed, 0x01];
 /// Returns `Err` for a wrong multibase, an undecodable base58, a non-Ed25519
 /// codec, or a payload that is not exactly 32 bytes.
 pub fn decode_ed25519_multikey(multibase: &str) -> Result<[u8; 32]> {
-    let body = multibase
-        .strip_prefix('z')
-        .ok_or_else(|| anyhow!("Multikey must use base58btc multibase ('z') prefix"))?;
-    let decoded = bs58::decode(body)
-        .into_vec()
-        .map_err(|e| anyhow!("invalid base58btc Multikey: {e}"))?;
-    if decoded.len() < 2 || decoded[..2] != MULTICODEC_ED25519_PUB {
-        bail!(
-            "unexpected multicodec prefix (expected ed25519-pub {MULTICODEC_ED25519_PUB:02x?}, got {:02x?})",
-            decoded.get(..2).unwrap_or(&decoded)
-        );
-    }
-    let raw: [u8; 32] = decoded[2..]
+    let payload = decode_multikey(multibase, &MULTICODEC_ED25519_PUB)?;
+    let len = payload.len();
+    payload
         .try_into()
-        .map_err(|_| anyhow!("ed25519 Multikey payload is {} bytes (expected 32)", decoded.len() - 2))?;
-    Ok(raw)
+        .map_err(|_| anyhow!("ed25519 Multikey payload is {len} bytes (expected 32)"))
 }
 
 /// Decode a `did:key` (Ed25519) identifier into its raw 32-byte Ed25519 key.

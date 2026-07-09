@@ -26,17 +26,17 @@
 //! - Default: Ristretto255 (prime-order group, no cofactor issues)
 //! - `fips`: ECDH P-256 for FIPS 140-2 compliance
 
-pub mod backend;
+// Generic crypto primitives now live in the light `hyprstream-crypto` crate.
+// Re-exported here so existing `crate::crypto::{backend,cose_sign,cose_sign1,hmac,pq}`
+// (and external `hyprstream_rpc::crypto::…`) paths keep compiling unchanged (#916).
+pub use hyprstream_crypto::{backend, cose_sign, cose_sign1, hmac, pq};
+
 pub mod cose_encrypt;
-pub mod cose_sign;
-pub mod cose_sign1;
 pub mod event_crypto;
 pub mod group_key;
-pub mod hmac;
 pub mod hybrid_kem;
 pub mod key_exchange;
 pub mod broadcast_primitives;
-pub mod pq;
 pub mod signing;
 
 /// Runtime crypto mode selecting how envelopes/tokens are signed and verified.
