@@ -12,6 +12,10 @@ pub mod types;
 pub mod service;
 pub mod daemon;
 
+/// at9p mainline (BEP5) locator — see #889 / epic #880 Track C.
+#[cfg(feature = "mainline-locator")]
+pub mod locator;
+
 // Re-export commonly used types
 pub use error::{Error, Result};
 pub use types::*;
