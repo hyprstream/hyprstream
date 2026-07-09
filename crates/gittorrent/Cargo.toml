@@ -74,6 +74,7 @@ libp2p = { version = "0.56", features = ["kad", "mdns", "noise", "tcp", "tokio",
 # Mainline (BEP5) DHT locator for did:at9p (#889, epic #880 Track C).
 # Optional: nothing ships enabled until Track C wiring lands.
 mainline = { version = "7.0", optional = true }
+blake3 = { workspace = true, optional = true }
 multihash = "0.19"
 sha2 = "0.10"
 
@@ -91,7 +92,7 @@ default = []
 debug = []
 # at9p mainline (BEP5) locator: arbitrary-infohash announce/get_peers, which
 # iroh's internal pkarr cannot do. Off by default (#889 / epic #880 Track C).
-mainline-locator = ["dep:mainline"]
+mainline-locator = ["dep:blake3", "dep:mainline"]
 
 [lints]
 workspace = true
