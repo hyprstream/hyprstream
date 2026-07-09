@@ -209,7 +209,10 @@ impl DagCbor {
             }
             MT_ARRAY => {
                 let len = read_arg(info, input, cursor)? as usize;
-                let mut items = Vec::with_capacity(len);
+                // Cap preallocation by what the remaining input could possibly
+                // hold (each element needs at least 1 byte) — the length arg is
+                // untrusted and a huge value must not trigger a capacity panic.
+                let mut items = Vec::with_capacity(len.min(input.len().saturating_sub(*cursor)));
                 for _ in 0..len {
                     items.push(Self::read(input, cursor)?);
                 }
@@ -217,7 +220,10 @@ impl DagCbor {
             }
             MT_MAP => {
                 let len = read_arg(info, input, cursor)? as usize;
-                let mut pairs: Vec<(DagCbor, DagCbor)> = Vec::with_capacity(len);
+                // Same untrusted-length cap as the array arm (each entry needs
+                // at least 2 bytes, so remaining-input is a safe upper bound).
+                let mut pairs: Vec<(DagCbor, DagCbor)> =
+                    Vec::with_capacity(len.min(input.len().saturating_sub(*cursor)));
                 let mut prev_key: Option<Vec<u8>> = None;
                 for _ in 0..len {
                     let k = Self::read(input, cursor)?;
@@ -467,6 +473,22 @@ mod tests {
         let enc = v.encode();
         let dec = DagCbor::decode(&enc).expect("round-trip");
         assert_eq!(v, dec);
+    }
+
+    #[test]
+    fn decode_huge_array_header_errors_not_panics() {
+        // 0x9b = array with 8-byte length arg; length claims 2^64-1 elements
+        // but the input is only 9 bytes. Must return Err — not panic with a
+        // capacity overflow or attempt a huge allocation.
+        let input = [0x9b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        assert!(DagCbor::decode(&input).is_err());
+    }
+
+    #[test]
+    fn decode_huge_map_header_errors_not_panics() {
+        // 0xbb = map with 8-byte length arg claiming 2^64-1 entries.
+        let input = [0xbb, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        assert!(DagCbor::decode(&input).is_err());
     }
 
     #[test]
