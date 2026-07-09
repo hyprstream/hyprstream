@@ -150,6 +150,21 @@ fn parse_record_key(key: &[u8], did: &str) -> AnyResult<(String, Tid)> {
 /// callers that need a live view reopen per read (see [`RecordBacking::ReadOnly`]).
 pub struct PdsRecordStore {
     backing: RecordBacking,
+    /// Serializes the publisher's whole `load_repo → build_tree → sign →
+    /// put_record_and_commit` critical section (#913).
+    ///
+    /// Every repo on this node publishes under the node's *single* DID, so they
+    /// all share one `commit\0{did}` pointer and one MST. `PdsPublisher::publish`
+    /// is a read-modify-write (load the record set, add one record, re-sign the
+    /// commit over the new MST root) with no atomicity across load and write.
+    /// On a multi-threaded runtime two concurrent publishes would each load the
+    /// same base, add *their* record, and sign a commit over *their* view; the
+    /// later write clobbers the earlier record and persists a commit whose
+    /// `data` no longer matches the MST a reader rebuilds — so the served proof
+    /// fails verification. Holding this lock across the entire critical section
+    /// makes publishes mutually exclusive. `publish` is synchronous (no `.await`
+    /// under the guard), so a plain (non-async) mutex is the correct primitive.
+    publish_lock: parking_lot::Mutex<()>,
 }
 
 enum RecordBacking {
@@ -173,7 +188,10 @@ impl PdsRecordStore {
         opts.create_if_missing(true);
         let db = rocksdb::DB::open(&opts, path)
             .with_context(|| format!("failed to open PDS record store (rw) at {path:?}"))?;
-        Ok(Self { backing: RecordBacking::ReadWrite(db) })
+        Ok(Self {
+            backing: RecordBacking::ReadWrite(db),
+            publish_lock: parking_lot::Mutex::new(()),
+        })
     }
 
     /// Open the store read-only at `path`, for resolvers that never write
@@ -184,7 +202,17 @@ impl PdsRecordStore {
         let opts = readonly_opts();
         let _probe = rocksdb::DB::open_for_read_only(&opts, path, false)
             .with_context(|| format!("failed to open PDS record store (ro) at {path:?}"))?;
-        Ok(Self { backing: RecordBacking::ReadOnly(path.to_path_buf()) })
+        Ok(Self {
+            backing: RecordBacking::ReadOnly(path.to_path_buf()),
+            publish_lock: parking_lot::Mutex::new(()),
+        })
+    }
+
+    /// Acquire the per-node publish lock, serializing the whole publish
+    /// critical section (see [`PdsRecordStore::publish_lock`]). `parking_lot`
+    /// has no poisoning, so the guard is infallible.
+    fn lock_for_publish(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.publish_lock.lock()
     }
 
     /// Atomically persist a record and the repo's freshly-signed commit.
@@ -353,20 +381,39 @@ pub struct PdsPublisher {
     /// every record this node publishes (single-node, self-hosted PDS; a
     /// per-account DID scheme is out of scope for #910a).
     did: String,
-    /// This node's `#atproto` commit-signing key (P-256/ES256), sourced from
-    /// the shared `Es256SigningKeyStore` — the *same* key `did_document.rs`
-    /// publishes as the `#atproto` verification method. Held only here (the
-    /// writer); resolvers hold no key. Used to sign each commit exactly once.
-    signing_key: p256::ecdsa::SigningKey,
+    /// Resolves the **current** `#atproto` commit-signing key at publish time.
+    /// See [`Es256KeyGetter`] for why this must not be a frozen key.
+    key_getter: Es256KeyGetter,
 }
 
+/// Resolves the current `#atproto` commit-signing key (P-256/ES256) on demand.
+///
+/// The publisher must **never** capture a single `SigningKey` at construction:
+/// the ES256 store rotates (~14 days) and `oauth::did_document` publishes only
+/// the *active* slot's key as the `#atproto` verification method. A frozen key
+/// would keep signing commits after the first rotation while the DID document
+/// advertises the new active key — so every new commit would fail verification
+/// until the process restarts (#913, Bug 2). This getter is invoked *inside*
+/// `publish`, so each commit is signed with the exact key the DID document
+/// advertises right now. In production the factory wires this to the live
+/// `Es256SigningKeyStore` (reading its active slot per call).
+///
+/// KNOWN LIMITATION (out of scope for #910a, tracked in #918): this getter
+/// keeps *new* commits signed by the current
+/// active key, but it does NOT rescue commits already persisted under a
+/// now-rotated key. `oauth::did_document` publishes only the single active
+/// `#atproto` verification method (no drain/lead slots), so once the active
+/// ES256 key rotates, previously-signed commits stop verifying against the
+/// published DID document until this repo is re-published (which re-signs with
+/// the new active key). A durable fix needs either drain-slot publication in
+/// the DID document (an atproto rotation-log-scale change) or re-signing every
+/// stored commit on rotation.
+pub type Es256KeyGetter =
+    Arc<dyn Fn() -> Option<p256::ecdsa::SigningKey> + Send + Sync>;
+
 impl PdsPublisher {
-    pub fn new(
-        store: Arc<PdsRecordStore>,
-        did: String,
-        signing_key: p256::ecdsa::SigningKey,
-    ) -> Self {
-        Self { store, did, signing_key }
+    pub fn new(store: Arc<PdsRecordStore>, did: String, key_getter: Es256KeyGetter) -> Self {
+        Self { store, did, key_getter }
     }
 
     /// Publish (or advance) the `ai.hyprstream.model` record for `repo_id`,
@@ -386,6 +433,20 @@ impl PdsPublisher {
     /// PDS publish is caught up by the next successful one (same
     /// eventual-consistency contract `git::promote` documents).
     pub fn publish(&self, repo_id: &str, current_oid_hex: &str) -> AnyResult<()> {
+        // Resolve the CURRENT active `#atproto` key (never a frozen
+        // construction-time capture): the ES256 store rotates and did_document
+        // publishes only the active key, so each commit must be signed with the
+        // key advertised right now (#913, Bug 2). See `Es256KeyGetter`.
+        let signing_key = (self.key_getter)()
+            .ok_or_else(|| anyhow!("no active ES256 #atproto key for PDS publish"))?;
+
+        // Serialize the ENTIRE read-modify-write critical section (#913, Bug 1):
+        // all repos share this node's one DID → one commit pointer + one MST, so
+        // the load→build→sign→write below must be mutually exclusive or a
+        // concurrent publish is silently lost (see `publish_lock`). Held across
+        // the whole sequence; released when this guard drops at end of scope.
+        let _publish_guard = self.store.lock_for_publish();
+
         let tid = PdsRecordStore::tid_for_repo(repo_id);
         let current_oid_cid = git_oid_to_cid_string(current_oid_hex)?;
         let record = ModelRecord::new(
@@ -412,7 +473,7 @@ impl PdsPublisher {
             None => (Tid::now(), None),
         };
         let unsigned = UnsignedCommit::new(self.did.clone(), root, rev, prev);
-        let commit = Commit::sign(&unsigned, &self.signing_key);
+        let commit = Commit::sign(&unsigned, &signing_key);
 
         self.store
             .put_record_and_commit(&self.did, COLLECTION_NSID, tid, &record, &commit)
@@ -495,6 +556,21 @@ impl RecordResolver for PdsRecordResolver {
         // re-signing. The proof's root is `commit.data`, which the rebuilt tree
         // reproduces exactly (records + commit were persisted together).
         let tree = PdsRecordStore::build_tree(&repo.records);
+        // Fail-closed consistency check (#913, defence in depth): the stored
+        // commit's `data` MUST equal the root of the MST we just rebuilt from
+        // the persisted record set. If a divergence ever slips through (e.g. an
+        // unserialized concurrent write), the proof would fail verification at
+        // the client anyway — refuse to serve it rather than hand out an
+        // inconsistent proof.
+        if tree.root_cid() != repo.commit.data {
+            tracing::error!(
+                did, collection, rkey,
+                "PDS store inconsistent: rebuilt MST root != signed commit.data — refusing to serve"
+            );
+            return Err(anyhow::anyhow!(
+                "PDS store inconsistent for {did}: rebuilt MST root != signed commit.data"
+            ));
+        }
         let proof = tree
             .proof(COLLECTION_NSID, &tid)
             .ok_or_else(|| anyhow::anyhow!("record present but no MST proof — store inconsistent"))?;
@@ -526,6 +602,18 @@ impl RecordResolver for PdsRecordResolver {
         let record = record.clone();
 
         let tree = PdsRecordStore::build_tree(&repo.records);
+        // Fail-closed consistency check (#913, defence in depth) — see
+        // `resolve_record`: the stored commit must sign exactly the MST we
+        // rebuild, or we refuse to serve.
+        if tree.root_cid() != repo.commit.data {
+            tracing::error!(
+                did,
+                "PDS store inconsistent: rebuilt MST root != signed commit.data — refusing to serve"
+            );
+            return Err(anyhow::anyhow!(
+                "PDS store inconsistent for {did}: rebuilt MST root != signed commit.data"
+            ));
+        }
         let proof = tree
             .proof(COLLECTION_NSID, &tid)
             .ok_or_else(|| anyhow::anyhow!("repo record has no MST proof — store inconsistent"))?;
@@ -548,6 +636,13 @@ mod pds_store_tests {
     const SAMPLE_OID: &str = "1111111111111111111111111111111111111111";
     const SAMPLE_OID_2: &str = "2222222222222222222222222222222222222222";
     const DID: &str = "did:key:zTestNode";
+
+    /// A fixed-key getter for tests: the concurrency/keyless-read hazards under
+    /// test are unrelated to rotation, so a single stable key is exactly right.
+    fn fixed_getter(sk: &SigningKey) -> Es256KeyGetter {
+        let sk = sk.clone();
+        Arc::new(move || Some(sk.clone()))
+    }
 
     /// Extract and decode the signed commit from a proof CAR (its single root).
     fn commit_from_car(car: &[u8]) -> Commit {
@@ -578,7 +673,7 @@ mod pds_store_tests {
         let vk: VerifyingKey = *sk.verifying_key();
 
         let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), fixed_getter(&sk));
         publisher.publish("repo-a", SAMPLE_OID).expect("publish");
 
         // Resolver holds no key at all.
@@ -603,7 +698,7 @@ mod pds_store_tests {
         let vk: VerifyingKey = *sk.verifying_key();
 
         let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), fixed_getter(&sk));
         publisher.publish("repo-a", SAMPLE_OID).expect("publish");
 
         // Reconstruct the proof the same way the resolver does (store holds no
@@ -628,7 +723,7 @@ mod pds_store_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let sk = SigningKey::random(&mut rand::rngs::OsRng);
         let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), fixed_getter(&sk));
 
         publisher.publish("repo-a", SAMPLE_OID).expect("publish 1");
         let first = store.load_repo(DID).expect("load").expect("repo").commit;
@@ -652,7 +747,7 @@ mod pds_store_tests {
 
         {
             let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-            let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+            let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), fixed_getter(&sk));
             publisher.publish("repo-b", SAMPLE_OID).expect("publish");
             // Writer handle dropped here — simulates a process restart.
         }
@@ -699,5 +794,71 @@ mod pds_store_tests {
         assert_eq!(first, second, "the same repo must always get the same rkey");
         let other = PdsRecordStore::tid_for_repo("repo-b");
         assert_ne!(first, other, "distinct repos must not alias onto one rkey");
+    }
+
+    #[test]
+    fn concurrent_publishes_serialize_and_stay_consistent() {
+        // Regression for #913 Bug 1. All repos publish under the node's single
+        // DID, sharing one commit pointer + one MST. Many threads publish
+        // distinct records concurrently; the publish lock must make the
+        // load→build→sign→write critical section mutually exclusive. Without the
+        // lock this FAILS — a lost update leaves fewer than N records and/or a
+        // stored commit whose `data` no longer matches the rebuilt MST root.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let vk: VerifyingKey = *sk.verifying_key();
+
+        let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
+        let publisher = Arc::new(PdsPublisher::new(
+            Arc::clone(&store),
+            DID.to_owned(),
+            fixed_getter(&sk),
+        ));
+
+        const N: usize = 8;
+        let repos: Vec<String> = (0..N).map(|i| format!("repo-{i}")).collect();
+
+        let mut handles = Vec::new();
+        for repo in &repos {
+            let publisher = Arc::clone(&publisher);
+            let repo = repo.clone();
+            handles.push(std::thread::spawn(move || {
+                publisher.publish(&repo, SAMPLE_OID).expect("publish");
+            }));
+        }
+        for h in handles {
+            h.join().expect("publish thread joined");
+        }
+
+        // (a) Every concurrently-published record survived — no lost update.
+        let repo = store.load_repo(DID).expect("load ok").expect("repo present");
+        assert_eq!(repo.records.len(), N, "all {N} records must survive");
+        for r in &repos {
+            let tid = PdsRecordStore::tid_for_repo(r);
+            assert!(
+                repo.records.contains_key(&(COLLECTION_NSID.to_owned(), tid)),
+                "record for {r} missing — a concurrent publish was lost"
+            );
+        }
+
+        // (b) The stored commit signs exactly the MST over the FULL record set,
+        // and each record's proof verifies keyless against the published key.
+        let tree = PdsRecordStore::build_tree(&repo.records);
+        assert_eq!(
+            tree.root_cid(),
+            repo.commit.data,
+            "stored commit.data must equal the MST root over all records"
+        );
+        for r in &repos {
+            let tid = PdsRecordStore::tid_for_repo(r);
+            let record = repo
+                .records
+                .get(&(COLLECTION_NSID.to_owned(), tid))
+                .cloned()
+                .expect("record present");
+            let proof = tree.proof(COLLECTION_NSID, &tid).expect("proof");
+            verify_record_proof(&repo.commit, &vk, &proof, &record)
+                .expect("each record proof must verify against the published key");
+        }
     }
 }

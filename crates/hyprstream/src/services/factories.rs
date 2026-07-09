@@ -568,19 +568,36 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
         let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir();
         let es256_store =
             crate::auth::key_rotation::global_es256_key_store(&secrets_dir, &config.oauth);
-        // `active_key` is async (tokio RwLock); resolve it once here on the
-        // current runtime. `block_in_place` avoids stalling a worker reactor.
-        let active = tokio::task::block_in_place(|| {
+        // `active_key` is async (tokio RwLock). Probe once here so a node with no
+        // #atproto key disables publish (with a warning) rather than silently
+        // failing every commit later; `block_in_place` avoids stalling a worker
+        // reactor.
+        let has_key = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(es256_store.active_key())
         })
-        .ok_or_else(|| anyhow::anyhow!("no active ES256 #atproto key for PDS publish"))?;
-        let atproto_key: p256::ecdsa::SigningKey = (*active).clone();
+        .is_some();
+        if !has_key {
+            anyhow::bail!("no active ES256 #atproto key for PDS publish");
+        }
+        // Source the signing key from the LIVE store on every publish — never a
+        // frozen construction-time capture. The ES256 store rotates (~14 days)
+        // and `oauth::did_document` publishes only the active slot, so each
+        // commit must be signed with the currently-advertised key (#913, Bug 2).
+        let key_getter: crate::services::discovery::Es256KeyGetter = {
+            let es256_store = Arc::clone(&es256_store);
+            Arc::new(move || {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(es256_store.active_key())
+                })
+                .map(|k| (*k).clone())
+            })
+        };
         let store = crate::services::discovery::PdsRecordStore::open(&store_dir)?;
         let node_did = hyprstream_rpc::did_key::ed25519_to_did_key(&ctx.verifying_key().to_bytes());
         Ok(crate::services::discovery::PdsPublisher::new(
             Arc::new(store),
             node_did,
-            atproto_key,
+            key_getter,
         ))
     })()
     .map_err(|e| tracing::warn!("PDS publish disabled: {e}"))
