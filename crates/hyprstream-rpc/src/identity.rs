@@ -77,6 +77,16 @@ impl Did {
         self.0.starts_with("did:web:")
     }
 
+    /// Whether this is a `did:at9p` identifier (the self-certifying hybrid-PQC
+    /// capsule identity, #879/#880).
+    ///
+    /// The capsule GATE pipeline that verifies a `did:at9p` and derives its
+    /// `PqHybrid` key material is epic #880 (D2); the method-dispatched resolver
+    /// reserves the arm but does not yet resolve it (fails closed until #894).
+    pub fn is_did_at9p(&self) -> bool {
+        self.0.starts_with("did:at9p:")
+    }
+
     /// Decode the raw 32-byte Ed25519 public key from a `did:key` identifier.
     ///
     /// Returns `Err` for a non-`did:key` DID, a non-Ed25519 multicodec, or a malformed body.
