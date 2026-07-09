@@ -31,6 +31,10 @@ blake3 = { workspace = true }
 # Random signing keys for round-trip / tamper tests.
 rand = { workspace = true }
 proptest = { workspace = true }
+# at9p_resolver tests exercise the admission arm (admit_key_against_did) which is
+# generic over DidDocResolve — an async trait — against a never-call test double.
+async-trait = { workspace = true }
+serde_json = { workspace = true }
 
 # E1 (#421) end-to-end content-addressing + identity test. The dev-deps are the
 # three crates whose composition the test validates: git2db (repo → commit OID),

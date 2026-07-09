@@ -50,6 +50,7 @@
 pub mod at9p;
 pub mod at9p_chain;
 pub mod at9p_gate;
+pub mod at9p_resolver;
 pub mod at9p_sign;
 pub mod car;
 pub mod cid;

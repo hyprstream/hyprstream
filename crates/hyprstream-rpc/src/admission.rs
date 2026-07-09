@@ -61,6 +61,41 @@ use crate::did_web::{
     did_key_to_ed25519, is_did_key, jwks_ed25519_keys, verification_method_ed25519_keys, DidDocFetcher,
     DidWebResolver,
 };
+use crate::envelope::KeyedPqTrustStore;
+use crate::identity_resolver::At9pCapsuleResolver;
+
+/// The `did:at9p:` method prefix; a `did:at9p` identifier is this prefix followed
+/// by the base32 CIDv1 (`cid512`) of the genesis capsule (#884).
+const DID_AT9P_PREFIX: &str = "did:at9p:";
+
+/// Whether `did` is a `did:at9p` identifier (the self-certifying hybrid-PQC arm).
+fn is_did_at9p(did: &str) -> bool {
+    did.starts_with(DID_AT9P_PREFIX)
+}
+
+/// Inputs for the `did:at9p` admission arm (D2/#894).
+///
+/// Parallel to the `is_did_key` arm, but a `did:at9p` peer upgrades its classical
+/// channel key to a hybrid-PQC anchor, so the arm additionally needs:
+/// - the **capsule bytes** the peer presented over the channel,
+/// - a **GATE verifier** ([`At9pCapsuleResolver`]) that runs the A4
+///   canon→hash→sig pipeline (#884) and returns the content-verified subject keys,
+/// - the **[`KeyedPqTrustStore`]** to bind those verified hybrid keys into — the
+///   atomic `ed25519 → ml_dsa_65` binding that replaces the out-of-band
+///   `mesh_peers` config path for `did:at9p` peers.
+///
+/// The arm is exercised by passing `Some(At9pAdmission { .. })` to
+/// [`admit_key_against_did`]; the live mesh admission flow is not wired beyond
+/// this arm, so [`FederationAdmissionGate::admit`] passes `None` (a `did:at9p`
+/// peer reaching that path fails closed until the accept path feeds capsule bytes).
+pub struct At9pAdmission<'a> {
+    /// The raw genesis capsule bytes the peer presented for `did:at9p:<cid512>`.
+    pub capsule_bytes: &'a [u8],
+    /// The GATE verifier (implemented in `hyprstream-pds` over `verify_did_at9p`).
+    pub gate: &'a dyn At9pCapsuleResolver,
+    /// The native PQ trust store to bind the verified hybrid keys into.
+    pub pq_store: &'a mut KeyedPqTrustStore,
+}
 
 /// The peer's authenticated channel key: the raw 32-byte Ed25519 public key the
 /// connecting peer proved possession of for this session.
@@ -193,7 +228,7 @@ impl<O: OriginAdmission, R: DidDocResolve> FederationAdmissionGate<O, R> {
             .map_err(|e| anyhow!("admission stage 1 (origin {origin}) denied: {e}"))?;
 
         // ── Stage 2: key binding (fail-closed) ────────────────────────────────
-        admit_key_against_did(&self.resolver, origin, peer_key, did, federation_jwks).await
+        admit_key_against_did(&self.resolver, origin, peer_key, did, federation_jwks, None).await
     }
 }
 
@@ -209,6 +244,14 @@ impl<O: OriginAdmission, R: DidDocResolve> FederationAdmissionGate<O, R> {
 ///   resolver call**. We decode the key directly ([`did_key_to_ed25519`]) and
 ///   admit iff `peer_key` equals it. (Reach for such a peer comes from iroh
 ///   discovery #282, not the DID string — out of scope here.)
+/// - **`did:at9p` (self-certifying hybrid-PQC, #894/D2)** — the capsule *is* the
+///   hybrid key commitment: GATE-verify the peer-presented bytes
+///   (canon→hash→sig, #884) via the supplied [`At9pCapsuleResolver`], admit iff
+///   the peer's channel key equals the capsule's Ed25519 subject key, and bind
+///   the verified `ed25519 → ml_dsa_65` pair into the [`KeyedPqTrustStore`].
+///   This is the classical→hybrid trust upgrade, populated from content-verified
+///   material (no config trust). No resolver/fetch: the capsule is
+///   self-certifying. Requires `at9p = Some(_)`; otherwise fail-closed.
 /// - **`did:web` (resolver fetch, #279/#137)** — resolve the peer DID document
 ///   and admit iff `peer_key` matches one of its Ed25519 `verificationMethod`
 ///   keys, falling back to a supplied federation JWKS.
@@ -221,6 +264,7 @@ pub async fn admit_key_against_did<R: DidDocResolve>(
     peer_key: PeerChannelKey,
     did: &str,
     federation_jwks: Option<&Value>,
+    at9p: Option<At9pAdmission<'_>>,
 ) -> Result<AdmittedIdentity> {
     // ── did:key self-certifying arm (#281) ────────────────────────────────────
     // A did:key carries its own Ed25519 key — no DID-doc resolution / network
@@ -241,6 +285,45 @@ pub async fn admit_key_against_did<R: DidDocResolve>(
             peer_key,
             &format!("peer key does not match the self-certifying did:key identity {did}"),
         ));
+    }
+
+    // ── did:at9p self-certifying hybrid arm (#894/D2) ──────────────────────────
+    // The capsule proves the ed25519→ml_dsa_65 binding (GATE pipeline #884), so no
+    // DID-doc fetch and no out-of-band config trust: the binding is installed
+    // straight from content-verified material. A GATE failure rejects and binds
+    // nothing; a missing admission context rejects too (the live accept path does
+    // not yet feed capsule bytes — `FederationAdmissionGate::admit` passes None).
+    if is_did_at9p(did) {
+        let ctx = at9p.ok_or_else(|| {
+            admission_reject(
+                origin,
+                peer_key,
+                &format!("did:at9p {did} presented without a capsule/admission context — fail-closed"),
+            )
+        })?;
+        let verified = ctx.gate.verify_bytes(did, ctx.capsule_bytes).map_err(|e| {
+            admission_reject(origin, peer_key, &format!("did:at9p {did} capsule GATE rejected: {e}"))
+        })?;
+        // The capsule's Ed25519 subject key IS the identity; the peer's
+        // authenticated channel key must equal it (one trust root, #185 closed
+        // by construction for did:at9p).
+        if !key_eq(&verified.ed25519, peer_key.as_bytes()) {
+            return Err(admission_reject(
+                origin,
+                peer_key,
+                &format!(
+                    "peer key does not match the did:at9p capsule Ed25519 subject key {did}"
+                ),
+            ));
+        }
+        // Atomic hybrid binding from the verified capsule — replaces the
+        // out-of-band `mesh_peers` config path for did:at9p peers (#894).
+        ctx.pq_store.bind(verified.ed25519, &verified.ml_dsa_65);
+        return Ok(AdmittedIdentity {
+            origin: origin.to_owned(),
+            did: Some(did.to_owned()),
+            key: *peer_key.as_bytes(),
+        });
     }
 
     // ── did:web resolver arm (#279/#137) ──────────────────────────────────────
@@ -624,5 +707,143 @@ mod tests {
             .await
             .expect_err("invalid did:key must reject (fail-closed)");
         assert!(err.to_string().contains("stage 2"), "{err}");
+    }
+
+    // ── did:at9p self-certifying hybrid arm (D2/#894) ──────────────────────────
+
+    use crate::crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes};
+    use crate::envelope::PqTrustStore;
+    use crate::identity_resolver::{At9pCapsuleResolver, VerifiedAt9pKeys};
+
+    const AT9P_DID: &str = "did:at9p:fakecid512";
+
+    /// A capsule gate test double: returns a fixed [`VerifiedAt9pKeys`] on
+    /// `verify_bytes`, or `Err` when `fail` is set (simulating a GATE rejection —
+    /// bad sig / wrong cid). The real GATE lives in `hyprstream-pds`
+    /// (`at9p_resolver::At9pGateResolver`); this fixture keeps the arm testable in
+    /// the lower rpc crate without a pds dependency.
+    struct FixtureGate {
+        keys: VerifiedAt9pKeys,
+        fail: bool,
+    }
+
+    impl At9pCapsuleResolver for FixtureGate {
+        fn verify_bytes(&self, _did: &str, _capsule_bytes: &[u8]) -> Result<VerifiedAt9pKeys> {
+            if self.fail {
+                bail!("simulated GATE failure (bad sig / wrong cid)");
+            }
+            Ok(self.keys.clone())
+        }
+    }
+
+    fn verified_subject(ed: [u8; 32]) -> VerifiedAt9pKeys {
+        let (_sk, vk) = ml_dsa_generate_keypair();
+        VerifiedAt9pKeys { ed25519: ed, ml_dsa_65: vk }
+    }
+
+    #[tokio::test]
+    async fn admits_did_at9p_peer_and_binds_hybrid_keys_from_capsule() {
+        // Valid capsule → GATE passes → the verified ed25519→ml_dsa_65 pair is
+        // bound into KeyedPqTrustStore, atomic hybrid binding from content-verified
+        // material (no config trust).
+        let ed = random_ed25519();
+        let keys = verified_subject(ed);
+        let gate = FixtureGate { keys: keys.clone(), fail: false };
+        let mut store = KeyedPqTrustStore::new();
+        assert!(store.is_empty(), "store starts empty (no config trust)");
+
+        let admitted = admit_key_against_did(
+            &NeverResolve,
+            ORIGIN,
+            PeerChannelKey(ed),
+            AT9P_DID,
+            None,
+            Some(At9pAdmission { capsule_bytes: b"<capsule>", gate: &gate, pq_store: &mut store }),
+        )
+        .await
+        .expect("verified capsule must admit");
+
+        assert_eq!(admitted.did.as_deref(), Some(AT9P_DID));
+        assert_eq!(admitted.key, ed);
+        // The binding is exactly the capsule's verified keys — comes from the
+        // capsule, not config.
+        assert_eq!(store.len(), 1, "exactly one hybrid binding installed");
+        let bound = store
+            .ml_dsa_key_for(&ed)
+            .expect("ed25519→ml_dsa_65 bound");
+        assert_eq!(ml_dsa_vk_bytes(&bound), ml_dsa_vk_bytes(&keys.ml_dsa_65));
+    }
+
+    #[tokio::test]
+    async fn rejects_did_at9p_on_gate_failure_and_binds_nothing() {
+        // A capsule that fails GATE (bad sig / wrong cid) → reject, and crucially
+        // NOTHING is bound into the trust store (no downgrade, no partial trust).
+        let ed = random_ed25519();
+        let gate = FixtureGate { keys: verified_subject(ed), fail: true };
+        let mut store = KeyedPqTrustStore::new();
+
+        let err = admit_key_against_did(
+            &NeverResolve,
+            ORIGIN,
+            PeerChannelKey(ed),
+            AT9P_DID,
+            None,
+            Some(At9pAdmission { capsule_bytes: b"<capsule>", gate: &gate, pq_store: &mut store }),
+        )
+        .await
+        .expect_err("GATE failure must reject (fail-closed)");
+        assert!(err.to_string().contains("stage 2"), "{err}");
+        assert!(err.to_string().contains("GATE"), "{err}");
+        assert!(store.is_empty(), "a rejected capsule must bind nothing");
+    }
+
+    #[tokio::test]
+    async fn rejects_did_at9p_on_channel_key_mismatch_and_binds_nothing() {
+        // The capsule verifies, but the peer's channel key is not the capsule's
+        // Ed25519 subject key → reject (one trust root, #185) and bind nothing.
+        let identity = random_ed25519();
+        let peer = random_ed25519();
+        assert_ne!(identity, peer);
+        let gate = FixtureGate { keys: verified_subject(identity), fail: false };
+        let mut store = KeyedPqTrustStore::new();
+
+        let err = admit_key_against_did(
+            &NeverResolve,
+            ORIGIN,
+            PeerChannelKey(peer),
+            AT9P_DID,
+            None,
+            Some(At9pAdmission { capsule_bytes: b"<capsule>", gate: &gate, pq_store: &mut store }),
+        )
+        .await
+        .expect_err("channel-key mismatch must reject");
+        assert!(err.to_string().contains("stage 2"), "{err}");
+        assert!(store.is_empty(), "a mismatched peer must bind nothing");
+    }
+
+    #[tokio::test]
+    async fn rejects_did_at9p_without_an_admission_context() {
+        // did:at9p presented but no capsule/admission context supplied (the live
+        // accept path does not feed bytes yet) → fail closed.
+        let peer = random_ed25519();
+        let err = admit_key_against_did(&NeverResolve, ORIGIN, PeerChannelKey(peer), AT9P_DID, None, None)
+            .await
+            .expect_err("missing capsule context must reject");
+        assert!(err.to_string().contains("stage 2"), "{err}");
+        assert!(err.to_string().contains("fail-closed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn did_at9p_still_enforces_stage1_origin() {
+        // Stage 1 (origin) runs first; a denied origin rejects before the at9p arm.
+        let ed = random_ed25519();
+        let gate = FederationAdmissionGate::new(DenyOrigin, NeverResolve);
+        let err = gate
+            .admit(ORIGIN, PeerChannelKey(ed), AT9P_DID, None)
+            .await
+            .expect_err("denied origin must reject a did:at9p peer");
+        // gate.admit passes None for the at9p context, so stage 1's denial is what
+        // surfaces (stage 2 never runs).
+        assert!(err.to_string().contains("stage 1"), "expected stage-1 rejection, got: {err}");
     }
 }
