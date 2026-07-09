@@ -70,6 +70,10 @@ async-trait = "0.1"
 
 # libp2p networking
 libp2p = { version = "0.56", features = ["kad", "mdns", "noise", "tcp", "tokio", "yamux", "identify", "request-response", "macros"] }
+
+# Mainline (BEP5) DHT locator for did:at9p (#889, epic #880 Track C).
+# Optional: nothing ships enabled until Track C wiring lands.
+mainline = { version = "7.0", optional = true }
 multihash = "0.19"
 sha2 = "0.10"
 
@@ -79,11 +83,15 @@ bincode = "1.3"
 
 [dev-dependencies]
 tokio-test = "0.4"
+parking_lot.workspace = true
 
 [features]
 default = []
 # Enable additional debug logging
 debug = []
+# at9p mainline (BEP5) locator: arbitrary-infohash announce/get_peers, which
+# iroh's internal pkarr cannot do. Off by default (#889 / epic #880 Track C).
+mainline-locator = ["dep:mainline"]
 
 [lints]
 workspace = true
