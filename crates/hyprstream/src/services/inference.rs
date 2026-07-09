@@ -199,6 +199,31 @@ unsafe impl Sync for InferenceServiceInner {}
 // ExportPeftResult) eliminated — handlers return generated types directly.
 
 impl InferenceService {
+    /// Drain-time export hook (#869): force-snapshot every resident per-tenant delta
+    /// with accumulated steps to `adapters/.snapshots/`, so a graceful shutdown / pod
+    /// preStop / scale-in does not drop uncommitted TTT adaptation.
+    ///
+    /// This is the reachable seam for the #865 serving-controller drain path to call.
+    /// It is exposed rather than auto-wired into `Spawnable::run`'s shutdown `Notify`
+    /// because the delta pool lives inside this `!Send` service behind the
+    /// `LocalServiceBridge` — there is no post-shutdown hook on the bridge lifecycle
+    /// today to invoke it from (adding one is part of the #865 rework, not this change).
+    /// Returns the number of deltas persisted (a `None` snapshot slot is a loss event and
+    /// is logged by the pool).
+    pub async fn drain_export(&self) -> anyhow::Result<usize> {
+        let Some(pool) = self.delta_pool.as_ref() else {
+            return Ok(0);
+        };
+        let exported = pool.export_all().await?;
+        let persisted = exported.iter().filter(|(_, p)| p.is_some()).count();
+        tracing::info!(
+            "drain_export: persisted {}/{} resident delta(s) to snapshots",
+            persisted,
+            exported.len()
+        );
+        Ok(persisted)
+    }
+
     /// Run invariant checks before any TTT-scoped operation.
     /// Returns GuardStatus encoding expired, capacity, and generation state.
     /// The result must be passed to delta.adaptation_state.resolve().
@@ -442,8 +467,10 @@ impl InferenceService {
         // (must happen before acquiring engine read lock to avoid holding lock across await)
         pool.ensure_capacity().await?;
 
+        // Rehydrate from a persisted snapshot on cold miss (#869) before taking the
+        // engine read lock (snapshot I/O is async and must not straddle the lock).
+        let delta_arc = pool.get_or_hydrate(subject).await?;
         let engine = self.engine.read();
-        let delta_arc = pool.get_or_create(subject)?;
 
         // Lock the delta and run adaptation
         let mut delta = delta_arc.lock();
@@ -1288,7 +1315,10 @@ impl InferenceService {
 
         // Ensure pool has capacity before creating/accessing delta
         pool.ensure_capacity().await?;
-        let delta_arc = pool.get_or_create(subject)?;
+        // Rehydrate from a persisted snapshot on cold miss (#869): a replica that lost
+        // this subject's warm delta (crash / reschedule / scale-in) reloads its
+        // accumulated adaptation instead of silently starting from zero.
+        let delta_arc = pool.get_or_hydrate(subject).await?;
 
         // Phase 1: Sync work under scoped lock — tokenize and snapshot.
         // Always snapshot (even for auto_commit) so auto-rollback can restore state.
