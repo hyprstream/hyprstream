@@ -445,6 +445,13 @@ pub fn resolve_service_signing_key(
     }
 }
 
+// The `#atproto` commit-signing key is NOT loaded here. It is the *active* key
+// of the shared `Es256SigningKeyStore` (`auth::key_rotation`), the same P-256
+// key `oauth::did_document` publishes as the `#atproto` verification method —
+// one source of truth for signer and published key. The PDS writer
+// (`services::discovery::PdsPublisher`) sources it from that store; there is no
+// separate `atproto-signing-key` secret and no duplicate loader (#910a).
+
 /// Decode the `exp` claim from a JWT without signature verification.
 /// Returns `None` on any parse error (invalid base64, not JSON, missing exp).
 pub fn decode_jwt_exp_raw(jwt: &str) -> Option<i64> {

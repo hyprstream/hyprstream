@@ -32,6 +32,15 @@ impl Tid {
         Tid(bits)
     }
 
+    /// The raw 64-bit integer value of this TID.
+    ///
+    /// Used by callers that need to advance a revision monotonically (the
+    /// atproto commit `rev` must strictly increase), e.g. bumping past a
+    /// previous commit's rev when the wall clock has not moved.
+    pub const fn to_raw(self) -> u64 {
+        self.0
+    }
+
     /// Build a TID from a microsecond timestamp (high 53 bits) and a 10-bit
     /// clock id (low 10 bits).
     ///
