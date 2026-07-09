@@ -82,18 +82,24 @@ fn get_or_init_git2db(models_dir: &std::path::Path) -> anyhow::Result<Arc<RwLock
 /// `HYPRSTREAM__SECRETS__PATH`; otherwise it is `<config_dir>/credentials`.
 /// This is the same on-disk location the wizard/bootstrap manager writes
 /// service JWTs to (`credentials/{service}/service-jwt`).
-fn credentials_dir() -> std::path::PathBuf {
+fn credentials_dir() -> anyhow::Result<std::path::PathBuf> {
     if let Ok(p) = std::env::var("HYPRSTREAM__SECRETS__PATH") {
-        return std::path::PathBuf::from(p);
+        return Ok(std::path::PathBuf::from(p));
     }
-    HyprConfig::load()
-        .map(|c| c.config_dir().join("credentials"))
-        .unwrap_or_else(|_| {
-            dirs::config_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-                .join("hyprstream")
-                .join("credentials")
-        })
+    if let Ok(c) = HyprConfig::load() {
+        return Ok(c.config_dir().join("credentials"));
+    }
+    // Never fall back to a world-writable /tmp path for a secret-bearing dir
+    // (#910a H2): a predictable /tmp location lets another local user pre-own
+    // the secrets store or read keys placed there. Fail closed instead.
+    let base = dirs::config_dir().ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot resolve a secrets directory: set HYPRSTREAM__SECRETS__PATH \
+             (systemd credentials / k8s secret mount) — refusing to fall back to /tmp \
+             for a secret-bearing store"
+        )
+    })?;
+    Ok(base.join("hyprstream").join("credentials"))
 }
 
 /// Resolve the on-disk directory for the durable PDS record store (#910a).
@@ -102,18 +108,24 @@ fn credentials_dir() -> std::path::PathBuf {
 /// `<config_dir>/users.db` convention. The registry service (the sole
 /// publisher) opens it read-write; the discovery service (the resolver)
 /// opens it read-only — see `services::discovery::PdsRecordStore`.
-fn pds_store_dir() -> std::path::PathBuf {
+fn pds_store_dir() -> anyhow::Result<std::path::PathBuf> {
     if let Ok(p) = std::env::var("HYPRSTREAM__PDS__STORE_PATH") {
-        return std::path::PathBuf::from(p);
+        return Ok(std::path::PathBuf::from(p));
     }
-    HyprConfig::load()
-        .map(|c| c.config_dir().join("pds-store"))
-        .unwrap_or_else(|_| {
-            dirs::config_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-                .join("hyprstream")
-                .join("pds-store")
-        })
+    if let Ok(c) = HyprConfig::load() {
+        return Ok(c.config_dir().join("pds-store"));
+    }
+    // Never fall back to a predictable, world-writable /tmp path for a durable,
+    // node-signed record store (#910a H2): another local user could pre-own it
+    // and have the node sign injected records as authentic. Fail closed.
+    let base = dirs::config_dir().ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot resolve a PDS store directory: set HYPRSTREAM__PDS__STORE_PATH \
+             (or a persistent volume in k8s) — refusing to fall back to /tmp for a \
+             durable, signable record store"
+        )
+    })?;
+    Ok(base.join("hyprstream").join("pds-store"))
 }
 
 /// Resolve the CA-signed JWT used to register a service's signing key.
@@ -178,7 +190,7 @@ fn register_service_key(
         return Ok(());
     }
 
-    let creds_dir = credentials_dir();
+    let creds_dir = credentials_dir()?;
 
     // The JWT may already be in the trust store (e.g. seeded by an earlier
     // registration in this process); otherwise load it from disk — the
@@ -543,26 +555,20 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     // TLS endorsement uses ("a node-level trust assertion, not specific to
     // any per-service key"). The `#atproto` commit-signing key is a
     // dedicated, persisted P-256 key (classical — atproto has no PQ variant).
-    let pds_publisher = match crate::services::discovery::PdsRecordStore::open(&pds_store_dir()) {
-        Ok(store) => {
-            let node_did = hyprstream_rpc::did_key::ed25519_to_did_key(&ctx.verifying_key().to_bytes());
-            match crate::auth::identity_store::load_or_generate_atproto_signing_key(&credentials_dir()) {
-                Ok(atproto_key) => Some(crate::services::discovery::PdsPublisher::new(
-                    Arc::new(store),
-                    node_did,
-                    atproto_key,
-                )),
-                Err(e) => {
-                    tracing::warn!("Failed to load/generate #atproto signing key; PDS publish disabled: {e}");
-                    None
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!("Failed to open PDS record store (rw); PDS publish disabled: {e}");
-            None
-        }
-    };
+    // Best-effort: any failure here disables PDS publish with a warning rather
+    // than failing the registry. The `#atproto` key is loaded from the secrets
+    // dir and handed to the store in memory — it is never persisted into the
+    // record DB (#910a H1). Paths fail closed rather than fall back to /tmp (H2).
+    let pds_publisher = (|| -> anyhow::Result<crate::services::discovery::PdsPublisher> {
+        let store_dir = pds_store_dir()?;
+        let atproto_key =
+            crate::auth::identity_store::load_or_generate_atproto_signing_key(&credentials_dir()?)?;
+        let store = crate::services::discovery::PdsRecordStore::open(&store_dir, atproto_key)?;
+        let node_did = hyprstream_rpc::did_key::ed25519_to_did_key(&ctx.verifying_key().to_bytes());
+        Ok(crate::services::discovery::PdsPublisher::new(Arc::new(store), node_did))
+    })()
+    .map_err(|e| tracing::warn!("PDS publish disabled: {e}"))
+    .ok();
 
     // Create registry service with infrastructure (blocking since we're in sync context)
     let mut registry_service = tokio::task::block_in_place(|| {
@@ -1574,12 +1580,20 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 /// the service manager will retry.
 fn open_pds_store_readonly(
     dir: &std::path::Path,
+    atproto_key: p256::ecdsa::SigningKey,
 ) -> anyhow::Result<crate::services::discovery::PdsRecordStore> {
-    match crate::services::discovery::PdsRecordStore::open_readonly(dir) {
+    match crate::services::discovery::PdsRecordStore::open_readonly(dir, atproto_key.clone()) {
         Ok(store) => Ok(store),
-        Err(_) => {
-            drop(crate::services::discovery::PdsRecordStore::open(dir)?);
-            crate::services::discovery::PdsRecordStore::open_readonly(dir)
+        Err(orig) => {
+            // Bootstrap the DB files by briefly opening read-write, then retry
+            // read-only. If bootstrap itself fails (e.g. the writer holds the
+            // lock, or the path is corrupt), surface BOTH errors so the real
+            // cause is visible rather than masked by the retry (#910a, fable M3).
+            drop(
+                crate::services::discovery::PdsRecordStore::open(dir, atproto_key.clone())
+                    .with_context(|| format!("read-only open failed ({orig}); bootstrap open also failed"))?,
+            );
+            crate::services::discovery::PdsRecordStore::open_readonly(dir, atproto_key)
         }
     }
 }
@@ -1614,8 +1628,15 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     // sole writer (it opens the same directory read-write and publishes on
     // register/commit — see `create_registry_service`); this factory opens
     // the directory read-only, matching `RocksDbUserStore::open_readonly`.
+    // The `#atproto` commit key is loaded from the secrets dir (the same one
+    // the registry/writer uses) and held in memory to sign CAR proofs — it is
+    // never read from the record DB (#910a H1). In systemd/k8s this is a
+    // read-only, pre-provisioned credential; all replicas must share the same
+    // key so proofs verify consistently.
+    let atproto_key =
+        crate::auth::identity_store::load_or_generate_atproto_signing_key(&credentials_dir()?)?;
     let pds_store = std::sync::Arc::new(
-        open_pds_store_readonly(&pds_store_dir())
+        open_pds_store_readonly(&pds_store_dir()?, atproto_key)
             .context("failed to open PDS record store (read-only)")?,
     );
     let record_resolver = crate::services::discovery::PdsRecordResolver::new(pds_store);

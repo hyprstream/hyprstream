@@ -20,6 +20,7 @@ use hyprstream_pds::commit::Commit;
 use hyprstream_pds::mst::Node;
 use hyprstream_pds::record::ModelRecord;
 use hyprstream_pds::tid::Tid;
+use sha2::Digest as _;
 
 // Re-export the generated discovery client types from our local generated module
 // (hyprstream still needs its own discovery_client for the DiscoveryClient type)
@@ -86,13 +87,11 @@ struct RepoState {
 //
 //   sk\0{did}                              -> 32-byte P-256 signing-key seed
 //   rk\0{did}\0{collection}\0{tid}         -> canonical DAG-CBOR record bytes
-//   tid\0{repo_id}                         -> the TID (13-char string) minted
-//                                              for that repo's *one* stable
-//                                              record key (see `tid_for_repo`)
-
-fn signing_key_key(did: &str) -> Vec<u8> {
-    format!("sk\0{did}").into_bytes()
-}
+//
+// The record's rkey (a TID) is derived deterministically from the repo id
+// (`PdsRecordStore::tid_for_repo`), so it is never minted or persisted. The
+// `#atproto` signing key is held in memory (loaded from the 0600 secrets dir),
+// never stored in this DB (#910a H1).
 
 fn record_prefix(did: &str) -> Vec<u8> {
     format!("rk\0{did}\0").into_bytes()
@@ -100,10 +99,6 @@ fn record_prefix(did: &str) -> Vec<u8> {
 
 fn record_key(did: &str, collection: &str, tid: Tid) -> Vec<u8> {
     format!("rk\0{did}\0{collection}\0{}", tid.encode()).into_bytes()
-}
-
-fn repo_tid_key(repo_id: &str) -> Vec<u8> {
-    format!("tid\0{repo_id}").into_bytes()
 }
 
 /// Split a full record key back into `(collection, tid)`, given the `did` it
@@ -138,6 +133,12 @@ fn parse_record_key(key: &[u8], did: &str) -> AnyResult<(String, Tid)> {
 /// callers that need a live view reopen per read (see [`RecordBacking::ReadOnly`]).
 pub struct PdsRecordStore {
     backing: RecordBacking,
+    /// This node's `#atproto` commit-signing key (P-256/ES256), held in memory
+    /// and loaded from the 0600 secrets dir by both the publisher and the
+    /// resolver. It is **never** persisted into the record DB (#910a H1) —
+    /// putting a private key into 0644 RocksDB files would let any local reader
+    /// forge signed PDS commits. Used to sign CAR proofs at read time.
+    atproto_signing_key: p256::ecdsa::SigningKey,
 }
 
 enum RecordBacking {
@@ -153,98 +154,84 @@ impl PdsRecordStore {
     /// Open (or create) the durable store at `path` for read-write access.
     /// Exactly one process should hold this — the publisher (registry
     /// service). See the type-level docs for the single-writer rationale.
-    pub fn open(path: &Path) -> AnyResult<Self> {
+    pub fn open(path: &Path, atproto_signing_key: p256::ecdsa::SigningKey) -> AnyResult<Self> {
         std::fs::create_dir_all(path)
             .with_context(|| format!("failed to create PDS store dir {path:?}"))?;
+        harden_store_dir(path)?;
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
         let db = rocksdb::DB::open(&opts, path)
             .with_context(|| format!("failed to open PDS record store (rw) at {path:?}"))?;
-        Ok(Self { backing: RecordBacking::ReadWrite(db) })
+        Ok(Self { backing: RecordBacking::ReadWrite(db), atproto_signing_key })
     }
 
     /// Open the store read-only at `path`, for resolvers that never write
     /// (the discovery service). Verifies the directory opens successfully now
     /// (surfacing a missing/corrupt store at startup) but does not hold the
     /// handle — see the type-level docs.
-    pub fn open_readonly(path: &Path) -> AnyResult<Self> {
+    pub fn open_readonly(path: &Path, atproto_signing_key: p256::ecdsa::SigningKey) -> AnyResult<Self> {
         let opts = readonly_opts();
         let _probe = rocksdb::DB::open_for_read_only(&opts, path, false)
             .with_context(|| format!("failed to open PDS record store (ro) at {path:?}"))?;
-        Ok(Self { backing: RecordBacking::ReadOnly(path.to_path_buf()) })
+        Ok(Self { backing: RecordBacking::ReadOnly(path.to_path_buf()), atproto_signing_key })
     }
 
-    /// Insert/replace a record for `did` under `collection` at `tid`, using
-    /// `signing_key` as the account's `#atproto` commit key. Used by the
-    /// publishing path and by tests. Fails if this store was opened
-    /// read-only.
+    /// Insert/replace a record for `did` under `collection` at `tid`. The
+    /// account's `#atproto` commit key lives in memory (never in this DB —
+    /// #910a H1). Used by the publishing path and by tests. Fails if this
+    /// store was opened read-only.
     pub fn put_record(
         &self,
         did: &str,
         collection: &str,
         tid: Tid,
         record: ModelRecord,
-        signing_key: p256::ecdsa::SigningKey,
     ) -> AnyResult<()> {
         let RecordBacking::ReadWrite(db) = &self.backing else {
             bail!("PdsRecordStore::put_record called on a read-only store");
         };
-        let mut batch = rocksdb::WriteBatch::default();
-        batch.put(signing_key_key(did), signing_key.to_bytes().as_slice());
-        batch.put(record_key(did, collection, tid), record.to_dag_cbor());
-        db.write(batch).context("PDS record store write failed")?;
+        db.put(record_key(did, collection, tid), record.to_dag_cbor())
+            .context("PDS record store write failed")?;
         Ok(())
     }
 
-    /// Return the TID previously minted for `repo_id`'s single stable record
-    /// key, or mint and persist a new one.
+    /// The stable record-key TID for `repo_id`, derived **deterministically**
+    /// from the repo id (#910a M1).
     ///
-    /// A record's rkey is assigned once at first publish and never changes —
-    /// later publishes for the same `repo_id` replace the record's *value* at
-    /// that same `(collection, tid)` key (the atproto "pointer advance").
-    /// Fails if this store was opened read-only.
-    pub fn tid_for_repo(&self, repo_id: &str) -> AnyResult<Tid> {
-        let RecordBacking::ReadWrite(db) = &self.backing else {
-            bail!("PdsRecordStore::tid_for_repo called on a read-only store");
-        };
-        let key = repo_tid_key(repo_id);
-        if let Some(existing) = db.get(&key).context("PDS store tid lookup failed")? {
-            let s = std::str::from_utf8(&existing).context("stored tid is not UTF-8")?;
-            return Tid::parse(s).context("stored tid is malformed");
-        }
-        let tid = Tid::now();
-        db.put(&key, tid.encode().as_bytes())
-            .context("PDS store tid persist failed")?;
-        Ok(tid)
+    /// The rkey must be a pure function of `repo_id`: two distinct repos must
+    /// never alias onto one `(collection, tid)` key (which would silently and
+    /// permanently clobber one repo's record with the other's), and the same
+    /// repo must always resolve to the same key so a re-publish is a pointer
+    /// advance, not a new record. A wall-clock `Tid::now()` fails both (same
+    /// microsecond → identical TID; and it needs a persisted mint with a
+    /// get-then-put race). Instead derive the TID's 53-bit micros field and
+    /// 10-bit clock id from `SHA-256(repo_id)` — a hash, not a timestamp:
+    /// these records are not time-ordered, so 63 bits of collision resistance
+    /// is exactly what we want, with no mint, no persistence, and no race.
+    pub fn tid_for_repo(repo_id: &str) -> Tid {
+        // SHA-256 output is always 32 bytes, so these indexes never panic and
+        // need no fallible `try_into`.
+        let d = sha2::Sha256::digest(repo_id.as_bytes());
+        let micros = u64::from_be_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]]);
+        let clock_id = u16::from_be_bytes([d[8], d[9]]);
+        Tid::from_micros(micros, clock_id)
     }
 
     /// Load the full record set + signing key for `did`, or `None` if the
     /// account has never published.
     fn load_repo(&self, did: &str) -> AnyResult<Option<RepoState>> {
         match &self.backing {
-            RecordBacking::ReadWrite(db) => Self::load_repo_from(db, did),
+            RecordBacking::ReadWrite(db) => self.load_repo_from(db, did),
             RecordBacking::ReadOnly(path) => {
                 let opts = readonly_opts();
                 let db = rocksdb::DB::open_for_read_only(&opts, path, false)
                     .with_context(|| format!("failed to reopen PDS record store at {path:?}"))?;
-                Self::load_repo_from(&db, did)
+                self.load_repo_from(&db, did)
             }
         }
     }
 
-    fn load_repo_from(db: &rocksdb::DB, did: &str) -> AnyResult<Option<RepoState>> {
-        let Some(sk_bytes) = db
-            .get(signing_key_key(did))
-            .context("PDS store signing-key lookup failed")?
-        else {
-            return Ok(None);
-        };
-        if sk_bytes.len() != 32 {
-            bail!("corrupt PDS signing key for {did:?}: expected 32 bytes, got {}", sk_bytes.len());
-        }
-        let signing_key = p256::ecdsa::SigningKey::from_bytes(sk_bytes.as_slice().into())
-            .map_err(|e| anyhow!("corrupt PDS signing key for {did:?}: {e}"))?;
-
+    fn load_repo_from(&self, db: &rocksdb::DB, did: &str) -> AnyResult<Option<RepoState>> {
         let prefix = record_prefix(did);
         let mut records = BTreeMap::new();
         // `prefix_iterator` without a configured `prefix_extractor` degrades to
@@ -259,7 +246,13 @@ impl PdsRecordStore {
                 .with_context(|| format!("corrupt PDS record for {did}/{collection}/{tid}"))?;
             records.insert((collection, tid), record);
         }
-        Ok(Some(RepoState { signing_key, records }))
+        // "Never published" == no records for this DID. The `#atproto` key is
+        // held in memory (never in the DB — #910a H1), so a repo's existence is
+        // determined by its records, not by a stored key.
+        if records.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(RepoState { signing_key: self.atproto_signing_key.clone(), records }))
     }
 
     /// Build the MST over all of a repo's records and return it with the
@@ -289,6 +282,25 @@ fn readonly_opts() -> rocksdb::Options {
     opts
 }
 
+/// Restrict the record-store directory to owner-only (0700) on unix.
+///
+/// Defence in depth: even though the `#atproto` private key never lands in
+/// this DB (#910a H1), the record *values* are what the node signs CAR proofs
+/// over at read time — a store another local user could write would let them
+/// inject records the node then serves as authentic. On non-unix this is a
+/// no-op (the store path is expected to be an OS-managed private dir there).
+fn harden_store_dir(path: &Path) -> AnyResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to set 0700 on PDS store dir {path:?}"))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 // ============================================================================
 // PdsPublisher — the register/commit write side of #910a
 // ============================================================================
@@ -303,22 +315,20 @@ pub struct PdsPublisher {
     /// every record this node publishes (single-node, self-hosted PDS; a
     /// per-account DID scheme is out of scope for #910a).
     did: String,
-    /// The `#atproto` commit-signing key (P-256/ES256, classical).
-    signing_key: p256::ecdsa::SigningKey,
 }
 
 impl PdsPublisher {
-    pub fn new(store: Arc<PdsRecordStore>, did: String, signing_key: p256::ecdsa::SigningKey) -> Self {
-        Self { store, did, signing_key }
+    pub fn new(store: Arc<PdsRecordStore>, did: String) -> Self {
+        Self { store, did }
     }
 
     /// Publish (or advance) the `ai.hyprstream.model` record for `repo_id`,
     /// pointing it at `current_oid_hex` (a git OID, hex-encoded).
     ///
-    /// The record's rkey is minted once per `repo_id` and reused on every
-    /// call (`PdsRecordStore::tid_for_repo`), so this always *replaces* the
-    /// existing record's value rather than creating a new one — the atproto
-    /// "pointer advance".
+    /// The record's rkey is derived deterministically from `repo_id`
+    /// (`PdsRecordStore::tid_for_repo`) and reused on every call, so this
+    /// always *replaces* the existing record's value rather than creating a
+    /// new one — the atproto "pointer advance".
     ///
     /// Best-effort by design: the caller (registry service) should log and
     /// continue on error rather than fail the git operation that triggered
@@ -326,7 +336,7 @@ impl PdsPublisher {
     /// PDS publish is caught up by the next successful one (same
     /// eventual-consistency contract `git::promote` documents).
     pub fn publish(&self, repo_id: &str, current_oid_hex: &str) -> AnyResult<()> {
-        let tid = self.store.tid_for_repo(repo_id)?;
+        let tid = PdsRecordStore::tid_for_repo(repo_id);
         let current_oid_cid = git_oid_to_cid_string(current_oid_hex)?;
         let record = ModelRecord::new(
             format!("at://{}", self.did),
@@ -334,7 +344,7 @@ impl PdsPublisher {
             atproto_datetime_now(),
         )?;
         self.store
-            .put_record(&self.did, hyprstream_pds::record::COLLECTION_NSID, tid, record, self.signing_key.clone())
+            .put_record(&self.did, hyprstream_pds::record::COLLECTION_NSID, tid, record)
     }
 }
 
@@ -475,13 +485,13 @@ mod pds_store_tests {
     #[test]
     fn put_then_load_round_trips_through_rocksdb() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = PdsRecordStore::open(dir.path()).expect("open");
         let sk = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let store = PdsRecordStore::open(dir.path(), sk.clone()).expect("open");
         let tid = Tid::now();
         let did = "did:key:zTestNode";
 
         store
-            .put_record(did, "ai.hyprstream.model", tid, sample_record("a"), sk.clone())
+            .put_record(did, "ai.hyprstream.model", tid, sample_record("a"))
             .expect("put_record");
 
         let resolver = PdsRecordResolver::new(Arc::new(store));
@@ -499,14 +509,14 @@ mod pds_store_tests {
         let tid = Tid::now();
 
         {
-            let store = PdsRecordStore::open(dir.path()).expect("open rw");
+            let store = PdsRecordStore::open(dir.path(), sk.clone()).expect("open rw");
             store
-                .put_record(did, "ai.hyprstream.model", tid, sample_record("b"), sk)
+                .put_record(did, "ai.hyprstream.model", tid, sample_record("b"))
                 .expect("put_record");
             // Writer handle dropped here — simulates a process restart.
         }
 
-        let ro = PdsRecordStore::open_readonly(dir.path()).expect("open ro");
+        let ro = PdsRecordStore::open_readonly(dir.path(), sk).expect("open ro");
         let resolver = PdsRecordResolver::new(Arc::new(ro));
         let got = tokio_test_block_on(resolver.resolve_repo(did))
             .expect("resolve_repo ok")
@@ -517,26 +527,24 @@ mod pds_store_tests {
     #[test]
     fn readonly_store_rejects_writes() {
         let dir = tempfile::tempdir().expect("tempdir");
-        // Create the directory with a real DB first so open_readonly succeeds.
-        drop(PdsRecordStore::open(dir.path()).expect("open rw"));
-
-        let ro = PdsRecordStore::open_readonly(dir.path()).expect("open ro");
         let sk = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        // Create the directory with a real DB first so open_readonly succeeds.
+        drop(PdsRecordStore::open(dir.path(), sk.clone()).expect("open rw"));
+
+        let ro = PdsRecordStore::open_readonly(dir.path(), sk).expect("open ro");
         let err = ro
-            .put_record("did:key:zX", "ai.hyprstream.model", Tid::now(), sample_record("c"), sk)
+            .put_record("did:key:zX", "ai.hyprstream.model", Tid::now(), sample_record("c"))
             .unwrap_err();
         assert!(err.to_string().contains("read-only"));
     }
 
     #[test]
-    fn tid_for_repo_is_stable_across_calls() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store = PdsRecordStore::open(dir.path()).expect("open");
-        let first = store.tid_for_repo("repo-a").expect("first mint");
-        let second = store.tid_for_repo("repo-a").expect("second lookup");
+    fn tid_for_repo_is_deterministic_and_distinct() {
+        let first = PdsRecordStore::tid_for_repo("repo-a");
+        let second = PdsRecordStore::tid_for_repo("repo-a");
         assert_eq!(first, second, "the same repo must always get the same rkey");
-        let other = store.tid_for_repo("repo-b").expect("different repo");
-        assert_ne!(first, other);
+        let other = PdsRecordStore::tid_for_repo("repo-b");
+        assert_ne!(first, other, "distinct repos must not alias onto one rkey");
     }
 
     /// Minimal single-threaded block_on so these tests don't need a full
