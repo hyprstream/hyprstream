@@ -6,17 +6,29 @@
 //! (`SandboxPool::acquire`) instead of the pre-#527 fire-and-forget
 //! `tokio::spawn` that ignored both.
 //!
-//! ## 🔒 Mapping convention (NEEDS REVIEWER SIGN-OFF)
+//! ## 🔒 Mapping convention (ratified: B′ group semantics, #921 decision 5)
 //!
 //! `runs_on: <label>` is matched, case-insensitively, against a small
 //! reserved alias set ([`IN_PROC_LABELS`]) meaning "no isolation — run
 //! in-process" (today's VFS/Tcl execution path, unchanged). Any other label
 //! routes the job onto the [`JobScheduler`]'s configured [`SandboxPool`] and
-//! is recorded as the admission `group` (`hyprstream_workers::runtime::ANN_GROUP`)
-//! so operators can give distinct runner labels independent per-group quota
-//! via `AdmissionConfig::max_per_group` — this is "consistent with how #525's
-//! admission engine already consumes that vocabulary", per the issue's own
-//! suggested wording.
+//! is recorded as the `hyprstream_workers::runtime::ANN_GROUP` annotation.
+//!
+//! Under the ratified B′ semantics that annotation is a **capacity-partition
+//! selector, never an authoritative quota/trust/billing key**: admission
+//! (`runtime::admission`) resolves it against the verified Subject's
+//! bidirectional-consent placement-group membership via the pool's
+//! `GroupSelectorValidator` — a workflow naming a group its Subject is not a
+//! member of is **rejected at admission**, not silently accepted. The
+//! production default validator (`DenyUnknownGroupValidator`) fail-closes on
+//! every non-empty selector until a membership source
+//! (`PlacementIndex::is_member`) is wired, so an isolated `runs_on:` label is
+//! deny-by-default today. Validated labels partition node-local capacity via
+//! `AdmissionConfig::max_per_group` (fairness/organization only —
+//! authoritative quota arrives via the ledger path, #922/#925). This module
+//! adds **no group accounting of its own**: the label's only consumer is the
+//! `ANN_GROUP` annotation read back by `admission::derive_group_selector`
+//! inside `SandboxPool::acquire`.
 //!
 //! This is a **label → group** mapping, not a **label → backend** mapping:
 //! one `JobScheduler` wraps exactly one pre-resolved [`SandboxPool`] (bound
@@ -88,7 +100,9 @@ pub fn wants_in_proc(runs_on: &RunsOn) -> bool {
 /// translate to for admission (#525 P2): cpu/memory become
 /// `linux.resources`, `gpu` becomes the `ANN_GPU_REQUEST` annotation (the
 /// same vocabulary `runtime::admission::derive_demand` already reads), and
-/// the `runs_on` label becomes the `ANN_GROUP` annotation (see module docs).
+/// the `runs_on` label becomes the `ANN_GROUP` annotation — a B′ group
+/// *selector*, validated against the verified Subject's membership by the
+/// pool's `GroupSelectorValidator` at admission (see module docs).
 pub fn job_pod_sandbox_config(
     job_name: &str,
     runs_on_label: &str,
@@ -179,6 +193,10 @@ impl JobScheduler {
     /// Decide placement for a job and, if it requests isolation, acquire a
     /// sandbox reservation for it (admitted via `subject`'s identity/quota —
     /// fail-closed if `subject` is anonymous, see `runtime::admission`).
+    ///
+    /// The `runs_on` label rides along as a B′ group selector; admission
+    /// rejects it unless the pool's `GroupSelectorValidator` proves `subject`
+    /// a consented member of that group (deny-unknown by default).
     pub async fn place(
         &self,
         job_name: &str,
@@ -206,6 +224,7 @@ mod tests {
     use crate::config::PoolConfig;
     use crate::runtime::{
         AdmissionConfig, LinuxContainerResources, PodSandbox, SandboxBackend, SandboxHandle,
+        StaticGroupMembership,
     };
     use async_trait::async_trait;
     use std::any::Any;
@@ -330,7 +349,9 @@ mod tests {
             _command: &[String],
             _timeout_secs: u64,
         ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
-            Err(crate::error::WorkerError::ExecFailed("not supported".into()))
+            Err(crate::error::WorkerError::ExecFailed(
+                "not supported".into(),
+            ))
         }
         async fn update_resources(
             &self,
@@ -341,6 +362,8 @@ mod tests {
         }
     }
 
+    /// Scheduler over a pool with the production-default (fail-closed,
+    /// deny-unknown-group) validator — what `SandboxPool::new` gives you.
     fn make_scheduler(admission: AdmissionConfig) -> (Arc<JobScheduler>, Arc<FakeBackend>) {
         let backend = Arc::new(FakeBackend::default());
         let pool_config = PoolConfig {
@@ -348,7 +371,31 @@ mod tests {
             admission,
             ..Default::default()
         };
-        let pool = Arc::new(SandboxPool::new(pool_config, backend.clone() as Arc<dyn SandboxBackend>));
+        let pool = Arc::new(SandboxPool::new(
+            pool_config,
+            backend.clone() as Arc<dyn SandboxBackend>,
+        ));
+        (Arc::new(JobScheduler::new(pool)), backend)
+    }
+
+    /// Scheduler over a pool with a membership-backed validator (B′): the
+    /// runs_on selector is only honored for groups `subject` provably belongs
+    /// to.
+    fn make_scheduler_with_membership(
+        admission: AdmissionConfig,
+        membership: StaticGroupMembership,
+    ) -> (Arc<JobScheduler>, Arc<FakeBackend>) {
+        let backend = Arc::new(FakeBackend::default());
+        let pool_config = PoolConfig {
+            warm_pool_size: 0,
+            admission,
+            ..Default::default()
+        };
+        let pool = Arc::new(SandboxPool::with_group_validator(
+            pool_config,
+            backend.clone() as Arc<dyn SandboxBackend>,
+            Arc::new(membership),
+        ));
         (Arc::new(JobScheduler::new(pool)), backend)
     }
 
@@ -373,7 +420,12 @@ mod tests {
 
     #[tokio::test]
     async fn isolated_runs_on_acquires_a_real_sandbox() {
-        let (scheduler, backend) = make_scheduler(AdmissionConfig::default());
+        // B′: the runs_on label is a group selector, so the Subject must be a
+        // consented member of that group for admission to honor it.
+        let (scheduler, backend) = make_scheduler_with_membership(
+            AdmissionConfig::default(),
+            StaticGroupMembership::new().with_member("kata", "test-user"),
+        );
         let subject = Subject::new("test-user");
 
         let placement = scheduler
@@ -393,32 +445,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unverified_runs_on_group_is_rejected_at_admission() {
+        // B′ fail-closed default: with no membership source wired
+        // (`DenyUnknownGroupValidator`, what `SandboxPool::new` installs), a
+        // runs_on label — an unverifiable group selector — must be REJECTED
+        // at admission, never silently accepted as a fresh quota bucket. The
+        // backend is never touched.
+        let (scheduler, backend) = make_scheduler(AdmissionConfig::default());
+        let subject = Subject::new("test-user");
+
+        let placement = scheduler
+            .place(
+                "job-x",
+                &RunsOn::Label("kata".into()),
+                &JobResources::default(),
+                &subject,
+            )
+            .await;
+
+        assert!(
+            placement.is_err(),
+            "unverifiable group selector must be rejected fail-closed (B′)"
+        );
+        assert_eq!(backend.starts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn runs_on_label_influences_admission_via_group_quota() {
         // max_per_group: 1 means a second job under the SAME runs_on label
         // cannot be admitted concurrently, while a job under a DIFFERENT
         // label is unaffected — proving the runs_on value actually reaches
         // and influences the scheduler's placement decision, not just that
-        // *a* sandbox gets created.
-        let (scheduler, _backend) = make_scheduler(AdmissionConfig {
-            max_per_group: 1,
-            ..AdmissionConfig::default()
-        });
+        // *a* sandbox gets created. Both labels are consented memberships of
+        // the Subject (B′) — the quota partition only applies to validated
+        // selectors.
+        let (scheduler, _backend) = make_scheduler_with_membership(
+            AdmissionConfig {
+                max_per_group: Some(1),
+                ..AdmissionConfig::default()
+            },
+            StaticGroupMembership::new()
+                .with_member("gpu-only", "test-user")
+                .with_member("cpu-only", "test-user"),
+        );
         let subject = Subject::new("test-user");
 
         let first = scheduler
-            .place("job-1", &RunsOn::Label("gpu-only".into()), &JobResources::default(), &subject)
+            .place(
+                "job-1",
+                &RunsOn::Label("gpu-only".into()),
+                &JobResources::default(),
+                &subject,
+            )
             .await
             .expect("first gpu-only job admitted");
 
         // Second job, SAME label, same subject: over the per-group quota.
         let second = scheduler
-            .place("job-2", &RunsOn::Label("gpu-only".into()), &JobResources::default(), &subject)
+            .place(
+                "job-2",
+                &RunsOn::Label("gpu-only".into()),
+                &JobResources::default(),
+                &subject,
+            )
             .await;
-        assert!(second.is_err(), "second job under the same maxed-out group should be rejected");
+        assert!(
+            second.is_err(),
+            "second job under the same maxed-out group should be rejected"
+        );
 
         // Third job, DIFFERENT label: its own group quota, unaffected by gpu-only's.
         let third = scheduler
-            .place("job-3", &RunsOn::Label("cpu-only".into()), &JobResources::default(), &subject)
+            .place(
+                "job-3",
+                &RunsOn::Label("cpu-only".into()),
+                &JobResources::default(),
+                &subject,
+            )
             .await
             .expect("different runs_on label has its own group quota");
 
