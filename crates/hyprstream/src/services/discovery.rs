@@ -17,6 +17,7 @@ use anyhow::{anyhow, bail, Context as _, Result as AnyResult};
 use hyprstream_discovery::{RecordCarData, RecordResolver};
 use hyprstream_pds::car::build_record_proof_car;
 use hyprstream_pds::commit::{Commit, UnsignedCommit};
+use hyprstream_pds::ledger::{AllocationRecord, CheckpointRecord, ReceiptRecord};
 use hyprstream_pds::mst::Node;
 use hyprstream_pds::record::{ModelRecord, COLLECTION_NSID};
 use hyprstream_pds::tid::Tid;
@@ -422,6 +423,69 @@ impl PdsPublisher {
         record_id: &str,
         current_oid_hex: &str,
     ) -> AnyResult<()> {
+        let current_oid_cid = git_oid_to_cid_string(current_oid_hex)?;
+        self.publish_pointer(collection, record_id, current_oid_cid)
+    }
+
+    /// Publish (or advance) a holder-controlled `ai.hyprstream.ledger.allocation`
+    /// record — the held entitlement (#924).
+    ///
+    /// The allocation's canonical DAG-CBOR bytes are content-addressed and the
+    /// resulting CID becomes the pointer this repo's MST carries under the
+    /// `ai.hyprstream.ledger.allocation` collection; the holder's signed PDS
+    /// commit is the only signature the record needs (it lives in the holder's
+    /// own repo). The rkey is derived deterministically from the record's grant
+    /// CID, so re-publishing the same grant advances the same record.
+    pub fn publish_ledger_allocation(&self, rec: &AllocationRecord) -> AnyResult<()> {
+        self.publish_pointer(
+            hyprstream_pds::ledger::allocation::COLLECTION_NSID,
+            &rec.grant,
+            hyprstream_pds::cid::Cid::from_dag_cbor(&rec.to_dag_cbor()).encode(),
+        )
+    }
+
+    /// Publish (or advance) a holder-controlled `ai.hyprstream.ledger.receipt`
+    /// record — a dual-signed usage record (#924).
+    ///
+    /// The rkey is derived from the receipt's `transferId`, giving at-least-once
+    /// (idempotent) receipt delivery: re-publishing the same transfer advances
+    /// the same record rather than creating a duplicate.
+    pub fn publish_ledger_receipt(&self, rec: &ReceiptRecord) -> AnyResult<()> {
+        self.publish_pointer(
+            hyprstream_pds::ledger::receipt::COLLECTION_NSID,
+            &rec.transfer_id,
+            hyprstream_pds::cid::Cid::from_dag_cbor(&rec.to_dag_cbor()).encode(),
+        )
+    }
+
+    /// Publish (or advance) a holder-controlled `ai.hyprstream.ledger.checkpoint`
+    /// record — a signed ledger head (#924).
+    ///
+    /// `ledger_id` is the stable key of the ledger whose head this checkpoint
+    /// commits, so successive checkpoints advance the one head pointer.
+    pub fn publish_ledger_checkpoint(
+        &self,
+        ledger_id: &str,
+        rec: &CheckpointRecord,
+    ) -> AnyResult<()> {
+        self.publish_pointer(
+            hyprstream_pds::ledger::checkpoint::COLLECTION_NSID,
+            ledger_id,
+            hyprstream_pds::cid::Cid::from_dag_cbor(&rec.to_dag_cbor()).encode(),
+        )
+    }
+
+    /// The shared publish critical section: write (or advance) the pointer record
+    /// in `collection` for `record_id`, pointing it at the already-formed
+    /// `current_oid_cid` (`format: "cid"` string). Every collection — the git
+    /// model pointer and the ledger records alike — shares the repo's ONE MST and
+    /// the ONE commit signed here (#910b).
+    fn publish_pointer(
+        &self,
+        collection: &str,
+        record_id: &str,
+        current_oid_cid: String,
+    ) -> AnyResult<()> {
         // The collection NSID becomes both a `\0`-delimited RocksDB key field
         // and the `<collection>/<rkey>` MST key prefix — reject anything that
         // would be ambiguous in either encoding.
@@ -429,7 +493,6 @@ impl PdsPublisher {
             bail!("invalid collection NSID {collection:?}");
         }
         let tid = PdsRecordStore::tid_for_repo(record_id);
-        let current_oid_cid = git_oid_to_cid_string(current_oid_hex)?;
         let record = ModelRecord::new(
             format!("at://{}", self.did),
             current_oid_cid,
@@ -824,6 +887,76 @@ mod pds_store_tests {
 
         resolve_and_verify(&store, &vk, COLLECTION_NSID, "repo-a");
         resolve_and_verify(&store, &vk, NAME_COLLECTION, "name-a");
+    }
+
+    #[test]
+    fn ledger_multi_collection_publish_resolves() {
+        // #924: an allocation + a receipt written under ONE holder DID as two new
+        // ledger collections, covered by ONE signed commit and each independently
+        // resolvable via the #910b path. The receipt binds a *pairwise* spender
+        // id (not a root DID), exercising the pseudonymity constraint end-to-end.
+        use hyprstream_pds::ledger::{
+            allocation as alloc_ns, receipt as receipt_ns, AllocationRecord, GrantClass,
+            ReceiptRecord, Unit,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let vk: VerifyingKey = *sk.verifying_key();
+
+        let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+
+        let alloc = AllocationRecord::new(
+            "bafyreiexamplegrantcid1234567890abcdef",
+            Unit {
+                code: "compute-second".into(),
+                issuer: "did:web:issuer.example.com".into(),
+            },
+            1_000,
+            7,
+            "did:web:issuer.example.com",
+            "did:key:zHolderSubject",
+            GrantClass::Prepaid,
+        )
+        .expect("valid allocation");
+        let receipt = ReceiptRecord::new(
+            alloc.cid().encode(),
+            "pairwise:cell42:8f3ad9c0e1",
+            "did:key:zHostNode",
+            "transfer-01HXYZ",
+            25,
+        )
+        .expect("valid receipt");
+
+        publisher
+            .publish_ledger_allocation(&alloc)
+            .expect("publish allocation");
+        publisher
+            .publish_ledger_receipt(&receipt)
+            .expect("publish receipt");
+
+        // One repo, one signed commit, two ledger collections.
+        let repo = store.load_repo(DID).expect("load").expect("repo");
+        assert_eq!(repo.records.len(), 2, "allocation + receipt in one repo");
+
+        // Each ledger collection resolves with a valid keyless proof.
+        resolve_and_verify(&store, &vk, alloc_ns::COLLECTION_NSID, &alloc.grant);
+        resolve_and_verify(&store, &vk, receipt_ns::COLLECTION_NSID, &receipt.transfer_id);
+
+        // The published pointer's currentOid is the ledger record's content CID —
+        // the record is content-addressed, so its bytes are recoverable/verifiable.
+        let alloc_tid = PdsRecordStore::tid_for_repo(&alloc.grant);
+        let ptr = repo
+            .records
+            .get(&(alloc_ns::COLLECTION_NSID.to_owned(), alloc_tid))
+            .cloned()
+            .expect("allocation pointer present");
+        assert_eq!(
+            ptr.current_oid,
+            alloc.cid().encode(),
+            "pointer must address the allocation record's content CID"
+        );
     }
 
     #[test]

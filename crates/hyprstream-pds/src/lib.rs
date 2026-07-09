@@ -56,6 +56,7 @@ pub mod cid;
 pub mod commit;
 pub mod dag_cbor;
 pub mod event_group;
+pub mod ledger;
 pub mod list_record;
 pub mod mst;
 pub mod placement;
@@ -63,5 +64,6 @@ pub mod record;
 pub mod tid;
 
 pub use cid::Cid;
+pub use ledger::{AllocationRecord, CheckpointRecord, GrantClass, ReceiptRecord, StateRoot, Unit};
 pub use placement::{GroupItemRecord, GroupRecord, NodeRecord, WorkloadRecord};
 pub use record::ModelRecord;
