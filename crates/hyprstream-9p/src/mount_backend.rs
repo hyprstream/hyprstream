@@ -154,13 +154,25 @@ impl Backend for MountBackend {
         // Attach-time ticket path (H1b): resolve+narrow. A MountError here maps
         // to an Rlerror errno (PermissionDenied → EACCES) via the translator.
         let subject = authorizer.authorize(uname).await.map_err(anyhow::Error::new)?;
+        let attempted_subject = subject.clone();
         // First attach wins; a second attach on the same connection must not
         // silently re-scope the session. Ignore a redundant identical set,
         // reject a conflicting one.
         match self.subject.set(subject) {
             Ok(()) => Ok(()),
-            Err(_) if self.subject.get().is_some() => Ok(()),
-            Err(e) => Err(anyhow!("bind session Subject: {e}")),
+            Err(_) => {
+                let existing = self
+                    .subject
+                    .get()
+                    .ok_or_else(|| anyhow!("bind session Subject: cell rejected without value"))?;
+                if existing == &attempted_subject {
+                    Ok(())
+                } else {
+                    Err(anyhow::Error::new(MountError::PermissionDenied(
+                        "conflicting attach subject".to_owned(),
+                    )))
+                }
+            }
         }
     }
 

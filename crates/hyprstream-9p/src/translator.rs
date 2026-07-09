@@ -48,13 +48,19 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use dashmap::DashMap;
+use hyprstream_rpc::auth::mac::SecurityContext;
 use hyprstream_rpc::Subject;
 use hyprstream_vfs::Mount;
 use tokio::io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+use tokio::sync::OnceCell;
 use tracing::{debug, error, info, warn};
 
 use crate::backend::Backend;
+use crate::mac_seam::{
+    anonymous_floor, AccessDecider, AllowAllDecider, Action, AnonymousAuthenticator,
+    AttachAuthenticator,
+};
 use crate::mount_backend::MountBackend;
 use crate::msg::{
     self, encode_response, parse_request, rflush, Request, Response,
@@ -71,6 +77,10 @@ struct FidState {
     qtype: u8,
     /// Whether open() has succeeded on this fid.
     opened: bool,
+    /// The caller's verified security context, derived once at `Tattach` by
+    /// the translator's [`AttachAuthenticator`] and inherited by every fid
+    /// walked from it (#568) — never re-derived per op.
+    ctx: SecurityContext,
 }
 
 /// Server-side fid table: 9P fid → state.
@@ -82,9 +92,10 @@ pub struct FidTable {
 }
 
 impl FidTable {
-    /// Insert state for a fid (from walk/attach).
-    pub fn insert(&self, fid: u32, qtype: u8) {
-        self.fids.insert(fid, FidState { qtype, opened: false });
+    /// Insert state for a fid (from walk/attach), inheriting `ctx` from the
+    /// attach or the source fid being walked.
+    pub fn insert(&self, fid: u32, qtype: u8, ctx: SecurityContext) {
+        self.fids.insert(fid, FidState { qtype, opened: false, ctx });
     }
 
     /// Mark a fid as opened.
@@ -99,6 +110,11 @@ impl FidTable {
         self.fids.get(&fid).map(|s| s.qtype)
     }
 
+    /// Look up a fid's cached security context (from attach/inherited walk).
+    pub fn security_context(&self, fid: u32) -> Option<SecurityContext> {
+        self.fids.get(&fid).map(|s| s.ctx.clone())
+    }
+
     /// Remove a fid (clunk).
     pub fn remove(&self, fid: u32) {
         self.fids.remove(&fid);
@@ -110,13 +126,62 @@ impl FidTable {
 /// Cloning is cheap (Arc internals); one translator serves many connections.
 pub struct Translator {
     backend: Arc<dyn Backend>,
+    backend_factory: Arc<dyn Fn() -> Arc<dyn Backend> + Send + Sync>,
     fids: Arc<FidTable>,
+    attach_ctx: OnceCell<SecurityContext>,
+    /// Verifies the `Tattach` credential and derives the fid's cached
+    /// [`SecurityContext`] (#568). Defaults to [`AnonymousAuthenticator`]
+    /// (always the anonymous floor), matching today's actual behavior — no
+    /// identity verification at attach. Real verification is an explicit
+    /// opt-in via [`Translator::with_authenticator`].
+    authenticator: Arc<dyn AttachAuthenticator>,
+    /// Authorizes each op against the fid's cached context (#568). Defaults
+    /// to [`AllowAllDecider`] (always allow), matching today's actual
+    /// behavior — no per-op authorization. See the module-level docs on
+    /// `mac_seam` for why a real deny-on-unlabeled decider must NOT be the
+    /// default: every object in the 9P namespace is unlabeled today, and the
+    /// S1 invariant is unlabeled ⇒ deny, not ⇒ floor.
+    decider: Arc<dyn AccessDecider>,
 }
 
 impl Translator {
     /// Build a translator over the given backend. The fid table starts empty.
+    /// Attach/authorization use the inert defaults (no behavior change from
+    /// before #568): see [`Translator::with_authenticator`] /
+    /// [`Translator::with_decider`] to opt into real enforcement.
     pub fn new(backend: Arc<dyn Backend>) -> Self {
-        Self { backend, fids: Arc::new(FidTable::default()) }
+        let backend_factory_backend = Arc::clone(&backend);
+        Self {
+            backend,
+            backend_factory: Arc::new(move || Arc::clone(&backend_factory_backend)),
+            fids: Arc::new(FidTable::default()),
+            attach_ctx: OnceCell::new(),
+            authenticator: Arc::new(AnonymousAuthenticator),
+            decider: Arc::new(AllowAllDecider),
+        }
+    }
+
+    /// Replace the attach-time credential verifier. The `hyprstream` crate is
+    /// expected to call this with a real verifier (backed by the S6-minted
+    /// access token + the service trust store) once a standalone "verify a
+    /// presented token" entry point exists outside the OAuth HTTP handler —
+    /// see the #568 PR discussion for why that plumbing is not included here.
+    pub fn with_authenticator(mut self, authenticator: Arc<dyn AttachAuthenticator>) -> Self {
+        self.authenticator = authenticator;
+        self
+    }
+
+    /// Replace the per-op access decider. The `hyprstream` crate is expected
+    /// to call this with a real decider (backed by `mac::avc::CachingAvc`,
+    /// optionally wrapped in `mac_seam::AuditedDecider`) once object labels
+    /// are actually available for the mount being served (genesis labeling,
+    /// or #699 carrier-b for content-addressed data) — wiring a real decider
+    /// before that point would deny every existing 9P client, since an
+    /// unlabeled object must deny per the S1 invariant, not fall back to a
+    /// permissive floor.
+    pub fn with_decider(mut self, decider: Arc<dyn AccessDecider>) -> Self {
+        self.decider = decider;
+        self
     }
 
     /// Build a translator that exports a single Subject-scoped VFS [`Mount`] as
@@ -129,7 +194,19 @@ impl Translator {
     /// `ModelBackend` uses on the TCP path — so no new attachment mechanism is
     /// introduced; only the export root differs.
     pub fn from_mount(mount: Arc<dyn Mount>, subject: Subject) -> Self {
-        Self::new(Arc::new(MountBackend::new(mount, subject)))
+        let backend: Arc<dyn Backend> =
+            Arc::new(MountBackend::new(Arc::clone(&mount), subject.clone()));
+        Self {
+            backend,
+            backend_factory: Arc::new(move || {
+                Arc::new(MountBackend::new(Arc::clone(&mount), subject.clone()))
+                    as Arc<dyn Backend>
+            }),
+            fids: Arc::new(FidTable::default()),
+            attach_ctx: OnceCell::new(),
+            authenticator: Arc::new(AnonymousAuthenticator),
+            decider: Arc::new(AllowAllDecider),
+        }
     }
 
     /// Build a translator that exports `mount`, resolving the session
@@ -148,7 +225,39 @@ impl Translator {
         mount: Arc<dyn Mount>,
         authorizer: Arc<dyn crate::mount_backend::AttachAuthorizer>,
     ) -> Self {
-        Self::new(Arc::new(MountBackend::with_authorizer(mount, authorizer)))
+        let backend: Arc<dyn Backend> = Arc::new(MountBackend::with_authorizer(
+            Arc::clone(&mount),
+            Arc::clone(&authorizer),
+        ));
+        Self {
+            backend,
+            backend_factory: Arc::new(move || {
+                Arc::new(MountBackend::with_authorizer(
+                    Arc::clone(&mount),
+                    Arc::clone(&authorizer),
+                )) as Arc<dyn Backend>
+            }),
+            fids: Arc::new(FidTable::default()),
+            attach_ctx: OnceCell::new(),
+            authenticator: Arc::new(AnonymousAuthenticator),
+            decider: Arc::new(AllowAllDecider),
+        }
+    }
+
+    /// Build a fresh per-connection translator state over the same wiring.
+    ///
+    /// The accept loop shares only immutable policy/auth seams. Fid state,
+    /// attach context, and stateful mount backends are connection-local so one
+    /// client cannot reuse another client's fid numbers or attach subject.
+    fn connection_scoped(&self) -> Self {
+        Self {
+            backend: (self.backend_factory)(),
+            backend_factory: Arc::clone(&self.backend_factory),
+            fids: Arc::new(FidTable::default()),
+            attach_ctx: OnceCell::new(),
+            authenticator: Arc::clone(&self.authenticator),
+            decider: Arc::clone(&self.decider),
+        }
     }
 
     /// Run a TCP accept loop until the listener errors or is closed.
@@ -223,7 +332,7 @@ impl Translator {
                     return Err(e).context("9P accept loop terminated");
                 }
             };
-            let this = Arc::clone(&this);
+            let this = Arc::new(this.connection_scoped());
             tokio::spawn(async move {
                 debug!(%peer, "9P connection accepted");
                 if let Err(e) = this.serve_connection(stream).await {
@@ -304,7 +413,9 @@ impl Translator {
         let (tag, req) = parse_request(buf).context("decode 9P T-message")?;
         let resp = match req {
             Request::Version { msize, version } => self.handle_version(msize, version),
-            Request::Attach { fid, uname, .. } => self.handle_attach(fid, &uname).await?,
+            Request::Attach { fid, uname, aname, .. } => {
+                self.handle_attach(fid, &uname, &aname).await?
+            }
             // Flush is intercepted in serve_connection before reaching here;
             // this arm is unreachable but kept exhaustive.
             Request::Flush { .. } => Response::Clunk,
@@ -339,19 +450,38 @@ impl Translator {
         Response::Version { msize, version: "9P2000.L".into() }
     }
 
-    async fn handle_attach(&self, fid: u32, uname: &str) -> Result<Response> {
+    async fn handle_attach(&self, fid: u32, uname: &str, aname: &str) -> Result<Response> {
         // Establish the session first: on the attach-time ticket path (H1b) this
         // validates `uname` and binds the session Subject; on the fixed-subject
         // path it is a no-op. A denied ticket returns here and is mapped to an
         // Rlerror by the serve loop — before any fid or mount handle exists.
         self.backend.attach(uname).await?;
+        // #568: verify the attach credential exactly once, deriving the
+        // context every fid walked from this attach will inherit. The
+        // default AnonymousAuthenticator always floors — no behavior change
+        // until a real authenticator is injected via `with_authenticator`.
+        let ctx = self.authenticator.authenticate(uname, aname).await;
+        self.bind_attach_context(&ctx)?;
         // Attach establishes the root fid. Walk the empty path to materialize
         // a root qid from the backend, then record it.
         let walk = self.backend.walk(fid, fid, &[]).await?;
         let qtype = walk.qids.last().map(|q| q.qtype).unwrap_or(0);
-        self.fids.insert(fid, qtype);
+        self.fids.insert(fid, qtype, ctx);
         let qid = walk.qids.into_iter().next().unwrap_or_default();
         Ok(Response::Attach { qid })
+    }
+
+    fn bind_attach_context(&self, ctx: &SecurityContext) -> Result<()> {
+        if self.attach_ctx.set(ctx.clone()).is_ok() {
+            return Ok(());
+        }
+        match self.attach_ctx.get() {
+            Some(existing) if existing == ctx => Ok(()),
+            Some(_) => Err(anyhow::Error::new(hyprstream_vfs::MountError::PermissionDenied(
+                "conflicting attach security context".to_owned(),
+            ))),
+            None => Err(anyhow::anyhow!("attach context cell rejected without value")),
+        }
     }
 
     async fn handle_walk(
@@ -360,27 +490,50 @@ impl Translator {
         newfid: u32,
         wnames: Vec<String>,
     ) -> Result<Response> {
+        if let Some(err) = self.deny(fid, Action::Walk) {
+            return Ok(err);
+        }
+        // The context is inherited from the fid being walked (#568 — a
+        // context is derived once at attach, never re-verified per op).
+        let ctx = self.fids.security_context(fid).unwrap_or_else(anonymous_floor);
         // Mirror of RemoteModelMount::walk: call backend.walk with the source
         // fid, the new fid, and the path components.
         let result = self.backend.walk(fid, newfid, &wnames).await?;
-        if let Some(q) = result.qids.last() {
-            self.fids.insert(newfid, q.qtype);
+        if wnames.is_empty() {
+            // nwname=0 is a fid *clone*: newfid aliases fid (same file), and
+            // the backend returns no qids. newfid must still inherit the source
+            // fid's qtype and context — otherwise the clone has no cached
+            // context, floors to anonymous, and a real decider wrongly denies
+            // it for an already-authenticated client (#568).
+            let qtype = self.fids.qtype(fid).unwrap_or(0);
+            self.fids.insert(newfid, qtype, ctx);
+        } else if let Some(q) = result.qids.last() {
+            self.fids.insert(newfid, q.qtype, ctx);
         }
         Ok(Response::Walk { qids: result.qids })
     }
 
     async fn handle_lopen(&self, fid: u32, flags: u32) -> Result<Response> {
+        if let Some(err) = self.deny(fid, Action::Open) {
+            return Ok(err);
+        }
         let open = self.backend.open(fid, flags).await?;
         self.fids.set_opened(fid);
         Ok(Response::Lopen { qid: open.qid, iounit: open.iounit })
     }
 
     async fn handle_read(&self, fid: u32, offset: u64, count: u32) -> Result<Response> {
+        if let Some(err) = self.deny(fid, Action::Read) {
+            return Ok(err);
+        }
         let data = self.backend.read(fid, offset, count).await?;
         Ok(Response::Read { data })
     }
 
     async fn handle_write(&self, fid: u32, offset: u64, data: &[u8]) -> Result<Response> {
+        if let Some(err) = self.deny(fid, Action::Write) {
+            return Ok(err);
+        }
         let count = self.backend.write(fid, offset, data).await?;
         Ok(Response::Write { count })
     }
@@ -395,13 +548,40 @@ impl Translator {
     }
 
     async fn handle_getattr(&self, fid: u32) -> Result<Response> {
+        // getattr leaks object metadata (qid/mode/size/mtime), so it is gated
+        // like every other fid op — it is not a metadata-only exemption.
+        if let Some(err) = self.deny(fid, Action::Getattr) {
+            return Ok(err);
+        }
         let st = self.backend.stat(fid).await?;
         Ok(Response::Getattr { qid: st.qid, mode: st.mode, size: st.size, mtime_sec: st.mtime_sec })
     }
 
     async fn handle_readdir(&self, fid: u32, offset: u64, count: u32) -> Result<Response> {
+        if let Some(err) = self.deny(fid, Action::Readdir) {
+            return Ok(err);
+        }
         let data = self.backend.readdir(fid, offset, count).await?;
         Ok(Response::Readdir { data })
+    }
+
+    /// Consults the decider for `fid`+`action` against the fid's cached
+    /// context. Returns `Some(Response::Error)` (EPERM) if denied, `None` if
+    /// allowed. No object label is available at this layer (see the
+    /// `mac_seam` module docs) — `object_label` is always `None` here; a real
+    /// decider must treat that as "deny" per the S1 invariant, not as
+    /// "unrestricted".
+    ///
+    /// A fid with no cached context (should not happen — every fid is
+    /// populated at attach or inherits from its parent on walk) is treated
+    /// as the anonymous floor rather than panicking.
+    fn deny(&self, fid: u32, action: Action) -> Option<Response> {
+        let ctx = self.fids.security_context(fid).unwrap_or_else(anonymous_floor);
+        if self.decider.check(&ctx, None, action) {
+            None
+        } else {
+            Some(Response::Error { ecode: libc_eperm() })
+        }
     }
 }
 
@@ -707,6 +887,9 @@ fn errno_from_mount_error(e: &hyprstream_vfs::MountError) -> u32 {
         M::Io(_) => EIO,
     }
 }
+const fn libc_eperm() -> u32 {
+    1 // EPERM
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -857,10 +1040,213 @@ mod tests {
         assert!(matches!(resp, Response::Clunk));
     }
 
+    /// #568: a translator with a real (non-default) decider actually blocks
+    /// ops, proving the `deny`/`FidTable::security_context` wiring is live —
+    /// not just present but inert. Uses a decider that denies `Action::Read`
+    /// unconditionally; walk/open (unblocked) still succeed, read is
+    /// rejected with `Rlerror EPERM` rather than reaching the backend.
+    #[tokio::test]
+    async fn injected_decider_blocks_denied_action() {
+        struct DenyReads;
+        impl AccessDecider for DenyReads {
+            fn check(
+                &self,
+                _ctx: &SecurityContext,
+                _object_label: Option<&hyprstream_rpc::auth::mac::SecurityLabel>,
+                action: Action,
+            ) -> bool {
+                !matches!(action, Action::Read)
+            }
+        }
+
+        let backend = MemoryBackend::default();
+        backend.add_file("/hello.txt", b"hello world");
+        let t = Translator::new(Arc::new(backend)).with_decider(Arc::new(DenyReads));
+
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
+        let (_, resp) =
+            t.handle_message(&msg::twalk(2, 0, 1, &["hello.txt"])).await.unwrap();
+        assert!(matches!(resp, Response::Walk { .. }), "walk must still succeed");
+
+        let (_, resp) = t.handle_message(&msg::tlopen(3, 1, 0)).await.unwrap();
+        assert!(matches!(resp, Response::Lopen { .. }), "open must still succeed");
+
+        let (_, resp) = t.handle_message(&msg::tread(4, 1, 0, 64)).await.unwrap();
+        match resp {
+            Response::Error { ecode } => assert_eq!(ecode, libc_eperm()),
+            other => panic!("expected Rlerror EPERM, got {other:?}"),
+        }
+    }
+
+    /// #767 review: `getattr` leaks object metadata (qid/mode/size/mtime) and
+    /// must be gated by the decider like every other fid op — it was the one
+    /// ungated op. A decider that denies `Action::Getattr` must produce EPERM.
+    #[tokio::test]
+    async fn injected_decider_blocks_getattr() {
+        struct DenyGetattr;
+        impl AccessDecider for DenyGetattr {
+            fn check(
+                &self,
+                _ctx: &SecurityContext,
+                _object_label: Option<&hyprstream_rpc::auth::mac::SecurityLabel>,
+                action: Action,
+            ) -> bool {
+                !matches!(action, Action::Getattr)
+            }
+        }
+
+        let backend = MemoryBackend::default();
+        backend.add_file("/hello.txt", b"hi");
+        let t = Translator::new(Arc::new(backend)).with_decider(Arc::new(DenyGetattr));
+
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
+        let (_, resp) = t.handle_message(&msg::twalk(2, 0, 1, &["hello.txt"])).await.unwrap();
+        assert!(matches!(resp, Response::Walk { .. }), "walk must still succeed");
+
+        let (_, resp) = t.handle_message(&msg::tgetattr(3, 1, u64::MAX)).await.unwrap();
+        match resp {
+            Response::Error { ecode } => assert_eq!(ecode, libc_eperm()),
+            other => panic!("expected Rlerror EPERM for gated getattr, got {other:?}"),
+        }
+    }
+
+    /// #767 review: a zero-element walk (nwname=0) is a fid *clone*; the new
+    /// fid must inherit the source fid's cached context rather than being left
+    /// untracked (which floored to anonymous under a real decider and wrongly
+    /// denied an already-authenticated client).
+    #[tokio::test]
+    async fn walk_clone_inherits_source_context() {
+        use async_trait::async_trait;
+        use hyprstream_rpc::auth::mac::{
+            Assurance, CompartmentSet, Level, SecurityLabel, VerifiedKeyMaterial,
+        };
+
+        struct ElevatedAuth;
+        #[async_trait]
+        impl AttachAuthenticator for ElevatedAuth {
+            async fn authenticate(&self, _u: &str, _a: &str) -> SecurityContext {
+                SecurityContext::from_clearance(
+                    SecurityLabel::new(Level::Secret, Assurance::Unverified, CompartmentSet::EMPTY),
+                    VerifiedKeyMaterial::Unverified,
+                )
+            }
+        }
+
+        let t = Translator::new(Arc::new(MemoryBackend::default()))
+            .with_authenticator(Arc::new(ElevatedAuth));
+
+        // Attach root fid 0 with the elevated (non-anonymous) context.
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
+        // Clone fid 0 -> fid 1 via a zero-element walk.
+        let (_, resp) = t.handle_message(&msg::twalk(2, 0, 1, &[])).await.unwrap();
+        assert!(matches!(resp, Response::Walk { .. }), "clone walk must succeed");
+
+        // The clone must carry the source's elevated context, not the anon floor.
+        let ctx = t
+            .fids
+            .security_context(1)
+            .expect("cloned fid must be tracked in the fid table");
+        assert_ne!(
+            ctx.level(),
+            Level::Public,
+            "cloned fid must inherit the source's elevated context, not floor to anonymous",
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_scoped_translators_do_not_share_fid_context() {
+        use async_trait::async_trait;
+        use hyprstream_rpc::auth::mac::{
+            Assurance, CompartmentSet, Level, SecurityLabel, VerifiedKeyMaterial,
+        };
+
+        struct SecretAuth;
+        #[async_trait]
+        impl AttachAuthenticator for SecretAuth {
+            async fn authenticate(&self, _u: &str, _a: &str) -> SecurityContext {
+                SecurityContext::from_clearance(
+                    SecurityLabel::new(Level::Secret, Assurance::Unverified, CompartmentSet::EMPTY),
+                    VerifiedKeyMaterial::Unverified,
+                )
+            }
+        }
+
+        struct DenyAnonymous;
+        impl AccessDecider for DenyAnonymous {
+            fn check(
+                &self,
+                ctx: &SecurityContext,
+                _object_label: Option<&hyprstream_rpc::auth::mac::SecurityLabel>,
+                _action: Action,
+            ) -> bool {
+                ctx.level() != Level::Public
+            }
+        }
+
+        let root = Translator::new(Arc::new(MemoryBackend::default()))
+            .with_authenticator(Arc::new(SecretAuth))
+            .with_decider(Arc::new(DenyAnonymous));
+        let conn_a = Arc::new(root.connection_scoped());
+        let conn_b = Arc::new(root.connection_scoped());
+
+        conn_a
+            .handle_message(&msg::tattach(1, 1, u32::MAX, "alice", "/"))
+            .await
+            .unwrap();
+
+        let (_, resp) = conn_b.handle_message(&msg::twalk(2, 1, 2, &[])).await.unwrap();
+        match resp {
+            Response::Error { ecode } => assert_eq!(ecode, libc_eperm()),
+            other => panic!("expected EPERM for unauthenticated fid reuse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn translator_rejects_conflicting_attach_security_context() {
+        use async_trait::async_trait;
+        use hyprstream_rpc::auth::mac::{
+            Assurance, CompartmentSet, Level, SecurityLabel, VerifiedKeyMaterial,
+        };
+
+        struct TicketAuth;
+        #[async_trait]
+        impl AttachAuthenticator for TicketAuth {
+            async fn authenticate(&self, uname: &str, _aname: &str) -> SecurityContext {
+                let level = if uname == "alice-ticket" {
+                    Level::Secret
+                } else {
+                    Level::Public
+                };
+                SecurityContext::from_clearance(
+                    SecurityLabel::new(level, Assurance::Unverified, CompartmentSet::EMPTY),
+                    VerifiedKeyMaterial::Unverified,
+                )
+            }
+        }
+
+        let t = Translator::new(Arc::new(MemoryBackend::default()))
+            .with_authenticator(Arc::new(TicketAuth));
+        let (_, resp) = t
+            .handle_message(&msg::tattach(1, 1, u32::MAX, "alice-ticket", "/"))
+            .await
+            .unwrap();
+        assert!(matches!(resp, Response::Attach { .. }), "got {resp:?}");
+
+        let err = t
+            .handle_message(&msg::tattach(2, 2, u32::MAX, "bob-ticket", "/"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            errno_from_error(&err),
+            EACCES,
+            "conflicting attach context must be EACCES",
+        );
+    }
+
     #[tokio::test]
     async fn fid_table_tracks_open_and_clunk() {
         let table = FidTable::default();
-        table.insert(7, 0x80);
+        table.insert(7, 0x80, anonymous_floor());
         assert_eq!(table.qtype(7), Some(0x80));
         table.set_opened(7);
         table.remove(7);
@@ -1123,10 +1509,10 @@ mod tests {
             &self,
             uname: &str,
         ) -> std::result::Result<hyprstream_rpc::Subject, hyprstream_vfs::MountError> {
-            if uname == "good-ticket" {
-                Ok(hyprstream_rpc::Subject::new("alice"))
-            } else {
-                Err(hyprstream_vfs::MountError::PermissionDenied("bad ticket".into()))
+            match uname {
+                "good-ticket" => Ok(hyprstream_rpc::Subject::new("alice")),
+                "other-ticket" => Ok(hyprstream_rpc::Subject::new("bob")),
+                _ => Err(hyprstream_vfs::MountError::PermissionDenied("bad ticket".into())),
             }
         }
     }
@@ -1186,6 +1572,24 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(errno_from_error(&err), EACCES, "missing ticket must be EACCES");
+    }
+
+    /// A second attach may repeat the same ticket, but it must not re-scope the
+    /// session to a different valid Subject.
+    #[tokio::test]
+    async fn second_attach_conflicting_ticket_denied() {
+        let t = authorized_translator();
+        let (_, resp) = t
+            .handle_message(&msg::tattach(1, 0, u32::MAX, "good-ticket", ""))
+            .await
+            .unwrap();
+        assert!(matches!(resp, Response::Attach { .. }), "got {resp:?}");
+
+        let err = t
+            .handle_message(&msg::tattach(2, 0, u32::MAX, "other-ticket", ""))
+            .await
+            .unwrap_err();
+        assert_eq!(errno_from_error(&err), EACCES, "conflicting attach must be EACCES");
     }
 
     /// Fail-closed: an op arriving before a successful attach binds the Subject

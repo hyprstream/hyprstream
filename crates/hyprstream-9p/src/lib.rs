@@ -46,6 +46,11 @@ pub mod memory;
 // The browser/wasm build reaches the backend through the DMA/Wanix client path.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod translator;
+// Attach-time MAC seam (#568): trait interface for verifying an attach
+// credential and authorizing per-op access, with inert (no-op) defaults.
+// Native-only alongside `translator`, its only consumer today.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod mac_seam;
 // `MountBackend` bridges a VFS `Mount` (+ `Subject`) to the `Backend` seam so
 // the translator can export it over TCP/UDS. Native-only (drives async Mount ops).
 #[cfg(not(target_arch = "wasm32"))]
@@ -73,4 +78,9 @@ pub use socket_transport::SocketTransport;
 #[cfg(not(target_arch = "wasm32"))]
 pub use translator::{
     serve_mount_uds, serve_mount_vsock, serve_mount_vsock_raw, FidTable, Translator,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use mac_seam::{
+    anonymous_floor, AccessDecider, Action, AllowAllDecider, AnonymousAuthenticator,
+    AttachAuthenticator, AuditSink, AuditedDecider, NullAuditSink,
 };
