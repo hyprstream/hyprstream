@@ -1,0 +1,9 @@
+# Pin the toolchain so CI and local development lint/build against the same
+# compiler. Previously CI used dtolnay/rust-toolchain@stable (floating to the
+# latest stable at run time) while developers ran an older pinned stable, so a
+# newer stable's tightened clippy lints failed CI on code that passed locally
+# — a non-deterministic, cache-dependent merge blocker. Bump this deliberately
+# (and fix any new lints in the same PR) rather than letting it float.
+[toolchain]
+channel = "1.96.0"
+components = ["clippy", "rustfmt"]

@@ -2855,7 +2855,7 @@ mod pipeline_tests {
 
         // Build the model in BF16 (cast tiny_weights to bf16 first).
         let mut w = tiny_weights();
-        for (_k, t) in w.iter_mut() {
+        for t in w.values_mut() {
             *t = t.to_kind(dtype);
         }
         let model = Qwen3_5Model::from_weights(

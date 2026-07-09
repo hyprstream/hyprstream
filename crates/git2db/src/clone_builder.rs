@@ -269,7 +269,7 @@ impl CloneBuilder {
         // Build paths
         let repo_dir = hyprstream_containedfs::contained_join(&models_dir, &repo_name)
             .map_err(|e| Git2DBError::configuration(format!("Invalid repository name: {e}")))?;
-        let bare_repo_name = format!("{}.git", &repo_name);
+        let bare_repo_name = format!("{}.git", repo_name);
         let bare_repo_path = repo_dir.join(&bare_repo_name);
         let worktrees_dir = repo_dir.join("worktrees");
 

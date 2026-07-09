@@ -35,7 +35,7 @@ jobs:
       run: sudo apt-get update && sudo apt-get install -y capnproto libsystemd-dev pkg-config libssl-dev
 
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@1.96.0
       with:
         components: clippy
 
@@ -83,7 +83,7 @@ jobs:
       run: sudo apt-get update && sudo apt-get install -y capnproto pkg-config
 
     - name: Install Rust toolchain (wasm32)
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@1.96.0
       with:
         targets: wasm32-unknown-unknown
 
