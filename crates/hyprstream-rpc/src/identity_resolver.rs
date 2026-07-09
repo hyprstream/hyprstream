@@ -79,16 +79,52 @@ pub trait DidDocumentProvider: Send + Sync {
 ///
 /// `ed25519` is the capsule's primary subject key — the iroh `NodeId` / channel
 /// identity. `ml_dsa_65` is the PQ half of the hybrid pair. A [`VerifiedAt9pKeys`]
-/// is only constructable by an [`At9pCapsuleResolver`] that ran the A4 GATE
-/// pipeline (canon→hash→sig, #884) to completion, so holding one is proof the
-/// binding came from **content-verified capsule material**, not a config file or a
-/// caller assertion (the D2/#894 provenance boundary).
+/// is only constructable via [`VerifiedAt9pKeys::new_gate_verified`] — the GATE
+/// mint — which only an [`At9pCapsuleResolver`] that ran the A4 GATE pipeline
+/// (canon→hash→sig, #884) to completion reaches. The private fields make the
+/// "only constructable after the GATE ran" provenance a type-level invariant
+/// rather than a bare rustdoc claim: arbitrary code cannot build one with an
+/// unverified `ed25519`↔`ml_dsa_65` pair, so holding one is proof the binding came
+/// from **content-verified capsule material**, not a config file or a caller
+/// assertion (the D2/#894 provenance boundary, hardened in #964).
 #[derive(Clone)]
 pub struct VerifiedAt9pKeys {
     /// The verified Ed25519 subject key (the classical identity / channel key).
-    pub ed25519: [u8; 32],
+    ed25519: [u8; 32],
     /// The verified ML-DSA-65 subject key bound to `ed25519` in the capsule.
-    pub ml_dsa_65: MlDsaVerifyingKey,
+    ml_dsa_65: MlDsaVerifyingKey,
+}
+
+impl VerifiedAt9pKeys {
+    /// The GATE mint — the sole construction path for a [`VerifiedAt9pKeys`].
+    ///
+    /// This is the constructor-witness chokepoint: the fields are private, so the
+    /// *only* way to produce a `VerifiedAt9pKeys` is to call this method, which
+    /// encodes the GATE-ran provenance in its name. Trusted callers are the A4 GATE
+    /// resolver implementations (the real [`At9pCapsuleResolver`] impl in
+    /// `hyprstream-pds::at9p_resolver`, plus in-crate test fixtures). Code that has
+    /// not run the GATE has no business calling this — review a new call site as a
+    /// provenance decision, not a mechanical field set.
+    ///
+    /// (Rust cannot seal this across crates — `hyprstream-pds` is a *dependent* of
+    /// `hyprstream-rpc`, so rpc has no way to grant pds the mint while denying it
+    /// to arbitrary code. The private fields + single named mint convert the
+    /// provenance from "any code can write the struct literal" to "any code must go
+    /// through one review-visible chokepoint", which is the proportionate
+    /// hardening; the trust root remains "whoever injects the gate is trusted".)
+    pub fn new_gate_verified(ed25519: [u8; 32], ml_dsa_65: MlDsaVerifyingKey) -> Self {
+        Self { ed25519, ml_dsa_65 }
+    }
+
+    /// The verified Ed25519 subject key (the classical identity / channel key).
+    pub fn ed25519(&self) -> &[u8; 32] {
+        &self.ed25519
+    }
+
+    /// The verified ML-DSA-65 subject key bound to `ed25519` in the capsule.
+    pub fn ml_dsa_65(&self) -> &MlDsaVerifyingKey {
+        &self.ml_dsa_65
+    }
 }
 
 /// Verifies a `did:at9p` capsule and yields its content-verified subject keys.
@@ -159,6 +195,25 @@ impl<P: DidDocumentProvider> MethodDispatchResolver<P> {
     /// - Ed25519 VM present + ML-DSA-65 VM present ⇒ `PqHybrid`.
     /// - Ed25519 VM present, no ML-DSA-65 VM ⇒ `Classical`.
     /// - No Ed25519 VM ⇒ `Err` (fail-closed: nothing to anchor).
+    ///
+    /// # Assurance quality — the at9p asymmetry
+    ///
+    /// Unlike the `did:at9p` arm, where the `ed25519`↔`ml_dsa_65` pair is
+    /// **content-verified** by the GATE over a self-certifying capsule, the
+    /// `did:web` arm's `PqHybrid` rests on **co-presence in a TLS-fetched
+    /// document**, not on a content-binding between the two keys. Two caveats
+    /// follow, consistent with the ratified #579/D1 "did:web we operate" model:
+    ///
+    /// - **Arbitrary pairing when multiple VMs exist:** the first Ed25519 VM and
+    ///   the first ML-DSA-65 VM in the document are paired. If a document carries
+    ///   several of either, which two get bound is incidental to document order,
+    ///   not cryptographic. (Operated nodes publish one of each, so this is a
+    ///   document-shape concern for third-party docs, not a live risk for nodes we
+    ///   run.)
+    /// - **No content binding:** the document attests both keys, but nothing in the
+    ///   TLS fetch proves the Ed25519 and ML-DSA-65 keys belong to the same
+    ///   principal beyond the document's own say-so. The at9p capsule proves this
+    ///   cryptographically; did:web trusts the (TLS-transported) document.
     fn resolve_did_web(&self, did: &Did) -> Result<IdentityKeys> {
         let doc = self
             .docs
@@ -212,8 +267,8 @@ impl<P: DidDocumentProvider> MethodDispatchResolver<P> {
             .resolve(did.as_str())
             .map_err(|e| anyhow!("did:at9p {did}: capsule GATE failed: {e}"))?;
         Ok(IdentityKeys {
-            ed25519: Some(verified.ed25519),
-            ml_dsa_65: Some(verified.ml_dsa_65),
+            ed25519: Some(*verified.ed25519()),
+            ml_dsa_65: Some(verified.ml_dsa_65().clone()),
             assurance: Assurance::PqHybrid,
         })
     }
@@ -445,7 +500,7 @@ mod tests {
 
     fn verified_keys() -> VerifiedAt9pKeys {
         let (_sk, vk) = ml_dsa_generate_keypair();
-        VerifiedAt9pKeys { ed25519: [9u8; 32], ml_dsa_65: vk }
+        VerifiedAt9pKeys::new_gate_verified([9u8; 32], vk)
     }
 
     #[test]
@@ -460,8 +515,8 @@ mod tests {
             .resolve_identity_keys(&did)
             .expect("verified capsule resolves at PqHybrid");
         assert_eq!(resolved.assurance, Assurance::PqHybrid);
-        assert_eq!(resolved.ed25519, Some(keys.ed25519));
-        assert_eq!(ml_dsa_vk_bytes(&resolved.ml_dsa_65.unwrap()), ml_dsa_vk_bytes(&keys.ml_dsa_65));
+        assert_eq!(resolved.ed25519, Some(*keys.ed25519()));
+        assert_eq!(ml_dsa_vk_bytes(&resolved.ml_dsa_65.unwrap()), ml_dsa_vk_bytes(keys.ml_dsa_65()));
         // The arm routed through the capsule resolver exactly once.
         assert_eq!(fixture.calls.lock().as_slice(), &["did:at9p:cid512abcdef"]);
     }

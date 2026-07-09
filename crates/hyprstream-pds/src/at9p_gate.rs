@@ -51,7 +51,11 @@ use crate::at9p_sign::verify_capsule;
 
 /// The `did:at9p:` method prefix. A `did:at9p` identifier is exactly this prefix
 /// followed by the base32 CIDv1 (`cid512`) of the genesis capsule.
-pub const DID_AT9P_PREFIX: &str = "did:at9p:";
+///
+/// Re-exported from the single source of truth (`hyprstream_rpc::identity`), shared
+/// with the admission gate and `Did::is_did_at9p`, so the literal cannot drift
+/// across arms (#964). Kept at this path for the existing pds/discovery import sites.
+pub use hyprstream_rpc::identity::DID_AT9P_PREFIX;
 
 /// Which gate of the [`verify_genesis_capsule`] pipeline rejected the input.
 ///
