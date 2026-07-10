@@ -109,10 +109,15 @@ struct PubkeyEntry {
   label @2 :Text;         # user-provided label (e.g., "laptop", "work")
   createdAt @3 :Int64;    # unix timestamp
   lastUsedAt @4 :Int64;   # unix timestamp, 0 if never used
-  # Multicodec algorithm tag (#439/#280): "ed25519" today, "ml-dsa-65"/hybrid
-  # additive later. Defaults to "ed25519" for records written before #439, so
-  # widening the store to PQ is additive rather than a schema migration.
+  # Multicodec algorithm tag (#439/#280): "ed25519" (classical) or
+  # "ed25519+ml-dsa-65" (post-quantum hybrid). Defaults to "ed25519" for records
+  # written before #439, so widening the store to PQ is additive rather than a
+  # schema migration.
   algorithm @5 :Text;
+  # Bound ML-DSA-65 (FIPS 204) verifying key bytes (~1952B) for a hybrid record
+  # (#439). Absent/empty ⇒ classical Ed25519 (None). Kid-anchored to
+  # `fingerprint`; the store enforces algorithm=="ed25519+ml-dsa-65" ⇔ present.
+  pqPubkey @6 :Data;
 }
 
 struct UserListResult {

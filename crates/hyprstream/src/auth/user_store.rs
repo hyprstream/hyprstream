@@ -33,31 +33,46 @@ pub struct UserProfile {
 
 /// The public-key algorithm of a stored [`PubkeyEntry`].
 ///
-/// Ed25519 is the only implemented variant today; the tag exists from day one
-/// (#439) so that adding ML-DSA-65 / hybrid user keys later (mirroring the
-/// #280 Multikey path) is *additive* — every record already carries its
-/// algorithm, so widening `UserStore::add_pubkey` past Ed25519 will not be a
-/// store-schema migration.
+/// - [`Ed25519`](Self::Ed25519) — classical anchor only (the pre-#439 default,
+///   and what SSH/raw-seed adopt still contributes as its classical component).
+/// - [`HybridEd25519MlDsa65`](Self::HybridEd25519MlDsa65) — the Ed25519 anchor
+///   with a **bound ML-DSA-65 verifying key** (#439 PQ enrollment). This mirrors
+///   the `register_pq_trust` / `KeyedPqTrustStore` envelope model and the
+///   did:at9p ed25519→ml_dsa binding: the fingerprint stays the Ed25519 anchor's
+///   SHA256, and the ML-DSA-65 vk is carried alongside in `pq_pubkey`.
+///
+/// Invariant enforced by the stores: `HybridEd25519MlDsa65 ⇔ pq_pubkey.is_some()`.
+/// A hybrid record with missing PQ bytes is a **read error** (fail closed),
+/// never a silent downgrade to Ed25519.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KeyAlgorithm {
     Ed25519,
+    /// EdDSA (Ed25519) anchor + bound ML-DSA-65 (FIPS 204) — post-quantum hybrid.
+    #[serde(rename = "ed25519+ml-dsa-65")]
+    HybridEd25519MlDsa65,
 }
 
 impl Default for KeyAlgorithm {
-    /// Ed25519 is the classical floor for local human identity keys (the same
-    /// call already made for the iroh NodeId); PQ user keys are deferred.
+    /// Ed25519 is the classical floor for records with no algorithm tag
+    /// (pre-#439) and for the SSH/raw-seed adopt paths' classical component.
     fn default() -> Self {
         Self::Ed25519
     }
 }
 
 impl KeyAlgorithm {
-    /// Multicodec-style lowercase algorithm name written into stored records.
+    /// Canonical lowercase algorithm tag written into stored records.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Ed25519 => "ed25519",
+            Self::HybridEd25519MlDsa65 => "ed25519+ml-dsa-65",
         }
+    }
+
+    /// Whether this algorithm carries a post-quantum (ML-DSA-65) component.
+    pub fn is_hybrid(&self) -> bool {
+        matches!(self, Self::HybridEd25519MlDsa65)
     }
 
     /// Parse an algorithm tag read back from a stored record.
@@ -67,8 +82,10 @@ impl KeyAlgorithm {
     pub fn parse(s: &str) -> anyhow::Result<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "ed25519" => Ok(Self::Ed25519),
+            "ed25519+ml-dsa-65" => Ok(Self::HybridEd25519MlDsa65),
             other => anyhow::bail!(
-                "Unknown key algorithm tag '{other}'; only 'ed25519' is implemented in this build"
+                "Unknown key algorithm tag '{other}'; this build implements \
+                 'ed25519' and 'ed25519+ml-dsa-65'"
             ),
         }
     }
@@ -90,6 +107,13 @@ pub struct PubkeyEntry {
     /// Algorithm tag (#439). Defaults to [`KeyAlgorithm::Ed25519`] for records
     /// written before the tag existed.
     pub algorithm: KeyAlgorithm,
+    /// Bound ML-DSA-65 verifying key bytes (~1952B) for a
+    /// [`KeyAlgorithm::HybridEd25519MlDsa65`] record; `None` for classical
+    /// Ed25519. Kid-anchored to `fingerprint` (the Ed25519 anchor); resolved
+    /// by the challenge verifier, never carried in a login request. The
+    /// `algorithm.is_hybrid() ⇔ pq_pubkey.is_some()` invariant is enforced at
+    /// store read/write.
+    pub pq_pubkey: Option<Vec<u8>>,
 }
 
 /// Filter parameters for user search (SCIM-aligned).
@@ -143,11 +167,34 @@ pub trait UserStore: Send + Sync {
     /// List all pubkeys for a user.
     async fn list_pubkeys(&self, username: &str) -> Result<Vec<PubkeyEntry>>;
 
-    /// Add a pubkey to a user. Returns the fingerprint.
+    /// Add a classical Ed25519 pubkey to a user. Returns the fingerprint.
+    ///
+    /// Records `KeyAlgorithm::Ed25519` with no PQ component. For post-quantum
+    /// hybrid enrollment use [`add_pubkey_hybrid`](Self::add_pubkey_hybrid).
     async fn add_pubkey(
         &self,
         username: &str,
         pubkey: VerifyingKey,
+        label: Option<String>,
+    ) -> Result<String>;
+
+    /// Add a post-quantum **hybrid** identity key: the Ed25519 anchor plus its
+    /// bound ML-DSA-65 verifying key (#439). Returns the fingerprint (of the
+    /// Ed25519 anchor — the PQ vk does not change the kid).
+    ///
+    /// Records `KeyAlgorithm::HybridEd25519MlDsa65` with `pq_pubkey = Some(..)`.
+    /// If a classical Ed25519 record for the same anchor already exists, this is
+    /// the in-place upgrade path (Ed25519 → Hybrid for the same fingerprint);
+    /// the reverse transition is rejected.
+    ///
+    /// `ml_dsa_vk` must be the ~1952-byte ML-DSA-65 verifying key encoding
+    /// (`pq::ml_dsa_vk_bytes`). Required of every backend — no fail-open default
+    /// that could silently drop the PQ binding.
+    async fn add_pubkey_hybrid(
+        &self,
+        username: &str,
+        pubkey: VerifyingKey,
+        ml_dsa_vk: Vec<u8>,
         label: Option<String>,
     ) -> Result<String>;
 

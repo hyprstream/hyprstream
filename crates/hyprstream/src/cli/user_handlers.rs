@@ -191,7 +191,13 @@ pub async fn handle_user_create(
 
     let source = resolve_create_key_source(generate, key, ssh)?;
 
-    let outcome = enroll_user(&store, &secrets_dir, username, source)
+    // Post-quantum policy is node policy: Hybrid by default (fail-closed), only
+    // an explicit HYPRSTREAM_ENVELOPE_POLICY=classical downgrades. Enrollment is
+    // a root-of-trust path, so it follows the same selector as envelope traffic
+    // rather than silently minting classical-only identity material.
+    let policy = hyprstream_rpc::envelope::envelope_policy_from_env();
+
+    let outcome = enroll_user(&store, &secrets_dir, username, source, policy)
         .await
         .context("Failed to enroll user")?;
 
@@ -199,12 +205,18 @@ pub async fn handle_user_create(
     if let Some(bak) = &outcome.key_backed_up {
         println!("  Backed up prior signing key to {}", bak.display());
     }
+    if let Some(bak) = &outcome.pq_key_backed_up {
+        println!("  Backed up prior post-quantum key to {}", bak.display());
+    }
     println!("  Signing key installed as the client key — the CLI now signs with this key.");
     println!(
         "  Fingerprint: {}  (algorithm={})",
         outcome.fingerprint,
         outcome.algorithm.as_str()
     );
+    for notice in &outcome.notices {
+        println!("  ⚠ {notice}");
+    }
     println!(
         "  Verify: `ssh-keygen -l -E sha256` of the key prints {}",
         outcome.fingerprint

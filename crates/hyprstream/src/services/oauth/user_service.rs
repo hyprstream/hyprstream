@@ -33,6 +33,9 @@ pub struct PubkeyInfo {
     pub created_at: i64,
     pub last_used_at: Option<i64>,
     pub algorithm: crate::auth::KeyAlgorithm,
+    /// Bound ML-DSA-65 verifying key bytes for a hybrid record (#439); `None`
+    /// for classical Ed25519.
+    pub pq_pubkey: Option<Vec<u8>>,
 }
 
 impl From<&PubkeyEntry> for PubkeyInfo {
@@ -44,6 +47,7 @@ impl From<&PubkeyEntry> for PubkeyInfo {
             created_at: entry.created_at,
             last_used_at: entry.last_used_at,
             algorithm: entry.algorithm,
+            pq_pubkey: entry.pq_pubkey.clone(),
         }
     }
 }

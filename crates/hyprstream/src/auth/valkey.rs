@@ -32,6 +32,10 @@ struct StoredKey {
     /// Algorithm tag (#439). Defaults to Ed25519 for pre-#439 records.
     #[serde(default)]
     algorithm: crate::auth::KeyAlgorithm,
+    /// Standard-base64 ML-DSA-65 verifying key for a hybrid record (#439);
+    /// `None`/absent for classical Ed25519. Invariant: present ⇔ hybrid tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pq_pubkey_base64: Option<String>,
 }
 
 pub struct ValkeyUserStore {
@@ -248,6 +252,28 @@ impl UserStore for ValkeyUserStore {
                 let raw = base64::engine::general_purpose::STANDARD.decode(&stored.pubkey_base64)?;
                 let key_bytes: [u8; 32] = raw.try_into().map_err(|_| anyhow!("bad key length"))?;
                 let pubkey = VerifyingKey::from_bytes(&key_bytes)?;
+                // Decode + invariant-check the PQ component (fail closed on a
+                // Hybrid record with no/empty PQ bytes — never a silent
+                // downgrade to Ed25519).
+                let pq_pubkey = match stored.pq_pubkey_base64.as_deref() {
+                    Some(b64) if !b64.is_empty() => Some(
+                        base64::engine::general_purpose::STANDARD
+                            .decode(b64)
+                            .with_context(|| format!("invalid base64 ML-DSA-65 key for {fp}"))?,
+                    ),
+                    _ => None,
+                };
+                match (stored.algorithm.is_hybrid(), &pq_pubkey) {
+                    (true, Some(_)) | (false, None) => {}
+                    (true, None) => anyhow::bail!(
+                        "hybrid pubkey record {fp} is missing its ML-DSA-65 key \
+                         material (refusing to read — fail closed)"
+                    ),
+                    (false, Some(_)) => anyhow::bail!(
+                        "classical pubkey record {fp} carries unexpected ML-DSA-65 \
+                         key material (refusing to read)"
+                    ),
+                }
                 entries.push(PubkeyEntry {
                     fingerprint: fp,
                     pubkey,
@@ -255,6 +281,7 @@ impl UserStore for ValkeyUserStore {
                     created_at: stored.created_at,
                     last_used_at: stored.last_used_at,
                     algorithm: stored.algorithm,
+                    pq_pubkey,
                 });
             }
         }
@@ -266,7 +293,57 @@ impl UserStore for ValkeyUserStore {
         let fp = pubkey_fingerprint(&pubkey);
         let pubkey_base64 = base64::engine::general_purpose::STANDARD.encode(pubkey.as_bytes());
         let now = chrono::Utc::now().timestamp();
-        let stored = StoredKey { pubkey_base64, label, created_at: now, last_used_at: None, algorithm: crate::auth::KeyAlgorithm::Ed25519 };
+        let stored = StoredKey {
+            pubkey_base64,
+            label,
+            created_at: now,
+            last_used_at: None,
+            algorithm: crate::auth::KeyAlgorithm::Ed25519,
+            pq_pubkey_base64: None,
+        };
+        let json = serde_json::to_string(&stored)?;
+        self.pool.set::<(), _, _>(format!("hs:key:{fp}"), json, None, None, false).await?;
+        self.pool.sadd::<i64, _, _>(format!("hs:user:{username}:keys"), &fp).await?;
+        self.pool.set::<(), _, _>(format!("hs:keyowner:{fp}"), username, None, None, false).await?;
+        Ok(fp)
+    }
+
+    async fn add_pubkey_hybrid(
+        &self,
+        username: &str,
+        pubkey: VerifyingKey,
+        ml_dsa_vk: Vec<u8>,
+        label: Option<String>,
+    ) -> Result<String> {
+        use base64::Engine;
+        if ml_dsa_vk.is_empty() {
+            anyhow::bail!("add_pubkey_hybrid: empty ML-DSA-65 verifying key");
+        }
+        // Fingerprint is the Ed25519 anchor's (kid) — the PQ vk does not change it.
+        let fp = pubkey_fingerprint(&pubkey);
+        let pubkey_base64 = base64::engine::general_purpose::STANDARD.encode(pubkey.as_bytes());
+        let pq_pubkey_base64 =
+            Some(base64::engine::general_purpose::STANDARD.encode(&ml_dsa_vk));
+
+        // In-place upgrade (Ed25519 → Hybrid) or idempotent re-bind: preserve
+        // the original created_at/last_used_at if a record already exists.
+        let (created_at, last_used_at, existing_label) =
+            match self.pool.get::<Option<String>, _>(format!("hs:key:{fp}")).await? {
+                Some(s) => {
+                    let prev: StoredKey = serde_json::from_str(&s)?;
+                    (prev.created_at, prev.last_used_at, prev.label)
+                }
+                None => (chrono::Utc::now().timestamp(), None, None),
+            };
+
+        let stored = StoredKey {
+            pubkey_base64,
+            label: label.or(existing_label),
+            created_at,
+            last_used_at,
+            algorithm: crate::auth::KeyAlgorithm::HybridEd25519MlDsa65,
+            pq_pubkey_base64,
+        };
         let json = serde_json::to_string(&stored)?;
         self.pool.set::<(), _, _>(format!("hs:key:{fp}"), json, None, None, false).await?;
         self.pool.sadd::<i64, _, _>(format!("hs:user:{username}:keys"), &fp).await?;

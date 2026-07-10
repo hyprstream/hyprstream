@@ -192,8 +192,11 @@ impl BootstrapManager {
             }
         };
 
+        // Root-of-trust enrollment follows node crypto policy (Hybrid default,
+        // fail-closed) — the same selector as envelope traffic.
+        let policy = hyprstream_rpc::envelope::envelope_policy_from_env();
         if let Err(e) = self.rt.block_on(
-            enroll_user(&store, &secrets_dir, username, EnrollKeySource::Generate),
+            enroll_user(&store, &secrets_dir, username, EnrollKeySource::Generate, policy),
         ) {
             tracing::warn!(
                 username,

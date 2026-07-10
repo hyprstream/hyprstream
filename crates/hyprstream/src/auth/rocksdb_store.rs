@@ -52,6 +52,9 @@ struct StoredPubkey {
     last_used_at: i64, // 0 means never used
     /// Algorithm tag (#439). Defaults to Ed25519 for pre-#439 records.
     algorithm: KeyAlgorithm,
+    /// Bound ML-DSA-65 verifying key bytes for a hybrid record (#439); `None`
+    /// for classical Ed25519. Invariant: `algorithm.is_hybrid() ⇔ Some`.
+    pq_pubkey: Option<Vec<u8>>,
 }
 
 pub struct RocksDbUserStore {
@@ -140,6 +143,20 @@ impl RocksDbUserStore {
                 entry.set_created_at(pk.created_at);
                 entry.set_last_used_at(pk.last_used_at);
                 entry.set_algorithm(pk.algorithm.as_str());
+                // Enforce the hybrid⇔pq_pubkey invariant on the write path too,
+                // so a malformed StoredPubkey can never be persisted.
+                match (pk.algorithm.is_hybrid(), &pk.pq_pubkey) {
+                    (true, Some(vk)) => entry.set_pq_pubkey(vk),
+                    (false, None) => {}
+                    (true, None) => anyhow::bail!(
+                        "hybrid pubkey {} has no ML-DSA-65 key material (refusing to persist)",
+                        pk.fingerprint
+                    ),
+                    (false, Some(_)) => anyhow::bail!(
+                        "classical pubkey {} carries ML-DSA-65 key material (refusing to persist)",
+                        pk.fingerprint
+                    ),
+                }
             }
         }
         let mut bytes = vec![flags];
@@ -179,16 +196,41 @@ impl RocksDbUserStore {
         let mut pubkeys = Vec::new();
         if ui.has_pubkeys() {
             for pk in ui.get_pubkeys()? {
+                let fingerprint = pk.get_fingerprint()?.to_string()?;
+                // Pre-#439 records have no algorithm tag → default Ed25519.
+                // A present-but-unknown tag must error rather than be misread as
+                // Ed25519 (would silently downgrade a PQ-hybrid key written by a
+                // newer build).
+                let algorithm = match text_or_none(pk.get_algorithm()) {
+                    Some(s) => KeyAlgorithm::parse(&s)?,
+                    None => KeyAlgorithm::default(),
+                };
+                // `pqPubkey` absent/empty ⇒ None. Enforce the hybrid⇔pq_pubkey
+                // invariant: a Hybrid record with no PQ bytes is a fail-closed
+                // read error, never a silent downgrade to Ed25519.
+                let pq_pubkey = match pk.get_pq_pubkey() {
+                    Ok(bytes) if !bytes.is_empty() => Some(bytes.to_vec()),
+                    _ => None,
+                };
+                match (algorithm.is_hybrid(), &pq_pubkey) {
+                    (true, Some(_)) | (false, None) => {}
+                    (true, None) => anyhow::bail!(
+                        "hybrid pubkey record {fingerprint} is missing its ML-DSA-65 \
+                         key material (refusing to read — fail closed)"
+                    ),
+                    (false, Some(_)) => anyhow::bail!(
+                        "classical pubkey record {fingerprint} carries unexpected \
+                         ML-DSA-65 key material (refusing to read)"
+                    ),
+                }
                 pubkeys.push(StoredPubkey {
-                    fingerprint: pk.get_fingerprint()?.to_string()?,
+                    fingerprint,
                     pubkey_base64: pk.get_pubkey_base64()?.to_string()?,
                     label: text_or_none(pk.get_label()),
                     created_at: pk.get_created_at(),
                     last_used_at: pk.get_last_used_at(),
-                    // Pre-#439 records have no algorithm tag → default Ed25519.
-                    algorithm: text_or_none(pk.get_algorithm())
-                        .and_then(|s| KeyAlgorithm::parse(&s).ok())
-                        .unwrap_or_default(),
+                    algorithm,
+                    pq_pubkey,
                 });
             }
         }
@@ -413,6 +455,7 @@ impl UserStore for RocksDbUserStore {
                 created_at: sp.created_at,
                 last_used_at: if sp.last_used_at == 0 { None } else { Some(sp.last_used_at) },
                 algorithm: sp.algorithm,
+                pq_pubkey: sp.pq_pubkey,
             });
         }
         Ok(entries)
@@ -451,10 +494,67 @@ impl UserStore for RocksDbUserStore {
             label,
             created_at: now,
             last_used_at: 0,
-            // Only Ed25519 keys can reach add_pubkey today; the tag is baked in
-            // so widening the trait to PQ later is additive (#439).
+            // Classical binding: no PQ component (#439).
             algorithm: KeyAlgorithm::Ed25519,
+            pq_pubkey: None,
         });
+
+        self.put_user(username, &sub, &profile, &pubkeys)?;
+        self.put_pubkey_index(&fingerprint, username)?;
+
+        Ok(fingerprint)
+    }
+
+    async fn add_pubkey_hybrid(
+        &self,
+        username: &str,
+        pubkey: VerifyingKey,
+        ml_dsa_vk: Vec<u8>,
+        label: Option<String>,
+    ) -> Result<String> {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        if ml_dsa_vk.is_empty() {
+            anyhow::bail!("add_pubkey_hybrid: empty ML-DSA-65 verifying key");
+        }
+
+        let (sub, profile, mut pubkeys) = self.get_raw(username)?
+            .ok_or_else(|| anyhow!("User '{}' not found", username))?;
+
+        // Fingerprint is the Ed25519 anchor's (kid) — the PQ vk does not change it.
+        let fingerprint = pubkey_fingerprint(&pubkey);
+
+        // Reject a fingerprint bound to a *different* user.
+        if let Some(existing_user) = self.get_pubkey_index(&fingerprint)? {
+            if existing_user != username {
+                anyhow::bail!("Pubkey already associated with user '{}'", existing_user);
+            }
+        }
+
+        let pubkey_base64 = URL_SAFE_NO_PAD.encode(pubkey.as_bytes());
+        if let Some(existing) = pubkeys.iter_mut().find(|pk| pk.fingerprint == fingerprint) {
+            // In-place upgrade path: an existing record for the same anchor is
+            // lifted Ed25519 → Hybrid. Hybrid → Hybrid is idempotent (re-bind).
+            // There is no Hybrid → Ed25519 transition here (this method only
+            // ever sets Hybrid), so the forbidden downgrade cannot occur.
+            existing.algorithm = KeyAlgorithm::HybridEd25519MlDsa65;
+            existing.pq_pubkey = Some(ml_dsa_vk);
+            if label.is_some() {
+                existing.label = label;
+            }
+        } else {
+            let now = chrono::Utc::now().timestamp();
+            pubkeys.push(StoredPubkey {
+                fingerprint: fingerprint.clone(),
+                pubkey_base64,
+                label,
+                created_at: now,
+                last_used_at: 0,
+                algorithm: KeyAlgorithm::HybridEd25519MlDsa65,
+                pq_pubkey: Some(ml_dsa_vk),
+            });
+        }
 
         self.put_user(username, &sub, &profile, &pubkeys)?;
         self.put_pubkey_index(&fingerprint, username)?;
@@ -1006,5 +1106,113 @@ mod tests {
         // Reverse lookup should also work
         assert_eq!(store2.get_pubkey_user(&fingerprint).await?, Some("alice".to_owned()));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_pubkey_round_trips_pq_material_across_reopen() -> Result<()> {
+        let dir = TempDir::new()?;
+        let key = SigningKey::generate(&mut rand::thread_rng()).verifying_key();
+        // A stand-in ML-DSA-65 vk (bytes are opaque to the store).
+        let pq_vk = vec![0xABu8; 1952];
+        let fingerprint;
+        {
+            let store = make_store(dir.path());
+            store.register("alice").await?;
+            fingerprint = store
+                .add_pubkey_hybrid("alice", key, pq_vk.clone(), Some("laptop".to_owned()))
+                .await?;
+        }
+
+        // Reopen (exercises capnp serialize + deserialize of pqPubkey).
+        let store2 = RocksDbUserStore::open(dir.path())?;
+        let keys = store2.list_pubkeys("alice").await?;
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].fingerprint, fingerprint);
+        assert_eq!(keys[0].algorithm, KeyAlgorithm::HybridEd25519MlDsa65);
+        assert_eq!(keys[0].pq_pubkey.as_ref(), Some(&pq_vk));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_upgrade_in_place_preserves_fingerprint() -> Result<()> {
+        let dir = TempDir::new()?;
+        let key = SigningKey::generate(&mut rand::thread_rng()).verifying_key();
+        let store = make_store(dir.path());
+        store.register("alice").await?;
+
+        // Classical first, then upgrade the SAME anchor to hybrid.
+        let fp1 = store.add_pubkey("alice", key, None).await?;
+        let fp2 = store
+            .add_pubkey_hybrid("alice", key, vec![0x11u8; 1952], None)
+            .await?;
+        assert_eq!(fp1, fp2, "hybrid upgrade keeps the Ed25519 anchor fingerprint");
+
+        let keys = store.list_pubkeys("alice").await?;
+        assert_eq!(keys.len(), 1, "in-place upgrade, not a second key");
+        assert_eq!(keys[0].algorithm, KeyAlgorithm::HybridEd25519MlDsa65);
+        assert!(keys[0].pq_pubkey.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn test_serialize_rejects_invariant_violations() {
+        // Hybrid tag with no PQ material must not be persistable.
+        let bad_hybrid = StoredPubkey {
+            fingerprint: "SHA256:x".to_owned(),
+            pubkey_base64: "AAAA".to_owned(),
+            label: None,
+            created_at: 0,
+            last_used_at: 0,
+            algorithm: KeyAlgorithm::HybridEd25519MlDsa65,
+            pq_pubkey: None,
+        };
+        let profile = UserProfile::default();
+        assert!(
+            RocksDbUserStore::serialize_profile("sub", &profile, &[bad_hybrid]).is_err(),
+            "hybrid record with no PQ key must fail to serialize"
+        );
+
+        // Classical tag carrying PQ material is equally invalid.
+        let bad_classical = StoredPubkey {
+            fingerprint: "SHA256:y".to_owned(),
+            pubkey_base64: "AAAA".to_owned(),
+            label: None,
+            created_at: 0,
+            last_used_at: 0,
+            algorithm: KeyAlgorithm::Ed25519,
+            pq_pubkey: Some(vec![1, 2, 3]),
+        };
+        assert!(
+            RocksDbUserStore::serialize_profile("sub", &profile, &[bad_classical]).is_err(),
+            "classical record carrying PQ key material must fail to serialize"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_rejects_unknown_algorithm_tag() {
+        // Hand-build a UserInfo capnp record whose pubkey carries a future,
+        // unknown algorithm tag; the read path must error (never silently
+        // downgrade to Ed25519).
+        let mut message = Builder::new_default();
+        {
+            let mut ui = message.init_root::<crate::oauth_capnp::user_info::Builder>();
+            ui.set_sub("sub");
+            let mut pk_list = ui.init_pubkeys(1);
+            let mut e = pk_list.reborrow().get(0);
+            e.set_fingerprint("SHA256:z");
+            e.set_pubkey_base64("AAAA");
+            e.set_created_at(0);
+            e.set_last_used_at(0);
+            e.set_algorithm("ml-dsa-99-future");
+        }
+        let mut bytes = vec![0u8]; // presence-flags prefix
+        capnp::serialize::write_message(&mut bytes, &message).unwrap();
+
+        let err = RocksDbUserStore::deserialize_profile(&bytes)
+            .expect_err("unknown algorithm tag must fail the read");
+        assert!(
+            err.to_string().to_lowercase().contains("unknown key algorithm"),
+            "error must name the unknown tag: {err}"
+        );
     }
 }
