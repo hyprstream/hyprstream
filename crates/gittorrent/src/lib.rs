@@ -1,27 +1,23 @@
-//! GitTorrent - Decentralized Git hosting using libp2p
+//! GitTorrent - Decentralized Git hosting over iroh-blobs + a mainline locator.
 //!
-//! This library implements a peer-to-peer network for sharing Git repositories
-//! using libp2p and a Kademlia distributed hash table (DHT).
+//! The object plane (`put_object`/`get_object`) is backed by iroh-blobs with a
+//! mainline (BEP5) DHT rendezvous locator (F1–F3, epic #880 Track F). The old
+//! libp2p Kademlia stack was retired in F3 (#901).
 
-#[cfg(feature = "iroh-blobs")]
 pub mod blobs;
 pub mod crypto;
-pub mod dht;
 pub mod error;
 pub mod git;
-// Using libp2p for P2P networking directly in DHT module
 pub mod types;
 pub mod service;
 pub mod daemon;
 
 /// at9p mainline (BEP5) locator — see #889 / epic #880 Track C.
-#[cfg(feature = "mainline-locator")]
 pub mod locator;
 
 // Re-export commonly used types
 pub use error::{Error, Result};
 pub use types::*;
-pub use dht::DhtMode;
 
 // Re-export transport functionality for consuming applications
 pub use git::transport::{GittorrentTransportFactory, TransportFactory, register_gittorrent_transport};

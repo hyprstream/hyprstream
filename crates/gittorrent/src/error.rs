@@ -52,9 +52,6 @@ pub enum Error {
     #[error("DHT error: {0}")]
     Dht(String),
 
-    #[error("libp2p error: {0}")]
-    Libp2p(String),
-
     #[error("Protocol error: {0}")]
     Protocol(String),
 
@@ -66,31 +63,6 @@ pub enum Error {
 
     #[error("Other error: {0}")]
     Other(String),
-}
-
-// libp2p error conversions
-impl From<libp2p::swarm::DialError> for Error {
-    fn from(err: libp2p::swarm::DialError) -> Self {
-        Error::Libp2p(format!("Dial error: {err}"))
-    }
-}
-
-impl From<libp2p::noise::Error> for Error {
-    fn from(err: libp2p::noise::Error) -> Self {
-        Error::Libp2p(format!("Noise error: {err}"))
-    }
-}
-
-impl From<libp2p::TransportError<std::io::Error>> for Error {
-    fn from(err: libp2p::TransportError<std::io::Error>) -> Self {
-        Error::Libp2p(format!("Transport error: {err}"))
-    }
-}
-
-impl From<libp2p::multiaddr::Error> for Error {
-    fn from(err: libp2p::multiaddr::Error) -> Self {
-        Error::Libp2p(format!("Multiaddr error: {err}"))
-    }
 }
 
 impl From<tokio::sync::oneshot::error::RecvError> for Error {
@@ -121,11 +93,6 @@ impl Error {
     /// Create a DHT error
     pub fn dht<S: Into<String>>(msg: S) -> Self {
         Error::Dht(msg.into())
-    }
-
-    /// Create a libp2p error
-    pub fn libp2p<S: Into<String>>(msg: S) -> Self {
-        Error::Libp2p(msg.into())
     }
 
     /// Create a protocol error

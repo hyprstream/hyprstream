@@ -3,10 +3,10 @@ name = "gittorrent"
 version = "0.2.0"
 edition = "2021"
 authors = ["Erica Windsich <erica@cyberdione.ai>"]
-description = "Decentralized git hosting using libp2p networking"
+description = "Decentralized git hosting over iroh-blobs + a mainline DHT locator"
 license = "MIT"
 repository = "https://github.com/hyprstream/hyprstream/tree/main/crates/gittorrent"
-keywords = ["git", "p2p", "libp2p", "decentralized", "networking"]
+keywords = ["git", "p2p", "iroh", "decentralized", "networking"]
 categories = ["network-programming", "development-tools"]
 
 [[bin]]
@@ -56,8 +56,6 @@ toml = "0.8"
 # Git utilities (0.20.3 for CVE-2024-24577 fix in libgit2 1.9.2)
 git2.workspace = true
 
-# Using libp2p for P2P networking and DHT
-
 # Terminal colors
 colored = "2.0"
 
@@ -68,18 +66,16 @@ tempfile = "3.0"
 # XET integration dependencies
 async-trait = "0.1"
 
-# libp2p networking
-libp2p = { version = "0.56", features = ["kad", "mdns", "noise", "tcp", "tokio", "yamux", "identify", "request-response", "macros"] }
+# Mainline (BEP5) DHT locator for did:at9p (#889, epic #880 Track C) — the
+# untrusted rendezvous plane for the iroh-blobs object facade (F3, #901).
+mainline = "7.0"
+blake3 = { workspace = true }
 
-# Mainline (BEP5) DHT locator for did:at9p (#889, epic #880 Track C).
-# Optional: nothing ships enabled until Track C wiring lands.
-mainline = { version = "7.0", optional = true }
-blake3 = { workspace = true, optional = true }
-
-# iroh-blobs content-addressed byte transport (F1, #899).
+# iroh-blobs content-addressed byte transport (F1, #899). This is now the
+# sole object plane behind `put_object`/`get_object` (F3 retired libp2p).
 # 0.101.0 pins iroh =1.0.0-rc.0 - the exact version the workspace pins via
 # web-transport-iroh 0.5.x; co-bump all three together (see workspace Cargo.toml).
-iroh-blobs = { version = "=0.101.0", default-features = false, features = ["fs-store"], optional = true }
+iroh-blobs = { version = "=0.101.0", default-features = false, features = ["fs-store"] }
 multihash = "0.19"
 sha2 = "0.10"
 
@@ -95,12 +91,13 @@ parking_lot.workspace = true
 default = []
 # Enable additional debug logging
 debug = []
-# at9p mainline (BEP5) locator: arbitrary-infohash announce/get_peers, which
-# iroh's internal pkarr cannot do. Off by default (#889 / epic #880 Track C).
-mainline-locator = ["dep:blake3", "dep:mainline"]
-# Experimental iroh-blobs-backed object store (F1, #899). Local store only;
-# networked fetch via the at9p locator is F2 (#900).
-iroh-blobs = ["dep:iroh-blobs"]
+# F3 (#901) retired the libp2p Kademlia stack. iroh-blobs + the mainline
+# locator are now the unconditional object plane (non-optional deps above).
+# These names remain as no-op markers so existing `--features` flags (e.g. the
+# `cargo test --features "iroh-blobs mainline-locator"` acceptance command)
+# stay valid; they no longer gate any code.
+iroh-blobs = []
+mainline-locator = []
 
 [lints]
 workspace = true

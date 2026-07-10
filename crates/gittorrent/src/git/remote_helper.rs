@@ -389,26 +389,25 @@ impl GitRemoteHelper {
         Ok(())
     }
 
-    /// Clone repository from DHT using merkle tree traversal
+    /// Clone repository for a commit hash via the object facade.
+    ///
+    /// The libp2p Kademlia DHT path this once wrapped was retired in F3 (#901).
+    /// Object-plane clone-over-iroh-blobs is not wired through the remote helper
+    /// yet, so this still returns `Err` until that lands.
     async fn clone_from_dht(
         &self,
         commit_hash: &crate::types::Sha256Hash,
         _target_path: &Path,
         _include_refs: bool,
     ) -> Result<()> {
-        // This would use the DHT service to perform the actual clone
-        // For now, we'll create a placeholder since we need the actual DHT connection
+        tracing::info!(
+            "Clone for commit {} requested; object-plane clone not wired into the remote helper yet",
+            commit_hash
+        );
 
-        tracing::info!("Attempting to clone commit {} from DHT", commit_hash);
-
-        // TODO: When DHT is properly initialized, use:
-        // if include_refs {
-        //     crate::git::objects::clone_commit_with_refs(commit_hash.clone(), target_path, &dht, true).await?;
-        // } else {
-        //     crate::git::objects::clone_commit(commit_hash.clone(), target_path, &dht).await?;
-        // }
-
-        Err(crate::Error::other("DHT cloning not yet implemented in remote helper"))
+        Err(crate::Error::other(
+            "object-plane cloning not yet implemented in remote helper",
+        ))
     }
 
     /// Create a basic functional repository
