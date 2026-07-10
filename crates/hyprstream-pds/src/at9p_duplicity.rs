@@ -61,15 +61,14 @@
 //! Both collapse onto the same terminal-watermark mechanism: an identity whose
 //! accepted head pre-commits to nothing admits no successor, ever.
 //!
-//! # B4 (#888): where the alarm goes — NOT here
+//! # B4 (#888): durable alarm routing
 //!
 //! This layer only *raises* the duplicity signal, as a typed [`DuplicityAlarm`]
-//! delivered to a pluggable [`DuplicityAlarmSink`]. **Routing** that signal — to
-//! the S7 [`mac::audit`](../../hyprstream/src/mac) tamper-evident store, an
-//! operator notification path, or both — is owned by B4 (#888) and deliberately
-//! left as a seam here: the default [`NoopAlarmSink`] drops it, and B4 plugs in
-//! the real sink. Detection (this layer) and response (B4) are decoupled so the
-//! fail-closed decision never waits on delivery.
+//! delivered to a pluggable [`DuplicityAlarmSink`]. [`WalDuplicityAlarmSink`]
+//! provides the production route: an fsync-on-write, hash-chained journal with
+//! a durable head checkpoint, plus a structured operator alarm through tracing
+//! / OTel. Detection and response remain decoupled; callers that intentionally
+//! do not need durable routing may still select [`NoopAlarmSink`] explicitly.
 //!
 //! # Persistence seam (#886)
 //!
@@ -79,6 +78,9 @@
 //! wired here** (#886 scopes the seam, not the storage engine).
 
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -196,8 +198,10 @@ pub enum DuplicityKind {
 /// sides of the divergence (the persisted watermark and the divergent record) so
 /// the routing layer (B4, #888) has everything it needs to audit or notify
 /// without re-deriving state.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct DuplicityAlarm {
+    /// The self-certifying DID subject whose chain forked.
+    pub subject_cid512: String,
     /// Which fork shape was detected.
     pub kind: DuplicityKind,
     /// Epoch of the persisted, honestly-accepted watermark.
@@ -212,17 +216,203 @@ pub struct DuplicityAlarm {
 
 /// Sink for [`DuplicityAlarm`]s (B4/#888 seam). Detection raises; **routing** the
 /// signal to the S7 audit store and/or an operator notification path is B4's
-/// job. Implementations must not block the caller's fail-closed decision — the
-/// guard has already decided to reject by the time this is called.
+/// job. The guard has already committed to rejecting before this is called;
+/// durable implementations may synchronously fsync so returning from admission
+/// means the alarm is crash-durable.
 pub trait DuplicityAlarmSink: Send + Sync {
     /// Handle a raised duplicity alarm. Called exactly once per detected fork,
     /// after the guard has committed to failing closed.
     fn raise(&self, alarm: &DuplicityAlarm);
 }
 
-/// Default sink: drops the alarm. Detection still fails closed; only the
-/// *routing* is a no-op until B4 (#888) plugs in a real sink (S7 audit /
-/// operator notify).
+const ALARM_WAL_MAGIC: &[u8; 8] = b"AT9PALM1";
+const ALARM_FIXED_PAYLOAD_LEN: usize = 1 + 8 + H512_LEN + 8 + H512_LEN;
+
+/// Durable B4 duplicity-alarm sink.
+///
+/// Each alarm is appended to a length-delimited WAL and linked to the previous
+/// entry by BLAKE3 (`entry_hash = BLAKE3(prev_hash || payload)`). `raise`
+/// returns only after `sync_all`, so a successfully recorded alarm survives a
+/// crash. Opening an existing WAL verifies every link and refuses a truncated
+/// or modified journal. The same call emits a structured `ERROR` event on the
+/// `hyprstream.at9p.duplicity` target, which reaches stderr and OTLP through the
+/// process tracing subscriber and is therefore visible to operators.
+pub struct WalDuplicityAlarmSink {
+    path: PathBuf,
+    checkpoint_path: PathBuf,
+    state: Mutex<AlarmWalState>,
+}
+
+struct AlarmWalState {
+    file: File,
+    head: [u8; 32],
+}
+
+impl WalDuplicityAlarmSink {
+    /// Open (or create) an alarm WAL, verifying its complete hash chain before
+    /// accepting new records. A corrupt journal fails closed at startup.
+    pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let checkpoint_path = path.with_extension("checkpoint");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let head = verify_alarm_wal(&bytes)?;
+        if checkpoint_path.exists() {
+            let checkpoint = std::fs::read(&checkpoint_path)?;
+            anyhow::ensure!(
+                checkpoint.as_slice() == head,
+                "duplicity alarm WAL does not match its durable checkpoint"
+            );
+        }
+        if bytes.is_empty() {
+            file.write_all(ALARM_WAL_MAGIC)?;
+            file.sync_all()?;
+        }
+        write_alarm_checkpoint(&checkpoint_path, &head)?;
+        Ok(Self {
+            path,
+            checkpoint_path,
+            state: Mutex::new(AlarmWalState { file, head }),
+        })
+    }
+
+    /// Location of the durable journal (operator diagnostics).
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn record(&self, alarm: &DuplicityAlarm) -> anyhow::Result<()> {
+        let payload = encode_alarm(alarm)?;
+        let mut state = self.state.lock();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&state.head);
+        hasher.update(&payload);
+        let entry_hash = *hasher.finalize().as_bytes();
+        let previous = state.head;
+
+        state
+            .file
+            .write_all(&(payload.len() as u32).to_be_bytes())?;
+        state.file.write_all(&previous)?;
+        state.file.write_all(&payload)?;
+        state.file.write_all(&entry_hash)?;
+        state.file.sync_all()?;
+        write_alarm_checkpoint(&self.checkpoint_path, &entry_hash)?;
+        state.head = entry_hash;
+        Ok(())
+    }
+}
+
+fn write_alarm_checkpoint(path: &Path, head: &[u8; 32]) -> anyhow::Result<()> {
+    let temporary = path.with_extension("checkpoint.tmp");
+    let mut file = File::create(&temporary)?;
+    file.write_all(head)?;
+    file.sync_all()?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
+impl DuplicityAlarmSink for WalDuplicityAlarmSink {
+    fn raise(&self, alarm: &DuplicityAlarm) {
+        let result = self.record(alarm);
+        tracing::error!(
+            target: "hyprstream.at9p.duplicity",
+            subject_cid512 = %alarm.subject_cid512,
+            kind = ?alarm.kind,
+            watermark_epoch = alarm.watermark_epoch,
+            watermark_digest = %hex_digest(&alarm.watermark_digest),
+            divergent_epoch = alarm.divergent_epoch,
+            divergent_digest = %hex_digest(&alarm.divergent_digest),
+            durable = result.is_ok(),
+            error = result.as_ref().err().map(ToString::to_string).as_deref().unwrap_or(""),
+            "did:at9p duplicity detected; identity remains fail-closed"
+        );
+    }
+}
+
+fn encode_alarm(alarm: &DuplicityAlarm) -> anyhow::Result<Vec<u8>> {
+    let subject = alarm.subject_cid512.as_bytes();
+    anyhow::ensure!(
+        subject.len() <= u16::MAX as usize,
+        "at9p subject exceeds WAL limit"
+    );
+    let mut out = Vec::with_capacity(2 + subject.len() + ALARM_FIXED_PAYLOAD_LEN);
+    out.extend_from_slice(&(subject.len() as u16).to_be_bytes());
+    out.extend_from_slice(subject);
+    out.push(match alarm.kind {
+        DuplicityKind::SameEpochFork => 0,
+        DuplicityKind::BelowWatermarkFork => 1,
+        DuplicityKind::HigherEpochFork => 2,
+    });
+    out.extend_from_slice(&alarm.watermark_epoch.to_be_bytes());
+    out.extend_from_slice(&alarm.watermark_digest);
+    out.extend_from_slice(&alarm.divergent_epoch.to_be_bytes());
+    out.extend_from_slice(&alarm.divergent_digest);
+    Ok(out)
+}
+
+fn verify_alarm_wal(bytes: &[u8]) -> anyhow::Result<[u8; 32]> {
+    if bytes.is_empty() {
+        return Ok([0; 32]);
+    }
+    anyhow::ensure!(
+        bytes.starts_with(ALARM_WAL_MAGIC),
+        "invalid duplicity alarm WAL header"
+    );
+    let mut cursor = ALARM_WAL_MAGIC.len();
+    let mut head = [0; 32];
+    while cursor < bytes.len() {
+        anyhow::ensure!(
+            bytes.len() - cursor >= 4 + 32,
+            "truncated duplicity alarm WAL entry"
+        );
+        let len = u32::from_be_bytes(bytes[cursor..cursor + 4].try_into()?) as usize;
+        cursor += 4;
+        let previous: [u8; 32] = bytes[cursor..cursor + 32].try_into()?;
+        cursor += 32;
+        anyhow::ensure!(previous == head, "duplicity alarm WAL hash-chain break");
+        anyhow::ensure!(
+            bytes.len() - cursor >= len + 32,
+            "truncated duplicity alarm WAL payload"
+        );
+        let payload = &bytes[cursor..cursor + len];
+        cursor += len;
+        let stored: [u8; 32] = bytes[cursor..cursor + 32].try_into()?;
+        cursor += 32;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&head);
+        hasher.update(payload);
+        let expected = *hasher.finalize().as_bytes();
+        anyhow::ensure!(
+            stored == expected,
+            "duplicity alarm WAL entry hash mismatch"
+        );
+        head = stored;
+    }
+    Ok(head)
+}
+
+fn hex_digest(digest: &[u8; H512_LEN]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(H512_LEN * 2);
+    for byte in digest {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    out
+}
+
+/// Explicit no-op sink for tests or deployments that route alarms elsewhere.
+/// Detection still fails closed, but this sink provides no durable/operator
+/// signal; production callers should use [`WalDuplicityAlarmSink`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoopAlarmSink;
 
@@ -353,8 +543,9 @@ pub struct DuplicityGuard<S: WatermarkStore, A: DuplicityAlarmSink> {
 }
 
 impl<S: WatermarkStore> DuplicityGuard<S, NoopAlarmSink> {
-    /// Build a guard whose alarm routing is a no-op (B4/#888 not yet wired). Use
-    /// [`with_alarm`](Self::with_alarm) to plug in a real sink.
+    /// Build a guard whose alarm routing is explicitly disabled. Production
+    /// callers should use [`with_alarm`](Self::with_alarm) with
+    /// [`WalDuplicityAlarmSink`].
     pub fn new(store: S) -> Self {
         Self {
             store,
@@ -530,6 +721,7 @@ impl<S: WatermarkStore, A: DuplicityAlarmSink> DuplicityGuard<S, A> {
                 // fork — this is precisely the "never select max epoch" case.
                 if predecessor.record_digest != watermark.record_digest {
                     return Err(self.raise_duplicity(
+                        subject,
                         DuplicityKind::HigherEpochFork,
                         &watermark,
                         state.epoch,
@@ -554,6 +746,7 @@ impl<S: WatermarkStore, A: DuplicityAlarmSink> DuplicityGuard<S, A> {
                 } else {
                     // Two individually-valid records at the same epoch → equivocation.
                     Err(self.raise_duplicity(
+                        subject,
                         DuplicityKind::SameEpochFork,
                         &watermark,
                         state.epoch,
@@ -567,6 +760,7 @@ impl<S: WatermarkStore, A: DuplicityAlarmSink> DuplicityGuard<S, A> {
             // the same record we accepted at that epoch — and per R6 a client that has
             // accepted epoch N never accepts < N. Fail closed as a fork; never prefer.
             Err(self.raise_duplicity(
+                subject,
                 DuplicityKind::BelowWatermarkFork,
                 &watermark,
                 state.epoch,
@@ -579,12 +773,14 @@ impl<S: WatermarkStore, A: DuplicityAlarmSink> DuplicityGuard<S, A> {
     /// fail-closed error. The watermark is deliberately NOT mutated.
     fn raise_duplicity(
         &self,
+        subject_cid512: &str,
         kind: DuplicityKind,
         watermark: &Watermark,
         divergent_epoch: u64,
         divergent_digest: [u8; H512_LEN],
     ) -> AdmissionError {
         let alarm = DuplicityAlarm {
+            subject_cid512: subject_cid512.to_owned(),
             kind,
             watermark_epoch: watermark.epoch,
             watermark_digest: watermark.record_digest,
@@ -720,8 +916,65 @@ mod tests {
     }
     impl DuplicityAlarmSink for RecordingSink {
         fn raise(&self, alarm: &DuplicityAlarm) {
-            self.alarms.lock().push(*alarm);
+            self.alarms.lock().push(alarm.clone());
         }
+    }
+
+    fn sample_alarm() -> DuplicityAlarm {
+        DuplicityAlarm {
+            subject_cid512: "bafyat9ptestsubject".to_owned(),
+            kind: DuplicityKind::SameEpochFork,
+            watermark_epoch: 7,
+            watermark_digest: [0x11; H512_LEN],
+            divergent_epoch: 7,
+            divergent_digest: [0x22; H512_LEN],
+        }
+    }
+
+    #[test]
+    fn wal_alarm_is_durable_and_reopens_with_chain_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duplicity.wal");
+        let sink = WalDuplicityAlarmSink::open(&path).unwrap();
+        sink.raise(&sample_alarm());
+        let first_len = std::fs::metadata(&path).unwrap().len();
+        assert!(first_len > ALARM_WAL_MAGIC.len() as u64);
+        drop(sink);
+
+        let reopened = WalDuplicityAlarmSink::open(&path).unwrap();
+        reopened.raise(&DuplicityAlarm {
+            kind: DuplicityKind::HigherEpochFork,
+            divergent_epoch: 9,
+            ..sample_alarm()
+        });
+        assert!(std::fs::metadata(path).unwrap().len() > first_len);
+    }
+
+    #[test]
+    fn wal_alarm_refuses_tampered_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duplicity.wal");
+        let sink = WalDuplicityAlarmSink::open(&path).unwrap();
+        sink.raise(&sample_alarm());
+        drop(sink);
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let payload_offset = ALARM_WAL_MAGIC.len() + 4 + 32;
+        bytes[payload_offset + 3] ^= 0x80;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(WalDuplicityAlarmSink::open(path).is_err());
+    }
+
+    #[test]
+    fn wal_alarm_checkpoint_detects_tail_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duplicity.wal");
+        let sink = WalDuplicityAlarmSink::open(&path).unwrap();
+        sink.raise(&sample_alarm());
+        drop(sink);
+
+        std::fs::write(&path, ALARM_WAL_MAGIC).unwrap();
+        assert!(WalDuplicityAlarmSink::open(path).is_err());
     }
     impl RecordingSink {
         fn count(&self) -> usize {
