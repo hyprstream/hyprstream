@@ -178,6 +178,10 @@ pub mod service_entry;
 pub use hyprstream_crypto::did_key;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod did_web;
+// Pure DID URL parser + inert dereference plan (#906, at9p epic #880 G1).
+// Available on every target and intentionally independent of DID resolution,
+// transport decoding, dial targets, admission, and carrier possession.
+pub mod did_url;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod admission;
 // The real, method-dispatched `IdentityResolver` (#579). Native-only: the
