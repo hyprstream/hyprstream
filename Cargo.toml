@@ -303,6 +303,14 @@ lto = "thin"
 strip = true
 codegen-units = 4 # More threads needed for smaller RAM targets
 
+[profile.ci-test]
+inherits = "dev"
+lto = false
+opt-level = 1
+codegen-units = 16
+debug = 0
+incremental = false
+
 [workspace.lints.rust]
 # unsafe_code = "warn"  # Informational only, many FFI calls are necessary
 # rust_2018_idioms = { level = "warn", priority = -1 }  # Too noisy with lifetime parameters
