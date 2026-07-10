@@ -266,6 +266,19 @@ impl LocalInferenceService {
             InferenceRequest::Shutdown { reply } => {
                 info!("Shutdown requested");
                 self.shutdown_requested = true;
+
+                // #429: drop every CUDA tensor the engine owns *now*, on this
+                // service thread, before we acknowledge shutdown. The service
+                // thread is spawned detached, so if we left the RoPE sin/cos
+                // tables (thread-local) and model weights to drop at thread-exit,
+                // their TLS destructors could fire during process-exit cleanup —
+                // after libtorch's atexit handler has torn down the CUDA context
+                // — aborting with `c10::Error: invalid device pointer`. Doing it
+                // here, while the client is still blocked on `reply`, guarantees
+                // the context is alive when these device tensors free. See
+                // `TorchEngine::release_device_resources`.
+                self.engine.release_device_resources();
+
                 let _ = reply.send(Ok(()));
             }
         }

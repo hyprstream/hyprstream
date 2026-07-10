@@ -21,6 +21,26 @@ use std::sync::Arc;
 use tch::{Device, Kind, Tensor};
 use tracing::info;
 
+// Thread-local cache of RoPE instances (sin/cos tables on the compute device),
+// keyed by (layer_idx, rope_theta bits, device ordinal). See the equivalent
+// `llama::ROPE_CACHE` for the full rationale.
+//
+// Teardown (#429): entries hold real CUDA tensors on GPU runs and survive the
+// engine's `Drop` (they are thread-local). `clear_rope_cache` drops them on the
+// service thread at shutdown, before libtorch's atexit handler tears down the
+// CUDA context — otherwise the TLS destructor frees them during process-exit
+// cleanup and aborts with `c10::Error: invalid device pointer`.
+thread_local! {
+    static ROPE_CACHE: std::cell::RefCell<HashMap<(usize, u32, i64), RoPE>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Drop every cached RoPE instance on the *calling* thread. Idempotent; call on
+/// the inference service thread at shutdown. See [`ROPE_CACHE`].
+pub(crate) fn clear_rope_cache() {
+    ROPE_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
 // ============================================================================
 // Config
 // ============================================================================
@@ -1074,18 +1094,8 @@ impl Qwen3_5FullAttention {
     ) -> Result<Tensor> {
         // Thread-local RoPE cache: reuses sin/cos tables across decode steps.
         // Saves ~9 GPU kernels per call (generate_embeddings) after the first token.
-        // Same pattern as LlamaModel::apply_rope.
-        use std::cell::RefCell;
-        // Cache key includes the DEVICE: the cached RoPE holds sin/cos tables on
-        // a specific device. Under a pipeline split (#314) the same `layer_idx`
-        // could legitimately run on different devices on one thread, so omitting
-        // device would hand back tables on the wrong device. We encode the device
-        // as an i64 (`-1` = CPU, otherwise the CUDA ordinal) since tch::Device is
-        // not Hash. On the single-device path this just adds one constant key dim.
-        thread_local! {
-            static ROPE_CACHE: RefCell<HashMap<(usize, u32, i64), RoPE>> =
-                RefCell::new(HashMap::new());
-        }
+        // Same pattern as LlamaModel::apply_rope. (The static lives at module scope;
+        // see [`clear_rope_cache`] for the teardown story.)
         let device_key: i64 = match device {
             Device::Cuda(i) => i as i64,
             _ => -1,

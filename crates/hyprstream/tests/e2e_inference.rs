@@ -34,18 +34,23 @@
 //!   cargo test -p hyprstream --release --test e2e_inference -- --ignored
 //! ```
 //!
-//! ## Known teardown artifact (GPU streaming test only)
+//! ## Teardown ordering (#429)
 //!
-//! `e6_gpu_load_and_stream_tokens` loads real model weights onto CUDA. After the
-//! test's assertions pass and the `ok` result line is printed, libtorch may abort
-//! the *test binary* during static/TLS-destructor cleanup with
-//! `c10::Error: invalid device pointer` (SIGABRT) — the CUDA caching allocator
-//! frees a tensor after the CUDA context has already been torn down at process
-//! exit. This is a known `tch`/libtorch process-teardown interaction, not a test
-//! failure: the load + streaming assertions have all passed by the time it fires,
-//! and it does not affect the default (CPU-only) `cargo test` run, which never
-//! touches CUDA. Run the streaming test in isolation (or read the `ok` line
-//! before the abort) to confirm the inference path itself is green.
+//! `e6_gpu_load_and_stream_tokens` loads real model weights onto CUDA. Two
+//! classes of device tensor used to outlive the engine struct: the
+//! thread-local RoPE sin/cos tables (`llama::ROPE_CACHE` / `qwen3_5::ROPE_CACHE`)
+//! and the model weights. Because the inference service thread is spawned
+//! *detached*, their TLS destructors could fire during process-exit cleanup —
+//! after libtorch's `atexit` handler had torn down the CUDA context — aborting
+//! the test binary with `c10::Error: invalid device pointer` (SIGABRT), *after*
+//! the assertions had already passed.
+//!
+//! The fix is an explicit, ordered teardown: `client.shutdown()` now drops every
+//! device tensor the engine owns **on the service thread, before replying** —
+//! while the caller is still blocked on the reply, so the process and the CUDA
+//! context are indubitably still alive. See `TorchEngine::release_device_resources`
+//! and the `Shutdown` arm of `LocalInferenceService`. After it returns only
+//! empty shells remain for any late static/TLS destruction.
 //!
 //! The router/placement tests (sections 3 & 4) are CPU-only and always run.
 //!
