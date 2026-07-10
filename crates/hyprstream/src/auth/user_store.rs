@@ -31,6 +31,49 @@ pub struct UserProfile {
     pub external_id: Option<String>,
 }
 
+/// The public-key algorithm of a stored [`PubkeyEntry`].
+///
+/// Ed25519 is the only implemented variant today; the tag exists from day one
+/// (#439) so that adding ML-DSA-65 / hybrid user keys later (mirroring the
+/// #280 Multikey path) is *additive* — every record already carries its
+/// algorithm, so widening `UserStore::add_pubkey` past Ed25519 will not be a
+/// store-schema migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyAlgorithm {
+    Ed25519,
+}
+
+impl Default for KeyAlgorithm {
+    /// Ed25519 is the classical floor for local human identity keys (the same
+    /// call already made for the iroh NodeId); PQ user keys are deferred.
+    fn default() -> Self {
+        Self::Ed25519
+    }
+}
+
+impl KeyAlgorithm {
+    /// Multicodec-style lowercase algorithm name written into stored records.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ed25519 => "ed25519",
+        }
+    }
+
+    /// Parse an algorithm tag read back from a stored record.
+    ///
+    /// Unknown tags error rather than silently falling back, so a future PQ
+    /// tag written by a newer build is never misread as Ed25519 by this one.
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ed25519" => Ok(Self::Ed25519),
+            other => anyhow::bail!(
+                "Unknown key algorithm tag '{other}'; only 'ed25519' is implemented in this build"
+            ),
+        }
+    }
+}
+
 /// A pubkey entry associated with a user (like GitHub SSH keys).
 #[derive(Debug, Clone)]
 pub struct PubkeyEntry {
@@ -44,6 +87,9 @@ pub struct PubkeyEntry {
     pub created_at: i64,
     /// Unix timestamp when the key was last used for auth, or None if never.
     pub last_used_at: Option<i64>,
+    /// Algorithm tag (#439). Defaults to [`KeyAlgorithm::Ed25519`] for records
+    /// written before the tag existed.
+    pub algorithm: KeyAlgorithm,
 }
 
 /// Filter parameters for user search (SCIM-aligned).
@@ -325,6 +371,7 @@ pub trait DeviceStore: Send + Sync {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -346,5 +393,17 @@ mod tests {
         assert!(matches_filter("userName pr", "alice", &None, &None, None));
         assert!(matches_filter("id pr", "alice", &sub, &None, None));
         assert!(!matches_filter("active pr", "alice", &None, &None, None));
+    }
+
+    #[test]
+    fn test_key_algorithm_parse_and_roundtrip() {
+        assert_eq!(KeyAlgorithm::Ed25519.as_str(), "ed25519");
+        assert_eq!(KeyAlgorithm::default(), KeyAlgorithm::Ed25519);
+        // Accepts case/whitespace variants.
+        assert_eq!(KeyAlgorithm::parse("ed25519").unwrap(), KeyAlgorithm::Ed25519);
+        assert_eq!(KeyAlgorithm::parse("  Ed25519 ").unwrap(), KeyAlgorithm::Ed25519);
+        // Unknown tags error (never silently fall back to Ed25519).
+        assert!(KeyAlgorithm::parse("ml-dsa-65").is_err());
+        assert!(KeyAlgorithm::parse("").is_err());
     }
 }

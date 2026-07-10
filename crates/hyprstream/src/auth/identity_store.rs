@@ -537,6 +537,54 @@ pub fn load_or_generate_user_signing_key(
     Ok((sk, vk))
 }
 
+/// Install `sk` as the client's user-signing-key (the file
+/// `load_or_generate_user_signing_key` reads), backing up any existing key
+/// first.
+///
+/// Used by `hyprstream user create --ssh`/`--key` (#439) to adopt an external
+/// key as the *actual* signing key the CLI signs with — without this, an
+/// imported-but-not-installed key leaves the client authenticating as
+/// `anonymous`. The previous key, if any, is copied to `user-signing-key.bak`
+/// (mode 0600) so the adopt is reversible; `None` is returned when no prior
+/// key existed.
+pub fn install_user_signing_key(
+    secrets_dir: &std::path::Path,
+    sk: &SigningKey,
+) -> Result<Option<std::path::PathBuf>> {
+    const NAME: &str = "user-signing-key";
+    const BAK: &str = "user-signing-key.bak";
+
+    if !is_writable(secrets_dir) {
+        return Err(missing_in_readonly(secrets_dir, NAME));
+    }
+
+    let path = secrets_dir.join(NAME);
+    let backup = if path.exists() {
+        let bak = secrets_dir.join(BAK);
+        let existing = std::fs::read(&path)
+            .with_context(|| format!("failed to read existing {NAME} for backup"))?;
+        std::fs::write(&bak, &existing)
+            .with_context(|| format!("failed to back up existing {NAME} to '{}'", bak.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bak, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("failed to chmod backup '{}'", bak.display()))?;
+        }
+        tracing::info!("Backed up prior user signing key → '{}'", bak.display());
+        Some(bak)
+    } else {
+        None
+    };
+
+    let mut raw = sk.to_bytes();
+    let result = write_secret(secrets_dir, NAME, &raw);
+    raw.zeroize();
+    result?;
+    tracing::info!("Installed adopted user signing key → '{}/{}'", secrets_dir.display(), NAME);
+    Ok(backup)
+}
+
 /// Load or generate an RSA 2048 keypair for RS256 JWT signing.
 ///
 /// Stored as PKCS#8 DER in `secrets_dir/rsa-key`. If the file doesn't exist

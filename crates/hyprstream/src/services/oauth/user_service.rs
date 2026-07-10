@@ -32,6 +32,7 @@ pub struct PubkeyInfo {
     pub label: Option<String>,
     pub created_at: i64,
     pub last_used_at: Option<i64>,
+    pub algorithm: crate::auth::KeyAlgorithm,
 }
 
 impl From<&PubkeyEntry> for PubkeyInfo {
@@ -42,6 +43,7 @@ impl From<&PubkeyEntry> for PubkeyInfo {
             label: entry.label.clone(),
             created_at: entry.created_at,
             last_used_at: entry.last_used_at,
+            algorithm: entry.algorithm,
         }
     }
 }

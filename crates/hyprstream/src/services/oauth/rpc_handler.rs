@@ -68,6 +68,7 @@ impl OAuthRpcHandler {
                 label: pk.label.clone().unwrap_or_default(),
                 created_at: pk.created_at,
                 last_used_at: pk.last_used_at.unwrap_or(0),
+                algorithm: pk.algorithm.as_str().to_owned(),
             }).collect(),
         }
     }
@@ -224,6 +225,7 @@ impl OauthHandler for OAuthRpcHandler {
             label: entry.label.unwrap_or_default(),
             created_at: entry.created_at,
             last_used_at: entry.last_used_at.unwrap_or(0),
+            algorithm: entry.algorithm.as_str().to_owned(),
         }))
     }
 
@@ -255,6 +257,7 @@ impl OauthHandler for OAuthRpcHandler {
                     label: e.label.unwrap_or_default(),
                     created_at: e.created_at,
                     last_used_at: e.last_used_at.unwrap_or(0),
+                    algorithm: e.algorithm.as_str().to_owned(),
                 })
                 .collect(),
         ))

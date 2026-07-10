@@ -29,6 +29,9 @@ struct StoredKey {
     label: Option<String>,
     created_at: i64,
     last_used_at: Option<i64>,
+    /// Algorithm tag (#439). Defaults to Ed25519 for pre-#439 records.
+    #[serde(default)]
+    algorithm: crate::auth::KeyAlgorithm,
 }
 
 pub struct ValkeyUserStore {
@@ -251,6 +254,7 @@ impl UserStore for ValkeyUserStore {
                     label: stored.label,
                     created_at: stored.created_at,
                     last_used_at: stored.last_used_at,
+                    algorithm: stored.algorithm,
                 });
             }
         }
@@ -262,7 +266,7 @@ impl UserStore for ValkeyUserStore {
         let fp = pubkey_fingerprint(&pubkey);
         let pubkey_base64 = base64::engine::general_purpose::STANDARD.encode(pubkey.as_bytes());
         let now = chrono::Utc::now().timestamp();
-        let stored = StoredKey { pubkey_base64, label, created_at: now, last_used_at: None };
+        let stored = StoredKey { pubkey_base64, label, created_at: now, last_used_at: None, algorithm: crate::auth::KeyAlgorithm::Ed25519 };
         let json = serde_json::to_string(&stored)?;
         self.pool.set::<(), _, _>(format!("hs:key:{fp}"), json, None, None, false).await?;
         self.pool.sadd::<i64, _, _>(format!("hs:user:{username}:keys"), &fp).await?;

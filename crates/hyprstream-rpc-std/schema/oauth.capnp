@@ -109,6 +109,10 @@ struct PubkeyEntry {
   label @2 :Text;         # user-provided label (e.g., "laptop", "work")
   createdAt @3 :Int64;    # unix timestamp
   lastUsedAt @4 :Int64;   # unix timestamp, 0 if never used
+  # Multicodec algorithm tag (#439/#280): "ed25519" today, "ml-dsa-65"/hybrid
+  # additive later. Defaults to "ed25519" for records written before #439, so
+  # widening the store to PQ is additive rather than a schema migration.
+  algorithm @5 :Text;
 }
 
 struct UserListResult {

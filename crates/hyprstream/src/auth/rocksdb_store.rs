@@ -16,7 +16,7 @@ use ed25519_dalek::VerifyingKey;
 use std::io::Cursor;
 use std::path::Path;
 
-use super::user_store::{pubkey_fingerprint, matches_filter, DeviceRecord, DeviceStore, PubkeyEntry, UserFilter, UserProfile, UserStore};
+use super::user_store::{pubkey_fingerprint, matches_filter, DeviceRecord, DeviceStore, KeyAlgorithm, PubkeyEntry, UserFilter, UserProfile, UserStore};
 
 const USER_PREFIX: &[u8] = b"user:";
 const PUBKEY_PREFIX: &[u8] = b"pubkey:";
@@ -50,6 +50,8 @@ struct StoredPubkey {
     label: Option<String>,
     created_at: i64,
     last_used_at: i64, // 0 means never used
+    /// Algorithm tag (#439). Defaults to Ed25519 for pre-#439 records.
+    algorithm: KeyAlgorithm,
 }
 
 pub struct RocksDbUserStore {
@@ -137,6 +139,7 @@ impl RocksDbUserStore {
                 }
                 entry.set_created_at(pk.created_at);
                 entry.set_last_used_at(pk.last_used_at);
+                entry.set_algorithm(pk.algorithm.as_str());
             }
         }
         let mut bytes = vec![flags];
@@ -182,6 +185,10 @@ impl RocksDbUserStore {
                     label: text_or_none(pk.get_label()),
                     created_at: pk.get_created_at(),
                     last_used_at: pk.get_last_used_at(),
+                    // Pre-#439 records have no algorithm tag → default Ed25519.
+                    algorithm: text_or_none(pk.get_algorithm())
+                        .and_then(|s| KeyAlgorithm::parse(&s).ok())
+                        .unwrap_or_default(),
                 });
             }
         }
@@ -405,6 +412,7 @@ impl UserStore for RocksDbUserStore {
                 label: sp.label,
                 created_at: sp.created_at,
                 last_used_at: if sp.last_used_at == 0 { None } else { Some(sp.last_used_at) },
+                algorithm: sp.algorithm,
             });
         }
         Ok(entries)
@@ -443,6 +451,9 @@ impl UserStore for RocksDbUserStore {
             label,
             created_at: now,
             last_used_at: 0,
+            // Only Ed25519 keys can reach add_pubkey today; the tag is baked in
+            // so widening the trait to PQ later is additive (#439).
+            algorithm: KeyAlgorithm::Ed25519,
         });
 
         self.put_user(username, &sub, &profile, &pubkeys)?;
@@ -815,6 +826,32 @@ mod tests {
         assert_eq!(keys[0].label.as_deref(), Some("laptop"));
         assert_eq!(keys[0].pubkey.as_bytes(), pubkey.as_bytes());
         assert!(keys[0].last_used_at.is_none());
+        // #439: every stored pubkey carries an algorithm tag (Ed25519 today).
+        assert_eq!(keys[0].algorithm, KeyAlgorithm::Ed25519);
+        Ok(())
+    }
+
+    /// #439: the algorithm tag survives a RocksDB roundtrip (serialize →
+    /// close → reopen → deserialize), so widening the store to PQ later is
+    /// additive rather than a re-migration of existing records.
+    #[tokio::test]
+    async fn test_pubkey_algorithm_tag_persists_across_reopen() -> Result<()> {
+        let dir = TempDir::new()?;
+        {
+            let store = make_store(dir.path());
+            store.register("alice").await?;
+            let pubkey = SigningKey::generate(&mut rand::thread_rng()).verifying_key();
+            store.add_pubkey("alice", pubkey, None).await?;
+            // `store` is dropped here, releasing the RocksDB write lock so the
+            // reopen below succeeds in the same process.
+        }
+
+        // Reopen the same store (exercises capnp serialize + deserialize path).
+        let store2 = RocksDbUserStore::open(dir.path())?;
+        let keys = store2.list_pubkeys("alice").await?;
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].algorithm, KeyAlgorithm::Ed25519);
+        assert_eq!(keys[0].algorithm.as_str(), "ed25519");
         Ok(())
     }
 
