@@ -772,19 +772,28 @@ async fn do_bootstrap(
         for factory in list_factories() {
             let service_name = factory.name;
 
-            if service_name == "policy" {
-                // PolicyService uses the root/CA key directly — no independent key needed.
-                bootstrap_pubkeys.insert(
-                    service_name.to_owned(),
-                    root_key.verifying_key(),
-                );
-                continue;
-            }
-
-            // Load or generate independent Ed25519 keypair
-            let service_key = identity_store::load_or_generate_service_signing_key(
-                &credentials_dir, service_name,
-            )?;
+            // PolicyService's identity IS the root/CA key: unlike every other
+            // service it has no independent per-service keypair, so it resolves
+            // to `root_key` rather than `load_or_generate_service_signing_key`
+            // (which would read/generate a divergent `policy/signing-key`).
+            //
+            // But it is NOT skipped: we still mint a CA-signed `service:policy`
+            // JWT — self-signed in the sense that the CA JWT key signs it, with
+            // `cnf` binding the root verifying key — and persist it to
+            // `policy/service-jwt`. That makes PolicyService symmetric with
+            // every other service and keeps the trust store (which records
+            // `root_key.verifying_key()` for "policy") in lockstep with the
+            // on-disk JWT, so a later `service repair`/reinstall can no longer
+            // leave a stale `policy` key/JWT pair that disagrees with the
+            // current CA key (#448). It also enables future per-service
+            // rotation of the policy credential.
+            let service_key = if service_name == "policy" {
+                root_key.clone()
+            } else {
+                identity_store::load_or_generate_service_signing_key(
+                    &credentials_dir, service_name,
+                )?
+            };
             let service_vk = service_key.verifying_key();
 
             let jwt = crate::auth::service_jwt::issue_or_load_service_jwt(
@@ -799,7 +808,7 @@ async fn do_bootstrap(
         identity_store::write_bootstrap_pubkeys(&credentials_dir, &bootstrap_pubkeys)?;
 
         tracing::info!(
-            "Generated {} independent service keypairs + JWTs",
+            "Generated service keypairs + JWTs for {} services",
             bootstrap_pubkeys.len(),
         );
     }

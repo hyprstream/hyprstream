@@ -112,6 +112,75 @@ mod tests {
         assert_eq!(decode_jwt_iss(&jwt).as_deref(), Some(issuer));
     }
 
+    /// PolicyService gets a `service:policy` JWT just like every other service
+    /// (#448). Bootstrap no longer skips it: it mints a CA-signed JWT whose
+    /// `cnf` binds the root/CA verifying key — the same key recorded in
+    /// `bootstrap_pubkeys["policy"]` and the key PolicyService actually signs
+    /// RPC responses with. This test encodes that invariant directly so the
+    /// "skip policy" regression cannot silently return: trust-store key ==
+    /// JWT `cnf` == actual signer, all three equal to `root_key`'s verifying
+    /// key.
+    #[test]
+    fn policy_service_jwt_is_symmetric_and_binds_root_key() {
+        let dir = tempfile::tempdir().unwrap();
+        // The CA: PolicyService's identity IS the root/CA key.
+        let root_key = SigningKey::from_bytes(&[7u8; 32]);
+        // The CA JWT signing key is purpose-derived from the root key, exactly
+        // as `do_bootstrap` derives it before signing any service JWT.
+        let ca_jwt_key =
+            hyprstream_rpc::node_identity::derive_purpose_key(&root_key, "hyprstream-jwt-v1");
+        let issuer = "http://localhost:6791";
+
+        // Reproduce the policy branch of the bootstrap loop: service_key ==
+        // root_key (NOT an independent per-service key), then issue + persist.
+        let policy_key = root_key.clone();
+        let policy_vk = policy_key.verifying_key();
+        let jwt = issue_or_load_service_jwt(
+            dir.path(),
+            "policy",
+            &ca_jwt_key,
+            &policy_vk,
+            issuer,
+            1_000_000,
+        )
+        .unwrap();
+        super::super::identity_store::write_service_jwt(dir.path(), "policy", &jwt).unwrap();
+
+        // The JWT is persisted at policy/service-jwt (not skipped).
+        let loaded =
+            super::super::identity_store::load_service_jwt(dir.path(), "policy").unwrap();
+        assert_eq!(loaded.as_deref(), Some(jwt.as_str()));
+
+        // Subject is service:policy.
+        let payload_b64 = jwt.split('.').nth(1).unwrap();
+        let payload = URL_SAFE_NO_PAD.decode(payload_b64).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(value.get("sub").and_then(|v| v.as_str()), Some("service:policy"));
+
+        // cnf.jwk binds the root verifying key — what the trust store records
+        // for "policy" and what PolicyService signs with.
+        let cnf = value.get("cnf").and_then(|v| v.get("jwk"));
+        assert!(cnf.is_some(), "policy service JWT must carry a cnf.jwk");
+        // The JWK thumbprint representation here is the raw 32-byte verifying
+        // key (x); compare against root_key.verifying_key() bytes.
+        let x = cnf
+            .and_then(|v| v.get("x"))
+            .and_then(|v| v.as_str())
+            .unwrap();
+        let x_bytes = URL_SAFE_NO_PAD.decode(x).unwrap();
+        assert_eq!(
+            x_bytes.as_slice(),
+            root_key.verifying_key().as_bytes(),
+            "cnf.jwk must bind root_key.verifying_key(), the key bootstrap registers for policy"
+        );
+
+        // And that equals what bootstrap would register in bootstrap_pubkeys.
+        assert_eq!(
+            root_key.verifying_key().as_bytes(),
+            policy_vk.as_bytes()
+        );
+    }
+
     /// A persisted legacy empty-issuer token is re-minted with the issuer set,
     /// rather than being returned as-is — so an upgrade heals the #328 mismatch
     /// on the next wizard/bootstrap run without manual intervention.
