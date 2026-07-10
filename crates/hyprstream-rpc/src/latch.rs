@@ -181,6 +181,27 @@ impl<K: ResourceKey> TerminalAuthz<K> for DenyAllTerminalAuthz {
     }
 }
 
+/// Permissive [`TerminalAuthz`] for a Public (plaintext) operational plane.
+///
+/// Counterpart to [`DenyAllTerminalAuthz`] for resources whose terminal value
+/// rides a plaintext EventService source — e.g. the model-lifecycle plane
+/// (`model.lifecycle.{loaded,failed}`), which EV5/#605 deliberately kept
+/// plaintext (the encrypted-default flip is deferred to #555). On such a plane
+/// a late read of the retained terminal releases no plaintext the live edge
+/// would not, so permitting the [`read_then_subscribe`] fast path is consistent
+/// with the plane's current posture.
+///
+/// This is NOT the right authz for a labelled/encrypted plane — there the late
+/// read must enforce MAC (`subject.ctx ⊒ object.label`); that impl lands under
+/// EV4 (#604). Use [`DenyAllTerminalAuthz`] (the default) until the plane has
+/// labels and a real MAC-backed impl exists.
+pub struct AllowAllTerminalAuthz;
+impl<K: ResourceKey> TerminalAuthz<K> for AllowAllTerminalAuthz {
+    fn authorize_read(&self, _key: &K, _watcher: &str) -> bool {
+        true
+    }
+}
+
 /// Latched-completion read: serve the retained terminal for `key` if already
 /// latched (and `authz` permits the late read), else subscribe to the live
 /// EventService edge via `subscriber` and block until an event that `classify`
@@ -296,6 +317,17 @@ mod tests {
         // Reaped keys got the fallback.
         assert_eq!(store.get(&2).unwrap().value.0, 255);
         assert_eq!(store.get(&3).unwrap().latched_by, "reaper@3");
+    }
+
+    #[test]
+    fn allow_all_authz_permits_late_read() {
+        // The plaintext-plane counterpart to deny_all_authz_blocks_late_read:
+        // AllowAllTerminalAuthz (correct for a Public EventService source, e.g.
+        // model lifecycle pre-#555) authorizes a late read of a retained value.
+        let store: TerminalStore<String, ExampleExit> = TerminalStore::new();
+        store.latch("t1".to_owned(), term(0, "owner"));
+        let authz = AllowAllTerminalAuthz;
+        assert!(authz.authorize_read(&"t1".to_owned(), "watcher"));
     }
 
     #[test]
