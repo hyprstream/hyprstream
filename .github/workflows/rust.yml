@@ -151,12 +151,22 @@ jobs:
       # the guard forces CI to actually exercise the sandbox. These guests are
       # EXCLUDED standalone crates with their own target dirs, so build them
       # explicitly; nextest locates them via HYPRSTREAM_*_WASM on the test step.
+      #
+      # IMPORTANT: `cd` into each guest crate dir before building. Cargo discovers
+      # .cargo/config.toml from the INVOCATION cwd, NOT the --manifest-path dir, so
+      # building from the repo root misses crates/hyprstream-workers-python-guest/
+      # .cargo/config.toml — which sets `--cfg getrandom_backend="custom"` for the
+      # wasm32-unknown-unknown target. Without it getrandom emits a hard
+      # compile_error!("...wasm32-unknown-unknown targets are not supported...").
+      # cd-ing in is the only invocation that honors the per-crate config (the
+      # fsguest has no such config today, but the same pattern is correct for both
+      # and is robust to a future config being added). See #1013 follow-up.
       run: |
         rustup target add wasm32-unknown-unknown wasm32-wasip1
-        cargo build --release --target wasm32-unknown-unknown \
-          --manifest-path crates/hyprstream-workers-python-guest/Cargo.toml
-        cargo build --release --target wasm32-wasip1 \
-          --manifest-path crates/hyprstream-workers-wasmtime-fsguest/Cargo.toml
+        ( cd crates/hyprstream-workers-python-guest && \
+          cargo build --release --target wasm32-unknown-unknown )
+        ( cd crates/hyprstream-workers-wasmtime-fsguest && \
+          cargo build --release --target wasm32-wasip1 )
 
     - name: Install cargo-nextest
       uses: taiki-e/install-action@nextest
