@@ -6766,6 +6766,7 @@ dependencies = [
  "cas-serve",
  "casbin",
  "chrono",
+ "ciborium",
  "clap",
  "config 0.13.4",
  "criterion",

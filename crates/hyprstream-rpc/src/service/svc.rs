@@ -54,6 +54,35 @@ fn composite_alg_components(alg: &str) -> Vec<&'static str> {
     }
 }
 
+/// Whether a JWT `alg` carries an ML-DSA-65 (post-quantum) component. Fu4/#677.
+fn alg_covers_pq(alg: &str) -> bool {
+    matches!(alg, "ML-DSA-65" | "ML-DSA-65-Ed25519")
+}
+
+/// Fu4/#677: CryptoPolicy-driven minimum-alg gate for JWT verification.
+///
+/// The `verify_claims` alg-routing accepts an EdDSA-only (classical) JWT
+/// whenever a kid resolves. Anti-stripping relies on `kid_algs`, whose default
+/// impl is empty ([`crate::auth::JwtKeySource::kid_algs]) and which the common
+/// `ClusterKeySource` never populates — so the existing defense is a no-op for
+/// most services. This gate makes the floor explicit and policy-driven: under a
+/// Hybrid [`CryptoPolicy`] a classical-only (`EdDSA`) JWT is rejected
+/// **independent of JWKS alg-list hygiene**. Under Classical any single alg is
+/// passed through to the per-alg decoders (existing behavior).
+fn jwt_alg_satisfies_policy(
+    policy: crate::crypto::CryptoPolicy,
+    alg: &str,
+) -> anyhow::Result<()> {
+    if policy.uses_pq() && !alg_covers_pq(alg) {
+        anyhow::bail!(
+            "Hybrid crypto policy requires a post-quantum JWT alg; \
+             classical-only alg '{}' rejected (Fu4/#677)",
+            alg
+        );
+    }
+    Ok(())
+}
+
 /// Work to execute after the RPC response is sent (e.g., stream publishing).
 pub type Continuation = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>;
 
@@ -529,6 +558,25 @@ pub trait RequestService: 'static {
         None
     }
 
+    /// Fu4/#677: the minimum JWT `alg` policy enforced in `verify_claims`.
+    ///
+    /// Under [`CryptoPolicy::Hybrid`] a classical-only (`EdDSA`) JWT is rejected
+    /// outright, independent of JWKS `kid_algs` hygiene. The default reads the
+    /// process-global envelope verify config (Hybrid in production), so the
+    /// per-call policy is test-isolated from sibling tests that mutate the
+    /// shared global — a mock/test service that needs EdDSA acceptance overrides
+    /// this to [`CryptoPolicy::Classical`].
+    fn jwt_verify_policy(&self) -> crate::crypto::CryptoPolicy {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            crate::envelope::global_verify_policy()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            crate::crypto::CryptoPolicy::Classical
+        }
+    }
+
     /// Resolve a verified signer key to an authorization subject (#446).
     ///
     /// Consulted by `verify_claims` for an unauthenticated (no-JWT) request: the
@@ -688,8 +736,19 @@ pub trait RequestService: 'static {
             }
         }
 
+        // ── Fu4/#677: CryptoPolicy-driven minimum-alg gate ───────────────────
+        //
+        // Independent of the JWKS `kid_algs` hygiene below: under a Hybrid
+        // policy a classical-only (EdDSA) JWT is rejected outright, before
+        // per-alg routing, so anti-stripping no longer depends on every key
+        // source populating `kid_algs` (the default impl is empty and
+        // `ClusterKeySource` never overrides it). The policy comes from
+        // `jwt_verify_policy` (the global config in production, overridable per
+        // service for tests).
+        jwt_alg_satisfies_policy(self.jwt_verify_policy(), &alg)?;
+
         // Route verification by algorithm
-        let verified = match alg.as_str() {
+        let mut verified = match alg.as_str() {
             "ML-DSA-65" => {
                 let vks = key_source.ml_dsa_verifying_keys();
                 if vks.is_empty() {
@@ -793,6 +852,12 @@ pub trait RequestService: 'static {
         // Store verified claims on context for downstream use
         let local_issuers = key_source.local_issuers();
         let local_issuers_refs: Vec<&str> = local_issuers.iter().map(String::as_str).collect();
+        // Fu5/#677: MAC clearance is authority-asserted and honored only from
+        // local-issuer tokens. An external OIDC issuer trusted for identity is
+        // not trusted to assert MAC clearance on this node — strip the claim
+        // from any federated token before the MAC PDP can read it (⇒ unlabeled
+        // ⇒ deny). Local-issuer tokens are unaffected.
+        verified.strip_federated_clearance(&local_issuers_refs);
         let s = verified.subject(&local_issuers_refs);
         if !s.is_anonymous() {
             ctx.jwt_subject = Some(s);
@@ -1048,6 +1113,12 @@ mod empty_iss_gate_tests {
         fn pq_signing_key(&self) -> Option<crate::crypto::pq::MlDsaSigningKey> {
             None
         }
+        // These tests exercise the empty-ISS / subject-routing gate with
+        // classical EdDSA tokens; pin the JWT policy to Classical so they are
+        // isolated from sibling tests that install a Hybrid global config.
+        fn jwt_verify_policy(&self) -> crate::crypto::CryptoPolicy {
+            crate::crypto::CryptoPolicy::Classical
+        }
     }
 
     /// Build an `EnvelopeContext` carrying `jwt_token`, with the chosen
@@ -1275,7 +1346,8 @@ mod ipc_key_identity_tests {
 
 #[cfg(test)]
 mod stripping_defense_tests {
-    use super::composite_alg_components;
+    use super::{composite_alg_components, jwt_alg_satisfies_policy};
+    use crate::crypto::CryptoPolicy;
 
     /// stripping_composite_covers_components:
     /// `ML-DSA-65-Ed25519` (composite) MUST cover both component algs so a
@@ -1307,6 +1379,45 @@ mod stripping_defense_tests {
     fn stripping_unknown_alg_is_empty() {
         assert!(composite_alg_components("HS256").is_empty());
         assert!(composite_alg_components("none").is_empty());
+    }
+
+    // ── Fu4/#677: CryptoPolicy-driven minimum-alg gate ──────────────────────
+
+    /// Under Classical policy every alg passes the gate (per-alg decoders do
+    /// the real checking); the gate is a no-op floor there.
+    #[test]
+    fn fu4_classical_accepts_any_alg() {
+        for alg in ["EdDSA", "ML-DSA-65", "ML-DSA-65-Ed25519", "ES256", "RS256"] {
+            assert!(
+                jwt_alg_satisfies_policy(CryptoPolicy::Classical, alg).is_ok(),
+                "Classical policy must not gate alg {alg}"
+            );
+        }
+    }
+
+    /// Under Hybrid policy a classical-only (`EdDSA`) JWT is rejected even
+    /// though a kid would resolve — the floor Fu4 adds, independent of JWKS
+    /// `kid_algs` hygiene. ES256/RS256 are likewise classical and rejected.
+    #[test]
+    fn fu4_hybrid_rejects_classical_only_alg() {
+        for alg in ["EdDSA", "ES256", "RS256", "none", "HS256"] {
+            assert!(
+                jwt_alg_satisfies_policy(CryptoPolicy::Hybrid, alg).is_err(),
+                "Hybrid policy must reject classical-only alg {alg}"
+            );
+        }
+    }
+
+    /// Under Hybrid policy the post-quantum algs (ML-DSA-65, composite) pass
+    /// the gate and proceed to per-alg verification.
+    #[test]
+    fn fu4_hybrid_accepts_pq_algs() {
+        for alg in ["ML-DSA-65", "ML-DSA-65-Ed25519"] {
+            assert!(
+                jwt_alg_satisfies_policy(CryptoPolicy::Hybrid, alg).is_ok(),
+                "Hybrid policy must accept post-quantum alg {alg}"
+            );
+        }
     }
 }
 

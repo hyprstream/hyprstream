@@ -120,30 +120,51 @@ impl PolicyService {
         self
     }
 
-    /// Sign a token with composite PQ signature when available, falling back to Ed25519.
-    async fn sign_token(&self, claims: &hyprstream_rpc::auth::Claims, is_service: bool) -> String {
-        {
-            let ml_dsa_key = if let Some(ref store) = self.ml_dsa_key_store {
-                store.active_key().await
-            } else {
-                None
-            };
-            if let Some(ref ml_key) = ml_dsa_key {
-                return if is_service {
-                    crate::auth::jwt::encode_composite_service_jwt(
-                        claims, ml_key, &self.jwt_signing_key,
-                    )
-                } else {
-                    crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
-                        claims, ml_key, &self.jwt_signing_key,
-                    )
-                };
-            }
-        }
-        if is_service {
-            crate::auth::jwt::encode_service_jwt(claims, &self.jwt_signing_key)
+    /// Sign a token, selecting the suite from [`CryptoPolicy`] (Fu3/#677).
+    ///
+    /// The composite PQ signature (EdDSA + ML-DSA-65) is used under a Hybrid
+    /// policy; under Classical the Ed25519-only suite is used. **Hybrid fails
+    /// closed:** if the node is Hybrid but no ML-DSA-65 signing key is
+    /// provisioned, this returns `Err` rather than silently minting a
+    /// classical-only token — mirroring [`crate::mac::audit::CoseAuditSigner`],
+    /// which the S7 audit path already gates the same way. Previously this seam
+    /// picked composite-vs-classical by *keystore state*, so a Hybrid node with
+    /// an empty/rotating ML-DSA store quietly downgraded minted tokens.
+    async fn sign_token(
+        &self,
+        claims: &hyprstream_rpc::auth::Claims,
+        is_service: bool,
+    ) -> Result<String> {
+        let policy = hyprstream_rpc::envelope::envelope_policy_from_env();
+        let ml_dsa_key = if let Some(ref store) = self.ml_dsa_key_store {
+            store.active_key().await
         } else {
-            crate::auth::jwt::encode(claims, &self.jwt_signing_key)
+            None
+        };
+        match (policy.uses_pq(), ml_dsa_key) {
+            (true, Some(ref ml_key)) => Ok(if is_service {
+                crate::auth::jwt::encode_composite_service_jwt(
+                    claims, ml_key, &self.jwt_signing_key,
+                )
+            } else {
+                crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
+                    claims, ml_key, &self.jwt_signing_key,
+                )
+            }),
+            (true, None) => {
+                warn!(
+                    "Hybrid crypto policy requires an ML-DSA-65 token-signing key, \
+                     none provisioned — refusing to mint a classical-only token (fail-closed)"
+                );
+                Err(anyhow!(
+                    "hybrid token signing key not provisioned (fail-closed under Hybrid policy)"
+                ))
+            }
+            (false, _) => Ok(if is_service {
+                crate::auth::jwt::encode_service_jwt(claims, &self.jwt_signing_key)
+            } else {
+                crate::auth::jwt::encode(claims, &self.jwt_signing_key)
+            }),
         }
     }
 
@@ -396,7 +417,16 @@ impl PolicyHandler for PolicyService {
             claims = claims.with_cnf_jwk(&key_bytes);
         }
 
-        let token = self.sign_token(&claims, is_service_token).await;
+        let token = match self.sign_token(&claims, is_service_token).await {
+            Ok(t) => t,
+            Err(e) => {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: "Failed to issue token".to_owned(),
+                    code: "SIGNING_NOT_CONFIGURED".to_owned(),
+                    details: e.to_string(),
+                }));
+            }
+        };
 
         Ok(PolicyResponseVariant::IssueTokenResult(TokenInfo {
             token,
@@ -1384,7 +1414,16 @@ impl PolicyHandler for PolicyService {
             .with_issuer(issuer)
             .with_cnf_jwk(vk.as_bytes());
 
-        let token = self.sign_token(&claims, true).await;
+        let token = match self.sign_token(&claims, true).await {
+            Ok(t) => t,
+            Err(e) => {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: "Failed to refresh service token".to_owned(),
+                    code: "SIGNING_NOT_CONFIGURED".to_owned(),
+                    details: e.to_string(),
+                }));
+            }
+        };
 
         // Persist renewed JWT to disk so it survives a server restart
         let credentials_dir = crate::auth::identity_store::credentials_dir()?;
@@ -1460,7 +1499,16 @@ impl PolicyHandler for PolicyService {
             claims = claims.with_cnf_jwk(&key_bytes);
         }
 
-        let token = self.sign_token(&claims, false).await;
+        let token = match self.sign_token(&claims, false).await {
+            Ok(t) => t,
+            Err(e) => {
+                return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                    message: "Failed to issue WIT".to_owned(),
+                    code: "SIGNING_NOT_CONFIGURED".to_owned(),
+                    details: e.to_string(),
+                }));
+            }
+        };
 
         info!(sub = %sub, expires_at, "ExchangeWit: issued at+jwt");
         Ok(PolicyResponseVariant::ExchangeWitResult(TokenInfo {

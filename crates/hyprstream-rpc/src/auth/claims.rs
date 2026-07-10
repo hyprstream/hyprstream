@@ -451,6 +451,23 @@ impl Claims {
         is_local_iss(&self.iss, local_issuers)
     }
 
+    /// Strip the authority-asserted MAC `clearance` when this token's issuer is
+    /// NOT a local issuer (Fu5/#677).
+    ///
+    /// `clearance` is authority-asserted: the issuing node signs the JWT, so a
+    /// local issuer (this node, or a configured local cluster issuer) is trusted
+    /// to grant MAC clearance. An external OIDC issuer trusted **for identity**
+    /// is NOT thereby trusted to assert MAC clearance on this node — honoring it
+    /// would let any trusted-for-identity federated IdP mint MAC clearance.
+    /// Federated-path decode therefore drops the claim before the MAC PDP can
+    /// read it ([`crate::auth::mac::SubjectContextClaims::clearance_label`]
+    /// returns `None` ⇒ unlabeled ⇒ deny). Local-issuer tokens are unaffected.
+    pub fn strip_federated_clearance(&mut self, local_issuers: &[&str]) {
+        if !self.is_local_to(local_issuers) {
+            self.clearance = None;
+        }
+    }
+
     /// Derive the Casbin authorization subject from these claims.
     ///
     /// Local tokens (issued by this node) produce bare subjects (`"alice"`)
@@ -561,6 +578,81 @@ mod tests {
         let claims = Claims::new("alice".to_owned(), 1000, 2000)
             .with_issuer("https://a.example.com".to_owned());
         assert_eq!(claims.iss, "https://a.example.com");
+    }
+
+    // ── Fu5/#677: clearance honored only from local-issuer tokens ───────────
+
+    use crate::auth::mac::{
+        Assurance, CompartmentSet, Level, SecurityLabel, SubjectContextClaims as _,
+    };
+
+    fn fu5_clearance() -> SecurityLabel {
+        SecurityLabel::new(
+            Level::Secret,
+            Assurance::PqHybrid,
+            CompartmentSet::EMPTY,
+        )
+    }
+
+    /// A federated token (issuer not in `local_issuers`) carrying a `clearance`
+    /// claim MUST have it stripped — an external OIDC issuer trusted for
+    /// identity is not trusted to assert MAC clearance on this node. After the
+    /// strip the MAC PDP reads `None` (⇒ unlabeled ⇒ deny).
+    #[test]
+    fn fu5_federated_clearance_is_stripped() {
+        let federated = "https://idp.example.com";
+        let mut claims = Claims::new("alice".to_owned(), 1000, 2000)
+            .with_issuer(federated.to_owned())
+            .with_clearance(fu5_clearance());
+        assert!(
+            claims.clearance.is_some(),
+            "precondition: federated token carries a clearance"
+        );
+
+        // Local issuers do NOT include the federated IdP.
+        claims.strip_federated_clearance(&["https://this.node"]);
+
+        assert!(
+            claims.clearance.is_none(),
+            "a federated token's clearance MUST be ignored (Fu5/#677)"
+        );
+        assert!(
+            claims.clearance_label().is_none(),
+            "the MAC PDP reads None ⇒ unlabeled ⇒ deny"
+        );
+    }
+
+    /// A local-issuer token's clearance is authority-asserted by this node and
+    /// MUST be preserved — `strip_federated_clearance` is a no-op for it.
+    #[test]
+    fn fu5_local_clearance_is_preserved() {
+        let local_iss = "https://this.node";
+        let mut claims = Claims::new("alice".to_owned(), 1000, 2000)
+            .with_issuer(local_iss.to_owned())
+            .with_clearance(fu5_clearance());
+
+        claims.strip_federated_clearance(&[local_iss]);
+
+        let kept = claims
+            .clearance
+            .expect("a local-issuer token keeps its authority-asserted clearance");
+        assert_eq!(kept.level, Level::Secret);
+    }
+
+    /// An unconfigured node (empty `local_issuers`) treats every non-empty iss
+    /// as federated (see [`is_local_iss`]) — so any clearance is stripped.
+    #[test]
+    fn fu5_unconfigured_node_strips_all_clearance() {
+        let mut claims = Claims::new("alice".to_owned(), 1000, 2000)
+            .with_issuer("https://some.idp".to_owned())
+            .with_clearance(fu5_clearance());
+
+        claims.strip_federated_clearance(&[]);
+
+        assert!(
+            claims.clearance.is_none(),
+            "an unconfigured node honors no clearance (deny-by-default)"
+        );
     }
 
     #[test]
