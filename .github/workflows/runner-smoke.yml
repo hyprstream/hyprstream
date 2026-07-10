@@ -4,6 +4,8 @@
 # scale-down terminates it. Trivial job (no build) — plumbing validation only.
 name: runner-smoke
 on:
+  push:
+    branches: [ewindisch/runner-smoke-test]
   workflow_dispatch:
 jobs:
   smoke:
