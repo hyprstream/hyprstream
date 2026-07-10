@@ -403,6 +403,89 @@ impl Spawnable for MoqEventBarrierService {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Ledger Service Factory (Phase-1 local-enforcer, #925 — `ledger` feature)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Factory for the Phase-1 cellular-ledger local-enforcer service (epic #922,
+/// #925). Gated behind the `ledger` cargo feature; inert unless
+/// `[ledger] enabled = true`.
+///
+/// **Follow-up wiring (clearly marked, not in this skeleton):**
+/// - The grant verifier is a [`StaticGrantVerifier`] that denies every
+///   presented grant until populated — wiring it to
+///   `hyprstream_rpc::auth::ucan` chain validation + the
+///   `ai.hyprstream.ledger.allocation` lexicon (item 1.5) is the production
+///   activation path.
+/// - The receipt sink is the [`LoggingReceiptSink`] (drains to zero, no PDS
+///   writes); the production sink writes the `ai.hyprstream.ledger.receipt`
+///   PDS records.
+/// - The live scheduler realign (`hyprstream-workers` `SandboxPool::acquire`
+///   → `LocalEnforcer::admit`) lands behind this flag once the #761
+///   group-authority decision (#921.5) is made.
+#[cfg(feature = "ledger")]
+#[service_factory("ledger", depends_on = ["policy"])]
+fn create_ledger_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+    use crate::services::ledger::{
+        CoseCheckpointSigner, LedgerService, LoggingReceiptSink, StaticGrantVerifier,
+    };
+    use hyprstream_crypto::did_key::ed25519_to_did_key;
+    use hyprstream_ledger::{Did, MemLedger};
+    use std::sync::Arc;
+
+    info!("Creating LedgerService (Phase-1 local-enforcer, #925)");
+
+    let config = load_config();
+    let lcfg = config.ledger.clone();
+    if !lcfg.is_enabled() {
+        anyhow::bail!("ledger service requested but [ledger] enabled = false (the Phase-1 enforcer is opt-in)");
+    }
+
+    // Cell identity = did:key over the service Ed25519 key.
+    let ed_sk = ctx.service_signing_key("ledger");
+    let ed_vk = ed_sk.verifying_key();
+    let cell_identity = Did(ed25519_to_did_key(&ed_vk.to_bytes()));
+
+    // Register this service's verifying key with PolicyService.
+    let _ = ctx.verifying_key();
+
+    // PQ (ML-DSA-65) key under the Hybrid policy. Fail-closed construction:
+    // `require_pq_signatures` set with no key available ⇒ refuse to start the
+    // ledger service rather than silently downgrade checkpoints to Classical.
+    let signer: Arc<dyn hyprstream_ledger::CheckpointSigner + Send + Sync> = if lcfg.require_pq_signatures {
+        let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
+        let store = crate::auth::key_rotation::global_ml_dsa_key_store(&secrets_dir, &config.oauth);
+        let pq_key = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async { store.active_key().await })
+        });
+        match pq_key {
+            Some(k) => Arc::new(CoseCheckpointSigner::hybrid(cell_identity.clone(), ed_sk, (*k).clone())),
+            None => anyhow::bail!(
+                "ledger: require_pq_signatures is set but no ML-DSA-65 key is available (fail-closed)"
+            ),
+        }
+    } else {
+        Arc::new(CoseCheckpointSigner::classical(cell_identity.clone(), ed_sk))
+    };
+
+    // Phase-1 backend: MemLedger (RocksLedger is item 1.2). The grant verifier
+    // is the fail-closed StaticGrantVerifier until the UCAN wiring lands.
+    let verifier: Arc<dyn crate::services::ledger::GrantVerifier + Send + Sync> =
+        Arc::new(StaticGrantVerifier::new());
+    let sink: Arc<dyn crate::services::ledger::ReceiptSink + Send + Sync> =
+        Arc::new(LoggingReceiptSink);
+
+    let service = LedgerService::spawn(
+        lcfg,
+        Box::new(MemLedger::new(cell_identity.clone())),
+        signer,
+        verifier,
+        sink,
+        cell_identity,
+    );
+    Ok(Box::new(service))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Policy Service Factory
 // ═══════════════════════════════════════════════════════════════════════════════
 
