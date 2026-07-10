@@ -2288,10 +2288,18 @@ fn main() -> Result<()> {
                                             &signing_key,
                                             &pq_sk,
                                         ) {
-                                            Ok(policy) => tracing::info!(
+                                            Ok((policy, true)) => tracing::info!(
                                                 "MAC S4: baseline compiled policy installed \
                                                  (generation {}, DORMANT — enforcement not enabled)",
                                                 policy.generation
+                                            ),
+                                            // The seam is write-once: a policy was
+                                            // already installed this process, so the
+                                            // baseline did NOT replace it. Report it
+                                            // honestly rather than claiming an install.
+                                            Ok((_policy, false)) => tracing::warn!(
+                                                "MAC S4: a compiled policy was already installed; \
+                                                 baseline NOT installed (write-once seam unchanged)"
                                             ),
                                             Err(e) => tracing::error!(
                                                 "MAC S4: baseline policy bootload failed \

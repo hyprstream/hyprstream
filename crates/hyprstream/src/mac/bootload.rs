@@ -69,10 +69,39 @@ pub enum BootPolicyError {
 /// reads only its capability set. Enrollment is the authority-owned
 /// DID→clearance table (#698), embedded in and covered by the signature.
 ///
-/// Installation is once-per-process (the underlying `OnceLock`): a second call
-/// leaves the first-installed policy in place, but always returns the policy
-/// **this** call compiled+verified (so callers observe their own artifact even
-/// when another already won the global slot).
+/// ## Return: `(policy, installed)` — the write-once truth
+///
+/// Returns the policy **this** call compiled+verified together with an
+/// `installed` flag from [`install_compiled_policy`]: `true` iff this call's
+/// policy actually became the process-global seam, `false` if one was already
+/// installed and the global slot is unchanged. The returned `Arc` is always this
+/// call's own artifact regardless — but when `installed == false`, that artifact
+/// is NOT what [`crate::mac::compiled_policy`] returns.
+///
+/// ## Write-once limitation (do not build a real-policy swap on this yet)
+///
+/// The seam is a `OnceLock`: the **first** installed policy pins it for the
+/// process lifetime. So this API installs a real policy ONLY on a node that has
+/// not already installed the boot baseline — which, at daemon startup, it always
+/// has. A config-driven real policy therefore CANNOT replace the baseline through
+/// this function today: it will compile+verify fine, get `installed == false`,
+/// and silently leave the empty baseline as the live seam. Swapping a
+/// newer verified generation in atomically (e.g. `ArcSwap<CompiledPolicy>` keyed
+/// by `generation`) is the follow-up; until then, treat `installed == false` as
+/// "the earlier policy still governs the seam", never as a successful swap.
+///
+/// ## Key provenance (self-issued smoke test, NOT a distributed trust anchor)
+///
+/// The signer and verifier are the SAME node keys and there are no approvals, so
+/// this is a self-signed, self-verified artifact: the round-trip exercises the
+/// real hybrid `sign_composite` → `verify_composite` path but proves nothing
+/// about an external authority. The node's `ed_sk` (registry identity) and the
+/// `pq_sk` (drawn from the JWT-rotation ML-DSA store) are also a chimera pairing,
+/// not a purpose-built policy-authority key. **Before any *distributed* policy
+/// flow reuses this signer/verifier pairing, key provenance must be settled** —
+/// a dedicated policy-authority keypair whose verifying key is anchored in the
+/// PQ trust store, with `PolicyLoader::with_approval` populated — so the loader
+/// verifies against an anchored authority, not against the same key that signed.
 pub fn compile_sign_load_install(
     grant: &Ucan,
     lattice: &Lattice,
@@ -80,7 +109,7 @@ pub fn compile_sign_load_install(
     enrollment: BTreeMap<String, SecurityLabel>,
     ed_sk: &SigningKey,
     pq_sk: &MlDsaSigningKey,
-) -> Result<Arc<CompiledPolicy>, BootPolicyError> {
+) -> Result<(Arc<CompiledPolicy>, bool), BootPolicyError> {
     // Control plane: lower the grant → TE matrix (S5 compiler) and attach the
     // authority-owned enrollment. Both travel inside the signature.
     let policy = compile(grant, lattice, permissions).with_enrollment(enrollment);
@@ -94,9 +123,9 @@ pub fn compile_sign_load_install(
     let signed = sign_policy(&policy, &signer)?;
 
     // Verify ONCE at load (require_pq = true, fail-closed). Same key material —
-    // the node self-signs its baseline; a production distribution flow would
-    // anchor the authority's key instead, but the load/verify contract is
-    // identical.
+    // the node self-signs its baseline (see the key-provenance note above); a
+    // production distribution flow would anchor a distinct authority key instead,
+    // but the load/verify contract is identical.
     let ed_vk = ed_sk.verifying_key();
     // `verifying_key` is provided by the `ml_dsa::Keypair` trait; call it
     // fully-qualified (matching `MlDsaKeySlot::verifying_key`) so this module
@@ -110,8 +139,8 @@ pub fn compile_sign_load_install(
     let loaded = PolicyLoader::new(verifier).load(&signed)?;
 
     let policy = Arc::new(loaded);
-    install_compiled_policy(policy.clone());
-    Ok(policy)
+    let installed = install_compiled_policy(policy.clone());
+    Ok((policy, installed))
 }
 
 /// Install the node's **dormant baseline** compiled policy at daemon boot.
@@ -125,13 +154,20 @@ pub fn compile_sign_load_install(
 /// Enforcement stays AllowAll — this is the dormant activation prerequisite, not
 /// the enforcement flip.
 ///
-/// A future policy-authoring step (config-driven UCAN grant + enrollment) feeds
-/// a real matrix through the same [`compile_sign_load_install`] path; the empty
-/// baseline is the fail-closed default until then.
+/// Returns `(policy, installed)` from [`compile_sign_load_install`]. At daemon
+/// boot this is the first (and, given the `OnceLock` write-once seam, only)
+/// install, so `installed` is normally `true`; a `false` means a policy was
+/// already installed this process.
+///
+/// A future policy-authoring step (config-driven UCAN grant + enrollment) will
+/// need a **swap-capable** seam to replace this baseline at runtime — it cannot
+/// do so through the current write-once [`install_compiled_policy`] (see that
+/// function's and [`compile_sign_load_install`]'s docs). The empty baseline is
+/// the fail-closed default until that seam lands.
 pub fn install_baseline_boot_policy(
     ed_sk: &SigningKey,
     pq_sk: &MlDsaSigningKey,
-) -> Result<Arc<CompiledPolicy>, BootPolicyError> {
+) -> Result<(Arc<CompiledPolicy>, bool), BootPolicyError> {
     // Self-issued empty grant: the node is its own baseline authority and grants
     // itself nothing. `compile` reads only the (empty) capability set.
     let did = Did::from_ed25519(&ed_sk.verifying_key().to_bytes());
@@ -214,7 +250,7 @@ mod tests {
             SecurityLabel::new(Level::Secret, Assurance::Classical, CompartmentSet::EMPTY);
         let enrollment = BTreeMap::from([(did.to_owned(), clearance)]);
 
-        let policy = compile_sign_load_install(
+        let (policy, _installed) = compile_sign_load_install(
             &grant,
             &lattice,
             &permissions,
@@ -257,7 +293,7 @@ mod tests {
         let ed_sk = SigningKey::generate(&mut OsRng);
         let (pq_sk, _pq_vk) = ml_dsa_generate_keypair();
 
-        let policy = install_baseline_boot_policy(&ed_sk, &pq_sk)
+        let (policy, _installed) = install_baseline_boot_policy(&ed_sk, &pq_sk)
             .expect("empty baseline must sign + verify-load");
 
         assert_eq!(policy.generation, 1);
@@ -267,5 +303,43 @@ mod tests {
             "the baseline enrolls nobody (fail-closed default)"
         );
         assert!(compiled_policy().is_some());
+    }
+
+    /// Seam-level "un-inert but dormant" assertion: after the baseline boot the
+    /// process-global seam is populated, so [`crate::mac::exchange_enrollment_resolver`]
+    /// returns the real [`EnrollmentSubjectContextResolver`] (no longer the
+    /// deny-all `DenyUnlabeledResolver`) — yet, because the baseline enrolls
+    /// nobody, that resolver still denies **every** DID. This is the truest
+    /// statement of what this PR does: it flips the seam on without granting
+    /// anything.
+    ///
+    /// The asserted DID is one no other test in this binary enrolls, so the
+    /// `is_none()` holds regardless of which test's install won the write-once
+    /// global slot.
+    #[test]
+    fn baseline_boot_flips_seam_on_but_still_denies_every_did() {
+        let ed_sk = SigningKey::generate(&mut OsRng);
+        let (pq_sk, _pq_vk) = ml_dsa_generate_keypair();
+
+        let _ = install_baseline_boot_policy(&ed_sk, &pq_sk)
+            .expect("empty baseline must sign + verify-load");
+
+        // The seam flipped on (a compiled policy is installed → the grant path
+        // resolves through EnrollmentSubjectContextResolver, not deny-all).
+        assert!(
+            compiled_policy().is_some(),
+            "the seam must be populated after boot"
+        );
+
+        // …and it still denies every DID (dormant): the enrollment resolver
+        // returns None for an unenrolled subject, exactly like the deny-all
+        // fallback would — un-inert, but grants nothing.
+        let resolver = crate::mac::exchange_enrollment_resolver();
+        assert!(
+            resolver
+                .resolve("did:key:zNobodyEverEnrollsThisSeamTest")
+                .is_none(),
+            "the flipped-on seam must still deny an unenrolled DID"
+        );
     }
 }

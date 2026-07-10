@@ -190,11 +190,24 @@ static COMPILED_POLICY: std::sync::OnceLock<std::sync::Arc<CompiledPolicy>> =
     std::sync::OnceLock::new();
 
 /// Install the node's verified [`CompiledPolicy`] for the
-/// [`exchange_enrollment_resolver`] seam. Once-per-process (a second call is a
-/// no-op, matching `install_verify_config`'s contract). The caller MUST have
+/// [`exchange_enrollment_resolver`] seam. **Write-once per process** (backed by a
+/// `OnceLock`): returns `true` if THIS call installed `policy`, `false` if a
+/// policy was already installed and this call was a no-op. The caller MUST have
 /// already verified the policy via [`PolicyLoader`] — this does not re-verify.
-pub fn install_compiled_policy(policy: std::sync::Arc<CompiledPolicy>) {
-    let _ = COMPILED_POLICY.set(policy);
+///
+/// The `bool` return makes the write-once contract honest: because the slot is a
+/// `OnceLock`, the **first** installed policy pins the seam for the process
+/// lifetime. Today the only caller is the boot baseline
+/// ([`bootload::install_baseline_boot_policy`]), so this is exactly-once; a
+/// future config-driven real policy CANNOT swap the baseline out through this API
+/// (it would get `false` and leave the empty baseline in place). Making the seam
+/// swap-capable — e.g. an `ArcSwap<CompiledPolicy>` keyed by policy generation so
+/// a newer, verified generation replaces an older one atomically — is the
+/// follow-up; until then callers must treat `false` as "the global seam still
+/// holds the earlier policy", never as success.
+#[must_use]
+pub fn install_compiled_policy(policy: std::sync::Arc<CompiledPolicy>) -> bool {
+    COMPILED_POLICY.set(policy).is_ok()
 }
 
 /// The installed [`CompiledPolicy`], if any. `None` on a node that hasn't loaded
