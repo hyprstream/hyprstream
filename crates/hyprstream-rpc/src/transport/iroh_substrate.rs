@@ -20,6 +20,51 @@
 //! real `moql` and `hyprstream-rpc/1` handlers are threaded in by the spawner
 //! (#282), and the OAuth/DID-controller identity binds its own canonical
 //! federation substrate (`build_oauth_iroh_substrate`).
+//!
+//! # D3 — iroh pkarr is LIVENESS-ONLY, never an authority source (#895)
+//!
+//! iroh's `presets::N0` discovery publishes classical **pkarr** records —
+//! signed-but-not-encrypted packets — onto the open BitTorrent mainline DHT to
+//! advertise reach (home relay + direct addresses) for a NodeId. As of #895
+//! (epic #880 Track D / D3) this is the contract for pkarr in hyprstream:
+//!
+//! - **Reach hint, not authority.** A pkarr record is an **unverified dial
+//!   candidate**: "NodeId N claims it is reachable at relay R / addr A." It is
+//!   signed by N's Ed25519 key, so it is integrity-protected *as a reach
+//!   claim* — but that says nothing about *which* federated identity (capsule,
+//!   `did:web`, `did:key`) controls N, what its PQ key material is, or whether
+//!   it may be admitted. **No identity / trust / admission decision is ever
+//!   derived from a pkarr record.** Identity is bound by the channel itself
+//!   (`Connection::remote_id()` == the peer's Ed25519 pubkey, verified by iroh's
+//!   QUIC TLS), and for a `did:at9p` peer the *authoritative* identity + PQ
+//!   binding comes only from a **GATE-verified capsule** (D1 / #893, served by
+//!   the at9p mainline locator). pkarr reach must be **confirmed by GATE-verified
+//!   capsule material before any authority is granted** — it is never itself the
+//!   source of that authority.
+//! - **Two riders, one DHT, one trust posture.** Both iroh pkarr and the at9p
+//!   mainline locator (#890 / C2) ride the *same* mainline DHT. Only at9p is
+//!   zero-trust: its records are content-addressed (`did:at9p:<cid512>`) and
+//!   made trustworthy by the GATE pipeline (canon → hash → composite-sig), so
+//!   the DHT is an **untrusted locator** for at9p, never a trust root. pkarr, by
+//!   contrast, is classical-only and trusts the DHT to carry the publisher's
+//!   reach claim verbatim — fine for liveness, fatal as an authority source.
+//! - **Not removed.** pkarr stays — it is genuinely useful for NAT traversal /
+//!   liveness ("is this peer dialable right now?"). D3 only strips (and forbids
+//!   re-deriving) authority from it; it does not disable publication.
+//!
+//! Enforcement seams: the dial path (`crate::dial`) resolves *addresses* from a
+//! NodeId whose identity is already channel-bound, never trusting the pkarr
+//! body; admission (`crate::admission`, `crate::transport::iroh_admission`)
+//! reads only `remote_id()` + (for at9p) GATE-verified capsule keys — never
+//! pkarr. The wasm pkarr output is typed as an unverified reach hint
+//! ([`crate::iroh_peer::PkarrReachHint`]) so it cannot be conflated with
+//! verified reach.
+//!
+//! The #385 metadata-leak side channel (a passive observer can enumerate which
+//! NodeIds are reachable and correlate lookup traffic) is **unaffected** by this
+//! demotion — pkarr is still public. Its mitigation is oblivious-relay (#361);
+//! until then, operators that consider the side channel actionable should run a
+//! self-hosted `iroh-dns-server` via [`IrohSubstrate::from_endpoint`].
 
 use anyhow::Result;
 use iroh::endpoint::{Connection, presets};
@@ -50,18 +95,11 @@ impl IrohSubstrate {
     /// constructor and use [`IrohSubstrate::from_endpoint`] with a
     /// pre-configured `iroh::Endpoint`.
     ///
-    /// #385 threat — discovery metadata leak (S8 close-out):
-    /// pkarr records are *public, signed-but-not-encrypted* packets published on
-    /// the open Mainline DHT. A passive network observer can enumerate which node
-    /// IDs are reachable, observe their home-relay binding, and correlate lookup
-    /// traffic (who is asking for whom) — i.e. discovery is a metadata side
-    /// channel by construction. This is inherent to DHT discovery; the streaming
-    /// plane never claims discovery-metadata privacy. Content confidentiality is
-    /// unaffected (frames are E2E AEAD-sealed at the source; the relay and the
-    /// DHT are blind to plaintext). The mitigation is oblivious-relay (#361):
-    /// hide the lookup pattern itself. Until #361 lands, operators that consider
-    /// the side channel actionable should run a self-hosted `iroh-dns-server`
-    /// via [`Self::from_endpoint`] to keep discovery traffic off the public DHT.
+    /// **pkarr here is liveness-only** — see the module-level "D3" note. The
+    /// published record carries reach hints (relay + direct addrs) for this
+    /// endpoint's NodeId; it derives **zero** identity/trust authority. The
+    /// #385 metadata-leak caveat also applies (mitigated by #361, not by this
+    /// demotion).
     pub async fn new<M, R>(
         secret_key_bytes: [u8; 32],
         moq_handler: M,
