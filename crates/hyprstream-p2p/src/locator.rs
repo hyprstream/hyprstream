@@ -20,6 +20,44 @@
 //! the full [`Cid512`] plus fixed-width rendezvous parameters; no truncated
 //! form escapes this module.
 //!
+//! # No name path — review rule R1 (story C4 = #892)
+//!
+//! Every public entry point on [`MainlineLocator`] takes a [`Cid512`]. There
+//! is deliberately **no** string-name lookup, no `name → cid` resolution, and
+//! no `name → cid` cache anywhere in this module. A name cache *inside the
+//! DHT client* re-opens threat A5: it turns the DHT into a trusted namespace
+//! authority (whoever poisons the cache chooses which capsule a name resolves
+//! to), exactly the "toxic mold" failure mode #879 §3 excludes. Names are
+//! resolved by a PQ-signed `NameRecord` from a trusted namespace authority
+//! (PDS / discovery / MoQ group) *above* this layer; the locator only ever
+//! answers "where might bytes for *this* cid live", never "which cid does
+//! *this* name mean".
+//!
+//! This is enforced, not merely documented:
+//! - [`Cid512`] has no `FromStr` / `From<&str>` / `from_name` — the only way
+//!   in is the full 64-byte digest.
+//! - [`r1_no_name_path_compiles_in`] is a regression test that scans this
+//!   module's source and fails if any `pub fn` grows a string-name parameter.
+//!
+//! # Add-only hints — review rule R7 (story C4 = #892)
+//!
+//! #879 §6.1 lists two rendezvous strategies: (1) BEP5 `announce_peer` /
+//! `get_peers` (chosen), and (2) a BEP44 deterministic-mailbox channel whose
+//! keypair is derived from the cid and is therefore public-by-construction —
+//! an overwrite war that is availability-only, acceptable *only* because the
+//! values are untrusted hints. The v1 decision (Q3) is recorded by
+//! [`V1_MAILBOX_HINT_CHANNEL`]: **BEP5-only for v1; the mailbox is deferred.**
+//!
+//! Whether or not the mailbox ships, R7 is load-bearing: a hint channel may
+//! only **add** lookup targets — it may never prune, replace, or terminate the
+//! watermark-anchored BEP5 scan (A14: a bogus "current epoch" hint that skips
+//! the scan converts an availability channel into a rollback assist). That
+//! constraint is encoded in [`LookupHints`], an accumulator whose API is
+//! add-only by construction (no `remove` / `replace` / `clear`), and in
+//! [`MainlineLocator::providers_with_hints`], which **always** performs the
+//! scan and then unions the hints in. There is no code path that lets a hint
+//! skip the scan.
+//!
 //! # wasm / browser note (documented, not built — C1 acceptance)
 //!
 //! There is **no raw mainline DHT from wasm**: browsers cannot open UDP
@@ -173,6 +211,88 @@ impl PeerContact {
     }
 }
 
+/// v1 decision on the BEP44 deterministic-mailbox hint channel (#879 §6.1,
+/// Q3 — resolved by story C4 / #892).
+///
+/// Records whether the public-by-construction BEP44 mailbox (§6.1 option 2)
+/// ships for v1. This is a *decision marker*, not a runtime switch: it exists
+/// so the rationale is discoverable from the compiled artifact and reviewers
+/// can see which branch of R7 binds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailboxHintDecision {
+    /// Ship BEP5 `announce_peer` / `get_peers` only (§6.1 option 1, "chosen").
+    /// The deterministic mailbox is deferred. R7's add-only rule nonetheless
+    /// binds the moment any future channel feeds [`LookupHints`].
+    Bep5Only,
+
+    /// Deterministic mailbox shipped; its values flow through [`LookupHints`]
+    /// and are add-only by construction (R7).
+    Mailbox,
+}
+
+/// The v1 mailbox decision: **BEP5-only** (#879 §6.1 names option 1 "chosen").
+///
+/// See the module-level "Add-only hints" doc for the rationale and for why
+/// R7 binds regardless of this value.
+pub const V1_MAILBOX_HINT_CHANNEL: MailboxHintDecision = MailboxHintDecision::Bep5Only;
+
+/// Add-only accumulator of out-of-band lookup hints (review rule R7).
+///
+/// Hints supplement — never replace — the watermark-anchored BEP5 scan. This
+/// type is the structural home for the BEP44 deterministic-mailbox channel
+/// when it ships (see [`V1_MAILBOX_HINT_CHANNEL`]); today it is fed by any
+/// out-of-band source (PDS record, relay bridge, configuration).
+///
+/// **Provably add-only.** The API exposes [`LookupHints::add_rendezvous`] and
+/// [`LookupHints::add_peer`] and nothing that removes, replaces, or clears
+/// entries. [`MainlineLocator::providers_with_hints`] always performs the
+/// scan at the canonical rendezvous key and then unions these hints in — a
+/// hint can enlarge the candidate set, never prune it or skip the scan (A14).
+#[derive(Default, Clone, Debug)]
+pub struct LookupHints {
+    extra_rendezvous: Vec<RendezvousKey>,
+    extra_peers: Vec<PeerContact>,
+}
+
+impl LookupHints {
+    /// Empty hint set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add an additional rendezvous bucket to scan, beyond the canonical key.
+    /// Add-only (R7): there is no corresponding remove.
+    pub fn add_rendezvous(&mut self, key: RendezvousKey) {
+        self.extra_rendezvous.push(key);
+    }
+
+    /// Add a candidate peer discovered out-of-band (e.g. from a PDS record).
+    /// Add-only (R7): there is no corresponding remove.
+    pub fn add_peer(&mut self, peer: PeerContact) {
+        self.extra_peers.push(peer);
+    }
+
+    /// Additional rendezvous buckets to scan (in insertion order).
+    pub fn extra_rendezvous(&self) -> &[RendezvousKey] {
+        &self.extra_rendezvous
+    }
+
+    /// Additional candidate peers to union in (in insertion order).
+    pub fn extra_peers(&self) -> &[PeerContact] {
+        &self.extra_peers
+    }
+
+    /// Total number of hints accumulated.
+    pub fn len(&self) -> usize {
+        self.extra_rendezvous.len() + self.extra_peers.len()
+    }
+
+    /// Whether the set is empty.
+    pub fn is_empty(&self) -> bool {
+        self.extra_rendezvous.is_empty() && self.extra_peers.is_empty()
+    }
+}
+
 /// TRUNC20: derive the 20-byte BEP5 infohash for a derived rendezvous key.
 ///
 /// **This is the single truncation site in the codebase** (R2). The result
@@ -296,6 +416,34 @@ impl MainlineLocator {
             .into_iter()
             .map(PeerContact::untrusted)
             .collect())
+    }
+
+    /// Look up candidate providers, unioning in add-only [`LookupHints`] (R7).
+    ///
+    /// The watermark-anchored BEP5 scan at `key` is **always** performed; each
+    /// rendezvous bucket in `hints` is scanned as well, and the hint peers are
+    /// appended. `hints` may only enlarge the candidate set — there is no
+    /// parameter and no code path that prunes, replaces, or skips the scan
+    /// (A14). Results remain untrusted: deduplication against the full
+    /// [`Cid512`] is the caller's job via the GATE pipeline.
+    pub async fn providers_with_hints(
+        &self,
+        cid: &Cid512,
+        key: RendezvousKey,
+        hints: &LookupHints,
+    ) -> Result<Vec<PeerContact>> {
+        // The canonical scan is unconditional — a hint can never suppress it.
+        let mut found = self.providers_at(cid, key).await?;
+
+        // Additional rendezvous buckets from hints: scanned, not trusted.
+        for extra in hints.extra_rendezvous() {
+            found.extend(self.providers_at(cid, *extra).await?);
+        }
+
+        // Out-of-band peer contacts: unioned in verbatim, still untrusted.
+        found.extend(hints.extra_peers().iter().cloned());
+
+        Ok(found)
     }
 }
 
@@ -454,5 +602,194 @@ mod tests {
         assert!(Cid512::from_slice(&[0u8; 63]).is_err());
         assert!(Cid512::from_slice(&[0u8; 64]).is_ok());
         assert!(Cid512::from_slice(&[0u8; 65]).is_err());
+    }
+
+    // ----- R1 enforcement (story C4 / #892) --------------------------------
+
+    /// Regression guard for review rule R1: no public locator API may accept a
+    /// string *name* parameter. A name path inside the DHT client re-opens
+    /// threat A5 (the DHT becomes a trusted name authority). This scans the
+    /// module's production source and fails if any `pub fn` grows a
+    /// `&str`/`String` parameter or the CID type gains a string constructor.
+    #[test]
+    fn r1_no_name_path_compiles_in() {
+        // Scan only the production code — everything before the test module —
+        // so the assertion literals below don't match this test's own source.
+        let full = include_str!("locator.rs");
+        let src = full.split("#[cfg(test)]").next().unwrap();
+
+        // 1. No name→cid constructor / string conversion exists on the CID type.
+        assert!(
+            !src.contains("fn from_name"),
+            "R1: Cid512 must not gain a from_name constructor (re-opens A5)"
+        );
+        assert!(
+            !src.contains("impl FromStr for Cid512"),
+            "R1: Cid512 must not impl FromStr (a string would name-resolve; A5)"
+        );
+        assert!(
+            !src.contains("impl From<&str> for Cid512"),
+            "R1: Cid512 must not impl From<&str> (A5)"
+        );
+
+        // 2. No public function carries a string-typed parameter. Walk pub fn
+        //    signatures and reject any whose parameter list contains `&str` or
+        //    `String` (a name→cid path would have to enter the API here).
+        for line in src.lines() {
+            let trimmed = line.trim_start();
+            let is_pub_fn = trimmed.starts_with("pub fn ")
+                || trimmed.starts_with("pub async fn ")
+                || trimmed.starts_with("pub const fn ");
+            if !is_pub_fn {
+                continue;
+            }
+            assert!(
+                !(line.contains("&str") || line.contains(": String")),
+                "R1 violation: public locator fn has a string parameter (re-opens A5):\n  {line}"
+            );
+        }
+    }
+
+    /// R1 positive proof: the only query key the public API accepts is a full
+    /// [`Cid512`] — content-addressed, not name-addressed.
+    #[test]
+    fn r1_locator_queries_are_content_addressed_only() {
+        // Compile-time check that Cid512 is constructible only from bytes.
+        let _ = Cid512::from_bytes([0xAB; CID512_LEN]);
+        let _ = Cid512::from_slice(&[0xCD; CID512_LEN]).unwrap();
+        // `from_name` / `FromStr` / `From<&str>` simply do not exist:
+        // (these would fail to compile if added and used here — left as a
+        //  comment to document intent; the source-scan test above enforces it).
+    }
+
+    // ----- R7 add-only hints (story C4 / #892) -----------------------------
+
+    #[test]
+    fn v1_mailbox_decision_is_recorded_and_bep5_only() {
+        // Q3 decision: ship BEP5-only for v1; the mailbox is deferred.
+        assert_eq!(V1_MAILBOX_HINT_CHANNEL, MailboxHintDecision::Bep5Only);
+    }
+
+    #[test]
+    fn lookup_hints_starts_empty_and_grows_only() {
+        let mut hints = LookupHints::new();
+        assert!(hints.is_empty());
+        assert_eq!(hints.len(), 0);
+
+        hints.add_rendezvous(RendezvousKey::new(1, 0));
+        assert!(!hints.is_empty());
+        assert_eq!(hints.len(), 1);
+
+        hints.add_peer(PeerContact::untrusted(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            7000,
+        )));
+        assert_eq!(hints.len(), 2);
+
+        assert_eq!(hints.extra_rendezvous(), &[RendezvousKey::new(1, 0)]);
+        assert_eq!(
+            hints.extra_peers(),
+            &[PeerContact::untrusted(SocketAddrV4::new(
+                Ipv4Addr::LOCALHOST,
+                7000
+            ))]
+        );
+    }
+
+    /// R7 load-bearing proof: hints can only ADD candidates. The canonical
+    /// BEP5 scan is always performed and its results always survive — a hint
+    /// set, however large, can never prune them.
+    #[tokio::test]
+    async fn r7_hints_are_add_only_scan_results_survive() {
+        let mock = MockBep5::default();
+        let locator = MainlineLocator::with_client(Box::new(mock.clone()));
+        let id = cid(0x77);
+        let canonical = RendezvousKey::DEFAULT;
+        let extra = RendezvousKey::new(2, 0);
+
+        // Seed the canonical bucket with a real provider.
+        locator.announce_at(&id, canonical, Some(4242)).await.unwrap();
+        // Seed the extra hinted bucket with a different provider.
+        locator.announce_at(&id, extra, Some(5353)).await.unwrap();
+
+        let mut hints = LookupHints::new();
+        hints.add_rendezvous(extra);
+        hints.add_peer(PeerContact::untrusted(SocketAddrV4::new(
+            Ipv4Addr::new(192, 0, 2, 99),
+            9999,
+        )));
+
+        let found = locator.providers_with_hints(&id, canonical, &hints).await.unwrap();
+
+        // Canonical scan result survives (never pruned by hints):
+        let canonical_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4242);
+        assert!(
+            found.iter().any(|p| p.socket_addr() == canonical_addr),
+            "R7: canonical scan result must survive hints (no prune)"
+        );
+        // Hinted rendezvous bucket was scanned and unioned in:
+        assert!(
+            found
+                .iter()
+                .any(|p| p.socket_addr() == SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5353)),
+            "R7: hinted rendezvous bucket must be unioned in (add-only)"
+        );
+        // Out-of-band peer hint was unioned in:
+        assert!(
+            found
+                .iter()
+                .any(|p| p.socket_addr() == SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 99), 9999)),
+            "R7: hinted peer must be unioned in (add-only)"
+        );
+    }
+
+    /// R7 proof: with no hints, the hinted path is identical to the plain scan
+    /// — confirming hints are purely additive.
+    #[tokio::test]
+    async fn r7_empty_hints_equal_plain_scan() {
+        let mock = MockBep5::default();
+        let locator = MainlineLocator::with_client(Box::new(mock.clone()));
+        let id = cid(0x33);
+        locator.announce(&id, Some(8080)).await.unwrap();
+
+        let plain = locator.providers(&id).await.unwrap();
+        let with_hints = locator
+            .providers_with_hints(&id, RendezvousKey::DEFAULT, &LookupHints::new())
+            .await
+            .unwrap();
+
+        assert_eq!(plain, with_hints);
+    }
+
+    /// R7 proof: a hint set cannot suppress the scan even when the hint points
+    /// at a *different* rendezvous bucket that has no providers. The canonical
+    /// scan still returns its providers — the misleading hint prunes nothing.
+    #[tokio::test]
+    async fn r7_misleading_hint_cannot_prune_scan() {
+        let mock = MockBep5::default();
+        let locator = MainlineLocator::with_client(Box::new(mock.clone()));
+        let id = cid(0x44);
+        let canonical = RendezvousKey::DEFAULT;
+
+        // Real provider at the canonical bucket.
+        locator.announce_at(&id, canonical, Some(1234)).await.unwrap();
+
+        // Misleading hint directing attention elsewhere (empty bucket).
+        let mut hints = LookupHints::new();
+        hints.add_rendezvous(RendezvousKey::new(9, 9));
+
+        let found = locator
+            .providers_with_hints(&id, canonical, &hints)
+            .await
+            .unwrap();
+
+        // The real canonical provider is still returned despite the misleading
+        // hint — A14 is excluded: a hint cannot skip the watermark scan.
+        assert!(
+            found
+                .iter()
+                .any(|p| p.socket_addr() == SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234)),
+            "R7/A14: misleading hint must not prune the canonical scan"
+        );
     }
 }
