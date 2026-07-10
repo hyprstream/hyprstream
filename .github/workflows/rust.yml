@@ -120,9 +120,12 @@ jobs:
     needs: clippy  # Only build if clippy passes
     # Merge-gate backstop: fail before the merge queue's 120min timeout (ruleset
     # check_response_timeout_minutes) so a hang yields a definitive failure and the
-    # queue keeps moving instead of timing out and kicking every queued PR. Healthy
-    # build+test is ~90min (Build ~13m / Run tests ~76min), so 115 leaves margin.
-    timeout-minutes: 115
+    # queue keeps moving instead of timing out and kicking every queued PR. The
+    # nextest step uses the ci-test Cargo profile to avoid release ThinLTO on test
+    # binaries, so 90min should retain headroom while catching regressions.
+    timeout-minutes: 90
+    env:
+      SCCACHE_IDLE_TIMEOUT: 0
 
     steps:
     - uses: actions/checkout@v4
@@ -148,10 +151,10 @@ jobs:
     - name: Run tests (nextest, per-test timeout)
       # nextest enforces the per-TEST slow-timeout from .config/nextest.toml
       # ([profile.ci]): a single deadlocked test is SIGKILLed after ~3min and fails
-      # fast, instead of stalling the job until the 115min job / 120min queue
+      # fast, instead of stalling the job until the 90min job / 120min queue
       # timeout. The cap is per-test on purpose — the legit suite is long (~76min),
       # so a per-step timeout could not tell a hang from healthy runtime.
-      run: cargo nextest run --release --profile ci --features download-libtorch
+      run: cargo nextest run --cargo-profile ci-test --profile ci --features download-libtorch
 
     - name: Run doctests
       # nextest does not run doctests; keep them in the merge gate.
