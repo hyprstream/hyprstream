@@ -1,0 +1,19 @@
+# Smoke test for the self-hosted Graviton ephemeral runners (metal aws/ stack).
+# Proves the pipeline: workflow_job event -> GitHub App webhook -> API Gateway ->
+# scale-up Lambda -> Graviton spot EC2 boots + JIT-registers -> runs this job ->
+# scale-down terminates it. Trivial job (no build) — plumbing validation only.
+name: runner-smoke
+on:
+  workflow_dispatch:
+jobs:
+  smoke:
+    runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
+    timeout-minutes: 20
+    steps:
+      - name: Who am I
+        run: |
+          echo "arch: $(uname -m)"
+          echo "host: $(hostname)"
+          echo "os:   $(. /etc/os-release 2>/dev/null; echo "$PRETTY_NAME")"
+          echo "nproc: $(nproc)  mem: $(free -h 2>/dev/null | awk '/Mem:/{print $2}')"
+          echo "runner smoke OK"
