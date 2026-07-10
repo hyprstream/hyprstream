@@ -56,6 +56,9 @@
 
 pub mod audit;
 pub mod avc;
+// S4 (#570): the daemon-boot compile → sign → verify-load → install path that
+// finally populates `COMPILED_POLICY`. Dormant (no enforcement flip).
+pub mod bootload;
 pub mod compiled;
 pub mod compiler;
 // S6 (#572): runtime grant path — UCAN grant-request → access/refresh tokens.
@@ -107,6 +110,9 @@ pub use genesis::{
     floor_label, genesis_lattice, CompositeObjectLabelResolver, GenesisGate, ManifestLabelSource,
     NamespaceEnumerator, NoManifests, SitePolicy,
 };
+// S4 (#570): the boot path that installs the verified `CompiledPolicy` at daemon
+// startup (dormant — makes the PDP inputs real without enabling enforcement).
+pub use bootload::{compile_sign_load_install, install_baseline_boot_policy, BootPolicyError};
 
 /// Construct the [`UcanVerifier`] the HTTP grant path uses to validate a
 /// presented UCAN's signatures.

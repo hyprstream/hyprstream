@@ -2258,6 +2258,51 @@ fn main() -> Result<()> {
                                     let _ = shared_vks.write().map(|mut guard| *guard = vks);
                                     ctx.set_ml_dsa_verifying_keys(shared_vks);
                                     tracing::info!("PQ-hybrid: ML-DSA-65 verifying keys loaded for JWT verification");
+
+                                    // MAC S4 policy bootload (#570): compile → sign
+                                    // → verify-once-at-load → install the node's
+                                    // baseline CompiledPolicy so the MAC PDP inputs
+                                    // are real. This is the one missing boot step
+                                    // that populates `mac::COMPILED_POLICY`, flipping
+                                    // `exchange_enrollment_resolver` from the deny-all
+                                    // `DenyUnlabeledResolver` to the real (#698)
+                                    // `EnrollmentSubjectContextResolver`.
+                                    //
+                                    // DORMANT: installing a compiled policy does NOT
+                                    // enable enforcement — the per-op deciders stay
+                                    // AllowAll (no PEP consults this PDP yet). It only
+                                    // makes the PDP inputs real.
+                                    //
+                                    // Fail-closed: the baseline is hybrid-signed
+                                    // (EdDSA + ML-DSA-65) and verified with
+                                    // require_pq=true. With no active ML-DSA signing
+                                    // key (Classical mode) nothing is installed —
+                                    // never an Ed25519-only baseline (design §14) —
+                                    // and the resolver keeps denying.
+                                    let active_pq = tokio::task::block_in_place(|| {
+                                        let rt = tokio::runtime::Handle::current();
+                                        rt.block_on(ml_dsa_store.active_key())
+                                    });
+                                    match active_pq {
+                                        Some(pq_sk) => match hyprstream_core::mac::install_baseline_boot_policy(
+                                            &signing_key,
+                                            &pq_sk,
+                                        ) {
+                                            Ok(policy) => tracing::info!(
+                                                "MAC S4: baseline compiled policy installed \
+                                                 (generation {}, DORMANT — enforcement not enabled)",
+                                                policy.generation
+                                            ),
+                                            Err(e) => tracing::error!(
+                                                "MAC S4: baseline policy bootload failed \
+                                                 (grant-path resolver stays fail-closed): {e}"
+                                            ),
+                                        },
+                                        None => tracing::warn!(
+                                            "MAC S4: no active ML-DSA signing key; baseline policy \
+                                             NOT installed (fail-closed — grant-path resolver denies)"
+                                        ),
+                                    }
                                 }
 
                                 // M3 (#152): install the process-global envelope
