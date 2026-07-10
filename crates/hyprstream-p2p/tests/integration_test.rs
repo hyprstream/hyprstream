@@ -5,7 +5,7 @@
 
 #[cfg(test)]
 mod tests {
-    use gittorrent::{
+    use hyprstream_p2p::{
         types::GitTorrentUrl,
         git::objects::*,
     };

@@ -1,11 +1,11 @@
 [package]
-name = "gittorrent"
+name = "hyprstream-p2p"
 version = "0.2.0"
 edition = "2021"
 authors = ["Erica Windsich <erica@cyberdione.ai>"]
 description = "Decentralized git hosting over iroh-blobs + a mainline DHT locator"
 license = "MIT"
-repository = "https://github.com/hyprstream/hyprstream/tree/main/crates/gittorrent"
+repository = "https://github.com/hyprstream/hyprstream/tree/main/crates/hyprstream-p2p"
 keywords = ["git", "p2p", "iroh", "decentralized", "networking"]
 categories = ["network-programming", "development-tools"]
 

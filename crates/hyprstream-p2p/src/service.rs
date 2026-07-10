@@ -78,7 +78,7 @@ impl GitTorrentConfig {
     ///
     /// # Basic Usage
     /// ```ignore
-    /// use gittorrent::service::GitTorrentConfig;
+    /// use hyprstream_p2p::service::GitTorrentConfig;
     ///
     /// // Simple case - use defaults
     /// let config: GitTorrentConfig = GitTorrentConfig::builder()?
@@ -88,7 +88,7 @@ impl GitTorrentConfig {
     ///
     /// # Extended Usage - Add Custom Sources
     /// ```ignore
-    /// use gittorrent::service::GitTorrentConfig;
+    /// use hyprstream_p2p::service::GitTorrentConfig;
     /// use config::File;
     ///
     /// // Add custom config source with highest priority
@@ -100,7 +100,7 @@ impl GitTorrentConfig {
     ///
     /// # Programmatic Overrides
     /// ```ignore
-    /// use gittorrent::service::GitTorrentConfig;
+    /// use hyprstream_p2p::service::GitTorrentConfig;
     ///
     /// // Override specific values programmatically
     /// let config: GitTorrentConfig = GitTorrentConfig::builder()?
@@ -139,7 +139,7 @@ impl GitTorrentConfig {
     ///
     /// # Basic Usage
     /// ```ignore
-    /// use gittorrent::service::GitTorrentConfig;
+    /// use hyprstream_p2p::service::GitTorrentConfig;
     ///
     /// let config = GitTorrentConfig::load()?;
     /// ```

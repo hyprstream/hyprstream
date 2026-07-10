@@ -65,7 +65,7 @@ hyprstream-9p = { path = "../hyprstream-9p" }  # 9P codec + Kata translator (Bac
 hyprstream-workers-tcl = { path = "../hyprstream-workers-tcl" }  # Tcl shell (TclMount, TclCommand)
 hyprstream-workers-python = { path = "../hyprstream-workers-python" }  # Python shell (PythonMount, PyCommand)
 inventory.workspace = true  # Service factory registration
-gittorrent = { workspace = true, optional = true }  # P2P transport
+hyprstream-p2p = { workspace = true, optional = true }  # P2P transport (formerly gittorrent)
 clap.workspace = true
 inquire = "0.7"
 tracing.workspace = true
@@ -202,7 +202,7 @@ valkey = ["dep:fred"]  # Enable Valkey/Redis-backed user and token stores
 bnb = ["dep:bitsandbytes-sys"]  # Enable bitsandbytes KV cache quantization (requires compatible ROCm/CUDA)
 xet = ["git2db/xet-storage"]  # Enable XET large file storage
 otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:opentelemetry-semantic-conventions", "dep:opentelemetry-stdout"]
-gittorrent = ["dep:gittorrent", "git2db/gittorrent-transport"]  # Enable P2P model sharing via gittorrent transport
+gittorrent = ["dep:hyprstream-p2p", "git2db/gittorrent-transport"]  # Enable P2P model sharing via hyprstream-p2p transport (feature name kept for compat)
 download-libtorch = ["tch/download-libtorch"]
 overlayfs = ["git2db/overlayfs"]  # Enable overlayfs-backed worktrees (delegated to git2db)
 systemd = ["hyprstream-rpc/systemd", "hyprstream-service/systemd", "hyprstream-workers/systemd", "dep:listenfd"]  # Systemd integration (socket activation, service units)

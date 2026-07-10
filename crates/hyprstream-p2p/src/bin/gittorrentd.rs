@@ -1,7 +1,7 @@
 //! GitTorrent daemon binary
 
 use clap::Parser;
-use gittorrent::{daemon::{run_daemon, DaemonConfig}, init_tracing};
+use hyprstream_p2p::{daemon::{run_daemon, DaemonConfig}, init_tracing};
 use std::path::PathBuf;
 use tracing::info;
 
@@ -47,13 +47,13 @@ struct Cli {
 }
 
 #[tokio::main]
-async fn main() -> gittorrent::Result<()> {
+async fn main() -> hyprstream_p2p::Result<()> {
     let cli = Cli::parse();
 
     // Initialize tracing
     init_tracing()?;
 
-    info!("Starting GitTorrent daemon v{}", gittorrent::VERSION);
+    info!("Starting GitTorrent daemon v{}", hyprstream_p2p::VERSION);
 
     // Create daemon configuration
     let mut config = DaemonConfig::default();

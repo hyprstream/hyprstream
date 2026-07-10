@@ -15,7 +15,7 @@ use crate::error::{Result, XetError, XetErrorKind};
 /// Attempts to fetch objects from DHT peers first, falling back to an optional
 /// HTTPS origin (typically XetStorage).
 pub struct GittorrentStorage {
-    service: Arc<gittorrent::service::GitTorrentService>,
+    service: Arc<hyprstream_p2p::service::GitTorrentService>,
     fallback: Option<Box<dyn super::storage::StorageBackend>>,
 }
 
@@ -26,7 +26,7 @@ impl GittorrentStorage {
     /// * `service` - The gittorrent service instance (DHT + object cache)
     /// * `fallback` - Optional fallback storage (e.g., XetStorage for HTTPS origin)
     pub fn new(
-        service: Arc<gittorrent::service::GitTorrentService>,
+        service: Arc<hyprstream_p2p::service::GitTorrentService>,
         fallback: Option<Box<dyn super::storage::StorageBackend>>,
     ) -> Self {
         Self { service, fallback }
@@ -85,8 +85,8 @@ impl super::storage::StorageBackend for GittorrentStorage {
     }
 
     async fn smudge_from_hash(&self, hash: &merklehash::MerkleHash) -> Result<Vec<u8>> {
-        // MerkleHash is 32-byte SHA256, same as gittorrent::Sha256Hash
-        let gt_hash = gittorrent::Sha256Hash::from_bytes(hash.as_bytes()).map_err(|e| {
+        // MerkleHash is 32-byte SHA256, same as hyprstream_p2p::Sha256Hash
+        let gt_hash = hyprstream_p2p::Sha256Hash::from_bytes(hash.as_bytes()).map_err(|e| {
             XetError::new(XetErrorKind::DownloadFailed, format!("Hash conversion: {e}"))
         })?;
 

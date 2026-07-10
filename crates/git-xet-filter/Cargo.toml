@@ -47,8 +47,8 @@ cas-serve = { path = "../cas-serve", optional = true }
 base64 = { version = "0.22", optional = true }
 dirs = { version = "5.0", optional = true }
 
-# Gittorrent P2P transport (optional)
-gittorrent = { path = "../gittorrent", optional = true }
+# hyprstream-p2p (formerly gittorrent) P2P transport (optional)
+hyprstream-p2p = { path = "../hyprstream-p2p", optional = true }
 
 [dev-dependencies]
 tokio-test.workspace = true
@@ -67,7 +67,7 @@ xet-storage = ["data", "cas_client", "cas_object", "merklehash", "async-trait"]
 # pending a repoint at the new dual-stack XET service (epic #654, task #5).
 ssh-transport = ["xet-storage", "russh", "russh-keys", "cas-serve", "base64", "dirs"]
 # Enable gittorrent P2P transport
-gittorrent-transport = ["xet-storage", "gittorrent"]
+gittorrent-transport = ["xet-storage", "hyprstream-p2p"]
 
 [lints]
 workspace = true
