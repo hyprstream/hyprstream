@@ -35,6 +35,17 @@
 //! handler MUST drop the connection. When no hook is installed the path is
 //! open (pre-#282 behaviour) so existing single-tenant / loopback deployments
 //! keep working until an operator opts into federation gating.
+//!
+//! # D3 — admission never consults pkarr (#895)
+//!
+//! This gate's only identity input is `Connection::remote_id()` — the
+//! channel-bound Ed25519 pubkey iroh's QUIC TLS already verified — plus, for a
+//! `did:at9p` peer, the GATE-verified capsule keys (D2 / #894). It **never**
+//! reads a pkarr record: pkarr is a liveness/reach hint on the mainline DHT
+//! and derives zero authority (see [`crate::transport::iroh_substrate`]'s "D3"
+//! note). The reach a pkarr record advertises may be what lets us *dial* a
+//! peer, but it plays no part in the *admit/deny* decision — that is the
+//! liveness-only invariant D3 pins.
 
 use std::sync::Arc;
 

@@ -129,7 +129,9 @@ pub async fn resolve_pkarr_relay_url_js(node_id: &[u8]) -> Result<JsValue, JsErr
         .map_err(|_| JsError::new("node_id must be exactly 32 bytes"))?;
 
     match resolve_pkarr_relay_url(&bytes).await {
-        Ok(Some(url)) => Ok(JsValue::from_str(&url)),
+        // Unwrap the unverified reach hint (D3: pkarr derives zero authority)
+        // to the bare URL string the JS dial path consumes as a relay address.
+        Ok(Some(hint)) => Ok(JsValue::from_str(hint.url())),
         Ok(None) => Ok(JsValue::NULL),
         Err(e) => Err(JsError::new(&e.to_string())),
     }
