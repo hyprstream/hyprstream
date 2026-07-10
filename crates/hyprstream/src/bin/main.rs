@@ -247,6 +247,16 @@ fn build_cli() -> ClapCommand {
             ),
     );
 
+    // Native MAC status/inspection (epic #547).
+    app = app.subcommand(
+        ClapCommand::new("mac")
+            .about("Native MAC (mandatory access control) status and inspection")
+            .subcommand(
+                ClapCommand::new("genesis")
+                    .about("Show the MAC genesis coverage report (activation coverage-gate evidence)"),
+            ),
+    );
+
     app
 }
 
@@ -2558,6 +2568,19 @@ fn main() -> Result<()> {
                 },
             )?;
         }
+
+        // ── Native MAC status/inspection ────────────────────────────────
+        Some(("mac", sub_m)) => match sub_m.subcommand() {
+            Some(("genesis", _)) => {
+                // Build the boot-time gate and print the coverage report. This is
+                // read-only inspection — it changes no enforcement state.
+                let gate = hyprstream_core::mac::GenesisGate::production();
+                print!("{}", gate.render_report());
+            }
+            _ => {
+                eprintln!("usage: hyprstream mac genesis");
+            }
+        },
 
         // ── No subcommand → wizard (first run) or ShellClient ──────────
         _ => {
