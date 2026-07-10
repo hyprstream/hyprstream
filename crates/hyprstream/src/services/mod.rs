@@ -92,6 +92,12 @@ pub mod rpc_types;
 pub mod typed;
 pub mod worker;
 
+/// Phase-1 cellular-ledger local-enforcer (epic #922, #925). Gated behind the
+/// `ledger` cargo feature, default off — the scheduler quota path is unchanged
+/// until an operator opts in.
+#[cfg(feature = "ledger")]
+pub mod ledger;
+
 pub use core::{
     Continuation, EnvelopeContext, RequestService,
 };

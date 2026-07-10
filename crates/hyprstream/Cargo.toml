@@ -55,6 +55,8 @@ ml-dsa = { workspace = true }  # ML-DSA-65 — always compiled (runtime CryptoPo
 hyprstream-rpc-std = { path = "../hyprstream-rpc-std" }  # Standard service schemas + clients
 hyprstream-discovery = { path = "../hyprstream-discovery" }  # Service discovery
 hyprstream-pds = { path = "../hyprstream-pds" }  # atproto PDS record store: DAG-CBOR + MST + signed commit + CAR proof (#392/#431)
+hyprstream-ledger = { path = "../hyprstream-ledger", optional = true }  # Cellular credit ledger accounting plane (#923); the Phase-1 local-enforcer service (#925) lands behind the `ledger` feature, default off
+hyprstream-crypto = { path = "../hyprstream-crypto" }  # COSE composite (EdDSA + ML-DSA-65) sign/verify — used by the ledger checkpoint signer (#925)
 hyprstream-service = { path = "../hyprstream-service" }  # Service orchestration
 hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }  # RPC code generation proc macros
 hyprstream-flight = { path = "../hyprstream-flight" }  # Flight SQL server and client
@@ -211,6 +213,12 @@ oci-image = ["hyprstream-workers/oci-image"]  # Universal mountable OCI/RAFS ima
 kata-vm = ["hyprstream-workers/kata-vm", "oci-image"]  # Kata/Cloud-Hypervisor VM worker backend; implies oci-image (kata serves it via virtio-fs). In default; drop for an nspawn-only build
 experimental = ["hyprstream-compositor/experimental"]  # EXPERIMENTAL: Enable service/worker panels, git write operations
 pq-hybrid = []  # NO-OP alias: PQ primitives always compiled; Classical/Hybrid selected at runtime. See M3 #152.
+# Phase-1 cellular-ledger local-enforcer (epic #922, #925): the `ledger` service
+# (actor + CreditGate + LocalEnforcer + receipt emitter + ReceiptDebt breaker).
+# Default OFF — the scheduler quota path is unchanged until this is opted into
+# and the 1.9 suites pass. MemLedger is the Phase-1 backend; RocksLedger (item
+# 1.2) lands separately.
+ledger = ["dep:hyprstream-ledger"]
 
 [build-dependencies]
 capnpc.workspace = true  # Cap'n Proto schema compiler

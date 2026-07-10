@@ -160,6 +160,15 @@ pub struct HyprConfig {
     /// systemd credentials directory).
     #[serde(default)]
     pub secrets: SecretsConfig,
+
+    /// Phase-1 cellular-ledger local-enforcer configuration (epic #922, #925).
+    ///
+    /// Only present when the `ledger` cargo feature is enabled; `enabled`
+    /// defaults to `false` so the scheduler quota path is unchanged until an
+    /// operator opts in. The whole subsystem fails closed when disabled.
+    #[cfg(feature = "ledger")]
+    #[serde(default)]
+    pub ledger: crate::services::ledger::LedgerConfig,
 }
 
 /// Persistent secrets storage configuration.
@@ -2107,6 +2116,8 @@ impl HyprConfigBuilder {
             metrics: self.metrics,
             signing_key: None,
             secrets: Default::default(),
+            #[cfg(feature = "ledger")]
+            ledger: Default::default(),
         }
     }
 
