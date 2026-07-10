@@ -33,23 +33,24 @@
 //! answers "where might bytes for *this* cid live", never "which cid does
 //! *this* name mean".
 //!
-//! This is enforced **structurally**, not by a grep:
+//! This is enforced **structurally** as a closed-world allowlist, not by
+//! enumerating forbidden string forms:
 //! - [`Cid512`] is a `[u8; 64]` newtype with no `FromStr`, `From<&str>`,
 //!   `AsRef<str>`, or `Deref<Target = str>` — the only way in is the full
 //!   64-byte digest.
-//! - `tests/locator_r1_invariants.rs` parses this module with `syn` and walks
-//!   the AST of every item. It fails if any public signature takes a
-//!   string-like **parameter** (`&str`, `String`, `&String`, `Cow<_, str>`,
-//!   `Box<str>`, `Vec<String>`, `impl AsRef<str>`, …) — including the
-//!   `<S: AsRef<str>>` / `where S: AsRef<str>` generic-bound desugarings of
-//!   `impl Trait`, which a concrete-param check alone misses; if any **type
-//!   alias** resolves to a string (`type X = String`); if any **macro** or
-//!   `pub use` item appears (forbidden outright, since they could inject or
-//!   surface an un-walked name-taking `pub fn`); or if [`Cid512`] gains a
-//!   string-conversion trait impl. A grep over single-line signatures is
-//!   bypassable; an AST walk that reads generics, where-clauses, aliases, and
-//!   item kinds is not. See the test's module doc for the honest coverage
-//!   matrix and known limitations.
+//! - `tests/locator_r1_invariants.rs` parses this module with `syn` and fails
+//!   unless **every** public function/method parameter, public struct/enum
+//!   field, and type-alias RHS is one of the vetted types — `Cid512`,
+//!   `RendezvousKey`, `PeerContact`, `LookupHints`, `SocketAddrV4`, primitives,
+//!   and byte views (recursing through `&`/`Option`/`Vec`/`Box`/slices). Any
+//!   other type — a `String`, a struct-wrapped name (`NameQuery`), a generic
+//!   (`<S: ToString>`, `impl Display`), an externally-aliased name — is
+//!   rejected *because it is not vetted*, so a name path cannot enter in any
+//!   new form; adding a public parameter type is a deliberate allowlist edit.
+//!   Macros and `pub use` are forbidden outright in this module. `Cid512` may
+//!   not gain a string-conversion trait impl. See the test's module doc for the
+//!   coverage matrix, the known limitation (test-time vs compile-time), and the
+//!   follow-up tracking a hard `compile_error!` enforcement.
 //!
 //! # Add-only hints — review rule R7 (story C4 = #892)
 //!
