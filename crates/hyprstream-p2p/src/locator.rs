@@ -38,12 +38,18 @@
 //!   `AsRef<str>`, or `Deref<Target = str>` — the only way in is the full
 //!   64-byte digest.
 //! - `tests/locator_r1_invariants.rs` parses this module with `syn` and walks
-//!   **every** public item signature (functions, inherent/trait methods,
-//!   multi-line and generic forms), failing if any public parameter is
-//!   string-like (`&str`, `String`, `&String`, `Cow<_, str>`, `Box<str>`,
-//!   `Vec<String>`, `impl AsRef<str>`, …) or if [`Cid512`] gains a
+//!   the AST of every item. It fails if any public signature takes a
+//!   string-like **parameter** (`&str`, `String`, `&String`, `Cow<_, str>`,
+//!   `Box<str>`, `Vec<String>`, `impl AsRef<str>`, …) — including the
+//!   `<S: AsRef<str>>` / `where S: AsRef<str>` generic-bound desugarings of
+//!   `impl Trait`, which a concrete-param check alone misses; if any **type
+//!   alias** resolves to a string (`type X = String`); if any **macro** or
+//!   `pub use` item appears (forbidden outright, since they could inject or
+//!   surface an un-walked name-taking `pub fn`); or if [`Cid512`] gains a
 //!   string-conversion trait impl. A grep over single-line signatures is
-//!   bypassable; a parser walk of the AST is not.
+//!   bypassable; an AST walk that reads generics, where-clauses, aliases, and
+//!   item kinds is not. See the test's module doc for the honest coverage
+//!   matrix and known limitations.
 //!
 //! # Add-only hints — review rule R7 (story C4 = #892)
 //!
@@ -637,16 +643,20 @@ mod tests {
                 .len(),
             1
         );
-        assert!(locator
-            .providers_at(&id, RendezvousKey::new(1, 7))
-            .await
-            .unwrap()
-            .is_empty());
-        assert!(locator
-            .providers_at(&id, RendezvousKey::new(0, 8))
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            locator
+                .providers_at(&id, RendezvousKey::new(1, 7))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            locator
+                .providers_at(&id, RendezvousKey::new(0, 8))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -728,7 +738,10 @@ mod tests {
         let extra = RendezvousKey::new(2, 0);
 
         // Seed the canonical bucket with a real provider.
-        locator.announce_at(&id, canonical, Some(4242)).await.unwrap();
+        locator
+            .announce_at(&id, canonical, Some(4242))
+            .await
+            .unwrap();
         // Seed the extra hinted bucket with a different provider.
         locator.announce_at(&id, extra, Some(5353)).await.unwrap();
 
@@ -739,7 +752,10 @@ mod tests {
             9999,
         )));
 
-        let found = locator.providers_with_hints(&id, canonical, &hints).await.unwrap();
+        let found = locator
+            .providers_with_hints(&id, canonical, &hints)
+            .await
+            .unwrap();
 
         // Canonical scan result survives (never pruned by hints):
         let canonical_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4242);
@@ -792,7 +808,10 @@ mod tests {
         let canonical = RendezvousKey::DEFAULT;
 
         // Real provider at the canonical bucket.
-        locator.announce_at(&id, canonical, Some(1234)).await.unwrap();
+        locator
+            .announce_at(&id, canonical, Some(1234))
+            .await
+            .unwrap();
 
         // Misleading hint directing attention elsewhere (empty bucket).
         let mut hints = LookupHints::new();
@@ -867,7 +886,10 @@ mod tests {
         let canonical = RendezvousKey::DEFAULT;
 
         // Canonical bucket returns one real provider.
-        locator.announce_at(&id, canonical, Some(4242)).await.unwrap();
+        locator
+            .announce_at(&id, canonical, Some(4242))
+            .await
+            .unwrap();
 
         // Hint the SAME peer the scan already returns: result must be deduped.
         let mut hints = LookupHints::new();
@@ -881,7 +903,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            found.iter().filter(|p| p.socket_addr().port() == 4242).count(),
+            found
+                .iter()
+                .filter(|p| p.socket_addr().port() == 4242)
+                .count(),
             1,
             "duplicate candidate must be deduped"
         );
@@ -905,8 +930,10 @@ mod tests {
             found.len()
         );
         // Canonical provider still present — add-only holds through bounding.
-        assert!(found
-            .iter()
-            .any(|p| p.socket_addr() == SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4242)));
+        assert!(
+            found
+                .iter()
+                .any(|p| p.socket_addr() == SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4242))
+        );
     }
 }

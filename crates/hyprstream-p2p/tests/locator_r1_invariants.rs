@@ -4,14 +4,35 @@
 //! client re-opens threat A5 (the DHT becomes a trusted name authority).
 //!
 //! Why parse the AST instead of grepping or using `trybuild`:
-//! - A line-by-line grep (the original #1000 guard) is bypassable with a
-//!   multi-line signature, `impl AsRef<str>`, `Cow<'_, str>`, `&String`,
-//!   `Box<str>`, `Vec<String>`, a type alias, or a trait method.
+//! - A line-by-line grep is bypassable with a multi-line signature,
+//!   `impl AsRef<str>`, `Cow<'_, str>`, `&String`, `Box<str>`, `Vec<String>`,
+//!   a generic bound (`<S: AsRef<str>>` / `where S: AsRef<str>`), a type alias,
+//!   a macro-generated `pub fn`, a re-export, or a trait method.
 //! - `trybuild` compile-fail tests can only pin *specific* forbidden call
 //!   sites; they cannot prove that *no* public method, present or future, takes
-//!   a string. This walk enumerates every public signature, so a string-name
-//!   parameter cannot be introduced anywhere in the module without failing
-//!   here — multi-line or otherwise.
+//!   a string.
+//!
+//! What this walk actually covers (kept honest against the #1000 re-review):
+//! - concrete parameter types — recurses through `&`/`Box`/`Cow`/slices/tuples/
+//!   generics/`impl Trait`/`dyn Trait` so every `&str`/`String`/`Box<str>`/
+//!   `Vec<String>`/`impl AsRef<str>` form is flagged;
+//! - **generic params and where-clauses** — `<S: AsRef<str>>`, `<T: Into<String>>`,
+//!   `<S: FromStr>`, and `where T: AsRef<str>` are flagged via the same bound
+//!   predicate, so the `<T: Trait>` desugaring of `impl Trait` cannot smuggle a
+//!   name type in;
+//! - **type aliases** — `pub type X = String;` (any visibility) is denied, since
+//!   a `String` alias used as a `pub fn` param type would not otherwise look
+//!   string-like;
+//! - **macros and `pub use`** — these are *forbidden outright* in this module
+//!   (not expanded/resolved), because a macro could generate, or a re-export
+//!   surface, a name-taking `pub fn` the AST walk would never see. Any such item
+//!   fails the test by name so a human must approve it explicitly;
+//! - forbidden string-conversion trait impls on `Cid512` et al.
+//!
+//! Known limitation: a type alias defined *outside* this module (`use`d in)
+//! whose target is a string is not resolved here — but `pub use` of the alias
+//! is forbidden (above), and the only admissible name source is an out-of-band
+//! trusted authority, never this locator.
 //!
 //! The source under test is `src/locator.rs` parsed with `syn`; the inline
 //! `#[cfg(test)] mod tests` is excluded.
@@ -25,7 +46,10 @@
 use std::collections::HashSet;
 
 use quote::ToTokens;
-use syn::{FnArg, GenericArgument, ImplItem, Item, Path, PathArguments, Type, TypeParamBound};
+use syn::{
+    FnArg, GenericArgument, GenericParam, ImplItem, Item, Path, PathArguments, Type,
+    TypeParamBound, WherePredicate,
+};
 
 /// Public types exported by `locator.rs` whose trait impls are gated by this
 /// test (a string-conversion impl on any of them re-opens A5).
@@ -74,8 +98,8 @@ impl Violations {
 
 #[test]
 fn r1_no_string_name_path_in_public_api() {
-    let file =
-        syn::parse_file(LOCATOR_SRC).expect("src/locator.rs must parse as valid Rust for the R1 invariant test");
+    let file = syn::parse_file(LOCATOR_SRC)
+        .expect("src/locator.rs must parse as valid Rust for the R1 invariant test");
 
     let mut v = Violations::default();
     walk_items(&file.items, &mut v);
@@ -118,6 +142,36 @@ fn walk_items(items: &[Item], v: &mut Violations) {
                     walk_items(nested_items, v);
                 }
             }
+            // `type X = String;` — a string alias used as a pub fn param type
+            // would not otherwise look string-like. Deny it at any visibility.
+            Item::Type(t) => {
+                if type_is_stringish(&t.ty) {
+                    v.string_param.push(format!(
+                        "  type alias `{}` = {} (string alias smuggles a name path; re-opens A5)",
+                        t.ident,
+                        t.ty.to_token_stream()
+                    ));
+                }
+            }
+            // Macros and `pub use` are forbidden outright: a macro could
+            // generate, or a re-export surface, a name-taking `pub fn` this AST
+            // walk would never see. Fail by name so a human must approve.
+            Item::Macro(m) => {
+                let label = m
+                    .ident
+                    .as_ref()
+                    .map(std::string::ToString::to_string)
+                    .unwrap_or_else(|| m.mac.path.to_token_stream().to_string());
+                v.string_param.push(format!(
+                    "  macro `{label}` — macros are forbidden in this module; they could generate an un-walked name-taking pub fn"
+                ));
+            }
+            Item::Use(u) if is_pub(&u.vis) => {
+                v.string_param.push(format!(
+                    "  {} — `pub use` is forbidden in this module; a re-export could surface a name-taking fn the AST walk cannot see",
+                    u.to_token_stream()
+                ));
+            }
             _ => {}
         }
     }
@@ -129,8 +183,10 @@ fn check_impl(imp: &syn::ItemImpl, v: &mut Violations) {
         if let Some(self_name) = type_name(&imp.self_ty) {
             if GATED_SELF_TYPES.contains(&self_name.as_str()) {
                 if let Some(reason) = forbidden_string_trait(trait_path) {
-                    v.string_trait_impl
-                        .push(format!("  impl {} for {self_name}: {reason}", trait_path.to_token_stream()));
+                    v.string_trait_impl.push(format!(
+                        "  impl {} for {self_name}: {reason}",
+                        trait_path.to_token_stream()
+                    ));
                 }
             }
         }
@@ -150,6 +206,7 @@ fn check_impl(imp: &syn::ItemImpl, v: &mut Violations) {
 }
 
 fn check_sig(sig: &syn::Signature, kind: &str, name: &syn::Ident, v: &mut Violations) {
+    // Concrete parameter types.
     for arg in &sig.inputs {
         if let FnArg::Typed(pat_type) = arg {
             if type_is_stringish(&pat_type.ty) {
@@ -161,6 +218,44 @@ fn check_sig(sig: &syn::Signature, kind: &str, name: &syn::Ident, v: &mut Violat
             }
         }
     }
+
+    // Generic params + where-clause. `<S: AsRef<str>>(name: S)` and
+    // `(s: S) where S: AsRef<str>` are the desugaring of `impl AsRef<str>` and
+    // would otherwise pass because the concrete param type `S` is a plain
+    // ident. Walk every generic bound and where-predicate with the same
+    // stringish predicate used for `impl Trait`.
+    if generics_admit_stringish(&sig.generics) {
+        v.string_param.push(format!(
+            "  {kind} `{name}` generic/where bound admits a string-like type (re-opens A5): {}",
+            sig.generics.to_token_stream()
+        ));
+    }
+}
+
+/// Does a generics list admit a string-like type via a bound?
+///
+/// Catches both `<S: AsRef<str>>` (bounds on type params) and
+/// `where S: AsRef<str>` (where-clause predicates), reusing the same
+/// [`bound_trait_is_stringish`] predicate as `impl Trait` so neither desugaring
+/// can smuggle a name type past the concrete-param check.
+fn generics_admit_stringish(generics: &syn::Generics) -> bool {
+    let param_bound = generics.params.iter().any(|p| match p {
+        GenericParam::Type(tp) => bounds_stringish(&tp.bounds),
+        // Lifetime/const params carry no stringish trait bound.
+        _ => false,
+    });
+    if param_bound {
+        return true;
+    }
+    generics
+        .where_clause
+        .iter()
+        .flat_map(|wc| &wc.predicates)
+        .any(|pred| match pred {
+            WherePredicate::Type(pt) => bounds_stringish(&pt.bounds),
+            // Lifetime/`Eq` predicates: no stringish trait bound.
+            _ => false,
+        })
 }
 
 fn is_pub(vis: &syn::Visibility) -> bool {
@@ -177,11 +272,7 @@ fn is_test_module(m: &syn::ItemMod) -> bool {
 /// Last path segment ident of a (possibly reference) type, if it is a simple path.
 fn type_name(ty: &Type) -> Option<String> {
     match ty {
-        Type::Path(tp) => tp
-            .path
-            .segments
-            .last()
-            .map(|s| s.ident.to_string()),
+        Type::Path(tp) => tp.path.segments.last().map(|s| s.ident.to_string()),
         Type::Reference(r) => type_name(&r.elem),
         Type::Paren(p) => type_name(&p.elem),
         _ => None,
@@ -208,7 +299,9 @@ fn type_is_stringish(ty: &Type) -> bool {
     }
 }
 
-fn bounds_stringish(bounds: &syn::punctuated::Punctuated<TypeParamBound, syn::token::Plus>) -> bool {
+fn bounds_stringish(
+    bounds: &syn::punctuated::Punctuated<TypeParamBound, syn::token::Plus>,
+) -> bool {
     bounds
         .iter()
         .any(|b| matches!(b, TypeParamBound::Trait(tb) if bound_trait_is_stringish(&tb.path)))
@@ -219,12 +312,8 @@ fn path_is_stringish(p: &Path) -> bool {
         let id = seg.ident.to_string();
         STRINGISH_IDENTS.contains(&id.as_str())
             || match &seg.arguments {
-                PathArguments::AngleBracketed(ab) => {
-                    ab.args.iter().any(generic_is_stringish)
-                }
-                PathArguments::Parenthesized(pa) => {
-                    pa.inputs.iter().any(type_is_stringish)
-                }
+                PathArguments::AngleBracketed(ab) => ab.args.iter().any(generic_is_stringish),
+                PathArguments::Parenthesized(pa) => pa.inputs.iter().any(type_is_stringish),
                 PathArguments::None => false,
             }
     })
@@ -238,21 +327,27 @@ fn generic_is_stringish(arg: &GenericArgument) -> bool {
     }
 }
 
-/// `AsRef<str>`, `Into<String>`, `Borrow<str>` — stringish only if the generic
-/// argument is itself stringish. (Plain `AsRef<[u8]>` is fine.)
+/// Is a trait *bound* stringish? Used for `impl Trait` params, `dyn Trait`
+/// trait objects, generic-param bounds (`<S: Trait>`), and where-clauses.
+///
+/// - `FromStr` names string construction with no generic argument.
+/// - Converter traits (`AsRef<..>`, `Into<..>`, `TryInto<..>`, `Borrow<..>`)
+///   are stringish only when their generic argument is itself stringish, so
+///   `AsRef<str>`/`Into<String>`/`Borrow<str>` flag but `AsRef<[u8]>` /
+///   `Borrow<[u8]>` (byte views) do not.
 fn bound_trait_is_stringish(p: &Path) -> bool {
-    let last = p.segments.last().map(|s| s.ident.to_string());
-    let is_converter = last
-        .as_deref()
-        .map(|l| ["AsRef", "Into", "TryInto", "Borrow"].contains(&l))
-        .unwrap_or(false);
-    if !is_converter {
+    let Some(last) = p.segments.last() else {
         return false;
+    };
+    let name = last.ident.to_string();
+    if name == "FromStr" {
+        return true;
     }
-    p.segments.iter().any(|seg| match &seg.arguments {
-        PathArguments::AngleBracketed(ab) => ab.args.iter().any(generic_is_stringish),
-        _ => false,
-    })
+    ["AsRef", "Into", "TryInto", "Borrow"].contains(&name.as_str())
+        && p.segments.iter().any(|seg| match &seg.arguments {
+            PathArguments::AngleBracketed(ab) => ab.args.iter().any(generic_is_stringish),
+            _ => false,
+        })
 }
 
 /// If `trait_path` is a forbidden string-conversion trait on a gated type,
@@ -321,11 +416,93 @@ fn detector_recognises_all_stringish_forms() {
         assert!(type_is_stringish(&parse_type(s)), "should flag: {s}");
     }
 
-    let not_stringish: HashSet<&str> =
-        ["&[u8]", "[u8; 64]", "Vec<u8>", "AsRef<[u8]>", "Cid512", "RendezvousKey"]
-            .into_iter()
-            .collect();
+    let not_stringish: HashSet<&str> = [
+        "&[u8]",
+        "[u8; 64]",
+        "Vec<u8>",
+        "AsRef<[u8]>",
+        "Borrow<[u8]>",
+        "Cid512",
+        "RendezvousKey",
+    ]
+    .into_iter()
+    .collect();
     for s in not_stringish {
         assert!(!type_is_stringish(&parse_type(s)), "should NOT flag: {s}");
     }
+}
+
+// Drive `check_sig` directly against signatures whose stringish-ness lives in
+// `generics` / the where-clause, not in a concrete param type. This path was
+// previously UNwalked (the original detector only read `sig.inputs`), so this
+// is the load-bearing regression guard for the #1000 re-review's primary hole.
+#[test]
+fn check_sig_flags_generic_and_where_clause_string_bounds() {
+    fn parse_sig(src: &str) -> syn::Signature {
+        syn::parse_str::<syn::ItemFn>(src).expect("valid fn").sig
+    }
+
+    fn flagged(src: &str) -> bool {
+        let sig = parse_sig(src);
+        let mut v = Violations::default();
+        check_sig(&sig, "fn", &sig.ident, &mut v);
+        !v.is_empty()
+    }
+
+    // The exact desugarings from the re-review — must all be caught.
+    let should_flag = [
+        "fn f<S: AsRef<str>>(s: S) {}",
+        "fn resolve<S: AsRef<str>>(name: S) -> () {}",
+        "fn f<T>(s: T) where T: AsRef<str> {}",
+        "fn f<T: Into<String>>(s: T) {}",
+        "fn f<T>(s: T) where T: Borrow<str> {}",
+        "fn f<S: FromStr>(s: S) {}",
+        // Multi-line generic bound — the original grep could not see this either.
+        "fn f<S>(\n    s: S,\n) where\n    S: AsRef<str>,\n{}",
+    ];
+    for src in should_flag {
+        assert!(
+            flagged(src),
+            "check_sig should flag generic/where string bound: {src}"
+        );
+    }
+
+    // Negative: non-string bounds must NOT be flagged.
+    let clean = [
+        "fn f<T: Clone + Send>(s: T) where T: 'static {}",
+        "fn f<T: AsRef<[u8]>>(s: T) {}",
+        "fn f(cid: &Cid512, key: RendezvousKey) {}",
+    ];
+    for src in clean {
+        assert!(!flagged(src), "check_sig should NOT flag: {src}");
+    }
+}
+
+// A public type alias whose RHS is a string must be denied — otherwise
+// `pub type CapsuleName = String;` used as a `pub fn` param type would not
+// look string-like to the concrete-param check.
+#[test]
+fn walk_flags_string_type_alias_and_clean_alias_passes() {
+    fn parse_items(src: &str) -> Vec<Item> {
+        syn::parse_file(src).expect("valid module").items
+    }
+
+    let mut v = Violations::default();
+    walk_items(
+        &parse_items("pub type CapsuleName = String; type Peer = PeerContact;"),
+        &mut v,
+    );
+    assert!(
+        v.string_param
+            .iter()
+            .any(|m| m.contains("CapsuleName") && m.contains("string alias")),
+        "string type alias must be flagged: {:?}",
+        v.string_param
+    );
+    // Non-string alias is not flagged.
+    assert!(
+        v.string_param.iter().all(|m| !m.contains("Peer =")),
+        "{:?}",
+        v.string_param
+    );
 }
