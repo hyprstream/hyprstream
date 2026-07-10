@@ -12,6 +12,33 @@ use std::collections::HashMap;
 use std::path::Path;
 use tch::{nn, Device, Kind as DType, Tensor};
 
+// Thread-local cache of RoPE instances (one per layer/head-dim/theta config).
+//
+// Each entry holds sin/cos tables built on the compute device — i.e. real CUDA
+// tensors when the model runs on GPU. The cache is keyed so the tables are
+// reused across decode steps instead of recomputing every token.
+//
+// Teardown (#429): because this is thread-local, these device tensors are *not*
+// dropped when the engine struct drops — they survive until the owning thread
+// exits. The inference service thread is detached, so its TLS destructors can
+// fire during process-exit cleanup, *after* libtorch's atexit handler has torn
+// down the CUDA context — producing the `c10::Error: invalid device pointer`
+// SIGABRT. `clear_rope_cache` drops them explicitly on the service thread,
+// while the context is still alive, at shutdown.
+thread_local! {
+    static ROPE_CACHE: std::cell::RefCell<HashMap<(usize, i64, u32), RoPE>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Drop every cached RoPE instance on the *calling* thread.
+///
+/// Must be called on the same thread that ran the forward passes (the
+/// inference service thread) so it clears the entries that matter. Idempotent.
+/// See [`ROPE_CACHE`] for why this exists.
+pub(crate) fn clear_rope_cache() {
+    ROPE_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
 /// Linear projection layer with optional bias and optional FP8 block scale.
 ///
 /// Weights may be stored as FP8 (E4M3 or E5M2) to save VRAM. When a `scale`
@@ -846,12 +873,6 @@ impl LlamaAttention {
 
     /// Apply Rotary Position Embeddings with optional scaling
     fn apply_rope(&self, tensor: &Tensor, position_ids: &Tensor) -> Result<Tensor> {
-        // Use a thread-local RoPE instance cache for efficiency
-        thread_local! {
-            static ROPE_CACHE: std::cell::RefCell<std::collections::HashMap<(usize, i64, u32), RoPE>> =
-                std::cell::RefCell::new(std::collections::HashMap::new());
-        }
-
         ROPE_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
 

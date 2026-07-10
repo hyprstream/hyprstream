@@ -2091,6 +2091,83 @@ impl TorchEngine {
 
         Ok(hidden_states)
     }
+
+    /// Explicitly drop every CUDA/device tensor the engine owns or has cached
+    /// on this thread, **now** — while the CUDA context is still alive.
+    ///
+    /// # Why this exists (#429)
+    ///
+    /// `tch`/libtorch defers CUDA context teardown to an `atexit` handler that
+    /// runs during *process* exit. But two classes of device tensor outlive the
+    /// engine struct and only drop later:
+    ///
+    /// 1. **Thread-local RoPE caches** (`llama::ROPE_CACHE`, `qwen3_5::ROPE_CACHE`)
+    ///    — sin/cos tables cached on the compute device. They are TLS, so they
+    ///    are not touched by `Drop` and survive until the owning thread exits.
+    /// 2. **The inference service thread itself** — it is spawned detached in
+    ///    `LocalInferenceService::start`, so its TLS destructors (and thus the
+    ///    RoPE cache drop) can fire during process-exit cleanup, *after* the
+    ///    CUDA context is gone → `c10::Error: invalid device pointer` (SIGABRT).
+    ///
+    /// The engine-only GPU smoke (`e6_gpu_engine_is_single_device_on_one_gpu_host`)
+    /// never loads weights nor runs a forward pass, so it populates no RoPE
+    /// cache and exits cleanly; the streaming test does, which is why only it
+    /// aborts.
+    ///
+    /// Calling this on the service thread at `Shutdown` receipt — *before*
+    /// replying to the client — drops the RoPE tables and the model weights
+    /// synchronously while the caller is still blocked on the reply (process
+    /// indubitably alive, context valid). After it returns only empty shells
+    /// remain for any late TLS/static destruction, so there is nothing left to
+    /// free against a dead context.
+    ///
+    /// # Contract
+    ///
+    /// This is a **terminal** teardown: the engine is unusable afterward
+    /// (`model_info` reports unloaded, generation will error). It must only be
+    /// called once, at shutdown. Unlike [`Drop`], it deliberately *does* clear
+    /// shared `Arc<Mutex<Option<T>>>` contents — that is safe precisely because
+    /// the engine is being retired, not because the contents are unused. (The
+    /// production inference path holds a single engine instance per service; a
+    /// cached clone would see `None` and fail closed with "No model loaded",
+    /// which is the correct behavior for a retired engine.)
+    pub fn release_device_resources(&mut self) {
+        // 1. Clear the model's own KV cache while the model still exists (the
+        //    cache tensors live inside the architecture model's KVCacheManager).
+        self.clear_kv_cache();
+
+        // 2. Drop the architecture model (all decoder-layer weights, embeddings,
+        //    lm_head) — the bulk of the device memory.
+        self.persistent_model = None;
+
+        // 3. Drop the (dummy) VarStore and clear the session KV registry so any
+        //    device tensors held there release before context teardown too.
+        {
+            let mut vs_guard = self.var_store.lock();
+            *vs_guard = None;
+        }
+        if let Some(registry) = self.kv_cache_registry.clone() {
+            registry.clear_all();
+        }
+
+        // 4. Drop the thread-local RoPE sin/cos tables on *this* thread. This is
+        //    the load-bearing step for #429: without it these CUDA tensors would
+        //    only free in the detached service thread's TLS destructor.
+        crate::runtime::architectures::llama::clear_rope_cache();
+        crate::runtime::architectures::qwen3_5::clear_rope_cache();
+
+        // 5. Drain any in-flight CUDA kernels (frees completed, makes the above
+        //    drops effective on the device) before we hand control back. CPU is
+        //    a no-op. Best-effort: a failure to synchronize is logged, not fatal
+        //    — the tensors are already dropped on the Rust side.
+        if let Device::Cuda(idx) = self.device {
+            // atc_synchronize panics on internal error; never propagate.
+            let res = std::panic::catch_unwind(|| tch::Cuda::synchronize(idx as i64));
+            if res.is_err() {
+                warn!("CUDA synchronize during teardown returned an error (ignored)");
+            }
+        }
+    }
 }
 
 impl Drop for TorchEngine {
@@ -2156,6 +2233,70 @@ mod tests {
         assert!(engine.device_pool().is_none());
         assert_eq!(engine.device(), Device::Cpu);
     }
+
+    /// #429: `release_device_resources` is the terminal teardown that drops
+    /// CUDA tensors (weights, KV cache, thread-local RoPE tables) on the
+    /// service thread at shutdown. It must:
+    /// - be safe on an engine that never loaded a model (no-op for the
+    ///   weight/KV paths, but must still clear RoPE TLS),
+    /// - be idempotent (double-call must not panic / double-free),
+    /// - leave the engine visibly unloaded afterward.
+    ///
+    /// This runs on CPU (no CUDA context), so it can't reproduce the SIGABRT
+    /// itself; it pins the *ordering contract* the GPU fix relies on. The
+    /// thread-local RoPE caches are populated on whichever thread runs the
+    /// forward pass — this test clears the test thread's own TLS, which is
+    /// exactly what the production Shutdown handler does on the service thread.
+    #[test]
+    fn release_device_resources_is_safe_and_idempotent() {
+        let mut engine =
+            super::TorchEngine::with_device(RuntimeConfig::default(), Device::Cpu, None).unwrap();
+
+        // Never loaded a model — these start empty.
+        assert!(!engine.has_varstore());
+
+        // First call: no model weights, no KV registry, no RoPE entries on this
+        // thread — must still succeed and clear the (empty) RoPE TLS.
+        engine.release_device_resources();
+        assert!(
+            !engine.has_varstore(),
+            "an unloaded engine stays unloaded after teardown"
+        );
+
+        // Second call: idempotent — must not panic or double-free.
+        engine.release_device_resources();
+        engine.release_device_resources();
+
+        // Dropping the engine afterward must also be clean (no double-drop of
+        // the already-None persistent_model / var_store).
+        drop(engine);
+    }
+
+    /// #429: a loaded-model teardown must actually drop the VarStore contents.
+    /// We can't load a real model without weights/libtorch-on-this-host, but we
+    /// can set the dummy VarStore (the same step `load_model_file` performs) and
+    /// confirm `release_device_resources` clears it — the contract the GPU path
+    /// relies on to free weight tensors before CUDA context teardown.
+    #[test]
+    fn release_device_resources_clears_loaded_varstore() {
+        let mut engine =
+            super::TorchEngine::with_device(RuntimeConfig::default(), Device::Cpu, None).unwrap();
+        // Mimic the load path: install a dummy VarStore on the engine's device.
+        {
+            let vs = VarStore::new(Device::Cpu);
+            let mut guard = engine.var_store.lock();
+            *guard = Some(vs);
+        }
+        assert!(engine.has_varstore());
+
+        engine.release_device_resources();
+
+        assert!(
+            !engine.has_varstore(),
+            "release_device_resources must drop the VarStore"
+        );
+    }
+
 
     /// `with_device(.., Some(multi_pool))` must mark the engine multi-device and
     /// expose the pool with the right primary. We build the pool from explicit
