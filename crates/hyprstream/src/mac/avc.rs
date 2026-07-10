@@ -359,6 +359,35 @@ mod tests {
         );
     }
 
+    /// Fu1/#677: a token whose attenuated capability subset is **empty** (the
+    /// mint granted nothing — `cap` attenuated to ∅, encoded as an empty
+    /// `op_set`) MUST grant nothing at the PEP, even when the PDP (lattice
+    /// floor and TE matrix) would permit. This is the ZSP guarantee the
+    /// on-the-wire `cap` claim exists to enforce: the deny-only token gate is
+    /// the floor no minted subset can escape, so an empty-subset token cannot
+    /// authorize any action regardless of the subject's clearance.
+    #[test]
+    fn fu1_empty_subset_token_grants_nothing() {
+        let a = avc();
+        // The PDP would Permit this on its own (rule (1,1,1) + high ⊒ low)...
+        assert_eq!(
+            a.decide(subj(1, high()), obj(1, low()), Action(1)),
+            Decision::Permit,
+            "precondition: the PDP permits absent the token gate"
+        );
+        // ...but an empty-subset token (op_set = ∅) denies at the PEP.
+        let empty_subset = TokenScope {
+            label_ceiling: high(),
+            op_set: Arc::from(Vec::<Action>::new()),
+            valid_until: Instant::now() + Duration::from_secs(60),
+        };
+        assert_eq!(
+            a.decide_with_token(subj(1, high()), obj(1, low()), Action(1), &empty_subset),
+            Decision::Deny,
+            "an empty-subset (cap=∅) token MUST grant nothing (Fu1/#677)"
+        );
+    }
+
     #[test]
     fn expired_token_fails_closed() {
         let a = avc();

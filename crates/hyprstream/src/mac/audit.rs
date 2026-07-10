@@ -277,15 +277,27 @@ impl DecisionReason {
 }
 
 impl AuditRecord {
-    /// Canonical CBOR encoding for hashing/signing. Deterministic: maps are
-    /// emitted in length-first sorted-key order, so the same record always
-    /// serializes to identical bytes regardless of struct field layout drift.
-    /// We re-serialize via [`serde_cbor`] would be ideal, but to avoid a new
-    /// dep we serialize through a canonical intermediate and rely on serde's
-    /// stable field order; the hash is reproducible across runs of the same
-    /// binary, which is what content-addressing here requires.
+    /// Canonical CBOR encoding for hashing/signing.
+    ///
+    /// Fu6/#677: this is real canonical CBOR via [`ciborium`] (the same CBOR
+    /// runtime the UCAN grant / COSE layers use), not `serde_json`. The module
+    /// docs, the WAL journal framing, and the S7 signed checkpoint all describe
+    /// the content-addressed digest as taken over *canonical CBOR*; the
+    /// previous `serde_json::to_vec` impl made the docs a lie and pinned the
+    /// hash to JSON's incidental field order — a hash-stability hazard on any
+    /// struct evolution that touched serde representation.
+    ///
+    /// Determinism: `ciborium` emits map keys in serde struct-field order, so
+    /// the same `AuditRecord` always serializes to identical bytes for a given
+    /// binary. This matches the canonical-CBOR convention used by the UCAN
+    /// grant's `signing_bytes` — see the `golden_content_hash_is_stable` test,
+    /// which pins a known record to a fixed BLAKE3 so any drift in the
+    /// canonical encoding is caught.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, AuditError> {
-        serde_json::to_vec(self).map_err(|e| AuditError::Encode(e.to_string()))
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(self, &mut buf)
+            .map_err(|e| AuditError::Encode(e.to_string()))?;
+        Ok(buf)
     }
 
     /// BLAKE3 content hash of the canonical bytes — the content-addressed key
@@ -876,7 +888,7 @@ impl<S: AuditSigner> WalAuditStore<S> {
             expected_seq = seq + 1;
             let bytes = base64_decode(cbor_b64)?;
             let sig = hex_decode(sig_hex)?;
-            let record: AuditRecord = serde_json::from_slice(&bytes).map_err(|e| {
+            let record: AuditRecord = ciborium::de::from_reader(&bytes[..]).map_err(|e| {
                 AuditError::Decode(format!("journal line {}: bad record: {}", lineno + 1, e))
             })?;
             // Chain: this record must link to the previous record's hash.
@@ -1514,6 +1526,38 @@ mod tests {
 
     // ── Property: content-addressing ────────────────────────────────────────
 
+    /// Fu6/#677: golden content-hash stability. The canonical encoding is real
+    /// CBOR (not serde_json); this pins a fully-specified record to a fixed
+    /// BLAKE3 so any drift in the canonical encoding — a struct field reorder,
+    /// a serde representation change, a swap back to JSON — is caught here
+    /// rather than silently breaking the on-disk hash chain. Update this hash
+    /// *only* as part of an intentional, migration-aware encoding change.
+    #[test]
+    fn golden_content_hash_is_stable() {
+        let rec = AuditRecord {
+            seq: 1,
+            prev_hash: [0u8; 32],
+            ts_unix_nanos: 0,
+            decision: Decision::Permit,
+            generation: 7,
+            policy_hash: None,
+            subject_type: SubjectType(1),
+            subject_clearance: high(),
+            on_behalf_of: None,
+            object_type: ObjectType(1),
+            object_label: low(),
+            action: Action(1),
+            reason: DecisionReason::Permit,
+        };
+        let hash = rec.content_hash().expect("canonical encode + hash");
+        let hex = hex::encode(hash);
+        assert_eq!(
+            hex,
+            "e3ca6519bde2ebb9a60273bd30a8acfa13a299280aafeca6c438ea21f8282b30",
+            "Fu6 golden hash drifted — was the canonical CBOR encoding changed intentionally?"
+        );
+    }
+
     #[test]
     fn same_decision_yields_same_content_hash() {
         let mut rec = AuditRecord {
@@ -1571,13 +1615,16 @@ mod tests {
             reason: DecisionReason::Permit,
         };
 
-        // `None` is skipped: the field name never appears in the canonical bytes,
-        // so a single-principal record is byte-identical to the pre-delegation
-        // schema (which had no such field at all).
+        // `None` is skipped: the field name never appears in the canonical
+        // bytes, so a single-principal record is byte-identical to the
+        // pre-delegation schema (which had no such field at all). The canonical
+        // encoding is CBOR (Fu6/#677); the field name is a CBOR text string, so
+        // a raw byte search for the UTF-8 substring tells us whether the field
+        // is present (CBOR maps/integers are not valid UTF-8, so we must not
+        // force the binary through `String::from_utf8`).
         let bytes_none = rec.canonical_bytes().unwrap();
-        let text = String::from_utf8(bytes_none.clone()).unwrap();
         assert!(
-            !text.contains("on_behalf_of"),
+            !contains_utf8(&bytes_none, b"on_behalf_of"),
             "a None delegator must be omitted from canonical bytes (hash-chain back-compat)"
         );
         let hash_none = rec.content_hash().unwrap();
@@ -1590,7 +1637,7 @@ mod tests {
         });
         let bytes_some = rec.canonical_bytes().unwrap();
         assert!(
-            String::from_utf8(bytes_some).unwrap().contains("on_behalf_of"),
+            contains_utf8(&bytes_some, b"on_behalf_of"),
             "a Some delegator must appear in the canonical bytes"
         );
         assert_ne!(
@@ -1598,6 +1645,14 @@ mod tests {
             rec.content_hash().unwrap(),
             "recording a delegator must change the content hash — it is tamper-evident content"
         );
+    }
+
+    /// Raw byte-substring search — works on canonical CBOR (Fu6/#677) where the
+    /// field name is a length-prefixed UTF-8 text string, without forcing the
+    /// binary through `String::from_utf8` (CBOR maps/integers are not valid
+    /// UTF-8).
+    fn contains_utf8(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
     }
 
     /// #680/#681: `AuditedAvc::decide_delegated` decides on the effective (met)
@@ -1759,23 +1814,42 @@ mod tests {
         };
         store.record(&rec).unwrap();
 
-        // Tamper: flip a byte in the journal payload. The signature (over the
-        // content hash of the canonical bytes) must no longer verify.
+        // Tamper: flip the first char of the journal payload's CBOR field. The
+        // signature (over the content hash of the canonical bytes) must no
+        // longer verify. We flip the FIRST base64 char of the `<cbor_b64>`
+        // field (not a trailing one) so the decoded bytes genuinely change
+        // regardless of the encoding's length — a trailing-appended char can be
+        // an incomplete base64 group the decoder drops, leaving the bytes (and
+        // thus the hash) unchanged (Fu6/#677 made the encoding CBOR, which
+        // shifted the payload length enough to expose this).
         let jp = dir.join("journal.log");
-        let mut content = std::fs::read_to_string(&jp).unwrap();
-        // Flip the last payload char before the newline.
-        let last = content.trim_end().chars().last().unwrap();
-        let mut chars: Vec<char> = content.chars().collect();
-        // Mutate the final base64 char to something different.
-        let replacement = if last == 'A' { 'B' } else { 'A' };
-        if let Some(c) = chars.last_mut() {
-            if *c == '\n' {
-                // step back one more
+        let content = std::fs::read(&jp).unwrap();
+        let mut lines: Vec<Vec<u8>> = content.split(|b| *b == b'\n').map(<[u8]>::to_vec).collect();
+        let last_line = lines
+            .iter_mut()
+            .rev()
+            .find(|l| !l.is_empty())
+            .expect("journal has at least one record");
+        // Locate the start of the 3rd `\t`-delimited field (the cbor_b64).
+        let mut tab_count = 0;
+        let mut cbor_start = 0;
+        for (i, b) in last_line.iter().enumerate() {
+            if *b == b'\t' {
+                tab_count += 1;
+                if tab_count == 2 {
+                    cbor_start = i + 1;
+                    break;
+                }
             }
-            *c = replacement;
         }
-        content = chars.into_iter().collect();
-        std::fs::write(&jp, content).unwrap();
+        assert!(cbor_start < last_line.len(), "journal line has a cbor field");
+        let orig = last_line[cbor_start];
+        last_line[cbor_start] = if orig == b'A' { b'B' } else { b'A' };
+        let tampered: Vec<u8> = lines
+            .iter()
+            .flat_map(|l| l.iter().copied().chain(std::iter::once(b'\n')))
+            .collect();
+        std::fs::write(&jp, tampered).unwrap();
 
         let reopened = WalAuditStore::open(&dir, StubSigner { key: [3; 32] }).unwrap();
         let verifier = StubVerifier { key: [3; 32] };

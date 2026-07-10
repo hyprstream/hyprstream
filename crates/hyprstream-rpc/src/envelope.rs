@@ -226,6 +226,30 @@ pub enum EnvelopeVerification<'a> {
     AnySigner,
 }
 
+/// Fu2/#677: how the verifier treats an identity with **no anchored ML-DSA-65
+/// key** (an "unanchored" signer) when verifying under a Hybrid [`CryptoPolicy`].
+///
+/// The composite signature is Weakly Non-Separable (per-identity): the inner
+/// EdDSA is independently verifiable, so whether the outer ML-DSA-65 layer is
+/// *required* is a per-identity decision. The audit (Fu2) found the verifier
+/// accepted unanchored identities classical-only by default — so "hybrid" was
+/// anchor-coverage-dependent, unlike the UCAN verifier which denies on a missing
+/// anchor. This enum makes the posture explicit and pins the **default to
+/// deny-on-missing-anchor**, with an opt-in per-peer allowlist for legacy
+/// classical-only peers (e.g. a pre-PQ federation edge).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnanchoredHybridPolicy {
+    /// Fail closed: an unanchored identity is rejected under Hybrid unless its
+    /// Ed25519 verifying key (hex) is present in the supplied allowlist. The
+    /// **production default** ([`UnwrapOptions`] defaults to this).
+    #[default]
+    Deny,
+    /// Accept the classical inner EdDSA only — the legacy WNS backcompat floor.
+    /// Exposed for low-level callers that explicitly opt into per-identity
+    /// classical verification; NOT the production default.
+    AllowClassicalFloor,
+}
+
 /// Options controlling envelope unwrap, verification, and optional decryption.
 ///
 /// # Crypto policy (fail-closed default)
@@ -254,6 +278,15 @@ pub struct UnwrapOptions<'a> {
     pub pq_store: Option<&'a dyn PqTrustStore>,
     /// Verification policy enforced at this site. Defaults to Hybrid (enforced).
     pub verify_policy: crate::crypto::CryptoPolicy,
+    /// Fu2/#677: posture for an unanchored signer (no ML-DSA-65 anchor) under
+    /// Hybrid. Defaults to [`UnanchoredHybridPolicy::Deny`] (deny-on-missing-
+    /// anchor). Under `Deny`, an unanchored identity is accepted classical-only
+    /// iff its Ed25519 key hex is in [`Self::unanchored_classical_allowlist`].
+    pub unanchored_policy: UnanchoredHybridPolicy,
+    /// Fu2/#677: Ed25519 verifying-key hexes permitted to verify classical-only
+    /// under Hybrid when [`Self::unanchored_policy`] is `Deny`. Empty by default
+    /// (every unanchored identity denied). Anchored identities bypass this list.
+    pub unanchored_classical_allowlist: Vec<String>,
 }
 
 impl<'a> UnwrapOptions<'a> {
@@ -265,6 +298,8 @@ impl<'a> UnwrapOptions<'a> {
             decryption_key: None,
             pq_store: None,
             verify_policy: crate::crypto::CryptoPolicy::default(),
+            unanchored_policy: UnanchoredHybridPolicy::default(),
+            unanchored_classical_allowlist: Vec::new(),
         }
     }
 
@@ -276,6 +311,8 @@ impl<'a> UnwrapOptions<'a> {
             decryption_key: None,
             pq_store: None,
             verify_policy: crate::crypto::CryptoPolicy::default(),
+            unanchored_policy: UnanchoredHybridPolicy::default(),
+            unanchored_classical_allowlist: Vec::new(),
         }
     }
 
@@ -293,6 +330,19 @@ impl<'a> UnwrapOptions<'a> {
     /// Set the verification policy explicitly.
     pub fn with_verify_policy(mut self, policy: crate::crypto::CryptoPolicy) -> Self {
         self.verify_policy = policy;
+        self
+    }
+
+    /// Fu2/#677: set the unanchored-signer posture under Hybrid (default `Deny`).
+    pub fn with_unanchored_policy(mut self, policy: UnanchoredHybridPolicy) -> Self {
+        self.unanchored_policy = policy;
+        self
+    }
+
+    /// Fu2/#677: set the Ed25519-key-hex allowlist of unanchored identities
+    /// accepted classical-only under Hybrid+`Deny`.
+    pub fn with_unanchored_allowlist(mut self, allowlist: Vec<String>) -> Self {
+        self.unanchored_classical_allowlist = allowlist;
         self
     }
 
@@ -1479,6 +1529,48 @@ impl SignedEnvelope {
         self.verify_cose(&verifying_key, pq_store, verify_policy)
     }
 
+    /// Fu2/#677: like [`Self::verify_with`] but with an explicit
+    /// [`UnanchoredHybridPolicy`] + classical-floor allowlist governing how an
+    /// *unanchored* signer (no ML-DSA-65 binding in `pq_store`) is treated under
+    /// Hybrid. This is the production wire-verify path
+    /// ([`unwrap_and_verify`]); the default posture is deny-on-missing-anchor.
+    pub fn verify_with_unanchored_policy(
+        &self,
+        expected_pubkey: &VerifyingKey,
+        nonce_cache: &dyn NonceCache,
+        pq_store: Option<&dyn PqTrustStore>,
+        verify_policy: crate::crypto::CryptoPolicy,
+        unanchored: UnanchoredHybridPolicy,
+        allowlist: &[String],
+    ) -> EnvelopeResult<()> {
+        if !bool::from(self.cnf.ct_eq(&expected_pubkey.to_bytes())) {
+            return Err(EnvelopeError::SignerMismatch {
+                expected: hex::encode(expected_pubkey.to_bytes()),
+                actual: hex::encode(self.cnf),
+            });
+        }
+        self.check_replay(nonce_cache)?;
+        self.verify_cose_unanchored(expected_pubkey, pq_store, verify_policy, unanchored, allowlist)
+    }
+
+    /// Fu2/#677: any-signer variant of [`Self::verify_with_unanchored_policy`].
+    pub fn verify_any_signer_with_unanchored_policy(
+        &self,
+        nonce_cache: &dyn NonceCache,
+        pq_store: Option<&dyn PqTrustStore>,
+        verify_policy: crate::crypto::CryptoPolicy,
+        unanchored: UnanchoredHybridPolicy,
+        allowlist: &[String],
+    ) -> EnvelopeResult<()> {
+        let verifying_key =
+            VerifyingKey::from_bytes(&self.cnf).map_err(|_| EnvelopeError::InvalidPublicKey {
+                expected: 32,
+                actual: 0,
+            })?;
+        self.check_replay(nonce_cache)?;
+        self.verify_cose_unanchored(&verifying_key, pq_store, verify_policy, unanchored, allowlist)
+    }
+
     /// Timestamp window + nonce replay check.
     fn check_replay(&self, nonce_cache: &dyn NonceCache) -> EnvelopeResult<()> {
         let now = current_timestamp();
@@ -1545,6 +1637,70 @@ impl SignedEnvelope {
         )
         .map_err(|e| EnvelopeError::PqSignatureInvalid(e.to_string()))?;
 
+        Ok(())
+    }
+
+    /// Fu2/#677: COSE composite verify with an explicit
+    /// [`UnanchoredHybridPolicy`] + classical-floor allowlist.
+    ///
+    /// Mirrors [`Self::verify_cose`] but, under a Hybrid policy, no longer
+    /// accepts an unanchored identity classical-only by default: with
+    /// [`UnanchoredHybridPolicy::Deny`] (the production default) an unanchored
+    /// signer is rejected unless its Ed25519 key hex is in `allowlist`. This
+    /// closes the audit's "hybrid is anchor-coverage-dependent" gap — the
+    /// default is now deny-on-missing-anchor, matching the UCAN verifier.
+    fn verify_cose_unanchored(
+        &self,
+        ed_vk: &VerifyingKey,
+        pq_store: Option<&dyn PqTrustStore>,
+        verify_policy: crate::crypto::CryptoPolicy,
+        unanchored: UnanchoredHybridPolicy,
+        allowlist: &[String],
+    ) -> EnvelopeResult<()> {
+        let signing_data = self.signed_bytes();
+        let aad = envelope_external_aad();
+        let anchored_pq = pq_store.and_then(|s| s.ml_dsa_key_for(&self.cnf));
+
+        let require_pq = if verify_policy.uses_pq() && anchored_pq.is_none() {
+            // Unanchored identity under Hybrid: gate the classical floor.
+            match unanchored {
+                UnanchoredHybridPolicy::AllowClassicalFloor => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    tracing::debug!(
+                        "Hybrid policy active but signer has no anchored ML-DSA-65 key; \
+                         verifying classical inner EdDSA (explicit AllowClassicalFloor)"
+                    );
+                    false
+                }
+                UnanchoredHybridPolicy::Deny => {
+                    let signer_hex = hex::encode(ed_vk.to_bytes());
+                    if allowlist.iter().any(|a| a == &signer_hex) {
+                        // Explicitly-allowlisted legacy peer: classical floor.
+                        false
+                    } else {
+                        return Err(EnvelopeError::PqSignatureInvalid(
+                            "Hybrid policy requires an anchored ML-DSA-65 key for this signer; \
+                             the identity is unanchored and not on the classical-floor allowlist \
+                             (deny-on-missing-anchor, Fu2/#677)"
+                                .to_owned(),
+                        ));
+                    }
+                }
+            }
+        } else {
+            // Anchored identity (require the outer under Hybrid) or Classical policy.
+            verify_policy.uses_pq() && anchored_pq.is_some()
+        };
+
+        crate::crypto::cose_sign::verify_composite(
+            &self.cose,
+            ed_vk,
+            anchored_pq.as_ref(),
+            &signing_data,
+            &aad,
+            require_pq,
+        )
+        .map_err(|e| EnvelopeError::PqSignatureInvalid(e.to_string()))?;
         Ok(())
     }
 
@@ -2123,10 +2279,26 @@ pub fn unwrap_and_verify(
 
     match &opts.verification {
         EnvelopeVerification::FixedSigner(pubkey) => {
-            signed.verify_with(pubkey, opts.nonce_cache, opts.pq_store, opts.verify_policy)?;
+            // Fu2/#677: production wire verify uses the unanchored-aware path —
+            // deny-on-missing-anchor by default, with an opt-in classical-floor
+            // allowlist for legacy peers.
+            signed.verify_with_unanchored_policy(
+                pubkey,
+                opts.nonce_cache,
+                opts.pq_store,
+                opts.verify_policy,
+                opts.unanchored_policy,
+                &opts.unanchored_classical_allowlist,
+            )?;
         }
         EnvelopeVerification::AnySigner => {
-            signed.verify_any_signer_with(opts.nonce_cache, opts.pq_store, opts.verify_policy)?;
+            signed.verify_any_signer_with_unanchored_policy(
+                opts.nonce_cache,
+                opts.pq_store,
+                opts.verify_policy,
+                opts.unanchored_policy,
+                &opts.unanchored_classical_allowlist,
+            )?;
         }
     }
 
@@ -3034,6 +3206,73 @@ mod tests {
             .map_err(|e| EnvelopeError::PqSignatureInvalid(e.to_string()))?;
         assert_eq!(payload, vec![4, 2]);
         Ok(())
+    }
+
+    // ── Fu2/#677: unanchored identity under Hybrid ──────────────────────────
+
+    /// Helper: a Hybrid-signed envelope on the wire (no PQ anchor installed).
+    fn fu2_hybrid_wire_unanchored() -> ((SigningKey, VerifyingKey), Vec<u8>) {
+        let (sk, vk) = generate_signing_keypair();
+        let (pq_sk, _pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let signed = SignedEnvelope::new_signed_hybrid(
+            RequestEnvelope::anonymous(vec![5, 0, 2]),
+            &sk,
+            &pq_sk,
+        );
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut builder = message.init_root::<common_capnp::signed_envelope::Builder>();
+            signed.write_to(&mut builder);
+        }
+        let mut wire = Vec::new();
+        capnp::serialize::write_message(&mut wire, &message).expect("serialize");
+        ((sk, vk), wire)
+    }
+
+    /// Fu2/#677 default: an unanchored identity (no ML-DSA-65 binding) is
+    /// DENIED under Hybrid via the production wire-verify path, even though the
+    /// inner EdDSA is valid. The previous behavior accepted it (WNS classical
+    /// floor); the default is now deny-on-missing-anchor.
+    #[test]
+    fn fu2_unanchored_denied_by_default_under_hybrid() {
+        let ((_sk, vk), wire) = fu2_hybrid_wire_unanchored();
+        let cache = TestNonceCache::new();
+        // Hybrid + NO pq_store (unanchored) + default Deny posture.
+        let opts = UnwrapOptions::fixed_signer(&vk, &cache).with_verify_policy(CryptoPolicy::Hybrid);
+        let res = unwrap_and_verify(&wire, &opts);
+        assert!(
+            res.is_err(),
+            "an unanchored identity MUST be denied under Hybrid by default (Fu2/#677)"
+        );
+    }
+
+    /// Fu2/#677 allowlist: the same unanchored identity IS accepted when its
+    /// Ed25519 key hex is on the classical-floor allowlist (the legacy-peer
+    /// escape hatch).
+    #[test]
+    fn fu2_unanchored_allowed_via_allowlist() {
+        let ((_sk, vk), wire) = fu2_hybrid_wire_unanchored();
+        let cache = TestNonceCache::new();
+        let opts = UnwrapOptions::fixed_signer(&vk, &cache)
+            .with_verify_policy(CryptoPolicy::Hybrid)
+            .with_unanchored_allowlist(vec![hex::encode(vk.to_bytes())]);
+        let (_signed, payload) = unwrap_and_verify(&wire, &opts)
+            .expect("an allowlisted unanchored identity is accepted (classical floor)");
+        assert_eq!(payload, vec![5, 0, 2]);
+    }
+
+    /// Fu2/#677 explicit opt-in: `AllowClassicalFloor` accepts an unanchored
+    /// identity under Hybrid without an allowlist (the legacy WNS posture,
+    /// available to low-level callers that want it).
+    #[test]
+    fn fu2_unanchored_allowed_via_legacy_policy() {
+        let ((_sk, vk), wire) = fu2_hybrid_wire_unanchored();
+        let cache = TestNonceCache::new();
+        let opts = UnwrapOptions::fixed_signer(&vk, &cache)
+            .with_verify_policy(CryptoPolicy::Hybrid)
+            .with_unanchored_policy(UnanchoredHybridPolicy::AllowClassicalFloor);
+        let (_signed, _payload) = unwrap_and_verify(&wire, &opts)
+            .expect("AllowClassicalFloor accepts an unanchored identity (legacy posture)");
     }
 
     // =========================================================================

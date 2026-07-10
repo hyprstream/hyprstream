@@ -845,14 +845,14 @@ fn parse_grant_request(
 /// never the whole grant. It is bound to the DPoP `jkt` (`cnf.jkt`) and carries
 /// a short ttl. A refresh token is stored when a token DB is configured.
 ///
-/// **S8 (#574):** the minted token is signed with the **hybrid** composite JWT
-/// signature (EdDSA + ML-DSA-65, `alg: "ML-DSA-65-Ed25519"`) when the node has
-/// a provisioned ML-DSA-65 key, matching the hybrid signature on the UCAN grant
-/// and approval it consumed. The minted token is the same kind of
+/// **S8 (#574) + Fu3/#677:** the minted token is signed with the **hybrid**
+/// composite JWT signature (EdDSA + ML-DSA-65, `alg: "ML-DSA-65-Ed25519"`)
+/// under a Hybrid policy, matching the hybrid signature on the UCAN grant and
+/// approval it consumed. The minted token is the same kind of
 /// confidentiality/integrity-critical authority artifact the rest of the MAC
-/// stack signs hybridly. When no ML-DSA-65 key is provisioned, the token falls
-/// back to the policy-selected classical Ed25519 suite (the explicit pinned
-/// suite — never an in-band downgrade).
+/// stack signs hybridly. Under Hybrid policy with no provisioned ML-DSA-65 key
+/// the mint **fails closed** (no silent classical downgrade); under Classical
+/// policy the token is signed with the pinned classical Ed25519 suite.
 async fn mint_grant_token(
     state: &Arc<OAuthState>,
     granted: &GrantedAccess,
@@ -900,11 +900,14 @@ async fn mint_grant_token(
         jkt: Some(dpop_jkt.to_owned()),
     });
 
-    // S8 (#574): sign via the hybrid composite (EdDSA + ML-DSA-65) when an
-    // ML-DSA-65 key is provisioned; fall back to the policy-selected classical
-    // Ed25519 suite otherwise. The hybrid path is the same construction the
-    // PolicyService uses for WIT/access-token minting. The UCAN grant and
-    // approval this token was minted from are already hybrid-signed.
+    // S8 (#574) + Fu3/#677: sign via the hybrid composite (EdDSA + ML-DSA-65)
+    // under a Hybrid policy; under Classical use the pinned classical Ed25519
+    // suite. **Hybrid fails closed:** if the node is Hybrid but no ML-DSA-65
+    // signing key is provisioned, refuse to mint rather than silently downgrade
+    // to a classical-only token — mirroring `PolicyService::sign_token` and
+    // `CoseAuditSigner`. The UCAN grant and approval this token was minted from
+    // are already hybrid-signed, so a classical-only minted token would break
+    // that chain of hybrid authority.
     let Some(ed_sk) = state.active_jwt_signing_key().await else {
         tracing::error!("no active JWT signing key configured; cannot mint UCAN grant token");
         return tx_error(
@@ -913,14 +916,28 @@ async fn mint_grant_token(
             "token signing not configured",
         );
     };
+    let policy = hyprstream_rpc::envelope::envelope_policy_from_env();
     let pq_sk = if let Some(store) = &state.ml_dsa_key_store {
         store.active_key().await
     } else {
         None
     };
-    let token = match pq_sk {
-        Some(pq) => crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(&claims, &pq, &ed_sk),
-        None => crate::auth::jwt::encode(&claims, &ed_sk),
+    let token = match (policy.uses_pq(), pq_sk) {
+        (true, Some(pq)) => {
+            crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(&claims, &pq, &ed_sk)
+        }
+        (true, None) => {
+            tracing::error!(
+                "Hybrid crypto policy requires an ML-DSA-65 token-signing key, none provisioned \
+                 — refusing to mint a classical-only UCAN grant token (fail-closed)"
+            );
+            return tx_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "hybrid token signing key not provisioned",
+            );
+        }
+        (false, _) => crate::auth::jwt::encode(&claims, &ed_sk),
     };
 
     // Optional refresh token (ZSP: refresh re-runs evaluate_refresh, not a free
