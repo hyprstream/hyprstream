@@ -145,6 +145,19 @@ jobs:
     - name: Build
       run: cargo build --release --verbose --features download-libtorch
 
+    - name: Build wasm guest artifacts (for sandbox/mount tests)
+      # The workers-python / workers-wasmtime sandbox tests hard-fail under CI
+      # (deny-on-missing-guest guard) when their wasm guest artifacts are absent —
+      # the guard forces CI to actually exercise the sandbox. These guests are
+      # EXCLUDED standalone crates with their own target dirs, so build them
+      # explicitly; nextest locates them via HYPRSTREAM_*_WASM on the test step.
+      run: |
+        rustup target add wasm32-unknown-unknown wasm32-wasip1
+        cargo build --release --target wasm32-unknown-unknown \
+          --manifest-path crates/hyprstream-workers-python-guest/Cargo.toml
+        cargo build --release --target wasm32-wasip1 \
+          --manifest-path crates/hyprstream-workers-wasmtime-fsguest/Cargo.toml
+
     - name: Install cargo-nextest
       uses: taiki-e/install-action@nextest
 
@@ -154,6 +167,9 @@ jobs:
       # fast, instead of stalling the job until the 90min job / 120min queue
       # timeout. The cap is per-test on purpose — the legit suite is long (~76min),
       # so a per-step timeout could not tell a hang from healthy runtime.
+      env:
+        HYPRSTREAM_PYGUEST_WASM: ${{ github.workspace }}/crates/hyprstream-workers-python-guest/target/wasm32-unknown-unknown/release/hyprstream_workers_python_guest.wasm
+        HYPRSTREAM_FSGUEST_WASM: ${{ github.workspace }}/crates/hyprstream-workers-wasmtime-fsguest/target/wasm32-wasip1/release/hyprstream-workers-wasmtime-fsguest.wasm
       run: cargo nextest run --cargo-profile ci-test --profile ci --features download-libtorch
 
     - name: Run doctests
