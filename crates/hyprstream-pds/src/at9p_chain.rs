@@ -91,7 +91,7 @@ impl ChainState {
         Ok(Self {
             subject_cid512: capsule.cid512()?,
             epoch: 0,
-            record_digest: h512(&capsule.to_dag_cbor()),
+            record_digest: h512(&capsule.to_dag_cbor()?),
             next_key_commitments: capsule.body.next_key_commitments.clone(),
         })
     }
@@ -104,7 +104,10 @@ impl ChainState {
         Self {
             subject_cid512: record.subject_cid512.clone(),
             epoch: record.epoch,
-            record_digest: h512(&record.to_dag_cbor()),
+            // Already validated by contract; use the unchecked serializer so
+            // this infallible projector stays infallible (a record that
+            // reached here came from `from_dag_cbor` or the signing path).
+            record_digest: h512(&record.encode_value()),
             next_key_commitments: record.new_capsule_body.next_key_commitments.clone(),
         }
     }
@@ -480,7 +483,7 @@ mod tests {
         let next_state = validate_successor(&gen_state, &rec, "2026-07-09T00:00:00Z")
             .expect("valid successor must be accepted");
         assert_eq!(next_state.epoch, 1);
-        assert_eq!(next_state.record_digest, h512(&rec.to_dag_cbor()));
+        assert_eq!(next_state.record_digest, h512(&rec.to_dag_cbor().unwrap()));
         assert_eq!(next_state.subject_cid512, gen_state.subject_cid512);
     }
 

@@ -66,6 +66,13 @@ pub enum DagCbor {
     /// Non-negative integer (CBOR major 0).
     Unsigned(u64),
     /// Negative integer (CBOR major 1); `-1 - n`.
+    ///
+    /// **Invariant:** the wrapped value MUST be `< 0`. The variant encodes as
+    /// CBOR major type 1 (`-1 - n`); a non-negative `n` has no valid encoding
+    /// there and is a programmer error caught (loudly, in release too) at
+    /// [`DagCbor::encode`]. Construct negatives via literal `i128` values
+    /// (`DagCbor::Negative(-1)`) — never compute `Negative(x)` from an
+    /// unbounded `x` without first checking `x < 0`.
     Negative(i128),
     /// Byte string (major 2).
     Bytes(Vec<u8>),
@@ -94,10 +101,12 @@ impl DagCbor {
         let mut v: Vec<(String, DagCbor)> = pairs.into_iter().map(|(k, v)| (k.into(), v)).collect();
         v.sort_by(|a, b| canonical_key_cmp(a.0.as_bytes(), b.0.as_bytes()));
         // Reject duplicate keys — they'd silently collapse in CBOR and produce
-        // a CID-collision risk across implementations.
+        // a CID-collision risk across implementations. This is a programmer
+        // error (the caller fed the same key twice), so it is a hard,
+        // always-on panic rather than a `debug_assert!` that vanishes in
+        // release builds and lets duplicate keys reach the wire.
         if let Some(i) = v.windows(2).position(|w| w[0].0 == w[1].0) {
-            // This is a programmer error; surface it loudly via debug assert.
-            debug_assert!(false, "duplicate DAG-CBOR map key: {:?}", v[i].0);
+            panic!("duplicate DAG-CBOR map key: {:?}", v[i].0);
         }
         let sorted = v
             .into_iter()
@@ -128,7 +137,14 @@ impl DagCbor {
             DagCbor::Unsigned(n) => write_uint(out, MT_UNSIGNED, *n),
             DagCbor::Negative(n) => {
                 // CBOR encodes negatives as -1 - n in major type 1 (uint).
-                // n is < 0 here.
+                // The variant invariant requires n < 0; a non-negative value is
+                // a programmer error (it belongs in `Unsigned`), and computing
+                // `-1 - n` then casting to u64 would silently mis-encode it.
+                // Reject loudly in release as well as debug.
+                assert!(
+                    *n < 0,
+                    "DagCbor::Negative must hold a negative value; got {n} (use Unsigned instead)"
+                );
                 let val = (-1_i128 - n) as u64;
                 write_uint(out, MT_NEGATIVE, val);
             }
@@ -609,5 +625,39 @@ mod tests {
             vec![0x19, 0x01, 0x00],
             "u16 must use head 25"
         );
+    }
+
+    /// Issue #934: duplicate keys fed to `str_map` must be a *hard* error in
+    /// release builds too, not a silent `debug_assert!` that lets two keys
+    /// collapse on the wire (a CID-collision risk across implementations).
+    #[test]
+    #[should_panic(expected = "duplicate DAG-CBOR map key")]
+    fn str_map_rejects_duplicate_keys_in_release() {
+        let _ = DagCbor::str_map([("a", DagCbor::Unsigned(1)), ("a", DagCbor::Unsigned(2))]);
+    }
+
+    /// Issue #934: `Negative(n)` with `n >= 0` has no valid CBOR major-1
+    /// encoding and must be rejected at encode (loudly, in release too) rather
+    /// than silently mis-encoded via the `-1 - n` cast.
+    #[test]
+    #[should_panic(expected = "must hold a negative value")]
+    fn negative_must_be_negative() {
+        // 0 and positive values belong in `Unsigned`; encoding them through
+        // `Negative` would wrap `-1 - n as u64` into a huge bogus major-1 arg.
+        DagCbor::Negative(0).encode();
+    }
+
+    #[test]
+    fn negative_boundary_round_trips() {
+        // The smallest representable negative (-1) and a deep negative both
+        // round-trip correctly through the validated encode path.
+        for n in [
+            DagCbor::Negative(-1),
+            DagCbor::Negative(-24),
+            DagCbor::Negative(-256),
+        ] {
+            let dec = DagCbor::decode(&n.encode()).expect("round-trip");
+            assert_eq!(n, dec);
+        }
     }
 }
