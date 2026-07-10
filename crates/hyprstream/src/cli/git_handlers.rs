@@ -1540,45 +1540,114 @@ pub async fn handle_load(
     if kv_quant != crate::runtime::KVQuantType::None { println!("  KV quantization: {:?}", kv_quant); }
 
     // If --wait, block on EventService model.lifecycle events until loaded/failed.
-    // EV5/#605: replaced NotificationService blinded-DH path with unified EventService.
-    // Model lifecycle events ride the "model" source in Public/plaintext mode
-    // (encrypted-default flip deferred to #555), so no group-key join is needed.
+    // EV7/#649: latched shape via `read_then_subscribe`. A `load --wait` issued
+    // AFTER the model already loaded would otherwise hang on an event that will
+    // never fire (the load RPC fast-paths and publishes nothing) — so after
+    // subscribing (never before, to avoid missing the live edge) we probe status
+    // and pre-latch the retained `Loaded` terminal; `read_then_subscribe` then
+    // fast-paths the retained value, else blocks on the live `model.lifecycle`
+    // edge until `model.loaded`/`model.failed`.
+    // EV5/#605: model lifecycle events ride the "model" source in Public/plaintext
+    // mode (encrypted-default flip deferred to #555), so the late read uses the
+    // plaintext-plane `AllowAllTerminalAuthz` and no group-key join is needed.
     if let Some(timeout_secs) = wait {
         println!("Waiting for model to load (timeout: {}s)...", timeout_secs);
         ensure_event_client_origin(paths::event_socket());
         let mut subscriber = EventSubscriber::new()?;
         subscriber.subscribe("model")?;
 
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-        let outcome = loop {
-            let remaining = deadline.checked_duration_since(tokio::time::Instant::now()).unwrap_or_default();
-            if remaining.is_zero() {
-                break Err(anyhow::anyhow!("Timeout waiting for model load notification ({}s elapsed)", timeout_secs));
-            }
-            match tokio::time::timeout(remaining, subscriber.recv()).await {
-                Err(_) => break Err(anyhow::anyhow!("Timeout waiting for model load notification ({}s elapsed)", timeout_secs)),
-                Ok(Err(e)) => { debug!("event recv error: {e}"); continue; }
-                Ok(Ok((topic, payload))) => {
-                    let event: EventEnvelope = match serde_json::from_slice(&payload) {
-                        Ok(e) => e, Err(_) => continue,
-                    };
-                    match &event.payload {
-                        EventPayload::ModelLoaded { model_ref: ref mr, endpoint }
-                            if mr.contains(model_ref_str) || model_ref_str.contains(mr.as_str()) =>
-                        {
-                            println!("\u{2713} Model {} loaded", model_ref_str);
-                            println!("  Endpoint: {}", endpoint);
-                            break Ok(());
-                        }
-                        EventPayload::ModelFailed { model_ref: ref mr, error }
-                            if mr.contains(model_ref_str) || model_ref_str.contains(mr.as_str()) =>
-                        {
-                            break Err(anyhow::anyhow!("Model {} failed to load: {}", model_ref_str, error));
-                        }
-                        _ => { debug!("ignoring event: {}", topic); }
-                    }
+        use hyprstream_rpc::latch::{
+            AllowAllTerminalAuthz, Terminal, TerminalStore, read_then_subscribe,
+        };
+        use crate::services::model::ModelLoadTerminal;
+
+        // Local retain-store for this load-wait invocation. Pre-seed from a
+        // status probe so a late arrival (model already loaded) fast-paths.
+        let store: TerminalStore<String, ModelLoadTerminal> = TerminalStore::new();
+        let mut fast_path = false;
+        match model_client
+            .status(&StatusRequest { model_ref: model_ref_str.to_owned() })
+            .await
+        {
+            Ok(entries) => {
+                let already_loaded = entries.iter().any(|e| {
+                    e.status == "loaded"
+                        && (e.model_ref.contains(model_ref_str)
+                            || model_ref_str.contains(e.model_ref.as_str()))
+                });
+                if already_loaded {
+                    // Co-located reach is empty on the wire (#320); the live
+                    // `model.loaded` event's endpoint is unavailable on this
+                    // path, so latch without one (display omits the line).
+                    let _ = store.latch(
+                        model_ref_str.to_owned(),
+                        Terminal {
+                            value: ModelLoadTerminal::Loaded { endpoint: String::new() },
+                            latched_by: "cli-status".to_owned(),
+                        },
+                    );
+                    fast_path = true;
                 }
             }
+            Err(e) => debug!("model status probe failed (will wait on live edge): {e}"),
+        }
+
+        // Classify a `model.lifecycle` event as a terminal value for THIS
+        // model_ref. Non-matching events (other models) yield `None` and
+        // `read_then_subscribe` keeps draining the live edge.
+        let classify_ref = model_ref_str.to_owned();
+        let classify = move |_topic: &str, payload: &[u8]| -> Option<ModelLoadTerminal> {
+            let event: EventEnvelope = match serde_json::from_slice(payload) {
+                Ok(e) => e,
+                Err(_) => return None,
+            };
+            match &event.payload {
+                EventPayload::ModelLoaded { model_ref: mr, endpoint }
+                    if mr.contains(classify_ref.as_str()) || classify_ref.contains(mr.as_str()) =>
+                {
+                    Some(ModelLoadTerminal::Loaded { endpoint: endpoint.clone() })
+                }
+                EventPayload::ModelFailed { model_ref: mr, error }
+                    if mr.contains(classify_ref.as_str()) || classify_ref.contains(mr.as_str()) =>
+                {
+                    Some(ModelLoadTerminal::LoadFailed { error: error.clone() })
+                }
+                _ => None,
+            }
+        };
+
+        let watcher = "cli-load-wait".to_owned();
+        let deadline = std::time::Duration::from_secs(timeout_secs);
+        let outcome = match tokio::time::timeout(
+            deadline,
+            read_then_subscribe(
+                &store,
+                &mut subscriber,
+                &AllowAllTerminalAuthz,
+                &watcher,
+                model_ref_str.to_owned(),
+                classify,
+            ),
+        )
+        .await
+        {
+            Err(_) => Err(anyhow::anyhow!(
+                "Timeout waiting for model load notification ({}s elapsed)",
+                timeout_secs
+            )),
+            Ok(Err(e)) => Err(anyhow::anyhow!("Model load wait failed: {e}")),
+            Ok(Ok(terminal)) => match terminal.value {
+                ModelLoadTerminal::Loaded { endpoint } => {
+                    println!("\u{2713} Model {} loaded{}", model_ref_str, if fast_path { " (already loaded)" } else { "" });
+                    if !endpoint.is_empty() {
+                        println!("  Endpoint: {}", endpoint);
+                    }
+                    Ok(())
+                }
+                ModelLoadTerminal::LoadFailed { error } => {
+                    Err(anyhow::anyhow!("Model {} failed to load: {}", model_ref_str, error))
+                }
+            },
         };
         outcome?;
     }

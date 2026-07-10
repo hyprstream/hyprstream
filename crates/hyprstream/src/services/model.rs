@@ -41,6 +41,7 @@ use crate::services::generated::registry_client::{StageFilesRequest, CommitWithA
 use crate::services::generated::policy_client::PolicyCheck;
 use crate::storage::ModelRef;
 use anyhow::{anyhow, Result};
+use hyprstream_rpc::latch::{Terminal, TerminalStore};
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::events::EventPublisher;
 use hyprstream_rpc::registry::{global as registry, SocketKind};
@@ -49,6 +50,7 @@ use hyprstream_rpc::stream_info::TransportConfig as WireTransportConfig;
 use lru::LruCache;
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
@@ -56,6 +58,42 @@ use tracing::{debug, info, warn};
 
 /// Default endpoint for the model service
 pub const MODEL_ENDPOINT: &str = "inproc://hyprstream/model";
+
+// ============================================================================
+// Latched load terminal (EV7/#649) — host-side retained load outcome
+// ============================================================================
+
+/// Terminal payload for a model load attempt (EV7/#649). Latched host-side by
+/// [`ModelService`] when a load completes — [`Loaded`](Self::Loaded) on success,
+/// [`LoadFailed`](Self::LoadFailed) otherwise — so a late `load --wait` (or a
+/// future P9 `/model/<ref>/loaded` file) is served the retained value instead
+/// of missing the live `model.lifecycle` edge it subscribed to too late.
+///
+/// Rides the same plaintext `model` EventService source as the live edge (EV5
+/// /#605; encrypted-default flip deferred to #555), so retaining it host-side
+/// releases no plaintext the live edge would not.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ModelLoadTerminal {
+    /// Load succeeded; `endpoint` is the inference endpoint string.
+    Loaded { endpoint: String },
+    /// Load failed; `error` is the failure message.
+    LoadFailed { error: String },
+}
+
+/// Per-load-attempt key into the model-service [`TerminalStore`] (EV7/#649).
+///
+/// Combines the model ref with a monotonic per-process epoch (see
+/// [`ModelServiceInner::load_epoch`]) so a reload allocates a fresh key and
+/// latches a NEW terminal — monotonic write-once then holds *per epoch*, the
+/// EV7 "reload = new latch, write-once within an attempt" contract. Without
+/// per-epoch keying the first `Loaded` latch would shadow every reload.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ModelLoadKey {
+    /// The model reference string (e.g. "qwen3-small:main").
+    pub model_ref: String,
+    /// Monotonic load-attempt number for this process.
+    pub epoch: u64,
+}
 
 // ============================================================================
 // ModelService (server-side)
@@ -158,6 +196,17 @@ pub struct ModelServiceInner {
     mesh_identity_roster: Option<Arc<Vec<([u8; 32], hyprstream_rpc::Subject)>>>,
     /// Persistent 9P synthetic tree for the fs scope (lazily initialized).
     fs_tree: std::sync::OnceLock<crate::services::fs::SyntheticTree>,
+    /// Retained terminal for each model load attempt (EV7/#649) — the
+    /// host-side "file holds the truth" retain. A late `load --wait` reads the
+    /// retained [`ModelLoadTerminal`] from here instead of missing the live
+    /// `model.lifecycle` edge. Distinct from the live EventService edge (which
+    /// never holds the retained value) and from the `loaded_models` cache
+    /// (which tracks residency, not the per-attempt terminal outcome).
+    load_terminals: TerminalStore<ModelLoadKey, ModelLoadTerminal>,
+    /// Monotonic per-process epoch counter; each genuine load attempt
+    /// allocates the next value, keying a fresh [`TerminalStore`] entry so a
+    /// reload latches under a new key (reload ⇒ new terminal, EV7/#649).
+    load_epoch: AtomicU64,
 }
 
 /// Model service that manages InferenceService lifecycle.
@@ -279,6 +328,8 @@ impl ModelService {
             discovery_client: None,
             mesh_identity_roster: None,
             fs_tree: std::sync::OnceLock::new(),
+            load_terminals: TerminalStore::new(),
+            load_epoch: AtomicU64::new(0),
         })})
     }
 
@@ -347,6 +398,35 @@ impl ModelService {
     /// Resolved via the registry (the local [`hyprstream_rpc::Resolver`] backend):
     /// the `Inproc` arm for a co-located service. The spawner registers it in the
     /// in-process dial registry and the router dials it via `dial()`.
+    /// Allocate the next monotonic load epoch (EV7/#649). Each genuine load
+    /// attempt (one that proceeds past the already-loaded / already-pending
+    /// fast paths) draws a fresh epoch so its terminal latches under a new
+    /// [`ModelLoadKey`] — reload ⇒ new terminal, monotonic write-once per epoch.
+    fn allocate_load_epoch(&self) -> u64 {
+        self.load_epoch.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Latch the retained terminal for a completed load attempt (EV7/#649) —
+    /// the host-side retain a late `load --wait` reads from. Monotonic
+    /// write-once per (`model_ref`, `epoch`): the first terminal for an attempt
+    /// wins; a real attempt always latches under a fresh epoch, so the guard is
+    /// belt-and-suspenders. Split out so the latch decision is unit-testable
+    /// independent of the full load path.
+    fn latch_load_terminal(&self, model_ref: &str, epoch: u64, result: &Result<String>) {
+        let terminal = match result {
+            Ok(endpoint) => Terminal {
+                value: ModelLoadTerminal::Loaded { endpoint: endpoint.clone() },
+                latched_by: "model-service".to_owned(),
+            },
+            Err(e) => Terminal {
+                value: ModelLoadTerminal::LoadFailed { error: e.to_string() },
+                latched_by: "model-service".to_owned(),
+            },
+        };
+        let key = ModelLoadKey { model_ref: model_ref.to_owned(), epoch };
+        let _ = self.load_terminals.latch(key, terminal);
+    }
+
     fn inference_transport(model_ref_str: &str) -> TransportConfig {
         let safe_name = model_ref_str.replace([':', '/', '\\'], "-");
         let service_name = format!("inference-{safe_name}");
@@ -744,10 +824,19 @@ impl ModelService {
             }
         }
 
+        // EV7/#649: this is a genuine new load attempt (past the already-loaded
+        // and already-pending fast paths) — allocate a fresh epoch so its
+        // terminal latches under a new key (reload ⇒ new terminal).
+        let epoch = self.allocate_load_epoch();
+
         let result = self.load_model_inner(model_ref_str, max_context, kv_quant).await;
 
         // Always remove from pending, whether load succeeded or failed
         self.pending_loads.lock().await.remove(model_ref_str);
+
+        // EV7/#649: latch the retained terminal (Loaded / LoadFailed) for this
+        // load attempt — the host-side retain a late `load --wait` reads.
+        self.latch_load_terminal(model_ref_str, epoch, &result);
 
         if result.is_ok() {
             info!("Model {} loaded successfully", model_ref_str);
@@ -1888,6 +1977,94 @@ mod tests {
         assert_eq!(config.max_models, 5);
         assert_eq!(config.max_context, None);
         assert_eq!(config.kv_quant, KVQuantType::None);
+    }
+
+    // ========================================================================
+    // #649 — latched load terminal (EV7 host-side retain)
+    //
+    // `ModelLoadTerminal` + `ModelLoadKey` latch directly into a
+    // `TerminalStore`; these tests prove the per-load-attempt / monotonic-
+    // write-once contract without constructing a full `ModelService` (which
+    // needs a registry + transport). The wiring (`allocate_load_epoch` +
+    // `latch_load_terminal` called from `load_model`) is thin glue over these
+    // primitives.
+    // ========================================================================
+
+    fn loaded_term(endpoint: &str) -> Terminal<ModelLoadTerminal> {
+        Terminal {
+            value: ModelLoadTerminal::Loaded { endpoint: endpoint.to_owned() },
+            latched_by: "model-service".to_owned(),
+        }
+    }
+
+    fn failed_term(err: &str) -> Terminal<ModelLoadTerminal> {
+        Terminal {
+            value: ModelLoadTerminal::LoadFailed { error: err.to_owned() },
+            latched_by: "model-service".to_owned(),
+        }
+    }
+
+    // Read back a latched terminal without `.unwrap()` (clippy denies it here).
+    fn latched_value(
+        store: &TerminalStore<ModelLoadKey, ModelLoadTerminal>,
+        key: &ModelLoadKey,
+    ) -> ModelLoadTerminal {
+        match store.get(key) {
+            Some(t) => t.value,
+            None => panic!("expected a terminal latched for {key:?}"),
+        }
+    }
+
+    /// Monotonic write-once within a single load attempt (single epoch): a
+    /// second latch on the same key is rejected and the first terminal wins.
+    #[test]
+    fn load_terminal_is_monotonic_write_once_per_epoch() {
+        let store: TerminalStore<ModelLoadKey, ModelLoadTerminal> = TerminalStore::new();
+        let key = ModelLoadKey { model_ref: "qwen3:main".to_owned(), epoch: 1 };
+        assert!(store.latch(key.clone(), loaded_term("ep1")));
+        // A late failure for the SAME attempt cannot overwrite the real Loaded.
+        assert!(!store.latch(key.clone(), failed_term("race")));
+        assert_eq!(
+            latched_value(&store, &key),
+            ModelLoadTerminal::Loaded { endpoint: "ep1".to_owned() }
+        );
+    }
+
+    /// Per-load-attempt keying: a reload allocates a fresh epoch and latches a
+    /// NEW terminal — the EV7 "reload = new latch" contract. Without per-epoch
+    /// keying the first Loaded would shadow every subsequent reload.
+    #[test]
+    fn reload_latches_new_terminal_under_new_epoch() {
+        let store: TerminalStore<ModelLoadKey, ModelLoadTerminal> = TerminalStore::new();
+        // First load attempt (epoch 1): Loaded.
+        let k1 = ModelLoadKey { model_ref: "qwen3:main".to_owned(), epoch: 1 };
+        assert!(store.latch(k1.clone(), loaded_term("ep1")));
+        // Reload (epoch 2): a distinct key, so it latches a fresh terminal.
+        let k2 = ModelLoadKey { model_ref: "qwen3:main".to_owned(), epoch: 2 };
+        assert!(store.latch(k2.clone(), loaded_term("ep2")));
+        // Both attempts' terminals are retained (monotonic per-epoch).
+        assert_eq!(
+            latched_value(&store, &k1),
+            ModelLoadTerminal::Loaded { endpoint: "ep1".to_owned() }
+        );
+        assert_eq!(
+            latched_value(&store, &k2),
+            ModelLoadTerminal::Loaded { endpoint: "ep2".to_owned() }
+        );
+    }
+
+    /// A failed attempt latches `LoadFailed` under its epoch; a later
+    /// successful reload (new epoch) latches `Loaded`. The failure is retained,
+    /// not overwritten — each attempt has its own authoritative terminal.
+    #[test]
+    fn failed_then_reload_latches_distinct_terminals() {
+        let store: TerminalStore<ModelLoadKey, ModelLoadTerminal> = TerminalStore::new();
+        let kf = ModelLoadKey { model_ref: "qwen3:main".to_owned(), epoch: 1 };
+        assert!(store.latch(kf.clone(), failed_term("oom")));
+        let ks = ModelLoadKey { model_ref: "qwen3:main".to_owned(), epoch: 2 };
+        assert!(store.latch(ks.clone(), loaded_term("ep2")));
+        assert!(matches!(latched_value(&store, &kf), ModelLoadTerminal::LoadFailed { .. }));
+        assert!(matches!(latched_value(&store, &ks), ModelLoadTerminal::Loaded { .. }));
     }
 
     /// #320: the co-located InferenceService resolves (via the local Resolver
