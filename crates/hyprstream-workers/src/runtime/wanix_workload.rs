@@ -774,9 +774,10 @@ mod tests {
         assert!(!dir.path().join(NINEP_SOCKET_NAME).exists());
     }
 
+    #[cfg(feature = "nspawn")]
     #[tokio::test]
     async fn prepare_succeeds_on_capable_backend() {
-        // nspawn is always registered and capable → injection proceeds.
+        // nspawn is registered (under the `nspawn` feature) and capable → injection proceeds.
         let dir = tempfile::tempdir().unwrap();
         let inj = prepare_wanix_workload(
             "nspawn",

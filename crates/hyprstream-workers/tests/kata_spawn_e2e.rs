@@ -60,7 +60,7 @@
 //!   tenant-VFS-rootfs path is exercised only when a pre-built RAFS image id
 //!   is supplied via `HYPRSTREAM_KATA_RAFS_IMAGE_ID`.
 
-#![cfg(feature = "kata-vm")]
+#![cfg(feature = "kata")]
 // This is an opt-in operator harness: it intentionally prints skip reasons to
 // stdout and asserts with the test-friendly macros. Allow the workspace
 // restriction lints that would otherwise fire on that harness style.
