@@ -18,6 +18,13 @@ Mounters:
   `trans=fd`; the bridge terminates the selected carrier and performs the mount
   with the ticket as `uname=` and the export selector as `aname`.
 
+NodePublishVolume is idempotent (as CSI requires): retries gate on an
+authoritative `/proc/self/mountinfo` check for a live FUSE mount at the target,
+backed by per-volume mount state kept under the plugin's own `--state-dir`
+(default `/var/lib/hyprstream-csi`), never under the mounted target where the
+FUSE mount would shadow it. A retry over an already-live mount returns success
+without starting a second mounter.
+
 The transport is a dial-time carrier. The Phase-1 FUSE client supports raw
 `vsock`, `unix`, and `tcp` dial targets, and requires an operator-provided
 node-local listener/bridge endpoint. `webtransport` / iroh-QUIC is the

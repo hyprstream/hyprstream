@@ -7,7 +7,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -224,52 +223,123 @@ func TestFuseCommandKeepsTicketOutOfArgvAndUsesUnameEnv(t *testing.T) {
 	}
 }
 
-func TestFuseMountProcessAliveHandlesStalePid(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, fusePIDFile), []byte("999999999\n"), 0o600); err != nil {
+func TestMountStateLivesOutsideTargetAndRoundTrips(t *testing.T) {
+	stateDir := t.TempDir()
+	target := t.TempDir()
+	state := fuseMountState{VolumeID: "vol-a", TargetPath: target, PID: os.Getpid()}
+	if err := writeMountState(stateDir, state); err != nil {
 		t.Fatal(err)
 	}
-	alive, err := fuseMountProcessAlive(dir)
+	// State must not land inside the target the FUSE client mounts over.
+	entries, err := os.ReadDir(target)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if alive {
-		t.Fatal("expected stale pid to be treated as not mounted")
+	if len(entries) != 0 {
+		t.Fatalf("state must not be written under target, found %d entries", len(entries))
 	}
-	if _, err := os.Stat(filepath.Join(dir, fusePIDFile)); !os.IsNotExist(err) {
-		t.Fatalf("stale pid file should be removed, stat err=%v", err)
+	got, ok, err := readMountState(stateDir, "vol-a")
+	if err != nil || !ok {
+		t.Fatalf("read state ok=%v err=%v", ok, err)
+	}
+	if got.PID != state.PID || got.TargetPath != target {
+		t.Fatalf("round-trip mismatch: %+v", got)
 	}
 }
 
-func TestFuseMountProcessAliveRecognizesLivePid(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, fusePIDFile), []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+func TestFuseMountLiveRecognizesEstablishingMounter(t *testing.T) {
+	stateDir := t.TempDir()
+	target := t.TempDir()
+	if err := writeMountState(stateDir, fuseMountState{VolumeID: "vol-a", TargetPath: target, PID: os.Getpid()}); err != nil {
 		t.Fatal(err)
 	}
-	alive, err := fuseMountProcessAlive(dir)
+	// Target is not a real mount, but a mounter we started is alive: idempotent.
+	live, err := fuseMountLive(stateDir, "vol-a", target)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !alive {
-		t.Fatal("expected current process pid to be treated as mounted")
+	if !live {
+		t.Fatal("expected alive mounter to be treated as live")
 	}
 }
 
-func TestUnpublishMountRemovesStalePidFile(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, fusePIDFile), []byte("999999999\n"), 0o600); err != nil {
+func TestFuseMountLiveTreatsDeadMounterAsNotLive(t *testing.T) {
+	stateDir := t.TempDir()
+	target := t.TempDir()
+	if err := writeMountState(stateDir, fuseMountState{VolumeID: "vol-a", TargetPath: target, PID: 999999999}); err != nil {
 		t.Fatal(err)
 	}
-	if err := unpublishMount(context.Background(), dir, filepath.Dir(dir)); err != nil {
+	live, err := fuseMountLive(stateDir, "vol-a", target)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, fusePIDFile)); !os.IsNotExist(err) {
-		t.Fatalf("pid file should be removed, stat err=%v", err)
+	if live {
+		t.Fatal("expected dead mounter over unmounted target to be treated as not live")
+	}
+	if _, ok, _ := readMountState(stateDir, "vol-a"); ok {
+		t.Fatal("stale state should be removed")
+	}
+}
+
+// Regression for the CSI idempotency bug (#867): a NodePublishVolume retry
+// while the mounter is still live must NOT start a second FUSE mounter. If it
+// did, executeMountPlan would invoke the (absent) hypr9p-guest binary and fail;
+// returning nil proves the idempotency gate short-circuited before starting.
+func TestExecuteMountPlanFuseIdempotentOnRetry(t *testing.T) {
+	stateDir := t.TempDir()
+	target := t.TempDir()
+	if err := writeMountState(stateDir, fuseMountState{VolumeID: "vol-a", TargetPath: target, PID: os.Getpid()}); err != nil {
+		t.Fatal(err)
+	}
+	plan := mountPlan{Mounter: "fuse", VolumeID: "vol-a", TargetPath: target, StateDir: stateDir}
+	if err := executeMountPlan(context.Background(), plan); err != nil {
+		t.Fatalf("retry must be idempotent, got %v", err)
+	}
+	if _, ok, _ := readMountState(stateDir, "vol-a"); !ok {
+		t.Fatal("mount state should survive an idempotent retry")
+	}
+}
+
+func TestParseMountinfoDetectsFuseMount(t *testing.T) {
+	target := "/var/lib/kubelet/pods/p/volumes/kubernetes.io~csi/v/mount"
+	line := "121 98 0:52 / " + target + " rw,nosuid,nodev,relatime shared:1 - fuse.hypr9p hypr9p rw,user_id=0,group_id=0\n"
+	mounted, err := parseMountinfo(strings.NewReader(line), target)
+	if err != nil || !mounted {
+		t.Fatalf("expected fuse mount detected, mounted=%v err=%v", mounted, err)
+	}
+	if m, _ := parseMountinfo(strings.NewReader(line), "/some/other/path"); m {
+		t.Fatal("non-matching path must not report mounted")
+	}
+	ext := "36 35 0:33 / /mnt/x rw,relatime shared:1 - ext4 /dev/sda1 rw\n"
+	if m, _ := parseMountinfo(strings.NewReader(ext), "/mnt/x"); m {
+		t.Fatal("non-fuse fstype must not count as a fuse mount")
+	}
+	esc := "36 35 0:33 / /mnt/with\\040space rw - fuse.hypr9p hypr9p rw\n"
+	if m, _ := parseMountinfo(strings.NewReader(esc), "/mnt/with space"); !m {
+		t.Fatal("expected octal-escaped mount point to match")
+	}
+}
+
+func TestUnpublishMountRemovesState(t *testing.T) {
+	stateDir := t.TempDir()
+	root := t.TempDir()
+	target := filepath.Join(root, "mount")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeMountState(stateDir, fuseMountState{VolumeID: "vol-a", TargetPath: target, PID: 999999999}); err != nil {
+		t.Fatal(err)
+	}
+	if err := unpublishMount(context.Background(), stateDir, "vol-a", target, root); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := readMountState(stateDir, "vol-a"); ok {
+		t.Fatal("state should be removed after unpublish")
 	}
 }
 
 func TestUnpublishMountRejectsTargetOutsideKubeletRoot(t *testing.T) {
-	if err := unpublishMount(context.Background(), "/etc/passwd", "/var/lib/kubelet"); err == nil {
+	if err := unpublishMount(context.Background(), t.TempDir(), "vol-a", "/etc/passwd", "/var/lib/kubelet"); err == nil {
 		t.Fatal("expected target path outside kubelet root rejection")
 	}
 }

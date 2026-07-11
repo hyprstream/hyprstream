@@ -30,6 +30,7 @@ type config struct {
 	transportEndpoint string
 	bridgeListen      string
 	kubeletRootDir    string
+	stateDir          string
 	logLevel          string
 	dryRun            bool
 }
@@ -54,6 +55,7 @@ func main() {
 	flag.StringVar(&cfg.transportEndpoint, "transport-endpoint", "", "carrier endpoint")
 	flag.StringVar(&cfg.bridgeListen, "bridge-listen", "127.0.0.1:0", "node-local stream bridge listen address")
 	flag.StringVar(&cfg.kubeletRootDir, "kubelet-root-dir", "/var/lib/kubelet", "kubelet root directory containing CSI target paths")
+	flag.StringVar(&cfg.stateDir, "state-dir", "/var/lib/hyprstream-csi", "plugin-owned directory for per-volume mount state (must be outside CSI target paths)")
 	flag.StringVar(&cfg.logLevel, "log-level", "info", "log level")
 	flag.BoolVar(&cfg.dryRun, "dry-run", false, "plan NodePublishVolume without executing mounts")
 	flag.Parse()
@@ -181,7 +183,7 @@ func (d *nodeDriver) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 }
 
 func (d *nodeDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
-	if err := unpublishMount(ctx, req.GetTargetPath(), d.cfg.kubeletRootDir); err != nil {
+	if err := unpublishMount(ctx, d.cfg.stateDir, req.GetVolumeId(), req.GetTargetPath(), d.cfg.kubeletRootDir); err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	return &csi.NodeUnpublishVolumeResponse{}, nil

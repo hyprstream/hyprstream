@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -29,9 +33,19 @@ const (
 	attrEndpoint            = "endpoint"
 	attrTicket              = "ticket"
 	attrServiceTokens       = "csi.storage.k8s.io/serviceAccount.tokens"
-	fusePIDFile             = ".hyprstream-fuse.pid"
 	ticketEnv               = "HYPRSTREAM_9P_UNAME"
+	mountinfoPath           = "/proc/self/mountinfo"
 )
+
+// fuseMountState is per-volume mount bookkeeping stored OUTSIDE the target
+// directory (under the plugin's own state dir), so a NodePublishVolume retry
+// can read it back through the underlying filesystem rather than through the
+// live FUSE mount that shadows the target.
+type fuseMountState struct {
+	VolumeID   string `json:"volume_id"`
+	TargetPath string `json:"target_path"`
+	PID        int    `json:"pid"`
+}
 
 type mountTicketRequest struct {
 	Plane  string `json:"plane"`
@@ -64,6 +78,7 @@ type mountPlan struct {
 	Ticket       string
 	DialTarget   string
 	KernelBridge string
+	StateDir     string
 }
 
 func buildMountPlan(cfg config, req *csi.NodePublishVolumeRequest) (mountPlan, error) {
@@ -114,6 +129,7 @@ func buildMountPlan(cfg config, req *csi.NodePublishVolumeRequest) (mountPlan, e
 		Endpoint:   endpoint,
 		Ticket:     ticket.Ticket,
 		DialTarget: endpoint,
+		StateDir:   cfg.stateDir,
 	}
 	if mounter == "kernel" {
 		plan.KernelBridge = cfg.bridgeListen
@@ -242,27 +258,35 @@ func executeMountPlan(ctx context.Context, plan mountPlan) error {
 	}
 	switch plan.Mounter {
 	case "fuse":
-		mounted, err := fuseMountProcessAlive(plan.TargetPath)
+		// Idempotency (CSI requires NodePublishVolume to be idempotent): the
+		// authoritative check is whether the target is already a live FUSE
+		// mount for this volume, plus whether a mounter we started is still
+		// coming up. Never rely on a pid file under the target — the mount
+		// shadows it, so a retry would read nothing and stack a second mount.
+		live, err := fuseMountLive(plan.StateDir, plan.VolumeID, plan.TargetPath)
 		if err != nil {
 			return err
 		}
-		if mounted {
+		if live {
 			return nil
+		}
+		if err := os.MkdirAll(plan.StateDir, 0o700); err != nil {
+			return fmt.Errorf("create CSI state dir: %w", err)
 		}
 		cmd := fuseCommand(ctx, plan)
 		if err := cmd.Start(); err != nil {
 			return fmt.Errorf("start FUSE 9P mounter: %w", err)
 		}
-		pidPath := filepath.Join(plan.TargetPath, fusePIDFile)
-		if err := os.WriteFile(pidPath, []byte(fmt.Sprintln(cmd.Process.Pid)), 0o600); err != nil {
+		state := fuseMountState{VolumeID: plan.VolumeID, TargetPath: plan.TargetPath, PID: cmd.Process.Pid}
+		if err := writeMountState(plan.StateDir, state); err != nil {
 			_ = cmd.Process.Kill()
 			_ = cmd.Wait()
-			return fmt.Errorf("write FUSE mounter pid: %w", err)
+			return fmt.Errorf("write FUSE mounter state: %w", err)
 		}
 		if err := cmd.Process.Release(); err != nil {
 			_ = cmd.Process.Kill()
 			_ = cmd.Wait()
-			_ = os.Remove(pidPath)
+			_ = removeMountState(plan.StateDir, plan.VolumeID)
 			return fmt.Errorf("release FUSE mounter process: %w", err)
 		}
 		return nil
@@ -298,37 +322,151 @@ func fuseCommand(ctx context.Context, plan mountPlan) *exec.Cmd {
 	return cmd
 }
 
-func fuseMountProcessAlive(targetPath string) (bool, error) {
-	pid, ok, err := readFusePID(targetPath)
+// fuseMountLive reports whether the target already carries a live FUSE mount
+// for this volume, or a mounter we started is still establishing it. It is the
+// idempotency gate for NodePublishVolume retries: an authoritative mountpoint
+// check first (via /proc/self/mountinfo), then the out-of-target state file.
+func fuseMountLive(stateDir, volumeID, targetPath string) (bool, error) {
+	mounted, err := isFuseMountPoint(targetPath)
+	if err != nil {
+		return false, err
+	}
+	if mounted {
+		return true, nil
+	}
+	state, ok, err := readMountState(stateDir, volumeID)
 	if err != nil || !ok {
 		return false, err
 	}
-	if err := syscall.Kill(pid, 0); err == nil {
+	if processAlive(state.PID) {
 		return true, nil
-	} else if errors.Is(err, syscall.ESRCH) {
-		_ = os.Remove(filepath.Join(targetPath, fusePIDFile))
-		return false, nil
-	} else {
-		return false, fmt.Errorf("check FUSE mounter pid %d: %w", pid, err)
 	}
+	// Mounter died before it established the mount: drop the stale record.
+	_ = removeMountState(stateDir, volumeID)
+	return false, nil
 }
 
-func readFusePID(targetPath string) (int, bool, error) {
-	raw, err := os.ReadFile(filepath.Join(targetPath, fusePIDFile))
+func processAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+func mountStatePath(stateDir, volumeID string) string {
+	sum := sha256.Sum256([]byte(volumeID))
+	return filepath.Join(stateDir, hex.EncodeToString(sum[:])+".json")
+}
+
+func writeMountState(stateDir string, state fuseMountState) error {
+	if stateDir == "" {
+		return errors.New("CSI state dir is required")
+	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return fmt.Errorf("create CSI state dir: %w", err)
+	}
+	raw, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(mountStatePath(stateDir, state.VolumeID), raw, 0o600)
+}
+
+func readMountState(stateDir, volumeID string) (fuseMountState, bool, error) {
+	if stateDir == "" || volumeID == "" {
+		return fuseMountState{}, false, nil
+	}
+	raw, err := os.ReadFile(mountStatePath(stateDir, volumeID))
 	if errors.Is(err, os.ErrNotExist) {
-		return 0, false, nil
+		return fuseMountState{}, false, nil
 	}
 	if err != nil {
-		return 0, false, fmt.Errorf("read FUSE mounter pid: %w", err)
+		return fuseMountState{}, false, fmt.Errorf("read FUSE mounter state: %w", err)
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
-	if err != nil || pid <= 0 {
-		return 0, false, fmt.Errorf("invalid FUSE mounter pid %q", strings.TrimSpace(string(raw)))
+	var state fuseMountState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		return fuseMountState{}, false, fmt.Errorf("parse FUSE mounter state: %w", err)
 	}
-	return pid, true, nil
+	return state, true, nil
 }
 
-func unpublishMount(ctx context.Context, targetPath, kubeletRootDir string) error {
+func removeMountState(stateDir, volumeID string) error {
+	if stateDir == "" || volumeID == "" {
+		return nil
+	}
+	if err := os.Remove(mountStatePath(stateDir, volumeID)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// isFuseMountPoint reports whether targetPath is currently a FUSE mount point,
+// read from the kernel's authoritative /proc/self/mountinfo.
+func isFuseMountPoint(targetPath string) (bool, error) {
+	f, err := os.Open(mountinfoPath)
+	if err != nil {
+		return false, fmt.Errorf("open %s: %w", mountinfoPath, err)
+	}
+	defer f.Close()
+	return parseMountinfo(f, targetPath)
+}
+
+// parseMountinfo scans mountinfo lines for a FUSE mount at targetPath.
+// Format: "<id> <parent> <maj:min> <root> <mountpoint> <opts> [tags...] - <fstype> <source> <superopts>".
+func parseMountinfo(r io.Reader, targetPath string) (bool, error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 5 {
+			continue
+		}
+		if unescapeMountField(fields[4]) != targetPath {
+			continue
+		}
+		sep := -1
+		for i := 5; i < len(fields); i++ {
+			if fields[i] == "-" {
+				sep = i
+				break
+			}
+		}
+		if sep < 0 || sep+1 >= len(fields) {
+			continue
+		}
+		fstype := fields[sep+1]
+		if fstype == "fuse" || strings.HasPrefix(fstype, "fuse.") {
+			return true, nil
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return false, fmt.Errorf("read %s: %w", mountinfoPath, err)
+	}
+	return false, nil
+}
+
+// unescapeMountField decodes the octal escapes (\040 space, \011 tab, \012
+// newline, \134 backslash) the kernel emits in mountinfo path fields.
+func unescapeMountField(field string) string {
+	if !strings.Contains(field, `\`) {
+		return field
+	}
+	var b strings.Builder
+	for i := 0; i < len(field); i++ {
+		if field[i] == '\\' && i+3 < len(field) {
+			if v, err := strconv.ParseInt(field[i+1:i+4], 8, 16); err == nil {
+				b.WriteByte(byte(v))
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(field[i])
+	}
+	return b.String()
+}
+
+func unpublishMount(ctx context.Context, stateDir, volumeID, targetPath, kubeletRootDir string) error {
 	if targetPath == "" {
 		return errors.New("target_path is required")
 	}
@@ -336,28 +474,27 @@ func unpublishMount(ctx context.Context, targetPath, kubeletRootDir string) erro
 	if err != nil {
 		return err
 	}
-	pid, ok, err := readFusePID(targetPath)
+	state, ok, err := readMountState(stateDir, volumeID)
 	if err != nil {
 		return err
 	}
-	if ok {
-		_ = syscall.Kill(pid, syscall.SIGTERM)
+	if ok && processAlive(state.PID) {
+		_ = syscall.Kill(state.PID, syscall.SIGTERM)
 	}
 	_ = bestEffortUnmount(ctx, targetPath)
-	if ok {
+	if ok && state.PID > 0 {
 		deadline := time.Now().Add(2 * time.Second)
 		for time.Now().Before(deadline) {
-			if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+			if !processAlive(state.PID) {
 				break
 			}
 			time.Sleep(50 * time.Millisecond)
 		}
-		if err := syscall.Kill(pid, 0); err == nil {
-			_ = syscall.Kill(pid, syscall.SIGKILL)
+		if processAlive(state.PID) {
+			_ = syscall.Kill(state.PID, syscall.SIGKILL)
 		}
 	}
-	_ = os.Remove(filepath.Join(targetPath, fusePIDFile))
-	return nil
+	return removeMountState(stateDir, volumeID)
 }
 
 func bestEffortUnmount(ctx context.Context, targetPath string) error {
