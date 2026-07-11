@@ -283,9 +283,66 @@ impl Workdir {
     }
 }
 
+impl Drop for Workdir {
+    fn drop(&mut self) {
+        if !self.skipped {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // capnp-rust ↔ serde_json canonicalization (the wire oracle)
 // ---------------------------------------------------------------------------
+
+/// Independent Rust copy of `wire_roundtrip_harness.cjs::canonicalRoundtrip()`.
+///
+/// The TS→Rust leg must compare against this oracle, not only TS self-parse vs
+/// Rust parse, otherwise a TS builder/parser pair that agrees on the wrong shape
+/// could pass.
+fn expected_ts_roundtrip_json() -> Value {
+    let big_f32s: Vec<Value> = (0..2048).map(|i| json!((i * 2) as f64)).collect();
+    let big_embeds: Vec<Value> = (0..4)
+        .map(|i| {
+            let inner: Vec<Value> = (0..512)
+                .map(|j| json!(i as f64 * 1000.0 + j as f64 * 0.5))
+                .collect();
+            json!(inner)
+        })
+        .collect();
+
+    json!({
+        "flag": true,
+        "u8": 200,
+        "u16": 60000,
+        "u32": 4_000_000_000u64,
+        "u64": "4294967297",
+        "i8": -5,
+        "i16": -1000,
+        "i32": -70000,
+        "i64": "-9007199254740993",
+        "f32": 3.5,
+        "f64": 2.718281828459045f64,
+        "text": "héllo 🦀 wörld",
+        "data": (0u8..=255).collect::<Vec<_>>(),
+        "bools": [true, false, true, true, false],
+        "u8s": [0, 7, 14, 21, 28, 35],
+        "u16s": [10, 20, 30],
+        "u32s": [1, 100, 10000],
+        "u64s": ["1", "100", "4294967297"],
+        "i8s": [-1, -2, 127],
+        "i16s": [],
+        "i32s": [-70000, 0, 70000],
+        "i64s": ["-9007199254740993", "0", "9007199254740991"],
+        "f32s": [1.5, 2.5, 3.5],
+        "f64s": [1.5, 2.25, 3.125],
+        "texts": ["a", "b🦀c", ""],
+        "datas": [[1, 2, 3], [], [255, 254]],
+        "embeds": [[1.5, 2.5, 3.5], [], [10.0, 20.0]],
+        "bigF32s": big_f32s,
+        "bigEmbeds": big_embeds,
+    })
+}
 
 /// Read a serialized WireRoundtrip and render it in the same canonical JSON
 /// shape the TS harness emits (bigints → decimal strings, `Data` → number[]).
@@ -498,6 +555,23 @@ fn build_rust_choice(arm: &str) -> Vec<u8> {
     bytes
 }
 
+fn expected_choice_json(arm: &str) -> Value {
+    match arm {
+        "none" => json!({"variant": "none"}),
+        "count" => json!({"variant": "count", "data": 42}),
+        "label" => json!({"variant": "label", "data": "rënamed 🦀"}),
+        "values" => json!({"variant": "values", "data": [1.5, 2.5, 3.5, 4.5]}),
+        "ranged" => json!({
+            "variant": "ranged",
+            "data": {
+                "lo": -1.5,
+                "hi": 99.5,
+            }
+        }),
+        other => panic!("unknown arm {other}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -514,12 +588,19 @@ fn ts2rust_roundtrip_full_coverage() {
     let ts_self_parse = wd.run("ts2rust", &[bytes_path.to_str().unwrap()]);
     let bytes = fs::read(&bytes_path).expect("read ts2rust bytes");
     let rust_read = roundtrip_to_json(&bytes);
+    let expected = expected_ts_roundtrip_json();
 
     assert!(
-        values_equal(&ts_self_parse, &rust_read),
+        values_equal(&ts_self_parse, &expected),
+        "TS→Rust mismatch: generated TS self-parse does not match the canonical \
+         payload requested from the builder. \
+         ts_self_parse={ts_self_parse:#} expected={expected:#}"
+    );
+    assert!(
+        values_equal(&rust_read, &expected),
         "TS→Rust mismatch: generated TS builder produced bytes that capnp-rust \
-         and the TS parser disagree on. \
-         ts_self_parse={ts_self_parse:#} rust_read={rust_read:#}"
+         reads differently from the canonical requested payload. \
+         rust_read={rust_read:#} expected={expected:#}"
     );
 
     // The growth cases must actually be present (otherwise the test is silently
@@ -574,9 +655,16 @@ fn choice_roundtrip_both_directions() {
         let t2r = wd.dir.join(format!("choice_ts2rust_{arm}.bin"));
         let ts_self = wd.run("choice-ts2rust", &[t2r.to_str().unwrap(), arm]);
         let rust_read = choice_to_json(&fs::read(&t2r).expect("read ts2rust choice"));
+        let expected = expected_choice_json(arm);
         assert!(
-            values_equal(&ts_self, &rust_read),
-            "TS→Rust WireChoice ({arm}) mismatch: ts_self={ts_self:#} rust_read={rust_read:#}"
+            values_equal(&ts_self, &expected),
+            "TS→Rust WireChoice ({arm}) self-parse did not select the requested \
+             union arm/data: ts_self={ts_self:#} expected={expected:#}"
+        );
+        assert!(
+            values_equal(&rust_read, &expected),
+            "TS→Rust WireChoice ({arm}) bytes did not encode the requested union \
+             arm/data: rust_read={rust_read:#} expected={expected:#}"
         );
 
         // Rust→TS

@@ -33,6 +33,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install system deps (capnproto)
         run: sudo apt-get update && sudo apt-get install -y capnproto pkg-config
