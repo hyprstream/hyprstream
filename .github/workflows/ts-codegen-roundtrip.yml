@@ -1,0 +1,54 @@
+name: ts codegen round-trip
+
+# Executable cross-implementation round-trip for the generated TypeScript RPC
+# client (#807): build representative Cap'n Proto messages with the Rust `capnp`
+# reference impl, decode them with the *generated* `capnp.ts` under node, and
+# vice-versa. The string-assertion tests in `hyprstream-rpc-build` can't see
+# wire-arithmetic bugs (off-by-one pointer offsets, stale-buffer capture after
+# arena growth — #725/#772); this job executes the generated code end-to-end.
+#
+# Node is preinstalled on the runner; `typescript` is installed globally so the
+# `tsc` global is found (the test skips without `HYPRSTREAM_TS_ROUNDTRIP_REQUIRE=1`
+# to keep the merge-gate `cargo nextest run` network-free). Torch-free.
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'crates/hyprstream-rpc-build/**'
+      - '.github/workflows/ts-codegen-roundtrip.yml'
+  pull_request:
+    paths:
+      - 'crates/hyprstream-rpc-build/**'
+      - '.github/workflows/ts-codegen-roundtrip.yml'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ts-roundtrip:
+    name: cargo test wire_roundtrip (rust capnp ⇄ generated capnp.ts)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install system deps (capnproto)
+        run: sudo apt-get update && sudo apt-get install -y capnproto pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
+
+      - name: Install Node + TypeScript
+        run: npm install -g typescript@5
+        # Node itself is preinstalled on ubuntu-latest; `tsc` lands on $PATH.
+
+      # Fail-closed: the test panics if node/tsc are missing rather than skipping,
+      # so a regression in the generated wire code can never pass CI silently.
+      - name: Run the cross-implementation round-trip test
+        run: cargo test -p hyprstream-rpc-build --test wire_roundtrip
+        env:
+          HYPRSTREAM_TS_ROUNDTRIP_REQUIRE: "1"
