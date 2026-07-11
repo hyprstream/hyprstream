@@ -23,21 +23,35 @@ env:
   SCCACHE_BUCKET: ${{ vars.AWS_SCCACHE_BUCKET }}
   SCCACHE_REGION: ${{ vars.AWS_SCCACHE_REGION }}
   CARGO_INCREMENTAL: 0
+  # The compile jobs run inside the arm64 rust-builder container (below), which
+  # bundles libtorch from the aarch64 PyTorch wheel at /opt/libtorch. Link against
+  # that instead of downloading an x86 libtorch (there is no aarch64 zip at
+  # download.pytorch.org). LIBTORCH is also baked into the image; set here for
+  # clarity. OPENSSL_NO_VENDOR uses the image's system OpenSSL.
+  LIBTORCH: /opt/libtorch
+  LD_LIBRARY_PATH: /opt/libtorch/lib
+  LIBTORCH_BYPASS_VERSION_CHECK: "1"
+  OPENSSL_NO_VENDOR: "1"
 
+# The Rust compile jobs run on the self-hosted Graviton (arm64) runners inside the
+# prebuilt rust-builder container (ghcr.io/hyprstream/rust-builder-arm64), which
+# carries rust + capnproto + clang + libtorch. Two wins: (1) same-region as the
+# sccache S3 bucket, so cache transfer is free — GitHub-hosted ubuntu-latest pulled
+# it over the internet (~560GB/mo of S3 DataTransfer-Out); (2) the toolchain lives
+# in the image, so the golden AMI stays toolchain-free. `container:` jobs get node
+# injected by the self-hosted actions/runner, so JS actions (checkout, aws-creds,
+# sccache-action) run normally inside the image.
 jobs:
   clippy:
     name: Clippy
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
+    container:
+      image: ghcr.io/hyprstream/rust-builder-arm64:latest
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install build dependencies
-      run: sudo apt-get update && sudo apt-get install -y capnproto libsystemd-dev pkg-config libssl-dev
-
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@1.97.0
-      with:
-        components: clippy
+    - name: Add clippy component
+      run: rustup component add clippy
 
     - name: Configure AWS credentials (OIDC → sccache S3)
       uses: aws-actions/configure-aws-credentials@v4
@@ -48,8 +62,10 @@ jobs:
     - name: Setup sccache
       uses: mozilla-actions/sccache-action@v0.0.9
 
+    # libtorch from the image (/opt/libtorch); default features — NOT
+    # download-libtorch (x86-only zip). LIBTORCH is set at the workflow env level.
     - name: Run Clippy
-      run: cargo clippy --workspace --all-targets --features download-libtorch -- -D warnings
+      run: cargo clippy --workspace --all-targets -- -D warnings
 
     - name: sccache stats
       if: always()
@@ -67,25 +83,22 @@ jobs:
     - name: Check bans
       # ZMQ crates are deny-listed in deny.toml (#138 complete). This gate must
       # be able to fail — do NOT add `|| true`.
-      # No compilation here, so no sccache/AWS. Unset RUSTC_WRAPPER defensively.
+      # No compilation here (metadata only), arch-independent, and no S3 traffic —
+      # so this one stays on the free GitHub-hosted runner.
       run: |
         unset RUSTC_WRAPPER
         cargo deny check bans licenses
 
   wasm:
     name: WASM (browser client)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
+    container:
+      image: ghcr.io/hyprstream/rust-builder-arm64:latest
     steps:
     - uses: actions/checkout@v4
 
-    # capnproto only — the wasm browser client (hyprstream-rpc) has no libtorch/systemd deps.
-    - name: Install build dependencies
-      run: sudo apt-get update && sudo apt-get install -y capnproto pkg-config
-
-    - name: Install Rust toolchain (wasm32)
-      uses: dtolnay/rust-toolchain@1.97.0
-      with:
-        targets: wasm32-unknown-unknown
+    - name: Add wasm32 target
+      run: rustup target add wasm32-unknown-unknown
 
     - name: Configure AWS credentials (OIDC → sccache S3)
       uses: aws-actions/configure-aws-credentials@v4
@@ -116,22 +129,18 @@ jobs:
     # merge queue. (Per-PR AppImage artifacts were dropped with the PR build; the
     # `appimage.yml` workflow still builds the AppImage on push to `main`.)
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
+    container:
+      image: ghcr.io/hyprstream/rust-builder-arm64:latest
     needs: clippy  # Only build if clippy passes
     # Merge-gate backstop: fail before the merge queue's 120min timeout (ruleset
     # check_response_timeout_minutes) so a hang yields a definitive failure and the
-    # queue keeps moving instead of timing out and kicking every queued PR. The
-    # nextest step uses the ci-test Cargo profile to avoid release ThinLTO on test
-    # binaries, so 90min should retain headroom while catching regressions.
-    timeout-minutes: 90
-    env:
-      SCCACHE_IDLE_TIMEOUT: 0
+    # queue keeps moving instead of timing out and kicking every queued PR. Healthy
+    # build+test is ~90min (Build ~13m / Run tests ~76min), so 115 leaves margin.
+    timeout-minutes: 115
 
     steps:
     - uses: actions/checkout@v4
-
-    - name: Install build dependencies
-      run: sudo apt-get update && sudo apt-get install -y capnproto libsystemd-dev pkg-config libssl-dev
 
     - name: Configure AWS credentials (OIDC → sccache S3)
       uses: aws-actions/configure-aws-credentials@v4
@@ -142,31 +151,10 @@ jobs:
     - name: Setup sccache
       uses: mozilla-actions/sccache-action@v0.0.9
 
+    # libtorch from the image (/opt/libtorch); default features (systemd, otel,
+    # kata-vm, oci-image, gittorrent, xet) — NOT download-libtorch (x86-only zip).
     - name: Build
-      run: cargo build --release --verbose --features download-libtorch
-
-    - name: Build wasm guest artifacts (for sandbox/mount tests)
-      # The workers-python / workers-wasmtime sandbox tests hard-fail under CI
-      # (deny-on-missing-guest guard) when their wasm guest artifacts are absent —
-      # the guard forces CI to actually exercise the sandbox. These guests are
-      # EXCLUDED standalone crates with their own target dirs, so build them
-      # explicitly; nextest locates them via HYPRSTREAM_*_WASM on the test step.
-      #
-      # IMPORTANT: `cd` into each guest crate dir before building. Cargo discovers
-      # .cargo/config.toml from the INVOCATION cwd, NOT the --manifest-path dir, so
-      # building from the repo root misses crates/hyprstream-workers-python-guest/
-      # .cargo/config.toml — which sets `--cfg getrandom_backend="custom"` for the
-      # wasm32-unknown-unknown target. Without it getrandom emits a hard
-      # compile_error!("...wasm32-unknown-unknown targets are not supported...").
-      # cd-ing in is the only invocation that honors the per-crate config (the
-      # fsguest has no such config today, but the same pattern is correct for both
-      # and is robust to a future config being added). See #1013 follow-up.
-      run: |
-        rustup target add wasm32-unknown-unknown wasm32-wasip1
-        ( cd crates/hyprstream-workers-python-guest && \
-          cargo build --release --target wasm32-unknown-unknown )
-        ( cd crates/hyprstream-workers-wasmtime-fsguest && \
-          cargo build --release --target wasm32-wasip1 )
+      run: cargo build --release --verbose
 
     - name: Install cargo-nextest
       uses: taiki-e/install-action@nextest
@@ -174,17 +162,14 @@ jobs:
     - name: Run tests (nextest, per-test timeout)
       # nextest enforces the per-TEST slow-timeout from .config/nextest.toml
       # ([profile.ci]): a single deadlocked test is SIGKILLed after ~3min and fails
-      # fast, instead of stalling the job until the 90min job / 120min queue
+      # fast, instead of stalling the job until the 115min job / 120min queue
       # timeout. The cap is per-test on purpose — the legit suite is long (~76min),
       # so a per-step timeout could not tell a hang from healthy runtime.
-      env:
-        HYPRSTREAM_PYGUEST_WASM: ${{ github.workspace }}/crates/hyprstream-workers-python-guest/target/wasm32-unknown-unknown/release/hyprstream_workers_python_guest.wasm
-        HYPRSTREAM_FSGUEST_WASM: ${{ github.workspace }}/crates/hyprstream-workers-wasmtime-fsguest/target/wasm32-wasip1/release/hyprstream-workers-wasmtime-fsguest.wasm
-      run: cargo nextest run --cargo-profile ci-test --profile ci --features download-libtorch
+      run: cargo nextest run --release --profile ci
 
     - name: Run doctests
       # nextest does not run doctests; keep them in the merge gate.
-      run: cargo test --release --doc --features download-libtorch
+      run: cargo test --release --doc
 
     - name: sccache stats
       if: always()
