@@ -1189,7 +1189,9 @@ impl<S: WatermarkStore, A: DuplicityAlarmSink> DuplicityGuard<S, A> {
 /// `record_digest`. Exposed so callers reconstructing a watermark from a
 /// persisted record (e.g. on restart) key it the same way the guard does.
 pub fn record_digest(record: &UpdateRecord) -> [u8; H512_LEN] {
-    h512(&record.to_dag_cbor())
+    // Input is a validated record (decoded or signed); use the unchecked
+    // serializer to keep this infallible — `to_dag_cbor` would re-validate.
+    h512(&record.encode_value())
 }
 
 #[cfg(test)]

@@ -293,7 +293,7 @@ mod tests {
         let s = signer(tag);
         let body = body_for(&s, tag);
         let capsule = sign_capsule(body, &s.ed_sk, &s.pq_sk).unwrap();
-        let bytes = capsule.to_dag_cbor();
+        let bytes = capsule.to_dag_cbor().unwrap();
         let cid = capsule.cid512().unwrap();
         (capsule, bytes, cid)
     }
@@ -391,7 +391,7 @@ mod tests {
         // Corrupt the ed25519 signature but keep it schema-valid (same length).
         let mut broken = capsule.clone();
         broken.signatures.ed25519_signature = vec![0u8; ED25519_SIGNATURE_LEN];
-        let bytes = broken.to_dag_cbor();
+        let bytes = broken.to_dag_cbor().unwrap();
         // The tampered capsule is still canonical & schema-valid.
         let reparsed = Capsule::from_dag_cbor(&bytes).expect("still canonical");
         let cid = reparsed.cid512().unwrap();

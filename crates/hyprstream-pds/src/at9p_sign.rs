@@ -201,7 +201,7 @@ pub fn sign_capsule(
         "signing ML-DSA-65 key does not match the capsule primary subject key"
     );
 
-    let payload = body.to_dag_cbor();
+    let payload = body.to_dag_cbor()?;
     let signatures = sign_record(&payload, CAPSULE_SIGNATURE_CONTEXT, ed_sk, pq_sk)?;
     Capsule::new(body, signatures)
 }
@@ -216,8 +216,9 @@ pub fn verify_capsule(capsule: &Capsule) -> Result<()> {
         .first()
         .ok_or_else(|| anyhow::anyhow!("capsule has no subject keys"))?;
     let (ed_vk, pq_vk) = verifying_keys(primary)?;
+    let payload = capsule.body.to_dag_cbor()?;
     verify_record(
-        &capsule.body.to_dag_cbor(),
+        &payload,
         &capsule.signatures,
         CAPSULE_SIGNATURE_CONTEXT,
         &ed_vk,
@@ -259,10 +260,10 @@ pub fn sign_update_record(
         expires_at,
         signatures: placeholder,
     };
-    let payload = record.signable_bytes();
+    let payload = record.signable_bytes()?;
     record.signatures = sign_record(&payload, UPDATE_SIGNATURE_CONTEXT, ed_sk, pq_sk)?;
     // Round-trip through the canonical codec to enforce every schema gate.
-    UpdateRecord::from_dag_cbor(&record.to_dag_cbor())
+    UpdateRecord::from_dag_cbor(&record.to_dag_cbor()?)
 }
 
 /// Verify an [`UpdateRecord`] under PINNED Hybrid policy against the authorizing
@@ -270,8 +271,9 @@ pub fn sign_update_record(
 /// key is authorized; this function enforces the crypto + context binding.
 pub fn verify_update_record(record: &UpdateRecord, signer: &HybridKeyPair) -> Result<()> {
     let (ed_vk, pq_vk) = verifying_keys(signer)?;
+    let payload = record.signable_bytes()?;
     verify_record(
-        &record.signable_bytes(),
+        &payload,
         &record.signatures,
         UPDATE_SIGNATURE_CONTEXT,
         &ed_vk,
@@ -330,7 +332,7 @@ mod tests {
             body.clone(),
             // any valid-shaped signature just to derive a cid for the field
             sign_record(
-                &body.to_dag_cbor(),
+                &body.to_dag_cbor().unwrap(),
                 CAPSULE_SIGNATURE_CONTEXT,
                 &s.ed_sk,
                 &s.pq_sk,
@@ -357,7 +359,7 @@ mod tests {
         let (_s, capsule) = signed_capsule();
         verify_capsule(&capsule).expect("capsule must verify");
         // Survives a canonical encode/decode round-trip.
-        let bytes = capsule.to_dag_cbor();
+        let bytes = capsule.to_dag_cbor().unwrap();
         let decoded = Capsule::from_dag_cbor(&bytes).unwrap();
         verify_capsule(&decoded).expect("decoded capsule must verify");
     }
@@ -367,7 +369,7 @@ mod tests {
         let s = signer();
         let record = signed_update(&s);
         verify_update_record(&record, &s.keypair).expect("update must verify");
-        let bytes = record.to_dag_cbor();
+        let bytes = record.to_dag_cbor().unwrap();
         let decoded = UpdateRecord::from_dag_cbor(&bytes).unwrap();
         verify_update_record(&decoded, &s.keypair).expect("decoded update must verify");
     }
@@ -386,18 +388,21 @@ mod tests {
         forged.protected = context_protected_header(UPDATE_SIGNATURE_CONTEXT);
         let (ed_vk, pq_vk) = verifying_keys(&s.keypair).unwrap();
         let res = verify_record(
-            &capsule.body.to_dag_cbor(),
+            &capsule.body.to_dag_cbor().unwrap(),
             &forged,
             UPDATE_SIGNATURE_CONTEXT,
             &ed_vk,
             &pq_vk,
         );
-        assert!(res.is_err(), "cross-context signature reuse must be rejected");
+        assert!(
+            res.is_err(),
+            "cross-context signature reuse must be rejected"
+        );
 
         // And verifying the genuine capsule signature while EXPECTING the update
         // context is rejected too.
         let res2 = verify_record(
-            &capsule.body.to_dag_cbor(),
+            &capsule.body.to_dag_cbor().unwrap(),
             &capsule.signatures,
             UPDATE_SIGNATURE_CONTEXT,
             &ed_vk,
@@ -414,7 +419,7 @@ mod tests {
     fn classical_only_signature_rejected_under_classical_policy() {
         let s = signer();
         let body = capsule_body(s.keypair.clone());
-        let payload = body.to_dag_cbor();
+        let payload = body.to_dag_cbor().unwrap();
         let protected = context_protected_header(CAPSULE_SIGNATURE_CONTEXT);
 
         // Directly emit a CLASSICAL-only composite (pq_sk = None) — the exact
@@ -449,7 +454,7 @@ mod tests {
     fn tampered_payload_rejected() {
         let (s, capsule) = signed_capsule();
         let (ed_vk, pq_vk) = verifying_keys(&s.keypair).unwrap();
-        let mut tampered = capsule.body.to_dag_cbor();
+        let mut tampered = capsule.body.to_dag_cbor().unwrap();
         // Flip a byte in the payload.
         let last = tampered.len() - 1;
         tampered[last] ^= 0x01;

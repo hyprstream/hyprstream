@@ -242,7 +242,7 @@ mod tests {
         let s = signer(tag);
         let body = body_with_services(&s, tag);
         let capsule = sign_capsule(body, &s.ed_sk, &s.pq_sk).unwrap();
-        let bytes = capsule.to_dag_cbor();
+        let bytes = capsule.to_dag_cbor().unwrap();
         let cid = capsule.cid512().unwrap();
         let did = format!("{DID_AT9P_PREFIX}{cid}");
         (capsule, bytes, cid, did)

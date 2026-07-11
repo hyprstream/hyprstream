@@ -135,7 +135,7 @@ mod tests {
             body.also_known_as = Some(aliases);
         }
         let capsule = sign_capsule(body, &s.ed_sk, &s.pq_sk).unwrap();
-        let bytes = capsule.to_dag_cbor();
+        let bytes = capsule.to_dag_cbor().unwrap();
         let did = format!("did:at9p:{}", capsule.cid512().unwrap());
         (bytes, did)
     }
