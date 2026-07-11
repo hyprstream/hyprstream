@@ -300,6 +300,10 @@ impl Drop for Workdir {
 /// The TS→Rust leg must compare against this oracle, not only TS self-parse vs
 /// Rust parse, otherwise a TS builder/parser pair that agrees on the wrong shape
 /// could pass.
+// The f64 fixture below intentionally uses the decimal expansion of e as a
+// non-trivial full-precision value; it is a cross-runtime golden, so keep the
+// literal byte-identical rather than swapping in std::f64::consts::E.
+#[allow(clippy::approx_constant)]
 fn expected_ts_roundtrip_json() -> Value {
     let big_f32s: Vec<Value> = (0..2048).map(|i| json!((i * 2) as f64)).collect();
     let big_embeds: Vec<Value> = (0..4)
