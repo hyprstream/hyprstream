@@ -320,6 +320,15 @@ func TestParseMountinfoDetectsFuseMount(t *testing.T) {
 	}
 }
 
+func TestWaitFuseMountReadyFailsWhenMounterDies(t *testing.T) {
+	// Target is not a live mount and the mounter pid is dead: NodePublish must
+	// surface an error rather than reporting success before the mount is usable.
+	err := waitFuseMountReady(context.Background(), t.TempDir(), 999999999)
+	if err == nil {
+		t.Fatal("expected error when mounter exits before establishing the mount")
+	}
+}
+
 func TestUnpublishMountRemovesState(t *testing.T) {
 	stateDir := t.TempDir()
 	root := t.TempDir()

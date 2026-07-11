@@ -35,6 +35,8 @@ const (
 	attrServiceTokens       = "csi.storage.k8s.io/serviceAccount.tokens"
 	ticketEnv               = "HYPRSTREAM_9P_UNAME"
 	mountinfoPath           = "/proc/self/mountinfo"
+	mountReadyTimeout       = 30 * time.Second
+	mountPollInterval       = 100 * time.Millisecond
 )
 
 // fuseMountState is per-volume mount bookkeeping stored OUTSIDE the target
@@ -289,6 +291,17 @@ func executeMountPlan(ctx context.Context, plan mountPlan) error {
 			_ = removeMountState(plan.StateDir, plan.VolumeID)
 			return fmt.Errorf("release FUSE mounter process: %w", err)
 		}
+		// Do not report NodePublish success until the target is an authoritative
+		// live FUSE mount: the mounter can fail its 9P attach or FUSE mount after
+		// Start(), and a pod must never start before its volume is usable. On
+		// failure tear the mounter down so a retry starts clean.
+		if err := waitFuseMountReady(ctx, plan.TargetPath, cmd.Process.Pid); err != nil {
+			if processAlive(cmd.Process.Pid) {
+				_ = syscall.Kill(cmd.Process.Pid, syscall.SIGTERM)
+			}
+			_ = removeMountState(plan.StateDir, plan.VolumeID)
+			return err
+		}
 		return nil
 	case "kernel":
 		cmd := exec.CommandContext(ctx, "hyprstream-csi-bridge",
@@ -401,6 +414,32 @@ func removeMountState(stateDir, volumeID string) error {
 	return nil
 }
 
+// waitFuseMountReady blocks until targetPath is an authoritative live FUSE mount,
+// the mounter (pid) exits first, the deadline elapses, or ctx is cancelled.
+func waitFuseMountReady(ctx context.Context, targetPath string, pid int) error {
+	deadline := time.Now().Add(mountReadyTimeout)
+	for {
+		mounted, err := isFuseMountPoint(targetPath)
+		if err != nil {
+			return err
+		}
+		if mounted {
+			return nil
+		}
+		if !processAlive(pid) {
+			return fmt.Errorf("FUSE 9P mounter exited before establishing mount at %s", targetPath)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("FUSE 9P mount at %s not ready within %s", targetPath, mountReadyTimeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(mountPollInterval):
+		}
+	}
+}
+
 // isFuseMountPoint reports whether targetPath is currently a FUSE mount point,
 // read from the kernel's authoritative /proc/self/mountinfo.
 func isFuseMountPoint(targetPath string) (bool, error) {
@@ -455,7 +494,9 @@ func unescapeMountField(field string) string {
 	var b strings.Builder
 	for i := 0; i < len(field); i++ {
 		if field[i] == '\\' && i+3 < len(field) {
-			if v, err := strconv.ParseInt(field[i+1:i+4], 8, 16); err == nil {
+			// ParseUint with bitSize 8 rejects any octal escape > 0377,
+			// so the byte(v) conversion below can never truncate.
+			if v, err := strconv.ParseUint(field[i+1:i+4], 8, 8); err == nil {
 				b.WriteByte(byte(v))
 				i += 3
 				continue
@@ -481,7 +522,7 @@ func unpublishMount(ctx context.Context, stateDir, volumeID, targetPath, kubelet
 	if ok && processAlive(state.PID) {
 		_ = syscall.Kill(state.PID, syscall.SIGTERM)
 	}
-	_ = bestEffortUnmount(ctx, targetPath)
+	unmountErr := unmountTarget(ctx, targetPath)
 	if ok && state.PID > 0 {
 		deadline := time.Now().Add(2 * time.Second)
 		for time.Now().Before(deadline) {
@@ -494,10 +535,26 @@ func unpublishMount(ctx context.Context, stateDir, volumeID, targetPath, kubelet
 			_ = syscall.Kill(state.PID, syscall.SIGKILL)
 		}
 	}
+	// Do not report NodeUnpublish success while the target is still mounted:
+	// verify the mount is gone (the authoritative check), surfacing the unmount
+	// error only when the target genuinely remains mounted.
+	mounted, mErr := isFuseMountPoint(targetPath)
+	if mErr != nil {
+		return mErr
+	}
+	if mounted {
+		if unmountErr != nil {
+			return fmt.Errorf("unmount %s: %w", targetPath, unmountErr)
+		}
+		return fmt.Errorf("target %s still mounted after unmount", targetPath)
+	}
 	return removeMountState(stateDir, volumeID)
 }
 
-func bestEffortUnmount(ctx context.Context, targetPath string) error {
+// unmountTarget tries each available unmount helper and returns the last error
+// if none succeed. It is a no-op (nil) when the target is already unmounted.
+func unmountTarget(ctx context.Context, targetPath string) error {
+	var lastErr error
 	for _, argv := range [][]string{
 		{"fusermount3", "-u", targetPath},
 		{"fusermount", "-u", targetPath},
@@ -505,7 +562,9 @@ func bestEffortUnmount(ctx context.Context, targetPath string) error {
 	} {
 		if err := exec.CommandContext(ctx, argv[0], argv[1:]...).Run(); err == nil {
 			return nil
+		} else {
+			lastErr = err
 		}
 	}
-	return nil
+	return lastErr
 }

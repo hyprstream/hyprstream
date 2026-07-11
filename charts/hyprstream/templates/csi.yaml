@@ -23,39 +23,11 @@ metadata:
   name: {{ $name }}
   labels:
     {{- include "hyprstream.labels" . | nindent 4 }}
-automountServiceAccountToken: true
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: {{ $name }}
-  labels:
-    {{- include "hyprstream.labels" . | nindent 4 }}
-rules:
-  - apiGroups: [""]
-    resources: ["pods", "nodes"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["storage.k8s.io"]
-    resources: ["csinodes"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: [""]
-    resources: ["events"]
-    verbs: ["create", "patch", "update"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: {{ $name }}
-  labels:
-    {{- include "hyprstream.labels" . | nindent 4 }}
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: {{ $name }}
-subjects:
-  - kind: ServiceAccount
-    name: {{ $name }}
-    namespace: {{ .Release.Namespace }}
+# No pod-mounted token or cluster RBAC: the node plugin talks to no Kubernetes
+# API. It obtains a per-call bearer for /oauth/mount-ticket via CSI tokenRequests
+# (podInfoOnMount), and node-driver-registrar uses the kubelet plugin socket, not
+# the API server. Least privilege: keep the SA identity, drop the standing token.
+automountServiceAccountToken: false
 ---
 apiVersion: apps/v1
 kind: DaemonSet
