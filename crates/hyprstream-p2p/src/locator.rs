@@ -488,10 +488,18 @@ impl MainlineLocator {
         // The canonical scan is unconditional — a hint can never suppress it.
         let mut found = self.providers_at(cid, key).await?;
 
-        // Additional rendezvous buckets from hints: scanned, not trusted.
+        // Additional rendezvous buckets from hints: scanned, not trusted, and
+        // strictly best-effort. A hint bucket lookup that errors must never
+        // discard the canonical results already in `found` — propagating `?`
+        // here would let an untrusted hint source induce a failure that
+        // suppresses the whole canonical scan (an A14 availability downgrade
+        // dressed as an error), contradicting R7. Errors are dropped; canonical
+        // and every other hint result survive.
         // `LookupHints` already bounded this to MAX_HINTED_RENDEZVOUS.
         for extra in hints.extra_rendezvous() {
-            found.extend(self.providers_at(cid, *extra).await?);
+            if let Ok(peers) = self.providers_at(cid, *extra).await {
+                found.extend(peers);
+            }
         }
 
         // Out-of-band peer contacts: unioned in verbatim, still untrusted.
@@ -935,6 +943,75 @@ mod tests {
             found
                 .iter()
                 .any(|p| p.socket_addr() == SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4242))
+        );
+    }
+
+    /// BEP5 fake that succeeds for the canonical bucket but returns `Err` for a
+    /// designated (attacker-chosen) infohash. Models an untrusted hint source
+    /// whose bucket lookup fails at the network layer.
+    #[derive(Clone)]
+    struct FailingBucketBep5 {
+        table: Arc<Mutex<HashMap<[u8; 20], Vec<SocketAddrV4>>>>,
+        fail_on: [u8; 20],
+    }
+
+    #[async_trait]
+    impl Bep5Client for FailingBucketBep5 {
+        async fn announce(&self, info_hash: [u8; 20], port: Option<u16>) -> Result<()> {
+            let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port.unwrap_or(6881));
+            self.table.lock().entry(info_hash).or_default().push(addr);
+            Ok(())
+        }
+
+        async fn get_peers(&self, info_hash: [u8; 20]) -> Result<Vec<SocketAddrV4>> {
+            if info_hash == self.fail_on {
+                return Err(Error::Dht("simulated hinted-bucket failure".into()));
+            }
+            Ok(self
+                .table
+                .lock()
+                .get(&info_hash)
+                .cloned()
+                .unwrap_or_default())
+        }
+    }
+
+    /// R7 regression: a hinted-bucket lookup that *errors* must not discard the
+    /// canonical scan results. Best-effort hint scans; the canonical providers
+    /// survive an untrusted hint that induces a failure (A14 downgrade excluded).
+    #[tokio::test]
+    async fn r7_failing_hint_bucket_does_not_discard_canonical() {
+        let id = cid(0x99);
+        let canonical = RendezvousKey::DEFAULT;
+        let bad = RendezvousKey::new(3, 1);
+
+        // Seed the canonical bucket with a real provider first (via a plain mock
+        // announce path), then reuse its table under the failing wrapper.
+        let table: Arc<Mutex<HashMap<[u8; 20], Vec<SocketAddrV4>>>> = Arc::default();
+        table.lock().insert(
+            rendezvous_infohash(&id, canonical),
+            vec![SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4242)],
+        );
+
+        let mock = FailingBucketBep5 {
+            table,
+            fail_on: rendezvous_infohash(&id, bad),
+        };
+        let locator = MainlineLocator::with_client(Box::new(mock));
+
+        let mut hints = LookupHints::new();
+        hints.add_rendezvous(bad);
+
+        let found = locator
+            .providers_with_hints(&id, canonical, &hints)
+            .await
+            .expect("a failing hint bucket must not make the whole lookup error");
+
+        assert!(
+            found
+                .iter()
+                .any(|p| p.socket_addr() == SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4242)),
+            "R7: canonical scan result must survive a failing hinted-bucket lookup"
         );
     }
 }

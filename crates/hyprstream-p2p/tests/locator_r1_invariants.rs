@@ -173,11 +173,16 @@ fn walk_items(items: &[Item], v: &mut Violations) {
             // Public struct/enum fields must be approved types — catches a
             // `pub struct NameQuery { pub name: String }` at the definition.
             Item::Struct(s) if is_pub(&s.vis) => {
-                check_fields(&s.fields, &s.ident, v);
+                // Struct fields carry their own visibility; only `pub` ones cross.
+                check_fields(&s.fields, &s.ident, false, v);
             }
             Item::Enum(e) if is_pub(&e.vis) => {
+                // Variant fields of a public enum are public regardless of their
+                // syntactic visibility (it is always inherited/empty), so force
+                // the check — otherwise `pub enum E { Name(String) }` slips
+                // through because the tuple field reads as non-`pub`.
                 for variant in &e.variants {
-                    check_fields(&variant.fields, &e.ident, v);
+                    check_fields(&variant.fields, &e.ident, true, v);
                 }
             }
             // `type X = String;` — an unapproved alias used as a pub fn param
@@ -270,9 +275,9 @@ fn check_sig(sig: &syn::Signature, kind: &str, name: &syn::Ident, v: &mut Violat
     }
 }
 
-fn check_fields(fields: &syn::Fields, owner: &syn::Ident, v: &mut Violations) {
+fn check_fields(fields: &syn::Fields, owner: &syn::Ident, force_public: bool, v: &mut Violations) {
     for f in fields {
-        if is_pub(&f.vis) && !type_is_approved(&f.ty) {
+        if (force_public || is_pub(&f.vis)) && !type_is_approved(&f.ty) {
             v.unapproved.push(format!(
                 "  public field on `{owner}` has un-vetted type {} (re-opens A5)",
                 f.ty.to_token_stream()
@@ -320,7 +325,9 @@ fn type_is_approved(ty: &Type) -> bool {
         Type::Ptr(p) => type_is_approved(&p.elem),
         // Unit `()` is approved; a tuple is approved iff every element is.
         Type::Tuple(t) => t.elems.is_empty() || t.elems.iter().all(type_is_approved),
-        Type::Path(tp) => path_is_approved(&tp.path),
+        // A qualified path (`<Evil as Trait>::Cid512`) is never approved: its
+        // resolved type is not one of the local vetted newtypes.
+        Type::Path(tp) => tp.qself.is_none() && path_is_approved(&tp.path),
         // ImplTrait, TraitObject, Infer, Macro, Never, Verbatim, bare type
         // params-as-types → not approved (rejected by default).
         _ => false,
@@ -328,6 +335,12 @@ fn type_is_approved(ty: &Type) -> bool {
 }
 
 fn path_is_approved(p: &Path) -> bool {
+    // Only a bare, single-segment path can name a local vetted type. A leading
+    // `::` or any qualifier (`evil::Cid512`) means the type is *not* the local
+    // newtype the allowlist vets — reject it so the closed-world guarantee holds.
+    if p.leading_colon.is_some() || p.segments.len() != 1 {
+        return false;
+    }
     let Some(last) = p.segments.last() else {
         return false;
     };
@@ -444,6 +457,12 @@ fn allowlist_approves_only_vetted_types() {
         "S", // a bare generic type param
         "Option<String>",
         "Box<NameQuery>",
+        // qualified / associated paths: a foreign `Cid512` (or a `<_ as _>`
+        // projection) is NOT the local vetted newtype and must be rejected.
+        "evil::Cid512",
+        "::Cid512",
+        "evil::Option<PeerContact>",
+        "<Evil as Trait>::Cid512",
     ]
     .into_iter()
     .collect();
@@ -521,6 +540,40 @@ fn walk_flags_public_string_struct_field() {
     assert!(
         v.unapproved.iter().all(|m| !m.contains("Clean")),
         "{:?}",
+        v.unapproved
+    );
+}
+
+// A public enum with a string-carrying variant field is caught. Variant fields
+// have inherited (non-`pub`) visibility yet are public in a public enum, so the
+// walk must force the field check — otherwise `pub enum E { Name(String) }`
+// silently bypasses R1.
+#[test]
+fn walk_flags_public_enum_variant_string_field() {
+    fn parse_items(src: &str) -> Vec<Item> {
+        syn::parse_file(src).expect("valid module").items
+    }
+
+    let mut v = Violations::default();
+    walk_items(
+        &parse_items(
+            "pub enum E { Name(String), Named { name: String }, Clean(u32) }\n\
+             pub enum Ok2 { A(Cid512), B(RendezvousKey) }",
+        ),
+        &mut v,
+    );
+    assert!(
+        v.unapproved
+            .iter()
+            .filter(|m| m.contains("String"))
+            .count()
+            >= 2,
+        "both tuple and struct-style enum variant String fields must be flagged: {:?}",
+        v.unapproved
+    );
+    assert!(
+        v.unapproved.iter().all(|m| !m.contains("u32")),
+        "approved variant fields must not be flagged: {:?}",
         v.unapproved
     );
 }
