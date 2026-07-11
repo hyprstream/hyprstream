@@ -962,9 +962,12 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let mut worker_service = WorkerService::new(
         pool_config,
         backend,
-        #[cfg(feature = "kata-vm")]
+        // `kata-vm = ["kata"]` is one-way: a `--features kata` build must still
+        // wire rafs_store, so gate on either the canonical feature or its alias
+        // rather than `kata-vm` alone (#518).
+        #[cfg(any(feature = "kata", feature = "kata-vm"))]
         Some(rafs_store),
-        #[cfg(not(feature = "kata-vm"))]
+        #[cfg(not(any(feature = "kata", feature = "kata-vm")))]
         None,
         ctx.transport("worker", SocketKind::Rep),
         sk.clone(),

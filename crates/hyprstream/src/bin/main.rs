@@ -1137,9 +1137,13 @@ fn handle_quick_command(
                         let mut worker_service = WorkerService::new(
                             pool_config,
                             backend,
-                            #[cfg(feature = "kata-vm")]
+                            // Wire rafs_store for the canonical `kata` feature as
+                            // well as its `kata-vm` compat alias — `kata-vm = ["kata"]`
+                            // is one-way, so a `--features kata` build must not fall
+                            // through to the `None` arm (#518).
+                            #[cfg(any(feature = "kata", feature = "kata-vm"))]
                             Some(rafs_store),
-                            #[cfg(not(feature = "kata-vm"))]
+                            #[cfg(not(any(feature = "kata", feature = "kata-vm")))]
                             None,
                             worker_transport,
                             signing_key.clone(),
