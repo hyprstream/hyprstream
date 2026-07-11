@@ -5,6 +5,9 @@ name: Graviton Build Validation
 # the required merge-gate `build` job over to arm64. workflow_dispatch only.
 on:
   workflow_dispatch:
+  push:
+    branches: [ewindisch/runner-smoke-test]
+    paths: ['.github/workflows/graviton-build-validate.yml']
 
 permissions:
   id-token: write   # OIDC → sccache S3 role
