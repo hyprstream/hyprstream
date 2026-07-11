@@ -478,7 +478,7 @@ impl CapsuleBody {
                 !aliases.is_empty(),
                 "alsoKnownAs must not be empty when present"
             );
-            validate_did_list(aliases, "alsoKnownAs")?;
+            validate_classical_did_list(aliases, "alsoKnownAs")?;
         }
         if let Some(delegations) = &self.delegations {
             ensure!(
@@ -1079,21 +1079,17 @@ fn validate_unique_texts(values: &[String], field: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate a list of DID identifiers: each entry must be non-empty, whitespace-
-/// free, `did:`-prefixed, and the list duplicate-free. Used for the capsule's
-/// `alsoKnownAs` aliases (#896 / D4) — a non-DID or duplicate alias is rejected
-/// at the schema gate, never silently normalized.
-fn validate_did_list(values: &[String], field: &str) -> Result<()> {
-    let mut seen = BTreeSet::new();
+/// Validate the classical DID aliases a `did:at9p` capsule can reciprocally
+/// attest to (#896 / D4): `did:web`, `did:key`, or `did:plc`, duplicate-free.
+fn validate_classical_did_list(values: &[String], field: &str) -> Result<()> {
+    validate_unique_texts(values, field)?;
     for value in values {
-        validate_nonempty_no_ws(value, field)?;
         ensure!(
-            value.starts_with("did:"),
-            "{field} entry {value:?} must be a DID identifier"
-        );
-        ensure!(
-            seen.insert(value.as_str()),
-            "duplicate {field} entry {value:?}"
+            value.starts_with("did:web:")
+                || value.starts_with("did:key:")
+                || value.starts_with("did:plc:"),
+            "{field} entry {value:?} must be a classical DID alias \
+             (did:web, did:key, or did:plc)"
         );
     }
     Ok(())
@@ -1323,11 +1319,16 @@ mod tests {
             "did:web:dup.example".to_owned(),
         ]);
         assert!(body.validate().is_err());
+        // did:at9p is the capsule identity, not a classical alias.
+        body.also_known_as = Some(vec!["did:at9p:bafynotaclassicalalias".to_owned()]);
+        assert!(body.validate().is_err());
         // Empty list rejected (must not be empty when present).
         body.also_known_as = Some(Vec::new());
         assert!(body.validate().is_err());
-        // A clean DID list validates.
+        // Clean classical DID aliases validate.
         body.also_known_as = Some(vec!["did:web:clean.example".to_owned()]);
+        assert!(body.validate().is_ok());
+        body.also_known_as = Some(vec!["did:plc:clean".to_owned()]);
         assert!(body.validate().is_ok());
     }
 }
