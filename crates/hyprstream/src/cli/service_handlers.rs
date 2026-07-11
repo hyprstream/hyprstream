@@ -199,11 +199,10 @@ pub async fn handle_service_start(
         config_services.to_vec()
     };
 
-    // MAC genesis coverage gate (S1 activation, #567): construct the boot-time
-    // gate and log the coverage report. DORMANT — this only emits the
-    // activation coverage-gate evidence (which nodes are labeled / would deny);
-    // it flips no decider to enforcing (see `mac::genesis`).
-    crate::mac::GenesisGate::production().log_report();
+    // MAC genesis coverage gate: logged by the shared `ServiceAction::Start`
+    // dispatch in `bin/main.rs` (before the foreground/systemd branching), so
+    // every startup mode — including foreground boots that bypass this
+    // handler — emits the report exactly once per process.
 
     // Use systemd if available and --daemon not specified
     if hyprstream_rpc::has_systemd() && !daemon {
