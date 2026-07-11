@@ -36,6 +36,7 @@ use anyhow::{bail, ensure, Result};
 
 use crate::cid::Cid;
 use crate::dag_cbor::DagCbor;
+use crate::list_record::validate_datetime;
 
 /// The NSID of this record type. The collection portion of an at-uri that
 /// addresses a record (`at://<repo>/<collection>/<rkey>`).
@@ -167,29 +168,6 @@ fn validate_cid_string(s: &str) -> Result<()> {
     ensure!(
         ok,
         "cid string must be a CIDv1 (b/z…) or CIDv0 (Qm…): {s:?}"
-    );
-    Ok(())
-}
-
-fn validate_datetime(s: &str) -> Result<()> {
-    // atproto `datetime`: ISO-8601 UTC, millisecond precision, trailing Z.
-    // Canonical example: "2026-06-23T12:34:56.789Z".
-    ensure!(s.ends_with('Z'), "datetime must end with 'Z' (UTC): {s:?}");
-    let pre = &s[..s.len() - 1];
-    ensure!(pre.len() >= 20, "datetime too short: {s:?}");
-    let bytes = pre.as_bytes();
-    ensure!(
-        bytes[4] == b'-'
-            && bytes[7] == b'-'
-            && bytes[10] == b'T'
-            && bytes[13] == b':'
-            && bytes[16] == b':',
-        "datetime must be ISO-8601 (YYYY-MM-DDTHH:MM:SS): {s:?}"
-    );
-    // Expect ".mmm" milliseconds between seconds and the trailing Z.
-    ensure!(
-        bytes.get(19) == Some(&b'.'),
-        "datetime must have millisecond precision (.mmm): {s:?}"
     );
     Ok(())
 }

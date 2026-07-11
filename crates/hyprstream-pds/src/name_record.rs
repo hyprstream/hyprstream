@@ -166,6 +166,14 @@ impl NameRecord {
                 ),
             }
         }
+        // `DagCbor::decode` already rejects duplicate map keys on the wire path,
+        // but `from_value` is public: reject hand-built values where a recognized
+        // key appears twice (which would make `map_get_str` pick one of two
+        // conflicting values).
+        ensure!(
+            map.len() == 4,
+            "{COLLECTION_NSID}: duplicate field (lexicon is exactly 4 fields)"
+        );
         Self::new(subject, pin, label, created_at)
     }
 }
@@ -386,6 +394,21 @@ mod tests {
             v.sort_by(|a, b| a.0.as_str().unwrap_or("").cmp(b.0.as_str().unwrap_or("")));
         }
         assert!(NameRecord::from_value(&extra).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_recognized_field() {
+        // A hand-built value with a second `subject` must not parse: the wire
+        // decoder rejects duplicate keys, and the value-level path must too.
+        let mut dup = sample().to_value();
+        if let DagCbor::Map(ref mut v) = dup {
+            v.push((
+                DagCbor::Text("subject".into()),
+                DagCbor::Text("did:web:evil.example.com".into()),
+            ));
+            v.sort_by(|a, b| a.0.as_str().unwrap_or("").cmp(b.0.as_str().unwrap_or("")));
+        }
+        assert!(NameRecord::from_value(&dup).is_err());
     }
 
     #[test]
