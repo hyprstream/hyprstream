@@ -62,6 +62,10 @@ pub mod compiler;
 // Pure fail-closed core: grant validation + ceiling-subset + MAC clearance +
 // sender-binding, consuming S1/S5/the compiler rather than re-implementing.
 pub mod exchange;
+// S1 activation (#567): production genesis CONTENT + enumerator + composite
+// ObjectLabelResolver + boot-time coverage gate. Dormant (Stage 0): builds the
+// coverage-gate evidence, flips no decider to enforcing.
+pub mod genesis;
 pub mod lattice;
 // #676: the production S3-scope ↔ S5-TE-rule vocabulary (injective + exact;
 // wildcards expand at compile time over a closed registry).
@@ -97,6 +101,11 @@ pub use te::{
 pub use compiler::{
     authorize, authorize_at, check_no_escalation, compile, compile_policy, missing_permission,
     AccessRequest, CompileError, PermissionMap, PrivilegeEscalation,
+};
+// S1 activation (#567): production genesis content/enumerator/resolver/gate.
+pub use genesis::{
+    floor_label, genesis_lattice, CompositeObjectLabelResolver, GenesisGate, ManifestLabelSource,
+    NamespaceEnumerator, NoManifests, SitePolicy,
 };
 
 /// Construct the [`UcanVerifier`] the HTTP grant path uses to validate a

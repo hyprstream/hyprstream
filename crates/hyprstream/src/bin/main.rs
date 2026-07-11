@@ -247,6 +247,16 @@ fn build_cli() -> ClapCommand {
             ),
     );
 
+    // Native MAC status/inspection (epic #547).
+    app = app.subcommand(
+        ClapCommand::new("mac")
+            .about("Native MAC (mandatory access control) status and inspection")
+            .subcommand(
+                ClapCommand::new("genesis")
+                    .about("Show the MAC genesis coverage report (activation coverage-gate evidence)"),
+            ),
+    );
+
     app
 }
 
@@ -1790,6 +1800,26 @@ fn main() -> Result<()> {
         }
     }
 
+    // ── `mac` early dispatch ─────────────────────────────────────────────────
+    // `mac genesis` is a read-only, in-memory diagnostic (compile-time service
+    // inventory + site policy — no registry client, no credentials). Dispatch it
+    // before credential loading and registry-key resolution so it works on a
+    // fresh or broken installation, where its coverage evidence is most needed.
+    if let Some(("mac", sub_m)) = matches.subcommand() {
+        match sub_m.subcommand() {
+            Some(("genesis", _)) => {
+                // Build the boot-time gate and print the coverage report. This is
+                // read-only inspection — it changes no enforcement state.
+                let gate = hyprstream_core::mac::GenesisGate::production();
+                print!("{}", gate.render_report());
+            }
+            _ => {
+                eprintln!("usage: hyprstream mac genesis");
+            }
+        }
+        return Ok(());
+    }
+
     // Start registry service ONCE at CLI level
     let _registry_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1898,6 +1928,16 @@ fn main() -> Result<()> {
                     print_cert_hash,
                     standalone,
                 } => {
+                    // MAC genesis coverage gate (S1 activation, #567): log the
+                    // boot-time coverage report on EVERY `service start` path —
+                    // foreground (the mode that actually hosts services, incl.
+                    // systemd ExecStart and standalone-spawned children),
+                    // standalone, and the systemd/spawner dispatch below.
+                    // DORMANT — this only emits the activation coverage-gate
+                    // evidence (which nodes are labeled / would deny); it flips
+                    // no decider to enforcing (see `mac::genesis`).
+                    hyprstream_core::mac::GenesisGate::production().log_report();
+
                     if foreground || standalone {
                         // --foreground requires a service name or --services list;
                         // --standalone uses all configured services.
@@ -2561,6 +2601,13 @@ fn main() -> Result<()> {
                     hyprstream_core::cli::update_handlers::handle_update(&models_dir, cleanup).await
                 },
             )?;
+        }
+
+        // ── Native MAC status/inspection ── handled early (before registry
+        // init) above: it is a read-only diagnostic that must work on fresh
+        // installations with no credentials.
+        Some(("mac", _)) => {
+            unreachable!("mac command is dispatched before registry init")
         }
 
         // ── No subcommand → wizard (first run) or ShellClient ──────────
