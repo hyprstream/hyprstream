@@ -380,11 +380,25 @@ impl CompositeObjectLabelResolver {
         // Walk from the full path up its ancestors. The first genesis assignment
         // found is either the exact node (arm 1) or the nearest labeled ancestor
         // (arm 2 — bind-time D2 descendant inheritance).
-        let mut depth = components.len();
+        let full = components.len();
+        let mut depth = full;
         while depth > 0 {
             let path = join_components(&components[..depth]);
             if let Some(label) = self.genesis.resolve(&path) {
-                return Some(*label);
+                // A structural export root (`/srv`, `/worktree`, `/stream`) is a
+                // container directory whose *own* Public label must NOT flow to
+                // its descendants — otherwise an unenumerated `/srv/unknown`
+                // would inherit Public and the structural root would act as an
+                // implicit permissive wildcard (fail-OPEN). Only honor a
+                // structural-root label on an EXACT hit; on an ancestor
+                // (inherited) hit, keep walking up so an unlabeled descendant
+                // falls through to `None` ⇒ deny (S1 fail-closed). Real service
+                // mounts (`/srv/model`, …) still inherit to their descendants.
+                let inherited = depth < full;
+                let structural_root = EXPORT_ROOTS.contains(&path.as_str());
+                if !inherited || !structural_root {
+                    return Some(*label);
+                }
             }
             depth -= 1;
         }
@@ -394,8 +408,13 @@ impl CompositeObjectLabelResolver {
     /// Resolve a content identifier via the CAS manifest source.
     fn resolve_cid(&self, cid: &[u8]) -> Option<SecurityLabel> {
         match self.manifests.label_for(cid) {
-            // Manifest present and labeled.
-            Some(Some(label)) => Some(label),
+            // Manifest present and labeled ⇒ D2 import clamp to the boundary
+            // floor. `import_label` is the restrict-only join: a carried label
+            // can only ever be raised toward the floor, never returned below it,
+            // so a `Public` carrier under an `Internal` floor still clamps to
+            // `Internal` (D2 — object labels clamp to the importing boundary's
+            // floor, never returned unrestricted).
+            Some(Some(label)) => Some(import_label(self.floor, label)),
             // Manifest present, carrier empty ⇒ D2 join-to-floor. `import_label`
             // is the restrict-only clamp: join(floor, ⊥) == floor, and it can
             // only ever raise, never lower, the effective label.
