@@ -321,6 +321,14 @@ impl UserStore for ValkeyUserStore {
         }
         // Fingerprint is the Ed25519 anchor's (kid) — the PQ vk does not change it.
         let fp = pubkey_fingerprint(&pubkey);
+        // Reject a fingerprint already owned by a *different* user (matches the
+        // RocksDB backend): without this, a cross-user re-bind would overwrite
+        // hs:keyowner and leave the key in both users' sets.
+        if let Some(existing_user) = self.get_pubkey_user(&fp).await? {
+            if existing_user != username {
+                anyhow::bail!("Pubkey already associated with user '{existing_user}'");
+            }
+        }
         let pubkey_base64 = base64::engine::general_purpose::STANDARD.encode(pubkey.as_bytes());
         let pq_pubkey_base64 =
             Some(base64::engine::general_purpose::STANDARD.encode(&ml_dsa_vk));
