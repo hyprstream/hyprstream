@@ -233,7 +233,9 @@ impl VfsFileSystem {
         let mut attr: libc::stat64 = unsafe { std::mem::zeroed() };
         attr.st_ino = inode;
         attr.st_size = st.size as i64;
-        attr.st_blksize = BLOCK_SIZE as i64;
+        // st_blksize is libc::blksize_t: i64 on x86_64 but i32 on aarch64 —
+        // cast to the field's own type so this compiles on both arches.
+        attr.st_blksize = BLOCK_SIZE as libc::blksize_t;
         attr.st_blocks = st.size.div_ceil(BLOCK_SIZE as u64) as i64;
         attr.st_nlink = 1;
         let (typ, perm) = match kind {
