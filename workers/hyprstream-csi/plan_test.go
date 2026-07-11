@@ -33,6 +33,7 @@ func TestBuildMountPlanFuseRequestsScopedTicket(t *testing.T) {
 	plan, err := buildMountPlan(config{
 		defaultMounter:    "fuse",
 		defaultPlane:      "webtransport",
+		kubeletRootDir:    "/var/lib/kubelet",
 		oauthAudience:     "hyprstream-9p",
 		mountTicketURL:    srv.URL,
 		transportCarrier:  "webtransport",
@@ -65,6 +66,7 @@ func TestBuildMountPlanKernelUsesBridge(t *testing.T) {
 	plan, err := buildMountPlan(config{
 		defaultMounter:    "fuse",
 		defaultPlane:      "webtransport",
+		kubeletRootDir:    "/mnt",
 		oauthAudience:     "hyprstream-9p",
 		mountTicketURL:    srv.URL,
 		transportCarrier:  "webtransport",
@@ -156,6 +158,53 @@ func TestBuildMountPlanRejectsLegacyNamespacePath(t *testing.T) {
 	}
 }
 
+func TestBuildMountPlanRejectsTargetOutsideKubeletRoot(t *testing.T) {
+	_, err := buildMountPlan(config{mountTicketURL: "http://127.0.0.1", kubeletRootDir: "/var/lib/kubelet"}, &csi.NodePublishVolumeRequest{
+		VolumeId:   "vol",
+		TargetPath: "/etc/passwd",
+		VolumeContext: map[string]string{
+			attrAname: "export:tenant-a",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected target path outside kubelet root rejection")
+	}
+}
+
+func TestBuildMountPlanRejectsUncleanTargetPath(t *testing.T) {
+	_, err := buildMountPlan(config{mountTicketURL: "http://127.0.0.1", kubeletRootDir: "/var/lib/kubelet"}, &csi.NodePublishVolumeRequest{
+		VolumeId:   "vol",
+		TargetPath: "/var/lib/kubelet/pods/../escape",
+		VolumeContext: map[string]string{
+			attrAname: "export:tenant-a",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected unclean target path rejection")
+	}
+}
+
+func TestBuildMountPlanRejectsSymlinkTargetPath(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "pods", "pod-a", "volumes", "kubernetes.io~csi", "vol", "mount")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/etc", target); err != nil {
+		t.Fatal(err)
+	}
+	_, err := buildMountPlan(config{mountTicketURL: "http://127.0.0.1", kubeletRootDir: root}, &csi.NodePublishVolumeRequest{
+		VolumeId:   "vol",
+		TargetPath: target,
+		VolumeContext: map[string]string{
+			attrAname: "export:tenant-a",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected symlink target path rejection")
+	}
+}
+
 func TestFuseCommandKeepsTicketOutOfArgvAndUsesUnameEnv(t *testing.T) {
 	plan := mountPlan{
 		TargetPath: "/mnt/hypr",
@@ -211,11 +260,17 @@ func TestUnpublishMountRemovesStalePidFile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, fusePIDFile), []byte("999999999\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := unpublishMount(context.Background(), dir); err != nil {
+	if err := unpublishMount(context.Background(), dir, filepath.Dir(dir)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, fusePIDFile)); !os.IsNotExist(err) {
 		t.Fatalf("pid file should be removed, stat err=%v", err)
+	}
+}
+
+func TestUnpublishMountRejectsTargetOutsideKubeletRoot(t *testing.T) {
+	if err := unpublishMount(context.Background(), "/etc/passwd", "/var/lib/kubelet"); err == nil {
+		t.Fatal("expected target path outside kubelet root rejection")
 	}
 }
 

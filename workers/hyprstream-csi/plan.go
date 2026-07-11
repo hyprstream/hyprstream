@@ -73,6 +73,10 @@ func buildMountPlan(cfg config, req *csi.NodePublishVolumeRequest) (mountPlan, e
 	if req.GetTargetPath() == "" {
 		return mountPlan{}, errors.New("target_path is required")
 	}
+	targetPath, err := validateTargetPath(req.GetTargetPath(), cfg.kubeletRootDir)
+	if err != nil {
+		return mountPlan{}, err
+	}
 	attrs := req.GetVolumeContext()
 	if attrs[attrTicket] != "" {
 		return mountPlan{}, errors.New("ticket volume attribute is forbidden; CSI must mint mount tickets at NodePublishVolume")
@@ -101,7 +105,7 @@ func buildMountPlan(cfg config, req *csi.NodePublishVolumeRequest) (mountPlan, e
 	}
 	plan := mountPlan{
 		VolumeID:   req.GetVolumeId(),
-		TargetPath: req.GetTargetPath(),
+		TargetPath: targetPath,
 		Aname:      aname,
 		Tenant:     attrs[attrTenant],
 		Plane:      plane,
@@ -148,6 +152,53 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func validateTargetPath(targetPath, kubeletRootDir string) (string, error) {
+	cleanTarget := filepath.Clean(targetPath)
+	if !filepath.IsAbs(cleanTarget) {
+		return "", fmt.Errorf("target_path must be absolute, got %q", targetPath)
+	}
+	if cleanTarget != targetPath {
+		return "", fmt.Errorf("target_path must be clean, got %q", targetPath)
+	}
+	root := filepath.Clean(firstNonEmpty(kubeletRootDir, "/var/lib/kubelet"))
+	if !filepath.IsAbs(root) {
+		return "", fmt.Errorf("kubelet root dir must be absolute, got %q", kubeletRootDir)
+	}
+	rel, err := filepath.Rel(root, cleanTarget)
+	if err != nil {
+		return "", fmt.Errorf("relativize target_path: %w", err)
+	}
+	if rel == "." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || rel == ".." || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("target_path %q must be under kubelet root %q", cleanTarget, root)
+	}
+	if _, err := os.Lstat(cleanTarget); err == nil {
+		resolved, err := filepath.EvalSymlinks(cleanTarget)
+		if err != nil {
+			return "", fmt.Errorf("resolve target_path symlinks: %w", err)
+		}
+		if resolved != cleanTarget {
+			return "", fmt.Errorf("target_path %q must not resolve through symlink %q", cleanTarget, resolved)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("stat target_path: %w", err)
+	}
+	parent := filepath.Dir(cleanTarget)
+	for {
+		if parent == root || parent == filepath.Dir(parent) {
+			break
+		}
+		if info, err := os.Lstat(parent); err == nil {
+			if info.Mode()&os.ModeSymlink != 0 {
+				return "", fmt.Errorf("target_path parent %q must not be a symlink", parent)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("stat target_path parent: %w", err)
+		}
+		parent = filepath.Dir(parent)
+	}
+	return cleanTarget, nil
 }
 
 func requestMountTicket(ctx context.Context, endpoint, bearer, plane, aname string) (mountTicketResponse, error) {
@@ -209,6 +260,9 @@ func executeMountPlan(ctx context.Context, plan mountPlan) error {
 			return fmt.Errorf("write FUSE mounter pid: %w", err)
 		}
 		if err := cmd.Process.Release(); err != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			_ = os.Remove(pidPath)
 			return fmt.Errorf("release FUSE mounter process: %w", err)
 		}
 		return nil
@@ -274,9 +328,13 @@ func readFusePID(targetPath string) (int, bool, error) {
 	return pid, true, nil
 }
 
-func unpublishMount(ctx context.Context, targetPath string) error {
+func unpublishMount(ctx context.Context, targetPath, kubeletRootDir string) error {
 	if targetPath == "" {
 		return errors.New("target_path is required")
+	}
+	targetPath, err := validateTargetPath(targetPath, kubeletRootDir)
+	if err != nil {
+		return err
 	}
 	pid, ok, err := readFusePID(targetPath)
 	if err != nil {
