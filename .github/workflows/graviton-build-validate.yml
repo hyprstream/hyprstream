@@ -68,11 +68,12 @@ jobs:
             capnp --version
           '
 
-      # The actual validation: compile the workspace with the CI feature set
-      # inside the container, repo bind-mounted. sccache runs as a local
-      # in-container disk cache (SCCACHE_DIR=/sccache from the image) — no S3
-      # wiring yet, keeping the first-cut failure surface minimal.
-      - name: Compile workspace in container (release, CI features)
+      # Validate the EXACT merge-gate commands the rust.yml cutover (#1021) runs
+      # on arm64: default features (systemd/kata-vm/oci-image/otel/gittorrent/xet),
+      # libtorch from the image, then the full nextest suite + doctests. This is
+      # the gap the cutover flagged — default-feature build + tests on arm64.
+      # sccache runs as a local in-container disk cache (SCCACHE_DIR=/sccache).
+      - name: Merge-gate build + tests in container (default features, arm64)
         run: |
           podman run --rm \
             -v "$PWD":/build:Z \
@@ -83,4 +84,13 @@ jobs:
             -e LIBTORCH_BYPASS_VERSION_CHECK=1 \
             -e CARGO_TERM_COLOR=always \
             hyprstream-builder-arm64:ci \
-            cargo build --release --no-default-features --features otel,gittorrent,xet
+            bash -euo pipefail -c '
+              echo "=== build (default features) ==="
+              cargo build --release --verbose
+              echo "=== install nextest ==="
+              cargo install cargo-nextest --locked || true
+              echo "=== nextest (ci profile) ==="
+              cargo nextest run --release --profile ci || cargo nextest run --release
+              echo "=== doctests ==="
+              cargo test --release --doc
+            '
