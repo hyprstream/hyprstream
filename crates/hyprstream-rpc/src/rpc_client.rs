@@ -155,6 +155,13 @@ pub struct RpcClientImpl<S: Signer, T: Transport + 'static> {
     /// falls back to the process-global response store
     /// ([`crate::envelope::global_response_pq_store`]).
     response_pq_store: Option<std::sync::Arc<dyn crate::envelope::PqTrustStore>>,
+    /// INV-2 (ADR #1023): `true` when this client dials an **untrusted carrier**
+    /// (iroh / relay / cross-host QUIC), on which a cleartext
+    /// (`encrypted_envelope = None`) `SignedEnvelope` is forbidden. Set at dial
+    /// time from [`crate::transport::EndpointType::forbids_cleartext_envelope`].
+    /// Defaults to `false` (permissive) for directly-constructed clients (tests,
+    /// wasm) — `dial()` is the production path that classifies correctly.
+    carrier_forbids_cleartext: bool,
 }
 
 impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
@@ -171,7 +178,19 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             request_id: AtomicU64::new(1),
             response_verify_policy: None,
             response_pq_store: None,
+            carrier_forbids_cleartext: false,
         }
+    }
+
+    /// INV-2 (ADR #1023): mark this client's carrier as one that forbids a
+    /// cleartext `SignedEnvelope` (iroh / relay / cross-host QUIC). Called by
+    /// [`crate::dial::dial`] with
+    /// [`crate::transport::EndpointType::forbids_cleartext_envelope`]. When set,
+    /// the send path refuses to emit a cleartext envelope per the process INV-2
+    /// mode (see [`crate::inv2`]) — fail-closed once the HyKEM tunnel is wired.
+    pub fn with_carrier_cleartext_forbidden(mut self, forbidden: bool) -> Self {
+        self.carrier_forbids_cleartext = forbidden;
+        self
     }
 
     /// Enforce Hybrid (EdDSA + ML-DSA-65) verification of responses (#275),
@@ -438,6 +457,18 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             pq_kem_ciphertext: None,
         };
 
+        // INV-2 (ADR #1023): structural, fail-closed refusal to hand a cleartext
+        // `SignedEnvelope` (encrypted_envelope = None, above) to an untrusted
+        // carrier. This is the single chokepoint for the RPC request send path —
+        // every `call*` variant funnels through `sign_envelope` before touching
+        // the transport — so the guard cannot be bypassed by a call flavor.
+        // Under the interim WarnOnly mode (HyKEM tunnel #551 not yet wired) it
+        // logs and proceeds; under Enforce it returns Err before any byte ships.
+        crate::inv2::guard_cleartext_envelope(
+            self.carrier_forbids_cleartext,
+            signed.is_encrypted(),
+        )?;
+
         let mut message = capnp::message::Builder::new_default();
         {
             let mut builder =
@@ -620,5 +651,110 @@ impl<S: Signer, T: Transport + 'static> RpcClient for RpcClientImpl<S, T> {
 
     fn next_id(&self) -> u64 {
         RpcClientImpl::next_id(self)
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod inv2_send_path_tests {
+    //! INV-2 (ADR #1023) end-to-end wiring test: prove the structural guard
+    //! fires on the real `RpcClientImpl` send path (`sign_envelope`) BEFORE any
+    //! byte is handed to the transport — i.e. a cleartext envelope can never
+    //! reach an untrusted carrier when enforcement is on. This is the
+    //! adversarial check that the fix is not merely cosmetic.
+
+    use super::*;
+    use crate::signer::LocalSigner;
+    use crate::transport_traits::{PublishSink, Transport};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A transport that records whether `send` was ever reached. If the INV-2
+    /// guard works, an untrusted-carrier client under Enforce must return an
+    /// error WITHOUT `send` being called.
+    struct SentinelTransport {
+        sent: Arc<AtomicBool>,
+    }
+
+    struct NoopSink;
+
+    #[async_trait]
+    impl PublishSink for NoopSink {
+        async fn send_frames(&self, _frames: &[&[u8]]) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Transport for SentinelTransport {
+        type Sub = futures::stream::Empty<Result<Vec<Vec<u8>>>>;
+        type Pub = NoopSink;
+
+        async fn send(&self, _payload: Vec<u8>, _timeout_ms: Option<i32>) -> Result<Vec<u8>> {
+            self.sent.store(true, Ordering::SeqCst);
+            // Return bogus bytes: if the guard failed to fire, response unwrap
+            // would fail here too — but we assert on `sent` to be unambiguous.
+            Ok(Vec::new())
+        }
+
+        async fn subscribe(&self, _topic: &[u8]) -> Result<Self::Sub> {
+            Ok(futures::stream::empty())
+        }
+
+        async fn publish(&self, _topic: &[u8]) -> Result<Self::Pub> {
+            Ok(NoopSink)
+        }
+    }
+
+    fn test_signer() -> LocalSigner {
+        let (sk, _vk) = crate::crypto::signing::generate_signing_keypair();
+        LocalSigner::new(sk)
+    }
+
+    #[tokio::test]
+    async fn cleartext_over_untrusted_carrier_is_refused_before_send() {
+        // Force fail-closed enforcement for this process (OnceLock: the only
+        // setter; Enforce is harmless to trusted-carrier tests which classify
+        // carrier_forbids = false and are therefore always Allowed).
+        crate::inv2::set_inv2_mode(crate::inv2::Inv2Mode::Enforce);
+
+        let sent = Arc::new(AtomicBool::new(false));
+        let transport = SentinelTransport { sent: sent.clone() };
+        // carrier_forbids_cleartext = true == the iroh / relay / cross-host case.
+        let client = RpcClientImpl::new(test_signer(), transport, None)
+            .with_carrier_cleartext_forbidden(true);
+
+        let result = client.call(b"payload".to_vec()).await;
+
+        assert!(
+            result.is_err(),
+            "INV-2: a cleartext envelope over an untrusted carrier must be refused"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("INV-2"),
+            "the refusal must be the INV-2 guard, not an unrelated error"
+        );
+        assert!(
+            !sent.load(Ordering::SeqCst),
+            "INV-2: refusal MUST happen before any byte reaches the transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleartext_over_trusted_carrier_is_allowed() {
+        // A trusted carrier (inproc/UDS) classifies carrier_forbids = false, so
+        // the same cleartext send proceeds to the transport even under Enforce.
+        crate::inv2::set_inv2_mode(crate::inv2::Inv2Mode::Enforce);
+
+        let sent = Arc::new(AtomicBool::new(false));
+        let transport = SentinelTransport { sent: sent.clone() };
+        let client = RpcClientImpl::new(test_signer(), transport, None)
+            .with_carrier_cleartext_forbidden(false);
+
+        // Response unwrap fails on the empty bogus reply, but that is AFTER send:
+        // the point is the guard did not block the trusted-carrier path.
+        let _ = client.call(b"payload".to_vec()).await;
+        assert!(
+            sent.load(Ordering::SeqCst),
+            "trusted-carrier cleartext must NOT be blocked by INV-2"
+        );
     }
 }

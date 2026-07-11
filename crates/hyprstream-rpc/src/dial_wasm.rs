@@ -83,7 +83,12 @@ pub async fn dial(
     jwt: Option<String>,
 ) -> Result<Arc<dyn RpcClient>> {
     let transport = WtConnection::connect(url, cert_hash).await?;
-    let client = RpcClientImpl::new(signer, transport, server_verifying_key);
+    // INV-2 (ADR #1023): the browser always dials a remote WebTransport/iroh
+    // carrier whose TLS is the browser's own stack (classical, no PQ we control)
+    // — exactly the untrusted-carrier case. Mark cleartext forbidden so the send
+    // path enforces INV-2 per the process mode (see `crate::inv2`).
+    let client = RpcClientImpl::new(signer, transport, server_verifying_key)
+        .with_carrier_cleartext_forbidden(true);
     let client = match jwt {
         Some(t) => client.with_default_jwt(t),
         None => client,

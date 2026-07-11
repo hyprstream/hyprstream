@@ -118,6 +118,7 @@ pub mod cid;
 pub mod crypto;
 pub mod envelope;
 pub mod error;
+pub mod inv2;
 pub mod platform;
 pub mod rpc_client;
 pub mod stream_info;

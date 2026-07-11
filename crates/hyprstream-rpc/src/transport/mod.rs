@@ -210,6 +210,33 @@ pub enum EndpointType {
     },
 }
 
+impl EndpointType {
+    /// INV-2 (ADR #1023): does this endpoint delegate confidentiality to an
+    /// **untrusted transport carrier**, making a cleartext (`encrypted_envelope =
+    /// None`) `SignedEnvelope` forbidden on it?
+    ///
+    /// - `Iroh` — carrier authenticated only by a *classical* Ed25519 NodeId; PQ
+    ///   kx is native-only (no wasm/browser) and passive/HNDL-only. ADR #1023
+    ///   declares it an untrusted carrier: **forbidden**.
+    /// - `Quic` — cross-host TLS 1.3; native-only, HNDL-classical, and the ADR
+    ///   treats it as an untrusted carrier for the same reason iroh is:
+    ///   **forbidden** (the app-layer tunnel is the confidentiality root).
+    /// - `Inproc` — a same-process function call; no wire at all: **allowed**.
+    /// - `Ipc` / `SystemdFd` — local Unix domain socket, peer-credential
+    ///   authenticated, never leaves the host: **allowed**.
+    ///
+    /// The ban must NOT be over-broadened onto the same-host carriers — cleartext
+    /// there remains legitimate (see [`crate::inv2`]).
+    pub fn forbids_cleartext_envelope(&self) -> bool {
+        match self {
+            EndpointType::Iroh { .. } | EndpointType::Quic { .. } => true,
+            EndpointType::Inproc { .. }
+            | EndpointType::Ipc { .. }
+            | EndpointType::SystemdFd { .. } => false,
+        }
+    }
+}
+
 impl TransportConfig {
     /// Create an in-process endpoint configuration.
     pub fn inproc(endpoint: impl Into<String>) -> Self {
@@ -429,6 +456,26 @@ impl TransportConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inv2_carrier_classification() {
+        // Untrusted carriers (ADR #1023 INV-2): cleartext forbidden.
+        assert!(EndpointType::Iroh {
+            node_id: [0u8; 32],
+            direct_addrs: vec![],
+            relay_url: None,
+        }
+        .forbids_cleartext_envelope());
+        assert!(EndpointType::Quic {
+            addr: "127.0.0.1:4433".parse().unwrap(),
+            server_name: "x".into(),
+            auth: QuicServerAuth::web_pki(),
+        }
+        .forbids_cleartext_envelope());
+        // Trusted same-host carriers: cleartext permitted — ban must NOT widen.
+        assert!(!EndpointType::Inproc { endpoint: "x".into() }.forbids_cleartext_envelope());
+        assert!(!EndpointType::Ipc { path: "/tmp/x.sock".into() }.forbids_cleartext_envelope());
+    }
 
     #[test]
     fn test_inproc_endpoint() {

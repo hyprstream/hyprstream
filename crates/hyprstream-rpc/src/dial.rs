@@ -128,18 +128,27 @@ where
         transport: T2,
         vk: Option<VerifyingKey>,
         token: Option<String>,
+        carrier_forbids_cleartext: bool,
     ) -> Arc<dyn RpcClient>
     where
         S2: Signer + 'static,
         T2: crate::transport_traits::Transport + 'static,
     {
-        let rpc = RpcClientImpl::new(signer, transport, vk);
+        let rpc = RpcClientImpl::new(signer, transport, vk)
+            // INV-2 (ADR #1023): the send path refuses a cleartext SignedEnvelope
+            // on an untrusted carrier. `dial()` is the single place transport
+            // choice is made, so it is the correct place to stamp the carrier
+            // classification onto the client.
+            .with_carrier_cleartext_forbidden(carrier_forbids_cleartext);
         let rpc = match token {
             Some(t) => rpc.with_default_jwt(t),
             None => rpc,
         };
         Arc::new(rpc) as Arc<dyn RpcClient>
     }
+
+    // INV-2 carrier classification, computed once from the resolved endpoint.
+    let carrier_forbids_cleartext = target.endpoint.forbids_cleartext_envelope();
 
     // Matched exhaustively on purpose: this is the one place transport choice is
     // made, so a newly-added EndpointType variant MUST be a compile error here
@@ -150,7 +159,7 @@ where
                 anyhow!("no in-process service registered for inproc endpoint '{endpoint}'")
             })?;
             let transport = InMemoryTransport::new(processor);
-            Ok(build_client(signer, transport, server_verifying_key, token))
+            Ok(build_client(signer, transport, server_verifying_key, token, carrier_forbids_cleartext))
         }
         EndpointType::Quic { addr, server_name, auth } => {
             // SECURITY (#185): QUIC channel auth (WebPKI / cert-hash pin) binds the
@@ -173,7 +182,7 @@ where
                 server_name.clone(),
                 auth.clone(),
             );
-            Ok(build_client(signer, transport, server_verifying_key, token))
+            Ok(build_client(signer, transport, server_verifying_key, token, carrier_forbids_cleartext))
         }
         EndpointType::Iroh { direct_addrs, relay_url, .. }
             if direct_addrs.is_empty() && relay_url.is_none() =>
@@ -196,7 +205,7 @@ where
                 direct_addrs.clone(),
                 relay_url.clone(),
             );
-            Ok(build_client(signer, transport, server_verifying_key, token))
+            Ok(build_client(signer, transport, server_verifying_key, token, carrier_forbids_cleartext))
         }
         // Same-host `ipc` plane: connect a UdsSession (RPC plane) at the socket
         // path. systemd socket-activation is the same client-side dial — the fd
@@ -207,11 +216,11 @@ where
         // + SO_PEERCRED are daemon-owned defense-in-depth (#207).
         EndpointType::Ipc { path } => {
             let transport = crate::transport::lazy_uds::LazyUdsTransport::new(path.clone());
-            Ok(build_client(signer, transport, server_verifying_key, token))
+            Ok(build_client(signer, transport, server_verifying_key, token, carrier_forbids_cleartext))
         }
         EndpointType::SystemdFd { client_path, .. } => {
             let transport = crate::transport::lazy_uds::LazyUdsTransport::new(client_path.clone());
-            Ok(build_client(signer, transport, server_verifying_key, token))
+            Ok(build_client(signer, transport, server_verifying_key, token, carrier_forbids_cleartext))
         }
     }
 }
