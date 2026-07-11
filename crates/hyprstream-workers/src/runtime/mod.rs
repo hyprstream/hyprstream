@@ -45,14 +45,18 @@ pub mod k8s_backend;
 // `/exec/instances/` VFS projection of `SandboxPool` (#608 P2 / #610) — a
 // `hyprstream_vfs::Mount` impl, so it has no `kata-vm`/`wasm` dependency.
 pub mod exec_mount;
-// Kata/CH VM backend — gated behind `kata-vm` (pulls the kata/nydus toolchain).
-#[cfg(feature = "kata-vm")]
+// Kata/CH VM backend — gated behind `kata` (pulls the kata/nydus toolchain).
+// `kata-vm` is a backward-compat alias for `kata` (#518).
+#[cfg(feature = "kata")]
 pub mod kata_backend;
 // kata-agent ttrpc/vsock client (#344): CreateContainer/StartContainer/
 // ExecProcess/WaitProcess against the guest's kata-agent. Used by
 // `kata_backend::KataBackend::exec_sync`.
-#[cfg(feature = "kata-vm")]
+#[cfg(feature = "kata")]
 pub mod kata_agent;
+// systemd-nspawn lightweight-container backend (#518: per-BackendType feature).
+// The lowest-isolation auto-selectable tier; torch-free, no heavy deps.
+#[cfg(feature = "nspawn")]
 pub mod nspawn;
 // Rootless OCI container backend (#346) — gated behind `oci`. Drives a rootless
 // OCI runtime (podman by default) via CLI shell-out; torch-free, no VM toolchain.
@@ -127,8 +131,9 @@ pub use backend::{SandboxBackend, SandboxHandle};
 pub use cri_backend::{CriBackend, CriConfig, CriHandle};
 // `/exec/instances/` Plan9 projection of the pool (#608 P2 / #610)
 pub use exec_mount::ExecMount;
-#[cfg(feature = "kata-vm")]
+#[cfg(feature = "kata")]
 pub use kata_backend::{KataBackend, KataHandle};
+#[cfg(feature = "nspawn")]
 pub use nspawn::{NspawnBackend, NspawnConfig, NspawnHandle};
 #[cfg(feature = "oci")]
 pub use oci_backend::{OciBackend, OciConfig, OciHandle};

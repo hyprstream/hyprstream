@@ -234,14 +234,16 @@ oci-image = [
     # it lives on `oci-image`, not `kata-vm`.
     "dep:hyprstream-vfs-server",
 ]
-# Kata/Cloud-Hypervisor VM backend. Implies `oci-image` (kata composes the
-# image filesystem service into a namespace and serves it to its guest via
-# virtio-fs) and adds the VM toolchain plus the kata-agent vsock/ttrpc client
-# (kata hypervisor + CH config + agent RPC). Opt-in so casual users who only
-# want the lightweight `systemd-nspawn` backend don't compile the VM stack.
-# When this feature is off, `BackendType::Kata` selection and CRI image ops
-# return a clean runtime error rather than failing to compile.
-kata-vm = [
+# Kata/Cloud-Hypervisor VM backend (#518: the granular per-`BackendType`
+# feature). Implies `oci-image` (kata composes the image filesystem service
+# into a namespace and serves it to its guest via virtio-fs) and adds the VM
+# toolchain plus the kata-agent vsock/ttrpc client (kata hypervisor + CH
+# config + agent RPC). Opt-in so casual users who only want the lightweight
+# `systemd-nspawn` backend don't compile the VM stack. When this feature is
+# off, `BackendType::Kata` selection and CRI image ops return a clean runtime
+# error rather than failing to compile. `kata-vm` (below) is the backward-
+# compat convenience alias for this feature.
+kata = [
     "oci-image",
     "dep:kata-hypervisor",
     "dep:kata-types",
@@ -252,6 +254,20 @@ kata-vm = [
     "dep:protobuf",
     "dep:vsock",
 ]
+# Backward-compat convenience alias (#518): the coarse `kata-vm` bundle (#347)
+# becomes a thin alias for the granular `kata` feature. Existing
+# `--features kata-vm` invocations keep working unchanged; `kata` is the
+# canonical per-`BackendType` name going forward.
+kata-vm = ["kata"]
+# systemd-nspawn lightweight-container backend (#518: the granular per-
+# `BackendType` feature). Compiles in `NspawnBackend` and registers it as the
+# lowest-isolation auto-selectable tier (priority 10). Torch-free and needs no
+# new dependencies (only the already-present `which`/`nix`/`tokio` process
+# plumbing), so it just gates the module. Opt-in like every other backend so a
+# build can pick exactly its backend set (casual = `wasm`+`nspawn`; server =
+# `kata`+`oci`+`cri`). When off, `nspawn` selection fails closed (the backend
+# simply isn't registered).
+nspawn = []
 # In-process WebAssembly sandbox backend (#505 P2). Compiles in `WasmBackend`
 # and the `hyprstream-workers-wasmtime` wasmtime substrate it consumes. A native in-process
 # sibling under the same `SandboxBackend` seam: no VM, no subprocess — a wasmtime
@@ -291,7 +307,8 @@ cri = ["dep:k8s-cri", "dep:tonic", "dep:tower", "dep:hyper-util"]
 # selection fails closed (the backend simply isn't registered).
 k8s = ["dep:hyprstream-k8s", "hyprstream-k8s/k8s"]
 # Enable Dragonball built-in VMM support (alternative to cloud-hypervisor).
-# Implies `kata-vm` since it tunes the kata hypervisor abstraction.
+# Implies `kata` (via the `kata-vm` alias) since it tunes the kata hypervisor
+# abstraction.
 dragonball = ["kata-vm", "kata-hypervisor/dragonball"]
 # Enable D-Bus bridge for container access to host D-Bus services
 dbus = ["dep:zbus"]

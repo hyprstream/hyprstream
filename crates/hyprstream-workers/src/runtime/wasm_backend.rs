@@ -356,8 +356,6 @@ impl SandboxBackend for WasmBackend {
         _subject: Subject,
         transport: super::backend::NamespaceTransport,
     ) -> Result<super::backend::NamespaceDelivery> {
-        use super::backend::NamespaceTransport;
-
         // Provisional (#635): wasm's guest has no separate OS to mount a
         // namespace into — the "host-imports" model means mount references
         // would be passed directly into the guest's linker as capability

@@ -512,8 +512,8 @@ pub struct PoolStats {
     pub warm_pool_target: usize,
 }
 
-// The pool tests build a KataBackend + RafsStore, so they only run under `kata-vm`.
-#[cfg(all(test, feature = "kata-vm"))]
+// The pool tests build a KataBackend + RafsStore, so they only run under `kata`.
+#[cfg(all(test, feature = "kata"))]
 mod tests {
     use super::*;
     use crate::config::{ImageConfig, PoolConfig};
