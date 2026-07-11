@@ -1,0 +1,64 @@
+name: Graviton Build Validation
+
+# Non-required validation (#1011): run the real hyprstream build+deps on a
+# self-hosted Graviton (arm64, Rocky 10) runner to find what breaks BEFORE cutting
+# the required merge-gate `build` job over to arm64. workflow_dispatch only.
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # OIDC → sccache S3 role
+  contents: read
+
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_BUCKET: ${{ vars.AWS_SCCACHE_BUCKET }}
+  SCCACHE_REGION: ${{ vars.AWS_SCCACHE_REGION }}
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-arm64:
+    runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Arch + OS sanity
+        run: uname -m && cat /etc/os-release | head -2
+
+      # Rocky/dnf, not ubuntu/apt. capnproto (EPEL), systemd + openssl headers,
+      # and a C/C++ toolchain for the native crates + libtorch glue.
+      - name: Install build dependencies (Rocky/dnf)
+        run: |
+          sudo dnf install -y --setopt=install_weak_deps=False \
+            capnproto systemd-devel openssl-devel pkgconf-pkg-config \
+            gcc gcc-c++ cmake make git which
+
+      # Toolchain is not baked into the golden AMI (that's for the build container,
+      # #996). Install rustup for this validation.
+      - name: Install rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Configure AWS credentials (OIDC → sccache S3)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_SCCACHE_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_SCCACHE_REGION }}
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: rustc version
+        run: rustc -vV && cargo --version
+
+      # THE make-or-break: does `download-libtorch` provide an aarch64-linux binary?
+      # If this step fails on a missing libtorch URL, arm64 needs a source build or a
+      # prebuilt arm64 libtorch (bake into the AMI / build container) before cutover.
+      - name: Build (release, download-libtorch)
+        run: cargo build --release --verbose --features download-libtorch
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
