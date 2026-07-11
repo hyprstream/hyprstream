@@ -15,10 +15,16 @@ name: Graviton Build Validation
 # reaches the default branch).
 on:
   workflow_dispatch:
-  # Any push to the validation branch re-runs this — during bring-up we iterate
-  # on both the Dockerfile (toolchain) and arch-specific source fixes.
+  # Re-run on changes that can affect the arm64 build — the Dockerfile
+  # (toolchain), workspace source (arch-specific fixes), or this workflow.
   push:
     branches: [ewindisch/runner-smoke-test]
+    paths:
+      - '.github/workflows/graviton-build-validate.yml'
+      - 'Dockerfile'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
 
 permissions:
   contents: read
