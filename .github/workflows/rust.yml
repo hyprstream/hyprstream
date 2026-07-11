@@ -25,14 +25,15 @@ env:
   CARGO_INCREMENTAL: 0
   BUILDER_IMAGE: ghcr.io/hyprstream/rust-builder-arm64:latest
 
-# The Rust compile jobs run on the self-hosted Graviton (arm64) runners and drive
-# the build through `podman run` against the prebuilt rust-builder image (rust +
-# capnproto + clang + libtorch). We DELIBERATELY do NOT use a job-level
-# `container:` — the runner's native container support wants a Docker-API socket
-# at /var/run/docker.sock, which the rootless-podman golden AMI does not expose
-# (a `container:` job fails with `statfs /var/run/docker.sock: permission
-# denied`). Driving `podman run` from host steps sidesteps that entirely and is
-# the same pattern proven in graviton-build-validate.yml.
+# The fast lint jobs (clippy, wasm) run on the self-hosted Graviton (arm64)
+# runners and drive the build through `podman run` against the prebuilt
+# rust-builder image (rust + capnproto + clang + libtorch). We DELIBERATELY do
+# NOT use a job-level `container:` — the runner's native container support wants
+# a Docker-API socket at /var/run/docker.sock, which the rootless-podman golden
+# AMI does not expose (a `container:` job fails with `statfs
+# /var/run/docker.sock: permission denied`). Driving `podman run` from host
+# steps sidesteps that entirely and is the same pattern proven in
+# graviton-build-validate.yml.
 #
 # Two wins over GitHub-hosted ubuntu-latest: (1) same-region as the sccache S3
 # bucket, so cache transfer is free (ubuntu-latest pulled it over the internet —
@@ -41,6 +42,9 @@ env:
 #
 # AWS creds from the OIDC step are passed into the container by name (`-e VAR`
 # with no value forwards the host value) so the image's sccache reaches S3.
+#
+# The merge-gate `build` job stays on ubuntu-latest for now (arm64 default-feature
+# test validation is not green yet) — see its inline note.
 jobs:
   clippy:
     name: Clippy
@@ -134,7 +138,11 @@ jobs:
     # merge queue. (Per-PR AppImage artifacts were dropped with the PR build; the
     # `appimage.yml` workflow still builds the AppImage on push to `main`.)
     if: github.event_name != 'pull_request'
-    runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
+    # NOTE: the merge-gate build+test stays on ubuntu-latest for now. The arm64
+    # default-feature nextest suite has NOT been validated green on Graviton yet
+    # (runner-smoke test run failed), so the required gate does not move until it
+    # is. clippy + wasm (above) run on Graviton via podman run; this job does not.
+    runs-on: ubuntu-latest
     needs: clippy  # Only build if clippy passes
     # Merge-gate backstop: fail before the merge queue's 120min timeout (ruleset
     # check_response_timeout_minutes) so a hang yields a definitive failure and the
@@ -142,9 +150,14 @@ jobs:
     # nextest step uses the ci-test Cargo profile to avoid release ThinLTO on test
     # binaries, so 90min should retain headroom while catching regressions.
     timeout-minutes: 90
+    env:
+      SCCACHE_IDLE_TIMEOUT: 0
 
     steps:
     - uses: actions/checkout@v4
+
+    - name: Install build dependencies
+      run: sudo apt-get update && sudo apt-get install -y capnproto libsystemd-dev pkg-config libssl-dev
 
     - name: Configure AWS credentials (OIDC → sccache S3)
       uses: aws-actions/configure-aws-credentials@v4
@@ -152,44 +165,53 @@ jobs:
         role-to-assume: ${{ vars.AWS_SCCACHE_ROLE_ARN }}
         aws-region: ${{ vars.AWS_SCCACHE_REGION }}
 
-    - name: Pull builder image
-      run: podman pull "$BUILDER_IMAGE"
+    - name: Setup sccache
+      uses: mozilla-actions/sccache-action@v0.0.9
 
-    # Whole build+test in ONE `podman run` so the target dir and wasm guest
-    # artifacts persist across the sequence. libtorch from the image; default
-    # features (systemd/kata-vm/oci-image/otel/gittorrent/xet) — NOT
-    # download-libtorch (x86-only zip). The wasm-guest `cd`-into-crate-dir dance
-    # is preserved verbatim from the ubuntu job (see #1013/#1016): cargo reads
-    # each guest's .cargo/config.toml from the INVOCATION cwd, not --manifest-path.
-    - name: Build + tests (in rust-builder container)
-      env:
-        SCCACHE_IDLE_TIMEOUT: 0
+    - name: Build
+      run: cargo build --release --verbose --features download-libtorch
+
+    - name: Build wasm guest artifacts (for sandbox/mount tests)
+      # The workers-python / workers-wasmtime sandbox tests hard-fail under CI
+      # (deny-on-missing-guest guard) when their wasm guest artifacts are absent —
+      # the guard forces CI to actually exercise the sandbox. These guests are
+      # EXCLUDED standalone crates with their own target dirs, so build them
+      # explicitly; nextest locates them via HYPRSTREAM_*_WASM on the test step.
+      #
+      # IMPORTANT: `cd` into each guest crate dir before building. Cargo discovers
+      # .cargo/config.toml from the INVOCATION cwd, NOT the --manifest-path dir, so
+      # building from the repo root misses crates/hyprstream-workers-python-guest/
+      # .cargo/config.toml — which sets `--cfg getrandom_backend="custom"` for the
+      # wasm32-unknown-unknown target. Without it getrandom emits a hard
+      # compile_error!("...wasm32-unknown-unknown targets are not supported...").
+      # cd-ing in is the only invocation that honors the per-crate config (the
+      # fsguest has no such config today, but the same pattern is correct for both
+      # and is robust to a future config being added). See #1013 follow-up.
       run: |
-        podman run --rm \
-          -v "$PWD":/build:Z -w /build \
-          -e RUSTC_WRAPPER=sccache -e SCCACHE_BUCKET -e SCCACHE_REGION -e SCCACHE_IDLE_TIMEOUT \
-          -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
-          -e AWS_REGION -e AWS_DEFAULT_REGION \
-          -e LIBTORCH=/opt/libtorch -e LD_LIBRARY_PATH=/opt/libtorch/lib \
-          -e LIBTORCH_BYPASS_VERSION_CHECK=1 -e OPENSSL_NO_VENDOR=1 \
-          -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always \
-          "$BUILDER_IMAGE" \
-          bash -euo pipefail -c '
-            cargo build --release --verbose
+        rustup target add wasm32-unknown-unknown wasm32-wasip1
+        ( cd crates/hyprstream-workers-python-guest && \
+          cargo build --release --target wasm32-unknown-unknown )
+        ( cd crates/hyprstream-workers-wasmtime-fsguest && \
+          cargo build --release --target wasm32-wasip1 )
 
-            rustup target add wasm32-unknown-unknown wasm32-wasip1
-            ( cd crates/hyprstream-workers-python-guest && \
-              cargo build --release --target wasm32-unknown-unknown )
-            ( cd crates/hyprstream-workers-wasmtime-fsguest && \
-              cargo build --release --target wasm32-wasip1 )
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@nextest
 
-            cargo install cargo-nextest --locked || true
+    - name: Run tests (nextest, per-test timeout)
+      # nextest enforces the per-TEST slow-timeout from .config/nextest.toml
+      # ([profile.ci]): a single deadlocked test is SIGKILLed after ~3min and fails
+      # fast, instead of stalling the job until the 90min job / 120min queue
+      # timeout. The cap is per-test on purpose — the legit suite is long (~76min),
+      # so a per-step timeout could not tell a hang from healthy runtime.
+      env:
+        HYPRSTREAM_PYGUEST_WASM: ${{ github.workspace }}/crates/hyprstream-workers-python-guest/target/wasm32-unknown-unknown/release/hyprstream_workers_python_guest.wasm
+        HYPRSTREAM_FSGUEST_WASM: ${{ github.workspace }}/crates/hyprstream-workers-wasmtime-fsguest/target/wasm32-wasip1/release/hyprstream-workers-wasmtime-fsguest.wasm
+      run: cargo nextest run --cargo-profile ci-test --profile ci --features download-libtorch
 
-            export HYPRSTREAM_PYGUEST_WASM=/build/crates/hyprstream-workers-python-guest/target/wasm32-unknown-unknown/release/hyprstream_workers_python_guest.wasm
-            export HYPRSTREAM_FSGUEST_WASM=/build/crates/hyprstream-workers-wasmtime-fsguest/target/wasm32-wasip1/release/hyprstream-workers-wasmtime-fsguest.wasm
-            cargo nextest run --cargo-profile ci-test --profile ci
+    - name: Run doctests
+      # nextest does not run doctests; keep them in the merge gate.
+      run: cargo test --release --doc --features download-libtorch
 
-            cargo test --release --doc
-
-            sccache --show-stats
-          '
+    - name: sccache stats
+      if: always()
+      run: sccache --show-stats
