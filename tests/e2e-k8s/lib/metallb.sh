@@ -10,7 +10,7 @@
 #   2. Apply metallb native manifests (CRDs + controller + the IPAddressPool +
 #      L2Advertisement) pointing at that pool.
 #
-# metallb is OPTIONAL for the spikes: #799 is fully runnable over a stable
+# metallb is OPTIONAL: LoadBalancer cases can fall back to a stable
 # NodePort (up.sh maps 30443 host<->node), and #458 only needs a ClusterIP
 # service + endpoint flapping, no LB at all. So a failure here is downgraded to
 # a warning by up.sh.
