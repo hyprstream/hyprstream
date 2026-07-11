@@ -81,22 +81,57 @@ pub fn validate_did(s: &str) -> Result<()> {
 }
 
 /// `format: "datetime"` — atproto ISO-8601 UTC, millisecond precision, `Z`.
+///
+/// The canonical shape is exactly `YYYY-MM-DDTHH:MM:SS.mmmZ`, and the fields
+/// are checked semantically (real month/day bounds incl. leap years, 24-hour
+/// clock), not just for separator positions.
 pub fn validate_datetime(s: &str) -> Result<()> {
     ensure!(s.ends_with('Z'), "datetime must end with 'Z' (UTC): {s:?}");
     let pre = &s[..s.len() - 1];
-    ensure!(pre.len() >= 20, "datetime too short: {s:?}");
     let bytes = pre.as_bytes();
+    ensure!(
+        bytes.len() == 23,
+        "datetime must be YYYY-MM-DDTHH:MM:SS.mmm (millisecond precision): {s:?}"
+    );
     ensure!(
         bytes[4] == b'-'
             && bytes[7] == b'-'
             && bytes[10] == b'T'
             && bytes[13] == b':'
-            && bytes[16] == b':',
-        "datetime must be ISO-8601 (YYYY-MM-DDTHH:MM:SS): {s:?}"
+            && bytes[16] == b':'
+            && bytes[19] == b'.',
+        "datetime must be ISO-8601 (YYYY-MM-DDTHH:MM:SS.mmm): {s:?}"
     );
     ensure!(
-        bytes.get(19) == Some(&b'.'),
-        "datetime must have millisecond precision (.mmm): {s:?}"
+        bytes
+            .iter()
+            .enumerate()
+            .all(|(i, b)| matches!(i, 4 | 7 | 10 | 13 | 16 | 19) || b.is_ascii_digit()),
+        "datetime must be all digits outside its separators: {s:?}"
+    );
+    // Every field is all-digit and <= 4 chars, so parse cannot fail — but stay
+    // panic-free anyway (u32::MAX falls out of every range below).
+    let num = |lo: usize, hi: usize| pre[lo..hi].parse::<u32>().unwrap_or(u32::MAX);
+    let (year, month, day) = (num(0, 4), num(5, 7), num(8, 10));
+    let (hour, minute, second) = (num(11, 13), num(14, 16), num(17, 19));
+    ensure!(
+        (1..=12).contains(&month),
+        "datetime month out of range: {s:?}"
+    );
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => 31,
+    };
+    ensure!(
+        (1..=days_in_month).contains(&day),
+        "datetime day out of range: {s:?}"
+    );
+    ensure!(
+        hour <= 23 && minute <= 59 && second <= 59,
+        "datetime time out of range: {s:?}"
     );
     Ok(())
 }
@@ -412,6 +447,35 @@ mod tests {
         )
         .is_err());
         assert!(ListRecord::new("g", "did:web:x", None, "2026", ()).is_err());
+    }
+
+    #[test]
+    fn datetime_is_validated_semantically() {
+        // Valid millisecond-precision UTC datetimes are accepted.
+        for ok in [
+            "2026-06-23T12:34:56.789Z",
+            "2024-02-29T00:00:00.000Z", // leap day in a leap year
+            "2026-12-31T23:59:59.999Z",
+        ] {
+            assert!(validate_datetime(ok).is_ok(), "{ok:?} must be accepted");
+        }
+        for bad in [
+            "2026-99-99T99:99:99.999Z",  // nonsense month/day/time
+            "2026-00-10T12:00:00.000Z",  // month 0
+            "2026-13-10T12:00:00.000Z",  // month 13
+            "2026-04-31T12:00:00.000Z",  // April has 30 days
+            "2026-02-29T12:00:00.000Z",  // not a leap year
+            "2026-06-23T24:00:00.000Z",  // hour 24
+            "2026-06-23T12:60:00.000Z",  // minute 60
+            "2026-06-23T12:34:60.000Z",  // second 60
+            "2026-06-23T12:34:56.Z",     // missing fractional digits
+            "2026-06-23T12:34:56.78Z",   // not millisecond precision
+            "2026-06-23T12:34:56.7890Z", // too many fractional digits
+            "2026-06-23T12:34:56.789",   // missing Z
+            "aaaa-aa-aaTaa:aa:aa.aaaZ",  // separators only, no digits
+        ] {
+            assert!(validate_datetime(bad).is_err(), "{bad:?} must be rejected");
+        }
     }
 
     #[test]

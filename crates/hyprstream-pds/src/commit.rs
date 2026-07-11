@@ -140,6 +140,17 @@ impl Commit {
         ])
     }
 
+    /// Classify this commit's account DID as an accepted repo authority for our
+    /// PDS (`did:web`/`did:plc`/`did:at9p`), or `Err` if the method is not one we
+    /// host a repo for.
+    ///
+    /// This is the method-level acceptance gate (#908); it is independent of and
+    /// additional to the signature check in [`Commit::verify`]. A caller ingesting
+    /// a commit should accept the authority *and* verify the signature.
+    pub fn repo_authority(&self) -> Result<crate::repo_authority::RepoAuthority> {
+        crate::repo_authority::accept_repo_authority(&self.did)
+    }
+
     /// The [`UnsignedCommit`] form of this commit (drops `sig`).
     pub fn unsigned(&self) -> UnsignedCommit {
         UnsignedCommit {
