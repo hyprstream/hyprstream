@@ -54,7 +54,6 @@ use anyhow::{ensure, Result};
 
 use crate::cid::Cid;
 use crate::dag_cbor::DagCbor;
-use crate::ledger::validate_cid_string;
 use crate::list_record::{map_get_str, validate_datetime, validate_nonempty};
 
 /// The NSID of this record type — the collection portion of an at-uri that
@@ -70,13 +69,13 @@ pub struct NameRecord {
     /// The **DID URL** this name resolves to, carried opaquely. Must be a
     /// `did:`-scheme DID URL (it may carry a path/query/fragment); it dereferences
     /// via G1. Never an `at://` URI and never a 9P path.
-    pub subject: String,
+    subject: String,
     /// The content pin — a `format: "cid"` string addressing the pinned content.
-    pub pin: String,
+    pin: String,
     /// A human-readable label for this name.
-    pub label: String,
+    label: String,
     /// ISO-8601 UTC datetime (`format: "datetime"`), millisecond precision, `Z`.
-    pub created_at: String,
+    created_at: String,
 }
 
 impl NameRecord {
@@ -96,7 +95,7 @@ impl NameRecord {
         let label = label.into();
         let created_at = created_at.into();
         validate_did_url(&subject)?;
-        validate_cid_string(&pin, "pin")?;
+        validate_pin_cid(&pin)?;
         validate_nonempty(&label, "label")?;
         validate_datetime(&created_at)?;
         Ok(Self {
@@ -105,6 +104,26 @@ impl NameRecord {
             label,
             created_at,
         })
+    }
+
+    /// The DID URL this name resolves to.
+    pub fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    /// The content CID string pinned by this name.
+    pub fn pin(&self) -> &str {
+        &self.pin
+    }
+
+    /// Human-readable label for this name.
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// Creation timestamp in canonical atproto datetime shape.
+    pub fn created_at(&self) -> &str {
+        &self.created_at
     }
 
     /// Encode to canonical DAG-CBOR bytes (deterministic).
@@ -163,7 +182,10 @@ fn validate_did_url(s: &str) -> Result<()> {
         "subject must be a did: DID URL (not an at-uri or 9P path): {s:?}"
     );
     let rest = &s[4..];
-    ensure!(!rest.is_empty(), "subject DID URL must have a method: {s:?}");
+    ensure!(
+        !rest.is_empty(),
+        "subject DID URL must have a method: {s:?}"
+    );
     ensure!(
         !rest.chars().any(char::is_whitespace),
         "subject DID URL must not contain whitespace: {s:?}"
@@ -175,7 +197,50 @@ fn validate_did_url(s: &str) -> Result<()> {
         !method.is_empty() && !id.is_empty(),
         "subject must be \"did:<method>:<id>[/path][?query][#fragment]\": {s:?}"
     );
+    ensure!(
+        !matches!(id.as_bytes().first(), Some(b'/' | b'?' | b'#')),
+        "subject DID URL must include a method-specific id before any path/query/fragment: {s:?}"
+    );
     Ok(())
+}
+
+fn validate_pin_cid(s: &str) -> Result<()> {
+    hyprstream_rpc::cid::decode_cid(s)
+        .map(|_| ())
+        .map_err(|err| anyhow::anyhow!("pin must be a parseable CIDv1 base32 string: {s:?}: {err}"))
+}
+
+#[cfg(test)]
+fn sample_pin() -> String {
+    hyprstream_rpc::cid::encode_cid(
+        hyprstream_rpc::cid::Codec::GitRaw,
+        hyprstream_rpc::cid::HashAlgo::Sha2_256,
+        &[0x42; 32],
+    )
+    .expect("valid sample CID")
+}
+
+#[cfg(test)]
+fn sample_at9p_pin() -> String {
+    hyprstream_rpc::cid::encode_cid(
+        hyprstream_rpc::cid::Codec::At9pCapsule,
+        hyprstream_rpc::cid::HashAlgo::Blake3,
+        &[0x24; 64],
+    )
+    .expect("valid sample at9p CID")
+}
+
+#[cfg(test)]
+fn truncated_pin() -> String {
+    hyprstream_rpc::cid::encode_cid(
+        hyprstream_rpc::cid::Codec::GitRaw,
+        hyprstream_rpc::cid::HashAlgo::Sha2_256,
+        &[0x11; 32],
+    )
+    .expect("valid CID")
+    .chars()
+    .take(12)
+    .collect()
 }
 
 #[cfg(test)]
@@ -191,7 +256,7 @@ mod tests {
     fn sample() -> NameRecord {
         NameRecord::new(
             "did:web:alice.example.com/models/qwen3",
-            "bafyreiexamplepin1234567890abcdefghij",
+            sample_pin(),
             "qwen3-serving",
             "2026-06-23T12:34:56.789Z",
         )
@@ -236,12 +301,12 @@ mod tests {
         // The acceptance case: a did:at9p DID URL as subject.
         let r = NameRecord::new(
             "did:at9p:bafkrei1234567890abcdefghijklmnop#service",
-            "bafyreiexamplepin1234567890abcdefghij",
+            sample_at9p_pin(),
             "my-node",
             "2026-06-23T12:34:56.789Z",
         )
         .expect("did:at9p subject must be accepted");
-        assert!(r.subject.starts_with("did:at9p:"));
+        assert!(r.subject().starts_with("did:at9p:"));
     }
 
     #[test]
@@ -250,7 +315,7 @@ mod tests {
         // record; the body resolves onward to a DID URL.
         assert!(NameRecord::new(
             "at://did:web:alice.example.com/ai.hyprstream.model/3kxy",
-            "bafyreiexamplepin1234567890abcdefghij",
+            sample_pin(),
             "bad",
             "2026-06-23T12:34:56.789Z",
         )
@@ -262,7 +327,7 @@ mod tests {
         // A raw 9P path must never leak into the at:// / record layer (#879).
         assert!(NameRecord::new(
             "/models/qwen3/adapters",
-            "bafyreiexamplepin1234567890abcdefghij",
+            sample_pin(),
             "bad",
             "2026-06-23T12:34:56.789Z",
         )
@@ -270,31 +335,47 @@ mod tests {
     }
 
     #[test]
+    fn rejects_did_url_without_method_specific_id_before_suffix() {
+        for subject in ["did:web:/models/qwen3", "did:web:?q", "did:web:#f"] {
+            assert!(
+                NameRecord::new(subject, sample_pin(), "bad", "2026-06-23T12:34:56.789Z",).is_err(),
+                "{subject:?} must not treat a URL suffix delimiter as the DID id"
+            );
+        }
+
+        NameRecord::new(
+            "did:web:alice.example.com/models/qwen3?version=1#svc",
+            sample_pin(),
+            "ok",
+            "2026-06-23T12:34:56.789Z",
+        )
+        .expect("valid DID URL suffix after method-specific id");
+    }
+
+    #[test]
     fn validates_formats() {
         // Bad pin (not a cid).
+        assert!(NameRecord::new("did:web:x", "x", "l", "2026-06-23T12:34:56.789Z").is_err());
+        // Bad pin (malformed base32 CID body).
+        assert!(
+            NameRecord::new("did:web:x", "b!!!!!!!!", "l", "2026-06-23T12:34:56.789Z").is_err()
+        );
+        // Bad pin (valid base32 prefix but truncated multihash/CID body).
         assert!(NameRecord::new(
             "did:web:x",
-            "x",
+            truncated_pin(),
             "l",
             "2026-06-23T12:34:56.789Z"
         )
         .is_err());
         // Empty label.
-        assert!(NameRecord::new(
-            "did:web:x",
-            "bafyreiexamplepin1234567890abcdefghij",
-            "",
-            "2026-06-23T12:34:56.789Z"
-        )
-        .is_err());
+        assert!(
+            NameRecord::new("did:web:x", sample_pin(), "", "2026-06-23T12:34:56.789Z").is_err()
+        );
         // Bad datetime.
-        assert!(NameRecord::new(
-            "did:web:x",
-            "bafyreiexamplepin1234567890abcdefghij",
-            "l",
-            "2026-06-23T12:34:56.789"
-        )
-        .is_err());
+        assert!(
+            NameRecord::new("did:web:x", sample_pin(), "l", "2026-06-23T12:34:56.789").is_err()
+        );
     }
 
     #[test]
@@ -310,13 +391,8 @@ mod tests {
     #[test]
     fn deterministic_across_rebuild() {
         let r1 = sample();
-        let r2 = NameRecord::new(
-            r1.subject.clone(),
-            r1.pin.clone(),
-            r1.label.clone(),
-            r1.created_at.clone(),
-        )
-        .expect("rebuild");
+        let r2 =
+            NameRecord::new(r1.subject(), r1.pin(), r1.label(), r1.created_at()).expect("rebuild");
         assert_eq!(r1.to_dag_cbor(), r2.to_dag_cbor());
         assert_eq!(r1.cid(), r2.cid());
     }
