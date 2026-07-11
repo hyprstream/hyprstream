@@ -34,6 +34,8 @@ RUN echo "deb http://deb.debian.org/debian bookworm-backports main" >> /etc/apt/
     ca-certificates \
     capnproto \
     cmake \
+    clang \
+    libclang-dev \
     && apt-get install -y -t bookworm-backports binutils \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
