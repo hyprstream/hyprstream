@@ -30,15 +30,17 @@
 //!   progress ([`DuplicityKind::HigherEpochFork`]);
 //! * a candidate at `epoch == watermark.epoch` with a **different** digest is a
 //!   same-epoch fork ([`DuplicityKind::SameEpochFork`]);
-//! * any B1-valid candidate at `epoch < watermark.epoch` is a branch reaching an
+//! * any candidate at `epoch < watermark.epoch` is a branch reaching an
 //!   already-passed epoch ([`DuplicityKind::BelowWatermarkFork`]) — we hold only
-//!   the high-watermark, not full history, so a valid record below it is never
+//!   the high-watermark, not full history, so a record below it is never
 //!   preferred and never silently dropped: it fails closed.
 //!
 //! Every one of those is **duplicity: hard fail-closed for that DID plus an
 //! operator alarm** — never a mere "lower-epoch reject", never a fork selection.
 //! The watermark advances **only** on a non-divergent, honestly-anchored
-//! successor.
+//! successor. Non-advancing verdicts are classified from the candidate's own
+//! digest/epoch without running B1 (see [`DuplicityKind`] on why the alarm is an
+//! *unauthenticated* divergence indication).
 //!
 //! # B3 (#887): empty / exhausted commitment semantics
 //!
@@ -288,17 +290,33 @@ impl WatermarkStore for InMemoryWatermarkStore {
 
 /// Which of the three fork shapes tripped duplicity detection. B4 (#888) can use
 /// this to grade the operator response; all three are equally fail-closed here.
+///
+/// # Authentication of the divergent record (#961)
+///
+/// These verdicts are classified from the candidate's **own** epoch and
+/// recomputed `H512` against the persisted watermark — B1 is deliberately NOT
+/// run first. It cannot be: validating a candidate at `epoch <= watermark.epoch`
+/// needs its committing predecessor (the accepted record at `epoch - 1`), which
+/// R6 watermark-only persistence does not retain, and re-accepting a
+/// caller-supplied predecessor for that purpose is exactly the forgeable input
+/// #961 removed (the pre-#961 "B1-valid" property was validated against a
+/// caller-forged `ChainState`, i.e. hollow). A duplicity verdict is therefore an
+/// **unauthenticated divergence indication** — evidence that *something*
+/// presented a record diverging from the accepted history, not proof the
+/// identity holder signed it. The admission decision itself is unaffected
+/// (fail-closed either way); alarm consumers (B4/#888) must treat alarms as
+/// pointers for investigation, not as attributable equivocation proof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DuplicityKind {
-    /// A B1-valid record at `epoch == watermark.epoch` with a **different**
-    /// record digest than the one accepted at that epoch — a classic equivocation
-    /// (two valid rotations at the same epoch).
+    /// A record at `epoch == watermark.epoch` with a **different** record digest
+    /// than the one accepted at that epoch — an equivocation indication (two
+    /// records at the same epoch).
     SameEpochFork,
-    /// A B1-valid record at `epoch < watermark.epoch`: a branch reaching an epoch
-    /// the client has already passed. We hold only the high-watermark, so this is
+    /// A record at `epoch < watermark.epoch`: a branch reaching an epoch the
+    /// client has already passed. We hold only the high-watermark, so this is
     /// never preferred over it and never silently dropped — it fails closed.
     BelowWatermarkFork,
-    /// A B1-valid record at `epoch > watermark.epoch` that chains through a
+    /// A record at `epoch > watermark.epoch` that chains through a
     /// predecessor other than the watermark head — a higher-epoch record on the
     /// attacker's fork rather than the client's accepted history (design #879
     /// §7.2, the "never select max epoch" case). Caught at the advance-path
@@ -322,9 +340,11 @@ pub struct DuplicityAlarm {
     pub watermark_epoch: u64,
     /// Digest of the persisted, honestly-accepted watermark record.
     pub watermark_digest: [u8; H512_LEN],
-    /// Epoch of the divergent (but individually B1-valid) record.
+    /// Epoch of the divergent record. NOT authenticated — see [`DuplicityKind`]'s
+    /// "Authentication of the divergent record" note.
     pub divergent_epoch: u64,
-    /// Digest of the divergent (but individually B1-valid) record.
+    /// Recomputed `H512` of the divergent record's canonical bytes. NOT
+    /// authenticated — see [`DuplicityKind`].
     pub divergent_digest: [u8; H512_LEN],
 }
 
@@ -979,18 +999,28 @@ impl<S: WatermarkStore, A: DuplicityAlarmSink> DuplicityGuard<S, A> {
     ///
     /// # Order of checks (each fails closed before the next)
     ///
-    /// 1. **Terminal watermark (B3)** — if the DID's accepted head pre-commits to
-    ///    nothing, no successor is admissible; reject without consulting B1.
-    /// 2. **Position vs watermark (by the candidate's OWN digest)** — for any
-    ///    candidate at `epoch <= watermark.epoch`, the verdict depends only on the
-    ///    candidate (its epoch and its recomputed `H512`), never on a caller-
-    ///    supplied predecessor. So B1 is not run and no predecessor commitments
-    ///    are consulted, which is the #961 invariant in the small: the guard never
-    ///    trusts a predecessor field to classify a non-advancing record.
+    /// 1. **Idempotent replay** — `epoch == watermark.epoch` with the candidate's
+    ///    recomputed `H512` equal to the watermark digest is a byte-identical
+    ///    re-presentation of the accepted head → [`Admission::AlreadyKnown`], even
+    ///    when that head is terminal (a caller retrying a lost response after a
+    ///    [`Admission::Frozen`] acceptance must be able to learn it succeeded).
+    /// 2. **Terminal watermark (B3)** — if the DID's accepted head pre-commits to
+    ///    nothing, no new successor is admissible; reject without consulting B1.
+    /// 3. **Position vs watermark (by the candidate's OWN digest)** — for any
+    ///    remaining candidate at `epoch <= watermark.epoch`, the verdict depends
+    ///    only on the candidate (its epoch and its recomputed `H512`), never on a
+    ///    caller-supplied predecessor. So B1 is not run and no predecessor
+    ///    commitments are consulted, which is the #961 invariant in the small: the
+    ///    guard never trusts a predecessor field to classify a non-advancing
+    ///    record. Because B1 cannot run here (the committing predecessor at
+    ///    `epoch - 1` is not retained under R6 watermark-only persistence), these
+    ///    duplicity verdicts are **unauthenticated divergence indications**, not
+    ///    proof the identity holder signed the divergent record — see
+    ///    [`DuplicityAlarm`].
     ///    * `epoch < watermark` → [`DuplicityKind::BelowWatermarkFork`];
-    ///    * `epoch == watermark`, same digest → [`Admission::AlreadyKnown`];
-    ///    * `epoch == watermark`, different digest → [`DuplicityKind::SameEpochFork`].
-    /// 3. **Advance path — anchor then B1 (#961)** — for `epoch > watermark`,
+    ///    * `epoch == watermark` (digest necessarily differs after step 1) →
+    ///      [`DuplicityKind::SameEpochFork`].
+    /// 4. **Advance path — anchor then B1 (#961)** — for `epoch > watermark`,
     ///    recompute the predecessor's `H512` and require it to equal the
     ///    watermark digest BEFORE B1 runs, then derive the authoritative
     ///    `ChainState` from the anchored record. A predecessor that does not hash
@@ -1025,23 +1055,34 @@ impl<S: WatermarkStore, A: DuplicityAlarmSink> DuplicityGuard<S, A> {
                     subject_cid512: subject.clone(),
                 })?;
 
-            // (1) B3: a terminal identity admits no successor, ever. Checked first so
-            // a frozen DID short-circuits without spending a signature verify — and so
-            // the reason surfaced is "frozen", not an incidental later gate.
+            // (1) Idempotent replay of the accepted head: same epoch AND same
+            // recomputed digest as the persisted watermark means the candidate is
+            // byte-identical to the record we already accepted. Return AlreadyKnown —
+            // even when that head is terminal — so a caller retrying a rotation after
+            // a lost response can learn its write already succeeded. No state changes
+            // and no alarm; checked before B3 so the terminal head's own record does
+            // not surface as FrozenIdentity.
+            let cand_epoch = candidate.epoch;
+            let cand_digest = record_digest(candidate);
+            if cand_epoch == watermark.epoch && cand_digest == watermark.record_digest {
+                return Ok(Admission::AlreadyKnown);
+            }
+
+            // (2) B3: a terminal identity admits no NEW successor, ever. Checked
+            // before the fork classification and B1 so a frozen DID short-circuits
+            // without spending a signature verify — and so the reason surfaced is
+            // "frozen", not an incidental later gate.
             if watermark.terminal {
                 return Err(AdmissionError::FrozenIdentity {
                     epoch: watermark.epoch,
                 });
             }
 
-            // (2) Position vs watermark by the candidate's OWN digest/epoch. These
+            // (3) Position vs watermark by the candidate's OWN digest/epoch. These
             // verdicts are independent of any predecessor, so B1 is not run and no
             // unanchored predecessor commitment is ever consulted (#961): the only
             // path that admits a successor — and therefore the only path that needs
             // B1's signer-authorization gate — is the advance path below.
-            let cand_epoch = candidate.epoch;
-            let cand_digest = record_digest(candidate);
-
             if cand_epoch < watermark.epoch {
                 // A valid record below the high-watermark. We keep only the
                 // watermark, not full history, so we cannot prove this is the record
@@ -1057,22 +1098,19 @@ impl<S: WatermarkStore, A: DuplicityAlarmSink> DuplicityGuard<S, A> {
             }
 
             if cand_epoch == watermark.epoch {
-                return if cand_digest == watermark.record_digest {
-                    // Byte-identical re-presentation of the record we already hold.
-                    Ok(Admission::AlreadyKnown)
-                } else {
-                    // Two individually-valid records at the same epoch → equivocation.
-                    Err(self.raise_duplicity(
-                        subject,
-                        DuplicityKind::SameEpochFork,
-                        &watermark,
-                        cand_epoch,
-                        cand_digest,
-                    ))
-                };
+                // The equal-digest case already returned AlreadyKnown at (1); a
+                // same-epoch candidate with a DIFFERENT digest is a divergent record
+                // at an epoch we have already accepted → equivocation indication.
+                return Err(self.raise_duplicity(
+                    subject,
+                    DuplicityKind::SameEpochFork,
+                    &watermark,
+                    cand_epoch,
+                    cand_digest,
+                ));
             }
 
-            // (3) Advance path (cand_epoch > watermark). ANCHOR (#961): recompute the
+            // (4) Advance path (cand_epoch > watermark). ANCHOR (#961): recompute the
             // predecessor's H512 from its bytes and refuse to trust ANY field of it
             // unless it matches the persisted watermark digest. This is the structural
             // enforcement — the next_key_commitments B1 is about to key off are proven
@@ -1103,13 +1141,13 @@ impl<S: WatermarkStore, A: DuplicityAlarmSink> DuplicityGuard<S, A> {
                 .to_chain_state()
                 .map_err(AdmissionError::MalformedPredecessor)?;
 
-            // (4) B1: is the candidate an authorized successor of the AUTHENTIC
+            // (5) B1: is the candidate an authorized successor of the AUTHENTIC
             // predecessor? `predecessor_state` is proven to be the watermark head, so
             // the signer-authorization gate keys off anchored commitments only.
             let state = validate_successor(&predecessor_state, candidate, now)
                 .map_err(AdmissionError::Successor)?;
 
-            // (5) Honest forward progress: the predecessor is the head and the
+            // (6) Honest forward progress: the predecessor is the head and the
             // candidate is a valid successor of it. Advance the watermark; freeze if
             // the new head pre-commits to nothing (B3).
             let terminal = state.next_key_commitments.is_empty();
@@ -1811,6 +1849,50 @@ mod tests {
             "expected FrozenIdentity at epoch 1, got {err:?}"
         );
         assert_eq!(guard.store_alarm_count(), 0);
+    }
+
+    /// Replaying the exact record that froze the identity (e.g. a retry after a
+    /// lost response) is AlreadyKnown, not FrozenIdentity: the caller must be
+    /// able to learn its terminal rotation already succeeded. No alarm, no
+    /// watermark change, still terminal.
+    #[test]
+    fn terminal_head_exact_replay_is_already_known() {
+        let (g, n1) = (signer(), signer());
+        let (cap0, s0) = genesis(&g, &[&n1]);
+        let guard = guard();
+        guard.seed_genesis(&s0).unwrap();
+
+        // Final rotation r1 (pre-commits to nothing) accepted → Frozen.
+        let r1 = update(&s0.subject_cid512, 1, s0.record_digest, &n1, &[]);
+        match guard
+            .admit_successor(PredecessorRecord::Genesis(&cap0), &r1, NOW)
+            .unwrap()
+        {
+            Admission::Frozen(_) => {}
+            other => panic!("expected Frozen, got {other:?}"),
+        }
+
+        // Byte-identical replay of r1: idempotent success, not FrozenIdentity.
+        let outcome = guard
+            .admit_successor(PredecessorRecord::Genesis(&cap0), &r1, NOW)
+            .unwrap();
+        assert_eq!(outcome, Admission::AlreadyKnown);
+        // Watermark untouched and still terminal; no alarm raised.
+        let wm = guard.watermark(&s0.subject_cid512).unwrap().unwrap();
+        assert_eq!(wm.epoch, 1);
+        assert!(wm.terminal);
+        assert_eq!(guard.store_alarm_count(), 0);
+
+        // A DIFFERENT record is still refused as frozen.
+        let (later,) = (signer(),);
+        let r2 = update(&s0.subject_cid512, 2, record_digest(&r1), &later, &[&later]);
+        let err = guard
+            .admit_successor(PredecessorRecord::Update(&r1), &r2, NOW)
+            .unwrap_err();
+        assert!(
+            matches!(err, AdmissionError::FrozenIdentity { epoch: 1 }),
+            "expected FrozenIdentity, got {err:?}"
+        );
     }
 
     // ---- fail-closed plumbing ---------------------------------------------
