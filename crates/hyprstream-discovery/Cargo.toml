@@ -46,6 +46,10 @@ tracing = { workspace = true }
 
 # Crypto (for signing keys)
 ed25519-dalek = { workspace = true }
+# #932 — the `#atproto` P-256 verifying key type named by the verified-by-
+# construction ingest seam (`RecordResolver::resolve_verifying_key`); also used
+# to build/verify real CAR proofs in getRecord + placement tests.
+p256 = { workspace = true }
 
 [dev-dependencies]
 # #431 / #524 — build/verify real CAR proofs in getRecord + placement tests.
