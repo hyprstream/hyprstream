@@ -9,7 +9,8 @@ source "${SCRIPT_DIR}/lib/common.sh"
 CLUSTER_NAME="${CLUSTER_NAME:-hyprstream}"
 export KIND_EXPERIMENTAL_PROVIDER=podman
 
-if kind_get_clusters | grep -qx "${CLUSTER_NAME}"; then
+clusters="$(kind_get_clusters)" || die "failed to query kind clusters via the podman provider"
+if grep -qx "${CLUSTER_NAME}" <<<"$clusters"; then
   log "deleting cluster '${CLUSTER_NAME}'"
   kind delete cluster --name "${CLUSTER_NAME}"
   log "done"

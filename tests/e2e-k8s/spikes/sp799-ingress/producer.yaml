@@ -19,7 +19,7 @@ spec:
       containers:
       - name: producer
         image: STANDIN_IMAGE
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: Always
         ports:
         - {name: quic, containerPort: 443, protocol: UDP}
         - {name: http, containerPort: 80, protocol: TCP}

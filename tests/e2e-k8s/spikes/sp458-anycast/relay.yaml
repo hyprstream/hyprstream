@@ -17,7 +17,7 @@ spec:
       containers:
       - name: relay
         image: __IMAGE__
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: Always
         ports: [{name: quic, containerPort: 443, protocol: UDP}]
         env:
         - {name: INSTANCE_ID, valueFrom: {fieldRef: {fieldPath: metadata.name}}}

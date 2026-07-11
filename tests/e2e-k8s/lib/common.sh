@@ -43,11 +43,13 @@ preflight() {
   # 2. cgroup v2 delegation. Rootless podman with cgroupManager=systemd needs the
   #    user delegated @set cpuset/cpu/io/memory/pids. This is the single most
   #    common kind-in-podman breakage. We can only READ this from the user slice.
-  local ucgroup="/sys/fs/cgroup/user.slice/$(id -u).user.slice"
+  local uid
+  uid="$(id -u)"
+  local ucgroup="/sys/fs/cgroup/user.slice/user-${uid}.slice/user@${uid}.service"
   if [[ -r "${ucgroup}/cgroup.controllers" ]]; then
     if ! grep -q memory "${ucgroup}/cgroup.controllers"; then
       warn "memory controller not delegated to your user slice"
-      warn "  fix: sudo systemctl edit user@$(id -u).service, add:"
+      warn "  fix: sudo systemctl edit user@${uid}.service, add:"
       warn "       [Service]"
       warn "       Delegate=yes"
       problems=$((problems+1))
@@ -57,7 +59,7 @@ preflight() {
     # don't hard-fail (some hosts expose it differently).
     warn "cannot read cgroup delegation state at ${ucgroup} —"
     warn "  if cluster bring-up fails with a cgroup/runc error, enable delegation:"
-    warn "  sudo mkdir -p /etc/systemd/system/user@$(id -u).service.d"
+    warn "  sudo mkdir -p /etc/systemd/system/user@${uid}.service.d"
     warn "  echo -e '[Service]\\nDelegate=yes' | sudo tee .../override.conf; systemctl daemon-reload"
     problems=$((problems+1))
   fi
@@ -91,7 +93,7 @@ preflight() {
 
   if (( problems > 0 )); then
     warn "${problems} pre-flight issue(s) found — bring-up may fail. See doctor.sh."
-    return 1
+    return "$problems"
   fi
   log "pre-flight OK"
   return 0
@@ -100,12 +102,12 @@ preflight() {
 # --- kind / kubectl wrappers (all force the podman provider) ---
 
 kind_get_clusters() {
-  KIND_EXPERIMENTAL_PROVIDER=podman kind get clusters 2>/dev/null || true
+  KIND_EXPERIMENTAL_PROVIDER=podman kind get clusters 2>/dev/null
 }
 
 kind_delete_cluster() {
   local name="$1"
-  KIND_EXPERIMENTAL_PROVIDER=podman kind delete cluster --name "$name" || true
+  KIND_EXPERIMENTAL_PROVIDER=podman kind delete cluster --name "$name"
 }
 
 write_kubeconfig() {
@@ -121,12 +123,21 @@ write_kubeconfig() {
 # Is the API server reachable AND answering? Used to decide reuse-vs-recreate.
 kube_ready() {
   local name="$1"
-  kube_ns_workers "$name" >/dev/null 2>&1
+  local workers
+  workers="$(kube_ns_workers "$name")" || return 1
+  (( workers > 0 ))
 }
 
 kube_ns_workers() {
-  kubectl --kubeconfig "$KUBECONFIG" get nodes \
-    --no-headers 2>/dev/null | grep -c . || true
+  local name="${1:-}"
+  if [[ -n "$name" ]]; then
+    mkdir -p "$(dirname "$KUBECONFIG")"
+    KIND_EXPERIMENTAL_PROVIDER=podman kind get kubeconfig --name "$name" > "$KUBECONFIG"
+  fi
+
+  local nodes
+  nodes="$(kubectl --kubeconfig "$KUBECONFIG" get nodes --no-headers 2>/dev/null)" || return 1
+  awk '$2 ~ /(^|,)Ready(,|$)/ { ready++ } END { print ready + 0; exit ready > 0 ? 0 : 1 }' <<<"$nodes"
 }
 
 # Locate a free TCP port on the host (best-effort, for ad-hoc port-forwards).

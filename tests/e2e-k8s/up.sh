@@ -26,7 +26,8 @@ export PODMAN_USERNS=keep-id
 preflight
 
 # Reuse an existing, healthy cluster if present (cheap re-run path).
-if kind_get_clusters | grep -qx "${CLUSTER_NAME}"; then
+clusters="$(kind_get_clusters)" || die "failed to query kind clusters via the podman provider"
+if grep -qx "${CLUSTER_NAME}" <<<"$clusters"; then
   if [[ "${RECREATE}" == "1" ]]; then
     log "found existing cluster '${CLUSTER_NAME}', recreating (--recreate)"
     kind_delete_cluster "${CLUSTER_NAME}"
