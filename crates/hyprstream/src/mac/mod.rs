@@ -205,8 +205,13 @@ static COMPILED_POLICY: std::sync::OnceLock<std::sync::Arc<CompiledPolicy>> =
 /// a newer, verified generation replaces an older one atomically — is the
 /// follow-up; until then callers must treat `false` as "the global seam still
 /// holds the earlier policy", never as success.
+// `pub(crate)` — this seam installs `policy` WITHOUT re-verifying it (the caller
+// MUST have already run it through `PolicyLoader`). Keeping it crate-private
+// prevents an out-of-crate caller from bypassing the verify-once-at-load path and
+// pinning an unsigned / classical-only policy into the process-global seam. The
+// only caller is `bootload`, which self-verifies through the full sign→load path.
 #[must_use]
-pub fn install_compiled_policy(policy: std::sync::Arc<CompiledPolicy>) -> bool {
+pub(crate) fn install_compiled_policy(policy: std::sync::Arc<CompiledPolicy>) -> bool {
     COMPILED_POLICY.set(policy).is_ok()
 }
 
