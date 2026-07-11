@@ -1,67 +1,81 @@
 name: Graviton Build Validation
 
-# Non-required validation (#1011): run the real hyprstream build+deps on a
-# self-hosted Graviton (arm64, Rocky 10) runner to find what breaks BEFORE cutting
-# the required merge-gate `build` job over to arm64. workflow_dispatch only.
+# Non-required validation (#1011): compile the hyprstream workspace on a
+# self-hosted Graviton (arm64, Rocky 10, podman-only) runner INSIDE the arm64
+# rust-builder container — the same layer the merge-gate `build` job will use.
+#
+# The golden AMI has no toolchain by design; everything (rust, capnproto,
+# libtorch) lives in the container. We therefore:
+#   1. podman build the arm64 builder image (Dockerfile target builder-cpu-arm64),
+#      which installs rust + capnproto + the aarch64 torch wheel's libtorch.
+#   2. podman run the workspace `cargo build` inside it (CI feature set), with the
+#      repo bind-mounted — mirroring how a `container:` merge-gate job would run.
+#
+# Trigger: push to this branch (workflow_dispatch won't work until the workflow
+# reaches the default branch).
 on:
   workflow_dispatch:
   push:
     branches: [ewindisch/runner-smoke-test]
-    paths: ['.github/workflows/graviton-build-validate.yml']
+    paths:
+      - '.github/workflows/graviton-build-validate.yml'
+      - 'Dockerfile'
 
 permissions:
-  id-token: write   # OIDC → sccache S3 role
   contents: read
-
-env:
-  RUSTC_WRAPPER: sccache
-  SCCACHE_BUCKET: ${{ vars.AWS_SCCACHE_BUCKET }}
-  SCCACHE_REGION: ${{ vars.AWS_SCCACHE_REGION }}
-  CARGO_TERM_COLOR: always
 
 jobs:
   build-arm64:
     runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
-    timeout-minutes: 90
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
 
-      - name: Arch + OS sanity
-        run: uname -m && cat /etc/os-release | head -2
-
-      # Rocky/dnf, not ubuntu/apt. capnproto (EPEL), systemd + openssl headers,
-      # and a C/C++ toolchain for the native crates + libtorch glue.
-      - name: Install build dependencies (Rocky/dnf)
+      - name: Arch + OS + podman sanity
         run: |
-          sudo dnf install -y --setopt=install_weak_deps=False \
-            capnproto systemd-devel openssl-devel pkgconf-pkg-config \
-            gcc gcc-c++ cmake make git which
+          uname -m
+          . /etc/os-release && echo "$PRETTY_NAME"
+          podman --version
+          nproc
 
-      # Toolchain is not baked into the golden AMI (that's for the build container,
-      # #996). Install rustup for this validation.
-      - name: Install rust toolchain
+      # Build the toolchain+libtorch image only (not the cargo-build `builder`
+      # stage) so the compile happens in the `podman run` below, where we can see
+      # cargo output live and iterate on the container:-style invocation.
+      - name: Build arm64 builder image
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          podman build \
+            --target builder-cpu-arm64 \
+            --build-arg VARIANT=cpu-arm64 \
+            -t hyprstream-builder-arm64:ci \
+            -f Dockerfile \
+            .
 
-      - name: Configure AWS credentials (OIDC → sccache S3)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.AWS_SCCACHE_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_SCCACHE_REGION }}
+      # Prove libtorch is the aarch64 wheel's and readable inside the container.
+      - name: Verify libtorch (arm64) in image
+        run: |
+          podman run --rm hyprstream-builder-arm64:ci sh -c '
+            set -e
+            echo "arch: $(uname -m)"
+            echo "LIBTORCH=$LIBTORCH"
+            file /opt/libtorch/lib/libtorch_cpu.so | head -1
+            ls /opt/libtorch/include/torch >/dev/null && echo "headers OK"
+            rustc -vV | head -2
+            capnp --version
+          '
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-
-      - name: rustc version
-        run: rustc -vV && cargo --version
-
-      # THE make-or-break: does `download-libtorch` provide an aarch64-linux binary?
-      # If this step fails on a missing libtorch URL, arm64 needs a source build or a
-      # prebuilt arm64 libtorch (bake into the AMI / build container) before cutover.
-      - name: Build (release, download-libtorch)
-        run: cargo build --release --verbose --features download-libtorch
-
-      - name: sccache stats
-        if: always()
-        run: sccache --show-stats
+      # The actual validation: compile the workspace with the CI feature set
+      # inside the container, repo bind-mounted. sccache runs as a local
+      # in-container disk cache (SCCACHE_DIR=/sccache from the image) — no S3
+      # wiring yet, keeping the first-cut failure surface minimal.
+      - name: Compile workspace in container (release, CI features)
+        run: |
+          podman run --rm \
+            -v "$PWD":/build:Z \
+            -w /build \
+            -e OPENSSL_NO_VENDOR=1 \
+            -e LIBTORCH=/opt/libtorch \
+            -e LD_LIBRARY_PATH=/opt/libtorch/lib \
+            -e LIBTORCH_BYPASS_VERSION_CHECK=1 \
+            -e CARGO_TERM_COLOR=always \
+            hyprstream-builder-arm64:ci \
+            cargo build --release --no-default-features --features otel,gittorrent,xet
