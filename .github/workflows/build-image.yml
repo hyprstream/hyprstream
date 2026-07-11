@@ -1,0 +1,58 @@
+name: Build arm64 rust-builder image
+
+# Publish the reusable aarch64 rust-builder image (Dockerfile target
+# builder-cpu-arm64) to GHCR so merge-gate/CI jobs PULL a pre-built toolchain
+# image (rust + capnproto + clang + the aarch64 libtorch wheel) instead of
+# rebuilding it per job. sccache-S3 handles the incremental cargo cache on top.
+#
+# The image is built ON a Graviton runner (native arm64 — no qemu) and pushed
+# with both :latest and an immutable content tag (short SHA of the Dockerfile).
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, ewindisch/runner-smoke-test]
+    paths:
+      - 'Dockerfile'
+      - '.github/workflows/build-image.yml'
+  schedule:
+    # Weekly rebuild to pick up base-image/toolchain security updates.
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/hyprstream/rust-builder-arm64
+
+jobs:
+  publish-arm64-builder:
+    runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute immutable tag (Dockerfile content hash)
+        id: tag
+        run: |
+          h=$(git hash-object Dockerfile | cut -c1-12)
+          echo "sha=$h" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        run: podman login ghcr.io -u "$GITHUB_ACTOR" -p "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Build arm64 builder image
+        run: |
+          podman build \
+            --target builder-cpu-arm64 \
+            --build-arg VARIANT=cpu-arm64 \
+            -t "$IMAGE:latest" \
+            -t "$IMAGE:${{ steps.tag.outputs.date }}-${{ steps.tag.outputs.sha }}" \
+            -f Dockerfile \
+            .
+
+      - name: Push tags
+        run: |
+          podman push "$IMAGE:latest"
+          podman push "$IMAGE:${{ steps.tag.outputs.date }}-${{ steps.tag.outputs.sha }}"
