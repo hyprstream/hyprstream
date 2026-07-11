@@ -23,37 +23,23 @@
 //! send path (`RpcClientImpl::sign_envelope`) with the dial-time carrier
 //! classification ([`crate::transport::EndpointType::forbids_cleartext_envelope`]).
 //!
-//! # Current status — GATED on the HyKEM tunnel (#551 / #550)
+//! # Current status — fail-closed by default
 //!
-//! As of this writing the PQ-hybrid tunnel is **NOT wired into the RPC send
-//! path**: `RpcClientImpl::sign_envelope` always emits `encrypted_envelope =
-//! None`, and the only producer of an encrypted envelope
-//! (`SignedEnvelope::new_signed_encrypted_mesh_kem`) is exercised only in a
-//! unit test. Consequently, hard-enforcing INV-2 today would make **every** iroh
-//! (and cross-host QUIC) RPC fail closed — bricking federation — because nothing
-//! can currently produce a compliant encrypted envelope on that path.
-//!
-//! So enforcement is gated by [`HYKEM_IROH_TUNNEL_WIRED`]. Until that flips
-//! `true` (the HyKEM tunnel is made mandatory on iroh/relay send paths), the
-//! default mode is [`Inv2Mode::WarnOnly`]: the hole is recorded loudly at the
-//! send boundary but the send proceeds so the daemon keeps working. Operators
-//! (and tests) can force hard enforcement via `HYPRSTREAM_INV2=enforce` or
-//! [`set_inv2_mode`]. When the tunnel lands, flip [`HYKEM_IROH_TUNNEL_WIRED`] to
-//! `true` and the default becomes fail-closed [`Inv2Mode::Enforce`] with no
-//! caller change — that is the concrete "close the hole" step.
+//! The default mode is [`Inv2Mode::Enforce`]. Cleartext envelopes over iroh,
+//! relay, cross-host QUIC, and wasm WebTransport are refused before any byte
+//! reaches the transport unless a compliant encrypted envelope is present.
+//! Operators and tests may explicitly select the temporary warn/dev path via
+//! `HYPRSTREAM_INV2=warn` or [`set_inv2_mode`].
 
 use crate::error::{Result, RpcError};
 
-/// Prerequisite gate: `true` once the app-layer PQ-hybrid (HyKEM #551) tunnel is
-/// wired **mandatory** on iroh/relay RPC send paths so those paths can actually
-/// produce `encrypted_envelope = Some(..)`. While `false`, hard-enforcing INV-2
-/// would fail-close all such traffic, so the default mode is `WarnOnly`.
+/// Default enforcement gate for INV-2. `true` means the process fails closed on
+/// cleartext envelopes over untrusted carriers unless an explicit override
+/// selects [`Inv2Mode::WarnOnly`].
 ///
-/// Flip this to `true` **only** together with wiring the tunnel into
-/// `RpcClientImpl::sign_envelope` (or the transport send boundary). Doing so
-/// makes [`default_inv2_mode`] return [`Inv2Mode::Enforce`] — the fail-closed
-/// end state INV-2 requires — with no other change.
-pub const HYKEM_IROH_TUNNEL_WIRED: bool = false;
+/// Keep the name for the existing call sites and tests that treat this as the
+/// operator-confirmed "fail closed by default" bit for the HyKEM/iroh path.
+pub const HYKEM_IROH_TUNNEL_WIRED: bool = true;
 
 /// INV-2 enforcement mode for the send path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,8 +53,7 @@ pub enum Inv2Mode {
 /// The default mode when nothing has been explicitly configured.
 ///
 /// Fail-closed [`Inv2Mode::Enforce`] once [`HYKEM_IROH_TUNNEL_WIRED`] is `true`;
-/// [`Inv2Mode::WarnOnly`] until then (see module docs — enforcing before the
-/// tunnel exists bricks iroh).
+/// otherwise [`Inv2Mode::WarnOnly`] for explicitly carried development builds.
 pub const fn default_inv2_mode() -> Inv2Mode {
     if HYKEM_IROH_TUNNEL_WIRED {
         Inv2Mode::Enforce
@@ -80,9 +65,8 @@ pub const fn default_inv2_mode() -> Inv2Mode {
 #[cfg(not(target_arch = "wasm32"))]
 static INV2_MODE: std::sync::OnceLock<Inv2Mode> = std::sync::OnceLock::new();
 
-/// Name of the operator escape hatch. `enforce` forces fail-closed INV-2 even
-/// before the tunnel is wired (federation over iroh will then fail closed, as
-/// intended for a hardened deployment); `warn` forces warn-only.
+/// Name of the operator escape hatch. `enforce` forces fail-closed INV-2;
+/// `warn` forces the temporary warn-only/dev path.
 pub const INV2_ENV: &str = "HYPRSTREAM_INV2";
 
 /// Explicitly pin the process-global INV-2 mode. First write wins; returns the
@@ -110,8 +94,8 @@ pub fn inv2_mode() -> Inv2Mode {
 }
 
 /// WASM has no env/process-global config surface here; use the compile-time
-/// default (browser path is exactly the untrusted-carrier case INV-2 targets,
-/// but the tunnel-not-wired gate applies identically).
+/// default. The browser path is exactly the untrusted-carrier case INV-2
+/// targets, so it also defaults to fail-closed.
 #[cfg(target_arch = "wasm32")]
 pub fn inv2_mode() -> Inv2Mode {
     default_inv2_mode()
@@ -162,7 +146,11 @@ pub fn guard_cleartext_envelope(
     carrier_forbids_cleartext: bool,
     envelope_is_encrypted: bool,
 ) -> Result<()> {
-    match decide(inv2_mode(), carrier_forbids_cleartext, envelope_is_encrypted) {
+    match decide(
+        inv2_mode(),
+        carrier_forbids_cleartext,
+        envelope_is_encrypted,
+    ) {
         Inv2Decision::Allow => Ok(()),
         Inv2Decision::Warn => {
             #[cfg(not(target_arch = "wasm32"))]
@@ -173,8 +161,8 @@ pub fn guard_cleartext_envelope(
                         "INV-2 (ADR #1023): sending a CLEARTEXT SignedEnvelope over an \
                          untrusted carrier (iroh/relay/cross-host QUIC). Confidentiality is \
                          delegated to transport TLS (classical, native-only, HNDL). This is \
-                         permitted only because the PQ-hybrid HyKEM tunnel (#551) is not yet \
-                         wired on this path; set HYPRSTREAM_INV2=enforce to fail closed."
+                         permitted only because HYPRSTREAM_INV2=warn selected the temporary \
+                         warn-only/dev path; unset it or set HYPRSTREAM_INV2=enforce to fail closed."
                     );
                 });
             }
@@ -197,7 +185,10 @@ mod tests {
     fn trusted_carrier_always_allows() {
         // inproc/UDS classify as `carrier_forbids_cleartext = false`.
         assert_eq!(decide(Inv2Mode::Enforce, false, false), Inv2Decision::Allow);
-        assert_eq!(decide(Inv2Mode::WarnOnly, false, false), Inv2Decision::Allow);
+        assert_eq!(
+            decide(Inv2Mode::WarnOnly, false, false),
+            Inv2Decision::Allow
+        );
     }
 
     #[test]
@@ -220,20 +211,13 @@ mod tests {
         assert_eq!(decide(Inv2Mode::WarnOnly, true, false), Inv2Decision::Warn);
     }
 
-    /// Captures the INV-2 END STATE and its prerequisite. INV-2 requires the
-    /// default to be fail-closed [`Inv2Mode::Enforce`]. It currently is NOT,
-    /// because the HyKEM tunnel (#551) is not yet wired mandatory on iroh/relay
-    /// send paths ([`HYKEM_IROH_TUNNEL_WIRED`] == false) — hard-enforcing now
-    /// would fail-close all iroh RPC. This test is `#[ignore]`d until that
-    /// prerequisite lands; flipping `HYKEM_IROH_TUNNEL_WIRED` to true (together
-    /// with wiring the tunnel) makes it pass and closes the hole by default.
+    /// Captures the INV-2 end state: the default is fail-closed
+    /// [`Inv2Mode::Enforce`].
     #[test]
-    #[ignore = "BLOCKED on HyKEM tunnel (#551) being wired mandatory on iroh/relay \
-                send paths; flip HYKEM_IROH_TUNNEL_WIRED once it is — see ADR #1023 INV-2"]
-    fn inv2_default_is_fail_closed_once_tunnel_wired() {
+    fn inv2_default_is_fail_closed() {
         assert!(
             HYKEM_IROH_TUNNEL_WIRED,
-            "HyKEM iroh/relay tunnel must be wired before INV-2 can default to enforce"
+            "INV-2 must default to fail-closed for untrusted carriers"
         );
         assert_eq!(default_inv2_mode(), Inv2Mode::Enforce);
     }

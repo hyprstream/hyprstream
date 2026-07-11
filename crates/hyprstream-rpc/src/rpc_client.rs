@@ -462,8 +462,8 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         // carrier. This is the single chokepoint for the RPC request send path —
         // every `call*` variant funnels through `sign_envelope` before touching
         // the transport — so the guard cannot be bypassed by a call flavor.
-        // Under the interim WarnOnly mode (HyKEM tunnel #551 not yet wired) it
-        // logs and proceeds; under Enforce it returns Err before any byte ships.
+        // By default it returns Err before any byte ships; an explicit
+        // WarnOnly/dev override logs and proceeds.
         crate::inv2::guard_cleartext_envelope(
             self.carrier_forbids_cleartext,
             signed.is_encrypted(),
