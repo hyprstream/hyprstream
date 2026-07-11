@@ -1,0 +1,86 @@
+name: Graviton Build Validation
+
+# Non-required validation (#1011): compile the hyprstream workspace on a
+# self-hosted Graviton (arm64, Rocky 10, podman-only) runner INSIDE the arm64
+# rust-builder container — the same layer the merge-gate `build` job will use.
+#
+# The golden AMI has no toolchain by design; everything (rust, capnproto,
+# libtorch) lives in the container. We therefore:
+#   1. podman build the arm64 builder image (Dockerfile target builder-cpu-arm64),
+#      which installs rust + capnproto + the aarch64 torch wheel's libtorch.
+#   2. podman run the workspace `cargo build` inside it (CI feature set), with the
+#      repo bind-mounted — mirroring how a `container:` merge-gate job would run.
+#
+# Trigger: push to this branch (workflow_dispatch won't work until the workflow
+# reaches the default branch).
+on:
+  workflow_dispatch:
+  # Re-run on changes that can affect the arm64 build — the Dockerfile
+  # (toolchain), workspace source (arch-specific fixes), or this workflow.
+  push:
+    branches: [ewindisch/runner-smoke-test]
+    paths:
+      - '.github/workflows/graviton-build-validate.yml'
+      - 'Dockerfile'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+
+permissions:
+  contents: read
+
+jobs:
+  build-arm64:
+    runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Arch + OS + podman sanity
+        run: |
+          uname -m
+          . /etc/os-release && echo "$PRETTY_NAME"
+          podman --version
+          nproc
+
+      # Build the toolchain+libtorch image only (not the cargo-build `builder`
+      # stage) so the compile happens in the `podman run` below, where we can see
+      # cargo output live and iterate on the container:-style invocation.
+      - name: Build arm64 builder image
+        run: |
+          podman build \
+            --target builder-cpu-arm64 \
+            --build-arg VARIANT=cpu-arm64 \
+            -t hyprstream-builder-arm64:ci \
+            -f Dockerfile \
+            .
+
+      # Prove libtorch is the aarch64 wheel's and readable inside the container.
+      - name: Verify libtorch (arm64) in image
+        run: |
+          podman run --rm hyprstream-builder-arm64:ci sh -c '
+            set -e
+            echo "arch: $(uname -m)"
+            echo "LIBTORCH=$LIBTORCH"
+            file /opt/libtorch/lib/libtorch_cpu.so | head -1
+            ls /opt/libtorch/include/torch >/dev/null && echo "headers OK"
+            rustc -vV | head -2
+            capnp --version
+          '
+
+      # The actual validation: compile the workspace with the CI feature set
+      # inside the container, repo bind-mounted. sccache runs as a local
+      # in-container disk cache (SCCACHE_DIR=/sccache from the image) — no S3
+      # wiring yet, keeping the first-cut failure surface minimal.
+      - name: Compile workspace in container (release, CI features)
+        run: |
+          podman run --rm \
+            -v "$PWD":/build:Z \
+            -w /build \
+            -e OPENSSL_NO_VENDOR=1 \
+            -e LIBTORCH=/opt/libtorch \
+            -e LD_LIBRARY_PATH=/opt/libtorch/lib \
+            -e LIBTORCH_BYPASS_VERSION_CHECK=1 \
+            -e CARGO_TERM_COLOR=always \
+            hyprstream-builder-arm64:ci \
+            cargo build --release --no-default-features --features otel,gittorrent,xet

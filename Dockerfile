@@ -34,6 +34,8 @@ RUN echo "deb http://deb.debian.org/debian bookworm-backports main" >> /etc/apt/
     ca-certificates \
     capnproto \
     cmake \
+    clang \
+    libclang-dev \
     && apt-get install -y -t bookworm-backports binutils \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
@@ -144,6 +146,45 @@ RUN --mount=type=cache,target=/tmp/libtorch-cache \
         wget -q ${LIBTORCH_CPU_URL} -O "$CACHE_FILE"; \
     fi && \
     unzip -q "$CACHE_FILE" -d /opt
+
+ENV LIBTORCH=/opt/libtorch
+ENV LD_LIBRARY_PATH=/opt/libtorch/lib
+
+#############################################
+# CPU Builder (aarch64 / arm64)
+#############################################
+#
+# There is NO aarch64 libtorch zip at download.pytorch.org/libtorch/cpu — that
+# URL is x86_64-only. The PyTorch aarch64 manylinux_2_28 pip wheel, however,
+# bundles a complete CPU libtorch (torch/lib/*.so + torch/include), so we install
+# torch via pip and point LIBTORCH at the wheel's torch dir. bookworm ships
+# glibc 2.36, satisfying the wheel's manylinux_2_28 (glibc 2.28+) floor.
+#
+# This stage is the toolchain+libtorch image only; the actual cargo build runs
+# either in the `builder` stage below (VARIANT=cpu-arm64) or by mounting the
+# workspace into this image (`container:`-style, as the merge-gate would).
+
+FROM builder-base AS builder-cpu-arm64
+ARG LIBTORCH_VERSION
+
+# tch-rs's fork keys its ABI check to the exact libtorch version string; the pip
+# wheel reports the same 2.10.0 but bypass keeps us resilient to wheel-suffix skew.
+ENV LIBTORCH_BYPASS_VERSION_CHECK=1
+
+# Python + pip to fetch the aarch64 torch wheel (bookworm python3 == 3.11 -> cp311).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Install the CPU torch wheel (aarch64) and expose its bundled libtorch as
+# /opt/libtorch so the shared `builder` stage's LIBTORCH=/opt/libtorch just works.
+# --break-system-packages: bookworm marks the system python PEP-668 externally-managed.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip3 install --break-system-packages "torch==${LIBTORCH_VERSION}" \
+    && TORCH_DIR="$(python3 -c 'import torch, os; print(os.path.dirname(torch.__file__))')" \
+    && ln -s "$TORCH_DIR" /opt/libtorch \
+    && ls -la /opt/libtorch/lib/libtorch_cpu.so /opt/libtorch/include >/dev/null
 
 ENV LIBTORCH=/opt/libtorch
 ENV LD_LIBRARY_PATH=/opt/libtorch/lib
