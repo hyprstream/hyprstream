@@ -195,13 +195,20 @@ impl BootstrapManager {
         // Root-of-trust enrollment follows node crypto policy (Hybrid default,
         // fail-closed) — the same selector as envelope traffic.
         let policy = hyprstream_rpc::envelope::envelope_policy_from_env();
-        if let Err(e) = self.rt.block_on(
+        match self.rt.block_on(
             enroll_user(&store, &secrets_dir, username, EnrollKeySource::Generate, policy),
         ) {
-            tracing::warn!(
+            Ok(outcome) => {
+                // Surface enrollment notices (e.g. the classical-downgrade
+                // warning) — `enroll_user` is fail-loud, not fail-silent.
+                for notice in &outcome.notices {
+                    tracing::warn!(username, "{notice}");
+                }
+            }
+            Err(e) => tracing::warn!(
                 username,
                 "Failed to enroll user identity (register + bind signing key): {e}"
-            );
+            ),
         }
     }
 
