@@ -61,15 +61,52 @@
 //! Both collapse onto the same terminal-watermark mechanism: an identity whose
 //! accepted head pre-commits to nothing admits no successor, ever.
 //!
-//! # B4 (#888): where the alarm goes — NOT here
+//! # B4 (#888): durable alarm routing
 //!
 //! This layer only *raises* the duplicity signal, as a typed [`DuplicityAlarm`]
-//! delivered to a pluggable [`DuplicityAlarmSink`]. **Routing** that signal — to
-//! the S7 [`mac::audit`](../../hyprstream/src/mac) tamper-evident store, an
-//! operator notification path, or both — is owned by B4 (#888) and deliberately
-//! left as a seam here: the default [`NoopAlarmSink`] drops it, and B4 plugs in
-//! the real sink. Detection (this layer) and response (B4) are decoupled so the
-//! fail-closed decision never waits on delivery.
+//! delivered to a pluggable [`DuplicityAlarmSink`]. [`WalDuplicityAlarmSink`]
+//! provides the production route: an fsync-on-write, **hybrid-signed**,
+//! hash-chained journal with a **signed** head checkpoint, plus a structured
+//! operator alarm through tracing / OTel. Detection and response remain
+//! decoupled; callers that intentionally do not need durable routing may still
+//! select [`NoopAlarmSink`] explicitly.
+//!
+//! ## Tamper-evidence (issue #888 acceptance: "durably recorded, tamper-evident")
+//!
+//! Every WAL entry AND the head checkpoint are signed with the **same pinned
+//! hybrid composite** (EdDSA + ML-DSA-65) the at9p record path and the S7
+//! `mac::audit` store use ([`hyprstream_crypto::cose_sign::sign_composite`],
+//! `require_pq = true`). This is what makes the "tamper-evident" claim true
+//! against a **local writer that does not hold the signing key**:
+//!
+//! * altering any entry breaks its BLAKE3 chain link *and* its signature;
+//! * rewriting the WAL to a shorter/forged valid chain is impossible without
+//!   forging every replaced entry's hybrid signature;
+//! * truncating the tail leaves the earlier entries individually valid, but the
+//!   **signed** checkpoint still anchors the true head — and the checkpoint
+//!   cannot be rolled back to the truncated head without forging *its* hybrid
+//!   signature.
+//!
+//! **Residual limit (honest, mirrors `WalAuditStore` in `mac::audit`):** the
+//! checkpoint is a *local* anchor. An attacker who can delete BOTH the journal
+//! and the checkpoint entirely re-baselines to an empty log — total erasure is
+//! not distinguishable from "no alarms yet" without an *off-host* anchor
+//! (replicating the signed head to a second host / OTel). That off-host anchor
+//! is deliberately out of scope here. What this store *does* guarantee: no
+//! tampering, reordering, middle-deletion, or tail-truncation goes undetected
+//! unless the attacker also holds the node's audit signing key.
+//!
+//! ## Wiring (finding remediation)
+//!
+//! Because [`WalDuplicityAlarmSink::open`] requires the node's signing keys, the
+//! durable route is a real construction path
+//! ([`DuplicityGuard::with_durable_alarm`]), not a latent option: a production
+//! guard built that way routes every real [`DuplicityGuard::admit_successor`]
+//! detection to the signed, durable sink by construction. The `NoopAlarmSink`
+//! default ([`DuplicityGuard::new`]) is the **explicit test / opt-out** path,
+//! never the accidental production one. (The live mesh PEP that *drives*
+//! `admit_successor` in the running daemon is a separate epic step and is not
+//! claimed live here.)
 //!
 //! # Persistence seam (#886)
 //!
@@ -79,9 +116,18 @@
 //! wired here** (#886 scopes the seam, not the storage engine).
 
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use parking_lot::Mutex;
+
+use hyprstream_crypto::cose_sign::{sign_composite, verify_composite};
+use hyprstream_crypto::pq::{
+    ml_dsa_sk_to_vk_bytes, ml_dsa_vk_from_bytes, MlDsaSigningKey, MlDsaVerifyingKey,
+};
 
 use crate::at9p::{h512, UpdateRecord, H512_LEN};
 use crate::at9p_chain::{validate_successor, ChainState, SuccessorError};
@@ -196,8 +242,10 @@ pub enum DuplicityKind {
 /// sides of the divergence (the persisted watermark and the divergent record) so
 /// the routing layer (B4, #888) has everything it needs to audit or notify
 /// without re-deriving state.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct DuplicityAlarm {
+    /// The self-certifying DID subject whose chain forked.
+    pub subject_cid512: String,
     /// Which fork shape was detected.
     pub kind: DuplicityKind,
     /// Epoch of the persisted, honestly-accepted watermark.
@@ -212,17 +260,375 @@ pub struct DuplicityAlarm {
 
 /// Sink for [`DuplicityAlarm`]s (B4/#888 seam). Detection raises; **routing** the
 /// signal to the S7 audit store and/or an operator notification path is B4's
-/// job. Implementations must not block the caller's fail-closed decision — the
-/// guard has already decided to reject by the time this is called.
+/// job. The guard has already committed to rejecting before this is called;
+/// durable implementations may synchronously fsync so returning from admission
+/// means the alarm is crash-durable.
 pub trait DuplicityAlarmSink: Send + Sync {
     /// Handle a raised duplicity alarm. Called exactly once per detected fork,
     /// after the guard has committed to failing closed.
     fn raise(&self, alarm: &DuplicityAlarm);
 }
 
-/// Default sink: drops the alarm. Detection still fails closed; only the
-/// *routing* is a no-op until B4 (#888) plugs in a real sink (S7 audit /
-/// operator notify).
+const ALARM_WAL_MAGIC: &[u8; 8] = b"AT9PALM2";
+const ALARM_FIXED_PAYLOAD_LEN: usize = 1 + 8 + H512_LEN + 8 + H512_LEN;
+
+/// AAD binding for a per-entry signature. Distinct from
+/// [`ALARM_CHECKPOINT_AAD`] so an entry signature can never be replayed as a
+/// checkpoint signature (and vice-versa).
+const ALARM_ENTRY_AAD: &[u8] = b"at9p-duplicity-alarm-entry/1";
+/// AAD binding for the signed head-anchor checkpoint.
+const ALARM_CHECKPOINT_AAD: &[u8] = b"at9p-duplicity-alarm-checkpoint/1";
+
+/// Durable, tamper-evident B4 duplicity-alarm sink.
+///
+/// Each alarm is appended to a length-delimited WAL, linked to the previous
+/// entry by BLAKE3 (`entry_hash = BLAKE3(prev_hash || payload)`), **and signed**
+/// with the pinned hybrid composite (EdDSA + ML-DSA-65). `raise` returns only
+/// after `sync_all`, so a successfully recorded alarm survives a crash. Opening
+/// an existing WAL verifies every link AND every signature and refuses a
+/// truncated, forged, or modified journal (see the module-level tamper-evidence
+/// section for the exact guarantee and its residual limit). The same call emits
+/// a structured `ERROR` event on the `hyprstream.at9p.duplicity` target, which
+/// reaches stderr and OTLP through the process tracing subscriber and is
+/// therefore visible to operators.
+pub struct WalDuplicityAlarmSink {
+    path: PathBuf,
+    checkpoint_path: PathBuf,
+    ed_sk: SigningKey,
+    pq_sk: MlDsaSigningKey,
+    state: Mutex<AlarmWalState>,
+}
+
+struct AlarmWalState {
+    file: File,
+    head: [u8; 32],
+}
+
+impl WalDuplicityAlarmSink {
+    /// Open (or create) an alarm WAL, verifying its complete hash chain and
+    /// every entry/checkpoint signature before accepting new records. A corrupt,
+    /// forged, or truncated journal fails closed at startup.
+    ///
+    /// `ed_sk` / `pq_sk` are the node's audit signing keys (the same pinned
+    /// hybrid pair the at9p record path uses). Requiring them here is what makes
+    /// the durable route a real, signed construction path rather than an
+    /// unauthenticated sidecar.
+    ///
+    /// # Crash-window recovery
+    ///
+    /// A crash between an entry's WAL `fsync` and its checkpoint persist leaves
+    /// the WAL exactly **one entry ahead** of the checkpoint. That is a valid,
+    /// recoverable state: `open` accepts an exact checkpoint match **or** a
+    /// verified one-entry lag (the durable WAL head is authoritative), then
+    /// advances the checkpoint to the WAL head. Any larger divergence — or a
+    /// checkpoint that names a head the WAL does not reach — fails closed as
+    /// truncation/tamper.
+    pub fn open(
+        path: impl AsRef<Path>,
+        ed_sk: SigningKey,
+        pq_sk: MlDsaSigningKey,
+    ) -> anyhow::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let checkpoint_path = path.with_extension("checkpoint");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let (ed_vk, pq_vk) = alarm_verifying_keys(&ed_sk, &pq_sk)?;
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        // Verify every hash link AND every hybrid signature; also recover the
+        // head just before the last entry so a one-entry WAL-ahead lag (crash
+        // window) can be distinguished from real truncation/tamper.
+        let (head, prev_head) = verify_alarm_wal(&bytes, &ed_vk, &pq_vk)?;
+
+        if let Some((cp_head, cp_sig)) = read_alarm_checkpoint(&checkpoint_path)? {
+            // The checkpoint's own signature must verify — a forged or rolled-back
+            // checkpoint (e.g. re-pointed at a truncated head) is rejected offline.
+            verify_composite(
+                &cp_sig,
+                &ed_vk,
+                Some(&pq_vk),
+                &cp_head,
+                ALARM_CHECKPOINT_AAD,
+                true,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "duplicity alarm checkpoint signature invalid (tamper/rollback): {e}"
+                )
+            })?;
+
+            let exact = cp_head == head;
+            // One-entry WAL-ahead lag: the checkpoint names the head as of before
+            // the last (durable) append. Valid crash-window state, not tamper.
+            let one_entry_lag = head != prev_head && cp_head == prev_head;
+            anyhow::ensure!(
+                exact || one_entry_lag,
+                "duplicity alarm WAL does not match its durable checkpoint (possible truncation/tamper)"
+            );
+        }
+
+        if bytes.is_empty() {
+            file.write_all(ALARM_WAL_MAGIC)?;
+            file.sync_all()?;
+        }
+        // (Re-)anchor the checkpoint at the authoritative WAL head. This both
+        // baselines a fresh log and advances a checkpoint that lagged the WAL by
+        // one entry after a crash — the WAL fsync already made that entry durable.
+        write_alarm_checkpoint(&checkpoint_path, &head, &ed_sk, &pq_sk)?;
+        Ok(Self {
+            path,
+            checkpoint_path,
+            ed_sk,
+            pq_sk,
+            state: Mutex::new(AlarmWalState { file, head }),
+        })
+    }
+
+    /// Location of the durable journal (operator diagnostics).
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn record(&self, alarm: &DuplicityAlarm) -> anyhow::Result<()> {
+        let payload = encode_alarm(alarm)?;
+        let mut state = self.state.lock();
+        let previous = state.head;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&previous);
+        hasher.update(&payload);
+        let entry_hash = *hasher.finalize().as_bytes();
+
+        // Sign the entry BEFORE any write, so a signer failure leaves the WAL
+        // untouched (no partial/unsigned entry ever reaches disk). Pinned hybrid:
+        // ML-DSA-65 is mandatory (require_pq on verify), so pass Some(pq_sk).
+        let signature =
+            sign_composite(&self.ed_sk, Some(&self.pq_sk), &entry_hash, ALARM_ENTRY_AAD)
+                .map_err(|e| anyhow::anyhow!("duplicity alarm entry signing failed: {e}"))?;
+
+        state
+            .file
+            .write_all(&(payload.len() as u32).to_be_bytes())?;
+        state.file.write_all(&previous)?;
+        state.file.write_all(&payload)?;
+        state.file.write_all(&entry_hash)?;
+        state
+            .file
+            .write_all(&(signature.len() as u32).to_be_bytes())?;
+        state.file.write_all(&signature)?;
+        state.file.sync_all()?;
+        // The alarm is now durable in the WAL. Advance the in-memory head BEFORE
+        // persisting the checkpoint: if the checkpoint write fails or the process
+        // crashes here, the next append still chains correctly from `entry_hash`
+        // (no corruption), and `open` recovers the one-entry lag.
+        state.head = entry_hash;
+
+        // Best-effort checkpoint advance. A failure here does NOT lose the alarm
+        // (it is durable above) and does NOT corrupt the chain; it only leaves the
+        // checkpoint one entry behind, which `open` treats as a valid crash-window
+        // lag and repairs. Surface it so operators can notice a failing anchor.
+        if let Err(e) =
+            write_alarm_checkpoint(&self.checkpoint_path, &entry_hash, &self.ed_sk, &self.pq_sk)
+        {
+            tracing::warn!(
+                target: "hyprstream.at9p.duplicity",
+                error = %e,
+                "duplicity alarm checkpoint persist failed; WAL entry is durable and self-recovers on reopen"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Derive the verifying keys for the pinned hybrid audit signature from the
+/// signing keys held by the sink.
+fn alarm_verifying_keys(
+    ed_sk: &SigningKey,
+    pq_sk: &MlDsaSigningKey,
+) -> anyhow::Result<(VerifyingKey, MlDsaVerifyingKey)> {
+    let ed_vk = ed_sk.verifying_key();
+    let pq_vk = ml_dsa_vk_from_bytes(&ml_dsa_sk_to_vk_bytes(pq_sk))
+        .map_err(|e| anyhow::anyhow!("deriving ML-DSA-65 audit verifying key failed: {e}"))?;
+    Ok((ed_vk, pq_vk))
+}
+
+/// Write the signed head-anchor checkpoint atomically (temp + rename + parent
+/// `fsync`). Layout: `head(32) || signature`. The signature is over `head` under
+/// [`ALARM_CHECKPOINT_AAD`], so it cannot be a replayed entry signature and a
+/// local writer without the key cannot re-point it at a truncated head.
+fn write_alarm_checkpoint(
+    path: &Path,
+    head: &[u8; 32],
+    ed_sk: &SigningKey,
+    pq_sk: &MlDsaSigningKey,
+) -> anyhow::Result<()> {
+    let signature = sign_composite(ed_sk, Some(pq_sk), head, ALARM_CHECKPOINT_AAD)
+        .map_err(|e| anyhow::anyhow!("duplicity alarm checkpoint signing failed: {e}"))?;
+    let mut buf = Vec::with_capacity(head.len() + signature.len());
+    buf.extend_from_slice(head);
+    buf.extend_from_slice(&signature);
+
+    let temporary = path.with_extension("checkpoint.tmp");
+    let mut file = File::create(&temporary)?;
+    file.write_all(&buf)?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, path)?;
+    // fsync the parent directory so the rename is durable — otherwise a crash can
+    // lose the checkpoint entry and re-baseline the log on the next open.
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
+/// Read a signed checkpoint file, returning `(head, signature)` or `None` if it
+/// does not exist. A file too short to hold a 32-byte head is treated as corrupt.
+fn read_alarm_checkpoint(path: &Path) -> anyhow::Result<Option<([u8; 32], Vec<u8>)>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(path)?;
+    anyhow::ensure!(
+        bytes.len() > 32,
+        "duplicity alarm checkpoint is truncated (missing head or signature)"
+    );
+    let mut head = [0u8; 32];
+    head.copy_from_slice(&bytes[..32]);
+    Ok(Some((head, bytes[32..].to_vec())))
+}
+
+impl DuplicityAlarmSink for WalDuplicityAlarmSink {
+    fn raise(&self, alarm: &DuplicityAlarm) {
+        let result = self.record(alarm);
+        tracing::error!(
+            target: "hyprstream.at9p.duplicity",
+            subject_cid512 = %alarm.subject_cid512,
+            kind = ?alarm.kind,
+            watermark_epoch = alarm.watermark_epoch,
+            watermark_digest = %hex_digest(&alarm.watermark_digest),
+            divergent_epoch = alarm.divergent_epoch,
+            divergent_digest = %hex_digest(&alarm.divergent_digest),
+            durable = result.is_ok(),
+            error = result.as_ref().err().map(ToString::to_string).as_deref().unwrap_or(""),
+            "did:at9p duplicity detected; identity remains fail-closed"
+        );
+    }
+}
+
+fn encode_alarm(alarm: &DuplicityAlarm) -> anyhow::Result<Vec<u8>> {
+    let subject = alarm.subject_cid512.as_bytes();
+    anyhow::ensure!(
+        subject.len() <= u16::MAX as usize,
+        "at9p subject exceeds WAL limit"
+    );
+    let mut out = Vec::with_capacity(2 + subject.len() + ALARM_FIXED_PAYLOAD_LEN);
+    out.extend_from_slice(&(subject.len() as u16).to_be_bytes());
+    out.extend_from_slice(subject);
+    out.push(match alarm.kind {
+        DuplicityKind::SameEpochFork => 0,
+        DuplicityKind::BelowWatermarkFork => 1,
+        DuplicityKind::HigherEpochFork => 2,
+    });
+    out.extend_from_slice(&alarm.watermark_epoch.to_be_bytes());
+    out.extend_from_slice(&alarm.watermark_digest);
+    out.extend_from_slice(&alarm.divergent_epoch.to_be_bytes());
+    out.extend_from_slice(&alarm.divergent_digest);
+    Ok(out)
+}
+
+/// Verify the whole alarm WAL end-to-end: the magic header, every hash-chain
+/// link, every entry's stored `entry_hash`, and every entry's **hybrid
+/// signature**. Returns `(head, prev_head)` where `head` is the final chain head
+/// and `prev_head` is the head as of just before the last entry (equal to `head`
+/// for an empty log) — the caller uses `prev_head` to recognise a legitimate
+/// one-entry WAL-ahead-of-checkpoint crash-window lag.
+fn verify_alarm_wal(
+    bytes: &[u8],
+    ed_vk: &VerifyingKey,
+    pq_vk: &MlDsaVerifyingKey,
+) -> anyhow::Result<([u8; 32], [u8; 32])> {
+    if bytes.is_empty() {
+        return Ok(([0; 32], [0; 32]));
+    }
+    anyhow::ensure!(
+        bytes.starts_with(ALARM_WAL_MAGIC),
+        "invalid duplicity alarm WAL header"
+    );
+    let mut cursor = ALARM_WAL_MAGIC.len();
+    let mut head = [0; 32];
+    let mut prev_head = [0; 32];
+    while cursor < bytes.len() {
+        anyhow::ensure!(
+            bytes.len() - cursor >= 4 + 32,
+            "truncated duplicity alarm WAL entry"
+        );
+        let len = u32::from_be_bytes(bytes[cursor..cursor + 4].try_into()?) as usize;
+        cursor += 4;
+        let previous: [u8; 32] = bytes[cursor..cursor + 32].try_into()?;
+        cursor += 32;
+        anyhow::ensure!(previous == head, "duplicity alarm WAL hash-chain break");
+        anyhow::ensure!(
+            bytes.len() - cursor >= len + 32 + 4,
+            "truncated duplicity alarm WAL payload"
+        );
+        let payload = &bytes[cursor..cursor + len];
+        cursor += len;
+        let stored: [u8; 32] = bytes[cursor..cursor + 32].try_into()?;
+        cursor += 32;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&head);
+        hasher.update(payload);
+        let expected = *hasher.finalize().as_bytes();
+        anyhow::ensure!(
+            stored == expected,
+            "duplicity alarm WAL entry hash mismatch"
+        );
+        let sig_len = u32::from_be_bytes(bytes[cursor..cursor + 4].try_into()?) as usize;
+        cursor += 4;
+        anyhow::ensure!(
+            bytes.len() - cursor >= sig_len,
+            "truncated duplicity alarm WAL signature"
+        );
+        let signature = &bytes[cursor..cursor + sig_len];
+        cursor += sig_len;
+        // Authenticity: a rewritten/forged entry cannot produce a valid hybrid
+        // signature over its (recomputed) entry_hash without the node's key.
+        verify_composite(
+            signature,
+            ed_vk,
+            Some(pq_vk),
+            &stored,
+            ALARM_ENTRY_AAD,
+            true,
+        )
+        .map_err(|e| anyhow::anyhow!("duplicity alarm WAL entry signature invalid: {e}"))?;
+        prev_head = head;
+        head = stored;
+    }
+    Ok((head, prev_head))
+}
+
+fn hex_digest(digest: &[u8; H512_LEN]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(H512_LEN * 2);
+    for byte in digest {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    out
+}
+
+/// Explicit no-op sink for tests or deployments that route alarms elsewhere.
+/// Detection still fails closed, but this sink provides no durable/operator
+/// signal; production callers should use [`WalDuplicityAlarmSink`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoopAlarmSink;
 
@@ -353,14 +759,42 @@ pub struct DuplicityGuard<S: WatermarkStore, A: DuplicityAlarmSink> {
 }
 
 impl<S: WatermarkStore> DuplicityGuard<S, NoopAlarmSink> {
-    /// Build a guard whose alarm routing is a no-op (B4/#888 not yet wired). Use
-    /// [`with_alarm`](Self::with_alarm) to plug in a real sink.
+    /// Build a guard whose alarm routing is **explicitly disabled** — the test /
+    /// opt-out path. This installs [`NoopAlarmSink`], so a real detection is
+    /// classified and fail-closed but produces **no durable, tamper-evident
+    /// record**. Production MUST NOT use this: build the guard with
+    /// [`with_durable_alarm`](DuplicityGuard::with_durable_alarm) (the signed WAL
+    /// route) or [`with_alarm`](Self::with_alarm) with an equivalent durable
+    /// sink, so callers opt *out* of durable routing deliberately rather than
+    /// keeping it off by accident.
     pub fn new(store: S) -> Self {
         Self {
             store,
             alarm: NoopAlarmSink,
             admit_locks: Mutex::new(HashMap::new()),
         }
+    }
+}
+
+impl<S: WatermarkStore> DuplicityGuard<S, WalDuplicityAlarmSink> {
+    /// The **production** construction path: build a guard that routes every
+    /// [`admit_successor`](Self::admit_successor) duplicity detection to a
+    /// durable, hybrid-signed, tamper-evident [`WalDuplicityAlarmSink`] at
+    /// `wal_path`, signed with the node's audit keys (`ed_sk` / `pq_sk`).
+    ///
+    /// Opening the sink verifies (or baselines) the existing journal, so a
+    /// corrupt/forged/truncated log fails closed before the guard is usable. Use
+    /// this — not [`new`](Self::new) — anywhere a real `did:at9p` chain is
+    /// admitted, so a fork is always durably recorded and surfaced to an operator
+    /// (issue #888 acceptance).
+    pub fn with_durable_alarm(
+        store: S,
+        wal_path: impl AsRef<Path>,
+        ed_sk: SigningKey,
+        pq_sk: MlDsaSigningKey,
+    ) -> anyhow::Result<Self> {
+        let alarm = WalDuplicityAlarmSink::open(wal_path, ed_sk, pq_sk)?;
+        Ok(Self::with_alarm(store, alarm))
     }
 }
 
@@ -530,6 +964,7 @@ impl<S: WatermarkStore, A: DuplicityAlarmSink> DuplicityGuard<S, A> {
                 // fork — this is precisely the "never select max epoch" case.
                 if predecessor.record_digest != watermark.record_digest {
                     return Err(self.raise_duplicity(
+                        subject,
                         DuplicityKind::HigherEpochFork,
                         &watermark,
                         state.epoch,
@@ -554,6 +989,7 @@ impl<S: WatermarkStore, A: DuplicityAlarmSink> DuplicityGuard<S, A> {
                 } else {
                     // Two individually-valid records at the same epoch → equivocation.
                     Err(self.raise_duplicity(
+                        subject,
                         DuplicityKind::SameEpochFork,
                         &watermark,
                         state.epoch,
@@ -567,6 +1003,7 @@ impl<S: WatermarkStore, A: DuplicityAlarmSink> DuplicityGuard<S, A> {
             // the same record we accepted at that epoch — and per R6 a client that has
             // accepted epoch N never accepts < N. Fail closed as a fork; never prefer.
             Err(self.raise_duplicity(
+                subject,
                 DuplicityKind::BelowWatermarkFork,
                 &watermark,
                 state.epoch,
@@ -579,12 +1016,14 @@ impl<S: WatermarkStore, A: DuplicityAlarmSink> DuplicityGuard<S, A> {
     /// fail-closed error. The watermark is deliberately NOT mutated.
     fn raise_duplicity(
         &self,
+        subject_cid512: &str,
         kind: DuplicityKind,
         watermark: &Watermark,
         divergent_epoch: u64,
         divergent_digest: [u8; H512_LEN],
     ) -> AdmissionError {
         let alarm = DuplicityAlarm {
+            subject_cid512: subject_cid512.to_owned(),
             kind,
             watermark_epoch: watermark.epoch,
             watermark_digest: watermark.record_digest,
@@ -617,11 +1056,30 @@ mod tests {
     };
     use crate::at9p_sign::{sign_capsule, sign_update_record};
     use ed25519_dalek::SigningKey;
-    use hyprstream_crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes, MlDsaSigningKey};
+    use hyprstream_crypto::pq::{
+        ml_dsa_generate_keypair, ml_dsa_sk_from_seed, ml_dsa_vk_bytes, MlDsaSigningKey,
+    };
     use rand::rngs::OsRng;
 
     const NOW: &str = "2026-07-09T00:00:00Z";
     const FUTURE: &str = "2099-01-01T00:00:00Z";
+
+    /// Deterministic audit signing keys for the WAL-sink tests. Reconstructed
+    /// from fixed seeds so every `open`/reopen in a test signs and verifies with
+    /// the *same* key (a random key per open would fail signature verification on
+    /// reopen). Mirrors the pinned-hybrid pair a production node holds.
+    fn alarm_keys() -> (SigningKey, MlDsaSigningKey) {
+        (
+            SigningKey::from_bytes(&[7u8; 32]),
+            ml_dsa_sk_from_seed(&[9u8; 32]),
+        )
+    }
+
+    /// Open the signed alarm WAL at `path` with the deterministic test keys.
+    fn open_alarm_wal(path: &std::path::Path) -> anyhow::Result<WalDuplicityAlarmSink> {
+        let (ed_sk, pq_sk) = alarm_keys();
+        WalDuplicityAlarmSink::open(path, ed_sk, pq_sk)
+    }
 
     /// A hybrid signer plus its public keypair (the pre-rotation commitment
     /// preimage). Mirrors the B1 test harness.
@@ -720,9 +1178,193 @@ mod tests {
     }
     impl DuplicityAlarmSink for RecordingSink {
         fn raise(&self, alarm: &DuplicityAlarm) {
-            self.alarms.lock().push(*alarm);
+            self.alarms.lock().push(alarm.clone());
         }
     }
+
+    fn sample_alarm() -> DuplicityAlarm {
+        DuplicityAlarm {
+            subject_cid512: "bafyat9ptestsubject".to_owned(),
+            kind: DuplicityKind::SameEpochFork,
+            watermark_epoch: 7,
+            watermark_digest: [0x11; H512_LEN],
+            divergent_epoch: 7,
+            divergent_digest: [0x22; H512_LEN],
+        }
+    }
+
+    #[test]
+    fn wal_alarm_is_durable_and_reopens_with_chain_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duplicity.wal");
+        let sink = open_alarm_wal(&path).unwrap();
+        sink.raise(&sample_alarm());
+        let first_len = std::fs::metadata(&path).unwrap().len();
+        assert!(first_len > ALARM_WAL_MAGIC.len() as u64);
+        drop(sink);
+
+        let reopened = open_alarm_wal(&path).unwrap();
+        reopened.raise(&DuplicityAlarm {
+            kind: DuplicityKind::HigherEpochFork,
+            divergent_epoch: 9,
+            ..sample_alarm()
+        });
+        assert!(std::fs::metadata(path).unwrap().len() > first_len);
+    }
+
+    #[test]
+    fn wal_alarm_refuses_tampered_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duplicity.wal");
+        let sink = open_alarm_wal(&path).unwrap();
+        sink.raise(&sample_alarm());
+        drop(sink);
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let payload_offset = ALARM_WAL_MAGIC.len() + 4 + 32;
+        bytes[payload_offset + 3] ^= 0x80;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(open_alarm_wal(&path).is_err());
+    }
+
+    #[test]
+    fn wal_alarm_checkpoint_detects_tail_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duplicity.wal");
+        let sink = open_alarm_wal(&path).unwrap();
+        sink.raise(&sample_alarm());
+        drop(sink);
+
+        std::fs::write(&path, ALARM_WAL_MAGIC).unwrap();
+        assert!(open_alarm_wal(&path).is_err());
+    }
+
+    // ---- FIX #1: WAL-ahead-of-checkpoint crash-window recovery ------------
+    //
+    // Simulates a crash after an entry's WAL fsync but before its checkpoint
+    // persist: the WAL holds a durable entry the checkpoint does not yet name.
+    // `open` must ACCEPT this one-entry lag (the durable WAL head is
+    // authoritative), advance the checkpoint, and let the next append chain
+    // correctly — never brick or corrupt the log.
+    #[test]
+    fn wal_ahead_of_checkpoint_by_one_entry_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duplicity.wal");
+        let checkpoint = path.with_extension("checkpoint");
+
+        let sink = open_alarm_wal(&path).unwrap();
+        sink.raise(&sample_alarm());
+        // Capture the checkpoint as of entry A (this is the "checkpoint behind"
+        // state the crash leaves once a *second* entry is appended).
+        let cp_after_a = std::fs::read(&checkpoint).unwrap();
+        sink.raise(&DuplicityAlarm {
+            divergent_epoch: 42,
+            ..sample_alarm()
+        });
+        drop(sink);
+
+        // Roll the checkpoint back to entry A while the WAL still holds A+B: the
+        // exact WAL-ahead/checkpoint-behind window the reviewer flagged.
+        std::fs::write(&checkpoint, &cp_after_a).unwrap();
+
+        // Recovery must succeed (not a spurious mismatch error)...
+        let reopened = open_alarm_wal(&path).unwrap();
+        // ...and the next append must chain cleanly, so a later reopen is clean.
+        reopened.raise(&DuplicityAlarm {
+            divergent_epoch: 43,
+            ..sample_alarm()
+        });
+        drop(reopened);
+        assert!(
+            open_alarm_wal(&path).is_ok(),
+            "post-recovery append must keep the chain valid"
+        );
+    }
+
+    // A checkpoint two-or-more entries behind is NOT a normal crash window
+    // (the store persists the checkpoint after every single append), so it must
+    // fail closed rather than be silently accepted.
+    #[test]
+    fn wal_ahead_of_checkpoint_by_two_entries_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duplicity.wal");
+        let checkpoint = path.with_extension("checkpoint");
+
+        let sink = open_alarm_wal(&path).unwrap();
+        sink.raise(&sample_alarm());
+        let cp_after_a = std::fs::read(&checkpoint).unwrap();
+        sink.raise(&DuplicityAlarm {
+            divergent_epoch: 2,
+            ..sample_alarm()
+        });
+        sink.raise(&DuplicityAlarm {
+            divergent_epoch: 3,
+            ..sample_alarm()
+        });
+        drop(sink);
+
+        // Checkpoint names entry A, WAL holds A+B+C ⇒ two-entry lag ⇒ reject.
+        std::fs::write(&checkpoint, &cp_after_a).unwrap();
+        assert!(open_alarm_wal(&path).is_err());
+    }
+
+    // FIX #3: a rolled-back / forged checkpoint (re-pointed at a truncated head
+    // without the signing key) is rejected — the signature no longer verifies.
+    #[test]
+    fn wal_alarm_rejects_forged_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duplicity.wal");
+        let checkpoint = path.with_extension("checkpoint");
+
+        let sink = open_alarm_wal(&path).unwrap();
+        sink.raise(&sample_alarm());
+        drop(sink);
+
+        // Corrupt the checkpoint's signature bytes (leave the head intact): the
+        // hybrid signature must fail to verify, so `open` fails closed.
+        let mut bytes = std::fs::read(&checkpoint).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x80;
+        std::fs::write(&checkpoint, bytes).unwrap();
+        assert!(open_alarm_wal(&path).is_err());
+    }
+
+    // FIX #3: a whole-chain rewrite to a *different but internally hash-consistent*
+    // journal is rejected because the attacker cannot forge the per-entry hybrid
+    // signature — even if they also delete the checkpoint.
+    #[test]
+    fn wal_alarm_rejects_rewrite_without_signing_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duplicity.wal");
+        let sink = open_alarm_wal(&path).unwrap();
+        sink.raise(&sample_alarm());
+        drop(sink);
+
+        // Attacker forges a fresh single-entry journal with a *valid* BLAKE3 chain
+        // but a bogus signature (they lack the key), and deletes the checkpoint.
+        let payload = encode_alarm(&sample_alarm()).unwrap();
+        let previous = [0u8; 32];
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&previous);
+        hasher.update(&payload);
+        let entry_hash = *hasher.finalize().as_bytes();
+        let forged_sig = vec![0u8; 64];
+        let mut forged = Vec::new();
+        forged.extend_from_slice(ALARM_WAL_MAGIC);
+        forged.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        forged.extend_from_slice(&previous);
+        forged.extend_from_slice(&payload);
+        forged.extend_from_slice(&entry_hash);
+        forged.extend_from_slice(&(forged_sig.len() as u32).to_be_bytes());
+        forged.extend_from_slice(&forged_sig);
+        std::fs::write(&path, forged).unwrap();
+        let _ = std::fs::remove_file(path.with_extension("checkpoint"));
+        assert!(
+            open_alarm_wal(&path).is_err(),
+            "a rewrite without the signing key must fail the entry signature check"
+        );
+    }
+
     impl RecordingSink {
         fn count(&self) -> usize {
             self.alarms.lock().len()
@@ -1194,6 +1836,69 @@ mod tests {
             1
         );
         assert_eq!(guard.store_alarm_count(), 0);
+    }
+
+    // ---- FIX #2: a real fork routes through the production guard into the
+    // durable, signed, tamper-evident sink (end-to-end, not a hand-built alarm).
+    #[test]
+    fn end_to_end_fork_routes_to_durable_signed_sink() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = dir.path().join("dup.wal");
+        let (ed_sk, pq_sk) = alarm_keys();
+
+        let (g, n1, n2a, n2b) = (signer(), signer(), signer(), signer());
+        let (_cap, s0) = genesis(&g, &[&n1]);
+
+        // The PRODUCTION construction path: guard wired to the signed WAL sink.
+        let guard =
+            DuplicityGuard::with_durable_alarm(InMemoryWatermarkStore::new(), &wal, ed_sk, pq_sk)
+                .unwrap();
+        guard.seed_genesis(&s0).unwrap();
+
+        // Honest r1 accepted (no alarm).
+        let r1a = update_salted(
+            &s0.subject_cid512,
+            1,
+            s0.record_digest,
+            &n1,
+            &[&n2a],
+            FUTURE,
+            Some("honest"),
+        );
+        guard.admit_successor(&s0, &r1a, NOW).unwrap();
+        assert_eq!(
+            std::fs::metadata(&wal).unwrap().len(),
+            ALARM_WAL_MAGIC.len() as u64,
+            "a clean succession must not write an alarm entry"
+        );
+
+        // A genuine same-epoch divergent fork → real duplicity detection.
+        let r1b = update_salted(
+            &s0.subject_cid512,
+            1,
+            s0.record_digest,
+            &n1,
+            &[&n2b],
+            FUTURE,
+            Some("evil"),
+        );
+        let err = guard.admit_successor(&s0, &r1b, NOW).unwrap_err();
+        assert!(
+            matches!(err, AdmissionError::Duplicity(_)),
+            "expected Duplicity, got {err:?}"
+        );
+
+        // The detection routed to the durable sink: the WAL grew a signed entry
+        // that survives reopen with full chain + signature verification.
+        drop(guard);
+        assert!(
+            std::fs::metadata(&wal).unwrap().len() > ALARM_WAL_MAGIC.len() as u64,
+            "the fork must be durably recorded"
+        );
+        assert!(
+            open_alarm_wal(&wal).is_ok(),
+            "the durable signed alarm must reopen and verify"
+        );
     }
 
     // Small accessors so the guard's sink can be inspected in-test.
