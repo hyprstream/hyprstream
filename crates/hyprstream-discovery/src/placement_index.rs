@@ -52,7 +52,7 @@
 //! membership in group `G` with `LabelSelector::new(format!("group/{G}"),
 //! SelectorOp::Exists, vec![])`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, Result};
 use p256::ecdsa::VerifyingKey;
@@ -205,7 +205,9 @@ impl PlacementIndex {
         }
 
         let mut entries = Vec::new();
-        walk_mst(commit.data, &block_map, &mut entries)?;
+        let mut visited = HashSet::new();
+        let mut budget = MST_MAX_NODE_VISITS;
+        walk_mst(commit.data, &block_map, &mut entries, &mut visited, &mut budget)?;
 
         let mut snapshot = DidSnapshot::default();
         for (key, record_cid) in entries {
@@ -347,6 +349,17 @@ impl PlacementIndex {
     }
 }
 
+/// Hard ceiling on the number of MST node visits per repo-CAR walk. An
+/// untrusted CAR is not a well-formed tree by assumption: it can be
+/// DAG-shaped (many `l`/`t` links pointing at the same child) or cyclic, so a
+/// depth bound alone does not bound total work — a poisoned CAR could fan out
+/// to visit the same subtrees exponentially, or loop forever. The `visited`
+/// CID set makes the walk terminate (a node is expanded at most once); this
+/// budget is the belt-and-suspenders ceiling that caps total node visits even
+/// against a broad-but-acyclic adversarial CAR, and is chosen well above any
+/// legitimate repo's node count.
+const MST_MAX_NODE_VISITS: usize = 1 << 20; // 1,048,576 nodes
+
 /// Enumerate every `(full_key, record_cid)` entry reachable from an MST node,
 /// depth-first in key order: left subtree, then each entry (recursing into its
 /// right subtree before the next entry). Mirrors the encode side
@@ -354,7 +367,35 @@ impl PlacementIndex {
 /// prefix-compression convention: `entry.p` compresses against the *previous
 /// entry within this same node* only (resets to 0 at the first entry of every
 /// node) — never against a key from a different node.
-fn walk_mst(node_cid: Cid, blocks: &HashMap<Cid, Vec<u8>>, out: &mut Vec<(String, Cid)>) -> Result<()> {
+///
+/// **Untrusted-ingest safety (#932):** `visited` records every node CID already
+/// expanded so a DAG-shaped or cyclic CAR cannot revisit the same subtree, and
+/// `budget` is a decrementing total-visit ceiling. Either guard trips a
+/// fail-closed `Err` — the whole CAR is rejected rather than partially
+/// ingested, so no derived membership fact is produced from an adversarial
+/// graph.
+fn walk_mst(
+    node_cid: Cid,
+    blocks: &HashMap<Cid, Vec<u8>>,
+    out: &mut Vec<(String, Cid)>,
+    visited: &mut HashSet<Cid>,
+    budget: &mut usize,
+) -> Result<()> {
+    if *budget == 0 {
+        return Err(anyhow!(
+            "MST walk exceeded the {MST_MAX_NODE_VISITS}-node visit budget (adversarial repo CAR?)"
+        ));
+    }
+    *budget -= 1;
+
+    // A node CID seen twice means the CAR reuses a subtree (DAG) or contains a
+    // cycle; refuse rather than re-expand it.
+    if !visited.insert(node_cid) {
+        return Err(anyhow!(
+            "MST node {node_cid} is reachable more than once (non-tree repo CAR); refusing ingest"
+        ));
+    }
+
     let bytes = blocks
         .get(&node_cid)
         .ok_or_else(|| anyhow!("MST node {node_cid} missing from repo CAR blocks"))?;
@@ -362,7 +403,7 @@ fn walk_mst(node_cid: Cid, blocks: &HashMap<Cid, Vec<u8>>, out: &mut Vec<(String
     let data = NodeData::from_value(&value)?;
 
     if let Some(left) = data.l {
-        walk_mst(left, blocks, out)?;
+        walk_mst(left, blocks, out, visited, budget)?;
     }
     let mut prev_key: Option<String> = None;
     for entry in &data.e {
@@ -380,7 +421,7 @@ fn walk_mst(node_cid: Cid, blocks: &HashMap<Cid, Vec<u8>>, out: &mut Vec<(String
         out.push((key.clone(), entry.v));
         prev_key = Some(key);
         if let Some(right) = entry.t {
-            walk_mst(right, blocks, out)?;
+            walk_mst(right, blocks, out, visited, budget)?;
         }
     }
     Ok(())
