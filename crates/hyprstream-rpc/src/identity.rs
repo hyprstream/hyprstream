@@ -87,8 +87,11 @@ impl Did {
         self.0.starts_with("did:web:")
     }
 
-    /// Whether this is a `did:at9p` identifier (the self-certifying hybrid-PQC
-    /// capsule identity, #879/#880).
+    /// Whether this is a `did:at9p` identifier — the PQC-hybrid, self-certifying
+    /// identity (`did:at9p:<cid512>`, #879). The authoritative end of the
+    /// `alsoKnownAs` aliasing bridge (#896 / D4): when a `did:web` / `did:key`
+    /// and a `did:at9p` mutually attest each other, the content-verified at9p
+    /// capsule is the stronger identity.
     ///
     /// The capsule GATE pipeline that verifies a `did:at9p` and derives its
     /// `PqHybrid` key material is epic #880 (D2); the method-dispatched resolver
@@ -197,6 +200,12 @@ mod did_tests {
         let neither = Did::new("did:plc:abc123".to_owned());
         assert!(!neither.is_did_key());
         assert!(!neither.is_did_web());
+        assert!(!neither.is_did_at9p());
+
+        let at9p = Did::new("did:at9p:bafyabcd".to_owned());
+        assert!(at9p.is_did_at9p());
+        assert!(!at9p.is_did_key());
+        assert!(!at9p.is_did_web());
     }
 
     #[test]
