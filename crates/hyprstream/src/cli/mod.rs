@@ -9,6 +9,7 @@
 pub mod commands;
 pub mod context;
 pub mod daemon;
+pub mod enroll;
 pub mod git_handlers;
 pub mod gpu_detect;
 pub mod handlers;
@@ -53,7 +54,7 @@ pub use policy_handlers::{
     load_or_generate_signing_key,
 };
 pub use user_handlers::{
-    handle_user_list, handle_user_register, handle_user_remove,
+    handle_user_create, handle_user_list, handle_user_register, handle_user_remove,
     handle_user_keys_list, handle_user_keys_import, handle_user_keys_remove,
 };
 pub use crate::auth::policy_templates::{PolicyTemplate, get_template, get_templates};

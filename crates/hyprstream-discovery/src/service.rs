@@ -154,6 +154,24 @@ pub trait RecordResolver: Send + Sync {
     /// Resolve a full repo CAR for a DID (commit + MST + all records).
     /// Returns `Ok(None)` when no repo is stored for the DID.
     async fn resolve_repo(&self, did: &str) -> Result<Option<RecordCarData>>;
+
+    /// Resolve the DID's `#atproto` P-256 verifying key — the key a repo
+    /// CAR's commit is signed by — or `Ok(None)` when this resolver cannot
+    /// provide one.
+    ///
+    /// This is the **signature-verification seam** for verified-by-construction
+    /// ingest: when a key is returned, [`PlacementIndex::ingest_did`] verifies
+    /// the ingested repo CAR's commit signature against it *before* any record
+    /// enters the index, and a record whose commit fails verification cannot
+    /// produce membership or any other derived fact (see #932). `None` is the
+    /// resolver declining to participate — the index then retains the trusted
+    /// in-process posture documented in `placement_index` (the day-1 stance;
+    /// full key resolution for foreign DIDs is the future federation-hardening
+    /// follow-up). A default of `Ok(None)` keeps resolvers that do not
+    /// participate unchanged.
+    async fn resolve_verifying_key(&self, _did: &str) -> Result<Option<p256::ecdsa::VerifyingKey>> {
+        Ok(None)
+    }
 }
 
 // ============================================================================

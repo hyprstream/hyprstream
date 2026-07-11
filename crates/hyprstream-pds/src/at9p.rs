@@ -405,6 +405,17 @@ pub struct CapsuleBody {
     pub next_key_commitments: Vec<[u8; H512_LEN]>,
     pub services: Vec<ServiceEntry>,
     pub label_hints: Option<Vec<String>>,
+    /// Classical DID aliases this `did:at9p` identity attests to — the
+    /// **hybrid-signed** leg of the `alsoKnownAs` aliasing bridge (#896 / D4,
+    /// design #879 Q4 / #905 §2/§6). Each entry is a `did:web` / `did:key` /
+    /// `did:plc` identifier the capsule claims to *also* be. Because the list
+    /// lives inside the GATE-verified capsule body, it is content-bound to the
+    /// at9p identity and signed under pinned Hybrid — the strongest of the two
+    /// aliasing legs. The reciprocal (classical→at9p) vouch is classical-only
+    /// (a DID document's best), so the authoritative-direction rule
+    /// (`at9p_alias::resolve_authoritative_alias`) requires **both** legs to
+    /// name each other before the at9p identity is trusted.
+    pub also_known_as: Option<Vec<String>>,
     pub delegations: Option<Vec<Delegation>>,
     pub witnesses: Option<Vec<String>>,
 }
@@ -417,6 +428,7 @@ impl CapsuleBody {
             next_key_commitments: Vec::new(),
             services,
             label_hints: None,
+            also_known_as: None,
             delegations: None,
             witnesses: None,
         };
@@ -428,9 +440,12 @@ impl CapsuleBody {
     ///
     /// This is the signed payload for an at9p capsule: the composite signature
     /// (see [`crate::at9p_sign`]) covers exactly these bytes, never the
-    /// enclosing `signatures` field.
-    pub fn to_dag_cbor(&self) -> Vec<u8> {
-        self.to_value().encode()
+    /// enclosing `signatures` field. Validates the body first so a record whose
+    /// pub fields were mutated after construction cannot emit (or get signed
+    /// over) bytes the decode side would reject.
+    pub fn to_dag_cbor(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        Ok(self.to_value().encode())
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -446,6 +461,12 @@ impl CapsuleBody {
         for key in &self.subject_keys {
             key.validate()?;
         }
+        // next_key_commitments MAY be empty (#879 §5.3: a declared-immutable
+        // identity with rotation frozen forever), but two identical commitments
+        // are meaningless (the same next key pre-committed twice) and would
+        // only waste bytes / invite ambiguity in key selection. Reject
+        // duplicates; each 64B entry is already length-checked on decode.
+        validate_unique_digests(&self.next_key_commitments, "nextKeyCommitments")?;
         ensure!(
             !self.services.is_empty(),
             "capsule services must not be empty"
@@ -460,6 +481,13 @@ impl CapsuleBody {
                 "labelHints must not be empty when present"
             );
             validate_unique_texts(label_hints, "labelHints")?;
+        }
+        if let Some(aliases) = &self.also_known_as {
+            ensure!(
+                !aliases.is_empty(),
+                "alsoKnownAs must not be empty when present"
+            );
+            validate_classical_did_list(aliases, "alsoKnownAs")?;
         }
         if let Some(delegations) = &self.delegations {
             ensure!(
@@ -511,6 +539,12 @@ impl CapsuleBody {
                 DagCbor::list(label_hints.iter().cloned().map(DagCbor::Text)),
             ));
         }
+        if let Some(aliases) = &self.also_known_as {
+            fields.push((
+                "alsoKnownAs",
+                DagCbor::list(aliases.iter().cloned().map(DagCbor::Text)),
+            ));
+        }
         if let Some(delegations) = &self.delegations {
             fields.push((
                 "delegations",
@@ -535,6 +569,7 @@ impl CapsuleBody {
                 "nextKeyCommitments",
                 "services",
                 "labelHints",
+                "alsoKnownAs",
                 "delegations",
                 "witnesses",
             ],
@@ -552,6 +587,7 @@ impl CapsuleBody {
             .collect::<Result<Vec<_>>>()?;
         let services = parse_services(required(value, "services", "at9p capsule body")?)?;
         let label_hints = optional_text_list(value, "labelHints")?;
+        let also_known_as = optional_text_list(value, "alsoKnownAs")?;
         let delegations = match value.get("delegations") {
             Some(v) => Some(
                 v.as_list()?
@@ -568,6 +604,7 @@ impl CapsuleBody {
             next_key_commitments,
             services,
             label_hints,
+            also_known_as,
             delegations,
             witnesses,
         };
@@ -589,8 +626,18 @@ impl Capsule {
         Ok(Self { body, signatures })
     }
 
-    pub fn to_dag_cbor(&self) -> Vec<u8> {
-        self.to_value().encode()
+    /// Validate the capsule (body + signature context binding) — the encode/
+    /// decode trust boundary. Public so holders of a `Capsule` built via struct
+    /// literal can check it before emitting bytes.
+    pub fn validate(&self) -> Result<()> {
+        self.body.validate()?;
+        self.signatures.ensure_context(CAPSULE_SIGNATURE_CONTEXT)?;
+        Ok(())
+    }
+
+    pub fn to_dag_cbor(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        Ok(self.to_value().encode())
     }
 
     pub fn from_dag_cbor(bytes: &[u8]) -> Result<Self> {
@@ -598,7 +645,7 @@ impl Capsule {
     }
 
     pub fn cid512(&self) -> Result<String> {
-        at9p_capsule_cid512(&self.to_dag_cbor())
+        at9p_capsule_cid512(&self.to_dag_cbor()?)
     }
 
     fn to_value(&self) -> DagCbor {
@@ -628,7 +675,39 @@ pub struct UpdateRecord {
 }
 
 impl UpdateRecord {
-    pub fn to_dag_cbor(&self) -> Vec<u8> {
+    /// Validating constructor — the encode/decode trust boundary. Prefer this
+    /// over struct-literal construction so an invalid record is caught at the
+    /// call site rather than at [`Self::to_dag_cbor`] / [`Self::signable_bytes`].
+    pub fn new(
+        subject_cid512: String,
+        epoch: u64,
+        prev_record_digest: [u8; H512_LEN],
+        new_capsule_body: CapsuleBody,
+        expires_at: String,
+        signatures: CoseCompositeSignature,
+    ) -> Result<Self> {
+        let record = Self {
+            subject_cid512,
+            epoch,
+            prev_record_digest,
+            new_capsule_body,
+            expires_at,
+            signatures,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub fn to_dag_cbor(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        Ok(self.to_value().encode())
+    }
+
+    /// Serialize without re-validating. For crate-internal digest/state
+    /// projection (chain watermark, duplicity digest) over records already known
+    /// to be valid — they reached here via [`Self::from_dag_cbor`] (validated)
+    /// or the signing path. External callers must use [`Self::to_dag_cbor`].
+    pub(crate) fn encode_value(&self) -> Vec<u8> {
         self.to_value().encode()
     }
 
@@ -638,9 +717,11 @@ impl UpdateRecord {
 
     /// Canonical DAG-CBOR bytes of the update record *without* its `signatures`
     /// field — the payload the composite signature covers (see
-    /// [`crate::at9p_sign`]).
-    pub fn signable_bytes(&self) -> Vec<u8> {
-        self.signable_value().encode()
+    /// [`crate::at9p_sign`]). Validates the signed content (cid, datetime,
+    /// capsule body); the signature itself is excluded by definition.
+    pub fn signable_bytes(&self) -> Result<Vec<u8>> {
+        self.validate_content()?;
+        Ok(self.signable_value().encode())
     }
 
     fn signable_value(&self) -> DagCbor {
@@ -656,10 +737,19 @@ impl UpdateRecord {
         ])
     }
 
-    fn validate(&self) -> Result<()> {
+    /// Validate the signed content (everything the signature covers) — cid,
+    /// datetime, and the new capsule body. Excludes the signature itself.
+    fn validate_content(&self) -> Result<()> {
         validate_cid512(&self.subject_cid512)?;
         validate_datetime(&self.expires_at)?;
         self.new_capsule_body.validate()?;
+        Ok(())
+    }
+
+    /// Full validation: content plus the signature-context binding. The
+    /// encode/decode trust boundary.
+    pub fn validate(&self) -> Result<()> {
+        self.validate_content()?;
         self.signatures.ensure_context(UPDATE_SIGNATURE_CONTEXT)?;
         Ok(())
     }
@@ -760,15 +850,38 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    pub fn to_dag_cbor(&self) -> Vec<u8> {
-        self.to_value().encode()
+    /// Validating constructor — the encode/decode trust boundary. Prefer this
+    /// over struct-literal construction so an invalid manifest (e.g. mismatched
+    /// `totalLen`, non-contiguous shards, wrong signature context) is caught at
+    /// the call site rather than at [`Self::to_dag_cbor`].
+    pub fn new(
+        subject_cid512: String,
+        codec: String,
+        total_len: u64,
+        shards: Vec<ShardEntry>,
+        signatures: CoseCompositeSignature,
+    ) -> Result<Self> {
+        let manifest = Self {
+            subject_cid512,
+            codec,
+            total_len,
+            shards,
+            signatures,
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub fn to_dag_cbor(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        Ok(self.to_value().encode())
     }
 
     pub fn from_dag_cbor(bytes: &[u8]) -> Result<Self> {
         Self::from_value(&decode_canonical(bytes, "at9p manifest")?)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         validate_cid512(&self.subject_cid512)?;
         validate_nonempty_no_ws(&self.codec, "manifest codec")?;
         ensure!(!self.shards.is_empty(), "manifest shards must not be empty");
@@ -844,13 +957,30 @@ pub struct Shard {
 }
 
 impl Shard {
-    pub fn to_dag_cbor(&self) -> Vec<u8> {
-        DagCbor::str_map([
+    /// Validating constructor — the encode/decode trust boundary.
+    pub fn new(subject_cid512: String, index: u64, shard_bytes: Vec<u8>) -> Result<Self> {
+        let shard = Self {
+            subject_cid512,
+            index,
+            shard_bytes,
+        };
+        shard.validate()?;
+        Ok(shard)
+    }
+
+    /// Validate the shard's `subjectCid512` (the only field-level invariant).
+    pub fn validate(&self) -> Result<()> {
+        validate_cid512(&self.subject_cid512)
+    }
+
+    pub fn to_dag_cbor(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        Ok(DagCbor::str_map([
             ("index", DagCbor::Unsigned(self.index)),
             ("shardBytes", DagCbor::Bytes(self.shard_bytes.clone())),
             ("subjectCid512", DagCbor::Text(self.subject_cid512.clone())),
         ])
-        .encode()
+        .encode())
     }
 
     pub fn from_dag_cbor(bytes: &[u8]) -> Result<Self> {
@@ -1000,18 +1130,99 @@ fn validate_did_or_endpoint(s: &str, field: &str) -> Result<()> {
     Ok(())
 }
 
+/// Strict ISO-8601 UTC datetime validator for at9p `expires-at` fields.
+///
+/// Accepts exactly `YYYY-MM-DDTHH:MM:SSZ` (20 chars, no fractional seconds,
+/// `Z` zone designator). Unlike a separator-only check, this validates the
+/// calendar fields — month 1..=12, day 1..=days-in-month (leap-aware), hour
+/// 0..=23, minute/second 0..=59 (no leap-second `60`), year 0001..=9999 — so
+/// nonsense like `0000-00-00T00:00:60Z` is rejected instead of passing. This
+/// is the freshness-gate input for rotation records (#883/#879 §7.2); a loose
+/// check would let a nonsensical `expires-at` reach the wire and the rollback
+/// bound.
 fn validate_datetime(s: &str) -> Result<()> {
-    ensure!(s.ends_with('Z'), "datetime must end with 'Z': {s:?}");
-    ensure!(s.len() >= 20, "datetime too short: {s:?}");
+    const EXPECTED_LEN: usize = 20; // YYYY-MM-DDTHH:MM:SSZ
     ensure!(
-        s.as_bytes().get(4) == Some(&b'-')
-            && s.as_bytes().get(7) == Some(&b'-')
-            && s.as_bytes().get(10) == Some(&b'T')
-            && s.as_bytes().get(13) == Some(&b':')
-            && s.as_bytes().get(16) == Some(&b':'),
-        "datetime must be ISO-8601 UTC: {s:?}"
+        s.len() == EXPECTED_LEN,
+        "datetime must be {EXPECTED_LEN} chars (YYYY-MM-DDTHH:MM:SSZ): {s:?}"
+    );
+    let b = s.as_bytes();
+    ensure!(
+        b[4] == b'-'
+            && b[7] == b'-'
+            && b[10] == b'T'
+            && b[13] == b':'
+            && b[16] == b':'
+            && b[19] == b'Z',
+        "datetime must be ISO-8601 UTC (YYYY-MM-DDTHH:MM:SSZ): {s:?}"
+    );
+    let year = four_digit_field(&b[0..4], s, "year")?;
+    let month = two_digit_field(&b[5..7], s, "month")?;
+    let day = two_digit_field(&b[8..10], s, "day")?;
+    let hour = two_digit_field(&b[11..13], s, "hour")?;
+    let minute = two_digit_field(&b[14..16], s, "minute")?;
+    let second = two_digit_field(&b[17..19], s, "second")?;
+    ensure!(
+        (1..=9999).contains(&year),
+        "datetime year out of range 0001..=9999: {s:?}"
+    );
+    ensure!(
+        (1..=12).contains(&month),
+        "datetime month out of range 1..=12: {s:?}"
+    );
+    let max_day = days_in_month(year, month);
+    ensure!(
+        (1..=max_day).contains(&day),
+        "datetime day out of range 1..={max_day} for {year}-{month:02}: {s:?}"
+    );
+    ensure!(hour <= 23, "datetime hour out of range 0..=23: {s:?}");
+    ensure!(minute <= 59, "datetime minute out of range 0..=59: {s:?}");
+    ensure!(
+        second <= 59,
+        "datetime second out of range 0..=59 (no leap seconds): {s:?}"
     );
     Ok(())
+}
+
+/// Parse a fixed 2-digit decimal field, requiring both bytes to be ASCII
+/// digits; returns the value or a datetime-shaped error.
+fn two_digit_field(g: &[u8], s: &str, name: &str) -> Result<u32> {
+    ensure!(
+        g.len() == 2 && g[0].is_ascii_digit() && g[1].is_ascii_digit(),
+        "datetime {name} must be two decimal digits: {s:?}"
+    );
+    Ok((g[0] - b'0') as u32 * 10 + (g[1] - b'0') as u32)
+}
+
+/// Parse a fixed 4-digit decimal field (the year).
+fn four_digit_field(g: &[u8], s: &str, name: &str) -> Result<u32> {
+    ensure!(
+        g.len() == 4 && g.iter().all(u8::is_ascii_digit),
+        "datetime {name} must be four decimal digits: {s:?}"
+    );
+    let mut v = 0u32;
+    for &c in g {
+        v = v * 10 + (c - b'0') as u32;
+    }
+    Ok(v)
+}
+
+/// Proleptic Gregorian leap-year test.
+fn is_leap_year(year: u32) -> bool {
+    year.is_multiple_of(4) && !year.is_multiple_of(100) || year.is_multiple_of(400)
+}
+
+/// Days in a Gregorian month, leap-year aware. `month` is validated 1..=12 by
+/// the caller; any other value is not a real calendar month and yields `0`
+/// (the day-range check in [`validate_datetime`] then rejects it).
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
 }
 
 fn validate_cid512(s: &str) -> Result<()> {
@@ -1047,6 +1258,32 @@ fn validate_unique_texts(values: &[String], field: &str) -> Result<()> {
             seen.insert(value.as_str()),
             "duplicate {field} entry {value:?}"
         );
+    }
+    Ok(())
+}
+
+/// Validate the classical DID aliases a `did:at9p` capsule can reciprocally
+/// attest to (#896 / D4): `did:web`, `did:key`, or `did:plc`, duplicate-free.
+fn validate_classical_did_list(values: &[String], field: &str) -> Result<()> {
+    validate_unique_texts(values, field)?;
+    for value in values {
+        ensure!(
+            value.starts_with("did:web:")
+                || value.starts_with("did:key:")
+                || value.starts_with("did:plc:"),
+            "{field} entry {value:?} must be a classical DID alias \
+             (did:web, did:key, or did:plc)"
+        );
+    }
+    Ok(())
+}
+
+/// Reject duplicate `H512` digests. The list may be empty (no iteration), but
+/// two equal digests are a meaningless repeat — used for `next_key_commitments`.
+fn validate_unique_digests(digests: &[[u8; H512_LEN]], field: &str) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for digest in digests {
+        ensure!(seen.insert(digest.as_slice()), "duplicate {field} entry");
     }
     Ok(())
 }
@@ -1118,6 +1355,10 @@ mod tests {
         .unwrap();
         body.next_key_commitments = vec![digest(seed.wrapping_add(3))];
         body.label_hints = Some(vec![format!("tenant{seed}")]);
+        body.also_known_as = Some(vec![
+            format!("did:web:node{seed}.example"),
+            format!("did:key:z6Mkaka{seed}"),
+        ]);
         body.witnesses = Some(vec![format!("did:at9p:witness{seed}")]);
         Capsule::new(body, signature(CAPSULE_SIGNATURE_CONTEXT, seed)).unwrap()
     }
@@ -1129,10 +1370,10 @@ mod tests {
     proptest! {
         #[test]
         fn capsule_round_trip_is_byte_stable(capsule in arb_capsule()) {
-            let bytes = capsule.to_dag_cbor();
+            let bytes = capsule.to_dag_cbor().unwrap();
             let decoded = Capsule::from_dag_cbor(&bytes).unwrap();
             prop_assert_eq!(&decoded, &capsule);
-            prop_assert_eq!(decoded.to_dag_cbor(), bytes);
+            prop_assert_eq!(decoded.to_dag_cbor().unwrap(), bytes);
             prop_assert!(decoded.cid512().unwrap().starts_with('b'));
         }
 
@@ -1147,10 +1388,10 @@ mod tests {
                 expires_at: "2026-07-08T12:00:00Z".to_owned(),
                 signatures: signature(UPDATE_SIGNATURE_CONTEXT, 7),
             };
-            let bytes = record.to_dag_cbor();
+            let bytes = record.to_dag_cbor().unwrap();
             let decoded = UpdateRecord::from_dag_cbor(&bytes).unwrap();
             prop_assert_eq!(&decoded, &record);
-            prop_assert_eq!(decoded.to_dag_cbor(), bytes);
+            prop_assert_eq!(decoded.to_dag_cbor().unwrap(), bytes);
         }
 
         #[test]
@@ -1166,16 +1407,16 @@ mod tests {
                 }],
                 signatures: signature(MANIFEST_SIGNATURE_CONTEXT, 10),
             };
-            let bytes = manifest.to_dag_cbor();
+            let bytes = manifest.to_dag_cbor().unwrap();
             let decoded = Manifest::from_dag_cbor(&bytes).unwrap();
             prop_assert_eq!(&decoded, &manifest);
-            prop_assert_eq!(decoded.to_dag_cbor(), bytes);
+            prop_assert_eq!(decoded.to_dag_cbor().unwrap(), bytes);
         }
     }
 
     #[test]
     fn capsule_rejects_unsorted_map_keys() {
-        let good = sample_capsule(1).to_dag_cbor();
+        let good = sample_capsule(1).to_dag_cbor().unwrap();
         let decoded = DagCbor::decode(&good).unwrap();
         let DagCbor::Map(mut pairs) = decoded else {
             panic!("capsule must encode as map");
@@ -1216,7 +1457,7 @@ mod tests {
             expires_at: "2026-07-08T12:00:00Z".to_owned(),
             signatures: signature(UPDATE_SIGNATURE_CONTEXT, 8),
         };
-        let mut bad = record.to_dag_cbor();
+        let mut bad = record.to_dag_cbor().unwrap();
         let pos = bad
             .windows(5)
             .position(|w| w == b"epoch")
@@ -1235,5 +1476,190 @@ mod tests {
         assert_eq!(decoded.codec, Codec::At9pCapsule);
         assert_eq!(decoded.multihash.algo, HashAlgo::Blake3);
         assert_eq!(decoded.multihash.digest.len(), H512_LEN);
+    }
+
+    #[test]
+    fn also_known_as_round_trips_and_round_trips_byte_stable() {
+        let capsule = sample_capsule(7);
+        // The fixture sets two classical aliases.
+        assert_eq!(
+            capsule.body.also_known_as.as_deref().unwrap(),
+            &[
+                "did:web:node7.example".to_owned(),
+                "did:key:z6Mkaka7".to_owned()
+            ]
+        );
+        // Byte-stable canonical round-trip carries alsoKnownAs.
+        let bytes = capsule.to_dag_cbor().unwrap();
+        let decoded = Capsule::from_dag_cbor(&bytes).unwrap();
+        assert_eq!(&decoded, &capsule);
+        assert_eq!(decoded.to_dag_cbor().unwrap(), bytes);
+    }
+
+    #[test]
+    fn also_known_as_rejects_non_did_and_duplicates() {
+        let mut body = CapsuleBody::new(
+            vec![key(1)],
+            vec![service("#ns".to_owned(), ServiceType::NinePExport, 1)],
+        )
+        .unwrap();
+        // Non-DID entry rejected at the schema gate.
+        body.also_known_as = Some(vec!["https://not.a.did.example".to_owned()]);
+        assert!(body.validate().is_err());
+        // Duplicate entry rejected.
+        body.also_known_as = Some(vec![
+            "did:web:dup.example".to_owned(),
+            "did:web:dup.example".to_owned(),
+        ]);
+        assert!(body.validate().is_err());
+        // did:at9p is the capsule identity, not a classical alias.
+        body.also_known_as = Some(vec!["did:at9p:bafynotaclassicalalias".to_owned()]);
+        assert!(body.validate().is_err());
+        // Empty list rejected (must not be empty when present).
+        body.also_known_as = Some(Vec::new());
+        assert!(body.validate().is_err());
+        // Clean classical DID aliases validate.
+        body.also_known_as = Some(vec!["did:web:clean.example".to_owned()]);
+        assert!(body.validate().is_ok());
+        body.also_known_as = Some(vec!["did:plc:clean".to_owned()]);
+        assert!(body.validate().is_ok());
+    }
+
+    /// Issue #934 (validate-on-encode): pub fields allow post-construction
+    /// mutation, so encode must re-validate and fail closed rather than emit
+    /// (or sign over / cid) bytes the decode side would reject.
+    #[test]
+    fn encode_rejects_post_construction_mutation() {
+        let mut capsule = sample_capsule(1);
+        capsule.body.subject_keys.clear(); // now invalid (empty subject keys)
+        assert!(capsule.body.to_dag_cbor().is_err());
+        assert!(
+            capsule.to_dag_cbor().is_err(),
+            "capsule encode must validate"
+        );
+        assert!(capsule.cid512().is_err(), "cid512 must validate");
+
+        // A record whose signature context was swapped still encodes its bytes
+        // fine for content, but a fully-mutated invalid body fails signable too.
+        let capsule2 = sample_capsule(2);
+        let mut record = UpdateRecord {
+            subject_cid512: capsule2.cid512().unwrap(),
+            epoch: 0,
+            prev_record_digest: digest(1),
+            new_capsule_body: capsule2.body.clone(),
+            expires_at: "2026-07-08T12:00:00Z".to_owned(),
+            signatures: signature(UPDATE_SIGNATURE_CONTEXT, 3),
+        };
+        assert!(record.signable_bytes().is_ok(), "valid content encodes");
+        assert!(record.to_dag_cbor().is_ok(), "valid record encodes");
+        record.new_capsule_body.subject_keys.clear();
+        assert!(record.signable_bytes().is_err(), "invalid content rejected");
+        assert!(record.to_dag_cbor().is_err());
+    }
+
+    /// Issue #934 (validating constructors): the new `new()` constructors close
+    /// the "no validating constructor" gap for UpdateRecord/Manifest/Shard.
+    #[test]
+    fn validating_constructors_reject_invalid() {
+        let capsule = sample_capsule(1);
+        let cid = capsule.cid512().unwrap();
+
+        // UpdateRecord::new rejects a bad datetime.
+        assert!(UpdateRecord::new(
+            cid.clone(),
+            0,
+            digest(1),
+            capsule.body.clone(),
+            "0000-00-00T00:00:60Z".to_owned(),
+            signature(UPDATE_SIGNATURE_CONTEXT, 2),
+        )
+        .is_err());
+
+        // Manifest::new rejects a mismatched totalLen (shard sum is 10, not 999).
+        assert!(Manifest::new(
+            cid.clone(),
+            "dag-cbor".to_owned(),
+            999,
+            vec![ShardEntry {
+                index: 0,
+                shard_len: 10,
+                shard_digest: digest(9),
+            }],
+            signature(MANIFEST_SIGNATURE_CONTEXT, 1),
+        )
+        .is_err());
+
+        // Shard::new rejects a malformed subjectCid512.
+        assert!(Shard::new("not-a-cid".to_owned(), 0, vec![0u8; 4]).is_err());
+        // ... and accepts a valid one.
+        assert!(Shard::new(cid.clone(), 0, vec![0u8; 4]).is_ok());
+    }
+
+    /// Issue #934 (datetime tightening): the old validator only checked
+    /// separator positions, letting nonsense like `0000-00-00T00:00:60Z`
+    /// through. Validate the actual calendar fields.
+    #[test]
+    fn validate_datetime_is_strict_iso8601_utc() {
+        fn check(expires: &str) -> Result<()> {
+            let capsule = sample_capsule(1);
+            UpdateRecord {
+                subject_cid512: capsule.cid512().unwrap(),
+                epoch: 0,
+                prev_record_digest: digest(1),
+                new_capsule_body: capsule.body,
+                expires_at: expires.to_owned(),
+                signatures: signature(UPDATE_SIGNATURE_CONTEXT, 2),
+            }
+            .validate()
+        }
+        // The exact nonsense the old separator-only check let through.
+        assert!(check("0000-00-00T00:00:60Z").is_err());
+        // Leap second 60.
+        assert!(check("2026-07-08T12:00:60Z").is_err());
+        // Month 13 / day 0 / hour 24.
+        assert!(check("2026-13-08T12:00:00Z").is_err());
+        assert!(check("2026-07-00T12:00:00Z").is_err());
+        assert!(check("2026-07-08T24:00:00Z").is_err());
+        // Minute / second 60.
+        assert!(check("2026-07-08T12:60:00Z").is_err());
+        // Fractional seconds (wrong length / not the Z-terminated 20-char form).
+        assert!(check("2026-07-08T12:00:00.5Z").is_err());
+        // Feb 29 in a non-leap year.
+        assert!(check("2023-02-29T00:00:00Z").is_err());
+        // Day 32.
+        assert!(check("2026-07-32T12:00:00Z").is_err());
+        // Wrong length (too short).
+        assert!(check("2026-07-08T12:00Z").is_err());
+        // Non-UTC zone designator.
+        assert!(check("2026-07-08T12:00:00+00:00").is_err());
+
+        // Valid values still pass — including a leap day and far-future dates.
+        assert!(check("2026-07-08T12:00:00Z").is_ok());
+        assert!(check("2024-02-29T00:00:00Z").is_ok()); // 2024 is a leap year
+        assert!(check("2099-01-01T00:00:00Z").is_ok());
+        assert!(check("2023-02-28T23:59:59Z").is_ok());
+    }
+
+    /// Issue #934 (next_key_commitments): MAY be empty (#879 §5.3
+    /// declared-immutable), but duplicate commitments are a meaningless repeat
+    /// and must be rejected.
+    #[test]
+    fn next_key_commitments_empty_ok_duplicates_rejected() {
+        let mut body = CapsuleBody::new(
+            vec![key(1)],
+            vec![service("#ns".to_owned(), ServiceType::NinePExport, 1)],
+        )
+        .unwrap();
+        // Empty is allowed (declared-immutable identity).
+        assert!(body.validate().is_ok());
+        // A single commitment is fine.
+        body.next_key_commitments = vec![digest(5)];
+        assert!(body.validate().is_ok());
+        // Two identical commitments are rejected.
+        body.next_key_commitments = vec![digest(5), digest(5)];
+        assert!(body.validate().is_err());
+        // Two distinct commitments are fine.
+        body.next_key_commitments = vec![digest(5), digest(6)];
+        assert!(body.validate().is_ok());
     }
 }

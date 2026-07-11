@@ -1,0 +1,44 @@
+# KIND cluster config for the hyprstream e2e K8s harness.
+#
+# Design notes
+# ------------
+# * Provider is rootless **podman** (KIND_EXPERIMENTAL_PROVIDER=podman); docker is
+#   intentionally absent from this environment. The scripts in this directory set
+#   that env var, but it is also harmless to export it in your shell.
+# * Topology: 1 control-plane + 2 workers. The workers are what #458's
+#   anycast/flow-stability spike reschedules pods across; #799's ingress spike
+#   only needs the control-plane API + a LoadBalancer. Two workers is the minimum
+#   that exercises cross-node rescheduling; bump WORKER_COUNT in up.sh to 3 if you
+#   want a stricter anti-affinity test.
+# * `disableDefaultCNI: false` keeps kindnet so the harness is self-contained.
+#   metallb is layered on top in `lib/metallb.sh` to give UDP-capable
+#   LoadBalancers for the QUIC/WebTransport path (#799).
+# * The `extraMounts` on the control-plane map a host scratch dir into the node so
+#   spike artifacts (captured certs, subscriber logs) can round-trip out of pods
+#   without `kubectl cp`. It is optional; create the dir or drop the mount.
+# * kube-proxy runs iptables-mode by default in kind; #458's forced-backend-flap
+#   relies on service reroute (endpoint removal), not on kube-proxy mode, so the
+#   default is fine.
+
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: hyprstream
+nodes:
+  - role: control-plane
+    # Expose a port range for UDP LoadBalancer/NodePort work (#799 WebTransport).
+    # 30443/tcp + 30443/udp are used by the spike scripts as a stable NodePort.
+    extraPortMappings:
+      - containerPort: 30443
+        hostPort: 30443
+        protocol: TCP
+      - containerPort: 30443
+        hostPort: 30443
+        protocol: UDP
+  - role: worker
+  - role: worker
+networking:
+  # The podman "kind" bridge subnet is what metallb's address pool is carved
+  # from (see lib/metallb.sh). kind picks a subnet automatically; metallb.sh
+  # discovers it from the node's podCIDR rather than hardcoding, so leave this
+  # unset unless you need deterministic addressing.
+  ipFamily: ipv4

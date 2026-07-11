@@ -1448,8 +1448,8 @@ impl RequestService for WorkerService {
 }
 
 // These tests exercise the VM lifecycle (RafsStore + KataBackend), so they only
-// build/run under `kata-vm`.
-#[cfg(all(test, feature = "kata-vm"))]
+// build/run under `kata`.
+#[cfg(all(test, feature = "kata"))]
 #[allow(clippy::print_stderr)]
 mod tests {
     use super::*;

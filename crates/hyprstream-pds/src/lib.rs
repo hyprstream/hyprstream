@@ -49,6 +49,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 pub mod at9p;
+pub mod at9p_alias;
 pub mod at9p_chain;
 pub mod at9p_duplicity;
 pub mod at9p_gate;
@@ -62,11 +63,15 @@ pub mod event_group;
 pub mod ledger;
 pub mod list_record;
 pub mod mst;
+pub mod name_record;
 pub mod placement;
 pub mod record;
+pub mod repo_authority;
 pub mod tid;
 
 pub use cid::Cid;
 pub use ledger::{AllocationRecord, CheckpointRecord, GrantClass, ReceiptRecord, StateRoot, Unit};
+pub use name_record::NameRecord;
 pub use placement::{GroupItemRecord, GroupRecord, NodeRecord, WorkloadRecord};
 pub use record::ModelRecord;
+pub use repo_authority::{accept_repo_authority, RepoAuthority};

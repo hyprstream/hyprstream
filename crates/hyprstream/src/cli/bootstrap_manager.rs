@@ -17,7 +17,7 @@ use hyprstream_tui::wizard::backend::*;
 
 use crate::auth::identity_store;
 use crate::auth::policy_templates::{get_template, get_templates};
-use crate::auth::{RocksDbUserStore, PolicyManager, UserStore};
+use crate::auth::{RocksDbUserStore, PolicyManager};
 use crate::cli::gpu_detect;
 use crate::cli::policy_handlers::{
     load_or_generate_signing_key, mint_local_token, parse_duration,
@@ -88,44 +88,10 @@ fn os_username() -> String {
         .unwrap_or_else(|_| "anonymous".to_owned())
 }
 
-/// Bind a user-signing-key public key to `username`, idempotently and
-/// collision-safely.
-///
-/// `add_pubkey` rejects a fingerprint that is already bound (to the same or a
-/// different user), so we resolve the current binding first:
-/// - already bound to `username` → no-op (the key is already recognized),
-/// - bound to a *different* user (e.g. an `anonymous` record left by a prior
-///   partial run) → re-point it: remove from the old user, add to `username`,
-/// - unbound → add it.
-///
-/// Re-pointing is the least-surprising behavior: there is exactly one local
-/// user-signing-key, so it should map to exactly one identity — the one the
-/// operator is setting up.
-async fn bind_user_signing_key(
-    store: &RocksDbUserStore,
-    username: &str,
-    vk: ed25519_dalek::VerifyingKey,
-) -> anyhow::Result<()> {
-    let fingerprint = crate::auth::user_store::pubkey_fingerprint(&vk);
-
-    match store.get_pubkey_user(&fingerprint).await? {
-        Some(existing) if existing == username => {
-            // Already bound to this user — nothing to do.
-            return Ok(());
-        }
-        Some(existing) => {
-            // Bound to a different (likely stale `anonymous`) user — re-point.
-            tracing::info!("Re-pointing user-signing-key from '{existing}' to '{username}'");
-            store.remove_pubkey(&existing, &fingerprint).await?;
-        }
-        None => {}
-    }
-
-    store
-        .add_pubkey(username, vk, Some("wizard".to_owned()))
-        .await?;
-    Ok(())
-}
+// The shared enroll routine (#438 wizard + #439 `user create`) lives in
+// `cli::enroll`; the wizard uses it directly. `bind_user_signing_key` is still
+// unit-tested here (see `tests`).
+use crate::cli::enroll::{enroll_user, EnrollKeySource};
 
 /// Returns true if this is the first run (no bootstrap completed yet).
 ///
@@ -185,13 +151,12 @@ impl BootstrapManager {
     /// Register a user identity in UserStore and bind the CLI's user-signing-key
     /// public key to it.
     ///
-    /// The wizard has the local user-signing-key (the credential the CLI signs
-    /// auth challenges with), so any username it is asked to register — the OS
-    /// user (non-interactive) or an operator-entered name (interactive) — can be
-    /// bound to that key. Without the binding the server can never resolve the
-    /// CLI's signature back to a subject and falls back to `anonymous` (#438).
-    ///
-    /// Idempotent and collision-safe (see `bind_user_signing_key`).
+    /// Delegates to the shared [`enroll_user`] routine (#438 wizard + #439
+    /// `user create`) so the register→store→bind sequence cannot drift. The
+    /// wizard uses the `Generate` source: it adopts the existing/on-disk
+    /// user-signing-key the CLI signs with. Without the binding the server can
+    /// never resolve the CLI's signature back to a subject and falls back to
+    /// `anonymous` (#438).
     fn register_local_identity(&mut self, username: &str) {
         let credentials_dir = match identity_store::credentials_dir() {
             Ok(path) => path,
@@ -214,18 +179,6 @@ impl BootstrapManager {
             }
         };
 
-        // Register the user record if it doesn't already exist. `register`
-        // overwrites pubkeys on an existing record, so only call it when absent.
-        if self.rt.block_on(store.get_profile(username)).ok().flatten().is_none() {
-            if let Err(e) = self.rt.block_on(store.register(username)) {
-                tracing::warn!(
-                    username,
-                    "Failed to register user identity in UserStore — user identity will not be registered: {e}"
-                );
-                return;
-            }
-        }
-
         // Load the user-signing-key from the SAME secrets dir the CLI uses, so
         // the bound fingerprint matches the key the CLI signs with.
         let secrets_dir = match crate::config::HyprConfig::resolve_secrets_dir() {
@@ -238,36 +191,25 @@ impl BootstrapManager {
                 return;
             }
         };
-        let vk = match identity_store::load_or_generate_user_signing_key(&secrets_dir) {
-            Ok((_sk, vk)) => vk,
-            Err(e) => {
-                tracing::warn!(
-                    username, ?secrets_dir,
-                    "Failed to load user-signing-key — CLI signing key will not be bound to '{username}': {e}"
-                );
-                return;
+
+        // Root-of-trust enrollment follows node crypto policy (Hybrid default,
+        // fail-closed) — the same selector as envelope traffic.
+        let policy = hyprstream_rpc::envelope::envelope_policy_from_env();
+        match self.rt.block_on(
+            enroll_user(&store, &secrets_dir, username, EnrollKeySource::Generate, policy),
+        ) {
+            Ok(outcome) => {
+                // Surface enrollment notices (e.g. the classical-downgrade
+                // warning) — `enroll_user` is fail-loud, not fail-silent.
+                for notice in &outcome.notices {
+                    tracing::warn!(username, "{notice}");
+                }
             }
-        };
-
-        if let Err(e) = self.bind_user_signing_key(&store, username, vk) {
-            tracing::warn!(
+            Err(e) => tracing::warn!(
                 username,
-                "Failed to bind user-signing-key pubkey to '{username}': {e}"
-            );
+                "Failed to enroll user identity (register + bind signing key): {e}"
+            ),
         }
-    }
-
-    /// Bind the user-signing-key public key to `username`.
-    ///
-    /// Blocking wrapper over [`bind_user_signing_key`] (the free async fn holds
-    /// the idempotency/collision logic and is unit-tested directly).
-    fn bind_user_signing_key(
-        &self,
-        store: &RocksDbUserStore,
-        username: &str,
-        vk: ed25519_dalek::VerifyingKey,
-    ) -> anyhow::Result<()> {
-        self.rt.block_on(bind_user_signing_key(store, username, vk))
     }
 
     /// Ensure the signing key is loaded.
@@ -826,6 +768,7 @@ async fn do_bootstrap(
 mod tests {
     use super::*;
     use crate::auth::{RocksDbUserStore, UserStore};
+    use crate::cli::enroll::bind_user_signing_key;
     use tempfile::TempDir;
 
     /// Replicates the register + bind sequence performed by

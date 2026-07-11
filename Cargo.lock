@@ -6855,6 +6855,7 @@ dependencies = [
  "serde_yaml",
  "sha2 0.10.9",
  "shellexpand",
+ "ssh-key",
  "subsecond",
  "subtle",
  "tch",
@@ -7112,10 +7113,12 @@ dependencies = [
  "mainline",
  "multihash",
  "parking_lot 0.12.4",
+ "quote",
  "rand 0.8.5",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "syn 2.0.111",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -7148,6 +7151,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-test",
+ "tracing",
  "tracing-subscriber",
 ]
 

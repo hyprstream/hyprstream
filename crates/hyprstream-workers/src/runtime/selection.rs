@@ -9,8 +9,10 @@
 //! feature-gated by the `#[cfg]` that compiles that backend in (#518). The
 //! registry is therefore *exactly* the set of backends built into this binary:
 //!
-//! * `nspawn` — always registered (systemd-nspawn lightweight container).
-//! * `kata`   — registered only under the `kata-vm` feature (full VM isolation).
+//! * `nspawn` — registered only under the `nspawn` feature (systemd-nspawn
+//!   lightweight container).
+//! * `kata`   — registered only under the `kata` feature (full VM isolation;
+//!   `kata-vm` is a backward-compat alias for `kata`).
 //! * `oci`    — registered only under the `oci` feature (rootless OCI/podman
 //!   container, #346).
 //! * `wasm`   — registered only under the `wasm` feature (in-process WebAssembly,
@@ -277,7 +279,7 @@ fn select_registration_with_cap<'a>(
             if name.eq_ignore_ascii_case("kata") {
                 msg.push_str(
                     ". The `kata` backend is only present when built with \
-                     `--features kata-vm`",
+                     `--features kata` (or the `kata-vm` alias)",
                 );
             }
             Err(WorkerError::ConfigError(msg))
@@ -829,11 +831,14 @@ mod tests {
         assert!(!backend_injects_9p_socket("does-not-exist"));
         assert!(require_9p_socket_capability("does-not-exist").is_err());
 
-        // nspawn is always registered and IS capable (host --bind).
-        assert!(backend_injects_9p_socket("nspawn"), "nspawn can bind a host UDS");
-        assert!(require_9p_socket_capability("nspawn").is_ok());
-        // Case-insensitive, mirroring name matching.
-        assert!(backend_injects_9p_socket("NSPAWN"));
+        // nspawn is registered under the `nspawn` feature and IS capable (host --bind).
+        #[cfg(feature = "nspawn")]
+        {
+            assert!(backend_injects_9p_socket("nspawn"), "nspawn can bind a host UDS");
+            assert!(require_9p_socket_capability("nspawn").is_ok());
+            // Case-insensitive, mirroring name matching.
+            assert!(backend_injects_9p_socket("NSPAWN"));
+        }
     }
 
     #[cfg(feature = "oci")]
@@ -845,14 +850,23 @@ mod tests {
         assert!(oci.injects_9p_socket, "oci bind-mounts a host UDS → capable");
     }
 
-    #[cfg(feature = "kata-vm")]
+    #[cfg(feature = "nspawn")]
+    #[test]
+    fn nspawn_advertises_9p_socket_injection() {
+        let nspawn = inventory::iter::<BackendRegistration>()
+            .find(|r| r.name == "nspawn")
+            .expect("nspawn registered under the nspawn feature");
+        assert!(nspawn.injects_9p_socket, "nspawn --bind can inject a host UDS");
+    }
+
+    #[cfg(feature = "kata")]
     #[test]
     fn kata_does_not_advertise_9p_socket_injection() {
         // A VM does not share the host mount namespace, so it cannot bind-inject
         // a host UDS the way oci/nspawn do — it must NOT advertise the capability.
         let kata = inventory::iter::<BackendRegistration>()
             .find(|r| r.name == "kata")
-            .expect("kata registered under the kata-vm feature");
+            .expect("kata registered under the kata feature");
         assert!(
             !kata.injects_9p_socket,
             "kata (VM, no shared host mount ns) must not advertise host-UDS injection"
@@ -872,18 +886,11 @@ mod tests {
     }
 
     #[test]
-    fn nspawn_advertises_9p_socket_injection() {
-        let nspawn = inventory::iter::<BackendRegistration>()
-            .find(|r| r.name == "nspawn")
-            .expect("nspawn always registered");
-        assert!(nspawn.injects_9p_socket, "nspawn --bind can inject a host UDS");
-    }
-
-    #[test]
     fn unknown_kata_hints_about_feature() {
-        // Asking for kata when it isn't registered (e.g. kata-vm off) gives a
+        // Asking for kata when it isn't registered (e.g. kata off) gives a
         // build-feature hint rather than a bare unknown error.
         let err = select_registration("kata", &regs(), |_| true).unwrap_err();
+        assert!(err.to_string().contains("kata"), "got: {err}");
         assert!(err.to_string().contains("kata-vm"), "got: {err}");
     }
 
@@ -920,17 +927,18 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "nspawn")]
     #[test]
     fn nspawn_advertises_fuse_mount_capability_in_real_inventory() {
         // The real inventory: nspawn is the Model B FUSE-root target (#715), so
-        // the public gate resolves it Ok. nspawn is always registered.
+        // the public gate resolves it Ok. nspawn registers under its feature.
         assert!(
             require_fuse_mount_capability("nspawn").is_ok(),
             "nspawn must advertise mounts_fuse_vfs"
         );
     }
 
-    #[cfg(feature = "kata-vm")]
+    #[cfg(feature = "kata")]
     #[test]
     fn kata_does_not_advertise_fuse_mount_capability() {
         // kata already shares the composed VFS via virtio-fs, not a host FUSE
@@ -940,11 +948,16 @@ mod tests {
     }
 
     #[test]
-    fn registry_contains_nspawn_always() {
-        let names: Vec<&str> = inventory::iter::<BackendRegistration>()
-            .map(|r| r.name)
-            .collect();
-        assert!(names.contains(&"nspawn"), "nspawn must always register; got {names:?}");
+    fn registry_contains_nspawn_only_under_feature() {
+        // nspawn registers iff built with `--features nspawn` (#518: per-
+        // BackendType feature, mirroring kata/oci/cri/wasm). With the feature off
+        // it must NOT be a selectable name (fail-closed).
+        let has_nspawn = inventory::iter::<BackendRegistration>().any(|r| r.name == "nspawn");
+        assert_eq!(
+            has_nspawn,
+            cfg!(feature = "nspawn"),
+            "nspawn registration must track the nspawn feature"
+        );
     }
 
     #[test]
@@ -952,8 +965,8 @@ mod tests {
         let has_kata = inventory::iter::<BackendRegistration>().any(|r| r.name == "kata");
         assert_eq!(
             has_kata,
-            cfg!(feature = "kata-vm"),
-            "kata registration must track the kata-vm feature"
+            cfg!(feature = "kata"),
+            "kata registration must track the kata feature (kata-vm is its alias)"
         );
     }
 
@@ -1025,7 +1038,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "oci")]
+    #[cfg(all(feature = "oci", feature = "nspawn"))]
     #[test]
     fn oci_is_auto_selectable_and_outranks_nspawn() {
         // A rootless container (user namespaces + seccomp + its own image rootfs)
@@ -1036,7 +1049,7 @@ mod tests {
             .expect("oci registered under the oci feature");
         let nspawn = inventory::iter::<BackendRegistration>()
             .find(|r| r.name == "nspawn")
-            .expect("nspawn always registered");
+            .expect("nspawn registered under the nspawn feature");
         assert!(oci.auto_selectable, "oci is a real isolation tier → auto-selectable");
         assert!(
             oci.priority > nspawn.priority,
@@ -1086,16 +1099,25 @@ mod tests {
             err.to_string().contains("no available sandbox backend"),
             "auto must not pick wasm; got: {err}"
         );
+    }
 
-        // And with nspawn alongside it, `"auto"` resolves to nspawn — never wasm.
+    // The wasm-vs-nspawn comparison needs both backends compiled in: wasm (the
+    // auto-excluded tier) and nspawn (the auto-eligible tier that must win).
+    #[cfg(all(feature = "wasm", feature = "nspawn"))]
+    #[test]
+    fn auto_prefers_nspawn_over_auto_excluded_wasm() {
+        // With nspawn alongside wasm, `"auto"` resolves to nspawn — never wasm.
         // Inject a deterministic availability oracle (everything available) so this
         // does NOT depend on the runner actually having nspawn installed: nspawn is
         // auto_selectable (and outranks), wasm is auto_selectable:false (excluded), so
         // auto must return nspawn. (Real-runtime availability is exercised elsewhere;
         // here we assert the selection *logic*, env-independently.)
+        let wasm = inventory::iter::<BackendRegistration>()
+            .find(|r| r.name == "wasm")
+            .expect("wasm registered under the wasm feature");
         let nspawn = inventory::iter::<BackendRegistration>()
             .find(|r| r.name == "nspawn")
-            .expect("nspawn always registered");
+            .expect("nspawn registered under the nspawn feature");
         let both = vec![wasm, nspawn];
         let r = select_registration("auto", &both, |_| true).unwrap();
         assert_eq!(r.name, "nspawn", "auto must pick nspawn, never wasm");
@@ -1114,7 +1136,7 @@ mod tests {
         assert!((reg.is_available)(), "wasm is always available once built");
     }
 
-    #[cfg(feature = "kata-vm")]
+    #[cfg(all(feature = "kata", feature = "nspawn"))]
     #[test]
     fn kata_outranks_nspawn_in_priority() {
         let kata = inventory::iter::<BackendRegistration>()

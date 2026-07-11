@@ -25,7 +25,7 @@ use hyprstream_core::cli::{
     handle_sign_challenge, handle_status, handle_token_create, handle_unload, handle_training_batch,
     handle_training_checkpoint, handle_training_infer, handle_training_init, handle_worktree_add,
     handle_worktree_info, handle_worktree_list, handle_worktree_remove,
-    handle_user_list, handle_user_register, handle_user_remove,
+    handle_user_create, handle_user_list, handle_user_register, handle_user_remove,
     handle_user_keys_list, handle_user_keys_import, handle_user_keys_remove,
     load_or_generate_signing_key, AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
     // Worker handlers
@@ -244,6 +244,16 @@ fn build_cli() -> ClapCommand {
                     .long("cleanup")
                     .action(clap::ArgAction::SetTrue)
                     .help("Remove old version worktrees"),
+            ),
+    );
+
+    // Native MAC status/inspection (epic #547).
+    app = app.subcommand(
+        ClapCommand::new("mac")
+            .about("Native MAC (mandatory access control) status and inspection")
+            .subcommand(
+                ClapCommand::new("genesis")
+                    .about("Show the MAC genesis coverage report (activation coverage-gate evidence)"),
             ),
     );
 
@@ -1137,9 +1147,13 @@ fn handle_quick_command(
                         let mut worker_service = WorkerService::new(
                             pool_config,
                             backend,
-                            #[cfg(feature = "kata-vm")]
+                            // Wire rafs_store for the canonical `kata` feature as
+                            // well as its `kata-vm` compat alias — `kata-vm = ["kata"]`
+                            // is one-way, so a `--features kata` build must not fall
+                            // through to the `None` arm (#518).
+                            #[cfg(any(feature = "kata", feature = "kata-vm"))]
                             Some(rafs_store),
-                            #[cfg(not(feature = "kata-vm"))]
+                            #[cfg(not(any(feature = "kata", feature = "kata-vm")))]
                             None,
                             worker_transport,
                             signing_key.clone(),
@@ -1786,6 +1800,26 @@ fn main() -> Result<()> {
         }
     }
 
+    // ── `mac` early dispatch ─────────────────────────────────────────────────
+    // `mac genesis` is a read-only, in-memory diagnostic (compile-time service
+    // inventory + site policy — no registry client, no credentials). Dispatch it
+    // before credential loading and registry-key resolution so it works on a
+    // fresh or broken installation, where its coverage evidence is most needed.
+    if let Some(("mac", sub_m)) = matches.subcommand() {
+        match sub_m.subcommand() {
+            Some(("genesis", _)) => {
+                // Build the boot-time gate and print the coverage report. This is
+                // read-only inspection — it changes no enforcement state.
+                let gate = hyprstream_core::mac::GenesisGate::production();
+                print!("{}", gate.render_report());
+            }
+            _ => {
+                eprintln!("usage: hyprstream mac genesis");
+            }
+        }
+        return Ok(());
+    }
+
     // Start registry service ONCE at CLI level
     let _registry_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1894,6 +1928,16 @@ fn main() -> Result<()> {
                     print_cert_hash,
                     standalone,
                 } => {
+                    // MAC genesis coverage gate (S1 activation, #567): log the
+                    // boot-time coverage report on EVERY `service start` path —
+                    // foreground (the mode that actually hosts services, incl.
+                    // systemd ExecStart and standalone-spawned children),
+                    // standalone, and the systemd/spawner dispatch below.
+                    // DORMANT — this only emits the activation coverage-gate
+                    // evidence (which nodes are labeled / would deny); it flips
+                    // no decider to enforcing (see `mac::genesis`).
+                    hyprstream_core::mac::GenesisGate::production().log_report();
+
                     if foreground || standalone {
                         // --foreground requires a service name or --services list;
                         // --standalone uses all configured services.
@@ -2214,6 +2258,59 @@ fn main() -> Result<()> {
                                     let _ = shared_vks.write().map(|mut guard| *guard = vks);
                                     ctx.set_ml_dsa_verifying_keys(shared_vks);
                                     tracing::info!("PQ-hybrid: ML-DSA-65 verifying keys loaded for JWT verification");
+
+                                    // MAC S4 policy bootload (#570): compile → sign
+                                    // → verify-once-at-load → install the node's
+                                    // baseline CompiledPolicy so the MAC PDP inputs
+                                    // are real. This is the one missing boot step
+                                    // that populates `mac::COMPILED_POLICY`, flipping
+                                    // `exchange_enrollment_resolver` from the deny-all
+                                    // `DenyUnlabeledResolver` to the real (#698)
+                                    // `EnrollmentSubjectContextResolver`.
+                                    //
+                                    // DORMANT: installing a compiled policy does NOT
+                                    // enable enforcement — the per-op deciders stay
+                                    // AllowAll (no PEP consults this PDP yet). It only
+                                    // makes the PDP inputs real.
+                                    //
+                                    // Fail-closed: the baseline is hybrid-signed
+                                    // (EdDSA + ML-DSA-65) and verified with
+                                    // require_pq=true. With no active ML-DSA signing
+                                    // key (Classical mode) nothing is installed —
+                                    // never an Ed25519-only baseline (design §14) —
+                                    // and the resolver keeps denying.
+                                    let active_pq = tokio::task::block_in_place(|| {
+                                        let rt = tokio::runtime::Handle::current();
+                                        rt.block_on(ml_dsa_store.active_key())
+                                    });
+                                    match active_pq {
+                                        Some(pq_sk) => match hyprstream_core::mac::install_baseline_boot_policy(
+                                            &signing_key,
+                                            &pq_sk,
+                                        ) {
+                                            Ok((policy, true)) => tracing::info!(
+                                                "MAC S4: baseline compiled policy installed \
+                                                 (generation {}, DORMANT — enforcement not enabled)",
+                                                policy.generation
+                                            ),
+                                            // The seam is write-once: a policy was
+                                            // already installed this process, so the
+                                            // baseline did NOT replace it. Report it
+                                            // honestly rather than claiming an install.
+                                            Ok((_policy, false)) => tracing::warn!(
+                                                "MAC S4: a compiled policy was already installed; \
+                                                 baseline NOT installed (write-once seam unchanged)"
+                                            ),
+                                            Err(e) => tracing::error!(
+                                                "MAC S4: baseline policy bootload failed \
+                                                 (grant-path resolver stays fail-closed): {e}"
+                                            ),
+                                        },
+                                        None => tracing::warn!(
+                                            "MAC S4: no active ML-DSA signing key; baseline policy \
+                                             NOT installed (fail-closed — grant-path resolver denies)"
+                                        ),
+                                    }
                                 }
 
                                 // M3 (#152): install the process-global envelope
@@ -2408,6 +2505,18 @@ fn main() -> Result<()> {
                 .context("Failed to create runtime for user command")?;
             rt.block_on(async {
                 match cmd {
+                    UserCommand::Create { username, role, generate, key, ssh, no_role } => {
+                        handle_user_create(
+                            &credentials_dir,
+                            &username,
+                            &role,
+                            no_role,
+                            generate,
+                            key.as_deref(),
+                            ssh.as_deref(),
+                        )
+                        .await?;
+                    }
                     UserCommand::Register { username } => {
                         handle_user_register(&credentials_dir, &username).await?;
                     }
@@ -2557,6 +2666,13 @@ fn main() -> Result<()> {
                     hyprstream_core::cli::update_handlers::handle_update(&models_dir, cleanup).await
                 },
             )?;
+        }
+
+        // ── Native MAC status/inspection ── handled early (before registry
+        // init) above: it is a read-only diagnostic that must work on fresh
+        // installations with no credentials.
+        Some(("mac", _)) => {
+            unreachable!("mac command is dispatched before registry init")
         }
 
         // ── No subcommand → wizard (first run) or ShellClient ──────────

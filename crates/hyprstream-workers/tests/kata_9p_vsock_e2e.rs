@@ -57,7 +57,7 @@
 //! 3. The kata guest kernel's lack of a 9P `trans=fd` transport is irrelevant
 //!    because the mount is userspace — confirming the V3 design choice.
 
-#![cfg(feature = "kata-vm")]
+#![cfg(feature = "kata")]
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 // Operator harness: assert with test-friendly macros.
 #![allow(clippy::unwrap_used, clippy::expect_used)]

@@ -1253,8 +1253,9 @@ impl KataBackend {
 
 // This whole file only compiles under `kata-vm` (see runtime/mod.rs), so this
 // `submit!` is feature-gated by construction: the `kata` backend is a selectable
-// name *only* in builds that include the VM toolchain. In a non-`kata-vm` binary
-// there is no registration, and selecting `kata` fails closed with a build hint.
+// name *only* in builds that include the VM toolchain. In a non-`kata` binary
+// (the `kata-vm` alias is off too) there is no registration, and selecting
+// `kata` fails closed with a build hint.
 //
 // Highest priority → preferred by `auto` (strongest isolation). Construction
 // pulls the RAFS image store from the per-call BackendCtx.

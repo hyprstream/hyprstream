@@ -20,6 +20,57 @@
 //! the full [`Cid512`] plus fixed-width rendezvous parameters; no truncated
 //! form escapes this module.
 //!
+//! # No name path — review rule R1 (story C4 = #892)
+//!
+//! Every public entry point on [`MainlineLocator`] takes a [`Cid512`]. There
+//! is deliberately **no** string-name lookup, no `name → cid` resolution, and
+//! no `name → cid` cache anywhere in this module. A name cache *inside the
+//! DHT client* re-opens threat A5: it turns the DHT into a trusted namespace
+//! authority (whoever poisons the cache chooses which capsule a name resolves
+//! to), exactly the "toxic mold" failure mode #879 §3 excludes. Names are
+//! resolved by a PQ-signed `NameRecord` from a trusted namespace authority
+//! (PDS / discovery / MoQ group) *above* this layer; the locator only ever
+//! answers "where might bytes for *this* cid live", never "which cid does
+//! *this* name mean".
+//!
+//! This is enforced **structurally** as a closed-world allowlist, not by
+//! enumerating forbidden string forms:
+//! - [`Cid512`] is a `[u8; 64]` newtype with no `FromStr`, `From<&str>`,
+//!   `AsRef<str>`, or `Deref<Target = str>` — the only way in is the full
+//!   64-byte digest.
+//! - `tests/locator_r1_invariants.rs` parses this module with `syn` and fails
+//!   unless **every** public function/method parameter, public struct/enum
+//!   field, and type-alias RHS is one of the vetted types — `Cid512`,
+//!   `RendezvousKey`, `PeerContact`, `LookupHints`, `SocketAddrV4`, primitives,
+//!   and byte views (recursing through `&`/`Option`/`Vec`/`Box`/slices). Any
+//!   other type — a `String`, a struct-wrapped name (`NameQuery`), a generic
+//!   (`<S: ToString>`, `impl Display`), an externally-aliased name — is
+//!   rejected *because it is not vetted*, so a name path cannot enter in any
+//!   new form; adding a public parameter type is a deliberate allowlist edit.
+//!   Macros and `pub use` are forbidden outright in this module. `Cid512` may
+//!   not gain a string-conversion trait impl. See the test's module doc for the
+//!   coverage matrix, the known limitation (test-time vs compile-time), and the
+//!   follow-up tracking a hard `compile_error!` enforcement.
+//!
+//! # Add-only hints — review rule R7 (story C4 = #892)
+//!
+//! #879 §6.1 lists two rendezvous strategies: (1) BEP5 `announce_peer` /
+//! `get_peers` (chosen), and (2) a BEP44 deterministic-mailbox channel whose
+//! keypair is derived from the cid and is therefore public-by-construction —
+//! an overwrite war that is availability-only, acceptable *only* because the
+//! values are untrusted hints. The v1 decision (Q3) is recorded by
+//! [`V1_MAILBOX_HINT_CHANNEL`]: **BEP5-only for v1; the mailbox is deferred.**
+//!
+//! Whether or not the mailbox ships, R7 is load-bearing: a hint channel may
+//! only **add** lookup targets — it may never prune, replace, or terminate the
+//! watermark-anchored BEP5 scan (A14: a bogus "current epoch" hint that skips
+//! the scan converts an availability channel into a rollback assist). That
+//! constraint is encoded in [`LookupHints`], an accumulator whose API is
+//! add-only by construction (no `remove` / `replace` / `clear`), and in
+//! [`MainlineLocator::providers_with_hints`], which **always** performs the
+//! scan and then unions the hints in. There is no code path that lets a hint
+//! skip the scan.
+//!
 //! # wasm / browser note (documented, not built — C1 acceptance)
 //!
 //! There is **no raw mainline DHT from wasm**: browsers cannot open UDP
@@ -173,6 +224,125 @@ impl PeerContact {
     }
 }
 
+/// v1 decision on the BEP44 deterministic-mailbox hint channel (#879 §6.1,
+/// Q3 — resolved by story C4 / #892).
+///
+/// Records whether the public-by-construction BEP44 mailbox (§6.1 option 2)
+/// ships for v1. This is a *decision marker*, not a runtime switch: it exists
+/// so the rationale is discoverable from the compiled artifact and reviewers
+/// can see which branch of R7 binds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailboxHintDecision {
+    /// Ship BEP5 `announce_peer` / `get_peers` only (§6.1 option 1, "chosen").
+    /// The deterministic mailbox is deferred. R7's add-only rule nonetheless
+    /// binds the moment any future channel feeds [`LookupHints`].
+    Bep5Only,
+
+    /// Deterministic mailbox shipped; its values flow through [`LookupHints`]
+    /// and are add-only by construction (R7).
+    Mailbox,
+}
+
+/// The v1 mailbox decision: **BEP5-only** (#879 §6.1 names option 1 "chosen").
+///
+/// See the module-level "Add-only hints" doc for the rationale and for why
+/// R7 binds regardless of this value.
+pub const V1_MAILBOX_HINT_CHANNEL: MailboxHintDecision = MailboxHintDecision::Bep5Only;
+
+/// Maximum number of out-of-band rendezvous buckets one lookup will scan in
+/// addition to the canonical key. Bounds DHT work: a malicious hint source
+/// (untrusted PDS record, relay bridge, mailbox) cannot amplify a single
+/// [`MainlineLocator::providers_with_hints`] into an unbounded fan-out.
+pub const MAX_HINTED_RENDEZVOUS: usize = 8;
+
+/// Maximum number of out-of-band candidate peers one lookup will union in.
+pub const MAX_HINTED_PEERS: usize = 64;
+
+/// Maximum total candidate peers a single lookup will return (canonical scan
+/// unioned with hints, post-dedup). Keeps a flooded provider list from being
+/// amplified into unbounded downstream fetch work.
+pub const MAX_LOCATOR_RESULTS: usize = 256;
+
+/// Add-only accumulator of out-of-band lookup hints (review rule R7).
+///
+/// Hints supplement — never replace — the watermark-anchored BEP5 scan. This
+/// type is the structural home for the BEP44 deterministic-mailbox channel
+/// when it ships (see [`V1_MAILBOX_HINT_CHANNEL`]); today it is fed by any
+/// out-of-band source (PDS record, relay bridge, configuration).
+///
+/// **Provably add-only.** The API exposes [`LookupHints::add_rendezvous`] and
+/// [`LookupHints::add_peer`] and nothing that removes, replaces, or clears
+/// entries. [`MainlineLocator::providers_with_hints`] always performs the
+/// scan at the canonical rendezvous key and then unions these hints in — a
+/// hint can enlarge the candidate set, never prune it or skip the scan (A14).
+///
+/// **Bounded (DoS).** Hints often originate from untrusted sources, so the
+/// accumulator caps both rendezvous buckets ([`MAX_HINTED_RENDEZVOUS`]) and
+/// peers ([`MAX_HINTED_PEERS`]), dedupes by value, and the locator caps total
+/// returned candidates ([`MAX_LOCATOR_RESULTS`]). An attacker who feeds a huge
+/// hint set can do no more than a fixed amount of extra DHT/network work.
+#[derive(Default, Clone, Debug)]
+pub struct LookupHints {
+    extra_rendezvous: Vec<RendezvousKey>,
+    extra_peers: Vec<PeerContact>,
+}
+
+impl LookupHints {
+    /// Empty hint set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add an additional rendezvous bucket to scan, beyond the canonical key.
+    /// Add-only (R7): there is no corresponding remove.
+    ///
+    /// Returns `false` (without storing) if `key` is a duplicate or the
+    /// [`MAX_HINTED_RENDEZVOUS`] cap is reached — bounding DHT work from
+    /// untrusted hint sources. The set otherwise never shrinks.
+    pub fn add_rendezvous(&mut self, key: RendezvousKey) -> bool {
+        if self.extra_rendezvous.len() >= MAX_HINTED_RENDEZVOUS
+            || self.extra_rendezvous.contains(&key)
+        {
+            return false;
+        }
+        self.extra_rendezvous.push(key);
+        true
+    }
+
+    /// Add a candidate peer discovered out-of-band (e.g. from a PDS record).
+    /// Add-only (R7): there is no corresponding remove.
+    ///
+    /// Returns `false` (without storing) if `peer` is a duplicate or the
+    /// [`MAX_HINTED_PEERS`] cap is reached — bounding downstream fetch work.
+    pub fn add_peer(&mut self, peer: PeerContact) -> bool {
+        if self.extra_peers.len() >= MAX_HINTED_PEERS || self.extra_peers.contains(&peer) {
+            return false;
+        }
+        self.extra_peers.push(peer);
+        true
+    }
+
+    /// Additional rendezvous buckets to scan (in insertion order, deduped).
+    pub fn extra_rendezvous(&self) -> &[RendezvousKey] {
+        &self.extra_rendezvous
+    }
+
+    /// Additional candidate peers to union in (in insertion order, deduped).
+    pub fn extra_peers(&self) -> &[PeerContact] {
+        &self.extra_peers
+    }
+
+    /// Total number of hints accumulated.
+    pub fn len(&self) -> usize {
+        self.extra_rendezvous.len() + self.extra_peers.len()
+    }
+
+    /// Whether the set is empty.
+    pub fn is_empty(&self) -> bool {
+        self.extra_rendezvous.is_empty() && self.extra_peers.is_empty()
+    }
+}
+
 /// TRUNC20: derive the 20-byte BEP5 infohash for a derived rendezvous key.
 ///
 /// **This is the single truncation site in the codebase** (R2). The result
@@ -296,6 +466,61 @@ impl MainlineLocator {
             .into_iter()
             .map(PeerContact::untrusted)
             .collect())
+    }
+
+    /// Look up candidate providers, unioning in add-only [`LookupHints`] (R7).
+    ///
+    /// The watermark-anchored BEP5 scan at `key` is **always** performed; each
+    /// rendezvous bucket in `hints` is scanned as well (capped by
+    /// [`MAX_HINTED_RENDEZVOUS`]), and the hint peers are appended (capped by
+    /// [`MAX_HINTED_PEERS`]). `hints` may only enlarge the candidate set —
+    /// there is no parameter and no code path that prunes, replaces, or skips
+    /// the scan (A14). Results are deduped and capped at
+    /// [`MAX_LOCATOR_RESULTS`], so untrusted hint input cannot amplify into
+    /// unbounded DHT/network work. Results remain untrusted: verification
+    /// against the full [`Cid512`] is the caller's job via the GATE pipeline.
+    pub async fn providers_with_hints(
+        &self,
+        cid: &Cid512,
+        key: RendezvousKey,
+        hints: &LookupHints,
+    ) -> Result<Vec<PeerContact>> {
+        // The canonical scan is unconditional — a hint can never suppress it.
+        let mut found = self.providers_at(cid, key).await?;
+
+        // Additional rendezvous buckets from hints: scanned, not trusted, and
+        // strictly best-effort. A hint bucket lookup that errors must never
+        // discard the canonical results already in `found` — propagating `?`
+        // here would let an untrusted hint source induce a failure that
+        // suppresses the whole canonical scan (an A14 availability downgrade
+        // dressed as an error), contradicting R7. Errors are dropped; canonical
+        // and every other hint result survive.
+        // `LookupHints` already bounded this to MAX_HINTED_RENDEZVOUS.
+        for extra in hints.extra_rendezvous() {
+            if let Ok(peers) = self.providers_at(cid, *extra).await {
+                found.extend(peers);
+            }
+        }
+
+        // Out-of-band peer contacts: unioned in verbatim, still untrusted.
+        // `LookupHints` already bounded this to MAX_HINTED_PEERS.
+        found.extend(hints.extra_peers().iter().cloned());
+
+        // Dedup by value and cap total candidates so an attacker flooding the
+        // DHT/hints cannot amplify into unbounded downstream fetch work.
+        dedup_and_cap(&mut found, MAX_LOCATOR_RESULTS);
+
+        Ok(found)
+    }
+}
+
+/// Deduplicate `peers` by value (preserving first-seen order) and truncate to
+/// `cap`. Keeps a flooded provider list bounded for callers.
+fn dedup_and_cap(peers: &mut Vec<PeerContact>, cap: usize) {
+    let mut seen = std::collections::HashSet::new();
+    peers.retain(|p| seen.insert(p.clone()));
+    if peers.len() > cap {
+        peers.truncate(cap);
     }
 }
 
@@ -427,16 +652,20 @@ mod tests {
                 .len(),
             1
         );
-        assert!(locator
-            .providers_at(&id, RendezvousKey::new(1, 7))
-            .await
-            .unwrap()
-            .is_empty());
-        assert!(locator
-            .providers_at(&id, RendezvousKey::new(0, 8))
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            locator
+                .providers_at(&id, RendezvousKey::new(1, 7))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            locator
+                .providers_at(&id, RendezvousKey::new(0, 8))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -454,5 +683,335 @@ mod tests {
         assert!(Cid512::from_slice(&[0u8; 63]).is_err());
         assert!(Cid512::from_slice(&[0u8; 64]).is_ok());
         assert!(Cid512::from_slice(&[0u8; 65]).is_err());
+    }
+
+    // ----- R1 enforcement (story C4 / #892) --------------------------------
+    //
+    // The "no string-name path in the public locator API" invariant is enforced
+    // structurally by `tests/locator_r1_invariants.rs`, which parses THIS
+    // module with `syn` and walks every public item signature (functions,
+    // inherent/trait methods, multi-line + generic forms), failing on any
+    // string-like public parameter or string-conversion impl on Cid512. A grep
+    // over single-line signatures is bypassable; an AST walk is not.
+
+    #[test]
+    fn r1_cid512_is_constructible_only_from_full_bytes() {
+        // Positive compile-time check: the only constructors take bytes.
+        let _ = Cid512::from_bytes([0xAB; CID512_LEN]);
+        let _ = Cid512::from_slice(&[0xCD; CID512_LEN]).unwrap();
+    }
+
+    // ----- R7 add-only hints (story C4 / #892) -----------------------------
+
+    #[test]
+    fn v1_mailbox_decision_is_recorded_and_bep5_only() {
+        // Q3 decision: ship BEP5-only for v1; the mailbox is deferred.
+        assert_eq!(V1_MAILBOX_HINT_CHANNEL, MailboxHintDecision::Bep5Only);
+    }
+
+    #[test]
+    fn lookup_hints_starts_empty_and_grows_only() {
+        let mut hints = LookupHints::new();
+        assert!(hints.is_empty());
+        assert_eq!(hints.len(), 0);
+
+        hints.add_rendezvous(RendezvousKey::new(1, 0));
+        assert!(!hints.is_empty());
+        assert_eq!(hints.len(), 1);
+
+        hints.add_peer(PeerContact::untrusted(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            7000,
+        )));
+        assert_eq!(hints.len(), 2);
+
+        assert_eq!(hints.extra_rendezvous(), &[RendezvousKey::new(1, 0)]);
+        assert_eq!(
+            hints.extra_peers(),
+            &[PeerContact::untrusted(SocketAddrV4::new(
+                Ipv4Addr::LOCALHOST,
+                7000
+            ))]
+        );
+    }
+
+    /// R7 load-bearing proof: hints can only ADD candidates. The canonical
+    /// BEP5 scan is always performed and its results always survive — a hint
+    /// set, however large, can never prune them.
+    #[tokio::test]
+    async fn r7_hints_are_add_only_scan_results_survive() {
+        let mock = MockBep5::default();
+        let locator = MainlineLocator::with_client(Box::new(mock.clone()));
+        let id = cid(0x77);
+        let canonical = RendezvousKey::DEFAULT;
+        let extra = RendezvousKey::new(2, 0);
+
+        // Seed the canonical bucket with a real provider.
+        locator
+            .announce_at(&id, canonical, Some(4242))
+            .await
+            .unwrap();
+        // Seed the extra hinted bucket with a different provider.
+        locator.announce_at(&id, extra, Some(5353)).await.unwrap();
+
+        let mut hints = LookupHints::new();
+        hints.add_rendezvous(extra);
+        hints.add_peer(PeerContact::untrusted(SocketAddrV4::new(
+            Ipv4Addr::new(192, 0, 2, 99),
+            9999,
+        )));
+
+        let found = locator
+            .providers_with_hints(&id, canonical, &hints)
+            .await
+            .unwrap();
+
+        // Canonical scan result survives (never pruned by hints):
+        let canonical_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4242);
+        assert!(
+            found.iter().any(|p| p.socket_addr() == canonical_addr),
+            "R7: canonical scan result must survive hints (no prune)"
+        );
+        // Hinted rendezvous bucket was scanned and unioned in:
+        assert!(
+            found
+                .iter()
+                .any(|p| p.socket_addr() == SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5353)),
+            "R7: hinted rendezvous bucket must be unioned in (add-only)"
+        );
+        // Out-of-band peer hint was unioned in:
+        assert!(
+            found
+                .iter()
+                .any(|p| p.socket_addr() == SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 99), 9999)),
+            "R7: hinted peer must be unioned in (add-only)"
+        );
+    }
+
+    /// R7 proof: with no hints, the hinted path is identical to the plain scan
+    /// — confirming hints are purely additive.
+    #[tokio::test]
+    async fn r7_empty_hints_equal_plain_scan() {
+        let mock = MockBep5::default();
+        let locator = MainlineLocator::with_client(Box::new(mock.clone()));
+        let id = cid(0x33);
+        locator.announce(&id, Some(8080)).await.unwrap();
+
+        let plain = locator.providers(&id).await.unwrap();
+        let with_hints = locator
+            .providers_with_hints(&id, RendezvousKey::DEFAULT, &LookupHints::new())
+            .await
+            .unwrap();
+
+        assert_eq!(plain, with_hints);
+    }
+
+    /// R7 proof: a hint set cannot suppress the scan even when the hint points
+    /// at a *different* rendezvous bucket that has no providers. The canonical
+    /// scan still returns its providers — the misleading hint prunes nothing.
+    #[tokio::test]
+    async fn r7_misleading_hint_cannot_prune_scan() {
+        let mock = MockBep5::default();
+        let locator = MainlineLocator::with_client(Box::new(mock.clone()));
+        let id = cid(0x44);
+        let canonical = RendezvousKey::DEFAULT;
+
+        // Real provider at the canonical bucket.
+        locator
+            .announce_at(&id, canonical, Some(1234))
+            .await
+            .unwrap();
+
+        // Misleading hint directing attention elsewhere (empty bucket).
+        let mut hints = LookupHints::new();
+        hints.add_rendezvous(RendezvousKey::new(9, 9));
+
+        let found = locator
+            .providers_with_hints(&id, canonical, &hints)
+            .await
+            .unwrap();
+
+        // The real canonical provider is still returned despite the misleading
+        // hint — A14 is excluded: a hint cannot skip the watermark scan.
+        assert!(
+            found
+                .iter()
+                .any(|p| p.socket_addr() == SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234)),
+            "R7/A14: misleading hint must not prune the canonical scan"
+        );
+    }
+
+    // ----- R7 DoS bounds (review of #1000) ---------------------------------
+
+    /// R7 + DoS: add-only still holds, but duplicates are dropped and the
+    /// rendezvous/peer caps are enforced so untrusted hint input cannot
+    /// amplify into unbounded DHT/network work.
+    #[tokio::test]
+    async fn r7_hints_are_bounded_and_deduped() {
+        // Duplicate rendezvous hint: second add returns false, stored once.
+        let mut hints = LookupHints::new();
+        assert!(hints.add_rendezvous(RendezvousKey::new(1, 0)));
+        assert!(!hints.add_rendezvous(RendezvousKey::new(1, 0)));
+        assert_eq!(hints.extra_rendezvous().len(), 1);
+
+        // Duplicate peer hint: same — deduped, add returns false.
+        let peer = PeerContact::untrusted(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1));
+        assert!(hints.add_peer(peer.clone()));
+        assert!(!hints.add_peer(peer));
+        assert_eq!(hints.extra_peers().len(), 1);
+
+        // Rendezvous cap: extras beyond MAX_HINTED_RENDEZVOUS are refused.
+        for i in 1..(MAX_HINTED_RENDEZVOUS as u32) + 5 {
+            hints.add_rendezvous(RendezvousKey::new(i.wrapping_add(10), 0));
+        }
+        assert_eq!(
+            hints.extra_rendezvous().len(),
+            MAX_HINTED_RENDEZVOUS,
+            "rendezvous hints must be capped at MAX_HINTED_RENDEZVOUS"
+        );
+
+        // Peer cap: extras beyond MAX_HINTED_PEERS are refused.
+        for port in 100..(MAX_HINTED_PEERS as u16) + 200 {
+            hints.add_peer(PeerContact::untrusted(SocketAddrV4::new(
+                Ipv4Addr::LOCALHOST,
+                port,
+            )));
+        }
+        assert_eq!(
+            hints.extra_peers().len(),
+            MAX_HINTED_PEERS,
+            "peer hints must be capped at MAX_HINTED_PEERS"
+        );
+    }
+
+    /// R7 + DoS: the locator dedupes and caps the final candidate list so a
+    /// flooded provider list cannot amplify into unbounded fetch work, while
+    /// the add-only property (canonical scan always present) still holds.
+    #[tokio::test]
+    async fn r7_locator_dedupes_and_caps_results() {
+        let mock = MockBep5::default();
+        let locator = MainlineLocator::with_client(Box::new(mock.clone()));
+        let id = cid(0x88);
+        let canonical = RendezvousKey::DEFAULT;
+
+        // Canonical bucket returns one real provider.
+        locator
+            .announce_at(&id, canonical, Some(4242))
+            .await
+            .unwrap();
+
+        // Hint the SAME peer the scan already returns: result must be deduped.
+        let mut hints = LookupHints::new();
+        hints.add_peer(PeerContact::untrusted(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            4242,
+        )));
+
+        let found = locator
+            .providers_with_hints(&id, canonical, &hints)
+            .await
+            .unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .filter(|p| p.socket_addr().port() == 4242)
+                .count(),
+            1,
+            "duplicate candidate must be deduped"
+        );
+
+        // Cap: flood well past MAX_LOCATOR_RESULTS via hinted peers and confirm
+        // the returned set is bounded.
+        let mut flood = LookupHints::new();
+        for port in 0..(MAX_LOCATOR_RESULTS as u16) * 4 {
+            flood.add_peer(PeerContact::untrusted(SocketAddrV4::new(
+                Ipv4Addr::new(203, 0, 113, 1),
+                port,
+            )));
+        }
+        let found = locator
+            .providers_with_hints(&id, canonical, &flood)
+            .await
+            .unwrap();
+        assert!(
+            found.len() <= MAX_LOCATOR_RESULTS,
+            "returned candidates must be capped at MAX_LOCATOR_RESULTS, got {}",
+            found.len()
+        );
+        // Canonical provider still present — add-only holds through bounding.
+        assert!(
+            found
+                .iter()
+                .any(|p| p.socket_addr() == SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4242))
+        );
+    }
+
+    /// BEP5 fake that succeeds for the canonical bucket but returns `Err` for a
+    /// designated (attacker-chosen) infohash. Models an untrusted hint source
+    /// whose bucket lookup fails at the network layer.
+    #[derive(Clone)]
+    struct FailingBucketBep5 {
+        table: Arc<Mutex<HashMap<[u8; 20], Vec<SocketAddrV4>>>>,
+        fail_on: [u8; 20],
+    }
+
+    #[async_trait]
+    impl Bep5Client for FailingBucketBep5 {
+        async fn announce(&self, info_hash: [u8; 20], port: Option<u16>) -> Result<()> {
+            let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port.unwrap_or(6881));
+            self.table.lock().entry(info_hash).or_default().push(addr);
+            Ok(())
+        }
+
+        async fn get_peers(&self, info_hash: [u8; 20]) -> Result<Vec<SocketAddrV4>> {
+            if info_hash == self.fail_on {
+                return Err(Error::Dht("simulated hinted-bucket failure".into()));
+            }
+            Ok(self
+                .table
+                .lock()
+                .get(&info_hash)
+                .cloned()
+                .unwrap_or_default())
+        }
+    }
+
+    /// R7 regression: a hinted-bucket lookup that *errors* must not discard the
+    /// canonical scan results. Best-effort hint scans; the canonical providers
+    /// survive an untrusted hint that induces a failure (A14 downgrade excluded).
+    #[tokio::test]
+    async fn r7_failing_hint_bucket_does_not_discard_canonical() {
+        let id = cid(0x99);
+        let canonical = RendezvousKey::DEFAULT;
+        let bad = RendezvousKey::new(3, 1);
+
+        // Seed the canonical bucket with a real provider first (via a plain mock
+        // announce path), then reuse its table under the failing wrapper.
+        let table: Arc<Mutex<HashMap<[u8; 20], Vec<SocketAddrV4>>>> = Arc::default();
+        table.lock().insert(
+            rendezvous_infohash(&id, canonical),
+            vec![SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4242)],
+        );
+
+        let mock = FailingBucketBep5 {
+            table,
+            fail_on: rendezvous_infohash(&id, bad),
+        };
+        let locator = MainlineLocator::with_client(Box::new(mock));
+
+        let mut hints = LookupHints::new();
+        hints.add_rendezvous(bad);
+
+        let found = locator
+            .providers_with_hints(&id, canonical, &hints)
+            .await
+            .expect("a failing hint bucket must not make the whole lookup error");
+
+        assert!(
+            found
+                .iter()
+                .any(|p| p.socket_addr() == SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4242)),
+            "R7: canonical scan result must survive a failing hinted-bucket lookup"
+        );
     }
 }

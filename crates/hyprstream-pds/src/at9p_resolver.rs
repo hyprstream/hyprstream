@@ -132,7 +132,7 @@ mod tests {
         let s = signer(tag);
         let body = body_for(&s, tag);
         let capsule = sign_capsule(body, &s.ed_sk, &s.pq_sk).unwrap();
-        let bytes = capsule.to_dag_cbor();
+        let bytes = capsule.to_dag_cbor().unwrap();
         let did = format!("{DID_AT9P_PREFIX}{}", capsule.cid512().unwrap());
         (capsule, bytes, did)
     }
@@ -162,7 +162,7 @@ mod tests {
         // can reject.
         let (mut capsule, _bytes, _did) = signed(2);
         capsule.signatures.ed25519_signature = vec![0u8; ED25519_SIGNATURE_LEN];
-        let bytes = capsule.to_dag_cbor();
+        let bytes = capsule.to_dag_cbor().unwrap();
         let cid = Capsule::from_dag_cbor(&bytes).unwrap().cid512().unwrap();
         let did = format!("{DID_AT9P_PREFIX}{cid}");
         assert!(At9pGateResolver::new().verify_bytes(&did, &bytes).is_err());
@@ -217,7 +217,7 @@ mod tests {
         // is bound into the trust store.
         let (mut capsule, _bytes, _did) = signed(6);
         capsule.signatures.ed25519_signature = vec![0u8; ED25519_SIGNATURE_LEN];
-        let bytes = capsule.to_dag_cbor();
+        let bytes = capsule.to_dag_cbor().unwrap();
         let cid = Capsule::from_dag_cbor(&bytes).unwrap().cid512().unwrap();
         let did = format!("{DID_AT9P_PREFIX}{cid}");
         let ed: [u8; 32] = capsule.body.subject_keys[0].ed25519_pub.as_slice().try_into().unwrap();

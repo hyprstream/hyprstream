@@ -154,7 +154,7 @@ extern "C" fn xet_stream_write(
             return -1;
         }
 
-        let data = std::slice::from_raw_parts(buffer as *const u8, len);
+        let data = std::slice::from_raw_parts(buffer.cast::<u8>(), len);
         (*xet_stream).buffer.extend_from_slice(data);
     }
     0
@@ -285,7 +285,7 @@ fn write_to_next(next: *mut OpaqueGitWriteStream, data: &[u8]) -> Result<(), Xet
     unsafe {
         let ws = next as *mut GitWriteStreamBase;
         let write_fn = (*ws).write;
-        let result = write_fn(ws, data.as_ptr() as *const c_char, data.len());
+        let result = write_fn(ws, data.as_ptr().cast::<c_char>(), data.len());
         if result < 0 {
             return Err(XetError::new(XetErrorKind::IoError, "Write to next stream failed"));
         }

@@ -7,18 +7,30 @@
 //! `data` root, and decode every `ai.hyprstream.placement.{node,workload,group,
 //! groupItem}` record we find into an in-process index.
 //!
-//! # Trust posture
+//! # Trust posture — verified-by-construction ingest (#932)
 //!
-//! Unlike `getRecord`/`getRepo` (D5: untrusted relay, caller verifies the CAR
-//! proof offline), this ingestion path does **not** verify the commit
-//! signature. The injected `RecordResolver` is the same trusted, in-process
-//! resolver `handle_get_repo` already serves *from* (see its trait docs: "the
-//! node's local PDS") — there is no untrusted network hop between the index and
-//! its source here. Verifying signatures would need a DID→verifying-key
-//! resolution step this crate doesn't have; that's future federation-hardening
-//! work, not a P1 blocker (the index is best-effort scheduling metadata, not a
-//! security boundary — the *per-candidate authz check* in `queryCandidates` is
-//! the security boundary).
+//! Membership is becoming a load-bearing input (scheduler capacity partitions
+//! today; group ledger / spend authorization tomorrow — #924/#925), so the
+//! index no longer trusts an ingested record graph merely because a resolver
+//! handed it over. Ingest is **verified by construction**: when the resolver
+//! can provide the DID's `#atproto` verifying key
+//! ([`RecordResolver::resolve_verifying_key`]), [`PlacementIndex::ingest_did`]
+//! verifies the repo CAR's commit signature against it *before* any record
+//! enters the index. A record whose commit signature fails verification (or
+//! whose CAR is malformed) is refused — it cannot reach the derived indices, so
+//! it cannot produce membership or any other fact derived from
+//! [`PlacementIndex::is_member`]. This makes signature verification a property
+//! of the index itself, not a caller obligation.
+//!
+//! When the resolver returns `Ok(None)` (it cannot provide a key for this DID
+//! — e.g. a foreign DID whose DID-document `#atproto` method this crate can't
+//! resolve yet), the index retains the day-1 trusted-resolver posture: the
+//! injected `RecordResolver` is the same trusted, in-process resolver
+//! `handle_get_repo` serves *from* (no untrusted network hop between the index
+//! and its source). DID-document `#atproto` key resolution for foreign repos is
+//! the future federation-hardening follow-up that closes that gap; until then
+//! the *per-candidate authz check* in `queryCandidates` remains the hard
+//! security boundary, with the index as best-effort scheduling metadata.
 //!
 //! # Group membership — bidirectional consent
 //!
@@ -40,9 +52,10 @@
 //! membership in group `G` with `LabelSelector::new(format!("group/{G}"),
 //! SelectorOp::Exists, vec![])`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, Result};
+use p256::ecdsa::VerifyingKey;
 use parking_lot::RwLock;
 
 use hyprstream_pds::car::parse_car_v1;
@@ -124,6 +137,15 @@ impl PlacementIndex {
     /// `Ok(())` with no visible effect when the DID has no stored repo (nothing
     /// to ingest) or its repo carries no placement records — this is not an
     /// error, just an empty directory entry.
+    ///
+    /// **Verified by construction (#932):** when the resolver provides a
+    /// verifying key for `did` ([`RecordResolver::resolve_verifying_key`]), the
+    /// repo CAR's commit signature is verified before any record enters the
+    /// index. A commit that fails verification is refused — its records never
+    /// reach the derived indices — and this returns `Err` (the caller —
+    /// `handle_report_node_liveness` — logs and continues, liveness still
+    /// recorded). When the resolver returns `Ok(None)` the trusted-resolver
+    /// day-1 posture applies (see the module trust-posture docs).
     pub async fn ingest_did(&self, resolver: &dyn RecordResolver, did: &str) -> Result<()> {
         let repo = resolver
             .resolve_repo(did)
@@ -135,7 +157,25 @@ impl PlacementIndex {
             self.recompute_derived();
             return Ok(());
         };
-        let snapshot = Self::decode_repo_car(did, &repo.car)?;
+        let verify_key = resolver
+            .resolve_verifying_key(did)
+            .await
+            .map_err(|e| anyhow!("resolve_verifying_key({did}) failed: {e}"))?;
+        // Decode (and, when a key is available, signature-verify) the CAR
+        // *before* touching the index. A verification failure leaves the index
+        // untouched for this DID and surfaces as an error — the previous
+        // contribution, if any, is cleared so stale facts can't survive a poll
+        // that now fails to verify.
+        let snapshot = match Self::decode_repo_car(did, &repo.car, verify_key.as_ref()) {
+            Ok(snap) => snap,
+            Err(e) => {
+                if verify_key.is_some() {
+                    self.raw.write().remove(did);
+                    self.recompute_derived();
+                }
+                return Err(e);
+            }
+        };
         self.raw.write().insert(did.to_owned(), snapshot);
         self.recompute_derived();
         Ok(())
@@ -143,7 +183,12 @@ impl PlacementIndex {
 
     /// Parse a repo CARv1 blob and decode every `ai.hyprstream.placement.*`
     /// record reachable from the commit's MST root into a [`DidSnapshot`].
-    fn decode_repo_car(did: &str, car: &[u8]) -> Result<DidSnapshot> {
+    ///
+    /// When `verify_key` is `Some`, the CAR's commit signature is verified
+    /// against it (the verified-by-construction gate of #932): a failing
+    /// signature returns `Err` and the caller refuses to ingest. `None` skips
+    /// verification (trusted-resolver posture).
+    fn decode_repo_car(did: &str, car: &[u8], verify_key: Option<&VerifyingKey>) -> Result<DidSnapshot> {
         let (roots, blocks) = parse_car_v1(car)?;
         let root_cid = *roots
             .first()
@@ -153,9 +198,16 @@ impl PlacementIndex {
             .get(&root_cid)
             .ok_or_else(|| anyhow!("repo CAR for {did} missing its commit block"))?;
         let commit = Commit::from_dag_cbor(commit_bytes)?;
+        if let Some(vk) = verify_key {
+            commit
+                .verify(vk)
+                .map_err(|e| anyhow!("repo CAR for {did} failed commit-signature verification: {e}"))?;
+        }
 
         let mut entries = Vec::new();
-        walk_mst(commit.data, &block_map, &mut entries)?;
+        let mut visited = HashSet::new();
+        let mut budget = MST_MAX_NODE_VISITS;
+        walk_mst(commit.data, &block_map, &mut entries, &mut visited, &mut budget)?;
 
         let mut snapshot = DidSnapshot::default();
         for (key, record_cid) in entries {
@@ -246,6 +298,13 @@ impl PlacementIndex {
     /// `group_uri`: the group owner must have published a `GroupItemRecord`
     /// naming this node, **and** the node's own `NodeRecord.groups` must list
     /// this group. Either claim alone is not membership.
+    ///
+    /// **Trust statement (#932):** membership facts returned here are
+    /// signature-verified at ingest — a `GroupItemRecord` / `NodeRecord` whose
+    /// repo CAR commit failed verification against the resolver-provided
+    /// `#atproto` key never entered the index, so it cannot back a `true`
+    /// result. See the module trust-posture docs for the verified-by-construction
+    /// ingest gate and its `Ok(None)` (trusted-resolver) fallback.
     pub fn is_member(&self, node_did: &str, group_uri: &str) -> bool {
         let node_consents = self
             .nodes
@@ -290,6 +349,17 @@ impl PlacementIndex {
     }
 }
 
+/// Hard ceiling on the number of MST node visits per repo-CAR walk. An
+/// untrusted CAR is not a well-formed tree by assumption: it can be
+/// DAG-shaped (many `l`/`t` links pointing at the same child) or cyclic, so a
+/// depth bound alone does not bound total work — a poisoned CAR could fan out
+/// to visit the same subtrees exponentially, or loop forever. The `visited`
+/// CID set makes the walk terminate (a node is expanded at most once); this
+/// budget is the belt-and-suspenders ceiling that caps total node visits even
+/// against a broad-but-acyclic adversarial CAR, and is chosen well above any
+/// legitimate repo's node count.
+const MST_MAX_NODE_VISITS: usize = 1 << 20; // 1,048,576 nodes
+
 /// Enumerate every `(full_key, record_cid)` entry reachable from an MST node,
 /// depth-first in key order: left subtree, then each entry (recursing into its
 /// right subtree before the next entry). Mirrors the encode side
@@ -297,7 +367,35 @@ impl PlacementIndex {
 /// prefix-compression convention: `entry.p` compresses against the *previous
 /// entry within this same node* only (resets to 0 at the first entry of every
 /// node) — never against a key from a different node.
-fn walk_mst(node_cid: Cid, blocks: &HashMap<Cid, Vec<u8>>, out: &mut Vec<(String, Cid)>) -> Result<()> {
+///
+/// **Untrusted-ingest safety (#932):** `visited` records every node CID already
+/// expanded so a DAG-shaped or cyclic CAR cannot revisit the same subtree, and
+/// `budget` is a decrementing total-visit ceiling. Either guard trips a
+/// fail-closed `Err` — the whole CAR is rejected rather than partially
+/// ingested, so no derived membership fact is produced from an adversarial
+/// graph.
+fn walk_mst(
+    node_cid: Cid,
+    blocks: &HashMap<Cid, Vec<u8>>,
+    out: &mut Vec<(String, Cid)>,
+    visited: &mut HashSet<Cid>,
+    budget: &mut usize,
+) -> Result<()> {
+    if *budget == 0 {
+        return Err(anyhow!(
+            "MST walk exceeded the {MST_MAX_NODE_VISITS}-node visit budget (adversarial repo CAR?)"
+        ));
+    }
+    *budget -= 1;
+
+    // A node CID seen twice means the CAR reuses a subtree (DAG) or contains a
+    // cycle; refuse rather than re-expand it.
+    if !visited.insert(node_cid) {
+        return Err(anyhow!(
+            "MST node {node_cid} is reachable more than once (non-tree repo CAR); refusing ingest"
+        ));
+    }
+
     let bytes = blocks
         .get(&node_cid)
         .ok_or_else(|| anyhow!("MST node {node_cid} missing from repo CAR blocks"))?;
@@ -305,7 +403,7 @@ fn walk_mst(node_cid: Cid, blocks: &HashMap<Cid, Vec<u8>>, out: &mut Vec<(String
     let data = NodeData::from_value(&value)?;
 
     if let Some(left) = data.l {
-        walk_mst(left, blocks, out)?;
+        walk_mst(left, blocks, out, visited, budget)?;
     }
     let mut prev_key: Option<String> = None;
     for entry in &data.e {
@@ -323,7 +421,7 @@ fn walk_mst(node_cid: Cid, blocks: &HashMap<Cid, Vec<u8>>, out: &mut Vec<(String
         out.push((key.clone(), entry.v));
         prev_key = Some(key);
         if let Some(right) = entry.t {
-            walk_mst(right, blocks, out)?;
+            walk_mst(right, blocks, out, visited, budget)?;
         }
     }
     Ok(())
@@ -340,7 +438,7 @@ mod tests {
     use hyprstream_pds::commit::UnsignedCommit;
     use hyprstream_pds::mst::Node;
     use hyprstream_pds::tid::Tid;
-    use p256::ecdsa::SigningKey as P256SigningKey;
+    use p256::ecdsa::{SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey};
 
     use crate::service::RecordCarData;
 
@@ -349,9 +447,12 @@ mod tests {
 
     /// Build a repo CARv1 for `did` from a set of already-encoded `(full_key,
     /// dag_cbor_bytes)` records (mixed collections OK — the repo MST spans all
-    /// of them, matching real atproto repos).
-    fn repo_car(did: &str, records: &[(String, Vec<u8>)]) -> Vec<u8> {
+    /// of them, matching real atproto repos), returning the CAR bytes **and**
+    /// the `#atproto` verifying key the commit was signed with (so the test
+    /// resolver can hand it to the verified-by-construction ingest gate).
+    fn repo_car(did: &str, records: &[(String, Vec<u8>)]) -> (Vec<u8>, P256VerifyingKey) {
         let signing_key = P256SigningKey::random(&mut rand::rngs::OsRng);
+        let verifying_key = P256VerifyingKey::from(&signing_key);
         let mut keyed: BTreeMap<String, Cid> = BTreeMap::new();
         let mut record_blocks: Vec<(Cid, Vec<u8>)> = Vec::new();
         for (key, bytes) in records {
@@ -370,7 +471,7 @@ mod tests {
             blocks.push((cid, data.encode()));
         }
         blocks.extend(record_blocks);
-        build_car_v1(&[commit.cid()], &blocks)
+        (build_car_v1(&[commit.cid()], &blocks), verifying_key)
     }
 
     fn node_record_key(rkey: &str) -> String {
@@ -383,9 +484,11 @@ mod tests {
         format!("{}/{rkey}", group_item::COLLECTION_NSID)
     }
 
-    /// A resolver serving fixed, per-DID repo CARs (built with real records).
+    /// A resolver serving fixed, per-DID repo CARs (built with real records)
+    /// and the `#atproto` verifying key each was signed with — so the
+    /// verified-by-construction ingest gate is armed in tests.
     struct FixedResolver {
-        repos: HashMap<String, Vec<u8>>,
+        repos: HashMap<String, (Vec<u8>, P256VerifyingKey)>,
     }
 
     #[async_trait(?Send)]
@@ -399,10 +502,13 @@ mod tests {
             Ok(None)
         }
         async fn resolve_repo(&self, did: &str) -> Result<Option<RecordCarData>> {
-            Ok(self.repos.get(did).map(|car| RecordCarData {
+            Ok(self.repos.get(did).map(|(car, _vk)| RecordCarData {
                 uri: format!("at://{did}"),
                 car: car.clone(),
             }))
+        }
+        async fn resolve_verifying_key(&self, did: &str) -> Result<Option<VerifyingKey>> {
+            Ok(self.repos.get(did).map(|(_car, vk)| *vk))
         }
     }
 
@@ -563,5 +669,105 @@ mod tests {
         let resolver_b = FixedResolver { repos: HashMap::new() };
         index.ingest_did(&resolver_b, NODE_DID).await.unwrap();
         assert!(index.known_node_dids().is_empty(), "stale contribution must be cleared on re-poll");
+    }
+
+    #[tokio::test]
+    async fn invalid_commit_signature_does_not_produce_membership() {
+        // #932 — verified-by-construction ingest: a repo CAR whose commit
+        // signature fails verification against the resolver-provided `#atproto`
+        // key must be REFUSED at ingest, so its records cannot produce
+        // membership (or any other derived fact). Mirror the "both sides agree
+        // -> member" setup, but have the resolver report a *wrong* key for the
+        // owner so the GroupItemRecord claiming NODE_DID never enters the index.
+        let group_uri_key = group_record_key("3g");
+        let group_rec = GroupRecord::new(
+            "east-coast-gpus",
+            OWNER_DID,
+            None,
+            "2026-06-23T12:34:56.789Z",
+        )
+        .unwrap();
+        let group_uri = format!("at://{OWNER_DID}/{group_uri_key}");
+
+        let (owner_car, _owner_vk) = repo_car(
+            OWNER_DID,
+            &[
+                (group_uri_key.clone(), group_rec.to_dag_cbor()),
+                (
+                    group_item_record_key("3i"),
+                    GroupItemRecord::new(group_uri.clone(), NODE_DID, "2026-06-23T12:34:56.789Z")
+                        .unwrap()
+                        .to_dag_cbor(),
+                ),
+            ],
+        );
+        // A key the owner's commit was NOT signed by -> verification must fail.
+        let wrong_vk = P256VerifyingKey::from(&P256SigningKey::random(&mut rand::rngs::OsRng));
+
+        // The node consents to the group (so membership would hold if the
+        // owner's claim were ingested); its own repo verifies normally.
+        let node_rec = sample_node_record(vec![group_uri.clone()]);
+        let (node_car, node_vk) =
+            repo_car(NODE_DID, &[(node_record_key("3a"), node_rec.to_dag_cbor())]);
+
+        let resolver = FixedResolver {
+            repos: HashMap::from([
+                (OWNER_DID.to_owned(), (owner_car, wrong_vk)),
+                (NODE_DID.to_owned(), (node_car, node_vk)),
+            ]),
+        };
+        let index = PlacementIndex::new();
+        // Owner ingest must fail closed — a commit that does not verify is
+        // refused (the caller logs and continues; liveness is unaffected).
+        assert!(
+            index.ingest_did(&resolver, OWNER_DID).await.is_err(),
+            "a repo whose commit signature fails verification must be refused at ingest"
+        );
+        index.ingest_did(&resolver, NODE_DID).await.unwrap();
+
+        assert!(
+            !index.is_member(NODE_DID, &group_uri),
+            "an unverified GroupItemRecord must not produce membership even with node consent"
+        );
+        assert!(!index
+            .effective_labels(NODE_DID)
+            .iter()
+            .any(|(k, _)| k == &format!("group/{group_uri}")));
+    }
+
+    #[tokio::test]
+    async fn missing_verifying_key_preserves_trusted_resolver_ingest() {
+        // #932 — the `Ok(None)` fallback: a resolver that cannot provide a key
+        // retains the day-1 trusted-resolver posture (records still ingest).
+        // This is the seam full DID-document key resolution for foreign DIDs
+        // will close later; until then it must not regress trusted ingest.
+        let rec = sample_node_record(vec![]);
+        let (car, _) = repo_car(NODE_DID, &[(node_record_key("3a"), rec.to_dag_cbor())]);
+
+        // A resolver that declines to provide any verifying key.
+        struct NoKeyResolver(HashMap<String, Vec<u8>>);
+        #[async_trait(?Send)]
+        impl RecordResolver for NoKeyResolver {
+            async fn resolve_record(
+                &self,
+                _did: &str,
+                _collection: &str,
+                _rkey: &str,
+            ) -> Result<Option<RecordCarData>> {
+                Ok(None)
+            }
+            async fn resolve_repo(&self, did: &str) -> Result<Option<RecordCarData>> {
+                Ok(self.0.get(did).map(|car| RecordCarData {
+                    uri: format!("at://{did}"),
+                    car: car.clone(),
+                }))
+            }
+            // resolve_verifying_key defaults to Ok(None).
+        }
+
+        let resolver = NoKeyResolver(HashMap::from([(NODE_DID.to_owned(), car)]));
+        let index = PlacementIndex::new();
+        index.ingest_did(&resolver, NODE_DID).await.unwrap();
+        assert_eq!(index.known_node_dids(), vec![NODE_DID.to_owned()]);
     }
 }
