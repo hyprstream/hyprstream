@@ -31,6 +31,66 @@ pub struct UserProfile {
     pub external_id: Option<String>,
 }
 
+/// The public-key algorithm of a stored [`PubkeyEntry`].
+///
+/// - [`Ed25519`](Self::Ed25519) — classical anchor only (the pre-#439 default,
+///   and what SSH/raw-seed adopt still contributes as its classical component).
+/// - [`HybridEd25519MlDsa65`](Self::HybridEd25519MlDsa65) — the Ed25519 anchor
+///   with a **bound ML-DSA-65 verifying key** (#439 PQ enrollment). This mirrors
+///   the `register_pq_trust` / `KeyedPqTrustStore` envelope model and the
+///   did:at9p ed25519→ml_dsa binding: the fingerprint stays the Ed25519 anchor's
+///   SHA256, and the ML-DSA-65 vk is carried alongside in `pq_pubkey`.
+///
+/// Invariant enforced by the stores: `HybridEd25519MlDsa65 ⇔ pq_pubkey.is_some()`.
+/// A hybrid record with missing PQ bytes is a **read error** (fail closed),
+/// never a silent downgrade to Ed25519.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyAlgorithm {
+    Ed25519,
+    /// EdDSA (Ed25519) anchor + bound ML-DSA-65 (FIPS 204) — post-quantum hybrid.
+    #[serde(rename = "ed25519+ml-dsa-65")]
+    HybridEd25519MlDsa65,
+}
+
+impl Default for KeyAlgorithm {
+    /// Ed25519 is the classical floor for records with no algorithm tag
+    /// (pre-#439) and for the SSH/raw-seed adopt paths' classical component.
+    fn default() -> Self {
+        Self::Ed25519
+    }
+}
+
+impl KeyAlgorithm {
+    /// Canonical lowercase algorithm tag written into stored records.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ed25519 => "ed25519",
+            Self::HybridEd25519MlDsa65 => "ed25519+ml-dsa-65",
+        }
+    }
+
+    /// Whether this algorithm carries a post-quantum (ML-DSA-65) component.
+    pub fn is_hybrid(&self) -> bool {
+        matches!(self, Self::HybridEd25519MlDsa65)
+    }
+
+    /// Parse an algorithm tag read back from a stored record.
+    ///
+    /// Unknown tags error rather than silently falling back, so a future PQ
+    /// tag written by a newer build is never misread as Ed25519 by this one.
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ed25519" => Ok(Self::Ed25519),
+            "ed25519+ml-dsa-65" => Ok(Self::HybridEd25519MlDsa65),
+            other => anyhow::bail!(
+                "Unknown key algorithm tag '{other}'; this build implements \
+                 'ed25519' and 'ed25519+ml-dsa-65'"
+            ),
+        }
+    }
+}
+
 /// A pubkey entry associated with a user (like GitHub SSH keys).
 #[derive(Debug, Clone)]
 pub struct PubkeyEntry {
@@ -44,6 +104,16 @@ pub struct PubkeyEntry {
     pub created_at: i64,
     /// Unix timestamp when the key was last used for auth, or None if never.
     pub last_used_at: Option<i64>,
+    /// Algorithm tag (#439). Defaults to [`KeyAlgorithm::Ed25519`] for records
+    /// written before the tag existed.
+    pub algorithm: KeyAlgorithm,
+    /// Bound ML-DSA-65 verifying key bytes (~1952B) for a
+    /// [`KeyAlgorithm::HybridEd25519MlDsa65`] record; `None` for classical
+    /// Ed25519. Kid-anchored to `fingerprint` (the Ed25519 anchor); resolved
+    /// by the challenge verifier, never carried in a login request. The
+    /// `algorithm.is_hybrid() ⇔ pq_pubkey.is_some()` invariant is enforced at
+    /// store read/write.
+    pub pq_pubkey: Option<Vec<u8>>,
 }
 
 /// Filter parameters for user search (SCIM-aligned).
@@ -97,11 +167,34 @@ pub trait UserStore: Send + Sync {
     /// List all pubkeys for a user.
     async fn list_pubkeys(&self, username: &str) -> Result<Vec<PubkeyEntry>>;
 
-    /// Add a pubkey to a user. Returns the fingerprint.
+    /// Add a classical Ed25519 pubkey to a user. Returns the fingerprint.
+    ///
+    /// Records `KeyAlgorithm::Ed25519` with no PQ component. For post-quantum
+    /// hybrid enrollment use [`add_pubkey_hybrid`](Self::add_pubkey_hybrid).
     async fn add_pubkey(
         &self,
         username: &str,
         pubkey: VerifyingKey,
+        label: Option<String>,
+    ) -> Result<String>;
+
+    /// Add a post-quantum **hybrid** identity key: the Ed25519 anchor plus its
+    /// bound ML-DSA-65 verifying key (#439). Returns the fingerprint (of the
+    /// Ed25519 anchor — the PQ vk does not change the kid).
+    ///
+    /// Records `KeyAlgorithm::HybridEd25519MlDsa65` with `pq_pubkey = Some(..)`.
+    /// If a classical Ed25519 record for the same anchor already exists, this is
+    /// the in-place upgrade path (Ed25519 → Hybrid for the same fingerprint);
+    /// the reverse transition is rejected.
+    ///
+    /// `ml_dsa_vk` must be the ~1952-byte ML-DSA-65 verifying key encoding
+    /// (`pq::ml_dsa_vk_bytes`). Required of every backend — no fail-open default
+    /// that could silently drop the PQ binding.
+    async fn add_pubkey_hybrid(
+        &self,
+        username: &str,
+        pubkey: VerifyingKey,
+        ml_dsa_vk: Vec<u8>,
         label: Option<String>,
     ) -> Result<String>;
 
@@ -325,6 +418,7 @@ pub trait DeviceStore: Send + Sync {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -346,5 +440,17 @@ mod tests {
         assert!(matches_filter("userName pr", "alice", &None, &None, None));
         assert!(matches_filter("id pr", "alice", &sub, &None, None));
         assert!(!matches_filter("active pr", "alice", &None, &None, None));
+    }
+
+    #[test]
+    fn test_key_algorithm_parse_and_roundtrip() {
+        assert_eq!(KeyAlgorithm::Ed25519.as_str(), "ed25519");
+        assert_eq!(KeyAlgorithm::default(), KeyAlgorithm::Ed25519);
+        // Accepts case/whitespace variants.
+        assert_eq!(KeyAlgorithm::parse("ed25519").unwrap(), KeyAlgorithm::Ed25519);
+        assert_eq!(KeyAlgorithm::parse("  Ed25519 ").unwrap(), KeyAlgorithm::Ed25519);
+        // Unknown tags error (never silently fall back to Ed25519).
+        assert!(KeyAlgorithm::parse("ml-dsa-65").is_err());
+        assert!(KeyAlgorithm::parse("").is_err());
     }
 }

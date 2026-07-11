@@ -4,12 +4,13 @@
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::io::{Read, Write};
 use std::path::Path;
 
 use crate::auth::{RocksDbUserStore, UserStore};
 use crate::cli::commands::UserKeysImportFormat;
+use crate::cli::enroll::{enroll_user, EnrollKeySource};
 
 fn open_store(credentials_dir: &Path) -> Result<RocksDbUserStore> {
     RocksDbUserStore::open(credentials_dir).context("Failed to open credential store")
@@ -129,7 +130,7 @@ pub async fn handle_user_keys_list(credentials_dir: &Path, username: &str) -> Re
         for pk in &pubkeys {
             let label = pk.label.as_deref().unwrap_or("(no label)");
             let ts = pk.created_at;
-            println!("{}  {}  (added {})", pk.fingerprint, label, ts);
+            println!("{}  {}  algorithm={}  (added {})", pk.fingerprint, label, pk.algorithm.as_str(), ts);
         }
     }
     Ok(())
@@ -167,6 +168,163 @@ pub async fn handle_user_keys_import(
         .context("Failed to add key")?;
     println!("Added key {fingerprint}");
     Ok(())
+}
+
+/// Handle `user create <username> [--role] [--generate|--key|--ssh] [--no-role]`.
+///
+/// One-command enrollment (#439): generates (default) or adopts a signing key,
+/// installs it as the client's actual signing key, registers the user record,
+/// binds the derived public key, and grants a role — collapsing the multi-step
+/// dance whose partial failure silently authenticates as `anonymous`.
+pub async fn handle_user_create(
+    credentials_dir: &Path,
+    username: &str,
+    role: &str,
+    no_role: bool,
+    generate: bool,
+    key: Option<&str>,
+    ssh: Option<&str>,
+) -> Result<()> {
+    let store = open_store(credentials_dir)?;
+    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()
+        .context("Failed to resolve secrets directory")?;
+
+    let source = resolve_create_key_source(generate, key, ssh)?;
+
+    // Post-quantum policy is node policy: Hybrid by default (fail-closed), only
+    // an explicit HYPRSTREAM_ENVELOPE_POLICY=classical downgrades. Enrollment is
+    // a root-of-trust path, so it follows the same selector as envelope traffic
+    // rather than silently minting classical-only identity material.
+    let policy = hyprstream_rpc::envelope::envelope_policy_from_env();
+
+    let outcome = enroll_user(&store, &secrets_dir, username, source, policy)
+        .await
+        .context("Failed to enroll user")?;
+
+    println!("✓ Enrolled user '{}'", outcome.username);
+    if let Some(bak) = &outcome.key_backed_up {
+        println!("  Backed up prior signing key to {}", bak.display());
+    }
+    if let Some(bak) = &outcome.pq_key_backed_up {
+        println!("  Backed up prior post-quantum key to {}", bak.display());
+    }
+    println!("  Signing key installed as the client key — the CLI now signs with this key.");
+    println!(
+        "  Fingerprint: {}  (algorithm={})",
+        outcome.fingerprint,
+        outcome.algorithm.as_str()
+    );
+    for notice in &outcome.notices {
+        println!("  ⚠ {notice}");
+    }
+    println!(
+        "  Verify: `ssh-keygen -l -E sha256` of the key prints {}",
+        outcome.fingerprint
+    );
+
+    if !no_role {
+        // Best-effort role grant via the running PolicyService. Enrollment
+        // already succeeded; a down service (or first-run setup) must not undo
+        // it — point the operator at the manual command instead.
+        match grant_role(username, role).await {
+            Ok(()) => {}
+            Err(e) => {
+                println!(
+                    "  ⚠ Could not grant role '{role}' automatically ({e}).\n    \
+                     Run `hyprstream policy role add {username} {role}` once services are up."
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Resolve the `user create` key source from the `--generate`/`--key`/`--ssh`
+/// flags. `--generate` (or no key flag) → [`EnrollKeySource::Generate`].
+fn resolve_create_key_source(
+    _generate: bool,
+    key: Option<&str>,
+    ssh: Option<&str>,
+) -> Result<EnrollKeySource> {
+    if let Some(path) = ssh {
+        let sk = parse_openssh_ed25519(path)?;
+        return Ok(EnrollKeySource::SigningKey(sk));
+    }
+    if let Some(path) = key {
+        let seed = read_seed_file(path)?;
+        return Ok(EnrollKeySource::RawSeed(seed));
+    }
+    Ok(EnrollKeySource::Generate)
+}
+
+/// Read a raw 32-byte Ed25519 seed from a file (or `-` stdin). Accepts either
+/// raw 32 bytes or standard base64 of 32 bytes.
+fn read_seed_file(path: &str) -> Result<[u8; 32]> {
+    let raw = if path == "-" {
+        let mut buf = Vec::new();
+        std::io::stdin().read_to_end(&mut buf)?;
+        buf
+    } else {
+        std::fs::read(path).with_context(|| format!("Failed to read seed file: {path}"))?
+    };
+
+    let seed: [u8; 32] = if raw.len() == 32 {
+        raw.try_into()
+            .map_err(|_| anyhow::anyhow!("Seed file is not 32 bytes (Ed25519)"))?
+    } else {
+        // Try base64 of 32 bytes.
+        let s = std::str::from_utf8(&raw)
+            .map_err(|_| anyhow::anyhow!("Seed file is neither 32 raw bytes nor base64 of 32 bytes"))?;
+        let decoded = STANDARD.decode(s.trim())
+            .map_err(|_| anyhow::anyhow!("Seed file is neither 32 raw bytes nor base64 of 32 bytes"))?;
+        decoded
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Decoded seed is not 32 bytes (Ed25519)"))?
+    };
+    Ok(seed)
+}
+
+/// Parse an OpenSSH Ed25519 private key from `path`, prompting for a passphrase
+/// if the key is encrypted.
+fn parse_openssh_ed25519(path: &str) -> Result<SigningKey> {
+    let pem = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read OpenSSH key: {path}"))?;
+    let key = ssh_key::PrivateKey::from_openssh(&pem)
+        .with_context(|| format!("Failed to parse OpenSSH private key: {path}"))?;
+    let key = if key.is_encrypted() {
+        let passphrase = prompt_passphrase()?;
+        key.decrypt(&passphrase)
+            .context("Failed to decrypt OpenSSH key (wrong passphrase?)")?
+    } else {
+        key
+    };
+    match key.key_data() {
+        ssh_key::private::KeypairData::Ed25519(ed) => {
+            Ok(SigningKey::from(&ed.private))
+        }
+        _ => anyhow::bail!(
+            "{path} is not an Ed25519 key ({}); only ssh-ed25519 is supported. \
+             Generate one with: ssh-keygen -t ed25519",
+            key.algorithm().as_str()
+        ),
+    }
+}
+
+/// Prompt the terminal for an OpenSSH passphrase without echoing it.
+fn prompt_passphrase() -> Result<String> {
+    inquire::Password::new("Passphrase (OpenSSH key is encrypted): ")
+        .with_display_mode(inquire::PasswordDisplayMode::Hidden)
+        .without_confirmation()
+        .prompt()
+        .map_err(|e| anyhow::anyhow!("failed to read passphrase: {e}"))
+}
+
+/// Grant a role to `username` via the running PolicyService.
+async fn grant_role(username: &str, role: &str) -> Result<()> {
+    let keys_dir = std::path::PathBuf::from("."); // load_or_generate_signing_key resolves via config
+    let signing_key = crate::cli::load_or_generate_signing_key(&keys_dir).await?;
+    crate::cli::handle_policy_role_add(&signing_key, username, role, false).await
 }
 
 /// Handle `user keys remove <username> <fingerprint>`

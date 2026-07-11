@@ -169,6 +169,7 @@ ciborium.workspace = true                # Canonical CBOR for tamper-evident aud
 tempfile.workspace = true                # Temporary files for model conversion
 base64.workspace = true                  # JWT token encoding
 ed25519-dalek.workspace = true           # JWT Ed25519 signatures
+ssh-key = { version = "0.6", features = ["ed25519", "encryption"] }  # OpenSSH Ed25519 key import (user create --ssh)
 p256.workspace = true                    # ES256 DPoP verification (atproto interop)
 keyring = { version = "3", features = ["linux-native"] }  # OS keyring — Linux keyutils
 curve25519-dalek.workspace = true        # Ristretto255 DH for stream authentication

@@ -25,7 +25,7 @@ use hyprstream_core::cli::{
     handle_sign_challenge, handle_status, handle_token_create, handle_unload, handle_training_batch,
     handle_training_checkpoint, handle_training_infer, handle_training_init, handle_worktree_add,
     handle_worktree_info, handle_worktree_list, handle_worktree_remove,
-    handle_user_list, handle_user_register, handle_user_remove,
+    handle_user_create, handle_user_list, handle_user_register, handle_user_remove,
     handle_user_keys_list, handle_user_keys_import, handle_user_keys_remove,
     load_or_generate_signing_key, AppContext, DeviceConfig, DevicePreference, RuntimeConfig,
     // Worker handlers
@@ -2452,6 +2452,18 @@ fn main() -> Result<()> {
                 .context("Failed to create runtime for user command")?;
             rt.block_on(async {
                 match cmd {
+                    UserCommand::Create { username, role, generate, key, ssh, no_role } => {
+                        handle_user_create(
+                            &credentials_dir,
+                            &username,
+                            &role,
+                            no_role,
+                            generate,
+                            key.as_deref(),
+                            ssh.as_deref(),
+                        )
+                        .await?;
+                    }
                     UserCommand::Register { username } => {
                         handle_user_register(&credentials_dir, &username).await?;
                     }

@@ -537,6 +537,237 @@ pub fn load_or_generate_user_signing_key(
     Ok((sk, vk))
 }
 
+/// Install `sk` as the client's user-signing-key (the file
+/// `load_or_generate_user_signing_key` reads), backing up any existing key
+/// first.
+///
+/// Used by `hyprstream user create --ssh`/`--key` (#439) to adopt an external
+/// key as the *actual* signing key the CLI signs with — without this, an
+/// imported-but-not-installed key leaves the client authenticating as
+/// `anonymous`. The previous key, if any, is copied to `user-signing-key.bak`
+/// (mode 0600) so the adopt is reversible; `None` is returned when no prior
+/// key existed.
+pub fn install_user_signing_key(
+    secrets_dir: &std::path::Path,
+    sk: &SigningKey,
+) -> Result<Option<std::path::PathBuf>> {
+    const NAME: &str = "user-signing-key";
+    const BAK: &str = "user-signing-key.bak";
+
+    if !is_writable(secrets_dir) {
+        return Err(missing_in_readonly(secrets_dir, NAME));
+    }
+
+    let path = secrets_dir.join(NAME);
+    let backup = if path.exists() {
+        let bak = secrets_dir.join(BAK);
+        // Back up via `write_secret` (atomic temp-file write with mode 0600 set
+        // *before* persist) so the raw seed is never briefly world-readable, and
+        // zeroize the in-memory copy before dropping it.
+        let mut existing = std::fs::read(&path)
+            .with_context(|| format!("failed to read existing {NAME} for backup"))?;
+        let result = write_secret(secrets_dir, BAK, &existing);
+        existing.zeroize();
+        result
+            .with_context(|| format!("failed to back up existing {NAME} to '{}'", bak.display()))?;
+        tracing::info!("Backed up prior user signing key → '{}'", bak.display());
+        Some(bak)
+    } else {
+        None
+    };
+
+    let mut raw = sk.to_bytes();
+    let result = write_secret(secrets_dir, NAME, &raw);
+    raw.zeroize();
+    result?;
+    tracing::info!("Installed adopted user signing key → '{}/{}'", secrets_dir.display(), NAME);
+    Ok(backup)
+}
+
+// ─── Post-quantum hybrid user identity (#439) ────────────────────────────────
+
+/// The on-disk name of the ML-DSA-65 sibling of `user-signing-key`.
+const USER_PQ_NAME: &str = "user-signing-key.mldsa";
+const USER_PQ_BAK: &str = "user-signing-key.mldsa.bak";
+
+/// A user's client identity key material: the Ed25519 anchor plus an optional
+/// bound ML-DSA-65 key (present under [`CryptoPolicy::Hybrid`], absent under
+/// `Classical`). The fingerprint / kid is always the Ed25519 anchor's — the PQ
+/// key is bound *to* it, never fingerprinted itself.
+pub struct UserIdentityKeys {
+    pub ed: SigningKey,
+    pub mldsa: Option<hyprstream_rpc::crypto::pq::MlDsaSigningKey>,
+}
+
+impl UserIdentityKeys {
+    /// The store algorithm tag this key material corresponds to.
+    pub fn algorithm(&self) -> crate::auth::KeyAlgorithm {
+        if self.mldsa.is_some() {
+            crate::auth::KeyAlgorithm::HybridEd25519MlDsa65
+        } else {
+            crate::auth::KeyAlgorithm::Ed25519
+        }
+    }
+
+    /// The bound ML-DSA-65 verifying key bytes (~1952B), if hybrid.
+    pub fn pq_verifying_key_bytes(&self) -> Option<Vec<u8>> {
+        self.mldsa
+            .as_ref()
+            .map(hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes)
+    }
+}
+
+/// Load (or, under `Hybrid`, generate) the user's identity key material for the
+/// given [`CryptoPolicy`].
+///
+/// - The Ed25519 anchor is loaded/generated exactly as before
+///   ([`load_or_generate_user_signing_key`]) — the on-disk `user-signing-key`
+///   file is unchanged, so existing loaders keep working.
+/// - Under [`CryptoPolicy::Hybrid`] an ML-DSA-65 sibling
+///   (`user-signing-key.mldsa`, a 32-byte FIPS 204 seed) is loaded if present,
+///   or generated when absent. This covers the **in-place upgrade** case: a
+///   legacy secrets dir that has only the Ed25519 key gains a bound PQ key for
+///   the *same anchor* (same fingerprint) — no re-enrollment. If the PQ
+///   component is missing and the directory is not writable, or if generating /
+///   persisting it fails, this is a **hard error — never a classical fallback**
+///   (fail closed, matching the node's default Hybrid policy).
+/// - Under [`CryptoPolicy::Classical`] no PQ key is loaded or generated.
+pub fn load_or_generate_user_identity(
+    secrets_dir: &std::path::Path,
+    policy: hyprstream_rpc::crypto::CryptoPolicy,
+) -> Result<UserIdentityKeys> {
+    use hyprstream_rpc::crypto::pq;
+
+    let (ed, _vk) = load_or_generate_user_signing_key(secrets_dir)?;
+
+    if !policy.uses_pq() {
+        return Ok(UserIdentityKeys { ed, mldsa: None });
+    }
+
+    // Hybrid: load the PQ sibling if present, else generate (fail closed).
+    if let Some(mut seed_bytes) = read_secret(secrets_dir, USER_PQ_NAME)? {
+        let mut seed: [u8; 32] = seed_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("secret '{}' must be 32 bytes (ML-DSA-65 seed)", USER_PQ_NAME))?;
+        let mldsa = pq::ml_dsa_sk_from_seed(&seed);
+        seed_bytes.zeroize();
+        seed.zeroize();
+        tracing::info!("Loaded hybrid PQ (ML-DSA-65) user key from '{}'", secrets_dir.display());
+        return Ok(UserIdentityKeys { ed, mldsa: Some(mldsa) });
+    }
+
+    // Missing PQ component. Under Hybrid this must be generated; if we cannot
+    // write, fail closed rather than mint a classical-only identity.
+    if !is_writable(secrets_dir) {
+        return Err(anyhow!(
+            "CryptoPolicy is Hybrid but the post-quantum component '{}' is missing \
+             and '{}' is not writable — refusing to fall back to a classical-only \
+             identity (fail closed). Provision the ML-DSA-65 key or set the policy \
+             to Classical explicitly.",
+            USER_PQ_NAME,
+            secrets_dir.display()
+        ));
+    }
+
+    let (mldsa, _mldsa_vk) = pq::ml_dsa_generate_keypair();
+    let mut seed = pq::ml_dsa_sk_to_seed(&mldsa);
+    let result = write_secret(secrets_dir, USER_PQ_NAME, &seed);
+    seed.zeroize();
+    result.with_context(|| {
+        format!(
+            "CryptoPolicy is Hybrid but persisting the ML-DSA-65 component '{}' failed \
+             — refusing a classical-only fallback (fail closed)",
+            USER_PQ_NAME
+        )
+    })?;
+    tracing::info!(
+        "Generated new hybrid PQ (ML-DSA-65) user key → '{}/{}'",
+        secrets_dir.display(),
+        USER_PQ_NAME
+    );
+    Ok(UserIdentityKeys { ed, mldsa: Some(mldsa) })
+}
+
+/// Paths of any prior key files displaced by an adopt, so the caller can report
+/// the backup(s).
+#[derive(Debug, Default)]
+pub struct InstalledIdentityBackup {
+    pub ed: Option<std::path::PathBuf>,
+    pub pq: Option<std::path::PathBuf>,
+}
+
+/// Install adopted identity key material (the `--ssh`/`--key` path), backing up
+/// any displaced key files first.
+///
+/// The adopted Ed25519 key becomes the client's `user-signing-key` (via
+/// [`install_user_signing_key`]). Under `Hybrid`, a **freshly generated**
+/// ML-DSA-65 key is installed as its sibling — an adopted SSH/seed key can never
+/// make the identity hybrid by itself, so a new PQ component is minted and bound
+/// to the same anchor. Under `Classical`, no PQ sibling is written, and any
+/// pre-existing sibling is backed up and removed so the on-disk pair stays
+/// consistent (the file layout never claims hybrid without a matching PQ key).
+pub fn install_user_identity(
+    secrets_dir: &std::path::Path,
+    ed_sk: &SigningKey,
+    mldsa_sk: Option<&hyprstream_rpc::crypto::pq::MlDsaSigningKey>,
+) -> Result<InstalledIdentityBackup> {
+    use hyprstream_rpc::crypto::pq;
+
+    let ed_backup = install_user_signing_key(secrets_dir, ed_sk)?;
+
+    let pq_backup = match mldsa_sk {
+        Some(mldsa) => {
+            // Back up any existing PQ sibling, then install the fresh one.
+            let bak = backup_secret_if_present(secrets_dir, USER_PQ_NAME, USER_PQ_BAK)?;
+            let mut seed = pq::ml_dsa_sk_to_seed(mldsa);
+            let result = write_secret(secrets_dir, USER_PQ_NAME, &seed);
+            seed.zeroize();
+            result?;
+            tracing::info!(
+                "Installed adopted hybrid PQ (ML-DSA-65) user key → '{}/{}'",
+                secrets_dir.display(),
+                USER_PQ_NAME
+            );
+            bak
+        }
+        None => {
+            // Classical adopt: retire any stale PQ sibling so the pair is
+            // consistent (never leave a PQ seed bound to a displaced anchor).
+            let bak = backup_secret_if_present(secrets_dir, USER_PQ_NAME, USER_PQ_BAK)?;
+            if bak.is_some() {
+                let live = secrets_dir.join(USER_PQ_NAME);
+                std::fs::remove_file(&live).with_context(|| {
+                    format!("failed to retire stale PQ key '{}'", live.display())
+                })?;
+                tracing::info!("Retired stale PQ user key (classical adopt) → backup kept");
+            }
+            bak
+        }
+    };
+
+    Ok(InstalledIdentityBackup { ed: ed_backup, pq: pq_backup })
+}
+
+/// Back up `name` → `bak_name` (via [`write_secret`], mode 0600 before persist)
+/// if `name` exists, zeroizing the read buffer. Returns the backup path if made.
+fn backup_secret_if_present(
+    secrets_dir: &std::path::Path,
+    name: &str,
+    bak_name: &str,
+) -> Result<Option<std::path::PathBuf>> {
+    let path = secrets_dir.join(name);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut existing = std::fs::read(&path)
+        .with_context(|| format!("failed to read existing {name} for backup"))?;
+    let result = write_secret(secrets_dir, bak_name, &existing);
+    existing.zeroize();
+    result.with_context(|| format!("failed to back up existing {name}"))?;
+    Ok(Some(secrets_dir.join(bak_name)))
+}
+
 /// Load or generate an RSA 2048 keypair for RS256 JWT signing.
 ///
 /// Stored as PKCS#8 DER in `secrets_dir/rsa-key`. If the file doesn't exist
