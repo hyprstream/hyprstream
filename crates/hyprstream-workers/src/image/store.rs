@@ -590,16 +590,21 @@ impl RafsStore {
             .join(format!("{}.meta", digest_to_filename(image_id)))
     }
 
-    /// Sum on-disk bytes for the config blob plus each layer blob recorded in
+    /// Sum on-disk bytes for each unique config or layer blob recorded in
     /// `metadata`.
     ///
     /// The config blob is counted alongside the layers to match
-    /// Docker/containerd image-size semantics. Missing or unreadable blobs are
+    /// Docker/containerd image-size semantics. Descriptors can alias the same
+    /// content digest, so each CAS blob is counted only once. The reported
+    /// value is the fetched on-disk byte length (the compressed OCI blob), not
+    /// the descriptor's advertised size. Missing or unreadable blobs are
     /// silently treated as zero so a partially-present image still reports a
     /// (under-)count rather than failing the whole listing.
     fn calculate_image_size(&self, metadata: &ImageMetadata) -> u64 {
         std::iter::once(&metadata.config_digest)
             .chain(metadata.layers.iter())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
             .map(|digest| {
                 let path = self.blobs_dir.join(digest_to_filename(digest));
                 std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
@@ -900,7 +905,7 @@ inventory::submit! {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod runtime_drop_tests {
+mod store_tests {
     use super::*;
     use crate::config::ImageConfig;
 
@@ -930,6 +935,50 @@ mod runtime_drop_tests {
             reference: "latest".to_owned(),
             is_digest: false,
         }
+    }
+
+    fn metadata(config_digest: &str, layers: &[&str]) -> ImageMetadata {
+        ImageMetadata {
+            image_ref: "registry.example/image:latest".to_owned(),
+            image_id: "sha256:image".to_owned(),
+            config_digest: config_digest.to_owned(),
+            layers: layers.iter().map(|digest| (*digest).to_owned()).collect(),
+            host: "registry.example".to_owned(),
+            repository: "image".to_owned(),
+        }
+    }
+
+    #[test]
+    fn image_size_counts_each_referenced_blob_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = test_store(tmp.path());
+        let config = "sha256:config";
+        let layer = "sha256:layer";
+        std::fs::write(store.blob_path(config), b"config").unwrap();
+        std::fs::write(store.blob_path(layer), b"layer-bytes").unwrap();
+
+        // Both a config/layer alias and a repeated layer descriptor name the
+        // same CAS content, which must contribute only one on-disk length.
+        let metadata = metadata(config, &[config, layer, layer]);
+
+        assert_eq!(store.calculate_image_size(&metadata), 6 + 11);
+    }
+
+    #[test]
+    fn image_size_uses_fetched_bytes_and_ignores_missing_blobs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = test_store(tmp.path());
+        let config = "sha256:config";
+        let present_layer = "sha256:present";
+        let missing_layer = "sha256:missing";
+        std::fs::write(store.blob_path(config), b"cfg").unwrap();
+        std::fs::write(store.blob_path(present_layer), b"fetched").unwrap();
+
+        // OCI descriptor sizes are metadata from the manifest; image storage
+        // usage reports the actual compressed bytes in the local CAS instead.
+        let metadata = metadata(config, &[present_layer, missing_layer]);
+
+        assert_eq!(store.calculate_image_size(&metadata), 3 + 7);
     }
 
     /// Drive `download_blob` from a multi-threaded tokio runtime. Must return an
