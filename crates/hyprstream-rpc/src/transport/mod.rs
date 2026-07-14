@@ -422,7 +422,23 @@ impl TransportConfig {
             _ => None,
         }
     }
+}
 
+impl EndpointType {
+    /// Whether this endpoint class forbids cleartext request envelopes.
+    ///
+    /// iroh and cross-host QUIC/WebTransport are untrusted carriers for RPC
+    /// envelope confidentiality. Loopback QUIC is treated as local test/dev
+    /// plumbing; same-process and same-host UDS remain cleartext-allowed.
+    pub fn forbids_cleartext_envelope(&self) -> bool {
+        match self {
+            EndpointType::Iroh { .. } => true,
+            EndpointType::Quic { addr, .. } => !addr.ip().is_loopback(),
+            EndpointType::Inproc { .. }
+            | EndpointType::Ipc { .. }
+            | EndpointType::SystemdFd { .. } => false,
+        }
+    }
 }
 
 #[cfg(test)]

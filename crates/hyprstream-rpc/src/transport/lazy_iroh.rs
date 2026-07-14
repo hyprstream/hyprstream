@@ -234,6 +234,10 @@ impl Transport for LazyIrohTransport {
         }
     }
 
+    fn forbids_cleartext_envelope(&self) -> bool {
+        true
+    }
+
     async fn subscribe(&self, _topic: &[u8]) -> Result<Self::Sub> {
         bail!("lazy iroh RPC transport does not support SUB — streaming is on the moq plane")
     }

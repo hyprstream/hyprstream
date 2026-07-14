@@ -789,7 +789,7 @@ pub const REQUEST_ENVELOPE_TYPE_ID: u64 = 0x5265_7145_6e76_3031; // "ReqEnv01"
 pub const RESPONSE_ENVELOPE_TYPE_ID: u64 = 0x5265_7350_456e_7631; // "RsPEnv1"
 
 /// Build the COSE external_aad used for all REQUEST envelope signatures.
-fn envelope_external_aad() -> Vec<u8> {
+pub(crate) fn envelope_external_aad() -> Vec<u8> {
     crate::crypto::cose_sign1::build_external_aad(ENVELOPE_SCHEMA_ID, REQUEST_ENVELOPE_TYPE_ID)
 }
 
@@ -1414,6 +1414,25 @@ impl SignedEnvelope {
         self.encrypted_envelope.is_some()
     }
 
+    /// Outer placeholder serialized beside `encrypted_envelope`.
+    ///
+    /// Replay checks intentionally run before decryption, so the outer envelope
+    /// keeps only non-secret replay metadata. Payload, JWT authorization,
+    /// delegation bearer, WTH, and streaming DH material live only inside the
+    /// COSE_Encrypt0 plaintext and replace this placeholder after decrypt.
+    fn redacted_encrypted_envelope(&self) -> RequestEnvelope {
+        RequestEnvelope {
+            request_id: self.envelope.request_id,
+            payload: Vec::new(),
+            iat: self.envelope.iat,
+            nonce: self.envelope.nonce,
+            authorization: Authorization::None,
+            delegation_token: None,
+            wth: None,
+            client_dh_public: None,
+        }
+    }
+
     /// Verify the signature and check replay protection.
     ///
     /// # Verification Steps
@@ -1873,8 +1892,13 @@ impl ToCapnp for SignedEnvelope {
     type Builder<'a> = common_capnp::signed_envelope::Builder<'a>;
 
     fn write_to(&self, builder: &mut Self::Builder<'_>) {
-        self.envelope
-            .write_to(&mut builder.reborrow().init_envelope());
+        if self.encrypted_envelope.is_some() {
+            self.redacted_encrypted_envelope()
+                .write_to(&mut builder.reborrow().init_envelope());
+        } else {
+            self.envelope
+                .write_to(&mut builder.reborrow().init_envelope());
+        }
         builder.set_sig(&self.sig);
         builder.set_cnf(&self.cnf);
         if let Some(ref ct) = self.encrypted_envelope {

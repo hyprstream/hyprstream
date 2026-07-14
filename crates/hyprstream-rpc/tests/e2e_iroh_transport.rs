@@ -33,8 +33,10 @@ use async_trait::async_trait;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::RngCore;
 
-use hyprstream_rpc::dial::{dial, dial_stream, MoqStreamSession};
+use hyprstream_rpc::crypto::hybrid_kem::KeyedKemTrustStore;
+use hyprstream_rpc::dial::{dial_stream, dial_with_kem_store, MoqStreamSession};
 use hyprstream_rpc::envelope::InMemoryNonceCache;
+use hyprstream_rpc::node_identity::derive_mesh_kem_recipient;
 use hyprstream_rpc::rpc_client::RpcClientImpl;
 use hyprstream_rpc::service::{Continuation, EnvelopeContext, RequestService};
 use hyprstream_rpc::signer::LocalSigner;
@@ -91,6 +93,26 @@ fn install_classical_verify_policy() {
             pq_store: None,
         },
     );
+}
+
+/// Build an anchored `#mesh-kem` recipient trust store binding the server's
+/// Ed25519 identity to its deterministically-derived HyKEM recipient key.
+///
+/// Iroh forbids cleartext request envelopes (untrusted carrier), so the client
+/// must anchor the server's `#mesh-kem` keyAgreement key out-of-band before it
+/// can encrypt the one-shot request envelope to it. The server side derives the
+/// same recipient keypair from its signing key for decryption
+/// ([`hyprstream_rpc::node_identity::derive_mesh_kem_recipient`]).
+fn request_kem_store_for(
+    server_signing: &SigningKey,
+) -> Result<std::sync::Arc<KeyedKemTrustStore>> {
+    let recipient = derive_mesh_kem_recipient(server_signing)?;
+    let mut store = KeyedKemTrustStore::new();
+    store.bind(
+        server_signing.verifying_key().to_bytes(),
+        recipient.public(),
+    );
+    Ok(std::sync::Arc::new(store))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -399,11 +421,13 @@ async fn rpc_round_trip_model_status_and_registry_list_over_iroh() -> Result<()>
     let client_endpoint = shared_client_endpoint().await;
 
     let target = TransportConfig::iroh(server_node_id, server_direct.clone(), None);
-    let rpc: Arc<dyn hyprstream_rpc::rpc_client::RpcClient> = dial(
+    let request_kem = request_kem_store_for(&server_signing)?;
+    let rpc: Arc<dyn hyprstream_rpc::rpc_client::RpcClient> = dial_with_kem_store(
         &target,
         LocalSigner::new(fresh_signing_key()),
         Some(server_vk),
         None,
+        Some(request_kem),
     )?;
 
     // ─── RPC round-trip #1: model.status() ──────────────────────────────────
@@ -439,7 +463,8 @@ async fn rpc_round_trip_model_status_and_registry_list_over_iroh() -> Result<()>
             LocalSigner::new(fresh_signing_key()),
             IrohTransport::new(conn),
             Some(server_vk),
-        );
+        )
+        .with_request_kem_store(request_kem_store_for(&server_signing)?);
         let r = explicit_rpc.call(encode_op("status", b"explicit")).await?;
         assert_eq!(std::str::from_utf8(&r)?, "model.status:ok:explicit=loaded");
     }
@@ -604,11 +629,13 @@ async fn one_substrate_serves_rpc_and_rejects_anonymous_moq() -> Result<()> {
 
     // ── RPC plane over `hyprstream-rpc/1` (via the `dial()` factory) ─────────
     let target = TransportConfig::iroh(server_node_id, server_direct.clone(), None);
-    let rpc: Arc<dyn hyprstream_rpc::rpc_client::RpcClient> = dial(
+    let request_kem = request_kem_store_for(&server_signing)?;
+    let rpc: Arc<dyn hyprstream_rpc::rpc_client::RpcClient> = dial_with_kem_store(
         &target,
         LocalSigner::new(fresh_signing_key()),
         Some(server_vk),
         None,
+        Some(request_kem),
     )?;
     let resp = rpc.call(encode_op("status", b"both-alpns-model")).await?;
     assert_eq!(

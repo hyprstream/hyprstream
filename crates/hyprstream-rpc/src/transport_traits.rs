@@ -71,6 +71,16 @@ pub trait Transport: Send + Sync {
     /// recv timeout. On WASM, WebTransport stream lifetime handles this.
     async fn send(&self, payload: Vec<u8>, timeout_ms: Option<i32>) -> Result<Vec<u8>>;
 
+    /// Whether this carrier forbids cleartext request envelopes.
+    ///
+    /// Networked/untrusted carriers override this to require the RPC client to
+    /// populate `SignedEnvelope.encrypted_envelope` with a HyKEM/COSE_Encrypt0
+    /// payload. Same-process and same-host IPC keep the default cleartext-
+    /// allowed posture.
+    fn forbids_cleartext_envelope(&self) -> bool {
+        false
+    }
+
     /// Subscribe to a topic (SUB pattern). Returns a stream of multipart frames.
     async fn subscribe(&self, topic: &[u8]) -> Result<Self::Sub>;
 

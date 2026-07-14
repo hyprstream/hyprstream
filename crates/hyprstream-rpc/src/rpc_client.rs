@@ -17,6 +17,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::crypto::VerifyingKey;
+use crate::crypto::hybrid_kem::KemTrustStore;
 use crate::envelope::{
     self, RequestEnvelope, SignedEnvelope,
 };
@@ -155,6 +156,10 @@ pub struct RpcClientImpl<S: Signer, T: Transport + 'static> {
     /// falls back to the process-global response store
     /// ([`crate::envelope::global_response_pq_store`]).
     response_pq_store: Option<std::sync::Arc<dyn crate::envelope::PqTrustStore>>,
+    /// Per-client kid-anchored `#mesh-kem` trust store used to encrypt request
+    /// envelopes for carriers that forbid cleartext. Bindings are established
+    /// out-of-band by DID keyAgreement / peer attestation; absence fails closed.
+    request_kem_store: Option<Arc<dyn KemTrustStore>>,
 }
 
 impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
@@ -171,6 +176,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             request_id: AtomicU64::new(1),
             response_verify_policy: None,
             response_pq_store: None,
+            request_kem_store: None,
         }
     }
 
@@ -185,6 +191,16 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
     ) -> Self {
         self.response_pq_store = Some(pq_store);
         self.response_verify_policy = Some(crate::crypto::CryptoPolicy::Hybrid);
+        self
+    }
+
+    /// Set the anchored `#mesh-kem` recipient key store used to encrypt request
+    /// envelopes when the selected transport forbids cleartext.
+    pub fn with_request_kem_store(
+        mut self,
+        kem_store: Arc<dyn KemTrustStore>,
+    ) -> Self {
+        self.request_kem_store = Some(kem_store);
         self
     }
 
@@ -368,10 +384,61 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
 
         let canonical = envelope.to_bytes();
         let ed_pubkey = self.signer.pubkey();
+        let encrypted_envelope = if self.transport.forbids_cleartext_envelope() {
+            let server_key = self.server_verifying_key.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "transport forbids cleartext envelopes but no server verifying key \
+                     is pinned; refusing to choose a #mesh-kem recipient"
+                )
+            })?;
+            let kem_store = self.request_kem_store.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "transport forbids cleartext envelopes but no #mesh-kem trust \
+                     store is configured; refusing cleartext downgrade"
+                )
+            })?;
+            let recipient = kem_store
+                .kem_recipient_for(&server_key.to_bytes())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "transport forbids cleartext envelopes but server {} has no \
+                         anchored #mesh-kem recipient key",
+                        hex::encode(server_key.to_bytes())
+                    )
+                })?;
+
+            let mut plaintext = Vec::new();
+            {
+                let mut message = capnp::message::Builder::new_default();
+                {
+                    let mut builder =
+                        message.init_root::<crate::common_capnp::request_envelope::Builder>();
+                    envelope.write_to(&mut builder);
+                }
+                capnp::serialize::write_message(&mut plaintext, &message)?;
+            }
+            Some(crate::crypto::cose_encrypt::seal_to_recipient(
+                &recipient,
+                &plaintext,
+                &crate::envelope::envelope_external_aad(),
+                0,
+                0,
+            )?)
+        } else {
+            None
+        };
+        let signing_data: &[u8] = encrypted_envelope.as_deref().unwrap_or(&canonical);
+
+        if encrypted_envelope.is_some() && self.signer.pq_pubkey().is_none() {
+            anyhow::bail!(
+                "transport forbids cleartext envelopes but signer has no ML-DSA-65 \
+                 key; refusing to emit encrypted envelope without hybrid signature"
+            );
+        }
 
         // Raw EdDSA signature (sig/cnf) retained for signer-pubkey advertisement
         // + the JWT cnf key-binding path.
-        let signature = self.signer.sign(&canonical).await?;
+        let signature = self.signer.sign(signing_data).await?;
 
         // Build the COSE composite (M3 #152) by signing each entry's
         // Sig_structure out-of-band via the (possibly async/WASM) Signer.
@@ -388,14 +455,14 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         // it byte-distinct from a Classical inner layer.
         let hybrid = self.signer.pq_pubkey().is_some();
         let ed_kid = ed_pubkey.to_vec();
-        let ed_tbs = crate::crypto::cose_sign::inner_tbs(ed_kid.clone(), &canonical, &aad, hybrid);
+        let ed_tbs = crate::crypto::cose_sign::inner_tbs(ed_kid.clone(), signing_data, &aad, hybrid);
         let ed_sig = self.signer.sign(&ed_tbs).await?.to_vec();
 
         // Hybrid component when the signer exposes an ML-DSA-65 key.
         let pq_entry = if let Some(pq_kid) = self.signer.pq_pubkey() {
             let pq_tbs = crate::crypto::cose_sign::outer_tbs(
                 pq_kid.clone(),
-                &canonical,
+                signing_data,
                 &ed_sig,
                 &aad,
             );
@@ -431,7 +498,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             envelope,
             sig: signature,
             cnf: ed_pubkey,
-            encrypted_envelope: None,
+            encrypted_envelope,
             client_ephemeral_public: None,
             cose,
             policy,

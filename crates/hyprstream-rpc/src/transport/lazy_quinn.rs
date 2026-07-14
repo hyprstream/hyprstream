@@ -160,6 +160,10 @@ impl Transport for LazyQuinnTransport {
         }
     }
 
+    fn forbids_cleartext_envelope(&self) -> bool {
+        !self.addr.ip().is_loopback()
+    }
+
     async fn subscribe(&self, _topic: &[u8]) -> Result<Self::Sub> {
         bail!("lazy quinn RPC transport does not support SUB — streaming is on the moq plane")
     }

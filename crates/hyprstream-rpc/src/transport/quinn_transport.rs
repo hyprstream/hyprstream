@@ -586,6 +586,10 @@ impl Transport for QuinnTransport {
         self.inner.send(payload, timeout_ms).await
     }
 
+    fn forbids_cleartext_envelope(&self) -> bool {
+        true
+    }
+
     async fn subscribe(&self, topic: &[u8]) -> Result<Self::Sub> {
         self.inner.subscribe(topic).await
     }
