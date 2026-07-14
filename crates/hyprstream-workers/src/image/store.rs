@@ -590,11 +590,16 @@ impl RafsStore {
             .join(format!("{}.meta", digest_to_filename(image_id)))
     }
 
-    /// Sum on-disk bytes for each layer blob recorded in `metadata`.
+    /// Sum on-disk bytes for the config blob plus each layer blob recorded in
+    /// `metadata`.
+    ///
+    /// The config blob is counted alongside the layers to match
+    /// Docker/containerd image-size semantics. Missing or unreadable blobs are
+    /// silently treated as zero so a partially-present image still reports a
+    /// (under-)count rather than failing the whole listing.
     fn calculate_image_size(&self, metadata: &ImageMetadata) -> u64 {
-        metadata
-            .layers
-            .iter()
+        std::iter::once(&metadata.config_digest)
+            .chain(metadata.layers.iter())
             .map(|digest| {
                 let path = self.blobs_dir.join(digest_to_filename(digest));
                 std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
