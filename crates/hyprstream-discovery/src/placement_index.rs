@@ -123,17 +123,22 @@ struct DidSnapshot {
 /// already used for `DiscoveryService`'s other in-memory maps.
 #[derive(Default)]
 pub struct PlacementIndex {
+    state: RwLock<PlacementState>,
+}
+
+#[derive(Default)]
+struct PlacementState {
     /// Per-DID last-ingested snapshot (the source of truth for re-poll replace
     /// semantics).
-    raw: RwLock<HashMap<String, DidSnapshot>>,
+    raw: HashMap<String, DidSnapshot>,
     /// Derived: node DID -> facts. Recomputed after every ingest.
-    nodes: RwLock<HashMap<String, NodeFacts>>,
+    nodes: HashMap<String, NodeFacts>,
     /// Derived: group at-uri -> facts.
-    groups: RwLock<HashMap<String, GroupFacts>>,
+    groups: HashMap<String, GroupFacts>,
     /// Derived: group at-uri -> DIDs the group OWNER claims as members
     /// (`GroupItemRecord.subject`). Effective membership additionally requires
     /// the node's own consent — see [`Self::is_member`].
-    group_claims: RwLock<HashMap<String, Vec<String>>>,
+    group_claims: HashMap<String, Vec<String>>,
 }
 
 impl PlacementIndex {
@@ -190,14 +195,16 @@ impl PlacementIndex {
                 return Err(e);
             }
         };
-        self.raw.write().insert(did.to_owned(), snapshot);
-        self.recompute_derived();
+        let mut state = self.state.write();
+        state.raw.insert(did.to_owned(), snapshot);
+        Self::recompute_derived(&mut state);
         Ok(())
     }
 
     fn clear_did(&self, did: &str) {
-        self.raw.write().remove(did);
-        self.recompute_derived();
+        let mut state = self.state.write();
+        state.raw.remove(did);
+        Self::recompute_derived(&mut state);
     }
 
     /// Parse a repo CARv1 blob and decode every `ai.hyprstream.placement.*`
@@ -289,6 +296,12 @@ impl PlacementIndex {
             } else if collection == group_item::COLLECTION_NSID {
                 let rec = GroupItemRecord::from_dag_cbor(bytes)
                     .map_err(|e| anyhow!("invalid {collection} record at {key}: {e}"))?;
+                let (group_did, group_collection) = parse_group_uri(&rec.group)?;
+                ensure!(
+                    group_did == commit.did && group_collection == group::COLLECTION_NSID,
+                    "repo CAR for {did} contains group item for a group it does not own: {}",
+                    rec.group
+                );
                 snapshot.group_items.push(rec);
             } else if collection == workload::COLLECTION_NSID {
                 // Decoded for completeness per #524 P1 scope; workload placement
@@ -305,12 +318,11 @@ impl PlacementIndex {
     /// full. Simple full-rebuild rather than incremental patching — correct by
     /// construction (a deleted upstream record can't leak forever) and cheap at
     /// fleet scale; this is an index refresh, not a hot path.
-    fn recompute_derived(&self) {
-        let raw = self.raw.read();
+    fn recompute_derived(state: &mut PlacementState) {
         let mut nodes = HashMap::new();
         let mut groups = HashMap::new();
         let mut claims: HashMap<String, Vec<String>> = HashMap::new();
-        for (did, snap) in raw.iter() {
+        for (did, snap) in &state.raw {
             if let Some(n) = &snap.node {
                 nodes.insert(did.clone(), n.clone());
             }
@@ -330,21 +342,24 @@ impl PlacementIndex {
                     .push(item.subject.clone());
             }
         }
-        drop(raw);
-        *self.nodes.write() = nodes;
-        *self.groups.write() = groups;
-        *self.group_claims.write() = claims;
+        state.nodes = nodes;
+        state.groups = groups;
+        state.group_claims = claims;
     }
 
     /// All node DIDs currently known to the index (have an ingested
     /// `NodeRecord`).
     pub fn known_node_dids(&self) -> Vec<String> {
-        self.nodes.read().keys().cloned().collect()
+        self.state.read().nodes.keys().cloned().collect()
     }
 
     /// The at-uri of `did`'s `NodeRecord`, if known.
     pub fn record_uri(&self, did: &str) -> Option<String> {
-        self.nodes.read().get(did).map(|f| f.record_uri.clone())
+        self.state
+            .read()
+            .nodes
+            .get(did)
+            .map(|f| f.record_uri.clone())
     }
 
     /// Whether `node_did` is an *effective* (bidirectional-consent) member of
@@ -364,16 +379,16 @@ impl PlacementIndex {
     /// docs for the verified-by-construction ingest gate and its `Ok(None)`
     /// (trusted-resolver) fallback.
     pub fn is_member(&self, node_did: &str, group_uri: &str) -> bool {
-        let node_consents = self
+        let state = self.state.read();
+        let node_consents = state
             .nodes
-            .read()
             .get(node_did)
             .is_some_and(|f| f.consented_groups.iter().any(|g| g == group_uri));
         if !node_consents {
             return false;
         }
-        self.group_claims
-            .read()
+        state
+            .group_claims
             .get(group_uri)
             .is_some_and(|members| members.iter().any(|m| m == node_did))
     }
@@ -383,12 +398,17 @@ impl PlacementIndex {
     /// per group it is an *effective* (bidirectional-consent) member of. See
     /// the module docs for why group membership uses a per-group label key.
     pub fn effective_labels(&self, node_did: &str) -> Vec<(String, String)> {
-        let (mut labels, consented_groups) = match self.nodes.read().get(node_did) {
+        let state = self.state.read();
+        let (mut labels, consented_groups) = match state.nodes.get(node_did) {
             Some(f) => (f.labels.clone(), f.consented_groups.clone()),
             None => return Vec::new(),
         };
         for group_uri in &consented_groups {
-            if self.is_member(node_did, group_uri) {
+            if state
+                .group_claims
+                .get(group_uri)
+                .is_some_and(|members| members.iter().any(|m| m == node_did))
+            {
                 labels.push((format!("group/{group_uri}"), "true".to_owned()));
             }
         }
@@ -399,8 +419,9 @@ impl PlacementIndex {
     /// `queryCandidates` matches resource requests against. Exposed mainly for
     /// tests / introspection.
     pub fn declared_resources(&self, node_did: &str) -> Vec<(String, String)> {
-        self.nodes
+        self.state
             .read()
+            .nodes
             .get(node_did)
             .map(|f| f.declared_resources.clone())
             .unwrap_or_default()
@@ -417,6 +438,21 @@ impl PlacementIndex {
 /// against a broad-but-acyclic adversarial CAR, and is chosen well above any
 /// legitimate repo's node count.
 const MST_MAX_NODE_VISITS: usize = 1 << 20; // 1,048,576 nodes
+
+fn parse_group_uri(uri: &str) -> Result<(&str, &str)> {
+    let rest = uri
+        .strip_prefix("at://")
+        .ok_or_else(|| anyhow!("group URI must start with at://: {uri:?}"))?;
+    let mut parts = rest.split('/');
+    let did = parts.next().filter(|part| !part.is_empty());
+    let collection = parts.next().filter(|part| !part.is_empty());
+    let rkey = parts.next().filter(|part| !part.is_empty());
+    ensure!(
+        did.is_some() && collection.is_some() && rkey.is_some() && parts.next().is_none(),
+        "group URI must be at://<did>/<collection>/<rkey>: {uri:?}"
+    );
+    Ok((did.unwrap_or_default(), collection.unwrap_or_default()))
+}
 
 /// Recompute a block's CID from its bytes and confirm it matches the CID its
 /// container (the CAR root list, a parent MST node's child pointer, or an MST
@@ -1054,6 +1090,24 @@ mod tests {
 
         let malformed = NoKeyResolver(HashMap::from([(NODE_DID.to_owned(), vec![0xff])]));
         assert!(index.ingest_did(&malformed, NODE_DID).await.is_err());
+        assert!(index.known_node_dids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn third_party_group_claim_is_rejected() {
+        let group_uri = format!("at://{OWNER_DID}/{}/3g", group::COLLECTION_NSID);
+        let third_party_item =
+            GroupItemRecord::new(group_uri, NODE_DID, "2026-06-23T12:34:56.789Z").unwrap();
+        let third_party_repo = repo_car(
+            NODE_DID,
+            &[(group_item_record_key("3i"), third_party_item.to_dag_cbor())],
+        );
+        let resolver = FixedResolver {
+            repos: HashMap::from([(NODE_DID.to_owned(), third_party_repo)]),
+        };
+        let index = PlacementIndex::new();
+
+        assert!(index.ingest_did(&resolver, NODE_DID).await.is_err());
         assert!(index.known_node_dids().is_empty());
     }
 
