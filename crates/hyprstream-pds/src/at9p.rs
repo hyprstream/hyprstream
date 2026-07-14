@@ -708,7 +708,7 @@ impl UpdateRecord {
 
     pub fn to_dag_cbor(&self) -> Result<Vec<u8>> {
         self.validate()?;
-        Ok(self.to_value().encode())
+        Ok(self.encode_value())
     }
 
     /// Serialize without re-validating. For crate-internal digest/state
