@@ -129,7 +129,7 @@ pub async fn handle_shell_tui(
     };
     use hyprstream_rpc::streaming::StreamPayload;
 
-    let client = create_tui_client(signing_key);
+    let client = create_tui_client(signing_key)?;
     let (cols, rows) = terminal_size();
     let pane_rows = rows.saturating_sub(4); // status(1) + top border(1) + bottom border(1) + strip(1)
     let pane_cols = cols.saturating_sub(2); // left + right border
@@ -392,13 +392,13 @@ pub async fn handle_shell_tui(
     // SIGWINCH — forward terminal resize to TuiService and compositor.
     let sigwinch_key = signing_key.clone();
     let resize_tx_sigwinch = resize_tx.clone();
+    let resize_client = create_tui_client(&sigwinch_key)?;
     let _sigwinch_handle = tokio::spawn(async move {
         use tokio::signal::unix::{signal, SignalKind};
         let mut sigwinch = match signal(SignalKind::window_change()) {
             Ok(s) => s,
             Err(_) => return,
         };
-        let resize_client = create_tui_client(&sigwinch_key);
         loop {
             sigwinch.recv().await;
             let (c, r) = terminal_size();
@@ -1564,7 +1564,7 @@ pub async fn handle_tui_shell(
     use crate::cli::tui_handlers::{create_tui_client, terminal_size};
 
     let (cols, rows) = terminal_size();
-    let client = create_tui_client(signing_key);
+    let client = create_tui_client(signing_key)?;
 
     let registry_dir = models_dir.join(".registry").join("models");
     let registry_dir = if registry_dir.exists() { registry_dir } else { models_dir.to_path_buf() };
