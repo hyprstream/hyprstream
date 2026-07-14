@@ -699,6 +699,7 @@ mod request_kem_tests {
     use crate::node_identity::derive_mesh_kem_recipient;
     use crate::signer::LocalSigner;
     use crate::transport::rpc_session::{RpcPendingStream, RpcPublishStub};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// A carrier that forbids cleartext envelopes; `send` must never be reached
     /// in these tests (they stop at `sign_envelope`).
@@ -723,6 +724,42 @@ mod request_kem_tests {
 
         async fn publish(&self, _topic: &[u8]) -> Result<Self::Pub> {
             anyhow::bail!("mock transport: no publish")
+        }
+    }
+
+    /// A carrier that records whether `send` was ever reached, with a
+    /// configurable cleartext-forbidding classification. Used by the full
+    /// `RpcClient::call()` sentinel tests (ported from #1032, adapted to
+    /// #1036's `forbids_cleartext_envelope` model — no WarnOnly / runtime
+    /// downgrade). If the fail-closed guard works, a forbidding-carrier client
+    /// with no KEM store must error WITHOUT `send` being called.
+    struct SentinelTransport {
+        sent: Arc<AtomicBool>,
+        forbids: bool,
+    }
+
+    #[async_trait]
+    impl Transport for SentinelTransport {
+        type Sub = RpcPendingStream;
+        type Pub = RpcPublishStub;
+
+        fn forbids_cleartext_envelope(&self) -> bool {
+            self.forbids
+        }
+
+        async fn send(&self, _payload: Vec<u8>, _timeout_ms: Option<i32>) -> Result<Vec<u8>> {
+            self.sent.store(true, Ordering::SeqCst);
+            // Bogus empty reply: response unwrap fails after this, but the tests
+            // assert on `sent` to be unambiguous about WHERE the failure occurs.
+            Ok(Vec::new())
+        }
+
+        async fn subscribe(&self, _topic: &[u8]) -> Result<Self::Sub> {
+            Ok(futures::stream::pending())
+        }
+
+        async fn publish(&self, _topic: &[u8]) -> Result<Self::Pub> {
+            Ok(RpcPublishStub)
         }
     }
 
@@ -797,6 +834,60 @@ mod request_kem_tests {
         assert!(
             !bytes.windows(b"payload".len()).any(|w| w == b"payload"),
             "cleartext payload must not appear on the wire"
+        );
+    }
+
+    /// Full-`call()` sentinel (ported from #1032): a forbidding carrier with no
+    /// KEM store must be refused BEFORE any byte reaches `Transport::send()`.
+    /// This proves the guard is on the real send path, not merely on the
+    /// `sign_envelope` helper in isolation.
+    #[tokio::test]
+    async fn call_over_forbidding_carrier_without_kem_store_refused_before_send() {
+        let (_server_sk, server_vk) = generate_signing_keypair();
+        let (client_sk, _client_vk) = generate_signing_keypair();
+        let sent = Arc::new(AtomicBool::new(false));
+        let rpc = RpcClientImpl::new(
+            LocalSigner::new(client_sk),
+            SentinelTransport {
+                sent: sent.clone(),
+                forbids: true,
+            },
+            Some(server_vk),
+        );
+
+        let result = rpc.call(b"payload".to_vec()).await;
+        assert!(
+            result.is_err(),
+            "forbidding carrier + no KEM store must be refused"
+        );
+        assert!(
+            !sent.load(Ordering::SeqCst),
+            "refusal MUST happen before any byte reaches the transport"
+        );
+    }
+
+    /// The mirror: a trusted carrier (forbids == false) is NOT blocked — the
+    /// same store-less cleartext send proceeds to the transport. Proves the ban
+    /// is not over-broadened onto trusted inproc/UDS paths. (Response unwrap
+    /// fails on the bogus empty reply, but that is AFTER `send`.)
+    #[tokio::test]
+    async fn call_over_trusted_carrier_reaches_send() {
+        let (_server_sk, server_vk) = generate_signing_keypair();
+        let (client_sk, _client_vk) = generate_signing_keypair();
+        let sent = Arc::new(AtomicBool::new(false));
+        let rpc = RpcClientImpl::new(
+            LocalSigner::new(client_sk),
+            SentinelTransport {
+                sent: sent.clone(),
+                forbids: false,
+            },
+            Some(server_vk),
+        );
+
+        let _ = rpc.call(b"payload".to_vec()).await;
+        assert!(
+            sent.load(Ordering::SeqCst),
+            "trusted-carrier cleartext must NOT be blocked — send must be reached"
         );
     }
 }
