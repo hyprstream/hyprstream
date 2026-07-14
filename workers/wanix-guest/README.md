@@ -109,7 +109,7 @@ standalone Go job, independent of the Rust workflows).
   (same `github.com/hugelgupf/p9` module path, `hyprstream/p9` source):
 
   ```
-  replace github.com/hugelgupf/p9 => github.com/hyprstream/p9 v0.0.0-20260714225611-9155f405ff22
+  replace github.com/hugelgupf/p9 => github.com/hyprstream/p9 v0.0.0-20260714231754-60421d6579fe
   ```
 
   Wanix's `p9kit` imports the path `github.com/hugelgupf/p9`. Go does **not**

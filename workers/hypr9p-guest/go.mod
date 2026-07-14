@@ -15,4 +15,4 @@ require github.com/u-root/uio v0.0.0-20240224005618-d2acac8f3701 // indirect
 // standard Tattach.uname field, so both Go consumers pin the AttachUname fork
 // at github.com/hyprstream/p9 (same module path, progrium/p9 lineage). Kept in
 // lockstep with workers/wanix-guest/go.mod. Upstream: https://github.com/progrium/p9/pull/2
-replace github.com/hugelgupf/p9 => github.com/hyprstream/p9 v0.0.0-20260714225611-9155f405ff22
+replace github.com/hugelgupf/p9 => github.com/hyprstream/p9 v0.0.0-20260714231754-60421d6579fe

@@ -16,8 +16,8 @@ github.com/hugelgupf/socketpair v0.0.0-20230822150718-707395b1939a h1:Nq7wDsqsVB
 github.com/hugelgupf/socketpair v0.0.0-20230822150718-707395b1939a/go.mod h1:71Bqb5Fh9zPHF8jwdmMEmJObzr25Mx5pWLbDBMMEn6E=
 github.com/hugelgupf/vmtest v0.0.0-20240115033909-46506b2af5ea h1:rSO4GiZ/EThUOkl1kFLB+DOGxa3oEgT8d8ZhrYbDIW8=
 github.com/hugelgupf/vmtest v0.0.0-20240115033909-46506b2af5ea/go.mod h1:3YxP4j/kQh5BzoobzCeSIVZOlz4te/CGVRxS9/NrwGU=
-github.com/hyprstream/p9 v0.0.0-20260714225611-9155f405ff22 h1:Vc9JuLP0UVEWjBixzkrDjHn6N4UlyD3Nifber/bMvVw=
-github.com/hyprstream/p9 v0.0.0-20260714225611-9155f405ff22/go.mod h1:LoNwfBWP+QlCkjS1GFNylCthRIk/TkMZd6ICTbC+hrI=
+github.com/hyprstream/p9 v0.0.0-20260714231754-60421d6579fe h1:RU84TP/tJpG3M+kbBo+UxHMGhyVfxAJ4iIoSkPUGMlo=
+github.com/hyprstream/p9 v0.0.0-20260714231754-60421d6579fe/go.mod h1:LoNwfBWP+QlCkjS1GFNylCthRIk/TkMZd6ICTbC+hrI=
 github.com/insomniacslk/dhcp v0.0.0-20231206064809-8c70d406f6d2 h1:9K06NfxkBh25x56yVhWWlKFE8YpicaSfHwoV8SFbueA=
 github.com/insomniacslk/dhcp v0.0.0-20231206064809-8c70d406f6d2/go.mod h1:3A9PQ1cunSDF/1rbTq99Ts4pVnycWg+vlPkfeD2NLFI=
 github.com/josharian/native v1.1.0 h1:uuaP0hAbW7Y4l0ZRQ6C9zfb7Mg1mbFKry/xzDAfmtLA=
