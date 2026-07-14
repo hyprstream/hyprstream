@@ -51,7 +51,23 @@ pub fn create_tui_client(signing_key: &SigningKey) -> TuiClient {
                 },
                 Err(_) => panic!("Invalid key length from PolicyService"),
             },
-            Err(e) => panic!("Failed to resolve TUI service key: {e}"),
+            Err(e) => {
+                // The bootstrap key set is an operator-authored trust anchor,
+                // not a derived or self-asserted fallback. It is populated in
+                // CLI mode before client construction and lets a client recover
+                // when PolicyService's process-local registration table was
+                // restarted or missed the TUI service registration (#1018).
+                // A subsequently returned response is still pinned to this key.
+                if let Some(vk) = hyprstream_service::global_trust_store().resolve_one("tui") {
+                    tracing::warn!(
+                        error = %e,
+                        "PolicyService did not resolve the TUI key; using provisioned bootstrap key"
+                    );
+                    vk
+                } else {
+                    panic!("Failed to resolve TUI service key: {e}")
+                }
+            }
         }
     };
 

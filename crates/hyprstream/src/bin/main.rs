@@ -1616,6 +1616,13 @@ fn main() -> Result<()> {
         .validate()
         .context("Configuration validation failed")?;
 
+    // RPC clients are used by ordinary CLI commands (`quick`, `tui`, etc.),
+    // not only by service entrypoints. Install both request- and response-side
+    // verification defaults before dispatch so every command uses the
+    // operator-configured mesh trust store (#1018). The installer is
+    // first-write-wins, so the service-specific calls below remain harmless.
+    install_envelope_verify_config(Some(&config.oauth));
+
     // Install the per-service streaming-response concurrency cap from config
     // (#186) before any RPC service starts. First-write-wins; ignore if already
     // installed on this process.
