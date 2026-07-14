@@ -15,9 +15,9 @@
 //! handed it over. Ingest is **verified by construction**: when the resolver
 //! can provide the DID's `#atproto` verifying key
 //! ([`RecordResolver::resolve_verifying_key`]), [`PlacementIndex::ingest_did`]
-//! verifies the repo CAR's commit signature against it **and content-binds
-//! every consumed block to its declared CID** — the commit block, each MST
-//! node, and each record block have their CID recomputed from their bytes and
+//! verifies the repo CAR's commit signature against it. Regardless of key
+//! availability, ingest **content-binds every CAR block to its declared CID**.
+//! The commit block, each MST node, and each record block have their CID recomputed from their bytes and
 //! checked against the CID the CAR / parent declared for them (mirroring
 //! `hyprstream_pds::mst::Proof::verify`) — *before* any record enters the
 //! index. The signature alone is not sufficient: `Commit::verify` only signs
@@ -36,7 +36,8 @@
 //! resolve yet), the index retains the day-1 trusted-resolver posture: the
 //! injected `RecordResolver` is the same trusted, in-process resolver
 //! `handle_get_repo` serves *from* (no untrusted network hop between the index
-//! and its source). DID-document `#atproto` key resolution for foreign repos is
+//! and its source) for authentication only; CID and structural validation are
+//! still mandatory. DID-document `#atproto` key resolution for foreign repos is
 //! the future federation-hardening follow-up that closes that gap; until then
 //! the *per-candidate authz check* in `queryCandidates` remains the hard
 //! security boundary, with the index as best-effort scheduling metadata.
@@ -149,29 +150,34 @@ impl PlacementIndex {
     ///
     /// **Verified by construction (#932):** when the resolver provides a
     /// verifying key for `did` ([`RecordResolver::resolve_verifying_key`]), the
-    /// repo CAR's commit signature is verified **and every consumed block is
-    /// content-bound to its declared CID** (commit, MST nodes, records) before
-    /// any record enters the index. A repo that fails either check — or whose
+    /// repo CAR's commit signature is verified. Every CAR block is always
+    /// content-bound to its declared CID before any record enters the index. A
+    /// repo that fails either check — or whose
     /// `commit.did` is not `did` — is refused — its records never reach the
     /// derived indices — and this returns `Err` (the caller —
     /// `handle_report_node_liveness` — logs and continues, liveness still
     /// recorded). When the resolver returns `Ok(None)` the trusted-resolver
     /// day-1 posture applies (see the module trust-posture docs).
     pub async fn ingest_did(&self, resolver: &dyn RecordResolver, did: &str) -> Result<()> {
-        let repo = resolver
-            .resolve_repo(did)
-            .await
-            .map_err(|e| anyhow!("resolve_repo({did}) failed: {e}"))?;
+        let repo = match resolver.resolve_repo(did).await {
+            Ok(repo) => repo,
+            Err(e) => {
+                self.clear_did(did);
+                return Err(anyhow!("resolve_repo({did}) failed: {e}"));
+            }
+        };
         let Some(repo) = repo else {
             // No repo stored for this DID — clear any stale contribution and stop.
-            self.raw.write().remove(did);
-            self.recompute_derived();
+            self.clear_did(did);
             return Ok(());
         };
-        let verify_key = resolver
-            .resolve_verifying_key(did)
-            .await
-            .map_err(|e| anyhow!("resolve_verifying_key({did}) failed: {e}"))?;
+        let verify_key = match resolver.resolve_verifying_key(did).await {
+            Ok(key) => key,
+            Err(e) => {
+                self.clear_did(did);
+                return Err(anyhow!("resolve_verifying_key({did}) failed: {e}"));
+            }
+        };
         // Decode (and, when a key is available, signature-verify) the CAR
         // *before* touching the index. A verification failure leaves the index
         // untouched for this DID and surfaces as an error — the previous
@@ -180,10 +186,7 @@ impl PlacementIndex {
         let snapshot = match Self::decode_repo_car(did, &repo.car, verify_key.as_ref()) {
             Ok(snap) => snap,
             Err(e) => {
-                if verify_key.is_some() {
-                    self.raw.write().remove(did);
-                    self.recompute_derived();
-                }
+                self.clear_did(did);
                 return Err(e);
             }
         };
@@ -192,12 +195,17 @@ impl PlacementIndex {
         Ok(())
     }
 
+    fn clear_did(&self, did: &str) {
+        self.raw.write().remove(did);
+        self.recompute_derived();
+    }
+
     /// Parse a repo CARv1 blob and decode every `ai.hyprstream.placement.*`
     /// record reachable from the commit's MST root into a [`DidSnapshot`].
     ///
-    /// When `verify_key` is `Some`, the CAR's commit signature is verified
-    /// against it (the verified-by-construction gate of #932), **and every
-    /// consumed block is content-bound to its declared CID** — the commit
+    /// Every CAR block is content-bound to its declared CID. When `verify_key`
+    /// is `Some`, the CAR's commit signature is additionally verified against
+    /// it (the verified-by-construction gate of #932). The commit
     /// block, each MST node, and each record block have their CID recomputed
     /// from their bytes and checked against the CID the CAR/parent declared for
     /// them before they are trusted (mirrors `hyprstream_pds::mst::Proof::verify`,
@@ -206,25 +214,33 @@ impl PlacementIndex {
     /// root CID), so without per-block binding an attacker could replay a
     /// genuine signed commit with substituted MST-node/record blocks and forge
     /// membership. A recomputed-CID ≠ declared-CID mismatch returns `Err` (the
-    /// caller refuses to ingest). `None` skips both verifications
-    /// (trusted-resolver posture).
+    /// caller refuses to ingest). `None` skips signature authentication only
+    /// (trusted-resolver posture); content and structural validation remain.
     fn decode_repo_car(
         did: &str,
         car: &[u8],
         verify_key: Option<&VerifyingKey>,
     ) -> Result<DidSnapshot> {
-        let verify = verify_key.is_some();
         let (roots, blocks) = parse_car_v1(car)?;
+        ensure!(
+            roots.len() == 1,
+            "repo CAR for {did} must have exactly one commit root (got {})",
+            roots.len()
+        );
         let root_cid = *roots
             .first()
             .ok_or_else(|| anyhow!("repo CAR for {did} has no root"))?;
-        let block_map: HashMap<Cid, Vec<u8>> = blocks.into_iter().collect();
+        let mut block_map = HashMap::with_capacity(blocks.len());
+        for (cid, bytes) in blocks {
+            verify_block_cid(did, cid, &bytes, "CAR")?;
+            ensure!(
+                block_map.insert(cid, bytes).is_none(),
+                "repo CAR for {did} contains duplicate block CID {cid}"
+            );
+        }
         let commit_bytes = block_map
             .get(&root_cid)
             .ok_or_else(|| anyhow!("repo CAR for {did} missing its commit block"))?;
-        if verify {
-            verify_block_cid(did, root_cid, commit_bytes, "commit")?;
-        }
         let commit = Commit::from_dag_cbor(commit_bytes)?;
         // A validly-signed repo for DID A must not be replayable under DID B:
         // even a commit whose signature verifies under the presented key is
@@ -241,51 +257,45 @@ impl PlacementIndex {
         }
 
         let mut entries = Vec::new();
-        walk_mst(commit.data, &block_map, &mut entries, did, verify)?;
+        walk_mst(commit.data, &block_map, &mut entries, did)?;
 
         let mut snapshot = DidSnapshot::default();
         for (key, record_cid) in entries {
-            let Some((collection, _rkey)) = key.split_once('/') else {
-                continue; // malformed key (no collection prefix) — skip, not fatal
-            };
-            let Some(bytes) = block_map.get(&record_cid) else {
-                continue; // entry points at a block the CAR didn't include
-            };
-            // Content-bind the record block to its declared CID (verified ingest
-            // only). A mismatch means bytes were substituted under a genuine
-            // CID — fail closed (reject the whole ingest), never `continue`.
-            if verify {
-                verify_block_cid(did, record_cid, bytes, "record")?;
-            }
+            let (collection, _rkey) = key
+                .split_once('/')
+                .ok_or_else(|| anyhow!("repo CAR for {did} has malformed MST key {key:?}"))?;
+            let bytes = block_map.get(&record_cid).ok_or_else(|| {
+                anyhow!("repo CAR for {did} missing record block {record_cid} referenced by MST key {key}")
+            })?;
 
             if collection == node::COLLECTION_NSID {
-                if let Ok(rec) = NodeRecord::from_dag_cbor(bytes) {
-                    snapshot.node = Some(NodeFacts {
-                        record_uri: format!("at://{did}/{key}"),
-                        labels: rec.labels.into_iter().map(|l| (l.key, l.value)).collect(),
-                        declared_resources: rec
-                            .resources
-                            .into_iter()
-                            .map(|r| (r.name, r.capacity))
-                            .collect(),
-                        consented_groups: rec.groups,
-                    });
-                }
+                let rec = NodeRecord::from_dag_cbor(bytes)
+                    .map_err(|e| anyhow!("invalid {collection} record at {key}: {e}"))?;
+                snapshot.node = Some(NodeFacts {
+                    record_uri: format!("at://{did}/{key}"),
+                    labels: rec.labels.into_iter().map(|l| (l.key, l.value)).collect(),
+                    declared_resources: rec
+                        .resources
+                        .into_iter()
+                        .map(|r| (r.name, r.capacity))
+                        .collect(),
+                    consented_groups: rec.groups,
+                });
             } else if collection == group::COLLECTION_NSID {
-                if let Ok(rec) = GroupRecord::from_dag_cbor(bytes) {
-                    let uri = format!("at://{did}/{key}");
-                    snapshot.groups.push((uri, rec.name, rec.owner_did));
-                }
+                let rec = GroupRecord::from_dag_cbor(bytes)
+                    .map_err(|e| anyhow!("invalid {collection} record at {key}: {e}"))?;
+                let uri = format!("at://{did}/{key}");
+                snapshot.groups.push((uri, rec.name, rec.owner_did));
             } else if collection == group_item::COLLECTION_NSID {
-                if let Ok(rec) = GroupItemRecord::from_dag_cbor(bytes) {
-                    snapshot.group_items.push(rec);
-                }
+                let rec = GroupItemRecord::from_dag_cbor(bytes)
+                    .map_err(|e| anyhow!("invalid {collection} record at {key}: {e}"))?;
+                snapshot.group_items.push(rec);
             } else if collection == workload::COLLECTION_NSID {
                 // Decoded for completeness per #524 P1 scope; workload placement
                 // decisions aren't consumed by queryCandidates (day-1 scope).
-                if WorkloadRecord::from_dag_cbor(bytes).is_ok() {
-                    snapshot.workload_count += 1;
-                }
+                WorkloadRecord::from_dag_cbor(bytes)
+                    .map_err(|e| anyhow!("invalid {collection} record at {key}: {e}"))?;
+                snapshot.workload_count += 1;
             }
         }
         Ok(snapshot)
@@ -342,10 +352,11 @@ impl PlacementIndex {
     /// naming this node, **and** the node's own `NodeRecord.groups` must list
     /// this group. Either claim alone is not membership.
     ///
-    /// **Trust statement (#932):** membership facts returned here are both
-    /// signature-verified *and* content-bound at ingest — a `GroupItemRecord` /
-    /// `NodeRecord` whose repo CAR commit failed signature verification against
-    /// the resolver-provided `#atproto` key, whose `commit.did` is not the
+    /// **Trust statement (#932):** membership facts returned here are always
+    /// content-bound and are signature-verified when the resolver supplies a
+    /// key. A `GroupItemRecord` / `NodeRecord` whose repo CAR commit failed
+    /// signature verification against the resolver-provided `#atproto` key,
+    /// whose `commit.did` is not the
     /// requested DID, **or whose any block's recomputed CID ≠ its declared CID**
     /// never entered the index, so it cannot back a `true` result. The per-block
     /// CID binding is what stops a replayed genuine signed commit carrying
@@ -443,28 +454,15 @@ const MST_MAX_DEPTH: usize = 1024;
 /// ingested, so no derived membership fact is produced from an adversarial
 /// graph.
 ///
-/// When `verify` is true, each MST node block is content-bound to its declared
-/// CID (via [`verify_block_cid`]) before it is decoded — the verified-ingest
-/// gate that stops a replayed signed commit carrying substituted MST nodes.
 fn walk_mst(
     node_cid: Cid,
     blocks: &HashMap<Cid, Vec<u8>>,
     out: &mut Vec<(String, Cid)>,
     did: &str,
-    verify: bool,
 ) -> Result<()> {
     let mut visited = HashSet::new();
     let mut budget = MST_MAX_NODE_VISITS;
-    walk_mst_inner(
-        node_cid,
-        blocks,
-        out,
-        did,
-        verify,
-        0,
-        &mut visited,
-        &mut budget,
-    )
+    walk_mst_inner(node_cid, blocks, out, did, 0, &mut visited, &mut budget)
 }
 
 fn walk_mst_inner(
@@ -472,7 +470,6 @@ fn walk_mst_inner(
     blocks: &HashMap<Cid, Vec<u8>>,
     out: &mut Vec<(String, Cid)>,
     did: &str,
-    verify: bool,
     depth: usize,
     visited: &mut HashSet<Cid>,
     budget: &mut usize,
@@ -493,14 +490,11 @@ fn walk_mst_inner(
     let bytes = blocks
         .get(&node_cid)
         .ok_or_else(|| anyhow!("MST node {node_cid} missing from repo CAR blocks"))?;
-    if verify {
-        verify_block_cid(did, node_cid, bytes, "MST node")?;
-    }
     let value = DagCbor::decode(bytes)?;
     let data = NodeData::from_value(&value)?;
 
     if let Some(left) = data.l {
-        walk_mst_inner(left, blocks, out, did, verify, depth + 1, visited, budget)?;
+        walk_mst_inner(left, blocks, out, did, depth + 1, visited, budget)?;
     }
     let mut prev_key: Option<String> = None;
     for entry in &data.e {
@@ -518,7 +512,7 @@ fn walk_mst_inner(
         out.push((key.clone(), entry.v));
         prev_key = Some(key);
         if let Some(right) = entry.t {
-            walk_mst_inner(right, blocks, out, did, verify, depth + 1, visited, budget)?;
+            walk_mst_inner(right, blocks, out, did, depth + 1, visited, budget)?;
         }
     }
     Ok(())
@@ -989,5 +983,121 @@ mod tests {
         let index = PlacementIndex::new();
         index.ingest_did(&resolver, NODE_DID).await.unwrap();
         assert_eq!(index.known_node_dids(), vec![NODE_DID.to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn did_confused_repo_is_rejected_and_clears_stale_state() {
+        let rec = sample_node_record(vec![]);
+        let valid = repo_car(NODE_DID, &[(node_record_key("3a"), rec.to_dag_cbor())]);
+        let index = PlacementIndex::new();
+        index
+            .ingest_did(
+                &FixedResolver {
+                    repos: HashMap::from([(NODE_DID.to_owned(), valid)]),
+                },
+                NODE_DID,
+            )
+            .await
+            .unwrap();
+
+        let owner_repo = repo_car(
+            OWNER_DID,
+            &[(
+                node_record_key("3a"),
+                sample_node_record(vec![]).to_dag_cbor(),
+            )],
+        );
+        let confused = FixedResolver {
+            repos: HashMap::from([(NODE_DID.to_owned(), owner_repo)]),
+        };
+        assert!(index.ingest_did(&confused, NODE_DID).await.is_err());
+        assert!(index.known_node_dids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn decode_failure_without_key_clears_stale_state() {
+        struct NoKeyResolver(HashMap<String, Vec<u8>>);
+        #[async_trait(?Send)]
+        impl RecordResolver for NoKeyResolver {
+            async fn resolve_record(
+                &self,
+                _did: &str,
+                _collection: &str,
+                _rkey: &str,
+            ) -> Result<Option<RecordCarData>> {
+                Ok(None)
+            }
+            async fn resolve_repo(&self, did: &str) -> Result<Option<RecordCarData>> {
+                Ok(self.0.get(did).map(|car| RecordCarData {
+                    uri: format!("at://{did}"),
+                    car: car.clone(),
+                }))
+            }
+        }
+
+        let (car, _) = repo_car(
+            NODE_DID,
+            &[(
+                node_record_key("3a"),
+                sample_node_record(vec![]).to_dag_cbor(),
+            )],
+        );
+        let index = PlacementIndex::new();
+        index
+            .ingest_did(
+                &NoKeyResolver(HashMap::from([(NODE_DID.to_owned(), car)])),
+                NODE_DID,
+            )
+            .await
+            .unwrap();
+        assert!(!index.known_node_dids().is_empty());
+
+        let malformed = NoKeyResolver(HashMap::from([(NODE_DID.to_owned(), vec![0xff])]));
+        assert!(index.ingest_did(&malformed, NODE_DID).await.is_err());
+        assert!(index.known_node_dids().is_empty());
+    }
+
+    #[test]
+    fn car_structure_bypasses_are_rejected() {
+        let (car, vk) = repo_car(
+            NODE_DID,
+            &[(
+                node_record_key("3a"),
+                sample_node_record(vec![]).to_dag_cbor(),
+            )],
+        );
+        let (roots, blocks) = parse_car_v1(&car).unwrap();
+
+        let duplicate = build_car_v1(&roots, &[blocks.clone(), blocks.clone()].concat());
+        assert!(PlacementIndex::decode_repo_car(NODE_DID, &duplicate, Some(&vk)).is_err());
+
+        let multiple_roots = build_car_v1(&[roots[0], roots[0]], &blocks);
+        assert!(PlacementIndex::decode_repo_car(NODE_DID, &multiple_roots, Some(&vk)).is_err());
+
+        let missing_record = build_car_v1(&roots, &blocks[..blocks.len() - 1]);
+        assert!(PlacementIndex::decode_repo_car(NODE_DID, &missing_record, Some(&vk)).is_err());
+    }
+
+    #[test]
+    fn shared_mst_node_is_rejected_traversal_wide() {
+        use hyprstream_pds::mst::TreeEntry;
+
+        let leaf_bytes = NodeData { l: None, e: vec![] }.encode();
+        let leaf_cid = Cid::from_dag_cbor(&leaf_bytes);
+        let parent = NodeData {
+            l: Some(leaf_cid),
+            e: vec![TreeEntry {
+                p: 0,
+                k: b"x/y".to_vec(),
+                v: Cid::from_dag_cbor(b"record"),
+                t: Some(leaf_cid),
+            }],
+        };
+        let parent_bytes = parent.encode();
+        let parent_cid = Cid::from_dag_cbor(&parent_bytes);
+        let blocks = HashMap::from([(leaf_cid, leaf_bytes), (parent_cid, parent_bytes)]);
+        let mut out = Vec::new();
+
+        assert!(walk_mst(parent_cid, &blocks, &mut out, NODE_DID).is_err());
     }
 }
