@@ -14,7 +14,9 @@ require (
 	tractor.dev/toolkit-go v0.0.0-20250103001615-9a6753936c19 // indirect
 )
 
-// wanix's p9kit imports the path github.com/hugelgupf/p9 but requires the
-// progrium fork. Go does NOT apply a dependency's replace directives
-// transitively, so this MUST be duplicated here verbatim from wanix's go.mod.
-replace github.com/hugelgupf/p9 => github.com/progrium/p9 v0.0.0-20260529042029-b49ec572080f
+// wanix's p9kit imports the path github.com/hugelgupf/p9. The upstream progrium
+// fork does not yet expose the standard Tattach.uname field, so both Go
+// consumers pin the AttachUname fork at github.com/hyprstream/p9 (same module
+// path, progrium/p9 lineage). Kept in lockstep with workers/hypr9p-guest/go.mod.
+// Upstream: https://github.com/progrium/p9/pull/2
+replace github.com/hugelgupf/p9 => github.com/hyprstream/p9 v0.0.0-20260714225611-9155f405ff22

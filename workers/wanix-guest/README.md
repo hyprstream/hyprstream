@@ -104,15 +104,19 @@ standalone Go job, independent of the Rust workflows).
 - **Wanix** is pinned in `go.mod` to commit
   `3811507904441f1298ea62df9061083f1d47a799`
   (`tractor.dev/wanix v0.0.0-20260703022758-381150790444`).
-- **Mandatory `p9` fork replace** — copied verbatim from Wanix's own `go.mod`:
+- **Mandatory `p9` fork replace** — the progrium p9 fork does not yet expose
+  the standard `Tattach.uname` field, so this module pins the `AttachUname` fork
+  (same `github.com/hugelgupf/p9` module path, `hyprstream/p9` source):
 
   ```
-  replace github.com/hugelgupf/p9 => github.com/progrium/p9 v0.0.0-20260529042029-b49ec572080f
+  replace github.com/hugelgupf/p9 => github.com/hyprstream/p9 v0.0.0-20260714225611-9155f405ff22
   ```
 
-  Wanix's `p9kit` imports the path `github.com/hugelgupf/p9` but requires the
-  **progrium fork**. Go does **not** apply a dependency's `replace` directives
-  transitively, so this line **must** be duplicated in *this* module's `go.mod`
-  or the build fails. (Wanix's other replaces — `golang.org/x/sys` → a wasm fork,
-  `cbor`, `r2fs` — are wasm/build-specific and are *not* needed by this native
-  guest's import subset, so they are intentionally omitted.)
+  Wanix's `p9kit` imports the path `github.com/hugelgupf/p9`. Go does **not**
+  apply a dependency's `replace` directives transitively, so this line **must**
+  be duplicated in *this* module's `go.mod` or the build fails. It is kept in
+  lockstep with `workers/hypr9p-guest/go.mod`. Upstream PR:
+  https://github.com/progrium/p9/pull/2. (Wanix's other replaces —
+  `golang.org/x/sys` → a wasm fork, `cbor`, `r2fs` — are wasm/build-specific and
+  are *not* needed by this native guest's import subset, so they are intentionally
+  omitted.)

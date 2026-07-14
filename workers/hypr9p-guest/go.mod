@@ -10,7 +10,9 @@ require (
 
 require github.com/u-root/uio v0.0.0-20240224005618-d2acac8f3701 // indirect
 
-// hyprstream's 9P server + wanix-guest both use the progrium p9 fork; pin the
-// same one here (Go does not apply a dependency's replace directives, so this is
-// declared, not inherited). Kept in lockstep with workers/wanix-guest/go.mod.
-replace github.com/hugelgupf/p9 => ../../third_party/progrium-p9
+// hyprstream's 9P server + wanix-guest both use the progrium p9 fork. The
+// upstream fork (module path github.com/hugelgupf/p9) does not yet expose the
+// standard Tattach.uname field, so both Go consumers pin the AttachUname fork
+// at github.com/hyprstream/p9 (same module path, progrium/p9 lineage). Kept in
+// lockstep with workers/wanix-guest/go.mod. Upstream: https://github.com/progrium/p9/pull/2
+replace github.com/hugelgupf/p9 => github.com/hyprstream/p9 v0.0.0-20260714225611-9155f405ff22
