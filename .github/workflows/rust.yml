@@ -49,8 +49,14 @@ jobs:
   clippy:
     name: Clippy
     runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
+    # The last successful run took ~6 minutes including image pull. Keep a
+    # bounded backstop for the shared runner without giving a stalled lint job
+    # the merge-gate's 90-minute budget.
+    timeout-minutes: 30
     steps:
     - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
 
     - name: Configure AWS credentials (OIDC → sccache S3)
       uses: aws-actions/configure-aws-credentials@v4
@@ -99,8 +105,11 @@ jobs:
   wasm:
     name: WASM (browser client)
     runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
+    timeout-minutes: 30
     steps:
     - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
 
     - name: Configure AWS credentials (OIDC → sccache S3)
       uses: aws-actions/configure-aws-credentials@v4
