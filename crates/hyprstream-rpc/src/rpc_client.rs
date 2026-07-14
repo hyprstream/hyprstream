@@ -675,3 +675,128 @@ impl<S: Signer, T: Transport + 'static> RpcClient for RpcClientImpl<S, T> {
         RpcClientImpl::next_id(self)
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod request_kem_tests {
+    //! Coverage for the request KEM-store plumbing that `dial_wasm::dial` /
+    //! `dial_wasm::dial_with_kem_store` delegate to.
+    //!
+    //! `dial_wasm` is `#![cfg(target_arch = "wasm32")]` and its bodies call
+    //! `WtConnection::connect()` (the browser WebTransport API), so they cannot
+    //! be exercised by native `cargo test`, and the workspace has no
+    //! `wasm-bindgen-test` browser runner. The security-relevant behavior those
+    //! functions delegate to, however — "a cleartext-forbidding carrier with a
+    //! forwarded `#mesh-kem` store encrypts, and with NO store fails closed" —
+    //! lives entirely in `RpcClientImpl::sign_envelope` and is fully testable
+    //! here over a mock forbidding transport. `dial_wasm`'s own logic is the
+    //! same `Some(store) => with_request_kem_store(store)` / `None => client`
+    //! match as native `dial` (already covered by the iroh e2e round-trip).
+
+    use super::*;
+    use crate::crypto::hybrid_kem::KeyedKemTrustStore;
+    use crate::crypto::signing::generate_signing_keypair;
+    use crate::node_identity::derive_mesh_kem_recipient;
+    use crate::signer::LocalSigner;
+    use crate::transport::rpc_session::{RpcPendingStream, RpcPublishStub};
+
+    /// A carrier that forbids cleartext envelopes; `send` must never be reached
+    /// in these tests (they stop at `sign_envelope`).
+    struct ForbidsCleartextMock;
+
+    #[async_trait]
+    impl Transport for ForbidsCleartextMock {
+        type Sub = RpcPendingStream;
+        type Pub = RpcPublishStub;
+
+        fn forbids_cleartext_envelope(&self) -> bool {
+            true
+        }
+
+        async fn send(&self, _payload: Vec<u8>, _timeout_ms: Option<i32>) -> Result<Vec<u8>> {
+            anyhow::bail!("mock transport: send must not be reached in sign_envelope tests")
+        }
+
+        async fn subscribe(&self, _topic: &[u8]) -> Result<Self::Sub> {
+            anyhow::bail!("mock transport: no subscribe")
+        }
+
+        async fn publish(&self, _topic: &[u8]) -> Result<Self::Pub> {
+            anyhow::bail!("mock transport: no publish")
+        }
+    }
+
+    fn signed_envelope_from_bytes(bytes: &[u8]) -> SignedEnvelope {
+        let reader = capnp::serialize::read_message(
+            &mut std::io::Cursor::new(bytes),
+            capnp::message::ReaderOptions::new(),
+        )
+        .expect("read signed envelope");
+        let sr = reader
+            .get_root::<crate::common_capnp::signed_envelope::Reader>()
+            .expect("signed envelope root");
+        SignedEnvelope::read_from(sr).expect("decode signed envelope")
+    }
+
+    /// `None` store (what `dial_wasm::dial` passes) MUST fail closed on a
+    /// cleartext-forbidding carrier — never a cleartext downgrade.
+    #[tokio::test]
+    async fn cleartext_forbidding_carrier_without_kem_store_fails_closed() {
+        let (_server_sk, server_vk) = generate_signing_keypair();
+        let (client_sk, _client_vk) = generate_signing_keypair();
+
+        // Pinned server key present, but NO request KEM store (the `None` arm).
+        let rpc = RpcClientImpl::new(
+            LocalSigner::new(client_sk),
+            ForbidsCleartextMock,
+            Some(server_vk),
+        );
+
+        let err = rpc
+            .sign_envelope(1, b"payload".to_vec(), None, None, None)
+            .await
+            .expect_err("must fail closed without a #mesh-kem store");
+        assert!(
+            err.to_string().contains("mesh-kem trust"),
+            "expected fail-closed on missing KEM store, got: {err}"
+        );
+    }
+
+    /// `Some(store)` (what `dial_wasm::dial_with_kem_store` forwards) with an
+    /// anchored recipient MUST produce an encrypted envelope — proving the
+    /// forwarded store is actually used to seal.
+    #[tokio::test]
+    async fn cleartext_forbidding_carrier_with_kem_store_encrypts() {
+        let (server_sk, server_vk) = generate_signing_keypair();
+        let (client_sk, _client_vk) = generate_signing_keypair();
+
+        // Anchor the server's #mesh-kem recipient key (out-of-band binding).
+        let mut kem_store = KeyedKemTrustStore::new();
+        kem_store.bind(
+            server_vk.to_bytes(),
+            derive_mesh_kem_recipient(&server_sk).unwrap().public(),
+        );
+
+        let rpc = RpcClientImpl::new(
+            LocalSigner::new(client_sk),
+            ForbidsCleartextMock,
+            Some(server_vk),
+        )
+        .with_request_kem_store(Arc::new(kem_store));
+
+        let bytes = rpc
+            .sign_envelope(1, b"payload".to_vec(), None, None, None)
+            .await
+            .expect("forwarded store must seal the envelope");
+        let signed = signed_envelope_from_bytes(&bytes);
+        assert!(
+            signed.is_encrypted(),
+            "forwarded #mesh-kem store must yield an encrypted_envelope"
+        );
+        // The redacted outer payload must not carry the cleartext.
+        assert!(
+            !bytes.windows(b"payload".len()).any(|w| w == b"payload"),
+            "cleartext payload must not appear on the wire"
+        );
+    }
+}

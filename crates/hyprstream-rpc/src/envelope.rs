@@ -814,11 +814,19 @@ pub(crate) fn envelope_external_aad() -> Vec<u8> {
 /// fails the AEAD tag; an unmutated replay is caught by the nonce cache. The
 /// encoding is a self-contained canonical CBOR array with a domain tag so it
 /// can never collide with the plain-signature AAD.
+///
+/// # Fail-closed
+///
+/// Serialization of this fixed integer/bytes shape into an unbounded `Vec` is
+/// infallible in practice, but on the off chance it errors this returns `Err`
+/// rather than substituting the weaker plain signing AAD — a silent downgrade
+/// there would reintroduce the exact replay bypass this binding closes. Both the
+/// seal and open callers propagate the error, so the request simply fails.
 pub(crate) fn encrypted_envelope_external_aad(
     request_id: u64,
     iat: i64,
     nonce: &[u8; 16],
-) -> Vec<u8> {
+) -> EnvelopeResult<Vec<u8>> {
     use ciborium::value::Value as CborValue;
     let value = CborValue::Array(vec![
         CborValue::Integer(ENVELOPE_SCHEMA_ID.into()),
@@ -829,13 +837,10 @@ pub(crate) fn encrypted_envelope_external_aad(
         CborValue::Bytes(nonce.to_vec()),
     ]);
     let mut buf = Vec::new();
-    // Fixed-shape canonical encoding into an unbounded Vec is infallible; fall
-    // back to the plain AAD rather than panicking. Both seal and open sides run
-    // this same function, so a (theoretical) empty result stays consistent.
-    if ciborium::ser::into_writer(&value, &mut buf).is_err() {
-        return envelope_external_aad();
-    }
-    buf
+    ciborium::ser::into_writer(&value, &mut buf).map_err(|e| {
+        EnvelopeError::Encryption(format!("encode replay-bound #mesh-kem AAD: {e}"))
+    })?;
+    Ok(buf)
 }
 
 /// Serialize `envelope` in stream framing and seal it to `recipient` as a
@@ -863,7 +868,7 @@ pub(crate) fn seal_request_envelope(
             EnvelopeError::Encryption(format!("serialize envelope for encryption: {e}"))
         })?;
     }
-    let aad = encrypted_envelope_external_aad(envelope.request_id, envelope.iat, &envelope.nonce);
+    let aad = encrypted_envelope_external_aad(envelope.request_id, envelope.iat, &envelope.nonce)?;
     // One-shot: `seal_to_recipient` performs a FRESH encapsulation per call, so
     // a fixed (epoch=0, seq=0) nonce is safe — the content key is unique per call.
     crate::crypto::cose_encrypt::seal_to_recipient(recipient, &plaintext, &aad, 0, 0)
@@ -1811,7 +1816,7 @@ impl SignedEnvelope {
             self.envelope.request_id,
             self.envelope.iat,
             &self.envelope.nonce,
-        );
+        )?;
 
         let plaintext =
             crate::crypto::cose_encrypt::open_from_recipient(node_kem_keypair, ct, &aad, 0, 0)
