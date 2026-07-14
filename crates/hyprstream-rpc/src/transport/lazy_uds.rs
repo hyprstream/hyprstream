@@ -112,6 +112,13 @@ impl Transport for LazyUdsTransport {
     type Sub = RpcPendingStream;
     type Pub = RpcPublishStub;
 
+    /// Same-host Unix domain socket: peer-credential authenticated and never
+    /// leaves the host, so cleartext envelopes are permitted (explicit opt-out
+    /// of the fail-closed default; #207).
+    fn forbids_cleartext_envelope(&self) -> bool {
+        false
+    }
+
     async fn send(&self, payload: Vec<u8>, timeout_ms: Option<i32>) -> Result<Vec<u8>> {
         let transport = self.connected().await?;
 

@@ -407,23 +407,9 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
                     )
                 })?;
 
-            let mut plaintext = Vec::new();
-            {
-                let mut message = capnp::message::Builder::new_default();
-                {
-                    let mut builder =
-                        message.init_root::<crate::common_capnp::request_envelope::Builder>();
-                    envelope.write_to(&mut builder);
-                }
-                capnp::serialize::write_message(&mut plaintext, &message)?;
-            }
-            Some(crate::crypto::cose_encrypt::seal_to_recipient(
-                &recipient,
-                &plaintext,
-                &crate::envelope::envelope_external_aad(),
-                0,
-                0,
-            )?)
+            // Shared seal path (framing + replay-bound AAD) — single source of
+            // truth with `SignedEnvelope::new_signed_encrypted_mesh_kem`.
+            Some(crate::envelope::seal_request_envelope(&envelope, &recipient)?)
         } else {
             None
         };

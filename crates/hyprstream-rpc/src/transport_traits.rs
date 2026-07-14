@@ -73,12 +73,17 @@ pub trait Transport: Send + Sync {
 
     /// Whether this carrier forbids cleartext request envelopes.
     ///
-    /// Networked/untrusted carriers override this to require the RPC client to
-    /// populate `SignedEnvelope.encrypted_envelope` with a HyKEM/COSE_Encrypt0
-    /// payload. Same-process and same-host IPC keep the default cleartext-
-    /// allowed posture.
+    /// Networked/untrusted carriers require the RPC client to populate
+    /// `SignedEnvelope.encrypted_envelope` with a HyKEM/COSE_Encrypt0 payload.
+    ///
+    /// **Fail-closed default (`true`).** A carrier is treated as untrusted for
+    /// envelope confidentiality unless it explicitly opts out — so a new or
+    /// out-of-tree `Transport` cannot silently inherit cleartext permission
+    /// (epic #550 principle 1: no silent downgrade). Only same-process and
+    /// same-host IPC transports override this to `false`; loopback QUIC does so
+    /// via [`crate::transport::lazy_quinn`]'s address-aware override.
     fn forbids_cleartext_envelope(&self) -> bool {
-        false
+        true
     }
 
     /// Subscribe to a topic (SUB pattern). Returns a stream of multipart frames.
