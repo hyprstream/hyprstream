@@ -29,10 +29,7 @@
 ///
 /// Trusted-local constructors are `pub(crate)`: only this crate's transport
 /// accept boundaries (in-memory inproc, UDS/systemd listeners) can mint a
-/// trusted context. Out-of-crate hosts that terminate their own genuinely
-/// same-host channel must use the loudly-named
-/// [`CarrierContext::explicit_trusted_local`] so every such grant is
-/// greppable. Untrusted constructors are freely public — classifying a
+/// trusted context. Untrusted constructors are freely public — classifying a
 /// carrier as untrusted is always safe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CarrierContext {
@@ -46,9 +43,6 @@ enum CarrierClass {
     /// Same-host Unix domain socket accepted by this crate's UDS listener
     /// (including systemd socket activation) — peer-credential authenticated.
     TrustedUds,
-    /// An out-of-crate host explicitly attested its channel as same-host
-    /// trusted via [`CarrierContext::explicit_trusted_local`].
-    ExplicitTrustedLocal,
     /// iroh connection, direct or relay-carried.
     Iroh,
     /// QUIC session — cross-host or loopback. A loopback address is not
@@ -64,48 +58,46 @@ enum CarrierClass {
 impl CarrierContext {
     /// Same-process in-memory carrier (trusted local). Accept-boundary only.
     pub(crate) fn inproc() -> Self {
-        Self { class: CarrierClass::Inproc }
+        Self {
+            class: CarrierClass::Inproc,
+        }
     }
 
     /// Same-host UDS carrier accepted by this crate's listener, including
     /// systemd socket activation (trusted local). Accept-boundary only.
     pub(crate) fn trusted_uds() -> Self {
-        Self { class: CarrierClass::TrustedUds }
+        Self {
+            class: CarrierClass::TrustedUds,
+        }
     }
 
     /// An iroh carrier (direct or relay-carried). Untrusted.
     pub fn iroh() -> Self {
-        Self { class: CarrierClass::Iroh }
+        Self {
+            class: CarrierClass::Iroh,
+        }
     }
 
     /// A QUIC carrier — cross-host **or loopback**. Untrusted.
     pub fn quic() -> Self {
-        Self { class: CarrierClass::Quic }
+        Self {
+            class: CarrierClass::Quic,
+        }
     }
 
     /// A WebTransport carrier. Untrusted.
     pub fn web_transport() -> Self {
-        Self { class: CarrierClass::WebTransport }
+        Self {
+            class: CarrierClass::WebTransport,
+        }
     }
 
     /// Unknown/ambiguous carrier. Untrusted (the fail-closed default any new
     /// accept path should start from until it is deliberately classified).
     pub fn untrusted_unknown() -> Self {
-        Self { class: CarrierClass::Unknown }
-    }
-
-    /// Explicit trusted-local attestation for an out-of-crate host that
-    /// terminates its own genuinely same-host channel (or a test driving the
-    /// dispatch API directly).
-    ///
-    /// **This is a security assertion.** Calling it declares that the bytes
-    /// handed to the processor never crossed a network carrier. It must never
-    /// be reachable from request data, and a code-review grep for this name
-    /// must account for every call site. When in doubt, use
-    /// [`CarrierContext::untrusted_unknown`] — cleartext will then be refused,
-    /// which is the safe failure.
-    pub fn explicit_trusted_local() -> Self {
-        Self { class: CarrierClass::ExplicitTrustedLocal }
+        Self {
+            class: CarrierClass::Unknown,
+        }
     }
 
     /// Whether this carrier forbids cleartext request envelopes (INV-2).
@@ -114,9 +106,7 @@ impl CarrierContext {
     /// explicitly trusted same-host classes.
     pub fn forbids_cleartext_envelope(&self) -> bool {
         match self.class {
-            CarrierClass::Inproc
-            | CarrierClass::TrustedUds
-            | CarrierClass::ExplicitTrustedLocal => false,
+            CarrierClass::Inproc | CarrierClass::TrustedUds => false,
             CarrierClass::Iroh
             | CarrierClass::Quic
             | CarrierClass::WebTransport
@@ -129,7 +119,6 @@ impl CarrierContext {
         match self.class {
             CarrierClass::Inproc => "inproc",
             CarrierClass::TrustedUds => "uds",
-            CarrierClass::ExplicitTrustedLocal => "explicit-trusted-local",
             CarrierClass::Iroh => "iroh",
             CarrierClass::Quic => "quic",
             CarrierClass::WebTransport => "webtransport",
@@ -162,6 +151,5 @@ mod tests {
         );
         assert!(!CarrierContext::inproc().forbids_cleartext_envelope());
         assert!(!CarrierContext::trusted_uds().forbids_cleartext_envelope());
-        assert!(!CarrierContext::explicit_trusted_local().forbids_cleartext_envelope());
     }
 }

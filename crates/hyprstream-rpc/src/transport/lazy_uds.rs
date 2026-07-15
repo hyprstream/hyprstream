@@ -130,7 +130,8 @@ impl Transport for LazyUdsTransport {
             .unwrap_or(DEFAULT_TIMEOUT);
         let inner_ceiling_ms = deadline.as_millis().saturating_mul(2).min(i32::MAX as u128) as i32;
 
-        match tokio::time::timeout(deadline, transport.send(payload, Some(inner_ceiling_ms))).await {
+        match tokio::time::timeout(deadline, transport.send(payload, Some(inner_ceiling_ms))).await
+        {
             Err(_elapsed) => Err(anyhow!("uds RPC timeout after {deadline:?}")),
             Ok(Ok(resp)) => Ok(resp),
             Ok(Err(e)) => {
@@ -191,7 +192,7 @@ mod tests {
                         tokio::spawn(async move {
                             let _ = serve_rpc_connection(
                                 session, p, sk, l, REQUEST_READ_TIMEOUT, sd,
-                                crate::transport::carrier::CarrierContext::explicit_trusted_local(),
+                                crate::transport::carrier::CarrierContext::trusted_uds(),
                             )
                             .await;
                         });
@@ -201,10 +202,16 @@ mod tests {
         });
 
         let t = LazyUdsTransport::new(path.clone());
-        assert!(t.state.lock().await.cached.is_none(), "no connection before first send");
+        assert!(
+            t.state.lock().await.cached.is_none(),
+            "no connection before first send"
+        );
         let resp = t.send(b"ping".to_vec(), Some(4_000)).await.unwrap();
         assert_eq!(resp, b"ping");
-        assert!(t.state.lock().await.cached.is_some(), "session cached after first send");
+        assert!(
+            t.state.lock().await.cached.is_some(),
+            "session cached after first send"
+        );
         // Second call reuses the cached session (multiplexed stream).
         let resp2 = t.send(b"pong".to_vec(), Some(4_000)).await.unwrap();
         assert_eq!(resp2, b"pong");
@@ -217,14 +224,18 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn lazy_uds_missing_socket_errors_without_hang() {
-        let path = std::env::temp_dir().join(format!("lazy-uds-absent-{}.sock", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("lazy-uds-absent-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let t = LazyUdsTransport::new(path);
         let res = tokio::time::timeout(Duration::from_secs(5), t.send(b"x".to_vec(), Some(2_000)))
             .await
             .expect("send must complete (with an error), not hang");
         assert!(res.is_err(), "dialing an absent socket must fail");
-        assert!(t.state.lock().await.cached.is_none(), "a failed connect caches nothing");
+        assert!(
+            t.state.lock().await.cached.is_none(),
+            "a failed connect caches nothing"
+        );
     }
 
     #[tokio::test]

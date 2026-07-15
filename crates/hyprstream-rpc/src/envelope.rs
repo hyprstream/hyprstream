@@ -214,6 +214,27 @@ fn envelope_reader_options() -> capnp::message::ReaderOptions {
     opts
 }
 
+/// Parse exactly one bounded Cap'n Proto message from an already-buffered
+/// frame without allocating storage based on its unauthenticated segment
+/// table. The no-allocation reader validates declared segment sizes against
+/// both the traversal limit and the supplied slice before exposing a root.
+fn read_exact_envelope_message(
+    bytes: &[u8],
+) -> Result<capnp::message::Reader<capnp::serialize::NoAllocSliceSegments<'_>>> {
+    let mut remaining = bytes;
+    let reader = capnp::serialize::read_message_from_flat_slice_no_alloc(
+        &mut remaining,
+        envelope_reader_options(),
+    )?;
+    if !remaining.is_empty() {
+        return Err(anyhow!(
+            "trailing bytes after Cap'n Proto envelope: {}",
+            remaining.len()
+        ));
+    }
+    Ok(reader)
+}
+
 // ============================================================================
 // Envelope Unwrap Options
 // ============================================================================
@@ -273,6 +294,10 @@ pub struct UnwrapOptions<'a> {
     /// When present and the envelope has `encrypted_envelope`, the server's
     /// Ed25519 key is converted to X25519 for DH decryption.
     pub decryption_key: Option<&'a crate::crypto::SigningKey>,
+    /// Require the verified wire envelope to carry a non-empty encrypted
+    /// envelope. Enforced after signature/replay verification and before
+    /// decryption or any claims/application processing.
+    pub require_encrypted: bool,
     /// kid-anchored ML-DSA-65 trust store used to resolve the PQ verifying key
     /// for the envelope's EdDSA signer. Required under Hybrid policy.
     pub pq_store: Option<&'a dyn PqTrustStore>,
@@ -296,6 +321,7 @@ impl<'a> UnwrapOptions<'a> {
             verification: EnvelopeVerification::FixedSigner(pubkey),
             nonce_cache,
             decryption_key: None,
+            require_encrypted: false,
             pq_store: None,
             verify_policy: crate::crypto::CryptoPolicy::default(),
             unanchored_policy: UnanchoredHybridPolicy::default(),
@@ -309,6 +335,7 @@ impl<'a> UnwrapOptions<'a> {
             verification: EnvelopeVerification::AnySigner,
             nonce_cache,
             decryption_key: None,
+            require_encrypted: false,
             pq_store: None,
             verify_policy: crate::crypto::CryptoPolicy::default(),
             unanchored_policy: UnanchoredHybridPolicy::default(),
@@ -318,6 +345,12 @@ impl<'a> UnwrapOptions<'a> {
 
     pub fn with_decryption_key(mut self, key: &'a crate::crypto::SigningKey) -> Self {
         self.decryption_key = Some(key);
+        self
+    }
+
+    /// Require request encryption after authenticating the wire envelope.
+    pub fn require_encrypted(mut self, required: bool) -> Self {
+        self.require_encrypted = required;
         self
     }
 
@@ -396,29 +429,6 @@ pub fn generate_nonce() -> [u8; 16] {
     // `crypto::event_crypto::random_nonce` pattern used for AES-GCM nonces.
     use rand::Rng;
     rand::rngs::OsRng.gen()
-}
-
-/// Bounded wire probe: does this serialized `SignedEnvelope` carry an
-/// encrypted (`#mesh-kem` COSE_Encrypt0) request envelope?
-///
-/// INV-2 receive-side pre-filter (#1042): untrusted carriers must reject a
-/// cleartext envelope **before** signature verification, claims evaluation,
-/// or handler dispatch. This decodes only the Cap'n Proto message root and
-/// reads the `encryptedEnvelope` field length — no signature, replay, or
-/// payload processing — so the rejection point does the minimum work needed
-/// to classify the envelope mode.
-///
-/// Returns `Err` on undecodable bytes; on an untrusted carrier the caller
-/// must treat that exactly like cleartext (reject). Presence is defined as a
-/// non-empty field, matching [`SignedEnvelope::read_from`]'s decoding of the
-/// optional field.
-pub fn wire_signed_envelope_is_encrypted(bytes: &[u8]) -> anyhow::Result<bool> {
-    let reader = capnp::serialize::read_message(
-        &mut std::io::Cursor::new(bytes),
-        capnp::message::ReaderOptions::new(),
-    )?;
-    let sr = reader.get_root::<crate::common_capnp::signed_envelope::Reader>()?;
-    Ok(!sr.get_encrypted_envelope()?.is_empty())
 }
 
 /// Authorization subject for Casbin policy checks and resource isolation.
@@ -887,8 +897,7 @@ pub(crate) fn seal_request_envelope(
     {
         let mut message = capnp::message::Builder::new_default();
         {
-            let mut builder =
-                message.init_root::<crate::common_capnp::request_envelope::Builder>();
+            let mut builder = message.init_root::<crate::common_capnp::request_envelope::Builder>();
             envelope.write_to(&mut builder);
         }
         capnp::serialize::write_message(&mut plaintext, &message).map_err(|e| {
@@ -1654,7 +1663,13 @@ impl SignedEnvelope {
             });
         }
         self.check_replay(nonce_cache)?;
-        self.verify_cose_unanchored(expected_pubkey, pq_store, verify_policy, unanchored, allowlist)
+        self.verify_cose_unanchored(
+            expected_pubkey,
+            pq_store,
+            verify_policy,
+            unanchored,
+            allowlist,
+        )
     }
 
     /// Fu2/#677: any-signer variant of [`Self::verify_with_unanchored_policy`].
@@ -1672,7 +1687,13 @@ impl SignedEnvelope {
                 actual: 0,
             })?;
         self.check_replay(nonce_cache)?;
-        self.verify_cose_unanchored(&verifying_key, pq_store, verify_policy, unanchored, allowlist)
+        self.verify_cose_unanchored(
+            &verifying_key,
+            pq_store,
+            verify_policy,
+            unanchored,
+            allowlist,
+        )
     }
 
     /// Timestamp window + nonce replay check.
@@ -1851,11 +1872,8 @@ impl SignedEnvelope {
                     EnvelopeError::Decryption(format!("#mesh-kem envelope open failed: {e}"))
                 })?;
 
-        let reader = capnp::serialize::read_message(
-            &mut std::io::Cursor::new(&plaintext),
-            envelope_reader_options(),
-        )
-        .map_err(|e| EnvelopeError::Decryption(format!("capnp parse after decrypt: {e}")))?;
+        let reader = read_exact_envelope_message(&plaintext)
+            .map_err(|e| EnvelopeError::Decryption(format!("capnp parse after decrypt: {e}")))?;
         let env_reader = reader
             .get_root::<crate::common_capnp::request_envelope::Reader>()
             .map_err(|e| EnvelopeError::Decryption(format!("envelope read after decrypt: {e}")))?;
@@ -2401,12 +2419,7 @@ pub fn unwrap_and_verify(
     request: &[u8],
     opts: &UnwrapOptions<'_>,
 ) -> Result<(SignedEnvelope, Vec<u8>)> {
-    use capnp::serialize;
-
-    let reader = serialize::read_message(
-        &mut std::io::Cursor::new(request),
-        envelope_reader_options(),
-    )?;
+    let reader = read_exact_envelope_message(request)?;
     let signed_reader = reader.get_root::<crate::common_capnp::signed_envelope::Reader>()?;
     let mut signed = SignedEnvelope::read_from(signed_reader)?;
 
@@ -2433,6 +2446,18 @@ pub fn unwrap_and_verify(
                 &opts.unanchored_classical_allowlist,
             )?;
         }
+    }
+
+    // INV-2 receive-side policy (#1042): the carrier requirement is supplied
+    // by the accept boundary, never by request bytes. Check it only after the
+    // signature and replay admission above, so unauthenticated input cannot
+    // select or exercise a signed policy-error path. A non-empty marker alone
+    // is not sufficient: encrypted envelopes continue through canonical KEM
+    // open below before any claims or handler sees their payload.
+    if opts.require_encrypted && !signed.is_encrypted() {
+        return Err(anyhow!(
+            "cleartext request envelope rejected: carrier requires #mesh-kem encryption (INV-2)"
+        ));
     }
 
     if signed.is_encrypted() {
@@ -2525,13 +2550,8 @@ pub fn unwrap_response_with(
     pq_store: Option<&dyn PqTrustStore>,
     verify_policy: crate::crypto::CryptoPolicy,
 ) -> Result<(u64, Vec<u8>)> {
-    use capnp::serialize;
-
     // Deserialize ResponseEnvelope from Cap'n Proto
-    let reader = serialize::read_message(
-        &mut std::io::Cursor::new(response),
-        envelope_reader_options(),
-    )?;
+    let reader = read_exact_envelope_message(response)?;
     let response_reader = reader.get_root::<crate::common_capnp::response_envelope::Reader>()?;
     let envelope = ResponseEnvelope::read_from(response_reader)?;
 
@@ -3451,7 +3471,8 @@ mod tests {
         let ((_sk, vk), wire) = fu2_hybrid_wire_unanchored();
         let cache = TestNonceCache::new();
         // Hybrid + NO pq_store (unanchored) + default Deny posture.
-        let opts = UnwrapOptions::fixed_signer(&vk, &cache).with_verify_policy(CryptoPolicy::Hybrid);
+        let opts =
+            UnwrapOptions::fixed_signer(&vk, &cache).with_verify_policy(CryptoPolicy::Hybrid);
         let res = unwrap_and_verify(&wire, &opts);
         assert!(
             res.is_err(),
@@ -3502,6 +3523,38 @@ mod tests {
         let mut wire = Vec::new();
         capnp::serialize::write_message(&mut wire, &message).expect("serialize response");
         wire
+    }
+
+    #[test]
+    fn exact_flat_parser_rejects_trailing_and_partial_frames() {
+        let (sk, _) = generate_signing_keypair();
+        let wire = response_to_wire(&ResponseEnvelope::new_signed(1, vec![1, 2, 3], &sk));
+
+        let mut trailing = wire.clone();
+        trailing.extend_from_slice(&[0u8; 8]);
+        assert!(
+            read_exact_envelope_message(&trailing).is_err(),
+            "a second/trailing frame must not be ignored"
+        );
+
+        let partial = &wire[..wire.len() - 1];
+        assert!(
+            read_exact_envelope_message(partial).is_err(),
+            "a truncated declared segment must be rejected"
+        );
+    }
+
+    #[test]
+    fn exact_flat_parser_rejects_oversized_and_malformed_segment_tables() {
+        // One segment declaring 131,073 words: one word over the canonical
+        // 1 MiB traversal cap. No body is supplied; rejection must occur from
+        // the bounded table parse without allocating the declared body.
+        let oversized = [0, 0, 0, 0, 1, 0, 2, 0];
+        assert!(read_exact_envelope_message(&oversized).is_err());
+
+        // u32::MAX + 1 wraps to an invalid zero segment count.
+        let malformed_count = [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
+        assert!(read_exact_envelope_message(&malformed_count).is_err());
     }
 
     /// Classical round-trip: sign + verify a response (EdDSA-only COSE).

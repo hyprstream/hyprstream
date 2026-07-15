@@ -6,8 +6,8 @@
 //!   [`crate::transport::iroh_substrate`] under the `hyprstream-rpc/1` ALPN.
 //!   Enforces a server-wide cap on concurrent streams (DoS bound) and
 //!   drains in-flight requests on `ProtocolHandler::shutdown`.
-//! - [`IrohRequestProcessor`] — trait callers implement to wire actual
-//!   request processing (envelope verification + service dispatch).
+//! - [`IrohRequestProcessor`] — sealed request processing trait; production
+//!   network sessions admit only the canonical envelope/service bridge.
 //! - [`LocalServiceBridge`] — adapts a [`crate::service::RequestService`]
 //!   (potentially `!Send`) to the Send-bounded [`IrohRequestProcessor`].
 //!
@@ -16,10 +16,9 @@
 //! verification, JWT/DPoP, and `authorize_signer` enforcement happen inside
 //! the processor (which is `LocalServiceBridge` in production, delegating
 //! to [`crate::service::dispatch::process_request`]). The handler does
-//! hold a signing key, but uses it only to produce signed error envelopes
-//! when the processor itself returns `Err` (a wire-level failure), so the
-//! client always sees a parseable `ResponseEnvelope` rather than an opaque
-//! EOF + Cap'n Proto parse error.
+//! hold a signing key for trusted-local transport-only processor failures.
+//! Admission failures on the untrusted iroh carrier are reset/dropped without
+//! a signed response, preventing an unauthenticated signing oracle.
 //!
 //! **Wire framing**: each request is the opaque bytes of a Cap'n Proto-encoded
 //! [`crate::envelope::SignedEnvelope`] written to a freshly-opened iroh bidi
@@ -41,8 +40,8 @@ use tokio_util::sync::CancellationToken;
 // Transport-generic core lives in `super::rpc_session`. Re-export the shared
 // surface from here so existing `iroh_rpc::{...}` imports keep working.
 pub use super::rpc_session::{
-    DEFAULT_STREAM_LIMIT, IrohRequestProcessor, MAX_FRAME_BYTES, build_error_envelope, from_fn,
-    read_to_cap, serve_rpc_connection,
+    build_error_envelope, from_fn, read_to_cap, serve_rpc_connection, IrohRequestProcessor,
+    DEFAULT_STREAM_LIMIT, MAX_FRAME_BYTES,
 };
 
 // ============================================================================
@@ -62,9 +61,10 @@ pub struct IrohRpcProtocolHandler {
 #[derive(Clone)]
 struct HandlerInner {
     processor: Arc<dyn IrohRequestProcessor>,
-    /// Used to produce signed error envelopes when the processor itself
-    /// returns `Err` (wire-level fatal). Application errors come back from
-    /// the processor pre-wrapped as signed `ResponseEnvelope` bytes.
+    /// Used for signed stub errors only below a trusted-local transport test
+    /// boundary. Production iroh admission failures are silently dropped.
+    /// Authenticated application errors come back from the processor already
+    /// wrapped as signed `ResponseEnvelope` bytes.
     signing_key: SigningKey,
     /// Caps concurrent bidi streams in flight. Hold one permit per stream.
     stream_limit: Arc<Semaphore>,
@@ -76,6 +76,10 @@ struct HandlerInner {
     connection_limit: Arc<Semaphore>,
     /// Per-stream request-read timeout (#159 slowloris bound).
     read_timeout: std::time::Duration,
+    /// Accept-boundary carrier classification. Production is always iroh;
+    /// unit tests may substitute inproc to exercise raw transport mechanics
+    /// below the network envelope-policy boundary.
+    carrier: crate::transport::carrier::CarrierContext,
     /// Level-triggered shutdown signal: once `cancel()` is called, every
     /// future and current `cancelled().await` resolves immediately. Used
     /// instead of `tokio::sync::Notify` because `Notify::notify_waiters`
@@ -116,6 +120,7 @@ impl IrohRpcProtocolHandler {
                     super::rpc_session::DEFAULT_CONNECTION_LIMIT,
                 )),
                 read_timeout: super::rpc_session::REQUEST_READ_TIMEOUT,
+                carrier: crate::transport::carrier::CarrierContext::iroh(),
                 shutdown: CancellationToken::new(),
             }),
         }
@@ -126,6 +131,12 @@ impl IrohRpcProtocolHandler {
     /// [`super::rpc_session::REQUEST_READ_TIMEOUT`].
     pub fn with_read_timeout(mut self, read_timeout: std::time::Duration) -> Self {
         self.mutate_inner(|i| i.read_timeout = read_timeout);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_test_trusted_carrier(mut self) -> Self {
+        self.mutate_inner(|i| i.carrier = crate::transport::carrier::CarrierContext::inproc());
         self
     }
 
@@ -186,7 +197,7 @@ impl ProtocolHandler for IrohRpcProtocolHandler {
             Arc::clone(&self.inner.stream_limit),
             self.inner.read_timeout,
             self.inner.shutdown.clone(),
-            crate::transport::carrier::CarrierContext::iroh(),
+            self.inner.carrier,
         )
         .await
         .map_err(|e| AcceptError::from_err(std::io::Error::other(e.to_string())))
@@ -308,6 +319,12 @@ pub struct LocalServiceBridge {
     tx: tokio::sync::mpsc::Sender<BridgeMessage>,
 }
 
+impl crate::transport::rpc_session::sealed::Sealed for LocalServiceBridge {
+    fn admits_untrusted_carrier(&self) -> bool {
+        true
+    }
+}
+
 impl LocalServiceBridge {
     /// Spawn a dedicated bridge thread that owns `service` and forwards
     /// requests through [`crate::service::dispatch::process_request`].
@@ -386,7 +403,10 @@ impl LocalServiceBridge {
         std::thread::Builder::new()
             .name(format!("rpc-bridge:{thread_name}"))
             .spawn(move || {
-                let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
                     Ok(rt) => rt,
                     Err(e) => {
                         let _ = ready_tx.send(Err(anyhow::anyhow!("bridge runtime: {e}")));
@@ -445,7 +465,7 @@ impl IrohRequestProcessor for LocalServiceBridge {
 mod tests {
     use super::*;
     use crate::transport::iroh_substrate::{
-        ALPN_HYPRSTREAM_RPC, ALPN_MOQ_LITE, IrohSubstrate, NoopHandler,
+        IrohSubstrate, NoopHandler, ALPN_HYPRSTREAM_RPC, ALPN_MOQ_LITE,
     };
     use iroh::{EndpointAddr, TransportAddr};
     use rand::RngCore;
@@ -521,7 +541,9 @@ mod tests {
             Arc::clone(&nonce),
             0,
         )?;
-        ready.await.map_err(|_| anyhow::anyhow!("readiness dropped"))??;
+        ready
+            .await
+            .map_err(|_| anyhow::anyhow!("readiness dropped"))??;
 
         // Builder fails (e.g. GPU init error) → the error surfaces on readiness,
         // not silently as a later channel-closed.
@@ -531,7 +553,9 @@ mod tests {
             nonce,
             0,
         )?;
-        let build_result = ready2.await.map_err(|_| anyhow::anyhow!("readiness dropped"))?;
+        let build_result = ready2
+            .await
+            .map_err(|_| anyhow::anyhow!("readiness dropped"))?;
         assert!(
             build_result.is_err(),
             "a build failure must surface on the readiness channel"
@@ -547,10 +571,12 @@ mod tests {
             out.extend_from_slice(&req);
             Ok(Bytes::from(out))
         });
-        let rpc_handler = IrohRpcProtocolHandler::new(processor, fresh_signing_key());
+        let rpc_handler =
+            IrohRpcProtocolHandler::new(processor, fresh_signing_key()).with_test_trusted_carrier();
 
         let server =
-            IrohSubstrate::new_test(fresh_key(), NoopHandler::new("moq-not-wired"), rpc_handler).await?;
+            IrohSubstrate::new_test(fresh_key(), NoopHandler::new("moq-not-wired"), rpc_handler)
+                .await?;
         let server_addr = direct_addr(&server);
 
         let client = IrohSubstrate::new_test(
@@ -582,7 +608,7 @@ mod tests {
         let server = IrohSubstrate::new_test(
             fresh_key(),
             NoopHandler::new("moq"),
-            IrohRpcProtocolHandler::new(processor, fresh_signing_key()),
+            IrohRpcProtocolHandler::new(processor, fresh_signing_key()).with_test_trusted_carrier(),
         )
         .await?;
         let server_addr = direct_addr(&server);
@@ -623,7 +649,8 @@ mod tests {
 
         let processor =
             from_fn(|_req: Bytes| async move { Err(anyhow::anyhow!("boom from processor")) });
-        let handler = IrohRpcProtocolHandler::new(processor, server_signing);
+        let handler =
+            IrohRpcProtocolHandler::new(processor, server_signing).with_test_trusted_carrier();
 
         let server = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("moq"), handler).await?;
         let server_addr = direct_addr(&server);
@@ -639,7 +666,8 @@ mod tests {
         // Send any bytes; the processor will Err regardless. The interesting
         // assertion is what comes back: a verifiable ResponseEnvelope.
         let resp_bytes = client_request(&conn, b"anything").await?;
-        let (request_id, payload) = crate::envelope::unwrap_response(&resp_bytes, Some(&server_vk))?;
+        let (request_id, payload) =
+            crate::envelope::unwrap_response(&resp_bytes, Some(&server_vk))?;
         assert_eq!(request_id, 0, "error envelope uses request_id=0");
         let body = std::str::from_utf8(&payload)?;
         assert!(body.contains("boom from processor"), "got: {body}");
@@ -678,11 +706,9 @@ mod tests {
                 Ok(Bytes::from_static(b"ok"))
             }
         });
-        let handler = IrohRpcProtocolHandler::with_stream_limit(
-            Arc::new(processor),
-            fresh_signing_key(),
-            2,
-        );
+        let handler =
+            IrohRpcProtocolHandler::with_stream_limit(Arc::new(processor), fresh_signing_key(), 2)
+                .with_test_trusted_carrier();
 
         let server = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("moq"), handler).await?;
         let server_addr = direct_addr(&server);
@@ -726,12 +752,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rpc_slowloris_stream_is_timed_out_and_permit_released() -> Result<()> {
         let processor = from_fn(move |_req: Bytes| async move { Ok(Bytes::from_static(b"ok")) });
-        let handler = IrohRpcProtocolHandler::with_stream_limit(
-            Arc::new(processor),
-            fresh_signing_key(),
-            1,
-        )
-        .with_read_timeout(Duration::from_millis(300));
+        let handler =
+            IrohRpcProtocolHandler::with_stream_limit(Arc::new(processor), fresh_signing_key(), 1)
+                .with_test_trusted_carrier()
+                .with_read_timeout(Duration::from_millis(300));
 
         let server = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("moq"), handler).await?;
         let server_addr = direct_addr(&server);
@@ -746,7 +770,10 @@ mod tests {
 
         // Slowloris: open a bidi stream, dribble one byte, never finish.
         let (mut stall_send, _stall_recv) = conn.open_bi().await.context("open_bi stall")?;
-        stall_send.write_all(b"x").await.context("write stall byte")?;
+        stall_send
+            .write_all(b"x")
+            .await
+            .context("write stall byte")?;
         // Deliberately DO NOT call finish(); keep the stream (and its server-side
         // permit) alive. Hold the handle so it isn't dropped/reset early.
 
@@ -783,7 +810,8 @@ mod tests {
                 Ok(Bytes::from_static(b"drained-ok"))
             }
         });
-        let handler = IrohRpcProtocolHandler::new(processor, fresh_signing_key());
+        let handler =
+            IrohRpcProtocolHandler::new(processor, fresh_signing_key()).with_test_trusted_carrier();
 
         let server = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("moq"), handler).await?;
         let server_addr = direct_addr(&server);
@@ -803,7 +831,9 @@ mod tests {
 
         // Synchronise: wait until the processor signals it has entered the
         // sleep, *then* shut down. No wall-clock guesses.
-        entered.notified().await;
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .context("processor was never entered before shutdown")?;
         server.shutdown().await?;
 
         let resp = req_task.await??;
@@ -812,5 +842,4 @@ mod tests {
         client.shutdown().await?;
         Ok(())
     }
-
 }

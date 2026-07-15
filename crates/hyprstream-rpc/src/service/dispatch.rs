@@ -7,7 +7,7 @@
 //! quinn) — extracted out of `transport/zmtp_quic.rs` so the ZMQ-specific
 //! remainder of that file can be deleted in #138 without touching this.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use capnp::message::Builder;
 use capnp::serialize;
 use tracing::{debug, error, warn};
@@ -90,61 +90,25 @@ where
         )
     };
 
-    // INV-2 receive-side policy (#1042), defense-in-depth behind the serve
-    // loop's own rejection: on a cleartext-forbidding carrier, refuse a
-    // cleartext (or undecodable) envelope BEFORE signature verification,
-    // claims evaluation, or handler dispatch. A valid signature does not make
-    // cleartext acceptable, and nothing in the request bytes can select the
-    // carrier class — `carrier` comes from the accept boundary.
-    if carrier.forbids_cleartext_envelope()
-        && !crate::envelope::wire_signed_envelope_is_encrypted(raw_bytes).unwrap_or(false)
-    {
-        warn!(
-            "{} rejecting cleartext request envelope on untrusted carrier '{}' (INV-2 #1042)",
-            service.name(),
-            carrier
-        );
-        let error_payload = service.build_error_payload(
-            0,
-            &format!(
-                "cleartext request envelope rejected: carrier '{carrier}' forbids \
-                 cleartext (INV-2); seal the request to the server's #mesh-kem recipient"
-            ),
-        );
-        let signed_response = sign_response(0, error_payload);
-        let mut message = Builder::new_default();
-        let mut builder = message.init_root::<crate::common_capnp::response_envelope::Builder>();
-        signed_response.write_to(&mut builder);
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-        return Ok(bytes);
-    }
-
     let pq_store_holder = crate::envelope::global_pq_store();
     let base = match verification {
-        EnvelopeVerification::FixedSigner(pubkey) =>
-            crate::envelope::UnwrapOptions::fixed_signer(pubkey, nonce_cache),
-        EnvelopeVerification::AnySigner =>
-            crate::envelope::UnwrapOptions::any_signer(nonce_cache),
-    }.with_decryption_key(signing_key);
-    let opts =
-        crate::envelope::apply_global_verify_config(base, &pq_store_holder);
+        EnvelopeVerification::FixedSigner(pubkey) => {
+            crate::envelope::UnwrapOptions::fixed_signer(pubkey, nonce_cache)
+        }
+        EnvelopeVerification::AnySigner => crate::envelope::UnwrapOptions::any_signer(nonce_cache),
+    }
+    .with_decryption_key(signing_key)
+    .require_encrypted(carrier.forbids_cleartext_envelope());
+    let opts = crate::envelope::apply_global_verify_config(base, &pq_store_holder);
 
     let (mut ctx, payload) = match crate::envelope::unwrap_envelope(raw_bytes, &opts) {
         Ok(result) => result,
         Err(e) => {
             warn!("{} envelope verification failed: {}", service.name(), e);
-            // Build error response with request_id=0 (envelope is invalid)
-            let error_payload = service.build_error_payload(0, &format!("envelope verification failed: {}", e));
-            let signed_response = sign_response(0, error_payload);
-
-            let mut message = Builder::new_default();
-            let mut builder = message.init_root::<crate::common_capnp::response_envelope::Builder>();
-            signed_response.write_to(&mut builder);
-
-            let mut bytes = Vec::new();
-            serialize::write_message(&mut bytes, &message)?;
-            return Ok(bytes);
+            // Never sign a response to unauthenticated input. The transport
+            // boundary treats this error as a silent stream reset/drop on
+            // untrusted carriers, preventing a signing oracle/amplifier.
+            return Err(e).with_context(|| format!("{} envelope admission failed", service.name()));
         }
     };
 
@@ -160,7 +124,10 @@ where
     if let Err(e) = service.verify_claims(&mut ctx).await {
         warn!(
             "{} claims verification failed for {} (id={}): {}",
-            service.name(), ctx.subject(), request_id, e
+            service.name(),
+            ctx.subject(),
+            request_id,
+            e
         );
         let error_payload = service.build_error_payload(request_id, &e.to_string());
         let signed_response = sign_response(request_id, error_payload);
@@ -179,7 +146,10 @@ where
         Ok((resp, cont)) => (resp, cont),
         Err(e) => {
             error!("{} request handling error: {}", service.name(), e);
-            (service.build_error_payload(request_id, &e.to_string()), None)
+            (
+                service.build_error_payload(request_id, &e.to_string()),
+                None,
+            )
         }
     };
 

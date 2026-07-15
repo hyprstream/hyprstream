@@ -263,7 +263,9 @@ async fn classify_inbound(
     match tag[0] {
         TAG_BIDI => {
             let (rh, wh) = stream.split();
-            let _ = bi_tx.send((UdsSendStream::new(wh), UdsRecvStream::new(rh))).await;
+            let _ = bi_tx
+                .send((UdsSendStream::new(wh), UdsRecvStream::new(rh)))
+                .await;
         }
         TAG_UNI => {
             let (rh, _wh) = stream.split();
@@ -427,7 +429,9 @@ impl UdsSession {
             .send(DriverCmd::OpenOutbound(tx))
             .await
             .map_err(|_| UdsError::closed())?;
-        rx.await.map_err(|_| UdsError::closed())?.map_err(UdsError::conn)
+        rx.await
+            .map_err(|_| UdsError::closed())?
+            .map_err(UdsError::conn)
     }
 }
 
@@ -527,7 +531,10 @@ pub async fn accept_uds(mut stream: tokio::net::UnixStream) -> Result<(u8, UdsSe
     if !matches!(plane[0], PLANE_RPC | PLANE_MOQ) {
         anyhow::bail!("uds: unknown plane selector byte 0x{:02x}", plane[0]);
     }
-    Ok((plane[0], UdsSession::spawn(stream.compat(), yamux::Mode::Server)))
+    Ok((
+        plane[0],
+        UdsSession::spawn(stream.compat(), yamux::Mode::Server),
+    ))
 }
 
 // Compile-time assertion that our types satisfy the native `MaybeSend` bound
@@ -684,7 +691,7 @@ mod tests {
             limit,
             REQUEST_READ_TIMEOUT,
             shutdown.clone(),
-            crate::transport::carrier::CarrierContext::explicit_trusted_local(),
+            crate::transport::carrier::CarrierContext::trusted_uds(),
         ));
 
         // Two sequential calls prove the session multiplexes fresh bidi streams.
@@ -714,7 +721,9 @@ mod tests {
         let mut broadcast = producer.create_broadcast("alice/run-1").unwrap();
         let mut track = broadcast.create_track(Track::new("tokens")).unwrap();
         let mut group = track.create_group(Group::from(0u64)).unwrap();
-        group.write_frame(Bytes::from_static(b"hello-uds-moq")).unwrap();
+        group
+            .write_frame(Bytes::from_static(b"hello-uds-moq"))
+            .unwrap();
         drop(group);
 
         // The moq handshake is bidirectional (client opens the SETUP stream, the
@@ -728,10 +737,11 @@ mod tests {
         let client_origin = Origin::random().produce();
         let client_consumer = client_origin.consume();
         let moq_client = Client::new().with_consume(client_origin);
-        let _moq_session = tokio::time::timeout(Duration::from_secs(8), moq_client.connect(client_session))
-            .await
-            .expect("client.connect hung")
-            .unwrap();
+        let _moq_session =
+            tokio::time::timeout(Duration::from_secs(8), moq_client.connect(client_session))
+                .await
+                .expect("client.connect hung")
+                .unwrap();
         let _moq_server = tokio::time::timeout(Duration::from_secs(8), server_task)
             .await
             .expect("server.accept hung")
@@ -803,7 +813,9 @@ mod tests {
         // Client writes a bogus plane selector.
         let cli = tokio::spawn(async move {
             let mut a = a;
-            tokio::io::AsyncWriteExt::write_all(&mut a, &[0xFF]).await.unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut a, &[0xFF])
+                .await
+                .unwrap();
             // Hold the socket open so the server's read sees the byte, not EOF.
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         });

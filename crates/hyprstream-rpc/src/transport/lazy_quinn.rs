@@ -140,12 +140,10 @@ impl Transport for LazyQuinnTransport {
         let deadline = timeout_ms
             .map(|ms| Duration::from_millis(ms.max(0) as u64))
             .unwrap_or(DEFAULT_TIMEOUT);
-        let inner_ceiling_ms = deadline
-            .as_millis()
-            .saturating_mul(2)
-            .min(i32::MAX as u128) as i32;
+        let inner_ceiling_ms = deadline.as_millis().saturating_mul(2).min(i32::MAX as u128) as i32;
 
-        match tokio::time::timeout(deadline, transport.send(payload, Some(inner_ceiling_ms))).await {
+        match tokio::time::timeout(deadline, transport.send(payload, Some(inner_ceiling_ms))).await
+        {
             // Our deadline fired: a slow/stalled request, not necessarily a dead
             // connection. Keep the cached session — re-dialing on every timeout
             // would thrash a merely-busy peer. (#156 owns liveness-based re-dial.)
@@ -209,8 +207,7 @@ mod tests {
     fn spawn_echo_server() -> (SocketAddr, [u8; 32], CancellationToken) {
         crate::transport::pq_provider::install_pq_crypto_provider();
 
-        let cert_key =
-            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let cert_key = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
         let cert_der = cert_key.cert.der().to_vec();
         let key_der = cert_key.key_pair.serialize_der();
         let chain = vec![rustls::pki_types::CertificateDer::from(cert_der.clone())];
@@ -224,9 +221,9 @@ mod tests {
             .unwrap();
         let bound = server.local_addr().unwrap();
 
-        let processor =
-            crate::transport::rpc_session::from_fn(|req: Bytes| async move { Ok(req) });
-        let rpc_server = QuinnRpcServer::new(server, processor, fresh_signing_key());
+        let processor = crate::transport::rpc_session::from_fn(|req: Bytes| async move { Ok(req) });
+        let rpc_server =
+            QuinnRpcServer::new(server, processor, fresh_signing_key()).with_test_trusted_carrier();
         let shutdown = rpc_server.shutdown_token();
         tokio::spawn(rpc_server.run());
 
@@ -236,13 +233,23 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn lazy_connects_on_first_send_and_caches() {
         let (addr, pin, shutdown) = spawn_echo_server();
-        let t = LazyQuinnTransport::new(addr, "localhost", QuicServerAuth::pinned(vec![pin]).unwrap());
+        let t = LazyQuinnTransport::new(
+            addr,
+            "localhost",
+            QuicServerAuth::pinned(vec![pin]).unwrap(),
+        );
 
-        assert!(t.state.lock().await.cached.is_none(), "no connection before first send");
+        assert!(
+            t.state.lock().await.cached.is_none(),
+            "no connection before first send"
+        );
 
         let resp = t.send(b"hello".to_vec(), Some(5_000)).await.unwrap();
         assert_eq!(resp, b"hello");
-        assert!(t.state.lock().await.cached.is_some(), "session cached after first send");
+        assert!(
+            t.state.lock().await.cached.is_some(),
+            "session cached after first send"
+        );
 
         let resp2 = t.send(b"again".to_vec(), Some(5_000)).await.unwrap();
         assert_eq!(resp2, b"again");
@@ -253,15 +260,22 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wrong_cert_pin_does_not_connect() {
         let (addr, _pin, shutdown) = spawn_echo_server();
-        let t = LazyQuinnTransport::new(addr, "localhost", QuicServerAuth::pinned(vec![[0u8; 32]]).unwrap()); // wrong fingerprint
-        // The TLS handshake must *promptly reject* a wrong pin: the send must
-        // COMPLETE with an error well within the hang-guard. If the guard fires
-        // (i.e. send hung), the test fails — so a hang can't masquerade as a pass.
+        let t = LazyQuinnTransport::new(
+            addr,
+            "localhost",
+            QuicServerAuth::pinned(vec![[0u8; 32]]).unwrap(),
+        ); // wrong fingerprint
+           // The TLS handshake must *promptly reject* a wrong pin: the send must
+           // COMPLETE with an error well within the hang-guard. If the guard fires
+           // (i.e. send hung), the test fails — so a hang can't masquerade as a pass.
         let res = tokio::time::timeout(Duration::from_secs(8), t.send(b"x".to_vec(), Some(3_000)))
             .await
             .expect("send must complete (with an error) — a wrong pin should reject, not hang");
         assert!(res.is_err(), "a wrong cert pin must make send fail");
-        assert!(t.state.lock().await.cached.is_none(), "failed dial leaves nothing cached");
+        assert!(
+            t.state.lock().await.cached.is_none(),
+            "failed dial leaves nothing cached"
+        );
         shutdown.cancel();
     }
 
@@ -278,8 +292,14 @@ mod tests {
         let res = tokio::time::timeout(Duration::from_secs(13), t.send(b"x".to_vec(), Some(2_000)))
             .await
             .expect("send must complete (with an error) within the connect timeout, not hang");
-        assert!(res.is_err(), "a dead address must yield an error, not a connection");
-        assert!(t.state.lock().await.cached.is_none(), "a failed connect caches nothing");
+        assert!(
+            res.is_err(),
+            "a dead address must yield an error, not a connection"
+        );
+        assert!(
+            t.state.lock().await.cached.is_none(),
+            "a failed connect caches nothing"
+        );
     }
 
     #[tokio::test]

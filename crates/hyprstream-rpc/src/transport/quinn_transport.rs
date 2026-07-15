@@ -19,15 +19,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+#[cfg(test)]
+use anyhow::Context;
+use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::transport::rpc_session::{
-    DEFAULT_STREAM_LIMIT, IrohRequestProcessor, RpcPendingStream, RpcPublishStub,
-    SessionRpcTransport, serve_rpc_connection,
+    serve_rpc_connection, IrohRequestProcessor, RpcPendingStream, RpcPublishStub,
+    SessionRpcTransport, DEFAULT_STREAM_LIMIT,
 };
 use crate::transport_traits::Transport;
 
@@ -104,6 +106,9 @@ pub struct QuinnRpcServer {
     connection_limit: Arc<Semaphore>,
     /// Per-stream request-read timeout (#159 slowloris bound).
     read_timeout: Duration,
+    /// Accept-boundary carrier classification. Production is always
+    /// WebTransport; unit tests may use inproc for raw transport-only probes.
+    carrier: crate::transport::carrier::CarrierContext,
     /// Optional moq streaming-plane consumer (#274). When set, sessions whose
     /// WebTransport CONNECT URL path is [`crate::dial::MOQ_PATH`] are handed to
     /// `moq_net::Server::accept` instead of the RPC core. `None` = RPC only.
@@ -136,7 +141,12 @@ impl QuinnRpcServer {
         processor: P,
         signing_key: SigningKey,
     ) -> Self {
-        Self::with_capacity(server, Arc::new(processor), signing_key, DEFAULT_STREAM_LIMIT)
+        Self::with_capacity(
+            server,
+            Arc::new(processor),
+            signing_key,
+            DEFAULT_STREAM_LIMIT,
+        )
     }
 
     /// Build a server with an explicit server-wide concurrent-stream cap.
@@ -156,6 +166,7 @@ impl QuinnRpcServer {
                 super::rpc_session::DEFAULT_CONNECTION_LIMIT,
             )),
             read_timeout: super::rpc_session::REQUEST_READ_TIMEOUT,
+            carrier: crate::transport::carrier::CarrierContext::web_transport(),
             moq_consumer: None,
             moq_relay_origin: None,
             moq_authz: crate::transport::iroh_moq::MoqAuthzConfig::default(),
@@ -175,6 +186,12 @@ impl QuinnRpcServer {
     /// over a per-connection iroh ALPN — here the multiplex is by URL path.
     pub fn with_moq_consumer(mut self, consumer: moq_net::OriginConsumer) -> Self {
         self.moq_consumer = Some(consumer);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_trusted_carrier(mut self) -> Self {
+        self.carrier = crate::transport::carrier::CarrierContext::inproc();
         self
     }
 
@@ -208,10 +225,7 @@ impl QuinnRpcServer {
     /// authorizer will deny *private* subscribes here (fail-closed) while public
     /// broadcasts stay open. Cross-tenant enumeration defense for authenticated
     /// peers lives on the iroh `moql` path.
-    pub fn with_moq_authz(
-        mut self,
-        authz: crate::transport::iroh_moq::MoqAuthzConfig,
-    ) -> Self {
+    pub fn with_moq_authz(mut self, authz: crate::transport::iroh_moq::MoqAuthzConfig) -> Self {
         self.moq_authz = authz;
         self
     }
@@ -356,6 +370,7 @@ impl QuinnRpcServer {
                     let moq_relay_origin = self.moq_relay_origin.clone();
                     let moq_authz = self.moq_authz.clone();
                     let ninep_handler = self.ninep_handler.clone();
+                    let carrier = self.carrier;
                     tokio::spawn(async move {
                         let _conn_permit = conn_permit; // released when this connection ends
                         // Multiplex by WebTransport CONNECT URL path (#274, H1b): read
@@ -548,7 +563,7 @@ impl QuinnRpcServer {
                             stream_limit,
                             read_timeout,
                             shutdown,
-                            crate::transport::carrier::CarrierContext::web_transport(),
+                            carrier,
                         )
                         .await
                         {
@@ -606,10 +621,7 @@ impl Transport for QuinnTransport {
 /// Build a quinn WebTransport client session against a server with a CA-issued
 /// certificate, validated via the system root store and the DNS `server_name`
 /// (`QuicServerAuth::web_pki`). Dials `https://{server_name}:{port}/`.
-pub async fn connect_webpki(
-    server_name: &str,
-    port: u16,
-) -> Result<web_transport_quinn::Session> {
+pub async fn connect_webpki(server_name: &str, port: u16) -> Result<web_transport_quinn::Session> {
     let client = web_transport_quinn::ClientBuilder::new()
         .with_system_roots()
         .map_err(|e| anyhow!("quinn client (system roots): {e}"))?;
@@ -634,8 +646,8 @@ pub async fn connect_pinned_hashes(
     let client = web_transport_quinn::ClientBuilder::new()
         .with_server_certificate_hashes(hashes)
         .map_err(|e| anyhow!("quinn client build: {e}"))?;
-    let url = url::Url::parse(&format!("https://{addr}/"))
-        .map_err(|e| anyhow!("quinn url: {e}"))?;
+    let url =
+        url::Url::parse(&format!("https://{addr}/")).map_err(|e| anyhow!("quinn url: {e}"))?;
     client
         .connect(url)
         .await
@@ -684,8 +696,8 @@ pub async fn connect_pinned_hashes_path(
     let client = web_transport_quinn::ClientBuilder::new()
         .with_server_certificate_hashes(hashes)
         .map_err(|e| anyhow!("quinn client build: {e}"))?;
-    let url = url::Url::parse(&format!("https://{addr}{path}"))
-        .map_err(|e| anyhow!("quinn url: {e}"))?;
+    let url =
+        url::Url::parse(&format!("https://{addr}{path}")).map_err(|e| anyhow!("quinn url: {e}"))?;
     client
         .connect(url)
         .await
@@ -783,7 +795,8 @@ mod tests {
         });
 
         let (server, addr, cert_der) = build_server()?;
-        let rpc_server = QuinnRpcServer::new(server, processor, fresh_signing_key());
+        let rpc_server =
+            QuinnRpcServer::new(server, processor, fresh_signing_key()).with_test_trusted_carrier();
         let shutdown = rpc_server.shutdown_token();
         let server_task = tokio::spawn(rpc_server.run());
 
@@ -804,10 +817,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn verify_peer_cert_pinned_accepts_right_rejects_wrong() -> Result<()> {
         crate::transport::pq_provider::install_pq_crypto_provider();
-        let processor =
-            crate::transport::rpc_session::from_fn(|req: Bytes| async move { Ok(req) });
+        let processor = crate::transport::rpc_session::from_fn(|req: Bytes| async move { Ok(req) });
         let (server, addr, cert_der) = build_server()?;
-        let rpc_server = QuinnRpcServer::new(server, processor, fresh_signing_key());
+        let rpc_server =
+            QuinnRpcServer::new(server, processor, fresh_signing_key()).with_test_trusted_carrier();
         let shutdown = rpc_server.shutdown_token();
         let server_task = tokio::spawn(rpc_server.run());
 
@@ -815,9 +828,18 @@ mod tests {
         let mut right = [0u8; 32];
         right.copy_from_slice(&sha256(&cert_der));
 
-        assert!(verify_peer_cert_pinned(&session, &[right]).is_ok(), "matching leaf hash must pass");
-        assert!(verify_peer_cert_pinned(&session, &[[0u8; 32]]).is_err(), "wrong hash must reject");
-        assert!(verify_peer_cert_pinned(&session, &[]).is_err(), "empty pin set must reject (fail-closed)");
+        assert!(
+            verify_peer_cert_pinned(&session, &[right]).is_ok(),
+            "matching leaf hash must pass"
+        );
+        assert!(
+            verify_peer_cert_pinned(&session, &[[0u8; 32]]).is_err(),
+            "wrong hash must reject"
+        );
+        assert!(
+            verify_peer_cert_pinned(&session, &[]).is_err(),
+            "empty pin set must reject (fail-closed)"
+        );
 
         shutdown.cancel();
         let _ = server_task.await;
@@ -830,12 +852,12 @@ mod tests {
     async fn quinn_connection_cap_rejects_excess() -> Result<()> {
         crate::transport::pq_provider::install_pq_crypto_provider();
 
-        let processor =
-            crate::transport::rpc_session::from_fn(|req: Bytes| async move { Ok(req) });
+        let processor = crate::transport::rpc_session::from_fn(|req: Bytes| async move { Ok(req) });
 
         let (server, addr, cert_der) = build_server()?;
-        let rpc_server =
-            QuinnRpcServer::new(server, processor, fresh_signing_key()).with_connection_limit(1);
+        let rpc_server = QuinnRpcServer::new(server, processor, fresh_signing_key())
+            .with_test_trusted_carrier()
+            .with_connection_limit(1);
         let shutdown = rpc_server.shutdown_token();
         let server_task = tokio::spawn(rpc_server.run());
 
@@ -891,7 +913,8 @@ mod tests {
         });
 
         let (server, addr, cert_der) = build_server()?;
-        let rpc_server = QuinnRpcServer::new(server, processor, fresh_signing_key());
+        let rpc_server =
+            QuinnRpcServer::new(server, processor, fresh_signing_key()).with_test_trusted_carrier();
         // Grab the shared drain handles before `run()` consumes the server.
         let stream_limit = rpc_server.stream_limit();
         let capacity = rpc_server.capacity();
@@ -909,7 +932,9 @@ mod tests {
 
         // Synchronise: wait until the processor has entered the sleep, then
         // drain-shutdown. No wall-clock guesses.
-        entered.notified().await;
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .context("processor was never entered before shutdown")?;
         QuinnRpcServer::shutdown(&stream_limit, capacity, &token).await;
 
         // The in-flight request must still complete with its real response.

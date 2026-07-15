@@ -3,13 +3,14 @@
 //! Proves `service::dispatch::process_request` — the shared envelope-verify →
 //! claims → handler pipeline — refuses a cleartext request envelope on an
 //! untrusted carrier **before** the application handler runs, while an
-//! encrypted (`#mesh-kem`) request on the same carrier and a cleartext request
-//! on an explicitly trusted local carrier both dispatch normally.
+//! encrypted (`#mesh-kem`) request on the same carrier dispatches normally.
+//! Trusted-local cleartext is covered through the actual inproc/UDS transport
+//! tests because trusted contexts are intentionally not publicly mintable.
 //!
 //! The carrier context is a required parameter supplied by the accept
 //! boundary; nothing inside the request bytes participates in the decision,
-//! which these tests demonstrate by sending byte-identical envelopes under
-//! different carrier classifications.
+//! which these tests demonstrate across all publicly constructible untrusted
+//! carrier classifications.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -60,7 +61,11 @@ fn keys() -> &'static Keys {
             pq_store: Some(Arc::new(store)),
         });
 
-        Keys { client_sk, client_pq, server_sk }
+        Keys {
+            client_sk,
+            client_pq,
+            server_sk,
+        }
     })
 }
 
@@ -163,20 +168,19 @@ async fn cleartext_on_untrusted_carrier_rejected_before_handler() {
     let (service, invoked) = SentinelService::new(k.server_sk.clone());
     let nonce_cache = envelope::InMemoryNonceCache::new();
 
-    let signed = SignedEnvelope::new_signed_hybrid(
-        request_envelope(b"sensitive-cleartext"),
-        &k.client_sk,
-        &k.client_pq,
-    );
-    let wire = to_wire(&signed);
-
     for carrier in [
         CarrierContext::iroh(),
         CarrierContext::quic(),
         CarrierContext::web_transport(),
         CarrierContext::untrusted_unknown(),
     ] {
-        let response_bytes = process_request(
+        let signed = SignedEnvelope::new_signed_hybrid(
+            request_envelope(b"sensitive-cleartext"),
+            &k.client_sk,
+            &k.client_pq,
+        );
+        let wire = to_wire(&signed);
+        let result = process_request(
             &wire,
             &service,
             EnvelopeVerification::AnySigner,
@@ -184,53 +188,14 @@ async fn cleartext_on_untrusted_carrier_rejected_before_handler() {
             &nonce_cache,
             carrier,
         )
-        .await
-        .expect("rejection is a signed error response, not a wire error");
+        .await;
 
-        let response = decode_response(&response_bytes);
-        assert_eq!(response.request_id, 0, "rejected before envelope processing");
-        let text = String::from_utf8_lossy(&response.payload);
-        assert!(
-            text.contains("cleartext"),
-            "error must state the cleartext rejection, got: {text}"
-        );
+        assert!(result.is_err(), "cleartext must be silently rejected");
         assert!(
             !invoked.load(Ordering::SeqCst),
             "handler must never run for cleartext on carrier '{carrier}'"
         );
     }
-}
-
-/// The same bytes that every untrusted carrier rejects dispatch normally on
-/// an explicitly trusted local carrier — proving the decision comes from the
-/// accept boundary's context, not from anything in the request.
-#[tokio::test]
-async fn cleartext_on_trusted_local_carrier_dispatches() {
-    let k = keys();
-    let (service, invoked) = SentinelService::new(k.server_sk.clone());
-    let nonce_cache = envelope::InMemoryNonceCache::new();
-
-    let signed = SignedEnvelope::new_signed_hybrid(
-        request_envelope(b"local-cleartext"),
-        &k.client_sk,
-        &k.client_pq,
-    );
-
-    let response_bytes = process_request(
-        &to_wire(&signed),
-        &service,
-        EnvelopeVerification::AnySigner,
-        &k.server_sk,
-        &nonce_cache,
-        CarrierContext::explicit_trusted_local(),
-    )
-    .await
-    .unwrap();
-
-    let response = decode_response(&response_bytes);
-    assert!(invoked.load(Ordering::SeqCst), "trusted-local cleartext must dispatch");
-    assert_eq!(response.request_id, 7);
-    assert_eq!(response.payload, b"local-cleartext");
 }
 
 /// An encrypted (`#mesh-kem`) hybrid-signed request on an untrusted carrier
@@ -263,7 +228,10 @@ async fn encrypted_on_untrusted_carrier_dispatches() {
     .unwrap();
 
     let response = decode_response(&response_bytes);
-    assert!(invoked.load(Ordering::SeqCst), "encrypted request must dispatch");
+    assert!(
+        invoked.load(Ordering::SeqCst),
+        "encrypted request must dispatch"
+    );
     assert_eq!(response.request_id, 7);
     assert_eq!(response.payload, b"sealed-payload");
 }
@@ -276,7 +244,7 @@ async fn garbage_on_untrusted_carrier_rejected_before_handler() {
     let (service, invoked) = SentinelService::new(k.server_sk.clone());
     let nonce_cache = envelope::InMemoryNonceCache::new();
 
-    let response_bytes = process_request(
+    let result = process_request(
         b"not-a-capnp-message",
         &service,
         EnvelopeVerification::AnySigner,
@@ -284,10 +252,14 @@ async fn garbage_on_untrusted_carrier_rejected_before_handler() {
         &nonce_cache,
         CarrierContext::iroh(),
     )
-    .await
-    .unwrap();
+    .await;
 
-    let response = decode_response(&response_bytes);
-    assert_eq!(response.request_id, 0);
-    assert!(!invoked.load(Ordering::SeqCst), "garbage must never dispatch");
+    assert!(
+        result.is_err(),
+        "garbage must be dropped without a signed response"
+    );
+    assert!(
+        !invoked.load(Ordering::SeqCst),
+        "garbage must never dispatch"
+    );
 }
