@@ -8,20 +8,20 @@
 //! # The shared client endpoint
 //!
 //! Unlike quinn (where `connect_pinned_sha256` builds its own one-shot client),
-//! iroh dials from a long-lived [`iroh::Endpoint`] that holds the node's
-//! identity and bound sockets. There is exactly one client endpoint per
+//! iroh dials from a long-lived [`iroh::Endpoint`] that holds its transport
+//! secret and bound sockets. There is exactly one client endpoint per
 //! process; it is installed once at startup via
 //! [`install_iroh_client_endpoint`] (the daemon provisions it during bootstrap),
 //! the same install-once pattern as the inproc registry and the envelope verify
 //! config. Until it is installed, the iroh dial arm errors loudly rather than
 //! silently falling back.
 //!
-//! # Identity
+//! # Target integrity
 //!
 //! iroh binds the connection to the peer's `EndpointId` (its Ed25519 public
-//! key), so the transport authenticates the peer **identity** — stronger than
-//! quinn's channel-only cert pin, and it closes the transport half of the
-//! cert↔identity gap (#185) for this dial.
+//! key), proving the dial reached the configured carrier address. This is path
+//! integrity only. It does not authenticate a DID, admission subject, assurance
+//! level, response key, or authorization identity (#1031).
 //!
 //! Re-dial/self-heal semantics match `LazyQuinnTransport`: a per-request timeout
 //! keeps the session; a transport-fatal error drops it so the next call
@@ -57,7 +57,7 @@ static IROH_CLIENT_ENDPOINT: OnceLock<iroh::Endpoint> = OnceLock::new();
 ///
 /// The daemon calls this once during bootstrap with the shared endpoint (the
 /// same one its inbound iroh substrate listens on, so outbound dials reuse the
-/// node identity).
+/// transport sockets and address).
 pub fn install_iroh_client_endpoint(endpoint: iroh::Endpoint) -> Result<(), iroh::Endpoint> {
     IROH_CLIENT_ENDPOINT.set(endpoint)
 }

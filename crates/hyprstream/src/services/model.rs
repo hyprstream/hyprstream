@@ -2101,7 +2101,8 @@ mod tests {
 
     /// #320: a networked (Iroh) inference reach maps to exactly ONE wire arm —
     /// the seam the router single-selects an Iroh reach from when no co-located
-    /// fast path is present. Identity (nodeId) is preserved (real identity bind).
+    /// fast path is present. The carrier target (`nodeId`) is preserved only for
+    /// routing; it does not grant an application role.
     #[test]
     fn model_reach_networked_iroh_single_select() {
         let node_id = [0xEEu8; 32];

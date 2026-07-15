@@ -289,43 +289,26 @@ async fn oauth_self_protected_resource_metadata(
 /// (separate thread), and ZMQ async I/O (TMQ) registers socket file descriptors
 /// with the current runtime's epoll. A PolicyClient created in the main runtime
 /// would hang when polled from the OAuth runtime.
-/// #282: build the OAuth service's canonical federation iroh substrate.
+/// Build the OAuth service's reach-only iroh endpoint.
 ///
-/// Serves BOTH ALPNs (`hyprstream-rpc/1` via `processor`, `moql` via the
-/// process-global moq origin) on a single iroh endpoint whose node key is the
-/// OAuth signing key. That implementation reuse does not make the NodeId an
-/// OAuth/DID trust anchor (#1031). Installs the shared client endpoint for outbound
-/// iroh dials. Native-only.
+/// Both inbound ALPNs are refused until #1027/#726 supplies independently
+/// verified application/session proof. In particular, the local user-CRUD
+/// handler is never installed behind `AnySigner`, and anonymous MoQ peers never
+/// receive the process-global origin. The endpoint remains usable as the shared
+/// outbound dialer. Native-only.
 async fn build_oauth_iroh_substrate(
-    signing_key: hyprstream_rpc::prelude::SigningKey,
-    processor: Arc<dyn hyprstream_rpc::transport::rpc_session::IrohRequestProcessor>,
+    transport_secret: [u8; 32],
 ) -> anyhow::Result<hyprstream_rpc::transport::iroh_substrate::IrohSubstrate> {
-    use hyprstream_rpc::transport::{iroh_moq, iroh_rpc, iroh_substrate, lazy_iroh, rpc_session};
-
-    // moq plane: reuse the SAME global origin the quinn `/moq` path serves.
-    let moq_handler = match hyprstream_rpc::moq_stream::global_moq_origin() {
-        Some(origin) => iroh_moq::IrohMoqProtocolHandler::with_origin(
-            iroh_moq::OriginShared::from_pair(origin.producer().clone(), origin.consumer().clone()),
-        ),
-        None => iroh_moq::IrohMoqProtocolHandler::new(),
-    };
-
-    let rpc_handler = iroh_rpc::IrohRpcProtocolHandler::with_stream_limit(
-        processor,
-        signing_key.clone(),
-        rpc_session::DEFAULT_STREAM_LIMIT,
-    );
+    use hyprstream_rpc::transport::iroh_substrate::{IrohSubstrate, RefuseHandler};
 
     // `presets::N0` discovery (pkarr publisher + n0 DNS) is enabled by
-    // `IrohSubstrate::new`, so this node is dial-by-node_id-discoverable (#282).
-    let substrate = iroh_substrate::IrohSubstrate::new(
-        signing_key.to_bytes(),
-        moq_handler,
-        rpc_handler,
+    // `IrohSubstrate::new`; that reach state grants no inbound authority.
+    IrohSubstrate::new(
+        transport_secret,
+        RefuseHandler::new("OAuth MoQ disabled pending verified session proof (#1027/#726)"),
+        RefuseHandler::new("OAuth RPC disabled pending verified application proof (#1027)"),
     )
-    .await?;
-    let _ = lazy_iroh::install_iroh_client_endpoint(substrate.endpoint().clone());
-    Ok(substrate)
+    .await
 }
 
 pub struct OAuthService {
@@ -762,21 +745,9 @@ impl Spawnable for OAuthService {
                         }
                     }
 
-                    // #282/#1031: advertise an IrohTransport entry only
-                    // when iroh is enabled. The iroh substrate the spawner binds
-                    // for THIS service uses `RequestService::signing_key` as its
-                    // node key, and that same key is `oauth_state.signing_key`
-                    // (set above via `with_signing_key`), so the published
-                    // `node_id` (== signing_key.verifying_key()) is exactly the
-                    // endpoint id this service's iroh substrate listens on — no
-                    // drift. Relays are left empty: peers resolve reachability by
-                    // node_id via iroh's built-in pkarr/DNS discovery (#282).
-                    if quic_cfg.iroh {
-                        if let Some(ref sk) = oauth_state.signing_key {
-                            let node_id = sk.verifying_key().to_bytes();
-                            oauth_state = oauth_state.with_iroh_transport(node_id, Vec::new());
-                        }
-                    }
+                    // OAuth's iroh inbound ALPNs are deliberately refused until
+                    // fresh application/session proof exists (#1027/#726), so do
+                    // not advertise them as an available DID service.
                 }
             }
 
@@ -830,9 +801,8 @@ impl Spawnable for OAuthService {
             let control_transport = self.control_transport.clone();
             let rpc_signing_key = self.signing_key.clone();
             let rpc_state = state.clone();
-            // #282: bind the node's canonical federation iroh substrate for the
-            // OAuth (DID controller) identity when `[quic] iroh = true`. The node
-            // NodeId is advertised strictly as transport reach.
+            // Bind OAuth's domain-separated outbound iroh carrier when enabled.
+            // Its refused inbound ALPNs are not advertised in the DID document.
             let iroh_enabled = self.quic_config.as_ref().is_some_and(|q| q.enabled && q.iroh);
             let serve_shutdown = Arc::new(Notify::new());
             let serve_shutdown_task = Arc::clone(&serve_shutdown);
@@ -857,15 +827,20 @@ impl Spawnable for OAuthService {
                 let processor: Arc<dyn hyprstream_rpc::transport::rpc_session::IrohRequestProcessor> =
                     Arc::new(bridge);
 
-                // #282: parallel iroh substrate (RPC + moq ALPNs) for federation.
+                // Reach-only iroh endpoint. Both inbound ALPNs refuse before the
+                // OAuth user-CRUD bridge or global MoQ origin can be reached.
                 let _iroh_substrate = if iroh_enabled {
-                    match build_oauth_iroh_substrate(
-                        rpc_signing_key.clone(),
-                        Arc::clone(&processor),
-                    )
-                    .await
-                    {
-                        Ok(substrate) => Some(substrate),
+                    let transport_key = hyprstream_rpc::node_identity::derive_purpose_key(
+                        &rpc_signing_key,
+                        "hyprstream-iroh-transport-v1",
+                    );
+                    match build_oauth_iroh_substrate(transport_key.to_bytes()).await {
+                        Ok(substrate) => {
+                            let _ = hyprstream_rpc::transport::lazy_iroh::install_iroh_client_endpoint(
+                                substrate.endpoint().clone(),
+                            );
+                            Some(substrate)
+                        }
                         Err(e) => {
                             tracing::warn!(
                                 "OAuth iroh substrate bind failed; continuing without iroh: {e}"
@@ -955,6 +930,84 @@ pub fn protected_resource_metadata(
 mod tests {
     use super::registration::validate_redirect_uri;
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oauth_iroh_refuses_arbitrary_rpc_and_anonymous_moq_before_dispatch(
+    ) -> anyhow::Result<()> {
+        use hyprstream_rpc::transport::iroh_substrate::{
+            ALPN_HYPRSTREAM_RPC, ALPN_MOQ_LITE, IrohSubstrate, NoopHandler,
+        };
+        use hyprstream_rpc::envelope::{RequestEnvelope, SignedEnvelope};
+        use hyprstream_rpc::ToCapnp as _;
+        use iroh::{EndpointAddr, TransportAddr};
+        use moq_net::Client;
+
+        let oauth_signer = hyprstream_rpc::prelude::SigningKey::generate(&mut rand::rngs::OsRng);
+        let transport_key = hyprstream_rpc::node_identity::derive_purpose_key(
+            &oauth_signer,
+            "hyprstream-iroh-transport-v1",
+        );
+        let server = build_oauth_iroh_substrate(transport_key.to_bytes()).await?;
+        assert_ne!(
+            server.endpoint_id().as_bytes(),
+            oauth_signer.verifying_key().as_bytes(),
+            "transport address must be domain-separated from the OAuth identity key"
+        );
+        let addr = EndpointAddr::from_parts(
+            server.endpoint_id(),
+            server
+                .endpoint()
+                .bound_sockets()
+                .into_iter()
+                .map(TransportAddr::Ip),
+        );
+        let client_key = hyprstream_rpc::prelude::SigningKey::generate(&mut rand::rngs::OsRng);
+        let client = IrohSubstrate::new(
+            client_key.to_bytes(),
+            NoopHandler::new("client moq"),
+            NoopHandler::new("client rpc"),
+        )
+        .await?;
+
+        // A valid envelope signed by an arbitrary, unenrolled key never reaches
+        // OAuthRpcHandler: the
+        // ALPN closes before any request processor/user CRUD dispatch exists.
+        let signed_crud = SignedEnvelope::new_signed(
+            RequestEnvelope::anonymous(b"oauth-user-crud".to_vec()),
+            &client_key,
+        );
+        let mut message = capnp::message::Builder::new_default();
+        signed_crud.write_to(
+            &mut message.init_root::<hyprstream_rpc::common_capnp::signed_envelope::Builder>(),
+        );
+        let mut signed_crud_bytes = Vec::new();
+        capnp::serialize::write_message(&mut signed_crud_bytes, &message)?;
+        let rpc = client.connect(addr.clone(), ALPN_HYPRSTREAM_RPC).await?;
+        if let Ok((mut send, mut recv)) = rpc.open_bi().await {
+            let _ = send.write_all(&signed_crud_bytes).await;
+            let _ = send.finish();
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                recv.read_to_end(1024),
+            )
+            .await;
+            assert!(
+                !matches!(response, Ok(Ok(ref bytes)) if !bytes.is_empty()),
+                "refused OAuth RPC ALPN must not produce a user-CRUD response"
+            );
+        }
+
+        let moq = client.connect(addr, ALPN_MOQ_LITE).await?;
+        let session = web_transport_iroh::Session::raw(moq);
+        assert!(
+            Client::new().connect(session).await.is_err(),
+            "anonymous OAuth MoQ carrier must not obtain publish/subscribe access"
+        );
+
+        client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
 
     #[test]
     fn test_protected_resource_metadata() {

@@ -23,10 +23,13 @@ identity.
 - `hyprstream-rpc/src/iroh_peer.rs` and
   `hyprstream-rpc-std/src/iroh_exports.rs`: wasm exposes endpoint bytes/z-base32
   and pkarr reach lookup. NodeId-to-`did:key` conversion APIs were removed.
-- `hyprstream-service/src/service/spawner/service.rs` and
-  `hyprstream/src/services/oauth/{state,mod,did_document}.rs`: derive/bind and
-  advertise the local iroh address. The DID document carries it only in an
-  `IrohTransport` service entry, never a verification method or JWKS entry.
+- `hyprstream-service/src/service/spawner/service.rs` derives/binds and advertises
+  a service's local iroh address. Transport secrets are domain-separated from
+  application signing keys.
+- `hyprstream/src/services/oauth/{state,mod,did_document}.rs` retains a typed
+  reach-only `IrohTransport` representation, never a verification method or JWKS
+  entry. The OAuth service does not currently publish that representation because
+  both inbound ALPNs are refused.
 
 ## Retained liveness and routing hints
 
@@ -45,8 +48,33 @@ identity.
   `EndpointId`. This may reject a wrong route, but it cannot grant or alter
   identity assurance.
 - `Connection::remote_id()` is not consumed by RPC admission, federation, or
-  MoQ tenant authorization. MoQ supplies `PeerIdentity::anonymous()` until
-  #1027 provides fresh inside-carrier proof against accepted current state.
+  MoQ tenant authorization. Iroh MoQ refuses anonymous connections before
+  origin/consumer construction or tenant resolution until #1027 provides fresh
+  inside-carrier proof against accepted current state.
+
+## Enforced network and local boundaries
+
+- OAuth binds refusing handlers for both iroh RPC and `moql`; no remote frame is
+  handed to `OAuthRpcHandler`, and no anonymous MoQ peer can publish, subscribe,
+  or obtain a tenant scope.
+- `OAuthRpcHandler` separately permits only a local caller or a verified
+  `system`/`service:*` subject. This preserves authenticated local UDS control
+  without making `AnySigner` or anonymous fallback an authorization grant.
+- Iroh RPC response verification requires an independently resolved application
+  response key. Mutating the carrier NodeId to equal or differ from that key does
+  not select, replace, or alter it.
+- Relay admission in `moq_stream.rs` is named and documented as target/path
+  pinning. EndpointId equality can reject target substitution but grants no relay
+  role or application identity.
+
+## Lifecycle and regression evidence
+
+- Production owns the install-once outbound iroh endpoint. Unit carrier tests use
+  explicit runtime-owned endpoints and shut them down; they never install a
+  runtime-bound endpoint into the process global.
+- The loopback refusal sentinel asserts the global is empty before and after its
+  real carrier exchange. This prevents test ordering from leaking an endpoint
+  whose runtime has already exited.
 
 ## Removed authority surfaces
 

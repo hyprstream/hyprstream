@@ -993,8 +993,8 @@ pub struct QuicLoopConfig {
     pub iroh_enabled: bool,
     /// #282: callback invoked after the iroh substrate binds, with
     /// (service_name, node_id) where `node_id` is the endpoint's 32-byte Ed25519
-    /// public key. Used to advertise the `#iroh` VM + `IrohTransport` service
-    /// entry in the DID document only when iroh is actually bound.
+    /// public carrier address. Used to advertise only an `IrohTransport` service
+    /// entry when bound; it must never become a verification method.
     #[cfg(not(target_arch = "wasm32"))]
     pub on_iroh_bound: Option<Box<dyn FnOnce(String, [u8; 32]) + Send>>,
     /// #358: the producer-chosen moq RELAY this node rendezvouses through, in

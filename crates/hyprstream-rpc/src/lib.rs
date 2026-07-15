@@ -173,8 +173,8 @@ pub mod service_entry;
 // Shared `did:key` (Ed25519) codec — now the single canonical home in the light
 // `hyprstream-crypto` crate (#916). Re-exported so existing `crate::did_key::…`
 // and external `hyprstream_rpc::did_key::…` paths keep compiling unchanged; the
-// native `did_web` resolver and the wasm32 `iroh_peer` identity helpers share
-// this one implementation (#475).
+// native `did_web` resolver and explicit DID consumers share this implementation.
+// wasm iroh reach APIs do not convert NodeId to or from `did:key` (#1031).
 pub use hyprstream_crypto::did_key;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod did_web;
@@ -204,9 +204,8 @@ pub mod web_transport;
 // native `dial()` (which is itself `#[cfg(not(target_arch = "wasm32"))]`).
 #[cfg(target_arch = "wasm32")]
 pub mod dial_wasm;
-// Phase 2: iroh peer identity + pkarr helpers for wasm32. Adds iroh as a
-// first-class wasm32 dep — browser gets own NodeId, did:key conversion,
-// and native pkarr lookup. Full dial_iroh_reach() is Phase 3.
+// Iroh carrier reach + pkarr helpers for wasm32. NodeId is exposed only as an
+// endpoint address/diagnostic; no DID or application-identity conversion exists.
 #[cfg(target_arch = "wasm32")]
 pub mod iroh_peer;
 

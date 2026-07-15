@@ -17,12 +17,12 @@
 //!    `hyprstream-rpc` crate has no `PolicyService` client, so the live decision
 //!    is injected). The gate calls it unchanged.
 //!
-//! 2. **Key binding** — does the peer's authenticated channel key (the raw
-//!    Ed25519 public key it proved possession of when establishing the session /
-//!    signing its envelopes) bind to the peer's DID? Two DID-method paths:
+//! 2. **Key binding** — does the independently verified application-envelope
+//!    signer key bind to the peer's DID? Carrier keys are never accepted here.
+//!    Two DID-method paths:
 //!
 //!    - **`did:web`** — match the key against a `verificationMethod` in the
-//!      peer's *resolved* DID document (the `#mesh` / `#iroh` Ed25519 VM), OR an
+//!      peer's *resolved* DID document (for example `#mesh`), OR an
 //!      Ed25519 key in a federation JWKS the caller supplies. The DID document is
 //!      resolved via the [`crate::did_web::DidWebResolver`] landed in #279 (no new
 //!      fetch/cache infra); the VM extraction is
@@ -31,9 +31,8 @@
 //!      the Ed25519 key *is* the identity (`did:key:z6Mk…` =
 //!      `multibase(0xed01 ‖ pubkey)`). There is **no document to resolve and no
 //!      network fetch**; the gate decodes the key from the DID
-//!      ([`crate::did_web::did_key_to_ed25519`]) and admits iff the peer's channel
-//!      key equals it. Reach for such a peer comes from iroh discovery (#282), not
-//!      the DID string.
+//!      ([`crate::did_web::did_key_to_ed25519`]) and admits iff the application
+//!      signer key equals it. Reach is resolved separately, never from this DID.
 //!
 //! Either stage failing — or any resolution / I/O error — rejects (§4.4
 //! fail-closed). A successful run yields an [`AdmittedIdentity`] binding the
@@ -43,15 +42,11 @@
 //!
 //! Stage 2's *logic* (resolve DID doc → extract VM keys → constant-time-ish
 //! membership match, with JWKS fallback) is fully implemented and unit-tested
-//! here against fixtures. The *live peer-key extraction at the transport accept
-//! path* is the integration seam: see the module-level note in
-//! [`PeerChannelKey`]. On the WebTransport/QUIC server accept path the client's
-//! raw Ed25519 is **not** available today (no mTLS client-cert verifier; RFC 7250
-//! raw-public-key binding is #200, not wired; iroh's live `node_id` is #282,
-//! pending). The accept path can wire stage 1 (origin) immediately and feed
-//! stage 2 the app-layer signed-envelope signer key (the architectural identity
-//! root per `transport::QuicServerAuth` docs) once that key is surfaced to the
-//! gate. Until then the live wiring carries a `TODO(#200/#185/#282)`.
+//! here against fixtures. Live callers must feed stage 2 only the signer key from
+//! a verified application envelope. A NodeId, EndpointId, TLS certificate key,
+//! endpoint field, or caller assertion is not an [`ApplicationSignerKey`]. If a
+//! network path has no verified application proof, it must not invoke this gate
+//! as though carrier establishment supplied one.
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -76,9 +71,9 @@ fn is_did_at9p(did: &str) -> bool {
 
 /// Inputs for the `did:at9p` admission arm (D2/#894).
 ///
-/// Parallel to the `is_did_key` arm, but a `did:at9p` peer upgrades its classical
-/// channel key to a hybrid-PQC anchor, so the arm additionally needs:
-/// - the **capsule bytes** the peer presented over the channel,
+/// Parallel to the `is_did_key` arm, but a `did:at9p` proof upgrades a verified
+/// application signer to a hybrid-PQC anchor, so the arm additionally needs:
+/// - the **capsule bytes** carried with the application proof,
 /// - a **GATE verifier** ([`At9pCapsuleResolver`]) that runs the A4
 ///   canon→hash→sig pipeline (#884) and returns the content-verified subject keys,
 /// - the **[`KeyedPqTrustStore`]** to bind those verified hybrid keys into — the
@@ -98,35 +93,31 @@ pub struct At9pAdmission<'a> {
     pub pq_store: &'a mut KeyedPqTrustStore,
 }
 
-/// The peer's authenticated channel key: the raw 32-byte Ed25519 public key the
-/// connecting peer proved possession of for this session.
+/// The raw Ed25519 signer key from independently verified application proof.
 ///
 /// # Where this comes from (integration seam)
 ///
-/// In this architecture peer *identity* is established at the **application
-/// layer** — every response is a signed COSE envelope verified against the
-/// peer's published keys (see [`crate::transport::QuicServerAuth`] docs). The
-/// authenticated key is therefore the envelope **signer key** (`cnf`, 32 bytes),
-/// which is the value to feed here. On transports where the channel itself binds
-/// the identity (iroh `node_id`; RFC 7250 raw-public-key QUIC, #200) that key is
-/// the same value and may be sourced from the channel instead.
+/// Peer identity is established at the application layer. The key here is the
+/// verified COSE envelope signer (`cnf`, 32 bytes) after the surrounding proof
+/// policy succeeds. It must never be sourced from iroh NodeId/EndpointId or any
+/// other carrier key, even when the bytes happen to be equal.
 ///
 /// This newtype keeps the gate honest about *which* bytes it is matching and
 /// makes the seam explicit at every call site.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct PeerChannelKey(pub [u8; 32]);
+pub struct ApplicationSignerKey(pub [u8; 32]);
 
-impl PeerChannelKey {
+impl ApplicationSignerKey {
     /// The raw 32-byte Ed25519 public key.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 }
 
-impl std::fmt::Debug for PeerChannelKey {
+impl std::fmt::Debug for ApplicationSignerKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Render a short fingerprint, not the full key, to keep logs tidy.
-        write!(f, "PeerChannelKey({:02x}{:02x}…)", self.0[0], self.0[1])
+        write!(f, "ApplicationSignerKey({:02x}{:02x}…)", self.0[0], self.0[1])
     }
 }
 
@@ -185,7 +176,7 @@ pub struct AdmittedIdentity {
 ///
 /// Transport-agnostic: construct it once with the origin-admission handle and a
 /// DID-doc resolver, then call [`admit`](FederationAdmissionGate::admit) from
-/// any transport accept path with the per-connection (origin, peer key, did,
+/// any transport accept path with the per-connection (origin, application signer key, did,
 /// optional federation JWKS).
 pub struct FederationAdmissionGate<O: OriginAdmission, R: DidDocResolve> {
     origin_admission: O,
@@ -202,8 +193,8 @@ impl<O: OriginAdmission, R: DidDocResolve> FederationAdmissionGate<O, R> {
     ///
     /// - `origin` — the peer's RFC 6454 origin (caller extracts it from the peer
     ///   DID / advertised issuer with `extract_origin`).
-    /// - `peer_key` — the peer's authenticated channel/envelope key (see
-    ///   [`PeerChannelKey`]).
+    /// - `application_signer_key` — the verified application-envelope signer key (see
+    ///   [`ApplicationSignerKey`]).
     /// - `did` — the peer's DID identifier for stage 2 (`did:web:…` resolved via
     ///   the DID-doc resolver, or `did:key:…` self-certifying / no fetch — #281).
     /// - `federation_jwks` — an optional already-resolved federation JWKS
@@ -212,11 +203,11 @@ impl<O: OriginAdmission, R: DidDocResolve> FederationAdmissionGate<O, R> {
     ///   the caller's JWKS cache; this module never fetches JWKS itself.
     ///
     /// Returns the [`AdmittedIdentity`] on success; `Err` (reject) if stage 1
-    /// denies, if DID resolution fails, or if no VM/JWKS key matches the peer key.
+    /// denies, if DID resolution fails, or if no VM/JWKS key matches the application signer key.
     pub async fn admit(
         &self,
         origin: &str,
-        peer_key: PeerChannelKey,
+        application_signer_key: ApplicationSignerKey,
         did: &str,
         federation_jwks: Option<&Value>,
     ) -> Result<AdmittedIdentity> {
@@ -229,12 +220,12 @@ impl<O: OriginAdmission, R: DidDocResolve> FederationAdmissionGate<O, R> {
             .map_err(|e| anyhow!("admission stage 1 (origin {origin}) denied: {e}"))?;
 
         // ── Stage 2: key binding (fail-closed) ────────────────────────────────
-        admit_key_against_did(&self.resolver, origin, peer_key, did, federation_jwks, None).await
+        admit_key_against_did(&self.resolver, origin, application_signer_key, did, federation_jwks, None).await
     }
 }
 
 /// Stage 2 core, factored out so it is independently unit-testable: bind the
-/// peer's authenticated channel key to its DID's published key material, and
+/// verified application signer key to its DID's published key material, and
 /// admit iff it matches.
 ///
 /// Two DID-method paths (chosen by the DID string):
@@ -243,18 +234,18 @@ impl<O: OriginAdmission, R: DidDocResolve> FederationAdmissionGate<O, R> {
 ///   identity. The key *is* the identity: `did:key:z6Mk…` is exactly
 ///   `multibase(0xed01 ‖ pubkey)`, so there is **no document to fetch and no
 ///   resolver call**. We decode the key directly ([`did_key_to_ed25519`]) and
-///   admit iff `peer_key` equals it. (Reach for such a peer comes from iroh
-///   discovery #282, not the DID string — out of scope here.)
+///   admit iff `application_signer_key` equals it. Reach is an independent resolver output.
 /// - **`did:at9p` (self-certifying hybrid-PQC, #894/D2)** — the capsule *is* the
 ///   hybrid key commitment: GATE-verify the peer-presented bytes
 ///   (canon→hash→sig, #884) via the supplied [`At9pCapsuleResolver`], admit iff
-///   the peer's channel key equals the capsule's Ed25519 subject key, and bind
+///   the verified application signer equals the capsule's Ed25519 subject key,
+///   and bind
 ///   the verified `ed25519 → ml_dsa_65` pair into the [`KeyedPqTrustStore`].
 ///   This is the classical→hybrid trust upgrade, populated from content-verified
 ///   material (no config trust). No resolver/fetch: the capsule is
 ///   self-certifying. Requires `at9p = Some(_)`; otherwise fail-closed.
 /// - **`did:web` (resolver fetch, #279/#137)** — resolve the peer DID document
-///   and admit iff `peer_key` matches one of its Ed25519 `verificationMethod`
+///   and admit iff `application_signer_key` matches one of its Ed25519 `verificationMethod`
 ///   keys, falling back to a supplied federation JWKS.
 ///
 /// Fail-closed: a parse error, a resolution error, an empty/absent VM set with no
@@ -262,29 +253,29 @@ impl<O: OriginAdmission, R: DidDocResolve> FederationAdmissionGate<O, R> {
 pub async fn admit_key_against_did<R: DidDocResolve>(
     resolver: &R,
     origin: &str,
-    peer_key: PeerChannelKey,
+    application_signer_key: ApplicationSignerKey,
     did: &str,
     federation_jwks: Option<&Value>,
     at9p: Option<At9pAdmission<'_>>,
 ) -> Result<AdmittedIdentity> {
     // ── did:key self-certifying arm (#281) ────────────────────────────────────
     // A did:key carries its own Ed25519 key — no DID-doc resolution / network
-    // fetch. The peer's authenticated channel key MUST equal the key the DID
+    // fetch. The verified application signer MUST equal the key the DID
     // encodes; any mismatch or parse error fails closed.
     if is_did_key(did) {
         let did_key = did_key_to_ed25519(did)
-            .map_err(|e| admission_reject(origin, peer_key, &format!("did:key {did} is invalid: {e}")))?;
-        if key_eq(&did_key, peer_key.as_bytes()) {
+            .map_err(|e| admission_reject(origin, application_signer_key, &format!("did:key {did} is invalid: {e}")))?;
+        if key_eq(&did_key, application_signer_key.as_bytes()) {
             return Ok(AdmittedIdentity {
                 origin: origin.to_owned(),
                 did: Some(did.to_owned()),
-                key: *peer_key.as_bytes(),
+                key: *application_signer_key.as_bytes(),
             });
         }
         return Err(admission_reject(
             origin,
-            peer_key,
-            &format!("peer key does not match the self-certifying did:key identity {did}"),
+            application_signer_key,
+            &format!("application signer key does not match the self-certifying did:key identity {did}"),
         ));
     }
 
@@ -298,22 +289,22 @@ pub async fn admit_key_against_did<R: DidDocResolve>(
         let ctx = at9p.ok_or_else(|| {
             admission_reject(
                 origin,
-                peer_key,
+                application_signer_key,
                 &format!("did:at9p {did} presented without a capsule/admission context — fail-closed"),
             )
         })?;
         let verified = ctx.gate.verify_bytes(did, ctx.capsule_bytes).map_err(|e| {
-            admission_reject(origin, peer_key, &format!("did:at9p {did} capsule GATE rejected: {e}"))
+            admission_reject(origin, application_signer_key, &format!("did:at9p {did} capsule GATE rejected: {e}"))
         })?;
-        // The capsule's Ed25519 subject key IS the identity; the peer's
-        // authenticated channel key must equal it (one trust root, #185 closed
-        // by construction for did:at9p).
-        if !key_eq(verified.ed25519(), peer_key.as_bytes()) {
+        // The capsule's Ed25519 subject key is genesis identity material; the
+        // separately verified application signer must equal it. This comparison
+        // says nothing about carrier reach or liveness.
+        if !key_eq(verified.ed25519(), application_signer_key.as_bytes()) {
             return Err(admission_reject(
                 origin,
-                peer_key,
+                application_signer_key,
                 &format!(
-                    "peer key does not match the did:at9p capsule Ed25519 subject key {did}"
+                    "application signer key does not match the did:at9p capsule Ed25519 subject key {did}"
                 ),
             ));
         }
@@ -323,44 +314,44 @@ pub async fn admit_key_against_did<R: DidDocResolve>(
         return Ok(AdmittedIdentity {
             origin: origin.to_owned(),
             did: Some(did.to_owned()),
-            key: *peer_key.as_bytes(),
+            key: *application_signer_key.as_bytes(),
         });
     }
 
     // ── did:web resolver arm (#279/#137) ──────────────────────────────────────
     // Resolve the peer's DID document. A resolution failure is fail-closed:
-    // without the published key material we cannot bind the channel key.
+    // without the published key material we cannot bind the application signer.
     let doc = resolver
         .resolve_doc(did)
         .await
-        .map_err(|e| admission_reject(origin, peer_key, &format!("DID {did} did not resolve: {e}")))?;
+        .map_err(|e| admission_reject(origin, application_signer_key, &format!("DID {did} did not resolve: {e}")))?;
 
     let vm_keys = verification_method_ed25519_keys(&doc);
-    if vm_keys.iter().any(|k| key_eq(k, peer_key.as_bytes())) {
+    if vm_keys.iter().any(|k| key_eq(k, application_signer_key.as_bytes())) {
         return Ok(AdmittedIdentity {
             origin: origin.to_owned(),
             did: Some(did.to_owned()),
-            key: *peer_key.as_bytes(),
+            key: *application_signer_key.as_bytes(),
         });
     }
 
     // Fallback: a federation-tagged JWKS the caller already resolved/cached.
     if let Some(jwks) = federation_jwks {
-        if jwks_ed25519_keys(jwks).iter().any(|k| key_eq(k, peer_key.as_bytes())) {
+        if jwks_ed25519_keys(jwks).iter().any(|k| key_eq(k, application_signer_key.as_bytes())) {
             return Ok(AdmittedIdentity {
                 origin: origin.to_owned(),
                 // Matched via JWKS, not a specific DID-doc VM.
                 did: None,
-                key: *peer_key.as_bytes(),
+                key: *application_signer_key.as_bytes(),
             });
         }
     }
 
     Err(admission_reject(
         origin,
-        peer_key,
+        application_signer_key,
         &format!(
-            "peer key does not match any Ed25519 verificationMethod in DID doc for {did}{}",
+            "application signer key does not match any Ed25519 verificationMethod in DID doc for {did}{}",
             if federation_jwks.is_some() { " (nor the federation JWKS)" } else { "" }
         ),
     ))
@@ -381,18 +372,16 @@ fn key_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 
 /// Build a uniform rejection error (also a single tracing point so denials are
 /// diagnosable without leaking the full key).
-fn admission_reject(origin: &str, key: PeerChannelKey, why: &str) -> anyhow::Error {
-    tracing::warn!(origin = %origin, peer_key = ?key, "federation admission stage 2 rejected: {why}");
+fn admission_reject(origin: &str, key: ApplicationSignerKey, why: &str) -> anyhow::Error {
+    tracing::warn!(origin = %origin, application_signer_key = ?key, "federation admission stage 2 rejected: {why}");
     anyhow!("admission stage 2 (origin {origin}) rejected: {why}")
 }
 
-/// Convenience: the rejection used when stage 2 is reached without a live peer
-/// key (the documented #200/#185/#282 seam). Callers on a transport that cannot
-/// yet surface the peer's authenticated Ed25519 MUST reject rather than admit.
-pub fn reject_no_peer_key(origin: &str) -> anyhow::Error {
+/// Convenience rejection for a network path lacking verified application proof.
+pub fn reject_no_application_signer_proof(origin: &str) -> anyhow::Error {
     anyhow!(
-        "admission stage 2 (origin {origin}): peer channel key not available at this accept path \
-         (RFC 7250 raw-public-key #200 / iroh node_id #282 not wired) — failing closed"
+        "admission stage 2 (origin {origin}): verified application signer proof is unavailable; \
+         carrier NodeId/EndpointId is not an admission key — failing closed"
     )
 }
 
@@ -532,11 +521,11 @@ mod tests {
     // ── Two-stage gate behavior ──────────────────────────────────────────────
 
     #[tokio::test]
-    async fn admits_when_peer_key_matches_did_vm() {
+    async fn admits_when_application_signer_key_matches_did_vm() {
         let key = random_ed25519();
         let gate = FederationAdmissionGate::new(AllowOrigin, FixtureDoc(did_doc_with_vm(&[key])));
         let admitted = gate
-            .admit(ORIGIN, PeerChannelKey(key), DID, None)
+            .admit(ORIGIN, ApplicationSignerKey(key), DID, None)
             .await
             .expect("matching VM must admit");
         assert_eq!(admitted.origin, ORIGIN);
@@ -545,13 +534,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_when_peer_key_mismatches_did_vm() {
+    async fn rejects_when_application_signer_key_mismatches_did_vm() {
         // Doc publishes a different key than the peer presents.
         let published = random_ed25519();
         let peer = random_ed25519();
         let gate = FederationAdmissionGate::new(AllowOrigin, FixtureDoc(did_doc_with_vm(&[published])));
         let err = gate
-            .admit(ORIGIN, PeerChannelKey(peer), DID, None)
+            .admit(ORIGIN, ApplicationSignerKey(peer), DID, None)
             .await
             .expect_err("mismatched key must reject");
         assert!(err.to_string().contains("stage 2"), "{err}");
@@ -564,7 +553,7 @@ mod tests {
         let doc = json!({ "id": DID, "verificationMethod": [], "service": [] });
         let gate = FederationAdmissionGate::new(AllowOrigin, FixtureDoc(doc));
         let err = gate
-            .admit(ORIGIN, PeerChannelKey(peer), DID, None)
+            .admit(ORIGIN, ApplicationSignerKey(peer), DID, None)
             .await
             .expect_err("no VM must reject");
         assert!(err.to_string().contains("stage 2"), "{err}");
@@ -578,7 +567,7 @@ mod tests {
         let peer = random_ed25519();
         let gate = FederationAdmissionGate::new(DenyOrigin, FailingResolve);
         let err = gate
-            .admit(ORIGIN, PeerChannelKey(peer), DID, None)
+            .admit(ORIGIN, ApplicationSignerKey(peer), DID, None)
             .await
             .expect_err("denied origin must reject");
         assert!(err.to_string().contains("stage 1"), "expected stage-1 rejection, got: {err}");
@@ -590,7 +579,7 @@ mod tests {
         let peer = random_ed25519();
         let gate = FederationAdmissionGate::new(AllowOrigin, FailingResolve);
         let err = gate
-            .admit(ORIGIN, PeerChannelKey(peer), DID, None)
+            .admit(ORIGIN, ApplicationSignerKey(peer), DID, None)
             .await
             .expect_err("resolution failure must reject (fail-closed)");
         assert!(err.to_string().contains("did not resolve"), "{err}");
@@ -600,13 +589,13 @@ mod tests {
 
     #[tokio::test]
     async fn admits_via_jwks_fallback_when_no_did_vm_match() {
-        // DID doc has a non-matching VM; the federation JWKS carries the peer key.
+        // DID doc has a non-matching VM; the federation JWKS carries the application signer key.
         let published = random_ed25519();
         let peer = random_ed25519();
         let jwks = jwks_with_keys(&[peer]);
         let gate = FederationAdmissionGate::new(AllowOrigin, FixtureDoc(did_doc_with_vm(&[published])));
         let admitted = gate
-            .admit(ORIGIN, PeerChannelKey(peer), DID, Some(&jwks))
+            .admit(ORIGIN, ApplicationSignerKey(peer), DID, Some(&jwks))
             .await
             .expect("JWKS fallback must admit");
         // Matched via JWKS, not a specific DID-doc VM.
@@ -622,17 +611,17 @@ mod tests {
         let jwks = jwks_with_keys(&[jwks_key]);
         let gate = FederationAdmissionGate::new(AllowOrigin, FixtureDoc(did_doc_with_vm(&[published])));
         let err = gate
-            .admit(ORIGIN, PeerChannelKey(peer), DID, Some(&jwks))
+            .admit(ORIGIN, ApplicationSignerKey(peer), DID, Some(&jwks))
             .await
             .expect_err("key in neither source must reject");
         assert!(err.to_string().contains("nor the federation JWKS"), "{err}");
     }
 
     #[test]
-    fn no_peer_key_helper_is_fail_closed() {
-        let err = reject_no_peer_key(ORIGIN);
+    fn no_application_signer_proof_helper_is_fail_closed() {
+        let err = reject_no_application_signer_proof(ORIGIN);
         assert!(err.to_string().contains("failing closed"), "{err}");
-        assert!(err.to_string().contains("#200"), "{err}");
+        assert!(err.to_string().contains("carrier NodeId/EndpointId"), "{err}");
     }
 
     // ── did:key self-certifying arm (#281) ───────────────────────────────────
@@ -650,15 +639,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admits_did_key_peer_whose_channel_key_matches() {
-        // Self-certifying: the peer's channel key equals the key the did:key
+    async fn admits_did_key_peer_whose_application_signer_matches() {
+        // Self-certifying: the verified application signer equals the did:key
         // encodes. No DID-doc resolution — NeverResolve proves the gate never
         // calls the resolver for a did:key.
         let key = random_ed25519();
         let did = ed25519_to_did_key(&key);
         let gate = FederationAdmissionGate::new(AllowOrigin, NeverResolve);
         let admitted = gate
-            .admit(ORIGIN, PeerChannelKey(key), &did, None)
+            .admit(ORIGIN, ApplicationSignerKey(key), &did, None)
             .await
             .expect("matching did:key must admit (self-certifying)");
         assert_eq!(admitted.origin, ORIGIN);
@@ -674,7 +663,7 @@ mod tests {
         let did = ed25519_to_did_key(&identity);
         let gate = FederationAdmissionGate::new(AllowOrigin, NeverResolve);
         let err = gate
-            .admit(ORIGIN, PeerChannelKey(peer), &did, None)
+            .admit(ORIGIN, ApplicationSignerKey(peer), &did, None)
             .await
             .expect_err("mismatched did:key must reject");
         assert!(err.to_string().contains("stage 2"), "{err}");
@@ -690,7 +679,7 @@ mod tests {
         let did = ed25519_to_did_key(&key);
         let gate = FederationAdmissionGate::new(DenyOrigin, NeverResolve);
         let err = gate
-            .admit(ORIGIN, PeerChannelKey(key), &did, None)
+            .admit(ORIGIN, ApplicationSignerKey(key), &did, None)
             .await
             .expect_err("denied origin must reject a did:key peer");
         assert!(err.to_string().contains("stage 1"), "expected stage-1 rejection, got: {err}");
@@ -704,7 +693,7 @@ mod tests {
         let bad_did = "did:key:zNotAValidEd25519Multikey";
         let gate = FederationAdmissionGate::new(AllowOrigin, NeverResolve);
         let err = gate
-            .admit(ORIGIN, PeerChannelKey(peer), bad_did, None)
+            .admit(ORIGIN, ApplicationSignerKey(peer), bad_did, None)
             .await
             .expect_err("invalid did:key must reject (fail-closed)");
         assert!(err.to_string().contains("stage 2"), "{err}");
@@ -756,7 +745,7 @@ mod tests {
         let admitted = admit_key_against_did(
             &NeverResolve,
             ORIGIN,
-            PeerChannelKey(ed),
+            ApplicationSignerKey(ed),
             AT9P_DID,
             None,
             Some(At9pAdmission { capsule_bytes: b"<capsule>", gate: &gate, pq_store: &mut store }),
@@ -786,7 +775,7 @@ mod tests {
         let err = admit_key_against_did(
             &NeverResolve,
             ORIGIN,
-            PeerChannelKey(ed),
+            ApplicationSignerKey(ed),
             AT9P_DID,
             None,
             Some(At9pAdmission { capsule_bytes: b"<capsule>", gate: &gate, pq_store: &mut store }),
@@ -799,9 +788,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_did_at9p_on_channel_key_mismatch_and_binds_nothing() {
-        // The capsule verifies, but the peer's channel key is not the capsule's
-        // Ed25519 subject key → reject (one trust root, #185) and bind nothing.
+    async fn rejects_did_at9p_on_application_signer_mismatch_and_binds_nothing() {
+        // The capsule verifies, but the application signer is not the capsule's
+        // Ed25519 subject key, so reject and bind nothing.
         let identity = random_ed25519();
         let peer = random_ed25519();
         assert_ne!(identity, peer);
@@ -811,13 +800,13 @@ mod tests {
         let err = admit_key_against_did(
             &NeverResolve,
             ORIGIN,
-            PeerChannelKey(peer),
+            ApplicationSignerKey(peer),
             AT9P_DID,
             None,
             Some(At9pAdmission { capsule_bytes: b"<capsule>", gate: &gate, pq_store: &mut store }),
         )
         .await
-        .expect_err("channel-key mismatch must reject");
+        .expect_err("application-signer mismatch must reject");
         assert!(err.to_string().contains("stage 2"), "{err}");
         assert!(store.is_empty(), "a mismatched peer must bind nothing");
     }
@@ -827,7 +816,7 @@ mod tests {
         // did:at9p presented but no capsule/admission context supplied (the live
         // accept path does not feed bytes yet) → fail closed.
         let peer = random_ed25519();
-        let err = admit_key_against_did(&NeverResolve, ORIGIN, PeerChannelKey(peer), AT9P_DID, None, None)
+        let err = admit_key_against_did(&NeverResolve, ORIGIN, ApplicationSignerKey(peer), AT9P_DID, None, None)
             .await
             .expect_err("missing capsule context must reject");
         assert!(err.to_string().contains("stage 2"), "{err}");
@@ -840,7 +829,7 @@ mod tests {
         let ed = random_ed25519();
         let gate = FederationAdmissionGate::new(DenyOrigin, NeverResolve);
         let err = gate
-            .admit(ORIGIN, PeerChannelKey(ed), AT9P_DID, None)
+            .admit(ORIGIN, ApplicationSignerKey(ed), AT9P_DID, None)
             .await
             .expect_err("denied origin must reject a did:at9p peer");
         // gate.admit passes None for the at9p context, so stage 1's denial is what

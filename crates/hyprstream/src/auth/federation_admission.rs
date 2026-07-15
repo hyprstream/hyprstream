@@ -19,12 +19,12 @@
 //! identity is the verified Ed25519 *envelope signer key* (`cnf`), surfaced at
 //! the application/service layer ([`hyprstream_rpc::service`]'s
 //! `verify_claims`/`resolve_key_subject`), **not** at the transport accept loop
-//! (the QUIC/WebTransport server has only the channel cert; client raw-public-key
-//! binding is #200 and iroh live `node_id` is #282, neither wired). The accept
+//! (the QUIC/WebTransport server has only carrier metadata, which is never an
+//! application signer proof). The accept
 //! loop also does not know the peer's *origin* (it arrives in the app-layer
 //! JWT/envelope), so even stage 1 cannot run at the raw accept loop. The gate is
 //! therefore designed to be invoked from the service layer once that path passes
-//! the verified signer key + issuer origin in; see `TODO(#200/#185/#282)` below.
+//! the verified signer key + issuer origin in; see the integration TODO below.
 
 use std::sync::Arc;
 
@@ -95,7 +95,7 @@ impl OriginAdmission for PolicyOriginAdmission {
 /// # Live proof seam
 ///
 /// The caller must pass the peer's *authenticated* Ed25519 key
-/// (`PeerChannelKey`). Today that key is the verified COSE envelope signer key,
+/// (`ApplicationSignerKey`). Today that key is the verified COSE envelope signer key,
 /// available at the service layer after `verify_claims`. A transport NodeId is
 /// never a substitute for that application proof (#1031/#1027).
 pub fn build_federation_admission_gate(

@@ -102,9 +102,10 @@ pub fn lookup_inproc(name: &str) -> Option<Arc<dyn IrohRequestProcessor>> {
 /// `server_verifying_key` is the destination's response-verification key.
 /// `None` does NOT disable signature verification — the response is still
 /// cryptographically verified against the key embedded in its envelope; `None`
-/// only declines to pin *which* identity that key must be. Passing `None` is
-/// only sound when the transport itself authenticates the peer (e.g. pinned
-/// TLS / QUIC cert).
+/// only declines to pin *which* identity that key must be. Network callers
+/// should supply an independently resolved application response key. In
+/// particular, iroh NodeId/EndpointId is only reach/path integrity and can
+/// never fill this parameter.
 ///
 /// **For `inproc://` there is no transport-level peer authentication** (it is a
 /// function call into a registry-resolved processor), so `None` is *discouraged*
@@ -159,8 +160,6 @@ where
             // envelope-embedded key even when `server_verifying_key` is `None`,
             // just not *pinned* to an expected identity. For a networked peer,
             // prefer passing the resolver-known key; note (debug) when we can't.
-            // (iroh's arm needs no such note — it is identity-bound at the
-            // transport, RFC 7250.)
             if server_verifying_key.is_none() {
                 tracing::debug!(
                     %addr,
@@ -187,16 +186,18 @@ where
             )
         }
         EndpointType::Iroh { node_id, direct_addrs, relay_url } => {
-            // iroh binds the connection to the peer's EndpointId (its pubkey),
-            // so the transport authenticates the peer *identity* — a `None`
-            // server_verifying_key is sound (response sig still verified, and
-            // the channel is identity-bound, unlike QUIC's cert pin).
+            let response_key = server_verifying_key.ok_or_else(|| {
+                anyhow!(
+                    "dial(): iroh reach has no independently resolved application response key; \
+                     NodeId/EndpointId cannot select response identity (#1031)"
+                )
+            })?;
             let transport = crate::transport::lazy_iroh::LazyIrohTransport::new(
                 *node_id,
                 direct_addrs.clone(),
                 relay_url.clone(),
             );
-            Ok(build_client(signer, transport, server_verifying_key, token))
+            Ok(build_client(signer, transport, Some(response_key), token))
         }
         // Same-host `ipc` plane: connect a UdsSession (RPC plane) at the socket
         // path. systemd socket-activation is the same client-side dial — the fd
@@ -306,13 +307,11 @@ pub async fn dial_stream(
             //
             // #282: dial the iroh `moql` ALPN from the shared process-wide client
             // endpoint (the SAME endpoint the daemon's inbound iroh substrate
-            // listens on, installed once at startup), then wrap the authenticated
-            // iroh Connection as a `web_transport_iroh::Session` for moq-net.
-            //
-            // iroh binds the connection to the peer's EndpointId (its Ed25519
-            // pubkey), so the channel is identity-bound (stronger than quinn's
-            // cert-hash pin); the per-Frame chained-HMAC envelope (§7.5) remains
-            // the application-layer integrity check the subscriber verifies.
+            // listens on, installed once at startup), then wrap the iroh
+            // Connection as a `web_transport_iroh::Session` for moq-net.
+            // EndpointId verification provides target/path integrity only; the
+            // per-Frame chained-HMAC envelope (§7.5) remains the independent
+            // application-layer integrity check the subscriber verifies.
             let session = dial_iroh_moq(node_id, direct_addrs, relay_url).await?;
             Ok(MoqStreamSession::Iroh(session))
         }
@@ -334,22 +333,36 @@ pub async fn dial_stream(
 /// Uses the process-wide client iroh endpoint installed at startup
 /// ([`crate::transport::lazy_iroh::install_iroh_client_endpoint`]) — the same
 /// install-once dialer the RPC plane's `LazyIrohTransport` uses, so the streaming
-/// dial reuses the node identity and bound sockets. Mirrors
+/// dial reuses the carrier address and bound sockets. Mirrors
 /// [`crate::transport::iroh_substrate::IrohSubstrate::connect`].
 async fn dial_iroh_moq(
     node_id: &[u8; 32],
     direct_addrs: &[std::net::SocketAddr],
     relay_url: &Option<String>,
 ) -> Result<web_transport_iroh::Session> {
-    use crate::transport::iroh_substrate::ALPN_MOQ_LITE;
-    use iroh::{EndpointAddr, EndpointId, TransportAddr};
-
     let endpoint = crate::transport::lazy_iroh::iroh_client_endpoint().ok_or_else(|| {
         anyhow!(
             "dial_stream(): no iroh client endpoint installed — call \
              install_iroh_client_endpoint() at startup before dialing iroh streams"
         )
     })?;
+
+    dial_iroh_moq_from_endpoint(endpoint, node_id, direct_addrs, relay_url).await
+}
+
+/// Dial from an explicitly owned endpoint.
+///
+/// Tests use this primitive so a runtime-bound endpoint never leaks into the
+/// process-global production slot. The caller owns the endpoint for the full
+/// connection lifecycle.
+async fn dial_iroh_moq_from_endpoint(
+    endpoint: iroh::Endpoint,
+    node_id: &[u8; 32],
+    direct_addrs: &[std::net::SocketAddr],
+    relay_url: &Option<String>,
+) -> Result<web_transport_iroh::Session> {
+    use crate::transport::iroh_substrate::ALPN_MOQ_LITE;
+    use iroh::{EndpointAddr, EndpointId, TransportAddr};
 
     let id = EndpointId::from_bytes(node_id).map_err(|e| anyhow!("invalid iroh node_id: {e}"))?;
     let mut transport_addrs: Vec<TransportAddr> =
@@ -504,17 +517,38 @@ mod tests {
         );
     }
 
-    /// #282: `dial_stream`'s iroh arm dials the `moql` ALPN and returns a live
-    /// moq session. A loopback: a server `IrohSubstrate` serves the moq handler
-    /// with one published broadcast; the client installs its endpoint as the
-    /// process-global dialer, then `dial_stream(EndpointType::Iroh{..})` →
-    /// `connect_moq` → subscribe → read the same frame back.
+    #[test]
+    fn iroh_node_equality_never_selects_or_changes_application_response_key() {
+        let response_signer = SigningKey::generate(&mut OsRng);
+        let response_key = response_signer.verifying_key();
+        let equal_to_response_key = response_key.to_bytes();
+        let unrelated_reach = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+
+        for node_id in [equal_to_response_key, unrelated_reach] {
+            let cfg = TransportConfig::iroh(
+                node_id,
+                Vec::new(),
+                Some("https://relay.example".to_owned()),
+            );
+            assert!(
+                dial(&cfg, test_signer(), None, None).is_err(),
+                "NodeId equality must not mint a response-verification key"
+            );
+            assert!(
+                dial(&cfg, test_signer(), Some(response_key), None).is_ok(),
+                "separately resolved response proof must remain valid regardless of NodeId mismatch"
+            );
+        }
+    }
+
+    /// The real carrier dial uses a runtime-owned endpoint and leaves the global
+    /// slot untouched. With no fresh session proof, the server then refuses the
+    /// anonymous MoQ handshake rather than exposing broadcasts.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dial_stream_iroh_moql_loopback_round_trip() -> Result<()> {
-        use crate::transport::iroh_moq::{IrohMoqProtocolHandler, OriginShared};
+    async fn dial_stream_iroh_moql_anonymous_refused_without_global_leak() -> Result<()> {
+        use crate::transport::iroh_moq::IrohMoqProtocolHandler;
         use crate::transport::iroh_substrate::{IrohSubstrate, NoopHandler};
-        use crate::transport::lazy_iroh::install_iroh_client_endpoint;
-        use moq_net::{Client, Group, Origin, OriginConsumer, OriginProducer, Track};
+        use moq_net::Client;
         use rand::RngCore;
 
         fn fresh_key() -> [u8; 32] {
@@ -523,65 +557,53 @@ mod tests {
             k
         }
 
-        // ── Server: moq handler on the `moql` ALPN with one broadcast ──────────
-        let shared = OriginShared::new();
-        let producer = shared.producer().clone();
-        let moq_handler = IrohMoqProtocolHandler::with_origin(shared);
+        let moq_handler = IrohMoqProtocolHandler::new();
         let server =
             IrohSubstrate::new(fresh_key(), moq_handler, NoopHandler::new("rpc")).await?;
         let server_id: [u8; 32] = *server.endpoint_id().as_bytes();
         let direct: Vec<std::net::SocketAddr> =
             server.endpoint().bound_sockets().into_iter().collect();
 
-        let mut broadcast = producer
-            .create_broadcast("alice/run-1")
-            .ok_or_else(|| anyhow!("create_broadcast denied"))?;
-        let mut track = broadcast.create_track(Track::new("tokens"))?;
-        let mut group = track.create_group(Group::from(0u64))?;
-        group.write_frame(bytes::Bytes::from_static(b"hello-dial-stream"))?;
-        drop(group);
-
-        // ── Client: install its endpoint as the process-global dialer ──────────
+        // ── Client: runtime-owned endpoint, never installed globally ──────────
         let client = IrohSubstrate::new(
             fresh_key(),
             NoopHandler::new("c-moq"),
             NoopHandler::new("c-rpc"),
         )
         .await?;
-        let _ = install_iroh_client_endpoint(client.endpoint().clone());
+        assert!(
+            crate::transport::lazy_iroh::iroh_client_endpoint().is_none(),
+            "unit tests must not inherit a process-global runtime-bound endpoint"
+        );
 
-        // ── dial_stream over iroh → MoqStreamSession::Iroh ─────────────────────
+        // Exercise the same carrier dial primitive from the isolated endpoint.
         let cfg = TransportConfig::iroh(server_id, direct, None);
-        let session = dial_stream(&cfg).await?;
+        let session = match &cfg.endpoint {
+            EndpointType::Iroh { node_id, direct_addrs, relay_url } => {
+                MoqStreamSession::Iroh(
+                    dial_iroh_moq_from_endpoint(
+                        client.endpoint().clone(),
+                        node_id,
+                        direct_addrs,
+                        relay_url,
+                    )
+                    .await?,
+                )
+            }
+            other => panic!("expected iroh endpoint, got {other:?}"),
+        };
         assert!(matches!(session, MoqStreamSession::Iroh(_)), "must be an iroh session");
 
-        // Run the moq handshake via the enum dispatcher and subscribe.
-        let client_origin: OriginProducer = Origin::random().produce();
-        let client_consumer: OriginConsumer = client_origin.consume();
-        let moq_client = Client::new().with_consume(client_origin);
-        let _moq_session = session
-            .connect_moq(&moq_client)
-            .await
-            .map_err(|e| anyhow!("moq handshake: {e}"))?;
+        let moq_client = Client::new();
+        let handshake = session.connect_moq(&moq_client).await;
+        assert!(handshake.is_err(), "anonymous MoQ carrier must fail closed");
 
-        let bc = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            client_consumer.announced_broadcast("alice/run-1"),
-        )
-        .await?
-        .ok_or_else(|| anyhow!("broadcast not announced"))?;
-        let mut tc = bc.subscribe_track(&Track::new("tokens"))?;
-        let mut gc = tokio::time::timeout(std::time::Duration::from_secs(5), tc.next_group())
-            .await??
-            .ok_or_else(|| anyhow!("next_group None"))?;
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), gc.read_frame())
-            .await??
-            .ok_or_else(|| anyhow!("read_frame None"))?;
-        assert_eq!(&frame[..], b"hello-dial-stream");
-
+        client.shutdown().await?;
         server.shutdown().await?;
-        // Do NOT shut down `client`: its endpoint is the install-once global.
-        drop(client);
+        assert!(
+            crate::transport::lazy_iroh::iroh_client_endpoint().is_none(),
+            "isolated carrier test must leave global endpoint state untouched"
+        );
         Ok(())
     }
 }

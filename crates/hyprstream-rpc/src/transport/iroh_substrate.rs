@@ -18,8 +18,8 @@
 //! one `IrohSubstrate` per QUIC-enabled service as the PRIMARY production
 //! endpoint (on by default; `[quic] iroh = false` opts out to quinn-only). The
 //! real `moql` and `hyprstream-rpc/1` handlers are threaded in by the spawner
-//! (#282), and the OAuth/DID-controller identity binds its own canonical
-//! federation substrate (`build_oauth_iroh_substrate`).
+//! (#282). OAuth binds a reach-only endpoint whose inbound ALPNs remain refused
+//! until independently verified application/session proof is wired.
 //!
 //! # D3 — iroh pkarr is LIVENESS-ONLY, never an authority source (#895)
 //!
@@ -136,8 +136,8 @@ impl IrohSubstrate {
         Self { endpoint, router }
     }
 
-    /// Endpoint id = our Ed25519 public key. Published in JWKS for
-    /// federation peer binding (Phase 6, issue #137).
+    /// Return this endpoint's carrier address for reach advertisement and
+    /// diagnostics. It is not a DID/JWKS key or application identity proof.
     pub fn endpoint_id(&self) -> EndpointId {
         self.endpoint.id()
     }
@@ -187,6 +187,30 @@ impl NoopHandler {
 impl ProtocolHandler for NoopHandler {
     async fn accept(&self, _conn: Connection) -> Result<(), AcceptError> {
         tracing::trace!(reason = %self.reason, "NoopHandler accepted (no-op)");
+        Ok(())
+    }
+}
+
+/// Fail-closed protocol handler for an ALPN that is intentionally disabled.
+///
+/// Unlike [`NoopHandler`], this explicitly closes the carrier connection. It is
+/// used where an endpoint may exist for outbound reach but no trustworthy
+/// application/session proof is available for inbound requests.
+#[derive(Debug, Clone)]
+pub struct RefuseHandler {
+    reason: &'static str,
+}
+
+impl RefuseHandler {
+    pub fn new(reason: &'static str) -> Self {
+        Self { reason }
+    }
+}
+
+impl ProtocolHandler for RefuseHandler {
+    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        tracing::warn!(reason = %self.reason, "refusing disabled iroh ALPN");
+        conn.close(0u32.into(), self.reason.as_bytes());
         Ok(())
     }
 }

@@ -234,8 +234,8 @@ pub fn preferred_transport(doc: &Value, kind: Option<SocketKind>) -> Option<Tran
 // The `did:key` (Ed25519) codec — `MULTICODEC_ED25519_PUB`,
 // `decode_ed25519_multikey`, `did_key_to_ed25519`, `ed25519_to_did_key` — lives
 // in the cross-target [`crate::did_key`] module so the native `did_web` resolver
-// (#279/#137/#281) and the wasm32 `iroh_peer` browser identity helpers (#475)
-// share one implementation and cannot drift. They are re-exported here so
+// (#279/#137/#281) share one implementation and cannot drift. WASM iroh reach
+// APIs intentionally do not consume it. These are re-exported here so
 // existing `crate::did_web::*` callers (admission gate, federation tests) are
 // unaffected.
 pub use crate::did_key::{
@@ -260,7 +260,7 @@ pub fn is_did_key(did: &str) -> bool {
 ///
 /// Only `Multikey` / `Ed25519VerificationKey2020`-shaped entries with a
 /// `publicKeyMultibase` carrying the `ed25519-pub` multicodec are returned (the
-/// `#mesh` / `#iroh` Ed25519 VMs the mesh publishes). Entries with a different
+/// identity VMs such as `#mesh`). Entries with a different
 /// codec, a non-multibase encoding (e.g. `publicKeyJwk`-only), or that fail to
 /// decode are skipped — a malformed VM must not be admitted, and a doc with no
 /// Ed25519 VM yields an **empty** vec (the caller treats empty as "no match →
@@ -790,7 +790,7 @@ mod tests {
             "iroh must be preferred first"
         );
         assert!(matches!(entries[1].config.endpoint, EndpointType::Quic { .. }));
-        // iroh entry carries the identity key; quic does not.
+        // Neither transport entry carries an application identity key.
     }
 
     #[test]

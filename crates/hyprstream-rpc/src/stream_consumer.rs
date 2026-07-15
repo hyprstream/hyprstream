@@ -409,9 +409,9 @@ impl<T: Transport> StreamHandleImpl<T> {
     /// The entire AEAD + chained-HMAC integrity envelope bootstraps from
     /// `stream_info.dh_public` — the server's ephemeral Ristretto255 DH public
     /// key. It is trustworthy ONLY because `StreamInfo` arrives over the
-    /// *authenticated* RPC channel: the RPC reply rides the iroh
-    /// node-id-bound / QUIC-cert-pinned transport, and (per #275) is wrapped in
-    /// a `ResponseEnvelope` carrying a COSE composite signature (EdDSA +
+    /// authenticated RPC response: carrier target/path checks are insufficient;
+    /// the reply is independently wrapped in a `ResponseEnvelope` carrying a
+    /// COSE composite signature (EdDSA +
     /// ML-DSA-65 under Hybrid), so `dhPublic` authentication reaches PQ
     /// strength. A `dh_public` sourced from an *unauthenticated* path would let
     /// any MITM substitute its own key, derive the stream keys itself, and forge

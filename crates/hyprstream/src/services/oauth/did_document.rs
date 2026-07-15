@@ -996,7 +996,7 @@ mod tests {
 
     #[test]
     fn root_doc_omits_iroh_when_not_bound() {
-        // No iroh transport configured → no `#iroh` VM, no IrohTransport entry.
+        // No iroh transport configured → no IrohTransport entry.
         let sk = SigningKey::generate(&mut OsRng);
         let did = "did:web:hyprstream.example.com";
         let doc = build_did_document(
@@ -1011,7 +1011,7 @@ mod tests {
         let vms = doc["verificationMethod"].as_array().unwrap();
         assert!(
             !vms.iter().any(|v| v["id"] == format!("{did}#iroh")),
-            "no `#iroh` VM when iroh is not bound"
+            "carrier NodeId is never a DID verification method"
         );
         let svcs = doc["service"].as_array().unwrap();
         assert!(

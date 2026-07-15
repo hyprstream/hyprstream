@@ -94,7 +94,7 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use hyprstream_crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes, MlDsaSigningKey};
-    use hyprstream_rpc::admission::{admit_key_against_did, At9pAdmission, PeerChannelKey};
+    use hyprstream_rpc::admission::{admit_key_against_did, At9pAdmission, ApplicationSignerKey};
     use hyprstream_rpc::envelope::{KeyedPqTrustStore, PqTrustStore};
 
     use anyhow::Result as AnyResult;
@@ -194,7 +194,7 @@ mod tests {
         let admitted = admit_key_against_did(
             &NeverResolve,
             "https://peer.example",
-            PeerChannelKey(ed_arr),
+            ApplicationSignerKey(ed_arr),
             &did,
             None,
             Some(At9pAdmission { capsule_bytes: &bytes, gate: &gate, pq_store: &mut store }),
@@ -225,7 +225,7 @@ mod tests {
         let res = admit_key_against_did(
             &NeverResolve,
             "https://peer.example",
-            PeerChannelKey(ed),
+            ApplicationSignerKey(ed),
             &did,
             None,
             Some(At9pAdmission { capsule_bytes: &bytes, gate: &gate, pq_store: &mut store }),

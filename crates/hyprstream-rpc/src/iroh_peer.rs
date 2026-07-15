@@ -13,7 +13,7 @@
 //!
 //! **Full iroh Endpoint bind**: creating a listening `iroh::Endpoint` (own relay
 //! address, pkarr publisher, relay keep-alive) is expensive and deferred. It's
-//! needed for dial_iroh_reach() (Phase 3) but not for identity + resolution.
+//! needed for dial_iroh_reach() (Phase 3), not for application identity.
 //!
 //! **moq-net wasm32**: moq-net 0.1.8 has `Session + Sync` bounds incompatible
 //! with browser `!Sync` types. Upstream fix needed before moq subscribe/publish
@@ -31,24 +31,24 @@ use iroh::{EndpointId, SecretKey};
 use n0_error::StackError;
 
 // ============================================================================
-// BrowserIrohPeer — ephemeral iroh identity without a full Endpoint bind
+// BrowserIrohPeer — ephemeral iroh carrier address without a full Endpoint bind
 // ============================================================================
 
-/// A browser iroh peer identity.
+/// A browser iroh carrier-key holder.
 ///
 /// Generates a fresh Ed25519 `SecretKey` and derives the corresponding
 /// `EndpointId` (NodeId). This provides the browser with a stable iroh
-/// identity for the session without the cost of binding a full
+/// carrier address for the session without the cost of binding a full
 /// `iroh::Endpoint` (relay connection, pkarr publisher, background tasks).
 ///
 /// The SecretKey is held in memory only; it is not persisted. Each call to
-/// `new()` produces a fresh identity.
+/// `new()` produces a fresh carrier address. It is not a DID or admission proof.
 pub struct BrowserIrohPeer {
     secret_key: SecretKey,
 }
 
 impl BrowserIrohPeer {
-    /// Generate a fresh ephemeral iroh peer identity.
+    /// Generate a fresh ephemeral iroh carrier key.
     pub fn new() -> Self {
         Self {
             secret_key: SecretKey::generate(),

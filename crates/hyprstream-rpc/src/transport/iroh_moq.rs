@@ -34,16 +34,15 @@ use web_transport_iroh::Session;
 
 use crate::moq_authz::{tenant_scoped_consumer, PeerIdentity, SharedSubscribeAuthorizer};
 
-/// Resolves the tenant a connected peer belongs to, from its (authenticated)
-/// identity. Returning `Some(tenant)` scopes that peer's view of announces to
-/// `{tenant}/`; returning `None` leaves the peer unscoped (the pre-#276 open
-/// model). Wired by the caller, which owns the peer↔tenant policy.
+/// Resolves the tenant for an independently authenticated application peer.
+/// Carrier NodeId is never passed here. Until a caller can supply fresh proof,
+/// the iroh accept path refuses before invoking this resolver.
 pub type PeerTenantResolver = Arc<dyn Fn(&PeerIdentity) -> Option<String> + Send + Sync>;
 
 /// #276 authorization config for a moq accept path: an optional subscribe
 /// authorizer and an optional peer→tenant resolver for per-tenant announce
-/// scoping. Both default to "off" so existing open same-tenant subscribe keeps
-/// working until a deployment opts in.
+/// scoping. Absence of fresh application/session proof is always fail-closed;
+/// these hooks cannot turn an anonymous carrier into an authenticated peer.
 #[derive(Clone, Default)]
 pub struct MoqAuthzConfig {
     /// Subscribe-time authorization hook (public-open / private-gated).
@@ -150,10 +149,8 @@ impl IrohMoqProtocolHandler {
 
     /// Install the #276 subscribe-authz + per-tenant announce-scoping config.
     ///
-    /// On this (iroh) path the accepted connection is authenticated, so the
-    /// `tenant_resolver` receives a real [`PeerIdentity`] (the remote endpoint
-    /// id) and per-tenant scoping is enforced live by handing the moq session a
-    /// tenant-scoped [`OriginConsumer`].
+    /// The resolver is usable only after a future fresh-proof seam supplies an
+    /// authenticated [`PeerIdentity`]. Carrier EndpointId alone never reaches it.
     pub fn with_authz(mut self, authz: MoqAuthzConfig) -> Self {
         self.rebuild_inner(|i| i.authz = authz);
         self
@@ -206,11 +203,18 @@ impl ProtocolHandler for IrohMoqProtocolHandler {
         // Carrier NodeId is transport metadata only. Until #1027 supplies fresh
         // inside-carrier proof, authorization must see an anonymous peer.
         let peer = PeerIdentity::anonymous();
+        if !peer.is_authenticated() {
+            tracing::warn!(
+                "iroh-moq: refusing anonymous carrier pending verified session proof (#1027/#726)"
+            );
+            conn.close(0u32.into(), b"verified MoQ session proof required");
+            return Ok(());
+        }
 
-        // Per-tenant announce scoping (live): if the caller installed a
-        // peer→tenant resolver, hand this session a consumer narrowed to its
-        // own `{tenant}/` prefix so it cannot enumerate or subscribe to other
-        // tenants' broadcasts. No resolver → unscoped (pre-#276 open model).
+        // Future authenticated-session path: if a fresh-proof integration
+        // supplies a verified peer, hand it only a consumer narrowed to its own
+        // `{tenant}/` prefix. Missing tenant resolution must remain fail-closed;
+        // it must never fall back to the process-global consumer.
         let publish_consumer = match self.inner.authz.tenant_for(&peer) {
             Some(tenant) => {
                 // `scope` returns None when the tenant prefix is outside the
@@ -233,7 +237,11 @@ impl ProtocolHandler for IrohMoqProtocolHandler {
                     }
                 }
             }
-            None => self.inner.origin.consumer.clone(),
+            None => {
+                tracing::warn!("iroh-moq: authenticated peer has no tenant scope; refusing");
+                conn.close(0u32.into(), b"tenant scope required");
+                return Ok(());
+            }
         };
 
         // NOTE (#276 subscribe-authz seam): `moq_net::Server` exposes no
@@ -308,14 +316,26 @@ mod tests {
         )
     }
 
-    /// In-process publisher writes one Frame to a Track on a Broadcast;
-    /// an external subscriber connects over iroh, navigates the same
-    /// broadcast/track path, and reads back the same Frame bytes.
+    /// An anonymous carrier cannot subscribe to server broadcasts, publish a
+    /// client origin, or reach the tenant resolver. Mutating the carrier NodeId
+    /// cannot change that decision because it is never an application proof.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn moq_publish_subscribe_round_trip() -> anyhow::Result<()> {
-        // ─── Server side ──────────────────────────────────────────────
-        let handler = IrohMoqProtocolHandler::new();
+    async fn anonymous_carrier_cannot_publish_subscribe_or_obtain_tenant_scope(
+    ) -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&resolver_calls);
+        let authz = MoqAuthzConfig {
+            authorizer: None,
+            tenant_resolver: Some(Arc::new(move |_peer| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Some("alice".to_owned())
+            })),
+        };
+        let handler = IrohMoqProtocolHandler::new().with_authz(authz);
         let producer = handler.origin_producer().clone();
+        let server_consumer = handler.origin_consumer().clone();
         let server = IrohSubstrate::new(
             fresh_key(),
             handler,
@@ -324,7 +344,8 @@ mod tests {
         .await?;
         let server_addr = direct_addr(&server);
 
-        // Publish a broadcast with one track before the subscriber connects.
+        // A server-side broadcast would be exposed if anonymous subscribe were
+        // still open.
         let mut broadcast = producer
             .create_broadcast("alice/run-1")
             .ok_or_else(|| anyhow::anyhow!("create_broadcast denied"))?;
@@ -333,8 +354,7 @@ mod tests {
         group.write_frame(Bytes::from_static(b"hello-moq"))?;
         drop(group);
 
-        // ─── Client side: connect via iroh, run moq Client to negotiate,
-        // then subscribe to the known broadcast path. ─────────────────
+        // A client-side origin would be exposed if anonymous publish were open.
         let client = IrohSubstrate::new(
             fresh_key(),
             NoopHandler::new("c-moq"),
@@ -345,114 +365,47 @@ mod tests {
         let session = Session::raw(conn);
         let client_origin: OriginProducer = Origin::random().produce();
         let client_consumer: OriginConsumer = client_origin.consume();
-        let moq_client = Client::new().with_consume(client_origin);
-        let _moq_session = moq_client.connect(session).await?;
-
-        // Subscribe to alice/run-1 and read the first group's frame.
-        let broadcast_consumer = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            client_consumer.announced_broadcast("alice/run-1"),
+        let mut attacker_broadcast = client_origin
+            .create_broadcast("mallory/injected")
+            .ok_or_else(|| anyhow::anyhow!("create attacker broadcast"))?;
+        let mut attacker_track = attacker_broadcast.create_track(Track::new("tokens"))?;
+        let mut attacker_group = attacker_track.create_group(Group::from(0u64))?;
+        attacker_group.write_frame(Bytes::from_static(b"attacker-data"))?;
+        drop(attacker_group);
+        let moq_client = Client::new().with_origin(client_origin.clone()).with_consume(client_origin);
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            moq_client.connect(session),
         )
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("broadcast not announced"))?;
-        let mut track_consumer =
-            broadcast_consumer.subscribe_track(&Track::new("tokens"))?;
-        let mut group_consumer = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            track_consumer.next_group(),
-        )
-        .await??
-        .ok_or_else(|| anyhow::anyhow!("next_group returned None"))?;
-        let frame: Bytes = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            group_consumer.read_frame(),
-        )
-        .await??
-        .ok_or_else(|| anyhow::anyhow!("read_frame returned None"))?;
-        assert_eq!(&frame[..], b"hello-moq");
+        .await;
 
-        client.shutdown().await?;
-        server.shutdown().await?;
-        Ok(())
-    }
-
-    /// #276 live per-tenant announce scoping over the iroh `moql` path: the
-    /// server publishes broadcasts for two tenants but the accept path scopes
-    /// every connection to `bob/` (via the tenant resolver). A remote subscriber
-    /// must see `bob`'s broadcast and must NOT be able to reach `alice`'s.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn iroh_moq_scopes_announces_to_connection_tenant() -> anyhow::Result<()> {
-        // `MoqAuthzConfig` is defined in this module (`super`).
-        // Server scoped so EVERY peer is treated as tenant "bob".
-        let authz = MoqAuthzConfig {
-            authorizer: None,
-            tenant_resolver: Some(Arc::new(|peer| {
-                assert!(!peer.is_authenticated(), "NodeId must not mint authorization identity");
-                Some("bob".to_owned())
-            })),
-        };
-        let handler = IrohMoqProtocolHandler::new().with_authz(authz);
-        let producer = handler.origin_producer().clone();
-        let server = IrohSubstrate::new(fresh_key(), handler, NoopHandler::new("rpc-not-wired")).await?;
-        let server_addr = direct_addr(&server);
-
-        // Publish one broadcast per tenant.
-        let mut alice_bc = producer
-            .create_broadcast("alice/streams/secret/i0")
-            .ok_or_else(|| anyhow::anyhow!("create alice broadcast"))?;
-        let mut alice_tr = alice_bc.create_track(Track::new("tokens"))?;
-        let mut alice_g = alice_tr.create_group(Group::from(0u64))?;
-        alice_g.write_frame(Bytes::from_static(b"alice-secret"))?;
-        drop(alice_g);
-
-        let mut bob_bc = producer
-            .create_broadcast("bob/streams/run-1/i0")
-            .ok_or_else(|| anyhow::anyhow!("create bob broadcast"))?;
-        let mut bob_tr = bob_bc.create_track(Track::new("tokens"))?;
-        let mut bob_g = bob_tr.create_group(Group::from(0u64))?;
-        bob_g.write_frame(Bytes::from_static(b"bob-data"))?;
-        drop(bob_g);
-
-        // Client connects; the accept path scopes its consumer to bob/.
-        let client =
-            IrohSubstrate::new(fresh_key(), NoopHandler::new("c-moq"), NoopHandler::new("c-rpc")).await?;
-        let conn = client.connect(server_addr, ALPN_MOQ_LITE).await?;
-        let session = Session::raw(conn);
-        let client_origin: OriginProducer = Origin::random().produce();
-        let client_consumer: OriginConsumer = client_origin.consume();
-        let moq_client = Client::new().with_consume(client_origin);
-        let _moq_session = moq_client.connect(session).await?;
-
-        // bob/ is visible: subscribe and read its frame.
-        let bob_consumer = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            client_consumer.announced_broadcast("bob/streams/run-1/i0"),
-        )
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("bob broadcast not announced"))?;
-        let mut bob_track = bob_consumer.subscribe_track(&Track::new("tokens"))?;
-        let mut bob_group = tokio::time::timeout(std::time::Duration::from_secs(5), bob_track.next_group())
-            .await??
-            .ok_or_else(|| anyhow::anyhow!("bob next_group None"))?;
-        let bob_frame: Bytes = tokio::time::timeout(std::time::Duration::from_secs(5), bob_group.read_frame())
-            .await??
-            .ok_or_else(|| anyhow::anyhow!("bob read_frame None"))?;
-        assert_eq!(&bob_frame[..], b"bob-data");
-
-        // alice/ is NOT visible to this bob-scoped subscriber: the announce
-        // must never arrive (timeout → not announced through the scoped cursor).
-        let alice_seen = tokio::time::timeout(
-            std::time::Duration::from_millis(750),
-            client_consumer.announced_broadcast("alice/streams/secret/i0"),
+        let server_seen_attacker = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            server_consumer.announced_broadcast("mallory/injected"),
         )
         .await;
         assert!(
-            alice_seen.is_err() || alice_seen.ok().flatten().is_none(),
-            "bob-scoped subscriber must NOT see alice's broadcast"
+            server_seen_attacker.is_err() || server_seen_attacker.ok().flatten().is_none(),
+            "anonymous carrier must not publish into the server origin"
+        );
+        let client_seen_server = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            client_consumer.announced_broadcast("alice/run-1"),
+        )
+        .await;
+        assert!(
+            client_seen_server.is_err() || client_seen_server.ok().flatten().is_none(),
+            "anonymous carrier must not subscribe to the server origin"
+        );
+        assert_eq!(
+            resolver_calls.load(Ordering::SeqCst),
+            0,
+            "anonymous carrier must not obtain tenant scope"
         );
 
         client.shutdown().await?;
         server.shutdown().await?;
         Ok(())
     }
+
 }

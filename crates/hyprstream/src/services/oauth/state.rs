@@ -630,8 +630,8 @@ impl OAuthState {
     /// Set the node's iroh transport info for DID-doc publication (#282).
     ///
     /// Call this only when the iroh substrate is actually bound: it makes
-    /// `root_did_document` advertise the `#iroh` Ed25519 verification method and
-    /// an `IrohTransport` service entry (`accept: [hyprstream-rpc/1, moql]`).
+    /// `root_did_document` advertise an `IrohTransport` service entry. The
+    /// `node_id` is reachability metadata, never a DID verification method.
     /// `relays` may be empty — peers then resolve reachability by node_id alone
     /// via iroh's pkarr/DNS discovery.
     pub fn with_iroh_transport(mut self, node_id: [u8; 32], relays: Vec<String>) -> Self {

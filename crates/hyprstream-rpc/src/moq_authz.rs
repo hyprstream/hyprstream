@@ -152,7 +152,7 @@ impl SubscribeDecision {
 /// treated as unauthenticated.
 #[derive(Debug, Clone, Default)]
 pub struct PeerIdentity {
-    /// Stable subject string for policy lookups (e.g. an iroh node id), or
+    /// Stable independently verified application subject for policy lookups, or
     /// `None` for an unauthenticated/anonymous peer.
     pub subject: Option<String>,
 }
