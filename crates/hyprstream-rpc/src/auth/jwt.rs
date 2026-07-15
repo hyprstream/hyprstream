@@ -639,9 +639,19 @@ mod tests {
     ) -> (String, crate::crypto::pq::MlDsaVerifyingKey, VerifyingKey) {
         let (pq, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
         let ed = make_key(0x71);
+        let token = composite_token_with_keys(typ, &pq, &pq_vk, &ed);
+        (token, pq_vk, ed.verifying_key())
+    }
+
+    fn composite_token_with_keys(
+        typ: &str,
+        pq: &crate::crypto::pq::MlDsaSigningKey,
+        pq_vk: &crate::crypto::pq::MlDsaVerifyingKey,
+        ed: &SigningKey,
+    ) -> String {
         let header = format!(
             r#"{{"alg":"ML-DSA-65-Ed25519","typ":"{typ}","kid":"{}"}}"#,
-            composite_kid(&pq_vk, &ed.verifying_key())
+            composite_kid(pq_vk, &ed.verifying_key())
         );
         let claims = Claims::new("dispatch-test".to_owned(), 0, 9_999_999_999);
         let input = format!(
@@ -649,13 +659,9 @@ mod tests {
             URL_SAFE_NO_PAD.encode(header),
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
         );
-        let mut signature = crate::crypto::pq::ml_dsa_sign(&pq, input.as_bytes());
+        let mut signature = crate::crypto::pq::ml_dsa_sign(pq, input.as_bytes());
         signature.extend_from_slice(&ed.sign(input.as_bytes()).to_bytes());
-        (
-            format!("{}.{}", input, URL_SAFE_NO_PAD.encode(signature)),
-            pq_vk,
-            ed.verifying_key(),
-        )
+        format!("{}.{}", input, URL_SAFE_NO_PAD.encode(signature))
     }
 
     #[test]
@@ -665,21 +671,14 @@ mod tests {
             parse_composite_dispatch(&bad_type, &["at+jwt"]),
             Err(JwtError::UnsupportedType(_))
         ));
-        let (token, pq, ed) = composite_token_with_type("at+jwt");
+        let (pq_sk, pq) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let ed_sk = make_key(0x72);
+        let ed = ed_sk.verifying_key();
+        let token = composite_token_with_keys("at+jwt", &pq_sk, &pq, &ed_sk);
         let dispatch = parse_composite_dispatch(&token, &["at+jwt"]).unwrap();
-        let (_, rest) = token.split_once('.').unwrap();
-        let altered_header = URL_SAFE_NO_PAD.encode(format!(
-            r#"{{"alg":"ML-DSA-65-Ed25519","typ":"wit+jwt","kid":"{}"}}"#,
-            composite_kid(&pq, &ed)
-        ));
+        let separately_valid = composite_token_with_keys("wit+jwt", &pq_sk, &pq, &ed_sk);
         assert!(matches!(
-            decode_composite(
-                &format!("{altered_header}.{rest}"),
-                &pq,
-                &ed,
-                None,
-                &dispatch
-            ),
+            decode_composite(&separately_valid, &pq, &ed, None, &dispatch),
             Err(JwtError::InvalidSignature)
         ));
     }
