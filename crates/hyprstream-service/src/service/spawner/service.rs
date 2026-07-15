@@ -84,6 +84,15 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
             let processor: Arc<dyn IrohRequestProcessor> = Arc::new(bridge);
 
             if let Some(mut qc) = quic_config {
+                // web-transport-quinn has no per-builder provider hook and
+                // resolves rustls's process default. Install and validate it at
+                // the actual bind seam so task/thread/subprocess startup cannot
+                // silently inherit a non-PQ first-installed provider (#557).
+                hyprstream_rpc::transport::install_pq_crypto_provider().map_err(|error| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                        "QUIC crypto provider: {error}"
+                    ))
+                })?;
                 // #274: serve the RPC plane over `web_transport_quinn` (replacing
                 // the bespoke h3 WebTransportServer) and multiplex the moq
                 // streaming plane on the same endpoint via `/moq` path-dispatch.

@@ -86,7 +86,7 @@ impl NinePWtHandler for EchoNineP {
 /// stream round-trips bytes both directions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn wt_ninep_path_routes_to_handler_and_streams() -> Result<()> {
-    hyprstream_rpc::transport::install_pq_crypto_provider();
+    hyprstream_rpc::transport::install_pq_crypto_provider().expect("install PQ provider");
 
     let (server, addr, cert) = build_server()?;
     let invoked = Arc::new(tokio::sync::Notify::new());
@@ -135,7 +135,7 @@ async fn wt_ninep_path_routes_to_handler_and_streams() -> Result<()> {
 /// off. We assert the server task keeps running afterwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn wt_ninep_without_handler_is_declined() -> Result<()> {
-    hyprstream_rpc::transport::install_pq_crypto_provider();
+    hyprstream_rpc::transport::install_pq_crypto_provider().expect("install PQ provider");
 
     let (server, addr, cert) = build_server()?;
     let processor =

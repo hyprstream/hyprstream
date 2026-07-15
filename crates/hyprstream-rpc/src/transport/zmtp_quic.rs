@@ -1312,27 +1312,19 @@ pub fn cert_hash(cert_der: &[u8]) -> String {
 // TLS Helpers
 // ============================================================================
 
-/// Install the PQ-hybrid (aws-lc-rs, X25519MLKEM768) crypto provider for rustls
-/// (required for QUIC/TLS), replacing the former ring provider (#557 / S6).
-///
-/// Must be called before creating any rustls `ServerConfig` or quinn endpoint.
-/// No-op if already installed (safe to call multiple times). See
-/// [`crate::transport::pq_provider`].
-pub fn ensure_crypto_provider() {
-    crate::transport::pq_provider::install_pq_crypto_provider();
-}
-
 /// Generate a self-signed TLS certificate for development/testing.
 ///
 /// Returns (ServerConfig, cert_der_bytes).
 pub fn server_tls_self_signed(name: &str) -> Result<(rustls::ServerConfig, Vec<u8>)> {
-    ensure_crypto_provider();
     let cert_key = rcgen::generate_simple_self_signed(vec![name.to_owned()])?;
 
     let cert_der = cert_key.cert.der().to_vec();
     let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(cert_key.key_pair.serialize_der());
 
-    let mut cfg = rustls::ServerConfig::builder()
+    let mut cfg = rustls::ServerConfig::builder_with_provider(
+        crate::transport::pq_provider::internal_mesh_crypto_provider(),
+    )
+        .with_safe_default_protocol_versions()?
         .with_no_client_auth()
         .with_single_cert(vec![cert_der.clone().into()], key_der.into())?;
 
@@ -1349,7 +1341,10 @@ pub fn client_tls_pinned(cert_der: &[u8]) -> Result<rustls::ClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.add(rustls::pki_types::CertificateDer::from_slice(cert_der))?;
 
-    let cfg = rustls::ClientConfig::builder()
+    let cfg = rustls::ClientConfig::builder_with_provider(
+        crate::transport::pq_provider::internal_mesh_crypto_provider(),
+    )
+        .with_safe_default_protocol_versions()?
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
@@ -1364,7 +1359,10 @@ pub fn client_tls_system_roots() -> Result<rustls::ClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-    let cfg = rustls::ClientConfig::builder()
+    let cfg = rustls::ClientConfig::builder_with_provider(
+        crate::transport::pq_provider::internal_mesh_crypto_provider(),
+    )
+        .with_safe_default_protocol_versions()?
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
@@ -1403,12 +1401,7 @@ pub use crate::envelope::EnvelopeVerification;
 mod tests {
     use super::*;
     use crate::zmtp_framing::{build_greeting, validate_greeting, build_ready_metadata};
-
-    /// Install the ring crypto provider for rustls (required for TLS tests).
-    /// Delegates to the public module-level function.
-    fn ensure_crypto_provider() {
-        super::ensure_crypto_provider();
-    }
+    use quinn::crypto::rustls::HandshakeData;
 
     #[test]
     fn test_greeting_format() {
@@ -1491,7 +1484,6 @@ mod tests {
 
     #[test]
     fn test_tls_self_signed_generates_valid_cert() {
-        ensure_crypto_provider();
         let (config, cert_der) = server_tls_self_signed("test.local").unwrap();
 
         // Check ALPN is set
@@ -1503,7 +1495,6 @@ mod tests {
 
     #[test]
     fn test_client_tls_pinned_accepts_matching_cert() {
-        ensure_crypto_provider();
         let (_server_config, cert_der) = server_tls_self_signed("test.local").unwrap();
 
         // Should succeed
@@ -1513,6 +1504,88 @@ mod tests {
         // Check ALPN is set
         let config = client_config.unwrap();
         assert!(config.alpn_protocols.iter().any(|p| p == ALPN_ZMTP3));
+    }
+
+    #[tokio::test]
+    async fn zmtp_live_handshake_negotiates_x25519mlkem768() {
+        let (server_tls, cert_der) = server_tls_self_signed("localhost").unwrap();
+        let server = QuicRep::bind("127.0.0.1:0".parse().unwrap(), server_tls).unwrap();
+        let addr = server.local_addr().unwrap();
+        let endpoint = server.endpoint.clone();
+
+        let accepted = tokio::spawn(async move {
+            let connection = endpoint
+                .accept()
+                .await
+                .expect("incoming zmtp connection")
+                .await
+                .expect("complete zmtp handshake");
+            connection
+                .handshake_data()
+                .expect("completed quinn connection has handshake data")
+                .downcast::<HandshakeData>()
+                .expect("quinn rustls handshake data")
+                .negotiated_key_exchange_group
+        });
+
+        let client = QuicReq::connect(addr, "localhost", client_tls_pinned(&cert_der).unwrap())
+            .await
+            .unwrap();
+        let client_group = client
+            .conn
+            .handshake_data()
+            .expect("completed quinn connection has handshake data")
+            .downcast::<HandshakeData>()
+            .expect("quinn rustls handshake data")
+            .negotiated_key_exchange_group;
+
+        assert_eq!(client_group, rustls::NamedGroup::X25519MLKEM768);
+        assert_eq!(
+            accepted.await.unwrap(),
+            rustls::NamedGroup::X25519MLKEM768
+        );
+    }
+
+    #[tokio::test]
+    async fn zmtp_internal_mesh_rejects_classical_only_peer() {
+        let (server_tls, cert_der) = server_tls_self_signed("localhost").unwrap();
+        let server = QuicRep::bind("127.0.0.1:0".parse().unwrap(), server_tls).unwrap();
+        let addr = server.local_addr().unwrap();
+        let endpoint = server.endpoint.clone();
+        let accepted = tokio::spawn(async move {
+            endpoint
+                .accept()
+                .await
+                .expect("incoming classical mutation connection")
+                .await
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from_slice(&cert_der))
+            .unwrap();
+        let mut classical = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        classical.alpn_protocols = vec![ALPN_ZMTP3.to_vec()];
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            QuicReq::connect(addr, "localhost", classical),
+        )
+        .await
+        .expect("classical-only mutation handshake must terminate");
+        assert!(result.is_err(), "internal mesh accepted classical-only TLS");
+
+        let server_result = tokio::time::timeout(std::time::Duration::from_secs(5), accepted)
+            .await
+            .expect("server mutation handshake must terminate")
+            .unwrap();
+        assert!(server_result.is_err(), "server negotiated classical fallback");
     }
 
     #[test]

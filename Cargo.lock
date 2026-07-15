@@ -7200,6 +7200,7 @@ dependencies = [
  "moq-net",
  "n0-error",
  "nix 0.27.1",
+ "noq",
  "once_cell",
  "p256",
  "parking_lot 0.12.4",
@@ -10091,6 +10092,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cee32450cf726b223ac4154003c93cb52fbde159ab1240990e88945bf3ae35e"
 dependencies = [
  "aes-gcm",
+ "aws-lc-rs",
  "bytes",
  "derive_more",
  "enum-assoc",
@@ -12804,6 +12806,7 @@ version = "0.11.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4fcb935c5bec503c2f0e306bdd3e58bb9029dcb14fa8d9ac76e3a5256ac0763e"
 dependencies = [
+ "aws-lc-rs",
  "bytes",
  "fastbloom",
  "getrandom 0.3.3",

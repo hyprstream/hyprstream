@@ -105,10 +105,9 @@ impl IrohSubstrate {
     {
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(SecretKey::from_bytes(&secret_key_bytes))
-            // PQ-hybrid TLS: pin X25519MLKEM768 on the iroh QUIC channel (#557 / S6).
-            // Overrides the preset's default (ring) provider; RFC 7250 raw-public-key
-            // identity binding is orthogonal to kx_groups and unaffected.
-            .crypto_provider(crate::transport::pq_provider::pq_crypto_provider())
+            // Owned mesh policy: require X25519MLKEM768 with no classical
+            // fallback. RFC 7250 raw-public-key identity is orthogonal to kx.
+            .crypto_provider(crate::transport::pq_provider::internal_mesh_crypto_provider())
             .bind()
             .await
             .map_err(|e| anyhow::anyhow!("iroh endpoint bind: {e}"))?;
@@ -270,10 +269,13 @@ impl ProtocolHandler for EchoHandler {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use iroh::TransportAddr;
+    use noq::crypto::rustls::HandshakeData;
     use rand::RngCore;
+    use std::sync::Arc;
 
     fn fresh_key() -> [u8; 32] {
         let mut k = [0u8; 32];
@@ -293,6 +295,20 @@ mod tests {
                 .into_iter()
                 .map(TransportAddr::Ip),
         )
+    }
+
+    fn assert_hybrid_handshake(conn: &Connection, alpn: &[u8]) {
+        let data = conn
+            .handshake_data()
+            .expect("completed iroh connection has handshake data")
+            .downcast::<HandshakeData>()
+            .expect("iroh uses noq rustls handshake data");
+        assert_eq!(data.protocol.as_deref(), Some(alpn));
+        assert_eq!(
+            data.negotiated_key_exchange_group,
+            Some(rustls::NamedGroup::X25519MLKEM768),
+            "owned iroh mesh must negotiate X25519MLKEM768"
+        );
     }
 
     /// Smoke test: build two substrates, dial direct (no DNS/pkarr), echo a
@@ -318,6 +334,7 @@ mod tests {
             let conn = client
                 .connect(server_addr.clone(), ALPN_HYPRSTREAM_RPC)
                 .await?;
+            assert_hybrid_handshake(&conn, ALPN_HYPRSTREAM_RPC);
             let (mut send, mut recv) = conn.open_bi().await?;
             send.write_all(b"hello rpc").await?;
             send.finish()?;
@@ -328,6 +345,7 @@ mod tests {
         // Streaming plane round-trip (echo here; real moq-net wiring lands in Phase 3).
         {
             let conn = client.connect(server_addr.clone(), ALPN_MOQ_LITE).await?;
+            assert_hybrid_handshake(&conn, ALPN_MOQ_LITE);
             let (mut send, mut recv) = conn.open_bi().await?;
             send.write_all(b"hello moq").await?;
             send.finish()?;
@@ -339,6 +357,30 @@ mod tests {
         assert_eq!(server.endpoint_id(), server_id);
 
         client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn internal_iroh_mesh_rejects_classical_only_peer() -> Result<()> {
+        let server = IrohSubstrate::new(fresh_key(), EchoHandler, EchoHandler).await?;
+        let server_addr = direct_addr(&server);
+        let classical_client = Endpoint::builder(presets::N0)
+            .secret_key(SecretKey::from_bytes(&fresh_key()))
+            .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .bind()
+            .await
+            .map_err(|e| anyhow::anyhow!("classical mutation endpoint bind: {e}"))?;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            classical_client.connect(server_addr, ALPN_HYPRSTREAM_RPC),
+        )
+        .await
+        .expect("classical-only iroh mutation handshake must terminate");
+        assert!(result.is_err(), "internal iroh mesh accepted classical-only TLS");
+
+        classical_client.close().await;
         server.shutdown().await?;
         Ok(())
     }

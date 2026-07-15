@@ -205,7 +205,8 @@ mod tests {
     /// server cert's SHA-256 pin, and a shutdown token. (Mirrors the harness in
     /// `quinn_transport::tests`; `build_server` there is test-private.)
     fn spawn_echo_server() -> (SocketAddr, [u8; 32], CancellationToken) {
-        crate::transport::pq_provider::install_pq_crypto_provider();
+        crate::transport::pq_provider::install_pq_crypto_provider()
+            .expect("install PQ provider");
 
         let cert_key = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
         let cert_der = cert_key.cert.der().to_vec();
