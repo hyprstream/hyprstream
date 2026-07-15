@@ -217,8 +217,8 @@ impl PredecessorRecord<'_> {
     /// the watermark pins is verified to describe *these* bytes.
     pub fn record_digest(&self) -> [u8; H512_LEN] {
         match self {
-            PredecessorRecord::Genesis(cap) => h512(&cap.to_dag_cbor()),
-            PredecessorRecord::Update(rec) => h512(&rec.to_dag_cbor()),
+            PredecessorRecord::Genesis(cap) => h512(&cap.encode_value()),
+            PredecessorRecord::Update(rec) => h512(&rec.encode_value()),
         }
     }
 
@@ -2263,7 +2263,6 @@ mod tests {
             Some(DuplicityKind::HigherEpochFork)
         );
     }
-
 
     // Small accessors so the guard's sink can be inspected in-test.
     impl DuplicityGuard<InMemoryWatermarkStore, RecordingSink> {

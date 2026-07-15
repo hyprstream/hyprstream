@@ -637,7 +637,7 @@ impl Capsule {
 
     pub fn to_dag_cbor(&self) -> Result<Vec<u8>> {
         self.validate()?;
-        Ok(self.to_value().encode())
+        Ok(self.encode_value())
     }
 
     pub fn from_dag_cbor(bytes: &[u8]) -> Result<Self> {
@@ -646,6 +646,14 @@ impl Capsule {
 
     pub fn cid512(&self) -> Result<String> {
         at9p_capsule_cid512(&self.to_dag_cbor()?)
+    }
+
+    /// Serialize without re-validating. For crate-internal digest/state
+    /// projection over capsules already known to be valid — they reached here
+    /// via [`Self::from_dag_cbor`] (validated) or the signing path. External
+    /// callers must use [`Self::to_dag_cbor`].
+    pub(crate) fn encode_value(&self) -> Vec<u8> {
+        self.to_value().encode()
     }
 
     fn to_value(&self) -> DagCbor {
@@ -700,7 +708,7 @@ impl UpdateRecord {
 
     pub fn to_dag_cbor(&self) -> Result<Vec<u8>> {
         self.validate()?;
-        Ok(self.to_value().encode())
+        Ok(self.encode_value())
     }
 
     /// Serialize without re-validating. For crate-internal digest/state

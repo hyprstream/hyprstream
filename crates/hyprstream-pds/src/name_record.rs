@@ -220,35 +220,39 @@ fn validate_pin_cid(s: &str) -> Result<()> {
 
 #[cfg(test)]
 fn sample_pin() -> String {
-    hyprstream_rpc::cid::encode_cid(
+    match hyprstream_rpc::cid::encode_cid(
         hyprstream_rpc::cid::Codec::GitRaw,
         hyprstream_rpc::cid::HashAlgo::Sha2_256,
         &[0x42; 32],
-    )
-    .expect("valid sample CID")
+    ) {
+        Ok(cid) => cid,
+        Err(err) => panic!("valid sample CID: {err}"),
+    }
 }
 
 #[cfg(test)]
 fn sample_at9p_pin() -> String {
-    hyprstream_rpc::cid::encode_cid(
+    match hyprstream_rpc::cid::encode_cid(
         hyprstream_rpc::cid::Codec::At9pCapsule,
         hyprstream_rpc::cid::HashAlgo::Blake3,
         &[0x24; 64],
-    )
-    .expect("valid sample at9p CID")
+    ) {
+        Ok(cid) => cid,
+        Err(err) => panic!("valid sample at9p CID: {err}"),
+    }
 }
 
 #[cfg(test)]
 fn truncated_pin() -> String {
-    hyprstream_rpc::cid::encode_cid(
+    let cid = match hyprstream_rpc::cid::encode_cid(
         hyprstream_rpc::cid::Codec::GitRaw,
         hyprstream_rpc::cid::HashAlgo::Sha2_256,
         &[0x11; 32],
-    )
-    .expect("valid CID")
-    .chars()
-    .take(12)
-    .collect()
+    ) {
+        Ok(cid) => cid,
+        Err(err) => panic!("valid CID: {err}"),
+    };
+    cid.chars().take(12).collect()
 }
 
 #[cfg(test)]
