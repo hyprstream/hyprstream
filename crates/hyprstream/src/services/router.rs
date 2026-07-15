@@ -54,9 +54,12 @@ use std::time::{Duration, Instant};
 
 use hyprstream_rpc::transport::TransportConfig;
 
-/// Cell-unique identifier for an inference node = its Ed25519 mesh identity
-/// (the 32-byte public key used as iroh's `EndpointId` in `TransportConfig::Iroh`).
-pub type NodeId = [u8; 32];
+/// Opaque identifier for an inference replica used only for placement.
+///
+/// This is not an iroh `EndpointId`, application signing key, or authorization
+/// subject. Network reach and authenticated authority must be resolved and
+/// verified independently before a future remote placement can be dialed.
+pub type ReplicaId = [u8; 32];
 
 /// Identifier for a chat / inference session (used as the HRW placement key).
 pub type SessionId = String;
@@ -77,8 +80,8 @@ pub const DEFAULT_DOWN_TTL: Duration = Duration::from_secs(5);
 /// applies HRW over this set keyed by `session_id`.
 #[derive(Debug, Clone)]
 pub struct InferenceServerInfo {
-    /// Cell-unique node identity (Ed25519 mesh root).
-    pub node_id: NodeId,
+    /// Opaque replica placement identifier; carries no transport or authority role.
+    pub replica_id: ReplicaId,
     /// How to dial this node (Iroh for cross-host, Inproc for co-located).
     pub transport: TransportConfig,
     /// Free GPU memory in bytes (capacity weight for HRW).
@@ -129,7 +132,7 @@ pub struct SessionAffinity {
 
 #[derive(Debug, Clone, Copy)]
 struct AffinityBinding {
-    owner: NodeId,
+    owner: ReplicaId,
     leased_until: Instant,
 }
 
@@ -151,7 +154,7 @@ impl SessionAffinity {
 
     /// Look up a live (non-expired) binding for a session, renewing its lease
     /// on hit. Returns `None` if there is no binding or it has expired.
-    pub fn get(&mut self, session_id: &str) -> Option<NodeId> {
+    pub fn get(&mut self, session_id: &str) -> Option<ReplicaId> {
         let now = Instant::now();
         let binding = self.map.get_mut(session_id)?;
         if binding.leased_until <= now {
@@ -166,7 +169,7 @@ impl SessionAffinity {
     }
 
     /// Read-only peek (no lease renewal). Used by tests and observers.
-    pub fn peek(&self, session_id: &str) -> Option<NodeId> {
+    pub fn peek(&self, session_id: &str) -> Option<ReplicaId> {
         let now = Instant::now();
         self.map
             .get(session_id)
@@ -175,7 +178,7 @@ impl SessionAffinity {
     }
 
     /// Bind (or rebind) a session to an owner with a fresh lease.
-    pub fn set(&mut self, session_id: SessionId, owner: NodeId) {
+    pub fn set(&mut self, session_id: SessionId, owner: ReplicaId) {
         let leased_until = Instant::now() + self.lease_duration;
         match self.map.insert(
             session_id,
@@ -234,7 +237,7 @@ impl SessionAffinity {
 
 /// Highest Random Weight (Rendezvous Hashing) selection.
 ///
-/// For each candidate, compute `h(session_id ‖ node_id)` weighted by capacity.
+/// For each candidate, compute `h(session_id ‖ replica_id)` weighted by capacity.
 /// The candidate with the highest weighted score wins. Deterministic for a
 /// given `(session_id, replica set)` pair: every router in the cell agrees on
 /// the owner without any coordination.
@@ -314,7 +317,7 @@ pub fn least_loaded_select(candidates: &[InferenceServerInfo]) -> Option<usize> 
 fn score(session_id: &str, cand: &InferenceServerInfo) -> u64 {
     let mut h = DefaultHasher::new();
     session_id.hash(&mut h);
-    cand.node_id.hash(&mut h);
+    cand.replica_id.hash(&mut h);
     let raw = h.finish();
     // Multiply by the capacity weight. u64 wrapping mul preserves total order
     // for non-pathological weights (we expect weights well below u64::MAX).
@@ -327,7 +330,7 @@ pub struct Placement {
     /// Index into the candidate slice that was chosen.
     pub candidate_idx: usize,
     /// The owning node id.
-    pub node_id: NodeId,
+    pub replica_id: ReplicaId,
     /// Whether a new affinity binding was recorded (vs a cache hit).
     pub rebound: bool,
 }
@@ -363,10 +366,10 @@ impl NodeHealth {
 pub struct CellRouter {
     policy: PlacementPolicy,
     affinity: SessionAffinity,
-    health: HashMap<NodeId, NodeHealth>,
+    health: HashMap<ReplicaId, NodeHealth>,
     /// Nodes currently declared stalled by the token-stream watchdog.
     /// `Instant` = when the stall was declared (used for log/TTL).
-    stalled: HashMap<NodeId, Instant>,
+    stalled: HashMap<ReplicaId, Instant>,
     down_ttl: Duration,
     stall_deadline: Duration,
 }
@@ -437,9 +440,9 @@ impl CellRouter {
             .filter(|(_, c)| {
                 let down = self
                     .health
-                    .get(&c.node_id)
+                    .get(&c.replica_id)
                     .is_some_and(|h| h.is_excluded(now));
-                let stalled = self.stalled.contains_key(&c.node_id);
+                let stalled = self.stalled.contains_key(&c.replica_id);
                 !down && !stalled
             })
             .collect()
@@ -467,10 +470,10 @@ impl CellRouter {
         // Fast path: affinity hit on a node that is still in the healthy set.
         if matches!(self.policy, PlacementPolicy::Affinity) {
             if let Some(owner) = self.affinity.get(session_id) {
-                if let Some(&(idx, _)) = healthy.iter().find(|(_, c)| c.node_id == owner) {
+                if let Some(&(idx, _)) = healthy.iter().find(|(_, c)| c.replica_id == owner) {
                     return Some(Placement {
                         candidate_idx: idx,
-                        node_id: owner,
+                        replica_id: owner,
                         rebound: false,
                     });
                 }
@@ -487,10 +490,10 @@ impl CellRouter {
             PlacementPolicy::Spread => least_loaded_select(&healthy_view),
         }?;
         let (idx, chosen) = healthy[local_idx];
-        self.affinity.set(session_id.to_owned(), chosen.node_id);
+        self.affinity.set(session_id.to_owned(), chosen.replica_id);
         Some(Placement {
             candidate_idx: idx,
-            node_id: chosen.node_id,
+            replica_id: chosen.replica_id,
             rebound: true,
         })
     }
@@ -502,13 +505,13 @@ impl CellRouter {
     ///
     /// Returns `true` if this was a new down-mark (the node was previously
     /// healthy), `false` if it was already down.
-    pub fn report_dial_fail(&mut self, node_id: NodeId, now: Instant) -> bool {
+    pub fn report_dial_fail(&mut self, replica_id: ReplicaId, now: Instant) -> bool {
         let down_until = now + self.down_ttl;
-        match self.health.get(&node_id) {
+        match self.health.get(&replica_id) {
             Some(h) if h.is_excluded(now) => false,
             _ => {
                 self.health.insert(
-                    node_id,
+                    replica_id,
                     NodeHealth {
                         down_until: Some(down_until),
                     },
@@ -523,15 +526,15 @@ impl CellRouter {
     /// ([`clear_stall`](Self::clear_stall)). A stall does *not* start the
     /// down-clock — it is a stronger signal (the node answered but is not
     /// producing tokens).
-    pub fn report_stall(&mut self, node_id: NodeId, now: Instant) {
-        self.stalled.insert(node_id, now);
+    pub fn report_stall(&mut self, replica_id: ReplicaId, now: Instant) {
+        self.stalled.insert(replica_id, now);
     }
 
     /// Clear a stall / down mark once the node recovers (e.g. a subsequent
     /// `healthCheck` succeeds, or tokens resume).
-    pub fn clear_node(&mut self, node_id: NodeId) {
-        self.health.remove(&node_id);
-        self.stalled.remove(&node_id);
+    pub fn clear_node(&mut self, replica_id: ReplicaId) {
+        self.health.remove(&replica_id);
+        self.stalled.remove(&replica_id);
     }
 
     /// Token-stream stall deadline currently in effect.
@@ -551,13 +554,13 @@ impl CellRouter {
     }
 
     /// Whether a node is currently excluded (down or stalled).
-    pub fn is_excluded(&self, node_id: NodeId, now: Instant) -> Option<ExcludeReason> {
-        if self.stalled.contains_key(&node_id) {
+    pub fn is_excluded(&self, replica_id: ReplicaId, now: Instant) -> Option<ExcludeReason> {
+        if self.stalled.contains_key(&replica_id) {
             return Some(ExcludeReason::Stalled);
         }
         if self
             .health
-            .get(&node_id)
+            .get(&replica_id)
             .is_some_and(|h| h.is_excluded(now))
         {
             return Some(ExcludeReason::Down);
@@ -573,7 +576,7 @@ mod tests {
 
     fn node(id: u8, mem_free: u64, active: u64) -> InferenceServerInfo {
         InferenceServerInfo {
-            node_id: [id; 32],
+            replica_id: [id; 32],
             transport: TransportConfig::inproc("test"),
             gpu_memory_free: mem_free,
             active_sessions: active,
@@ -677,7 +680,7 @@ mod tests {
         // HRW consistency property. (Sessions on the removed node rebind.)
         let set = replica_set();
         let owner_full = hrw_select("sess-Z", &set).unwrap();
-        let owner_node_id = set[owner_full].node_id;
+        let owner_replica_id = set[owner_full].replica_id;
         // Remove each non-owner and confirm sess-Z's selection is stable.
         for drop_idx in 0..set.len() {
             if drop_idx == owner_full {
@@ -691,7 +694,7 @@ mod tests {
                 .collect();
             let owner_sub = hrw_select("sess-Z", &subset).unwrap();
             assert_eq!(
-                subset[owner_sub].node_id, owner_node_id,
+                subset[owner_sub].replica_id, owner_replica_id,
                 "sess-Z must stay on its owner when a different node is dropped"
             );
         }
@@ -789,7 +792,7 @@ mod tests {
         assert!(p1.rebound, "first placement must be a rebind");
         let p2 = router.place("sess-A", &set, now).unwrap();
         assert!(!p2.rebound, "second placement must hit the affinity cache");
-        assert_eq!(p1.node_id, p2.node_id);
+        assert_eq!(p1.replica_id, p2.replica_id);
         assert_eq!(p1.candidate_idx, p2.candidate_idx);
     }
 
@@ -801,7 +804,7 @@ mod tests {
         let mut owners = std::collections::HashSet::new();
         for i in 0..60 {
             let p = router.place(&format!("sess-{i}"), &set, now).unwrap();
-            owners.insert(p.node_id);
+            owners.insert(p.replica_id);
         }
         assert!(
             owners.len() > 1,
@@ -824,7 +827,7 @@ mod tests {
         // the least-loaded node.
         let _ = router.place("sess-A", &set, now).unwrap();
         let p = router.place("sess-B", &set, now).unwrap();
-        assert_eq!(p.node_id, set[1].node_id, "Spread must pick least-loaded");
+        assert_eq!(p.replica_id, set[1].replica_id, "Spread must pick least-loaded");
     }
 
     // ---- Failure detection: dial-fail → reassign ----
@@ -836,17 +839,17 @@ mod tests {
         let now = Instant::now();
         let p1 = router.place("sess-A", &set, now).unwrap();
         // Mark the owner down.
-        let was_new = router.report_dial_fail(p1.node_id, now);
+        let was_new = router.report_dial_fail(p1.replica_id, now);
         assert!(was_new, "first down-mark must be a transition");
         // Next placement must rebind to a different node.
         let p2 = router.place("sess-A", &set, now).unwrap();
-        assert_ne!(p2.node_id, p1.node_id, "down node must not be reselected");
+        assert_ne!(p2.replica_id, p1.replica_id, "down node must not be reselected");
         assert!(
             p2.rebound,
             "reassignment after down must record a new binding"
         );
         // Idempotent re-report.
-        let was_new2 = router.report_dial_fail(p1.node_id, now);
+        let was_new2 = router.report_dial_fail(p1.replica_id, now);
         assert!(
             !was_new2,
             "re-reporting an already-down node is not a transition"
@@ -859,7 +862,7 @@ mod tests {
         let set = replica_set();
         let t0 = Instant::now();
         let p1 = router.place("sess-A", &set, t0).unwrap();
-        router.report_dial_fail(p1.node_id, t0);
+        router.report_dial_fail(p1.replica_id, t0);
         // After the TTL, the node is eligible again.
         let t1 = t0 + Duration::from_millis(40);
         // We must clear the session's (now-rebound) binding first, otherwise
@@ -868,7 +871,7 @@ mod tests {
         let p2 = router.place("sess-A", &set, t1).unwrap();
         // The recovered node is now eligible; if it wins HRW again, great.
         assert!(
-            router.is_excluded(p1.node_id, t1).is_none(),
+            router.is_excluded(p1.replica_id, t1).is_none(),
             "node should be healthy after TTL"
         );
         let _ = p2;
@@ -880,7 +883,7 @@ mod tests {
         let set = replica_set();
         let now = Instant::now();
         for n in &set {
-            router.report_dial_fail(n.node_id, now);
+            router.report_dial_fail(n.replica_id, now);
         }
         assert!(
             router.place("sess-A", &set, now).is_none(),
@@ -896,19 +899,19 @@ mod tests {
         let set = replica_set();
         let now = Instant::now();
         let p1 = router.place("sess-A", &set, now).unwrap();
-        router.report_stall(p1.node_id, now);
+        router.report_stall(p1.replica_id, now);
         assert_eq!(
-            router.is_excluded(p1.node_id, now),
+            router.is_excluded(p1.replica_id, now),
             Some(ExcludeReason::Stalled)
         );
         let p2 = router.place("sess-A", &set, now).unwrap();
         assert_ne!(
-            p2.node_id, p1.node_id,
+            p2.replica_id, p1.replica_id,
             "stalled node must not be reselected"
         );
         // Recovery.
-        router.clear_node(p1.node_id);
-        assert!(router.is_excluded(p1.node_id, now).is_none());
+        router.clear_node(p1.replica_id);
+        assert!(router.is_excluded(p1.replica_id, now).is_none());
     }
 
     #[test]

@@ -184,16 +184,6 @@ pub struct ModelServiceInner {
     /// federation; `resolve_model_ref`'s at:// branch then falls through to
     /// local resolution.
     discovery_client: Option<Arc<hyprstream_discovery::DiscoveryClient>>,
-    /// Mesh peer identity roster (#328): enrolled Ed25519 node id → per-host
-    /// mesh-authz `Subject` (`service:inference:host-<label>`), built from
-    /// operator-configured `mesh_peers` via
-    /// [`crate::auth::mesh_trust::build_mesh_identity_roster`]. Consumed by
-    /// [`ModelService::mesh_authz_gate`] (#523 P3) to resolve a routed
-    /// [`crate::services::router::NodeId`] before the fail-closed #319/#328
-    /// policy check. `None` = no roster configured (e.g. federation/mesh not
-    /// enabled) — every non-co-located candidate is then denied by
-    /// [`ModelService::resolve_mesh_subject`], never silently skipped.
-    mesh_identity_roster: Option<Arc<Vec<([u8; 32], hyprstream_rpc::Subject)>>>,
     /// Persistent 9P synthetic tree for the fs scope (lazily initialized).
     fs_tree: std::sync::OnceLock<crate::services::fs::SyntheticTree>,
     /// Retained terminal for each model load attempt (EV7/#649) — the
@@ -286,9 +276,9 @@ enum RouteDecision {
     CoLocated,
     /// The router selected a DIFFERENT (non-co-located) replica from the
     /// resolved candidate set. #282 has not wired a cross-host dial yet,
-    /// so callers still fall back to the co-located client — but only
-    /// AFTER running the #319/#328 mesh-authz gate against this node.
-    Remote(crate::services::router::NodeId),
+    /// so callers still fall back to the co-located client. Placement metadata
+    /// supplies neither network reach nor authority.
+    Remote(crate::services::router::ReplicaId),
     /// No healthy candidate at all (every entry excluded as down/stalled,
     /// or the replica set is empty).
     NoHealthyCandidate,
@@ -326,7 +316,6 @@ impl ModelService {
             expected_audience: None,
             jwt_key_source: None,
             discovery_client: None,
-            mesh_identity_roster: None,
             fs_tree: std::sync::OnceLock::new(),
             load_terminals: TerminalStore::new(),
             load_epoch: AtomicU64::new(0),
@@ -373,23 +362,6 @@ impl ModelService {
         Arc::get_mut(&mut self.inner)
             .expect("with_discovery_client must be called before service is shared")
             .discovery_client = Some(client);
-        self
-    }
-
-    /// Set the mesh peer identity roster for the #319/#328 mesh-authz gate
-    /// (#523 P3), typically built via
-    /// [`crate::auth::mesh_trust::build_mesh_identity_roster`].
-    ///
-    /// # Panics
-    /// Panics if called after the service has been cloned (Arc refcount > 1).
-    #[allow(clippy::expect_used)]
-    pub fn with_mesh_identity_roster(
-        mut self,
-        roster: Arc<Vec<([u8; 32], hyprstream_rpc::Subject)>>,
-    ) -> Self {
-        Arc::get_mut(&mut self.inner)
-            .expect("with_mesh_identity_roster must be called before service is shared")
-            .mesh_identity_roster = Some(roster);
         self
     }
 
@@ -462,13 +434,13 @@ impl ModelService {
     fn route_decision(
         router: &mut crate::services::router::CellRouter,
         load_state: &[crate::services::router::InferenceServerInfo],
-        co_located: crate::services::router::NodeId,
+        co_located: crate::services::router::ReplicaId,
         session_id: &str,
         now: Instant,
     ) -> RouteDecision {
         match router.place(session_id, load_state, now) {
-            Some(placement) if placement.node_id == co_located => RouteDecision::CoLocated,
-            Some(placement) => RouteDecision::Remote(placement.node_id),
+            Some(placement) if placement.replica_id == co_located => RouteDecision::CoLocated,
+            Some(placement) => RouteDecision::Remote(placement.replica_id),
             None => RouteDecision::NoHealthyCandidate,
         }
     }
@@ -485,11 +457,9 @@ impl ModelService {
     /// it; the fast path returns the in-process `model.client` directly (no
     /// dial). `load_state` grows to multiple entries once cross-host replicas
     /// are resolved into it (tracked separately — see the module-level P3 PR
-    /// notes); when HRW picks a non-co-located entry, the #319/#328 mesh-authz
-    /// gate below runs BEFORE any (still not-yet-wired, #282) dial would
-    /// happen, so enforcement is already fail-closed the moment #282 adds the
-    /// dial. The router body operates on the resolved replica set; OID/reach
-    /// resolution is the entry's job.
+    /// notes). A placement identifier never supplies transport reach, a signer
+    /// key, or an authorization subject. A future cross-host path must resolve
+    /// and verify those roles independently before dialing (#282).
     ///
     /// `session_id` is the placement key (defaults to "default" when the caller
     /// has no session — keeps HRW stable for non-session-scoped requests like
@@ -500,22 +470,15 @@ impl ModelService {
         session_id: &str,
     ) -> InferenceClient {
         let now = Instant::now();
-        let co_located = Self::co_located_node_id(model);
+        let co_located = Self::co_located_replica_id(model);
         match Self::route_decision(&mut model.router, &model.load_state, co_located, session_id, now) {
             RouteDecision::CoLocated => model.client.clone(),
-            RouteDecision::Remote(node_id) => {
-                // AUTHZ SEAM (#319/#328 mesh policy): a co-located `Inproc`
-                // selection never reaches here (handled above) — it's an
-                // in-process call within the same trust domain, so no mesh
-                // policy fires there. A non-co-located selection DOES reach
-                // here; gate it fail-closed against the target host identity
-                // BEFORE any dial (the dial itself stays a documented no-op —
-                // cross-host inference spawn/discovery is deferred to #282).
-                self.mesh_authz_gate(&model.model_ref, node_id, session_id).await;
+            RouteDecision::Remote(replica_id) => {
                 debug!(
-                    "router placed session {session_id} on remote node {:?} but no \
-                     networked dial path is wired yet (#282) — using co-located fallback",
-                    node_id
+                    "router placed session {session_id} on remote replica {:?}, but placement \
+                     carries no reach or authority and no networked dial path is wired yet \
+                     (#282) — using co-located fallback",
+                    replica_id
                 );
                 model.client.clone()
             }
@@ -529,95 +492,14 @@ impl ModelService {
         }
     }
 
-    /// #319/#328 mesh-authz gate: fail-closed check that a routed
-    /// non-co-located node's host identity is authorized for `mesh.rpc`
-    /// (the inference peer-call umbrella right) before any networked dial
-    /// would occur. Resolves `node_id` to its per-host subject
-    /// (`service:inference:host-<label>`) via the enrolled `mesh_peers`
-    /// roster (#328) — an un-enrolled node (or no roster configured at all)
-    /// resolves to `None`, which is treated as denied, never as "skip the
-    /// check". The Casbin decision itself is evaluated by `PolicyService`
-    /// against the `mesh-host` template (deny-by-default, never wildcard).
-    ///
-    /// No cross-host dial exists yet (#282), so this call's outcome does not
-    /// change today's fallback-to-co-located behavior — it only logs the
-    /// decision. Wiring it now means the gate is fail-closed and already in
-    /// place the instant #282 adds the dial, rather than a TODO discovered
-    /// under time pressure later.
-    async fn mesh_authz_gate(
-        &self,
-        model_ref: &str,
-        node_id: crate::services::router::NodeId,
-        session_id: &str,
-    ) {
-        let subject = Self::resolve_mesh_subject(
-            self.mesh_identity_roster.as_deref().map(Vec::as_slice),
-            node_id,
-        );
-        let Some(subject) = subject else {
-            warn!(
-                "mesh-authz: node {node_id:?} is not an enrolled mesh_peers host — \
-                 denying mesh.rpc for session {session_id} on model {model_ref} \
-                 (fail closed, #319/#328)"
-            );
-            return;
-        };
-        let resource = format!("mesh://inference/{model_ref}");
-        let allowed = self
-            .policy_client
-            .check(&PolicyCheck {
-                subject: subject.to_string(),
-                domain: "*".to_owned(),
-                resource,
-                operation: "mesh.rpc".to_owned(),
-            })
-            .await
-            .unwrap_or_else(|e| {
-                warn!(
-                    "mesh-authz: policy check failed for {subject} on model {model_ref}: \
-                     {e} — denying (fail closed)"
-                );
-                false
-            });
-        if allowed {
-            debug!(
-                "mesh-authz: {subject} authorized for mesh.rpc on model {model_ref} \
-                 (dial not wired yet, #282)"
-            );
-        } else {
-            warn!(
-                "mesh-authz: denied mesh.rpc for {subject} on model {model_ref} \
-                 (session {session_id})"
-            );
-        }
-    }
-
-    /// Resolve a routed [`NodeId`](crate::services::router::NodeId) to its
-    /// per-host mesh-authz [`Subject`] via the enrolled `mesh_peers` roster
-    /// (#328). Pure/no I/O — split out so the fail-closed resolution rule
-    /// (`None` roster or unmatched node ⇒ `None` ⇒ deny) is directly
-    /// unit-testable.
-    fn resolve_mesh_subject(
-        roster: Option<&[([u8; 32], hyprstream_rpc::Subject)]>,
-        node_id: crate::services::router::NodeId,
-    ) -> Option<hyprstream_rpc::Subject> {
-        roster?
-            .iter()
-            .find(|(id, _)| *id == node_id)
-            .map(|(_, s)| s.clone())
-    }
-
-    /// Identity of the co-located InferenceService = our own Ed25519 verifying
-    /// key. Used by [`Self::select_inference_server`] to recognise the HRW
-    /// winner as the in-process fast path.
-    fn co_located_node_id(model: &LoadedModel) -> crate::services::router::NodeId {
+    /// Opaque placement identifier for the co-located InferenceService.
+    fn co_located_replica_id(model: &LoadedModel) -> crate::services::router::ReplicaId {
         // `load_state[0]` is the co-located entry (seeded first at load). All
-        // entries share the model's signing identity in v1; in a multi-replica
-        // future each entry carries its own node_id.
+        // future multi-replica entries carry their own opaque placement ID.
         model
             .load_state
             .first()
-            .map(|info| info.node_id)
+            .map(|info| info.replica_id)
             .unwrap_or([0u8; 32])
     }
 
@@ -970,14 +852,20 @@ impl ModelService {
                     transport: transport.clone(),
                     service_handle,
                     client,
-                    // #322 leaf cell-router. v1: single co-located replica (the
-                    // service's own verifying key as the node identity). The
+                    // #322 leaf cell-router. v1: single co-located replica. Its
+                    // placement ID is purpose-separated from every transport,
+                    // application-signing, and subject identity. The
                     // router fast-paths to `client` when HRW picks the
                     // co-located node; the replica set grows when cross-host
                     // reaches are resolved via the Resolver.
                     router: crate::services::router::CellRouter::default(),
                     load_state: vec![crate::services::router::InferenceServerInfo {
-                        node_id: self.signing_key.verifying_key().to_bytes(),
+                        replica_id: hyprstream_rpc::node_identity::derive_purpose_key(
+                            &self.signing_key,
+                            "hyprstream-inference-replica-placement-v1",
+                        )
+                        .verifying_key()
+                        .to_bytes(),
                         transport: transport.clone(),
                         gpu_memory_free: 0,
                         active_sessions: 0,
@@ -2206,7 +2094,7 @@ mod tests {
 
     fn server(id: u8, mem_free: u64, active: u64) -> InferenceServerInfo {
         InferenceServerInfo {
-            node_id: [id; 32],
+            replica_id: [id; 32],
             transport: TransportConfig::inproc("test"),
             gpu_memory_free: mem_free,
             active_sessions: active,
@@ -2333,34 +2221,4 @@ mod tests {
         assert_eq!(decision, RouteDecision::NoHealthyCandidate);
     }
 
-    // ========================================================================
-    // #523 P3 / #319 / #328 — resolve_mesh_subject (mesh-authz gate resolution)
-    // ========================================================================
-
-    #[test]
-    fn resolve_mesh_subject_none_roster_denies() {
-        // No roster configured (mesh/federation not enabled) must resolve to
-        // `None` — the caller treats this as deny, never as "skip the check".
-        assert_eq!(ModelService::resolve_mesh_subject(None, [0x10; 32]), None);
-    }
-
-    #[test]
-    fn resolve_mesh_subject_unenrolled_node_denies() {
-        let roster = vec![([0x20u8; 32], hyprstream_rpc::Subject::new("service:inference:host-known"))];
-        assert_eq!(
-            ModelService::resolve_mesh_subject(Some(&roster), [0x99; 32]),
-            None,
-            "a node absent from the roster must resolve to None (fail closed)"
-        );
-    }
-
-    #[test]
-    fn resolve_mesh_subject_enrolled_node_resolves() {
-        let subject = hyprstream_rpc::Subject::new("service:inference:host-gpu-3");
-        let roster = vec![([0x20u8; 32], subject.clone())];
-        assert_eq!(
-            ModelService::resolve_mesh_subject(Some(&roster), [0x20; 32]),
-            Some(subject)
-        );
-    }
 }

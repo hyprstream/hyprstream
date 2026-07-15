@@ -106,10 +106,10 @@ use hyprstream_core::runtime::device_pool::{DevicePool, LayerDeviceMap};
 use hyprstream_rpc::transport::TransportConfig;
 
 /// Same helper the router's own unit tests use: a node with a byte-pattern
-/// `node_id`, a free-GPU-memory weight, and an active-session counter.
+/// `replica_id`, a free-GPU-memory weight, and an active-session counter.
 fn node(id: u8, mem_free: u64, active: u64) -> InferenceServerInfo {
     InferenceServerInfo {
-        node_id: [id; 32],
+        replica_id: [id; 32],
         transport: TransportConfig::inproc("test"),
         gpu_memory_free: mem_free,
         active_sessions: active,
@@ -130,10 +130,10 @@ fn replica_set() -> Vec<InferenceServerInfo> {
 /// Cross-process-stable hash used to re-derive an HRW score independently of
 /// the router internals, so the test is a real cross-check rather than a
 /// tautology over `hrw_select`. Mirrors `router::score`'s recipe.
-fn independent_score(session_id: &str, node_id: &[u8; 32], weight: u64) -> u64 {
+fn independent_score(session_id: &str, replica_id: &[u8; 32], weight: u64) -> u64 {
     let mut h = DefaultHasher::new();
     session_id.hash(&mut h);
-    node_id.hash(&mut h);
+    replica_id.hash(&mut h);
     h.finish().wrapping_mul(weight)
 }
 
@@ -162,7 +162,7 @@ fn e6_router_same_session_id_is_sticky_across_calls() -> Result<()> {
             .place("sess-A", &set, now)
             .ok_or_else(|| anyhow!("placement must succeed (call {i})"))?;
         assert_eq!(
-            again.node_id, first.node_id,
+            again.replica_id, first.replica_id,
             "affinity: same session_id must stick to one node (call {i})"
         );
         assert_eq!(
@@ -177,12 +177,12 @@ fn e6_router_same_session_id_is_sticky_across_calls() -> Result<()> {
 
     // The stickiness comes from the affinity map, not chance: the bound owner is
     // recorded there and survives an unrelated placement in between.
-    let first_node = first.node_id;
+    let first_node = first.replica_id;
     let _other = router.place("sess-B", &set, now);
     let again = router
         .place("sess-A", &set, now)
         .ok_or_else(|| anyhow!("sess-A placement after sess-B"))?;
-    assert_eq!(again.node_id, first_node, "sess-A unchanged after sess-B");
+    assert_eq!(again.replica_id, first_node, "sess-A unchanged after sess-B");
     Ok(())
 }
 
@@ -203,8 +203,8 @@ fn e6_router_distinct_session_ids_spread_across_nodes() -> Result<()> {
         let p = router
             .place(&format!("sess-{i}"), &set, now)
             .ok_or_else(|| anyhow!("placement must succeed for session {i}"))?;
-        owners.insert(p.node_id);
-        *counts.entry(p.node_id).or_insert(0u32) += 1;
+        owners.insert(p.replica_id);
+        *counts.entry(p.replica_id).or_insert(0u32) += 1;
     }
 
     assert!(
@@ -215,9 +215,9 @@ fn e6_router_distinct_session_ids_spread_across_nodes() -> Result<()> {
     // healthy hash hits all buckets given enough draws.
     for n in &set {
         assert!(
-            owners.contains(&n.node_id),
+            owners.contains(&n.replica_id),
             "node {:?} received zero sessions (counts {counts:?})",
-            n.node_id
+            n.replica_id
         );
     }
     // No single node should hoard >80% of sessions (a uniform 3-way split would
@@ -252,7 +252,7 @@ fn e6_router_placement_is_process_independent() -> Result<()> {
             .place(&sid, &set, now)
             .ok_or_else(|| anyhow!("router b placement for {sid}"))?;
         assert_eq!(
-            pa.node_id, pb.node_id,
+            pa.replica_id, pb.replica_id,
             "two routers must agree on owner for {sid}"
         );
     }
@@ -268,14 +268,14 @@ fn e6_router_placement_is_process_independent() -> Result<()> {
         .iter()
         .map(|n| {
             (
-                independent_score("probe", &n.node_id, n.gpu_memory_free.saturating_add(1)),
-                n.node_id,
+                independent_score("probe", &n.replica_id, n.gpu_memory_free.saturating_add(1)),
+                n.replica_id,
             )
         })
         .max_by_key(|(s, _)| *s)
         .map(|(_, id)| id);
     assert_eq!(
-        Some(p.node_id),
+        Some(p.replica_id),
         expected,
         "router selection must match the HRW score"
     );
@@ -297,7 +297,7 @@ fn e6_router_affinity_lease_expiry_rebinds() -> Result<()> {
         .place("sess-A", &set, now)
         .ok_or_else(|| anyhow!("first placement"))?;
     assert!(first.rebound, "sanity: first placement is a rebind");
-    assert_eq!(router.affinity().peek("sess-A"), Some(first.node_id));
+    assert_eq!(router.affinity().peek("sess-A"), Some(first.replica_id));
 
     // After the lease lapses with no heartbeat, the binding is gone.
     std::thread::sleep(Duration::from_millis(60));
@@ -332,10 +332,10 @@ fn e6_router_dial_fail_and_stall_reassign_to_a_different_node() -> Result<()> {
     let owner = router
         .place("sess-A", &set, now)
         .ok_or_else(|| anyhow!("sess-A placement"))?;
-    let was_new = router.report_dial_fail(owner.node_id, now);
+    let was_new = router.report_dial_fail(owner.replica_id, now);
     assert!(was_new, "first dial-fail report is a state transition");
     assert_eq!(
-        router.is_excluded(owner.node_id, now),
+        router.is_excluded(owner.replica_id, now),
         Some(ExcludeReason::Down),
         "down node is excluded for placement"
     );
@@ -343,7 +343,7 @@ fn e6_router_dial_fail_and_stall_reassign_to_a_different_node() -> Result<()> {
         .place("sess-A", &set, now)
         .ok_or_else(|| anyhow!("sess-A re-placement after down"))?;
     assert_ne!(
-        rebound.node_id, owner.node_id,
+        rebound.replica_id, owner.replica_id,
         "down node must not be reselected for its own session"
     );
     assert!(rebound.rebound, "reassignment records a fresh binding");
@@ -353,20 +353,20 @@ fn e6_router_dial_fail_and_stall_reassign_to_a_different_node() -> Result<()> {
     let owner2 = router2
         .place("sess-B", &set, now)
         .ok_or_else(|| anyhow!("sess-B placement"))?;
-    router2.report_stall(owner2.node_id, now);
+    router2.report_stall(owner2.replica_id, now);
     assert_eq!(
-        router2.is_excluded(owner2.node_id, now),
+        router2.is_excluded(owner2.replica_id, now),
         Some(ExcludeReason::Stalled)
     );
     let after_stall = router2
         .place("sess-B", &set, now)
         .ok_or_else(|| anyhow!("sess-B re-placement after stall"))?;
-    assert_ne!(after_stall.node_id, owner2.node_id, "stalled node is skipped");
+    assert_ne!(after_stall.replica_id, owner2.replica_id, "stalled node is skipped");
 
     // And clearing the stall re-enables the node.
-    router2.clear_node(owner2.node_id);
+    router2.clear_node(owner2.replica_id);
     assert!(
-        router2.is_excluded(owner2.node_id, now).is_none(),
+        router2.is_excluded(owner2.replica_id, now).is_none(),
         "clear_node restores the node"
     );
     Ok(())
@@ -380,7 +380,7 @@ fn e6_router_all_nodes_down_returns_none() {
     let set = replica_set();
     let now = Instant::now();
     for n in &set {
-        router.report_dial_fail(n.node_id, now);
+        router.report_dial_fail(n.replica_id, now);
     }
     assert!(
         router.place("sess-A", &set, now).is_none(),
@@ -413,8 +413,8 @@ fn e6_router_spread_policy_picks_least_loaded() -> Result<()> {
         .place("sess-A", &set, now)
         .ok_or_else(|| anyhow!("sess-A placement under Spread"))?;
     assert_eq!(
-        p.node_id,
-        set[1].node_id,
+        p.replica_id,
+        set[1].replica_id,
         "Spread must pick the fewest-active-sessions node"
     );
     Ok(())

@@ -57,15 +57,20 @@ identity.
 - OAuth binds refusing handlers for both iroh RPC and `moql`; no remote frame is
   handed to `OAuthRpcHandler`, and no anonymous MoQ peer can publish, subscribe,
   or obtain a tenant scope.
-- `OAuthRpcHandler` separately permits only a local caller or a verified
-  `system`/`service:*` subject. This preserves authenticated local UDS control
-  without making `AnySigner` or anonymous fallback an authorization grant.
+- `OAuthRpcHandler` separately permits only provenance marked by the local
+  transport. A subject name, including `system` or `service:*`, cannot turn an
+  untrusted carrier into a local caller.
 - Iroh RPC response verification requires an independently resolved application
   response key. Mutating the carrier NodeId to equal or differ from that key does
   not select, replace, or alter it.
 - Relay admission in `moq_stream.rs` is named and documented as target/path
   pinning. EndpointId equality can reject target substitution but grants no relay
   role or application identity.
+- Inference routing uses an opaque `ReplicaId`, purpose-separated from the root
+  key and used only for HRW placement and health bookkeeping. It is never an
+  iroh EndpointId, application signer, or authorization subject. The currently
+  unwired remote branch derives no reach or authority from it; a future remote
+  dial must independently resolve and verify each of those roles.
 
 ## Lifecycle and regression evidence
 
