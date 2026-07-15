@@ -77,6 +77,10 @@ identity.
 - Production owns the install-once outbound iroh endpoint. Unit carrier tests use
   explicit runtime-owned endpoints and shut them down; they never install a
   runtime-bound endpoint into the process global.
+- Unit carrier endpoints use a direct-only real UDP/QUIC preset. Because tests
+  supply bound socket addresses explicitly, production discovery, pkarr, and
+  relay workers add no coverage and must not outlive or cross independent test
+  runtimes. Every owned substrate is drained before its runtime exits.
 - The loopback refusal sentinel asserts the global is empty before and after its
   real carrier exchange. This prevents test ordering from leaking an endpoint
   whose runtime has already exited.

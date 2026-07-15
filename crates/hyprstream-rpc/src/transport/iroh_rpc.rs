@@ -541,10 +541,10 @@ mod tests {
         let rpc_handler = IrohRpcProtocolHandler::new(processor, fresh_signing_key());
 
         let server =
-            IrohSubstrate::new(fresh_key(), NoopHandler::new("moq-not-wired"), rpc_handler).await?;
+            IrohSubstrate::new_test(fresh_key(), NoopHandler::new("moq-not-wired"), rpc_handler).await?;
         let server_addr = direct_addr(&server);
 
-        let client = IrohSubstrate::new(
+        let client = IrohSubstrate::new_test(
             fresh_key(),
             NoopHandler::new("client moq"),
             NoopHandler::new("client rpc"),
@@ -570,7 +570,7 @@ mod tests {
             out.push(b'!');
             Ok(Bytes::from(out))
         });
-        let server = IrohSubstrate::new(
+        let server = IrohSubstrate::new_test(
             fresh_key(),
             NoopHandler::new("moq"),
             IrohRpcProtocolHandler::new(processor, fresh_signing_key()),
@@ -578,7 +578,7 @@ mod tests {
         .await?;
         let server_addr = direct_addr(&server);
 
-        let client = IrohSubstrate::new(
+        let client = IrohSubstrate::new_test(
             fresh_key(),
             NoopHandler::new("c-moq"),
             NoopHandler::new("c-rpc"),
@@ -616,10 +616,10 @@ mod tests {
             from_fn(|_req: Bytes| async move { Err(anyhow::anyhow!("boom from processor")) });
         let handler = IrohRpcProtocolHandler::new(processor, server_signing);
 
-        let server = IrohSubstrate::new(fresh_key(), NoopHandler::new("moq"), handler).await?;
+        let server = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("moq"), handler).await?;
         let server_addr = direct_addr(&server);
 
-        let client = IrohSubstrate::new(
+        let client = IrohSubstrate::new_test(
             fresh_key(),
             NoopHandler::new("c-moq"),
             NoopHandler::new("c-rpc"),
@@ -675,10 +675,10 @@ mod tests {
             2,
         );
 
-        let server = IrohSubstrate::new(fresh_key(), NoopHandler::new("moq"), handler).await?;
+        let server = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("moq"), handler).await?;
         let server_addr = direct_addr(&server);
 
-        let client = IrohSubstrate::new(
+        let client = IrohSubstrate::new_test(
             fresh_key(),
             NoopHandler::new("c-moq"),
             NoopHandler::new("c-rpc"),
@@ -724,10 +724,10 @@ mod tests {
         )
         .with_read_timeout(Duration::from_millis(300));
 
-        let server = IrohSubstrate::new(fresh_key(), NoopHandler::new("moq"), handler).await?;
+        let server = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("moq"), handler).await?;
         let server_addr = direct_addr(&server);
 
-        let client = IrohSubstrate::new(
+        let client = IrohSubstrate::new_test(
             fresh_key(),
             NoopHandler::new("c-moq"),
             NoopHandler::new("c-rpc"),
@@ -776,10 +776,10 @@ mod tests {
         });
         let handler = IrohRpcProtocolHandler::new(processor, fresh_signing_key());
 
-        let server = IrohSubstrate::new(fresh_key(), NoopHandler::new("moq"), handler).await?;
+        let server = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("moq"), handler).await?;
         let server_addr = direct_addr(&server);
 
-        let client = IrohSubstrate::new(
+        let client = IrohSubstrate::new_test(
             fresh_key(),
             NoopHandler::new("c-moq"),
             NoopHandler::new("c-rpc"),

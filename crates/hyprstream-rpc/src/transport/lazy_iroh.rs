@@ -259,7 +259,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn lazy_iroh_connects_on_first_send_and_caches() {
         // Echo server substrate.
-        let server = IrohSubstrate::new(fresh_key(), EchoHandler, EchoHandler).await.unwrap();
+        let server = IrohSubstrate::new_test(fresh_key(), EchoHandler, EchoHandler).await.unwrap();
         let server_id = server.endpoint_id();
         let direct: Vec<SocketAddr> = server.endpoint().bound_sockets().into_iter().collect();
 
@@ -269,7 +269,7 @@ mod tests {
         // with that runtime, which made this test flake with iroh's "Internal
         // consistency error" (RemoteStateActorStopped) when it ran after another
         // iroh test. A per-test endpoint on the current runtime is deterministic.
-        let client = IrohSubstrate::new(
+        let client = IrohSubstrate::new_test(
             fresh_key(),
             NoopHandler::new("client moq"),
             NoopHandler::new("client rpc"),
@@ -292,23 +292,25 @@ mod tests {
         assert_eq!(resp, b"ping");
         assert!(t.state.lock().await.cached.is_some(), "session cached after first send");
 
+        // Release the cached connection and endpoint clone before draining both
+        // routers. Abruptly dropping the client substrate while `t` still held a
+        // live connection left noq driver tasks racing runtime teardown, which
+        // intermittently triggered its GSO-batch assertion in the full suite.
+        drop(t);
+        client.shutdown().await.unwrap();
         server.shutdown().await.unwrap();
-        // `client`'s endpoint was injected into `t` (not installed globally), so it
-        // is local to this test. The dial is already complete; drop it. The
-        // endpoint Arc clone held by `t` keeps it alive until `t` drops.
-        drop(client);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wrong_node_id_rejected() {
         // Server we'll dial the *address* of, but with a different identity.
-        let server = IrohSubstrate::new(fresh_key(), EchoHandler, EchoHandler).await.unwrap();
+        let server = IrohSubstrate::new_test(fresh_key(), EchoHandler, EchoHandler).await.unwrap();
         let direct: Vec<SocketAddr> = server.endpoint().bound_sockets().into_iter().collect();
 
         // Dial from this test's own endpoint (see `lazy_iroh_connects_*` above and
         // `endpoint_override`'s docs): the install-once global is bound to another
         // test's runtime and would flake with "Internal consistency error".
-        let client = IrohSubstrate::new(
+        let client = IrohSubstrate::new_test(
             fresh_key(),
             NoopHandler::new("client moq"),
             NoopHandler::new("client rpc"),
@@ -318,7 +320,7 @@ mod tests {
 
         // A *valid* but wrong EndpointId (a third node's), so this tests handshake
         // identity rejection — not a malformed key.
-        let other = IrohSubstrate::new(fresh_key(), NoopHandler::new("o1"), NoopHandler::new("o2"))
+        let other = IrohSubstrate::new_test(fresh_key(), NoopHandler::new("o1"), NoopHandler::new("o2"))
             .await
             .unwrap();
         let wrong_id: [u8; 32] = *other.endpoint_id().as_bytes();
@@ -330,11 +332,12 @@ mod tests {
         assert!(res.is_err(), "dialing a server's address under a wrong EndpointId must fail");
         assert!(t.state.lock().await.cached.is_none(), "a failed handshake caches nothing");
 
+        // As above, release the transport's endpoint clone before cleanly
+        // draining every substrate owned by this test.
+        drop(t);
+        client.shutdown().await.unwrap();
         other.shutdown().await.unwrap();
         server.shutdown().await.unwrap();
-        // `client`'s endpoint was injected into `t` (not installed globally), so it
-        // is local to this test; drop it. The Arc clone held by `t` keeps it alive.
-        drop(client);
     }
 
     #[tokio::test]

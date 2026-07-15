@@ -559,13 +559,13 @@ mod tests {
 
         let moq_handler = IrohMoqProtocolHandler::new();
         let server =
-            IrohSubstrate::new(fresh_key(), moq_handler, NoopHandler::new("rpc")).await?;
+            IrohSubstrate::new_test(fresh_key(), moq_handler, NoopHandler::new("rpc")).await?;
         let server_id: [u8; 32] = *server.endpoint_id().as_bytes();
         let direct: Vec<std::net::SocketAddr> =
             server.endpoint().bound_sockets().into_iter().collect();
 
         // ── Client: runtime-owned endpoint, never installed globally ──────────
-        let client = IrohSubstrate::new(
+        let client = IrohSubstrate::new_test(
             fresh_key(),
             NoopHandler::new("c-moq"),
             NoopHandler::new("c-rpc"),

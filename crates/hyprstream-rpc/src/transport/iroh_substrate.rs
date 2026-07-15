@@ -116,6 +116,34 @@ impl IrohSubstrate {
         Ok(Self::from_endpoint(endpoint, moq_handler, rpc_handler))
     }
 
+    /// Build a hermetic direct-only substrate for unit tests.
+    ///
+    /// Production uses [`presets::N0`] for discovery, pkarr publication, and
+    /// relay fallback. Unit carrier tests construct their target explicitly
+    /// from bound sockets, so those background paths add no coverage and can
+    /// race independent Tokio runtimes during parallel suite teardown. The
+    /// empty preset keeps the same QUIC crypto provider and real UDP carrier
+    /// while disabling discovery and relay workers.
+    #[cfg(test)]
+    pub(crate) async fn new_test<M, R>(
+        secret_key_bytes: [u8; 32],
+        moq_handler: M,
+        rpc_handler: R,
+    ) -> Result<Self>
+    where
+        M: Into<Box<dyn DynProtocolHandler>>,
+        R: Into<Box<dyn DynProtocolHandler>>,
+    {
+        let endpoint = Endpoint::builder(presets::Empty)
+            .secret_key(SecretKey::from_bytes(&secret_key_bytes))
+            .crypto_provider(crate::transport::pq_provider::pq_crypto_provider())
+            .bind()
+            .await
+            .map_err(|e| anyhow::anyhow!("test iroh endpoint bind: {e}"))?;
+
+        Ok(Self::from_endpoint(endpoint, moq_handler, rpc_handler))
+    }
+
     /// Wrap a caller-built endpoint. Useful when the caller wants
     /// non-default discovery (e.g. self-hosted `iroh-dns-server`), a
     /// non-default crypto provider, or to share an existing endpoint
@@ -273,12 +301,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn smoke_two_endpoints_two_alpns() -> Result<()> {
         // Server with EchoHandler on both ALPNs.
-        let server = IrohSubstrate::new(fresh_key(), EchoHandler, EchoHandler).await?;
+        let server = IrohSubstrate::new_test(fresh_key(), EchoHandler, EchoHandler).await?;
         let server_id = server.endpoint_id();
         let server_addr = direct_addr(&server);
 
         // Client with no-op handlers (it only originates).
-        let client = IrohSubstrate::new(
+        let client = IrohSubstrate::new_test(
             fresh_key(),
             NoopHandler::new("client moq"),
             NoopHandler::new("client rpc"),

@@ -336,7 +336,7 @@ mod tests {
         let handler = IrohMoqProtocolHandler::new().with_authz(authz);
         let producer = handler.origin_producer().clone();
         let server_consumer = handler.origin_consumer().clone();
-        let server = IrohSubstrate::new(
+        let server = IrohSubstrate::new_test(
             fresh_key(),
             handler,
             NoopHandler::new("rpc-not-wired"),
@@ -355,7 +355,7 @@ mod tests {
         drop(group);
 
         // A client-side origin would be exposed if anonymous publish were open.
-        let client = IrohSubstrate::new(
+        let client = IrohSubstrate::new_test(
             fresh_key(),
             NoopHandler::new("c-moq"),
             NoopHandler::new("c-rpc"),
