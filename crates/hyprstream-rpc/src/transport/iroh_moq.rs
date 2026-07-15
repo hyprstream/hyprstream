@@ -373,11 +373,15 @@ mod tests {
         attacker_group.write_frame(Bytes::from_static(b"attacker-data"))?;
         drop(attacker_group);
         let moq_client = Client::new().with_origin(client_origin.clone()).with_consume(client_origin);
-        let _ = tokio::time::timeout(
+        let handshake = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             moq_client.connect(session),
         )
         .await;
+        assert!(
+            matches!(handshake, Ok(Err(_))),
+            "anonymous MoQ handshake must be explicitly rejected, not succeed or time out"
+        );
 
         let server_seen_attacker = tokio::time::timeout(
             std::time::Duration::from_millis(300),

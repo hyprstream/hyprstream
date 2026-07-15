@@ -85,15 +85,10 @@ impl OauthHandler for OAuthRpcHandler {
         _operation: &str,
     ) -> Result<()> {
         // This handler is restricted to the authenticated local control plane.
-        // An AnySigner network envelope stays anonymous unless its signer is in
-        // the local service-key roster; JWT presence or a caller assertion is
-        // never sufficient. OAuth iroh does not install this handler at all.
-        let subject = ctx.subject();
-        let trusted_local_service = subject
-            .name()
-            .is_some_and(|name| name == "system" || name.starts_with("service:"));
+        // Subject names (including JWT-derived `system` / `service:*`) cannot
+        // establish locality. OAuth iroh does not install this handler at all.
         anyhow::ensure!(
-            ctx.is_local_caller() || trusted_local_service,
+            ctx.is_local_caller(),
             "OAuth user management requires an authenticated local service boundary"
         );
         Ok(())

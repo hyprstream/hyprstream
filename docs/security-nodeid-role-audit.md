@@ -38,7 +38,7 @@ identity.
   resolver, federation gate, MAC label/assurance logic, response-key selection,
   or KEM selection.
 - A signed at9p genesis service relay is a durable reach claim, not live reach.
-  `hyprstream-discovery/src/at9p_resolver.rs` now fails closed because the
+  `crates/hyprstream-pds/src/at9p_resolver.rs` now fails closed because the
   current schema lacks an independent carrier `EndpointId`; it does not derive
   one from the genesis subject Ed25519 key.
 

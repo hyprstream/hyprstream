@@ -1903,9 +1903,9 @@ mod tests {
         Ok(())
     }
 
-    /// #320: the iroh reach codec round-trips carrier address (nodeId) + relay;
-    /// an empty-relay reach is decoded but is not dialable
-    /// (dial/dial_stream fail-fast on it — pkarr-only is deferred to #282).
+    /// #320: the iroh reach codec round-trips carrier address (nodeId) + relay.
+    /// An empty-relay reach remains stream-dialable through iroh discovery;
+    /// application RPC dialing separately requires explicit reach and proof.
     #[test]
     fn iroh_reach_dial_wire_roundtrip() {
         use crate::transport::{EndpointType, TransportConfig};
@@ -1941,8 +1941,9 @@ mod tests {
         assert!(dial_transport_to_wire(&TransportConfig::ipc("/tmp/x.sock")).is_none());
     }
 
-    /// #320: a wire iroh reach with an empty relayUrl preserves its carrier address
-    /// but is not dialable — `dial` fails fast rather than hang in discovery.
+    /// #320: a wire iroh reach with an empty relayUrl preserves its carrier
+    /// address. RPC `dial()` rejects it without explicit reachability and an
+    /// independently resolved response key; `dial_stream()` may use discovery.
     #[test]
     fn iroh_reach_empty_relay_decodes_but_not_dialable() {
         use crate::stream_info::{IrohReach, TransportConfig as ReachTransport};
@@ -1952,9 +1953,12 @@ mod tests {
             relay_url: String::new(),
         });
         let dial = wire_transport_to_dial(&wire).expect("decodes");
-        // No relay + no direct addrs ⇒ dial() fail-fast.
+        // No relay + no direct addrs ⇒ application RPC dial() fails fast.
         let signer = crate::signer::LocalSigner::new(crate::crypto::SigningKey::generate(&mut rand::rngs::OsRng));
-        assert!(crate::dial::dial(&dial, signer, None, None).is_err(), "unreachable iroh reach must not dial");
+        assert!(
+            crate::dial::dial(&dial, signer, None, None).is_err(),
+            "RPC dial must require explicit reachability and response proof"
+        );
     }
 
     /// #275: a StreamInfo carrying a dialable Quic reach must be classified as
