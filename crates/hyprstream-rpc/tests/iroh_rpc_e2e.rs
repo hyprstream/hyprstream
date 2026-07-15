@@ -305,7 +305,9 @@ async fn hykem_encrypted_envelope_round_trip_over_iroh() -> Result<()> {
     .with_response_pq_store(Arc::new(response_pq_store));
 
     // Real encrypted + hybrid-signed envelope round-trip over iroh.
-    let response = rpc.call(b"ping-payload".to_vec()).await?;
+    let response = rpc
+        .call_for_service("iroh-echo", b"ping-payload".to_vec())
+        .await?;
     assert_eq!(&response[..], b"\xECping-payload");
     let received = last_received
         .lock()
@@ -354,7 +356,9 @@ async fn hykem_encrypted_envelope_round_trip_over_iroh() -> Result<()> {
     );
 
     // Second call on the same connection to exercise multiple bidi streams.
-    let response2 = rpc.call(b"second".to_vec()).await?;
+    let response2 = rpc
+        .call_for_service("iroh-echo", b"second".to_vec())
+        .await?;
     assert_eq!(&response2[..], b"\xECsecond");
 
     client.shutdown().await?;
@@ -425,6 +429,7 @@ async fn cleartext_envelope_rejected_on_iroh_receive() -> Result<()> {
         wth: None,
         client_dh_public: None,
         response_kem_recipient: None,
+        service_domain: None,
     };
     let signed = SignedEnvelope::new_signed_hybrid(envelope, &client_signing, &client_pq_sk);
     let mut wire = Vec::new();
@@ -508,6 +513,7 @@ async fn false_encrypted_marker_never_reaches_custom_processor_over_iroh() -> Re
             wth: None,
             client_dh_public: None,
             response_kem_recipient: None,
+            service_domain: None,
         },
         &signer,
     );

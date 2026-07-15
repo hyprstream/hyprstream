@@ -57,6 +57,7 @@ struct RequestEnvelope {
   clientDhPublic @7 :Data $fixedSize(32) $optional;  # LEGACY classical DH pubkey (removed at S5 #556; superseded by clientKemPublic)
   clientKemPublic @8 :Data $optional;  # S3 #554: client ephemeral hybrid-KEM RecipientPublic.encode() (X25519+ML-KEM-768) for PQ stream key agreement
   responseKemRecipient @9 :Data $optional;  # #1044: fresh per-call HyKEM recipient for the unary response (distinct from stream KEM material)
+  serviceDomain @10 :Text $optional;  # #1044: canonical destination service, authenticated inside the sealed request
 }
 
 # Signed wrapper - signature covers serialized RequestEnvelope bytes

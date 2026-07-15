@@ -144,6 +144,7 @@ pub struct EnvelopeContext {
     pub(crate) request_iat: i64,
     pub(crate) request_nonce: [u8; 16],
     pub(crate) response_kem_recipient: Option<crate::crypto::hybrid_kem::RecipientPublic>,
+    pub(crate) service_domain: Option<String>,
 
     /// Whether this request originated from a genuine in-process / IPC caller
     /// (the `FixedSigner` mutual-auth plane), as opposed to a networked peer
@@ -178,6 +179,7 @@ impl EnvelopeContext {
             request_iat: envelope.envelope.iat,
             request_nonce: envelope.envelope.nonce,
             response_kem_recipient: envelope.envelope.response_kem_recipient.clone(),
+            service_domain: envelope.envelope.service_domain.clone(),
             // AnySigner / networked plane — NOT a local caller (#328).
             is_local_caller: false,
         }
@@ -201,6 +203,7 @@ impl EnvelopeContext {
             request_iat: envelope.envelope.iat,
             request_nonce: envelope.envelope.nonce,
             response_kem_recipient: envelope.envelope.response_kem_recipient.clone(),
+            service_domain: envelope.envelope.service_domain.clone(),
             // FixedSigner mutual-auth plane — genuine in-process / IPC caller (#328).
             is_local_caller: true,
         }
@@ -228,6 +231,7 @@ impl EnvelopeContext {
             request_iat: 0,
             request_nonce: [0; 16],
             response_kem_recipient: None,
+            service_domain: None,
             // Internal self-call that never crosses a network boundary (#328).
             is_local_caller: true,
         }
@@ -1143,6 +1147,7 @@ mod empty_iss_gate_tests {
             request_iat: 0,
             request_nonce: [0; 16],
             response_kem_recipient: None,
+            service_domain: None,
             is_local_caller,
         }
     }
@@ -1296,6 +1301,7 @@ mod ipc_key_identity_tests {
             request_iat: 0,
             request_nonce: [0; 16],
             response_kem_recipient: None,
+            service_domain: None,
             // AnySigner / networked-or-UDS plane.
             is_local_caller: false,
         }
@@ -1521,6 +1527,7 @@ mod accounting_audit_tests {
             request_iat: 0,
             request_nonce: [0; 16],
             response_kem_recipient: None,
+            service_domain: None,
             is_local_caller: true,
         }
     }
@@ -1574,6 +1581,7 @@ mod accounting_audit_tests {
             request_iat: 0,
             request_nonce: [0; 16],
             response_kem_recipient: None,
+            service_domain: None,
             is_local_caller: false,
         };
         let records = capture(|| {
@@ -1637,6 +1645,7 @@ mod accounting_audit_tests {
             request_iat: 0,
             request_nonce: [0; 16],
             response_kem_recipient: None,
+            service_domain: None,
             is_local_caller: false,
         }
     }

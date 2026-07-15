@@ -30,6 +30,17 @@ type TokenProviderBox = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 /// are dropped immediately after the sole response-open attempt.
 struct ResponseRecipientSecret {
     keypair: crate::crypto::hybrid_kem::RecipientKeypair,
+    #[cfg(test)]
+    drop_probe: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+#[cfg(test)]
+impl Drop for ResponseRecipientSecret {
+    fn drop(&mut self) {
+        if let Some(probe) = &self.drop_probe {
+            probe.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 }
 
 struct PendingResponse {
@@ -38,6 +49,7 @@ struct PendingResponse {
     request_nonce: [u8; 16],
     server_identity: [u8; 32],
     recipient_public: crate::crypto::hybrid_kem::RecipientPublic,
+    service_domain: String,
     secret: ResponseRecipientSecret,
 }
 
@@ -46,6 +58,7 @@ impl std::fmt::Debug for PendingResponse {
         f.debug_struct("PendingResponse")
             .field("request_id", &self.request_id)
             .field("server_identity", &hex::encode(self.server_identity))
+            .field("service_domain", &self.service_domain)
             .finish_non_exhaustive()
     }
 }
@@ -65,6 +78,7 @@ impl PendingResponse {
             self.request_iat,
             &self.request_nonce,
             &self.server_identity,
+            &self.service_domain,
         )
     }
 }
@@ -134,6 +148,7 @@ impl CallOptions {
 /// ```
 pub struct RequestBuilder<'a> {
     client: &'a Arc<dyn RpcClient>,
+    service_domain: Option<&'static str>,
     jwt: Option<String>,
     delegated_bearer: Option<String>,
 }
@@ -155,6 +170,17 @@ impl<'a> RequestBuilder<'a> {
     pub fn new(client: &'a Arc<dyn RpcClient>) -> Self {
         Self {
             client,
+            service_domain: None,
+            jwt: None,
+            delegated_bearer: None,
+        }
+    }
+
+    /// Create a builder bound to a generated client's canonical service.
+    pub fn for_service(client: &'a Arc<dyn RpcClient>, service_domain: &'static str) -> Self {
+        Self {
+            client,
+            service_domain: Some(service_domain),
             jwt: None,
             delegated_bearer: None,
         }
@@ -174,15 +200,18 @@ impl<'a> RequestBuilder<'a> {
 
     /// Send a raw request with these options and return the raw response bytes.
     pub async fn call(self, payload: Vec<u8>) -> Result<Vec<u8>> {
-        self.client
-            .call_with_options(
-                payload,
-                CallOptions {
-                    jwt: self.jwt,
-                    delegated_bearer: self.delegated_bearer,
-                },
-            )
-            .await
+        let options = CallOptions {
+            jwt: self.jwt,
+            delegated_bearer: self.delegated_bearer,
+        };
+        match self.service_domain {
+            Some(service_domain) => {
+                self.client
+                    .call_with_options_for_service(service_domain, payload, options)
+                    .await
+            }
+            None => self.client.call_with_options(payload, options).await,
+        }
     }
 }
 
@@ -210,6 +239,8 @@ pub struct RpcClientImpl<S: Signer, T: Transport + 'static> {
     /// envelopes for carriers that forbid cleartext. Bindings are established
     /// out-of-band by DID keyAgreement / peer attestation; absence fails closed.
     request_kem_store: Option<Arc<dyn KemTrustStore>>,
+    #[cfg(test)]
+    response_secret_drop_probe: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
@@ -227,6 +258,8 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             response_verify_policy: None,
             response_pq_store: None,
             request_kem_store: None,
+            #[cfg(test)]
+            response_secret_drop_probe: None,
         }
     }
 
@@ -248,6 +281,15 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
     /// envelopes when the selected transport forbids cleartext.
     pub fn with_request_kem_store(mut self, kem_store: Arc<dyn KemTrustStore>) -> Self {
         self.request_kem_store = Some(kem_store);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_response_secret_drop_probe(
+        mut self,
+        probe: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.response_secret_drop_probe = Some(probe);
         self
     }
 
@@ -286,9 +328,30 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
     /// Send a request and return the verified, unwrapped response payload.
     /// Uses the client's default JWT.
     pub async fn call(&self, payload: Vec<u8>) -> Result<Vec<u8>> {
+        self.call_bound(payload, None).await
+    }
+
+    /// Send a request bound to a canonical destination service. Generated
+    /// clients always use this path with their `SERVICE_NAME`.
+    pub async fn call_for_service(
+        &self,
+        service_domain: &str,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        self.call_bound(payload, Some(service_domain)).await
+    }
+
+    async fn call_bound(&self, payload: Vec<u8>, service_domain: Option<&str>) -> Result<Vec<u8>> {
         let request_id = self.next_id();
         let (signed_bytes, pending) = self
-            .sign_envelope(request_id, payload, None, self.effective_jwt(), None)
+            .sign_envelope(
+                request_id,
+                payload,
+                None,
+                self.effective_jwt(),
+                None,
+                service_domain,
+            )
             .await?;
         let timeout = self.calculate_timeout();
         let response_bytes = self.transport.send(signed_bytes, timeout).await?;
@@ -304,6 +367,27 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         payload: Vec<u8>,
         ephemeral_pubkey: [u8; 32],
     ) -> Result<Vec<u8>> {
+        self.call_streaming_bound(payload, ephemeral_pubkey, None)
+            .await
+    }
+
+    /// Send a streaming setup request bound to a canonical destination.
+    pub async fn call_streaming_for_service(
+        &self,
+        service_domain: &str,
+        payload: Vec<u8>,
+        ephemeral_pubkey: [u8; 32],
+    ) -> Result<Vec<u8>> {
+        self.call_streaming_bound(payload, ephemeral_pubkey, Some(service_domain))
+            .await
+    }
+
+    async fn call_streaming_bound(
+        &self,
+        payload: Vec<u8>,
+        ephemeral_pubkey: [u8; 32],
+        service_domain: Option<&str>,
+    ) -> Result<Vec<u8>> {
         let request_id = self.next_id();
         let (signed_bytes, pending) = self
             .sign_envelope(
@@ -312,6 +396,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
                 Some(ephemeral_pubkey),
                 self.effective_jwt(),
                 None,
+                service_domain,
             )
             .await?;
         let timeout = self.calculate_timeout();
@@ -329,6 +414,17 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         ephemeral_pubkey: [u8; 32],
         options: CallOptions,
     ) -> Result<Vec<u8>> {
+        self.call_streaming_with_options_bound(payload, ephemeral_pubkey, options, None)
+            .await
+    }
+
+    async fn call_streaming_with_options_bound(
+        &self,
+        payload: Vec<u8>,
+        ephemeral_pubkey: [u8; 32],
+        options: CallOptions,
+        service_domain: Option<&str>,
+    ) -> Result<Vec<u8>> {
         let request_id = self.next_id();
         let jwt = options.jwt.or_else(|| self.effective_jwt());
         let (signed_bytes, pending) = self
@@ -338,6 +434,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
                 Some(ephemeral_pubkey),
                 jwt,
                 options.delegated_bearer,
+                service_domain,
             )
             .await?;
         let timeout = self.calculate_timeout();
@@ -355,10 +452,37 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         payload: Vec<u8>,
         options: CallOptions,
     ) -> Result<Vec<u8>> {
+        self.call_with_options_bound(payload, options, None).await
+    }
+
+    /// Send an option-bearing request bound to a canonical destination.
+    pub async fn call_with_options_for_service(
+        &self,
+        service_domain: &str,
+        payload: Vec<u8>,
+        options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        self.call_with_options_bound(payload, options, Some(service_domain))
+            .await
+    }
+
+    async fn call_with_options_bound(
+        &self,
+        payload: Vec<u8>,
+        options: CallOptions,
+        service_domain: Option<&str>,
+    ) -> Result<Vec<u8>> {
         let request_id = self.next_id();
         let jwt = options.jwt.or_else(|| self.effective_jwt());
         let (signed_bytes, pending) = self
-            .sign_envelope(request_id, payload, None, jwt, options.delegated_bearer)
+            .sign_envelope(
+                request_id,
+                payload,
+                None,
+                jwt,
+                options.delegated_bearer,
+                service_domain,
+            )
             .await?;
         let timeout = self.calculate_timeout();
         let response_bytes = self.transport.send(signed_bytes, timeout).await?;
@@ -453,10 +577,10 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             if store.ml_dsa_key_for(&server.to_bytes()).is_none() {
                 anyhow::bail!("network response server has no anchored ML-DSA-65 key");
             }
-            response.verify_with(
-                Some(server),
-                Some(store),
-                crate::crypto::CryptoPolicy::Hybrid,
+            response.verify_encrypted_with_service_domain(
+                server,
+                store,
+                &pending.service_domain,
             )?;
             let payload = pending.open(&response)?;
             Ok((response.request_id, payload))
@@ -486,6 +610,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         ephemeral_pubkey: Option<[u8; 32]>,
         jwt: Option<String>,
         delegated_bearer: Option<String>,
+        service_domain: Option<&str>,
     ) -> Result<(Vec<u8>, Option<PendingResponse>)> {
         let mut envelope = RequestEnvelope::new(payload);
         envelope.request_id = request_id;
@@ -498,62 +623,63 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         if let Some(key) = ephemeral_pubkey {
             envelope = envelope.with_client_dh_public(key);
         }
+        if let Some(service_domain) = service_domain {
+            envelope = envelope.with_service_domain(service_domain)?;
+        }
 
-        let pending = if self.transport.forbids_cleartext_envelope() {
-            let server = self
-                .server_verifying_key
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("network request has no pinned server identity"))?;
+        let (pending, encrypted_envelope) = if self.transport.forbids_cleartext_envelope() {
+            let service_domain = service_domain.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "network request has no canonical service domain; use a generated client or explicit service-bound call"
+                )
+            })?;
+            crate::envelope::validate_service_domain(service_domain)?;
+            let server = self.server_verifying_key.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "transport forbids cleartext envelopes but no server verifying key is pinned; refusing to choose a #mesh-kem recipient"
+                )
+            })?;
+            let kem_store = self.request_kem_store.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "transport forbids cleartext envelopes but no #mesh-kem trust store is configured; refusing cleartext downgrade"
+                )
+            })?;
+            let recipient = kem_store
+                .kem_recipient_for(&server.to_bytes())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "transport forbids cleartext envelopes but server {} has no anchored #mesh-kem recipient key",
+                        hex::encode(server.to_bytes())
+                    )
+                })?;
             let keypair = crate::crypto::hybrid_kem::generate_recipient(
                 crate::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
             )?;
             let public = keypair.public();
             envelope = envelope.with_response_kem_recipient(public.clone());
-            Some(PendingResponse {
+            let pending = Some(PendingResponse {
                 request_id,
                 request_iat: envelope.iat,
                 request_nonce: envelope.nonce,
                 server_identity: server.to_bytes(),
                 recipient_public: public,
-                secret: ResponseRecipientSecret { keypair },
-            })
+                service_domain: service_domain.to_owned(),
+                secret: ResponseRecipientSecret {
+                    keypair,
+                    #[cfg(test)]
+                    drop_probe: self.response_secret_drop_probe.clone(),
+                },
+            });
+            let sealed = Some(crate::envelope::seal_request_envelope(
+                &envelope, &recipient,
+            )?);
+            (pending, sealed)
         } else {
-            None
+            (None, None)
         };
 
         let canonical = envelope.to_bytes();
         let ed_pubkey = self.signer.pubkey();
-        let encrypted_envelope = if self.transport.forbids_cleartext_envelope() {
-            let server_key = self.server_verifying_key.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "transport forbids cleartext envelopes but no server verifying key \
-                     is pinned; refusing to choose a #mesh-kem recipient"
-                )
-            })?;
-            let kem_store = self.request_kem_store.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "transport forbids cleartext envelopes but no #mesh-kem trust \
-                     store is configured; refusing cleartext downgrade"
-                )
-            })?;
-            let recipient = kem_store
-                .kem_recipient_for(&server_key.to_bytes())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "transport forbids cleartext envelopes but server {} has no \
-                         anchored #mesh-kem recipient key",
-                        hex::encode(server_key.to_bytes())
-                    )
-                })?;
-
-            // Shared seal path (framing + replay-bound AAD) — single source of
-            // truth with `SignedEnvelope::new_signed_encrypted_mesh_kem`.
-            Some(crate::envelope::seal_request_envelope(
-                &envelope, &recipient,
-            )?)
-        } else {
-            None
-        };
         let signing_data: &[u8] = encrypted_envelope.as_deref().unwrap_or(&canonical);
 
         if encrypted_envelope.is_some() && self.signer.pq_pubkey().is_none() {
@@ -734,15 +860,34 @@ pub trait RpcClient: Send + Sync {
     /// Send a request and return the verified response payload.
     async fn call(&self, payload: Vec<u8>) -> Result<Vec<u8>>;
 
+    /// Send a request bound to a canonical destination service.
+    async fn call_for_service(&self, service_domain: &str, payload: Vec<u8>) -> Result<Vec<u8>>;
+
     /// Send a request with per-call authentication options.
     ///
     /// Uses `options.jwt` if provided, otherwise falls back to the client's
     /// default JWT. Includes `options.delegated_bearer` in the envelope.
     async fn call_with_options(&self, payload: Vec<u8>, options: CallOptions) -> Result<Vec<u8>>;
 
+    /// Send an option-bearing request bound to a canonical destination.
+    async fn call_with_options_for_service(
+        &self,
+        service_domain: &str,
+        payload: Vec<u8>,
+        options: CallOptions,
+    ) -> Result<Vec<u8>>;
+
     /// Send a streaming request with ephemeral DH pubkey.
     async fn call_streaming(&self, payload: Vec<u8>, ephemeral_pubkey: [u8; 32])
         -> Result<Vec<u8>>;
+
+    /// Send a streaming setup request bound to a canonical destination.
+    async fn call_streaming_for_service(
+        &self,
+        service_domain: &str,
+        payload: Vec<u8>,
+        ephemeral_pubkey: [u8; 32],
+    ) -> Result<Vec<u8>>;
 
     /// Open a verified streaming subscription.
     async fn open_stream(&self, payload: Vec<u8>) -> Result<Box<dyn StreamHandle>>;
@@ -767,8 +912,21 @@ impl<S: Signer, T: Transport + 'static> RpcClient for RpcClientImpl<S, T> {
         RpcClientImpl::call(self, payload).await
     }
 
+    async fn call_for_service(&self, service_domain: &str, payload: Vec<u8>) -> Result<Vec<u8>> {
+        RpcClientImpl::call_for_service(self, service_domain, payload).await
+    }
+
     async fn call_with_options(&self, payload: Vec<u8>, options: CallOptions) -> Result<Vec<u8>> {
         RpcClientImpl::call_with_options(self, payload, options).await
+    }
+
+    async fn call_with_options_for_service(
+        &self,
+        service_domain: &str,
+        payload: Vec<u8>,
+        options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        RpcClientImpl::call_with_options_for_service(self, service_domain, payload, options).await
     }
 
     async fn call_streaming(
@@ -777,6 +935,16 @@ impl<S: Signer, T: Transport + 'static> RpcClient for RpcClientImpl<S, T> {
         ephemeral_pubkey: [u8; 32],
     ) -> Result<Vec<u8>> {
         RpcClientImpl::call_streaming(self, payload, ephemeral_pubkey).await
+    }
+
+    async fn call_streaming_for_service(
+        &self,
+        service_domain: &str,
+        payload: Vec<u8>,
+        ephemeral_pubkey: [u8; 32],
+    ) -> Result<Vec<u8>> {
+        RpcClientImpl::call_streaming_for_service(self, service_domain, payload, ephemeral_pubkey)
+            .await
     }
 
     #[cfg(not(feature = "fips"))]
@@ -841,13 +1009,159 @@ mod request_kem_tests {
     use crate::node_identity::derive_mesh_kem_recipient;
     use crate::signer::LocalSigner;
     use crate::transport::rpc_session::{RpcPendingStream, RpcPublishStub};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+    use tokio::sync::{oneshot, Mutex, Notify};
 
     /// A carrier that forbids cleartext envelopes; `send` must never be reached
     /// in these tests (they stop at `sign_envelope`).
     struct ForbidsCleartextMock;
 
     struct CleartextResponseMock(Vec<u8>);
+
+    const LIFECYCLE_SUCCESS: u8 = 0;
+    const LIFECYCLE_FAIL_SEND: u8 = 1;
+    const LIFECYCLE_BLOCK: u8 = 2;
+    const LIFECYCLE_SWAP: u8 = 3;
+
+    struct LifecycleState {
+        behavior: AtomicU8,
+        recipients: parking_lot::Mutex<Vec<Vec<u8>>>,
+        swap_waiters: Mutex<Vec<(Vec<u8>, oneshot::Sender<Vec<u8>>)>>,
+        entered: Notify,
+    }
+
+    struct LifecycleTransport {
+        server_sk: crate::crypto::SigningKey,
+        state: Arc<LifecycleState>,
+    }
+
+    impl LifecycleTransport {
+        fn response_for(&self, payload: &[u8]) -> Result<Vec<u8>> {
+            let mut signed = signed_envelope_from_bytes(payload);
+            let server_recipient = derive_mesh_kem_recipient(&self.server_sk)?;
+            signed.decrypt_in_place_mesh_kem(&server_recipient)?;
+            let request = signed.envelope;
+            let recipient = request
+                .response_kem_recipient
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("test request omitted response recipient"))?;
+            let service_domain = request
+                .service_domain
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("test request omitted service domain"))?;
+            self.state
+                .recipients
+                .lock()
+                .push(recipient.encode());
+            let pq_sk = crate::node_identity::derive_mesh_mldsa_key(&self.server_sk);
+            let response = crate::envelope::ResponseEnvelope::new_signed_encrypted(
+                request.request_id,
+                request.payload,
+                &self.server_sk,
+                &pq_sk,
+                recipient,
+                request.iat,
+                &request.nonce,
+                service_domain,
+            )?;
+            let mut message = capnp::message::Builder::new_default();
+            response.write_to(
+                &mut message.init_root::<crate::common_capnp::response_envelope::Builder>(),
+            );
+            let mut bytes = Vec::new();
+            capnp::serialize::write_message(&mut bytes, &message)?;
+            Ok(bytes)
+        }
+    }
+
+    #[async_trait]
+    impl Transport for LifecycleTransport {
+        type Sub = RpcPendingStream;
+        type Pub = RpcPublishStub;
+
+        fn forbids_cleartext_envelope(&self) -> bool {
+            true
+        }
+
+        async fn send(&self, payload: Vec<u8>, _timeout_ms: Option<i32>) -> Result<Vec<u8>> {
+            let response = self.response_for(&payload)?;
+            match self.state.behavior.load(Ordering::SeqCst) {
+                LIFECYCLE_SUCCESS => Ok(response),
+                LIFECYCLE_FAIL_SEND => anyhow::bail!("controlled send failure"),
+                LIFECYCLE_BLOCK => {
+                    self.state.entered.notify_waiters();
+                    std::future::pending().await
+                }
+                LIFECYCLE_SWAP => {
+                    let (tx, rx) = oneshot::channel();
+                    let mut waiters = self.state.swap_waiters.lock().await;
+                    waiters.push((response, tx));
+                    if waiters.len() == 2 {
+                        let (second_response, second_tx) = waiters.pop().unwrap();
+                        let (first_response, first_tx) = waiters.pop().unwrap();
+                        first_tx
+                            .send(second_response)
+                            .map_err(|_| anyhow::anyhow!("first swapped caller was cancelled"))?;
+                        second_tx
+                            .send(first_response)
+                            .map_err(|_| anyhow::anyhow!("second swapped caller was cancelled"))?;
+                    }
+                    drop(waiters);
+                    rx.await
+                        .map_err(|_| anyhow::anyhow!("swap response channel closed"))
+                }
+                other => anyhow::bail!("unknown lifecycle behavior {other}"),
+            }
+        }
+
+        async fn subscribe(&self, _topic: &[u8]) -> Result<Self::Sub> {
+            Ok(futures::stream::pending())
+        }
+
+        async fn publish(&self, _topic: &[u8]) -> Result<Self::Pub> {
+            Ok(RpcPublishStub)
+        }
+    }
+
+    fn lifecycle_client() -> (
+        Arc<RpcClientImpl<LocalSigner, LifecycleTransport>>,
+        Arc<LifecycleState>,
+        Arc<AtomicUsize>,
+    ) {
+        let (server_sk, server_vk) = generate_signing_keypair();
+        let (client_sk, _client_vk) = generate_signing_keypair();
+        let mut kem_store = KeyedKemTrustStore::new();
+        kem_store.bind(
+            server_vk.to_bytes(),
+            derive_mesh_kem_recipient(&server_sk).unwrap().public(),
+        );
+        let pq_sk = crate::node_identity::derive_mesh_mldsa_key(&server_sk);
+        let pq_vk = crate::crypto::pq::ml_dsa_vk_from_bytes(
+            &crate::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq_sk),
+        )
+        .unwrap();
+        let mut pq_store = crate::envelope::KeyedPqTrustStore::new();
+        pq_store.bind(server_vk.to_bytes(), &pq_vk);
+        let state = Arc::new(LifecycleState {
+            behavior: AtomicU8::new(LIFECYCLE_SUCCESS),
+            recipients: parking_lot::Mutex::new(Vec::new()),
+            swap_waiters: Mutex::new(Vec::new()),
+            entered: Notify::new(),
+        });
+        let drops = Arc::new(AtomicUsize::new(0));
+        let client = RpcClientImpl::new(
+            LocalSigner::new(client_sk),
+            LifecycleTransport {
+                server_sk,
+                state: Arc::clone(&state),
+            },
+            Some(server_vk),
+        )
+        .with_request_kem_store(Arc::new(kem_store))
+        .with_response_pq_store(Arc::new(pq_store))
+        .with_response_secret_drop_probe(Arc::clone(&drops));
+        (Arc::new(client), state, drops)
+    }
 
     #[async_trait]
     impl Transport for ForbidsCleartextMock {
@@ -965,7 +1279,14 @@ mod request_kem_tests {
         );
 
         let err = rpc
-            .sign_envelope(1, b"payload".to_vec(), None, None, None)
+            .sign_envelope(
+                1,
+                b"payload".to_vec(),
+                None,
+                None,
+                None,
+                Some("test-service"),
+            )
             .await
             .expect_err("must fail closed without a #mesh-kem store");
         assert!(
@@ -997,7 +1318,14 @@ mod request_kem_tests {
         .with_request_kem_store(Arc::new(kem_store));
 
         let (bytes, pending) = rpc
-            .sign_envelope(1, b"payload".to_vec(), None, None, None)
+            .sign_envelope(
+                1,
+                b"payload".to_vec(),
+                None,
+                None,
+                None,
+                Some("test-service"),
+            )
             .await
             .expect("forwarded store must seal the envelope");
         assert!(
@@ -1048,7 +1376,10 @@ mod request_kem_tests {
         .with_request_kem_store(Arc::new(kem_store))
         .with_response_pq_store(Arc::new(pq_store));
 
-        let err = rpc.call(b"request".to_vec()).await.unwrap_err();
+        let err = rpc
+            .call_for_service("test-service", b"request".to_vec())
+            .await
+            .unwrap_err();
         assert!(
             err.to_string()
                 .contains("cleartext response rejected before payload use"),
@@ -1107,6 +1438,109 @@ mod request_kem_tests {
         assert!(
             sent.load(Ordering::SeqCst),
             "trusted-carrier cleartext must NOT be blocked — send must be reached"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_calls_use_distinct_recipients_and_swapped_live_responses_fail() {
+        let (client, state, _drops) = lifecycle_client();
+        let control = client
+            .call_for_service("service-a", b"control".to_vec())
+            .await
+            .expect("unmutated control must succeed before response swapping");
+        assert_eq!(control, b"control");
+
+        state.behavior.store(LIFECYCLE_SWAP, Ordering::SeqCst);
+        let first = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .call_for_service("service-a", b"first".to_vec())
+                    .await
+            })
+        };
+        let second = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .call_for_service("service-a", b"second".to_vec())
+                    .await
+            })
+        };
+        assert!(
+            first.await.unwrap().is_err(),
+            "first swapped response must fail"
+        );
+        assert!(
+            second.await.unwrap().is_err(),
+            "second swapped response must fail"
+        );
+
+        let recipients = state.recipients.lock();
+        assert_eq!(recipients.len(), 3);
+        assert_ne!(
+            recipients[1], recipients[2],
+            "concurrent calls must carry distinct response recipients"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_one_shot_response_state() {
+        let (client, state, drops) = lifecycle_client();
+        client
+            .call_for_service("service-a", b"control".to_vec())
+            .await
+            .expect("unmutated control must succeed before cancellation");
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        state.behavior.store(LIFECYCLE_BLOCK, Ordering::SeqCst);
+        let entered = state.entered.notified();
+        let call = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .call_for_service("service-a", b"cancelled".to_vec())
+                    .await
+            })
+        };
+        entered.await;
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            2,
+            "cancelling a live send must drop its response secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_failure_drops_state_and_caller_retry_uses_fresh_recipient() {
+        let (client, state, drops) = lifecycle_client();
+        client
+            .call_for_service("service-a", b"control".to_vec())
+            .await
+            .expect("unmutated control must succeed before send failure");
+
+        state.behavior.store(LIFECYCLE_FAIL_SEND, Ordering::SeqCst);
+        assert!(client
+            .call_for_service("service-a", b"retry-me".to_vec())
+            .await
+            .is_err());
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+
+        state.behavior.store(LIFECYCLE_SUCCESS, Ordering::SeqCst);
+        let retried = client
+            .call_for_service("service-a", b"retry-me".to_vec())
+            .await
+            .expect("caller retry control succeeds");
+        assert_eq!(retried, b"retry-me");
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
+
+        let recipients = state.recipients.lock();
+        assert_eq!(recipients.len(), 3);
+        assert_ne!(
+            recipients[1], recipients[2],
+            "caller retry must generate a fresh response recipient"
         );
     }
 }

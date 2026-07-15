@@ -103,6 +103,23 @@ where
     };
 
     let request_id = ctx.request_id;
+    let actual_service_domain = service.name();
+    crate::envelope::validate_service_domain(actual_service_domain).with_context(|| {
+        format!("service exposes non-canonical domain '{actual_service_domain}'")
+    })?;
+    match ctx.service_domain.as_deref() {
+        Some(expected) if expected != actual_service_domain => {
+            anyhow::bail!(
+                "authenticated request service domain '{expected}' does not match dispatcher '{actual_service_domain}'"
+            );
+        }
+        None if carrier.forbids_cleartext_envelope() => {
+            anyhow::bail!(
+                "authenticated network request omitted serviceDomain; dropping without response"
+            );
+        }
+        _ => {}
+    }
     if carrier.forbids_cleartext_envelope() && ctx.response_kem_recipient.is_none() {
         anyhow::bail!(
             "authenticated network request omitted responseKemRecipient; dropping without response"
@@ -132,6 +149,7 @@ where
                 recipient,
                 request_iat,
                 &request_nonce,
+                actual_service_domain,
             )
             .map_err(Into::into)
         } else {

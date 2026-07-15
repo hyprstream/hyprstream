@@ -637,6 +637,10 @@ pub struct RequestEnvelope {
     /// distinct from both legacy `client_dh_public` and stream-plane
     /// `clientKemPublic`, and is carried only inside a sealed network request.
     pub response_kem_recipient: Option<crate::crypto::hybrid_kem::RecipientPublic>,
+
+    /// Canonical destination service. On untrusted carriers this is required,
+    /// carried only in the signed+sealed request, and checked by dispatch.
+    pub service_domain: Option<String>,
 }
 
 impl RequestEnvelope {
@@ -652,6 +656,7 @@ impl RequestEnvelope {
             wth: None,
             client_dh_public: None,
             response_kem_recipient: None,
+            service_domain: None,
         }
     }
 
@@ -694,6 +699,14 @@ impl RequestEnvelope {
     ) -> Self {
         self.response_kem_recipient = Some(recipient);
         self
+    }
+
+    /// Bind the request to one canonical destination service.
+    pub fn with_service_domain(mut self, service_domain: impl Into<String>) -> Result<Self> {
+        let service_domain = service_domain.into();
+        validate_service_domain(&service_domain)?;
+        self.service_domain = Some(service_domain);
+        Ok(self)
     }
 
     /// Create an envelope for an anonymous request.
@@ -937,6 +950,34 @@ fn response_envelope_external_aad() -> Vec<u8> {
 
 const MAX_RESPONSE_KEM_RECIPIENT_BYTES: usize = 2 * 1024;
 const MAX_ENCRYPTED_RESPONSE_BYTES: usize = 1024 * 1024;
+pub const MAX_SERVICE_DOMAIN_BYTES: usize = 128;
+
+/// Validate the one canonical RPC service/destination identifier.
+///
+/// Domains are compared byte-for-byte and never normalized at a trust
+/// boundary, avoiding aliases between the client and dispatcher.
+pub fn validate_service_domain(service_domain: &str) -> Result<()> {
+    let bytes = service_domain.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_SERVICE_DOMAIN_BYTES {
+        anyhow::bail!(
+            "service domain must contain 1..={} bytes",
+            MAX_SERVICE_DOMAIN_BYTES
+        );
+    }
+    if !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit() {
+        anyhow::bail!("service domain must begin with a lowercase ASCII letter or digit");
+    }
+    if !bytes.iter().all(|byte| {
+        byte.is_ascii_lowercase()
+            || byte.is_ascii_digit()
+            || matches!(byte, b'.' | b'_' | b'-' | b'/')
+    }) {
+        anyhow::bail!(
+            "service domain must use only lowercase ASCII letters, digits, '.', '_', '-', or '/'"
+        );
+    }
+    Ok(())
+}
 
 /// Transcript-bound external AAD for the response HyKEM COSE_Encrypt0.
 pub(crate) fn encrypted_response_external_aad(
@@ -945,6 +986,7 @@ pub(crate) fn encrypted_response_external_aad(
     request_nonce: &[u8; 16],
     server_identity: &[u8; 32],
     recipient: &crate::crypto::hybrid_kem::RecipientPublic,
+    service_domain: &str,
 ) -> EnvelopeResult<Vec<u8>> {
     use ciborium::value::Value as CborValue;
     use sha2::{Digest, Sha256};
@@ -959,6 +1001,7 @@ pub(crate) fn encrypted_response_external_aad(
         CborValue::Bytes(request_nonce.to_vec()),
         CborValue::Bytes(server_identity.to_vec()),
         CborValue::Bytes(recipient_hash.to_vec()),
+        CborValue::Text(service_domain.to_owned()),
     ]);
     let mut buf = Vec::new();
     ciborium::ser::into_writer(&value, &mut buf)
@@ -1571,6 +1614,7 @@ impl SignedEnvelope {
             wth: None,
             client_dh_public: None,
             response_kem_recipient: None,
+            service_domain: None,
         }
     }
 
@@ -1985,6 +2029,9 @@ impl ToCapnp for RequestEnvelope {
         if let Some(ref recipient) = self.response_kem_recipient {
             builder.set_response_kem_recipient(&recipient.encode());
         }
+        if let Some(ref service_domain) = self.service_domain {
+            builder.set_service_domain(service_domain);
+        }
     }
 }
 
@@ -2070,6 +2117,14 @@ impl FromCapnp for RequestEnvelope {
             }
         };
 
+        let service_domain = if reader.has_service_domain() {
+            let value = reader.get_service_domain()?.to_str()?.to_owned();
+            validate_service_domain(&value)?;
+            Some(value)
+        } else {
+            None
+        };
+
         Ok(Self {
             request_id: reader.get_request_id(),
             payload: reader.get_payload()?.to_vec(),
@@ -2080,6 +2135,7 @@ impl FromCapnp for RequestEnvelope {
             wth,
             client_dh_public,
             response_kem_recipient,
+            service_domain,
         })
     }
 }
@@ -2250,6 +2306,24 @@ impl ResponseEnvelope {
         data
     }
 
+    /// Signature transcript for a sealed response. The expected service is
+    /// retained by the pending call rather than trusted from response bytes.
+    fn encrypted_signing_data(
+        request_id: u64,
+        ciphertext: &[u8],
+        service_domain: &str,
+    ) -> EnvelopeResult<Vec<u8>> {
+        validate_service_domain(service_domain)
+            .map_err(|e| EnvelopeError::Encryption(e.to_string()))?;
+        let mut data = Vec::with_capacity(40 + service_domain.len() + ciphertext.len());
+        data.extend_from_slice(b"hykem-rpc-response-signature-v2\0");
+        data.extend_from_slice(&request_id.to_le_bytes());
+        data.extend_from_slice(&(service_domain.len() as u16).to_le_bytes());
+        data.extend_from_slice(service_domain.as_bytes());
+        data.extend_from_slice(ciphertext);
+        Ok(data)
+    }
+
     /// Create and sign a new response envelope (Classical, EdDSA-only).
     ///
     /// The bare constructor defaults to Classical so callers that don't supply a
@@ -2333,7 +2407,10 @@ impl ResponseEnvelope {
         recipient: &crate::crypto::hybrid_kem::RecipientPublic,
         request_iat: i64,
         request_nonce: &[u8; 16],
+        service_domain: &str,
     ) -> EnvelopeResult<Self> {
+        validate_service_domain(service_domain)
+            .map_err(|e| EnvelopeError::Encryption(e.to_string()))?;
         let mut plaintext = Vec::new();
         {
             let mut message = capnp::message::Builder::new_default();
@@ -2352,6 +2429,7 @@ impl ResponseEnvelope {
             request_nonce,
             &server_identity,
             recipient,
+            service_domain,
         )?;
         let ciphertext =
             crate::crypto::cose_encrypt::seal_to_recipient(recipient, &plaintext, &aad, 0, 0)
@@ -2363,7 +2441,7 @@ impl ResponseEnvelope {
                 "encrypted response exceeds envelope limit".into(),
             ));
         }
-        let signing_data = Self::signing_data(request_id, &ciphertext);
+        let signing_data = Self::encrypted_signing_data(request_id, &ciphertext, service_domain)?;
         let signature_obj = signing_key.sign(&signing_data);
         let cose = Self::build_cose(
             signing_key,
@@ -2392,6 +2470,7 @@ impl ResponseEnvelope {
         request_iat: i64,
         request_nonce: &[u8; 16],
         expected_server_identity: &[u8; 32],
+        service_domain: &str,
     ) -> Result<Vec<u8>> {
         let ciphertext = self
             .encrypted_response
@@ -2406,6 +2485,7 @@ impl ResponseEnvelope {
             request_nonce,
             expected_server_identity,
             recipient_public,
+            service_domain,
         )?;
         let plaintext = crate::crypto::cose_encrypt::open_from_recipient(
             recipient_keypair,
@@ -2486,7 +2566,33 @@ impl ResponseEnvelope {
             }
         }
 
-        self.verify_cose(&verifying_key, pq_store, verify_policy)
+        self.verify_cose(&verifying_key, pq_store, verify_policy, None)
+    }
+
+    /// Verify a sealed response against the destination retained by the
+    /// pending call. Generic verification deliberately cannot authenticate an
+    /// encrypted response because it has no expected service domain.
+    pub(crate) fn verify_encrypted_with_service_domain(
+        &self,
+        expected_pubkey: &VerifyingKey,
+        pq_store: &dyn PqTrustStore,
+        service_domain: &str,
+    ) -> Result<()> {
+        validate_service_domain(service_domain)?;
+        if self.encrypted_response.is_none() {
+            anyhow::bail!("cleartext response rejected: sealed response required");
+        }
+        let verifying_key = VerifyingKey::from_bytes(&self.cnf)
+            .map_err(|_| anyhow::anyhow!("Invalid signer public key"))?;
+        if !bool::from(verifying_key.to_bytes().ct_eq(&expected_pubkey.to_bytes())) {
+            anyhow::bail!("Response signed by unexpected key");
+        }
+        self.verify_cose(
+            &verifying_key,
+            Some(pq_store),
+            crate::crypto::CryptoPolicy::Hybrid,
+            Some(service_domain),
+        )
     }
 
     /// Verify the COSE composite signature (authoritative auth check).
@@ -2499,9 +2605,17 @@ impl ResponseEnvelope {
         ed_vk: &VerifyingKey,
         pq_store: Option<&dyn PqTrustStore>,
         verify_policy: crate::crypto::CryptoPolicy,
+        service_domain: Option<&str>,
     ) -> Result<()> {
         let signing_bytes = self.encrypted_response.as_deref().unwrap_or(&self.payload);
-        let signing_data = Self::signing_data(self.request_id, signing_bytes);
+        let signing_data = if self.encrypted_response.is_some() {
+            let service_domain = service_domain.ok_or_else(|| {
+                anyhow!("encrypted response verification requires the pending service domain")
+            })?;
+            Self::encrypted_signing_data(self.request_id, signing_bytes, service_domain)?
+        } else {
+            Self::signing_data(self.request_id, signing_bytes)
+        };
         let aad = response_envelope_external_aad();
 
         // kid-anchor: resolve the trusted ML-DSA-65 key for this EdDSA identity.
@@ -2752,6 +2866,10 @@ pub fn unwrap_response_with(
     verify_policy: crate::crypto::CryptoPolicy,
 ) -> Result<(u64, Vec<u8>)> {
     let envelope = read_response_envelope(response, false)?;
+
+    if envelope.encrypted_response.is_some() {
+        anyhow::bail!("encrypted response requires one-shot pending decapsulation material");
+    }
 
     // Verify the COSE composite under the supplied policy + anchor.
     envelope.verify_with(expected_pubkey, pq_store, verify_policy)?;
@@ -3230,6 +3348,7 @@ mod tests {
             wth: Some([0xAB; 32]),
             client_dh_public: Some([0xCD; 32]),
             response_kem_recipient: None,
+            service_domain: None,
         };
 
         let mut message = Builder::new_default();
@@ -3272,6 +3391,7 @@ mod tests {
             wth: None,
             client_dh_public: None,
             response_kem_recipient: None,
+            service_domain: None,
         };
 
         // Seal to the node's #mesh-kem public, dual-signed (EdDSA + ML-DSA-65).
@@ -3333,6 +3453,7 @@ mod tests {
             wth: None,
             client_dh_public: None,
             response_kem_recipient: None,
+            service_domain: None,
         };
         let signed =
             SignedEnvelope::new_signed_encrypted_mesh_kem(envelope, &node_sk, &pq_sk, &kem_pub)
@@ -3376,6 +3497,7 @@ mod tests {
             wth: None,
             client_dh_public: None,
             response_kem_recipient: None,
+            service_domain: None,
         };
 
         let mut signed = test_new_signed(envelope, &signing_key);
@@ -3421,6 +3543,7 @@ mod tests {
             wth: Some([0xAA; 32]),
             client_dh_public: None,
             response_kem_recipient: None,
+            service_domain: None,
         };
 
         let mut signed = test_new_signed(envelope, &signing_key);
@@ -4292,17 +4415,29 @@ mod tests {
             &public,
             1234,
             &nonce,
+            "service-a",
         )
         .unwrap();
         response
-            .verify_with(Some(&server_vk), Some(&store), CryptoPolicy::Hybrid)
+            .verify_encrypted_with_service_domain(&server_vk, &store, "service-a")
             .unwrap();
         let wire = response_to_wire(&response);
         assert!(!wire
             .windows(secret_payload.len())
             .any(|w| w == secret_payload));
+        let public_unwrap =
+            unwrap_response_with(&wire, Some(&server_vk), Some(&store), CryptoPolicy::Hybrid)
+                .expect_err("public unwrap has no one-shot decapsulation state");
+        assert!(public_unwrap.to_string().contains("decapsulation material"));
         let opened = response
-            .open_encrypted(&recipient, &public, 1234, &nonce, &server_vk.to_bytes())
+            .open_encrypted(
+                &recipient,
+                &public,
+                1234,
+                &nonce,
+                &server_vk.to_bytes(),
+                "service-a",
+            )
             .unwrap();
         assert_eq!(opened, secret_payload);
 
@@ -4317,10 +4452,18 @@ mod tests {
                 1234,
                 &nonce,
                 &server_vk.to_bytes(),
+                "service-a",
             )
             .is_err());
         assert!(response
-            .open_encrypted(&recipient, &public, 1235, &nonce, &server_vk.to_bytes(),)
+            .open_encrypted(
+                &recipient,
+                &public,
+                1235,
+                &nonce,
+                &server_vk.to_bytes(),
+                "service-a",
+            )
             .is_err());
         let other_nonce = distinct_test_nonce(&nonce);
         assert!(response
@@ -4330,6 +4473,7 @@ mod tests {
                 1234,
                 &other_nonce,
                 &server_vk.to_bytes(),
+                "service-a",
             )
             .is_err());
         let (other_server, _) = generate_signing_keypair();
@@ -4340,6 +4484,20 @@ mod tests {
                 1234,
                 &nonce,
                 &other_server.verifying_key().to_bytes(),
+                "service-a",
+            )
+            .is_err());
+        assert!(response
+            .verify_encrypted_with_service_domain(&server_vk, &store, "service-b")
+            .is_err());
+        assert!(response
+            .open_encrypted(
+                &recipient,
+                &public,
+                1234,
+                &nonce,
+                &server_vk.to_bytes(),
+                "service-b",
             )
             .is_err());
     }
@@ -4367,37 +4525,58 @@ mod tests {
             &public,
             99,
             &nonce,
+            "service-a",
         )
         .unwrap();
 
         response.request_id = 9;
-        let data = ResponseEnvelope::signing_data(
+        let data = ResponseEnvelope::encrypted_signing_data(
             response.request_id,
             response.encrypted_response.as_deref().unwrap(),
-        );
+            "service-a",
+        )
+        .unwrap();
         response.sig = server_sk.sign(&data).to_bytes();
         response.cose =
             ResponseEnvelope::build_cose(&server_sk, Some(&pq_sk), CryptoPolicy::Hybrid, &data)
                 .unwrap();
         response
-            .verify_with(Some(&server_vk), Some(&store), CryptoPolicy::Hybrid)
+            .verify_encrypted_with_service_domain(&server_vk, &store, "service-a")
             .unwrap();
         assert!(response
-            .open_encrypted(&recipient, &public, 99, &nonce, &server_vk.to_bytes(),)
+            .open_encrypted(
+                &recipient,
+                &public,
+                99,
+                &nonce,
+                &server_vk.to_bytes(),
+                "service-a",
+            )
             .is_err());
 
         response.encrypted_response = Some(b"not-a-cose-encrypt0".to_vec());
-        let data =
-            ResponseEnvelope::signing_data(9, response.encrypted_response.as_deref().unwrap());
+        let data = ResponseEnvelope::encrypted_signing_data(
+            9,
+            response.encrypted_response.as_deref().unwrap(),
+            "service-a",
+        )
+        .unwrap();
         response.sig = server_sk.sign(&data).to_bytes();
         response.cose =
             ResponseEnvelope::build_cose(&server_sk, Some(&pq_sk), CryptoPolicy::Hybrid, &data)
                 .unwrap();
         response
-            .verify_with(Some(&server_vk), Some(&store), CryptoPolicy::Hybrid)
+            .verify_encrypted_with_service_domain(&server_vk, &store, "service-a")
             .unwrap();
         assert!(response
-            .open_encrypted(&recipient, &public, 99, &nonce, &server_vk.to_bytes(),)
+            .open_encrypted(
+                &recipient,
+                &public,
+                99,
+                &nonce,
+                &server_vk.to_bytes(),
+                "service-a",
+            )
             .is_err());
     }
 

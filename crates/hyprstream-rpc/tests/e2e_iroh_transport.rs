@@ -447,19 +447,21 @@ async fn rpc_round_trip_model_status_and_registry_list_over_iroh() -> Result<()>
     // stream, writes the signed envelope, and reads back the signed response,
     // which `RpcClientImpl` verifies against `server_vk`.
     let status_req = encode_op("status", b"qwen3-4b");
-    let resp = rpc.call(status_req).await?;
+    let resp = rpc.call_for_service("composite-rpc", status_req).await?;
     let resp_str = std::str::from_utf8(&resp)?;
     assert_eq!(resp_str, "model.status:ok:qwen3-4b=loaded");
 
     // A second op on the same dialed connection exercises stream multiplexing.
     let status_all_req = encode_op("status", b"");
-    let resp_all = rpc.call(status_all_req).await?;
+    let resp_all = rpc
+        .call_for_service("composite-rpc", status_all_req)
+        .await?;
     let resp_all_str = std::str::from_utf8(&resp_all)?;
     assert_eq!(resp_all_str, "model.status:ok:all=loaded");
 
     // ─── RPC round-trip #2: registry.list() ─────────────────────────────────
     let list_req = encode_op("list", b"");
-    let resp_list = rpc.call(list_req).await?;
+    let resp_list = rpc.call_for_service("composite-rpc", list_req).await?;
     let resp_list_str = std::str::from_utf8(&resp_list)?;
     assert_eq!(resp_list_str, "registry.list:ok:model,registry,policy");
 
@@ -479,7 +481,9 @@ async fn rpc_round_trip_model_status_and_registry_list_over_iroh() -> Result<()>
         )
         .with_request_kem_store(request_kem_store_for(&server_signing)?)
         .with_response_pq_store(response_pq_store_for(&server_signing)?);
-        let r = explicit_rpc.call(encode_op("status", b"explicit")).await?;
+        let r = explicit_rpc
+            .call_for_service("composite-rpc", encode_op("status", b"explicit"))
+            .await?;
         assert_eq!(std::str::from_utf8(&r)?, "model.status:ok:explicit=loaded");
     }
 
@@ -652,7 +656,9 @@ async fn one_substrate_serves_rpc_and_rejects_anonymous_moq() -> Result<()> {
         Some(request_kem),
         Some(response_pq_store_for(&server_signing)?),
     )?;
-    let resp = rpc.call(encode_op("status", b"both-alpns-model")).await?;
+    let resp = rpc
+        .call_for_service("model", encode_op("status", b"both-alpns-model"))
+        .await?;
     assert_eq!(
         std::str::from_utf8(&resp)?,
         "model.status:ok:both-alpns-model=loaded"
