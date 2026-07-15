@@ -16,8 +16,10 @@
 //! suite over iroh) requires `services/factories.rs` wiring — tracked as
 //! Phase 2 part 3 of #133.
 
+use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -122,10 +124,51 @@ fn direct_addr(substrate: &IrohSubstrate) -> EndpointAddr {
     )
 }
 
-fn assert_silent_drop(result: Result<Vec<u8>>, message: &str) {
-    if let Ok(bytes) = result {
-        assert!(bytes.is_empty(), "{message}: unexpected response bytes");
+const SILENT_DROP_DEADLINE: Duration = Duration::from_secs(1);
+
+/// Assert that a network admission drop completes promptly with an empty FIN.
+///
+/// Real iroh reproduction of every intended drop in this suite yields
+/// `Ok(empty)`. No reset/closed error is allowlisted because none is produced
+/// by this path. In particular, the transport's own timeout and every unrelated
+/// error are failures rather than alternate evidence of a silent drop.
+async fn assert_silent_drop<F>(operation: F, message: &str)
+where
+    F: Future<Output = Result<Vec<u8>>>,
+{
+    match tokio::time::timeout(SILENT_DROP_DEADLINE, operation).await {
+        Err(_) => panic!(
+            "{message}: outer deadline elapsed after {SILENT_DROP_DEADLINE:?}; \
+             timeout is not evidence of peer close"
+        ),
+        Ok(Ok(bytes)) => assert!(
+            bytes.is_empty(),
+            "{message}: unexpected response bytes: {}",
+            bytes.len()
+        ),
+        Ok(Err(error)) => panic!(
+            "{message}: unexpected transport error (only prompt Ok(empty) is accepted): {error:#}"
+        ),
     }
+}
+
+#[tokio::test]
+async fn silent_drop_oracle_rejects_nonresponsive_peer_control() {
+    let started = Instant::now();
+    let assertion = tokio::spawn(assert_silent_drop(
+        std::future::pending::<Result<Vec<u8>>>(),
+        "nonresponsive peer control",
+    ));
+
+    match tokio::time::timeout(SILENT_DROP_DEADLINE * 2, assertion).await {
+        Err(_) => panic!("oracle control itself hung"),
+        Ok(Ok(())) => panic!("a nonresponsive peer passed the silent-drop assertion"),
+        Ok(Err(join_error)) => assert!(join_error.is_panic()),
+    }
+    assert!(
+        started.elapsed() < SILENT_DROP_DEADLINE * 2,
+        "timeout control must fail promptly"
+    );
 }
 
 struct RecordingTransport<T> {
@@ -365,8 +408,11 @@ async fn cleartext_envelope_rejected_on_iroh_receive() -> Result<()> {
 
     // Raw send bypasses RpcClientImpl's send-side guard — this exercises the
     // *receive* side directly, the scenario a hostile/downgrading peer creates.
-    let result = transport.send(wire, Some(8_000)).await;
-    assert_silent_drop(result, "cleartext must be reset/dropped without a response");
+    assert_silent_drop(
+        transport.send(wire, Some(8_000)),
+        "cleartext must be reset/dropped without a response",
+    )
+    .await;
     assert_eq!(
         invocations.load(Ordering::SeqCst),
         0,
@@ -445,8 +491,11 @@ async fn false_encrypted_marker_never_reaches_custom_processor_over_iroh() -> Re
         "adversarial frame must actually contain the clear outer payload"
     );
 
-    let result = transport.send(wire, Some(5_000)).await;
-    assert_silent_drop(result, "false marker must be silently reset/dropped");
+    assert_silent_drop(
+        transport.send(wire, Some(5_000)),
+        "false marker must be silently reset/dropped",
+    )
+    .await;
     assert_eq!(invocations.load(Ordering::SeqCst), 0);
 
     client.shutdown().await?;
@@ -483,10 +532,11 @@ async fn repeated_garbage_is_silently_dropped_without_handler_work() -> Result<(
     let transport = IrohTransport::new(conn);
 
     for _ in 0..3 {
-        let result = transport
-            .send(b"not-a-capnp-message".to_vec(), Some(5_000))
-            .await;
-        assert_silent_drop(result, "garbage must not receive a signed response");
+        assert_silent_drop(
+            transport.send(b"not-a-capnp-message".to_vec(), Some(5_000)),
+            "garbage must not receive a signed response",
+        )
+        .await;
     }
     assert_eq!(invocations.load(Ordering::SeqCst), 0);
 
