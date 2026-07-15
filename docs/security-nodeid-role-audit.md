@@ -41,6 +41,11 @@ identity.
   `crates/hyprstream-discovery/src/at9p_resolver.rs` now fails closed because the
   current schema lacks an independent carrier `EndpointId`; it does not derive
   one from the genesis subject Ed25519 key.
+- `crates/hyprstream-pds/src/at9p_resolver.rs` separately performs the A4 GATE
+  over peer-presented capsule bytes and returns verified application signer
+  material for admission. Its Ed25519 subject half is explicitly not a NodeId,
+  reach selector, or proof of live carrier possession; unwired locator fetch
+  fails closed.
 
 ## Retained carrier comparison/diagnostic occurrences
 
@@ -66,11 +71,12 @@ identity.
 - Relay admission in `moq_stream.rs` is named and documented as target/path
   pinning. EndpointId equality can reject target substitution but grants no relay
   role or application identity.
-- Inference routing uses an opaque `ReplicaId`, purpose-separated from the root
-  key and used only for HRW placement and health bookkeeping. It is never an
-  iroh EndpointId, application signer, or authorization subject. The currently
-  unwired remote branch derives no reach or authority from it; a future remote
-  dial must independently resolve and verify each of those roles.
+- Inference routing uses a dedicated `ReplicaId` newtype, purpose-separated from
+  the root key and used only for HRW placement and health bookkeeping. The
+  private representation prevents accidental interchange with raw iroh
+  EndpointId or signer bytes. It is never an application signer or authorization
+  subject. The currently unwired remote branch derives no reach or authority
+  from it; a future remote dial must independently resolve and verify each role.
 
 ## Lifecycle and regression evidence
 

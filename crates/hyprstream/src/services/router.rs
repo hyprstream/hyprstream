@@ -59,7 +59,23 @@ use hyprstream_rpc::transport::TransportConfig;
 /// This is not an iroh `EndpointId`, application signing key, or authorization
 /// subject. Network reach and authenticated authority must be resolved and
 /// verified independently before a future remote placement can be dialed.
-pub type ReplicaId = [u8; 32];
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReplicaId([u8; 32]);
+
+impl ReplicaId {
+    /// Construct placement metadata from its stable byte representation.
+    ///
+    /// This explicit conversion does not verify or grant any transport or
+    /// authority role; it only prevents accidental type interchange.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Borrow the stable bytes used by the placement hash.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
 
 /// Identifier for a chat / inference session (used as the HRW placement key).
 pub type SessionId = String;
@@ -576,7 +592,7 @@ mod tests {
 
     fn node(id: u8, mem_free: u64, active: u64) -> InferenceServerInfo {
         InferenceServerInfo {
-            replica_id: [id; 32],
+            replica_id: ReplicaId::from_bytes([id; 32]),
             transport: TransportConfig::inproc("test"),
             gpu_memory_free: mem_free,
             active_sessions: active,
@@ -729,7 +745,7 @@ mod tests {
     #[test]
     fn affinity_get_set_expire() {
         let mut aff = SessionAffinity::new(Duration::from_millis(50));
-        let owner = [0xAB; 32];
+        let owner = ReplicaId::from_bytes([0xAB; 32]);
         assert_eq!(aff.peek("s1"), None, "empty map → no binding");
         aff.set("s1".to_owned(), owner);
         assert_eq!(aff.peek("s1"), Some(owner));
@@ -750,21 +766,21 @@ mod tests {
     fn affinity_generation_bumps_on_change() {
         let mut aff = SessionAffinity::new(Duration::from_secs(10));
         let g0 = aff.generation();
-        aff.set("s1".to_owned(), [1; 32]);
+        aff.set("s1".to_owned(), ReplicaId::from_bytes([1; 32]));
         assert!(aff.generation() > g0);
         let g1 = aff.generation();
         // Same owner rebind → no bump.
-        aff.set("s1".to_owned(), [1; 32]);
+        aff.set("s1".to_owned(), ReplicaId::from_bytes([1; 32]));
         assert_eq!(aff.generation(), g1);
         // Different owner → bump.
-        aff.set("s1".to_owned(), [2; 32]);
+        aff.set("s1".to_owned(), ReplicaId::from_bytes([2; 32]));
         assert!(aff.generation() > g1);
     }
 
     #[test]
     fn affinity_remove_drops_binding() {
         let mut aff = SessionAffinity::new(Duration::from_secs(10));
-        aff.set("s1".to_owned(), [1; 32]);
+        aff.set("s1".to_owned(), ReplicaId::from_bytes([1; 32]));
         assert_eq!(aff.len(), 1);
         aff.remove("s1");
         assert!(aff.is_empty());
@@ -773,8 +789,8 @@ mod tests {
     #[test]
     fn affinity_sweep_expired() {
         let mut aff = SessionAffinity::new(Duration::from_millis(20));
-        aff.set("a".to_owned(), [1; 32]);
-        aff.set("b".to_owned(), [2; 32]);
+        aff.set("a".to_owned(), ReplicaId::from_bytes([1; 32]));
+        aff.set("b".to_owned(), ReplicaId::from_bytes([2; 32]));
         std::thread::sleep(Duration::from_millis(40));
         let dropped = aff.sweep_expired();
         assert_eq!(dropped, 2);

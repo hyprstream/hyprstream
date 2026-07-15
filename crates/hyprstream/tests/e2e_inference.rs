@@ -109,7 +109,7 @@ use hyprstream_rpc::transport::TransportConfig;
 /// `replica_id`, a free-GPU-memory weight, and an active-session counter.
 fn node(id: u8, mem_free: u64, active: u64) -> InferenceServerInfo {
     InferenceServerInfo {
-        replica_id: [id; 32],
+        replica_id: hyprstream_core::services::router::ReplicaId::from_bytes([id; 32]),
         transport: TransportConfig::inproc("test"),
         gpu_memory_free: mem_free,
         active_sessions: active,
@@ -268,7 +268,7 @@ fn e6_router_placement_is_process_independent() -> Result<()> {
         .iter()
         .map(|n| {
             (
-                independent_score("probe", &n.replica_id, n.gpu_memory_free.saturating_add(1)),
+                independent_score("probe", n.replica_id.as_bytes(), n.gpu_memory_free.saturating_add(1)),
                 n.replica_id,
             )
         })

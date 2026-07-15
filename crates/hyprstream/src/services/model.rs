@@ -500,7 +500,7 @@ impl ModelService {
             .load_state
             .first()
             .map(|info| info.replica_id)
-            .unwrap_or([0u8; 32])
+            .unwrap_or(crate::services::router::ReplicaId::from_bytes([0u8; 32]))
     }
 
     /// Resolve a model identifier string to a [`ModelRef`].
@@ -860,12 +860,14 @@ impl ModelService {
                     // reaches are resolved via the Resolver.
                     router: crate::services::router::CellRouter::default(),
                     load_state: vec![crate::services::router::InferenceServerInfo {
-                        replica_id: hyprstream_rpc::node_identity::derive_purpose_key(
-                            &self.signing_key,
-                            "hyprstream-inference-replica-placement-v1",
-                        )
-                        .verifying_key()
-                        .to_bytes(),
+                        replica_id: crate::services::router::ReplicaId::from_bytes(
+                            hyprstream_rpc::node_identity::derive_purpose_key(
+                                &self.signing_key,
+                                "hyprstream-inference-replica-placement-v1",
+                            )
+                            .verifying_key()
+                            .to_bytes(),
+                        ),
                         transport: transport.clone(),
                         gpu_memory_free: 0,
                         active_sessions: 0,
@@ -2094,7 +2096,7 @@ mod tests {
 
     fn server(id: u8, mem_free: u64, active: u64) -> InferenceServerInfo {
         InferenceServerInfo {
-            replica_id: [id; 32],
+            replica_id: crate::services::router::ReplicaId::from_bytes([id; 32]),
             transport: TransportConfig::inproc("test"),
             gpu_memory_free: mem_free,
             active_sessions: active,
@@ -2107,7 +2109,7 @@ mod tests {
     /// `CoLocated` — no regression from pre-P3 behavior.
     #[test]
     fn route_decision_single_replica_is_co_located() {
-        let co_located = [0x10; 32];
+        let co_located = crate::services::router::ReplicaId::from_bytes([0x10; 32]);
         let load_state = vec![server(0x10, 1024, 0)];
         let mut router = CellRouter::default();
         let decision = ModelService::route_decision(
@@ -2127,7 +2129,7 @@ mod tests {
     /// by HRW/least-loaded over live candidates" proven at this layer.
     #[test]
     fn route_decision_multi_replica_distributes_and_detects_remote() {
-        let co_located = [0x10; 32];
+        let co_located = crate::services::router::ReplicaId::from_bytes([0x10; 32]);
         let load_state = vec![
             server(0x10, 16 * 1024 * 1024 * 1024, 0), // co-located
             server(0x20, 16 * 1024 * 1024 * 1024, 0), // remote
@@ -2160,7 +2162,7 @@ mod tests {
     /// whether it lands co-located or remote.
     #[test]
     fn route_decision_session_affinity_holds() {
-        let co_located = [0x10; 32];
+        let co_located = crate::services::router::ReplicaId::from_bytes([0x10; 32]);
         let load_state = vec![
             server(0x10, 16 * 1024 * 1024 * 1024, 0),
             server(0x20, 16 * 1024 * 1024 * 1024, 0),
@@ -2180,7 +2182,7 @@ mod tests {
     /// reassign to a different node rather than returning the excluded one.
     #[test]
     fn route_decision_fails_over_on_replica_loss() {
-        let co_located = [0x10; 32];
+        let co_located = crate::services::router::ReplicaId::from_bytes([0x10; 32]);
         let load_state = vec![
             server(0x10, 16 * 1024 * 1024 * 1024, 0),
             server(0x20, 16 * 1024 * 1024 * 1024, 0),
@@ -2208,7 +2210,7 @@ mod tests {
     /// caller's fallback-to-co-located-client path), never a panic.
     #[test]
     fn route_decision_empty_replica_set_is_no_healthy_candidate() {
-        let co_located = [0x10; 32];
+        let co_located = crate::services::router::ReplicaId::from_bytes([0x10; 32]);
         let load_state: Vec<InferenceServerInfo> = vec![];
         let mut router = CellRouter::default();
         let decision = ModelService::route_decision(
