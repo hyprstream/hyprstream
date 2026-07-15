@@ -58,7 +58,7 @@
 //! NodeIds are reachable and correlate lookup traffic) is **unaffected** by this
 //! demotion — pkarr is still public. Its mitigation is oblivious-relay (#361);
 //! until then, operators that consider the side channel actionable should run a
-//! self-hosted `iroh-dns-server` via [`IrohSubstrate::from_endpoint`].
+//! self-hosted `iroh-dns-server` configured through the owned endpoint builder.
 
 use anyhow::Result;
 use iroh::endpoint::{Connection, presets};
@@ -85,9 +85,10 @@ impl IrohSubstrate {
     /// Build the substrate from raw 32-byte Ed25519 secret key material.
     ///
     /// Uses iroh's `presets::N0` for discovery (n0 DNS + pkarr) and relay
-    /// fallback. Operators wanting self-hosted discovery should bypass this
-    /// constructor and use [`IrohSubstrate::from_endpoint`] with a
-    /// pre-configured `iroh::Endpoint`.
+    /// fallback. Alternate discovery configuration must be added through an
+    /// owned builder that also installs this same hybrid-only provider; a
+    /// prebuilt endpoint cannot safely be accepted because iroh exposes no
+    /// effective-provider introspection after bind.
     ///
     /// **pkarr here is liveness-only** — see the module-level "D3" note. The
     /// published record carries reach hints (relay + direct addrs) for this
@@ -112,7 +113,7 @@ impl IrohSubstrate {
             .await
             .map_err(|e| anyhow::anyhow!("iroh endpoint bind: {e}"))?;
 
-        Ok(Self::from_endpoint(endpoint, moq_handler, rpc_handler))
+        Ok(Self::from_owned_endpoint(endpoint, moq_handler, rpc_handler))
     }
 
     /// Build a hermetic direct-only substrate for unit tests.
@@ -135,19 +136,17 @@ impl IrohSubstrate {
     {
         let endpoint = Endpoint::builder(presets::Empty)
             .secret_key(SecretKey::from_bytes(&secret_key_bytes))
-            .crypto_provider(crate::transport::pq_provider::pq_crypto_provider())
+            .crypto_provider(crate::transport::pq_provider::internal_mesh_crypto_provider())
             .bind()
             .await
             .map_err(|e| anyhow::anyhow!("test iroh endpoint bind: {e}"))?;
 
-        Ok(Self::from_endpoint(endpoint, moq_handler, rpc_handler))
+        Ok(Self::from_owned_endpoint(endpoint, moq_handler, rpc_handler))
     }
 
-    /// Wrap a caller-built endpoint. Useful when the caller wants
-    /// non-default discovery (e.g. self-hosted `iroh-dns-server`), a
-    /// non-default crypto provider, or to share an existing endpoint
-    /// across substrates.
-    pub fn from_endpoint<M, R>(
+    /// Attach the owned ALPNs to an endpoint constructed immediately above.
+    /// Kept private because `Endpoint` does not reveal its effective provider.
+    fn from_owned_endpoint<M, R>(
         endpoint: Endpoint,
         moq_handler: M,
         rpc_handler: R,

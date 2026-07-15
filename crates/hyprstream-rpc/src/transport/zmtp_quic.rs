@@ -322,6 +322,9 @@ impl QuicRep {
     /// * `addr` - Socket address to bind to
     /// * `tls` - TLS server configuration
     pub fn bind(addr: SocketAddr, tls: rustls::ServerConfig) -> Result<Self> {
+        crate::transport::pq_provider::validate_internal_mesh_crypto_provider(
+            tls.crypto_provider(),
+        )?;
         let quic_server_cfg =
             quinn::ServerConfig::with_crypto(Arc::new(quinn::crypto::rustls::QuicServerConfig::try_from(tls)?));
 
@@ -646,6 +649,9 @@ impl QuicReq {
         server_name: &str,
         tls: rustls::ClientConfig,
     ) -> Result<Self> {
+        crate::transport::pq_provider::validate_internal_mesh_crypto_provider(
+            tls.crypto_provider(),
+        )?;
         let quic_client_config =
             quinn::ClientConfig::new(Arc::new(quinn::crypto::rustls::QuicClientConfig::try_from(
                 tls,
@@ -1548,44 +1554,42 @@ mod tests {
 
     #[tokio::test]
     async fn zmtp_internal_mesh_rejects_classical_only_peer() {
-        let (server_tls, cert_der) = server_tls_self_signed("localhost").unwrap();
-        let server = QuicRep::bind("127.0.0.1:0".parse().unwrap(), server_tls).unwrap();
-        let addr = server.local_addr().unwrap();
-        let endpoint = server.endpoint.clone();
-        let accepted = tokio::spawn(async move {
-            endpoint
-                .accept()
-                .await
-                .expect("incoming classical mutation connection")
-                .await
-        });
-
-        let mut roots = rustls::RootCertStore::empty();
-        roots
-            .add(rustls::pki_types::CertificateDer::from_slice(&cert_der))
-            .unwrap();
         let mut classical = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
         .with_safe_default_protocol_versions()
         .unwrap()
-        .with_root_certificates(roots)
+        .with_root_certificates(rustls::RootCertStore::empty())
         .with_no_client_auth();
         classical.alpn_protocols = vec![ALPN_ZMTP3.to_vec()];
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            QuicReq::connect(addr, "localhost", classical),
-        )
-        .await
-        .expect("classical-only mutation handshake must terminate");
-        assert!(result.is_err(), "internal mesh accepted classical-only TLS");
-
-        let server_result = tokio::time::timeout(std::time::Duration::from_secs(5), accepted)
+        let err = QuicReq::connect("127.0.0.1:9".parse().unwrap(), "localhost", classical)
             .await
-            .expect("server mutation handshake must terminate")
-            .unwrap();
-        assert!(server_result.is_err(), "server negotiated classical fallback");
+            .err()
+            .expect("public REQ seam must reject classical config before dialing");
+        assert!(err.to_string().contains("owned-mesh crypto policy mismatch"));
+    }
+
+    #[test]
+    fn zmtp_rep_rejects_classical_only_config_before_bind() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(
+            cert.key_pair.serialize_der(),
+        );
+        let mut classical = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.cert.der().clone()], key.into())
+        .unwrap();
+        classical.alpn_protocols = vec![ALPN_ZMTP3.to_vec()];
+
+        let err = QuicRep::bind("127.0.0.1:0".parse().unwrap(), classical)
+            .err()
+            .expect("public REP seam must reject classical config before bind");
+        assert!(err.to_string().contains("owned-mesh crypto policy mismatch"));
     }
 
     #[test]

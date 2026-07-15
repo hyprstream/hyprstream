@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 use rustls::crypto::{aws_lc_rs, CryptoProvider};
 
-#[cfg(test)]
 const INTERNAL_MESH_GROUPS: &[rustls::NamedGroup] = &[rustls::NamedGroup::X25519MLKEM768];
 const EXTERNAL_INTEROP_GROUPS: &[rustls::NamedGroup] = &[
     rustls::NamedGroup::X25519MLKEM768,
@@ -21,6 +20,8 @@ const EXTERNAL_INTEROP_GROUPS: &[rustls::NamedGroup] = &[
 /// declared external-interoperability policy.
 #[derive(Debug)]
 pub struct ProviderPolicyError {
+    expected: &'static [rustls::NamedGroup],
+    boundary: &'static str,
     actual: Vec<rustls::NamedGroup>,
 }
 
@@ -28,9 +29,8 @@ impl std::fmt::Display for ProviderPolicyError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "rustls process-default crypto policy mismatch: expected \
-             [X25519MLKEM768, X25519], got {:?}; another provider was installed first",
-            self.actual
+            "rustls {} crypto policy mismatch: expected {:?}, got {:?}",
+            self.boundary, self.expected, self.actual
         )
     }
 }
@@ -69,6 +69,31 @@ fn group_names(provider: &CryptoProvider) -> Vec<rustls::NamedGroup> {
         .collect()
 }
 
+fn validate_provider(
+    provider: &CryptoProvider,
+    expected: &'static [rustls::NamedGroup],
+    boundary: &'static str,
+) -> Result<(), ProviderPolicyError> {
+    let actual = group_names(provider);
+    if actual != expected {
+        return Err(ProviderPolicyError {
+            expected,
+            boundary,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+/// Validate that a caller-supplied config uses the exact owned-mesh policy.
+/// This is intentionally stricter than merely preferring the hybrid group:
+/// any classical fallback makes the config unsuitable for an owned boundary.
+pub fn validate_internal_mesh_crypto_provider(
+    provider: &CryptoProvider,
+) -> Result<(), ProviderPolicyError> {
+    validate_provider(provider, INTERNAL_MESH_GROUPS, "owned-mesh")
+}
+
 /// Install and validate the external-interoperability provider as rustls's
 /// process-wide default.
 ///
@@ -86,12 +111,16 @@ pub fn install_pq_crypto_provider() -> Result<(), ProviderPolicyError> {
     ])
     .install_default();
 
-    let actual =
-        CryptoProvider::get_default().map_or_else(Vec::new, |provider| group_names(provider));
-    if actual != EXTERNAL_INTEROP_GROUPS {
-        return Err(ProviderPolicyError { actual });
-    }
-    Ok(())
+    let provider = CryptoProvider::get_default().ok_or(ProviderPolicyError {
+        expected: EXTERNAL_INTEROP_GROUPS,
+        boundary: "process-default external-interoperability",
+        actual: Vec::new(),
+    })?;
+    validate_provider(
+        provider,
+        EXTERNAL_INTEROP_GROUPS,
+        "process-default external-interoperability",
+    )
 }
 
 #[cfg(test)]
