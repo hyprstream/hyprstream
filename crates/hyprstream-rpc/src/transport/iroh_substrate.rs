@@ -34,13 +34,9 @@
 //!   claim* — but that says nothing about *which* federated identity (capsule,
 //!   `did:web`, `did:key`) controls N, what its PQ key material is, or whether
 //!   it may be admitted. **No identity / trust / admission decision is ever
-//!   derived from a pkarr record.** Identity is bound by the channel itself
-//!   (`Connection::remote_id()` == the peer's Ed25519 pubkey, verified by iroh's
-//!   QUIC TLS), and for a `did:at9p` peer the *authoritative* identity + PQ
-//!   binding comes only from a **GATE-verified capsule** (D1 / #893, served by
-//!   the at9p mainline locator). pkarr reach must be **confirmed by GATE-verified
-//!   capsule material before any authority is granted** — it is never itself the
-//!   source of that authority.
+//!   derived from a pkarr record.** `Connection::remote_id()` authenticates only
+//!   the carrier endpoint. Application identity requires independently resolved
+//!   current keys plus fresh inside-carrier proof (#1027).
 //! - **Two riders, one DHT, one trust posture.** Both iroh pkarr and the at9p
 //!   mainline locator (#890 / C2) ride the *same* mainline DHT. Only at9p is
 //!   zero-trust: its records are content-addressed (`did:at9p:<cid512>`) and
@@ -53,10 +49,8 @@
 //!   re-deriving) authority from it; it does not disable publication.
 //!
 //! Enforcement seams: the dial path (`crate::dial`) resolves *addresses* from a
-//! NodeId whose identity is already channel-bound, never trusting the pkarr
-//! body; admission (`crate::admission`, `crate::transport::iroh_admission`)
-//! reads only `remote_id()` + (for at9p) GATE-verified capsule keys — never
-//! pkarr. The wasm pkarr output is typed as an unverified reach hint
+//! NodeId as an address, never trusting pkarr for identity. Admission does not
+//! consume NodeId, `remote_id()`, or pkarr. The wasm pkarr output is typed as an unverified reach hint
 //! ([`crate::iroh_peer::PkarrReachHint`]) so it cannot be conflated with
 //! verified reach.
 //!

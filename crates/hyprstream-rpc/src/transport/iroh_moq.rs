@@ -117,10 +117,6 @@ struct HandlerInner {
     /// #276 subscribe-authz + per-tenant announce scoping config. Defaults to
     /// "off" (open same-tenant subscribe preserved).
     authz: MoqAuthzConfig,
-    /// #137/#282 federation admission hook. `None` = open (pre-#282). When set,
-    /// an inbound connection whose `remote_id()` is not admitted is dropped
-    /// (fail-closed) before any moq session is served.
-    admission: Option<crate::transport::iroh_admission::SharedIrohAdmission>,
     /// Triggered by `ProtocolHandler::shutdown` so accept handlers stop
     /// waiting for `Session::closed()` and exit promptly.
     shutdown: CancellationToken,
@@ -147,21 +143,9 @@ impl IrohMoqProtocolHandler {
                 origin,
                 stats: StatsHandle::default(),
                 authz: MoqAuthzConfig::default(),
-                admission: None,
                 shutdown: CancellationToken::new(),
             }),
         }
-    }
-
-    /// Install the #137/#282 federation admission hook. When set, an inbound
-    /// connection whose authenticated `remote_id()` is not admitted by the gate
-    /// is dropped (fail-closed) before any moq session is served.
-    pub fn with_admission(
-        mut self,
-        admission: crate::transport::iroh_admission::SharedIrohAdmission,
-    ) -> Self {
-        self.rebuild_inner(|i| i.admission = Some(admission));
-        self
     }
 
     /// Install the #276 subscribe-authz + per-tenant announce-scoping config.
@@ -187,7 +171,6 @@ impl IrohMoqProtocolHandler {
                 origin: old.origin.clone(),
                 stats: old.stats.clone(),
                 authz: old.authz.clone(),
-                admission: old.admission.clone(),
                 shutdown: old.shutdown.clone(),
             };
             f(&mut cloned);
@@ -220,24 +203,9 @@ impl Default for IrohMoqProtocolHandler {
 
 impl ProtocolHandler for IrohMoqProtocolHandler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
-        // #137/#282 federation admission: the accepted iroh connection is
-        // authenticated to the remote endpoint's Ed25519 key (`remote_id()`).
-        // Run the gate (origin + key-binding) before serving any broadcast; on
-        // rejection, fail-closed by dropping the connection. No hook = open.
-        let remote = *conn.remote_id().as_bytes();
-        if !crate::transport::iroh_admission::check_admission(
-            self.inner.admission.as_ref(),
-            &remote,
-        )
-        .await
-        {
-            return Ok(());
-        }
-
-        // #276: peer identity IS available here — an accepted iroh connection
-        // is authenticated by the remote endpoint's public key. Use it to
-        // derive the peer's tenant and scope the consumer it's served.
-        let peer = PeerIdentity::authenticated(conn.remote_id().to_string());
+        // Carrier NodeId is transport metadata only. Until #1027 supplies fresh
+        // inside-carrier proof, authorization must see an anonymous peer.
+        let peer = PeerIdentity::anonymous();
 
         // Per-tenant announce scoping (live): if the caller installed a
         // peer→tenant resolver, hand this session a consumer narrowed to its
@@ -418,7 +386,10 @@ mod tests {
         // Server scoped so EVERY peer is treated as tenant "bob".
         let authz = MoqAuthzConfig {
             authorizer: None,
-            tenant_resolver: Some(Arc::new(|_peer| Some("bob".to_owned()))),
+            tenant_resolver: Some(Arc::new(|peer| {
+                assert!(!peer.is_authenticated(), "NodeId must not mint authorization identity");
+                Some("bob".to_owned())
+            })),
         };
         let handler = IrohMoqProtocolHandler::new().with_authz(authz);
         let producer = handler.origin_producer().clone();

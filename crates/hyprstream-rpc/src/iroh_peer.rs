@@ -1,16 +1,11 @@
-//! Browser (wasm32) iroh peer identity and pkarr helpers.
+//! Browser (wasm32) iroh endpoint and pkarr reach helpers.
 //!
 //! Phase 2 adds iroh as a first-class wasm32 dependency, enabling:
 //!
-//! 1. **Browser iroh identity** — `BrowserIrohPeer` generates a fresh Ed25519
-//!    SecretKey and exposes the derived NodeId / EndpointId, which equals the
-//!    32-byte pubkey. The NodeId IS the iroh peer identity.
+//! 1. **Browser iroh endpoint** — `BrowserIrohPeer` generates a fresh transport
+//!    key and exposes its NodeId / EndpointId for dialing and diagnostics.
 //!
-//! 2. **did:key ↔ NodeId helpers** — bidirectional conversion between iroh's
-//!    `EndpointId` (32-byte ed25519 pubkey) and the W3C `did:key` DID that
-//!    atproto and hyprstream use to identify peers.
-//!
-//! 3. **Pkarr lookup** — `resolve_pkarr` wraps `PkarrRelayClient` to fetch a
+//! 2. **Pkarr lookup** — `resolve_pkarr` wraps `PkarrRelayClient` to fetch a
 //!    peer's relay URL from the N0 pkarr relay without a full iroh endpoint bind.
 //!    This replaces the manual HTTP fetch + DNS-wire parse in `atproto.ts`.
 //!
@@ -80,53 +75,12 @@ impl BrowserIrohPeer {
         self.endpoint_id().to_z32()
     }
 
-    /// Express this peer's NodeId as a W3C `did:key`.
-    ///
-    /// The did:key format encodes Ed25519 keys as base58btc multibase with the
-    /// `0xed 0x01` multicodec prefix.
-    pub fn did_key(&self) -> String {
-        did_key_from_node_id(&self.node_id_bytes())
-    }
 }
 
 impl Default for BrowserIrohPeer {
     fn default() -> Self {
         Self::new()
     }
-}
-
-// ============================================================================
-// did:key ↔ NodeId conversions
-// ============================================================================
-//
-// The actual `did:key` (Ed25519) codec lives in the cross-target
-// [`crate::did_key`] module — the SAME implementation the native `did_web`
-// resolver uses (#475). An iroh NodeId IS a 32-byte Ed25519 public key, so the
-// NodeId ⇄ did:key mapping is exactly the Ed25519 ⇄ did:key codec. Delegating
-// here keeps the multicodec constant and the DID-URL fragment/query stripping in
-// one place so the native and wasm32 paths can never drift.
-
-/// Convert a 32-byte iroh NodeId to a `did:key:z6Mk...` DID.
-///
-/// Thin wasm32 alias for [`crate::did_key::ed25519_to_did_key`] (the NodeId is
-/// the Ed25519 public key).
-pub fn did_key_from_node_id(node_id_bytes: &[u8; 32]) -> String {
-    crate::did_key::ed25519_to_did_key(node_id_bytes)
-}
-
-/// Extract the raw 32-byte NodeId from a `did:key:z6Mk...` DID.
-///
-/// Thin wasm32 alias for [`crate::did_key::did_key_to_ed25519`]. The 32 decoded
-/// bytes are the iroh `EndpointId`. Unlike the previous local copy, this strips a
-/// DID URL fragment / query (`did:key:z6Mk…#z6Mk…`) before decoding, matching the
-/// native `did_web` behavior.
-///
-/// # Errors
-///
-/// Returns an error if the DID is not base58btc, not an ed25519 key, or
-/// malformed.
-pub fn node_id_from_did_key(did: &str) -> Result<[u8; 32]> {
-    crate::did_key::did_key_to_ed25519(did)
 }
 
 // ============================================================================
@@ -144,9 +98,8 @@ pub fn node_id_from_did_key(did: &str) -> Result<[u8; 32]> {
 ///
 /// **Forbidden use:** this value MUST NOT be treated as an identity authority
 /// input. Authority for a `did:at9p` peer comes only from a GATE-verified
-/// capsule (D1 / #893); for a raw `did:key` peer, from the channel-bound
-/// `remote_id()`. The hint is a dial candidate only — feed it to the iroh dial
-/// path as a relay address, never to admission / trust decisions.
+/// accepted identity state plus fresh application proof. The hint is a dial
+/// candidate only, never an admission or trust input.
 ///
 /// The newtype has no conversion to any identity type by design; reach its URL
 /// via [`PkarrReachHint::url`] when constructing a dial target.

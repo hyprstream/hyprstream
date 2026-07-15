@@ -991,11 +991,6 @@ pub struct QuicLoopConfig {
     /// Set `false` (via `[quic] iroh = false`) to run quinn-only (legacy).
     #[cfg(not(target_arch = "wasm32"))]
     pub iroh_enabled: bool,
-    /// #282: optional #137 federation admission hook applied at the iroh accept
-    /// path (origin + key-binding against `remote_id()`). `None` = open (the
-    /// pre-#282 accept-open behaviour). Native-only.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub iroh_admission: Option<crate::transport::iroh_admission::SharedIrohAdmission>,
     /// #282: callback invoked after the iroh substrate binds, with
     /// (service_name, node_id) where `node_id` is the endpoint's 32-byte Ed25519
     /// public key. Used to advertise the `#iroh` VM + `IrohTransport` service

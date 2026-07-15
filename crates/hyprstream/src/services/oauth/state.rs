@@ -473,9 +473,8 @@ pub struct OAuthState {
     /// during `with_signing_key`).
     pub mesh_kem_public: Option<hyprstream_rpc::crypto::hybrid_kem::RecipientPublic>,
     /// #282: the node's iroh endpoint id (its Ed25519 `node_id`, 32 bytes),
-    /// published as the `#iroh` verification method + an `IrohTransport` service
-    /// entry in the root DID document — **only** when the iroh substrate is
-    /// actually bound. `None` until the daemon binds iroh and reports it.
+    /// published only as an `IrohTransport` service entry when bound. It is not
+    /// a verification method or JWKS key (#1031).
     pub iroh_node_id: Option<[u8; 32]>,
     /// #282: iroh relay URLs to advertise in the `IrohTransport` entry's
     /// `relays`. Empty = rely on pkarr/DNS discovery for reachability (the

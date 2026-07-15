@@ -3,35 +3,27 @@
 //! Wraps `hyprstream_rpc::iroh_peer` with wasm-bindgen so JavaScript can:
 //!
 //! 1. Generate an ephemeral iroh identity (`IrohPeer::new()`).
-//! 2. Get the browser's NodeId as bytes or as a `did:key` DID.
+//! 2. Get the browser's NodeId as transport-address bytes or z-base32.
 //! 3. Resolve a peer's relay URL from the N0 pkarr relay
 //!    (replaces the manual HTTP fetch + DNS-wire parse in `atproto.ts`).
 //!
 //! # Usage (TypeScript)
 //!
 //! ```ts
-//! import { IrohPeer, irohNodeIdFromDidKey, irohDidKeyFromNodeId,
-//!          irohResolvePkarrRelayUrl } from 'hyprstream-rpc-std';
+//! import { IrohPeer, irohResolvePkarrRelayUrl } from 'hyprstream-rpc-std';
 //!
 //! // Generate a fresh browser identity.
 //! const peer = new IrohPeer();
 //! console.log("NodeId (z32):", peer.nodeIdZ32());
-//! console.log("did:key:", peer.didKey());
-//!
-//! // Convert a did:key to raw NodeId bytes (for pkarr lookup).
-//! const nodeId = irohNodeIdFromDidKey("did:key:z6Mk...");
-//!
 //! // Resolve a peer's relay URL.
-//! const relayUrl = await irohResolvePkarrRelayUrl(nodeId);
+//! const relayUrl = await irohResolvePkarrRelayUrl(peer.nodeIdBytes());
 //! ```
 
 #![cfg(target_arch = "wasm32")]
 
 use wasm_bindgen::prelude::*;
 
-use hyprstream_rpc::iroh_peer::{
-    BrowserIrohPeer, did_key_from_node_id, node_id_from_did_key, resolve_pkarr_relay_url,
-};
+use hyprstream_rpc::iroh_peer::{BrowserIrohPeer, resolve_pkarr_relay_url};
 
 // ============================================================================
 // IrohPeer — ephemeral browser iroh identity
@@ -69,44 +61,12 @@ impl WasmIrohPeer {
         self.inner.node_id_z32()
     }
 
-    /// This peer's identity as a W3C `did:key` DID.
-    ///
-    /// E.g. `did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK`
-    #[wasm_bindgen(js_name = "didKey")]
-    pub fn did_key(&self) -> String {
-        self.inner.did_key()
-    }
 }
 
 impl Default for WasmIrohPeer {
     fn default() -> Self {
         Self::new()
     }
-}
-
-// ============================================================================
-// did:key ↔ NodeId helpers (free functions)
-// ============================================================================
-
-/// Convert a `did:key:z6Mk...` DID to a 32-byte NodeId (`Uint8Array`).
-///
-/// Throws if the DID is not a valid ed25519 `did:key`.
-#[wasm_bindgen(js_name = "irohNodeIdFromDidKey")]
-pub fn node_id_from_did_key_js(did: &str) -> Result<Vec<u8>, JsError> {
-    node_id_from_did_key(did)
-        .map(|b| b.to_vec())
-        .map_err(|e| JsError::new(&e.to_string()))
-}
-
-/// Convert a 32-byte NodeId (`Uint8Array`) to a `did:key:z6Mk...` DID.
-///
-/// Throws if `node_id` is not exactly 32 bytes.
-#[wasm_bindgen(js_name = "irohDidKeyFromNodeId")]
-pub fn did_key_from_node_id_js(node_id: &[u8]) -> Result<String, JsError> {
-    let bytes: [u8; 32] = node_id
-        .try_into()
-        .map_err(|_| JsError::new("node_id must be exactly 32 bytes"))?;
-    Ok(did_key_from_node_id(&bytes))
 }
 
 // ============================================================================

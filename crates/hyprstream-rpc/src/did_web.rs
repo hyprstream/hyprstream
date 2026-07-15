@@ -154,10 +154,8 @@ fn validate_path_segment(seg: &str, did: &str) -> Result<()> {
 /// dialable [`DecodedEntry`]s, in **preference order**.
 ///
 /// Preference (deterministic):
-///   1. By transport class: `IrohTransport` before `QuicTransport` — iroh is
-///      identity-bound at the transport (the `nodeId` *is* the Ed25519 identity,
-///      so the channel authenticates the peer; see [`crate::service_entry`]),
-///      whereas QUIC's cert pin is channel-only.
+///   1. By transport class: `IrohTransport` before `QuicTransport`. This is a
+///      reach preference only; neither carrier supplies application identity.
 ///   2. Within a class, document order is preserved (stable sort) — operators
 ///      can express secondary preference by ordering entries in the doc.
 ///
@@ -793,8 +791,6 @@ mod tests {
         );
         assert!(matches!(entries[1].config.endpoint, EndpointType::Quic { .. }));
         // iroh entry carries the identity key; quic does not.
-        assert_eq!(entries[0].identity_key, Some([7u8; 32]));
-        assert_eq!(entries[1].identity_key, None);
     }
 
     #[test]
@@ -1154,5 +1150,29 @@ mod tests {
         // And both decode to the same key.
         assert_eq!(decode_ed25519_multikey(&vm_multibase).unwrap(), raw);
         assert_eq!(did_key_to_ed25519(&did_key).unwrap(), raw);
+    }
+
+    #[test]
+    fn did_key_identity_is_independent_of_iroh_reach_equality() {
+        let identity = rand_ed25519();
+        let unrelated_reach = rand_ed25519();
+        let did = ed25519_to_did_key(&identity);
+        for node_id in [identity, unrelated_reach] {
+            let doc = json!({
+                "id": did,
+                "verificationMethod": [{
+                    "id": format!("{did}#key-1"), "type": "Multikey",
+                    "controller": did, "publicKeyMultibase": ed25519_multikey(&identity),
+                }],
+                "service": [{
+                    "id": format!("{did}#iroh"), "type": "IrohTransport",
+                    "serviceEndpoint": encode_iroh(&node_id, &[], &["hyprstream-rpc/1"]),
+                }],
+            });
+            assert_eq!(verification_method_ed25519_keys(&doc), vec![identity]);
+            let reach = transport_entries(&doc);
+            assert!(matches!(&reach[0].config.endpoint,
+                crate::transport::EndpointType::Iroh { node_id: got, .. } if *got == node_id));
+        }
     }
 }

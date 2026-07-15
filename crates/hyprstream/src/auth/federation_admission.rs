@@ -30,11 +30,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use hyprstream_rpc::admission::{
-    DidDocResolve, FederationAdmissionGate, OriginAdmission, PeerChannelKey,
-};
-use hyprstream_rpc::did_web::{ed25519_to_did_key, DidWebResolver, HttpDidDocFetcher};
-use hyprstream_rpc::transport::iroh_admission::IrohPeerAdmission;
+use hyprstream_rpc::admission::{FederationAdmissionGate, OriginAdmission};
+use hyprstream_rpc::did_web::{DidWebResolver, HttpDidDocFetcher};
 
 use crate::services::PolicyClient;
 
@@ -48,14 +45,12 @@ use crate::services::PolicyClient;
 pub struct PolicyOriginAdmission {
     policy_client: Arc<PolicyClient>,
 }
-
 impl PolicyOriginAdmission {
     /// Construct over a shared `PolicyService` client.
     pub fn new(policy_client: Arc<PolicyClient>) -> Self {
         Self { policy_client }
     }
 }
-
 #[async_trait]
 impl OriginAdmission for PolicyOriginAdmission {
     async fn admit_origin(&self, origin: &str) -> Result<()> {
@@ -97,14 +92,12 @@ impl OriginAdmission for PolicyOriginAdmission {
 /// [`FederationAdmissionGate::admit`] per inbound federated peer with the
 /// verified envelope-signer key and the peer's origin + DID.
 ///
-/// # TODO(#200/#185/#282) — live peer-key seam
+/// # Live proof seam
 ///
 /// The caller must pass the peer's *authenticated* Ed25519 key
 /// (`PeerChannelKey`). Today that key is the verified COSE envelope signer key,
-/// available at the service layer after `verify_claims`. Once RFC 7250
-/// raw-public-key QUIC (#200) and/or iroh live `node_id` (#282) are wired, the
-/// same key can be sourced from the channel; the gate's match logic is
-/// unchanged.
+/// available at the service layer after `verify_claims`. A transport NodeId is
+/// never a substitute for that application proof (#1031/#1027).
 pub fn build_federation_admission_gate(
     policy_client: Arc<PolicyClient>,
 ) -> Result<FederationAdmissionGate<PolicyOriginAdmission, DidWebResolver<HttpDidDocFetcher>>> {
@@ -115,129 +108,4 @@ pub fn build_federation_admission_gate(
         PolicyOriginAdmission::new(policy_client),
         resolver,
     ))
-}
-
-/// #282: adapt the #137 [`FederationAdmissionGate`] to the iroh accept path's
-/// [`IrohPeerAdmission`] hook.
-///
-/// Bridges the iroh `remote_id()` (the inbound peer's authenticated Ed25519
-/// `node_id`) into the gate's three inputs:
-///
-/// - **DID** — the self-certifying `did:key` of `node_id` (#281). The key *is*
-///   the identity, so the gate's key-binding stage 2 is satisfied without any
-///   network fetch.
-/// - **`PeerChannelKey`** — `node_id` itself: iroh's QUIC TLS already bound the
-///   channel to this key, so it is the authenticated channel key the gate matches
-///   (this is exactly the live peer-key the #137 quinn path lacked).
-/// - **origin (RFC 6454)** — the residual seam. A raw inbound iroh peer carries
-///   no http origin on the channel; the app-layer envelope/JWT `iss` does, but
-///   that is not available at the accept loop. We therefore pass the `did:key`
-///   string as the admission **subject** — the same identifier `did:key` peers
-///   register under (#281) — so stage 1 (`federation:register`) is the
-///   load-bearing decision. The per-request service-layer path still re-verifies
-///   the envelope signer key == `remote_id()`, closing the loop.
-///
-/// Fail-closed: any gate error rejects the connection (the iroh handler drops it).
-pub struct IrohFederationAdmission<O: OriginAdmission, R: DidDocResolve> {
-    gate: Arc<FederationAdmissionGate<O, R>>,
-}
-
-impl<O: OriginAdmission, R: DidDocResolve> IrohFederationAdmission<O, R> {
-    /// Wrap a shared #137 gate as the iroh accept-path admission hook.
-    pub fn new(gate: Arc<FederationAdmissionGate<O, R>>) -> Self {
-        Self { gate }
-    }
-}
-
-#[async_trait]
-impl<O: OriginAdmission + 'static, R: DidDocResolve + 'static> IrohPeerAdmission
-    for IrohFederationAdmission<O, R>
-{
-    async fn admit_peer(&self, node_id: &[u8; 32]) -> Result<()> {
-        // Self-certifying did:key of the authenticated node_id (#281): the key is
-        // the identity, used both as the DID (stage 2 self-cert) and the stage-1
-        // admission subject (origin seam — see struct docs).
-        let did = ed25519_to_did_key(node_id);
-        self.gate
-            .admit(&did, PeerChannelKey(*node_id), &did, None)
-            .await
-            .map(|_admitted| ())
-    }
-}
-
-/// Build the iroh accept-path admission hook over the real `PolicyService`
-/// (stage 1) + native `did:web`/`did:key` resolver (stage 2), ready to install
-/// on an iroh substrate via `QuicLoopConfig::iroh_admission`.
-pub fn build_iroh_admission(
-    policy_client: Arc<PolicyClient>,
-) -> Result<Arc<dyn IrohPeerAdmission>> {
-    let gate = Arc::new(build_federation_admission_gate(policy_client)?);
-    Ok(Arc::new(IrohFederationAdmission::new(gate)))
-}
-
-#[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
-mod iroh_admission_tests {
-    use super::*;
-    use ed25519_dalek::SigningKey;
-    use hyprstream_rpc::admission::FederationAdmissionGate;
-    use rand::rngs::OsRng;
-    use serde_json::Value;
-
-    struct AllowAll;
-    #[async_trait]
-    impl OriginAdmission for AllowAll {
-        async fn admit_origin(&self, _origin: &str) -> Result<()> {
-            Ok(())
-        }
-    }
-    struct DenyAll;
-    #[async_trait]
-    impl OriginAdmission for DenyAll {
-        async fn admit_origin(&self, origin: &str) -> Result<()> {
-            anyhow::bail!("origin {origin} denied")
-        }
-    }
-    /// did:key is self-certifying — the resolver must never be called.
-    struct NeverResolve;
-    #[async_trait]
-    impl DidDocResolve for NeverResolve {
-        async fn resolve_doc(&self, did: &str) -> Result<Value> {
-            panic!("did:key admission must not resolve (called for {did})")
-        }
-    }
-
-    fn random_node_id() -> [u8; 32] {
-        SigningKey::generate(&mut OsRng).verifying_key().to_bytes()
-    }
-
-    #[tokio::test]
-    async fn iroh_peer_admitted_when_origin_policy_allows() {
-        // The peer's remote_id() drives a self-certifying did:key; stage 1 allows
-        // the subject → admitted. NeverResolve proves stage 2 is self-certifying.
-        let gate = Arc::new(FederationAdmissionGate::new(AllowAll, NeverResolve));
-        let hook = IrohFederationAdmission::new(gate);
-        assert!(hook.admit_peer(&random_node_id()).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn iroh_peer_rejected_fail_closed_when_policy_denies() {
-        // Stage 1 (federation:register) denies the did:key subject → reject.
-        let gate = Arc::new(FederationAdmissionGate::new(DenyAll, NeverResolve));
-        let hook = IrohFederationAdmission::new(gate);
-        assert!(hook.admit_peer(&random_node_id()).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn node_id_binds_to_its_did_key_iroh_vm() {
-        // The DID the gate matches is exactly the did:key of the node_id, and its
-        // key-binding stage trivially holds (self-certifying). This is the
-        // node_id ↔ #iroh VM binding invariant (#282): the key advertised as the
-        // `#iroh` VM is the node_id, and a peer presenting that node_id binds to
-        // that DID.
-        let node_id = random_node_id();
-        let did = ed25519_to_did_key(&node_id);
-        let decoded = hyprstream_rpc::did_web::did_key_to_ed25519(&did).unwrap();
-        assert_eq!(decoded, node_id, "did:key(node_id) must round-trip to node_id");
-    }
 }

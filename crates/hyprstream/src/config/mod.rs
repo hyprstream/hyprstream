@@ -509,7 +509,6 @@ impl QuicConfig {
             // This minimal builder mirrors the daemon bootstrap default; the
             // full `QuicSharedConfig` path in `main.rs` honours `[quic] iroh`.
             iroh_enabled: default_iroh_enabled(),
-            iroh_admission: None,
             on_iroh_bound: None,
             // #358: relay rendezvous is provisioned by the daemon bootstrap
             // (`QuicSharedConfig`), not this minimal builder. Direct-only here.

@@ -52,10 +52,8 @@ impl At9pCapsuleResolver for At9pGateResolver {
             .map_err(|e| anyhow!("did:at9p {did} GATE rejected: {e}"))?;
         let capsule = verified.capsule();
 
-        // The primary subject key (index 0) is the hybrid identity: its Ed25519
-        // half is the iroh NodeId / channel key, its ML-DSA-65 half is the PQ
-        // anchor. `verify_capsule` (sig-gate) already confirmed the capsule's
-        // composite signature verifies against this keypair.
+        // The primary subject key is the hybrid genesis identity. Its Ed25519
+        // half is not a NodeId/channel key, and GATE is not live possession.
         let subject = capsule
             .body
             .subject_keys

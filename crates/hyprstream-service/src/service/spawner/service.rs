@@ -211,11 +211,8 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                 // BOTH ALPNs (`hyprstream-rpc/1` + `moql`) with the SAME request
                 // processor + moq origin, in parallel to the quinn endpoint (kept
                 // for back-compat). The iroh endpoint's node key is the service's
-                // Ed25519 signing key, so its `node_id`
-                // (`== signing_key.verifying_key()`) is already covered by the
-                // node's published DID verification methods — and the #137 gate,
-                // when installed, matches an inbound peer's `remote_id()` against
-                // its DID. Discovery is iroh's built-in pkarr publisher + n0 DNS
+                // Ed25519 key for transport mechanics. Its NodeId remains only a
+                // carrier address, not a DID or admission input (#1031).
                 // (`presets::N0`), so this node is dial-by-node_id-discoverable.
                 //
                 // Kept alive in this scope via `_iroh_substrate`; on shutdown the
@@ -236,21 +233,12 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                         None => hyprstream_rpc::transport::iroh_moq::IrohMoqProtocolHandler::new(),
                     };
                     // RPC plane: same processor + signing key as the quinn path.
-                    let mut rpc_handler =
+                    let rpc_handler =
                         hyprstream_rpc::transport::iroh_rpc::IrohRpcProtocolHandler::with_stream_limit(
                             Arc::clone(&processor),
                             signing_key.clone(),
                             hyprstream_rpc::transport::rpc_session::DEFAULT_STREAM_LIMIT,
                         );
-                    let mut moq_handler = moq_handler;
-                    // #137/#282: apply the federation admission gate at both iroh
-                    // accept paths (origin + key-binding against `remote_id()`),
-                    // fail-closed. `None` → accept-open (documented seam until the
-                    // factory threads a gate down).
-                    if let Some(gate) = qc.iroh_admission.take() {
-                        rpc_handler = rpc_handler.with_admission(gate.clone());
-                        moq_handler = moq_handler.with_admission(gate);
-                    }
                     match hyprstream_rpc::transport::iroh_substrate::IrohSubstrate::new(
                         iroh_secret, moq_handler, rpc_handler,
                     )

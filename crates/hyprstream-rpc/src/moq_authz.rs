@@ -147,11 +147,9 @@ impl SubscribeDecision {
 /// Identity of the subscribing peer, as far as the moq accept path can
 /// determine it.
 ///
-/// On the iroh `moql` path this is the authenticated remote node id
-/// (`Connection::remote_node_id()`); on the anonymous quinn `/moq` path no
-/// peer identity is available at the TLS layer (the server presents a pinned
-/// cert; the client is not mutually authenticated), so `subject` is `None`
-/// there. Authorizers must treat `subject == None` as an unauthenticated peer.
+/// Carrier metadata such as an iroh NodeId is not an authorization identity.
+/// Without fresh application proof, peers have `subject == None` and must be
+/// treated as unauthenticated.
 #[derive(Debug, Clone, Default)]
 pub struct PeerIdentity {
     /// Stable subject string for policy lookups (e.g. an iroh node id), or
@@ -189,8 +187,8 @@ impl PeerIdentity {
 /// ## Wiring status
 ///
 /// - **iroh `moql` path** ([`crate::transport::iroh_moq::IrohMoqProtocolHandler`]):
-///   the accepted `Connection` carries an authenticated `remote_node_id()`, so a
-///   real [`PeerIdentity`] is available and the hook can enforce policy.
+///   `remote_id()` is carrier metadata, so the hook receives anonymous until
+///   #1027 supplies fresh proof.
 /// - **quinn `/moq` path** ([`crate::transport::quinn_transport::QuinnRpcServer`]):
 ///   the WebTransport CONNECT is *not* mutually authenticated, so no peer
 ///   identity is available at accept time. The hook is still invoked with

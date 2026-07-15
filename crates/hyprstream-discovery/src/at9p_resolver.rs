@@ -10,33 +10,22 @@
 //! arm, injected at the network-profile resolver seam (`Resolver::set_global`,
 //! the future `NetworkDiscoveryResolver` of #873).
 //!
-//! # Why reach comes from the capsule, not an endpoint list
+//! # Why a genesis capsule cannot mint a dial target
 //!
-//! A `did:at9p:<cid512>` is self-certifying: the identity *is* the BLAKE3-512
-//! hash of the genesis capsule. After [`verify_did_at9p`] passes all three gates
-//! (canon → hash → sig), every field on the capsule is content-bound to that
-//! identity — an attacker cannot substitute keys or endpoints without changing
-//! the cid. The resolver therefore trusts **only** what the GATE verified, and
-//! fails closed otherwise: no GATE witness, no reach.
-//!
-//! The reach it emits is the iroh dial the existing transport already speaks:
-//!
-//! - `node_id` — the capsule's **primary subject Ed25519 key**. On iroh the
-//!   `EndpointId` *is* the Ed25519 pubkey, so this is the authoritative NodeId,
-//!   taken from the GATE-verified [`Capsule`] (not from a self-declared string
-//!   on the endpoint). The ed25519 half already drives the existing iroh dial
-//!   path verbatim — this is additive.
-//! - `relay_url` — the relay hint carried by the selected 9P-export service
-//!   entry's iroh endpoint.
+//! GATE makes genesis fields content-bound claims; it does not prove current
+//! state, liveness, or possession. The schema carries a relay claim but no
+//! independent carrier `EndpointId`, so this resolver fails closed rather than
+//! deriving reach from the subject Ed25519 key (#1031).
 //!
 //! # Service selection (#893 update; design #905 §4, #879 §5.1a)
 //!
 //! A capsule carries a **map** of named services (the `#882` `services` field),
 //! each typed (`NinePExport`, `AtprotoPds`). The resolver takes an optional
 //! service selector (default [`DEFAULT_AT9P_SERVICE`] = `#ns`, the 9P export a
-//! client attaches to) and emits reach from **that selected `NinePExport`
-//! service entry only**. A missing id, a wrong-type entry, or a non-iroh
-//! transport **fails closed** — never an unrequested or wrong-shape endpoint.
+//! client attaches to) and validates **that selected `NinePExport` service
+//! entry only**. A missing id, a wrong-type entry, a non-iroh transport, or the
+//! absence of an independent carrier EndpointId **fails closed** — never an
+//! unrequested, wrong-shape, or identity-derived endpoint.
 //! This is the seam #906 (the DID-URL dereferencer, G1) pins against, and the
 //! one #877's attach profile consumes.
 
@@ -44,9 +33,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, ensure, Result};
 
-use hyprstream_pds::at9p::{
-    Capsule, ServiceType, Transport as At9pTransport, ED25519_PUBLIC_KEY_LEN,
-};
+use hyprstream_pds::at9p::{ServiceType, Transport as At9pTransport};
 use hyprstream_pds::at9p_gate::{verify_did_at9p, VerifiedCapsule};
 use hyprstream_rpc::transport::TransportConfig;
 
@@ -67,14 +54,9 @@ pub const DEFAULT_AT9P_SERVICE: &str = "#ns";
 /// 1. selects the requested `NinePExport` service entry — fail closed if the id
 ///    is absent or the entry is the wrong type;
 /// 2. requires that entry's transport to be iroh — fail closed otherwise;
-/// 3. emits `TransportConfig::iroh(node_id = primary subject Ed25519,
-///    relay_url = entry.relay)`.
-///
-/// The `node_id` is the **verified** primary subject key, not the endpoint's
-/// self-declared `nodeId` string: on iroh the `EndpointId` *is* the Ed25519
-/// pubkey, so the capsule's content-bound subject key is the authoritative dial
-/// target. Direct addresses are not carried (iroh discovers direct paths; the
-/// relay is a NAT-traversal hint), matching `decode_iroh`.
+/// 3. rejects the capsule because the current schema has no independent
+///    carrier EndpointId. The signed relay remains a reach claim, but cannot
+///    turn the genesis subject identity key into a live dial target.
 pub fn capsule_to_iroh_reach(
     verified: &VerifiedCapsule,
     service: Option<&str>,
@@ -101,30 +83,10 @@ pub fn capsule_to_iroh_reach(
         entry.endpoint.transport,
     );
 
-    // node_id = the GATE-verified primary subject Ed25519 key (the iroh NodeId).
-    let node_id = primary_ed25519(capsule)?;
-    let relay_url = entry.endpoint.relay.clone();
-
-    Ok(TransportConfig::iroh(node_id, Vec::new(), relay_url))
-}
-
-/// Extract the primary subject Ed25519 key as a 32-byte iroh `EndpointId`.
-///
-/// The capsule schema guarantees `subject_keys` is non-empty and each keypair's
-/// ed25519 half is exactly 32 bytes, so this only fails if a future schema
-/// change breaks that invariant — kept fallible for defense in depth.
-fn primary_ed25519(capsule: &Capsule) -> Result<[u8; ED25519_PUBLIC_KEY_LEN]> {
-    let primary = capsule
-        .body
-        .subject_keys
-        .first()
-        .ok_or_else(|| anyhow!("verified capsule has no subject keys"))?;
-    let node_id: [u8; ED25519_PUBLIC_KEY_LEN] = primary
-        .ed25519_pub
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("at9p primary subject ed25519 key is not 32 bytes"))?;
-    Ok(node_id)
+    let relay = entry.endpoint.relay.as_deref().unwrap_or("<none>");
+    Err(anyhow!(
+        "at9p service {svc_id:?} carries relay claim {relay:?} but no independent iroh EndpointId; refusing to derive transport reach from the genesis identity key (#1031)"
+    ))
 }
 
 /// Untrusted source of capsule bytes for a `did:at9p:<cid>` identifier.
@@ -146,15 +108,15 @@ pub trait CapsuleSource: Send + Sync {
 ///
 /// This is the injectable capsule source for the `Resolver::set_global` /
 /// `NetworkDiscoveryResolver` seam (#873 network profile): a future network
-/// resolver that recognizes `did:at9p:` peer addresses composes this to turn
-/// them into reach. Everything here is additive — the ed25519 half already
-/// drives the existing iroh dial path verbatim.
+/// resolver that recognizes `did:at9p:` peer addresses may compose this after
+/// the capsule schema carries independently authenticated live reach.
 ///
 /// # Fail-closed posture
 ///
-/// Reach is emitted **only** from a capsule that passes [`verify_did_at9p`]
-/// (canon → hash → sig). Any GATE failure, a missing/wrong-type service entry,
-/// or a non-iroh transport returns `Err` — never a partial or unverified reach.
+/// The capsule must pass [`verify_did_at9p`] (canon → hash → sig), but that
+/// proves only the genesis claim. Until an independent EndpointId is available,
+/// even a valid capsule returns `Err`; other GATE and service-selection failures
+/// also return `Err`, never partial or identity-derived reach.
 pub struct At9pResolver {
     source: Arc<dyn CapsuleSource>,
 }
@@ -169,8 +131,8 @@ impl At9pResolver {
     /// `NinePExport` service entry named `service` (default `#ns`).
     ///
     /// Fetches the capsule bytes from the (untrusted) [`CapsuleSource`], runs the
-    /// full GATE pipeline, and maps the verified capsule to iroh reach. Fails
-    /// closed at the first gate that rejects the input.
+    /// full GATE pipeline, and validates the selected reach claim. It fails
+    /// closed because the current capsule has no independent live EndpointId.
     pub async fn resolve_did(&self, did: &str, service: Option<&str>) -> Result<TransportConfig> {
         let bytes = self.source.fetch_capsule(did).await?;
         // GATE — the only place authority is granted. Fail closed on any gate.
@@ -186,11 +148,10 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use hyprstream_crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes, MlDsaSigningKey};
     use hyprstream_pds::at9p::{
-        CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, Transport,
+        Capsule, CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, Transport,
     };
     use hyprstream_pds::at9p_gate::DID_AT9P_PREFIX;
     use hyprstream_pds::at9p_sign::sign_capsule;
-    use hyprstream_rpc::transport::{BindMode, EndpointType};
 
     /// A test signer with matching hybrid subject keys.
     struct Signer {
@@ -249,36 +210,21 @@ mod tests {
     }
 
     #[test]
-    fn valid_capsule_emits_iroh_reach_from_verified_subject_key() {
-        let (capsule, bytes, _cid, did) = signed(1);
+    fn signed_capsule_relay_claim_does_not_mint_live_reach() {
+        let (_capsule, bytes, _cid, did) = signed(1);
 
         // Reach comes from the GATE witness, not the raw capsule.
         let verified = verify_did_at9p(&did, &bytes).unwrap();
-        let cfg = capsule_to_iroh_reach(&verified, None).unwrap();
-
-        let expected_node = capsule.body.subject_keys[0].ed25519_pub.clone();
-        match cfg.endpoint {
-            EndpointType::Iroh {
-                node_id,
-                direct_addrs,
-                relay_url,
-            } => {
-                assert_eq!(node_id.as_slice(), &expected_node);
-                assert!(direct_addrs.is_empty());
-                assert_eq!(relay_url.as_deref(), Some("https://relay1.example"));
-            }
-            // Bind mode is Connect — this is a client dial.
-            other => panic!("expected Iroh endpoint, got {other:?}"),
-        }
-        assert_eq!(cfg.bind_mode, BindMode::Connect);
+        let err = capsule_to_iroh_reach(&verified, None).unwrap_err();
+        assert!(err.to_string().contains("no independent iroh EndpointId"));
     }
 
     #[test]
     fn explicit_service_selector_selects_named_entry() {
         let (capsule, bytes, _cid, did) = signed(2);
         let verified = verify_did_at9p(&did, &bytes).unwrap();
-        // Default `#ns` succeeds.
-        assert!(capsule_to_iroh_reach(&verified, None).is_ok());
+        // Default `#ns` is signed, but cannot mint live reach.
+        assert!(capsule_to_iroh_reach(&verified, None).is_err());
         let _ = capsule; // keep capsule alive for clarity
                          // `#quic` is a NinePExport but QUIC → wrong transport, fail closed.
         let err = capsule_to_iroh_reach(&verified, Some("#quic")).unwrap_err();
@@ -334,22 +280,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolver_valid_capsule_resolves_to_iroh() {
-        let (capsule, bytes, _cid, did) = signed(20);
+    async fn resolver_valid_capsule_without_transport_id_fails_closed() {
+        let (_capsule, bytes, _cid, did) = signed(20);
         let resolver = At9pResolver::new(Arc::new(FixedSource {
             bytes: bytes.clone(),
         }));
-        let cfg = resolver.resolve_did(&did, None).await.unwrap();
-        let expected_node = capsule.body.subject_keys[0].ed25519_pub.clone();
-        match cfg.endpoint {
-            EndpointType::Iroh {
-                node_id, relay_url, ..
-            } => {
-                assert_eq!(node_id.as_slice(), &expected_node);
-                assert_eq!(relay_url.as_deref(), Some("https://relay20.example"));
-            }
-            other => panic!("expected Iroh endpoint, got {other:?}"),
-        }
+        let err = resolver.resolve_did(&did, None).await.unwrap_err();
+        assert!(err.to_string().contains("no independent iroh EndpointId"));
     }
 
     #[tokio::test]
