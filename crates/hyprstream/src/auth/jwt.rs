@@ -339,8 +339,9 @@ mod tests {
         let header: serde_json::Value = serde_json::from_slice(&header_bytes).unwrap();
         assert_eq!(header["alg"], "ML-DSA-65-Ed25519");
 
+        let dispatch = hyprstream_rpc::auth::parse_composite_dispatch(&token, &["at+jwt"]).unwrap();
         let decoded = hyprstream_rpc::auth::jwt::decode_composite(
-            &token, &ml_dsa_vk, &ed25519_vk, None,
+            &token, &ml_dsa_vk, &ed25519_vk, None, &dispatch,
         ).unwrap();
         assert_eq!(decoded.sub, "bob");
         assert!(decoded.jti.is_some());
@@ -378,8 +379,9 @@ mod tests {
 
         let claims = Claims::new("bob".to_owned(), 0, 9_999_999_999);
         let token = encode_composite_ml_dsa_65_ed25519(&claims, &ml_dsa_sk, &ed25519_sk);
+        let dispatch = hyprstream_rpc::auth::parse_composite_dispatch(&token, &["at+jwt"]).unwrap();
         assert!(hyprstream_rpc::auth::jwt::decode_composite(
-            &token, &ml_dsa_vk, &wrong_ed25519_vk, None,
+            &token, &ml_dsa_vk, &wrong_ed25519_vk, None, &dispatch,
         ).is_err());
     }
 
@@ -399,8 +401,9 @@ mod tests {
         let ed25519_vk = ed25519_sk.verifying_key();
         let claims = Claims::new("bob".to_owned(), 0, 1);
         let token = encode_composite_ml_dsa_65_ed25519(&claims, &ml_dsa_sk, &ed25519_sk);
+        let dispatch = hyprstream_rpc::auth::parse_composite_dispatch(&token, &["at+jwt"]).unwrap();
         let err = hyprstream_rpc::auth::jwt::decode_composite(
-            &token, &ml_dsa_vk, &ed25519_vk, None,
+            &token, &ml_dsa_vk, &ed25519_vk, None, &dispatch,
         ).unwrap_err();
         assert!(matches!(err, hyprstream_rpc::auth::JwtError::Expired));
     }

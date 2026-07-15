@@ -351,16 +351,19 @@ fn decode_composite_multi(
     expected_aud: Option<&str>,
     header: &hyprstream_rpc::auth::ProtectedHeader,
 ) -> Result<jwt::Claims, &'static str> {
+    let dispatch = hyprstream_rpc::auth::parse_composite_dispatch(token, &["at+jwt"])
+        .map_err(|_| "JWT validation failed")?;
+    if dispatch.kid() != header.kid { return Err("JWT validation failed"); }
     let pair = published_composite
         .iter()
         .find(|pair| pair.kid() == header.kid)
         .ok_or("JWT validation failed")?;
-    hyprstream_rpc::auth::jwt::decode_composite_with_header(
+    hyprstream_rpc::auth::jwt::decode_composite(
         token,
         pair.ml_dsa(),
         pair.ed25519(),
         expected_aud,
-        header,
+        &dispatch,
     )
     .map_err(|_| "JWT validation failed")
 }

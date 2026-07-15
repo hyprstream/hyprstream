@@ -1,5 +1,6 @@
 //! Atomic exact-pair authority for composite JWT signing and verification.
 
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
@@ -147,6 +148,14 @@ impl CompositeKeySetSnapshot {
 /// Process-shared atomic publication point for exact composite pairs.
 pub struct CompositeKeySet {
     snapshot: RwLock<Arc<CompositeKeySetSnapshot>>,
+    authority: RwLock<Option<CompositeAuthorityPaths>>,
+}
+
+#[derive(Clone)]
+struct CompositeAuthorityPaths {
+    ledger: PathBuf,
+    committed: PathBuf,
+    ledger_lock: PathBuf,
 }
 
 impl Default for CompositeKeySet {
@@ -156,22 +165,59 @@ impl Default for CompositeKeySet {
                 version: 0,
                 pairs: Arc::from([]),
             })),
+            authority: RwLock::new(None),
         }
     }
 }
 
 impl CompositeKeySet {
     pub fn snapshot(&self) -> Arc<CompositeKeySetSnapshot> {
-        self.snapshot
+        self.snapshot.read().clone()
+    }
+
+    pub fn configure_authority(&self, ledger: PathBuf, committed: PathBuf, ledger_lock: PathBuf) {
+        *self.authority.write() = Some(CompositeAuthorityPaths {
+            ledger,
+            committed,
+            ledger_lock,
+        });
+    }
+
+    /// Return a signing snapshot only when it matches the committed disk generation.
+    pub fn mint_snapshot(&self) -> anyhow::Result<Arc<CompositeKeySetSnapshot>> {
+        use nix::fcntl::{flock, FlockArg};
+        use std::os::fd::AsRawFd;
+        let authority = self
+            .authority
             .read()
             .clone()
+            .ok_or_else(|| anyhow::anyhow!("composite authority is not configured"))?;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&authority.ledger_lock)?;
+        flock(lock.as_raw_fd(), FlockArg::LockShared)?;
+        let snapshot = self.snapshot();
+        let ledger: serde_json::Value = serde_json::from_slice(&std::fs::read(&authority.ledger)?)?;
+        let disk = ledger
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("composite ledger version missing"))?;
+        let committed = std::fs::read_to_string(&authority.committed)?
+            .trim()
+            .parse::<u64>()?;
+        anyhow::ensure!(
+            snapshot.version == disk && snapshot.version == committed,
+            "composite signing authority is stale or cutover is pending"
+        );
+        Ok(snapshot)
     }
 
     /// Atomically replace the complete ledger. Versions must increase.
     pub fn publish(&self, version: u64, pairs: Vec<CompositeKeyPair>) -> anyhow::Result<()> {
-        let mut guard = self
-            .snapshot
-            .write();
+        let mut guard = self.snapshot.write();
         anyhow::ensure!(
             version > guard.version,
             "composite key-set version must increase"
@@ -220,19 +266,9 @@ mod tests {
         ed: Arc<SigningKey>,
         state: CompositePairState,
     ) -> CompositeKeyPair {
-        let kid = crate::auth::composite_kid(
-            &ml_dsa::Keypair::verifying_key(&*pq),
-            &ed.verifying_key(),
-        );
-        CompositeKeyPair::signing(
-            kid,
-            pq,
-            ed,
-            CompositePairRole::OAuth,
-            state,
-            0,
-            i64::MAX,
-        )
+        let kid =
+            crate::auth::composite_kid(&ml_dsa::Keypair::verifying_key(&*pq), &ed.verifying_key());
+        CompositeKeyPair::signing(kid, pq, ed, CompositePairRole::OAuth, state, 0, i64::MAX)
     }
 
     fn pair(seed: u8) -> CompositeKeyPair {
@@ -263,18 +299,18 @@ mod tests {
     }
 
     fn verify(token: &str, snapshot: &CompositeKeySetSnapshot) -> bool {
-        let Ok(header) = crate::auth::parse_protected_header(token) else {
+        let Ok(dispatch) = crate::auth::parse_composite_dispatch(token, &["at+jwt"]) else {
             return false;
         };
-        let Some(pair) = snapshot.pair(&header.kid) else {
+        let Some(pair) = snapshot.pair(dispatch.kid()) else {
             return false;
         };
-        crate::auth::jwt::decode_composite_with_header(
+        crate::auth::jwt::decode_composite(
             token,
             pair.ml_dsa(),
             pair.ed25519(),
             Some("resource"),
-            &header,
+            &dispatch,
         )
         .is_ok()
     }
@@ -319,7 +355,13 @@ mod tests {
             let jwks_has_old = jwks_snapshot.pair(&reader_old_kid).is_some();
             let jwks_len = jwks_snapshot.pairs().len();
             reader_jwks.wait();
-            (token, verify_version, token_verified, jwks_has_old, jwks_len)
+            (
+                token,
+                verify_version,
+                token_verified,
+                jwks_has_old,
+                jwks_len,
+            )
         });
 
         let promoted_ed = Arc::new(SigningKey::from_bytes(&[2; 32]));
@@ -352,13 +394,35 @@ mod tests {
         let after = keys.snapshot();
         assert_eq!(after.version(), 3);
         assert!(after.pair(&promoted_kid).is_some());
-        assert!(after.pair(&old_kid).is_none(), "evicted pair remained accepted");
-        assert!(!verify(&old_token, &after));
-        let new_token = mint(
-            after
-                .active_signing_pair(CompositePairRole::OAuth)
-                .unwrap(),
+        assert!(
+            after.pair(&old_kid).is_none(),
+            "evicted pair remained accepted"
         );
+        assert!(!verify(&old_token, &after));
+        let new_token = mint(after.active_signing_pair(CompositePairRole::OAuth).unwrap());
         assert!(verify(&new_token, &after));
+    }
+
+    #[test]
+    fn mint_snapshot_fails_closed_for_missing_pending_and_stale_authority() {
+        let dir = std::env::temp_dir().join(format!(
+            "hyprstream-composite-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ledger = dir.join("ledger.json");
+        let committed = dir.join("committed");
+        let keys = CompositeKeySet::default();
+        keys.configure_authority(ledger.clone(), committed.clone(), dir.join("lock"));
+        keys.publish(1, vec![pair(9)]).unwrap();
+        assert!(keys.mint_snapshot().is_err());
+        std::fs::write(&ledger, br#"{"version":2}"#).unwrap();
+        std::fs::write(&committed, b"1").unwrap();
+        assert!(keys.mint_snapshot().is_err(), "pending cutover minted");
+        std::fs::write(&committed, b"2").unwrap();
+        assert!(keys.mint_snapshot().is_err(), "stale cache minted");
+        keys.publish(2, vec![pair(10)]).unwrap();
+        assert_eq!(keys.mint_snapshot().unwrap().version(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

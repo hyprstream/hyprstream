@@ -25,6 +25,23 @@ pub struct ProtectedHeader {
     pub kid: String,
 }
 
+/// Parser-produced dispatch for a composite JWT. Its fields are private so
+/// callers cannot supply metadata that disagrees with the signed header.
+#[derive(Clone, Debug)]
+pub struct CompositeJwtDispatch {
+    header: ProtectedHeader,
+    protected_b64: String,
+}
+
+impl CompositeJwtDispatch {
+    pub fn typ(&self) -> &str {
+        &self.header.typ
+    }
+    pub fn kid(&self) -> &str {
+        &self.header.kid
+    }
+}
+
 impl<'de> serde::Deserialize<'de> for ProtectedHeader {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -115,6 +132,28 @@ pub fn parse_protected_header(token: &str) -> Result<ProtectedHeader, JwtError> 
         .decode(header_b64)
         .map_err(|_| JwtError::InvalidBase64)?;
     serde_json::from_slice(&header_bytes).map_err(|e| JwtError::InvalidJson(e.to_string()))
+}
+
+/// Parse composite dispatch exactly once and enforce the caller's allowed types.
+pub fn parse_composite_dispatch(
+    token: &str,
+    allowed_types: &[&str],
+) -> Result<CompositeJwtDispatch, JwtError> {
+    let header = parse_protected_header(token)?;
+    if header.alg != "ML-DSA-65-Ed25519" {
+        return Err(JwtError::UnsupportedAlgorithm(header.alg));
+    }
+    if !allowed_types.iter().any(|allowed| *allowed == header.typ) {
+        return Err(JwtError::UnsupportedType(header.typ));
+    }
+    let protected_b64 = token
+        .split_once('.')
+        .map(|(value, _)| value.to_owned())
+        .ok_or(JwtError::InvalidFormat)?;
+    Ok(CompositeJwtDispatch {
+        header,
+        protected_b64,
+    })
 }
 
 /// Input for RFC 7638 JWK Thumbprint computation.
@@ -238,6 +277,9 @@ pub enum JwtError {
 
     #[error("Unsupported algorithm: {0}")]
     UnsupportedAlgorithm(String),
+
+    #[error("Unsupported token type: {0}")]
+    UnsupportedType(String),
 }
 
 /// Encode and sign a JWT with a specific JOSE header.
@@ -492,7 +534,7 @@ pub fn decode_ml_dsa_65(
     if let Some(expected) = expected_aud {
         match &claims.aud {
             Some(aud) if aud == expected => {}
-            None => {}                                    // lenient: absent aud accepted
+            None => {} // lenient: absent aud accepted
             Some(_) => return Err(JwtError::InvalidAudience), // wrong aud rejected
         }
     }
@@ -509,21 +551,9 @@ pub fn decode_composite(
     ml_dsa_vk: &crate::crypto::pq::MlDsaVerifyingKey,
     ed25519_vk: &VerifyingKey,
     expected_aud: Option<&str>,
+    dispatch: &CompositeJwtDispatch,
 ) -> Result<Claims, JwtError> {
-    let header = parse_protected_header(token)?;
-    decode_composite_with_header(token, ml_dsa_vk, ed25519_vk, expected_aud, &header)
-}
-
-/// Verify a composite JWT using an already validated protected header.
-/// This prevents dispatch and the signature primitive from interpreting the
-/// protected bytes differently.
-pub fn decode_composite_with_header(
-    token: &str,
-    ml_dsa_vk: &crate::crypto::pq::MlDsaVerifyingKey,
-    ed25519_vk: &VerifyingKey,
-    expected_aud: Option<&str>,
-    header: &ProtectedHeader,
-) -> Result<Claims, JwtError> {
+    let header = &dispatch.header;
     if header.alg != "ML-DSA-65-Ed25519" {
         return Err(JwtError::UnsupportedAlgorithm(header.alg.clone()));
     }
@@ -533,6 +563,9 @@ pub fn decode_composite_with_header(
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return Err(JwtError::InvalidFormat);
+    }
+    if parts[0] != dispatch.protected_b64 {
+        return Err(JwtError::InvalidSignature);
     }
 
     let signing_input = format!("{}.{}", parts[0], parts[1]);
@@ -599,6 +632,56 @@ mod tests {
 
     fn make_key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn composite_token_with_type(
+        typ: &str,
+    ) -> (String, crate::crypto::pq::MlDsaVerifyingKey, VerifyingKey) {
+        let (pq, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let ed = make_key(0x71);
+        let header = format!(
+            r#"{{"alg":"ML-DSA-65-Ed25519","typ":"{typ}","kid":"{}"}}"#,
+            composite_kid(&pq_vk, &ed.verifying_key())
+        );
+        let claims = Claims::new("dispatch-test".to_owned(), 0, 9_999_999_999);
+        let input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(header),
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        );
+        let mut signature = crate::crypto::pq::ml_dsa_sign(&pq, input.as_bytes());
+        signature.extend_from_slice(&ed.sign(input.as_bytes()).to_bytes());
+        (
+            format!("{}.{}", input, URL_SAFE_NO_PAD.encode(signature)),
+            pq_vk,
+            ed.verifying_key(),
+        )
+    }
+
+    #[test]
+    fn public_composite_dispatch_rejects_type_and_header_binding_bypasses() {
+        let (bad_type, _, _) = composite_token_with_type("JWT");
+        assert!(matches!(
+            parse_composite_dispatch(&bad_type, &["at+jwt"]),
+            Err(JwtError::UnsupportedType(_))
+        ));
+        let (token, pq, ed) = composite_token_with_type("at+jwt");
+        let dispatch = parse_composite_dispatch(&token, &["at+jwt"]).unwrap();
+        let (_, rest) = token.split_once('.').unwrap();
+        let altered_header = URL_SAFE_NO_PAD.encode(format!(
+            r#"{{"alg":"ML-DSA-65-Ed25519","typ":"wit+jwt","kid":"{}"}}"#,
+            composite_kid(&pq, &ed)
+        ));
+        assert!(matches!(
+            decode_composite(
+                &format!("{altered_header}.{rest}"),
+                &pq,
+                &ed,
+                None,
+                &dispatch
+            ),
+            Err(JwtError::InvalidSignature)
+        ));
     }
 
     #[test]

@@ -137,7 +137,9 @@ impl PolicyService {
     ) -> Result<String> {
         let policy = hyprstream_rpc::envelope::envelope_policy_from_env();
         if policy.uses_pq() {
-            let snapshot = hyprstream_rpc::auth::global_composite_key_set().snapshot();
+            let snapshot = hyprstream_rpc::auth::global_composite_key_set()
+                .mint_snapshot()
+                .map_err(|error| anyhow!("composite authority unavailable: {error}"))?;
             let signing = snapshot
                 .active_signing_pair(hyprstream_rpc::auth::CompositePairRole::Policy)
                 .and_then(hyprstream_rpc::auth::CompositeKeyPair::signing_keys);

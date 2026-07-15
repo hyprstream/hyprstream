@@ -910,7 +910,13 @@ async fn mint_grant_token(
     // that chain of hybrid authority.
     let policy = hyprstream_rpc::envelope::envelope_policy_from_env();
     let token = if policy.uses_pq() {
-        let snapshot = hyprstream_rpc::auth::global_composite_key_set().snapshot();
+        let snapshot = match hyprstream_rpc::auth::global_composite_key_set().mint_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::error!("composite authority unavailable or stale; refusing to mint: {error}");
+                return tx_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "hybrid token authority is not current");
+            }
+        };
         let signing = snapshot
             .active_signing_pair(hyprstream_rpc::auth::CompositePairRole::OAuth)
             .and_then(hyprstream_rpc::auth::CompositeKeyPair::signing_keys);

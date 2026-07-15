@@ -786,16 +786,18 @@ pub trait RequestService: 'static {
                 {
                     anyhow::bail!("local composite JWT issuer mismatch");
                 }
+                let dispatch = crate::auth::parse_composite_dispatch(&token, &["at+jwt", "wit+jwt"])
+                    .map_err(|error| anyhow::anyhow!("JWT dispatch failed: {error}"))?;
                 let snapshot = key_source.composite_key_set().snapshot();
                 let pair = snapshot
-                    .pair(&protected.kid)
+                    .pair(dispatch.kid())
                     .ok_or_else(|| anyhow::anyhow!("unknown composite JWT kid"))?;
-                crate::auth::jwt::decode_composite_with_header(
+                crate::auth::jwt::decode_composite(
                     &token,
                     pair.ml_dsa(),
                     pair.ed25519(),
                     self.expected_audience(),
-                    &protected,
+                    &dispatch,
                 )
                 .map_err(|error| {
                     tracing::warn!("composite JWT verification failed: {error}");
