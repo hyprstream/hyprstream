@@ -12,6 +12,11 @@ on:
 
 jobs:
   claude-review:
+    # Disabled: CLAUDE_CODE_OAUTH_TOKEN is broken — the action fails auth before
+    # reviewing any code (is_error:true, ~2s, no findings) on every PR since
+    # 2026-07-11. Re-enable once the token is rotated. See #1046.
+    if: false
+
     # Optional: Filter by PR author
     # if: |
     #   github.event.pull_request.user.login == 'external-contributor' ||
