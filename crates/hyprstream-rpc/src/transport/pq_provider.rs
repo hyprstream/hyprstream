@@ -46,6 +46,13 @@ fn provider_with_groups(
     }
 }
 
+fn external_interop_provider() -> CryptoProvider {
+    provider_with_groups([
+        aws_lc_rs::kx_group::X25519MLKEM768,
+        aws_lc_rs::kx_group::X25519,
+    ])
+}
+
 /// Provider for an owned internal-mesh connection. Classical fallback is
 /// intentionally absent, so an X25519-only peer fails the TLS handshake.
 pub fn internal_mesh_crypto_provider() -> Arc<CryptoProvider> {
@@ -55,10 +62,7 @@ pub fn internal_mesh_crypto_provider() -> Arc<CryptoProvider> {
 /// Provider for an explicitly declared external-interoperability boundary.
 /// PQ hybrid is preferred, with classical X25519 retained for non-PQ peers.
 pub fn pq_crypto_provider() -> Arc<CryptoProvider> {
-    Arc::new(provider_with_groups([
-        aws_lc_rs::kx_group::X25519MLKEM768,
-        aws_lc_rs::kx_group::X25519,
-    ]))
+    Arc::new(external_interop_provider())
 }
 
 fn group_names(provider: &CryptoProvider) -> Vec<rustls::NamedGroup> {
@@ -105,11 +109,7 @@ pub fn validate_internal_mesh_crypto_provider(
 /// external policy. Call it before constructing any WebTransport/rustls
 /// builder; a policy violation fails startup instead of downgrading transport.
 pub fn install_pq_crypto_provider() -> Result<(), ProviderPolicyError> {
-    let _ = provider_with_groups([
-        aws_lc_rs::kx_group::X25519MLKEM768,
-        aws_lc_rs::kx_group::X25519,
-    ])
-    .install_default();
+    let _ = external_interop_provider().install_default();
 
     let provider = CryptoProvider::get_default().ok_or(ProviderPolicyError {
         expected: EXTERNAL_INTEROP_GROUPS,
