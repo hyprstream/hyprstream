@@ -849,7 +849,7 @@ impl Spawnable for OAuthService {
                     match build_oauth_iroh_substrate(transport_key.to_bytes()).await {
                         Ok(substrate) => {
                             let _ = hyprstream_rpc::transport::lazy_iroh::install_iroh_client_endpoint(
-                                substrate.endpoint().clone(),
+                                substrate.owned_client_endpoint(),
                             );
                             Some(substrate)
                         }

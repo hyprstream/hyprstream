@@ -36,7 +36,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::transport::backoff::LazyState;
-use crate::transport::iroh_substrate::ALPN_HYPRSTREAM_RPC;
+use crate::transport::iroh_substrate::{ALPN_HYPRSTREAM_RPC, OwnedIrohClientEndpoint};
 use crate::transport::iroh_transport::{IrohPendingStream, IrohPublishStub, IrohTransport};
 use crate::transport_traits::Transport;
 
@@ -51,15 +51,34 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Process-wide client iroh endpoint, installed once at startup.
 static IROH_CLIENT_ENDPOINT: OnceLock<iroh::Endpoint> = OnceLock::new();
 
-/// Install the process-global client iroh [`Endpoint`](iroh::Endpoint) used to
+/// Install the process-global client iroh endpoint used to
 /// originate outbound RPC dials. First-write-wins (mirrors
 /// `install_verify_config`); returns `Err(endpoint)` if one is already set.
 ///
 /// The daemon calls this once during bootstrap with the shared endpoint (the
 /// same one its inbound iroh substrate listens on, so outbound dials reuse the
-/// transport sockets and address).
-pub fn install_iroh_client_endpoint(endpoint: iroh::Endpoint) -> Result<(), iroh::Endpoint> {
-    IROH_CLIENT_ENDPOINT.set(endpoint)
+/// node identity). The capability can only be obtained from
+/// [`crate::transport::iroh_substrate::IrohSubstrate::owned_client_endpoint`],
+/// which proves the endpoint was bound with the exact hybrid-only provider.
+///
+/// Arbitrary already-bound endpoints are rejected by the type system:
+///
+/// ```compile_fail
+/// # let endpoint: iroh::Endpoint = todo!();
+/// hyprstream_rpc::transport::lazy_iroh::install_iroh_client_endpoint(endpoint);
+/// ```
+///
+/// The opaque capability itself also cannot be forged from a raw endpoint:
+///
+/// ```compile_fail
+/// # let endpoint: iroh::Endpoint = todo!();
+/// let _owned =
+///     hyprstream_rpc::transport::iroh_substrate::OwnedIrohClientEndpoint(endpoint);
+/// ```
+pub fn install_iroh_client_endpoint(
+    endpoint: OwnedIrohClientEndpoint,
+) -> Result<(), OwnedIrohClientEndpoint> {
+    endpoint.install_into(&IROH_CLIENT_ENDPOINT)
 }
 
 /// The installed client endpoint, cloned (cheap — iroh `Endpoint` is `Arc`-backed).

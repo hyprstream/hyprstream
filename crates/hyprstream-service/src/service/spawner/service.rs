@@ -262,7 +262,7 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                             // Install the shared client endpoint (install-once) so
                             // outbound iroh RPC/stream dials reuse this carrier.
                             let _ = hyprstream_rpc::transport::lazy_iroh::install_iroh_client_endpoint(
-                                substrate.endpoint().clone(),
+                                substrate.owned_client_endpoint(),
                             );
                             // #357: register our iroh node_id so producer_reach()
                             // advertises an iroh-direct Destination for native

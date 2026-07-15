@@ -81,6 +81,24 @@ pub struct IrohSubstrate {
     router: Router,
 }
 
+/// Capability proving an outbound iroh endpoint was constructed by
+/// [`IrohSubstrate::new`] with the owned hybrid-only crypto provider.
+///
+/// The inner endpoint is intentionally private: an already-bound iroh endpoint
+/// does not expose its effective provider, so arbitrary endpoints cannot be
+/// promoted into the process-global RPC/MoQ dialer.
+#[derive(Clone)]
+pub struct OwnedIrohClientEndpoint(Endpoint);
+
+impl OwnedIrohClientEndpoint {
+    pub(crate) fn install_into(
+        self,
+        slot: &std::sync::OnceLock<Endpoint>,
+    ) -> std::result::Result<(), Self> {
+        slot.set(self.0).map_err(Self)
+    }
+}
+
 impl IrohSubstrate {
     /// Build the substrate from raw 32-byte Ed25519 secret key material.
     ///
@@ -172,6 +190,12 @@ impl IrohSubstrate {
     /// an ALPN not served by this substrate's router.
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
+    }
+
+    /// Clone the endpoint as an owned-provider capability for installation as
+    /// the shared outbound RPC and MoQ dial endpoint.
+    pub fn owned_client_endpoint(&self) -> OwnedIrohClientEndpoint {
+        OwnedIrohClientEndpoint(self.endpoint.clone())
     }
 
     /// Borrow the router (e.g. to inspect or to share lifetime).
@@ -371,13 +395,19 @@ mod tests {
             .await
             .map_err(|e| anyhow::anyhow!("classical mutation endpoint bind: {e}"))?;
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            classical_client.connect(server_addr, ALPN_HYPRSTREAM_RPC),
-        )
-        .await
-        .expect("classical-only iroh mutation handshake must terminate");
-        assert!(result.is_err(), "internal iroh mesh accepted classical-only TLS");
+        for alpn in [ALPN_HYPRSTREAM_RPC, ALPN_MOQ_LITE] {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                classical_client.connect(server_addr.clone(), alpn),
+            )
+            .await
+            .expect("classical-only iroh mutation handshake must terminate");
+            assert!(
+                result.is_err(),
+                "internal iroh outbound endpoint reached owned ALPN {:?}",
+                String::from_utf8_lossy(alpn)
+            );
+        }
 
         classical_client.close().await;
         server.shutdown().await?;

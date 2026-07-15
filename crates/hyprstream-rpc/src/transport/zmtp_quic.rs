@@ -306,6 +306,24 @@ impl Multipart {
 // QUIC Socket Types (server-side)
 // ============================================================================
 
+fn owned_quic_server_config(tls: rustls::ServerConfig) -> Result<quinn::ServerConfig> {
+    crate::transport::pq_provider::validate_internal_mesh_crypto_provider(
+        tls.crypto_provider(),
+    )?;
+    Ok(quinn::ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(tls)?,
+    )))
+}
+
+fn owned_quic_client_config(tls: rustls::ClientConfig) -> Result<quinn::ClientConfig> {
+    crate::transport::pq_provider::validate_internal_mesh_crypto_provider(
+        tls.crypto_provider(),
+    )?;
+    Ok(quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(tls)?,
+    )))
+}
+
 /// Server-side REP socket over QUIC.
 ///
 /// Accepts QUIC connections; each connection carries one ZmtpStream for ZMTP exchange.
@@ -322,13 +340,7 @@ impl QuicRep {
     /// * `addr` - Socket address to bind to
     /// * `tls` - TLS server configuration
     pub fn bind(addr: SocketAddr, tls: rustls::ServerConfig) -> Result<Self> {
-        crate::transport::pq_provider::validate_internal_mesh_crypto_provider(
-            tls.crypto_provider(),
-        )?;
-        let quic_server_cfg =
-            quinn::ServerConfig::with_crypto(Arc::new(quinn::crypto::rustls::QuicServerConfig::try_from(tls)?));
-
-        let endpoint = quinn::Endpoint::server(quic_server_cfg, addr)?;
+        let endpoint = quinn::Endpoint::server(owned_quic_server_config(tls)?, addr)?;
 
         Ok(Self { endpoint })
     }
@@ -649,16 +661,8 @@ impl QuicReq {
         server_name: &str,
         tls: rustls::ClientConfig,
     ) -> Result<Self> {
-        crate::transport::pq_provider::validate_internal_mesh_crypto_provider(
-            tls.crypto_provider(),
-        )?;
-        let quic_client_config =
-            quinn::ClientConfig::new(Arc::new(quinn::crypto::rustls::QuicClientConfig::try_from(
-                tls,
-            )?));
-
         let mut endpoint = quinn::Endpoint::client("[::]:0".parse()?)?;
-        endpoint.set_default_client_config(quic_client_config);
+        endpoint.set_default_client_config(owned_quic_client_config(tls)?);
 
         let conn = endpoint
             .connect(addr, server_name)?
@@ -719,10 +723,7 @@ pub struct QuicXPub {
 impl QuicXPub {
     /// Bind a QUIC XPUB socket to the given address.
     pub fn bind(addr: SocketAddr, tls: rustls::ServerConfig) -> Result<Self> {
-        let quic_server_cfg =
-            quinn::ServerConfig::with_crypto(Arc::new(quinn::crypto::rustls::QuicServerConfig::try_from(tls)?));
-
-        let endpoint = quinn::Endpoint::server(quic_server_cfg, addr)?;
+        let endpoint = quinn::Endpoint::server(owned_quic_server_config(tls)?, addr)?;
 
         Ok(Self {
             endpoint,
@@ -900,13 +901,8 @@ impl QuicSub {
         server_name: &str,
         tls: rustls::ClientConfig,
     ) -> Result<Self> {
-        let quic_client_config =
-            quinn::ClientConfig::new(Arc::new(quinn::crypto::rustls::QuicClientConfig::try_from(
-                tls,
-            )?));
-
         let mut endpoint = quinn::Endpoint::client("[::]:0".parse()?)?;
-        endpoint.set_default_client_config(quic_client_config);
+        endpoint.set_default_client_config(owned_quic_client_config(tls)?);
 
         let conn = endpoint
             .connect(addr, server_name)?
@@ -991,13 +987,8 @@ impl QuicPush {
         server_name: &str,
         tls: rustls::ClientConfig,
     ) -> Result<Self> {
-        let quic_client_config =
-            quinn::ClientConfig::new(Arc::new(quinn::crypto::rustls::QuicClientConfig::try_from(
-                tls,
-            )?));
-
         let mut endpoint = quinn::Endpoint::client("[::]:0".parse()?)?;
-        endpoint.set_default_client_config(quic_client_config);
+        endpoint.set_default_client_config(owned_quic_client_config(tls)?);
 
         let conn = endpoint
             .connect(addr, server_name)?
@@ -1044,10 +1035,7 @@ pub struct QuicPull {
 impl QuicPull {
     /// Bind a QUIC PULL socket to the given address.
     pub fn bind(addr: SocketAddr, tls: rustls::ServerConfig) -> Result<Self> {
-        let quic_server_cfg =
-            quinn::ServerConfig::with_crypto(Arc::new(quinn::crypto::rustls::QuicServerConfig::try_from(tls)?));
-
-        let endpoint = quinn::Endpoint::server(quic_server_cfg, addr)?;
+        let endpoint = quinn::Endpoint::server(owned_quic_server_config(tls)?, addr)?;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
         Ok(Self {
@@ -1554,29 +1542,35 @@ mod tests {
 
     #[tokio::test]
     async fn zmtp_internal_mesh_rejects_classical_only_peer() {
-        let mut classical = rustls::ClientConfig::builder_with_provider(Arc::new(
+        let err = QuicReq::connect(
+            "127.0.0.1:9".parse().unwrap(),
+            "localhost",
+            classical_client_config(),
+        )
+        .await
+        .err()
+        .expect("public REQ seam must reject classical config before dialing");
+        assert!(err.to_string().contains("owned-mesh crypto policy mismatch"));
+    }
+
+    fn classical_client_config() -> rustls::ClientConfig {
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_root_certificates(rustls::RootCertStore::empty())
         .with_no_client_auth();
-        classical.alpn_protocols = vec![ALPN_ZMTP3.to_vec()];
-
-        let err = QuicReq::connect("127.0.0.1:9".parse().unwrap(), "localhost", classical)
-            .await
-            .err()
-            .expect("public REQ seam must reject classical config before dialing");
-        assert!(err.to_string().contains("owned-mesh crypto policy mismatch"));
+        config.alpn_protocols = vec![ALPN_ZMTP3.to_vec()];
+        config
     }
 
-    #[test]
-    fn zmtp_rep_rejects_classical_only_config_before_bind() {
+    fn classical_server_config() -> rustls::ServerConfig {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
         let key = rustls::pki_types::PrivatePkcs8KeyDer::from(
             cert.key_pair.serialize_der(),
         );
-        let mut classical = rustls::ServerConfig::builder_with_provider(Arc::new(
+        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
         .with_safe_default_protocol_versions()
@@ -1584,12 +1578,47 @@ mod tests {
         .with_no_client_auth()
         .with_single_cert(vec![cert.cert.der().clone()], key.into())
         .unwrap();
-        classical.alpn_protocols = vec![ALPN_ZMTP3.to_vec()];
+        config.alpn_protocols = vec![ALPN_ZMTP3.to_vec()];
+        config
+    }
 
-        let err = QuicRep::bind("127.0.0.1:0".parse().unwrap(), classical)
+    fn assert_owned_policy_error<T>(result: Result<T>, seam: &str) {
+        let err = result.err().unwrap_or_else(|| panic!("{seam} accepted classical config"));
+        assert!(
+            err.to_string().contains("owned-mesh crypto policy mismatch"),
+            "{seam} returned the wrong error: {err}"
+        );
+    }
+
+    #[test]
+    fn zmtp_rep_rejects_classical_only_config_before_bind() {
+        let err = QuicRep::bind("127.0.0.1:0".parse().unwrap(), classical_server_config())
             .err()
             .expect("public REP seam must reject classical config before bind");
         assert!(err.to_string().contains("owned-mesh crypto policy mismatch"));
+    }
+
+    #[tokio::test]
+    async fn all_owned_zmtp_socket_families_reject_classical_configs() {
+        let bind_addr = "127.0.0.1:0".parse().unwrap();
+        assert_owned_policy_error(
+            QuicXPub::bind(bind_addr, classical_server_config()),
+            "XPUB bind",
+        );
+        assert_owned_policy_error(
+            QuicPull::bind(bind_addr, classical_server_config()),
+            "PULL bind",
+        );
+
+        let dial_addr = "127.0.0.1:9".parse().unwrap();
+        assert_owned_policy_error(
+            QuicSub::connect(dial_addr, "localhost", classical_client_config()).await,
+            "SUB connect",
+        );
+        assert_owned_policy_error(
+            QuicPush::connect(dial_addr, "localhost", classical_client_config()).await,
+            "PUSH connect",
+        );
     }
 
     #[test]
