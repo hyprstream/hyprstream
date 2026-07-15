@@ -138,6 +138,30 @@ pub fn dial_with_kem_store<S>(
 where
     S: Signer + 'static,
 {
+    dial_with_crypto_stores(
+        target,
+        signer,
+        server_verifying_key,
+        token,
+        request_kem_store,
+        None,
+    )
+}
+
+/// Dial with both request-confidentiality and response-authentication anchors.
+/// Network response confidentiality requires both stores; absence remains a
+/// fail-closed runtime error at the shared client chokepoint.
+pub fn dial_with_crypto_stores<S>(
+    target: &TransportConfig,
+    signer: S,
+    server_verifying_key: Option<VerifyingKey>,
+    token: Option<String>,
+    request_kem_store: Option<Arc<dyn KemTrustStore>>,
+    response_pq_store: Option<Arc<dyn crate::envelope::PqTrustStore>>,
+) -> Result<Arc<dyn RpcClient>>
+where
+    S: Signer + 'static,
+{
     /// Wrap a built transport as an `RpcClient`, applying the optional default
     /// JWT (CA-signed trust cert included in request envelopes) if present.
     fn build_client<S2, T2>(
@@ -146,6 +170,7 @@ where
         vk: Option<VerifyingKey>,
         token: Option<String>,
         request_kem_store: Option<Arc<dyn KemTrustStore>>,
+        response_pq_store: Option<Arc<dyn crate::envelope::PqTrustStore>>,
     ) -> Arc<dyn RpcClient>
     where
         S2: Signer + 'static,
@@ -154,6 +179,10 @@ where
         let rpc = RpcClientImpl::new(signer, transport, vk);
         let rpc = match request_kem_store {
             Some(store) => rpc.with_request_kem_store(store),
+            None => rpc,
+        };
+        let rpc = match response_pq_store {
+            Some(store) => rpc.with_response_pq_store(store),
             None => rpc,
         };
         let rpc = match token {
@@ -172,9 +201,20 @@ where
                 anyhow!("no in-process service registered for inproc endpoint '{endpoint}'")
             })?;
             let transport = InMemoryTransport::new(processor);
-            Ok(build_client(signer, transport, server_verifying_key, token, request_kem_store))
+            Ok(build_client(
+                signer,
+                transport,
+                server_verifying_key,
+                token,
+                request_kem_store,
+                response_pq_store,
+            ))
         }
-        EndpointType::Quic { addr, server_name, auth } => {
+        EndpointType::Quic {
+            addr,
+            server_name,
+            auth,
+        } => {
             // SECURITY (#185): QUIC channel auth (WebPKI / cert-hash pin) binds the
             // *channel*, not the peer's DID identity. Identity is established at the
             // application layer — the response signature is verified against the
@@ -193,11 +233,20 @@ where
                 server_name.clone(),
                 auth.clone(),
             );
-            Ok(build_client(signer, transport, server_verifying_key, token, request_kem_store))
+            Ok(build_client(
+                signer,
+                transport,
+                server_verifying_key,
+                token,
+                request_kem_store,
+                response_pq_store,
+            ))
         }
-        EndpointType::Iroh { direct_addrs, relay_url, .. }
-            if direct_addrs.is_empty() && relay_url.is_none() =>
-        {
+        EndpointType::Iroh {
+            direct_addrs,
+            relay_url,
+            ..
+        } if direct_addrs.is_empty() && relay_url.is_none() => {
             // Fail fast rather than hand iroh an EndpointId with no reachability,
             // which would fall through to discovery and time out (~10-30s). The
             // resolver is expected to supply at least one direct addr or a relay.
@@ -206,7 +255,11 @@ where
                  not dialable; the resolver must supply reachability"
             )
         }
-        EndpointType::Iroh { node_id, direct_addrs, relay_url } => {
+        EndpointType::Iroh {
+            node_id,
+            direct_addrs,
+            relay_url,
+        } => {
             let response_key = server_verifying_key.ok_or_else(|| {
                 anyhow!(
                     "dial(): iroh reach has no independently resolved application response key; \
@@ -224,6 +277,7 @@ where
                 Some(response_key),
                 token,
                 request_kem_store,
+                response_pq_store,
             ))
         }
         // Same-host `ipc` plane: connect a UdsSession (RPC plane) at the socket
@@ -235,11 +289,25 @@ where
         // + SO_PEERCRED are daemon-owned defense-in-depth (#207).
         EndpointType::Ipc { path } => {
             let transport = crate::transport::lazy_uds::LazyUdsTransport::new(path.clone());
-            Ok(build_client(signer, transport, server_verifying_key, token, request_kem_store))
+            Ok(build_client(
+                signer,
+                transport,
+                server_verifying_key,
+                token,
+                request_kem_store,
+                response_pq_store,
+            ))
         }
         EndpointType::SystemdFd { client_path, .. } => {
             let transport = crate::transport::lazy_uds::LazyUdsTransport::new(client_path.clone());
-            Ok(build_client(signer, transport, server_verifying_key, token, request_kem_store))
+            Ok(build_client(
+                signer,
+                transport,
+                server_verifying_key,
+                token,
+                request_kem_store,
+                response_pq_store,
+            ))
         }
     }
 }
@@ -297,14 +365,16 @@ impl MoqStreamSession {
 /// / `SystemdFd` are same-host endpoints resolved from LOCAL config — never from
 /// a wire-published reach — so they are rejected: a co-located client must use
 /// the same-host UDS fast path instead of dialing.
-pub async fn dial_stream(
-    target: &TransportConfig,
-) -> Result<MoqStreamSession> {
+pub async fn dial_stream(target: &TransportConfig) -> Result<MoqStreamSession> {
     use crate::transport::quinn_transport::{
         connect_pinned_hashes_path, connect_webpki_path, verify_peer_cert_pinned,
     };
     match &target.endpoint {
-        EndpointType::Quic { addr, server_name, auth } => {
+        EndpointType::Quic {
+            addr,
+            server_name,
+            auth,
+        } => {
             let pins = auth.accept_cert_hashes();
             let session = if auth.require_web_pki() {
                 // WebPKI (optionally + pin): validate via system roots + SNI.
@@ -323,7 +393,11 @@ pub async fn dial_stream(
             };
             Ok(MoqStreamSession::Quinn(session))
         }
-        EndpointType::Iroh { node_id, direct_addrs, relay_url } => {
+        EndpointType::Iroh {
+            node_id,
+            direct_addrs,
+            relay_url,
+        } => {
             // #357: dial-by-node_id-alone is now supported — when no direct addrs
             // or relay are supplied, the shared client endpoint's pkarr / n0 DNS
             // discovery (`presets::N0`) resolves the routable addresses from the
@@ -342,9 +416,7 @@ pub async fn dial_stream(
             let session = dial_iroh_moq(node_id, direct_addrs, relay_url).await?;
             Ok(MoqStreamSession::Iroh(session))
         }
-        EndpointType::Ipc { .. }
-        | EndpointType::SystemdFd { .. }
-        | EndpointType::Inproc { .. } => {
+        EndpointType::Ipc { .. } | EndpointType::SystemdFd { .. } | EndpointType::Inproc { .. } => {
             bail!(
                 "dial_stream(): same-host endpoint ({:?}) is resolved from local \
                  config, not dialed from the wire — use the UDS fast path",
@@ -392,10 +464,15 @@ async fn dial_iroh_moq_from_endpoint(
     use iroh::{EndpointAddr, EndpointId, TransportAddr};
 
     let id = EndpointId::from_bytes(node_id).map_err(|e| anyhow!("invalid iroh node_id: {e}"))?;
-    let mut transport_addrs: Vec<TransportAddr> =
-        direct_addrs.iter().copied().map(TransportAddr::Ip).collect();
+    let mut transport_addrs: Vec<TransportAddr> = direct_addrs
+        .iter()
+        .copied()
+        .map(TransportAddr::Ip)
+        .collect();
     if let Some(url) = relay_url {
-        let relay = url.parse().map_err(|e| anyhow!("invalid iroh relay_url '{url}': {e}"))?;
+        let relay = url
+            .parse()
+            .map_err(|e| anyhow!("invalid iroh relay_url '{url}': {e}"))?;
         transport_addrs.push(TransportAddr::Relay(relay));
     }
     let addr = EndpointAddr::from_parts(id, transport_addrs);
@@ -412,9 +489,9 @@ async fn dial_iroh_moq_from_endpoint(
 mod tests {
     use super::*;
     use crate::crypto::SigningKey;
-    use crate::transport::QuicServerAuth;
     use crate::signer::LocalSigner;
     use crate::transport::rpc_session::from_fn;
+    use crate::transport::QuicServerAuth;
     use bytes::Bytes;
     use rand::rngs::OsRng;
 
@@ -446,7 +523,10 @@ mod tests {
         // Service shuts down: drop the only strong ref. The Weak in the
         // registry is now dead and must not resolve (and is pruned).
         drop(proc);
-        assert!(lookup_inproc(name).is_none(), "dead-service entry must not resolve");
+        assert!(
+            lookup_inproc(name).is_none(),
+            "dead-service entry must not resolve"
+        );
     }
 
     #[test]
@@ -457,7 +537,10 @@ mod tests {
 
         let cfg = TransportConfig::inproc(name);
         let client = dial(&cfg, test_signer(), None, None);
-        assert!(client.is_ok(), "dialing a registered inproc endpoint must succeed");
+        assert!(
+            client.is_ok(),
+            "dialing a registered inproc endpoint must succeed"
+        );
 
         unregister_inproc(name);
     }
@@ -466,7 +549,10 @@ mod tests {
     fn dial_inproc_unregistered_errors() {
         let cfg = TransportConfig::inproc("test/dial/never_registered");
         let err = dial(&cfg, test_signer(), None, None);
-        assert!(err.is_err(), "dialing an unregistered inproc endpoint must error");
+        assert!(
+            err.is_err(),
+            "dialing an unregistered inproc endpoint must error"
+        );
     }
 
     #[test]
@@ -475,7 +561,10 @@ mod tests {
         // first send (the socket need not exist yet at dial() time).
         let cfg = TransportConfig::ipc("/tmp/hyprstream-test-dial.sock");
         let client = dial(&cfg, test_signer(), None, None);
-        assert!(client.is_ok(), "ipc dial must build a lazy client without connecting");
+        assert!(
+            client.is_ok(),
+            "ipc dial must build a lazy client without connecting"
+        );
     }
 
     #[test]
@@ -483,7 +572,10 @@ mod tests {
         // systemd socket-activation: client dials the client_path via UDS.
         let cfg = TransportConfig::systemd_fd(7, "/tmp/hyprstream-test-systemd.sock");
         let client = dial(&cfg, test_signer(), None, None);
-        assert!(client.is_ok(), "systemd-fd dial must build a lazy client via client_path");
+        assert!(
+            client.is_ok(),
+            "systemd-fd dial must build a lazy client via client_path"
+        );
     }
 
     #[test]
@@ -492,15 +584,22 @@ mod tests {
         // builds a (lazy, not-yet-connected) client.
         let cfg = TransportConfig::quic("127.0.0.1:9999".parse().unwrap(), "localhost");
         let client = dial(&cfg, test_signer(), None, None);
-        assert!(client.is_ok(), "WebPKI QUIC dial must build a client without connecting");
+        assert!(
+            client.is_ok(),
+            "WebPKI QUIC dial must build a client without connecting"
+        );
     }
 
     #[test]
     fn dial_quic_pinned_builds_client() {
         // Cert-hash-pinned QUIC: builds a lazy client — sync, no I/O.
-        let cfg = TransportConfig::quic_pinned("127.0.0.1:9999".parse().unwrap(), "localhost", [7u8; 32]);
+        let cfg =
+            TransportConfig::quic_pinned("127.0.0.1:9999".parse().unwrap(), "localhost", [7u8; 32]);
         let client = dial(&cfg, test_signer(), None, None);
-        assert!(client.is_ok(), "pinned QUIC dial must build a client without connecting");
+        assert!(
+            client.is_ok(),
+            "pinned QUIC dial must build a client without connecting"
+        );
     }
 
     #[test]
@@ -520,8 +619,14 @@ mod tests {
 
     #[test]
     fn quic_server_auth_rejects_no_requirement() {
-        assert!(QuicServerAuth::pinned(vec![]).is_err(), "empty pin set is no auth");
-        assert!(QuicServerAuth::web_pki_pinned(vec![]).is_err(), "empty pin set is no auth");
+        assert!(
+            QuicServerAuth::pinned(vec![]).is_err(),
+            "empty pin set is no auth"
+        );
+        assert!(
+            QuicServerAuth::web_pki_pinned(vec![]).is_err(),
+            "empty pin set is no auth"
+        );
         assert!(QuicServerAuth::web_pki().require_web_pki());
     }
 
@@ -538,7 +643,8 @@ mod tests {
             Err(e) => e,
         };
         assert!(
-            err.to_string().contains("no iroh client endpoint installed"),
+            err.to_string()
+                .contains("no iroh client endpoint installed"),
             "expected an install-endpoint error (node_id-alone is dialable once an \
              endpoint is installed); got: {err}"
         );

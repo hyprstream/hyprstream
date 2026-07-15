@@ -80,16 +80,6 @@ where
     } else {
         crate::crypto::CryptoPolicy::Classical
     };
-    let sign_response = |request_id: u64, payload: Vec<u8>| {
-        ResponseEnvelope::new_signed_with_policy(
-            request_id,
-            payload,
-            signing_key,
-            response_pq_key.as_ref(),
-            response_policy,
-        )
-    };
-
     let pq_store_holder = crate::envelope::global_pq_store();
     let base = match verification {
         EnvelopeVerification::FixedSigner(pubkey) => {
@@ -113,6 +103,47 @@ where
     };
 
     let request_id = ctx.request_id;
+    if carrier.forbids_cleartext_envelope() && ctx.response_kem_recipient.is_none() {
+        anyhow::bail!(
+            "authenticated network request omitted responseKemRecipient; dropping without response"
+        );
+    }
+    if carrier.forbids_cleartext_envelope() && response_pq_key.is_none() {
+        anyhow::bail!(
+            "network response requires an ML-DSA-65 signing key; dropping without cleartext"
+        );
+    }
+    let response_recipient = ctx.response_kem_recipient.clone();
+    let request_iat = ctx.request_iat;
+    let request_nonce = ctx.request_nonce;
+    let sign_response = |payload: Vec<u8>| -> Result<ResponseEnvelope> {
+        if carrier.forbids_cleartext_envelope() {
+            let recipient = response_recipient
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing authenticated response recipient"))?;
+            let pq_key = response_pq_key
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing response ML-DSA-65 signing key"))?;
+            ResponseEnvelope::new_signed_encrypted(
+                request_id,
+                payload,
+                signing_key,
+                pq_key,
+                recipient,
+                request_iat,
+                &request_nonce,
+            )
+            .map_err(Into::into)
+        } else {
+            Ok(ResponseEnvelope::new_signed_with_policy(
+                request_id,
+                payload,
+                signing_key,
+                response_pq_key.as_ref(),
+                response_policy,
+            ))
+        }
+    };
     debug!(
         "{} verified request from {} (id={})",
         service.name(),
@@ -130,7 +161,7 @@ where
             e
         );
         let error_payload = service.build_error_payload(request_id, &e.to_string());
-        let signed_response = sign_response(request_id, error_payload);
+        let signed_response = sign_response(error_payload)?;
 
         let mut message = Builder::new_default();
         let mut builder = message.init_root::<crate::common_capnp::response_envelope::Builder>();
@@ -154,7 +185,7 @@ where
     };
 
     // 4. Sign and serialize response
-    let signed_response = sign_response(request_id, response_payload);
+    let signed_response = sign_response(response_payload)?;
 
     let mut message = Builder::new_default();
     let mut builder = message.init_root::<crate::common_capnp::response_envelope::Builder>();

@@ -94,6 +94,10 @@ impl RequestService for EchoService {
     fn signing_key(&self) -> SigningKey {
         self.signing_key.clone()
     }
+
+    fn pq_signing_key(&self) -> Option<hyprstream_rpc::crypto::pq::MlDsaSigningKey> {
+        Some(derive_mesh_mldsa_key(&self.signing_key))
+    }
 }
 
 fn fresh_signing_key() -> SigningKey {
@@ -174,17 +178,27 @@ async fn silent_drop_oracle_rejects_nonresponsive_peer_control() {
 struct RecordingTransport<T> {
     inner: T,
     last_sent: Arc<Mutex<Option<Vec<u8>>>>,
+    last_received: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 impl<T> RecordingTransport<T> {
-    fn new(inner: T) -> (Self, Arc<Mutex<Option<Vec<u8>>>>) {
+    fn new(
+        inner: T,
+    ) -> (
+        Self,
+        Arc<Mutex<Option<Vec<u8>>>>,
+        Arc<Mutex<Option<Vec<u8>>>>,
+    ) {
         let last_sent = Arc::new(Mutex::new(None));
+        let last_received = Arc::new(Mutex::new(None));
         (
             Self {
                 inner,
                 last_sent: Arc::clone(&last_sent),
+                last_received: Arc::clone(&last_received),
             },
             last_sent,
+            last_received,
         )
     }
 }
@@ -201,7 +215,9 @@ where
 
     async fn send(&self, payload: Vec<u8>, timeout_ms: Option<i32>) -> Result<Vec<u8>> {
         *self.last_sent.lock().await = Some(payload.clone());
-        self.inner.send(payload, timeout_ms).await
+        let response = self.inner.send(payload, timeout_ms).await?;
+        *self.last_received.lock().await = Some(response.clone());
+        Ok(response)
     }
 
     fn forbids_cleartext_envelope(&self) -> bool {
@@ -249,7 +265,7 @@ async fn hykem_encrypted_envelope_round_trip_over_iroh() -> Result<()> {
     .await?;
 
     let conn = client.connect(server_addr, ALPN_HYPRSTREAM_RPC).await?;
-    let (transport, last_sent) = RecordingTransport::new(IrohTransport::new(conn));
+    let (transport, last_sent, last_received) = RecordingTransport::new(IrohTransport::new(conn));
 
     // Request verification: server anchors the client's mesh ML-DSA key.
     let client_pq_sk = derive_mesh_mldsa_key(&client_signing);
@@ -291,6 +307,25 @@ async fn hykem_encrypted_envelope_round_trip_over_iroh() -> Result<()> {
     // Real encrypted + hybrid-signed envelope round-trip over iroh.
     let response = rpc.call(b"ping-payload".to_vec()).await?;
     assert_eq!(&response[..], b"\xECping-payload");
+    let received = last_received
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("response bytes not recorded"))?;
+    assert!(
+        !received
+            .windows(b"ping-payload".len())
+            .any(|w| w == b"ping-payload"),
+        "clear response payload must not appear on the iroh wire"
+    );
+    let response_reader = capnp::serialize::read_message(
+        &mut std::io::Cursor::new(&received),
+        capnp::message::ReaderOptions::new(),
+    )?;
+    let response_outer =
+        response_reader.get_root::<hyprstream_rpc::common_capnp::response_envelope::Reader>()?;
+    assert!(response_outer.get_payload()?.is_empty());
+    assert!(!response_outer.get_encrypted_response()?.is_empty());
     let sent = last_sent
         .lock()
         .await
@@ -389,6 +424,7 @@ async fn cleartext_envelope_rejected_on_iroh_receive() -> Result<()> {
         delegation_token: None,
         wth: None,
         client_dh_public: None,
+        response_kem_recipient: None,
     };
     let signed = SignedEnvelope::new_signed_hybrid(envelope, &client_signing, &client_pq_sk);
     let mut wire = Vec::new();
@@ -471,6 +507,7 @@ async fn false_encrypted_marker_never_reaches_custom_processor_over_iroh() -> Re
             delegation_token: None,
             wth: None,
             client_dh_public: None,
+            response_kem_recipient: None,
         },
         &signer,
     );

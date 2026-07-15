@@ -99,6 +99,9 @@ impl RequestService for SentinelService {
         payload: &[u8],
     ) -> Result<(Vec<u8>, Option<Continuation>)> {
         self.invoked.store(true, Ordering::SeqCst);
+        if payload == b"handler-error" {
+            anyhow::bail!("intentional handler failure");
+        }
         Ok((payload.to_vec(), None))
     }
 
@@ -112,6 +115,10 @@ impl RequestService for SentinelService {
 
     fn signing_key(&self) -> SigningKey {
         self.signing_key.clone()
+    }
+
+    fn pq_signing_key(&self) -> Option<MlDsaSigningKey> {
+        Some(derive_mesh_mldsa_key(&self.signing_key))
     }
 
     /// Surface the raw error text (the default returns an empty vec) so the
@@ -131,6 +138,7 @@ fn request_envelope(payload: &[u8]) -> RequestEnvelope {
         delegation_token: None,
         wth: None,
         client_dh_public: None,
+        response_kem_recipient: None,
     }
 }
 
@@ -208,8 +216,14 @@ async fn encrypted_on_untrusted_carrier_dispatches() {
     let nonce_cache = envelope::InMemoryNonceCache::new();
 
     let recipient = derive_mesh_kem_recipient(&k.server_sk).unwrap();
+    let response_recipient = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
+        hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+    )
+    .unwrap();
+    let request = request_envelope(b"sealed-payload")
+        .with_response_kem_recipient(response_recipient.public());
     let signed = SignedEnvelope::new_signed_encrypted_mesh_kem(
-        request_envelope(b"sealed-payload"),
+        request,
         &k.client_sk,
         &k.client_pq,
         &recipient.public(),
@@ -233,7 +247,85 @@ async fn encrypted_on_untrusted_carrier_dispatches() {
         "encrypted request must dispatch"
     );
     assert_eq!(response.request_id, 7);
-    assert_eq!(response.payload, b"sealed-payload");
+    assert!(response.payload.is_empty());
+    assert!(response.encrypted_response.is_some());
+}
+
+/// A verified, sealed request that omits the response recipient must be
+/// dropped before claims/handler work on every untrusted carrier. The server
+/// cannot safely construct either a success or error response, so no
+/// cleartext fallback is permitted.
+#[tokio::test]
+async fn missing_response_recipient_drops_without_handler_on_all_network_carriers() {
+    let k = keys();
+    let (service, invoked) = SentinelService::new(k.server_sk.clone());
+    let nonce_cache = envelope::InMemoryNonceCache::new();
+    let server_recipient = derive_mesh_kem_recipient(&k.server_sk).unwrap();
+
+    for carrier in [
+        CarrierContext::iroh(),
+        CarrierContext::quic(),
+        CarrierContext::web_transport(),
+        CarrierContext::untrusted_unknown(),
+    ] {
+        let request = request_envelope(b"must-not-dispatch");
+        let signed = SignedEnvelope::new_signed_encrypted_mesh_kem(
+            request,
+            &k.client_sk,
+            &k.client_pq,
+            &server_recipient.public(),
+        )
+        .unwrap();
+        let result = process_request(
+            &to_wire(&signed),
+            &service,
+            EnvelopeVerification::AnySigner,
+            &k.server_sk,
+            &nonce_cache,
+            carrier,
+        )
+        .await;
+        assert!(result.is_err(), "missing recipient must drop on {carrier}");
+        assert!(!invoked.load(Ordering::SeqCst));
+    }
+}
+
+#[tokio::test]
+async fn post_admission_handler_error_is_sealed_not_cleartext() {
+    let k = keys();
+    let (service, invoked) = SentinelService::new(k.server_sk.clone());
+    let nonce_cache = envelope::InMemoryNonceCache::new();
+    let server_recipient = derive_mesh_kem_recipient(&k.server_sk).unwrap();
+    let response_recipient = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
+        hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+    )
+    .unwrap();
+    let request =
+        request_envelope(b"handler-error").with_response_kem_recipient(response_recipient.public());
+    let signed = SignedEnvelope::new_signed_encrypted_mesh_kem(
+        request,
+        &k.client_sk,
+        &k.client_pq,
+        &server_recipient.public(),
+    )
+    .unwrap();
+    let bytes = process_request(
+        &to_wire(&signed),
+        &service,
+        EnvelopeVerification::AnySigner,
+        &k.server_sk,
+        &nonce_cache,
+        CarrierContext::quic(),
+    )
+    .await
+    .unwrap();
+    let response = decode_response(&bytes);
+    assert!(invoked.load(Ordering::SeqCst));
+    assert!(response.payload.is_empty());
+    assert!(response.encrypted_response.is_some());
+    assert!(!bytes
+        .windows(b"intentional handler failure".len())
+        .any(|w| { w == b"intentional handler failure" }));
 }
 
 /// Undecodable bytes on an untrusted carrier follow the cleartext branch

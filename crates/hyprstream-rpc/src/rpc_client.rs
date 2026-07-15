@@ -16,16 +16,58 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::crypto::VerifyingKey;
-use crate::crypto::hybrid_kem::KemTrustStore;
-use crate::envelope::{
-    self, RequestEnvelope, SignedEnvelope,
-};
-use crate::transport_traits::{Signer, Transport};
 use crate::capnp::{FromCapnp, ToCapnp};
+use crate::crypto::hybrid_kem::KemTrustStore;
+use crate::crypto::VerifyingKey;
+use crate::envelope::{self, RequestEnvelope, SignedEnvelope};
 use crate::stream_consumer::{StreamHandle, StreamHandleImpl};
+use crate::transport_traits::{Signer, Transport};
 
 type TokenProviderBox = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// Non-cloneable, non-serializable one-call response decapsulation material.
+/// The component secret bytes are `Zeroizing` inside `RecipientKeypair` and
+/// are dropped immediately after the sole response-open attempt.
+struct ResponseRecipientSecret {
+    keypair: crate::crypto::hybrid_kem::RecipientKeypair,
+}
+
+struct PendingResponse {
+    request_id: u64,
+    request_iat: i64,
+    request_nonce: [u8; 16],
+    server_identity: [u8; 32],
+    recipient_public: crate::crypto::hybrid_kem::RecipientPublic,
+    secret: ResponseRecipientSecret,
+}
+
+impl std::fmt::Debug for PendingResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingResponse")
+            .field("request_id", &self.request_id)
+            .field("server_identity", &hex::encode(self.server_identity))
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingResponse {
+    fn open(self, envelope: &crate::envelope::ResponseEnvelope) -> Result<Vec<u8>> {
+        if envelope.request_id != self.request_id {
+            anyhow::bail!(
+                "response request id {} does not match pending request {}",
+                envelope.request_id,
+                self.request_id
+            );
+        }
+        envelope.open_encrypted(
+            &self.secret.keypair,
+            &self.recipient_public,
+            self.request_iat,
+            &self.request_nonce,
+            &self.server_identity,
+        )
+    }
+}
 
 // ============================================================================
 // Per-call options (non-mutating, Send+Sync, owned data)
@@ -100,7 +142,10 @@ impl<'a> std::fmt::Debug for RequestBuilder<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RequestBuilder")
             .field("jwt", &self.jwt.as_ref().map(|_| "***"))
-            .field("delegated_bearer", &self.delegated_bearer.as_ref().map(|_| "***"))
+            .field(
+                "delegated_bearer",
+                &self.delegated_bearer.as_ref().map(|_| "***"),
+            )
             .finish()
     }
 }
@@ -129,10 +174,15 @@ impl<'a> RequestBuilder<'a> {
 
     /// Send a raw request with these options and return the raw response bytes.
     pub async fn call(self, payload: Vec<u8>) -> Result<Vec<u8>> {
-        self.client.call_with_options(payload, CallOptions {
-            jwt: self.jwt,
-            delegated_bearer: self.delegated_bearer,
-        }).await
+        self.client
+            .call_with_options(
+                payload,
+                CallOptions {
+                    jwt: self.jwt,
+                    delegated_bearer: self.delegated_bearer,
+                },
+            )
+            .await
     }
 }
 
@@ -196,10 +246,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
 
     /// Set the anchored `#mesh-kem` recipient key store used to encrypt request
     /// envelopes when the selected transport forbids cleartext.
-    pub fn with_request_kem_store(
-        mut self,
-        kem_store: Arc<dyn KemTrustStore>,
-    ) -> Self {
+    pub fn with_request_kem_store(mut self, kem_store: Arc<dyn KemTrustStore>) -> Self {
         self.request_kem_store = Some(kem_store);
         self
     }
@@ -240,10 +287,12 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
     /// Uses the client's default JWT.
     pub async fn call(&self, payload: Vec<u8>) -> Result<Vec<u8>> {
         let request_id = self.next_id();
-        let signed_bytes = self.sign_envelope(request_id, payload, None, self.effective_jwt(), None).await?;
+        let (signed_bytes, pending) = self
+            .sign_envelope(request_id, payload, None, self.effective_jwt(), None)
+            .await?;
         let timeout = self.calculate_timeout();
         let response_bytes = self.transport.send(signed_bytes, timeout).await?;
-        let (_req_id, inner) = self.unwrap_response(&response_bytes)?;
+        let (_req_id, inner) = self.unwrap_response(&response_bytes, request_id, pending)?;
         Ok(inner)
     }
 
@@ -256,12 +305,18 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         ephemeral_pubkey: [u8; 32],
     ) -> Result<Vec<u8>> {
         let request_id = self.next_id();
-        let signed_bytes = self
-            .sign_envelope(request_id, payload, Some(ephemeral_pubkey), self.effective_jwt(), None)
+        let (signed_bytes, pending) = self
+            .sign_envelope(
+                request_id,
+                payload,
+                Some(ephemeral_pubkey),
+                self.effective_jwt(),
+                None,
+            )
             .await?;
         let timeout = self.calculate_timeout();
         let response_bytes = self.transport.send(signed_bytes, timeout).await?;
-        let (_req_id, inner) = self.unwrap_response(&response_bytes)?;
+        let (_req_id, inner) = self.unwrap_response(&response_bytes, request_id, pending)?;
         Ok(inner)
     }
 
@@ -276,12 +331,18 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
     ) -> Result<Vec<u8>> {
         let request_id = self.next_id();
         let jwt = options.jwt.or_else(|| self.effective_jwt());
-        let signed_bytes = self
-            .sign_envelope(request_id, payload, Some(ephemeral_pubkey), jwt, options.delegated_bearer)
+        let (signed_bytes, pending) = self
+            .sign_envelope(
+                request_id,
+                payload,
+                Some(ephemeral_pubkey),
+                jwt,
+                options.delegated_bearer,
+            )
             .await?;
         let timeout = self.calculate_timeout();
         let response_bytes = self.transport.send(signed_bytes, timeout).await?;
-        let (_req_id, inner) = self.unwrap_response(&response_bytes)?;
+        let (_req_id, inner) = self.unwrap_response(&response_bytes, request_id, pending)?;
         Ok(inner)
     }
 
@@ -296,12 +357,12 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
     ) -> Result<Vec<u8>> {
         let request_id = self.next_id();
         let jwt = options.jwt.or_else(|| self.effective_jwt());
-        let signed_bytes = self
+        let (signed_bytes, pending) = self
             .sign_envelope(request_id, payload, None, jwt, options.delegated_bearer)
             .await?;
         let timeout = self.calculate_timeout();
         let response_bytes = self.transport.send(signed_bytes, timeout).await?;
-        let (_req_id, inner) = self.unwrap_response(&response_bytes)?;
+        let (_req_id, inner) = self.unwrap_response(&response_bytes, request_id, pending)?;
         Ok(inner)
     }
 
@@ -323,7 +384,12 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
     /// hatch. Under `Hybrid` the server's kid-anchored ML-DSA-65 layer is
     /// required (no silent downgrade).
     #[cfg(not(target_arch = "wasm32"))]
-    fn unwrap_response(&self, response_bytes: &[u8]) -> Result<(u64, Vec<u8>)> {
+    fn unwrap_response(
+        &self,
+        response_bytes: &[u8],
+        request_id: u64,
+        pending: Option<PendingResponse>,
+    ) -> Result<(u64, Vec<u8>)> {
         let policy = self
             .response_verify_policy
             .unwrap_or_else(envelope::global_response_verify_policy);
@@ -338,12 +404,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             .response_pq_store
             .as_deref()
             .or(global_store.as_deref());
-        envelope::unwrap_response_with(
-            response_bytes,
-            self.server_verifying_key.as_ref(),
-            store,
-            policy,
-        )
+        self.unwrap_response_with_pending(response_bytes, request_id, pending, store, policy)
     }
 
     /// WASM response unwrap (#277 scope boundary): no process-global response
@@ -351,14 +412,70 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
     /// verify policy is owned by #158 (`wasm_api.rs`) and is intentionally NOT
     /// changed here.
     #[cfg(target_arch = "wasm32")]
-    fn unwrap_response(&self, response_bytes: &[u8]) -> Result<(u64, Vec<u8>)> {
-        envelope::unwrap_response_with(
+    fn unwrap_response(
+        &self,
+        response_bytes: &[u8],
+        request_id: u64,
+        pending: Option<PendingResponse>,
+    ) -> Result<(u64, Vec<u8>)> {
+        self.unwrap_response_with_pending(
             response_bytes,
-            self.server_verifying_key.as_ref(),
+            request_id,
+            pending,
             self.response_pq_store.as_deref(),
             self.response_verify_policy
                 .unwrap_or(crate::crypto::CryptoPolicy::Classical),
         )
+    }
+
+    fn unwrap_response_with_pending(
+        &self,
+        response_bytes: &[u8],
+        request_id: u64,
+        pending: Option<PendingResponse>,
+        pq_store: Option<&dyn envelope::PqTrustStore>,
+        policy: crate::crypto::CryptoPolicy,
+    ) -> Result<(u64, Vec<u8>)> {
+        if self.transport.forbids_cleartext_envelope() {
+            let pending = pending.ok_or_else(|| {
+                anyhow::anyhow!("network response has no one-shot pending recipient")
+            })?;
+            // Carrier gate first: inspect only the bounded encrypted field and
+            // reject cleartext before copying or using the outer payload.
+            let response = envelope::read_response_envelope(response_bytes, true)?;
+            let server = self
+                .server_verifying_key
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("network response has no pinned server identity"))?;
+            let store = pq_store.ok_or_else(|| {
+                anyhow::anyhow!("network response has no anchored ML-DSA-65 trust store")
+            })?;
+            if store.ml_dsa_key_for(&server.to_bytes()).is_none() {
+                anyhow::bail!("network response server has no anchored ML-DSA-65 key");
+            }
+            response.verify_with(
+                Some(server),
+                Some(store),
+                crate::crypto::CryptoPolicy::Hybrid,
+            )?;
+            let payload = pending.open(&response)?;
+            Ok((response.request_id, payload))
+        } else {
+            let (response_id, payload) = envelope::unwrap_response_with(
+                response_bytes,
+                self.server_verifying_key.as_ref(),
+                pq_store,
+                policy,
+            )?;
+            if response_id != request_id {
+                anyhow::bail!(
+                    "response request id {} does not match pending request {}",
+                    response_id,
+                    request_id
+                );
+            }
+            Ok((response_id, payload))
+        }
     }
 
     /// Build, sign, and serialize a request envelope.
@@ -369,7 +486,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         ephemeral_pubkey: Option<[u8; 32]>,
         jwt: Option<String>,
         delegated_bearer: Option<String>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<(Vec<u8>, Option<PendingResponse>)> {
         let mut envelope = RequestEnvelope::new(payload);
         envelope.request_id = request_id;
         if let Some(token) = jwt {
@@ -381,6 +498,28 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         if let Some(key) = ephemeral_pubkey {
             envelope = envelope.with_client_dh_public(key);
         }
+
+        let pending = if self.transport.forbids_cleartext_envelope() {
+            let server = self
+                .server_verifying_key
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("network request has no pinned server identity"))?;
+            let keypair = crate::crypto::hybrid_kem::generate_recipient(
+                crate::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+            )?;
+            let public = keypair.public();
+            envelope = envelope.with_response_kem_recipient(public.clone());
+            Some(PendingResponse {
+                request_id,
+                request_iat: envelope.iat,
+                request_nonce: envelope.nonce,
+                server_identity: server.to_bytes(),
+                recipient_public: public,
+                secret: ResponseRecipientSecret { keypair },
+            })
+        } else {
+            None
+        };
 
         let canonical = envelope.to_bytes();
         let ed_pubkey = self.signer.pubkey();
@@ -409,7 +548,9 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
 
             // Shared seal path (framing + replay-bound AAD) — single source of
             // truth with `SignedEnvelope::new_signed_encrypted_mesh_kem`.
-            Some(crate::envelope::seal_request_envelope(&envelope, &recipient)?)
+            Some(crate::envelope::seal_request_envelope(
+                &envelope, &recipient,
+            )?)
         } else {
             None
         };
@@ -441,34 +582,27 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         // it byte-distinct from a Classical inner layer.
         let hybrid = self.signer.pq_pubkey().is_some();
         let ed_kid = ed_pubkey.to_vec();
-        let ed_tbs = crate::crypto::cose_sign::inner_tbs(ed_kid.clone(), signing_data, &aad, hybrid);
+        let ed_tbs =
+            crate::crypto::cose_sign::inner_tbs(ed_kid.clone(), signing_data, &aad, hybrid);
         let ed_sig = self.signer.sign(&ed_tbs).await?.to_vec();
 
         // Hybrid component when the signer exposes an ML-DSA-65 key.
         let pq_entry = if let Some(pq_kid) = self.signer.pq_pubkey() {
-            let pq_tbs = crate::crypto::cose_sign::outer_tbs(
-                pq_kid.clone(),
-                signing_data,
-                &ed_sig,
-                &aad,
-            );
+            let pq_tbs =
+                crate::crypto::cose_sign::outer_tbs(pq_kid.clone(), signing_data, &ed_sig, &aad);
             // The inner EdDSA above was already bound to the hybrid-composite
             // alg-id (`hybrid = pq_pubkey().is_some()`), so it cannot fall back to
             // a classical inner. A signer that advertises a PQ key but declines to
             // sign must therefore be a HARD ERROR, not a silent downgrade that
             // would desync inner-AAD (hybrid) from outer-presence (none) and make
             // the peer's inner verification fail (#278 review).
-            let pq_sig = self
-                .signer
-                .pq_sign(&pq_tbs)
-                .await?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "signer exposes a PQ public key but pq_sign() returned no \
+            let pq_sig = self.signer.pq_sign(&pq_tbs).await?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "signer exposes a PQ public key but pq_sign() returned no \
                          signature; refusing to emit a hybrid-bound inner without \
                          its ML-DSA-65 outer (#278)"
-                    )
-                })?;
+                )
+            })?;
             Some((pq_kid, pq_sig))
         } else {
             None
@@ -493,13 +627,12 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
 
         let mut message = capnp::message::Builder::new_default();
         {
-            let mut builder =
-                message.init_root::<crate::common_capnp::signed_envelope::Builder>();
+            let mut builder = message.init_root::<crate::common_capnp::signed_envelope::Builder>();
             signed.write_to(&mut builder);
         }
         let mut bytes = Vec::new();
         capnp::serialize::write_message(&mut bytes, &message)?;
-        Ok(bytes)
+        Ok((bytes, pending))
     }
 
     /// Calculate timeout, defaulting to 30s.
@@ -550,7 +683,9 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         let (secret, public) = generate_ephemeral_keypair();
         let pub_bytes = public.to_bytes();
 
-        let response = self.call_streaming_with_options(payload, pub_bytes, options).await?;
+        let response = self
+            .call_streaming_with_options(payload, pub_bytes, options)
+            .await?;
         let stream_info = parse_stream_info(&response)?;
 
         let secret_bytes = secret.scalar().to_bytes();
@@ -606,7 +741,8 @@ pub trait RpcClient: Send + Sync {
     async fn call_with_options(&self, payload: Vec<u8>, options: CallOptions) -> Result<Vec<u8>>;
 
     /// Send a streaming request with ephemeral DH pubkey.
-    async fn call_streaming(&self, payload: Vec<u8>, ephemeral_pubkey: [u8; 32]) -> Result<Vec<u8>>;
+    async fn call_streaming(&self, payload: Vec<u8>, ephemeral_pubkey: [u8; 32])
+        -> Result<Vec<u8>>;
 
     /// Open a verified streaming subscription.
     async fn open_stream(&self, payload: Vec<u8>) -> Result<Box<dyn StreamHandle>>;
@@ -635,7 +771,11 @@ impl<S: Signer, T: Transport + 'static> RpcClient for RpcClientImpl<S, T> {
         RpcClientImpl::call_with_options(self, payload, options).await
     }
 
-    async fn call_streaming(&self, payload: Vec<u8>, ephemeral_pubkey: [u8; 32]) -> Result<Vec<u8>> {
+    async fn call_streaming(
+        &self,
+        payload: Vec<u8>,
+        ephemeral_pubkey: [u8; 32],
+    ) -> Result<Vec<u8>> {
         RpcClientImpl::call_streaming(self, payload, ephemeral_pubkey).await
     }
 
@@ -657,7 +797,9 @@ impl<S: Signer, T: Transport + 'static> RpcClient for RpcClientImpl<S, T> {
         client_secret: [u8; 32],
         client_pubkey: [u8; 32],
     ) -> Result<Box<dyn StreamHandle>> {
-        let handle = RpcClientImpl::open_stream_from_info(self, stream_info, &client_secret, &client_pubkey).await?;
+        let handle =
+            RpcClientImpl::open_stream_from_info(self, stream_info, &client_secret, &client_pubkey)
+                .await?;
         Ok(Box::new(handle))
     }
 
@@ -705,6 +847,8 @@ mod request_kem_tests {
     /// in these tests (they stop at `sign_envelope`).
     struct ForbidsCleartextMock;
 
+    struct CleartextResponseMock(Vec<u8>);
+
     #[async_trait]
     impl Transport for ForbidsCleartextMock {
         type Sub = RpcPendingStream;
@@ -725,6 +869,37 @@ mod request_kem_tests {
         async fn publish(&self, _topic: &[u8]) -> Result<Self::Pub> {
             anyhow::bail!("mock transport: no publish")
         }
+    }
+
+    #[async_trait]
+    impl Transport for CleartextResponseMock {
+        type Sub = RpcPendingStream;
+        type Pub = RpcPublishStub;
+
+        fn forbids_cleartext_envelope(&self) -> bool {
+            true
+        }
+
+        async fn send(&self, _payload: Vec<u8>, _timeout_ms: Option<i32>) -> Result<Vec<u8>> {
+            Ok(self.0.clone())
+        }
+
+        async fn subscribe(&self, _topic: &[u8]) -> Result<Self::Sub> {
+            anyhow::bail!("unused")
+        }
+
+        async fn publish(&self, _topic: &[u8]) -> Result<Self::Pub> {
+            anyhow::bail!("unused")
+        }
+    }
+
+    fn response_wire(response: &crate::envelope::ResponseEnvelope) -> Vec<u8> {
+        let mut message = capnp::message::Builder::new_default();
+        let mut builder = message.init_root::<crate::common_capnp::response_envelope::Builder>();
+        response.write_to(&mut builder);
+        let mut bytes = Vec::new();
+        capnp::serialize::write_message(&mut bytes, &message).unwrap();
+        bytes
     }
 
     /// A carrier that records whether `send` was ever reached, with a
@@ -821,10 +996,14 @@ mod request_kem_tests {
         )
         .with_request_kem_store(Arc::new(kem_store));
 
-        let bytes = rpc
+        let (bytes, pending) = rpc
             .sign_envelope(1, b"payload".to_vec(), None, None, None)
             .await
             .expect("forwarded store must seal the envelope");
+        assert!(
+            pending.is_some(),
+            "network call must retain a response secret"
+        );
         let signed = signed_envelope_from_bytes(&bytes);
         assert!(
             signed.is_encrypted(),
@@ -834,6 +1013,46 @@ mod request_kem_tests {
         assert!(
             !bytes.windows(b"payload".len()).any(|w| w == b"payload"),
             "cleartext payload must not appear on the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn hostile_cleartext_response_is_rejected_before_payload_use() {
+        let (server_sk, server_vk) = generate_signing_keypair();
+        let (client_sk, _) = generate_signing_keypair();
+        let server_pq_sk = crate::node_identity::derive_mesh_mldsa_key(&server_sk);
+        let clear = crate::envelope::ResponseEnvelope::new_signed_hybrid(
+            1,
+            b"cleartext-response-sentinel".to_vec(),
+            &server_sk,
+            &server_pq_sk,
+        );
+
+        let mut kem_store = KeyedKemTrustStore::new();
+        kem_store.bind(
+            server_vk.to_bytes(),
+            derive_mesh_kem_recipient(&server_sk).unwrap().public(),
+        );
+        let server_pq_vk = crate::crypto::pq::ml_dsa_vk_from_bytes(
+            &crate::crypto::pq::ml_dsa_sk_to_vk_bytes(&server_pq_sk),
+        )
+        .unwrap();
+        let mut pq_store = crate::envelope::KeyedPqTrustStore::new();
+        pq_store.bind(server_vk.to_bytes(), &server_pq_vk);
+
+        let rpc = RpcClientImpl::new(
+            LocalSigner::new(client_sk),
+            CleartextResponseMock(response_wire(&clear)),
+            Some(server_vk),
+        )
+        .with_request_kem_store(Arc::new(kem_store))
+        .with_response_pq_store(Arc::new(pq_store));
+
+        let err = rpc.call(b"request".to_vec()).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cleartext response rejected before payload use"),
+            "unexpected error: {err}"
         );
     }
 

@@ -34,19 +34,17 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::RngCore;
 
 use hyprstream_rpc::crypto::hybrid_kem::KeyedKemTrustStore;
-use hyprstream_rpc::dial::{dial_stream, dial_with_kem_store, MoqStreamSession};
-use hyprstream_rpc::envelope::InMemoryNonceCache;
-use hyprstream_rpc::node_identity::derive_mesh_kem_recipient;
+use hyprstream_rpc::dial::{dial_stream, dial_with_crypto_stores, MoqStreamSession};
+use hyprstream_rpc::envelope::{InMemoryNonceCache, KeyedPqTrustStore};
+use hyprstream_rpc::node_identity::{derive_mesh_kem_recipient, derive_mesh_mldsa_key};
 use hyprstream_rpc::rpc_client::RpcClientImpl;
 use hyprstream_rpc::service::{Continuation, EnvelopeContext, RequestService};
 use hyprstream_rpc::signer::LocalSigner;
 use hyprstream_rpc::transport::iroh_moq::{IrohMoqProtocolHandler, OriginShared};
 use hyprstream_rpc::transport::iroh_rpc::{IrohRpcProtocolHandler, LocalServiceBridge};
-use hyprstream_rpc::transport::iroh_substrate::{
-    ALPN_HYPRSTREAM_RPC, IrohSubstrate, NoopHandler,
-};
-use hyprstream_rpc::transport::lazy_iroh::install_iroh_client_endpoint;
+use hyprstream_rpc::transport::iroh_substrate::{IrohSubstrate, NoopHandler, ALPN_HYPRSTREAM_RPC};
 use hyprstream_rpc::transport::iroh_transport::IrohTransport;
+use hyprstream_rpc::transport::lazy_iroh::install_iroh_client_endpoint;
 use hyprstream_rpc::transport::TransportConfig;
 use iroh::{EndpointAddr, EndpointId, TransportAddr};
 use moq_net::{Client, Origin};
@@ -113,6 +111,16 @@ fn request_kem_store_for(
         recipient.public(),
     );
     Ok(std::sync::Arc::new(store))
+}
+
+fn response_pq_store_for(server_signing: &SigningKey) -> Result<std::sync::Arc<KeyedPqTrustStore>> {
+    let pq_sk = derive_mesh_mldsa_key(server_signing);
+    let pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
+        &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq_sk),
+    )?;
+    let mut store = KeyedPqTrustStore::new();
+    store.bind(server_signing.verifying_key().to_bytes(), &pq_vk);
+    Ok(Arc::new(store))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -298,10 +306,8 @@ impl RequestService for ModelService {
         self.signing_key.clone()
     }
 
-    // Force Classical responses: this test exercises the EdDSA-only envelope
-    // path (no PQ store provisioned), matching the verify policy installed below.
     fn pq_signing_key(&self) -> Option<hyprstream_rpc::crypto::pq::MlDsaSigningKey> {
-        None
+        Some(derive_mesh_mldsa_key(&self.signing_key))
     }
 }
 
@@ -358,7 +364,7 @@ impl RequestService for RegistryService {
     }
 
     fn pq_signing_key(&self) -> Option<hyprstream_rpc::crypto::pq::MlDsaSigningKey> {
-        None
+        Some(derive_mesh_mldsa_key(&self.signing_key))
     }
 }
 
@@ -394,7 +400,11 @@ async fn rpc_round_trip_model_status_and_registry_list_over_iroh() -> Result<()>
         ModelService::new(fresh_signing_key()),
         RegistryService::new(
             fresh_signing_key(),
-            vec!["model".to_owned(), "registry".to_owned(), "policy".to_owned()],
+            vec![
+                "model".to_owned(),
+                "registry".to_owned(),
+                "policy".to_owned(),
+            ],
         ),
     );
 
@@ -422,12 +432,13 @@ async fn rpc_round_trip_model_status_and_registry_list_over_iroh() -> Result<()>
 
     let target = TransportConfig::iroh(server_node_id, server_direct.clone(), None);
     let request_kem = request_kem_store_for(&server_signing)?;
-    let rpc: Arc<dyn hyprstream_rpc::rpc_client::RpcClient> = dial_with_kem_store(
+    let rpc: Arc<dyn hyprstream_rpc::rpc_client::RpcClient> = dial_with_crypto_stores(
         &target,
         LocalSigner::new(fresh_signing_key()),
         Some(server_vk),
         None,
         Some(request_kem),
+        Some(response_pq_store_for(&server_signing)?),
     )?;
 
     // ─── RPC round-trip #1: model.status() ──────────────────────────────────
@@ -458,13 +469,16 @@ async fn rpc_round_trip_model_status_and_registry_list_over_iroh() -> Result<()>
     // a regression where `dial()`'s erasure drops a setup step. Uses the SAME
     // shared client endpoint the `dial()` factory rides.
     {
-        let conn = client_endpoint.connect(server_addr, ALPN_HYPRSTREAM_RPC).await?;
+        let conn = client_endpoint
+            .connect(server_addr, ALPN_HYPRSTREAM_RPC)
+            .await?;
         let explicit_rpc = RpcClientImpl::new(
             LocalSigner::new(fresh_signing_key()),
             IrohTransport::new(conn),
             Some(server_vk),
         )
-        .with_request_kem_store(request_kem_store_for(&server_signing)?);
+        .with_request_kem_store(request_kem_store_for(&server_signing)?)
+        .with_response_pq_store(response_pq_store_for(&server_signing)?);
         let r = explicit_rpc.call(encode_op("status", b"explicit")).await?;
         assert_eq!(std::str::from_utf8(&r)?, "model.status:ok:explicit=loaded");
     }
@@ -526,7 +540,7 @@ impl RequestService for CompositeRpcService {
     }
 
     fn pq_signing_key(&self) -> Option<hyprstream_rpc::crypto::pq::MlDsaSigningKey> {
-        None
+        Some(derive_mesh_mldsa_key(&self.signing_key))
     }
 }
 
@@ -630,12 +644,13 @@ async fn one_substrate_serves_rpc_and_rejects_anonymous_moq() -> Result<()> {
     // ── RPC plane over `hyprstream-rpc/1` (via the `dial()` factory) ─────────
     let target = TransportConfig::iroh(server_node_id, server_direct.clone(), None);
     let request_kem = request_kem_store_for(&server_signing)?;
-    let rpc: Arc<dyn hyprstream_rpc::rpc_client::RpcClient> = dial_with_kem_store(
+    let rpc: Arc<dyn hyprstream_rpc::rpc_client::RpcClient> = dial_with_crypto_stores(
         &target,
         LocalSigner::new(fresh_signing_key()),
         Some(server_vk),
         None,
         Some(request_kem),
+        Some(response_pq_store_for(&server_signing)?),
     )?;
     let resp = rpc.call(encode_op("status", b"both-alpns-model")).await?;
     assert_eq!(
