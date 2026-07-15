@@ -12,7 +12,7 @@
 // CLI handlers intentionally print to stdout/stderr for user interaction
 #![allow(clippy::print_stdout, clippy::print_stderr, clippy::expect_used)]
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::SigningKey;
 use std::io::Write;
 use tracing::info;
@@ -23,17 +23,14 @@ use crate::services::generated::tui_client::{TuiClient, ConnectRequest, DisplayM
 ///
 /// Resolves the TUI service verifying key via PolicyService, then dials the
 /// TUI service via the registry (inproc or QUIC — transport-agnostic).
-pub fn create_tui_client(signing_key: &SigningKey) -> TuiClient {
+pub fn create_tui_client(signing_key: &SigningKey) -> Result<TuiClient> {
     let sk = signing_key.clone();
 
     // Bootstrap: PolicyService uses the root key in inproc mode
     let policy_vk = signing_key.verifying_key();
-    let policy_client = match crate::services::PolicyClient::for_service(
+    let policy_client = crate::services::PolicyClient::for_service(
         sk.clone(), policy_vk, None,
-    ) {
-        Ok(c) => c,
-        Err(e) => panic!("Failed to create PolicyClient: {e}"),
-    };
+    ).context("Failed to create PolicyClient")?;
     let server_vk = {
         let resp = tokio::task::block_in_place(|| {
             let rt = tokio::runtime::Handle::current();
@@ -43,22 +40,16 @@ pub fn create_tui_client(signing_key: &SigningKey) -> TuiClient {
                 },
             ))
         });
-        match resp {
-            Ok(r) => match <[u8; 32]>::try_from(r.verifying_key.as_slice()) {
-                Ok(bytes) => match hyprstream_rpc::crypto::VerifyingKey::from_bytes(&bytes) {
-                    Ok(vk) => vk,
-                    Err(_) => panic!("Invalid Ed25519 key from PolicyService"),
-                },
-                Err(_) => panic!("Invalid key length from PolicyService"),
-            },
-            Err(e) => panic!("Failed to resolve TUI service key: {e}"),
-        }
+        let response = resp.context(
+            "TUI service is not registered with PolicyService; identity-bound service resolution is required",
+        )?;
+        let bytes: [u8; 32] = response.verifying_key.as_slice().try_into()
+            .map_err(|_| anyhow!("PolicyService returned an invalid TUI verifying-key length"))?;
+        hyprstream_rpc::crypto::VerifyingKey::from_bytes(&bytes)
+            .context("PolicyService returned an invalid TUI Ed25519 key")?
     };
 
-    match TuiClient::for_service(sk, server_vk, None) {
-        Ok(c) => c,
-        Err(e) => panic!("Failed to create TuiClient: {e}"),
-    }
+    TuiClient::for_service(sk, server_vk, None).context("Failed to create TuiClient")
 }
 
 /// Attach to an existing TUI session.
@@ -70,7 +61,7 @@ pub async fn handle_tui_attach(signing_key: &SigningKey, session_id: Option<u32>
     let sid = session_id.unwrap_or(0);
     info!(session_id = sid, "Attaching to TUI session");
 
-    let client = create_tui_client(signing_key);
+    let client = create_tui_client(signing_key)?;
     let (cols, rows) = terminal_size();
 
     // Connect to session via generated TuiClient
@@ -239,7 +230,7 @@ async fn run_attach_loop(
 pub async fn handle_tui_new(signing_key: &SigningKey) -> Result<()> {
     info!("Creating new TUI session");
 
-    let client = create_tui_client(signing_key);
+    let client = create_tui_client(signing_key)?;
     let window_info = client.create_window().await
         .context("Failed to create window. Is the TUI service running?")?;
 
@@ -257,7 +248,7 @@ pub async fn handle_tui_new(signing_key: &SigningKey) -> Result<()> {
 pub async fn handle_tui_list(signing_key: &SigningKey) -> Result<()> {
     info!("Listing TUI sessions");
 
-    let client = create_tui_client(signing_key);
+    let client = create_tui_client(signing_key)?;
 
     let window_list = client.list_windows(0).await
         .context("Failed to list windows. Is the TUI service running?")?;
@@ -391,7 +382,7 @@ pub async fn handle_tui_play(
     app.set_loop(loop_playback);
 
     // Connect to the TUI session to get the active pane ID
-    let client = create_tui_client(signing_key);
+    let client = create_tui_client(signing_key)?;
     let (cols, rows) = terminal_size();
 
     let result = client
@@ -467,6 +458,16 @@ pub async fn forward_process_output(
 
     let resize_tx = process.input_tx.clone();
 
+    // Resolve every auxiliary client before entering raw mode or spawning
+    // background work. A resolution error must leave the terminal and task set
+    // untouched so the CLI can report it cleanly.
+    let resize_client = create_tui_client(signing_key)?;
+    let poll_client = if stdin_stream.is_some_and(|stream| !stream.topic.is_empty()) {
+        Some(create_tui_client(signing_key)?)
+    } else {
+        None
+    };
+
     // Enter raw mode and read stdin if we're on a real terminal.
     // When stdin is not a tty (piped/headless), skip input handling.
     let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
@@ -527,7 +528,6 @@ pub async fn forward_process_output(
     };
 
     // Resize polling task — detects when another viewer triggers a pane resize
-    let resize_client = create_tui_client(signing_key);
     let resize_handle = tokio::spawn(async move {
         let mut cur = (initial_cols, initial_rows);
         loop {
@@ -547,29 +547,24 @@ pub async fn forward_process_output(
     // This avoids creating a second ZMQ context in this process, which triggers a
     // libzmq signaler assertion (dummy == 0) when fork() is involved.
     let stdin_input_tx = process.input_tx.clone();
-    let stdin_handle = if let Some(si) = stdin_stream {
-        if !si.topic.is_empty() {
-            let poll_client = create_tui_client(signing_key);
-            let poll_viewer_id = viewer_id;
-            let handle = tokio::spawn(async move {
-                use crate::tui::shell_client::poll_stdin_rpc;
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                    match poll_stdin_rpc(&poll_client, poll_viewer_id).await {
-                        Ok(data) if !data.is_empty() => {
-                            if stdin_input_tx.send(ProcessInput::Stdin(data)).await.is_err() {
-                                break;
-                            }
+    let stdin_handle = if let Some(poll_client) = poll_client {
+        let poll_viewer_id = viewer_id;
+        let handle = tokio::spawn(async move {
+            use crate::tui::shell_client::poll_stdin_rpc;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                match poll_stdin_rpc(&poll_client, poll_viewer_id).await {
+                    Ok(data) if !data.is_empty() => {
+                        if stdin_input_tx.send(ProcessInput::Stdin(data)).await.is_err() {
+                            break;
                         }
-                        Err(_) => break,
-                        _ => {}
                     }
+                    Err(_) => break,
+                    _ => {}
                 }
-            });
-            Some(handle)
-        } else {
-            None
-        }
+            }
+        });
+        Some(handle)
     } else {
         None
     };
