@@ -2264,6 +2264,22 @@ fn main() -> Result<()> {
                                     let shared_vks = hyprstream_core::auth::key_rotation::global_ml_dsa_verifying_keys();
                                     let _ = shared_vks.write().map(|mut guard| *guard = vks);
                                     ctx.set_ml_dsa_verifying_keys(shared_vks);
+                                    let ed_store = hyprstream_core::auth::key_rotation::global_ed25519_key_store(
+                                        &secrets_dir,
+                                        &config.oauth,
+                                    );
+                                    let restore_result = tokio::task::block_in_place(|| {
+                                        let rt = tokio::runtime::Handle::current();
+                                        rt.block_on(hyprstream_core::auth::key_rotation::restore_composite_verifying_key_set(
+                                            &secrets_dir,
+                                            &ed_store,
+                                            &ml_dsa_store,
+                                            ctx.jwt_verifying_key(),
+                                        ))
+                                    });
+                                    if let Err(error) = restore_result {
+                                        tracing::warn!("exact composite pair ledger unavailable in verifier process: {error}");
+                                    }
                                     tracing::info!("PQ-hybrid: ML-DSA-65 verifying keys loaded for JWT verification");
 
                                     // MAC S4 policy bootload (#570): compile → sign

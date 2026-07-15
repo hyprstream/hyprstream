@@ -574,22 +574,27 @@ impl Spawnable for OAuthService {
                     info!("CA JWT signing key loaded — POST /oauth/wit available");
 
                     // Load or initialize the multi-slot Ed25519 rotation store.
-                    let store = crate::auth::key_rotation::load_or_init_key_store(
+                    let store_arc = crate::auth::key_rotation::global_ed25519_key_store(
                         &secrets_dir,
                         &self.config,
                     );
-                    let store_arc = Arc::new(store);
 
                     // Publish the current Ed25519 rotation-slot verifying keys to the
                     // process-shared handle so the OAI/HTTP validator (`verify_token_claims`)
                     // accepts tokens signed by any active/lead/drain slot from startup —
                     // before the first rotation tick. Mirrors the /oauth/jwks key set.
                     crate::auth::key_rotation::refresh_ed25519_verifying_keys(&store_arc).await;
-                    crate::auth::key_rotation::initialize_composite_verifying_keys(
+                    crate::auth::key_rotation::initialize_composite_key_set(
+                        &secrets_dir,
                         &store_arc,
                         &ml_dsa_store,
-                        &key.verifying_key(),
-                    ).await;
+                        Arc::new(key.clone()),
+                        self.config.drain_secs(),
+                    ).await.map_err(|error| {
+                        hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                            "composite key-set initialization failed: {error:#}"
+                        ))
+                    })?;
 
                     // Spawn the background rotation task (rotates all algorithm stores).
                     crate::auth::key_rotation::spawn_rotation_task(
@@ -599,7 +604,7 @@ impl Spawnable for OAuthService {
                         crate::auth::key_rotation::RotationStores {
                             es256: Some(Arc::clone(&es256_store)),
                             ml_dsa: Some(Arc::clone(&ml_dsa_store)),
-                            composite_ca_key: key.verifying_key(),
+                            composite_ca_key: Arc::new(key.clone()),
                         },
                     );
                     info!("JWT signing key rotation task started (active_days={}, lead_days={}, drain_days={})",

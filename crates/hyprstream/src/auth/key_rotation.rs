@@ -10,6 +10,7 @@
 //!   2. drain exp + drain_days * 86400 < now → remove drain
 //!   3. lead is None and active.exp - now < lead_days * 86400 → generate new lead, persist
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -28,33 +29,15 @@ use crate::config::OAuthConfig;
 // Cross-crate `Arc<std::sync::RwLock<..>>` contract with `JwtKeySource` and the
 // service factory; intentionally `std::sync::RwLock`, not `parking_lot`.
 #[allow(clippy::disallowed_types)]
-static ML_DSA_VERIFYING_KEYS: std::sync::OnceLock<std::sync::Arc<std::sync::RwLock<Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>>>> = std::sync::OnceLock::new();
+static ML_DSA_VERIFYING_KEYS: std::sync::OnceLock<
+    std::sync::Arc<std::sync::RwLock<Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>>>,
+> = std::sync::OnceLock::new();
 
 /// Get or initialize the global ML-DSA verifying keys Arc.
 #[allow(clippy::disallowed_types)]
-pub fn global_ml_dsa_verifying_keys() -> std::sync::Arc<std::sync::RwLock<Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>>> {
-    ML_DSA_VERIFYING_KEYS.get_or_init(|| {
-        std::sync::Arc::new(std::sync::RwLock::new(Vec::new()))
-    }).clone()
-}
-
-/// One exact, locally-authorized composite JWT verifying-key pair.
-#[derive(Clone)]
-pub struct PublishedCompositeKey {
-    pub ml_dsa: hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,
-    pub ed25519: ed25519_dalek::VerifyingKey,
-    pub kid: String,
-}
-
-#[allow(clippy::disallowed_types)]
-pub type PublishedCompositeKeys = std::sync::Arc<std::sync::RwLock<Vec<PublishedCompositeKey>>>;
-
-static COMPOSITE_VERIFYING_KEYS: std::sync::OnceLock<PublishedCompositeKeys> = std::sync::OnceLock::new();
-
-/// Atomic snapshot of the exact composite pairs authorized for verification.
-#[allow(clippy::disallowed_types)]
-pub fn global_composite_verifying_keys() -> PublishedCompositeKeys {
-    COMPOSITE_VERIFYING_KEYS
+pub fn global_ml_dsa_verifying_keys(
+) -> std::sync::Arc<std::sync::RwLock<Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>>> {
+    ML_DSA_VERIFYING_KEYS
         .get_or_init(|| std::sync::Arc::new(std::sync::RwLock::new(Vec::new())))
         .clone()
 }
@@ -77,7 +60,8 @@ pub type PublishedEd25519Keys = std::sync::Arc<std::sync::RwLock<Vec<ed25519_dal
 /// Populated at OAuth service init from the signing-key store's current slots
 /// and refreshed by the rotation task after each promotion/eviction. The CA key
 /// is NOT included here — callers already hold it separately (`verifying_key`).
-static ED25519_VERIFYING_KEYS: std::sync::OnceLock<PublishedEd25519Keys> = std::sync::OnceLock::new();
+static ED25519_VERIFYING_KEYS: std::sync::OnceLock<PublishedEd25519Keys> =
+    std::sync::OnceLock::new();
 
 /// Get or initialize the global published-Ed25519 verifying-key handle.
 ///
@@ -118,74 +102,291 @@ pub async fn refresh_ml_dsa_verifying_keys(store: &Arc<MlDsaSigningKeyStore>) {
     let _ = shared.write().map(|mut guard| *guard = vks);
 }
 
-fn same_ml_dsa_key(
-    left: &hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,
-    right: &hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,
-) -> bool {
-    hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(left)
-        == hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(right)
+#[derive(Serialize, Deserialize)]
+struct CompositeLedger {
+    version: u64,
+    pairs: Vec<CompositeLedgerPair>,
 }
 
-/// Initialize only the two active pairs that local issuance can mint.
-/// Drain associations are not reconstructed after restart; they fail closed.
-pub async fn initialize_composite_verifying_keys(
-    ed_store: &SigningKeyStore,
-    ml_dsa_store: &MlDsaSigningKeyStore,
-    ca_key: &ed25519_dalek::VerifyingKey,
-) {
-    let mut pairs = Vec::new();
-    if let Some(pq) = ml_dsa_store.active_key().await {
-        let pq_vk = ml_dsa::Keypair::verifying_key(&*pq).clone();
-        if let Some(ed) = ed_store.active_key().await {
-            push_composite_pair(&mut pairs, pq_vk.clone(), ed.verifying_key());
-        }
-        push_composite_pair(&mut pairs, pq_vk, *ca_key);
-    }
-    let shared = global_composite_verifying_keys();
-    let mut guard = shared.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-    *guard = pairs;
+#[derive(Serialize, Deserialize)]
+struct CompositeLedgerPair {
+    kid: String,
+    ml_dsa_public: String,
+    ed25519_public: String,
+    role: String,
+    state: String,
+    not_before: i64,
+    expires_at: i64,
 }
 
-/// Retain exact old pairs while both halves remain published, then add only
-/// the active OAuth pair and active PolicyService/CA pair.
-pub async fn refresh_composite_verifying_keys(
+fn composite_ledger_path(secrets_dir: &Path) -> PathBuf {
+    secrets_dir.join("jwt-composite-pairs.json")
+}
+
+/// Restore the public exact-pair ledger in verifier-only service processes.
+pub async fn restore_composite_verifying_key_set(
+    secrets_dir: &Path,
     ed_store: &SigningKeyStore,
     ml_dsa_store: &MlDsaSigningKeyStore,
-    ca_key: &ed25519_dalek::VerifyingKey,
-) {
+    ca_key: ed25519_dalek::VerifyingKey,
+) -> anyhow::Result<()> {
+    use hyprstream_rpc::auth::{CompositeKeyPair, CompositePairRole, CompositePairState};
+
+    let bytes = std::fs::read(composite_ledger_path(secrets_dir))?;
+    let ledger: CompositeLedger = serde_json::from_slice(&bytes)?;
     let ed_slots = ed_store.all_slots_snapshot().await;
     let pq_slots = ml_dsa_store.all_slots_snapshot().await;
-    let ed_published: Vec<_> = ed_slots.iter().map(|slot| slot.key.verifying_key()).collect();
-    let pq_published: Vec<_> = pq_slots.iter().map(MlDsaKeySlot::verifying_key).collect();
-    let shared = global_composite_verifying_keys();
-    let mut pairs = shared
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    pairs.retain(|pair| {
-        let ed_valid = pair.ed25519 == *ca_key || ed_published.contains(&pair.ed25519);
-        let pq_valid = pq_published.iter().any(|key| same_ml_dsa_key(key, &pair.ml_dsa));
-        ed_valid && pq_valid
-    });
-    if let Some(pq) = ml_dsa_store.active_key().await {
-        let pq_vk = ml_dsa::Keypair::verifying_key(&*pq).clone();
-        if let Some(ed) = ed_store.active_key().await {
-            push_composite_pair(&mut pairs, pq_vk.clone(), ed.verifying_key());
+    let now = chrono::Utc::now().timestamp();
+    let mut pairs = Vec::new();
+    for record in ledger.pairs {
+        if record.expires_at <= now {
+            continue;
         }
-        push_composite_pair(&mut pairs, pq_vk, *ca_key);
+        let Some(pq) = pq_slots.iter().find(|slot| {
+            URL_SAFE_NO_PAD.encode(hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(
+                &slot.verifying_key(),
+            )) == record.ml_dsa_public
+        }) else {
+            continue;
+        };
+        let ed = if URL_SAFE_NO_PAD.encode(ca_key.to_bytes()) == record.ed25519_public {
+            Some(ca_key)
+        } else {
+            ed_slots
+                .iter()
+                .map(|slot| slot.key.verifying_key())
+                .find(|key| URL_SAFE_NO_PAD.encode(key.to_bytes()) == record.ed25519_public)
+        };
+        let Some(ed) = ed else { continue };
+        pairs.push(CompositeKeyPair::verifying(
+            record.kid,
+            pq.verifying_key(),
+            ed,
+            if record.role == "policy" {
+                CompositePairRole::Policy
+            } else {
+                CompositePairRole::OAuth
+            },
+            if record.state == "active" {
+                CompositePairState::Active
+            } else {
+                CompositePairState::Drain
+            },
+            record.not_before,
+            record.expires_at,
+        ));
     }
-    let mut guard = shared.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-    *guard = pairs;
+    let key_set = hyprstream_rpc::auth::global_composite_key_set();
+    let version = key_set
+        .snapshot()
+        .version()
+        .max(ledger.version)
+        .saturating_add(1);
+    key_set.publish(version, pairs)
 }
 
-fn push_composite_pair(
-    pairs: &mut Vec<PublishedCompositeKey>,
-    ml_dsa: hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,
-    ed25519: ed25519_dalek::VerifyingKey,
+/// Restore exact persisted associations and atomically publish the complete
+/// signing/verifying/JWKS authority. Component stores are used only to resolve
+/// identities recorded in the ledger; they are never cross-paired.
+pub async fn initialize_composite_key_set(
+    secrets_dir: &Path,
+    ed_store: &SigningKeyStore,
+    ml_dsa_store: &MlDsaSigningKeyStore,
+    ca_key: Arc<SigningKey>,
+    drain_secs: i64,
+) -> anyhow::Result<()> {
+    publish_composite_key_set(
+        secrets_dir,
+        ed_store,
+        ml_dsa_store,
+        ca_key,
+        drain_secs,
+        true,
+    )
+    .await
+}
+
+/// Publish the post-rotation lifecycle as one atomic exact-pair snapshot.
+pub async fn refresh_composite_key_set(
+    secrets_dir: &Path,
+    ed_store: &SigningKeyStore,
+    ml_dsa_store: &MlDsaSigningKeyStore,
+    ca_key: Arc<SigningKey>,
+    drain_secs: i64,
+) -> anyhow::Result<()> {
+    publish_composite_key_set(
+        secrets_dir,
+        ed_store,
+        ml_dsa_store,
+        ca_key,
+        drain_secs,
+        false,
+    )
+    .await
+}
+
+async fn publish_composite_key_set(
+    secrets_dir: &Path,
+    ed_store: &SigningKeyStore,
+    ml_dsa_store: &MlDsaSigningKeyStore,
+    ca_key: Arc<SigningKey>,
+    drain_secs: i64,
+    restore: bool,
+) -> anyhow::Result<()> {
+    use hyprstream_rpc::auth::{CompositeKeyPair, CompositePairRole, CompositePairState};
+
+    let now = chrono::Utc::now().timestamp();
+    let ed_slots = ed_store.all_slots_snapshot().await;
+    let pq_slots = ml_dsa_store.all_slots_snapshot().await;
+    let key_set = hyprstream_rpc::auth::global_composite_key_set();
+    let current = key_set.snapshot();
+    let persisted = if restore {
+        std::fs::read(composite_ledger_path(secrets_dir))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<CompositeLedger>(&bytes).ok())
+    } else {
+        Some(CompositeLedger {
+            version: current.version(),
+            pairs: current.pairs().iter().map(ledger_record).collect(),
+        })
+    };
+    let persisted_version = persisted.as_ref().map_or(0, |ledger| ledger.version);
+    let mut pairs = Vec::new();
+
+    for record in persisted.into_iter().flat_map(|ledger| ledger.pairs) {
+        if record.expires_at <= now {
+            continue;
+        }
+        let Some(pq) = pq_slots.iter().find(|slot| {
+            URL_SAFE_NO_PAD.encode(hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(
+                &slot.verifying_key(),
+            )) == record.ml_dsa_public
+        }) else {
+            continue;
+        };
+        let ed =
+            if URL_SAFE_NO_PAD.encode(ca_key.verifying_key().to_bytes()) == record.ed25519_public {
+                Some(Arc::clone(&ca_key))
+            } else {
+                ed_slots
+                    .iter()
+                    .find(|slot| {
+                        URL_SAFE_NO_PAD.encode(slot.key.verifying_key().to_bytes())
+                            == record.ed25519_public
+                    })
+                    .map(|slot| Arc::clone(&slot.key))
+            };
+        let Some(ed) = ed else {
+            continue;
+        };
+        let role = if record.role == "policy" {
+            CompositePairRole::Policy
+        } else {
+            CompositePairRole::OAuth
+        };
+        pairs.push(CompositeKeyPair::signing(
+            record.kid,
+            Arc::clone(&pq.key),
+            ed,
+            role,
+            CompositePairState::Drain,
+            record.not_before,
+            record.expires_at,
+        ));
+    }
+
+    let active_pq_key = ml_dsa_store.active_key().await;
+    let active_pq = active_pq_key.as_ref().and_then(|active| {
+        let active_vk = ml_dsa::Keypair::verifying_key(&**active);
+        pq_slots
+            .iter()
+            .find(|slot| {
+                hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&active_vk)
+                    == hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&slot.verifying_key())
+            })
+            .cloned()
+    });
+    let active_ed = ed_store.active_key().await;
+    if let Some(pq) = active_pq {
+        if let Some(ed) = active_ed {
+            upsert_active_pair(
+                &mut pairs,
+                Arc::clone(&pq.key),
+                ed,
+                CompositePairRole::OAuth,
+                pq.nbf,
+                pq.exp + drain_secs,
+            );
+        }
+        upsert_active_pair(
+            &mut pairs,
+            pq.key,
+            ca_key,
+            CompositePairRole::Policy,
+            pq.nbf,
+            pq.exp + drain_secs,
+        );
+    }
+
+    let version = current.version().max(persisted_version).saturating_add(1);
+    let ledger = CompositeLedger {
+        version,
+        pairs: pairs.iter().map(ledger_record).collect(),
+    };
+    super::identity_store::write_secret(
+        secrets_dir,
+        "jwt-composite-pairs.json",
+        &serde_json::to_vec(&ledger)?,
+    )?;
+    key_set.publish(version, pairs)
+}
+
+fn upsert_active_pair(
+    pairs: &mut Vec<hyprstream_rpc::auth::CompositeKeyPair>,
+    ml_dsa: Arc<hyprstream_rpc::crypto::pq::MlDsaSigningKey>,
+    ed25519: Arc<SigningKey>,
+    role: hyprstream_rpc::auth::CompositePairRole,
+    not_before: i64,
+    expires_at: i64,
 ) {
-    let kid = crate::auth::jwt::composite_kid(&ml_dsa, &ed25519);
-    if !pairs.iter().any(|pair| pair.kid == kid) {
-        pairs.push(PublishedCompositeKey { ml_dsa, ed25519, kid });
+    let ml_vk = ml_dsa::Keypair::verifying_key(&*ml_dsa).clone();
+    let kid = crate::auth::jwt::composite_kid(&ml_vk, &ed25519.verifying_key());
+    pairs.retain(|pair| {
+        pair.kid() != kid
+            && !(pair.role() == role
+                && pair.state() == hyprstream_rpc::auth::CompositePairState::Active)
+    });
+    pairs.push(hyprstream_rpc::auth::CompositeKeyPair::signing(
+        kid,
+        ml_dsa,
+        ed25519,
+        role,
+        hyprstream_rpc::auth::CompositePairState::Active,
+        not_before,
+        expires_at,
+    ));
+}
+
+fn ledger_record(pair: &hyprstream_rpc::auth::CompositeKeyPair) -> CompositeLedgerPair {
+    CompositeLedgerPair {
+        kid: pair.kid().to_owned(),
+        ml_dsa_public: URL_SAFE_NO_PAD
+            .encode(hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(pair.ml_dsa())),
+        ed25519_public: URL_SAFE_NO_PAD.encode(pair.ed25519().to_bytes()),
+        role: if pair.role() == hyprstream_rpc::auth::CompositePairRole::Policy {
+            "policy"
+        } else {
+            "oauth"
+        }
+        .to_owned(),
+        state: if pair.state() == hyprstream_rpc::auth::CompositePairState::Active {
+            "active"
+        } else {
+            "drain"
+        }
+        .to_owned(),
+        not_before: pair.not_before(),
+        expires_at: pair.expires_at(),
     }
 }
 
@@ -193,25 +394,42 @@ fn push_composite_pair(
 ///
 /// Ensures all services (PolicyService, OAuthService, rotation task) share
 /// the same store instance — rotation applies universally.
-static ML_DSA_SIGNING_STORE: std::sync::OnceLock<Arc<MlDsaSigningKeyStore>> = std::sync::OnceLock::new();
+static ML_DSA_SIGNING_STORE: std::sync::OnceLock<Arc<MlDsaSigningKeyStore>> =
+    std::sync::OnceLock::new();
+static ED25519_SIGNING_STORE: std::sync::OnceLock<Arc<SigningKeyStore>> =
+    std::sync::OnceLock::new();
+
+/// Get or initialize the process-wide Ed25519 rotation store.
+pub fn global_ed25519_key_store(secrets_dir: &Path, config: &OAuthConfig) -> Arc<SigningKeyStore> {
+    ED25519_SIGNING_STORE
+        .get_or_init(|| Arc::new(load_or_init_key_store(secrets_dir, config)))
+        .clone()
+}
 
 /// Get or initialize the global ML-DSA signing key store.
 ///
 /// First call initializes from disk; subsequent calls return the same Arc.
-pub fn global_ml_dsa_key_store(secrets_dir: &Path, config: &OAuthConfig) -> Arc<MlDsaSigningKeyStore> {
-    ML_DSA_SIGNING_STORE.get_or_init(|| {
-        Arc::new(load_or_init_ml_dsa_key_store(secrets_dir, config))
-    }).clone()
+pub fn global_ml_dsa_key_store(
+    secrets_dir: &Path,
+    config: &OAuthConfig,
+) -> Arc<MlDsaSigningKeyStore> {
+    ML_DSA_SIGNING_STORE
+        .get_or_init(|| Arc::new(load_or_init_ml_dsa_key_store(secrets_dir, config)))
+        .clone()
 }
 
 /// Global ES256 signing key store singleton.
-static ES256_SIGNING_STORE: std::sync::OnceLock<Arc<Es256SigningKeyStore>> = std::sync::OnceLock::new();
+static ES256_SIGNING_STORE: std::sync::OnceLock<Arc<Es256SigningKeyStore>> =
+    std::sync::OnceLock::new();
 
 /// Get or initialize the global ES256 signing key store.
-pub fn global_es256_key_store(secrets_dir: &Path, config: &OAuthConfig) -> Arc<Es256SigningKeyStore> {
-    ES256_SIGNING_STORE.get_or_init(|| {
-        Arc::new(load_or_init_es256_key_store(secrets_dir, config))
-    }).clone()
+pub fn global_es256_key_store(
+    secrets_dir: &Path,
+    config: &OAuthConfig,
+) -> Arc<Es256SigningKeyStore> {
+    ES256_SIGNING_STORE
+        .get_or_init(|| Arc::new(load_or_init_es256_key_store(secrets_dir, config)))
+        .clone()
 }
 
 // ── Key slot ────────────────────────────────────────────────────────────────
@@ -227,7 +445,11 @@ pub struct KeySlot {
 
 impl KeySlot {
     pub fn new(key: SigningKey, nbf: i64, exp: i64) -> Self {
-        Self { key: Arc::new(key), nbf, exp }
+        Self {
+            key: Arc::new(key),
+            nbf,
+            exp,
+        }
     }
 
     pub fn verifying_key_bytes(&self) -> [u8; 32] {
@@ -314,22 +536,40 @@ fn load_slot(secrets_dir: &Path, name: &str) -> Option<KeySlot> {
     let (key_path, meta_path) = slot_paths(secrets_dir, name);
     let seed = std::fs::read(&key_path).ok()?;
     if seed.len() != 32 {
-        warn!("JWT key slot '{name}': unexpected seed length {}", seed.len());
+        warn!(
+            "JWT key slot '{name}': unexpected seed length {}",
+            seed.len()
+        );
         return None;
     }
     let meta_bytes = std::fs::read(&meta_path).ok()?;
     let meta: SlotMeta = serde_json::from_slice(&meta_bytes).ok()?;
     let mut seed_arr = [0u8; 32];
     seed_arr.copy_from_slice(&seed);
-    Some(KeySlot::new(SigningKey::from_bytes(&seed_arr), meta.nbf, meta.exp))
+    Some(KeySlot::new(
+        SigningKey::from_bytes(&seed_arr),
+        meta.nbf,
+        meta.exp,
+    ))
 }
 
 fn persist_slot(secrets_dir: &Path, name: &str, slot: &KeySlot) -> anyhow::Result<()> {
     // Atomic write + 0600 perms (#179) — replaces bare std::fs::write which
     // used 0644 (world-readable) and was non-atomic (torn file on crash).
-    super::identity_store::write_secret(secrets_dir, &format!("jwt-signing-key.{name}"), &slot.key.to_bytes())?;
-    let meta = SlotMeta { nbf: slot.nbf, exp: slot.exp };
-    super::identity_store::write_secret(secrets_dir, &format!("jwt-signing-key.{name}.meta"), &serde_json::to_vec(&meta)?)?;
+    super::identity_store::write_secret(
+        secrets_dir,
+        &format!("jwt-signing-key.{name}"),
+        &slot.key.to_bytes(),
+    )?;
+    let meta = SlotMeta {
+        nbf: slot.nbf,
+        exp: slot.exp,
+    };
+    super::identity_store::write_secret(
+        secrets_dir,
+        &format!("jwt-signing-key.{name}.meta"),
+        &serde_json::to_vec(&meta)?,
+    )?;
     Ok(())
 }
 
@@ -371,8 +611,8 @@ pub fn load_or_init_key_store(secrets_dir: &Path, config: &OAuthConfig) -> Signi
     }
 
     // If we have active but no lead and active is close to expiry, generate lead now.
-    let should_gen_lead = lead.is_none() && active.as_ref()
-        .is_some_and(|a| a.exp - now < lead_secs);
+    let should_gen_lead =
+        lead.is_none() && active.as_ref().is_some_and(|a| a.exp - now < lead_secs);
     if should_gen_lead {
         let lead_nbf = active.as_ref().map(|a| a.exp).unwrap_or(now) - lead_secs;
         let lead_exp = lead_nbf + active_secs;
@@ -385,9 +625,17 @@ pub fn load_or_init_key_store(secrets_dir: &Path, config: &OAuthConfig) -> Signi
     }
 
     // Re-load lead if we just generated it
-    let lead = if should_gen_lead { load_slot(secrets_dir, "lead") } else { lead };
+    let lead = if should_gen_lead {
+        load_slot(secrets_dir, "lead")
+    } else {
+        lead
+    };
 
-    SigningKeyStore::new(KeySlots { drain, active, lead })
+    SigningKeyStore::new(KeySlots {
+        drain,
+        active,
+        lead,
+    })
 }
 
 // ── Rotation logic ──────────────────────────────────────────────────────────
@@ -430,7 +678,11 @@ pub async fn rotate_jwt_keys(
     }
 
     // 2. Remove drain if drain window has closed.
-    if slots.drain.as_ref().is_some_and(|d| now >= d.exp + drain_secs) {
+    if slots
+        .drain
+        .as_ref()
+        .is_some_and(|d| now >= d.exp + drain_secs)
+    {
         let kid = slots.drain.as_ref().map(KeySlot::kid).unwrap_or_default();
         info!("Removing expired drain JWT key (kid={kid})");
         delete_slot(secrets_dir, "drain");
@@ -444,7 +696,11 @@ pub async fn rotate_jwt_keys(
                 let lead_nbf = active.exp - lead_secs;
                 let lead_exp = lead_nbf + active_secs;
                 let new_lead = generate_slot(lead_nbf, lead_exp);
-                info!("Generated new lead JWT key (kid={}, nbf={})", new_lead.kid(), new_lead.nbf);
+                info!(
+                    "Generated new lead JWT key (kid={}, nbf={})",
+                    new_lead.kid(),
+                    new_lead.nbf
+                );
                 if let Err(e) = persist_slot(secrets_dir, "lead", &new_lead) {
                     warn!("Could not persist lead JWT key: {e}");
                 }
@@ -460,7 +716,7 @@ pub async fn rotate_jwt_keys(
 pub struct RotationStores {
     pub es256: Option<Arc<Es256SigningKeyStore>>,
     pub ml_dsa: Option<Arc<MlDsaSigningKeyStore>>,
-    pub composite_ca_key: ed25519_dalek::VerifyingKey,
+    pub composite_ca_key: Arc<SigningKey>,
 }
 
 pub fn spawn_rotation_task(
@@ -487,7 +743,19 @@ pub fn spawn_rotation_task(
             if let Some(ref ml_dsa) = extra.ml_dsa {
                 rotate_ml_dsa_keys(&config, &secrets_dir, ml_dsa, now).await;
                 refresh_ml_dsa_verifying_keys(ml_dsa).await;
-                refresh_composite_verifying_keys(&store, ml_dsa, &extra.composite_ca_key).await;
+                if let Err(error) = refresh_composite_key_set(
+                    &secrets_dir,
+                    &store,
+                    ml_dsa,
+                    Arc::clone(&extra.composite_ca_key),
+                    config.drain_secs(),
+                )
+                .await
+                {
+                    warn!(
+                        "composite key-set publication failed; retaining prior authority: {error}"
+                    );
+                }
             }
         }
     });
@@ -508,7 +776,11 @@ pub struct Es256KeySlot {
 
 impl Es256KeySlot {
     pub fn new(key: Es256SigningKey, nbf: i64, exp: i64) -> Self {
-        Self { key: Arc::new(key), nbf, exp }
+        Self {
+            key: Arc::new(key),
+            nbf,
+            exp,
+        }
     }
 
     pub fn kid(&self) -> String {
@@ -541,7 +813,12 @@ impl Es256SigningKeyStore {
     }
 
     pub async fn active_key(&self) -> Option<Arc<Es256SigningKey>> {
-        self.0.read().await.active.as_ref().map(|s| Arc::clone(&s.key))
+        self.0
+            .read()
+            .await
+            .active
+            .as_ref()
+            .map(|s| Arc::clone(&s.key))
     }
 
     pub async fn all_slots_snapshot(&self) -> Vec<Es256KeySlot> {
@@ -562,7 +839,10 @@ fn load_es256_slot(secrets_dir: &Path, name: &str) -> Option<Es256KeySlot> {
     let (key_path, meta_path) = es256_slot_paths(secrets_dir, name);
     let seed = std::fs::read(&key_path).ok()?;
     if seed.len() != 32 {
-        warn!("ES256 key slot '{name}': unexpected seed length {}", seed.len());
+        warn!(
+            "ES256 key slot '{name}': unexpected seed length {}",
+            seed.len()
+        );
         return None;
     }
     let meta_bytes = std::fs::read(&meta_path).ok()?;
@@ -573,9 +853,20 @@ fn load_es256_slot(secrets_dir: &Path, name: &str) -> Option<Es256KeySlot> {
 
 fn persist_es256_slot(secrets_dir: &Path, name: &str, slot: &Es256KeySlot) -> anyhow::Result<()> {
     // Atomic write + 0600 perms (#179).
-    super::identity_store::write_secret(secrets_dir, &format!("es256-signing-key.{name}"), &slot.key.to_bytes())?;
-    let meta = SlotMeta { nbf: slot.nbf, exp: slot.exp };
-    super::identity_store::write_secret(secrets_dir, &format!("es256-signing-key.{name}.meta"), &serde_json::to_vec(&meta)?)?;
+    super::identity_store::write_secret(
+        secrets_dir,
+        &format!("es256-signing-key.{name}"),
+        &slot.key.to_bytes(),
+    )?;
+    let meta = SlotMeta {
+        nbf: slot.nbf,
+        exp: slot.exp,
+    };
+    super::identity_store::write_secret(
+        secrets_dir,
+        &format!("es256-signing-key.{name}.meta"),
+        &serde_json::to_vec(&meta)?,
+    )?;
     Ok(())
 }
 
@@ -590,7 +881,10 @@ fn generate_es256_slot(nbf: i64, exp: i64) -> Es256KeySlot {
     Es256KeySlot::new(key, nbf, exp)
 }
 
-pub fn load_or_init_es256_key_store(secrets_dir: &Path, config: &OAuthConfig) -> Es256SigningKeyStore {
+pub fn load_or_init_es256_key_store(
+    secrets_dir: &Path,
+    config: &OAuthConfig,
+) -> Es256SigningKeyStore {
     let now = chrono::Utc::now().timestamp();
     let active_secs = config.active_secs();
     let lead_secs = config.lead_secs();
@@ -610,8 +904,8 @@ pub fn load_or_init_es256_key_store(secrets_dir: &Path, config: &OAuthConfig) ->
         active = Some(slot);
     }
 
-    let should_gen_lead = lead.is_none() && active.as_ref()
-        .is_some_and(|a| a.exp - now < lead_secs);
+        let should_gen_lead =
+            lead.is_none() && active.as_ref().is_some_and(|a| a.exp - now < lead_secs);
     if should_gen_lead {
         let lead_nbf = active.as_ref().map(|a| a.exp).unwrap_or(now) - lead_secs;
         let lead_exp = lead_nbf + active_secs;
@@ -621,8 +915,16 @@ pub fn load_or_init_es256_key_store(secrets_dir: &Path, config: &OAuthConfig) ->
         }
     }
 
-    let lead = if should_gen_lead { load_es256_slot(secrets_dir, "lead") } else { lead };
-    Es256SigningKeyStore::new(Es256KeySlots { drain, active, lead })
+    let lead = if should_gen_lead {
+        load_es256_slot(secrets_dir, "lead")
+    } else {
+        lead
+    };
+    Es256SigningKeyStore::new(Es256KeySlots {
+        drain,
+        active,
+        lead,
+    })
 }
 
 pub async fn rotate_es256_keys(
@@ -689,7 +991,7 @@ pub async fn rotate_es256_keys(
 mod ml_dsa_rotation {
     use super::*;
     use hyprstream_rpc::crypto::pq::{
-        MlDsaSigningKey, ml_dsa_generate_keypair, ml_dsa_sk_to_seed, ml_dsa_sk_from_seed,
+        ml_dsa_generate_keypair, ml_dsa_sk_from_seed, ml_dsa_sk_to_seed, MlDsaSigningKey,
     };
 
     #[derive(Clone)]
@@ -701,7 +1003,11 @@ mod ml_dsa_rotation {
 
     impl MlDsaKeySlot {
         pub fn new(key: MlDsaSigningKey, nbf: i64, exp: i64) -> Self {
-            Self { key: Arc::new(key), nbf, exp }
+            Self {
+                key: Arc::new(key),
+                nbf,
+                exp,
+            }
         }
 
         pub fn verifying_key(&self) -> hyprstream_rpc::crypto::pq::MlDsaVerifyingKey {
@@ -734,7 +1040,12 @@ mod ml_dsa_rotation {
         }
 
         pub async fn active_key(&self) -> Option<Arc<MlDsaSigningKey>> {
-            self.0.read().await.active.as_ref().map(|s| Arc::clone(&s.key))
+            self.0
+                .read()
+                .await
+                .active
+                .as_ref()
+                .map(|s| Arc::clone(&s.key))
         }
 
         pub async fn all_slots_snapshot(&self) -> Vec<MlDsaKeySlot> {
@@ -755,7 +1066,10 @@ mod ml_dsa_rotation {
         let (key_path, meta_path) = ml_dsa_slot_paths(secrets_dir, name);
         let seed_bytes = std::fs::read(&key_path).ok()?;
         if seed_bytes.len() != 32 {
-            warn!("ML-DSA key slot '{name}': unexpected seed length {}", seed_bytes.len());
+            warn!(
+                "ML-DSA key slot '{name}': unexpected seed length {}",
+                seed_bytes.len()
+            );
             return None;
         }
         let meta_bytes = std::fs::read(&meta_path).ok()?;
@@ -766,12 +1080,27 @@ mod ml_dsa_rotation {
         Some(MlDsaKeySlot::new(key, meta.nbf, meta.exp))
     }
 
-    pub(super) fn persist_ml_dsa_slot(secrets_dir: &Path, name: &str, slot: &MlDsaKeySlot) -> anyhow::Result<()> {
+    pub(super) fn persist_ml_dsa_slot(
+        secrets_dir: &Path,
+        name: &str,
+        slot: &MlDsaKeySlot,
+    ) -> anyhow::Result<()> {
         // Atomic write + 0600 perms (#179).
         let seed = ml_dsa_sk_to_seed(&slot.key);
-        super::super::identity_store::write_secret(secrets_dir, &format!("ml-dsa-signing-key.{name}"), &seed)?;
-        let meta = SlotMeta { nbf: slot.nbf, exp: slot.exp };
-        super::super::identity_store::write_secret(secrets_dir, &format!("ml-dsa-signing-key.{name}.meta"), &serde_json::to_vec(&meta)?)?;
+        super::super::identity_store::write_secret(
+            secrets_dir,
+            &format!("ml-dsa-signing-key.{name}"),
+            &seed,
+        )?;
+        let meta = SlotMeta {
+            nbf: slot.nbf,
+            exp: slot.exp,
+        };
+        super::super::identity_store::write_secret(
+            secrets_dir,
+            &format!("ml-dsa-signing-key.{name}.meta"),
+            &serde_json::to_vec(&meta)?,
+        )?;
         Ok(())
     }
 
@@ -786,7 +1115,10 @@ mod ml_dsa_rotation {
         MlDsaKeySlot::new(key, nbf, exp)
     }
 
-    pub fn load_or_init_ml_dsa_key_store(secrets_dir: &Path, config: &OAuthConfig) -> MlDsaSigningKeyStore {
+    pub fn load_or_init_ml_dsa_key_store(
+        secrets_dir: &Path,
+        config: &OAuthConfig,
+    ) -> MlDsaSigningKeyStore {
         let now = chrono::Utc::now().timestamp();
         let active_secs = config.active_secs();
         let lead_secs = config.lead_secs();
@@ -806,8 +1138,8 @@ mod ml_dsa_rotation {
             active = Some(slot);
         }
 
-        let should_gen_lead = lead.is_none() && active.as_ref()
-            .is_some_and(|a| a.exp - now < lead_secs);
+    let should_gen_lead =
+        lead.is_none() && active.as_ref().is_some_and(|a| a.exp - now < lead_secs);
         if should_gen_lead {
             let lead_nbf = active.as_ref().map(|a| a.exp).unwrap_or(now) - lead_secs;
             let lead_exp = lead_nbf + active_secs;
@@ -817,8 +1149,16 @@ mod ml_dsa_rotation {
             }
         }
 
-        let lead = if should_gen_lead { load_ml_dsa_slot(secrets_dir, "lead") } else { lead };
-        MlDsaSigningKeyStore::new(MlDsaKeySlots { drain, active, lead })
+        let lead = if should_gen_lead {
+            load_ml_dsa_slot(secrets_dir, "lead")
+        } else {
+            lead
+        };
+        MlDsaSigningKeyStore::new(MlDsaKeySlots {
+            drain,
+            active,
+            lead,
+        })
     }
 
     pub async fn rotate_ml_dsa_keys(
@@ -878,12 +1218,15 @@ mod ml_dsa_rotation {
     }
 }
 
-pub use ml_dsa_rotation::{MlDsaKeySlot, MlDsaKeySlots, MlDsaSigningKeyStore, load_or_init_ml_dsa_key_store, rotate_ml_dsa_keys};
+pub use ml_dsa_rotation::{
+    load_or_init_ml_dsa_key_store, rotate_ml_dsa_keys, MlDsaKeySlot, MlDsaKeySlots,
+    MlDsaSigningKeyStore,
+};
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
@@ -904,7 +1247,10 @@ mod tests {
         let store = load_or_init_key_store(dir.path(), &config);
         let rt = tokio::runtime::Runtime::new().unwrap();
         let vk = rt.block_on(store.active_verifying_key_bytes());
-        assert!(vk.is_some(), "active key should be present after first boot");
+        assert!(
+            vk.is_some(),
+            "active key should be present after first boot"
+        );
     }
 
     #[test]
@@ -952,12 +1298,18 @@ mod tests {
         rotate_jwt_keys(&config, dir.path(), &store, now).await;
 
         let new_active_vk = store.active_verifying_key_bytes().await.unwrap();
-        assert_eq!(new_active_vk, lead_vk, "lead must become active after promotion");
+        assert_eq!(
+            new_active_vk, lead_vk,
+            "lead must become active after promotion"
+        );
 
         // Old active must now be drain
         let slots = store.0.read().await;
         assert!(slots.drain.is_some(), "old active must become drain");
-        assert!(slots.lead.is_none(), "lead slot must be cleared after promotion");
+        assert!(
+            slots.lead.is_none(),
+            "lead slot must be cleared after promotion"
+        );
     }
 
     #[tokio::test]
@@ -988,7 +1340,10 @@ mod tests {
         rotate_jwt_keys(&config, dir.path(), &store, now).await;
 
         let slots = store.0.read().await;
-        assert!(slots.drain.is_none(), "drain must be removed after drain window closes");
+        assert!(
+            slots.drain.is_none(),
+            "drain must be removed after drain window closes"
+        );
     }
 
     #[tokio::test]
@@ -1014,7 +1369,10 @@ mod tests {
         rotate_jwt_keys(&config, dir.path(), &store, now).await;
 
         let slots = store.0.read().await;
-        assert!(slots.lead.is_some(), "lead must be generated when active is within lead window");
+        assert!(
+            slots.lead.is_some(),
+            "lead must be generated when active is within lead window"
+        );
     }
 
     // ── ES256 store tests ──────────────────────────────────────────────────
@@ -1093,12 +1451,16 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let vk1 = {
             let key = rt.block_on(store1.active_key()).unwrap();
-            hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&ml_dsa::Keypair::verifying_key(&*key).clone())
+            hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(
+                &ml_dsa::Keypair::verifying_key(&*key).clone(),
+            )
         };
         let store2 = load_or_init_ml_dsa_key_store(dir.path(), &config);
         let vk2 = {
             let key = rt.block_on(store2.active_key()).unwrap();
-            hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&ml_dsa::Keypair::verifying_key(&*key).clone())
+            hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(
+                &ml_dsa::Keypair::verifying_key(&*key).clone(),
+            )
         };
         assert_eq!(vk1, vk2, "ML-DSA key must survive reload from disk");
     }
@@ -1130,8 +1492,146 @@ mod tests {
         let active_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(
             &ml_dsa::Keypair::verifying_key(&*slots.active.as_ref().unwrap().key).clone(),
         );
-        assert_eq!(active_vk, lead_vk, "lead must become active after promotion");
+        assert_eq!(
+            active_vk, lead_vk,
+            "lead must become active after promotion"
+        );
         assert!(slots.drain.is_some());
         assert!(slots.lead.is_none());
+    }
+
+    #[tokio::test]
+    async fn composite_ledger_survives_joint_rotation_restart_and_drain_expiry() {
+        use super::ml_dsa_rotation::*;
+
+        let dir = TempDir::new().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let drain_secs = 600;
+        let ca = Arc::new(SigningKey::from_bytes(&[91; 32]));
+        let old_ed = KeySlot::new(SigningKey::from_bytes(&[92; 32]), now - 60, now + 60);
+        let old_pq = generate_ml_dsa_slot(now - 60, now + 60);
+        persist_slot(dir.path(), "active", &old_ed).unwrap();
+        persist_ml_dsa_slot(dir.path(), "active", &old_pq).unwrap();
+        let ed_store = SigningKeyStore::new(KeySlots {
+            drain: None,
+            active: Some(old_ed.clone()),
+            lead: None,
+        });
+        let pq_store = MlDsaSigningKeyStore::new(MlDsaKeySlots {
+            drain: None,
+            active: Some(old_pq.clone()),
+            lead: None,
+        });
+        initialize_composite_key_set(
+            dir.path(),
+            &ed_store,
+            &pq_store,
+            Arc::clone(&ca),
+            drain_secs,
+        )
+        .await
+        .unwrap();
+        let initial = hyprstream_rpc::auth::global_composite_key_set().snapshot();
+        let old_pair = initial
+            .active_signing_pair(hyprstream_rpc::auth::CompositePairRole::OAuth)
+            .unwrap();
+        let old_kid = old_pair.kid().to_owned();
+        let (old_pq_signing, old_ed_signing) = old_pair.signing_keys().unwrap();
+        let claims = hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 300)
+            .with_issuer("https://local".to_owned())
+            .with_audience(Some("https://resource".to_owned()));
+        let token = crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
+            &claims,
+            &old_pq_signing,
+            &old_ed_signing,
+        );
+
+        // Deterministic joint promotion: old exact pair becomes drain and a
+        // new exact pair becomes active in one publication.
+        let new_ed = KeySlot::new(SigningKey::from_bytes(&[93; 32]), now, now + 1200);
+        let new_pq = generate_ml_dsa_slot(now, now + 1200);
+        persist_slot(dir.path(), "drain", &old_ed).unwrap();
+        persist_slot(dir.path(), "active", &new_ed).unwrap();
+        persist_ml_dsa_slot(dir.path(), "drain", &old_pq).unwrap();
+        persist_ml_dsa_slot(dir.path(), "active", &new_pq).unwrap();
+        let rotated_ed = SigningKeyStore::new(KeySlots {
+            drain: Some(old_ed),
+            active: Some(new_ed),
+            lead: None,
+        });
+        let rotated_pq = MlDsaSigningKeyStore::new(MlDsaKeySlots {
+            drain: Some(old_pq),
+            active: Some(new_pq),
+            lead: None,
+        });
+        refresh_composite_key_set(
+            dir.path(),
+            &rotated_ed,
+            &rotated_pq,
+            Arc::clone(&ca),
+            drain_secs,
+        )
+        .await
+        .unwrap();
+        let rotated = hyprstream_rpc::auth::global_composite_key_set().snapshot();
+        let retained = rotated
+            .pair(&old_kid)
+            .expect("old exact pair retained as drain");
+        hyprstream_rpc::auth::jwt::decode_composite(
+            &token,
+            retained.ml_dsa(),
+            retained.ed25519(),
+            Some("https://resource"),
+        )
+        .unwrap();
+
+        // Restart from component files plus the exact persisted association.
+        let reloaded_ed = load_or_init_key_store(dir.path(), &test_config());
+        let reloaded_pq = load_or_init_ml_dsa_key_store(dir.path(), &test_config());
+        initialize_composite_key_set(
+            dir.path(),
+            &reloaded_ed,
+            &reloaded_pq,
+            Arc::clone(&ca),
+            drain_secs,
+        )
+        .await
+        .unwrap();
+        let restarted = hyprstream_rpc::auth::global_composite_key_set().snapshot();
+        assert!(restarted.pair(&old_kid).is_some());
+        let jwks_kids: Vec<_> = restarted
+            .pairs()
+            .iter()
+            .map(|pair| {
+                crate::auth::jwt::composite_jwk(pair.ml_dsa(), pair.ed25519())["kid"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert!(jwks_kids.contains(&old_kid));
+
+        // Expiring the persisted exact association revokes both verifier and JWKS views.
+        let mut ledger: CompositeLedger =
+            serde_json::from_slice(&std::fs::read(composite_ledger_path(dir.path())).unwrap())
+                .unwrap();
+        ledger
+            .pairs
+            .iter_mut()
+            .filter(|pair| pair.kid == old_kid)
+            .for_each(|pair| pair.expires_at = now - 1);
+        super::super::identity_store::write_secret(
+            dir.path(),
+            "jwt-composite-pairs.json",
+            &serde_json::to_vec(&ledger).unwrap(),
+        )
+        .unwrap();
+        initialize_composite_key_set(dir.path(), &reloaded_ed, &reloaded_pq, ca, drain_secs)
+            .await
+            .unwrap();
+        assert!(hyprstream_rpc::auth::global_composite_key_set()
+            .snapshot()
+            .pair(&old_kid)
+            .is_none());
     }
 }

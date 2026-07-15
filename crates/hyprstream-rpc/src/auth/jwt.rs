@@ -12,10 +12,110 @@
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::Utc;
-use ed25519_dalek::{Signature, Signer, Verifier, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use thiserror::Error;
 
 use super::Claims;
+
+/// Duplicate-detecting, closed protected JOSE header used for security dispatch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProtectedHeader {
+    pub alg: String,
+    pub typ: String,
+    pub kid: String,
+}
+
+impl<'de> serde::Deserialize<'de> for ProtectedHeader {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error as _, MapAccess, Visitor};
+
+        struct HeaderVisitor;
+        impl<'de> Visitor<'de> for HeaderVisitor {
+            type Value = ProtectedHeader;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a closed JOSE protected header")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let (mut alg, mut typ, mut kid): (Option<String>, Option<String>, Option<String>) =
+                    (None, None, None);
+                let mut crit_seen = false;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "alg" => {
+                            if alg.is_some() {
+                                return Err(A::Error::duplicate_field("alg"));
+                            }
+                            alg = Some(map.next_value()?);
+                        }
+                        "typ" => {
+                            if typ.is_some() {
+                                return Err(A::Error::duplicate_field("typ"));
+                            }
+                            typ = Some(map.next_value()?);
+                        }
+                        "kid" => {
+                            if kid.is_some() {
+                                return Err(A::Error::duplicate_field("kid"));
+                            }
+                            kid = Some(map.next_value()?);
+                        }
+                        "crit" => {
+                            if crit_seen {
+                                return Err(A::Error::duplicate_field("crit"));
+                            }
+                            crit_seen = true;
+                            let crit: Vec<String> = map.next_value()?;
+                            if !crit.is_empty() {
+                                return Err(A::Error::custom(
+                                    "unsupported critical JOSE semantics",
+                                ));
+                            }
+                        }
+                        _ => {
+                            return Err(A::Error::unknown_field(
+                                &key,
+                                &["alg", "typ", "kid", "crit"],
+                            ))
+                        }
+                    }
+                }
+                let alg = alg.ok_or_else(|| A::Error::missing_field("alg"))?;
+                let typ = typ.ok_or_else(|| A::Error::missing_field("typ"))?;
+                let kid = kid.ok_or_else(|| A::Error::missing_field("kid"))?;
+                if kid.is_empty() {
+                    return Err(A::Error::custom("kid must not be empty"));
+                }
+                Ok(ProtectedHeader { alg, typ, kid })
+            }
+        }
+        deserializer.deserialize_map(HeaderVisitor)
+    }
+}
+
+/// Parse a JWT protected header exactly once for security dispatch.
+pub fn parse_protected_header(token: &str) -> Result<ProtectedHeader, JwtError> {
+    let mut parts = token.split('.');
+    let header_b64 = parts.next().ok_or(JwtError::InvalidFormat)?;
+    if header_b64.len() > 4096
+        || parts.next().is_none()
+        || parts.next().is_none()
+        || parts.next().is_some()
+    {
+        return Err(JwtError::InvalidFormat);
+    }
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(header_b64)
+        .map_err(|_| JwtError::InvalidBase64)?;
+    serde_json::from_slice(&header_bytes).map_err(|e| JwtError::InvalidJson(e.to_string()))
+}
 
 /// Input for RFC 7638 JWK Thumbprint computation.
 ///
@@ -46,7 +146,10 @@ pub fn jwk_thumbprint(input: &JwkThumbprintInput<'_>) -> String {
         JwkThumbprintInput::Es256 { x, y } => {
             let x_b64 = URL_SAFE_NO_PAD.encode(x);
             let y_b64 = URL_SAFE_NO_PAD.encode(y);
-            format!(r#"{{"crv":"P-256","kty":"EC","x":"{}","y":"{}"}}"#, x_b64, y_b64)
+            format!(
+                r#"{{"crv":"P-256","kty":"EC","x":"{}","y":"{}"}}"#,
+                x_b64, y_b64
+            )
         }
         JwkThumbprintInput::Rsa { n, e } => {
             format!(r#"{{"e":"{}","kty":"RSA","n":"{}"}}"#, e, n)
@@ -58,6 +161,19 @@ pub fn jwk_thumbprint(input: &JwkThumbprintInput<'_>) -> String {
     };
     let hash = Sha256::digest(canonical.as_bytes());
     URL_SAFE_NO_PAD.encode(hash)
+}
+
+/// Compute the RFC 7638 thumbprint for one exact composite public-key pair.
+pub fn composite_kid(
+    ml_dsa: &crate::crypto::pq::MlDsaVerifyingKey,
+    ed25519: &VerifyingKey,
+) -> String {
+    let mut public = crate::crypto::pq::ml_dsa_vk_bytes(ml_dsa);
+    public.extend_from_slice(ed25519.as_bytes());
+    jwk_thumbprint(&JwkThumbprintInput::Akp {
+        alg: "ML-DSA-65-Ed25519",
+        pub_bytes: &public,
+    })
 }
 
 /// Compute the JWT `kid` for an Ed25519 signing key using RFC 7638 JWK Thumbprint.
@@ -75,8 +191,8 @@ pub fn header_alg(token: &str) -> Result<Option<String>, JwtError> {
     let header_bytes = URL_SAFE_NO_PAD
         .decode(header_b64)
         .map_err(|_| JwtError::InvalidBase64)?;
-    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
-        .map_err(|e| JwtError::InvalidJson(e.to_string()))?;
+    let header: serde_json::Value =
+        serde_json::from_slice(&header_bytes).map_err(|e| JwtError::InvalidJson(e.to_string()))?;
     Ok(header.get("alg").and_then(|v| v.as_str()).map(String::from))
 }
 
@@ -88,8 +204,8 @@ pub fn header_kid(token: &str) -> Result<Option<String>, JwtError> {
     let header_bytes = URL_SAFE_NO_PAD
         .decode(header_b64)
         .map_err(|_| JwtError::InvalidBase64)?;
-    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
-        .map_err(|e| JwtError::InvalidJson(e.to_string()))?;
+    let header: serde_json::Value =
+        serde_json::from_slice(&header_bytes).map_err(|e| JwtError::InvalidJson(e.to_string()))?;
     Ok(header.get("kid").and_then(|v| v.as_str()).map(String::from))
 }
 
@@ -198,7 +314,11 @@ pub fn encode_id_token(claims: &super::IdTokenClaims, signing_key: &SigningKey) 
 ///
 /// Uses strict audience validation: if `expected_aud` is `Some`, the token
 /// must have a matching `aud` claim (absent `aud` is rejected).
-pub fn decode(token: &str, verifying_key: &VerifyingKey, expected_aud: Option<&str>) -> Result<Claims, JwtError> {
+pub fn decode(
+    token: &str,
+    verifying_key: &VerifyingKey,
+    expected_aud: Option<&str>,
+) -> Result<Claims, JwtError> {
     decode_inner(token, verifying_key, expected_aud, false)
 }
 
@@ -220,7 +340,12 @@ pub fn decode_with_key(
 ///
 /// `lenient_aud`: when true, accepts tokens with no `aud` claim even when
 /// `expected_aud` is `Some`. Wrong `aud` is always rejected.
-fn decode_inner(token: &str, verifying_key: &VerifyingKey, expected_aud: Option<&str>, lenient_aud: bool) -> Result<Claims, JwtError> {
+fn decode_inner(
+    token: &str,
+    verifying_key: &VerifyingKey,
+    expected_aud: Option<&str>,
+    lenient_aud: bool,
+) -> Result<Claims, JwtError> {
     // Split into parts
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
@@ -254,8 +379,8 @@ fn decode_inner(token: &str, verifying_key: &VerifyingKey, expected_aud: Option<
     let header_bytes = URL_SAFE_NO_PAD
         .decode(header_b64)
         .map_err(|_| JwtError::InvalidBase64)?;
-    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
-        .map_err(|e| JwtError::InvalidJson(e.to_string()))?;
+    let header: serde_json::Value =
+        serde_json::from_slice(&header_bytes).map_err(|e| JwtError::InvalidJson(e.to_string()))?;
     if header.get("alg").and_then(|v| v.as_str()) != Some("EdDSA") {
         return Err(JwtError::InvalidSignature);
     }
@@ -265,8 +390,8 @@ fn decode_inner(token: &str, verifying_key: &VerifyingKey, expected_aud: Option<
         .decode(payload_b64)
         .map_err(|_| JwtError::InvalidBase64)?;
 
-    let claims: Claims = serde_json::from_slice(&payload_bytes)
-        .map_err(|e| JwtError::InvalidJson(e.to_string()))?;
+    let claims: Claims =
+        serde_json::from_slice(&payload_bytes).map_err(|e| JwtError::InvalidJson(e.to_string()))?;
 
     // Check expiration
     if claims.is_expired() {
@@ -309,8 +434,7 @@ pub fn decode_unverified(token: &str) -> Result<Claims, JwtError> {
         .decode(parts[1])
         .map_err(|_| JwtError::InvalidBase64)?;
 
-    serde_json::from_slice(&payload_bytes)
-        .map_err(|e| JwtError::InvalidJson(e.to_string()))
+    serde_json::from_slice(&payload_bytes).map_err(|e| JwtError::InvalidJson(e.to_string()))
 }
 
 /// Decode and verify a JWT signed with ML-DSA-65 (`alg: "ML-DSA-65"`).
@@ -339,19 +463,23 @@ pub fn decode_ml_dsa_65(
     let header_bytes = URL_SAFE_NO_PAD
         .decode(parts[0])
         .map_err(|_| JwtError::InvalidBase64)?;
-    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
-        .map_err(|e| JwtError::InvalidJson(e.to_string()))?;
+    let header: serde_json::Value =
+        serde_json::from_slice(&header_bytes).map_err(|e| JwtError::InvalidJson(e.to_string()))?;
     if header.get("alg").and_then(|v| v.as_str()) != Some("ML-DSA-65") {
         return Err(JwtError::UnsupportedAlgorithm(
-            header.get("alg").and_then(|v| v.as_str()).unwrap_or("none").to_owned(),
+            header
+                .get("alg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("none")
+                .to_owned(),
         ));
     }
 
     let payload_bytes = URL_SAFE_NO_PAD
         .decode(parts[1])
         .map_err(|_| JwtError::InvalidBase64)?;
-    let claims: Claims = serde_json::from_slice(&payload_bytes)
-        .map_err(|e| JwtError::InvalidJson(e.to_string()))?;
+    let claims: Claims =
+        serde_json::from_slice(&payload_bytes).map_err(|e| JwtError::InvalidJson(e.to_string()))?;
 
     if claims.is_expired() {
         return Err(JwtError::Expired);
@@ -382,6 +510,26 @@ pub fn decode_composite(
     ed25519_vk: &VerifyingKey,
     expected_aud: Option<&str>,
 ) -> Result<Claims, JwtError> {
+    let header = parse_protected_header(token)?;
+    decode_composite_with_header(token, ml_dsa_vk, ed25519_vk, expected_aud, &header)
+}
+
+/// Verify a composite JWT using an already validated protected header.
+/// This prevents dispatch and the signature primitive from interpreting the
+/// protected bytes differently.
+pub fn decode_composite_with_header(
+    token: &str,
+    ml_dsa_vk: &crate::crypto::pq::MlDsaVerifyingKey,
+    ed25519_vk: &VerifyingKey,
+    expected_aud: Option<&str>,
+    header: &ProtectedHeader,
+) -> Result<Claims, JwtError> {
+    if header.alg != "ML-DSA-65-Ed25519" {
+        return Err(JwtError::UnsupportedAlgorithm(header.alg.clone()));
+    }
+    if header.kid != composite_kid(ml_dsa_vk, ed25519_vk) {
+        return Err(JwtError::InvalidSignature);
+    }
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return Err(JwtError::InvalidFormat);
@@ -418,22 +566,11 @@ pub fn decode_composite(
         .verify_strict(message, &ed_signature)
         .map_err(|_| JwtError::InvalidSignature)?;
 
-    let header_bytes = URL_SAFE_NO_PAD
-        .decode(parts[0])
-        .map_err(|_| JwtError::InvalidBase64)?;
-    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
-        .map_err(|e| JwtError::InvalidJson(e.to_string()))?;
-    if header.get("alg").and_then(|v| v.as_str()) != Some("ML-DSA-65-Ed25519") {
-        return Err(JwtError::UnsupportedAlgorithm(
-            header.get("alg").and_then(|v| v.as_str()).unwrap_or("none").to_owned(),
-        ));
-    }
-
     let payload_bytes = URL_SAFE_NO_PAD
         .decode(parts[1])
         .map_err(|_| JwtError::InvalidBase64)?;
-    let claims: Claims = serde_json::from_slice(&payload_bytes)
-        .map_err(|e| JwtError::InvalidJson(e.to_string()))?;
+    let claims: Claims =
+        serde_json::from_slice(&payload_bytes).map_err(|e| JwtError::InvalidJson(e.to_string()))?;
 
     if claims.is_expired() {
         return Err(JwtError::Expired);
@@ -444,10 +581,9 @@ pub fn decode_composite(
     }
 
     if let Some(expected) = expected_aud {
-        match &claims.aud {
-            Some(aud) if aud == expected => {}
-            None => {}                                    // lenient: absent aud accepted
-            Some(_) => return Err(JwtError::InvalidAudience), // wrong aud rejected
+        match claims.aud.as_deref() {
+            Some(aud) if aud.trim_end_matches('/') == expected.trim_end_matches('/') => {}
+            _ => return Err(JwtError::InvalidAudience),
         }
     }
 
@@ -603,7 +739,10 @@ mod tests {
     fn test_jwk_thumbprint_different_algorithms_differ() {
         let bytes = [1u8; 32];
         let ed_kid = jwk_thumbprint(&JwkThumbprintInput::Ed25519 { x: &bytes });
-        let es_kid = jwk_thumbprint(&JwkThumbprintInput::Es256 { x: &bytes, y: &[2u8; 32] });
+        let es_kid = jwk_thumbprint(&JwkThumbprintInput::Es256 {
+            x: &bytes,
+            y: &[2u8; 32],
+        });
         assert_ne!(ed_kid, es_kid);
     }
 

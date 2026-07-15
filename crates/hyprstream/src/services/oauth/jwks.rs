@@ -3,18 +3,21 @@
 //! Returns the node's signing keys: Ed25519 (OKP, RFC 8037) and optionally
 //! RSA (for RS256 interop with enterprise RPs).
 
+use super::state::OAuthState;
 use axum::{extract::State, response::IntoResponse, Json};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use hyprstream_rpc::auth::{JwkThumbprintInput, jwk_thumbprint};
+use hyprstream_rpc::auth::{jwk_thumbprint, JwkThumbprintInput};
 use std::sync::Arc;
-use super::state::OAuthState;
 
 /// Compute the RFC 7638 JWK Thumbprint for an Ed25519 key (32-byte raw pubkey).
 pub fn compute_kid(key_bytes: &[u8]) -> String {
     let bytes: [u8; 32] = match key_bytes.try_into() {
         Ok(b) => b,
         Err(_) => {
-            tracing::error!("compute_kid called with {} bytes, expected 32", key_bytes.len());
+            tracing::error!(
+                "compute_kid called with {} bytes, expected 32",
+                key_bytes.len()
+            );
             return String::new();
         }
     };
@@ -106,20 +109,18 @@ pub async fn jwks_json(state: &OAuthState) -> Vec<serde_json::Value> {
                 obj.insert("exp".to_owned(), slot.exp.into());
             }
             keys.push(jwk);
-
         }
     }
 
     // Publish exactly the pairs accepted by the local verifier. Never rebuild
     // these as a Cartesian product of independently published component keys.
-    let composite_pairs = crate::auth::key_rotation::global_composite_verifying_keys();
-    let snapshot = composite_pairs
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    keys.extend(snapshot.iter().map(|pair| {
-        crate::auth::jwt::composite_jwk(&pair.ml_dsa, &pair.ed25519)
-    }));
+    let snapshot = hyprstream_rpc::auth::global_composite_key_set().snapshot();
+    keys.extend(
+        snapshot
+            .pairs()
+            .iter()
+            .map(|pair| crate::auth::jwt::composite_jwk(pair.ml_dsa(), pair.ed25519())),
+    );
 
     // Add RSA public key if available
     if let Some(ref rsa_jwk) = state.rsa_jwk {

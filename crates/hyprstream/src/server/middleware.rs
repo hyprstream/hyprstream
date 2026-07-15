@@ -9,8 +9,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use hyprstream_rpc::auth::JtiBlocklist as _;
-use std::time::Instant;
 use std::time::Duration;
+use std::time::Instant;
 use subtle::ConstantTimeEq as _;
 use tracing::{debug, info, warn};
 
@@ -136,16 +136,22 @@ pub async fn auth_middleware(
         {
             let now = chrono::Utc::now().timestamp();
             let ttl_secs = ((proof.iat + 120) - now).max(0) as u64;
-            if !state
-                .dpop_jti_seen
-                .insert_if_absent(proof.jti.clone(), (), Duration::from_secs(ttl_secs))
-            {
+            if !state.dpop_jti_seen.insert_if_absent(
+                proof.jti.clone(),
+                (),
+                Duration::from_secs(ttl_secs),
+            ) {
                 debug!("DPoP proof jti already used: {}", proof.jti);
                 return unauthorized_response("Authentication failed", &www_authenticate);
             }
         }
         // cnf.jkt must match the DPoP proof key thumbprint.
-        if expected_jkt.as_bytes().ct_eq(proof.jkt.as_bytes()).unwrap_u8() == 0 {
+        if expected_jkt
+            .as_bytes()
+            .ct_eq(proof.jkt.as_bytes())
+            .unwrap_u8()
+            == 0
+        {
             warn!(sub = %claims.sub, "cnf.jkt mismatch — DPoP proof key does not match token binding");
             return unauthorized_response("Authentication failed", &www_authenticate);
         }
@@ -301,41 +307,21 @@ fn decode_local_multi_key(
     token: &str,
     ca_key: &ed25519_dalek::VerifyingKey,
     published_ed25519: &[ed25519_dalek::VerifyingKey],
-    published_composite: &[crate::auth::key_rotation::PublishedCompositeKey],
+    published_composite: &[hyprstream_rpc::auth::CompositeKeyPair],
     expected_aud: Option<&str>,
     allow_eddsa: bool,
 ) -> Result<jwt::Claims, &'static str> {
-    let (alg, typ, kid) = local_jose_header(token)?;
-    if typ != "at+jwt" {
+    let header =
+        hyprstream_rpc::auth::parse_protected_header(token).map_err(|_| "JWT validation failed")?;
+    if header.typ != "at+jwt" {
         return Err("JWT validation failed");
     }
-    match alg.as_str() {
+    match header.alg.as_str() {
         "ML-DSA-65-Ed25519" => {
-            decode_composite_multi(token, published_composite, expected_aud, &kid)
+            decode_composite_multi(token, published_composite, expected_aud, &header)
         }
         "EdDSA" if allow_eddsa => {
-            decode_ed25519_multi(token, ca_key, published_ed25519, expected_aud, &kid)
-        }
-        _ => Err("JWT validation failed"),
-    }
-}
-
-fn local_jose_header(token: &str) -> Result<(String, String, String), &'static str> {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-    let header_b64 = token.split('.').next().ok_or("JWT validation failed")?;
-    if header_b64.len() > 4096 {
-        return Err("JWT validation failed");
-    }
-    let bytes = URL_SAFE_NO_PAD.decode(header_b64).map_err(|_| "JWT validation failed")?;
-    let header: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| "JWT validation failed")?;
-    let object = header.as_object().ok_or("JWT validation failed")?;
-    match (
-        object.get("alg").and_then(serde_json::Value::as_str),
-        object.get("typ").and_then(serde_json::Value::as_str),
-        object.get("kid").and_then(serde_json::Value::as_str),
-    ) {
-        (Some(alg), Some(typ), Some(kid)) if !kid.is_empty() => {
-            Ok((alg.to_owned(), typ.to_owned(), kid.to_owned()))
+            decode_ed25519_multi(token, ca_key, published_ed25519, expected_aud, &header.kid)
         }
         _ => Err("JWT validation failed"),
     }
@@ -361,32 +347,26 @@ fn decode_ed25519_multi(
 
 fn decode_composite_multi(
     token: &str,
-    published_composite: &[crate::auth::key_rotation::PublishedCompositeKey],
+    published_composite: &[hyprstream_rpc::auth::CompositeKeyPair],
     expected_aud: Option<&str>,
-    token_kid: &str,
+    header: &hyprstream_rpc::auth::ProtectedHeader,
 ) -> Result<jwt::Claims, &'static str> {
     let pair = published_composite
         .iter()
-        .find(|pair| pair.kid == token_kid)
+        .find(|pair| pair.kid() == header.kid)
         .ok_or("JWT validation failed")?;
-    let claims = hyprstream_rpc::auth::jwt::decode_composite(
+    hyprstream_rpc::auth::jwt::decode_composite_with_header(
         token,
-        &pair.ml_dsa,
-        &pair.ed25519,
+        pair.ml_dsa(),
+        pair.ed25519(),
         expected_aud,
+        header,
     )
-    .map_err(|_| "JWT validation failed")?;
-    if let Some(expected) = expected_aud {
-        let expected = expected.trim_end_matches('/');
-        if claims.aud.as_deref().map(|aud| aud.trim_end_matches('/')) != Some(expected) {
-            return Err("JWT validation failed");
-        }
-    }
-    Ok(claims)
+    .map_err(|_| "JWT validation failed")
 }
 
 fn local_issuer_matches(claims: &jwt::Claims, expected: &str) -> bool {
-    claims.iss.is_empty() || claims.iss == expected
+    claims.iss == expected
 }
 
 pub(crate) async fn verify_token_claims(
@@ -418,18 +398,12 @@ pub(crate) async fn verify_token_claims(
         // MAC/key-rotation path populates at boot and after each ML-DSA rotation.
         // Empty under Classical policy or before the OAuth store is provisioned —
         // in which case a composite token simply fails closed here.
-        let published_composite = {
-            let shared = crate::auth::key_rotation::global_composite_verifying_keys();
-            let guard = shared
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.clone()
-        };
+        let published_composite = { hyprstream_rpc::auth::global_composite_key_set().snapshot() };
         let claims = decode_local_multi_key(
             token,
             &state.verifying_key,
             &published,
-            &published_composite,
+            published_composite.pairs(),
             Some(&state.resource_url),
             !hyprstream_rpc::envelope::envelope_policy_from_env().uses_pq(),
         )?;
@@ -465,20 +439,14 @@ fn build_www_authenticate(state: &ServerState) -> String {
         "{}/.well-known/oauth-protected-resource",
         state.resource_url
     );
-    format!(
-        "Bearer resource_metadata=\"{}\"",
-        resource_metadata_url,
-    )
+    format!("Bearer resource_metadata=\"{}\"", resource_metadata_url,)
 }
 
 /// Return a 401 response with WWW-Authenticate header.
 fn unauthorized_response(message: &str, www_authenticate: &str) -> Response {
     let mut response = (StatusCode::UNAUTHORIZED, message.to_owned()).into_response();
     if let Ok(val) = HeaderValue::from_str(www_authenticate) {
-        response.headers_mut().insert(
-            header::WWW_AUTHENTICATE,
-            val,
-        );
+        response.headers_mut().insert(header::WWW_AUTHENTICATE, val);
     }
     response
 }
@@ -864,13 +832,17 @@ mod composite_aware_tests {
     fn published_pair(
         ml_dsa: hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,
         ed25519: ed25519_dalek::VerifyingKey,
-    ) -> crate::auth::key_rotation::PublishedCompositeKey {
+    ) -> hyprstream_rpc::auth::CompositeKeyPair {
         let kid = crate::auth::jwt::composite_kid(&ml_dsa, &ed25519);
-        crate::auth::key_rotation::PublishedCompositeKey {
+        hyprstream_rpc::auth::CompositeKeyPair::verifying(
+            kid,
             ml_dsa,
             ed25519,
-            kid,
-        }
+            hyprstream_rpc::auth::CompositePairRole::OAuth,
+            hyprstream_rpc::auth::CompositePairState::Drain,
+            0,
+            i64::MAX,
+        )
     }
 
     /// A composite at+JWT signed by `(pq, ed)`, audience `aud`.
@@ -1024,8 +996,8 @@ mod composite_aware_tests {
             .with_audience(Some(AUD.to_owned()));
         let wrong_kid = "not-the-published-pair";
         for (alg, typ, kid) in [
-            ("EdDSA", "at+jwt", pair.kid.as_str()),
-            ("ML-DSA-65-Ed25519", "wit+jwt", pair.kid.as_str()),
+            ("EdDSA", "at+jwt", pair.kid()),
+            ("ML-DSA-65-Ed25519", "wit+jwt", pair.kid()),
             ("ML-DSA-65-Ed25519", "at+jwt", wrong_kid),
         ] {
             let token = composite_token_with_header(&pq, &ed, &claims, alg, typ, kid);
@@ -1051,12 +1023,20 @@ mod composite_aware_tests {
         let ed = new_ed_key();
         let pair = published_pair(pq_vk, ed.verifying_key());
         let cases = [
-            ("expired", jwt::Claims::new("expired".to_owned(), now() - 7200, now() - 10)
+            (
+                "expired",
+                jwt::Claims::new("expired".to_owned(), now() - 7200, now() - 10)
+                    .with_audience(Some(AUD.to_owned())),
+            ),
+            (
+                "future",
+                jwt::Claims::new("future".to_owned(), now() + 120, now() + 3600)
                 .with_audience(Some(AUD.to_owned())),
             ),
-            ("future", jwt::Claims::new("future".to_owned(), now() + 120, now() + 3600)
-                .with_audience(Some(AUD.to_owned()))),
-            ("no-aud", jwt::Claims::new("no-aud".to_owned(), now(), now() + 3600)),
+            (
+                "no-aud",
+                jwt::Claims::new("no-aud".to_owned(), now(), now() + 3600),
+            ),
         ];
         for (case, claims) in cases {
             let token = composite_token_with_header(
@@ -1065,9 +1045,10 @@ mod composite_aware_tests {
                 &claims,
                 "ML-DSA-65-Ed25519",
                 "at+jwt",
-                &pair.kid,
+                pair.kid(),
             );
-            assert!(decode_local_multi_key(
+            assert!(
+                decode_local_multi_key(
                 &token,
                 &ca.verifying_key(),
                 &[ed.verifying_key()],
@@ -1075,7 +1056,9 @@ mod composite_aware_tests {
                 Some(AUD),
                 false,
             )
-            .is_err(), "accepted invalid {case} claims");
+                .is_err(),
+                "accepted invalid {case} claims"
+            );
         }
     }
 
@@ -1094,7 +1077,7 @@ mod composite_aware_tests {
             &claims,
             "ML-DSA-65-Ed25519",
             "at+jwt",
-            &pair.kid,
+            pair.kid(),
         );
         let verified = decode_local_multi_key(
             &token,
@@ -1198,7 +1181,7 @@ mod composite_aware_tests {
             &claims,
             "ML-DSA-65-Ed25519",
             "at+jwt",
-            &pair.kid,
+            pair.kid(),
         );
         let verified = decode_local_multi_key(
             &token,

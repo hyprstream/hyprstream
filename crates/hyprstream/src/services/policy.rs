@@ -136,35 +136,30 @@ impl PolicyService {
         is_service: bool,
     ) -> Result<String> {
         let policy = hyprstream_rpc::envelope::envelope_policy_from_env();
-        let ml_dsa_key = if let Some(ref store) = self.ml_dsa_key_store {
-            store.active_key().await
-        } else {
-            None
-        };
-        match (policy.uses_pq(), ml_dsa_key) {
-            (true, Some(ref ml_key)) => Ok(if is_service {
+        if policy.uses_pq() {
+            let snapshot = hyprstream_rpc::auth::global_composite_key_set().snapshot();
+            let signing = snapshot
+                .active_signing_pair(hyprstream_rpc::auth::CompositePairRole::Policy)
+                .and_then(hyprstream_rpc::auth::CompositeKeyPair::signing_keys);
+            let Some((ml_key, ed_key)) = signing else {
+                warn!("no authorized active Policy composite pair; refusing to mint");
+                return Err(anyhow!("hybrid token signing pair not provisioned"));
+            };
+            Ok(if is_service {
                 crate::auth::jwt::encode_composite_service_jwt(
-                    claims, ml_key, &self.jwt_signing_key,
+                    claims, &ml_key, &ed_key,
                 )
             } else {
                 crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
-                    claims, ml_key, &self.jwt_signing_key,
+                    claims, &ml_key, &ed_key,
                 )
-            }),
-            (true, None) => {
-                warn!(
-                    "Hybrid crypto policy requires an ML-DSA-65 token-signing key, \
-                     none provisioned — refusing to mint a classical-only token (fail-closed)"
-                );
-                Err(anyhow!(
-                    "hybrid token signing key not provisioned (fail-closed under Hybrid policy)"
-                ))
-            }
-            (false, _) => Ok(if is_service {
+            })
+        } else {
+            Ok(if is_service {
                 crate::auth::jwt::encode_service_jwt(claims, &self.jwt_signing_key)
             } else {
                 crate::auth::jwt::encode(claims, &self.jwt_signing_key)
-            }),
+            })
         }
     }
 

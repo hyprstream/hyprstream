@@ -202,15 +202,7 @@ pub fn composite_kid(
     ml_dsa_vk: &hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,
     ed25519_vk: &ed25519_dalek::VerifyingKey,
 ) -> String {
-    let ml_dsa_vk_bytes = hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(ml_dsa_vk);
-    let ed25519_vk_bytes = ed25519_vk.to_bytes();
-    let mut composite_pub = Vec::with_capacity(ml_dsa_vk_bytes.len() + 32);
-    composite_pub.extend_from_slice(&ml_dsa_vk_bytes);
-    composite_pub.extend_from_slice(&ed25519_vk_bytes);
-    hyprstream_rpc::auth::jwk_thumbprint(&hyprstream_rpc::auth::JwkThumbprintInput::Akp {
-        alg: "ML-DSA-65-Ed25519",
-        pub_bytes: &composite_pub,
-    })
+    hyprstream_rpc::auth::composite_kid(ml_dsa_vk, ed25519_vk)
 }
 
 /// Build a JWK for a composite ML-DSA-65-Ed25519 key (`kty: "AKP"`).

@@ -69,10 +69,7 @@ fn alg_covers_pq(alg: &str) -> bool {
 /// Hybrid [`CryptoPolicy`] a classical-only (`EdDSA`) JWT is rejected
 /// **independent of JWKS alg-list hygiene**. Under Classical any single alg is
 /// passed through to the per-alg decoders (existing behavior).
-fn jwt_alg_satisfies_policy(
-    policy: crate::crypto::CryptoPolicy,
-    alg: &str,
-) -> anyhow::Result<()> {
+fn jwt_alg_satisfies_policy(policy: crate::crypto::CryptoPolicy, alg: &str) -> anyhow::Result<()> {
     if policy.uses_pq() && !alg_covers_pq(alg) {
         anyhow::bail!(
             "Hybrid crypto policy requires a post-quantum JWT alg; \
@@ -678,9 +675,15 @@ pub trait RequestService: 'static {
             anyhow::bail!("empty JWT issuer is only accepted from in-process callers");
         }
 
-        // Extract kid from JOSE header for key selection
-        let kid = crate::auth::header_kid(&token)
+        // Parse the protected JOSE header once with duplicate detection. All
+        // dispatch and primitive verification below consumes this exact value.
+        let protected = crate::auth::parse_protected_header(&token)
             .map_err(|e| anyhow::anyhow!("JWT header parse failed: {}", e))?;
+        anyhow::ensure!(
+            protected.typ == "at+jwt" || protected.typ == "wit+jwt",
+            "unsupported JWT typ"
+        );
+        let kid = Some(protected.kid.clone());
 
         // Check if issuer is trusted
         if !key_source.is_trusted(&unverified.iss) {
@@ -691,10 +694,7 @@ pub trait RequestService: 'static {
             anyhow::bail!("JWT issuer not trusted: {}", unverified.iss);
         }
 
-        // Extract algorithm for routing
-        let alg = crate::auth::header_alg(&token)
-            .map_err(|e| anyhow::anyhow!("JWT header parse failed: {}", e))?
-            .unwrap_or_default();
+        let alg = protected.alg.clone();
 
         // ── Stripping defense (composite signature hardening) ───────────────
         //
@@ -781,45 +781,28 @@ pub trait RequestService: 'static {
                 }
             }
             "ML-DSA-65-Ed25519" => {
-                let vks = key_source.ml_dsa_verifying_keys();
-                if vks.is_empty() {
-                    anyhow::bail!("Composite JWT received but no PQ verifying keys available");
+                if !unverified.iss.is_empty()
+                    && !key_source.local_issuers().iter().any(|issuer| issuer == &unverified.iss)
+                {
+                    anyhow::bail!("local composite JWT issuer mismatch");
                 }
-                let verifying_key = key_source
-                    .get_key(&unverified.iss, kid.as_deref())
-                    .await
-                    .map_err(|e| {
-                        tracing::warn!(
-                            "JWT key resolution failed for iss={}: {}",
-                            unverified.iss,
-                            e
-                        );
-                        anyhow::anyhow!("JWT key resolution failed")
-                    })?;
-                let aud = self.expected_audience();
-                let mut last_err = None;
-                let mut result = None;
-                for vk in &vks {
-                    match crate::auth::jwt::decode_composite(&token, vk, &verifying_key, aud) {
-                        Ok(claims) => {
-                            result = Some(claims);
-                            break;
-                        }
-                        Err(e) => {
-                            last_err = Some(e);
-                        }
-                    }
-                }
-                match result {
-                    Some(claims) => claims,
-                    None => {
-                        tracing::warn!("Composite ML-DSA-65-Ed25519 JWT verification failed (tried {} keys): {:?}", vks.len(), last_err);
-                        anyhow::bail!("JWT verification failed");
-                    }
-                }
+                let snapshot = key_source.composite_key_set().snapshot();
+                let pair = snapshot
+                    .pair(&protected.kid)
+                    .ok_or_else(|| anyhow::anyhow!("unknown composite JWT kid"))?;
+                crate::auth::jwt::decode_composite_with_header(
+                    &token,
+                    pair.ml_dsa(),
+                    pair.ed25519(),
+                    self.expected_audience(),
+                    &protected,
+                )
+                .map_err(|error| {
+                    tracing::warn!("composite JWT verification failed: {error}");
+                    anyhow::anyhow!("JWT verification failed")
+                })?
             }
-            _ => {
-                // EdDSA (default path)
+            "EdDSA" => {
                 let verifying_key = key_source
                     .get_key(&unverified.iss, kid.as_deref())
                     .await
@@ -837,6 +820,7 @@ pub trait RequestService: 'static {
                         anyhow::anyhow!("JWT verification failed")
                     })?
             }
+            _ => anyhow::bail!("unsupported JWT algorithm"),
         };
 
         // Check jti against blocklist (revoked access tokens)
@@ -1070,7 +1054,8 @@ mod empty_iss_gate_tests {
     use super::*;
     use crate::auth::{Claims, ClusterKeySource};
     use crate::transport::TransportConfig;
-    use ed25519_dalek::SigningKey;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use ed25519_dalek::{Signer as _, SigningKey};
 
     /// Minimal mock service exposing a `ClusterKeySource` for JWT verification.
     /// `require_cnf_binding` is disabled so the empty-`iss` gate is exercised in
@@ -1079,6 +1064,7 @@ mod empty_iss_gate_tests {
         signing_key: SigningKey,
         transport: TransportConfig,
         key_source: std::sync::Arc<dyn crate::auth::JwtKeySource>,
+        policy: crate::crypto::CryptoPolicy,
     }
 
     #[async_trait(?Send)]
@@ -1112,7 +1098,7 @@ mod empty_iss_gate_tests {
         // classical EdDSA tokens; pin the JWT policy to Classical so they are
         // isolated from sibling tests that install a Hybrid global config.
         fn jwt_verify_policy(&self) -> crate::crypto::CryptoPolicy {
-            crate::crypto::CryptoPolicy::Classical
+            self.policy
         }
     }
 
@@ -1143,6 +1129,7 @@ mod empty_iss_gate_tests {
             signing_key: SigningKey::from_bytes(&[8u8; 32]),
             transport: TransportConfig::inproc("mock"),
             key_source,
+            policy: crate::crypto::CryptoPolicy::Classical,
         };
         (svc, ca)
     }
@@ -1186,6 +1173,178 @@ mod empty_iss_gate_tests {
         );
         // And the local bare-sub subject is resolved.
         assert_eq!(ctx.subject().name(), Some("alice"));
+    }
+
+    fn composite_token(
+        header: &str,
+        claims: &Claims,
+        pq: &crate::crypto::pq::MlDsaSigningKey,
+        ed: &SigningKey,
+        half: bool,
+    ) -> String {
+        let header = URL_SAFE_NO_PAD.encode(header);
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
+        let input = format!("{header}.{payload}");
+        let mut signature = crate::crypto::pq::ml_dsa_sign(pq, input.as_bytes());
+        if !half {
+            signature.extend_from_slice(&ed.sign(input.as_bytes()).to_bytes());
+        }
+        format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature))
+    }
+
+    #[tokio::test]
+    async fn request_service_enforces_exact_pair_and_closed_header() {
+        let ca = SigningKey::from_bytes(&[41; 32]);
+        let ed_a = SigningKey::from_bytes(&[42; 32]);
+        let ed_b = SigningKey::from_bytes(&[43; 32]);
+        let (pq_a, pq_a_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let (_pq_b, pq_b_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let kid_a = crate::auth::jwk_thumbprint(&crate::auth::JwkThumbprintInput::Akp {
+            alg: "ML-DSA-65-Ed25519",
+            pub_bytes: &[
+                crate::crypto::pq::ml_dsa_vk_bytes(&pq_a_vk),
+                ed_a.verifying_key().to_bytes().to_vec(),
+            ]
+            .concat(),
+        });
+        let kid_b = crate::auth::jwk_thumbprint(&crate::auth::JwkThumbprintInput::Akp {
+            alg: "ML-DSA-65-Ed25519",
+            pub_bytes: &[
+                crate::crypto::pq::ml_dsa_vk_bytes(&pq_b_vk),
+                ed_b.verifying_key().to_bytes().to_vec(),
+            ]
+            .concat(),
+        });
+        let key_set = std::sync::Arc::new(crate::auth::CompositeKeySet::default());
+        key_set
+            .publish(
+                1,
+                vec![
+                    crate::auth::CompositeKeyPair::verifying(
+                        kid_a.clone(),
+                        pq_a_vk,
+                        ed_a.verifying_key(),
+                        crate::auth::CompositePairRole::OAuth,
+                        crate::auth::CompositePairState::Active,
+                        0,
+                        i64::MAX,
+                    ),
+                    crate::auth::CompositeKeyPair::verifying(
+                        kid_b,
+                        pq_b_vk,
+                        ed_b.verifying_key(),
+                        crate::auth::CompositePairRole::OAuth,
+                        crate::auth::CompositePairState::Drain,
+                        0,
+                        i64::MAX,
+                    ),
+                ],
+            )
+            .unwrap();
+        let key_source = std::sync::Arc::new(
+            ClusterKeySource::new(ca.verifying_key(), "https://local".to_owned())
+                .with_composite_key_set(key_set),
+        );
+        let svc = MockService {
+            signing_key: ca,
+            transport: TransportConfig::inproc("mock"),
+            key_source,
+            policy: crate::crypto::CryptoPolicy::Hybrid,
+        };
+        let now = chrono::Utc::now().timestamp();
+        let claims =
+            Claims::new("alice".to_owned(), now, now + 60).with_issuer("https://local".to_owned());
+        let valid_header =
+            format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"at+jwt","kid":"{kid_a}"}}"#);
+        let valid = composite_token(&valid_header, &claims, &pq_a, &ed_a, false);
+        assert!(svc
+            .verify_claims(&mut ctx_with_token(valid, false))
+            .await
+            .is_ok());
+
+        let mutations = [
+            (
+                r#"{"alg":"ML-DSA-65-Ed25519","typ":"at+jwt"}"#.to_owned(),
+                false,
+            ),
+            (
+                r#"{"alg":"ML-DSA-65-Ed25519","typ":"at+jwt","kid":"unknown"}"#.to_owned(),
+                false,
+            ),
+            (
+                format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"JWT","kid":"{kid_a}"}}"#),
+                false,
+            ),
+            (
+                format!(r#"{{"alg":"EdDSA","typ":"at+jwt","kid":"{kid_a}"}}"#),
+                false,
+            ),
+            (
+                format!(
+                    r#"{{"alg":"EdDSA","alg":"ML-DSA-65-Ed25519","typ":"at+jwt","kid":"{kid_a}"}}"#
+                ),
+                false,
+            ),
+            (
+                format!(
+                    r#"{{"alg":"ML-DSA-65-Ed25519","alg":"EdDSA","typ":"at+jwt","kid":"{kid_a}"}}"#
+                ),
+                false,
+            ),
+            (
+                format!(
+                    r#"{{"alg":"ML-DSA-65-Ed25519","typ":"JWT","typ":"at+jwt","kid":"{kid_a}"}}"#
+                ),
+                false,
+            ),
+            (
+                format!(
+                    r#"{{"alg":"ML-DSA-65-Ed25519","typ":"at+jwt","typ":"JWT","kid":"{kid_a}"}}"#
+                ),
+                false,
+            ),
+            (
+                format!(
+                    r#"{{"alg":"ML-DSA-65-Ed25519","typ":"at+jwt","kid":"other","kid":"{kid_a}"}}"#
+                ),
+                false,
+            ),
+            (
+                format!(
+                    r#"{{"alg":"ML-DSA-65-Ed25519","typ":"at+jwt","kid":"{kid_a}","kid":"other"}}"#
+                ),
+                false,
+            ),
+            (
+                format!(
+                    r#"{{"alg":"ML-DSA-65-Ed25519","typ":"at+jwt","kid":"{kid_a}","crit":["exp"]}}"#
+                ),
+                false,
+            ),
+            (valid_header.clone(), true),
+        ];
+        for (header, half) in mutations {
+            let token = composite_token(&header, &claims, &pq_a, &ed_a, half);
+            assert!(
+                svc.verify_claims(&mut ctx_with_token(token, false))
+                    .await
+                    .is_err(),
+                "accepted {header}"
+            );
+        }
+
+        let cross = composite_token(&valid_header, &claims, &pq_a, &ed_b, false);
+        assert!(svc
+            .verify_claims(&mut ctx_with_token(cross, false))
+            .await
+            .is_err());
+
+        let missing_issuer = Claims::new("alice".to_owned(), now, now + 60);
+        let token = composite_token(&valid_header, &missing_issuer, &pq_a, &ed_a, false);
+        assert!(svc.verify_claims(&mut ctx_with_token(token, false)).await.is_err());
+        let wrong_issuer = claims.clone().with_issuer("https://other".to_owned());
+        let token = composite_token(&valid_header, &wrong_issuer, &pq_a, &ed_a, false);
+        assert!(svc.verify_claims(&mut ctx_with_token(token, false)).await.is_err());
     }
 
     #[test]

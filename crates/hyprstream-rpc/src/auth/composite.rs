@@ -1,0 +1,364 @@
+//! Atomic exact-pair authority for composite JWT signing and verification.
+
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::RwLock;
+
+use ed25519_dalek::{SigningKey, VerifyingKey};
+
+use crate::crypto::pq::{MlDsaSigningKey, MlDsaVerifyingKey};
+
+/// The local issuer path that is authorized to mint with an exact pair.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum CompositePairRole {
+    OAuth,
+    Policy,
+}
+
+/// Lifecycle state of an exact pair.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompositePairState {
+    Active,
+    Drain,
+}
+
+/// One exact ML-DSA-65 + Ed25519 pair in the authoritative ledger.
+#[derive(Clone)]
+pub struct CompositeKeyPair {
+    kid: String,
+    ml_dsa: MlDsaVerifyingKey,
+    ed25519: VerifyingKey,
+    role: CompositePairRole,
+    state: CompositePairState,
+    not_before: i64,
+    expires_at: i64,
+    ml_dsa_signing: Option<Arc<MlDsaSigningKey>>,
+    ed25519_signing: Option<Arc<SigningKey>>,
+}
+
+impl CompositeKeyPair {
+    #[allow(clippy::too_many_arguments)]
+    pub fn signing(
+        kid: String,
+        ml_dsa: Arc<MlDsaSigningKey>,
+        ed25519: Arc<SigningKey>,
+        role: CompositePairRole,
+        state: CompositePairState,
+        not_before: i64,
+        expires_at: i64,
+    ) -> Self {
+        let ml_dsa_vk = ml_dsa::Keypair::verifying_key(&*ml_dsa).clone();
+        let ed25519_vk = ed25519.verifying_key();
+        Self {
+            kid,
+            ml_dsa: ml_dsa_vk,
+            ed25519: ed25519_vk,
+            role,
+            state,
+            not_before,
+            expires_at,
+            ml_dsa_signing: Some(ml_dsa),
+            ed25519_signing: Some(ed25519),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn verifying(
+        kid: String,
+        ml_dsa: MlDsaVerifyingKey,
+        ed25519: VerifyingKey,
+        role: CompositePairRole,
+        state: CompositePairState,
+        not_before: i64,
+        expires_at: i64,
+    ) -> Self {
+        Self {
+            kid,
+            ml_dsa,
+            ed25519,
+            role,
+            state,
+            not_before,
+            expires_at,
+            ml_dsa_signing: None,
+            ed25519_signing: None,
+        }
+    }
+
+    pub fn kid(&self) -> &str {
+        &self.kid
+    }
+    pub fn ml_dsa(&self) -> &MlDsaVerifyingKey {
+        &self.ml_dsa
+    }
+    pub fn ed25519(&self) -> &VerifyingKey {
+        &self.ed25519
+    }
+    pub fn role(&self) -> CompositePairRole {
+        self.role
+    }
+    pub fn state(&self) -> CompositePairState {
+        self.state
+    }
+    pub fn not_before(&self) -> i64 {
+        self.not_before
+    }
+    pub fn expires_at(&self) -> i64 {
+        self.expires_at
+    }
+
+    pub fn signing_keys(&self) -> Option<(Arc<MlDsaSigningKey>, Arc<SigningKey>)> {
+        Some((
+            self.ml_dsa_signing.as_ref()?.clone(),
+            self.ed25519_signing.as_ref()?.clone(),
+        ))
+    }
+}
+
+/// One immutable view of the exact-pair ledger.
+#[derive(Clone)]
+pub struct CompositeKeySetSnapshot {
+    version: u64,
+    pairs: Arc<[CompositeKeyPair]>,
+}
+
+impl CompositeKeySetSnapshot {
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+    pub fn pairs(&self) -> &[CompositeKeyPair] {
+        &self.pairs
+    }
+
+    pub fn pair(&self, kid: &str) -> Option<&CompositeKeyPair> {
+        self.pairs.iter().find(|pair| pair.kid == kid)
+    }
+
+    pub fn active_signing_pair(&self, role: CompositePairRole) -> Option<&CompositeKeyPair> {
+        self.pairs.iter().find(|pair| {
+            pair.role == role
+                && pair.state == CompositePairState::Active
+                && pair.ml_dsa_signing.is_some()
+                && pair.ed25519_signing.is_some()
+        })
+    }
+}
+
+/// Process-shared atomic publication point for exact composite pairs.
+pub struct CompositeKeySet {
+    snapshot: RwLock<Arc<CompositeKeySetSnapshot>>,
+}
+
+impl Default for CompositeKeySet {
+    fn default() -> Self {
+        Self {
+            snapshot: RwLock::new(Arc::new(CompositeKeySetSnapshot {
+                version: 0,
+                pairs: Arc::from([]),
+            })),
+        }
+    }
+}
+
+impl CompositeKeySet {
+    pub fn snapshot(&self) -> Arc<CompositeKeySetSnapshot> {
+        self.snapshot
+            .read()
+            .clone()
+    }
+
+    /// Atomically replace the complete ledger. Versions must increase.
+    pub fn publish(&self, version: u64, pairs: Vec<CompositeKeyPair>) -> anyhow::Result<()> {
+        let mut guard = self
+            .snapshot
+            .write();
+        anyhow::ensure!(
+            version > guard.version,
+            "composite key-set version must increase"
+        );
+        let mut kids = std::collections::HashSet::new();
+        let mut active_roles = std::collections::HashSet::new();
+        for pair in &pairs {
+            anyhow::ensure!(kids.insert(pair.kid.clone()), "duplicate composite kid");
+            if pair.state == CompositePairState::Active {
+                anyhow::ensure!(
+                    active_roles.insert(pair.role),
+                    "multiple active composite pairs for one issuer role"
+                );
+            }
+            anyhow::ensure!(
+                pair.kid == super::jwt::composite_kid(&pair.ml_dsa, &pair.ed25519),
+                "composite kid does not bind its exact key pair"
+            );
+        }
+        *guard = Arc::new(CompositeKeySetSnapshot {
+            version,
+            pairs: pairs.into(),
+        });
+        Ok(())
+    }
+}
+
+static GLOBAL_COMPOSITE_KEY_SET: OnceLock<Arc<CompositeKeySet>> = OnceLock::new();
+
+pub fn global_composite_key_set() -> Arc<CompositeKeySet> {
+    GLOBAL_COMPOSITE_KEY_SET
+        .get_or_init(|| Arc::new(CompositeKeySet::default()))
+        .clone()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use ed25519_dalek::Signer as _;
+    use std::sync::Barrier;
+
+    fn pair_from_keys(
+        pq: Arc<MlDsaSigningKey>,
+        ed: Arc<SigningKey>,
+        state: CompositePairState,
+    ) -> CompositeKeyPair {
+        let kid = crate::auth::composite_kid(
+            &ml_dsa::Keypair::verifying_key(&*pq),
+            &ed.verifying_key(),
+        );
+        CompositeKeyPair::signing(
+            kid,
+            pq,
+            ed,
+            CompositePairRole::OAuth,
+            state,
+            0,
+            i64::MAX,
+        )
+    }
+
+    fn pair(seed: u8) -> CompositeKeyPair {
+        let ed = Arc::new(SigningKey::from_bytes(&[seed; 32]));
+        let (pq, _) = crate::crypto::pq::ml_dsa_generate_keypair();
+        pair_from_keys(Arc::new(pq), ed, CompositePairState::Active)
+    }
+
+    fn mint(pair: &CompositeKeyPair) -> String {
+        let (pq, ed) = pair.signing_keys().unwrap();
+        let header = format!(
+            r#"{{"alg":"ML-DSA-65-Ed25519","typ":"at+jwt","kid":"{}"}}"#,
+            pair.kid()
+        );
+        let now = chrono::Utc::now().timestamp();
+        let claims = crate::auth::Claims::new("subject".to_owned(), now, now + 3600)
+            .with_audience(Some("resource".to_owned()));
+        let input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(header),
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        );
+        let pq_signature = crate::crypto::pq::ml_dsa_sign(&pq, input.as_bytes());
+        let ed_signature = ed.sign(input.as_bytes());
+        let mut signature = pq_signature;
+        signature.extend_from_slice(&ed_signature.to_bytes());
+        format!("{}.{}", input, URL_SAFE_NO_PAD.encode(signature))
+    }
+
+    fn verify(token: &str, snapshot: &CompositeKeySetSnapshot) -> bool {
+        let Ok(header) = crate::auth::parse_protected_header(token) else {
+            return false;
+        };
+        let Some(pair) = snapshot.pair(&header.kid) else {
+            return false;
+        };
+        crate::auth::jwt::decode_composite_with_header(
+            token,
+            pair.ml_dsa(),
+            pair.ed25519(),
+            Some("resource"),
+            &header,
+        )
+        .is_ok()
+    }
+
+    #[test]
+    fn publication_is_atomic_across_mint_verify_and_jwks_barriers() {
+        let keys = Arc::new(CompositeKeySet::default());
+        let old = pair(1);
+        let old_kid = old.kid().to_owned();
+        keys.publish(1, vec![old.clone()]).unwrap();
+        let ed_promotion = Arc::new(Barrier::new(2));
+        let pq_promotion = Arc::new(Barrier::new(2));
+        let mint_barrier = Arc::new(Barrier::new(2));
+        let publication_barrier = Arc::new(Barrier::new(2));
+        let verify_barrier = Arc::new(Barrier::new(2));
+        let jwks_barrier = Arc::new(Barrier::new(2));
+
+        let reader_keys = Arc::clone(&keys);
+        let reader_ed = Arc::clone(&ed_promotion);
+        let reader_pq = Arc::clone(&pq_promotion);
+        let reader_mint = Arc::clone(&mint_barrier);
+        let reader_publication = Arc::clone(&publication_barrier);
+        let reader_verify = Arc::clone(&verify_barrier);
+        let reader_jwks = Arc::clone(&jwks_barrier);
+        let reader_old_kid = old_kid.clone();
+        let reader = std::thread::spawn(move || {
+            reader_ed.wait();
+            reader_pq.wait();
+            let mint_snapshot = reader_keys.snapshot();
+            let token = mint(
+                mint_snapshot
+                    .active_signing_pair(CompositePairRole::OAuth)
+                    .unwrap(),
+            );
+            reader_mint.wait();
+            reader_publication.wait();
+            let verify_snapshot = reader_keys.snapshot();
+            let verify_version = verify_snapshot.version();
+            let token_verified = verify(&token, &verify_snapshot);
+            reader_verify.wait();
+            let jwks_snapshot = reader_keys.snapshot();
+            let jwks_has_old = jwks_snapshot.pair(&reader_old_kid).is_some();
+            let jwks_len = jwks_snapshot.pairs().len();
+            reader_jwks.wait();
+            (token, verify_version, token_verified, jwks_has_old, jwks_len)
+        });
+
+        let promoted_ed = Arc::new(SigningKey::from_bytes(&[2; 32]));
+        ed_promotion.wait();
+        let (promoted_pq, _) = crate::crypto::pq::ml_dsa_generate_keypair();
+        pq_promotion.wait();
+        let promoted = pair_from_keys(
+            Arc::new(promoted_pq),
+            promoted_ed,
+            CompositePairState::Active,
+        );
+        let promoted_kid = promoted.kid().to_owned();
+        mint_barrier.wait();
+        let mut old_drain = old;
+        old_drain.state = CompositePairState::Drain;
+        keys.publish(2, vec![old_drain, promoted.clone()]).unwrap();
+        publication_barrier.wait();
+        verify_barrier.wait();
+        jwks_barrier.wait();
+        let (old_token, verify_version, token_verified, jwks_has_old, jwks_len) =
+            reader.join().unwrap();
+        assert_eq!(verify_version, 2);
+        assert!(token_verified, "a returned token became unverifiable");
+        assert!(jwks_has_old);
+        assert_eq!(jwks_len, 2);
+
+        // Drain expiry/revocation is a later atomic publication: the old pair
+        // disappears completely, while the new exact pair remains usable.
+        keys.publish(3, vec![promoted]).unwrap();
+        let after = keys.snapshot();
+        assert_eq!(after.version(), 3);
+        assert!(after.pair(&promoted_kid).is_some());
+        assert!(after.pair(&old_kid).is_none(), "evicted pair remained accepted");
+        assert!(!verify(&old_token, &after));
+        let new_token = mint(
+            after
+                .active_signing_pair(CompositePairRole::OAuth)
+                .unwrap(),
+        );
+        assert!(verify(&new_token, &after));
+    }
+}
