@@ -80,8 +80,16 @@ pub trait Transport: Send + Sync {
     /// envelope confidentiality unless it explicitly opts out — so a new or
     /// out-of-tree `Transport` cannot silently inherit cleartext permission
     /// (epic #550 principle 1: no silent downgrade). Only same-process and
-    /// same-host IPC transports override this to `false`; loopback QUIC does so
-    /// via [`crate::transport::lazy_quinn`]'s address-aware override.
+    /// same-host IPC transports (`InMemoryTransport`, `LazyUdsTransport`)
+    /// override this to `false`. Every QUIC carrier
+    /// (`QuinnTransport`, `LazyQuinnTransport`) and iroh carrier forbids
+    /// cleartext unconditionally — a loopback address earns NO exemption, since
+    /// it is not evidence the bytes stay inside the trust boundary (it can
+    /// terminate at a proxy/tunnel). This mirrors
+    /// [`EndpointType::forbids_cleartext_envelope`](crate::transport::EndpointType::forbids_cleartext_envelope),
+    /// the parallel config-time classification; the two are intentionally
+    /// layered (pre-dial classification vs runtime enforcement) rather than
+    /// delegated, so a runtime transport need not reconstruct an `EndpointType`.
     fn forbids_cleartext_envelope(&self) -> bool {
         true
     }
