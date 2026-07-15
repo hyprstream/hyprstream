@@ -24,6 +24,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use tokio::sync::Mutex;
 
 use hyprstream_rpc::capnp::FromCapnp;
+use hyprstream_rpc::ToCapnp;
 use hyprstream_rpc::crypto::hybrid_kem::KeyedKemTrustStore;
 use hyprstream_rpc::envelope::{InMemoryNonceCache, KeyedPqTrustStore, SignedEnvelope};
 use hyprstream_rpc::node_identity::{derive_mesh_kem_recipient, derive_mesh_mldsa_key};
@@ -255,6 +256,111 @@ async fn hykem_encrypted_envelope_round_trip_over_iroh() -> Result<()> {
     // Second call on the same connection to exercise multiple bidi streams.
     let response2 = rpc.call(b"second".to_vec()).await?;
     assert_eq!(&response2[..], b"\xECsecond");
+
+    client.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// INV-2 receive-side (#1042) over a real iroh carrier: a validly hybrid-signed
+/// **cleartext** envelope, sent raw over the wire (bypassing the client's
+/// send-side guard), is rejected by the server before the echo handler runs.
+/// The reply is a signed error envelope naming the cleartext rejection, and it
+/// never carries the echo handler's `0xEC` prefix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cleartext_envelope_rejected_on_iroh_receive() -> Result<()> {
+    use hyprstream_rpc::envelope::{
+        current_timestamp, generate_nonce, Authorization, RequestEnvelope, ResponseEnvelope,
+    };
+
+    // ─── Server side ──────────────────────────────────────────────────────
+    let server_signing = fresh_signing_key();
+    let server_nonce_cache = Arc::new(InMemoryNonceCache::new());
+    let bridge = LocalServiceBridge::spawn(
+        EchoService::new(server_signing.clone()),
+        server_nonce_cache,
+        0,
+    )?;
+    let server = IrohSubstrate::new(
+        fresh_node_key(),
+        NoopHandler::new("moq-not-wired"),
+        IrohRpcProtocolHandler::new(bridge, server_signing.clone()),
+    )
+    .await?;
+    let server_addr = direct_addr(&server);
+
+    // ─── Client side: send a CLEARTEXT signed envelope raw ────────────────
+    let client_signing = fresh_signing_key();
+    let client = IrohSubstrate::new(
+        fresh_node_key(),
+        NoopHandler::new("client-moq"),
+        NoopHandler::new("client-rpc"),
+    )
+    .await?;
+    let conn = client.connect(server_addr, ALPN_HYPRSTREAM_RPC).await?;
+    let transport = IrohTransport::new(conn);
+
+    // Anchor the client's ML-DSA key so the envelope is a *validly* hybrid-signed
+    // cleartext one — the rejection must be about the carrier, not the signature.
+    let client_pq_sk = derive_mesh_mldsa_key(&client_signing);
+    let client_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
+        &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&client_pq_sk),
+    )?;
+    let mut request_pq_store = KeyedPqTrustStore::new();
+    request_pq_store.bind(client_signing.verifying_key().to_bytes(), &client_pq_vk);
+    let _ = hyprstream_rpc::envelope::install_verify_config(
+        hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+            policy: hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+            pq_store: Some(Arc::new(request_pq_store)),
+        },
+    );
+
+    let envelope = RequestEnvelope {
+        request_id: 99,
+        payload: b"ping-payload".to_vec(),
+        iat: current_timestamp(),
+        nonce: generate_nonce(),
+        authorization: Authorization::None,
+        delegation_token: None,
+        wth: None,
+        client_dh_public: None,
+    };
+    let signed = SignedEnvelope::new_signed_hybrid(envelope, &client_signing, &client_pq_sk);
+    let mut wire = Vec::new();
+    {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut builder =
+                message.init_root::<hyprstream_rpc::common_capnp::signed_envelope::Builder>();
+            signed.write_to(&mut builder);
+        }
+        capnp::serialize::write_message(&mut wire, &message)?;
+    }
+    assert!(!signed.is_encrypted(), "test must send a cleartext envelope");
+
+    // Raw send bypasses RpcClientImpl's send-side guard — this exercises the
+    // *receive* side directly, the scenario a hostile/downgrading peer creates.
+    let response_bytes = transport.send(wire, Some(8_000)).await?;
+
+    let reader = capnp::serialize::read_message(
+        &mut std::io::Cursor::new(&response_bytes),
+        capnp::message::ReaderOptions::new(),
+    )?;
+    let response = ResponseEnvelope::read_from(
+        reader.get_root::<hyprstream_rpc::common_capnp::response_envelope::Reader>()?,
+    )?;
+
+    assert_eq!(response.request_id, 0, "rejected before request processing (id=0)");
+    let text = String::from_utf8_lossy(&response.payload);
+    assert!(
+        text.contains("cleartext"),
+        "server must report the INV-2 cleartext rejection, got: {text}"
+    );
+    assert_ne!(
+        response.payload.first().copied(),
+        Some(0xEC),
+        "echo handler must not have run — no 0xEC prefix"
+    );
 
     client.shutdown().await?;
     server.shutdown().await?;

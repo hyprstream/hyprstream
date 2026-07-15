@@ -177,6 +177,8 @@ impl ProtocolHandler for IrohRpcProtocolHandler {
         // abstraction and delegate to the shared accept loop. Drain semantics
         // (`shutdown` below draining the same `Semaphore`) are unchanged.
         let session = web_transport_iroh::Session::raw(conn);
+        // INV-2 (#1042): this accept boundary terminates an iroh connection —
+        // an untrusted carrier regardless of direct/relay path or NodeId.
         serve_rpc_connection(
             session,
             Arc::clone(&self.inner.processor),
@@ -184,6 +186,7 @@ impl ProtocolHandler for IrohRpcProtocolHandler {
             Arc::clone(&self.inner.stream_limit),
             self.inner.read_timeout,
             self.inner.shutdown.clone(),
+            crate::transport::carrier::CarrierContext::iroh(),
         )
         .await
         .map_err(|e| AcceptError::from_err(std::io::Error::other(e.to_string())))
@@ -251,6 +254,9 @@ pub async fn client_request(conn: &Connection, request: &[u8]) -> Result<Bytes> 
 /// Per-request payload + response slot exchanged with the bridge thread.
 struct BridgeMessage {
     request: Bytes,
+    /// Accept-boundary carrier classification (INV-2 #1042), forwarded
+    /// verbatim to the dispatch pipeline's cleartext policy.
+    carrier: crate::transport::carrier::CarrierContext,
     respond: tokio::sync::oneshot::Sender<Result<Bytes>>,
 }
 
@@ -275,6 +281,7 @@ async fn run_bridge_dispatch_loop<S>(
                 crate::envelope::EnvelopeVerification::AnySigner,
                 &signing_key,
                 &nonce_cache,
+                msg.carrier,
             )
             .await
             .map(Bytes::from);
@@ -415,12 +422,14 @@ impl IrohRequestProcessor for LocalServiceBridge {
     fn process(
         &self,
         request: Bytes,
+        carrier: crate::transport::carrier::CarrierContext,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>> {
         let tx = self.tx.clone();
         Box::pin(async move {
             let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
             tx.send(BridgeMessage {
                 request,
+                carrier,
                 respond: respond_tx,
             })
             .await

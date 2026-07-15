@@ -191,6 +191,7 @@ mod tests {
                         tokio::spawn(async move {
                             let _ = serve_rpc_connection(
                                 session, p, sk, l, REQUEST_READ_TIMEOUT, sd,
+                                crate::transport::carrier::CarrierContext::explicit_trusted_local(),
                             )
                             .await;
                         });

@@ -398,6 +398,29 @@ pub fn generate_nonce() -> [u8; 16] {
     rand::rngs::OsRng.gen()
 }
 
+/// Bounded wire probe: does this serialized `SignedEnvelope` carry an
+/// encrypted (`#mesh-kem` COSE_Encrypt0) request envelope?
+///
+/// INV-2 receive-side pre-filter (#1042): untrusted carriers must reject a
+/// cleartext envelope **before** signature verification, claims evaluation,
+/// or handler dispatch. This decodes only the Cap'n Proto message root and
+/// reads the `encryptedEnvelope` field length — no signature, replay, or
+/// payload processing — so the rejection point does the minimum work needed
+/// to classify the envelope mode.
+///
+/// Returns `Err` on undecodable bytes; on an untrusted carrier the caller
+/// must treat that exactly like cleartext (reject). Presence is defined as a
+/// non-empty field, matching [`SignedEnvelope::read_from`]'s decoding of the
+/// optional field.
+pub fn wire_signed_envelope_is_encrypted(bytes: &[u8]) -> anyhow::Result<bool> {
+    let reader = capnp::serialize::read_message(
+        &mut std::io::Cursor::new(bytes),
+        capnp::message::ReaderOptions::new(),
+    )?;
+    let sr = reader.get_root::<crate::common_capnp::signed_envelope::Reader>()?;
+    Ok(!sr.get_encrypted_envelope()?.is_empty())
+}
+
 /// Authorization subject for Casbin policy checks and resource isolation.
 ///
 /// A simple newtype over `Option<String>`:

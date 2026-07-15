@@ -684,6 +684,7 @@ mod tests {
             limit,
             REQUEST_READ_TIMEOUT,
             shutdown.clone(),
+            crate::transport::carrier::CarrierContext::explicit_trusted_local(),
         ));
 
         // Two sequential calls prove the session multiplexes fresh bidi streams.

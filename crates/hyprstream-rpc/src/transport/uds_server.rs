@@ -229,8 +229,12 @@ impl UdsRpcServer {
 
                         match plane {
                             PLANE_RPC => {
+                                // INV-2 (#1042): this accept boundary terminates a
+                                // same-host UDS connection (incl. systemd socket
+                                // activation) — the explicitly trusted local class.
                                 if let Err(e) = serve_rpc_connection(
                                     session, processor, signing_key, stream_limit, read_timeout, shutdown,
+                                    crate::transport::carrier::CarrierContext::trusted_uds(),
                                 )
                                 .await
                                 {

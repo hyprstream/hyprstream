@@ -538,6 +538,9 @@ impl QuinnRpcServer {
                             return;
                         }
 
+                        // INV-2 (#1042): this accept boundary terminates a
+                        // WebTransport-over-QUIC session — an untrusted
+                        // carrier even on a loopback address.
                         if let Err(e) = serve_rpc_connection(
                             session,
                             processor,
@@ -545,6 +548,7 @@ impl QuinnRpcServer {
                             stream_limit,
                             read_timeout,
                             shutdown,
+                            crate::transport::carrier::CarrierContext::web_transport(),
                         )
                         .await
                         {

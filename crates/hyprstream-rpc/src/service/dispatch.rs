@@ -59,6 +59,7 @@ pub async fn process_request<S>(
     verification: EnvelopeVerification<'_>,
     signing_key: &ed25519_dalek::SigningKey,
     nonce_cache: &crate::envelope::InMemoryNonceCache,
+    carrier: crate::transport::carrier::CarrierContext,
 ) -> Result<Vec<u8>>
 where
     S: crate::service::RequestService,
@@ -88,6 +89,36 @@ where
             response_policy,
         )
     };
+
+    // INV-2 receive-side policy (#1042), defense-in-depth behind the serve
+    // loop's own rejection: on a cleartext-forbidding carrier, refuse a
+    // cleartext (or undecodable) envelope BEFORE signature verification,
+    // claims evaluation, or handler dispatch. A valid signature does not make
+    // cleartext acceptable, and nothing in the request bytes can select the
+    // carrier class — `carrier` comes from the accept boundary.
+    if carrier.forbids_cleartext_envelope()
+        && !crate::envelope::wire_signed_envelope_is_encrypted(raw_bytes).unwrap_or(false)
+    {
+        warn!(
+            "{} rejecting cleartext request envelope on untrusted carrier '{}' (INV-2 #1042)",
+            service.name(),
+            carrier
+        );
+        let error_payload = service.build_error_payload(
+            0,
+            &format!(
+                "cleartext request envelope rejected: carrier '{carrier}' forbids \
+                 cleartext (INV-2); seal the request to the server's #mesh-kem recipient"
+            ),
+        );
+        let signed_response = sign_response(0, error_payload);
+        let mut message = Builder::new_default();
+        let mut builder = message.init_root::<crate::common_capnp::response_envelope::Builder>();
+        signed_response.write_to(&mut builder);
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        return Ok(bytes);
+    }
 
     let pq_store_holder = crate::envelope::global_pq_store();
     let base = match verification {

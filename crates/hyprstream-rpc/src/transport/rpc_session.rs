@@ -36,6 +36,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use web_transport_trait::{RecvStream, SendStream, Session};
 
+use crate::transport::carrier::CarrierContext;
 use crate::transport_traits::{PublishSink, Transport};
 
 /// Hard cap on per-frame size (request or response) for the RPC control plane.
@@ -159,16 +160,31 @@ impl Default for RpcConfig {
 /// a multi-threaded tokio runtime. For services that are `!Send` (e.g. those
 /// holding `tch-rs` tensors), use [`super::iroh_rpc::LocalServiceBridge`].
 ///
+/// The `carrier` argument is the accept boundary's attestation of which
+/// carrier class the request arrived on (INV-2 receive side, #1042). It is a
+/// **required** parameter — a processor cannot be invoked without a carrier
+/// classification, so a forgotten context is a compile error, not a silent
+/// fail-open. Processors that verify envelopes (the [`dispatch`] pipeline)
+/// re-enforce the cleartext policy against it; the generic serve loop has
+/// already rejected cleartext on forbidding carriers before invoking the
+/// processor, so for most implementations it is defense-in-depth.
+///
+/// [`dispatch`]: crate::service::dispatch::process_request
+///
 /// (Name retained from the iroh-only era to avoid churn in callers.)
 pub trait IrohRequestProcessor: Send + Sync + 'static {
     fn process(
         &self,
         request: Bytes,
+        carrier: CarrierContext,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>>;
 }
 
 /// Convenience: build an [`IrohRequestProcessor`] from a `Send + Sync`
 /// async closure. Useful for tests.
+/// The closure is carrier-agnostic: the INV-2 cleartext rejection has already
+/// run in the serve loop before the processor is invoked, and test closures
+/// have no envelope policy of their own.
 pub fn from_fn<F, Fut>(f: F) -> impl IrohRequestProcessor
 where
     F: Fn(Bytes) -> Fut + Send + Sync + 'static,
@@ -183,6 +199,7 @@ where
         fn process(
             &self,
             request: Bytes,
+            _carrier: CarrierContext,
         ) -> std::pin::Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>> {
             Box::pin((self.0)(request))
         }
@@ -262,6 +279,12 @@ pub async fn read_to_cap<R: RecvStream>(recv: &mut R, cap: usize) -> Result<Byte
 /// shutdown, cancels `shutdown` then `acquire_many(capacity)`s every permit so
 /// detached `handle_stream` tasks finish before teardown. This fn only acquires
 /// one per-stream permit per accepted bidi stream.
+///
+/// `carrier` is the accept boundary's classification of this session's
+/// carrier (INV-2 receive side, #1042). On a carrier that forbids cleartext,
+/// every stream's request is probed for an encrypted envelope **before** the
+/// processor is invoked; a cleartext (or undecodable) request is answered
+/// with a signed error envelope and never reaches request processing.
 pub async fn serve_rpc_connection<S>(
     session: S,
     processor: Arc<dyn IrohRequestProcessor>,
@@ -269,6 +292,7 @@ pub async fn serve_rpc_connection<S>(
     stream_limit: Arc<Semaphore>,
     read_timeout: Duration,
     shutdown: CancellationToken,
+    carrier: CarrierContext,
 ) -> Result<()>
 where
     S: Session,
@@ -307,7 +331,8 @@ where
                 tokio::spawn(async move {
                     let _permit = permit; // released on task end
                     let _keepalive = session_keepalive;
-                    handle_stream::<S>(send, recv, processor, signing_key, read_timeout).await;
+                    handle_stream::<S>(send, recv, processor, signing_key, read_timeout, carrier)
+                        .await;
                 });
             }
         }
@@ -322,6 +347,7 @@ async fn handle_stream<S>(
     processor: Arc<dyn IrohRequestProcessor>,
     signing_key: SigningKey,
     read_timeout: Duration,
+    carrier: CarrierContext,
 ) where
     S: Session,
 {
@@ -344,13 +370,37 @@ async fn handle_stream<S>(
         }
     };
 
-    let response = match processor.process(request).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::warn!(error = ?e, "rpc-session: processor error, sending stub error envelope");
-            // No PQ key flows through the generic processor path; the error
-            // envelope is Classical (a Classical client verifies it via EdDSA).
-            build_error_envelope(&signing_key, None, &format!("processor error: {e}"))
+    // INV-2 receive-side chokepoint (#1042): on a cleartext-forbidding
+    // carrier, probe the envelope mode before ANY request processing. A
+    // cleartext envelope is rejected even if it is validly signed by an
+    // authorized signer; undecodable bytes are treated exactly like cleartext
+    // (fail-closed). Only the message root and the `encryptedEnvelope` field
+    // length are read here — no signature, claims, or payload work happens
+    // for a rejected request.
+    let response = if carrier.forbids_cleartext_envelope()
+        && !crate::envelope::wire_signed_envelope_is_encrypted(&request).unwrap_or(false)
+    {
+        tracing::warn!(
+            carrier = %carrier,
+            "rpc-session: rejecting cleartext request envelope on untrusted carrier (INV-2 #1042)"
+        );
+        build_error_envelope(
+            &signing_key,
+            None,
+            &format!(
+                "cleartext request envelope rejected: carrier '{carrier}' forbids \
+                 cleartext (INV-2); seal the request to the server's #mesh-kem recipient"
+            ),
+        )
+    } else {
+        match processor.process(request, carrier).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(error = ?e, "rpc-session: processor error, sending stub error envelope");
+                // No PQ key flows through the generic processor path; the error
+                // envelope is Classical (a Classical client verifies it via EdDSA).
+                build_error_envelope(&signing_key, None, &format!("processor error: {e}"))
+            }
         }
     };
 

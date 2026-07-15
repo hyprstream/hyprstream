@@ -83,7 +83,16 @@ impl Transport for InMemoryTransport {
             .map(|ms| Duration::from_millis(ms.max(0) as u64))
             .unwrap_or(DEFAULT_TIMEOUT);
         let processor = Arc::clone(&self.processor);
-        let fut = async move { processor.process(Bytes::from(payload)).await };
+        // INV-2 (#1042): the request never leaves this address space — the
+        // one carrier class that is inproc by construction.
+        let fut = async move {
+            processor
+                .process(
+                    Bytes::from(payload),
+                    crate::transport::carrier::CarrierContext::inproc(),
+                )
+                .await
+        };
         let resp = tokio::time::timeout(timeout, fut)
             .await
             .map_err(|_| anyhow!("in-process RPC timeout after {timeout:?}"))??;
