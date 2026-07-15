@@ -121,17 +121,7 @@ pub fn encode_composite_ml_dsa_65_ed25519(
         std::borrow::Cow::Owned(claims.clone().with_jti())
     };
     let vk = ml_dsa::Keypair::verifying_key(ml_dsa_key);
-    let ml_dsa_vk_bytes = hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&vk);
-    let ed25519_vk_bytes = ed25519_key.verifying_key().to_bytes();
-    let mut composite_pub = Vec::with_capacity(ml_dsa_vk_bytes.len() + 32);
-    composite_pub.extend_from_slice(&ml_dsa_vk_bytes);
-    composite_pub.extend_from_slice(&ed25519_vk_bytes);
-    let kid = hyprstream_rpc::auth::jwk_thumbprint(
-        &hyprstream_rpc::auth::JwkThumbprintInput::Akp {
-            alg: "ML-DSA-65-Ed25519",
-            pub_bytes: &composite_pub,
-        },
-    );
+    let kid = composite_kid(&vk, &ed25519_key.verifying_key());
     let header = format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"at+jwt","kid":"{}"}}"#, kid);
     let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
     let payload_json = serde_json::to_string(claims.as_ref()).unwrap_or_else(|_e| {
@@ -166,17 +156,7 @@ pub fn encode_composite_service_jwt(
         std::borrow::Cow::Owned(claims.clone().with_jti())
     };
     let vk = ml_dsa::Keypair::verifying_key(ml_dsa_key);
-    let ml_dsa_vk_bytes = hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&vk);
-    let ed25519_vk_bytes = ed25519_key.verifying_key().to_bytes();
-    let mut composite_pub = Vec::with_capacity(ml_dsa_vk_bytes.len() + 32);
-    composite_pub.extend_from_slice(&ml_dsa_vk_bytes);
-    composite_pub.extend_from_slice(&ed25519_vk_bytes);
-    let kid = hyprstream_rpc::auth::jwk_thumbprint(
-        &hyprstream_rpc::auth::JwkThumbprintInput::Akp {
-            alg: "ML-DSA-65-Ed25519",
-            pub_bytes: &composite_pub,
-        },
-    );
+    let kid = composite_kid(&vk, &ed25519_key.verifying_key());
     let header = format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"wit+jwt","kid":"{}"}}"#, kid);
     let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
     let payload_json = serde_json::to_string(claims.as_ref()).unwrap_or_else(|_e| {
@@ -217,22 +197,33 @@ pub fn ml_dsa_65_jwk(
     })
 }
 
-/// Build a JWK for a composite ML-DSA-65-Ed25519 key (`kty: "AKP"`).
-pub fn composite_jwk(
+/// Compute the RFC 7638 JWK thumbprint for one exact composite key pair.
+pub fn composite_kid(
     ml_dsa_vk: &hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,
     ed25519_vk: &ed25519_dalek::VerifyingKey,
-) -> serde_json::Value {
+) -> String {
     let ml_dsa_vk_bytes = hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(ml_dsa_vk);
     let ed25519_vk_bytes = ed25519_vk.to_bytes();
     let mut composite_pub = Vec::with_capacity(ml_dsa_vk_bytes.len() + 32);
     composite_pub.extend_from_slice(&ml_dsa_vk_bytes);
     composite_pub.extend_from_slice(&ed25519_vk_bytes);
-    let kid = hyprstream_rpc::auth::jwk_thumbprint(
-        &hyprstream_rpc::auth::JwkThumbprintInput::Akp {
-            alg: "ML-DSA-65-Ed25519",
-            pub_bytes: &composite_pub,
-        },
-    );
+    hyprstream_rpc::auth::jwk_thumbprint(&hyprstream_rpc::auth::JwkThumbprintInput::Akp {
+        alg: "ML-DSA-65-Ed25519",
+        pub_bytes: &composite_pub,
+    })
+}
+
+/// Build a JWK for a composite ML-DSA-65-Ed25519 key (`kty: "AKP"`).
+pub fn composite_jwk(
+    ml_dsa_vk: &hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,
+    ed25519_vk: &ed25519_dalek::VerifyingKey,
+) -> serde_json::Value {
+    let kid = composite_kid(ml_dsa_vk, ed25519_vk);
+    let ml_dsa_vk_bytes = hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(ml_dsa_vk);
+    let ed25519_vk_bytes = ed25519_vk.to_bytes();
+    let mut composite_pub = Vec::with_capacity(ml_dsa_vk_bytes.len() + 32);
+    composite_pub.extend_from_slice(&ml_dsa_vk_bytes);
+    composite_pub.extend_from_slice(&ed25519_vk_bytes);
     serde_json::json!({
         "kty": "AKP",
         "alg": "ML-DSA-65-Ed25519",

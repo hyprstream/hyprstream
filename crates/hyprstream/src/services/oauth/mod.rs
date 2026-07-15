@@ -512,6 +512,7 @@ impl Spawnable for OAuthService {
                 &self.config,
             );
             info!("ML-DSA-65 signing key rotation store loaded");
+            crate::auth::key_rotation::refresh_ml_dsa_verifying_keys(&ml_dsa_store).await;
             let crypto_policy = hyprstream_rpc::envelope::envelope_policy_from_env();
 
             // MAC #547 / B2 (#674): construct the S6 grant-path audit sink. A
@@ -584,6 +585,11 @@ impl Spawnable for OAuthService {
                     // accepts tokens signed by any active/lead/drain slot from startup —
                     // before the first rotation tick. Mirrors the /oauth/jwks key set.
                     crate::auth::key_rotation::refresh_ed25519_verifying_keys(&store_arc).await;
+                    crate::auth::key_rotation::initialize_composite_verifying_keys(
+                        &store_arc,
+                        &ml_dsa_store,
+                        &key.verifying_key(),
+                    ).await;
 
                     // Spawn the background rotation task (rotates all algorithm stores).
                     crate::auth::key_rotation::spawn_rotation_task(
@@ -593,6 +599,7 @@ impl Spawnable for OAuthService {
                         crate::auth::key_rotation::RotationStores {
                             es256: Some(Arc::clone(&es256_store)),
                             ml_dsa: Some(Arc::clone(&ml_dsa_store)),
+                            composite_ca_key: key.verifying_key(),
                         },
                     );
                     info!("JWT signing key rotation task started (active_days={}, lead_days={}, drain_days={})",

@@ -38,6 +38,27 @@ pub fn global_ml_dsa_verifying_keys() -> std::sync::Arc<std::sync::RwLock<Vec<hy
     }).clone()
 }
 
+/// One exact, locally-authorized composite JWT verifying-key pair.
+#[derive(Clone)]
+pub struct PublishedCompositeKey {
+    pub ml_dsa: hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,
+    pub ed25519: ed25519_dalek::VerifyingKey,
+    pub kid: String,
+}
+
+#[allow(clippy::disallowed_types)]
+pub type PublishedCompositeKeys = std::sync::Arc<std::sync::RwLock<Vec<PublishedCompositeKey>>>;
+
+static COMPOSITE_VERIFYING_KEYS: std::sync::OnceLock<PublishedCompositeKeys> = std::sync::OnceLock::new();
+
+/// Atomic snapshot of the exact composite pairs authorized for verification.
+#[allow(clippy::disallowed_types)]
+pub fn global_composite_verifying_keys() -> PublishedCompositeKeys {
+    COMPOSITE_VERIFYING_KEYS
+        .get_or_init(|| std::sync::Arc::new(std::sync::RwLock::new(Vec::new())))
+        .clone()
+}
+
 /// Live, shared handle to the node's published Ed25519 rotation-slot verifying
 /// keys (drain/active/lead). This is the SAME Ed25519 key set the `/oauth/jwks`
 /// endpoint publishes — the keys that sign rotation-issued at+JWTs (WIT, S6
@@ -83,6 +104,89 @@ pub async fn refresh_ed25519_verifying_keys(store: &SigningKeyStore) {
         .collect();
     let shared = global_ed25519_verifying_keys();
     let _ = shared.write().map(|mut guard| *guard = vks);
+}
+
+/// Refresh the published ML-DSA component-key snapshot.
+pub async fn refresh_ml_dsa_verifying_keys(store: &Arc<MlDsaSigningKeyStore>) {
+    let vks: Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey> = store
+        .all_slots_snapshot()
+        .await
+        .iter()
+        .map(ml_dsa_rotation::MlDsaKeySlot::verifying_key)
+        .collect();
+    let shared = global_ml_dsa_verifying_keys();
+    let _ = shared.write().map(|mut guard| *guard = vks);
+}
+
+fn same_ml_dsa_key(
+    left: &hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,
+    right: &hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,
+) -> bool {
+    hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(left)
+        == hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(right)
+}
+
+/// Initialize only the two active pairs that local issuance can mint.
+/// Drain associations are not reconstructed after restart; they fail closed.
+pub async fn initialize_composite_verifying_keys(
+    ed_store: &SigningKeyStore,
+    ml_dsa_store: &MlDsaSigningKeyStore,
+    ca_key: &ed25519_dalek::VerifyingKey,
+) {
+    let mut pairs = Vec::new();
+    if let Some(pq) = ml_dsa_store.active_key().await {
+        let pq_vk = ml_dsa::Keypair::verifying_key(&*pq).clone();
+        if let Some(ed) = ed_store.active_key().await {
+            push_composite_pair(&mut pairs, pq_vk.clone(), ed.verifying_key());
+        }
+        push_composite_pair(&mut pairs, pq_vk, *ca_key);
+    }
+    let shared = global_composite_verifying_keys();
+    let mut guard = shared.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = pairs;
+}
+
+/// Retain exact old pairs while both halves remain published, then add only
+/// the active OAuth pair and active PolicyService/CA pair.
+pub async fn refresh_composite_verifying_keys(
+    ed_store: &SigningKeyStore,
+    ml_dsa_store: &MlDsaSigningKeyStore,
+    ca_key: &ed25519_dalek::VerifyingKey,
+) {
+    let ed_slots = ed_store.all_slots_snapshot().await;
+    let pq_slots = ml_dsa_store.all_slots_snapshot().await;
+    let ed_published: Vec<_> = ed_slots.iter().map(|slot| slot.key.verifying_key()).collect();
+    let pq_published: Vec<_> = pq_slots.iter().map(MlDsaKeySlot::verifying_key).collect();
+    let shared = global_composite_verifying_keys();
+    let mut pairs = shared
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    pairs.retain(|pair| {
+        let ed_valid = pair.ed25519 == *ca_key || ed_published.contains(&pair.ed25519);
+        let pq_valid = pq_published.iter().any(|key| same_ml_dsa_key(key, &pair.ml_dsa));
+        ed_valid && pq_valid
+    });
+    if let Some(pq) = ml_dsa_store.active_key().await {
+        let pq_vk = ml_dsa::Keypair::verifying_key(&*pq).clone();
+        if let Some(ed) = ed_store.active_key().await {
+            push_composite_pair(&mut pairs, pq_vk.clone(), ed.verifying_key());
+        }
+        push_composite_pair(&mut pairs, pq_vk, *ca_key);
+    }
+    let mut guard = shared.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = pairs;
+}
+
+fn push_composite_pair(
+    pairs: &mut Vec<PublishedCompositeKey>,
+    ml_dsa: hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,
+    ed25519: ed25519_dalek::VerifyingKey,
+) {
+    let kid = crate::auth::jwt::composite_kid(&ml_dsa, &ed25519);
+    if !pairs.iter().any(|pair| pair.kid == kid) {
+        pairs.push(PublishedCompositeKey { ml_dsa, ed25519, kid });
+    }
 }
 
 /// Global ML-DSA signing key store singleton.
@@ -356,6 +460,7 @@ pub async fn rotate_jwt_keys(
 pub struct RotationStores {
     pub es256: Option<Arc<Es256SigningKeyStore>>,
     pub ml_dsa: Option<Arc<MlDsaSigningKeyStore>>,
+    pub composite_ca_key: ed25519_dalek::VerifyingKey,
 }
 
 pub fn spawn_rotation_task(
@@ -381,12 +486,8 @@ pub fn spawn_rotation_task(
             }
             if let Some(ref ml_dsa) = extra.ml_dsa {
                 rotate_ml_dsa_keys(&config, &secrets_dir, ml_dsa, now).await;
-                // Refresh the global verifying key snapshot.
-                let vks: Vec<_> = ml_dsa.all_slots_snapshot().await.iter()
-                    .map(ml_dsa_rotation::MlDsaKeySlot::verifying_key)
-                    .collect();
-                let shared = global_ml_dsa_verifying_keys();
-                let _ = shared.write().map(|mut guard| *guard = vks);
+                refresh_ml_dsa_verifying_keys(ml_dsa).await;
+                refresh_composite_verifying_keys(&store, ml_dsa, &extra.composite_ca_key).await;
             }
         }
     });

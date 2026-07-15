@@ -96,7 +96,7 @@ pub async fn jwks_json(state: &OAuthState) -> Vec<serde_json::Value> {
         }
     }
 
-    // ML-DSA-65 from rotation store — publish all slots + composite pairing
+    // ML-DSA-65 from rotation store — publish all component slots.
     if let Some(ref store) = state.ml_dsa_key_store {
         for slot in store.all_slots_snapshot().await {
             let vk = ml_dsa::Keypair::verifying_key(&*slot.key);
@@ -107,17 +107,19 @@ pub async fn jwks_json(state: &OAuthState) -> Vec<serde_json::Value> {
             }
             keys.push(jwk);
 
-            // Composite key pairing with active Ed25519 from rotation store
-            if let Some(ref ed_store) = state.signing_key_store {
-                if let Some(ed_key) = ed_store.active_key().await {
-                    keys.push(crate::auth::jwt::composite_jwk(
-                        &vk,
-                        &ed_key.verifying_key(),
-                    ));
-                }
-            }
         }
     }
+
+    // Publish exactly the pairs accepted by the local verifier. Never rebuild
+    // these as a Cartesian product of independently published component keys.
+    let composite_pairs = crate::auth::key_rotation::global_composite_verifying_keys();
+    let snapshot = composite_pairs
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    keys.extend(snapshot.iter().map(|pair| {
+        crate::auth::jwt::composite_jwk(&pair.ml_dsa, &pair.ed25519)
+    }));
 
     // Add RSA public key if available
     if let Some(ref rsa_jwk) = state.rsa_jwk {
