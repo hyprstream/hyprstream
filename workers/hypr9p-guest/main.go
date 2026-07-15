@@ -39,8 +39,9 @@
 //
 // # Run modes
 //
-//	hypr9p-guest [--vsock-cid 2] [--vsock-port 564] [--aname ""] <op> <args...>
-//	hypr9p-guest --sock /path/to/9p.sock <op> <args...>     # UDS instead of vsock
+//	hypr9p-guest [--dial vsock://2:564] [--uname ""] [--aname ""] <op> <args...>
+//	hypr9p-guest --dial unix:///path/to/9p.sock <op> <args...>
+//	hypr9p-guest --dial tcp://127.0.0.1:564 <op> <args...>
 //	hypr9p-guest --fuse-mount /mnt/vfs                       # POSIX FUSE mount (operator-only)
 //	hypr9p-guest --self-test
 //
@@ -65,8 +66,10 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 
 	"github.com/hugelgupf/p9/p9"
@@ -86,6 +89,8 @@ type config struct {
 	vsockCID  uint
 	vsockPort uint
 	sock      string
+	dial      string
+	uname     string
 	aname     string
 	selfTest  bool
 	fuseMount string
@@ -98,7 +103,11 @@ func main() {
 	flag.UintVar(&cfg.vsockPort, "vsock-port", 564,
 		"vsock port the host tenant-VFS 9P server listens on (VFS_9P_VSOCK_PORT)")
 	flag.StringVar(&cfg.sock, "sock", os.Getenv("HYPRSTREAM_9P_SOCK"),
-		"dial this Unix socket instead of vsock (env: HYPRSTREAM_9P_SOCK); for host-side debugging/self-test")
+		"deprecated alias for --dial unix://<path> (env: HYPRSTREAM_9P_SOCK)")
+	flag.StringVar(&cfg.dial, "dial", os.Getenv("HYPRSTREAM_9P_DIAL"),
+		"9P stream target: vsock://<cid>:<port>, unix://<path>, or tcp://<host>:<port> (env: HYPRSTREAM_9P_DIAL)")
+	flag.StringVar(&cfg.uname, "uname", os.Getenv("HYPRSTREAM_9P_UNAME"),
+		"9P attach user name / ticket (env: HYPRSTREAM_9P_UNAME)")
 	flag.StringVar(&cfg.aname, "aname", "", "9P attach name (empty = default tree)")
 	flag.BoolVar(&cfg.selfTest, "self-test", false,
 		"run ls/cat/write against a throwaway in-process 9P server and exit")
@@ -138,9 +147,9 @@ func run(cfg config, args []string) error {
 	}
 	defer client.Close()
 
-	root, err := client.Attach(cfg.aname)
+	root, err := client.AttachUname(cfg.uname, cfg.aname)
 	if err != nil {
-		return fmt.Errorf("9P attach (aname=%q): %w", cfg.aname, err)
+		return fmt.Errorf("9P attach (uname set=%t, aname=%q): %w", cfg.uname != "", cfg.aname, err)
 	}
 	defer root.Close()
 
@@ -171,17 +180,87 @@ func dispatch(root p9.File, args []string) error {
 	}
 }
 
-// dial opens the byte stream to the host 9P server: a Unix socket when --sock is
-// set, otherwise AF_VSOCK to (cfg.vsockCID, cfg.vsockPort).
+// dial opens the byte stream to the host 9P server. The default remains the
+// kata guest's AF_VSOCK path, but #790 generalizes the FUSE client for CSI:
+// operators can feed it a dial-time carrier (or a node-local stream bridge) via
+// HYPRSTREAM_9P_DIAL / --dial without changing the 9P app layer.
 func dial(cfg config) (io.ReadWriteCloser, error) {
 	if cfg.sock != "" {
-		conn, err := net.Dial("unix", cfg.sock)
-		if err != nil {
-			return nil, fmt.Errorf("dial unix %q: %w", cfg.sock, err)
-		}
-		return conn, nil
+		return dialTarget("unix://" + cfg.sock)
+	}
+	if cfg.dial != "" {
+		return dialTarget(cfg.dial)
 	}
 	return dialVsock(uint32(cfg.vsockCID), uint32(cfg.vsockPort))
+}
+
+func dialTarget(target string) (io.ReadWriteCloser, error) {
+	d, err := parseDialTarget(target)
+	if err != nil {
+		return nil, err
+	}
+	switch d.network {
+	case "vsock":
+		return dialVsock(uint32(d.vsockCID), uint32(d.vsockPort))
+	case "unix", "tcp":
+		conn, err := net.Dial(d.network, d.address)
+		if err != nil {
+			return nil, fmt.Errorf("dial %s %q: %w", d.network, d.address, err)
+		}
+		return conn, nil
+	default:
+		return nil, fmt.Errorf("unsupported 9P dial network %q", d.network)
+	}
+}
+
+type dialTargetSpec struct {
+	network   string
+	address   string
+	vsockCID  uint64
+	vsockPort uint64
+}
+
+func parseDialTarget(target string) (dialTargetSpec, error) {
+	if target == "" {
+		return dialTargetSpec{}, errors.New("empty 9P dial target")
+	}
+	u, err := url.Parse(target)
+	if err != nil {
+		return dialTargetSpec{}, fmt.Errorf("parse 9P dial target %q: %w", target, err)
+	}
+	switch u.Scheme {
+	case "unix":
+		p := u.Path
+		if p == "" && u.Host != "" {
+			p = u.Host
+		}
+		if p == "" {
+			return dialTargetSpec{}, fmt.Errorf("unix 9P dial target %q has no path", target)
+		}
+		return dialTargetSpec{network: "unix", address: p}, nil
+	case "tcp":
+		if u.Host == "" {
+			return dialTargetSpec{}, fmt.Errorf("tcp 9P dial target %q has no host:port", target)
+		}
+		return dialTargetSpec{network: "tcp", address: u.Host}, nil
+	case "vsock":
+		cidText := u.Hostname()
+		portText := u.Port()
+		if cidText == "" || portText == "" {
+			return dialTargetSpec{}, fmt.Errorf("vsock 9P dial target %q must be vsock://<cid>:<port>", target)
+		}
+		cid, err := strconv.ParseUint(cidText, 10, 32)
+		if err != nil {
+			return dialTargetSpec{}, fmt.Errorf("invalid vsock cid %q: %w", cidText, err)
+		}
+		port, err := strconv.ParseUint(portText, 10, 32)
+		if err != nil {
+			return dialTargetSpec{}, fmt.Errorf("invalid vsock port %q: %w", portText, err)
+		}
+		return dialTargetSpec{network: "vsock", vsockCID: cid, vsockPort: port}, nil
+	default:
+		return dialTargetSpec{}, fmt.Errorf("unsupported 9P dial target scheme %q in %q", u.Scheme, target)
+	}
 }
 
 // dialVsock opens a connected AF_VSOCK stream socket and wraps it in an

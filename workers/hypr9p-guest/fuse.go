@@ -79,10 +79,10 @@ func runFuseMount(cfg config, mountpoint string) error {
 		return fmt.Errorf("9P version handshake: %w", err)
 	}
 
-	root, err := client.Attach(cfg.aname)
+	root, err := client.AttachUname(cfg.uname, cfg.aname)
 	if err != nil {
 		client.Close()
-		return fmt.Errorf("9P attach (aname=%q): %w", cfg.aname, err)
+		return fmt.Errorf("9P attach (uname set=%t, aname=%q): %w", cfg.uname != "", cfg.aname, err)
 	}
 
 	backend := &fuseFS{root: root}
