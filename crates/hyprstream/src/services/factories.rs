@@ -633,13 +633,30 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
         })
         .ok_or_else(|| anyhow::anyhow!("no active ES256 #atproto key for PDS publish"))?;
         let atproto_key: p256::ecdsa::SigningKey = (*active).clone();
-        let store = crate::services::discovery::PdsRecordStore::open(&store_dir)?;
+        let store = Arc::new(crate::services::discovery::PdsRecordStore::open(&store_dir)?);
+        // The alarm WAL must remain verifiable across OAuth key rotations and
+        // process restarts. Derive a dedicated, stable audit identity from the
+        // node/service root available in this deployment mode; the second
+        // derivation keeps the ML-DSA material separate from the Ed25519 key.
+        let audit_ed = hyprstream_rpc::node_identity::derive_purpose_key(
+            ctx.signing_key(),
+            "hyprstream-at9p-audit-ed25519-v1",
+        );
+        let audit_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&audit_ed);
+        let alarm_path = store_dir.with_extension("at9p-duplicity.wal");
+        let at9p_state = crate::services::discovery::At9pStateIngest::open(
+            Arc::clone(&store),
+            &alarm_path,
+            audit_ed,
+            audit_pq,
+        )?;
         let node_did = hyprstream_rpc::did_key::ed25519_to_did_key(&ctx.verifying_key().to_bytes());
         Ok(crate::services::discovery::PdsPublisher::new(
-            Arc::new(store),
+            store,
             node_did,
             atproto_key,
-        ))
+        )
+        .with_at9p_state_ingest(at9p_state))
     })()
     .map_err(|e| tracing::warn!("PDS publish disabled: {e}"))
     .ok();
