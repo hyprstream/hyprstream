@@ -567,6 +567,32 @@ impl RecipientKeypair {
 }
 
 impl RecipientPublic {
+    /// Validate component count, order-by-position, and public-key lengths
+    /// before callers encode or perform KEM work on manually constructed public
+    /// material.
+    pub(crate) fn validate(&self) -> Result<()> {
+        let components = self.suite_id.components();
+        if self.eks.len() != components.len() {
+            bail!(
+                "recipient has {} encap keys, suite {} needs {}",
+                self.eks.len(),
+                self.suite_id.as_str(),
+                components.len()
+            );
+        }
+        for (index, (&kem, key)) in components.iter().zip(&self.eks).enumerate() {
+            let expected = kem.component().ek_len();
+            if key.len() != expected {
+                bail!(
+                    "recipient component {index} {:?} encap key length {} != expected {expected}",
+                    kem,
+                    key.len()
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Canonical length-prefixed encoding of the recipient's per-component
     /// encapsulation keys, mirroring [`HybridKemMaterial::encode`]:
     /// `be16(suite_id) ‖ be16(n) ‖ Σ_i (be16(kem_id) ‖ be32(len) ‖ ek_bytes)`.
@@ -704,16 +730,9 @@ pub fn recipient_from_seeds(suite: SuiteId, seeds: &[&[u8]]) -> Result<Recipient
 pub fn encapsulate_to(
     recipient: &RecipientPublic,
 ) -> Result<(HybridKemMaterial, Zeroizing<[u8; 32]>)> {
+    recipient.validate()?;
     let suite = recipient.suite_id;
     let comps = suite.components();
-    if recipient.eks.len() != comps.len() {
-        bail!(
-            "recipient has {} encap keys, suite {} needs {}",
-            recipient.eks.len(),
-            suite.as_str(),
-            comps.len()
-        );
-    }
 
     let mut shares = Vec::with_capacity(comps.len());
     let mut sss = Vec::with_capacity(comps.len());
@@ -722,14 +741,6 @@ pub fn encapsulate_to(
 
     for (i, &kem) in comps.iter().enumerate() {
         let ek = &recipient.eks[i];
-        if ek.len() != kem.component().ek_len() {
-            bail!(
-                "recipient component {:?} encap key length {} != expected {}",
-                kem,
-                ek.len(),
-                kem.component().ek_len()
-            );
-        }
         let (ct, ss) = kem.component().encapsulate(ek)?;
         cts.push(ct.clone());
         shares.push(KemShare {

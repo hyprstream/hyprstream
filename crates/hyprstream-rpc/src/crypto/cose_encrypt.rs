@@ -856,6 +856,10 @@ fn compatibility_context(
     epoch: u64,
     sequence: u64,
 ) -> Result<SealContext> {
+    if external_aad.len() > MAX_EXTERNAL_AAD_BYTES {
+        bail!("external AAD exceeds {MAX_EXTERNAL_AAD_BYTES}-byte limit");
+    }
+    recipient.validate()?;
     let epoch = u32::try_from(epoch).context("epoch exceeds u32 nonce domain")?;
     let encoded = recipient.encode();
     let recipient_id = digest_parts(COMPAT_RECIPIENT_LABEL, &[&encoded]).to_vec();
@@ -891,6 +895,7 @@ pub fn seal_to_recipient(
     sequence: u64,
 ) -> Result<Vec<u8>> {
     let context = compatibility_context(recipient, external_aad, epoch, sequence)?;
+    validate_inputs(&context, plaintext.len(), external_aad)?;
     let (material, secret) = hybrid_kem::encapsulate_to(recipient)?;
     let base_key = derive_aead_key(&secret);
     seal_core(
@@ -914,6 +919,7 @@ pub fn open_from_recipient(
     sequence: u64,
 ) -> Result<Vec<u8>> {
     let context = compatibility_context(&recipient.public(), external_aad, epoch, sequence)?;
+    validate_inputs(&context, 0, external_aad)?;
     let enc = parse_canonical(cose_bytes)?;
     require_exact_protected(&enc, recipient.suite_id, &context)?;
     let material = require_material(&enc)?;
@@ -1343,6 +1349,23 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_map_order_is_encoded_length_then_bytewise() {
+        let finish = |mut prefix: Vec<u8>| {
+            prefix.push(0x50);
+            prefix.extend_from_slice(&[0u8; 16]);
+            prefix
+        };
+        // RFC 8949 core deterministic order puts the one-byte encoded key -1
+        // (0x20) before the two-byte encoded key 100 (0x18 0x64), even though a
+        // raw lexicographic comparison alone would reverse them.
+        let canonical = finish(vec![0x83, 0x41, 0xa0, 0xa2, 0x20, 0x00, 0x18, 0x64, 0x00]);
+        assert!(preflight_cose_encrypt0(&canonical).is_ok());
+
+        let reversed = finish(vec![0x83, 0x41, 0xa0, 0xa2, 0x18, 0x64, 0x00, 0x20, 0x00]);
+        assert!(preflight_cose_encrypt0(&reversed).is_err());
+    }
+
+    #[test]
     fn focused_cose_gate_covers_every_hybrid_component_secret() {
         assert!(hybrid_kem::combiner_is_sensitive_to_every_component_for_cose());
     }
@@ -1511,5 +1534,17 @@ mod tests {
             open_from_recipient(&recipient, &sealed, AAD, 0, 0).unwrap(),
             b"legacy"
         );
+    }
+
+    #[test]
+    fn compatibility_wrappers_validate_before_encoding_or_crypto() {
+        let recipient = generate_recipient(SUITE).unwrap();
+        let oversized_aad = vec![0u8; MAX_EXTERNAL_AAD_BYTES + 1];
+        assert!(seal_to_recipient(&recipient.public(), b"legacy", &oversized_aad, 0, 0).is_err());
+        assert!(open_from_recipient(&recipient, &[], &oversized_aad, 0, 0).is_err());
+
+        let mut malformed = recipient.public();
+        malformed.eks.push(vec![0u8; 32]);
+        assert!(seal_to_recipient(&malformed, b"legacy", AAD, 0, 0).is_err());
     }
 }
