@@ -1622,8 +1622,8 @@ impl SignedEnvelope {
     ///
     /// # Verification Steps
     ///
-    /// 1. Verify signer pubkey matches expected key
-    /// 2. Check timestamp is within acceptable window
+    /// 1. Check timestamp is within the acceptable window without mutation
+    /// 2. Verify signer pubkey matches expected key
     /// 3. Verify Ed25519 signature
     /// 4. Atomically check and record the nonce
     ///
@@ -1664,6 +1664,7 @@ impl SignedEnvelope {
         pq_store: Option<&dyn PqTrustStore>,
         verify_policy: crate::crypto::CryptoPolicy,
     ) -> EnvelopeResult<()> {
+        self.validate_timestamp()?;
         // 1. Verify signer matches expected (constant-time comparison)
         if !bool::from(self.cnf.ct_eq(&expected_pubkey.to_bytes())) {
             return Err(EnvelopeError::SignerMismatch {
@@ -1724,6 +1725,7 @@ impl SignedEnvelope {
         pq_store: Option<&dyn PqTrustStore>,
         verify_policy: crate::crypto::CryptoPolicy,
     ) -> EnvelopeResult<()> {
+        self.validate_timestamp()?;
         let verifying_key =
             VerifyingKey::from_bytes(&self.cnf).map_err(|_| EnvelopeError::InvalidPublicKey {
                 expected: 32,
@@ -1747,6 +1749,7 @@ impl SignedEnvelope {
         unanchored: UnanchoredHybridPolicy,
         allowlist: &[String],
     ) -> EnvelopeResult<()> {
+        self.validate_timestamp()?;
         if !bool::from(self.cnf.ct_eq(&expected_pubkey.to_bytes())) {
             return Err(EnvelopeError::SignerMismatch {
                 expected: hex::encode(expected_pubkey.to_bytes()),
@@ -1772,6 +1775,7 @@ impl SignedEnvelope {
         unanchored: UnanchoredHybridPolicy,
         allowlist: &[String],
     ) -> EnvelopeResult<()> {
+        self.validate_timestamp()?;
         let verifying_key =
             VerifyingKey::from_bytes(&self.cnf).map_err(|_| EnvelopeError::InvalidPublicKey {
                 expected: 32,
@@ -1831,8 +1835,9 @@ impl SignedEnvelope {
         )
     }
 
-    /// Timestamp window + nonce replay check.
-    fn check_replay(&self, nonce_cache: &dyn NonceCache) -> EnvelopeResult<()> {
+    /// Non-mutating timestamp-window validation for early rejection before
+    /// signature verification, KEM decapsulation, or decryption.
+    fn validate_timestamp(&self) -> EnvelopeResult<()> {
         let now = current_timestamp();
         let age = now - self.envelope.iat;
         if age > MAX_TIMESTAMP_AGE_MS {
@@ -1846,6 +1851,14 @@ impl SignedEnvelope {
                 -age - MAX_CLOCK_SKEW_MS
             )));
         }
+        Ok(())
+    }
+
+    /// Revalidate the timestamp, then atomically check and record the nonce.
+    fn check_replay(&self, nonce_cache: &dyn NonceCache) -> EnvelopeResult<()> {
+        // Recheck at commit time so work performed near a timestamp-window
+        // boundary cannot admit an entry after it expires.
+        self.validate_timestamp()?;
         if !nonce_cache.check_and_insert(&self.envelope.nonce) {
             return Err(EnvelopeError::ReplayAttack("nonce already seen".to_owned()));
         }
@@ -2782,6 +2795,10 @@ pub fn unwrap_and_verify(
     let signed_reader = reader.get_root::<crate::common_capnp::signed_envelope::Reader>()?;
     let mut signed = SignedEnvelope::read_from(signed_reader)?;
 
+    // Reject stale or future requests before signature or KEM work without
+    // mutating replay state. The timestamp is revalidated at final commit.
+    signed.validate_timestamp()?;
+
     // Authenticate first without mutating replay state.  The compatibility
     // lifecycle commits the nonce only after canonical COSE parsing, external-
     // AAD authentication, decryption, and inner/outer equality all succeed.
@@ -3584,6 +3601,19 @@ mod tests {
                 .with_verify_policy(crate::crypto::CryptoPolicy::Classical)
         };
         unwrap_and_verify(&original_wire, &options()).expect("original request is accepted");
+
+        // Authenticated but expired outer metadata is rejected before KEM work
+        // and cannot disturb the full capacity-one cache.
+        let mut stale = original.clone();
+        stale.envelope.nonce = distinct_test_nonce(&original_nonce);
+        stale.envelope.iat = current_timestamp() - MAX_TIMESTAMP_AGE_MS - 1;
+        stale
+            .verify_signature_only(&node_vk)
+            .expect("ciphertext signature remains valid");
+        let stale_error = unwrap_and_verify(&signed_envelope_to_wire(&stale), &options())
+            .expect_err("expired request is rejected");
+        assert!(stale_error.to_string().contains("timestamp too old"));
+        assert!(unwrap_and_verify(&original_wire, &options()).is_err());
 
         // A distinct outer nonce plus an invalid signature must not consume or
         // evict cache capacity.
