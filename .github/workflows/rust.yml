@@ -204,10 +204,18 @@ jobs:
           -e LIBTORCH=/opt/libtorch -e LD_LIBRARY_PATH=/opt/libtorch/lib \
           -e LIBTORCH_BYPASS_VERSION_CHECK=1 -e OPENSSL_NO_VENDOR=1 \
           -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always \
+          -e CARGO_BUILD_JOBS=4 -e RUST_TEST_THREADS=4 \
           "$BUILDER_IMAGE" \
           bash -euo pipefail -c '
             # Default features (parity with the former x86 gate); libtorch from the
             # image means NO --features download-libtorch here.
+            #
+            # CARGO_BUILD_JOBS=4 (set via -e above): the c8g.2xlarge is 8 vCPU /
+            # 16GiB — same RAM as the old ubuntu-latest gate but twice the cores, so
+            # cargos default of one job per core runs 8-way and OOM-kills a full
+            # release link on 16GiB. 4-way matches the parallelism the 16GiB x86
+            # runner used successfully. Bump instance RAM (not this cap) if the
+            # build wall-time becomes the constraint.
             cargo build --release --verbose
 
             # wasm guest artifacts for the sandbox/mount tests (deny-on-missing-guest
@@ -230,7 +238,10 @@ jobs:
             # container-absolute (/build is the bind mount).
             export HYPRSTREAM_PYGUEST_WASM=/build/crates/hyprstream-workers-python-guest/target/wasm32-unknown-unknown/release/hyprstream_workers_python_guest.wasm
             export HYPRSTREAM_FSGUEST_WASM=/build/crates/hyprstream-workers-wasmtime-fsguest/target/wasm32-wasip1/release/hyprstream-workers-wasmtime-fsguest.wasm
-            cargo nextest run --cargo-profile ci-test --profile ci
+            # --test-threads bounded for the same 16GiB memory reason as
+            # CARGO_BUILD_JOBS: libtorch-loading tests are memory-heavy and the
+            # 8-vCPU default over-subscribes RAM.
+            cargo nextest run --cargo-profile ci-test --profile ci --test-threads 4
 
             # nextest does not run doctests; keep them in the merge gate.
             cargo test --release --doc
