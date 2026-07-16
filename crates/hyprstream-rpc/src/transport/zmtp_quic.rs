@@ -529,12 +529,15 @@ impl QuicRep {
         // just don't pin it to the server's own key. JWT claims + Casbin handle
         // authorization.
         // subsecond::call wraps dispatch for hot-patching during dev
+        // INV-2 (#1042): this legacy ZMTP entry point terminates a QUIC
+        // stream — an untrusted carrier even on a loopback address.
         let response_bytes = subsecond::call(|| crate::service::dispatch::process_request(
             raw_bytes,
             &*service,
             EnvelopeVerification::AnySigner,
             &signing_key,
             &nonce_cache,
+            crate::transport::carrier::CarrierContext::quic(),
         )).await?;
 
         // Send response

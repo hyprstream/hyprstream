@@ -28,7 +28,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use ed25519_dalek::SigningKey;
@@ -36,6 +36,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use web_transport_trait::{RecvStream, SendStream, Session};
 
+use crate::transport::carrier::CarrierContext;
 use crate::transport_traits::{PublishSink, Transport};
 
 /// Hard cap on per-frame size (request or response) for the RPC control plane.
@@ -136,10 +137,17 @@ impl Default for RpcConfig {
 }
 
 // ============================================================================
-// IrohRequestProcessor — pluggable request handling trait
+// IrohRequestProcessor — sealed request handling trait
 // ============================================================================
 
-/// Trait implemented by callers to wire actual request processing.
+pub(crate) mod sealed {
+    pub trait Sealed {
+        /// True only for the crate-owned canonical envelope pipeline.
+        fn admits_untrusted_carrier(&self) -> bool;
+    }
+}
+
+/// Sealed trait used to wire actual request processing.
 ///
 /// The processor receives the raw request bytes (a Cap'n Proto-encoded
 /// `SignedEnvelope`) and returns the raw response bytes.
@@ -150,31 +158,48 @@ impl Default for RpcConfig {
 ///   Application-layer errors (verification failure, handler error, etc.)
 ///   MUST be returned this way as signed error envelopes — the server
 ///   forwards them unchanged.
-/// - **`Err(_)`** — wire-level fatal: the processor cannot produce *any*
-///   response. The server responds with its own signed error envelope
-///   (`request_id = 0`) so the client sees a parseable error rather than a
-///   Cap'n Proto parse failure.
+/// - **`Err(_)`** — admission or wire-level fatal. Untrusted network carriers
+///   silently reset/drop the stream so unauthenticated input cannot trigger a
+///   signed response. Trusted local carriers retain the legacy signed stub
+///   error for transport-only callers.
 ///
-/// Implementations MUST be `Send + Sync + 'static` because accept loops run on
-/// a multi-threaded tokio runtime. For services that are `!Send` (e.g. those
-/// holding `tch-rs` tensors), use [`super::iroh_rpc::LocalServiceBridge`].
+/// Implementations are crate-owned so arbitrary raw-byte callbacks cannot
+/// become an application-facing network boundary. Services use
+/// [`super::iroh_rpc::LocalServiceBridge`], including `!Send` services.
+///
+/// The `carrier` argument is the accept boundary's attestation of which
+/// carrier class the request arrived on (INV-2 receive side, #1042). It is a
+/// **required** parameter — a processor cannot be invoked without a carrier
+/// classification, so a forgotten context is a compile error, not a silent
+/// fail-open. On an untrusted carrier, the serve loop invokes only the
+/// crate-owned canonical [`dispatch`] processor.
+///
+/// [`dispatch`]: crate::service::dispatch::process_request
 ///
 /// (Name retained from the iroh-only era to avoid churn in callers.)
-pub trait IrohRequestProcessor: Send + Sync + 'static {
+pub trait IrohRequestProcessor: sealed::Sealed + Send + Sync + 'static {
     fn process(
         &self,
         request: Bytes,
+        carrier: CarrierContext,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>>;
 }
 
 /// Convenience: build an [`IrohRequestProcessor`] from a `Send + Sync`
 /// async closure. Useful for tests.
+/// The closure is carrier-agnostic and is therefore restricted to trusted
+/// inproc/UDS carriers. It cannot receive bytes from an untrusted carrier.
 pub fn from_fn<F, Fut>(f: F) -> impl IrohRequestProcessor
 where
     F: Fn(Bytes) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<Bytes>> + Send + 'static,
 {
     struct FnProcessor<F>(F);
+    impl<F> sealed::Sealed for FnProcessor<F> {
+        fn admits_untrusted_carrier(&self) -> bool {
+            false
+        }
+    }
     impl<F, Fut> IrohRequestProcessor for FnProcessor<F>
     where
         F: Fn(Bytes) -> Fut + Send + Sync + 'static,
@@ -183,6 +208,7 @@ where
         fn process(
             &self,
             request: Bytes,
+            _carrier: CarrierContext,
         ) -> std::pin::Pin<Box<dyn Future<Output = Result<Bytes>> + Send + '_>> {
             Box::pin((self.0)(request))
         }
@@ -262,6 +288,11 @@ pub async fn read_to_cap<R: RecvStream>(recv: &mut R, cap: usize) -> Result<Byte
 /// shutdown, cancels `shutdown` then `acquire_many(capacity)`s every permit so
 /// detached `handle_stream` tasks finish before teardown. This fn only acquires
 /// one per-stream permit per accepted bidi stream.
+///
+/// `carrier` is the accept boundary's classification of this session's
+/// carrier (INV-2 receive side, #1042). Untrusted carriers may invoke only the
+/// crate-owned canonical envelope processor; raw closure processors are
+/// silently refused before their callback can observe request bytes.
 pub async fn serve_rpc_connection<S>(
     session: S,
     processor: Arc<dyn IrohRequestProcessor>,
@@ -269,6 +300,7 @@ pub async fn serve_rpc_connection<S>(
     stream_limit: Arc<Semaphore>,
     read_timeout: Duration,
     shutdown: CancellationToken,
+    carrier: CarrierContext,
 ) -> Result<()>
 where
     S: Session,
@@ -307,21 +339,24 @@ where
                 tokio::spawn(async move {
                     let _permit = permit; // released on task end
                     let _keepalive = session_keepalive;
-                    handle_stream::<S>(send, recv, processor, signing_key, read_timeout).await;
+                    handle_stream::<S>(send, recv, processor, signing_key, read_timeout, carrier)
+                        .await;
                 });
             }
         }
     }
 }
 
-/// Handle one bidi stream end-to-end: read request, dispatch to processor,
-/// write response (or signed error envelope on processor failure).
+/// Handle one bidi stream end-to-end: read request, dispatch to the admitted
+/// processor, and write its response. Admission failures on untrusted carriers
+/// are silently dropped; trusted-local processor failures get a signed stub.
 async fn handle_stream<S>(
     mut send: S::SendStream,
     mut recv: S::RecvStream,
     processor: Arc<dyn IrohRequestProcessor>,
     signing_key: SigningKey,
     read_timeout: Duration,
+    carrier: CarrierContext,
 ) where
     S: Session,
 {
@@ -329,27 +364,49 @@ async fn handle_stream<S>(
     // we return, dropping `recv`/`send` (which resets the stream) and releasing
     // the semaphore permit held by the caller — so a stalled/trickling peer
     // cannot pin a server-wide permit indefinitely.
-    let request = match tokio::time::timeout(read_timeout, read_to_cap(&mut recv, MAX_FRAME_BYTES)).await {
-        Ok(Ok(buf)) => buf,
-        Ok(Err(e)) => {
-            tracing::warn!(error = ?e, "rpc-session: failed reading request");
-            return;
-        }
-        Err(_) => {
+    let request =
+        match tokio::time::timeout(read_timeout, read_to_cap(&mut recv, MAX_FRAME_BYTES)).await {
+            Ok(Ok(buf)) => buf,
+            Ok(Err(e)) => {
+                tracing::warn!(error = ?e, "rpc-session: failed reading request");
+                return;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout = ?read_timeout,
+                    "rpc-session: request read timed out, abandoning stream"
+                );
+                return;
+            }
+        };
+
+    // A raw/custom callback must never become the application boundary for a
+    // network carrier. Only the sealed canonical bridge is allowed to receive
+    // such bytes; it performs bounded parsing, authentication, replay checks,
+    // INV-2 enforcement, and KEM open before handler dispatch.
+    if carrier.forbids_cleartext_envelope() && !processor.admits_untrusted_carrier() {
+        tracing::warn!(
+            carrier = %carrier,
+            "rpc-session: refusing non-canonical raw processor on untrusted carrier"
+        );
+        return;
+    }
+
+    let response = match processor.process(request, carrier).await {
+        Ok(bytes) => bytes,
+        Err(e) if carrier.forbids_cleartext_envelope() => {
+            // Do not sign responses to input that failed canonical network
+            // admission: malformed, unauthenticated, replayed, cleartext, and
+            // undecryptable requests all reset/drop silently.
             tracing::warn!(
-                timeout = ?read_timeout,
-                "rpc-session: request read timed out, abandoning stream"
+                error = ?e,
+                carrier = %carrier,
+                "rpc-session: silently dropping request that failed canonical admission"
             );
             return;
         }
-    };
-
-    let response = match processor.process(request).await {
-        Ok(bytes) => bytes,
         Err(e) => {
-            tracing::warn!(error = ?e, "rpc-session: processor error, sending stub error envelope");
-            // No PQ key flows through the generic processor path; the error
-            // envelope is Classical (a Classical client verifies it via EdDSA).
+            tracing::warn!(error = ?e, "rpc-session: trusted-carrier processor error, sending stub error envelope");
             build_error_envelope(&signing_key, None, &format!("processor error: {e}"))
         }
     };

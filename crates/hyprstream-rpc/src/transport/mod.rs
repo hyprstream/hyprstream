@@ -8,6 +8,7 @@
 //! - Raw socket options via `sockopt` submodule
 
 mod traits;
+pub mod carrier;
 pub mod zmtp_quic;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod pq_provider;
