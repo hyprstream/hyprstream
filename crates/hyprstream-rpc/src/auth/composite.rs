@@ -159,6 +159,7 @@ pub struct CompositeKeySet {
 struct CompositeAuthorityPaths {
     ledger: PathBuf,
     committed: PathBuf,
+    committed_ledger_prefix: PathBuf,
     ledger_lock: PathBuf,
 }
 
@@ -180,10 +181,17 @@ impl CompositeKeySet {
         self.snapshot.read().clone()
     }
 
-    pub fn configure_authority(&self, ledger: PathBuf, committed: PathBuf, ledger_lock: PathBuf) {
+    pub fn configure_authority(
+        &self,
+        ledger: PathBuf,
+        committed: PathBuf,
+        committed_ledger_prefix: PathBuf,
+        ledger_lock: PathBuf,
+    ) {
         *self.authority.write() = Some(CompositeAuthorityPaths {
             ledger,
             committed,
+            committed_ledger_prefix,
             ledger_lock,
         });
     }
@@ -204,17 +212,6 @@ impl CompositeKeySet {
             .write(true)
             .open(&authority.ledger_lock)?;
         flock(lock.as_raw_fd(), FlockArg::LockShared)?;
-        let snapshot = self.snapshot();
-        let ledger: serde_json::Value = serde_json::from_slice(&std::fs::read(&authority.ledger)?)?;
-        let disk_version = ledger
-            .get("version")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| anyhow::anyhow!("composite ledger version missing"))?;
-        let disk_digest = ledger
-            .get("component_digest")
-            .and_then(serde_json::Value::as_str)
-            .filter(|digest| !digest.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("composite ledger component digest missing"))?;
         let committed: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&authority.committed)?)?;
         let committed_version = committed
@@ -226,6 +223,34 @@ impl CompositeKeySet {
             .and_then(serde_json::Value::as_str)
             .filter(|digest| !digest.is_empty())
             .ok_or_else(|| anyhow::anyhow!("committed component digest missing"))?;
+        let prefix_name = authority
+            .committed_ledger_prefix
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("committed ledger prefix has no file name"))?;
+        let committed_ledger = authority.committed_ledger_prefix.with_file_name(format!(
+            "{prefix_name}-{committed_version}-{committed_digest}.json"
+        ));
+        let ledger_bytes = match std::fs::read(&committed_ledger) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Legacy migration is safe only while the mutable ledger still
+                // names the exact generation selected by the commit marker.
+                std::fs::read(&authority.ledger)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let ledger: serde_json::Value = serde_json::from_slice(&ledger_bytes)?;
+        let disk_version = ledger
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("composite ledger version missing"))?;
+        let disk_digest = ledger
+            .get("component_digest")
+            .and_then(serde_json::Value::as_str)
+            .filter(|digest| !digest.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("composite ledger component digest missing"))?;
+        let snapshot = self.snapshot();
         anyhow::ensure!(
             snapshot.version == disk_version
                 && snapshot.version == committed_version
@@ -444,8 +469,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let ledger = dir.join("ledger.json");
         let committed = dir.join("committed");
+        let committed_ledger_prefix = dir.join("committed-ledger");
         let keys = CompositeKeySet::default();
-        keys.configure_authority(ledger.clone(), committed.clone(), dir.join("lock"));
+        keys.configure_authority(
+            ledger.clone(),
+            committed.clone(),
+            committed_ledger_prefix.clone(),
+            dir.join("lock"),
+        );
         keys.publish(1, "generation-1".into(), vec![pair(9)])
             .unwrap();
         assert!(keys.mint_snapshot().is_err());
@@ -459,13 +490,31 @@ mod tests {
             br#"{"version":1,"component_digest":"generation-1"}"#,
         )
         .unwrap();
-        assert!(keys.mint_snapshot().is_err(), "pending cutover minted");
+        assert!(
+            keys.mint_snapshot().is_err(),
+            "legacy fallback accepted a pending mutable ledger"
+        );
+        std::fs::write(
+            dir.join("committed-ledger-1-generation-1.json"),
+            br#"{"version":1,"component_digest":"generation-1"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            keys.mint_snapshot().unwrap().version(),
+            1,
+            "pending mutable authority displaced the last committed snapshot"
+        );
         std::fs::write(
             &committed,
             br#"{"version":2,"component_digest":"generation-2"}"#,
         )
         .unwrap();
         assert!(keys.mint_snapshot().is_err(), "stale cache minted");
+        std::fs::write(
+            dir.join("committed-ledger-2-generation-2.json"),
+            br#"{"version":2,"component_digest":"generation-2"}"#,
+        )
+        .unwrap();
         keys.publish(2, "generation-2".into(), vec![pair(10)])
             .unwrap();
         assert_eq!(keys.mint_snapshot().unwrap().version(), 2);
