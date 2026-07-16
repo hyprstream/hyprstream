@@ -386,29 +386,49 @@ impl PredecessorRecord<'_> {
 /// in-memory [`InMemoryWatermarkStore`] is provided for tests; the daemon/PDS
 /// supplies the durable atomic implementation.
 ///
-/// Implementations must be safe for concurrent use (`Send + Sync`). The trait
-/// makes **no** atomicity guarantee across `get`/`put`: a `get` followed by a
-/// `put` are two independent calls, and concurrent callers can interleave
-/// between them. Atomicity of the read-modify-write in [`DuplicityGuard::
-/// admit_successor`] is the **guard's** responsibility — it holds a per-DID
-/// admission lock across the whole classification+advance so concurrent
-/// admissions of the same DID serialize. The store owns only its own interior
-/// mutability (each individual call is sound under concurrency); it does NOT
-/// need to provide compare-and-swap.
+/// Implementations must be safe for concurrent use (`Send + Sync`) and MUST
+/// serialize [`conditional_advance`](WatermarkStore::conditional_advance)
+/// across every guard sharing the store. A guard-local lock is only an
+/// optimization: the durable store is the authority and the conditional write
+/// is the security boundary.
 pub trait WatermarkStore: Send + Sync {
     /// Load the complete accepted state. Implementations must re-verify that
     /// the retained head bytes derive the returned watermark fields.
     fn get(&self, subject_cid512: &str) -> anyhow::Result<Option<AcceptedAt9pState>>;
 
-    /// Atomically replace head/body and watermark/terminal state as one durable
-    /// commit. A successful return must survive restart; partial state must not
-    /// be observable after recovery.
-    fn put(&self, state: &AcceptedAt9pState) -> anyhow::Result<()>;
+    /// Advance from exactly `expected` to `state` as one atomic durable commit.
+    /// `None` means the identity must still be unseeded. There is deliberately
+    /// no unconditional public write API.
+    fn conditional_advance(
+        &self,
+        expected: Option<Watermark>,
+        state: &AcceptedAt9pState,
+    ) -> anyhow::Result<ConditionalAdvance>;
+}
+
+impl<T: WatermarkStore + ?Sized> WatermarkStore for Arc<T> {
+    fn get(&self, subject_cid512: &str) -> anyhow::Result<Option<AcceptedAt9pState>> {
+        (**self).get(subject_cid512)
+    }
+
+    fn conditional_advance(
+        &self,
+        expected: Option<Watermark>,
+        state: &AcceptedAt9pState,
+    ) -> anyhow::Result<ConditionalAdvance> {
+        (**self).conditional_advance(expected, state)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConditionalAdvance {
+    Committed,
+    Conflict(Box<AcceptedAt9pState>),
 }
 
 /// In-memory [`WatermarkStore`] — a `Mutex<HashMap<..>>`. Suitable for tests and
-/// single-process use; **not** durable across restarts. The durable seam is
-/// intentionally left for #886 follow-up (no RocksDB wired here).
+/// single-process use; **not** durable across restarts. Production wires this
+/// trait to the signed, checkpointed RocksDB store owned by the PDS service.
 #[derive(Default)]
 pub struct InMemoryWatermarkStore {
     marks: Mutex<HashMap<String, AcceptedAt9pState>>,
@@ -425,11 +445,21 @@ impl WatermarkStore for InMemoryWatermarkStore {
         Ok(self.marks.lock().get(subject_cid512).cloned())
     }
 
-    fn put(&self, state: &AcceptedAt9pState) -> anyhow::Result<()> {
-        self.marks
-            .lock()
-            .insert(state.subject_cid512.clone(), state.clone());
-        Ok(())
+    fn conditional_advance(
+        &self,
+        expected: Option<Watermark>,
+        state: &AcceptedAt9pState,
+    ) -> anyhow::Result<ConditionalAdvance> {
+        let mut marks = self.marks.lock();
+        let current = marks.get(&state.subject_cid512).cloned();
+        if current.as_ref().map(AcceptedAt9pState::watermark) != expected {
+            return current.map_or_else(
+                || anyhow::bail!("conditional advance expected an existing head, but none exists"),
+                |current| Ok(ConditionalAdvance::Conflict(Box::new(current))),
+            );
+        }
+        marks.insert(state.subject_cid512.clone(), state.clone());
+        Ok(ConditionalAdvance::Committed)
     }
 }
 
@@ -992,13 +1022,8 @@ impl std::error::Error for AdmissionError {
 pub struct DuplicityGuard<S: WatermarkStore, A: DuplicityAlarmSink> {
     store: S,
     alarm: A,
-    /// Per-DID admission locks. Holding one of these across the whole
-    /// `admit_successor`/`seed_genesis` read-modify-write is what makes the R6
-    /// watermark advance atomic (see FIX in #959): without it, two concurrent
-    /// divergent-but-B1-valid epoch-`(N+1)` successors of the same head could
-    /// BOTH observe the head, BOTH pass B1, and BOTH `put` — defeating
-    /// duplicity detection. The `WatermarkStore` trait offers no atomicity of
-    /// its own, so the guard owns it here.
+    /// Per-DID optimization locks for calls through this guard instance. The
+    /// store-owned conditional advance is authoritative across guards.
     admit_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
@@ -1080,7 +1105,7 @@ impl<S: WatermarkStore, A: DuplicityAlarmSink> DuplicityGuard<S, A> {
     /// anchor backward. The only overwrite permitted is an idempotent re-seed
     /// of the exact same genesis (epoch 0, identical `record_digest`), which is
     /// a no-op success. The per-DID admission lock is held across the
-    /// read-then-conditional-`put` so this check is race-free against a
+    /// read-then-conditional-advance so this check is race-free against a
     /// concurrent `admit_successor`.
     ///
     /// If the genesis pre-commits to no next keys, the seeded watermark is
@@ -1092,20 +1117,29 @@ impl<S: WatermarkStore, A: DuplicityAlarmSink> DuplicityGuard<S, A> {
             .map_err(AdmissionError::MalformedPredecessor)?;
         let subject = &accepted.subject_cid512;
         self.with_admission_lock(subject, || {
-            if let Some(existing) = self.store.get(subject).map_err(AdmissionError::Store)? {
-                // Idempotent re-seed of the exact same genesis is a no-op success.
-                if existing.epoch == 0 && existing.head_digest == accepted.head_digest {
-                    return Ok(());
+            loop {
+                if let Some(existing) = self.store.get(subject).map_err(AdmissionError::Store)? {
+                    // Idempotent re-seed of the exact same genesis is a no-op success.
+                    if existing.epoch == 0 && existing.head_digest == accepted.head_digest {
+                        return Ok(());
+                    }
+                    // Anything else — an already-advanced watermark, or a different
+                    // genesis — is the anti-rollback anchor; refuse rather than let a
+                    // re-seed clobber it.
+                    return Err(AdmissionError::AlreadySeeded {
+                        subject_cid512: subject.clone(),
+                        existing_epoch: existing.epoch,
+                    });
                 }
-                // Anything else — an already-advanced watermark, or a different
-                // genesis — is the anti-rollback anchor; refuse rather than let a
-                // re-seed clobber it.
-                return Err(AdmissionError::AlreadySeeded {
-                    subject_cid512: subject.clone(),
-                    existing_epoch: existing.epoch,
-                });
+                match self
+                    .store
+                    .conditional_advance(None, &accepted)
+                    .map_err(AdmissionError::Store)?
+                {
+                    ConditionalAdvance::Committed => return Ok(()),
+                    ConditionalAdvance::Conflict(_) => continue,
+                }
             }
-            self.store.put(&accepted).map_err(AdmissionError::Store)
         })
     }
 
@@ -1202,16 +1236,17 @@ impl<S: WatermarkStore, A: DuplicityAlarmSink> DuplicityGuard<S, A> {
         // Hold the per-DID admission lock across the ENTIRE read-modify-write so
         // concurrent admissions of this DID serialize (FIX in #959, R6 property).
         self.with_admission_lock(subject, || {
-            // A DID we've never seeded has no anchored baseline; refuse rather than
-            // trust an unanchored predecessor (fail-closed first contact).
-            let accepted = self
-                .store
-                .get(subject)
-                .map_err(AdmissionError::Store)?
-                .ok_or_else(|| AdmissionError::NotSeeded {
-                    subject_cid512: subject.clone(),
-                })?;
-            let watermark = accepted.watermark();
+            loop {
+                // A DID we've never seeded has no anchored baseline; refuse rather than
+                // trust an unanchored predecessor (fail-closed first contact).
+                let accepted = self
+                    .store
+                    .get(subject)
+                    .map_err(AdmissionError::Store)?
+                    .ok_or_else(|| AdmissionError::NotSeeded {
+                        subject_cid512: subject.clone(),
+                    })?;
+                let watermark = accepted.watermark();
 
             // (1) Idempotent replay of the accepted head: same epoch AND same
             // recomputed digest as the persisted watermark means the candidate is
@@ -1326,12 +1361,16 @@ impl<S: WatermarkStore, A: DuplicityAlarmSink> DuplicityGuard<S, A> {
             let terminal = state.next_key_commitments.is_empty();
             let accepted = AcceptedAt9pState::from_accepted_update(candidate.clone());
             debug_assert_eq!(accepted.watermark(), Watermark::from_state(&state));
-            self.store.put(&accepted).map_err(AdmissionError::Store)?;
-            Ok(if terminal {
-                Admission::Frozen(state)
-            } else {
-                Admission::Advanced(state)
-            })
+            match self.store.conditional_advance(Some(watermark), &accepted)
+                .map_err(AdmissionError::Store)? {
+                ConditionalAdvance::Committed => return Ok(if terminal {
+                    Admission::Frozen(state)
+                } else {
+                    Admission::Advanced(state)
+                }),
+                ConditionalAdvance::Conflict(_) => continue,
+            }
+            }
         })
     }
 
@@ -2160,6 +2199,44 @@ mod tests {
             "watermark digest must be one of the candidates"
         );
         assert_eq!(guard.store_alarm_count(), N - 1);
+    }
+
+    #[test]
+    fn independent_guards_share_store_cas() {
+        const N: usize = 8;
+        let (g, n1, n2) = (signer(), signer(), signer());
+        let nexts: Vec<_> = (0..N).map(|_| signer()).collect();
+        let store = Arc::new(InMemoryWatermarkStore::new());
+        let a = DuplicityGuard::new(Arc::clone(&store));
+        let b = DuplicityGuard::new(store);
+        let (cap0, s0) = genesis(&g, &[&n1]);
+        a.seed_genesis(&verified_genesis(&cap0)).unwrap();
+        let r1 = update(&s0.subject_cid512, 1, s0.record_digest, &n1, &[&n2]);
+        let s1 = match a.admit_successor(&r1, NOW).unwrap() {
+            Admission::Advanced(state) => state,
+            other => panic!("expected advance, got {other:?}"),
+        };
+        let records: Vec<_> = nexts.iter().enumerate().map(|(i, next)| update_salted(
+            &s1.subject_cid512, 2, s1.record_digest, &n2, &[next], FUTURE,
+            Some(&format!("independent-{i}")),
+        )).collect();
+        let barrier = std::sync::Barrier::new(N);
+        let outcomes = Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for (i, record) in records.iter().enumerate() {
+                let guard = if i % 2 == 0 { &a } else { &b };
+                let outcomes = &outcomes;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    outcomes.lock().push(guard.admit_successor(record, NOW));
+                });
+            }
+        });
+        let outcomes = outcomes.into_inner();
+        assert_eq!(outcomes.iter().filter(|o| matches!(o, Ok(Admission::Advanced(_)))).count(), 1);
+        assert_eq!(outcomes.iter().filter(|o| matches!(o, Err(AdmissionError::Duplicity(_)))).count(), N - 1);
+        assert_eq!(b.watermark(&s0.subject_cid512).unwrap().unwrap().epoch, 2);
     }
 
     // ---- FIX (#959): seed_genesis is rollback-safe ------------------------
