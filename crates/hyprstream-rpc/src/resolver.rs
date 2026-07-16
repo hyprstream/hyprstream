@@ -241,28 +241,38 @@ fn transport_fingerprint(transport: &TransportConfig) -> String {
     blake3::hash(bytes.as_bytes()).to_hex().to_string()
 }
 
+fn hash_framed(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
 fn candidate_fingerprint(candidate: &ServiceCandidate) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(candidate.service_name.as_bytes());
-    h.update(candidate.service_did.as_str().as_bytes());
+    hash_framed(&mut h, candidate.service_name.as_bytes());
+    hash_framed(&mut h, candidate.service_did.as_str().as_bytes());
     h.update(&candidate.response_verifying_key);
-    h.update(&candidate.response_ml_dsa65);
-    h.update(candidate.response_key_id.as_bytes());
+    hash_framed(&mut h, &candidate.response_ml_dsa65);
+    hash_framed(&mut h, candidate.response_key_id.as_bytes());
     if let Some(kem) = &candidate.request_kem_recipient {
-        h.update(kem.key_id.as_bytes());
-        h.update(&kem.recipient.encode());
+        hash_framed(&mut h, kem.key_id.as_bytes());
+        hash_framed(&mut h, &kem.recipient.encode());
     }
-    h.update(transport_fingerprint(&candidate.transport).as_bytes());
+    hash_framed(
+        &mut h,
+        transport_fingerprint(&candidate.transport).as_bytes(),
+    );
     for capability in &candidate.capabilities {
-        h.update(capability.as_bytes());
-        h.update(&[0]);
+        hash_framed(&mut h, capability.as_bytes());
     }
     h.update(&candidate.accepted_state.digest);
     h.update(&candidate.accepted_state.epoch.to_be_bytes());
-    h.update(candidate.accepted_state.service_did.as_str().as_bytes());
+    hash_framed(
+        &mut h,
+        candidate.accepted_state.service_did.as_str().as_bytes(),
+    );
     h.update(&candidate.accepted_state.expires_at_unix_ms.to_be_bytes());
     h.update(&candidate.accepted_state.response_ed25519);
-    h.update(&candidate.accepted_state.response_ml_dsa65);
+    hash_framed(&mut h, &candidate.accepted_state.response_ml_dsa65);
     h.update(&candidate.source_signer);
     h.update(&candidate.expires_at_unix_ms.to_be_bytes());
     if let Some(kem) = &candidate.request_kem_recipient {
@@ -374,8 +384,7 @@ where
                 && resolved.request_kem_recipient == authority.request_kem_recipient
                 && resolved.evidence.accepted_state_digest
                     == authority.evidence.accepted_state_digest
-                && resolved.evidence.accepted_state_epoch
-                    == authority.evidence.accepted_state_epoch
+                && resolved.evidence.accepted_state_epoch == authority.evidence.accepted_state_epoch
         }),
         "validated retry set crosses service authority"
     );
@@ -391,9 +400,7 @@ where
                     .cmp(&b.evidence.selected_fingerprint)
             })
     });
-    ordered.dedup_by(|a, b| {
-        a.evidence.selected_fingerprint == b.evidence.selected_fingerprint
-    });
+    ordered.dedup_by(|a, b| a.evidence.selected_fingerprint == b.evidence.selected_fingerprint);
     let mut last_error = None;
     for resolved in ordered.iter().take(max_attempts.min(16)) {
         match attempt(resolved).await {
@@ -752,8 +759,13 @@ mod tests {
 
     #[test]
     fn candidate_permutations_select_identically() {
-        let a = candidate(1, TransportConfig::iroh([1; 32], Vec::new(), None));
+        let mut a = candidate(1, TransportConfig::iroh([1; 32], Vec::new(), None));
+        a.capabilities.extend(["x".to_owned(), "y".to_owned()]);
         let mut b = a.clone();
+        b.capabilities.remove("x");
+        b.capabilities.remove("y");
+        b.capabilities.insert("x\0y".to_owned());
+        assert_ne!(candidate_fingerprint(&a), candidate_fingerprint(&b));
         b.transport = TransportConfig::iroh([2; 32], Vec::new(), None);
         let first = select_service_candidate(&network_query(), vec![a.clone(), b.clone()], 1_000)
             .unwrap_or_else(|e| panic!("selection failed: {e}"));
@@ -817,18 +829,10 @@ mod tests {
         let first_candidate = candidate(1, TransportConfig::iroh([1; 32], Vec::new(), None));
         let mut second_candidate = first_candidate.clone();
         second_candidate.transport = TransportConfig::iroh([2; 32], Vec::new(), None);
-        let first = select_service_candidate(
-            &network_query(),
-            vec![first_candidate],
-            1_000,
-        )
-        .unwrap_or_else(|e| panic!("selection failed: {e}"));
-        let second = select_service_candidate(
-            &network_query(),
-            vec![second_candidate],
-            1_000,
-        )
-        .unwrap_or_else(|e| panic!("selection failed: {e}"));
+        let first = select_service_candidate(&network_query(), vec![first_candidate], 1_000)
+            .unwrap_or_else(|e| panic!("selection failed: {e}"));
+        let second = select_service_candidate(&network_query(), vec![second_candidate], 1_000)
+            .unwrap_or_else(|e| panic!("selection failed: {e}"));
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let observed = Arc::clone(&seen);
         let result: anyhow::Result<()> =

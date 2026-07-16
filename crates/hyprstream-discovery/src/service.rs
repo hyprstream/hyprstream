@@ -469,7 +469,9 @@ impl DiscoveryServiceResolver {
             {
                 continue;
             }
-            let state_expiry = accepted_expiry_unix_ms(&state)?;
+            let Ok(state_expiry) = accepted_expiry_unix_ms(&state) else {
+                continue;
+            };
             let Some(current_key) = state
                 .current
                 .subject_keys
@@ -478,14 +480,17 @@ impl DiscoveryServiceResolver {
             else {
                 continue;
             };
-            let response_ed25519: [u8; 32] =
-                current_key.ed25519_pub.as_slice().try_into().map_err(|_| {
-                    anyhow::anyhow!("accepted response Ed25519 key has wrong length")
-                })?;
-            let recipient = hyprstream_rpc::crypto::hybrid_kem::RecipientPublic::decode(
+            let Ok(response_ed25519) = current_key.ed25519_pub.as_slice().try_into() else {
+                continue;
+            };
+            let Ok(recipient) = hyprstream_rpc::crypto::hybrid_kem::RecipientPublic::decode(
                 &entry.request_kem_recipient,
-            )?;
-            let transport = announced_endpoint_to_transport(&entry)?;
+            ) else {
+                continue;
+            };
+            let Ok(transport) = announced_endpoint_to_transport(&entry) else {
+                continue;
+            };
             let mut digest = [0u8; 64];
             digest.copy_from_slice(&entry.accepted_state_digest);
             candidates.push(ServiceCandidate {
@@ -829,6 +834,26 @@ mod resolver_tests {
             .resolve_service(ServiceQuery::network("model").expect("query"))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn malformed_candidate_does_not_poison_valid_alternative() {
+        let (resolver, _) = production_fixture(false);
+        {
+            let mut endpoints = resolver.announced_endpoints.write();
+            let entries = endpoints.get_mut("model").expect("fixture service");
+            let mut malformed = entries.first().expect("fixture endpoint").clone();
+            malformed.request_kem_recipient = vec![0xff];
+            malformed.socket_kind = "quic".to_owned();
+            malformed.endpoint = "quic://missing-port".to_owned();
+            entries.insert(0, malformed);
+        }
+
+        let resolved = resolver
+            .resolve_service(ServiceQuery::network("model").expect("query"))
+            .await
+            .unwrap_or_else(|e| panic!("malformed alternative poisoned valid candidate: {e}"));
+        assert_eq!(resolved.service_name(), "model");
     }
 
     #[tokio::test]
@@ -1266,6 +1291,39 @@ impl DiscoveryHandler for DiscoveryService {
                 !service_jwt.is_empty(),
                 "identity-bound announcement requires a verified service JWT"
             );
+            anyhow::ensure!(
+                data.service_did.is_did_at9p()
+                    && data.accepted_state_digest.len() == 64
+                    && !data.capabilities.is_empty()
+                    && data
+                        .response_key_id
+                        .starts_with(&format!("{}#", data.service_did))
+                    && data
+                        .request_kem_key_id
+                        .starts_with(&format!("{}#", data.service_did))
+                    && data.expires_at_unix_ms > unix_millis_now(),
+                "identity-bound announcement metadata is incomplete or expired"
+            );
+            let recipient = hyprstream_rpc::crypto::hybrid_kem::RecipientPublic::decode(
+                &data.request_kem_recipient,
+            )?;
+            anyhow::ensure!(
+                recipient.suite_id
+                    == hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768
+                    && recipient.eks.len() == recipient.suite_id.components().len(),
+                "identity-bound announcement requires suite-complete hybrid KEM material"
+            );
+            match data.socket_kind.as_str() {
+                "quic" => {
+                    parse_announced_quic(&data.endpoint)?;
+                }
+                "iroh" => {
+                    parse_announced_iroh(&data.endpoint)?;
+                }
+                _ => {
+                    anyhow::bail!("identity-bound network announcement requires QUIC or Iroh reach")
+                }
+            }
         }
 
         // R3: Verify service JWT signature + subject matches serviceName.

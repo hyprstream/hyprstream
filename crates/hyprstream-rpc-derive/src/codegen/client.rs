@@ -616,7 +616,10 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
     quote! {
         #[cfg(not(target_arch = "wasm32"))]
         impl #client_name {
-            /// Deprecated explicit local/bootstrap adapter.
+            /// Legacy explicit local/bootstrap adapter.
+            ///
+            /// This remains necessary for co-located bootstrap, but it is not
+            /// production resolution and carries no closure evidence.
             ///
             /// `destination` is the Ed25519 verifying key of the target service,
             /// used to verify response envelope signatures. This must be the target service's
