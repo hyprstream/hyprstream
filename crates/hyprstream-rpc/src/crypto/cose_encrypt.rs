@@ -12,10 +12,11 @@
 //! labels below define a project-local profile and make no draft-interoperability
 //! claim.  PQUIP / RFC 9794 supplies transition terminology, not wire semantics.
 //!
-//! New consumers should use [`seal`], [`open`], [`seal_prederived`], and
-//! [`open_prederived`] with an owning [`NonceLedger`].  The fresh-encapsulation
-//! envelope wrappers at the bottom remain only for the already-landed signed
-//! envelope path, whose replay lifecycle is owned by `SignedEnvelope`.
+//! New consumers should use [`seal`] and [`seal_prederived`] with an owning
+//! [`OutboundNonceLedger`], and [`open`] and [`open_prederived`] with an owning
+//! [`InboundReplayLedger`].  The fresh-encapsulation envelope wrappers at the
+//! bottom remain only for the already-landed signed envelope path, whose replay
+//! lifecycle is owned by `SignedEnvelope`.
 
 use std::collections::HashSet;
 
@@ -130,24 +131,26 @@ impl NonceUse {
     }
 }
 
-/// Bounded owning state for outbound nonce-use and inbound replay rejection.
+/// Irreversible bounded state for outbound nonce use.
 ///
-/// A ledger is directional: do not share the same instance between a sender and
-/// receiver.  `seal*` burns a coordinate before cryptographic work, so even an
-/// error cannot lead to an uncertain nonce being reused.  `open*` records a
-/// coordinate only after successful authentication, preventing invalid packets
-/// from consuming the replay budget.
+/// One ledger owns the complete lifetime of the base key supplied to `seal*`.
+/// It may be dropped only after that base key has been irreversibly destroyed or
+/// rotated out; constructing a replacement ledger while retaining the key would
+/// discard its nonce-safety history.  Burns are never evicted or retired, and
+/// capacity exhaustion therefore requires base-key rotation.  A coordinate is
+/// burned before cryptographic work, so even an error cannot make an uncertain
+/// nonce reusable.
 #[derive(Debug)]
-pub struct NonceLedger {
+pub struct OutboundNonceLedger {
     capacity: usize,
     seen: HashSet<NonceUse>,
 }
 
-impl NonceLedger {
-    /// Construct a ledger with a finite non-zero capacity.
+impl OutboundNonceLedger {
+    /// Construct outbound state with a finite non-zero lifetime capacity.
     pub fn new(capacity: usize) -> Result<Self> {
         if capacity == 0 || capacity > MAX_LEDGER_ENTRIES {
-            bail!("nonce ledger capacity must be in 1..={MAX_LEDGER_ENTRIES}");
+            bail!("outbound nonce ledger capacity must be in 1..={MAX_LEDGER_ENTRIES}");
         }
         Ok(Self {
             capacity,
@@ -155,20 +158,70 @@ impl NonceLedger {
         })
     }
 
-    /// Number of retained nonce/replay coordinates.
+    /// Number of irreversibly burned nonce coordinates.
     pub fn len(&self) -> usize {
         self.seen.len()
     }
 
-    /// Whether no coordinates are retained.
+    /// Whether no coordinates have been burned.
     pub fn is_empty(&self) -> bool {
         self.seen.is_empty()
     }
 
-    /// Retire one epoch after the owning lifecycle has made it unacceptable.
+    fn ensure_unseen(&self, usage: &NonceUse) -> Result<()> {
+        if self.seen.contains(usage) {
+            bail!("nonce coordinate already used or ciphertext replayed");
+        }
+        Ok(())
+    }
+
+    fn record(&mut self, usage: NonceUse) -> Result<()> {
+        self.ensure_unseen(&usage)?;
+        if self.seen.len() >= self.capacity {
+            bail!("outbound nonce ledger capacity exhausted; destroy and rotate the base key");
+        }
+        self.seen.insert(usage);
+        Ok(())
+    }
+}
+
+/// Bounded state for authenticated inbound replay rejection.
+///
+/// Unlike outbound burns, replay entries may be retired after the public
+/// lifecycle owner has made the corresponding epoch unacceptable before
+/// calling `open*`.  Retirement does not and cannot affect outbound state.
+#[derive(Debug)]
+pub struct InboundReplayLedger {
+    capacity: usize,
+    seen: HashSet<NonceUse>,
+}
+
+impl InboundReplayLedger {
+    /// Construct inbound replay state with a finite non-zero capacity.
+    pub fn new(capacity: usize) -> Result<Self> {
+        if capacity == 0 || capacity > MAX_LEDGER_ENTRIES {
+            bail!("inbound replay ledger capacity must be in 1..={MAX_LEDGER_ENTRIES}");
+        }
+        Ok(Self {
+            capacity,
+            seen: HashSet::with_capacity(capacity.min(4096)),
+        })
+    }
+
+    /// Number of retained authenticated replay coordinates.
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
+    /// Whether no replay coordinates are retained.
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
+
+    /// Retire an inbound epoch after the owner has made it unacceptable.
     ///
-    /// Removing replay state is safe only after the lifecycle rejects that epoch
-    /// before calling `open`; this method does not itself implement grace policy.
+    /// This is replay-retention management only; epoch install, accept, grace,
+    /// and retirement policy remain with #554/#555.
     pub fn retire_epoch(
         &mut self,
         suite: SuiteId,
@@ -188,7 +241,7 @@ impl NonceLedger {
 
     fn ensure_unseen(&self, usage: &NonceUse) -> Result<()> {
         if self.seen.contains(usage) {
-            bail!("nonce coordinate already used or ciphertext replayed");
+            bail!("ciphertext replayed");
         }
         Ok(())
     }
@@ -196,7 +249,7 @@ impl NonceLedger {
     fn record(&mut self, usage: NonceUse) -> Result<()> {
         self.ensure_unseen(&usage)?;
         if self.seen.len() >= self.capacity {
-            bail!("nonce ledger capacity exhausted; rotate/retire at lifecycle boundary");
+            bail!("inbound replay ledger capacity exhausted; retire an unacceptable epoch");
         }
         self.seen.insert(usage);
         Ok(())
@@ -462,7 +515,7 @@ fn require_no_unprotected(enc: &CoseEncrypt0) -> Result<()> {
 /// Allocation-free structural validation of the small CBOR subset used by the
 /// COSE profile.  In addition to bounding work, this independently enforces RFC
 /// 8949 core deterministic argument encodings and map-key order (encoded-key
-/// length, then bytewise lexical order).  It intentionally performs no COSE
+/// bytes compared lexicographically).  It intentionally performs no COSE
 /// semantics; `coset` remains the sole semantic decoder below.
 struct CborPreflight<'a> {
     input: &'a [u8],
@@ -633,7 +686,7 @@ impl<'a> CborPreflight<'a> {
                     if let Some((previous_start, previous_end)) = previous_key {
                         let previous = &self.input[previous_start..previous_end];
                         let current = &self.input[key_start..key_end];
-                        if (previous.len(), previous) >= (current.len(), current) {
+                        if previous >= current {
                             bail!("CBOR map keys are duplicate or not in deterministic order");
                         }
                     }
@@ -774,7 +827,7 @@ pub fn seal(
     context: &SealContext,
     plaintext: &[u8],
     external_aad: &[u8],
-    nonce_ledger: &mut NonceLedger,
+    nonce_ledger: &mut OutboundNonceLedger,
 ) -> Result<Vec<u8>> {
     validate_inputs(context, plaintext.len(), external_aad)?;
     nonce_ledger.record(NonceUse::new(recipient.suite_id, context))?;
@@ -796,7 +849,7 @@ pub fn open(
     expected: &SealContext,
     cose_bytes: &[u8],
     external_aad: &[u8],
-    replay_ledger: &mut NonceLedger,
+    replay_ledger: &mut InboundReplayLedger,
 ) -> Result<Vec<u8>> {
     validate_inputs(expected, 0, external_aad)?;
     let usage = NonceUse::new(recipient.suite_id, expected);
@@ -824,7 +877,7 @@ pub fn seal_prederived(
     context: &SealContext,
     plaintext: &[u8],
     external_aad: &[u8],
-    nonce_ledger: &mut NonceLedger,
+    nonce_ledger: &mut OutboundNonceLedger,
 ) -> Result<Vec<u8>> {
     validate_inputs(context, plaintext.len(), external_aad)?;
     nonce_ledger.record(NonceUse::new(suite, context))?;
@@ -838,7 +891,7 @@ pub fn open_prederived(
     expected: &SealContext,
     cose_bytes: &[u8],
     external_aad: &[u8],
-    replay_ledger: &mut NonceLedger,
+    replay_ledger: &mut InboundReplayLedger,
 ) -> Result<Vec<u8>> {
     validate_inputs(expected, 0, external_aad)?;
     let usage = NonceUse::new(expected_suite, expected);
@@ -886,7 +939,7 @@ fn digest_parts(label: &[u8], parts: &[&[u8]]) -> [u8; 32] {
 
 /// Compatibility wrapper for the existing encrypted-envelope lifecycle.
 ///
-/// New code must use [`seal`] with an owning [`NonceLedger`].
+/// New code must use [`seal`] with an owning [`OutboundNonceLedger`].
 pub fn seal_to_recipient(
     recipient: &RecipientPublic,
     plaintext: &[u8],
@@ -910,7 +963,7 @@ pub fn seal_to_recipient(
 
 /// Compatibility wrapper for the existing encrypted-envelope lifecycle.
 ///
-/// New code must use [`open`] with an owning [`NonceLedger`].
+/// New code must use [`open`] with an owning [`InboundReplayLedger`].
 pub fn open_from_recipient(
     recipient: &RecipientKeypair,
     cose_bytes: &[u8],
@@ -947,8 +1000,12 @@ mod tests {
         }
     }
 
-    fn ledger() -> NonceLedger {
-        NonceLedger::new(32).unwrap()
+    fn outbound_ledger() -> OutboundNonceLedger {
+        OutboundNonceLedger::new(32).unwrap()
+    }
+
+    fn inbound_ledger() -> InboundReplayLedger {
+        InboundReplayLedger::new(32).unwrap()
     }
 
     fn material(enc: &CoseEncrypt0) -> HybridKemMaterial {
@@ -1007,9 +1064,9 @@ mod tests {
     fn recipient_roundtrip_and_replay_rejected() {
         let recipient = generate_recipient(SUITE).unwrap();
         let ctx = context(9);
-        let mut outbound = ledger();
+        let mut outbound = outbound_ledger();
         let sealed = seal(&recipient.public(), &ctx, b"secret", AAD, &mut outbound).unwrap();
-        let mut inbound = ledger();
+        let mut inbound = inbound_ledger();
         assert_eq!(
             open(&recipient, &ctx, &sealed, AAD, &mut inbound).unwrap(),
             b"secret"
@@ -1021,7 +1078,7 @@ mod tests {
     fn outbound_nonce_reuse_is_burned() {
         let recipient = generate_recipient(SUITE).unwrap();
         let ctx = context(4);
-        let mut outbound = ledger();
+        let mut outbound = outbound_ledger();
         seal(&recipient.public(), &ctx, b"first", AAD, &mut outbound).unwrap();
         assert!(seal(&recipient.public(), &ctx, b"second", AAD, &mut outbound).is_err());
     }
@@ -1030,7 +1087,14 @@ mod tests {
     fn wrong_context_fields_and_aad_rejected() {
         let recipient = generate_recipient(SUITE).unwrap();
         let ctx = context(7);
-        let sealed = seal(&recipient.public(), &ctx, b"secret", AAD, &mut ledger()).unwrap();
+        let sealed = seal(
+            &recipient.public(),
+            &ctx,
+            b"secret",
+            AAD,
+            &mut outbound_ledger(),
+        )
+        .unwrap();
         let mutations = [
             {
                 let mut value = ctx.clone();
@@ -1059,14 +1123,14 @@ mod tests {
             },
         ];
         for mutation in mutations {
-            assert!(open(&recipient, &mutation, &sealed, AAD, &mut ledger()).is_err());
+            assert!(open(&recipient, &mutation, &sealed, AAD, &mut inbound_ledger()).is_err());
         }
         assert!(open(
             &recipient,
             &ctx,
             &sealed,
             b"wrong transcript",
-            &mut ledger()
+            &mut inbound_ledger()
         )
         .is_err());
     }
@@ -1076,8 +1140,15 @@ mod tests {
         let first = generate_recipient(SUITE).unwrap();
         let second = generate_recipient(SUITE).unwrap();
         let ctx = context(1);
-        let sealed = seal(&first.public(), &ctx, b"secret", AAD, &mut ledger()).unwrap();
-        assert!(open(&second, &ctx, &sealed, AAD, &mut ledger()).is_err());
+        let sealed = seal(
+            &first.public(),
+            &ctx,
+            b"secret",
+            AAD,
+            &mut outbound_ledger(),
+        )
+        .unwrap();
+        assert!(open(&second, &ctx, &sealed, AAD, &mut inbound_ledger()).is_err());
 
         let x_seed = [0x11; 32];
         let pq_seed_a = [0x22; 64];
@@ -1089,10 +1160,10 @@ mod tests {
             &context(2),
             b"secret",
             AAD,
-            &mut ledger(),
+            &mut outbound_ledger(),
         )
         .unwrap();
-        assert!(open(&cartesian, &context(2), &sealed, AAD, &mut ledger()).is_err());
+        assert!(open(&cartesian, &context(2), &sealed, AAD, &mut inbound_ledger()).is_err());
     }
 
     #[test]
@@ -1100,8 +1171,22 @@ mod tests {
         let recipient = generate_recipient(SUITE).unwrap();
         let ctx_a = context(10);
         let ctx_b = context(11);
-        let sealed_a = seal(&recipient.public(), &ctx_a, b"a", AAD, &mut ledger()).unwrap();
-        let sealed_b = seal(&recipient.public(), &ctx_b, b"b", AAD, &mut ledger()).unwrap();
+        let sealed_a = seal(
+            &recipient.public(),
+            &ctx_a,
+            b"a",
+            AAD,
+            &mut outbound_ledger(),
+        )
+        .unwrap();
+        let sealed_b = seal(
+            &recipient.public(),
+            &ctx_b,
+            b"b",
+            AAD,
+            &mut outbound_ledger(),
+        )
+        .unwrap();
         let enc_a = CoseEncrypt0::from_slice(&sealed_a).unwrap();
         let enc_b = CoseEncrypt0::from_slice(&sealed_b).unwrap();
 
@@ -1115,7 +1200,7 @@ mod tests {
             &ctx_a,
             &mutated.to_vec().unwrap(),
             AAD,
-            &mut ledger()
+            &mut inbound_ledger()
         )
         .is_err());
 
@@ -1132,7 +1217,7 @@ mod tests {
             &ctx_a,
             &mutated.to_vec().unwrap(),
             AAD,
-            &mut ledger()
+            &mut inbound_ledger()
         )
         .is_err());
 
@@ -1151,7 +1236,7 @@ mod tests {
             &ctx_a,
             &mutated.to_vec().unwrap(),
             AAD,
-            &mut ledger()
+            &mut inbound_ledger()
         )
         .is_err());
     }
@@ -1160,11 +1245,18 @@ mod tests {
     fn noncanonical_and_duplicate_headers_rejected() {
         let recipient = generate_recipient(SUITE).unwrap();
         let ctx = context(12);
-        let sealed = seal(&recipient.public(), &ctx, b"secret", AAD, &mut ledger()).unwrap();
+        let sealed = seal(
+            &recipient.public(),
+            &ctx,
+            b"secret",
+            AAD,
+            &mut outbound_ledger(),
+        )
+        .unwrap();
         assert_eq!(sealed[0], 0x83);
         let mut noncanonical = vec![0x98, 0x03];
         noncanonical.extend_from_slice(&sealed[1..]);
-        assert!(open(&recipient, &ctx, &noncanonical, AAD, &mut ledger()).is_err());
+        assert!(open(&recipient, &ctx, &noncanonical, AAD, &mut inbound_ledger()).is_err());
 
         let mut top: CborValue = ciborium::de::from_reader(sealed.as_slice()).unwrap();
         let array = match &mut top {
@@ -1186,7 +1278,14 @@ mod tests {
         protected.extend_from_slice(&encoded_duplicate[1..]);
         let mut duplicate_wire = Vec::new();
         ciborium::ser::into_writer(&top, &mut duplicate_wire).unwrap();
-        assert!(open(&recipient, &ctx, &duplicate_wire, AAD, &mut ledger()).is_err());
+        assert!(open(
+            &recipient,
+            &ctx,
+            &duplicate_wire,
+            AAD,
+            &mut inbound_ledger()
+        )
+        .is_err());
     }
 
     #[test]
@@ -1197,7 +1296,7 @@ mod tests {
             &context(121),
             b"secret",
             AAD,
-            &mut ledger(),
+            &mut outbound_ledger(),
         )
         .unwrap();
 
@@ -1241,7 +1340,7 @@ mod tests {
             &context(122),
             b"secret",
             AAD,
-            &mut ledger(),
+            &mut outbound_ledger(),
         )
         .unwrap();
 
@@ -1349,19 +1448,20 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_map_order_is_encoded_length_then_bytewise() {
+    fn deterministic_map_order_is_core_bytewise_lexicographic() {
         let finish = |mut prefix: Vec<u8>| {
             prefix.push(0x50);
             prefix.extend_from_slice(&[0u8; 16]);
             prefix
         };
-        // RFC 8949 core deterministic order puts the one-byte encoded key -1
-        // (0x20) before the two-byte encoded key 100 (0x18 0x64), even though a
-        // raw lexicographic comparison alone would reverse them.
-        let canonical = finish(vec![0x83, 0x41, 0xa0, 0xa2, 0x20, 0x00, 0x18, 0x64, 0x00]);
+        // RFC 8949 section 4.2.1 compares the deterministic key encodings
+        // bytewise, so 100 (0x18 0x64) sorts before -1 (0x20).  The reverse is
+        // the optional length-first order from section 4.2.3, which this profile
+        // deliberately does not implement.
+        let canonical = finish(vec![0x83, 0x41, 0xa0, 0xa2, 0x18, 0x64, 0x00, 0x20, 0x00]);
         assert!(preflight_cose_encrypt0(&canonical).is_ok());
 
-        let reversed = finish(vec![0x83, 0x41, 0xa0, 0xa2, 0x18, 0x64, 0x00, 0x20, 0x00]);
+        let reversed = finish(vec![0x83, 0x41, 0xa0, 0xa2, 0x20, 0x00, 0x18, 0x64, 0x00]);
         assert!(preflight_cose_encrypt0(&reversed).is_err());
     }
 
@@ -1374,14 +1474,21 @@ mod tests {
     fn truncation_unknown_headers_and_tamper_rejected() {
         let recipient = generate_recipient(SUITE).unwrap();
         let ctx = context(13);
-        let sealed = seal(&recipient.public(), &ctx, b"secret", AAD, &mut ledger()).unwrap();
+        let sealed = seal(
+            &recipient.public(),
+            &ctx,
+            b"secret",
+            AAD,
+            &mut outbound_ledger(),
+        )
+        .unwrap();
         for cut in [0, 1, sealed.len() / 2, sealed.len() - 1] {
-            assert!(open(&recipient, &ctx, &sealed[..cut], AAD, &mut ledger()).is_err());
+            assert!(open(&recipient, &ctx, &sealed[..cut], AAD, &mut inbound_ledger()).is_err());
         }
         let mut tampered = sealed.clone();
         let last = tampered.len() - 1;
         tampered[last] ^= 0x80;
-        assert!(open(&recipient, &ctx, &tampered, AAD, &mut ledger()).is_err());
+        assert!(open(&recipient, &ctx, &tampered, AAD, &mut inbound_ledger()).is_err());
 
         let mut unknown = CoseEncrypt0::from_slice(&sealed).unwrap();
         unknown
@@ -1395,7 +1502,7 @@ mod tests {
             &ctx,
             &unknown.to_vec().unwrap(),
             AAD,
-            &mut ledger()
+            &mut inbound_ledger()
         )
         .is_err());
     }
@@ -1404,7 +1511,14 @@ mod tests {
     fn wrong_suite_and_algorithm_headers_rejected() {
         let recipient = generate_recipient(SUITE).unwrap();
         let ctx = context(14);
-        let sealed = seal(&recipient.public(), &ctx, b"secret", AAD, &mut ledger()).unwrap();
+        let sealed = seal(
+            &recipient.public(),
+            &ctx,
+            b"secret",
+            AAD,
+            &mut outbound_ledger(),
+        )
+        .unwrap();
 
         let mut wrong_suite = CoseEncrypt0::from_slice(&sealed).unwrap();
         let (_, suite_value) = wrong_suite
@@ -1421,7 +1535,7 @@ mod tests {
             &ctx,
             &wrong_suite.to_vec().unwrap(),
             AAD,
-            &mut ledger()
+            &mut inbound_ledger()
         )
         .is_err());
 
@@ -1434,7 +1548,7 @@ mod tests {
             &ctx,
             &wrong_algorithm.to_vec().unwrap(),
             AAD,
-            &mut ledger()
+            &mut inbound_ledger()
         )
         .is_err());
     }
@@ -1442,16 +1556,17 @@ mod tests {
     #[test]
     fn bounded_inputs_and_ledger_exhaustion_fail_closed() {
         let recipient = generate_recipient(SUITE).unwrap();
-        let mut one = NonceLedger::new(1).unwrap();
+        let mut one = OutboundNonceLedger::new(1).unwrap();
         seal(&recipient.public(), &context(0), b"a", AAD, &mut one).unwrap();
         assert!(seal(&recipient.public(), &context(1), b"b", AAD, &mut one).is_err());
-        assert!(NonceLedger::new(0).is_err());
+        assert!(OutboundNonceLedger::new(0).is_err());
+        assert!(InboundReplayLedger::new(0).is_err());
         assert!(seal(
             &recipient.public(),
             &context(2),
             b"x",
             &vec![0; MAX_EXTERNAL_AAD_BYTES + 1],
-            &mut ledger()
+            &mut outbound_ledger()
         )
         .is_err());
         assert!(seal(
@@ -1459,7 +1574,7 @@ mod tests {
             &context(3),
             &vec![0; MAX_PLAINTEXT_BYTES + 1],
             AAD,
-            &mut ledger()
+            &mut outbound_ledger()
         )
         .is_err());
         assert!(open(
@@ -1467,18 +1582,18 @@ mod tests {
             &context(4),
             &vec![0; MAX_COSE_BYTES + 1],
             AAD,
-            &mut ledger()
+            &mut inbound_ledger()
         )
         .is_err());
     }
 
     #[test]
-    fn prederived_roundtrip_context_key_and_epoch_retirement() {
+    fn prederived_outbound_burn_survives_inbound_epoch_retirement() {
         let key = [0x42; 32];
         let ctx = context(21);
-        let mut outbound = ledger();
+        let mut outbound = outbound_ledger();
         let sealed = seal_prederived(&key, SUITE, &ctx, b"block", AAD, &mut outbound).unwrap();
-        let mut inbound = ledger();
+        let mut inbound = inbound_ledger();
         assert_eq!(
             open_prederived(&key, SUITE, &ctx, &sealed, AAD, &mut inbound).unwrap(),
             b"block"
@@ -1491,6 +1606,7 @@ mod tests {
             ctx.epoch,
         );
         assert!(inbound.is_empty());
+        assert!(seal_prederived(&key, SUITE, &ctx, b"again", AAD, &mut outbound).is_err());
     }
 
     #[test]
