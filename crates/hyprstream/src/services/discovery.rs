@@ -122,8 +122,15 @@ fn at9p_state_key(subject_cid512: &str) -> Vec<u8> {
     format!("at9p-state\0{subject_cid512}").into_bytes()
 }
 
-const AT9P_STATE_MAGIC: &[u8; 8] = b"AT9PST01";
+const AT9P_STATE_MAGIC: &[u8; 8] = b"AT9PST02";
 const AT9P_STATE_HEADER_LEN: usize = 8 + 1 + 8 + 64 + 1 + 4;
+const AT9P_ACCEPTANCE_MAGIC: &[u8; 8] = b"AT9PAC01";
+const ED25519_KEY_LEN: usize = 32;
+const ED25519_SIGNATURE_LEN: usize = 64;
+const AT9P_ACCEPTANCE_PREFIX_LEN: usize =
+    AT9P_ACCEPTANCE_MAGIC.len() + ED25519_KEY_LEN + ED25519_SIGNATURE_LEN;
+const AT9P_ACCEPTANCE_KEY_AAD: &[u8] = b"hyprstream-at9p-acceptance-key/1";
+const AT9P_ACCEPTANCE_STATE_AAD: &[u8] = b"hyprstream-at9p-accepted-state/1";
 
 /// Split a full record key back into `(collection, tid)`, given the `did` it
 /// was built for.
@@ -163,6 +170,10 @@ fn parse_record_key(key: &[u8], did: &str) -> AnyResult<(String, Tid)> {
 /// callers that need a live view reopen per read (see [`RecordBacking::ReadOnly`]).
 pub struct PdsRecordStore {
     backing: RecordBacking,
+    /// Trusted deployment identity that certifies the purpose-derived key on
+    /// daemon-authenticated accepted-state envelopes. This is verification
+    /// material only; the resolver still holds no signing key.
+    at9p_acceptance_identity: Option<ed25519_dalek::VerifyingKey>,
 }
 
 enum RecordBacking {
@@ -188,6 +199,7 @@ impl PdsRecordStore {
             .with_context(|| format!("failed to open PDS record store (rw) at {path:?}"))?;
         Ok(Self {
             backing: RecordBacking::ReadWrite(db),
+            at9p_acceptance_identity: None,
         })
     }
 
@@ -201,7 +213,14 @@ impl PdsRecordStore {
             .with_context(|| format!("failed to open PDS record store (ro) at {path:?}"))?;
         Ok(Self {
             backing: RecordBacking::ReadOnly(path.to_path_buf()),
+            at9p_acceptance_identity: None,
         })
+    }
+
+    /// Pin the deployment identity that certifies accepted-state envelopes.
+    pub fn with_at9p_acceptance_identity(mut self, identity: ed25519_dalek::VerifyingKey) -> Self {
+        self.at9p_acceptance_identity = Some(identity);
+        self
     }
 
     /// Atomically persist a record and the repo's freshly-signed commit.
@@ -227,7 +246,11 @@ impl PdsRecordStore {
         Ok(())
     }
 
-    fn load_at9p_state(&self, subject_cid512: &str) -> AnyResult<Option<AcceptedAt9pState>> {
+    fn load_at9p_state(
+        &self,
+        subject_cid512: &str,
+        acceptance_identity: &ed25519_dalek::VerifyingKey,
+    ) -> AnyResult<Option<AcceptedAt9pState>> {
         let bytes = match &self.backing {
             RecordBacking::ReadWrite(db) => db.get(at9p_state_key(subject_cid512))?,
             RecordBacking::ReadOnly(path) => {
@@ -236,7 +259,7 @@ impl PdsRecordStore {
             }
         };
         let Some(bytes) = bytes else { return Ok(None) };
-        decode_at9p_state(subject_cid512, &bytes).map(Some)
+        decode_at9p_state(subject_cid512, &bytes, acceptance_identity).map(Some)
     }
 
     /// Typed accepted-current state read path for resolver/admission consumers.
@@ -250,7 +273,11 @@ impl PdsRecordStore {
         let subject = did
             .strip_prefix(DID_AT9P_PREFIX)
             .ok_or_else(|| anyhow!("identifier is not did:at9p: {did:?}"))?;
-        let Some(state) = self.load_at9p_state(subject)? else {
+        let acceptance_identity = self
+            .at9p_acceptance_identity
+            .as_ref()
+            .ok_or_else(|| anyhow!("accepted-state verification identity is not configured"))?;
+        let Some(state) = self.load_at9p_state(subject, acceptance_identity)? else {
             return Ok(None);
         };
         anyhow::ensure!(state.did == did, "accepted at9p state DID mismatch");
@@ -260,11 +287,16 @@ impl PdsRecordStore {
         Ok(Some(state))
     }
 
-    fn put_at9p_state(&self, state: &AcceptedAt9pState) -> AnyResult<()> {
+    fn put_at9p_state(
+        &self,
+        state: &AcceptedAt9pState,
+        acceptance_identity: &ed25519_dalek::SigningKey,
+        audit_key: &ed25519_dalek::SigningKey,
+    ) -> AnyResult<()> {
         let RecordBacking::ReadWrite(db) = &self.backing else {
             bail!("accepted did:at9p state write attempted on a read-only PDS store");
         };
-        let encoded = encode_at9p_state(state)?;
+        let encoded = encode_at9p_state(state, acceptance_identity, audit_key)?;
         let mut options = rocksdb::WriteOptions::default();
         options.set_sync(true);
         db.put_opt(at9p_state_key(&state.subject_cid512), encoded, &options)
@@ -364,7 +396,14 @@ impl PdsRecordStore {
     }
 }
 
-fn encode_at9p_state(state: &AcceptedAt9pState) -> AnyResult<Vec<u8>> {
+fn acceptance_message(domain: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(domain.len() + payload.len());
+    message.extend_from_slice(domain);
+    message.extend_from_slice(payload);
+    message
+}
+
+fn encode_at9p_state_body(state: &AcceptedAt9pState) -> AnyResult<Vec<u8>> {
     let (kind, head) = match state.head() {
         AcceptedAt9pHead::Genesis(capsule) => (0u8, capsule.to_dag_cbor()?),
         AcceptedAt9pHead::Update(record) => (1u8, record.to_dag_cbor()?),
@@ -381,7 +420,85 @@ fn encode_at9p_state(state: &AcceptedAt9pState) -> AnyResult<Vec<u8>> {
     Ok(out)
 }
 
-fn decode_at9p_state(subject_cid512: &str, bytes: &[u8]) -> AnyResult<AcceptedAt9pState> {
+/// Wrap one complete state value in a daemon-authenticated envelope. The
+/// stable deployment identity certifies the purpose-derived audit key, and the
+/// audit key signs the exact state bytes. A different internally valid at9p
+/// fork therefore cannot be substituted by someone who can edit RocksDB.
+fn encode_at9p_state(
+    state: &AcceptedAt9pState,
+    acceptance_identity: &ed25519_dalek::SigningKey,
+    audit_key: &ed25519_dalek::SigningKey,
+) -> AnyResult<Vec<u8>> {
+    use ed25519_dalek::Signer as _;
+
+    let body = encode_at9p_state_body(state)?;
+    let audit_vk = audit_key.verifying_key().to_bytes();
+    let key_signature =
+        acceptance_identity.sign(&acceptance_message(AT9P_ACCEPTANCE_KEY_AAD, &audit_vk));
+    let state_signature = audit_key.sign(&acceptance_message(AT9P_ACCEPTANCE_STATE_AAD, &body));
+    let mut out =
+        Vec::with_capacity(AT9P_ACCEPTANCE_PREFIX_LEN + body.len() + ED25519_SIGNATURE_LEN);
+    out.extend_from_slice(AT9P_ACCEPTANCE_MAGIC);
+    out.extend_from_slice(&audit_vk);
+    out.extend_from_slice(&key_signature.to_bytes());
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&state_signature.to_bytes());
+    Ok(out)
+}
+
+fn decode_at9p_state(
+    subject_cid512: &str,
+    bytes: &[u8],
+    acceptance_identity: &ed25519_dalek::VerifyingKey,
+) -> AnyResult<AcceptedAt9pState> {
+    anyhow::ensure!(
+        bytes.len() >= AT9P_ACCEPTANCE_PREFIX_LEN + AT9P_STATE_HEADER_LEN + ED25519_SIGNATURE_LEN,
+        "accepted at9p envelope is truncated"
+    );
+    anyhow::ensure!(
+        bytes.starts_with(AT9P_ACCEPTANCE_MAGIC),
+        "accepted at9p envelope has bad version"
+    );
+    let audit_vk_bytes: [u8; ED25519_KEY_LEN] = bytes
+        .get(AT9P_ACCEPTANCE_MAGIC.len()..AT9P_ACCEPTANCE_MAGIC.len() + ED25519_KEY_LEN)
+        .ok_or_else(|| anyhow!("accepted at9p envelope missing audit key"))?
+        .try_into()?;
+    let key_sig_start = AT9P_ACCEPTANCE_MAGIC.len() + ED25519_KEY_LEN;
+    let key_sig_end = key_sig_start + ED25519_SIGNATURE_LEN;
+    let key_signature = ed25519_dalek::Signature::from_bytes(
+        bytes
+            .get(key_sig_start..key_sig_end)
+            .ok_or_else(|| anyhow!("accepted at9p envelope missing key certificate"))?
+            .try_into()?,
+    );
+    acceptance_identity
+        .verify_strict(
+            &acceptance_message(AT9P_ACCEPTANCE_KEY_AAD, &audit_vk_bytes),
+            &key_signature,
+        )
+        .context("accepted at9p audit-key certificate rejected")?;
+    let audit_vk = ed25519_dalek::VerifyingKey::from_bytes(&audit_vk_bytes)
+        .context("accepted at9p envelope has malformed audit key")?;
+    let state_sig_start = bytes.len() - ED25519_SIGNATURE_LEN;
+    let body = bytes
+        .get(AT9P_ACCEPTANCE_PREFIX_LEN..state_sig_start)
+        .ok_or_else(|| anyhow!("accepted at9p envelope missing state body"))?;
+    let state_signature = ed25519_dalek::Signature::from_bytes(
+        bytes
+            .get(state_sig_start..)
+            .ok_or_else(|| anyhow!("accepted at9p envelope missing state signature"))?
+            .try_into()?,
+    );
+    audit_vk
+        .verify_strict(
+            &acceptance_message(AT9P_ACCEPTANCE_STATE_AAD, body),
+            &state_signature,
+        )
+        .context("accepted at9p daemon acceptance signature rejected")?;
+    decode_at9p_state_body(subject_cid512, body)
+}
+
+fn decode_at9p_state_body(subject_cid512: &str, bytes: &[u8]) -> AnyResult<AcceptedAt9pState> {
     anyhow::ensure!(
         bytes.len() >= AT9P_STATE_HEADER_LEN,
         "accepted at9p state is truncated"
@@ -451,15 +568,19 @@ fn decode_at9p_state(subject_cid512: &str, bytes: &[u8]) -> AnyResult<AcceptedAt
 #[derive(Clone)]
 struct RocksAt9pStateStore {
     store: Arc<PdsRecordStore>,
+    acceptance_identity: ed25519_dalek::SigningKey,
+    audit_key: ed25519_dalek::SigningKey,
 }
 
 impl WatermarkStore for RocksAt9pStateStore {
     fn get(&self, subject_cid512: &str) -> AnyResult<Option<AcceptedAt9pState>> {
-        self.store.load_at9p_state(subject_cid512)
+        self.store
+            .load_at9p_state(subject_cid512, &self.acceptance_identity.verifying_key())
     }
 
     fn put(&self, state: &AcceptedAt9pState) -> AnyResult<()> {
-        self.store.put_at9p_state(state)
+        self.store
+            .put_at9p_state(state, &self.acceptance_identity, &self.audit_key)
     }
 }
 
@@ -475,13 +596,18 @@ impl At9pStateIngest {
     pub fn open(
         store: Arc<PdsRecordStore>,
         alarm_path: &Path,
-        ed_sk: ed25519_dalek::SigningKey,
+        acceptance_identity: ed25519_dalek::SigningKey,
+        audit_ed_sk: ed25519_dalek::SigningKey,
         pq_sk: hyprstream_rpc::crypto::pq::MlDsaSigningKey,
     ) -> AnyResult<Self> {
         let guard = DuplicityGuard::with_durable_alarm(
-            RocksAt9pStateStore { store },
+            RocksAt9pStateStore {
+                store,
+                acceptance_identity,
+                audit_key: audit_ed_sk.clone(),
+            },
             alarm_path,
-            ed_sk,
+            audit_ed_sk,
             pq_sk,
         )?;
         Ok(Self { guard })
@@ -1487,8 +1613,15 @@ mod pds_store_tests {
 
     fn production_at9p_publisher(store: Arc<PdsRecordStore>, alarm: &Path) -> PdsPublisher {
         let (audit_ed, audit_pq) = audit_keys();
-        let ingest = At9pStateIngest::open(Arc::clone(&store), alarm, audit_ed, audit_pq)
-            .expect("open accepted-state owner");
+        let acceptance_identity = ed25519_dalek::SigningKey::from_bytes(&[90u8; 32]);
+        let ingest = At9pStateIngest::open(
+            Arc::clone(&store),
+            alarm,
+            acceptance_identity,
+            audit_ed,
+            audit_pq,
+        )
+        .expect("open accepted-state owner");
         PdsPublisher::new(
             store,
             DID.to_owned(),
@@ -1672,11 +1805,67 @@ mod pds_store_tests {
         };
         let key = at9p_state_key(&cid);
         let mut encoded = db.get(&key).expect("get").expect("stored state");
-        encoded[16] ^= 1; // mutate persisted epoch without changing the head body
+        encoded[AT9P_ACCEPTANCE_PREFIX_LEN + 16] ^= 1;
+        // Mutate persisted epoch without changing the retained head body or
+        // recomputing the daemon acceptance signature.
         db.put(&key, encoded).expect("inject mutation");
         assert!(
             publisher.accepted_at9p_state(&did, None).is_err(),
             "a partial watermark/body representation must fail closed"
+        );
+    }
+
+    #[test]
+    fn accepted_at9p_read_rejects_attacker_selected_signed_fork() {
+        use hyprstream_pds::at9p_sign::{sign_capsule, sign_update_record};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
+        let (genesis_signer, n1, n2) = (at9p_signer(21), at9p_signer(22), at9p_signer(23));
+        let genesis = sign_capsule(
+            at9p_body(&genesis_signer, &[&n1], "genesis"),
+            &genesis_signer.ed,
+            &genesis_signer.pq,
+        )
+        .expect("genesis");
+        let genesis_bytes = genesis.to_dag_cbor().expect("genesis bytes");
+        let cid = genesis.cid512().expect("cid");
+        let did = format!("{DID_AT9P_PREFIX}{cid}");
+        let publisher = production_at9p_publisher(Arc::clone(&store), &dir.path().join("alarm"));
+        publisher
+            .ingest_at9p_genesis(&did, &genesis_bytes)
+            .expect("seed");
+
+        // This update is internally canonical, correctly linked, and signed by
+        // the identity's committed key. It was never selected by this daemon.
+        let fork = sign_update_record(
+            cid.clone(),
+            1,
+            hyprstream_pds::at9p::h512(&genesis_bytes),
+            at9p_body(&n1, &[&n2], "attacker-selected-fork"),
+            "2099-01-01T00:00:00Z".to_owned(),
+            &n1.ed,
+            &n1.pq,
+        )
+        .expect("signed fork");
+        let fork_state =
+            AcceptedAt9pState::from_persisted_update(&fork.to_dag_cbor().expect("fork bytes"))
+                .expect("internally valid fork state");
+
+        // A process that can rewrite RocksDB but lacks the stable deployment
+        // identity can only certify the substituted value with its own key.
+        let attacker_identity = ed25519_dalek::SigningKey::from_bytes(&[70u8; 32]);
+        let attacker_audit = ed25519_dalek::SigningKey::from_bytes(&[71u8; 32]);
+        let forged = encode_at9p_state(&fork_state, &attacker_identity, &attacker_audit)
+            .expect("forge self-consistent envelope");
+        let RecordBacking::ReadWrite(db) = &store.backing else {
+            panic!("writer")
+        };
+        db.put(at9p_state_key(&cid), forged)
+            .expect("inject attacker-selected fork");
+        assert!(
+            publisher.accepted_at9p_state(&did, None).is_err(),
+            "an identity-valid fork without daemon acceptance must fail closed"
         );
     }
 }

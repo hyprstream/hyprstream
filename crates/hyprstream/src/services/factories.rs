@@ -633,20 +633,25 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
         })
         .ok_or_else(|| anyhow::anyhow!("no active ES256 #atproto key for PDS publish"))?;
         let atproto_key: p256::ecdsa::SigningKey = (*active).clone();
-        let store = Arc::new(crate::services::discovery::PdsRecordStore::open(&store_dir)?);
+        let acceptance_identity = ctx.signing_key().clone();
         // The alarm WAL must remain verifiable across OAuth key rotations and
         // process restarts. Derive a dedicated, stable audit identity from the
         // node/service root available in this deployment mode; the second
         // derivation keeps the ML-DSA material separate from the Ed25519 key.
         let audit_ed = hyprstream_rpc::node_identity::derive_purpose_key(
-            ctx.signing_key(),
+            &acceptance_identity,
             "hyprstream-at9p-audit-ed25519-v1",
         );
         let audit_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&audit_ed);
+        let store = Arc::new(
+            crate::services::discovery::PdsRecordStore::open(&store_dir)?
+                .with_at9p_acceptance_identity(acceptance_identity.verifying_key()),
+        );
         let alarm_path = store_dir.with_extension("at9p-duplicity.wal");
         let at9p_state = crate::services::discovery::At9pStateIngest::open(
             Arc::clone(&store),
             &alarm_path,
+            acceptance_identity,
             audit_ed,
             audit_pq,
         )?;
@@ -1717,9 +1722,20 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     // proof). This is the #910a security fix — a read path that re-signed a
     // commit on every `getRecord` (and so needed the private key) was the root
     // of the key-exposure problem; atproto never re-signs on read.
+    // In-process factories share the stable node root. In IPC mode the
+    // registry process signs with its stable service credential, whose public
+    // key is anchored in the global service trust store.
+    let at9p_acceptance_identity = if ctx.is_ipc() {
+        hyprstream_service::global_trust_store()
+            .resolve_one("registry")
+            .ok_or_else(|| anyhow::anyhow!("trust store has no registry key"))?
+    } else {
+        ctx.verifying_key()
+    };
     let pds_store = std::sync::Arc::new(
         open_pds_store_readonly(&pds_store_dir()?)
-            .context("failed to open PDS record store (read-only)")?,
+            .context("failed to open PDS record store (read-only)")?
+            .with_at9p_acceptance_identity(at9p_acceptance_identity),
     );
     let record_resolver = crate::services::discovery::PdsRecordResolver::new(pds_store);
 
