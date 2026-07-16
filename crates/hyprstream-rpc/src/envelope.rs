@@ -1838,17 +1838,30 @@ impl SignedEnvelope {
     /// Non-mutating timestamp-window validation for early rejection before
     /// signature verification, KEM decapsulation, or decryption.
     fn validate_timestamp(&self) -> EnvelopeResult<()> {
-        let now = current_timestamp();
-        let age = now - self.envelope.iat;
-        if age > MAX_TIMESTAMP_AGE_MS {
+        Self::validate_timestamp_at(self.envelope.iat, current_timestamp())
+    }
+
+    /// Validate `iat` against an explicit clock reading.
+    ///
+    /// Widen both wire-controlled timestamps before subtracting so every `i64`
+    /// input, including the two extremes, has defined fail-closed behavior.
+    /// Both limits are inclusive: an age exactly equal to the past window or a
+    /// future distance exactly equal to the clock-skew allowance is accepted.
+    fn validate_timestamp_at(iat: i64, now: i64) -> EnvelopeResult<()> {
+        let age = i128::from(now) - i128::from(iat);
+        let max_age = i128::from(MAX_TIMESTAMP_AGE_MS);
+        if age > max_age {
             return Err(EnvelopeError::ReplayAttack(format!(
                 "timestamp too old: {age}ms > {MAX_TIMESTAMP_AGE_MS}ms"
             )));
         }
-        if age < -MAX_CLOCK_SKEW_MS {
+
+        let future_distance = i128::from(iat) - i128::from(now);
+        let max_future = i128::from(MAX_CLOCK_SKEW_MS);
+        if future_distance > max_future {
+            let excess = future_distance - max_future;
             return Err(EnvelopeError::ReplayAttack(format!(
-                "timestamp in future: {}ms beyond clock skew tolerance",
-                -age - MAX_CLOCK_SKEW_MS
+                "timestamp in future: {excess}ms beyond clock skew tolerance"
             )));
         }
         Ok(())
@@ -3602,6 +3615,30 @@ mod tests {
         };
         unwrap_and_verify(&original_wire, &options()).expect("original request is accepted");
 
+        // Wire-controlled integer extremes fail in the early non-mutating
+        // timestamp precheck and cannot evict the accepted entry from this
+        // capacity-one cache. The ciphertext signature is intentionally left
+        // valid; changing only outer metadata would otherwise proceed to AEAD.
+        for extreme_iat in [i64::MIN, i64::MAX] {
+            let mut extreme = original.clone();
+            extreme.envelope.nonce = distinct_test_nonce(&original_nonce);
+            extreme.envelope.iat = extreme_iat;
+            extreme
+                .verify_signature_only(&node_vk)
+                .expect("ciphertext signature remains valid");
+            let error = unwrap_and_verify(&signed_envelope_to_wire(&extreme), &options())
+                .expect_err("extreme timestamp is rejected without a panic");
+            assert!(error.to_string().contains(if extreme_iat == i64::MIN {
+                "timestamp too old"
+            } else {
+                "timestamp in future"
+            }));
+            assert!(
+                unwrap_and_verify(&original_wire, &options()).is_err(),
+                "rejected extreme timestamp must not evict accepted replay state"
+            );
+        }
+
         // Authenticated but expired outer metadata is rejected before KEM work
         // and cannot disturb the full capacity-one cache.
         let mut stale = original.clone();
@@ -3662,6 +3699,89 @@ mod tests {
                 .count()
         });
         assert_eq!(accepted, 1);
+    }
+
+    #[test]
+    fn timestamp_window_boundaries_and_extremes_are_overflow_safe() {
+        let now = 0;
+
+        // Both documented limits are inclusive.
+        assert!(SignedEnvelope::validate_timestamp_at(-MAX_TIMESTAMP_AGE_MS, now).is_ok());
+        assert!(SignedEnvelope::validate_timestamp_at(MAX_CLOCK_SKEW_MS, now).is_ok());
+
+        // Values one millisecond inside either inclusive limit also remain valid.
+        assert!(SignedEnvelope::validate_timestamp_at(-MAX_TIMESTAMP_AGE_MS + 1, now).is_ok());
+        assert!(SignedEnvelope::validate_timestamp_at(MAX_CLOCK_SKEW_MS - 1, now).is_ok());
+
+        // The immediately adjacent values outside either window fail closed.
+        assert!(SignedEnvelope::validate_timestamp_at(-MAX_TIMESTAMP_AGE_MS - 1, now).is_err());
+        assert!(SignedEnvelope::validate_timestamp_at(MAX_CLOCK_SKEW_MS + 1, now).is_err());
+
+        // Widening before subtraction defines both ends of the wire domain,
+        // even when the clock is itself at the opposite i64 boundary.
+        assert!(SignedEnvelope::validate_timestamp_at(i64::MIN, now).is_err());
+        assert!(SignedEnvelope::validate_timestamp_at(i64::MAX, now).is_err());
+        assert!(SignedEnvelope::validate_timestamp_at(i64::MIN, i64::MAX).is_err());
+        assert!(SignedEnvelope::validate_timestamp_at(i64::MAX, i64::MIN).is_err());
+    }
+
+    #[test]
+    fn ordinary_unwrap_rejects_extreme_timestamps_for_all_compatibility_paths() {
+        use crate::node_identity::{derive_mesh_kem_recipient, derive_mesh_mldsa_key};
+
+        let (node_sk, node_vk) = generate_signing_keypair();
+        let pq_sk = derive_mesh_mldsa_key(&node_sk);
+        let kem_pub = derive_mesh_kem_recipient(&node_sk)
+            .expect("derive #mesh-kem")
+            .public();
+
+        let clear = SignedEnvelope::new_signed(
+            RequestEnvelope::anonymous(b"clear timestamp boundary".to_vec()),
+            &node_sk,
+        );
+        let encrypted = SignedEnvelope::new_signed_encrypted_mesh_kem(
+            RequestEnvelope::anonymous(b"encrypted timestamp boundary".to_vec()),
+            &node_sk,
+            &pq_sk,
+            &kem_pub,
+        )
+        .expect("seal encrypted boundary fixture");
+
+        for extreme_iat in [i64::MIN, i64::MAX] {
+            for fixture in [&clear, &encrypted] {
+                let mut extreme = fixture.clone();
+                extreme.envelope.iat = extreme_iat;
+                let wire = signed_envelope_to_wire(&extreme);
+
+                for any_signer in [false, true] {
+                    let cache = TestNonceCache::new();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let opts = if any_signer {
+                            UnwrapOptions::any_signer(&cache)
+                        } else {
+                            UnwrapOptions::fixed_signer(&node_vk, &cache)
+                        }
+                        .with_verify_policy(crate::crypto::CryptoPolicy::Classical);
+                        unwrap_and_verify(&wire, &opts)
+                    }));
+                    let error = result
+                        .expect("wire-controlled timestamp must never panic")
+                        .expect_err("extreme timestamp must fail closed");
+                    assert!(
+                        error.to_string().contains(if extreme_iat == i64::MIN {
+                            "timestamp too old"
+                        } else {
+                            "timestamp in future"
+                        }),
+                        "timestamp rejection must precede signature or KEM work: {error}"
+                    );
+                    assert!(
+                        cache.seen.lock().is_empty(),
+                        "rejected timestamp must not commit replay state"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
