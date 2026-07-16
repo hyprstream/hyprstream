@@ -149,7 +149,11 @@ jobs:
     # feedback; `build` is the required check enforced by the `protection` ruleset's
     # merge queue. (Per-PR AppImage artifacts were dropped with the PR build; the
     # `appimage.yml` workflow still builds the AppImage on push to `main`.)
-    if: github.event_name != 'pull_request'
+    # TEMPORARY (#1011 validation, REVERT before merge): the second clause lets
+    # this job run on the pull_request event for THIS branch only, so the arm64
+    # build+test can be watched directly on the PR before it becomes the required
+    # merge gate. No other PR is affected. Remove it to restore merge-gate-only.
+    if: github.event_name != 'pull_request' || github.head_ref == 'ewindisch/1011-build-on-graviton'
     # MERGE GATE runs on the self-hosted Graviton (arm64) fleet, INSIDE the
     # prebuilt rust-builder container via `podman run` — the same layer clippy +
     # wasm use (#1011). Two consequences of arm64-in-container vs the old
