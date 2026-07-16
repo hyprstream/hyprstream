@@ -13,10 +13,9 @@
 //! claim.  PQUIP / RFC 9794 supplies transition terminology, not wire semantics.
 //!
 //! New consumers should use [`seal`], [`open`], [`seal_prederived`], and
-//! [`open_prederived`] with an owning [`NonceLedger`].  The legacy wrappers at
-//! the bottom remain only for the already-landed envelope path, whose replay
-//! lifecycle is owned by `SignedEnvelope`; they must not be used for new stream
-//! or group lifecycles.
+//! [`open_prederived`] with an owning [`NonceLedger`].  The fresh-encapsulation
+//! envelope wrappers at the bottom remain only for the already-landed signed
+//! envelope path, whose replay lifecycle is owned by `SignedEnvelope`.
 
 use std::collections::HashSet;
 
@@ -64,6 +63,18 @@ const KDF_CONTEXT_LABEL: &[u8] = b"hyprstream cose-encrypt0 context key v2";
 const COMPAT_RECIPIENT_LABEL: &[u8] = b"hyprstream cose-encrypt0 compat recipient v2";
 const COMPAT_KEY_LABEL: &[u8] = b"hyprstream cose-encrypt0 compat key v2";
 const COMPAT_DOMAIN_LABEL: &[u8] = b"hyprstream cose-encrypt0 compat domain v2";
+
+// These structural limits are deliberately much tighter than the 16 MiB wire
+// cap.  This profile has a three-item outer array, at most eight protected
+// headers, one unprotected header, and a five-item `crit` array.  The modest
+// headroom permits future private headers without allowing a small input to
+// amplify into a large generic `ciborium::Value` tree before schema validation.
+const MAX_CBOR_DEPTH: usize = 8;
+const MAX_CBOR_CONTAINER_ITEMS: usize = 32;
+const MAX_CBOR_TOTAL_ITEMS: usize = 64;
+const MAX_PROTECTED_HEADER_BYTES: usize = 4 * 1024;
+const MAX_HEADER_VALUE_BYTES: usize = 4 * 1024;
+const MAX_HEADER_TEXT_BYTES: usize = MAX_IDENTIFIER_BYTES;
 
 /// Authenticated identity and nonce coordinates for one sealed object.
 ///
@@ -448,10 +459,243 @@ fn require_no_unprotected(enc: &CoseEncrypt0) -> Result<()> {
     Ok(())
 }
 
+/// Allocation-free structural validation of the small CBOR subset used by the
+/// COSE profile.  In addition to bounding work, this independently enforces RFC
+/// 8949 core deterministic argument encodings and map-key order (encoded-key
+/// length, then bytewise lexical order).  It intentionally performs no COSE
+/// semantics; `coset` remains the sole semantic decoder below.
+struct CborPreflight<'a> {
+    input: &'a [u8],
+    offset: usize,
+    items: usize,
+    max_byte_string: usize,
+}
+
+impl<'a> CborPreflight<'a> {
+    fn new(input: &'a [u8], max_byte_string: usize) -> Self {
+        Self {
+            input,
+            offset: 0,
+            items: 0,
+            max_byte_string,
+        }
+    }
+
+    fn finish(self) -> Result<()> {
+        if self.offset != self.input.len() {
+            bail!("CBOR contains trailing data");
+        }
+        Ok(())
+    }
+
+    fn read_byte(&mut self) -> Result<u8> {
+        let byte = *self.input.get(self.offset).context("truncated CBOR item")?;
+        self.offset += 1;
+        Ok(byte)
+    }
+
+    fn read_exact<const N: usize>(&mut self) -> Result<[u8; N]> {
+        let end = self.offset.checked_add(N).context("CBOR length overflow")?;
+        let bytes = self
+            .input
+            .get(self.offset..end)
+            .context("truncated CBOR argument")?;
+        self.offset = end;
+        bytes.try_into().context("invalid CBOR argument width")
+    }
+
+    fn head(&mut self) -> Result<(u8, u64)> {
+        self.items = self.items.checked_add(1).context("CBOR item overflow")?;
+        if self.items > MAX_CBOR_TOTAL_ITEMS {
+            bail!("CBOR contains more than {MAX_CBOR_TOTAL_ITEMS} items");
+        }
+        let initial = self.read_byte()?;
+        let major = initial >> 5;
+        let additional = initial & 0x1f;
+        let argument = match additional {
+            value @ 0..=23 => u64::from(value),
+            24 => {
+                let value = u64::from(self.read_byte()?);
+                if value < 24 {
+                    bail!("CBOR argument is not shortest-form encoded");
+                }
+                value
+            }
+            25 => {
+                let value = u64::from(u16::from_be_bytes(self.read_exact()?));
+                if value <= u64::from(u8::MAX) {
+                    bail!("CBOR argument is not shortest-form encoded");
+                }
+                value
+            }
+            26 => {
+                let value = u64::from(u32::from_be_bytes(self.read_exact()?));
+                if value <= u64::from(u16::MAX) {
+                    bail!("CBOR argument is not shortest-form encoded");
+                }
+                value
+            }
+            27 => {
+                let value = u64::from_be_bytes(self.read_exact()?);
+                if value <= u64::from(u32::MAX) {
+                    bail!("CBOR argument is not shortest-form encoded");
+                }
+                value
+            }
+            31 => bail!("indefinite-length CBOR is forbidden"),
+            _ => bail!("reserved CBOR additional-information value"),
+        };
+        Ok((major, argument))
+    }
+
+    fn length(argument: u64) -> Result<usize> {
+        usize::try_from(argument).context("CBOR length does not fit address space")
+    }
+
+    fn bytes(&mut self, expected_major: u8, limit: usize) -> Result<&'a [u8]> {
+        let (major, argument) = self.head()?;
+        if major != expected_major {
+            bail!("unexpected CBOR major type {major}, expected {expected_major}");
+        }
+        let length = Self::length(argument)?;
+        if length > limit {
+            bail!("CBOR string length {length} exceeds {limit}-byte limit");
+        }
+        let end = self
+            .offset
+            .checked_add(length)
+            .context("CBOR string length overflow")?;
+        let bytes = self
+            .input
+            .get(self.offset..end)
+            .context("truncated CBOR string")?;
+        self.offset = end;
+        Ok(bytes)
+    }
+
+    fn container(&mut self, expected_major: u8) -> Result<usize> {
+        let (major, argument) = self.head()?;
+        if major != expected_major {
+            bail!("unexpected CBOR major type {major}, expected {expected_major}");
+        }
+        let length = Self::length(argument)?;
+        if length > MAX_CBOR_CONTAINER_ITEMS {
+            bail!("CBOR container has {length} entries; limit is {MAX_CBOR_CONTAINER_ITEMS}");
+        }
+        Ok(length)
+    }
+
+    fn item(&mut self, depth: usize) -> Result<()> {
+        if depth > MAX_CBOR_DEPTH {
+            bail!("CBOR nesting exceeds depth {MAX_CBOR_DEPTH}");
+        }
+        let start = self.offset;
+        let (major, argument) = self.head()?;
+        match major {
+            0 | 1 => {}
+            2 | 3 => {
+                let length = Self::length(argument)?;
+                let limit = if major == 2 {
+                    self.max_byte_string
+                } else {
+                    MAX_HEADER_TEXT_BYTES
+                };
+                if length > limit {
+                    bail!("CBOR string length {length} exceeds {limit}-byte limit");
+                }
+                self.offset = self
+                    .offset
+                    .checked_add(length)
+                    .context("CBOR string length overflow")?;
+                if self.offset > self.input.len() {
+                    bail!("truncated CBOR string");
+                }
+            }
+            4 => {
+                let length = Self::length(argument)?;
+                if length > MAX_CBOR_CONTAINER_ITEMS {
+                    bail!("CBOR array has {length} entries; limit is {MAX_CBOR_CONTAINER_ITEMS}");
+                }
+                for _ in 0..length {
+                    self.item(depth + 1)?;
+                }
+            }
+            5 => {
+                let length = Self::length(argument)?;
+                if length > MAX_CBOR_CONTAINER_ITEMS {
+                    bail!("CBOR map has {length} entries; limit is {MAX_CBOR_CONTAINER_ITEMS}");
+                }
+                let mut previous_key: Option<(usize, usize)> = None;
+                for _ in 0..length {
+                    let key_start = self.offset;
+                    self.item(depth + 1)?;
+                    let key_end = self.offset;
+                    if let Some((previous_start, previous_end)) = previous_key {
+                        let previous = &self.input[previous_start..previous_end];
+                        let current = &self.input[key_start..key_end];
+                        if (previous.len(), previous) >= (current.len(), current) {
+                            bail!("CBOR map keys are duplicate or not in deterministic order");
+                        }
+                    }
+                    previous_key = Some((key_start, key_end));
+                    self.item(depth + 1)?;
+                }
+            }
+            // Tags, floats, simple values, and break are not used anywhere in
+            // this fixed COSE profile.  Rejecting them keeps the preflight small
+            // and prevents semantic-decoder discrepancies.
+            6 | 7 => bail!("unsupported CBOR type in COSE_Encrypt0 profile"),
+            _ => unreachable!("CBOR major type is three bits"),
+        }
+        if self.offset <= start {
+            bail!("CBOR scanner made no progress");
+        }
+        Ok(())
+    }
+}
+
+fn preflight_cose_encrypt0(cose_bytes: &[u8]) -> Result<()> {
+    let mut outer = CborPreflight::new(cose_bytes, MAX_HEADER_VALUE_BYTES);
+    let top_level_items = outer.container(4)?;
+    if top_level_items != 3 {
+        bail!("COSE_Encrypt0 must be a definite three-element array");
+    }
+
+    let protected = outer.bytes(2, MAX_PROTECTED_HEADER_BYTES)?;
+    let mut protected_scanner = CborPreflight::new(protected, MAX_HEADER_VALUE_BYTES);
+    let protected_entries = protected_scanner.container(5)?;
+    if protected_entries > 16 {
+        bail!("protected header map has too many entries");
+    }
+    // Rewind and scan the entire map so key ordering and nested values are
+    // checked by the same generic deterministic scanner.
+    protected_scanner.offset = 0;
+    protected_scanner.items = 0;
+    protected_scanner.item(0)?;
+    protected_scanner.finish()?;
+
+    let unprotected_start = outer.offset;
+    let unprotected_entries = outer.container(5)?;
+    if unprotected_entries > 16 {
+        bail!("unprotected header map has too many entries");
+    }
+    outer.offset = unprotected_start;
+    outer.items -= 1;
+    outer.item(0)?;
+
+    let ciphertext = outer.bytes(2, MAX_PLAINTEXT_BYTES + 16)?;
+    if ciphertext.len() < 16 {
+        bail!("COSE_Encrypt0 ciphertext is shorter than its AEAD tag");
+    }
+    outer.finish()
+}
+
 fn parse_canonical(cose_bytes: &[u8]) -> Result<CoseEncrypt0> {
     if cose_bytes.len() > MAX_COSE_BYTES {
         bail!("COSE_Encrypt0 exceeds {MAX_COSE_BYTES}-byte limit");
     }
+    preflight_cose_encrypt0(cose_bytes)
+        .context("COSE_Encrypt0 failed bounded deterministic CBOR preflight")?;
     let enc = CoseEncrypt0::from_slice(cose_bytes)
         .map_err(|error| anyhow::anyhow!("malformed COSE_Encrypt0: {error}"))?;
     let ciphertext_len = enc
@@ -626,22 +870,6 @@ fn compatibility_context(
     })
 }
 
-fn compatibility_key_context(
-    base_key: &[u8; 32],
-    external_aad: &[u8],
-    epoch: u64,
-    sequence: u64,
-) -> Result<SealContext> {
-    let epoch = u32::try_from(epoch).context("epoch exceeds u32 nonce domain")?;
-    Ok(SealContext {
-        recipient_id: digest_parts(COMPAT_RECIPIENT_LABEL, &[base_key]).to_vec(),
-        key_id: digest_parts(COMPAT_KEY_LABEL, &[base_key]).to_vec(),
-        nonce_domain: digest_parts(COMPAT_DOMAIN_LABEL, &[external_aad]),
-        epoch,
-        sequence,
-    })
-}
-
 fn digest_parts(label: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(label);
@@ -694,38 +922,6 @@ pub fn open_from_recipient(
     open_core(&base_key, recipient.suite_id, &context, &enc, external_aad)
 }
 
-/// Compatibility wrapper for pre-derived key callers.
-///
-/// New code must use [`seal_prederived`] with an owning [`NonceLedger`].
-pub fn seal_with_key(
-    base_key: &[u8; 32],
-    suite: SuiteId,
-    plaintext: &[u8],
-    external_aad: &[u8],
-    epoch: u64,
-    sequence: u64,
-) -> Result<Vec<u8>> {
-    let context = compatibility_key_context(base_key, external_aad, epoch, sequence)?;
-    seal_core(base_key, suite, &context, None, plaintext, external_aad)
-}
-
-/// Compatibility wrapper for pre-derived key callers.
-///
-/// New code must use [`open_prederived`] with an owning [`NonceLedger`].
-pub fn open_with_key(
-    base_key: &[u8; 32],
-    expected_suite: SuiteId,
-    cose_bytes: &[u8],
-    external_aad: &[u8],
-    epoch: u64,
-    sequence: u64,
-) -> Result<Vec<u8>> {
-    let context = compatibility_key_context(base_key, external_aad, epoch, sequence)?;
-    let enc = parse_canonical(cose_bytes)?;
-    require_no_unprotected(&enc)?;
-    open_core(base_key, expected_suite, &context, &enc, external_aad)
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -761,6 +957,44 @@ mod tests {
             .find(|(label, _)| label == &Label::Int(HDR_KEM_MATERIAL))
             .unwrap();
         *header_value = CborValue::Bytes(value.encode());
+    }
+
+    fn encode_value(value: &CborValue) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(value, &mut bytes).unwrap();
+        bytes
+    }
+
+    fn mutate_protected_map(
+        sealed: &[u8],
+        mutation: impl FnOnce(&mut Vec<(CborValue, CborValue)>),
+    ) -> Vec<u8> {
+        let mut top: CborValue = ciborium::de::from_reader(sealed).unwrap();
+        let top_array = match &mut top {
+            CborValue::Array(items) => items,
+            _ => panic!("COSE_Encrypt0 must be an array"),
+        };
+        let protected_bytes = match &mut top_array[0] {
+            CborValue::Bytes(bytes) => bytes,
+            _ => panic!("protected header must be a byte string"),
+        };
+        let mut protected: CborValue =
+            ciborium::de::from_reader(protected_bytes.as_slice()).unwrap();
+        let map = match &mut protected {
+            CborValue::Map(entries) => entries,
+            _ => panic!("protected header must contain a map"),
+        };
+        mutation(map);
+        *protected_bytes = encode_value(&protected);
+        encode_value(&top)
+    }
+
+    fn replace_once(bytes: &mut Vec<u8>, needle: &[u8], replacement: &[u8]) {
+        let offset = bytes
+            .windows(needle.len())
+            .position(|candidate| candidate == needle)
+            .expect("mutation target must exist");
+        bytes.splice(offset..offset + needle.len(), replacement.iter().copied());
     }
 
     #[test]
@@ -950,6 +1184,170 @@ mod tests {
     }
 
     #[test]
+    fn reordered_protected_and_unprotected_maps_are_rejected_by_preflight() {
+        let recipient = generate_recipient(SUITE).unwrap();
+        let sealed = seal(
+            &recipient.public(),
+            &context(121),
+            b"secret",
+            AAD,
+            &mut ledger(),
+        )
+        .unwrap();
+
+        let reordered_protected = mutate_protected_map(&sealed, |entries| {
+            let first = entries
+                .iter()
+                .position(|(key, _)| key == &CborValue::Integer(HDR_SUITE_ID.into()))
+                .unwrap();
+            let second = entries
+                .iter()
+                .position(|(key, _)| key == &CborValue::Integer(HDR_RECIPIENT_ID.into()))
+                .unwrap();
+            entries.swap(first, second);
+        });
+        assert!(parse_canonical(&reordered_protected).is_err());
+
+        let mut top: CborValue = ciborium::de::from_reader(sealed.as_slice()).unwrap();
+        let unprotected = match &mut top {
+            CborValue::Array(items) => match &mut items[1] {
+                CborValue::Map(entries) => entries,
+                _ => panic!("unprotected header must be a map"),
+            },
+            _ => panic!("COSE_Encrypt0 must be an array"),
+        };
+        unprotected.push((
+            CborValue::Integer((-65560).into()),
+            CborValue::Integer(1.into()),
+        ));
+        // Both private labels have equal-length encodings; -65539 sorts before
+        // -65560 by its encoded argument.  Swap them to retain a valid map with
+        // a mutation that only the independent ordering check must reject.
+        unprotected.swap(0, 1);
+        assert!(parse_canonical(&encode_value(&top)).is_err());
+    }
+
+    #[test]
+    fn nonminimal_header_keys_and_values_are_rejected_by_preflight() {
+        let recipient = generate_recipient(SUITE).unwrap();
+        let sealed = seal(
+            &recipient.public(),
+            &context(122),
+            b"secret",
+            AAD,
+            &mut ledger(),
+        )
+        .unwrap();
+
+        // -65538 is major type 1 with argument 65537.  Eight argument bytes are
+        // valid CBOR but not the shortest deterministic representation.
+        let mut protected_key = mutate_protected_map(&sealed, |_| {});
+        let mut top: CborValue = ciborium::de::from_reader(protected_key.as_slice()).unwrap();
+        let protected = match &mut top {
+            CborValue::Array(items) => match &mut items[0] {
+                CborValue::Bytes(bytes) => bytes,
+                _ => panic!("protected header must be bytes"),
+            },
+            _ => panic!("COSE_Encrypt0 must be an array"),
+        };
+        replace_once(
+            protected,
+            &[0x3a, 0x00, 0x01, 0x00, 0x01],
+            &[0x3b, 0, 0, 0, 0, 0, 1, 0, 1],
+        );
+        protected_key = encode_value(&top);
+        assert!(parse_canonical(&protected_key).is_err());
+
+        // The suite value 1 follows that key.  Encoding it as 0x18 0x01 is
+        // likewise a valid but non-shortest integer representation.
+        let mut top: CborValue = ciborium::de::from_reader(sealed.as_slice()).unwrap();
+        let protected = match &mut top {
+            CborValue::Array(items) => match &mut items[0] {
+                CborValue::Bytes(bytes) => bytes,
+                _ => panic!("protected header must be bytes"),
+            },
+            _ => panic!("COSE_Encrypt0 must be an array"),
+        };
+        replace_once(
+            protected,
+            &[0x3a, 0x00, 0x01, 0x00, 0x01, 0x01],
+            &[0x3a, 0x00, 0x01, 0x00, 0x01, 0x18, 0x01],
+        );
+        assert!(parse_canonical(&encode_value(&top)).is_err());
+
+        // The unprotected private key -65539 is also rejected when widened.
+        let mut unprotected_key = sealed.clone();
+        replace_once(
+            &mut unprotected_key,
+            &[0x3a, 0x00, 0x01, 0x00, 0x02],
+            &[0x3b, 0, 0, 0, 0, 0, 1, 0, 2],
+        );
+        assert!(parse_canonical(&unprotected_key).is_err());
+
+        // The hybrid material is a 16-bit-length byte string in the valid
+        // object.  Widen only that length argument to 32 bits.
+        let mut unprotected_value = sealed.clone();
+        let key = [0x3a, 0x00, 0x01, 0x00, 0x02];
+        let key_offset = unprotected_value
+            .windows(key.len())
+            .position(|candidate| candidate == key)
+            .unwrap();
+        let value_offset = key_offset + key.len();
+        assert_eq!(unprotected_value[value_offset], 0x59);
+        let high = unprotected_value[value_offset + 1];
+        let low = unprotected_value[value_offset + 2];
+        unprotected_value.splice(
+            value_offset..value_offset + 3,
+            [0x5a, 0x00, 0x00, high, low],
+        );
+        assert!(parse_canonical(&unprotected_value).is_err());
+    }
+
+    #[test]
+    fn hostile_cbor_is_rejected_before_value_tree_amplification() {
+        let ciphertext = [0u8; 16];
+        let finish = |mut prefix: Vec<u8>| {
+            prefix.push(0x50);
+            prefix.extend_from_slice(&ciphertext);
+            prefix
+        };
+
+        // A 12-byte prefix claims more than four billion array members.  The
+        // preflight rejects the declared count without iterating or allocating.
+        let amplified = finish(vec![
+            0x83, 0x41, 0xa0, 0xa1, 0x00, 0x9a, 0xff, 0xff, 0xff, 0xff,
+        ]);
+        assert!(preflight_cose_encrypt0(&amplified).is_err());
+
+        let oversized_container = finish(vec![0x83, 0x41, 0xa0, 0xa1, 0x00, 0x98, 0x21]);
+        assert!(preflight_cose_encrypt0(&oversized_container).is_err());
+
+        let indefinite = finish(vec![0x83, 0x41, 0xa0, 0xbf, 0xff]);
+        assert!(preflight_cose_encrypt0(&indefinite).is_err());
+
+        let mut deep = vec![0x83, 0x41, 0xa0, 0xa1, 0x00];
+        deep.extend(std::iter::repeat_n(0x81, MAX_CBOR_DEPTH + 1));
+        deep.push(0x00);
+        assert!(preflight_cose_encrypt0(&finish(deep)).is_err());
+
+        // A header byte string over the 4 KiB schema limit is rejected from its
+        // five-byte declaration alone, before looking for or allocating bytes.
+        let oversized_string = finish(vec![
+            0x83, 0x41, 0xa0, 0xa1, 0x00, 0x5a, 0x00, 0x00, 0x10, 0x01,
+        ]);
+        assert!(preflight_cose_encrypt0(&oversized_string).is_err());
+
+        let mut trailing = finish(vec![0x83, 0x41, 0xa0, 0xa0]);
+        trailing.push(0x00);
+        assert!(preflight_cose_encrypt0(&trailing).is_err());
+    }
+
+    #[test]
+    fn focused_cose_gate_covers_every_hybrid_component_secret() {
+        assert!(hybrid_kem::combiner_is_sensitive_to_every_component_for_cose());
+    }
+
+    #[test]
     fn truncation_unknown_headers_and_tamper_rejected() {
         let recipient = generate_recipient(SUITE).unwrap();
         let ctx = context(13);
@@ -1111,12 +1509,6 @@ mod tests {
         let sealed = seal_to_recipient(&recipient.public(), b"legacy", AAD, 0, 0).unwrap();
         assert_eq!(
             open_from_recipient(&recipient, &sealed, AAD, 0, 0).unwrap(),
-            b"legacy"
-        );
-        let key = [7; 32];
-        let sealed = seal_with_key(&key, SUITE, b"legacy", AAD, 0, 1).unwrap();
-        assert_eq!(
-            open_with_key(&key, SUITE, &sealed, AAD, 0, 1).unwrap(),
             b"legacy"
         );
     }

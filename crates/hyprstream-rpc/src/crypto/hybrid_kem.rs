@@ -402,6 +402,30 @@ fn combine(
     )
 }
 
+/// Focused #553 test seam proving that both the classical and ML-KEM shared
+/// secrets affect the content-key input.  Keeping this beside the private
+/// combiner makes an "ignore the PQ share" mutation visible to the focused
+/// COSE test command as well as this module's broader tests.
+#[cfg(test)]
+pub(crate) fn combiner_is_sensitive_to_every_component_for_cose() -> bool {
+    let suite = SuiteId::HyKemX25519MlKem768;
+    let ciphertexts = vec![vec![9u8; 32], vec![8u8; 1088]];
+    let recipient_eks: Vec<&[u8]> = vec![&[7u8; 32], &[6u8; 1184]];
+    let secret = |first, second| {
+        combine(
+            suite,
+            &[
+                Zeroizing::new(vec![first; 32]),
+                Zeroizing::new(vec![second; 32]),
+            ],
+            &ciphertexts,
+            &recipient_eks,
+        )
+    };
+    let base = secret(1, 2);
+    *base != *secret(0xff, 2) && *base != *secret(1, 0xff)
+}
+
 // ============================================================================
 // Suite-identified wire material + recipient keys
 // ============================================================================
