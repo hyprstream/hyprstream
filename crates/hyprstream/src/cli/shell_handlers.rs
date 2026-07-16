@@ -165,7 +165,7 @@ pub async fn handle_shell_tui(
     // Model load-status channel (background polling → event loop).
     // Resolve model + worker keys via PolicyClient.
     let policy_vk = signing_key.verifying_key();
-    let policy_client = crate::services::PolicyClient::for_service(
+    let policy_client = crate::services::PolicyClient::for_local_bootstrap(
         signing_key.clone(),
         policy_vk,
         None,
@@ -189,7 +189,7 @@ pub async fn handle_shell_tui(
             .context("Invalid worker key length")?,
     ).context("Invalid worker key")?;
     let model_client = {
-        crate::services::generated::model_client::ModelClient::for_service(
+        crate::services::generated::model_client::ModelClient::for_local_bootstrap(
             signing_key.clone(),
             model_server_vk,
             None,
@@ -197,7 +197,7 @@ pub async fn handle_shell_tui(
     };
     // Worker client for sandbox/container/image management.
     let worker_client = {
-        hyprstream_workers::runtime::WorkerClient::for_service(
+        hyprstream_workers::runtime::WorkerClient::for_local_bootstrap(
             signing_key.clone(),
             worker_server_vk,
             None,
@@ -213,7 +213,7 @@ pub async fn handle_shell_tui(
         ).unwrap_or_else(|_| signing_key.verifying_key()),
         Err(_) => signing_key.verifying_key(),
     };
-    let registry = crate::services::RegistryClient::for_service(
+    let registry = crate::services::RegistryClient::for_local_bootstrap(
         signing_key.clone(),
         registry_server_vk,
         None,
@@ -1597,7 +1597,7 @@ async fn fetch_models(
 
     // Resolve registry + model keys via PolicyClient
     let policy_vk = signing_key.verifying_key();
-    let policy_client = match crate::services::PolicyClient::for_service(
+    let policy_client = match crate::services::PolicyClient::for_local_bootstrap(
         signing_key.clone(), policy_vk, None,
     ) {
         Ok(c) => c,
@@ -1637,7 +1637,7 @@ async fn fetch_models(
         }
     };
 
-    let registry: crate::services::RegistryClient = match crate::services::RegistryClient::for_service(
+    let registry: crate::services::RegistryClient = match crate::services::RegistryClient::for_local_bootstrap(
         signing_key.clone(),
         registry_server_vk,
         None,
@@ -1648,7 +1648,7 @@ async fn fetch_models(
             return Vec::new();
         }
     };
-    let model_client_for_status = match crate::services::generated::model_client::ModelClient::for_service(
+    let model_client_for_status = match crate::services::generated::model_client::ModelClient::for_local_bootstrap(
         signing_key.clone(),
         model_server_vk,
         None,

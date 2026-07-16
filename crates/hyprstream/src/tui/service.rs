@@ -828,7 +828,7 @@ impl TuiService {
         let policy_vk = hyprstream_service::global_trust_store()
             .resolve_one("policy")
             .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-        let policy_client = PolicyClient::for_service(
+        let policy_client = PolicyClient::for_local_bootstrap(
             self.signing_key.clone(),
             policy_vk,
             None,
@@ -856,12 +856,12 @@ impl TuiService {
 
         let models = {
             let registry_client: crate::services::RegistryClient =
-                crate::services::RegistryClient::for_service(
+                crate::services::RegistryClient::for_local_bootstrap(
                     self.signing_key.clone(),
                     registry_vk,
                     None,
                 )?;
-            let model_client_for_status = crate::services::generated::model_client::ModelClient::for_service(
+            let model_client_for_status = crate::services::generated::model_client::ModelClient::for_local_bootstrap(
                 self.signing_key.clone(),
                 model_vk,
                 None,
@@ -915,7 +915,7 @@ impl TuiService {
                 let vk  = model_vk_load;
                 // Submit load — returns "accepted" immediately (Continuation pattern).
                 h.block_on(async {
-                    let client = match crate::services::generated::model_client::ModelClient::for_service(
+                    let client = match crate::services::generated::model_client::ModelClient::for_local_bootstrap(
                         sk.clone(),
                         vk,
                         None,
@@ -941,7 +941,7 @@ impl TuiService {
                     for _ in 0..60u32 {   // max ~2 minutes (60 × 2 s)
                         std::thread::sleep(std::time::Duration::from_secs(2));
                         let loaded = h_poll.block_on(async {
-                            let client = match crate::services::generated::model_client::ModelClient::for_service(
+                            let client = match crate::services::generated::model_client::ModelClient::for_local_bootstrap(
                                 sk_poll.clone(),
                                 vk_poll,
                                 None,
@@ -971,7 +971,7 @@ impl TuiService {
             let sk = sk_unload.clone();
             let mr = model_ref.to_owned();
             handle_unload.block_on(async move {
-                let client = match crate::services::generated::model_client::ModelClient::for_service(
+                let client = match crate::services::generated::model_client::ModelClient::for_local_bootstrap(
                     sk.clone(),
                     model_vk_unload,
                     None,
@@ -1002,7 +1002,7 @@ impl TuiService {
                 let rmd = rmd_clone.clone();
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = match crate::services::RegistryClient::for_service(sk, rvk, None) {
+                        let registry = match crate::services::RegistryClient::for_local_bootstrap(sk, rvk, None) {
                             Ok(c) => c,
                             Err(e) => {
                                 let _ = tx.send(GitOpProgress::Failed(format!("Failed to create RegistryClient: {e}")));
@@ -1103,7 +1103,7 @@ impl TuiService {
                 let rvk = rvk_pull;
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = match crate::services::RegistryClient::for_service(sk, rvk, None) {
+                        let registry = match crate::services::RegistryClient::for_local_bootstrap(sk, rvk, None) {
                             Ok(c) => c,
                             Err(e) => {
                                 let _ = tx.send(GitOpProgress::Failed(format!("Failed to create RegistryClient: {e}")));
@@ -1144,7 +1144,7 @@ impl TuiService {
                 let rvk = rvk_push;
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = match crate::services::RegistryClient::for_service(sk, rvk, None) {
+                        let registry = match crate::services::RegistryClient::for_local_bootstrap(sk, rvk, None) {
                             Ok(c) => c,
                             Err(e) => {
                                 let _ = tx.send(GitOpProgress::Failed(format!("Failed to create RegistryClient: {e}")));
@@ -1191,7 +1191,7 @@ impl TuiService {
                 let rvk = rvk_status;
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = match crate::services::RegistryClient::for_service(sk, rvk, None) {
+                        let registry = match crate::services::RegistryClient::for_local_bootstrap(sk, rvk, None) {
                             Ok(c) => c,
                             Err(e) => {
                                 tracing::warn!("Failed to create RegistryClient: {e}");
@@ -1224,14 +1224,14 @@ impl TuiService {
                 let rmd = rmd_refresh.clone();
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry_client = match crate::services::RegistryClient::for_service(sk.clone(), rvk, None) {
+                        let registry_client = match crate::services::RegistryClient::for_local_bootstrap(sk.clone(), rvk, None) {
                             Ok(c) => c,
                             Err(e) => {
                                 tracing::warn!("model-list refresh: RegistryClient: {e}");
                                 return;
                             }
                         };
-                        let model_client = match crate::services::generated::model_client::ModelClient::for_service(sk, mvk, None) {
+                        let model_client = match crate::services::generated::model_client::ModelClient::for_local_bootstrap(sk, mvk, None) {
                             Ok(c) => c,
                             Err(e) => {
                                 tracing::warn!("model-list refresh: ModelClient: {e}");

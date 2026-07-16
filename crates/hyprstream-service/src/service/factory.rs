@@ -177,7 +177,7 @@ impl QuicSharedConfig {
                         let _ = policy_vk; // suppress unused warning
                     }
 
-                    let client = match hyprstream_discovery::DiscoveryClient::for_service(
+                    let client = match hyprstream_discovery::DiscoveryClient::for_local_bootstrap(
                         sk,
                         discovery_vk,
                         None,
@@ -193,6 +193,14 @@ impl QuicSharedConfig {
                         socket_kind: "quic".to_owned(),
                         endpoint,
                         service_jwt: jwt,
+                        service_did: hyprstream_rpc::identity::Did::default(),
+                        capabilities: Vec::new(),
+                        accepted_state_digest: Vec::new(),
+                        accepted_state_epoch: 0,
+                        response_key_id: String::new(),
+                        request_kem_key_id: String::new(),
+                        request_kem_recipient: Vec::new(),
+                        expires_at_unix_ms: 0,
                     }).await {
                         Ok(_) => tracing::info!("Announced QUIC endpoint to DiscoveryService"),
                         Err(e) => tracing::warn!("Failed to announce QUIC endpoint: {}", e),

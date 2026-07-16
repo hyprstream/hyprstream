@@ -28,7 +28,7 @@ use std::process::Command;
 ///
 /// Bootstrap: PolicyService key needed to create the PolicyClient for peer key resolution.
 fn create_policy_client(signing_key: &SigningKey) -> Result<PolicyClient> {
-    PolicyClient::for_service(
+    PolicyClient::for_local_bootstrap(
         signing_key.clone(),
         // Bootstrap: PolicyService uses the root key
         signing_key.verifying_key(),

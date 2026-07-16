@@ -97,7 +97,10 @@ pub mod podspec;
 // Re-export key types
 pub use hyprstream_rpc::registry::SocketKind;
 pub use hyprstream_rpc::resolver::Resolver;
-pub use service::{AuthorizationProvider, DiscoveryService, RecordCarData, RecordResolver};
+pub use service::{
+    AcceptedStateSource, AuthorizationProvider, DiscoveryService, DiscoveryServiceResolver,
+    RecordCarData, RecordResolver,
+};
 
 // Re-export generated types that consumers need
 pub use generated::discovery_client::{

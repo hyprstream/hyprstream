@@ -416,7 +416,7 @@ impl Spawnable for OAuthService {
                     ));
                 }
             };
-            let policy_client = PolicyClient::for_service(
+            let policy_client = PolicyClient::for_local_bootstrap(
                 self.signing_key.clone(),
                 policy_vk,
                 None,
@@ -434,7 +434,7 @@ impl Spawnable for OAuthService {
                     ));
                 }
             };
-            let discovery_client = crate::services::DiscoveryClient::for_service(
+            let discovery_client = crate::services::DiscoveryClient::for_local_bootstrap(
                 self.signing_key.clone(),
                 discovery_vk,
                 None,

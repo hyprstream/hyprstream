@@ -2540,7 +2540,7 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                             anyhow::anyhow!("trust store has no policy key — startup must populate it")
                         })?;
                     let policy_client =
-                        PolicyClient::for_service(policy_signing_key, policy_vk, None)?;
+                        PolicyClient::for_local_bootstrap(policy_signing_key, policy_vk, None)?;
                     let service = InferenceService::initialize(
                         model_path,
                         config,

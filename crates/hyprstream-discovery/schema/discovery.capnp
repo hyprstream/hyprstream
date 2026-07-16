@@ -273,6 +273,17 @@ struct ServiceAnnouncement {
   endpoint @2 :Text;
   # Service JWT attesting to the service's pubkey and identity
   serviceJwt @3 :Text $optional;
+  # Identity-bound resolution metadata. These fields are covered by the
+  # request envelope signature; the resolver additionally requires the signer
+  # and keys to match the current checkpoint-verified did:at9p state.
+  serviceDid @4 :Text $domainType("hyprstream_rpc::identity::Did");
+  capabilities @5 :List(Text);
+  acceptedStateDigest @6 :Data;
+  acceptedStateEpoch @7 :UInt64;
+  responseKeyId @8 :Text;
+  requestKemKeyId @9 :Text;
+  requestKemRecipient @10 :Data;
+  expiresAtUnixMs @11 :Int64;
 }
 
 # #431 — federated record lookup as a verifiable CAR proof.

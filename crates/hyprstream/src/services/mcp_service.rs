@@ -426,14 +426,14 @@ fn register_scoped_tools_recursive(
                             let stream_info: hyprstream_rpc::stream_info::StreamInfo = match service.as_str() {
                                 "registry" => {
                                     let server_vk = ctx.resolve_peer_key("registry").await?;
-                                    let client: RegistryClient = RegistryClient::for_service(
+                                    let client: RegistryClient = RegistryClient::for_local_bootstrap(
                                         ctx.signing_key, server_vk, None,
                                     )?;
                                     client.call_scoped_streaming_method(&scope_refs, &method, &ctx.args, client_pubkey_bytes).await?
                                 }
                                 "model" => {
                                     let server_vk = ctx.resolve_peer_key("model").await?;
-                                    let client = ModelClient::for_service(ctx.signing_key, server_vk, None)?;
+                                    let client = ModelClient::for_local_bootstrap(ctx.signing_key, server_vk, None)?;
                                     client.call_scoped_streaming_method(&scope_refs, &method, &ctx.args, client_pubkey_bytes).await?
                                 }
                                 _ => anyhow::bail!("No scoped streaming dispatch for service: {service}"),
@@ -514,14 +514,14 @@ async fn dispatch_scoped_call(
     let result = match service {
         "registry" => {
             let server_vk = ctx.resolve_peer_key("registry").await?;
-            let client: RegistryClient = RegistryClient::for_service(
+            let client: RegistryClient = RegistryClient::for_local_bootstrap(
                 ctx.signing_key.clone(), server_vk, None,
             )?;
             client.call_scoped_method(scopes, method, &ctx.args).await?
         }
         "model" => {
             let server_vk = ctx.resolve_peer_key("model").await?;
-            let client = ModelClient::for_service(ctx.signing_key.clone(), server_vk, None)?;
+            let client = ModelClient::for_local_bootstrap(ctx.signing_key.clone(), server_vk, None)?;
             client.call_scoped_method(scopes, method, &ctx.args).await?
         }
         _ => anyhow::bail!("No scoped dispatch for service: {service}"),
@@ -583,19 +583,19 @@ fn register_streaming_tool(
                 let stream_info: hyprstream_rpc::stream_info::StreamInfo = match service.as_str() {
                     "registry" => {
                         let server_vk = ctx.resolve_peer_key("registry").await?;
-                        let client: RegistryClient = RegistryClient::for_service(
+                        let client: RegistryClient = RegistryClient::for_local_bootstrap(
                             ctx.signing_key, server_vk, None,
                         )?;
                         client.call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?
                     }
                     "model" => {
                         let server_vk = ctx.resolve_peer_key("model").await?;
-                        let client = ModelClient::for_service(ctx.signing_key, server_vk, None)?;
+                        let client = ModelClient::for_local_bootstrap(ctx.signing_key, server_vk, None)?;
                         client.call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?
                     }
                     "tui" => {
                         let server_vk = ctx.resolve_peer_key("tui").await?;
-                        let client = TuiClient::for_service(ctx.signing_key, server_vk, None)?;
+                        let client = TuiClient::for_local_bootstrap(ctx.signing_key, server_vk, None)?;
                         client.call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?
                     }
                     _ => anyhow::bail!("No streaming support for service: {}", service),
@@ -701,24 +701,24 @@ async fn dispatch_schema_call(service: &str, method: &str, ctx: &ToolCallContext
     match service {
         "model" => {
             let server_vk = ctx.resolve_peer_key("model").await?;
-            let client = ModelClient::for_service(signing_key, server_vk, None)?;
+            let client = ModelClient::for_local_bootstrap(signing_key, server_vk, None)?;
             client.call_method(method, &ctx.args).await
         }
         "registry" => {
             let server_vk = ctx.resolve_peer_key("registry").await?;
-            let client: RegistryClient = RegistryClient::for_service(
+            let client: RegistryClient = RegistryClient::for_local_bootstrap(
                 signing_key, server_vk, None,
             )?;
             client.call_method(method, &ctx.args).await
         }
         "policy" => {
             let server_vk = ctx.resolve_peer_key("policy").await?;
-            let client = PolicyClient::for_service(signing_key, server_vk, None)?;
+            let client = PolicyClient::for_local_bootstrap(signing_key, server_vk, None)?;
             client.call_method(method, &ctx.args).await
         }
         "tui" => {
             let server_vk = ctx.resolve_peer_key("tui").await?;
-            let client = TuiClient::for_service(signing_key, server_vk, None)?;
+            let client = TuiClient::for_local_bootstrap(signing_key, server_vk, None)?;
             client.call_method(method, &ctx.args).await
         }
         _ => anyhow::bail!("Unknown service: {service}"),
@@ -763,7 +763,7 @@ impl McpService {
             tool_reg.by_uuid.len(),
         );
 
-        let policy_client = PolicyClient::for_service(
+        let policy_client = PolicyClient::for_local_bootstrap(
             config.signing_key.clone(),
             config.policy_verifying_key,
             None,
@@ -1057,7 +1057,7 @@ impl McpHandler for McpService {
         let loaded_model_count = {
             // Status check uses local identity (internal health check, no user context)
             let server_vk = self.resolve_peer_key("model").await?;
-            let client = ModelClient::for_service(
+            let client = ModelClient::for_local_bootstrap(
                 self.signing_key.clone(),
                 server_vk,
                 None,

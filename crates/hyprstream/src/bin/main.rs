@@ -503,7 +503,7 @@ fn handle_quick_command(
                 let signing_key = load_or_generate_signing_key(&keys_dir).await?;
                 let model_server_vk = resolve_service_vk("model")
                     .ok_or_else(|| anyhow::anyhow!("Cannot resolve model service pubkey. Run 'hyprstream wizard -y' to generate bootstrap credentials."))?;
-                let model_client = hyprstream_core::services::generated::model_client::ModelClient::for_service(
+                let model_client = hyprstream_core::services::generated::model_client::ModelClient::for_local_bootstrap(
                     signing_key,
                     model_server_vk,
                     None,
@@ -1160,7 +1160,7 @@ fn handle_quick_command(
                         )?;
 
                         // Wire up policy-backed authorization
-                        let worker_policy_client = PolicyClient::for_service(
+                        let worker_policy_client = PolicyClient::for_local_bootstrap(
                             signing_key.clone(),
                             resolve_service_vk("policy")
                                 .ok_or_else(|| anyhow::anyhow!("Cannot resolve policy pubkey. Run wizard."))?,
@@ -1193,7 +1193,7 @@ fn handle_quick_command(
                     let worker_server_vk = resolve_service_vk("worker")
                         .ok_or_else(|| anyhow::anyhow!("Cannot resolve worker pubkey. Run wizard."))?;
                     let worker_client =
-                        WorkerClient::for_service(signing_key, worker_server_vk, None)?;
+                        WorkerClient::for_local_bootstrap(signing_key, worker_server_vk, None)?;
 
                     match action {
                         WorkerAction::List {
@@ -1851,7 +1851,7 @@ fn main() -> Result<()> {
             let registry_vk = resolve_service_vk("registry")
                 .ok_or_else(|| anyhow::anyhow!("Cannot resolve registry pubkey. Run wizard."))?;
 
-            let client = hyprstream_core::services::RegistryClient::for_service(
+            let client = hyprstream_core::services::RegistryClient::for_local_bootstrap(
                 signing_key.clone(),
                 registry_vk,
                 None,

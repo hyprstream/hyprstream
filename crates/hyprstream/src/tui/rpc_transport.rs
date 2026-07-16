@@ -61,7 +61,7 @@ pub fn make_chat_spawner(
             rt.block_on(async move {
                 // Resolve model service key via PolicyClient.
                 let policy_vk = sk_inner.verifying_key();
-                let policy_client = match crate::services::PolicyClient::for_service(
+                let policy_client = match crate::services::PolicyClient::for_local_bootstrap(
                     sk_inner.clone(),
                     policy_vk,
                     None,
@@ -97,7 +97,7 @@ pub fn make_chat_spawner(
                     }
                 };
                 let model_client =
-                    match ModelClient::for_service(sk_inner.clone(), model_vk, None) {
+                    match ModelClient::for_local_bootstrap(sk_inner.clone(), model_vk, None) {
                         Ok(c) => c,
                         Err(e) => {
                             let _ = tx.send(ChatEvent::StreamError(format!("Failed to create ModelClient: {e}")));
@@ -281,7 +281,7 @@ pub fn make_tool_caller(
             rt.block_on(async move {
                 // Resolve MCP service key via PolicyClient.
                 let policy_vk = sk_fetch.verifying_key();
-                let policy_client = crate::services::PolicyClient::for_service(
+                let policy_client = crate::services::PolicyClient::for_local_bootstrap(
                     sk_fetch.clone(),
                     policy_vk,
                     None,
@@ -295,7 +295,7 @@ pub fn make_tool_caller(
                     mcp_key_resp.verifying_key.as_slice().try_into().ok()?
                 ).ok()?;
                 let gen: GenMcpClient =
-                    GenMcpClient::for_service(sk_fetch, mcp_vk, None).ok()?;
+                    GenMcpClient::for_local_bootstrap(sk_fetch, mcp_vk, None).ok()?;
                 let tool_list = gen.list_tools().await.ok()?;
                 let mut descs = HashMap::new();
                 let mut tools = Vec::new();
@@ -338,7 +338,7 @@ pub fn make_tool_caller(
                     rt.block_on(async move {
                         // Resolve MCP service key via PolicyClient.
                         let policy_vk = sk_c.verifying_key();
-                        let policy_client = match crate::services::PolicyClient::for_service(
+                        let policy_client = match crate::services::PolicyClient::for_local_bootstrap(
                             sk_c.clone(),
                             policy_vk,
                             None,
@@ -363,7 +363,7 @@ pub fn make_tool_caller(
                             },
                             Err(e) => return format!("error: failed to resolve MCP key: {e}"),
                         };
-                        let mcp_client = match GenMcpClient::for_service(sk_c, mcp_vk, None) {
+                        let mcp_client = match GenMcpClient::for_local_bootstrap(sk_c, mcp_vk, None) {
                             Ok(c) => c,
                             Err(e) => return format!("error: failed to create McpClient: {e}"),
                         };

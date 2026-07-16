@@ -1164,6 +1164,12 @@ impl RecordResolver for PdsRecordResolver {
     }
 }
 
+impl hyprstream_discovery::AcceptedStateSource for PdsRecordResolver {
+    fn accepted_state(&self, did: &str) -> AnyResult<Option<AcceptedAt9pState>> {
+        self.store.accepted_at9p_state(did, None)
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,

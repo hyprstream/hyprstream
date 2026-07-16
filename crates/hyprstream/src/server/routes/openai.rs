@@ -482,7 +482,7 @@ async fn chat_completions(
             return (StatusCode::INTERNAL_SERVER_ERROR, "Key resolution failed").into_response();
         }
     };
-    let model_client = match ModelClient::for_service((*state.signing_key).clone(), model_server_vk, None) {
+    let model_client = match ModelClient::for_local_bootstrap((*state.signing_key).clone(), model_server_vk, None) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Failed to create ModelClient: {e}");
@@ -717,7 +717,7 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
                 return;
             }
         };
-        let model_client = match ModelClient::for_service((*state.signing_key).clone(), model_server_vk, None) {
+        let model_client = match ModelClient::for_local_bootstrap((*state.signing_key).clone(), model_server_vk, None) {
             Ok(c) => c,
             Err(e) => {
                 error!("Failed to create ModelClient: {}", e);
@@ -1072,7 +1072,7 @@ async fn completions(
             return (StatusCode::INTERNAL_SERVER_ERROR, "Key resolution failed").into_response();
         }
     };
-    let model_client = match ModelClient::for_service((*state.signing_key).clone(), model_server_vk, None) {
+    let model_client = match ModelClient::for_local_bootstrap((*state.signing_key).clone(), model_server_vk, None) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Failed to create ModelClient: {e}");

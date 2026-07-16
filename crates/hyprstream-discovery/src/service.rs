@@ -4,35 +4,36 @@
 //! socket kinds, and schemas via the standard REQ/REP transport.
 
 use async_trait::async_trait;
+use hyprstream_rpc::registry::{self, EndpointRegistry, SocketKind};
+use hyprstream_rpc::resolver::{
+    select_service_candidate, AcceptedStateEvidence, AnchoredKemRecipient, ResolvedService,
+    Resolver, ServiceCandidate, ServiceQuery, ServiceResolver,
+};
 use hyprstream_rpc::service::{EnvelopeContext, RequestService};
 use hyprstream_rpc::transport::TransportConfig;
-use hyprstream_rpc::registry::{self, EndpointRegistry, SocketKind};
-use hyprstream_rpc::resolver::Resolver;
 use hyprstream_rpc::SigningKey;
 
 use crate::generated::discovery_client::{
-    DiscoveryHandler, DiscoveryResponseVariant,
-    ErrorInfo, ServiceList, ServiceSummary, ServiceEndpoints, EndpointInfo,
-    PingInfo, AuthMetadata, AuthMetadataList, ServiceAnnouncement,
-    RegisterEntityStatementRequest, RegisterEnvelopeKeysetRequest,
-    EntityStatement, EnvelopeKeyset, IssuerList,
-    GetRecordRequest, RecordCar,
-    QueryCandidatesRequest, NodeLiveness, PlacementCandidate, PlacementCandidateSet, Resource,
-    dispatch_discovery, serialize_response,
+    dispatch_discovery, serialize_response, AuthMetadata, AuthMetadataList, DiscoveryHandler,
+    DiscoveryResponseVariant, EndpointInfo, EntityStatement, EnvelopeKeyset, ErrorInfo,
+    GetRecordRequest, IssuerList, NodeLiveness, PingInfo, PlacementCandidate,
+    PlacementCandidateSet, QueryCandidatesRequest, RecordCar, RegisterEntityStatementRequest,
+    RegisterEnvelopeKeysetRequest, Resource, ServiceAnnouncement, ServiceEndpoints, ServiceList,
+    ServiceSummary,
 };
 use crate::placement_index::PlacementIndex;
 use crate::scheduling;
 
 use anyhow::Result;
-use std::collections::HashMap;
+use hyprstream_rpc::identity::Did;
+use hyprstream_util::ttl_cache::TtlCache;
+use parking_lot::RwLock;
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use parking_lot::RwLock;
-use tracing::{trace, info};
-use hyprstream_rpc::identity::Did;
-use hyprstream_util::ttl_cache::TtlCache;
+use tracing::{info, trace};
 
 /// #524 P1 — liveness heartbeat TTL: a node with no live/fresh
 /// `reportNodeLiveness` entry is hard-excluded from `queryCandidates`
@@ -77,9 +78,7 @@ fn unix_millis_now() -> i64 {
 /// shared scheduling-substrate `SelectorOp` (`crate::scheduling`, #628).
 /// Deliberately exhaustive (no catch-all) so a future wire variant fails to
 /// compile here instead of silently matching nothing.
-fn to_scheduling_op(
-    op: crate::generated::discovery_client::SelectorOp,
-) -> scheduling::SelectorOp {
+fn to_scheduling_op(op: crate::generated::discovery_client::SelectorOp) -> scheduling::SelectorOp {
     use crate::generated::discovery_client::SelectorOp as Wire;
     match op {
         Wire::In => scheduling::SelectorOp::In,
@@ -179,6 +178,7 @@ pub trait RecordResolver: Send + Sync {
 // ============================================================================
 
 /// Endpoint data stored per announced entry.
+#[derive(Clone)]
 struct AnnouncedEndpoint {
     /// Socket kind (e.g. "quic", "rep")
     socket_kind: String,
@@ -186,8 +186,32 @@ struct AnnouncedEndpoint {
     endpoint: String,
     /// Service JWT attesting to the service's identity and pubkey
     service_jwt: String,
+    service_did: Did,
+    capabilities: BTreeSet<String>,
+    accepted_state_digest: Vec<u8>,
+    accepted_state_epoch: u64,
+    response_key_id: String,
+    request_kem_key_id: String,
+    request_kem_recipient: Vec<u8>,
+    expires_at_unix_ms: i64,
+    source_signer: [u8; 32],
     /// Last heartbeat timestamp (Instant)
     last_heartbeat: Instant,
+}
+
+/// Checkpoint-verifying accepted-current-state read used by production
+/// resolution. Implemented by the daemon-owned PDS reader from #1004.
+pub trait AcceptedStateSource: Send + Sync {
+    fn accepted_state(
+        &self,
+        did: &str,
+    ) -> Result<Option<hyprstream_pds::at9p_duplicity::AcceptedAt9pState>>;
+}
+
+/// Cloneable production resolver installed after Discovery bootstrap.
+pub struct DiscoveryServiceResolver {
+    announced_endpoints: Arc<RwLock<HashMap<String, Vec<AnnouncedEndpoint>>>>,
+    accepted_state_source: Arc<dyn AcceptedStateSource>,
 }
 
 /// Phase 0.5 Stage D — cached signed OIDF entity statement.
@@ -251,10 +275,11 @@ pub struct DiscoveryService {
     auth_provider: Option<Box<dyn AuthorizationProvider>>,
     /// Record resolver backing getRecord/getRepo (#431). None = no local PDS,
     /// so getRecord/getRepo report NOT_FOUND for everything.
-    record_resolver: Option<Box<dyn RecordResolver>>,
+    record_resolver: Option<Arc<dyn RecordResolver>>,
+    accepted_state_source: Option<Arc<dyn AcceptedStateSource>>,
     /// Endpoints announced by other services (cross-process).
     /// Maps service_name → Vec<AnnouncedEndpoint>.
-    announced_endpoints: RwLock<HashMap<String, Vec<AnnouncedEndpoint>>>,
+    announced_endpoints: Arc<RwLock<HashMap<String, Vec<AnnouncedEndpoint>>>>,
     /// Phase 0.5 Stage D — cached signed OIDF entity statements per issuer URL.
     /// Pushed by IdPService/OAuth at startup + on every signing-key rotation.
     /// Consumed by FederationKeyResolver before falling back to HTTPS.
@@ -301,7 +326,8 @@ impl DiscoveryService {
             expected_audience: None,
             auth_provider: None,
             record_resolver: None,
-            announced_endpoints: RwLock::new(HashMap::new()),
+            accepted_state_source: None,
+            announced_endpoints: Arc::new(RwLock::new(HashMap::new())),
             entity_statements: RwLock::new(HashMap::new()),
             envelope_keysets: RwLock::new(HashMap::new()),
             tls_endorsement: Vec::new(),
@@ -351,15 +377,32 @@ impl DiscoveryService {
     }
 
     /// Set the record resolver backing getRecord/getRepo (#431).
-    pub fn with_record_resolver(mut self, resolver: Box<dyn RecordResolver>) -> Self {
+    pub fn with_record_resolver(mut self, resolver: Arc<dyn RecordResolver>) -> Self {
         self.record_resolver = Some(resolver);
         self
     }
 
+    pub fn with_accepted_state_source(mut self, source: Arc<dyn AcceptedStateSource>) -> Self {
+        self.accepted_state_source = Some(source);
+        self
+    }
+
+    /// Build the resolver sharing only owned candidate/state handles. No
+    /// Cap'n Proto reader or registry guard crosses the boundary.
+    pub fn production_resolver(&self) -> Result<Arc<dyn ServiceResolver>> {
+        let source = self
+            .accepted_state_source
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Discovery accepted-state source is not installed"))?;
+        Ok(Arc::new(DiscoveryServiceResolver {
+            announced_endpoints: Arc::clone(&self.announced_endpoints),
+            accepted_state_source: source,
+        }))
+    }
+
     /// Get the global EndpointRegistry (D9: graceful error, not panic).
     fn reg(&self) -> Result<impl std::ops::Deref<Target = EndpointRegistry> + '_> {
-        registry::try_global()
-            .ok_or_else(|| anyhow::anyhow!("EndpointRegistry not initialized"))
+        registry::try_global().ok_or_else(|| anyhow::anyhow!("EndpointRegistry not initialized"))
     }
 }
 
@@ -381,6 +424,123 @@ impl Resolver for DiscoveryService {
         }
 
         self.reg()?.try_endpoint(name, kind)
+    }
+}
+
+fn accepted_expiry_unix_ms(
+    state: &hyprstream_pds::at9p_duplicity::AcceptedAt9pState,
+) -> Result<i64> {
+    let expiry = state.expires_at.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "genesis-only accepted state has no bounded expiry; refusing production resolution"
+        )
+    })?;
+    Ok(chrono::DateTime::parse_from_rfc3339(expiry)
+        .map_err(|e| anyhow::anyhow!("invalid accepted-state expiry: {e}"))?
+        .timestamp_millis())
+}
+
+impl DiscoveryServiceResolver {
+    fn acquire_candidates(&self, query: &ServiceQuery) -> Result<Vec<ServiceCandidate>> {
+        let announced = self.announced_endpoints.read();
+        let entries = announced
+            .get(&query.service_name)
+            .cloned()
+            .unwrap_or_default();
+        drop(announced);
+
+        let mut candidates = Vec::new();
+        for entry in entries {
+            if entry.last_heartbeat.elapsed() > ANNOUNCED_ENDPOINT_TTL
+                || entry.service_did.as_str().is_empty()
+                || entry.accepted_state_digest.len() != 64
+            {
+                continue;
+            }
+            let Some(state) = self
+                .accepted_state_source
+                .accepted_state(entry.service_did.as_str())?
+            else {
+                continue;
+            };
+            if state.did != entry.service_did.as_str()
+                || state.epoch != entry.accepted_state_epoch
+                || state.head_digest.as_slice() != entry.accepted_state_digest.as_slice()
+            {
+                continue;
+            }
+            let state_expiry = accepted_expiry_unix_ms(&state)?;
+            let Some(current_key) = state
+                .current
+                .subject_keys
+                .iter()
+                .find(|key| key.ed25519_pub.as_slice() == entry.source_signer)
+            else {
+                continue;
+            };
+            let response_ed25519: [u8; 32] =
+                current_key.ed25519_pub.as_slice().try_into().map_err(|_| {
+                    anyhow::anyhow!("accepted response Ed25519 key has wrong length")
+                })?;
+            let recipient = hyprstream_rpc::crypto::hybrid_kem::RecipientPublic::decode(
+                &entry.request_kem_recipient,
+            )?;
+            let transport = announced_endpoint_to_transport(&entry)?;
+            let mut digest = [0u8; 64];
+            digest.copy_from_slice(&entry.accepted_state_digest);
+            candidates.push(ServiceCandidate {
+                service_name: query.service_name.clone(),
+                service_did: entry.service_did,
+                response_verifying_key: response_ed25519,
+                response_ml_dsa65: current_key.mldsa65_pub.clone(),
+                response_key_id: entry.response_key_id,
+                request_kem_recipient: Some(AnchoredKemRecipient {
+                    key_id: entry.request_kem_key_id,
+                    recipient,
+                    not_after_unix_ms: entry.expires_at_unix_ms,
+                }),
+                transport,
+                capabilities: entry.capabilities,
+                accepted_state: AcceptedStateEvidence {
+                    service_did: Did::from(state.did),
+                    digest,
+                    epoch: state.epoch,
+                    expires_at_unix_ms: state_expiry,
+                    response_ed25519,
+                    response_ml_dsa65: current_key.mldsa65_pub.clone(),
+                },
+                source_signer: entry.source_signer,
+                expires_at_unix_ms: entry.expires_at_unix_ms,
+            });
+        }
+        Ok(candidates)
+    }
+}
+
+#[async_trait]
+impl ServiceResolver for DiscoveryServiceResolver {
+    async fn resolve_service(&self, query: ServiceQuery) -> Result<ResolvedService> {
+        let candidates = self.acquire_candidates(&query)?;
+        select_service_candidate(&query, candidates, unix_millis_now())
+    }
+
+    async fn ensure_current(&self, resolved: &ResolvedService) -> Result<()> {
+        resolved.ensure_fresh(unix_millis_now())?;
+        let state = self
+            .accepted_state_source
+            .accepted_state(resolved.service_did.as_str())?
+            .ok_or_else(|| anyhow::anyhow!("accepted state disappeared; re-resolution required"))?;
+        anyhow::ensure!(
+            state.epoch == resolved.evidence.accepted_state_epoch
+                && state.head_digest == resolved.evidence.accepted_state_digest,
+            "accepted state advanced or forked; re-resolution required"
+        );
+        let state_expiry = accepted_expiry_unix_ms(&state)?;
+        anyhow::ensure!(
+            unix_millis_now() < state_expiry,
+            "accepted state expired; re-resolution required"
+        );
+        Ok(())
     }
 }
 
@@ -408,7 +568,9 @@ impl DiscoveryService {
     }
 }
 
-fn announced_endpoint_to_transport(endpoint: &AnnouncedEndpoint) -> anyhow::Result<TransportConfig> {
+fn announced_endpoint_to_transport(
+    endpoint: &AnnouncedEndpoint,
+) -> anyhow::Result<TransportConfig> {
     match endpoint.socket_kind.as_str() {
         "quic" => parse_announced_quic(&endpoint.endpoint),
         "iroh" => parse_announced_iroh(&endpoint.endpoint),
@@ -420,13 +582,19 @@ fn parse_announced_quic(endpoint: &str) -> anyhow::Result<TransportConfig> {
     let rest = endpoint
         .strip_prefix("quic://")
         .ok_or_else(|| anyhow::anyhow!("announced QUIC endpoint must start with quic://"))?;
-    let (server_name, addr) = rest
-        .split_once(':')
-        .ok_or_else(|| anyhow::anyhow!("announced QUIC endpoint must be quic://<server-name>:<socket-addr>"))?;
-    anyhow::ensure!(!server_name.is_empty(), "announced QUIC endpoint is missing server name");
+    let (server_name, addr) = rest.split_once(':').ok_or_else(|| {
+        anyhow::anyhow!("announced QUIC endpoint must be quic://<server-name>:<socket-addr>")
+    })?;
+    anyhow::ensure!(
+        !server_name.is_empty(),
+        "announced QUIC endpoint is missing server name"
+    );
     let addr = SocketAddr::from_str(addr)
         .map_err(|e| anyhow::anyhow!("invalid announced QUIC socket address '{addr}': {e}"))?;
-    anyhow::ensure!(addr.port() != 0, "announced QUIC endpoint must not use port 0");
+    anyhow::ensure!(
+        addr.port() != 0,
+        "announced QUIC endpoint must not use port 0"
+    );
     Ok(TransportConfig::quic(addr, server_name).with_connect_mode())
 }
 
@@ -434,7 +602,10 @@ fn parse_announced_iroh(endpoint: &str) -> anyhow::Result<TransportConfig> {
     let hex = endpoint
         .strip_prefix("iroh://")
         .ok_or_else(|| anyhow::anyhow!("announced iroh endpoint must start with iroh://"))?;
-    anyhow::ensure!(hex.len() == 64, "announced iroh node id must be 32 bytes of hex");
+    anyhow::ensure!(
+        hex.len() == 64,
+        "announced iroh node id must be 32 bytes of hex"
+    );
     let mut node_id = [0u8; 32];
     for (idx, byte) in node_id.iter_mut().enumerate() {
         let start = idx * 2;
@@ -445,17 +616,242 @@ fn parse_announced_iroh(endpoint: &str) -> anyhow::Result<TransportConfig> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod resolver_tests {
     use super::*;
+    use hyprstream_crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes};
+    use hyprstream_pds::at9p::{
+        CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType,
+        Transport as At9pTransport,
+    };
+    use hyprstream_pds::at9p_duplicity::AcceptedAt9pState;
+    use hyprstream_pds::at9p_sign::{sign_capsule, sign_update_record};
     use hyprstream_rpc::transport::{BindMode, EndpointType};
 
     fn service() -> DiscoveryService {
         let (sk, vk) = hyprstream_rpc::crypto::generate_signing_keypair();
-        DiscoveryService::new(
-            Arc::new(sk),
-            vk,
-            TransportConfig::inproc("resolver-test"),
+        DiscoveryService::new(Arc::new(sk), vk, TransportConfig::inproc("resolver-test"))
+    }
+
+    fn legacy_endpoint(
+        socket_kind: &str,
+        endpoint: &str,
+        last_heartbeat: Instant,
+    ) -> AnnouncedEndpoint {
+        AnnouncedEndpoint {
+            socket_kind: socket_kind.to_owned(),
+            endpoint: endpoint.to_owned(),
+            service_jwt: "jwt".to_owned(),
+            service_did: Did::default(),
+            capabilities: BTreeSet::new(),
+            accepted_state_digest: Vec::new(),
+            accepted_state_epoch: 0,
+            response_key_id: String::new(),
+            request_kem_key_id: String::new(),
+            request_kem_recipient: Vec::new(),
+            expires_at_unix_ms: 0,
+            source_signer: [0; 32],
+            last_heartbeat,
+        }
+    }
+
+    fn accepted_state(tag: u8) -> (AcceptedAt9pState, SigningKey) {
+        let signing = SigningKey::from_bytes(&[tag; 32]);
+        let (pq_signing, pq_verifying) = ml_dsa_generate_keypair();
+        let keys = HybridKeyPair::new(
+            signing.verifying_key().to_bytes().to_vec(),
+            ml_dsa_vk_bytes(&pq_verifying),
         )
+        .unwrap_or_else(|e| panic!("test hybrid keys invalid: {e}"));
+        let endpoint = ServiceEndpoint::new(At9pTransport::Iroh, "iroh://reach")
+            .unwrap_or_else(|e| panic!("test endpoint invalid: {e}"));
+        let service = ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint)
+            .unwrap_or_else(|e| panic!("test service invalid: {e}"));
+        let body = CapsuleBody::new(vec![keys], vec![service])
+            .unwrap_or_else(|e| panic!("test body invalid: {e}"));
+        let genesis = sign_capsule(body.clone(), &signing, &pq_signing)
+            .unwrap_or_else(|e| panic!("test genesis signing failed: {e}"));
+        let subject = genesis
+            .cid512()
+            .unwrap_or_else(|e| panic!("test genesis CID failed: {e}"));
+        let update = sign_update_record(
+            subject,
+            1,
+            [1; 64],
+            body,
+            "2099-01-01T00:00:00Z".to_owned(),
+            &signing,
+            &pq_signing,
+        )
+        .unwrap_or_else(|e| panic!("test update signing failed: {e}"));
+        let bytes = update
+            .to_dag_cbor()
+            .unwrap_or_else(|e| panic!("test update encoding failed: {e}"));
+        let state = AcceptedAt9pState::from_persisted_update(&bytes)
+            .unwrap_or_else(|e| panic!("test accepted state invalid: {e}"));
+        (state, signing)
+    }
+
+    struct MutableAcceptedState(parking_lot::Mutex<Option<AcceptedAt9pState>>);
+
+    impl AcceptedStateSource for MutableAcceptedState {
+        fn accepted_state(&self, _did: &str) -> Result<Option<AcceptedAt9pState>> {
+            Ok(self.0.lock().clone())
+        }
+    }
+
+    fn production_fixture(
+        local_reach: bool,
+    ) -> (DiscoveryServiceResolver, Arc<MutableAcceptedState>) {
+        let (state, signing) = accepted_state(11);
+        let kem = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
+            hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        )
+        .unwrap_or_else(|e| panic!("test KEM generation failed: {e}"));
+        let endpoint = if local_reach {
+            "inproc://hyprstream/model".to_owned()
+        } else {
+            "quic://localhost:127.0.0.1:9".to_owned()
+        };
+        let announced = Arc::new(RwLock::new(HashMap::from([(
+            "model".to_owned(),
+            vec![AnnouncedEndpoint {
+                socket_kind: if local_reach { "rep" } else { "quic" }.to_owned(),
+                endpoint,
+                service_jwt: "verified-by-handler".to_owned(),
+                service_did: Did::from(state.did.clone()),
+                capabilities: ["hyprstream-rpc/1".to_owned()].into_iter().collect(),
+                accepted_state_digest: state.head_digest.to_vec(),
+                accepted_state_epoch: state.epoch,
+                response_key_id: format!("{}#response-current", state.did),
+                request_kem_key_id: format!("{}#kem-current", state.did),
+                request_kem_recipient: kem.public().encode(),
+                expires_at_unix_ms: 4_070_908_800_000,
+                source_signer: signing.verifying_key().to_bytes(),
+                last_heartbeat: Instant::now(),
+            }],
+        )])));
+        let source = Arc::new(MutableAcceptedState(parking_lot::Mutex::new(Some(state))));
+        (
+            DiscoveryServiceResolver {
+                announced_endpoints: announced,
+                accepted_state_source: Arc::clone(&source) as Arc<dyn AcceptedStateSource>,
+            },
+            source,
+        )
+    }
+
+    #[tokio::test]
+    async fn production_resolver_joins_announcement_to_current_pds_state() {
+        let (resolver, _) = production_fixture(false);
+        let resolved = resolver
+            .resolve_service(ServiceQuery::network("model").expect("query"))
+            .await
+            .unwrap_or_else(|e| panic!("production candidate rejected: {e}"));
+        assert_eq!(resolved.service_name, "model");
+        assert_eq!(resolved.evidence.accepted_state_epoch, 1);
+        assert!(resolved.service_did.is_did_at9p());
+        assert!(!resolved.request_kem_recipient.recipient.eks.is_empty());
+        resolver
+            .ensure_current(&resolved)
+            .await
+            .unwrap_or_else(|e| panic!("unchanged accepted state rejected: {e}"));
+    }
+
+    #[tokio::test]
+    async fn accepted_state_advance_between_selection_and_dial_refuses() {
+        let (resolver, source) = production_fixture(false);
+        let resolved = resolver
+            .resolve_service(ServiceQuery::network("model").expect("query"))
+            .await
+            .unwrap_or_else(|e| panic!("production candidate rejected: {e}"));
+        {
+            let mut guard = source.0.lock();
+            let state = guard.as_mut().expect("fixture state");
+            state.epoch += 1;
+            state.head_digest = [0x55; 64];
+        }
+        let error = resolver
+            .ensure_current(&resolved)
+            .await
+            .expect_err("advanced state accepted");
+        assert!(error.to_string().contains("advanced or forked"));
+    }
+
+    #[tokio::test]
+    async fn production_network_resolver_never_falls_back_to_local_reach() {
+        let (resolver, _) = production_fixture(true);
+        assert!(resolver
+            .resolve_service(ServiceQuery::network("model").expect("query"))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn generated_client_uses_ordinary_identity_bound_resolver_path() {
+        let (resolver, _) = production_fixture(false);
+        let entries = resolver
+            .announced_endpoints
+            .write()
+            .remove("model")
+            .expect("fixture announcement");
+        resolver
+            .announced_endpoints
+            .write()
+            .insert("discovery".to_owned(), entries);
+        let resolver = Arc::new(resolver);
+        hyprstream_rpc::resolver::set_global_service(resolver);
+        let client_signing = SigningKey::from_bytes(&[0x44; 32]);
+        let _client = crate::DiscoveryClient::from_resolver(client_signing, None)
+            .await
+            .unwrap_or_else(|e| panic!("generated resolver path failed: {e}"));
+    }
+
+    #[tokio::test]
+    async fn stale_or_expired_production_evidence_is_rejected() {
+        let (resolver, _) = production_fixture(false);
+        resolver
+            .announced_endpoints
+            .write()
+            .get_mut("model")
+            .and_then(|entries| entries.first_mut())
+            .expect("fixture service")
+            .last_heartbeat = Instant::now() - ANNOUNCED_ENDPOINT_TTL - Duration::from_secs(1);
+        assert!(resolver
+            .resolve_service(ServiceQuery::network("model").expect("query"))
+            .await
+            .is_err());
+
+        let (resolver, source) = production_fixture(false);
+        source.0.lock().as_mut().expect("fixture state").expires_at =
+            Some("2000-01-01T00:00:00Z".to_owned());
+        assert!(resolver
+            .resolve_service(ServiceQuery::network("model").expect("query"))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn rejected_or_forked_current_state_never_produces_candidate() {
+        let (resolver, source) = production_fixture(false);
+        *source.0.lock() = None;
+        assert!(resolver
+            .resolve_service(ServiceQuery::network("model").expect("query"))
+            .await
+            .is_err());
+
+        let (resolver, _) = production_fixture(false);
+        resolver
+            .announced_endpoints
+            .write()
+            .get_mut("model")
+            .and_then(|entries| entries.first_mut())
+            .expect("fixture service")
+            .accepted_state_digest = vec![0x77; 64];
+        assert!(resolver
+            .resolve_service(ServiceQuery::network("model").expect("query"))
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -463,12 +859,11 @@ mod resolver_tests {
         let svc = service();
         svc.announced_endpoints.write().insert(
             "model".to_owned(),
-            vec![AnnouncedEndpoint {
-                socket_kind: "quic".to_owned(),
-                endpoint: "quic://model.hyprstream.svc.cluster.local:10.96.0.42:4433".to_owned(),
-                service_jwt: "jwt".to_owned(),
-                last_heartbeat: Instant::now(),
-            }],
+            vec![legacy_endpoint(
+                "quic",
+                "quic://model.hyprstream.svc.cluster.local:10.96.0.42:4433",
+                Instant::now(),
+            )],
         );
 
         let transport = match svc.resolve("model", SocketKind::Quic).await {
@@ -477,7 +872,9 @@ mod resolver_tests {
         };
         assert_eq!(transport.bind_mode(), BindMode::Connect);
         match transport.endpoint {
-            EndpointType::Quic { addr, server_name, .. } => {
+            EndpointType::Quic {
+                addr, server_name, ..
+            } => {
                 assert_eq!(server_name, "model.hyprstream.svc.cluster.local");
                 assert_eq!(addr, SocketAddr::from(([10, 96, 0, 42], 4433)));
             }
@@ -502,12 +899,11 @@ mod resolver_tests {
         let svc = service();
         svc.announced_endpoints.write().insert(
             "model".to_owned(),
-            vec![AnnouncedEndpoint {
-                socket_kind: "quic".to_owned(),
-                endpoint: "quic://model.hyprstream.svc.cluster.local:10.96.0.42:4433".to_owned(),
-                service_jwt: "jwt".to_owned(),
-                last_heartbeat: Instant::now() - (ANNOUNCED_ENDPOINT_TTL + Duration::from_secs(1)),
-            }],
+            vec![legacy_endpoint(
+                "quic",
+                "quic://model.hyprstream.svc.cluster.local:10.96.0.42:4433",
+                Instant::now() - (ANNOUNCED_ENDPOINT_TTL + Duration::from_secs(1)),
+            )],
         );
 
         let err = match svc.resolve("model", SocketKind::Quic).await {
@@ -529,7 +925,11 @@ mod resolver_tests {
         };
         assert_eq!(transport.bind_mode(), BindMode::Connect);
         match transport.endpoint {
-            EndpointType::Iroh { node_id, direct_addrs, relay_url } => {
+            EndpointType::Iroh {
+                node_id,
+                direct_addrs,
+                relay_url,
+            } => {
                 assert_eq!(node_id, [7u8; 32]);
                 assert!(direct_addrs.is_empty());
                 assert!(relay_url.is_none());
@@ -554,7 +954,12 @@ fn socket_kind_to_string(kind: SocketKind) -> &'static str {
 
 #[async_trait(?Send)]
 impl DiscoveryHandler for DiscoveryService {
-    async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
+    async fn authorize(
+        &self,
+        ctx: &EnvelopeContext,
+        resource: &str,
+        operation: &str,
+    ) -> Result<()> {
         // Delegate to authorization provider if available
         if let Some(ref auth) = self.auth_provider {
             let subject = ctx.subject().to_string();
@@ -568,7 +973,12 @@ impl DiscoveryHandler for DiscoveryService {
             if allowed {
                 Ok(())
             } else {
-                anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource)
+                anyhow::bail!(
+                    "Unauthorized: {} cannot {} on {}",
+                    subject,
+                    operation,
+                    resource
+                )
             }
         } else {
             // No auth provider — allow (backward compat for local-only deployments)
@@ -810,7 +1220,9 @@ impl DiscoveryHandler for DiscoveryService {
         _request_id: u64,
     ) -> Result<DiscoveryResponseVariant> {
         Ok(DiscoveryResponseVariant::Error(ErrorInfo {
-            message: "getStream removed — use StreamChannel::prepare_stream for authenticated streaming".to_owned(),
+            message:
+                "getStream removed — use StreamChannel::prepare_stream for authenticated streaming"
+                    .to_owned(),
             code: "REMOVED".to_owned(),
             details: String::new(),
         }))
@@ -836,13 +1248,25 @@ impl DiscoveryHandler for DiscoveryService {
     ) -> Result<DiscoveryResponseVariant> {
         info!(
             "Discovery: service '{}' announced {} endpoint: {} (from {})",
-            data.service_name, data.socket_kind, data.endpoint, ctx.subject()
+            data.service_name,
+            data.socket_kind,
+            data.endpoint,
+            ctx.subject()
         );
 
         let svc_name = data.service_name.clone();
         let sock_kind = data.socket_kind.clone();
         let endpoint = data.endpoint.clone();
         let service_jwt = data.service_jwt.clone().unwrap_or_default();
+        let identity_bound = !data.service_did.as_str().is_empty()
+            || !data.accepted_state_digest.is_empty()
+            || !data.request_kem_recipient.is_empty();
+        if identity_bound {
+            anyhow::ensure!(
+                !service_jwt.is_empty(),
+                "identity-bound announcement requires a verified service JWT"
+            );
+        }
 
         // R3: Verify service JWT signature + subject matches serviceName.
         // Full JWT verification (not decode_unverified) to prevent forged identities.
@@ -851,7 +1275,8 @@ impl DiscoveryHandler for DiscoveryService {
                 &service_jwt,
                 &self.jwt_verifying_key,
                 self.expected_audience.as_deref(),
-            ).map_err(|e| {
+            )
+            .map_err(|e| {
                 tracing::warn!("Service JWT verification failed in announce: {}", e);
                 anyhow::anyhow!("Invalid service JWT in announce: {}", e)
             })?;
@@ -864,22 +1289,35 @@ impl DiscoveryHandler for DiscoveryService {
                     verified.sub
                 );
             }
+            anyhow::ensure!(
+                verified.cnf_key_bytes() == Some(ctx.cnf),
+                "service JWT confirmation key does not match verified announcement signer"
+            );
         }
+
+        let replacement = AnnouncedEndpoint {
+            socket_kind: sock_kind.clone(),
+            endpoint: endpoint.clone(),
+            service_jwt: service_jwt.clone(),
+            service_did: data.service_did.clone(),
+            capabilities: data.capabilities.iter().cloned().collect(),
+            accepted_state_digest: data.accepted_state_digest.clone(),
+            accepted_state_epoch: data.accepted_state_epoch,
+            response_key_id: data.response_key_id.clone(),
+            request_kem_key_id: data.request_kem_key_id.clone(),
+            request_kem_recipient: data.request_kem_recipient.clone(),
+            expires_at_unix_ms: data.expires_at_unix_ms,
+            source_signer: ctx.cnf,
+            last_heartbeat: Instant::now(),
+        };
 
         let mut endpoints = self.announced_endpoints.write();
         let entry = endpoints.entry(svc_name).or_default();
         // Replace existing endpoint for the same socket kind, or add new
         if let Some(existing) = entry.iter_mut().find(|e| e.socket_kind == sock_kind) {
-            existing.endpoint = endpoint;
-            existing.service_jwt = service_jwt;
-            existing.last_heartbeat = Instant::now();
+            *existing = replacement;
         } else {
-            entry.push(AnnouncedEndpoint {
-                socket_kind: sock_kind,
-                endpoint,
-                service_jwt,
-                last_heartbeat: Instant::now(),
-            });
+            entry.push(replacement);
         }
 
         Ok(DiscoveryResponseVariant::AnnounceResult)
@@ -949,11 +1387,13 @@ impl DiscoveryHandler for DiscoveryService {
         match map.get(issuer) {
             Some(cached) => {
                 trace!(issuer = %issuer, "Discovery: entity statement cache hit");
-                Ok(DiscoveryResponseVariant::GetEntityStatementResult(EntityStatement {
-                    issuer: issuer.to_owned(),
-                    jwt: cached.jwt.clone(),
-                    fetched_at: cached.fetched_at,
-                }))
+                Ok(DiscoveryResponseVariant::GetEntityStatementResult(
+                    EntityStatement {
+                        issuer: issuer.to_owned(),
+                        jwt: cached.jwt.clone(),
+                        fetched_at: cached.fetched_at,
+                    },
+                ))
             }
             None => Ok(DiscoveryResponseVariant::Error(ErrorInfo {
                 message: format!("no entity statement cached for issuer: {}", issuer),
@@ -1013,11 +1453,13 @@ impl DiscoveryHandler for DiscoveryService {
         match map.get(service_did) {
             Some(cached) => {
                 trace!(service_did = %service_did, "Discovery: envelope keyset cache hit");
-                Ok(DiscoveryResponseVariant::GetEnvelopeKeysetResult(EnvelopeKeyset {
-                    service_did: hyprstream_rpc::identity::Did::new(service_did.to_owned()),
-                    cose_keyset_cbor: cached.cose_keyset_cbor.clone(),
-                    fetched_at: cached.fetched_at,
-                }))
+                Ok(DiscoveryResponseVariant::GetEnvelopeKeysetResult(
+                    EnvelopeKeyset {
+                        service_did: hyprstream_rpc::identity::Did::new(service_did.to_owned()),
+                        cose_keyset_cbor: cached.cose_keyset_cbor.clone(),
+                        fetched_at: cached.fetched_at,
+                    },
+                ))
             }
             None => Ok(DiscoveryResponseVariant::Error(ErrorInfo {
                 message: format!("no envelope keyset cached for service: {}", service_did),
@@ -1036,7 +1478,10 @@ impl DiscoveryHandler for DiscoveryService {
         // Phase 0.5 plan Q10: getEntityStatement/getEnvelopeKeyset are
         // anonymous-readable (public artifacts), but listKnownIssuers
         // enumerates which partners we trust, which is operator-sensitive.
-        if let Err(e) = self.authorize(ctx, "discovery:federation", "list-known-issuers").await {
+        if let Err(e) = self
+            .authorize(ctx, "discovery:federation", "list-known-issuers")
+            .await
+        {
             return Ok(DiscoveryResponseVariant::Error(ErrorInfo {
                 message: format!("unauthorized: {}", e),
                 code: "UNAUTHORIZED".to_owned(),
@@ -1045,7 +1490,9 @@ impl DiscoveryHandler for DiscoveryService {
         }
         let map = self.entity_statements.read();
         let issuers: Vec<String> = map.keys().cloned().collect();
-        Ok(DiscoveryResponseVariant::ListKnownIssuersResult(IssuerList { issuers }))
+        Ok(DiscoveryResponseVariant::ListKnownIssuersResult(
+            IssuerList { issuers },
+        ))
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -1075,7 +1522,8 @@ impl DiscoveryHandler for DiscoveryService {
             (data.did.clone(), data.collection.clone(), data.rkey.clone())
         } else {
             return Ok(DiscoveryResponseVariant::Error(ErrorInfo {
-                message: "getRecord requires either `uri` or all of (did, collection, rkey)".to_owned(),
+                message: "getRecord requires either `uri` or all of (did, collection, rkey)"
+                    .to_owned(),
                 code: "INVALID_ARGUMENT".to_owned(),
                 details: String::new(),
             }));
@@ -1214,7 +1662,13 @@ impl DiscoveryHandler for DiscoveryService {
         let selectors: Vec<scheduling::LabelSelector> = data
             .selectors
             .iter()
-            .map(|s| scheduling::LabelSelector::new(s.key.clone(), to_scheduling_op(s.op), s.values.clone()))
+            .map(|s| {
+                scheduling::LabelSelector::new(
+                    s.key.clone(),
+                    to_scheduling_op(s.op),
+                    s.values.clone(),
+                )
+            })
             .collect();
         let resources: Vec<scheduling::ResourceRequest> = data
             .resources
@@ -1280,7 +1734,11 @@ impl DiscoveryHandler for DiscoveryService {
         ];
 
         let outcomes = scheduling::filter(&candidates, &predicates);
-        let survivors: Vec<&Candidate> = outcomes.iter().filter(|o| o.passed()).map(|o| o.candidate).collect();
+        let survivors: Vec<&Candidate> = outcomes
+            .iter()
+            .filter(|o| o.passed())
+            .map(|o| o.candidate)
+            .collect();
 
         // Per-candidate fail-closed authz — async, so it runs as its own pass
         // rather than inside a (sync) `scheduling::Predicate` closure. A denied
@@ -1328,10 +1786,12 @@ impl DiscoveryHandler for DiscoveryService {
             })
             .collect();
 
-        Ok(DiscoveryResponseVariant::QueryCandidatesResult(PlacementCandidateSet {
-            candidates: candidates_out,
-            total_matching,
-        }))
+        Ok(DiscoveryResponseVariant::QueryCandidatesResult(
+            PlacementCandidateSet {
+                candidates: candidates_out,
+                total_matching,
+            },
+        ))
     }
 
     /// #524 P1 — node liveness heartbeat. The auto-generated dispatch gate
@@ -1366,13 +1826,21 @@ impl DiscoveryHandler for DiscoveryService {
                 .map(|r| (r.name.clone(), r.quantity.clone()))
                 .collect(),
             load_fraction: data.load_fraction,
-            last_seen: if data.ts != 0 { data.ts } else { unix_millis_now() },
+            last_seen: if data.ts != 0 {
+                data.ts
+            } else {
+                unix_millis_now()
+            },
         };
         self.liveness.insert(data.node.clone(), live, LIVENESS_TTL);
 
         if self.placement_index.record_uri(&node_did).is_none() {
             if let Some(resolver) = &self.record_resolver {
-                if let Err(e) = self.placement_index.ingest_did(resolver.as_ref(), &node_did).await {
+                if let Err(e) = self
+                    .placement_index
+                    .ingest_did(resolver.as_ref(), &node_did)
+                    .await
+                {
                     tracing::warn!(
                         node = %node_did,
                         error = %e,
@@ -1493,10 +1961,10 @@ mod get_record_tests {
     ) -> (
         MockResolver,
         P256VerifyingKey,
-        String,             // target rkey
-        ModelRecord,        // target record
-        PdsCid,             // target record CID
-        Proof,              // target inclusion proof
+        String,      // target rkey
+        ModelRecord, // target record
+        PdsCid,      // target record CID
+        Proof,       // target inclusion proof
     ) {
         let signing_key = P256SigningKey::random(&mut rand::rngs::OsRng);
         let verifying_key = P256VerifyingKey::from(&signing_key);
@@ -1575,10 +2043,7 @@ mod get_record_tests {
         }
     }
 
-    fn service_with(
-        allow: Vec<(&str, &str)>,
-        resolver: MockResolver,
-    ) -> DiscoveryService {
+    fn service_with(allow: Vec<(&str, &str)>, resolver: MockResolver) -> DiscoveryService {
         let (sk, vk) = hyprstream_rpc::crypto::generate_signing_keypair();
         let allow = allow
             .into_iter()
@@ -1590,7 +2055,7 @@ mod get_record_tests {
             hyprstream_rpc::transport::TransportConfig::inproc("discovery-test"),
         )
         .with_auth_provider(Box::new(MockAuth { allow }))
-        .with_record_resolver(Box::new(resolver))
+        .with_record_resolver(Arc::new(resolver))
     }
 
     fn test_ctx() -> EnvelopeContext {
@@ -1741,20 +2206,26 @@ mod query_candidates_tests {
 
     use std::collections::BTreeMap;
 
+    use crate::generated::discovery_client::{LabelSelector, ResourceRequest, SelectorOp};
     use hyprstream_pds::car::build_car_v1;
     use hyprstream_pds::cid::Cid;
     use hyprstream_pds::commit::{Commit, UnsignedCommit};
     use hyprstream_pds::mst::Node;
     use hyprstream_pds::placement::node::{self, NodeRecord};
     use hyprstream_pds::tid::Tid;
-    use crate::generated::discovery_client::{LabelSelector, SelectorOp, ResourceRequest};
     use p256::ecdsa::SigningKey as P256SigningKey;
 
     /// Allows every (resource, operation) pair.
     struct AllowAll;
     #[async_trait(?Send)]
     impl AuthorizationProvider for AllowAll {
-        async fn check(&self, _subject: &str, _domain: &str, _resource: &str, _operation: &str) -> Result<bool> {
+        async fn check(
+            &self,
+            _subject: &str,
+            _domain: &str,
+            _resource: &str,
+            _operation: &str,
+        ) -> Result<bool> {
             Ok(true)
         }
     }
@@ -1764,7 +2235,13 @@ mod query_candidates_tests {
     struct DenyNode(String);
     #[async_trait(?Send)]
     impl AuthorizationProvider for DenyNode {
-        async fn check(&self, _subject: &str, _domain: &str, resource: &str, _operation: &str) -> Result<bool> {
+        async fn check(
+            &self,
+            _subject: &str,
+            _domain: &str,
+            resource: &str,
+            _operation: &str,
+        ) -> Result<bool> {
             Ok(resource != format!("placement:candidate:{}", self.0))
         }
     }
@@ -1776,14 +2253,19 @@ mod query_candidates_tests {
     }
     #[async_trait(?Send)]
     impl RecordResolver for FixedRepoResolver {
-        async fn resolve_record(&self, _did: &str, _collection: &str, _rkey: &str) -> Result<Option<RecordCarData>> {
+        async fn resolve_record(
+            &self,
+            _did: &str,
+            _collection: &str,
+            _rkey: &str,
+        ) -> Result<Option<RecordCarData>> {
             Ok(None)
         }
         async fn resolve_repo(&self, did: &str) -> Result<Option<RecordCarData>> {
-            Ok(self
-                .repos
-                .get(did)
-                .map(|car| RecordCarData { uri: format!("at://{did}"), car: car.clone() }))
+            Ok(self.repos.get(did).map(|car| RecordCarData {
+                uri: format!("at://{did}"),
+                car: car.clone(),
+            }))
         }
     }
 
@@ -1813,7 +2295,10 @@ mod query_candidates_tests {
             format!("at://{did}"),
             labels
                 .into_iter()
-                .map(|(k, v)| node::Label { key: k.to_owned(), value: v.to_owned() })
+                .map(|(k, v)| node::Label {
+                    key: k.to_owned(),
+                    value: v.to_owned(),
+                })
                 .collect(),
             vec![],
             vec![],
@@ -1822,7 +2307,10 @@ mod query_candidates_tests {
         .unwrap()
     }
 
-    fn service_with(auth: Box<dyn AuthorizationProvider>, repos: HashMap<String, Vec<u8>>) -> DiscoveryService {
+    fn service_with(
+        auth: Box<dyn AuthorizationProvider>,
+        repos: HashMap<String, Vec<u8>>,
+    ) -> DiscoveryService {
         let (sk, vk) = hyprstream_rpc::crypto::generate_signing_keypair();
         DiscoveryService::new(
             Arc::new(sk),
@@ -1830,29 +2318,47 @@ mod query_candidates_tests {
             hyprstream_rpc::transport::TransportConfig::inproc("query-candidates-test"),
         )
         .with_auth_provider(auth)
-        .with_record_resolver(Box::new(FixedRepoResolver { repos }))
+        .with_record_resolver(Arc::new(FixedRepoResolver { repos }))
     }
 
     fn test_ctx() -> EnvelopeContext {
         EnvelopeContext::from_callback_service(1, "test-caller")
     }
 
-    async fn heartbeat(svc: &DiscoveryService, did: &str, allocatable: Vec<(&str, &str)>, load_fraction: f32) {
+    async fn heartbeat(
+        svc: &DiscoveryService,
+        did: &str,
+        allocatable: Vec<(&str, &str)>,
+        load_fraction: f32,
+    ) {
         let req = NodeLiveness {
             node: Did::new(did.to_owned()),
             allocatable: allocatable
                 .into_iter()
-                .map(|(n, q)| Resource { name: n.to_owned(), quantity: q.to_owned() })
+                .map(|(n, q)| Resource {
+                    name: n.to_owned(),
+                    quantity: q.to_owned(),
+                })
                 .collect(),
             load_fraction,
             ts: 0,
         };
-        let resp = svc.handle_report_node_liveness(&test_ctx(), 1, &req).await.unwrap();
-        assert!(matches!(resp, DiscoveryResponseVariant::ReportNodeLivenessResult));
+        let resp = svc
+            .handle_report_node_liveness(&test_ctx(), 1, &req)
+            .await
+            .unwrap();
+        assert!(matches!(
+            resp,
+            DiscoveryResponseVariant::ReportNodeLivenessResult
+        ));
     }
 
     fn empty_query(max_candidates: u32) -> QueryCandidatesRequest {
-        QueryCandidatesRequest { selectors: vec![], resources: vec![], max_candidates }
+        QueryCandidatesRequest {
+            selectors: vec![],
+            resources: vec![],
+            max_candidates,
+        }
     }
 
     fn as_set(resp: DiscoveryResponseVariant) -> PlacementCandidateSet {
@@ -1868,9 +2374,16 @@ mod query_candidates_tests {
     async fn liveness_hard_excludes_nodes_never_heartbeated() {
         let did = "did:web:node1.example.com";
         let rec = sample_node_record(did, vec![("zone", "us-east")]);
-        let svc = service_with(Box::new(AllowAll), HashMap::from([(did.to_owned(), node_repo_car(did, &rec))]));
+        let svc = service_with(
+            Box::new(AllowAll),
+            HashMap::from([(did.to_owned(), node_repo_car(did, &rec))]),
+        );
 
-        let set = as_set(svc.handle_query_candidates(&test_ctx(), 1, &empty_query(0)).await.unwrap());
+        let set = as_set(
+            svc.handle_query_candidates(&test_ctx(), 1, &empty_query(0))
+                .await
+                .unwrap(),
+        );
         assert!(set.candidates.is_empty());
         assert_eq!(set.total_matching, 0);
     }
@@ -1880,8 +2393,14 @@ mod query_candidates_tests {
         let did_a = "did:web:node-a.example.com";
         let did_b = "did:web:node-b.example.com";
         let repos = HashMap::from([
-            (did_a.to_owned(), node_repo_car(did_a, &sample_node_record(did_a, vec![("zone", "us-east")]))),
-            (did_b.to_owned(), node_repo_car(did_b, &sample_node_record(did_b, vec![("zone", "us-west")]))),
+            (
+                did_a.to_owned(),
+                node_repo_car(did_a, &sample_node_record(did_a, vec![("zone", "us-east")])),
+            ),
+            (
+                did_b.to_owned(),
+                node_repo_car(did_b, &sample_node_record(did_b, vec![("zone", "us-west")])),
+            ),
         ]);
         let svc = service_with(Box::new(AllowAll), repos);
         heartbeat(&svc, did_a, vec![], 0.1).await;
@@ -1896,7 +2415,11 @@ mod query_candidates_tests {
             resources: vec![],
             max_candidates: 0,
         };
-        let set = as_set(svc.handle_query_candidates(&test_ctx(), 1, &req).await.unwrap());
+        let set = as_set(
+            svc.handle_query_candidates(&test_ctx(), 1, &req)
+                .await
+                .unwrap(),
+        );
         assert_eq!(set.candidates.len(), 1);
         assert_eq!(set.candidates[0].node, did_a);
         assert_eq!(set.total_matching, 1);
@@ -1906,24 +2429,44 @@ mod query_candidates_tests {
     async fn resource_request_filters_insufficient_live_capacity() {
         let did = "did:web:node1.example.com";
         let rec = sample_node_record(did, vec![]);
-        let svc = service_with(Box::new(AllowAll), HashMap::from([(did.to_owned(), node_repo_car(did, &rec))]));
+        let svc = service_with(
+            Box::new(AllowAll),
+            HashMap::from([(did.to_owned(), node_repo_car(did, &rec))]),
+        );
         heartbeat(&svc, did, vec![("nvidia.com/gpu", "2")], 0.1).await;
 
         let req = QueryCandidatesRequest {
             selectors: vec![],
-            resources: vec![ResourceRequest { name: "nvidia.com/gpu".to_owned(), min_quantity: "4".to_owned() }],
+            resources: vec![ResourceRequest {
+                name: "nvidia.com/gpu".to_owned(),
+                min_quantity: "4".to_owned(),
+            }],
             max_candidates: 0,
         };
-        let set = as_set(svc.handle_query_candidates(&test_ctx(), 1, &req).await.unwrap());
-        assert!(set.candidates.is_empty(), "2 GPUs must not satisfy a request for >=4");
+        let set = as_set(
+            svc.handle_query_candidates(&test_ctx(), 1, &req)
+                .await
+                .unwrap(),
+        );
+        assert!(
+            set.candidates.is_empty(),
+            "2 GPUs must not satisfy a request for >=4"
+        );
 
         // A satisfiable request against the same live report succeeds.
         let req_ok = QueryCandidatesRequest {
             selectors: vec![],
-            resources: vec![ResourceRequest { name: "nvidia.com/gpu".to_owned(), min_quantity: "1".to_owned() }],
+            resources: vec![ResourceRequest {
+                name: "nvidia.com/gpu".to_owned(),
+                min_quantity: "1".to_owned(),
+            }],
             max_candidates: 0,
         };
-        let set_ok = as_set(svc.handle_query_candidates(&test_ctx(), 1, &req_ok).await.unwrap());
+        let set_ok = as_set(
+            svc.handle_query_candidates(&test_ctx(), 1, &req_ok)
+                .await
+                .unwrap(),
+        );
         assert_eq!(set_ok.candidates.len(), 1);
     }
 
@@ -1934,23 +2477,37 @@ mod query_candidates_tests {
         let did_a = "did:web:node-a.example.com";
         let did_b = "did:web:node-b.example.com";
         let repos = HashMap::from([
-            (did_a.to_owned(), node_repo_car(did_a, &sample_node_record(did_a, vec![]))),
-            (did_b.to_owned(), node_repo_car(did_b, &sample_node_record(did_b, vec![]))),
+            (
+                did_a.to_owned(),
+                node_repo_car(did_a, &sample_node_record(did_a, vec![])),
+            ),
+            (
+                did_b.to_owned(),
+                node_repo_car(did_b, &sample_node_record(did_b, vec![])),
+            ),
         ]);
         let svc = service_with(Box::new(DenyNode(did_a.to_owned())), repos);
         heartbeat(&svc, did_a, vec![], 0.1).await;
         heartbeat(&svc, did_b, vec![], 0.1).await;
 
-        let resp = svc.handle_query_candidates(&test_ctx(), 1, &empty_query(0)).await.unwrap();
+        let resp = svc
+            .handle_query_candidates(&test_ctx(), 1, &empty_query(0))
+            .await
+            .unwrap();
         let set = as_set(resp);
         assert_eq!(set.candidates.len(), 1);
         assert_eq!(set.candidates[0].node, did_b);
-        assert_eq!(set.total_matching, 1, "denied candidate must not inflate totalMatching");
+        assert_eq!(
+            set.total_matching, 1,
+            "denied candidate must not inflate totalMatching"
+        );
     }
 
     #[tokio::test]
     async fn bounding_respects_max_candidates_and_total_matching_is_pre_bound() {
-        let dids: Vec<String> = (0..5).map(|i| format!("did:web:node{i}.example.com")).collect();
+        let dids: Vec<String> = (0..5)
+            .map(|i| format!("did:web:node{i}.example.com"))
+            .collect();
         let mut repos = HashMap::new();
         for d in &dids {
             repos.insert(d.clone(), node_repo_car(d, &sample_node_record(d, vec![])));
@@ -1960,9 +2517,16 @@ mod query_candidates_tests {
             heartbeat(&svc, d, vec![], i as f32 * 0.1).await;
         }
 
-        let set = as_set(svc.handle_query_candidates(&test_ctx(), 1, &empty_query(2)).await.unwrap());
+        let set = as_set(
+            svc.handle_query_candidates(&test_ctx(), 1, &empty_query(2))
+                .await
+                .unwrap(),
+        );
         assert_eq!(set.candidates.len(), 2, "bounded to maxCandidates");
-        assert_eq!(set.total_matching, 5, "totalMatching counts all authorized survivors, not just the bound");
+        assert_eq!(
+            set.total_matching, 5,
+            "totalMatching counts all authorized survivors, not just the bound"
+        );
         // Ranked ascending by load_fraction: node0 (0.0) then node1 (0.1).
         assert_eq!(set.candidates[0].node, dids[0]);
         assert_eq!(set.candidates[1].node, dids[1]);
@@ -1970,7 +2534,9 @@ mod query_candidates_tests {
 
     #[tokio::test]
     async fn zero_max_candidates_uses_default_bound() {
-        let dids: Vec<String> = (0..3).map(|i| format!("did:web:node{i}.example.com")).collect();
+        let dids: Vec<String> = (0..3)
+            .map(|i| format!("did:web:node{i}.example.com"))
+            .collect();
         let mut repos = HashMap::new();
         for d in &dids {
             repos.insert(d.clone(), node_repo_car(d, &sample_node_record(d, vec![])));
@@ -1979,21 +2545,39 @@ mod query_candidates_tests {
         for d in &dids {
             heartbeat(&svc, d, vec![], 0.0).await;
         }
-        let set = as_set(svc.handle_query_candidates(&test_ctx(), 1, &empty_query(0)).await.unwrap());
-        assert_eq!(set.candidates.len(), 3, "under the default bound, all 3 come back");
+        let set = as_set(
+            svc.handle_query_candidates(&test_ctx(), 1, &empty_query(0))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            set.candidates.len(),
+            3,
+            "under the default bound, all 3 come back"
+        );
     }
 
     #[tokio::test]
     async fn heartbeat_refreshes_ttl_and_liveness_fields() {
         let did = "did:web:node1.example.com";
         let rec = sample_node_record(did, vec![]);
-        let svc = service_with(Box::new(AllowAll), HashMap::from([(did.to_owned(), node_repo_car(did, &rec))]));
+        let svc = service_with(
+            Box::new(AllowAll),
+            HashMap::from([(did.to_owned(), node_repo_car(did, &rec))]),
+        );
         heartbeat(&svc, did, vec![("cpu", "1")], 0.9).await;
         heartbeat(&svc, did, vec![("cpu", "8")], 0.1).await;
 
-        let set = as_set(svc.handle_query_candidates(&test_ctx(), 1, &empty_query(0)).await.unwrap());
+        let set = as_set(
+            svc.handle_query_candidates(&test_ctx(), 1, &empty_query(0))
+                .await
+                .unwrap(),
+        );
         assert_eq!(set.candidates.len(), 1);
-        assert!((set.candidates[0].load_fraction - 0.1).abs() < f32::EPSILON, "second heartbeat must win");
+        assert!(
+            (set.candidates[0].load_fraction - 0.1).abs() < f32::EPSILON,
+            "second heartbeat must win"
+        );
         assert_eq!(set.candidates[0].allocatable[0].quantity, "8");
     }
 }

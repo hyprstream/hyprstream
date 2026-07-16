@@ -108,7 +108,7 @@ pub fn build_chat_vfs_namespace(
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = crate::services::PolicyClient::for_service(
+    let policy_client = crate::services::PolicyClient::for_local_bootstrap(
         signing_key.clone(),
         policy_vk,
         None,
@@ -127,7 +127,7 @@ pub fn build_chat_vfs_namespace(
             .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
     ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?;
 
-    let model_client = crate::services::generated::model_client::ModelClient::for_service(
+    let model_client = crate::services::generated::model_client::ModelClient::for_local_bootstrap(
         signing_key.clone(),
         model_vk,
         None,

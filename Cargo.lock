@@ -6961,6 +6961,7 @@ dependencies = [
  "async-trait",
  "capnp",
  "capnpc",
+ "chrono",
  "ed25519-dalek 2.2.0",
  "hyprstream-crypto",
  "hyprstream-k8s",

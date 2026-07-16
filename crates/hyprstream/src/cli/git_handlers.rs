@@ -1338,7 +1338,7 @@ pub async fn handle_infer(
     // ModelService is already running (started by main.rs in inproc mode, or by systemd in ipc-systemd mode).
     let model_server_vk = {
         let policy_vk = signing_key.verifying_key();
-        let policy_client = crate::services::PolicyClient::for_service(
+        let policy_client = crate::services::PolicyClient::for_local_bootstrap(
             signing_key.clone(), policy_vk, None,
         )?;
         let resp = policy_client.resolve_service_key(
@@ -1351,7 +1351,7 @@ pub async fn handle_infer(
                 .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
         ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?
     };
-    let model_client = ModelClient::for_service(
+    let model_client = ModelClient::for_local_bootstrap(
         signing_key.clone(),
         model_server_vk,
         None,
@@ -1509,7 +1509,7 @@ pub async fn handle_load(
     let load_kv_quant = if kv_quant == crate::runtime::KVQuantType::None { None } else { Some(kv_quant) };
 
     let policy_vk = signing_key.verifying_key();
-    let policy_client = crate::services::PolicyClient::for_service(
+    let policy_client = crate::services::PolicyClient::for_local_bootstrap(
         signing_key.clone(), policy_vk, None,
     )?;
 
@@ -1523,7 +1523,7 @@ pub async fn handle_load(
         model_key_resp.verifying_key.as_slice().try_into()
             .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
     ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?;
-    let model_client = ModelClient::for_service(
+    let model_client = ModelClient::for_local_bootstrap(
         signing_key.clone(), model_vk, None,
     )?;
     match model_client.load(&LoadModelRequest {
@@ -1738,7 +1738,7 @@ pub async fn handle_unload(
 
     let model_server_vk = {
         let policy_vk = signing_key.verifying_key();
-        let policy_client = crate::services::PolicyClient::for_service(
+        let policy_client = crate::services::PolicyClient::for_local_bootstrap(
             signing_key.clone(), policy_vk, None,
         )?;
         let resp = policy_client.resolve_service_key(
@@ -1751,7 +1751,7 @@ pub async fn handle_unload(
                 .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
         ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?
     };
-    let model_client = ModelClient::for_service(signing_key, model_server_vk, None)?;
+    let model_client = ModelClient::for_local_bootstrap(signing_key, model_server_vk, None)?;
 
     model_client.unload(&UnloadModelRequest { model_ref: model_ref_str.to_owned() }).await?;
 

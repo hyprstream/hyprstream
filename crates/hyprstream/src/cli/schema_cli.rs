@@ -364,7 +364,7 @@ async fn resolve_key_via_policy(
     service_name: &str,
 ) -> Result<hyprstream_rpc::crypto::VerifyingKey> {
     let policy_vk = signing_key.verifying_key();
-    let policy_client = PolicyClient::for_service(
+    let policy_client = PolicyClient::for_local_bootstrap(
         signing_key.clone(), policy_vk, None,
     )?;
     let resp = policy_client.resolve_service_key(
@@ -388,25 +388,25 @@ async fn dispatch_top_level(
     match service {
         "registry" => {
             let server_vk = resolve_key_via_policy(&signing_key, "registry").await?;
-            let client: RegistryClient = RegistryClient::for_service(
+            let client: RegistryClient = RegistryClient::for_local_bootstrap(
                 signing_key, server_vk, None,
             )?;
             client.call_method(method, args).await
         }
         "model" => {
             let server_vk = resolve_key_via_policy(&signing_key, "model").await?;
-            let client = ModelClient::for_service(signing_key, server_vk, None)?;
+            let client = ModelClient::for_local_bootstrap(signing_key, server_vk, None)?;
             client.call_method(method, args).await
         }
         "inference" => {
             let server_vk = resolve_key_via_policy(&signing_key, "inference").await?;
-            let client = InferenceClient::for_service(signing_key, server_vk, None)?;
+            let client = InferenceClient::for_local_bootstrap(signing_key, server_vk, None)?;
             client.call_method(method, args).await
         }
         "policy" => {
             // Bootstrap: PolicyService uses the root key
             let server_vk = signing_key.verifying_key();
-            let client = PolicyClient::for_service(signing_key, server_vk, None)?;
+            let client = PolicyClient::for_local_bootstrap(signing_key, server_vk, None)?;
             client.call_method(method, args).await
         }
         "worker" => {
@@ -430,19 +430,19 @@ async fn dispatch_scoped_dynamic(
     match service {
         "registry" => {
             let server_vk = resolve_key_via_policy(&signing_key, "registry").await?;
-            let client: RegistryClient = RegistryClient::for_service(
+            let client: RegistryClient = RegistryClient::for_local_bootstrap(
                 signing_key, server_vk, None,
             )?;
             client.call_scoped_method(scope_chain, method, args).await
         }
         "model" => {
             let server_vk = resolve_key_via_policy(&signing_key, "model").await?;
-            let client = ModelClient::for_service(signing_key, server_vk, None)?;
+            let client = ModelClient::for_local_bootstrap(signing_key, server_vk, None)?;
             client.call_scoped_method(scope_chain, method, args).await
         }
         "worker" => {
             let server_vk = resolve_key_via_policy(&signing_key, "worker").await?;
-            let client = WorkerClient::for_service(signing_key, server_vk, None)?;
+            let client = WorkerClient::for_local_bootstrap(signing_key, server_vk, None)?;
             client.call_scoped_method(scope_chain, method, args).await
         }
         _ => bail!("Service '{}' has no scoped methods", service),

@@ -203,7 +203,7 @@ fn register_service_key(
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = PolicyClient::for_service(
+    let policy_client = PolicyClient::for_local_bootstrap(
         signing_key.clone(),
         policy_vk,
         Some(jwt.clone()),
@@ -296,7 +296,7 @@ fn spawn_jwt_renewal_task(
                 (vk, svc_jwt)
             };
 
-            let policy_client = match PolicyClient::for_service(signing_key.clone(), policy_vk, Some(current_jwt)) {
+            let policy_client = match PolicyClient::for_local_bootstrap(signing_key.clone(), policy_vk, Some(current_jwt)) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(service = service_name, error = %e, "failed to create PolicyClient; skipping JWT renewal");
@@ -620,7 +620,7 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("registry"))?;
+    let policy_client = PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token("registry"))?;
 
     // #910a — the registry service is the sole PDS-record writer AND the sole
     // holder of the `#atproto` private key: it opens the durable store
@@ -850,13 +850,13 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("model"))?;
+    let policy_client = PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token("model"))?;
 
     // Create registry client
     let registry_vk = hyprstream_service::global_trust_store()
         .resolve_one("registry")
         .ok_or_else(|| anyhow::anyhow!("trust store has no registry key"))?;
-    let registry_client: RegistryClient = RegistryClient::for_service(
+    let registry_client: RegistryClient = RegistryClient::for_local_bootstrap(
         sk.clone(),
         registry_vk,
         service_token("model"),
@@ -887,7 +887,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     // if discovery isn't resolvable, ModelService simply has no federation client
     // and at:// refs fall through to local resolution.
     if let Some(discovery_vk) = hyprstream_service::global_trust_store().resolve_one("discovery") {
-        match crate::services::DiscoveryClient::for_service(sk.clone(), discovery_vk, None) {
+        match crate::services::DiscoveryClient::for_local_bootstrap(sk.clone(), discovery_vk, None) {
             Ok(dc) => {
                 model_service = model_service.with_discovery_client(std::sync::Arc::new(dc));
             }
@@ -1006,7 +1006,7 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = crate::services::PolicyClient::for_service(
+    let policy_client = crate::services::PolicyClient::for_local_bootstrap(
         sk.clone(),
         policy_vk,
         service_token("worker"),
@@ -1047,17 +1047,17 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let model_vk = hyprstream_service::global_trust_store()
         .resolve_one("model")
         .ok_or_else(|| anyhow::anyhow!("trust store has no model key"))?;
-    let model_client = ModelClient::for_service(sk.clone(), model_vk, service_token("oai"))?;
+    let model_client = ModelClient::for_local_bootstrap(sk.clone(), model_vk, service_token("oai"))?;
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("oai"))?;
+    let policy_client = PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token("oai"))?;
 
     // Create registry client
     let registry_vk = hyprstream_service::global_trust_store()
         .resolve_one("registry")
         .ok_or_else(|| anyhow::anyhow!("trust store has no registry key"))?;
-    let registry_client: RegistryClient = RegistryClient::for_service(
+    let registry_client: RegistryClient = RegistryClient::for_local_bootstrap(
         sk.clone(),
         registry_vk,
         service_token("oai"),
@@ -1126,7 +1126,7 @@ fn create_xet_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         .resolve_one("registry")
         .ok_or_else(|| anyhow::anyhow!("trust store has no registry key"))?;
     let registry_client: RegistryClient =
-        RegistryClient::for_service(sk.clone(), registry_vk, service_token("xet"))?;
+        RegistryClient::for_local_bootstrap(sk.clone(), registry_vk, service_token("xet"))?;
 
     let state = XetState {
         // Reads share the same L1 CAS substrate the registry's getBlob uses (#812).
@@ -1175,7 +1175,7 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
             let registry_vk = hyprstream_service::global_trust_store()
                 .resolve_one("registry")
                 .ok_or_else(|| anyhow::anyhow!("trust store has no registry key"))?;
-            let registry_client: RegistryClient = RegistryClient::for_service(
+            let registry_client: RegistryClient = RegistryClient::for_local_bootstrap(
                 sk.clone(),
                 registry_vk,
                 service_token("flight"),
@@ -1299,7 +1299,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         if let Some(fed) = federation_key_source {
             fed
         } else {
-            let fallback_policy_client = std::sync::Arc::new(PolicyClient::for_service(
+            let fallback_policy_client = std::sync::Arc::new(PolicyClient::for_local_bootstrap(
                 ctx.service_signing_key("mcp"),
                 policy_vk,
                 service_token("mcp"),
@@ -1650,7 +1650,7 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("tui"))?;
+    let policy_client = PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token("tui"))?;
 
     // Build VFS namespace for ChatApps spawned via TUI RPC.
     let (vfs_ns, vfs_subject) = crate::tui::vfs::build_chat_vfs_namespace(&sk)?;
@@ -1725,7 +1725,7 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("discovery"))?;
+    let policy_client = PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token("discovery"))?;
     let auth_provider = crate::services::discovery::PolicyAuthProvider::new(policy_client);
 
     // #431 — record resolver backing getRecord/getRepo, over the durable
@@ -1753,7 +1753,9 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
             .context("failed to open PDS record store (read-only)")?
             .with_at9p_acceptance_identity(at9p_acceptance_identity),
     );
-    let record_resolver = crate::services::discovery::PdsRecordResolver::new(pds_store);
+    let record_resolver = std::sync::Arc::new(
+        crate::services::discovery::PdsRecordResolver::new(pds_store),
+    );
 
     let mut discovery_service = DiscoveryService::new(
         Arc::new(sk),
@@ -1761,7 +1763,11 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
         ctx.transport("discovery", SocketKind::Rep),
     )
     .with_auth_provider(Box::new(auth_provider))
-    .with_record_resolver(Box::new(record_resolver));
+    .with_record_resolver(
+        std::sync::Arc::clone(&record_resolver)
+            as std::sync::Arc<dyn hyprstream_discovery::RecordResolver>,
+    )
+    .with_accepted_state_source(record_resolver);
     if let Some(issuer) = ctx.oauth_issuer_url() {
         discovery_service = discovery_service.with_oauth_issuer(issuer.to_owned());
         // Use the issuer URL as the audience for discovery tokens
@@ -1788,6 +1794,12 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
             }
         }
     }
+    // Discovery has now been explicitly bootstrapped through the local registry
+    // path. Replace only the identity-bound resolver; the endpoint-only legacy
+    // resolver remains isolated for named bootstrap adapters.
+    let production_resolver = discovery_service.production_resolver()?;
+    hyprstream_rpc::resolver::set_global_service(production_resolver);
+
     // TODO: DiscoveryService federation key source support
     // (federation_key_source not yet implemented on DiscoveryService)
 
@@ -1851,7 +1863,7 @@ fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = PolicyClient::for_service(sk.clone(), policy_vk, service_token("metrics"))?;
+    let policy_client = PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token("metrics"))?;
 
     let mut metrics_service = MetricsService::new(
         orchestrator,

@@ -28,7 +28,7 @@ pub fn create_tui_client(signing_key: &SigningKey) -> Result<TuiClient> {
 
     // Bootstrap: PolicyService uses the root key in inproc mode
     let policy_vk = signing_key.verifying_key();
-    let policy_client = crate::services::PolicyClient::for_service(
+    let policy_client = crate::services::PolicyClient::for_local_bootstrap(
         sk.clone(), policy_vk, None,
     ).context("Failed to create PolicyClient")?;
     let server_vk = {
@@ -49,7 +49,7 @@ pub fn create_tui_client(signing_key: &SigningKey) -> Result<TuiClient> {
             .context("PolicyService returned an invalid TUI Ed25519 key")?
     };
 
-    TuiClient::for_service(sk, server_vk, None).context("Failed to create TuiClient")
+    TuiClient::for_local_bootstrap(sk, server_vk, None).context("Failed to create TuiClient")
 }
 
 /// Attach to an existing TUI session.

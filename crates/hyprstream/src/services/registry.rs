@@ -3465,7 +3465,7 @@ mod tests {
         let _policy_handle = manager.spawn(Box::new(policy_service)).await.expect("test: start policy service");
 
         // Create policy client for RegistryService
-        let policy_client: PolicyClient = PolicyClient::for_endpoint(
+        let policy_client: PolicyClient = PolicyClient::for_local_endpoint_bootstrap(
             "inproc://test-policy-health",
             signing_key.clone(),
             signing_key.verifying_key(),
@@ -3483,7 +3483,7 @@ mod tests {
         let mut handle = manager.spawn(Box::new(registry_service)).await.expect("test: start registry service");
 
         // Create signed client with matching key and local identity
-        let client: RegistryClient = RegistryClient::for_endpoint(
+        let client: RegistryClient = RegistryClient::for_local_endpoint_bootstrap(
             "inproc://test-registry-health",
             signing_key.clone(),
             signing_key.verifying_key(),
@@ -3516,7 +3516,7 @@ mod tests {
             TransportConfig::inproc("at9p-policy"));
         let manager = InprocManager::new();
         let policy_handle = manager.spawn(Box::new(policy)).await.unwrap();
-        let policy_client = PolicyClient::for_endpoint("inproc://at9p-policy", key.clone(), key.verifying_key(), None).unwrap();
+        let policy_client = PolicyClient::for_local_endpoint_bootstrap("inproc://at9p-policy", key.clone(), key.verifying_key(), None).unwrap();
         let store = Arc::new(crate::services::discovery::PdsRecordStore::open(&pds).unwrap()
             .with_at9p_acceptance_identity(key.verifying_key()));
         let ingest = crate::services::discovery::At9pStateIngest::open(
@@ -3530,7 +3530,7 @@ mod tests {
             TransportConfig::inproc("at9p-registry"), key.clone()).await.unwrap()
             .with_pds_publisher(publisher);
         let mut handle = manager.spawn(Box::new(registry)).await.unwrap();
-        let client = RegistryClient::for_endpoint("inproc://at9p-registry", key.clone(), key.verifying_key(), None).unwrap();
+        let client = RegistryClient::for_local_endpoint_bootstrap("inproc://at9p-registry", key.clone(), key.verifying_key(), None).unwrap();
         let (g, n1, n2, n3) = (
             at9p_test_signer(1), at9p_test_signer(2),
             at9p_test_signer(3), at9p_test_signer(4),
@@ -3617,7 +3617,7 @@ mod tests {
         );
         let manager = InprocManager::new();
         let _policy_handle = manager.spawn(Box::new(policy_service)).await.expect("test: start policy");
-        let policy_client: PolicyClient = PolicyClient::for_endpoint(
+        let policy_client: PolicyClient = PolicyClient::for_local_endpoint_bootstrap(
             &format!("inproc://test-policy-{suffix}"),
             signing_key.clone(),
             signing_key.verifying_key(),
@@ -3631,7 +3631,7 @@ mod tests {
             signing_key.clone(),
         ).await.expect("test: create registry service");
         let handle = manager.spawn(Box::new(registry_service)).await.expect("test: start registry");
-        let client: RegistryClient = RegistryClient::for_endpoint(
+        let client: RegistryClient = RegistryClient::for_local_endpoint_bootstrap(
             &format!("inproc://test-registry-{suffix}"),
             signing_key.clone(),
             signing_key.verifying_key(),
@@ -3742,7 +3742,7 @@ mod tests {
             .await
             .expect("test: start policy");
         std::mem::forget(policy_handle);
-        let policy_client: PolicyClient = PolicyClient::for_endpoint(
+        let policy_client: PolicyClient = PolicyClient::for_local_endpoint_bootstrap(
             &format!("inproc://{policy_ep}"),
             signing_key.clone(),
             signing_key.verifying_key(),
@@ -3972,7 +3972,7 @@ mod tests {
             .await
             .expect("test: start policy");
         std::mem::forget(policy_handle);
-        let policy_client: PolicyClient = PolicyClient::for_endpoint(
+        let policy_client: PolicyClient = PolicyClient::for_local_endpoint_bootstrap(
             "inproc://test-policy-register-path",
             signing_key.clone(),
             signing_key.verifying_key(),
