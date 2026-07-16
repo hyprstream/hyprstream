@@ -680,7 +680,8 @@ pub trait RequestService: 'static {
         let protected = crate::auth::parse_protected_header(&token)
             .map_err(|e| anyhow::anyhow!("JWT header parse failed: {}", e))?;
         anyhow::ensure!(
-            protected.typ == "at+jwt" || protected.typ == "wit+jwt",
+            crate::auth::is_rfc9068_access_token_type(&protected.typ)
+                || protected.typ == "wit+jwt",
             "unsupported JWT typ"
         );
         let kid = Some(protected.kid.clone());
@@ -786,7 +787,12 @@ pub trait RequestService: 'static {
                 {
                     anyhow::bail!("local composite JWT issuer mismatch");
                 }
-                let dispatch = crate::auth::parse_composite_dispatch(&token, &["at+jwt", "wit+jwt"])
+                let allowed_types = [
+                    crate::auth::RFC9068_ACCESS_TOKEN_TYPES[0],
+                    crate::auth::RFC9068_ACCESS_TOKEN_TYPES[1],
+                    "wit+jwt",
+                ];
+                let dispatch = crate::auth::parse_composite_dispatch(&token, &allowed_types)
                     .map_err(|error| anyhow::anyhow!("JWT dispatch failed: {error}"))?;
                 let snapshot = key_source.composite_key_set().snapshot();
                 let pair = snapshot
@@ -1257,13 +1263,21 @@ mod empty_iss_gate_tests {
         let now = chrono::Utc::now().timestamp();
         let claims =
             Claims::new("alice".to_owned(), now, now + 60).with_issuer("https://local".to_owned());
+        for typ in crate::auth::RFC9068_ACCESS_TOKEN_TYPES {
+            let header = format!(
+                r#"{{"alg":"ML-DSA-65-Ed25519","typ":"{typ}","kid":"{kid_a}"}}"#
+            );
+            let valid = composite_token(&header, &claims, &pq_a, &ed_a, false);
+            assert!(
+                svc.verify_claims(&mut ctx_with_token(valid, false))
+                    .await
+                    .is_ok(),
+                "rejected RFC 9068 access-token type {typ}"
+            );
+        }
+
         let valid_header =
             format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"at+jwt","kid":"{kid_a}"}}"#);
-        let valid = composite_token(&valid_header, &claims, &pq_a, &ed_a, false);
-        assert!(svc
-            .verify_claims(&mut ctx_with_token(valid, false))
-            .await
-            .is_ok());
 
         let mutations = [
             (
@@ -1276,6 +1290,34 @@ mod empty_iss_gate_tests {
             ),
             (
                 format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"JWT","kid":"{kid_a}"}}"#),
+                false,
+            ),
+            (
+                format!(r#"{{"alg":"ML-DSA-65-Ed25519","kid":"{kid_a}"}}"#),
+                false,
+            ),
+            (
+                format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":7,"kid":"{kid_a}"}}"#),
+                false,
+            ),
+            (
+                format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"AT+JWT","kid":"{kid_a}"}}"#),
+                false,
+            ),
+            (
+                format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"at+jwt ","kid":"{kid_a}"}}"#),
+                false,
+            ),
+            (
+                format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"Application/at+jwt","kid":"{kid_a}"}}"#),
+                false,
+            ),
+            (
+                format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"application/AT+JWT","kid":"{kid_a}"}}"#),
+                false,
+            ),
+            (
+                format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"application/at+jwt ","kid":"{kid_a}"}}"#),
                 false,
             ),
             (

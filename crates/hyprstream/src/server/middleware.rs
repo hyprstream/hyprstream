@@ -313,7 +313,7 @@ fn decode_local_multi_key(
 ) -> Result<jwt::Claims, &'static str> {
     let header =
         hyprstream_rpc::auth::parse_protected_header(token).map_err(|_| "JWT validation failed")?;
-    if header.typ != "at+jwt" {
+    if !hyprstream_rpc::auth::is_rfc9068_access_token_type(&header.typ) {
         return Err("JWT validation failed");
     }
     match header.alg.as_str() {
@@ -351,8 +351,11 @@ fn decode_composite_multi(
     expected_aud: Option<&str>,
     header: &hyprstream_rpc::auth::ProtectedHeader,
 ) -> Result<jwt::Claims, &'static str> {
-    let dispatch = hyprstream_rpc::auth::parse_composite_dispatch(token, &["at+jwt"])
-        .map_err(|_| "JWT validation failed")?;
+    let dispatch = hyprstream_rpc::auth::parse_composite_dispatch(
+        token,
+        hyprstream_rpc::auth::RFC9068_ACCESS_TOKEN_TYPES,
+    )
+    .map_err(|_| "JWT validation failed")?;
     if dispatch.kid() != header.kid { return Err("JWT validation failed"); }
     let pair = published_composite
         .iter()
@@ -646,7 +649,8 @@ mod tests {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod rotation_aware_tests {
     use super::*;
-    use ed25519_dalek::SigningKey;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use ed25519_dalek::{Signer as _, SigningKey};
 
     const AUD: &str = "https://node-a/resource";
 
@@ -661,13 +665,83 @@ mod rotation_aware_tests {
     /// Build a locally-issued at+JWT signed by `key`, with the given audience and
     /// optional explicit jti (`jwt::encode` auto-assigns a random jti otherwise).
     fn signed_token(key: &SigningKey, aud: &str, jti: Option<&str>) -> String {
+        signed_token_with_type(key, aud, jti, "at+jwt")
+    }
+
+    fn signed_token_with_type(
+        key: &SigningKey,
+        aud: &str,
+        jti: Option<&str>,
+        typ: &str,
+    ) -> String {
         let n = now();
         let mut claims =
             jwt::Claims::new("alice".to_owned(), n, n + 3600).with_audience(Some(aud.to_owned()));
         if let Some(j) = jti {
             claims.jti = Some(j.to_owned());
         }
-        jwt::encode(&claims, key)
+        let header = serde_json::json!({
+            "alg": "EdDSA",
+            "typ": typ,
+            "kid": ed25519_kid(&key.verifying_key()),
+        });
+        let input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap()),
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap()),
+        );
+        format!(
+            "{input}.{}",
+            URL_SAFE_NO_PAD.encode(key.sign(input.as_bytes()).to_bytes())
+        )
+    }
+
+    #[test]
+    fn ordinary_eddsa_verifier_accepts_exact_rfc9068_type_forms() {
+        let ca = new_key();
+        let rotation = new_key();
+        let published = [rotation.verifying_key()];
+
+        for typ in hyprstream_rpc::auth::RFC9068_ACCESS_TOKEN_TYPES {
+            let token = signed_token_with_type(&rotation, AUD, None, typ);
+            let claims = decode_local_multi_key(
+                &token,
+                &ca.verifying_key(),
+                &published,
+                &[],
+                Some(AUD),
+                true,
+            )
+            .unwrap();
+            assert_eq!(claims.sub, "alice");
+        }
+
+        for typ in [
+            "",
+            "AT+JWT",
+            "at+JWT",
+            " at+jwt",
+            "at+jwt ",
+            "Application/at+jwt",
+            "application/AT+JWT",
+            "application/at+jwt ",
+            "JWT",
+            "wit+jwt",
+        ] {
+            let token = signed_token_with_type(&rotation, AUD, None, typ);
+            assert!(
+                decode_local_multi_key(
+                    &token,
+                    &ca.verifying_key(),
+                    &published,
+                    &[],
+                    Some(AUD),
+                    true,
+                )
+                .is_err(),
+                "accepted non-RFC 9068 access-token type {typ:?}"
+            );
+        }
     }
 
     #[test]
@@ -885,20 +959,31 @@ mod composite_aware_tests {
         let ca = new_ed_key();
         let (pq, pq_vk) = new_ml_dsa();
         let active = new_ed_key();
-        let token = composite_token(&pq, &active, AUD);
         let published_ed = vec![active.verifying_key()];
         let pairs = [published_pair(pq_vk, active.verifying_key())];
+        let claims = jwt::Claims::new("alice".to_owned(), now(), now() + 3600)
+            .with_audience(Some(AUD.to_owned()));
 
-        let claims = decode_local_multi_key(
-            &token,
-            &ca.verifying_key(),
-            &published_ed,
-            &pairs,
-            Some(AUD),
-            false,
-        )
-        .unwrap();
-        assert_eq!(claims.sub, "alice");
+        for typ in hyprstream_rpc::auth::RFC9068_ACCESS_TOKEN_TYPES {
+            let token = composite_token_with_header(
+                &pq,
+                &active,
+                &claims,
+                "ML-DSA-65-Ed25519",
+                typ,
+                pairs[0].kid(),
+            );
+            let verified = decode_local_multi_key(
+                &token,
+                &ca.verifying_key(),
+                &published_ed,
+                &pairs,
+                Some(AUD),
+                false,
+            )
+            .unwrap();
+            assert_eq!(verified.sub, "alice");
+        }
     }
 
     #[test]
@@ -1001,6 +1086,11 @@ mod composite_aware_tests {
         for (alg, typ, kid) in [
             ("EdDSA", "at+jwt", pair.kid()),
             ("ML-DSA-65-Ed25519", "wit+jwt", pair.kid()),
+            ("ML-DSA-65-Ed25519", "AT+JWT", pair.kid()),
+            ("ML-DSA-65-Ed25519", "at+jwt ", pair.kid()),
+            ("ML-DSA-65-Ed25519", "Application/at+jwt", pair.kid()),
+            ("ML-DSA-65-Ed25519", "application/AT+JWT", pair.kid()),
+            ("ML-DSA-65-Ed25519", "application/at+jwt ", pair.kid()),
             ("ML-DSA-65-Ed25519", "at+jwt", wrong_kid),
         ] {
             let token = composite_token_with_header(&pq, &ed, &claims, alg, typ, kid);

@@ -17,6 +17,15 @@ use thiserror::Error;
 
 use super::Claims;
 
+/// The two exact access-token type forms resource servers must accept under
+/// RFC 9068 section 4. Matching is intentionally case- and whitespace-sensitive.
+pub const RFC9068_ACCESS_TOKEN_TYPES: &[&str] = &["at+jwt", "application/at+jwt"];
+
+/// Return whether `typ` is exactly one of the RFC 9068 access-token forms.
+pub fn is_rfc9068_access_token_type(typ: &str) -> bool {
+    RFC9068_ACCESS_TOKEN_TYPES.contains(&typ)
+}
+
 /// Duplicate-detecting, closed protected JOSE header used for security dispatch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProtectedHeader {
@@ -681,6 +690,28 @@ mod tests {
             decode_composite(&separately_valid, &pq, &ed, None, &dispatch),
             Err(JwtError::InvalidSignature)
         ));
+    }
+
+    #[test]
+    fn rfc9068_access_token_type_matching_is_exact() {
+        for allowed in RFC9068_ACCESS_TOKEN_TYPES {
+            assert!(is_rfc9068_access_token_type(allowed));
+        }
+        for rejected in [
+            "",
+            "AT+JWT",
+            "at+JWT",
+            " at+jwt",
+            "at+jwt ",
+            "Application/at+jwt",
+            "application/AT+JWT",
+            "application/at+jwt ",
+            "application/at+jwt; charset=utf-8",
+            "JWT",
+            "wit+jwt",
+        ] {
+            assert!(!is_rfc9068_access_token_type(rejected), "accepted {rejected:?}");
+        }
     }
 
     #[test]
