@@ -295,8 +295,8 @@ pub struct UnwrapOptions<'a> {
     /// Ed25519 key is converted to X25519 for DH decryption.
     pub decryption_key: Option<&'a crate::crypto::SigningKey>,
     /// Require the verified wire envelope to carry a non-empty encrypted
-    /// envelope. Enforced after signature/replay verification and before
-    /// decryption or any claims/application processing.
+    /// envelope. Enforced after signature verification and before decryption,
+    /// the final replay commit, or any claims/application processing.
     pub require_encrypted: bool,
     /// kid-anchored ML-DSA-65 trust store used to resolve the PQ verifying key
     /// for the envelope's EdDSA signer. Required under Hybrid policy.
@@ -1599,8 +1599,8 @@ impl SignedEnvelope {
 
     /// Outer placeholder serialized beside `encrypted_envelope`.
     ///
-    /// Replay checks intentionally run before decryption, so the outer envelope
-    /// keeps only non-secret replay metadata. Payload, JWT authorization,
+    /// The outer envelope keeps only non-secret replay metadata until
+    /// authenticated decryption succeeds. Payload, JWT authorization,
     /// delegation bearer, WTH, and streaming DH material live only inside the
     /// COSE_Encrypt0 plaintext and replace this placeholder after decrypt.
     fn redacted_encrypted_envelope(&self) -> RequestEnvelope {
@@ -1618,14 +1618,14 @@ impl SignedEnvelope {
         }
     }
 
-    /// Verify the signature and check replay protection.
+    /// Verify the signature, then atomically commit replay protection.
     ///
     /// # Verification Steps
     ///
-    /// 1. Verify signer pubkey matches expected key
-    /// 2. Check timestamp is within acceptable window
-    /// 3. Check nonce hasn't been seen before
-    /// 4. Verify Ed25519 signature
+    /// 1. Check timestamp is within the acceptable window without mutation
+    /// 2. Verify signer pubkey matches expected key
+    /// 3. Verify Ed25519 signature
+    /// 4. Atomically check and record the nonce
     ///
     /// # Errors
     ///
@@ -1664,6 +1664,7 @@ impl SignedEnvelope {
         pq_store: Option<&dyn PqTrustStore>,
         verify_policy: crate::crypto::CryptoPolicy,
     ) -> EnvelopeResult<()> {
+        self.validate_timestamp()?;
         // 1. Verify signer matches expected (constant-time comparison)
         if !bool::from(self.cnf.ct_eq(&expected_pubkey.to_bytes())) {
             return Err(EnvelopeError::SignerMismatch {
@@ -1672,8 +1673,8 @@ impl SignedEnvelope {
             });
         }
 
-        self.check_replay(nonce_cache)?;
-        self.verify_cose(expected_pubkey, pq_store, verify_policy)
+        self.verify_cose(expected_pubkey, pq_store, verify_policy)?;
+        self.check_replay(nonce_cache)
     }
 
     /// Verify signature only (skip replay protection).
@@ -1724,13 +1725,14 @@ impl SignedEnvelope {
         pq_store: Option<&dyn PqTrustStore>,
         verify_policy: crate::crypto::CryptoPolicy,
     ) -> EnvelopeResult<()> {
+        self.validate_timestamp()?;
         let verifying_key =
             VerifyingKey::from_bytes(&self.cnf).map_err(|_| EnvelopeError::InvalidPublicKey {
                 expected: 32,
                 actual: 0,
             })?;
-        self.check_replay(nonce_cache)?;
-        self.verify_cose(&verifying_key, pq_store, verify_policy)
+        self.verify_cose(&verifying_key, pq_store, verify_policy)?;
+        self.check_replay(nonce_cache)
     }
 
     /// Fu2/#677: like [`Self::verify_with`] but with an explicit
@@ -1747,20 +1749,21 @@ impl SignedEnvelope {
         unanchored: UnanchoredHybridPolicy,
         allowlist: &[String],
     ) -> EnvelopeResult<()> {
+        self.validate_timestamp()?;
         if !bool::from(self.cnf.ct_eq(&expected_pubkey.to_bytes())) {
             return Err(EnvelopeError::SignerMismatch {
                 expected: hex::encode(expected_pubkey.to_bytes()),
                 actual: hex::encode(self.cnf),
             });
         }
-        self.check_replay(nonce_cache)?;
         self.verify_cose_unanchored(
             expected_pubkey,
             pq_store,
             verify_policy,
             unanchored,
             allowlist,
-        )
+        )?;
+        self.check_replay(nonce_cache)
     }
 
     /// Fu2/#677: any-signer variant of [`Self::verify_with_unanchored_policy`].
@@ -1772,12 +1775,57 @@ impl SignedEnvelope {
         unanchored: UnanchoredHybridPolicy,
         allowlist: &[String],
     ) -> EnvelopeResult<()> {
+        self.validate_timestamp()?;
         let verifying_key =
             VerifyingKey::from_bytes(&self.cnf).map_err(|_| EnvelopeError::InvalidPublicKey {
                 expected: 32,
                 actual: 0,
             })?;
-        self.check_replay(nonce_cache)?;
+        self.verify_cose_unanchored(
+            &verifying_key,
+            pq_store,
+            verify_policy,
+            unanchored,
+            allowlist,
+        )?;
+        self.check_replay(nonce_cache)
+    }
+
+    fn verify_signature_with_unanchored_policy(
+        &self,
+        expected_pubkey: &VerifyingKey,
+        pq_store: Option<&dyn PqTrustStore>,
+        verify_policy: crate::crypto::CryptoPolicy,
+        unanchored: UnanchoredHybridPolicy,
+        allowlist: &[String],
+    ) -> EnvelopeResult<()> {
+        if !bool::from(self.cnf.ct_eq(&expected_pubkey.to_bytes())) {
+            return Err(EnvelopeError::SignerMismatch {
+                expected: hex::encode(expected_pubkey.to_bytes()),
+                actual: hex::encode(self.cnf),
+            });
+        }
+        self.verify_cose_unanchored(
+            expected_pubkey,
+            pq_store,
+            verify_policy,
+            unanchored,
+            allowlist,
+        )
+    }
+
+    fn verify_any_signature_with_unanchored_policy(
+        &self,
+        pq_store: Option<&dyn PqTrustStore>,
+        verify_policy: crate::crypto::CryptoPolicy,
+        unanchored: UnanchoredHybridPolicy,
+        allowlist: &[String],
+    ) -> EnvelopeResult<()> {
+        let verifying_key =
+            VerifyingKey::from_bytes(&self.cnf).map_err(|_| EnvelopeError::InvalidPublicKey {
+                expected: 32,
+                actual: 0,
+            })?;
         self.verify_cose_unanchored(
             &verifying_key,
             pq_store,
@@ -1787,21 +1835,43 @@ impl SignedEnvelope {
         )
     }
 
-    /// Timestamp window + nonce replay check.
-    fn check_replay(&self, nonce_cache: &dyn NonceCache) -> EnvelopeResult<()> {
-        let now = current_timestamp();
-        let age = now - self.envelope.iat;
-        if age > MAX_TIMESTAMP_AGE_MS {
+    /// Non-mutating timestamp-window validation for early rejection before
+    /// signature verification, KEM decapsulation, or decryption.
+    fn validate_timestamp(&self) -> EnvelopeResult<()> {
+        Self::validate_timestamp_at(self.envelope.iat, current_timestamp())
+    }
+
+    /// Validate `iat` against an explicit clock reading.
+    ///
+    /// Widen both wire-controlled timestamps before subtracting so every `i64`
+    /// input, including the two extremes, has defined fail-closed behavior.
+    /// Both limits are inclusive: an age exactly equal to the past window or a
+    /// future distance exactly equal to the clock-skew allowance is accepted.
+    fn validate_timestamp_at(iat: i64, now: i64) -> EnvelopeResult<()> {
+        let age = i128::from(now) - i128::from(iat);
+        let max_age = i128::from(MAX_TIMESTAMP_AGE_MS);
+        if age > max_age {
             return Err(EnvelopeError::ReplayAttack(format!(
                 "timestamp too old: {age}ms > {MAX_TIMESTAMP_AGE_MS}ms"
             )));
         }
-        if age < -MAX_CLOCK_SKEW_MS {
+
+        let future_distance = i128::from(iat) - i128::from(now);
+        let max_future = i128::from(MAX_CLOCK_SKEW_MS);
+        if future_distance > max_future {
+            let excess = future_distance - max_future;
             return Err(EnvelopeError::ReplayAttack(format!(
-                "timestamp in future: {}ms beyond clock skew tolerance",
-                -age - MAX_CLOCK_SKEW_MS
+                "timestamp in future: {excess}ms beyond clock skew tolerance"
             )));
         }
+        Ok(())
+    }
+
+    /// Revalidate the timestamp, then atomically check and record the nonce.
+    fn check_replay(&self, nonce_cache: &dyn NonceCache) -> EnvelopeResult<()> {
+        // Recheck at commit time so work performed near a timestamp-window
+        // boundary cannot admit an entry after it expires.
+        self.validate_timestamp()?;
         if !nonce_cache.check_and_insert(&self.envelope.nonce) {
             return Err(EnvelopeError::ReplayAttack("nonce already seen".to_owned()));
         }
@@ -1947,10 +2017,10 @@ impl SignedEnvelope {
             .encrypted_envelope
             .as_ref()
             .ok_or_else(|| EnvelopeError::Decryption("no encrypted envelope present".into()))?;
-        // Recompute the AAD from the OUTER replay metadata that the server
-        // already replay-checked. This binds those unsigned outer fields into
-        // the AEAD: a network attacker that mutated the outer nonce/iat to evade
-        // the pre-decrypt replay check changes this AAD and the open fails.
+        // Recompute the AAD from the OUTER replay metadata that the server will
+        // commit only after this method succeeds. This binds those unsigned
+        // fields into the AEAD: a network attacker that mutates the outer
+        // nonce/iat changes this AAD and the open fails before replay commit.
         let aad = encrypted_envelope_external_aad(
             self.envelope.request_id,
             self.envelope.iat,
@@ -1974,10 +2044,10 @@ impl SignedEnvelope {
 
         // Defense in depth: the replay metadata the server verified (outer) MUST
         // equal the authenticated inner metadata, so the request that gets
-        // authorized is the same one whose nonce/timestamp were replay-checked.
+        // authorized is the same one whose nonce/timestamp will be replay-checked.
         // The AAD binding above guarantees outer == what-was-sealed on success;
         // this additionally rejects a sender that sealed inner fields diverging
-        // from the outer envelope it presented for the replay check.
+        // from the outer envelope it presented for replay admission.
         if inner.request_id != self.envelope.request_id
             || inner.iat != self.envelope.iat
             || inner.nonce != self.envelope.nonce
@@ -2738,14 +2808,20 @@ pub fn unwrap_and_verify(
     let signed_reader = reader.get_root::<crate::common_capnp::signed_envelope::Reader>()?;
     let mut signed = SignedEnvelope::read_from(signed_reader)?;
 
+    // Reject stale or future requests before signature or KEM work without
+    // mutating replay state. The timestamp is revalidated at final commit.
+    signed.validate_timestamp()?;
+
+    // Authenticate first without mutating replay state.  The compatibility
+    // lifecycle commits the nonce only after canonical COSE parsing, external-
+    // AAD authentication, decryption, and inner/outer equality all succeed.
     match &opts.verification {
         EnvelopeVerification::FixedSigner(pubkey) => {
             // Fu2/#677: production wire verify uses the unanchored-aware path —
             // deny-on-missing-anchor by default, with an opt-in classical-floor
             // allowlist for legacy peers.
-            signed.verify_with_unanchored_policy(
+            signed.verify_signature_with_unanchored_policy(
                 pubkey,
-                opts.nonce_cache,
                 opts.pq_store,
                 opts.verify_policy,
                 opts.unanchored_policy,
@@ -2753,8 +2829,7 @@ pub fn unwrap_and_verify(
             )?;
         }
         EnvelopeVerification::AnySigner => {
-            signed.verify_any_signer_with_unanchored_policy(
-                opts.nonce_cache,
+            signed.verify_any_signature_with_unanchored_policy(
                 opts.pq_store,
                 opts.verify_policy,
                 opts.unanchored_policy,
@@ -2765,7 +2840,7 @@ pub fn unwrap_and_verify(
 
     // INV-2 receive-side policy (#1042): the carrier requirement is supplied
     // by the accept boundary, never by request bytes. Check it only after the
-    // signature and replay admission above, so unauthenticated input cannot
+    // signature above, so unauthenticated input cannot
     // select or exercise a signed policy-error path. A non-empty marker alone
     // is not sufficient: encrypted envelopes continue through canonical KEM
     // open below before any claims or handler sees their payload.
@@ -2789,6 +2864,12 @@ pub fn unwrap_and_verify(
             ));
         }
     }
+
+    // This is the single atomic replay commit for the public compatibility
+    // lifecycle. Invalid signatures, non-canonical ciphertext, wrong AAD,
+    // failed decryption, and inner/outer mismatch cannot consume or evict cache
+    // capacity; concurrent identical valid inputs race here and only one wins.
+    signed.check_replay(opts.nonce_cache)?;
 
     let payload = signed.payload().to_vec();
     Ok((signed, payload))
@@ -2953,6 +3034,17 @@ mod tests {
             *b = !*b;
         }
         out
+    }
+
+    fn signed_envelope_to_wire(envelope: &SignedEnvelope) -> Vec<u8> {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut builder = message.init_root::<common_capnp::signed_envelope::Builder>();
+            envelope.write_to(&mut builder);
+        }
+        let mut wire = Vec::new();
+        capnp::serialize::write_message(&mut wire, &message).expect("serialize signed envelope");
+        wire
     }
 
     /// In-memory kid-anchored PQ trust store for tests.
@@ -3432,7 +3524,7 @@ mod tests {
         // request_id) is unsigned on the wire — the composite signature covers
         // only the ciphertext. It MUST be bound into the COSE_Encrypt0 AEAD so a
         // network attacker cannot mutate the outer nonce/iat to evade the
-        // server's pre-decrypt replay check while the signature still verifies.
+        // server's replay admission while the signature still verifies.
         use crate::node_identity::{derive_mesh_kem_recipient, derive_mesh_mldsa_key};
 
         let (node_sk, node_vk) = generate_signing_keypair();
@@ -3481,6 +3573,215 @@ mod tests {
         good.decrypt_in_place_mesh_kem(&kem_kp)
             .expect("untampered envelope opens");
         assert_eq!(good.envelope.request_id, 42);
+    }
+
+    #[test]
+    fn compatibility_replay_commits_only_after_full_authentication_and_atomically() {
+        use crate::node_identity::{derive_mesh_kem_recipient, derive_mesh_mldsa_key};
+
+        let (node_sk, node_vk) = generate_signing_keypair();
+        let pq_sk = derive_mesh_mldsa_key(&node_sk);
+        let kem_pub = derive_mesh_kem_recipient(&node_sk)
+            .expect("derive #mesh-kem")
+            .public();
+        let original_nonce = fresh_test_nonce();
+        let original = SignedEnvelope::new_signed_encrypted_mesh_kem(
+            RequestEnvelope {
+                request_id: 553,
+                payload: b"authenticated payload".to_vec(),
+                nonce: original_nonce,
+                iat: current_timestamp(),
+                authorization: Authorization::None,
+                delegation_token: None,
+                wth: None,
+                client_dh_public: None,
+                response_kem_recipient: None,
+                service_domain: None,
+            },
+            &node_sk,
+            &pq_sk,
+            &kem_pub,
+        )
+        .expect("seal original");
+        let original_wire = signed_envelope_to_wire(&original);
+
+        // Fill a capacity-one cache with one fully authenticated request.
+        let cache = InMemoryNonceCache::with_config(MAX_TIMESTAMP_AGE_MS, 1);
+        let options = || {
+            UnwrapOptions::fixed_signer(&node_vk, &cache)
+                .with_decryption_key(&node_sk)
+                .require_encrypted(true)
+                .with_verify_policy(crate::crypto::CryptoPolicy::Classical)
+        };
+        unwrap_and_verify(&original_wire, &options()).expect("original request is accepted");
+
+        // Wire-controlled integer extremes fail in the early non-mutating
+        // timestamp precheck and cannot evict the accepted entry from this
+        // capacity-one cache. The ciphertext signature is intentionally left
+        // valid; changing only outer metadata would otherwise proceed to AEAD.
+        for extreme_iat in [i64::MIN, i64::MAX] {
+            let mut extreme = original.clone();
+            extreme.envelope.nonce = distinct_test_nonce(&original_nonce);
+            extreme.envelope.iat = extreme_iat;
+            extreme
+                .verify_signature_only(&node_vk)
+                .expect("ciphertext signature remains valid");
+            let error = unwrap_and_verify(&signed_envelope_to_wire(&extreme), &options())
+                .expect_err("extreme timestamp is rejected without a panic");
+            assert!(error.to_string().contains(if extreme_iat == i64::MIN {
+                "timestamp too old"
+            } else {
+                "timestamp in future"
+            }));
+            assert!(
+                unwrap_and_verify(&original_wire, &options()).is_err(),
+                "rejected extreme timestamp must not evict accepted replay state"
+            );
+        }
+
+        // Authenticated but expired outer metadata is rejected before KEM work
+        // and cannot disturb the full capacity-one cache.
+        let mut stale = original.clone();
+        stale.envelope.nonce = distinct_test_nonce(&original_nonce);
+        stale.envelope.iat = current_timestamp() - MAX_TIMESTAMP_AGE_MS - 1;
+        stale
+            .verify_signature_only(&node_vk)
+            .expect("ciphertext signature remains valid");
+        let stale_error = unwrap_and_verify(&signed_envelope_to_wire(&stale), &options())
+            .expect_err("expired request is rejected");
+        assert!(stale_error.to_string().contains("timestamp too old"));
+        assert!(unwrap_and_verify(&original_wire, &options()).is_err());
+
+        // A distinct outer nonce plus an invalid signature must not consume or
+        // evict cache capacity.
+        let mut invalid_signature = original.clone();
+        invalid_signature.envelope.nonce = distinct_test_nonce(&original_nonce);
+        let last = invalid_signature.cose.len() - 1;
+        invalid_signature.cose[last] ^= 1;
+        assert!(
+            unwrap_and_verify(&signed_envelope_to_wire(&invalid_signature), &options()).is_err()
+        );
+        assert!(unwrap_and_verify(&original_wire, &options()).is_err());
+
+        // The signature covers the unchanged ciphertext and remains valid, but
+        // the distinct outer nonce changes authenticated external AAD. Failed
+        // AEAD authentication likewise must not touch replay state.
+        let mut invalid_aad = original.clone();
+        invalid_aad.envelope.nonce = distinct_test_nonce(&original_nonce);
+        invalid_aad
+            .verify_signature_only(&node_vk)
+            .expect("ciphertext signature remains valid");
+        assert!(unwrap_and_verify(&signed_envelope_to_wire(&invalid_aad), &options()).is_err());
+
+        // Both invalid attempts independently left the original accepted nonce
+        // resident in the capacity-one cache.
+        assert!(unwrap_and_verify(&original_wire, &options()).is_err());
+
+        // Two concurrent, identical, fully valid inputs perform all validation
+        // before racing at one atomic check-and-insert; exactly one can commit.
+        let concurrent_cache = InMemoryNonceCache::with_config(MAX_TIMESTAMP_AGE_MS, 1);
+        let accepted = std::thread::scope(|scope| {
+            let attempts: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let opts = UnwrapOptions::fixed_signer(&node_vk, &concurrent_cache)
+                            .with_decryption_key(&node_sk)
+                            .require_encrypted(true)
+                            .with_verify_policy(crate::crypto::CryptoPolicy::Classical);
+                        unwrap_and_verify(&original_wire, &opts).is_ok()
+                    })
+                })
+                .collect();
+            attempts
+                .into_iter()
+                .map(|attempt| attempt.join().expect("verification thread"))
+                .filter(|accepted| *accepted)
+                .count()
+        });
+        assert_eq!(accepted, 1);
+    }
+
+    #[test]
+    fn timestamp_window_boundaries_and_extremes_are_overflow_safe() {
+        let now = 0;
+
+        // Both documented limits are inclusive.
+        assert!(SignedEnvelope::validate_timestamp_at(-MAX_TIMESTAMP_AGE_MS, now).is_ok());
+        assert!(SignedEnvelope::validate_timestamp_at(MAX_CLOCK_SKEW_MS, now).is_ok());
+
+        // Values one millisecond inside either inclusive limit also remain valid.
+        assert!(SignedEnvelope::validate_timestamp_at(-MAX_TIMESTAMP_AGE_MS + 1, now).is_ok());
+        assert!(SignedEnvelope::validate_timestamp_at(MAX_CLOCK_SKEW_MS - 1, now).is_ok());
+
+        // The immediately adjacent values outside either window fail closed.
+        assert!(SignedEnvelope::validate_timestamp_at(-MAX_TIMESTAMP_AGE_MS - 1, now).is_err());
+        assert!(SignedEnvelope::validate_timestamp_at(MAX_CLOCK_SKEW_MS + 1, now).is_err());
+
+        // Widening before subtraction defines both ends of the wire domain,
+        // even when the clock is itself at the opposite i64 boundary.
+        assert!(SignedEnvelope::validate_timestamp_at(i64::MIN, now).is_err());
+        assert!(SignedEnvelope::validate_timestamp_at(i64::MAX, now).is_err());
+        assert!(SignedEnvelope::validate_timestamp_at(i64::MIN, i64::MAX).is_err());
+        assert!(SignedEnvelope::validate_timestamp_at(i64::MAX, i64::MIN).is_err());
+    }
+
+    #[test]
+    fn ordinary_unwrap_rejects_extreme_timestamps_for_all_compatibility_paths() {
+        use crate::node_identity::{derive_mesh_kem_recipient, derive_mesh_mldsa_key};
+
+        let (node_sk, node_vk) = generate_signing_keypair();
+        let pq_sk = derive_mesh_mldsa_key(&node_sk);
+        let kem_pub = derive_mesh_kem_recipient(&node_sk)
+            .expect("derive #mesh-kem")
+            .public();
+
+        let clear = SignedEnvelope::new_signed(
+            RequestEnvelope::anonymous(b"clear timestamp boundary".to_vec()),
+            &node_sk,
+        );
+        let encrypted = SignedEnvelope::new_signed_encrypted_mesh_kem(
+            RequestEnvelope::anonymous(b"encrypted timestamp boundary".to_vec()),
+            &node_sk,
+            &pq_sk,
+            &kem_pub,
+        )
+        .expect("seal encrypted boundary fixture");
+
+        for extreme_iat in [i64::MIN, i64::MAX] {
+            for fixture in [&clear, &encrypted] {
+                let mut extreme = fixture.clone();
+                extreme.envelope.iat = extreme_iat;
+                let wire = signed_envelope_to_wire(&extreme);
+
+                for any_signer in [false, true] {
+                    let cache = TestNonceCache::new();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let opts = if any_signer {
+                            UnwrapOptions::any_signer(&cache)
+                        } else {
+                            UnwrapOptions::fixed_signer(&node_vk, &cache)
+                        }
+                        .with_verify_policy(crate::crypto::CryptoPolicy::Classical);
+                        unwrap_and_verify(&wire, &opts)
+                    }));
+                    let error = result
+                        .expect("wire-controlled timestamp must never panic")
+                        .expect_err("extreme timestamp must fail closed");
+                    assert!(
+                        error.to_string().contains(if extreme_iat == i64::MIN {
+                            "timestamp too old"
+                        } else {
+                            "timestamp in future"
+                        }),
+                        "timestamp rejection must precede signature or KEM work: {error}"
+                    );
+                    assert!(
+                        cache.seen.lock().is_empty(),
+                        "rejected timestamp must not commit replay state"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

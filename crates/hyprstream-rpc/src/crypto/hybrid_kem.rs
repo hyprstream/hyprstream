@@ -402,6 +402,30 @@ fn combine(
     )
 }
 
+/// Focused #553 test seam proving that both the classical and ML-KEM shared
+/// secrets affect the content-key input.  Keeping this beside the private
+/// combiner makes an "ignore the PQ share" mutation visible to the focused
+/// COSE test command as well as this module's broader tests.
+#[cfg(test)]
+pub(crate) fn combiner_is_sensitive_to_every_component_for_cose() -> bool {
+    let suite = SuiteId::HyKemX25519MlKem768;
+    let ciphertexts = vec![vec![9u8; 32], vec![8u8; 1088]];
+    let recipient_eks: Vec<&[u8]> = vec![&[7u8; 32], &[6u8; 1184]];
+    let secret = |first, second| {
+        combine(
+            suite,
+            &[
+                Zeroizing::new(vec![first; 32]),
+                Zeroizing::new(vec![second; 32]),
+            ],
+            &ciphertexts,
+            &recipient_eks,
+        )
+    };
+    let base = secret(1, 2);
+    *base != *secret(0xff, 2) && *base != *secret(1, 0xff)
+}
+
 // ============================================================================
 // Suite-identified wire material + recipient keys
 // ============================================================================
@@ -543,6 +567,32 @@ impl RecipientKeypair {
 }
 
 impl RecipientPublic {
+    /// Validate component count, order-by-position, and public-key lengths
+    /// before callers encode or perform KEM work on manually constructed public
+    /// material.
+    pub(crate) fn validate(&self) -> Result<()> {
+        let components = self.suite_id.components();
+        if self.eks.len() != components.len() {
+            bail!(
+                "recipient has {} encap keys, suite {} needs {}",
+                self.eks.len(),
+                self.suite_id.as_str(),
+                components.len()
+            );
+        }
+        for (index, (&kem, key)) in components.iter().zip(&self.eks).enumerate() {
+            let expected = kem.component().ek_len();
+            if key.len() != expected {
+                bail!(
+                    "recipient component {index} {:?} encap key length {} != expected {expected}",
+                    kem,
+                    key.len()
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Canonical length-prefixed encoding of the recipient's per-component
     /// encapsulation keys, mirroring [`HybridKemMaterial::encode`]:
     /// `be16(suite_id) ‖ be16(n) ‖ Σ_i (be16(kem_id) ‖ be32(len) ‖ ek_bytes)`.
@@ -680,16 +730,9 @@ pub fn recipient_from_seeds(suite: SuiteId, seeds: &[&[u8]]) -> Result<Recipient
 pub fn encapsulate_to(
     recipient: &RecipientPublic,
 ) -> Result<(HybridKemMaterial, Zeroizing<[u8; 32]>)> {
+    recipient.validate()?;
     let suite = recipient.suite_id;
     let comps = suite.components();
-    if recipient.eks.len() != comps.len() {
-        bail!(
-            "recipient has {} encap keys, suite {} needs {}",
-            recipient.eks.len(),
-            suite.as_str(),
-            comps.len()
-        );
-    }
 
     let mut shares = Vec::with_capacity(comps.len());
     let mut sss = Vec::with_capacity(comps.len());
@@ -698,14 +741,6 @@ pub fn encapsulate_to(
 
     for (i, &kem) in comps.iter().enumerate() {
         let ek = &recipient.eks[i];
-        if ek.len() != kem.component().ek_len() {
-            bail!(
-                "recipient component {:?} encap key length {} != expected {}",
-                kem,
-                ek.len(),
-                kem.component().ek_len()
-            );
-        }
         let (ct, ss) = kem.component().encapsulate(ek)?;
         cts.push(ct.clone());
         shares.push(KemShare {
