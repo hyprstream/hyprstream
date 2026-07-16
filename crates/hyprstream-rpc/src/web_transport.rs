@@ -215,6 +215,10 @@ impl Transport for WtConnection {
         self.request(&payload).await
     }
 
+    fn forbids_cleartext_envelope(&self) -> bool {
+        true
+    }
+
     async fn subscribe(&self, topic: &[u8]) -> Result<WtSubscriber> {
         self.open_subscriber(topic).await
     }

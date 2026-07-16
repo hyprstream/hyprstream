@@ -422,12 +422,107 @@ impl TransportConfig {
             _ => None,
         }
     }
+}
 
+impl EndpointType {
+    /// Whether this endpoint class forbids cleartext request envelopes.
+    ///
+    /// iroh and cross-host QUIC/WebTransport are untrusted carriers for RPC
+    /// envelope confidentiality. Loopback QUIC is treated as local test/dev
+    /// plumbing; same-process and same-host UDS remain cleartext-allowed.
+    pub fn forbids_cleartext_envelope(&self) -> bool {
+        match self {
+            // QUIC and iroh are untrusted carriers for RPC envelope
+            // confidentiality — cleartext forbidden unconditionally. A loopback
+            // QUIC address is NOT evidence the bytes stay inside the trust
+            // boundary (it can terminate at a proxy/tunnel), so it gets no
+            // exemption; genuinely-local trusted RPC uses inproc or UDS. Any
+            // hermetic test that needs cleartext must use an explicit trusted
+            // transport (inproc/UDS), never a loopback-QUIC address heuristic.
+            EndpointType::Iroh { .. } | EndpointType::Quic { .. } => true,
+            EndpointType::Inproc { .. }
+            | EndpointType::Ipc { .. }
+            | EndpointType::SystemdFd { .. } => false,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// INV-2 (ADR #1023) carrier classification matrix: which `EndpointType`s
+    /// forbid a cleartext request envelope. Untrusted network carriers (iroh,
+    /// QUIC incl. loopback, relay-carried) MUST forbid; genuinely-local trusted
+    /// carriers (inproc, UDS, systemd-activated UDS) permit. Loopback QUIC gets
+    /// NO exemption — a loopback address is not evidence the bytes stay inside
+    /// the trust boundary (it can terminate at a proxy/tunnel).
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn inv2_carrier_classification_matrix() {
+        // Untrusted network carriers → forbid cleartext.
+        assert!(
+            EndpointType::Iroh {
+                node_id: [0u8; 32],
+                direct_addrs: vec![],
+                relay_url: None,
+            }
+            .forbids_cleartext_envelope(),
+            "iroh is an untrusted carrier"
+        );
+        assert!(
+            EndpointType::Iroh {
+                node_id: [0u8; 32],
+                direct_addrs: vec![],
+                relay_url: Some("https://relay.example".into()),
+            }
+            .forbids_cleartext_envelope(),
+            "relay-carried iroh is an untrusted carrier"
+        );
+        // Non-loopback QUIC → forbid.
+        assert!(
+            EndpointType::Quic {
+                addr: "10.0.0.1:4433".parse().unwrap(),
+                server_name: "x".into(),
+                auth: QuicServerAuth::web_pki(),
+            }
+            .forbids_cleartext_envelope(),
+            "cross-host QUIC is an untrusted carrier"
+        );
+        // Loopback QUIC → STILL forbid (no address-heuristic exemption).
+        assert!(
+            EndpointType::Quic {
+                addr: "127.0.0.1:4433".parse().unwrap(),
+                server_name: "x".into(),
+                auth: QuicServerAuth::web_pki(),
+            }
+            .forbids_cleartext_envelope(),
+            "loopback QUIC must NOT be exempt — it can terminate at a proxy/tunnel"
+        );
+        // Trusted same-host carriers → permit cleartext (ban must not widen).
+        assert!(
+            !EndpointType::Inproc {
+                endpoint: "hyprstream/x".into()
+            }
+            .forbids_cleartext_envelope(),
+            "inproc is trusted"
+        );
+        assert!(
+            !EndpointType::Ipc {
+                path: "/tmp/x.sock".into()
+            }
+            .forbids_cleartext_envelope(),
+            "UDS/ipc is trusted"
+        );
+        assert!(
+            !EndpointType::SystemdFd {
+                fd: 5,
+                client_path: "/run/hyprstream/x.sock".into(),
+            }
+            .forbids_cleartext_envelope(),
+            "systemd-activated UDS is trusted"
+        );
+    }
 
     #[test]
     fn test_inproc_endpoint() {

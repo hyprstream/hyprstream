@@ -21,17 +21,20 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use tokio::sync::Mutex;
 
-use hyprstream_rpc::envelope::InMemoryNonceCache;
+use hyprstream_rpc::capnp::FromCapnp;
+use hyprstream_rpc::crypto::hybrid_kem::KeyedKemTrustStore;
+use hyprstream_rpc::envelope::{InMemoryNonceCache, KeyedPqTrustStore, SignedEnvelope};
+use hyprstream_rpc::node_identity::{derive_mesh_kem_recipient, derive_mesh_mldsa_key};
 use hyprstream_rpc::rpc_client::RpcClientImpl;
 use hyprstream_rpc::service::{Continuation, EnvelopeContext, RequestService};
 use hyprstream_rpc::signer::LocalSigner;
 use hyprstream_rpc::transport::iroh_rpc::{IrohRpcProtocolHandler, LocalServiceBridge};
-use hyprstream_rpc::transport::iroh_substrate::{
-    ALPN_HYPRSTREAM_RPC, IrohSubstrate, NoopHandler,
-};
+use hyprstream_rpc::transport::iroh_substrate::{IrohSubstrate, NoopHandler, ALPN_HYPRSTREAM_RPC};
 use hyprstream_rpc::transport::iroh_transport::IrohTransport;
 use hyprstream_rpc::transport::TransportConfig;
+use hyprstream_rpc::transport_traits::Transport;
 use iroh::{EndpointAddr, TransportAddr};
 use rand::RngCore;
 
@@ -102,21 +105,54 @@ fn direct_addr(substrate: &IrohSubstrate) -> EndpointAddr {
     )
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn signed_envelope_round_trip_over_iroh() -> Result<()> {
-    // This canary exercises the classical (EdDSA-only) wire+envelope path. As
-    // an integration test it compiles hyprstream-rpc in non-test mode, where
-    // the uninstalled global verify policy now fail-closes to Hybrid (#160).
-    // Opt in to the Classical policy this test actually validates. `set` is
-    // idempotent-by-first-write; ignore the error if another test in this
-    // binary already installed a (matching) config.
-    let _ = hyprstream_rpc::envelope::install_verify_config(
-        hyprstream_rpc::envelope::EnvelopeVerifyConfig {
-            policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
-            pq_store: None,
-        },
-    );
+struct RecordingTransport<T> {
+    inner: T,
+    last_sent: Arc<Mutex<Option<Vec<u8>>>>,
+}
 
+impl<T> RecordingTransport<T> {
+    fn new(inner: T) -> (Self, Arc<Mutex<Option<Vec<u8>>>>) {
+        let last_sent = Arc::new(Mutex::new(None));
+        (
+            Self {
+                inner,
+                last_sent: Arc::clone(&last_sent),
+            },
+            last_sent,
+        )
+    }
+}
+
+#[async_trait]
+impl<T> Transport for RecordingTransport<T>
+where
+    T: Transport + Send + Sync,
+    T::Sub: Send,
+    T::Pub: Send,
+{
+    type Sub = T::Sub;
+    type Pub = T::Pub;
+
+    async fn send(&self, payload: Vec<u8>, timeout_ms: Option<i32>) -> Result<Vec<u8>> {
+        *self.last_sent.lock().await = Some(payload.clone());
+        self.inner.send(payload, timeout_ms).await
+    }
+
+    fn forbids_cleartext_envelope(&self) -> bool {
+        self.inner.forbids_cleartext_envelope()
+    }
+
+    async fn subscribe(&self, topic: &[u8]) -> Result<Self::Sub> {
+        self.inner.subscribe(topic).await
+    }
+
+    async fn publish(&self, topic: &[u8]) -> Result<Self::Pub> {
+        self.inner.publish(topic).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hykem_encrypted_envelope_round_trip_over_iroh() -> Result<()> {
     // ─── Server side ──────────────────────────────────────────────────────
     let server_signing = fresh_signing_key();
     let server_verifying: VerifyingKey = server_signing.verifying_key();
@@ -138,6 +174,7 @@ async fn signed_envelope_round_trip_over_iroh() -> Result<()> {
 
     // ─── Client side ──────────────────────────────────────────────────────
     let client_signing = fresh_signing_key();
+    let client_verifying = client_signing.verifying_key();
     let client = IrohSubstrate::new(
         fresh_node_key(),
         NoopHandler::new("client-moq"),
@@ -146,16 +183,74 @@ async fn signed_envelope_round_trip_over_iroh() -> Result<()> {
     .await?;
 
     let conn = client.connect(server_addr, ALPN_HYPRSTREAM_RPC).await?;
-    let transport = IrohTransport::new(conn);
+    let (transport, last_sent) = RecordingTransport::new(IrohTransport::new(conn));
+
+    // Request verification: server anchors the client's mesh ML-DSA key.
+    let client_pq_sk = derive_mesh_mldsa_key(&client_signing);
+    let client_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
+        &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&client_pq_sk),
+    )?;
+    let mut request_pq_store = KeyedPqTrustStore::new();
+    request_pq_store.bind(client_verifying.to_bytes(), &client_pq_vk);
+    let _ = hyprstream_rpc::envelope::install_verify_config(
+        hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+            policy: hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+            pq_store: Some(Arc::new(request_pq_store)),
+        },
+    );
+
+    // Request encryption: client anchors the server's #mesh-kem keyAgreement key.
+    let mut request_kem_store = KeyedKemTrustStore::new();
+    request_kem_store.bind(
+        server_verifying.to_bytes(),
+        derive_mesh_kem_recipient(&server_signing)?.public(),
+    );
+
+    // Response verification: client anchors the server's mesh ML-DSA key.
+    let server_pq_sk = derive_mesh_mldsa_key(&server_signing);
+    let server_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
+        &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&server_pq_sk),
+    )?;
+    let mut response_pq_store = KeyedPqTrustStore::new();
+    response_pq_store.bind(server_verifying.to_bytes(), &server_pq_vk);
+
     let rpc = RpcClientImpl::new(
         LocalSigner::new(client_signing.clone()),
         transport,
         Some(server_verifying),
-    );
+    )
+    .with_request_kem_store(Arc::new(request_kem_store))
+    .with_response_pq_store(Arc::new(response_pq_store));
 
-    // Real signed envelope round-trip.
+    // Real encrypted + hybrid-signed envelope round-trip over iroh.
     let response = rpc.call(b"ping-payload".to_vec()).await?;
     assert_eq!(&response[..], b"\xECping-payload");
+    let sent = last_sent
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("request bytes not recorded"))?;
+    let reader = capnp::serialize::read_message(
+        &mut std::io::Cursor::new(&sent),
+        capnp::message::ReaderOptions::new(),
+    )?;
+    let signed = SignedEnvelope::read_from(
+        reader.get_root::<hyprstream_rpc::common_capnp::signed_envelope::Reader>()?,
+    )?;
+    assert!(
+        signed.is_encrypted(),
+        "iroh request must carry encrypted_envelope"
+    );
+    assert!(
+        signed.payload().is_empty(),
+        "outer request payload must be redacted when encrypted_envelope is present"
+    );
+    assert!(
+        !sent
+            .windows(b"ping-payload".len())
+            .any(|w| w == b"ping-payload"),
+        "clear request payload must not appear in the serialized SignedEnvelope"
+    );
 
     // Second call on the same connection to exercise multiple bidi streams.
     let response2 = rpc.call(b"second".to_vec()).await?;

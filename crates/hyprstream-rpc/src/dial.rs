@@ -32,6 +32,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use anyhow::{anyhow, bail, Result};
 use parking_lot::RwLock;
 
+use crate::crypto::hybrid_kem::KemTrustStore;
 use crate::crypto::VerifyingKey;
 use crate::rpc_client::{RpcClient, RpcClientImpl};
 use crate::transport::in_memory::InMemoryTransport;
@@ -122,6 +123,21 @@ pub fn dial<S>(
 where
     S: Signer + 'static,
 {
+    dial_with_kem_store(target, signer, server_verifying_key, token, None)
+}
+
+/// Dial with an anchored `#mesh-kem` recipient trust store for carriers that
+/// forbid cleartext request envelopes.
+pub fn dial_with_kem_store<S>(
+    target: &TransportConfig,
+    signer: S,
+    server_verifying_key: Option<VerifyingKey>,
+    token: Option<String>,
+    request_kem_store: Option<Arc<dyn KemTrustStore>>,
+) -> Result<Arc<dyn RpcClient>>
+where
+    S: Signer + 'static,
+{
     /// Wrap a built transport as an `RpcClient`, applying the optional default
     /// JWT (CA-signed trust cert included in request envelopes) if present.
     fn build_client<S2, T2>(
@@ -129,12 +145,17 @@ where
         transport: T2,
         vk: Option<VerifyingKey>,
         token: Option<String>,
+        request_kem_store: Option<Arc<dyn KemTrustStore>>,
     ) -> Arc<dyn RpcClient>
     where
         S2: Signer + 'static,
         T2: crate::transport_traits::Transport + 'static,
     {
         let rpc = RpcClientImpl::new(signer, transport, vk);
+        let rpc = match request_kem_store {
+            Some(store) => rpc.with_request_kem_store(store),
+            None => rpc,
+        };
         let rpc = match token {
             Some(t) => rpc.with_default_jwt(t),
             None => rpc,
@@ -151,7 +172,7 @@ where
                 anyhow!("no in-process service registered for inproc endpoint '{endpoint}'")
             })?;
             let transport = InMemoryTransport::new(processor);
-            Ok(build_client(signer, transport, server_verifying_key, token))
+            Ok(build_client(signer, transport, server_verifying_key, token, request_kem_store))
         }
         EndpointType::Quic { addr, server_name, auth } => {
             // SECURITY (#185): QUIC channel auth (WebPKI / cert-hash pin) binds the
@@ -172,7 +193,7 @@ where
                 server_name.clone(),
                 auth.clone(),
             );
-            Ok(build_client(signer, transport, server_verifying_key, token))
+            Ok(build_client(signer, transport, server_verifying_key, token, request_kem_store))
         }
         EndpointType::Iroh { direct_addrs, relay_url, .. }
             if direct_addrs.is_empty() && relay_url.is_none() =>
@@ -197,7 +218,13 @@ where
                 direct_addrs.clone(),
                 relay_url.clone(),
             );
-            Ok(build_client(signer, transport, Some(response_key), token))
+            Ok(build_client(
+                signer,
+                transport,
+                Some(response_key),
+                token,
+                request_kem_store,
+            ))
         }
         // Same-host `ipc` plane: connect a UdsSession (RPC plane) at the socket
         // path. systemd socket-activation is the same client-side dial — the fd
@@ -208,11 +235,11 @@ where
         // + SO_PEERCRED are daemon-owned defense-in-depth (#207).
         EndpointType::Ipc { path } => {
             let transport = crate::transport::lazy_uds::LazyUdsTransport::new(path.clone());
-            Ok(build_client(signer, transport, server_verifying_key, token))
+            Ok(build_client(signer, transport, server_verifying_key, token, request_kem_store))
         }
         EndpointType::SystemdFd { client_path, .. } => {
             let transport = crate::transport::lazy_uds::LazyUdsTransport::new(client_path.clone());
-            Ok(build_client(signer, transport, server_verifying_key, token))
+            Ok(build_client(signer, transport, server_verifying_key, token, request_kem_store))
         }
     }
 }

@@ -71,6 +71,13 @@ impl Transport for InMemoryTransport {
     type Sub = RpcPendingStream;
     type Pub = RpcPublishStub;
 
+    /// Same-process, zero-copy carrier: never leaves the address space, so
+    /// cleartext envelopes are permitted (explicit opt-out of the fail-closed
+    /// default).
+    fn forbids_cleartext_envelope(&self) -> bool {
+        false
+    }
+
     async fn send(&self, payload: Vec<u8>, timeout_ms: Option<i32>) -> Result<Vec<u8>> {
         let timeout = timeout_ms
             .map(|ms| Duration::from_millis(ms.max(0) as u64))

@@ -160,6 +160,16 @@ impl Transport for LazyQuinnTransport {
         }
     }
 
+    /// QUIC is an untrusted carrier for envelope confidentiality — cleartext
+    /// forbidden unconditionally, matching the concrete
+    /// [`QuinnTransport`](super::quinn_transport) and
+    /// [`EndpointType::Quic`](super::EndpointType). A loopback address is not
+    /// evidence the bytes stay inside the trust boundary (it can terminate at a
+    /// proxy/tunnel), so it earns no exemption; local trusted RPC uses UDS/inproc.
+    fn forbids_cleartext_envelope(&self) -> bool {
+        true
+    }
+
     async fn subscribe(&self, _topic: &[u8]) -> Result<Self::Sub> {
         bail!("lazy quinn RPC transport does not support SUB — streaming is on the moq plane")
     }

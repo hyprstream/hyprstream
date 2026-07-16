@@ -43,6 +43,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 
+use crate::crypto::hybrid_kem::KemTrustStore;
 use crate::crypto::VerifyingKey;
 use crate::rpc_client::{RpcClient, RpcClientImpl};
 use crate::signer::JsSigner;
@@ -82,8 +83,38 @@ pub async fn dial(
     server_verifying_key: Option<VerifyingKey>,
     jwt: Option<String>,
 ) -> Result<Arc<dyn RpcClient>> {
+    dial_with_kem_store(url, cert_hash, signer, server_verifying_key, jwt, None).await
+}
+
+/// Dial over WebTransport with an anchored `#mesh-kem` recipient trust store.
+///
+/// WebTransport is a cleartext-forbidding carrier
+/// ([`WtConnection::forbids_cleartext_envelope`] → `true`), so its request
+/// envelopes MUST be sealed to the server's anchored `#mesh-kem` recipient. This
+/// mirrors native [`crate::dial::dial_with_kem_store`]: without a store, every
+/// `call()` fails closed at sign time (no cleartext downgrade).
+///
+/// # Prerequisite
+///
+/// The browser must first resolve the server's `#mesh-kem` recipient key
+/// out-of-band (DID `keyAgreement` / peer attestation) and provision a
+/// [`KemTrustStore`]. That browser-side provisioning is tracked separately; the
+/// bare [`dial`] entrypoint (store `None`) therefore cannot yet complete an
+/// encrypted WebTransport request — use this entrypoint once a store exists.
+pub async fn dial_with_kem_store(
+    url: &str,
+    cert_hash: Option<&str>,
+    signer: JsSigner,
+    server_verifying_key: Option<VerifyingKey>,
+    jwt: Option<String>,
+    request_kem_store: Option<Arc<dyn KemTrustStore>>,
+) -> Result<Arc<dyn RpcClient>> {
     let transport = WtConnection::connect(url, cert_hash).await?;
     let client = RpcClientImpl::new(signer, transport, server_verifying_key);
+    let client = match request_kem_store {
+        Some(store) => client.with_request_kem_store(store),
+        None => client,
+    };
     let client = match jwt {
         Some(t) => client.with_default_jwt(t),
         None => client,
