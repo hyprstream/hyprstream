@@ -1221,6 +1221,7 @@ mod empty_iss_gate_tests {
         key_set
             .publish(
                 1,
+                "request-service-test-generation".to_owned(),
                 vec![
                     crate::auth::CompositeKeyPair::verifying(
                         kid_a.clone(),

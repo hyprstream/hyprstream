@@ -165,6 +165,23 @@ impl PolicyService {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn sign_token_through_production_path(
+        base_dir: &std::path::Path,
+        claims: &hyprstream_rpc::auth::Claims,
+    ) -> Result<String> {
+        let policy_manager = Arc::new(PolicyManager::permissive().await?);
+        let git2db = Arc::new(RwLock::new(Git2DB::open(base_dir).await?));
+        let service = Self::new(
+            policy_manager,
+            Arc::new(SigningKey::from_bytes(&[0x73; 32])),
+            crate::config::TokenConfig::default(),
+            git2db,
+            TransportConfig::inproc("multiprocess-policy-sign"),
+        );
+        service.sign_token(claims, false).await
+    }
+
     /// Set the JWT key source for verifying JWTs (local and federated).
     pub fn with_jwt_key_source(
         mut self,

@@ -13,6 +13,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -106,7 +107,21 @@ pub async fn refresh_ml_dsa_verifying_keys(store: &Arc<MlDsaSigningKeyStore>) {
 #[derive(Clone, Serialize, Deserialize)]
 struct CompositeLedger {
     version: u64,
+    #[serde(default)]
+    component_digest: String,
     pairs: Vec<CompositeLedgerPair>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct CompositeCommit {
+    version: u64,
+    component_digest: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct CompositeAcknowledgement {
+    version: u64,
+    component_digest: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -152,6 +167,95 @@ fn configure_composite_authority(dir: &Path) {
     );
 }
 
+fn digest_component_slot(
+    digest: &mut Sha256,
+    family: &[u8],
+    name: &[u8],
+    public: Option<&[u8]>,
+    validity: Option<(i64, i64)>,
+) {
+    digest.update((family.len() as u64).to_be_bytes());
+    digest.update(family);
+    digest.update((name.len() as u64).to_be_bytes());
+    digest.update(name);
+    match (public, validity) {
+        (Some(public), Some((nbf, exp))) => {
+            digest.update([1]);
+            digest.update((public.len() as u64).to_be_bytes());
+            digest.update(public);
+            digest.update(nbf.to_be_bytes());
+            digest.update(exp.to_be_bytes());
+        }
+        _ => digest.update([0]),
+    }
+}
+
+fn component_state_digest_from_slots(
+    ed: &KeySlots,
+    pq: &ml_dsa_rotation::MlDsaKeySlots,
+    ca_key: ed25519_dalek::VerifyingKey,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"hyprstream-composite-component-state-v1");
+    let ed_drain = ed.drain.as_ref().map(KeySlot::verifying_key_bytes);
+    let ed_active = ed.active.as_ref().map(KeySlot::verifying_key_bytes);
+    let ed_lead = ed.lead.as_ref().map(KeySlot::verifying_key_bytes);
+    digest_component_slot(
+        &mut digest,
+        b"ed25519",
+        b"drain",
+        ed_drain.as_ref().map(<[u8; 32]>::as_slice),
+        ed.drain.as_ref().map(|slot| (slot.nbf, slot.exp)),
+    );
+    digest_component_slot(
+        &mut digest,
+        b"ed25519",
+        b"active",
+        ed_active.as_ref().map(<[u8; 32]>::as_slice),
+        ed.active.as_ref().map(|slot| (slot.nbf, slot.exp)),
+    );
+    digest_component_slot(
+        &mut digest,
+        b"ed25519",
+        b"lead",
+        ed_lead.as_ref().map(<[u8; 32]>::as_slice),
+        ed.lead.as_ref().map(|slot| (slot.nbf, slot.exp)),
+    );
+    for (name, slot) in [
+        (b"drain".as_slice(), pq.drain.as_ref()),
+        (b"active".as_slice(), pq.active.as_ref()),
+        (b"lead".as_slice(), pq.lead.as_ref()),
+    ] {
+        let public =
+            slot.map(|slot| hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&slot.verifying_key()));
+        digest_component_slot(
+            &mut digest,
+            b"ml-dsa-65",
+            name,
+            public.as_deref(),
+            slot.map(|slot| (slot.nbf, slot.exp)),
+        );
+    }
+    digest_component_slot(
+        &mut digest,
+        b"ed25519",
+        b"policy-ca",
+        Some(&ca_key.to_bytes()),
+        Some((i64::MIN, i64::MAX)),
+    );
+    URL_SAFE_NO_PAD.encode(digest.finalize())
+}
+
+async fn component_state_digest(
+    ed_store: &SigningKeyStore,
+    pq_store: &MlDsaSigningKeyStore,
+    ca_key: ed25519_dalek::VerifyingKey,
+) -> String {
+    let ed = ed_store.0.read().await;
+    let pq = pq_store.0.read().await;
+    component_state_digest_from_slots(&ed, &pq, ca_key)
+}
+
 /// Restore the public exact-pair ledger in verifier-only service processes.
 pub async fn restore_composite_verifying_key_set(
     secrets_dir: &Path,
@@ -166,6 +270,11 @@ pub async fn restore_composite_verifying_key_set(
     start_composite_authority_subscription(secrets_dir.to_path_buf(), ca_key)?;
     let bytes = std::fs::read(composite_ledger_path(secrets_dir))?;
     let ledger: CompositeLedger = serde_json::from_slice(&bytes)?;
+    let local_digest = component_state_digest(ed_store, ml_dsa_store, ca_key).await;
+    anyhow::ensure!(
+        !ledger.component_digest.is_empty() && ledger.component_digest == local_digest,
+        "persisted composite ledger does not match the local component generation"
+    );
     let ed_slots = ed_store.all_slots_snapshot().await;
     let pq_slots = ml_dsa_store.all_slots_snapshot().await;
     let now = chrono::Utc::now().timestamp();
@@ -210,7 +319,7 @@ pub async fn restore_composite_verifying_key_set(
     }
     let key_set = hyprstream_rpc::auth::global_composite_key_set();
     if ledger.version > key_set.snapshot().version() {
-        key_set.publish(ledger.version, pairs)?;
+        key_set.publish(ledger.version, ledger.component_digest, pairs)?;
     }
     Ok(())
 }
@@ -226,7 +335,6 @@ fn start_composite_authority_subscription(
     let subscribers = composite_subscribers_dir(&secrets_dir);
     std::fs::create_dir_all(&subscribers)?;
     let name = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4());
-    let subscriber = subscribers.join(&name);
     super::identity_store::write_secret(&subscribers, &name, b"0")?;
     std::thread::Builder::new()
         .name("composite-authority".into())
@@ -256,10 +364,18 @@ fn start_composite_authority_subscription(
                             load_or_init_ml_dsa_key_store(&secrets_dir, &OAuthConfig::default());
                         key_set.publish(
                             ledger.version,
+                            ledger.component_digest.clone(),
                             ledger_pairs_from_local_keys(&ledger, &ed, &pq, ca_key)?,
                         )?;
                     }
-                    std::fs::write(&subscriber, ledger.version.to_string())?;
+                    super::identity_store::write_secret(
+                        &subscribers,
+                        &name,
+                        &serde_json::to_vec(&CompositeAcknowledgement {
+                            version: ledger.version,
+                            component_digest: ledger.component_digest,
+                        })?,
+                    )?;
                     Ok(())
                 })();
                 if let Err(error) = load {
@@ -280,6 +396,11 @@ fn ledger_pairs_from_local_keys(
     use hyprstream_rpc::auth::{CompositeKeyPair, CompositePairRole, CompositePairState};
     let ed_slots = ed_store.0.blocking_read();
     let pq_slots = pq_store.0.blocking_read();
+    let local_digest = component_state_digest_from_slots(&ed_slots, &pq_slots, ca_key);
+    anyhow::ensure!(
+        !ledger.component_digest.is_empty() && ledger.component_digest == local_digest,
+        "composite ledger component digest does not match local persisted components"
+    );
     let ca_signing = composite_ca_signing_key().read().clone();
     let now = chrono::Utc::now().timestamp();
     ledger
@@ -311,7 +432,11 @@ fn ledger_pairs_from_local_keys(
                     hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&s.verifying_key()) == pq_bytes
                 })
                 .map(|s| Arc::clone(&s.key))
-                .ok_or_else(|| anyhow::anyhow!("composite PQ key is absent from the persisted component generation"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "composite PQ key is absent from the persisted component generation"
+                    )
+                })?;
             let ed_signing = if ca_key == ed_vk {
                 ca_signing.clone()
             } else {
@@ -321,7 +446,10 @@ fn ledger_pairs_from_local_keys(
                     .find(|s| s.key.verifying_key() == ed_vk)
                     .map(|s| Arc::clone(&s.key))
             };
-            anyhow::ensure!(ca_key == ed_vk || ed_signing.is_some(), "composite Ed25519 key is absent from the persisted component generation");
+            anyhow::ensure!(
+                ca_key == ed_vk || ed_signing.is_some(),
+                "composite Ed25519 key is absent from the persisted component generation"
+            );
             Ok(match (ca_signing.is_some(), ed_signing) {
                 (true, Some(ed)) => CompositeKeyPair::signing(
                     r.kid.clone(),
@@ -363,6 +491,7 @@ pub async fn initialize_composite_key_set(
         ca_key,
         drain_secs,
         true,
+        None,
     )
     .await
 }
@@ -374,6 +503,7 @@ pub async fn refresh_composite_key_set(
     ml_dsa_store: &MlDsaSigningKeyStore,
     ca_key: Arc<SigningKey>,
     drain_secs: i64,
+    expected_component_digest: &str,
 ) -> anyhow::Result<()> {
     publish_composite_key_set(
         secrets_dir,
@@ -382,6 +512,7 @@ pub async fn refresh_composite_key_set(
         ca_key,
         drain_secs,
         false,
+        Some(expected_component_digest.to_owned()),
     )
     .await
 }
@@ -392,7 +523,8 @@ async fn publish_composite_key_set(
     ml_dsa_store: &MlDsaSigningKeyStore,
     ca_key: Arc<SigningKey>,
     drain_secs: i64,
-    _restore: bool,
+    restore: bool,
+    expected_component_digest: Option<String>,
 ) -> anyhow::Result<()> {
     use hyprstream_rpc::auth::{CompositeKeyPair, CompositePairRole, CompositePairState};
     use nix::fcntl::{flock, FlockArg};
@@ -418,8 +550,15 @@ async fn publish_composite_key_set(
     let _guard = Guard;
 
     let now = chrono::Utc::now().timestamp();
-    let ed_slots = ed_store.all_slots_snapshot().await;
-    let pq_slots = ml_dsa_store.all_slots_snapshot().await;
+    let ed_component_slots = ed_store.0.read().await.clone();
+    let pq_component_slots = ml_dsa_store.0.read().await.clone();
+    let ed_slots: Vec<_> = ed_component_slots.all().into_iter().cloned().collect();
+    let pq_slots: Vec<_> = pq_component_slots.all().into_iter().cloned().collect();
+    let proposed_component_digest = component_state_digest_from_slots(
+        &ed_component_slots,
+        &pq_component_slots,
+        ca_key.verifying_key(),
+    );
     let key_set = hyprstream_rpc::auth::global_composite_key_set();
     let current = key_set.snapshot();
     let ledger_lock = std::fs::OpenOptions::new()
@@ -433,6 +572,23 @@ async fn publish_composite_key_set(
         .ok()
         .and_then(|bytes| serde_json::from_slice::<CompositeLedger>(&bytes).ok());
     let persisted_version = persisted.as_ref().map_or(0, |ledger| ledger.version);
+    match (&persisted, expected_component_digest.as_deref()) {
+        (Some(ledger), Some(expected)) => anyhow::ensure!(
+            !ledger.component_digest.is_empty() && ledger.component_digest == expected,
+            "stale composite component authority: expected {expected}, authoritative digest is {}",
+            ledger.component_digest
+        ),
+        (Some(ledger), None) => anyhow::ensure!(
+            restore
+                && (ledger.component_digest.is_empty()
+                    || ledger.component_digest == proposed_component_digest),
+            "persisted composite authority does not match startup component generation"
+        ),
+        (None, Some(_)) => {
+            anyhow::bail!("stale composite component authority: expected generation has no ledger")
+        }
+        (None, None) => anyhow::ensure!(restore, "composite authority is not initialized"),
+    }
     let mut pairs = Vec::new();
 
     for record in persisted.into_iter().flat_map(|ledger| ledger.pairs) {
@@ -513,6 +669,7 @@ async fn publish_composite_key_set(
     let version = current.version().max(persisted_version).saturating_add(1);
     let ledger = CompositeLedger {
         version,
+        component_digest: proposed_component_digest.clone(),
         pairs: pairs.iter().map(ledger_record).collect(),
     };
     super::identity_store::write_secret(
@@ -521,7 +678,7 @@ async fn publish_composite_key_set(
         &serde_json::to_vec(&ledger)?,
     )?;
     drop(ledger_lock);
-    wait_for_composite_acknowledgements(secrets_dir, version)?;
+    wait_for_composite_acknowledgements(secrets_dir, version, &proposed_component_digest)?;
     let ledger_lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -529,18 +686,31 @@ async fn publish_composite_key_set(
         .write(true)
         .open(composite_ledger_lock_path(secrets_dir))?;
     flock(ledger_lock.as_raw_fd(), FlockArg::LockExclusive)?;
+    let pending: CompositeLedger =
+        serde_json::from_slice(&std::fs::read(composite_ledger_path(secrets_dir))?)?;
+    anyhow::ensure!(
+        pending.version == version && pending.component_digest == proposed_component_digest,
+        "composite publication changed before commit"
+    );
     super::identity_store::write_secret(
         secrets_dir,
         "jwt-composite-pairs.committed",
-        version.to_string().as_bytes(),
+        &serde_json::to_vec(&CompositeCommit {
+            version,
+            component_digest: proposed_component_digest.clone(),
+        })?,
     )?;
     if version > key_set.snapshot().version() {
-        key_set.publish(version, pairs)?;
+        key_set.publish(version, proposed_component_digest, pairs)?;
     }
     Ok(())
 }
 
-fn wait_for_composite_acknowledgements(dir: &Path, version: u64) -> anyhow::Result<()> {
+fn wait_for_composite_acknowledgements(
+    dir: &Path,
+    version: u64,
+    component_digest: &str,
+) -> anyhow::Result<()> {
     let subscribers = composite_subscribers_dir(dir);
     std::fs::create_dir_all(&subscribers)?;
     let own = format!("{}-", std::process::id());
@@ -557,7 +727,7 @@ fn wait_for_composite_acknowledgements(dir: &Path, version: u64) -> anyhow::Resu
             let pid = name
                 .split_once('-')
                 .and_then(|(p, _)| p.parse::<u32>().ok());
-        if pid.is_some_and(|p| !composite_subscriber_alive(p)) {
+            if pid.is_some_and(|p| !composite_subscriber_alive(p)) {
                 let _ = std::fs::remove_file(path);
                 return false;
             }
@@ -567,10 +737,12 @@ fn wait_for_composite_acknowledgements(dir: &Path, version: u64) -> anyhow::Resu
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         if required.iter().all(|p| {
-            std::fs::read_to_string(p)
+            std::fs::read(p)
                 .ok()
-                .and_then(|v| v.trim().parse::<u64>().ok())
-                .is_some_and(|v| v >= version)
+                .and_then(|bytes| serde_json::from_slice::<CompositeAcknowledgement>(&bytes).ok())
+                .is_some_and(|ack| {
+                    ack.version == version && ack.component_digest == component_digest
+                })
         }) {
             return Ok(());
         }
@@ -711,7 +883,7 @@ impl KeySlot {
 
 // ── Slot container ───────────────────────────────────────────────────────────
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct KeySlots {
     pub drain: Option<KeySlot>,
     pub active: Option<KeySlot>,
@@ -981,6 +1153,14 @@ pub fn spawn_rotation_task(
         loop {
             interval.tick().await;
             let now = chrono::Utc::now().timestamp();
+            let expected_component_digest = if let Some(ref ml_dsa) = extra.ml_dsa {
+                Some(
+                    component_state_digest(&store, ml_dsa, extra.composite_ca_key.verifying_key())
+                        .await,
+                )
+            } else {
+                None
+            };
             rotate_jwt_keys(&config, &secrets_dir, &store, now).await;
             // Keep the shared HTTP validator's published Ed25519 key set current
             // after every rotation (drain evicted / lead promoted → active).
@@ -988,7 +1168,9 @@ pub fn spawn_rotation_task(
             if let Some(ref es256) = extra.es256 {
                 rotate_es256_keys(&config, &secrets_dir, es256, now).await;
             }
-            if let Some(ref ml_dsa) = extra.ml_dsa {
+            if let (Some(ref ml_dsa), Some(expected_component_digest)) =
+                (&extra.ml_dsa, expected_component_digest.as_deref())
+            {
                 rotate_ml_dsa_keys(&config, &secrets_dir, ml_dsa, now).await;
                 refresh_ml_dsa_verifying_keys(ml_dsa).await;
                 if let Err(error) = refresh_composite_key_set(
@@ -997,6 +1179,7 @@ pub fn spawn_rotation_task(
                     ml_dsa,
                     Arc::clone(&extra.composite_ca_key),
                     config.drain_secs(),
+                    expected_component_digest,
                 )
                 .await
                 {
@@ -1263,7 +1446,7 @@ mod ml_dsa_rotation {
         }
     }
 
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     pub struct MlDsaKeySlots {
         pub drain: Option<MlDsaKeySlot>,
         pub active: Option<MlDsaKeySlot>,
@@ -1488,136 +1671,155 @@ mod tests {
         }
     }
 
-    fn verify_authority_token(token: &str) -> bool {
-        let Ok(dispatch) = hyprstream_rpc::auth::parse_composite_dispatch(token, &["at+jwt"])
-        else {
-            return false;
-        };
-        let snapshot = hyprstream_rpc::auth::global_composite_key_set().snapshot();
-        let Some(pair) = snapshot.pair(dispatch.kid()) else {
-            return false;
-        };
-        hyprstream_rpc::auth::jwt::decode_composite(
-            token,
-            pair.ml_dsa(),
-            pair.ed25519(),
-            Some("multiprocess"),
-            &dispatch,
-        )
-        .is_ok()
+    struct ProductionAuthorityVerifier {
+        transport: hyprstream_rpc::transport::TransportConfig,
+        signing_key: hyprstream_rpc::prelude::SigningKey,
+        key_source: Arc<hyprstream_rpc::auth::ClusterKeySource>,
+        accepted: Arc<std::sync::atomic::AtomicBool>,
+        error: Arc<parking_lot::Mutex<Option<String>>>,
     }
 
-    #[test]
-    fn composite_authority_process() {
-        let Ok(dir) = std::env::var("HYPRSTREAM_COMPOSITE_TEST_DIR") else {
-            return;
+    #[async_trait::async_trait(?Send)]
+    impl crate::services::RequestService for ProductionAuthorityVerifier {
+        async fn handle_request(
+            &self,
+            _ctx: &crate::services::EnvelopeContext,
+            _payload: &[u8],
+        ) -> anyhow::Result<(Vec<u8>, Option<crate::services::Continuation>)> {
+            self.accepted.store(true, Ordering::Release);
+            Ok((Vec::new(), None))
+        }
+
+        fn name(&self) -> &str {
+            "multiprocess-authority-verifier"
+        }
+
+        fn transport(&self) -> &hyprstream_rpc::transport::TransportConfig {
+            &self.transport
+        }
+
+        fn signing_key(&self) -> hyprstream_rpc::prelude::SigningKey {
+            self.signing_key.clone()
+        }
+
+        fn jwt_key_source(&self) -> Option<Arc<dyn hyprstream_rpc::auth::JwtKeySource>> {
+            Some(self.key_source.clone())
+        }
+
+        fn expected_audience(&self) -> Option<&str> {
+            Some("multiprocess")
+        }
+
+        fn require_cnf_binding(&self) -> bool {
+            false
+        }
+
+        fn pq_signing_key(&self) -> Option<hyprstream_rpc::crypto::pq::MlDsaSigningKey> {
+            None
+        }
+
+        fn jwt_verify_policy(&self) -> hyprstream_rpc::crypto::CryptoPolicy {
+            hyprstream_rpc::crypto::CryptoPolicy::Hybrid
+        }
+
+        fn build_error_payload(&self, _request_id: u64, error: &str) -> Vec<u8> {
+            *self.error.lock() = Some(error.to_owned());
+            Vec::new()
+        }
+    }
+
+    async fn verify_through_production_request_service(token: String) -> anyhow::Result<()> {
+        use hyprstream_rpc::ToCapnp as _;
+        if !hyprstream_rpc::envelope::verify_config_installed() {
+            hyprstream_rpc::envelope::install_verify_config(
+                hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+                    policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
+                    pq_store: None,
+                },
+            )?;
+        }
+        let accepted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let verification_error = Arc::new(parking_lot::Mutex::new(None));
+        let ca = SigningKey::from_bytes(&[0x5a; 32]);
+        let service = ProductionAuthorityVerifier {
+            transport: hyprstream_rpc::transport::TransportConfig::inproc(
+                "multiprocess-authority-verifier",
+            ),
+            signing_key: hyprstream_rpc::prelude::SigningKey::from_bytes(&[0x74; 32]),
+            key_source: Arc::new(hyprstream_rpc::auth::ClusterKeySource::new(
+                ca.verifying_key(),
+                "https://multiprocess.test".to_owned(),
+            )),
+            accepted: Arc::clone(&accepted),
+            error: Arc::clone(&verification_error),
         };
-        let dir = PathBuf::from(dir);
-        let role = std::env::var("HYPRSTREAM_COMPOSITE_TEST_ROLE").unwrap();
-        let mode =
-            std::env::var("HYPRSTREAM_COMPOSITE_TEST_MODE").unwrap_or_else(|_| "service".into());
-        let ca = Arc::new(SigningKey::from_bytes(&[0x5a; 32]));
+        let envelope_signer = ed25519_dalek::SigningKey::from_bytes(&[0x75; 32]);
+        let signed = hyprstream_rpc::envelope::SignedEnvelope::new_signed(
+            hyprstream_rpc::envelope::RequestEnvelope::new(Vec::new()).with_jwt_token(token),
+            &envelope_signer,
+        );
+        let mut message = capnp::message::Builder::new_default();
+        signed.write_to(
+            &mut message.init_root::<hyprstream_rpc::common_capnp::signed_envelope::Builder>(),
+        );
+        let mut bytes = Vec::new();
+        capnp::serialize::write_message(&mut bytes, &message)?;
+        let _ = hyprstream_rpc::service::process_request(
+            &bytes,
+            &service,
+            hyprstream_rpc::envelope::EnvelopeVerification::AnySigner,
+            &service.signing_key,
+            &hyprstream_rpc::envelope::InMemoryNonceCache::new(),
+        )
+        .await?;
+        anyhow::ensure!(
+            accepted.load(Ordering::Acquire),
+            "production RequestService rejected returned token: {}",
+            verification_error
+                .lock()
+                .clone()
+                .unwrap_or_else(|| "envelope rejected before JWT dispatch".to_owned())
+        );
+        Ok(())
+    }
+
+    fn authority_process_dir() -> Option<PathBuf> {
+        std::env::var_os("HYPRSTREAM_COMPOSITE_PRODUCTION_TEST_DIR").map(PathBuf::from)
+    }
+
+    fn authority_ca_key() -> Arc<SigningKey> {
+        Arc::new(SigningKey::from_bytes(&[0x5a; 32]))
+    }
+
+    async fn install_signing_authority(
+        dir: &Path,
+        subscribe: bool,
+    ) -> anyhow::Result<(Arc<SigningKeyStore>, Arc<MlDsaSigningKeyStore>)> {
         let config = test_config();
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let ed = load_or_init_key_store(&dir, &config);
-        let pq = load_or_init_ml_dsa_key_store(&dir, &config);
-        let _ = runtime.block_on(restore_composite_verifying_key_set(
-            &dir,
-            &ed,
-            &pq,
-            ca.verifying_key(),
-        ));
-        start_composite_authority_subscription(dir.clone(), ca.verifying_key()).unwrap();
-        if role == "oauth" || role == "policy" || mode == "publisher" {
-            *composite_ca_signing_key().write() = Some(Arc::clone(&ca));
+        let ca = authority_ca_key();
+        let ed = Arc::new(load_or_init_key_store(dir, &config));
+        let pq = Arc::new(load_or_init_ml_dsa_key_store(dir, &config));
+        *composite_ca_signing_key().write() = Some(Arc::clone(&ca));
+        configure_composite_authority(dir);
+        if subscribe {
+            start_composite_authority_subscription(dir.to_path_buf(), ca.verifying_key())?;
         }
-
-        if mode == "publisher" {
-            std::fs::write(dir.join(format!("ready-{role}")), b"1").unwrap();
-            while !dir.join("publish-gate").exists() {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            let ed = load_or_init_key_store(&dir, &config);
-            let pq = load_or_init_ml_dsa_key_store(&dir, &config);
-            runtime
-                .block_on(initialize_composite_key_set(&dir, &ed, &pq, ca, 300))
-                .unwrap();
-            std::fs::write(
-                dir.join(format!("published-{role}")),
-                hyprstream_rpc::auth::global_composite_key_set()
-                    .snapshot()
-                    .version()
-                    .to_string(),
-            )
-            .unwrap();
-            return;
-        }
-
-        std::fs::write(dir.join(format!("ready-{role}")), b"1").unwrap();
-        while !dir.join("target-version").exists() {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        let target = std::fs::read_to_string(dir.join("target-version"))
-            .unwrap()
-            .parse::<u64>()
-            .unwrap();
-        while hyprstream_rpc::auth::global_composite_key_set()
-            .snapshot()
-            .version()
-            < target
-        {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        let token = std::fs::read_to_string(dir.join("oauth-token")).unwrap();
-        std::fs::write(
-            dir.join(format!("verified-{role}")),
-            if verify_authority_token(&token) {
-                b"1"
-            } else {
-                b"0"
-            },
-        )
-        .unwrap();
-        if role == "oauth" || role == "policy" {
-            let pair_role = if role == "policy" {
-                hyprstream_rpc::auth::CompositePairRole::Policy
-            } else {
-                hyprstream_rpc::auth::CompositePairRole::OAuth
-            };
-            let snapshot = hyprstream_rpc::auth::global_composite_key_set()
-                .mint_snapshot()
-                .unwrap();
-            let (pq, ed) = snapshot
-                .active_signing_pair(pair_role)
-                .and_then(hyprstream_rpc::auth::CompositeKeyPair::signing_keys)
-                .unwrap();
-            let now = chrono::Utc::now().timestamp();
-            let claims = hyprstream_rpc::auth::Claims::new(role.clone(), now, now + 60)
-                .with_audience(Some("multiprocess".into()));
-            let token = crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(&claims, &pq, &ed);
-            std::fs::write(dir.join(format!("token-{role}")), token).unwrap();
-        }
-        while !dir.join("done").exists() {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        initialize_composite_key_set(dir, &ed, &pq, ca, 300).await?;
+        Ok((ed, pq))
     }
 
-    fn spawn_authority_child(dir: &Path, role: &str, mode: &str) -> std::process::Child {
-        std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "auth::key_rotation::tests::composite_authority_process",
-                "--nocapture",
-            ])
-            .env("HYPRSTREAM_COMPOSITE_TEST_DIR", dir)
-            .env("HYPRSTREAM_COMPOSITE_TEST_ROLE", role)
-            .env("HYPRSTREAM_COMPOSITE_TEST_MODE", mode)
-            .spawn()
-            .unwrap()
+    async fn install_verifying_authority(dir: &Path) -> anyhow::Result<()> {
+        let config = test_config();
+        let ca = authority_ca_key();
+        let ed = load_or_init_key_store(dir, &config);
+        let pq = load_or_init_ml_dsa_key_store(dir, &config);
+        restore_composite_verifying_key_set(dir, &ed, &pq, ca.verifying_key()).await?;
+        start_composite_authority_subscription(dir.to_path_buf(), ca.verifying_key())?;
+        Ok(())
     }
 
     fn wait_path(path: &Path) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while !path.exists() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -1628,9 +1830,276 @@ mod tests {
         }
     }
 
+    fn wait_for_target_authority(dir: &Path) -> CompositeCommit {
+        let target_path = dir.join("target-authority.json");
+        wait_path(&target_path);
+        let target: CompositeCommit =
+            serde_json::from_slice(&std::fs::read(target_path).unwrap()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let snapshot = hyprstream_rpc::auth::global_composite_key_set().snapshot();
+            if snapshot.version() == target.version
+                && snapshot.component_digest() == target.component_digest
+            {
+                return target;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "process did not converge to {} {}",
+                target.version,
+                target.component_digest
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    async fn verify_returned_tokens(dir: &Path, process: &str) -> anyhow::Result<()> {
+        wait_path(&dir.join("tokens-ready"));
+        for token_file in ["oauth-token", "policy-token"] {
+            verify_through_production_request_service(std::fs::read_to_string(
+                dir.join(token_file),
+            )?)
+            .await?;
+        }
+        std::fs::write(dir.join(format!("verified-{process}")), b"1")?;
+        Ok(())
+    }
+
+    fn wait_for_done(dir: &Path) {
+        wait_path(&dir.join("done"));
+    }
+
     #[test]
-    fn composite_authority_converges_across_oauth_policy_and_rpc_processes() {
-        let dir = TempDir::new().unwrap();
+    fn composite_old_oauth_production_process() {
+        let Some(dir) = authority_process_dir() else {
+            return;
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime
+            .block_on(async {
+                install_signing_authority(&dir, false).await?;
+                let token = crate::services::oauth::token_exchange::mint_grant_token_through_production_path().await?;
+                std::fs::write(dir.join("old-oauth-token"), token)?;
+                anyhow::Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn composite_oauth_production_process() {
+        let Some(dir) = authority_process_dir() else {
+            return;
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime
+            .block_on(async {
+                install_signing_authority(&dir, true).await?;
+                std::fs::write(dir.join("ready-oauth"), b"1")?;
+                wait_for_target_authority(&dir);
+                let token = crate::services::oauth::token_exchange::mint_grant_token_through_production_path().await?;
+                std::fs::write(dir.join("oauth-token"), token)?;
+                verify_returned_tokens(&dir, "oauth").await?;
+                anyhow::Ok(())
+            })
+            .unwrap();
+        wait_for_done(&dir);
+    }
+
+    #[test]
+    fn composite_policy_production_process() {
+        let Some(dir) = authority_process_dir() else {
+            return;
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime
+            .block_on(async {
+                install_signing_authority(&dir, true).await?;
+                std::fs::write(dir.join("ready-policy"), b"1")?;
+                wait_for_target_authority(&dir);
+                let now = chrono::Utc::now().timestamp();
+                let claims = hyprstream_rpc::auth::Claims::new(
+                    "did:key:multiprocess-policy".to_owned(),
+                    now,
+                    now + 60,
+                )
+                .with_issuer("https://multiprocess.test".to_owned())
+                .with_audience(Some("multiprocess".to_owned()));
+                let db = dir.join(format!("policy-db-{}", std::process::id()));
+                std::fs::create_dir_all(&db)?;
+                let token = crate::services::PolicyService::sign_token_through_production_path(
+                    &db, &claims,
+                )
+                .await?;
+                std::fs::write(dir.join("policy-token"), token)?;
+                verify_returned_tokens(&dir, "policy").await?;
+                anyhow::Ok(())
+            })
+            .unwrap();
+        wait_for_done(&dir);
+    }
+
+    #[test]
+    fn composite_jwks_production_process() {
+        let Some(dir) = authority_process_dir() else {
+            return;
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime
+            .block_on(async {
+                install_verifying_authority(&dir).await?;
+                std::fs::write(dir.join("ready-jwks"), b"1")?;
+                wait_for_target_authority(&dir);
+                let config = test_config();
+                let ed = Arc::new(load_or_init_key_store(&dir, &config));
+                let pq = Arc::new(load_or_init_ml_dsa_key_store(&dir, &config));
+                let jwks = crate::services::oauth::jwks::jwks_through_production_path(
+                    ed,
+                    pq,
+                    authority_ca_key().verifying_key().to_bytes(),
+                )
+                .await?;
+                std::fs::write(dir.join("jwks-response.json"), serde_json::to_vec(&jwks)?)?;
+                verify_returned_tokens(&dir, "jwks").await?;
+                anyhow::Ok(())
+            })
+            .unwrap();
+        wait_for_done(&dir);
+    }
+
+    #[test]
+    fn composite_rpc_production_process() {
+        let Some(dir) = authority_process_dir() else {
+            return;
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime
+            .block_on(async {
+                install_verifying_authority(&dir).await?;
+                std::fs::write(dir.join("ready-rpc"), b"1")?;
+                wait_for_target_authority(&dir);
+                verify_returned_tokens(&dir, "rpc").await
+            })
+            .unwrap();
+        wait_for_done(&dir);
+    }
+
+    #[test]
+    fn composite_stale_policy_production_process() {
+        let Some(dir) = authority_process_dir() else {
+            return;
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime
+            .block_on(async {
+                install_signing_authority(&dir, false).await?;
+                std::fs::write(dir.join("ready-stale-policy"), b"1")?;
+                wait_path(&dir.join("stale-attempt-gate"));
+                let now = chrono::Utc::now().timestamp();
+                let claims =
+                    hyprstream_rpc::auth::Claims::new("stale-policy".to_owned(), now, now + 60)
+                        .with_issuer("https://multiprocess.test".to_owned())
+                        .with_audience(Some("multiprocess".to_owned()));
+                let db = dir.join(format!("stale-policy-db-{}", std::process::id()));
+                std::fs::create_dir_all(&db)?;
+                let result = crate::services::PolicyService::sign_token_through_production_path(
+                    &db, &claims,
+                )
+                .await;
+                anyhow::ensure!(result.is_err(), "stale PolicyService minted a token");
+                std::fs::write(dir.join("stale-policy-refused"), b"1")?;
+                anyhow::Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn composite_stale_writer_process() {
+        let Some(dir) = authority_process_dir() else {
+            return;
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime
+            .block_on(async {
+                let (ed, pq) = install_signing_authority(&dir, false).await?;
+                let expected = hyprstream_rpc::auth::global_composite_key_set()
+                    .snapshot()
+                    .component_digest()
+                    .to_owned();
+                std::fs::write(dir.join("ready-stale-writer"), b"1")?;
+                wait_path(&dir.join("stale-attempt-gate"));
+                let result =
+                    refresh_composite_key_set(&dir, &ed, &pq, authority_ca_key(), 300, &expected)
+                        .await;
+                let error = result.expect_err("stale writer publication unexpectedly succeeded");
+                anyhow::ensure!(
+                    error
+                        .to_string()
+                        .contains("stale composite component authority"),
+                    "unexpected stale writer error: {error:#}"
+                );
+                std::fs::write(dir.join("stale-writer-refused"), error.to_string())?;
+                anyhow::Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn composite_restart_rpc_production_process() {
+        let Some(dir) = authority_process_dir() else {
+            return;
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime
+            .block_on(async {
+                install_verifying_authority(&dir).await?;
+                verify_through_production_request_service(std::fs::read_to_string(
+                    dir.join("old-oauth-token"),
+                )?)
+                .await?;
+                std::fs::write(dir.join("restart-drain-verified"), b"1")?;
+                anyhow::Ok(())
+            })
+            .unwrap();
+    }
+
+    fn spawn_production_authority_process(dir: &Path, test_name: &str) -> std::process::Child {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env("HYPRSTREAM_COMPOSITE_PRODUCTION_TEST_DIR", dir)
+            .env("HYPRSTREAM_ENVELOPE_POLICY", "hybrid")
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn composite_authority_production_paths_reject_semantic_rollback() {
+        const ORCHESTRATOR_DIR: &str = "HYPRSTREAM_COMPOSITE_ORCHESTRATOR_TEST_DIR";
+        if std::env::var_os(ORCHESTRATOR_DIR).is_none() {
+            let test_tmp = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/composite-authority-tests");
+            std::fs::create_dir_all(&test_tmp).unwrap();
+            let dir = TempDir::new_in(test_tmp).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "auth::key_rotation::tests::composite_authority_production_paths_reject_semantic_rollback",
+                    "--nocapture",
+                ])
+                .env(ORCHESTRATOR_DIR, dir.path())
+                .env("HYPRSTREAM_ENVELOPE_POLICY", "hybrid")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        struct AuthorityTestDir(PathBuf);
+        impl AuthorityTestDir {
+            fn path(&self) -> &Path {
+                &self.0
+            }
+        }
+        let dir = AuthorityTestDir(PathBuf::from(std::env::var_os(ORCHESTRATOR_DIR).unwrap()));
         let config = test_config();
         let now = chrono::Utc::now().timestamp();
         let old_ed = KeySlot::new(SigningKey::from_bytes(&[0x11; 32]), now - 10, now + 600);
@@ -1638,10 +2107,10 @@ mod tests {
         let old_pq = MlDsaKeySlot::new(old_pq_key, now - 10, now + 600);
         persist_slot(dir.path(), "active", &old_ed).unwrap();
         ml_dsa_rotation::persist_ml_dsa_slot(dir.path(), "active", &old_pq).unwrap();
-        let ca = Arc::new(SigningKey::from_bytes(&[0x5a; 32]));
+        let ca = authority_ca_key();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
         let old_ed_store = load_or_init_key_store(dir.path(), &config);
         let old_pq_store = load_or_init_ml_dsa_key_store(dir.path(), &config);
-        let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime
             .block_on(initialize_composite_key_set(
                 dir.path(),
@@ -1651,28 +2120,59 @@ mod tests {
                 300,
             ))
             .unwrap();
-        let old_snapshot = hyprstream_rpc::auth::global_composite_key_set()
-            .mint_snapshot()
-            .unwrap();
-        let old_pair = old_snapshot
-            .active_signing_pair(hyprstream_rpc::auth::CompositePairRole::OAuth)
-            .unwrap();
-        let old_kid = old_pair.kid().to_owned();
-        let (old_pq_sign, old_ed_sign) = old_pair.signing_keys().unwrap();
-        let old_claims = hyprstream_rpc::auth::Claims::new("old".into(), now, now + 60)
-            .with_audience(Some("multiprocess".into()));
-        let old_token = crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
-            &old_claims,
-            &old_pq_sign,
-            &old_ed_sign,
-        );
+        let old_digest = hyprstream_rpc::auth::global_composite_key_set()
+            .snapshot()
+            .component_digest()
+            .to_owned();
 
-        let mut oauth = spawn_authority_child(dir.path(), "oauth", "service");
-        let mut policy = spawn_authority_child(dir.path(), "policy", "service");
-        let mut rpc = spawn_authority_child(dir.path(), "rpc", "service");
-        for role in ["oauth", "policy", "rpc"] {
-            wait_path(&dir.path().join(format!("ready-{role}")));
+        let mut old_oauth = spawn_production_authority_process(
+            dir.path(),
+            "auth::key_rotation::tests::composite_old_oauth_production_process",
+        );
+        wait_path(&dir.path().join("old-oauth-token"));
+        assert!(old_oauth.wait().unwrap().success());
+
+        let process_tests = [
+            (
+                "oauth",
+                "auth::key_rotation::tests::composite_oauth_production_process",
+            ),
+            (
+                "policy",
+                "auth::key_rotation::tests::composite_policy_production_process",
+            ),
+            (
+                "jwks",
+                "auth::key_rotation::tests::composite_jwks_production_process",
+            ),
+            (
+                "rpc",
+                "auth::key_rotation::tests::composite_rpc_production_process",
+            ),
+        ];
+        let mut services: Vec<_> = process_tests
+            .iter()
+            .map(|(_, test)| spawn_production_authority_process(dir.path(), test))
+            .collect();
+        let mut stale_policy = spawn_production_authority_process(
+            dir.path(),
+            "auth::key_rotation::tests::composite_stale_policy_production_process",
+        );
+        let mut stale_writer = spawn_production_authority_process(
+            dir.path(),
+            "auth::key_rotation::tests::composite_stale_writer_process",
+        );
+        for process in [
+            "oauth",
+            "policy",
+            "jwks",
+            "rpc",
+            "stale-policy",
+            "stale-writer",
+        ] {
+            wait_path(&dir.path().join(format!("ready-{process}")));
         }
+
         persist_slot(dir.path(), "drain", &old_ed).unwrap();
         ml_dsa_rotation::persist_ml_dsa_slot(dir.path(), "drain", &old_pq).unwrap();
         let new_ed = KeySlot::new(SigningKey::from_bytes(&[0x22; 32]), now, now + 1200);
@@ -1689,90 +2189,111 @@ mod tests {
                 &new_pq_store,
                 Arc::clone(&ca),
                 300,
+                &old_digest,
             ))
             .unwrap();
-        let snapshot = hyprstream_rpc::auth::global_composite_key_set()
-            .mint_snapshot()
-            .unwrap();
-        let version = snapshot.version();
-        assert!(
-            snapshot.pair(&old_kid).is_some(),
-            "rotation lost drain pair"
-        );
-        let pair = snapshot
-            .active_signing_pair(hyprstream_rpc::auth::CompositePairRole::OAuth)
-            .unwrap();
-        let (pq, ed) = pair.signing_keys().unwrap();
-        let claims = hyprstream_rpc::auth::Claims::new("oauth".into(), now, now + 60)
-            .with_audience(Some("multiprocess".into()));
-        let token = crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(&claims, &pq, &ed);
-        std::fs::write(dir.path().join("oauth-token"), token).unwrap();
-        std::fs::write(dir.path().join("target-version"), version.to_string()).unwrap();
-        for role in ["oauth", "policy", "rpc"] {
-            let verified = dir.path().join(format!("verified-{role}"));
-            wait_path(&verified);
-            assert_eq!(std::fs::read_to_string(verified).unwrap(), "1");
-        }
-        for role in ["oauth", "policy"] {
-            let path = dir.path().join(format!("token-{role}"));
-            wait_path(&path);
-            assert!(verify_authority_token(
-                &std::fs::read_to_string(path).unwrap()
-            ));
-        }
-
-        // A fresh verifier restores the persisted drain and accepts the old returned token.
-        std::fs::write(dir.path().join("oauth-token"), &old_token).unwrap();
-        let _ = std::fs::remove_file(dir.path().join("verified-restart"));
-        let mut restart = spawn_authority_child(dir.path(), "restart", "service");
-        wait_path(&dir.path().join("ready-restart"));
-        wait_path(&dir.path().join("verified-restart"));
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("verified-restart")).unwrap(),
-            "1"
-        );
-
-        std::fs::write(dir.path().join("done"), b"1").unwrap();
-        oauth.wait().unwrap();
-        policy.wait().unwrap();
-        rpc.wait().unwrap();
-        restart.wait().unwrap();
-
-        // Two real publishers serialize, advance twice, and cannot fork/overwrite.
-        for name in ["ready-pub-a", "ready-pub-b"] {
-            let _ = std::fs::remove_file(dir.path().join(name));
-        }
-        let _ = std::fs::remove_file(dir.path().join("publish-gate"));
-        let mut a = spawn_authority_child(dir.path(), "pub-a", "publisher");
-        let mut b = spawn_authority_child(dir.path(), "pub-b", "publisher");
-        wait_path(&dir.path().join("ready-pub-a"));
-        wait_path(&dir.path().join("ready-pub-b"));
-        std::fs::write(dir.path().join("publish-gate"), b"1").unwrap();
-        wait_path(&dir.path().join("published-pub-a"));
-        wait_path(&dir.path().join("published-pub-b"));
-        a.wait().unwrap();
-        b.wait().unwrap();
-        let va = std::fs::read_to_string(dir.path().join("published-pub-a"))
-            .unwrap()
-            .parse::<u64>()
-            .unwrap();
-        let vb = std::fs::read_to_string(dir.path().join("published-pub-b"))
-            .unwrap()
-            .parse::<u64>()
-            .unwrap();
-        assert_ne!(va, vb);
-        assert_eq!(va.max(vb), version + 2);
-        let ledger: CompositeLedger =
+        let committed: CompositeCommit =
+            serde_json::from_slice(&std::fs::read(composite_committed_path(dir.path())).unwrap())
+                .unwrap();
+        let ledger_after_rotation: CompositeLedger =
             serde_json::from_slice(&std::fs::read(composite_ledger_path(dir.path())).unwrap())
                 .unwrap();
-        assert_eq!(ledger.version, va.max(vb));
+        assert_eq!(committed.version, ledger_after_rotation.version);
         assert_eq!(
-            std::fs::read_to_string(composite_committed_path(dir.path()))
-                .unwrap()
-                .parse::<u64>()
-                .unwrap(),
-            ledger.version
+            committed.component_digest,
+            ledger_after_rotation.component_digest
         );
+        assert_ne!(committed.component_digest, old_digest);
+        std::fs::write(
+            dir.path().join("target-authority.json"),
+            serde_json::to_vec(&committed).unwrap(),
+        )
+        .unwrap();
+
+        wait_path(&dir.path().join("oauth-token"));
+        wait_path(&dir.path().join("policy-token"));
+        std::fs::write(dir.path().join("tokens-ready"), b"1").unwrap();
+        for process in ["oauth", "policy", "jwks", "rpc"] {
+            wait_path(&dir.path().join(format!("verified-{process}")));
+        }
+        wait_path(&dir.path().join("jwks-response.json"));
+        let jwks: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("jwks-response.json")).unwrap())
+                .unwrap();
+        assert_eq!(jwks["composite_version"].as_u64(), Some(committed.version));
+        assert_eq!(
+            jwks["composite_component_digest"].as_str(),
+            Some(committed.component_digest.as_str())
+        );
+        let active_kids: Vec<&str> = ledger_after_rotation
+            .pairs
+            .iter()
+            .filter(|pair| pair.state == "active")
+            .map(|pair| pair.kid.as_str())
+            .collect();
+        for kid in active_kids {
+            assert!(jwks["keys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|key| { key.get("kid").and_then(serde_json::Value::as_str) == Some(kid) }));
+        }
+
+        let mut restart = spawn_production_authority_process(
+            dir.path(),
+            "auth::key_rotation::tests::composite_restart_rpc_production_process",
+        );
+        wait_path(&dir.path().join("restart-drain-verified"));
+        assert!(restart.wait().unwrap().success());
+
+        std::fs::write(dir.path().join("stale-attempt-gate"), b"1").unwrap();
+        wait_path(&dir.path().join("stale-policy-refused"));
+        wait_path(&dir.path().join("stale-writer-refused"));
+        assert!(stale_policy.wait().unwrap().success());
+        assert!(stale_writer.wait().unwrap().success());
+        let ledger_after_stale: CompositeLedger =
+            serde_json::from_slice(&std::fs::read(composite_ledger_path(dir.path())).unwrap())
+                .unwrap();
+        assert_eq!(ledger_after_stale.version, ledger_after_rotation.version);
+        assert_eq!(
+            ledger_after_stale.component_digest,
+            ledger_after_rotation.component_digest
+        );
+        assert_eq!(
+            ledger_after_stale.pairs.len(),
+            ledger_after_rotation.pairs.len()
+        );
+        for pair in &ledger_after_rotation.pairs {
+            assert!(ledger_after_stale.pairs.iter().any(|candidate| {
+                candidate.kid == pair.kid
+                    && candidate.role == pair.role
+                    && candidate.state == pair.state
+            }));
+        }
+        let committed_after_stale: CompositeCommit =
+            serde_json::from_slice(&std::fs::read(composite_committed_path(dir.path())).unwrap())
+                .unwrap();
+        assert_eq!(committed_after_stale.version, committed.version);
+        assert_eq!(
+            committed_after_stale.component_digest,
+            committed.component_digest
+        );
+        runtime
+            .block_on(async {
+                for token_file in ["oauth-token", "policy-token"] {
+                    verify_through_production_request_service(std::fs::read_to_string(
+                        dir.path().join(token_file),
+                    )?)
+                    .await?;
+                }
+                anyhow::Ok(())
+            })
+            .unwrap();
+
+        std::fs::write(dir.path().join("done"), b"1").unwrap();
+        for service in &mut services {
+            assert!(service.wait().unwrap().success());
+        }
     }
 
     #[test]
@@ -2067,6 +2588,7 @@ mod tests {
         .await
         .unwrap();
         let initial = hyprstream_rpc::auth::global_composite_key_set().snapshot();
+        let initial_component_digest = initial.component_digest().to_owned();
         let old_pair = initial
             .active_signing_pair(hyprstream_rpc::auth::CompositePairRole::OAuth)
             .unwrap();
@@ -2083,8 +2605,10 @@ mod tests {
 
         // Deterministic joint promotion: old exact pair becomes drain and a
         // new exact pair becomes active in one publication.
-        let new_ed = KeySlot::new(SigningKey::from_bytes(&[93; 32]), now, now + 1200);
-        let new_pq = generate_ml_dsa_slot(now, now + 1200);
+        // Keep the active generation outside the configured lead window so a
+        // restart reloads this exact persisted component generation.
+        let new_ed = KeySlot::new(SigningKey::from_bytes(&[93; 32]), now, now + 15 * 86_400);
+        let new_pq = generate_ml_dsa_slot(now, now + 15 * 86_400);
         persist_slot(dir.path(), "drain", &old_ed).unwrap();
         persist_slot(dir.path(), "active", &new_ed).unwrap();
         persist_ml_dsa_slot(dir.path(), "drain", &old_pq).unwrap();
@@ -2105,6 +2629,7 @@ mod tests {
             &rotated_pq,
             Arc::clone(&ca),
             drain_secs,
+            &initial_component_digest,
         )
         .await
         .unwrap();

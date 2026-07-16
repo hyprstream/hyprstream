@@ -31,7 +31,50 @@ pub fn compute_rsa_kid(n: &str, e: &str) -> String {
 
 /// GET /oauth/jwks
 pub async fn jwks(State(state): State<Arc<OAuthState>>) -> impl IntoResponse {
-    Json(serde_json::json!({ "keys": jwks_json(&state).await }))
+    let snapshot = hyprstream_rpc::auth::global_composite_key_set().snapshot();
+    Json(serde_json::json!({
+        "keys": jwks_json(&state).await,
+        "composite_version": snapshot.version(),
+        "composite_component_digest": snapshot.component_digest(),
+    }))
+}
+
+#[cfg(test)]
+pub(crate) async fn jwks_through_production_path(
+    ed_store: Arc<crate::auth::SigningKeyStore>,
+    pq_store: Arc<crate::auth::MlDsaSigningKeyStore>,
+    verifying_key: [u8; 32],
+) -> anyhow::Result<serde_json::Value> {
+    let client_key = hyprstream_rpc::prelude::SigningKey::from_bytes(&[0x7b; 32]);
+    let processor: Arc<dyn hyprstream_rpc::transport::rpc_session::IrohRequestProcessor> =
+        Arc::new(hyprstream_rpc::transport::rpc_session::from_fn(|_| async {
+            Ok(bytes::Bytes::new())
+        }));
+    hyprstream_rpc::dial::register_inproc("multiprocess-jwks-unused-policy", &processor);
+    hyprstream_rpc::dial::register_inproc("multiprocess-jwks-unused-discovery", &processor);
+    let policy_client = crate::services::PolicyClient::for_endpoint(
+        "inproc://multiprocess-jwks-unused-policy",
+        client_key.clone(),
+        client_key.verifying_key(),
+        None,
+    )?;
+    let discovery_client = crate::services::DiscoveryClient::for_endpoint(
+        "inproc://multiprocess-jwks-unused-discovery",
+        client_key,
+        ed25519_dalek::SigningKey::from_bytes(&[0x7c; 32]).verifying_key(),
+        None,
+    )?;
+    let state = OAuthState::new(
+        &crate::config::OAuthConfig::default(),
+        policy_client,
+        discovery_client,
+        verifying_key,
+    )
+    .with_signing_key_store(ed_store)
+    .with_ml_dsa_key_store(pq_store);
+    let response = jwks(State(Arc::new(state))).await.into_response();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
+    Ok(serde_json::from_slice(&body)?)
 }
 
 /// Build the public JWKS key array shared by `/oauth/jwks` and the SPIFFE

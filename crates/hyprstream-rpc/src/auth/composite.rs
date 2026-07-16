@@ -120,12 +120,16 @@ impl CompositeKeyPair {
 #[derive(Clone)]
 pub struct CompositeKeySetSnapshot {
     version: u64,
+    component_digest: Arc<str>,
     pairs: Arc<[CompositeKeyPair]>,
 }
 
 impl CompositeKeySetSnapshot {
     pub fn version(&self) -> u64 {
         self.version
+    }
+    pub fn component_digest(&self) -> &str {
+        &self.component_digest
     }
     pub fn pairs(&self) -> &[CompositeKeyPair] {
         &self.pairs
@@ -163,6 +167,7 @@ impl Default for CompositeKeySet {
         Self {
             snapshot: RwLock::new(Arc::new(CompositeKeySetSnapshot {
                 version: 0,
+                component_digest: Arc::from(""),
                 pairs: Arc::from([]),
             })),
             authority: RwLock::new(None),
@@ -201,26 +206,51 @@ impl CompositeKeySet {
         flock(lock.as_raw_fd(), FlockArg::LockShared)?;
         let snapshot = self.snapshot();
         let ledger: serde_json::Value = serde_json::from_slice(&std::fs::read(&authority.ledger)?)?;
-        let disk = ledger
+        let disk_version = ledger
             .get("version")
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| anyhow::anyhow!("composite ledger version missing"))?;
-        let committed = std::fs::read_to_string(&authority.committed)?
-            .trim()
-            .parse::<u64>()?;
+        let disk_digest = ledger
+            .get("component_digest")
+            .and_then(serde_json::Value::as_str)
+            .filter(|digest| !digest.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("composite ledger component digest missing"))?;
+        let committed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&authority.committed)?)?;
+        let committed_version = committed
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("committed composite version missing"))?;
+        let committed_digest = committed
+            .get("component_digest")
+            .and_then(serde_json::Value::as_str)
+            .filter(|digest| !digest.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("committed component digest missing"))?;
         anyhow::ensure!(
-            snapshot.version == disk && snapshot.version == committed,
+            snapshot.version == disk_version
+                && snapshot.version == committed_version
+                && snapshot.component_digest() == disk_digest
+                && snapshot.component_digest() == committed_digest,
             "composite signing authority is stale or cutover is pending"
         );
         Ok(snapshot)
     }
 
     /// Atomically replace the complete ledger. Versions must increase.
-    pub fn publish(&self, version: u64, pairs: Vec<CompositeKeyPair>) -> anyhow::Result<()> {
+    pub fn publish(
+        &self,
+        version: u64,
+        component_digest: String,
+        pairs: Vec<CompositeKeyPair>,
+    ) -> anyhow::Result<()> {
         let mut guard = self.snapshot.write();
         anyhow::ensure!(
             version > guard.version,
             "composite key-set version must increase"
+        );
+        anyhow::ensure!(
+            !component_digest.is_empty(),
+            "composite component digest must not be empty"
         );
         let mut kids = std::collections::HashSet::new();
         let mut active_roles = std::collections::HashSet::new();
@@ -239,6 +269,7 @@ impl CompositeKeySet {
         }
         *guard = Arc::new(CompositeKeySetSnapshot {
             version,
+            component_digest: Arc::from(component_digest),
             pairs: pairs.into(),
         });
         Ok(())
@@ -320,7 +351,8 @@ mod tests {
         let keys = Arc::new(CompositeKeySet::default());
         let old = pair(1);
         let old_kid = old.kid().to_owned();
-        keys.publish(1, vec![old.clone()]).unwrap();
+        keys.publish(1, "generation-1".into(), vec![old.clone()])
+            .unwrap();
         let ed_promotion = Arc::new(Barrier::new(2));
         let pq_promotion = Arc::new(Barrier::new(2));
         let mint_barrier = Arc::new(Barrier::new(2));
@@ -377,7 +409,8 @@ mod tests {
         mint_barrier.wait();
         let mut old_drain = old;
         old_drain.state = CompositePairState::Drain;
-        keys.publish(2, vec![old_drain, promoted.clone()]).unwrap();
+        keys.publish(2, "generation-2".into(), vec![old_drain, promoted.clone()])
+            .unwrap();
         publication_barrier.wait();
         verify_barrier.wait();
         jwks_barrier.wait();
@@ -390,7 +423,8 @@ mod tests {
 
         // Drain expiry/revocation is a later atomic publication: the old pair
         // disappears completely, while the new exact pair remains usable.
-        keys.publish(3, vec![promoted]).unwrap();
+        keys.publish(3, "generation-3".into(), vec![promoted])
+            .unwrap();
         let after = keys.snapshot();
         assert_eq!(after.version(), 3);
         assert!(after.pair(&promoted_kid).is_some());
@@ -405,23 +439,35 @@ mod tests {
 
     #[test]
     fn mint_snapshot_fails_closed_for_missing_pending_and_stale_authority() {
-        let dir = std::env::temp_dir().join(format!(
-            "hyprstream-composite-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("hyprstream-composite-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let ledger = dir.join("ledger.json");
         let committed = dir.join("committed");
         let keys = CompositeKeySet::default();
         keys.configure_authority(ledger.clone(), committed.clone(), dir.join("lock"));
-        keys.publish(1, vec![pair(9)]).unwrap();
+        keys.publish(1, "generation-1".into(), vec![pair(9)])
+            .unwrap();
         assert!(keys.mint_snapshot().is_err());
-        std::fs::write(&ledger, br#"{"version":2}"#).unwrap();
-        std::fs::write(&committed, b"1").unwrap();
+        std::fs::write(
+            &ledger,
+            br#"{"version":2,"component_digest":"generation-2"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &committed,
+            br#"{"version":1,"component_digest":"generation-1"}"#,
+        )
+        .unwrap();
         assert!(keys.mint_snapshot().is_err(), "pending cutover minted");
-        std::fs::write(&committed, b"2").unwrap();
+        std::fs::write(
+            &committed,
+            br#"{"version":2,"component_digest":"generation-2"}"#,
+        )
+        .unwrap();
         assert!(keys.mint_snapshot().is_err(), "stale cache minted");
-        keys.publish(2, vec![pair(10)]).unwrap();
+        keys.publish(2, "generation-2".into(), vec![pair(10)])
+            .unwrap();
         assert_eq!(keys.mint_snapshot().unwrap().version(), 2);
         std::fs::remove_dir_all(dir).unwrap();
     }
