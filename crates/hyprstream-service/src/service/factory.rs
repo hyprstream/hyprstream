@@ -55,6 +55,7 @@ impl NativeServiceAnnouncement {
         anyhow::ensure!(self.response_key_id.starts_with(&format!("{}#", self.service_did)), "response key id crosses service authority");
         anyhow::ensure!(self.request_kem_key_id.starts_with(&format!("{}#", self.service_did)), "KEM key id crosses service authority");
         anyhow::ensure!(self.request_kem_recipient.suite_id == hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768, "native announcement requires hybrid KEM suite");
+        self.request_kem_recipient.validate()?;
         anyhow::ensure!(self.accepted_state_epoch > 0 && self.accepted_state_expires_at_unix_ms > chrono::Utc::now().timestamp_millis(), "accepted state is unbounded or expired");
         Ok(())
     }
@@ -869,5 +870,25 @@ mod tests {
 
         let factory = ServiceFactory::new("test", dummy_factory);
         assert_eq!(factory.name, "test");
+    }
+
+    #[test]
+    fn native_announcement_rejects_incomplete_hybrid_recipient() {
+        let signer = SigningKey::from_bytes(&[0x51; 32]);
+        let announcement = NativeServiceAnnouncement {
+            service_did: hyprstream_rpc::identity::Did::from("did:at9p:test"),
+            capabilities: vec!["hyprstream-rpc/1".to_owned()],
+            accepted_state_digest: [0x31; 64],
+            accepted_state_epoch: 1,
+            accepted_state_expires_at_unix_ms: i64::MAX,
+            response_key_id: "did:at9p:test#response".to_owned(),
+            response_verifying_key: signer.verifying_key().to_bytes(),
+            request_kem_key_id: "did:at9p:test#kem".to_owned(),
+            request_kem_recipient: hyprstream_rpc::crypto::hybrid_kem::RecipientPublic {
+                suite_id: hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+                eks: Vec::new(),
+            },
+        };
+        assert!(announcement.validate("model", &signer.verifying_key()).is_err());
     }
 }

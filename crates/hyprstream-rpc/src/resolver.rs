@@ -312,7 +312,12 @@ impl ResolvedRpcClient {
                 let client = self.client_for(&snapshot)?;
                 match call(client).await {
                     Ok(value) => return Ok(value),
-                    Err(error) => last_transport_error = Some(error),
+                    Err(error)
+                        if crate::transport_traits::is_pre_dispatch_transport_error(&error) =>
+                    {
+                        last_transport_error = Some(error);
+                    }
+                    Err(error) => return Err(error),
                 }
             }
             if let Some(error) = invalidated {
@@ -981,6 +986,20 @@ mod tests {
         );
         assert_eq!(resolver.resolves.load(Ordering::SeqCst), 2);
         assert_eq!(resolver.checks.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn only_explicit_pre_dispatch_errors_are_retry_safe() {
+        let ordinary = anyhow!("service rejected request after dispatch");
+        assert!(!crate::transport_traits::is_pre_dispatch_transport_error(
+            &ordinary
+        ));
+        let marked = anyhow::Error::new(
+            crate::transport_traits::PreDispatchTransportError::new(anyhow!("dial refused")),
+        );
+        assert!(crate::transport_traits::is_pre_dispatch_transport_error(
+            &marked
+        ));
     }
 
     #[test]

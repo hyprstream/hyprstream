@@ -233,7 +233,9 @@ impl Transport for LazyIrohTransport {
     type Pub = IrohPublishStub;
 
     async fn send(&self, payload: Vec<u8>, timeout_ms: Option<i32>) -> Result<Vec<u8>> {
-        let transport = self.connected().await?;
+        let transport = self.connected().await.map_err(|error| {
+            crate::transport_traits::PreDispatchTransportError::new(error)
+        })?;
 
         // Our deadline is authoritative so a per-request timeout (busy peer —
         // keep the session) is distinguishable from a transport-fatal error

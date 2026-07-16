@@ -1851,7 +1851,8 @@ fn main() -> Result<()> {
             let registry_vk = resolve_service_vk("registry")
                 .ok_or_else(|| anyhow::anyhow!("Cannot resolve registry pubkey. Run wizard."))?;
 
-            let client = hyprstream_core::services::RegistryClient::from_installed_resolver(
+            // Pre-Discovery CLI bootstrap: the identity-bound resolver is not installed yet.
+            let client = hyprstream_core::services::RegistryClient::for_local_bootstrap(
                 signing_key.clone(),
                 registry_vk,
                 None,

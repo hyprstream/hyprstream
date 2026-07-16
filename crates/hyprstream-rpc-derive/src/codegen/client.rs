@@ -684,6 +684,15 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
                 destination: hyprstream_rpc::crypto::VerifyingKey,
                 token: Option<String>,
             ) -> anyhow::Result<Self> {
+                anyhow::ensure!(
+                    matches!(
+                        &transport.endpoint,
+                        hyprstream_rpc::transport::EndpointType::Inproc { .. }
+                            | hyprstream_rpc::transport::EndpointType::Ipc { .. }
+                            | hyprstream_rpc::transport::EndpointType::SystemdFd { .. }
+                    ),
+                    "local bootstrap refuses network transport; use the identity-bound resolver",
+                );
                 let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key);
                 let rpc = hyprstream_rpc::dial::dial(transport, signer, Some(destination), token)?;
                 Ok(Self::new(rpc))
@@ -792,6 +801,15 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
                 transport: &hyprstream_rpc::transport::TransportConfig,
                 provider: &dyn hyprstream_rpc::identity::IdentityProvider,
             ) -> anyhow::Result<Self> {
+                anyhow::ensure!(
+                    matches!(
+                        &transport.endpoint,
+                        hyprstream_rpc::transport::EndpointType::Inproc { .. }
+                            | hyprstream_rpc::transport::EndpointType::Ipc { .. }
+                            | hyprstream_rpc::transport::EndpointType::SystemdFd { .. }
+                    ),
+                    "local bootstrap refuses network transport; use the identity-bound resolver",
+                );
                 let handle = provider.identity_open(concat!("hyprstream-", #service_name_lit, "-v1")).await?;
                 let pubkey = handle.pubkey();
                 let server_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(&pubkey)
@@ -1755,6 +1773,12 @@ mod resolved_service_codegen_tests {
         assert!(generated.contains("from_service_resolver"));
         assert!(generated.contains("ResolvedRpcClient"));
         assert!(generated.contains("from_installed_resolver"));
+        assert_eq!(
+            generated
+                .matches("local bootstrap refuses network transport")
+                .count(),
+            2,
+        );
         assert!(!generated.contains("pub fn for_service"));
         assert!(!generated.contains("pub async fn from_provider"));
         assert!(generated.contains("for_local_bootstrap"));
@@ -1779,12 +1803,17 @@ mod resolved_service_codegen_tests {
                 } else if path.extension().and_then(|v| v.to_str()) == Some("rs") {
                     let source = std::fs::read_to_string(&path).expect("read Rust source");
                     ordinary += source.matches("::from_installed_resolver(").count();
+                    let registry_cli_bootstrap = path.ends_with("bin/main.rs")
+                        && source.contains("Pre-Discovery CLI bootstrap")
+                        && source.matches("RegistryClient::for_local_bootstrap(").count() == 1;
                     for line in source
                         .lines()
                         .filter(|line| line.contains("::for_local_bootstrap("))
                     {
                         assert!(
-                            line.contains("PolicyClient") || line.contains("DiscoveryClient"),
+                            line.contains("PolicyClient")
+                                || line.contains("DiscoveryClient")
+                                || (registry_cli_bootstrap && line.contains("RegistryClient")),
                             "non-bootstrap application client bypasses installed resolver in {}: {line}",
                             path.display(),
                         );

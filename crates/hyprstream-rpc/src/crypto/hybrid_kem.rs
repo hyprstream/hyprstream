@@ -570,7 +570,7 @@ impl RecipientPublic {
     /// Validate component count, order-by-position, and public-key lengths
     /// before callers encode or perform KEM work on manually constructed public
     /// material.
-    pub(crate) fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         let components = self.suite_id.components();
         if self.eks.len() != components.len() {
             bail!(
