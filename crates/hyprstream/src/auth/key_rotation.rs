@@ -182,11 +182,27 @@ fn read_committed_composite_ledger(
 ) -> anyhow::Result<(CompositeCommit, CompositeLedger)> {
     let commit: CompositeCommit =
         serde_json::from_slice(&std::fs::read(composite_committed_path(dir))?)?;
-    let immutable = composite_committed_ledger_path(dir, &commit);
+    let ledger = read_composite_ledger_selected_by_commit(dir, &commit)?;
+    Ok((commit, ledger))
+}
+
+fn read_composite_ledger_selected_by_commit(
+    dir: &Path,
+    commit: &CompositeCommit,
+) -> anyhow::Result<CompositeLedger> {
+    let immutable = composite_committed_ledger_path(dir, commit);
     let ledger: CompositeLedger = match std::fs::read(&immutable) {
         Ok(bytes) => serde_json::from_slice(&bytes)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            serde_json::from_slice(&std::fs::read(composite_ledger_path(dir))?)?
+            match std::fs::symlink_metadata(&immutable) {
+                Err(metadata_error)
+                    if metadata_error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    serde_json::from_slice(&std::fs::read(composite_ledger_path(dir))?)?
+                }
+                Ok(_) => return Err(error.into()),
+                Err(metadata_error) => return Err(metadata_error.into()),
+            }
         }
         Err(error) => return Err(error.into()),
     };
@@ -196,7 +212,49 @@ fn read_committed_composite_ledger(
             && ledger.component_digest == commit.component_digest,
         "committed composite ledger does not match its commit marker"
     );
-    Ok((commit, ledger))
+    Ok(ledger)
+}
+
+/// Load the marker-selected authority while the caller holds the exclusive
+/// ledger lock. Only an absent marker means first bootstrap. A legacy marker
+/// whose matching generation still lives in the mutable ledger is migrated to
+/// an immutable snapshot before the lock can be released and a publisher can
+/// replace the mutable file.
+fn load_or_migrate_committed_composite_ledger(
+    dir: &Path,
+) -> anyhow::Result<Option<CompositeLedger>> {
+    let marker_path = composite_committed_path(dir);
+    let marker_bytes = match std::fs::read(&marker_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(&marker_path) {
+                Err(metadata_error)
+                    if metadata_error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    return Ok(None);
+                }
+                Ok(_) => return Err(error.into()),
+                Err(metadata_error) => return Err(metadata_error.into()),
+            }
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let commit: CompositeCommit = serde_json::from_slice(&marker_bytes)?;
+    let immutable = composite_committed_ledger_path(dir, &commit);
+    let immutable_missing = match std::fs::symlink_metadata(&immutable) {
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => return Err(error.into()),
+    };
+    let ledger = read_composite_ledger_selected_by_commit(dir, &commit)?;
+    if immutable_missing {
+        let name = immutable
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("invalid committed composite ledger path"))?;
+        super::identity_store::write_secret(dir, name, &serde_json::to_vec(&ledger)?)?;
+    }
+    Ok(Some(ledger))
 }
 
 fn digest_component_slot(
@@ -604,9 +662,7 @@ async fn publish_composite_key_set(
         .write(true)
         .open(composite_ledger_lock_path(secrets_dir))?;
     flock(ledger_lock.as_raw_fd(), FlockArg::LockExclusive)?;
-    let persisted = read_committed_composite_ledger(secrets_dir)
-        .ok()
-        .map(|(_, ledger)| ledger);
+    let persisted = load_or_migrate_committed_composite_ledger(secrets_dir)?;
     let restoring_committed = restore && persisted.is_some();
     let persisted_version = persisted.as_ref().map_or(0, |ledger| ledger.version);
     let persisted_digest = persisted
@@ -2594,15 +2650,17 @@ mod tests {
                     dpop_jkt: None,
                 })
                 .await?;
-            let response = reqwest::Client::new()
+            let client = reqwest::Client::new();
+            let authorization_code_form = [
+                ("grant_type", "authorization_code"),
+                ("client_id", "multiprocess-client"),
+                ("code", "multiprocess-code"),
+                ("redirect_uri", "https://client.test/callback"),
+                ("code_verifier", "multiprocess-pkce-verifier"),
+            ];
+            let response = client
                 .post(format!("{oauth_url}/oauth/token"))
-                .form(&[
-                    ("grant_type", "authorization_code"),
-                    ("client_id", "multiprocess-client"),
-                    ("code", "multiprocess-code"),
-                    ("redirect_uri", "https://client.test/callback"),
-                    ("code_verifier", "multiprocess-pkce-verifier"),
-                ])
+                .form(&authorization_code_form)
                 .send()
                 .await?;
             if !response.status().is_success() {
@@ -2611,10 +2669,28 @@ mod tests {
                 anyhow::bail!("pre-rotation OAuth endpoint returned {status}: {body}");
             }
             let body: serde_json::Value = response.json().await?;
-            body.get("access_token")
+            let token = body
+                .get("access_token")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
-                .ok_or_else(|| anyhow::anyhow!("pre-rotation OAuth response omitted access_token"))
+                .ok_or_else(|| anyhow::anyhow!("pre-rotation OAuth response omitted access_token"))?;
+            let replay = client
+                .post(format!("{oauth_url}/oauth/token"))
+                .form(&authorization_code_form)
+                .send()
+                .await?;
+            anyhow::ensure!(
+                replay.status() == reqwest::StatusCode::BAD_REQUEST,
+                "authorization-code replay returned {}, expected 400",
+                replay.status()
+            );
+            let replay_body: serde_json::Value = replay.json().await?;
+            anyhow::ensure!(
+                replay_body.get("error").and_then(serde_json::Value::as_str)
+                    == Some("invalid_grant"),
+                "authorization-code replay was not rejected as invalid_grant: {replay_body}"
+            );
+            anyhow::Ok(token)
         }).unwrap();
         std::fs::write(dir.path().join("old-oauth-token"), old_token).unwrap();
 
@@ -2649,6 +2725,31 @@ mod tests {
             ledger_after_rotation.component_digest
         );
         assert_ne!(committed.component_digest, old_digest);
+
+        // Recreate a round-three committed-B layout (marker + matching mutable
+        // ledger, no immutable B). The production initializer must migrate B
+        // while holding the ledger lock, before either failure writer can
+        // replace the mutable file with pending C.
+        let committed_immutable = composite_committed_ledger_path(dir.path(), &committed);
+        std::fs::remove_file(&committed_immutable).unwrap();
+        runtime
+            .block_on(initialize_composite_key_set(
+                dir.path(),
+                &new_ed_store,
+                &new_pq_store,
+                Arc::clone(&ca),
+                300,
+            ))
+            .unwrap();
+        let migrated: CompositeLedger =
+            serde_json::from_slice(&std::fs::read(&committed_immutable).unwrap()).unwrap();
+        assert_eq!(migrated.version, committed.version);
+        assert_eq!(migrated.component_digest, committed.component_digest);
+        assert_eq!(
+            std::fs::read(composite_ledger_path(dir.path())).unwrap(),
+            serde_json::to_vec(&ledger_after_rotation).unwrap(),
+            "legacy migration changed mutable B before pending C was staged"
+        );
         std::fs::write(
             dir.path().join("target-authority.json"),
             serde_json::to_vec(&committed).unwrap(),
@@ -3204,6 +3305,165 @@ mod tests {
         );
         assert!(slots.drain.is_some());
         assert!(slots.lead.is_none());
+    }
+
+    #[tokio::test]
+    async fn committed_marker_failures_never_reinitialize_from_mutable_authority() {
+        const ISOLATED: &str = "HYPRSTREAM_COMPOSITE_FAIL_CLOSED_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "auth::key_rotation::tests::committed_marker_failures_never_reinitialize_from_mutable_authority",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        enum ImmutableFailure {
+            Missing,
+            Corrupt,
+            Mismatched,
+            Unavailable,
+        }
+
+        for failure in [
+            ImmutableFailure::Missing,
+            ImmutableFailure::Corrupt,
+            ImmutableFailure::Mismatched,
+            ImmutableFailure::Unavailable,
+        ] {
+            let dir = TempDir::new().unwrap();
+            let config = test_config();
+            let ca = Arc::new(SigningKey::from_bytes(&[0x6a; 32]));
+            let ed = load_or_init_key_store(dir.path(), &config);
+            let pq = load_or_init_ml_dsa_key_store(dir.path(), &config);
+            initialize_composite_key_set(
+                dir.path(),
+                &ed,
+                &pq,
+                Arc::clone(&ca),
+                300,
+            )
+            .await
+            .unwrap();
+
+            let marker_bytes = std::fs::read(composite_committed_path(dir.path())).unwrap();
+            let commit: CompositeCommit = serde_json::from_slice(&marker_bytes).unwrap();
+            let immutable = composite_committed_ledger_path(dir.path(), &commit);
+            let mut pending: CompositeLedger = serde_json::from_slice(
+                &std::fs::read(composite_ledger_path(dir.path())).unwrap(),
+            )
+            .unwrap();
+            pending.version = pending.version.saturating_add(1);
+            pending.component_digest = "staged-component-C".to_owned();
+            let pending_bytes = serde_json::to_vec(&pending).unwrap();
+            std::fs::write(composite_ledger_path(dir.path()), &pending_bytes).unwrap();
+
+            match failure {
+                ImmutableFailure::Missing => std::fs::remove_file(&immutable).unwrap(),
+                ImmutableFailure::Corrupt => std::fs::write(&immutable, b"{").unwrap(),
+                ImmutableFailure::Mismatched => {
+                    std::fs::write(&immutable, &pending_bytes).unwrap();
+                }
+                ImmutableFailure::Unavailable => {
+                    std::fs::remove_file(&immutable).unwrap();
+                    std::fs::create_dir(&immutable).unwrap();
+                }
+            }
+
+            let error = initialize_composite_key_set(
+                dir.path(),
+                &ed,
+                &pq,
+                Arc::clone(&ca),
+                300,
+            )
+            .await
+            .expect_err("marker-selected authority failure must fail closed");
+            assert!(!error.to_string().is_empty());
+            assert_eq!(
+                std::fs::read(composite_committed_path(dir.path())).unwrap(),
+                marker_bytes,
+                "failure rewrote the committed marker"
+            );
+            assert_eq!(
+                std::fs::read(composite_ledger_path(dir.path())).unwrap(),
+                pending_bytes,
+                "failure published over staged mutable C"
+            );
+            assert!(
+                !composite_committed_ledger_path(
+                    dir.path(),
+                    &CompositeCommit {
+                        version: pending.version,
+                        component_digest: pending.component_digest.clone(),
+                    },
+                )
+                .exists(),
+                "failure materialized staged C as committed authority"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn first_bootstrap_and_locked_legacy_migration_are_distinct() {
+        const ISOLATED: &str = "HYPRSTREAM_COMPOSITE_LEGACY_MIGRATION_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "auth::key_rotation::tests::first_bootstrap_and_locked_legacy_migration_are_distinct",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let ca = Arc::new(SigningKey::from_bytes(&[0x6b; 32]));
+        let ed = load_or_init_key_store(dir.path(), &config);
+        let pq = load_or_init_ml_dsa_key_store(dir.path(), &config);
+
+        assert!(!composite_committed_path(dir.path()).exists());
+        initialize_composite_key_set(dir.path(), &ed, &pq, Arc::clone(&ca), 300)
+            .await
+            .unwrap();
+        let commit: CompositeCommit = serde_json::from_slice(
+            &std::fs::read(composite_committed_path(dir.path())).unwrap(),
+        )
+        .unwrap();
+        let immutable = composite_committed_ledger_path(dir.path(), &commit);
+        let committed_bytes = std::fs::read(&immutable).unwrap();
+
+        // Recreate the round-three layout, then restart through the production
+        // initializer. It must durably pin B before mutable C can be staged.
+        std::fs::remove_file(&immutable).unwrap();
+        initialize_composite_key_set(dir.path(), &ed, &pq, ca, 300)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&immutable).unwrap(), committed_bytes);
+
+        let mut pending: CompositeLedger =
+            serde_json::from_slice(&committed_bytes).unwrap();
+        pending.version = pending.version.saturating_add(1);
+        pending.component_digest = "staged-component-C".to_owned();
+        std::fs::write(
+            composite_ledger_path(dir.path()),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+        let (_, selected) = read_committed_composite_ledger(dir.path()).unwrap();
+        assert_eq!(selected.version, commit.version);
+        assert_eq!(selected.component_digest, commit.component_digest);
     }
 
     #[tokio::test]
