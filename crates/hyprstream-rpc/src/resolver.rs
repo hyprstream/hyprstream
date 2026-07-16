@@ -352,7 +352,7 @@ fn rejection_reason(
 /// Run a bounded retry over an already validated deterministic order.
 /// The callback cannot request or substitute any out-of-plan candidate.
 pub async fn retry_validated_candidates<T, F, Fut>(
-    ordered: Vec<ResolvedService>,
+    mut ordered: Vec<ResolvedService>,
     max_attempts: usize,
     mut attempt: F,
 ) -> anyhow::Result<T>
@@ -361,6 +361,39 @@ where
     Fut: std::future::Future<Output = anyhow::Result<T>>,
 {
     anyhow::ensure!(max_attempts > 0, "retry bound must be non-zero");
+    let authority = ordered
+        .first()
+        .ok_or_else(|| anyhow!("validated retry set is empty"))?;
+    anyhow::ensure!(
+        ordered.iter().all(|resolved| {
+            resolved.service_name == authority.service_name
+                && resolved.service_did == authority.service_did
+                && resolved.response_verifying_key == authority.response_verifying_key
+                && resolved.response_ml_dsa65 == authority.response_ml_dsa65
+                && resolved.response_key_id == authority.response_key_id
+                && resolved.request_kem_recipient == authority.request_kem_recipient
+                && resolved.evidence.accepted_state_digest
+                    == authority.evidence.accepted_state_digest
+                && resolved.evidence.accepted_state_epoch
+                    == authority.evidence.accepted_state_epoch
+        }),
+        "validated retry set crosses service authority"
+    );
+    ordered.sort_by(|a, b| {
+        b.expires_at_unix_ms
+            .cmp(&a.expires_at_unix_ms)
+            .then_with(|| {
+                transport_fingerprint(&a.transport).cmp(&transport_fingerprint(&b.transport))
+            })
+            .then_with(|| {
+                a.evidence
+                    .selected_fingerprint
+                    .cmp(&b.evidence.selected_fingerprint)
+            })
+    });
+    ordered.dedup_by(|a, b| {
+        a.evidence.selected_fingerprint == b.evidence.selected_fingerprint
+    });
     let mut last_error = None;
     for resolved in ordered.iter().take(max_attempts.min(16)) {
         match attempt(resolved).await {
@@ -368,7 +401,7 @@ where
             Err(error) => last_error = Some(error),
         }
     }
-    Err(last_error.unwrap_or_else(|| anyhow!("validated retry set is empty")))
+    Err(last_error.unwrap_or_else(|| anyhow!("validated retry set exhausted")))
 }
 
 /// Filter, canonicalize, rank, and select without insertion-order dependence.
@@ -781,34 +814,45 @@ mod tests {
 
     #[tokio::test]
     async fn retries_are_bounded_to_validated_order() {
+        let first_candidate = candidate(1, TransportConfig::iroh([1; 32], Vec::new(), None));
+        let mut second_candidate = first_candidate.clone();
+        second_candidate.transport = TransportConfig::iroh([2; 32], Vec::new(), None);
         let first = select_service_candidate(
             &network_query(),
-            vec![candidate(
-                1,
-                TransportConfig::iroh([1; 32], Vec::new(), None),
-            )],
+            vec![first_candidate],
             1_000,
         )
         .unwrap_or_else(|e| panic!("selection failed: {e}"));
         let second = select_service_candidate(
             &network_query(),
-            vec![candidate(
-                2,
-                TransportConfig::iroh([2; 32], Vec::new(), None),
-            )],
+            vec![second_candidate],
             1_000,
         )
         .unwrap_or_else(|e| panic!("selection failed: {e}"));
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let observed = Arc::clone(&seen);
         let result: anyhow::Result<()> =
-            retry_validated_candidates(vec![first, second], 1, move |resolved| {
+            retry_validated_candidates(vec![first, second.clone()], 1, move |resolved| {
                 observed.lock().push(resolved.service_did.clone());
                 std::future::ready(Err(anyhow!("sentinel dial failure")))
             })
             .await;
         assert!(result.is_err());
         assert_eq!(seen.lock().len(), 1);
+
+        let other = select_service_candidate(
+            &network_query(),
+            vec![candidate(
+                2,
+                TransportConfig::iroh([3; 32], Vec::new(), None),
+            )],
+            1_000,
+        )
+        .unwrap_or_else(|e| panic!("selection failed: {e}"));
+        let crossed: anyhow::Result<()> =
+            retry_validated_candidates(vec![second, other], 2, |_| std::future::ready(Ok(())))
+                .await;
+        assert!(crossed.is_err());
     }
 
     struct StaticResolver(TransportConfig);
