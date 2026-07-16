@@ -29,6 +29,7 @@ use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::did_url::percent_decode;
 use crate::registry::SocketKind;
 use crate::resolver::Resolver;
 use crate::service_entry::{decode_service_entry, DecodedEntry};
@@ -63,7 +64,7 @@ pub fn did_web_to_url(did: &str) -> Result<String> {
     // Colons delimit the host then path segments; percent-decode each.
     let mut segments = msi.split(':');
     let host_raw = segments.next().unwrap_or_default();
-    let host = percent_decode(host_raw);
+    let host = percent_decode(host_raw)?;
     if host.is_empty() {
         bail!("did:web has empty host: {did}");
     }
@@ -81,7 +82,7 @@ pub fn did_web_to_url(did: &str) -> Result<String> {
     // empty.)
     let mut path_segments: Vec<String> = Vec::new();
     for raw in segments.filter(|s| !s.is_empty()) {
-        let seg = percent_decode(raw);
+        let seg = percent_decode(raw)?;
         validate_path_segment(&seg, did)?;
         path_segments.push(seg);
     }
@@ -93,31 +94,6 @@ pub fn did_web_to_url(did: &str) -> Result<String> {
         // Path form → document at the joined path.
         Ok(format!("https://{host}/{}/did.json", path_segments.join("/")))
     }
-}
-
-/// Minimal percent-decoder for did:web identifier segments.
-///
-/// did:web only mandates that `:` (port / segment separators) be percent-encoded
-/// (`%3A`); a general decoder handles any `%XX`. Invalid escapes are left
-/// verbatim (defensive: never panic on malformed input).
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(hi), Some(lo)) = (hi, lo) {
-                out.push((hi * 16 + lo) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Reject a decoded host that contains path-injecting or control characters.
@@ -721,6 +697,12 @@ mod tests {
         assert!(did_web_to_url("did:key:z6Mk...").is_err());
         assert!(did_web_to_url("https://example.com").is_err());
         assert!(did_web_to_url("did:web:").is_err());
+    }
+
+    #[test]
+    fn url_rejects_invalid_utf8_percent_encoding() {
+        assert!(did_web_to_url("did:web:example%FF.com").is_err());
+        assert!(did_web_to_url("did:web:example.com:path%FE").is_err());
     }
 
     #[test]
