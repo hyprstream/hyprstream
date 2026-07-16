@@ -528,11 +528,11 @@ impl ServiceResolver for DiscoveryServiceResolver {
         resolved.ensure_fresh(unix_millis_now())?;
         let state = self
             .accepted_state_source
-            .accepted_state(resolved.service_did.as_str())?
+            .accepted_state(resolved.service_did().as_str())?
             .ok_or_else(|| anyhow::anyhow!("accepted state disappeared; re-resolution required"))?;
         anyhow::ensure!(
-            state.epoch == resolved.evidence.accepted_state_epoch
-                && state.head_digest == resolved.evidence.accepted_state_digest,
+            state.epoch == resolved.evidence().accepted_state_epoch
+                && state.head_digest == resolved.evidence().accepted_state_digest,
             "accepted state advanced or forked; re-resolution required"
         );
         let state_expiry = accepted_expiry_unix_ms(&state)?;
@@ -748,10 +748,10 @@ mod resolver_tests {
             .resolve_service(ServiceQuery::network("model").expect("query"))
             .await
             .unwrap_or_else(|e| panic!("production candidate rejected: {e}"));
-        assert_eq!(resolved.service_name, "model");
-        assert_eq!(resolved.evidence.accepted_state_epoch, 1);
-        assert!(resolved.service_did.is_did_at9p());
-        assert!(!resolved.request_kem_recipient.recipient.eks.is_empty());
+        assert_eq!(resolved.service_name(), "model");
+        assert_eq!(resolved.evidence().accepted_state_epoch, 1);
+        assert!(resolved.service_did().is_did_at9p());
+        assert!(!resolved.request_kem_recipient().recipient.eks.is_empty());
         resolver
             .ensure_current(&resolved)
             .await

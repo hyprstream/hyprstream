@@ -694,10 +694,10 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
                 token: Option<String>,
             ) -> anyhow::Result<Self> {
                 anyhow::ensure!(
-                    resolved.service_name == Self::SERVICE_NAME,
+                    resolved.service_name() == Self::SERVICE_NAME,
                     "resolved service name mismatch: expected {}, got {}",
                     Self::SERVICE_NAME,
-                    resolved.service_name,
+                    resolved.service_name(),
                 );
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -707,9 +707,9 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
                 let (request_kem_store, response_pq_store) = resolved.crypto_stores()?;
                 let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key);
                 let rpc = hyprstream_rpc::dial::dial_with_crypto_stores(
-                    &resolved.transport,
+                    resolved.transport(),
                     signer,
-                    Some(resolved.response_verifying_key),
+                    Some(resolved.response_verifying_key()),
                     token,
                     Some(request_kem_store),
                     Some(response_pq_store),

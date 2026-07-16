@@ -129,19 +129,51 @@ pub struct ResolutionEvidence {
 /// One identity-bound, owned service resolution result.
 #[derive(Debug, Clone)]
 pub struct ResolvedService {
-    pub service_name: String,
-    pub service_did: Did,
-    pub response_verifying_key: VerifyingKey,
-    pub response_ml_dsa65: Vec<u8>,
-    pub response_key_id: String,
-    pub request_kem_recipient: AnchoredKemRecipient,
-    pub transport: TransportConfig,
-    pub capabilities: BTreeSet<String>,
-    pub expires_at_unix_ms: i64,
-    pub evidence: ResolutionEvidence,
+    service_name: String,
+    service_did: Did,
+    response_verifying_key: VerifyingKey,
+    response_ml_dsa65: Vec<u8>,
+    response_key_id: String,
+    request_kem_recipient: AnchoredKemRecipient,
+    transport: TransportConfig,
+    capabilities: BTreeSet<String>,
+    expires_at_unix_ms: i64,
+    evidence: ResolutionEvidence,
 }
 
 impl ResolvedService {
+    pub fn service_name(&self) -> &str {
+        &self.service_name
+    }
+
+    pub fn service_did(&self) -> &Did {
+        &self.service_did
+    }
+
+    pub fn response_verifying_key(&self) -> VerifyingKey {
+        self.response_verifying_key
+    }
+
+    pub fn response_key_id(&self) -> &str {
+        &self.response_key_id
+    }
+
+    pub fn request_kem_recipient(&self) -> &AnchoredKemRecipient {
+        &self.request_kem_recipient
+    }
+
+    pub fn transport(&self) -> &TransportConfig {
+        &self.transport
+    }
+
+    pub fn capabilities(&self) -> &BTreeSet<String> {
+        &self.capabilities
+    }
+
+    pub fn evidence(&self) -> &ResolutionEvidence {
+        &self.evidence
+    }
+
     /// Re-check the snapshot clock boundary immediately before dialing/sealing.
     pub fn ensure_fresh(&self, now_unix_ms: i64) -> anyhow::Result<()> {
         anyhow::ensure!(
