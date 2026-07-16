@@ -689,9 +689,10 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
                 Ok(Self::new(rpc))
             }
 
-            /// Create a client from one owned identity-bound result. Reach,
-            /// response keys and request KEM material enter dial atomically.
-            pub fn from_resolved(
+            /// Internal test seam for one already verified result. Ordinary
+            /// production callers retain the resolver via [`Self::from_resolver`].
+            #[cfg(test)]
+            fn from_resolved_for_test(
                 resolved: hyprstream_rpc::ResolvedService,
                 signing_key: hyprstream_rpc::crypto::SigningKey,
                 token: Option<String>,
@@ -722,7 +723,7 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
 
             /// Ordinary production construction path through the identity-bound
             /// resolver installed after Discovery bootstrap.
-            pub async fn from_resolver(
+            pub fn from_resolver(
                 signing_key: hyprstream_rpc::crypto::SigningKey,
                 token: Option<String>,
             ) -> anyhow::Result<Self> {
@@ -730,21 +731,35 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
                     .ok_or_else(|| anyhow::anyhow!(
                         "identity-bound service resolver is not installed"
                     ))?;
-                Self::from_service_resolver(resolver.as_ref(), signing_key, token).await
+                Self::from_service_resolver(resolver, signing_key, token)
+            }
+
+            /// Transitional source-compatible ordinary constructor.  The
+            /// legacy destination argument is deliberately ignored: production
+            /// response/KEM authority comes only from the installed resolver.
+            pub fn from_installed_resolver(
+                signing_key: hyprstream_rpc::crypto::SigningKey,
+                _legacy_destination: hyprstream_rpc::crypto::VerifyingKey,
+                token: Option<String>,
+            ) -> anyhow::Result<Self> {
+                Self::from_resolver(signing_key, token)
             }
 
             /// Explicit resolver injection for hermetic clients and tests. The
             /// resolver is consulted again for accepted-head currency immediately
             /// before dial; this is not an independent key or reach lookup.
-            pub async fn from_service_resolver(
-                resolver: &dyn hyprstream_rpc::ServiceResolver,
+            pub fn from_service_resolver(
+                resolver: std::sync::Arc<dyn hyprstream_rpc::ServiceResolver>,
                 signing_key: hyprstream_rpc::crypto::SigningKey,
                 token: Option<String>,
             ) -> anyhow::Result<Self> {
-                let query = hyprstream_rpc::ServiceQuery::network(Self::SERVICE_NAME)?;
-                let resolved = resolver.resolve_service(query).await?;
-                resolver.ensure_current(&resolved).await?;
-                Self::from_resolved(resolved, signing_key, token)
+                let rpc = hyprstream_rpc::ResolvedRpcClient::new(
+                    Self::SERVICE_NAME,
+                    signing_key,
+                    token,
+                    resolver,
+                )?;
+                Ok(Self::new(std::sync::Arc::new(rpc)))
             }
 
             /// Create a client from an `IdentityProvider` with automatic endpoint resolution.
@@ -1726,21 +1741,60 @@ fn generate_portable_scoped_factory_method(sc: &ScopedClient) -> TokenStream {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod resolved_service_codegen_tests {
     use super::generate_constructors;
 
     #[test]
     fn generated_clients_use_atomic_resolved_service_for_production() {
         let generated = generate_constructors("model").to_string();
-        assert!(generated.contains("from_resolved"));
+        assert!(generated.contains("from_resolved_for_test"));
+        assert!(!generated.contains("pub fn from_resolved"));
         assert!(generated.contains("ServiceResolver"));
         assert!(generated.contains("try_global_service"));
         assert!(generated.contains("from_service_resolver"));
-        assert!(generated.contains("ensure_current"));
-        assert!(generated.contains("dial_with_crypto_stores"));
+        assert!(generated.contains("ResolvedRpcClient"));
+        assert!(generated.contains("from_installed_resolver"));
         assert!(!generated.contains("pub fn for_service"));
         assert!(!generated.contains("pub async fn from_provider"));
         assert!(generated.contains("for_local_bootstrap"));
         assert!(generated.contains("from_local_bootstrap_provider"));
+    }
+
+    #[test]
+    fn application_call_graph_limits_local_bootstrap_to_policy_and_discovery() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root");
+        let source_root = root.join("crates/hyprstream/src");
+        let mut ordinary = 0usize;
+        let mut stack = vec![source_root];
+        while let Some(path) = stack.pop() {
+            for entry in std::fs::read_dir(path).expect("read application source") {
+                let entry = entry.expect("source entry");
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(|v| v.to_str()) == Some("rs") {
+                    let source = std::fs::read_to_string(&path).expect("read Rust source");
+                    ordinary += source.matches("::from_installed_resolver(").count();
+                    for line in source
+                        .lines()
+                        .filter(|line| line.contains("::for_local_bootstrap("))
+                    {
+                        assert!(
+                            line.contains("PolicyClient") || line.contains("DiscoveryClient"),
+                            "non-bootstrap application client bypasses installed resolver in {}: {line}",
+                            path.display(),
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            ordinary >= 50,
+            "ordinary installed-resolver migration regressed"
+        );
     }
 }

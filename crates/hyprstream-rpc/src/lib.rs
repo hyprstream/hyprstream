@@ -253,9 +253,10 @@ pub use hyprstream_rpc_derive::{authorize, service_factory, FromCapnp, ToCapnp};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use resolver::{
-    retry_validated_candidates, select_service_candidate, AcceptedStateEvidence,
-    AnchoredKemRecipient, CandidateDecision, NetworkDiscoveryResolver, ResolutionEvidence,
-    ResolvedService, Resolver, ResolverProfile, ServiceCandidate, ServiceQuery, ServiceResolver,
+    retry_validated_candidates, select_service_candidate, select_service_candidates,
+    AcceptedStateEvidence, AnchoredKemRecipient, CandidateDecision, NetworkDiscoveryResolver,
+    ResolutionEvidence, ResolvedRpcClient, ResolvedService, Resolver, ResolverProfile,
+    ServiceCandidate, ServiceQuery, ServiceResolver,
 };
 
 #[cfg(not(target_arch = "wasm32"))]

@@ -6,8 +6,9 @@
 use async_trait::async_trait;
 use hyprstream_rpc::registry::{self, EndpointRegistry, SocketKind};
 use hyprstream_rpc::resolver::{
-    select_service_candidate, AcceptedStateEvidence, AnchoredKemRecipient, ResolvedService,
-    Resolver, ServiceCandidate, ServiceQuery, ServiceResolver,
+    select_service_candidate, select_service_candidates, AcceptedStateEvidence,
+    AnchoredKemRecipient, ResolvedService, Resolver, ServiceCandidate, ServiceQuery,
+    ServiceResolver,
 };
 use hyprstream_rpc::service::{EnvelopeContext, RequestService};
 use hyprstream_rpc::transport::TransportConfig;
@@ -529,6 +530,14 @@ impl ServiceResolver for DiscoveryServiceResolver {
         select_service_candidate(&query, candidates, unix_millis_now())
     }
 
+    async fn resolve_service_candidates(
+        &self,
+        query: ServiceQuery,
+    ) -> Result<Vec<ResolvedService>> {
+        let candidates = self.acquire_candidates(&query)?;
+        select_service_candidates(&query, candidates, unix_millis_now())
+    }
+
     async fn ensure_current(&self, resolved: &ResolvedService) -> Result<()> {
         resolved.ensure_fresh(unix_millis_now())?;
         let state = self
@@ -764,6 +773,65 @@ mod resolver_tests {
     }
 
     #[tokio::test]
+    async fn ordinary_announcement_handler_populates_production_resolver() {
+        let (state, service_signing) = accepted_state(12);
+        let root = SigningKey::from_bytes(&[0x61; 32]);
+        let source = Arc::new(MutableAcceptedState(parking_lot::Mutex::new(Some(
+            state.clone(),
+        ))));
+        let service = DiscoveryService::new(
+            Arc::new(root.clone()),
+            root.verifying_key(),
+            TransportConfig::inproc("announcement-rpc-test"),
+        )
+        .with_accepted_state_source(source);
+        let claims = hyprstream_rpc::auth::Claims::new(
+            "service:model".to_owned(),
+            chrono::Utc::now().timestamp(),
+            chrono::Utc::now().timestamp() + 3_600,
+        )
+        .with_cnf_jwk(service_signing.verifying_key().as_bytes());
+        let jwt = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &root);
+        let signed = hyprstream_rpc::SignedEnvelope::new_signed(
+            hyprstream_rpc::RequestEnvelope::anonymous(Vec::new()),
+            &service_signing,
+        );
+        let ctx = EnvelopeContext::from_verified_as_system(&signed);
+        let kem = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
+            hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        )
+        .expect("test KEM");
+        let response = service
+            .handle_announce(
+                &ctx,
+                1,
+                &ServiceAnnouncement {
+                    service_name: "model".to_owned(),
+                    socket_kind: "quic".to_owned(),
+                    endpoint: "quic://localhost:127.0.0.1:9".to_owned(),
+                    service_jwt: Some(jwt),
+                    service_did: Did::from(state.did.clone()),
+                    capabilities: vec!["hyprstream-rpc/1".to_owned()],
+                    accepted_state_digest: state.head_digest.to_vec(),
+                    accepted_state_epoch: state.epoch,
+                    response_key_id: format!("{}#response-current", state.did),
+                    request_kem_key_id: format!("{}#kem-current", state.did),
+                    request_kem_recipient: kem.public().encode(),
+                    expires_at_unix_ms: 4_070_908_800_000,
+                },
+            )
+            .await
+            .expect("ordinary announcement handler");
+        assert!(matches!(response, DiscoveryResponseVariant::AnnounceResult));
+        let resolver = service.production_resolver().expect("production resolver");
+        let resolved = resolver
+            .resolve_service(ServiceQuery::network("model").expect("query"))
+            .await
+            .expect("ordinary announcement must resolve");
+        assert_eq!(resolved.evidence().accepted_state_digest, state.head_digest);
+    }
+
+    #[tokio::test]
     async fn accepted_state_advance_between_selection_and_dial_refuses() {
         let (resolver, source) = production_fixture(false);
         let resolved = resolver
@@ -808,7 +876,6 @@ mod resolver_tests {
         hyprstream_rpc::resolver::set_global_service(resolver);
         let client_signing = SigningKey::from_bytes(&[0x44; 32]);
         let _client = crate::DiscoveryClient::from_resolver(client_signing, None)
-            .await
             .unwrap_or_else(|e| panic!("generated resolver path failed: {e}"));
     }
 

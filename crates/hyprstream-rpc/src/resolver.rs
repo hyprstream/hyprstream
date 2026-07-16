@@ -32,6 +32,8 @@ use parking_lot::RwLock;
 
 use crate::identity::Did;
 use crate::registry::SocketKind;
+use crate::rpc_client::{CallOptions, RpcClient};
+use crate::stream_consumer::StreamHandle;
 use crate::transport::{EndpointType, TransportConfig};
 use crate::VerifyingKey;
 
@@ -142,6 +144,16 @@ pub struct ResolvedService {
 }
 
 impl ResolvedService {
+    fn same_authority(&self, other: &Self) -> bool {
+        self.service_name == other.service_name
+            && self.service_did == other.service_did
+            && self.response_verifying_key == other.response_verifying_key
+            && self.response_ml_dsa65 == other.response_ml_dsa65
+            && self.response_key_id == other.response_key_id
+            && self.request_kem_recipient == other.request_kem_recipient
+            && self.evidence.accepted_state_digest == other.evidence.accepted_state_digest
+            && self.evidence.accepted_state_epoch == other.evidence.accepted_state_epoch
+    }
     pub fn service_name(&self) -> &str {
         &self.service_name
     }
@@ -211,9 +223,218 @@ impl ResolvedService {
 pub trait ServiceResolver: Send + Sync {
     async fn resolve_service(&self, query: ServiceQuery) -> anyhow::Result<ResolvedService>;
 
+    /// Resolve the complete deterministic same-authority retry set.  The
+    /// default preserves compatibility for resolvers with a single reach.
+    async fn resolve_service_candidates(
+        &self,
+        query: ServiceQuery,
+    ) -> anyhow::Result<Vec<ResolvedService>> {
+        Ok(vec![self.resolve_service(query).await?])
+    }
+
     /// Consult the authoritative accepted-state source immediately before dial.
     /// Implementations reject an advanced, expired, or missing head.
     async fn ensure_current(&self, resolved: &ResolvedService) -> anyhow::Result<()>;
+}
+
+/// RPC client which retains the identity-bound resolver through every lazy
+/// network operation.  It resolves and checks the accepted head immediately
+/// before sealing, and constructs the transport and crypto stores from the
+/// same snapshot.  A transport failure may advance only through the bounded,
+/// deterministic same-authority alternatives returned by that resolver.
+pub struct ResolvedRpcClient {
+    service_name: String,
+    signing_key: crate::crypto::SigningKey,
+    token: Option<String>,
+    resolver: Arc<dyn ServiceResolver>,
+    request_id: std::sync::atomic::AtomicU64,
+}
+
+impl ResolvedRpcClient {
+    pub fn new(
+        service_name: impl Into<String>,
+        signing_key: crate::crypto::SigningKey,
+        token: Option<String>,
+        resolver: Arc<dyn ServiceResolver>,
+    ) -> anyhow::Result<Self> {
+        let service_name = canonical_service_name(&service_name.into())?;
+        Ok(Self {
+            service_name,
+            signing_key,
+            token,
+            resolver,
+            request_id: std::sync::atomic::AtomicU64::new(1),
+        })
+    }
+
+    async fn snapshots(&self) -> anyhow::Result<Vec<ResolvedService>> {
+        let query = ServiceQuery::network(self.service_name.clone())?;
+        let max_attempts = query.max_attempts;
+        let resolved = self.resolver.resolve_service_candidates(query).await?;
+        anyhow::ensure!(
+            !resolved.is_empty(),
+            "resolver returned no validated alternatives"
+        );
+        let authority = &resolved[0];
+        anyhow::ensure!(
+            resolved.iter().all(|item| item.same_authority(authority)),
+            "resolver retry set crosses service authority"
+        );
+        Ok(resolved.into_iter().take(max_attempts).collect())
+    }
+
+    fn client_for(&self, snapshot: &ResolvedService) -> anyhow::Result<Arc<dyn RpcClient>> {
+        let (kem, pq) = snapshot.crypto_stores()?;
+        let signer = crate::signer::LocalSigner::new(self.signing_key.clone());
+        crate::dial::dial_with_crypto_stores(
+            snapshot.transport(),
+            signer,
+            Some(snapshot.response_verifying_key()),
+            self.token.clone(),
+            Some(kem),
+            Some(pq),
+        )
+    }
+
+    async fn attempt<T, F, Fut>(&self, mut call: F) -> anyhow::Result<T>
+    where
+        F: FnMut(Arc<dyn RpcClient>) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<T>>,
+    {
+        for refresh in 0..2 {
+            let mut last_transport_error = None;
+            let mut invalidated = None;
+            for snapshot in self.snapshots().await? {
+                if let Err(error) = self.resolver.ensure_current(&snapshot).await {
+                    invalidated = Some(error);
+                    break;
+                }
+                let client = self.client_for(&snapshot)?;
+                match call(client).await {
+                    Ok(value) => return Ok(value),
+                    Err(error) => last_transport_error = Some(error),
+                }
+            }
+            if let Some(error) = invalidated {
+                if refresh == 0 {
+                    continue;
+                }
+                return Err(anyhow!(
+                    "resolved service remained invalid after re-resolution: {error}"
+                ));
+            }
+            return Err(last_transport_error
+                .unwrap_or_else(|| anyhow!("validated same-authority alternatives exhausted")));
+        }
+        unreachable!("bounded re-resolution loop always returns")
+    }
+}
+
+#[async_trait::async_trait]
+impl RpcClient for ResolvedRpcClient {
+    async fn call(&self, payload: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+        self.attempt(|c| {
+            let p = payload.clone();
+            async move { c.call(p).await }
+        })
+        .await
+    }
+    async fn call_for_service(&self, service: &str, payload: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(
+            service == self.service_name,
+            "generated service authority mismatch"
+        );
+        let service = service.to_owned();
+        self.attempt(|c| {
+            let p = payload.clone();
+            let s = service.clone();
+            async move { c.call_for_service(&s, p).await }
+        })
+        .await
+    }
+    async fn call_with_options(
+        &self,
+        payload: Vec<u8>,
+        options: CallOptions,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.attempt(|c| {
+            let p = payload.clone();
+            let o = options.clone();
+            async move { c.call_with_options(p, o).await }
+        })
+        .await
+    }
+    async fn call_with_options_for_service(
+        &self,
+        service: &str,
+        payload: Vec<u8>,
+        options: CallOptions,
+    ) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(
+            service == self.service_name,
+            "generated service authority mismatch"
+        );
+        let service = service.to_owned();
+        self.attempt(|c| {
+            let p = payload.clone();
+            let o = options.clone();
+            let s = service.clone();
+            async move { c.call_with_options_for_service(&s, p, o).await }
+        })
+        .await
+    }
+    async fn call_streaming(
+        &self,
+        payload: Vec<u8>,
+        ephemeral: [u8; 32],
+    ) -> anyhow::Result<Vec<u8>> {
+        self.attempt(|c| {
+            let p = payload.clone();
+            async move { c.call_streaming(p, ephemeral).await }
+        })
+        .await
+    }
+    async fn call_streaming_for_service(
+        &self,
+        service: &str,
+        payload: Vec<u8>,
+        ephemeral: [u8; 32],
+    ) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(
+            service == self.service_name,
+            "generated service authority mismatch"
+        );
+        let service = service.to_owned();
+        self.attempt(|c| {
+            let p = payload.clone();
+            let s = service.clone();
+            async move { c.call_streaming_for_service(&s, p, ephemeral).await }
+        })
+        .await
+    }
+    async fn open_stream(&self, payload: Vec<u8>) -> anyhow::Result<Box<dyn StreamHandle>> {
+        self.attempt(|c| {
+            let p = payload.clone();
+            async move { c.open_stream(p).await }
+        })
+        .await
+    }
+    async fn open_stream_from_info(
+        &self,
+        info: crate::stream_info::StreamInfo,
+        secret: [u8; 32],
+        public: [u8; 32],
+    ) -> anyhow::Result<Box<dyn StreamHandle>> {
+        self.attempt(|c| {
+            let i = info.clone();
+            async move { c.open_stream_from_info(i, secret, public).await }
+        })
+        .await
+    }
+    fn next_id(&self) -> u64 {
+        self.request_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 fn canonical_service_name(name: &str) -> anyhow::Result<String> {
@@ -494,6 +715,31 @@ pub fn select_service_candidate(
     })
 }
 
+/// Return every validated alternative in the same deterministic order used by
+/// selection. Invalid candidates are discarded independently. Each iteration
+/// reuses the authority-ambiguity gate, so the returned set cannot cross a DID,
+/// accepted head, response key, or KEM recipient.
+pub fn select_service_candidates(
+    query: &ServiceQuery,
+    mut candidates: Vec<ServiceCandidate>,
+    now_unix_ms: i64,
+) -> anyhow::Result<Vec<ResolvedService>> {
+    let mut ordered = Vec::new();
+    loop {
+        let selected = match select_service_candidate(query, candidates.clone(), now_unix_ms) {
+            Ok(selected) => selected,
+            Err(error) if !ordered.is_empty() && error.to_string().contains("no validated") => {
+                break;
+            }
+            Err(error) => return Err(error),
+        };
+        let fingerprint = selected.evidence.selected_fingerprint.clone();
+        candidates.retain(|candidate| candidate_fingerprint(candidate) != fingerprint);
+        ordered.push(selected);
+    }
+    Ok(ordered)
+}
+
 /// Async endpoint resolver.
 ///
 /// Implementations convert a (service_name, socket_kind) pair into a
@@ -625,6 +871,7 @@ pub fn global() -> Arc<dyn Resolver> {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn candidate(tag: u8, transport: TransportConfig) -> ServiceCandidate {
         let ed = crate::crypto::SigningKey::from_bytes(&[tag; 32])
@@ -684,6 +931,56 @@ mod tests {
         selected
             .crypto_stores()
             .unwrap_or_else(|e| panic!("selected exact crypto stores invalid: {e}"));
+    }
+
+    struct AlwaysAdvancedResolver {
+        snapshot: ResolvedService,
+        resolves: AtomicUsize,
+        checks: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ServiceResolver for AlwaysAdvancedResolver {
+        async fn resolve_service(&self, _query: ServiceQuery) -> anyhow::Result<ResolvedService> {
+            self.resolves.fetch_add(1, Ordering::SeqCst);
+            Ok(self.snapshot.clone())
+        }
+
+        async fn ensure_current(&self, _resolved: &ResolvedService) -> anyhow::Result<()> {
+            self.checks.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("accepted state advanced")
+        }
+    }
+
+    #[tokio::test]
+    async fn lazy_first_send_re_resolves_once_and_refuses_before_transport() {
+        let snapshot = select_service_candidate(
+            &network_query(),
+            vec![candidate(
+                8,
+                TransportConfig::iroh([8; 32], Vec::new(), None),
+            )],
+            1_000,
+        )
+        .expect("fixture snapshot");
+        let resolver = Arc::new(AlwaysAdvancedResolver {
+            snapshot,
+            resolves: AtomicUsize::new(0),
+            checks: AtomicUsize::new(0),
+        });
+        let signing = crate::crypto::SigningKey::from_bytes(&[0x41; 32]);
+        let client = ResolvedRpcClient::new("model", signing, None, resolver.clone())
+            .expect("resolved lazy client");
+        let error = client
+            .call(vec![1, 2, 3])
+            .await
+            .expect_err("advanced state dialed");
+        assert!(
+            error.to_string().contains("remained invalid"),
+            "unexpected refusal: {error:#}"
+        );
+        assert_eq!(resolver.resolves.load(Ordering::SeqCst), 2);
+        assert_eq!(resolver.checks.load(Ordering::SeqCst), 2);
     }
 
     #[test]

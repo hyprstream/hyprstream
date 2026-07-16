@@ -397,7 +397,7 @@ pub async fn handle_training_infer(
 
     // Create client for service communication — resolve inference key via PolicyService
     let policy_vk = signing_key.verifying_key();
-    let policy_client = crate::services::PolicyClient::for_local_bootstrap(
+    let policy_client = crate::services::PolicyClient::from_installed_resolver(
         signing_key.clone(), policy_vk, None,
     )?;
     let key_resp = policy_client.resolve_service_key(
@@ -409,7 +409,7 @@ pub async fn handle_training_infer(
         key_resp.verifying_key.as_slice().try_into()
             .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
     ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?;
-    let client = InferenceClient::for_local_bootstrap(
+    let client = InferenceClient::from_installed_resolver(
         signing_key.clone(),
         inference_vk,
         None,
@@ -705,7 +705,7 @@ pub async fn handle_training_batch(
 
     // Resolve inference key via PolicyService
     let policy_vk = signing_key.verifying_key();
-    let policy_client = crate::services::PolicyClient::for_local_bootstrap(
+    let policy_client = crate::services::PolicyClient::from_installed_resolver(
         signing_key.clone(), policy_vk, None,
     )?;
     let key_resp = policy_client.resolve_service_key(
@@ -717,7 +717,7 @@ pub async fn handle_training_batch(
         key_resp.verifying_key.as_slice().try_into()
             .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
     ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?;
-    let client = InferenceClient::for_local_bootstrap(
+    let client = InferenceClient::from_installed_resolver(
         signing_key.clone(),
         inference_vk,
         None,

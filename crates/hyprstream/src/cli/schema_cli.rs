@@ -388,19 +388,19 @@ async fn dispatch_top_level(
     match service {
         "registry" => {
             let server_vk = resolve_key_via_policy(&signing_key, "registry").await?;
-            let client: RegistryClient = RegistryClient::for_local_bootstrap(
+            let client: RegistryClient = RegistryClient::from_installed_resolver(
                 signing_key, server_vk, None,
             )?;
             client.call_method(method, args).await
         }
         "model" => {
             let server_vk = resolve_key_via_policy(&signing_key, "model").await?;
-            let client = ModelClient::for_local_bootstrap(signing_key, server_vk, None)?;
+            let client = ModelClient::from_installed_resolver(signing_key, server_vk, None)?;
             client.call_method(method, args).await
         }
         "inference" => {
             let server_vk = resolve_key_via_policy(&signing_key, "inference").await?;
-            let client = InferenceClient::for_local_bootstrap(signing_key, server_vk, None)?;
+            let client = InferenceClient::from_installed_resolver(signing_key, server_vk, None)?;
             client.call_method(method, args).await
         }
         "policy" => {
@@ -430,19 +430,19 @@ async fn dispatch_scoped_dynamic(
     match service {
         "registry" => {
             let server_vk = resolve_key_via_policy(&signing_key, "registry").await?;
-            let client: RegistryClient = RegistryClient::for_local_bootstrap(
+            let client: RegistryClient = RegistryClient::from_installed_resolver(
                 signing_key, server_vk, None,
             )?;
             client.call_scoped_method(scope_chain, method, args).await
         }
         "model" => {
             let server_vk = resolve_key_via_policy(&signing_key, "model").await?;
-            let client = ModelClient::for_local_bootstrap(signing_key, server_vk, None)?;
+            let client = ModelClient::from_installed_resolver(signing_key, server_vk, None)?;
             client.call_scoped_method(scope_chain, method, args).await
         }
         "worker" => {
             let server_vk = resolve_key_via_policy(&signing_key, "worker").await?;
-            let client = WorkerClient::for_local_bootstrap(signing_key, server_vk, None)?;
+            let client = WorkerClient::from_installed_resolver(signing_key, server_vk, None)?;
             client.call_scoped_method(scope_chain, method, args).await
         }
         _ => bail!("Service '{}' has no scoped methods", service),

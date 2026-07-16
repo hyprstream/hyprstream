@@ -856,7 +856,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     let registry_vk = hyprstream_service::global_trust_store()
         .resolve_one("registry")
         .ok_or_else(|| anyhow::anyhow!("trust store has no registry key"))?;
-    let registry_client: RegistryClient = RegistryClient::for_local_bootstrap(
+    let registry_client: RegistryClient = RegistryClient::from_installed_resolver(
         sk.clone(),
         registry_vk,
         service_token("model"),
@@ -887,7 +887,7 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     // if discovery isn't resolvable, ModelService simply has no federation client
     // and at:// refs fall through to local resolution.
     if let Some(discovery_vk) = hyprstream_service::global_trust_store().resolve_one("discovery") {
-        match crate::services::DiscoveryClient::for_local_bootstrap(sk.clone(), discovery_vk, None) {
+        match crate::services::DiscoveryClient::from_installed_resolver(sk.clone(), discovery_vk, None) {
             Ok(dc) => {
                 model_service = model_service.with_discovery_client(std::sync::Arc::new(dc));
             }
@@ -1006,7 +1006,7 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = crate::services::PolicyClient::for_local_bootstrap(
+    let policy_client = crate::services::PolicyClient::from_installed_resolver(
         sk.clone(),
         policy_vk,
         service_token("worker"),
@@ -1047,7 +1047,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let model_vk = hyprstream_service::global_trust_store()
         .resolve_one("model")
         .ok_or_else(|| anyhow::anyhow!("trust store has no model key"))?;
-    let model_client = ModelClient::for_local_bootstrap(sk.clone(), model_vk, service_token("oai"))?;
+    let model_client = ModelClient::from_installed_resolver(sk.clone(), model_vk, service_token("oai"))?;
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
@@ -1057,7 +1057,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let registry_vk = hyprstream_service::global_trust_store()
         .resolve_one("registry")
         .ok_or_else(|| anyhow::anyhow!("trust store has no registry key"))?;
-    let registry_client: RegistryClient = RegistryClient::for_local_bootstrap(
+    let registry_client: RegistryClient = RegistryClient::from_installed_resolver(
         sk.clone(),
         registry_vk,
         service_token("oai"),
@@ -1126,7 +1126,7 @@ fn create_xet_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         .resolve_one("registry")
         .ok_or_else(|| anyhow::anyhow!("trust store has no registry key"))?;
     let registry_client: RegistryClient =
-        RegistryClient::for_local_bootstrap(sk.clone(), registry_vk, service_token("xet"))?;
+        RegistryClient::from_installed_resolver(sk.clone(), registry_vk, service_token("xet"))?;
 
     let state = XetState {
         // Reads share the same L1 CAS substrate the registry's getBlob uses (#812).
@@ -1175,7 +1175,7 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
             let registry_vk = hyprstream_service::global_trust_store()
                 .resolve_one("registry")
                 .ok_or_else(|| anyhow::anyhow!("trust store has no registry key"))?;
-            let registry_client: RegistryClient = RegistryClient::for_local_bootstrap(
+            let registry_client: RegistryClient = RegistryClient::from_installed_resolver(
                 sk.clone(),
                 registry_vk,
                 service_token("flight"),

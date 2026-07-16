@@ -33,6 +33,33 @@ use crate::service::metadata::SchemaMetadataFn;
 use crate::service::spawner::Spawnable;
 use hyprstream_rpc::transport::TransportConfig;
 
+/// Complete native announcement material verified against one accepted state.
+#[derive(Clone)]
+pub struct NativeServiceAnnouncement {
+    pub service_did: hyprstream_rpc::identity::Did,
+    pub capabilities: Vec<String>,
+    pub accepted_state_digest: [u8; 64],
+    pub accepted_state_epoch: u64,
+    pub accepted_state_expires_at_unix_ms: i64,
+    pub response_key_id: String,
+    pub response_verifying_key: [u8; 32],
+    pub request_kem_key_id: String,
+    pub request_kem_recipient: hyprstream_rpc::crypto::hybrid_kem::RecipientPublic,
+}
+
+impl NativeServiceAnnouncement {
+    fn validate(&self, service_name: &str, signer: &VerifyingKey) -> anyhow::Result<()> {
+        anyhow::ensure!(self.service_did.is_did_at9p(), "native announcement requires did:at9p identity");
+        anyhow::ensure!(!service_name.is_empty() && self.capabilities.iter().any(|c| c == "hyprstream-rpc/1"), "native announcement lacks canonical service capability");
+        anyhow::ensure!(self.response_verifying_key == signer.to_bytes(), "accepted response key does not match service signer");
+        anyhow::ensure!(self.response_key_id.starts_with(&format!("{}#", self.service_did)), "response key id crosses service authority");
+        anyhow::ensure!(self.request_kem_key_id.starts_with(&format!("{}#", self.service_did)), "KEM key id crosses service authority");
+        anyhow::ensure!(self.request_kem_recipient.suite_id == hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768, "native announcement requires hybrid KEM suite");
+        anyhow::ensure!(self.accepted_state_epoch > 0 && self.accepted_state_expires_at_unix_ms > chrono::Utc::now().timestamp_millis(), "accepted state is unbounded or expired");
+        Ok(())
+    }
+}
+
 /// Shared QUIC/WebTransport configuration for all services.
 ///
 /// Contains TLS materials and base settings shared across services.
@@ -120,12 +147,14 @@ impl QuicSharedConfig {
         service_jwt: Option<String>,
         policy_verifying_key: VerifyingKey,
         discovery_verifying_key: VerifyingKey,
+        accepted: Option<NativeServiceAnnouncement>,
     ) -> hyprstream_rpc::service::QuicLoopConfig {
         let mut config = self.for_service(service_name, port);
         config.on_quic_bound = Some(Box::new(move |svc_name, addr, sn| {
             let endpoint = format!("quic://{}:{}:{}", sn, addr.ip(), addr.port());
             let sk = signing_key.clone();
             let jwt = service_jwt.clone();
+            let accepted = accepted.clone();
 
             // Check if JWT needs renewal (within 2 days of expiry, or missing)
             let needs_renewal = jwt.as_ref().is_none_or(|j| {
@@ -164,6 +193,14 @@ impl QuicSharedConfig {
                     }
                 };
                 rt.block_on(async {
+                    let Some(accepted) = accepted else {
+                        tracing::warn!("Refusing production network announcement for '{svc_name}': accepted native identity/KEM bundle is unavailable");
+                        return;
+                    };
+                    if let Err(error) = accepted.validate(&svc_name, &sk.verifying_key()) {
+                        tracing::warn!("Refusing production network announcement for '{svc_name}': {error}");
+                        return;
+                    }
                     // Request JWT renewal from PolicyService if needed
                     if needs_renewal {
                         // TODO: Call PolicyService issueToken RPC for renewal.
@@ -193,14 +230,14 @@ impl QuicSharedConfig {
                         socket_kind: "quic".to_owned(),
                         endpoint,
                         service_jwt: jwt,
-                        service_did: hyprstream_rpc::identity::Did::default(),
-                        capabilities: Vec::new(),
-                        accepted_state_digest: Vec::new(),
-                        accepted_state_epoch: 0,
-                        response_key_id: String::new(),
-                        request_kem_key_id: String::new(),
-                        request_kem_recipient: Vec::new(),
-                        expires_at_unix_ms: 0,
+                        service_did: accepted.service_did,
+                        capabilities: accepted.capabilities,
+                        accepted_state_digest: accepted.accepted_state_digest.to_vec(),
+                        accepted_state_epoch: accepted.accepted_state_epoch,
+                        response_key_id: accepted.response_key_id,
+                        request_kem_key_id: accepted.request_kem_key_id,
+                        request_kem_recipient: accepted.request_kem_recipient.encode(),
+                        expires_at_unix_ms: accepted.accepted_state_expires_at_unix_ms,
                     }).await {
                         Ok(_) => tracing::info!("Announced QUIC endpoint to DiscoveryService"),
                         Err(e) => tracing::warn!("Failed to announce QUIC endpoint: {}", e),
@@ -250,6 +287,8 @@ pub struct ServiceContext {
     /// - Multi-process: loaded from per-service credential files
     service_keys: HashMap<String, SigningKey>,
 
+    native_announcements: HashMap<String, NativeServiceAnnouncement>,
+
     /// CA verifying key (trust anchor for verifying service JWTs).
     ///
     /// In single-process mode, this is derived from the root key.
@@ -291,6 +330,7 @@ impl ServiceContext {
             oauth_issuer_url: None,
             federation_key_source: None,
             service_keys: HashMap::new(),
+            native_announcements: HashMap::new(),
             ca_verifying_key: None,
             jwks_fetcher: None,
             ml_dsa_verifying_keys: {
@@ -318,6 +358,15 @@ impl ServiceContext {
     /// In multi-process mode, these are loaded from per-service credential files.
     pub fn with_service_key(mut self, service_name: &str, signing_key: SigningKey) -> Self {
         self.service_keys.insert(service_name.to_owned(), signing_key);
+        self
+    }
+
+    pub fn with_native_announcement(
+        mut self,
+        service_name: impl Into<String>,
+        announcement: NativeServiceAnnouncement,
+    ) -> Self {
+        self.native_announcements.insert(service_name.into(), announcement);
         self
     }
 
@@ -683,6 +732,7 @@ impl ServiceContext {
                         service_jwt,
                         policy_vk,
                         discovery_vk,
+                        self.native_announcements.get(service.name()).cloned(),
                     ))
                 }
             }
