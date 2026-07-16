@@ -42,9 +42,9 @@ fn build_server() -> Result<(web_transport_quinn::Server, std::net::SocketAddr, 
     let key_der = cert_key.key_pair.serialize_der();
 
     let chain = vec![rustls::pki_types::CertificateDer::from(cert_der.clone())];
-    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
-        rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
-    );
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+        key_der,
+    ));
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse()?;
     let server = web_transport_quinn::ServerBuilder::new()
@@ -98,7 +98,9 @@ async fn wt_ninep_path_routes_to_handler_and_streams() -> Result<()> {
         fresh_signing_key(),
         hyprstream_rpc::transport::rpc_session::DEFAULT_STREAM_LIMIT,
     )
-    .with_ninep_handler(Arc::new(EchoNineP { invoked: invoked.clone() }));
+    .with_ninep_handler(Arc::new(EchoNineP {
+        invoked: invoked.clone(),
+    }));
     let shutdown = rpc.shutdown_token();
     let server_task = tokio::spawn(rpc.run());
 
@@ -112,7 +114,10 @@ async fn wt_ninep_path_routes_to_handler_and_streams() -> Result<()> {
 
     let mut got = vec![0u8; b"hello-9p-over-wt".len()];
     tokio::time::timeout(Duration::from_secs(5), recv.read_exact(&mut got)).await??;
-    assert_eq!(&got, b"hello-9p-over-wt", "echo must round-trip over the WT bidi stream");
+    assert_eq!(
+        &got, b"hello-9p-over-wt",
+        "echo must round-trip over the WT bidi stream"
+    );
 
     // The handler was actually reached via the `/9p` path (not RPC/moq).
     tokio::time::timeout(Duration::from_secs(5), invoked.notified()).await?;
@@ -146,21 +151,38 @@ async fn wt_ninep_without_handler_is_declined() -> Result<()> {
     let server_task = tokio::spawn(rpc.run());
 
     let pin = cert_sha256(&cert);
-    // The CONNECT succeeds (path mux runs post-handshake); the `/9p` arm finds
-    // no handler and returns, resetting the stream. The client's bidi read then
-    // fails — which is the expected "plane off" outcome, not a hang.
-    let session = connect_pinned_hashes_path(addr, &[pin], NINEP_PATH).await?;
-    let (mut send, mut recv) = session.open_bi().await?;
-    let _ = send.write_all(b"ping").await;
-    let mut got = [0u8; 4];
-    let res = tokio::time::timeout(Duration::from_secs(3), recv.read_exact(&mut got)).await;
+    // The path mux runs after the WebTransport handshake. Once the `/9p` arm
+    // finds no handler it returns immediately, so the client can observe the
+    // explicit transport denial either while CONNECT completes or on its first
+    // stream operation. Both are valid; a successful echo or a hang is not.
+    let explicitly_denied = match connect_pinned_hashes_path(addr, &[pin], NINEP_PATH).await {
+        Err(_) => true,
+        Ok(session) => match session.open_bi().await {
+            Err(_) => true,
+            Ok((mut send, mut recv)) => {
+                if send.write_all(b"ping").await.is_err() {
+                    true
+                } else {
+                    let mut got = [0u8; 4];
+                    matches!(
+                        tokio::time::timeout(Duration::from_secs(3), recv.read_exact(&mut got),)
+                            .await,
+                        Ok(Err(_))
+                    )
+                }
+            }
+        },
+    };
     assert!(
-        matches!(res, Ok(Err(_)) | Err(_)),
-        "no-handler /9p must not deliver an echo (stream declined)"
+        explicitly_denied,
+        "no-handler /9p must be explicitly declined"
     );
 
     // The accept loop is still alive.
-    assert!(!server_task.is_finished(), "accept loop must survive a declined /9p session");
+    assert!(
+        !server_task.is_finished(),
+        "accept loop must survive a declined /9p session"
+    );
     shutdown.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), server_task).await;
     Ok(())
