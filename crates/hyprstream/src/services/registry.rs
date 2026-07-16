@@ -342,7 +342,7 @@ pub struct RegistryService {
     /// Publishes/advances a repo's `ai.hyprstream.model` PDS record on
     /// register + commit (#910a). `None` means this node has no PDS
     /// configured — register/commit proceed exactly as before.
-    pds_publisher: Option<crate::services::discovery::PdsPublisher>,
+    pds_publisher: Option<Arc<crate::services::discovery::PdsPublisher>>,
 }
 
 /// Progress reporter that sends updates via a tokio mpsc channel.
@@ -437,7 +437,7 @@ impl RegistryService {
     /// `commitWithAuthor` (the RPC promote also drives) will publish/advance
     /// the repo's `ai.hyprstream.model` record through it.
     pub fn with_pds_publisher(mut self, publisher: crate::services::discovery::PdsPublisher) -> Self {
-        self.pds_publisher = Some(publisher);
+        self.pds_publisher = Some(Arc::new(publisher));
         self
     }
 
@@ -1849,21 +1849,28 @@ impl RegistryHandler for RegistryService {
     async fn handle_ingest_at9p_candidate(&self, _ctx: &EnvelopeContext, _request_id: u64,
         data: &At9pCandidateRequest,
     ) -> Result<RegistryResponseVariant> {
-        let result = (|| -> Result<AcceptedAt9pStateInfo> {
+        let result = async {
             anyhow::ensure!(!data.did.is_empty(), "did is required");
             anyhow::ensure!(!data.record_bytes.is_empty(), "candidate bytes are required");
             anyhow::ensure!(data.record_bytes.len() <= MAX_AT9P_CANDIDATE_BYTES, "candidate exceeds ingest cap");
             let publisher = self.pds_publisher.as_ref()
                 .ok_or_else(|| anyhow!("accepted did:at9p ingest is not configured"))?;
-            let state = match data.kind {
-                At9pCandidateKind::Genesis => publisher.ingest_at9p_genesis(&data.did, &data.record_bytes)?,
+            let publisher = Arc::clone(publisher);
+            let did = data.did.clone();
+            let record_bytes = data.record_bytes.clone();
+            let kind = data.kind;
+            let now = chrono::Utc::now()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let state = tokio::task::spawn_blocking(move || match kind {
+                At9pCandidateKind::Genesis => publisher.ingest_at9p_genesis(&did, &record_bytes),
                 At9pCandidateKind::Successor => {
-                    anyhow::ensure!(!data.now.is_empty(), "successor evaluation time is required");
-                    publisher.ingest_at9p_successor(&data.did, &data.record_bytes, &data.now)?
+                    publisher.ingest_at9p_successor(&did, &record_bytes, &now)
                 }
-            };
-            Ok(AcceptedAt9pStateInfo { did: state.did, epoch: state.epoch, head_digest: state.head_digest.to_vec(), terminal: state.terminal })
-        })();
+            })
+            .await
+            .map_err(|error| anyhow!("at9p candidate worker failed: {error}"))??;
+            Ok::<_, anyhow::Error>(AcceptedAt9pStateInfo { did: state.did, epoch: state.epoch, head_digest: state.head_digest.to_vec(), terminal: state.terminal })
+        }.await;
         Ok(match result {
             Ok(info) => RegistryResponseVariant::IngestAt9pCandidateResult(info),
             Err(error) => reg_error(&format!("at9p candidate rejected: {error}")),
@@ -3534,13 +3541,13 @@ mod tests {
         let did = format!("{}{}", hyprstream_pds::at9p_gate::DID_AT9P_PREFIX, cid);
         assert_eq!(client.ingest_at9p_candidate(&At9pCandidateRequest {
             did: did.clone(), kind: At9pCandidateKind::Genesis,
-            record_bytes: genesis_bytes.clone(), now: String::new(),
+            record_bytes: genesis_bytes.clone(),
         }).await.unwrap().epoch, 0);
         let update = sign_update_record(cid.clone(), 1, hyprstream_pds::at9p::h512(&genesis_bytes),
             at9p_test_body(&n1, &[&n2], "rotated"), "2099-01-01T00:00:00Z".to_owned(), &n1.ed, &n1.pq).unwrap();
         let accepted = client.ingest_at9p_candidate(&At9pCandidateRequest {
             did: did.clone(), kind: At9pCandidateKind::Successor,
-            record_bytes: update.to_dag_cbor().unwrap(), now: NOW.to_owned(),
+            record_bytes: update.to_dag_cbor().unwrap(),
         }).await.unwrap();
         assert_eq!(accepted.epoch, 1);
         let resolver = crate::services::discovery::PdsRecordResolver::new(Arc::clone(&store));
@@ -3550,26 +3557,26 @@ mod tests {
             at9p_test_body(&n1, &[&n2], "fork"), "2099-01-01T00:00:00Z".to_owned(), &n1.ed, &n1.pq).unwrap();
         assert!(client.ingest_at9p_candidate(&At9pCandidateRequest {
             did: did.clone(), kind: At9pCandidateKind::Successor,
-            record_bytes: fork.to_dag_cbor().unwrap(), now: NOW.to_owned(),
+            record_bytes: fork.to_dag_cbor().unwrap(),
         }).await.is_err());
         let expired = sign_update_record(cid.clone(), 2, state.head_digest,
             at9p_test_body(&n2, &[], "expired"), "2026-01-01T00:00:00Z".to_owned(), &n2.ed, &n2.pq).unwrap();
         assert!(client.ingest_at9p_candidate(&At9pCandidateRequest {
             did: did.clone(), kind: At9pCandidateKind::Successor,
-            record_bytes: expired.to_dag_cbor().unwrap(), now: NOW.to_owned(),
+            record_bytes: expired.to_dag_cbor().unwrap(),
         }).await.is_err());
         let terminal = sign_update_record(cid.clone(), 2, state.head_digest,
             at9p_test_body(&n2, &[], "terminal"), "2099-01-01T00:00:00Z".to_owned(), &n2.ed, &n2.pq).unwrap();
         let terminal_state = client.ingest_at9p_candidate(&At9pCandidateRequest {
             did: did.clone(), kind: At9pCandidateKind::Successor,
-            record_bytes: terminal.to_dag_cbor().unwrap(), now: NOW.to_owned(),
+            record_bytes: terminal.to_dag_cbor().unwrap(),
         }).await.unwrap();
         assert!(terminal_state.terminal);
         let after_terminal = sign_update_record(cid, 3, terminal_state.head_digest.try_into().unwrap(),
             at9p_test_body(&n3, &[&n3], "forbidden"), "2099-01-01T00:00:00Z".to_owned(), &n3.ed, &n3.pq).unwrap();
         assert!(client.ingest_at9p_candidate(&At9pCandidateRequest {
             did, kind: At9pCandidateKind::Successor,
-            record_bytes: after_terminal.to_dag_cbor().unwrap(), now: NOW.to_owned(),
+            record_bytes: after_terminal.to_dag_cbor().unwrap(),
         }).await.is_err());
         let _ = handle.stop().await;
         drop(policy_handle);

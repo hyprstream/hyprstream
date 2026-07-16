@@ -38,8 +38,10 @@ re-reads and is classified against the durable winner, never `Advanced`.
 The ordinary registry RPC schema exposes authenticated
 `ingestAt9pCandidate`. Network/PDS callers supply untrusted DID and record bytes
 only; genesis authority comes solely from GATE and successor authority solely
-from the verified durable predecessor. Consumers read the typed verified PDS
-seam.
+from the fresh verified durable predecessor. Expiry is evaluated with the
+daemon's UTC clock, never caller-supplied time, and the synchronous crypto/
+RocksDB transaction runs on the service's blocking worker pool. Consumers read
+the typed verified PDS seam.
 
 Duplicity alarms use the existing separately fsynced, hybrid-signed alarm WAL.
 An alarm never advances accepted state. Restart eagerly reopens and verifies

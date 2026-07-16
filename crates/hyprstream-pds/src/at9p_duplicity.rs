@@ -953,6 +953,9 @@ pub enum AdmissionError {
         /// Epoch of the existing watermark that refused the re-seed.
         existing_epoch: u64,
     },
+    /// The durable accepted predecessor is an update whose validity window has
+    /// elapsed. An expired head cannot authorize a later rotation.
+    AcceptedHeadNotFresh(anyhow::Error),
     /// The underlying [`WatermarkStore`] failed (I/O, poisoned lock). Fail-closed:
     /// a watermark that cannot be read or written is treated as blocking, never
     /// bypassed.
@@ -990,6 +993,9 @@ impl std::fmt::Display for AdmissionError {
                 "duplicity guard: watermark for {subject_cid512:?} already exists at epoch {existing_epoch}; refusing re-seed (anti-rollback)"
             ),
             Self::Store(err) => write!(f, "duplicity guard: watermark store error: {err}"),
+            Self::AcceptedHeadNotFresh(err) => {
+                write!(f, "duplicity guard: accepted predecessor is not fresh: {err}")
+            }
             Self::MalformedPredecessor(err) => {
                 write!(f, "duplicity guard: anchored predecessor did not decode: {err}")
             }
@@ -1001,7 +1007,9 @@ impl std::error::Error for AdmissionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Successor(err) => Some(err),
-            Self::Store(err) | Self::MalformedPredecessor(err) => Some(err.as_ref()),
+            Self::Store(err)
+            | Self::AcceptedHeadNotFresh(err)
+            | Self::MalformedPredecessor(err) => Some(err.as_ref()),
             _ => None,
         }
     }
@@ -1246,6 +1254,9 @@ impl<S: WatermarkStore, A: DuplicityAlarmSink> DuplicityGuard<S, A> {
                     .ok_or_else(|| AdmissionError::NotSeeded {
                         subject_cid512: subject.clone(),
                     })?;
+                accepted
+                    .ensure_fresh(now)
+                    .map_err(AdmissionError::AcceptedHeadNotFresh)?;
                 let watermark = accepted.watermark();
 
             // (1) Idempotent replay of the accepted head: same epoch AND same
@@ -1782,6 +1793,34 @@ mod tests {
             other => panic!("expected Advanced, got {other:?}"),
         };
         assert_eq!(s2.epoch, 2);
+        assert_eq!(guard.store_alarm_count(), 0);
+    }
+
+    #[test]
+    fn expired_accepted_head_cannot_authorize_successor() {
+        let (g, n1, n2, n3) = (signer(), signer(), signer(), signer());
+        let (cap0, s0) = genesis(&g, &[&n1]);
+        let guard = guard();
+        guard.seed_genesis(&verified_genesis(&cap0)).unwrap();
+        let r1 = update_salted(
+            &s0.subject_cid512,
+            1,
+            s0.record_digest,
+            &n1,
+            &[&n2],
+            "2026-07-10T00:00:00Z",
+            None,
+        );
+        let s1 = match guard.admit_successor(&r1, NOW).unwrap() {
+            Admission::Advanced(state) => state,
+            other => panic!("expected advance, got {other:?}"),
+        };
+        let r2 = update(&s1.subject_cid512, 2, s1.record_digest, &n2, &[&n3]);
+        assert!(matches!(
+            guard.admit_successor(&r2, "2026-07-11T00:00:00Z"),
+            Err(AdmissionError::AcceptedHeadNotFresh(_))
+        ));
+        assert_eq!(guard.watermark(&s0.subject_cid512).unwrap().unwrap().epoch, 1);
         assert_eq!(guard.store_alarm_count(), 0);
     }
 

@@ -647,7 +647,7 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
             crate::services::discovery::PdsRecordStore::open(&store_dir)?
                 .with_at9p_acceptance_identity(acceptance_identity.verifying_key()),
         );
-        let alarm_path = store_dir.with_extension("at9p-duplicity.wal");
+        let alarm_path = store_dir.join("at9p-duplicity.wal");
         let at9p_state = crate::services::discovery::At9pStateIngest::open(
             Arc::clone(&store),
             &alarm_path,

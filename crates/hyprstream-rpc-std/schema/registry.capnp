@@ -420,7 +420,6 @@ struct At9pCandidateRequest {
   did @0 :Text;
   kind @1 :At9pCandidateKind;
   recordBytes @2 :Data;
-  now @3 :Text;
 }
 struct AcceptedAt9pStateInfo {
   did @0 :Text;
