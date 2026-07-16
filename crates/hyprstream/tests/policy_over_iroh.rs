@@ -29,11 +29,12 @@ use hyprstream_core::services::PolicyService;
 use hyprstream_core::services::generated::policy_client::{PolicyCheck, PolicyClient};
 
 use hyprstream_rpc::crypto::CryptoPolicy;
+use hyprstream_rpc::crypto::hybrid_kem::{KemTrustStore, KeyedKemTrustStore};
 use hyprstream_rpc::envelope::{
     EnvelopeVerifyConfig, InMemoryNonceCache, KeyedPqTrustStore, PqTrustStore,
     install_verify_config,
 };
-use hyprstream_rpc::node_identity::derive_mesh_mldsa_key;
+use hyprstream_rpc::node_identity::{derive_mesh_kem_recipient, derive_mesh_mldsa_key};
 use hyprstream_rpc::rpc_client::RpcClientImpl;
 use hyprstream_rpc::signer::LocalSigner;
 use hyprstream_rpc::transport::TransportConfig;
@@ -67,6 +68,15 @@ fn policy_pq_trust_store() -> Arc<dyn PqTrustStore> {
     bind_mesh_anchor(&mut store, &policy_service_signing_key());
     bind_mesh_anchor(&mut store, &policy_client_signing_key());
     Arc::new(store)
+}
+
+fn policy_request_kem_store(server_signing: &SigningKey) -> Result<Arc<dyn KemTrustStore>> {
+    let mut store = KeyedKemTrustStore::new();
+    store.bind(
+        server_signing.verifying_key().to_bytes(),
+        derive_mesh_kem_recipient(server_signing)?.public(),
+    );
+    Ok(Arc::new(store))
 }
 
 fn install_hybrid_verify_config() -> Arc<dyn PqTrustStore> {
@@ -146,6 +156,7 @@ async fn serve_over_iroh(
 async fn client_for(
     server_addr: EndpointAddr,
     server_vk: ed25519_dalek::VerifyingKey,
+    request_kem_store: Arc<dyn KemTrustStore>,
     response_pq_store: Arc<dyn PqTrustStore>,
 ) -> Result<(IrohSubstrate, PolicyClient)> {
     let client_substrate = IrohSubstrate::new(
@@ -164,6 +175,7 @@ async fn client_for(
         transport,
         Some(server_vk),
     )
+    .with_request_kem_store(request_kem_store)
     .with_response_pq_store(response_pq_store);
     let policy_client = PolicyClient::new(Arc::new(rpc));
     Ok((client_substrate, policy_client))
@@ -178,9 +190,11 @@ async fn policy_check_allow_and_deny_over_iroh() -> Result<()> {
 
     let (service, server_signing, _temp) = make_policy_service().await?;
     let server_vk = server_signing.verifying_key();
+    let request_kem_store = policy_request_kem_store(&server_signing)?;
 
     let (server, server_addr) = serve_over_iroh(service, server_signing).await?;
-    let (client_substrate, policy) = client_for(server_addr, server_vk, pq_store).await?;
+    let (client_substrate, policy) =
+        client_for(server_addr, server_vk, request_kem_store, pq_store).await?;
 
     // ALLOW: service:oauth → policy:ResolveServiceKey:query (from
     // SERVICE_BASE_POLICIES, asserted in policy_manager.rs base-rules test).
@@ -219,9 +233,11 @@ async fn policy_concurrent_checks_over_iroh() -> Result<()> {
 
     let (service, server_signing, _temp) = make_policy_service().await?;
     let server_vk = server_signing.verifying_key();
+    let request_kem_store = policy_request_kem_store(&server_signing)?;
 
     let (server, server_addr) = serve_over_iroh(service, server_signing).await?;
-    let (client_substrate, policy) = client_for(server_addr, server_vk, pq_store).await?;
+    let (client_substrate, policy) =
+        client_for(server_addr, server_vk, request_kem_store, pq_store).await?;
     let policy = Arc::new(policy);
 
     // Cases chosen so wildcard base rules don't interfere:
