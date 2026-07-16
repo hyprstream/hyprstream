@@ -643,21 +643,14 @@ impl RecipientPublic {
                 );
             }
             let len = r.u32()? as usize;
-            let bytes = r.take(len)?.to_vec();
-            if bytes.len() != want.component().ek_len() {
-                bail!(
-                    "ek {i} ({:?}) length {} != expected {}",
-                    want,
-                    bytes.len(),
-                    want.component().ek_len()
-                );
-            }
-            eks.push(bytes);
+            eks.push(r.take(len)?.to_vec());
         }
         if r.pos != buf.len() {
             bail!("trailing bytes after recipient public material");
         }
-        Ok(Self { suite_id, eks })
+        let recipient = Self { suite_id, eks };
+        recipient.validate()?;
+        Ok(recipient)
     }
 }
 
