@@ -10,8 +10,9 @@
 //!    (the object-safe client trait, erasing the concrete `LazyIrohTransport`).
 //! 3. **RPC round-trip over Iroh**: `model.status()` and `registry.list()`-shaped
 //!    operations traverse the signed-envelope pipeline both directions.
-//! 4. **moq stream over Iroh**: `dial_stream()` → `MoqStreamSession::Iroh` → a
-//!    real `moq_net::Client` pub/sub round-trip.
+//! 4. **moq stream over Iroh**: `dial_stream()` → `MoqStreamSession::Iroh`, then
+//!    the real handler rejects the anonymous carrier until #1027 supplies a
+//!    separately verified application/session identity.
 //!
 //! The model/registry *business logic* lives in the libtorch-bound `hyprstream`
 //! crate; this test models those services as test-local [`RequestService`] impls
@@ -29,7 +30,6 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use bytes::Bytes;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::RngCore;
 
@@ -47,7 +47,7 @@ use hyprstream_rpc::transport::lazy_iroh::install_iroh_client_endpoint;
 use hyprstream_rpc::transport::iroh_transport::IrohTransport;
 use hyprstream_rpc::transport::TransportConfig;
 use iroh::{EndpointAddr, EndpointId, TransportAddr};
-use moq_net::{Client, Group, Origin, OriginConsumer, OriginProducer, Track};
+use moq_net::{Client, Origin};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // helpers
@@ -506,19 +506,18 @@ impl RequestService for CompositeRpcService {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// E4.4: moq stream over Iroh (MoqStreamSession::Iroh pub/sub round-trip)
+// E4.4: anonymous moq stream over Iroh is rejected
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// The server substrate binds the `moql` ALPN with a real `IrohMoqProtocolHandler`
-// holding a shared origin. The client dials via the production `dial_stream()`
-// factory, which returns `MoqStreamSession::Iroh`; the moq handshake runs through
-// `connect_moq()`, and a published Frame is read back by the subscriber.
+// The server substrate binds the `moql` ALPN with a real `IrohMoqProtocolHandler`.
+// The client dials via the production `dial_stream()` factory, which returns
+// `MoqStreamSession::Iroh`; the real handler must then reject the anonymous
+// carrier promptly. Carrier NodeId/reach must not create an application subject.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn moq_stream_pub_sub_round_trip_over_iroh() -> Result<()> {
-    // ─── Server: moq handler on the `moql` ALPN with one published broadcast
+async fn anonymous_moq_handshake_over_iroh_is_rejected() -> Result<()> {
+    // ─── Server: real moq handler on the `moql` ALPN.
     let shared = OriginShared::new();
-    let producer = shared.producer().clone();
     let moq_handler = IrohMoqProtocolHandler::with_origin(shared);
     let server = IrohSubstrate::new(
         fresh_node_key(),
@@ -530,25 +529,6 @@ async fn moq_stream_pub_sub_round_trip_over_iroh() -> Result<()> {
     let server_node_id: [u8; 32] = *server.endpoint_id().as_bytes();
     let server_direct: Vec<std::net::SocketAddr> =
         server.endpoint().bound_sockets().into_iter().collect();
-
-    // Publish a broadcast with one track + one group + one frame BEFORE the
-    // subscriber connects (late-join: the frame must still be readable).
-    const BROADCAST: &str = "alice/run-1";
-    const TRACK: &str = "tokens";
-    const FRAME: &[u8] = b"hello-moq-over-iroh";
-    // Keep `broadcast` + `track` alive for the rest of the test: dropping the
-    // `BroadcastProducer`/`TrackProducer` un-announces the broadcast from the
-    // origin, so a late-joining subscriber would never see it. Only the group
-    // is dropped (it just finalizes that group's frames).
-    let mut broadcast = producer
-        .create_broadcast(BROADCAST)
-        .ok_or_else(|| anyhow!("create_broadcast denied"))?;
-    let mut track = broadcast.create_track(Track::new(TRACK))?;
-    {
-        let mut group = track.create_group(Group::from(0u64))?;
-        group.write_frame(Bytes::from_static(FRAME))?;
-        drop(group);
-    }
 
     // ─── Client: dial_stream via the shared process-global iroh endpoint ─────
     // `dial_stream`'s iroh arm reuses the same install-once client endpoint as
@@ -564,29 +544,19 @@ async fn moq_stream_pub_sub_round_trip_over_iroh() -> Result<()> {
         "dial_stream must return MoqStreamSession::Iroh for an iroh reach"
     );
 
-    // Run the moq handshake via the enum dispatcher, then subscribe + read.
-    let client_origin: OriginProducer = Origin::random().produce();
-    let client_consumer: OriginConsumer = client_origin.consume();
+    // Run the moq handshake via the enum dispatcher. Rejection must be prompt:
+    // success, timeout, or an outer timer error would all weaken fail-closed.
+    let client_origin = Origin::random().produce();
     let moq_client = Client::new().with_consume(client_origin);
-    let _moq_session = session
-        .connect_moq(&moq_client)
-        .await
-        .map_err(|e| anyhow!("moq handshake over iroh: {e}"))?;
-
-    let bc = tokio::time::timeout(
+    let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        client_consumer.announced_broadcast(BROADCAST),
+        session.connect_moq(&moq_client),
     )
-    .await?
-    .ok_or_else(|| anyhow!("broadcast '{BROADCAST}' not announced"))?;
-    let mut tc = bc.subscribe_track(&Track::new(TRACK))?;
-    let mut gc = tokio::time::timeout(std::time::Duration::from_secs(5), tc.next_group())
-        .await??
-        .ok_or_else(|| anyhow!("next_group returned None"))?;
-    let frame: Bytes = tokio::time::timeout(std::time::Duration::from_secs(5), gc.read_frame())
-        .await??
-        .ok_or_else(|| anyhow!("read_frame returned None"))?;
-    assert_eq!(&frame[..], FRAME, "moq frame must round-trip over iroh");
+    .await;
+    assert!(
+        matches!(result, Ok(Err(_))),
+        "anonymous MoQ handshake must be explicitly rejected, not succeed or time out"
+    );
 
     // Do NOT shut down the shared client endpoint (install-once global dialer).
     server.shutdown().await?;
@@ -594,22 +564,21 @@ async fn moq_stream_pub_sub_round_trip_over_iroh() -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// E4.1 (both ALPNs): one substrate serves RPC + moq concurrently
+// E4.1 (both ALPNs): RPC works while anonymous moq fails closed
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // The #410/#411 production posture: a SINGLE `IrohSubstrate` serves BOTH ALPNs
 // (`moql` + `hyprstream-rpc/1`) with the same node identity. This test binds one
-// substrate with a real moq handler AND a real RPC handler, then exercises BOTH
-// planes against it — proving the router dispatches by ALPN and that the two
-// planes do not interfere. This is the full E4 acceptance check in one process.
+// substrate with a real moq handler AND a real RPC handler, then exercises both
+// ALPNs: RPC completes, while MoQ rejects the anonymous carrier pending #1027.
+// This proves ALPN routing without treating the shared NodeId as identity.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn one_substrate_serves_both_alpns_rpc_and_moq() -> Result<()> {
+async fn one_substrate_serves_rpc_and_rejects_anonymous_moq() -> Result<()> {
     install_classical_verify_policy();
 
     // ─── Server: one substrate, two real handlers ───────────────────────────
     let shared = OriginShared::new();
-    let producer = shared.producer().clone();
     let moq_handler = IrohMoqProtocolHandler::with_origin(shared);
 
     let server_signing = fresh_signing_key();
@@ -626,22 +595,6 @@ async fn one_substrate_serves_both_alpns_rpc_and_moq() -> Result<()> {
     let server_node_id: [u8; 32] = *server.endpoint_id().as_bytes();
     let server_direct: Vec<std::net::SocketAddr> =
         server.endpoint().bound_sockets().into_iter().collect();
-
-    // Publish a frame so the moq plane has something to serve.
-    const BROADCAST: &str = "bob/run-2";
-    const TRACK: &str = "tokens";
-    const FRAME: &[u8] = b"both-alpns-frame";
-    // Keep `broadcast` + `track` alive past the subscriber's connect: dropping
-    // the producers un-announces the broadcast (see the moq-only test above).
-    let mut broadcast = producer
-        .create_broadcast(BROADCAST)
-        .ok_or_else(|| anyhow!("create_broadcast denied"))?;
-    let mut track = broadcast.create_track(Track::new(TRACK))?;
-    {
-        let mut group = track.create_group(Group::from(0u64))?;
-        group.write_frame(Bytes::from_static(FRAME))?;
-        drop(group);
-    }
 
     // ─── Client: the shared process-global endpoint dials BOTH ALPNs ────────
     // One shared client endpoint serves both the RPC `dial()` and the moq
@@ -668,28 +621,17 @@ async fn one_substrate_serves_both_alpns_rpc_and_moq() -> Result<()> {
     let session = dial_stream(&stream_cfg).await?;
     assert!(matches!(session, MoqStreamSession::Iroh(_)));
 
-    let client_origin: OriginProducer = Origin::random().produce();
-    let client_consumer: OriginConsumer = client_origin.consume();
+    let client_origin = Origin::random().produce();
     let moq_client = Client::new().with_consume(client_origin);
-    let _moq_session = session
-        .connect_moq(&moq_client)
-        .await
-        .map_err(|e| anyhow!("moq handshake over iroh: {e}"))?;
-
-    let bc = tokio::time::timeout(
+    let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        client_consumer.announced_broadcast(BROADCAST),
+        session.connect_moq(&moq_client),
     )
-    .await?
-    .ok_or_else(|| anyhow!("broadcast '{BROADCAST}' not announced"))?;
-    let mut tc = bc.subscribe_track(&Track::new(TRACK))?;
-    let mut gc = tokio::time::timeout(std::time::Duration::from_secs(5), tc.next_group())
-        .await??
-        .ok_or_else(|| anyhow!("next_group returned None"))?;
-    let frame: Bytes = tokio::time::timeout(std::time::Duration::from_secs(5), gc.read_frame())
-        .await??
-        .ok_or_else(|| anyhow!("read_frame returned None"))?;
-    assert_eq!(&frame[..], FRAME);
+    .await;
+    assert!(
+        matches!(result, Ok(Err(_))),
+        "anonymous MoQ handshake must be explicitly rejected without affecting RPC"
+    );
 
     // Do NOT shut down the shared client endpoint (install-once global dialer).
     server.shutdown().await?;

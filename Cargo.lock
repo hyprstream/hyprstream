@@ -6884,6 +6884,7 @@ dependencies = [
  "vte",
  "walkdir",
  "waxterm",
+ "web-transport-iroh",
  "xdg",
  "zeroize",
 ]

@@ -80,7 +80,7 @@ This document describes the RPC infrastructure used by hyprstream for inter-serv
 | **Inproc** | Same process, test harnesses | `InprocChannel` (in-memory) |
 | **UDS / ipc** | Same host (default) | `LazyUdsTransport` over Unix domain sockets |
 | **QUIC** | Remote, TLS 1.3 | `LazyQuinnTransport` (ALPN: `ALPN_HYPRSTREAM_RPC`) |
-| **iroh** | P2P / NAT-traversal | iroh substrate (Ed25519 node identity) |
+| **iroh** | P2P / NAT-traversal | iroh substrate (Ed25519 carrier address; no application identity authority) |
 
 All transports carry the same `SignedEnvelope`-wrapped Cap'n Proto frames via ZMTP 3.1 framing (the wire serialization only — a holdover from the retired ZeroMQ stack; no libzmq is involved). Only the wire transport layer differs; the application security model is identical.
 

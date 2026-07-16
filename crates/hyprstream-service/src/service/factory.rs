@@ -97,13 +97,8 @@ impl QuicSharedConfig {
             server_name: self.server_name.clone(),
             protected_resource_json: metadata,
             on_quic_bound: None,
-            // #282: bind iroh in parallel when the deployment opted in. The
-            // admission hook + on_iroh_bound advert callback are threaded by the
-            // service factory (which owns PolicyService / OAuthState); left None
-            // here so iroh, when enabled, runs accept-open until that wiring lands
-            // (documented seam — see service.rs spawner).
+            // #282: bind iroh in parallel when the deployment opted in.
             iroh_enabled: self.iroh_enabled,
-            iroh_admission: None,
             on_iroh_bound: None,
             // #358: thread the producer-chosen relay through so the spawner
             // advertises a Role::Relay reach + links the origin up to the relay.

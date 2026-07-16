@@ -210,19 +210,21 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                 // endpoint (on by default; `[quic] iroh = false` opts out), serving
                 // BOTH ALPNs (`hyprstream-rpc/1` + `moql`) with the SAME request
                 // processor + moq origin, in parallel to the quinn endpoint (kept
-                // for back-compat). The iroh endpoint's node key is the service's
-                // Ed25519 signing key, so its `node_id`
-                // (`== signing_key.verifying_key()`) is already covered by the
-                // node's published DID verification methods — and the #137 gate,
-                // when installed, matches an inbound peer's `remote_id()` against
-                // its DID. Discovery is iroh's built-in pkarr publisher + n0 DNS
+                // for back-compat). The iroh endpoint uses a domain-separated
+                // transport key, so its NodeId is not even byte-equal to the
+                // service signer. It remains only a carrier address, never a DID
+                // or admission input (#1031).
                 // (`presets::N0`), so this node is dial-by-node_id-discoverable.
                 //
                 // Kept alive in this scope via `_iroh_substrate`; on shutdown the
                 // spawned task calls `IrohSubstrate::shutdown` to drain handlers.
                 let _iroh_substrate_guard = if qc.iroh_enabled {
-                    let iroh_secret = signing_key.to_bytes();
-                    let node_id: [u8; 32] = signing_key.verifying_key().to_bytes();
+                    let iroh_transport_key = hyprstream_rpc::node_identity::derive_purpose_key(
+                        &signing_key,
+                        "hyprstream-iroh-transport-v1",
+                    );
+                    let iroh_secret = iroh_transport_key.to_bytes();
+                    let node_id: [u8; 32] = iroh_transport_key.verifying_key().to_bytes();
                     // moq plane: reuse the SAME global origin the quinn `/moq`
                     // path serves, so broadcasts are visible over both transports.
                     let moq_handler = match hyprstream_rpc::moq_stream::global_moq_origin() {
@@ -236,21 +238,12 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                         None => hyprstream_rpc::transport::iroh_moq::IrohMoqProtocolHandler::new(),
                     };
                     // RPC plane: same processor + signing key as the quinn path.
-                    let mut rpc_handler =
+                    let rpc_handler =
                         hyprstream_rpc::transport::iroh_rpc::IrohRpcProtocolHandler::with_stream_limit(
                             Arc::clone(&processor),
                             signing_key.clone(),
                             hyprstream_rpc::transport::rpc_session::DEFAULT_STREAM_LIMIT,
                         );
-                    let mut moq_handler = moq_handler;
-                    // #137/#282: apply the federation admission gate at both iroh
-                    // accept paths (origin + key-binding against `remote_id()`),
-                    // fail-closed. `None` → accept-open (documented seam until the
-                    // factory threads a gate down).
-                    if let Some(gate) = qc.iroh_admission.take() {
-                        rpc_handler = rpc_handler.with_admission(gate.clone());
-                        moq_handler = moq_handler.with_admission(gate);
-                    }
                     match hyprstream_rpc::transport::iroh_substrate::IrohSubstrate::new(
                         iroh_secret, moq_handler, rpc_handler,
                     )
@@ -258,7 +251,7 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                     {
                         Ok(substrate) => {
                             // Install the shared client endpoint (install-once) so
-                            // outbound iroh RPC/stream dials reuse this identity.
+                            // outbound iroh RPC/stream dials reuse this carrier.
                             let _ = hyprstream_rpc::transport::lazy_iroh::install_iroh_client_endpoint(
                                 substrate.endpoint().clone(),
                             );
@@ -266,7 +259,8 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                             // advertises an iroh-direct Destination for native
                             // peers (dial-by-node_id via pkarr; NAT + cross-instance).
                             let _ = hyprstream_rpc::moq_stream::init_global_iroh_node_id(node_id);
-                            // Advertise the `#iroh` VM only now that iroh is bound.
+                            // Advertise iroh reachability only now that the carrier
+                            // is bound; EndpointId is never application authority.
                             if let Some(cb) = qc.on_iroh_bound.take() {
                                 cb(service_name.clone(), node_id);
                             }

@@ -18,8 +18,8 @@
 //! one `IrohSubstrate` per QUIC-enabled service as the PRIMARY production
 //! endpoint (on by default; `[quic] iroh = false` opts out to quinn-only). The
 //! real `moql` and `hyprstream-rpc/1` handlers are threaded in by the spawner
-//! (#282), and the OAuth/DID-controller identity binds its own canonical
-//! federation substrate (`build_oauth_iroh_substrate`).
+//! (#282). OAuth binds a reach-only endpoint whose inbound ALPNs remain refused
+//! until independently verified application/session proof is wired.
 //!
 //! # D3 — iroh pkarr is LIVENESS-ONLY, never an authority source (#895)
 //!
@@ -34,13 +34,9 @@
 //!   claim* — but that says nothing about *which* federated identity (capsule,
 //!   `did:web`, `did:key`) controls N, what its PQ key material is, or whether
 //!   it may be admitted. **No identity / trust / admission decision is ever
-//!   derived from a pkarr record.** Identity is bound by the channel itself
-//!   (`Connection::remote_id()` == the peer's Ed25519 pubkey, verified by iroh's
-//!   QUIC TLS), and for a `did:at9p` peer the *authoritative* identity + PQ
-//!   binding comes only from a **GATE-verified capsule** (D1 / #893, served by
-//!   the at9p mainline locator). pkarr reach must be **confirmed by GATE-verified
-//!   capsule material before any authority is granted** — it is never itself the
-//!   source of that authority.
+//!   derived from a pkarr record.** `Connection::remote_id()` authenticates only
+//!   the carrier endpoint. Application identity requires independently resolved
+//!   current keys plus fresh inside-carrier proof (#1027).
 //! - **Two riders, one DHT, one trust posture.** Both iroh pkarr and the at9p
 //!   mainline locator (#890 / C2) ride the *same* mainline DHT. Only at9p is
 //!   zero-trust: its records are content-addressed (`did:at9p:<cid512>`) and
@@ -53,10 +49,8 @@
 //!   re-deriving) authority from it; it does not disable publication.
 //!
 //! Enforcement seams: the dial path (`crate::dial`) resolves *addresses* from a
-//! NodeId whose identity is already channel-bound, never trusting the pkarr
-//! body; admission (`crate::admission`, `crate::transport::iroh_admission`)
-//! reads only `remote_id()` + (for at9p) GATE-verified capsule keys — never
-//! pkarr. The wasm pkarr output is typed as an unverified reach hint
+//! NodeId as an address, never trusting pkarr for identity. Admission does not
+//! consume NodeId, `remote_id()`, or pkarr. The wasm pkarr output is typed as an unverified reach hint
 //! ([`crate::iroh_peer::PkarrReachHint`]) so it cannot be conflated with
 //! verified reach.
 //!
@@ -122,6 +116,34 @@ impl IrohSubstrate {
         Ok(Self::from_endpoint(endpoint, moq_handler, rpc_handler))
     }
 
+    /// Build a hermetic direct-only substrate for unit tests.
+    ///
+    /// Production uses [`presets::N0`] for discovery, pkarr publication, and
+    /// relay fallback. Unit carrier tests construct their target explicitly
+    /// from bound sockets, so those background paths add no coverage and can
+    /// race independent Tokio runtimes during parallel suite teardown. The
+    /// empty preset keeps the same QUIC crypto provider and real UDP carrier
+    /// while disabling discovery and relay workers.
+    #[cfg(test)]
+    pub(crate) async fn new_test<M, R>(
+        secret_key_bytes: [u8; 32],
+        moq_handler: M,
+        rpc_handler: R,
+    ) -> Result<Self>
+    where
+        M: Into<Box<dyn DynProtocolHandler>>,
+        R: Into<Box<dyn DynProtocolHandler>>,
+    {
+        let endpoint = Endpoint::builder(presets::Empty)
+            .secret_key(SecretKey::from_bytes(&secret_key_bytes))
+            .crypto_provider(crate::transport::pq_provider::pq_crypto_provider())
+            .bind()
+            .await
+            .map_err(|e| anyhow::anyhow!("test iroh endpoint bind: {e}"))?;
+
+        Ok(Self::from_endpoint(endpoint, moq_handler, rpc_handler))
+    }
+
     /// Wrap a caller-built endpoint. Useful when the caller wants
     /// non-default discovery (e.g. self-hosted `iroh-dns-server`), a
     /// non-default crypto provider, or to share an existing endpoint
@@ -142,8 +164,8 @@ impl IrohSubstrate {
         Self { endpoint, router }
     }
 
-    /// Endpoint id = our Ed25519 public key. Published in JWKS for
-    /// federation peer binding (Phase 6, issue #137).
+    /// Return this endpoint's carrier address for reach advertisement and
+    /// diagnostics. It is not a DID/JWKS key or application identity proof.
     pub fn endpoint_id(&self) -> EndpointId {
         self.endpoint.id()
     }
@@ -193,6 +215,30 @@ impl NoopHandler {
 impl ProtocolHandler for NoopHandler {
     async fn accept(&self, _conn: Connection) -> Result<(), AcceptError> {
         tracing::trace!(reason = %self.reason, "NoopHandler accepted (no-op)");
+        Ok(())
+    }
+}
+
+/// Fail-closed protocol handler for an ALPN that is intentionally disabled.
+///
+/// Unlike [`NoopHandler`], this explicitly closes the carrier connection. It is
+/// used where an endpoint may exist for outbound reach but no trustworthy
+/// application/session proof is available for inbound requests.
+#[derive(Debug, Clone)]
+pub struct RefuseHandler {
+    reason: &'static str,
+}
+
+impl RefuseHandler {
+    pub fn new(reason: &'static str) -> Self {
+        Self { reason }
+    }
+}
+
+impl ProtocolHandler for RefuseHandler {
+    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        tracing::warn!(reason = %self.reason, "refusing disabled iroh ALPN");
+        conn.close(0u32.into(), self.reason.as_bytes());
         Ok(())
     }
 }
@@ -255,12 +301,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn smoke_two_endpoints_two_alpns() -> Result<()> {
         // Server with EchoHandler on both ALPNs.
-        let server = IrohSubstrate::new(fresh_key(), EchoHandler, EchoHandler).await?;
+        let server = IrohSubstrate::new_test(fresh_key(), EchoHandler, EchoHandler).await?;
         let server_id = server.endpoint_id();
         let server_addr = direct_addr(&server);
 
         // Client with no-op handlers (it only originates).
-        let client = IrohSubstrate::new(
+        let client = IrohSubstrate::new_test(
             fresh_key(),
             NoopHandler::new("client moq"),
             NoopHandler::new("client rpc"),

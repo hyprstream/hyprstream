@@ -26,7 +26,6 @@ pub mod iroh_transport;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod iroh_moq;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod iroh_admission;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod in_memory;
 #[cfg(not(target_arch = "wasm32"))]
@@ -195,7 +194,7 @@ pub enum EndpointType {
     ///
     /// The optional NAT-traversing dial. Unlike QUIC's channel-only cert pin,
     /// iroh binds the connection to the peer's `EndpointId` (its Ed25519 public
-    /// key), so the transport itself authenticates the peer *identity*. All
+    /// key), authenticating only the carrier endpoint, not application identity. All
     /// fields are serializable primitives so `TransportConfig` stays
     /// `Clone + Eq` and wire-publishable (a DID-doc `service` entry).
     ///

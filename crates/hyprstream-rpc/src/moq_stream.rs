@@ -1224,7 +1224,7 @@ pub fn dial_transport_to_wire(
             server_name: server_name.clone(),
             cert_hashes: auth.accept_cert_hashes().iter().map(|h| h.to_vec()).collect(),
         })),
-        // The wire iroh reach carries identity (nodeId) + relay only; direct
+        // The wire iroh reach carries the carrier address (nodeId) + relay only; direct
         // addrs are not published (privacy + iroh discovery), matching the
         // DID-doc `IrohTransport` entry shape (#280/#282).
         EndpointType::Iroh { node_id, relay_url, .. } => Some(ReachTransport::Iroh(IrohReach {
@@ -1408,9 +1408,9 @@ const RELAY_RECONNECT_MAX: std::time::Duration = std::time::Duration::from_secs(
 /// `debug!` to `warn!` so a persistently-unreachable relay is observable.
 const RELAY_RECONNECT_WARN_AFTER: u32 = 5;
 
-/// Fail-closed relay-capability gate (#504 item 3) — assert the dialed relay
-/// endpoint is **cryptographically identity-pinned** before this node announces
-/// its origin UP to it (`with_origin`).
+/// Fail-closed relay path-integrity gate (#504 item 3) — assert the dial is
+/// pinned to the explicitly configured carrier endpoint before this node
+/// announces its origin UP to it (`with_origin`).
 ///
 /// ## The gap this closes
 /// [`run_relay_announce_link`] dials the producer-chosen relay and announces this
@@ -1419,46 +1419,45 @@ const RELAY_RECONNECT_WARN_AFTER: u32 = 5;
 /// announce-handshake exposes broadcast **metadata** to whatever endpoint answers.
 /// moq-net's session handshake exposes **no relay-role / announce-capability**
 /// negotiation (the setup parameters are opaque `Bytes` and `Client` offers no
-/// role hook), so the only signal we can gate on is the relay's **configured
-/// cryptographic identity** — exactly the signal the #356/#357/#358 reach work
-/// already plumbs through [`crate::transport::QuicServerAuth`] / the iroh
-/// `EndpointId`.
+/// role hook). Relay-role authorization is an upstream configuration/policy
+/// decision. This function only prevents path substitution by checking the
+/// configured cert pin or iroh `EndpointId`; it grants no role or identity.
 ///
 /// ## The check (fail-closed)
-/// - **iroh**: the connection is bound to the peer's `EndpointId` (its Ed25519
-///   public key), so the channel is identity-bound by construction — accepted.
+/// - **iroh**: the connection is bound to the configured carrier `EndpointId`,
+///   so target/path substitution is rejected. No application identity follows.
 /// - **QUIC, leaf-pinned** (`accept_cert_hashes` non-empty, with or without
 ///   WebPKI): the dialed peer must present a pinned leaf — accepted.
 /// - **QUIC, WebPKI-only** (`require_web_pki` with an EMPTY pin set): **rejected.**
 ///   WebPKI proves only "some cert valid for this SNI", so any holder of a
 ///   CA-valid cert for that name could be substituted as the relay and silently
 ///   receive our broadcast announcements. We will not announce our origin UP to
-///   an endpoint that is not pinned to a specific relay identity.
+///   an endpoint that is not pinned to the configured relay target.
 /// - **same-host (`Ipc`/`Inproc`/`SystemdFd`)**: not reachable here
 ///   ([`reach_to_transport_config`] yields `None` for them), but rejected
-///   defensively — they carry no transport-level peer identity.
+///   defensively — they carry no network target pin at this seam.
 ///
-/// Returns `Err` (and the caller skips `with_origin`) when the relay identity
-/// cannot be confirmed, rather than leaking announcements to an unverified
-/// endpoint.
-fn assert_relay_identity_pinned(cfg: &crate::transport::TransportConfig) -> Result<()> {
+/// Returns `Err` (and the caller skips `with_origin`) when target/path integrity
+/// cannot be confirmed, rather than leaking announcements to a substituted
+/// endpoint. Endpoint equality never authorizes application identity.
+fn assert_relay_path_pinned(cfg: &crate::transport::TransportConfig) -> Result<()> {
     use crate::transport::EndpointType;
     match &cfg.endpoint {
-        // iroh is identity-bound to the peer's Ed25519 EndpointId by the transport.
+        // Iroh pins the dial path to the configured EndpointId.
         EndpointType::Iroh { .. } => Ok(()),
-        // QUIC is identity-pinned iff a leaf-cert pin is required.
+        // QUIC target/path integrity requires a leaf-cert pin.
         EndpointType::Quic { auth, .. } => {
             if auth.accept_cert_hashes().is_empty() {
                 Err(anyhow!(
                     "relay endpoint is WebPKI-only (no leaf-cert pin): cannot confirm it is the \
-                     authorized relay identity — refusing to announce origin UP (fail-closed, #504)"
+                     configured relay target — refusing to announce origin UP (fail-closed, #504)"
                 ))
             } else {
                 Ok(())
             }
         }
         other => Err(anyhow!(
-            "relay endpoint {other:?} carries no transport-level peer identity — \
+            "relay endpoint {other:?} carries no network target pin — \
              refusing to announce origin UP (fail-closed, #504)"
         )),
     }
@@ -1542,13 +1541,13 @@ pub async fn run_relay_announce_link(
 
     // #504 item 3 — relay-capability gate (fail-closed): do NOT announce this
     // node's origin (broadcast track names / `broadcastPath`, traffic patterns)
-    // UP to an endpoint we cannot confirm is the authorized relay identity. moq
-    // exposes no relay-role handshake, so we gate on the relay's configured
-    // cryptographic identity (cert-hash pin / iroh EndpointId). A WebPKI-only
+    // UP to an endpoint whose path does not match the configured relay target.
+    // moq exposes no relay-role handshake; role authorization is upstream, while
+    // this seam checks only the cert-hash pin / iroh EndpointId. A WebPKI-only
     // (unpinned) or identity-less endpoint is refused here — surfaced loudly and
     // the announce is skipped — rather than leaking announcements to a
-    // misconfigured / substituted relay. See [`assert_relay_identity_pinned`].
-    if let Err(e) = assert_relay_identity_pinned(&cfg) {
+    // misconfigured / substituted relay. See [`assert_relay_path_pinned`].
+    if let Err(e) = assert_relay_path_pinned(&cfg) {
         tracing::warn!("moq relay announce gate: {e}");
         return Err(e);
     }
@@ -1904,9 +1903,9 @@ mod tests {
         Ok(())
     }
 
-    /// #320: the iroh reach codec round-trips dial↔wire and preserves identity
-    /// (nodeId) + relay; an empty-relay reach is decoded but is not dialable
-    /// (dial/dial_stream fail-fast on it — pkarr-only is deferred to #282).
+    /// #320: the iroh reach codec round-trips carrier address (nodeId) + relay.
+    /// An empty-relay reach remains stream-dialable through iroh discovery;
+    /// application RPC dialing separately requires explicit reach and proof.
     #[test]
     fn iroh_reach_dial_wire_roundtrip() {
         use crate::transport::{EndpointType, TransportConfig};
@@ -1942,8 +1941,9 @@ mod tests {
         assert!(dial_transport_to_wire(&TransportConfig::ipc("/tmp/x.sock")).is_none());
     }
 
-    /// #320: a wire iroh reach with an empty relayUrl decodes (identity preserved)
-    /// but is not dialable — `dial` fails fast rather than hang in discovery.
+    /// #320: a wire iroh reach with an empty relayUrl preserves its carrier
+    /// address. RPC `dial()` rejects it without explicit reachability and an
+    /// independently resolved response key; `dial_stream()` may use discovery.
     #[test]
     fn iroh_reach_empty_relay_decodes_but_not_dialable() {
         use crate::stream_info::{IrohReach, TransportConfig as ReachTransport};
@@ -1953,9 +1953,12 @@ mod tests {
             relay_url: String::new(),
         });
         let dial = wire_transport_to_dial(&wire).expect("decodes");
-        // No relay + no direct addrs ⇒ dial() fail-fast.
+        // No relay + no direct addrs ⇒ application RPC dial() fails fast.
         let signer = crate::signer::LocalSigner::new(crate::crypto::SigningKey::generate(&mut rand::rngs::OsRng));
-        assert!(crate::dial::dial(&dial, signer, None, None).is_err(), "unreachable iroh reach must not dial");
+        assert!(
+            crate::dial::dial(&dial, signer, None, None).is_err(),
+            "RPC dial must require explicit reachability and response proof"
+        );
     }
 
     /// #275: a StreamInfo carrying a dialable Quic reach must be classified as
@@ -2141,22 +2144,26 @@ mod tests {
         }
     }
 
-    // ── #504 item 3: relay-capability (identity-pin) gate ───────────────────
+    // ── #504 item 3: configured relay target/path pin gate ──────────────────
 
-    /// An iroh relay endpoint is identity-bound to its EndpointId by the
-    /// transport, so the announce-UP gate accepts it.
+    /// An iroh relay dial is pinned to the configured EndpointId, so path
+    /// substitution is rejected without treating equality as identity authority.
     #[test]
-    fn relay_gate_accepts_iroh_identity_bound() {
-        let cfg = crate::transport::TransportConfig::iroh([7u8; 32], Vec::new(), None);
-        assert!(assert_relay_identity_pinned(&cfg).is_ok());
+    fn relay_gate_accepts_iroh_target_pinned_without_granting_identity() {
+        // Equality or inequality with any application key cannot change this
+        // path-only result: both values are opaque carrier targets here.
+        for node_id in [[7u8; 32], [19u8; 32]] {
+            let cfg = crate::transport::TransportConfig::iroh(node_id, Vec::new(), None);
+            assert!(assert_relay_path_pinned(&cfg).is_ok());
+        }
     }
 
-    /// A leaf-cert-pinned QUIC relay is a confirmed identity — accepted.
+    /// A leaf-cert-pinned QUIC relay has a confirmed target path — accepted.
     #[test]
     fn relay_gate_accepts_quic_leaf_pinned() {
         let addr = "127.0.0.1:7777".parse().expect("addr");
         let cfg = crate::transport::TransportConfig::quic_pinned(addr, "relay", [3u8; 32]);
-        assert!(assert_relay_identity_pinned(&cfg).is_ok());
+        assert!(assert_relay_path_pinned(&cfg).is_ok());
     }
 
     /// A WebPKI-only QUIC relay (no leaf pin) proves only "some cert valid for
@@ -2166,7 +2173,7 @@ mod tests {
     fn relay_gate_rejects_quic_webpki_only() {
         let addr = "127.0.0.1:7777".parse().expect("addr");
         let cfg = crate::transport::TransportConfig::quic(addr, "relay");
-        let err = assert_relay_identity_pinned(&cfg).expect_err("WebPKI-only relay must be rejected");
+        let err = assert_relay_path_pinned(&cfg).expect_err("WebPKI-only relay must be rejected");
         assert!(
             err.to_string().contains("WebPKI-only"),
             "expected a WebPKI-only rejection, got: {err}"
@@ -2180,15 +2187,15 @@ mod tests {
         let addr = "127.0.0.1:7777".parse().expect("addr");
         let auth = crate::transport::QuicServerAuth::web_pki_pinned(vec![[5u8; 32]]).expect("auth");
         let cfg = crate::transport::TransportConfig::quic_with_auth(addr, "relay", auth);
-        assert!(assert_relay_identity_pinned(&cfg).is_ok());
+        assert!(assert_relay_path_pinned(&cfg).is_ok());
     }
 
-    /// A same-host endpoint carries no transport-level peer identity — rejected
-    /// (defensive; `reach_to_transport_config` already yields None for these).
+    /// A same-host endpoint carries no network target pin — rejected (defensive;
+    /// `reach_to_transport_config` already yields None for these).
     #[test]
-    fn relay_gate_rejects_identityless_same_host() {
+    fn relay_gate_rejects_unpinned_same_host() {
         let cfg = crate::transport::TransportConfig::inproc("hyprstream/x");
-        assert!(assert_relay_identity_pinned(&cfg).is_err());
+        assert!(assert_relay_path_pinned(&cfg).is_err());
     }
 
     /// A [`ProducerReachConfig`] with a server-global relay advertises a

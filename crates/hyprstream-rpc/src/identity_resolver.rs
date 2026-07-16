@@ -17,7 +17,7 @@
 //! the DID method:
 //!
 //! - **`did:web`** — resolve the DID document and extract its verification
-//!   methods. An Ed25519 VM (`#mesh` / `#iroh`) is the classical anchor; a
+//!   methods. An Ed25519 identity VM (for example `#mesh`) is the classical anchor; a
 //!   verified ML-DSA-65 VM (`#mesh-pq`, multicodec `0x1211`) is the PQ anchor.
 //!   Both present ⇒ [`Assurance::PqHybrid`] (a did:web we operate); Ed25519-only ⇒
 //!   [`Assurance::Classical`] (a third-party did:web). No Ed25519 VM ⇒ nothing to
@@ -77,8 +77,9 @@ pub trait DidDocumentProvider: Send + Sync {
 /// rpc-local key types so this crate need not depend on `hyprstream-pds` (pds
 /// depends on rpc; the dependency does not reverse).
 ///
-/// `ed25519` is the capsule's primary subject key — the iroh `NodeId` / channel
-/// identity. `ml_dsa_65` is the PQ half of the hybrid pair. A [`VerifiedAt9pKeys`]
+/// `ed25519` is the capsule's primary genesis identity key, not carrier metadata
+/// or live possession proof. `ml_dsa_65` is the PQ half of the
+/// hybrid pair. A [`VerifiedAt9pKeys`]
 /// is only constructable via [`VerifiedAt9pKeys::new_gate_verified`] — the GATE
 /// mint — which only an [`At9pCapsuleResolver`] that ran the A4 GATE pipeline
 /// (canon→hash→sig, #884) to completion reaches. The private fields make the
@@ -89,7 +90,7 @@ pub trait DidDocumentProvider: Send + Sync {
 /// assertion (the D2/#894 provenance boundary, hardened in #964).
 #[derive(Clone)]
 pub struct VerifiedAt9pKeys {
-    /// The verified Ed25519 subject key (the classical identity / channel key).
+    /// The content-verified Ed25519 genesis identity key.
     ed25519: [u8; 32],
     /// The verified ML-DSA-65 subject key bound to `ed25519` in the capsule.
     ml_dsa_65: MlDsaVerifyingKey,
@@ -116,7 +117,7 @@ impl VerifiedAt9pKeys {
         Self { ed25519, ml_dsa_65 }
     }
 
-    /// The verified Ed25519 subject key (the classical identity / channel key).
+    /// The content-verified Ed25519 genesis identity key.
     pub fn ed25519(&self) -> &[u8; 32] {
         &self.ed25519
     }
@@ -220,7 +221,7 @@ impl<P: DidDocumentProvider> MethodDispatchResolver<P> {
             .document(did.as_str())
             .map_err(|e| anyhow!("did:web {did} document did not resolve: {e}"))?;
 
-        // First Ed25519 VM is the classical anchor (the `#mesh` / `#iroh` key).
+        // First Ed25519 VM is the classical application-signing anchor.
         // A did:web with no Ed25519 VM cannot be bound (the PQ trust store is
         // keyed BY the Ed25519 identity), so fail closed.
         let ed25519 = verification_method_ed25519_keys(&doc).into_iter().next().ok_or_else(|| {

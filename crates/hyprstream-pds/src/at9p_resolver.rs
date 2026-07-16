@@ -52,10 +52,8 @@ impl At9pCapsuleResolver for At9pGateResolver {
             .map_err(|e| anyhow!("did:at9p {did} GATE rejected: {e}"))?;
         let capsule = verified.capsule();
 
-        // The primary subject key (index 0) is the hybrid identity: its Ed25519
-        // half is the iroh NodeId / channel key, its ML-DSA-65 half is the PQ
-        // anchor. `verify_capsule` (sig-gate) already confirmed the capsule's
-        // composite signature verifies against this keypair.
+        // The primary subject key is the hybrid genesis identity. Its Ed25519
+        // half is not a NodeId/channel key, and GATE is not live possession.
         let subject = capsule
             .body
             .subject_keys
@@ -96,7 +94,7 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use hyprstream_crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes, MlDsaSigningKey};
-    use hyprstream_rpc::admission::{admit_key_against_did, At9pAdmission, PeerChannelKey};
+    use hyprstream_rpc::admission::{admit_key_against_did, At9pAdmission, ApplicationSignerKey};
     use hyprstream_rpc::envelope::{KeyedPqTrustStore, PqTrustStore};
 
     use anyhow::Result as AnyResult;
@@ -196,7 +194,7 @@ mod tests {
         let admitted = admit_key_against_did(
             &NeverResolve,
             "https://peer.example",
-            PeerChannelKey(ed_arr),
+            ApplicationSignerKey(ed_arr),
             &did,
             None,
             Some(At9pAdmission { capsule_bytes: &bytes, gate: &gate, pq_store: &mut store }),
@@ -227,7 +225,7 @@ mod tests {
         let res = admit_key_against_did(
             &NeverResolve,
             "https://peer.example",
-            PeerChannelKey(ed),
+            ApplicationSignerKey(ed),
             &did,
             None,
             Some(At9pAdmission { capsule_bytes: &bytes, gate: &gate, pq_store: &mut store }),

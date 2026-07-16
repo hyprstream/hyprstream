@@ -9,10 +9,8 @@
 //! Peer **identity** is established at the application layer — the response
 //! `SignedEnvelope` is verified against the node's published keys (the `#mesh`
 //! verification method / JWKS). The transport entries here carry **reach info +
-//! channel auth**, not the identity root. For iroh the `nodeId` *is* the
-//! Ed25519 identity key (so [`DecodedEntry::identity_key`] is populated and the
-//! resolver can bind it to `#mesh`); for QUIC, identity comes from `#mesh`
-//! separately and the cert pin is channel-only (#185).
+//! channel mechanics**, not the identity root. An iroh `nodeId` is an endpoint
+//! address and must not manufacture identity or key authority (#1031).
 //!
 //! # Wire shape
 //!
@@ -44,16 +42,11 @@ use crate::transport::{QuicServerAuth, TransportConfig};
 /// multihash prefix for `sha2-256` with a 32-byte digest (`0x12` code, `0x20` len).
 const MULTIHASH_SHA2_256: [u8; 2] = [0x12, 0x20];
 
-/// A decoded transport entry: a dialable config plus, for identity-bearing
-/// transports, the peer's identity public key.
+/// A decoded transport entry containing only dialable reach information.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedEntry {
     /// Dial target for [`crate::dial::dial`].
     pub config: TransportConfig,
-    /// The peer's Ed25519 identity key, when the transport binds to it
-    /// (iroh: the `nodeId`). `None` for QUIC, where identity comes from the
-    /// `#mesh` verification method separately.
-    pub identity_key: Option<[u8; 32]>,
 }
 
 // ── multibase helpers ────────────────────────────────────────────────────────
@@ -147,7 +140,6 @@ fn decode_iroh(svc: &Value) -> Result<DecodedEntry> {
     let relay_url = relays.into_iter().next();
     Ok(DecodedEntry {
         config: TransportConfig::iroh(node_id, Vec::new(), relay_url),
-        identity_key: Some(node_id),
     })
 }
 
@@ -186,7 +178,6 @@ fn decode_quic(svc: &Value) -> Result<DecodedEntry> {
     };
     Ok(DecodedEntry {
         config: TransportConfig::quic_with_auth(addr, host, auth),
-        identity_key: None,
     })
 }
 
@@ -215,7 +206,6 @@ mod tests {
             "serviceEndpoint": encode_iroh(&node_id, &relays, &["hyprstream-rpc/1", "moql"]),
         });
         let decoded = decode_service_entry(&entry).unwrap();
-        assert_eq!(decoded.identity_key, Some(node_id));
         match &decoded.config.endpoint {
             EndpointType::Iroh { node_id: n, relay_url, direct_addrs } => {
                 assert_eq!(*n, node_id);
@@ -234,7 +224,6 @@ mod tests {
             "serviceEndpoint": encode_quic("https://10.0.0.1:4433", &auth, &["hyprstream-rpc/1"]),
         });
         let decoded = decode_service_entry(&entry).unwrap();
-        assert_eq!(decoded.identity_key, None);
         match &decoded.config.endpoint {
             EndpointType::Quic { addr, server_name, auth: a } => {
                 assert_eq!(addr.to_string(), "10.0.0.1:4433");

@@ -22,10 +22,11 @@ use crate::services::generated::oauth_client::{
 use super::user_service::{self, UserUpdate};
 use super::state::OAuthState;
 
-/// ZMQ RPC handler for OAuth user management.
+/// Local-control RPC handler for OAuth user management.
 ///
 /// Wraps `UserService` and implements the generated `OauthHandler` trait
-/// for Cap'n Proto serialization, and `RequestService` for ZMQ transport.
+/// for Cap'n Proto serialization. Network transports must not install this
+/// handler until they provide independently verified application/session proof.
 pub struct OAuthRpcHandler {
     state: Arc<OAuthState>,
     transport: TransportConfig,
@@ -79,11 +80,17 @@ impl OAuthRpcHandler {
 impl OauthHandler for OAuthRpcHandler {
     async fn authorize(
         &self,
-        _ctx: &EnvelopeContext,
+        ctx: &EnvelopeContext,
         _resource: &str,
         _operation: &str,
     ) -> Result<()> {
-        // ZMQ RPC is internal — service-to-service. All requests are authorized.
+        // This handler is restricted to the authenticated local control plane.
+        // Subject names (including JWT-derived `system` / `service:*`) cannot
+        // establish locality. OAuth iroh does not install this handler at all.
+        anyhow::ensure!(
+            ctx.is_local_caller(),
+            "OAuth user management requires an authenticated local service boundary"
+        );
         Ok(())
     }
 
