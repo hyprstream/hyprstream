@@ -90,6 +90,9 @@ struct RegistryRequest {
     # mirrors authorize_get_blob's per-repo "query" check, one verb up. A read
     # grant never implies write.
     putBlob @11 :PutBlobRequest $scope(write) $mcpDescription("Ingest content-addressed bytes; server computes the merkle and binds merkle→repo provenance");
+    # #1004: caller supplies untrusted bytes only; GATE/durable predecessor is authority.
+    ingestAt9pCandidate @12 :At9pCandidateRequest $scope(write)
+        $mcpDescription("Submit untrusted did:at9p genesis/update bytes to the durable acceptance PEP");
   }
 }
 
@@ -180,6 +183,7 @@ struct RegistryResponse {
     # Content-addressed blob ingest result — the SERVER-COMPUTED merkle (never
     # caller-supplied) plus the stored xorb set. See PutBlobResult / epic #654.
     putBlobResult @12 :PutBlobResult;
+    ingestAt9pCandidateResult @13 :AcceptedAt9pStateInfo;
   }
 }
 
@@ -409,6 +413,19 @@ struct PutBlobResult {
   xorbHashes @1 :List(Text);
   # Bytes actually stored after global dedup (0 if fully deduplicated).
   bytesStored @2 :UInt64;
+}
+
+enum At9pCandidateKind { genesis @0; successor @1; }
+struct At9pCandidateRequest {
+  did @0 :Text;
+  kind @1 :At9pCandidateKind;
+  recordBytes @2 :Data;
+}
+struct AcceptedAt9pStateInfo {
+  did @0 :Text;
+  epoch @1 :UInt64;
+  headDigest @2 :Data;
+  terminal @3 :Bool;
 }
 
 # Create Worktree Request (repoId removed — curried into RepositoryClient)

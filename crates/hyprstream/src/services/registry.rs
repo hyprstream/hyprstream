@@ -35,6 +35,7 @@ use crate::services::generated::registry_client::{
     CloneRequest, RegisterRequest,
     GetBlobRequest, GetBlobRequestContent,
     PutBlobRequest, PutBlobResult,
+    At9pCandidateRequest, At9pCandidateKind, AcceptedAt9pStateInfo,
     CreateWorktreeRequest, RemoveWorktreeRequest,
     BranchRequest, CheckoutRequest, StageFilesRequest,
     CommitRequest, MergeRequest, ContinueMergeRequest,
@@ -159,6 +160,7 @@ const FID_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Model-weight-scale blobs are NOT intended for the inline path; a streaming
 /// upload channel (additive schema follow-up) will carry those. 64 MiB.
 const MAX_INLINE_UPLOAD: u64 = 64 * 1024 * 1024;
+const MAX_AT9P_CANDIDATE_BYTES: usize = 4 * 1024 * 1024;
 
 fn now_epoch_secs() -> u64 {
     SystemTime::now()
@@ -340,7 +342,7 @@ pub struct RegistryService {
     /// Publishes/advances a repo's `ai.hyprstream.model` PDS record on
     /// register + commit (#910a). `None` means this node has no PDS
     /// configured — register/commit proceed exactly as before.
-    pds_publisher: Option<crate::services::discovery::PdsPublisher>,
+    pds_publisher: Option<Arc<crate::services::discovery::PdsPublisher>>,
 }
 
 /// Progress reporter that sends updates via a tokio mpsc channel.
@@ -435,7 +437,7 @@ impl RegistryService {
     /// `commitWithAuthor` (the RPC promote also drives) will publish/advance
     /// the repo's `ai.hyprstream.model` record through it.
     pub fn with_pds_publisher(mut self, publisher: crate::services::discovery::PdsPublisher) -> Self {
-        self.pds_publisher = Some(publisher);
+        self.pds_publisher = Some(Arc::new(publisher));
         self
     }
 
@@ -1842,6 +1844,37 @@ impl RegistryHandler for RegistryService {
             // Fail-closed: any deny/error → error response, nothing stored.
             Err(e) => Ok(reg_error(&format!("putBlob denied: {e}"))),
         }
+    }
+
+    async fn handle_ingest_at9p_candidate(&self, _ctx: &EnvelopeContext, _request_id: u64,
+        data: &At9pCandidateRequest,
+    ) -> Result<RegistryResponseVariant> {
+        let result = async {
+            anyhow::ensure!(!data.did.is_empty(), "did is required");
+            anyhow::ensure!(!data.record_bytes.is_empty(), "candidate bytes are required");
+            anyhow::ensure!(data.record_bytes.len() <= MAX_AT9P_CANDIDATE_BYTES, "candidate exceeds ingest cap");
+            let publisher = self.pds_publisher.as_ref()
+                .ok_or_else(|| anyhow!("accepted did:at9p ingest is not configured"))?;
+            let publisher = Arc::clone(publisher);
+            let did = data.did.clone();
+            let record_bytes = data.record_bytes.clone();
+            let kind = data.kind;
+            let now = chrono::Utc::now()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let state = tokio::task::spawn_blocking(move || match kind {
+                At9pCandidateKind::Genesis => publisher.ingest_at9p_genesis(&did, &record_bytes),
+                At9pCandidateKind::Successor => {
+                    publisher.ingest_at9p_successor(&did, &record_bytes, &now)
+                }
+            })
+            .await
+            .map_err(|error| anyhow!("at9p candidate worker failed: {error}"))??;
+            Ok::<_, anyhow::Error>(AcceptedAt9pStateInfo { did: state.did, epoch: state.epoch, head_digest: state.head_digest.to_vec(), terminal: state.terminal })
+        }.await;
+        Ok(match result {
+            Ok(info) => RegistryResponseVariant::IngestAt9pCandidateResult(info),
+            Err(error) => reg_error(&format!("at9p candidate rejected: {error}")),
+        })
     }
 
 }
@@ -3373,6 +3406,29 @@ mod tests {
     use hyprstream_service::ServiceManager;
     use tempfile::TempDir;
 
+    struct At9pTestSigner {
+        ed: ed25519_dalek::SigningKey,
+        pq: hyprstream_rpc::crypto::pq::MlDsaSigningKey,
+        pair: hyprstream_pds::at9p::HybridKeyPair,
+    }
+    fn at9p_test_signer(tag: u8) -> At9pTestSigner {
+        use hyprstream_rpc::crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes};
+        let mut seed = [0u8; 32]; seed[0] = tag;
+        let ed = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let (pq, vk) = ml_dsa_generate_keypair();
+        let pair = hyprstream_pds::at9p::HybridKeyPair::new(
+            ed.verifying_key().to_bytes().to_vec(), ml_dsa_vk_bytes(&vk)).unwrap();
+        At9pTestSigner { ed, pq, pair }
+    }
+    fn at9p_test_body(current: &At9pTestSigner, next: &[&At9pTestSigner], tag: &str) -> hyprstream_pds::at9p::CapsuleBody {
+        use hyprstream_pds::at9p::{CapsuleBody, ServiceEndpoint, ServiceEntry, ServiceType, Transport};
+        let service = ServiceEntry::new("#ns", ServiceType::NinePExport,
+            ServiceEndpoint::new(Transport::Iroh, format!("iroh://{tag}")).unwrap()).unwrap();
+        let mut body = CapsuleBody::new(vec![current.pair.clone()], vec![service]).unwrap();
+        body.next_key_commitments = next.iter().map(|s| s.pair.commitment_digest()).collect();
+        body
+    }
+
     #[tokio::test]
     async fn test_registry_service_health_check() {
         use hyprstream_service::InprocManager;
@@ -3439,6 +3495,91 @@ mod tests {
 
         // Stop the service
         let _ = handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn registry_rpc_is_live_at9p_candidate_boundary() {
+        use hyprstream_pds::at9p_sign::{sign_capsule, sign_update_record};
+        use hyprstream_service::InprocManager;
+        const NOW: &str = "2026-07-16T12:00:00Z";
+        let _ = hyprstream_rpc::envelope::install_verify_config(hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+            policy: hyprstream_rpc::crypto::CryptoPolicy::Classical, pq_store: None,
+        });
+        let root = TempDir::new().unwrap();
+        let models = root.path().join("models");
+        let pds = root.path().join("pds");
+        let (key, _) = generate_signing_keypair();
+        let policy_manager = Arc::new(PolicyManager::permissive().await.unwrap());
+        let policy_git = Arc::new(RwLock::new(Git2DB::open(&models).await.unwrap()));
+        let policy = PolicyService::new(policy_manager, Arc::new(key.clone()),
+            crate::config::TokenConfig::default(), policy_git,
+            TransportConfig::inproc("at9p-policy"));
+        let manager = InprocManager::new();
+        let policy_handle = manager.spawn(Box::new(policy)).await.unwrap();
+        let policy_client = PolicyClient::for_endpoint("inproc://at9p-policy", key.clone(), key.verifying_key(), None).unwrap();
+        let store = Arc::new(crate::services::discovery::PdsRecordStore::open(&pds).unwrap()
+            .with_at9p_acceptance_identity(key.verifying_key()));
+        let ingest = crate::services::discovery::At9pStateIngest::open(
+            Arc::clone(&store), &root.path().join("alarm"), key.clone(),
+            ed25519_dalek::SigningKey::from_bytes(&[81u8; 32]),
+            hyprstream_rpc::crypto::pq::ml_dsa_sk_from_seed(&[82u8; 32])).unwrap();
+        let publisher = crate::services::discovery::PdsPublisher::new(Arc::clone(&store),
+            "did:key:test".to_owned(), p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng))
+            .with_at9p_state_ingest(ingest);
+        let registry = RegistryService::new(&models, policy_client,
+            TransportConfig::inproc("at9p-registry"), key.clone()).await.unwrap()
+            .with_pds_publisher(publisher);
+        let mut handle = manager.spawn(Box::new(registry)).await.unwrap();
+        let client = RegistryClient::for_endpoint("inproc://at9p-registry", key.clone(), key.verifying_key(), None).unwrap();
+        let (g, n1, n2, n3) = (
+            at9p_test_signer(1), at9p_test_signer(2),
+            at9p_test_signer(3), at9p_test_signer(4),
+        );
+        let genesis = sign_capsule(at9p_test_body(&g, &[&n1], "genesis"), &g.ed, &g.pq).unwrap();
+        let genesis_bytes = genesis.to_dag_cbor().unwrap();
+        let cid = genesis.cid512().unwrap();
+        let did = format!("{}{}", hyprstream_pds::at9p_gate::DID_AT9P_PREFIX, cid);
+        assert_eq!(client.ingest_at9p_candidate(&At9pCandidateRequest {
+            did: did.clone(), kind: At9pCandidateKind::Genesis,
+            record_bytes: genesis_bytes.clone(),
+        }).await.unwrap().epoch, 0);
+        let update = sign_update_record(cid.clone(), 1, hyprstream_pds::at9p::h512(&genesis_bytes),
+            at9p_test_body(&n1, &[&n2], "rotated"), "2099-01-01T00:00:00Z".to_owned(), &n1.ed, &n1.pq).unwrap();
+        let accepted = client.ingest_at9p_candidate(&At9pCandidateRequest {
+            did: did.clone(), kind: At9pCandidateKind::Successor,
+            record_bytes: update.to_dag_cbor().unwrap(),
+        }).await.unwrap();
+        assert_eq!(accepted.epoch, 1);
+        let resolver = crate::services::discovery::PdsRecordResolver::new(Arc::clone(&store));
+        let state = resolver.accepted_at9p_state(&did, NOW).unwrap().unwrap();
+        assert_eq!(state.current.subject_keys[0], n1.pair);
+        let fork = sign_update_record(cid.clone(), 1, hyprstream_pds::at9p::h512(&genesis_bytes),
+            at9p_test_body(&n1, &[&n2], "fork"), "2099-01-01T00:00:00Z".to_owned(), &n1.ed, &n1.pq).unwrap();
+        assert!(client.ingest_at9p_candidate(&At9pCandidateRequest {
+            did: did.clone(), kind: At9pCandidateKind::Successor,
+            record_bytes: fork.to_dag_cbor().unwrap(),
+        }).await.is_err());
+        let expired = sign_update_record(cid.clone(), 2, state.head_digest,
+            at9p_test_body(&n2, &[], "expired"), "2026-01-01T00:00:00Z".to_owned(), &n2.ed, &n2.pq).unwrap();
+        assert!(client.ingest_at9p_candidate(&At9pCandidateRequest {
+            did: did.clone(), kind: At9pCandidateKind::Successor,
+            record_bytes: expired.to_dag_cbor().unwrap(),
+        }).await.is_err());
+        let terminal = sign_update_record(cid.clone(), 2, state.head_digest,
+            at9p_test_body(&n2, &[], "terminal"), "2099-01-01T00:00:00Z".to_owned(), &n2.ed, &n2.pq).unwrap();
+        let terminal_state = client.ingest_at9p_candidate(&At9pCandidateRequest {
+            did: did.clone(), kind: At9pCandidateKind::Successor,
+            record_bytes: terminal.to_dag_cbor().unwrap(),
+        }).await.unwrap();
+        assert!(terminal_state.terminal);
+        let after_terminal = sign_update_record(cid, 3, terminal_state.head_digest.try_into().unwrap(),
+            at9p_test_body(&n3, &[&n3], "forbidden"), "2099-01-01T00:00:00Z".to_owned(), &n3.ed, &n3.pq).unwrap();
+        assert!(client.ingest_at9p_candidate(&At9pCandidateRequest {
+            did, kind: At9pCandidateKind::Successor,
+            record_bytes: after_terminal.to_dag_cbor().unwrap(),
+        }).await.is_err());
+        let _ = handle.stop().await;
+        drop(policy_handle);
     }
 
     // ── #432 getBlob authz: the hash is NOT a capability ──────────────────────

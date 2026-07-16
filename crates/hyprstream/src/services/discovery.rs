@@ -15,6 +15,12 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context as _, Result as AnyResult};
 use hyprstream_discovery::{RecordCarData, RecordResolver};
+use hyprstream_pds::at9p::h512;
+use hyprstream_pds::at9p_duplicity::{
+    AcceptedAt9pHead, AcceptedAt9pState, ConditionalAdvance, DuplicityGuard,
+    WalDuplicityAlarmSink, Watermark, WatermarkStore,
+};
+use hyprstream_pds::at9p_gate::{verify_did_at9p, DID_AT9P_PREFIX};
 use hyprstream_pds::car::build_record_proof_car;
 use hyprstream_pds::commit::{Commit, UnsignedCommit};
 use hyprstream_pds::ledger::{AllocationRecord, CheckpointRecord, ReceiptRecord};
@@ -39,7 +45,6 @@ impl PolicyAuthProvider {
     pub fn new(client: crate::services::PolicyClient) -> Self {
         Self { client }
     }
-
 }
 
 #[async_trait(?Send)]
@@ -115,6 +120,27 @@ fn commit_key(did: &str) -> Vec<u8> {
     format!("commit\0{did}").into_bytes()
 }
 
+fn at9p_state_key(subject_cid512: &str) -> Vec<u8> {
+    format!("at9p-state\0{subject_cid512}").into_bytes()
+}
+fn at9p_checkpoint_key(subject_cid512: &str) -> Vec<u8> {
+    format!("at9p-checkpoint\0{subject_cid512}").into_bytes()
+}
+
+const AT9P_STATE_MAGIC: &[u8; 8] = b"AT9PST02";
+const AT9P_STATE_HEADER_LEN: usize = 8 + 1 + 8 + 64 + 1 + 4;
+const AT9P_ACCEPTANCE_MAGIC: &[u8; 8] = b"AT9PAC01";
+const ED25519_KEY_LEN: usize = 32;
+const ED25519_SIGNATURE_LEN: usize = 64;
+const AT9P_ACCEPTANCE_PREFIX_LEN: usize =
+    AT9P_ACCEPTANCE_MAGIC.len() + ED25519_KEY_LEN + ED25519_SIGNATURE_LEN;
+const AT9P_ACCEPTANCE_KEY_AAD: &[u8] = b"hyprstream-at9p-acceptance-key/1";
+const AT9P_ACCEPTANCE_STATE_AAD: &[u8] = b"hyprstream-at9p-accepted-state/1";
+const AT9P_CHECKPOINT_MAGIC: &[u8; 8] = b"AT9PCK01";
+const AT9P_CHECKPOINT_PAYLOAD_LEN: usize = 8 + 8 + 64 + 1 + 64;
+const AT9P_CHECKPOINT_LEN: usize = AT9P_CHECKPOINT_PAYLOAD_LEN + ED25519_SIGNATURE_LEN;
+const AT9P_CHECKPOINT_AAD: &[u8] = b"hyprstream-at9p-monotonic-checkpoint/1";
+
 /// Split a full record key back into `(collection, tid)`, given the `did` it
 /// was built for.
 fn parse_record_key(key: &[u8], did: &str) -> AnyResult<(String, Tid)> {
@@ -153,6 +179,11 @@ fn parse_record_key(key: &[u8], did: &str) -> AnyResult<(String, Tid)> {
 /// callers that need a live view reopen per read (see [`RecordBacking::ReadOnly`]).
 pub struct PdsRecordStore {
     backing: RecordBacking,
+    /// Trusted deployment identity that certifies the purpose-derived key on
+    /// daemon-authenticated accepted-state envelopes. This is verification
+    /// material only; the resolver still holds no signing key.
+    at9p_acceptance_identity: Option<ed25519_dalek::VerifyingKey>,
+    at9p_advance_lock: parking_lot::Mutex<()>,
 }
 
 enum RecordBacking {
@@ -176,7 +207,11 @@ impl PdsRecordStore {
         opts.create_if_missing(true);
         let db = rocksdb::DB::open(&opts, path)
             .with_context(|| format!("failed to open PDS record store (rw) at {path:?}"))?;
-        Ok(Self { backing: RecordBacking::ReadWrite(db) })
+        Ok(Self {
+            backing: RecordBacking::ReadWrite(db),
+            at9p_acceptance_identity: None,
+            at9p_advance_lock: parking_lot::Mutex::new(()),
+        })
     }
 
     /// Open the store read-only at `path`, for resolvers that never write
@@ -187,7 +222,17 @@ impl PdsRecordStore {
         let opts = readonly_opts();
         let _probe = rocksdb::DB::open_for_read_only(&opts, path, false)
             .with_context(|| format!("failed to open PDS record store (ro) at {path:?}"))?;
-        Ok(Self { backing: RecordBacking::ReadOnly(path.to_path_buf()) })
+        Ok(Self {
+            backing: RecordBacking::ReadOnly(path.to_path_buf()),
+            at9p_acceptance_identity: None,
+            at9p_advance_lock: parking_lot::Mutex::new(()),
+        })
+    }
+
+    /// Pin the deployment identity that certifies accepted-state envelopes.
+    pub fn with_at9p_acceptance_identity(mut self, identity: ed25519_dalek::VerifyingKey) -> Self {
+        self.at9p_acceptance_identity = Some(identity);
+        self
     }
 
     /// Atomically persist a record and the repo's freshly-signed commit.
@@ -211,6 +256,74 @@ impl PdsRecordStore {
         batch.put(commit_key(did), commit.to_dag_cbor());
         db.write(batch).context("PDS record+commit write failed")?;
         Ok(())
+    }
+
+    fn load_at9p_state(
+        &self,
+        subject_cid512: &str,
+        acceptance_identity: &ed25519_dalek::VerifyingKey,
+    ) -> AnyResult<Option<AcceptedAt9pState>> {
+        match &self.backing {
+            RecordBacking::ReadWrite(db) => load_at9p_state_from_db(db, subject_cid512, acceptance_identity),
+            RecordBacking::ReadOnly(path) => {
+                let db = rocksdb::DB::open_for_read_only(&readonly_opts(), path, false)?;
+                load_at9p_state_from_db(&db, subject_cid512, acceptance_identity)
+            }
+        }
+    }
+
+    /// Typed accepted-current state read path for resolver/admission consumers.
+    /// Read-only store instances reopen RocksDB for a live view, just like PDS
+    /// record resolution. `now` enforces update expiry when supplied.
+    pub fn accepted_at9p_state(
+        &self,
+        did: &str,
+        now: Option<&str>,
+    ) -> AnyResult<Option<AcceptedAt9pState>> {
+        let subject = did
+            .strip_prefix(DID_AT9P_PREFIX)
+            .ok_or_else(|| anyhow!("identifier is not did:at9p: {did:?}"))?;
+        let acceptance_identity = self
+            .at9p_acceptance_identity
+            .as_ref()
+            .ok_or_else(|| anyhow!("accepted-state verification identity is not configured"))?;
+        let Some(state) = self.load_at9p_state(subject, acceptance_identity)? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(state.did == did, "accepted at9p state DID mismatch");
+        if let Some(now) = now {
+            state.ensure_fresh(now)?;
+        }
+        Ok(Some(state))
+    }
+
+    fn conditional_advance_at9p_state(
+        &self,
+        expected: Option<Watermark>,
+        state: &AcceptedAt9pState,
+        acceptance_identity: &ed25519_dalek::SigningKey,
+        audit_key: &ed25519_dalek::SigningKey,
+    ) -> AnyResult<ConditionalAdvance> {
+        let RecordBacking::ReadWrite(db) = &self.backing else {
+            bail!("accepted did:at9p state write attempted on a read-only PDS store");
+        };
+        let _advance = self.at9p_advance_lock.lock();
+        let current = load_at9p_state_from_db(db, &state.subject_cid512, &acceptance_identity.verifying_key())?;
+        if current.as_ref().map(AcceptedAt9pState::watermark) != expected {
+            return current.map_or_else(
+                || bail!("conditional accepted-state advance expected a durable head, but none exists"),
+                |current| Ok(ConditionalAdvance::Conflict(Box::new(current))),
+            );
+        }
+        let encoded = encode_at9p_state(state, acceptance_identity, audit_key)?;
+        let checkpoint = encode_at9p_checkpoint(state, &encoded, acceptance_identity)?;
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put(at9p_state_key(&state.subject_cid512), encoded);
+        batch.put(at9p_checkpoint_key(&state.subject_cid512), checkpoint);
+        let mut options = rocksdb::WriteOptions::default();
+        options.set_sync(true);
+        db.write_opt(batch, &options).context("synchronous accepted did:at9p state+checkpoint commit failed")?;
+        Ok(ConditionalAdvance::Committed)
     }
 
     /// The stable record-key TID for `repo_id`, derived **deterministically**
@@ -300,11 +413,330 @@ impl PdsRecordStore {
     fn build_tree(records: &BTreeMap<(String, Tid), ModelRecord>) -> Node {
         let keyed: BTreeMap<String, hyprstream_pds::cid::Cid> = records
             .iter()
-            .map(|((collection, tid), rec)| {
-                (format!("{collection}/{}", tid.encode()), rec.cid())
-            })
+            .map(|((collection, tid), rec)| (format!("{collection}/{}", tid.encode()), rec.cid()))
             .collect();
         Node::from_keyed_records(&keyed)
+    }
+}
+
+fn acceptance_message(domain: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(domain.len() + payload.len());
+    message.extend_from_slice(domain);
+    message.extend_from_slice(payload);
+    message
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct At9pCheckpoint { watermark: Watermark, envelope_digest: [u8; 64] }
+
+fn checkpoint_message(subject: &str, payload: &[u8]) -> AnyResult<Vec<u8>> {
+    let len = u32::try_from(subject.len()).context("at9p subject exceeds u32")?;
+    let mut out = Vec::with_capacity(AT9P_CHECKPOINT_AAD.len() + 4 + subject.len() + payload.len());
+    out.extend_from_slice(AT9P_CHECKPOINT_AAD);
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(subject.as_bytes());
+    out.extend_from_slice(payload);
+    Ok(out)
+}
+
+fn encode_at9p_checkpoint(state: &AcceptedAt9pState, envelope: &[u8], identity: &ed25519_dalek::SigningKey) -> AnyResult<Vec<u8>> {
+    use ed25519_dalek::Signer as _;
+    let mut payload = Vec::with_capacity(AT9P_CHECKPOINT_LEN);
+    payload.extend_from_slice(AT9P_CHECKPOINT_MAGIC);
+    payload.extend_from_slice(&state.epoch.to_be_bytes());
+    payload.extend_from_slice(&state.head_digest);
+    payload.push(u8::from(state.terminal));
+    payload.extend_from_slice(&h512(envelope));
+    let sig = identity.sign(&checkpoint_message(&state.subject_cid512, &payload)?);
+    payload.extend_from_slice(&sig.to_bytes());
+    Ok(payload)
+}
+
+fn decode_at9p_checkpoint(subject: &str, bytes: &[u8], identity: &ed25519_dalek::VerifyingKey) -> AnyResult<At9pCheckpoint> {
+    anyhow::ensure!(bytes.len() == AT9P_CHECKPOINT_LEN, "accepted at9p checkpoint length mismatch");
+    let payload = bytes.get(..AT9P_CHECKPOINT_PAYLOAD_LEN)
+        .ok_or_else(|| anyhow!("accepted at9p checkpoint payload missing"))?;
+    anyhow::ensure!(payload.starts_with(AT9P_CHECKPOINT_MAGIC), "accepted at9p checkpoint has bad version");
+    let sig = ed25519_dalek::Signature::from_bytes(bytes.get(AT9P_CHECKPOINT_PAYLOAD_LEN..)
+        .ok_or_else(|| anyhow!("accepted at9p checkpoint signature missing"))?.try_into()?);
+    identity.verify_strict(&checkpoint_message(subject, payload)?, &sig)
+        .context("accepted at9p monotonic checkpoint signature rejected")?;
+    let epoch = u64::from_be_bytes(payload.get(8..16).ok_or_else(|| anyhow!("checkpoint epoch missing"))?.try_into()?);
+    let record_digest = payload.get(16..80).ok_or_else(|| anyhow!("checkpoint digest missing"))?.try_into()?;
+    let terminal = match payload.get(80) { Some(0) => false, Some(1) => true, _ => bail!("invalid checkpoint terminal flag") };
+    Ok(At9pCheckpoint {
+        watermark: Watermark { epoch, record_digest, terminal },
+        envelope_digest: payload.get(81..145).ok_or_else(|| anyhow!("checkpoint envelope digest missing"))?.try_into()?,
+    })
+}
+
+fn load_at9p_state_from_db(db: &rocksdb::DB, subject: &str, identity: &ed25519_dalek::VerifyingKey) -> AnyResult<Option<AcceptedAt9pState>> {
+    let snapshot = db.snapshot();
+    let envelope = snapshot.get(at9p_state_key(subject))?;
+    let checkpoint = snapshot.get(at9p_checkpoint_key(subject))?;
+    match (envelope, checkpoint) {
+        (None, None) => Ok(None),
+        (Some(_), None) => bail!("accepted at9p state exists without its monotonic checkpoint"),
+        (None, Some(_)) => bail!("accepted at9p checkpoint exists without its state envelope"),
+        (Some(envelope), Some(checkpoint)) => {
+            let state = decode_at9p_state(subject, &envelope, identity)?;
+            let checkpoint = decode_at9p_checkpoint(subject, &checkpoint, identity)?;
+            anyhow::ensure!(checkpoint.watermark == state.watermark(), "accepted at9p checkpoint/body watermark mismatch");
+            anyhow::ensure!(checkpoint.envelope_digest == h512(&envelope), "accepted at9p checkpoint/state envelope mismatch");
+            Ok(Some(state))
+        }
+    }
+}
+
+fn encode_at9p_state_body(state: &AcceptedAt9pState) -> AnyResult<Vec<u8>> {
+    let (kind, head) = match state.head() {
+        AcceptedAt9pHead::Genesis(capsule) => (0u8, capsule.to_dag_cbor()?),
+        AcceptedAt9pHead::Update(record) => (1u8, record.to_dag_cbor()?),
+    };
+    let head_len = u32::try_from(head.len()).context("accepted at9p head exceeds u32")?;
+    let mut out = Vec::with_capacity(AT9P_STATE_HEADER_LEN + head.len());
+    out.extend_from_slice(AT9P_STATE_MAGIC);
+    out.push(kind);
+    out.extend_from_slice(&state.epoch.to_be_bytes());
+    out.extend_from_slice(&state.head_digest);
+    out.push(u8::from(state.terminal));
+    out.extend_from_slice(&head_len.to_be_bytes());
+    out.extend_from_slice(&head);
+    Ok(out)
+}
+
+/// Wrap one complete state value in a daemon-authenticated envelope. The
+/// stable deployment identity certifies the purpose-derived audit key, and the
+/// audit key signs the exact state bytes. A different internally valid at9p
+/// fork therefore cannot be substituted by someone who can edit RocksDB.
+fn encode_at9p_state(
+    state: &AcceptedAt9pState,
+    acceptance_identity: &ed25519_dalek::SigningKey,
+    audit_key: &ed25519_dalek::SigningKey,
+) -> AnyResult<Vec<u8>> {
+    use ed25519_dalek::Signer as _;
+
+    let body = encode_at9p_state_body(state)?;
+    let audit_vk = audit_key.verifying_key().to_bytes();
+    let key_signature =
+        acceptance_identity.sign(&acceptance_message(AT9P_ACCEPTANCE_KEY_AAD, &audit_vk));
+    let state_signature = audit_key.sign(&acceptance_message(AT9P_ACCEPTANCE_STATE_AAD, &body));
+    let mut out =
+        Vec::with_capacity(AT9P_ACCEPTANCE_PREFIX_LEN + body.len() + ED25519_SIGNATURE_LEN);
+    out.extend_from_slice(AT9P_ACCEPTANCE_MAGIC);
+    out.extend_from_slice(&audit_vk);
+    out.extend_from_slice(&key_signature.to_bytes());
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&state_signature.to_bytes());
+    Ok(out)
+}
+
+fn decode_at9p_state(
+    subject_cid512: &str,
+    bytes: &[u8],
+    acceptance_identity: &ed25519_dalek::VerifyingKey,
+) -> AnyResult<AcceptedAt9pState> {
+    anyhow::ensure!(
+        bytes.len() >= AT9P_ACCEPTANCE_PREFIX_LEN + AT9P_STATE_HEADER_LEN + ED25519_SIGNATURE_LEN,
+        "accepted at9p envelope is truncated"
+    );
+    anyhow::ensure!(
+        bytes.starts_with(AT9P_ACCEPTANCE_MAGIC),
+        "accepted at9p envelope has bad version"
+    );
+    let audit_vk_bytes: [u8; ED25519_KEY_LEN] = bytes
+        .get(AT9P_ACCEPTANCE_MAGIC.len()..AT9P_ACCEPTANCE_MAGIC.len() + ED25519_KEY_LEN)
+        .ok_or_else(|| anyhow!("accepted at9p envelope missing audit key"))?
+        .try_into()?;
+    let key_sig_start = AT9P_ACCEPTANCE_MAGIC.len() + ED25519_KEY_LEN;
+    let key_sig_end = key_sig_start + ED25519_SIGNATURE_LEN;
+    let key_signature = ed25519_dalek::Signature::from_bytes(
+        bytes
+            .get(key_sig_start..key_sig_end)
+            .ok_or_else(|| anyhow!("accepted at9p envelope missing key certificate"))?
+            .try_into()?,
+    );
+    acceptance_identity
+        .verify_strict(
+            &acceptance_message(AT9P_ACCEPTANCE_KEY_AAD, &audit_vk_bytes),
+            &key_signature,
+        )
+        .context("accepted at9p audit-key certificate rejected")?;
+    let audit_vk = ed25519_dalek::VerifyingKey::from_bytes(&audit_vk_bytes)
+        .context("accepted at9p envelope has malformed audit key")?;
+    let state_sig_start = bytes.len() - ED25519_SIGNATURE_LEN;
+    let body = bytes
+        .get(AT9P_ACCEPTANCE_PREFIX_LEN..state_sig_start)
+        .ok_or_else(|| anyhow!("accepted at9p envelope missing state body"))?;
+    let state_signature = ed25519_dalek::Signature::from_bytes(
+        bytes
+            .get(state_sig_start..)
+            .ok_or_else(|| anyhow!("accepted at9p envelope missing state signature"))?
+            .try_into()?,
+    );
+    audit_vk
+        .verify_strict(
+            &acceptance_message(AT9P_ACCEPTANCE_STATE_AAD, body),
+            &state_signature,
+        )
+        .context("accepted at9p daemon acceptance signature rejected")?;
+    decode_at9p_state_body(subject_cid512, body)
+}
+
+fn decode_at9p_state_body(subject_cid512: &str, bytes: &[u8]) -> AnyResult<AcceptedAt9pState> {
+    anyhow::ensure!(
+        bytes.len() >= AT9P_STATE_HEADER_LEN,
+        "accepted at9p state is truncated"
+    );
+    anyhow::ensure!(
+        bytes.starts_with(AT9P_STATE_MAGIC),
+        "accepted at9p state has bad version"
+    );
+    let kind = *bytes
+        .get(8)
+        .ok_or_else(|| anyhow!("accepted at9p state missing kind"))?;
+    let epoch = u64::from_be_bytes(
+        bytes
+            .get(9..17)
+            .ok_or_else(|| anyhow!("accepted at9p state missing epoch"))?
+            .try_into()?,
+    );
+    let digest: [u8; 64] = bytes
+        .get(17..81)
+        .ok_or_else(|| anyhow!("accepted at9p state missing digest"))?
+        .try_into()?;
+    let terminal = match bytes
+        .get(81)
+        .ok_or_else(|| anyhow!("accepted at9p state missing terminal flag"))?
+    {
+        0 => false,
+        1 => true,
+        _ => bail!("accepted at9p state has invalid terminal flag"),
+    };
+    let head_len = u32::from_be_bytes(
+        bytes
+            .get(82..86)
+            .ok_or_else(|| anyhow!("accepted at9p state missing length"))?
+            .try_into()?,
+    ) as usize;
+    anyhow::ensure!(
+        bytes.len() == AT9P_STATE_HEADER_LEN + head_len,
+        "accepted at9p state length mismatch"
+    );
+    let head = bytes
+        .get(AT9P_STATE_HEADER_LEN..)
+        .ok_or_else(|| anyhow!("accepted at9p state missing head"))?;
+    let state = match kind {
+        0 => AcceptedAt9pState::from_persisted_genesis(head)?,
+        1 => AcceptedAt9pState::from_persisted_update(head)?,
+        _ => bail!("accepted at9p state has unknown head kind {kind}"),
+    };
+    anyhow::ensure!(
+        state.subject_cid512 == subject_cid512,
+        "accepted at9p state subject mismatch"
+    );
+    anyhow::ensure!(
+        state.epoch == epoch,
+        "accepted at9p state epoch/body mismatch"
+    );
+    anyhow::ensure!(
+        state.head_digest == digest,
+        "accepted at9p state digest/body mismatch"
+    );
+    anyhow::ensure!(
+        state.terminal == terminal,
+        "accepted at9p state terminal/body mismatch"
+    );
+    Ok(state)
+}
+
+#[derive(Clone)]
+struct RocksAt9pStateStore {
+    store: Arc<PdsRecordStore>,
+    acceptance_identity: ed25519_dalek::SigningKey,
+    audit_key: ed25519_dalek::SigningKey,
+}
+
+impl WatermarkStore for RocksAt9pStateStore {
+    fn get(&self, subject_cid512: &str) -> AnyResult<Option<AcceptedAt9pState>> {
+        self.store
+            .load_at9p_state(subject_cid512, &self.acceptance_identity.verifying_key())
+    }
+
+    fn conditional_advance(&self, expected: Option<Watermark>, state: &AcceptedAt9pState) -> AnyResult<ConditionalAdvance> {
+        self.store.conditional_advance_at9p_state(expected, state, &self.acceptance_identity, &self.audit_key)
+    }
+}
+
+/// Sole production ownership boundary for accepted current `did:at9p` state.
+/// It GATE-seeds genesis, reloads predecessors exclusively from durable state,
+/// calls the duplicity guard for every successor, and atomically commits the
+/// complete accepted head. It does not dial, select reach, or admit carriers.
+pub struct At9pStateIngest {
+    guard: DuplicityGuard<RocksAt9pStateStore, WalDuplicityAlarmSink>,
+}
+
+impl At9pStateIngest {
+    pub fn open(
+        store: Arc<PdsRecordStore>,
+        alarm_path: &Path,
+        acceptance_identity: ed25519_dalek::SigningKey,
+        audit_ed_sk: ed25519_dalek::SigningKey,
+        pq_sk: hyprstream_rpc::crypto::pq::MlDsaSigningKey,
+    ) -> AnyResult<Self> {
+        let guard = DuplicityGuard::with_durable_alarm(
+            RocksAt9pStateStore {
+                store,
+                acceptance_identity,
+                audit_key: audit_ed_sk.clone(),
+            },
+            alarm_path,
+            audit_ed_sk,
+            pq_sk,
+        )?;
+        Ok(Self { guard })
+    }
+
+    pub fn ingest_genesis(&self, did: &str, capsule_bytes: &[u8]) -> AnyResult<AcceptedAt9pState> {
+        let verified = verify_did_at9p(did, capsule_bytes)
+            .map_err(|e| anyhow!("did:at9p genesis ingest rejected: {e}"))?;
+        self.guard.seed_genesis(&verified)?;
+        self.accepted_state(did, None)
+    }
+
+    pub fn ingest_successor(
+        &self,
+        did: &str,
+        update_bytes: &[u8],
+        now: &str,
+    ) -> AnyResult<AcceptedAt9pState> {
+        let subject = did
+            .strip_prefix(DID_AT9P_PREFIX)
+            .ok_or_else(|| anyhow!("identifier is not did:at9p: {did:?}"))?;
+        let candidate = hyprstream_pds::at9p::UpdateRecord::from_dag_cbor(update_bytes)?;
+        anyhow::ensure!(
+            candidate.subject_cid512 == subject,
+            "update subject does not match ingest DID"
+        );
+        self.guard.admit_successor(&candidate, now)?;
+        self.accepted_state(did, Some(now))
+    }
+
+    /// Read the complete accepted snapshot. Supplying `now` enforces successor
+    /// expiry before the state is exposed to a consumer.
+    pub fn accepted_state(&self, did: &str, now: Option<&str>) -> AnyResult<AcceptedAt9pState> {
+        let subject = did
+            .strip_prefix(DID_AT9P_PREFIX)
+            .ok_or_else(|| anyhow!("identifier is not did:at9p: {did:?}"))?;
+        let state = self
+            .guard
+            .accepted_state(subject)?
+            .ok_or_else(|| anyhow!("no accepted did:at9p state for {did}"))?;
+        anyhow::ensure!(state.did == did, "accepted at9p state DID mismatch");
+        if let Some(now) = now {
+            state.ensure_fresh(now)?;
+        }
+        Ok(state)
     }
 }
 
@@ -351,6 +783,7 @@ fn harden_store_dir(path: &Path) {
 /// The resolver never sees the key.
 pub struct PdsPublisher {
     store: Arc<PdsRecordStore>,
+    at9p_state: Option<At9pStateIngest>,
     /// This node's own `did:key` identity — the `repo` at-uri authority for
     /// every record this node publishes (single-node, self-hosted PDS; a
     /// per-account DID scheme is out of scope for #910a).
@@ -380,10 +813,53 @@ impl PdsPublisher {
     ) -> Self {
         Self {
             store,
+            at9p_state: None,
             did,
             signing_key,
             publish_lock: parking_lot::Mutex::new(()),
         }
+    }
+
+    /// Install the daemon-owned accepted-state ingest boundary. Production
+    /// construction always calls this; the optional form keeps isolated PDS
+    /// pointer-store tests free of unrelated audit-key setup.
+    pub fn with_at9p_state_ingest(mut self, ingest: At9pStateIngest) -> Self {
+        self.at9p_state = Some(ingest);
+        self
+    }
+
+    pub fn ingest_at9p_genesis(
+        &self,
+        did: &str,
+        capsule_bytes: &[u8],
+    ) -> AnyResult<AcceptedAt9pState> {
+        self.at9p_state
+            .as_ref()
+            .ok_or_else(|| anyhow!("accepted did:at9p ingest is not configured"))?
+            .ingest_genesis(did, capsule_bytes)
+    }
+
+    pub fn ingest_at9p_successor(
+        &self,
+        did: &str,
+        update_bytes: &[u8],
+        now: &str,
+    ) -> AnyResult<AcceptedAt9pState> {
+        self.at9p_state
+            .as_ref()
+            .ok_or_else(|| anyhow!("accepted did:at9p ingest is not configured"))?
+            .ingest_successor(did, update_bytes, now)
+    }
+
+    pub fn accepted_at9p_state(
+        &self,
+        did: &str,
+        now: Option<&str>,
+    ) -> AnyResult<AcceptedAt9pState> {
+        self.at9p_state
+            .as_ref()
+            .ok_or_else(|| anyhow!("accepted did:at9p ingest is not configured"))?
+            .accepted_state(did, now)
     }
 
     /// Publish (or advance) the `ai.hyprstream.model` record for `repo_id`,
@@ -556,14 +1032,17 @@ fn next_rev(prev: Tid) -> Tid {
 /// there. Once that lands, swap this call for the real encoder; nothing else
 /// in the publish path needs to change.
 fn git_oid_to_cid_string(oid_hex: &str) -> AnyResult<String> {
-    let oid_bytes = hex::decode(oid_hex).with_context(|| format!("git OID {oid_hex:?} is not valid hex"))?;
+    let oid_bytes =
+        hex::decode(oid_hex).with_context(|| format!("git OID {oid_hex:?} is not valid hex"))?;
     Ok(hyprstream_pds::cid::Cid::from_raw(&oid_bytes).encode())
 }
 
 /// The current UTC time in the atproto `datetime` lexicon format
 /// (ISO-8601, millisecond precision, trailing `Z`).
 fn atproto_datetime_now() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
 }
 
 /// `RecordResolver` over a [`PdsRecordStore`]. Builds CAR proofs via the
@@ -577,6 +1056,14 @@ pub struct PdsRecordResolver {
 impl PdsRecordResolver {
     pub fn new(store: Arc<PdsRecordStore>) -> Self {
         Self { store }
+    }
+
+    pub fn accepted_at9p_state(
+        &self,
+        did: &str,
+        now: &str,
+    ) -> AnyResult<Option<AcceptedAt9pState>> {
+        self.store.accepted_at9p_state(did, Some(now))
     }
 }
 
@@ -610,7 +1097,12 @@ fn proof_car(
         .proof(collection, &tid)
         .ok_or_else(|| anyhow!("record present but no MST proof — store inconsistent"))?;
     let (_root_data, node_blocks) = tree.to_node_data_with_blocks();
-    Ok(build_record_proof_car(&repo.commit, &proof, &node_blocks, record))
+    Ok(build_record_proof_car(
+        &repo.commit,
+        &proof,
+        &node_blocks,
+        record,
+    ))
 }
 
 #[async_trait(?Send)]
@@ -673,7 +1165,12 @@ impl RecordResolver for PdsRecordResolver {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod pds_store_tests {
     use super::*;
     use hyprstream_pds::car::{parse_car_v1, verify_record_proof};
@@ -743,7 +1240,10 @@ mod pds_store_tests {
 
         // Reconstruct the proof the same way the resolver does (store holds no
         // key), and run the offline verifier against the published key.
-        let repo = store.load_repo(DID).expect("load ok").expect("repo present");
+        let repo = store
+            .load_repo(DID)
+            .expect("load ok")
+            .expect("repo present");
         let tid = PdsRecordStore::tid_for_repo("repo-a");
         let record = repo
             .records
@@ -769,7 +1269,9 @@ mod pds_store_tests {
         let first = store.load_repo(DID).expect("load").expect("repo").commit;
         assert!(first.prev.is_none(), "genesis commit has no prev");
 
-        publisher.publish("repo-a", SAMPLE_OID_2).expect("publish 2");
+        publisher
+            .publish("repo-a", SAMPLE_OID_2)
+            .expect("publish 2");
         let second = store.load_repo(DID).expect("load").expect("repo").commit;
         assert_eq!(
             second.prev,
@@ -846,10 +1348,15 @@ mod pds_store_tests {
             .expect("resolve ok")
             .expect("record present");
         assert_eq!(got.uri, format!("at://{DID}/{collection}/{}", tid.encode()));
-        commit_from_car(&got.car).verify(vk).expect("commit verifies");
+        commit_from_car(&got.car)
+            .verify(vk)
+            .expect("commit verifies");
 
         // Full offline proof, reconstructed the way the resolver does it.
-        let repo = store.load_repo(DID).expect("load ok").expect("repo present");
+        let repo = store
+            .load_repo(DID)
+            .expect("load ok")
+            .expect("repo present");
         let record = repo
             .records
             .get(&(collection.to_owned(), tid))
@@ -876,7 +1383,9 @@ mod pds_store_tests {
 
         let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
         let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
-        publisher.publish("repo-a", SAMPLE_OID).expect("publish model");
+        publisher
+            .publish("repo-a", SAMPLE_OID)
+            .expect("publish model");
         publisher
             .publish_record(NAME_COLLECTION, "name-a", SAMPLE_OID_2)
             .expect("publish name");
@@ -942,7 +1451,12 @@ mod pds_store_tests {
 
         // Each ledger collection resolves with a valid keyless proof.
         resolve_and_verify(&store, &vk, alloc_ns::COLLECTION_NSID, &alloc.grant);
-        resolve_and_verify(&store, &vk, receipt_ns::COLLECTION_NSID, &receipt.transfer_id);
+        resolve_and_verify(
+            &store,
+            &vk,
+            receipt_ns::COLLECTION_NSID,
+            &receipt.transfer_id,
+        );
 
         // The published pointer's currentOid is the ledger record's content CID —
         // the record is content-addressed, so its bytes are recoverable/verifiable.
@@ -970,7 +1484,9 @@ mod pds_store_tests {
 
         let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
         let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
-        publisher.publish("repo-a", SAMPLE_OID).expect("publish model");
+        publisher
+            .publish("repo-a", SAMPLE_OID)
+            .expect("publish model");
         let tid_a = PdsRecordStore::tid_for_repo("repo-a");
         let record_a_before = store
             .load_repo(DID)
@@ -993,7 +1509,10 @@ mod pds_store_tests {
             .get(&(COLLECTION_NSID.to_owned(), tid_a))
             .cloned()
             .expect("record a still present");
-        assert_eq!(record_a_before, record_a_after, "B write must not touch A's record");
+        assert_eq!(
+            record_a_before, record_a_after,
+            "B write must not touch A's record"
+        );
         resolve_and_verify(&store, &vk, COLLECTION_NSID, "repo-a");
         resolve_and_verify(&store, &vk, NAME_COLLECTION, "name-a");
 
@@ -1003,7 +1522,10 @@ mod pds_store_tests {
         let resolver = PdsRecordResolver::new(Arc::clone(&store));
         let cross = block_on(resolver.resolve_record(DID, COLLECTION_NSID, &tid_name.encode()))
             .expect("resolve ok");
-        assert!(cross.is_none(), "collections must not alias onto each other");
+        assert!(
+            cross.is_none(),
+            "collections must not alias onto each other"
+        );
     }
 
     #[test]
@@ -1119,5 +1641,446 @@ mod pds_store_tests {
         assert_eq!(first, second, "the same repo must always get the same rkey");
         let other = PdsRecordStore::tid_for_repo("repo-b");
         assert_ne!(first, other, "distinct repos must not alias onto one rkey");
+    }
+
+    struct At9pSigner {
+        ed: ed25519_dalek::SigningKey,
+        pq: hyprstream_rpc::crypto::pq::MlDsaSigningKey,
+        pair: hyprstream_pds::at9p::HybridKeyPair,
+    }
+
+    fn at9p_signer(tag: u8) -> At9pSigner {
+        use hyprstream_rpc::crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes};
+        let mut seed = [0u8; 32];
+        seed[0] = tag;
+        seed[31] = tag.wrapping_add(17);
+        let ed = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let (pq, pq_vk) = ml_dsa_generate_keypair();
+        let pair = hyprstream_pds::at9p::HybridKeyPair::new(
+            ed.verifying_key().to_bytes().to_vec(),
+            ml_dsa_vk_bytes(&pq_vk),
+        )
+        .expect("hybrid pair");
+        At9pSigner { ed, pq, pair }
+    }
+
+    fn at9p_body(
+        current: &At9pSigner,
+        next: &[&At9pSigner],
+        service_tag: &str,
+    ) -> hyprstream_pds::at9p::CapsuleBody {
+        use hyprstream_pds::at9p::{
+            CapsuleBody, ServiceEndpoint, ServiceEntry, ServiceType, Transport,
+        };
+        let endpoint = ServiceEndpoint::new(Transport::Iroh, format!("iroh://{service_tag}"))
+            .expect("endpoint");
+        let service =
+            ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint).expect("service");
+        let mut body =
+            CapsuleBody::new(vec![current.pair.clone()], vec![service]).expect("capsule body");
+        body.next_key_commitments = next
+            .iter()
+            .map(|signer| signer.pair.commitment_digest())
+            .collect();
+        body
+    }
+
+    fn audit_keys() -> (
+        ed25519_dalek::SigningKey,
+        hyprstream_rpc::crypto::pq::MlDsaSigningKey,
+    ) {
+        (
+            ed25519_dalek::SigningKey::from_bytes(&[91u8; 32]),
+            hyprstream_rpc::crypto::pq::ml_dsa_sk_from_seed(&[92u8; 32]),
+        )
+    }
+
+    fn production_at9p_publisher(store: Arc<PdsRecordStore>, alarm: &Path) -> PdsPublisher {
+        let (audit_ed, audit_pq) = audit_keys();
+        let acceptance_identity = ed25519_dalek::SigningKey::from_bytes(&[90u8; 32]);
+        let ingest = At9pStateIngest::open(
+            Arc::clone(&store),
+            alarm,
+            acceptance_identity,
+            audit_ed,
+            audit_pq,
+        )
+        .expect("open accepted-state owner");
+        PdsPublisher::new(
+            store,
+            DID.to_owned(),
+            SigningKey::random(&mut rand::rngs::OsRng),
+        )
+        .with_at9p_state_ingest(ingest)
+    }
+
+    #[test]
+    fn independent_production_guards_share_rocks_cas() {
+        use hyprstream_pds::at9p_duplicity::{Admission, DuplicityGuard};
+        use hyprstream_pds::at9p_sign::{sign_capsule, sign_update_record};
+        use std::sync::Barrier;
+
+        const NOW: &str = "2026-07-16T12:00:00Z";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("pds");
+        let store = Arc::new(PdsRecordStore::open(&db_path).expect("open"));
+        let (g, n1, n2) = (at9p_signer(41), at9p_signer(42), at9p_signer(43));
+        let genesis = sign_capsule(at9p_body(&g, &[&n1], "genesis"), &g.ed, &g.pq)
+            .expect("genesis");
+        let genesis_bytes = genesis.to_dag_cbor().expect("genesis bytes");
+        let cid = genesis.cid512().expect("cid");
+        let did = format!("{DID_AT9P_PREFIX}{cid}");
+        let verified = verify_did_at9p(&did, &genesis_bytes).expect("verified genesis");
+        let acceptance_identity = ed25519_dalek::SigningKey::from_bytes(&[90u8; 32]);
+        let make_guard = |alarm: &str| {
+            let (audit_ed, audit_pq) = audit_keys();
+            DuplicityGuard::with_durable_alarm(
+                RocksAt9pStateStore {
+                    store: Arc::clone(&store),
+                    acceptance_identity: acceptance_identity.clone(),
+                    audit_key: audit_ed.clone(),
+                },
+                dir.path().join(alarm),
+                audit_ed,
+                audit_pq,
+            )
+            .expect("guard")
+        };
+        let guard_a = Arc::new(make_guard("alarm-a"));
+        let guard_b = Arc::new(make_guard("alarm-b"));
+        guard_a.seed_genesis(&verified).expect("seed");
+        let candidate_a = sign_update_record(
+            cid.clone(),
+            1,
+            h512(&genesis_bytes),
+            at9p_body(&n1, &[&n2], "winner-a"),
+            "2099-01-01T00:00:00Z".to_owned(),
+            &n1.ed,
+            &n1.pq,
+        )
+        .expect("candidate a");
+        let candidate_b = sign_update_record(
+            cid,
+            1,
+            h512(&genesis_bytes),
+            at9p_body(&n1, &[&n2], "winner-b"),
+            "2099-01-01T00:00:00Z".to_owned(),
+            &n1.ed,
+            &n1.pq,
+        )
+        .expect("candidate b");
+        let barrier = Arc::new(Barrier::new(3));
+        let run = |guard: Arc<DuplicityGuard<_, _>>,
+                   candidate: hyprstream_pds::at9p::UpdateRecord| {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                guard.admit_successor(&candidate, NOW)
+            })
+        };
+        let thread_a = run(guard_a, candidate_a);
+        let thread_b = run(guard_b, candidate_b);
+        barrier.wait();
+        let results = [thread_a.join().expect("thread a"), thread_b.join().expect("thread b")];
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Ok(Admission::Advanced(_))))
+                .count(),
+            1,
+            "the RocksDB CAS must allow exactly one independently locked guard to advance"
+        );
+        assert_eq!(
+            store
+                .load_at9p_state(&did[DID_AT9P_PREFIX.len()..], &acceptance_identity.verifying_key())
+                .expect("load")
+                .expect("state")
+                .epoch,
+            1
+        );
+    }
+
+    #[test]
+    fn production_at9p_ingest_rotation_forks_expiry_terminal_and_restart() {
+        use hyprstream_pds::at9p_sign::{sign_capsule, sign_update_record};
+
+        const NOW: &str = "2026-07-16T12:00:00Z";
+        const FUTURE: &str = "2099-01-01T00:00:00Z";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("pds");
+        let alarm_path = dir.path().join("at9p-alarm.wal");
+        let (genesis_signer, n1, n2, n3) = (
+            at9p_signer(1),
+            at9p_signer(2),
+            at9p_signer(3),
+            at9p_signer(4),
+        );
+        let genesis = sign_capsule(
+            at9p_body(&genesis_signer, &[&n1], "genesis"),
+            &genesis_signer.ed,
+            &genesis_signer.pq,
+        )
+        .expect("signed genesis");
+        let genesis_bytes = genesis.to_dag_cbor().expect("genesis bytes");
+        let did = format!("{DID_AT9P_PREFIX}{}", genesis.cid512().expect("cid"));
+
+        let u1 = sign_update_record(
+            genesis.cid512().expect("cid"),
+            1,
+            hyprstream_pds::at9p::h512(&genesis_bytes),
+            at9p_body(&n1, &[&n2], "rotated"),
+            FUTURE.to_owned(),
+            &n1.ed,
+            &n1.pq,
+        )
+        .expect("u1");
+
+        {
+            let store = Arc::new(PdsRecordStore::open(&db_path).expect("open rw"));
+            let publisher = production_at9p_publisher(store, &alarm_path);
+            let seeded = publisher
+                .ingest_at9p_genesis(&did, &genesis_bytes)
+                .expect("GATE seed");
+            assert_eq!(seeded.epoch, 0);
+            assert_eq!(seeded.current.subject_keys[0], genesis_signer.pair);
+
+            let accepted = publisher
+                .ingest_at9p_successor(&did, &u1.to_dag_cbor().expect("u1 bytes"), NOW)
+                .expect("accept rotation");
+            assert_eq!(accepted.epoch, 1);
+            assert_eq!(accepted.current.subject_keys[0], n1.pair);
+            assert_ne!(accepted.current.subject_keys[0], genesis_signer.pair);
+            assert_eq!(
+                accepted.current.services[0].endpoint.address,
+                "iroh://rotated"
+            );
+
+            // Same-epoch, separately valid fork: fail closed and durably alarm.
+            let fork = sign_update_record(
+                genesis.cid512().expect("cid"),
+                1,
+                hyprstream_pds::at9p::h512(&genesis_bytes),
+                at9p_body(&n1, &[&n2], "same-epoch-fork"),
+                FUTURE.to_owned(),
+                &n1.ed,
+                &n1.pq,
+            )
+            .expect("fork");
+            assert!(publisher
+                .ingest_at9p_successor(&did, &fork.to_dag_cbor().expect("fork bytes"), NOW)
+                .is_err());
+            let alarm_after_same = std::fs::metadata(&alarm_path).expect("alarm WAL").len();
+
+            // A higher record whose link is not the durable head is never chosen.
+            let off_head = sign_update_record(
+                genesis.cid512().expect("cid"),
+                2,
+                [44u8; 64],
+                at9p_body(&n2, &[&n3], "off-head"),
+                FUTURE.to_owned(),
+                &n2.ed,
+                &n2.pq,
+            )
+            .expect("off-head");
+            assert!(publisher
+                .ingest_at9p_successor(&did, &off_head.to_dag_cbor().expect("bytes"), NOW)
+                .is_err());
+            assert!(std::fs::metadata(&alarm_path).expect("alarm WAL").len() > alarm_after_same);
+
+            // Expiry rejects without changing the accepted head.
+            let expired = sign_update_record(
+                genesis.cid512().expect("cid"),
+                2,
+                accepted.head_digest,
+                at9p_body(&n2, &[&n3], "expired"),
+                "2026-01-01T00:00:00Z".to_owned(),
+                &n2.ed,
+                &n2.pq,
+            )
+            .expect("expired");
+            assert!(publisher
+                .ingest_at9p_successor(&did, &expired.to_dag_cbor().expect("bytes"), NOW)
+                .is_err());
+            assert_eq!(
+                publisher
+                    .accepted_at9p_state(&did, Some(NOW))
+                    .expect("state")
+                    .epoch,
+                1
+            );
+
+            // A valid final rotation persists terminal state; later successors
+            // fail closed before any genesis/key fallback.
+            let terminal = sign_update_record(
+                genesis.cid512().expect("cid"),
+                2,
+                accepted.head_digest,
+                at9p_body(&n2, &[], "terminal"),
+                FUTURE.to_owned(),
+                &n2.ed,
+                &n2.pq,
+            )
+            .expect("terminal");
+            let terminal_state = publisher
+                .ingest_at9p_successor(&did, &terminal.to_dag_cbor().expect("bytes"), NOW)
+                .expect("accept terminal");
+            assert!(terminal_state.terminal);
+            let after_terminal = sign_update_record(
+                genesis.cid512().expect("cid"),
+                3,
+                terminal_state.head_digest,
+                at9p_body(&n3, &[&n3], "forbidden"),
+                FUTURE.to_owned(),
+                &n3.ed,
+                &n3.pq,
+            )
+            .expect("syntactically genuine successor");
+            assert!(publisher
+                .ingest_at9p_successor(&did, &after_terminal.to_dag_cbor().expect("bytes"), NOW)
+                .is_err());
+        }
+
+        // Reopen verifies the signed alarm WAL and recovers the complete atomic
+        // state. Re-seed and rollback remain refused after restart.
+        let store = Arc::new(PdsRecordStore::open(&db_path).expect("reopen rw"));
+        let publisher = production_at9p_publisher(store, &alarm_path);
+        let recovered = publisher
+            .accepted_at9p_state(&did, Some(NOW))
+            .expect("recover state");
+        assert_eq!(recovered.epoch, 2);
+        assert!(recovered.terminal);
+        assert_eq!(recovered.current.subject_keys[0], n2.pair);
+        assert!(publisher.ingest_at9p_genesis(&did, &genesis_bytes).is_err());
+        assert!(publisher
+            .ingest_at9p_successor(&did, &u1.to_dag_cbor().expect("u1 bytes"), NOW)
+            .is_err());
+    }
+
+    #[test]
+    fn accepted_at9p_read_rejects_watermark_body_mutation() {
+        use hyprstream_pds::at9p_sign::sign_capsule;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
+        let signer = at9p_signer(11);
+        let capsule = sign_capsule(at9p_body(&signer, &[], "immutable"), &signer.ed, &signer.pq)
+            .expect("capsule");
+        let bytes = capsule.to_dag_cbor().expect("bytes");
+        let cid = capsule.cid512().expect("cid");
+        let did = format!("{DID_AT9P_PREFIX}{cid}");
+        let publisher = production_at9p_publisher(Arc::clone(&store), &dir.path().join("alarm"));
+        publisher.ingest_at9p_genesis(&did, &bytes).expect("seed");
+
+        let RecordBacking::ReadWrite(db) = &store.backing else {
+            panic!("writer")
+        };
+        let key = at9p_state_key(&cid);
+        let mut encoded = db.get(&key).expect("get").expect("stored state");
+        encoded[AT9P_ACCEPTANCE_PREFIX_LEN + 16] ^= 1;
+        // Mutate persisted epoch without changing the retained head body or
+        // recomputing the daemon acceptance signature.
+        db.put(&key, encoded).expect("inject mutation");
+        assert!(
+            publisher.accepted_at9p_state(&did, None).is_err(),
+            "a partial watermark/body representation must fail closed"
+        );
+    }
+
+    #[test]
+    fn accepted_checkpoint_rejects_old_envelope_and_reverse_mismatch() {
+        use hyprstream_pds::at9p_sign::{sign_capsule, sign_update_record};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("pds");
+        let alarm = dir.path().join("alarm");
+        let store = Arc::new(PdsRecordStore::open(&db_path).expect("open"));
+        let (g, n1, n2) = (at9p_signer(31), at9p_signer(32), at9p_signer(33));
+        let genesis = sign_capsule(at9p_body(&g, &[&n1], "genesis"), &g.ed, &g.pq).expect("genesis");
+        let genesis_bytes = genesis.to_dag_cbor().expect("bytes");
+        let cid = genesis.cid512().expect("cid");
+        let did = format!("{DID_AT9P_PREFIX}{cid}");
+        let publisher = production_at9p_publisher(Arc::clone(&store), &alarm);
+        publisher.ingest_at9p_genesis(&did, &genesis_bytes).expect("seed");
+        let RecordBacking::ReadWrite(db) = &store.backing else { panic!("writer") };
+        let state_key = at9p_state_key(&cid);
+        let checkpoint_key = at9p_checkpoint_key(&cid);
+        let old_state = db.get(&state_key).unwrap().unwrap();
+        let old_checkpoint = db.get(&checkpoint_key).unwrap().unwrap();
+        let update = sign_update_record(
+            cid.clone(), 1, h512(&genesis_bytes), at9p_body(&n1, &[&n2], "rotated"),
+            "2099-01-01T00:00:00Z".to_owned(), &n1.ed, &n1.pq,
+        ).expect("update");
+        publisher.ingest_at9p_successor(&did, &update.to_dag_cbor().unwrap(), "2026-07-16T12:00:00Z").expect("advance");
+        let new_state = db.get(&state_key).unwrap().unwrap();
+        let new_checkpoint = db.get(&checkpoint_key).unwrap().unwrap();
+        db.delete(&state_key).expect("simulate state-half missing");
+        assert!(publisher.accepted_at9p_state(&did, None).is_err());
+        db.put(&state_key, &new_state).expect("restore state");
+        db.delete(&checkpoint_key).expect("simulate checkpoint-half missing");
+        assert!(publisher.accepted_at9p_state(&did, None).is_err());
+        db.put(&checkpoint_key, &new_checkpoint).expect("restore checkpoint");
+        db.put(&state_key, old_state).expect("old envelope replay");
+        assert!(publisher.accepted_at9p_state(&did, None).is_err());
+        db.put(&state_key, new_state).expect("restore body");
+        db.put(&checkpoint_key, old_checkpoint).expect("old checkpoint replay");
+        assert!(publisher.accepted_at9p_state(&did, None).is_err());
+        db.put(&checkpoint_key, new_checkpoint).expect("restore checkpoint");
+        assert_eq!(publisher.accepted_at9p_state(&did, None).unwrap().epoch, 1);
+        drop(publisher);
+        drop(store);
+        let reopened = Arc::new(PdsRecordStore::open(&db_path).expect("reopen"));
+        assert_eq!(production_at9p_publisher(reopened, &alarm).accepted_at9p_state(&did, None).unwrap().epoch, 1);
+    }
+
+    #[test]
+    fn accepted_at9p_read_rejects_attacker_selected_signed_fork() {
+        use hyprstream_pds::at9p_sign::{sign_capsule, sign_update_record};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
+        let (genesis_signer, n1, n2) = (at9p_signer(21), at9p_signer(22), at9p_signer(23));
+        let genesis = sign_capsule(
+            at9p_body(&genesis_signer, &[&n1], "genesis"),
+            &genesis_signer.ed,
+            &genesis_signer.pq,
+        )
+        .expect("genesis");
+        let genesis_bytes = genesis.to_dag_cbor().expect("genesis bytes");
+        let cid = genesis.cid512().expect("cid");
+        let did = format!("{DID_AT9P_PREFIX}{cid}");
+        let publisher = production_at9p_publisher(Arc::clone(&store), &dir.path().join("alarm"));
+        publisher
+            .ingest_at9p_genesis(&did, &genesis_bytes)
+            .expect("seed");
+
+        // This update is internally canonical, correctly linked, and signed by
+        // the identity's committed key. It was never selected by this daemon.
+        let fork = sign_update_record(
+            cid.clone(),
+            1,
+            hyprstream_pds::at9p::h512(&genesis_bytes),
+            at9p_body(&n1, &[&n2], "attacker-selected-fork"),
+            "2099-01-01T00:00:00Z".to_owned(),
+            &n1.ed,
+            &n1.pq,
+        )
+        .expect("signed fork");
+        let fork_state =
+            AcceptedAt9pState::from_persisted_update(&fork.to_dag_cbor().expect("fork bytes"))
+                .expect("internally valid fork state");
+
+        // A process that can rewrite RocksDB but lacks the stable deployment
+        // identity can only certify the substituted value with its own key.
+        let attacker_identity = ed25519_dalek::SigningKey::from_bytes(&[70u8; 32]);
+        let attacker_audit = ed25519_dalek::SigningKey::from_bytes(&[71u8; 32]);
+        let forged = encode_at9p_state(&fork_state, &attacker_identity, &attacker_audit)
+            .expect("forge self-consistent envelope");
+        let RecordBacking::ReadWrite(db) = &store.backing else {
+            panic!("writer")
+        };
+        db.put(at9p_state_key(&cid), forged)
+            .expect("inject attacker-selected fork");
+        assert!(
+            publisher.accepted_at9p_state(&did, None).is_err(),
+            "an identity-valid fork without daemon acceptance must fail closed"
+        );
     }
 }

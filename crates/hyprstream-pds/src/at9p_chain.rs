@@ -289,7 +289,7 @@ pub fn validate_successor(
 /// `Ok(true)` iff `a` is strictly before `b`. Pure integer parse — no clock, no
 /// external date crate. Malformed input is an error (fail-closed), never a
 /// silent `false`.
-fn datetime_before(a: &str, b: &str) -> anyhow::Result<bool> {
+pub(crate) fn datetime_before(a: &str, b: &str) -> anyhow::Result<bool> {
     Ok(datetime_nanos(a)? < datetime_nanos(b)?)
 }
 
