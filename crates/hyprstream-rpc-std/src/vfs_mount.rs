@@ -17,9 +17,9 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use async_trait::async_trait;
-use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
-use hyprstream_rpc::Subject;
 use hyprstream_rpc::rpc_client::RpcClient;
+use hyprstream_rpc::Subject;
+use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
 
 // ============================================================================
 // RpcClient is already Send + Sync — no wrapper needed.
@@ -81,7 +81,9 @@ impl CtlResponseCache {
 /// Monotonic counter for request IDs.
 struct IdCounter(AtomicU64);
 impl IdCounter {
-    fn new() -> Self { Self(AtomicU64::new(1)) }
+    fn new() -> Self {
+        Self(AtomicU64::new(1))
+    }
     fn next(&self) -> u64 {
         self.0.fetch_add(1, Ordering::Relaxed)
     }
@@ -109,8 +111,18 @@ pub enum ServiceDispatchResult {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait ServiceDispatch: Send + Sync {
-    async fn dispatch(&self, method: &str, args_json: &str, client: &dyn RpcClient) -> Result<ServiceDispatchResult, String>;
-    fn metadata(&self) -> (&'static str, &'static [hyprstream_rpc::metadata::MethodMeta]);
+    async fn dispatch(
+        &self,
+        method: &str,
+        args_json: &str,
+        client: &dyn RpcClient,
+    ) -> Result<ServiceDispatchResult, String>;
+    fn metadata(
+        &self,
+    ) -> (
+        &'static str,
+        &'static [hyprstream_rpc::metadata::MethodMeta],
+    );
 }
 
 /// Generic VFS mount driven by a ServiceDispatch implementation.
@@ -159,13 +171,20 @@ impl Mount for GenericServiceMount {
         Ok(())
     }
 
-    async fn read(&self, fid: &Fid, offset: u64, count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
+    async fn read(
+        &self,
+        fid: &Fid,
+        offset: u64,
+        count: u32,
+        _caller: &Subject,
+    ) -> Result<Vec<u8>, MountError> {
         // Check for ctl response first (from previous write)
         if let Some(resp) = self.ctl_response.take() {
             return Ok(slice_read(resp, offset, count));
         }
 
-        let state = fid.downcast_ref::<VfsFidState>()
+        let state = fid
+            .downcast_ref::<VfsFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
 
         if state.path.is_empty() {
@@ -176,19 +195,30 @@ impl Mount for GenericServiceMount {
 
         // cat /srv/{service}/{method} → dispatch query method with empty args
         let method = &state.path[0];
-        match self.service.dispatch(method, "{}", self.client.as_ref()).await
-            .map_err(MountError::Io)? {
+        match self
+            .service
+            .dispatch(method, "{}", self.client.as_ref())
+            .await
+            .map_err(MountError::Io)?
+        {
             ServiceDispatchResult::Response(json) => {
                 Ok(slice_read(json.into_bytes(), offset, count))
             }
-            ServiceDispatchResult::Stream { .. } => {
-                Err(MountError::NotSupported("use ctl to start streams, then read from /stream/{topic}/data".into()))
-            }
+            ServiceDispatchResult::Stream { .. } => Err(MountError::NotSupported(
+                "use ctl to start streams, then read from /stream/{topic}/data".into(),
+            )),
         }
     }
 
-    async fn write(&self, fid: &Fid, _offset: u64, data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
-        let state = fid.downcast_ref::<VfsFidState>()
+    async fn write(
+        &self,
+        fid: &Fid,
+        _offset: u64,
+        data: &[u8],
+        _caller: &Subject,
+    ) -> Result<u32, MountError> {
+        let state = fid
+            .downcast_ref::<VfsFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
 
         // ctl pattern: data = "command {json_args}" or "command json_args"
@@ -196,13 +226,15 @@ impl Mount for GenericServiceMount {
         let data_str = std::str::from_utf8(data).unwrap_or("").trim();
 
         // Strip shell quotes from around JSON if present
-        let stripped = data_str
-            .trim_end_matches('\'')
-            .trim_end_matches('"');
+        let stripped = data_str.trim_end_matches('\'').trim_end_matches('"');
 
         let (cmd, args_owned);
         if let Some(brace) = stripped.find('{') {
-            let cmd_part = stripped[..brace].trim().trim_end_matches('\'').trim_end_matches('"').trim();
+            let cmd_part = stripped[..brace]
+                .trim()
+                .trim_end_matches('\'')
+                .trim_end_matches('"')
+                .trim();
             let args_part = &stripped[brace..];
             cmd = if cmd_part.is_empty() {
                 state.path.first().map(|s| s.as_str()).unwrap_or("")
@@ -213,7 +245,9 @@ impl Mount for GenericServiceMount {
         } else if stripped.contains(':') && stripped.contains('"') {
             // Looks like stripped JSON (Tcl brace quoting removed outer {})
             // Split on first whitespace to find command, rest is bare JSON
-            let (c, rest) = stripped.split_once(char::is_whitespace).unwrap_or((stripped, ""));
+            let (c, rest) = stripped
+                .split_once(char::is_whitespace)
+                .unwrap_or((stripped, ""));
             cmd = c.trim();
             // Re-wrap bare JSON fields with braces
             args_owned = format!("{{{}}}", rest.trim());
@@ -227,12 +261,18 @@ impl Mount for GenericServiceMount {
         };
         let args_str = args_owned.as_str();
 
-        let dispatch_result = self.service.dispatch(cmd, args_str, self.client.as_ref()).await
+        let dispatch_result = self
+            .service
+            .dispatch(cmd, args_str, self.client.as_ref())
+            .await
             .map_err(MountError::Io)?;
 
         let resp = match dispatch_result {
             ServiceDispatchResult::Response(json) => json.into_bytes(),
-            ServiceDispatchResult::Stream { info, ephemeral_keypair } => {
+            ServiceDispatchResult::Stream {
+                info,
+                ephemeral_keypair,
+            } => {
                 // #468: `info` is the VERIFIED-capnp StreamInfo library type carried
                 // typed through dispatch (decoded + COSE-verified upstream) — no
                 // serde_json round-trip / re-parse at this boundary.
@@ -249,7 +289,9 @@ impl Mount for GenericServiceMount {
                 pubkey_32.copy_from_slice(client_pubkey);
 
                 // Open verified stream handle via RpcClient
-                let handle = self.client.open_stream_from_info(info.clone(), secret_32, pubkey_32)
+                let handle = self
+                    .client
+                    .open_stream_from_info(info.clone(), secret_32, pubkey_32)
                     .await
                     .map_err(|e| MountError::Io(format!("open stream: {e}")))?;
 
@@ -267,7 +309,9 @@ impl Mount for GenericServiceMount {
                     "streamId": info.stream_id,
                     "topic": topic,
                 });
-                serde_json::to_string(&result).unwrap_or_default().into_bytes()
+                serde_json::to_string(&result)
+                    .unwrap_or_default()
+                    .into_bytes()
             }
         };
         let len = resp.len() as u32;
@@ -276,7 +320,8 @@ impl Mount for GenericServiceMount {
     }
 
     async fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
-        let state = fid.downcast_ref::<VfsFidState>()
+        let state = fid
+            .downcast_ref::<VfsFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
 
         if state.path.is_empty() {
@@ -298,7 +343,8 @@ impl Mount for GenericServiceMount {
     }
 
     async fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
-        let state = fid.downcast_ref::<VfsFidState>()
+        let state = fid
+            .downcast_ref::<VfsFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
         let (svc_name, _) = self.service.metadata();
         let name = state.path.last().map(|s| s.as_str()).unwrap_or(svc_name);
@@ -319,13 +365,19 @@ impl Mount for GenericServiceMount {
 
 pub struct DocMount {
     render: fn(&[&str]) -> Option<String>,
-    metadata: fn() -> (&'static str, &'static [hyprstream_rpc::metadata::MethodMeta]),
+    metadata: fn() -> (
+        &'static str,
+        &'static [hyprstream_rpc::metadata::MethodMeta],
+    ),
 }
 
 impl DocMount {
     pub fn new(
         render: fn(&[&str]) -> Option<String>,
-        metadata: fn() -> (&'static str, &'static [hyprstream_rpc::metadata::MethodMeta]),
+        metadata: fn() -> (
+            &'static str,
+            &'static [hyprstream_rpc::metadata::MethodMeta],
+        ),
     ) -> Self {
         Self { render, metadata }
     }
@@ -348,8 +400,15 @@ impl Mount for DocMount {
         Ok(())
     }
 
-    async fn read(&self, fid: &Fid, offset: u64, count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
-        let state = fid.downcast_ref::<VfsFidState>()
+    async fn read(
+        &self,
+        fid: &Fid,
+        offset: u64,
+        count: u32,
+        _caller: &Subject,
+    ) -> Result<Vec<u8>, MountError> {
+        let state = fid
+            .downcast_ref::<VfsFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
 
         let path_refs: Vec<&str> = state.path.iter().map(|s| s.as_str()).collect();
@@ -362,12 +421,19 @@ impl Mount for DocMount {
         }
     }
 
-    async fn write(&self, _fid: &Fid, _offset: u64, _data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
+    async fn write(
+        &self,
+        _fid: &Fid,
+        _offset: u64,
+        _data: &[u8],
+        _caller: &Subject,
+    ) -> Result<u32, MountError> {
         Err(MountError::NotSupported("docs are read-only".into()))
     }
 
     async fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
-        let state = fid.downcast_ref::<VfsFidState>()
+        let state = fid
+            .downcast_ref::<VfsFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
 
         if state.path.is_empty() {
@@ -388,7 +454,8 @@ impl Mount for DocMount {
     }
 
     async fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
-        let state = fid.downcast_ref::<VfsFidState>()
+        let state = fid
+            .downcast_ref::<VfsFidState>()
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
         let name = state.path.last().map(|s| s.as_str()).unwrap_or("doc");
         Ok(Stat::unknown_qid(
@@ -501,10 +568,7 @@ inventory::collect!(MountFactory);
 /// (per-sandbox isolation is by *forking* the namespace, FS-D #365 — not by
 /// re-running this loop).
 #[cfg(not(target_arch = "wasm32"))]
-pub fn mount_all_services(
-    ns: &mut hyprstream_vfs::Namespace,
-    ctx: &MountContext,
-) -> usize {
+pub fn mount_all_services(ns: &mut hyprstream_vfs::Namespace, ctx: &MountContext) -> usize {
     let mut mounted = 0;
     for factory in inventory::iter::<MountFactory> {
         match (factory.construct)(ctx) {
@@ -624,49 +688,85 @@ impl_service_dispatch!(InferenceDispatch, "inference", crate::inference_client);
 pub fn build_browser_namespace(
     registry_client: Arc<dyn RpcClient>,
     model_client: Arc<dyn RpcClient>,
-) -> (hyprstream_vfs::Namespace, Arc<crate::stream_mount::StreamRegistry>) {
+) -> (
+    hyprstream_vfs::Namespace,
+    Arc<crate::stream_mount::StreamRegistry>,
+) {
     let stream_registry = Arc::new(crate::stream_mount::StreamRegistry::new());
     let mut ns = hyprstream_vfs::Namespace::new();
 
     // Service mounts — all use GenericServiceMount with generated dispatch
     let registry_mount: Arc<GenericServiceMount> = Arc::new(GenericServiceMount::new(
-        Arc::clone(&registry_client), Box::new(RegistryDispatch), Arc::clone(&stream_registry),
+        Arc::clone(&registry_client),
+        Box::new(RegistryDispatch),
+        Arc::clone(&stream_registry),
     ));
-    ns.mount("/srv/registry", registry_mount.clone()).expect("mount /srv/registry");
+    ns.mount("/srv/registry", registry_mount.clone())
+        .expect("mount /srv/registry");
     // `/worktree` aliases `/srv/registry` for path-shape parity with the
     // native namespace (see `hyprstream_vfs::STANDARD_NAMESPACE_PATHS`).
     ns.bind_mount("/worktree", registry_mount, hyprstream_vfs::BindFlag::After)
         .expect("bind mount /worktree");
-    ns.mount("/srv/model", Arc::new(GenericServiceMount::new(
-        Arc::clone(&model_client), Box::new(ModelDispatch), Arc::clone(&stream_registry),
-    ))).expect("mount /srv/model");
+    ns.mount(
+        "/srv/model",
+        Arc::new(GenericServiceMount::new(
+            Arc::clone(&model_client),
+            Box::new(ModelDispatch),
+            Arc::clone(&stream_registry),
+        )),
+    )
+    .expect("mount /srv/model");
 
     // Documentation mounts — generated at compile time from schema annotations
-    ns.mount("/srv/registry/doc", Arc::new(DocMount::new(
-        crate::registry_client::render_doc,
-        crate::registry_client::schema_metadata,
-    ))).expect("mount /srv/registry/doc");
-    ns.mount("/srv/model/doc", Arc::new(DocMount::new(
-        crate::model_client::render_doc,
-        crate::model_client::schema_metadata,
-    ))).expect("mount /srv/model/doc");
-    ns.mount("/srv/inference/doc", Arc::new(DocMount::new(
-        crate::inference_client::render_doc,
-        crate::inference_client::schema_metadata,
-    ))).expect("mount /srv/inference/doc");
-    ns.mount("/srv/policy/doc", Arc::new(DocMount::new(
-        crate::policy_client::render_doc,
-        crate::policy_client::schema_metadata,
-    ))).expect("mount /srv/policy/doc");
-    ns.mount("/srv/mcp/doc", Arc::new(DocMount::new(
-        crate::mcp_client::render_doc,
-        crate::mcp_client::schema_metadata,
-    ))).expect("mount /srv/mcp/doc");
+    ns.mount(
+        "/srv/registry/doc",
+        Arc::new(DocMount::new(
+            crate::registry_client::render_doc,
+            crate::registry_client::schema_metadata,
+        )),
+    )
+    .expect("mount /srv/registry/doc");
+    ns.mount(
+        "/srv/model/doc",
+        Arc::new(DocMount::new(
+            crate::model_client::render_doc,
+            crate::model_client::schema_metadata,
+        )),
+    )
+    .expect("mount /srv/model/doc");
+    ns.mount(
+        "/srv/inference/doc",
+        Arc::new(DocMount::new(
+            crate::inference_client::render_doc,
+            crate::inference_client::schema_metadata,
+        )),
+    )
+    .expect("mount /srv/inference/doc");
+    ns.mount(
+        "/srv/policy/doc",
+        Arc::new(DocMount::new(
+            crate::policy_client::render_doc,
+            crate::policy_client::schema_metadata,
+        )),
+    )
+    .expect("mount /srv/policy/doc");
+    ns.mount(
+        "/srv/mcp/doc",
+        Arc::new(DocMount::new(
+            crate::mcp_client::render_doc,
+            crate::mcp_client::schema_metadata,
+        )),
+    )
+    .expect("mount /srv/mcp/doc");
 
     // Stream mount — named pipes for active streaming data
-    ns.mount("/stream", Arc::new(crate::stream_mount::StreamMount::new(
-        Arc::clone(&stream_registry),
-    ))).expect("mount /stream");
+    ns.mount(
+        "/stream",
+        Arc::new(crate::stream_mount::StreamMount::new(Arc::clone(
+            &stream_registry,
+        ))),
+    )
+    .expect("mount /stream");
 
     // `/wanix` is NOT mounted here: it needs a Wanix-provided SharedArrayBuffer
     // that the browser only has when running under Wanix. Wire it separately
@@ -757,6 +857,13 @@ mod automount_tests {
         async fn call(&self, _payload: Vec<u8>) -> anyhow::Result<Vec<u8>> {
             anyhow::bail!("NoopClient: no transport")
         }
+        async fn call_for_service(
+            &self,
+            _service_domain: &str,
+            _payload: Vec<u8>,
+        ) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("NoopClient: no transport")
+        }
         async fn call_with_options(
             &self,
             _payload: Vec<u8>,
@@ -764,8 +871,24 @@ mod automount_tests {
         ) -> anyhow::Result<Vec<u8>> {
             anyhow::bail!("NoopClient: no transport")
         }
+        async fn call_with_options_for_service(
+            &self,
+            _service_domain: &str,
+            _payload: Vec<u8>,
+            _options: CallOptions,
+        ) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("NoopClient: no transport")
+        }
         async fn call_streaming(
             &self,
+            _payload: Vec<u8>,
+            _ephemeral_pubkey: [u8; 32],
+        ) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("NoopClient: no transport")
+        }
+        async fn call_streaming_for_service(
+            &self,
+            _service_domain: &str,
             _payload: Vec<u8>,
             _ephemeral_pubkey: [u8; 32],
         ) -> anyhow::Result<Vec<u8>> {
@@ -817,7 +940,10 @@ mod automount_tests {
 
         // The auto-mount landed at /srv/{name}.
         let prefixes = ns.mount_prefixes();
-        assert!(prefixes.contains(&"/srv/registry"), "prefixes: {prefixes:?}");
+        assert!(
+            prefixes.contains(&"/srv/registry"),
+            "prefixes: {prefixes:?}"
+        );
         assert!(prefixes.contains(&"/srv/model"), "prefixes: {prefixes:?}");
 
         // End-to-end through the auto-registered mount: walk the mount root and

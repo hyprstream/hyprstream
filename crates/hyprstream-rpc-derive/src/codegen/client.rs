@@ -25,7 +25,11 @@ fn is_rpc_stream_info(type_name: &str, resolved: &ResolvedSchema) -> bool {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Generate the top-level service trait and all scope traits.
-pub fn generate_service_traits(service_name: &str, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
+pub fn generate_service_traits(
+    service_name: &str,
+    resolved: &ResolvedSchema,
+    types_crate: Option<&syn::Path>,
+) -> TokenStream {
     let mut tokens = TokenStream::new();
 
     // Generate scope traits first (bottom-up: nested → parent → top-level)
@@ -34,18 +38,30 @@ pub fn generate_service_traits(service_name: &str, resolved: &ResolvedSchema, ty
     }
 
     // Generate top-level service trait
-    tokens.extend(generate_top_level_trait(service_name, resolved, types_crate));
+    tokens.extend(generate_top_level_trait(
+        service_name,
+        resolved,
+        types_crate,
+    ));
 
     tokens
 }
 
 /// Generate a scope trait (e.g., RuntimeRpc, ContainerRpc) and recurse into nested scopes.
-fn generate_scope_trait_recursive(sc: &ScopedClient, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
+fn generate_scope_trait_recursive(
+    sc: &ScopedClient,
+    resolved: &ResolvedSchema,
+    types_crate: Option<&syn::Path>,
+) -> TokenStream {
     let mut tokens = TokenStream::new();
 
     // Generate nested scope traits first
     for nested in &sc.nested_clients {
-        tokens.extend(generate_scope_trait_recursive(nested, resolved, types_crate));
+        tokens.extend(generate_scope_trait_recursive(
+            nested,
+            resolved,
+            types_crate,
+        ));
     }
 
     let trait_name = scope_trait_name(&sc.client_name);
@@ -53,23 +69,35 @@ fn generate_scope_trait_recursive(sc: &ScopedClient, resolved: &ResolvedSchema, 
     let doc = format!("Generated RPC trait for {} scope.", sc.factory_name);
 
     // Nested scope associated types + factory methods
-    let nested_assoc_types: Vec<TokenStream> = sc.nested_clients.iter().map(|nested| {
-        let assoc_name = format_ident!("{}", to_pascal_case(&nested.factory_name));
-        let nested_trait = format_ident!("{}", scope_trait_name(&nested.client_name));
-        quote! { type #assoc_name: #nested_trait; }
-    }).collect();
+    let nested_assoc_types: Vec<TokenStream> = sc
+        .nested_clients
+        .iter()
+        .map(|nested| {
+            let assoc_name = format_ident!("{}", to_pascal_case(&nested.factory_name));
+            let nested_trait = format_ident!("{}", scope_trait_name(&nested.client_name));
+            quote! { type #assoc_name: #nested_trait; }
+        })
+        .collect();
 
-    let nested_factory_methods: Vec<TokenStream> = sc.nested_clients.iter().map(|nested| {
-        let method = format_ident!("{}", to_snake_case(&nested.factory_name));
-        let assoc_name = format_ident!("{}", to_pascal_case(&nested.factory_name));
-        let params = scope_factory_params(&nested.scope_fields, resolved);
-        quote! { fn #method(&self #(, #params)*) -> Self::#assoc_name; }
-    }).collect();
+    let nested_factory_methods: Vec<TokenStream> = sc
+        .nested_clients
+        .iter()
+        .map(|nested| {
+            let method = format_ident!("{}", to_snake_case(&nested.factory_name));
+            let assoc_name = format_ident!("{}", to_pascal_case(&nested.factory_name));
+            let params = scope_factory_params(&nested.scope_fields, resolved);
+            quote! { fn #method(&self #(, #params)*) -> Self::#assoc_name; }
+        })
+        .collect();
 
     // Trait methods from inner_request_variants
-    let trait_methods: Vec<TokenStream> = sc.inner_request_variants.iter().filter_map(|v| {
-        generate_trait_method(v, &sc.inner_response_variants, resolved, types_crate, true)
-    }).collect();
+    let trait_methods: Vec<TokenStream> = sc
+        .inner_request_variants
+        .iter()
+        .filter_map(|v| {
+            generate_trait_method(v, &sc.inner_response_variants, resolved, types_crate, true)
+        })
+        .collect();
 
     tokens.extend(quote! {
         #[doc = #doc]
@@ -86,37 +114,61 @@ fn generate_scope_trait_recursive(sc: &ScopedClient, resolved: &ResolvedSchema, 
 }
 
 /// Generate the top-level service trait (e.g., WorkerRpc, ModelRpc).
-fn generate_top_level_trait(service_name: &str, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
+fn generate_top_level_trait(
+    service_name: &str,
+    resolved: &ResolvedSchema,
+    types_crate: Option<&syn::Path>,
+) -> TokenStream {
     let pascal = to_pascal_case(service_name);
     let trait_name = format_ident!("{}Rpc", pascal);
     let doc = format!("Generated RPC trait for the {pascal} service.");
 
-    let scoped_variant_names: Vec<&str> = resolved.raw
+    let scoped_variant_names: Vec<&str> = resolved
+        .raw
         .scoped_clients
         .iter()
         .map(|sc| sc.factory_name.as_str())
         .collect();
 
     // Associated types for scoped clients
-    let assoc_types: Vec<TokenStream> = resolved.raw.scoped_clients.iter().map(|sc| {
-        let assoc_name = format_ident!("{}", to_pascal_case(&sc.factory_name));
-        let scope_trait = format_ident!("{}", scope_trait_name(&sc.client_name));
-        quote! { type #assoc_name: #scope_trait; }
-    }).collect();
+    let assoc_types: Vec<TokenStream> = resolved
+        .raw
+        .scoped_clients
+        .iter()
+        .map(|sc| {
+            let assoc_name = format_ident!("{}", to_pascal_case(&sc.factory_name));
+            let scope_trait = format_ident!("{}", scope_trait_name(&sc.client_name));
+            quote! { type #assoc_name: #scope_trait; }
+        })
+        .collect();
 
     // Factory methods for scoped clients
-    let factory_methods: Vec<TokenStream> = resolved.raw.scoped_clients.iter().map(|sc| {
-        let method = format_ident!("{}", to_snake_case(&sc.factory_name));
-        let assoc_name = format_ident!("{}", to_pascal_case(&sc.factory_name));
-        let params = scope_factory_params(&sc.scope_fields, resolved);
-        quote! { fn #method(&self #(, #params)*) -> Self::#assoc_name; }
-    }).collect();
+    let factory_methods: Vec<TokenStream> = resolved
+        .raw
+        .scoped_clients
+        .iter()
+        .map(|sc| {
+            let method = format_ident!("{}", to_snake_case(&sc.factory_name));
+            let assoc_name = format_ident!("{}", to_pascal_case(&sc.factory_name));
+            let params = scope_factory_params(&sc.scope_fields, resolved);
+            quote! { fn #method(&self #(, #params)*) -> Self::#assoc_name; }
+        })
+        .collect();
 
     // Non-scoped methods
-    let trait_methods: Vec<TokenStream> = resolved.raw.request_variants.iter()
+    let trait_methods: Vec<TokenStream> = resolved
+        .raw
+        .request_variants
+        .iter()
         .filter(|v| !scoped_variant_names.contains(&v.name.as_str()))
         .filter_map(|v| {
-            generate_trait_method(v, &resolved.raw.response_variants, resolved, types_crate, false)
+            generate_trait_method(
+                v,
+                &resolved.raw.response_variants,
+                resolved,
+                types_crate,
+                false,
+            )
         })
         .collect();
 
@@ -143,13 +195,23 @@ fn generate_trait_method(
     let method_name = format_ident!("{}", to_snake_case(&variant.name));
 
     // Determine return type
-    let return_type = determine_return_type(&variant.name, response_variants, resolved, is_scoped, types_crate)?;
+    let return_type = determine_return_type(
+        &variant.name,
+        response_variants,
+        resolved,
+        is_scoped,
+        types_crate,
+    )?;
 
     // Detect streaming — trait methods return StreamHandle directly (no ephemeral_pubkey param)
     let is_streaming = response_variants
         .iter()
         .find(|v| {
-            let expected = if is_scoped { variant.name.clone() } else { format!("{}Result", variant.name) };
+            let expected = if is_scoped {
+                variant.name.clone()
+            } else {
+                format!("{}Result", variant.name)
+            };
             v.name == expected
         })
         .map(|v| is_rpc_stream_info(&v.type_name, resolved))
@@ -204,16 +266,26 @@ fn determine_return_type(
     };
 
     let resp_variant = response_variants.iter().find(|v| v.name == expected_name)?;
-    let ct = resolved.resolve_type(&resp_variant.type_name).capnp_type.clone();
+    let ct = resolved
+        .resolve_type(&resp_variant.type_name)
+        .capnp_type
+        .clone();
 
     Some(match ct {
         CapnpType::Void => quote! { () },
         CapnpType::Bool => quote! { bool },
         CapnpType::Text => quote! { String },
         CapnpType::Data => quote! { Vec<u8> },
-        CapnpType::UInt8 | CapnpType::UInt16 | CapnpType::UInt32 | CapnpType::UInt64
-        | CapnpType::Int8 | CapnpType::Int16 | CapnpType::Int32 | CapnpType::Int64
-        | CapnpType::Float32 | CapnpType::Float64 => {
+        CapnpType::UInt8
+        | CapnpType::UInt16
+        | CapnpType::UInt32
+        | CapnpType::UInt64
+        | CapnpType::Int8
+        | CapnpType::Int16
+        | CapnpType::Int32
+        | CapnpType::Int64
+        | CapnpType::Float32
+        | CapnpType::Float64 => {
             let rust_type = rust_type_tokens(&ct.rust_owned_type());
             quote! { #rust_type }
         }
@@ -252,11 +324,15 @@ fn scope_trait_name(client_name: &str) -> String {
 
 /// Generate scope factory method parameters.
 fn scope_factory_params(scope_fields: &[FieldDef], _resolved: &ResolvedSchema) -> Vec<TokenStream> {
-    scope_fields.iter().map(|f| {
-        let name = format_ident!("{}", to_snake_case(&f.name));
-        let ty = rust_type_tokens(&CapnpType::classify_primitive(&f.type_name).rust_param_type());
-        quote! { #name: #ty }
-    }).collect()
+    scope_fields
+        .iter()
+        .map(|f| {
+            let name = format_ident!("{}", to_snake_case(&f.name));
+            let ty =
+                rust_type_tokens(&CapnpType::classify_primitive(&f.type_name).rust_param_type());
+            quote! { #name: #ty }
+        })
+        .collect()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -264,46 +340,72 @@ fn scope_factory_params(scope_fields: &[FieldDef], _resolved: &ResolvedSchema) -
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Generate trait impl for the top-level client + all scoped clients.
-pub fn generate_trait_impls(service_name: &str, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
+pub fn generate_trait_impls(
+    service_name: &str,
+    resolved: &ResolvedSchema,
+    types_crate: Option<&syn::Path>,
+) -> TokenStream {
     let mut tokens = TokenStream::new();
 
     let pascal = to_pascal_case(service_name);
     let client_ident = format_ident!("{}Client", pascal);
     let trait_ident = format_ident!("{}Rpc", pascal);
 
-    let scoped_variant_names: Vec<&str> = resolved.raw
+    let scoped_variant_names: Vec<&str> = resolved
+        .raw
         .scoped_clients
         .iter()
         .map(|sc| sc.factory_name.as_str())
         .collect();
 
     // Associated type bindings
-    let assoc_bindings: Vec<TokenStream> = resolved.raw.scoped_clients.iter().map(|sc| {
-        let assoc_name = format_ident!("{}", to_pascal_case(&sc.factory_name));
-        let scoped_client = format_ident!("{}", sc.client_name);
-        quote! { type #assoc_name = #scoped_client; }
-    }).collect();
+    let assoc_bindings: Vec<TokenStream> = resolved
+        .raw
+        .scoped_clients
+        .iter()
+        .map(|sc| {
+            let assoc_name = format_ident!("{}", to_pascal_case(&sc.factory_name));
+            let scoped_client = format_ident!("{}", sc.client_name);
+            quote! { type #assoc_name = #scoped_client; }
+        })
+        .collect();
 
     // Factory method impls
-    let factory_impls: Vec<TokenStream> = resolved.raw.scoped_clients.iter().map(|sc| {
-        let method = format_ident!("{}", to_snake_case(&sc.factory_name));
-        let assoc_name = format_ident!("{}", to_pascal_case(&sc.factory_name));
-        let params = scope_factory_params(&sc.scope_fields, resolved);
-        let param_names: Vec<syn::Ident> = sc.scope_fields.iter().map(|f| {
-            format_ident!("{}", to_snake_case(&f.name))
-        }).collect();
-        quote! {
-            fn #method(&self #(, #params)*) -> Self::#assoc_name {
-                #client_ident::#method(self #(, #param_names),*)
+    let factory_impls: Vec<TokenStream> = resolved
+        .raw
+        .scoped_clients
+        .iter()
+        .map(|sc| {
+            let method = format_ident!("{}", to_snake_case(&sc.factory_name));
+            let assoc_name = format_ident!("{}", to_pascal_case(&sc.factory_name));
+            let params = scope_factory_params(&sc.scope_fields, resolved);
+            let param_names: Vec<syn::Ident> = sc
+                .scope_fields
+                .iter()
+                .map(|f| format_ident!("{}", to_snake_case(&f.name)))
+                .collect();
+            quote! {
+                fn #method(&self #(, #params)*) -> Self::#assoc_name {
+                    #client_ident::#method(self #(, #param_names),*)
+                }
             }
-        }
-    }).collect();
+        })
+        .collect();
 
     // Non-scoped method delegation
-    let method_impls: Vec<TokenStream> = resolved.raw.request_variants.iter()
+    let method_impls: Vec<TokenStream> = resolved
+        .raw
+        .request_variants
+        .iter()
         .filter(|v| !scoped_variant_names.contains(&v.name.as_str()))
         .filter_map(|v| {
-            generate_trait_method_impl(v, &resolved.raw.response_variants, resolved, types_crate, false)
+            generate_trait_method_impl(
+                v,
+                &resolved.raw.response_variants,
+                resolved,
+                types_crate,
+                false,
+            )
         })
         .collect();
 
@@ -319,40 +421,60 @@ pub fn generate_trait_impls(service_name: &str, resolved: &ResolvedSchema, types
 
     // Scoped client trait impls
     for sc in &resolved.raw.scoped_clients {
-        tokens.extend(generate_scope_trait_impl_recursive(sc, resolved, types_crate));
+        tokens.extend(generate_scope_trait_impl_recursive(
+            sc,
+            resolved,
+            types_crate,
+        ));
     }
 
     tokens
 }
 
-fn generate_scope_trait_impl_recursive(sc: &ScopedClient, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
+fn generate_scope_trait_impl_recursive(
+    sc: &ScopedClient,
+    resolved: &ResolvedSchema,
+    types_crate: Option<&syn::Path>,
+) -> TokenStream {
     let mut tokens = TokenStream::new();
 
     let client_ident = format_ident!("{}", sc.client_name);
     let trait_ident = format_ident!("{}", scope_trait_name(&sc.client_name));
 
     // Nested associated type bindings + factory impls
-    let nested_assoc: Vec<TokenStream> = sc.nested_clients.iter().map(|nested| {
-        let assoc_name = format_ident!("{}", to_pascal_case(&nested.factory_name));
-        let nested_client = format_ident!("{}", nested.client_name);
-        quote! { type #assoc_name = #nested_client; }
-    }).collect();
+    let nested_assoc: Vec<TokenStream> = sc
+        .nested_clients
+        .iter()
+        .map(|nested| {
+            let assoc_name = format_ident!("{}", to_pascal_case(&nested.factory_name));
+            let nested_client = format_ident!("{}", nested.client_name);
+            quote! { type #assoc_name = #nested_client; }
+        })
+        .collect();
 
-    let nested_factory_impls: Vec<TokenStream> = sc.nested_clients.iter().map(|nested| {
-        let method = format_ident!("{}", to_snake_case(&nested.factory_name));
-        let assoc_name = format_ident!("{}", to_pascal_case(&nested.factory_name));
-        let params = scope_factory_params(&nested.scope_fields, resolved);
-        let param_names: Vec<syn::Ident> = nested.scope_fields.iter().map(|f| {
-            format_ident!("{}", to_snake_case(&f.name))
-        }).collect();
-        quote! {
-            fn #method(&self #(, #params)*) -> Self::#assoc_name {
-                #client_ident::#method(self #(, #param_names),*)
+    let nested_factory_impls: Vec<TokenStream> = sc
+        .nested_clients
+        .iter()
+        .map(|nested| {
+            let method = format_ident!("{}", to_snake_case(&nested.factory_name));
+            let assoc_name = format_ident!("{}", to_pascal_case(&nested.factory_name));
+            let params = scope_factory_params(&nested.scope_fields, resolved);
+            let param_names: Vec<syn::Ident> = nested
+                .scope_fields
+                .iter()
+                .map(|f| format_ident!("{}", to_snake_case(&f.name)))
+                .collect();
+            quote! {
+                fn #method(&self #(, #params)*) -> Self::#assoc_name {
+                    #client_ident::#method(self #(, #param_names),*)
+                }
             }
-        }
-    }).collect();
+        })
+        .collect();
 
-    let method_impls: Vec<TokenStream> = sc.inner_request_variants.iter()
+    let method_impls: Vec<TokenStream> = sc
+        .inner_request_variants
+        .iter()
         .filter_map(|v| {
             generate_trait_method_impl(v, &sc.inner_response_variants, resolved, types_crate, true)
         })
@@ -370,7 +492,11 @@ fn generate_scope_trait_impl_recursive(sc: &ScopedClient, resolved: &ResolvedSch
 
     // Recurse into nested scoped clients
     for nested in &sc.nested_clients {
-        tokens.extend(generate_scope_trait_impl_recursive(nested, resolved, types_crate));
+        tokens.extend(generate_scope_trait_impl_recursive(
+            nested,
+            resolved,
+            types_crate,
+        ));
     }
 
     tokens
@@ -386,12 +512,22 @@ fn generate_trait_method_impl(
 ) -> Option<TokenStream> {
     let method_name = format_ident!("{}", to_snake_case(&variant.name));
 
-    let return_type = determine_return_type(&variant.name, response_variants, resolved, is_scoped, types_crate)?;
+    let return_type = determine_return_type(
+        &variant.name,
+        response_variants,
+        resolved,
+        is_scoped,
+        types_crate,
+    )?;
 
     let is_streaming = response_variants
         .iter()
         .find(|v| {
-            let expected = if is_scoped { variant.name.clone() } else { format!("{}Result", variant.name) };
+            let expected = if is_scoped {
+                variant.name.clone()
+            } else {
+                format!("{}Result", variant.name)
+            };
             v.name == expected
         })
         .map(|v| is_rpc_stream_info(&v.type_name, resolved))
@@ -421,7 +557,10 @@ fn generate_trait_method_impl(
                 (Vec::new(), Vec::new())
             } else {
                 let data_name = format_ident!("{}", struct_name);
-                (vec![quote! { request: &#data_name }], vec![quote! { request }])
+                (
+                    vec![quote! { request: &#data_name }],
+                    vec![quote! { request }],
+                )
             }
         }
     };
@@ -477,9 +616,6 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
     quote! {
         #[cfg(not(target_arch = "wasm32"))]
         impl #client_name {
-            /// The service name used for endpoint resolution.
-            pub const SERVICE_NAME: &'static str = #service_name_lit;
-
             /// Create a new client by looking up the service endpoint from the global registry.
             ///
             /// `destination` is the Ed25519 verifying key of the target service,
@@ -618,7 +754,11 @@ fn resolve_domain_type(domain_path: &str, types_crate: Option<&syn::Path>) -> To
 // Response Enum
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub fn generate_response_enum(service_name: &str, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
+pub fn generate_response_enum(
+    service_name: &str,
+    resolved: &ResolvedSchema,
+    types_crate: Option<&syn::Path>,
+) -> TokenStream {
     let pascal = to_pascal_case(service_name);
     let enum_name_str = format!("{pascal}ResponseVariant");
     generate_response_enum_from_variants(
@@ -666,7 +806,8 @@ fn generate_enum_variant(
         "Data" => quote! { #variant_pascal(Vec<u8>) },
         "UInt32" | "UInt64" | "Int32" | "Int64" | "Float32" | "Float64" | "UInt8" | "UInt16"
         | "Int8" | "Int16" => {
-            let rust_type = rust_type_tokens(&CapnpType::classify_primitive(&v.type_name).rust_owned_type());
+            let rust_type =
+                rust_type_tokens(&CapnpType::classify_primitive(&v.type_name).rust_owned_type());
             quote! { #variant_pascal(#rust_type) }
         }
         type_name if type_name.starts_with("List(") => {
@@ -708,7 +849,11 @@ fn generate_enum_variant(
 // Client Struct + Impl
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub fn generate_client(service_name: &str, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
+pub fn generate_client(
+    service_name: &str,
+    resolved: &ResolvedSchema,
+    types_crate: Option<&syn::Path>,
+) -> TokenStream {
     let pascal = to_pascal_case(service_name);
     let client_name = format_ident!("{}Client", pascal);
     let response_type = format_ident!("{}ResponseVariant", pascal);
@@ -720,14 +865,16 @@ pub fn generate_client(service_name: &str, resolved: &ResolvedSchema, types_crat
     let req_type = format_ident!("{}", to_snake_case(&format!("{pascal}Request")));
     let doc = format!("Auto-generated client for the {pascal} service.");
 
-    let scoped_variant_names: Vec<&str> = resolved.raw
+    let scoped_variant_names: Vec<&str> = resolved
+        .raw
         .scoped_clients
         .iter()
         .map(|sc| sc.factory_name.as_str())
         .collect();
 
     // Request methods (portable — uses self.client.call(), not CallOptions)
-    let request_methods: Vec<TokenStream> = resolved.raw
+    let request_methods: Vec<TokenStream> = resolved
+        .raw
         .request_variants
         .iter()
         .filter(|v| !scoped_variant_names.contains(&v.name.as_str()))
@@ -757,7 +904,8 @@ pub fn generate_client(service_name: &str, resolved: &ResolvedSchema, types_crat
     );
 
     // Factory methods for scoped clients
-    let factory_methods: Vec<TokenStream> = resolved.raw
+    let factory_methods: Vec<TokenStream> = resolved
+        .raw
         .scoped_clients
         .iter()
         .map(generate_portable_scoped_factory_method)
@@ -771,6 +919,9 @@ pub fn generate_client(service_name: &str, resolved: &ResolvedSchema, types_crat
         }
 
         impl #client_name {
+            /// Canonical service/destination domain used for cryptographic RPC binding.
+            pub const SERVICE_NAME: &'static str = #service_name;
+
             /// Create from any RpcClient implementation.
             pub fn new(client: std::sync::Arc<dyn hyprstream_rpc::RpcClient>) -> Self {
                 Self { client }
@@ -787,17 +938,17 @@ pub fn generate_client(service_name: &str, resolved: &ResolvedSchema, types_crat
             /// context without mutating the shared client. Safe for use with
             /// connection pooling.
             pub fn request(&self) -> hyprstream_rpc::RequestBuilder<'_> {
-                hyprstream_rpc::RequestBuilder::new(&self.client)
+                hyprstream_rpc::RequestBuilder::for_service(&self.client, Self::SERVICE_NAME)
             }
 
             /// Send a raw request and return the raw response bytes.
             pub async fn call(&self, payload: Vec<u8>) -> anyhow::Result<Vec<u8>> {
-                self.client.call(payload).await
+                self.client.call_for_service(Self::SERVICE_NAME, payload).await
             }
 
             /// Send a streaming request with ephemeral DH pubkey.
             pub async fn call_streaming(&self, payload: Vec<u8>, ephemeral_pubkey: [u8; 32]) -> anyhow::Result<Vec<u8>> {
-                self.client.call_streaming(payload, ephemeral_pubkey).await
+                self.client.call_streaming_for_service(Self::SERVICE_NAME, payload, ephemeral_pubkey).await
             }
 
             #(#request_methods)*
@@ -826,7 +977,17 @@ pub fn generate_portable_request_method(
     is_scoped: bool,
     types_crate: Option<&syn::Path>,
 ) -> TokenStream {
-    generate_request_method_inner(capnp_mod, req_type, response_type, variant, resolved, scope, response_variants, is_scoped, types_crate)
+    generate_request_method_inner(
+        capnp_mod,
+        req_type,
+        response_type,
+        variant,
+        resolved,
+        scope,
+        response_variants,
+        is_scoped,
+        types_crate,
+    )
 }
 
 /// Inner request method generation (transport-agnostic).
@@ -844,9 +1005,17 @@ fn generate_request_method_inner(
 ) -> TokenStream {
     let method_name = format_ident!("{}", to_snake_case(&variant.name));
     let doc = if variant.description.is_empty() {
-        format!("{} ({} variant)", to_snake_case(&variant.name), variant.type_name)
+        format!(
+            "{} ({} variant)",
+            to_snake_case(&variant.name),
+            variant.type_name
+        )
     } else {
-        let scope_info = if variant.scope.is_empty() { String::new() } else { format!("\n\nScope: {}", variant.scope) };
+        let scope_info = if variant.scope.is_empty() {
+            String::new()
+        } else {
+            format!("\n\nScope: {}", variant.scope)
+        };
         format!("{}{}", variant.description, scope_info)
     };
 
@@ -884,12 +1053,23 @@ fn generate_request_method_inner(
 
         (setup, quote! { Self::parse_scoped_response(&response) })
     } else {
-        (TokenStream::new(), quote! { Self::parse_response(&response) })
+        (
+            TokenStream::new(),
+            quote! { Self::parse_response(&response) },
+        )
     };
 
     // Determine typed return info if response_variants are available
     let typed_info = response_variants.and_then(|resp_vars| {
-        find_typed_return_info(&variant.name, resp_vars, resolved, is_scoped, response_type, &parse_call, types_crate)
+        find_typed_return_info(
+            &variant.name,
+            resp_vars,
+            resolved,
+            is_scoped,
+            response_type,
+            &parse_call,
+            types_crate,
+        )
     });
 
     // Detect if this method returns StreamInfo
@@ -1033,8 +1213,8 @@ fn generate_request_method_inner(
         struct_name => {
             if let Some(s) = resolved.find_struct(struct_name) {
                 let nuf: Vec<_> = s.non_union_fields().collect();
-                let is_void_wrapper = nuf.is_empty()
-                    || (nuf.len() == 1 && nuf[0].type_name == "Void");
+                let is_void_wrapper =
+                    nuf.is_empty() || (nuf.len() == 1 && nuf[0].type_name == "Void");
 
                 if is_void_wrapper {
                     let init_method = format_ident!("init_{}", to_snake_case(&variant.name));
@@ -1074,7 +1254,11 @@ fn generate_request_method_inner(
                     }
                 }
             } else {
-                let _comment = format!("TODO: {} — struct {} not found in schema", to_snake_case(&variant.name), struct_name);
+                let _comment = format!(
+                    "TODO: {} — struct {} not found in schema",
+                    to_snake_case(&variant.name),
+                    struct_name
+                );
                 quote! {
                     // #comment
                 }
@@ -1109,7 +1293,10 @@ fn find_typed_return_info(
 
     let resp_variant = response_variants.iter().find(|v| v.name == expected_name)?;
     let variant_pascal = resolved.name(&resp_variant.name).pascal_ident.clone();
-    let ct = resolved.resolve_type(&resp_variant.type_name).capnp_type.clone();
+    let ct = resolved
+        .resolve_type(&resp_variant.type_name)
+        .capnp_type
+        .clone();
 
     let has_error = response_variants.iter().any(|v| v.name == "error");
 
@@ -1166,9 +1353,16 @@ fn find_typed_return_info(
                 }
             },
         }),
-        CapnpType::UInt8 | CapnpType::UInt16 | CapnpType::UInt32 | CapnpType::UInt64
-        | CapnpType::Int8 | CapnpType::Int16 | CapnpType::Int32 | CapnpType::Int64
-        | CapnpType::Float32 | CapnpType::Float64 => {
+        CapnpType::UInt8
+        | CapnpType::UInt16
+        | CapnpType::UInt32
+        | CapnpType::UInt64
+        | CapnpType::Int8
+        | CapnpType::Int16
+        | CapnpType::Int32
+        | CapnpType::Int64
+        | CapnpType::Float32
+        | CapnpType::Float64 => {
             let rust_type = rust_type_tokens(&ct.rust_owned_type());
             Some(TypedReturnInfo {
                 return_type: quote! { #rust_type },
@@ -1275,7 +1469,16 @@ pub fn generate_parse_response_fn(
     let which_ident = format_ident!("Which");
     let match_arms: Vec<TokenStream> = variants
         .iter()
-        .map(|v| generate_parse_match_arm(response_type, capnp_mod, v, resolved, &which_ident, types_crate))
+        .map(|v| {
+            generate_parse_match_arm(
+                response_type,
+                capnp_mod,
+                v,
+                resolved,
+                &which_ident,
+                types_crate,
+            )
+        })
         .collect();
 
     quote! {
@@ -1310,9 +1513,16 @@ pub fn generate_parse_match_arm(
             #which_ident::#variant_pascal(()) => Ok(#response_type::#variant_pascal),
         },
         CapnpType::Bool
-        | CapnpType::UInt8 | CapnpType::UInt16 | CapnpType::UInt32 | CapnpType::UInt64
-        | CapnpType::Int8 | CapnpType::Int16 | CapnpType::Int32 | CapnpType::Int64
-        | CapnpType::Float32 | CapnpType::Float64 => quote! {
+        | CapnpType::UInt8
+        | CapnpType::UInt16
+        | CapnpType::UInt32
+        | CapnpType::UInt64
+        | CapnpType::Int8
+        | CapnpType::Int16
+        | CapnpType::Int32
+        | CapnpType::Int64
+        | CapnpType::Float32
+        | CapnpType::Float64 => quote! {
             #which_ident::#variant_pascal(v) => Ok(#response_type::#variant_pascal(v)),
         },
         CapnpType::Text => quote! {
@@ -1321,9 +1531,17 @@ pub fn generate_parse_match_arm(
         CapnpType::Data => quote! {
             #which_ident::#variant_pascal(v) => Ok(#response_type::#variant_pascal(v?.to_vec())),
         },
-        CapnpType::ListText | CapnpType::ListData | CapnpType::ListPrimitive(_) | CapnpType::ListStruct(_) => {
-            generate_list_parse_arm(&variant_pascal, response_type, &v.type_name, resolved, capnp_mod, which_ident)
-        }
+        CapnpType::ListText
+        | CapnpType::ListData
+        | CapnpType::ListPrimitive(_)
+        | CapnpType::ListStruct(_) => generate_list_parse_arm(
+            &variant_pascal,
+            response_type,
+            &v.type_name,
+            resolved,
+            capnp_mod,
+            which_ident,
+        ),
         CapnpType::Struct(ref name) => {
             if let Some(s) = resolved.find_struct(name) {
                 let data_type = if let Some(ref dt) = s.domain_type {
@@ -1415,26 +1633,34 @@ fn generate_list_parse_arm(
 // Scoped Factory Method
 // ─────────────────────────────────────────────────────────────────────────────
 
-
 /// Generate a scoped factory method for portable clients (no jwt_token field).
 fn generate_portable_scoped_factory_method(sc: &ScopedClient) -> TokenStream {
     let method_name = format_ident!("{}", to_snake_case(&sc.factory_name));
     let client_name_ident = format_ident!("{}", sc.client_name);
     let doc = format!("Create a scoped {} client.", sc.factory_name);
 
-    let params: Vec<TokenStream> = sc.scope_fields.iter().map(|f| {
-        let name = format_ident!("{}", to_snake_case(&f.name));
-        let ty = rust_type_tokens(&CapnpType::classify_primitive(&f.type_name).rust_param_type());
-        quote! { #name: #ty }
-    }).collect();
+    let params: Vec<TokenStream> = sc
+        .scope_fields
+        .iter()
+        .map(|f| {
+            let name = format_ident!("{}", to_snake_case(&f.name));
+            let ty =
+                rust_type_tokens(&CapnpType::classify_primitive(&f.type_name).rust_param_type());
+            quote! { #name: #ty }
+        })
+        .collect();
 
-    let field_inits: Vec<TokenStream> = sc.scope_fields.iter().map(|f| {
-        let name = format_ident!("{}", to_snake_case(&f.name));
-        match f.type_name.as_str() {
-            "Text" => quote! { #name: #name.to_owned() },
-            _ => quote! { #name },
-        }
-    }).collect();
+    let field_inits: Vec<TokenStream> = sc
+        .scope_fields
+        .iter()
+        .map(|f| {
+            let name = format_ident!("{}", to_snake_case(&f.name));
+            match f.type_name.as_str() {
+                "Text" => quote! { #name: #name.to_owned() },
+                _ => quote! { #name },
+            }
+        })
+        .collect();
 
     quote! {
         #[doc = #doc]

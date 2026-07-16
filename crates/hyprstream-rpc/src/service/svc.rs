@@ -69,10 +69,7 @@ fn alg_covers_pq(alg: &str) -> bool {
 /// Hybrid [`CryptoPolicy`] a classical-only (`EdDSA`) JWT is rejected
 /// **independent of JWKS alg-list hygiene**. Under Classical any single alg is
 /// passed through to the per-alg decoders (existing behavior).
-fn jwt_alg_satisfies_policy(
-    policy: crate::crypto::CryptoPolicy,
-    alg: &str,
-) -> anyhow::Result<()> {
+fn jwt_alg_satisfies_policy(policy: crate::crypto::CryptoPolicy, alg: &str) -> anyhow::Result<()> {
     if policy.uses_pq() && !alg_covers_pq(alg) {
         anyhow::bail!(
             "Hybrid crypto policy requires a post-quantum JWT alg; \
@@ -142,6 +139,13 @@ pub struct EnvelopeContext {
     /// Present on streaming requests; extracted from `RequestEnvelope.client_dh_public`.
     client_dh_public: Option<[u8; 32]>,
 
+    /// Authenticated request transcript and one-shot response recipient.
+    /// These are used only by the response seal chokepoint.
+    pub(crate) request_iat: i64,
+    pub(crate) request_nonce: [u8; 16],
+    pub(crate) response_kem_recipient: Option<crate::crypto::hybrid_kem::RecipientPublic>,
+    pub(crate) service_domain: Option<String>,
+
     /// Whether this request originated from a genuine in-process / IPC caller
     /// (the `FixedSigner` mutual-auth plane), as opposed to a networked peer
     /// (the `AnySigner` plane used by ZMQ-QUIC / iroh / WebTransport).
@@ -172,6 +176,10 @@ impl EnvelopeContext {
             cnf: envelope.cnf,
             envelope_wit_hash: envelope.envelope.wth,
             client_dh_public: envelope.envelope.client_dh_public,
+            request_iat: envelope.envelope.iat,
+            request_nonce: envelope.envelope.nonce,
+            response_kem_recipient: envelope.envelope.response_kem_recipient.clone(),
+            service_domain: envelope.envelope.service_domain.clone(),
             // AnySigner / networked plane — NOT a local caller (#328).
             is_local_caller: false,
         }
@@ -192,6 +200,10 @@ impl EnvelopeContext {
             cnf: envelope.cnf,
             envelope_wit_hash: envelope.envelope.wth,
             client_dh_public: envelope.envelope.client_dh_public,
+            request_iat: envelope.envelope.iat,
+            request_nonce: envelope.envelope.nonce,
+            response_kem_recipient: envelope.envelope.response_kem_recipient.clone(),
+            service_domain: envelope.envelope.service_domain.clone(),
             // FixedSigner mutual-auth plane — genuine in-process / IPC caller (#328).
             is_local_caller: true,
         }
@@ -216,6 +228,10 @@ impl EnvelopeContext {
             cnf: [0u8; 32],
             envelope_wit_hash: None,
             client_dh_public: None,
+            request_iat: 0,
+            request_nonce: [0; 16],
+            response_kem_recipient: None,
+            service_domain: None,
             // Internal self-call that never crosses a network boundary (#328).
             is_local_caller: true,
         }
@@ -1128,6 +1144,10 @@ mod empty_iss_gate_tests {
             cnf: [0u8; 32],
             envelope_wit_hash: None,
             client_dh_public: None,
+            request_iat: 0,
+            request_nonce: [0; 16],
+            response_kem_recipient: None,
+            service_domain: None,
             is_local_caller,
         }
     }
@@ -1278,6 +1298,10 @@ mod ipc_key_identity_tests {
             cnf: signer_pubkey,
             envelope_wit_hash: None,
             client_dh_public: None,
+            request_iat: 0,
+            request_nonce: [0; 16],
+            response_kem_recipient: None,
+            service_domain: None,
             // AnySigner / networked-or-UDS plane.
             is_local_caller: false,
         }
@@ -1500,6 +1524,10 @@ mod accounting_audit_tests {
             cnf: [0u8; 32],
             envelope_wit_hash: None,
             client_dh_public: None,
+            request_iat: 0,
+            request_nonce: [0; 16],
+            response_kem_recipient: None,
+            service_domain: None,
             is_local_caller: true,
         }
     }
@@ -1550,6 +1578,10 @@ mod accounting_audit_tests {
             cnf: [0u8; 32],
             envelope_wit_hash: None,
             client_dh_public: None,
+            request_iat: 0,
+            request_nonce: [0; 16],
+            response_kem_recipient: None,
+            service_domain: None,
             is_local_caller: false,
         };
         let records = capture(|| {
@@ -1610,6 +1642,10 @@ mod accounting_audit_tests {
             cnf,
             envelope_wit_hash: None,
             client_dh_public: None,
+            request_iat: 0,
+            request_nonce: [0; 16],
+            response_kem_recipient: None,
+            service_domain: None,
             is_local_caller: false,
         }
     }

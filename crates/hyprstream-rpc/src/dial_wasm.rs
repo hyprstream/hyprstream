@@ -109,10 +109,38 @@ pub async fn dial_with_kem_store(
     jwt: Option<String>,
     request_kem_store: Option<Arc<dyn KemTrustStore>>,
 ) -> Result<Arc<dyn RpcClient>> {
+    dial_with_crypto_stores(
+        url,
+        cert_hash,
+        signer,
+        server_verifying_key,
+        jwt,
+        request_kem_store,
+        None,
+    )
+    .await
+}
+
+/// WebTransport dial seam provisioning both request KEM and response hybrid
+/// signature anchors. The shared client then applies the same response
+/// carrier-check → verify → HyKEM-open ordering as native clients.
+pub async fn dial_with_crypto_stores(
+    url: &str,
+    cert_hash: Option<&str>,
+    signer: JsSigner,
+    server_verifying_key: Option<VerifyingKey>,
+    jwt: Option<String>,
+    request_kem_store: Option<Arc<dyn KemTrustStore>>,
+    response_pq_store: Option<Arc<dyn crate::envelope::PqTrustStore>>,
+) -> Result<Arc<dyn RpcClient>> {
     let transport = WtConnection::connect(url, cert_hash).await?;
     let client = RpcClientImpl::new(signer, transport, server_verifying_key);
     let client = match request_kem_store {
         Some(store) => client.with_request_kem_store(store),
+        None => client,
+    };
+    let client = match response_pq_store {
+        Some(store) => client.with_response_pq_store(store),
         None => client,
     };
     let client = match jwt {

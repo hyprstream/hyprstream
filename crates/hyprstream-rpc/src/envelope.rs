@@ -632,6 +632,15 @@ pub struct RequestEnvelope {
     /// Present on streaming requests; the server uses this with its own
     /// ephemeral keypair to derive the shared secret for HMAC chain keys.
     pub client_dh_public: Option<[u8; 32]>,
+
+    /// Fresh per-call hybrid-KEM recipient for the unary response. This is
+    /// distinct from both legacy `client_dh_public` and stream-plane
+    /// `clientKemPublic`, and is carried only inside a sealed network request.
+    pub response_kem_recipient: Option<crate::crypto::hybrid_kem::RecipientPublic>,
+
+    /// Canonical destination service. On untrusted carriers this is required,
+    /// carried only in the signed+sealed request, and checked by dispatch.
+    pub service_domain: Option<String>,
 }
 
 impl RequestEnvelope {
@@ -646,6 +655,8 @@ impl RequestEnvelope {
             delegation_token: None,
             wth: None,
             client_dh_public: None,
+            response_kem_recipient: None,
+            service_domain: None,
         }
     }
 
@@ -679,6 +690,23 @@ impl RequestEnvelope {
     pub fn with_client_dh_public(mut self, key: [u8; 32]) -> Self {
         self.client_dh_public = Some(key);
         self
+    }
+
+    /// Set the one-shot HyKEM recipient for the corresponding unary response.
+    pub fn with_response_kem_recipient(
+        mut self,
+        recipient: crate::crypto::hybrid_kem::RecipientPublic,
+    ) -> Self {
+        self.response_kem_recipient = Some(recipient);
+        self
+    }
+
+    /// Bind the request to one canonical destination service.
+    pub fn with_service_domain(mut self, service_domain: impl Into<String>) -> Result<Self> {
+        let service_domain = service_domain.into();
+        validate_service_domain(&service_domain)?;
+        self.service_domain = Some(service_domain);
+        Ok(self)
     }
 
     /// Create an envelope for an anonymous request.
@@ -918,6 +946,67 @@ pub(crate) fn seal_request_envelope(
 /// response cannot verify against the request AAD, and vice-versa.
 fn response_envelope_external_aad() -> Vec<u8> {
     crate::crypto::cose_sign1::build_external_aad(ENVELOPE_SCHEMA_ID, RESPONSE_ENVELOPE_TYPE_ID)
+}
+
+const MAX_RESPONSE_KEM_RECIPIENT_BYTES: usize = 2 * 1024;
+const MAX_ENCRYPTED_RESPONSE_BYTES: usize = 1024 * 1024;
+pub const MAX_SERVICE_DOMAIN_BYTES: usize = 128;
+
+/// Validate the one canonical RPC service/destination identifier.
+///
+/// Domains are compared byte-for-byte and never normalized at a trust
+/// boundary, avoiding aliases between the client and dispatcher.
+pub fn validate_service_domain(service_domain: &str) -> Result<()> {
+    let bytes = service_domain.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_SERVICE_DOMAIN_BYTES {
+        anyhow::bail!(
+            "service domain must contain 1..={} bytes",
+            MAX_SERVICE_DOMAIN_BYTES
+        );
+    }
+    if !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit() {
+        anyhow::bail!("service domain must begin with a lowercase ASCII letter or digit");
+    }
+    if !bytes.iter().all(|byte| {
+        byte.is_ascii_lowercase()
+            || byte.is_ascii_digit()
+            || matches!(byte, b'.' | b'_' | b'-' | b'/')
+    }) {
+        anyhow::bail!(
+            "service domain must use only lowercase ASCII letters, digits, '.', '_', '-', or '/'"
+        );
+    }
+    Ok(())
+}
+
+/// Transcript-bound external AAD for the response HyKEM COSE_Encrypt0.
+pub(crate) fn encrypted_response_external_aad(
+    request_id: u64,
+    request_iat: i64,
+    request_nonce: &[u8; 16],
+    server_identity: &[u8; 32],
+    recipient: &crate::crypto::hybrid_kem::RecipientPublic,
+    service_domain: &str,
+) -> EnvelopeResult<Vec<u8>> {
+    use ciborium::value::Value as CborValue;
+    use sha2::{Digest, Sha256};
+
+    let recipient_hash = Sha256::digest(recipient.encode());
+    let value = CborValue::Array(vec![
+        CborValue::Integer(ENVELOPE_SCHEMA_ID.into()),
+        CborValue::Integer(RESPONSE_ENVELOPE_TYPE_ID.into()),
+        CborValue::Text("hykem-rpc-response-v1".to_owned()),
+        CborValue::Integer(request_id.into()),
+        CborValue::Integer(request_iat.into()),
+        CborValue::Bytes(request_nonce.to_vec()),
+        CborValue::Bytes(server_identity.to_vec()),
+        CborValue::Bytes(recipient_hash.to_vec()),
+        CborValue::Text(service_domain.to_owned()),
+    ]);
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&value, &mut buf)
+        .map_err(|e| EnvelopeError::Encryption(format!("encode response HyKEM AAD: {e}")))?;
+    Ok(buf)
 }
 
 /// Resolves the anchored ML-DSA-65 verifying key for an EdDSA signer identity.
@@ -1524,6 +1613,8 @@ impl SignedEnvelope {
             delegation_token: None,
             wth: None,
             client_dh_public: None,
+            response_kem_recipient: None,
+            service_domain: None,
         }
     }
 
@@ -1935,6 +2026,12 @@ impl ToCapnp for RequestEnvelope {
         if let Some(ref key) = self.client_dh_public {
             builder.set_client_dh_public(key);
         }
+        if let Some(ref recipient) = self.response_kem_recipient {
+            builder.set_response_kem_recipient(&recipient.encode());
+        }
+        if let Some(ref service_domain) = self.service_domain {
+            builder.set_service_domain(service_domain);
+        }
     }
 }
 
@@ -2002,6 +2099,32 @@ impl FromCapnp for RequestEnvelope {
             }
         };
 
+        let response_kem_recipient = {
+            let data = reader.get_response_kem_recipient()?;
+            if data.is_empty() {
+                None
+            } else {
+                if data.len() > MAX_RESPONSE_KEM_RECIPIENT_BYTES {
+                    return Err(anyhow!(
+                        "responseKemRecipient exceeds {} byte limit",
+                        MAX_RESPONSE_KEM_RECIPIENT_BYTES
+                    ));
+                }
+                Some(
+                    crate::crypto::hybrid_kem::RecipientPublic::decode(data)
+                        .map_err(|e| anyhow!("invalid responseKemRecipient: {e}"))?,
+                )
+            }
+        };
+
+        let service_domain = if reader.has_service_domain() {
+            let value = reader.get_service_domain()?.to_str()?.to_owned();
+            validate_service_domain(&value)?;
+            Some(value)
+        } else {
+            None
+        };
+
         Ok(Self {
             request_id: reader.get_request_id(),
             payload: reader.get_payload()?.to_vec(),
@@ -2011,6 +2134,8 @@ impl FromCapnp for RequestEnvelope {
             delegation_token,
             wth,
             client_dh_public,
+            response_kem_recipient,
+            service_domain,
         })
     }
 }
@@ -2149,6 +2274,10 @@ pub struct ResponseEnvelope {
     /// Serialized inner response
     pub payload: Vec<u8>,
 
+    /// HyKEM COSE_Encrypt0 carrying a `ResponsePlaintext`. When present the
+    /// outer payload is empty and the hybrid signature covers these bytes.
+    pub encrypted_response: Option<Vec<u8>>,
+
     /// Ed25519 signature (64 bytes) over request_id || payload
     pub sig: [u8; 64],
 
@@ -2175,6 +2304,24 @@ impl ResponseEnvelope {
         data.extend_from_slice(&request_id.to_le_bytes());
         data.extend_from_slice(payload);
         data
+    }
+
+    /// Signature transcript for a sealed response. The expected service is
+    /// retained by the pending call rather than trusted from response bytes.
+    fn encrypted_signing_data(
+        request_id: u64,
+        ciphertext: &[u8],
+        service_domain: &str,
+    ) -> EnvelopeResult<Vec<u8>> {
+        validate_service_domain(service_domain)
+            .map_err(|e| EnvelopeError::Encryption(e.to_string()))?;
+        let mut data = Vec::with_capacity(40 + service_domain.len() + ciphertext.len());
+        data.extend_from_slice(b"hykem-rpc-response-signature-v2\0");
+        data.extend_from_slice(&request_id.to_le_bytes());
+        data.extend_from_slice(&(service_domain.len() as u16).to_le_bytes());
+        data.extend_from_slice(service_domain.as_bytes());
+        data.extend_from_slice(ciphertext);
+        Ok(data)
     }
 
     /// Create and sign a new response envelope (Classical, EdDSA-only).
@@ -2242,11 +2389,123 @@ impl ResponseEnvelope {
         Self {
             request_id,
             payload,
+            encrypted_response: None,
             sig,
             cnf,
             cose,
             policy,
         }
+    }
+
+    /// Seal a unary response to the request's one-shot recipient, then
+    /// hybrid-sign the ciphertext in the response signature domain.
+    pub fn new_signed_encrypted(
+        request_id: u64,
+        payload: Vec<u8>,
+        signing_key: &SigningKey,
+        pq_signing_key: &crate::crypto::pq::MlDsaSigningKey,
+        recipient: &crate::crypto::hybrid_kem::RecipientPublic,
+        request_iat: i64,
+        request_nonce: &[u8; 16],
+        service_domain: &str,
+    ) -> EnvelopeResult<Self> {
+        validate_service_domain(service_domain)
+            .map_err(|e| EnvelopeError::Encryption(e.to_string()))?;
+        let mut plaintext = Vec::new();
+        {
+            let mut message = capnp::message::Builder::new_default();
+            let mut builder =
+                message.init_root::<crate::common_capnp::response_plaintext::Builder>();
+            builder.set_request_id(request_id);
+            builder.set_payload(&payload);
+            capnp::serialize::write_message(&mut plaintext, &message).map_err(|e| {
+                EnvelopeError::Encryption(format!("serialize response plaintext: {e}"))
+            })?;
+        }
+        let server_identity = signing_key.verifying_key().to_bytes();
+        let aad = encrypted_response_external_aad(
+            request_id,
+            request_iat,
+            request_nonce,
+            &server_identity,
+            recipient,
+            service_domain,
+        )?;
+        let ciphertext =
+            crate::crypto::cose_encrypt::seal_to_recipient(recipient, &plaintext, &aad, 0, 0)
+                .map_err(|e| {
+                    EnvelopeError::Encryption(format!("response HyKEM seal failed: {e}"))
+                })?;
+        if ciphertext.len() > MAX_ENCRYPTED_RESPONSE_BYTES {
+            return Err(EnvelopeError::Encryption(
+                "encrypted response exceeds envelope limit".into(),
+            ));
+        }
+        let signing_data = Self::encrypted_signing_data(request_id, &ciphertext, service_domain)?;
+        let signature_obj = signing_key.sign(&signing_data);
+        let cose = Self::build_cose(
+            signing_key,
+            Some(pq_signing_key),
+            crate::crypto::CryptoPolicy::Hybrid,
+            &signing_data,
+        )
+        .map_err(|e| EnvelopeError::Encryption(format!("sign sealed response: {e}")))?;
+        Ok(Self {
+            request_id,
+            payload: Vec::new(),
+            encrypted_response: Some(ciphertext),
+            sig: signature_obj.to_bytes(),
+            cnf: server_identity,
+            cose,
+            policy: crate::crypto::CryptoPolicy::Hybrid,
+        })
+    }
+
+    /// Open a previously verified sealed response with the client's one-shot
+    /// recipient and the transcript retained by the pending call.
+    pub(crate) fn open_encrypted(
+        &self,
+        recipient_keypair: &crate::crypto::hybrid_kem::RecipientKeypair,
+        recipient_public: &crate::crypto::hybrid_kem::RecipientPublic,
+        request_iat: i64,
+        request_nonce: &[u8; 16],
+        expected_server_identity: &[u8; 32],
+        service_domain: &str,
+    ) -> Result<Vec<u8>> {
+        let ciphertext = self
+            .encrypted_response
+            .as_deref()
+            .ok_or_else(|| anyhow!("cleartext response rejected: sealed response required"))?;
+        if &self.cnf != expected_server_identity {
+            anyhow::bail!("sealed response server identity does not match pending call");
+        }
+        let aad = encrypted_response_external_aad(
+            self.request_id,
+            request_iat,
+            request_nonce,
+            expected_server_identity,
+            recipient_public,
+            service_domain,
+        )?;
+        let plaintext = crate::crypto::cose_encrypt::open_from_recipient(
+            recipient_keypair,
+            ciphertext,
+            &aad,
+            0,
+            0,
+        )
+        .map_err(|e| anyhow!("response HyKEM open failed: {e}"))?;
+        let reader = read_exact_envelope_message(&plaintext)?;
+        let inner = reader.get_root::<crate::common_capnp::response_plaintext::Reader>()?;
+        let inner_request_id = inner.get_request_id();
+        if inner_request_id != self.request_id {
+            anyhow::bail!(
+                "inner/outer response request id mismatch: {} != {}",
+                inner_request_id,
+                self.request_id
+            );
+        }
+        Ok(inner.get_payload()?.to_vec())
     }
 
     /// Build the nested COSE composite over the response signing-data per policy.
@@ -2307,7 +2566,33 @@ impl ResponseEnvelope {
             }
         }
 
-        self.verify_cose(&verifying_key, pq_store, verify_policy)
+        self.verify_cose(&verifying_key, pq_store, verify_policy, None)
+    }
+
+    /// Verify a sealed response against the destination retained by the
+    /// pending call. Generic verification deliberately cannot authenticate an
+    /// encrypted response because it has no expected service domain.
+    pub(crate) fn verify_encrypted_with_service_domain(
+        &self,
+        expected_pubkey: &VerifyingKey,
+        pq_store: &dyn PqTrustStore,
+        service_domain: &str,
+    ) -> Result<()> {
+        validate_service_domain(service_domain)?;
+        if self.encrypted_response.is_none() {
+            anyhow::bail!("cleartext response rejected: sealed response required");
+        }
+        let verifying_key = VerifyingKey::from_bytes(&self.cnf)
+            .map_err(|_| anyhow::anyhow!("Invalid signer public key"))?;
+        if !bool::from(verifying_key.to_bytes().ct_eq(&expected_pubkey.to_bytes())) {
+            anyhow::bail!("Response signed by unexpected key");
+        }
+        self.verify_cose(
+            &verifying_key,
+            Some(pq_store),
+            crate::crypto::CryptoPolicy::Hybrid,
+            Some(service_domain),
+        )
     }
 
     /// Verify the COSE composite signature (authoritative auth check).
@@ -2320,8 +2605,17 @@ impl ResponseEnvelope {
         ed_vk: &VerifyingKey,
         pq_store: Option<&dyn PqTrustStore>,
         verify_policy: crate::crypto::CryptoPolicy,
+        service_domain: Option<&str>,
     ) -> Result<()> {
-        let signing_data = Self::signing_data(self.request_id, &self.payload);
+        let signing_bytes = self.encrypted_response.as_deref().unwrap_or(&self.payload);
+        let signing_data = if self.encrypted_response.is_some() {
+            let service_domain = service_domain.ok_or_else(|| {
+                anyhow!("encrypted response verification requires the pending service domain")
+            })?;
+            Self::encrypted_signing_data(self.request_id, signing_bytes, service_domain)?
+        } else {
+            Self::signing_data(self.request_id, signing_bytes)
+        };
         let aad = response_envelope_external_aad();
 
         // kid-anchor: resolve the trusted ML-DSA-65 key for this EdDSA identity.
@@ -2371,6 +2665,9 @@ impl ToCapnp for ResponseEnvelope {
     fn write_to(&self, builder: &mut Self::Builder<'_>) {
         builder.set_request_id(self.request_id);
         builder.set_payload(&self.payload);
+        if let Some(ref ciphertext) = self.encrypted_response {
+            builder.set_encrypted_response(ciphertext);
+        }
         builder.set_sig(&self.sig);
         builder.set_cnf(&self.cnf);
         builder.set_cose(&self.cose);
@@ -2396,12 +2693,30 @@ impl FromCapnp for ResponseEnvelope {
         cnf.copy_from_slice(cnf_data);
 
         let cose = reader.get_cose()?.to_vec();
+        let encrypted_data = reader.get_encrypted_response()?;
+        let payload_data = reader.get_payload()?;
+        if !encrypted_data.is_empty() && !payload_data.is_empty() {
+            anyhow::bail!("encrypted response carries a non-empty cleartext payload");
+        }
+        let payload = payload_data.to_vec();
+        let encrypted_response = {
+            let data = encrypted_data;
+            if data.is_empty() {
+                None
+            } else {
+                if data.len() > MAX_ENCRYPTED_RESPONSE_BYTES {
+                    anyhow::bail!("encryptedResponse exceeds envelope limit");
+                }
+                Some(data.to_vec())
+            }
+        };
 
         // `policy` is a signing-time concept; the verifier supplies the verify
         // policy explicitly, so decode to the default here (mirrors SignedEnvelope).
         Ok(Self {
             request_id: reader.get_request_id(),
-            payload: reader.get_payload()?.to_vec(),
+            payload,
+            encrypted_response,
             sig,
             cnf,
             cose,
@@ -2550,15 +2865,30 @@ pub fn unwrap_response_with(
     pq_store: Option<&dyn PqTrustStore>,
     verify_policy: crate::crypto::CryptoPolicy,
 ) -> Result<(u64, Vec<u8>)> {
-    // Deserialize ResponseEnvelope from Cap'n Proto
-    let reader = read_exact_envelope_message(response)?;
-    let response_reader = reader.get_root::<crate::common_capnp::response_envelope::Reader>()?;
-    let envelope = ResponseEnvelope::read_from(response_reader)?;
+    let envelope = read_response_envelope(response, false)?;
+
+    if envelope.encrypted_response.is_some() {
+        anyhow::bail!("encrypted response requires one-shot pending decapsulation material");
+    }
 
     // Verify the COSE composite under the supplied policy + anchor.
     envelope.verify_with(expected_pubkey, pq_store, verify_policy)?;
 
     Ok((envelope.request_id, envelope.payload))
+}
+
+/// Bounded response parse with an early encrypted-field gate. When encryption
+/// is required, the cleartext payload is never copied or surfaced.
+pub(crate) fn read_response_envelope(
+    response: &[u8],
+    require_encrypted: bool,
+) -> Result<ResponseEnvelope> {
+    let reader = read_exact_envelope_message(response)?;
+    let response_reader = reader.get_root::<crate::common_capnp::response_envelope::Reader>()?;
+    if require_encrypted && response_reader.get_encrypted_response()?.is_empty() {
+        anyhow::bail!("cleartext response rejected before payload use (INV-2)");
+    }
+    ResponseEnvelope::read_from(response_reader)
 }
 
 #[cfg(test)]
@@ -3017,6 +3347,8 @@ mod tests {
             delegation_token: Some("delegated".to_owned()),
             wth: Some([0xAB; 32]),
             client_dh_public: Some([0xCD; 32]),
+            response_kem_recipient: None,
+            service_domain: None,
         };
 
         let mut message = Builder::new_default();
@@ -3058,6 +3390,8 @@ mod tests {
             delegation_token: None,
             wth: None,
             client_dh_public: None,
+            response_kem_recipient: None,
+            service_domain: None,
         };
 
         // Seal to the node's #mesh-kem public, dual-signed (EdDSA + ML-DSA-65).
@@ -3118,6 +3452,8 @@ mod tests {
             delegation_token: None,
             wth: None,
             client_dh_public: None,
+            response_kem_recipient: None,
+            service_domain: None,
         };
         let signed =
             SignedEnvelope::new_signed_encrypted_mesh_kem(envelope, &node_sk, &pq_sk, &kem_pub)
@@ -3160,6 +3496,8 @@ mod tests {
             delegation_token: None,
             wth: None,
             client_dh_public: None,
+            response_kem_recipient: None,
+            service_domain: None,
         };
 
         let mut signed = test_new_signed(envelope, &signing_key);
@@ -3204,6 +3542,8 @@ mod tests {
             delegation_token: None,
             wth: Some([0xAA; 32]),
             client_dh_public: None,
+            response_kem_recipient: None,
+            service_domain: None,
         };
 
         let mut signed = test_new_signed(envelope, &signing_key);
@@ -4049,5 +4389,235 @@ mod tests {
             res.is_err(),
             "a request-domain COSE grafted onto a response must be rejected"
         );
+    }
+
+    #[test]
+    fn sealed_response_roundtrip_is_transcript_bound_and_not_plaintext_on_wire() {
+        let (server_sk, server_vk) = generate_signing_keypair();
+        let pq_sk = crate::node_identity::derive_mesh_mldsa_key(&server_sk);
+        let pq_vk = crate::crypto::pq::ml_dsa_vk_from_bytes(
+            &crate::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq_sk),
+        )
+        .unwrap();
+        let store = pq_store_for(server_vk.to_bytes(), &pq_vk);
+        let recipient = crate::crypto::hybrid_kem::generate_recipient(
+            crate::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        )
+        .unwrap();
+        let public = recipient.public();
+        let nonce = fresh_test_nonce();
+        let secret_payload = b"response-plaintext-sentinel";
+        let response = ResponseEnvelope::new_signed_encrypted(
+            77,
+            secret_payload.to_vec(),
+            &server_sk,
+            &pq_sk,
+            &public,
+            1234,
+            &nonce,
+            "service-a",
+        )
+        .unwrap();
+        response
+            .verify_encrypted_with_service_domain(&server_vk, &store, "service-a")
+            .unwrap();
+        let wire = response_to_wire(&response);
+        assert!(!wire
+            .windows(secret_payload.len())
+            .any(|w| w == secret_payload));
+        let public_unwrap =
+            unwrap_response_with(&wire, Some(&server_vk), Some(&store), CryptoPolicy::Hybrid)
+                .expect_err("public unwrap has no one-shot decapsulation state");
+        assert!(public_unwrap.to_string().contains("decapsulation material"));
+        let opened = response
+            .open_encrypted(
+                &recipient,
+                &public,
+                1234,
+                &nonce,
+                &server_vk.to_bytes(),
+                "service-a",
+            )
+            .unwrap();
+        assert_eq!(opened, secret_payload);
+
+        let wrong_recipient = crate::crypto::hybrid_kem::generate_recipient(
+            crate::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        )
+        .unwrap();
+        assert!(response
+            .open_encrypted(
+                &wrong_recipient,
+                &wrong_recipient.public(),
+                1234,
+                &nonce,
+                &server_vk.to_bytes(),
+                "service-a",
+            )
+            .is_err());
+        assert!(response
+            .open_encrypted(
+                &recipient,
+                &public,
+                1235,
+                &nonce,
+                &server_vk.to_bytes(),
+                "service-a",
+            )
+            .is_err());
+        let other_nonce = distinct_test_nonce(&nonce);
+        assert!(response
+            .open_encrypted(
+                &recipient,
+                &public,
+                1234,
+                &other_nonce,
+                &server_vk.to_bytes(),
+                "service-a",
+            )
+            .is_err());
+        let (other_server, _) = generate_signing_keypair();
+        assert!(response
+            .open_encrypted(
+                &recipient,
+                &public,
+                1234,
+                &nonce,
+                &other_server.verifying_key().to_bytes(),
+                "service-a",
+            )
+            .is_err());
+        assert!(response
+            .verify_encrypted_with_service_domain(&server_vk, &store, "service-b")
+            .is_err());
+        assert!(response
+            .open_encrypted(
+                &recipient,
+                &public,
+                1234,
+                &nonce,
+                &server_vk.to_bytes(),
+                "service-b",
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn sealed_response_rejects_request_id_substitution_and_validly_signed_garbage() {
+        let (server_sk, server_vk) = generate_signing_keypair();
+        let pq_sk = crate::node_identity::derive_mesh_mldsa_key(&server_sk);
+        let pq_vk = crate::crypto::pq::ml_dsa_vk_from_bytes(
+            &crate::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq_sk),
+        )
+        .unwrap();
+        let store = pq_store_for(server_vk.to_bytes(), &pq_vk);
+        let recipient = crate::crypto::hybrid_kem::generate_recipient(
+            crate::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        )
+        .unwrap();
+        let public = recipient.public();
+        let nonce = fresh_test_nonce();
+        let mut response = ResponseEnvelope::new_signed_encrypted(
+            8,
+            b"bound".to_vec(),
+            &server_sk,
+            &pq_sk,
+            &public,
+            99,
+            &nonce,
+            "service-a",
+        )
+        .unwrap();
+
+        response.request_id = 9;
+        let data = ResponseEnvelope::encrypted_signing_data(
+            response.request_id,
+            response.encrypted_response.as_deref().unwrap(),
+            "service-a",
+        )
+        .unwrap();
+        response.sig = server_sk.sign(&data).to_bytes();
+        response.cose =
+            ResponseEnvelope::build_cose(&server_sk, Some(&pq_sk), CryptoPolicy::Hybrid, &data)
+                .unwrap();
+        response
+            .verify_encrypted_with_service_domain(&server_vk, &store, "service-a")
+            .unwrap();
+        assert!(response
+            .open_encrypted(
+                &recipient,
+                &public,
+                99,
+                &nonce,
+                &server_vk.to_bytes(),
+                "service-a",
+            )
+            .is_err());
+
+        response.encrypted_response = Some(b"not-a-cose-encrypt0".to_vec());
+        let data = ResponseEnvelope::encrypted_signing_data(
+            9,
+            response.encrypted_response.as_deref().unwrap(),
+            "service-a",
+        )
+        .unwrap();
+        response.sig = server_sk.sign(&data).to_bytes();
+        response.cose =
+            ResponseEnvelope::build_cose(&server_sk, Some(&pq_sk), CryptoPolicy::Hybrid, &data)
+                .unwrap();
+        response
+            .verify_encrypted_with_service_domain(&server_vk, &store, "service-a")
+            .unwrap();
+        assert!(response
+            .open_encrypted(
+                &recipient,
+                &public,
+                99,
+                &nonce,
+                &server_vk.to_bytes(),
+                "service-a",
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn cleartext_response_is_refused_by_early_network_gate() {
+        let (sk, _) = generate_signing_keypair();
+        let wire = response_to_wire(&ResponseEnvelope::new_signed(
+            1,
+            b"must-not-surface".to_vec(),
+            &sk,
+        ));
+        assert!(read_response_envelope(&wire, true).is_err());
+    }
+
+    #[test]
+    fn response_recipient_and_ciphertext_sizes_are_bounded() {
+        let mut request_message = capnp::message::Builder::new_default();
+        {
+            let mut builder =
+                request_message.init_root::<crate::common_capnp::request_envelope::Builder>();
+            builder.set_nonce(&fresh_test_nonce());
+            builder.set_response_kem_recipient(&vec![0u8; MAX_RESPONSE_KEM_RECIPIENT_BYTES + 1]);
+        }
+        let request_message_reader = request_message.into_reader();
+        let request_reader = request_message_reader
+            .get_root::<crate::common_capnp::request_envelope::Reader>()
+            .unwrap();
+        assert!(RequestEnvelope::read_from(request_reader).is_err());
+
+        let mut response_message = capnp::message::Builder::new_default();
+        {
+            let mut builder =
+                response_message.init_root::<crate::common_capnp::response_envelope::Builder>();
+            builder.set_sig(&[0u8; 64]);
+            builder.set_cnf(&[0u8; 32]);
+            builder.set_encrypted_response(&vec![0u8; MAX_ENCRYPTED_RESPONSE_BYTES + 1]);
+        }
+        let response_message_reader = response_message.into_reader();
+        let response_reader = response_message_reader
+            .get_root::<crate::common_capnp::response_envelope::Reader>()
+            .unwrap();
+        assert!(ResponseEnvelope::read_from(response_reader).is_err());
     }
 }

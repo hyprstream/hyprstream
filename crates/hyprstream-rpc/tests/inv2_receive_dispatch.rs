@@ -72,6 +72,7 @@ fn keys() -> &'static Keys {
 /// Minimal service whose only job is to record whether the application
 /// handler was ever reached.
 struct SentinelService {
+    name: String,
     transport: TransportConfig,
     signing_key: SigningKey,
     invoked: Arc<AtomicBool>,
@@ -79,9 +80,14 @@ struct SentinelService {
 
 impl SentinelService {
     fn new(signing_key: SigningKey) -> (Self, Arc<AtomicBool>) {
+        Self::new_named(signing_key, "inv2-sentinel")
+    }
+
+    fn new_named(signing_key: SigningKey, name: &str) -> (Self, Arc<AtomicBool>) {
         let invoked = Arc::new(AtomicBool::new(false));
         (
             Self {
+                name: name.to_owned(),
                 transport: TransportConfig::inproc("inv2-sentinel"),
                 signing_key,
                 invoked: Arc::clone(&invoked),
@@ -99,11 +105,14 @@ impl RequestService for SentinelService {
         payload: &[u8],
     ) -> Result<(Vec<u8>, Option<Continuation>)> {
         self.invoked.store(true, Ordering::SeqCst);
+        if payload == b"handler-error" {
+            anyhow::bail!("intentional handler failure");
+        }
         Ok((payload.to_vec(), None))
     }
 
     fn name(&self) -> &str {
-        "inv2-sentinel"
+        &self.name
     }
 
     fn transport(&self) -> &TransportConfig {
@@ -114,11 +123,72 @@ impl RequestService for SentinelService {
         self.signing_key.clone()
     }
 
+    fn pq_signing_key(&self) -> Option<MlDsaSigningKey> {
+        Some(derive_mesh_mldsa_key(&self.signing_key))
+    }
+
     /// Surface the raw error text (the default returns an empty vec) so the
     /// test can assert *which* rejection path produced the response.
     fn build_error_payload(&self, _request_id: u64, error: &str) -> Vec<u8> {
         error.as_bytes().to_vec()
     }
+}
+
+/// Two logical services may intentionally share one Ed25519/PQ/KEM identity.
+/// The authenticated destination, not the key alone, must prevent forwarding
+/// an exact request for A to B.
+#[tokio::test]
+async fn exact_same_key_request_is_bound_to_destination_service() {
+    let k = keys();
+    let (service_a, invoked_a) = SentinelService::new_named(k.server_sk.clone(), "service-a");
+    let (service_b, invoked_b) = SentinelService::new_named(k.server_sk.clone(), "service-b");
+    let response_recipient = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
+        hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+    )
+    .unwrap();
+    let request = request_envelope(b"service-bound-control")
+        .with_service_domain("service-a")
+        .unwrap()
+        .with_response_kem_recipient(response_recipient.public());
+    let server_recipient = derive_mesh_kem_recipient(&k.server_sk).unwrap();
+    let signed = SignedEnvelope::new_signed_encrypted_mesh_kem(
+        request,
+        &k.client_sk,
+        &k.client_pq,
+        &server_recipient.public(),
+    )
+    .unwrap();
+    let wire = to_wire(&signed);
+
+    let forwarded = process_request(
+        &wire,
+        &service_b,
+        EnvelopeVerification::AnySigner,
+        &k.server_sk,
+        &envelope::InMemoryNonceCache::new(),
+        CarrierContext::iroh(),
+    )
+    .await;
+    assert!(
+        forwarded.is_err(),
+        "service B must reject A's exact request"
+    );
+    assert!(!invoked_b.load(Ordering::SeqCst));
+
+    let matching = process_request(
+        &wire,
+        &service_a,
+        EnvelopeVerification::AnySigner,
+        &k.server_sk,
+        &envelope::InMemoryNonceCache::new(),
+        CarrierContext::iroh(),
+    )
+    .await
+    .expect("unmutated matching-service control succeeds");
+    let response = decode_response(&matching);
+    assert!(invoked_a.load(Ordering::SeqCst));
+    assert!(response.payload.is_empty());
+    assert!(response.encrypted_response.is_some());
 }
 
 fn request_envelope(payload: &[u8]) -> RequestEnvelope {
@@ -131,6 +201,8 @@ fn request_envelope(payload: &[u8]) -> RequestEnvelope {
         delegation_token: None,
         wth: None,
         client_dh_public: None,
+        response_kem_recipient: None,
+        service_domain: Some("inv2-sentinel".to_owned()),
     }
 }
 
@@ -208,8 +280,14 @@ async fn encrypted_on_untrusted_carrier_dispatches() {
     let nonce_cache = envelope::InMemoryNonceCache::new();
 
     let recipient = derive_mesh_kem_recipient(&k.server_sk).unwrap();
+    let response_recipient = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
+        hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+    )
+    .unwrap();
+    let request = request_envelope(b"sealed-payload")
+        .with_response_kem_recipient(response_recipient.public());
     let signed = SignedEnvelope::new_signed_encrypted_mesh_kem(
-        request_envelope(b"sealed-payload"),
+        request,
         &k.client_sk,
         &k.client_pq,
         &recipient.public(),
@@ -233,7 +311,85 @@ async fn encrypted_on_untrusted_carrier_dispatches() {
         "encrypted request must dispatch"
     );
     assert_eq!(response.request_id, 7);
-    assert_eq!(response.payload, b"sealed-payload");
+    assert!(response.payload.is_empty());
+    assert!(response.encrypted_response.is_some());
+}
+
+/// A verified, sealed request that omits the response recipient must be
+/// dropped before claims/handler work on every untrusted carrier. The server
+/// cannot safely construct either a success or error response, so no
+/// cleartext fallback is permitted.
+#[tokio::test]
+async fn missing_response_recipient_drops_without_handler_on_all_network_carriers() {
+    let k = keys();
+    let (service, invoked) = SentinelService::new(k.server_sk.clone());
+    let nonce_cache = envelope::InMemoryNonceCache::new();
+    let server_recipient = derive_mesh_kem_recipient(&k.server_sk).unwrap();
+
+    for carrier in [
+        CarrierContext::iroh(),
+        CarrierContext::quic(),
+        CarrierContext::web_transport(),
+        CarrierContext::untrusted_unknown(),
+    ] {
+        let request = request_envelope(b"must-not-dispatch");
+        let signed = SignedEnvelope::new_signed_encrypted_mesh_kem(
+            request,
+            &k.client_sk,
+            &k.client_pq,
+            &server_recipient.public(),
+        )
+        .unwrap();
+        let result = process_request(
+            &to_wire(&signed),
+            &service,
+            EnvelopeVerification::AnySigner,
+            &k.server_sk,
+            &nonce_cache,
+            carrier,
+        )
+        .await;
+        assert!(result.is_err(), "missing recipient must drop on {carrier}");
+        assert!(!invoked.load(Ordering::SeqCst));
+    }
+}
+
+#[tokio::test]
+async fn post_admission_handler_error_is_sealed_not_cleartext() {
+    let k = keys();
+    let (service, invoked) = SentinelService::new(k.server_sk.clone());
+    let nonce_cache = envelope::InMemoryNonceCache::new();
+    let server_recipient = derive_mesh_kem_recipient(&k.server_sk).unwrap();
+    let response_recipient = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
+        hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+    )
+    .unwrap();
+    let request =
+        request_envelope(b"handler-error").with_response_kem_recipient(response_recipient.public());
+    let signed = SignedEnvelope::new_signed_encrypted_mesh_kem(
+        request,
+        &k.client_sk,
+        &k.client_pq,
+        &server_recipient.public(),
+    )
+    .unwrap();
+    let bytes = process_request(
+        &to_wire(&signed),
+        &service,
+        EnvelopeVerification::AnySigner,
+        &k.server_sk,
+        &nonce_cache,
+        CarrierContext::quic(),
+    )
+    .await
+    .unwrap();
+    let response = decode_response(&bytes);
+    assert!(invoked.load(Ordering::SeqCst));
+    assert!(response.payload.is_empty());
+    assert!(response.encrypted_response.is_some());
+    assert!(!bytes
+        .windows(b"intentional handler failure".len())
+        .any(|w| { w == b"intentional handler failure" }));
 }
 
 /// Undecodable bytes on an untrusted carrier follow the cleartext branch

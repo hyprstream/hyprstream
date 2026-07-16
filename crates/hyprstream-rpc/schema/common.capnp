@@ -56,6 +56,8 @@ struct RequestEnvelope {
   wth @6 :Data $fixedSize(32) $optional;  # SHA-256 of jwtToken (WIT binding)
   clientDhPublic @7 :Data $fixedSize(32) $optional;  # LEGACY classical DH pubkey (removed at S5 #556; superseded by clientKemPublic)
   clientKemPublic @8 :Data $optional;  # S3 #554: client ephemeral hybrid-KEM RecipientPublic.encode() (X25519+ML-KEM-768) for PQ stream key agreement
+  responseKemRecipient @9 :Data $optional;  # #1044: fresh per-call HyKEM recipient for the unary response (distinct from stream KEM material)
+  serviceDomain @10 :Text $optional;  # #1044: canonical destination service, authenticated inside the sealed request
 }
 
 # Signed wrapper - signature covers serialized RequestEnvelope bytes
@@ -109,6 +111,13 @@ struct ResponseEnvelope {
   # The ML-DSA-65 verifying key is NOT carried here; it is resolved by kid from
   # the trust store (kid-anchored), fixing the prior self-certification gap.
   cose @4 :Data;                   # CBOR-encoded nested COSE composite signature
+  encryptedResponse @5 :Data;      # #1044: HyKEM COSE_Encrypt0 of ResponsePlaintext; payload MUST be empty when present
+}
+
+# Authenticated plaintext carried only inside ResponseEnvelope.encryptedResponse.
+struct ResponsePlaintext {
+  requestId @0 :UInt64;
+  payload @1 :Data;
 }
 
 # Authorization subject — bare username or "anonymous".

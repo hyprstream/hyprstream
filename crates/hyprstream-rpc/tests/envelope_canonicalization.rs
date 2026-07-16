@@ -1,5 +1,5 @@
-use hyprstream_rpc::envelope::{Authorization, RequestEnvelope, SignedEnvelope};
 use ed25519_dalek::SigningKey;
+use hyprstream_rpc::envelope::{Authorization, RequestEnvelope, SignedEnvelope};
 use rand::rngs::OsRng;
 
 fn make_signed(envelope: RequestEnvelope, signing_key: &SigningKey) -> SignedEnvelope {
@@ -20,6 +20,8 @@ fn test_envelope_serialization_deterministic() {
         delegation_token: None,
         wth: None,
         client_dh_public: None,
+        response_kem_recipient: None,
+        service_domain: None,
     };
 
     let envelope2 = envelope1.clone();
@@ -52,6 +54,8 @@ fn test_envelope_signature_verification_stable() {
         delegation_token: None,
         wth: None,
         client_dh_public: None,
+        response_kem_recipient: None,
+        service_domain: None,
     };
 
     let signed1 = make_signed(envelope.clone(), &signing_key);
@@ -109,12 +113,17 @@ fn test_envelope_canonical_form() {
         delegation_token: None,
         wth: None,
         client_dh_public: None,
+        response_kem_recipient: None,
+        service_domain: None,
     };
 
     let bytes = envelope.to_bytes();
 
     let bytes_again = envelope.to_bytes();
-    assert_eq!(bytes, bytes_again, "Multiple serializations must be identical");
+    assert_eq!(
+        bytes, bytes_again,
+        "Multiple serializations must be identical"
+    );
 
     assert!(
         bytes.len() < 200,
@@ -134,6 +143,8 @@ fn test_envelope_with_authorization_deterministic() {
         delegation_token: None,
         wth: None,
         client_dh_public: None,
+        response_kem_recipient: None,
+        service_domain: None,
     };
 
     let bytes1 = envelope.to_bytes();
@@ -146,6 +157,8 @@ fn test_envelope_with_authorization_deterministic() {
 
 #[test]
 fn test_envelope_different_data_different_bytes() {
+    use hyprstream_rpc::crypto::hybrid_kem::{RecipientPublic, SuiteId};
+
     let envelope1 = RequestEnvelope {
         request_id: 100,
         payload: vec![1, 2, 3],
@@ -155,6 +168,11 @@ fn test_envelope_different_data_different_bytes() {
         delegation_token: None,
         wth: None,
         client_dh_public: None,
+        response_kem_recipient: Some(RecipientPublic {
+            suite_id: SuiteId::HyKemX25519MlKem768,
+            eks: vec![vec![0x11; 32], vec![0x22; 1184]],
+        }),
+        service_domain: Some("canonical-a".to_owned()),
     };
 
     let envelope2 = RequestEnvelope {
@@ -166,6 +184,11 @@ fn test_envelope_different_data_different_bytes() {
         delegation_token: None,
         wth: None,
         client_dh_public: None,
+        response_kem_recipient: Some(RecipientPublic {
+            suite_id: SuiteId::HyKemX25519MlKem768,
+            eks: vec![vec![0x33; 32], vec![0x44; 1184]],
+        }),
+        service_domain: Some("canonical-b".to_owned()),
     };
 
     let bytes1 = envelope1.to_bytes();
@@ -174,5 +197,37 @@ fn test_envelope_different_data_different_bytes() {
     assert_ne!(
         bytes1, bytes2,
         "Different envelopes must produce different bytes"
+    );
+}
+
+#[test]
+fn test_populated_response_recipient_changes_canonical_bytes() {
+    use hyprstream_rpc::crypto::hybrid_kem::{RecipientPublic, SuiteId};
+
+    let recipient = |x25519: u8, mlkem: u8| RecipientPublic {
+        suite_id: SuiteId::HyKemX25519MlKem768,
+        eks: vec![vec![x25519; 32], vec![mlkem; 1184]],
+    };
+    let first = RequestEnvelope {
+        request_id: 300,
+        payload: vec![7, 8, 9],
+        nonce: [3u8; 16],
+        iat: 3000000000,
+        authorization: Authorization::None,
+        delegation_token: None,
+        wth: None,
+        client_dh_public: None,
+        response_kem_recipient: Some(recipient(0x55, 0x66)),
+        service_domain: Some("canonical-service".to_owned()),
+    };
+    let first_again = first.to_bytes();
+    assert_eq!(first_again, first.to_bytes());
+
+    let mut second = first.clone();
+    second.response_kem_recipient = Some(recipient(0x77, 0x88));
+    assert_ne!(
+        first.to_bytes(),
+        second.to_bytes(),
+        "changing only a populated response recipient must change canonical bytes"
     );
 }
