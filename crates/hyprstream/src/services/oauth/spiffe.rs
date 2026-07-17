@@ -243,7 +243,8 @@ pub async fn issue_service_svid(
 
 /// `GET /.well-known/spiffe/bundle` — SPIFFE trust-domain bundle.
 pub async fn spiffe_bundle(State(state): State<Arc<OAuthState>>) -> Response {
-    let keys = super::jwks::jwks_json(&state).await;
+    let composite_snapshot = hyprstream_rpc::auth::global_composite_key_set().snapshot();
+    let keys = super::jwks::jwks_json(&state, &composite_snapshot).await;
     Json(serde_json::json!({
         "spiffe_sequence": 1,
         "keys": keys,

@@ -13,6 +13,8 @@
 pub mod atproto_perimeter;
 pub mod claims;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod composite;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod federation;
 pub mod jti_blocklist;
 pub mod jwt;
@@ -37,6 +39,11 @@ pub use atproto_perimeter::{AtprotoPerimeterGateway, EnrolledPeer, EnrollmentSto
 // re-exported here so existing `crate::auth::{IdentityResolver, ...}` paths keep working.
 pub use crate::identity::{Ed25519Vk, IdentityKeys, IdentityResolver, MlDsaVk};
 pub use claims::{ActClaim, Claims, Cnf, CnfJwk, IdTokenClaims, OneOrMany, compute_jkt, is_local_iss};
+#[cfg(not(target_arch = "wasm32"))]
+pub use composite::{
+    global_composite_key_set, CompositeKeyPair, CompositeKeySet, CompositeKeySetSnapshot,
+    CompositePairRole, CompositePairState,
+};
 pub use jti_blocklist::{InMemoryJtiBlocklist, JtiBlocklist};
 pub use mac::{
     bind_time_label, import_label, Assurance, Compartment, CompartmentSet, ContentBoundLabel,
@@ -46,7 +53,12 @@ pub use mac::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use federation::FederationKeySource;
-pub use jwt::{decode, decode_unverified, decode_with_key, encode, encode_service_jwt, header_alg, header_kid, jwk_thumbprint, JwkThumbprintInput, JwtError};
+pub use jwt::{
+    composite_kid, decode, decode_unverified, decode_with_key, encode, encode_service_jwt,
+    header_alg, header_kid, is_rfc9068_access_token_type, jwk_thumbprint,
+    parse_composite_dispatch, parse_protected_header, CompositeJwtDispatch, JwkThumbprintInput,
+    JwtError, ProtectedHeader, RFC9068_ACCESS_TOKEN_TYPES,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use key_source::{ClusterKeySource, FederatedKeySource, IssuerResolver, JwksFetcher, JwksKeySource, JwksMode, JwtKeySource};
 #[cfg(not(target_arch = "wasm32"))]

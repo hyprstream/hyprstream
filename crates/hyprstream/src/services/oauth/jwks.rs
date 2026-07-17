@@ -3,18 +3,21 @@
 //! Returns the node's signing keys: Ed25519 (OKP, RFC 8037) and optionally
 //! RSA (for RS256 interop with enterprise RPs).
 
+use super::state::OAuthState;
 use axum::{extract::State, response::IntoResponse, Json};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use hyprstream_rpc::auth::{JwkThumbprintInput, jwk_thumbprint};
+use hyprstream_rpc::auth::{jwk_thumbprint, JwkThumbprintInput};
 use std::sync::Arc;
-use super::state::OAuthState;
 
 /// Compute the RFC 7638 JWK Thumbprint for an Ed25519 key (32-byte raw pubkey).
 pub fn compute_kid(key_bytes: &[u8]) -> String {
     let bytes: [u8; 32] = match key_bytes.try_into() {
         Ok(b) => b,
         Err(_) => {
-            tracing::error!("compute_kid called with {} bytes, expected 32", key_bytes.len());
+            tracing::error!(
+                "compute_kid called with {} bytes, expected 32",
+                key_bytes.len()
+            );
             return String::new();
         }
     };
@@ -28,12 +31,20 @@ pub fn compute_rsa_kid(n: &str, e: &str) -> String {
 
 /// GET /oauth/jwks
 pub async fn jwks(State(state): State<Arc<OAuthState>>) -> impl IntoResponse {
-    Json(serde_json::json!({ "keys": jwks_json(&state).await }))
+    let snapshot = hyprstream_rpc::auth::global_composite_key_set().snapshot();
+    Json(serde_json::json!({
+        "keys": jwks_json(&state, &snapshot).await,
+        "composite_version": snapshot.version(),
+        "composite_component_digest": snapshot.component_digest(),
+    }))
 }
 
 /// Build the public JWKS key array shared by `/oauth/jwks` and the SPIFFE
 /// bundle endpoint.
-pub async fn jwks_json(state: &OAuthState) -> Vec<serde_json::Value> {
+pub async fn jwks_json(
+    state: &OAuthState,
+    composite_snapshot: &hyprstream_rpc::auth::CompositeKeySetSnapshot,
+) -> Vec<serde_json::Value> {
     let mut keys: Vec<serde_json::Value> = Vec::new();
 
     // Serve all rotation slots (drain + active + lead) when the store is present.
@@ -96,7 +107,7 @@ pub async fn jwks_json(state: &OAuthState) -> Vec<serde_json::Value> {
         }
     }
 
-    // ML-DSA-65 from rotation store — publish all slots + composite pairing
+    // ML-DSA-65 from rotation store — publish all component slots.
     if let Some(ref store) = state.ml_dsa_key_store {
         for slot in store.all_slots_snapshot().await {
             let vk = ml_dsa::Keypair::verifying_key(&*slot.key);
@@ -106,18 +117,17 @@ pub async fn jwks_json(state: &OAuthState) -> Vec<serde_json::Value> {
                 obj.insert("exp".to_owned(), slot.exp.into());
             }
             keys.push(jwk);
-
-            // Composite key pairing with active Ed25519 from rotation store
-            if let Some(ref ed_store) = state.signing_key_store {
-                if let Some(ed_key) = ed_store.active_key().await {
-                    keys.push(crate::auth::jwt::composite_jwk(
-                        &vk,
-                        &ed_key.verifying_key(),
-                    ));
-                }
-            }
         }
     }
+
+    // Publish exactly the pairs accepted by the local verifier. Never rebuild
+    // these as a Cartesian product of independently published component keys.
+    keys.extend(
+        composite_snapshot
+            .pairs()
+            .iter()
+            .map(|pair| crate::auth::jwt::composite_jwk(pair.ml_dsa(), pair.ed25519())),
+    );
 
     // Add RSA public key if available
     if let Some(ref rsa_jwk) = state.rsa_jwk {

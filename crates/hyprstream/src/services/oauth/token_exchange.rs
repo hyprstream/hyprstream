@@ -908,36 +908,43 @@ async fn mint_grant_token(
     // `CoseAuditSigner`. The UCAN grant and approval this token was minted from
     // are already hybrid-signed, so a classical-only minted token would break
     // that chain of hybrid authority.
-    let Some(ed_sk) = state.active_jwt_signing_key().await else {
-        tracing::error!("no active JWT signing key configured; cannot mint UCAN grant token");
-        return tx_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            "token signing not configured",
-        );
-    };
     let policy = hyprstream_rpc::envelope::envelope_policy_from_env();
-    let pq_sk = if let Some(store) = &state.ml_dsa_key_store {
-        store.active_key().await
-    } else {
-        None
-    };
-    let token = match (policy.uses_pq(), pq_sk) {
-        (true, Some(pq)) => {
-            crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(&claims, &pq, &ed_sk)
-        }
-        (true, None) => {
+    let token = if policy.uses_pq() {
+        let snapshot = match hyprstream_rpc::auth::global_composite_key_set().mint_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::error!("composite authority unavailable or stale; refusing to mint: {error}");
+                return tx_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "hybrid token authority is not current");
+            }
+        };
+        let signing = snapshot
+            .active_signing_pair(hyprstream_rpc::auth::CompositePairRole::OAuth)
+            .and_then(hyprstream_rpc::auth::CompositeKeyPair::signing_keys);
+        match signing {
+            Some((pq, ed)) => crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
+                &claims, &pq, &ed,
+            ),
+            None => {
             tracing::error!(
-                "Hybrid crypto policy requires an ML-DSA-65 token-signing key, none provisioned \
-                 — refusing to mint a classical-only UCAN grant token (fail-closed)"
+                "no authorized active OAuth composite pair; refusing to mint (fail-closed)"
             );
             return tx_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",
-                "hybrid token signing key not provisioned",
+                "hybrid token signing pair not provisioned",
             );
+            }
         }
-        (false, _) => crate::auth::jwt::encode(&claims, &ed_sk),
+    } else {
+        let Some(ed_sk) = state.active_jwt_signing_key().await else {
+            tracing::error!("no active JWT signing key configured; cannot mint UCAN grant token");
+            return tx_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "token signing not configured",
+            );
+        };
+        crate::auth::jwt::encode(&claims, &ed_sk)
     };
 
     // Optional refresh token (ZSP: refresh re-runs evaluate_refresh, not a free

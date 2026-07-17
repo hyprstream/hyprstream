@@ -9,8 +9,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use hyprstream_rpc::auth::JtiBlocklist as _;
-use std::time::Instant;
 use std::time::Duration;
+use std::time::Instant;
 use subtle::ConstantTimeEq as _;
 use tracing::{debug, info, warn};
 
@@ -136,16 +136,22 @@ pub async fn auth_middleware(
         {
             let now = chrono::Utc::now().timestamp();
             let ttl_secs = ((proof.iat + 120) - now).max(0) as u64;
-            if !state
-                .dpop_jti_seen
-                .insert_if_absent(proof.jti.clone(), (), Duration::from_secs(ttl_secs))
-            {
+            if !state.dpop_jti_seen.insert_if_absent(
+                proof.jti.clone(),
+                (),
+                Duration::from_secs(ttl_secs),
+            ) {
                 debug!("DPoP proof jti already used: {}", proof.jti);
                 return unauthorized_response("Authentication failed", &www_authenticate);
             }
         }
         // cnf.jkt must match the DPoP proof key thumbprint.
-        if expected_jkt.as_bytes().ct_eq(proof.jkt.as_bytes()).unwrap_u8() == 0 {
+        if expected_jkt
+            .as_bytes()
+            .ct_eq(proof.jkt.as_bytes())
+            .unwrap_u8()
+            == 0
+        {
             warn!(sub = %claims.sub, "cnf.jkt mismatch — DPoP proof key does not match token binding");
             return unauthorized_response("Authentication failed", &www_authenticate);
         }
@@ -294,39 +300,79 @@ fn ed25519_kid(key: &ed25519_dalek::VerifyingKey) -> String {
 /// key set `/oauth/jwks` publishes). Accepts the token if ANY of these trusted,
 /// node-published keys verifies it — standard JWKS/`kid`-rotation semantics.
 ///
-/// Security invariant: only keys the node itself publishes are ever tried. A
-/// token-supplied (`jwk`/embedded) key is NEVER admitted; the `kid` header is
-/// used only as an ordering *hint* to try the matching published key first, and
-/// falls through to the other trusted keys. Audience validation is unchanged —
-/// `jwt::decode` still enforces strict local-issuer audience matching.
+/// Composite tokens verify only against exact published pairs; component key
+/// sets are never cross-paired. `alg`, `typ`, and `kid` are mandatory, and
+/// EdDSA is accepted only when the configured crypto policy permits it.
 fn decode_local_multi_key(
     token: &str,
     ca_key: &ed25519_dalek::VerifyingKey,
-    published_keys: &[ed25519_dalek::VerifyingKey],
+    published_ed25519: &[ed25519_dalek::VerifyingKey],
+    published_composite: &[hyprstream_rpc::auth::CompositeKeyPair],
     expected_aud: Option<&str>,
+    allow_eddsa: bool,
 ) -> Result<jwt::Claims, &'static str> {
-    // Candidate set: CA key first, then all published rotation slots. This is the
-    // exact set the JWKS endpoint publishes; nothing else is trusted.
-    let mut candidates: Vec<&ed25519_dalek::VerifyingKey> =
-        Vec::with_capacity(1 + published_keys.len());
-    candidates.push(ca_key);
-    candidates.extend(published_keys.iter());
-
-    // If the JOSE header carries a kid, try the matching published key first
-    // (fast path for the common rotation case). This is a stable reordering
-    // only — every trusted candidate is still attempted, so a token whose kid
-    // is absent/mismatched but which is validly signed by a published key still
-    // verifies. The kid is the RFC 7638 JWK thumbprint the JWKS `kid` uses.
-    if let Some(token_kid) = extract_kid_from_token(token) {
-        candidates.sort_by_key(|k| u8::from(ed25519_kid(k) != token_kid));
+    let header =
+        hyprstream_rpc::auth::parse_protected_header(token).map_err(|_| "JWT validation failed")?;
+    if !hyprstream_rpc::auth::is_rfc9068_access_token_type(&header.typ) {
+        return Err("JWT validation failed");
     }
-
-    for key in candidates {
-        if let Ok(claims) = jwt::decode(token, key, expected_aud) {
-            return Ok(claims);
+    match header.alg.as_str() {
+        "ML-DSA-65-Ed25519" => {
+            decode_composite_multi(token, published_composite, expected_aud, &header)
         }
+        "EdDSA" if allow_eddsa => {
+            decode_ed25519_multi(token, ca_key, published_ed25519, expected_aud, &header.kid)
+        }
+        _ => Err("JWT validation failed"),
     }
-    Err("JWT validation failed")
+}
+
+fn decode_ed25519_multi(
+    token: &str,
+    ca_key: &ed25519_dalek::VerifyingKey,
+    published_ed25519: &[ed25519_dalek::VerifyingKey],
+    expected_aud: Option<&str>,
+    token_kid: &str,
+) -> Result<jwt::Claims, &'static str> {
+    let mut candidates: Vec<&ed25519_dalek::VerifyingKey> =
+        Vec::with_capacity(1 + published_ed25519.len());
+    candidates.push(ca_key);
+    candidates.extend(published_ed25519.iter());
+    let key = candidates
+        .into_iter()
+        .find(|key| ed25519_kid(key) == token_kid)
+        .ok_or("JWT validation failed")?;
+    jwt::decode(token, key, expected_aud).map_err(|_| "JWT validation failed")
+}
+
+fn decode_composite_multi(
+    token: &str,
+    published_composite: &[hyprstream_rpc::auth::CompositeKeyPair],
+    expected_aud: Option<&str>,
+    header: &hyprstream_rpc::auth::ProtectedHeader,
+) -> Result<jwt::Claims, &'static str> {
+    let dispatch = hyprstream_rpc::auth::parse_composite_dispatch(
+        token,
+        hyprstream_rpc::auth::RFC9068_ACCESS_TOKEN_TYPES,
+    )
+    .map_err(|_| "JWT validation failed")?;
+    if dispatch.kid() != header.kid { return Err("JWT validation failed"); }
+    let pair = published_composite
+        .iter()
+        .find(|pair| pair.kid() == header.kid)
+        .ok_or("JWT validation failed")?;
+    hyprstream_rpc::auth::jwt::decode_composite(
+        token,
+        pair.ml_dsa(),
+        pair.ed25519(),
+        expected_aud,
+        &dispatch,
+    )
+    .map_err(|_| "JWT validation failed")
+}
+
+fn local_issuer_matches(claims: &jwt::Claims, expected: &str) -> bool {
+    claims.iss == expected
 }
 
 pub(crate) async fn verify_token_claims(
@@ -353,12 +399,24 @@ pub(crate) async fn verify_token_claims(
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard.clone()
         };
-        decode_local_multi_key(
+        // Published ML-DSA-65 verifying keys (PQ half of the composite key set
+        // `/oauth/jwks` publishes). Lives in the same process-shared handle the
+        // MAC/key-rotation path populates at boot and after each ML-DSA rotation.
+        // Empty under Classical policy or before the OAuth store is provisioned —
+        // in which case a composite token simply fails closed here.
+        let published_composite = { hyprstream_rpc::auth::global_composite_key_set().snapshot() };
+        let claims = decode_local_multi_key(
             token,
             &state.verifying_key,
             &published,
+            published_composite.pairs(),
             Some(&state.resource_url),
-        )?
+            !hyprstream_rpc::envelope::envelope_policy_from_env().uses_pq(),
+        )?;
+        if !local_issuer_matches(&claims, &state.oauth_issuer_url) {
+            return Err("JWT validation failed");
+        }
+        claims
     } else {
         if !state.federation_resolver.is_trusted(&iss) {
             return Err("untrusted federation issuer");
@@ -387,20 +445,14 @@ fn build_www_authenticate(state: &ServerState) -> String {
         "{}/.well-known/oauth-protected-resource",
         state.resource_url
     );
-    format!(
-        "Bearer resource_metadata=\"{}\"",
-        resource_metadata_url,
-    )
+    format!("Bearer resource_metadata=\"{}\"", resource_metadata_url,)
 }
 
 /// Return a 401 response with WWW-Authenticate header.
 fn unauthorized_response(message: &str, www_authenticate: &str) -> Response {
     let mut response = (StatusCode::UNAUTHORIZED, message.to_owned()).into_response();
     if let Ok(val) = HeaderValue::from_str(www_authenticate) {
-        response.headers_mut().insert(
-            header::WWW_AUTHENTICATE,
-            val,
-        );
+        response.headers_mut().insert(header::WWW_AUTHENTICATE, val);
     }
     response
 }
@@ -426,7 +478,8 @@ pub fn extract_iss_from_token(token: &str) -> String {
         Ok(v) => v,
         Err(_) => return String::new(),
     };
-    payload.get("iss")
+    payload
+        .get("iss")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_owned()
@@ -441,7 +494,10 @@ pub fn extract_kid_from_token(token: &str) -> Option<String> {
     }
     let header_bytes = URL_SAFE_NO_PAD.decode(header_b64).ok()?;
     let header: serde_json::Value = serde_json::from_slice(&header_bytes).ok()?;
-    header.get("kid").and_then(|v| v.as_str()).map(str::to_owned)
+    header
+        .get("kid")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
 }
 
 /// Extract the client IP from `X-Forwarded-For` or `X-Real-IP` headers.
@@ -568,16 +624,13 @@ mod tests {
 
         // Craft a JWT with iss in payload: header.payload.sig
         // payload = base64url({"iss":"https://node-a","sub":"alice","exp":9999999999,"iat":0})
-        let payload = URL_SAFE_NO_PAD.encode(
-            r#"{"iss":"https://node-a","sub":"alice","exp":9999999999,"iat":0}"#
-        );
+        let payload = URL_SAFE_NO_PAD
+            .encode(r#"{"iss":"https://node-a","sub":"alice","exp":9999999999,"iat":0}"#);
         let token = format!("eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.{}.fakesig", payload);
         assert_eq!(extract_iss_from_token(&token), "https://node-a");
 
         // Token without iss
-        let payload2 = URL_SAFE_NO_PAD.encode(
-            r#"{"sub":"alice","exp":9999999999,"iat":0}"#
-        );
+        let payload2 = URL_SAFE_NO_PAD.encode(r#"{"sub":"alice","exp":9999999999,"iat":0}"#);
         let token2 = format!("eyJhbGciOiJFZERTQSJ9.{}.fakesig", payload2);
         assert_eq!(extract_iss_from_token(&token2), "");
 
@@ -596,7 +649,8 @@ mod tests {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod rotation_aware_tests {
     use super::*;
-    use ed25519_dalek::SigningKey;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use ed25519_dalek::{Signer as _, SigningKey};
 
     const AUD: &str = "https://node-a/resource";
 
@@ -611,13 +665,83 @@ mod rotation_aware_tests {
     /// Build a locally-issued at+JWT signed by `key`, with the given audience and
     /// optional explicit jti (`jwt::encode` auto-assigns a random jti otherwise).
     fn signed_token(key: &SigningKey, aud: &str, jti: Option<&str>) -> String {
+        signed_token_with_type(key, aud, jti, "at+jwt")
+    }
+
+    fn signed_token_with_type(
+        key: &SigningKey,
+        aud: &str,
+        jti: Option<&str>,
+        typ: &str,
+    ) -> String {
         let n = now();
-        let mut claims = jwt::Claims::new("alice".to_owned(), n, n + 3600)
-            .with_audience(Some(aud.to_owned()));
+        let mut claims =
+            jwt::Claims::new("alice".to_owned(), n, n + 3600).with_audience(Some(aud.to_owned()));
         if let Some(j) = jti {
             claims.jti = Some(j.to_owned());
         }
-        jwt::encode(&claims, key)
+        let header = serde_json::json!({
+            "alg": "EdDSA",
+            "typ": typ,
+            "kid": ed25519_kid(&key.verifying_key()),
+        });
+        let input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap()),
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap()),
+        );
+        format!(
+            "{input}.{}",
+            URL_SAFE_NO_PAD.encode(key.sign(input.as_bytes()).to_bytes())
+        )
+    }
+
+    #[test]
+    fn ordinary_eddsa_verifier_accepts_exact_rfc9068_type_forms() {
+        let ca = new_key();
+        let rotation = new_key();
+        let published = [rotation.verifying_key()];
+
+        for typ in hyprstream_rpc::auth::RFC9068_ACCESS_TOKEN_TYPES {
+            let token = signed_token_with_type(&rotation, AUD, None, typ);
+            let claims = decode_local_multi_key(
+                &token,
+                &ca.verifying_key(),
+                &published,
+                &[],
+                Some(AUD),
+                true,
+            )
+            .unwrap();
+            assert_eq!(claims.sub, "alice");
+        }
+
+        for typ in [
+            "",
+            "AT+JWT",
+            "at+JWT",
+            " at+jwt",
+            "at+jwt ",
+            "Application/at+jwt",
+            "application/AT+JWT",
+            "application/at+jwt ",
+            "JWT",
+            "wit+jwt",
+        ] {
+            let token = signed_token_with_type(&rotation, AUD, None, typ);
+            assert!(
+                decode_local_multi_key(
+                    &token,
+                    &ca.verifying_key(),
+                    &published,
+                    &[],
+                    Some(AUD),
+                    true,
+                )
+                .is_err(),
+                "accepted non-RFC 9068 access-token type {typ:?}"
+            );
+        }
     }
 
     #[test]
@@ -629,8 +753,15 @@ mod rotation_aware_tests {
         let token = signed_token(&rotation, AUD, None);
         let published = vec![rotation.verifying_key()];
 
-        let claims =
-            decode_local_multi_key(&token, &ca.verifying_key(), &published, Some(AUD)).unwrap();
+        let claims = decode_local_multi_key(
+            &token,
+            &ca.verifying_key(),
+            &published,
+            &[],
+            Some(AUD),
+            true,
+        )
+        .unwrap();
         assert_eq!(claims.sub, "alice");
     }
 
@@ -640,7 +771,8 @@ mod rotation_aware_tests {
         let ca = new_key();
         let token = signed_token(&ca, AUD, None);
 
-        let claims = decode_local_multi_key(&token, &ca.verifying_key(), &[], Some(AUD)).unwrap();
+        let claims =
+            decode_local_multi_key(&token, &ca.verifying_key(), &[], &[], Some(AUD), true).unwrap();
         assert_eq!(claims.sub, "alice");
     }
 
@@ -654,7 +786,14 @@ mod rotation_aware_tests {
         let token = signed_token(&attacker, AUD, None);
         let published = vec![rotation.verifying_key()];
 
-        let err = decode_local_multi_key(&token, &ca.verifying_key(), &published, Some(AUD))
+        let err = decode_local_multi_key(
+            &token,
+            &ca.verifying_key(),
+            &published,
+            &[],
+            Some(AUD),
+            true,
+        )
             .unwrap_err();
         assert_eq!(err, "JWT validation failed");
     }
@@ -668,7 +807,14 @@ mod rotation_aware_tests {
         let token = signed_token(&rotation, "https://evil/other", None);
         let published = vec![rotation.verifying_key()];
 
-        let err = decode_local_multi_key(&token, &ca.verifying_key(), &published, Some(AUD))
+        let err = decode_local_multi_key(
+            &token,
+            &ca.verifying_key(),
+            &published,
+            &[],
+            Some(AUD),
+            true,
+        )
             .unwrap_err();
         assert_eq!(err, "JWT validation failed");
     }
@@ -684,8 +830,15 @@ mod rotation_aware_tests {
         let token = signed_token(&rotation, AUD, Some("jti-777"));
         let published = vec![rotation.verifying_key()];
 
-        let claims =
-            decode_local_multi_key(&token, &ca.verifying_key(), &published, Some(AUD)).unwrap();
+        let claims = decode_local_multi_key(
+            &token,
+            &ca.verifying_key(),
+            &published,
+            &[],
+            Some(AUD),
+            true,
+        )
+        .unwrap();
         assert_eq!(claims.jti.as_deref(), Some("jti-777"));
 
         let blocklist = InMemoryJtiBlocklist::new();
@@ -709,8 +862,481 @@ mod rotation_aware_tests {
         );
         let published = vec![rotation.verifying_key()];
 
+        let claims = decode_local_multi_key(
+            &token,
+            &ca.verifying_key(),
+            &published,
+            &[],
+            Some(AUD),
+            true,
+        )
+        .unwrap();
+        assert_eq!(claims.sub, "alice");
+    }
+}
+
+/// Composite (`ML-DSA-65-Ed25519`) local-token verification (#1038).
+///
+/// Exercises the composite branch of `decode_local_multi_key` end-to-end:
+/// happy path (active pair + via-CA-ed pair), both wrong-half rejections,
+/// header confusion, exact-pair rotation, audience/issuer/time/JTI rejection,
+/// half stripping, and policy-controlled plain `EdDSA` compatibility.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod composite_aware_tests {
+    use super::*;
+    use crate::auth::jwt::encode_composite_ml_dsa_65_ed25519;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use ed25519_dalek::SigningKey;
+
+    const AUD: &str = "https://node-a/resource";
+
+    fn now() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+
+    fn new_ed_key() -> SigningKey {
+        SigningKey::generate(&mut rand::rngs::OsRng)
+    }
+
+    fn new_ml_dsa() -> (
+        hyprstream_rpc::crypto::pq::MlDsaSigningKey,
+        hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,
+    ) {
+        hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair()
+    }
+
+    fn published_pair(
+        ml_dsa: hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,
+        ed25519: ed25519_dalek::VerifyingKey,
+    ) -> hyprstream_rpc::auth::CompositeKeyPair {
+        let kid = crate::auth::jwt::composite_kid(&ml_dsa, &ed25519);
+        hyprstream_rpc::auth::CompositeKeyPair::verifying(
+            kid,
+            ml_dsa,
+            ed25519,
+            hyprstream_rpc::auth::CompositePairRole::OAuth,
+            hyprstream_rpc::auth::CompositePairState::Drain,
+            0,
+            i64::MAX,
+        )
+    }
+
+    /// A composite at+JWT signed by `(pq, ed)`, audience `aud`.
+    fn composite_token(
+        pq: &hyprstream_rpc::crypto::pq::MlDsaSigningKey,
+        ed: &SigningKey,
+        aud: &str,
+    ) -> String {
+        let n = now();
         let claims =
-            decode_local_multi_key(&token, &ca.verifying_key(), &published, Some(AUD)).unwrap();
+            jwt::Claims::new("alice".to_owned(), n, n + 3600).with_audience(Some(aud.to_owned()));
+        encode_composite_ml_dsa_65_ed25519(&claims, pq, ed)
+    }
+
+    fn composite_token_with_header(
+        pq: &hyprstream_rpc::crypto::pq::MlDsaSigningKey,
+        ed: &SigningKey,
+        claims: &jwt::Claims,
+        alg: &str,
+        typ: &str,
+        kid: &str,
+    ) -> String {
+        use ed25519_dalek::Signer as _;
+        let header = serde_json::json!({ "alg": alg, "typ": typ, "kid": kid });
+        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let mut signature = hyprstream_rpc::crypto::pq::ml_dsa_sign(pq, signing_input.as_bytes());
+        signature.extend_from_slice(&ed.sign(signing_input.as_bytes()).to_bytes());
+        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature))
+    }
+
+    #[test]
+    fn composite_active_pair_verifies() {
+        // The common post-#574 case: token minted by the active (ML-DSA, Ed25519)
+        // pair the node publishes. This is the exact case that 401'd before #1038.
+        let ca = new_ed_key();
+        let (pq, pq_vk) = new_ml_dsa();
+        let active = new_ed_key();
+        let published_ed = vec![active.verifying_key()];
+        let pairs = [published_pair(pq_vk, active.verifying_key())];
+        let claims = jwt::Claims::new("alice".to_owned(), now(), now() + 3600)
+            .with_audience(Some(AUD.to_owned()));
+
+        for typ in hyprstream_rpc::auth::RFC9068_ACCESS_TOKEN_TYPES {
+            let token = composite_token_with_header(
+                &pq,
+                &active,
+                &claims,
+                "ML-DSA-65-Ed25519",
+                typ,
+                pairs[0].kid(),
+            );
+            let verified = decode_local_multi_key(
+                &token,
+                &ca.verifying_key(),
+                &published_ed,
+                &pairs,
+                Some(AUD),
+                false,
+            )
+            .unwrap();
+            assert_eq!(verified.sub, "alice");
+        }
+    }
+
+    #[test]
+    fn composite_verifies_via_ca_ed_half() {
+        // No Ed25519 rotation slots published — only the CA key. A composite
+        // token signed with the CA Ed25519 half verifies through the CA entry.
+        let ca = new_ed_key();
+        let (pq, pq_vk) = new_ml_dsa();
+        let token = composite_token(&pq, &ca, AUD);
+        let pairs = [published_pair(pq_vk, ca.verifying_key())];
+
+        let claims =
+            decode_local_multi_key(&token, &ca.verifying_key(), &[], &pairs, Some(AUD), false)
+                .unwrap();
+        assert_eq!(claims.sub, "alice");
+    }
+
+    #[test]
+    fn composite_wrong_pq_half_rejected() {
+        // Correct Ed25519 half, wrong (unpublished) ML-DSA half → rejected.
+        // The Ed25519 half alone can never verify a composite signature.
+        let ca = new_ed_key();
+        let (pq, _pq_vk) = new_ml_dsa();
+        let (_other_pq, other_pq_vk) = new_ml_dsa();
+        let active = new_ed_key();
+        let token = composite_token(&pq, &active, AUD);
+        let published_ed = vec![active.verifying_key()];
+        let pairs = [published_pair(other_pq_vk, active.verifying_key())];
+
+        let err = decode_local_multi_key(
+            &token,
+            &ca.verifying_key(),
+            &published_ed,
+            &pairs,
+            Some(AUD),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(err, "JWT validation failed");
+    }
+
+    #[test]
+    fn composite_wrong_ed25519_half_rejected() {
+        // Correct ML-DSA half, wrong (unpublished) Ed25519 half → rejected.
+        // The ML-DSA half alone can never verify a composite signature.
+        let ca = new_ed_key();
+        let (pq, pq_vk) = new_ml_dsa();
+        let active = new_ed_key();
+        let attacker = new_ed_key();
+        let token = composite_token(&pq, &active, AUD);
+        // Only the attacker's (unpublished) Ed25519 key is offered alongside CA.
+        let published_ed = vec![attacker.verifying_key()];
+        let pairs = [published_pair(pq_vk, attacker.verifying_key())];
+
+        let err = decode_local_multi_key(
+            &token,
+            &ca.verifying_key(),
+            &published_ed,
+            &pairs,
+            Some(AUD),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(err, "JWT validation failed");
+    }
+
+    #[test]
+    fn composite_cross_paired_published_halves_rejected() {
+        let ca = new_ed_key();
+        let (pq_a, pq_a_vk) = new_ml_dsa();
+        let (_pq_b, pq_b_vk) = new_ml_dsa();
+        let ed_a = new_ed_key();
+        let ed_b = new_ed_key();
+        let cross_token = composite_token(&pq_a, &ed_b, AUD);
+        let published = [
+            published_pair(pq_a_vk, ed_a.verifying_key()),
+            published_pair(pq_b_vk, ed_b.verifying_key()),
+        ];
+
+        assert!(decode_local_multi_key(
+            &cross_token,
+            &ca.verifying_key(),
+            &[ed_a.verifying_key(), ed_b.verifying_key()],
+            &published,
+            Some(AUD),
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn composite_signed_header_mutations_rejected() {
+        let ca = new_ed_key();
+        let (pq, pq_vk) = new_ml_dsa();
+        let ed = new_ed_key();
+        let pair = published_pair(pq_vk, ed.verifying_key());
+        let claims = jwt::Claims::new("alice".to_owned(), now(), now() + 3600)
+            .with_audience(Some(AUD.to_owned()));
+        let wrong_kid = "not-the-published-pair";
+        for (alg, typ, kid) in [
+            ("EdDSA", "at+jwt", pair.kid()),
+            ("ML-DSA-65-Ed25519", "wit+jwt", pair.kid()),
+            ("ML-DSA-65-Ed25519", "AT+JWT", pair.kid()),
+            ("ML-DSA-65-Ed25519", "at+jwt ", pair.kid()),
+            ("ML-DSA-65-Ed25519", "Application/at+jwt", pair.kid()),
+            ("ML-DSA-65-Ed25519", "application/AT+JWT", pair.kid()),
+            ("ML-DSA-65-Ed25519", "application/at+jwt ", pair.kid()),
+            ("ML-DSA-65-Ed25519", "at+jwt", wrong_kid),
+        ] {
+            let token = composite_token_with_header(&pq, &ed, &claims, alg, typ, kid);
+            assert!(
+                decode_local_multi_key(
+                    &token,
+                    &ca.verifying_key(),
+                    &[ed.verifying_key()],
+                    std::slice::from_ref(&pair),
+                    Some(AUD),
+                    true,
+                )
+                .is_err(),
+                "accepted altered header alg={alg} typ={typ} kid={kid}"
+            );
+        }
+    }
+
+    #[test]
+    fn composite_expiry_future_iat_and_missing_audience_rejected() {
+        let ca = new_ed_key();
+        let (pq, pq_vk) = new_ml_dsa();
+        let ed = new_ed_key();
+        let pair = published_pair(pq_vk, ed.verifying_key());
+        let cases = [
+            (
+                "expired",
+                jwt::Claims::new("expired".to_owned(), now() - 7200, now() - 10)
+                    .with_audience(Some(AUD.to_owned())),
+            ),
+            (
+                "future",
+                jwt::Claims::new("future".to_owned(), now() + 120, now() + 3600)
+                .with_audience(Some(AUD.to_owned())),
+            ),
+            (
+                "no-aud",
+                jwt::Claims::new("no-aud".to_owned(), now(), now() + 3600),
+            ),
+        ];
+        for (case, claims) in cases {
+            let token = composite_token_with_header(
+                &pq,
+                &ed,
+                &claims,
+                "ML-DSA-65-Ed25519",
+                "at+jwt",
+                pair.kid(),
+            );
+            assert!(
+                decode_local_multi_key(
+                &token,
+                &ca.verifying_key(),
+                &[ed.verifying_key()],
+                std::slice::from_ref(&pair),
+                Some(AUD),
+                false,
+            )
+                .is_err(),
+                "accepted invalid {case} claims"
+            );
+        }
+    }
+
+    #[test]
+    fn composite_wrong_issuer_rejected_by_local_policy() {
+        let ca = new_ed_key();
+        let (pq, pq_vk) = new_ml_dsa();
+        let ed = new_ed_key();
+        let pair = published_pair(pq_vk, ed.verifying_key());
+        let claims = jwt::Claims::new("alice".to_owned(), now(), now() + 3600)
+            .with_issuer("https://other.example".to_owned())
+            .with_audience(Some(AUD.to_owned()));
+        let token = composite_token_with_header(
+            &pq,
+            &ed,
+            &claims,
+            "ML-DSA-65-Ed25519",
+            "at+jwt",
+            pair.kid(),
+        );
+        let verified = decode_local_multi_key(
+            &token,
+            &ca.verifying_key(),
+            &[ed.verifying_key()],
+            std::slice::from_ref(&pair),
+            Some(AUD),
+            false,
+        )
+        .unwrap();
+        assert!(!local_issuer_matches(&verified, "https://node-a.example"));
+    }
+
+    #[test]
+    fn composite_half_signature_stripping_rejected() {
+        let ca = new_ed_key();
+        let (pq, pq_vk) = new_ml_dsa();
+        let active = new_ed_key();
+        let token = composite_token(&pq, &active, AUD);
+        let published_ed = vec![active.verifying_key()];
+        let pairs = [published_pair(pq_vk, active.verifying_key())];
+
+        // Sanity: the well-formed composite token verifies.
+        decode_local_multi_key(
+            &token,
+            &ca.verifying_key(),
+            &published_ed,
+            &pairs,
+            Some(AUD),
+            false,
+        )
+        .unwrap();
+
+        let dot2 = token.rfind('.').unwrap();
+        let sig_b64 = &token[dot2 + 1..];
+        let sig_bytes = URL_SAFE_NO_PAD.decode(sig_b64).unwrap();
+        for stripped in [&sig_bytes[..3309], &sig_bytes[3309..]] {
+            let tampered = format!("{}.{}", &token[..dot2], URL_SAFE_NO_PAD.encode(stripped));
+            assert!(decode_local_multi_key(
+                &tampered,
+                &ca.verifying_key(),
+                &published_ed,
+                &pairs,
+                Some(AUD),
+                false,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn plain_eddsa_is_policy_controlled() {
+        let ca = new_ed_key();
+        let active = new_ed_key();
+        let n = now();
+        let claims =
+            jwt::Claims::new("alice".to_owned(), n, n + 3600).with_audience(Some(AUD.to_owned()));
+        let token = jwt::encode(&claims, &active);
+        let published_ed = vec![active.verifying_key()];
+        // Even with composite keys published, a plain EdDSA token routes to and
+        // verifies via the plain Ed25519 branch.
+        let (pq, pq_vk) = new_ml_dsa();
+        let pairs = [published_pair(pq_vk, active.verifying_key())];
+        let _ = pq;
+        let claims = decode_local_multi_key(
+            &token,
+            &ca.verifying_key(),
+            &published_ed,
+            &pairs,
+            Some(AUD),
+            true,
+        )
+        .unwrap();
+        assert_eq!(claims.sub, "alice");
+
+        assert!(decode_local_multi_key(
+            &token,
+            &ca.verifying_key(),
+            &published_ed,
+            &pairs,
+            Some(AUD),
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn composite_jti_remains_subject_to_revocation() {
+        use hyprstream_rpc::auth::{InMemoryJtiBlocklist, JtiBlocklist as _};
+
+        let ca = new_ed_key();
+        let (pq, pq_vk) = new_ml_dsa();
+        let ed = new_ed_key();
+        let pair = published_pair(pq_vk, ed.verifying_key());
+        let claims = jwt::Claims::new("alice".to_owned(), now(), now() + 3600)
+            .with_audience(Some(AUD.to_owned()))
+            .with_jti();
+        let token = composite_token_with_header(
+            &pq,
+            &ed,
+            &claims,
+            "ML-DSA-65-Ed25519",
+            "at+jwt",
+            pair.kid(),
+        );
+        let verified = decode_local_multi_key(
+            &token,
+            &ca.verifying_key(),
+            &[ed.verifying_key()],
+            std::slice::from_ref(&pair),
+            Some(AUD),
+            false,
+        )
+        .unwrap();
+        let jti = verified.jti.as_deref().unwrap();
+        let blocklist = InMemoryJtiBlocklist::new();
+        blocklist.revoke(jti.to_owned(), verified.exp);
+        assert!(blocklist.is_revoked(jti));
+    }
+
+    #[test]
+    fn composite_wrong_audience_rejected() {
+        // Correct published pair, wrong audience → rejected. Composite audience
+        // validation is as strict as the plain path.
+        let ca = new_ed_key();
+        let (pq, pq_vk) = new_ml_dsa();
+        let active = new_ed_key();
+        let token = composite_token(&pq, &active, "https://evil/other");
+        let published_ed = vec![active.verifying_key()];
+        let pairs = [published_pair(pq_vk, active.verifying_key())];
+
+        let err = decode_local_multi_key(
+            &token,
+            &ca.verifying_key(),
+            &published_ed,
+            &pairs,
+            Some(AUD),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(err, "JWT validation failed");
+    }
+
+    #[test]
+    fn composite_survives_independent_ed_rotation() {
+        // A token signed under (ml_dsa, ed_active) still verifies after the
+        // Ed25519 half rotates because its previously authorized exact pair is
+        // retained while both halves remain published.
+        let ca = new_ed_key();
+        let (pq, pq_vk) = new_ml_dsa();
+        let ed_old_active = new_ed_key();
+        let token = composite_token(&pq, &ed_old_active, AUD);
+        // Post-rotation published set: old active is now in drain, new active added.
+        let ed_new_active = new_ed_key();
+        let published_ed = vec![ed_new_active.verifying_key(), ed_old_active.verifying_key()];
+        let pairs = [published_pair(pq_vk, ed_old_active.verifying_key())];
+
+        let claims = decode_local_multi_key(
+            &token,
+            &ca.verifying_key(),
+            &published_ed,
+            &pairs,
+            Some(AUD),
+            false,
+        )
+        .unwrap();
         assert_eq!(claims.sub, "alice");
     }
 }

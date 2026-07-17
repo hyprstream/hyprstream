@@ -569,6 +569,22 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     policy_service = policy_service.with_es256_key_store(es256_store);
     {
         let ml_dsa_store = crate::auth::key_rotation::global_ml_dsa_key_store(&secrets_dir, &config.oauth);
+        let ed_store = crate::auth::key_rotation::global_ed25519_key_store(&secrets_dir, &config.oauth);
+        let ca_key = Arc::new(hyprstream_rpc::node_identity::derive_purpose_key(
+            ctx.signing_key(),
+            "hyprstream-jwt-v1",
+        ));
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(
+                crate::auth::key_rotation::initialize_composite_key_set(
+                    &secrets_dir,
+                    &ed_store,
+                    &ml_dsa_store,
+                    ca_key,
+                    config.oauth.drain_secs(),
+                ),
+            )
+        })?;
         policy_service = policy_service.with_ml_dsa_key_store(ml_dsa_store);
     }
 

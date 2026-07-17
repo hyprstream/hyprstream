@@ -74,6 +74,11 @@ pub trait JwtKeySource: Send + Sync + 'static {
         vec![]
     }
 
+    /// Return the authoritative exact-pair composite key ledger.
+    fn composite_key_set(&self) -> Arc<super::CompositeKeySet> {
+        super::global_composite_key_set()
+    }
+
     /// Return the list of `alg` values bound to a given `kid` in the JWKS.
     ///
     /// This is used as a **stripping defense**: when a JWKS entry carries a
@@ -115,6 +120,7 @@ pub struct ClusterKeySource {
     local_issuer_url: String,
     local_issuers_vec: Vec<String>,
     ml_dsa_vks: Arc<std::sync::RwLock<Vec<crate::crypto::pq::MlDsaVerifyingKey>>>,
+    composite_keys: Arc<super::CompositeKeySet>,
 }
 
 impl ClusterKeySource {
@@ -135,6 +141,7 @@ impl ClusterKeySource {
             local_issuer_url,
             local_issuers_vec,
             ml_dsa_vks: Arc::new(std::sync::RwLock::new(Vec::new())),
+            composite_keys: super::global_composite_key_set(),
         }
     }
 
@@ -143,6 +150,12 @@ impl ClusterKeySource {
     /// The Arc is shared with the rotation task so keys stay current.
     pub fn with_ml_dsa_verifying_keys(mut self, vks: Arc<std::sync::RwLock<Vec<crate::crypto::pq::MlDsaVerifyingKey>>>) -> Self {
         self.ml_dsa_vks = vks;
+        self
+    }
+
+    /// Override the composite key ledger, primarily for isolated service instances.
+    pub fn with_composite_key_set(mut self, keys: Arc<super::CompositeKeySet>) -> Self {
+        self.composite_keys = keys;
         self
     }
 
@@ -181,6 +194,10 @@ impl JwtKeySource for ClusterKeySource {
 
     fn ml_dsa_verifying_keys(&self) -> Vec<crate::crypto::pq::MlDsaVerifyingKey> {
         self.ml_dsa_vks.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    fn composite_key_set(&self) -> Arc<super::CompositeKeySet> {
+        self.composite_keys.clone()
     }
 }
 
@@ -235,6 +252,10 @@ impl JwtKeySource for FederatedKeySource {
 
     fn ml_dsa_verifying_keys(&self) -> Vec<crate::crypto::pq::MlDsaVerifyingKey> {
         self.local.ml_dsa_verifying_keys()
+    }
+
+    fn composite_key_set(&self) -> Arc<super::CompositeKeySet> {
+        self.local.composite_key_set()
     }
 
     fn kid_algs(&self, kid: &str) -> Vec<String> {
