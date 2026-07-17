@@ -12,7 +12,7 @@ crate-type = ["rlib"]  # rlib-only: OnceLock singletons must be shared workspace
 [dependencies]
 # Workspace crates
 hyprstream-rpc = { path = "../hyprstream-rpc" }
-hyprstream-discovery = { path = "../hyprstream-discovery" }
+hyprstream-pds = { path = "../hyprstream-pds" }
 
 # Async runtime
 tokio = { workspace = true }
@@ -68,6 +68,10 @@ zbus_systemd = { version = "0.0.11", features = ["login1", "systemd1"], optional
 default = []
 systemd = ["dep:systemd", "dep:zbus_systemd"]
 pq-hybrid = []  # NO-OP alias (PQ always compiled; runtime CryptoPolicy). See M3 #152.
+
+[dev-dependencies]
+tempfile = { workspace = true }
+hex = { workspace = true }
 
 [lints]
 workspace = true

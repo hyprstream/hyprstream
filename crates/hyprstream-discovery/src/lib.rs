@@ -15,6 +15,8 @@
 //! hyprstream              factory creates DiscoveryService, injects AuthorizationProvider
 //! ```
 
+extern crate self as hyprstream_discovery;
+
 // Re-export shared capnp modules so generated code's `crate::*_capnp` resolves
 pub use hyprstream_rpc::annotations_capnp;
 pub use hyprstream_rpc::common_capnp;
@@ -51,6 +53,8 @@ pub mod generated {
 }
 
 mod service;
+#[cfg(not(target_arch = "wasm32"))]
+mod checkpointed_pds;
 
 /// #893 (at9p D1) — `did:at9p` capsule resolver: turns a GATE-verified capsule
 /// into a dialable `TransportConfig::iroh` (sibling to
@@ -97,7 +101,11 @@ pub mod podspec;
 // Re-export key types
 pub use hyprstream_rpc::registry::SocketKind;
 pub use hyprstream_rpc::resolver::Resolver;
-pub use service::{AuthorizationProvider, DiscoveryService, RecordCarData, RecordResolver};
+pub use service::{
+    bootstrap_deployment_process, deployment_registry_verifier, AuthorizationProvider,
+    DiscoveryService, RecordCarData, RecordResolver, RegistryDeploymentVerifier,
+    production_rpc_client,
+};
 
 // Re-export generated types that consumers need
 pub use generated::discovery_client::{

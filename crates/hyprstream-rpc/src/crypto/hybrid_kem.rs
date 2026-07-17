@@ -570,7 +570,7 @@ impl RecipientPublic {
     /// Validate component count, order-by-position, and public-key lengths
     /// before callers encode or perform KEM work on manually constructed public
     /// material.
-    pub(crate) fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         let components = self.suite_id.components();
         if self.eks.len() != components.len() {
             bail!(
@@ -643,21 +643,21 @@ impl RecipientPublic {
                 );
             }
             let len = r.u32()? as usize;
-            let bytes = r.take(len)?.to_vec();
-            if bytes.len() != want.component().ek_len() {
+            let expected_len = want.component().ek_len();
+            if len != expected_len {
                 bail!(
-                    "ek {i} ({:?}) length {} != expected {}",
-                    want,
-                    bytes.len(),
-                    want.component().ek_len()
+                    "ek {i} length {len} does not match {:?} public-key length {expected_len}",
+                    want
                 );
             }
-            eks.push(bytes);
+            eks.push(r.take(len)?.to_vec());
         }
         if r.pos != buf.len() {
             bail!("trailing bytes after recipient public material");
         }
-        Ok(Self { suite_id, eks })
+        let recipient = Self { suite_id, eks };
+        recipient.validate()?;
+        Ok(recipient)
     }
 }
 

@@ -1,5 +1,11 @@
 # Service Runtime Architecture
 
+Production registry/Discovery trust is provisioned through the fixed OS-owned
+startup seam documented in
+[`deployment-registry-trust.md`](deployment-registry-trust.md). Service-manager
+credential directories and user configuration remain suitable for ordinary
+service secrets, but they do not select the registry/PDS authority root.
+
 This document describes the threading model, async patterns, and `Send`/`Sync` constraints for hyprstream services.
 
 ## Overview

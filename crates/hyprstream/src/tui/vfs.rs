@@ -56,10 +56,7 @@ async fn vfs_proxy_loop(
 
     while let Some(req) = rx.recv().await {
         let result = match req.op {
-            VfsOp::Cat { ref path } => ns
-                .cat(path, &subject)
-                .await
-                .map_err(|e| e.to_string()),
+            VfsOp::Cat { ref path } => ns.cat(path, &subject).await.map_err(|e| e.to_string()),
             VfsOp::Ls { ref path } => ns
                 .ls(path, &subject)
                 .await
@@ -83,13 +80,10 @@ async fn vfs_proxy_loop(
                 .await
                 .map(|_| Vec::new())
                 .map_err(|e| e.to_string()),
-            VfsOp::Ctl { ref path, ref cmd } => ns
-                .ctl(path, cmd, &subject)
-                .await
-                .map_err(|e| e.to_string()),
-            VfsOp::MountPrefixes => {
-                Ok(ns.mount_prefixes().join("\n").into_bytes())
+            VfsOp::Ctl { ref path, ref cmd } => {
+                ns.ctl(path, cmd, &subject).await.map_err(|e| e.to_string())
             }
+            VfsOp::MountPrefixes => Ok(ns.mount_prefixes().join("\n").into_bytes()),
         };
         let _ = req.reply.send(result);
     }
@@ -104,32 +98,8 @@ pub fn build_chat_vfs_namespace(
         Subject::new(pubkey_hex)
     };
 
-    // Resolve the model service's verifying key via PolicyClient.
-    let policy_vk = hyprstream_service::global_trust_store()
-        .resolve_one("policy")
-        .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client = crate::services::PolicyClient::for_service(
+    let model_client = crate::services::generated::model_client::ModelClient::from_resolver(
         signing_key.clone(),
-        policy_vk,
-        None,
-    )?;
-    let model_vk_resp = tokio::task::block_in_place(|| {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(policy_client.resolve_service_key(
-            &crate::services::generated::policy_client::ResolveServiceKey {
-                service_name: "model".to_owned(),
-            },
-        ))
-    })
-    .map_err(|e| anyhow::anyhow!("Failed to resolve model service key: {e}"))?;
-    let model_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
-        model_vk_resp.verifying_key.as_slice().try_into()
-            .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
-    ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?;
-
-    let model_client = crate::services::generated::model_client::ModelClient::for_service(
-        signing_key.clone(),
-        model_vk,
         None,
     )?;
 

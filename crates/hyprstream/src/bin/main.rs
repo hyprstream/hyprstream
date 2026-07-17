@@ -501,11 +501,8 @@ fn handle_quick_command(
             || async move {
                 let keys_dir = ctx.models_dir().join(".registry").join("keys");
                 let signing_key = load_or_generate_signing_key(&keys_dir).await?;
-                let model_server_vk = resolve_service_vk("model")
-                    .ok_or_else(|| anyhow::anyhow!("Cannot resolve model service pubkey. Run 'hyprstream wizard -y' to generate bootstrap credentials."))?;
-                let model_client = hyprstream_core::services::generated::model_client::ModelClient::for_service(
+                let model_client = hyprstream_core::services::generated::model_client::ModelClient::from_resolver(
                     signing_key,
-                    model_server_vk,
                     None,
                 )?;
                 let filters = parse_filters(&filter)?;
@@ -1160,7 +1157,7 @@ fn handle_quick_command(
                         )?;
 
                         // Wire up policy-backed authorization
-                        let worker_policy_client = PolicyClient::for_service(
+                        let worker_policy_client = PolicyClient::for_local_bootstrap(
                             signing_key.clone(),
                             resolve_service_vk("policy")
                                 .ok_or_else(|| anyhow::anyhow!("Cannot resolve policy pubkey. Run wizard."))?,
@@ -1190,10 +1187,12 @@ fn handle_quick_command(
                     };
 
                     use hyprstream_workers::runtime::WorkerClient;
-                    let worker_server_vk = resolve_service_vk("worker")
-                        .ok_or_else(|| anyhow::anyhow!("Cannot resolve worker pubkey. Run wizard."))?;
-                    let worker_client =
-                        WorkerClient::for_service(signing_key, worker_server_vk, None)?;
+                    let worker_client = if worker_already_running {
+                        WorkerClient::from_resolver(signing_key, None)?
+                    } else {
+                        let destination = signing_key.verifying_key();
+                        WorkerClient::for_local_bootstrap(signing_key, destination, None)?
+                    };
 
                     match action {
                         WorkerAction::List {
@@ -1417,6 +1416,10 @@ fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
         }
     }
     trust.resolve_one(service_name)
+}
+
+fn install_process_production_resolver(signing_key: &SigningKey) -> Result<()> {
+    hyprstream_discovery::bootstrap_deployment_process(signing_key.clone())
 }
 
 /// Install the process-global envelope verify configuration (#152, #160).
@@ -1840,20 +1843,14 @@ fn main() -> Result<()> {
         VerifyingKey,
     ) = _registry_runtime
         .block_on(async {
-            let models_dir = config.models_dir();
-            let keys_dir = models_dir.join(".registry").join("keys");
+            let keys_dir = config.models_dir().join(".registry").join("keys");
             let signing_key = load_or_generate_signing_key(&keys_dir).await?;
             let verifying_key = signing_key.verifying_key();
 
-            // Resolve the registry service's verifying key from bootstrap pubkeys.
-            // CLI mode doesn't have a ServiceContext, so we look up the target
-            // pubkey directly from the credential store.
-            let registry_vk = resolve_service_vk("registry")
-                .ok_or_else(|| anyhow::anyhow!("Cannot resolve registry pubkey. Run wizard."))?;
-
-            let client = hyprstream_core::services::RegistryClient::for_service(
+            install_process_production_resolver(&signing_key)
+                .context("Failed to install checkpoint-backed production resolver")?;
+            let client = hyprstream_core::services::RegistryClient::from_resolver(
                 signing_key.clone(),
-                registry_vk,
                 None,
             )?;
 
@@ -2045,15 +2042,11 @@ fn main() -> Result<()> {
                                     // re-derives instead of reading the authoritative record"
                                     // disease #441 targets, just one directory earlier.
                                     let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir()?;
-
-                                    // Load CA verifying key (trust anchor) for JWT verification only.
-                                    // Do NOT insert into the trust store as "policy" scope — the trust
-                                    // store maps ZMQ signing keys to subjects, and the policy service
-                                    // signs ZMQ responses with its own independent keypair (not the CA
-                                    // key). The CA key is only used to verify service JWTs (at+jwt).
-                                    if let Ok(ca_vk) = hyprstream_core::auth::identity_store::load_ca_verifying_key(&secrets_dir) {
-                                        ctx = ctx.with_ca_verifying_key(ca_vk);
-                                    }
+                                    ctx = ctx.with_ca_verifying_key(
+                                        hyprstream_core::auth::identity_store::load_ca_verifying_key(
+                                            &secrets_dir,
+                                        )?,
+                                    );
 
                                     // Load bootstrap pubkeys (all service pubkeys) into trust store
                                     if let Ok(pubkeys) = hyprstream_core::auth::identity_store::load_bootstrap_pubkeys(&secrets_dir) {
@@ -2117,12 +2110,11 @@ fn main() -> Result<()> {
                                     // #759: same authoritative resolver as the `--ipc` branch above —
                                     // see the comment there.
                                     let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir()?;
-
-                                    // Load CA verifying key (trust anchor)
-                                    let ca_vk = hyprstream_core::auth::identity_store::load_ca_verifying_key(&secrets_dir)
-                                        .context("CA key not found — run 'hyprstream wizard' first")?;
-                                    // CA key is for JWT verification only — not a ZMQ signing key.
-                                    ctx = ctx.with_ca_verifying_key(ca_vk);
+                                    ctx = ctx.with_ca_verifying_key(
+                                        hyprstream_core::auth::identity_store::load_ca_verifying_key(
+                                            &secrets_dir,
+                                        )?,
+                                    );
 
                                     // Load bootstrap pubkeys (all service pubkeys) into trust store
                                     let pubkeys = hyprstream_core::auth::identity_store::load_bootstrap_pubkeys(&secrets_dir)
@@ -2180,6 +2172,13 @@ fn main() -> Result<()> {
                                     }
                                 }
 
+                                if quic_cfg.enabled {
+                                    ctx = hyprstream_core::services::factories::with_checkpointed_native_announcements(
+                                        ctx,
+                                        &service_names,
+                                    )?;
+                                }
+
                                 // Wire QUIC shared config (must be after key generation so jwt_verifying_key is set)
                                 if quic_cfg.enabled {
                                     let qc = quic_cfg;
@@ -2222,6 +2221,53 @@ fn main() -> Result<()> {
                                         iroh_enabled: qc.iroh,
                                         // #358: producer-chosen relay rendezvous (None = direct-only).
                                         moq_relay,
+                                        native_announcement_publisher: Some(std::sync::Arc::new(
+                                            |request: hyprstream_service::NativeAnnouncementRequest| {
+                                                std::thread::spawn(move || {
+                                                    let runtime = match tokio::runtime::Builder::new_current_thread()
+                                                        .enable_all()
+                                                        .build()
+                                                    {
+                                                        Ok(runtime) => runtime,
+                                                        Err(error) => {
+                                                            tracing::warn!("Failed to create announcement runtime: {error}");
+                                                            return;
+                                                        }
+                                                    };
+                                                    runtime.block_on(async move {
+                                                        let client = match hyprstream_discovery::DiscoveryClient::for_local_bootstrap(
+                                                            request.signing_key,
+                                                            request.discovery_verifying_key,
+                                                            None,
+                                                        ) {
+                                                            Ok(client) => client,
+                                                            Err(error) => {
+                                                                tracing::warn!("Failed to build DiscoveryClient: {error}");
+                                                                return;
+                                                            }
+                                                        };
+                                                        let announcement = hyprstream_discovery::ServiceAnnouncement {
+                                                            service_name: request.service_name,
+                                                            socket_kind: "quic".to_owned(),
+                                                            endpoint: request.endpoint,
+                                                            service_jwt: request.service_jwt,
+                                                            service_did: request.service_did,
+                                                            capabilities: request.capabilities,
+                                                            accepted_state_digest: request.accepted_state_digest,
+                                                            accepted_state_epoch: request.accepted_state_epoch,
+                                                            response_key_id: request.response_key_id,
+                                                            request_kem_key_id: request.request_kem_key_id,
+                                                            request_kem_recipient: request.request_kem_recipient,
+                                                            expires_at_unix_ms: request.expires_at_unix_ms,
+                                                        };
+                                                        match client.announce(&announcement).await {
+                                                            Ok(_) => tracing::info!("Announced QUIC endpoint to DiscoveryService"),
+                                                            Err(error) => tracing::warn!("Failed to announce QUIC endpoint: {error}"),
+                                                        }
+                                                    });
+                                                });
+                                            },
+                                        )),
                                     };
                                     ctx = ctx.with_quic(shared);
                                 }
@@ -2733,4 +2779,79 @@ fn main() -> Result<()> {
     };
 
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod resolver_startup_controls {
+    #[test]
+    fn command_and_service_processes_install_before_consumers() {
+        let source = include_str!("main.rs");
+        let production = source
+            .split("mod resolver_startup_controls {")
+            .next()
+            .expect("production binary source");
+        let startup = production
+            .find("install_process_production_resolver(&signing_key)")
+            .expect("trusted startup boundary");
+        let install = production[startup..]
+            .find("install_process_production_resolver(&signing_key)")
+            .expect("process resolver install");
+        let first_generated = production[startup..]
+            .find("RegistryClient::from_resolver(")
+            .expect("first generated client");
+        let command_dispatch = production[startup..]
+            .find("match matches.subcommand()")
+            .expect("top-level command dispatch");
+        assert!(install < first_generated);
+        assert!(first_generated < command_dispatch);
+        assert_eq!(
+            production
+                .matches("install_process_production_resolver(&signing_key)")
+                .count(),
+            1
+        );
+        assert!(!production.contains("install_process_production_resolver(&mut ctx)"));
+
+        let announcements = production
+            .find("with_checkpointed_native_announcements(")
+            .expect("authenticated announcements");
+        let first_factory = production[announcements..]
+            .find("get_factory(")
+            .expect("first inventory factory invocation");
+        assert!(first_factory > 0);
+
+        // These entry points all dispatch below the single command bootstrap:
+        // quick, TUI, schema/tool, MCP/OpenAI services, shell, training, git,
+        // and isolated `service start` IPC consumers.
+        for entry in [
+            "Some((\"tool\"",
+            "Some((\"quick\"",
+            "Some((\"tui\"",
+            "handle_shell_tui",
+            "handle_training_batch",
+        ] {
+            assert!(production.contains(entry), "missing {entry}");
+        }
+    }
+
+    #[test]
+    fn command_local_spawns_never_use_the_production_resolver() {
+        let source = include_str!("main.rs");
+        let worker = source
+            .find("let worker_client = if worker_already_running")
+            .expect("worker client selection");
+        let worker_selection = &source[worker..worker + 500];
+        assert!(worker_selection.contains("WorkerClient::from_resolver"));
+        assert!(worker_selection.contains("WorkerClient::for_local_bootstrap"));
+
+        let training = include_str!("../cli/training_handlers.rs");
+        assert_eq!(training.matches("InferenceClient::from_resolver").count(), 0);
+        assert_eq!(
+            training
+                .matches("InferenceClient::for_local_bootstrap")
+                .count(),
+            2
+        );
+    }
 }

@@ -800,7 +800,7 @@ impl ModelService {
         // Create client for this service from the typed transport (#320).
         // Inference services share the model service's signing key, so use our
         // own verifying key directly — no PolicyService lookup needed.
-        let client = InferenceClient::for_transport(
+        let client = InferenceClient::for_local_transport_bootstrap(
             &transport,
             self.signing_key.clone(),
             self.signing_key.verifying_key(),

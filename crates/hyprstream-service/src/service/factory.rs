@@ -28,10 +28,129 @@ use std::sync::Arc;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use zeroize::Zeroizing;
 
-use hyprstream_rpc::registry::{global as global_registry, SocketKind};
 use crate::service::metadata::SchemaMetadataFn;
 use crate::service::spawner::Spawnable;
+use hyprstream_rpc::registry::{global as global_registry, SocketKind};
 use hyprstream_rpc::transport::TransportConfig;
+
+/// Complete, already-validated native announcement ready for publication.
+pub struct NativeAnnouncementRequest {
+    pub service_name: String,
+    pub endpoint: String,
+    pub signing_key: SigningKey,
+    pub service_jwt: Option<String>,
+    pub discovery_verifying_key: VerifyingKey,
+    pub service_did: hyprstream_rpc::identity::Did,
+    pub capabilities: Vec<String>,
+    pub accepted_state_digest: Vec<u8>,
+    pub accepted_state_epoch: u64,
+    pub response_key_id: String,
+    pub request_kem_key_id: String,
+    pub request_kem_recipient: Vec<u8>,
+    pub expires_at_unix_ms: i64,
+}
+
+pub type NativeAnnouncementPublisher =
+    Arc<dyn Fn(NativeAnnouncementRequest) + Send + Sync + 'static>;
+
+/// Complete native announcement material verified against one accepted state.
+#[derive(Clone)]
+pub struct NativeServiceAnnouncement {
+    service_did: hyprstream_rpc::identity::Did,
+    capabilities: Vec<String>,
+    accepted_state_digest: [u8; 64],
+    accepted_state_epoch: u64,
+    accepted_state_expires_at_unix_ms: i64,
+    response_key_id: String,
+    response_verifying_key: [u8; 32],
+    request_kem_key_id: String,
+    request_kem_recipient: hyprstream_rpc::crypto::hybrid_kem::RecipientPublic,
+}
+
+impl NativeServiceAnnouncement {
+    /// Project a complete native announcement from the opaque #1004 accepted
+    /// state. The local service key must be the accepted current key and the
+    /// named service must be present in that exact state.
+    pub fn from_accepted_state(
+        service_name: &str,
+        signer: &SigningKey,
+        state: &hyprstream_pds::at9p_duplicity::AcceptedAt9pState,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            state
+                .current
+                .services
+                .iter()
+                .any(|entry| entry.id == service_name),
+            "accepted state does not authorize service {service_name}"
+        );
+        let current = state
+            .current
+            .subject_keys
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("accepted state has no current response key"))?;
+        anyhow::ensure!(
+            current.ed25519_pub.as_slice() == signer.verifying_key().as_bytes(),
+            "service signer is not the accepted current response key"
+        );
+        let expires_at = state.expires_at.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("genesis-only accepted state has no bounded production expiry")
+        })?;
+        let expires_at = chrono::DateTime::parse_from_rfc3339(expires_at)?.timestamp_millis();
+        let did = hyprstream_rpc::identity::Did::from(state.did.clone());
+        let recipient = hyprstream_rpc::node_identity::derive_mesh_kem_recipient(signer)?.public();
+        let announcement = Self {
+            service_did: did.clone(),
+            capabilities: vec!["hyprstream-rpc/1".to_owned()],
+            accepted_state_digest: state.head_digest,
+            accepted_state_epoch: state.epoch,
+            accepted_state_expires_at_unix_ms: expires_at,
+            response_key_id: format!("{did}#response"),
+            response_verifying_key: signer.verifying_key().to_bytes(),
+            request_kem_key_id: format!("{did}#mesh-kem"),
+            request_kem_recipient: recipient,
+        };
+        announcement.validate(service_name, &signer.verifying_key())?;
+        Ok(announcement)
+    }
+
+    fn validate(&self, service_name: &str, signer: &VerifyingKey) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.service_did.is_did_at9p(),
+            "native announcement requires did:at9p identity"
+        );
+        anyhow::ensure!(
+            !service_name.is_empty() && self.capabilities.iter().any(|c| c == "hyprstream-rpc/1"),
+            "native announcement lacks canonical service capability"
+        );
+        anyhow::ensure!(
+            self.response_verifying_key == signer.to_bytes(),
+            "accepted response key does not match service signer"
+        );
+        anyhow::ensure!(
+            self.response_key_id
+                .starts_with(&format!("{}#", self.service_did)),
+            "response key id crosses service authority"
+        );
+        anyhow::ensure!(
+            self.request_kem_key_id
+                .starts_with(&format!("{}#", self.service_did)),
+            "KEM key id crosses service authority"
+        );
+        anyhow::ensure!(
+            self.request_kem_recipient.suite_id
+                == hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+            "native announcement requires hybrid KEM suite"
+        );
+        self.request_kem_recipient.validate()?;
+        anyhow::ensure!(
+            self.accepted_state_epoch > 0
+                && self.accepted_state_expires_at_unix_ms > chrono::Utc::now().timestamp_millis(),
+            "accepted state is unbounded or expired"
+        );
+        Ok(())
+    }
+}
 
 /// Shared QUIC/WebTransport configuration for all services.
 ///
@@ -65,13 +184,20 @@ pub struct QuicSharedConfig {
     /// service's [`QuicLoopConfig`] so the spawner advertises a `Role::Relay` reach
     /// and links the origin UP to the relay.
     pub moq_relay: Option<hyprstream_rpc::stream_info::TransportConfig>,
+    /// Application-owned publisher. Keeping this callback here avoids making
+    /// orchestration depend on the Discovery implementation crate.
+    pub native_announcement_publisher: Option<NativeAnnouncementPublisher>,
 }
 
 impl QuicSharedConfig {
     /// Build a per-service `QuicLoopConfig` with the given port.
     ///
     /// Port 0 = ephemeral (OS-assigned).
-    pub fn for_service(&self, service_name: &str, port: u16) -> hyprstream_rpc::service::QuicLoopConfig {
+    pub fn for_service(
+        &self,
+        service_name: &str,
+        port: u16,
+    ) -> hyprstream_rpc::service::QuicLoopConfig {
         let bind_addr = std::net::SocketAddr::new(self.base_ip, port);
         let metadata = self.oauth_issuer_url.as_ref().map(|issuer| {
             let mut meta = serde_json::json!({
@@ -120,12 +246,15 @@ impl QuicSharedConfig {
         service_jwt: Option<String>,
         policy_verifying_key: VerifyingKey,
         discovery_verifying_key: VerifyingKey,
+        accepted: Option<NativeServiceAnnouncement>,
     ) -> hyprstream_rpc::service::QuicLoopConfig {
         let mut config = self.for_service(service_name, port);
+        let publisher = self.native_announcement_publisher.clone();
         config.on_quic_bound = Some(Box::new(move |svc_name, addr, sn| {
-            let endpoint = format!("quic://{}:{}:{}", sn, addr.ip(), addr.port());
+            let endpoint = format!("quic://{sn}:{addr}");
             let sk = signing_key.clone();
             let jwt = service_jwt.clone();
+            let accepted = accepted.clone();
 
             // Check if JWT needs renewal (within 2 days of expiry, or missing)
             let needs_renewal = jwt.as_ref().is_none_or(|j| {
@@ -146,58 +275,48 @@ impl QuicSharedConfig {
             });
 
             if needs_renewal {
-                tracing::info!("Service JWT for '{svc_name}' needs renewal — requesting from PolicyService");
+                tracing::info!(
+                    "Service JWT for '{svc_name}' needs renewal — requesting from PolicyService"
+                );
             }
 
-            // Spawn async announce in a new thread since we may not be in a tokio context
             let discovery_vk = discovery_verifying_key;
             let policy_vk = policy_verifying_key;
-            std::thread::spawn(move || {
-                let rt = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => rt,
-                    Err(e) => {
-                        tracing::warn!("Failed to create announce runtime: {}", e);
-                        return;
-                    }
-                };
-                rt.block_on(async {
-                    // Request JWT renewal from PolicyService if needed
-                    if needs_renewal {
-                        // TODO: Call PolicyService issueToken RPC for renewal.
-                        // Requires adding existingToken field to policy.capnp and
-                        // regenerating codegen. For now, log a warning.
-                        tracing::warn!(
-                            "Service JWT for '{svc_name}' expired or near-expiry. \
-                             Renewal RPC pending capnp schema update. \
-                             Re-run wizard to refresh JWTs."
-                        );
-                        let _ = policy_vk; // suppress unused warning
-                    }
-
-                    let client = match hyprstream_discovery::DiscoveryClient::for_service(
-                        sk,
-                        discovery_vk,
-                        None,
-                    ) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::warn!("Failed to build DiscoveryClient: {}", e);
-                            return;
-                        }
-                    };
-                    match client.announce(&hyprstream_discovery::ServiceAnnouncement {
-                        service_name: svc_name,
-                        socket_kind: "quic".to_owned(),
-                        endpoint,
-                        service_jwt: jwt,
-                    }).await {
-                        Ok(_) => tracing::info!("Announced QUIC endpoint to DiscoveryService"),
-                        Err(e) => tracing::warn!("Failed to announce QUIC endpoint: {}", e),
-                    }
-                });
+            let Some(accepted) = accepted else {
+                tracing::warn!("Refusing production network announcement for '{svc_name}': accepted native identity/KEM bundle is unavailable");
+                return;
+            };
+            if let Err(error) = accepted.validate(&svc_name, &sk.verifying_key()) {
+                tracing::warn!(
+                    "Refusing production network announcement for '{svc_name}': {error}"
+                );
+                return;
+            }
+            if needs_renewal {
+                tracing::warn!(
+                    "Service JWT for '{svc_name}' expired or near-expiry. \
+                     Renewal RPC pending capnp schema update. Re-run wizard to refresh JWTs."
+                );
+                let _ = policy_vk;
+            }
+            let Some(publish) = publisher.clone() else {
+                tracing::warn!("Refusing production network announcement for '{svc_name}': publisher is unavailable");
+                return;
+            };
+            publish(NativeAnnouncementRequest {
+                service_name: svc_name,
+                endpoint,
+                signing_key: sk,
+                service_jwt: jwt,
+                discovery_verifying_key: discovery_vk,
+                service_did: accepted.service_did,
+                capabilities: accepted.capabilities,
+                accepted_state_digest: accepted.accepted_state_digest.to_vec(),
+                accepted_state_epoch: accepted.accepted_state_epoch,
+                response_key_id: accepted.response_key_id,
+                request_kem_key_id: accepted.request_kem_key_id,
+                request_kem_recipient: accepted.request_kem_recipient.encode(),
+                expires_at_unix_ms: accepted.accepted_state_expires_at_unix_ms,
             });
         }));
         config
@@ -242,6 +361,8 @@ pub struct ServiceContext {
     /// - Multi-process: loaded from per-service credential files
     service_keys: HashMap<String, SigningKey>,
 
+    native_announcements: HashMap<String, NativeServiceAnnouncement>,
+
     /// CA verifying key (trust anchor for verifying service JWTs).
     ///
     /// In single-process mode, this is derived from the root key.
@@ -259,7 +380,8 @@ pub struct ServiceContext {
     /// Uses `std::sync::RwLock` to match the cross-crate `Arc<RwLock<..>>`
     /// contract with `hyprstream::auth::key_rotation` and `JwtKeySource`.
     #[allow(clippy::disallowed_types)]
-    ml_dsa_verifying_keys: std::sync::Arc<std::sync::RwLock<Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>>>,
+    ml_dsa_verifying_keys:
+        std::sync::Arc<std::sync::RwLock<Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>>>,
 }
 
 impl ServiceContext {
@@ -270,9 +392,9 @@ impl ServiceContext {
         ipc: bool,
         models_dir: std::path::PathBuf,
     ) -> Self {
-        let identity_provider = Arc::new(
-            hyprstream_rpc::node_identity::NodeIdentityProvider::new(&signing_key)
-        );
+        let identity_provider = Arc::new(hyprstream_rpc::node_identity::NodeIdentityProvider::new(
+            &signing_key,
+        ));
         Self {
             signing_key,
             verifying_key,
@@ -283,6 +405,7 @@ impl ServiceContext {
             oauth_issuer_url: None,
             federation_key_source: None,
             service_keys: HashMap::new(),
+            native_announcements: HashMap::new(),
             ca_verifying_key: None,
             jwks_fetcher: None,
             ml_dsa_verifying_keys: {
@@ -294,13 +417,18 @@ impl ServiceContext {
 
     /// Set the shared ML-DSA-65 verifying keys for PQ-hybrid JWT verification.
     #[allow(clippy::disallowed_types)]
-    pub fn set_ml_dsa_verifying_keys(&mut self, keys: std::sync::Arc<std::sync::RwLock<Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>>>) {
+    pub fn set_ml_dsa_verifying_keys(
+        &mut self,
+        keys: std::sync::Arc<std::sync::RwLock<Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>>>,
+    ) {
         self.ml_dsa_verifying_keys = keys;
     }
 
     /// Get a clone of the shared ML-DSA verifying keys Arc.
     #[allow(clippy::disallowed_types)]
-    pub fn ml_dsa_verifying_keys_arc(&self) -> std::sync::Arc<std::sync::RwLock<Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>>> {
+    pub fn ml_dsa_verifying_keys_arc(
+        &self,
+    ) -> std::sync::Arc<std::sync::RwLock<Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>>> {
         self.ml_dsa_verifying_keys.clone()
     }
 
@@ -309,7 +437,18 @@ impl ServiceContext {
     /// In single-process mode, these are generated in memory at startup.
     /// In multi-process mode, these are loaded from per-service credential files.
     pub fn with_service_key(mut self, service_name: &str, signing_key: SigningKey) -> Self {
-        self.service_keys.insert(service_name.to_owned(), signing_key);
+        self.service_keys
+            .insert(service_name.to_owned(), signing_key);
+        self
+    }
+
+    pub fn with_native_announcement(
+        mut self,
+        service_name: impl Into<String>,
+        announcement: NativeServiceAnnouncement,
+    ) -> Self {
+        self.native_announcements
+            .insert(service_name.into(), announcement);
         self
     }
 
@@ -338,7 +477,7 @@ impl ServiceContext {
     pub fn swap_signing_key(mut self, new_key: SigningKey) -> Self {
         self.verifying_key = new_key.verifying_key();
         self.identity_provider = Arc::new(
-            hyprstream_rpc::node_identity::NodeIdentityProvider::new(&new_key)
+            hyprstream_rpc::node_identity::NodeIdentityProvider::new(&new_key),
         );
         self.signing_key = new_key;
         self
@@ -354,14 +493,13 @@ impl ServiceContext {
     /// Populates `service_keys`, `ca_verifying_key`, and the global trust store
     /// from the generated materials.
     pub fn generate_independent_service_keys(self, service_names: &[String]) -> Self {
-
         let ca_signing_key = hyprstream_rpc::node_identity::derive_purpose_key(
-            &self.signing_key, "hyprstream-jwt-v1",
+            &self.signing_key,
+            "hyprstream-jwt-v1",
         );
         let ca_verifying_key = ca_signing_key.verifying_key();
 
-        let mut ctx = self
-            .with_ca_verifying_key(ca_verifying_key);
+        let mut ctx = self.with_ca_verifying_key(ca_verifying_key);
 
         let now = chrono::Utc::now().timestamp();
         let expiry = now + 7 * 86_400; // 7 days
@@ -393,17 +531,19 @@ impl ServiceContext {
                 // PolicyService uses the root key directly (it IS the CA).
                 // Register its signing key in the registry
                 // so service_signing_key("policy") works.
-                ctx = ctx
-                    .with_service_key(name, root_signing_key.clone());
+                ctx = ctx.with_service_key(name, root_signing_key.clone());
 
                 // PolicyService key never expires — it IS the trust anchor.
-                trust.insert(root_verifying_key, crate::service::trust_store::Attestation {
-                    scopes: std::iter::once("policy".to_owned()).collect(),
-                    subject: None,
-                    jwt: None,
-                    expires_at: 0,
-                    attested_by: None,
-                });
+                trust.insert(
+                    root_verifying_key,
+                    crate::service::trust_store::Attestation {
+                        scopes: std::iter::once("policy".to_owned()).collect(),
+                        subject: None,
+                        jwt: None,
+                        expires_at: 0,
+                        attested_by: None,
+                    },
+                );
                 continue;
             }
 
@@ -415,12 +555,9 @@ impl ServiceContext {
             // Set iss and aud to match PolicyService's local_issuer_url and
             // default_audience so it recognizes these CA-signed tokens as local.
             let oauth_issuer = ctx.oauth_issuer_url().map(str::to_owned);
-            let mut claims = hyprstream_rpc::auth::Claims::new(
-                format!("service:{name}"),
-                now,
-                expiry,
-            )
-            .with_cnf_jwk(service_vk.as_bytes());
+            let mut claims =
+                hyprstream_rpc::auth::Claims::new(format!("service:{name}"), now, expiry)
+                    .with_cnf_jwk(service_vk.as_bytes());
             if let Some(ref iss) = oauth_issuer {
                 claims = claims
                     .with_issuer(iss.clone())
@@ -429,17 +566,19 @@ impl ServiceContext {
 
             let jwt = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &ca_signing_key);
 
-            ctx = ctx
-                .with_service_key(name, service_key);
+            ctx = ctx.with_service_key(name, service_key);
 
             // Register this service's key in the trust store.
-            trust.insert(service_vk, crate::service::trust_store::Attestation {
-                scopes: std::iter::once(name.clone()).collect(),
-                subject: None,
-                jwt: Some(jwt),
-                expires_at: expiry,
-                attested_by: Some(root_verifying_key.to_bytes()),
-            });
+            trust.insert(
+                service_vk,
+                crate::service::trust_store::Attestation {
+                    scopes: std::iter::once(name.clone()).collect(),
+                    subject: None,
+                    jwt: Some(jwt),
+                    expires_at: expiry,
+                    attested_by: Some(root_verifying_key.to_bytes()),
+                },
+            );
         }
 
         ctx
@@ -581,10 +720,8 @@ impl ServiceContext {
             let source = source.with_local_ca_key(self.jwt_verifying_key());
             std::sync::Arc::new(source)
         } else {
-            let source = hyprstream_rpc::auth::ClusterKeySource::new(
-                self.jwt_verifying_key(),
-                issuer_url,
-            );
+            let source =
+                hyprstream_rpc::auth::ClusterKeySource::new(self.jwt_verifying_key(), issuer_url);
             let source = source.with_ml_dsa_verifying_keys(self.ml_dsa_verifying_keys.clone());
             std::sync::Arc::new(source)
         }
@@ -612,6 +749,15 @@ impl ServiceContext {
     /// Get models directory path.
     pub fn models_dir(&self) -> &std::path::Path {
         &self.models_dir
+    }
+
+    /// Canonical service-owned deployment directory.
+    ///
+    /// This deliberately ignores the caller-provided `models_dir`: public
+    /// `ServiceContext::new` creates local/factory context only and cannot
+    /// select the production Discovery authority root.
+    pub fn deployment_data_dir(&self) -> anyhow::Result<std::path::PathBuf> {
+        deployment_data_dir()
     }
 
     /// Get transport config for a service endpoint from the registry.
@@ -646,7 +792,9 @@ impl ServiceContext {
     /// When `[quic] enabled = true` in config, all services get QUIC on
     /// auto-assigned ephemeral ports by default. Set an explicit port to
     /// control which port a service uses.
-    pub fn into_spawnable_quic<S: hyprstream_rpc::service::RequestService + Send + Sync + 'static>(
+    pub fn into_spawnable_quic<
+        S: hyprstream_rpc::service::RequestService + Send + Sync + 'static,
+    >(
         &self,
         service: S,
         quic_port: Option<u16>,
@@ -661,9 +809,11 @@ impl ServiceContext {
                 } else {
                     // Read JWT from trust store attestation
                     let trust = crate::service::trust_store::global_trust_store();
-                    let service_jwt = trust.resolve_one(service.name())
+                    let service_jwt = trust
+                        .resolve_one(service.name())
                         .and_then(|vk| trust.get(&vk).and_then(|att| att.jwt.clone()));
-                    let policy_vk = trust.resolve_one("policy")
+                    let policy_vk = trust
+                        .resolve_one("policy")
                         .unwrap_or_else(|| panic!("trust store has no policy key"));
                     let discovery_vk = crate::service::trust_store::global_trust_store()
                         .resolve_one("discovery")
@@ -675,6 +825,7 @@ impl ServiceContext {
                         service_jwt,
                         policy_vk,
                         discovery_vk,
+                        self.native_announcements.get(service.name()).cloned(),
                     ))
                 }
             }
@@ -698,6 +849,16 @@ impl ServiceContext {
     ) -> Box<dyn Spawnable> {
         self.into_spawnable_quic(service, None)
     }
+}
+
+/// Deployment-owned registry directory shared by the checkpoint writer and
+/// authenticated process bootstrap. No caller-provided context or path can
+/// influence this value.
+pub fn deployment_data_dir() -> anyhow::Result<std::path::PathBuf> {
+    let data_dir = hyprstream_rpc::paths::data_dir()
+        .ok_or_else(|| anyhow::anyhow!("deployment data directory is unavailable"))?;
+    anyhow::ensure!(data_dir.is_absolute(), "deployment data directory must be absolute");
+    Ok(data_dir.join("models/.registry"))
 }
 
 // ServiceClient trait removed — generated clients use Arc<dyn RpcClient> directly.
@@ -742,14 +903,30 @@ impl ServiceFactory {
     ///
     /// Called by the `#[service_factory]` macro-generated code.
     pub const fn new(name: &'static str, factory: ServiceFactoryFn) -> Self {
-        Self { name, factory, schema: None, metadata: None, depends_on: &[] }
+        Self {
+            name,
+            factory,
+            schema: None,
+            metadata: None,
+            depends_on: &[],
+        }
     }
 
     /// Create a new service factory with schema bytes.
     ///
     /// Called by the `#[service_factory("name", schema = "...")]` macro-generated code.
-    pub const fn with_schema(name: &'static str, factory: ServiceFactoryFn, schema: &'static [u8]) -> Self {
-        Self { name, factory, schema: Some(schema), metadata: None, depends_on: &[] }
+    pub const fn with_schema(
+        name: &'static str,
+        factory: ServiceFactoryFn,
+        schema: &'static [u8],
+    ) -> Self {
+        Self {
+            name,
+            factory,
+            schema: Some(schema),
+            metadata: None,
+            depends_on: &[],
+        }
     }
 
     /// Create a new service factory with schema bytes and metadata.
@@ -761,7 +938,13 @@ impl ServiceFactory {
         schema: &'static [u8],
         metadata: SchemaMetadataFn,
     ) -> Self {
-        Self { name, factory, schema: Some(schema), metadata: Some(metadata), depends_on: &[] }
+        Self {
+            name,
+            factory,
+            schema: Some(schema),
+            metadata: Some(metadata),
+            depends_on: &[],
+        }
     }
 
     /// Set service dependencies (chained builder).
@@ -800,6 +983,7 @@ pub fn list_factories() -> impl Iterator<Item = &'static ServiceFactory> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -812,4 +996,78 @@ mod tests {
         let factory = ServiceFactory::new("test", dummy_factory);
         assert_eq!(factory.name, "test");
     }
+
+    #[test]
+    fn native_announcement_rejects_incomplete_hybrid_recipient() {
+        let signer = SigningKey::from_bytes(&[0x51; 32]);
+        let announcement = NativeServiceAnnouncement {
+            service_did: hyprstream_rpc::identity::Did::from("did:at9p:test"),
+            capabilities: vec!["hyprstream-rpc/1".to_owned()],
+            accepted_state_digest: [0x31; 64],
+            accepted_state_epoch: 1,
+            accepted_state_expires_at_unix_ms: i64::MAX,
+            response_key_id: "did:at9p:test#response".to_owned(),
+            response_verifying_key: signer.verifying_key().to_bytes(),
+            request_kem_key_id: "did:at9p:test#kem".to_owned(),
+            request_kem_recipient: hyprstream_rpc::crypto::hybrid_kem::RecipientPublic {
+                suite_id: hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+                eks: Vec::new(),
+            },
+        };
+        assert!(announcement
+            .validate("model", &signer.verifying_key())
+            .is_err());
+    }
+
+    #[test]
+    fn public_context_cannot_select_production_authority() {
+        const CHILD: &str = "HYPRSTREAM_TEST_AUTHORITY_CHILD";
+        const EXPECTED: &str = "HYPRSTREAM_TEST_AUTHORITY_EXPECTED";
+        if std::env::var_os(CHILD).is_some() {
+            let expected = std::path::PathBuf::from(
+                std::env::var_os(EXPECTED).expect("deployment-owned expected path"),
+            );
+            let first = SigningKey::from_bytes(&[0x71; 32]);
+            let second = SigningKey::from_bytes(&[0x73; 32]);
+            let caller_one = tempfile::tempdir().expect("caller models one");
+            let caller_two = tempfile::tempdir().expect("caller models two");
+            let local_one = ServiceContext::new(
+                first.clone(),
+                first.verifying_key(),
+                false,
+                caller_one.path().to_owned(),
+            );
+            let local_two = ServiceContext::new(
+                second.clone(),
+                second.verifying_key(),
+                true,
+                caller_two.path().to_owned(),
+            );
+            assert_eq!(local_one.deployment_data_dir().unwrap(), expected);
+            assert_eq!(local_two.deployment_data_dir().unwrap(), expected);
+            assert_ne!(local_one.models_dir(), local_two.models_dir());
+            return;
+        }
+
+        let deployment = tempfile::tempdir().expect("deployment data root");
+        let caller_store = tempfile::tempdir().expect("caller store");
+        let caller = SigningKey::from_bytes(&[0x72; 32]);
+        let expected = deployment.path().join("hyprstream/models/.registry");
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("service::factory::tests::public_context_cannot_select_production_authority")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .env(EXPECTED, &expected)
+            .env("XDG_DATA_HOME", deployment.path())
+            .env("HYPRSTREAM__PDS__STORE_PATH", caller_store.path())
+            .env(
+                "HYPRSTREAM__PDS__ACCEPTANCE_IDENTITY",
+                hex::encode(caller.verifying_key().to_bytes()),
+            )
+            .status()
+            .expect("authority mutation subprocess");
+        assert!(status.success(), "authority mutation subprocess failed");
+    }
+
 }

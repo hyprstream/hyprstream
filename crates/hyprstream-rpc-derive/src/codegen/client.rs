@@ -616,7 +616,10 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
     quote! {
         #[cfg(not(target_arch = "wasm32"))]
         impl #client_name {
-            /// Create a new client by looking up the service endpoint from the global registry.
+            /// Legacy explicit local/bootstrap adapter.
+            ///
+            /// This remains necessary for co-located bootstrap, but it is not
+            /// production resolution and carries no closure evidence.
             ///
             /// `destination` is the Ed25519 verifying key of the target service,
             /// used to verify response envelope signatures. This must be the target service's
@@ -625,20 +628,22 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
             /// `token` is an optional CA-signed JWT certificate for trust establishment.
             /// When provided, the token is included in request envelopes so the server
             /// can bind the caller's Ed25519 key to a subject.
-            pub fn for_service(
+            pub fn for_local_bootstrap(
                 signing_key: hyprstream_rpc::crypto::SigningKey,
                 destination: hyprstream_rpc::crypto::VerifyingKey,
                 token: Option<String>,
             ) -> anyhow::Result<Self> {
                 let registry = hyprstream_rpc::registry::try_global()
                     .ok_or_else(|| anyhow::anyhow!(
-                        "EndpointRegistry not initialized — call registry::init() or use from_resolver()"
+                        "EndpointRegistry not initialized — local bootstrap requires registry::init()"
                     ))?;
-                let transport = registry.try_endpoint(
+                let transport = registry.registered_endpoint(
                     #service_name_lit,
                     hyprstream_rpc::registry::SocketKind::Rep,
-                )?;
-                Self::dial_transport(&transport, signing_key, destination, token)
+                ).ok_or_else(|| anyhow::anyhow!(
+                    "local bootstrap requires an explicitly registered service endpoint"
+                ))?;
+                Self::dial_local_transport_bootstrap(&transport, signing_key, destination, token)
             }
 
             /// Create a new client connected to a specific endpoint string
@@ -646,85 +651,105 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
             /// through [`hyprstream_rpc::dial::dial`] — the one place transport
             /// selection happens. For networked (quic/iroh) targets, prefer
             /// [`Self::from_resolver`], which carries the full auth config.
-            pub fn for_endpoint(
+            pub fn for_local_endpoint_bootstrap(
                 endpoint: &str,
                 signing_key: hyprstream_rpc::crypto::SigningKey,
                 destination: hyprstream_rpc::crypto::VerifyingKey,
                 token: Option<String>,
             ) -> anyhow::Result<Self> {
                 let transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(endpoint);
-                Self::dial_transport(&transport, signing_key, destination, token)
+                Self::dial_local_transport_bootstrap(&transport, signing_key, destination, token)
             }
 
             /// Create a client for an already-resolved typed
             /// [`hyprstream_rpc::transport::TransportConfig`] (the Inproc arm for
             /// a co-located service, or a networked Quic/Iroh reach). Prefer this
-            /// over [`Self::for_endpoint`] when the caller already holds a typed
+            /// over [`Self::for_local_endpoint_bootstrap`] when the caller already holds a typed
             /// transport (e.g. the inference router, #320) — it skips string
             /// parsing and routes straight through [`hyprstream_rpc::dial::dial`].
-            pub fn for_transport(
+            pub fn for_local_transport_bootstrap(
                 transport: &hyprstream_rpc::transport::TransportConfig,
                 signing_key: hyprstream_rpc::crypto::SigningKey,
                 destination: hyprstream_rpc::crypto::VerifyingKey,
                 token: Option<String>,
             ) -> anyhow::Result<Self> {
-                Self::dial_transport(transport, signing_key, destination, token)
+                Self::dial_local_transport_bootstrap(transport, signing_key, destination, token)
             }
 
-            /// Build a client for an already-resolved `TransportConfig` (the one
-            /// place the generated client meets `dial()`).
-            fn dial_transport(
+            /// Local/bootstrap dial helper. It is deliberately unable to
+            /// manufacture production resolution evidence.
+            fn dial_local_transport_bootstrap(
                 transport: &hyprstream_rpc::transport::TransportConfig,
                 signing_key: hyprstream_rpc::crypto::SigningKey,
                 destination: hyprstream_rpc::crypto::VerifyingKey,
                 token: Option<String>,
             ) -> anyhow::Result<Self> {
+                anyhow::ensure!(
+                    matches!(
+                        &transport.endpoint,
+                        hyprstream_rpc::transport::EndpointType::Inproc { .. }
+                            | hyprstream_rpc::transport::EndpointType::Ipc { .. }
+                            | hyprstream_rpc::transport::EndpointType::SystemdFd { .. }
+                    ),
+                    "local bootstrap refuses network transport; use the identity-bound resolver",
+                );
                 let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key);
                 let rpc = hyprstream_rpc::dial::dial(transport, signer, Some(destination), token)?;
                 Ok(Self::new(rpc))
             }
 
-            /// Create a new client by resolving the service endpoint via a `Resolver`.
-            pub async fn from_resolver(
-                resolver: &dyn hyprstream_rpc::Resolver,
+            /// Ordinary production construction path through the identity-bound
+            /// checkpoint/PDS resolver installed after Discovery bootstrap.
+            pub fn from_resolver(
                 signing_key: hyprstream_rpc::crypto::SigningKey,
-                destination: hyprstream_rpc::crypto::VerifyingKey,
                 token: Option<String>,
             ) -> anyhow::Result<Self> {
-                let transport = resolver
-                    .resolve(Self::SERVICE_NAME, hyprstream_rpc::registry::SocketKind::Rep)
-                    .await?;
-                Self::dial_transport(&transport, signing_key, destination, token)
+                Ok(Self::new(hyprstream_discovery::production_rpc_client(
+                    Self::SERVICE_NAME,
+                    signing_key,
+                    token,
+                )?))
             }
 
             /// Create a client from an `IdentityProvider` with automatic endpoint resolution.
-            pub async fn from_provider(
+            pub async fn from_local_bootstrap_provider(
                 provider: &dyn hyprstream_rpc::identity::IdentityProvider,
             ) -> anyhow::Result<Self> {
                 let registry = hyprstream_rpc::registry::try_global()
                     .ok_or_else(|| anyhow::anyhow!(
-                        "EndpointRegistry not initialized — call registry::init() or use from_resolver()"
+                        "EndpointRegistry not initialized — local bootstrap requires registry::init()"
                     ))?;
-                let transport = registry.try_endpoint(
+                let transport = registry.registered_endpoint(
                     #service_name_lit,
                     hyprstream_rpc::registry::SocketKind::Rep,
-                )?;
-                Self::from_provider_at_transport(&transport, provider).await
+                ).ok_or_else(|| anyhow::anyhow!(
+                    "local bootstrap requires an explicitly registered service endpoint"
+                ))?;
+                Self::from_local_provider_at_transport(&transport, provider).await
             }
 
             /// Create a client from an `IdentityProvider` at a specific endpoint string.
-            pub async fn from_provider_at(
+            pub async fn from_local_bootstrap_provider_at(
                 endpoint: &str,
                 provider: &dyn hyprstream_rpc::identity::IdentityProvider,
             ) -> anyhow::Result<Self> {
                 let transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(endpoint);
-                Self::from_provider_at_transport(&transport, provider).await
+                Self::from_local_provider_at_transport(&transport, provider).await
             }
 
-            async fn from_provider_at_transport(
+            async fn from_local_provider_at_transport(
                 transport: &hyprstream_rpc::transport::TransportConfig,
                 provider: &dyn hyprstream_rpc::identity::IdentityProvider,
             ) -> anyhow::Result<Self> {
+                anyhow::ensure!(
+                    matches!(
+                        &transport.endpoint,
+                        hyprstream_rpc::transport::EndpointType::Inproc { .. }
+                            | hyprstream_rpc::transport::EndpointType::Ipc { .. }
+                            | hyprstream_rpc::transport::EndpointType::SystemdFd { .. }
+                    ),
+                    "local bootstrap refuses network transport; use the identity-bound resolver",
+                );
                 let handle = provider.identity_open(concat!("hyprstream-", #service_name_lit, "-v1")).await?;
                 let pubkey = handle.pubkey();
                 let server_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(&pubkey)
@@ -1670,5 +1695,91 @@ fn generate_portable_scoped_factory_method(sc: &ScopedClient) -> TokenStream {
                 #(#field_inits,)*
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod resolved_service_codegen_tests {
+    use super::generate_constructors;
+
+    #[test]
+    fn generated_clients_use_atomic_resolved_service_for_production() {
+        let generated = generate_constructors("model").to_string();
+        assert!(generated.contains("production_rpc_client"));
+        assert!(!generated.contains("SelectedService"));
+        assert!(!generated.contains("ServiceResolver"));
+        assert!(!generated.contains("try_global_service"));
+        assert!(!generated.contains("from_service_resolver"));
+        assert!(!generated.contains("ResolvedRpcClient"));
+        assert!(!generated.contains("from_installed_resolver"));
+        assert_eq!(
+            generated
+                .matches("local bootstrap refuses network transport")
+                .count(),
+            2,
+        );
+        assert!(!generated.contains("pub fn for_service"));
+        assert!(!generated.contains("pub async fn from_provider"));
+        assert!(generated.contains("for_local_bootstrap"));
+        assert!(generated.contains("from_local_bootstrap_provider"));
+    }
+
+    #[test]
+    fn application_call_graph_limits_local_bootstrap_to_explicit_bootstrap_paths() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root");
+        let source_root = root.join("crates/hyprstream/src");
+        let mut ordinary = 0usize;
+        let mut stack = vec![source_root];
+        while let Some(path) = stack.pop() {
+            for entry in std::fs::read_dir(path).expect("read application source") {
+                let entry = entry.expect("source entry");
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(|v| v.to_str()) == Some("rs") {
+                    let source = std::fs::read_to_string(&path).expect("read Rust source");
+                    ordinary += source.matches("::from_resolver(").count();
+                    if !path.ends_with("services/policy.rs") {
+                        assert!(
+                            !source.contains(".resolve_service_key("),
+                            "ordinary consumer performs an independent response-key lookup in {}",
+                            path.display(),
+                        );
+                    }
+                    let registry_cli_bootstrap = path.ends_with("bin/main.rs")
+                        && source.contains("Pre-Discovery CLI bootstrap")
+                        && source
+                            .matches("RegistryClient::for_local_bootstrap(")
+                            .count()
+                            == 1;
+                    for line in source
+                        .lines()
+                        .filter(|line| line.contains("::for_local_bootstrap("))
+                    {
+                        let command_local_worker = path.ends_with("bin/main.rs")
+                            && line.contains("WorkerClient::for_local_bootstrap");
+                        let command_local_inference = path.ends_with("cli/training_handlers.rs")
+                            && line.contains("InferenceClient::for_local_bootstrap");
+                        assert!(
+                            line.contains("PolicyClient")
+                                || line.contains("DiscoveryClient")
+                                || (registry_cli_bootstrap && line.contains("RegistryClient"))
+                                || command_local_worker
+                                || command_local_inference,
+                            "non-bootstrap application client bypasses installed resolver in {}: {line}",
+                            path.display(),
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            ordinary >= 50,
+            "ordinary installed-resolver migration regressed"
+        );
     }
 }

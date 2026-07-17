@@ -4,35 +4,36 @@
 //! socket kinds, and schemas via the standard REQ/REP transport.
 
 use async_trait::async_trait;
-use hyprstream_rpc::service::{EnvelopeContext, RequestService};
-use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc::registry::{self, EndpointRegistry, SocketKind};
-use hyprstream_rpc::resolver::Resolver;
-use hyprstream_rpc::SigningKey;
+use hyprstream_rpc::resolver::{Resolver, ResolverProfile, ServiceQuery};
+use hyprstream_rpc::rpc_client::{CallOptions, RpcClient};
+use hyprstream_rpc::service::{EnvelopeContext, RequestService};
+use hyprstream_rpc::stream_consumer::StreamHandle;
+use hyprstream_rpc::transport::{EndpointType, TransportConfig};
+use hyprstream_rpc::{SigningKey, VerifyingKey};
 
 use crate::generated::discovery_client::{
-    DiscoveryHandler, DiscoveryResponseVariant,
-    ErrorInfo, ServiceList, ServiceSummary, ServiceEndpoints, EndpointInfo,
-    PingInfo, AuthMetadata, AuthMetadataList, ServiceAnnouncement,
-    RegisterEntityStatementRequest, RegisterEnvelopeKeysetRequest,
-    EntityStatement, EnvelopeKeyset, IssuerList,
-    GetRecordRequest, RecordCar,
-    QueryCandidatesRequest, NodeLiveness, PlacementCandidate, PlacementCandidateSet, Resource,
-    dispatch_discovery, serialize_response,
+    dispatch_discovery, serialize_response, AuthMetadata, AuthMetadataList, DiscoveryHandler,
+    DiscoveryResponseVariant, EndpointInfo, EntityStatement, EnvelopeKeyset, ErrorInfo,
+    GetRecordRequest, IssuerList, NodeLiveness, PingInfo, PlacementCandidate,
+    PlacementCandidateSet, QueryCandidatesRequest, RecordCar, RegisterEntityStatementRequest,
+    RegisterEnvelopeKeysetRequest, Resource, ServiceAnnouncement, ServiceEndpoints, ServiceList,
+    ServiceSummary,
 };
 use crate::placement_index::PlacementIndex;
 use crate::scheduling;
 
 use anyhow::Result;
-use std::collections::HashMap;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use hyprstream_rpc::identity::Did;
+use hyprstream_util::ttl_cache::TtlCache;
+use parking_lot::RwLock;
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use parking_lot::RwLock;
-use tracing::{trace, info};
-use hyprstream_rpc::identity::Did;
-use hyprstream_util::ttl_cache::TtlCache;
+use tracing::{info, trace};
 
 /// #524 P1 — liveness heartbeat TTL: a node with no live/fresh
 /// `reportNodeLiveness` entry is hard-excluded from `queryCandidates`
@@ -73,13 +74,391 @@ fn unix_millis_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Private checkpoint-bound projection used only while Discovery validates an
+/// announcement against the daemon-owned accepted-state source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AcceptedStateEvidence {
+    service_did: Did,
+    digest: [u8; 64],
+    epoch: u64,
+    expires_at_unix_ms: i64,
+    response_ed25519: [u8; 32],
+    response_ml_dsa65: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AnchoredKemRecipient {
+    key_id: String,
+    recipient: hyprstream_rpc::crypto::hybrid_kem::RecipientPublic,
+    not_after_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServiceCandidate {
+    service_name: String,
+    service_did: Did,
+    response_verifying_key: [u8; 32],
+    response_ml_dsa65: Vec<u8>,
+    response_key_id: String,
+    request_kem_recipient: Option<AnchoredKemRecipient>,
+    transport: TransportConfig,
+    capabilities: BTreeSet<String>,
+    accepted_state: AcceptedStateEvidence,
+    source_signer: [u8; 32],
+    expires_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CandidateDecision {
+    candidate_fingerprint: String,
+    accepted: bool,
+    reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolutionEvidence {
+    accepted_state_digest: [u8; 64],
+    accepted_state_epoch: u64,
+    selected_fingerprint: String,
+    ordered_decisions: Vec<CandidateDecision>,
+}
+
+/// Private raw selection result. It can become production authority only via
+/// `ResolvedService::mint`, which requires the typed accepted-state witness.
+#[derive(Debug, Clone)]
+struct SelectedService {
+    service_name: String,
+    service_did: Did,
+    response_verifying_key: VerifyingKey,
+    response_ml_dsa65: Vec<u8>,
+    response_key_id: String,
+    request_kem_recipient: AnchoredKemRecipient,
+    transport: TransportConfig,
+    expires_at_unix_ms: i64,
+    evidence: ResolutionEvidence,
+}
+
+impl SelectedService {
+    fn same_authority(&self, other: &Self) -> bool {
+        self.service_name == other.service_name
+            && self.service_did == other.service_did
+            && self.response_verifying_key == other.response_verifying_key
+            && self.response_ml_dsa65 == other.response_ml_dsa65
+            && self.response_key_id == other.response_key_id
+            && self.request_kem_recipient == other.request_kem_recipient
+            && self.evidence.accepted_state_digest == other.evidence.accepted_state_digest
+            && self.evidence.accepted_state_epoch == other.evidence.accepted_state_epoch
+    }
+
+    #[cfg(test)]
+    fn service_name(&self) -> &str {
+        &self.service_name
+    }
+
+    fn service_did(&self) -> &Did {
+        &self.service_did
+    }
+
+    fn response_verifying_key(&self) -> VerifyingKey {
+        self.response_verifying_key
+    }
+
+    fn response_ml_dsa65(&self) -> &[u8] {
+        &self.response_ml_dsa65
+    }
+
+    #[cfg(test)]
+    fn request_kem_recipient(&self) -> &AnchoredKemRecipient {
+        &self.request_kem_recipient
+    }
+
+    fn transport(&self) -> &TransportConfig {
+        &self.transport
+    }
+
+    fn evidence(&self) -> &ResolutionEvidence {
+        &self.evidence
+    }
+
+    fn ensure_fresh(&self, now_unix_ms: i64) -> Result<()> {
+        anyhow::ensure!(
+            now_unix_ms < self.expires_at_unix_ms,
+            "resolved service snapshot expired; re-resolution required"
+        );
+        anyhow::ensure!(
+            now_unix_ms < self.request_kem_recipient.not_after_unix_ms,
+            "resolved request KEM recipient expired; re-resolution required"
+        );
+        Ok(())
+    }
+
+    fn crypto_stores(
+        &self,
+    ) -> Result<(
+        Arc<dyn hyprstream_rpc::crypto::hybrid_kem::KemTrustStore>,
+        Arc<dyn hyprstream_rpc::envelope::PqTrustStore>,
+    )> {
+        let ed = self.response_verifying_key.to_bytes();
+        let mut kem = hyprstream_rpc::crypto::hybrid_kem::KeyedKemTrustStore::new();
+        kem.bind(ed, self.request_kem_recipient.recipient.clone());
+        let pq_key = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(&self.response_ml_dsa65)
+            .map_err(|e| anyhow::anyhow!("invalid resolved ML-DSA-65 response key: {e}"))?;
+        let mut pq = hyprstream_rpc::envelope::KeyedPqTrustStore::new();
+        pq.bind(ed, &pq_key);
+        Ok((Arc::new(kem), Arc::new(pq)))
+    }
+}
+
+fn canonical_service_name(name: &str) -> Result<String> {
+    let canonical = name.trim().to_ascii_lowercase();
+    anyhow::ensure!(!canonical.is_empty(), "service name is empty");
+    anyhow::ensure!(
+        canonical
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+        "service name contains non-canonical characters"
+    );
+    anyhow::ensure!(canonical == name, "service name is not canonical");
+    Ok(canonical)
+}
+
+fn network_reach(transport: &TransportConfig) -> bool {
+    matches!(
+        transport.endpoint,
+        EndpointType::Quic { .. } | EndpointType::Iroh { .. }
+    )
+}
+
+fn transport_fingerprint(transport: &TransportConfig) -> String {
+    blake3::hash(format!("{transport:?}").as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+fn hash_framed(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn candidate_fingerprint(candidate: &ServiceCandidate) -> String {
+    let mut h = blake3::Hasher::new();
+    hash_framed(&mut h, candidate.service_name.as_bytes());
+    hash_framed(&mut h, candidate.service_did.as_str().as_bytes());
+    h.update(&candidate.response_verifying_key);
+    hash_framed(&mut h, &candidate.response_ml_dsa65);
+    hash_framed(&mut h, candidate.response_key_id.as_bytes());
+    if let Some(kem) = &candidate.request_kem_recipient {
+        hash_framed(&mut h, kem.key_id.as_bytes());
+        hash_framed(&mut h, &kem.recipient.encode());
+    }
+    hash_framed(
+        &mut h,
+        transport_fingerprint(&candidate.transport).as_bytes(),
+    );
+    for capability in &candidate.capabilities {
+        hash_framed(&mut h, capability.as_bytes());
+    }
+    h.update(&candidate.accepted_state.digest);
+    h.update(&candidate.accepted_state.epoch.to_be_bytes());
+    hash_framed(
+        &mut h,
+        candidate.accepted_state.service_did.as_str().as_bytes(),
+    );
+    h.update(&candidate.accepted_state.expires_at_unix_ms.to_be_bytes());
+    h.update(&candidate.accepted_state.response_ed25519);
+    hash_framed(&mut h, &candidate.accepted_state.response_ml_dsa65);
+    h.update(&candidate.source_signer);
+    h.update(&candidate.expires_at_unix_ms.to_be_bytes());
+    if let Some(kem) = &candidate.request_kem_recipient {
+        h.update(&kem.not_after_unix_ms.to_be_bytes());
+    }
+    h.finalize().to_hex().to_string()
+}
+
+fn rejection_reason(
+    query: &ServiceQuery,
+    candidate: &ServiceCandidate,
+    now_unix_ms: i64,
+) -> Option<&'static str> {
+    if canonical_service_name(&candidate.service_name)
+        .ok()
+        .as_deref()
+        != Some(query.service_name.as_str())
+    {
+        return Some("service-name-mismatch");
+    }
+    if !candidate.service_did.is_did_at9p()
+        || candidate.service_did != candidate.accepted_state.service_did
+    {
+        return Some("missing-or-mismatched-accepted-identity");
+    }
+    if candidate.source_signer != candidate.accepted_state.response_ed25519 {
+        return Some("announcement-signer-not-current");
+    }
+    if candidate.response_verifying_key != candidate.accepted_state.response_ed25519
+        || candidate.response_ml_dsa65 != candidate.accepted_state.response_ml_dsa65
+    {
+        return Some("response-key-not-current");
+    }
+    if !candidate
+        .response_key_id
+        .starts_with(&format!("{}#", candidate.service_did))
+        || hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(&candidate.response_ml_dsa65).is_err()
+    {
+        return Some("missing-or-invalid-response-key-material");
+    }
+    if !query
+        .required_capabilities
+        .is_subset(&candidate.capabilities)
+    {
+        return Some("missing-capability");
+    }
+    if candidate.expires_at_unix_ms <= now_unix_ms
+        || candidate.accepted_state.expires_at_unix_ms <= now_unix_ms
+    {
+        return Some("expired-candidate-or-state");
+    }
+    match query.profile {
+        ResolverProfile::NetworkDiscovery if !network_reach(&candidate.transport) => {
+            return Some("local-reach-for-network-profile");
+        }
+        ResolverProfile::LocalInproc
+            if !matches!(candidate.transport.endpoint, EndpointType::Inproc { .. }) =>
+        {
+            return Some("non-inproc-reach-for-local-profile");
+        }
+        ResolverProfile::Ipc
+            if !matches!(
+                candidate.transport.endpoint,
+                EndpointType::Ipc { .. } | EndpointType::SystemdFd { .. }
+            ) =>
+        {
+            return Some("non-ipc-reach-for-ipc-profile");
+        }
+        _ => {}
+    }
+    let Some(kem) = &candidate.request_kem_recipient else {
+        return Some("missing-request-kem-recipient");
+    };
+    if !kem
+        .key_id
+        .starts_with(&format!("{}#", candidate.service_did))
+        || kem.not_after_unix_ms <= now_unix_ms
+        || kem.recipient.suite_id
+            != hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768
+        || kem.recipient.eks.len() != kem.recipient.suite_id.components().len()
+        || hyprstream_rpc::crypto::hybrid_kem::RecipientPublic::decode(&kem.recipient.encode())
+            .is_err()
+    {
+        return Some("invalid-expired-or-nonhybrid-kem-recipient");
+    }
+    None
+}
+
+fn select_service_candidate(
+    query: &ServiceQuery,
+    candidates: Vec<ServiceCandidate>,
+    now_unix_ms: i64,
+) -> Result<SelectedService> {
+    let mut decisions = Vec::with_capacity(candidates.len());
+    let mut valid = Vec::new();
+    for candidate in candidates {
+        let fingerprint = candidate_fingerprint(&candidate);
+        if let Some(reason) = rejection_reason(query, &candidate, now_unix_ms) {
+            decisions.push(CandidateDecision {
+                candidate_fingerprint: fingerprint,
+                accepted: false,
+                reason: reason.to_owned(),
+            });
+        } else {
+            decisions.push(CandidateDecision {
+                candidate_fingerprint: fingerprint.clone(),
+                accepted: true,
+                reason: "validated".to_owned(),
+            });
+            valid.push((fingerprint, candidate));
+        }
+    }
+    anyhow::ensure!(!valid.is_empty(), "no validated service candidates");
+    let authority = &valid[0].1;
+    anyhow::ensure!(
+        valid.iter().all(|(_, candidate)| {
+            candidate.service_did == authority.service_did
+                && candidate.response_verifying_key == authority.response_verifying_key
+                && candidate.response_ml_dsa65 == authority.response_ml_dsa65
+                && candidate.response_key_id == authority.response_key_id
+                && candidate.request_kem_recipient == authority.request_kem_recipient
+                && candidate.accepted_state == authority.accepted_state
+        }),
+        "ambiguous validated service authority"
+    );
+    valid.sort_by(|(af, a), (bf, b)| {
+        b.accepted_state
+            .epoch
+            .cmp(&a.accepted_state.epoch)
+            .then_with(|| b.expires_at_unix_ms.cmp(&a.expires_at_unix_ms))
+            .then_with(|| a.service_did.cmp(&b.service_did))
+            .then_with(|| {
+                transport_fingerprint(&a.transport).cmp(&transport_fingerprint(&b.transport))
+            })
+            .then_with(|| af.cmp(bf))
+    });
+    valid.dedup_by(|(af, _), (bf, _)| af == bf);
+    let (selected_fingerprint, selected) = valid.remove(0);
+    decisions.sort_by(|a, b| a.candidate_fingerprint.cmp(&b.candidate_fingerprint));
+    let response_verifying_key = VerifyingKey::from_bytes(&selected.response_verifying_key)
+        .map_err(|e| anyhow::anyhow!("invalid selected response verifying key: {e}"))?;
+    let request_kem_recipient = selected
+        .request_kem_recipient
+        .ok_or_else(|| anyhow::anyhow!("validated candidate lost request KEM recipient"))?;
+    let expires_at_unix_ms = selected
+        .expires_at_unix_ms
+        .min(selected.accepted_state.expires_at_unix_ms)
+        .min(request_kem_recipient.not_after_unix_ms);
+    Ok(SelectedService {
+        service_name: selected.service_name,
+        service_did: selected.service_did,
+        response_verifying_key,
+        response_ml_dsa65: selected.response_ml_dsa65,
+        response_key_id: selected.response_key_id,
+        request_kem_recipient,
+        transport: selected.transport,
+        expires_at_unix_ms,
+        evidence: ResolutionEvidence {
+            accepted_state_digest: selected.accepted_state.digest,
+            accepted_state_epoch: selected.accepted_state.epoch,
+            selected_fingerprint,
+            ordered_decisions: decisions,
+        },
+    })
+}
+
+fn select_service_candidates(
+    query: &ServiceQuery,
+    mut candidates: Vec<ServiceCandidate>,
+    now_unix_ms: i64,
+) -> Result<Vec<SelectedService>> {
+    let mut ordered = Vec::new();
+    loop {
+        let selected = match select_service_candidate(query, candidates.clone(), now_unix_ms) {
+            Ok(selected) => selected,
+            Err(error) if !ordered.is_empty() && error.to_string().contains("no validated") => {
+                break;
+            }
+            Err(error) => return Err(error),
+        };
+        let fingerprint = selected.evidence.selected_fingerprint.clone();
+        candidates.retain(|candidate| candidate_fingerprint(candidate) != fingerprint);
+        ordered.push(selected);
+    }
+    Ok(ordered)
+}
+
 /// Convert the wire `SelectorOp` (generated from `discovery.capnp`) to the
 /// shared scheduling-substrate `SelectorOp` (`crate::scheduling`, #628).
 /// Deliberately exhaustive (no catch-all) so a future wire variant fails to
 /// compile here instead of silently matching nothing.
-fn to_scheduling_op(
-    op: crate::generated::discovery_client::SelectorOp,
-) -> scheduling::SelectorOp {
+fn to_scheduling_op(op: crate::generated::discovery_client::SelectorOp) -> scheduling::SelectorOp {
     use crate::generated::discovery_client::SelectorOp as Wire;
     match op {
         Wire::In => scheduling::SelectorOp::In,
@@ -179,6 +558,7 @@ pub trait RecordResolver: Send + Sync {
 // ============================================================================
 
 /// Endpoint data stored per announced entry.
+#[derive(Clone)]
 struct AnnouncedEndpoint {
     /// Socket kind (e.g. "quic", "rep")
     socket_kind: String,
@@ -186,8 +566,119 @@ struct AnnouncedEndpoint {
     endpoint: String,
     /// Service JWT attesting to the service's identity and pubkey
     service_jwt: String,
+    service_did: Did,
+    capabilities: BTreeSet<String>,
+    accepted_state_digest: Vec<u8>,
+    accepted_state_epoch: u64,
+    response_key_id: String,
+    request_kem_key_id: String,
+    request_kem_recipient: Vec<u8>,
+    expires_at_unix_ms: i64,
+    source_signer: [u8; 32],
     /// Last heartbeat timestamp (Instant)
     last_heartbeat: Instant,
+}
+
+/// Checkpoint-verifying accepted-current-state read used by production
+/// resolution. Implemented by the daemon-owned PDS reader from #1004.
+pub(super) trait AcceptedStateSource: Send + Sync {
+    fn accepted_state(
+        &self,
+        did: &str,
+    ) -> Result<Option<hyprstream_pds::at9p_duplicity::AcceptedAt9pState>>;
+}
+
+/// Opaque production authority minted only while holding the checkpoint/PDS
+/// accepted-state object. Raw announcement candidates never have this type.
+#[derive(Clone)]
+struct ResolvedService {
+    selected: SelectedService,
+}
+
+impl ResolvedService {
+    fn mint(
+        selected: SelectedService,
+        state: &hyprstream_pds::at9p_duplicity::AcceptedAt9pState,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            selected.service_did().as_str() == state.did,
+            "selected service DID is not the checkpoint-verified subject"
+        );
+        anyhow::ensure!(
+            selected.evidence().accepted_state_epoch == state.epoch,
+            "selected service epoch is not checkpoint current"
+        );
+        anyhow::ensure!(
+            selected.evidence().accepted_state_digest == state.head_digest,
+            "selected service digest is not checkpoint current"
+        );
+        let current_key = state
+            .current
+            .subject_keys
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("accepted state has no current response key"))?;
+        anyhow::ensure!(
+            selected.response_verifying_key().to_bytes().as_slice()
+                == current_key.ed25519_pub.as_slice(),
+            "selected response key is not accepted current key"
+        );
+        anyhow::ensure!(
+            selected.response_ml_dsa65() == current_key.mldsa65_pub.as_slice(),
+            "selected PQ response key is not accepted current key"
+        );
+        Ok(Self { selected })
+    }
+    fn same_authority(&self, other: &Self) -> bool {
+        self.selected.same_authority(&other.selected)
+    }
+}
+
+impl std::ops::Deref for ResolvedService {
+    type Target = SelectedService;
+    fn deref(&self) -> &Self::Target {
+        &self.selected
+    }
+}
+
+struct CurrentStreamHandle {
+    inner: Box<dyn StreamHandle>,
+    resolver: Arc<DiscoveryServiceResolver>,
+    snapshot: ResolvedService,
+    invalidated: bool,
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+impl StreamHandle for CurrentStreamHandle {
+    async fn next_payload(&mut self) -> Result<Option<hyprstream_rpc::streaming::StreamPayload>> {
+        anyhow::ensure!(!self.invalidated, "stream snapshot is invalidated");
+        if let Err(error) = self.resolver.ensure_current(&self.snapshot).await {
+            self.invalidated = true;
+            return Err(error);
+        }
+        self.inner.next_payload().await
+    }
+    async fn cancel(&mut self) -> Result<()> {
+        anyhow::ensure!(!self.invalidated, "stream snapshot is invalidated");
+        if let Err(error) = self.resolver.ensure_current(&self.snapshot).await {
+            self.invalidated = true;
+            return Err(error);
+        }
+        self.inner.cancel().await
+    }
+    fn stream_id(&self) -> &str {
+        self.inner.stream_id()
+    }
+    fn is_completed(&self) -> bool {
+        self.invalidated || self.inner.is_completed()
+    }
+}
+
+/// Cloneable production resolver installed after Discovery bootstrap.
+struct DiscoveryServiceResolver {
+    announced_endpoints: Arc<RwLock<HashMap<String, Vec<AnnouncedEndpoint>>>>,
+    accepted_state_source: Arc<dyn AcceptedStateSource>,
+    discovery_client: Option<crate::DiscoveryClient>,
 }
 
 /// Phase 0.5 Stage D — cached signed OIDF entity statement.
@@ -251,10 +742,11 @@ pub struct DiscoveryService {
     auth_provider: Option<Box<dyn AuthorizationProvider>>,
     /// Record resolver backing getRecord/getRepo (#431). None = no local PDS,
     /// so getRecord/getRepo report NOT_FOUND for everything.
-    record_resolver: Option<Box<dyn RecordResolver>>,
+    record_resolver: Option<Arc<dyn RecordResolver>>,
+    accepted_state_source: Option<Arc<dyn AcceptedStateSource>>,
     /// Endpoints announced by other services (cross-process).
     /// Maps service_name → Vec<AnnouncedEndpoint>.
-    announced_endpoints: RwLock<HashMap<String, Vec<AnnouncedEndpoint>>>,
+    announced_endpoints: Arc<RwLock<HashMap<String, Vec<AnnouncedEndpoint>>>>,
     /// Phase 0.5 Stage D — cached signed OIDF entity statements per issuer URL.
     /// Pushed by IdPService/OAuth at startup + on every signing-key rotation.
     /// Consumed by FederationKeyResolver before falling back to HTTPS.
@@ -301,7 +793,8 @@ impl DiscoveryService {
             expected_audience: None,
             auth_provider: None,
             record_resolver: None,
-            announced_endpoints: RwLock::new(HashMap::new()),
+            accepted_state_source: None,
+            announced_endpoints: Arc::new(RwLock::new(HashMap::new())),
             entity_statements: RwLock::new(HashMap::new()),
             envelope_keysets: RwLock::new(HashMap::new()),
             tls_endorsement: Vec::new(),
@@ -351,15 +844,237 @@ impl DiscoveryService {
     }
 
     /// Set the record resolver backing getRecord/getRepo (#431).
-    pub fn with_record_resolver(mut self, resolver: Box<dyn RecordResolver>) -> Self {
+    pub fn with_record_resolver(mut self, resolver: Arc<dyn RecordResolver>) -> Self {
         self.record_resolver = Some(resolver);
         self
     }
 
+    #[cfg(test)]
+    fn with_accepted_state_source(mut self, source: Arc<dyn AcceptedStateSource>) -> Self {
+        self.accepted_state_source = Some(source);
+        self
+    }
+
+    /// Prove that downstream crates cannot access any production authority
+    /// construction or installation seam.
+    ///
+    /// ```compile_fail
+    /// use hyprstream_discovery::AcceptedStateSource;
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use hyprstream_discovery::DiscoveryService;
+    /// fn inject(service: DiscoveryService) {
+    ///     service.with_accepted_state_source(todo!());
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use hyprstream_discovery::DiscoveryService;
+    /// fn install_caller_authority(service: &DiscoveryService) {
+    ///     service.install_production_resolver().unwrap();
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use hyprstream_discovery::DiscoveryService;
+    /// fn choose_store_and_key(service: &mut DiscoveryService) {
+    ///     service.install_checkpointed_pds_resolver(todo!(), todo!()).unwrap();
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use hyprstream_discovery::CheckpointedPdsAuthority;
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use hyprstream_discovery::DiscoveryService;
+    /// fn ambient_production_constructor() {
+    ///     let _ = DiscoveryService::new_production(todo!(), todo!(), todo!());
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use hyprstream_service::DiscoveryBootstrapAuthority;
+    /// fn forge(path: std::path::PathBuf, key: ed25519_dalek::VerifyingKey) {
+    ///     let _ = DiscoveryBootstrapAuthority { store_path: path, acceptance_identity: key };
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// fn duplicate(authority: hyprstream_service::DiscoveryBootstrapAuthority) {
+    ///     let _ = authority.clone();
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use hyprstream_discovery::AuthenticatedDiscoveryBootstrap;
+    /// fn forge(
+    ///     store_path: std::path::PathBuf,
+    ///     acceptance_identity: ed25519_dalek::VerifyingKey,
+    /// ) -> AuthenticatedDiscoveryBootstrap {
+    ///     AuthenticatedDiscoveryBootstrap { seal: (), store_path, acceptance_identity }
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use hyprstream_service::AuthenticatedRegistryDeploymentIdentity;
+    /// fn forge(key: ed25519_dalek::VerifyingKey) -> AuthenticatedRegistryDeploymentIdentity {
+    ///     AuthenticatedRegistryDeploymentIdentity { verifying_key: key }
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use hyprstream_service::AuthenticatedRegistryDeploymentIdentity;
+    /// fn mint(key: ed25519_dalek::VerifyingKey) {
+    ///     let _ = AuthenticatedRegistryDeploymentIdentity::mint(key);
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// fn duplicate(identity: hyprstream_service::AuthenticatedRegistryDeploymentIdentity) {
+    ///     let _ = identity.clone();
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// # use ed25519_dalek::SigningKey;
+    /// let signing = SigningKey::from_bytes(&[7; 32]);
+    /// let mut context = hyprstream_service::ServiceContext::new(
+    ///     signing.clone(), signing.verifying_key(), false, "caller".into()
+    /// );
+    /// context.authenticate_registry_deployment_credential("caller-issued-jwt")?;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    ///
+    /// ```compile_fail
+    /// # use ed25519_dalek::SigningKey;
+    /// let signing = SigningKey::from_bytes(&[7; 32]);
+    /// let mut context = hyprstream_service::ServiceContext::new(
+    ///     signing.clone(), signing.verifying_key(), false, "caller".into()
+    /// );
+    /// context.authenticate_registry_deployment_credential()?;
+    /// context.take_authenticated_registry_identity()?;
+    /// let _raw = context.authenticated_registry_identity()?;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    ///
+    /// ```compile_fail
+    /// fn old_discovery_chain(
+    ///     identity: hyprstream_service::AuthenticatedRegistryDeploymentIdentity,
+    ///     client: hyprstream_discovery::DiscoveryClient,
+    /// ) {
+    ///     let authority = hyprstream_discovery::authenticate_discovery_bootstrap(identity).unwrap();
+    ///     hyprstream_discovery::DiscoveryService::bootstrap_authenticated_process(authority, client).unwrap();
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// fn extract(verifier: hyprstream_discovery::RegistryDeploymentVerifier) {
+    ///     let _: ed25519_dalek::VerifyingKey = verifier.into_verifying_key();
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use hyprstream_discovery::RegistryDeploymentVerifier;
+    /// fn forge(key: ed25519_dalek::VerifyingKey) -> RegistryDeploymentVerifier {
+    ///     RegistryDeploymentVerifier { verifying_key: key }
+    /// }
+    /// ```
+    ///
+    /// The complete former public composition chain is unavailable to an
+    /// external crate.
+    /// ```compile_fail
+    /// use hyprstream_discovery::DiscoveryService;
+    /// use hyprstream_service::ServiceContext;
+    /// fn inject(context: ServiceContext, client: hyprstream_discovery::DiscoveryClient) {
+    ///     context.seal_discovery_bootstrap_authority().unwrap();
+    ///     let authority = context
+    ///         .consume_discovery_bootstrap_authority(|path, key| Ok((path.to_owned(), key)))
+    ///         .unwrap();
+    ///     DiscoveryService::install_process_bootstrap(&context, client).unwrap();
+    ///     drop(authority);
+    /// }
+    /// ```
+    #[cfg(not(target_arch = "wasm32"))]
+    fn bootstrap_authenticated_process(
+        authority: ProcessBootstrapAuthority,
+        discovery_client: crate::DiscoveryClient,
+    ) -> Result<()> {
+        let authority = {
+            let mut state = PROCESS_BOOTSTRAP_AUTHORITY.lock();
+            match std::mem::replace(&mut *state, ProcessBootstrapAuthorityState::Consumed) {
+                ProcessBootstrapAuthorityState::Sealed => {}
+                previous => {
+                    *state = previous;
+                    anyhow::bail!("authenticated Discovery bootstrap is unavailable or consumed");
+                }
+            }
+            authority
+        };
+        let deployment_identity = match &authority.acceptance_identity {
+            ProcessAcceptanceIdentity::Deployment(identity) => Some(identity.clone()),
+            #[cfg(test)]
+            ProcessAcceptanceIdentity::Test(_) => None,
+        };
+        let source: Arc<dyn AcceptedStateSource> = match authority.acceptance_identity {
+            ProcessAcceptanceIdentity::Deployment(identity) => Arc::new(
+                crate::checkpointed_pds::CheckpointedPdsAcceptedStateSource::open(
+                    &authority.store_path,
+                    identity,
+                )?,
+            ),
+            #[cfg(test)]
+            ProcessAcceptanceIdentity::Test(identity) => Arc::new(
+                crate::checkpointed_pds::CheckpointedPdsAcceptedStateSource::open_test(
+                    &authority.store_path,
+                    identity,
+                )?,
+            ),
+        };
+        PROCESS_ACCEPTED_STATE_SOURCE
+            .set(Arc::clone(&source))
+            .map_err(|_| anyhow::anyhow!("process Discovery authority is already consumed"))?;
+        if let Some(identity) = deployment_identity {
+            PROCESS_REGISTRY_VERIFIER.set(identity).map_err(|_| {
+                anyhow::anyhow!("deployment registry verifier is already installed")
+            })?;
+        }
+        PRODUCTION_RESOLVER
+            .set(Arc::new(DiscoveryServiceResolver {
+                announced_endpoints: Arc::new(RwLock::new(HashMap::new())),
+                accepted_state_source: source,
+                discovery_client: Some(discovery_client),
+            }))
+            .map_err(|_| anyhow::anyhow!("production service resolver is already installed"))
+    }
+
+    /// Attach the process-pinned source to the Discovery daemon. The source
+    /// was fixed and consumed before inventory factories were invoked.
+    pub fn attach_process_accepted_state_source(&mut self) -> Result<()> {
+        self.accepted_state_source = Some(
+            PROCESS_ACCEPTED_STATE_SOURCE
+                .get()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("process Discovery authority is not installed"))?,
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn production_resolver(&self) -> Result<DiscoveryServiceResolver> {
+        Ok(DiscoveryServiceResolver {
+            announced_endpoints: Arc::clone(&self.announced_endpoints),
+            accepted_state_source: self.accepted_state_source.clone().ok_or_else(|| {
+                anyhow::anyhow!("Discovery accepted-state source is not installed")
+            })?,
+            discovery_client: None,
+        })
+    }
+
     /// Get the global EndpointRegistry (D9: graceful error, not panic).
     fn reg(&self) -> Result<impl std::ops::Deref<Target = EndpointRegistry> + '_> {
-        registry::try_global()
-            .ok_or_else(|| anyhow::anyhow!("EndpointRegistry not initialized"))
+        registry::try_global().ok_or_else(|| anyhow::anyhow!("EndpointRegistry not initialized"))
     }
 }
 
@@ -381,6 +1096,960 @@ impl Resolver for DiscoveryService {
         }
 
         self.reg()?.try_endpoint(name, kind)
+    }
+}
+
+fn accepted_expiry_unix_ms(
+    state: &hyprstream_pds::at9p_duplicity::AcceptedAt9pState,
+) -> Result<i64> {
+    let expiry = state.expires_at.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "genesis-only accepted state has no bounded expiry; refusing production resolution"
+        )
+    })?;
+    Ok(chrono::DateTime::parse_from_rfc3339(expiry)
+        .map_err(|e| anyhow::anyhow!("invalid accepted-state expiry: {e}"))?
+        .timestamp_millis())
+}
+
+impl DiscoveryServiceResolver {
+    #[cfg(test)]
+    async fn resolve_service(&self, query: ServiceQuery) -> Result<ResolvedService> {
+        let selected = select_service_candidate(
+            &query,
+            self.acquire_candidates(&query).await?,
+            unix_millis_now(),
+        )?;
+        let state = self
+            .accepted_state_source
+            .accepted_state(selected.service_did().as_str())?
+            .ok_or_else(|| anyhow::anyhow!("accepted state disappeared during resolution"))?;
+        ResolvedService::mint(selected, &state)
+    }
+
+    async fn acquire_candidates(&self, query: &ServiceQuery) -> Result<Vec<ServiceCandidate>> {
+        let entries = if let Some(client) = &self.discovery_client {
+            client
+                .get_endpoints(&query.service_name)
+                .await?
+                .endpoints
+                .into_iter()
+                .filter_map(|endpoint| {
+                    let source_signer: [u8; 32] = endpoint.source_signer.try_into().ok()?;
+                    Some(AnnouncedEndpoint {
+                        socket_kind: endpoint.socket_kind,
+                        endpoint: endpoint.endpoint,
+                        service_jwt: endpoint.service_jwt,
+                        service_did: endpoint.service_did,
+                        capabilities: endpoint.capabilities.into_iter().collect(),
+                        accepted_state_digest: endpoint.accepted_state_digest,
+                        accepted_state_epoch: endpoint.accepted_state_epoch,
+                        response_key_id: endpoint.response_key_id,
+                        request_kem_key_id: endpoint.request_kem_key_id,
+                        request_kem_recipient: endpoint.request_kem_recipient,
+                        expires_at_unix_ms: endpoint.expires_at_unix_ms,
+                        source_signer,
+                        last_heartbeat: Instant::now(),
+                    })
+                })
+                .collect()
+        } else {
+            self.announced_endpoints
+                .read()
+                .get(&query.service_name)
+                .cloned()
+                .unwrap_or_default()
+        };
+
+        let mut candidates = Vec::new();
+        for entry in entries {
+            if entry.last_heartbeat.elapsed() > ANNOUNCED_ENDPOINT_TTL
+                || entry.service_did.as_str().is_empty()
+                || entry.accepted_state_digest.len() != 64
+            {
+                continue;
+            }
+            let Some(state) = self
+                .accepted_state_source
+                .accepted_state(entry.service_did.as_str())?
+            else {
+                continue;
+            };
+            if state.did != entry.service_did.as_str()
+                || state.epoch != entry.accepted_state_epoch
+                || state.head_digest.as_slice() != entry.accepted_state_digest.as_slice()
+            {
+                continue;
+            }
+            let Ok(state_expiry) = accepted_expiry_unix_ms(&state) else {
+                continue;
+            };
+            let Some(current_key) = state
+                .current
+                .subject_keys
+                .iter()
+                .find(|key| key.ed25519_pub.as_slice() == entry.source_signer)
+            else {
+                continue;
+            };
+            let Ok(response_ed25519) = current_key.ed25519_pub.as_slice().try_into() else {
+                continue;
+            };
+            let Ok(recipient) = hyprstream_rpc::crypto::hybrid_kem::RecipientPublic::decode(
+                &entry.request_kem_recipient,
+            ) else {
+                continue;
+            };
+            let Ok(transport) = announced_endpoint_to_transport(&entry) else {
+                continue;
+            };
+            let mut digest = [0u8; 64];
+            digest.copy_from_slice(&entry.accepted_state_digest);
+            candidates.push(ServiceCandidate {
+                service_name: query.service_name.clone(),
+                service_did: entry.service_did,
+                response_verifying_key: response_ed25519,
+                response_ml_dsa65: current_key.mldsa65_pub.clone(),
+                response_key_id: entry.response_key_id,
+                request_kem_recipient: Some(AnchoredKemRecipient {
+                    key_id: entry.request_kem_key_id,
+                    recipient,
+                    not_after_unix_ms: entry.expires_at_unix_ms,
+                }),
+                transport,
+                capabilities: entry.capabilities,
+                accepted_state: AcceptedStateEvidence {
+                    service_did: Did::from(state.did),
+                    digest,
+                    epoch: state.epoch,
+                    expires_at_unix_ms: state_expiry,
+                    response_ed25519,
+                    response_ml_dsa65: current_key.mldsa65_pub.clone(),
+                },
+                source_signer: entry.source_signer,
+                expires_at_unix_ms: entry.expires_at_unix_ms,
+            });
+        }
+        Ok(candidates)
+    }
+}
+
+impl DiscoveryServiceResolver {
+    async fn resolve_service_candidates(
+        &self,
+        query: ServiceQuery,
+    ) -> Result<Vec<ResolvedService>> {
+        let candidates = self.acquire_candidates(&query).await?;
+        let selected = select_service_candidates(&query, candidates, unix_millis_now())?;
+        let mut resolved = Vec::with_capacity(selected.len());
+        for item in selected {
+            let state = self
+                .accepted_state_source
+                .accepted_state(item.service_did().as_str())?
+                .ok_or_else(|| anyhow::anyhow!("accepted state disappeared during resolution"))?;
+            resolved.push(ResolvedService::mint(item, &state)?);
+        }
+        Ok(resolved)
+    }
+
+    async fn ensure_current(&self, resolved: &ResolvedService) -> Result<()> {
+        resolved.ensure_fresh(unix_millis_now())?;
+        let state = self
+            .accepted_state_source
+            .accepted_state(resolved.service_did().as_str())?
+            .ok_or_else(|| anyhow::anyhow!("accepted state disappeared; re-resolution required"))?;
+        anyhow::ensure!(
+            state.epoch == resolved.evidence().accepted_state_epoch
+                && state.head_digest == resolved.evidence().accepted_state_digest,
+            "accepted state advanced or forked; re-resolution required"
+        );
+        let state_expiry = accepted_expiry_unix_ms(&state)?;
+        anyhow::ensure!(
+            unix_millis_now() < state_expiry,
+            "accepted state expired; re-resolution required"
+        );
+        Ok(())
+    }
+}
+
+static PROCESS_ACCEPTED_STATE_SOURCE: std::sync::OnceLock<Arc<dyn AcceptedStateSource>> =
+    std::sync::OnceLock::new();
+static PRODUCTION_RESOLVER: std::sync::OnceLock<Arc<DiscoveryServiceResolver>> =
+    std::sync::OnceLock::new();
+static PROCESS_REGISTRY_VERIFIER: std::sync::OnceLock<RegistryDeploymentVerifier> =
+    std::sync::OnceLock::new();
+
+const DEPLOYMENT_CA_ROOT_PATH: &str = "/etc/hyprstream/trust/deployment-ca.ed25519";
+const REGISTRY_DEPLOYMENT_CREDENTIAL_PATH: &str =
+    "/run/hyprstream/credentials/registry-service.jwt";
+const REGISTRY_DEPLOYMENT_CREDENTIAL_PROFILE: &str = "hyprstream.registry-deployment.v1";
+const REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE: &str = "urn:hyprstream:service:registry";
+const REGISTRY_DEPLOYMENT_CREDENTIAL_MAX_TTL_SECONDS: i64 = 3_600;
+const REGISTRY_DEPLOYMENT_CREDENTIAL_CLOCK_SKEW_SECONDS: i64 = 60;
+
+/// Opaque verification-only view of the authenticated deployment registry.
+/// It exposes neither the raw key nor an authority replacement operation.
+#[derive(Clone)]
+pub struct RegistryDeploymentVerifier {
+    verifying_key: VerifyingKey,
+}
+
+impl RegistryDeploymentVerifier {
+    pub fn verify_strict(
+        &self,
+        message: &[u8],
+        signature: &ed25519_dalek::Signature,
+    ) -> Result<()> {
+        self.verifying_key
+            .verify_strict(message, signature)
+            .map_err(|error| anyhow::anyhow!("deployment registry signature rejected: {error}"))
+    }
+
+    pub fn matches(&self, key: &VerifyingKey) -> bool {
+        self.verifying_key == *key
+    }
+}
+
+/// Read the verification-only identity installed by trusted startup.
+pub fn deployment_registry_verifier() -> Result<RegistryDeploymentVerifier> {
+    PROCESS_REGISTRY_VERIFIER
+        .get()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("deployment registry verifier is not installed"))
+}
+
+/// Non-cloneable proof privately minted from the fixed CA/JWT pair.
+struct AuthenticatedRegistryDeploymentIdentity {
+    verifier: RegistryDeploymentVerifier,
+}
+
+struct TrustedRegistryDeploymentCredentials {
+    ca_verifying_key: VerifyingKey,
+    registry_credential: String,
+}
+
+/// JSON value decoded while preserving the security property that every object
+/// member has exactly one interpretation. `serde_json::Value` alone accepts a
+/// duplicate member with last-value-wins semantics, which is unsuitable for a
+/// credential profile.
+struct UniqueJson(serde_json::Value);
+
+impl<'de> serde::Deserialize<'de> for UniqueJson {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = UniqueJson;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("JSON without duplicate object members")
+            }
+
+            fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueJson(serde_json::Value::Null))
+            }
+
+            fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueJson(serde_json::Value::Bool(value)))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueJson(serde_json::Value::Number(value.into())))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueJson(serde_json::Value::Number(value.into())))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                serde_json::Number::from_f64(value)
+                    .map(serde_json::Value::Number)
+                    .map(UniqueJson)
+                    .ok_or_else(|| E::custom("non-finite JSON number"))
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueJson(serde_json::Value::String(value.to_owned())))
+            }
+
+            fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueJson(serde_json::Value::String(value)))
+            }
+
+            fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_unit()
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                <UniqueJson as serde::Deserialize>::deserialize(deserializer)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut values = Vec::new();
+                while let Some(value) = seq.next_element::<UniqueJson>()? {
+                    values.push(value.0);
+                }
+                Ok(UniqueJson(serde_json::Value::Array(values)))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut values = serde_json::Map::new();
+                while let Some((key, value)) = map.next_entry::<String, UniqueJson>()? {
+                    if values.insert(key.clone(), value.0).is_some() {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate JSON member {key:?}"
+                        )));
+                    }
+                }
+                Ok(UniqueJson(serde_json::Value::Object(values)))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+fn exact_json_object<'a>(
+    value: &'a serde_json::Value,
+    expected: &[&str],
+    description: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("{description} must be a JSON object"))?;
+    for member in object.keys() {
+        anyhow::ensure!(
+            expected.contains(&member.as_str()),
+            "{description} contains unexpected member {member:?}"
+        );
+    }
+    for member in expected {
+        anyhow::ensure!(
+            object.contains_key(*member),
+            "{description} is missing member {member:?}"
+        );
+    }
+    Ok(object)
+}
+
+fn exact_string_member<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    member: &str,
+    description: &str,
+) -> Result<&'a str> {
+    object[member]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("{description}.{member} must be a string"))
+}
+
+fn exact_i64_member(
+    object: &serde_json::Map<String, serde_json::Value>,
+    member: &str,
+    description: &str,
+) -> Result<i64> {
+    object[member]
+        .as_i64()
+        .ok_or_else(|| anyhow::anyhow!("{description}.{member} must be an integer"))
+}
+
+fn decode_canonical_jwt_segment(segment: &str, description: &str, limit: usize) -> Result<Vec<u8>> {
+    anyhow::ensure!(!segment.is_empty(), "{description} is empty");
+    anyhow::ensure!(segment.len() <= limit, "{description} is too large");
+    let decoded = URL_SAFE_NO_PAD
+        .decode(segment)
+        .map_err(|error| anyhow::anyhow!("{description} is not unpadded base64url: {error}"))?;
+    anyhow::ensure!(
+        URL_SAFE_NO_PAD.encode(&decoded) == segment,
+        "{description} is not canonical unpadded base64url"
+    );
+    Ok(decoded)
+}
+
+fn parse_unique_jwt_json(
+    segment: &str,
+    description: &str,
+    limit: usize,
+) -> Result<serde_json::Value> {
+    let bytes = decode_canonical_jwt_segment(segment, description, limit)?;
+    let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+    let value = <UniqueJson as serde::Deserialize>::deserialize(&mut deserializer)
+        .map_err(|error| anyhow::anyhow!("{description} is malformed: {error}"))?;
+    deserializer
+        .end()
+        .map_err(|error| anyhow::anyhow!("{description} has trailing data: {error}"))?;
+    Ok(value.0)
+}
+
+fn deployment_domain(ca_verifying_key: &VerifyingKey) -> String {
+    hyprstream_rpc::auth::jwk_thumbprint(&hyprstream_rpc::auth::JwkThumbprintInput::Ed25519 {
+        x: ca_verifying_key.as_bytes(),
+    })
+}
+
+fn validate_registry_credential_numeric_dates(
+    exp: i64,
+    nbf: i64,
+    iat: i64,
+    now: i64,
+) -> Result<()> {
+    for (name, value) in [("exp", exp), ("nbf", nbf), ("iat", iat)] {
+        anyhow::ensure!(
+            value >= 0,
+            "credential {name} must not precede the Unix epoch"
+        );
+    }
+
+    anyhow::ensure!(exp > now, "credential has expired");
+    let latest_future_time = now
+        .checked_add(REGISTRY_DEPLOYMENT_CREDENTIAL_CLOCK_SKEW_SECONDS)
+        .ok_or_else(|| anyhow::anyhow!("credential clock-skew boundary overflow"))?;
+    anyhow::ensure!(nbf <= latest_future_time, "credential is not yet valid");
+    anyhow::ensure!(
+        iat <= latest_future_time,
+        "credential was issued in the future"
+    );
+    anyhow::ensure!(nbf <= exp, "credential nbf is after exp");
+    anyhow::ensure!(nbf <= iat, "credential nbf is after iat");
+    anyhow::ensure!(iat < exp, "credential iat is not before exp");
+    let lifetime = exp
+        .checked_sub(iat)
+        .ok_or_else(|| anyhow::anyhow!("credential lifetime arithmetic overflow"))?;
+    anyhow::ensure!(
+        lifetime <= REGISTRY_DEPLOYMENT_CREDENTIAL_MAX_TTL_SECONDS,
+        "credential lifetime exceeds the inclusive one-hour profile limit"
+    );
+    Ok(())
+}
+
+fn validate_registry_deployment_credential_profile(
+    token: &str,
+    ca_verifying_key: &VerifyingKey,
+) -> Result<[u8; 32]> {
+    let mut segments = token.split('.');
+    let protected_segment = segments.next().unwrap_or_default();
+    let claims_segment = segments.next().unwrap_or_default();
+    let signature_segment = segments.next().unwrap_or_default();
+    anyhow::ensure!(
+        segments.next().is_none(),
+        "credential must contain exactly three segments"
+    );
+    decode_canonical_jwt_segment(signature_segment, "credential signature", 128)?;
+
+    let protected = parse_unique_jwt_json(protected_segment, "protected header", 4_096)?;
+    let protected = exact_json_object(&protected, &["alg", "typ", "kid"], "protected header")?;
+    anyhow::ensure!(
+        exact_string_member(protected, "alg", "protected header")? == "EdDSA",
+        "protected header alg must be exactly EdDSA"
+    );
+    anyhow::ensure!(
+        exact_string_member(protected, "typ", "protected header")? == "wit+jwt",
+        "protected header typ must be exactly wit+jwt"
+    );
+    let domain = deployment_domain(ca_verifying_key);
+    anyhow::ensure!(
+        exact_string_member(protected, "kid", "protected header")? == domain,
+        "protected header kid does not bind the pinned deployment CA"
+    );
+
+    let claims = parse_unique_jwt_json(claims_segment, "credential claims", 16_384)?;
+    let claims = exact_json_object(
+        &claims,
+        &[
+            "iss",
+            "sub",
+            "aud",
+            "exp",
+            "nbf",
+            "iat",
+            "deployment_domain",
+            "profile",
+            "cnf",
+        ],
+        "credential claims",
+    )?;
+    anyhow::ensure!(
+        exact_string_member(claims, "sub", "credential claims")? == "service:registry",
+        "credential subject must be exactly service:registry"
+    );
+    let intended_issuer = format!("urn:hyprstream:deployment:{domain}");
+    anyhow::ensure!(
+        exact_string_member(claims, "iss", "credential claims")? == intended_issuer,
+        "credential issuer does not bind the pinned deployment domain"
+    );
+    anyhow::ensure!(
+        exact_string_member(claims, "aud", "credential claims")?
+            == REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE,
+        "credential audience must be exactly {REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE}"
+    );
+    anyhow::ensure!(
+        exact_string_member(claims, "deployment_domain", "credential claims")? == domain,
+        "credential deployment_domain does not bind the pinned deployment CA"
+    );
+    anyhow::ensure!(
+        exact_string_member(claims, "profile", "credential claims")?
+            == REGISTRY_DEPLOYMENT_CREDENTIAL_PROFILE,
+        "credential profile must be exactly {REGISTRY_DEPLOYMENT_CREDENTIAL_PROFILE}"
+    );
+
+    let now = chrono::Utc::now().timestamp();
+    let exp = exact_i64_member(claims, "exp", "credential claims")?;
+    let nbf = exact_i64_member(claims, "nbf", "credential claims")?;
+    let iat = exact_i64_member(claims, "iat", "credential claims")?;
+    validate_registry_credential_numeric_dates(exp, nbf, iat, now)?;
+
+    let cnf = exact_json_object(&claims["cnf"], &["jwk"], "credential claims.cnf")?;
+    let jwk = exact_json_object(
+        &cnf["jwk"],
+        &["kty", "crv", "x"],
+        "credential claims.cnf.jwk",
+    )?;
+    anyhow::ensure!(
+        exact_string_member(jwk, "kty", "credential claims.cnf.jwk")? == "OKP",
+        "credential cnf.jwk.kty must be exactly OKP"
+    );
+    anyhow::ensure!(
+        exact_string_member(jwk, "crv", "credential claims.cnf.jwk")? == "Ed25519",
+        "credential cnf.jwk.crv must be exactly Ed25519"
+    );
+    let x = exact_string_member(jwk, "x", "credential claims.cnf.jwk")?;
+    let key = decode_canonical_jwt_segment(x, "credential cnf.jwk.x", 64)?;
+    let key: [u8; 32] = key
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("credential cnf.jwk.x must decode to exactly 32 bytes"))?;
+
+    // Signature verification is deliberately last: no parsed material can mint
+    // authority unless the exact closed profile is authenticated by the fixed CA.
+    let verified = hyprstream_rpc::auth::jwt::decode(
+        token,
+        ca_verifying_key,
+        Some(REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE),
+    )
+    .map_err(|error| anyhow::anyhow!("credential signature rejected: {error}"))?;
+    anyhow::ensure!(
+        verified.sub == "service:registry" && verified.cnf_key_bytes() == Some(key),
+        "verified credential differs from the exact deployment profile"
+    );
+    Ok(key)
+}
+
+#[cfg(unix)]
+fn read_os_owned_file(path: &std::path::Path, description: &str) -> Result<Vec<u8>> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    anyhow::ensure!(path.is_absolute(), "{description} path must be absolute");
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| anyhow::anyhow!("{description} is unavailable at {path:?}: {error}"))?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "{description} is not a regular file"
+    );
+    anyhow::ensure!(metadata.uid() == 0, "{description} is not owned by root");
+    anyhow::ensure!(
+        metadata.mode() & 0o022 == 0,
+        "{description} is group/world writable"
+    );
+    for parent in path.ancestors().skip(1) {
+        let parent_metadata = std::fs::symlink_metadata(parent).map_err(|error| {
+            anyhow::anyhow!("{description} parent {parent:?} is unavailable: {error}")
+        })?;
+        anyhow::ensure!(
+            parent_metadata.file_type().is_dir(),
+            "{description} parent {parent:?} is not a directory"
+        );
+        anyhow::ensure!(
+            parent_metadata.uid() == 0 && parent_metadata.mode() & 0o022 == 0,
+            "{description} parent {parent:?} is writable or not root-owned"
+        );
+    }
+    std::fs::read(path)
+        .map_err(|error| anyhow::anyhow!("failed to read {description} at {path:?}: {error}"))
+}
+
+#[cfg(not(unix))]
+fn read_os_owned_file(_path: &std::path::Path, description: &str) -> Result<Vec<u8>> {
+    anyhow::bail!("{description} requires the OS-owned Unix deployment seam")
+}
+
+fn load_trusted_registry_deployment_credentials() -> Result<TrustedRegistryDeploymentCredentials> {
+    let ca_bytes = read_os_owned_file(
+        std::path::Path::new(DEPLOYMENT_CA_ROOT_PATH),
+        "deployment CA root",
+    )?;
+    let ca_bytes: [u8; 32] = ca_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("deployment CA root must be 32 bytes"))?;
+    let ca_verifying_key = VerifyingKey::from_bytes(&ca_bytes)
+        .map_err(|error| anyhow::anyhow!("deployment CA root is malformed: {error}"))?;
+    let registry_credential = String::from_utf8(read_os_owned_file(
+        std::path::Path::new(REGISTRY_DEPLOYMENT_CREDENTIAL_PATH),
+        "registry deployment credential",
+    )?)
+    .map_err(|error| anyhow::anyhow!("registry deployment credential is not UTF-8: {error}"))?;
+    Ok(TrustedRegistryDeploymentCredentials {
+        ca_verifying_key,
+        registry_credential,
+    })
+}
+
+fn authenticate_registry_deployment_credentials(
+    credentials: TrustedRegistryDeploymentCredentials,
+) -> Result<AuthenticatedRegistryDeploymentIdentity> {
+    let key_bytes = validate_registry_deployment_credential_profile(
+        &credentials.registry_credential,
+        &credentials.ca_verifying_key,
+    )
+    .map_err(|error| anyhow::anyhow!("registry deployment credential rejected: {error}"))?;
+    let verifying_key = VerifyingKey::from_bytes(&key_bytes)
+        .map_err(|error| anyhow::anyhow!("registry credential key is malformed: {error}"))?;
+    Ok(AuthenticatedRegistryDeploymentIdentity {
+        verifier: RegistryDeploymentVerifier { verifying_key },
+    })
+}
+
+struct ProcessBootstrapAuthority {
+    store_path: std::path::PathBuf,
+    acceptance_identity: ProcessAcceptanceIdentity,
+}
+
+enum ProcessAcceptanceIdentity {
+    Deployment(RegistryDeploymentVerifier),
+    #[cfg(test)]
+    Test(VerifyingKey),
+}
+
+enum ProcessBootstrapAuthorityState {
+    Unsealed,
+    Sealed,
+    Consumed,
+}
+
+static PROCESS_BOOTSTRAP_AUTHORITY: parking_lot::Mutex<ProcessBootstrapAuthorityState> =
+    parking_lot::Mutex::new(ProcessBootstrapAuthorityState::Unsealed);
+
+/// Atomically consume the fixed OS-owned deployment witness and install the
+/// process Discovery resolver. No credential path, CA, JWT, key, witness, or
+/// extraction callback crosses this boundary.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn bootstrap_deployment_process(signing_key: SigningKey) -> Result<()> {
+    let authority = authenticate_deployment_bootstrap()?;
+    let discovery_vk = hyprstream_service::global_trust_store()
+        .resolve_one("discovery")
+        .ok_or_else(|| anyhow::anyhow!("trust store has no authenticated discovery key"))?;
+    let discovery_client =
+        crate::DiscoveryClient::for_local_bootstrap(signing_key, discovery_vk, None)?;
+    DiscoveryService::bootstrap_authenticated_process(authority, discovery_client)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn authenticate_deployment_bootstrap() -> Result<ProcessBootstrapAuthority> {
+    let mut state = PROCESS_BOOTSTRAP_AUTHORITY.lock();
+    anyhow::ensure!(
+        matches!(*state, ProcessBootstrapAuthorityState::Unsealed),
+        "Discovery bootstrap authority is already sealed or consumed"
+    );
+    *state = ProcessBootstrapAuthorityState::Sealed;
+    drop(state);
+    let witness = authenticate_registry_deployment_credentials(
+        load_trusted_registry_deployment_credentials()?,
+    )?;
+    let store_path = hyprstream_service::deployment_data_dir()?.join("pds-store");
+    Ok(ProcessBootstrapAuthority {
+        store_path,
+        acceptance_identity: ProcessAcceptanceIdentity::Deployment(witness.verifier),
+    })
+}
+
+#[cfg(test)]
+fn authenticate_discovery_bootstrap_identity(
+    acceptance_identity: ed25519_dalek::VerifyingKey,
+) -> Result<ProcessBootstrapAuthority> {
+    let mut state = PROCESS_BOOTSTRAP_AUTHORITY.lock();
+    anyhow::ensure!(
+        matches!(*state, ProcessBootstrapAuthorityState::Unsealed),
+        "Discovery bootstrap authority is already sealed or consumed"
+    );
+    *state = ProcessBootstrapAuthorityState::Sealed;
+    Ok(ProcessBootstrapAuthority {
+        store_path: hyprstream_service::deployment_data_dir()?.join("pds-store"),
+        acceptance_identity: ProcessAcceptanceIdentity::Test(acceptance_identity),
+    })
+}
+
+/// Construct an ordinary production RPC client. Production authority cannot
+/// be implemented, injected, or replaced by a downstream caller.
+///
+/// ```compile_fail
+/// use hyprstream_rpc::{ResolvedRpcClient, ServiceResolver};
+/// ```
+///
+/// ```compile_fail
+/// use hyprstream_discovery::{DiscoveryServiceResolver, ResolvedService};
+/// ```
+///
+/// Raw accepted evidence, candidates, selection, and the selected transport/key
+/// bundle are private to Discovery's checkpoint-verifying implementation.
+/// ```compile_fail
+/// use hyprstream_rpc::{
+///     select_service_candidate, AcceptedStateEvidence, AnchoredKemRecipient,
+///     SelectedService, ServiceCandidate,
+/// };
+/// ```
+pub fn production_rpc_client(
+    service_name: &str,
+    signing_key: SigningKey,
+    token: Option<String>,
+) -> Result<Arc<dyn RpcClient>> {
+    let resolver = PRODUCTION_RESOLVER
+        .get()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("checkpoint-backed production resolver is not installed"))?;
+    Ok(Arc::new(ProductionRpcClient::new(
+        service_name,
+        signing_key,
+        token,
+        resolver,
+    )?))
+}
+
+struct ProductionRpcClient {
+    service_name: String,
+    signing_key: SigningKey,
+    token: Option<String>,
+    resolver: Arc<DiscoveryServiceResolver>,
+    request_id: std::sync::atomic::AtomicU64,
+}
+
+impl ProductionRpcClient {
+    fn new(
+        service_name: &str,
+        signing_key: SigningKey,
+        token: Option<String>,
+        resolver: Arc<DiscoveryServiceResolver>,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            !service_name.is_empty()
+                && service_name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+            "service name is not canonical"
+        );
+        Ok(Self {
+            service_name: service_name.to_owned(),
+            signing_key,
+            token,
+            resolver,
+            request_id: std::sync::atomic::AtomicU64::new(1),
+        })
+    }
+    async fn snapshots(&self) -> Result<Vec<ResolvedService>> {
+        let query = ServiceQuery::network(self.service_name.clone())?;
+        let max_attempts = query.max_attempts;
+        let snapshots = self.resolver.resolve_service_candidates(query).await?;
+        let authority = snapshots
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("resolver returned no validated alternatives"))?;
+        anyhow::ensure!(
+            snapshots.iter().all(|item| item.same_authority(authority)),
+            "resolver retry set crosses service authority"
+        );
+        Ok(snapshots.into_iter().take(max_attempts).collect())
+    }
+    fn client_for(&self, snapshot: &ResolvedService) -> Result<Arc<dyn RpcClient>> {
+        let (kem, pq) = snapshot.crypto_stores()?;
+        let signer = hyprstream_rpc::signer::LocalSigner::new(self.signing_key.clone());
+        hyprstream_rpc::dial::dial_with_crypto_stores(
+            snapshot.transport(),
+            signer,
+            Some(snapshot.response_verifying_key()),
+            self.token.clone(),
+            Some(kem),
+            Some(pq),
+        )
+    }
+    async fn attempt<T, F, Fut>(&self, mut call: F) -> Result<(T, ResolvedService)>
+    where
+        F: FnMut(Arc<dyn RpcClient>) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        for refresh in 0..2 {
+            let mut last_transport_error = None;
+            let mut invalidated = None;
+            for snapshot in self.snapshots().await? {
+                if let Err(error) = self.resolver.ensure_current(&snapshot).await {
+                    invalidated = Some(error);
+                    break;
+                }
+                match call(self.client_for(&snapshot)?).await {
+                    Ok(value) => return Ok((value, snapshot)),
+                    Err(error)
+                        if hyprstream_rpc::transport_traits::is_pre_dispatch_transport_error(
+                            &error,
+                        ) =>
+                    {
+                        last_transport_error = Some(error);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if let Some(error) = invalidated {
+                if refresh == 0 {
+                    continue;
+                }
+                return Err(anyhow::anyhow!(
+                    "resolved service remained invalid after re-resolution: {error}"
+                ));
+            }
+            return Err(last_transport_error.unwrap_or_else(|| {
+                anyhow::anyhow!("validated same-authority alternatives exhausted")
+            }));
+        }
+        unreachable!("bounded re-resolution loop always returns")
+    }
+    fn checked_stream(
+        &self,
+        inner: Box<dyn StreamHandle>,
+        snapshot: ResolvedService,
+    ) -> Box<dyn StreamHandle> {
+        Box::new(CurrentStreamHandle {
+            inner,
+            resolver: Arc::clone(&self.resolver),
+            snapshot,
+            invalidated: false,
+        })
+    }
+}
+
+#[async_trait]
+impl RpcClient for ProductionRpcClient {
+    async fn call(&self, payload: Vec<u8>) -> Result<Vec<u8>> {
+        Ok(self
+            .attempt(|c| {
+                let p = payload.clone();
+                async move { c.call(p).await }
+            })
+            .await?
+            .0)
+    }
+    async fn call_for_service(&self, service: &str, payload: Vec<u8>) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            service == self.service_name,
+            "generated service authority mismatch"
+        );
+        let service = service.to_owned();
+        Ok(self
+            .attempt(|c| {
+                let p = payload.clone();
+                let s = service.clone();
+                async move { c.call_for_service(&s, p).await }
+            })
+            .await?
+            .0)
+    }
+    async fn call_with_options(&self, payload: Vec<u8>, options: CallOptions) -> Result<Vec<u8>> {
+        Ok(self
+            .attempt(|c| {
+                let p = payload.clone();
+                let o = options.clone();
+                async move { c.call_with_options(p, o).await }
+            })
+            .await?
+            .0)
+    }
+    async fn call_with_options_for_service(
+        &self,
+        service: &str,
+        payload: Vec<u8>,
+        options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            service == self.service_name,
+            "generated service authority mismatch"
+        );
+        let service = service.to_owned();
+        Ok(self
+            .attempt(|c| {
+                let p = payload.clone();
+                let o = options.clone();
+                let s = service.clone();
+                async move { c.call_with_options_for_service(&s, p, o).await }
+            })
+            .await?
+            .0)
+    }
+    async fn call_streaming(&self, payload: Vec<u8>, ephemeral: [u8; 32]) -> Result<Vec<u8>> {
+        Ok(self
+            .attempt(|c| {
+                let p = payload.clone();
+                async move { c.call_streaming(p, ephemeral).await }
+            })
+            .await?
+            .0)
+    }
+    async fn call_streaming_for_service(
+        &self,
+        service: &str,
+        payload: Vec<u8>,
+        ephemeral: [u8; 32],
+    ) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            service == self.service_name,
+            "generated service authority mismatch"
+        );
+        let service = service.to_owned();
+        Ok(self
+            .attempt(|c| {
+                let p = payload.clone();
+                let s = service.clone();
+                async move { c.call_streaming_for_service(&s, p, ephemeral).await }
+            })
+            .await?
+            .0)
+    }
+    async fn open_stream(&self, payload: Vec<u8>) -> Result<Box<dyn StreamHandle>> {
+        let (inner, snapshot) = self
+            .attempt(|c| {
+                let p = payload.clone();
+                async move { c.open_stream(p).await }
+            })
+            .await?;
+        Ok(self.checked_stream(inner, snapshot))
+    }
+    async fn open_stream_from_info(
+        &self,
+        info: hyprstream_rpc::stream_info::StreamInfo,
+        secret: [u8; 32],
+        public: [u8; 32],
+    ) -> Result<Box<dyn StreamHandle>> {
+        let (inner, snapshot) = self
+            .attempt(|c| {
+                let i = info.clone();
+                async move { c.open_stream_from_info(i, secret, public).await }
+            })
+            .await?;
+        Ok(self.checked_stream(inner, snapshot))
+    }
+    fn next_id(&self) -> u64 {
+        self.request_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -408,7 +2077,9 @@ impl DiscoveryService {
     }
 }
 
-fn announced_endpoint_to_transport(endpoint: &AnnouncedEndpoint) -> anyhow::Result<TransportConfig> {
+fn announced_endpoint_to_transport(
+    endpoint: &AnnouncedEndpoint,
+) -> anyhow::Result<TransportConfig> {
     match endpoint.socket_kind.as_str() {
         "quic" => parse_announced_quic(&endpoint.endpoint),
         "iroh" => parse_announced_iroh(&endpoint.endpoint),
@@ -420,13 +2091,19 @@ fn parse_announced_quic(endpoint: &str) -> anyhow::Result<TransportConfig> {
     let rest = endpoint
         .strip_prefix("quic://")
         .ok_or_else(|| anyhow::anyhow!("announced QUIC endpoint must start with quic://"))?;
-    let (server_name, addr) = rest
-        .split_once(':')
-        .ok_or_else(|| anyhow::anyhow!("announced QUIC endpoint must be quic://<server-name>:<socket-addr>"))?;
-    anyhow::ensure!(!server_name.is_empty(), "announced QUIC endpoint is missing server name");
+    let (server_name, addr) = rest.split_once(':').ok_or_else(|| {
+        anyhow::anyhow!("announced QUIC endpoint must be quic://<server-name>:<socket-addr>")
+    })?;
+    anyhow::ensure!(
+        !server_name.is_empty(),
+        "announced QUIC endpoint is missing server name"
+    );
     let addr = SocketAddr::from_str(addr)
         .map_err(|e| anyhow::anyhow!("invalid announced QUIC socket address '{addr}': {e}"))?;
-    anyhow::ensure!(addr.port() != 0, "announced QUIC endpoint must not use port 0");
+    anyhow::ensure!(
+        addr.port() != 0,
+        "announced QUIC endpoint must not use port 0"
+    );
     Ok(TransportConfig::quic(addr, server_name).with_connect_mode())
 }
 
@@ -434,7 +2111,10 @@ fn parse_announced_iroh(endpoint: &str) -> anyhow::Result<TransportConfig> {
     let hex = endpoint
         .strip_prefix("iroh://")
         .ok_or_else(|| anyhow::anyhow!("announced iroh endpoint must start with iroh://"))?;
-    anyhow::ensure!(hex.len() == 64, "announced iroh node id must be 32 bytes of hex");
+    anyhow::ensure!(
+        hex.len() == 64,
+        "announced iroh node id must be 32 bytes of hex"
+    );
     let mut node_id = [0u8; 32];
     for (idx, byte) in node_id.iter_mut().enumerate() {
         let start = idx * 2;
@@ -445,17 +2125,1209 @@ fn parse_announced_iroh(endpoint: &str) -> anyhow::Result<TransportConfig> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod resolver_tests {
     use super::*;
+    use ed25519_dalek::Signer as _;
+    use hyprstream_crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes};
+    use hyprstream_pds::at9p::{
+        CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType,
+        Transport as At9pTransport,
+    };
+    use hyprstream_pds::at9p_duplicity::AcceptedAt9pState;
+    use hyprstream_pds::at9p_sign::{sign_capsule, sign_update_record};
     use hyprstream_rpc::transport::{BindMode, EndpointType};
+
+    fn checked_test_time(now: i64, offset: i64) -> i64 {
+        now.checked_add(offset).expect("test NumericDate offset")
+    }
+
+    fn sign_registry_credential_json(
+        ca: &SigningKey,
+        protected_json: &str,
+        claims_json: &str,
+    ) -> String {
+        let protected = URL_SAFE_NO_PAD.encode(protected_json.as_bytes());
+        let claims = URL_SAFE_NO_PAD.encode(claims_json.as_bytes());
+        let signing_input = format!("{protected}.{claims}");
+        let signature = ca.sign(signing_input.as_bytes());
+        format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        )
+    }
+
+    fn exact_registry_credential_values(
+        ca: &SigningKey,
+        registry: &SigningKey,
+    ) -> (serde_json::Value, serde_json::Value) {
+        let domain = deployment_domain(&ca.verifying_key());
+        let now = chrono::Utc::now().timestamp();
+        (
+            serde_json::json!({"alg":"EdDSA", "typ":"wit+jwt", "kid":domain}),
+            serde_json::json!({
+                "iss": format!("urn:hyprstream:deployment:{domain}"),
+                "sub": "service:registry",
+                "aud": REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE,
+                "exp": checked_test_time(now, 3600),
+                "nbf": now,
+                "iat": now,
+                "deployment_domain": domain,
+                "profile": REGISTRY_DEPLOYMENT_CREDENTIAL_PROFILE,
+                "cnf": {"jwk": {
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "x": URL_SAFE_NO_PAD.encode(registry.verifying_key().as_bytes()),
+                }},
+            }),
+        )
+    }
+
+    fn exact_registry_credential(ca: &SigningKey, registry: &SigningKey) -> String {
+        let (protected, claims) = exact_registry_credential_values(ca, registry);
+        sign_registry_credential_json(ca, &protected.to_string(), &claims.to_string())
+    }
+
+    fn authenticate_test_registry_credential(
+        ca: &SigningKey,
+        credential: String,
+    ) -> Result<AuthenticatedRegistryDeploymentIdentity> {
+        authenticate_registry_deployment_credentials(TrustedRegistryDeploymentCredentials {
+            ca_verifying_key: ca.verifying_key(),
+            registry_credential: credential,
+        })
+    }
+
+    fn assert_registry_credential_rejected(
+        ca: &SigningKey,
+        protected: &serde_json::Value,
+        claims: &serde_json::Value,
+        case: &str,
+    ) {
+        let credential =
+            sign_registry_credential_json(ca, &protected.to_string(), &claims.to_string());
+        assert!(
+            authenticate_test_registry_credential(ca, credential).is_err(),
+            "invalid deployment credential accepted: {case}"
+        );
+    }
+
+    #[test]
+    fn exact_registry_deployment_credential_installs_the_exact_bound_jwk() {
+        let ca = SigningKey::from_bytes(&[0x31; 32]);
+        let registry = SigningKey::from_bytes(&[0x32; 32]);
+        let witness =
+            authenticate_test_registry_credential(&ca, exact_registry_credential(&ca, &registry))
+                .expect("exact deployment credential profile");
+        assert!(witness.verifier.matches(&registry.verifying_key()));
+    }
+
+    #[test]
+    fn deployment_credential_numeric_dates_enforce_all_boundaries_and_orderings() {
+        let now = 1_000_000;
+
+        for (case, exp, nbf, iat) in [
+            (
+                "one-hour lifetime endpoint",
+                checked_test_time(now, 3600),
+                now,
+                now,
+            ),
+            (
+                "inside lifetime endpoint",
+                checked_test_time(now, 3599),
+                now,
+                now,
+            ),
+            (
+                "future-skew and lifetime endpoints",
+                checked_test_time(now, 3660),
+                checked_test_time(now, 60),
+                checked_test_time(now, 60),
+            ),
+        ] {
+            validate_registry_credential_numeric_dates(exp, nbf, iat, now)
+                .unwrap_or_else(|error| panic!("valid {case} rejected: {error}"));
+        }
+
+        for (case, exp, nbf, iat, validation_now) in [
+            (
+                "expired endpoint",
+                now,
+                now,
+                checked_test_time(now, -1),
+                now,
+            ),
+            (
+                "outside lifetime endpoint",
+                checked_test_time(now, 3601),
+                now,
+                now,
+                now,
+            ),
+            (
+                "future nbf outside skew",
+                checked_test_time(now, 3600),
+                checked_test_time(now, 61),
+                now,
+                now,
+            ),
+            (
+                "future iat outside skew",
+                checked_test_time(now, 3661),
+                now,
+                checked_test_time(now, 61),
+                now,
+            ),
+            (
+                "exp equal to iat",
+                checked_test_time(now, 1),
+                checked_test_time(now, 1),
+                checked_test_time(now, 1),
+                now,
+            ),
+            (
+                "exp before iat",
+                checked_test_time(now, 1),
+                now,
+                checked_test_time(now, 2),
+                now,
+            ),
+            (
+                "nbf after exp",
+                checked_test_time(now, 2),
+                checked_test_time(now, 3),
+                now,
+                now,
+            ),
+            (
+                "nbf after iat",
+                checked_test_time(now, 2),
+                checked_test_time(now, 1),
+                now,
+                now,
+            ),
+            ("negative exp", -1, 0, 0, -2),
+            ("negative nbf", checked_test_time(now, 1), -1, 0, now),
+            ("negative iat", checked_test_time(now, 1), 0, -1, now),
+            ("minimum and maximum extremes", i64::MAX, 0, i64::MIN, now),
+            ("all minimum extremes", i64::MIN, i64::MIN, i64::MIN, now),
+            ("all maximum extremes", i64::MAX, i64::MAX, i64::MAX, now),
+            (
+                "clock-skew boundary overflow",
+                i64::MAX,
+                i64::MAX - 1,
+                i64::MAX - 1,
+                i64::MAX - 1,
+            ),
+        ] {
+            assert!(
+                validate_registry_credential_numeric_dates(exp, nbf, iat, validation_now).is_err(),
+                "invalid NumericDate profile accepted: {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn deployment_credential_rejects_signed_wraparound_lifetime_in_all_profiles() {
+        let ca = SigningKey::from_bytes(&[0x6a; 32]);
+        let registry = SigningKey::from_bytes(&[0x6b; 32]);
+        let (protected, mut claims) = exact_registry_credential_values(&ca, &registry);
+        claims["exp"] = serde_json::json!(checked_test_time(
+            chrono::Utc::now().timestamp(),
+            REGISTRY_DEPLOYMENT_CREDENTIAL_MAX_TTL_SECONDS,
+        ));
+        claims["nbf"] = serde_json::json!(i64::MIN);
+        claims["iat"] = serde_json::json!(i64::MIN);
+
+        assert_registry_credential_rejected(
+            &ca,
+            &protected,
+            &claims,
+            "signed exp-minus-iat wraparound",
+        );
+    }
+
+    #[test]
+    fn deployment_credential_rejects_every_protected_and_trust_dimension() {
+        let ca = SigningKey::from_bytes(&[0x33; 32]);
+        let other_ca = SigningKey::from_bytes(&[0x34; 32]);
+        let registry = SigningKey::from_bytes(&[0x35; 32]);
+        let (protected, claims) = exact_registry_credential_values(&ca, &registry);
+
+        for (case, member, value) in [
+            ("access token type", "typ", serde_json::json!("at+jwt")),
+            (
+                "application access token type",
+                "typ",
+                serde_json::json!("application/at+jwt"),
+            ),
+            ("generic JWT type", "typ", serde_json::json!("JWT")),
+            ("wrong-case type", "typ", serde_json::json!("WIT+JWT")),
+            ("whitespace type", "typ", serde_json::json!("wit+jwt ")),
+            ("alternate algorithm", "alg", serde_json::json!("ES256")),
+            ("wrong key id", "kid", serde_json::json!("attacker")),
+        ] {
+            let mut changed = protected.clone();
+            changed[member] = value;
+            assert_registry_credential_rejected(&ca, &changed, &claims, case);
+        }
+        for missing in ["typ", "alg", "kid"] {
+            let mut changed = protected.clone();
+            changed
+                .as_object_mut()
+                .expect("header object")
+                .remove(missing);
+            assert_registry_credential_rejected(&ca, &changed, &claims, missing);
+        }
+        let mut unknown = protected.clone();
+        unknown["crit"] = serde_json::json!([]);
+        assert_registry_credential_rejected(&ca, &unknown, &claims, "unknown header member");
+
+        let credential = exact_registry_credential(&ca, &registry);
+        assert!(
+            authenticate_test_registry_credential(&other_ca, credential).is_err(),
+            "CA substitution accepted"
+        );
+        let signed_by_other = {
+            let (other_header, _) = exact_registry_credential_values(&other_ca, &registry);
+            sign_registry_credential_json(&other_ca, &other_header.to_string(), &claims.to_string())
+        };
+        assert!(
+            authenticate_test_registry_credential(&ca, signed_by_other).is_err(),
+            "signature substitution accepted"
+        );
+    }
+
+    #[test]
+    fn deployment_credential_rejects_every_claim_and_time_dimension() {
+        let ca = SigningKey::from_bytes(&[0x36; 32]);
+        let registry = SigningKey::from_bytes(&[0x37; 32]);
+        let (protected, claims) = exact_registry_credential_values(&ca, &registry);
+        let now = chrono::Utc::now().timestamp();
+
+        for (case, member, value) in [
+            ("wrong subject", "sub", serde_json::json!("service:model")),
+            (
+                "wrong issuer",
+                "iss",
+                serde_json::json!("https://attacker.invalid"),
+            ),
+            (
+                "wrong audience",
+                "aud",
+                serde_json::json!("service:registry"),
+            ),
+            (
+                "audience array",
+                "aud",
+                serde_json::json!([REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE]),
+            ),
+            (
+                "wrong deployment domain",
+                "deployment_domain",
+                serde_json::json!("attacker"),
+            ),
+            (
+                "wrong profile",
+                "profile",
+                serde_json::json!("hyprstream.registry-deployment.v2"),
+            ),
+            (
+                "expired",
+                "exp",
+                serde_json::json!(checked_test_time(now, -1)),
+            ),
+            (
+                "future nbf",
+                "nbf",
+                serde_json::json!(checked_test_time(now, 61)),
+            ),
+            (
+                "future iat",
+                "iat",
+                serde_json::json!(checked_test_time(now, 61)),
+            ),
+            (
+                "nbf after iat",
+                "nbf",
+                serde_json::json!(checked_test_time(now, 1)),
+            ),
+            (
+                "excessive lifetime",
+                "exp",
+                serde_json::json!(checked_test_time(now, 3601)),
+            ),
+        ] {
+            let mut changed = claims.clone();
+            changed[member] = value;
+            assert_registry_credential_rejected(&ca, &protected, &changed, case);
+        }
+        for missing in [
+            "iss",
+            "sub",
+            "aud",
+            "exp",
+            "nbf",
+            "iat",
+            "deployment_domain",
+            "profile",
+            "cnf",
+        ] {
+            let mut changed = claims.clone();
+            changed
+                .as_object_mut()
+                .expect("claims object")
+                .remove(missing);
+            assert_registry_credential_rejected(&ca, &protected, &changed, missing);
+        }
+        let mut unknown = claims.clone();
+        unknown["scope"] = serde_json::json!("registry");
+        assert_registry_credential_rejected(&ca, &protected, &unknown, "unknown claim");
+    }
+
+    #[test]
+    fn deployment_credential_rejects_every_confirmation_and_jwk_dimension() {
+        let ca = SigningKey::from_bytes(&[0x38; 32]);
+        let registry = SigningKey::from_bytes(&[0x39; 32]);
+        let (protected, claims) = exact_registry_credential_values(&ca, &registry);
+
+        for (case, member, value) in [
+            ("RSA declaration", "kty", serde_json::json!("RSA")),
+            ("EC declaration", "kty", serde_json::json!("EC")),
+            ("P-256 curve", "crv", serde_json::json!("P-256")),
+            ("alternate OKP curve", "crv", serde_json::json!("X25519")),
+            ("malformed x", "x", serde_json::json!("%%%")),
+            (
+                "padded x",
+                "x",
+                serde_json::json!(format!(
+                    "{}=",
+                    URL_SAFE_NO_PAD.encode(registry.verifying_key().as_bytes())
+                )),
+            ),
+            (
+                "short x",
+                "x",
+                serde_json::json!(URL_SAFE_NO_PAD.encode([0u8; 31])),
+            ),
+        ] {
+            let mut changed = claims.clone();
+            changed["cnf"]["jwk"][member] = value;
+            assert_registry_credential_rejected(&ca, &protected, &changed, case);
+        }
+        for missing in ["kty", "crv", "x"] {
+            let mut changed = claims.clone();
+            changed["cnf"]["jwk"]
+                .as_object_mut()
+                .expect("jwk object")
+                .remove(missing);
+            assert_registry_credential_rejected(&ca, &protected, &changed, missing);
+        }
+        for incompatible in ["alg", "use", "key_ops", "kid"] {
+            let mut changed = claims.clone();
+            changed["cnf"]["jwk"][incompatible] = serde_json::json!("unexpected");
+            assert_registry_credential_rejected(&ca, &protected, &changed, incompatible);
+        }
+        let mut ambiguous = claims.clone();
+        ambiguous["cnf"]["jkt"] = serde_json::json!("thumbprint");
+        assert_registry_credential_rejected(&ca, &protected, &ambiguous, "jwk plus jkt");
+        let mut alternate = claims.clone();
+        alternate["cnf"] = serde_json::json!({"jkt":"thumbprint"});
+        assert_registry_credential_rejected(&ca, &protected, &alternate, "jkt only");
+    }
+
+    #[test]
+    fn deployment_credential_duplicate_members_fail_closed_at_every_level() {
+        let ca = SigningKey::from_bytes(&[0x3a; 32]);
+        let registry = SigningKey::from_bytes(&[0x3b; 32]);
+        let domain = deployment_domain(&ca.verifying_key());
+        let (_, claims) = exact_registry_credential_values(&ca, &registry);
+        let duplicate_headers = [
+            format!(r#"{{"alg":"EdDSA","alg":"ES256","typ":"wit+jwt","kid":"{domain}"}}"#),
+            format!(r#"{{"alg":"EdDSA","typ":"wit+jwt","typ":"at+jwt","kid":"{domain}"}}"#),
+            format!(r#"{{"alg":"EdDSA","typ":"wit+jwt","kid":"{domain}","kid":"attacker"}}"#),
+        ];
+        for header in duplicate_headers {
+            let token = sign_registry_credential_json(&ca, &header, &claims.to_string());
+            assert!(authenticate_test_registry_credential(&ca, token).is_err());
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let exp = checked_test_time(now, 3600);
+        let x = URL_SAFE_NO_PAD.encode(registry.verifying_key().as_bytes());
+        let protected = serde_json::json!({"alg":"EdDSA", "typ":"wit+jwt", "kid":domain});
+        for duplicate_claims in [
+            format!(
+                r#"{{"iss":"urn:hyprstream:deployment:{domain}","sub":"service:registry","sub":"service:model","aud":"{REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE}","exp":{},"nbf":{now},"iat":{now},"deployment_domain":"{domain}","profile":"{REGISTRY_DEPLOYMENT_CREDENTIAL_PROFILE}","cnf":{{"jwk":{{"kty":"OKP","crv":"Ed25519","x":"{x}"}}}}}}"#,
+                exp
+            ),
+            format!(
+                r#"{{"iss":"urn:hyprstream:deployment:{domain}","sub":"service:registry","aud":"{REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE}","exp":{},"nbf":{now},"iat":{now},"deployment_domain":"{domain}","profile":"{REGISTRY_DEPLOYMENT_CREDENTIAL_PROFILE}","cnf":{{"jwk":{{"kty":"OKP","crv":"Ed25519","x":"{x}"}},"jwk":{{"kty":"RSA","crv":"P-256","x":"{x}"}}}}}}"#,
+                exp
+            ),
+            format!(
+                r#"{{"iss":"urn:hyprstream:deployment:{domain}","sub":"service:registry","aud":"{REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE}","exp":{},"nbf":{now},"iat":{now},"deployment_domain":"{domain}","profile":"{REGISTRY_DEPLOYMENT_CREDENTIAL_PROFILE}","cnf":{{"jwk":{{"kty":"OKP","kty":"RSA","crv":"Ed25519","x":"{x}"}}}}}}"#,
+                exp
+            ),
+        ] {
+            let token =
+                sign_registry_credential_json(&ca, &protected.to_string(), &duplicate_claims);
+            assert!(authenticate_test_registry_credential(&ca, token).is_err());
+        }
+    }
+
+    #[test]
+    fn production_authority_api_inventory_has_no_public_composition_chain() {
+        let service_factory = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../hyprstream-service/src/service/factory.rs"
+        ));
+        for forbidden in [
+            "pub fn seal_discovery_bootstrap_authority",
+            "pub fn consume_discovery_bootstrap_authority",
+            "struct DiscoveryBootstrapAuthority",
+            "discovery_authority:",
+            "pub fn authenticate_registry_deployment_credential",
+            "pub fn take_authenticated_registry_identity",
+            "pub fn authenticated_registry_identity",
+            "pub struct AuthenticatedRegistryDeploymentIdentity",
+            "into_verifying_key",
+        ] {
+            assert!(
+                !service_factory.contains(forbidden),
+                "authority seam returned: {forbidden}"
+            );
+        }
+        let discovery = include_str!("service.rs");
+        let production = discovery
+            .split("mod resolver_tests {")
+            .next()
+            .expect("production Discovery source");
+        assert!(!production.contains("\n    pub fn install_process_bootstrap("));
+        assert!(production.contains("struct ProcessBootstrapAuthority {"));
+        assert!(production.contains("enum ProcessBootstrapAuthorityState {"));
+        let authentication = production
+            .split("fn authenticate_deployment_bootstrap()")
+            .nth(1)
+            .expect("private deployment authentication boundary")
+            .split("#[cfg(test)]\nfn authenticate_discovery_bootstrap_identity")
+            .next()
+            .expect("authentication body");
+        assert!(authentication.contains("hyprstream_service::deployment_data_dir()"));
+        assert!(authentication.contains("load_trusted_registry_deployment_credentials()"));
+        assert!(authentication.contains("authenticate_registry_deployment_credentials("));
+        assert!(!authentication.contains("global_trust_store()"));
+        assert!(!authentication.contains("resolve_one("));
+        assert!(!authentication.contains("FnOnce"));
+        assert!(!production.contains("pub fn authenticate_discovery_bootstrap("));
+        assert!(!production.contains("pub struct AuthenticatedDiscoveryBootstrap"));
+        assert!(!production.contains("pub fn bootstrap_authenticated_process("));
+        assert!(production.contains("/etc/hyprstream/trust/deployment-ca.ed25519"));
+        assert!(production.contains("/run/hyprstream/credentials/registry-service.jwt"));
+        let loader = production
+            .split("fn load_trusted_registry_deployment_credentials()")
+            .nth(1)
+            .expect("fixed deployment loader")
+            .split("fn authenticate_registry_deployment_credentials(")
+            .next()
+            .expect("loader body");
+        assert!(!loader.contains("CREDENTIALS_DIRECTORY"));
+        assert!(!loader.contains("dirs::config_dir"));
+    }
 
     fn service() -> DiscoveryService {
         let (sk, vk) = hyprstream_rpc::crypto::generate_signing_keypair();
-        DiscoveryService::new(
-            Arc::new(sk),
-            vk,
-            TransportConfig::inproc("resolver-test"),
+        DiscoveryService::new(Arc::new(sk), vk, TransportConfig::inproc("resolver-test"))
+    }
+
+    fn legacy_endpoint(
+        socket_kind: &str,
+        endpoint: &str,
+        last_heartbeat: Instant,
+    ) -> AnnouncedEndpoint {
+        AnnouncedEndpoint {
+            socket_kind: socket_kind.to_owned(),
+            endpoint: endpoint.to_owned(),
+            service_jwt: "jwt".to_owned(),
+            service_did: Did::default(),
+            capabilities: BTreeSet::new(),
+            accepted_state_digest: Vec::new(),
+            accepted_state_epoch: 0,
+            response_key_id: String::new(),
+            request_kem_key_id: String::new(),
+            request_kem_recipient: Vec::new(),
+            expires_at_unix_ms: 0,
+            source_signer: [0; 32],
+            last_heartbeat,
+        }
+    }
+
+    fn accepted_state(tag: u8) -> (AcceptedAt9pState, SigningKey) {
+        let signing = SigningKey::from_bytes(&[tag; 32]);
+        let (pq_signing, pq_verifying) = ml_dsa_generate_keypair();
+        let keys = HybridKeyPair::new(
+            signing.verifying_key().to_bytes().to_vec(),
+            ml_dsa_vk_bytes(&pq_verifying),
         )
+        .unwrap_or_else(|e| panic!("test hybrid keys invalid: {e}"));
+        let endpoint = ServiceEndpoint::new(At9pTransport::Iroh, "iroh://reach")
+            .unwrap_or_else(|e| panic!("test endpoint invalid: {e}"));
+        let service = ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint)
+            .unwrap_or_else(|e| panic!("test service invalid: {e}"));
+        let body = CapsuleBody::new(vec![keys], vec![service])
+            .unwrap_or_else(|e| panic!("test body invalid: {e}"));
+        let genesis = sign_capsule(body.clone(), &signing, &pq_signing)
+            .unwrap_or_else(|e| panic!("test genesis signing failed: {e}"));
+        let subject = genesis
+            .cid512()
+            .unwrap_or_else(|e| panic!("test genesis CID failed: {e}"));
+        let update = sign_update_record(
+            subject,
+            1,
+            [1; 64],
+            body,
+            "2099-01-01T00:00:00Z".to_owned(),
+            &signing,
+            &pq_signing,
+        )
+        .unwrap_or_else(|e| panic!("test update signing failed: {e}"));
+        let bytes = update
+            .to_dag_cbor()
+            .unwrap_or_else(|e| panic!("test update encoding failed: {e}"));
+        let state = AcceptedAt9pState::from_persisted_update(&bytes)
+            .unwrap_or_else(|e| panic!("test accepted state invalid: {e}"));
+        (state, signing)
+    }
+
+    struct MutableAcceptedState(parking_lot::Mutex<Option<AcceptedAt9pState>>);
+
+    impl AcceptedStateSource for MutableAcceptedState {
+        fn accepted_state(&self, _did: &str) -> Result<Option<AcceptedAt9pState>> {
+            Ok(self.0.lock().clone())
+        }
+    }
+
+    fn production_fixture(
+        local_reach: bool,
+    ) -> (DiscoveryServiceResolver, Arc<MutableAcceptedState>) {
+        let (state, signing) = accepted_state(11);
+        let kem = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
+            hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        )
+        .unwrap_or_else(|e| panic!("test KEM generation failed: {e}"));
+        let endpoint = if local_reach {
+            "inproc://hyprstream/model".to_owned()
+        } else {
+            "quic://localhost:127.0.0.1:9".to_owned()
+        };
+        let announced = Arc::new(RwLock::new(HashMap::from([(
+            "model".to_owned(),
+            vec![AnnouncedEndpoint {
+                socket_kind: if local_reach { "rep" } else { "quic" }.to_owned(),
+                endpoint,
+                service_jwt: "verified-by-handler".to_owned(),
+                service_did: Did::from(state.did.clone()),
+                capabilities: ["hyprstream-rpc/1".to_owned()].into_iter().collect(),
+                accepted_state_digest: state.head_digest.to_vec(),
+                accepted_state_epoch: state.epoch,
+                response_key_id: format!("{}#response-current", state.did),
+                request_kem_key_id: format!("{}#kem-current", state.did),
+                request_kem_recipient: kem.public().encode(),
+                expires_at_unix_ms: 4_070_908_800_000,
+                source_signer: signing.verifying_key().to_bytes(),
+                last_heartbeat: Instant::now(),
+            }],
+        )])));
+        let source = Arc::new(MutableAcceptedState(parking_lot::Mutex::new(Some(state))));
+        (
+            DiscoveryServiceResolver {
+                announced_endpoints: announced,
+                accepted_state_source: Arc::clone(&source) as Arc<dyn AcceptedStateSource>,
+                discovery_client: None,
+            },
+            source,
+        )
+    }
+
+    #[tokio::test]
+    async fn production_resolver_joins_announcement_to_current_pds_state() {
+        let (resolver, _) = production_fixture(false);
+        let resolved = resolver
+            .resolve_service(ServiceQuery::network("model").expect("query"))
+            .await
+            .unwrap_or_else(|e| panic!("production candidate rejected: {e}"));
+        assert_eq!(resolved.service_name(), "model");
+        assert_eq!(resolved.evidence().accepted_state_epoch, 1);
+        assert!(resolved.service_did().is_did_at9p());
+        assert!(!resolved.request_kem_recipient().recipient.eks.is_empty());
+        resolver
+            .ensure_current(&resolved)
+            .await
+            .unwrap_or_else(|e| panic!("unchanged accepted state rejected: {e}"));
+    }
+
+    #[tokio::test]
+    async fn ordinary_announcement_handler_populates_production_resolver() {
+        let (state, service_signing) = accepted_state(12);
+        let root = SigningKey::from_bytes(&[0x61; 32]);
+        let source = Arc::new(MutableAcceptedState(parking_lot::Mutex::new(Some(
+            state.clone(),
+        ))));
+        let service = DiscoveryService::new(
+            Arc::new(root.clone()),
+            root.verifying_key(),
+            TransportConfig::inproc("announcement-rpc-test"),
+        )
+        .with_accepted_state_source(source);
+        let claims = hyprstream_rpc::auth::Claims::new(
+            "service:model".to_owned(),
+            chrono::Utc::now().timestamp(),
+            chrono::Utc::now().timestamp() + 3_600,
+        )
+        .with_cnf_jwk(service_signing.verifying_key().as_bytes());
+        let jwt = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &root);
+        let signed = hyprstream_rpc::SignedEnvelope::new_signed(
+            hyprstream_rpc::RequestEnvelope::anonymous(Vec::new()),
+            &service_signing,
+        );
+        let ctx = EnvelopeContext::from_verified_as_system(&signed);
+        let kem = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
+            hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        )
+        .expect("test KEM");
+        let response = service
+            .handle_announce(
+                &ctx,
+                1,
+                &ServiceAnnouncement {
+                    service_name: "model".to_owned(),
+                    socket_kind: "quic".to_owned(),
+                    endpoint: "quic://localhost:127.0.0.1:9".to_owned(),
+                    service_jwt: Some(jwt),
+                    service_did: Did::from(state.did.clone()),
+                    capabilities: vec!["hyprstream-rpc/1".to_owned()],
+                    accepted_state_digest: state.head_digest.to_vec(),
+                    accepted_state_epoch: state.epoch,
+                    response_key_id: format!("{}#response-current", state.did),
+                    request_kem_key_id: format!("{}#kem-current", state.did),
+                    request_kem_recipient: kem.public().encode(),
+                    expires_at_unix_ms: 4_070_908_800_000,
+                },
+            )
+            .await
+            .expect("ordinary announcement handler");
+        assert!(matches!(response, DiscoveryResponseVariant::AnnounceResult));
+        let resolver = service.production_resolver().expect("production resolver");
+        let resolved = resolver
+            .resolve_service(ServiceQuery::network("model").expect("query"))
+            .await
+            .expect("ordinary announcement must resolve");
+        assert_eq!(resolved.evidence().accepted_state_digest, state.head_digest);
+    }
+
+    #[tokio::test]
+    async fn accepted_state_advance_between_selection_and_dial_refuses() {
+        let (resolver, source) = production_fixture(false);
+        let resolved = resolver
+            .resolve_service(ServiceQuery::network("model").expect("query"))
+            .await
+            .unwrap_or_else(|e| panic!("production candidate rejected: {e}"));
+        {
+            let mut guard = source.0.lock();
+            let state = guard.as_mut().expect("fixture state");
+            state.epoch += 1;
+            state.head_digest = [0x55; 64];
+        }
+        let error = resolver
+            .ensure_current(&resolved)
+            .await
+            .expect_err("advanced state accepted");
+        assert!(error.to_string().contains("advanced or forked"));
+    }
+
+    struct CountingStream(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait]
+    impl StreamHandle for CountingStream {
+        async fn next_payload(
+            &mut self,
+        ) -> Result<Option<hyprstream_rpc::streaming::StreamPayload>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(None)
+        }
+        async fn cancel(&mut self) -> Result<()> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn stream_id(&self) -> &str {
+            "counting"
+        }
+        fn is_completed(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn live_stream_continuation_fails_closed_after_snapshot_advance() {
+        let (resolver, source) = production_fixture(false);
+        let resolver = Arc::new(resolver);
+        let snapshot = resolver
+            .resolve_service_candidates(ServiceQuery::network("model").expect("query"))
+            .await
+            .expect("snapshot")
+            .remove(0);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut stream = CurrentStreamHandle {
+            inner: Box::new(CountingStream(Arc::clone(&calls))),
+            resolver,
+            snapshot,
+            invalidated: false,
+        };
+        {
+            let mut guard = source.0.lock();
+            let state = guard.as_mut().expect("fixture state");
+            state.epoch += 1;
+            state.head_digest = [0x77; 64];
+        }
+        assert!(stream.next_payload().await.is_err());
+        assert!(stream.cancel().await.is_err());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "invalid continuation dispatched an operation"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_network_resolver_never_falls_back_to_local_reach() {
+        let (resolver, _) = production_fixture(true);
+        assert!(resolver
+            .resolve_service(ServiceQuery::network("model").expect("query"))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn generated_client_uses_ordinary_identity_bound_resolver_path() {
+        let (resolver, _) = production_fixture(false);
+        let entries = resolver
+            .announced_endpoints
+            .write()
+            .remove("model")
+            .expect("fixture announcement");
+        resolver
+            .announced_endpoints
+            .write()
+            .insert("discovery".to_owned(), entries);
+        let resolver = Arc::new(resolver);
+        let _ = PRODUCTION_RESOLVER.set(resolver);
+        let client_signing = SigningKey::from_bytes(&[0x44; 32]);
+        let _client = crate::DiscoveryClient::from_resolver(client_signing, None)
+            .unwrap_or_else(|e| panic!("generated resolver path failed: {e}"));
+    }
+
+    #[test]
+    fn isolated_process_without_bootstrap_fails_closed() {
+        const CHILD: &str = "HYPRSTREAM_TEST_RESOLVER_ABSENT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let signing = SigningKey::from_bytes(&[0x46; 32]);
+            let error = match production_rpc_client("model", signing, None) {
+                Ok(_) => panic!("isolated process unexpectedly inherited another resolver"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("not installed"));
+            return;
+        }
+        let status =
+            std::process::Command::new(std::env::current_exe().expect("discovery test executable"))
+                .arg("--exact")
+                .arg("service::resolver_tests::isolated_process_without_bootstrap_fails_closed")
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .status()
+                .expect("isolated resolver subprocess");
+        assert!(status.success(), "isolated resolver subprocess failed");
+    }
+
+    struct NoopBootstrapClient;
+
+    #[async_trait::async_trait]
+    impl RpcClient for NoopBootstrapClient {
+        async fn call(&self, _: Vec<u8>) -> Result<Vec<u8>> {
+            anyhow::bail!("bootstrap transport was unexpectedly dispatched")
+        }
+        async fn call_for_service(&self, _: &str, _: Vec<u8>) -> Result<Vec<u8>> {
+            anyhow::bail!("bootstrap transport was unexpectedly dispatched")
+        }
+        async fn call_with_options(&self, _: Vec<u8>, _: CallOptions) -> Result<Vec<u8>> {
+            anyhow::bail!("bootstrap transport was unexpectedly dispatched")
+        }
+        async fn call_with_options_for_service(
+            &self,
+            _: &str,
+            _: Vec<u8>,
+            _: CallOptions,
+        ) -> Result<Vec<u8>> {
+            anyhow::bail!("bootstrap transport was unexpectedly dispatched")
+        }
+        async fn call_streaming(&self, _: Vec<u8>, _: [u8; 32]) -> Result<Vec<u8>> {
+            anyhow::bail!("bootstrap transport was unexpectedly dispatched")
+        }
+        async fn call_streaming_for_service(
+            &self,
+            _: &str,
+            _: Vec<u8>,
+            _: [u8; 32],
+        ) -> Result<Vec<u8>> {
+            anyhow::bail!("bootstrap transport was unexpectedly dispatched")
+        }
+        async fn open_stream(&self, _: Vec<u8>) -> Result<Box<dyn StreamHandle>> {
+            anyhow::bail!("bootstrap transport was unexpectedly dispatched")
+        }
+        async fn open_stream_from_info(
+            &self,
+            _: hyprstream_rpc::stream_info::StreamInfo,
+            _: [u8; 32],
+            _: [u8; 32],
+        ) -> Result<Box<dyn StreamHandle>> {
+            anyhow::bail!("bootstrap transport was unexpectedly dispatched")
+        }
+        fn next_id(&self) -> u64 {
+            1
+        }
+    }
+
+    fn authenticated_registry_identity(tag: u8) -> ed25519_dalek::VerifyingKey {
+        SigningKey::from_bytes(&[tag; 32]).verifying_key()
+    }
+
+    #[test]
+    fn redirected_credential_directories_have_zero_registry_authority() {
+        const CHILD: &str = "HYPRSTREAM_TEST_FIXED_REGISTRY_CREDENTIAL_CHILD";
+        const ATTACKER_KEY: &str = "HYPRSTREAM_TEST_ATTACKER_REGISTRY_KEY";
+        if std::env::var_os(CHILD).is_some() {
+            let key_bytes: [u8; 32] =
+                hex::decode(std::env::var(ATTACKER_KEY).expect("attacker registry key"))
+                    .expect("attacker key hex")
+                    .try_into()
+                    .expect("attacker key length");
+            let attacker = VerifyingKey::from_bytes(&key_bytes).expect("attacker key");
+            match load_trusted_registry_deployment_credentials() {
+                Ok(credentials) => {
+                    let witness = authenticate_registry_deployment_credentials(credentials)
+                        .expect("fixed OS-owned credential pair must authenticate");
+                    assert!(
+                        !witness.verifier.matches(&attacker),
+                        "ambient credential pair selected production authority"
+                    );
+                }
+                Err(error) => assert!(
+                    error.to_string().contains(DEPLOYMENT_CA_ROOT_PATH)
+                        || error
+                            .to_string()
+                            .contains(REGISTRY_DEPLOYMENT_CREDENTIAL_PATH),
+                    "startup did not fail at the fixed OS-owned seam: {error}"
+                ),
+            }
+            return;
+        }
+
+        let alternate = tempfile::tempdir().expect("alternate credential directory");
+        let ca = SigningKey::from_bytes(&[0x71; 32]);
+        let registry = SigningKey::from_bytes(&[0x72; 32]);
+        let jwt = exact_registry_credential(&ca, &registry);
+        std::fs::write(
+            alternate.path().join("ca-pubkey"),
+            ca.verifying_key().as_bytes(),
+        )
+        .expect("alternate CA");
+        std::fs::write(alternate.path().join("registry-service-jwt"), jwt)
+            .expect("alternate registry JWT");
+        let user_config = alternate.path().join("user-config");
+        let user_credentials = user_config.join("hyprstream/credentials");
+        std::fs::create_dir_all(&user_credentials).expect("user credential fallback");
+        std::fs::copy(
+            alternate.path().join("ca-pubkey"),
+            user_credentials.join("ca-pubkey"),
+        )
+        .expect("user CA copy");
+        std::fs::copy(
+            alternate.path().join("registry-service-jwt"),
+            user_credentials.join("registry-service-jwt"),
+        )
+        .expect("user JWT copy");
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("service::resolver_tests::redirected_credential_directories_have_zero_registry_authority")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .env("CREDENTIALS_DIRECTORY", alternate.path())
+            .env("XDG_CONFIG_HOME", &user_config)
+            .env(ATTACKER_KEY, hex::encode(registry.verifying_key().as_bytes()))
+            .status()
+            .expect("redirected credential subprocess");
+        assert!(status.success(), "redirected credential subprocess failed");
+    }
+
+    #[test]
+    fn verified_registry_identity_ignores_policy_and_post_start_environment_mutation() {
+        const CHILD: &str = "HYPRSTREAM_TEST_POST_START_REGISTRY_ENV_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("discovery test executable"),
+            )
+            .arg("--exact")
+            .arg("service::resolver_tests::verified_registry_identity_ignores_policy_and_post_start_environment_mutation")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .status()
+            .expect("post-start environment subprocess");
+            assert!(status.success(), "post-start environment subprocess failed");
+            return;
+        }
+        let caller = SigningKey::from_bytes(&[0x61; 32]);
+        hyprstream_service::global_trust_store().insert(
+            caller.verifying_key(),
+            hyprstream_service::Attestation {
+                scopes: std::iter::once("registry".to_owned()).collect(),
+                subject: None,
+                jwt: None,
+                expires_at: 0,
+                attested_by: None,
+            },
+        );
+        let ca = SigningKey::from_bytes(&[0x62; 32]);
+        let registry = SigningKey::from_bytes(&[0x63; 32]);
+        let witness =
+            authenticate_registry_deployment_credentials(TrustedRegistryDeploymentCredentials {
+                ca_verifying_key: ca.verifying_key(),
+                registry_credential: exact_registry_credential(&ca, &registry),
+            })
+            .expect("trusted pair");
+        std::env::set_var("CREDENTIALS_DIRECTORY", "post-start-attacker-directory");
+        std::env::set_var("XDG_CONFIG_HOME", "post-start-attacker-config");
+        assert!(witness.verifier.matches(&registry.verifying_key()));
+        assert!(!witness.verifier.matches(&caller.verifying_key()));
+    }
+
+    #[test]
+    fn process_bootstrap_precedes_first_generated_client() {
+        const CHILD: &str = "HYPRSTREAM_TEST_RESOLVER_BOOTSTRAP_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let store = hyprstream_service::deployment_data_dir()
+                .expect("deployment-owned data root")
+                .join("pds-store");
+            std::fs::create_dir_all(&store).expect("checkpoint store directory");
+            drop(rocksdb::DB::open_default(&store).expect("empty checkpoint store"));
+            let signing = SigningKey::from_bytes(&[0x47; 32]);
+            hyprstream_service::global_trust_store().insert(
+                signing.verifying_key(),
+                hyprstream_service::Attestation {
+                    scopes: std::iter::once("registry".to_owned()).collect(),
+                    subject: None,
+                    jwt: None,
+                    expires_at: 0,
+                    attested_by: None,
+                },
+            );
+            let authority =
+                authenticate_discovery_bootstrap_identity(authenticated_registry_identity(0x51))
+                    .expect("authenticate process resolver");
+            DiscoveryService::bootstrap_authenticated_process(
+                authority,
+                crate::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
+            )
+            .expect("install process resolver");
+            assert!(production_rpc_client("model", signing, None).is_ok());
+            assert!(
+                authenticate_discovery_bootstrap_identity(authenticated_registry_identity(0x52))
+                    .is_err()
+            );
+            return;
+        }
+        let deployment = tempfile::tempdir().expect("deployment data root");
+        let status =
+            std::process::Command::new(std::env::current_exe().expect("discovery test executable"))
+                .arg("--exact")
+                .arg("service::resolver_tests::process_bootstrap_precedes_first_generated_client")
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .env("XDG_DATA_HOME", deployment.path())
+                .status()
+                .expect("resolver bootstrap subprocess");
+        assert!(status.success(), "resolver bootstrap subprocess failed");
+    }
+
+    fn seed_registry_for_bootstrap(tag: u8) {
+        let registry = SigningKey::from_bytes(&[tag; 32]);
+        hyprstream_service::global_trust_store().insert(
+            registry.verifying_key(),
+            hyprstream_service::Attestation {
+                scopes: std::iter::once("registry".to_owned()).collect(),
+                subject: None,
+                jwt: None,
+                expires_at: 0,
+                attested_by: None,
+            },
+        );
+    }
+
+    #[test]
+    fn authenticated_process_bootstrap_has_exactly_one_concurrent_consumer() {
+        const CHILD: &str = "HYPRSTREAM_TEST_RESOLVER_CONCURRENT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let store = hyprstream_service::deployment_data_dir()
+                .unwrap()
+                .join("pds-store");
+            std::fs::create_dir_all(&store).unwrap();
+            drop(rocksdb::DB::open_default(&store).unwrap());
+            seed_registry_for_bootstrap(0x48);
+            let barrier = Arc::new(std::sync::Barrier::new(9));
+            let attempts: Vec<_> = (0..8)
+                .map(|_| {
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        authenticate_discovery_bootstrap_identity(authenticated_registry_identity(
+                            0x53,
+                        ))
+                        .and_then(|authority| {
+                            DiscoveryService::bootstrap_authenticated_process(
+                                authority,
+                                crate::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
+                            )
+                        })
+                        .is_ok()
+                    })
+                })
+                .collect();
+            barrier.wait();
+            assert_eq!(
+                attempts
+                    .into_iter()
+                    .map(|attempt| attempt.join().unwrap())
+                    .filter(|installed| *installed)
+                    .count(),
+                1
+            );
+            return;
+        }
+        let deployment = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("service::resolver_tests::authenticated_process_bootstrap_has_exactly_one_concurrent_consumer")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .env("XDG_DATA_HOME", deployment.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn authenticated_process_bootstrap_failure_is_terminal() {
+        const CHILD: &str = "HYPRSTREAM_TEST_RESOLVER_FAILURE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            seed_registry_for_bootstrap(0x49);
+            let authority =
+                authenticate_discovery_bootstrap_identity(authenticated_registry_identity(0x54))
+                    .unwrap();
+            let first = DiscoveryService::bootstrap_authenticated_process(
+                authority,
+                crate::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
+            )
+            .expect_err("missing checkpoint store unexpectedly installed");
+            assert!(first.to_string().contains("failed to open"));
+            let store = hyprstream_service::deployment_data_dir()
+                .unwrap()
+                .join("pds-store");
+            std::fs::create_dir_all(&store).unwrap();
+            drop(rocksdb::DB::open_default(&store).unwrap());
+            let second =
+                authenticate_discovery_bootstrap_identity(authenticated_registry_identity(0x55))
+                    .err()
+                    .expect("failed bootstrap authority was replayed");
+            assert!(second.to_string().contains("already sealed or consumed"));
+            return;
+        }
+        let deployment = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("service::resolver_tests::authenticated_process_bootstrap_failure_is_terminal")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .env("XDG_DATA_HOME", deployment.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[tokio::test]
+    async fn stale_or_expired_production_evidence_is_rejected() {
+        let (resolver, _) = production_fixture(false);
+        resolver
+            .announced_endpoints
+            .write()
+            .get_mut("model")
+            .and_then(|entries| entries.first_mut())
+            .expect("fixture service")
+            .last_heartbeat = Instant::now() - ANNOUNCED_ENDPOINT_TTL - Duration::from_secs(1);
+        assert!(resolver
+            .resolve_service(ServiceQuery::network("model").expect("query"))
+            .await
+            .is_err());
+
+        let (resolver, source) = production_fixture(false);
+        source.0.lock().as_mut().expect("fixture state").expires_at =
+            Some("2000-01-01T00:00:00Z".to_owned());
+        assert!(resolver
+            .resolve_service(ServiceQuery::network("model").expect("query"))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn malformed_candidate_does_not_poison_valid_alternative() {
+        let (resolver, _) = production_fixture(false);
+        {
+            let mut endpoints = resolver.announced_endpoints.write();
+            let entries = endpoints.get_mut("model").expect("fixture service");
+            let mut malformed = entries.first().expect("fixture endpoint").clone();
+            malformed.request_kem_recipient = vec![0xff];
+            malformed.socket_kind = "quic".to_owned();
+            malformed.endpoint = "quic://missing-port".to_owned();
+            entries.insert(0, malformed);
+        }
+
+        let resolved = resolver
+            .resolve_service(ServiceQuery::network("model").expect("query"))
+            .await
+            .unwrap_or_else(|e| panic!("malformed alternative poisoned valid candidate: {e}"));
+        assert_eq!(resolved.service_name(), "model");
+    }
+
+    #[tokio::test]
+    async fn rejected_or_forked_current_state_never_produces_candidate() {
+        let (resolver, source) = production_fixture(false);
+        *source.0.lock() = None;
+        assert!(resolver
+            .resolve_service(ServiceQuery::network("model").expect("query"))
+            .await
+            .is_err());
+
+        let (resolver, _) = production_fixture(false);
+        resolver
+            .announced_endpoints
+            .write()
+            .get_mut("model")
+            .and_then(|entries| entries.first_mut())
+            .expect("fixture service")
+            .accepted_state_digest = vec![0x77; 64];
+        assert!(resolver
+            .resolve_service(ServiceQuery::network("model").expect("query"))
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -463,12 +3335,11 @@ mod resolver_tests {
         let svc = service();
         svc.announced_endpoints.write().insert(
             "model".to_owned(),
-            vec![AnnouncedEndpoint {
-                socket_kind: "quic".to_owned(),
-                endpoint: "quic://model.hyprstream.svc.cluster.local:10.96.0.42:4433".to_owned(),
-                service_jwt: "jwt".to_owned(),
-                last_heartbeat: Instant::now(),
-            }],
+            vec![legacy_endpoint(
+                "quic",
+                "quic://model.hyprstream.svc.cluster.local:10.96.0.42:4433",
+                Instant::now(),
+            )],
         );
 
         let transport = match svc.resolve("model", SocketKind::Quic).await {
@@ -477,7 +3348,9 @@ mod resolver_tests {
         };
         assert_eq!(transport.bind_mode(), BindMode::Connect);
         match transport.endpoint {
-            EndpointType::Quic { addr, server_name, .. } => {
+            EndpointType::Quic {
+                addr, server_name, ..
+            } => {
                 assert_eq!(server_name, "model.hyprstream.svc.cluster.local");
                 assert_eq!(addr, SocketAddr::from(([10, 96, 0, 42], 4433)));
             }
@@ -502,12 +3375,11 @@ mod resolver_tests {
         let svc = service();
         svc.announced_endpoints.write().insert(
             "model".to_owned(),
-            vec![AnnouncedEndpoint {
-                socket_kind: "quic".to_owned(),
-                endpoint: "quic://model.hyprstream.svc.cluster.local:10.96.0.42:4433".to_owned(),
-                service_jwt: "jwt".to_owned(),
-                last_heartbeat: Instant::now() - (ANNOUNCED_ENDPOINT_TTL + Duration::from_secs(1)),
-            }],
+            vec![legacy_endpoint(
+                "quic",
+                "quic://model.hyprstream.svc.cluster.local:10.96.0.42:4433",
+                Instant::now() - (ANNOUNCED_ENDPOINT_TTL + Duration::from_secs(1)),
+            )],
         );
 
         let err = match svc.resolve("model", SocketKind::Quic).await {
@@ -529,7 +3401,11 @@ mod resolver_tests {
         };
         assert_eq!(transport.bind_mode(), BindMode::Connect);
         match transport.endpoint {
-            EndpointType::Iroh { node_id, direct_addrs, relay_url } => {
+            EndpointType::Iroh {
+                node_id,
+                direct_addrs,
+                relay_url,
+            } => {
                 assert_eq!(node_id, [7u8; 32]);
                 assert!(direct_addrs.is_empty());
                 assert!(relay_url.is_none());
@@ -554,7 +3430,12 @@ fn socket_kind_to_string(kind: SocketKind) -> &'static str {
 
 #[async_trait(?Send)]
 impl DiscoveryHandler for DiscoveryService {
-    async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
+    async fn authorize(
+        &self,
+        ctx: &EnvelopeContext,
+        resource: &str,
+        operation: &str,
+    ) -> Result<()> {
         // Delegate to authorization provider if available
         if let Some(ref auth) = self.auth_provider {
             let subject = ctx.subject().to_string();
@@ -568,7 +3449,12 @@ impl DiscoveryHandler for DiscoveryService {
             if allowed {
                 Ok(())
             } else {
-                anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource)
+                anyhow::bail!(
+                    "Unauthorized: {} cannot {} on {}",
+                    subject,
+                    operation,
+                    resource
+                )
             }
         } else {
             // No auth provider — allow (backward compat for local-only deployments)
@@ -659,6 +3545,15 @@ impl DiscoveryHandler for DiscoveryService {
                     service_jwt: String::new(),
                     tls_endorsement: self.tls_endorsement.clone(),
                     tls_domain: self.tls_domain.clone(),
+                    service_did: Did::default(),
+                    capabilities: Vec::new(),
+                    accepted_state_digest: Vec::new(),
+                    accepted_state_epoch: 0,
+                    response_key_id: String::new(),
+                    request_kem_key_id: String::new(),
+                    request_kem_recipient: Vec::new(),
+                    expires_at_unix_ms: 0,
+                    source_signer: Vec::new(),
                 })
                 .collect(),
             None => Vec::new(),
@@ -676,6 +3571,15 @@ impl DiscoveryHandler for DiscoveryService {
                         service_jwt: ep.service_jwt.clone(),
                         tls_endorsement: self.tls_endorsement.clone(),
                         tls_domain: self.tls_domain.clone(),
+                        service_did: ep.service_did.clone(),
+                        capabilities: ep.capabilities.iter().cloned().collect(),
+                        accepted_state_digest: ep.accepted_state_digest.clone(),
+                        accepted_state_epoch: ep.accepted_state_epoch,
+                        response_key_id: ep.response_key_id.clone(),
+                        request_kem_key_id: ep.request_kem_key_id.clone(),
+                        request_kem_recipient: ep.request_kem_recipient.clone(),
+                        expires_at_unix_ms: ep.expires_at_unix_ms,
+                        source_signer: ep.source_signer.to_vec(),
                     });
                 }
             }
@@ -810,7 +3714,9 @@ impl DiscoveryHandler for DiscoveryService {
         _request_id: u64,
     ) -> Result<DiscoveryResponseVariant> {
         Ok(DiscoveryResponseVariant::Error(ErrorInfo {
-            message: "getStream removed — use StreamChannel::prepare_stream for authenticated streaming".to_owned(),
+            message:
+                "getStream removed — use StreamChannel::prepare_stream for authenticated streaming"
+                    .to_owned(),
             code: "REMOVED".to_owned(),
             details: String::new(),
         }))
@@ -836,13 +3742,58 @@ impl DiscoveryHandler for DiscoveryService {
     ) -> Result<DiscoveryResponseVariant> {
         info!(
             "Discovery: service '{}' announced {} endpoint: {} (from {})",
-            data.service_name, data.socket_kind, data.endpoint, ctx.subject()
+            data.service_name,
+            data.socket_kind,
+            data.endpoint,
+            ctx.subject()
         );
 
         let svc_name = data.service_name.clone();
         let sock_kind = data.socket_kind.clone();
         let endpoint = data.endpoint.clone();
         let service_jwt = data.service_jwt.clone().unwrap_or_default();
+        let identity_bound = !data.service_did.as_str().is_empty()
+            || !data.accepted_state_digest.is_empty()
+            || !data.request_kem_recipient.is_empty();
+        if identity_bound {
+            anyhow::ensure!(
+                !service_jwt.is_empty(),
+                "identity-bound announcement requires a verified service JWT"
+            );
+            anyhow::ensure!(
+                data.service_did.is_did_at9p()
+                    && data.accepted_state_digest.len() == 64
+                    && !data.capabilities.is_empty()
+                    && data
+                        .response_key_id
+                        .starts_with(&format!("{}#", data.service_did))
+                    && data
+                        .request_kem_key_id
+                        .starts_with(&format!("{}#", data.service_did))
+                    && data.expires_at_unix_ms > unix_millis_now(),
+                "identity-bound announcement metadata is incomplete or expired"
+            );
+            let recipient = hyprstream_rpc::crypto::hybrid_kem::RecipientPublic::decode(
+                &data.request_kem_recipient,
+            )?;
+            anyhow::ensure!(
+                recipient.suite_id
+                    == hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768
+                    && recipient.eks.len() == recipient.suite_id.components().len(),
+                "identity-bound announcement requires suite-complete hybrid KEM material"
+            );
+            match data.socket_kind.as_str() {
+                "quic" => {
+                    parse_announced_quic(&data.endpoint)?;
+                }
+                "iroh" => {
+                    parse_announced_iroh(&data.endpoint)?;
+                }
+                _ => {
+                    anyhow::bail!("identity-bound network announcement requires QUIC or Iroh reach")
+                }
+            }
+        }
 
         // R3: Verify service JWT signature + subject matches serviceName.
         // Full JWT verification (not decode_unverified) to prevent forged identities.
@@ -851,7 +3802,8 @@ impl DiscoveryHandler for DiscoveryService {
                 &service_jwt,
                 &self.jwt_verifying_key,
                 self.expected_audience.as_deref(),
-            ).map_err(|e| {
+            )
+            .map_err(|e| {
                 tracing::warn!("Service JWT verification failed in announce: {}", e);
                 anyhow::anyhow!("Invalid service JWT in announce: {}", e)
             })?;
@@ -864,22 +3816,35 @@ impl DiscoveryHandler for DiscoveryService {
                     verified.sub
                 );
             }
+            anyhow::ensure!(
+                verified.cnf_key_bytes() == Some(ctx.cnf),
+                "service JWT confirmation key does not match verified announcement signer"
+            );
         }
+
+        let replacement = AnnouncedEndpoint {
+            socket_kind: sock_kind.clone(),
+            endpoint: endpoint.clone(),
+            service_jwt: service_jwt.clone(),
+            service_did: data.service_did.clone(),
+            capabilities: data.capabilities.iter().cloned().collect(),
+            accepted_state_digest: data.accepted_state_digest.clone(),
+            accepted_state_epoch: data.accepted_state_epoch,
+            response_key_id: data.response_key_id.clone(),
+            request_kem_key_id: data.request_kem_key_id.clone(),
+            request_kem_recipient: data.request_kem_recipient.clone(),
+            expires_at_unix_ms: data.expires_at_unix_ms,
+            source_signer: ctx.cnf,
+            last_heartbeat: Instant::now(),
+        };
 
         let mut endpoints = self.announced_endpoints.write();
         let entry = endpoints.entry(svc_name).or_default();
         // Replace existing endpoint for the same socket kind, or add new
         if let Some(existing) = entry.iter_mut().find(|e| e.socket_kind == sock_kind) {
-            existing.endpoint = endpoint;
-            existing.service_jwt = service_jwt;
-            existing.last_heartbeat = Instant::now();
+            *existing = replacement;
         } else {
-            entry.push(AnnouncedEndpoint {
-                socket_kind: sock_kind,
-                endpoint,
-                service_jwt,
-                last_heartbeat: Instant::now(),
-            });
+            entry.push(replacement);
         }
 
         Ok(DiscoveryResponseVariant::AnnounceResult)
@@ -949,11 +3914,13 @@ impl DiscoveryHandler for DiscoveryService {
         match map.get(issuer) {
             Some(cached) => {
                 trace!(issuer = %issuer, "Discovery: entity statement cache hit");
-                Ok(DiscoveryResponseVariant::GetEntityStatementResult(EntityStatement {
-                    issuer: issuer.to_owned(),
-                    jwt: cached.jwt.clone(),
-                    fetched_at: cached.fetched_at,
-                }))
+                Ok(DiscoveryResponseVariant::GetEntityStatementResult(
+                    EntityStatement {
+                        issuer: issuer.to_owned(),
+                        jwt: cached.jwt.clone(),
+                        fetched_at: cached.fetched_at,
+                    },
+                ))
             }
             None => Ok(DiscoveryResponseVariant::Error(ErrorInfo {
                 message: format!("no entity statement cached for issuer: {}", issuer),
@@ -1013,11 +3980,13 @@ impl DiscoveryHandler for DiscoveryService {
         match map.get(service_did) {
             Some(cached) => {
                 trace!(service_did = %service_did, "Discovery: envelope keyset cache hit");
-                Ok(DiscoveryResponseVariant::GetEnvelopeKeysetResult(EnvelopeKeyset {
-                    service_did: hyprstream_rpc::identity::Did::new(service_did.to_owned()),
-                    cose_keyset_cbor: cached.cose_keyset_cbor.clone(),
-                    fetched_at: cached.fetched_at,
-                }))
+                Ok(DiscoveryResponseVariant::GetEnvelopeKeysetResult(
+                    EnvelopeKeyset {
+                        service_did: hyprstream_rpc::identity::Did::new(service_did.to_owned()),
+                        cose_keyset_cbor: cached.cose_keyset_cbor.clone(),
+                        fetched_at: cached.fetched_at,
+                    },
+                ))
             }
             None => Ok(DiscoveryResponseVariant::Error(ErrorInfo {
                 message: format!("no envelope keyset cached for service: {}", service_did),
@@ -1036,7 +4005,10 @@ impl DiscoveryHandler for DiscoveryService {
         // Phase 0.5 plan Q10: getEntityStatement/getEnvelopeKeyset are
         // anonymous-readable (public artifacts), but listKnownIssuers
         // enumerates which partners we trust, which is operator-sensitive.
-        if let Err(e) = self.authorize(ctx, "discovery:federation", "list-known-issuers").await {
+        if let Err(e) = self
+            .authorize(ctx, "discovery:federation", "list-known-issuers")
+            .await
+        {
             return Ok(DiscoveryResponseVariant::Error(ErrorInfo {
                 message: format!("unauthorized: {}", e),
                 code: "UNAUTHORIZED".to_owned(),
@@ -1045,7 +4017,9 @@ impl DiscoveryHandler for DiscoveryService {
         }
         let map = self.entity_statements.read();
         let issuers: Vec<String> = map.keys().cloned().collect();
-        Ok(DiscoveryResponseVariant::ListKnownIssuersResult(IssuerList { issuers }))
+        Ok(DiscoveryResponseVariant::ListKnownIssuersResult(
+            IssuerList { issuers },
+        ))
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -1075,7 +4049,8 @@ impl DiscoveryHandler for DiscoveryService {
             (data.did.clone(), data.collection.clone(), data.rkey.clone())
         } else {
             return Ok(DiscoveryResponseVariant::Error(ErrorInfo {
-                message: "getRecord requires either `uri` or all of (did, collection, rkey)".to_owned(),
+                message: "getRecord requires either `uri` or all of (did, collection, rkey)"
+                    .to_owned(),
                 code: "INVALID_ARGUMENT".to_owned(),
                 details: String::new(),
             }));
@@ -1214,7 +4189,13 @@ impl DiscoveryHandler for DiscoveryService {
         let selectors: Vec<scheduling::LabelSelector> = data
             .selectors
             .iter()
-            .map(|s| scheduling::LabelSelector::new(s.key.clone(), to_scheduling_op(s.op), s.values.clone()))
+            .map(|s| {
+                scheduling::LabelSelector::new(
+                    s.key.clone(),
+                    to_scheduling_op(s.op),
+                    s.values.clone(),
+                )
+            })
             .collect();
         let resources: Vec<scheduling::ResourceRequest> = data
             .resources
@@ -1280,7 +4261,11 @@ impl DiscoveryHandler for DiscoveryService {
         ];
 
         let outcomes = scheduling::filter(&candidates, &predicates);
-        let survivors: Vec<&Candidate> = outcomes.iter().filter(|o| o.passed()).map(|o| o.candidate).collect();
+        let survivors: Vec<&Candidate> = outcomes
+            .iter()
+            .filter(|o| o.passed())
+            .map(|o| o.candidate)
+            .collect();
 
         // Per-candidate fail-closed authz — async, so it runs as its own pass
         // rather than inside a (sync) `scheduling::Predicate` closure. A denied
@@ -1328,10 +4313,12 @@ impl DiscoveryHandler for DiscoveryService {
             })
             .collect();
 
-        Ok(DiscoveryResponseVariant::QueryCandidatesResult(PlacementCandidateSet {
-            candidates: candidates_out,
-            total_matching,
-        }))
+        Ok(DiscoveryResponseVariant::QueryCandidatesResult(
+            PlacementCandidateSet {
+                candidates: candidates_out,
+                total_matching,
+            },
+        ))
     }
 
     /// #524 P1 — node liveness heartbeat. The auto-generated dispatch gate
@@ -1366,13 +4353,21 @@ impl DiscoveryHandler for DiscoveryService {
                 .map(|r| (r.name.clone(), r.quantity.clone()))
                 .collect(),
             load_fraction: data.load_fraction,
-            last_seen: if data.ts != 0 { data.ts } else { unix_millis_now() },
+            last_seen: if data.ts != 0 {
+                data.ts
+            } else {
+                unix_millis_now()
+            },
         };
         self.liveness.insert(data.node.clone(), live, LIVENESS_TTL);
 
         if self.placement_index.record_uri(&node_did).is_none() {
             if let Some(resolver) = &self.record_resolver {
-                if let Err(e) = self.placement_index.ingest_did(resolver.as_ref(), &node_did).await {
+                if let Err(e) = self
+                    .placement_index
+                    .ingest_did(resolver.as_ref(), &node_did)
+                    .await
+                {
                     tracing::warn!(
                         node = %node_did,
                         error = %e,
@@ -1493,10 +4488,10 @@ mod get_record_tests {
     ) -> (
         MockResolver,
         P256VerifyingKey,
-        String,             // target rkey
-        ModelRecord,        // target record
-        PdsCid,             // target record CID
-        Proof,              // target inclusion proof
+        String,      // target rkey
+        ModelRecord, // target record
+        PdsCid,      // target record CID
+        Proof,       // target inclusion proof
     ) {
         let signing_key = P256SigningKey::random(&mut rand::rngs::OsRng);
         let verifying_key = P256VerifyingKey::from(&signing_key);
@@ -1575,10 +4570,7 @@ mod get_record_tests {
         }
     }
 
-    fn service_with(
-        allow: Vec<(&str, &str)>,
-        resolver: MockResolver,
-    ) -> DiscoveryService {
+    fn service_with(allow: Vec<(&str, &str)>, resolver: MockResolver) -> DiscoveryService {
         let (sk, vk) = hyprstream_rpc::crypto::generate_signing_keypair();
         let allow = allow
             .into_iter()
@@ -1590,7 +4582,7 @@ mod get_record_tests {
             hyprstream_rpc::transport::TransportConfig::inproc("discovery-test"),
         )
         .with_auth_provider(Box::new(MockAuth { allow }))
-        .with_record_resolver(Box::new(resolver))
+        .with_record_resolver(Arc::new(resolver))
     }
 
     fn test_ctx() -> EnvelopeContext {
@@ -1741,20 +4733,26 @@ mod query_candidates_tests {
 
     use std::collections::BTreeMap;
 
+    use crate::generated::discovery_client::{LabelSelector, ResourceRequest, SelectorOp};
     use hyprstream_pds::car::build_car_v1;
     use hyprstream_pds::cid::Cid;
     use hyprstream_pds::commit::{Commit, UnsignedCommit};
     use hyprstream_pds::mst::Node;
     use hyprstream_pds::placement::node::{self, NodeRecord};
     use hyprstream_pds::tid::Tid;
-    use crate::generated::discovery_client::{LabelSelector, SelectorOp, ResourceRequest};
     use p256::ecdsa::SigningKey as P256SigningKey;
 
     /// Allows every (resource, operation) pair.
     struct AllowAll;
     #[async_trait(?Send)]
     impl AuthorizationProvider for AllowAll {
-        async fn check(&self, _subject: &str, _domain: &str, _resource: &str, _operation: &str) -> Result<bool> {
+        async fn check(
+            &self,
+            _subject: &str,
+            _domain: &str,
+            _resource: &str,
+            _operation: &str,
+        ) -> Result<bool> {
             Ok(true)
         }
     }
@@ -1764,7 +4762,13 @@ mod query_candidates_tests {
     struct DenyNode(String);
     #[async_trait(?Send)]
     impl AuthorizationProvider for DenyNode {
-        async fn check(&self, _subject: &str, _domain: &str, resource: &str, _operation: &str) -> Result<bool> {
+        async fn check(
+            &self,
+            _subject: &str,
+            _domain: &str,
+            resource: &str,
+            _operation: &str,
+        ) -> Result<bool> {
             Ok(resource != format!("placement:candidate:{}", self.0))
         }
     }
@@ -1776,14 +4780,19 @@ mod query_candidates_tests {
     }
     #[async_trait(?Send)]
     impl RecordResolver for FixedRepoResolver {
-        async fn resolve_record(&self, _did: &str, _collection: &str, _rkey: &str) -> Result<Option<RecordCarData>> {
+        async fn resolve_record(
+            &self,
+            _did: &str,
+            _collection: &str,
+            _rkey: &str,
+        ) -> Result<Option<RecordCarData>> {
             Ok(None)
         }
         async fn resolve_repo(&self, did: &str) -> Result<Option<RecordCarData>> {
-            Ok(self
-                .repos
-                .get(did)
-                .map(|car| RecordCarData { uri: format!("at://{did}"), car: car.clone() }))
+            Ok(self.repos.get(did).map(|car| RecordCarData {
+                uri: format!("at://{did}"),
+                car: car.clone(),
+            }))
         }
     }
 
@@ -1813,7 +4822,10 @@ mod query_candidates_tests {
             format!("at://{did}"),
             labels
                 .into_iter()
-                .map(|(k, v)| node::Label { key: k.to_owned(), value: v.to_owned() })
+                .map(|(k, v)| node::Label {
+                    key: k.to_owned(),
+                    value: v.to_owned(),
+                })
                 .collect(),
             vec![],
             vec![],
@@ -1822,7 +4834,10 @@ mod query_candidates_tests {
         .unwrap()
     }
 
-    fn service_with(auth: Box<dyn AuthorizationProvider>, repos: HashMap<String, Vec<u8>>) -> DiscoveryService {
+    fn service_with(
+        auth: Box<dyn AuthorizationProvider>,
+        repos: HashMap<String, Vec<u8>>,
+    ) -> DiscoveryService {
         let (sk, vk) = hyprstream_rpc::crypto::generate_signing_keypair();
         DiscoveryService::new(
             Arc::new(sk),
@@ -1830,29 +4845,47 @@ mod query_candidates_tests {
             hyprstream_rpc::transport::TransportConfig::inproc("query-candidates-test"),
         )
         .with_auth_provider(auth)
-        .with_record_resolver(Box::new(FixedRepoResolver { repos }))
+        .with_record_resolver(Arc::new(FixedRepoResolver { repos }))
     }
 
     fn test_ctx() -> EnvelopeContext {
         EnvelopeContext::from_callback_service(1, "test-caller")
     }
 
-    async fn heartbeat(svc: &DiscoveryService, did: &str, allocatable: Vec<(&str, &str)>, load_fraction: f32) {
+    async fn heartbeat(
+        svc: &DiscoveryService,
+        did: &str,
+        allocatable: Vec<(&str, &str)>,
+        load_fraction: f32,
+    ) {
         let req = NodeLiveness {
             node: Did::new(did.to_owned()),
             allocatable: allocatable
                 .into_iter()
-                .map(|(n, q)| Resource { name: n.to_owned(), quantity: q.to_owned() })
+                .map(|(n, q)| Resource {
+                    name: n.to_owned(),
+                    quantity: q.to_owned(),
+                })
                 .collect(),
             load_fraction,
             ts: 0,
         };
-        let resp = svc.handle_report_node_liveness(&test_ctx(), 1, &req).await.unwrap();
-        assert!(matches!(resp, DiscoveryResponseVariant::ReportNodeLivenessResult));
+        let resp = svc
+            .handle_report_node_liveness(&test_ctx(), 1, &req)
+            .await
+            .unwrap();
+        assert!(matches!(
+            resp,
+            DiscoveryResponseVariant::ReportNodeLivenessResult
+        ));
     }
 
     fn empty_query(max_candidates: u32) -> QueryCandidatesRequest {
-        QueryCandidatesRequest { selectors: vec![], resources: vec![], max_candidates }
+        QueryCandidatesRequest {
+            selectors: vec![],
+            resources: vec![],
+            max_candidates,
+        }
     }
 
     fn as_set(resp: DiscoveryResponseVariant) -> PlacementCandidateSet {
@@ -1868,9 +4901,16 @@ mod query_candidates_tests {
     async fn liveness_hard_excludes_nodes_never_heartbeated() {
         let did = "did:web:node1.example.com";
         let rec = sample_node_record(did, vec![("zone", "us-east")]);
-        let svc = service_with(Box::new(AllowAll), HashMap::from([(did.to_owned(), node_repo_car(did, &rec))]));
+        let svc = service_with(
+            Box::new(AllowAll),
+            HashMap::from([(did.to_owned(), node_repo_car(did, &rec))]),
+        );
 
-        let set = as_set(svc.handle_query_candidates(&test_ctx(), 1, &empty_query(0)).await.unwrap());
+        let set = as_set(
+            svc.handle_query_candidates(&test_ctx(), 1, &empty_query(0))
+                .await
+                .unwrap(),
+        );
         assert!(set.candidates.is_empty());
         assert_eq!(set.total_matching, 0);
     }
@@ -1880,8 +4920,14 @@ mod query_candidates_tests {
         let did_a = "did:web:node-a.example.com";
         let did_b = "did:web:node-b.example.com";
         let repos = HashMap::from([
-            (did_a.to_owned(), node_repo_car(did_a, &sample_node_record(did_a, vec![("zone", "us-east")]))),
-            (did_b.to_owned(), node_repo_car(did_b, &sample_node_record(did_b, vec![("zone", "us-west")]))),
+            (
+                did_a.to_owned(),
+                node_repo_car(did_a, &sample_node_record(did_a, vec![("zone", "us-east")])),
+            ),
+            (
+                did_b.to_owned(),
+                node_repo_car(did_b, &sample_node_record(did_b, vec![("zone", "us-west")])),
+            ),
         ]);
         let svc = service_with(Box::new(AllowAll), repos);
         heartbeat(&svc, did_a, vec![], 0.1).await;
@@ -1896,7 +4942,11 @@ mod query_candidates_tests {
             resources: vec![],
             max_candidates: 0,
         };
-        let set = as_set(svc.handle_query_candidates(&test_ctx(), 1, &req).await.unwrap());
+        let set = as_set(
+            svc.handle_query_candidates(&test_ctx(), 1, &req)
+                .await
+                .unwrap(),
+        );
         assert_eq!(set.candidates.len(), 1);
         assert_eq!(set.candidates[0].node, did_a);
         assert_eq!(set.total_matching, 1);
@@ -1906,24 +4956,44 @@ mod query_candidates_tests {
     async fn resource_request_filters_insufficient_live_capacity() {
         let did = "did:web:node1.example.com";
         let rec = sample_node_record(did, vec![]);
-        let svc = service_with(Box::new(AllowAll), HashMap::from([(did.to_owned(), node_repo_car(did, &rec))]));
+        let svc = service_with(
+            Box::new(AllowAll),
+            HashMap::from([(did.to_owned(), node_repo_car(did, &rec))]),
+        );
         heartbeat(&svc, did, vec![("nvidia.com/gpu", "2")], 0.1).await;
 
         let req = QueryCandidatesRequest {
             selectors: vec![],
-            resources: vec![ResourceRequest { name: "nvidia.com/gpu".to_owned(), min_quantity: "4".to_owned() }],
+            resources: vec![ResourceRequest {
+                name: "nvidia.com/gpu".to_owned(),
+                min_quantity: "4".to_owned(),
+            }],
             max_candidates: 0,
         };
-        let set = as_set(svc.handle_query_candidates(&test_ctx(), 1, &req).await.unwrap());
-        assert!(set.candidates.is_empty(), "2 GPUs must not satisfy a request for >=4");
+        let set = as_set(
+            svc.handle_query_candidates(&test_ctx(), 1, &req)
+                .await
+                .unwrap(),
+        );
+        assert!(
+            set.candidates.is_empty(),
+            "2 GPUs must not satisfy a request for >=4"
+        );
 
         // A satisfiable request against the same live report succeeds.
         let req_ok = QueryCandidatesRequest {
             selectors: vec![],
-            resources: vec![ResourceRequest { name: "nvidia.com/gpu".to_owned(), min_quantity: "1".to_owned() }],
+            resources: vec![ResourceRequest {
+                name: "nvidia.com/gpu".to_owned(),
+                min_quantity: "1".to_owned(),
+            }],
             max_candidates: 0,
         };
-        let set_ok = as_set(svc.handle_query_candidates(&test_ctx(), 1, &req_ok).await.unwrap());
+        let set_ok = as_set(
+            svc.handle_query_candidates(&test_ctx(), 1, &req_ok)
+                .await
+                .unwrap(),
+        );
         assert_eq!(set_ok.candidates.len(), 1);
     }
 
@@ -1934,23 +5004,37 @@ mod query_candidates_tests {
         let did_a = "did:web:node-a.example.com";
         let did_b = "did:web:node-b.example.com";
         let repos = HashMap::from([
-            (did_a.to_owned(), node_repo_car(did_a, &sample_node_record(did_a, vec![]))),
-            (did_b.to_owned(), node_repo_car(did_b, &sample_node_record(did_b, vec![]))),
+            (
+                did_a.to_owned(),
+                node_repo_car(did_a, &sample_node_record(did_a, vec![])),
+            ),
+            (
+                did_b.to_owned(),
+                node_repo_car(did_b, &sample_node_record(did_b, vec![])),
+            ),
         ]);
         let svc = service_with(Box::new(DenyNode(did_a.to_owned())), repos);
         heartbeat(&svc, did_a, vec![], 0.1).await;
         heartbeat(&svc, did_b, vec![], 0.1).await;
 
-        let resp = svc.handle_query_candidates(&test_ctx(), 1, &empty_query(0)).await.unwrap();
+        let resp = svc
+            .handle_query_candidates(&test_ctx(), 1, &empty_query(0))
+            .await
+            .unwrap();
         let set = as_set(resp);
         assert_eq!(set.candidates.len(), 1);
         assert_eq!(set.candidates[0].node, did_b);
-        assert_eq!(set.total_matching, 1, "denied candidate must not inflate totalMatching");
+        assert_eq!(
+            set.total_matching, 1,
+            "denied candidate must not inflate totalMatching"
+        );
     }
 
     #[tokio::test]
     async fn bounding_respects_max_candidates_and_total_matching_is_pre_bound() {
-        let dids: Vec<String> = (0..5).map(|i| format!("did:web:node{i}.example.com")).collect();
+        let dids: Vec<String> = (0..5)
+            .map(|i| format!("did:web:node{i}.example.com"))
+            .collect();
         let mut repos = HashMap::new();
         for d in &dids {
             repos.insert(d.clone(), node_repo_car(d, &sample_node_record(d, vec![])));
@@ -1960,9 +5044,16 @@ mod query_candidates_tests {
             heartbeat(&svc, d, vec![], i as f32 * 0.1).await;
         }
 
-        let set = as_set(svc.handle_query_candidates(&test_ctx(), 1, &empty_query(2)).await.unwrap());
+        let set = as_set(
+            svc.handle_query_candidates(&test_ctx(), 1, &empty_query(2))
+                .await
+                .unwrap(),
+        );
         assert_eq!(set.candidates.len(), 2, "bounded to maxCandidates");
-        assert_eq!(set.total_matching, 5, "totalMatching counts all authorized survivors, not just the bound");
+        assert_eq!(
+            set.total_matching, 5,
+            "totalMatching counts all authorized survivors, not just the bound"
+        );
         // Ranked ascending by load_fraction: node0 (0.0) then node1 (0.1).
         assert_eq!(set.candidates[0].node, dids[0]);
         assert_eq!(set.candidates[1].node, dids[1]);
@@ -1970,7 +5061,9 @@ mod query_candidates_tests {
 
     #[tokio::test]
     async fn zero_max_candidates_uses_default_bound() {
-        let dids: Vec<String> = (0..3).map(|i| format!("did:web:node{i}.example.com")).collect();
+        let dids: Vec<String> = (0..3)
+            .map(|i| format!("did:web:node{i}.example.com"))
+            .collect();
         let mut repos = HashMap::new();
         for d in &dids {
             repos.insert(d.clone(), node_repo_car(d, &sample_node_record(d, vec![])));
@@ -1979,21 +5072,39 @@ mod query_candidates_tests {
         for d in &dids {
             heartbeat(&svc, d, vec![], 0.0).await;
         }
-        let set = as_set(svc.handle_query_candidates(&test_ctx(), 1, &empty_query(0)).await.unwrap());
-        assert_eq!(set.candidates.len(), 3, "under the default bound, all 3 come back");
+        let set = as_set(
+            svc.handle_query_candidates(&test_ctx(), 1, &empty_query(0))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            set.candidates.len(),
+            3,
+            "under the default bound, all 3 come back"
+        );
     }
 
     #[tokio::test]
     async fn heartbeat_refreshes_ttl_and_liveness_fields() {
         let did = "did:web:node1.example.com";
         let rec = sample_node_record(did, vec![]);
-        let svc = service_with(Box::new(AllowAll), HashMap::from([(did.to_owned(), node_repo_car(did, &rec))]));
+        let svc = service_with(
+            Box::new(AllowAll),
+            HashMap::from([(did.to_owned(), node_repo_car(did, &rec))]),
+        );
         heartbeat(&svc, did, vec![("cpu", "1")], 0.9).await;
         heartbeat(&svc, did, vec![("cpu", "8")], 0.1).await;
 
-        let set = as_set(svc.handle_query_candidates(&test_ctx(), 1, &empty_query(0)).await.unwrap());
+        let set = as_set(
+            svc.handle_query_candidates(&test_ctx(), 1, &empty_query(0))
+                .await
+                .unwrap(),
+        );
         assert_eq!(set.candidates.len(), 1);
-        assert!((set.candidates[0].load_fraction - 0.1).abs() < f32::EPSILON, "second heartbeat must win");
+        assert!(
+            (set.candidates[0].load_fraction - 0.1).abs() < f32::EPSILON,
+            "second heartbeat must win"
+        );
         assert_eq!(set.candidates[0].allocatable[0].quantity, "8");
     }
 }

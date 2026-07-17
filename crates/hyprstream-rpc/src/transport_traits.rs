@@ -8,6 +8,35 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::Stream;
 
+/// A transport failure proven to have occurred before any request bytes were
+/// dispatched. Only this marker is safe for automatic endpoint retry.
+#[derive(Debug)]
+pub struct PreDispatchTransportError(anyhow::Error);
+
+impl PreDispatchTransportError {
+    pub fn new(error: anyhow::Error) -> Self {
+        Self(error)
+    }
+}
+
+impl std::fmt::Display for PreDispatchTransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "pre-dispatch transport failure: {}", self.0)
+    }
+}
+
+impl std::error::Error for PreDispatchTransportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+pub fn is_pre_dispatch_transport_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<PreDispatchTransportError>().is_some())
+}
+
 /// Signing abstraction for Ed25519 envelope signatures.
 ///
 /// Native: `LocalSigner` owns the `SigningKey` and signs synchronously.

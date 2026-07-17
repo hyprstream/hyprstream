@@ -227,7 +227,7 @@ async fn spawn_services(repo_dir: &std::path::Path, repo_name: &str) -> Result<S
         .map_err(|e| anyhow!("spawn policy: {e}"))?;
 
     // PolicyClient used by RegistryService for authz checks.
-    let policy_client = PolicyClient::for_endpoint(
+    let policy_client = PolicyClient::for_local_endpoint_bootstrap(
         &policy_endpoint,
         signing_key.clone(),
         signing_key.verifying_key(),
@@ -293,7 +293,7 @@ async fn spawn_services(repo_dir: &std::path::Path, repo_name: &str) -> Result<S
         .await
         .map_err(|e| anyhow!("spawn registry: {e}"))?;
 
-    let registry_client = RegistryClient::for_endpoint(
+    let registry_client = RegistryClient::for_local_endpoint_bootstrap(
         &registry_endpoint,
         signing_key.clone(),
         signing_key.verifying_key(),

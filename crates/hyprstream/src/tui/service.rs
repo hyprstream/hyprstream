@@ -824,46 +824,14 @@ impl TuiService {
 
         let registry_models_dir = std::path::PathBuf::from(registry_dir);
 
-        // Resolve peer service keys via PolicyClient.
-        let policy_vk = hyprstream_service::global_trust_store()
-            .resolve_one("policy")
-            .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-        let policy_client = PolicyClient::for_service(
-            self.signing_key.clone(),
-            policy_vk,
-            None,
-        )?;
-
-        let registry_key_resp = policy_client.resolve_service_key(
-            &crate::services::generated::policy_client::ResolveServiceKey {
-                service_name: "registry".to_owned(),
-            },
-        ).await.map_err(|e| anyhow::anyhow!("Failed to resolve registry key: {e}"))?;
-        let registry_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
-            registry_key_resp.verifying_key.as_slice().try_into()
-                .map_err(|_| anyhow::anyhow!("Invalid registry key length"))?,
-        ).map_err(|e| anyhow::anyhow!("Invalid registry key: {e}"))?;
-
-        let model_key_resp = policy_client.resolve_service_key(
-            &crate::services::generated::policy_client::ResolveServiceKey {
-                service_name: "model".to_owned(),
-            },
-        ).await.map_err(|e| anyhow::anyhow!("Failed to resolve model key: {e}"))?;
-        let model_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
-            model_key_resp.verifying_key.as_slice().try_into()
-                .map_err(|_| anyhow::anyhow!("Invalid model key length"))?,
-        ).map_err(|e| anyhow::anyhow!("Invalid model key: {e}"))?;
-
         let models = {
             let registry_client: crate::services::RegistryClient =
-                crate::services::RegistryClient::for_service(
+                crate::services::RegistryClient::from_resolver(
                     self.signing_key.clone(),
-                    registry_vk,
                     None,
                 )?;
-            let model_client_for_status = crate::services::generated::model_client::ModelClient::for_service(
+            let model_client_for_status = crate::services::generated::model_client::ModelClient::from_resolver(
                 self.signing_key.clone(),
-                model_vk,
                 None,
             )?;
             let status_timeout = std::time::Duration::from_millis(500);
@@ -906,18 +874,15 @@ impl TuiService {
         let handle = tokio::runtime::Handle::current();
         let sk_load = self.signing_key.clone();
         let handle_load = handle.clone();
-        let model_vk_load = model_vk;
         let load_fn: Box<dyn Fn(&str, hyprstream_tui::shell_app::ModelStatusSender) + Send> =
             Box::new(move |model_ref: &str, tx: hyprstream_tui::shell_app::ModelStatusSender| {
                 let sk  = sk_load.clone();
                 let mr  = model_ref.to_owned();
                 let h   = handle_load.clone();
-                let vk  = model_vk_load;
                 // Submit load — returns "accepted" immediately (Continuation pattern).
                 h.block_on(async {
-                    let client = match crate::services::generated::model_client::ModelClient::for_service(
+                    let client = match crate::services::generated::model_client::ModelClient::from_resolver(
                         sk.clone(),
-                        vk,
                         None,
                     ) {
                         Ok(c) => c,
@@ -936,14 +901,12 @@ impl TuiService {
                 let sk_poll = sk.clone();
                 let mr_poll = mr.clone();
                 let h_poll  = h.clone();
-                let vk_poll = vk;
                 std::thread::spawn(move || {
                     for _ in 0..60u32 {   // max ~2 minutes (60 × 2 s)
                         std::thread::sleep(std::time::Duration::from_secs(2));
                         let loaded = h_poll.block_on(async {
-                            let client = match crate::services::generated::model_client::ModelClient::for_service(
+                            let client = match crate::services::generated::model_client::ModelClient::from_resolver(
                                 sk_poll.clone(),
-                                vk_poll,
                                 None,
                             ) {
                                 Ok(c) => c,
@@ -966,14 +929,12 @@ impl TuiService {
             });
         let sk_unload = self.signing_key.clone();
         let handle_unload = handle.clone();
-        let model_vk_unload = model_vk;
         let unload_fn: Box<dyn Fn(&str) -> bool + Send> = Box::new(move |model_ref: &str| {
             let sk = sk_unload.clone();
             let mr = model_ref.to_owned();
             handle_unload.block_on(async move {
-                let client = match crate::services::generated::model_client::ModelClient::for_service(
+                let client = match crate::services::generated::model_client::ModelClient::from_resolver(
                     sk.clone(),
-                    model_vk_unload,
                     None,
                 ) {
                     Ok(c) => c,
@@ -993,16 +954,14 @@ impl TuiService {
 
             let sk_clone = self.signing_key.clone();
             let h_clone = handle.clone();
-            let rvk_clone = registry_vk;
             let rmd_clone = registry_models_dir.clone();
             let clone_fn: hyprstream_tui::shell_app::CloneFn = Box::new(move |url, name, branch, tx: GitProgressSender| {
                 let sk = sk_clone.clone();
                 let h = h_clone.clone();
-                let rvk = rvk_clone;
                 let rmd = rmd_clone.clone();
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = match crate::services::RegistryClient::for_service(sk, rvk, None) {
+                        let registry = match crate::services::RegistryClient::from_resolver(sk, None) {
                             Ok(c) => c,
                             Err(e) => {
                                 let _ = tx.send(GitOpProgress::Failed(format!("Failed to create RegistryClient: {e}")));
@@ -1096,14 +1055,12 @@ impl TuiService {
 
             let sk_pull = self.signing_key.clone();
             let h_pull = handle.clone();
-            let rvk_pull = registry_vk;
             let pull_fn: hyprstream_tui::shell_app::PullFn = Box::new(move |model_ref, tx: GitProgressSender| {
                 let sk = sk_pull.clone();
                 let h = h_pull.clone();
-                let rvk = rvk_pull;
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = match crate::services::RegistryClient::for_service(sk, rvk, None) {
+                        let registry = match crate::services::RegistryClient::from_resolver(sk, None) {
                             Ok(c) => c,
                             Err(e) => {
                                 let _ = tx.send(GitOpProgress::Failed(format!("Failed to create RegistryClient: {e}")));
@@ -1137,14 +1094,12 @@ impl TuiService {
 
             let sk_push = self.signing_key.clone();
             let h_push = handle.clone();
-            let rvk_push = registry_vk;
             let push_fn: hyprstream_tui::shell_app::PushFn = Box::new(move |model_ref, tx: GitProgressSender| {
                 let sk = sk_push.clone();
                 let h = h_push.clone();
-                let rvk = rvk_push;
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = match crate::services::RegistryClient::for_service(sk, rvk, None) {
+                        let registry = match crate::services::RegistryClient::from_resolver(sk, None) {
                             Ok(c) => c,
                             Err(e) => {
                                 let _ = tx.send(GitOpProgress::Failed(format!("Failed to create RegistryClient: {e}")));
@@ -1184,14 +1139,12 @@ impl TuiService {
 
             let sk_status = self.signing_key.clone();
             let h_status = handle.clone();
-            let rvk_status = registry_vk;
             let fetch_status_fn: hyprstream_tui::shell_app::FetchStatusFn = Box::new(move |model_refs, tx| {
                 let sk = sk_status.clone();
                 let h = h_status.clone();
-                let rvk = rvk_status;
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry = match crate::services::RegistryClient::for_service(sk, rvk, None) {
+                        let registry = match crate::services::RegistryClient::from_resolver(sk, None) {
                             Ok(c) => c,
                             Err(e) => {
                                 tracing::warn!("Failed to create RegistryClient: {e}");
@@ -1213,25 +1166,21 @@ impl TuiService {
 
             let sk_refresh = self.signing_key.clone();
             let h_refresh = handle.clone();
-            let rvk_refresh = registry_vk;
-            let mvk_refresh = model_vk;
             let rmd_refresh = registry_models_dir.clone();
             let refresh_fn: hyprstream_tui::shell_app::RefreshFn = Box::new(move |tx: GitProgressSender| {
                 let sk = sk_refresh.clone();
                 let h = h_refresh.clone();
-                let rvk = rvk_refresh;
-                let mvk = mvk_refresh;
                 let rmd = rmd_refresh.clone();
                 std::thread::spawn(move || {
                     h.block_on(async {
-                        let registry_client = match crate::services::RegistryClient::for_service(sk.clone(), rvk, None) {
+                        let registry_client = match crate::services::RegistryClient::from_resolver(sk.clone(), None) {
                             Ok(c) => c,
                             Err(e) => {
                                 tracing::warn!("model-list refresh: RegistryClient: {e}");
                                 return;
                             }
                         };
-                        let model_client = match crate::services::generated::model_client::ModelClient::for_service(sk, mvk, None) {
+                        let model_client = match crate::services::generated::model_client::ModelClient::from_resolver(sk, None) {
                             Ok(c) => c,
                             Err(e) => {
                                 tracing::warn!("model-list refresh: ModelClient: {e}");

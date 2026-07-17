@@ -131,7 +131,9 @@ impl Transport for LazyQuinnTransport {
     type Pub = QuinnPublishStub;
 
     async fn send(&self, payload: Vec<u8>, timeout_ms: Option<i32>) -> Result<Vec<u8>> {
-        let transport = self.connected().await?;
+        let transport = self.connected().await.map_err(|error| {
+            crate::transport_traits::PreDispatchTransportError::new(error)
+        })?;
 
         // Make *our* deadline authoritative so we can tell a per-request timeout
         // (the connection is probably fine — keep it) apart from a transport-fatal

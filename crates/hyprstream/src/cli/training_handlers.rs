@@ -395,23 +395,9 @@ pub async fn handle_training_infer(
     let mut service_handle = spawner.spawn(service_config).await
         .map_err(|e| anyhow::anyhow!("Failed to spawn inference service: {}", e))?;
 
-    // Create client for service communication — resolve inference key via PolicyService
-    let policy_vk = signing_key.verifying_key();
-    let policy_client = crate::services::PolicyClient::for_service(
-        signing_key.clone(), policy_vk, None,
-    )?;
-    let key_resp = policy_client.resolve_service_key(
-        &crate::services::generated::policy_client::ResolveServiceKey {
-            service_name: "inference".to_owned(),
-        },
-    ).await.map_err(|e| anyhow::anyhow!("Failed to resolve inference key: {e}"))?;
-    let inference_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
-        key_resp.verifying_key.as_slice().try_into()
-            .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
-    ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?;
-    let client = InferenceClient::for_service(
+    let client = InferenceClient::for_local_bootstrap(
         signing_key.clone(),
-        inference_vk,
+        signing_key.verifying_key(),
         None,
     )?;
 
@@ -703,23 +689,9 @@ pub async fn handle_training_batch(
     let mut service_handle = spawner.spawn(service_config).await
         .map_err(|e| anyhow::anyhow!("Failed to spawn inference service: {}", e))?;
 
-    // Resolve inference key via PolicyService
-    let policy_vk = signing_key.verifying_key();
-    let policy_client = crate::services::PolicyClient::for_service(
-        signing_key.clone(), policy_vk, None,
-    )?;
-    let key_resp = policy_client.resolve_service_key(
-        &crate::services::generated::policy_client::ResolveServiceKey {
-            service_name: "inference".to_owned(),
-        },
-    ).await.map_err(|e| anyhow::anyhow!("Failed to resolve inference key: {e}"))?;
-    let inference_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
-        key_resp.verifying_key.as_slice().try_into()
-            .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
-    ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?;
-    let client = InferenceClient::for_service(
+    let client = InferenceClient::for_local_bootstrap(
         signing_key.clone(),
-        inference_vk,
+        signing_key.verifying_key(),
         None,
     )?;
 

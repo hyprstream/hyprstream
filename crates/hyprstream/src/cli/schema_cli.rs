@@ -12,13 +12,11 @@ use ed25519_dalek::SigningKey;
 use hyprstream_service::ScopedClientTreeNode;
 use serde_json::Value;
 
-use crate::services::generated::{
-    inference_client, model_client, policy_client, registry_client,
-};
-use hyprstream_workers::generated::{worker_client, workflow_client};
-use crate::services::{PolicyClient, RegistryClient};
 use crate::services::generated::inference_client::InferenceClient;
 use crate::services::generated::model_client::ModelClient;
+use crate::services::generated::{inference_client, model_client, policy_client, registry_client};
+use crate::services::{PolicyClient, RegistryClient};
+use hyprstream_workers::generated::{worker_client, workflow_client};
 use hyprstream_workers::runtime::WorkerClient;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -212,13 +210,17 @@ fn build_method_command(method: &MethodView) -> Command {
 ///
 /// Usage: `hyprstream tool <service> [scope <id>] <method> [--param value ...]`
 pub fn build_tool_command() -> Command {
-    let mut tool = Command::new("tool")
-        .about("Direct RPC tool access (schema-driven, mirrors MCP tools)");
+    let mut tool =
+        Command::new("tool").about("Direct RPC tool access (schema-driven, mirrors MCP tools)");
 
     // Registry service
     let registry_methods = extract_methods!(registry_client::schema_metadata());
     let registry_tree = registry_client::scoped_client_tree();
-    tool = tool.subcommand(build_service_command("registry", &registry_methods, registry_tree));
+    tool = tool.subcommand(build_service_command(
+        "registry",
+        &registry_methods,
+        registry_tree,
+    ));
 
     // Model service
     let model_methods = extract_methods!(model_client::schema_metadata());
@@ -228,35 +230,49 @@ pub fn build_tool_command() -> Command {
     // Inference service (standalone, no scoped)
     let inference_methods = extract_methods!(inference_client::schema_metadata());
     let inference_tree = inference_client::scoped_client_tree();
-    tool = tool.subcommand(build_service_command("inference", &inference_methods, inference_tree));
+    tool = tool.subcommand(build_service_command(
+        "inference",
+        &inference_methods,
+        inference_tree,
+    ));
 
     // Policy service (standalone, no scoped)
     let policy_methods = extract_methods!(policy_client::schema_metadata());
     let policy_tree = policy_client::scoped_client_tree();
-    tool = tool.subcommand(build_service_command("policy", &policy_methods, policy_tree));
+    tool = tool.subcommand(build_service_command(
+        "policy",
+        &policy_methods,
+        policy_tree,
+    ));
 
     // Worker service + CRI-aligned scoped resources
     let worker_methods = extract_methods!(worker_client::schema_metadata());
     let worker_tree = worker_client::scoped_client_tree();
-    tool = tool.subcommand(build_service_command("worker", &worker_methods, worker_tree));
+    tool = tool.subcommand(build_service_command(
+        "worker",
+        &worker_methods,
+        worker_tree,
+    ));
 
     // Workflow service
     let workflow_methods = extract_methods!(workflow_client::schema_metadata());
     let workflow_tree = workflow_client::scoped_client_tree();
-    tool = tool.subcommand(build_service_command("workflow", &workflow_methods, workflow_tree));
+    tool = tool.subcommand(build_service_command(
+        "workflow",
+        &workflow_methods,
+        workflow_tree,
+    ));
 
     tool
 }
 
 /// Handle a `tool` subcommand by extracting the service name and delegating.
 pub async fn handle_tool_command(matches: &ArgMatches, signing_key: SigningKey) -> Result<()> {
-    let (service_name, service_matches) = matches
-        .subcommand()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "No service specified. Use: tool <registry|model|inference|policy|worker|workflow> ..."
-            )
-        })?;
+    let (service_name, service_matches) = matches.subcommand().ok_or_else(|| {
+        anyhow::anyhow!(
+            "No service specified. Use: tool <registry|model|inference|policy|worker|workflow> ..."
+        )
+    })?;
     handle_schema_command(service_name, service_matches, signing_key).await
 }
 
@@ -315,7 +331,11 @@ pub async fn handle_schema_command(
                 .ok_or_else(|| anyhow::anyhow!("No method provided"))?;
 
             // Check if next_name is a nested scope
-            if let Some(nested_node) = current_node.nested.iter().find(|n| n.scope_name == next_name) {
+            if let Some(nested_node) = current_node
+                .nested
+                .iter()
+                .find(|n| n.scope_name == next_name)
+            {
                 // It's a deeper scope level
                 if !nested_node.scope_field.is_empty() {
                     let nested_id = next_matches
@@ -334,7 +354,11 @@ pub async fn handle_schema_command(
                 let args = matches_to_json(next_matches, &methods, &method_snake);
 
                 let result = dispatch_scoped_dynamic(
-                    service_name, &scope_chain, &method_snake, &args, signing_key,
+                    service_name,
+                    &scope_chain,
+                    &method_snake,
+                    &args,
+                    signing_key,
                 )
                 .await?;
 
@@ -355,29 +379,6 @@ pub async fn handle_schema_command(
     Ok(())
 }
 
-/// Resolve a service verifying key via PolicyService.
-///
-/// Creates a PolicyClient using the root key (inproc mode) and resolves the
-/// given service name to its verifying key.
-async fn resolve_key_via_policy(
-    signing_key: &SigningKey,
-    service_name: &str,
-) -> Result<hyprstream_rpc::crypto::VerifyingKey> {
-    let policy_vk = signing_key.verifying_key();
-    let policy_client = PolicyClient::for_service(
-        signing_key.clone(), policy_vk, None,
-    )?;
-    let resp = policy_client.resolve_service_key(
-        &crate::services::generated::policy_client::ResolveServiceKey {
-            service_name: service_name.to_owned(),
-        },
-    ).await.map_err(|e| anyhow::anyhow!("Failed to resolve key for '{}': {e}", service_name))?;
-    hyprstream_rpc::crypto::VerifyingKey::from_bytes(
-        resp.verifying_key.as_slice().try_into()
-            .map_err(|_| anyhow::anyhow!("Invalid key length for '{}'", service_name))?,
-    ).map_err(|e| anyhow::anyhow!("Invalid key for '{}': {e}", service_name))
-}
-
 /// Dispatch a top-level (non-scoped) method call.
 async fn dispatch_top_level(
     service: &str,
@@ -387,33 +388,30 @@ async fn dispatch_top_level(
 ) -> Result<Value> {
     match service {
         "registry" => {
-            let server_vk = resolve_key_via_policy(&signing_key, "registry").await?;
-            let client: RegistryClient = RegistryClient::for_service(
-                signing_key, server_vk, None,
-            )?;
+            let client: RegistryClient = RegistryClient::from_resolver(signing_key, None)?;
             client.call_method(method, args).await
         }
         "model" => {
-            let server_vk = resolve_key_via_policy(&signing_key, "model").await?;
-            let client = ModelClient::for_service(signing_key, server_vk, None)?;
+            let client = ModelClient::from_resolver(signing_key, None)?;
             client.call_method(method, args).await
         }
         "inference" => {
-            let server_vk = resolve_key_via_policy(&signing_key, "inference").await?;
-            let client = InferenceClient::for_service(signing_key, server_vk, None)?;
+            let client = InferenceClient::from_resolver(signing_key, None)?;
             client.call_method(method, args).await
         }
         "policy" => {
             // Bootstrap: PolicyService uses the root key
             let server_vk = signing_key.verifying_key();
-            let client = PolicyClient::for_service(signing_key, server_vk, None)?;
+            let client = PolicyClient::for_local_bootstrap(signing_key, server_vk, None)?;
             client.call_method(method, args).await
         }
         "worker" => {
             bail!("Worker service has no top-level methods. Use: tool worker <runtime|sandbox|container|image> <method>")
         }
         "workflow" => {
-            bail!("Workflow service is not yet registered. Service factory needs to be implemented.")
+            bail!(
+                "Workflow service is not yet registered. Service factory needs to be implemented."
+            )
         }
         _ => bail!("Unknown service: {}", service),
     }
@@ -429,20 +427,15 @@ async fn dispatch_scoped_dynamic(
 ) -> Result<Value> {
     match service {
         "registry" => {
-            let server_vk = resolve_key_via_policy(&signing_key, "registry").await?;
-            let client: RegistryClient = RegistryClient::for_service(
-                signing_key, server_vk, None,
-            )?;
+            let client: RegistryClient = RegistryClient::from_resolver(signing_key, None)?;
             client.call_scoped_method(scope_chain, method, args).await
         }
         "model" => {
-            let server_vk = resolve_key_via_policy(&signing_key, "model").await?;
-            let client = ModelClient::for_service(signing_key, server_vk, None)?;
+            let client = ModelClient::from_resolver(signing_key, None)?;
             client.call_scoped_method(scope_chain, method, args).await
         }
         "worker" => {
-            let server_vk = resolve_key_via_policy(&signing_key, "worker").await?;
-            let client = WorkerClient::for_service(signing_key, server_vk, None)?;
+            let client = WorkerClient::from_resolver(signing_key, None)?;
             client.call_scoped_method(scope_chain, method, args).await
         }
         _ => bail!("Service '{}' has no scoped methods", service),
@@ -516,18 +509,25 @@ fn matches_to_json(matches: &ArgMatches, methods: &[MethodView], method_name: &s
 fn coerce_value(s: &str, type_name: &str) -> Value {
     match type_name {
         "Bool" => Value::Bool(s.parse().unwrap_or(false)),
-        "UInt8" | "UInt16" | "UInt32" | "UInt64" => {
-            s.parse::<u64>().map(Value::from).unwrap_or_else(|_| Value::String(s.to_owned()))
-        }
-        "Int8" | "Int16" | "Int32" | "Int64" => {
-            s.parse::<i64>().map(Value::from).unwrap_or_else(|_| Value::String(s.to_owned()))
-        }
-        "Float32" | "Float64" => {
-            s.parse::<f64>().map(Value::from).unwrap_or_else(|_| Value::String(s.to_owned()))
-        }
+        "UInt8" | "UInt16" | "UInt32" | "UInt64" => s
+            .parse::<u64>()
+            .map(Value::from)
+            .unwrap_or_else(|_| Value::String(s.to_owned())),
+        "Int8" | "Int16" | "Int32" | "Int64" => s
+            .parse::<i64>()
+            .map(Value::from)
+            .unwrap_or_else(|_| Value::String(s.to_owned())),
+        "Float32" | "Float64" => s
+            .parse::<f64>()
+            .map(Value::from)
+            .unwrap_or_else(|_| Value::String(s.to_owned())),
         _ if type_name.starts_with("List(") => {
             // Split comma-separated values into a JSON array
-            Value::Array(s.split(',').map(|v| Value::String(v.trim().to_owned())).collect())
+            Value::Array(
+                s.split(',')
+                    .map(|v| Value::String(v.trim().to_owned()))
+                    .collect(),
+            )
         }
         _ => Value::String(s.to_owned()),
     }
@@ -577,7 +577,11 @@ fn format_array_as_table(arr: &[Value]) -> String {
             if i > 0 {
                 out.push_str("  ");
             }
-            out.push_str(&format!("{:<width$}", key.to_uppercase(), width = widths[i]));
+            out.push_str(&format!(
+                "{:<width$}",
+                key.to_uppercase(),
+                width = widths[i]
+            ));
         }
         out.push('\n');
 
@@ -660,8 +664,6 @@ fn format_cell(value: Option<&Value>) -> String {
                 .collect();
             items.join(", ")
         }
-        Some(Value::Object(obj)) => {
-            serde_json::to_string(obj).unwrap_or_else(|_| "{}".to_owned())
-        }
+        Some(Value::Object(obj)) => serde_json::to_string(obj).unwrap_or_else(|_| "{}".to_owned()),
     }
 }

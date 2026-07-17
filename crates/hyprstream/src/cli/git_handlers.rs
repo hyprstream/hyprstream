@@ -1336,24 +1336,8 @@ pub async fn handle_infer(
     let _ = ModelRef::parse(model_ref_str)?;
 
     // ModelService is already running (started by main.rs in inproc mode, or by systemd in ipc-systemd mode).
-    let model_server_vk = {
-        let policy_vk = signing_key.verifying_key();
-        let policy_client = crate::services::PolicyClient::for_service(
-            signing_key.clone(), policy_vk, None,
-        )?;
-        let resp = policy_client.resolve_service_key(
-            &crate::services::generated::policy_client::ResolveServiceKey {
-                service_name: "model".to_owned(),
-            },
-        ).await.map_err(|e| anyhow::anyhow!("Failed to resolve model key: {e}"))?;
-        hyprstream_rpc::crypto::VerifyingKey::from_bytes(
-            resp.verifying_key.as_slice().try_into()
-                .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
-        ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?
-    };
-    let model_client = ModelClient::for_service(
+    let model_client = ModelClient::from_resolver(
         signing_key.clone(),
-        model_server_vk,
         None,
     )?;
 
@@ -1508,23 +1492,9 @@ pub async fn handle_load(
     let load_max_context = max_context.map(|v| v as u32);
     let load_kv_quant = if kv_quant == crate::runtime::KVQuantType::None { None } else { Some(kv_quant) };
 
-    let policy_vk = signing_key.verifying_key();
-    let policy_client = crate::services::PolicyClient::for_service(
-        signing_key.clone(), policy_vk, None,
-    )?;
-
     // Issue the load RPC directly (returns immediately - Continuation pattern).
-    let model_key_resp = policy_client.resolve_service_key(
-        &crate::services::generated::policy_client::ResolveServiceKey {
-            service_name: "model".to_owned(),
-        },
-    ).await.map_err(|e| anyhow::anyhow!("Failed to resolve model key: {e}"))?;
-    let model_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
-        model_key_resp.verifying_key.as_slice().try_into()
-            .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
-    ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?;
-    let model_client = ModelClient::for_service(
-        signing_key.clone(), model_vk, None,
+    let model_client = ModelClient::from_resolver(
+        signing_key.clone(), None,
     )?;
     match model_client.load(&LoadModelRequest {
         model_ref: model_ref_str.to_owned(),
@@ -1736,22 +1706,7 @@ pub async fn handle_unload(
     // Validate model reference format
     let _ = ModelRef::parse(model_ref_str)?;
 
-    let model_server_vk = {
-        let policy_vk = signing_key.verifying_key();
-        let policy_client = crate::services::PolicyClient::for_service(
-            signing_key.clone(), policy_vk, None,
-        )?;
-        let resp = policy_client.resolve_service_key(
-            &crate::services::generated::policy_client::ResolveServiceKey {
-                service_name: "model".to_owned(),
-            },
-        ).await.map_err(|e| anyhow::anyhow!("Failed to resolve model key: {e}"))?;
-        hyprstream_rpc::crypto::VerifyingKey::from_bytes(
-            resp.verifying_key.as_slice().try_into()
-                .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
-        ).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?
-    };
-    let model_client = ModelClient::for_service(signing_key, model_server_vk, None)?;
+    let model_client = ModelClient::from_resolver(signing_key, None)?;
 
     model_client.unload(&UnloadModelRequest { model_ref: model_ref_str.to_owned() }).await?;
 

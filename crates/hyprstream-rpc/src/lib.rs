@@ -252,7 +252,16 @@ pub use error::{EnvelopeError, EnvelopeResult, Result, RpcError};
 pub use hyprstream_rpc_derive::{authorize, service_factory, FromCapnp, ToCapnp};
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use resolver::{NetworkDiscoveryResolver, Resolver, ResolverProfile};
+pub use resolver::{
+    NetworkDiscoveryResolver, Resolver, ResolverProfile, ServiceQuery,
+};
+
+#[cfg(all(not(target_arch = "wasm32"), test))]
+pub use resolver::{
+    retry_validated_candidates, select_service_candidate, select_service_candidates,
+    AcceptedStateEvidence, AnchoredKemRecipient, CandidateDecision, ResolutionEvidence,
+    SelectedService, ServiceCandidate,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use registry::SocketKind;

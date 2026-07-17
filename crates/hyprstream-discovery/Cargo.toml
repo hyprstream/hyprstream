@@ -19,6 +19,7 @@ k8s = ["dep:hyprstream-k8s"]
 [dependencies]
 # Workspace crates
 hyprstream-rpc = { path = "../hyprstream-rpc" }
+hyprstream-service = { path = "../hyprstream-service" }
 # K4c (#787) — optional, only for the `k8s` feature's placement→PodSpec map.
 hyprstream-k8s = { path = "../hyprstream-k8s", optional = true }
 hyprstream-util = { path = "../hyprstream-util" }
@@ -34,6 +35,7 @@ async-trait = { workspace = true }
 capnp = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+base64 = { workspace = true }
 
 # Error handling
 anyhow = { workspace = true }
@@ -43,13 +45,21 @@ parking_lot = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
+chrono = { workspace = true }
 
 # Crypto (for signing keys)
 ed25519-dalek = { workspace = true }
+blake3 = { workspace = true }
+hex = { workspace = true }
 # #932 — the `#atproto` P-256 verifying key type named by the verified-by-
 # construction ingest seam (`RecordResolver::resolve_verifying_key`); also used
 # to build/verify real CAR proofs in getRecord + placement tests.
 p256 = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Production accepted-state authority is read directly from the concrete
+# checkpointed PDS store. No downstream callback/trait can supply authority.
+rocksdb = "0.23"
 
 [dev-dependencies]
 # #431 / #524 — build/verify real CAR proofs in getRecord + placement tests.
@@ -61,6 +71,7 @@ hyprstream-crypto = { path = "../hyprstream-crypto" }
 # K4c (#787) — property tests for the placement→PodSpec map's no-widening invariant.
 proptest = { workspace = true }
 serde_yaml = { workspace = true }
+tempfile = { workspace = true }
 
 [build-dependencies]
 capnpc = { workspace = true }
