@@ -1,0 +1,28 @@
+# Standards-gap matrix
+
+**Assessment date:** 2026-07-17. Links are primary sources. “Gap” is not a request for an allocation and does not claim WG adoption.
+
+| Source | Status at assessment | Reused surface | Gap / boundary for this work | Disposition / owner |
+|---|---|---|---|---|
+| [RFC 9576](https://www.rfc-editor.org/info/rfc9576), Privacy Pass Architecture | Informational RFC | client/issuer/origin roles; issuance/redemption separation | Does not select a PQ anonymous issuance construction for this profile | #1060 must select/review one; no selection here |
+| [RFC 9577](https://www.rfc-editor.org/info/rfc9577), Privacy Pass HTTP Authentication Scheme | Proposed Standard RFC | classical HTTP auth/challenge/token use where applicable | HTTP authentication is not a carrier-neutral inner capability and cannot convey `PqHybrid` by itself | outer/coarse admission only; #1063/#726 |
+| [RFC 9578](https://www.rfc-editor.org/info/rfc9578), VOPRF and Blind RSA Tokens | Proposed Standard RFC | classical token terminology and existing token types | Listed issuance protocols are classical; a signature wrapper does not provide PQ anonymous authorization | #1060 construction/review blocker |
+| [RFC 9794](https://www.rfc-editor.org/info/rfc9794), PQ/T terminology | Informational RFC | hybrid terminology and claim discipline | Does not specify anonymous tokens, binding, or MOQT authorization | terminology only; #1059 |
+| [draft-ietf-moq-transport-19](https://www.ietf.org/archive/id/draft-ietf-moq-transport-19.html) | IETF Internet-Draft, work in progress | ordinary MOQT Objects, forwarding, caching, session/track mechanics | No mandatory Hyprstream PQ-anonymous extension is selected | use ordinary payloads; #726 |
+| [draft-ietf-moq-privacy-pass-auth-03](https://www.ietf.org/archive/id/draft-ietf-moq-privacy-pass-auth-03.html) | IETF Internet-Draft, work in progress | standard authorization-token/challenge surfaces for participating relays | Classical relay authorization remains coarse and cannot satisfy origin MAC/key release | outer plane only; #726 |
+| [draft-guo-privacypass-token-binding-02](https://www.ietf.org/archive/id/draft-guo-privacypass-token-binding-02.html) | Individual Internet-Draft, not adopted | binding design input | Not adopted and does not establish this profile's PQ assurance or HyKEM semantics | #1061 review/question; no normative dependency yet |
+| [draft-ietf-pquip-hybrid-signature-spectrums-07](https://www.ietf.org/archive/id/draft-ietf-pquip-hybrid-signature-spectrums-07.html) | IETF Internet-Draft, work in progress | composition/non-separability terminology | Signatures are not a blind anonymous issuance primitive | terminology only; #1059/#1060 |
+
+## Explicit non-allocations
+
+This scaffold is a local, pre-I-D implementation profile. `domain-separation.json` is **not** an IANA registry, a Privacy Pass token-type allocation, a MOQT parameter, an extension, a URI scheme, or an assigned codepoint. The included RFCXML draft makes no codepoint request. Any future token type, extension, or registry action requires construction selection, working-group engagement, and separate review.
+
+## Construction-selection questions
+
+1. What PQ anonymous/blind issuance construction has a reviewable proof and implementation path under the collusion model in `threat-model.md`?
+2. Is AND-composition with the classical leg defined without introducing a linkable wrapper or an ambiguous assurance upgrade?
+3. Is a token-binding extension needed after evaluating the individual binding draft, and how are PoP/HyKEM/resource commitments canonically encoded?
+4. Can existing MOQT Objects plus standard authorization-token surfaces carry all relay needs, leaving private data inside encrypted payloads?
+5. What exact replay/spend, audit, ledger, and state-rollback behavior is needed before a restricted key release is safe?
+
+The answers block #1060/#1061 production crypto and restricted anonymous portions of #1062/#1063/#726/#554/#555. They do not block independently scoped identified stream/group work.

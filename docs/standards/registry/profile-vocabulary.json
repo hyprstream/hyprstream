@@ -1,0 +1,80 @@
+{
+  "vocabulary_version": 1,
+  "status": "local-pre-construction-vocabulary",
+  "scope": "Bounded names and safety ceilings shared by the #1058 draft family. This file is not a wire schema, MOQT namespace registration, Privacy Pass token type, or codepoint allocation.",
+  "roles": [
+    "client",
+    "attester",
+    "issuer",
+    "origin",
+    "controller",
+    "relay"
+  ],
+  "principal_kinds": [
+    "unauthenticated",
+    "anonymous-capability",
+    "identified"
+  ],
+  "carrier_profiles": [
+    "owned-hybrid-transport",
+    "standard-public-relay"
+  ],
+  "inner_control": {
+    "logical_namespace": "hyprstream-pq-anonymous-control-v1",
+    "note": "This logical application label is carried only inside an encrypted ordinary Object payload; it is not a registered or mandatory MOQT track namespace.",
+    "message_kinds": [
+      "challenge",
+      "issuance-request",
+      "issuance-response",
+      "redemption",
+      "authorization-result",
+      "key-release-request",
+      "key-release-response",
+      "error"
+    ],
+    "max_object_payload_bytes": 65536,
+    "max_exchange_objects": 16,
+    "max_concurrent_exchanges_per_session": 8,
+    "unknown_message_kind": "reject"
+  },
+  "states": {
+    "client": [
+      "idle",
+      "entitlement-checked",
+      "issuance-prepared",
+      "token-held",
+      "outer-session-ready",
+      "inner-control-sent",
+      "released",
+      "spent-or-expired",
+      "denied"
+    ],
+    "issuer": [
+      "configuration-resolved",
+      "issuance-received",
+      "issuance-accepted",
+      "issuance-rejected",
+      "key-draining"
+    ],
+    "origin": [
+      "challenge-issued",
+      "outer-session-observed",
+      "inner-control-received",
+      "state-resolved",
+      "binding-verified",
+      "mac-authorized",
+      "spend-committed",
+      "release-committed",
+      "denied"
+    ]
+  },
+  "transition_invariants": [
+    "entitlement-checked and outer-session-ready are optional client states",
+    "outer-session-observed is an optional origin state",
+    "no outer-only state transitions to dispatch, plaintext, or key release",
+    "all state, binding, MAC, and audit checks succeed before spend-committed",
+    "spend-committed is durable and precedes dispatch or release-committed",
+    "any failed required check transitions to denied",
+    "unknown states, message kinds, versions, or transition events reject"
+  ]
+}
