@@ -207,63 +207,54 @@ jobs:
           -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always \
           "$BUILDER_IMAGE" \
           bash -euo pipefail -c '
-            # Default features (parity with the former x86 gate); libtorch from the
-            # image means NO --features download-libtorch here.
-            #
-            # Runs at full parallelism: the fleet is on memory-optimized r8g/r7g
-            # (8 vCPU / 64 GiB = 8 GiB/vCPU, metal #1011), which absorbs a full
-            # release link at all cores. (The earlier c8g.2xlarge at 2 GiB/vCPU
-            # OOM-killed the runner, so the fix was instance RAM, not a jobs cap.)
-            # No --verbose: it emits a line per rustc invocation and floods the
-            # Actions log pipeline, truncating the visible log ~4min in and hiding
-            # the actual failure. Keep it off so real errors are readable.
-            cargo build --release
-
-            # wasm guest artifacts for the sandbox/mount tests (deny-on-missing-guest
-            # guard). cd INTO each guest crate dir: cargo discovers .cargo/config.toml
-            # from the invocation cwd, not --manifest-path, and the python guest needs
-            # its getrandom_backend="custom" cfg for wasm32-unknown-unknown. See #1013.
-            rustup target add wasm32-unknown-unknown wasm32-wasip1
-            ( cd crates/hyprstream-workers-python-guest && \
-              cargo build --release --target wasm32-unknown-unknown )
-            ( cd crates/hyprstream-workers-wasmtime-fsguest && \
-              cargo build --release --target wasm32-wasip1 )
-
-            # cargo-nextest is not baked into the builder image; fetch the arm64
-            # binary (get.nexte.st linux-arm == aarch64) onto PATH in the container.
+            # ---- root setup (these belong in the builder image; #1011 follow-up) ----
+            # cargo-nextest (get.nexte.st linux-arm == aarch64) onto PATH.
             curl -LsSf https://get.nexte.st/latest/linux-arm | tar zxf - -C /usr/local/bin
-
-            # git-lfs: the git2db LFS worktree tests shell out to the git-lfs binary.
-            # GitHub-hosted ubuntu-latest ships it preinstalled (why the old gate
-            # passed); the arm64 builder image does not, so install it here. TODO:
-            # bake git-lfs into the rust-builder image and drop this step (#1011).
+            # git-lfs: the git2db LFS worktree tests shell out to it. ubuntu-latest
+            # shipped it preinstalled (why the old gate passed); the image does not.
             apt-get update && apt-get install -y --no-install-recommends git-lfs
             git lfs install --system --skip-repo
+            # Add the wasm targets while still root (rustup home is root-owned).
+            rustup target add wasm32-unknown-unknown wasm32-wasip1
 
-            # nextest enforces the per-TEST slow-timeout from .config/nextest.toml
-            # ([profile.ci]): a deadlocked test is SIGKILLed rather than stalling the
-            # job to its 90min / the queue to its 120min timeout. Guest wasm paths are
-            # container-absolute (/build is the bind mount).
-            export HYPRSTREAM_PYGUEST_WASM=/build/crates/hyprstream-workers-python-guest/target/wasm32-unknown-unknown/release/hyprstream_workers_python_guest.wasm
-            export HYPRSTREAM_FSGUEST_WASM=/build/crates/hyprstream-workers-wasmtime-fsguest/target/wasm32-wasip1/release/hyprstream-workers-wasmtime-fsguest.wasm
-            # TEMP (#1011 validation): --no-fail-fast enumerates EVERY arm64 failure
-            # in one pass. Its full console output is too large for the Actions log
-            # API to serve, so capture to a file (uploaded as an artifact below) and
-            # print ONLY the FAIL/summary lines here. Revert to plain fail-fast (no
-            # redirection/artifact) for the real gate.
-            set +e
-            cargo nextest run --cargo-profile ci-test --profile ci --no-fail-fast > /build/nextest-arm64.log 2>&1
-            nextest_rc=$?
-            cargo test --release --doc > /build/doctest-arm64.log 2>&1
-            doctest_rc=$?
-            set -e
-            echo "===== nextest failures (full log in the arm64-test-logs artifact) ====="
-            grep -E "FAIL \[|Summary \[|tests run:|error\[|panicked at|not available" /build/nextest-arm64.log | tail -100 || true
-            echo "===== doctest tail ====="
-            grep -E "test result|error\[|FAILED|panicked at" /build/doctest-arm64.log | tail -30 || true
-            sccache --show-stats
-            echo "nextest_rc=$nextest_rc doctest_rc=$doctest_rc"
-            [ "$nextest_rc" -eq 0 ] && [ "$doctest_rc" -eq 0 ]
+            # Build + test run as a NON-ROOT user. Several fail-closed tests assert a
+            # write to a read-only dir is rejected, but root bypasses file permissions,
+            # so they pass only as non-root (as the old ubuntu-latest gate ran). Make
+            # the toolchain usable by the ci user and hand it the workspace (fresh
+            # checkout, no target/ yet, so the chown is cheap).
+            useradd -m ci
+            chmod a+rx /root
+            chmod -R a+rwX /root/.cargo /root/.rustup
+            chown -R ci:ci /build
+
+            runuser -u ci -- bash -euo pipefail -c "
+              export PATH=/root/.cargo/bin:/usr/local/bin:\$PATH
+              export CARGO_HOME=/root/.cargo RUSTUP_HOME=/root/.rustup
+              export SCCACHE_DIR=/build/.sccache && mkdir -p /build/.sccache
+              # Same-filesystem TMPDIR: overlay_fsmount rename-across-layers fails
+              # EXDEV (cross-device link) when temp dirs land on /tmp (tmpfs) while the
+              # workspace is on another fs. Keep temp on the workspace fs.
+              mkdir -p /build/.citmp && export TMPDIR=/build/.citmp
+              export HYPRSTREAM_PYGUEST_WASM=/build/crates/hyprstream-workers-python-guest/target/wasm32-unknown-unknown/release/hyprstream_workers_python_guest.wasm
+              export HYPRSTREAM_FSGUEST_WASM=/build/crates/hyprstream-workers-wasmtime-fsguest/target/wasm32-wasip1/release/hyprstream-workers-wasmtime-fsguest.wasm
+              cargo build --release
+              ( cd crates/hyprstream-workers-python-guest && cargo build --release --target wasm32-unknown-unknown )
+              ( cd crates/hyprstream-workers-wasmtime-fsguest && cargo build --release --target wasm32-wasip1 )
+              # TEMP (#1011 validation): --no-fail-fast enumerates every failure in one
+              # pass; its full output is too large for the Actions log API, so capture
+              # to files (uploaded as an artifact) and print only FAIL/summary lines.
+              set +e
+              cargo nextest run --cargo-profile ci-test --profile ci --no-fail-fast > /build/nextest-arm64.log 2>&1
+              nextest_rc=\$?
+              cargo test --release --doc > /build/doctest-arm64.log 2>&1
+              doctest_rc=\$?
+              set -e
+              echo ===== nextest failures =====
+              grep -E \"FAIL |Summary |tests run:|not available\" /build/nextest-arm64.log | tail -100 || true
+              sccache --show-stats || true
+              echo nextest_rc=\$nextest_rc doctest_rc=\$doctest_rc
+              [ \"\$nextest_rc\" -eq 0 ] && [ \"\$doctest_rc\" -eq 0 ]
+            "
           '
 
     # TEMP (#1011 validation): full nextest/doctest output, reliable regardless of
