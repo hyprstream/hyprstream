@@ -1,0 +1,223 @@
+{
+  "vector_version": 1,
+  "status": "non-cryptographic-structural-fixture",
+  "profile_id": "hs-pp-pqhybrid/experimental-boundary/v1",
+  "note": "No artifact in this file is a signature, token, issuance proof, or production credential. The structurally valid baseline must still be refused because no PQ anonymous construction is selected.",
+  "evaluation": {
+    "now": 2000000000,
+    "current_accepted_state_epoch": 7,
+    "current_policy_generation": 11,
+    "issuer_id": "did:at9p:issuer-example",
+    "audience": "did:at9p:origin-example"
+  },
+  "baseline": {
+    "messages": {
+      "challenge": {
+        "kind": "challenge",
+        "version": 1,
+        "profile_id": "hs-pp-pqhybrid/experimental-boundary/v1",
+        "issuer_id": "did:at9p:issuer-example",
+        "audience": "did:at9p:origin-example",
+        "suite_id": "unselected-pq-anonymous-construction",
+        "accepted_state_digest": "1010101010101010101010101010101010101010101010101010101010101010",
+        "accepted_state_epoch": 7,
+        "policy_generation": 11,
+        "expiry": 2000000600,
+        "challenge_nonce": "20202020202020202020202020202020",
+        "redemption_context": "30303030303030303030303030303030",
+        "resource_profile_commitment": "4040404040404040404040404040404040404040404040404040404040404040"
+      },
+      "issuance-request": {
+        "kind": "issuance-request",
+        "version": 1,
+        "profile_id": "hs-pp-pqhybrid/experimental-boundary/v1",
+        "composition": "and",
+        "challenge_digest": "5050505050505050505050505050505050505050505050505050505050505050",
+        "legs": [
+          {
+            "role": "classical-anonymous",
+            "purpose": "privacy-pass-classical-issuance",
+            "issuer_key_id": "did:at9p:issuer-example#privacy-pass-classical-2026-07",
+            "suite_id": "rfc9578-publicly-verifiable-v1",
+            "challenge_digest": "5050505050505050505050505050505050505050505050505050505050505050",
+            "context_digest": "6060606060606060606060606060606060606060606060606060606060606060",
+            "artifact": "c0"
+          },
+          {
+            "role": "pq-anonymous",
+            "purpose": "privacy-pass-pq-anonymous-issuance",
+            "issuer_key_id": "did:at9p:issuer-example#privacy-pass-pq-anonymous-unselected",
+            "suite_id": null,
+            "challenge_digest": "5050505050505050505050505050505050505050505050505050505050505050",
+            "context_digest": "6060606060606060606060606060606060606060606060606060606060606060",
+            "artifact": ""
+          }
+        ]
+      },
+      "issuance-response": {
+        "kind": "issuance-response",
+        "version": 1,
+        "profile_id": "hs-pp-pqhybrid/experimental-boundary/v1",
+        "composition": "and",
+        "challenge_digest": "5050505050505050505050505050505050505050505050505050505050505050",
+        "legs": [
+          {
+            "role": "classical-anonymous",
+            "purpose": "privacy-pass-classical-issuance",
+            "issuer_key_id": "did:at9p:issuer-example#privacy-pass-classical-2026-07",
+            "suite_id": "rfc9578-publicly-verifiable-v1",
+            "challenge_digest": "5050505050505050505050505050505050505050505050505050505050505050",
+            "context_digest": "6060606060606060606060606060606060606060606060606060606060606060",
+            "artifact": "c1"
+          },
+          {
+            "role": "pq-anonymous",
+            "purpose": "privacy-pass-pq-anonymous-issuance",
+            "issuer_key_id": "did:at9p:issuer-example#privacy-pass-pq-anonymous-unselected",
+            "suite_id": null,
+            "challenge_digest": "5050505050505050505050505050505050505050505050505050505050505050",
+            "context_digest": "6060606060606060606060606060606060606060606060606060606060606060",
+            "artifact": ""
+          }
+        ]
+      },
+      "token": {
+        "kind": "token",
+        "version": 1,
+        "profile_id": "hs-pp-pqhybrid/experimental-boundary/v1",
+        "composition": "and",
+        "challenge_digest": "5050505050505050505050505050505050505050505050505050505050505050",
+        "issuer_id": "did:at9p:issuer-example",
+        "audience": "did:at9p:origin-example",
+        "suite_id": "unselected-pq-anonymous-construction",
+        "accepted_state_digest": "1010101010101010101010101010101010101010101010101010101010101010",
+        "accepted_state_epoch": 7,
+        "policy_generation": 11,
+        "expiry": 2000000600,
+        "redemption_context": "30303030303030303030303030303030",
+        "resource_profile_commitment": "4040404040404040404040404040404040404040404040404040404040404040",
+        "legs": [
+          {
+            "role": "classical-anonymous",
+            "purpose": "privacy-pass-classical-issuance",
+            "issuer_key_id": "did:at9p:issuer-example#privacy-pass-classical-2026-07",
+            "suite_id": "rfc9578-publicly-verifiable-v1",
+            "challenge_digest": "5050505050505050505050505050505050505050505050505050505050505050",
+            "context_digest": "6060606060606060606060606060606060606060606060606060606060606060",
+            "artifact": "c2"
+          },
+          {
+            "role": "pq-anonymous",
+            "purpose": "privacy-pass-pq-anonymous-issuance",
+            "issuer_key_id": "did:at9p:issuer-example#privacy-pass-pq-anonymous-unselected",
+            "suite_id": null,
+            "challenge_digest": "5050505050505050505050505050505050505050505050505050505050505050",
+            "context_digest": "6060606060606060606060606060606060606060606060606060606060606060",
+            "artifact": ""
+          }
+        ],
+        "production_disposition": "refuse-construction-unselected"
+      }
+    }
+  },
+  "baseline_canonical_sha256": "5545101a791689fc9292d6ae5b4c1f8ff9d6dc4721dbdfa38d2815b37d90f028",
+  "expected_production_refusal": "construction-unselected",
+  "mutations": [
+    {
+      "id": "missing-pq-leg",
+      "op": "delete",
+      "path": ["messages", "issuance-request", "legs", 1],
+      "expected_error": "issuance-request:leg-count"
+    },
+    {
+      "id": "duplicated-classical-leg",
+      "op": "duplicate",
+      "path": ["messages", "issuance-request", "legs", 0],
+      "expected_error": "issuance-request:duplicate-leg"
+    },
+    {
+      "id": "reordered-legs",
+      "op": "swap",
+      "path": ["messages", "issuance-response", "legs"],
+      "indices": [0, 1],
+      "expected_error": "issuance-response:leg-order"
+    },
+    {
+      "id": "unknown-leg",
+      "op": "replace",
+      "path": ["messages", "token", "legs", 1, "role"],
+      "value": "pq-visible-signature",
+      "expected_error": "token:unknown-leg"
+    },
+    {
+      "id": "crossed-leg-context",
+      "op": "replace",
+      "path": ["messages", "token", "legs", 1, "challenge_digest"],
+      "value": "7070707070707070707070707070707070707070707070707070707070707070",
+      "expected_error": "token:crossed-challenge"
+    },
+    {
+      "id": "stripped-to-classical-only",
+      "op": "replace",
+      "path": ["messages", "token", "composition"],
+      "value": "classical-only",
+      "expected_error": "token:composition"
+    },
+    {
+      "id": "holder-identifying-field",
+      "op": "add",
+      "path": ["messages", "token", "holder_did"],
+      "value": "did:plc:holder-example",
+      "expected_error": "holder-identifying-field"
+    },
+    {
+      "id": "stale-accepted-state",
+      "op": "replace",
+      "path": ["messages", "challenge", "accepted_state_epoch"],
+      "value": 6,
+      "expected_error": "challenge:stale-state"
+    },
+    {
+      "id": "policy-rollback",
+      "op": "replace",
+      "path": ["messages", "challenge", "policy_generation"],
+      "value": 10,
+      "expected_error": "challenge:policy-rollback"
+    },
+    {
+      "id": "expired-challenge",
+      "op": "replace",
+      "path": ["messages", "challenge", "expiry"],
+      "value": 1999999999,
+      "expected_error": "challenge:expired"
+    },
+    {
+      "id": "wrong-origin",
+      "op": "replace",
+      "path": ["messages", "challenge", "audience"],
+      "value": "did:at9p:other-origin",
+      "expected_error": "challenge:audience"
+    },
+    {
+      "id": "key-purpose-substitution",
+      "op": "replace",
+      "path": ["messages", "token", "legs", 1, "purpose"],
+      "value": "mesh-signing",
+      "expected_error": "token:key-purpose"
+    },
+    {
+      "id": "cross-purpose-key-reuse",
+      "op": "replace",
+      "path": ["messages", "token", "legs", 1, "issuer_key_id"],
+      "value": "did:at9p:issuer-example#privacy-pass-classical-2026-07",
+      "expected_error": "token:key-reuse"
+    },
+    {
+      "id": "unknown-message-kind",
+      "op": "add",
+      "path": ["messages", "visible-signature-wrapper"],
+      "value": {},
+      "expected_error": "unknown-message"
+    }
+  ]
+}

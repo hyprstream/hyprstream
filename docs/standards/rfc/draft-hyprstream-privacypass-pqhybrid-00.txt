@@ -73,18 +73,19 @@ Table of Contents
 
    1.  Introduction  . . . . . . . . . . . . . . . . . . . . . . . .   2
    2.  Requirements Language . . . . . . . . . . . . . . . . . . . .   2
-   3.  Bounded Vocabulary  . . . . . . . . . . . . . . . . . . . . .   2
+   3.  Bounded Vocabulary  . . . . . . . . . . . . . . . . . . . . .   3
    4.  Assurance Separation  . . . . . . . . . . . . . . . . . . . .   3
    5.  Classical MOQT Relay Profile  . . . . . . . . . . . . . . . .   3
    6.  Transcript Registry . . . . . . . . . . . . . . . . . . . . .   4
-   7.  State-Machine Skeleton  . . . . . . . . . . . . . . . . . . .   4
-   8.  Security Considerations . . . . . . . . . . . . . . . . . . .   4
-   9.  Privacy Considerations  . . . . . . . . . . . . . . . . . . .   5
-   10. IANA Considerations . . . . . . . . . . . . . . . . . . . . .   5
-   11. References  . . . . . . . . . . . . . . . . . . . . . . . . .   5
-     11.1.  Normative References . . . . . . . . . . . . . . . . . .   5
-     11.2.  Informative References . . . . . . . . . . . . . . . . .   5
-   Author's Address  . . . . . . . . . . . . . . . . . . . . . . . .   6
+   7.  Construction Status and Experimental Refusal Boundary . . . .   4
+   8.  State-Machine Skeleton  . . . . . . . . . . . . . . . . . . .   5
+   9.  Security Considerations . . . . . . . . . . . . . . . . . . .   5
+   10. Privacy Considerations  . . . . . . . . . . . . . . . . . . .   6
+   11. IANA Considerations . . . . . . . . . . . . . . . . . . . . .   6
+   12. References  . . . . . . . . . . . . . . . . . . . . . . . . .   6
+     12.1.  Normative References . . . . . . . . . . . . . . . . . .   6
+     12.2.  Informative References . . . . . . . . . . . . . . . . .   6
+   Author's Address  . . . . . . . . . . . . . . . . . . . . . . . .   7
 
 1.  Introduction
 
@@ -103,9 +104,8 @@ Table of Contents
    interpreted as described in BCP 14 [RFC2119] [RFC8174] when, and only
    when, they appear in all capitals, as shown here.
 
-3.  Bounded Vocabulary
 
-   Outer admission:  Classical, carrier-local relay admission, routing,
+
 
 
 
@@ -114,6 +114,9 @@ HyprStream               Expires 18 January 2027                [Page 2]
 Internet-Draft       PQ Hybrid Privacy Pass Profile            July 2026
 
 
+3.  Bounded Vocabulary
+
+   Outer admission:  Classical, carrier-local relay admission, routing,
       rate control, or cache policy using standard MOQT/Privacy Pass
       surfaces.
 
@@ -155,11 +158,8 @@ Internet-Draft       PQ Hybrid Privacy Pass Profile            July 2026
    coarse admission; an unsupported private authorization profile must
    not make forwarding non-interoperable.
 
-   Private challenge, issuance, redemption, and key-release data are
-   future encrypted application Object payloads.  The relay-visible
-   Object identity, size, timing, cache behavior, and routing metadata
-   are not confidential by this document and no traffic-analysis
-   resistance is claimed.
+
+
 
 
 
@@ -169,6 +169,12 @@ HyprStream               Expires 18 January 2027                [Page 3]
 
 Internet-Draft       PQ Hybrid Privacy Pass Profile            July 2026
 
+
+   Private challenge, issuance, redemption, and key-release data are
+   future encrypted application Object payloads.  The relay-visible
+   Object identity, size, timing, cache behavior, and routing metadata
+   are not confidential by this document and no traffic-analysis
+   resistance is claimed.
 
 6.  Transcript Registry
 
@@ -182,7 +188,52 @@ Internet-Draft       PQ Hybrid Privacy Pass Profile            July 2026
    The registry is local to this repository.  It is not an IANA registry
    or a request to allocate Privacy Pass, MOQT, or any other codepoint.
 
-7.  State-Machine Skeleton
+7.  Construction Status and Experimental Refusal Boundary
+
+   A 2026-07-17 primary-source audit found promising post-quantum blind-
+   signature and anonymous-credential research, but no candidate
+   supplied the complete reviewed Privacy Pass construction, fixed
+   parameters, maintained implementation, canonical profile encoding and
+   vectors, and analysis of this exact classical-plus-PQ composition.  A
+   production implementation MUST NOT issue, accept, redeem, dispatch,
+   or release a key under this profile while the PQ construction and
+   token type are unselected.  The experimental boundary checker MUST
+   terminate a structurally valid fixture with the
+   ConstructionUnselected refusal.
+
+   The repository-local experimental boundary is a deterministic non-
+   cryptographic fixture schema, not a token type or protocol encoding.
+   The experimental boundary checker MUST require exactly two ordered
+   roles, ClassicalAnonymous then PqAnonymous, combined with AND, and
+   MUST reject a missing, duplicated, reordered, unknown, crossed, or
+   stripped leg.  The boundary MUST reject any holder DID, ATProto
+   handle, account identifier, or other stable holder subject field.
+   Each leg MUST use its dedicated Privacy Pass issuer-key purpose, and
+   the boundary MUST reject cross-role key reuse or substitution of a
+   mesh, PDS, response, or controller key.  The boundary MUST require
+   exact accepted-current issuer, audience, state epoch and digest,
+   policy generation, expiry, redemption context, and resource-profile
+   commitment values and MUST reject stale, rolled-back, expired, or
+   crossed values.
+
+
+
+
+
+
+HyprStream               Expires 18 January 2027                [Page 4]
+
+Internet-Draft       PQ Hybrid Privacy Pass Profile            July 2026
+
+
+   A structurally valid experimental fixture still terminates in the
+   ConstructionUnselected refusal.  It is not a positive cryptographic
+   vector and cannot mint PqHybrid assurance.  Standard classical
+   Privacy Pass remains available only for its standard classical
+   purpose; standard MOQT relays remain unchanged and forward ordinary
+   opaque application Object bytes.
+
+8.  State-Machine Skeleton
 
    Client states are: Idle; EntitlementChecked (optional);
    IssuancePrepared; TokenHeld; OuterSessionReady (optional);
@@ -210,7 +261,7 @@ Internet-Draft       PQ Hybrid Privacy Pass Profile            July 2026
    are application-profile inputs, not MOQT or Privacy Pass allocations;
    unknown kinds and versions reject.
 
-8.  Security Considerations
+9.  Security Considerations
 
    Construction selection and independent review are prerequisites for
    any PqHybrid production claim.  The profile requires exact binding to
@@ -221,12 +272,17 @@ Internet-Draft       PQ Hybrid Privacy Pass Profile            July 2026
 
 
 
-HyprStream               Expires 18 January 2027                [Page 4]
+
+
+
+
+
+HyprStream               Expires 18 January 2027                [Page 5]
 
 Internet-Draft       PQ Hybrid Privacy Pass Profile            July 2026
 
 
-9.  Privacy Considerations
+10.  Privacy Considerations
 
    The profile makes no issuance/redemption unlinkability claim against
    issuer-origin collusion, no traffic-analysis claim against an origin-
@@ -235,13 +291,13 @@ Internet-Draft       PQ Hybrid Privacy Pass Profile            July 2026
    See the companion privacy and threat analyses for the required
    collusion model.
 
-10.  IANA Considerations
+11.  IANA Considerations
 
    This document requests no IANA actions and allocates no codepoints.
 
-11.  References
+12.  References
 
-11.1.  Normative References
+12.1.  Normative References
 
    [RFC2119]  Bradner, S., "Key words for use in RFCs to Indicate
               Requirement Levels", BCP 14, RFC 2119, March 1997,
@@ -263,7 +319,7 @@ Internet-Draft       PQ Hybrid Privacy Pass Profile            July 2026
               "Privacy Pass Issuance Protocols", RFC 9578, June 2024,
               <https://www.rfc-editor.org/info/rfc9578>.
 
-11.2.  Informative References
+12.2.  Informative References
 
    [RFC9794]  Driscoll, F., Parsons, M., and B. Hale, "Terminology for
               Post-Quantum Traditional Hybrid Schemes", RFC 9794, June
@@ -277,7 +333,7 @@ Internet-Draft       PQ Hybrid Privacy Pass Profile            July 2026
 
 
 
-HyprStream               Expires 18 January 2027                [Page 5]
+HyprStream               Expires 18 January 2027                [Page 6]
 
 Internet-Draft       PQ Hybrid Privacy Pass Profile            July 2026
 
@@ -333,4 +389,4 @@ Author's Address
 
 
 
-HyprStream               Expires 18 January 2027                [Page 6]
+HyprStream               Expires 18 January 2027                [Page 7]

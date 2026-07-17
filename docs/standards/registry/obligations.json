@@ -71,6 +71,56 @@
       "owner": "#1061/#1062",
       "blocker": "Canonical binding encoding and anonymous principal have not been selected/implemented.",
       "planned_test": "holder-identity-and-route-substitution-reject"
+    },
+    {
+      "id": "PPQH-REQ-008",
+      "keyword": "MUST NOT",
+      "source": "construction-status",
+      "statement": "A production implementation MUST NOT issue, accept, redeem, dispatch, or release a key under this profile while the PQ construction and token type are unselected.",
+      "kind": "specification-only",
+      "owner": "#1060",
+      "blocker": "No production issuance or redemption path exists and no reviewed PQ anonymous construction is selected.",
+      "planned_test": "production-issuer-origin-and-key-release-refuse-unselected-construction"
+    },
+    {
+      "id": "PPQH-REQ-009",
+      "keyword": "MUST",
+      "source": "construction-status",
+      "statement": "The experimental boundary checker MUST require exactly two ordered roles, ClassicalAnonymous then PqAnonymous, combined with AND, and MUST reject a missing, duplicated, reordered, unknown, crossed, or stripped leg.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_pq_anonymous_issuance.py (missing-pq-leg through stripped-to-classical-only)"
+    },
+    {
+      "id": "PPQH-REQ-010",
+      "keyword": "MUST",
+      "source": "construction-status",
+      "statement": "The boundary MUST reject any holder DID, ATProto handle, account identifier, or other stable holder subject field.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_pq_anonymous_issuance.py (holder-identifying-field)"
+    },
+    {
+      "id": "PPQH-REQ-011",
+      "keyword": "MUST",
+      "source": "construction-status",
+      "statement": "Each leg MUST use its dedicated Privacy Pass issuer-key purpose, and the boundary MUST reject cross-role key reuse or substitution of a mesh, PDS, response, or controller key.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_pq_anonymous_issuance.py (key-purpose-substitution and cross-purpose-key-reuse)"
+    },
+    {
+      "id": "PPQH-REQ-012",
+      "keyword": "MUST",
+      "source": "construction-status",
+      "statement": "The boundary MUST require exact accepted-current issuer, audience, state epoch and digest, policy generation, expiry, redemption context, and resource-profile commitment values and MUST reject stale, rolled-back, expired, or crossed values.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_pq_anonymous_issuance.py (stale-state, policy-rollback, expiry, origin, and crossed-context controls)"
+    },
+    {
+      "id": "PPQH-REQ-013",
+      "keyword": "MUST",
+      "source": "construction-status",
+      "statement": "The experimental boundary checker MUST terminate a structurally valid fixture with the ConstructionUnselected refusal.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_pq_anonymous_issuance.py (baseline structural success followed by production refusal)"
     }
   ]
 }
