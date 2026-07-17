@@ -409,11 +409,11 @@ impl StreamContext {
 
     /// Disable transport-level AEAD for this stream (#321).
     ///
-    /// Clears the AEAD key so the publisher emits cleartext (HMAC-chained) blocks.
-    /// Used for streams whose consumer receives only `(mac_key, topic)` out of band
-    /// and never derives the DH `enc_key` (e.g. the TUI PTY/shell stdout viewer,
-    /// a same-host stream). AEAD remains mandatory and ON for the DH-keyed mesh
-    /// inference stream, whose consumer derives `enc_key` from the same DH.
+    /// Clears the AEAD key so a legacy publisher emits cleartext (HMAC-chained)
+    /// blocks. Identified epoch contexts retain an internal profile marker and
+    /// are rejected by `MoqStreamOrigin::publisher` if this escape hatch is used;
+    /// it exists only for legacy same-host streams whose consumer receives
+    /// `(mac_key, topic)` out of band and cannot derive the classical DH key.
     pub fn without_aead(mut self) -> Self {
         self.enc_key = None;
         self

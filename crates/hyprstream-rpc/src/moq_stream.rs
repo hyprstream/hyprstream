@@ -689,6 +689,12 @@ impl MoqStreamOrigin {
         ctx: &StreamContext,
         provenance: Option<crate::stream_provenance::ProvenanceSigner>,
     ) -> Result<MoqStreamPublisher> {
+        let epoch_ratchet = ctx.epoch_ratchet();
+        ensure!(
+            epoch_ratchet.is_none() || ctx.enc_key().is_some(),
+            "identified stream rejected a context with transport AEAD disabled"
+        );
+
         let path = self.broadcast_path(ctx.topic());
         let mut broadcast = self
             .inner
@@ -713,7 +719,7 @@ impl MoqStreamOrigin {
             track,
             next_group: 0,
             next_sequence: 0,
-            epoch_ratchet: ctx.epoch_ratchet(),
+            epoch_ratchet,
             cancel_token: ctx.cancel_token().clone(),
             terminated: false,
             topic: ctx.topic().to_owned(),
@@ -2224,6 +2230,10 @@ mod tests {
         let initial_ratchet = client_ratchet.clone();
         let topic = ctx.topic().to_owned();
         let origin = origin();
+        assert!(
+            origin.publisher(&ctx.clone().without_aead()).is_err(),
+            "identified context accepted an AEAD downgrade before publication"
+        );
         let mut publisher = origin.publisher(&ctx)?;
         publisher.publish_data(b"epoch-zero-secret").await?;
         assert!(
