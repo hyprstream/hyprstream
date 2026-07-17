@@ -916,6 +916,36 @@ impl DiscoveryService {
     /// }
     /// ```
     ///
+    /// ```compile_fail
+    /// use hyprstream_service::AuthenticatedRegistryDeploymentIdentity;
+    /// fn forge(key: ed25519_dalek::VerifyingKey) -> AuthenticatedRegistryDeploymentIdentity {
+    ///     AuthenticatedRegistryDeploymentIdentity { verifying_key: key }
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use hyprstream_service::AuthenticatedRegistryDeploymentIdentity;
+    /// fn mint(key: ed25519_dalek::VerifyingKey) {
+    ///     let _ = AuthenticatedRegistryDeploymentIdentity::mint(key);
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// fn duplicate(identity: hyprstream_service::AuthenticatedRegistryDeploymentIdentity) {
+    ///     let _ = identity.clone();
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// # use ed25519_dalek::SigningKey;
+    /// let signing = SigningKey::from_bytes(&[7; 32]);
+    /// let mut context = hyprstream_service::ServiceContext::new(
+    ///     signing.clone(), signing.verifying_key(), false, "caller".into()
+    /// );
+    /// context.authenticate_registry_deployment_credential("caller-issued-jwt")?;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    ///
     /// The complete former public composition chain is unavailable to an
     /// external crate.
     /// ```compile_fail
@@ -1227,16 +1257,22 @@ pub struct AuthenticatedDiscoveryBootstrap {
 /// This is the only public mint for [`AuthenticatedDiscoveryBootstrap`]. It
 /// accepts no context, path, key, callback, or other caller-selected authority.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn authenticate_discovery_bootstrap() -> Result<AuthenticatedDiscoveryBootstrap> {
+pub fn authenticate_discovery_bootstrap(
+    registry_identity: hyprstream_service::AuthenticatedRegistryDeploymentIdentity,
+) -> Result<AuthenticatedDiscoveryBootstrap> {
+    authenticate_discovery_bootstrap_identity(registry_identity.into_verifying_key())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn authenticate_discovery_bootstrap_identity(
+    acceptance_identity: ed25519_dalek::VerifyingKey,
+) -> Result<AuthenticatedDiscoveryBootstrap> {
     let mut state = PROCESS_BOOTSTRAP_AUTHORITY.lock();
     anyhow::ensure!(
         matches!(*state, ProcessBootstrapAuthorityState::Unsealed),
         "Discovery bootstrap authority is already sealed or consumed"
     );
     let store_path = hyprstream_service::deployment_data_dir()?.join("pds-store");
-    let acceptance_identity = hyprstream_service::global_trust_store()
-        .resolve_one("registry")
-        .ok_or_else(|| anyhow::anyhow!("trust store has no authenticated registry key"))?;
     *state = ProcessBootstrapAuthorityState::Sealed;
     Ok(AuthenticatedDiscoveryBootstrap { seal: (), store_path, acceptance_identity })
 }
@@ -1603,14 +1639,17 @@ mod resolver_tests {
         assert!(discovery.contains("struct ProcessBootstrapAuthority {"));
         assert!(discovery.contains("enum ProcessBootstrapAuthorityState {"));
         let authentication = discovery
-            .split("pub fn authenticate_discovery_bootstrap()")
+            .split("pub fn authenticate_discovery_bootstrap(")
             .nth(1)
             .expect("authenticated bootstrap entrypoint")
             .split("/// Construct an ordinary production RPC client")
             .next()
             .expect("authentication body");
         assert!(authentication.contains("hyprstream_service::deployment_data_dir()"));
-        assert!(authentication.contains("global_trust_store()"));
+        assert!(authentication.contains("AuthenticatedRegistryDeploymentIdentity"));
+        assert!(authentication.contains("registry_identity.into_verifying_key()"));
+        assert!(!authentication.contains("global_trust_store()"));
+        assert!(!authentication.contains("resolve_one("));
         assert!(!authentication.contains("ServiceContext"));
         assert!(!authentication.contains("FnOnce"));
         let capability = discovery
@@ -1986,6 +2025,10 @@ mod resolver_tests {
         }
     }
 
+    fn authenticated_registry_identity(tag: u8) -> ed25519_dalek::VerifyingKey {
+        SigningKey::from_bytes(&[tag; 32]).verifying_key()
+    }
+
     #[test]
     fn process_bootstrap_precedes_first_generated_client() {
         const CHILD: &str = "HYPRSTREAM_TEST_RESOLVER_BOOTSTRAP_CHILD";
@@ -2006,7 +2049,9 @@ mod resolver_tests {
                     attested_by: None,
                 },
             );
-            let authority = authenticate_discovery_bootstrap()
+            let authority = authenticate_discovery_bootstrap_identity(
+                authenticated_registry_identity(0x51),
+            )
                 .expect("authenticate process resolver");
             DiscoveryService::bootstrap_authenticated_process(
                 authority,
@@ -2014,7 +2059,10 @@ mod resolver_tests {
             )
             .expect("install process resolver");
             assert!(production_rpc_client("model", signing, None).is_ok());
-            assert!(authenticate_discovery_bootstrap().is_err());
+            assert!(authenticate_discovery_bootstrap_identity(authenticated_registry_identity(
+                0x52
+            ))
+            .is_err());
             return;
         }
         let deployment = tempfile::tempdir().expect("deployment data root");
@@ -2059,12 +2107,16 @@ mod resolver_tests {
                     let barrier = Arc::clone(&barrier);
                     std::thread::spawn(move || {
                         barrier.wait();
-                        authenticate_discovery_bootstrap().and_then(|authority| {
-                            DiscoveryService::bootstrap_authenticated_process(
-                                authority,
-                                crate::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
-                            )
-                        }).is_ok()
+                        authenticate_discovery_bootstrap_identity(authenticated_registry_identity(
+                            0x53,
+                        ))
+                            .and_then(|authority| {
+                                DiscoveryService::bootstrap_authenticated_process(
+                                    authority,
+                                    crate::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
+                                )
+                            })
+                            .is_ok()
                     })
                 })
                 .collect();
@@ -2096,7 +2148,9 @@ mod resolver_tests {
         const CHILD: &str = "HYPRSTREAM_TEST_RESOLVER_FAILURE_CHILD";
         if std::env::var_os(CHILD).is_some() {
             seed_registry_for_bootstrap(0x49);
-            let authority = authenticate_discovery_bootstrap().unwrap();
+            let authority =
+                authenticate_discovery_bootstrap_identity(authenticated_registry_identity(0x54))
+                    .unwrap();
             let first = DiscoveryService::bootstrap_authenticated_process(
                 authority,
                 crate::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
@@ -2105,7 +2159,8 @@ mod resolver_tests {
             let store = hyprstream_service::deployment_data_dir().unwrap().join("pds-store");
             std::fs::create_dir_all(&store).unwrap();
             drop(rocksdb::DB::open_default(&store).unwrap());
-            let second = authenticate_discovery_bootstrap()
+            let second =
+                authenticate_discovery_bootstrap_identity(authenticated_registry_identity(0x55))
                 .err()
                 .expect("failed bootstrap authority was replayed");
             assert!(second.to_string().contains("already sealed or consumed"));

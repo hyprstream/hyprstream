@@ -33,6 +33,54 @@ use crate::service::spawner::Spawnable;
 use hyprstream_rpc::registry::{global as global_registry, SocketKind};
 use hyprstream_rpc::transport::TransportConfig;
 
+/// One-shot proof that trusted startup verified the deployment registry
+/// credential against the deployment CA. Fields and mint are private.
+pub struct AuthenticatedRegistryDeploymentIdentity {
+    verifying_key: VerifyingKey,
+}
+
+impl AuthenticatedRegistryDeploymentIdentity {
+    fn mint(verifying_key: VerifyingKey) -> Self {
+        Self { verifying_key }
+    }
+
+    #[doc(hidden)]
+    pub fn into_verifying_key(self) -> VerifyingKey {
+        self.verifying_key
+    }
+}
+
+struct TrustedRegistryDeploymentCredentials {
+    ca_verifying_key: VerifyingKey,
+    registry_credential: String,
+}
+
+fn load_trusted_registry_deployment_credentials(
+) -> anyhow::Result<TrustedRegistryDeploymentCredentials> {
+    let credential_dir = std::env::var_os("CREDENTIALS_DIRECTORY")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            dirs::config_dir().map(|dir| dir.join("hyprstream").join("credentials"))
+        })
+        .ok_or_else(|| anyhow::anyhow!("deployment credential directory is unavailable"))?;
+    let ca_bytes = std::fs::read(credential_dir.join("ca-pubkey"))
+        .map_err(|error| anyhow::anyhow!("deployment CA credential is unavailable: {error}"))?;
+    let ca_bytes: [u8; 32] = ca_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("deployment CA credential must be 32 bytes"))?;
+    let ca_verifying_key = VerifyingKey::from_bytes(&ca_bytes)
+        .map_err(|error| anyhow::anyhow!("deployment CA credential is malformed: {error}"))?;
+    let registry_path = credential_dir.join("registry-service-jwt");
+    let registry_bytes = std::fs::read(&registry_path).or_else(|flat_error| {
+        std::fs::read(credential_dir.join("registry").join("service-jwt"))
+            .map_err(|_| flat_error)
+    })?;
+    let registry_credential = String::from_utf8(registry_bytes)
+        .map_err(|error| anyhow::anyhow!("registry deployment credential is not UTF-8: {error}"))?;
+    Ok(TrustedRegistryDeploymentCredentials { ca_verifying_key, registry_credential })
+}
+
 /// Complete, already-validated native announcement ready for publication.
 pub struct NativeAnnouncementRequest {
     pub service_name: String,
@@ -251,7 +299,7 @@ impl QuicSharedConfig {
         let mut config = self.for_service(service_name, port);
         let publisher = self.native_announcement_publisher.clone();
         config.on_quic_bound = Some(Box::new(move |svc_name, addr, sn| {
-            let endpoint = format!("quic://{}:{}:{}", sn, addr.ip(), addr.port());
+            let endpoint = format!("quic://{sn}:{addr}");
             let sk = signing_key.clone();
             let jwt = service_jwt.clone();
             let accepted = accepted.clone();
@@ -369,6 +417,10 @@ pub struct ServiceContext {
     /// In multi-process mode, this is loaded from the ca-pubkey credential.
     ca_verifying_key: Option<VerifyingKey>,
 
+    /// Immutable output of the credential-verifying startup boundary.
+    authenticated_registry_identity: Option<VerifyingKey>,
+    authenticated_registry_bootstrap_available: bool,
+
     /// Optional JWKS fetcher for JWKS-backed key resolution.
     /// When set, `cluster_key_source()` returns `JwksKeySource(Mode::Isolated)`
     /// instead of `ClusterKeySource`.
@@ -407,6 +459,8 @@ impl ServiceContext {
             service_keys: HashMap::new(),
             native_announcements: HashMap::new(),
             ca_verifying_key: None,
+            authenticated_registry_identity: None,
+            authenticated_registry_bootstrap_available: false,
             jwks_fetcher: None,
             ml_dsa_verifying_keys: {
                 #[allow(clippy::disallowed_types)]
@@ -467,6 +521,66 @@ impl ServiceContext {
     pub fn with_ca_verifying_key(mut self, key: VerifyingKey) -> Self {
         self.ca_verifying_key = Some(key);
         self
+    }
+
+    /// Load, verify, and pin the deployment-owned registry credential.
+    ///
+    /// The trust anchor and credential are obtained together from the startup
+    /// credential boundary; caller-installed general JWT CA configuration is
+    /// deliberately ignored.
+    pub fn authenticate_registry_deployment_credential(&mut self) -> anyhow::Result<()> {
+        let credentials = load_trusted_registry_deployment_credentials()?;
+        self.authenticate_registry_deployment_credentials(credentials)
+    }
+
+    fn authenticate_registry_deployment_credentials(
+        &mut self,
+        credentials: TrustedRegistryDeploymentCredentials,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.authenticated_registry_identity.is_none(),
+            "registry deployment identity is already authenticated"
+        );
+        let claims = hyprstream_rpc::auth::jwt::decode(
+            &credentials.registry_credential,
+            &credentials.ca_verifying_key,
+            None,
+        )
+            .map_err(|error| anyhow::anyhow!("registry deployment credential rejected: {error}"))?;
+        anyhow::ensure!(
+            claims.sub == "service:registry",
+            "deployment credential is not for service:registry"
+        );
+        let key_bytes = claims
+            .cnf_key_bytes()
+            .ok_or_else(|| anyhow::anyhow!("registry deployment credential has no cnf.jwk"))?;
+        let verifying_key = VerifyingKey::from_bytes(&key_bytes)
+            .map_err(|error| anyhow::anyhow!("registry credential key is malformed: {error}"))?;
+        self.ca_verifying_key = Some(credentials.ca_verifying_key);
+        self.authenticated_registry_identity = Some(verifying_key);
+        self.authenticated_registry_bootstrap_available = true;
+        Ok(())
+    }
+
+    /// Read the already-authenticated identity without initializing it.
+    pub fn authenticated_registry_identity(&self) -> anyhow::Result<VerifyingKey> {
+        self.authenticated_registry_identity
+            .ok_or_else(|| anyhow::anyhow!("registry deployment identity is not authenticated"))
+    }
+
+    /// Take the sole bootstrap witness; the immutable pinned identity remains
+    /// available to the checkpoint writer and announcement verifier.
+    pub fn take_authenticated_registry_identity(
+        &mut self,
+    ) -> anyhow::Result<AuthenticatedRegistryDeploymentIdentity> {
+        anyhow::ensure!(
+            self.authenticated_registry_bootstrap_available,
+            "registry deployment bootstrap identity is unavailable"
+        );
+        self.authenticated_registry_bootstrap_available = false;
+        let key = self.authenticated_registry_identity
+            .ok_or_else(|| anyhow::anyhow!("registry deployment identity is unavailable"))?;
+        Ok(AuthenticatedRegistryDeploymentIdentity::mint(key))
     }
 
     /// Swap the signing key to an independent per-service key.
@@ -1068,5 +1182,75 @@ mod tests {
             .status()
             .expect("authority mutation subprocess");
         assert!(status.success(), "authority mutation subprocess failed");
+    }
+
+    #[test]
+    fn registry_credential_verification_ignores_mutable_registry_policy_entries() {
+        const CHILD: &str = "HYPRSTREAM_TEST_REGISTRY_CREDENTIAL_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("test executable"),
+            )
+            .arg("--exact")
+            .arg(
+                "service::factory::tests::registry_credential_verification_ignores_mutable_registry_policy_entries",
+            )
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .status()
+            .expect("registry credential subprocess");
+            assert!(status.success(), "registry credential subprocess failed");
+            return;
+        }
+
+        let caller = SigningKey::from_bytes(&[0x61; 32]);
+        crate::service::trust_store::global_trust_store().insert(
+            caller.verifying_key(),
+            crate::service::trust_store::Attestation {
+                scopes: std::iter::once("registry".to_owned()).collect(),
+                subject: None,
+                jwt: None,
+                expires_at: 0,
+                attested_by: None,
+            },
+        );
+        let ca = SigningKey::from_bytes(&[0x62; 32]);
+        let registry = SigningKey::from_bytes(&[0x63; 32]);
+        let now = chrono::Utc::now().timestamp();
+        let claims = hyprstream_rpc::auth::Claims::new(
+            "service:registry".to_owned(),
+            now,
+            now + 3600,
+        )
+        .with_cnf_jwk(registry.verifying_key().as_bytes());
+        let jwt = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &ca);
+        let local = SigningKey::from_bytes(&[0x64; 32]);
+        let mut context = ServiceContext::new(
+            local.clone(),
+            local.verifying_key(),
+            true,
+            std::path::PathBuf::from("caller-local-only"),
+        )
+        .with_ca_verifying_key(caller.verifying_key());
+        context
+            .authenticate_registry_deployment_credentials(TrustedRegistryDeploymentCredentials {
+                ca_verifying_key: ca.verifying_key(),
+                registry_credential: jwt,
+            })
+            .unwrap();
+        assert_eq!(
+            context.authenticated_registry_identity().unwrap(),
+            registry.verifying_key()
+        );
+        assert_ne!(
+            context.authenticated_registry_identity().unwrap(),
+            caller.verifying_key()
+        );
+        assert!(context.take_authenticated_registry_identity().is_ok());
+        assert_eq!(
+            context.authenticated_registry_identity().unwrap(),
+            registry.verifying_key()
+        );
+        assert!(context.take_authenticated_registry_identity().is_err());
     }
 }

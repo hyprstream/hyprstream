@@ -303,7 +303,7 @@ mod tests {
         CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType,
         Transport as At9pTransport,
     };
-    use hyprstream_pds::at9p_sign::sign_capsule;
+    use hyprstream_pds::at9p_sign::{sign_capsule, sign_update_record};
 
     fn accepted_state() -> AcceptedAt9pState {
         let signing = ed25519_dalek::SigningKey::from_bytes(&[0x41; 32]);
@@ -328,17 +328,17 @@ mod tests {
     }
 
     fn encode_body(state: &AcceptedAt9pState) -> Vec<u8> {
-        let head = match state.head() {
+        let (kind, head) = match state.head() {
             hyprstream_pds::at9p_duplicity::AcceptedAt9pHead::Genesis(capsule) => {
-                capsule.to_dag_cbor().expect("genesis bytes")
+                (0, capsule.to_dag_cbor().expect("genesis bytes"))
             }
             hyprstream_pds::at9p_duplicity::AcceptedAt9pHead::Update(update) => {
-                update.to_dag_cbor().expect("update bytes")
+                (1, update.to_dag_cbor().expect("update bytes"))
             }
         };
         let mut out = Vec::new();
         out.extend_from_slice(AT9P_STATE_MAGIC);
-        out.push(0);
+        out.push(kind);
         out.extend_from_slice(&state.epoch.to_be_bytes());
         out.extend_from_slice(&state.head_digest);
         out.push(u8::from(state.terminal));
@@ -349,6 +349,47 @@ mod tests {
         );
         out.extend_from_slice(&head);
         out
+    }
+
+    #[test]
+    fn update_fixture_encodes_and_decodes_update_kind() {
+        let genesis = accepted_state();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x41; 32]);
+        let (pq_signing, pq_verifying) = ml_dsa_generate_keypair();
+        let keys = HybridKeyPair::new(
+            signing.verifying_key().to_bytes().to_vec(),
+            ml_dsa_vk_bytes(&pq_verifying),
+        )
+        .expect("hybrid keys");
+        let endpoint = ServiceEndpoint::new(At9pTransport::Iroh, "iroh://updated-reach")
+            .expect("service endpoint");
+        let service = ServiceEntry::new("#updated", ServiceType::NinePExport, endpoint)
+            .expect("service entry");
+        let update = sign_update_record(
+            genesis.subject_cid512.clone(),
+            1,
+            genesis.head_digest,
+            CapsuleBody::new(vec![keys], vec![service]).expect("capsule body"),
+            "2099-01-01T00:00:00Z".to_owned(),
+            &signing,
+            &pq_signing,
+        )
+        .expect("signed update");
+        let state = AcceptedAt9pState::from_persisted_update(
+            &update.to_dag_cbor().expect("update bytes"),
+        )
+        .expect("accepted update");
+        assert_eq!(encode_body(&state)[AT9P_STATE_MAGIC.len()], 1);
+
+        let identity = ed25519_dalek::SigningKey::from_bytes(&[0x45; 32]);
+        let audit = ed25519_dalek::SigningKey::from_bytes(&[0x46; 32]);
+        let (envelope, _) = encode_fixture(&state, &identity, &audit);
+        let decoded = decode_state(&state.subject_cid512, &envelope, &identity.verifying_key())
+            .expect("decode update fixture");
+        assert!(matches!(
+            decoded.head(),
+            hyprstream_pds::at9p_duplicity::AcceptedAt9pHead::Update(_)
+        ));
     }
 
     fn encode_fixture(

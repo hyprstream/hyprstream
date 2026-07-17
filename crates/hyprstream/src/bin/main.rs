@@ -1423,7 +1423,14 @@ fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
 /// deployment-owned store plus authenticated registry identity internally;
 /// the public factory context supplies neither. The bootstrap dial is local
 /// only and supplies candidate announcements, never resolution authority.
-fn install_process_production_resolver(ctx: &ServiceContext) -> Result<()> {
+fn authenticate_registry_deployment_credential(ctx: &mut ServiceContext) -> Result<()> {
+    ctx.authenticate_registry_deployment_credential()
+}
+
+fn install_process_production_resolver(ctx: &mut ServiceContext) -> Result<()> {
+    if ctx.authenticated_registry_identity().is_err() {
+        authenticate_registry_deployment_credential(ctx)?;
+    }
     let discovery_vk = hyprstream_service::global_trust_store()
         .resolve_one("discovery")
         .ok_or_else(|| anyhow::anyhow!("trust store has no authenticated discovery key"))?;
@@ -1432,7 +1439,8 @@ fn install_process_production_resolver(ctx: &ServiceContext) -> Result<()> {
         discovery_vk,
         None,
     )?;
-    let authority = hyprstream_discovery::authenticate_discovery_bootstrap()?;
+    let registry_identity = ctx.take_authenticated_registry_identity()?;
+    let authority = hyprstream_discovery::authenticate_discovery_bootstrap(registry_identity)?;
     hyprstream_discovery::DiscoveryService::bootstrap_authenticated_process(
         authority,
         discovery_client,
@@ -1854,10 +1862,11 @@ fn main() -> Result<()> {
         .context("Failed to create registry runtime")?;
 
     // Start services and create keypair
-    let (registry_client, signing_key, verifying_key): (
+    let (registry_client, signing_key, verifying_key, mut resolver_context): (
         RegistryClient,
         SigningKey,
         VerifyingKey,
+        ServiceContext,
     ) = _registry_runtime
         .block_on(async {
             let models_dir = config.models_dir();
@@ -1865,11 +1874,14 @@ fn main() -> Result<()> {
             let signing_key = load_or_generate_signing_key(&keys_dir).await?;
             let verifying_key = signing_key.verifying_key();
 
-            // Resolve the registry service's verifying key from bootstrap pubkeys.
-            // CLI mode doesn't have a ServiceContext, so we look up the target
-            // pubkey directly from the credential store.
-            let registry_vk = resolve_service_vk("registry")
-                .ok_or_else(|| anyhow::anyhow!("Cannot resolve registry pubkey. Run wizard."))?;
+            let mut resolver_context = ServiceContext::new(
+                signing_key.clone(),
+                verifying_key,
+                execution_mode.uses_ipc(),
+                config.models_dir().clone(),
+            );
+            authenticate_registry_deployment_credential(&mut resolver_context)?;
+            let registry_vk = resolver_context.authenticated_registry_identity()?;
 
             // Pre-Discovery CLI bootstrap: the identity-bound resolver is not installed yet.
             let client = hyprstream_core::services::RegistryClient::for_local_bootstrap(
@@ -1878,20 +1890,26 @@ fn main() -> Result<()> {
                 None,
             )?;
 
-            Ok::<_, anyhow::Error>((client, signing_key, verifying_key))
+            Ok::<_, anyhow::Error>((client, signing_key, verifying_key, resolver_context))
         })
         .context("Failed to connect to services")?;
 
     // Every command process owns its resolver. Another daemon's process-local
-    // installation is intentionally irrelevant.
-    let resolver_context = ServiceContext::new(
-        signing_key.clone(),
-        verifying_key,
-        execution_mode.uses_ipc(),
-        config.models_dir().clone(),
-    );
-    install_process_production_resolver(&resolver_context)
-        .context("Failed to install checkpoint-backed production resolver")?;
+    // installation is intentionally irrelevant. A foreground/standalone
+    // service process installs after building its authenticated announcements,
+    // immediately before its first factory invocation.
+    let service_process_installs_later = matches.subcommand().is_some_and(|(command, args)| {
+        command == "service"
+            && matches!(
+                ServiceAction::from_arg_matches(args),
+                Ok(ServiceAction::Start { foreground: true, .. })
+                    | Ok(ServiceAction::Start { standalone: true, .. })
+            )
+    });
+    if !service_process_installs_later {
+        install_process_production_resolver(&mut resolver_context)
+            .context("Failed to install checkpoint-backed production resolver")?;
+    }
 
     // Create application context with shared registry client
     let config_for_service = config.clone();
@@ -2083,9 +2101,7 @@ fn main() -> Result<()> {
                                     // store maps ZMQ signing keys to subjects, and the policy service
                                     // signs ZMQ responses with its own independent keypair (not the CA
                                     // key). The CA key is only used to verify service JWTs (at+jwt).
-                                    if let Ok(ca_vk) = hyprstream_core::auth::identity_store::load_ca_verifying_key(&secrets_dir) {
-                                        ctx = ctx.with_ca_verifying_key(ca_vk);
-                                    }
+                                    authenticate_registry_deployment_credential(&mut ctx)?;
 
                                     // Load bootstrap pubkeys (all service pubkeys) into trust store
                                     if let Ok(pubkeys) = hyprstream_core::auth::identity_store::load_bootstrap_pubkeys(&secrets_dir) {
@@ -2151,10 +2167,7 @@ fn main() -> Result<()> {
                                     let secrets_dir = hyprstream_core::config::HyprConfig::resolve_secrets_dir()?;
 
                                     // Load CA verifying key (trust anchor)
-                                    let ca_vk = hyprstream_core::auth::identity_store::load_ca_verifying_key(&secrets_dir)
-                                        .context("CA key not found — run 'hyprstream wizard' first")?;
-                                    // CA key is for JWT verification only — not a ZMQ signing key.
-                                    ctx = ctx.with_ca_verifying_key(ca_vk);
+                                    authenticate_registry_deployment_credential(&mut ctx)?;
 
                                     // Load bootstrap pubkeys (all service pubkeys) into trust store
                                     let pubkeys = hyprstream_core::auth::identity_store::load_bootstrap_pubkeys(&secrets_dir)
@@ -2212,16 +2225,20 @@ fn main() -> Result<()> {
                                     }
                                 }
 
-                                // Authenticate and install this process's authority before any
-                                // inventory factory or downstream plugin can run.
-                                install_process_production_resolver(&ctx)?;
-
-                                // Wire QUIC shared config (must be after key generation so jwt_verifying_key is set)
                                 if quic_cfg.enabled {
                                     ctx = hyprstream_core::services::factories::with_checkpointed_native_announcements(
                                         ctx,
                                         &service_names,
                                     )?;
+                                }
+
+                                // Consume the bootstrap witness exactly once, after authenticated
+                                // announcements have read the pinned identity and before any
+                                // inventory factory or downstream plugin can run.
+                                install_process_production_resolver(&mut ctx)?;
+
+                                // Wire QUIC shared config (must be after key generation so jwt_verifying_key is set)
+                                if quic_cfg.enabled {
                                     let qc = quic_cfg;
                                     let (cert_chain, key_der) = qc.load_tls_materials()
                                         .context("Failed to load QUIC TLS materials")?;
@@ -2835,19 +2852,27 @@ mod resolver_startup_controls {
             .find("match matches.subcommand()")
             .expect("top-level command dispatch");
         let command_install = source[command_bootstrap..]
-            .find("install_process_production_resolver(&resolver_context)")
+            .find("install_process_production_resolver(&mut resolver_context)")
             .expect("command-process resolver install");
         assert!(command_install < command_dispatch);
+        assert!(source[command_bootstrap..command_bootstrap + command_dispatch]
+            .contains("if !service_process_installs_later"));
 
         let service_bootstrap = source
-            .find("// Authenticate and install this process's authority")
+            .find("// Consume the bootstrap witness exactly once")
             .expect("service-process bootstrap marker");
+        let announcement_search_start = service_bootstrap.saturating_sub(500);
+        let announcements = announcement_search_start
+            + source[announcement_search_start..service_bootstrap]
+            .find("with_checkpointed_native_announcements(")
+            .expect("authenticated announcements");
         let first_factory = source[service_bootstrap..]
             .find("get_factory(")
             .expect("first inventory factory invocation");
         let service_install = source[service_bootstrap..]
-            .find("install_process_production_resolver(&ctx)")
+            .find("install_process_production_resolver(&mut ctx)")
             .expect("service-process resolver install");
+        assert!(announcements < service_bootstrap);
         assert!(service_install < first_factory);
 
         // These entry points all dispatch below the single command bootstrap:

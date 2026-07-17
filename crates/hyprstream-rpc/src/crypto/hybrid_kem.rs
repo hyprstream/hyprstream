@@ -643,6 +643,13 @@ impl RecipientPublic {
                 );
             }
             let len = r.u32()? as usize;
+            let expected_len = want.component().ek_len();
+            if len != expected_len {
+                bail!(
+                    "ek {i} length {len} does not match {:?} public-key length {expected_len}",
+                    want
+                );
+            }
             eks.push(r.take(len)?.to_vec());
         }
         if r.pos != buf.len() {

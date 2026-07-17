@@ -39,6 +39,7 @@ pub const NODE_CREDENTIAL_NAMES: &[&str] = &[
     "quic-cert",
     "ca-pubkey",
     "bootstrap-pubkeys",
+    "registry-service-jwt",
 ];
 
 /// Per-service credentials — each service gets its own subdirectory.
@@ -187,6 +188,15 @@ pub fn service_unit(service: &str, use_systemd_creds: bool, depends_on: &[&str])
         let mut import_lines = String::new();
 
         for name in &names {
+            if *name == "registry-service-jwt" {
+                let registry_jwt = plain_creds.join("registry").join("service-jwt");
+                if registry_jwt.exists() {
+                    import_lines.push_str(&format!(
+                        "LoadCredential=registry-service-jwt:{}\n", registry_jwt.display()
+                    ));
+                    continue;
+                }
+            }
             // Per-service credentials (signing-key, service-jwt): each service
             // has its own independent Ed25519 key stored in a subdirectory.
             //

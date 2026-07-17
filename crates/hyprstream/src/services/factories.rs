@@ -98,13 +98,7 @@ pub fn with_checkpointed_native_announcements(
     mut ctx: ServiceContext,
     service_names: &[String],
 ) -> anyhow::Result<ServiceContext> {
-    let acceptance_identity = if ctx.is_ipc() {
-        hyprstream_service::global_trust_store()
-            .resolve_one("registry")
-            .ok_or_else(|| anyhow::anyhow!("trust store has no registry bootstrap key"))?
-    } else {
-        ctx.verifying_key()
-    };
+    let acceptance_identity = ctx.authenticated_registry_identity()?;
     let store = crate::services::discovery::PdsRecordStore::open_readonly(&pds_store_dir(&ctx)?)?
         .with_at9p_acceptance_identity(acceptance_identity);
     let states = store.accepted_at9p_states()?;
@@ -725,7 +719,11 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
         })
         .ok_or_else(|| anyhow::anyhow!("no active ES256 #atproto key for PDS publish"))?;
         let atproto_key: p256::ecdsa::SigningKey = (*active).clone();
-        let acceptance_identity = ctx.signing_key().clone();
+        let acceptance_identity = ctx.service_signing_key("registry");
+        anyhow::ensure!(
+            acceptance_identity.verifying_key() == ctx.authenticated_registry_identity()?,
+            "registry signing credential does not match authenticated deployment identity"
+        );
         // The alarm WAL must remain verifiable across OAuth key rotations and
         // process restarts. Derive a dedicated, stable audit identity from the
         // node/service root available in this deployment mode; the second
@@ -1806,13 +1804,7 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     // In-process factories share the stable node root. In IPC mode the
     // registry process signs with its stable service credential, whose public
     // key is anchored in the global service trust store.
-    let at9p_acceptance_identity = if ctx.is_ipc() {
-        hyprstream_service::global_trust_store()
-            .resolve_one("registry")
-            .ok_or_else(|| anyhow::anyhow!("trust store has no registry key"))?
-    } else {
-        ctx.verifying_key()
-    };
+    let at9p_acceptance_identity = ctx.authenticated_registry_identity()?;
     let pds_store_path = pds_store_dir(ctx)?;
     let pds_store = std::sync::Arc::new(
         open_pds_store_readonly(&pds_store_path)

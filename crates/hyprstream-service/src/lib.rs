@@ -30,7 +30,7 @@ pub use service::spawner::{
 pub use service::factory::{
     deployment_data_dir, get_factory, list_factories, NativeAnnouncementPublisher,
     NativeAnnouncementRequest, NativeServiceAnnouncement, QuicSharedConfig, ServiceContext,
-    ServiceFactory, ServiceFactoryFn,
+    ServiceFactory, ServiceFactoryFn, AuthenticatedRegistryDeploymentIdentity,
 };
 
 pub use service::trust_store::{TrustStore, Attestation, global_trust_store};
