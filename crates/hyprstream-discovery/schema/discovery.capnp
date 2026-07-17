@@ -187,6 +187,17 @@ struct EndpointInfo {
   tlsEndorsement @3 :Data;
   # Domain the TLS cert covers — optional, present when tlsEndorsement is set
   tlsDomain @4 :Text;
+  # Identity-bound announcement projection. Empty for process-local registry
+  # entries, which are never production resolver candidates.
+  serviceDid @5 :Text $domainType("hyprstream_rpc::identity::Did");
+  capabilities @6 :List(Text);
+  acceptedStateDigest @7 :Data;
+  acceptedStateEpoch @8 :UInt64;
+  responseKeyId @9 :Text;
+  requestKemKeyId @10 :Text;
+  requestKemRecipient @11 :Data;
+  expiresAtUnixMs @12 :Int64;
+  sourceSigner @13 :Data;
 }
 
 # Endpoints for a specific service

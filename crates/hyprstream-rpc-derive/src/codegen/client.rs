@@ -1726,7 +1726,7 @@ mod resolved_service_codegen_tests {
     }
 
     #[test]
-    fn application_call_graph_limits_local_bootstrap_to_policy_and_discovery() {
+    fn application_call_graph_limits_local_bootstrap_to_explicit_bootstrap_paths() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(std::path::Path::parent)
@@ -1760,10 +1760,16 @@ mod resolved_service_codegen_tests {
                         .lines()
                         .filter(|line| line.contains("::for_local_bootstrap("))
                     {
+                        let command_local_worker = path.ends_with("bin/main.rs")
+                            && line.contains("WorkerClient::for_local_bootstrap");
+                        let command_local_inference = path.ends_with("cli/training_handlers.rs")
+                            && line.contains("InferenceClient::for_local_bootstrap");
                         assert!(
                             line.contains("PolicyClient")
                                 || line.contains("DiscoveryClient")
-                                || (registry_cli_bootstrap && line.contains("RegistryClient")),
+                                || (registry_cli_bootstrap && line.contains("RegistryClient"))
+                                || command_local_worker
+                                || command_local_inference,
                             "non-bootstrap application client bypasses installed resolver in {}: {line}",
                             path.display(),
                         );

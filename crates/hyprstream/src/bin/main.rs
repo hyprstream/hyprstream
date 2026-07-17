@@ -1187,8 +1187,12 @@ fn handle_quick_command(
                     };
 
                     use hyprstream_workers::runtime::WorkerClient;
-                    let worker_client =
-                        WorkerClient::from_resolver(signing_key, None)?;
+                    let worker_client = if worker_already_running {
+                        WorkerClient::from_resolver(signing_key, None)?
+                    } else {
+                        let destination = signing_key.verifying_key();
+                        WorkerClient::for_local_bootstrap(signing_key, destination, None)?
+                    };
 
                     match action {
                         WorkerAction::List {
@@ -1412,6 +1416,26 @@ fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
         }
     }
     trust.resolve_one(service_name)
+}
+
+/// Install this process's checkpoint-backed resolver before any ordinary
+/// generated client can be constructed. The context fixes the canonical store
+/// and authenticated registry identity; the Discovery bootstrap dial is local
+/// only and supplies candidate announcements, never resolution authority.
+fn install_process_production_resolver(ctx: &ServiceContext) -> Result<()> {
+    ctx.seal_discovery_bootstrap_authority()?;
+    let discovery_vk = hyprstream_service::global_trust_store()
+        .resolve_one("discovery")
+        .ok_or_else(|| anyhow::anyhow!("trust store has no authenticated discovery key"))?;
+    let discovery_client = hyprstream_core::services::DiscoveryClient::for_local_bootstrap(
+        ctx.signing_key().clone(),
+        discovery_vk,
+        None,
+    )?;
+    hyprstream_discovery::DiscoveryService::install_process_bootstrap(
+        ctx,
+        discovery_client,
+    )
 }
 
 /// Install the process-global envelope verify configuration (#152, #160).
@@ -1857,6 +1881,17 @@ fn main() -> Result<()> {
         })
         .context("Failed to connect to services")?;
 
+    // Every command process owns its resolver. Another daemon's process-local
+    // installation is intentionally irrelevant.
+    let resolver_context = ServiceContext::new(
+        signing_key.clone(),
+        verifying_key,
+        execution_mode.uses_ipc(),
+        config.models_dir().clone(),
+    );
+    install_process_production_resolver(&resolver_context)
+        .context("Failed to install checkpoint-backed production resolver")?;
+
     // Create application context with shared registry client
     let config_for_service = config.clone();
     let ctx = AppContext::with_client(config, Clone::clone(&registry_client));
@@ -2176,10 +2211,9 @@ fn main() -> Result<()> {
                                     }
                                 }
 
-                                // Seal production resolution authority before any inventory service
-                                // factory or downstream plugin can run. Both inputs are derived inside
-                                // ServiceContext from the authenticated deployment context.
-                                ctx.seal_discovery_bootstrap_authority()?;
+                                // Consume and install this process's authority before any inventory
+                                // factory or downstream plugin can run.
+                                install_process_production_resolver(&ctx)?;
 
                                 // Wire QUIC shared config (must be after key generation so jwt_verifying_key is set)
                                 if quic_cfg.enabled {
@@ -2785,4 +2819,67 @@ fn main() -> Result<()> {
     };
 
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod resolver_startup_controls {
+    #[test]
+    fn command_and_service_processes_install_before_consumers() {
+        let source = include_str!("main.rs");
+        let command_bootstrap = source
+            .find("// Every command process owns its resolver")
+            .expect("command-process bootstrap marker");
+        let command_dispatch = source[command_bootstrap..]
+            .find("match matches.subcommand()")
+            .expect("top-level command dispatch");
+        let command_install = source[command_bootstrap..]
+            .find("install_process_production_resolver(&resolver_context)")
+            .expect("command-process resolver install");
+        assert!(command_install < command_dispatch);
+
+        let service_bootstrap = source
+            .find("// Consume and install this process's authority")
+            .expect("service-process bootstrap marker");
+        let first_factory = source[service_bootstrap..]
+            .find("get_factory(")
+            .expect("first inventory factory invocation");
+        let service_install = source[service_bootstrap..]
+            .find("install_process_production_resolver(&ctx)")
+            .expect("service-process resolver install");
+        assert!(service_install < first_factory);
+
+        // These entry points all dispatch below the single command bootstrap:
+        // quick, TUI, schema/tool, MCP/OpenAI services, shell, training, git,
+        // and isolated `service start` IPC consumers.
+        for entry in [
+            "Some((\"tool\"",
+            "Some((\"quick\"",
+            "Some((\"tui\"",
+            "handle_shell_tui",
+            "handle_training_batch",
+        ] {
+            assert!(source[command_bootstrap..].contains(entry), "missing {entry}");
+        }
+    }
+
+    #[test]
+    fn command_local_spawns_never_use_the_production_resolver() {
+        let source = include_str!("main.rs");
+        let worker = source
+            .find("let worker_client = if worker_already_running")
+            .expect("worker client selection");
+        let worker_selection = &source[worker..worker + 500];
+        assert!(worker_selection.contains("WorkerClient::from_resolver"));
+        assert!(worker_selection.contains("WorkerClient::for_local_bootstrap"));
+
+        let training = include_str!("../cli/training_handlers.rs");
+        assert_eq!(training.matches("InferenceClient::from_resolver").count(), 0);
+        assert_eq!(
+            training
+                .matches("InferenceClient::for_local_bootstrap")
+                .count(),
+            2
+        );
+    }
 }

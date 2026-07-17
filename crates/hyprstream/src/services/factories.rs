@@ -1831,7 +1831,7 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     .with_auth_provider(Box::new(auth_provider))
     .with_record_resolver(std::sync::Arc::clone(&record_resolver)
         as std::sync::Arc<dyn hyprstream_discovery::RecordResolver>);
-    discovery_service.install_bootstrap_authority(ctx.take_discovery_bootstrap_authority()?)?;
+    discovery_service.attach_process_accepted_state_source()?;
     if let Some(issuer) = ctx.oauth_issuer_url() {
         discovery_service = discovery_service.with_oauth_issuer(issuer.to_owned());
         // Use the issuer URL as the audience for discovery tokens

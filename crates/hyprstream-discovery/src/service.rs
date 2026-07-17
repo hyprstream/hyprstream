@@ -677,6 +677,7 @@ impl StreamHandle for CurrentStreamHandle {
 struct DiscoveryServiceResolver {
     announced_endpoints: Arc<RwLock<HashMap<String, Vec<AnnouncedEndpoint>>>>,
     accepted_state_source: Arc<dyn AcceptedStateSource>,
+    discovery_client: Option<crate::DiscoveryClient>,
 }
 
 /// Phase 0.5 Stage D — cached signed OIDF entity statement.
@@ -853,21 +854,6 @@ impl DiscoveryService {
         self
     }
 
-    /// Build the resolver sharing only owned candidate/state handles. No
-    /// Cap'n Proto reader or registry guard crosses the boundary.
-    fn install_production_resolver(&self) -> Result<()> {
-        let source = self
-            .accepted_state_source
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Discovery accepted-state source is not installed"))?;
-        PRODUCTION_RESOLVER
-            .set(Arc::new(DiscoveryServiceResolver {
-                announced_endpoints: Arc::clone(&self.announced_endpoints),
-                accepted_state_source: source,
-            }))
-            .map_err(|_| anyhow::anyhow!("production service resolver is already installed"))
-    }
-
     /// Prove that downstream crates cannot access any production authority
     /// construction or installation seam.
     ///
@@ -920,19 +906,41 @@ impl DiscoveryService {
     /// }
     /// ```
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn install_bootstrap_authority(
-        &mut self,
-        authority: hyprstream_service::DiscoveryBootstrapAuthority,
+    pub fn install_process_bootstrap(
+        context: &hyprstream_service::ServiceContext,
+        discovery_client: crate::DiscoveryClient,
     ) -> Result<()> {
-        let (path, acceptance_identity) = authority.into_parts();
-        let source = Arc::new(
-            crate::checkpointed_pds::CheckpointedPdsAcceptedStateSource::open(
-                &path,
-                acceptance_identity,
-            )?,
+        let source: Arc<dyn AcceptedStateSource> =
+            context.consume_discovery_bootstrap_authority(|path, acceptance_identity| {
+                Ok(Arc::new(
+                    crate::checkpointed_pds::CheckpointedPdsAcceptedStateSource::open(
+                        path,
+                        acceptance_identity,
+                    )?,
+                ) as Arc<dyn AcceptedStateSource>)
+            })?;
+        PROCESS_ACCEPTED_STATE_SOURCE
+            .set(Arc::clone(&source))
+            .map_err(|_| anyhow::anyhow!("process Discovery authority is already consumed"))?;
+        PRODUCTION_RESOLVER
+            .set(Arc::new(DiscoveryServiceResolver {
+                announced_endpoints: Arc::new(RwLock::new(HashMap::new())),
+                accepted_state_source: source,
+                discovery_client: Some(discovery_client),
+            }))
+            .map_err(|_| anyhow::anyhow!("production service resolver is already installed"))
+    }
+
+    /// Attach the process-pinned source to the Discovery daemon. The source
+    /// was fixed and consumed before inventory factories were invoked.
+    pub fn attach_process_accepted_state_source(&mut self) -> Result<()> {
+        self.accepted_state_source = Some(
+            PROCESS_ACCEPTED_STATE_SOURCE
+                .get()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("process Discovery authority is not installed"))?,
         );
-        self.accepted_state_source = Some(source);
-        self.install_production_resolver()
+        Ok(())
     }
 
     #[cfg(test)]
@@ -942,6 +950,7 @@ impl DiscoveryService {
             accepted_state_source: self.accepted_state_source.clone().ok_or_else(|| {
                 anyhow::anyhow!("Discovery accepted-state source is not installed")
             })?,
+            discovery_client: None,
         })
     }
 
@@ -988,8 +997,11 @@ fn accepted_expiry_unix_ms(
 impl DiscoveryServiceResolver {
     #[cfg(test)]
     async fn resolve_service(&self, query: ServiceQuery) -> Result<ResolvedService> {
-        let selected =
-            select_service_candidate(&query, self.acquire_candidates(&query)?, unix_millis_now())?;
+        let selected = select_service_candidate(
+            &query,
+            self.acquire_candidates(&query).await?,
+            unix_millis_now(),
+        )?;
         let state = self
             .accepted_state_source
             .accepted_state(selected.service_did().as_str())?
@@ -997,13 +1009,39 @@ impl DiscoveryServiceResolver {
         ResolvedService::mint(selected, &state)
     }
 
-    fn acquire_candidates(&self, query: &ServiceQuery) -> Result<Vec<ServiceCandidate>> {
-        let announced = self.announced_endpoints.read();
-        let entries = announced
-            .get(&query.service_name)
-            .cloned()
-            .unwrap_or_default();
-        drop(announced);
+    async fn acquire_candidates(&self, query: &ServiceQuery) -> Result<Vec<ServiceCandidate>> {
+        let entries = if let Some(client) = &self.discovery_client {
+            client
+                .get_endpoints(&query.service_name)
+                .await?
+                .endpoints
+                .into_iter()
+                .filter_map(|endpoint| {
+                    let source_signer: [u8; 32] = endpoint.source_signer.try_into().ok()?;
+                    Some(AnnouncedEndpoint {
+                        socket_kind: endpoint.socket_kind,
+                        endpoint: endpoint.endpoint,
+                        service_jwt: endpoint.service_jwt,
+                        service_did: endpoint.service_did,
+                        capabilities: endpoint.capabilities.into_iter().collect(),
+                        accepted_state_digest: endpoint.accepted_state_digest,
+                        accepted_state_epoch: endpoint.accepted_state_epoch,
+                        response_key_id: endpoint.response_key_id,
+                        request_kem_key_id: endpoint.request_kem_key_id,
+                        request_kem_recipient: endpoint.request_kem_recipient,
+                        expires_at_unix_ms: endpoint.expires_at_unix_ms,
+                        source_signer,
+                        last_heartbeat: Instant::now(),
+                    })
+                })
+                .collect()
+        } else {
+            self.announced_endpoints
+                .read()
+                .get(&query.service_name)
+                .cloned()
+                .unwrap_or_default()
+        };
 
         let mut candidates = Vec::new();
         for entry in entries {
@@ -1083,7 +1121,7 @@ impl DiscoveryServiceResolver {
         &self,
         query: ServiceQuery,
     ) -> Result<Vec<ResolvedService>> {
-        let candidates = self.acquire_candidates(&query)?;
+        let candidates = self.acquire_candidates(&query).await?;
         let selected = select_service_candidates(&query, candidates, unix_millis_now())?;
         let mut resolved = Vec::with_capacity(selected.len());
         for item in selected {
@@ -1116,6 +1154,8 @@ impl DiscoveryServiceResolver {
     }
 }
 
+static PROCESS_ACCEPTED_STATE_SOURCE: std::sync::OnceLock<Arc<dyn AcceptedStateSource>> =
+    std::sync::OnceLock::new();
 static PRODUCTION_RESOLVER: std::sync::OnceLock<Arc<DiscoveryServiceResolver>> =
     std::sync::OnceLock::new();
 
@@ -1570,6 +1610,7 @@ mod resolver_tests {
             DiscoveryServiceResolver {
                 announced_endpoints: announced,
                 accepted_state_source: Arc::clone(&source) as Arc<dyn AcceptedStateSource>,
+                discovery_client: None,
             },
             source,
         )
@@ -1750,6 +1791,120 @@ mod resolver_tests {
         let client_signing = SigningKey::from_bytes(&[0x44; 32]);
         let _client = crate::DiscoveryClient::from_resolver(client_signing, None)
             .unwrap_or_else(|e| panic!("generated resolver path failed: {e}"));
+    }
+
+    #[test]
+    fn isolated_process_without_bootstrap_fails_closed() {
+        const CHILD: &str = "HYPRSTREAM_TEST_RESOLVER_ABSENT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let signing = SigningKey::from_bytes(&[0x46; 32]);
+            let error = match production_rpc_client("model", signing, None) {
+                Ok(_) => panic!("isolated process unexpectedly inherited another resolver"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("not installed"));
+            return;
+        }
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("discovery test executable"),
+        )
+        .arg("--exact")
+        .arg("service::resolver_tests::isolated_process_without_bootstrap_fails_closed")
+        .arg("--nocapture")
+        .env(CHILD, "1")
+        .status()
+        .expect("isolated resolver subprocess");
+        assert!(status.success(), "isolated resolver subprocess failed");
+    }
+
+    struct NoopBootstrapClient;
+
+    #[async_trait::async_trait]
+    impl RpcClient for NoopBootstrapClient {
+        async fn call(&self, _: Vec<u8>) -> Result<Vec<u8>> {
+            anyhow::bail!("bootstrap transport was unexpectedly dispatched")
+        }
+        async fn call_for_service(&self, _: &str, _: Vec<u8>) -> Result<Vec<u8>> {
+            anyhow::bail!("bootstrap transport was unexpectedly dispatched")
+        }
+        async fn call_with_options(&self, _: Vec<u8>, _: CallOptions) -> Result<Vec<u8>> {
+            anyhow::bail!("bootstrap transport was unexpectedly dispatched")
+        }
+        async fn call_with_options_for_service(
+            &self,
+            _: &str,
+            _: Vec<u8>,
+            _: CallOptions,
+        ) -> Result<Vec<u8>> {
+            anyhow::bail!("bootstrap transport was unexpectedly dispatched")
+        }
+        async fn call_streaming(&self, _: Vec<u8>, _: [u8; 32]) -> Result<Vec<u8>> {
+            anyhow::bail!("bootstrap transport was unexpectedly dispatched")
+        }
+        async fn call_streaming_for_service(
+            &self,
+            _: &str,
+            _: Vec<u8>,
+            _: [u8; 32],
+        ) -> Result<Vec<u8>> {
+            anyhow::bail!("bootstrap transport was unexpectedly dispatched")
+        }
+        async fn open_stream(&self, _: Vec<u8>) -> Result<Box<dyn StreamHandle>> {
+            anyhow::bail!("bootstrap transport was unexpectedly dispatched")
+        }
+        async fn open_stream_from_info(
+            &self,
+            _: hyprstream_rpc::stream_info::StreamInfo,
+            _: [u8; 32],
+            _: [u8; 32],
+        ) -> Result<Box<dyn StreamHandle>> {
+            anyhow::bail!("bootstrap transport was unexpectedly dispatched")
+        }
+        fn next_id(&self) -> u64 {
+            1
+        }
+    }
+
+    #[test]
+    fn process_bootstrap_precedes_first_generated_client() {
+        const CHILD: &str = "HYPRSTREAM_TEST_RESOLVER_BOOTSTRAP_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let models = tempfile::tempdir().expect("service-owned data root");
+            let store = models.path().join(".registry/pds-store");
+            std::fs::create_dir_all(&store).expect("checkpoint store directory");
+            drop(rocksdb::DB::open_default(&store).expect("empty checkpoint store"));
+            let signing = SigningKey::from_bytes(&[0x47; 32]);
+            let context = hyprstream_service::ServiceContext::new(
+                signing.clone(),
+                signing.verifying_key(),
+                false,
+                models.path().to_owned(),
+            );
+            context
+                .seal_discovery_bootstrap_authority()
+                .expect("seal process authority");
+            DiscoveryService::install_process_bootstrap(
+                &context,
+                crate::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
+            )
+            .expect("install process resolver");
+            assert!(production_rpc_client("model", signing, None).is_ok());
+            assert!(context.seal_discovery_bootstrap_authority().is_err());
+            assert!(context
+                .consume_discovery_bootstrap_authority(|_, _| Ok(()))
+                .is_err());
+            return;
+        }
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("discovery test executable"),
+        )
+        .arg("--exact")
+        .arg("service::resolver_tests::process_bootstrap_precedes_first_generated_client")
+        .arg("--nocapture")
+        .env(CHILD, "1")
+        .status()
+        .expect("resolver bootstrap subprocess");
+        assert!(status.success(), "resolver bootstrap subprocess failed");
     }
 
     #[tokio::test]
@@ -2034,6 +2189,15 @@ impl DiscoveryHandler for DiscoveryService {
                     service_jwt: String::new(),
                     tls_endorsement: self.tls_endorsement.clone(),
                     tls_domain: self.tls_domain.clone(),
+                    service_did: Did::default(),
+                    capabilities: Vec::new(),
+                    accepted_state_digest: Vec::new(),
+                    accepted_state_epoch: 0,
+                    response_key_id: String::new(),
+                    request_kem_key_id: String::new(),
+                    request_kem_recipient: Vec::new(),
+                    expires_at_unix_ms: 0,
+                    source_signer: Vec::new(),
                 })
                 .collect(),
             None => Vec::new(),
@@ -2051,6 +2215,15 @@ impl DiscoveryHandler for DiscoveryService {
                         service_jwt: ep.service_jwt.clone(),
                         tls_endorsement: self.tls_endorsement.clone(),
                         tls_domain: self.tls_domain.clone(),
+                        service_did: ep.service_did.clone(),
+                        capabilities: ep.capabilities.iter().cloned().collect(),
+                        accepted_state_digest: ep.accepted_state_digest.clone(),
+                        accepted_state_epoch: ep.accepted_state_epoch,
+                        response_key_id: ep.response_key_id.clone(),
+                        request_kem_key_id: ep.request_kem_key_id.clone(),
+                        request_kem_recipient: ep.request_kem_recipient.clone(),
+                        expires_at_unix_ms: ep.expires_at_unix_ms,
+                        source_signer: ep.source_signer.to_vec(),
                     });
                 }
             }

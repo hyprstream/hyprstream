@@ -12,7 +12,7 @@ pub mod trust_store;
 
 pub use spawner::{InprocManager, Spawnable, SpawnedService};
 pub use factory::{
-    get_factory, list_factories, DiscoveryBootstrapAuthority, NativeAnnouncementPublisher,
+    get_factory, list_factories, NativeAnnouncementPublisher,
     NativeAnnouncementRequest, NativeServiceAnnouncement, QuicSharedConfig, ServiceContext,
     ServiceFactory,
 };

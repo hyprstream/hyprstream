@@ -36,18 +36,15 @@ use hyprstream_rpc::transport::TransportConfig;
 /// One-shot, non-cloneable witness for installing the production Discovery
 /// authority. Only [`ServiceContext`] can mint it, from the authenticated
 /// application identity and its canonical service-owned data directory.
-pub struct DiscoveryBootstrapAuthority {
+struct DiscoveryBootstrapAuthority {
     store_path: std::path::PathBuf,
     acceptance_identity: VerifyingKey,
 }
 
-impl DiscoveryBootstrapAuthority {
-    /// Consume the witness. This is intentionally the only way Discovery can
-    /// obtain the already-fixed authority inputs.
-    #[doc(hidden)]
-    pub fn into_parts(self) -> (std::path::PathBuf, VerifyingKey) {
-        (self.store_path, self.acceptance_identity)
-    }
+enum DiscoveryAuthorityState {
+    Unsealed,
+    Sealed(Box<DiscoveryBootstrapAuthority>),
+    Consumed,
 }
 
 /// Complete, already-validated native announcement ready for publication.
@@ -362,7 +359,7 @@ pub struct ServiceContext {
 
     /// One-shot production authority latch. Interior mutability is required
     /// because inventory factories receive a shared context.
-    discovery_authority: parking_lot::Mutex<Option<DiscoveryBootstrapAuthority>>,
+    discovery_authority: parking_lot::Mutex<DiscoveryAuthorityState>,
 
     /// Shared QUIC/WebTransport config (TLS materials + base settings).
     /// Per-service ports are resolved via `into_spawnable_quic()`.
@@ -422,7 +419,7 @@ impl ServiceContext {
             identity_provider,
             ipc,
             models_dir,
-            discovery_authority: parking_lot::Mutex::new(None),
+            discovery_authority: parking_lot::Mutex::new(DiscoveryAuthorityState::Unsealed),
             quic_shared: None,
             oauth_issuer_url: None,
             federation_key_source: None,
@@ -792,8 +789,8 @@ impl ServiceContext {
     pub fn seal_discovery_bootstrap_authority(&self) -> anyhow::Result<()> {
         let mut slot = self.discovery_authority.lock();
         anyhow::ensure!(
-            slot.is_none(),
-            "Discovery bootstrap authority was already sealed"
+            matches!(*slot, DiscoveryAuthorityState::Unsealed),
+            "Discovery bootstrap authority is already sealed or consumed"
         );
         let acceptance_identity = if self.ipc {
             crate::service::trust_store::global_trust_store()
@@ -807,22 +804,35 @@ impl ServiceContext {
             store_path.is_absolute(),
             "service-owned PDS path must be absolute"
         );
-        *slot = Some(DiscoveryBootstrapAuthority {
+        *slot = DiscoveryAuthorityState::Sealed(Box::new(DiscoveryBootstrapAuthority {
             store_path,
             acceptance_identity,
-        });
+        }));
         Ok(())
     }
 
-    /// Consume the pre-sealed authority. Calling this method cannot derive a
-    /// new identity or path, and the slot cannot be replaced after sealing.
-    pub fn take_discovery_bootstrap_authority(
+    /// Consume the pre-sealed authority inside one terminal operation. The
+    /// opaque witness is never returned or nameable outside this crate, and
+    /// the state becomes `Consumed` before the callback runs (including when
+    /// the callback fails).
+    #[doc(hidden)]
+    pub fn consume_discovery_bootstrap_authority<T>(
         &self,
-    ) -> anyhow::Result<DiscoveryBootstrapAuthority> {
-        self.discovery_authority
-            .lock()
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("Discovery bootstrap authority is unavailable"))
+        consume: impl FnOnce(&std::path::Path, VerifyingKey) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let mut slot = self.discovery_authority.lock();
+        match std::mem::replace(&mut *slot, DiscoveryAuthorityState::Consumed) {
+            DiscoveryAuthorityState::Sealed(authority) => {
+                drop(slot);
+                consume(&authority.store_path, authority.acceptance_identity)
+            }
+            state => {
+                *slot = state;
+                Err(anyhow::anyhow!(
+                    "Discovery bootstrap authority is unavailable or already consumed"
+                ))
+            }
+        }
     }
 
     /// Get transport config for a service endpoint from the registry.
@@ -1091,16 +1101,20 @@ mod tests {
                 .seal_discovery_bootstrap_authority()
                 .expect("seal trusted startup authority");
             assert!(context.seal_discovery_bootstrap_authority().is_err());
-            let authority = context
-                .take_discovery_bootstrap_authority()
+            let (path, identity) = context
+                .consume_discovery_bootstrap_authority(|path, identity| {
+                    Ok((path.to_owned(), identity))
+                })
                 .expect("trusted startup authority");
-            let (path, identity) = authority.into_parts();
             assert_eq!(
                 path,
                 models.canonicalize().unwrap().join(".registry/pds-store")
             );
             assert_eq!(identity, application.verifying_key());
-            assert!(context.take_discovery_bootstrap_authority().is_err());
+            assert!(context
+                .consume_discovery_bootstrap_authority(|_, _| Ok(()))
+                .is_err());
+            assert!(context.seal_discovery_bootstrap_authority().is_err());
 
             let registry = SigningKey::from_bytes(&[0x73; 32]);
             crate::service::trust_store::global_trust_store().insert(
@@ -1123,10 +1137,9 @@ mod tests {
             ipc_context
                 .seal_discovery_bootstrap_authority()
                 .expect("seal authenticated registry authority");
-            let (_, ipc_identity) = ipc_context
-                .take_discovery_bootstrap_authority()
-                .expect("authenticated registry authority")
-                .into_parts();
+            let ipc_identity = ipc_context
+                .consume_discovery_bootstrap_authority(|_, identity| Ok(identity))
+                .expect("authenticated registry authority");
             assert_eq!(ipc_identity, registry.verifying_key());
             return;
         }
@@ -1148,5 +1161,45 @@ mod tests {
             .status()
             .expect("authority mutation subprocess");
         assert!(status.success(), "authority mutation subprocess failed");
+    }
+
+    #[test]
+    fn production_authority_has_exactly_one_concurrent_consumer() {
+        let models = tempfile::tempdir().expect("service-owned data root");
+        let application = SigningKey::from_bytes(&[0x75; 32]);
+        let context = Arc::new(ServiceContext::new(
+            application.clone(),
+            application.verifying_key(),
+            false,
+            models.path().to_owned(),
+        ));
+        context
+            .seal_discovery_bootstrap_authority()
+            .expect("seal authority");
+        let barrier = Arc::new(std::sync::Barrier::new(9));
+        let mut attempts = Vec::new();
+        for _ in 0..8 {
+            let context = Arc::clone(&context);
+            let barrier = Arc::clone(&barrier);
+            attempts.push(std::thread::spawn(move || {
+                barrier.wait();
+                context
+                    .consume_discovery_bootstrap_authority(|_, _| Ok(()))
+                    .is_ok()
+            }));
+        }
+        barrier.wait();
+        assert_eq!(
+            attempts
+                .into_iter()
+                .map(|attempt| attempt.join().expect("consumer thread"))
+                .filter(|consumed| *consumed)
+                .count(),
+            1
+        );
+        assert!(context
+            .consume_discovery_bootstrap_authority(|_, _| Ok(()))
+            .is_err());
+        assert!(context.seal_discovery_bootstrap_authority().is_err());
     }
 }

@@ -688,10 +688,7 @@ async fn dispatch_schema_call(service: &str, method: &str, ctx: &ToolCallContext
             client.call_method(method, &ctx.args).await
         }
         "policy" => {
-            let server_vk = hyprstream_service::global_trust_store().resolve_one("policy")
-                .ok_or_else(|| anyhow::anyhow!("trust store has no policy bootstrap key"))?;
-            let client = PolicyClient::for_local_bootstrap(signing_key, server_vk, None)?;
-            client.call_method(method, &ctx.args).await
+            ctx.policy_client.call_method(method, &ctx.args).await
         }
         "tui" => {
             let client = TuiClient::from_resolver(signing_key, None)?;
