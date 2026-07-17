@@ -233,13 +233,23 @@ jobs:
             # binary (get.nexte.st linux-arm == aarch64) onto PATH in the container.
             curl -LsSf https://get.nexte.st/latest/linux-arm | tar zxf - -C /usr/local/bin
 
+            # git-lfs: the git2db LFS worktree tests shell out to the git-lfs binary.
+            # GitHub-hosted ubuntu-latest ships it preinstalled (why the old gate
+            # passed); the arm64 builder image does not, so install it here. TODO:
+            # bake git-lfs into the rust-builder image and drop this step (#1011).
+            apt-get update && apt-get install -y --no-install-recommends git-lfs
+            git lfs install --system --skip-repo
+
             # nextest enforces the per-TEST slow-timeout from .config/nextest.toml
             # ([profile.ci]): a deadlocked test is SIGKILLed rather than stalling the
             # job to its 90min / the queue to its 120min timeout. Guest wasm paths are
             # container-absolute (/build is the bind mount).
             export HYPRSTREAM_PYGUEST_WASM=/build/crates/hyprstream-workers-python-guest/target/wasm32-unknown-unknown/release/hyprstream_workers_python_guest.wasm
             export HYPRSTREAM_FSGUEST_WASM=/build/crates/hyprstream-workers-wasmtime-fsguest/target/wasm32-wasip1/release/hyprstream-workers-wasmtime-fsguest.wasm
-            cargo nextest run --cargo-profile ci-test --profile ci
+            # TEMP (#1011 validation): --no-fail-fast enumerates EVERY arm64 failure
+            # in one pass instead of stopping at the first, so env/arch gaps surface
+            # together. Revert to plain fail-fast for the real gate.
+            cargo nextest run --cargo-profile ci-test --profile ci --no-fail-fast
 
             # nextest does not run doctests; keep them in the merge gate.
             cargo test --release --doc
