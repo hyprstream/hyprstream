@@ -31,6 +31,7 @@
 //! - FIPS mode: HMAC-SHA256 (FIPS 198-1)
 
 use std::future::Future;
+use std::sync::Arc;
 
 use anyhow::Result;
 use capnp::message::Builder;
@@ -240,9 +241,11 @@ pub struct StreamContext {
     /// `None` on the legacy classical [`from_dh`](Self::from_dh) and the keyless
     /// [`new`](Self::new) paths.
     kem_ciphertexts: Option<Vec<u8>>,
-    /// Identified, transcript-bound epoch state.  Present only on the pinned
-    /// HyKEM path; legacy/keyless contexts cannot ratchet into this profile.
-    epoch_ratchet: Option<crate::stream_epoch::StreamEpochRatchet>,
+    /// Shared one-shot identified producer state. The outer `Option` is a
+    /// persistent profile marker; the inner state is consumed exactly once
+    /// across every clone before an identified publisher creates MoQ resources.
+    /// Legacy/keyless contexts have no claim and cannot ratchet into this profile.
+    epoch_ratchet: Option<Arc<parking_lot::Mutex<Option<crate::stream_epoch::StreamEpochRatchet>>>>,
 }
 
 impl StreamContext {
@@ -367,8 +370,38 @@ impl StreamContext {
             relay_choice: crate::moq_stream::RelayChoice::default(),
             reach_config: crate::moq_stream::global_reach_config(),
             kem_ciphertexts: Some(material.encode()),
-            epoch_ratchet: Some(ratchet),
+            epoch_ratchet: Some(Arc::new(parking_lot::Mutex::new(Some(ratchet)))),
         })
+    }
+
+    /// Whether this context was created for the identified epoch profile.
+    ///
+    /// This marker remains true after the producer claim is consumed so policy
+    /// checks such as the transport-AEAD requirement cannot be downgraded.
+    pub(crate) fn has_epoch_ratchet(&self) -> bool {
+        self.epoch_ratchet.is_some()
+    }
+
+    /// Build a publisher while holding the shared identified producer claim.
+    ///
+    /// The callback sees `Some` only once across every clone. It must consume
+    /// the state only after all fallible resource setup succeeds; if setup
+    /// fails first, the claim remains available for a retry. Legacy contexts
+    /// receive an unshared `None` slot.
+    pub(crate) fn with_publisher_epoch_ratchet<T>(
+        &self,
+        build: impl FnOnce(&mut Option<crate::stream_epoch::StreamEpochRatchet>) -> Result<T>,
+    ) -> Result<T> {
+        let Some(claim) = &self.epoch_ratchet else {
+            let mut legacy = None;
+            return build(&mut legacy);
+        };
+        let mut claim = claim.lock();
+        anyhow::ensure!(
+            claim.is_some(),
+            "identified stream publisher already claimed"
+        );
+        build(&mut claim)
     }
 
     /// The hybrid KEM ciphertexts to emit in `StreamInfo.kemCiphertexts` (S3 #554):
@@ -377,11 +410,6 @@ impl StreamContext {
     /// otherwise.
     pub fn kem_ciphertexts(&self) -> Option<&[u8]> {
         self.kem_ciphertexts.as_deref()
-    }
-
-    /// Clone the committed identified epoch state for a publisher/verifier.
-    pub fn epoch_ratchet(&self) -> Option<crate::stream_epoch::StreamEpochRatchet> {
-        self.epoch_ratchet.clone()
     }
 
     /// Get the stream ID (for logging/display).

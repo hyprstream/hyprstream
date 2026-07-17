@@ -689,40 +689,45 @@ impl MoqStreamOrigin {
         ctx: &StreamContext,
         provenance: Option<crate::stream_provenance::ProvenanceSigner>,
     ) -> Result<MoqStreamPublisher> {
-        let epoch_ratchet = ctx.epoch_ratchet();
         ensure!(
-            epoch_ratchet.is_none() || ctx.enc_key().is_some(),
+            !ctx.has_epoch_ratchet() || ctx.enc_key().is_some(),
             "identified stream rejected a context with transport AEAD disabled"
         );
+        // Hold the identified producer claim through all fallible MoQ setup.
+        // Every `StreamContext` clone shares this lock/slot. The ratchet is
+        // consumed only once setup succeeds, so a setup error remains retryable
+        // while successful construction cannot restart epoch/group/sequence
+        // zero or reuse the same AEAD key and nonce domain.
+        ctx.with_publisher_epoch_ratchet(|epoch_ratchet| {
+            let path = self.broadcast_path(ctx.topic());
+            let mut broadcast = self
+                .inner
+                .producer
+                .create_broadcast(path.as_str())
+                .ok_or_else(|| anyhow!("create_broadcast denied for {path}"))?;
+            let track = broadcast.create_track(Track::new(STREAM_TRACK))?;
 
-        let path = self.broadcast_path(ctx.topic());
-        let mut broadcast = self
-            .inner
-            .producer
-            .create_broadcast(path.as_str())
-            .ok_or_else(|| anyhow!("create_broadcast denied for {path}"))?;
-        let track = broadcast.create_track(Track::new(STREAM_TRACK))?;
+            // Retain the broadcast producer so it stays announced for the
+            // publisher's lifetime (dropping it would unannounce the broadcast).
+            // Replace-semantics: inserting the same path twice drops the old
+            // BroadcastProducer rather than accumulating indefinitely (#164).
+            self.inner.broadcasts.lock().insert(path, broadcast);
 
-        // Retain the broadcast producer so it stays announced for the
-        // publisher's lifetime (dropping it would unannounce the broadcast).
-        // Replace-semantics: inserting the same path twice drops the old
-        // BroadcastProducer rather than accumulating indefinitely (#164).
-        self.inner.broadcasts.lock().insert(path, broadcast);
-
-        Ok(MoqStreamPublisher {
-            hmac_state: StreamHmacState::new(*ctx.mac_key(), ctx.topic().to_owned()),
-            // #321: AEAD enc_key — `Some` only on the DH (mesh) path. `None` on the
-            // keyless `StreamContext::new` path (NotificationService topics, whose
-            // payloads are already E2E-encrypted), where transport AEAD is skipped.
-            enc_key: ctx.enc_key().copied(),
-            provenance,
-            track,
-            next_group: 0,
-            next_sequence: 0,
-            epoch_ratchet,
-            cancel_token: ctx.cancel_token().clone(),
-            terminated: false,
-            topic: ctx.topic().to_owned(),
+            Ok(MoqStreamPublisher {
+                hmac_state: StreamHmacState::new(*ctx.mac_key(), ctx.topic().to_owned()),
+                // #321: AEAD enc_key — `Some` only on the DH (mesh) path. `None` on the
+                // keyless `StreamContext::new` path (NotificationService topics, whose
+                // payloads are already E2E-encrypted), where transport AEAD is skipped.
+                enc_key: ctx.enc_key().copied(),
+                provenance,
+                track,
+                next_group: 0,
+                next_sequence: 0,
+                epoch_ratchet: epoch_ratchet.take(),
+                cancel_token: ctx.cancel_token().clone(),
+                terminated: false,
+                topic: ctx.topic().to_owned(),
+            })
         })
     }
 }
@@ -2230,11 +2235,16 @@ mod tests {
         let initial_ratchet = client_ratchet.clone();
         let topic = ctx.topic().to_owned();
         let origin = origin();
+        let duplicate_ctx = ctx.clone();
         assert!(
             origin.publisher(&ctx.clone().without_aead()).is_err(),
             "identified context accepted an AEAD downgrade before publication"
         );
         let mut publisher = origin.publisher(&ctx)?;
+        assert!(
+            origin.publisher(&duplicate_ctx).is_err(),
+            "identified context clone created a second epoch-zero publisher"
+        );
         publisher.publish_data(b"epoch-zero-secret").await?;
         assert!(
             publisher.publish_data(b"must-rekey-first").await.is_err(),
@@ -2261,14 +2271,13 @@ mod tests {
 
         let mut frames = Vec::new();
         for group_id in 0..5 {
-            let mut group = track
-                .get_group(group_id)
-                .await?
-                .ok_or_else(|| anyhow!("identified Group {group_id} missing"))?;
+            let mut group =
+                tokio::time::timeout(std::time::Duration::from_secs(5), track.get_group(group_id))
+                    .await??
+                    .ok_or_else(|| anyhow!("identified Group {group_id} missing"))?;
             frames.push(
-                group
-                    .read_frame()
-                    .await?
+                tokio::time::timeout(std::time::Duration::from_secs(5), group.read_frame())
+                    .await??
                     .ok_or_else(|| anyhow!("identified Object {group_id} missing"))?,
             );
         }
