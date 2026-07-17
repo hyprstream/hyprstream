@@ -208,11 +208,18 @@ jobs:
             # root bypasses file permissions, so they pass only as non-root (the old
             # ubuntu-latest gate ran non-root). These three installs belong in the
             # builder image and move there in the #1011 follow-up:
-            #   - cargo-nextest (get.nexte.st linux-arm == aarch64)
+            #   - cargo-nextest, pinned to an exact version + verified SHA-256 (never
+            #     the mutable get.nexte.st/latest — this runs in a container holding
+            #     AWS creds, so an unpinned fetch is a supply-chain risk; the image
+            #     follow-up removes the download entirely)
             #   - git-lfs (git2db LFS worktree tests shell out to it; ubuntu-latest
             #     shipped it, the image does not)
             #   - the wasm rustup targets (added while root; rustup home is root-owned)
-            curl -LsSf https://get.nexte.st/latest/linux-arm | tar zxf - -C /usr/local/bin
+            NEXTEST_VERSION=0.9.140
+            NEXTEST_SHA256=8b3f4d4560b6b0f83774fecc6be07e47716dbad0eb0bb6c3890f478f4affe4b6
+            curl -fsSL "https://get.nexte.st/${NEXTEST_VERSION}/linux-arm" -o /tmp/nextest.tar.gz
+            echo "${NEXTEST_SHA256}  /tmp/nextest.tar.gz" | sha256sum -c -
+            tar zxf /tmp/nextest.tar.gz -C /usr/local/bin && rm -f /tmp/nextest.tar.gz
             apt-get update && apt-get install -y --no-install-recommends git-lfs
             git lfs install --system --skip-repo
             rustup target add wasm32-unknown-unknown wasm32-wasip1
