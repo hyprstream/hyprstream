@@ -161,8 +161,9 @@ jobs:
     #      (systemd/kata-vm/nspawn/otel/gittorrent/xet) matches the former gate.
     #   2. all tooling is baked into the image — build deps (capnproto,
     #      libsystemd-dev), sccache, cargo-nextest, git-lfs, and the pinned
-    #      toolchain (components + wasm targets) — so the job fetches nothing over
-    #      the network at runtime (only sets up the non-root ci user below).
+    #      toolchain (components + wasm targets) — so the job installs no TOOLING
+    #      over the network at runtime (cargo still fetches workspace/crate deps,
+    #      served by sccache-S3 + crates.io). It only sets up the non-root ci user.
     runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
     needs: clippy  # Only build if clippy passes
     # Backstop below the fleet's 150-min reaper cap (metal reaper_max_lifetime_
