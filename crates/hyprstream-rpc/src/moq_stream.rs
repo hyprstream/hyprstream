@@ -409,6 +409,10 @@ pub struct MoqStreamOrigin {
     inner: Arc<OriginInner>,
 }
 
+/// Mutable per-service MoQ origin source. `None` preserves the process-global
+/// origin for services that do not need relay isolation.
+pub type MoqStreamOriginHandle = Arc<RwLock<Option<MoqStreamOrigin>>>;
+
 /// Builder for [`MoqStreamOrigin`] — set the prefix and publish gate before the
 /// shared `Arc` is constructed (avoids clone-on-write of the origin tree).
 pub struct MoqStreamOriginBuilder {

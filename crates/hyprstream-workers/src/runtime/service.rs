@@ -1424,6 +1424,10 @@ impl RequestService for WorkerService {
         Some(self.stream_channel.reach_config_handle())
     }
 
+    fn moq_origin_handle(&self) -> Option<hyprstream_rpc::moq_stream::MoqStreamOriginHandle> {
+        Some(self.stream_channel.moq_origin_handle())
+    }
+
     async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> AnyhowResult<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
         debug!(
             "Worker request from {} (request_id={})",

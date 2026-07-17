@@ -141,6 +141,8 @@ pub struct TuiService {
     signing_key: SigningKey,
     /// Bound reach for streams served by this TUI instance.
     reach_config: hyprstream_rpc::moq_stream::ProducerReachConfigHandle,
+    /// Optional relay-scoped MoQ origin for this TUI instance.
+    moq_origin: hyprstream_rpc::moq_stream::MoqStreamOriginHandle,
     /// Per-session viewer registration channels + frame loop tokens.
     sessions: SessionRegistry,
     /// Per-viewer stdin queues (for pollStdin RPC).
@@ -175,6 +177,7 @@ impl TuiService {
             reach_config: Arc::new(parking_lot::RwLock::new(
                 hyprstream_rpc::moq_stream::ProducerReachConfig::default(),
             )),
+            moq_origin: Arc::new(parking_lot::RwLock::new(None)),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             stdin_queues: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             policy_client: None,
@@ -402,6 +405,7 @@ impl TuiService {
         let sk = self.signing_key.clone();
         let stdin_queues = Arc::clone(&self.stdin_queues);
         let reach_config = self.reach_config.clone();
+        let moq_origin = self.moq_origin.clone();
         let continuation: Continuation = Box::pin(async move {
             let mut reg = sessions_reg.write().await;
             let (sender, _cancel) = reg.entry(sid).or_insert_with(|| {
@@ -411,7 +415,7 @@ impl TuiService {
                 let s = Arc::clone(&tui_state);
                 let c = cancel.clone();
                 let sq = Arc::clone(&stdin_queues);
-                tokio::task::spawn_local(run_frame_loop(s, sid, rx, sk, c, sq, reach_config));
+                tokio::task::spawn_local(run_frame_loop(s, sid, rx, sk, c, sq, reach_config, moq_origin));
                 info!(session_id = sid, "Frame loop spawned");
                 (tx, cancel)
             });
@@ -1698,6 +1702,10 @@ impl RequestService for TuiService {
         Some(self.reach_config.clone())
     }
 
+    fn moq_origin_handle(&self) -> Option<hyprstream_rpc::moq_stream::MoqStreamOriginHandle> {
+        Some(self.moq_origin.clone())
+    }
+
     async fn handle_request(
         &self,
         _ctx: &EnvelopeContext,
@@ -1880,6 +1888,7 @@ pub(crate) async fn run_frame_loop(
     cancel: CancellationToken,
     stdin_queues: StdinQueues,
     reach_config: hyprstream_rpc::moq_stream::ProducerReachConfigHandle,
+    moq_origin: hyprstream_rpc::moq_stream::MoqStreamOriginHandle,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(33));
     let mut event_rx = {
@@ -1904,7 +1913,8 @@ pub(crate) async fn run_frame_loop(
     // StreamChannel for creating publisher sockets (ZMQ or moq, auto-dispatched).
     let stream_channel = StreamChannel::new(signing_key)
         .with_reach_config(hyprstream_rpc::moq_stream::ProducerReachConfig::default())
-        .with_reach_config_handle(reach_config);
+        .with_reach_config_handle(reach_config)
+        .with_moq_origin_handle(moq_origin);
 
     info!(session_id, "Frame loop started");
 

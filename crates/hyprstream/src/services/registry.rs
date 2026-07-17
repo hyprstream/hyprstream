@@ -326,6 +326,7 @@ pub struct RegistryService {
     transport: TransportConfig,
     signing_key: SigningKey,
     reach_config: hyprstream_rpc::moq_stream::ProducerReachConfigHandle,
+    moq_origin: hyprstream_rpc::moq_stream::MoqStreamOriginHandle,
     /// 9P fid table for filesystem operations.
     fid_table: Arc<FidTable>,
     /// Cached contained roots for worktrees: (repo_id, worktree_name) → ContainedFs.
@@ -419,6 +420,7 @@ impl RegistryService {
             reach_config: Arc::new(parking_lot::RwLock::new(
                 hyprstream_rpc::moq_stream::ProducerReachConfig::default(),
             )),
+            moq_origin: Arc::new(parking_lot::RwLock::new(None)),
             fid_table,
             contained_roots: DashMap::new(),
             editing_table,
@@ -803,7 +805,8 @@ impl RegistryService {
         // Create StreamChannel for DH key exchange and publishing
         let stream_channel = StreamChannel::new(self.signing_key.clone())
             .with_reach_config(hyprstream_rpc::moq_stream::ProducerReachConfig::default())
-            .with_reach_config_handle(self.reach_config.clone());
+            .with_reach_config_handle(self.reach_config.clone())
+            .with_moq_origin_handle(self.moq_origin.clone());
 
         // 10 minutes expiry for clone operations
         let stream_ctx = stream_channel.prepare_stream(client_pub_bytes, 600).await?;
@@ -1042,7 +1045,8 @@ impl RegistryService {
 
         let stream_channel = StreamChannel::new(self.signing_key.clone())
             .with_reach_config(hyprstream_rpc::moq_stream::ProducerReachConfig::default())
-            .with_reach_config_handle(self.reach_config.clone());
+            .with_reach_config_handle(self.reach_config.clone())
+            .with_moq_origin_handle(self.moq_origin.clone());
         // 10 minutes expiry — weights are GB-scale.
         let stream_ctx = stream_channel.prepare_stream(client_pub_bytes, 600).await?;
 
@@ -3162,6 +3166,10 @@ impl WorktreeHandler for RegistryService {
 impl RequestService for RegistryService {
     fn producer_reach_config_handle(&self) -> Option<hyprstream_rpc::moq_stream::ProducerReachConfigHandle> {
         Some(self.reach_config.clone())
+    }
+
+    fn moq_origin_handle(&self) -> Option<hyprstream_rpc::moq_stream::MoqStreamOriginHandle> {
+        Some(self.moq_origin.clone())
     }
 
     async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {

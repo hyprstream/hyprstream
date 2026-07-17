@@ -683,6 +683,8 @@ pub struct StreamChannel {
     pq_signing_key: Option<crate::crypto::pq::MlDsaSigningKey>,
     /// Per-service reach source, updated by the service spawner after bind.
     reach_config: crate::moq_stream::ProducerReachConfigHandle,
+    /// Optional service-scoped origin installed when this service links a relay.
+    moq_origin: crate::moq_stream::MoqStreamOriginHandle,
 }
 
 impl StreamChannel {
@@ -703,6 +705,7 @@ impl StreamChannel {
             reach_config: std::sync::Arc::new(parking_lot::RwLock::new(
                 crate::moq_stream::ProducerReachConfig::default(),
             )),
+            moq_origin: std::sync::Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 
@@ -721,6 +724,17 @@ impl StreamChannel {
     /// Return this channel's service-owned reach handle.
     pub fn reach_config_handle(&self) -> crate::moq_stream::ProducerReachConfigHandle {
         self.reach_config.clone()
+    }
+
+    /// Share a service-owned MoQ origin handle with this channel.
+    pub fn with_moq_origin_handle(mut self, handle: crate::moq_stream::MoqStreamOriginHandle) -> Self {
+        self.moq_origin = handle;
+        self
+    }
+
+    /// Return this channel's service-owned MoQ origin handle.
+    pub fn moq_origin_handle(&self) -> crate::moq_stream::MoqStreamOriginHandle {
+        self.moq_origin.clone()
     }
 
     /// Install the node's persistent ML-DSA-65 signing key, replacing the
@@ -807,8 +821,12 @@ impl StreamChannel {
         &self,
         ctx: &StreamContext,
     ) -> Result<crate::moq_stream::AnyStreamPublisher> {
-        let origin = crate::moq_stream::global_moq_origin()
-            .ok_or_else(|| anyhow::anyhow!("no moq stream origin — server not initialized"))?;
+        let scoped_origin = self.moq_origin.read().clone();
+        let origin = match scoped_origin.as_ref() {
+            Some(origin) => origin,
+            None => crate::moq_stream::global_moq_origin()
+                .ok_or_else(|| anyhow::anyhow!("no moq stream origin — server not initialized"))?,
+        };
         // #321: on the DH (mesh) path, sign each StreamBlock with the node's per-host
         // hybrid identity (Ed25519 + the deterministically-derived mesh ML-DSA key)
         // so consumers can attribute blocks to this host (C-PROV / threat T3). The
@@ -1411,6 +1429,26 @@ mod tests {
         };
         assert_eq!(addr(&stream_a), "127.0.0.1:4101");
         assert_eq!(addr(&stream_b), "127.0.0.1:4102");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_channel_uses_service_scoped_moq_origin() -> Result<()> {
+        let scoped_origin = crate::moq_stream::MoqStreamOrigin::standalone().build();
+        let origin_handle = std::sync::Arc::new(parking_lot::RwLock::new(Some(scoped_origin.clone())));
+        let channel = StreamChannel::new(SigningKey::from_bytes(&[3; 32]))
+            .with_moq_origin_handle(origin_handle);
+        let (_, client_pub) = crate::crypto::generate_ephemeral_keypair();
+        let stream = channel.prepare_stream(&client_pub.to_bytes(), 60).await?;
+        let _publisher = channel.publisher(&stream).await?;
+
+        let path = scoped_origin.broadcast_path(stream.topic());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            scoped_origin.consumer().announced_broadcast(&path),
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("scoped origin did not announce {path}"))?;
         Ok(())
     }
 

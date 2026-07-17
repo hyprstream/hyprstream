@@ -522,6 +522,12 @@ pub trait RequestService: 'static {
         None
     }
 
+    /// Optional per-service MoQ origin source. The unified spawner installs a
+    /// scoped origin here when this service has a relay configured.
+    fn moq_origin_handle(&self) -> Option<crate::moq_stream::MoqStreamOriginHandle> {
+        None
+    }
+
     /// ML-DSA-65 signing key for the post-quantum half of the response COSE
     /// composite (#275). When `Some`, `process_request` signs the
     /// `ResponseEnvelope` under the Hybrid policy (EdDSA + ML-DSA-65); when

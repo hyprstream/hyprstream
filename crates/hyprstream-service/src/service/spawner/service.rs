@@ -67,6 +67,7 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
         let server_pubkey = signing_key.verifying_key();
         let service_name = RequestService::name(&service).to_owned();
         let reach_config_handle = service.producer_reach_config_handle();
+        let moq_origin_handle = service.moq_origin_handle();
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -129,6 +130,17 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                     actual_addr
                 };
                 let pin = hyprstream_rpc::transport::quinn_transport::cert_sha256(&qc.cert_chain[0]);
+                let relay_origin = qc.moq_relay.as_ref().map(|_| {
+                    hyprstream_rpc::moq_stream::MoqStreamOrigin::standalone()
+                        .with_prefix(hyprstream_rpc::moq_stream::DEFAULT_PREFIX)
+                        .build()
+                });
+                if let Some(handle) = &moq_origin_handle {
+                    *handle.write() = relay_origin.clone();
+                }
+                let moq_origin = relay_origin
+                    .clone()
+                    .or_else(|| hyprstream_rpc::moq_stream::global_moq_origin().cloned());
 
                 let mut rpc_server = hyprstream_rpc::transport::quinn_transport::QuinnRpcServer::with_capacity(
                     wt_server,
@@ -136,8 +148,9 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                     signing_key.clone(),
                     hyprstream_rpc::transport::rpc_session::DEFAULT_STREAM_LIMIT,
                 );
-                // Multiplex moq on the same endpoint when the global origin is up.
-                if let Some(origin) = hyprstream_rpc::moq_stream::global_moq_origin() {
+                // Relay-configured services get a distinct origin; other services
+                // retain the process-global origin and existing behavior.
+                if let Some(origin) = &moq_origin {
                     rpc_server = rpc_server.with_moq_consumer(origin.consumer().clone());
                     // #276: subscribe-authz + per-tenant announce scoping. The
                     // default config is permissive (no resolver, no authorizer)
@@ -195,9 +208,10 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                     cb(service_name.clone(), advertise_addr, qc.server_name.clone());
                 }
 
-                // Link each service's configured relay to the shared origin.
+                // Link a relay only to this service's scoped origin. The shared
+                // process origin would leak other services' broadcasts into it.
                 if let Some(relay) = qc.moq_relay.take() {
-                    if let Some(origin) = hyprstream_rpc::moq_stream::global_moq_origin() {
+                    if let Some(origin) = relay_origin {
                         hyprstream_rpc::moq_stream::serve_origin_to_relay_background(
                             origin.producer().clone(),
                             relay,
@@ -228,9 +242,9 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                     );
                     let iroh_secret = iroh_transport_key.to_bytes();
                     let node_id: [u8; 32] = iroh_transport_key.verifying_key().to_bytes();
-                    // moq plane: reuse the SAME global origin the quinn `/moq`
-                    // path serves, so broadcasts are visible over both transports.
-                    let moq_handler = match hyprstream_rpc::moq_stream::global_moq_origin() {
+                    // Use the same service-specific origin as the quinn `/moq`
+                    // path, so relay-scoped broadcasts remain isolated on iroh.
+                    let moq_handler = match moq_origin.as_ref() {
                         Some(origin) => {
                             let shared = hyprstream_rpc::transport::iroh_moq::OriginShared::from_pair(
                                 origin.producer().clone(),
