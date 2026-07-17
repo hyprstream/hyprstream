@@ -8,7 +8,11 @@
     "current_accepted_state_epoch": 7,
     "current_policy_generation": 11,
     "issuer_id": "did:at9p:issuer-example",
-    "audience": "did:at9p:origin-example"
+    "audience": "did:at9p:origin-example",
+    "accepted_state_digest": "1010101010101010101010101010101010101010101010101010101010101010",
+    "expiry": 2000000600,
+    "redemption_context": "30303030303030303030303030303030",
+    "resource_profile_commitment": "4040404040404040404040404040404040404040404040404040404040404040"
   },
   "baseline": {
     "messages": {
@@ -190,6 +194,41 @@
       "path": ["messages", "challenge", "expiry"],
       "value": 1999999999,
       "expected_error": "challenge:expired"
+    },
+    {
+      "id": "crossed-expiry",
+      "op": "replace",
+      "path": ["messages", "challenge", "expiry"],
+      "value": 2000000601,
+      "expected_error": "challenge:expiry-binding"
+    },
+    {
+      "id": "crossed-accepted-state-digest",
+      "op": "replace",
+      "path": ["messages", "challenge", "accepted_state_digest"],
+      "value": "1111111111111111111111111111111111111111111111111111111111111111",
+      "expected_error": "challenge:state-digest-binding"
+    },
+    {
+      "id": "whitespace-in-hex",
+      "op": "replace",
+      "path": ["messages", "challenge", "accepted_state_digest"],
+      "value": "  10101010101010101010101010101010101010101010101010101010101010",
+      "expected_error": "challenge:state-digest"
+    },
+    {
+      "id": "crossed-redemption-context",
+      "op": "replace",
+      "path": ["messages", "challenge", "redemption_context"],
+      "value": "31313131313131313131313131313131",
+      "expected_error": "challenge:redemption-context-binding"
+    },
+    {
+      "id": "crossed-resource-profile-commitment",
+      "op": "replace",
+      "path": ["messages", "challenge", "resource_profile_commitment"],
+      "value": "4141414141414141414141414141414141414141414141414141414141414141",
+      "expected_error": "challenge:resource-profile-commitment-binding"
     },
     {
       "id": "wrong-origin",

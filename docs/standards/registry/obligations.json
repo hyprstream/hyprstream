@@ -112,7 +112,7 @@
       "source": "construction-status",
       "statement": "The boundary MUST require exact accepted-current issuer, audience, state epoch and digest, policy generation, expiry, redemption context, and resource-profile commitment values and MUST reject stale, rolled-back, expired, or crossed values.",
       "kind": "implemented-test",
-      "test": "python3 tools/check_pq_anonymous_issuance.py (stale-state, policy-rollback, expiry, origin, and crossed-context controls)"
+      "test": "python3 tools/check_pq_anonymous_issuance.py (state epoch/digest, policy, expiry, issuer/origin, redemption-context, and resource-profile controls)"
     },
     {
       "id": "PPQH-REQ-013",

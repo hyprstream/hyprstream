@@ -124,11 +124,7 @@ def exact_fields(message: dict[str, Any], expected: list[str], kind: str) -> Non
 def is_hex(value: Any, *, minimum: int, maximum: int) -> bool:
     if not isinstance(value, str) or not minimum <= len(value) <= maximum or len(value) % 2:
         return False
-    try:
-        bytes.fromhex(value)
-    except ValueError:
-        return False
-    return True
+    return all(character in "0123456789abcdefABCDEF" for character in value)
 
 
 def validate_legs(
@@ -227,6 +223,7 @@ def validate_boundary(
     )
     require(isinstance(challenge.get("expiry"), int), "challenge:expiry-type")
     require(challenge["expiry"] > evaluation.get("now"), "challenge:expired")
+    require(challenge["expiry"] == evaluation.get("expiry"), "challenge:expiry-binding")
     require(
         is_hex(
             challenge.get("accepted_state_digest"),
@@ -236,12 +233,41 @@ def validate_boundary(
         "challenge:state-digest",
     )
     require(
+        challenge["accepted_state_digest"] == evaluation.get("accepted_state_digest"),
+        "challenge:state-digest-binding",
+    )
+    require(
         is_hex(
             challenge.get("challenge_nonce"),
             minimum=bounds["nonce_hex_min_chars"],
             maximum=bounds["nonce_hex_max_chars"],
         ),
         "challenge:nonce",
+    )
+    require(
+        is_hex(
+            challenge.get("redemption_context"),
+            minimum=bounds["nonce_hex_min_chars"],
+            maximum=bounds["nonce_hex_max_chars"],
+        ),
+        "challenge:redemption-context",
+    )
+    require(
+        challenge["redemption_context"] == evaluation.get("redemption_context"),
+        "challenge:redemption-context-binding",
+    )
+    require(
+        is_hex(
+            challenge.get("resource_profile_commitment"),
+            minimum=bounds["digest_hex_chars"],
+            maximum=bounds["digest_hex_chars"],
+        ),
+        "challenge:resource-profile-commitment",
+    )
+    require(
+        challenge["resource_profile_commitment"]
+        == evaluation.get("resource_profile_commitment"),
+        "challenge:resource-profile-commitment-binding",
     )
 
     request_digest = messages["issuance-request"].get("challenge_digest")

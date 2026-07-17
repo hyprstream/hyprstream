@@ -39,10 +39,20 @@ the `PqHybrid` authorization assurance used by Hyprstream.
 | [PACT workshop summary](https://datatracker.ietf.org/meeting/interim-2026-privacypass-01/materials/slides-interim-2026-privacypass-01-sessa-pact-workshop-update-00), 2026-05-13 | Places post-quantum adversaries in scope for unlinkability but presents a problem statement and preliminary realization directions rather than a complete PQ-unforgeable issuance construction. | Relevant requirements input; no implementable PQ token suite follows from it. |
 
 The active [Privacy Pass WG document list](https://datatracker.ietf.org/wg/privacypass/)
-contained no adopted post-quantum-unforgeable anonymous token issuance suite at
-the assessment date. Recent research is promising, but selecting its algorithms,
-parameters, encodings, and composition here would invent a protocol rather than
-implement a reviewed one.
+was retrieved at 2026-07-17T17:43:08Z (datatracker release 12.65.0,
+`3203f91`). Its complete active-document inventory was
+`draft-ietf-privacypass-arc-crypto-01`,
+`draft-ietf-privacypass-arc-protocol-01`,
+`draft-ietf-privacypass-auth-scheme-extensions-03`,
+`draft-ietf-privacypass-batched-tokens-08`,
+`draft-ietf-privacypass-expiration-extension-00`, and
+`draft-ietf-privacypass-public-metadata-issuance-03`. None specifies an adopted
+post-quantum-unforgeable anonymous token issuance suite; the two ARC drafts are
+the only anonymous-credential construction in that inventory and use the
+classical group construction discussed above. This enumerated snapshot makes
+the negative finding reproducible even as the live WG page changes. Recent
+research is promising, but selecting its algorithms, parameters, encodings, and
+composition here would invent a protocol rather than implement a reviewed one.
 
 ## Implemented boundary
 
@@ -56,9 +66,11 @@ then reaches the mandatory `construction-unselected` refusal; no vector is a
 mintable or redeemable token.
 
 The checker proves the boundary rejects missing, duplicate, reordered, unknown,
-crossed, or stripped legs; holder-identifying fields; stale state; policy
-rollback; expiry; wrong origin; and key-purpose or key-reuse substitutions. These
-are parser/profile negative controls, not evidence of cryptographic issuance.
+crossed, or stripped legs; holder-identifying fields; stale or crossed state;
+policy rollback; expired or crossed expiry; wrong origin; crossed redemption or
+resource-profile bindings; malformed hex; and key-purpose or key-reuse
+substitutions. These are parser/profile negative controls, not evidence of
+cryptographic issuance.
 
 ## Precise dependency
 
