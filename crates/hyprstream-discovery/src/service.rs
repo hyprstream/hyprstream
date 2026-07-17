@@ -2333,7 +2333,10 @@ mod resolver_tests {
         let ca = SigningKey::from_bytes(&[0x6a; 32]);
         let registry = SigningKey::from_bytes(&[0x6b; 32]);
         let (protected, mut claims) = exact_registry_credential_values(&ca, &registry);
-        claims["exp"] = serde_json::json!(i64::MAX);
+        claims["exp"] = serde_json::json!(checked_test_time(
+            chrono::Utc::now().timestamp(),
+            REGISTRY_DEPLOYMENT_CREDENTIAL_MAX_TTL_SECONDS,
+        ));
         claims["nbf"] = serde_json::json!(i64::MIN);
         claims["iat"] = serde_json::json!(i64::MIN);
 
