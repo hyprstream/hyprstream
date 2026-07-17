@@ -167,12 +167,13 @@ jobs:
     #      not baked in, so it is fetched into the container below.
     runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
     needs: clippy  # Only build if clippy passes
-    # Merge-gate backstop: fail before the merge queue's 120min timeout (ruleset
-    # check_response_timeout_minutes) so a hang yields a definitive failure and the
-    # queue keeps moving instead of timing out and kicking every queued PR. The
-    # nextest step uses the ci-test Cargo profile to avoid release ThinLTO on test
-    # binaries, so 90min should retain headroom while catching regressions.
-    timeout-minutes: 90
+    # Backstop below the fleet's 150-min reaper cap (metal reaper_max_lifetime_
+    # minutes) so a genuine hang fails definitively rather than being reaped
+    # mid-run. A COLD-cache build+test can approach this; once sccache (S3) is
+    # warm, real runs finish well under the merge queue's 120-min
+    # check_response_timeout. The nextest ci-test profile avoids release ThinLTO
+    # on test binaries to keep the suite bounded.
+    timeout-minutes: 140
 
     steps:
     - uses: actions/checkout@v4
@@ -204,19 +205,19 @@ jobs:
           -e LIBTORCH=/opt/libtorch -e LD_LIBRARY_PATH=/opt/libtorch/lib \
           -e LIBTORCH_BYPASS_VERSION_CHECK=1 -e OPENSSL_NO_VENDOR=1 \
           -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always \
-          -e CARGO_BUILD_JOBS=4 -e RUST_TEST_THREADS=4 \
           "$BUILDER_IMAGE" \
           bash -euo pipefail -c '
             # Default features (parity with the former x86 gate); libtorch from the
             # image means NO --features download-libtorch here.
             #
-            # CARGO_BUILD_JOBS=4 (set via -e above): the c8g.2xlarge is 8 vCPU /
-            # 16GiB — same RAM as the old ubuntu-latest gate but twice the cores, so
-            # cargos default of one job per core runs 8-way and OOM-kills a full
-            # release link on 16GiB. 4-way matches the parallelism the 16GiB x86
-            # runner used successfully. Bump instance RAM (not this cap) if the
-            # build wall-time becomes the constraint.
-            cargo build --release --verbose
+            # Runs at full parallelism: the fleet is on memory-optimized r8g/r7g
+            # (8 vCPU / 64 GiB = 8 GiB/vCPU, metal #1011), which absorbs a full
+            # release link at all cores. (The earlier c8g.2xlarge at 2 GiB/vCPU
+            # OOM-killed the runner, so the fix was instance RAM, not a jobs cap.)
+            # No --verbose: it emits a line per rustc invocation and floods the
+            # Actions log pipeline, truncating the visible log ~4min in and hiding
+            # the actual failure. Keep it off so real errors are readable.
+            cargo build --release
 
             # wasm guest artifacts for the sandbox/mount tests (deny-on-missing-guest
             # guard). cd INTO each guest crate dir: cargo discovers .cargo/config.toml
@@ -238,10 +239,7 @@ jobs:
             # container-absolute (/build is the bind mount).
             export HYPRSTREAM_PYGUEST_WASM=/build/crates/hyprstream-workers-python-guest/target/wasm32-unknown-unknown/release/hyprstream_workers_python_guest.wasm
             export HYPRSTREAM_FSGUEST_WASM=/build/crates/hyprstream-workers-wasmtime-fsguest/target/wasm32-wasip1/release/hyprstream-workers-wasmtime-fsguest.wasm
-            # --test-threads bounded for the same 16GiB memory reason as
-            # CARGO_BUILD_JOBS: libtorch-loading tests are memory-heavy and the
-            # 8-vCPU default over-subscribes RAM.
-            cargo nextest run --cargo-profile ci-test --profile ci --test-threads 4
+            cargo nextest run --cargo-profile ci-test --profile ci
 
             # nextest does not run doctests; keep them in the merge gate.
             cargo test --release --doc
