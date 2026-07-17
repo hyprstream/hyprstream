@@ -7,3 +7,7 @@
 [toolchain]
 channel = "1.97.0"
 components = ["clippy", "rustfmt"]
+# Declared here (not `rustup target add` in CI) so the pinned toolchain provisions
+# them consistently for CI and local dev. The wasm32 targets are needed by the
+# browser/WebTransport build (hyprstream-rpc) and the sandbox wasm guests.
+targets = ["wasm32-unknown-unknown", "wasm32-wasip1"]

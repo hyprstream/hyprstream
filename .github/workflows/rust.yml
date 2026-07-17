@@ -23,9 +23,12 @@ env:
   SCCACHE_BUCKET: ${{ vars.AWS_SCCACHE_BUCKET }}
   SCCACHE_REGION: ${{ vars.AWS_SCCACHE_REGION }}
   CARGO_INCREMENTAL: 0
-  # Pin the arm64 image resolved from :latest on 2026-07-14. Bump this digest
-  # deliberately after a builder-image publish so CI inputs remain reproducible.
-  BUILDER_IMAGE: ghcr.io/hyprstream/rust-builder-arm64@sha256:92d8b445f8020e38a4ab08a5868b98819630e3bbf3425f3e281b0e66f1e4b9d5
+  # Pinned arm64 rust-builder image (built by build-image.yml): toolchain +
+  # libtorch + capnproto + sccache + cargo-nextest + git-lfs + the pinned Rust
+  # toolchain's components/targets, all baked. Bump this digest deliberately after
+  # a builder-image publish so CI inputs stay reproducible (a follow-up automates
+  # the bump — see build-image.yml).
+  BUILDER_IMAGE: ghcr.io/hyprstream/rust-builder-arm64@sha256:aa9feb1c8432ebf4583fcfc9c8236c371cb050f489c4d0882a7f2d8c8589120e
 
 # The fast lint jobs (clippy, wasm) run on the self-hosted Graviton (arm64)
 # runners and drive the build through `podman run` against the prebuilt
@@ -82,7 +85,6 @@ jobs:
           -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always \
           "$BUILDER_IMAGE" \
           bash -euo pipefail -c '
-            rustup component add clippy
             cargo clippy --workspace --all-targets -- -D warnings
             sccache --show-stats
           '
@@ -137,7 +139,6 @@ jobs:
           -e RUSTFLAGS='--cfg=web_sys_unstable_apis' \
           "$BUILDER_IMAGE" \
           bash -euo pipefail -c '
-            rustup target add wasm32-unknown-unknown
             cargo check --target wasm32-unknown-unknown -p hyprstream-rpc
             sccache --show-stats
           '
@@ -158,9 +159,11 @@ jobs:
     #      there is NO `download-libtorch` feature (no aarch64 libtorch zip
     #      exists). Default features are otherwise unchanged, so coverage
     #      (systemd/kata-vm/nspawn/otel/gittorrent/xet) matches the former gate.
-    #   2. build deps (capnproto, libsystemd-dev) and sccache are baked into the
-    #      image, so there is no host apt-get / sccache-action; cargo-nextest is
-    #      not baked in, so it is fetched into the container below.
+    #   2. all tooling is baked into the image — build deps (capnproto,
+    #      libsystemd-dev), sccache, cargo-nextest, git-lfs, and the pinned
+    #      toolchain (components + wasm targets) — so the job installs no TOOLING
+    #      over the network at runtime (cargo still fetches workspace/crate deps,
+    #      served by sccache-S3 + crates.io). It only sets up the non-root ci user.
     runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
     needs: clippy  # Only build if clippy passes
     # Backstop below the fleet's 150-min reaper cap (metal reaper_max_lifetime_
@@ -203,26 +206,12 @@ jobs:
           -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always \
           "$BUILDER_IMAGE" \
           bash -euo pipefail -c '
-            # Root-only setup, then hand build+test to a NON-ROOT user. Several
-            # fail-closed tests assert a write to a read-only dir is rejected, but
-            # root bypasses file permissions, so they pass only as non-root (the old
-            # ubuntu-latest gate ran non-root). These three installs belong in the
-            # builder image and move there in the #1011 follow-up:
-            #   - cargo-nextest, pinned to an exact version + verified SHA-256 (never
-            #     the mutable get.nexte.st/latest — this runs in a container holding
-            #     AWS creds, so an unpinned fetch is a supply-chain risk; the image
-            #     follow-up removes the download entirely)
-            #   - git-lfs (git2db LFS worktree tests shell out to it; ubuntu-latest
-            #     shipped it, the image does not)
-            #   - the wasm rustup targets (added while root; rustup home is root-owned)
-            NEXTEST_VERSION=0.9.140
-            NEXTEST_SHA256=8b3f4d4560b6b0f83774fecc6be07e47716dbad0eb0bb6c3890f478f4affe4b6
-            curl -fsSL "https://get.nexte.st/${NEXTEST_VERSION}/linux-arm" -o /tmp/nextest.tar.gz
-            echo "${NEXTEST_SHA256}  /tmp/nextest.tar.gz" | sha256sum -c -
-            tar zxf /tmp/nextest.tar.gz -C /usr/local/bin && rm -f /tmp/nextest.tar.gz
-            apt-get update && apt-get install -y --no-install-recommends git-lfs
-            git lfs install --system --skip-repo
-            rustup target add wasm32-unknown-unknown wasm32-wasip1
+            # cargo-nextest, git-lfs, the wasm targets and clippy are baked into the
+            # builder image (BUILDER_IMAGE, Dockerfile builder-cpu-arm64) — no runtime
+            # installs here. Only set up the NON-ROOT user: several fail-closed tests
+            # assert a write to a read-only dir is rejected, but root bypasses file
+            # permissions, so they pass only as non-root (the old ubuntu-latest gate
+            # ran non-root). Make the toolchain usable by ci and hand it the workspace.
             useradd -m ci
             chmod a+rx /root
             chmod -R a+rwX /root/.cargo /root/.rustup
