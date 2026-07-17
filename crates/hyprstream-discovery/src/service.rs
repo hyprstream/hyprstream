@@ -29,8 +29,6 @@ use hyprstream_util::ttl_cache::TtlCache;
 use parking_lot::RwLock;
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
-#[cfg(not(target_arch = "wasm32"))]
-use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -870,10 +868,8 @@ impl DiscoveryService {
             .map_err(|_| anyhow::anyhow!("production service resolver is already installed"))
     }
 
-    /// Install the production resolver from the concrete checkpoint-verified
-    /// #1004 PDS store. The store reader and accepted-state source are private;
-    /// callers can name only the durable store path and its pinned deployment
-    /// verification identity, never implement or inject resolution authority.
+    /// Prove that downstream crates cannot access any production authority
+    /// construction or installation seam.
     ///
     /// ```compile_fail
     /// use hyprstream_discovery::AcceptedStateSource;
@@ -892,18 +888,38 @@ impl DiscoveryService {
     ///     service.install_production_resolver().unwrap();
     /// }
     /// ```
+    ///
+    /// ```compile_fail
+    /// use hyprstream_discovery::DiscoveryService;
+    /// fn choose_store_and_key(service: &mut DiscoveryService) {
+    ///     service.install_checkpointed_pds_resolver(todo!(), todo!()).unwrap();
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use hyprstream_discovery::CheckpointedPdsAuthority;
+    /// ```
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn install_checkpointed_pds_resolver(
-        &mut self,
-        store_path: &Path,
-        acceptance_identity: ed25519_dalek::VerifyingKey,
-    ) -> Result<()> {
-        let source = Arc::new(crate::checkpointed_pds::CheckpointedPdsAcceptedStateSource::open(
-            store_path,
-            acceptance_identity,
-        )?);
+    fn install_checkpointed_pds_resolver(&mut self) -> Result<()> {
+        let authority = crate::checkpointed_pds::CheckpointedPdsAuthority::from_deployment()?;
+        let source = Arc::new(authority.open_source()?);
         self.accepted_state_source = Some(source);
         self.install_production_resolver()
+    }
+
+    /// Construct the ordinary production service after the trusted daemon
+    /// bootstrap has fixed the durable PDS location and acceptance identity in
+    /// its deployment environment. The opaque authority is derived and
+    /// consumed inside this crate; no path/key parameters cross the API.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn new_production(
+        signing_key: Arc<SigningKey>,
+        jwt_verifying_key: hyprstream_rpc::prelude::VerifyingKey,
+        transport: TransportConfig,
+    ) -> Result<Self> {
+        let mut service = Self::new(signing_key, jwt_verifying_key, transport);
+        service.install_checkpointed_pds_resolver()?;
+        Ok(service)
     }
 
     #[cfg(test)]

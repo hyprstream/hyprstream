@@ -8,6 +8,12 @@ use hyprstream_pds::at9p_duplicity::{AcceptedAt9pState, Watermark};
 use hyprstream_pds::at9p_gate::DID_AT9P_PREFIX;
 use std::path::{Path, PathBuf};
 
+/// Trusted bootstrap input names. Ordinary startup writes these from its
+/// deployment context before constructing Discovery; no production API accepts
+/// the path and trust anchor as caller arguments.
+pub(crate) const PDS_STORE_PATH_ENV: &str = "HYPRSTREAM__PDS__STORE_PATH";
+pub(crate) const PDS_ACCEPTANCE_IDENTITY_ENV: &str = "HYPRSTREAM__PDS__ACCEPTANCE_IDENTITY";
+
 const AT9P_STATE_MAGIC: &[u8; 8] = b"AT9PST02";
 const AT9P_STATE_HEADER_LEN: usize = 8 + 1 + 8 + 64 + 1 + 4;
 const AT9P_ACCEPTANCE_MAGIC: &[u8; 8] = b"AT9PAC01";
@@ -25,6 +31,44 @@ const AT9P_CHECKPOINT_AAD: &[u8] = b"hyprstream-at9p-monotonic-checkpoint/1";
 pub(super) struct CheckpointedPdsAcceptedStateSource {
     path: PathBuf,
     acceptance_identity: ed25519_dalek::VerifyingKey,
+}
+
+/// Opaque production authority capability derived only from the deployment
+/// bootstrap environment. Its fields and constructor are private to this
+/// crate, so downstream code cannot manufacture a path/key pair and install
+/// it as accepted-state authority.
+pub(super) struct CheckpointedPdsAuthority {
+    path: PathBuf,
+    acceptance_identity: ed25519_dalek::VerifyingKey,
+}
+
+impl CheckpointedPdsAuthority {
+    pub(super) fn from_deployment() -> Result<Self> {
+        let path = std::env::var_os(PDS_STORE_PATH_ENV)
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("deployment PDS store path is not configured"))?;
+        anyhow::ensure!(
+            path.is_absolute(),
+            "deployment PDS store path must be absolute"
+        );
+        let encoded = std::env::var(PDS_ACCEPTANCE_IDENTITY_ENV)
+            .context("deployment PDS acceptance identity is not configured")?;
+        let bytes =
+            hex::decode(encoded).context("deployment PDS acceptance identity is not valid hex")?;
+        let bytes: [u8; ED25519_KEY_LEN] = bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("deployment PDS acceptance identity must be 32 bytes"))?;
+        let acceptance_identity = ed25519_dalek::VerifyingKey::from_bytes(&bytes)
+            .context("deployment PDS acceptance identity is invalid")?;
+        Ok(Self {
+            path,
+            acceptance_identity,
+        })
+    }
+
+    pub(super) fn open_source(self) -> Result<CheckpointedPdsAcceptedStateSource> {
+        CheckpointedPdsAcceptedStateSource::open(&self.path, self.acceptance_identity)
+    }
 }
 
 impl CheckpointedPdsAcceptedStateSource {
@@ -305,6 +349,8 @@ mod tests {
     };
     use hyprstream_pds::at9p_sign::sign_capsule;
 
+    static DEPLOYMENT_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     fn accepted_state() -> AcceptedAt9pState {
         let signing = ed25519_dalek::SigningKey::from_bytes(&[0x41; 32]);
         let (pq_signing, pq_verifying) = ml_dsa_generate_keypair();
@@ -414,5 +460,33 @@ mod tests {
             rejected.is_err(),
             "caller-selected checkpoint identity accepted"
         );
+    }
+
+    #[test]
+    fn deployment_authority_uses_only_bootstrap_configuration() {
+        let _guard = DEPLOYMENT_ENV_LOCK.lock();
+        let old_path = std::env::var_os(PDS_STORE_PATH_ENV);
+        let old_identity = std::env::var_os(PDS_ACCEPTANCE_IDENTITY_ENV);
+        let dir = tempfile::tempdir().expect("deployment store");
+        let identity = ed25519_dalek::SigningKey::from_bytes(&[0x52; 32]);
+        std::env::set_var(PDS_STORE_PATH_ENV, dir.path());
+        std::env::set_var(
+            PDS_ACCEPTANCE_IDENTITY_ENV,
+            hex::encode(identity.verifying_key().to_bytes()),
+        );
+
+        let authority =
+            CheckpointedPdsAuthority::from_deployment().expect("configured deployment authority");
+        assert_eq!(authority.path, dir.path());
+        assert_eq!(authority.acceptance_identity, identity.verifying_key());
+
+        match old_path {
+            Some(value) => std::env::set_var(PDS_STORE_PATH_ENV, value),
+            None => std::env::remove_var(PDS_STORE_PATH_ENV),
+        }
+        match old_identity {
+            Some(value) => std::env::set_var(PDS_ACCEPTANCE_IDENTITY_ENV, value),
+            None => std::env::remove_var(PDS_ACCEPTANCE_IDENTITY_ENV),
+        }
     }
 }
