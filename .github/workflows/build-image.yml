@@ -74,11 +74,16 @@ jobs:
       # PR self-validates: the merge gate runs against the new image, so a broken
       # image simply never merges and the old digest stays live.
       #
-      # The PR MUST be authored by a non-GITHUB_TOKEN identity (a fine-grained PAT
-      # or GitHub App installation token, secret BUILDER_IMAGE_BUMP_TOKEN) — PRs
-      # opened with the default GITHUB_TOKEN do not trigger workflows, so the merge
-      # gate would never run and the PR could not validate. If the secret is unset
-      # the step is skipped with a warning (image still published; bump is manual).
+      # The PR MUST be authored by a non-GITHUB_TOKEN identity — PRs opened with the
+      # default GITHUB_TOKEN do not trigger workflows, so the merge gate would never
+      # run and the PR could not validate. We use a GitHub App installation token
+      # (minted per-run, short-lived, scoped to contents+pull-requests on this repo)
+      # rather than a long-lived PAT. (Actions OIDC cannot be used here — it federates
+      # to EXTERNAL providers like AWS, not to GitHub's own API.) Configure a GitHub
+      # App with those two write permissions, install it on this repo, and set:
+      #   vars.BUILDER_IMAGE_BUMP_APP_ID + secrets.BUILDER_IMAGE_BUMP_APP_PRIVATE_KEY
+      # If the App id var is unset the bump step is skipped with a warning (the image
+      # still publishes; bump rust.yml manually until the App is provisioned).
       # -------------------------------------------------------------------------
       - name: Rewrite the rust.yml pin if the digest changed
         id: pin
@@ -91,23 +96,23 @@ jobs:
           sed -i "s|ghcr\.io/hyprstream/rust-builder-arm64@sha256:[0-9a-f]*|$new|g" .github/workflows/rust.yml
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
-      - name: Check for the bump token
-        id: bot
-        env:
-          BOT: ${{ secrets.BUILDER_IMAGE_BUMP_TOKEN }}
-        run: |
-          if [ -n "$BOT" ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::BUILDER_IMAGE_BUMP_TOKEN not set — skipping the auto digest-bump PR (image is published; bump rust.yml manually until the token is provisioned)."
-            echo "present=false" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Warn if the bump App is not configured
+        if: steps.pin.outputs.changed == 'true' && vars.BUILDER_IMAGE_BUMP_APP_ID == ''
+        run: echo "::warning::BUILDER_IMAGE_BUMP_APP_ID not set — skipping the auto digest-bump PR (image is published; bump rust.yml manually until the GitHub App is provisioned)."
+
+      - name: Mint a short-lived App installation token
+        id: apptoken
+        if: steps.pin.outputs.changed == 'true' && vars.BUILDER_IMAGE_BUMP_APP_ID != ''
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.BUILDER_IMAGE_BUMP_APP_ID }}
+          private-key: ${{ secrets.BUILDER_IMAGE_BUMP_APP_PRIVATE_KEY }}
 
       - name: Open digest-bump PR
-        if: steps.pin.outputs.changed == 'true' && steps.bot.outputs.present == 'true'
+        if: steps.apptoken.outputs.token != ''
         uses: peter-evans/create-pull-request@v6
         with:
-          token: ${{ secrets.BUILDER_IMAGE_BUMP_TOKEN }}
+          token: ${{ steps.apptoken.outputs.token }}
           branch: automation/bump-builder-image
           base: main
           add-paths: .github/workflows/rust.yml
