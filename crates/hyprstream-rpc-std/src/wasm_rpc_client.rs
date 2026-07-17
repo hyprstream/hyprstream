@@ -12,7 +12,14 @@
 
 #![cfg(target_arch = "wasm32")]
 
+use std::sync::Arc;
+
 use wasm_bindgen::prelude::*;
+
+use hyprstream_rpc::browser_provisioning::{
+    fetch_browser_provisioning, BrowserCarrierProfile, BrowserProvisioningGuard,
+    BrowserProvisioningRequest,
+};
 
 use hyprstream_rpc::crypto::VerifyingKey;
 use hyprstream_rpc::rpc_client::{CallOptions, RpcClientImpl};
@@ -57,11 +64,11 @@ impl WasmWtConnection {
     /// - `url`: WebTransport URL (e.g., `https://host:port/wt`)
     /// - `cert_hash`: Optional base64-encoded SHA-256 certificate hash for pinning
     #[wasm_bindgen(constructor)]
-    pub async fn connect(url: &str, cert_hash: Option<String>) -> Result<WasmWtConnection, JsError> {
-        let transport = WtConnection::connect(url, cert_hash.as_deref())
-            .await
-            .map_err(|e| JsError::new(&e.to_string()))?;
-        Ok(Self { inner: transport })
+    pub async fn connect(
+        _url: &str,
+        _cert_hash: Option<String>,) -> Result<WasmWtConnection, JsError> {
+        Err( JsError::new(
+            "unprovisioned browser WebTransport dial is disabled; use RpcClient.connectResolved",))
     }
 }
 
@@ -112,7 +119,8 @@ impl WasmRpcClient {
                 let arr: [u8; 32] = bytes.try_into()
                     .map_err(|_| JsError::new("server_verifying_key must be 32 bytes"))?;
                 Some(VerifyingKey::from_bytes(&arr)
-                    .map_err(|e| JsError::new(&format!("invalid server verifying key: {}", e)))?)
+                    .map_err(|e| { JsError::new(&format!("invalid server verifying key: {}", e))
+                    })?)
             }
             None => None,
         };
@@ -136,6 +144,59 @@ impl WasmRpcClient {
         let conn = WasmWtConnection::connect(url, cert_hash).await?;
         // conn is moved into Self::new()
         Self::new(conn, signer_pubkey, sign_fn, server_verifying_key)
+    }
+
+    /// Resolve accepted-current authority, then dial and seal only to the
+    /// bound owned WebTransport reach. Every call re-fetches before sealing.
+    #[wasm_bindgen(js_name = "connectResolved")]
+    pub async fn connect_resolved(
+        provisioning_origin: &str,
+        service_name: &str,
+        signer_pubkey: &[u8],
+        sign_fn: js_sys::Function,
+        signer_ml_dsa65_pubkey: &[u8],
+        pq_sign_fn: js_sys::Function,
+        jwt: Option<String>,
+    ) -> Result<WasmRpcClient, JsError> {
+        let expected = BrowserProvisioningRequest::new(
+            service_name,
+            "hyprstream-rpc/1",
+            service_name,
+            BrowserCarrierProfile::OwnedHybridWebTransport,
+        )
+        .map_err(|error| JsError::new(&error.to_string()))?;
+        let provisioned = fetch_browser_provisioning(provisioning_origin, &expected)
+            .await
+            .map_err(|error| JsError::new(&error.to_string()))?;
+        let transport = WtConnection::connect_with_certificate_hashes(
+            provisioned.webtransport_url(),
+            provisioned.certificate_hashes(),
+        )
+        .await
+        .map_err(|error| JsError::new(&error.to_string()))?;
+        let signer =
+            JsSigner::new_hybrid(signer_pubkey, sign_fn, signer_ml_dsa65_pubkey, pq_sign_fn)
+                .map_err(|error| JsError::new(&error.to_string()))?;
+        let (kem, pq) = provisioned
+            .crypto_stores()
+            .map_err(|error| JsError::new(&error.to_string()))?;
+        let guard =
+            BrowserProvisioningGuard::new(provisioning_origin, expected, provisioned.clone());
+        let binding = provisioned
+            .request_binding()
+            .map_err(|error| JsError::new(&error.to_string()))?;
+        let client =
+            RpcClientImpl::new(signer, transport, Some(provisioned.server_verifying_key()))
+                .with_request_kem_store(kem)
+                .with_response_pq_store(pq)
+                .with_pre_seal_guard(Arc::new(guard))
+                .with_browser_provisioning_binding(binding)
+                .map_err(|error| JsError::new(&error.to_string()))?;
+        let client = match jwt {
+            Some(token) => client.with_default_jwt(token),
+            None => client,
+        };
+        Ok(Self { inner: client })
     }
 
     /// Builder: set a dynamic token provider called on every RPC request.
@@ -257,15 +318,13 @@ impl WasmStreamHandle {
     #[wasm_bindgen(js_name = "nextPayload")]
     pub async fn next_payload(&mut self) -> Result<JsValue, JsError> {
         match self.inner.next_payload().await {
-            Ok(Some(StreamPayload::Data(data))) => {
-                Ok(js_sys::Uint8Array::from(&data[..]).into())
-            }
+            Ok(Some(StreamPayload::Data(data))) =>
+                Ok(js_sys::Uint8Array::from(&data[..]).into()),
             Ok(Some(StreamPayload::Complete(meta))) => {
                 Ok(js_sys::Uint8Array::from(&meta[..]).into())
             }
-            Ok(Some(StreamPayload::Error(msg))) => {
-                Err(JsError::new(&msg))
-            }
+            Ok(Some(StreamPayload::Error(msg))) =>
+                Err(JsError::new(&msg)),
             Ok(Some(StreamPayload::Tagged { payload, .. })) => {
                 Ok(js_sys::Uint8Array::from(&payload[..]).into())
             }

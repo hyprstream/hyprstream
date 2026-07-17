@@ -114,6 +114,12 @@ impl CarrierContext {
         }
     }
 
+    /// Browser requests must carry accepted-current evidence and pass a live
+    /// checkpoint-backed check immediately before dispatch.
+    pub(crate) fn requires_browser_provisioning(self) -> bool {
+        self.class == CarrierClass::WebTransport
+    }
+
     /// Short static label for logs/errors. Never used for policy.
     pub fn label(&self) -> &'static str {
         match self.class {

@@ -25,6 +25,14 @@ use crate::transport_traits::{Signer, Transport};
 
 type TokenProviderBox = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
+/// Revalidates external resolution authority immediately before envelope
+/// construction and sealing.
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait PreSealGuard: Send + Sync {
+    async fn ensure_current(&self) -> Result<()>;
+}
+
 /// Non-cloneable, non-serializable one-call response decapsulation material.
 /// The component secret bytes are `Zeroizing` inside `RecipientKeypair` and
 /// are dropped immediately after the sole response-open attempt.
@@ -239,6 +247,8 @@ pub struct RpcClientImpl<S: Signer, T: Transport + 'static> {
     /// envelopes for carriers that forbid cleartext. Bindings are established
     /// out-of-band by DID keyAgreement / peer attestation; absence fails closed.
     request_kem_store: Option<Arc<dyn KemTrustStore>>,
+    pre_seal_guard: Option<Arc<dyn PreSealGuard>>,
+    browser_provisioning_binding: Option<crate::browser_provisioning::BrowserRequestBinding>,
     #[cfg(test)]
     response_secret_drop_probe: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
@@ -258,6 +268,8 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             response_verify_policy: None,
             response_pq_store: None,
             request_kem_store: None,
+            pre_seal_guard: None,
+            browser_provisioning_binding: None,
             #[cfg(test)]
             response_secret_drop_probe: None,
         }
@@ -282,6 +294,20 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
     pub fn with_request_kem_store(mut self, kem_store: Arc<dyn KemTrustStore>) -> Self {
         self.request_kem_store = Some(kem_store);
         self
+    }
+
+    pub fn with_pre_seal_guard(mut self, guard: Arc<dyn PreSealGuard>) -> Self {
+        self.pre_seal_guard = Some(guard);
+        self
+    }
+
+    pub fn with_browser_provisioning_binding(
+        mut self,
+        binding: crate::browser_provisioning::BrowserRequestBinding,
+    ) -> Result<Self> {
+        binding.validate_shape()?;
+        self.browser_provisioning_binding = Some(binding);
+        Ok(self)
     }
 
     #[cfg(test)]
@@ -328,7 +354,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
     /// Send a request and return the verified, unwrapped response payload.
     /// Uses the client's default JWT.
     pub async fn call(&self, payload: Vec<u8>) -> Result<Vec<u8>> {
-        self.call_bound(payload, None).await
+        self.call_bound(payload, None, None).await
     }
 
     /// Send a request bound to a canonical destination service. Generated
@@ -338,10 +364,22 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         service_domain: &str,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>> {
-        self.call_bound(payload, Some(service_domain)).await
+        self.call_bound(payload, Some(service_domain), None).await
     }
 
-    async fn call_bound(&self, payload: Vec<u8>, service_domain: Option<&str>) -> Result<Vec<u8>> {
+    /// Send a generated request with an explicit schema method commitment.
+    pub async fn call_for_service_with_method(
+        &self,
+        service_domain: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        self.call_bound(payload, Some(service_domain), Some(method_discriminator)).await
+    }
+
+    async fn call_bound(&self, payload: Vec<u8>, service_domain: Option<&str>,
+        method_discriminator: Option<u16>,) -> Result<Vec<u8>> {
+        self.ensure_pre_seal_current().await?;
         let request_id = self.next_id();
         let (signed_bytes, pending) = self
             .sign_envelope(
@@ -351,6 +389,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
                 self.effective_jwt(),
                 None,
                 service_domain,
+                method_discriminator,
             )
             .await?;
         let timeout = self.calculate_timeout();
@@ -367,7 +406,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         payload: Vec<u8>,
         ephemeral_pubkey: [u8; 32],
     ) -> Result<Vec<u8>> {
-        self.call_streaming_bound(payload, ephemeral_pubkey, None)
+        self.call_streaming_bound(payload, ephemeral_pubkey, None, None)
             .await
     }
 
@@ -378,7 +417,23 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         payload: Vec<u8>,
         ephemeral_pubkey: [u8; 32],
     ) -> Result<Vec<u8>> {
-        self.call_streaming_bound(payload, ephemeral_pubkey, Some(service_domain))
+        self.call_streaming_bound(payload, ephemeral_pubkey, Some(service_domain), None)
+            .await
+    }
+
+    /// Send a generated streaming request with an explicit schema method commitment.
+    pub async fn call_streaming_for_service_with_method(
+        &self,
+        service_domain: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+        ephemeral_pubkey: [u8; 32],
+    ) -> Result<Vec<u8>> {
+        self.call_streaming_bound(
+            payload,
+            ephemeral_pubkey,
+            Some(service_domain),
+            Some(method_discriminator),)
             .await
     }
 
@@ -387,7 +442,9 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         payload: Vec<u8>,
         ephemeral_pubkey: [u8; 32],
         service_domain: Option<&str>,
+        method_discriminator: Option<u16>,
     ) -> Result<Vec<u8>> {
+        self.ensure_pre_seal_current().await?;
         let request_id = self.next_id();
         let (signed_bytes, pending) = self
             .sign_envelope(
@@ -397,6 +454,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
                 self.effective_jwt(),
                 None,
                 service_domain,
+                method_discriminator,
             )
             .await?;
         let timeout = self.calculate_timeout();
@@ -425,6 +483,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         options: CallOptions,
         service_domain: Option<&str>,
     ) -> Result<Vec<u8>> {
+        self.ensure_pre_seal_current().await?;
         let request_id = self.next_id();
         let jwt = options.jwt.or_else(|| self.effective_jwt());
         let (signed_bytes, pending) = self
@@ -435,6 +494,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
                 jwt,
                 options.delegated_bearer,
                 service_domain,
+                None,
             )
             .await?;
         let timeout = self.calculate_timeout();
@@ -472,6 +532,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         options: CallOptions,
         service_domain: Option<&str>,
     ) -> Result<Vec<u8>> {
+        self.ensure_pre_seal_current().await?;
         let request_id = self.next_id();
         let jwt = options.jwt.or_else(|| self.effective_jwt());
         let (signed_bytes, pending) = self
@@ -482,6 +543,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
                 jwt,
                 options.delegated_bearer,
                 service_domain,
+                None,
             )
             .await?;
         let timeout = self.calculate_timeout();
@@ -493,6 +555,13 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
     /// Get the next monotonically increasing request ID.
     pub fn next_id(&self) -> u64 {
         self.request_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    async fn ensure_pre_seal_current(&self) -> Result<()> {
+        if let Some(guard) = &self.pre_seal_guard {
+            guard.ensure_current().await?;
+        }
+        Ok(())
     }
 
     /// Unwrap + verify a `ResponseEnvelope` (#275/#277).
@@ -611,6 +680,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         jwt: Option<String>,
         delegated_bearer: Option<String>,
         service_domain: Option<&str>,
+        method_discriminator: Option<u16>,
     ) -> Result<(Vec<u8>, Option<PendingResponse>)> {
         let mut envelope = RequestEnvelope::new(payload);
         envelope.request_id = request_id;
@@ -625,6 +695,22 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         }
         if let Some(service_domain) = service_domain {
             envelope = envelope.with_service_domain(service_domain)?;
+        }
+        if let Some(binding) = &self.browser_provisioning_binding {
+            let service_domain = service_domain.ok_or_else(|| {
+                anyhow::anyhow!("browser request extension requires a canonical service domain")
+            })?;
+            let method_discriminator = method_discriminator.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "provisioned browser request requires an explicit generated method identifier"
+                )
+            })?;
+            envelope.payload = crate::browser_provisioning::bind_request_payload(
+                binding,
+                request_id,
+                service_domain,
+                method_discriminator,
+                &envelope.payload,)?;
         }
 
         let (pending, encrypted_envelope) = if self.transport.forbids_cleartext_envelope() {
@@ -863,6 +949,14 @@ pub trait RpcClient: Send + Sync {
     /// Send a request bound to a canonical destination service.
     async fn call_for_service(&self, service_domain: &str, payload: Vec<u8>) -> Result<Vec<u8>>;
 
+    /// Send a generated request with an explicit canonical schema method id.
+    async fn call_for_service_with_method(
+        &self,
+        service_domain: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>>;
+
     /// Send a request with per-call authentication options.
     ///
     /// Uses `options.jwt` if provided, otherwise falls back to the client's
@@ -885,6 +979,15 @@ pub trait RpcClient: Send + Sync {
     async fn call_streaming_for_service(
         &self,
         service_domain: &str,
+        payload: Vec<u8>,
+        ephemeral_pubkey: [u8; 32],
+    ) -> Result<Vec<u8>>;
+
+    /// Send a generated streaming request with an explicit schema method id.
+    async fn call_streaming_for_service_with_method(
+        &self,
+        service_domain: &str,
+        method_discriminator: u16,
         payload: Vec<u8>,
         ephemeral_pubkey: [u8; 32],
     ) -> Result<Vec<u8>>;
@@ -916,6 +1019,21 @@ impl<S: Signer, T: Transport + 'static> RpcClient for RpcClientImpl<S, T> {
         RpcClientImpl::call_for_service(self, service_domain, payload).await
     }
 
+    async fn call_for_service_with_method(
+        &self,
+        service_domain: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        RpcClientImpl::call_for_service_with_method(
+            self,
+            service_domain,
+            method_discriminator,
+            payload,
+        )
+        .await
+    }
+
     async fn call_with_options(&self, payload: Vec<u8>, options: CallOptions) -> Result<Vec<u8>> {
         RpcClientImpl::call_with_options(self, payload, options).await
     }
@@ -945,6 +1063,23 @@ impl<S: Signer, T: Transport + 'static> RpcClient for RpcClientImpl<S, T> {
     ) -> Result<Vec<u8>> {
         RpcClientImpl::call_streaming_for_service(self, service_domain, payload, ephemeral_pubkey)
             .await
+    }
+
+    async fn call_streaming_for_service_with_method(
+        &self,
+        service_domain: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+        ephemeral_pubkey: [u8; 32],
+    ) -> Result<Vec<u8>> {
+        RpcClientImpl::call_streaming_for_service_with_method(
+            self,
+            service_domain,
+            method_discriminator,
+            payload,
+            ephemeral_pubkey,
+        )
+        .await
     }
 
     #[cfg(not(feature = "fips"))]
@@ -1286,6 +1421,7 @@ mod request_kem_tests {
                 None,
                 None,
                 Some("test-service"),
+                None,
             )
             .await
             .expect_err("must fail closed without a #mesh-kem store");
@@ -1325,6 +1461,7 @@ mod request_kem_tests {
                 None,
                 None,
                 Some("test-service"),
+                None,
             )
             .await
             .expect("forwarded store must seal the envelope");

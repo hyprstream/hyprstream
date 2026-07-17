@@ -28,8 +28,14 @@ pub struct LocalSigner {
 impl std::fmt::Debug for LocalSigner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LocalSigner")
-            .field("pubkey", &hex::encode(self.signing_key.verifying_key().to_bytes()))
-            .field("pq_pubkey", &self.pq_signing_key.as_ref().map(|_| "<ml-dsa-65>"))
+            .field(
+                "pubkey",
+                &hex::encode(self.signing_key.verifying_key().to_bytes()),
+            )
+            .field(
+                "pq_pubkey",
+                &self.pq_signing_key.as_ref().map(|_| "<ml-dsa-65>"),
+            )
             .finish()
     }
 }
@@ -137,6 +143,8 @@ mod wasm {
     pub struct JsSigner {
         pubkey: [u8; 32],
         sign_fn: Function,
+        pq_pubkey: Option<Vec<u8>>,
+        pq_sign_fn: Option<Function>,
     }
 
     // SAFETY: wasm32 is single-threaded. js_sys::Function is !Send only because
@@ -151,7 +159,25 @@ mod wasm {
             }
             let mut pk = [0u8; 32];
             pk.copy_from_slice(pubkey);
-            Ok(Self { pubkey: pk, sign_fn })
+            Ok(Self { pubkey: pk, sign_fn,
+                pq_pubkey: None,
+                pq_sign_fn: None, })
+        }
+
+        /// Construct a browser signer whose Ed25519 and ML-DSA-65 private
+        /// material remains behind separate JS callbacks.
+        pub fn new_hybrid(
+            pubkey: &[u8],
+            sign_fn: Function,
+            pq_pubkey: &[u8],
+            pq_sign_fn: Function,
+        ) -> Result<Self> {
+            crate::crypto::pq::ml_dsa_vk_from_bytes(pq_pubkey)
+                .map_err(|error| anyhow!("invalid signer ML-DSA-65 public key: {error}"))?;
+            let mut signer = Self::new(pubkey, sign_fn)?;
+            signer.pq_pubkey = Some(pq_pubkey.to_vec());
+            signer.pq_sign_fn = Some(pq_sign_fn);
+            Ok(signer)
         }
     }
 
@@ -187,6 +213,36 @@ mod wasm {
             let mut signature = [0u8; 64];
             signature.copy_from_slice(&signature_vec);
             Ok(signature)
+        }
+
+        fn pq_pubkey(&self) -> Option<Vec<u8>> {
+            self.pq_pubkey.clone()
+        }
+
+        async fn pq_sign(&self, canonical_bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+            const ML_DSA65_SIGNATURE_LEN: usize = 3309;
+            let Some(sign_fn) = &self.pq_sign_fn else {
+                return Ok(None);
+            };
+            let canonical_js = js_sys::Uint8Array::from(canonical_bytes);
+            let promise_jsvalue = sign_fn
+                .call1(&JsValue::NULL, &canonical_js)
+                .map_err(|error| anyhow!("PQ sign callback threw: {error:?}"))?;
+            let promise: js_sys::Promise = promise_jsvalue
+                .dyn_into()
+                .map_err(|_| anyhow!("PQ sign callback must return a Promise<Uint8Array>"))?;
+            let signature_jsvalue = JsFuture::from(promise)
+                .await
+                .map_err(|error| anyhow!("PQ sign callback rejected: {error:?}"))?;
+            let signature_js: js_sys::Uint8Array = signature_jsvalue
+                .dyn_into()
+                .map_err(|_| anyhow!("PQ sign callback must resolve to a Uint8Array"))?;
+            let signature = signature_js.to_vec();
+            anyhow::ensure!(
+                signature.len() == ML_DSA65_SIGNATURE_LEN,
+                "ML-DSA-65 signature must be {ML_DSA65_SIGNATURE_LEN} bytes"
+            );
+            Ok(Some(signature))
         }
     }
 }

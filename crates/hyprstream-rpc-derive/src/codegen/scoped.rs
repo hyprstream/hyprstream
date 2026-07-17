@@ -158,19 +158,43 @@ fn generate_scoped_response_only(
 }
 
 /// Build a `ScopedMethodContext` chain from ancestors + current scope.
-fn build_scope_context(sc: &ScopedClient, ancestors: &[&ScopedClient]) -> ScopedMethodContext {
+fn build_scope_context(
+    sc: &ScopedClient,
+    ancestors: &[&ScopedClient],
+    resolved: &ResolvedSchema,
+) -> ScopedMethodContext {
+    let root_name = ancestors
+        .first()
+        .map_or(sc.factory_name.as_str(), |root| root.factory_name.as_str());
+    let root_method_discriminator = resolved
+        .raw
+        .request_struct
+        .as_ref()
+        .and_then(|request| request.union_fields().find(|field| field.name == root_name))
+        .map(|field| field.discriminant_value)
+        .or_else(|| {
+            resolved
+                .raw
+                .request_variants
+                .iter()
+                .position(|variant| variant.name == root_name)
+                .and_then(|index| u16::try_from(index).ok())
+        })
+        .unwrap_or(0);
     let mut parent_ctx: Option<Box<ScopedMethodContext>> = None;
     for ancestor in ancestors {
         parent_ctx = Some(Box::new(ScopedMethodContext {
             factory_name: ancestor.factory_name.clone(),
             scope_fields: ancestor.scope_fields.clone(),
             parent: parent_ctx,
+            root_method_discriminator,
         }));
     }
     ScopedMethodContext {
         factory_name: sc.factory_name.clone(),
         scope_fields: sc.scope_fields.clone(),
         parent: parent_ctx,
+        root_method_discriminator,
     }
 }
 
@@ -217,6 +241,7 @@ fn generate_portable_scoped_client_recursive(
     let response_type = format_ident!("{}ResponseVariant", sc.client_name);
     let outer_req_type = format_ident!("{}", to_snake_case(&format!("{pascal}Request")));
     let doc = format!("Scoped client for {} operations (transport-agnostic).", sc.factory_name);
+    let service_name = to_snake_case(pascal);
 
     // Struct fields: all ancestor scope fields + own scope fields
     let all_scope_field_defs: Vec<TokenStream> = ancestors.iter()
@@ -282,7 +307,7 @@ fn generate_portable_scoped_client_recursive(
     }
 
     // Request methods (portable mode)
-    let scope_ctx = build_scope_context(sc, ancestors);
+    let scope_ctx = build_scope_context(sc, ancestors, resolved);
     let request_methods: Vec<TokenStream> = sc.inner_request_variants.iter().map(|v| {
         generate_portable_request_method(
             capnp_mod,
@@ -318,12 +343,42 @@ fn generate_portable_scoped_client_recursive(
 
             /// Send a raw request and return the raw response bytes.
             pub async fn call(&self, payload: Vec<u8>) -> anyhow::Result<Vec<u8>> {
-                self.client.call(payload).await
+                self.client.call_for_service(#service_name, payload).await
+            }
+
+            /// Send a generated request with its canonical root method id.
+            async fn call_with_method(
+                &self,
+                method_discriminator: u16,
+                payload: Vec<u8>,
+            ) -> anyhow::Result<Vec<u8>> {
+                self.client
+                    .call_for_service_with_method(#service_name, method_discriminator, payload)
+                    .await
             }
 
             /// Send a streaming request with ephemeral DH pubkey.
             pub async fn call_streaming(&self, payload: Vec<u8>, ephemeral_pubkey: [u8; 32]) -> anyhow::Result<Vec<u8>> {
-                self.client.call_streaming(payload, ephemeral_pubkey).await
+                self.client
+                    .call_streaming_for_service(#service_name, payload, ephemeral_pubkey)
+                    .await
+            }
+
+            /// Send a generated streaming request with its canonical root method id.
+            async fn call_streaming_with_method(
+                &self,
+                method_discriminator: u16,
+                payload: Vec<u8>,
+                ephemeral_pubkey: [u8; 32],
+            ) -> anyhow::Result<Vec<u8>> {
+                self.client
+                    .call_streaming_for_service_with_method(
+                        #service_name,
+                        method_discriminator,
+                        payload,
+                        ephemeral_pubkey,
+                    )
+                    .await
             }
 
             /// Parse a scoped response from raw bytes.

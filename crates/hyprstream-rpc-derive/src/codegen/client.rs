@@ -971,9 +971,35 @@ pub fn generate_client(
                 self.client.call_for_service(Self::SERVICE_NAME, payload).await
             }
 
+            /// Send a generated request with its canonical schema method id.
+            async fn call_with_method(
+                &self,
+                method_discriminator: u16,
+                payload: Vec<u8>,
+            ) -> anyhow::Result<Vec<u8>> {
+                self.client
+                    .call_for_service_with_method(Self::SERVICE_NAME, method_discriminator, payload)
+                    .await
+            }
+
             /// Send a streaming request with ephemeral DH pubkey.
             pub async fn call_streaming(&self, payload: Vec<u8>, ephemeral_pubkey: [u8; 32]) -> anyhow::Result<Vec<u8>> {
                 self.client.call_streaming_for_service(Self::SERVICE_NAME, payload, ephemeral_pubkey).await
+            }
+
+            /// Send a generated streaming request with its schema method id.
+            async fn call_streaming_with_method(
+                &self,
+                method_discriminator: u16,
+                payload: Vec<u8>,
+                ephemeral_pubkey: [u8; 32],
+            ) -> anyhow::Result<Vec<u8>> {
+                self.client
+                    .call_streaming_for_service_with_method(
+                        Self::SERVICE_NAME,
+                        method_discriminator,
+                        payload,
+                        ephemeral_pubkey,).await
             }
 
             #(#request_methods)*
@@ -1029,6 +1055,29 @@ fn generate_request_method_inner(
     types_crate: Option<&syn::Path>,
 ) -> TokenStream {
     let method_name = format_ident!("{}", to_snake_case(&variant.name));
+    let method_discriminator = scope
+        .map(|context| context.root_method_discriminator)
+        .unwrap_or_else(|| {
+            resolved
+                .raw
+                .request_struct
+                .as_ref()
+                .and_then(|request| {
+                    request
+                        .union_fields()
+                        .find(|field| field.name == variant.name)
+                })
+                .map(|field| field.discriminant_value)
+                .unwrap_or_else(|| {
+                    resolved
+                        .raw
+                        .request_variants
+                        .iter()
+                        .position(|candidate| candidate.name == variant.name)
+                        .and_then(|index| u16::try_from(index).ok())
+                        .unwrap_or(0)
+                })
+        });
     let doc = if variant.description.is_empty() {
         format!(
             "{} ({} variant)",
@@ -1124,7 +1173,7 @@ fn generate_request_method_inner(
             rh,
             quote! { , ephemeral_pubkey: [u8; 32] },
             quote! {
-                let response = self.call_streaming(payload, ephemeral_pubkey).await?;
+                let response = self.call_streaming_with_method(#method_discriminator,payload, ephemeral_pubkey).await?;
             },
         )
     } else {
@@ -1139,7 +1188,7 @@ fn generate_request_method_inner(
             rt,
             rh,
             TokenStream::new(),
-            quote! { let response = self.call(payload).await?; },
+            quote! { let response = self.call_with_method(#method_discriminator,payload).await?; },
         )
     };
 
@@ -1477,6 +1526,8 @@ pub struct ScopedMethodContext {
     pub factory_name: String,
     pub scope_fields: Vec<FieldDef>,
     pub parent: Option<Box<ScopedMethodContext>>,
+    /// Canonical discriminator of the outermost service union arm.
+    pub root_method_discriminator: u16,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

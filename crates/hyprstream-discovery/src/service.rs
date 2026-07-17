@@ -4,6 +4,11 @@
 //! socket kinds, and schemas via the standard REQ/REP transport.
 
 use async_trait::async_trait;
+use hyprstream_rpc::browser_provisioning::{
+    BrowserCarrierProfile, BrowserCurrentnessVerifier, BrowserProvisioningDocument,
+    BrowserProvisioningMaterial, BrowserProvisioningRequest, BrowserRequestBinding,
+    BrowserRouteRole, BrowserTransportSecurity,
+};
 use hyprstream_rpc::registry::{self, EndpointRegistry, SocketKind};
 use hyprstream_rpc::resolver::{Resolver, ResolverProfile, ServiceQuery};
 use hyprstream_rpc::rpc_client::{CallOptions, RpcClient};
@@ -23,7 +28,7 @@ use crate::generated::discovery_client::{
 use crate::placement_index::PlacementIndex;
 use crate::scheduling;
 
-use anyhow::Result;
+use anyhow::{Context,Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hyprstream_rpc::identity::Did;
 use hyprstream_util::ttl_cache::TtlCache;
@@ -149,8 +154,6 @@ impl SelectedService {
             && self.evidence.accepted_state_digest == other.evidence.accepted_state_digest
             && self.evidence.accepted_state_epoch == other.evidence.accepted_state_epoch
     }
-
-    #[cfg(test)]
     fn service_name(&self) -> &str {
         &self.service_name
     }
@@ -167,7 +170,9 @@ impl SelectedService {
         &self.response_ml_dsa65
     }
 
-    #[cfg(test)]
+    fn response_key_id(&self) -> &str {
+        &self.response_key_id
+    }
     fn request_kem_recipient(&self) -> &AnchoredKemRecipient {
         &self.request_kem_recipient
     }
@@ -178,6 +183,10 @@ impl SelectedService {
 
     fn evidence(&self) -> &ResolutionEvidence {
         &self.evidence
+    }
+
+    fn expires_at_unix_ms(&self) -> i64 {
+        self.expires_at_unix_ms
     }
 
     fn ensure_fresh(&self, now_unix_ms: i64) -> Result<()> {
@@ -625,6 +634,14 @@ impl ResolvedService {
         anyhow::ensure!(
             selected.response_ml_dsa65() == current_key.mldsa65_pub.as_slice(),
             "selected PQ response key is not accepted current key"
+        );
+        anyhow::ensure!(
+            state
+                .current
+                .services
+                .iter()
+                .any(|service| service.id == format!("#{}", selected.service_name())),
+            "selected service is not present in accepted current state"
         );
         Ok(Self { selected })
     }
@@ -1270,6 +1287,187 @@ impl DiscoveryServiceResolver {
         );
         Ok(())
     }
+
+    async fn browser_provisioning(
+        &self,
+        request: BrowserProvisioningRequest,
+    ) -> Result<BrowserProvisioningDocument> {
+        request.validate()?;
+        match request.carrier_profile {
+            BrowserCarrierProfile::OwnedHybridWebTransport => {
+                anyhow::ensure!(
+                    request.capability == "hyprstream-rpc/1"
+                        && request.scope == request.service_name,
+                    "owned browser RPC provisioning requires hyprstream-rpc/1 and exact service scope"
+                );
+            }
+            BrowserCarrierProfile::StandardPublicRelay => {
+                anyhow::ensure!(
+                    request.capability == "hyprstream-moq/1",
+                    "standard-public-relay provisioning requires hyprstream-moq/1"
+                );
+            }
+        }
+
+        let query = ServiceQuery::new(
+            request.service_name.clone(),
+            [request.capability.clone()],
+            ResolverProfile::NetworkDiscovery,
+            1,
+        )?;
+        let resolved = self
+            .resolve_service_candidates(query)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("resolver returned no validated browser reach"))?;
+        self.ensure_current(&resolved).await?;
+        let state = self
+            .accepted_state_source
+            .accepted_state(resolved.service_did().as_str())?
+            .ok_or_else(|| {
+                anyhow::anyhow!("accepted state disappeared during browser provisioning")
+            })?;
+        anyhow::ensure!(
+            state.epoch == resolved.evidence().accepted_state_epoch
+                && state.head_digest == resolved.evidence().accepted_state_digest,
+            "accepted state advanced during browser provisioning; re-resolution required"
+        );
+        let accepted_service = state
+            .current
+            .services
+            .iter()
+            .find(|service| service.id == format!("#{}", request.service_name))
+            .ok_or_else(|| {
+                anyhow::anyhow!("accepted current state does not contain requested service")
+            })?;
+
+        let (origin, route, certificate_hashes, route_role, transport_security, encrypted_objects) =
+            match request.carrier_profile {
+                BrowserCarrierProfile::OwnedHybridWebTransport => {
+                    let EndpointType::Quic {
+                        addr,
+                        server_name,
+                        auth,
+                    } = resolved.transport().endpoint.clone()
+                    else {
+                        anyhow::bail!(
+                            "browser provisioning requires selected QUIC/WebTransport network reach"
+                        );
+                    };
+                    let authority = format!("{server_name}:{}", addr.port());
+                    let url = format!("https://{authority}/");
+                    (
+                        url.clone(),
+                        url,
+                        auth.accept_cert_hashes().to_vec(),
+                        BrowserRouteRole::Origin,
+                        BrowserTransportSecurity::OwnedHybridRequired,
+                        false,
+                    )
+                }
+                BrowserCarrierProfile::StandardPublicRelay => {
+                    anyhow::ensure!(
+                        accepted_service.endpoint.transport == hyprstream_pds::at9p::Transport::Moq,
+                        "accepted service does not select the MoQT carrier"
+                    );
+                    let relay = accepted_service.endpoint.relay.clone().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "accepted service has no signed standard public relay route"
+                        )
+                    })?;
+                    (
+                        accepted_service.endpoint.address.clone(),
+                        relay,
+                        Vec::new(),
+                        BrowserRouteRole::Relay,
+                        BrowserTransportSecurity::ClassicalUntrusted,
+                        true,
+                    )
+                }
+            };
+
+        let now = unix_millis_now();
+        let expires_at_unix_ms = resolved
+            .expires_at_unix_ms()
+            .min(now.saturating_add(30_000));
+        anyhow::ensure!(
+            expires_at_unix_ms > now,
+            "resolved browser provisioning expired before projection"
+        );
+        Ok(BrowserProvisioningDocument::from_material(
+            BrowserProvisioningMaterial {
+                service_name: request.service_name,
+                service_did: resolved.service_did().as_str().to_owned(),
+                service_origin: origin,
+                webtransport_url: route,
+                capability: request.capability,
+                scope: request.scope,
+                carrier_profile: request.carrier_profile,
+                route_role,
+                transport_security,
+                response_key_id: resolved.response_key_id().to_owned(),
+                response_ed25519: resolved.response_verifying_key().to_bytes(),
+                response_ml_dsa65: resolved.response_ml_dsa65().to_vec(),
+                request_kem_key_id: resolved.request_kem_recipient().key_id.clone(),
+                request_kem_recipient: resolved.request_kem_recipient().recipient.clone(),
+                accepted_state_digest: resolved.evidence().accepted_state_digest,
+                accepted_state_epoch: resolved.evidence().accepted_state_epoch,
+                expires_at_unix_ms,
+                certificate_hashes,
+                encrypted_objects_required: encrypted_objects,
+            },
+        ))
+    }
+
+    async fn verify_browser_binding(&self, binding: &BrowserRequestBinding) -> Result<()> {
+        binding.validate_shape()?;
+        let now = unix_millis_now();
+        anyhow::ensure!(
+            binding.expires_at_unix_ms > now,
+            "sealed browser provisioning binding expired before dispatch"
+        );
+        let current = self
+            .browser_provisioning(BrowserProvisioningRequest::new(
+                binding.service_name.clone(),
+                binding.capability.clone(),
+                binding.scope.clone(),
+                binding.carrier_profile,
+            )?)
+            .await?;
+        anyhow::ensure!(
+            binding.service_did == current.service_did
+                && binding.service_origin == current.service_origin
+                && binding.response_key_id == current.response_key_id
+                && binding.request_kem_key_id == current.request_kem_key_id
+                && binding.accepted_state_epoch == current.accepted_state_epoch
+                && binding.accepted_state_digest == current.accepted_state_digest
+                && binding.expires_at_unix_ms <= current.expires_at_unix_ms,
+            "accepted-current browser authority changed before dispatch"
+        );
+        let response_key = URL_SAFE_NO_PAD
+            .decode(&current.response_ed25519)
+            .context("invalid current response key projection")?;
+        let kem = URL_SAFE_NO_PAD
+            .decode(&current.request_kem_recipient)
+            .context("invalid current request KEM projection")?;
+        anyhow::ensure!(
+            binding.matches_response_key(&response_key)? && binding.matches_request_kem(&kem)?,
+            "accepted-current browser key material changed before dispatch"
+        );
+        Ok(())
+    }
+}
+
+struct ProductionBrowserCurrentnessVerifier {
+    resolver: Arc<DiscoveryServiceResolver>,
+}
+
+#[async_trait]
+impl BrowserCurrentnessVerifier for ProductionBrowserCurrentnessVerifier {
+    async fn ensure_current(&self, binding: &BrowserRequestBinding) -> Result<()> {
+        self.resolver.verify_browser_binding(binding).await
+    }
 }
 
 static PROCESS_ACCEPTED_STATE_SOURCE: std::sync::OnceLock<Arc<dyn AcceptedStateSource>> =
@@ -1830,6 +2028,30 @@ pub fn production_rpc_client(
     )?))
 }
 
+/// Project a browser/WebTransport provisioning document from the installed
+/// checkpoint-backed production resolver. No caller can inject candidates,
+/// accepted state, keys, reach, or a fallback resolver through this seam.
+pub async fn production_browser_provisioning(
+    request: BrowserProvisioningRequest,
+) -> Result<BrowserProvisioningDocument> {
+    let resolver = PRODUCTION_RESOLVER
+        .get()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("checkpoint-backed production resolver is not installed"))?;
+    resolver.browser_provisioning(request).await
+}
+
+/// Return the verifier backed by the same opaque production resolver used for
+/// projection. It is installed at the server dispatch boundary; no caller can
+/// inject accepted state or a fallback trust source.
+pub fn production_browser_currentness_verifier() -> Result<Arc<dyn BrowserCurrentnessVerifier>> {
+    let resolver = PRODUCTION_RESOLVER
+        .get()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("checkpoint-backed production resolver is not installed"))?;
+    Ok(Arc::new(ProductionBrowserCurrentnessVerifier { resolver }))
+}
+
 struct ProductionRpcClient {
     service_name: String,
     signing_key: SigningKey,
@@ -1964,6 +2186,30 @@ impl RpcClient for ProductionRpcClient {
             .await?
             .0)
     }
+    async fn call_for_service_with_method(
+        &self,
+        service: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            service == self.service_name,
+            "generated service authority mismatch"
+        );
+        let service = service.to_owned();
+        Ok(self
+            .attempt(|c| {
+                let p = payload.clone();
+                let s = service.clone();
+                async move {
+                    c.call_for_service_with_method(&s, method_discriminator, p)
+                        .await
+                }
+            })
+            .await?
+            .0)
+    }
+
     async fn call_with_options(&self, payload: Vec<u8>, options: CallOptions) -> Result<Vec<u8>> {
         Ok(self
             .attempt(|c| {
@@ -2020,6 +2266,28 @@ impl RpcClient for ProductionRpcClient {
                 let p = payload.clone();
                 let s = service.clone();
                 async move { c.call_streaming_for_service(&s, p, ephemeral).await }
+            })
+            .await?
+            .0)
+    }
+    async fn call_streaming_for_service_with_method(
+        &self,
+        service: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+        ephemeral: [u8; 32],
+    ) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            service == self.service_name,
+            "generated service authority mismatch"
+        );
+        let service = service.to_owned();
+        Ok(self
+            .attempt(|c| {
+                let p = payload.clone();
+                let s = service.clone();
+                async move {
+                    c.call_streaming_for_service_with_method(&s, method_discriminator, p, ephemeral).await }
             })
             .await?
             .0)
@@ -2129,7 +2397,7 @@ fn parse_announced_iroh(endpoint: &str) -> anyhow::Result<TransportConfig> {
 mod resolver_tests {
     use super::*;
     use ed25519_dalek::Signer as _;
-    use hyprstream_crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes};
+    use hyprstream_crypto::pq::ml_dsa_sk_to_vk_bytes;
     use hyprstream_pds::at9p::{
         CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType,
         Transport as At9pTransport,
@@ -2665,15 +2933,15 @@ mod resolver_tests {
 
     fn accepted_state(tag: u8) -> (AcceptedAt9pState, SigningKey) {
         let signing = SigningKey::from_bytes(&[tag; 32]);
-        let (pq_signing, pq_verifying) = ml_dsa_generate_keypair();
+        let pq_signing = hyprstream_rpc::node_identity::derive_mesh_mldsa_key (&signing);
         let keys = HybridKeyPair::new(
             signing.verifying_key().to_bytes().to_vec(),
-            ml_dsa_vk_bytes(&pq_verifying),
+            ml_dsa_sk_to_vk_bytes(&pq_signing),
         )
         .unwrap_or_else(|e| panic!("test hybrid keys invalid: {e}"));
         let endpoint = ServiceEndpoint::new(At9pTransport::Iroh, "iroh://reach")
             .unwrap_or_else(|e| panic!("test endpoint invalid: {e}"));
-        let service = ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint)
+        let service = ServiceEntry::new("#model", ServiceType::NinePExport, endpoint)
             .unwrap_or_else(|e| panic!("test service invalid: {e}"));
         let body = CapsuleBody::new(vec![keys], vec![service])
             .unwrap_or_else(|e| panic!("test body invalid: {e}"));
@@ -2728,7 +2996,7 @@ mod resolver_tests {
                 endpoint,
                 service_jwt: "verified-by-handler".to_owned(),
                 service_did: Did::from(state.did.clone()),
-                capabilities: ["hyprstream-rpc/1".to_owned()].into_iter().collect(),
+                capabilities: ["hyprstream-rpc/1".to_owned(), "hyprstream-moq/1".to_owned()].into_iter().collect(),
                 accepted_state_digest: state.head_digest.to_vec(),
                 accepted_state_epoch: state.epoch,
                 response_key_id: format!("{}#response-current", state.did),
@@ -2765,6 +3033,140 @@ mod resolver_tests {
             .ensure_current(&resolved)
             .await
             .unwrap_or_else(|e| panic!("unchanged accepted state rejected: {e}"));
+    }
+
+    fn owned_browser_request() -> BrowserProvisioningRequest {
+        BrowserProvisioningRequest::new(
+            "model",
+            "hyprstream-rpc/1",
+            "model",
+            BrowserCarrierProfile::OwnedHybridWebTransport,
+        )
+        .expect("browser request")
+    }
+
+    #[tokio::test]
+    async fn production_browser_projection_is_current_and_resolution_bound() {
+        let (resolver, _) = production_fixture(false);
+        let document = resolver
+            .browser_provisioning(owned_browser_request())
+            .await
+            .unwrap_or_else(|error| panic!("browser projection failed: {error}"))
+            .sign_projection(&SigningKey::from_bytes(&[11; 32]))
+            .expect("sign accepted projection");
+        let json = serde_json::to_vec(&document).expect("serialize provisioning");
+        let validated = hyprstream_rpc::browser_provisioning::BrowserProvisioning::from_json(
+            &json,
+            &owned_browser_request(),
+            unix_millis_now(),
+        )
+        .unwrap_or_else(|error| panic!("browser projection did not validate: {error}"));
+        assert_eq!(validated.service_name(), "model");
+        assert_eq!(validated.accepted_state_epoch(), 1);
+        assert!(validated.service_did().starts_with("did:at9p:"));
+    }
+
+    #[tokio::test]
+    async fn browser_projection_rejects_state_advance_revocation_and_cross_service() {
+        let (resolver, source) = production_fixture(false);
+        source.0.lock().as_mut().expect("fixture state").epoch += 1;
+        assert!(resolver
+            .browser_provisioning(owned_browser_request())
+            .await
+            .is_err());
+
+        let (resolver, _) = production_fixture(false);
+        resolver
+            .announced_endpoints
+            .write()
+            .get_mut("model")
+            .and_then(|entries| entries.first_mut())
+            .expect("fixture announcement")
+            .request_kem_recipient = vec![0x01];
+        assert!(resolver
+            .browser_provisioning(owned_browser_request())
+            .await
+            .is_err());
+
+        let (resolver, source) = production_fixture(false);
+        source
+            .0
+            .lock()
+            .as_mut()
+            .expect("fixture state")
+            .current
+            .services[0]
+            .id = "#policy".to_owned();
+        assert!(resolver
+            .browser_provisioning(owned_browser_request())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn public_relay_requires_signed_moq_route_and_application_object_profile() {
+        let (resolver, source) = production_fixture(false);
+        let request = BrowserProvisioningRequest::new(
+            "model",
+            "hyprstream-moq/1",
+            "tenant-a/track-a",
+            BrowserCarrierProfile::StandardPublicRelay,
+        )
+        .expect("relay request");
+        assert!(resolver
+            .browser_provisioning(request.clone())
+            .await
+            .is_err());
+
+        {
+            let mut state = source.0.lock();
+            let endpoint = &mut state.as_mut().expect("fixture state").current.services[0].endpoint;
+            endpoint.transport = At9pTransport::Moq;
+            endpoint.address = "https://model.example/".to_owned();
+            endpoint.relay = Some("https://relay.example/moq".to_owned());
+        }
+        let document = resolver
+            .browser_provisioning(request.clone())
+            .await
+            .unwrap_or_else(|error| panic!("signed relay projection failed: {error}"))
+            .sign_projection(&SigningKey::from_bytes(&[11; 32]))
+            .expect("sign accepted relay projection");
+        assert_eq!(
+            document.transport_security,
+            BrowserTransportSecurity::ClassicalUntrusted
+        );
+        assert!(document.application_hybrid_required);
+        assert!(document.encrypted_objects_required);
+        let json = serde_json::to_vec(&document).expect("serialize relay provisioning");
+        hyprstream_rpc::browser_provisioning::BrowserProvisioning::from_json(
+            &json,
+            &request,
+            unix_millis_now(),
+        )
+        .expect("validate relay provisioning");
+    }
+
+    #[tokio::test]
+    async fn post_refetch_pre_dispatch_state_advance_rejects_pinned_binding() {
+        let (resolver, source) = production_fixture(false);
+        let document = resolver
+            .browser_provisioning(owned_browser_request())
+            .await
+            .expect("pre-seal refetch")
+            .sign_projection(&SigningKey::from_bytes(&[11; 32]))
+            .expect("sign projection");
+        let json = serde_json::to_vec(&document).expect("serialize projection");
+        let binding = hyprstream_rpc::browser_provisioning::BrowserProvisioning::from_json(
+            &json,
+            &owned_browser_request(),
+            unix_millis_now(),
+        )
+        .expect("validate projection")
+        .request_binding()
+        .expect("bind accepted evidence");
+
+        source.0.lock().as_mut().expect("fixture state").epoch += 1;
+        assert!(resolver.verify_browser_binding(&binding).await.is_err());
     }
 
     #[tokio::test]
@@ -2960,6 +3362,14 @@ mod resolver_tests {
         async fn call_for_service(&self, _: &str, _: Vec<u8>) -> Result<Vec<u8>> {
             anyhow::bail!("bootstrap transport was unexpectedly dispatched")
         }
+        async fn call_for_service_with_method(
+            &self,
+            _: &str,
+            _: u16,
+            _: Vec<u8>,
+        ) -> Result<Vec<u8>> {
+            anyhow::bail!("noop bootstrap client")
+        }
         async fn call_with_options(&self, _: Vec<u8>, _: CallOptions) -> Result<Vec<u8>> {
             anyhow::bail!("bootstrap transport was unexpectedly dispatched")
         }
@@ -2981,6 +3391,15 @@ mod resolver_tests {
             _: [u8; 32],
         ) -> Result<Vec<u8>> {
             anyhow::bail!("bootstrap transport was unexpectedly dispatched")
+        }
+        async fn call_streaming_for_service_with_method(
+            &self,
+            _: &str,
+            _: u16,
+            _: Vec<u8>,
+            _: [u8; 32],
+        ) -> Result<Vec<u8>> {
+            anyhow::bail!("noop bootstrap client")
         }
         async fn open_stream(&self, _: Vec<u8>) -> Result<Box<dyn StreamHandle>> {
             anyhow::bail!("bootstrap transport was unexpectedly dispatched")

@@ -69,6 +69,10 @@ pub fn create_app(state: ServerState) -> Router {
             "/.well-known/planes",
             get(routes::ninep::wire_planes_metadata),
         )
+        .route(
+            "/.well-known/hyprstream/browser-provisioning/:service",
+            get(routes::browser_provisioning::browser_provisioning),
+        )
         .route("/9p", get(routes::ninep::ninep_ws));
 
     // Protected routes (auth required)

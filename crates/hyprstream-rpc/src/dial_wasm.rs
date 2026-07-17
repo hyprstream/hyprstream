@@ -77,13 +77,14 @@ use crate::web_transport::WtConnection;
 ///
 /// Returns an error if the WebTransport handshake fails.
 pub async fn dial(
-    url: &str,
-    cert_hash: Option<&str>,
-    signer: JsSigner,
-    server_verifying_key: Option<VerifyingKey>,
-    jwt: Option<String>,
+    _url: &str,
+    _cert_hash: Option<&str>,
+    _signer: JsSigner,
+    _server_verifying_key: Option<VerifyingKey>,
+    _jwt: Option<String>,
 ) -> Result<Arc<dyn RpcClient>> {
-    dial_with_kem_store(url, cert_hash, signer, server_verifying_key, jwt, None).await
+    Err(anyhow!(
+        "unprovisioned browser WebTransport dial is disabled; resolve accepted-current browser provisioning first"))
 }
 
 /// Dial over WebTransport with an anchored `#mesh-kem` recipient trust store.
