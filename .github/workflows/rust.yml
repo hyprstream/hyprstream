@@ -247,12 +247,33 @@ jobs:
             export HYPRSTREAM_PYGUEST_WASM=/build/crates/hyprstream-workers-python-guest/target/wasm32-unknown-unknown/release/hyprstream_workers_python_guest.wasm
             export HYPRSTREAM_FSGUEST_WASM=/build/crates/hyprstream-workers-wasmtime-fsguest/target/wasm32-wasip1/release/hyprstream-workers-wasmtime-fsguest.wasm
             # TEMP (#1011 validation): --no-fail-fast enumerates EVERY arm64 failure
-            # in one pass instead of stopping at the first, so env/arch gaps surface
-            # together. Revert to plain fail-fast for the real gate.
-            cargo nextest run --cargo-profile ci-test --profile ci --no-fail-fast
-
-            # nextest does not run doctests; keep them in the merge gate.
-            cargo test --release --doc
-
+            # in one pass. Its full console output is too large for the Actions log
+            # API to serve, so capture to a file (uploaded as an artifact below) and
+            # print ONLY the FAIL/summary lines here. Revert to plain fail-fast (no
+            # redirection/artifact) for the real gate.
+            set +e
+            cargo nextest run --cargo-profile ci-test --profile ci --no-fail-fast > /build/nextest-arm64.log 2>&1
+            nextest_rc=$?
+            cargo test --release --doc > /build/doctest-arm64.log 2>&1
+            doctest_rc=$?
+            set -e
+            echo "===== nextest failures (full log in the arm64-test-logs artifact) ====="
+            grep -E "FAIL \[|Summary \[|tests run:|error\[|panicked at|not available" /build/nextest-arm64.log | tail -100 || true
+            echo "===== doctest tail ====="
+            grep -E "test result|error\[|FAILED|panicked at" /build/doctest-arm64.log | tail -30 || true
             sccache --show-stats
+            echo "nextest_rc=$nextest_rc doctest_rc=$doctest_rc"
+            [ "$nextest_rc" -eq 0 ] && [ "$doctest_rc" -eq 0 ]
           '
+
+    # TEMP (#1011 validation): full nextest/doctest output, reliable regardless of
+    # the Actions log-size limit. Remove with the other validation-only bits.
+    - name: Upload arm64 test logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: arm64-test-logs
+        path: |
+          nextest-arm64.log
+          doctest-arm64.log
+        if-no-files-found: warn
